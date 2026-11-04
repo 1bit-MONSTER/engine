@@ -25,11 +25,16 @@ PIDFILE=/run/1bit-logs.pid
 
 start() {
     [ -x "$LOGS" ] || { echo "06onboard-logs: $LOGS is missing" >&2; return 0; }
-    grep -q " /data " /proc/mounts 2> /dev/null || {
-        echo "06onboard-logs: no /data partition: this boot's logs stay in RAM" >&2; return 0; }
+    # No one-shot "is /data mounted yet" test here. rc.services runs this ~7 s into a boot and the partition can
+    # mount long after that (measured 4 Nov: 3.7 min), and nothing re-ran the test, so those boots kept no log
+    # anywhere. The daemon waits for the mount itself; this only reports which of the two states it started in.
     "$LOGS" daemon > /var/log/1bit-logs.log 2>&1 &
     echo $! > "$PIDFILE"
-    echo "06onboard-logs: writing /data/logs/$(cat /tmp/1bit-logs.bootid 2> /dev/null) (pid $(cat "$PIDFILE"))"
+    if grep -q " /data " /proc/mounts 2> /dev/null; then
+        echo "06onboard-logs: writing /data/logs/$(cat /tmp/1bit-logs.bootid 2> /dev/null) (pid $(cat "$PIDFILE"))"
+    else
+        echo "06onboard-logs: /data is not mounted yet, 1bit-logs waits for it (pid $(cat "$PIDFILE"))"
+    fi
 }
 
 stop() {

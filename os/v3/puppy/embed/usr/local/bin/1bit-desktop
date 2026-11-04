@@ -94,6 +94,16 @@ run_x() {
     "$XWIN"
     rc=$?
     say "== 1bit-desktop: xwin returned $rc at $(date -u +%FT%TZ 2> /dev/null)"
+    # Cycle 18 (pi-release's c17 finding): X runs on VT3, and when it exits the console STAYS there, showing
+    # xwin's "Exited from X" text while the menu is alive on VT1 - so menu item 6's promise ("the menu comes back
+    # when X exits") was true in the process table and false on the screen. Put the screen back on the menu's VT.
+    if command -v chvt > /dev/null 2>&1; then
+        chvt 1 2> /dev/null && say "== 1bit-desktop: console back on VT1 (the menu)"
+    elif busybox chvt 1 2> /dev/null; then
+        say "== 1bit-desktop: console back on VT1 (the menu, busybox chvt)"
+    else
+        say "== 1bit-desktop: no chvt here: the console stays on X's VT, Ctrl+Alt+F1 returns to the menu"
+    fi
     # The X log and xerrs.log are the two files a boot would lose; the boot's own copy is what makes the next
     # failure diagnosable even though /var/log is tmpfs.
     [ -x "$LOGS" ] && "$LOGS" snap "xwin-returned-$rc" > /dev/null 2>&1

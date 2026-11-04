@@ -149,7 +149,7 @@ this recipe ships are:
 | service | what it does |
 |---|---|
 | `05onboard-data` | finds `1BIT-DATA` (`1bit.data=` on the boot line, else the label), mounts it at `/data`, creates the contract dirs, points `/etc/1bit/lemond.conf` at `/data/lemonade/lemond.conf`, copies `/data/ssh/authorized_keys` and links the host key from `/data/ssh`, and registers `/data/models` in Lemonade's `user_models.json` |
-| `10lemonade` | starts `/opt/1bit-package/lemond-onebit`, mints `LEMONADE_API_KEY` into `/etc/1bit/lemond.conf` (mode 600) on first boot, binds `0.0.0.0:13305`, logs to `/var/log/lemond-onebit.log` |
+| `10lemonade` | starts `/opt/1bit-package/lemond-onebit`, binds `0.0.0.0:13305`, logs to `/var/log/lemond-onebit.log`. **No key by default** (cycle 20, the owner's "blank key": the appliance ships like stock Lemonade). A key is opt-in and lives in `/etc/1bit/lemond.conf` (mode 600, a symlink onto `/data`) — console menu item 1 mints one, removes it, and restarts this service so lemond comes up in the other mode; nothing else in the image holds it |
 | `20onboard-ssh` | `ssh-keygen -A`, `/root/.ssh` 700 + `authorized_keys` 600, then sshd. An image with no key provisions no listener |
 | `21serial-console` | a root shell on `/dev/ttyS0`, only when the command line carries `1bit.serial=1` (that shell has no password, so it is opt-in) |
 | `26onboard-board` | `os/mini/board.sh` as `/usr/sbin/1bit-board` (the path release-check's `fans` row reads): EC fan curve, power profile and the detached boost loop, on a board whose DMI it knows; on any other machine it writes nothing and says so |

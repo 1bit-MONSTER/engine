@@ -55,6 +55,12 @@ namespace {
 
 using json = nlohmann::json;
 
+// The device is held by another request for longer than this serve will wait: a refusal with a status
+// code (503 + Retry-After), never a silent pause and never a 500.
+struct DeviceBusy : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 struct Engine {
     std::string id;
     std::unique_ptr<npu::Model> model;
@@ -64,7 +70,15 @@ struct Engine {
     int max_context = npu::Lane::kMaxContext;
     float default_penalty = 1.1f;  // greedy 0.6B models loop without it
     bool open_think = false;       // the template opens "<think>\n" when thinking is on
-    std::mutex mu;
+    std::timed_mutex mu;  // timed: the wait for the device is bounded (engine#911)
+    // How long a request may wait for the device before it is told the device is busy (engine#911).
+    // The one-device lock below serialises generations, and an *unbounded* wait is what made a second
+    // request look like a hung answer: measured on this box, a 48-token probe queued 10.04 s behind an
+    // in-flight generation and then answered in 51 ms. Lemonade's streaming proxy gives up at ~6 s, so
+    // the pause reached its client as "0 chunks in 5.9 s / backend did not send [DONE]" -- the board's
+    // failure in issue #911 -- with no way to tell "queued" from "stuck". 5 s keeps a short queue
+    // working (a probe that finishes quickly is waited for) and still answers before that proxy does.
+    int queue_ms = 5000;
 
     // reused: prompt tokens already on the device (a private route's); cache: where from,
     // empty when none.
@@ -179,7 +193,9 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         if (ids.empty()) throw std::runtime_error("empty prompt");
         const int room = e.max_context - int(ids.size());
         if (room < 1) throw std::runtime_error("prompt longer than the context");
-        std::lock_guard<std::mutex> lock(e.mu);
+        std::unique_lock<std::timed_mutex> lock(e.mu, std::defer_lock);
+        if (!lock.try_lock_for(std::chrono::milliseconds(e.queue_ms)))
+            throw DeviceBusy("the NPU is busy with another request");
         opt.max_tokens = std::min(opt.max_tokens, room);
         std::string pending;
         opt.on_token = [&](int t) {
@@ -253,6 +269,10 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
             } catch (const std::exception& ex) {
                 const std::string err = "data: " + json{{"error", {{"message", ex.what()}}}}.dump() + "\n\n";
                 sink.write(err.data(), err.size());
+                // A stream that ends without [DONE] is what Lemonade reports as a hung backend, so every
+                // refusal closes the stream properly, whatever ended it.
+                const std::string done = "data: [DONE]\n\n";
+                sink.write(done.data(), done.size());
             }
             sink.done();
             return true;
@@ -278,6 +298,11 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         out["usage"] = usage(r, n_prompt, n_cached);
         out["timings"] = timings(r, cache);
         res.set_content(out.dump(), "application/json");
+    } catch (const DeviceBusy& ex) {
+        res.status = 503;
+        res.set_header("Retry-After", "1");
+        res.set_content(json{{"error", {{"message", ex.what()}, {"type", "device_busy"}}}}.dump(),
+                        "application/json");
     } catch (const std::exception& ex) {
         res.status = 500;
         res.set_content(json{{"error", {{"message", ex.what()}}}}.dump(), "application/json");
@@ -330,7 +355,7 @@ bool is_npu_model_dir(const std::string& dir, const npu::PrivateOptions& opts) {
 
 int run_unified(int argc, char** argv) {
     std::string model_dir, host = "127.0.0.1", alias;
-    int port = 8000;
+    int port = 8000, queue_ms = 5000;
     npu::PrivateOptions opts;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -343,24 +368,33 @@ int run_unified(int argc, char** argv) {
         else if (a == "--host") host = next();
         else if (a == "--alias") alias = next();
         else if (a == "--opt") npu::parse_private_option(next(), opts);
+        else if (a == "--queue-ms") queue_ms = std::stoi(next());
         else if (a == "--help" || a == "-h") {
             std::printf("usage: 1bit unified -m <model dir> [-p 8000] [--host 127.0.0.1] [--alias NAME]\n"
                         "                    [--opt KEY=VALUE ...]\n"
                         "  <model dir> holds model.q4nx, config.json, tokenizer.json, and for the fast lane\n"
                         "              npu/ (its kernels); a model a private route serves needs no npu/\n"
+                        "  --queue-ms N a request waits at most N ms for the device before 503 (default 5000)\n"
                         "  --opt       an option for a private route (docs/npu.md, \"Private routes\")\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
     }
+    if (queue_ms < 0) throw std::runtime_error("--queue-ms takes 0 (refuse at once) or more, not " +
+                                               std::to_string(queue_ms));
     if (model_dir.empty()) throw std::runtime_error("-m <model dir> is required");
     // Lemonade hands over the checkpoint path, which may name the container file.
     if (std::filesystem::is_regular_file(model_dir)) model_dir = std::filesystem::path(model_dir).parent_path().string();
 
     Engine e;
+    e.queue_ms = queue_ms;
     e.id = alias.empty() ? std::filesystem::path(model_dir).filename().string() : alias;
     httplib::Server srv;
     install_request_guard(srv, host);  // Host / Origin (app/http_guard.h)
     std::atomic<bool> ready{false};
+    // /health must never take e.mu or touch the device: Lemonade's BackendWatchdog probes it with a
+    // 2 s timeout while a request is ACTIVE, and three consecutive failures reset the backend (kill +
+    // reload), i.e. they would end a healthy turn. Measured under a 512-token generation in flight:
+    // 200 in 0.3-1.0 ms on six consecutive probes, while a chat request in the same window got 503.
     srv.Get("/v1/health", [&](const httplib::Request&, httplib::Response& res) {
         res.status = ready ? 200 : 503;
         res.set_content(json{{"status", ready ? "ok" : "loading"}, {"model", e.id}, {"device", "npu"}}.dump(),

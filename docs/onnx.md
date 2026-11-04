@@ -193,13 +193,13 @@ cell, `~/wt/qdq-quiet-timing.sh` + `~/wt/qdq-quiet-medians.py`): the table above
 single q figure there is 1.7×), 32 rows **2.86–3.63×** (3.1–3.4×), and the device column stays flat between 1
 and 32 rows (q: 1.693 ms at one row against 1.724 ms at 32). The box was
 not quiet — load 5.2 at round 1 rising to 13.8 at round 3, another lane's `ort_run` at 382 % CPU — and *both*
-columns move with it (round 3 is 1.3–2.2× slower on the device as well as on the host), so the 1-, 12- and
-16-row cells are quoted from rounds 1–2 only. A second estimator agrees with the first: taking each cell's **minimum**
+columns move with it (round 3 against round 1 is 1.15–1.98× slower on the device and 1.51–3.39× on the
+host), so the 1-, 12- and 16-row cells are quoted from rounds 1–2 only. A second estimator agrees with the first: taking each cell's **minimum**
 over all three rounds (the least-contended sample) gives k/v 1.06× at 12 rows, the other four 1.13–1.19×, 16 rows
 1.49–1.63× and 32 rows 3.00–3.17×, so the boundary sentence changed above is not an artefact of which average was
 picked. Every one of those 75 probe runs also asserts the device's exact
 int32 accumulators equal the host loop's, so it is a correctness re-check of `gemm_q8_raw` on five shapes at
-four row counts as well as a timing one. A genuinely quiet-box table is still owed: this box has not been quiet
+five row counts (1, 12, 16, 32, 64) as well as a timing one. A genuinely quiet-box table is still owed: this box has not been quiet
 for any of the three attempts so far.
 
 **What `gemm_q8` does with that number.** It routes by rows: below `kDeviceMinRows` — 16, declared once in

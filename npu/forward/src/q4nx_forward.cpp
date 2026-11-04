@@ -2105,6 +2105,20 @@ void Q4nxNpuForward::begin_verify(int rows, int start_pos) {
 bool Q4nxNpuForward::commit_verify_rows(int accepted) {
     if (!verify_open_) { err_ = "commit_verify: no verify batch open"; return false; }
     if (accepted < 0 || accepted > verify_rows_) { err_ = "commit_verify: accepted out of range"; return false; }
+    // NPU_PHASE_PROF=1: a commit is the per-row half of a verify batch, so its two terms are named separately --
+    // the snapshot restore (M-independent) and the recurrence replay (per accepted row, engine#972).
+    const bool cv_prof = lh_on();
+    const auto cv_t0 = std::chrono::steady_clock::now();
+    // NPU_REPLAY_CHECK=1: a FULL accept has nothing to roll back, so the snapshot-restore + replay must land on
+    // exactly the state the batch's own recurrence left.  That equality is the invariant the deferred commit rests on
+    // (and the one a loop-shape change could break silently).  Captured HERE, before the snapshot is restored under
+    // it -- reported once per commit, off by default because the copy is 151 MB at this model's dimensions.
+    static const bool replay_check = std::getenv("NPU_REPLAY_CHECK") != nullptr;
+    std::vector<std::vector<float>> expect_rec, expect_conv;
+    if (replay_check && accepted == verify_rows_ && accepted > 0) {
+        expect_rec = rec_state_;
+        expect_conv = conv_state_;
+    }
     const size_t per = (size_t)c_.NKV * (size_t)c_.HD;
     const size_t keep = (size_t)(verify_pos_ + accepted) * per;
     for (size_t l = 0; l < kcache_.size(); l++) {
@@ -2120,8 +2134,38 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
         const size_t stride = last_hidden_rows_.size() / (size_t)verify_rows_;
         last_hidden_rows_.resize(stride * (size_t)accepted);
     }
+    const auto cv_t1 = std::chrono::steady_clock::now();
     verify_open_ = false;                        // the replay below must not re-record
     if (accepted > 0 && !gdn_apply_rows(0, accepted)) return false;
+    if (cv_prof) {
+        const auto cv_t2 = std::chrono::steady_clock::now();
+        const double restore = std::chrono::duration<double, std::milli>(cv_t1 - cv_t0).count();
+        const double replay = std::chrono::duration<double, std::milli>(cv_t2 - cv_t1).count();
+        std::fprintf(stderr, "[cv] accepted %2d of %2d: restore %6.1f ms, replay %7.1f ms (%6.1f ms/row)\n",
+                     accepted, verify_rows_, restore, replay, replay / (accepted > 0 ? accepted : 1));
+    }
+    if (!expect_rec.empty()) {
+        double maxd = 0.0, scale = 0.0;
+        for (size_t l = 0; l < expect_rec.size(); l++) {
+            const size_t n = std::min(expect_rec[l].size(), rec_state_[l].size());
+            for (size_t i = 0; i < n; i++) {
+                const double d = std::fabs((double)rec_state_[l][i] - (double)expect_rec[l][i]);
+                if (d > maxd) maxd = d;
+                const double a = std::fabs((double)expect_rec[l][i]);
+                if (a > scale) scale = a;
+            }
+        }
+        for (size_t l = 0; l < expect_conv.size(); l++) {
+            const size_t n = std::min(expect_conv[l].size(), conv_state_[l].size());
+            for (size_t i = 0; i < n; i++) {
+                const double d = std::fabs((double)conv_state_[l][i] - (double)expect_conv[l][i]);
+                if (d > maxd) maxd = d;
+            }
+        }
+        const bool ok_state = maxd <= 1e-6 * (scale > 0.0 ? scale : 1.0);
+        std::fprintf(stderr, "[cv] replay-check: full accept of %d rows, max |replay - batch| %.3e (scale %.3e) %s\n",
+                     accepted, maxd, scale, ok_state ? "OK" : "MISMATCH");
+    }
     for (auto& v : row_in_) v.clear();
     return true;
 }
@@ -2129,13 +2173,30 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
 // The recurrence alone, re-applied from the restored snapshot: conv ring, q/k/v normalisation from the stored
 // conv input, the decay + rank-1 update.  The output is not recomputed -- the verify pass already produced the
 // logits for these rows, and only the STATE has to be made consistent with the accepted prefix.
+//
+// This is the per-ROW term of a verify batch, so it has to cost like the batch does (engine#972).  It ran the
+// pre-#944 shape -- one thread, and the rank-1 update walking the state row with stride VHD:
+//
+//   for (vd) { for (kd) ssum += sh[kd * VHD + vd] * kh[kd]; }     // every touch a different cache line
+//
+// which measured 85-95 ms per accepted row on the device (74-153 across arms) and 90 ms on a host probe at these
+// dimensions (48 layers x 48 heads x 128x128 state = 144 MB), against 1.9-13.5 ms for the shape gdn_layer_batch()
+// uses.  So the loops are exchanged exactly as #944 exchanged them (kd outer, vd inner, contiguous on sh; each
+// output element still accumulates over kd in increasing order) and the heads run in the SAME
+// one-region-per-replay, head-parallel form as the batch path, so a partial accept costs the batch's own per-row
+// work instead of 48 single-threaded strided passes over the state.
 bool Q4nxNpuForward::gdn_apply_rows(int from, int to) {
     const int KD = lin_kd_, CD = 2 * lin_kd_ + lin_vd_;
     const int NKH = lin_nkh_, NVH = lin_nvh_, KHD = lin_khd_, VHD = lin_vhd_;
     const int CK = lin_ck_;
     const int rep = (NKH > 0) ? std::max(1, NVH / NKH) : 1;
     std::vector<float> co((size_t)CD), ql((size_t)NVH * KHD), kl((size_t)NVH * KHD), vv((size_t)NVH * VHD);
-    std::vector<float> kvm((size_t)VHD);
+    const int gdn_nt = omp_heads_threads();
+    // ONE parallel region for the whole replay: the layer loop and the row loop stay sequential (the recurrence
+    // carries state from row to row), and only the heads are shared out.  The per-row preparation writes the shared
+    // conv ring and the shared q/k/v buffers, so exactly one thread does it and the others meet it at a barrier.
+#pragma omp parallel num_threads(gdn_nt)
+    {
     for (int l = 0; l < (int)row_in_.size(); l++) {
         if (row_in_[(size_t)l].empty() || rec_state_[(size_t)l].empty()) continue;
         const int lt = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
@@ -2143,6 +2204,8 @@ bool Q4nxNpuForward::gdn_apply_rows(int from, int to) {
         for (int m = from; m < to; m++) {
             const GdnRowIn& rec = row_in_[(size_t)l][(size_t)m];
             if (rec.qkv.empty()) continue;
+#pragma omp single
+            {
             float* st = conv_state_[(size_t)l].data();
             for (int ch = 0; ch < CD; ch++) {
                 const float* cs = st + (size_t)ch * (CK - 1);
@@ -2174,32 +2237,78 @@ bool Q4nxNpuForward::gdn_apply_rows(int from, int to) {
                     kl[(size_t)hh * KHD + d] *= ik;
                 }
             }
+            }
             float* rs = rec_state_[(size_t)l].data();
+#pragma omp for schedule(static)
             for (int hh = 0; hh < NVH; hh++) {
+                // As in gdn_layer_batch(): one scratch row per head, inside the region (a per-head allocation in
+                // the serial loop is the mistake that cost the mla attempt 2x on 2026-11-03).
+                std::vector<float> scratch((size_t)VHD);
+                float* kvm = scratch.data();
                 const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] *
                                       softplus_f(rec.ah[(size_t)hh] + gdn_small_[(size_t)l].dt[hh]));
                 const float beta = 1.0f / (1.0f + expf(-rec.bh[(size_t)hh]));
                 float* sh = rs + (size_t)hh * KHD * VHD;
                 const float* kh = &kl[(size_t)hh * KHD];
                 const float* vh = &vv[(size_t)hh * VHD];
+#pragma omp simd
                 for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
-                for (int vd = 0; vd < VHD; vd++) {
-                    float ssum = 0;
-                    for (int kd = 0; kd < KHD; kd++) ssum += sh[kd * VHD + vd] * kh[kd];
-                    kvm[(size_t)vd] = ssum;
+                for (int vd = 0; vd < VHD; vd++) kvm[vd] = 0.0f;
+                for (int kd = 0; kd < KHD; kd++) {
+                    const float k = kh[kd];
+                    const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+                    for (int vd = 0; vd < VHD; vd++) kvm[vd] += srow[vd] * k;
                 }
-                for (int vd = 0; vd < VHD; vd++) {
-                    const float delta = (vh[vd] - kvm[(size_t)vd]) * beta;
-                    for (int kd = 0; kd < KHD; kd++) sh[kd * VHD + vd] += kh[kd] * delta;
+#pragma omp simd
+                for (int vd = 0; vd < VHD; vd++) kvm[vd] = (vh[vd] - kvm[vd]) * beta;
+                for (int kd = 0; kd < KHD; kd++) {
+                    const float k = kh[kd];
+                    float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+                    for (int vd = 0; vd < VHD; vd++) srow[vd] += k * kvm[vd];
                 }
             }
         }
     }
+    }
     return true;
 }
 
+// Batch phase attribution (engine#972).  A batched verify pass pays every row's *host* work M times while
+// its array launches are M-independent (a pb16i ELF runs its 16 rows whatever M is), so the marginal cost of
+// a row is host-side and has to be named, not inferred.  Snapshots the same slots step() fills, prints the
+// delta of one step_batch() call when NPU_PHASE_PROF is set.  Measurement only: nothing here is read back.
+namespace {
+struct BatchPhases {
+    const bool on = lh_on();
+    double v[LH_N]{};
+    long n[LH_N]{};
+    BatchPhases() {
+        if (on) {
+            std::copy(g_lh, g_lh + LH_N, v);
+            std::copy(g_lh_n, g_lh_n + LH_N, n);
+        }
+    }
+    double ms(int s) const { return on ? g_lh[s] - v[s] : 0.0; }
+    void print(int M) const {
+        if (!on) return;
+        const double gemm = ms(LH_GEMM) + ms(LH_GEMM_GDN);
+        const double row = M > 0 ? (double)M : 1.0;
+        std::fprintf(stderr,
+                     "[bl] M=%2d gdn %7.1f ab %7.1f core %7.1f attn %6.1f mlp %6.1f rms %5.1f "
+                     "res %5.1f gemm %7.1f head %6.1f | per row: gdn %6.1f attn %5.1f "
+                     "gemm %6.1f head %5.1f\n",
+                     M, ms(LH_GDN), ms(LH_GDN_AB), ms(LH_GDN_CORE), ms(LH_ATTN), ms(LH_MLP),
+                     ms(LH_RMS), ms(LH_RES), gemm, ms(LH_HEAD_ROWS),
+                     ms(LH_GDN) / row, ms(LH_ATTN) / row, gemm / row, ms(LH_HEAD_ROWS) / row);
+    }
+};
+}  // namespace
+
 bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                                      std::vector<float>& out) {
+    LhScope _tlh_gdn(LH_GDN);  // as in gdn_layer(): makes the gemm launches inside count as LH_GEMM_GDN
     const int H = c_.H;
     const int KD = lin_kd_, VD = lin_vd_, CD = 2 * lin_kd_ + lin_vd_;
     const int NKH = lin_nkh_, NVH = lin_nvh_, KHD = lin_khd_, VHD = lin_vhd_;
@@ -2276,13 +2385,16 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         }
         // alpha/beta on the host (N = NVH, below the GEMM tile width)
         const float* xm = xn.data() + (size_t)m * H;
-        for (int hh = 0; hh < NVH; hh++) {
-            const float* ra = gdn_small_[(size_t)l].wa.data() + (size_t)hh * H;
-            const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)hh * H;
-            float sa = 0, sb = 0;
-            for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
-            ah[(size_t)hh] = sa;
-            bh[(size_t)hh] = sb;
+        {
+            LhScope _t_ab(LH_GDN_AB);
+            for (int hh = 0; hh < NVH; hh++) {
+                const float* ra = gdn_small_[(size_t)l].wa.data() + (size_t)hh * H;
+                const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)hh * H;
+                float sa = 0, sb = 0;
+                for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
+                ah[(size_t)hh] = sa;
+                bh[(size_t)hh] = sb;
+            }
         }
         if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l) {   // keep what a commit would need
             auto& rec = row_in_[(size_t)l][(size_t)m];
@@ -2319,6 +2431,8 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         // 24 was level with 16 (2026-11-04, same window, same binary).  OMP_NUM_THREADS still wins downward;
         // this only stops the default from oversubscribing.
         const int gdn_nt = omp_heads_threads();
+        {
+        LhScope _t_core(LH_GDN_CORE);
 #pragma omp parallel for schedule(static) num_threads(gdn_nt)
         for (int hh = 0; hh < NVH; hh++) {
             // One scratch row for kvm and one for the delta, ONE allocation: this runs 48 heads x 48 layers x rows
@@ -2368,6 +2482,7 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                 const float zz = z[(size_t)hh * VHD + vd];
                 crow[vd] = crow[vd] * inv * gdn_small_[(size_t)l].norm[vd] * (zz / (1.0f + expf(-zz)));
             }
+        }
         }
         if (dump_gb && l == 0 && m < 2) {
             auto d2 = [&](const char* nm, const float* v, int n) {
@@ -3388,6 +3503,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
     }
 
+    BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
     const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
     const int i_o   = idx_of(Q4NX_DESIGN_O);
     const int i_gu  = idx_of(Q4NX_DESIGN_GU);
@@ -3531,6 +3647,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                     gate_ptr = qkv_row.data() + nhd;
                     in = &qkv_use;
                 }
+                LhScope _t_attn(LH_ATTN);
                 if (!attention(*in, start_pos + m, dst ? ctx_row : ctx_scratch, l_hd, l_nkv, l_theta,
                                l_rot, l_prop, l_win, l, append, kvlen)) {
                     err_ = "attention failed"; return false;
@@ -3569,6 +3686,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         // column grid (engine#854 pads it otherwise): reading at H put every row after the first at the
         // wrong offset, which is why only position 0 of a prompt came out right (engine#855).
         {
+            LhScope _t_res(LH_RES);
             const int nrow = q4nx_pad_n(H);
             for (int m = 0; m < M; m++)
                 for (int k = 0; k < H; k++)
@@ -3660,6 +3778,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                           g->real_k);
         }
         {
+            LhScope _t_res(LH_RES);
             const int nrow = q4nx_pad_n(H);   // as above: the design's N, identity when H is on the grid
             for (int m = 0; m < M; m++)
                 for (int k = 0; k < H; k++)
@@ -3696,7 +3815,10 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             rmsnorm(&X[(size_t)m * H], final_norm_.data(), H, &norm_all[(size_t)m * H]);
         std::copy(norm_all.begin() + (size_t)(M - 1) * H, norm_all.end(), fnorm.begin());
         last_hidden_rows_ = norm_all;          // per-row normed hidden, for a drafter that must advance too
-        ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
+        {
+            LhScope _t_head(LH_HEAD_ROWS);
+            ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
+        }
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
     } else {
         std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
@@ -3729,6 +3851,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         std::fprintf(stderr, "[batch] M=%d start=%d batched (%d layers, two_widths=%d)\n",
                      M, start_pos, c_.NL, (int)two_widths);
     }
+    bph.print(M);
     return ok;
 }
 

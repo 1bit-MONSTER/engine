@@ -331,6 +331,14 @@ A MoE model's router stays bf16 and untiled (it runs on the host, and its top-k 
 GGUF's own), and its routed expert stacks become one tensor per layer and projection — see
 "Routed expert stacks" below.
 
+`config.json` also carries the tokenizer's `add_bos_token` and `add_eos_token` when the GGUF
+states them (`tokenizer.ggml.add_bos_token`/`add_eos_token`), because the forward builds its
+prompt from `config.json`'s flag and defaults to no BOS (`app/forward_serve.cpp`). A checkpoint
+whose `tokenizer_config.json` sets `add_bos_token: true` — Zyphra/ZR1-1.5B, a Qwen2 fine-tune —
+is otherwise served a chat prompt with no BOS: measured on ZR1-1.5B, the forward built a
+5-token prompt where llama.cpp built 6, and the reply opened with the end-of-turn token.
+`tools/safetensors_to_q4nx.py` carries the same two keys from `tokenizer_config.json`.
+
 | GGUF type | To q4_1 | Error |
 |---|---|---|
 | Q4_0 | scale `d`, zero `-8d`, codes unchanged | bf16 rounding of scale and zero |

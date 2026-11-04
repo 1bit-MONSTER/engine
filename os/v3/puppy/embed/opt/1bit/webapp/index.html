@@ -31,9 +31,10 @@
   Opened as http://localhost:8080/ by /usr/local/bin/1bit-lemonade-webapp (the desktop autostart), served by
   /etc/init.d/24onboard-webapp. There is NO key in that URL and none in this page: the server on 8080 is
   1bit-webapp-proxy, which adds `Authorization: Bearer <key from /etc/1bit/lemond.conf>` to every /api/ request it
-  forwards to Lemonade (cycle 17 item 8 - the cycle-16 demo recording had `?key=…` in the address bar). ?api= still
-  points the page at a different server; a ?key= left over from an older launcher is used once and then dropped
-  from the address bar, so it cannot end up in a recording or in history.
+  forwards to Lemonade (cycle 17 item 8 - the cycle-16 demo recording had `?key=…` in the address bar). The page is
+  same-origin only: the old `?api=` override (a debug affordance nothing used) is gone, so no request URL carries a
+  user-supplied value. A ?key= left over from an older launcher is used once and then dropped from the address bar,
+  so it cannot end up in a recording or in history.
 
   Cycle 18 (from the c17 board demo) fixed two things about the conversation itself, both visible in the owner's
   recording: a thinking model (Qwen3) put its whole reply in `reasoning_content`, so the page - which read only
@@ -89,15 +90,18 @@
 <script>
 (function () {
   var p = new URLSearchParams(location.search);
-  // same origin by default: the server that served this page IS the proxy that holds the key
-  var api = (p.get("api") || "").replace(/\/+$/, "");
+  // Same origin, always: the server that served this page IS the proxy that holds the key, so the paths below are
+  // literal and there is no user-controlled value in a request URL (CodeQL's client-side request forgery on the
+  // cycle-18 diff; the old ?api= override was a debug affordance nothing in the image used and a way to make the
+  // appliance's own browser POST at another host).
+  var api = "";
   var q = document.getElementById("q"), out = document.getElementById("out"), stat = document.getElementById("stat");
   var go = document.getElementById("go"), ui = document.getElementById("uibtn");
   var sel = document.getElementById("model"), think = document.getElementById("think");
   // an old ?key= link keeps working, but the secret is taken out of the address bar immediately (no history entry
   // to read it from, nothing for a screen recording to catch). New launchers do not use it at all.
   var key = p.get("key") || "";
-  if (p.get("key") || p.get("api")) {
+  if (p.get("key")) {
     try { history.replaceState({}, "", location.pathname); } catch (e) {}
   }
   ui.href = "http://127.0.0.1:13305/";
@@ -174,6 +178,27 @@
   }
   sel.addEventListener("change", function () { model = sel.value; show(); q.focus(); });
 
+  // engine#924: a request that cannot have the NPU (the device is one cache, one generation at a time) is
+  // REFUSED with a status, never parked silently: 503 + Retry-After + {"error":{"type":"device_busy"}} when the
+  // engine refuses before it starts answering, and - for a streaming request, which is what this page sends - one
+  // `data: {"error":...}` frame followed by `data: [DONE]`, because a stream that ends without [DONE] is what
+  // Lemonade reports as a hung backend (the c17 board's "0 chunks in 5.9 s"). Both shapes mean the same thing and
+  // both are retried here, up to RETRIES times, saying so on the status line while it waits.
+  var RETRIES = 3;
+  function isBusy(json) {
+    var e = (json && json.error) || json || {};
+    return e.type === "device_busy" || (json && json.type === "device_busy");
+  }
+  function waitMs(res) {
+    var s = 1;
+    try { s = parseInt(res.headers.get("Retry-After"), 10); } catch (e) {}
+    if (!(s >= 0)) s = 1;
+    return Math.min(s, 10) * 1000;   // never park the demo for longer than the engine asks for
+  }
+  var busyErr = function (ms, why) {
+    var e = new Error("device_busy"); e.busy = true; e.waitMs = ms; e.why = why || "device_busy"; return e;
+  };
+
   function ask() {
     var text = (q.value || "").trim();
     if (!text || busy) return;
@@ -188,75 +213,123 @@
     an.className = "ans";
     turn.appendChild(hu); turn.appendChild(th); turn.appendChild(an);
     out.appendChild(turn);
-    var t0 = Date.now(), chunks = 0, rchunks = 0, first = 0, finish = "", done = false;
-    stat.textContent = "waiting for the first token…";
-    window.scrollTo(0, document.body.scrollHeight);
     function add(el, t) { el.appendChild(document.createTextNode(t)); window.scrollTo(0, document.body.scrollHeight); }
-    function end() {
-      var bits = [chunks + " answer chunk" + (chunks === 1 ? "" : "s")];
-      if (rchunks) bits.push(rchunks + " thinking chunk" + (rchunks === 1 ? "" : "s") + " (dimmed above)");
-      bits.push(((Date.now() - t0) / 1000).toFixed(1) + " s");
-      if (first) bits.push("first token after " + ((first - t0) / 1000).toFixed(1) + " s");
-      var s = "done: " + bits.join(", ");
-      if (finish) s += " (" + finish + ")";
-      if (!done) s += " - the backend ended the stream without [DONE]";
-      // The two shapes that used to look identical from the outside ("done: 0 chunks"): thinking ate the budget,
-      // and thinking is all the model did. Both name the switch that fixes them.
-      if (!chunks && rchunks) s += " - no answer text: the model spent its budget thinking, untick 'show thinking'";
-      else if (!chunks && finish === "length") s += " - no answer text before max_tokens (" + MAXTOK + ")";
-      stat.textContent = s;
-      out.appendChild(document.createElement("div"));
-      if (th.textContent) th.textContent = "[thinking] " + th.textContent;
-      busy = false; go.disabled = false; sel.disabled = false; q.focus();
-    }
-    fill().then(function (m) {
-      var body = { model: m, messages: [{ role: "user", content: text }],
+    function settle() { busy = false; go.disabled = false; sel.disabled = false; q.focus(); }
+
+    var attempt = 0;
+    function tryOnce() {
+      attempt++;
+      // a refusal wrote nothing, but a retry must not stack two answers in one turn
+      th.textContent = ""; an.textContent = "";
+      var t0 = Date.now(), chunks = 0, rchunks = 0, first = 0, finish = "", done = false;
+      stat.textContent = attempt > 1 ? "NPU busy, retrying (" + (attempt - 1) + "/" + RETRIES + ")…"
+                                     : "waiting for the first token…";
+      var body = { model: model, messages: [{ role: "user", content: text }],
                    max_tokens: MAXTOK, temperature: 0, stream: true,
                    enable_thinking: !!think.checked };
-      return fetch(api + "/api/v1/chat/completions", { method: "POST", headers: headers(),
-                                                       body: JSON.stringify(body) });
-    }).then(function (r) {
-      if (r.status === 401) { throw new Error("401 - the API key is wrong or missing (this image mints one in /etc/1bit/lemond.conf, and only 1bit-webapp-proxy on :8080 can use it)"); }
-      if (!r.ok) { throw new Error("HTTP " + r.status); }
-      var reader = r.body.getReader(), dec = new TextDecoder(), buf = "";
-      function pump() {
-        return reader.read().then(function (res) {
-          if (res.done) { end(); return; }
-          buf += dec.decode(res.value, { stream: true });
-          var lines = buf.split("\n"); buf = lines.pop();
-          lines.forEach(function (l) {
-            l = l.trim();
-            if (l.indexOf("data:") !== 0) return;
-            var pay = l.slice(5).trim();
-            if (pay === "[DONE]") { done = true; return; }
-            var j; try { j = JSON.parse(pay); } catch (e) { return; }
-            var ch = (j.choices && j.choices[0]) || {};
-            if (ch.finish_reason) finish = ch.finish_reason;
-            var d = ch.delta || {};
-            if (d.reasoning_content) {
-              rchunks++;
-              add(th, d.reasoning_content);
-              if (!chunks) stat.textContent = "thinking… " + rchunks + " chunk" + (rchunks === 1 ? "" : "s") +
-                " (the model reasons before it answers; untick 'show thinking' for a direct answer)";
-            }
-            if (d.content) {
-              if (!first) first = Date.now();
-              chunks++;
-              add(an, d.content);
-              stat.textContent = "streaming… " + chunks + " chunk" + (chunks === 1 ? "" : "s");
-            }
-          });
+      fetch(api + "/api/v1/chat/completions", { method: "POST", headers: headers(), body: JSON.stringify(body) })
+        .then(function (r) {
+          if (r.status === 503) {
+            return r.text().then(function (t) {
+              var j = null; try { j = JSON.parse(t); } catch (e) {}
+              if (isBusy(j) || r.headers.get("Retry-After")) throw busyErr(waitMs(r));
+              throw new Error("HTTP 503" + (j && j.error && j.error.message ? ": " + j.error.message : ""));
+            });
+          }
+          if (r.status === 401) { throw new Error("401 - the API key is wrong or missing (this image mints one in /etc/1bit/lemond.conf, and only 1bit-webapp-proxy on :8080 can use it)"); }
+          if (!r.ok) { throw new Error("HTTP " + r.status); }
+          var reader = r.body.getReader(), dec = new TextDecoder(), buf = "";
+          function pump() {
+            return reader.read().then(function (res) {
+              if (res.done) {
+                var bits = [chunks + " answer chunk" + (chunks === 1 ? "" : "s")];
+                if (rchunks) bits.push(rchunks + " thinking chunk" + (rchunks === 1 ? "" : "s") + " (dimmed above)");
+                bits.push(((Date.now() - t0) / 1000).toFixed(1) + " s");
+                if (first) bits.push("first token after " + ((first - t0) / 1000).toFixed(1) + " s");
+                var s2 = "done: " + bits.join(", ");
+                if (finish) s2 += " (" + finish + ")";
+                if (!done) s2 += " - the backend ended the stream without [DONE]";
+                // The two shapes that used to look identical from the outside ("done: 0 chunks"): thinking ate
+                // the budget, and thinking is all the model did. Both name the switch that fixes them.
+                if (!chunks && rchunks) s2 += " - no answer text: the model spent its budget thinking, untick 'show thinking'";
+                else if (!chunks && finish === "length") s2 += " - no answer text before max_tokens (" + MAXTOK + ")";
+                stat.textContent = s2;
+                out.appendChild(document.createElement("div"));
+                if (th.textContent) th.textContent = "[thinking] " + th.textContent;
+                settle();
+                return;
+              }
+              buf += dec.decode(res.value, { stream: true });
+              var lines = buf.split("\n"); buf = lines.pop();
+              lines.forEach(function (l) {
+                l = l.trim();
+                if (l.indexOf("data:") !== 0) return;
+                var pay = l.slice(5).trim();
+                if (pay === "[DONE]") { done = true; return; }
+                var j; try { j = JSON.parse(pay); } catch (e) { return; }
+                if (j.error) {
+                  // engine#924's streaming refusal is ONE `data: {"error":{"message":...}}` frame and then
+                  // [DONE] - and it carries no `type`, so the message is what says "the NPU is busy with another
+                  // request". A stream that failed before it produced anything is retried whatever it said (that
+                  // is exactly the c17 "0 chunks" shape).
+                  var why = (j.error && j.error.message) || "the backend reported an error";
+                  // Retry ONLY on a stream that has produced NOTHING - no answer chunk and no reasoning chunk -
+                  // because a retry clears this turn's two output elements: doing it after any text would
+                  // silently replace what the reader already has, and reasoning-only output is text too
+                  // (engine#924's own refusal shape is a reasoning-only stream). A failure after output is
+                  // reported and the output is kept.
+                  if (!chunks && !rchunks) throw busyErr(1000, why);
+                  throw new Error(why + " (after " + (chunks + rchunks) + " chunk(s); the partial answer is kept)");
+                }
+                var ch = (j.choices && j.choices[0]) || {};
+                if (ch.finish_reason) finish = ch.finish_reason;
+                var d = ch.delta || {};
+                if (d.reasoning_content) {
+                  rchunks++;
+                  add(th, d.reasoning_content);
+                  if (!chunks) stat.textContent = "thinking… " + rchunks + " chunk" + (rchunks === 1 ? "" : "s") +
+                    " (the model reasons before it answers; untick 'show thinking' for a direct answer)";
+                }
+                if (d.content) {
+                  if (!first) first = Date.now();
+                  chunks++;
+                  add(an, d.content);
+                  stat.textContent = "streaming… " + chunks + " chunk" + (chunks === 1 ? "" : "s");
+                }
+              });
+              return pump();
+            });
+          }
           return pump();
+        })
+        .catch(function (e) {
+          if (e && e.busy) {
+            if (attempt <= RETRIES) {
+              var s = Math.max(1, Math.round((e.waitMs || 1000) / 1000));
+              stat.textContent = "NPU busy, retrying (" + attempt + "/" + RETRIES + ") in " + s + " s";
+              setTimeout(tryOnce, e.waitMs || 1000);
+              return;
+            }
+            stat.textContent = "NPU busy: still refused after " + attempt + " attempts (" + (e.why || "device_busy") +
+              ") - press Send again in a moment";
+            settle();
+            return;
+          }
+          var err = document.createElement("div");
+          err.className = "ans"; err.textContent = "[" + e + "]";
+          out.appendChild(err);
+          stat.textContent = "failed: " + e;
+          settle();
         });
-      }
-      return pump();
-    }).catch(function (e) {
-      var err = document.createElement("div");
-      err.className = "ans"; err.textContent = "[" + e + "]";
-      out.appendChild(err);
-      stat.textContent = "failed: " + e;
-      busy = false; go.disabled = false; sel.disabled = false;
-    });
+    }
+    fill().then(function () { tryOnce(); })
+          .catch(function (e) {
+              var err = document.createElement("div");
+              err.className = "ans"; err.textContent = "[" + e + "]";
+              out.appendChild(err);
+              stat.textContent = "failed: " + e;
+              settle();
+          });
   }
   go.addEventListener("click", ask);
   q.addEventListener("keydown", function (e) { if (e.key === "Enter") ask(); });

@@ -72,7 +72,7 @@ characters into `/etc/1bit/lemond.conf` (mode `0600`, a symlink onto `/data`), r
 prints the key; in keyed mode it prints the key and offers to turn it off
 (`os/v3/puppy/embed/usr/local/bin/1bit-console-menu:300-370`). The console says which mode you are in —
 `api http://<ip>:13305/api/v1   (no key: anyone, press 1)` against `(API key: press 1)`
-(`1bit-console-menu:238,242`; the TUI's own line at `os/v3/puppy/console-tui/src/ui.rs:203-215`). To read
+(`1bit-console-menu:238,242`; the TUI's own line at `os/v3/puppy/console-tui/src/ui.rs:218-222`). To read
 a key that exists: `sudo sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf`.
 
 The **cycle-13 image** is why this section is careful. It minted a key at first boot, and on a

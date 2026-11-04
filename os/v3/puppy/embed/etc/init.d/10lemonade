@@ -24,7 +24,7 @@
 # What it starts is the release package's own launcher, which resolves lemond/the engine BESIDE ITSELF
 # (LEMONADE_ONEBIT_BIN defaults to $here/1bit/1bit), so the whole package lives in one directory and
 # nothing has to be on PATH. The two pieces of configuration:
-#   /etc/1bit/lemond.conf   LEMONADE_API_KEY=... (mode 600) - minted at build time, or here on first boot
+#   /etc/1bit/lemond.conf   LEMONADE_API_KEY=... (mode 600) - only when a person turned one on (cycle 20)
 #   /etc/1bit/libhsa.env    optional; what the release build pins for HRX (v2's lemond unit used the same
 #                           file as its EnvironmentFile, so an image built for v2 stays valid)
 LEMONADE_ONEBIT=/opt/1bit-package/lemond-onebit
@@ -40,27 +40,26 @@ start() {
     ulimit -l unlimited 2>/dev/null
     # shellcheck disable=SC1090  # the release build pins what HRX needs; the file may not exist
     if [ -f "$ENVFILE" ]; then . "$ENVFILE"; fi
-    # engine#867: mint on "there is no KEY", not on "there is no file". A file that exists but is empty - an older
-    # image pre-created one, and prepare-stick writes it - left the key unset, and lemond then serves every
-    # endpoint including /internal/* to the whole LAN (zz-onboard-ports opens 13305 on purpose). Measured on a
-    # dd-written stick: 0-byte file, 200 without an Authorization header, second boot identical.
+    # Cycle 20, the owner's "blank key" decision (2026-11-03 ~20:1x): the appliance ships like stock Lemonade,
+    # i.e. with NO LEMONADE_API_KEY, and a key is something a person turns ON from the console (menu item 1 mints
+    # it, writes this file and restarts this service). Nothing mints here any more: an appliance that invents a
+    # secret its owner never saw is how "where do I get the key" became the first question on every boot.
+    #
+    # What stays forbidden is the third state - an EMPTY assignment. It reads as "keyed" to every script that greps
+    # for the line and as "no key" to lemond, which is engine#867's dd-written stick (0-byte file, 200 without an
+    # Authorization header). So: no key line = blank mode, an empty one is treated as none, and the mode is logged.
     key=$(sed -n 's/^LEMONADE_API_KEY=//p' "$CONF" 2> /dev/null | head -1)
-    if [ -z "$key" ]; then
-        mkdir -p /etc/1bit 2> /dev/null
-        key=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        if printf 'LEMONADE_API_KEY=%s\n' "$key" > "$CONF" 2> /dev/null; then
-            chmod 600 "$CONF" 2> /dev/null
-            echo "10lemonade: minted an API key in $CONF"
-        else
-            key=
-            echo "10lemonade: cannot write $CONF - Lemonade will serve loopback only" >&2
-        fi
-    fi
     # a shipped file may carry more than the key (v2's unit read the same path as an EnvironmentFile)
     # shellcheck disable=SC1090  # the file is the appliance's own env file
     if [ -s "$CONF" ]; then . "$CONF"; fi
     key=${LEMONADE_API_KEY:-$key}
-    export LEMONADE_API_KEY="$key"
+    if [ -n "$key" ]; then
+        export LEMONADE_API_KEY="$key"
+        echo "10lemonade: API key required (keyed mode, $CONF) - menu item 1 turns it off"
+    else
+        unset LEMONADE_API_KEY
+        echo "10lemonade: no API key (blank mode): anyone on this network can use Lemonade - menu item 1 requires one"
+    fi
     # Where Lemonade keeps its state is os/mini's data contract: /data/lemonade/{cache,config}, so the
     # catalogue, downloaded backends and the HRX JIT cache survive a reboot. Without a data partition it
     # lives in RAM and says so, rather than pretending to persist.
@@ -72,11 +71,11 @@ start() {
         echo "10lemonade: no /data partition: Lemonade state is in RAM, nothing persists"
     fi
     mkdir -p "$LEM/cache" "$LEM/config"
-    # lemond's positionals are cache_dir config_dir (lemond --help); the rest are the runtime overrides
-    # engine#867 second half: with no key there is nothing between the LAN and Lemonade's control endpoints, so the
-    # fallback is loopback (the console menu and ssh still reach it) rather than 0.0.0.0 plus a warning nobody reads.
+    # lemond's positionals are cache_dir config_dir (lemond --help); the rest are the runtime overrides.
+    # Blank mode is LAN-reachable on purpose: the appliance is a server, Lemonade's own web UI and Lemonade Mobile
+    # are the two clients the owner demos, and neither asks for a key on stock Lemonade. The console's CONNECT block
+    # says so in those words, and menu item 1 is the way to close it.
     host=0.0.0.0
-    [ -n "$key" ] || host=127.0.0.1
     "$LEMONADE_ONEBIT" "$LEM/cache" "$LEM/config" --port "$PORT" --host "$host" >> "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
     echo "10lemonade: started (pid $(cat "$PIDFILE"), :$PORT, log $LOG)"

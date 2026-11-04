@@ -47,6 +47,7 @@ import json
 import math
 import os
 import pathlib
+import platform
 import re
 import socket
 import statistics
@@ -221,14 +222,56 @@ def serve_lever_args():
     return args
 
 
+def build_identity(onebit, bin_dir):
+    """Name the binary that produced the measurement, inside the artifact itself.
+
+    A session report outlives the shell it was made in, and this workload is routinely measured on
+    more than one build of the same tree (out-of-tree `hl-engine-build` / `-c20`). Without this field
+    two results that differ only by build are indistinguishable, so a KEEP can be read against a binary
+    it was never measured on. ``1bit`` is far under ``sha256_head``'s 64 MiB head, so this is the whole
+    binary's hash, not a prefix.
+    """
+    onebit, bin_dir = pathlib.Path(onebit), pathlib.Path(bin_dir)
+    return {
+        "onebit": str(onebit),
+        "bin_dir": str(bin_dir),
+        "sha256": sha256_head(onebit),
+    }
+
+
+def device_stack():
+    """Name the device stack the measurement came from: kernel and the HSA runtime HRX loads.
+
+    Same class as ``build_identity``: this box reboots between measurement series (three times on
+    2026-11-03 alone) and the tuner launcher applies no kernel gate, so a report that names no kernel
+    cannot say which driver stack a number belongs to -- every long-context number of record so far is
+    tied to its kernel by prose only. The runtime is named by path AND whole-file hash; when the env
+    does not point at one, the box's ROCm-TheRock path is hashed if it exists and reported as null
+    otherwise, rather than guessing.
+    """
+    libhsa = pathlib.Path(env("IREE_HAL_AMDGPU_LIBHSA_PATH") or
+                          "/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/"
+                          "libhsa-runtime64.so.1").expanduser()
+    return {
+        "kernel": platform.release(),
+        "hsa_runtime": str(libhsa) if libhsa.is_file() else None,
+        "hsa_runtime_sha256": sha256_head(libhsa) if libhsa.is_file() else None,
+    }
+
+
 def levers():
-    """Echo the configuration into the report, so a KEEP is explicable months later."""
+    """Echo the configuration into the report, so a KEEP is explicable months later.
+
+    Every name here has to be one the engine actually reads: an echoed knob nothing consumes makes
+    a report claim a configuration the measurement never had (`GGML_HRX_TER_Q4_0` used to be listed
+    and appears nowhere in the engine or its llama.cpp pin).
+    """
     return {
         k: env(k)
         for k in ("HL_B", "HL_UB", "HL_FA", "HL_CTK", "HL_CTV", "HL_MTP_MAX", "HL_DFLASH",
                   "HL_PARALLEL", "HL_CTX", "HL_LONGCTX", "HL_LONGTOK",
                   "GGML_HRX_Q8_PREFILL_RELAX", "GGML_HRX_GRAPH_PROGRAM_CACHE",
-                  "GGML_HRX_TER_Q4_0", "ONEBIT_HRX_DECODE_SPLIT")
+                  "ONEBIT_HRX_DECODE_SPLIT")
         if env(k)
     }
 
@@ -430,6 +473,7 @@ def main():
     deadline = time.time() + env_int("HL_BUDGET_SEC", 780 if not longctx else 1200)
 
     log(f"model={model} bin={bin_dir} state={state}")
+    log(f"device={device_stack()}")
     log(f"levers={levers() or '{}'}")
     result = {
         "framework": "custom",
@@ -443,7 +487,9 @@ def main():
         "completed": 0,
         "total_output_tokens": tokens,
         "quality_gate": {"passed": False, "reason": "not run"},
-        "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE")},
+        "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
+                          "build": build_identity(onebit, bin_dir),
+                          "device_stack": device_stack()},
     }
 
     def finish(passed, reason, rc=0):

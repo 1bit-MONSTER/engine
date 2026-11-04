@@ -542,6 +542,17 @@ add_test(NAME npu_chatml COMMAND npu_chatml_test)
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_chatml_test)
 
+# `forward-serve`'s /v1/completions prompt as text or as the caller's exact token ids (app/npu_prompt_ids.h):
+# the acceptance rules and the refusals that keep an out-of-vocabulary id from reaching the embedding
+# lookup.  Device-free, model-free.
+add_executable(npu_prompt_ids_test tests/npu_prompt_ids_test.cpp)
+target_include_directories(npu_prompt_ids_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(npu_prompt_ids_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_prompt_ids COMMAND npu_prompt_ids_test)
+# Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
+# target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
+add_dependencies(npu_sampling_test npu_prompt_ids_test)
+
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
 add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c)

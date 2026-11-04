@@ -374,7 +374,7 @@ chat_one() {   # chat_one <model id> -> "id<TAB>answer<TAB>tok/s"
 }
 item_chat() {
     # blank mode needs no key (that is the point of it), so "no key" is no longer "cannot chat"
-    ids=$(api_get "$API/api/v1/models" -s -m 5 2>/dev/null |
+    ids=$(api_get "$API/v1/models" -s -m 5 2>/dev/null |
         grep -o '"id":"[^"]*"' | cut -d'"' -f4)
     # "nothing downloaded" is not a broken menu item: a machine with no model, and every VM (Lemonade hides the
     # onebit entries when there is no GPU and no NPU), legitimately has nothing to chat with. It is a SKIP with
@@ -465,7 +465,7 @@ This lives until reboot unless the save layer keeps it."
 # appliance's key when it has one, so the menu cannot drift from what `lemonade` does from a shell.
 item_models() {
     k=$(api_key); export LEMONADE_API_KEY="$k" LEMONADE_PORT=13305
-    ids=$(api_get "$API/api/v1/models" -s -m 5 2>/dev/null |
+    ids=$(api_get "$API/v1/models" -s -m 5 2>/dev/null |
         grep -o '"id":"[^"]*"' | cut -d'"' -f4)
     if [ "$NONINT" = 1 ]; then
         say "downloaded:"; printf '%s\n' "${ids:-<none>}"
@@ -493,7 +493,7 @@ $(printf '%s\n' "${ids:-<none>}" | head -12)" 22 76 3 \
            say_text "Delete" "$(tail -5 /tmp/1bit-delete.log 2>/dev/null)" ;;
         *) return 0 ;;
         esac
-        ids=$(api_get "$API/api/v1/models" -s -m 5 2>/dev/null |
+        ids=$(api_get "$API/v1/models" -s -m 5 2>/dev/null |
             grep -o '"id":"[^"]*"' | cut -d'"' -f4)
     done
 }

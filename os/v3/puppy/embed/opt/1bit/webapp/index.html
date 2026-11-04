@@ -105,7 +105,7 @@
     try { history.replaceState({}, "", location.pathname); } catch (e) {}
   }
   ui.href = "http://127.0.0.1:13305/";
-  ui.title = "Lemonade's own web UI asks for the API key (console menu item 1 shows it)";
+  ui.title = "Lemonade's own web UI (on :13305) - with no API key set it just opens; with one, console menu item 1 shows it";
   document.getElementById("srv").textContent = api || (location.origin + " (Lemonade key held here)");
   var host = location.hostname || "this machine";
   var busy = false;

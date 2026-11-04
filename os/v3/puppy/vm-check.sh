@@ -425,7 +425,7 @@ rows = [
                      "1bit-console-menu --status 2>&1 | grep -q 'http://' && echo menu-status-lines",
                      "menu-status-lines"),
     ("U2 menu actions", "1bit-console-menu --selftest > /tmp/menu-self.txt 2>&1; echo selftest-rc=$?; "
-                     "grep -E '^(--- item|item [0-9] FAILED|api-key-shown|models-listed|install-guard-checked|desktop-available|shell-bash|logs-shown|power-noop)' "
+                     "grep -E '^(--- item|item [0-9] FAILED|api-key-shown|auth-mode|models-listed|install-guard-checked|desktop-available|shell-bash|logs-shown|power-noop)' "
                      "/tmp/menu-self.txt | tr '\\n' ' '", "selftest-rc=0"),
     # Cycle 17 item 4: the menu's probes run with Lemonade's environment, and no line is cut in the middle of a
     # word (the c16 board showed "firmware prese"). Both are read off the shipped script and its own status
@@ -436,13 +436,16 @@ rows = [
                      "1bit-console-menu --status | grep -q 'firmware present' && echo lines-whole || echo truncated",
                      "lines-whole"),
     # Cycle 17 item 8: the key is not in the page or its URL, and the same-origin proxy still answers WITH it.
-    # 401 direct on 13305 is the other half: the key is still enforced where it matters.
+    # Cycle 20: the direct probe follows the MODE - blank (the shipped default) answers 200 without a header, keyed
+    # answers 401 - so the row proves the mode is coherent rather than pinning one auth behaviour.
     # (the page's own text mentions "?key=" in a comment, so the count is of a KEY-SHAPED value, not of the word)
     ("U3 webapp key", "n=$(curl -s -m 5 http://127.0.0.1:8080/ | grep -Ec 'key=[0-9a-f]{16,}'); "
                      "a=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/models); "
                      "b=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:13305/api/v1/models); "
-                     "echo \"key-in-page=$n proxy=$a direct-no-key=$b\"; "
-                     "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = 401 ] && echo webapp-key-not-in-url",
+                     "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
+                     "if [ -n \"$k\" ]; then mode=keyed want=401; else mode=blank want=200; fi; "
+                     "echo \"key-in-page=$n proxy=$a direct-no-key=$b mode=$mode\"; "
+                     "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = \"$want\" ] && echo webapp-key-not-in-url",
                      "webapp-key-not-in-url"),
     # Cycle 18 items 1-2, from the c17 board demo: a thinking model (Qwen3) spent the whole token budget in
     # reasoning_content, so the page - which read only delta.content - showed a mid-sentence stop and then
@@ -608,7 +611,11 @@ rows = [
     ("U7 sshd",      "ps | grep -c '[s]shd'; ls -l /root/.ssh/authorized_keys 2>&1 | tail -1; "
                      "ls /etc/ssh/ssh_host_* 2>&1 | head -3; /usr/sbin/sshd -t 2>&1 | head -3; echo sshd-checked", None),
     ("data mount",   "grep -c ' /data ' /proc/mounts; df -h /data 2>/dev/null | tail -1", "/data"),
-    ("data key",     "ls -l /etc/1bit/lemond.conf; head -c 0 /data/lemonade/lemond.conf && echo persists-on-data", "persists-on-data"),
+    # Cycle 20: blank is the shipped mode, so there may be NO key file yet - what this row owes is that when one is
+    # turned on it lands on /data (the symlink 05onboard-data makes), not that a key exists.
+    ("data key",     "ls -l /etc/1bit/lemond.conf; readlink -f /etc/1bit/lemond.conf; "
+                     "readlink -f /etc/1bit/lemond.conf | grep -q '/data/lemonade/lemond.conf' && echo key-path-on-data",
+                     "key-path-on-data"),
     ("data ssh",     "ls -l /etc/ssh/ssh_host_ed25519_key; readlink -f /etc/ssh/ssh_host_ed25519_key", "/data/ssh/"),
     ("data state",   "ls /data; grep -c . /data/lemonade/config/user_models.json 2>/dev/null || echo no-registry", None),
     # release identity: the package reports "1bit 0.0.1" whatever was built, so the binary hash is what ties

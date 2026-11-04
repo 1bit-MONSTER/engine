@@ -79,6 +79,21 @@ def main():
     texts["prose"] = "B"
     assert [k for k in bench.gated_text_keys(ref_texts) if texts.get(k) != ref_texts[k]] == ["prose"]
 
+    # Raw logs are kept per measurement. They used to be fixed names inside RESULT_DIR, so a second
+    # measurement in the same RESULT_DIR overwrote the first one's serve.log / llama-bench.log — measured
+    # on 2026-11-02, the 19:01 arm destroyed the 18:45 baseline's raw logs, and a pair's A and B halves
+    # would have collided the same way. This is that reproducer: two measurement names, one RESULT_DIR.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        for fname, payload in (("arm-A", "FIRST"), ("arm-B", "SECOND")):
+            bench.run(["sh", "-c", f"echo {payload}"], "llama-bench", 10, bench.log_dir_for(root, fname))
+        assert (root / "logs-arm-A/llama-bench.log").read_text().strip() == "FIRST"
+        assert (root / "logs-arm-B/llama-bench.log").read_text().strip() == "SECOND"
+        # A repeat of the same measurement overwrites only itself, and the result file is untouched by it.
+        assert bench.log_dir_for(root, "arm-A") == root / "logs-arm-A"
+
     # Box rule 2026-11-01 12:13: the drafter at long context is the arm that faulted this box, so a
     # candidate that asks for both must be refused (scores zero) and not load a drafter.
     import os

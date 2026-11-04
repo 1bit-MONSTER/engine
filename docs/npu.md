@@ -780,7 +780,8 @@ that runs the phase is private, like the kernels it runs.
   all 14 match, ids and round trip.
 - **Endpoints:** `/v1/health` (503 while loading), `/v1/models`, `/v1/chat/completions`
   (streaming or not) and `/v1/completions`.
-- **Prompt:** ChatML, Qwen2/Qwen3's template for text messages.
+- **Prompt:** ChatML, Qwen2/Qwen3's template for text messages — for a container whose tokenizer has the
+  ChatML anchors. One that does not is refused on the chat route rather than prompted anyway (#963).
 - **Decoding:** greedy, with a 1.1 repetition penalty over the last 64 ids by default.
   `repetition_penalty` in the request overrides it, and 1 gives plain greedy.
 - **One request at a time:** the model has one KV cache.
@@ -850,6 +851,20 @@ got before.
 | `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
+
+Every chat prompt is rendered with **ChatML** (`app/npu_chatml.h`), the template Qwen2/Qwen3 use, not with a
+template read out of the container. A container whose tokenizer has no `<|im_start|>`/`<|im_end|>` added token
+cannot represent that text — the marker becomes ordinary pieces — so `/v1/chat/completions` answers **400**
+naming the model's own specials instead of prompting it with text its tokenizer never produces (#963). The
+measured cost of getting it wrong on Zyphra/ZR1-1.5B, whose specials are DeepSeek's: the same request is **23
+tokens under this render against 9** under Qwen3's tokenizer, and `<|im_start|>` alone is **6 pieces**.
+
+`/v1/completions` is unaffected, and it is how such a container is served: it takes the prompt as token ids
+(`prompt: [ids]`, #938), so a caller renders the model's own template and sends those ids. The check reads the
+container's tokenizer **once at load** (`chatml_supported()`), so it costs a request nothing, and it is a
+necessary condition rather than a proof — a container can carry both anchors and still use another template.
+Packing the model's `chat_template` into the container is what closes that gap, and it is a container-format
+decision, not something this route does.
 
 `logprobs` keeps OpenAI's shape: non-streamed, every entry is `choices[0].logprobs.content[i] =
 {token, logprob, top_logprobs: [{token, logprob}]}`; streamed, each chunk carries the entries whose bytes that
@@ -1193,3 +1208,38 @@ per-group bias, while the source blocks are asymmetric (`w = q4*S + M`) and thei
 inside a column, where an int16 with an 11-bit mantissa allows about 16x. Forcing it costs a measured 11-18 %
 relative L1 residual, so the mode-1 or Q4_K forms are the ones to run; the script keeps the measurement next to
 the images it writes.
+
+## FFN row sparsity: a stream question, answered before a kernel is written
+
+The FFN is the largest part of a dense model's per-token stream, so "skip most of the FFN" is a
+recurring idea. It only pays if the rows can be skipped **in the blocks a streaming kernel can
+address**: a token's `h = silu(gate(x)) * up(x)` is selected row by row in any analysis, while a
+kernel reads whole blocks and cannot skip a scattered row. `tools/ffn_sparsity.py` is the
+device-free pair of measurements that decides which of those two answers a model gives, and it
+runs in CI (`ctest -R ffn_sparsity`).
+
+**`budget <model.gguf>`** reads the GGUF's tensor table with the standard library only — no
+dequantising, no model in memory — and reports what share of one token's stream is
+`ffn_gate_up`, `ffn_down`, `attn`, `ssm_gdn`, `embd_head` and `norms`, with `--per-layer` for the
+block-by-block split and `--json` for a record. The FFN share is the **ceiling**: any row-skipping
+kernel saves a fraction of that, never more.
+
+**`stats <capture.csv>`** summarizes a capture of the `ffn_down` input: one CSV row per
+(layer, token), with the columns in two families, because they mean opposite things.
+
+| columns | rule | who can use it |
+|---|---|---|
+| `b64_e90` … `b128_e99`, `b<B>_em10` … `b<B>_em50` | keep the whole blocks of `B` rows whose own `\|h\|_1` is largest | **this is the rule a streaming kernel obeys** |
+| `r90`, `r95`, `r99`, `m10` … `m50` | plain row selection: rows needed for 90/95/99 % of `\|h\|_1`, mass of the top 10/20/30/50 % | nothing that streams blocks — it is the upper bound, not an achievable one |
+
+Read the block rows first. A model whose `r90` looks promising and whose `b64_e90` is close to
+100 % is the common case, and it is a no: the intermediate is *spatially* dense, so the saving is
+spread over every block the kernel has to read anyway. The per-layer table (`--every N`) shows
+whether a minority of layers behaves differently, which is the one shape a per-layer policy could
+still use.
+
+A capture is any harness's output in that shape, so the columns are the contract rather than a
+pinned generator: the tool drops a half-written last line (a killed capture), refuses a CSV with no
+measurable column instead of printing an empty table, and exits non-zero on a malformed one. The
+`--self-test` builds a synthetic GGUF and capture with hand-computed answers, so the arithmetic is
+gated without a model on disk.

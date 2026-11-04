@@ -4779,6 +4779,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         // it (NPU_C_SYNC_PROF=1). Cumulative per process, printed once per token: a token's flushes are the
         // delta between two lines, and the bytes are exact (bo::sync is a clflush loop over its range).
         if (getenv("NPU_C_SYNC_PROF")) I8Ctx::c_sync_print(token);
+        if (getenv("NPU_A_SYNC_PROF")) I8Ctx::a_sync_print(token);
         // Ranked layer-loop host call sites: what the `host=` residual is made of.
         // Nested rows (of-which) are inside their parent; the TOP-LEVEL SUM is the
         // one the residual is compared against.

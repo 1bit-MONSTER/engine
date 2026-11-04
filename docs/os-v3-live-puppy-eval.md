@@ -29,7 +29,8 @@ persistent save layer), headless, with **our** kernel and **our** drivers, not t
 > not are the cycle-12 list), Lemonade answers on `:13305` with its key, chat 70.49 tok/s, TTFT 1.30 s,
 > 0 `amdxdna` errors. It boots headless by default, with a second boot entry, `1bit OS (desktop)`, for
 > Puppy's JWM desktop. **Nothing is published**: the next release carries it. The body of this page is
-> kept as the measurement that decided it.
+> kept as the measurement that decided it. *That cycle's image minted its own API key; since cycle 20 the
+> appliance ships with none and console item 1 turns one on (`10lemonade:43-62`).*
 
 This page is the measurement, and the recommendation. Everything below is measured on strixhalo
 (2026-11-01) or in QEMU here unless it says otherwise; the numbers that are not measured yet say so.

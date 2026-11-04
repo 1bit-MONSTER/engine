@@ -30,13 +30,17 @@ and the gates table - is [os-v3-live-puppy-eval.md](os-v3-live-puppy-eval.md); t
 [`os/v3/puppy/`](../os/v3/puppy/README.md); the page for what the appliance is, is
 [os/README.md](../os/README.md).
 
-Where it stands, measured 2026-11-01 and 2026-11-02: every blocker of the evaluation is closed or
+Where it stands, measured 2026-11-01 to 2026-11-04: every blocker of the evaluation is closed or
 answered - `kernel-puppy.fragment` is built into our kernel (G2 green, the initrd finds and layers the
 SFS), `amdxdna` and `ec_su_axb35` are present, signed and verify against the enrolled MOK (G3 green), the
 save layer persists across a reboot (G7 green, `PUPMODE=12` on `1BIT-DATA`), and `sudo`, `apt`, `sshd`
-and `mokutil` are in the image - and the appliance **booted on the Max+ 395 with Secure Boot on**: 20 of
-`puppy-check`'s 25 rows PASS (the 5 that do not are the cycle-12 list), Lemonade answers on `:13305`
-with its key, chat 70.49 tok/s, TTFT 1.30 s, 0 `amdxdna` errors. **Nothing is published**: the next
+and `mokutil` are in the image - and the appliance **boots on the Max+ 395 with Secure Boot on**. Cycle 19
+(2026-11-03) came back **33 `puppy-check` rows, 0 failed, 1 skipped** (the skip is `u2-desktop`, correct on
+a headless entry); cycle 20 (2026-11-04) booted and served three chats on the NPU at 88.06 / 80.91 /
+87.43 tok/s (TTFT 0.37 / 0.26 / 0.18 s), and its two red rows were traced to a defect in the acceptance
+script rather than the image (engine#945, fix open as #951). Since cycle 20 the appliance ships with **no
+API key** - `10lemonade` leaves `LEMONADE_API_KEY` unset and binds `0.0.0.0:13305` anyway, and console
+item 1 turns a key on (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62`). **Nothing is published**: the next
 release carries it.
 
 **The Ubuntu Server `autoinstall` plan below is the documented fallback**, and it stays the

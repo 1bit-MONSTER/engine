@@ -27,6 +27,7 @@ Run directly (`python3 tests/hyperloom_benchmark_test.py`) or through ctest.
 import hashlib
 import importlib.util
 import pathlib
+import platform
 import sys
 
 BENCH = pathlib.Path(__file__).resolve().parents[1] / "tools/hyperloom/custom/benchmark.py"
@@ -116,6 +117,22 @@ def main():
         assert bench.serve_batch_args()[0] == "-c" and bench.serve_batch_args()[1] == str(bench.serve_ctx())
     for k in ("HL_LONGCTX", "HL_LONGTOK", "HL_CTX"):
         os.environ.pop(k, None)
+
+    # The artifact has to name the device stack too: the box reboots between series and the launcher
+    # applies no kernel gate, so before this a report could not say which kernel/driver a number came
+    # from (the pair-of-record JSONs carried no kernel field at all).
+    ident = bench.device_stack()
+    assert ident["kernel"] == platform.release(), ident
+    with tempfile.TemporaryDirectory() as tmp:
+        stub = pathlib.Path(tmp) / "libhsa-runtime64.so.1"
+        stub.write_bytes(b"\x7fELF not really a runtime\n")
+        os.environ["IREE_HAL_AMDGPU_LIBHSA_PATH"] = str(stub)
+        ident = bench.device_stack()
+        assert ident["hsa_runtime"] == str(stub), ident
+        assert ident["hsa_runtime_sha256"] == hashlib.sha256(stub.read_bytes()).hexdigest(), ident
+        os.environ["IREE_HAL_AMDGPU_LIBHSA_PATH"] = str(pathlib.Path(tmp) / "absent.so.1")
+        assert bench.device_stack()["hsa_runtime"] is None, bench.device_stack()
+    os.environ.pop("IREE_HAL_AMDGPU_LIBHSA_PATH")
 
     print("hyperloom_benchmark_test: OK")
     return 0

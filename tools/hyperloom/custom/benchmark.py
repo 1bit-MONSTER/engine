@@ -47,6 +47,7 @@ import json
 import math
 import os
 import pathlib
+import platform
 import re
 import socket
 import statistics
@@ -258,6 +259,26 @@ def build_identity(onebit, bin_dir):
         "onebit": str(onebit),
         "bin_dir": str(bin_dir),
         "sha256": sha256_head(onebit),
+    }
+
+
+def device_stack():
+    """Name the device stack the measurement came from: kernel and the HSA runtime HRX loads.
+
+    Same class as ``build_identity``: this box reboots between measurement series (three times on
+    2026-11-03 alone) and the tuner launcher applies no kernel gate, so a report that names no kernel
+    cannot say which driver stack a number belongs to -- every long-context number of record so far is
+    tied to its kernel by prose only. The runtime is named by path AND whole-file hash; when the env
+    does not point at one, the box's ROCm-TheRock path is hashed if it exists and reported as null
+    otherwise, rather than guessing.
+    """
+    libhsa = pathlib.Path(env("IREE_HAL_AMDGPU_LIBHSA_PATH") or
+                          "/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/"
+                          "libhsa-runtime64.so.1").expanduser()
+    return {
+        "kernel": platform.release(),
+        "hsa_runtime": str(libhsa) if libhsa.is_file() else None,
+        "hsa_runtime_sha256": sha256_head(libhsa) if libhsa.is_file() else None,
     }
 
 
@@ -482,6 +503,7 @@ def main():
     deadline = time.time() + env_int("HL_BUDGET_SEC", 780 if not longctx else 1200)
 
     log(f"model={model} bin={bin_dir} state={state}")
+    log(f"device={device_stack()}")
     log(f"levers={levers() or '{}'}")
     result = {
         "framework": "custom",
@@ -496,7 +518,8 @@ def main():
         "total_output_tokens": tokens,
         "quality_gate": {"passed": False, "reason": "not run"},
         "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
-                          "build": build_identity(onebit, bin_dir)},
+                          "build": build_identity(onebit, bin_dir),
+                          "device_stack": device_stack()},
     }
 
     def finish(passed, reason, rc=0):

@@ -34,6 +34,7 @@ static void uses(const std::vector<char>& image) {
     xrt::ext::kernel k(*ctx, std::string("kernel"));
     auto act = std::make_unique<xrt::ext::bo>(dev, size_t(4096));
     xrt::ext::bo e{dev, size_t(4096)};
+    xrt::ext::bo imported{dev, 3, size_t(4096), nullptr};   // a BO over an imported dma-buf (#753)
     auto plain = std::make_unique<xrt::bo>(e);
     static_cast<char*>(act->map())[0] = 0;
     act->sync(XCL_BO_SYNC_BO_TO_DEVICE);

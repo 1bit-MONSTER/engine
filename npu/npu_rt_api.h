@@ -102,6 +102,12 @@ class bo : public npu_rt_api::bo {
 public:
     bo() = default;
     bo(const device& d, size_t size);
+    // A buffer whose memory already exists outside this process: `dma_buf_fd` is a dma-buf (the decoder's KV
+    // region, an HRX/host allocation) which the runtime imports and pins, and whose pages the NPU then addresses
+    // directly, so a producer's output needs no copy to reach the NPU and the NPU's output needs no copy to reach
+    // the producer (TZEROCOPY target 1, engine#753). `host` is the caller's own mapping of the same dma-buf --
+    // the address the device is given; pass nullptr to have the runtime map the imported handle itself.
+    bo(const device& d, int dma_buf_fd, size_t size, void* host = nullptr);
 };
 }  // namespace ext
 

@@ -83,6 +83,7 @@ uint64_t bo::address() const { return 0; }
 
 // --- ext::bo
 ext::bo::bo(const device&, size_t) { stub_called("ext::bo::bo"); }
+ext::bo::bo(const device&, int, size_t, void*) { stub_called("ext::bo::bo(dma-buf)"); }
 
 // --- elf
 elf::elf() = default;

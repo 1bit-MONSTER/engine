@@ -48,6 +48,19 @@ inline bool device_lost_line(const std::string& line) {
     return false;
 }
 
+// A request the in-process NPU path ended with a failed runlist: npu/lane.cpp waits on a runlist, whose
+// wait() throws when a run did not complete, and the runtime's message names the code (614) and the ERT
+// state (8 = ERT_CMD_STATE_TIMEOUT). The TDR behind it power-cycles the array, and the context the process
+// still holds is dead: measured on the c22 board (2026-11-04), the same `1bit unified` answered every later
+// request with 614 and made the driver TDR again, while a fresh process on the same device answered 200.
+// So the engine cannot heal the context -- the runtime's session is not ours to rebuild -- and a process
+// that keeps serving on it is worse than one that leaves. The runtime is private, so its text is the only
+// signal that reaches us; match its own prefix plus either code, never a bare "state 8".
+inline bool npu_run_failed(const std::string& what) {
+    if (what.find("npu runtime:") == std::string::npos) return false;
+    return what.find("(code 614)") != std::string::npos || what.find("ERT_CMD_STATE_TIMEOUT") != std::string::npos;
+}
+
 struct WatchdogConfig {
     double secs = 120;        // no progress for this long: the backend is wedged (0: watchdog off)
     double prompt_tps = 50;   // before the first byte, allow prompt_tokens / prompt_tps more

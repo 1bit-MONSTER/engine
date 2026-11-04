@@ -250,6 +250,10 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         // states), so a position the base consumed outside the batch still has to reach it -- otherwise its cache
         // misses one position per iteration and every draft after the first is drafted against a stale stream.
         if (head) head->commit_rows(std::vector<int>{t1}, base.last_hidden(), 1);
+        // The budget can already be full here (t1 was the last token asked for): a chain drafted from this
+        // position could not emit anything, so paying for it -- head steps plus a verify batch -- is pure cost.
+        // The step above is still taken, so the base has consumed every token the caller was handed.
+        if ((int)r.tokens.size() >= opt.max_tokens) break;
 
         std::vector<int> d;
         std::vector<float> conf;
@@ -284,10 +288,16 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         // Emit the accepted prefix, capped by the caller's budget (the accepted drafts are a prefix of
         // plain decode, so a cap only drops the tail -- the text stays identical).
         int take = 0;
+        bool stopped = false;
         for (int i = 0; i < a; i++) {
             if ((int)r.tokens.size() >= opt.max_tokens) break;
-            if (!emit(d[(size_t)i])) { r.tokens.pop_back(); break; }
-            take++;
+            // A false from on_token stops the RUN (run()'s contract, and what a streaming serve needs to stop on
+            // EOS or on a client that went away): breaking only this prefix loop walked back out to the top of the
+            // while, which then handed the consumer the base's own token again -- one delivery past its stop.
+            // The refused token stays emitted and committed, exactly as a refusal on t1 at the top of the loop does.
+            const bool keep = emit(d[(size_t)i]);
+            take = i + 1;
+            if (!keep) { stopped = true; break; }
         }
         r.stats.accepted += a;              // acceptance is a property of the model, not of the budget
         r.stats.chain_drafts.push_back(std::vector<int>(d.begin(), d.begin() + nd));
@@ -317,7 +327,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
             logits.assign(all.begin() + (size_t)(take - 1) * (size_t)V,
                           all.begin() + (size_t)take * (size_t)V);
         pos = have + take;
-        if ((int)r.tokens.size() >= opt.max_tokens) break;
+        if (stopped || (int)r.tokens.size() >= opt.max_tokens) break;
     }
 
     r.stats.emitted = (int)r.tokens.size();

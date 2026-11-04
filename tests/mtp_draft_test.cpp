@@ -528,6 +528,58 @@ int main() {
                     bad_cols);
     }
 
+    // [11] a stop is a stop: the consumer's refusal and the caller's budget both end the run where they happen.
+    // Both defects live in the same place -- the accepted-prefix loop of npu/mtp/draft.h run():
+    //   (a) `if (!emit(d[i])) { r.tokens.pop_back(); break; }` broke the INNER loop, while run()'s own contract says
+    //       a false from on_token stops the loop (the top-of-loop token honours it).  The refused draft is the base's
+    //       own argmax at that position, so the next iteration emitted it again: the consumer got the same token a
+    //       second time, and a streaming serve could not stop on EOS or on a gone client in one iteration.
+    //   (b) the budget was only noticed inside that loop, so an iteration that entered with one token left paid a
+    //       full step + verify batch, credited its accepted drafts, and then emitted none of them.
+    {
+        // (a) a consumer that refuses the 3rd delivery: iteration 1 emits t1 and then its 4 accepted drafts, so the
+        // refusal has to land INSIDE the accepted-prefix loop -- that is the arm the top-of-loop check does not cover
+        // (a refusal on t1 already stopped the run, which is why the original 6 never exercised the defect).
+        const int refuse_at = 3;
+        ToyBase m(8); StreamDrafter sd;
+        for (int i = 0; i < (int)P.size(); i++) sd.prime(std::vector<float>{(float)(i + 1)}, 0, i);
+        Options o = base_opt;
+        o.k = 4;                      // a perfect stream drafter: every draft is accepted, so a refusal lands on one
+        o.tau = 0.0f;
+        o.max_tokens = 64;            // the budget is not what stops this run
+        std::vector<int> seen;
+        const Result r = onebit::npu::mtp::run(m, &sd, P, o, [&](int t) {
+            seen.push_back(t);
+            return (int)seen.size() < refuse_at;      // false on the refuse_at-th delivery
+        });
+        check(r.ok, "stop: the run still reports ok when the consumer stops it");
+        check((int)seen.size() == refuse_at, "stop: no delivery after the consumer refused a token (the loop ends here)");
+        check((int)r.tokens.size() == refuse_at,
+              "stop: the refused token is in the output exactly once, as the top-of-loop token is");
+        // The old behaviour, stated as the number it produced instead of described: one extra delivery of the SAME
+        // token (it is the base's own choice at the position the loop would have re-entered), so the sequence the
+        // consumer saw ended ..., X, X.
+        int repeat = 0;
+        for (size_t i = 1; i < seen.size(); i++) if (seen[i] == seen[i - 1]) repeat++;
+        check(repeat == 0, "stop: the consumer is never handed the same token twice by one stop");
+        std::printf("INFO stop: %zu deliveries (refusal at %d), tokens %zu, iterations %d, batches %d\n", seen.size(),
+                    refuse_at, r.tokens.size(), r.stats.iterations, r.stats.batches);
+    }
+    {
+        // (b) an ODD budget, so the token that fills it is a bare t1 and nothing can be drafted from a full chain.
+        ToyBase m(8); HalfHead hh;
+        Options o = base_opt;
+        o.k = 4;                      // accepts exactly one draft per iteration: 2 tokens per iteration
+        o.max_tokens = 7;             // 2, 4, 6, then the 7th is a bare t1 -> the budget is full before the batch
+        const Result r = onebit::npu::mtp::run(m, &hh, P, o);
+        check((int)r.tokens.size() == 7, "budget: the loop emits exactly the requested tokens");
+        check(m.batches() == 3, "budget: no verify batch is paid for a chain that cannot emit a token");
+        check(m.consumed() == (int)P.size() + 7,
+              "budget: the base still consumed every emitted token (no position is skipped by the early stop)");
+        std::printf("INFO budget: emitted %d, steps %d, batches %d, consumed %d for a prompt of %zu\n",
+                    r.stats.emitted, m.steps(), m.batches(), m.consumed(), P.size());
+    }
+
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);
     return fails ? 1 : 0;
 }

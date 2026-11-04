@@ -526,6 +526,9 @@ if(Python3_Interpreter_FOUND)
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.
     add_test(NAME q4nx_dir_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_q4nx_dir.py --self-test)
+    # the FFN row/block sparsity measurements (docs/npu.md, "FFN row sparsity"): a synthetic GGUF and
+    # a synthetic capture, so the byte budget and the capture arithmetic are gated without a model
+    add_test(NAME ffn_sparsity COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ffn_sparsity.py --self-test)
     # the HRX hardware gate's judges (docs/hw-gate.md) against a fake server and synthetic logs;
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
@@ -584,8 +587,10 @@ add_dependencies(npu_sampling_test systemone_route_test)
 # and the bytes it produces, which is the half of issue #832 a test can pin without a model.
 add_executable(npu_chatml_test tests/npu_chatml_test.cpp)
 target_include_directories(npu_chatml_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu)
-target_link_libraries(npu_chatml_test PRIVATE nlohmann_json::nlohmann_json)
-add_test(NAME npu_chatml COMMAND npu_chatml_test)
+target_link_libraries(npu_chatml_test PRIVATE onebit_npu nlohmann_json::nlohmann_json)
+# The #963 rows read the two fixtures: a tokenizer with ChatML anchors (served) and one without (refused).
+add_test(NAME npu_chatml COMMAND npu_chatml_test ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_chatml.json
+                                          ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_linear.json)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_chatml_test)

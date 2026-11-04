@@ -498,9 +498,32 @@ rows = [
                      "grep -q '^AllowHostnameUpdates = false' /etc/connman/main.conf && echo hostname-dhcp-pinned",
                      "hostname-dhcp-pinned"),
     # Cycle 17 item 2: the boot's evidence is on the DATA partition, not in RAM.
-    ("U3 boot logs", "ls -d /data/logs/*/ 2> /dev/null | tail -2; "
-                     "ls /data/logs/*/dmesg.log > /dev/null 2>&1 && grep -q cmdline /data/logs/*/BOOT && "
+    # Cycle 22 (TOS3-NOTE-c21-logs): the log has to be ON the partition AND the daemon has to be alive. The 4 Nov
+    # failure was a boot whose /data mounted after 06onboard-logs' one-shot test: no log on the stick, no daemon, and
+    # nothing failing. A 1bit-logs that only tested "can I mkdir" would have written the "persisted" log to RAM and
+    # reported success, which is why the mount point is part of the marker.
+    ("U3 boot logs", "grep -q ' /data ' /proc/mounts && echo data-is-mount; "
+                     "pgrep -f '1bit-logs daemon' > /dev/null && echo logs-daemon-running; "
+                     "ls -d /data/logs/*/ 2> /dev/null | tail -2; "
+                     "grep -q cmdline /data/logs/*/BOOT 2> /dev/null && "
+                     "grep -q ' /data ' /proc/mounts && pgrep -f '1bit-logs daemon' > /dev/null && "
                      "echo boot-logs-on-data", "boot-logs-on-data"),
+    # The same mechanism, by hand, in the guest: the daemon is pointed at a directory that is NOT a mount point
+    # (nothing may be written there - that is the RAM log), then a tmpfs is mounted over it late, which is /data
+    # arriving after 06onboard-logs ran. The log must appear without anything restarting the daemon.
+    ("U3 logs wait", "d=/tmp/logs-late; umount $d 2> /dev/null; rm -rf $d; mkdir -p $d; "
+                     "ONEBIT_LOG_DATA=$d 1bit-logs daemon > /tmp/logs-late.out 2>&1 & "
+                     "p=$!; sleep 4; pre=$(ls $d 2> /dev/null | wc -l); "
+                     "mount -t tmpfs none $d; mrc=$?; sleep 6; "
+                     "n=0; while [ $n -lt 6 ]; do [ -n \"$(find $d -name BOOT 2> /dev/null)\" ] && break; "
+                     "sleep 3; n=$((n + 1)); done; "
+                     "post=$(find $d -name BOOT 2> /dev/null | wc -l); "
+                     "mnt=$(grep -c \" $(readlink -f $d) \" /proc/mounts); "
+                     "alive=$(kill -0 $p 2> /dev/null && echo yes || echo no); "
+                     "kill $p 2> /dev/null; umount $d 2> /dev/null; "
+                     "echo \"logs-wait pre=$pre post=$post mount-rc=$mrc mount-lines=$mnt daemon-alive=$alive\"; "
+                     "head -3 /tmp/logs-late.out; "
+                     "[ \"$pre\" = 0 ] && [ \"$post\" -ge 1 ] && echo logs-wait-for-data", "logs-wait-for-data"),
     # Cycle 17 item 1: menu item 6 can never reset the machine - the guard is built and a reboot THROUGH it is
     # refused, which is the same call xwin's exit path makes (`exec reboot`) and the WM's shutdown menu makes.
     ("U2 desktop safe", "1bit-desktop --check | tail -3; 1bit-desktop --guard-test 2>&1 | tail -2",
@@ -600,6 +623,28 @@ rows = [
     ("U6 installer", "ls -l /usr/local/bin/1bit-install | tail -1; "
                      "ls /bin/1bit-install; sfdisk --version 2>&1 | head -1; "
                      "command -v efibootmgr mkfs.vfat mkfs.ext4; echo installer-present", "installer-present"),
+    # Cycle 21 (owner: "the stick moves to Linux 7.4-rc1"). What this row can say is what the ARTIFACT carries: its
+    # kernel release. BTF gets its OWN row below, because a row passes on ONE substring (`want in body`): with the BTF
+    # probe folded in here, a board with no /sys/kernel/btf/vmlinux still printed PASS as long as uname matched - the
+    # report-without-failing class this row exists to close (pi-prs' #989 verdict, 4 Nov).
+    ("U4 kernel",   "uname -r", "7.4.0-rc1-1bit"),
+    # BTF is a 7.4 fact worth a row because the 7.4 board boot showed it working (systemd attaches bpf-restrict-fs
+    # instead of logging "Failed to load BPF object"). -s, not ls: an empty file is not a BTF blob.
+    ("U4 btf",      "ls -l /sys/kernel/btf/vmlinux 2>&1 | awk '{print $5\" bytes\"}'; "
+                    "[ -s /sys/kernel/btf/vmlinux ] && echo btf-vmlinux-present", "btf-vmlinux-present"),
+    # OUR driver, never the in-tree one (owner word). The kernel ships an in-tree amdxdna as well, so presence proves
+    # nothing: the assertion is the RESOLVED PATH - depmod gives updates/ priority, and a renamed or dropped module
+    # would silently load the in-tree driver.
+    ("U4 our driver", "modinfo -n amdxdna; modinfo -F srcversion amdxdna; modinfo -n ec_su_axb35",
+                      "/updates/amdxdna.ko"),
+    # And the module has to be the one THIS kernel can load and this appliance trusts: vermagic must name the image's
+    # release and the signer must be our MOK. Both are asserted in one token, because one substring per row is all the
+    # harness compares - printing them and matching the path, as this row did before pi-prs' verdict, passed a module
+    # built for another kernel or signed by someone else.
+    ("U4 driver sig", "s=$(modinfo -F signer amdxdna); v=$(modinfo -F vermagic amdxdna | cut -d' ' -f1); "
+                      "echo signer=$s; echo vermagic=$v; "
+                      "[ \"$s\" = 'strixhalo Secure Boot Kernel' ] && [ \"$v\" = '7.4.0-rc1-1bit' ] && "
+                      "echo driver-signed-and-vermagic-ok", "driver-signed-and-vermagic-ok"),
     ("U3 log",       "tail -3 /var/log/lemond-onebit.log 2>&1", None),
     # BEFORE any in-VM fix runs: on an image that carries the fixes these two say so (root, and 1), on an
     # older image they say what is missing. The fix rows below then repair it so the login can still be
@@ -638,6 +683,19 @@ rows = [
     ("U4 hrx path",   "ls -l /opt/1bit-llama/llama-server 2>&1 | tail -1; "
                       "/opt/1bit-llama/llama-server --version 2>&1 | head -2", None),
     ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels", None),
+    # Cycle 23 (c22 board, 4 Nov): a chat that crosses ~512 positions wedged the NPU, and the fix is the hang
+    # detector's timeout in /etc/modprobe.d/amdxdna.conf. The build asserts the FILE; this row asserts kmod's own
+    # resolved view of it (`modprobe -c`), which is what the kernel will apply.
+    # It does NOT assert the loaded value, and that is measured, not convenience: in this harness `modprobe amdxdna`
+    # is refused `Key was rejected by service`, because sb-vars.sh enrolls ONE certificate in db (the one that signs
+    # the kernel, /var/lib/shim-signed/mok/MOK-Kernel.pem, SKI 27:68:3E:38:…) while the modules are signed by a
+    # DIFFERENT certificate with the same CN (sig_key 35:5C:A4:8A:…). The board trusts it - it loads this module - so
+    # the runtime reading belongs there: /sys/module/amdxdna/parameters/tdr_timeout_ms must be 15000 on the board.
+    ("U5 npu tdr",    "o=$(modprobe -c 2>/dev/null | grep -c 'amdxdna.*tdr_timeout_ms=15000'); "
+                      "c=$(grep -h 'tdr_timeout_ms=15000' /etc/modprobe.d/*.conf 2>/dev/null | grep -c amdxdna); "
+                      "echo kmod-view=$o conf-file=$c; modprobe amdxdna 2>&1 | head -1; "
+                      "echo runtime=$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms 2>/dev/null || echo not-loaded); "
+                      "[ \"$o\" -ge 1 ] && echo tdr-config-15000", "tdr-config-15000"),
     # U3 says "reachable on the LAN", so whether the appliance has an address at all is a row, not a
     # footnote: the cycle-2 image booted with no /data and answered nothing on the forwarded port, and
     # these two lines say whether that was the listener or the interface.
@@ -645,6 +703,15 @@ rows = [
     # row runs is a race, but an ACCEPT for tcp/13305 is what makes U3 reachable either way.
     ("U3 port rule", "iptables -C INPUT -p tcp --dport 13305 -j ACCEPT && echo port-13305-open; "
                      "iptables -C INPUT -p tcp --dport 22 -j ACCEPT && echo port-22-open", None),
+    # Cycle 23 (c22 board, 4 Nov): avahi logged "1bit-os.local is announced" and a raw mDNS query from ryzen got no
+    # answer at all. The cause is in the same rc.firewall the two rows above work around: every NEW inbound UDP
+    # packet goes to `udp_inbound`, which accepts only DHCP and RETURNs to the DROP policy, and a query on 5353 is
+    # UDP - while the announcements themselves left fine (`-A OUTPUT -p ALL -j ACCEPT`). The durable assertion is
+    # the rule, for the same reason as the ports above; whether the responder is up is read in the same row.
+    ("U3 mdns rule", "iptables -S INPUT | grep -E -- '-p udp.*--dport 5353.*-j ACCEPT' | head -2; "
+                     "iptables -C INPUT -p udp --dport 5353 -s 10.0.0.0/8 -j ACCEPT 2>/dev/null && echo udp-5353-open; "
+                     "pidof avahi-daemon > /dev/null && echo avahi-up; tail -1 /var/log/mdns.log 2>&1",
+                     "udp-5353-open"),
     ("net addr",     "ip -4 -o addr show 2>/dev/null | tr -s ' '", None),
     ("net route",    "ip -4 route 2>/dev/null | head -3", None),
 ]

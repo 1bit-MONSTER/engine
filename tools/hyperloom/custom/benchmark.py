@@ -162,7 +162,8 @@ def bench_args():
 
 
 def serve_batch_args():
-    """The batch levers `1bit serve` accepts.
+    """The arguments every serve leg carries: the batch levers `1bit serve` accepts, and the two
+    measurement conditions it has to be started with.
 
     `1bit serve` is a wrapper with its own argument parser: it takes `-fa` (forwarded to its
     llama-server child) but NOT `-b`/`-ub`/`-ctk`/`-ctv` -- it sets those itself per route, and it
@@ -173,8 +174,15 @@ def serve_batch_args():
     model's OWN context (262144 on Qwen3.8-27B = 16.1 GiB of KV), which only fits when the box
     happens to be idle -- under another lane's GTT the engine's fit check aborts the server and every
     candidate fails for a reason that has nothing to do with the lever under test. `HL_CTX` overrides.
+
+    `--placement-report` is the second one. It is what makes serve pass `-lv 4` to its llama-server,
+    and llama-server drops the library's INFO lines below that (`common/log.cpp`), so the report
+    `GGML_HRX_REPORT=2` asks ggml-hrx for never reached serve.log: `bench_summary.placement` was null
+    in every artifact this workload has ever written, and an unrecorded placement cannot be told
+    apart from a graph that left HRX (`docs/serve.md`, engine#390). It reports, it does not check:
+    serve's `--strict-device` is the one that refuses, and `GGML_HRX_STRICT=0` already opts out here.
     """
-    args = ["-c", str(serve_ctx())]
+    args = ["-c", str(serve_ctx()), "--placement-report"]
     if env("HL_FA"):
         args += ["-fa", env("HL_FA")]
     return args
@@ -230,7 +238,7 @@ def serve_lever_args():
     args = serve_batch_args()
     mtp_max_raw = env("HL_MTP_MAX")
     if dflash_on():
-        args += ["--dflash", env("HL_DFLASH_GGUF", "dflash.gguf")]
+        args += ["--dflash", dflash_gguf_arg()]
     elif mtp_max_raw:
         mtp_max = env_int("HL_MTP_MAX", 0)
         if mtp_max <= 0:
@@ -243,6 +251,38 @@ def serve_lever_args():
     if parallel:
         args += ["--parallel", str(parallel)]
     return args
+
+
+def dflash_gguf_arg():
+    """The drafter path handed to `--dflash`. One definition, so the report cannot name another."""
+    return env("HL_DFLASH_GGUF", "dflash.gguf")
+
+
+def drafting_identity():
+    """Name the drafting files the serve leg actually used, as resolved paths with hashes.
+
+    Same class as ``build_identity``/``device_stack``, and the gap the tuner itself points at: it
+    *drops* a drafter-quant variant because overwriting `HL_DFLASH_GGUF` "would make its number
+    incomparable to the baseline" (`run-26030.log`, 2026-10-30 18:14), and this model has two drafter
+    quants on the box (`~/models/qwen38/DFlash2/{q8_0,q4k}.gguf`), yet a result echoed `HL_DFLASH`
+    alone -- so `{"HL_DFLASH": "1"}`, the arm that produced the 50.87 best of record, names no
+    drafter at all. `--dflash` is handed a *relative* path by default, so the run's cwd decided it
+    too: the path here is resolved, and `env` says whether it came from the environment or the
+    default rather than leaving the default unnamed.
+    """
+    ident = {}
+    if dflash_on():
+        raw = dflash_gguf_arg()
+        path = pathlib.Path(raw).expanduser().resolve()
+        ident["dflash"] = {"env": "HL_DFLASH_GGUF" if env("HL_DFLASH_GGUF") else "default",
+                          "path": str(path),
+                          "sha256": sha256_head(path) if path.is_file() else None}
+    external_head = env("HL_MTP_HEAD")
+    if external_head and not dflash_on():
+        path = pathlib.Path(external_head).expanduser().resolve()
+        ident["mtp_head"] = {"env": "HL_MTP_HEAD", "path": str(path),
+                            "sha256": sha256_head(path) if path.is_file() else None}
+    return ident
 
 
 def build_identity(onebit, bin_dir):
@@ -260,6 +300,21 @@ def build_identity(onebit, bin_dir):
         "bin_dir": str(bin_dir),
         "sha256": sha256_head(onebit),
     }
+
+
+def model_identity(model):
+    """Name the model file, with the fingerprint the quality gate itself compares against.
+
+    Same class as ``build_identity`` and ``device_stack``, one level closer to the number: the gate's
+    references are per box in ``HL_STATE`` and are keyed by this fingerprint (``ref.json``'s ``model``), so
+    a report that names the model only by file name cannot say which file its score and its KLD verdict
+    belong to. That case is not hypothetical here: the weights were re-downloaded after a restore while
+    the gate references survived, i.e. the same file name on this box can be a different file.
+    ``sha256_head`` is the gate's own notion of model identity (header + first tensors, not 17 GB), so a
+    result and a reference can be checked against each other by hash rather than by name.
+    """
+    model = pathlib.Path(model)
+    return {"path": str(model), "sha256": sha256_head(model)}
 
 
 def device_stack():
@@ -312,6 +367,19 @@ def run(cmd, name, timeout, out_dir):
     (out_dir / f"{name}.log").write_text(text, encoding="utf-8", errors="replace")
     log(f"{name}: rc={rc} in {time.time() - start:.1f} s -> {out_dir / (name + '.log')}")
     return rc, text
+
+
+def log_dir_for(out_dir, name):
+    """The directory one measurement's raw logs go in.
+
+    They used to share fixed names with the result directory itself, so a second measurement in the same
+    RESULT_DIR silently overwrote the first one's serve.log / llama-bench.log / kld.log: measured on
+    2026-11-02, the 19:01 arm destroyed the 18:45 baseline's raw logs, and a pair's two halves (A, B) would
+    have collided the same way. One directory per RESULT_FILENAME makes the raw evidence survive the run.
+    """
+    log_dir = out_dir / f"logs-{name}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
 
 
 def bench_csv(text):
@@ -381,24 +449,24 @@ def long_prompt(n_tokens):
     return LONG_PROMPT_UNIT * max(1, int(n_tokens * LONG_CHARS_PER_TOKEN / len(LONG_PROMPT_UNIT)) + 1)
 
 
-def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir, longctx=0, longtok=128):
+def serve_measure(onebit, model, args, reps, tokens, timeout, log_dir, longctx=0, longtok=128):
     """Start `1bit serve` once, run the three prompts (+ the long-context leg), return the numbers."""
     port = free_port()
     cmd = [onebit, "serve", "-m", str(model), "--port", str(port)] + args
     # GGML_HRX_STRICT=0: on this pin the MTP draft graph has one node (the head's PAD) off HRX, and
     # strict placement aborts the server on it -- the engine's own hardware gate runs its server the
     # same way (scripts/hw-gate.sh), counting placement instead of aborting. GGML_HRX_REPORT=2 asks
-    # ggml-hrx for the counts; `1bit serve` exposes no `-lv` passthrough, so they only surface when
-    # its own verbosity reaches the library's INFO level, and `placement` stays null otherwise.
+    # ggml-hrx for every graph's counts; `serve_batch_args` carries `--placement-report`, which is
+    # what lifts llama-server's verbosity enough for those lines to reach the log at all.
     run_env = dict(os.environ, GGML_HRX_STRICT="0", GGML_HRX_REPORT="2")
-    logtext = (out_dir / "serve.log").open("w", encoding="utf-8")
+    logtext = (log_dir / "serve.log").open("w", encoding="utf-8")
     proc = subprocess.Popen(cmd, env=run_env, stdout=logtext, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL)
     tps, texts = {}, {}
     long_info = {}
     try:
         if not wait_healthy(port, proc, time.time() + timeout / 2):
-            raise RuntimeError(f"`1bit serve` did not become healthy (see {out_dir / 'serve.log'})")
+            raise RuntimeError(f"`1bit serve` did not become healthy (see {log_dir / 'serve.log'})")
         ask(port, "hi", 4, timeout)  # warm-up: pays the first-token compile, not the measurement
         for name, prompt in DECODE_PROMPTS.items():
             samples = []
@@ -424,7 +492,7 @@ def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir, longctx=0
             proc.kill()
             proc.wait()
         logtext.close()
-    return tps, texts, placement_summary(out_dir / "serve.log"), long_info
+    return tps, texts, placement_summary(log_dir / "serve.log"), long_info
 
 
 PLACEMENT_RE = re.compile(r"placement: (\d+) nodes, (\d+) off HRX")
@@ -460,13 +528,13 @@ def gate_reference(ref, base_kld, texts_path):
             "base_kld_sha256": sha256_head(base_kld), "texts_sha256": sha256_head(texts_path)}
 
 
-def kld(ppl, model, args, base, wiki, timeout, out_dir):
+def kld(ppl, model, args, base, wiki, timeout, log_dir):
     """Prefill-path KLD against the stored base logits; records the base when it is missing."""
     cmd = [ppl, "-m", str(model), "-f", str(wiki), "-c", "512", "--chunks", "8",
            "--device", "HRX0", "-ngl", "99"] + (args or ["-b", "512", "-ub", "512"])
     recording = not base.is_file()
     cmd += ["--kl-divergence-base", str(base)] + ([] if recording else ["--kl-divergence"])
-    rc, text = run(cmd, "kld-record" if recording else "kld", timeout, out_dir)
+    rc, text = run(cmd, "kld-record" if recording else "kld", timeout, log_dir)
     if recording:
         return {"recorded": rc == 0 and base.is_file(), "mean": None}
     match = KLD_MEAN_RE.search(text)
@@ -491,6 +559,7 @@ def main():
     out_dir = pathlib.Path(env("RESULT_DIR") or ".").expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     name = env("RESULT_FILENAME") or "inferencex_result"
+    log_dir = log_dir_for(out_dir, name)
     model = model_file()
 
     # Out-of-tree build (README.md): `1bit` at the build root, the HRX llama.cpp tools built by
@@ -515,6 +584,7 @@ def main():
     longtok = env_int("HL_LONGTOK", 128)
     deadline = time.time() + env_int("HL_BUDGET_SEC", 780 if not longctx else 1200)
 
+    model_ident = model_identity(model)
     log(f"model={model} bin={bin_dir} state={state}")
     log(f"device={device_stack()}")
     log(f"levers={levers() or '{}'}")
@@ -531,8 +601,11 @@ def main():
         "total_output_tokens": tokens,
         "quality_gate": {"passed": False, "reason": "not run"},
         "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
+                          "model": model_ident,
                           "build": build_identity(onebit, bin_dir),
-                          "device_stack": device_stack()},
+                          "device_stack": device_stack(),
+                          "drafting": drafting_identity(),
+                          "llama_bench_reps": reps},
     }
 
     def finish(passed, reason, rc=0):
@@ -548,7 +621,7 @@ def main():
     # 1. llama-bench: prefill and decode throughput from one model load.
     rc, text = run([str(bench), "-m", str(model), "-dev", "HRX0"] + bench_args()
                    + ["-p", "512", "-n", "128", "-r", str(reps), "-o", "csv"],
-                   "llama-bench", min(600, deadline - time.time()), out_dir)
+                   "llama-bench", min(600, deadline - time.time()), log_dir)
     rows = bench_csv(text)
     pp512, tg128 = rows.get((512, 0)), rows.get((0, 128))
     if rc != 0 or not pp512 or not tg128:
@@ -559,7 +632,7 @@ def main():
     try:
         tps, texts, placement, long_info = serve_measure(
             onebit, model, serve_lever_args(), reps, tokens,
-            min(1200 if longctx else 600, deadline - time.time()), out_dir,
+            min(1200 if longctx else 600, deadline - time.time()), log_dir,
             longctx=longctx, longtok=longtok)
     except (RuntimeError, OSError) as exc:
         return finish(False, f"serve leg failed: {exc}", rc=1)
@@ -575,7 +648,7 @@ def main():
     result["request_throughput"] = round(result["total_token_throughput"] / tokens, 4)
 
     # 3. the gate: reference halves are recorded on the first (baseline) measurement only.
-    fingerprint = sha256_head(model)
+    fingerprint = model_ident["sha256"]
     ref = {}
     if ref_path.is_file():
         try:
@@ -593,7 +666,7 @@ def main():
             ref_texts = {}
     establishing = not ref or not ref_texts or not base_kld.is_file()
 
-    kld_stat = kld(ppl, model, bench_args(), base_kld, wiki, min(900, deadline - time.time()), out_dir)
+    kld_stat = kld(ppl, model, bench_args(), base_kld, wiki, min(900, deadline - time.time()), log_dir)
     result["quality_gate"].update({"kld_max_mean": kld_max, "kld_mean": kld_stat["mean"],
                                    "kld_recorded": kld_stat["recorded"]})
     if establishing and kld_stat["recorded"] and kld_stat["mean"] is None:

@@ -79,6 +79,21 @@ def main():
     texts["prose"] = "B"
     assert [k for k in bench.gated_text_keys(ref_texts) if texts.get(k) != ref_texts[k]] == ["prose"]
 
+    # Raw logs are kept per measurement. They used to be fixed names inside RESULT_DIR, so a second
+    # measurement in the same RESULT_DIR overwrote the first one's serve.log / llama-bench.log — measured
+    # on 2026-11-02, the 19:01 arm destroyed the 18:45 baseline's raw logs, and a pair's A and B halves
+    # would have collided the same way. This is that reproducer: two measurement names, one RESULT_DIR.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        root = pathlib.Path(td)
+        for fname, payload in (("arm-A", "FIRST"), ("arm-B", "SECOND")):
+            bench.run(["sh", "-c", f"echo {payload}"], "llama-bench", 10, bench.log_dir_for(root, fname))
+        assert (root / "logs-arm-A/llama-bench.log").read_text().strip() == "FIRST"
+        assert (root / "logs-arm-B/llama-bench.log").read_text().strip() == "SECOND"
+        # A repeat of the same measurement overwrites only itself, and the result file is untouched by it.
+        assert bench.log_dir_for(root, "arm-A") == root / "logs-arm-A"
+
     # Box rule 2026-11-01 12:13: the drafter at long context is the arm that faulted this box, so a
     # candidate that asks for both must be refused (scores zero) and not load a drafter.
     import os
@@ -149,6 +164,85 @@ def main():
         # A different base of the same name is a different reference, which is the point.
         base.write_bytes(b"logits " * 999)
         assert bench.gate_reference({}, base, texts)["base_kld_sha256"] != ident["base_kld_sha256"]
+
+    # And it has to name what *drafted*: `--dflash` is handed `HL_DFLASH_GGUF` (relative default
+    # `dflash.gguf`, so the run's cwd decided it too) and this model has two drafter quants on the box,
+    # so `{"HL_DFLASH": "1"}` -- the arm that produced the 50.87 best of record -- is not a
+    # configuration. The tuner drops a drafter-quant variant because overwriting that env "would make
+    # its number incomparable to the baseline"; the result JSON never recorded it at all.
+    with tempfile.TemporaryDirectory() as tmp:
+        drafter = pathlib.Path(tmp) / "q4k.gguf"
+        drafter.write_bytes(b"GGUF not really a drafter\n")
+        os.environ["HL_DFLASH"], os.environ["HL_DFLASH_GGUF"] = "1", str(drafter)
+        ident = bench.drafting_identity()
+        assert ident["dflash"]["path"] == str(drafter), ident
+        assert ident["dflash"]["sha256"] == hashlib.sha256(drafter.read_bytes()).hexdigest(), ident
+        assert ident["dflash"]["env"] == "HL_DFLASH_GGUF", ident
+        assert bench.dflash_gguf_arg() == str(drafter)          # the value serve is really handed
+        # Same lever, other file: a different configuration, and the report says which one.
+        other = pathlib.Path(tmp) / "q8_0.gguf"
+        other.write_bytes(b"GGUF another drafter\n")
+        os.environ["HL_DFLASH_GGUF"] = str(other)
+        assert bench.drafting_identity()["dflash"]["path"] == str(other)
+        assert bench.drafting_identity()["dflash"]["sha256"] == \
+            hashlib.sha256(other.read_bytes()).hexdigest()
+        # Unset: the default is resolved and marked as the default, not left unnamed...
+        os.environ.pop("HL_DFLASH_GGUF")
+        assert bench.dflash_gguf_arg() == "dflash.gguf"
+        ident = bench.drafting_identity()
+        assert ident["dflash"]["env"] == "default", ident
+        assert pathlib.Path(ident["dflash"]["path"]).is_absolute(), ident
+        # ...and an absent file is a null hash, not a guess.
+        assert ident["dflash"]["sha256"] is None, ident
+        # Drafting off is an empty map: no claim about a drafter that never ran.
+        os.environ["HL_DFLASH"] = "0"
+        assert bench.drafting_identity() == {}, bench.drafting_identity()
+        # An external MTP head is the same class of input, and is reported when it is the one in use.
+        os.environ.pop("HL_DFLASH")
+        os.environ["HL_MTP_HEAD"], os.environ["HL_MTP_MAX"] = str(drafter), "6"
+        ident = bench.drafting_identity()
+        assert ident["mtp_head"]["sha256"] == hashlib.sha256(drafter.read_bytes()).hexdigest(), ident
+        assert ident["mtp_head"]["env"] == "HL_MTP_HEAD", ident
+    for k in ("HL_DFLASH", "HL_DFLASH_GGUF", "HL_MTP_HEAD", "HL_MTP_MAX"):
+        os.environ.pop(k, None)
+
+    # The artifact has to say whether the graph stayed on HRX, and for a year of runs it could not: the
+    # report the parser reads only reaches serve.log when serve lifts llama-server's verbosity, so
+    # `placement` was null in 147 of 147 artifacts on this box while no serve.log carried the line.
+    # `--placement-report` is that lift; the parser is checked against the engine's own documented
+    # line (docs/serve.md, tests/hrx_placement_test.cpp), and a log without it stays None, not 0.
+    assert "--placement-report" in bench.serve_batch_args(), bench.serve_batch_args()
+    with tempfile.TemporaryDirectory() as tmp:
+        clean = pathlib.Path(tmp) / "clean.log"
+        clean.write_text("placement_observer: placement: 512 nodes, 0 off HRX (none), 1 graph splits\n",
+                         encoding="utf-8")
+        assert bench.placement_summary(clean) == {"graphs_reported": 1, "nodes": 512, "off_hrx": 0,
+                                                 "worst_graph_off_hrx": 0}, bench.placement_summary(clean)
+        worst = pathlib.Path(tmp) / "worst.log"
+        worst.write_text(
+            "placement_observer: placement: 512 nodes, 0 off HRX (none), 1 graph splits\n"
+            "placement_observer: placement: 354 nodes, 20 off HRX (MUL_MAT x 20), 5 graph splits\n",
+            encoding="utf-8")
+        got = bench.placement_summary(worst)
+        assert got["graphs_reported"] == 2 and got["off_hrx"] == 20, got
+        assert got["worst_graph_off_hrx"] == 20, got
+        silent = pathlib.Path(tmp) / "silent.log"
+        silent.write_text("I slot print_timing: id 0 | task 1 | eval time\n", encoding="utf-8")
+        assert bench.placement_summary(silent) is None, bench.placement_summary(silent)
+    # The artifact has to name the *model file* too, and by the hash its own gate keys on: the references
+    # in HL_STATE are per box and a changed file silently drops them, so before this a report could not say
+    # which file its score and its KLD verdict belonged to (all 150 result JSONs on this box name the model
+    # only by file name, inside a hardcoded `model_id` string).
+    with tempfile.TemporaryDirectory() as tmp:
+        model = pathlib.Path(tmp) / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+        model.write_bytes(b"GGUF" + b"\0" * 4096)
+        ident = bench.model_identity(model)
+        assert ident["path"] == str(model), ident
+        assert ident["sha256"] == bench.sha256_head(model), ident
+        assert ident["sha256"] == hashlib.sha256(model.read_bytes()).hexdigest(), ident
+        # A different file under the same name is a different model, which is the point.
+        model.write_bytes(b"GGUF" + b"\0" * 4095)
+        assert bench.model_identity(model)["sha256"] != ident["sha256"]
 
     print("hyperloom_benchmark_test: OK")
     return 0

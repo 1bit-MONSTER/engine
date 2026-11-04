@@ -210,7 +210,9 @@ int64_t group_bytes(int64_t k, int rows);
 // `bf16_bits_of()`; the default is bf16 1e-6, which is what the Qwen family declares.
 struct FconstGeom {
     int64_t stride = 0;   // bytes per layer block
-    int64_t h1 = 0;       // offset of the second (post-attention) header within a block
+    int64_t h1 = 0;       // offset of the block's SECOND header (the post-attention one only when a block
+                          // carries two; on a 4-header block it opens the k_norm section -- use
+                          // post_attn_hdr() for the post-attention norm and the MLP section)
     int period = 0;       // headers per block
     int blocks = 0;       // block starts seen
     // Every in-block header offset after the block's first (so hdr[0] == h1), relative to the block
@@ -218,6 +220,12 @@ struct FconstGeom {
     // one payload) and 3 on the Qwen3 packs (q/k/v, then one per-head QK norm each, then o_proj), so
     // which layout a pack uses is measured from the pack rather than guessed from a version.
     std::vector<int64_t> hdr;
+    // Where the block's post-attention section starts: `h1` on a 2-header block (Qwen2.5/Llama), the LAST
+    // header on a 4-header block (Qwen3, where the second and third open the per-head QK norms). Both the
+    // post_attention_layernorm weight and the first byte of the MLP section are read from here, so this is
+    // the one rule the two readers share -- reading `h1` unconditionally imported the k_norm section's
+    // padding as post_attention_layernorm on every Qwen3 pack (engine#1003).
+    int64_t post_attn_hdr() const { return hdr.empty() ? h1 : hdr.back(); }
     std::string why;      // non-empty when the geometry could not be established
 };
 unsigned short bf16_bits_of(float v);

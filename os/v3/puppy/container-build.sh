@@ -316,6 +316,9 @@ if [ -n "${PAYLOAD:-}" ]; then
     # lost to it ("cannot move ... Directory not empty"). 1bit-lemonade-webapp copies the file into the
     # application directory before the browser creates its profile.
     install -D -m 644 /recipe/embed/etc/1bit/palemoon-prefs.js "$skeleton/etc/1bit/palemoon-prefs.js"
+    # Cycle 23: the NPU's hang-detector timeout goes in the image, because the stock default resets the device
+    # under a chat that crosses ~512 positions (c22 board, 4 Nov; the file's own header carries the numbers).
+    install -D -m 644 /recipe/embed/etc/modprobe.d/amdxdna.conf "$skeleton/etc/modprobe.d/amdxdna.conf"
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-lemonade-webapp "$skeleton/usr/local/bin/1bit-lemonade-webapp"
     install -D -m 755 /recipe/embed/etc/init.d/24onboard-webapp "$skeleton/etc/init.d/24onboard-webapp"
     # item 10: the responder that makes http://1bit-os.local:13305 work from another machine (cycle 21, owner).
@@ -551,6 +554,34 @@ done
 hn=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/hostname 2>/dev/null | head -1)
 [ "$hn" = 1bit-os ] || { echo "build: REFUSED: the packed hostname is '${hn:-<none>}' (board row reads 1bit-os)" >&2; exit 1; }
 echo "   ok: dialog + hostname 1bit-os + the quiet-boot modprobe file are in the image"
+# Cycle 23: the TDR timeout has to be in the PACKED image - and no other packed kmod config may contradict it.
+# kmod merges every file in /etc/modprobe.d and a later `options` line wins, so a stale copy silently shadows the
+# installed one (the strixhalo lesson, and the reason the board row reads the RUNNING module's parameter).
+packed_tdr=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/modprobe.d/amdxdna.conf 2> /dev/null)
+case "$packed_tdr" in
+    *"options amdxdna tdr_timeout_ms=15000"*) ;;
+    *) echo "build: REFUSED: the packed image has no 'options amdxdna tdr_timeout_ms=15000' in" >&2
+       echo "       /etc/modprobe.d/amdxdna.conf - a long NPU chat would reset the device mid-answer (c22 board)" >&2
+       exit 1 ;;
+esac
+# every other packed modprobe.d file that names amdxdna, across every SFS, must carry the same value. Collected
+# into a file first: a `... | while read` loop runs in a subshell, where an exit only ends the loop.
+: > /tmp/1bit-tdr-shadow
+grep -E 'modprobe\.d/[^/]*amdxdna[^/]*$' /tmp/1bit-sfs-listing | while read -r entry; do
+    case "$entry" in */etc/modprobe.d/amdxdna.conf) continue ;; esac
+    sfs=${entry%%/*}; rel=${entry#*/}
+    body=$(unsquashfs -cat "sandbox3/build/$sfs" "$rel" 2> /dev/null) || continue
+    case "$body" in
+        *amdxdna*tdr_timeout_ms=15000*) ;;
+        *amdxdna*) printf '%s\n' "   $entry" >> /tmp/1bit-tdr-shadow ;;
+    esac
+done
+if [ -s /tmp/1bit-tdr-shadow ]; then
+    echo "build: REFUSED: these packed files also configure amdxdna and would shadow the 15000 ms TDR timeout:" >&2
+    cat /tmp/1bit-tdr-shadow >&2
+    exit 1
+fi
+echo "   ok: tdr_timeout_ms=15000 for amdxdna is in the packed image, with no shadowing kmod config"
 if [ -n "${PAYLOAD:-}" ]; then
     in_image usr/local/bin/1bit-console-menu || {
         echo "build: REFUSED: the image has no /usr/local/bin/1bit-console-menu - tty1 would respawn nothing" >&2; exit 1; }
@@ -575,6 +606,20 @@ if [ -n "${PAYLOAD:-}" ]; then
     fi
     echo "   ok: the console menu is in the image and executable (tty1's whole surface on a headless boot)"
 fi
+# Cycle 22 (TOS3-NOTE-c21-logs): the boot's log capture has to survive /data mounting AFTER the service started.
+# Both spellings that lost four of five boots' logs are refused by name, because each one fails silently: the
+# one-shot "is /data mounted?" guard in the service (nothing re-ran the test), and a 1bit-logs whose dir() only
+# tested "can I mkdir" ($DATA is a directory even when nothing is mounted on it, so the log went to RAM and
+# reported success).
+packed_logsvc=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/init.d/06onboard-logs 2> /dev/null || true)
+packed_logs=$(unsquashfs -cat sandbox3/build/puppy_*.sfs usr/local/bin/1bit-logs 2> /dev/null || true)
+case $packed_logsvc in *"this boot's logs stay in RAM"*)
+    echo "build: REFUSED: the packed 06onboard-logs gives up when /data is not mounted yet, so those boots keep no log" >&2
+    exit 1;; esac
+printf '%s\n' "$packed_logs" | grep -q '^mounted() ' || {
+    echo "build: REFUSED: the packed 1bit-logs has no mount-point test, so it would log to RAM when /data is not mounted" >&2
+    exit 1; }
+echo "   ok: the boot's log capture waits for /data (1bit-logs carries the mount-point test)"
 modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=" || true)
 [ "$modconf" = "ADDLIST=ec_su_axb35" ] || {
     echo "build: REFUSED: the image would not load the EC driver at boot (ADDLIST is $modconf)" >&2; exit 1; }

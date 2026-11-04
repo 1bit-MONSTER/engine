@@ -13,13 +13,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What the screen looks like. Two layouts, chosen by width, over ONE set of facts:
+//! What the screen looks like. Top to bottom, as the owner asked on cycle 20 ("can we place the menu above the
+//! scrolling logs and below the technical information"), in this order and nothing between:
 //!
-//!   * 240x67 (the appliance's tty1 on a monitor) - the CONNECT block, then six panels in a 3x2 grid, then the
-//!     log pane, then the nine actions.
-//!   * 80x25 (a serial/VGA default console, and what the QEMU rows read) - the same block, the same panels one
-//!     line each, a shorter log pane, and the SAME action labels: the c15 acceptance row looks for
-//!     "Show the API key" and "Reboot / power off" on tty1, so they are never abbreviated.
+//!   header | CONNECT | the status facts | MENU (nine numbered rows) | LOGS (scrolling) | one footer line
+//!
+//! The status facts are the only part that changes shape with the screen:
+//!
+//!   * 240x67 (the appliance's tty1 on a monitor) - six panels in a 3x2 grid (LEMONADE / GPU / NPU, then
+//!     MODELS / FANS+TEMPS / DATA).
+//!   * 80x25 (a serial/VGA default console, and what the QEMU rows read) - the same six facts, and their short
+//!     forms, on ONE line, because nine menu rows plus that line is what leaves the log pane its three rows.
+//!
+//! The MENU is always on screen at both sizes: the c15 acceptance row looks for "Show the API key" and
+//! "Reboot / power off" on tty1, and the owner's complaint was a menu you had to scroll the log off to read.
 //!
 //! Colours are the 16-colour VT palette by name only (no RGB: a bare Linux console has no truecolour) and no
 //! glyph outside what every console font has - titles are ASCII rules, so a VGA text mode with a plain code page
@@ -219,22 +226,36 @@ pub fn connect_block(f: &Facts, spin: &str, width: usize) -> Vec<Line<'static>> 
         let avail = width.saturating_sub(indent).max(8);
         // a row that fits is emitted VERBATIM: its two spaces are part of what the gate greps for (`api  http://`),
         // and wrap_words normalises runs of spaces by design
-        let pieces = if value.chars().count() <= avail { vec![value.clone()] } else { wrap_words(&value, avail) };
+        let pieces = if value.chars().count() <= avail {
+            vec![value.clone()]
+        } else {
+            wrap_words(&value, avail)
+        };
         for (i, w) in pieces.into_iter().enumerate() {
             if i == 0 {
                 out.push(Line::from(vec![
                     Span::styled(IND, Style::default().fg(Color::Cyan)),
-                    Span::styled(w, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        w,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]));
             } else {
-                out.push(Line::from(vec![Span::raw(" ".repeat(indent)), Span::styled(w, style)]));
+                out.push(Line::from(vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(w, style),
+                ]));
             }
         }
     }
 
     if f.ips.is_empty() {
         out.push(Line::from(Span::styled(
-            format!("{IND}no address yet - press 3 (Network); DHCP is automatic once a cable is in"),
+            format!(
+                "{IND}no address yet - press 3 (Network); DHCP is automatic once a cable is in"
+            ),
             Style::default().fg(Color::Yellow),
         )));
     } else if !f.lemond_listening {
@@ -369,29 +390,30 @@ pub fn panels(f: &Facts) -> Vec<(&'static str, Vec<String>)> {
     p
 }
 
-/// The nine actions, never abbreviated, packed whole into as few rows as the width allows.
-pub fn action_lines(width: usize) -> Vec<String> {
+/// The nine actions, numbered, one row each (the owner's MENU block). Never abbreviated: the labels are what the
+/// gates and the owner's own fingers know.
+///
+/// Item 1 is the SAME string in both key modes on purpose. pi-prs on #935: the appliance ships blank (cycle-20 item
+/// 7), and `vm-check.sh:417` greps `Show the API key` off tty1, so a mode-dependent label turns `U2 menu` (and
+/// pi-release's c15 menugate) red on every shipped image. The blank-key offer belongs where the item-7 work puts it
+/// - the CONNECT block and item 1's own dialog, on `os/v3-c20` - not in the label the gates know.
+pub fn menu_lines() -> Vec<String> {
+    ACTIONS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| format!("{} {label}", i + 1))
+        .collect()
+}
+
+/// The same rows as drawn: wrapped (never clipped) with a continuation indent, should the screen be narrower
+/// than the longest label.
+pub fn menu_rows(width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let mut cur = String::new();
-    for (i, label) in ACTIONS.iter().enumerate() {
-        let item = format!("{} {label}", i + 1);
-        let add = if cur.is_empty() {
-            item.chars().count()
-        } else {
-            item.chars().count() + 3
-        };
-        if cur.chars().count() + add > width && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-            cur = item;
-        } else {
-            if !cur.is_empty() {
-                cur.push_str("   ");
-            }
-            cur.push_str(&item);
+    for row in menu_lines() {
+        for (i, part) in wrap_words(&row, width).into_iter().enumerate() {
+            let text = if i == 0 { part } else { format!("  {part}") };
+            out.push(styled(text, Some(Color::Cyan), i == 0));
         }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
     }
     out
 }
@@ -517,19 +539,111 @@ fn panel_grid(f: &Facts, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-fn panel_compact(f: &Facts, width: usize) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    for (title, values) in panels(f) {
-        let text = format!("{title}  {}", values.join("  "));
-        for (i, l) in wrap_words(&text, width).into_iter().enumerate() {
+/// The six panels as ONE line for a text console, because 80x25 has to hold header + CONNECT + this + nine menu
+/// rows + three log rows, and the nine rows are the owner's. Each field is the shortest TRUE form of the same
+/// fact the panel shows at 240x67, never a truncated field: `wrap_words` breaks the line if the screen is narrower
+/// than the whole thing.
+fn compact_status(f: &Facts, width: usize) -> Vec<Line<'static>> {
+    let mut fields: Vec<String> = Vec::new();
+
+    fields.push(match (f.lemond_pid, f.lemond_listening) {
+        (Some(pid), true) => format!("LEMONADE up {pid}"),
+        (Some(pid), false) => format!("LEMONADE pid {pid} no answer"),
+        (None, _) => "LEMONADE DOWN".to_string(),
+    });
+
+    let g = &f.gpu;
+    fields.push(match (&g.device, g.temp_c) {
+        (Some(d), Some(t)) => format!("GPU {} {t}C", short_device(d)),
+        (Some(d), None) => format!("GPU {}", short_device(d)),
+        (None, _) => "GPU no HRX device".to_string(),
+    });
+
+    let n = &f.npu;
+    fields.push(
+        match (&n.device, n.module) {
+            (Some(_), true) if n.busy => "NPU busy",
+            (Some(_), true) => "NPU idle",
+            (_, false) => "NPU amdxdna absent",
+            _ => "NPU no accel node",
+        }
+        .to_string(),
+    );
+
+    fields.push(match f.models.downloaded.len() {
+        0 => "MODELS none".to_string(),
+        n => format!("MODELS {n}"),
+    });
+    fields.push(fans_word(f));
+    fields.push(match f.data {
+        Some((_, free)) => format!("DATA {} free", human_bytes(free)),
+        None => "DATA not mounted".to_string(),
+    });
+    if let Some(t) = f.stats.tps {
+        fields.push(format!("{t:.0} tok/s"));
+    }
+
+    let text = pack_fields(&fields, width);
+    text.into_iter()
+        .enumerate()
+        .map(|(i, l)| {
             if i == 0 {
-                out.push(styled(l, Some(Color::Gray), false));
+                styled(l, Some(Color::Gray), false)
             } else {
-                out.push(styled(format!("  {l}"), Some(Color::DarkGray), false));
+                styled(format!("  {l}"), Some(Color::DarkGray), false)
             }
+        })
+        .collect()
+}
+
+/// Pack `A | B | C` into as few rows as the width allows WITHOUT splitting a field: at 80 columns the six facts
+/// come out as two rows, and `DATA` never ends up alone at the end of the first one. A field wider than the whole
+/// screen (a long device name on a 40-column serial line) is wrapped by itself rather than cut.
+fn pack_fields(fields: &[String], width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for field in fields {
+        if cur.is_empty() {
+            cur = field.clone();
+        } else if cur.chars().count() + 3 + field.chars().count() <= width {
+            cur.push_str(" | ");
+            cur.push_str(field);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur = field.clone();
+        }
+        if cur.chars().count() > width {
+            let mut parts = wrap_words(&cur, width).into_iter();
+            if let Some(first) = parts.next() {
+                out.push(first);
+            }
+            out.extend(parts.map(|p| format!("  {p}")));
+            cur.clear();
         }
     }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
     out
+}
+
+/// `HRX0: AMD Radeon 8060S Graphics` -> `HRX0`: the colons separate the runtime's node from the marketing name.
+fn short_device(d: &str) -> &str {
+    d.split(':').next().unwrap_or(d).trim()
+}
+
+/// `fans: controlled (fan1 0 rpm fan2 0 rpm)` -> `FANS controlled`.
+// shortcut: the probe's "fans: <state> (fanN rpm)" shape; a different shape says "?" instead of a guess -
+// upgrade if the ec_su_axb35 probe's wording changes.
+fn fans_word(f: &Facts) -> String {
+    if f.fans.is_empty() {
+        return "FANS not readable".to_string();
+    }
+    let state = f.fans.split_once(':').map(|(_, r)| r).unwrap_or(&f.fans);
+    match state.split('(').next().unwrap_or("").trim() {
+        "" => "FANS ?".to_string(),
+        word => format!("FANS {word}"),
+    }
 }
 
 fn modal_box(m: &Modal) -> (String, Vec<String>, String) {
@@ -576,23 +690,22 @@ pub fn draw(f: &mut Frame, a: &App) {
     let h = area.height as usize;
     let wide = w >= 100;
 
-    let body: Vec<Line<'static>> = if a.full_logs {
-        let inner = h.saturating_sub(2);
-        let mut v = vec![log_title(a, w, true)];
-        v.extend(log_lines(a, inner, w));
-        v
-    } else {
-        let mut v = vec![header(&a.facts)];
-        v.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
-        v.extend(if wide {
-            panel_grid(&a.facts, w)
+    // header, CONNECT, then the status facts - the "technical information" the owner wants the menu below
+    let mut top: Vec<Line<'static>> = Vec::new();
+    let mut menu: Vec<Line<'static>> = Vec::new();
+    if !a.full_logs {
+        top.push(header(&a.facts));
+        top.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
+        if wide {
+            top.extend(panel_grid(&a.facts, w));
         } else {
-            panel_compact(&a.facts, w)
-        });
-        v
-    };
+            top.extend(compact_status(&a.facts, w));
+        }
+        // the MENU sits between the facts and the log, always whole, one numbered row per action
+        menu.push(rule("MENU", w));
+        menu.extend(menu_rows(w));
+    }
 
-    let actions = action_lines(w);
     let mut footer: Vec<String> = vec![if a.full_logs {
         "q back   arrows scroll   f newest   r refresh   1-9 actions".to_string()
     } else {
@@ -608,37 +721,37 @@ pub fn draw(f: &mut Frame, a: &App) {
         .map(|s| styled(s, Some(Color::DarkGray), false))
         .collect();
 
-    // the log pane gets what is left, which is the only flexible row
-    let fixed = body.len() + if a.full_logs { 0 } else { actions.len() } + footer.len();
-    let log_h = h.saturating_sub(fixed).max(1);
+    // the log pane is the only flexible row: it gets what the fixed rows leave, and the pane's own title is the
+    // first of its rows (counting it twice left the last console row blank at 80x25 - measured)
+    let log_h = h
+        .saturating_sub(top.len() + menu.len() + footer.len())
+        .max(1);
+    let mut logs = vec![log_title(a, w, a.full_logs)];
+    logs.extend(log_lines(a, log_h.saturating_sub(1), w));
 
     let mut constraints: Vec<Constraint> = Vec::new();
-    if a.full_logs {
-        constraints.push(Constraint::Length(log_h as u16));
-        constraints.push(Constraint::Length(footer.len() as u16));
-    } else {
-        constraints.push(Constraint::Length(body.len() as u16));
-        constraints.push(Constraint::Length(log_h as u16));
-        constraints.push(Constraint::Length(actions.len() as u16));
-        constraints.push(Constraint::Length(footer.len() as u16));
+    if !top.is_empty() {
+        constraints.push(Constraint::Length(top.len() as u16));
     }
+    if !menu.is_empty() {
+        constraints.push(Constraint::Length(menu.len() as u16));
+    }
+    constraints.push(Constraint::Length(log_h as u16));
+    constraints.push(Constraint::Length(footer.len() as u16));
     let rows = Layout::vertical(constraints).split(area);
 
-    if a.full_logs {
-        render_lines(f, rows[0], &body);
-        render_lines(f, rows[1], &footer);
-    } else {
-        render_lines(f, rows[0], &body);
-        let mut logs = vec![log_title(a, w, false)];
-        logs.extend(log_lines(a, log_h.saturating_sub(1), w));
-        render_lines(f, rows[1], &logs);
-        let acts: Vec<Line> = actions
-            .iter()
-            .map(|s| styled(s, Some(Color::Cyan), false))
-            .collect();
-        render_lines(f, rows[2], &acts);
-        render_lines(f, rows[3], &footer);
+    let mut row = 0;
+    if !top.is_empty() {
+        render_lines(f, rows[row], &top);
+        row += 1;
     }
+    if !menu.is_empty() {
+        render_lines(f, rows[row], &menu);
+        row += 1;
+    }
+    render_lines(f, rows[row], &logs);
+    row += 1;
+    render_lines(f, rows[row], &footer);
 
     if let Some(m) = &a.modal {
         let (title, text, hint) = modal_box(m);
@@ -705,7 +818,7 @@ pub fn status_text(f: &Facts) -> Vec<String> {
     for (title, values) in panels(f) {
         out.push(format!("{title}  {}", values.join("  ")));
     }
-    for l in action_lines(240) {
+    for l in menu_lines() {
         out.push(l);
     }
     out
@@ -775,8 +888,17 @@ mod tests {
         // is what tty1 gets, that row must keep passing, so the block uses the dialog menu's own wording.
         for (w, h) in [(240u16, 67u16), (80, 25)] {
             let text = render_snapshot(&app(c16_board()), w, h);
-            for want in ["CONNECT", "web UI http://", "api  http://", "ssh  root@", "Lemonade Mobile"] {
-                assert!(text.contains(want), "{w}x{h}: the U2 menu connect row would go red - {want:?} is missing");
+            for want in [
+                "CONNECT",
+                "web UI http://",
+                "api  http://",
+                "ssh  root@",
+                "Lemonade Mobile",
+            ] {
+                assert!(
+                    text.contains(want),
+                    "{w}x{h}: the U2 menu connect row would go red - {want:?} is missing"
+                );
             }
             assert!(
                 text.contains("web UI http://192.168.50.110:13305"),
@@ -856,10 +978,19 @@ mod tests {
     }
 
     #[test]
-    fn the_gates_action_labels_survive_at_every_width() {
-        // vm-check's `U2 menu` row looks for these two strings on tty1
+    fn the_gates_action_labels_are_on_their_own_rows() {
+        // vm-check's `U2 menu` row looks for these two strings on tty1, and the owner reads the MENU block, so
+        // both sizes carry all nine labels whole, one numbered row each
+        let rows = menu_lines();
+        assert_eq!(rows.len(), 9, "one row per action: {rows:?}");
         for w in [80usize, 100, 120, 240] {
-            let joined = action_lines(w).join(" ");
+            for row in &rows {
+                assert!(
+                    row.chars().count() <= w,
+                    "width {w}: {row:?} does not fit on its row"
+                );
+            }
+            let joined = rows.join(" ");
             assert!(joined.contains("Show the API key"), "width {w}: {joined}");
             assert!(joined.contains("Reboot / power off"), "width {w}: {joined}");
             for (i, l) in ACTIONS.iter().enumerate() {
@@ -868,6 +999,127 @@ mod tests {
                     "width {w}: action {} missing",
                     i + 1
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn the_compact_status_keeps_every_panel_and_never_splits_a_field() {
+        let f = c16_board();
+        for w in [80usize, 90, 99] {
+            let lines: Vec<String> = compact_status(&f, w)
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect();
+            assert!(lines.len() <= 2, "width {w}: {lines:?}");
+            for l in &lines {
+                assert!(l.chars().count() <= w, "width {w}: {l:?} is over");
+                assert!(
+                    !l.trim_end().ends_with('|'),
+                    "width {w}: field split: {l:?}"
+                );
+                assert!(
+                    !l.trim_start().starts_with('|'),
+                    "width {w}: field split: {l:?}"
+                );
+            }
+            let joined = lines.join(" ");
+            for name in ["LEMONADE", "GPU", "NPU", "MODELS", "FANS", "DATA"] {
+                assert!(joined.contains(name), "width {w}: {name} is gone: {joined}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_menu_sits_between_the_facts_and_the_log() {
+        // the owner, cycle 20: "can we place the menu above the scrolling logs and below the technical
+        // information". This is the layout, asserted off a rendered frame rather than off the code's intent.
+        for (w, h) in [(240u16, 67u16), (80, 25)] {
+            let text = render_snapshot(&app(c16_board()), w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            let at = |needle: &str| {
+                lines
+                    .iter()
+                    .position(|l| l.contains(needle))
+                    .unwrap_or_else(|| panic!("{w}x{h}: {needle:?} is not on screen:\n{text}"))
+            };
+            let (header, connect, menu, logs) =
+                (at("1bit OS"), at("CONNECT"), at("MENU"), at("LOGS"));
+            assert!(header < connect, "{w}x{h}: CONNECT is not below the header");
+            assert!(
+                connect < menu,
+                "{w}x{h}: the menu is not below the technical information"
+            );
+            assert!(
+                menu < logs,
+                "{w}x{h}: the menu is not above the scrolling log"
+            );
+            // the nine rows are the nine lines right under the MENU rule, all of them above the log
+            for i in 1..=9 {
+                let row = menu + i;
+                assert!(
+                    row < logs,
+                    "{w}x{h}: action {i} is not above the log:\n{text}"
+                );
+                assert!(
+                    lines[row].starts_with(&format!("{i} ")),
+                    "{w}x{h}: action {i} is not on its own row (row {row} reads {:?}):\n{text}",
+                    lines[row]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn at_80x25_the_log_pane_still_gets_three_rows() {
+        let text = render_snapshot(&app(c16_board()), 80, 25);
+        let lines: Vec<&str> = text.lines().collect();
+        let log_at = lines
+            .iter()
+            .position(|l| l.contains("LOGS"))
+            .expect("a log pane");
+        // the last line is the footer; everything between the LOGS title and it is the pane
+        let pane = &lines[log_at + 1..lines.len() - 1];
+        let filled = pane.iter().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            filled >= 3,
+            "the log pane keeps only {filled} rows at 80x25:\n{text}"
+        );
+        // and the pane reaches the footer: a row counted twice leaves the last console row blank (measured before
+        // the log title was made part of the pane)
+        assert!(
+            lines.last().is_some_and(|l| !l.trim().is_empty()),
+            "the last console row at 80x25 is blank:\n{text}"
+        );
+    }
+
+    #[test]
+    fn item_1_keeps_the_gate_string_in_both_key_modes() {
+        // pi-prs on #935: the appliance ships BLANK (cycle-20 item 7), so a mode-dependent item 1 turns `U2 menu`
+        // red on every shipped image - `vm-check.sh:417` greps `Show the API key` off tty1. The label is therefore
+        // the same string whatever the key mode, and the blank-key offer lives in the CONNECT block and in item 1's
+        // own dialog (the item-7 work on os/v3-c20).
+        let keyed = c16_board();
+        let mut blank = c16_board();
+        blank.key = None;
+        // menu_lines() takes no facts at all any more, which is the structural half of the guarantee
+        let rows = menu_lines();
+        assert_eq!(rows.len(), 9, "{rows:?}");
+        assert_eq!(rows[0], "1 Show the API key");
+        for (name, f) in [("keyed", keyed), ("blank", blank)] {
+            for (w, h) in [(240u16, 67u16), (80, 25)] {
+                let text = render_snapshot(&app(f.clone()), w, h);
+                for want in ["Show the API key", "Reboot / power off"] {
+                    assert!(
+                        text.contains(want),
+                        "{name} box at {w}x{h}: the U2 menu row goes red - {want:?} is missing"
+                    );
+                }
             }
         }
     }

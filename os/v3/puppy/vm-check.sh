@@ -557,6 +557,12 @@ rows = [
                      "curl -s -o /dev/null -w 'http=%{http_code}' ${k:+-H \"Authorization: Bearer $k\"} "
                      "http://127.0.0.1:13305/api/v1/models", "http=200"),
     ("U3 keyvalue",  'sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf 2>/dev/null | head -1', None),
+    # Cycle 20, pi-prs' note 2 on #934: item 1's mint is the ONE new write path in this image and it was reachable
+    # only from a dialog. The menu carries its own selftest for it, driven on a throwaway conf with the restart
+    # replaced by `true`, so this row proves the write (one 48-hex line, mode 600, the other lines kept) and the
+    # removal (no line, no temp file) INSIDE the image without touching /etc/1bit or restarting Lemonade.
+    ("U3 key toggle", "d=$(mktemp -d); 1bit-console-menu --mint-selftest \"$d\" | tail -2; rm -rf \"$d\"",
+                     "mint-selftest-ok"),
     # Cycle 20 item 6 and item 5 in one row: the box's own Lemonade UI works THROUGH the key-injecting proxy (health
     # 200), a same-origin page is served, and a request that carries a foreign Origin is refused before the key is
     # attached - i.e. the proxy cannot be borrowed as a key-adding open relay by a page from anywhere else.

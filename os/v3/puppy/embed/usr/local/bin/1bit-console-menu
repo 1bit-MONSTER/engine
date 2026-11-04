@@ -73,6 +73,14 @@ api_key() {
     f=$(readlink -f "$CONF" 2>/dev/null || echo "$CONF")
     sed -n 's/^LEMONADE_API_KEY=//p' "$f" 2>/dev/null | head -1
 }
+# The request helper the menu uses for Lemonade: the Authorization header goes in only when the appliance is keyed.
+# Blank mode is the shipped default (cycle 20), and an empty `Bearer ` is not the same request as no header at all.
+api_get() {   # api_get <url> [curl args...]
+    u=$1; shift
+    k=$(api_key)
+    if [ -n "$k" ]; then curl -H "Authorization: Bearer $k" "$@" "$u"; else curl "$@" "$u"; fi
+}
+keyed() { [ -n "$(api_key)" ]; }
 lemond_up() { [ -n "$(lemond_pid)" ]; }
 lemond_pid() {
     ps 2>/dev/null | awk '/[l]emond /{print $1; exit}'
@@ -152,9 +160,8 @@ data_line() {
     [ -n "$d" ] && echo "$d" || echo "not mounted"
 }
 models_line() {
-    k=$(api_key)
     list=""
-    [ -n "$k" ] && list=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
+    list=$(api_get "$API/v1/models" -s -m 5 2>/dev/null |
         grep -o '"id":"[^"]*"' | cut -d'"' -f4)
     if [ -n "$list" ]; then
         # the count is what the banner can hold whole; the ids are item 4's screen (no line here is cut mid-word -
@@ -211,8 +218,11 @@ booting_text() {
     fi
 }
 # Four lines, each measured to fit one 78-column dialog row (a longer line wraps and pushes the last menu items off
-# the screen - cycle 14 measured item 9 disappearing exactly that way). The key is NOT printed here: menu item 1
-# shows it, and the console is the surface a screen recording catches.
+# the screen - cycle 14 measured item 9 disappearing exactly that way). The key itself is NEVER printed here: menu
+# item 1 shows it, and the console is the surface a screen recording catches. Cycle 20 (owner: "blank key") makes
+# blank the shipped mode, so the api line carries the mode itself - and it is a SUBSTITUTION, not an addition: a
+# fifth line measured exactly the cycle-14 failure again (dialog at 80x25, "88%" scroll indicator, item 9 "Reboot /
+# power off" not drawn at all). The long form of the sentence lives in the TUI, which has the width for it.
 connect_text() {
     ip=$(first_ip)
     if [ -z "$ip" ]; then
@@ -220,9 +230,15 @@ connect_text() {
         return
     fi
     say "CONNECT  $(hostname_now)   web UI http://$ip:13305"
-    say "         api  http://$ip:13305/api/v1   (key: menu item 1)"
-    say "         ssh  root@$ip   (your key in /data/ssh/authorized_keys)"
-    say "         app  Lemonade Mobile: server http://$ip:13305 + that key"
+    if keyed; then
+        say "         api  http://$ip:13305/api/v1   (API key: press 1)"
+        say "         ssh  root@$ip   (your key in /data/ssh/authorized_keys)"
+        say "         app  Lemonade Mobile: server http://$ip:13305 + that key"
+    else
+        say "         api  http://$ip:13305/api/v1   (no key: anyone, press 1)"
+        say "         ssh  root@$ip   (your key in /data/ssh/authorized_keys)"
+        say "         app  Lemonade Mobile: server http://$ip:13305 (any key)"
+    fi
 }
 # What the dialog shows. Nine lines with the nine menu rows, i.e. inside the 12 the 24-row box leaves free.
 status_brief() {
@@ -277,37 +293,77 @@ say_text() {   # say_text <title> <text...>
 }
 
 # ── items ─────────────────────────────────────────────────────────────────────────────────────────────
-# 1 Show API key. Confirmed first: the key is a bearer token, and a console that prints it on any stray Enter
-# is a console that leaks it into a JetKVM recording.
+# 1 The API key: OFF (blank) by default, ON when a person asks for one. Owner's decision, 2026-11-03 ~20:1x: "1bit OS
+# ships like stock Lemonade" - no key, everything works (the box's own Lemonade UI, this console's chat test, Lemonade
+# Mobile, any OpenAI client with a placeholder key), and the only reason to turn one on is a shared network. Turning it
+# on mints 48 hex characters into /etc/1bit/lemond.conf (mode 600, a symlink onto /data) - the same file 10lemonade
+# reads - and restarts 10lemonade so lemond comes up in the other mode. Nothing else in the image holds the key, and
+# the console still never prints it without a confirm: it is a bearer token and this screen can be on a recording.
+key_file() { readlink -f "$CONF" 2>/dev/null || echo "$CONF"; }
+key_on() {
+    k=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    f=$(key_file)
+    mkdir -p /etc/1bit 2> /dev/null
+    { [ -f "$f" ] && grep -v '^LEMONADE_API_KEY=' "$f"; printf 'LEMONADE_API_KEY=%s\n' "$k"; } > "$f.new" 2> /dev/null &&
+        mv "$f.new" "$f" && chmod 600 "$f" || { say "cannot write $f - the key was not turned on"; return 1; }
+    /etc/init.d/10lemonade restart > /dev/null 2>&1
+    say "api-key: turned ON (lemond restarted in keyed mode)"
+    say_text "API key" "Lemonade now requires this key
+
+$k
+
+As a header:   Authorization: Bearer $k
+Try it:        curl -H \"Authorization: Bearer $k\" $API/api/v1/models
+
+Menu item 1 again turns it off."
+    return 0
+}
+key_off() {
+    f=$(key_file)
+    [ -f "$f" ] && { grep -v '^LEMONADE_API_KEY=' "$f" > "$f.new" 2> /dev/null && mv "$f.new" "$f"; }
+    /etc/init.d/10lemonade restart > /dev/null 2>&1
+    say "api-key: turned OFF (blank mode - anyone on this network can use Lemonade)"
+    return 0
+}
 item_api_key() {
     k=$(api_key)
-    if [ -z "$k" ]; then
-        say "no API key: $CONF has no LEMONADE_API_KEY line (first boot mints one; see item 8)"
-        return 1
-    fi
     if [ "$NONINT" = 1 ]; then
-        say "api-key: $k"
-        [ ${#k} -ge 32 ] && { say "api-key-shown"; return 0; }
-        return 1
+        # The read-only half: the mode, and the key when there is one. --selftest and the image's own rows run this
+        # path, so it must never mint, remove or restart anything.
+        if [ -n "$k" ]; then say "api-key: $k"; say "api-key-shown"; else say "api-key: none ($CONF has no LEMONADE_API_KEY line)"; fi
+        if keyed; then say "auth-mode: keyed"; else say "auth-mode: blank"; fi
+        return 0
     fi
-    yesno "Show the Lemonade API key on this screen?
-It is a bearer token: anyone who can read this screen can use the appliance." || return 0
-    say_text "API key" "Lemonade API key
+    if [ -n "$k" ]; then
+        yesno "Lemonade requires an API key (keyed mode).
+
+Show it on this screen? It is a bearer token: anyone who can
+read this screen can use the appliance." && say_text "API key" "Lemonade API key
 
 $k
 
 As a header:   Authorization: Bearer $k
 Try it:        curl -H \"Authorization: Bearer $k\" $API/api/v1/models"
+        yesno "Turn the API key OFF?
+
+The appliance would then be stock Lemonade: anyone on this
+network could use it. The key line is removed from
+$CONF and lemond restarts." && key_off
+    else
+        yesno "No API key (blank mode): anyone on this network can use Lemonade.
+
+Require one from now on? A key is minted into
+$CONF and lemond restarts in keyed mode." && key_on
+    fi
+    return 0
 }
 
 # 2 Quick chat test: one request per backend that this machine can actually run, printing the answer and the
 # rate. The rate is Lemonade's own predicted_per_second, which is what release-check's chat rows report, so the
 # menu and the acceptance run cannot disagree about how fast the box is.
 chat_one() {   # chat_one <model id> -> "id<TAB>answer<TAB>tok/s"
-    k=$(api_key)
-    r=$(curl -s -m 300 -H 'Content-Type: application/json' -H "Authorization: Bearer $k" \
-        --data-binary "{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":32,\"temperature\":0}" \
-        "$API/api/v1/chat/completions" 2>/dev/null)
+    r=$(api_get "$API/api/v1/chat/completions" -s -m 300 -H 'Content-Type: application/json' \
+        --data-binary "{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":32,\"temperature\":0}" 2>/dev/null)
     case $r in
     *'"content"'*)
         a=$(printf '%s' "$r" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | head -1)
@@ -317,9 +373,8 @@ chat_one() {   # chat_one <model id> -> "id<TAB>answer<TAB>tok/s"
     esac
 }
 item_chat() {
-    k=$(api_key)
-    if [ -z "$k" ]; then say "no API key: cannot chat (item 8 shows the Lemonade log)"; return 1; fi
-    ids=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
+    # blank mode needs no key (that is the point of it), so "no key" is no longer "cannot chat"
+    ids=$(api_get "$API/v1/models" -s -m 5 2>/dev/null |
         grep -o '"id":"[^"]*"' | cut -d'"' -f4)
     # "nothing downloaded" is not a broken menu item: a machine with no model, and every VM (Lemonade hides the
     # onebit entries when there is no GPU and no NPU), legitimately has nothing to chat with. It is a SKIP with
@@ -407,10 +462,10 @@ This lives until reboot unless the save layer keeps it."
 }
 
 # 4 Models: what is downloaded, pull by Hub id, delete. All three are the release CLI's own verbs, with the
-# appliance's key, so the menu cannot drift from what `lemonade` does from a shell.
+# appliance's key when it has one, so the menu cannot drift from what `lemonade` does from a shell.
 item_models() {
     k=$(api_key); export LEMONADE_API_KEY="$k" LEMONADE_PORT=13305
-    ids=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
+    ids=$(api_get "$API/v1/models" -s -m 5 2>/dev/null |
         grep -o '"id":"[^"]*"' | cut -d'"' -f4)
     if [ "$NONINT" = 1 ]; then
         say "downloaded:"; printf '%s\n' "${ids:-<none>}"
@@ -438,7 +493,7 @@ $(printf '%s\n' "${ids:-<none>}" | head -12)" 22 76 3 \
            say_text "Delete" "$(tail -5 /tmp/1bit-delete.log 2>/dev/null)" ;;
         *) return 0 ;;
         esac
-        ids=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
+        ids=$(api_get "$API/v1/models" -s -m 5 2>/dev/null |
             grep -o '"id":"[^"]*"' | cut -d'"' -f4)
     done
 }

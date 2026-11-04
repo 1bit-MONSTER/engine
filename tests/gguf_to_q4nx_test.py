@@ -38,6 +38,10 @@ import gguf_to_q4nx as G  # noqa: E402
 
 Q = gguf.GGMLQuantizationType
 GOLDEN_Q4_1 = "9f58d4201c4844abc937204c2b7f8d364ff44bc574b0bb87292928c54447d2c8"
+# one real Q8 tile (Qwen3.5-4B lm_head tile 0), hashed by the same test as npu/q4nx.cpp: this is
+# the layout check that a self-inverse round trip cannot make, because our encoder and decoder
+# could agree with each other and still disagree with the container a device serves.
+GOLDEN_Q8 = "09ad9e7a61cad612ffcb9cc2a1d7dfd27b6813a6d184329404045d4691c5fdf2"
 
 
 def golden_tile():
@@ -52,6 +56,22 @@ def golden_tile():
     again = G.tiles(codes.reshape(32, 256).astype(np.uint8), sc, zr)
     same = again.tobytes() == tile.tobytes()
     print(f"{'ok  ' if same else 'FAIL'} golden q4_1 tile re-encodes to the same bytes")
+    return ok and same
+
+
+def golden_tile8():
+    """The committed real Q8 tile: decoded by our decoder, and re-encoded by our encoder."""
+    tile = np.fromfile(os.path.join(HERE, "golden", "q4nx", "q8.bin"), dtype=np.uint8)
+    assert tile.size == G.Q8, f"q8.bin is {tile.size} B"
+    w = G.untile_q8(tile.reshape(1, G.Q8), 32, 256).astype(np.float32)
+    ok = hashlib.sha256(w.tobytes()).hexdigest() == GOLDEN_Q8
+    print(f"{'ok  ' if ok else 'FAIL'} golden q8 tile decodes to the verified SHA-256")
+    # its parts, back through the writer (scale plane is [g, r]; tiles_q8 wants [r, g])
+    sc = G.from_bf16(tile[:512].view(np.uint16)).reshape(8, 32).T
+    codes = np.clip(np.rint(w.reshape(32, 8, 32) / np.where(sc == 0, 1, sc)[..., None]), -127, 127)
+    again = G.tiles_q8(codes.reshape(32, 256).astype(np.int8), sc)
+    same = again.tobytes() == tile.tobytes()
+    print(f"{'ok  ' if same else 'FAIL'} golden q8 tile re-encodes to the same bytes")
     return ok and same
 
 
@@ -284,6 +304,7 @@ def q8_check(gguf_path, out, ok):
 
 def main():
     ok = golden_tile()
+    ok = golden_tile8() and ok
     rng = np.random.default_rng(1)
     tool = os.path.join(HERE, "..", "tools", "gguf_to_q4nx.py")
     with tempfile.TemporaryDirectory() as d:

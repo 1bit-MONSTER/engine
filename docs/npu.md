@@ -556,7 +556,7 @@ FACTS §7.13 established that layout by known-answer write and §7.15 against sh
 
 ### The `.fconst` MLP section
 
-The MLP section fills the rest of the layer block after the second norm, in three parts:
+The MLP section fills the rest of the layer block after that block's **post-attention norm**, in three parts:
 
 | part | shape | layout |
 |---|---|---|
@@ -587,6 +587,19 @@ measured offset. An earlier note here said Qwen3's MLP sections "do not add up .
 different kernel shapes"; that was this reader's error, not the packs': the section was located from
 the wrong boundary, so the geometry check (`total == stride`) failed and was read as a shape
 difference. With §7.24's boundaries the gap closes to the byte on all four (FACTS §7.24.1).
+
+### Which header opens the post-attention norm
+
+A layer block opens with a 64-byte epsilon header, then `input_layernorm`, then the attention section,
+then **another epsilon header** and the `post_attention_layernorm` weight. Which header that second one is
+depends on how many the block carries, and that is measured per pack, not assumed: **2-header blocks**
+(Qwen2.5, Llama) carry exactly one extra, so it is the block's second header; **4-header blocks** (Qwen3)
+carry three more, because the first two open the per-head `k_norm` and `q_norm` sections, so the
+post-attention header is the block's **last** one. Reading the second header unconditionally is correct
+only on the 2-header packs — on a Qwen3 block it imports the `k_norm` gains and the padding behind them as
+`post_attention_layernorm` (1,791 of 2,048 values zero and max 68.0 on Qwen3-1.7B, against a real norm
+that is zero-free and 0.9919 correlated with the upstream checkpoint). Both readers — the norm and the MLP
+section's first byte — now go through `FconstGeom::post_attn_hdr()` (engine#1003, FACTS §7.25).
 
 Which tile belongs to which projection is **measured, not assumed**: on the shipped 0.5B pack the
 tiles' bias subvolumes matched the pack's own q/k/v bias vectors, which identifies the runs as

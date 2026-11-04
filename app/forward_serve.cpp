@@ -128,7 +128,15 @@ int json_int(const std::string& path, const char* key, int def) {
     if (!f) return def;
     json j;
     f >> j;
-    if (j.contains(key) && j[key].is_number_integer()) return j[key].get<int>();
+    if (!j.contains(key)) return def;
+    // A boolean is an int here: every HF checkpoint writes add_bos_token/add_eos_token as a
+    // JSON boolean, and the alternative -- asking the packers to write 1/0 instead -- would make
+    // the container's config.json disagree with the checkpoint it came from.  Reading only
+    // is_number_integer() made add_bos_token a dead key: measured on Zyphra/ZR1-1.5B, forward-serve
+    // reported the same 27 prompt tokens with "add_bos_token": true and with false, i.e. the chat
+    // prompt never got its BOS.
+    if (j[key].is_boolean()) return j[key].get<bool>() ? 1 : 0;
+    if (j[key].is_number_integer()) return j[key].get<int>();
     return def;
 }
 

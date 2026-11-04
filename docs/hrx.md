@@ -974,7 +974,13 @@ same build now passes `tests/serve_e2e.sh` on both devices through `1bit serve`.
 `tests/hrx_cpu_weight_parity.sh` (engine #674) is the row that compares placements instead of just checking that each one
 answers: the same greedy prompt through the CPU (`-dev none`), through the device with **every layer assigned to the CPU**
 (`-dev HRX0 -ngl 0`, the partial-offload path where the device still claims nodes and materializes their weights) and fully
-offloaded (`-ngl 99`) must come back byte-identical. It skips without a gfx1151, and it fails rather than skips when the
+offloaded (`-ngl 99`). It compares the **distributions**, not the text: the CPU path and the device paths are different
+arithmetic (f32 CPU kernels vs HRX's kernels over an f16 KV cache), their logits differ by ~0.1 nats, and at temperature 0 a
+coin flip between two candidates flips one token — measured on `ca1d42f`, where the *shipped* `-ngl 99` placement flips its
+own coin 24 tokens in. So each device arm must keep the CPU's top-5 distribution (overlap >= 0.30, median |dlogprob| <=
+0.50 nats, calibrated: 0.63-0.78 overlap and 0.038-0.094 nats on a correct stack, 0.00 overlap when placement actually
+corrupts the answer), compared over **at least 12 steps** — an arm that stops early (EOS, or a placement bug that ends the
+graph) is reported as a failure rather than compared over the one or two steps it managed. It skips without a gfx1151, and it fails rather than skips when the
 machine has a GPU but the HRX runtime cannot open it — the `IREE_HAL_AMDGPU_LIBHSA_PATH` case `scripts/hrx-env.sh` now
 resolves for hand-run tools.
 

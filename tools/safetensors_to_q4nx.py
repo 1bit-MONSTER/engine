@@ -335,6 +335,18 @@ def pack(args):
     cfg["q4nx_source"].update({"converter": "tools/safetensors_to_q4nx.py",
                                "safetensors": os.path.basename(args.hf.rstrip("/"))})
     cfg["q4nx_weight_layout"] = args.weight_layout
+    # The engine's forward reads add_bos_token from config.json (app/forward_serve.cpp: "the
+    # rendered chat prompt needs BOS") and defaults to 0, while an HF pack keeps that flag in
+    # tokenizer_config.json -- so a pack that needs BOS (Qwen2 fine-tunes with add_bos_token:
+    # true, Zyphra/ZR1-1.5B) was served chat prompts with none.  Copy the flag across; the same
+    # carry-through exists in tools/gguf_to_q4nx.py from the GGUF's tokenizer.ggml metadata.
+    tok_cfg_path = os.path.join(args.tokenizer or args.hf, "tokenizer_config.json")
+    if os.path.exists(tok_cfg_path):
+        with open(tok_cfg_path) as f:
+            tok_cfg = json.load(f)
+        for k in ("add_bos_token", "add_eos_token"):
+            if k in tok_cfg:
+                cfg.setdefault(k, bool(tok_cfg[k]))
     if arch == "qwen3_5":
         cfg["q4nx_source"]["arch"] = arch
         # The engine reads config.json at depth 1 only (q4nx_semantics.c's value_for_top), so a pack

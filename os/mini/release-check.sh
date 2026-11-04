@@ -23,7 +23,7 @@
 #
 # Rows that cannot PASS without the hardware are marked SKIP in a VM (Lemonade hides its onebit
 # entries on a machine with no AMD GPU or NPU, and there is no HRX or NPU device to run them on):
-# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream. Everything else - mode, kernel,
+# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder. Everything else - mode, kernel,
 # Secure Boot, Lemonade up with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU
 # sets and the signed manifests over them, the licences and the image identity - is checked in the VM as well.
 set -u
@@ -37,7 +37,7 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1))
-    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
 # Every fetch is capped. Without that, a Lemonade that accepts the connection and never answers hangs
@@ -844,6 +844,47 @@ elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
     skip chat-npu-stream "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
 else
     skip chat-npu-stream "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
+
+# ── NPU length ladder: the position count a real chat reaches (cycle 23; c22 board, 4 Nov 2026) ──────────────
+# The c22 board made the wedge deterministic. Fresh backend each time, temperature 0, /no_think, a long-essay
+# prompt: 400 max_tokens (429 positions) answered, 480 (509) answered, and 600 - the first step that crosses 512 -
+# produced `npu runtime: invalid call (code 614): state 8` plus one amdxdna TDR and a power-cycle, and both board
+# chat failures that day (12:56, 13:13 AST) sat ~7 s into a thinking-on reply, at that same boundary. The image
+# now ships `options amdxdna tdr_timeout_ms=15000`, so the same ladder has to answer at 1000 with no new TDR line.
+# The model is unloaded before every step: a warm context would let one step hide the next.
+if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    TDRL0=$(tdr_count)
+    TDRL1=$TDRL0
+    LAD_OK=
+    LAD_BAD=
+    for n in 400 600 1000; do
+        got --header='Content-Type: application/json' --post-data='{}' "$API/api/v1/unload" > /dev/null 2>&1
+        RL=$(auth_post "{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Write a long essay about the history of cartography, and about what map-making changed in how people understood the world.\"}],\"max_tokens\":$n,\"temperature\":0}" "$API/api/v1/chat/completions" slow)
+        AL=$(json_str "$RL" content)
+        CL=$(json_str "$RL" completion_tokens)
+        PL=$(json_str "$RL" prompt_tokens)
+        TDRL1=$(tdr_count)
+        if [ -z "$AL" ]; then
+            LAD_BAD="$LAD_BAD ${n}->no-answer"
+        elif [ -n "$TDRL1" ] && [ -n "$TDRL0" ] && [ "$TDRL1" -gt "$TDRL0" ]; then
+            LAD_BAD="$LAD_BAD ${n}->TDR(${TDRL0}->${TDRL1})"
+        else
+            LAD_OK="$LAD_OK $n ok (${CL:-?} tokens${PL:+, ${PL} prompt})"
+        fi
+        [ -z "$LAD_BAD" ] || break
+    done
+    _tdrs_l() { if [ -n "$TDRL0" ] && [ -n "$TDRL1" ]; then printf 'TDRs %s -> %s' "$TDRL0" "$TDRL1"
+                else printf 'dmesg not readable, so the TDR count is unknown'; fi; }
+    if [ -n "$LAD_BAD" ]; then
+        fail chat-npu-ladder "$NPU ladder 400/600/1000:$LAD_BAD; clean steps:$LAD_OK ($(_tdrs_l))"
+    else
+        pass chat-npu-ladder "$NPU answered every rung of 400/600/1000 max_tokens with a fresh backend, no TDR:$LAD_OK ($(_tdrs_l))"
+    fi
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-ladder "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+else
+    skip chat-npu-ladder "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────

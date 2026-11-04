@@ -316,6 +316,9 @@ if [ -n "${PAYLOAD:-}" ]; then
     # lost to it ("cannot move ... Directory not empty"). 1bit-lemonade-webapp copies the file into the
     # application directory before the browser creates its profile.
     install -D -m 644 /recipe/embed/etc/1bit/palemoon-prefs.js "$skeleton/etc/1bit/palemoon-prefs.js"
+    # Cycle 23: the NPU's hang-detector timeout goes in the image, because the stock default resets the device
+    # under a chat that crosses ~512 positions (c22 board, 4 Nov; the file's own header carries the numbers).
+    install -D -m 644 /recipe/embed/etc/modprobe.d/amdxdna.conf "$skeleton/etc/modprobe.d/amdxdna.conf"
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-lemonade-webapp "$skeleton/usr/local/bin/1bit-lemonade-webapp"
     install -D -m 755 /recipe/embed/etc/init.d/24onboard-webapp "$skeleton/etc/init.d/24onboard-webapp"
     # item 10: the responder that makes http://1bit-os.local:13305 work from another machine (cycle 21, owner).
@@ -551,6 +554,34 @@ done
 hn=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/hostname 2>/dev/null | head -1)
 [ "$hn" = 1bit-os ] || { echo "build: REFUSED: the packed hostname is '${hn:-<none>}' (board row reads 1bit-os)" >&2; exit 1; }
 echo "   ok: dialog + hostname 1bit-os + the quiet-boot modprobe file are in the image"
+# Cycle 23: the TDR timeout has to be in the PACKED image - and no other packed kmod config may contradict it.
+# kmod merges every file in /etc/modprobe.d and a later `options` line wins, so a stale copy silently shadows the
+# installed one (the strixhalo lesson, and the reason the board row reads the RUNNING module's parameter).
+packed_tdr=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/modprobe.d/amdxdna.conf 2> /dev/null)
+case "$packed_tdr" in
+    *"options amdxdna tdr_timeout_ms=15000"*) ;;
+    *) echo "build: REFUSED: the packed image has no 'options amdxdna tdr_timeout_ms=15000' in" >&2
+       echo "       /etc/modprobe.d/amdxdna.conf - a long NPU chat would reset the device mid-answer (c22 board)" >&2
+       exit 1 ;;
+esac
+# every other packed modprobe.d file that names amdxdna, across every SFS, must carry the same value. Collected
+# into a file first: a `... | while read` loop runs in a subshell, where an exit only ends the loop.
+: > /tmp/1bit-tdr-shadow
+grep -E 'modprobe\.d/[^/]*amdxdna[^/]*$' /tmp/1bit-sfs-listing | while read -r entry; do
+    case "$entry" in */etc/modprobe.d/amdxdna.conf) continue ;; esac
+    sfs=${entry%%/*}; rel=${entry#*/}
+    body=$(unsquashfs -cat "sandbox3/build/$sfs" "$rel" 2> /dev/null) || continue
+    case "$body" in
+        *amdxdna*tdr_timeout_ms=15000*) ;;
+        *amdxdna*) printf '%s\n' "   $entry" >> /tmp/1bit-tdr-shadow ;;
+    esac
+done
+if [ -s /tmp/1bit-tdr-shadow ]; then
+    echo "build: REFUSED: these packed files also configure amdxdna and would shadow the 15000 ms TDR timeout:" >&2
+    cat /tmp/1bit-tdr-shadow >&2
+    exit 1
+fi
+echo "   ok: tdr_timeout_ms=15000 for amdxdna is in the packed image, with no shadowing kmod config"
 if [ -n "${PAYLOAD:-}" ]; then
     in_image usr/local/bin/1bit-console-menu || {
         echo "build: REFUSED: the image has no /usr/local/bin/1bit-console-menu - tty1 would respawn nothing" >&2; exit 1; }

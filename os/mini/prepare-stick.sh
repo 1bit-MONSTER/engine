@@ -18,9 +18,13 @@
 #                   [--model FILE.gguf]... [--npu-model DIR]... [--check] [--force]
 #
 # Prepares a 1bit OS stick or image from any Linux box: puts your SSH public keys where Dropbear reads
-# them, sets Lemonade's API key, and copies models into the models directory - GGUFs, and NPU model
+# them, copies models into the models directory - GGUFs, and NPU model
 # directories (a directory holding model.q4nx, the engine's own NPU format) - then REMOUNTS THE
 # PARTITION READ-ONLY and proves what it wrote. Everything it refuses, it refuses before writing.
+#
+# The API key is OPT-IN (cycle 20, the owner's "blank key"): a stick with no --mint and no --key comes up like
+# stock Lemonade, with no key at all, because that is what the appliance ships and what its console CONNECT block
+# says. --mint (or --key <hex>) is how you hand a key to a shared network.
 #
 # The data partition is found the way the image describes it, never by a fixed offset: `sfdisk -d`
 # reads the GPT, the partition with the Linux filesystem type (and, when there is more than one, the
@@ -339,15 +343,24 @@ bad()  { printf '  FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
 
 printf '\nassertions (%s)\n' "$( [ "$CHECK" = 1 ] && echo --check || echo 'read-only remount' )"
 
-[ -f "$CONF" ] || bad "lemonade/lemond.conf is missing"
+# Cycle 20, the owner's "blank key": a stick with no key has NO lemond.conf at all - nothing mints one any more, and
+# 05onboard-data deliberately leaves the file absent (an empty one is the third state engine#867 guarded against).
+# So "absent" is a PASS that says so; everything inside the file is still asserted whenever it exists.
+if [ -f "$CONF" ]; then
+    ok "lemonade/lemond.conf is present"
+else
+    [ -n "${KEY:-}" ] && bad "lemonade/lemond.conf is missing, but a key was asked for (--mint/--key) and has nowhere to go" ||
+        ok "no lemonade/lemond.conf (blank mode: no API key; the console's item 1 creates it on the stick)"
+fi
 if [ -f "$CONF" ]; then
     confbytes=$(stat -c %s "$CONF")
     nonzero=$(tr -d '\000' < "$CONF" | wc -c)
     [ "$confbytes" = "$nonzero" ] && ok "lemond.conf has no NUL bytes ($confbytes bytes)" ||
         bad "lemond.conf has $((confbytes - nonzero)) NUL byte(s); Lemonade would misread it"
 
-    # no key at all is legitimate: init.sh mints one at boot when lemond.conf has no assignment. What
-    # is never legitimate is asking for a key and not getting a line of its own (the c10 trap), or two.
+    # No key at all is the SHIPPED state (cycle 20: "blank key"), not a defect - 10lemonade leaves it blank and the
+    # console's item 1 turns one on. What is never legitimate is asking for a key and not getting a line of its own
+    # (the c10 trap), or two.
     keylines=$(grep -c '^LEMONADE_API_KEY=' "$CONF" || true)
     wantkey=0
     [ -n "${KEY:-}" ] && wantkey=1
@@ -356,7 +369,7 @@ if [ -f "$CONF" ]; then
         0) if [ "$wantkey" = 1 ]; then
                bad "no ^LEMONADE_API_KEY= line: the key is missing, or glued to the previous line (the c10 trap)"
            else
-               ok "no key yet (init.sh mints one at boot)"
+               ok "no key (blank mode: stock-Lemonade behaviour, console item 1 turns one on)"
            fi ;;
         *) bad "$keylines ^LEMONADE_API_KEY= lines; Lemonade would take whichever it reads last" ;;
     esac
@@ -385,8 +398,12 @@ if [ -f "$CONF" ]; then
 fi
 
 if [ -e "$MNT/ssh/authorized_keys" ]; then
-    [ "$(stat -c %a "$CONF")" = 600 ] && ok "lemonade/lemond.conf is 0600 (the key is in it)" ||
-        bad "lemonade/lemond.conf is $(stat -c %a "$CONF"), wanted 600"
+    # mode 600 is asserted only when the file exists: blank mode has none, and that case is decided above
+    [ -f "$CONF" ] || ok "lemonade/lemond.conf is absent (blank mode), so there is no key file to restrict"
+    if [ -f "$CONF" ]; then
+        [ "$(stat -c %a "$CONF")" = 600 ] && ok "lemonade/lemond.conf is 0600 (the key is in it)" ||
+            bad "lemonade/lemond.conf is $(stat -c %a "$CONF"), wanted 600"
+    fi
     [ "$(stat -c %a "$MNT/ssh")" = 700 ] && ok "ssh/ is 0700" || bad "ssh/ is $(stat -c %a "$MNT/ssh"), wanted 700"
     [ "$(stat -c %u "$MNT/ssh")" = 0 ] && ok "ssh/ is owned by root" || bad "ssh/ is owned by uid $(stat -c %u "$MNT/ssh"), wanted 0"
     [ "$(stat -c %a "$MNT/ssh/authorized_keys")" = 600 ] && ok "ssh/authorized_keys is 0600" ||

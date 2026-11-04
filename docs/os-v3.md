@@ -52,7 +52,12 @@ The first slice is `os/v3/pin.txt` (the pinned server ISO), `os/v3/seed.sh` and 
 (**PR #732**, 32 checks, no device; not in this PR either, so this page stands alone at any merge
 order). Everything after the seed — `mkstick.sh`, `mkdebs.sh`,
 `postinstall`, `steps`, the vmtest scripts — is design. `os/mini` keeps shipping in v2026.44, and
-engine#712 says v3 is the next release, not the Sunday one. What *is* measured is in
+engine#712 says v3 is the next release, not the Sunday one. One difference worth naming, because both
+media are 1bit OS: **the Puppy appliance (`os/v3/puppy`) ships with no Lemonade API key at all** (cycle 20,
+stock-Lemonade behaviour; console menu item 1 turns one on), while the `os/mini` image still **mints** one
+into `/data/lemonade/lemond.conf` on first boot (`os/mini/init.sh`) because it was built when every stick was
+meant to be keyed. Nothing in this page depends on either; `prepare-stick.sh --mint` is how a *shared*
+network gets a key on both. What *is* measured is in
 [What is measured now](#what-is-measured-now) — most of it on the Strix Halo box this design was written
 on, which is itself the reference install: it runs Ubuntu 26.04.1 with our kernel, our out-of-tree
 modules, TheRock's ROCm, the distro's XRT, the engine and Lemonade, and it serves HRX and the NPU.
@@ -127,8 +132,8 @@ byte-identical payload `os/mini/mkimage.sh` writes today.
 ### `prepare-stick.sh` grows an identity
 
 The seed is per-stick, not per-release: it names the machine's user, password hash, hostname and target
-disk. `prepare-stick.sh` (already the tool that writes `authorized_keys` and mints Lemonade's API key)
-gains:
+disk. `prepare-stick.sh` (already the tool that writes `authorized_keys`, and the one that can hand a stick
+a Lemonade API key with `--mint`) gains:
 
 ```sh
 prepare-stick.sh /dev/sdX --ssh-pubkey ~/.ssh/id_ed25519.pub \
@@ -413,7 +418,7 @@ BusyBox initramfs on the ESP and one ext4 `/data`; there is no dpkg database, no
 | Lemonade's config, cache and backends | left in place; the unit's `HOME=/data/lemonade` is unchanged |
 | `hrx-jit` kernel cache, sealed NPU sets (`/data/npu`) | left in place; `GGML_HRX_JIT_CACHE_DIR` unchanged |
 | SSH host key and `authorized_keys` | `/data/ssh/host_ed25519` → `/etc/ssh/ssh_host_ed25519_key`; `authorized_keys` → `/home/onebit/.ssh/` |
-| Lemonade's API key | `/data/lemonade/lemond.conf` read as before |
+| Lemonade's API key | `/data/lemonade/lemond.conf` read as before — and **blank is the shipped default** (cycle 20): no key line means stock-Lemonade behaviour, and console menu item 1 turns one on |
 
 | not carried, by design | why |
 |---|---|

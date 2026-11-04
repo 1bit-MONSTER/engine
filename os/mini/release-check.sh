@@ -23,7 +23,7 @@
 #
 # Rows that cannot PASS without the hardware are marked SKIP in a VM (Lemonade hides its onebit
 # entries on a machine with no AMD GPU or NPU, and there is no HRX or NPU device to run them on):
-# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder. Everything else - mode, kernel,
+# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder, chat-npu-queue. Everything else - mode, kernel,
 # Secure Boot, Lemonade up with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU
 # sets and the signed manifests over them, the licences and the image identity - is checked in the VM as well.
 set -u
@@ -37,7 +37,7 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1))
-    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
 # A row that holds the NPU can hold it for a minute or two (a fresh backend per ladder rung, a 512-token turn),
@@ -275,6 +275,44 @@ stream_verdict() {
     printf 'PASS %s text chunk(s) and [DONE] over the stream, no TDR (still %s)' "$_n" "$_t1"
 }
 
+# The NPU row's BUSY decision (engine#1024, c23 board 2026-11-04). A single-user appliance's second chat has to
+# queue behind the first, not be refused. On the board the owner's chat got
+# `{"message":"the NPU is busy with another request"}` inside a 200, because the serve waited --queue-ms (5 s) for
+# the device and gave up while the check's own 1000-token ladder row held it for 14 s. The refusal is a frame in
+# the body, so a row that looks at the status passes it. Pure, so --self-test drives it and the row below uses the
+# same code: <the long chat's body> <the queued chat's body> <TDRs before> <TDRs after>.
+queue_verdict() {
+    _q1=$1 _q2=$2 _t0=$3 _t1=$4
+    case "$_q1" in
+        '') printf 'FAIL the long chat, which owns the device, came back empty'; return 0 ;;
+        *'"error"'*) printf 'FAIL the long chat answered an error: %.100s' "$_q1"; return 0 ;;
+    esac
+    case "$_q2" in
+        ''|'000') printf 'FAIL the queued chat came back empty: a refusal still has a body, so this is a dropped request'
+                   return 0 ;;
+    esac
+    case "$_q2" in
+        *'"error"'*) printf 'FAIL the second chat was refused while the device was busy: %.120s' \
+                          "$(printf '%s' "$_q2" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+                     return 0 ;;
+    esac
+    case "$_q2" in
+        *'data: '[[[]DONE]*) ;;
+        *) printf 'FAIL the queued chat ended without data: [DONE], so it was cut rather than answered: %.80s' "$_q2"
+           return 0 ;;
+    esac
+    _qn=$(printf '%s' "$_q2" | grep -oE '"(content|reasoning_content)":"[^"]' | wc -l | tr -d ' ')
+    [ "${_qn:-0}" -gt 0 ] || { printf 'FAIL the queued chat carried no text chunk at all: a queue that ends in silence is the #911 shape'
+                               return 0; }
+    if [ -z "$_t0" ] || [ -z "$_t1" ]; then
+        printf 'PASS the second chat queued behind a 1000-token turn and answered (%s chunk(s), [DONE]); the kernel log was not readable, so no TDR was ruled out' "$_qn"
+        return 0
+    fi
+    [ "$_t1" -gt "$_t0" ] && { printf 'FAIL the NPU logged a TDR while the second chat queued (%s -> %s): see dmesg' "$_t0" "$_t1"
+                               return 0; }
+    printf 'PASS the second chat queued behind a 1000-token turn and answered (%s chunk(s), [DONE]), no TDR (still %s)' "$_qn" "$_t1"
+}
+
 # The first value of a JSON key - quoted or not, since usage counts are bare numbers - for the row's
 # small bodies (one line, one message: the same assumption chat() already makes).
 json_str() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\\1/p" | head -1; }
@@ -340,6 +378,22 @@ data: [DONE]' 0 1)"
 data: [DONE]' 0 0)"
     check PASS "$(stream_verdict 'data: {"choices":[{"delta":{"content":"1BIT OK"}}]}
 data: [DONE]' '' '')"
+    # engine #1024 / c23 board: the busy row. The board's shape is the second case - the refusal is an `error`
+    # frame inside a 200, so a row that looks at a status stays green on it.
+    check PASS "$(queue_verdict 'data: {"choices":[{"delta":{"content":"long"}}]}
+data: [DONE]' 'data: {"choices":[{"delta":{"content":""}}]}
+data: {"choices":[{"delta":{"content":"1BIT OK"}}]}
+data: [DONE]' 0 0)"
+    check FAIL "$(queue_verdict 'data: [DONE]' 'data: {"error":{"message":"the NPU is busy with another request"}}
+data: [DONE]' 0 0)"
+    check FAIL "$(queue_verdict 'data: [DONE]' 'data: {"choices":[{"delta":{"content":""}}]}
+data: [DONE]' 0 0)"                                                                                   # queued, then nothing
+    check FAIL "$(queue_verdict 'data: [DONE]' 'data: {"choices":[{"delta":{"content":"OK"}}]}' 0 0)"   # no [DONE]
+    check FAIL "$(queue_verdict 'data: [DONE]' '' 0 0)"                                                  # no body at all
+    check FAIL "$(queue_verdict 'data: [DONE]' 'data: {"choices":[{"delta":{"content":"OK"}}]}
+data: [DONE]' 0 1)"                                                                                    # a TDR while queueing
+    check PASS "$(queue_verdict 'data: [DONE]' 'data: {"choices":[{"delta":{"reasoning_content":"OK"}}]}
+data: [DONE]' '' '')"                                                                                  # dmesg unreadable
     # the history that goes back into the request has to survive a JSON string
     jt=$(json_text 'a "quoted" \\ line
 next')
@@ -910,6 +964,35 @@ else
     skip chat-npu-ladder "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
+# ── NPU chat while the device is busy: two concurrent chats, both complete (engine#1024; c23 board, 4 Nov 2026) ──
+# The c23 board refused the owner's chat with `the NPU is busy with another request` because THIS check's own
+# 1000-token ladder row held the device for 14 s: the serve waited --queue-ms (5 s) and gave up. On a single-user
+# appliance the second request has to queue, so a streamed 16-token chat started 1 s into a streamed 1000-token one
+# must be ANSWERED, and the long one must stay whole. The refusal arrives inside a 200 on the stream path, so the
+# bodies are read (queue_verdict), not the statuses.
+if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    TDRQ0=$(tdr_count)
+    QDIR=$(mktemp -d /tmp/npu-queue.XXXXXX)
+    QLONG="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Write a long essay about the history of cartography, and about what map-making changed in how people understood the world.\"}],\"max_tokens\":1000,\"temperature\":0,\"stream\":true}"
+    QSHORT="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":16,\"temperature\":0,\"stream\":true}"
+    ( auth_post "$QLONG" "$API/api/v1/chat/completions" slow > "$QDIR/long.sse" 2>&1 ) &
+    QPID=$!
+    sleep 1
+    QSHORT_BODY=$(auth_post "$QSHORT" "$API/api/v1/chat/completions" slow)
+    wait "$QPID" 2>/dev/null
+    QLONG_BODY=$(cat "$QDIR/long.sse" 2>/dev/null)
+    TDRQ1=$(tdr_count)
+    VQ=$(queue_verdict "$QLONG_BODY" "$QSHORT_BODY" "$TDRQ0" "$TDRQ1")
+    rm -rf "$QDIR"
+    case "$VQ" in
+        PASS*) pass chat-npu-queue "$NPU: $VQ" ;;
+        *)     fail chat-npu-queue "$NPU: $VQ" ;;
+    esac
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-queue "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+else
+    skip chat-npu-queue "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────
 BENCH=$LEMDIR/bin/lemonade

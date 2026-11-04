@@ -66,6 +66,23 @@
    "why": "The model's own MTP head accepts about two thirds of its three drafts, and acceptance collapses past seven, so a longer verify batch costs more than the extra drafts return. The flag is llama-server's own (--spec-draft-n-max is what serve's --mtp-max 3 passes); capping there is what the measurement below is for. Do not raise it past 7.",
    "measured": "Qwen3.8-27B UD-Q4_K_XL with its in-file MTP head, greedy 256-token chats, medians of 3, performance mode, 2026-10-24: --mtp-max 3 gives 32.6 / 26.9 / 28.0 tok/s on code / prose / short (12.1 / 12.1 / 12.5 without drafting). --mtp-max 7 --mtp-p-min 0 gives 37.9 / 22.4 / 22.4 and --mtp-max 15 33.6 / 14.9 / 13.5, with 0.17-0.60 acceptance past 8 drafts.",
    "source": "TDFLASH-HRX / TDFLASH-STRICT"
+  },
+  {
+   "id": "hrx-graph-program-cache-128",
+   "match": {
+    "device": [
+     "hrx"
+    ],
+    "architecture": [
+     "qwen4exp"
+    ]
+   },
+   "env": {
+    "GGML_HRX_GRAPH_PROGRAM_CACHE": "128"
+   },
+   "why": "Qwen3.8-Flash-Next's decode graph needs 66 distinct programs and the default count limit is 64, so at least one program is evicted and re-JITed for the whole run; one re-JIT costs about as much as four whole 36-layer GDN decode steps. The byte budget (8192 MiB) is not the binding constraint - the arenas sit at ~2.4 GiB - so raising only the count is the cheap half of this knob.",
+   "measured": "Flash-Next UD-IQ3_XXS at -c 19456, 40-minute server run: 933 'trim_graph_programs: HRX graph program cache trimmed (1 of 66 programs, ... 64 max)' lines, and 779 in the pre-rebuild run of the same row, each trim evicting exactly one program and freeing ~6 MiB. On the same box (2026-11-04) a program that is not resident costs, measured as the first graph_compute of a fresh graph against the immediately following one: 40.9 / 46.0 / 42.7 ms for a 44 / 528 / 1584-node program (warm, flat in graph size), 110-136 ms first thing in a cold process, against steady p50 of 0.65 / 5.39 / 15.29 ms for those same graphs. On a 66-program-class model at cache 128 the same build logged 0 trims. NOT measured, and the reason this is a recipe rather than a default change: the tok/s effect at 18.8k, which needs the 76.33 GiB file with the box to itself (GTT >= 109 GiB measured at load). At the observed trim rate of ~1 per 10 decode steps the ceiling is ~4 ms/step; at 1 per step it would be ~41 ms/step.",
+   "source": "engine #679, TATTN-STATE 2026-11-04"
   }
  ]
 }

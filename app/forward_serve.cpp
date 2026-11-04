@@ -40,6 +40,7 @@
 #include "npu_chatml.h"
 #include "npu_grammar.h"
 #include "npu_prefix_cache.h"
+#include "npu_prompt_ids.h"
 #include "npu_sampling.h"
 #include "npu_systemone.h"
 #include "tokenizer.h"
@@ -91,6 +92,11 @@ struct ForwardEngine {
     // model: it is what turns this server into a decision endpoint as well as a chat one.
     std::unique_ptr<npu::DecisionHead> head;
     std::string head_error;  // why there is no head, for the 503 the decision route answers
+    // --dump-logits <dir>: write each generated position's raw logits (float32, vocabulary-wide)
+    // as step_<n>.bin.  The OpenAI API cannot express this -- it caps top_logprobs at 100 -- so a
+    // KL-divergence comparison against another stack (engine#671 gate b) needs the distribution
+    // itself.  Empty means off, which is the default: nothing is written unless asked.
+    std::string dump_logits;
     std::mutex mu;
 };
 
@@ -149,10 +155,20 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         res.set_content(R"({"error":{"message":"request body is not JSON"}})", "application/json");
         return;
     }
-    std::string prompt;
+    std::string prompt;  // the chat template, or a string prompt; documents say nothing for an ids prompt
+    // Set when /v1/completions was given the prompt as token ids (llama.cpp's shape): the ids are then
+    // the prompt and nothing is tokenized or prepended -- that is what makes a two-engine parity run
+    // compare the forward instead of the tokenizer (app/npu_prompt_ids.h).  `prompt` stays empty on that
+    // path and nothing reads it: the token count, the context guard and the prefix-cache key all come
+    // from `ids`.  Do not log `prompt` as the request's text without handling this case first.
+    std::vector<int> prompt_ids;
+    bool prompt_is_ids = false;
     try {
-        prompt = chat ? npu::chatml(body.at("messages"), npu::thinking_from_body(body))
-                      : body.at("prompt").get<std::string>();
+        if (chat) prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
+        else {
+            prompt_is_ids = npu::prompt_ids_from_body(body, e.tok->size(), prompt_ids);
+            if (!prompt_is_ids) prompt = body.at("prompt").get<std::string>();
+        }
     } catch (const std::exception& ex) {
         res.status = 400;
         res.set_content(json{{"error", {{"message", std::string("bad request: ") + ex.what()}}}}.dump(), "application/json");
@@ -179,8 +195,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     }
     const npu::Grammar* gram = grammar.get();
     // A prompt this long cannot fit the context whatever it tokenizes to; refuse it before
-    // spending time on it.
-    if (prompt.size() > size_t(e.max_context) * 16) {
+    // spending time on it.  An id prompt states its own length, so the check runs on ids below.
+    if (!prompt_is_ids && prompt.size() > size_t(e.max_context) * 16) {
         res.status = 400;
         res.set_content(R"({"error":{"message":"prompt longer than the context"}})", "application/json");
         return;
@@ -195,15 +211,18 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
     // a stop sequence or a grammar that allows nothing more, "length" when the token
     // budget ran out.
-    auto run = [&e, &req, prompt, max_tokens, chat, &opts, gram, &stats](
+    auto run = [&e, &req, prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats](
                    const std::function<bool(const std::string&, const std::vector<Emitted>&)>& on_text) {
         std::string finish = "stop";
-        // The tokenizer is const and keeps no per-call state, so it runs before the lock.
-        std::vector<int> ids = e.tok->encode(prompt);
+        // The tokenizer is const and keeps no per-call state, so it runs before the lock.  A caller
+        // that sent ids already stated the positions: they are used exactly, with no BOS inserted
+        // on top (inserting one there would re-introduce the one-token prompt difference an id
+        // prompt exists to remove).
+        std::vector<int> ids = prompt_is_ids ? prompt_ids : e.tok->encode(prompt);
         // A chat template that opens with {{- bos_token }} (MiniCPM5 and other
         // llama-class models) needs the BOS id: the ChatML prompt built above never
         // carries it, and those models derail into their special tokens without it.
-        if (chat && e.add_bos && e.bos_id >= 0) ids.insert(ids.begin(), e.bos_id);
+        if (!prompt_is_ids && chat && e.add_bos && e.bos_id >= 0) ids.insert(ids.begin(), e.bos_id);
         if (ids.empty()) throw std::runtime_error("empty prompt");
         stats.prompt_tokens = int(ids.size());
         // The KV cache grows with every position: the prompt and the answer together stay
@@ -326,6 +345,16 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         for (int n = 0; n < limit; n++) {
             if (req.is_connection_closed()) break;  // the client is gone: free the NPU
             if (gram) refresh_allowed();
+            // Raw distribution for a reference comparison: sample_token() takes logits by const
+            // reference and the copy below happens before it runs, so what lands on disk is what
+            // the model produced, not what the sampler chose.
+            if (!e.dump_logits.empty()) {
+                const std::string path = e.dump_logits + "/step_" + std::to_string(n) + ".bin";
+                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(logits.data(), sizeof(float), logits.size(), f);
+                    std::fclose(f);
+                }
+            }
             const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr);
             // -1: the grammar allows no token here, so the answer ends where it is.  EOS is
             // not masked by the grammar on purpose: a constrained answer is still allowed to
@@ -648,7 +677,7 @@ void handle_systemone(ForwardEngine& e, const httplib::Request& req, httplib::Re
 }  // namespace
 
 int run_forward_serve(int argc, char** argv) {
-    std::string model, kernels, host = "127.0.0.1", alias;
+    std::string model, kernels, host = "127.0.0.1", alias, dump_logits;
     int port = 8000, streams = 1;
     npu::PrefixOptions prefix_opts;  // --prefix-slots / --prefix-cache-mb / --prefix-min-gain (#650)
     for (int i = 0; i < argc; i++) {
@@ -666,10 +695,11 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--prefix-cache-mb") prefix_opts.cache_mb = std::stoul(next());
         else if (a == "--prefix-min-gain") prefix_opts.min_gain = std::stoi(next());
         else if (a == "--npu-streams") streams = std::stoi(next());
+        else if (a == "--dump-logits") dump_logits = next();
         else throw std::runtime_error("unknown option " + a);
     }
     if (model.empty())
-        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N]");
+        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--dump-logits <dir>]");
     if (streams < 1 || streams > kNpuMaxStreams)
         throw std::runtime_error("--npu-streams takes 1.." + std::to_string(kNpuMaxStreams) +
                                  " (the device's hwctx limit), not " + std::to_string(streams));
@@ -681,6 +711,14 @@ int run_forward_serve(int argc, char** argv) {
 
     ForwardEngine e;
     e.id = alias.empty() ? std::filesystem::path(dir).filename().string() : alias;
+    if (!dump_logits.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(dump_logits, ec);
+        if (ec || !std::filesystem::is_directory(dump_logits))
+            throw std::runtime_error("--dump-logits: cannot use " + dump_logits + " as a directory");
+        e.dump_logits = dump_logits;
+        std::fprintf(stderr, "1bit forward-serve: dumping raw logits to %s\n", dump_logits.c_str());
+    }
     e.tok = std::make_unique<npu::Tokenizer>(tok_json);
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;

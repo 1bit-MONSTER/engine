@@ -19,13 +19,16 @@ limitations under the License.
 1bit OS runs [Lemonade Server](https://github.com/lemonade-sdk/lemonade), and Lemonade is what a client
 talks to. On the appliance it listens on **`0.0.0.0:13305`** — every interface, not just loopback — with
 an OpenAI-compatible API under **`/api/v1`** (and `/v1`), a WebSocket on **9000**, and its web app at the
-root. Every request needs the API key as a Bearer token:
+root. **It ships with no API key** (cycle 20, stock-Lemonade behaviour,
+[#934](https://github.com/1bit-MONSTER/engine/pull/934)): every request works with no header at all, so
+anything on your network can use the box until you turn a key on — console **1 → Show the API key**, or
+`prepare-stick --mint` when you write the stick. Once keyed, every request needs it as a Bearer token:
 
 ```
 Authorization: Bearer <key>
 ```
 
-The key is the only gate. Anything on the same network that has it can use the box.
+and then the key is the only gate: anything on the same network that has it can use the box.
 
 | client | how it connects |
 |---|---|
@@ -53,22 +56,41 @@ console, the router's client list shows the box
 `lemond` logs `Net Broadcast` on each RFC1918 interface, and `lemonade scan` (run anywhere on the same
 network with the CLI installed) lists the beacons it hears.
 
-**The key.** It is one line in Lemonade's environment file on the `1BIT-DATA` partition:
+**The key, if there is one.** The shipped default has none — `10lemonade` starts with `LEMONADE_API_KEY`
+unset and binds `0.0.0.0:13305` anyway (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62`) — so the first
+thing to check is the console's status block:
+
+```
+API key: none (blank mode), press 1      # blank: no key, anyone on this network can use the box
+API key: set, press 1                    # keyed
+```
+
+**1 → Show the API key** is the toggle. In blank mode it mints 48 hex characters into
+`/etc/1bit/lemond.conf` (mode `0600`, a symlink onto `/data`), restarts the service and prints the key; in
+keyed mode it prints the key and offers to turn it off
+(`os/v3/puppy/embed/usr/local/bin/1bit-console-menu:300-370`). `prepare-stick --mint` writes the same
+line offline. When a key exists it is one line in Lemonade's environment file on the `1BIT-DATA`
+partition:
 
 ```sh
 sudo sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf
 ```
 
-`/etc/1bit/lemond.conf` is a symlink to that same file, so either path reads the same key. It is
-`0600 root`, minted by `prepare-stick --mint` when the stick is written, and written on first boot if the
-file is empty. There is no `lemonade` CLI command that prints it — the file is the interface.
+`/etc/1bit/lemond.conf` is a symlink to that same file, so either path reads the same key, and it is
+`0600 root`. There is no `lemonade` CLI command that prints it — the file is the interface.
 
 ## 2. `curl`
 
-List the models, with the key:
+List the models. In blank mode (the default) there is no header:
 
 ```sh
 BOX=192.168.1.42
+curl -s http://$BOX:13305/api/v1/models          # blank mode
+```
+
+Once the box is keyed, every request carries the key:
+
+```sh
 KEY=$(ssh root@$BOX "sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf")   # or copy it by hand
 
 curl -s -H "Authorization: Bearer $KEY" http://$BOX:13305/api/v1/models
@@ -82,8 +104,9 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   http://$BOX:13305/api/v1/chat/completions
 ```
 
-`http=200` and a `choices[0].message.content` in the body is the whole check. Without the key the same
-request answers **401**; with a wrong key, also 401.
+`http=200` and a `choices[0].message.content` in the body is the whole check. The
+`-H "Authorization: Bearer $KEY"` goes on every request once the box is keyed and is redundant in blank
+mode; in keyed mode, without the key the same request answers **401**, and with a wrong key too.
 
 The `chat_template_kwargs` bit is for the thinking models in the catalogue: without it Qwen3 answers in
 `reasoning_content` and `content` stays empty, which is correct but reads like a failure in a one-line
@@ -102,9 +125,9 @@ Lemonade (2026-11-02 board run).
 ## 3. The Lemonade web app in a browser
 
 Open `http://<box>:13305` from any machine on the LAN. Lemonade's web app is served there — chat, the
-model catalogue, downloads, settings and logs. The page itself loads without a key (it is static), and
-every request it makes needs one, so the first time it asks for the API key; paste the key from
-[1](#1-find-the-box-and-its-key).
+model catalogue, downloads, settings and logs. The page itself loads without a key (it is static). In
+blank mode (the default) it needs nothing; once the box is keyed, every request it makes needs the key,
+so the first time it asks for it; paste the key from [1](#1-find-the-box-and-its-key).
 
 ## 4. Lemonade Mobile on a phone
 
@@ -119,16 +142,18 @@ server: no cloud account and no Lemonade service in the path, just the box you c
 In the app: **Settings → Manage servers → add a server**, then
 
 - **URL**: `http://<box>:13305` (the scheme and the port are part of it; no trailing `/api/v1`)
-- **API key**: the key from [1](#1-find-the-box-and-its-key)
+- **API key**: empty in blank mode (the shipped default); otherwise the key from [1](#1-find-the-box-and-its-key)
 
 The app manages several servers, so a second box (or the same model on another machine) is a second
-entry. The App Store listing calls the API key optional — that is for a Lemonade running with no key. **On
-1bit OS it is required**: without it the app gets 401 from every request.
+entry. The App Store listing calls the API key optional, and on the shipped appliance it is: blank is the
+default, so leave the field empty. If a key has been turned on, it is required — without it the app gets
+401 from every request.
 
 ## 5. OpenAI SDKs and OpenAI-compatible apps
 
-Any OpenAI client works; the two values are the base URL and the key. Python, against the `openai`
-package:
+Any OpenAI client works; the two values are the base URL and, once the box is keyed, the key. Python,
+against the `openai` package (in blank mode the SDK still wants some string for `api_key` — anything works,
+because Lemonade ignores it):
 
 ```python
 from openai import OpenAI
@@ -148,8 +173,8 @@ the same as the `curl` example above.
 
 The same two values fill in any app that speaks the OpenAI API and lets you set a base URL — Open WebUI,
 Continue, a chat front-end, an agent framework. Give it `http://<box>:13305/api/v1` (or `…/v1`; Lemonade
-answers both) and the key. Lemonade's own docs keep a list of clients it is tested with at
-[lemonade-server.ai](https://lemonade-server.ai).
+answers both) and, if the box is keyed, the key. Lemonade's own docs keep a list of clients it is tested
+with at [lemonade-server.ai](https://lemonade-server.ai).
 
 ## 6. The `lemonade` CLI from another machine
 
@@ -165,16 +190,18 @@ The same three values have environment variables, which is how a script sets the
 `LEMONADE_HOST`, `LEMONADE_PORT`, `LEMONADE_API_KEY`. `lemonade scan` finds servers on the LAN that
 announce themselves (the beacon `lemond` sends — the same one the mobile app can use).
 
-On the box itself the CLI needs no `--host`: `lemonade status` uses `127.0.0.1:13305`, and it still needs
-`--api-key` (or `LEMONADE_API_KEY` in the environment) because the server requires it on every route.
+On the box itself the CLI needs no `--host`: `lemonade status` uses `127.0.0.1:13305`, and `--api-key`
+only matters once the box is keyed (blank mode has no key to pass).
 
-## 7. Security: the key is the whole gate
+## 7. Security: blank by default, the key once it is on
 
 | | |
 |---|---|
-| the gate | `LEMONADE_API_KEY` on every `/api/*`, `/v0/*` and `/v1/*` request, as a Bearer token. No key, no service |
-| network | the appliance opens **13305** (Lemonade) and **22** (SSH) in its firewall, and allows the RFC1918 ranges through `/etc/hosts.allow`; everything else inbound is dropped. It is a LAN service |
-| never | forward 13305 from your router to the internet. If you need it from outside, use a VPN, or an HTTPS reverse proxy in front of it — Lemonade's own [FAQ](https://lemonade-server.ai/docs/guide/faq/) says the same |
+| the default | **no key** (cycle 20). `lemond` answers every `/api/*`, `/v0/*` and `/v1/*` request with no header — stock Lemonade — and it is reachable from the LAN by design (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62,78-81`). The console's CONNECT block says so in those words, `(no key: anyone, press 1)` |
+| turning it on | console **1 → Show the API key**: mints 48 hex into `/etc/1bit/lemond.conf` (`0600`, a symlink onto `/data`), restarts the service, prints it; run it again to turn it off. `prepare-stick --mint` does the offline half. From then on the key is the whole gate: every request needs it as a Bearer token, no key or a wrong key is **401** |
+| the web app's key | only the box's own page uses it, and `1bit-webapp-proxy` (the `127.0.0.1:8080` chat page) adds the header itself — a URL never carries the key, and a forward whose `Origin` is not that loopback page is refused before the key is attached (`os/v3/puppy/embed/usr/local/bin/1bit-webapp-proxy:37-44`) |
+| network | the appliance opens **13305** (Lemonade) and **22** (SSH) in its firewall, and allows the RFC1918 ranges through `/etc/hosts.allow`; everything else inbound is dropped. It is a LAN service, keyed or not |
+| never | forward 13305 from your router to the internet. If you need it from outside, use a VPN, or an HTTPS reverse proxy in front of it — and turn a key on first. Lemonade's own [FAQ](https://lemonade-server.ai/docs/guide/faq/) says the same |
 | SSH | keys only: `/data/ssh/authorized_keys` on the stick is copied to `/root/.ssh/authorized_keys` at boot. `prepare-stick --ssh-pubkey` writes it |
 | rotate the key | write the new one and restart the service: `sudo sh -c 'printf "LEMONADE_API_KEY=%s\n" "$(head -c 24 /dev/urandom \| od -An -tx1 \| tr -d " \\n")" > /data/lemonade/lemond.conf' && sudo /etc/init.d/10lemonade restart`. Every client's key has to be updated with it. Re-running `prepare-stick --mint` on a reflashed stick does the same thing offline |
 
@@ -196,7 +223,7 @@ Against the cycle-13 appliance image booted in QEMU (`sha256 dcc619ff…`, kerne
 |---|---|
 | Lemonade listens on every interface | `netstat`: `lemond` on `0.0.0.0:13305`, WebSocket `9000`, `sshd` on `0.0.0.0:22` |
 | `/api/v1` and `/v1` are the API | `GET /api/v1/models` and `GET /v1/models` both answer |
-| the key is required, and only the key | with a key minted: no key and a wrong key → **401**, the right key → **200** (both paths) |
+| the key is required, and only the key (cycle-13 image, which minted one) | with a key minted: no key and a wrong key → **401**, the right key → **200** (both paths). Cycle 20 ships blank instead: the appliance's own gate asserts **200 with no header** in blank mode and 401/200 keyed (`os/v3/puppy/vm-check.sh:710-730`) |
 | the key's file | `readlink -f /etc/1bit/lemond.conf` → `/data/lemonade/lemond.conf`, `0600 root`; a key written there plus `/etc/init.d/10lemonade restart` takes effect on the next request |
 | the web app | `GET http://<box>:13305/` → 200, `text/html`, `<title>Lemonade App</title>`, with and without a key (it is static; its own API calls are what 401) |
 | the `curl` chat example | `POST /api/v1/chat/completions` with `chat_template_kwargs.enable_thinking=false`: **200**, `content: "Sure! 😊"`, `finish_reason: stop` |

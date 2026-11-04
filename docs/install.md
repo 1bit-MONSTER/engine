@@ -41,32 +41,48 @@ The image is on Hugging Face, not on the GitHub release, because a GitHub releas
 2 GiB and this one is 9,128,902,656 B written (**2,212,389,580 B** as `.img.xz`). That repository is
 private until v2026.44 is published, so from that day the lines below are the download; an earlier
 release carries only the BusyBox `os/mini` image, which is the CI/VM target. Fetch both files, check
-the checksum, then write it and prepare it (the last line is what puts the API key, your SSH key and any
-models on the stick — see [1](#1-run-from-the-stick-no-install)):
+the checksum, then write it and prepare it (the last line puts your SSH key and any models on the stick;
+`--mint` is optional and is the only way to ship a key, because the appliance boots with none — see
+[1](#1-run-from-the-stick-no-install)):
 
 ```sh
 # 1bit-os-puppy.img.xz and SHA256SUMS from https://huggingface.co/1bit-MONSTER/1bit-OS
 sha256sum -c SHA256SUMS --ignore-missing
 xz -dc 1bit-os-puppy.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
 sudo os/mini/prepare-stick.sh /dev/sdX --mint --ssh-pubkey ~/.ssh/id_ed25519.pub
+#                                      ^^^^^^ opt-in: drop it for the shipped no-key default
 ```
 
 Writing the `.img.xz` straight from balenaEtcher or Rufus (DD mode) is the same write with no shell
-line. The `prepare-stick` line below is still the one to run if you want the key in your hand before the
-box boots — a `dd`-only stick gets one on its first boot instead.
+line. The `prepare-stick` line is the one to run if you want your SSH key on before the box boots (and a
+Lemonade key in your hand, with `--mint`); a `dd`-only stick gets no Lemonade key at all, and that is the
+shipped state.
 
-`prepare-stick` writes `/ssh/authorized_keys` and a freshly minted Lemonade API key into
-`/lemonade/lemond.conf` on the stick's `1BIT-DATA` partition, and copies `--model` files into
-`/models`. A stick written with `dd` alone starts with no key, but the appliance mints one on its first
-boot: `05onboard-data` no longer pre-creates an empty `lemond.conf`, and `10lemonade` asks "is there a
-key", not "is there a file", before minting ([#867](https://github.com/1bit-MONSTER/engine/issues/867),
-fixed on `main` by [#828](https://github.com/1bit-MONSTER/engine/pull/828)). On the **cycle-13 image**
-that was not true: a `dd`-written stick booted Lemonade on `0.0.0.0:13305` with no key at all and served
-every endpoint — `/internal/*` included — unauthenticated, on every boot. So if your image predates that
-fix, treat `--mint` as mandatory. Read the key either way with
-`sudo sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf`; an empty answer on a box that has
-booted once means no key was minted and the box is open, and the console's **1 → Show API key** prints
-the key that was.
+`prepare-stick` writes `/ssh/authorized_keys` into the stick's `1BIT-DATA` partition and copies `--model`
+files into `/models`. With `--mint` it also writes a Lemonade API key into `/lemonade/lemond.conf`.
+**Without `--mint` there is no key line and no `lemond.conf`, which is the shipped default**: cycle 20 made
+the appliance behave like stock Lemonade (owner decision 2026-11-03, "blank key",
+[#934](https://github.com/1bit-MONSTER/engine/pull/934)), so `10lemonade` starts with
+`LEMONADE_API_KEY` unset **and still binds `0.0.0.0:13305`** — anyone on your network can use the box
+until you turn a key on (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62`). `prepare-stick` reports the
+absent file as a PASS that names the mode (`os/mini/prepare-stick.sh:346-410`).
+
+Turn one on from the console: **1 → Show the API key** is a toggle. In blank mode it mints 48 hex
+characters into `/etc/1bit/lemond.conf` (mode `0600`, a symlink onto `/data`), restarts the service and
+prints the key; in keyed mode it prints the key and offers to turn it off
+(`os/v3/puppy/embed/usr/local/bin/1bit-console-menu:300-370`). The console says which mode you are in —
+`api http://<ip>:13305/api/v1   (no key: anyone, press 1)` against `(API key: press 1)`
+(`1bit-console-menu:238,242`; the TUI's own line at `os/v3/puppy/console-tui/src/ui.rs:203-215`). To read
+a key that exists: `sudo sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf`.
+
+The **cycle-13 image** is why this section is careful. It minted a key at first boot, and on a
+`dd`-written stick it could leave a 0-byte `lemond.conf` that every script read as "keyed" and `lemond`
+read as "no key" — so it served every endpoint, `/internal/*` included, unauthenticated
+([#867](https://github.com/1bit-MONSTER/engine/issues/867) fixed on `main` by
+[#828](https://github.com/1bit-MONSTER/engine/pull/828); cycle 20 then removed the mint entirely). If
+your image predates that, treat `--mint` as mandatory. One **media difference** to keep straight:
+`os/mini` still mints a key at first boot (`os/mini/init.sh`), so a BusyBox stick is keyed while the Puppy
+appliance is blank ([os-v3.md](os-v3.md)).
 
 ## 1. Run from the stick (no install)
 
@@ -74,27 +90,30 @@ the key that was.
    ([7](#7-the-bosgame-beyondmax-has-one-usable-usb-port)).
 2. Boot it. The default entry, `1bit OS (headless console, 7.3.0-rc4-1bit-perfopt+)`, comes up headless:
    a console with no X, whose first screen prints the box's address and how to connect to it (web UI,
-   API, `ssh`), above a menu whose item 1 shows the API key. The second, `1bit OS (desktop, JWM)`, starts
+   API, `ssh`), above a menu whose item 1 turns the Lemonade API key on (the shipped default is no key)
+   and prints it. The second, `1bit OS (desktop, JWM)`, starts
    Puppy's desktop on the same system;
    the third, `1bit OS - install to a disk (1bit.installer=1)`, opens the installer
    ([2](#2-install-to-an-internal-disk)); the fourth, `1bit OS - serial root shell (1bit.serial=1)`, gives
    a root shell on the serial port for a rack machine with no monitor.
 3. Nothing on the machine is written. The system runs in RAM from the stick's squashfs
-   (`pfix=copy`); the models, Lemonade's config and cache, your SSH keys and the API key live on the
-   stick's `1BIT-DATA` partition.
+   (`pfix=copy`); the models, Lemonade's config and cache, your SSH keys and the API key (once turned
+   on) live on the stick's `1BIT-DATA` partition.
 
 Check that it is up:
 
 ```sh
+curl -s http://127.0.0.1:13305/api/v1/models      # blank mode (the default): no header needed
 curl -s -H "Authorization: Bearer $(sudo sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf)" \
-     http://127.0.0.1:13305/api/v1/models
+     http://127.0.0.1:13305/api/v1/models         # keyed mode
 ```
 
-That command is one of the ones measured below; a client on another machine uses the box's address
-instead of `127.0.0.1` ([clients.md](clients.md)).
+The second form is the one measured below on the cycle-13 image, which minted a key; a client on another
+machine uses the box's address instead of `127.0.0.1` ([clients.md](clients.md)).
 
 **What persists on the stick**, all of it on `1BIT-DATA` (Puppy's save layer, `PUPMODE=12`):
-`models/`, `lemonade/config/`, `lemonade/cache/`, `lemonade/lemond.conf` (the API key), `ssh/` (host key
+`models/`, `lemonade/config/`, `lemonade/cache/`, `lemonade/lemond.conf` (the API key, once turned on),
+`ssh/` (host key
 and `authorized_keys`), `npu/kernels/`, `cache/hrx-jit/`. Those are written straight to the partition, so
 they survive any shutdown. A change elsewhere (`/etc`, `/root`, `/tmp`) is RAM-only until there is a save
 folder to put it in: measured on a stick with no save folder, a marker written in `/etc` was gone after
@@ -266,7 +285,7 @@ On the cycle-13 image (`sha256 dcc619ff74882f484e4c7dfb373980f294ce2f39b02291fb8
 [#889](https://github.com/1bit-MONSTER/engine/pull/889)) |
 | what the install copies | the installed data partition holds `/1bit` (`vmlinuz`, `initrd.gz`, the four SFS), `/data` with the models, `lemonade/` and `ssh/`, and `.installed` |
 | boot of the installed disk as written | **fails** on this image: init says `Partition UUID=<uuid> not found` and drops to the rescue console ([#865](https://github.com/1bit-MONSTER/engine/issues/865); fixed on `main` by [#890](https://github.com/1bit-MONSTER/engine/pull/890), merged 2026-11-03) |
-| boot of the same disk with `pupsfs=1BIT-DATA` (label) instead of `pupsfs=UUID=…` | **boots**: `puppypc20143`, `/data/.installed` present, `lemond` up, `GET /api/v1/models` 401 without the key and 200 with it |
+| boot of the same disk with `pupsfs=1BIT-DATA` (label) instead of `pupsfs=UUID=…` | **boots**: `puppypc20143`, `/data/.installed` present, `lemond` up, `GET /api/v1/models` 401 without the key and 200 with it (cycle-13 minted a key; cycle 20 ships blank and answers 200 with no header — see [1](#1-run-from-the-stick-no-install)) |
 | the boot device is rejected, not guessed | the refusal above is by device: `/proc/mounts` names `/dev/sda2` as `/data`, and the installer resolves the disk behind it |
 | `pmedia=usbhd` is not the cause | the failed boot was from a USB device, where `pmedia=usbhd` is the correct media class; the label/UUID A/B above isolates the cause to the UUID form |
 

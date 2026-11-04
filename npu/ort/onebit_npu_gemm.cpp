@@ -330,6 +330,9 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
         std::memset(ctx.Am, 0, (size_t)ctx.MD * ctx.KD);
         for (int r = 0; r < rows; ++r)
             std::memcpy(ctx.Am + (size_t)r * ctx.KD, a + (row0 + r) * k, (size_t)k);
+        // This path writes A itself (no quantiser), so the context has no way to know how many rows the host
+        // will read back: one row of the C BO is the default, and a batched block needs `rows` of them.
+        ctx.set_activation_rows(rows);
         // Only row 0 of a launch is watched (that is what #701's canary covers, and deliberately: poisoning
         // the padded last row of a batched launch fires on every prefill), so a block after the first is
         // protected exactly as much as the rest of this file's batched paths are.

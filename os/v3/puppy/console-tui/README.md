@@ -63,7 +63,13 @@ and everything above them gives way in a fixed order - the status facts first (t
 then the log pane (a title needs a row under it), then the CONNECT block's own tail, whole rows at a time. So an
 ssh window at 80x18 still shows all nine actions and `Reboot / power off`; before this the menu itself was clipped
 and the footer went on promising "1-9 actions" (`a_short_window_keeps_the_nine_actions_and_the_footer_whole` sweeps
-nine sizes).
+ten sizes).
+
+**When the frame is one row short of the menu itself** - 80x10, 56x11, 40x12, 30x16: a tmux split or an ssh window on
+a phone - the `MENU` rule goes before any action does. It is decoration, and it used to be charged first, so ratatui
+clipped the end of the menu: `9 Reboot / power off` (a `vm-check.sh` string) was off the screen while the footer still
+promised "1-9 actions". Swept over 13 widths x 19 heights, 72 sizes gained that row and none lost the
+frame-is-the-terminal invariant (`the_menu_rule_gives_way_before_an_action_does`).
 
 ## Keys
 
@@ -156,7 +162,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 45 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
+cargo test                                    # 46 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

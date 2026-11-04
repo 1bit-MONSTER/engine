@@ -121,6 +121,17 @@ struct Plan {
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);
 
+// The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
+// actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos
+// do publish the text, and how much of it varies per pack), and an importer that says nothing about
+// it writes a container that only fails later, in another command, as "not an NPU model
+// directory" -- which reads like our bug.
+struct TextArtifacts {
+    std::vector<std::string> present, missing;  // both in the importer's own file order
+    bool tokenizer = false;                     // tokenizer.json present: what `1bit serve` opens
+};
+TextArtifacts scan_text_artifacts(const std::string& pack_dir);
+
 struct Options {
     bool allow_incomplete = false;  // write what is representable and name the rest
 };

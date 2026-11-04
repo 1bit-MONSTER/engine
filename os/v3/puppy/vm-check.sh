@@ -668,6 +668,15 @@ rows = [
     # row runs is a race, but an ACCEPT for tcp/13305 is what makes U3 reachable either way.
     ("U3 port rule", "iptables -C INPUT -p tcp --dport 13305 -j ACCEPT && echo port-13305-open; "
                      "iptables -C INPUT -p tcp --dport 22 -j ACCEPT && echo port-22-open", None),
+    # Cycle 23 (c22 board, 4 Nov): avahi logged "1bit-os.local is announced" and a raw mDNS query from ryzen got no
+    # answer at all. The cause is in the same rc.firewall the two rows above work around: every NEW inbound UDP
+    # packet goes to `udp_inbound`, which accepts only DHCP and RETURNs to the DROP policy, and a query on 5353 is
+    # UDP - while the announcements themselves left fine (`-A OUTPUT -p ALL -j ACCEPT`). The durable assertion is
+    # the rule, for the same reason as the ports above; whether the responder is up is read in the same row.
+    ("U3 mdns rule", "iptables -S INPUT | grep -E -- '-p udp.*--dport 5353.*-j ACCEPT' | head -2; "
+                     "iptables -C INPUT -p udp --dport 5353 -s 10.0.0.0/8 -j ACCEPT 2>/dev/null && echo udp-5353-open; "
+                     "pidof avahi-daemon > /dev/null && echo avahi-up; tail -1 /var/log/mdns.log 2>&1",
+                     "udp-5353-open"),
     ("net addr",     "ip -4 -o addr show 2>/dev/null | tr -s ' '", None),
     ("net route",    "ip -4 route 2>/dev/null | head -3", None),
 ]

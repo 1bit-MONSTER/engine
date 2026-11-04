@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# /etc/init.d/zz-onboard-ports - the appliance's two inbound ports, opened after Puppy's firewall.
+# /etc/init.d/zz-onboard-ports - the appliance's inbound ports and its mDNS responder, opened after Puppy's
+# firewall.
 #
 # Measured in a booted image: `iptables -S` shows `-P INPUT DROP` with `tcp_inbound` RETURNing to that
 # policy, so every new inbound TCP connection from outside is dropped. lemond binds 0.0.0.0:13305 and the
@@ -34,6 +35,35 @@ open_port() {
 }
 open_port 13305   # Lemonade (U3)
 open_port 22      # ssh, the owner's key (U7)
+
+# mDNS (cycle 23; c22 board 4 Nov: avahi logged "1bit-os.local is announced" and a raw mDNS query from ryzen got
+# no answer at all). The reason is in the same rc.firewall this file already had to work around, read out of the
+# packed c22 puppy sfs:
+#
+#   -P INPUT DROP
+#   -A INPUT -p ALL -d 224.0.0.1 -j DROP          (only .1; a query to 224.0.0.251 gets past this)
+#   -A INPUT -p UDP -j udp_inbound                (drops 137/138, accepts DHCP 67->68, then -j RETURN)
+#   -A INPUT -m pkttype --pkt-type broadcast -j DROP
+#
+# so every NEW inbound UDP packet falls through to the DROP policy, and 5353 is UDP. A query is exactly that
+# packet, which is why the responder never saw one; its own announcements did reach the wire, because the same
+# file ends with `-A OUTPUT -p ALL -j ACCEPT` - so this needs no OUTPUT rule, only the query that confirms it.
+#
+# LAN-only, the same ranges as hosts.allow below, plus link-local (avahi's fallback when there is no lease):
+# announcing to a phone on the LAN is the point, being a public responder is not. `-I INPUT 1` puts these ahead
+# of udp_inbound and of the broadcast drop, and -C keeps a re-run a no-op.
+open_mdns() {
+    for src in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
+        iptables -C INPUT -p udp --dport 5353 -s "$src" -j ACCEPT 2> /dev/null && continue
+        iptables -I INPUT 1 -p udp --dport 5353 -s "$src" -j ACCEPT 2> /dev/null && continue
+        echo "zz-onboard-ports: could not open udp/5353 for $src" >&2
+        return 1
+    done
+}
+# shortcut: IPv4 only. 18onboard-mdns's responder answers on both families, but this image's IPv6 is
+# unconfigured (no global address, and the board reaches it at 192.168.50.110), so a v6 rule would be untested
+# code; add fe80::/10 to this loop when the appliance gets an IPv6 address.
+open_mdns
 
 # And the other half of reachability, measured the same way: Puppy ships /etc/hosts.deny = "ALL: ALL" with
 # /etc/hosts.allow = "ALL: LOCAL", and LOCAL means this machine, so a client on the LAN is refused by

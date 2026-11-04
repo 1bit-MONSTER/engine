@@ -58,6 +58,13 @@ Two layouts off ONE set of facts, chosen by width:
 The MENU is whole and always on screen at both sizes; the log pane gets whatever rows are left (at least three at
 80x25). Key **8** is the full-screen, scrollable view.
 
+**On a window shorter than the layout** nothing is drawn half: the nine menu rows and the footer are never trimmed,
+and everything above them gives way in a fixed order - the status facts first (they are the "technical information"),
+then the log pane (a title needs a row under it), then the CONNECT block's own tail, whole rows at a time. So an
+ssh window at 80x18 still shows all nine actions and `Reboot / power off`; before this the menu itself was clipped
+and the footer went on promising "1-9 actions" (`a_short_window_keeps_the_nine_actions_and_the_footer_whole` sweeps
+nine sizes).
+
 ## Keys
 
 | key | what it does |
@@ -149,7 +156,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 43 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the two renders
+cargo test                                    # 45 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

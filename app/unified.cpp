@@ -267,6 +267,11 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
                 end += "data: [DONE]\n\n";
                 sink.write(end.data(), end.size());
             } catch (const std::exception& ex) {
+                // The 200 and the SSE headers are already on the wire, so an error event inside the stream is all the
+                // client can be told. The server's own stderr is where the appliance keeps its evidence, and without
+                // this line a failed generation left "200 OK" behind and no reason at all (c21 board 2026-11-04:
+                // "code 614, state 8" reached the page, nothing reached /data/logs).
+                std::fprintf(stderr, "1bit unified: the generation failed after the stream started: %s\n", ex.what());
                 const std::string err = "data: " + json{{"error", {{"message", ex.what()}}}}.dump() + "\n\n";
                 sink.write(err.data(), err.size());
                 // A stream that ends without [DONE] is what Lemonade reports as a hung backend, so every

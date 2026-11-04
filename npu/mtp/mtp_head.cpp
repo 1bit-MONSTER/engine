@@ -295,6 +295,17 @@ int argmax_prob(const std::vector<float>& logits, float* prob) {
     return best;
 }
 
+DepthVerdict depth_verdict(int live_hits, int live_reached, int offline_hits, int offline_reached, double bar_pp) {
+    DepthVerdict v;
+    if (live_reached <= 0 || offline_reached <= 0) return v;   // no denominator on a side: n/a, not 0.00 %
+    v.scored = true;
+    v.live = 100.0 * live_hits / live_reached;
+    v.offline = 100.0 * offline_hits / offline_reached;
+    v.delta = v.live - v.offline;
+    v.within = v.delta <= bar_pp && v.delta >= -bar_pp;
+    return v;
+}
+
 bool MtpDrafter::next_row(const float* hidden, int token, int pos, std::vector<float>& next,
                           std::vector<float>& logits) {
     std::vector<float> emb;

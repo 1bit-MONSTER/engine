@@ -167,6 +167,12 @@ struct Stats {
     // Per draft depth: rows offered at depth d, and how many of them the base model agreed with.  This is the
     // shape the offline protocol reports, and the only form in which "live equals offline" can be checked.
     int drafted_at[kMaxDepth] = {0}, accepted_at[kMaxDepth] = {0};
+    // The denominator of the per-depth acceptance RATE: chains that accepted drafts 0..d-1 AND offered a draft at
+    // d.  It is not accepted_at[d-1]: under a tau gate a chain can stop exactly after accepting depth d-1, which
+    // leaves accepted_at[d-1] positive with nothing drafted at d -- and scoring that depth reads a phantom 0 %
+    // against an offline rate that was measured.  At tau=0 every reached chain offers draft d, so this equals
+    // accepted_at[d-1] (drafted_at[0] at d=0) and no reported number moves.
+    int reached_at[kMaxDepth] = {0};
     // The stream position of every chain this loop opened, and what that chain produced.  The offline protocol
     // chains from EVERY position, so its per-depth table and this one are only the same measurement when it is
     // scored at these positions -- and the drafts themselves are the only way to tell a feeding difference from a
@@ -182,6 +188,23 @@ struct Stats {
     // Passes per emitted token: the number that has to fall for speculation to be a speed win at all.
     double passes_per_token() const { return emitted ? double(steps + batches) / double(emitted) : 0.0; }
 };
+
+// The live loop's side of the per-depth comparison, built in ONE place so the report sites and the tests cannot
+// read it differently: hit[d] = chains that accepted depth d, reached[d] = chains that offered a draft at d after
+// accepting the prefix.  reached[] is Stats::reached_at and NOT accepted_at[d-1]: under a tau gate the two differ
+// exactly where a chain stopped right after accepting a depth, and using the second one scores a depth the loop
+// never drafted (see tests/mtp_draft_test.cpp [9]).
+struct LiveDepths {
+    int hit[Stats::kMaxDepth] = {0};
+    int reached[Stats::kMaxDepth] = {0};
+};
+
+inline void add_live_depths(const Stats& s, LiveDepths& t) {
+    for (int d = 0; d < Stats::kMaxDepth; d++) {
+        t.hit[d] += s.accepted_at[d];
+        t.reached[d] += s.reached_at[d];
+    }
+}
 
 struct Result {
     std::vector<int> tokens;
@@ -270,6 +293,9 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         r.stats.chain_drafts.push_back(std::vector<int>(d.begin(), d.begin() + nd));
         r.stats.chain_accepted.push_back(a);
         for (int i = 0; i < a && i < Stats::kMaxDepth; i++) r.stats.accepted_at[i]++;
+        // Depth d is scored only if the prefix was accepted (a >= d) and a draft at d actually existed (nd > d).
+        // a <= nd always, so this counts i < a plus the one rejected draft at i == a when the chain went that far.
+        for (int i = 0; i <= a && i < nd && i < Stats::kMaxDepth; i++) r.stats.reached_at[i]++;
         if (a == 0) r.stats.first_reject++;
 
         // Commit the accepted rows of the verify batch and discard the rest.  With a deferring base this

@@ -67,6 +67,10 @@ pub enum Modal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Yes {
     ShowKey,
+    // Cycle 20: blank is the shipped mode, so item 1 in the TUI also has to be able to TURN a key on. It hands the
+    // terminal to the dialog menu's item (1bit-console-menu --action 1), which mints the key, writes lemond.conf and
+    // restarts Lemonade - one implementation, not a second copy in Rust.
+    MintKey,
     Desktop,
     Reboot,
     Poweroff,
@@ -188,12 +192,27 @@ pub fn connect_block(f: &Facts, spin: &str, width: usize) -> Vec<Line<'static>> 
     out.push(rule(&title, width));
 
     let host = f.ip().unwrap_or("-");
-    let rows = [
+    let keyed = f.key.is_some();
+    // Cycle 20 (owner: "blank key"): the appliance ships with NO API key, so the block says what that means for
+    // whoever is reading it - anyone on this network can use Lemonade until item 1 mints one. Keyed mode keeps the
+    // wording the gate greps for, so one renderer serves both modes and neither reads as the other.
+    let mut rows = vec![
         format!("web UI http://{host}:13305"),
-        format!("api  http://{host}:13305/api/v1   (API key: press 1)"),
+        if keyed {
+            format!("api  http://{host}:13305/api/v1   (API key: press 1)")
+        } else {
+            format!("api  http://{host}:13305/api/v1")
+        },
         format!("ssh  root@{host}   (your key in /data/ssh/authorized_keys)"),
-        format!("app  Lemonade Mobile: server http://{host}:13305 + that key"),
+        if keyed {
+            format!("app  Lemonade Mobile: server http://{host}:13305 + that key")
+        } else {
+            format!("app  Lemonade Mobile: server http://{host}:13305 (any key)")
+        },
     ];
+    if !keyed {
+        rows.push("key  none - anyone here can use it; press 1 to require one".to_string());
+    }
     for value in rows {
         let indent = IND.len();
         let style = Style::default().fg(Color::Gray);
@@ -245,7 +264,7 @@ pub fn panels(f: &Facts) -> Vec<(&'static str, Vec<String>)> {
     lemonade.push(if f.key.is_some() {
         "API key: set, press 1".to_string()
     } else {
-        "API key: none in /etc/1bit/lemond.conf".to_string()
+        "API key: none (blank mode), press 1".to_string()
     });
     p.push(("LEMONADE", lemonade));
 
@@ -527,6 +546,7 @@ fn modal_box(m: &Modal) -> (String, Vec<String>, String) {
         } => {
             let hint = match yes {
                 Yes::ShowKey => "y shows the key on this screen, n cancels",
+                Yes::MintKey => "y mints one and restarts Lemonade, n cancels",
                 Yes::Desktop => "y starts the desktop now, n cancels",
                 Yes::Reboot => "y reboots the box, n cancels",
                 Yes::Poweroff => "y powers the box off, n cancels",
@@ -860,6 +880,28 @@ mod tests {
         let got_80 = render_snapshot(&app(c16_board()), 80, 25);
         assert_eq!(got_240, want_240, "\n--- got 240x67 ---\n{got_240}");
         assert_eq!(got_80, want_80, "\n--- got 80x25 ---\n{got_80}");
+    }
+
+    #[test]
+    fn the_connect_block_says_what_a_blank_key_means() {
+        // Cycle 20: blank is the shipped default, so the block has to say that anyone on the network can use the
+        // appliance, at BOTH console sizes - the 80x25 render is what a person standing at the box sees.
+        let mut f = c16_board();
+        f.key = None;
+        for (w, h) in [(80u16, 25u16), (240, 67)] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("key none - anyone here can use it; press 1 to require one"), "{w}x{h}: {text}");
+            assert!(!flat.contains("API key: press 1"), "{w}x{h}: keyed wording in blank mode");
+            // the extra row must not push the nine actions off the screen - that is the cycle-14 failure in a
+            // different renderer, and the TUI is the surface this image actually puts on tty1
+            for action in ACTIONS {
+                assert!(flat.contains(action), "{w}x{h}: action {action:?} not drawn");
+            }
+        }
+        // and keyed mode still carries the strings vm-check's U2 menu connect row greps for
+        let text = render_snapshot(&app(c16_board()), 80, 25).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("api http://192.168.50.110:13305/api/v1 (API key: press 1)"), "{text}");
     }
 
     #[test]

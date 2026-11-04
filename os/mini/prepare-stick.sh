@@ -18,9 +18,13 @@
 #                   [--model FILE.gguf]... [--npu-model DIR]... [--check] [--force]
 #
 # Prepares a 1bit OS stick or image from any Linux box: puts your SSH public keys where Dropbear reads
-# them, sets Lemonade's API key, and copies models into the models directory - GGUFs, and NPU model
+# them, copies models into the models directory - GGUFs, and NPU model
 # directories (a directory holding model.q4nx, the engine's own NPU format) - then REMOUNTS THE
 # PARTITION READ-ONLY and proves what it wrote. Everything it refuses, it refuses before writing.
+#
+# The API key is OPT-IN (cycle 20, the owner's "blank key"): a stick with no --mint and no --key comes up like
+# stock Lemonade, with no key at all, because that is what the appliance ships and what its console CONNECT block
+# says. --mint (or --key <hex>) is how you hand a key to a shared network.
 #
 # The data partition is found the way the image describes it, never by a fixed offset: `sfdisk -d`
 # reads the GPT, the partition with the Linux filesystem type (and, when there is more than one, the
@@ -346,8 +350,9 @@ if [ -f "$CONF" ]; then
     [ "$confbytes" = "$nonzero" ] && ok "lemond.conf has no NUL bytes ($confbytes bytes)" ||
         bad "lemond.conf has $((confbytes - nonzero)) NUL byte(s); Lemonade would misread it"
 
-    # no key at all is legitimate: init.sh mints one at boot when lemond.conf has no assignment. What
-    # is never legitimate is asking for a key and not getting a line of its own (the c10 trap), or two.
+    # No key at all is the SHIPPED state (cycle 20: "blank key"), not a defect - 10lemonade leaves it blank and the
+    # console's item 1 turns one on. What is never legitimate is asking for a key and not getting a line of its own
+    # (the c10 trap), or two.
     keylines=$(grep -c '^LEMONADE_API_KEY=' "$CONF" || true)
     wantkey=0
     [ -n "${KEY:-}" ] && wantkey=1
@@ -356,7 +361,7 @@ if [ -f "$CONF" ]; then
         0) if [ "$wantkey" = 1 ]; then
                bad "no ^LEMONADE_API_KEY= line: the key is missing, or glued to the previous line (the c10 trap)"
            else
-               ok "no key yet (init.sh mints one at boot)"
+               ok "no key (blank mode: stock-Lemonade behaviour, console item 1 turns one on)"
            fi ;;
         *) bad "$keylines ^LEMONADE_API_KEY= lines; Lemonade would take whichever it reads last" ;;
     esac

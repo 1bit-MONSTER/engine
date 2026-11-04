@@ -127,8 +127,8 @@ byte-identical payload `os/mini/mkimage.sh` writes today.
 ### `prepare-stick.sh` grows an identity
 
 The seed is per-stick, not per-release: it names the machine's user, password hash, hostname and target
-disk. `prepare-stick.sh` (already the tool that writes `authorized_keys` and mints Lemonade's API key)
-gains:
+disk. `prepare-stick.sh` (already the tool that writes `authorized_keys`, and the one that can hand a stick
+a Lemonade API key with `--mint`) gains:
 
 ```sh
 prepare-stick.sh /dev/sdX --ssh-pubkey ~/.ssh/id_ed25519.pub \
@@ -413,7 +413,7 @@ BusyBox initramfs on the ESP and one ext4 `/data`; there is no dpkg database, no
 | Lemonade's config, cache and backends | left in place; the unit's `HOME=/data/lemonade` is unchanged |
 | `hrx-jit` kernel cache, sealed NPU sets (`/data/npu`) | left in place; `GGML_HRX_JIT_CACHE_DIR` unchanged |
 | SSH host key and `authorized_keys` | `/data/ssh/host_ed25519` → `/etc/ssh/ssh_host_ed25519_key`; `authorized_keys` → `/home/onebit/.ssh/` |
-| Lemonade's API key | `/data/lemonade/lemond.conf` read as before |
+| Lemonade's API key | `/data/lemonade/lemond.conf` read as before — and **blank is the shipped default** (cycle 20): no key line means stock-Lemonade behaviour, and console menu item 1 turns one on |
 
 | not carried, by design | why |
 |---|---|

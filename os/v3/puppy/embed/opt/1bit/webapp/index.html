@@ -236,7 +236,7 @@
               throw new Error("HTTP 503" + (j && j.error && j.error.message ? ": " + j.error.message : ""));
             });
           }
-          if (r.status === 401) { throw new Error("401 - the API key is wrong or missing (this image mints one in /etc/1bit/lemond.conf, and only 1bit-webapp-proxy on :8080 can use it)"); }
+          if (r.status === 401) { throw new Error("401 - Lemonade refused the request (keyed mode: the key in /etc/1bit/lemond.conf is wrong or missing - console menu item 1)"); }
           if (!r.ok) { throw new Error("HTTP " + r.status); }
           var reader = r.body.getReader(), dec = new TextDecoder(), buf = "";
           function pump() {

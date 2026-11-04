@@ -260,6 +260,7 @@ fn handle(
                             ],
                         });
                     }
+                    Yes::MintKey => handoff(app, term, 1),
                     Yes::Desktop => handoff(app, term, 6),
                     Yes::Reboot | Yes::Poweroff => {
                         let what = if yes == Yes::Reboot {
@@ -324,16 +325,13 @@ fn handle(
                         yes: Yes::ShowKey,
                     })
                 } else {
-                    app.modal = Some(Modal::Info {
+                    // Cycle 20, owner's "blank key": no key is the SHIPPED state now, not a first-boot accident, so
+                    // this asks whether to require one instead of sending the reader to Lemonade's log.
+                    app.modal = Some(Modal::Confirm {
                         title: "API key".into(),
-                        body: vec![
-                            "no LEMONADE_API_KEY line in".into(),
-                            "/etc/1bit/lemond.conf yet.".into(),
-                            String::new(),
-                            "The first boot mints one. If it never appeared,".into(),
-                            "8 shows Lemonade's log, and the reason is in it".into(),
-                            "(cycle 16: a keyless file made it bind 127.0.0.1).".into(),
-                        ],
+                        question: "No API key (blank mode): this appliance is stock\nLemonade, so anyone on this network can use it.\n\nRequire one from now on? A key is minted into\n/etc/1bit/lemond.conf and Lemonade restarts."
+                            .into(),
+                        yes: Yes::MintKey,
                     })
                 }
             }

@@ -26,6 +26,7 @@
 // Requests run one at a time: the device holds one cache. The fast lane rewrites it from
 // position 0 per request; a private route may reuse it (usage.prompt_tokens_details).
 #include "unified.h"
+#include "npu_queue.h"
 #include "think_split.h"
 
 #include "generate.h"
@@ -72,14 +73,16 @@ struct Engine {
     float default_penalty = 1.1f;  // greedy 0.6B models loop without it
     bool open_think = false;       // the template opens "<think>\n" when thinking is on
     std::timed_mutex mu;  // timed: the wait for the device is bounded (engine#911)
-    // How long a request may wait for the device before it is told the device is busy (engine#911).
-    // The one-device lock below serialises generations, and an *unbounded* wait is what made a second
-    // request look like a hung answer: measured on this box, a 48-token probe queued 10.04 s behind an
-    // in-flight generation and then answered in 51 ms. Lemonade's streaming proxy gives up at ~6 s, so
-    // the pause reached its client as "0 chunks in 5.9 s / backend did not send [DONE]" -- the board's
-    // failure in issue #911 -- with no way to tell "queued" from "stuck". 5 s keeps a short queue
-    // working (a probe that finishes quickly is waited for) and still answers before that proxy does.
-    int queue_ms = 5000;
+    // How long a request may wait for the device before it is told the device is busy (engine#1024).
+    // The one-device lock below serialises generations, and an *unbounded, silent* wait is what made a
+    // second request look like a hung answer: measured on this box, a 48-token probe queued 10.04 s with
+    // zero bytes on the wire and then answered in 51 ms, so Lemonade's proxy gave up at ~6 s ("0 chunks
+    // in 5.9 s / backend did not send [DONE]", engine#911). 5 s then answered before that proxy did - but
+    // on the appliance a single user's first request IS a whole generation (c23 board 2026-11-04: a
+    // 1000-token row held the device 14 s and the owner's chat got 503 "the NPU is busy"). So the wait now
+    // covers a full generation and the stream keeps the wire alive while it waits (app/npu_queue.h); the
+    // 503 is only for a wait past this.
+    int queue_ms = 300000;
 
     // reused: prompt tokens already on the device (a private route's); cache: where from,
     // empty when none.
@@ -191,15 +194,15 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         res.set_content(R"({"error":{"message":"prompt longer than the context"}})", "application/json");
         return;
     }
-    auto run = [&e, prompt, opt](const std::function<bool(const std::string&)>& on_text) mutable {
+    auto run = [&e, prompt, opt](const std::function<bool(const std::string&)>& on_text,
+                                 const std::function<void()>& on_queue) mutable {
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.
         const auto ids = e.tok->encode(prompt);
         if (ids.empty()) throw std::runtime_error("empty prompt");
         const int room = e.max_context - int(ids.size());
         if (room < 1) throw std::runtime_error("prompt longer than the context");
-        std::unique_lock<std::timed_mutex> lock(e.mu, std::defer_lock);
-        if (!lock.try_lock_for(std::chrono::milliseconds(e.queue_ms)))
-            throw DeviceBusy("the NPU is busy with another request");
+        if (!wait_for_device(e.mu, e.queue_ms, on_queue)) throw DeviceBusy("the NPU is busy with another request");
+        std::unique_lock<std::timed_mutex> lock(e.mu, std::adopt_lock);
         opt.max_tokens = std::min(opt.max_tokens, room);
         std::string pending;
         opt.on_token = [&](int t) {
@@ -254,11 +257,19 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
                     const std::string c = chunk(t, nullptr, reasoning);
                     ok = ok && sink.write(c.data(), c.size());
                 };
+                // The 200 and the SSE headers are already on the wire, so a request that has to queue says so:
+                // an empty content delta every second is inert for an OpenAI client and for the appliance page
+                // (which only counts a chunk it can print), and it keeps a proxy's no-data timer from firing
+                // while the device finishes the previous generation (engine#911, engine#1024).
+                auto queued = [&] {
+                    const std::string c = chunk("", nullptr);
+                    sink.write(c.data(), c.size());
+                };
                 auto [r, n_prompt, n_cached, cache] = run([&](const std::string& t) {
                     if (split_reasoning) split.feed(t, emit);
                     else emit(false, t);
                     return ok;
-                });
+                }, queued);
                 if (split_reasoning) split.flush(emit);
                 std::string end = chunk("", r.stopped_at_eos ? "stop" : "length");
                 if (stream_usage) {
@@ -297,7 +308,7 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
             if (split_reasoning) split.feed(t, emit);
             else text += t;
             return true;
-        });
+        }, nullptr);
         if (split_reasoning) split.flush(emit);
         json out{{"id", id}, {"object", object}, {"created", created}, {"model", e.id}};
         const char* finish = r.stopped_at_eos ? "stop" : "length";
@@ -366,7 +377,7 @@ bool is_npu_model_dir(const std::string& dir, const npu::PrivateOptions& opts) {
 
 int run_unified(int argc, char** argv) {
     std::string model_dir, host = "127.0.0.1", alias;
-    int port = 8000, queue_ms = 5000;
+    int port = 8000, queue_ms = 300000;
     npu::PrivateOptions opts;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -385,7 +396,8 @@ int run_unified(int argc, char** argv) {
                         "                    [--opt KEY=VALUE ...]\n"
                         "  <model dir> holds model.q4nx, config.json, tokenizer.json, and for the fast lane\n"
                         "              npu/ (its kernels); a model a private route serves needs no npu/\n"
-                        "  --queue-ms N a request waits at most N ms for the device before 503 (default 5000)\n"
+                        "  --queue-ms N a request waits at most N ms for the device before 503 (default 300000,\n"
+                        "              a full generation; 0 refuses at once)\n"
                         "  --opt       an option for a private route (docs/npu.md, \"Private routes\")\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);

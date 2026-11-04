@@ -177,7 +177,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 47 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
+cargo test                                    # 48 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

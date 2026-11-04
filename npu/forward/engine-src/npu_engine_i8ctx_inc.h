@@ -130,6 +130,10 @@ struct I8Ctx {
     // quantiser wrote. Both C syncs (the canary's writeback and readback()'s invalidate) cover
     // exactly these rows instead of the whole BO -- see c_host_bytes().
     int last_am_ = 1;
+    // A client that writes A itself instead of going through the quantisers has to say how many rows it
+    // wrote, or the narrow invalidation would be sized for one row: onnx/ort/onebit_npu_gemm.cpp memcpys the
+    // graph's int8 rows straight into Am, so it calls this with the rows of the launch it is about to make.
+    void set_activation_rows(int rows) { last_am_ = rows > 0 ? rows : 1; }
 
     // Bytes of one weight image: the int8 layouts are KD*ND, pb16i and t2s are their own sizes.
     size_t w_bytes() const {

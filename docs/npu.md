@@ -331,6 +331,14 @@ A MoE model's router stays bf16 and untiled (it runs on the host, and its top-k 
 GGUF's own), and its routed expert stacks become one tensor per layer and projection — see
 "Routed expert stacks" below.
 
+`config.json` also carries the tokenizer's `add_bos_token` and `add_eos_token` when the GGUF
+states them (`tokenizer.ggml.add_bos_token`/`add_eos_token`), because the forward builds its
+prompt from `config.json`'s flag and defaults to no BOS (`app/forward_serve.cpp`). A checkpoint
+whose `tokenizer_config.json` sets `add_bos_token: true` — Zyphra/ZR1-1.5B, a Qwen2 fine-tune —
+is otherwise served a chat prompt with no BOS: measured on ZR1-1.5B, the forward built a
+5-token prompt where llama.cpp built 6, and the reply opened with the end-of-turn token.
+`tools/safetensors_to_q4nx.py` carries the same two keys from `tokenizer_config.json`.
+
 | GGUF type | To q4_1 | Error |
 |---|---|---|
 | Q4_0 | scale `d`, zero `-8d`, codes unchanged | bf16 rounding of scale and zero |
@@ -755,6 +763,20 @@ $ curl -sS localhost:8000/v1/completions -d '{"prompt": "The capital of France i
     "grammar": "root ::= \" Paris\" | \" Lyon\" | \" Marseille\""}'
 {"choices":[{"finish_reason":"length","index":0,"text":" Paris"},...]}
 ```
+
+`prompt` may also be the **token ids themselves**, the shape llama.cpp's `/completion` accepts:
+
+```
+$ curl -sS localhost:8000/v1/completions -d '{"prompt": [151646, 785, 6722, 315, 9625, 374], "max_tokens": 16}'
+```
+
+Supplied ids are used exactly as given — nothing is tokenized and no BOS is inserted — which is what a
+parity run against llama.cpp needs: the same *text* reaches the two engines through two tokenizers and one
+prompt-construction rule each, so only supplied ids make the comparison about the forward. `151646` above is
+*Zyphra/ZR1-1.5B's* BOS id; another container's BOS is a different id, and pasting the wrong one is the
+out-of-vocabulary 400 below rather than a silently different prompt. An id outside the vocabulary, a
+non-integer element, or an empty array is a 400 that names the position, never a clamped or dropped one.
+OpenAI's array-of-strings batch form is not implemented and is refused by the same rule.
 
 ### Decisions (`/v1/systemone`, issue #653)
 

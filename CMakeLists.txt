@@ -377,6 +377,24 @@ add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
 
+# ── npu/forward's forward C++ compiles without the NPU runtime (engine #898) ───────────────
+# CI configures without ONEBIT_NPU, so npu/forward/src/q4nx_forward.cpp - where every A1 defect so
+# far has lived (engine #808, #874) - reached a green build without being compiled. This OBJECT
+# library compiles it and links nothing: the runtime's symbols are only needed at link time, and
+# the in-tree npu/rt.h needs no XRT. `onebit` depends on it, so the CI build job (which builds
+# `onebit`) compiles it without a workflow change.
+add_library(onebit_npu_forward_syntax OBJECT npu/forward/src/q4nx_forward.cpp)
+target_compile_definitions(onebit_npu_forward_syntax PRIVATE ONEBIT_NPU_RUNTIME_OWN)
+target_include_directories(onebit_npu_forward_syntax PRIVATE
+    npu/forward/include npu/forward/engine-src npu)
+target_link_libraries(onebit_npu_forward_syntax PRIVATE nlohmann_json::nlohmann_json)
+# Same OpenMP flags as onebit_npu_forward, so `#pragma omp` clauses are parsed here too.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(onebit_npu_forward_syntax PRIVATE OpenMP::OpenMP_CXX)
+endif()
+add_dependencies(onebit onebit_npu_forward_syntax)
+
 # ── MoE expert streaming (docs/moe-streaming.md) ─────────────────────────
 # The routed-expert cache: pinned RAM slots filled with O_DIRECT reads, and
 # `1bit moe-cache`, which replays expert traces through it. Linux only.
@@ -540,6 +558,17 @@ add_test(NAME npu_chatml COMMAND npu_chatml_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_chatml_test)
+
+# `forward-serve`'s /v1/completions prompt as text or as the caller's exact token ids (app/npu_prompt_ids.h):
+# the acceptance rules and the refusals that keep an out-of-vocabulary id from reaching the embedding
+# lookup.  Device-free, model-free.
+add_executable(npu_prompt_ids_test tests/npu_prompt_ids_test.cpp)
+target_include_directories(npu_prompt_ids_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(npu_prompt_ids_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_prompt_ids COMMAND npu_prompt_ids_test)
+# Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
+# target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
+add_dependencies(npu_sampling_test npu_prompt_ids_test)
 
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.

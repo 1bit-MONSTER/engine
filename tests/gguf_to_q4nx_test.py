@@ -78,6 +78,11 @@ def synthetic(path, rng):
     w.add_rope_freq_base(1e6)
     w.add_layer_norm_rms_eps(1e-6)
     w.add_eos_token_id(1)
+    # The two flags app/forward_serve.cpp builds the prompt from; add_bos_token is the one a
+    # qwen2 checkpoint can set to true (Zyphra/ZR1-1.5B does) and the packer has to carry.
+    w.add_bos_token_id(2)
+    w.add_add_bos_token(True)
+    w.add_add_eos_token(False)
 
     def quant(name, N, K, qt):
         x = rng.standard_normal((N, K)).astype(np.float32) * 0.05
@@ -212,6 +217,21 @@ def moe_check(gguf_path, out, ok):
     return ok
 
 
+def tokenizer_flags_check(src, out, ok):
+    """config.json must carry the tokenizer's add_bos/add_eos flags, or the forward builds chat
+    prompts without BOS (it reads add_bos_token from config.json and defaults to 0)."""
+    import json
+    with open(os.path.join(out, "config.json")) as f:
+        cfg = json.load(f)
+    checks = [("config.json keeps add_bos_token from the GGUF", cfg.get("add_bos_token") is True),
+              ("config.json keeps add_eos_token from the GGUF", cfg.get("add_eos_token") is False),
+              ("bos_token_id still written", cfg.get("bos_token_id") == 2)]
+    for label, good in checks:
+        print(f"{'ok  ' if good else 'FAIL'} {label}")
+        ok = ok and good
+    return ok
+
+
 def main():
     ok = golden_tile()
     rng = np.random.default_rng(1)
@@ -237,6 +257,7 @@ def main():
                 print(f"FAIL moe {cmd[0]} exited {r.returncode}")
                 ok = False
         ok = moe_check(os.path.join(d, "tiny-moe.gguf"), mout, ok)
+        ok = tokenizer_flags_check(src, out, ok)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

@@ -512,11 +512,17 @@ rows = [
     # (nothing may be written there - that is the RAM log), then a tmpfs is mounted over it late, which is /data
     # arriving after 06onboard-logs ran. The log must appear without anything restarting the daemon.
     ("U3 logs wait", "d=/tmp/logs-late; umount $d 2> /dev/null; rm -rf $d; mkdir -p $d; "
-                     "ONEBIT_LOG_DATA=$d 1bit-logs daemon > /tmp/logs-late.out 2> /tmp/logs-late.err & "
+                     "ONEBIT_LOG_DATA=$d 1bit-logs daemon > /tmp/logs-late.out 2>&1 & "
                      "p=$!; sleep 4; pre=$(ls $d 2> /dev/null | wc -l); "
-                     "mount -t tmpfs none $d && sleep 10; post=$(find $d -name BOOT 2> /dev/null | wc -l); "
+                     "mount -t tmpfs none $d; mrc=$?; sleep 6; "
+                     "n=0; while [ $n -lt 6 ]; do [ -n \"$(find $d -name BOOT 2> /dev/null)\" ] && break; "
+                     "sleep 3; n=$((n + 1)); done; "
+                     "post=$(find $d -name BOOT 2> /dev/null | wc -l); "
+                     "mnt=$(grep -c \" $d \" /proc/mounts); "
+                     "alive=$(kill -0 $p 2> /dev/null && echo yes || echo no); "
                      "kill $p 2> /dev/null; umount $d 2> /dev/null; "
-                     "echo \"logs-wait pre=$pre post=$post\"; tail -2 /tmp/logs-late.err; "
+                     "echo \"logs-wait pre=$pre post=$post mount-rc=$mrc mount-lines=$mnt daemon-alive=$alive\"; "
+                     "head -3 /tmp/logs-late.out; "
                      "[ \"$pre\" = 0 ] && [ \"$post\" -ge 1 ] && echo logs-wait-for-data", "logs-wait-for-data"),
     # Cycle 17 item 1: menu item 6 can never reset the machine - the guard is built and a reboot THROUGH it is
     # refused, which is the same call xwin's exit path makes (`exec reboot`) and the WM's shutdown menu makes.

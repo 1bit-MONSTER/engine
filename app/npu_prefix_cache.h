@@ -57,6 +57,18 @@ struct PrefixDecision {
     std::string reason;       // "hit", "off", "no slot shares a prefix", "slot has no state", ...
 };
 
+// Where a hit may resume.  A slot's snapshot is taken one token short of the prompt it was saved for
+// (forward-serve splits the last prefill chunk and saves before it, because the answer is drawn from the last
+// position's logits and a snapshot holds state, not logits), so the positions it can restore are `cached - 1`,
+// and the resume never goes past the prompt's own last token either.  On a GDN model restoring `cached - 1`
+// of a snapshot taken at `cached` would apply the last token's in-place recurrence update twice, which answers
+// the same prompt differently -- measured 2026-11-04, engine#984.
+inline int resume_point(const PrefixDecision& d, size_t prompt_tokens) {
+    if (d.slot < 0 || d.cached_tokens <= 0 || prompt_tokens == 0) return 0;
+    const int cached = std::min(d.cached_tokens, int(prompt_tokens));
+    return cached > 0 ? cached - 1 : 0;
+}
+
 struct PrefixSlot {
     std::vector<int> ids;     // the tokens this slot covers, from position 0
     size_t bytes = 0;         // what its snapshot costs in the budget

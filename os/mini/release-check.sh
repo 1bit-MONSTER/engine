@@ -132,6 +132,13 @@ lemonade_verdict_blank() {
     esac
 }
 
+# The model list the rows below read (engine #945). In blank mode the keyless body IS the list; in keyed mode
+# the authenticated one is. Pure and chosen in ONE place, so a mode that sets $BODY and forgets $MODELS cannot
+# report a healthy server as dead and skip every chat/bench row behind it. <keyed body> <keyless body>
+models_list() {
+    if [ -n "${1:-}" ]; then printf '%s' "$1"; else printf '%s' "${2:-}"; fi
+}
+
 # The sealed-set manifest rule (engine #574). Sealing is confidentiality: the kernel files are
 # 1BPKCRYP ciphertext and the loader opens them with the kernel key. A set re-sealed by another key,
 # or swapped for a different set that also decrypts, is indistinguishable from ours by that alone.
@@ -233,6 +240,10 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(lemonade_verdict_blank 401 'error')"                    # blank mode that demands a key
     check FAIL "$(lemonade_verdict_blank 200 '')"                         # 200 with no model list
     check FAIL "$(lemonade_verdict_blank 000 '')"                         # nothing answered
+    # engine #945: whichever body this mode has is the model list the rows below read
+    check '{"data":[{"id":"m"}]}' "$(models_list '' '{"data":[{"id":"m"}]}')"   # blank mode: the keyless body
+    check '{"data":[{"id":"k"}]}' "$(models_list '{"data":[{"id":"k"}]}' '{"data":[]}')"  # keyed mode
+    check '' "$(models_list '' '')"                                         # nothing answered
     # engine #911: the NPU follow-up row. The board's shape is the second case: a long turn that
     # finished, then a follow-up with no content at all and a TDR in the kernel log.
     check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 0)"
@@ -430,8 +441,11 @@ else
         PASS*) pass lemonade "$(printf '%s' "$(lemonade_verdict "$WITH" "$MODELS" "$WITHOUT")" | sed 's/^PASS //')";;
         *) fail lemonade "$(printf '%s' "$(lemonade_verdict "$WITH" "$MODELS" "$WITHOUT")" | sed 's/^FAIL //')";;
     esac
-    : "$BODY"
 fi
+
+# The rows below read only $MODELS, so it is chosen here for BOTH modes (engine #945): the keyed probe's answer
+# when there is a key, else the keyless body - which is the list in blank mode.
+MODELS=$(models_list "${MODELS:-}" "$BODY")
 
 # Lemonade registers the onebit entries under a "user." prefix: candidate 8's hardware boot logged
 # "lemond DID register user.Qwen3-0.6B-Q4_K_M-1bit". The manifest holds the bare catalogue id, so a

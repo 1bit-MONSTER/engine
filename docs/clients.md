@@ -54,9 +54,19 @@ is neither is a person's rename, not a fault: console **3** (Network) then **3**
 `/etc/hostname` and applies it live (`1bit-console-menu:437,463-466`; the top-level row is
 `1bit-console-menu:632`). The cycle-16 board booted as
 `strix` for exactly that reason while the frozen bytes still read `1bit-os`, so check the address, not the
-name. Read the
-address off the box rather than guessing `1bit.local` — mDNS is not claimed. If you cannot get to a
-console, the router's client list shows the box
+name.
+
+**The mDNS name.** From an image built with cycle-21 item 10 on
+([#953](https://github.com/1bit-MONSTER/engine/pull/953)) the box announces itself over mDNS, so
+`http://1bit-os.local:13305` is a link a phone can click without reading an address off the console
+(`os/v3/puppy/embed/etc/init.d/18onboard-mdns:17-19`; the image refuses to pack without the responder or
+the `nsswitch` resolve line, `os/v3/puppy/container-build.sh:496,505`). The announced name is the box's
+own hostname plus `.local` (`18onboard-mdns:58`), so it follows a rename. Two things can still leave you
+reading an address: the responder, and your LAN — the CONNECT block prints
+`name http://1bit-os.local:13305 (mDNS)` only while `avahi-daemon` is running and
+`(mDNS - avahi not running)` when it is not (`os/v3/puppy/console-tui/src/ui.rs:213-216`), and a network
+that drops multicast does not resolve the name at all. Sticks through the cycle-20 image do not announce
+it. If you cannot get to a console, the router's client list shows the box
 (the MAC of the wired or wireless interface), and the box announces the server on the LAN itself —
 `lemond` logs `Net Broadcast` on each RFC1918 interface, and `lemonade scan` (run anywhere on the same
 network with the CLI installed) lists the beacons it hears.
@@ -245,6 +255,8 @@ recipe — the answer came from llama.cpp on the VM's CPU at 1.7-2.3 tok/s, not 
 board run adds, and this page does not re-measure, is the onebit route itself: `Qwen3-0.6B-NPU-1bit`
 through Lemonade on the Ryzen AI MAX+ 395.
 
-Not verified on this page: a phone against a real box on a real LAN (the app needs a device), and mDNS —
-avahi-daemon runs on the box, but this page does not claim `<name>.local` resolves, so read the address
+Not verified on this page: a phone against a real box on a real LAN (the app needs a device), and the mDNS
+name *from another machine* — the image gate asserts a responder is up and that
+`getent hosts 1bit-os.local` answers on the box itself (`os/v3/puppy/vm-check.sh:593-598`), which is not
+the same as a peer resolving it over multicast. If the name does not resolve for you, read the address
 with `hostname -I` or the router instead.

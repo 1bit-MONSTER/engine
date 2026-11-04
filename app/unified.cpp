@@ -35,6 +35,7 @@
 
 #include <httplib.h>
 #include "http_guard.h"
+#include "serve_watchdog.h"  // npu_run_failed: a failed runlist means this process's NPU context is dead
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -146,7 +147,10 @@ std::string now_id(const char* prefix) {
            std::to_string(n++);
 }
 
-void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& res, bool chat) {
+// on_run_failed: the request that ends with a failed NPU runlist is answered with its error frame, and
+// this asks the process to leave once that frame is out (app/serve_watchdog.h, npu_run_failed).
+void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& res, bool chat,
+                     const std::function<void(const std::string&)>& on_run_failed) {
     json body;
     try {
         body = json::parse(req.body);
@@ -241,7 +245,7 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
 
     if (stream) {
         res.set_chunked_content_provider("text/event-stream", [run, chunk, usage, timings, stream_usage, id, object, created,
-                                                               split_reasoning, think_opened,
+                                                               split_reasoning, think_opened, on_run_failed,
                                                                model = e.id](size_t, httplib::DataSink& sink) mutable {
             try {
                 ThinkSplit split(think_opened);
@@ -278,6 +282,7 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
                 // refusal closes the stream properly, whatever ended it.
                 const std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
+                if (npu_run_failed(ex.what())) on_run_failed(ex.what());
             }
             sink.done();
             return true;
@@ -311,6 +316,7 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
     } catch (const std::exception& ex) {
         res.status = 500;
         res.set_content(json{{"error", {{"message", ex.what()}}}}.dump(), "application/json");
+        if (npu_run_failed(ex.what())) on_run_failed(ex.what());
     }
 }
 
@@ -396,6 +402,18 @@ int run_unified(int argc, char** argv) {
     httplib::Server srv;
     install_request_guard(srv, host);  // Host / Origin (app/http_guard.h)
     std::atomic<bool> ready{false};
+    // A failed NPU runlist leaves this process's context dead and no later request can heal it (measured on
+    // the c22 board: every request after the first 614 got 614 and TDR'd the array again, while a fresh
+    // process on the same device answered 200). Answer the failing request, stop accepting, and exit
+    // non-zero: Lemonade's BackendWatchdog then starts a fresh backend on the power-cycled array, which is
+    // the same contract serve has for a backend that lost its device (app/serve_watchdog.h).
+    std::atomic<bool> run_failed{false};
+    auto on_run_failed = [&srv, &run_failed](const std::string& what) {
+        if (run_failed.exchange(true)) return;
+        std::fprintf(stderr, "1bit unified: the NPU's run did not complete (%s); exiting 1 so the backend is reloaded\n",
+                     what.c_str());
+        srv.stop();  // only the listening socket: this response still goes out, and the workers are joined
+    };
     // /health must never take e.mu or touch the device: Lemonade's BackendWatchdog probes it with a
     // 2 s timeout while a request is ACTIVE, and three consecutive failures reset the backend (kill +
     // reload), i.e. they would end a healthy turn. Measured under a 512-token generation in flight:
@@ -416,11 +434,11 @@ int run_unified(int argc, char** argv) {
     });
     srv.Post("/v1/chat/completions", [&](const httplib::Request& q, httplib::Response& r) {
         if (!ready) { r.status = 503; return; }
-        handle_generate(e, q, r, true);
+        handle_generate(e, q, r, true, on_run_failed);
     });
     srv.Post("/v1/completions", [&](const httplib::Request& q, httplib::Response& r) {
         if (!ready) { r.status = 503; return; }
-        handle_generate(e, q, r, false);
+        handle_generate(e, q, r, false, on_run_failed);
     });
     if (!srv.bind_to_port(host, port)) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
     // Serve /v1/health (503 until ready) while the model loads.
@@ -464,7 +482,7 @@ int run_unified(int argc, char** argv) {
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), host.c_str(),
                  port);
     listener.join();
-    return 0;
+    return run_failed ? 1 : 0;
 }
 
 }  // namespace onebit

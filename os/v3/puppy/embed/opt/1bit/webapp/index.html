@@ -105,7 +105,7 @@
     try { history.replaceState({}, "", location.pathname); } catch (e) {}
   }
   ui.href = "http://127.0.0.1:13305/";
-  ui.title = "Lemonade's own web UI asks for the API key (console menu item 1 shows it)";
+  ui.title = "Lemonade's own web UI (on :13305) - with no API key set it just opens; with one, console menu item 1 shows it";
   document.getElementById("srv").textContent = api || (location.origin + " (Lemonade key held here)");
   var host = location.hostname || "this machine";
   var busy = false;
@@ -236,7 +236,7 @@
               throw new Error("HTTP 503" + (j && j.error && j.error.message ? ": " + j.error.message : ""));
             });
           }
-          if (r.status === 401) { throw new Error("401 - the API key is wrong or missing (this image mints one in /etc/1bit/lemond.conf, and only 1bit-webapp-proxy on :8080 can use it)"); }
+          if (r.status === 401) { throw new Error("401 - Lemonade refused the request (keyed mode: the key in /etc/1bit/lemond.conf is wrong or missing - console menu item 1)"); }
           if (!r.ok) { throw new Error("HTTP " + r.status); }
           var reader = r.body.getReader(), dec = new TextDecoder(), buf = "";
           function pump() {

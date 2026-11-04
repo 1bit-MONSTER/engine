@@ -31,6 +31,14 @@
 #                         NOT, so 1bit-install cannot write a GPT (the 26.04 split ships both in the fdisk
 #                         package; the file that survives woof-CE's splitting is the one with a spec row)
 #
+#   U2  avahi-daemon    - item 10 (owner 2026-11-04): the appliance announces itself as 1bit-os.local, so
+#                         http://1bit-os.local:13305 works from ryzen or a phone. Measured on the built rootfs,
+#                         which carries libavahi-client/common only - no /usr/sbin/avahi-daemon, so nothing can
+#                         answer an mDNS query.
+#   U2  libnss-mdns      - the client half. Without it `getent hosts 1bit-os.local` cannot resolve the name the
+#                         appliance publishes; container-build.sh adds the mdns4_minimal line to nsswitch.conf
+#                         and REFUSES an image whose nsswitch.conf still lacks it.
+#
 # bash, dpkg, python3, efibootmgr, jwm, rox, xterm and curl are already in the merged set (measured).
 
 yes|apt|apt|exe,dev>null,doc>null,nls>null||deps:yes
@@ -38,3 +46,5 @@ yes|sudo|sudo|exe,dev>null,doc>null,nls>null||deps:yes
 yes|mokutil|mokutil|exe,dev>null,doc>null,nls>null||deps:yes
 yes|openssh-server|openssh-server|exe,dev>null,doc>null,nls>null||deps:yes
 yes|fdisk|fdisk|exe,dev>null,doc>null,nls>null||deps:yes
+yes|avahi-daemon|avahi-daemon|exe,dev>null,doc>null,nls>null||deps:yes
+yes|libnss-mdns|libnss-mdns|exe,dev>null,doc>null,nls>null||deps:yes

@@ -1,0 +1,21 @@
+{
+ "source": {
+  "pack": "Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K",
+  "fconst": "dd_metastate_Llm_Token_Token_*",
+  "offset": 1117824,
+  "group_index": 0,
+  "projections": "layers.0.mlp.gate_proj rows 0..63, then mlp.up_proj rows 0..63"
+ },
+ "layout": "amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md \u00a77.17",
+ "group_bytes": 68608,
+ "k": 896,
+ "rows": 128,
+ "subvolume_bytes": 4288,
+ "subvolume_columns": 64,
+ "split": {
+  "gate": "rows 0..31 and 64..95",
+  "up": "rows 32..63 and 96..127"
+ },
+ "bias_bytes_nonzero": 0,
+ "note": "q4_1 tiles are the container's, gate first then up; the unit itself is the vendor writer's bytes, unmodified"
+}

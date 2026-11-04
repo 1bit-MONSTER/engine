@@ -42,6 +42,19 @@ cache and config, 2026-11-03. Three probes, exact results:
 So the routing engine, the decision format, the per-class dispatch and the validator all work today with zero new
 code, and the two gaps are exactly the two the owner names: Laya is not a condition, and `auto` is not a name.
 
+Laya itself, asked the same three prompts through the installed `1bit route --classify` (CPU scorer,
+`~/.local/share/1bit/laya`, 2026-11-03), agrees with the classes those rules assume — which is why the table in §4 can
+be written today and only the scorer call is missing:
+
+| prompt | chars | Laya | confidence | decision | scorer load, per invocation |
+|---|---|---|---|---|---|
+| `Write a Rust function that sums a slice.` | 40 | **code** | 0.44 | 361 ms | 3,819 ms |
+| `What is a good name for a cat?` | 30 | **short** | 0.38 | 448 ms | 3,062 ms |
+| a 1,751-character paddock log | 1,751 | **long_doc** | 1.00 | **0 ms** (size gate, no forward pass) | 4,307 ms |
+
+The 3.1-4.3 s in that last column is the whole reason §3 asks for a resident service rather than a process per request:
+it is paid once at lemond start instead of once per cold conversation.
+
 ## 2. Request flow in our Lemonade fork
 
 1. Client → `POST /v1/chat/completions` (`src/cpp/server/routes/openai/text/chat_completions.cpp`), `model` field.

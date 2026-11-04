@@ -146,12 +146,54 @@ with `--laya-first FILE`:
 | `model` | the catalogue id the router's `route_to` names (so a pulled row is an ordinary Lemonade model) |
 | `hf_repo` + `file` | what to pull when the row is not on disk; a Q4NX row names no `file` and pulls the whole directory (`1bit-MONSTER/Qwen3.6-35B-A3B-NPU`) |
 | `device` | `hrx` (our HIP kernels), `npu` (our NPU engine, Q4NX), `hybrid` (`--device hybrid --prefill-provider <NPU route>`, [hybrid.md](hybrid.md)), or `auto`; it becomes the candidate's `recipe_options.onebit_backend`, so `1bit serve` still makes the final check |
+| `on_busy` | optional: the device to fall back to when the GPU is saturated or hot, with the condition that triggers it (see "Device: HRX by default" below). Absent means never fall back |
 | `ctx` | the candidate's `ctx_size` |
 
 Every repo and file name above was read from the Hub on 2026-11-03 (`1bit-MONSTER` has 68 repositories, all four
 classes have a first-party repo with the file named here). The two classes that also have an NPU form get a second row
 rather than a second device: `Qwen3.6-35B-A3B-NPU` for a heavy class on the NPU, and the FLM rows already in
 `server_models.json` for a small NPU chat model (see "Owner decisions").
+
+### Device: HRX by default, and the NPU only when the GPU is busy or hot
+
+Measured on Strix Halo on 2026-11-04 (`llama-bench`, same box, same file, `-r 2`): a dense 27B-class model —
+Ternary-Bonsai-2-27B — runs on HRX0 at **124-152 tok/s prefill and 15.3 tok/s decode**, against **13.9 / 3.05** on our
+own NPU route (`bonsai2-27b-t2s2`, commit `916e90d`). HRX wins **both** halves, by 10.7-13.2× and 5.0×, so a heavy
+class's `device` defaults to `hrx` and the NPU is **not** a faster second half: the "HRX prefill + NPU decode" split
+that [hybrid.md](hybrid.md) designs is not worth building for this model, and the same measurement re-run after a
+reboot (138.8 / 151.8 / 131.1 tok/s prefill, 13.9 decode with four other lanes running) does not move that.
+
+What the NPU is still good for is **contention**. An HRX reply pins the *shared* iGPU for its whole length (512 tokens
+≈ 33 s at 15.3 tok/s), the same window the fleet serialises through its fair GPU queue, while the NPU has its own
+device. So the NPU is a **fallback for a saturated or hot GPU** — a routing condition, not a speed choice. A class
+may name it:
+
+```json
+"long_doc": {
+  "model": "Qwen3.8-27B-1bit", "device": "hrx", "ctx": 65536,
+  "on_busy": {"device": "npu", "model": "<the class's NPU row>",
+              "queue_depth": 1, "tctl_c": null, "wait_s": 0}
+}
+```
+
+| field | meaning |
+|---|---|
+| `queue_depth` | fall back when at least this many GPU jobs are waiting (live tickets in the fleet's fair queue, the same FIFO `gpu-hold` arbitrates) **or** the device is held by a label that is not this lemond |
+| `tctl_c` | fall back at or above this package temperature, read from the k10temp hwmon `temp1_input` — the file `gpu-hold`'s own start gate and thermal guard read; `null` means "the guard's critical minus a margin", filled from the measurement below, not guessed |
+| `wait_s` | wait this long for the GPU to come back before switching; `0` switches immediately |
+
+Three properties the condition keeps:
+
+- **Decided once, at load time**, never per request: a class changes device between conversations at most, never
+  mid-conversation, and the decision header ([§6](#6-override-and-what-never-happens)) says
+  `"device": "npu", "why": "gpu_busy"` or `"gpu_hot"`. The decode penalty is 5×, so a fallback answer that did not
+  say so would be a silent slowdown presented as a normal one.
+- **Off for interactive classes by default.** `short` and `code` do not fall back — a 5× slower answer is worse than
+  waiting for the GPU — while `long_doc` and batch-style classes may.
+- **The thresholds come from H0, not from this note.** H0 is the unmeasured half: what a 512-token HRX decode costs in
+  power and package heat, and what pinning the iGPU for 33 s costs the lanes sharing it. Until that lands, `on_busy`
+  is **absent from the shipped table** and the gate row asserts the HRX landing only; when it ships, the rule gains a
+  warm-up guard (no fallback in the first minute after boot, when the thermal guard itself is still settling).
 
 ## 5. Cold start
 
@@ -191,7 +233,10 @@ On a cold lemond (empty cache), three prompts — one code, one 2 KB document, o
 expected class, model and device, with `x-lemonade-route` naming the class rule, decision time under 100 ms, and the
 pull+load counted separately (so a regression in either is visible). A second immediate request must show no pull and
 no re-decision, and an explicit model name must produce no routing header at all. That is four assertions per prompt,
-which is the same shape as the existing `chat-hrx`/`chat-npu` rows.
+which is the same shape as the existing `chat-hrx`/`chat-npu` rows. When `on_busy` ships (§4), the row gains a fifth
+case — a ticket held by another label makes the document prompt land on the NPU row, the header says `why: gpu_busy`,
+and the same prompt with the queue empty lands on `hrx` — because a fallback that only ever runs on one side of the
+condition is the classic untested branch.
 
 ## 8. Order of work
 

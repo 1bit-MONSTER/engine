@@ -2900,7 +2900,7 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
             if (it == m.end()) {
                 LhScope _tlh_pk(LH_PACK_UPLOAD);
                 PackedWeight pw;
-                pw.bo = kctx.make_weight_bo(*dev_);
+                pw.bo = kctx.make_weight_bo(*dev_, /*zero=*/false);
                 std::vector<int16_t> eref;
                 int mode = 0;
                 const std::string stem = pb16i_stem(cur_layer_, sc);
@@ -3161,7 +3161,7 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
             if (it == m.end()) {
                 LhScope _tlh_pk(LH_PACK_UPLOAD);
                 PackedWeight pw;
-                pw.bo = kctx.make_weight_bo(*dev_);
+                pw.bo = kctx.make_weight_bo(*dev_, /*zero=*/false);
                 std::vector<int16_t> eref;
                 int mode = 0;
                 const std::string stem = pb16i_stem(cur_layer_, sc);
@@ -5020,7 +5020,7 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             // the K=H ELF family is a one-plane design.
             for (int t = 0; t < ntiles; t++) {
                 PackedWeight pw;
-                pw.bo = lctx.make_weight_bo(*dev_);
+                pw.bo = lctx.make_weight_bo(*dev_, /*zero=*/false);
                 if (!lctx.load_pb16i_into(*pw.bo, head_pb16i_stem(t), pw.eref, pw.pb16i_mode)) {
                     err_ = "lm head: cannot load the ternary image for tile " + std::to_string(t);
                     return false;

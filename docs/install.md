@@ -73,7 +73,9 @@ the key that was.
 1. Put the stick in the machine. On the Bosgame BeyondMax use the **front USB-A** port
    ([7](#7-the-bosgame-beyondmax-has-one-usable-usb-port)).
 2. Boot it. The default entry, `1bit OS (headless console, 7.3.0-rc4-1bit-perfopt+)`, comes up headless:
-   a console with no X. The second, `1bit OS (desktop, JWM)`, starts Puppy's desktop on the same system;
+   a console with no X, whose first screen prints the box's address and how to connect to it (web UI,
+   API, `ssh`), above a menu whose item 1 shows the API key. The second, `1bit OS (desktop, JWM)`, starts
+   Puppy's desktop on the same system;
    the third, `1bit OS - install to a disk (1bit.installer=1)`, opens the installer
    ([2](#2-install-to-an-internal-disk)); the fourth, `1bit OS - serial root shell (1bit.serial=1)`, gives
    a root shell on the serial port for a rack machine with no monitor.

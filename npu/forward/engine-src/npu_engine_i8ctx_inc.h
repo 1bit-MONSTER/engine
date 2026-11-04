@@ -133,7 +133,19 @@ struct I8Ctx {
     // A client that writes A itself instead of going through the quantisers has to say how many rows it
     // wrote, or the narrow invalidation would be sized for one row: onnx/ort/onebit_npu_gemm.cpp memcpys the
     // graph's int8 rows straight into Am, so it calls this with the rows of the launch it is about to make.
-    void set_activation_rows(int rows) { last_am_ = rows > 0 ? rows : 1; }
+    void set_activation_rows(int rows) {
+        last_am_ = rows > 0 ? rows : 1;
+        // ...but its A writeback stays the whole BO: that client memsets all MD rows first (the pad rows have to
+        // read as zero) and only then memcpys `rows` of them, so every line of bA is dirty. Narrowing this to
+        // `rows` would leave the memset's zeroes in cache to be evicted *after* the kernel read them.
+        a_dirty(MD);
+    }
+
+    // Rows of bA the host has written since the last A writeback (audit row 17). The array reads rows
+    // [0, MD), but only lines the host touched can be dirty in cache, and every other row was flushed
+    // when it was last written -- so the writeback's range is the dirty span, not the BO. See a_host_bytes().
+    int a_dirty_rows_ = 0;
+    inline void a_dirty(int rows) { if (rows > a_dirty_rows_) a_dirty_rows_ = rows; }
 
     // Bytes of one weight image: the int8 layouts are KD*ND, pb16i and t2s are their own sizes.
     size_t w_bytes() const {
@@ -568,6 +580,7 @@ struct I8Ctx {
     inline uint16_t* quantize_bf16(const float* A, int am, int ak) {
         if (am != 1) { std::fprintf(stderr, "  I8Ctx: the gemv family takes one row per launch (am=%d)\n", am); return Ag; }
         last_am_ = am;
+        a_dirty(1);
         const int n = ak < KD ? ak : KD;
         for (int k = 0; k < n; k++) {
             float v = A[k];
@@ -607,11 +620,14 @@ struct I8Ctx {
             //     whole-BO zero, exactly as the code did unconditionally before this change
             memset(Am, 0, (size_t)MD * KD);
             a_written_rows_ = am;
+            a_dirty(MD);   // the whole BO is dirty after this zero
             return;
         }
         if (a_written_rows_ > am) {
             memset(Am + (size_t)am * KD, 0, (size_t)(a_written_rows_ - am) * KD);
+            a_dirty(a_written_rows_);   // the rows this zeroed
         }
+        a_dirty(am);                    // what the caller's quantiser loop writes next
         a_written_rows_ = am;
     }
 
@@ -629,7 +645,25 @@ struct I8Ctx {
     }
     inline void sync_a_to_device() {
         static const bool skip = env_off("NPU_NO_A_FLUSH");
-        if (!skip) bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        static const bool whole = getenv("NPU_NO_A_NARROW") != nullptr || getenv("NPU_DBG") != nullptr;
+        if (skip) return;
+        const auto t0 = a_sync_prof() ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+        if (whole) bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        else bA->sync(XCL_BO_SYNC_BO_TO_DEVICE, a_host_bytes(), 0);
+        a_sync_note(t0, whole ? bA->size() : a_host_bytes());
+        a_dirty_rows_ = 0;   // the rows the host had touched are in memory now
+    }
+
+    // Bytes of bA the host has written since the last writeback: rows [0, a_dirty_rows_), each KD int8 (one
+    // KD-wide bf16 row in the gemv family). bo::sync() is a per-64-B clflush loop over its range -- the same
+    // instrument that measured the C syncs -- so its cost IS the range, and on the decode path the range is
+    // one row instead of MD. NPU_NO_A_NARROW=1 restores the whole-BO range for an A/B, NPU_DBG forces it
+    // because bochk checksums the full extent.
+    inline size_t a_host_bytes() const {
+        const size_t row = gemv ? (size_t)KD * 2u : (size_t)KD;
+        const size_t bytes = row * (size_t)(a_dirty_rows_ > 0 ? a_dirty_rows_ : 1);
+        return bytes < bA->size() ? bytes : bA->size();
     }
 
     inline int8_t* quantize_async(const float* A, int am, int ak, float ascale) {
@@ -817,6 +851,23 @@ struct I8Ctx {
     static void c_sync_print(int token) {
         fprintf(stderr, "[csync] tok %d calls=%ld bytes=%zu mb=%.2f ms=%.2f\n", token, c_sync_calls(),
                 c_sync_bytes(), (double)c_sync_bytes() / 1e6, c_sync_ms());
+    }
+
+    // ── The same instrument for the A writeback (audit row 17, NPU_A_SYNC_PROF=1) ──
+    static bool& a_sync_prof() { static bool v = getenv("NPU_A_SYNC_PROF") != nullptr; return v; }
+    static double& a_sync_ms() { static double v = 0; return v; }
+    static long& a_sync_calls() { static long v = 0; return v; }
+    static size_t& a_sync_bytes() { static size_t v = 0; return v; }
+    static void a_sync_note(const std::chrono::steady_clock::time_point& t0, size_t bytes) {
+        if (!a_sync_prof()) return;
+        a_sync_ms() += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t0).count();
+        a_sync_calls()++;
+        a_sync_bytes() += bytes;
+    }
+    static void a_sync_print(int token) {
+        fprintf(stderr, "[async] tok %d calls=%ld bytes=%zu mb=%.2f ms=%.2f\n", token, a_sync_calls(),
+                a_sync_bytes(), (double)a_sync_bytes() / 1e6, a_sync_ms());
     }
 
     inline void readback() {

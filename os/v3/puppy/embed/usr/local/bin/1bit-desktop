@@ -42,7 +42,11 @@ CONF=/etc/X11/xorg.conf
 say() { printf '%s\n' "$*"; }
 
 logdir() {
-    if [ -x "$LOGS" ]; then "$LOGS" dir 2> /dev/null; else printf '/var/log/1bit-logs\n'; fi
+    # 1bit-logs dir is empty when $DATA is not a mounted partition (cycle 22: it refuses rather than pretend the
+    # RAM copy is persistent), and an empty word here would have made callers write to "/xwin-console.log".
+    d=
+    [ -x "$LOGS" ] && d=$("$LOGS" dir 2> /dev/null)
+    printf '%s\n' "${d:-/var/log/1bit-logs}"
 }
 
 # --check is what menu item 6's read-only half runs: no terminal needed, no X started, and it says which of the

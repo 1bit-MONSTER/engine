@@ -544,7 +544,10 @@ Two facts bound what the container can hold, and both are reported, not hidden:
 
 A layer block's attention payload sits between its two epsilon headers and is a whole number of
 **64-row tiles**: one tile is `2*(K/128) + 2` subvolumes of 2,176 B, a pair per (column half, K
-block of 128) plus the pair the writer puts its bias input in. Inside a weight subvolume,
+block of 128) plus the pair the writer puts its bias input in. It starts at `64 + 2*hidden` bytes
+past the block's first header — the 64-byte header, then `input_layernorm` as bf16 `[hidden]` — which
+reads 1,856 on a hidden-896 pack and 4,160 on Llama-3.2-1B's hidden 2,048. It is not a constant;
+reading it as one made every other hidden look like "whole tiles plus a stray run" (engine#979). Inside a weight subvolume,
 `[0, 2048)` are the quants (byte `(cp%4) + kk*4 + (cp/4)*512` holds rows `2*cp` and `2*cp+1` at
 column `kk` of the block), `[2048, 2064)` the zero points and `[2112, 2176)` 32 bf16 scales, one
 per row of the half. Codes and zero points are int4 in two's complement; the +8 an ONNX
@@ -578,17 +581,30 @@ zero points for all 24 layers x {gate, up, down}. `tests/golden/oga_mlp_gu_group
 unit copied verbatim from the pack by `tools/oga_mlp_gu_golden.py`, with the container tiles its two
 projections give, so the same decode runs in CI against the vendor writer's bytes.
 
-**Scope, stated as a refusal rather than a hope:** this closed form fits hidden 896 / intermediate 4864
-exactly. Qwen3-1.7B (hidden 2048) and Qwen3-4B (hidden 2560) do not add up — their MLP sections are larger
-than this tiling predicts, i.e. their writer used different kernel shapes, which is the same
-runtime-supported-shapes table engine#734 ran into. Those packs refuse the MLP projections with the
-number.
+**Scope:** this closed form fits all four shipped `_rai_1.8.0_npu_4K` packs exactly — hidden 896
+(0.5B), 2,048 (Llama-3.2-1B and Qwen3-1.7B) and 2,560 (Qwen3-4B) — once the section starts at its
+measured offset. An earlier note here said Qwen3's MLP sections "do not add up ... their writer used
+different kernel shapes"; that was this reader's error, not the packs': the section was located from
+the wrong boundary, so the geometry check (`total == stride`) failed and was read as a shape
+difference. With §7.24's boundaries the gap closes to the byte on all four (FACTS §7.24.1).
 
 Which tile belongs to which projection is **measured, not assumed**: on the shipped 0.5B pack the
 tiles' bias subvolumes matched the pack's own q/k/v bias vectors, which identifies the runs as
 k (2 tiles), q (14), v (2), o (14) — 32 tiles, the payload's whole size. A pack whose payload is
 not a whole number of tiles of that hidden size, or whose q/k/v/o row counts do not add up to the
 measured tile count, is refused by name with the numbers (`npu-pack info` reports the measurement).
+
+**The section is not always one uniform run** (engine#979). The Qwen3 packs carry *four* epsilon
+headers per layer block instead of two, and the three sections between them are `[k, q, v tiles at
+K = hidden]` (k first — the order the pack's own biases identified on the 0.5B), then `[64-byte
+header + k_norm, bf16 [head_dim]]`, then `[64-byte header + q_norm, bf16 [head_dim]]` followed by
+**o_proj's tiles at K = q_proj's output width** — the pack declares
+`o_proj N=2560 K=4096` on Qwen3-4B, where hidden is 2,560. So o_proj needs its own payload offset
+and its own K, and the two per-head gains are ordinary bf16 `[head_dim]` RMSNorm weights (Qwen3's
+are `[128]`, i.e. 256 B, which is why the section between them is 320 B on both packs although
+their hidden sizes differ). `plan()` accepts a block of 2 or 4 headers, checks each section against
+that arithmetic to the byte, and refuses any other count by name. FACTS §7.24 has the tables and
+the checkpoint evidence.
 
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
@@ -773,6 +789,35 @@ or `=1` forces it either way, and the resolved state is logged once as
 `[ffn] dense-tail cache on|off (default|NPU_FFN_CACHE; lin_kd=… IM=… H=…)`. On Qwen3.8-27B-NPU2 an
 interleaved 5-round A/B (`~/lb/587-cache-20261030`) measured an 8-token request at 104.5 s against
 117.4 s (**−11%**), CPU per token 22.9 s against 63.3 s (**−64%**), same text in every arm.
+
+### The prefix cache's snapshot: two kinds of plane
+
+`snapshot_state`/`restore_state` (`npu/forward/include/q4nx_forward.h`) hand a prefill's state to the next
+request that shares its prompt (`app/npu_prefix_cache.h`, issue #650). A snapshot is not just the KV: a GDN layer
+also carries a conv window and a recurrent state, and the two kinds of plane are cut differently.
+
+- **Per position** (`kcache_`, `vcache_`): a layer holds `[NKV][HD]` floats for every position it has seen, so a
+  snapshot of the first `tokens` positions keeps exactly `tokens * NKV * HD` floats of each.
+- **Whole** (`conv_state_`, `rec_state_`): the conv window and the recurrent state are one fixed block per layer
+  that each position *updates*, not appends to, so they are carried and restored whole at any prompt length.
+
+Both live in `npu/forward/include/q4nx_state_planes.h`, header-only and unit-tested without a device
+(`tests/q4nx_state_planes_test.cpp`, ctest `q4nx_state_planes`). Cutting the whole planes with the per-position
+count was the shipped behaviour until 2026-11-04, and it cost the cache every request: on a GDN model the conv
+plane (30,720 floats for Bonsai-2-27B) can never cover `tokens * 1024`, so `restore_state` refused every snapshot
+of a prompt longer than 30 tokens and the serve logged `[prefix] slot=-1 cached=0 … reason=slot has no usable
+state` and re-prefilled from 0 — 5 of 5 long requests measured, and a repeat of an 849-token prompt paid its full
+prefill twice. Shorter prompts had the mirror-image problem: below 768 tokens the 786,432-float recurrent plane
+was silently truncated (23 % of it kept at 180 tokens). A truncated plane is now *refused* rather than installed
+short, so the fallback is a full prefill instead of a wrong state.
+
+The whole planes also fix where the snapshot may be *taken*: they are updated in place, so there is no "restore
+these positions of that state". `forward-serve` therefore saves a prompt's state one token short of the prompt —
+splitting the final prefill chunk, one extra launch — and the resume point is `cached - 1`, running the last token
+again to get the logits the answer is drawn from. Restoring `cached - 1` positions out of a snapshot taken at
+`cached` is what the KV alone would allow, and it applies the last token's GDN update twice: measured on the first
+version of this fix, the cache hit (`[prefix] slot=0 cached=179 of 180 reason=hit`, TTFT 5.3 s against 15.6 s) and
+answered the same prompt with different, fragmented text.
 
 ### Sampling and structured output
 

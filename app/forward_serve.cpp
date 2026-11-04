@@ -255,7 +255,9 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         if (e.prefix && e.prefix->enabled()) {
             const npu::PrefixDecision d = e.prefix->lookup(ids);
             stats.prefix = d;
-            const int want = std::min(d.cached_tokens, int(ids.size()) - 1);
+            // One token short of both the slot and the prompt: the snapshot stops one token short (see the save
+            // below), and the last token is run again for the logits the answer is drawn from.
+            const int want = npu::resume_point(d, ids.size());
             // The forward clears itself only when a batch starts at 0 (step_batch), and a resumed
             // prefill starts above 0, so the previous request's state has to go first.
             if (d.slot >= 0 && want > 0) {
@@ -274,25 +276,38 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         }
         {
             const int chunk_max = std::max(1, e.fwd->max_batch_rows());
-            for (int off = resume; off < (int)ids.size(); off += chunk_max) {
-                const int take = std::min(chunk_max, (int)ids.size() - off);
-                std::vector<int> chunk(ids.begin() + off, ids.begin() + off + take);
+            const int n = int(ids.size());
+            for (int off = resume; off < n;) {
+                const int take = std::min(chunk_max, n - off);
+                // The state the prefix cache keeps is taken one token short of the prompt, because the answer is
+                // drawn from the last position's logits and a snapshot holds state, not logits -- so the snapshot
+                // is saved just before the last token and that token is run again on a resume.  On a GDN model
+                // this is also the only exact point: the conv window and the recurrent state are updated in
+                // place, so a snapshot taken *after* the last token cannot be restored to just before it.
+                // Splitting the final chunk costs one launch.
+                if (off + take == n && take > 1) {
+                    const std::vector<int> head(ids.begin() + off, ids.begin() + off + take - 1);
+                    if (!e.fwd->step_batch(head, off, logits))
+                        throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
+                    off += take - 1;
+                    continue;
+                }
+                if (off + take == n && e.prefix && e.prefix->enabled()) {
+                    Q4nxNpuForward::StateSnapshot snap;
+                    if (e.fwd->snapshot_state(off, snap)) {
+                        std::string why;
+                        const int slot = e.prefix->insert(ids, snap.bytes(), stats.prefix.slot, &why);
+                        if (slot >= 0 && size_t(slot) < e.prefix_state.size()) {
+                            e.prefix_state[size_t(slot)] = std::move(snap);
+                            std::fprintf(stderr, "[prefix] saved slot=%d tokens=%d bytes=%zu %s\n", slot, off,
+                                         e.prefix_state[size_t(slot)].bytes(), why.c_str());
+                        }
+                    }
+                }
+                const std::vector<int> chunk(ids.begin() + off, ids.begin() + off + take);
                 if (!e.fwd->step_batch(chunk, off, logits))
                     throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
-            }
-        }
-        // Save the prompt's own state for the next request that shares it: taken here, at the
-        // prefill boundary, because the decode loop appends the answer to the same cache.
-        if (e.prefix && e.prefix->enabled() && !ids.empty()) {
-            Q4nxNpuForward::StateSnapshot snap;
-            if (e.fwd->snapshot_state(int(ids.size()), snap)) {
-                std::string why;
-                const int slot = e.prefix->insert(ids, snap.bytes(), stats.prefix.slot, &why);
-                if (slot >= 0 && size_t(slot) < e.prefix_state.size()) {
-                    e.prefix_state[size_t(slot)] = std::move(snap);
-                    std::fprintf(stderr, "[prefix] saved slot=%d tokens=%zu bytes=%zu %s\n", slot, ids.size(),
-                                 e.prefix_state[size_t(slot)].bytes(), why.c_str());
-                }
+                off += take;
             }
         }
 

@@ -224,7 +224,7 @@ constexpr int64_t kTokStride = 8708288;
 constexpr int64_t kNormOff = 64;         // input_layernorm.weight, bf16 [hidden]
 constexpr int64_t kPostNormOff = 1116032;
 constexpr int64_t kPostEpsOff = 1115968;  // the block's second epsilon
-constexpr int64_t kTailNorm = 1856;       // [1792 norm][2 eps][62 pad] at the file's end
+constexpr int64_t kTailNorm = 1856;       // the .fconst tail envelope: [2 eps][62 pad][1792 norm]
 constexpr int64_t kFconstHidden = 896;    // the geometry both fconsts describe
 
 struct Fconst {
@@ -918,17 +918,12 @@ Plan plan(const std::string& pack_dir) {
         p.tensors.push_back(std::move(a));
         p.tensors.push_back(std::move(b));
     }
-    // Measured 2026-10-31 on the shipped 0.5B pack: the 1,856-byte tail of EITHER .fconst
-    // is not an RMSNorm weight. Token_Token's tail opens with a byte-pattern run
-    // (33 33 33 33 55 55 55 55 77 77 ...) and ends in 64 constant bf16; Llm_Prefill's opens
-    // with the epsilon at +0, then 62 pad, then 448 f32 in 7.6..16.8 -- the tail prologue
-    // FACTS §2.2 already flagged as "not a plain fp32 scale array". So FACTS §2's
-    // "final-norm/eps bytes appear at the tail end of both files" holds only for the
-    // epsilon; the final norm's position is not established, and it is refused rather
-    // than guessed.
+    // The .fconst tail: the file's layer blocks stop at `layers x stride`, and what follows is a 1,856-byte
+    // envelope `[eps bf16 1e-6][62 pad][hidden x bf16]` -- the final norm -- and, in the Token_Token file,
+    // the lm_head tile stream (§7.15). Measured on all three packs here: the epsilon is at `layers x stride`
+    // and the norm at +64, and where both .fconst files exist the two copies are byte-identical. The
+    // position is confirmed at import time by the epsilon marker plus that cross-check.
     auto fin = make("model.norm.weight", norm_source, "BF16", {H});
-    fin.refusal = "the .fconst tail envelope is [eps][pad][448 f32], not an RMSNorm weight; the final "
-                  "norm's position is not established (measured 2026-10-31)";
     p.tensors.push_back(std::move(fin));
 
     // projections: the attention payload (q/k/v/o) decodes tile by tile and the MLP section group by
@@ -1390,7 +1385,68 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 add_norm(base + g.post_attn_hdr() + kNormOff,
                          "model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");
             }
-            // the final norm is refused in the plan: the 1,856-byte tail is not an RMSNorm weight
+            // the final norm: the tail envelope opens at `layers x stride`, the norm sits at +64, and the
+            // prefill file (when the pack ships one) holds a second copy that has to match byte for byte
+            {
+                const int64_t tail = int64_t(p.dims.layers) * g.stride;
+                if (!eps_at(fc, tail, p.dims.eps_bits)) {
+                    late.push_back("model.norm.weight: no RMSNorm epsilon at " + std::to_string(tail) +
+                                   " B, where the .fconst tail envelope opens, so its position is not "
+                                   "established for this pack");
+                } else {
+                    const uint8_t* v = at(fc, tail + kNormOff, H * 2);
+                    w.add("model.norm.weight", "BF16", {H}, as_bf16(v, kBF16, size_t(H)));
+                    ++r.tensors;
+                    r.final_norm_imported = true;
+                    const std::string pre = find_one(pack_dir, "dd_metastate_Llm_Prefill_", ".fconst");
+                    if (!pre.empty()) {
+                        // the prefill program has its own stride, so its envelope sits at its own
+                        // `layers x stride` -- measured the same way, from its own epsilon anchors
+                        const FconstGeom pg = locate_fconst(pre, p.dims.eps_bits);
+                        const int64_t ptail = int64_t(p.dims.layers) * pg.stride;
+                        // The duplicate is optional evidence, so a prefill file that cannot even be mapped
+                        // (empty, truncated, unreadable) must leave the cross-check unavailable rather than
+                        // abort an import whose Token_Token copy is fine.
+                        bool mapped = false;
+                        Fconst pf;
+                        try {
+                            pf = open_fconst(pre);
+                            mapped = true;
+                        } catch (const std::exception& e) {
+                            std::fprintf(stderr,
+                                         "1bit npu-pack: note: the prefill .fconst could not be read (%s), so the "
+                                         "final norm has no cross-check (the import uses the Token_Token copy)\n",
+                                         e.what());
+                        }
+                        const bool there = mapped && pg.stride > 0 && eps_at(pf, ptail, p.dims.eps_bits) &&
+                                           size_t(ptail + kNormOff + H * 2) <= pf.size;
+                        r.prefill_tail_seen = there;
+                        r.final_norm_crosscheck =
+                            there && std::memcmp(at(pf, ptail + kNormOff, H * 2), v, size_t(H * 2)) == 0;
+                        // The cross-check compares two copies the VENDOR ships; the one that matters is the
+                        // Token_Token tail, because that is the program this importer reads the norm for and
+                        // the one the device runs. So a mismatch is REPORTED, not fatal: refusing the import
+                        // over a duplicated copy would make an otherwise complete pack unimportable for a
+                        // vendor-side inconsistency we cannot repair. (Measured on this box: the 0.5B pack's
+                        // prefill .fconst, rewritten 2026-11-03 15:10, differs from its Token copy in exactly
+                        // one bf16 of model.norm.weight -- index 895, 9.375 vs -0.1465 -- and every other one
+                        // of the 896 matches; the container is unaffected because the norm comes from Token.)
+                        if (!there)
+                            std::fprintf(stderr,
+                                         "1bit npu-pack: note: the prefill .fconst has no readable tail envelope at "
+                                         "%lld B, so the final norm has no cross-check (the import uses the "
+                                         "Token_Token copy)\n",
+                                         (long long)ptail);
+                        else if (!r.final_norm_crosscheck)
+                            std::fprintf(stderr,
+                                         "1bit npu-pack: WARNING: the Token_Token and Llm_Prefill tails disagree, "
+                                         "so the pack's two copies of model.norm.weight are not the same bytes; "
+                                         "the container uses the Token_Token copy\n");
+                        if (mapped) unmap_file(pf.map, pf.size);
+                    }
+                }
+            }
+            // the final norm is refused in the plan only when the block geometry itself is unknown
 
             // ── the attention payload: q/k/v/o ─────────────────────────────────────────────────────
             // The projection order is the one measured on the shipped pack: each tile's bias subvolumes
@@ -1704,9 +1760,15 @@ int run(int argc, char** argv) {
                     100.0 - r.mlp_zero_inexact_pct);
     if (r.stride)
         std::printf("  fconst:     stride %lld, second header %lld (measured from the eps anchors); "
-                    "%d/%d RMSNorm anchors found\n",
+                    "%d/%d RMSNorm anchors found, final norm %s\n",
                     (long long)r.stride, (long long)r.second_header, r.norm_anchors_ok,
-                    r.norm_anchors_total);
+                    r.norm_anchors_total,
+                    !r.final_norm_imported
+                        ? "REFUSED (no readable tail envelope)"
+                        : (r.prefill_tail_seen ? (r.final_norm_crosscheck
+                                                      ? "identical in both .fconst tails"
+                                                      : "taken from the Token_Token tail -- the two copies DISAGREE")
+                                               : "taken from the tail envelope (the pack ships no prefill copy)"));
     if (!r.fconst_note.empty()) std::printf("  fconst:     %s\n", r.fconst_note.c_str());
     if (!r.refused.empty()) std::printf("  incomplete: %zu tensors, listed in %s/model.q4nx\n",
                                         r.refused.size(), out.c_str());

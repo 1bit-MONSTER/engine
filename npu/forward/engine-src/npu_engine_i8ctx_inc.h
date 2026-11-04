@@ -126,6 +126,11 @@ struct I8Ctx {
     // kernel; the reverse is not allowed, and load_pb16i_into refuses it.
     int pb16i_planes = 1;
 
+    // Rows of C the host will read after the launch that is in flight: the activation rows the
+    // quantiser wrote. Both C syncs (the canary's writeback and readback()'s invalidate) cover
+    // exactly these rows instead of the whole BO -- see c_host_bytes().
+    int last_am_ = 1;
+
     // Bytes of one weight image: the int8 layouts are KD*ND, pb16i and t2s are their own sizes.
     size_t w_bytes() const {
         if (gemv) return gemv_w_bytes(KD, ND);
@@ -558,6 +563,7 @@ struct I8Ctx {
     }
     inline uint16_t* quantize_bf16(const float* A, int am, int ak) {
         if (am != 1) { std::fprintf(stderr, "  I8Ctx: the gemv family takes one row per launch (am=%d)\n", am); return Ag; }
+        last_am_ = am;
         const int n = ak < KD ? ak : KD;
         for (int k = 0; k < n; k++) {
             float v = A[k];
@@ -623,6 +629,7 @@ struct I8Ctx {
     }
 
     inline int8_t* quantize_async(const float* A, int am, int ak, float ascale) {
+        last_am_ = am;
         if (gemv) { quantize_bf16(A, am, ak); return Am; }
         float ais = 1.0f / ascale;
         prepare_activation(am, ak);
@@ -651,6 +658,7 @@ struct I8Ctx {
                     "must walk the prompt in MD-row blocks)\n", am, MD);
             return Am;
         }
+        last_am_ = am;
         prepare_activation(am, ak);
         for (int m = 0; m < am; m++)
             q4nx_quant_i8::row(A + (size_t)m * ak, ak, 1.0f / ascales[m], Am + (size_t)m * KD);
@@ -771,9 +779,52 @@ struct I8Ctx {
     // landed), not that the host read under them. The mitigation is the canary below: poison the row we
     // read before the launch, and if that row is still poisoned after the invalidate, re-issue the launch
     // once instead of dequantising garbage into a layer.
+    // Bytes of C the host actually reads: rows [0, last_am_), each ND int32 (two planes in the int64
+    // mode). bo::sync() is a per-64-B clflush loop over its range -- disassembled from
+    // libonebit_npu_rt.a -- so its cost IS the range, and the device writes C through the IOMMU into
+    // memory: only lines the host touched can be stale, and the host touches rows [0, am).  A decode
+    // launch therefore invalidates its one row (ND x 4 B, i.e. up to 128x less than the MD-row BO).
+    // NPU_NO_C_NARROW=1 restores the whole-BO range for an A/B, and NPU_DBG forces it because
+    // bochk/RBCHK checksum the full extent.
+    inline size_t c_host_bytes() const {
+        size_t row = (size_t)ND * 4u;
+        if (!gemv && (pb16i || pb16i_planes > 1)) row *= 2u;
+        const size_t bytes = row * (size_t)(last_am_ > 0 ? last_am_ : 1);
+        return bytes < bC->size() ? bytes : bC->size();
+    }
+    inline bool c_sync_whole() const {
+        return getenv("NPU_NO_C_NARROW") != nullptr || getenv("NPU_DBG") != nullptr;
+    }
+
+    // ── Optional instrument for the narrow-vs-whole A/B (NPU_C_SYNC_PROF=1) ──
+    // bo::sync() is a clflush loop over the range it is given, so the bytes are exact and the ms is the
+    // cost of flushing them. Process-global on purpose: every context's flushes land in the same process,
+    // and the printer is per token, so consecutive lines give that token's flushes. Off unless asked.
+    static bool& c_sync_prof() { static bool v = getenv("NPU_C_SYNC_PROF") != nullptr; return v; }
+    static double& c_sync_ms() { static double v = 0; return v; }
+    static long& c_sync_calls() { static long v = 0; return v; }
+    static size_t& c_sync_bytes() { static size_t v = 0; return v; }
+    static void c_sync_note(const std::chrono::steady_clock::time_point& t0, size_t bytes) {
+        c_sync_ms() += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t0).count();
+        c_sync_calls()++;
+        c_sync_bytes() += bytes;
+    }
+    static void c_sync_print(int token) {
+        fprintf(stderr, "[csync] tok %d calls=%ld bytes=%zu mb=%.2f ms=%.2f\n", token, c_sync_calls(),
+                c_sync_bytes(), (double)c_sync_bytes() / 1e6, c_sync_ms());
+    }
+
     inline void readback() {
         static const bool skip_inval = env_off("NPU_NO_C_INVAL");
-        if (!skip_inval) bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        const bool whole = c_sync_whole();
+        if (!skip_inval) {
+            const auto cs0 = c_sync_prof() ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+            if (whole) bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            else bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE, c_host_bytes(), 0);
+            if (c_sync_prof()) c_sync_note(cs0, whole ? bC->size() : c_host_bytes());
+        }
         if (canary_on_ && !gemv) verify_canary();
         if (getenv("NPU_DBG")) {
             static int n = 0;
@@ -805,13 +856,18 @@ struct I8Ctx {
     // a false positive that also doubles prefill work through the retry. Prefill numerics are NPU_M16_CHECK's job.
     inline void poison_canary(int an, int /*am*/ = 1) {
         if (!canary_on_ || Cm == nullptr) return;
+        const auto cs0 = c_sync_prof() ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
         const int n = std::min(an, ND);
         for (int i = 0; i < n; i += kCanaryStride) Cm[i] = kCanary;
         // Write the sentinels back NOW. Without this the poisoned lines sit dirty in the host cache and are
         // evicted after the kernel has already written the same memory, so the eviction overwrites the device's
         // result with the sentinel -- the canary then "detects" a short read it caused itself (measured: 1,416
         // false positives on the shipping M=128 decode path, one per launch group, before this line existed).
-        bC->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (c_sync_whole()) bC->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        else bC->sync(XCL_BO_SYNC_BO_TO_DEVICE, c_host_bytes(), 0);
+        if (c_sync_prof())
+            c_sync_note(cs0, c_sync_whole() ? bC->size() : c_host_bytes());
     }
 
     inline void verify_canary() {

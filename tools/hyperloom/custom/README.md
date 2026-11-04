@@ -136,7 +136,7 @@ the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 | `HL_FA` | `-fa on\|off\|auto` | flash attention, on both legs. `off` reaches serve and then fails at decode (`decode() failed: Compute error`, HTTP 500) on this pin — a real finding, reported as a rejected candidate. |
 | `HL_CTK`, `HL_CTV` | `-ctk`, `-ctv` | KV cache types (`f16`, `q8_0`, ...), `llama-bench`/KLD only (serve has no such flag). A quantized cache implies `-fa on`: without it the bench dies in `graph_compute ... error -1`. |
 | `HL_MTP_MAX` | `--no-mtp` / `--mtp-max N` | A GGUF with its own MTP head drafts **by default** on HRX (`1bit serve` reports it); `0` turns drafting off, `N` caps the draft length, unset keeps serve's default (draft length 3 via its recipe). `HL_MTP_HEAD` names an external head instead. |
-| `HL_DFLASH` | `--dflash <drafter>` | block-diffusion drafter; exclusive with `--mtp` |
+| `HL_DFLASH`, `HL_DFLASH_GGUF` | `--dflash <drafter>` | block-diffusion drafter; exclusive with `--mtp`. `HL_DFLASH_GGUF` names the drafter file (default `dflash.gguf`, so relative to the run's cwd) and this model has two quants of it, so the arm's identity is the *pair*: `bench_summary.drafting` reports the resolved path and sha256 of the file the measurement really used, and of `HL_MTP_HEAD` when that is the head in use. Before that, a DFlash arm recorded `{"HL_DFLASH": "1"}` and the drafter was recoverable only from `serve.log`. |
 | `HL_PARALLEL` | `--parallel N` | HRX runs one gated-delta-net sequence at a time, so this is expected flat on Qwen3.8 |
 | `GGML_HRX_*` | environment only | the knobs `docs/hrx.md` names (`Q8_PREFILL_RELAX`, `GRAPH_PROGRAM_CACHE`, ...) |
 | `HL_CTX` | `-c` | context the serve leg is started at (default 8192). Not a lever: without it serve sizes the KV cache for the model's own context and aborts on its own fit check whenever the box is busy. Raise it for a long-context workload; `HL_LONGCTX` must fit inside it (`HL_CTX >= HL_LONGCTX + HL_LONGTOK`), and a run that does not fit is refused before anything loads. |
@@ -149,4 +149,6 @@ the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 * The measurement assumes it is the only GPU work in flight: it does not wait for a cool die first,
   so do not raise the hold above the measurement's own worst case. `HL_BUDGET_SEC` (default 780)
   bounds the script itself so it finishes inside the hold.
-* `HL_REPS`, `HL_TOKENS`, `HL_WIKI`, `HL_STATE`, `HL_GPU_HOLD_MINUTES` are the other knobs.
+* `HL_REPS` (default 3 — the repetition count behind the pp512/tg128 medians, recorded as
+  `bench_summary.llama_bench_reps`), `HL_TOKENS`, `HL_WIKI`, `HL_STATE`, `HL_GPU_HOLD_MINUTES` are the other
+  knobs.

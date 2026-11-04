@@ -29,31 +29,40 @@ facts on every draw.
 ```
 1bit OS rc-2026-11-03-c21 strix  192.168.50.110  up 2h 13m  Secure Boot enabled  SoC 43C
  CONNECT -------------------------------------------------------------------------------
-  web UI   http://192.168.50.110:13305
-  API base http://192.168.50.110:13305/api/v1
-  API key  press 1
-  ssh      root@192.168.50.110
-  mobile   Lemonade Mobile: server http://192.168.50.110:13305, key from 1
+  web UI http://192.168.50.110:13305                                        █▀▀▀▀▀█ ▄ █ ▀█▄▄
+  name http://1bit-os.local:13305   (mDNS)                                 █ ███ █ ▄▄▄ █▄ █▄
+  api  http://192.168.50.110:13305/api/v1   (API key: press 1)             █ ▀▀▀ █ ▄█ ▄▄ ▀▄▄ █
+  ssh  root@192.168.50.110   (your key in /data/ssh/authorized_keys)       ▀▀▀▀▀▀▀ ▀▄█▄▀ █▄█ ▀▀▀
+  app  Lemonade Mobile: server http://192.168.50.110:13305 + that key      (the web UI URL as a QR)
  LEMONADE -------------------- GPU ---------------------------- NPU ----------------------
  MODELS ---------------------- FANS / TEMPS ------------------- DATA ---------------------
+ MENU -----------------------------------------------------------------------------------
+ 1 Show the API key
+ 2 Quick chat test (GPU and NPU)
+ ...
+ 9 Reboot / power off
  LOGS newest ----------------------------------------------------------------------------
- 1 Show the API key   2 Quick chat test (GPU and NPU)   ...   9 Reboot / power off
 ```
+
+Top to bottom, in this order and with nothing between (the owner, cycle 20: *"can we place the menu above the
+scrolling logs and below the technical information"*): **header, CONNECT, the status facts, the MENU, the
+scrolling log**, then one footer line.
 
 Two layouts off ONE set of facts, chosen by width:
 
 | size | what you get |
 |---|---|
-| 240x67 (tty1 on a monitor) | CONNECT block, six panels in a 3x2 grid, a tall log pane, the nine actions on two rows |
-| 80x25 (serial/VGA console, what the QEMU rows read) | the same block and panels one line each, a 2-line log pane, the SAME action labels - `Show the API key` and `Reboot / power off` are never abbreviated, because `vm-check.sh`'s `U2 menu` row looks for exactly those strings on tty1 |
+| 240x67 (tty1 on a monitor) | CONNECT block, six panels in a 3x2 grid, the nine menu rows, then the log pane |
+| 80x25 (serial/VGA console, what the QEMU rows read) | the same block, the same six facts on two compact rows, all nine menu rows, and the log pane left four rows - `Show the API key` and `Reboot / power off` are never abbreviated, because `vm-check.sh`'s `U2 menu` row looks for exactly those strings on tty1 |
 
-The log pane gets whatever rows are left. Key **8** is the full-screen, scrollable view.
+The MENU is whole and always on screen at both sizes; the log pane gets whatever rows are left (at least three at
+80x25). Key **8** is the full-screen, scrollable view.
 
 ## Keys
 
 | key | what it does |
 |---|---|
-| **1** | show the API key (confirmed first: it is a bearer token and this screen can be on a KVM recording) |
+| **1** | show the API key (confirmed first: it is a bearer token and this screen can be on a KVM recording). The label is the same whether or not the box has a key - `vm-check.sh`'s `U2 menu` row greps it - and on a blank box the CONNECT block says anyone on the network can use Lemonade (cycle 20's blank-key default, item 7) |
 | **2** | quick chat test on GPU and NPU -> `1bit-console-menu --action 2` |
 | **3** | network: DHCP, static address, hostname -> `--action 3` |
 | **4** | models: list, pull, delete -> `--action 4` |
@@ -65,11 +74,35 @@ The log pane gets whatever rows are left. Key **8** is the full-screen, scrollab
 | arrows, PgUp/PgDn, Home/End | scroll the log (one keypress = one record, oldest to newest) |
 | **f** | follow the newest line again |
 | **r** | re-read the facts now (they refresh every 2 s while the box is coming up, every 3 s after) |
-| **q** | stays on this screen: this console never drops to a bare prompt |
+| **q** | stays on this screen: this console never drops to a bare prompt. Over ssh (`ssh -t root@<box> /usr/local/bin/1bit-console-tui`) it quits, as `q` does in every full-screen program - the footer says which of the two you are looking at |
 
 Keys 2-7 hand the terminal to `1bit-console-menu --action N` - the *same* code `vm-check.sh`'s `U2 menu actions`
 and `--selftest` rows exercise. Nothing that needs a typed answer is re-implemented here, so the two surfaces
 cannot drift, and an action the gate proves is an action the screen has.
+
+## Reaching it from another machine (ssh, links, QR)
+
+The owner, 2026-11-04: *"due to being headless, can you make the links clickable, because i'm on kvm and i want use
+it through ryzen"*. So the same binary runs over ssh - it makes no tty1 assumption - and three things follow from
+the terminal it finds itself on:
+
+* **Clickable URLs** (OSC 8 hyperlinks) on the CONNECT rows when `TERM` is a terminal emulator (`xterm-256color`,
+  `tmux`, `kitty`, ...). ratatui has no hyperlink style, so `main` writes them *after* the frame, at the cells
+  `ui::draw` reports in `Link`, with the drawn text as the target: the text and the link cannot disagree, and
+  `every_hyperlink_covers_the_url_that_is_drawn_there` asserts exactly that off the rendered frame. On the VGA
+  console (`TERM=linux`), JetKVM and a serial line they are **not** written - there they would be printed as
+  garbage - and no link is emitted for a URL that wrapping split, because half a URL opens the wrong thing.
+* **A QR code** of the web UI URL, to the right of the CONNECT rows, two modules per cell (17 rows for the
+  appliance's 27-character URL: version 2, ECC L, `qrcodegen`, the only new dependency and one with no
+  transitive ones), drawn **black on white** because a scanner wants dark-on-light. The drawn code was read back
+  with zxing-cpp from a PNG of the 240x67 frame and decoded to `http://192.168.50.110:13305` (2026-11-04, by hand);
+  `a_known_url_renders_to_these_exact_rows` pins the 17 rows literally, so a change to the encoder, the ECC level or
+  the quiet zone fails the build instead of shipping a code nobody can read. It is only drawn where it
+  fits: at 80x25 there are no 33 free columns beside the block and squeezing it in would push the menu or the log
+  off the screen, so there the URL stays plain text - which a phone camera reads too.
+* **The mDNS name** `http://1bit-os.local:13305`, next to the address, with `(mDNS)` when the box's own
+  `avahi-daemon` is running and `(mDNS - avahi not running)` when it is not: the row never promises a name that
+  will not answer. The responder itself is pi-os3's half of the request (engine #953).
 
 ## What it reads, and why from there
 
@@ -116,7 +149,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 25 tests: the probe parsers + the two renders
+cargo test                                    # 43 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the two renders
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

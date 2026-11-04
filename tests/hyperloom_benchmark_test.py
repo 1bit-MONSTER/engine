@@ -26,7 +26,9 @@ Run directly (`python3 tests/hyperloom_benchmark_test.py`) or through ctest.
 """
 import hashlib
 import importlib.util
+import json
 import pathlib
+import platform
 import sys
 
 BENCH = pathlib.Path(__file__).resolve().parents[1] / "tools/hyperloom/custom/benchmark.py"
@@ -98,6 +100,55 @@ def main():
         assert ident["onebit"] == str(onebit), ident
         assert ident["bin_dir"].endswith("hrx/llama/bin"), ident
         assert ident["sha256"] == hashlib.sha256(onebit.read_bytes()).hexdigest(), ident
+
+    # HL_LONGCTX and HL_CTX are independent variables and the 8192 default is smaller than every
+    # long-context value in use, so a run that set only HL_LONGCTX asked for an 18.8k prompt on an
+    # 8192-token server: rejected, or answered on a shifted context = a different measurement wearing
+    # the same label. One definition of the pinned context, and a refusal before anything loads.
+    for longctx, ctx, longtok, want in ((18800, "20480", 128, False), (18800, None, 128, True),
+                                        (18800, "18800", 128, True), (8000, None, 128, False),
+                                        (0, None, 128, False)):
+        os.environ["HL_LONGCTX"], os.environ["HL_LONGTOK"] = str(longctx), str(longtok)
+        if ctx is None:
+            os.environ.pop("HL_CTX", None)
+        else:
+            os.environ["HL_CTX"] = ctx
+        assert bench.longctx_exceeds_serve_ctx() is want, (longctx, ctx, longtok, want)
+        assert bench.serve_ctx() == (8192 if ctx is None else int(ctx))
+        assert bench.serve_batch_args()[0] == "-c" and bench.serve_batch_args()[1] == str(bench.serve_ctx())
+    for k in ("HL_LONGCTX", "HL_LONGTOK", "HL_CTX"):
+        os.environ.pop(k, None)
+
+    # The artifact has to name the device stack too: the box reboots between series and the launcher
+    # applies no kernel gate, so before this a report could not say which kernel/driver a number came
+    # from (the pair-of-record JSONs carried no kernel field at all).
+    ident = bench.device_stack()
+    assert ident["kernel"] == platform.release(), ident
+    with tempfile.TemporaryDirectory() as tmp:
+        stub = pathlib.Path(tmp) / "libhsa-runtime64.so.1"
+        stub.write_bytes(b"\x7fELF not really a runtime\n")
+        os.environ["IREE_HAL_AMDGPU_LIBHSA_PATH"] = str(stub)
+        ident = bench.device_stack()
+        assert ident["hsa_runtime"] == str(stub), ident
+        assert ident["hsa_runtime_sha256"] == hashlib.sha256(stub.read_bytes()).hexdigest(), ident
+        os.environ["IREE_HAL_AMDGPU_LIBHSA_PATH"] = str(pathlib.Path(tmp) / "absent.so.1")
+        assert bench.device_stack()["hsa_runtime"] is None, bench.device_stack()
+    os.environ.pop("IREE_HAL_AMDGPU_LIBHSA_PATH")
+
+    # And the verdict has to name what it was relative to: `HL_STATE` is per-box and the base logits are
+    # regenerated when missing, so a KLD number reads PASS against a reference the JSON never named.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = pathlib.Path(tmp) / "kld-base.kld"
+        texts = pathlib.Path(tmp) / "texts.json"
+        base.write_bytes(b"logits " * 1000)
+        texts.write_text(json.dumps({"texts": {"code": "a"}}), encoding="utf-8")
+        ident = bench.gate_reference({"model": "deadbeef", "levers": {"HL_DFLASH": "1"}}, base, texts)
+        assert ident["model"] == "deadbeef" and ident["levers"] == {"HL_DFLASH": "1"}, ident
+        assert ident["base_kld_sha256"] == hashlib.sha256(base.read_bytes()).hexdigest(), ident
+        assert ident["texts_sha256"] == hashlib.sha256(texts.read_bytes()).hexdigest(), ident
+        # A different base of the same name is a different reference, which is the point.
+        base.write_bytes(b"logits " * 999)
+        assert bench.gate_reference({}, base, texts)["base_kld_sha256"] != ident["base_kld_sha256"]
 
     print("hyperloom_benchmark_test: OK")
     return 0

@@ -13,13 +13,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! What the screen looks like. Two layouts, chosen by width, over ONE set of facts:
+//! What the screen looks like. Top to bottom, as the owner asked on cycle 20 ("can we place the menu above the
+//! scrolling logs and below the technical information"), in this order and nothing between:
 //!
-//!   * 240x67 (the appliance's tty1 on a monitor) - the CONNECT block, then six panels in a 3x2 grid, then the
-//!     log pane, then the nine actions.
-//!   * 80x25 (a serial/VGA default console, and what the QEMU rows read) - the same block, the same panels one
-//!     line each, a shorter log pane, and the SAME action labels: the c15 acceptance row looks for
-//!     "Show the API key" and "Reboot / power off" on tty1, so they are never abbreviated.
+//!   header | CONNECT | the status facts | MENU (nine numbered rows) | LOGS (scrolling) | one footer line
+//!
+//! The status facts are the only part that changes shape with the screen:
+//!
+//!   * 240x67 (the appliance's tty1 on a monitor) - six panels in a 3x2 grid (LEMONADE / GPU / NPU, then
+//!     MODELS / FANS+TEMPS / DATA).
+//!   * 80x25 (a serial/VGA default console, and what the QEMU rows read) - the same six facts, and their short
+//!     forms, on ONE line, because nine menu rows plus that line is what leaves the log pane its three rows.
+//!
+//! The MENU is always on screen at both sizes: the c15 acceptance row looks for "Show the API key" and
+//! "Reboot / power off" on tty1, and the owner's complaint was a menu you had to scroll the log off to read.
 //!
 //! Colours are the 16-colour VT palette by name only (no RGB: a bare Linux console has no truecolour) and no
 //! glyph outside what every console font has - titles are ASCII rules, so a VGA text mode with a plain code page
@@ -67,6 +74,10 @@ pub enum Modal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Yes {
     ShowKey,
+    // Cycle 20: blank is the shipped mode, so item 1 in the TUI also has to be able to TURN a key on. It hands the
+    // terminal to the dialog menu's item (1bit-console-menu --action 1), which mints the key, writes lemond.conf and
+    // restarts Lemonade - one implementation, not a second copy in Rust.
+    MintKey,
     Desktop,
     Reboot,
     Poweroff,
@@ -79,6 +90,8 @@ pub struct App {
     pub modal: Option<Modal>,
     /// advanced by the event loop ~4x a second while the box is still coming up
     pub spin: usize,
+    /// started from an ssh session: `q` is then the way out, which the footer has to say (tty1's does not quit)
+    pub ssh: bool,
     /// what just happened, or why the console did not exit, and when it was said (it clears itself after a while)
     pub message: Option<(String, std::time::Instant)>,
 }
@@ -91,6 +104,7 @@ impl App {
             full_logs: false,
             modal: None,
             spin: 0,
+            ssh: false,
             message: None,
         }
     }
@@ -188,34 +202,70 @@ pub fn connect_block(f: &Facts, spin: &str, width: usize) -> Vec<Line<'static>> 
     out.push(rule(&title, width));
 
     let host = f.ip().unwrap_or("-");
-    let rows = [
+    let keyed = f.key.is_some();
+    // Cycle 20 (owner: "blank key"): the appliance ships with NO API key, so the block says what that means for
+    // whoever is reading it - anyone on this network can use Lemonade until item 1 mints one. Keyed mode keeps the
+    // wording the gate greps for, so one renderer serves both modes and neither reads as the other.
+    let mut rows = vec![
         format!("web UI http://{host}:13305"),
-        format!("api  http://{host}:13305/api/v1   (API key: press 1)"),
+        // the name a phone (and Lemonade Mobile) can use instead of the address: pi-os3 makes the box announce
+        // it via avahi, so when the responder is not running the row says so instead of promising a dead name
+        if f.mdns {
+            "name http://1bit-os.local:13305   (mDNS)".to_string()
+        } else {
+            "name http://1bit-os.local:13305   (mDNS - avahi not running)".to_string()
+        },
+        if keyed {
+            format!("api  http://{host}:13305/api/v1   (API key: press 1)")
+        } else {
+            format!("api  http://{host}:13305/api/v1")
+        },
         format!("ssh  root@{host}   (your key in /data/ssh/authorized_keys)"),
-        format!("app  Lemonade Mobile: server http://{host}:13305 + that key"),
+        if keyed {
+            format!("app  Lemonade Mobile: server http://{host}:13305 + that key")
+        } else {
+            format!("app  Lemonade Mobile: server http://{host}:13305 (any key)")
+        },
     ];
+    if !keyed {
+        rows.push("key  none - anyone here can use it; press 1 to require one".to_string());
+    }
     for value in rows {
         let indent = IND.len();
         let style = Style::default().fg(Color::Gray);
         let avail = width.saturating_sub(indent).max(8);
         // a row that fits is emitted VERBATIM: its two spaces are part of what the gate greps for (`api  http://`),
         // and wrap_words normalises runs of spaces by design
-        let pieces = if value.chars().count() <= avail { vec![value.clone()] } else { wrap_words(&value, avail) };
+        let pieces = if value.chars().count() <= avail {
+            vec![value.clone()]
+        } else {
+            wrap_words(&value, avail)
+        };
         for (i, w) in pieces.into_iter().enumerate() {
             if i == 0 {
                 out.push(Line::from(vec![
                     Span::styled(IND, Style::default().fg(Color::Cyan)),
-                    Span::styled(w, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        w,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]));
             } else {
-                out.push(Line::from(vec![Span::raw(" ".repeat(indent)), Span::styled(w, style)]));
+                out.push(Line::from(vec![
+                    Span::raw(" ".repeat(indent)),
+                    Span::styled(w, style),
+                ]));
             }
         }
     }
 
     if f.ips.is_empty() {
         out.push(Line::from(Span::styled(
-            format!("{IND}no address yet - press 3 (Network); DHCP is automatic once a cable is in"),
+            format!(
+                "{IND}no address yet - press 3 (Network); DHCP is automatic once a cable is in"
+            ),
             Style::default().fg(Color::Yellow),
         )));
     } else if !f.lemond_listening {
@@ -245,7 +295,7 @@ pub fn panels(f: &Facts) -> Vec<(&'static str, Vec<String>)> {
     lemonade.push(if f.key.is_some() {
         "API key: set, press 1".to_string()
     } else {
-        "API key: none in /etc/1bit/lemond.conf".to_string()
+        "API key: none (blank mode), press 1".to_string()
     });
     p.push(("LEMONADE", lemonade));
 
@@ -350,29 +400,30 @@ pub fn panels(f: &Facts) -> Vec<(&'static str, Vec<String>)> {
     p
 }
 
-/// The nine actions, never abbreviated, packed whole into as few rows as the width allows.
-pub fn action_lines(width: usize) -> Vec<String> {
+/// The nine actions, numbered, one row each (the owner's MENU block). Never abbreviated: the labels are what the
+/// gates and the owner's own fingers know.
+///
+/// Item 1 is the SAME string in both key modes on purpose. pi-prs on #935: the appliance ships blank (cycle-20 item
+/// 7), and `vm-check.sh:417` greps `Show the API key` off tty1, so a mode-dependent label turns `U2 menu` (and
+/// pi-release's c15 menugate) red on every shipped image. The blank-key offer belongs where the item-7 work puts it
+/// - the CONNECT block and item 1's own dialog, on `os/v3-c20` - not in the label the gates know.
+pub fn menu_lines() -> Vec<String> {
+    ACTIONS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| format!("{} {label}", i + 1))
+        .collect()
+}
+
+/// The same rows as drawn: wrapped (never clipped) with a continuation indent, should the screen be narrower
+/// than the longest label.
+pub fn menu_rows(width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let mut cur = String::new();
-    for (i, label) in ACTIONS.iter().enumerate() {
-        let item = format!("{} {label}", i + 1);
-        let add = if cur.is_empty() {
-            item.chars().count()
-        } else {
-            item.chars().count() + 3
-        };
-        if cur.chars().count() + add > width && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-            cur = item;
-        } else {
-            if !cur.is_empty() {
-                cur.push_str("   ");
-            }
-            cur.push_str(&item);
+    for row in menu_lines() {
+        for (i, part) in wrap_words(&row, width).into_iter().enumerate() {
+            let text = if i == 0 { part } else { format!("  {part}") };
+            out.push(styled(text, Some(Color::Cyan), i == 0));
         }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
     }
     out
 }
@@ -498,19 +549,111 @@ fn panel_grid(f: &Facts, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-fn panel_compact(f: &Facts, width: usize) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    for (title, values) in panels(f) {
-        let text = format!("{title}  {}", values.join("  "));
-        for (i, l) in wrap_words(&text, width).into_iter().enumerate() {
+/// The six panels as ONE line for a text console, because 80x25 has to hold header + CONNECT + this + nine menu
+/// rows + three log rows, and the nine rows are the owner's. Each field is the shortest TRUE form of the same
+/// fact the panel shows at 240x67, never a truncated field: `wrap_words` breaks the line if the screen is narrower
+/// than the whole thing.
+fn compact_status(f: &Facts, width: usize) -> Vec<Line<'static>> {
+    let mut fields: Vec<String> = Vec::new();
+
+    fields.push(match (f.lemond_pid, f.lemond_listening) {
+        (Some(pid), true) => format!("LEMONADE up {pid}"),
+        (Some(pid), false) => format!("LEMONADE pid {pid} no answer"),
+        (None, _) => "LEMONADE DOWN".to_string(),
+    });
+
+    let g = &f.gpu;
+    fields.push(match (&g.device, g.temp_c) {
+        (Some(d), Some(t)) => format!("GPU {} {t}C", short_device(d)),
+        (Some(d), None) => format!("GPU {}", short_device(d)),
+        (None, _) => "GPU no HRX device".to_string(),
+    });
+
+    let n = &f.npu;
+    fields.push(
+        match (&n.device, n.module) {
+            (Some(_), true) if n.busy => "NPU busy",
+            (Some(_), true) => "NPU idle",
+            (_, false) => "NPU amdxdna absent",
+            _ => "NPU no accel node",
+        }
+        .to_string(),
+    );
+
+    fields.push(match f.models.downloaded.len() {
+        0 => "MODELS none".to_string(),
+        n => format!("MODELS {n}"),
+    });
+    fields.push(fans_word(f));
+    fields.push(match f.data {
+        Some((_, free)) => format!("DATA {} free", human_bytes(free)),
+        None => "DATA not mounted".to_string(),
+    });
+    if let Some(t) = f.stats.tps {
+        fields.push(format!("{t:.0} tok/s"));
+    }
+
+    let text = pack_fields(&fields, width);
+    text.into_iter()
+        .enumerate()
+        .map(|(i, l)| {
             if i == 0 {
-                out.push(styled(l, Some(Color::Gray), false));
+                styled(l, Some(Color::Gray), false)
             } else {
-                out.push(styled(format!("  {l}"), Some(Color::DarkGray), false));
+                styled(format!("  {l}"), Some(Color::DarkGray), false)
             }
+        })
+        .collect()
+}
+
+/// Pack `A | B | C` into as few rows as the width allows WITHOUT splitting a field: at 80 columns the six facts
+/// come out as two rows, and `DATA` never ends up alone at the end of the first one. A field wider than the whole
+/// screen (a long device name on a 40-column serial line) is wrapped by itself rather than cut.
+fn pack_fields(fields: &[String], width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for field in fields {
+        if cur.is_empty() {
+            cur = field.clone();
+        } else if cur.chars().count() + 3 + field.chars().count() <= width {
+            cur.push_str(" | ");
+            cur.push_str(field);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur = field.clone();
+        }
+        if cur.chars().count() > width {
+            let mut parts = wrap_words(&cur, width).into_iter();
+            if let Some(first) = parts.next() {
+                out.push(first);
+            }
+            out.extend(parts.map(|p| format!("  {p}")));
+            cur.clear();
         }
     }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
     out
+}
+
+/// `HRX0: AMD Radeon 8060S Graphics` -> `HRX0`: the colons separate the runtime's node from the marketing name.
+fn short_device(d: &str) -> &str {
+    d.split(':').next().unwrap_or(d).trim()
+}
+
+/// `fans: controlled (fan1 0 rpm fan2 0 rpm)` -> `FANS controlled`.
+// shortcut: the probe's "fans: <state> (fanN rpm)" shape; a different shape says "?" instead of a guess -
+// upgrade if the ec_su_axb35 probe's wording changes.
+fn fans_word(f: &Facts) -> String {
+    if f.fans.is_empty() {
+        return "FANS not readable".to_string();
+    }
+    let state = f.fans.split_once(':').map(|(_, r)| r).unwrap_or(&f.fans);
+    match state.split('(').next().unwrap_or("").trim() {
+        "" => "FANS ?".to_string(),
+        word => format!("FANS {word}"),
+    }
 }
 
 fn modal_box(m: &Modal) -> (String, Vec<String>, String) {
@@ -527,6 +670,7 @@ fn modal_box(m: &Modal) -> (String, Vec<String>, String) {
         } => {
             let hint = match yes {
                 Yes::ShowKey => "y shows the key on this screen, n cancels",
+                Yes::MintKey => "y mints one and restarts Lemonade, n cancels",
                 Yes::Desktop => "y starts the desktop now, n cancels",
                 Yes::Reboot => "y reboots the box, n cancels",
                 Yes::Poweroff => "y powers the box off, n cancels",
@@ -550,34 +694,55 @@ fn modal_box(m: &Modal) -> (String, Vec<String>, String) {
     }
 }
 
-pub fn draw(f: &mut Frame, a: &App) {
+/// Where one URL sits on the finished screen, in cells: `text` is both what is shown and what the terminal is
+/// asked to open. Only whole URLs are collected - a URL split by wrapping is left plain, because half a link is
+/// worse than none - and `main` writes them as OSC 8 hyperlinks when the terminal is not the VGA console.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub x: u16,
+    pub y: u16,
+    pub text: String,
+}
+
+pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
     let area = f.area();
     let w = area.width as usize;
     let h = area.height as usize;
     let wide = w >= 100;
 
-    let body: Vec<Line<'static>> = if a.full_logs {
-        let inner = h.saturating_sub(2);
-        let mut v = vec![log_title(a, w, true)];
-        v.extend(log_lines(a, inner, w));
-        v
-    } else {
-        let mut v = vec![header(&a.facts)];
-        v.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
-        v.extend(if wide {
-            panel_grid(&a.facts, w)
+    // header, CONNECT, then the status facts - the "technical information" the owner wants the menu below
+    let mut top: Vec<Line<'static>> = Vec::new();
+    let mut menu: Vec<Line<'static>> = Vec::new();
+    let mut qr: Option<(u16, Vec<Line<'static>>)> = None;
+    if !a.full_logs {
+        top.push(header(&a.facts));
+        top.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
+        // the QR is drawn to the RIGHT of the CONNECT rows, so the block has to be as tall as the code; when the
+        // screen cannot hold both (80x25 - the URL there is plain text, which a phone's camera reads too) it is
+        // absent rather than squeezed into the log pane's rows
+        if let Some((qw, rows)) = qr_panel(&a.facts, &top[1..], w, h) {
+            top.resize(top.len().max(2 + rows.len()), Line::from(""));
+            qr = Some((qw, rows));
+        }
+        if wide {
+            top.extend(panel_grid(&a.facts, w));
         } else {
-            panel_compact(&a.facts, w)
-        });
-        v
-    };
+            top.extend(compact_status(&a.facts, w));
+        }
+        // the MENU sits between the facts and the log, always whole, one numbered row per action
+        menu.push(rule("MENU", w));
+        menu.extend(menu_rows(w));
+    }
 
-    let actions = action_lines(w);
     let mut footer: Vec<String> = vec![if a.full_logs {
         "q back   arrows scroll   f newest   r refresh   1-9 actions".to_string()
     } else {
-        "1-9 actions   arrows scroll   f newest   r refresh   8 logs   q stays on this screen"
-            .to_string()
+        if a.ssh {
+            "1-9 actions   arrows scroll   f newest   r refresh   8 logs   q quits".to_string()
+        } else {
+            // the tty1 promise: this console never drops to a bare prompt
+            "1-9 actions   arrows scroll   f newest   r refresh   8 logs   q stays".to_string()
+        }
     }];
     if let Some((m, _)) = &a.message {
         footer.push(m.clone());
@@ -588,36 +753,60 @@ pub fn draw(f: &mut Frame, a: &App) {
         .map(|s| styled(s, Some(Color::DarkGray), false))
         .collect();
 
-    // the log pane gets what is left, which is the only flexible row
-    let fixed = body.len() + if a.full_logs { 0 } else { actions.len() } + footer.len();
-    let log_h = h.saturating_sub(fixed).max(1);
+    // the log pane is the only flexible row: it gets what the fixed rows leave, and the pane's own title is the
+    // first of its rows (counting it twice left the last console row blank at 80x25 - measured)
+    let log_h = h
+        .saturating_sub(top.len() + menu.len() + footer.len())
+        .max(1);
+    let mut logs = vec![log_title(a, w, a.full_logs)];
+    logs.extend(log_lines(a, log_h.saturating_sub(1), w));
 
     let mut constraints: Vec<Constraint> = Vec::new();
-    if a.full_logs {
-        constraints.push(Constraint::Length(log_h as u16));
-        constraints.push(Constraint::Length(footer.len() as u16));
-    } else {
-        constraints.push(Constraint::Length(body.len() as u16));
-        constraints.push(Constraint::Length(log_h as u16));
-        constraints.push(Constraint::Length(actions.len() as u16));
-        constraints.push(Constraint::Length(footer.len() as u16));
+    if !top.is_empty() {
+        constraints.push(Constraint::Length(top.len() as u16));
     }
+    if !menu.is_empty() {
+        constraints.push(Constraint::Length(menu.len() as u16));
+    }
+    constraints.push(Constraint::Length(log_h as u16));
+    constraints.push(Constraint::Length(footer.len() as u16));
     let rows = Layout::vertical(constraints).split(area);
 
-    if a.full_logs {
-        render_lines(f, rows[0], &body);
-        render_lines(f, rows[1], &footer);
-    } else {
-        render_lines(f, rows[0], &body);
-        let mut logs = vec![log_title(a, w, false)];
-        logs.extend(log_lines(a, log_h.saturating_sub(1), w));
-        render_lines(f, rows[1], &logs);
-        let acts: Vec<Line> = actions
-            .iter()
-            .map(|s| styled(s, Some(Color::Cyan), false))
-            .collect();
-        render_lines(f, rows[2], &acts);
-        render_lines(f, rows[3], &footer);
+    let mut row = 0;
+    if !top.is_empty() {
+        render_lines(f, rows[row], &top);
+        row += 1;
+    }
+    if !menu.is_empty() {
+        render_lines(f, rows[row], &menu);
+        row += 1;
+    }
+    render_lines(f, rows[row], &logs);
+    row += 1;
+    render_lines(f, rows[row], &footer);
+
+    // the QR goes on top of the blank columns the block left free (it was measured to fit before it is drawn),
+    // and before the modal, so a dialog is never covered by a code
+    if let Some((qw, lines)) = &qr {
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(*qw + 1),
+            y: area.y + 2,
+            width: (*qw).min(area.width),
+            height: (lines.len() as u16).min(area.height.saturating_sub(1)),
+        };
+        f.render_widget(Paragraph::new(lines.clone()), rect);
+    }
+
+    out_links.clear();
+    for (i, line) in top.iter().enumerate() {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        for (x, url) in urls_in(&text, w) {
+            out_links.push(Link {
+                x: x as u16,
+                y: i as u16,
+                text: url,
+            });
+        }
     }
 
     if let Some(m) = &a.modal {
@@ -648,6 +837,70 @@ pub fn draw(f: &mut Frame, a: &App) {
         f.render_widget(block, rect);
         f.render_widget(Paragraph::new(body), inner);
     }
+}
+
+/// The web UI URL as a scannable block, drawn on paper (black on white: a scanner wants dark-on-light) to the
+/// right of the CONNECT rows. `None` when the screen cannot hold both - the QR is 33 columns wide for a
+/// 27-character URL and 80x25 has no 33 free columns beside the block, so there the URL stays plain text.
+fn qr_panel(
+    f: &Facts,
+    connect: &[Line<'static>],
+    w: usize,
+    h: usize,
+) -> Option<(u16, Vec<Line<'static>>)> {
+    let url = format!("http://{}:13305", f.ip()?);
+    let rows = crate::qr::code(&url)?;
+    let qw = rows[0].chars().count();
+    // the block's first line is the CONNECT rule, which is as wide as the screen: the code only has to clear
+    // the rows that carry text
+    let widest = connect
+        .iter()
+        .skip(1)
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    // one column of air between the block and the code, and enough rows left for the panels, the nine menu rows,
+    // three log rows and the footer: a code that pushes the menu off the screen would be the cycle-14 failure again
+    if w < widest + qw + 2 || h < rows.len() + 12 {
+        return None;
+    }
+    let paper = Style::default().fg(Color::Black).bg(Color::White);
+    Some((
+        qw as u16,
+        rows.into_iter()
+            .map(|r| Line::from(Span::styled(r, paper)))
+            .collect(),
+    ))
+}
+
+/// Every whole URL on one line of text, with the column it starts at - the CONNECT block's hyperlink cells.
+///
+/// A URL that ends exactly on the pane's last column is NOT returned: `wrap_words` hard-breaks a token that is
+/// wider than the pane, so such a token may be the first half of one, and a link whose text is half a URL opens
+/// the wrong thing (or nothing) when clicked. On an 80- or 240-column screen no CONNECT row reaches that edge,
+/// so nothing real is lost; on a 30-column serial line it costs a link instead of opening a broken one.
+fn urls_in(text: &str, width: usize) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = text[from..].find("http://") {
+        let start = from + i;
+        let tail = &text[start..];
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == ')' || c == ',')
+            .unwrap_or(tail.len());
+        let url = &tail[..end];
+        let x = text[..start].chars().count();
+        if url.len() > "http://".len() && x + url.chars().count() < width {
+            out.push((x, url.to_string()));
+        }
+        from = start + end.max(1);
+    }
+    out
 }
 
 fn centred(area: Rect, w: u16, h: u16) -> Rect {
@@ -685,7 +938,7 @@ pub fn status_text(f: &Facts) -> Vec<String> {
     for (title, values) in panels(f) {
         out.push(format!("{title}  {}", values.join("  ")));
     }
-    for l in action_lines(240) {
+    for l in menu_lines() {
         out.push(l);
     }
     out
@@ -706,10 +959,16 @@ fn buffer_text(buf: &Buffer) -> String {
 
 /// Render one frame off-screen - what the snapshot tests and `--snapshot` both use.
 pub fn render_snapshot(a: &App, width: u16, height: u16) -> String {
+    render_snapshot_with_links(a, width, height).0
+}
+
+/// The frame and the hyperlink cells it carries, for the tests that check one against the other.
+pub fn render_snapshot_with_links(a: &App, width: u16, height: u16) -> (String, Vec<Link>) {
     let backend = TestBackend::new(width, height);
     let mut t = Terminal::new(backend).expect("test terminal");
-    t.draw(|f| draw(f, a)).expect("draw");
-    buffer_text(t.backend().buffer())
+    let mut links = Vec::new();
+    t.draw(|f| draw(f, a, &mut links)).expect("draw");
+    (buffer_text(t.backend().buffer()), links)
 }
 
 #[cfg(test)]
@@ -755,8 +1014,17 @@ mod tests {
         // is what tty1 gets, that row must keep passing, so the block uses the dialog menu's own wording.
         for (w, h) in [(240u16, 67u16), (80, 25)] {
             let text = render_snapshot(&app(c16_board()), w, h);
-            for want in ["CONNECT", "web UI http://", "api  http://", "ssh  root@", "Lemonade Mobile"] {
-                assert!(text.contains(want), "{w}x{h}: the U2 menu connect row would go red - {want:?} is missing");
+            for want in [
+                "CONNECT",
+                "web UI http://",
+                "api  http://",
+                "ssh  root@",
+                "Lemonade Mobile",
+            ] {
+                assert!(
+                    text.contains(want),
+                    "{w}x{h}: the U2 menu connect row would go red - {want:?} is missing"
+                );
             }
             assert!(
                 text.contains("web UI http://192.168.50.110:13305"),
@@ -836,10 +1104,19 @@ mod tests {
     }
 
     #[test]
-    fn the_gates_action_labels_survive_at_every_width() {
-        // vm-check's `U2 menu` row looks for these two strings on tty1
+    fn the_gates_action_labels_are_on_their_own_rows() {
+        // vm-check's `U2 menu` row looks for these two strings on tty1, and the owner reads the MENU block, so
+        // both sizes carry all nine labels whole, one numbered row each
+        let rows = menu_lines();
+        assert_eq!(rows.len(), 9, "one row per action: {rows:?}");
         for w in [80usize, 100, 120, 240] {
-            let joined = action_lines(w).join(" ");
+            for row in &rows {
+                assert!(
+                    row.chars().count() <= w,
+                    "width {w}: {row:?} does not fit on its row"
+                );
+            }
+            let joined = rows.join(" ");
             assert!(joined.contains("Show the API key"), "width {w}: {joined}");
             assert!(joined.contains("Reboot / power off"), "width {w}: {joined}");
             for (i, l) in ACTIONS.iter().enumerate() {
@@ -853,6 +1130,127 @@ mod tests {
     }
 
     #[test]
+    fn the_compact_status_keeps_every_panel_and_never_splits_a_field() {
+        let f = c16_board();
+        for w in [80usize, 90, 99] {
+            let lines: Vec<String> = compact_status(&f, w)
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect();
+            assert!(lines.len() <= 2, "width {w}: {lines:?}");
+            for l in &lines {
+                assert!(l.chars().count() <= w, "width {w}: {l:?} is over");
+                assert!(
+                    !l.trim_end().ends_with('|'),
+                    "width {w}: field split: {l:?}"
+                );
+                assert!(
+                    !l.trim_start().starts_with('|'),
+                    "width {w}: field split: {l:?}"
+                );
+            }
+            let joined = lines.join(" ");
+            for name in ["LEMONADE", "GPU", "NPU", "MODELS", "FANS", "DATA"] {
+                assert!(joined.contains(name), "width {w}: {name} is gone: {joined}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_menu_sits_between_the_facts_and_the_log() {
+        // the owner, cycle 20: "can we place the menu above the scrolling logs and below the technical
+        // information". This is the layout, asserted off a rendered frame rather than off the code's intent.
+        for (w, h) in [(240u16, 67u16), (80, 25)] {
+            let text = render_snapshot(&app(c16_board()), w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            let at = |needle: &str| {
+                lines
+                    .iter()
+                    .position(|l| l.contains(needle))
+                    .unwrap_or_else(|| panic!("{w}x{h}: {needle:?} is not on screen:\n{text}"))
+            };
+            let (header, connect, menu, logs) =
+                (at("1bit OS"), at("CONNECT"), at("MENU"), at("LOGS"));
+            assert!(header < connect, "{w}x{h}: CONNECT is not below the header");
+            assert!(
+                connect < menu,
+                "{w}x{h}: the menu is not below the technical information"
+            );
+            assert!(
+                menu < logs,
+                "{w}x{h}: the menu is not above the scrolling log"
+            );
+            // the nine rows are the nine lines right under the MENU rule, all of them above the log
+            for i in 1..=9 {
+                let row = menu + i;
+                assert!(
+                    row < logs,
+                    "{w}x{h}: action {i} is not above the log:\n{text}"
+                );
+                assert!(
+                    lines[row].starts_with(&format!("{i} ")),
+                    "{w}x{h}: action {i} is not on its own row (row {row} reads {:?}):\n{text}",
+                    lines[row]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn at_80x25_the_log_pane_still_gets_three_rows() {
+        let text = render_snapshot(&app(c16_board()), 80, 25);
+        let lines: Vec<&str> = text.lines().collect();
+        let log_at = lines
+            .iter()
+            .position(|l| l.contains("LOGS"))
+            .expect("a log pane");
+        // the last line is the footer; everything between the LOGS title and it is the pane
+        let pane = &lines[log_at + 1..lines.len() - 1];
+        let filled = pane.iter().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            filled >= 3,
+            "the log pane keeps only {filled} rows at 80x25:\n{text}"
+        );
+        // and the pane reaches the footer: a row counted twice leaves the last console row blank (measured before
+        // the log title was made part of the pane)
+        assert!(
+            lines.last().is_some_and(|l| !l.trim().is_empty()),
+            "the last console row at 80x25 is blank:\n{text}"
+        );
+    }
+
+    #[test]
+    fn item_1_keeps_the_gate_string_in_both_key_modes() {
+        // pi-prs on #935: the appliance ships BLANK (cycle-20 item 7), so a mode-dependent item 1 turns `U2 menu`
+        // red on every shipped image - `vm-check.sh:417` greps `Show the API key` off tty1. The label is therefore
+        // the same string whatever the key mode, and the blank-key offer lives in the CONNECT block and in item 1's
+        // own dialog (the item-7 work on os/v3-c20).
+        let keyed = c16_board();
+        let mut blank = c16_board();
+        blank.key = None;
+        // menu_lines() takes no facts at all any more, which is the structural half of the guarantee
+        let rows = menu_lines();
+        assert_eq!(rows.len(), 9, "{rows:?}");
+        assert_eq!(rows[0], "1 Show the API key");
+        for (name, f) in [("keyed", keyed), ("blank", blank)] {
+            for (w, h) in [(240u16, 67u16), (80, 25)] {
+                let text = render_snapshot(&app(f.clone()), w, h);
+                for want in ["Show the API key", "Reboot / power off"] {
+                    assert!(
+                        text.contains(want),
+                        "{name} box at {w}x{h}: the U2 menu row goes red - {want:?} is missing"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn renders_at_the_two_console_sizes() {
         let want_240 = include_str!("../tests/snapshots/240x67.txt");
         let want_80 = include_str!("../tests/snapshots/80x25.txt");
@@ -860,6 +1258,162 @@ mod tests {
         let got_80 = render_snapshot(&app(c16_board()), 80, 25);
         assert_eq!(got_240, want_240, "\n--- got 240x67 ---\n{got_240}");
         assert_eq!(got_80, want_80, "\n--- got 80x25 ---\n{got_80}");
+    }
+
+    #[test]
+    fn the_connect_block_says_what_a_blank_key_means() {
+        // Cycle 20: blank is the shipped default, so the block has to say that anyone on the network can use the
+        // appliance, at BOTH console sizes - the 80x25 render is what a person standing at the box sees.
+        let mut f = c16_board();
+        f.key = None;
+        for (w, h) in [(80u16, 25u16), (240, 67)] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flat.contains("key none - anyone here can use it; press 1 to require one"),
+                "{w}x{h}: {text}"
+            );
+            assert!(
+                !flat.contains("API key: press 1"),
+                "{w}x{h}: keyed wording in blank mode"
+            );
+            // the extra row must not push the nine actions off the screen - that is the cycle-14 failure in a
+            // different renderer, and the TUI is the surface this image actually puts on tty1
+            for action in ACTIONS {
+                assert!(
+                    flat.contains(action),
+                    "{w}x{h}: action {action:?} not drawn"
+                );
+            }
+        }
+        // and keyed mode still carries the strings vm-check's U2 menu connect row greps for
+        let text = render_snapshot(&app(c16_board()), 80, 25)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("api http://192.168.50.110:13305/api/v1 (API key: press 1)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_footer_tells_the_truth_about_q_in_both_places() {
+        // over ssh `q` is what it is in every full-screen program; on tty1 the console must not promise a way to
+        // a bare prompt. The line is the only place the console says which of the two you are looking at.
+        let mut ssh = app(c16_board());
+        ssh.ssh = true;
+        let text = render_snapshot(&ssh, 80, 25);
+        assert!(
+            text.trim_end()
+                .lines()
+                .last()
+                .unwrap_or("")
+                .contains("q quits"),
+            "{text}"
+        );
+        let text = render_snapshot(&app(c16_board()), 80, 25);
+        assert!(
+            text.trim_end()
+                .lines()
+                .last()
+                .unwrap_or("")
+                .contains("q stays"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_mdns_name_is_on_screen_at_both_sizes() {
+        // the owner, 2026-11-04: "show the mDNS name too". pi-os3 makes the box announce it; the c16 sample this
+        // fixture records shipped no avahi, so the row must say that rather than promise a name that is not there.
+        for (w, h) in [(240u16, 67u16), (80, 25)] {
+            let text = render_snapshot(&app(c16_board()), w, h);
+            assert!(
+                text.contains("name http://1bit-os.local:13305"),
+                "{w}x{h}: no mDNS name:\n{text}"
+            );
+            assert!(
+                text.contains("avahi not running"),
+                "{w}x{h}: a dead name is promised silently:\n{text}"
+            );
+            let mut up = c16_board();
+            up.mdns = true;
+            let text = render_snapshot(&app(up), w, h);
+            assert!(text.contains("(mDNS)"), "{w}x{h}:\n{text}");
+            assert!(!text.contains("avahi not running"), "{w}x{h}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn every_hyperlink_covers_the_url_that_is_drawn_there() {
+        // the links are written AFTER the frame, at these very cells, so the only thing that makes them safe is
+        // that the text on screen and the link target are the same string. Asserted off the rendered frame.
+        for (w, h) in [(240u16, 67u16), (80, 25)] {
+            let (text, links) = render_snapshot_with_links(&app(c16_board()), w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            let mut seen: Vec<String> = Vec::new();
+            for l in &links {
+                let row = lines[l.y as usize];
+                let at: String = row
+                    .chars()
+                    .skip(l.x as usize)
+                    .take(l.text.chars().count())
+                    .collect();
+                assert_eq!(
+                    at, l.text,
+                    "{w}x{h}: link at {},{} does not cover its own URL",
+                    l.x, l.y
+                );
+                seen.push(l.text.clone());
+            }
+            for want in [
+                "http://192.168.50.110:13305",
+                "http://1bit-os.local:13305",
+                "http://192.168.50.110:13305/api/v1",
+            ] {
+                assert!(
+                    seen.iter().any(|s| s == want),
+                    "{w}x{h}: {want} is not a link: {seen:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_url_that_wrapping_split_is_not_a_link() {
+        // half a URL as the link text would open the wrong thing (or nothing), so only whole tokens are returned
+        assert_eq!(
+            urls_in("  web UI http://10.0.0.5:13305", 80),
+            vec![(9, "http://10.0.0.5:13305".to_string())]
+        );
+        assert_eq!(
+            urls_in(
+                "  api  http://10.0.0.5:13305/api/v1   (API key: press 1)",
+                80
+            ),
+            vec![(7, "http://10.0.0.5:13305/api/v1".to_string())]
+        );
+        assert_eq!(urls_in("no links here", 80), Vec::new());
+        // a token that fills the pane to its last column may be half a URL: no link rather than a broken one
+        let row = "  web UI http://10.0.0.5:13305";
+        let w = row.chars().count() + 1;
+        assert_eq!(
+            urls_in(row, w),
+            vec![(9, "http://10.0.0.5:13305".to_string())]
+        );
+        assert_eq!(urls_in(row, w - 1), Vec::new());
+    }
+
+    #[test]
+    fn the_qr_is_drawn_beside_the_block_only_where_it_fits() {
+        // 240x67: 33 columns and 17 rows to the right of the CONNECT rows, on paper (black on white)
+        let text = render_snapshot(&app(c16_board()), 240, 67);
+        assert!(text.contains('█'), "no QR at 240x67:\n{text}");
+        // 80x25: 33 free columns do not exist next to the block, and squeezing the code in would push the nine
+        // menu rows or the three log rows off the screen. The URL stays plain text.
+        let text = render_snapshot(&app(c16_board()), 80, 25);
+        assert!(!text.contains('█'), "the QR took the 80x25 screen:\n{text}");
     }
 
     #[test]

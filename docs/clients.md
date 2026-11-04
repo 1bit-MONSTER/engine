@@ -244,7 +244,7 @@ Against the cycle-13 appliance image booted in QEMU (`sha256 dcc619ff…`, kerne
 |---|---|
 | Lemonade listens on every interface | `netstat`: `lemond` on `0.0.0.0:13305`, WebSocket `9000`, `sshd` on `0.0.0.0:22` |
 | `/api/v1` and `/v1` are the API | `GET /api/v1/models` and `GET /v1/models` both answer |
-| the key is required, and only the key (cycle-13 image, which minted one) | with a key minted: no key and a wrong key → **401**, the right key → **200** (both paths). Cycle 20 ships blank instead: the appliance's own gate asserts **200 with no header** in blank mode and 401/200 keyed (`os/v3/puppy/vm-check.sh:710-730`) |
+| the key is required, and only the key (cycle-13 image, which minted one) | with a key minted: no key and a wrong key → **401**, the right key → **200** (both paths). Cycle 20 ships blank instead: the appliance's own gate asserts **200 with no header** in blank mode and 401/200 keyed (`os/v3/puppy/vm-check.sh:740-754`) |
 | the key's file | `readlink -f /etc/1bit/lemond.conf` → `/data/lemonade/lemond.conf`, `0600 root`; a key written there plus `/etc/init.d/10lemonade restart` takes effect on the next request |
 | the web app | `GET http://<box>:13305/` → 200, `text/html`, `<title>Lemonade App</title>`, with and without a key (it is static; its own API calls are what 401) |
 | the `curl` chat example | `POST /api/v1/chat/completions` with `chat_template_kwargs.enable_thinking=false`: **200**, `content: "Sure! 😊"`, `finish_reason: stop` |
@@ -263,6 +263,6 @@ through Lemonade on the Ryzen AI MAX+ 395.
 
 Not verified on this page: a phone against a real box on a real LAN (the app needs a device), and the mDNS
 name *from another machine* — the image gate asserts a responder is up and that
-`getent hosts 1bit-os.local` answers on the box itself (`os/v3/puppy/vm-check.sh:593-598`), which is not
+`getent hosts 1bit-os.local` answers on the box itself (`os/v3/puppy/vm-check.sh:616-621`), which is not
 the same as a peer resolving it over multicast. If the name does not resolve for you, read the address
 with `hostname -I` or the router instead.

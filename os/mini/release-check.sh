@@ -23,9 +23,9 @@
 #
 # Rows that cannot PASS without the hardware are marked SKIP in a VM (Lemonade hides its onebit
 # entries on a machine with no AMD GPU or NPU, and there is no HRX or NPU device to run them on):
-# gpu, npu, models, chat-hrx, chat-npu. Everything else - mode, kernel, Secure Boot, Lemonade up
-# with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU sets and
-# the signed manifests over them, the licences and the image identity - is checked in the VM as well.
+# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder. Everything else - mode, kernel,
+# Secure Boot, Lemonade up with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU
+# sets and the signed manifests over them, the licences and the image identity - is checked in the VM as well.
 set -u
 
 LOG=/data/release-check.log
@@ -37,7 +37,7 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1))
-    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
 # Every fetch is capped. Without that, a Lemonade that accepts the connection and never answers hangs
@@ -225,6 +225,38 @@ followup_verdict() {
     printf 'PASS the follow-up answered after a long turn, no TDR (still %s)' "$_t1"
 }
 
+# The NPU row's STREAMING decision (engine #911, c21 board 2026-11-04). The page streams, and a stream can
+# fail after its 200: the engine answers a mid-generation failure with `data: {"error":...}` inside the body,
+# so the HTTP status says nothing at all - on the board two such 200s carried "npu runtime: invalid call (code
+# 614): state 8, run 0 of 28" while every row that looks at a status stayed green. Pure, so --self-test drives
+# it and the row below uses the same code: <sse body> <TDRs before> <TDRs after>.
+stream_verdict() {
+    _b=$1 _t0=$2 _t1=$3
+    case "$_b" in
+        '') printf 'FAIL nothing came back at all'; return 0 ;;
+    esac
+    case "$_b" in
+        *'"error"'*) printf 'FAIL the reply carried an error inside the stream: %.100s' \
+                          "$(printf '%s' "$_b" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+                      return 0 ;;
+    esac
+    case "$_b" in
+        # '[[]' outside the quotes is a literal '['; inside them the shell would take the text as-is and the
+        # pattern would never match, and unquoted '[DONE]' is a character class (the 'perfopt+' trap again)
+        *'data: '[[[]DONE]*) ;;
+        *) printf 'FAIL the stream ended without data: [DONE], so the backend stopped mid-reply: %.80s' "$_b"
+           return 0 ;;
+    esac
+    _n=$(printf '%s' "$_b" | grep -oE '"(content|reasoning_content)":"[^"]' | wc -l | tr -d ' ')
+    [ "${_n:-0}" -gt 0 ] || { printf 'FAIL the stream carried no text chunk at all'; return 0; }
+    if [ -z "$_t0" ] || [ -z "$_t1" ]; then
+        printf 'PASS %s text chunk(s) and [DONE]; the kernel log was not readable, so no TDR was ruled out' "$_n"
+        return 0
+    fi
+    [ "$_t1" -gt "$_t0" ] && { printf 'FAIL the NPU logged a TDR during the turn (%s -> %s): see dmesg' "$_t0" "$_t1"; return 0; }
+    printf 'PASS %s text chunk(s) and [DONE] over the stream, no TDR (still %s)' "$_n" "$_t1"
+}
+
 # The first value of a JSON key - quoted or not, since usage counts are bare numbers - for the row's
 # small bodies (one line, one message: the same assumption chat() already makes).
 json_str() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\\1/p" | head -1; }
@@ -273,6 +305,22 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(followup_verdict '{"error":{"message":"no answer"}}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 0)"
     check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT"}}]}' 0 0)"
     check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' '' '')"
+    # engine #911 / c21 board: the streaming row. The board's own failure is the second case - the status was
+    # 200, the body carried the error and the stream still closed with [DONE], so only the body can tell.
+    check PASS "$(stream_verdict 'data: {"choices":[{"delta":{"content":"1BIT"}}]}
+data: {"choices":[{"delta":{"content":" OK"}}]}
+data: [DONE]' 0 0)"
+    check FAIL "$(stream_verdict 'data: {"error":{"message":"npu runtime: invalid call (code 614): state 8, run 0 of 28"}}
+data: [DONE]' 0 0)"
+    check FAIL "$(stream_verdict 'data: {"choices":[{"delta":{"content":"1BI"}}]}
+data: [DONE]' 0 1)"
+    check FAIL "$(stream_verdict 'data: {"choices":[{"delta":{"content":"1BI"}}]}' 0 0)"      # no [DONE]
+    check FAIL "$(stream_verdict 'data: [DONE]' 0 0)"                                              # no text at all
+    check FAIL "$(stream_verdict '' 0 0)"
+    check PASS "$(stream_verdict 'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}
+data: [DONE]' 0 0)"
+    check PASS "$(stream_verdict 'data: {"choices":[{"delta":{"content":"1BIT OK"}}]}
+data: [DONE]' '' '')"
     # the history that goes back into the request has to survive a JSON string
     jt=$(json_text 'a "quoted" \\ line
 next')
@@ -762,6 +810,81 @@ elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
     skip chat-npu-followup "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
 else
     skip chat-npu-followup "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
+
+# ── NPU chat the way a person uses it: after a reload, streaming, thinking on (engine #911, c21 board) ──────
+# The board's green check proved nothing about the shape the release onebit page actually uses: the page
+# loads the model on demand (after this check's own rows evicted it), leaves thinking ON and streams the
+# reply. On the c21 board exactly that failed twice, "npu runtime: invalid call (code 614): state 8, run 0 of
+# 28", inside two 200s, while every row above stayed green - and the same boot logged one amdxdna TDR. So a
+# 200 is not evidence here: the body is read (stream_verdict) and the kernel log is counted.
+if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    TDRS0=$(tdr_count)
+    _stream() {  # <json body> -> the whole SSE body
+        got_slow --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
+            --post-data="$1" "$API/api/v1/chat/completions"
+    }
+    # Evict first: that is what makes the next request auto-load the model, and an auto-load is when Lemonade's
+    # ctx auto-tune runs (the board's reload resolved 32768 where the rows above load at 4096).
+    got --header='Content-Type: application/json' --post-data='{}' "$API/api/v1/unload" >/dev/null 2>&1
+    SS1=$(_stream "{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"Give me the history of New Brunswick in several paragraphs.\"}],\"max_tokens\":300,\"temperature\":0.7,\"stream\":true}")
+    TDRS1=$(tdr_count)
+    VSS1=$(stream_verdict "$SS1" "$TDRS0" "$TDRS1")
+    SS2=$(_stream "{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":48,\"temperature\":0,\"stream\":true}")
+    TDRS2=$(tdr_count)
+    VSS2=$(stream_verdict "$SS2" "$TDRS1" "$TDRS2")
+    _tdrs_s() { if [ -n "$TDRS0" ] && [ -n "$TDRS2" ]; then printf 'TDRs %s -> %s -> %s' "$TDRS0" "$TDRS1" "$TDRS2"
+                else printf 'dmesg not readable, so the TDR count is unknown'; fi; }
+    if [ "${VSS1%% *}" != PASS ] || [ "${VSS2%% *}" != PASS ]; then
+        fail chat-npu-stream "$NPU: reload + thinking on -> $VSS1 | follow-up -> $VSS2 ($(_tdrs_s))"
+    else
+        pass chat-npu-stream "$NPU after an evict and a reload, streaming: $VSS1; then $VSS2 ($(_tdrs_s))"
+    fi
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-stream "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+else
+    skip chat-npu-stream "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
+
+# ── NPU length ladder: the position count a real chat reaches (cycle 23; c22 board, 4 Nov 2026) ──────────────
+# The c22 board made the wedge deterministic. Fresh backend each time, temperature 0, /no_think, a long-essay
+# prompt: 400 max_tokens (429 positions) answered, 480 (509) answered, and 600 - the first step that crosses 512 -
+# produced `npu runtime: invalid call (code 614): state 8` plus one amdxdna TDR and a power-cycle, and both board
+# chat failures that day (12:56, 13:13 AST) sat ~7 s into a thinking-on reply, at that same boundary. The image
+# now ships `options amdxdna tdr_timeout_ms=15000`, so the same ladder has to answer at 1000 with no new TDR line.
+# The model is unloaded before every step: a warm context would let one step hide the next.
+if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    TDRL0=$(tdr_count)
+    TDRL1=$TDRL0
+    LAD_OK=
+    LAD_BAD=
+    for n in 400 600 1000; do
+        got --header='Content-Type: application/json' --post-data='{}' "$API/api/v1/unload" > /dev/null 2>&1
+        RL=$(auth_post "{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Write a long essay about the history of cartography, and about what map-making changed in how people understood the world.\"}],\"max_tokens\":$n,\"temperature\":0}" "$API/api/v1/chat/completions" slow)
+        AL=$(json_str "$RL" content)
+        CL=$(json_str "$RL" completion_tokens)
+        PL=$(json_str "$RL" prompt_tokens)
+        TDRL1=$(tdr_count)
+        if [ -z "$AL" ]; then
+            LAD_BAD="$LAD_BAD ${n}->no-answer"
+        elif [ -n "$TDRL1" ] && [ -n "$TDRL0" ] && [ "$TDRL1" -gt "$TDRL0" ]; then
+            LAD_BAD="$LAD_BAD ${n}->TDR(${TDRL0}->${TDRL1})"
+        else
+            LAD_OK="$LAD_OK $n ok (${CL:-?} tokens${PL:+, ${PL} prompt})"
+        fi
+        [ -z "$LAD_BAD" ] || break
+    done
+    _tdrs_l() { if [ -n "$TDRL0" ] && [ -n "$TDRL1" ]; then printf 'TDRs %s -> %s' "$TDRL0" "$TDRL1"
+                else printf 'dmesg not readable, so the TDR count is unknown'; fi; }
+    if [ -n "$LAD_BAD" ]; then
+        fail chat-npu-ladder "$NPU ladder 400/600/1000:$LAD_BAD; clean steps:$LAD_OK ($(_tdrs_l))"
+    else
+        pass chat-npu-ladder "$NPU answered every rung of 400/600/1000 max_tokens with a fresh backend, no TDR:$LAD_OK ($(_tdrs_l))"
+    fi
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-ladder "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+else
+    skip chat-npu-ladder "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────

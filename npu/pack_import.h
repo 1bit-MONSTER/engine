@@ -94,6 +94,18 @@ struct Plan {
     // (engine#734's lesson: `info` must report the measurement, not the plan.)
     int64_t attn_tiles = 0;
     std::string attn_note;
+    // Where the four projections actually sit, once the section count is known (engine#979). k/q/v are
+    // always in the block's first payload at K = hidden. o_proj has a payload of its own whose K is
+    // q_proj's output width -- the same payload as q/k/v on the Qwen2/Llama families, a separate one
+    // behind the two per-head norms on the Qwen3 families, where the pack itself declares
+    // `o_proj N=2560 K=4096` (q_out, not hidden). o_off is relative to the block start.
+    int64_t o_off = 0;
+    int o_k = 0;
+    // Per-head QK RMSNorm gains (Qwen3 and later): their offsets inside the block, 0 when the family has
+    // none. Identified and verified byte-exact against the public Qwen3-1.7B/4B checkpoints (0 of 128
+    // values differ on either pack, and the swap differs on 127-128 of 128).
+    int64_t knorm_off = 0, qnorm_off = 0;
+    int64_t mlp_off = 0;  // the MLP section starts just past the block's post-attention norm
     // The MLP section's geometry, likewise measured: gate and up share one fused 4,288-byte-subvolume
     // tensor of `mlp_gu_units` x 128 columns, then a 64-byte parameter subvolume, then down_proj in
     // 2,176-byte subvolumes. All of it has to add up to the block stride exactly, which is the check
@@ -198,15 +210,33 @@ int64_t group_bytes(int64_t k, int rows);
 // `bf16_bits_of()`; the default is bf16 1e-6, which is what the Qwen family declares.
 struct FconstGeom {
     int64_t stride = 0;   // bytes per layer block
-    int64_t h1 = 0;       // offset of the second (post-attention) header within a block
+    int64_t h1 = 0;       // offset of the block's SECOND header (the post-attention one only when a block
+                          // carries two; on a 4-header block it opens the k_norm section -- use
+                          // post_attn_hdr() for the post-attention norm and the MLP section)
     int period = 0;       // headers per block
     int blocks = 0;       // block starts seen
+    // Every in-block header offset after the block's first (so hdr[0] == h1), relative to the block
+    // start. These are the block's section boundaries: 1 header on the Qwen2/Llama packs (q/k/v/o share
+    // one payload) and 3 on the Qwen3 packs (q/k/v, then one per-head QK norm each, then o_proj), so
+    // which layout a pack uses is measured from the pack rather than guessed from a version.
+    std::vector<int64_t> hdr;
+    // Where the block's post-attention section starts: `h1` on a 2-header block (Qwen2.5/Llama), the LAST
+    // header on a 4-header block (Qwen3, where the second and third open the per-head QK norms). Both the
+    // post_attention_layernorm weight and the first byte of the MLP section are read from here, so this is
+    // the one rule the two readers share -- reading `h1` unconditionally imported the k_norm section's
+    // padding as post_attention_layernorm on every Qwen3 pack (engine#1003).
+    int64_t post_attn_hdr() const { return hdr.empty() ? h1 : hdr.back(); }
     std::string why;      // non-empty when the geometry could not be established
 };
 unsigned short bf16_bits_of(float v);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);
+// Where a layer block's attention payload starts: the block's 64-byte header, then its
+// input_layernorm weight as bf16 [hidden]. So it is `64 + 2 x hidden`, not a constant. It reads 1,856 on
+// the 0.5B pack (hidden 896) and 4,160 on Llama-3.2-1B (hidden 2,048); reading it as the constant is what
+// made every pack with a different hidden look like "whole tiles plus a stray run" (engine#979).
+int64_t attn_payload_off(int64_t hidden);
 TileW decode_tile(const uint8_t* tile, int k, int rows = 64);
 // The exact inverse. Used only as the importer's self-check: a tile that does not survive
 // encode(decode(t)) == t is a tile whose fields we do not understand, and it is refused by name.

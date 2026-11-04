@@ -51,6 +51,7 @@ gguf(d + "/plain.gguf")
 gguf(d + "/draft.gguf", "dflash", {"dflash.block_size": 8})
 gguf(d + "/prism.gguf", "qwen35", strs={"prism.hadamard.version": "1"})   # PrismML ternary, Hadamard-folded
 gguf(d + "/plainq35.gguf", "qwen35")                                      # same architecture, no PrismML key
+gguf(d + "/q4exp.gguf", "qwen4exp", {"qwen4exp.expert_count": 128})        # Qwen3.8-Flash-Next's architecture
 open(d + "/gk.json", "w").write("""{"recipes": [{"id": "gk", "match": {"architecture": ["qwen35"],
   "gguf_keys": ["prism.hadamard.version"]}, "args": ["--spec-draft-n-max", "2"], "measured": "test"}]}""")
 open(d + "/gkbad.json", "w").write("""{"recipes": [{"id": "gkbad", "match": {"gguf_keys": "prism.hadamard.version"},
@@ -85,10 +86,11 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
 PY
 chmod +x "$scratch/backend.py"
 
-run() {  # <model> <record> [serve args]: serve with --device auto until the backend has recorded its start
+run() {  # <model> <record> [serve args]: serve with --device ${SERVE_DEVICE:-auto} until the backend has recorded its start
     local port
     port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    env -u GGML_Q4_0_HADAMARD -u GGML_W4A4_TENSORS -u ONEBIT_RECIPE_TEST RECORD="$2" "$bin" serve -m "$1" --device auto \
+    env -u GGML_Q4_0_HADAMARD -u GGML_W4A4_TENSORS -u ONEBIT_RECIPE_TEST -u GGML_HRX_GRAPH_PROGRAM_CACHE \
+        RECORD="$2" "$bin" serve -m "$1" --device "${SERVE_DEVICE:-auto}" \
         --port "$port" --llama-server "$scratch/backend.py" "${@:3}" >"$2.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do [ -s "$2" ] && break; sleep 0.1; done
@@ -103,6 +105,24 @@ check "the built-in set adds nothing to a MoE file" '[ "$(after "$scratch/moe.js
 
 run "$scratch/plain.gguf" "$scratch/dfv.json" --dflash "$scratch/draft.gguf"
 check "  nor to --dflash" '[ "$(after "$scratch/dfv.json" --spec-draft-p-min)" = None ] && ! grep -q recipe "$scratch/dfv.json.log"'
+
+run "$scratch/q4exp.gguf" "$scratch/q4exp.json"
+check "the qwen4exp graph-program-cache recipe is hrx-scoped: nothing on cpu" \
+      '! grep -q "hrx-graph-program-cache-128" "$scratch/q4exp.json.log"'
+check "  and nothing is set for the other architectures" '[ "$(field "$scratch/moe.json" "r[\"env\"].get(\"GGML_HRX_GRAPH_PROGRAM_CACHE\")")" = None ]'
+# The positive case needs the HRX runtime to resolve the device; the model itself never loads (the backend is a stub),
+# so skip rather than fail on a box without it.
+hsalib=${IREE_HAL_AMDGPU_LIBHSA_PATH:-/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1}
+if [ -e "$hsalib" ]; then
+    SERVE_DEVICE=hrx run "$scratch/q4exp.gguf" "$scratch/q4exp-hrx.json"
+    check "  on hrx it sets GGML_HRX_GRAPH_PROGRAM_CACHE=128 and names the recipe" \
+          '[ "$(field "$scratch/q4exp-hrx.json" "r[\"env\"].get(\"GGML_HRX_GRAPH_PROGRAM_CACHE\")")" = 128 ] && grep -q "recipe hrx-graph-program-cache-128" "$scratch/q4exp-hrx.json.log"'
+    SERVE_DEVICE=hrx run "$scratch/plainq35.gguf" "$scratch/q35-hrx.json"
+    check "  and leaves another hrx architecture alone" \
+          '[ "$(field "$scratch/q35-hrx.json" "r[\"env\"].get(\"GGML_HRX_GRAPH_PROGRAM_CACHE\")")" = None ]'
+else
+    echo "skip  qwen4exp recipe on hrx (no HSA runtime at $hsalib)"
+fi
 
 run "$scratch/plain.gguf" "$scratch/dfr.json" --dflash "$scratch/draft.gguf" --recipes "$scratch/pmin.json"
 check "a recipe file's --dflash recipe adds --spec-draft-p-min 0" '[ "$(after "$scratch/dfr.json" --spec-draft-p-min)" = 0 ] && [ "$(count "$scratch/dfr.json" --spec-draft-p-min)" = 1 ]'

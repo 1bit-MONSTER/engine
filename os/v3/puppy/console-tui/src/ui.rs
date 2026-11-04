@@ -713,27 +713,11 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
     // header, CONNECT, then the status facts - the "technical information" the owner wants the menu below
     let mut top: Vec<Line<'static>> = Vec::new();
     let mut menu: Vec<Line<'static>> = Vec::new();
+    let mut facts: Vec<Line<'static>> = Vec::new();
     let mut qr: Option<(u16, Vec<Line<'static>>)> = None;
-    if !a.full_logs {
-        top.push(header(&a.facts));
-        top.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
-        // the QR is drawn to the RIGHT of the CONNECT rows, so the block has to be as tall as the code; when the
-        // screen cannot hold both (80x25 - the URL there is plain text, which a phone's camera reads too) it is
-        // absent rather than squeezed into the log pane's rows
-        if let Some((qw, rows)) = qr_panel(&a.facts, &top[1..], w, h) {
-            top.resize(top.len().max(2 + rows.len()), Line::from(""));
-            qr = Some((qw, rows));
-        }
-        if wide {
-            top.extend(panel_grid(&a.facts, w));
-        } else {
-            top.extend(compact_status(&a.facts, w));
-        }
-        // the MENU sits between the facts and the log, always whole, one numbered row per action
-        menu.push(rule("MENU", w));
-        menu.extend(menu_rows(w));
-    }
 
+    // The footer is built here, before the QR, because the code has to be charged for the rows it costs: the
+    // frame is exactly the terminal, and a code that does not fit takes a rule or the panel grid with it.
     let mut footer: Vec<String> = vec![if a.full_logs {
         "q back   arrows scroll   f newest   r refresh   1-9 actions".to_string()
     } else {
@@ -753,13 +737,65 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
         .map(|s| styled(s, Some(Color::DarkGray), false))
         .collect();
 
-    // the log pane is the only flexible row: it gets what the fixed rows leave, and the pane's own title is the
-    // first of its rows (counting it twice left the last console row blank at 80x25 - measured)
-    let log_h = h
-        .saturating_sub(top.len() + menu.len() + footer.len())
-        .max(1);
-    let mut logs = vec![log_title(a, w, a.full_logs)];
-    logs.extend(log_lines(a, log_h.saturating_sub(1), w));
+    if !a.full_logs {
+        top.push(header(&a.facts));
+        top.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
+        facts = if wide {
+            panel_grid(&a.facts, w)
+        } else {
+            compact_status(&a.facts, w)
+        };
+        // The MENU sits between the facts and the log, always whole, one numbered row per action. The rule above
+        // them is decoration, so it is the first thing to give way when the frame is short: before this, at 80x10,
+        // 56x11, 40x12 and 30x16 (a tmux pane, an ssh window on a phone) the rule took the row that
+        // `9 Reboot / power off` needed and ratatui clipped the END of the menu while the footer still promised
+        // "1-9 actions". Swept over 13 widths x 19 heights: 72 sizes gained that row, none lost the
+        // frame-is-the-terminal invariant (`the_menu_rule_gives_way_before_an_action_does`).
+        let actions = menu_rows(w);
+        if 1 + actions.len() + footer.len() <= h {
+            menu.push(rule("MENU", w));
+        }
+        menu.extend(actions);
+        // The QR is drawn to the RIGHT of the CONNECT rows, so the block has to be as tall as the code. It is only
+        // drawn when the WHOLE frame still fits (a log title and one log row are the floor): the first version
+        // charged it 12 rows, counted by hand, which at 104x29 let it take the panel grid's rows and paint its
+        // quiet zone over the MENU rule (measured; `the_qr_never_costs_another_block_a_row` sweeps the sizes).
+        if let Some((qw, rows)) = qr_panel(&a.facts, &top[1..], w) {
+            let padded = top.len().max(2 + rows.len());
+            if padded + facts.len() + menu.len() + 2 + footer.len() <= h {
+                top.resize(padded, Line::from(""));
+                qr = Some((qw, rows));
+            }
+        }
+    }
+
+    // Nothing is drawn half a block. The nine actions and the footer are what this screen is for - `Reboot /
+    // power off` is a gate string - so they are never trimmed, and everything above them gives way in a fixed
+    // order: the status facts first (they are "technical information"), then the CONNECT block's own tail rows.
+    // Before this, `log_h` was a remainder with no floor, and a 15-row window clipped the MENU itself: 40x15 drew
+    // actions 1-5 and a footer that still promised "1-9 actions", and a log title with nothing under it.
+    // The nine actions and the footer come first; `avail` is what they leave for everything above them.
+    let fixed = menu.len() + footer.len();
+    let avail = h.saturating_sub(fixed);
+    if top.len() + facts.len() + 2 > avail {
+        facts.clear();
+    }
+    let mut keep = top.len().min(avail.saturating_sub(facts.len()));
+    // A log pane is a title and at least one row; one row alone is the tail of a wrapped record ("  tokens,
+    // 330.75 tok/s)"), which reads as broken output. When only one row is left it goes back to the block above,
+    // so the footer stays on the last row.
+    if avail.saturating_sub(keep + facts.len()) == 1 && keep < top.len() {
+        keep += 1;
+    }
+    top.truncate(keep);
+
+    let log_h = avail.saturating_sub(top.len() + facts.len());
+    let mut logs: Vec<Line> = Vec::new();
+    if log_h >= 2 {
+        logs.push(log_title(a, w, a.full_logs));
+        logs.extend(log_lines(a, log_h - 1, w));
+    }
+    top.extend(facts);
 
     let mut constraints: Vec<Constraint> = Vec::new();
     if !top.is_empty() {
@@ -768,7 +804,9 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
     if !menu.is_empty() {
         constraints.push(Constraint::Length(menu.len() as u16));
     }
-    constraints.push(Constraint::Length(log_h as u16));
+    if log_h > 0 {
+        constraints.push(Constraint::Length(log_h as u16));
+    }
     constraints.push(Constraint::Length(footer.len() as u16));
     let rows = Layout::vertical(constraints).split(area);
 
@@ -781,8 +819,10 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
         render_lines(f, rows[row], &menu);
         row += 1;
     }
-    render_lines(f, rows[row], &logs);
-    row += 1;
+    if log_h > 0 {
+        render_lines(f, rows[row], &logs);
+        row += 1;
+    }
     render_lines(f, rows[row], &footer);
 
     // the QR goes on top of the blank columns the block left free (it was measured to fit before it is drawn),
@@ -842,12 +882,7 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
 /// The web UI URL as a scannable block, drawn on paper (black on white: a scanner wants dark-on-light) to the
 /// right of the CONNECT rows. `None` when the screen cannot hold both - the QR is 33 columns wide for a
 /// 27-character URL and 80x25 has no 33 free columns beside the block, so there the URL stays plain text.
-fn qr_panel(
-    f: &Facts,
-    connect: &[Line<'static>],
-    w: usize,
-    h: usize,
-) -> Option<(u16, Vec<Line<'static>>)> {
+fn qr_panel(f: &Facts, connect: &[Line<'static>], w: usize) -> Option<(u16, Vec<Line<'static>>)> {
     let url = format!("http://{}:13305", f.ip()?);
     let rows = crate::qr::code(&url)?;
     let qw = rows[0].chars().count();
@@ -864,9 +899,9 @@ fn qr_panel(
         })
         .max()
         .unwrap_or(0);
-    // one column of air between the block and the code, and enough rows left for the panels, the nine menu rows,
-    // three log rows and the footer: a code that pushes the menu off the screen would be the cycle-14 failure again
-    if w < widest + qw + 2 || h < rows.len() + 12 {
+    // one column of air between the block and the code. The rows are the CALLER's question: it knows the panel
+    // grid, the nine menu rows, the log floor and the footer it is about to draw, and only it can count them.
+    if w < widest + qw + 2 {
         return None;
     }
     let paper = Style::default().fg(Color::Black).bg(Color::White);
@@ -1417,6 +1452,75 @@ mod tests {
     }
 
     #[test]
+    fn the_qr_never_costs_another_block_a_row() {
+        // Measured on the shipped mode (blank key: six CONNECT rows, the widest block) at 104x29 - a plain ssh
+        // window - the code fit the width test, the layout then had one row too many, and ratatui gave the panel
+        // grid's rows to the code: `LEMONADE` was gone and the code's bottom quiet zone painted over the MENU
+        // rule (it came back as `MENU ----      -`). The frame is the terminal exactly, so the code is drawn only
+        // when every block still gets its rows.
+        let mut f = c16_board();
+        f.key = None;
+        for (w, h) in [
+            (101u16, 29u16),
+            (104, 29),
+            (104, 33),
+            (104, 39),
+            (110, 34),
+            (120, 40),
+            (140, 40),
+            (240, 67),
+        ] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines.len(),
+                h as usize,
+                "{w}x{h}: frame is not the terminal"
+            );
+            // the footer is the last block on the screen, whole: at 40 columns it wraps to two lines
+            let foot = lines
+                .iter()
+                .position(|l| l.contains("1-9 actions"))
+                .unwrap_or_else(|| panic!("{w}x{h}: no footer:\n{text}"));
+            let tail = lines[foot..].join(" ");
+            assert!(
+                tail.contains("q stays") || tail.contains("q quits"),
+                "{w}x{h}: the footer is cut ({tail:?}):\n{text}"
+            );
+            // a rule is its label and then nothing but dashes: a hole in one means the code was drawn over it
+            for label in ["CONNECT", "MENU"] {
+                let row = lines
+                    .iter()
+                    .find(|l| l.trim_start().starts_with(label))
+                    .unwrap_or_else(|| panic!("{w}x{h}: no {label} rule:\n{text}"));
+                let tail = row.trim_start().split_once(label).unwrap().1;
+                assert!(
+                    tail.trim().chars().all(|c| c == '-'),
+                    "{w}x{h}: the {label} rule has a hole in it ({row:?}):\n{text}"
+                );
+            }
+            // the panel grid is the block the old row budget used to eat: whenever the code IS on the frame it
+            // did not cost another block its rows. (A frame too short for the panels drops them by design - the
+            // nine actions win - so the assertion is conditional on the code, which is what this test is about.)
+            if text.contains('█') {
+                assert!(
+                    text.contains("LEMONADE"),
+                    "{w}x{h}: the status panels lost their rows to the code:\n{text}"
+                );
+            }
+            // and the nine actions are whole, at every size
+            for n in 1..=9 {
+                assert!(
+                    text.contains(&format!("{n} ")),
+                    "{w}x{h}: action {n} missing"
+                );
+            }
+        }
+        // the code still IS drawn where it fits - the fix must not have deleted it
+        assert!(render_snapshot(&app(c16_board()), 240, 67).contains('█'));
+    }
+
+    #[test]
     fn renders_a_booting_box_and_a_modal_without_panicking() {
         let mut f = c16_board();
         f.ips.clear();
@@ -1437,5 +1541,112 @@ mod tests {
             body: vec!["a".repeat(300)],
         });
         let _ = render_snapshot(&a, 80, 25);
+    }
+
+    #[test]
+    fn a_short_window_keeps_the_nine_actions_and_the_footer_whole() {
+        // Measured before this: a window shorter than the full screen clipped the MENU itself. 40x15 drew actions
+        // 1-5 with a footer that still promised "1-9 actions" and an empty `LOGS newest` title; 80x18 and 100x20
+        // lost `8 Logs`/`9 Reboot / power off` - the last one is a gate string (`vm-check.sh` greps tty1 for it).
+        // Now the blocks above the menu give way whole, in a fixed order (status facts, then the CONNECT block's
+        // tail rows, then the log pane), and nothing is drawn half.
+        let mut f = c16_board();
+        f.key = None;
+        for (w, h) in [
+            (40u16, 15u16),
+            (60, 15),
+            (80, 18),
+            (80, 20),
+            (80, 24),
+            (100, 20),
+            (120, 16),
+            (160, 13),
+            (240, 12),
+            (240, 67),
+        ] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines.len(),
+                h as usize,
+                "{w}x{h}: frame is not the terminal"
+            );
+            for n in 1..=9 {
+                assert!(
+                    text.contains(&format!("{n} ")),
+                    "{w}x{h}: action {n} is off the screen:\n{text}"
+                );
+            }
+            // the footer is the last block on the screen, whole: at 40 columns it wraps to two lines
+            let foot = lines
+                .iter()
+                .position(|l| l.contains("1-9 actions"))
+                .unwrap_or_else(|| panic!("{w}x{h}: no footer:\n{text}"));
+            let tail = lines[foot..].join(" ");
+            assert!(
+                tail.contains("q stays") || tail.contains("q quits"),
+                "{w}x{h}: the footer is cut ({tail:?}):\n{text}"
+            );
+            // no half blocks in the pane that carries the log: a log title always has a log row under it
+            for (i, l) in lines.iter().enumerate() {
+                let t = l.trim_start();
+                if t.starts_with("LOGS") {
+                    let tail = &lines[i + 1..lines.len() - 1];
+                    assert!(
+                        tail.iter().any(|n| !n.trim().is_empty()),
+                        "{w}x{h}: a log title with no log row under it:\n{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_menu_rule_gives_way_before_an_action_does() {
+        // Measured on the shipped binary before this: 80x10, 56x11, 40x12 and 30x16 are all exactly one row short
+        // of the MENU rule plus the nine actions plus the footer, and the rule was charged as fixed while ratatui
+        // clipped the END of the menu - `9 Reboot / power off`, a gate string - with the footer still promising
+        // "1-9 actions". These are ordinary pane sizes (a tmux split, an ssh window on a phone). The rule is
+        // decoration; the actions are the screen, so the rule goes first.
+        let mut f = c16_board();
+        f.key = None;
+        for (w, h) in [(80u16, 10u16), (56, 11), (40, 12), (30, 16)] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines.len(),
+                h as usize,
+                "{w}x{h}: frame is not the terminal"
+            );
+            for n in 1..=9 {
+                assert!(
+                    text.contains(&format!("{n} ")),
+                    "{w}x{h}: action {n} is off the screen:\n{text}"
+                );
+            }
+            assert!(
+                text.contains("stays") || text.contains("quits"),
+                "{w}x{h}: the footer was paid for the rule ({text})"
+            );
+            assert!(
+                !text.contains("MENU"),
+                "{w}x{h}: the rule is still on a frame with no row for it:\n{text}"
+            );
+        }
+        // ...and where a row IS free, the rule is still drawn: the fix must not have deleted it
+        for (w, h) in [
+            (80u16, 11u16),
+            (56, 12),
+            (40, 13),
+            (30, 17),
+            (80, 25),
+            (240, 67),
+        ] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            assert!(
+                text.contains("MENU"),
+                "{w}x{h}: the MENU rule is missing where it fits:\n{text}"
+            );
+        }
     }
 }

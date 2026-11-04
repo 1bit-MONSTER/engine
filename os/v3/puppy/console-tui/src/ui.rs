@@ -851,19 +851,39 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
 
     if let Some(m) = &a.modal {
         let (title, text, hint) = modal_box(m);
-        let lines: Vec<String> = std::iter::once(title)
-            .chain(text)
-            .chain(std::iter::once(hint))
+        let lines: Vec<String> = std::iter::once(title.clone())
+            .chain(text.iter().cloned())
+            .chain(std::iter::once(hint.clone()))
             .collect();
         // the box is the longest line plus its own padding: sizing it to the longest line and then wrapping
         // inside it made every hint wrap for no reason (measured: "any other key / cancels")
         let width = (lines.iter().map(|l| l.chars().count()).max().unwrap_or(10) + 4)
             .min(w.saturating_sub(4))
             .max(27);
-        let body: Vec<Line> = lines
-            .iter()
-            .flat_map(|l| wrap_words(l, width.saturating_sub(4)))
-            .map(|l| styled(l, Some(Color::White), false))
+        let wrap = |s: &str| -> Vec<Line<'static>> {
+            wrap_words(s, width.saturating_sub(4))
+                .into_iter()
+                .map(|l| styled(l, Some(Color::White), false))
+                .collect()
+        };
+        let mut title_rows = wrap(&title);
+        let mut text_rows: Vec<Line> = text.iter().flat_map(|l| wrap(l)).collect();
+        let hint_rows = wrap(&hint);
+        // The hint is the only row that says how to answer the question, so it is never the row that goes: a frame
+        // too short for the whole box loses the explanation first, whole rows at a time, and then the title. Before
+        // this the box was clamped to the frame and ratatui clipped the END - at 40x11 the reboot confirm drew
+        // `Reboot the appliance now?` with `y reboots the box, n cancels` off the screen while `y` still rebooted.
+        let room = (area.height as usize).saturating_sub(2);
+        while title_rows.len() + text_rows.len() + hint_rows.len() > room && !text_rows.is_empty() {
+            text_rows.pop();
+        }
+        while title_rows.len() + hint_rows.len() > room && !title_rows.is_empty() {
+            title_rows.pop();
+        }
+        let body: Vec<Line> = title_rows
+            .into_iter()
+            .chain(text_rows)
+            .chain(hint_rows)
             .collect();
         let bh = (body.len() as u16 + 2).min(area.height);
         let bw = (width as u16 + 4).min(area.width);
@@ -1647,6 +1667,81 @@ mod tests {
                 text.contains("MENU"),
                 "{w}x{h}: the MENU rule is missing where it fits:\n{text}"
             );
+        }
+    }
+
+    #[test]
+    fn the_modal_hint_is_never_the_row_that_goes() {
+        // A frame too short for the whole dialog used to clip its END - the hint, i.e. the only row that says how to
+        // answer. Measured on the shipped binary in ptys: at 40x11, 40x10, 30x12 and 24x12 the blank-key confirm
+        // (`API key` / `Require one from now on?` / `y mints one and restarts Lemonade, n cancels`) drew no hint at
+        // all, and at 40x12 it drew `y mints one and restarts`. For the reboot confirm that is
+        // `y reboots the box, n cancels` off the screen while `y` still reboots.
+        let dialogs = [
+            (
+                Modal::Confirm {
+                    title: "Reboot the box?".into(),
+                    question: "The console ends and the box comes back on its own.".into(),
+                    yes: Yes::Reboot,
+                },
+                "y reboots the box, n cancels",
+            ),
+            (
+                Modal::Confirm {
+                    title: "API key".into(),
+                    question: "No API key (blank mode): this appliance is stock Lemonade, so anyone on this network can use it.\nRequire one from now on? A key is minted into /etc/1bit/lemond.conf and Lemonade restarts.".into(),
+                    yes: Yes::MintKey,
+                },
+                "y mints one and restarts Lemonade, n cancels",
+            ),
+            (
+                Modal::Power,
+                "r reboots, p powers off, any other key cancels",
+            ),
+            (
+                Modal::Info {
+                    title: "Lemonade API key".into(),
+                    body: vec!["API key      0f3a".into(), String::new(), "as a header  Authorization: Bearer 0f3a".into()],
+                },
+                "any key returns to the dashboard",
+            ),
+        ];
+        for (modal, hint) in dialogs {
+            for (w, h) in [
+                (24u16, 12u16),
+                (30, 12),
+                (40, 10),
+                (40, 11),
+                (40, 12),
+                (60, 12),
+                (80, 25),
+                (240, 67),
+            ] {
+                let mut a = app(c16_board());
+                a.modal = Some(modal.clone());
+                let text = render_snapshot(&a, w, h);
+                let lines: Vec<&str> = text.lines().collect();
+                assert_eq!(
+                    lines.len(),
+                    h as usize,
+                    "{w}x{h}: frame is not the terminal:\n{text}"
+                );
+                // the box's borders sit between the wrapped words: drop them before looking for a phrase
+                let flat = text
+                    .replace(
+                        [
+                            '\u{2502}', '\u{250c}', '\u{2510}', '\u{2514}', '\u{2518}', '\u{2500}',
+                        ],
+                        " ",
+                    )
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    flat.contains(hint),
+                    "{w}x{h}: the dialog does not say how to answer it ({hint:?}):\n{text}"
+                );
+            }
         }
     }
 }

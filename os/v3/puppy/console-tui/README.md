@@ -71,6 +71,14 @@ clipped the end of the menu: `9 Reboot / power off` (a `vm-check.sh` string) was
 promised "1-9 actions". Swept over 13 widths x 19 heights, 72 sizes gained that row and none lost the
 frame-is-the-terminal invariant (`the_menu_rule_gives_way_before_an_action_does`).
 
+**The same rule inside a dialog.** A confirmation box is `title | the question | the hint`, and the hint is the only
+row that says how to answer, so a frame too short for the whole box loses the question first, whole rows at a time,
+and then the title - never the hint. Before this the box was clamped to the frame and ratatui clipped its end: at
+40x11, 30x12 and 24x12 the key-confirm dialog drew no hint at all (`y mints one and restarts Lemonade, n cancels`),
+and at 40x12 half of one, while `y` still worked - for the reboot confirm that is `y reboots the box, n cancels`
+missing from the screen that is about to reboot
+(`the_modal_hint_is_never_the_row_that_goes` sweeps four dialogs at eight sizes).
+
 ## Keys
 
 | key | what it does |
@@ -162,7 +170,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 46 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
+cargo test                                    # 47 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

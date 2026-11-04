@@ -784,10 +784,11 @@ that runs the phase is private, like the kernels it runs.
   ChatML anchors. One that does not is refused on the chat route rather than prompted anyway (#963).
 - **Decoding:** greedy, with a 1.1 repetition penalty over the last 64 ids by default.
   `repetition_penalty` in the request overrides it, and 1 gives plain greedy.
-- **One request at a time:** the model has one KV cache. A second request **queues** for the device and is
-  answered when the first generation ends (`--queue-ms`, default 300000); a streamed request that is queueing
-  sends an empty delta once a second, so a proxy's no-data timer does not read the queue as a hung backend (#1024).
-  Past `--queue-ms` the request is refused with 503 + `Retry-After` rather than left waiting.
+- **One request at a time:** the model has one KV cache. A second **streamed** request queues for the device and is
+  answered when the first generation ends (`--queue-ms`, default 300000), sending an empty delta once a second while
+  it waits so a proxy's no-data timer does not read the queue as a hung backend (#1024). A **non-streamed** request
+  cannot be told anything while it waits, so it keeps a short bound (`--queue-ms-plain`, default 5000): past either
+  bound the request is refused with 503 + `Retry-After` rather than left waiting silently.
 - **Repeatable:** every generation starts from a zeroed KV cache (#400), so identical greedy
   requests give identical text, whatever ran before them.
 

@@ -26,6 +26,7 @@ Run directly (`python3 tests/hyperloom_benchmark_test.py`) or through ctest.
 """
 import hashlib
 import importlib.util
+import json
 import pathlib
 import platform
 import sys
@@ -133,6 +134,21 @@ def main():
         os.environ["IREE_HAL_AMDGPU_LIBHSA_PATH"] = str(pathlib.Path(tmp) / "absent.so.1")
         assert bench.device_stack()["hsa_runtime"] is None, bench.device_stack()
     os.environ.pop("IREE_HAL_AMDGPU_LIBHSA_PATH")
+
+    # And the verdict has to name what it was relative to: `HL_STATE` is per-box and the base logits are
+    # regenerated when missing, so a KLD number reads PASS against a reference the JSON never named.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = pathlib.Path(tmp) / "kld-base.kld"
+        texts = pathlib.Path(tmp) / "texts.json"
+        base.write_bytes(b"logits " * 1000)
+        texts.write_text(json.dumps({"texts": {"code": "a"}}), encoding="utf-8")
+        ident = bench.gate_reference({"model": "deadbeef", "levers": {"HL_DFLASH": "1"}}, base, texts)
+        assert ident["model"] == "deadbeef" and ident["levers"] == {"HL_DFLASH": "1"}, ident
+        assert ident["base_kld_sha256"] == hashlib.sha256(base.read_bytes()).hexdigest(), ident
+        assert ident["texts_sha256"] == hashlib.sha256(texts.read_bytes()).hexdigest(), ident
+        # A different base of the same name is a different reference, which is the point.
+        base.write_bytes(b"logits " * 999)
+        assert bench.gate_reference({}, base, texts)["base_kld_sha256"] != ident["base_kld_sha256"]
 
     print("hyperloom_benchmark_test: OK")
     return 0

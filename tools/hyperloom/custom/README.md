@@ -118,8 +118,11 @@ The gate is fail-closed and has two halves; a candidate that fails either is rej
 * **Greedy text**: the three replies must be byte-identical to the baseline's.
 
 Both references are recorded by the first measurement (the baseline) in `HL_STATE`
-(default `~/lb/hl-gate/<model-stem>`), outside the checkout. At 1e-4, a lever that legitimately
-changes rounding (KV cache types, flash-attn, micro-batch) will usually fail the KLD half — that is
+(default `~/lb/hl-gate/<model-stem>`), outside the checkout. Every *compared* result names that state
+in `quality_gate.reference` (baseline model fingerprint and levers, plus the SHA-256 of `kld-base.kld`
+and `texts.json`) — the directory is per-box and the base logits are regenerated when missing, so the
+same KLD mean can read `PASS` against a reference the report never named. At 1e-4, a lever that
+legitimately changes rounding (KV cache types, flash-attn, micro-batch) will usually fail the KLD half — that is
 the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 
 ## Levers

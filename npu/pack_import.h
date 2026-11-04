@@ -94,6 +94,12 @@ struct Plan {
     // (engine#734's lesson: `info` must report the measurement, not the plan.)
     int64_t attn_tiles = 0;
     std::string attn_note;
+    // The MLP section's geometry, likewise measured: gate and up share one fused 4,288-byte-subvolume
+    // tensor of `mlp_gu_units` x 128 columns, then a 64-byte parameter subvolume, then down_proj in
+    // 2,176-byte subvolumes. All of it has to add up to the block stride exactly, which is the check
+    // that keeps this from being an assumption about one pack.
+    int64_t mlp_gu_units = 0, mlp_down_groups = 0;
+    std::string mlp_note;
 
     std::vector<std::string> refused() const;
     std::string manifest() const;  // JSON: format, layout version, source, geometry, tensors
@@ -139,6 +145,12 @@ struct Report {
     long long attn_tiles_ok = 0, attn_tiles_total = 0;
     int attn_projections = 0, attn_bias_tensors = 0;
     double attn_zero_inexact_pct = 0;  // per-32-group zero points that are not bf16-exact in the container
+
+    // Self-check 4: the same round trip over the MLP section -- every 128-column gate/up unit and every
+    // 64-column down_proj group decoded and re-encoded, which has to give the shipped bytes back.
+    long long mlp_groups_ok = 0, mlp_groups_total = 0;
+    int mlp_projections = 0;
+    double mlp_zero_inexact_pct = 0;
 };
 
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options&);
@@ -164,15 +176,23 @@ Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t
 // Both narrow fields pair with rows the same way -- byte `i` of a subvolume carries rows 2i and 2i+1
 // (low nibble = even row) -- so a per-row bug in one of them cannot hide behind the other, and a
 // decode->encode round trip cannot see the pairing at all (engine#849).
+//
+// The same subvolume also carries the MLP section at a second width: `rows` is the group's column
+// count, which fixes the subvolume's own width (rows/2 = 32 columns at 2,176 B, 64 at 4,288 B).
 struct TileW {
     int k = 0;                  // the projection's K
-    std::vector<uint8_t> code;   // [64][k] stored nibbles
-    std::vector<float> scale;    // [64][k/128], widened from bf16 (exact, and bf16 again on the way back)
-    std::vector<uint8_t> zp;     // [64][k/128] stored zero points
-    std::vector<uint16_t> bias;  // [64] bf16
+    int rows = 64;              // columns covered: 64 in the attention payload and down_proj, 128 where
+                                // gate and up are fused into one 4,288-byte subvolume
+    std::vector<uint8_t> code;   // [rows][k] stored nibbles
+    std::vector<float> scale;    // [rows][k/128], widened from bf16 (exact, and bf16 again on the way back)
+    std::vector<uint8_t> zp;     // [rows][k/128] stored zero points
+    std::vector<uint16_t> bias;  // [rows] bf16
 };
-// Bytes in one 64-row tile of that layout: 2*(k/128) + 2 subvolumes of 2,176. 0 when k is not a
-// positive multiple of 128, i.e. when the payload cannot be tiles of this shape.
+// Bytes in one group of that layout: 2*(k/128) + 2 subvolumes, each 64*(rows/2) + 64 + rows bytes.
+// 0 when k is not a positive multiple of 128 or rows is not a positive multiple of 64, i.e. when the
+// payload cannot be groups of this shape.
+int64_t group_bytes(int64_t k, int rows);
+// Byte count below is the 64-row tile: the attention payload's and down_proj's shape.
 // The layer-block geometry of a `.fconst`, measured from its epsilon anchors (engine#734). The anchors
 // are the pack's OWN bf16 rms_norm_eps, so `eps_bits` comes from its config.json via
 // `bf16_bits_of()`; the default is bf16 1e-6, which is what the Qwen family declares.
@@ -187,12 +207,16 @@ unsigned short bf16_bits_of(float v);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);
-TileW decode_tile(const uint8_t* tile, int k);
+TileW decode_tile(const uint8_t* tile, int k, int rows = 64);
 // The exact inverse. Used only as the importer's self-check: a tile that does not survive
 // encode(decode(t)) == t is a tile whose fields we do not understand, and it is refused by name.
 std::vector<uint8_t> encode_tile(const TileW& t);
 // A projection assembled from consecutive tiles, in the form the container's writer takes.
 Q4 q_from_tiles(const std::vector<TileW>& tiles);
+// gate and up are ONE tensor in the .fconst, interleaved in 32-column chunks, so a 128-column group holds
+// 64 gate rows and 64 up rows: this takes one of the two as a 64-row tile (rows 0..31 from the group's
+// first column half, rows 32..63 from the second).
+TileW gu_half(const TileW& group, bool up);
 
 // Q4NX q4_1 tiles of a Q4 tensor: [N/32 * K/256, 5120] bytes, plus the parameters
 // that were not exactly representable in bf16 (counted, not fixed up).

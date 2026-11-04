@@ -14,11 +14,11 @@
 // limitations under the License.
 
 // engine#713 criterion 4 (docs/hrx.md, "The HSA runtime"): the HRX init line names the HSA runtime
-// HRX will dlopen - its path and its sha256 - because three libhsa-runtime64.so.1 exist on a box
-// and they are not interchangeable: the release-shipped one does not register HRX0 for a dev
-// build, the pinned toolchain's does, and a distro one is untested. Without naming it, a run can
-// pass while a silent fallback to another copy executes, which is how the A/B behind engine#315's
-// residual was only trustworthy - every arm named its runtime.
+// HRX will dlopen - its path and its sha256 - because several libhsa-runtime64.so.1 copies exist on a box
+// and they are not interchangeable: a distro ROCr predates an entry point the driver resolves by name, and
+// a copy of the right build without its librocm_sysdeps_* siblings cannot be loaded at all. Without naming
+// it, a run can pass while a silent fallback to another copy executes, which is how the A/B behind
+// engine#315's residual was only trustworthy - every arm named its runtime.
 //
 // Anything that needs the same identity (llama-server's log, a test) gets it from here, so the
 // format is written once.

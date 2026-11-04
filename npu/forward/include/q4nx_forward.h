@@ -552,6 +552,9 @@ private:
     // gemv family: the head's tile stream is the whole image in one BO, copied once.
     std::vector<uint8_t>      gemv_blob_;   // one design's tile stream, reused per upload
     std::vector<uint8_t>      gemv_head_;
+    // The plan's resolved decode directories, when it names any. The head ELF lives in the same place as
+    // the projections' ELFs, so it is looked for there rather than in the built-in guesses only.
+    std::vector<std::string>  plan_decode_dirs_;
     std::unique_ptr<xrt::bo>  head_bo_;
     // The lm head on ternary pb16i images (conv/pack_head_pb16i.py): output.weight is PTQ1_0 in
     // the folded GGUF, so the image is exact, it is half the int8 codes' bytes, and it runs the

@@ -745,9 +745,17 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
         } else {
             compact_status(&a.facts, w)
         };
-        // the MENU sits between the facts and the log, always whole, one numbered row per action
-        menu.push(rule("MENU", w));
-        menu.extend(menu_rows(w));
+        // The MENU sits between the facts and the log, always whole, one numbered row per action. The rule above
+        // them is decoration, so it is the first thing to give way when the frame is short: before this, at 80x10,
+        // 56x11, 40x12 and 30x16 (a tmux pane, an ssh window on a phone) the rule took the row that
+        // `9 Reboot / power off` needed and ratatui clipped the END of the menu while the footer still promised
+        // "1-9 actions". Swept over 13 widths x 19 heights: 72 sizes gained that row, none lost the
+        // frame-is-the-terminal invariant (`the_menu_rule_gives_way_before_an_action_does`).
+        let actions = menu_rows(w);
+        if 1 + actions.len() + footer.len() <= h {
+            menu.push(rule("MENU", w));
+        }
+        menu.extend(actions);
         // The QR is drawn to the RIGHT of the CONNECT rows, so the block has to be as tall as the code. It is only
         // drawn when the WHOLE frame still fits (a log title and one log row are the floor): the first version
         // charged it 12 rows, counted by hand, which at 104x29 let it take the panel grid's rows and paint its
@@ -1590,6 +1598,55 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_menu_rule_gives_way_before_an_action_does() {
+        // Measured on the shipped binary before this: 80x10, 56x11, 40x12 and 30x16 are all exactly one row short
+        // of the MENU rule plus the nine actions plus the footer, and the rule was charged as fixed while ratatui
+        // clipped the END of the menu - `9 Reboot / power off`, a gate string - with the footer still promising
+        // "1-9 actions". These are ordinary pane sizes (a tmux split, an ssh window on a phone). The rule is
+        // decoration; the actions are the screen, so the rule goes first.
+        let mut f = c16_board();
+        f.key = None;
+        for (w, h) in [(80u16, 10u16), (56, 11), (40, 12), (30, 16)] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines.len(),
+                h as usize,
+                "{w}x{h}: frame is not the terminal"
+            );
+            for n in 1..=9 {
+                assert!(
+                    text.contains(&format!("{n} ")),
+                    "{w}x{h}: action {n} is off the screen:\n{text}"
+                );
+            }
+            assert!(
+                text.contains("stays") || text.contains("quits"),
+                "{w}x{h}: the footer was paid for the rule ({text})"
+            );
+            assert!(
+                !text.contains("MENU"),
+                "{w}x{h}: the rule is still on a frame with no row for it:\n{text}"
+            );
+        }
+        // ...and where a row IS free, the rule is still drawn: the fix must not have deleted it
+        for (w, h) in [
+            (80u16, 11u16),
+            (56, 12),
+            (40, 13),
+            (30, 17),
+            (80, 25),
+            (240, 67),
+        ] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            assert!(
+                text.contains("MENU"),
+                "{w}x{h}: the MENU rule is missing where it fits:\n{text}"
+            );
         }
     }
 }

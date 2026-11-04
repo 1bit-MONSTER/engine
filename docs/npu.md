@@ -780,7 +780,8 @@ that runs the phase is private, like the kernels it runs.
   all 14 match, ids and round trip.
 - **Endpoints:** `/v1/health` (503 while loading), `/v1/models`, `/v1/chat/completions`
   (streaming or not) and `/v1/completions`.
-- **Prompt:** ChatML, Qwen2/Qwen3's template for text messages.
+- **Prompt:** ChatML, Qwen2/Qwen3's template for text messages — for a container whose tokenizer has the
+  ChatML anchors. One that does not is refused on the chat route rather than prompted anyway (#963).
 - **Decoding:** greedy, with a 1.1 repetition penalty over the last 64 ids by default.
   `repetition_penalty` in the request overrides it, and 1 gives plain greedy.
 - **One request at a time:** the model has one KV cache.
@@ -850,6 +851,20 @@ got before.
 | `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
+
+Every chat prompt is rendered with **ChatML** (`app/npu_chatml.h`), the template Qwen2/Qwen3 use, not with a
+template read out of the container. A container whose tokenizer has no `<|im_start|>`/`<|im_end|>` added token
+cannot represent that text — the marker becomes ordinary pieces — so `/v1/chat/completions` answers **400**
+naming the model's own specials instead of prompting it with text its tokenizer never produces (#963). The
+measured cost of getting it wrong on Zyphra/ZR1-1.5B, whose specials are DeepSeek's: the same request is **23
+tokens under this render against 9** under Qwen3's tokenizer, and `<|im_start|>` alone is **6 pieces**.
+
+`/v1/completions` is unaffected, and it is how such a container is served: it takes the prompt as token ids
+(`prompt: [ids]`, #938), so a caller renders the model's own template and sends those ids. The check reads the
+container's tokenizer **once at load** (`chatml_supported()`), so it costs a request nothing, and it is a
+necessary condition rather than a proof — a container can carry both anchors and still use another template.
+Packing the model's `chat_template` into the container is what closes that gap, and it is a container-format
+decision, not something this route does.
 
 `logprobs` keeps OpenAI's shape: non-streamed, every entry is `choices[0].logprobs.content[i] =
 {token, logprob, top_logprobs: [{token, logprob}]}`; streamed, each chunk carries the entries whose bytes that

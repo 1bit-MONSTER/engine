@@ -2200,7 +2200,6 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     const float scale = 1.0f / sqrtf((float)KHD);
     std::vector<float> co((size_t)CD), ah((size_t)NVH), bh((size_t)NVH);
     std::vector<float> ql((size_t)NVH * KHD), kl((size_t)NVH * KHD), vv((size_t)NVH * VHD);
-    std::vector<float> kvm((size_t)VHD);
     for (int m = 0; m < M; m++) {
         const float* qkv = QKV.data() + (size_t)m * CD;
         const float* z = Z.data() + (size_t)m * VD;
@@ -2254,8 +2253,13 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
             }
         }
         // recurrent gated delta rule + scale-free gated RMSNorm
+        // Heads are independent (disjoint rec_state_ rows, disjoint CORE rows), so this is the
+        // one loop in the GDN layer that parallelises: perf puts gdn_layer_batch at 76% of the
+        // host cycles and this state update at 2*KHD*VHD MACs per head.  kvm is per-head scratch.
         float* rs = rec_state_[l].data();
+#pragma omp parallel for schedule(static)
         for (int hh = 0; hh < NVH; hh++) {
+            std::vector<float> kvm((size_t)VHD);
             const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] * softplus_f(ah[(size_t)hh] + gdn_small_[(size_t)l].dt[hh]));
             const float beta = 1.0f / (1.0f + expf(-bh[(size_t)hh]));
             float* sh = rs + (size_t)hh * KHD * VHD;

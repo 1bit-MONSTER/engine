@@ -492,6 +492,10 @@ FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits) {
         g.stride = 0;
         return g;
     }
+    // The rest of the first block's headers, which are its section boundaries. A block whose detected
+    // period is 4 has three of them and plan() reads a different layout from it than from a 2-header
+    // block, so they are recorded here rather than re-derived there.
+    for (int i = 1; i < g.period; ++i) g.hdr.push_back(pos[i] - pos[0]);
     g.blocks = int(pos.size());
     return g;
 }
@@ -850,7 +854,10 @@ std::string Plan::manifest() const {
         ts.push_back(std::move(e));
     }
     j["tensors"] = ts;
-    j["attention_payload"] = {{"tiles_measured", attn_tiles}, {"note", attn_note}};
+    j["attention_payload"] = {{"tiles_measured", attn_tiles},
+                             {"o_proj_k", o_k},
+                             {"qk_norm", knorm_off != 0},
+                             {"note", attn_note}};
     j["mlp_section"] = {{"gate_up_units_measured", mlp_gu_units},
                         {"down_groups_measured", mlp_down_groups},
                         {"note", mlp_note}};
@@ -944,27 +951,82 @@ Plan plan(const std::string& pack_dir) {
                 p.mlp_note = p.attn_note;
             } else {
                 // The payload starts just past the block's input_layernorm weight, so its offset is
-                // `attn_payload_off(hidden)` (engine#979).
-                const int64_t payload = g.h1 - attn_payload_off(H);
-                const int64_t want = (kv_out / 64) * 2 + (q_out / 64) * 2;  // k, q, v, o = 2/14/2/14 on 0.5B
-                if (payload <= 0 || payload % tile_bytes)
-                    p.attn_note = "attention payload is " + std::to_string(payload) + " B, not a whole number of " +
-                                  std::to_string(tile_bytes) + "-byte tiles";
-                else if (q_out != H)
-                    p.attn_note = "the attention payload's q_proj is " + std::to_string(q_out) +
-                                  " rows against hidden " + std::to_string(H) +
-                                  ", so o_proj's K would not be the tile's K";
-                else if (payload / tile_bytes != want)
-                    p.attn_note = "attention payload holds " + std::to_string(payload / tile_bytes) +
-                                  " tiles; q/k/v/o at 64 rows each need " + std::to_string(want);
-                else
-                    p.attn_tiles = payload / tile_bytes;
-                // the MLP section starts right after the second norm of the block
-                const MlpGeom mg = mlp_geom(H, d.intermediate, g.h1 + kNormOff + H * 2, g.stride);
+                // `attn_payload_off(hidden)` (engine#979). How the rest of the section is divided is what
+                // the block's own header count says: q/k/v/o in one uniform tile run (Qwen2.5, Llama), or
+                // q/k/v, then a per-head QK norm each, then o_proj at K = q_proj's width (Qwen3). Every
+                // section is checked against that arithmetic to the byte; a pack that does not match is
+                // refused with the numbers rather than decoded on a guess.
+                const int64_t attn_off = attn_payload_off(H);
+                const int64_t per_head = int64_t(d.head_dim) * 2;  // one QK norm gain, bf16
+                const int64_t tile_o = attn_tile_bytes(q_out);
+                const int64_t n_kv = kv_out / 64, n_q = q_out / 64;
+                auto refuse = [&](const std::string& s) {
+                    p.attn_note = s;
+                    p.knorm_off = p.qnorm_off = p.o_off = 0;  // an unread section is not a half-read one
+                    p.o_k = 0;
+                };
+                if (g.hdr.size() == 1) {
+                    // One header after the block's first: q, k, v and o share one uniform payload, so
+                    // o_proj's K is hidden and q_proj has to be hidden wide for the run to be uniform.
+                    const int64_t payload = g.hdr[0] - attn_off;
+                    const int64_t want = n_kv * 2 + n_q * 2;  // k, q, v, o = 2/14/2/14 on 0.5B
+                    if (payload <= 0 || payload % tile_bytes)
+                        refuse("attention payload is " + std::to_string(payload) + " B, not a whole number of " +
+                               std::to_string(tile_bytes) + "-byte tiles");
+                    else if (q_out != H)
+                        refuse("the attention payload holds q/k/v/o as one uniform tile run, which needs "
+                               "q_proj's width to be hidden; this pack's q_proj is " + std::to_string(q_out) +
+                               " rows against hidden " + std::to_string(H) +
+                               ", so o_proj's K would not be the tile's K");
+                    else if (payload / tile_bytes != want)
+                        refuse("attention payload holds " + std::to_string(payload / tile_bytes) +
+                               " tiles; q/k/v/o at 64 rows each need " + std::to_string(want));
+                    else {
+                        p.attn_tiles = payload / tile_bytes;
+                        p.o_off = attn_off + (n_kv + n_q + n_kv) * tile_bytes;
+                        p.o_k = int(H);
+                    }
+                } else if (g.hdr.size() == 3) {
+                    // engine#979: the Qwen3 families split the attention section in four. Measured on
+                    // both shipped packs: [k,q,v tiles][header + per-head k_norm][header + per-head q_norm
+                    // + o_proj tiles], with o_proj's tiles at K = q_proj's output width.
+                    const int64_t kv_tiles = n_kv + n_q + n_kv;
+                    const int64_t s0 = g.hdr[0] - attn_off;
+                    const int64_t s1 = g.hdr[1] - g.hdr[0];
+                    const int64_t s2 = g.hdr[2] - g.hdr[1];
+                    if (s0 != kv_tiles * tile_bytes)
+                        refuse("the attention payload before the first per-head norm is " + std::to_string(s0) +
+                               " B; k/q/v at 64 rows each are " + std::to_string(kv_tiles) + " tiles = " +
+                               std::to_string(kv_tiles * tile_bytes) + " B");
+                    else if (s1 != kNormOff + per_head)
+                        refuse("the section between the two per-head QK norms is " + std::to_string(s1) +
+                               " B; a " + std::to_string(kNormOff) + "-byte header plus a bf16 [head_dim " +
+                               std::to_string(d.head_dim) + "] gain is " + std::to_string(kNormOff + per_head));
+                    else if (s2 != kNormOff + per_head + (H / 64) * tile_o)
+                        refuse("the section holding o_proj is " + std::to_string(s2) + " B; a header, a gain and " +
+                               std::to_string(H / 64) + " o_proj tiles (hidden " + std::to_string(H) +
+                               " rows) at K = q_proj's " + std::to_string(q_out) + " are " +
+                               std::to_string(kNormOff + per_head + (H / 64) * tile_o));
+                    else {
+                        p.attn_tiles = kv_tiles;
+                        p.knorm_off = g.hdr[0] + kNormOff;
+                        p.qnorm_off = g.hdr[1] + kNormOff;
+                        p.o_off = g.hdr[1] + kNormOff + per_head;
+                        p.o_k = q_out;
+                    }
+                } else {
+                    refuse("the layer block has " + std::to_string(g.hdr.size() + 1) +
+                           " epsilon headers, and this importer reads blocks of 2 (q/k/v/o in one payload) "
+                           "or 4 (q/k/v, two per-head QK norms, o_proj) -- recorded 2026-11-04 on Qwen3");
+                }
+                // the MLP section starts right after the block's post-attention norm
+                const int64_t mlp_off = g.hdr.back() + kNormOff + H * 2;
+                const MlpGeom mg = mlp_geom(H, d.intermediate, mlp_off, g.stride);
                 p.mlp_note = mg.why;
                 if (mg.ok()) {
                     p.mlp_gu_units = mg.gu_units;
                     p.mlp_down_groups = mg.down_groups;
+                    p.mlp_off = mlp_off;
                 }
             }
         }
@@ -1010,6 +1072,13 @@ Plan plan(const std::string& pack_dir) {
             b.declared_check = "written only when the tile's bias subvolumes are not all zero";
             p.tensors.push_back(std::move(b));
         }
+    // per-head QK RMSNorm gains (Qwen3 and later): bf16 [head_dim], in the two sections that sit between
+    // q/k/v and o_proj. Planned only when the block measured those two sections (engine#979).
+    if (p.knorm_off)
+        for (int L = 0; L < d.layers; ++L)
+            for (const char* nm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"})
+                p.tensors.push_back(make("model.layers." + std::to_string(L) + "." + nm, norm_source,
+                                         "BF16", {d.head_dim}));
     return p;
 }
 
@@ -1306,23 +1375,28 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             if (p.attn_tiles) {
                 const int q_out = p.dims.heads * p.dims.head_dim;
                 const int kv_out = p.dims.kv_heads * p.dims.head_dim;
-                const int tile_bytes = int(attn_tile_bytes(H));
                 const int n_kv = kv_out / kTileRows, n_q = q_out / kTileRows;
-                struct Slot { const char* proj; int rows, first; };
-                const Slot slots[] = {{"k_proj", kv_out, 0},
-                                      {"q_proj", q_out, n_kv},
-                                      {"v_proj", kv_out, n_kv + n_q},
-                                      {"o_proj", int(H), n_kv + n_q + n_kv}};
+                // k, q, v share the block's first payload at K = hidden; o_proj has a base and a K of its
+                // own (engine#979: on the Qwen3 families the two per-head QK norms sit between them and
+                // o_proj's K is q_proj's output width).
+                struct Slot { const char* proj; int rows; int64_t base; int k; int first; };
+                const int64_t attn_off = attn_payload_off(H);
+                const Slot slots[] = {{"k_proj", kv_out, attn_off, int(H), 0},
+                                      {"q_proj", q_out, attn_off, int(H), n_kv},
+                                      {"v_proj", kv_out, attn_off, int(H), n_kv + n_q},
+                                      {"o_proj", int(H), p.o_off, p.o_k, 0}};
                 for (int L = 0; L < p.dims.layers; ++L) {
-                    const int64_t base = int64_t(L) * g.stride + attn_payload_off(H);
+                    const int64_t block = int64_t(L) * g.stride;
                     for (const auto& sl : slots) {
                         const int nt = sl.rows / kTileRows;
+                        const int tile_bytes = int(attn_tile_bytes(sl.k));
                         std::vector<TileW> tiles;
                         tiles.reserve(size_t(nt));
                         bool exact = true;
                         for (int i = 0; i < nt; ++i) {
-                            const uint8_t* src = at(fc, base + int64_t(sl.first + i) * tile_bytes, tile_bytes);
-                            tiles.push_back(decode_tile(src, int(H)));
+                            const uint8_t* src = at(fc, block + sl.base + int64_t(sl.first + i) * tile_bytes,
+                                                    tile_bytes);
+                            tiles.push_back(decode_tile(src, sl.k));
                             ++r.attn_tiles_total;
                             const std::vector<uint8_t> back = encode_tile(tiles.back());
                             if (std::memcmp(back.data(), src, size_t(tile_bytes)) == 0) ++r.attn_tiles_ok;
@@ -1366,6 +1440,16 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             ++r.attn_bias_tensors;
                         }
                     }
+                    // per-head QK norms (Qwen3 and later): plain bf16 [head_dim] gains that the
+                    // container already carries for families that have them.
+                    if (p.knorm_off)
+                        for (const auto& [off, nm] : {std::pair<int64_t, const char*>{p.knorm_off, "k_norm"},
+                                                      std::pair<int64_t, const char*>{p.qnorm_off, "q_norm"}}) {
+                            const int64_t n = p.dims.head_dim;
+                            w.add("model.layers." + std::to_string(L) + ".self_attn." + nm + ".weight",
+                                  "BF16", {n}, as_bf16(at(fc, block + off, n * 2), kBF16, size_t(n)));
+                            ++r.tensors;
+                        }
                 }
                 r.attn_zero_inexact_pct =
                     zero_groups_all ? 100.0 * double(zero_inexact_all) / double(zero_groups_all) : 0.0;
@@ -1377,7 +1461,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // not survive that is refused by name. The geometry is re-derived from this block rather
             // than taken from plan(), so the stride identity is checked against the file being read.
             if (p.mlp_gu_units) {
-                const MlpGeom mg = mlp_geom(H, p.dims.intermediate, g.h1 + kNormOff + H * 2, g.stride);
+                const MlpGeom mg = mlp_geom(H, p.dims.intermediate, p.mlp_off, g.stride);
                 if (!mg.ok()) {
                     late.push_back("the MLP section: " + mg.why);
                 } else {

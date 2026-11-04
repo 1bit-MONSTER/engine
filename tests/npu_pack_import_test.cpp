@@ -918,8 +918,57 @@ void test_attn_payload_off() {
                 (long long)(h1 - 1856 - 80 * tile));
 }
 
-void test_fconst_eps(const std::string& root) {
-    const fs::path dir = fs::path(root) / "fconst-eps";
+// engine#979: the .fconst attention section is not always one uniform run of q/k/v/o tiles. The Qwen3
+// packs carry FOUR epsilon headers per layer block (the Qwen2.5/Llama packs carry two), and the three
+// sections between them decompose to the byte as [k,q,v tiles][header + per-head k_norm][header +
+// per-head q_norm + o_proj tiles]. The offsets below are the packs' OWN measured header positions; the
+// pack's own metadata names the two norms (attn/k_norm/MLADFRMSNORM before attn/q_norm/MLADFRMSNORM in
+// the Token program's op_list) and declares `o_proj N=2560 K=4096` on the 4B, i.e. o_proj's K is
+// q_proj's output width, not hidden. The two 256-byte gains match Qwen/Qwen3-1.7B's and -4B's public
+// q_norm/k_norm weights bit for bit at those offsets (128 of 128 values, and 127-128 of 128 on the swap).
+void test_qwen3_attn_sections() {
+    struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
+    const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
+                          {"Qwen3-4B", 2560, 4096, 1024, 128, 8778816, 8779136, 14524096}};
+    for (const Pack& p : packs) {
+        const int64_t tile = pi::attn_tile_bytes(p.hidden);
+        const int64_t tile_o = pi::attn_tile_bytes(p.q_out);
+        const int64_t norm = 64 + 2 * p.hd;  // a 64-byte header plus one bf16 [head_dim] gain
+        const int64_t s0 = p.h0 - pi::attn_payload_off(p.hidden);
+        const int64_t s1 = p.h1 - p.h0;
+        const int64_t s2 = p.h2 - p.h1;
+        const int64_t kv_tiles = (p.kv_out / 64) * 2 + p.q_out / 64;  // k, q, v in that order
+        const std::string n = p.name;
+        check(s0 == kv_tiles * tile,
+              n + ": the payload before the first per-head norm is " + std::to_string(s0) +
+                  " B, and k/q/v are " + std::to_string(kv_tiles) + " tiles = " +
+                  std::to_string(kv_tiles * tile));
+        check(s1 == norm, n + ": the section between the two per-head norms is " + std::to_string(s1) +
+                              " B, a header plus a bf16 [128] gain is " + std::to_string(norm));
+        check(s2 == norm + (p.hidden / 64) * tile_o,
+              n + ": the section holding o_proj is " + std::to_string(s2) + " B, a header, a gain and " +
+                  std::to_string(p.hidden / 64) + " o_proj tiles at K = q_proj's " +
+                  std::to_string(p.q_out) + " are " + std::to_string(norm + (p.hidden / 64) * tile_o));
+        // The negative control: with o_proj's K taken as hidden the same rows are a different size, and
+        // with all four projections in one run the first section cannot hold them. Both are what the
+        // importer refused before this fix, so the check is that the measured numbers are NOT those.
+        if (p.q_out != p.hidden)
+            check(s2 != norm + (p.hidden / 64) * tile,
+                  n + ": o_proj's section is not 40 tiles at K = hidden (" +
+                      std::to_string(norm + (p.hidden / 64) * tile) + " B), which is how the pack states "
+                      "o_proj's K is q_proj's width");
+        check(s0 != (kv_tiles + p.hidden / 64) * tile,
+              n + ": q/k/v/o do not share one uniform run (that would be " +
+                  std::to_string((kv_tiles + p.hidden / 64) * tile) + " B against a measured " +
+                  std::to_string(s0) + ")");
+        std::printf("qwen3 sections: %s -> k/q/v %d tiles, norm %lld B, norm+o_proj %lld B (%d tiles at "
+                    "K=%lld)\n",
+                    p.name, int(kv_tiles), (long long)s1, (long long)s2, int(p.hidden / 64),
+                    (long long)p.q_out);
+    }
+}
+
+void test_fconst_eps(const std::string& root) {    const fs::path dir = fs::path(root) / "fconst-eps";
     fs::remove_all(dir);
     fs::create_directories(dir);
 
@@ -988,6 +1037,7 @@ int main(int argc, char** argv) {
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
+        test_qwen3_attn_sections();
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

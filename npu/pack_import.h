@@ -94,6 +94,18 @@ struct Plan {
     // (engine#734's lesson: `info` must report the measurement, not the plan.)
     int64_t attn_tiles = 0;
     std::string attn_note;
+    // Where the four projections actually sit, once the section count is known (engine#979). k/q/v are
+    // always in the block's first payload at K = hidden. o_proj has a payload of its own whose K is
+    // q_proj's output width -- the same payload as q/k/v on the Qwen2/Llama families, a separate one
+    // behind the two per-head norms on the Qwen3 families, where the pack itself declares
+    // `o_proj N=2560 K=4096` (q_out, not hidden). o_off is relative to the block start.
+    int64_t o_off = 0;
+    int o_k = 0;
+    // Per-head QK RMSNorm gains (Qwen3 and later): their offsets inside the block, 0 when the family has
+    // none. Identified and verified byte-exact against the public Qwen3-1.7B/4B checkpoints (0 of 128
+    // values differ on either pack, and the swap differs on 127-128 of 128).
+    int64_t knorm_off = 0, qnorm_off = 0;
+    int64_t mlp_off = 0;  // the MLP section starts just past the block's post-attention norm
     // The MLP section's geometry, likewise measured: gate and up share one fused 4,288-byte-subvolume
     // tensor of `mlp_gu_units` x 128 columns, then a 64-byte parameter subvolume, then down_proj in
     // 2,176-byte subvolumes. All of it has to add up to the block stride exactly, which is the check
@@ -201,6 +213,11 @@ struct FconstGeom {
     int64_t h1 = 0;       // offset of the second (post-attention) header within a block
     int period = 0;       // headers per block
     int blocks = 0;       // block starts seen
+    // Every in-block header offset after the block's first (so hdr[0] == h1), relative to the block
+    // start. These are the block's section boundaries: 1 header on the Qwen2/Llama packs (q/k/v/o share
+    // one payload) and 3 on the Qwen3 packs (q/k/v, then one per-head QK norm each, then o_proj), so
+    // which layout a pack uses is measured from the pack rather than guessed from a version.
+    std::vector<int64_t> hdr;
     std::string why;      // non-empty when the geometry could not be established
 };
 unsigned short bf16_bits_of(float v);

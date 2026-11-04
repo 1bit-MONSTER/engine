@@ -150,6 +150,13 @@ struct Report {
     int64_t stride = 0, second_header = 0;
     std::string fconst_note;
     int norm_anchors_ok = 0, norm_anchors_total = 0;
+    // The final norm is the last tensor the .fconst tail carries. `final_norm_crosscheck` is only
+    // meaningful when both facts below hold, so they are reported separately rather than inferred from it:
+    // false means "no agreeing duplicate", which also covers "no duplicate to compare" and "the norm was
+    // refused", and those are different things to say about an import.
+    bool final_norm_imported = false;      // model.norm.weight was written into the container
+    bool prefill_tail_seen = false;        // a second copy was readable in the prefill .fconst
+    bool final_norm_crosscheck = false;    // ... and it is byte-identical to the Token_Token copy
 
     // Self-check 3: the attention tiles' own round trip. Decoding a shipped tile and re-encoding it has to
     // give the same 34,816 bytes back, every field at once (quants, zero points, scales and the writer's

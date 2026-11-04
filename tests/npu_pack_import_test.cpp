@@ -29,9 +29,9 @@
 // 4b. The same, for the MLP section's 68,608-byte gate|up unit
 //    (tests/golden/oga_mlp_gu_group.bin, tools/oga_mlp_gu_golden.py): one decode, then the fused
 //    tensor split into gate and up, both against their recorded container tiles.
-// 5. With a pack dir: `1bit npu-pack`'s plan refuses only the final norm, imports the attention
-//    projections and their biases and the MLP projections, and produces a container the engine's
-//    own Model can open.
+// 5. With a pack dir: `1bit npu-pack` imports every tensor of the pack -- the attention projections and
+//    their biases, the MLP projections and the final norm -- and produces a container the engine's own
+//    Model can open.
 
 #include "model.h"
 #include "pack.h"
@@ -656,6 +656,114 @@ void test_mlp_gu(const std::string& golden_dir) {
                 tiled.size() / onebit::npu::kTileBytes);
 }
 
+// ── the final norm out of the tail envelope, on a crafted pack (engine#844) ──────────────────
+// The real-pack leg only covers this where a pack is supplied, and three of the four packs on the
+// box ship no prefill program, so the import's tail-envelope read had no coverage in the default
+// CTest path. This builds the smallest pack that reaches it and checks the bytes that land in the
+// container -- plus the control: with the tail epsilon corrupted the norm must be refused, nothing
+// may be written without --allow-incomplete, and with it the omission must be recorded.
+void test_final_norm_envelope(const std::string& root) {
+    const fs::path dir = fs::path(root) / "final-norm";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    const int H = 128, L = 8;   // locate_fconst refuses fewer than 6 epsilon headers in the first GiB
+    const int64_t stride = 1 << 20;      // locate_fconst ignores periods below 1e6
+    const int64_t second = 262144;
+    const size_t unit = size_t(L * stride) + size_t(64) + size_t(H * 2);
+    std::string fc(unit, '\0');
+    auto put_eps = [&](int64_t off, unsigned short bits) {
+        fc[size_t(off)] = char(bits & 0xFF);
+        fc[size_t(off) + 1] = char(bits >> 8);
+    };
+    for (int l = 0; l < L; ++l) {
+        put_eps(int64_t(l) * stride, 0x3586);                 // the block header
+        put_eps(int64_t(l) * stride + second, 0x3586);        // the post-attention header
+    }
+    put_eps(int64_t(L) * stride, 0x3586);                     // the tail envelope
+    for (int i = 0; i < H; ++i) {                             // a recognisable norm: 1.0, 2.0, 3.0 ...
+        const uint16_t bits = pi::bf16_bits_of(float(i + 1));
+        fc[size_t(int64_t(L) * stride + 64 + 2 * i)] = char(bits & 0xFF);
+        fc[size_t(int64_t(L) * stride + 64 + 2 * i) + 1] = char(bits >> 8);
+    }
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":128,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06})");
+    // pb::tensor's default element type is f32, and the importer's over-read guard takes 4 B per element
+    // for anything that is not declared f32 (2 B), so the data is one f32 per element here.
+    put_file((dir / "model.onnx.data").string(), std::string(size_t(H) * size_t(H) * 4, '\x11'));
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {H, H}, "model.onnx.data", 0,
+                                   int64_t(H) * H * 4)}, {}));
+    const std::string tok = (dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string();
+    put_file(tok, fc);
+
+    const pi::FconstGeom geom = pi::locate_fconst(tok, 0x3586);
+    check(geom.stride == stride && geom.h1 == second,
+          "final norm: the crafted .fconst is locatable (stride " + std::to_string(geom.stride) +
+              (geom.why.empty() ? "" : ", why: " + geom.why) + ")");
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    const std::string out = (fs::temp_directory_path() /
+                             ("oga_pack_import_norm." + std::to_string(::getpid()))).string();
+    fs::remove_all(out);
+    const pi::Report r = pi::import_pack(dir.string(), out, allow);
+    check(r.final_norm_imported, "final norm: the crafted tail envelope yields model.norm.weight");
+    check(!r.prefill_tail_seen && !r.final_norm_crosscheck,
+          "final norm: with no prefill program the cross-check is unavailable, not failed");
+    if (r.final_norm_imported) {
+        onebit::npu::Model m(out);
+        const auto& t = m.tensor("model.norm.weight");
+        bool same = t.bytes >= size_t(H) * 2;
+        for (int i = 0; same && i < H; ++i) {
+            const uint16_t want = pi::bf16_bits_of(float(i + 1));
+            same = t.data[2 * i] == uint8_t(want & 0xFF) && t.data[2 * i + 1] == uint8_t(want >> 8);
+        }
+        check(same, "final norm: the container carries exactly the bf16 bytes at tail+64");
+    }
+    fs::remove_all(out);
+
+    // control: corrupt the tail epsilon -- the norm must be refused, and the refusal must be recorded
+    std::string bad = fc;
+    bad[size_t(int64_t(L) * stride)] = '\x28';
+    bad[size_t(int64_t(L) * stride) + 1] = '\x37';   // 1e-5, not this pack's 1e-6
+    put_file(tok, bad);
+    std::string refused_by_name = "0123456789";
+    bool wrote_anyway = false;
+    try {
+        const pi::Report r0 = pi::import_pack(dir.string(), out, pi::Options{});
+        wrote_anyway = fs::exists(out + "/model.q4nx");
+        (void)r0;
+    } catch (const std::exception&) {
+        wrote_anyway = fs::exists(out + "/model.q4nx");
+    }
+    check(!wrote_anyway, "final norm: a pack whose tail epsilon is missing writes nothing by default");
+    fs::remove_all(out);
+    const pi::Report rb = pi::import_pack(dir.string(), out, allow);
+    bool named = false;
+    for (const auto& s : rb.refused)
+        if (s.rfind("model.norm.weight", 0) == 0) named = true;
+    check(!rb.final_norm_imported && named,
+          "final norm: a missing tail epsilon refuses model.norm.weight by name");
+    // ... and the container it still writes must say so (the manifest merge, engine#842 review)
+    if (named && fs::exists(out + "/model.q4nx")) {
+        std::ifstream cf(out + "/model.q4nx", std::ios::binary);
+        uint64_t hlen = 0;
+        cf.read(reinterpret_cast<char*>(&hlen), 8);
+        std::string hdr(size_t(hlen), '\0');
+        cf.read(hdr.data(), std::streamsize(hlen));
+        while (!hdr.empty() && (hdr.back() == ' ' || hdr.back() == '\0')) hdr.pop_back();
+        const auto doc = json::parse(hdr);
+        bool listed = false;
+        for (const auto& e : doc.at("__metadata__").at("incomplete"))
+            if (e.is_string() && e.get<std::string>().rfind("model.norm.weight", 0) == 0) listed = true;
+        check(listed, "final norm: the incomplete container lists the refused final norm");
+    }
+    fs::remove_all(out);
+    fs::remove_all(dir);
+    std::printf("final norm: crafted tail envelope imported from tail+64, missing-epsilon control refused\n");
+}
+
 // A pack directory is only an OGA NPU pack if it ships the compiler's programs: `dd_metastate_*.fconst`.
 // The *hybrid* flavour of these packs (Qwen2.5-0.5B-Instruct_rai_1.8.0_hybrid) ships model.bin instead and
 // has no cache/ directory either -- it is a different on-disk layout, and the importer has nothing to read
@@ -699,7 +807,9 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     check(mlp == (p.mlp_note.empty() ? 0 : layers * 3),
           "pack: the " + std::to_string(layers * 3) + " MLP projections are planned when their geometry "
           "adds up and refused by name when it does not (" + std::to_string(mlp) + ")");
-    check(tail == 1, "pack: the final norm is the one refused norm (got " + std::to_string(tail) + ")");
+    // #844 imports the final norm, so it is no longer a refusal: the count is 0, and the tail envelope
+    // assertion below is what proves it was found.
+    check(tail == 0, "pack: the final norm is imported, not refused (got " + std::to_string(tail) + ")");
     check(attn == (p.attn_note.empty() ? 0 : layers * 7),
           "pack: attention projections are refused only when the payload does not tile (" +
               std::to_string(attn) + " of " + std::to_string(layers * 7) + ")");
@@ -729,7 +839,7 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find(".mlp.") != std::string::npos) ++mlp_planned;
     }
     check(norms == layers * 2 + 1,
-          "pack: 2 norms per layer plus the final norm are planned (the final one refused)");
+          "pack: 2 norms per layer plus the final norm are planned");
     check(p.attn_note.empty() ? attn_planned == layers * 4 : true,
           "pack: the 4 attention projections per layer are planned when the payload tiles (" +
               std::to_string(attn_planned) + ")");
@@ -742,15 +852,16 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
           "pack: lm_head tile count follows from its shape and the 256-column grid");
     if (qwen05b) check(lm_tiles_planned == (151936 / 32) * 4, "pack: 0.5B lm_head plans 4748 x 4 tiles");
 
-    // refusing must write nothing at all
+    // a fully representable pack imports without --allow-incomplete; a partial one writes nothing.
     // Per-process scratch dir: two concurrent runs of this binary (or two ctest shards) otherwise write
     // into the same directory and one dies with "cannot write .../model.q4nx" (measured 2026-11-03).
     const std::string out = (fs::temp_directory_path() /
                              ("oga_pack_import_test." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     const pi::Report r0 = pi::import_pack(pack, out, pi::Options{});
-    check(!r0.refused.empty() && !fs::exists(out + "/model.q4nx"),
-          "pack: the refusal writes no container");
+    check(refused.empty() ? (r0.refused.empty() && fs::exists(out + "/model.q4nx"))
+                          : (!r0.refused.empty() && !fs::exists(out + "/model.q4nx")),
+          "pack: without --allow-incomplete a container is written only when nothing is refused");
     fs::remove_all(out);
     if (golden_dir.empty()) { /* unreachable in practice */ }
 
@@ -851,6 +962,25 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
           "pack: lm_head tile count matches the container");
     check(m.tensor("model.layers.0.input_layernorm.weight").shape.at(0) == p.dims.hidden,
           "pack: a layer norm is `hidden` bf16 values, whatever the hidden size");
+    check(m.tensor("model.norm.weight").shape.at(0) == int64_t(p.dims.hidden),
+          "pack: the final norm is in the container");
+    // The final norm comes from the Token_Token tail -- the program this importer reads and the device
+    // runs. The Llm_Prefill duplicate is evidence about the PACK, not a gate on the import, so it is
+    // reported rather than asserted: on this box the 0.5B pack's prefill .fconst (rewritten
+    // 2026-11-03 15:10) disagrees with its Token copy in exactly one bf16 of this tensor, and three of
+    // the four packs ship no prefill program at all. Refusing the import over a duplicated copy made a
+    // complete pack unimportable, which is why this is a warning in the importer and a note here.
+    if (r.stride && !pack.empty()) {
+        bool has_prefill = false;
+        if (fs::is_directory(pack))
+            for (const auto& e : fs::directory_iterator(pack))
+                if (e.path().filename().string().rfind("dd_metastate_Llm_Prefill_", 0) == 0) has_prefill = true;
+        if (!has_prefill)
+            std::printf("note: no Llm_Prefill .fconst in this pack, so the norm cross-check is skipped\n");
+        else
+            std::printf("note: the pack's two norm copies %s\n",
+                        r.final_norm_crosscheck ? "agree" : "DISAGREE (reported; the Token copy is used)");
+    }
     if (r.attn_projections) {
         const auto& qw = m.tensor("model.layers.0.self_attn.q_proj.weight");
         check(qw.shape.at(1) == int64_t(onebit::npu::kTileBytes),
@@ -1038,6 +1168,7 @@ int main(int argc, char** argv) {
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_qwen3_attn_sections();
+        test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

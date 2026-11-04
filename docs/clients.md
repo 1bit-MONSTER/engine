@@ -60,7 +60,7 @@ name.
 ([#953](https://github.com/1bit-MONSTER/engine/pull/953)) the box announces itself over mDNS, so
 `http://1bit-os.local:13305` is a link a phone can click without reading an address off the console
 (`os/v3/puppy/embed/etc/init.d/18onboard-mdns:17-19`; the image refuses to pack without the responder or
-the `nsswitch` resolve line, `os/v3/puppy/container-build.sh:496,505`). The announced name is the box's
+the `nsswitch` resolve line, `os/v3/puppy/container-build.sh:508,517`). The announced name is the box's
 own hostname plus `.local` (`18onboard-mdns:58`), so it follows a rename. Two things can still leave you
 reading an address: the responder, and your LAN — the CONNECT block prints
 `name http://1bit-os.local:13305 (mDNS)` only while `avahi-daemon` is running and
@@ -214,7 +214,7 @@ only matters once the box is keyed (blank mode has no key to pass).
 |---|---|
 | the default | **no key** (cycle 20). `lemond` answers every `/api/*`, `/v0/*` and `/v1/*` request with no header — stock Lemonade — and it is reachable from the LAN by design (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62,78-81`). The console's CONNECT block says so in those words, `(no key: anyone, press 1)` |
 | turning it on | console **1 → Show the API key**: mints 48 hex into `/etc/1bit/lemond.conf` (`0600`, a symlink onto `/data`), restarts the service, prints it; run it again to turn it off. `prepare-stick --mint` does the offline half. From then on the key is the whole gate: every request needs it as a Bearer token, no key or a wrong key is **401** |
-| the web app's key | only the box's own page uses it, and `1bit-webapp-proxy` (the `127.0.0.1:8080` chat page) adds the header itself — a URL never carries the key, and a forward whose `Origin` is not that loopback page is refused before the key is attached (`os/v3/puppy/embed/usr/local/bin/1bit-webapp-proxy:37-44`) |
+| the web app's key | only the box's own page uses it, and `1bit-webapp-proxy` (the `127.0.0.1:8080` chat page) adds the header itself — a URL never carries the key, and a forward whose `Origin` is not that loopback page is refused before the key is attached (`os/v3/puppy/embed/usr/local/bin/1bit-webapp-proxy:45-49,74-77`) |
 | network | the appliance opens **13305** (Lemonade) and **22** (SSH) in its firewall, and allows the RFC1918 ranges through `/etc/hosts.allow`; everything else inbound is dropped. It is a LAN service, keyed or not |
 | never | forward 13305 from your router to the internet. If you need it from outside, use a VPN, or an HTTPS reverse proxy in front of it — and turn a key on first. Lemonade's own [FAQ](https://lemonade-server.ai/docs/guide/faq/) says the same |
 | SSH | keys only: `/data/ssh/authorized_keys` on the stick is copied to `/root/.ssh/authorized_keys` at boot. `prepare-stick --ssh-pubkey` writes it |

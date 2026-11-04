@@ -40,6 +40,24 @@ skip() {
     case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
+# A row that holds the NPU can hold it for a minute or two (a fresh backend per ladder rung, a 512-token turn),
+# and on the owner's console that is indistinguishable from a hung check - which is what the board operator
+# reported. So each NPU row announces itself before it starts. Not a row: the prefix is `info` so a harness that
+# greps PASS/FAIL/SKIP is unaffected, and ROWS does not move.
+# The GUI banner the brief also asked for ("if cheap") is not cheap (a status endpoint plus a poller), so the
+# console line is what ships and the hand-off says the banner did not.
+# Two guards are pi-release's, from their npu-console-notice row, and both are measured facts rather than caution:
+# an X session owning the VT is graphics mode, where a text write corrupts what the person sees (the appliance can
+# have a desktop session - the u2-desktop-session row exists for exactly that), and a headless boot may have no
+# writable tty1 at all, so /dev/console is the fallback. Nothing here can fail a row.
+npu_note() {  # <row>
+    [ -e /tmp/.X11-unix/X0 ] && return 0
+    for _d in /dev/tty1 /dev/console; do
+        [ -c "$_d" ] && [ -w "$_d" ] || continue
+        printf '\n1bit-release-check: %s is holding the NPU (this can take a minute)\n' "$1" > "$_d" 2>/dev/null && break
+    done
+    say "info  $1 : holding the NPU (this can take a minute)"
+}
 # Every fetch is capped. Without that, a Lemonade that accepts the connection and never answers hangs
 # the whole check with no output - measured on the release candidate: 1bit-release-check sat in the
 # lemonade row until an external 20-minute limit killed the run, which on the owner's console would
@@ -265,6 +283,7 @@ json_str() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0
 # two characters JSON escapes. Used to replay the long turn's own answer as the follow-up's history,
 # as the web page does.
 json_text() { printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
 
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
@@ -747,6 +766,7 @@ fi
 NPU=$(listed '[^"]*-1bit' | grep -i 'npu' | head -1)
 [ -n "$NPU" ] || NPU=$(pick '[^"]*-NPU-1bit')
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    npu_note chat-npu
     chat "$NPU"
     if [ -n "$TPS" ]; then pass chat-npu "$NPU (onebit, NPU) answered \"$ANSWER\" at ${TPS} tok/s"
     else fail chat-npu "$NPU (onebit, NPU) did not answer ($ANSWER)"; fi
@@ -777,6 +797,7 @@ tdr_count() {  # the kernel's TDR lines so far; empty when the kernel log cannot
     return 0
 }
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    npu_note chat-npu-followup
     TDR0=$(tdr_count)
     Q_LONG='/no_think Explain in detail how tides work: the moon and the sun, the shape of ocean basins, why some coasts have two high tides a day and others one, and what an amphidromic point is'
     _post() {  # <json body> -> the reply
@@ -819,6 +840,7 @@ fi
 # 28", inside two 200s, while every row above stayed green - and the same boot logged one amdxdna TDR. So a
 # 200 is not evidence here: the body is read (stream_verdict) and the kernel log is counted.
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    npu_note chat-npu-stream
     TDRS0=$(tdr_count)
     _stream() {  # <json body> -> the whole SSE body
         got_slow --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
@@ -854,6 +876,7 @@ fi
 # now ships `options amdxdna tdr_timeout_ms=15000`, so the same ladder has to answer at 1000 with no new TDR line.
 # The model is unloaded before every step: a warm context would let one step hide the next.
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    npu_note chat-npu-ladder
     TDRL0=$(tdr_count)
     TDRL1=$TDRL0
     LAD_OK=
@@ -886,6 +909,7 @@ elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
 else
     skip chat-npu-ladder "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
+
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────
 BENCH=$LEMDIR/bin/lemonade

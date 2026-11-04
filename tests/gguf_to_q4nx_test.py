@@ -302,9 +302,104 @@ def q8_check(gguf_path, out, ok):
     return ok
 
 
+def dense_3d_gguf(path, rng):
+    """A qwen3 GGUF carrying one 3-D tensor under a DENSE name (a conv/SSM-style weight).
+
+    ggml stores it as [K, N, C]; nothing about it is a routed expert stack. `planned()` used to
+    decide "expert-tiles" from the rank alone, so this tensor was decomposed into C "experts" of
+    N rows -- and because __metadata__.moe is only written for qwen3moe, the container then held
+    a reshaped conv kernel as a dense 1024x256 matrix with no error, no metadata and a `verify`
+    that agrees with it (verify() calls planned() too, so it checks the same wrong shape).
+    """
+    H, IM, NH, NKV, HD, V, C = 256, 512, 2, 1, 128, 512, 4
+    w = gguf.GGUFWriter(path, "qwen3")
+    w.add_block_count(1)
+    w.add_context_length(4096)
+    w.add_embedding_length(H)
+    w.add_feed_forward_length(IM)
+    w.add_head_count(NH)
+    w.add_head_count_kv(NKV)
+    w.add_key_length(HD)
+    w.add_value_length(HD)
+    w.add_rope_freq_base(1e6)
+    w.add_layer_norm_rms_eps(1e-6)
+    w.add_eos_token_id(1)
+    w.add_tensor("token_embd.weight",
+                 gguf.quants.quantize(rng.standard_normal((V, H)).astype(np.float32) * 0.05, Q.Q8_0),
+                 raw_dtype=Q.Q8_0)
+    for n in ("output_norm", "blk.0.attn_norm", "blk.0.ffn_norm"):
+        w.add_tensor(f"{n}.weight", rng.standard_normal(H).astype(np.float32))
+    # numpy shape is the reverse of the ggml shape the reader reports, so this is [K=256, N=256, C=4]
+    w.add_tensor("blk.0.attn_q.weight",
+                 rng.standard_normal((C, NH * HD, H)).astype(np.float32) * 0.05, raw_dtype=Q.F32)
+    for name, N, K in (("blk.0.attn_k.weight", NKV * HD, H), ("blk.0.attn_v.weight", NKV * HD, H),
+                       ("blk.0.attn_output.weight", H, NH * HD), ("blk.0.ffn_gate.weight", IM, H),
+                       ("blk.0.ffn_up.weight", IM, H), ("blk.0.ffn_down.weight", H, IM)):
+        x = rng.standard_normal((N, K)).astype(np.float32) * 0.05
+        w.add_tensor(name, gguf.quants.quantize(x, Q.Q4_1), raw_dtype=Q.Q4_1)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+class _T:
+    """The three attributes planned() reads from a GGUFReader tensor."""
+
+    def __init__(self, name, shape):
+        self.name, self.shape = name, shape
+
+
+class _R:
+    def __init__(self, tensors):
+        self.tensors = tensors
+
+
+def expert_kind_check(ok):
+    """A 3-D tensor that is not a routed expert stack is refused by name, not packed as one."""
+    # the predicate itself, on the two shapes that must stay apart
+    kinds = {n: k for n, _t, k in G.planned(_R([
+        _T("token_embd.weight", (512, 256)),
+        _T("blk.0.ffn_gate_exps.weight", (256, 512, 4)),   # a real routed stack: [K, N, E]
+        _T("blk.0.ffn_up.weight", (256, 512)),             # a dense projection
+    ]))}
+    checks = [('a 3-D blk.N.ffn_gate_exps stack is kind "expert-tiles"',
+               kinds["model.layers.0.mlp.experts.gate_proj.weight"] == "expert-tiles"),
+              ('a 2-D blk.N.ffn_up is kind "tiles" (not over-refused)',
+               kinds["model.layers.0.mlp.up_proj.weight"] == "tiles")]
+    try:
+        G.planned(_R([_T("token_embd.weight", (512, 256)), _T("blk.0.attn_q.weight", (256, 256, 4))]))
+        checks.append(("a 3-D dense blk.N.attn_q is refused", False))
+    except SystemExit as e:
+        msg = str(e)
+        checks.append(("a 3-D dense blk.N.attn_q is refused", "blk.0.attn_q.weight" in msg))
+        checks.append((f'... and says why ("not a routed expert stack")',
+                       "not a routed expert stack" in msg))
+    for label, good in checks:
+        print(f"{'ok  ' if good else 'FAIL'} {label}")
+        ok = ok and good
+    return ok
+
+
+def dense_3d_pack_check(gguf_path, out, ok):
+    """The same thing end to end: the pack exits non-zero instead of writing a wrong container."""
+    tool = os.path.join(HERE, "..", "tools", "gguf_to_q4nx.py")
+    r = subprocess.run([sys.executable, tool, "pack", gguf_path, out], capture_output=True, text=True)
+    good = r.returncode != 0 and "blk.0.attn_q.weight" in (r.stderr + r.stdout)
+    print(f"{'ok  ' if good else 'FAIL'} packing a 3-D dense tensor exits non-zero and names it "
+          f"(rc {r.returncode})")
+    if not good:
+        print(r.stdout[-800:], r.stderr[-800:])
+    # and nothing half-written was left pretending to be a container
+    left = os.path.exists(os.path.join(out, "model.q4nx"))
+    print(f"{'ok  ' if not left else 'FAIL'} no model.q4nx was written for it")
+    return ok and good and not left
+
+
 def main():
     ok = golden_tile()
     ok = golden_tile8() and ok
+    ok = expert_kind_check(ok)
     rng = np.random.default_rng(1)
     tool = os.path.join(HERE, "..", "tools", "gguf_to_q4nx.py")
     with tempfile.TemporaryDirectory() as d:
@@ -340,6 +435,8 @@ def main():
                 print(f"FAIL moe-q8 {cmd[0]} exited {r.returncode}")
                 ok = False
         ok = moe_check(os.path.join(d, "tiny-moe.gguf"), mq8, ok)
+        dense_3d_gguf(os.path.join(d, "dense3d.gguf"), rng)
+        ok = dense_3d_pack_check(os.path.join(d, "dense3d.gguf"), os.path.join(d, "dense3d"), ok)
         ok = tokenizer_flags_check(src, out, ok)
         q8out, q8gguf = os.path.join(d, "q8"), os.path.join(d, "q8.gguf")
         for cmd in (["pack", src, q8out, "--dtype8", "o_proj|up_proj|v_proj"],

@@ -595,9 +595,10 @@ not a whole number of tiles of that hidden size, or whose q/k/v/o row counts do 
 measured tile count, is refused by name with the numbers (`npu-pack info` reports the measurement).
 
 **The section is not always one uniform run** (engine#979). The Qwen3 packs carry *four* epsilon
-headers per layer block instead of two, and the three sections between them are `[q, k, v tiles at
-K = hidden]`, `[64-byte header + k_norm, bf16 [head_dim]]`, `[64-byte header + q_norm, bf16
-[head_dim]]` followed by **o_proj's tiles at K = q_proj's output width** — the pack declares
+headers per layer block instead of two, and the three sections between them are `[k, q, v tiles at
+K = hidden]` (k first — the order the pack's own biases identified on the 0.5B), then `[64-byte
+header + k_norm, bf16 [head_dim]]`, then `[64-byte header + q_norm, bf16 [head_dim]]` followed by
+**o_proj's tiles at K = q_proj's output width** — the pack declares
 `o_proj N=2560 K=4096` on Qwen3-4B, where hidden is 2,560. So o_proj needs its own payload offset
 and its own K, and the two per-head gains are ordinary bf16 `[head_dim]` RMSNorm weights (Qwen3's
 are `[128]`, i.e. 256 B, which is why the section between them is 320 B on both packs although

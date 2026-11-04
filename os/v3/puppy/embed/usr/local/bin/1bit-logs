@@ -46,7 +46,16 @@ say() { printf '%s\n' "$*"; }
 # (05onboard-data mkdirs it before mounting), so a missing mount would put the "persisted" log on the RAM-backed
 # root instead, and nothing would say so. Measured 4 Nov (TOS3-NOTE-c21-logs): four of five boots kept no log on the
 # partition and nothing was logged anywhere.
-mounted() { grep -q " $DATA " /proc/mounts 2> /dev/null; }
+#
+# The path is made canonical first, because /proc/mounts records the mount point the kernel was given: in this
+# image /tmp is a symlink to /initrd/mnt/tmpfs/tmp, so a tmpfs mounted at /tmp/x appears there as
+# /initrd/mnt/tmpfs/tmp/x and a literal compare would call a mounted directory unmounted (measured in the guest,
+# 4 Nov: `findmnt` showed the mount, the string match found nothing, and the daemon waited for ever).
+mounted() {
+    real=$(readlink -f "$DATA" 2> /dev/null) || return 1
+    [ -n "$real" ] || return 1
+    grep -q " $real " /proc/mounts 2> /dev/null
+}
 
 # The id has to be stable within one boot and different across boots, and it must not need a clock read on every
 # call (the daemon and every snap would otherwise name a different directory). /proc/sys/kernel/random/boot_id is

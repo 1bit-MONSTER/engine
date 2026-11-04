@@ -31,10 +31,16 @@ type gets there:
   Q4_K   w = d*sc*q - dmin*mn    scale d*sc, zero -dmin*mn per 32-column sub-block; codes
                                  unchanged (a Q4_K super-block is one tile row's 256 columns)
   other  (Q5_K, Q6_K, Q8_0, F16, BF16, F32) dequantized, then quantized to q4_1 per group
-         (min/max): lossy
+         (min/max): lossy -- or to Q8 tiles (I8 [tiles, 8704]: bf16 scale per row and
+         32-column group, int8 codes) when the tensor's Q4NX name matches --dtype8
 
 The first three are exact apart from rounding scale and zero to bf16 (nearest even);
 verify checks every tensor against that bound and reports the error of the lossy ones.
+--dtype8 exists because q4_1 spends 4 bits of every 32-value group on a min and only has
+16 levels: a tensor that was Q6_K or Q8_0 in the source (typically v_proj, down_proj and
+an untied lm_head) is strictly worse *and* bigger after the crush, so naming it keeps it at
+8 bits for 8.5 bits/weight instead of 5 (e.g. --dtype8 'v_proj|down_proj'). Default is
+today's behaviour, so no existing container changes.
 Norms, the embedding and the router are stored as bf16. A tied lm_head (no output.weight)
 is made from token_embd.
 
@@ -53,6 +59,7 @@ Supported architectures: qwen3, qwen3moe and qwen2. Needs numpy and gguf (gguf-p
 import argparse
 import json
 import os
+import re
 import shutil
 import struct
 import sys
@@ -61,8 +68,8 @@ import numpy as np
 import gguf
 from gguf.quants import dequantize
 
-from q4nx_pack import (COLS, GROUP, ROWS, TILE, bf16_bits, f16, from_bf16,  # noqa: F401
-                       quantize_q4_1, tiles, untile)
+from q4nx_pack import (COLS, GROUP, Q8, ROWS, TILE, bf16_bits, f16, from_bf16,  # noqa: F401
+                       quantize_q4_1, quantize_q8, tiles, tiles_q8, untile, untile_q8)
 
 
 # --- GGUF blocks -> (codes [N, K] u8, scale [N, K/32] f32, zero [N, K/32] f32), exact ---
@@ -196,6 +203,18 @@ def config(r, vocab):
         "hidden_act": "silu",
         "q4nx_source": {"converter": "tools/gguf_to_q4nx.py"},
     }
+    # The tokenizer's add_bos/add_eos flags are part of the prompt, not decoration.
+    # app/forward_serve.cpp reads config.json's add_bos_token ("the rendered chat prompt needs
+    # BOS") and defaults to 0 when the key is absent, so a checkpoint whose tokenizer_config.json
+    # sets add_bos_token: true is served chat prompts with NO BOS.  Measured on Zyphra/ZR1-1.5B
+    # (a Qwen2 fine-tune): the GGUF's metadata says true, the container's config.json was silent,
+    # and the forward built a 5-token prompt where llama.cpp built 6 -- its reply opened with the
+    # end-of-turn token.  Carry both flags through while the GGUF still has them.
+    for gguf_key, hf_key in (("tokenizer.ggml.add_bos_token", "add_bos_token"),
+                             ("tokenizer.ggml.add_eos_token", "add_eos_token")):
+        flag = field(r, gguf_key)
+        if flag is not None:
+            c[hf_key] = bool(flag)
     if arch == "qwen2":
         # qwen2 differs from qwen3 in exactly two attention ways: no per-head q/k
         # RMSNorm, and q/k/v projection bias.  Both are declared here so a consumer
@@ -250,30 +269,36 @@ def grid(rows, cols):
     return rows // ROWS, cols // COLS
 
 
-def blob_shape(t, kind):
+def blob_shape(t, kind, chunk=TILE):
     """The shape the container records for this tensor's data."""
     if kind == "bf16":
         return [int(t.shape[1]), int(t.shape[0])] if len(t.shape) == 2 else [int(np.prod(t.shape))]
     K, N = int(t.shape[0]), int(t.shape[1])
     rows, cols = (N * int(t.shape[2]), K) if kind == "expert-tiles" else (N, K)
     rt, kt = grid(rows, cols)
-    return [rt, kt, TILE]
+    return [rt, kt, chunk]
 
 
-def blob_bytes(t, kind):
-    return int(np.prod(blob_shape(t, kind))) * (2 if kind == "bf16" else 1)
+def blob_bytes(t, kind, chunk=TILE):
+    return int(np.prod(blob_shape(t, kind, chunk))) * (2 if kind == "bf16" else 1)
 
 
-def encode(t, kind):
+def encode(t, kind, chunk=TILE):
     """One tensor's container bytes, and whether the conversion was exact."""
     if kind == "bf16":
         w = dequantize(t.data, t.tensor_type).astype(np.float32)
         return np.ascontiguousarray(bf16_bits(w if w.ndim == 2 else w.reshape(-1))).tobytes(), True
-    codes, scale, zero, exact = to_q4_1(t)
-    data = tiles(codes, scale, zero)
+    if chunk == Q8:
+        K, n = int(t.shape[0]), int(t.shape[1])
+        n *= int(t.shape[2]) if len(t.shape) == 3 else 1  # expert-major rows, as to_q4_1
+        codes, scale = quantize_q8(dequantize(t.data, t.tensor_type).astype(np.float32).reshape(n, K))
+        data, exact = tiles_q8(codes, scale), False
+    else:
+        codes, scale, zero, exact = to_q4_1(t)
+        data = tiles(codes, scale, zero)
     if kind == "expert-tiles":
         rt, kt = grid(int(t.shape[1]), int(t.shape[0]))
-        data = data.reshape(int(t.shape[2]) * rt, kt, TILE)
+        data = data.reshape(int(t.shape[2]) * rt, kt, chunk)
     return np.ascontiguousarray(data).tobytes(), exact
 
 
@@ -286,7 +311,8 @@ def moe_meta(r, items, table):
             continue
         K, N, E = int(t.shape[0]), int(t.shape[1]), int(t.shape[2])
         rt, kt = grid(N, K)
-        chunk = rt * kt * TILE
+        # The chunk kind is in the table already (5120 for q4_1, 8704 for a --dtype8 stack).
+        chunk = rt * kt * table[name]["shape"][-1]
         lo, hi = table[name]["data_offsets"]
         if hi - lo != E * chunk:
             raise SystemExit(f"{name}: expert stack does not fill its blob")
@@ -308,18 +334,35 @@ def pack(args):
     r = gguf.GGUFReader(args.gguf)
     os.makedirs(args.out, exist_ok=True)
     items = planned(r)
+    # --dtype8 names tensors to store as Q8 chunks instead of q4_1. Selection is by Q4NX name,
+    # so one pattern covers every layer; the router and the bf16 tensors are never affected, and
+    # neither is a tensor the source already held at 4 bits (Q4_K_M mixes types layer by layer:
+    # an exact Q4_K tensor has nothing to gain from 8 bits and only grows).
+    pattern = re.compile(args.dtype8) if args.dtype8 else None
+    chunk = {}
+    for name, t, kind in items:
+        q8 = bool(pattern and kind != "bf16" and pattern.search(name))
+        if q8 and t.tensor_type in EXACT:
+            print(f"{name:52s} {t.tensor_type.name:5s} -> q4_1 (named by --dtype8, already exact "
+                  "at 4 bits)", flush=True)
+            q8 = False
+        chunk[name] = Q8 if q8 else TILE
     # Every blob's size follows from its shape, so the table (and so the header) is written
     # before any weight is converted and the data is streamed to its offset in one pass: a 30B
     # expert stack does not fit in memory as a list of blobs.
     table, off = {}, 0
     for name, t, kind in items:
         off += (-off) % 64
-        n = blob_bytes(t, kind)
+        n = blob_bytes(t, kind, chunk[name])
         table[name] = {"dtype": "BF16" if kind == "bf16" else "I8",
-                       "shape": blob_shape(t, kind), "data_offsets": [off, off + n]}
+                       "shape": blob_shape(t, kind, chunk[name]), "data_offsets": [off, off + n]}
         off += n
     meta = {"format": "q4nx", "source": os.path.basename(args.gguf),
             "converter": "tools/gguf_to_q4nx.py"}
+    if args.dtype8:
+        # The chunk kinds are already in every tensor's shape; the pattern is recorded so a
+        # round trip (tools/q4nx_to_gguf.py verify --roundtrip) re-packs the same container.
+        meta["dtype8"] = args.dtype8
     if field(r, "general.architecture") == "qwen3moe":
         meta["moe"] = moe_meta(r, items, table)
     table["__metadata__"] = meta
@@ -331,13 +374,14 @@ def pack(args):
         f.write(header)
         f.truncate(8 + len(header) + off)  # sparse: the 64-byte pads stay zero
         for name, t, kind in items:
-            data, exact = encode(t, kind)
+            data, exact = encode(t, kind, chunk[name])
             lo, hi = table[name]["data_offsets"]
             if len(data) != hi - lo:
                 raise SystemExit(f"{name}: wrote {len(data)} B, the table says {hi - lo} B")
             f.seek(8 + len(header) + lo)
             f.write(data)
-            how = "bf16" if kind == "bf16" else ("exact" if exact else "requantized")
+            how = "bf16" if kind == "bf16" else (
+                "Q8 int8" if chunk[name] == Q8 else ("exact" if exact else "requantized"))
             if kind == "expert-tiles":
                 how += f" {int(t.shape[2])} experts"
             print(f"{name:52s} {t.tensor_type.name:5s} -> {table[name]['dtype']} "
@@ -396,7 +440,11 @@ def verify(args):
             K, N = int(t.shape[0]), int(t.shape[1])
             E = int(t.shape[2]) if kind == "expert-tiles" else 1
             rt, kt = grid(N, K)
-            tiles_e = raw.reshape(E, rt * kt, TILE)
+            # A Q8 tensor's chunk is 8704 B and its codes are symmetric int8, so the q4_1 bound
+            # below does not apply: check against 0.5 * the group scale the codes were rounded
+            # with, plus the bf16 rounding of the stored scale (<= 127 * |d_bf16 - d|).
+            q8 = int(hdr[name]["shape"][-1]) == Q8
+            tiles_e = raw.reshape(E, rt * kt, Q8 if q8 else TILE)
             ref = ref.reshape(E, N, K)
             exact = t.tensor_type in EXACT
             codes, scale, zero = (None, None, None)
@@ -407,6 +455,20 @@ def verify(args):
             over, worst, worstb = 0, 0.0, 0.0
             gse = rsse = dot = 0.0
             for e in range(E):
+                if q8:
+                    got = untile_q8(tiles_e[e], N, K).astype(np.float64)
+                    err = np.abs(got - ref[e]).reshape(N, K // 32, 32)
+                    se = np.abs(ref[e]).reshape(N, K // 32, 32).max(-1) / 127.0
+                    d_bf = from_bf16(bf16_bits(se)).astype(np.float64)
+                    eps = np.spacing(np.abs(ref[e]).astype(np.float32)).reshape(N, K // 32, 32)
+                    bound = (0.5 * se + 127.0 * np.abs(d_bf - se))[..., None] + eps
+                    over += int((err > bound).sum())
+                    worst = max(worst, float(err.max()))
+                    worstb = max(worstb, float(bound.max()))
+                    gse += float((got * got).sum())
+                    rsse += float((ref[e] * ref[e]).sum())
+                    dot += float((got * ref[e]).sum())
+                    continue
                 got = untile(tiles_e[e], N, K).astype(np.float64)
                 err = np.abs(got - ref[e])
                 worst = max(worst, float(err.max()))
@@ -424,7 +486,13 @@ def verify(args):
                     gse += float((got * got).sum())
                     rsse += float((ref[e] * ref[e]).sum())
                     dot += float((got * ref[e]).sum())
-            if exact:
+            if q8:
+                rel = float(np.sqrt(max(gse + rsse - 2 * dot, 0.0) / max(rsse, 1e-30)))
+                cos = float(dot / np.sqrt(max(gse * rsse, 1e-30)))
+                ok = over == 0 and cos > 0.99
+                note = (f"Q8 int8: max err {worst:.3g} (bound {worstb:.3g}), {over} over, "
+                        f"rel rms err {rel:.4f}, cos {cos:.6f}")
+            elif exact:
                 ok = over == 0
                 note = (f"exact to bf16 scales: max err {worst:.3g} (bound {worstb:.3g}), "
                         f"{over} over")
@@ -454,6 +522,11 @@ def main():
                         "row-major, matches every container before this) or b8 (blocked "
                         "8x8 microtiles, needs the _b8 kernel family, streams 2.4-2.6x faster "
                         "with a bit-identical result)")
+    a.add_argument("--dtype8", metavar="REGEX",
+                   help="store the tensors whose Q4NX name matches REGEX as Q8 chunks (int8 "
+                        "codes, bf16 scale) instead of requantizing them to q4_1, e.g. "
+                        "'v_proj|down_proj'; meant for the tensors the source never had at "
+                        "4 bits, so an exactly-4-bit source is left alone")
     b = sub.add_parser("verify")
     b.add_argument("gguf")
     b.add_argument("out")

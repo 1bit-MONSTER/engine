@@ -273,6 +273,23 @@ set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 # the EP roster this binary actually has) and links onnx/, which also builds libonebit_ep.so.
 option(ONEBIT_ORT "Link ONNX Runtime 1.23.2 in-process (1bit ort-info + the plugin EP)" OFF)
 
+# ── the ONNX EP's NPU leg compiles and links without ORT, the device or the runtime (#874) ───────
+# npu/ort/onebit_npu_gemm.cpp is built only by onnx/ep when ONEBIT_EP_NPU=ON, and that needs ONNX
+# Runtime *and* the private NPU runtime -- so no configuration CI has ever built it, and #874 (a call
+# to q4nx_elf_arg_sizes with no declaration, then the file defining it missing from the link) was
+# green for a week. This target compiles onnx/ep's own source list (onnx/ep/npu_sources.cmake, the
+# list the EP builds) and links it against onnx/ep/npu_runtime_ci_stub.cpp instead of the private
+# runtime, so a broken leg turns the `build` job red. `onebit` depends on it because that is the
+# target the CI build step names; nothing here is linked into `onebit` or into libonebit_ep.so.
+if(NOT WIN32 AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/onnx/ep/npu_sources.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/onnx/ep/npu_sources.cmake)
+    add_executable(onebit_ep_npu_linkcheck ${ONEBIT_EP_NPU_COMMON_SRC}
+        onnx/ep/npu_runtime_ci_stub.cpp onnx/ep/npu_linkcheck.cpp)
+    target_include_directories(onebit_ep_npu_linkcheck PRIVATE ${ONEBIT_EP_NPU_COMMON_INCS})
+    target_compile_definitions(onebit_ep_npu_linkcheck PRIVATE ${ONEBIT_EP_NPU_COMMON_DEFS})
+    add_dependencies(onebit onebit_ep_npu_linkcheck)
+endif()
+
 # ── Step 2: HRX, the engine's GPU route (docs/hrx.md) ─────────────────────
 # Off by default: it needs TheRock/ROCm and the HRX submodules, and it only runs on AMD GPUs.
 # `1bit serve --device hrx` (and auto for a .gguf) then uses this llama-server on HRX0, and
@@ -377,6 +394,16 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(onebit_npu_forward_syntax PRIVATE OpenMP::OpenMP_CXX)
 endif()
 add_dependencies(onebit onebit_npu_forward_syntax)
+
+# What one MTP head step costs on the HOST (tools/mtp_head_bench.cpp).  The draft route's per-iteration cost is two
+# base passes plus the drafter's logits calls (both on the array) and the head's own arithmetic (this host), so this
+# is the only term measurable without the device -- and the term a maths change has to be stated on.  It also prints
+# a hash of every output hidden, so "no number moves" is checked bit for bit instead of argued.
+add_executable(mtp_head_bench tools/mtp_head_bench.cpp npu/mtp/mtp_head.cpp)
+target_include_directories(mtp_head_bench PRIVATE npu)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(mtp_head_bench PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 # ── MoE expert streaming (docs/moe-streaming.md) ─────────────────────────
 # The routed-expert cache: pinned RAM slots filled with O_DIRECT reads, and
@@ -541,6 +568,17 @@ add_test(NAME npu_chatml COMMAND npu_chatml_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_chatml_test)
+
+# `forward-serve`'s /v1/completions prompt as text or as the caller's exact token ids (app/npu_prompt_ids.h):
+# the acceptance rules and the refusals that keep an out-of-vocabulary id from reaching the embedding
+# lookup.  Device-free, model-free.
+add_executable(npu_prompt_ids_test tests/npu_prompt_ids_test.cpp)
+target_include_directories(npu_prompt_ids_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(npu_prompt_ids_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_prompt_ids COMMAND npu_prompt_ids_test)
+# Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
+# target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
+add_dependencies(npu_sampling_test npu_prompt_ids_test)
 
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.

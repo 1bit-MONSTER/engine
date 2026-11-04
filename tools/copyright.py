@@ -68,7 +68,10 @@ EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*",
           "os/v3/puppy/embed/etc/timezone",
           # os/v3 Puppy image, cycle 15: the appliance's hostname is one word and is read verbatim by
           # hostname(1), rc.sysinit and /etc/hosts - a comment line would BE the hostname
-          "os/v3/puppy/embed/etc/hostname"]
+          "os/v3/puppy/embed/etc/hostname",
+          # os/v3 Puppy image, cycle 18: the console TUI's rendered frames ARE the regression fixtures - a notice
+          # line in one would change the frame it exists to freeze
+          "os/v3/puppy/console-tui/tests/snapshots/*.txt"]
 
 
 def _match(name, patterns):

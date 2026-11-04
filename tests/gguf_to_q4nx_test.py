@@ -38,6 +38,10 @@ import gguf_to_q4nx as G  # noqa: E402
 
 Q = gguf.GGMLQuantizationType
 GOLDEN_Q4_1 = "9f58d4201c4844abc937204c2b7f8d364ff44bc574b0bb87292928c54447d2c8"
+# one real Q8 tile (Qwen3.5-4B lm_head tile 0), hashed by the same test as npu/q4nx.cpp: this is
+# the layout check that a self-inverse round trip cannot make, because our encoder and decoder
+# could agree with each other and still disagree with the container a device serves.
+GOLDEN_Q8 = "09ad9e7a61cad612ffcb9cc2a1d7dfd27b6813a6d184329404045d4691c5fdf2"
 
 
 def golden_tile():
@@ -52,6 +56,22 @@ def golden_tile():
     again = G.tiles(codes.reshape(32, 256).astype(np.uint8), sc, zr)
     same = again.tobytes() == tile.tobytes()
     print(f"{'ok  ' if same else 'FAIL'} golden q4_1 tile re-encodes to the same bytes")
+    return ok and same
+
+
+def golden_tile8():
+    """The committed real Q8 tile: decoded by our decoder, and re-encoded by our encoder."""
+    tile = np.fromfile(os.path.join(HERE, "golden", "q4nx", "q8.bin"), dtype=np.uint8)
+    assert tile.size == G.Q8, f"q8.bin is {tile.size} B"
+    w = G.untile_q8(tile.reshape(1, G.Q8), 32, 256).astype(np.float32)
+    ok = hashlib.sha256(w.tobytes()).hexdigest() == GOLDEN_Q8
+    print(f"{'ok  ' if ok else 'FAIL'} golden q8 tile decodes to the verified SHA-256")
+    # its parts, back through the writer (scale plane is [g, r]; tiles_q8 wants [r, g])
+    sc = G.from_bf16(tile[:512].view(np.uint16)).reshape(8, 32).T
+    codes = np.clip(np.rint(w.reshape(32, 8, 32) / np.where(sc == 0, 1, sc)[..., None]), -127, 127)
+    again = G.tiles_q8(codes.reshape(32, 256).astype(np.int8), sc)
+    same = again.tobytes() == tile.tobytes()
+    print(f"{'ok  ' if same else 'FAIL'} golden q8 tile re-encodes to the same bytes")
     return ok and same
 
 
@@ -78,6 +98,11 @@ def synthetic(path, rng):
     w.add_rope_freq_base(1e6)
     w.add_layer_norm_rms_eps(1e-6)
     w.add_eos_token_id(1)
+    # The two flags app/forward_serve.cpp builds the prompt from; add_bos_token is the one a
+    # qwen2 checkpoint can set to true (Zyphra/ZR1-1.5B does) and the packer has to carry.
+    w.add_bos_token_id(2)
+    w.add_add_bos_token(True)
+    w.add_add_eos_token(False)
 
     def quant(name, N, K, qt):
         x = rng.standard_normal((N, K)).astype(np.float32) * 0.05
@@ -195,17 +220,82 @@ def moe_check(gguf_path, out, ok):
 
     r = gguf.GGUFReader(gguf_path)
     for name, key in ((gate, "blk.0.ffn_gate_exps.weight"),
+                      ("model.layers.0.mlp.experts.up_proj.weight", "blk.0.ffn_up_exps.weight"),
                       ("model.layers.0.mlp.experts.down_proj.weight", "blk.0.ffn_down_exps.weight")):
         t = next(t for t in r.tensors if t.name == key)
         K, N = int(t.shape[0]), int(t.shape[1])
         ref = gguf.quants.dequantize(t.data, t.tensor_type).astype(np.float64).reshape(4, N, K)
         info = moe["tensors"][name]
-        bad = 0
+        chunk = hdr[name]["shape"][-1]  # 5120, or 8704 for a --dtype8 stack
+        worst = 0.0
         for e in range(4):
             lo = base + info["offsets"][e]
-            got = G.untile(np.asarray(mm[lo:lo + info["bytes"]]).reshape(-1, G.TILE), N, K)
-            bad += int((np.abs(got - ref[e]) > 1e-2).sum())
-        checks.append((f"each of {name}'s 4 offsets decodes to THAT expert", bad == 0))
+            tiles = np.asarray(mm[lo:lo + info["bytes"]]).reshape(-1, chunk)
+            got = (G.untile_q8(tiles, N, K) if chunk == G.Q8 else G.untile(tiles, N, K))
+            # A wrong offset points at another expert (rel rms ~sqrt(2)); the right one is within
+            # the chunk's own quantisation error (0.08 for q4_1, 0.005 for Q8), so compare
+            # distributions rather than a max.
+            rel = float(np.sqrt(((got - ref[e]) ** 2).sum() / (ref[e] ** 2).sum()))
+            worst = max(worst, rel)
+        checks.append((f"each of {name}'s 4 offsets decodes to THAT expert "
+                       f"({'Q8' if chunk == G.Q8 else 'q4_1'} chunk, rel rms {worst:.4f})",
+                       worst <= 0.15))
+    for label, good in checks:
+        print(f"{'ok  ' if good else 'FAIL'} {label}")
+        ok = ok and good
+    return ok
+
+
+def tokenizer_flags_check(src, out, ok):
+    """config.json must carry the tokenizer's add_bos/add_eos flags, or the forward builds chat
+    prompts without BOS (it reads add_bos_token from config.json and defaults to 0)."""
+    import json
+    with open(os.path.join(out, "config.json")) as f:
+        cfg = json.load(f)
+    checks = [("config.json keeps add_bos_token from the GGUF", cfg.get("add_bos_token") is True),
+              ("config.json keeps add_eos_token from the GGUF", cfg.get("add_eos_token") is False),
+              ("bos_token_id still written", cfg.get("bos_token_id") == 2)]
+    for label, good in checks:
+        print(f"{'ok  ' if good else 'FAIL'} {label}")
+        ok = ok and good
+    return ok
+
+
+def q8_check(gguf_path, out, ok):
+    """--dtype8: the named tensors are 8704-B Q8 chunks, an exactly-4-bit one is left alone, and
+    the Q8 tile re-encodes byte for byte from the source (so the encoder IS the decoder's inverse)."""
+    import json
+    import struct
+    with open(os.path.join(out, "model.q4nx"), "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+        base = 8 + n
+    mm = np.memmap(os.path.join(out, "model.q4nx"), dtype=np.uint8, mode="r")
+    o_proj = "model.layers.0.self_attn.o_proj.weight"       # Q8_0 in the source
+    up_proj = "model.layers.0.mlp.up_proj.weight"           # F32 in the source
+    v_proj = "model.layers.0.self_attn.v_proj.weight"       # Q4_K: exact already, must stay q4_1
+    checks = [
+        ("--dtype8 writes 8704-B Q8 chunks",
+         hdr[o_proj]["shape"][-1] == G.Q8 and hdr[up_proj]["shape"][-1] == G.Q8),
+        ("an exact Q4_K tensor named by --dtype8 stays q4_1",
+         hdr[v_proj]["shape"][-1] == G.TILE),
+        ("the pattern is recorded for a round trip",
+         hdr["__metadata__"].get("dtype8") == "o_proj|up_proj|v_proj"),
+    ]
+    r = gguf.GGUFReader(gguf_path)
+    for name, key in ((o_proj, "blk.0.attn_output.weight"), (up_proj, "blk.0.ffn_up.weight")):
+        t = next(t for t in r.tensors if t.name == key)
+        K, N = int(t.shape[0]), int(t.shape[1])
+        w = gguf.quants.dequantize(t.data, t.tensor_type).astype(np.float32).reshape(N, K)
+        lo, hi = hdr[name]["data_offsets"]
+        raw = np.asarray(mm[base + lo:base + hi])
+        got = G.untile_q8(raw, N, K)
+        # the source, quantised by the packer's own rule, must give these bytes back
+        codes, scale = G.quantize_q8(w)
+        again = G.tiles_q8(codes, scale).tobytes() == raw.tobytes()
+        rel = float(np.sqrt(((got - w) ** 2).sum() / (w ** 2).sum()))
+        checks.append((f"{key}: Q8 tile re-encodes to the same bytes", again))
+        checks.append((f"{key}: 8-bit error rel rms {rel:.4f} (<= 0.01)", rel <= 0.01))
     for label, good in checks:
         print(f"{'ok  ' if good else 'FAIL'} {label}")
         ok = ok and good
@@ -214,6 +304,7 @@ def moe_check(gguf_path, out, ok):
 
 def main():
     ok = golden_tile()
+    ok = golden_tile8() and ok
     rng = np.random.default_rng(1)
     tool = os.path.join(HERE, "..", "tools", "gguf_to_q4nx.py")
     with tempfile.TemporaryDirectory() as d:
@@ -237,6 +328,43 @@ def main():
                 print(f"FAIL moe {cmd[0]} exited {r.returncode}")
                 ok = False
         ok = moe_check(os.path.join(d, "tiny-moe.gguf"), mout, ok)
+        # the same MoE container with one expert stack in Q8: __metadata__.moe's offsets must
+        # follow the 8704-B chunk, not stay on 5120
+        mq8 = os.path.join(d, "moe-q8")
+        for cmd in (["pack", os.path.join(d, "tiny-moe.gguf"), mq8, "--dtype8", "experts.up_proj"],
+                    ["verify", "--all", os.path.join(d, "tiny-moe.gguf"), mq8]):
+            r = subprocess.run([sys.executable, tool, *cmd], capture_output=True, text=True)
+            print(r.stdout, end="")
+            if r.returncode:
+                print(r.stderr, end="")
+                print(f"FAIL moe-q8 {cmd[0]} exited {r.returncode}")
+                ok = False
+        ok = moe_check(os.path.join(d, "tiny-moe.gguf"), mq8, ok)
+        ok = tokenizer_flags_check(src, out, ok)
+        q8out, q8gguf = os.path.join(d, "q8"), os.path.join(d, "q8.gguf")
+        for cmd in (["pack", src, q8out, "--dtype8", "o_proj|up_proj|v_proj"],
+                    ["verify", "--all", src, q8out]):
+            r = subprocess.run([sys.executable, tool, *cmd], capture_output=True, text=True)
+            print(r.stdout, end="")
+            if r.returncode:
+                print(r.stderr, end="")
+                print(f"FAIL q8 {cmd[0]} exited {r.returncode}")
+                ok = False
+        ok = q8_check(src, q8out, ok)
+        # and the inverse: the Q8 container written back as a GGUF, identical weights both ways
+        inv = os.path.join(HERE, "..", "tools", "q4nx_to_gguf.py")
+        for cmd in (["write", os.path.join(q8out, "model.q4nx"), src, q8gguf],
+                    ["verify", os.path.join(q8out, "model.q4nx"), q8gguf, "--roundtrip", src]):
+            r = subprocess.run([sys.executable, inv, *cmd], capture_output=True, text=True)
+            if r.returncode:
+                print(r.stdout[-2000:], r.stderr[-2000:])
+                print(f"FAIL q4nx_to_gguf {cmd[0]} exited {r.returncode}")
+                ok = False
+        q8w = gguf.GGUFReader(q8gguf)
+        q8_0 = sum(t.tensor_type == Q.Q8_0 for t in q8w.tensors)
+        print(f"{'ok  ' if q8_0 == 2 else 'FAIL'} the Q8 container writes back as 2 Q8_0 tensors "
+              f"(got {q8_0})")
+        ok = ok and q8_0 == 2
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

@@ -42,6 +42,21 @@
 #include "q4nx_dequant.h"
 #include "q4nx_pack.h"
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+// How many threads one head-parallel loop in the GDN layer may take: three quarters of the cores, because the
+// forward's own array-submit thread and the serve's HTTP thread need one each.  OMP_NUM_THREADS below that wins.
+static inline int omp_heads_threads() {
+#if defined(_OPENMP)
+    const int cap = (3 * omp_get_num_procs()) / 4;
+    const int want = omp_get_max_threads();
+    return want < cap ? (want > 0 ? want : 1) : (cap > 0 ? cap : 1);
+#else
+    return 1;
+#endif
+}
+
 #ifdef NPU_INFER_DEBUG_DUMPS
 // Debug dumps to a path named by an environment variable (NPU_INFER_DUMP_ATTN, _LN/_L0,
 // _HEAD): compiled only into debug builds (cmake -DONEBIT_NPU_DEBUG_DUMPS=ON), written
@@ -116,7 +131,12 @@ static const char* pb16i_instance(Q4nxDesign r) {
 // Where an M=16 int8 twin is looked for, first hit wins: <model dir>/kernels-m16,
 // <kernels>/m16, then <kernels> itself.
 static std::vector<std::string> m16dirs_like_head(const std::string& mdir,
-                                                  const std::string& dir) {
+                                                  const std::string& dir,
+                                                  const std::vector<std::string>& plan_dirs = {}) {
+    // A plan that names its decode directories wins, the same rule the projection lookup uses: with
+    // decode ELFs under e.g. <model>/kernels-m16-seq the projections load from there, and a head lookup
+    // restricted to the built-in guesses cannot find its ELF beside them (engine#910 review).
+    if (!plan_dirs.empty()) return plan_dirs;
     return {mdir + "/kernels-m16", dir + "/m16", dir};
 }
 
@@ -1036,11 +1056,13 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
         }
         std::vector<std::string> m16dirs;
+        plan_decode_dirs_.clear();
         if (plan_.loaded() && !plan_.decode_dirs.empty()) {
             // The plan says which of the two given paths each candidate hangs off, so the runtime
             // stops guessing which base a bare directory name meant.
             for (const auto& d : plan_.decode_dirs)
-                m16dirs.push_back((d.under_model ? mdir : dir) + "/" + d.path);
+                plan_decode_dirs_.push_back((d.under_model ? mdir : dir) + "/" + d.path);
+            for (const auto& p : plan_decode_dirs_) m16dirs.push_back(p);
         } else {
             m16dirs.push_back(mdir + "/kernels-m16");
             m16dirs.push_back(dir + "/m16");
@@ -1215,6 +1237,54 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 fprintf(stderr, "  [forward] lm head M=%d K=%d N=%d  %s\n", m, g.K, g.N,
                         elf.c_str());
             }
+        }
+    }
+
+    // ---- the lm head on the q4_1 gemv family ----
+    // That family has no int8 packer: its weight BO holds the container's own q4_1 tile stream and the
+    // launch dequantises from those tiles, so the tiled int8 head above cannot express it -- packing an
+    // int8 image into a tile BO both overruns the BO by (KD*ND - tile bytes) and means nothing to the
+    // kernel.  The head is therefore ONE launch whose N is the vocabulary: the only width whose output
+    // is the whole logits row, which is what run_lm_head_gemv() gathers the container's head tiles for.
+    if (!host_gemm_ && !ctx_head_) {
+        bool any_gemv = false;
+        for (int i = 0; i < ndesigns_ && !any_gemv; i++)
+            any_gemv = (ctx_[i] && ctx_[i]->gemv) || (ctx16_[i] && ctx16_[i]->gemv);
+        if (any_gemv) {
+            // The head ELF's N is on the gemv column grid, so try the padded vocabulary first and the
+            // raw one after: the pack's vocab 151936 is 152064 on the grid.
+            std::string elf;
+            for (int nn : {q4nx_pad_n(c_.NV), c_.NV}) {
+                for (const char* suf : {"_m16.elf", ".elf"}) {
+                    const std::string n = "full_i8_LMHEAD_K" + std::to_string(kpad_) + "_N" +
+                                          std::to_string(nn) + suf;
+                    for (const std::string& d : m16dirs_like_head(mdir, dir, plan_decode_dirs_)) {
+                        if (file_exists(d + "/" + n)) { elf = d + "/" + n; break; }
+                    }
+                    if (!elf.empty()) break;
+                }
+                if (!elf.empty()) break;
+            }
+            if (elf.empty()) {
+                err_ = "lm head: this container's kernels are the q4_1 gemv family, whose head is one "
+                       "launch at N=vocab, and no head ELF is on disk (want full_i8_LMHEAD_K" +
+                       std::to_string(kpad_) + "_N" + std::to_string(q4nx_pad_n(c_.NV)) + "[_m16].elf)";
+                return false;
+            }
+            const int m = elf.find("_m16.elf") != std::string::npos ? Q4NX_DESIGN_M_DECODE
+                                                                   : Q4NX_DESIGN_M_PREFILL;
+            const int n = (elf.find("_N" + std::to_string(q4nx_pad_n(c_.NV))) != std::string::npos)
+                              ? q4nx_pad_n(c_.NV) : c_.NV;
+            ctx_head_ = std::make_unique<I8Ctx>();
+            ctx_head_->MD = m; ctx_head_->KD = kpad_; ctx_head_->ND = n;
+            if (!ctx_head_->init_elf(*dev, elf.c_str(), m, kpad_, n, 1) || !ctx_head_->gemv) {
+                err_ = "lm head: " + elf + " does not load as the gemv head (K=" +
+                       std::to_string(kpad_) + " N=" + std::to_string(n) + ")";
+                ctx_head_.reset();
+                return false;
+            }
+            fprintf(stderr, "  [forward] lm head M=%d K=%d N=%d  %s (q4_1 gemv tiles)\n", m, kpad_, n,
+                    elf.c_str());
         }
     }
 
@@ -2200,7 +2270,6 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     const float scale = 1.0f / sqrtf((float)KHD);
     std::vector<float> co((size_t)CD), ah((size_t)NVH), bh((size_t)NVH);
     std::vector<float> ql((size_t)NVH * KHD), kl((size_t)NVH * KHD), vv((size_t)NVH * VHD);
-    std::vector<float> kvm((size_t)VHD);
     for (int m = 0; m < M; m++) {
         const float* qkv = QKV.data() + (size_t)m * CD;
         const float* z = Z.data() + (size_t)m * VD;
@@ -2254,32 +2323,59 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
             }
         }
         // recurrent gated delta rule + scale-free gated RMSNorm
+        // Heads are independent (disjoint rec_state_ rows, disjoint CORE rows), so this is the
+        // one loop in the GDN layer that parallelises: perf puts gdn_layer_batch at 76% of the
+        // host cycles and this state update at 2*KHD*VHD MACs per head.  kvm is per-head scratch.
         float* rs = rec_state_[l].data();
+        // Never take the whole box.  The forward also needs a core for the array's submit thread and the serve
+        // needs one for HTTP, so 32 threads on 32 cores measured 25% SLOWER than 16 on a 149-token prefill and
+        // 24 was level with 16 (2026-11-04, same window, same binary).  OMP_NUM_THREADS still wins downward;
+        // this only stops the default from oversubscribing.
+        const int gdn_nt = omp_heads_threads();
+#pragma omp parallel for schedule(static) num_threads(gdn_nt)
         for (int hh = 0; hh < NVH; hh++) {
+            // One scratch row for kvm and one for the delta, ONE allocation: this runs 48 heads x 48 layers x rows
+            // per token, and a per-head allocation inside a parallel region is the mistake that cost the mla
+            // attempt 2x on 2026-11-03.
+            std::vector<float> scratch((size_t)2 * VHD);
+            float* kvm = scratch.data();
+            float* delta = kvm + VHD;
             const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] * softplus_f(ah[(size_t)hh] + gdn_small_[(size_t)l].dt[hh]));
             const float beta = 1.0f / (1.0f + expf(-bh[(size_t)hh]));
             float* sh = rs + (size_t)hh * KHD * VHD;
             const float* kh = &kl[(size_t)hh * KHD];
             const float* qh = &ql[(size_t)hh * KHD];
             const float* vh = &vv[(size_t)hh * VHD];
+#pragma omp simd
             for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
-            for (int vd = 0; vd < VHD; vd++) {
-                float s = 0;
-                for (int kd = 0; kd < KHD; kd++) s += sh[kd * VHD + vd] * kh[kd];
-                kvm[(size_t)vd] = s;
+            // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
+            // gathering with stride VHD.  Each output element still accumulates over kd in increasing order, so
+            // the result is the same sequence of operations -- verified by the greedy text being byte-identical.
+            for (int vd = 0; vd < VHD; vd++) kvm[vd] = 0.0f;
+            for (int kd = 0; kd < KHD; kd++) {
+                const float k = kh[kd];
+                const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+                for (int vd = 0; vd < VHD; vd++) kvm[vd] += srow[vd] * k;
             }
-            for (int vd = 0; vd < VHD; vd++) {
-                const float delta = (vh[vd] - kvm[(size_t)vd]) * beta;
-                for (int kd = 0; kd < KHD; kd++) sh[kd * VHD + vd] += kh[kd] * delta;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) delta[vd] = (vh[vd] - kvm[vd]) * beta;
+            for (int kd = 0; kd < KHD; kd++) {
+                const float k = kh[kd];
+                float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+                for (int vd = 0; vd < VHD; vd++) srow[vd] += k * delta[vd];
             }
             float ss = 0;
             float* crow = CORE.data() + (size_t)m * VD + (size_t)hh * VHD;
-            for (int vd = 0; vd < VHD; vd++) {
-                float s = 0;
-                for (int kd = 0; kd < KHD; kd++) s += sh[kd * VHD + vd] * qh[kd];
-                crow[vd] = s * scale;
-                ss += crow[vd] * crow[vd];
+            for (int vd = 0; vd < VHD; vd++) crow[vd] = 0.0f;
+            for (int kd = 0; kd < KHD; kd++) {
+                const float q = qh[kd];
+                const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+                for (int vd = 0; vd < VHD; vd++) crow[vd] += srow[vd] * q;
             }
+            for (int vd = 0; vd < VHD; vd++) { crow[vd] *= scale; ss += crow[vd] * crow[vd]; }
             const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
             for (int vd = 0; vd < VHD; vd++) {
                 const float zz = z[(size_t)hh * VHD + vd];
@@ -2712,11 +2808,32 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
         if (!d) { err_ = "gemv head: no lm_head.weight tensor"; return false; }
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         const size_t want = I8Ctx::gemv_w_bytes(kpad_, ctx_head_->ND);
-        if (!raw || (size_t)d->data_size < want) {
-            err_ = "gemv head: the container has no q4_1 tile stream for the head";
+        // The container stores the head's tiles at the REAL vocabulary width, and the head ELF's N is
+        // that width on the column grid (151936 -> 152064 for the 0.5B pack).  The tail between them is
+        // columns past the vocabulary, so it stays zero tiles -- the same rule the fused designs use for
+        // a padded tail -- and only the first NV logits are ever read.
+        const size_t have = I8Ctx::gemv_w_bytes(kpad_, NV);
+        // The gemv family reads q4_1 TILES. A BF16 or Q8 head can easily be at least `have` bytes, and
+        // copying one into the tile stream produced invalid logits instead of a refusal (engine#910
+        // review), so the dtype is checked by name and the length has to BE the stream size -- at the
+        // real vocabulary width, or at the padded one when a container stores the padding too.
+        const std::string dt(d->dtype);
+        if (dt != "q4_1" && dt != "I8") {
+            err_ = "gemv head: lm_head.weight is " + dt + ", not the q4_1 tile stream this family reads";
             return false;
         }
-        gemv_head_.assign(raw, raw + want);
+        const size_t stored = size_t(d->data_size);
+        if (!raw || (stored != have && stored != want)) {
+            err_ = "gemv head: lm_head.weight is " + std::to_string(stored) + " B, which is neither " +
+                   std::to_string(have) + " (the real vocabulary width) nor " + std::to_string(want) +
+                   " (the padded grid): not a q4_1 tile stream for K=" + std::to_string(kpad_) +
+                   " N=" + std::to_string(NV);
+            return false;
+        }
+        gemv_head_.assign(want, 0);
+        // Bound by the DESTINATION, not the source: `want` is this buffer's size, and the tail past
+        // the container's tiles is zero-fill by construction.
+        std::memcpy(gemv_head_.data(), raw, std::min(want, have));
         if (!head_bo_) head_bo_ = ctx_head_->make_weight_bo(*dev_);
         if (!ctx_head_->upload_tiles_into(*head_bo_, gemv_head_.data(), gemv_head_.size())) {
             err_ = "gemv head: upload failed"; return false;
@@ -2783,7 +2900,7 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
             if (it == m.end()) {
                 LhScope _tlh_pk(LH_PACK_UPLOAD);
                 PackedWeight pw;
-                pw.bo = kctx.make_weight_bo(*dev_);
+                pw.bo = kctx.make_weight_bo(*dev_, /*zero=*/false);
                 std::vector<int16_t> eref;
                 int mode = 0;
                 const std::string stem = pb16i_stem(cur_layer_, sc);
@@ -3044,7 +3161,7 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
             if (it == m.end()) {
                 LhScope _tlh_pk(LH_PACK_UPLOAD);
                 PackedWeight pw;
-                pw.bo = kctx.make_weight_bo(*dev_);
+                pw.bo = kctx.make_weight_bo(*dev_, /*zero=*/false);
                 std::vector<int16_t> eref;
                 int mode = 0;
                 const std::string stem = pb16i_stem(cur_layer_, sc);
@@ -4876,6 +4993,14 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     // The head keeps the int8 family even in a pb16i container: lm_head is not a
     // PTQ1_0 ternary tensor and has no image, and packB below is the int8 packer.
     I8Ctx& lctx = ctx_head_ ? *ctx_head_ : *ctx_for(ctx_[i_qkv].get(), 1);
+    // Belt for the gemv family: packB_into writes a KD*ND int8 image, which is larger than that
+    // family's tile-stream BO.  The head context above handles this family; reaching here means a
+    // container with no head ELF, and a loud refusal beats a heap overrun (measured: it aborted a
+    // 0.5B pack in run_lm_head, ASan named the memset).
+    if (!host_gemm_ && lctx.gemv) {
+        err_ = "lm head: the int8 tiled head cannot run on the q4_1 gemv family (no head ELF loaded)";
+        return false;
+    }
     // ── Pack the head's B tiles ONCE ──────────────────────────────────────────
     // Before this, every token copied all 15 f32 tiles out of lm_head_tiles_ (356 MB
     // a tile) and re-ran packB -- a per-column int8 quantisation of all 89 M head
@@ -4895,7 +5020,7 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             // the K=H ELF family is a one-plane design.
             for (int t = 0; t < ntiles; t++) {
                 PackedWeight pw;
-                pw.bo = lctx.make_weight_bo(*dev_);
+                pw.bo = lctx.make_weight_bo(*dev_, /*zero=*/false);
                 if (!lctx.load_pb16i_into(*pw.bo, head_pb16i_stem(t), pw.eref, pw.pb16i_mode)) {
                     err_ = "lm head: cannot load the ternary image for tile " + std::to_string(t);
                     return false;

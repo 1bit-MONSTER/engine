@@ -28,6 +28,9 @@ model itself, so both sides decode the same weights:
               bf16 scale and m = its bf16 zero, both as f16. bf16 -> f16 is exact for every value
               that is a normal or subnormal f16 at full precision; `write` checks every scale and zero
               and stops if one is not (no such case is handled, because none was found).
+  Q8 tiles    (tensors pack --dtype8 named)   -> GGML Q8_0 blocks: the same symmetric int8 codes and
+              the same bf16 scale as f16 d (checked the same way). Q8_0 is this layout exactly, so a
+              container packed with --dtype8 is still one model on both sides.
   bf16        (norms, the embedding)          -> F32 for 1-D tensors (exact), F16 for the embedding
               when every value survives bf16 -> f16 exactly, else F32 (always exact).
 
@@ -62,7 +65,7 @@ from gguf.quants import dequantize
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gguf_to_q4nx as g2q  # noqa: E402
 
-ROWS, COLS, TILE = g2q.ROWS, g2q.COLS, g2q.TILE
+ROWS, COLS, TILE, Q8 = g2q.ROWS, g2q.COLS, g2q.TILE, g2q.Q8
 
 
 def read_q4nx(path):
@@ -78,9 +81,17 @@ def read_q4nx(path):
     return hdr, raw
 
 
-def tile_parts(raw, N, K):
-    """[tiles, 5120] -> codes u8 [N, K], scale and zero bf16 bits u16 [N, K/32]."""
+def tile_parts(raw, N, K, chunk=TILE):
+    """[tiles, chunk] -> codes [N, K], and the bf16 scale/zero bits u16 [N, K/32].
+
+    For a 8704-B Q8 chunk there is a scale and no zero, and the codes are int8.
+    """
     RT, KT = N // ROWS, K // COLS
+    if chunk == Q8:
+        t = raw.reshape(RT, KT, Q8)
+        sc = t[..., :512].copy().view(np.uint16).reshape(RT, KT, 8, ROWS).transpose(0, 3, 1, 2).reshape(N, K // 32)
+        c = t[..., 512:].copy().view(np.int8).reshape(RT, KT, COLS, ROWS)
+        return c.transpose(0, 3, 1, 2).reshape(N, K), sc, None
     t = raw.reshape(RT, KT, TILE)
     sc = t[..., :512].copy().view(np.uint16).reshape(RT, KT, 8, 32).transpose(0, 3, 1, 2).reshape(N, K // 32)
     zr = t[..., 512:1024].copy().view(np.uint16).reshape(RT, KT, 8, 32).transpose(0, 3, 1, 2).reshape(N, K // 32)
@@ -95,6 +106,15 @@ def bf16_to_f16_exact(bits, what):
     h = f.astype(np.float16)
     bad = h.astype(np.float32) != f
     return h, int(bad.sum()), (float((np.abs(h.astype(np.float32) - f)[bad] / np.abs(f[bad])).max()) if bad.any() else 0.0)
+
+
+def q8_0_blocks(codes, d16):
+    """GGML block_q8_0 (f16 d, int8 qs[32]) -> u8 [N, K/32*34]."""
+    N, K = codes.shape
+    out = np.empty((N, K // 32, 34), np.uint8)
+    out[..., 0:2] = d16.reshape(N, K // 32, 1).view(np.uint8)
+    out[..., 2:] = codes.reshape(N, K // 32, 32).view(np.uint8)
+    return out.reshape(N, K // 32 * 34)
 
 
 def q4_1_blocks(codes, d16, m16):
@@ -143,17 +163,29 @@ def write(args):
         h = hdr[name]
         if kind == "tiles":
             K, N = int(t.shape[0]), int(t.shape[1])
-            codes, sc, zr = tile_parts(raw(name), N, K)
+            chunk = int(h["shape"][-1])
+            codes, sc, zr = tile_parts(raw(name), N, K, chunk)
             d16, nd, wd = bf16_to_f16_exact(sc, name + " scale")
-            m16, nm, wm = bf16_to_f16_exact(zr, name + " zero")
-            total += sc.size + zr.size
-            changed += nd + nm
-            worst = max(worst, wd, wm)
-            if nd or nm:
-                raise SystemExit(f"{name}: {nd} scales and {nm} zeros are not exact in f16 (max rel {max(wd, wm):.3g})")
-            w.add_tensor(gname, q4_1_blocks(codes, d16, m16), raw_shape=(N, K // 32 * 20),
-                         raw_dtype=gguf.GGMLQuantizationType.Q4_1)
-            how = "Q4_1"
+            total += sc.size
+            changed += nd
+            worst = max(worst, wd)
+            if nd:
+                raise SystemExit(f"{name}: {nd} scales are not exact in f16 (max rel {wd:.3g})")
+            if chunk == Q8:
+                # Symmetric int8 codes are GGML Q8_0 exactly: f16 d, then 32 int8 per block.
+                w.add_tensor(gname, q8_0_blocks(codes, d16), raw_shape=(N, K // 32 * 34),
+                             raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+                how = "Q8_0"
+            else:
+                m16, nm, wm = bf16_to_f16_exact(zr, name + " zero")
+                total += zr.size
+                changed += nm
+                worst = max(worst, wm)
+                if nm:
+                    raise SystemExit(f"{name}: {nm} zeros are not exact in f16 (max rel {wm:.3g})")
+                w.add_tensor(gname, q4_1_blocks(codes, d16, m16), raw_shape=(N, K // 32 * 20),
+                             raw_dtype=gguf.GGMLQuantizationType.Q4_1)
+                how = "Q4_1"
         else:
             bits = raw(name).view(np.uint16)
             f = g2q.from_bf16(bits).reshape(h["shape"])
@@ -188,7 +220,8 @@ def verify(args):
         h = hdr[name]
         if h["dtype"] == "I8":
             K, N = int(t.shape[0]), int(t.shape[1])
-            ref = g2q.untile(raw(name), N, K).astype(np.float32)
+            chunk = int(h["shape"][-1])
+            ref = (g2q.untile_q8(raw(name), N, K) if chunk == Q8 else g2q.untile(raw(name), N, K)).astype(np.float32)
             got = got.reshape(N, K)
         else:
             ref = g2q.from_bf16(raw(name).view(np.uint16)).reshape(got.shape)
@@ -201,11 +234,14 @@ def verify(args):
     rc = 1 if bad else 0
     if args.roundtrip:
         src = hdr.get("__metadata__", {}).get("source", os.path.basename(args.roundtrip))
+        extra = []
+        if hdr.get("__metadata__", {}).get("dtype8"):
+            extra = ["--dtype8", hdr["__metadata__"]["dtype8"]]
         with tempfile.TemporaryDirectory() as td:
             os.symlink(os.path.abspath(args.gguf), os.path.join(td, src))
             out = os.path.join(td, "q")
             subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "gguf_to_q4nx.py"),
-                            "pack", os.path.join(td, src), out], check=True, stdout=subprocess.DEVNULL)
+                            "pack", os.path.join(td, src), out] + extra, check=True, stdout=subprocess.DEVNULL)
             same = subprocess.run(["cmp", os.path.join(out, "model.q4nx"), args.q4nx]).returncode == 0
         print(f"round trip gguf_to_q4nx.py pack(out.gguf) {'byte-identical to' if same else 'DIFFERS from'} {args.q4nx}")
         rc |= 0 if same else 1

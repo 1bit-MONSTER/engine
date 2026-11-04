@@ -43,7 +43,7 @@ prog=$(basename "$0")
 [ $# -ge 2 ] || { sed -n "/^# $prog/,/^# exit 0/p" "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 iso=$(cd "$(dirname "$1")" 2>/dev/null && pwd)/$(basename "$1")
 work=$2
-secs=${3:-300}
+secs=${3:-600}
 [ -f "$iso" ] || { echo "$prog: no such image: $iso" >&2; exit 2; }
 for t in qemu-system-x86_64 xorriso python3 systemd-run curl; do
     command -v "$t" > /dev/null || { echo "$prog: $t is missing" >&2; exit 2; }
@@ -122,6 +122,12 @@ esac
 # $iso would find nothing and leave the VM holding its image and its forwarded ports until its own timeout.
 qemuimg=${bootimg:-$iso}
 vmqemu() { for p in $(pgrep -f "qemu-system-x86_64 -m.*$qemuimg" 2> /dev/null); do kill "$p" 2> /dev/null; done; }
+# A host-side row (U3 lan, U7 ssh) measures a FORWARD, and a forward exists only while qemu does. The cycle-18 run
+# had both of them fail "connection refused" while every in-guest row passed: the rows run after the row driver, the
+# qemu budget (${secs}s) had expired, and the table read that as an image defect. Ask whether the VM is still there
+# and say so, so a budget overrun can never be mistaken for a broken image again.
+vm_alive() { pgrep -f "qemu-system-x86_64 -m.*$qemuimg" > /dev/null 2>&1; }
+vm_gone() { echo "the VM was no longer running when this row ran (qemu budget ${secs}s) - not an image finding"; }
 ( timeout "$secs" systemd-run --user --scope -q -p MemoryMax=6G -- \
     qemu-system-x86_64 -m 4096 -smp 4 "${boot[@]}" -display none -vga std -no-reboot \
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
@@ -419,7 +425,7 @@ rows = [
                      "1bit-console-menu --status 2>&1 | grep -q 'http://' && echo menu-status-lines",
                      "menu-status-lines"),
     ("U2 menu actions", "1bit-console-menu --selftest > /tmp/menu-self.txt 2>&1; echo selftest-rc=$?; "
-                     "grep -E '^(--- item|item [0-9] FAILED|api-key-shown|models-listed|install-guard-checked|desktop-available|shell-bash|logs-shown|power-noop)' "
+                     "grep -E '^(--- item|item [0-9] FAILED|api-key-shown|auth-mode|models-listed|install-guard-checked|desktop-available|shell-bash|logs-shown|power-noop)' "
                      "/tmp/menu-self.txt | tr '\\n' ' '", "selftest-rc=0"),
     # Cycle 17 item 4: the menu's probes run with Lemonade's environment, and no line is cut in the middle of a
     # word (the c16 board showed "firmware prese"). Both are read off the shipped script and its own status
@@ -430,14 +436,62 @@ rows = [
                      "1bit-console-menu --status | grep -q 'firmware present' && echo lines-whole || echo truncated",
                      "lines-whole"),
     # Cycle 17 item 8: the key is not in the page or its URL, and the same-origin proxy still answers WITH it.
-    # 401 direct on 13305 is the other half: the key is still enforced where it matters.
+    # Cycle 20: the direct probe follows the MODE - blank (the shipped default) answers 200 without a header, keyed
+    # answers 401 - so the row proves the mode is coherent rather than pinning one auth behaviour.
     # (the page's own text mentions "?key=" in a comment, so the count is of a KEY-SHAPED value, not of the word)
     ("U3 webapp key", "n=$(curl -s -m 5 http://127.0.0.1:8080/ | grep -Ec 'key=[0-9a-f]{16,}'); "
                      "a=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/models); "
                      "b=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:13305/api/v1/models); "
-                     "echo \"key-in-page=$n proxy=$a direct-no-key=$b\"; "
-                     "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = 401 ] && echo webapp-key-not-in-url",
+                     "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
+                     "if [ -n \"$k\" ]; then mode=keyed want=401; else mode=blank want=200; fi; "
+                     "echo \"key-in-page=$n proxy=$a direct-no-key=$b mode=$mode\"; "
+                     "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = \"$want\" ] && echo webapp-key-not-in-url",
                      "webapp-key-not-in-url"),
+    # Cycle 18 items 1-2, from the c17 board demo: a thinking model (Qwen3) spent the whole token budget in
+    # reasoning_content, so the page - which read only delta.content - showed a mid-sentence stop and then
+    # "done: 0 chunks"; and the model could only be chosen with ?model= in the URL. The page the proxy actually
+    # serves must ask for enable_thinking:false, render reasoning_content, give the answer 1024 tokens, and carry
+    # the picker. It is read off the RUNNING server (8080), not off the file in the tree.
+    ("U3 webapp page", "p=$(curl -s -m 5 http://127.0.0.1:8080/); "
+                     "t=$(printf '%s' \"$p\" | grep -c enable_thinking); "
+                     "r=$(printf '%s' \"$p\" | grep -c reasoning_content); "
+                     "k=$(printf '%s' \"$p\" | grep -c 'select id=.model.'); "
+                     "m=$(printf '%s' \"$p\" | grep -c 'MAXTOK = 1024'); "
+                     # engine#924: Lemonade does not retry a 503 device_busy on the request path, so the page is
+                     # the only layer that can - and the refusal reaches it as EITHER a 503 + Retry-After or, for a
+                     # streaming request (what this page sends), one `data: {"error":...}` frame before [DONE].
+                     # Both spellings and the retry text must be in the served page, not only in the source.
+                     "b=$(printf '%s' \"$p\" | grep -c 'device_busy'); "
+                     "w=$(printf '%s' \"$p\" | grep -c 'NPU busy, retrying'); "
+                     "echo \"thinking=$t reasoning=$r picker=$k max_tokens=$m busy=$b retry-text=$w\"; "
+                     "[ \"$t\" -ge 1 ] && [ \"$r\" -ge 1 ] && [ \"$k\" = 1 ] && [ \"$m\" = 1 ] && "
+                     "[ \"$b\" -ge 1 ] && [ \"$w\" -ge 1 ] && "
+                     "echo webapp-thinking-picker-busy",
+                     "webapp-thinking-picker-busy"),
+    # Cycle 18 item 4 (the owner: "when you first boot the headless there is no data to display on how to
+    # connect, just the menu"): the screen a person sees must carry the CONNECT block - the address, the web UI,
+    # the API base, the key's location, ssh and the mobile app - not just the menu. Read off tty1's own VGA
+    # buffer, the same surface the U2 tty1 row uses, so this is the screen and not the script.
+    # tr -s ' ': the screen is drawn by ONE OF TWO renderers now (the dialog menu, which collapses runs of spaces in
+    # a --menu prompt, and the ratatui TUI, which does not), so the row must not depend on how many spaces sit
+    # between "api" and its URL. Measured on both renders of the same facts.
+    ("U2 menu connect", "s=$(1bit-tty1 1 | tr -s ' '); printf '%s\\n' \"$s\" | head -10; "
+                     "for w in CONNECT 'web UI http://' 'api http://' 'ssh root@' 'Lemonade Mobile'; do "
+                     "printf '%s' \"$s\" | grep -qF \"$w\" || echo missing-\"$w\"; done; "
+                     "printf '%s' \"$s\" | grep -qE 'web UI http://[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:13305' && "
+                     "echo menu-connect-block",
+                     "menu-connect-block"),
+    # The mechanism behind U3-lan and U7 (cycle 15's finding, and the row the c16 refactor folded away): inbound
+    # connections from the LAN pass only if the appliance opened the ports AFTER Puppy's rc.firewall (which ends
+    # in `-P INPUT DROP`) and let the RFC1918 ranges through tcpwrappers. Printing all three - the rules, the
+    # listener, hosts.allow - is what tells "the image never opened them" apart from "something else answered".
+    ("U3 inbound", "iptables -S INPUT 2> /dev/null | head -8; "
+                     "r=$(iptables -S INPUT 2> /dev/null | grep -c dport); "
+                     "l=$(netstat -lnt 2> /dev/null | grep -cE ':22 |:13305 '); "
+                     "a=$(grep -c 1bit-lan /etc/hosts.allow 2> /dev/null); "
+                     "echo \"dport-rules=$r listeners=$l hosts-allow-lan=${a:-0}\"; "
+                     "[ \"$r\" -ge 2 ] && [ \"$l\" -ge 2 ] && [ \"${a:-0}\" -ge 1 ] && echo inbound-open",
+                     "inbound-open"),
     # Cycle 17 item 3: the appliance's name is /etc/hostname, not the DHCP server's opinion - connman's
     # AllowHostnameUpdates defaults to true, which is the one path a name nobody typed can take.
     ("U1 hostname pin", "grep -n '^AllowHostnameUpdates' /etc/connman/main.conf; "
@@ -478,28 +532,46 @@ rows = [
                      "apt install -y --no-install-recommends cowsay 2>&1 | tail -3; "
                      "command -v cowsay && echo apt-install-works", "apt-install-works", 600),
     ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
-    ("U3 key",       "grep -q '^LEMONADE_API_KEY=..' \"$(readlink -f /etc/1bit/lemond.conf)\" && "
-                     "echo key-on-data", "key-on-data"),    # engine#867 (dd-written stick had NO key at all, so Lemonade served the LAN unauthenticated): two rows that can
-    # only pass if the key exists AND the server enforces it. On a prepared stick and on a bare `dd` copy both must
-    # be green - the bare copy is the case that was broken, and it is what makes these rows a gate rather than a
-    # restatement of "the file is there".
-    ("U3 key file",  "f=$(readlink -f /etc/1bit/lemond.conf); echo \"$f $(stat -c %s \"$f\" 2>/dev/null) bytes$(stat -c %a \"$f\" 2>/dev/null | sed 's/^/ mode /')\"; "
-                     "grep -c '^LEMONADE_API_KEY=[0-9a-f]\\{32,\\}$' \"$f\" 2>/dev/null; "
-                     "grep -q '^LEMONADE_API_KEY=[0-9a-f]\\{32,\\}$' \"$f\" 2>/dev/null && echo key-minted-48-hex",
-                     "key-minted-48-hex"),
-    ("U3 auth",      "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf); "
+    ("U3 key",       "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
+                     "if [ -n \"$k\" ]; then echo \"auth-mode=keyed (${#k} hex chars)\"; "
+                     "else echo 'auth-mode=blank (no LEMONADE_API_KEY line)'; fi",
+                     "auth-mode=blank"),
+    # Cycle 20, the owner's "blank key": blank is the SHIPPED state, so these rows assert the MODE and the mode's own
+    # contract rather than a key nobody asked for. `U3 key` names what this image ships; `U3 auth` proves it (blank:
+    # 200 with no header at all; keyed: 401 without the key, 200 with it) as one token, whichever mode is in force.
+    ("U3 key file",  "readlink -f /etc/1bit/lemond.conf; "
+                     "readlink -f /etc/1bit/lemond.conf | grep -q '/data/lemonade/lemond.conf' && echo key-file-on-data",
+                     "key-file-on-data"),
+    ("U3 auth",      "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
                      "n=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:13305/api/v1/models); "
+                     "if [ -n \"$k\" ]; then "
                      "y=$(curl -s -o /dev/null -w '%{http_code}' -H \"Authorization: Bearer $k\" http://127.0.0.1:13305/api/v1/models); "
-                     "echo no-key=$n with-key=$y; "
-                     "[ \"$n\" = 401 ] && [ \"$y\" = 200 ] && echo lemonade-auth-enforced",
-                     "lemonade-auth-enforced"),
+                     "echo keyed no-key=$n with-key=$y; [ \"$n\" = 401 ] && [ \"$y\" = 200 ] && echo auth-mode-ok; "
+                     "else echo blank keyless=$n; [ \"$n\" = 200 ] && echo auth-mode-ok; fi",
+                     "auth-mode-ok"),
 
-    ("U3 catalogue", "k=$(sed -n \"s/^LEMONADE_API_KEY=//p\" /etc/1bit/lemond.conf); "
-                     "curl -s -H \"Authorization: Bearer $k\" http://127.0.0.1:13305/api/v1/models "
+    ("U3 catalogue", "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
+                     "curl -s ${k:+-H \"Authorization: Bearer $k\"} http://127.0.0.1:13305/api/v1/models "
                      "| grep -o onebit | wc -l", None),
-    ("U3 api local", 'k=$(sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf); curl -s -o /dev/null '
-                     '-w "http=%{http_code}" -H "Authorization: Bearer $k" http://127.0.0.1:13305/api/v1/models', "http=200"),
-    ("U3 keyvalue",  'sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf', None),
+    ("U3 api local", "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
+                     "curl -s -o /dev/null -w 'http=%{http_code}' ${k:+-H \"Authorization: Bearer $k\"} "
+                     "http://127.0.0.1:13305/api/v1/models", "http=200"),
+    ("U3 keyvalue",  'sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf 2>/dev/null | head -1', None),
+    # Cycle 20, pi-prs' note 2 on #934: item 1's mint is the ONE new write path in this image and it was reachable
+    # only from a dialog. The menu carries its own selftest for it, driven on a throwaway conf with the restart
+    # replaced by `true`, so this row proves the write (one 48-hex line, mode 600, the other lines kept) and the
+    # removal (no line, no temp file) INSIDE the image without touching /etc/1bit or restarting Lemonade.
+    ("U3 key toggle", "d=$(mktemp -d); 1bit-console-menu --mint-selftest \"$d\" | tail -2; rm -rf \"$d\"",
+                     "mint-selftest-ok"),
+    # Cycle 20 item 6 and item 5 in one row: the box's own Lemonade UI works THROUGH the key-injecting proxy (health
+    # 200), a same-origin page is served, and a request that carries a foreign Origin is refused before the key is
+    # attached - i.e. the proxy cannot be borrowed as a key-adding open relay by a page from anywhere else.
+    ("U3 proxy",     "h=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/health); "
+                     "o=$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: http://localhost:8080' http://127.0.0.1:8080/api/v1/health); "
+                     "x=$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: http://evil.example' http://127.0.0.1:8080/api/v1/health); "
+                     "echo proxy-health=$h same-origin=$o cross-origin=$x; "
+                     "[ \"$h\" = 200 ] && [ \"$o\" = 200 ] && [ \"$x\" = 403 ] && echo webapp-proxy-keyed-and-guarded",
+                     "webapp-proxy-keyed-and-guarded"),
     ("U4 engine",    "command -v 1bit; 1bit --version 2>&1 | head -2", "1bit"),
     ("U4 addlist",   "grep -i '^ADDLIST' /etc/rc.d/MODULESCONFIG; lsmod | grep -c ec_su_axb35", "ec_su_axb35"),
     ("U4 package",   "ls /opt/1bit-package | tr '\\n' ' '; ls -l /usr/local/bin/1bit /usr/local/bin/lemond-onebit | tail -2",
@@ -508,15 +580,22 @@ rows = [
     # it has to be the release package's binary, not something a package manager left behind.
     ("U3 cli",       "ls -l /usr/local/bin/lemonade; readlink /usr/local/bin/lemonade; "
                      "lemonade --version 2>&1 | head -2", "/opt/1bit-package/bin/lemonade"),
-    # U4 (cycle 12 item 4): the release check ships in the appliance. In the VM its GPU/NPU rows SKIP (no
-    # device), so this row records what it said instead of asserting a PASS: the board run is the one that
-    # has to be 0 FAIL / 0 SKIP, and this row proves the tool runs and which rows it could not answer here.
+    # U4 (cycle 12 item 4): the release check ships in the appliance. Its GPU/NPU rows SKIP in the VM (no device), and
+    # the board run is the one that has to be 0 FAIL. Cycle 21: this row no longer just RECORDS the result - the c20
+    # image reached the owner with release-check saying `FAIL models` and every chat row SKIPped while this row printed
+    # it as INFO. It now fails on the same line the board reads.
     ("U4 release-check", "/usr/local/bin/1bit-release-check --self-test 2>&1 | tail -1; "
                      "/usr/local/bin/1bit-release-check > /tmp/release-check.log 2>&1; "
                      "sed -n 's/^\\(FAIL\|SKIP\\)  *\\([a-z0-9-]*\\).*/\\1 \\2/p' /tmp/release-check.log "
                      "| tr '\\n' ' '; echo; "
                      "grep '^RESULT' /tmp/release-check.log; "
-                     "grep -c '^PASS ' /tmp/release-check.log", None, 900),
+                     "grep -c '^PASS ' /tmp/release-check.log", "RESULT: PASS", 900),
+    # Item 10 (owner 2026-11-04): the appliance announces itself as 1bit-os.local, so http://1bit-os.local:13305 is a
+    # link a phone can click. Two halves are asserted HERE: a responder is up, and the name resolves on the box.
+    # Whether a PEER on the LAN sees it needs multicast from outside the guest, which a QEMU user-mode network does
+    # not carry - that is the board's row, and the hand-off says so instead of implying this one covers it.
+    ("U2 mdns", "tail -2 /var/log/mdns.log 2>/dev/null; pidof avahi-daemon >/dev/null 2>&1 && echo avahi-up; "
+                "getent hosts 1bit-os.local", "1bit-os.local"),
     # U6 (cycle 12 item 5): the installer the release ships, and the tools it needs on this boot.
     ("U6 installer", "ls -l /usr/local/bin/1bit-install | tail -1; "
                      "ls /bin/1bit-install; sfdisk --version 2>&1 | head -1; "
@@ -545,7 +624,11 @@ rows = [
     ("U7 sshd",      "ps | grep -c '[s]shd'; ls -l /root/.ssh/authorized_keys 2>&1 | tail -1; "
                      "ls /etc/ssh/ssh_host_* 2>&1 | head -3; /usr/sbin/sshd -t 2>&1 | head -3; echo sshd-checked", None),
     ("data mount",   "grep -c ' /data ' /proc/mounts; df -h /data 2>/dev/null | tail -1", "/data"),
-    ("data key",     "ls -l /etc/1bit/lemond.conf; head -c 0 /data/lemonade/lemond.conf && echo persists-on-data", "persists-on-data"),
+    # Cycle 20: blank is the shipped mode, so there may be NO key file yet - what this row owes is that when one is
+    # turned on it lands on /data (the symlink 05onboard-data makes), not that a key exists.
+    ("data key",     "ls -l /etc/1bit/lemond.conf; readlink -f /etc/1bit/lemond.conf; "
+                     "readlink -f /etc/1bit/lemond.conf | grep -q '/data/lemonade/lemond.conf' && echo key-path-on-data",
+                     "key-path-on-data"),
     ("data ssh",     "ls -l /etc/ssh/ssh_host_ed25519_key; readlink -f /etc/ssh/ssh_host_ed25519_key", "/data/ssh/"),
     ("data state",   "ls /data; grep -c . /data/lemonade/config/user_models.json 2>/dev/null || echo no-registry", None),
     # release identity: the package reports "1bit 0.0.1" whatever was built, so the binary hash is what ties
@@ -631,18 +714,24 @@ else
     echo "FAIL U8 boot progress the console never said what it was doing (no progress line in the transcript)"
 fi
 
-# U3 over the network, from outside the guest.
+# U3 over the network, from outside the guest. Cycle 20: blank mode is the shipped default, so an empty key is not a
+# reason to SKIP - the probe then carries no Authorization header, which is what a stock-Lemonade client does.
 key=$(awk '/^INFO U3 keyvalue/ {print $NF}' "$work/rows.txt" 2>/dev/null | tail -1)
 if [ -n "${key:-}" ]; then
     code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Authorization: Bearer $key" \
         "http://127.0.0.1:$hostport/api/v1/models" 2>/dev/null)
-    if [ "$code" = "200" ]; then
-        echo "PASS U3 lan        http=200 on the forwarded :13305 (host :$hostport) with the image's key"
-    else
-        echo "FAIL U3 lan        http=${code:-none} on the forwarded :13305 (host :$hostport)"
-    fi
+    mode=" with the image's key"
 else
-    echo "SKIP U3 lan        no key in the transcript"
+    code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \
+        "http://127.0.0.1:$hostport/api/v1/models" 2>/dev/null)
+    mode=" with no key (blank mode)"
+fi
+if [ "$code" = "200" ]; then
+    echo "PASS U3 lan        http=200 on the forwarded :13305 (host :$hostport)$mode"
+elif ! vm_alive; then
+    echo "FAIL U3 lan        http=${code:-none} - $(vm_gone)"
+else
+    echo "FAIL U3 lan        http=${code:-none} on the forwarded :13305 (host :$hostport)$mode"
 fi
 # U7, over the wire: SSHKEY=<private key> and the key half of which must be in the image's keys.
 if [ -n "${SSHKEY:-}" ] && [ -f "$SSHKEY" ]; then
@@ -658,7 +747,8 @@ if [ -n "${SSHKEY:-}" ] && [ -f "$SSHKEY" ]; then
     case $said in
     *ONBOARD-SSH-OK*ssh-bash*) echo "PASS U7 ssh        $(printf '%s' "$said" | tail -c 200)" ;;
     *ONBOARD-SSH-OK*) echo "FAIL U7 ssh        the login works but the shell is not bash: $(printf '%s' "$said" | tail -c 200)" ;;
-    *) echo "FAIL U7 ssh        $(printf '%s' "$said" | tail -c 240)" ;;
+    *) if vm_alive; then echo "FAIL U7 ssh        $(printf '%s' "$said" | tail -c 240)"
+       else echo "FAIL U7 ssh        $(printf '%s' "$said" | tail -c 160) - $(vm_gone)"; fi ;;
     esac
 else
     echo "SKIP U7 ssh        set SSHKEY=<private key> whose public half is in the image"

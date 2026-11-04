@@ -710,8 +710,25 @@ fault at device address 0x…`, and in `dmesg` `[gfxhub] page fault … client C
 | TheRock nightly `21a66824…` (10.3.0a20261031) | `HSA_USE_SVM` unset, `HSA_USERPTR_FOR_PAGED_MEM=0` | server up, first completion **HTTP 500**, 31 fault lines | **+1** |
 | TheRock nightly `21a66824…` | `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1` | **HTTP 200, 260.1 tok/s** | **0** |
 
-So on a dev build the release-bundled libhsa cannot register HRX0 at all, and the nightly libhsa the engine
-picks page-faults in the mode above.
+So on a dev build the runtime the release *image* installs could not register HRX0 in **that** arm, and the nightly
+libhsa the engine picks page-faults in the mode above.
+
+Two corrections to how those first two rows should be read (2026-11-04, measured with the image's own runtime set):
+
+* **The arm did not use the set the image installs.** That A/B arm pointed
+  `IREE_HAL_AMDGPU_LIBHSA_PATH` at a **single-file** extract of the same bytes, and ROCr 1.21.0's build needs its eight
+  `librocm_sysdeps_*` siblings plus `librocprofiler-register.so.0` in the same directory. Without them `dlopen` fails
+  (`librocm_sysdeps_elf.so.1: cannot open shared object file`) and no device can appear, whatever the SVM mode.
+* **With the closure, the image's runtime does register a device.** The 10-file set at `/opt/rocm-therock/lib`
+  (sha256 `f6ef689d163b42ded68cb99ffa4f9103251f05ba91fc3ca70f4a1d1909d9c34a`) exports all 121 HSA entry points the
+  driver resolves by name, and `hrx_cts_device` passes 7/7 device cases on it. So the digest is not the problem and the
+  two TheRock builds are interchangeable by symbol set — the *directory* was. Diagnose with `ldd`, not with `sha256sum`
+  alone.
+
+One diagnostic caveat that follows: a runtime path that cannot be `dlopen`ed does not fail loudly. The loader appends
+that error and keeps searching, so the run falls through to the bare `libhsa-runtime64.so.1` on the system path — the
+_distro_ ROCr, which lacks `hsa_amd_queue_create` — and the error you see names the distro copy, not the path you
+passed. "Not found" about the system library usually means the runtime you named could not be loaded.
 
 **Which variable is responsible is narrower than "SVM":** a four-corner table on the same 0.6B file (same binary,
 cache limit 128) shows the fault needs the two knobs *together* — libhsakmt takes the SVM save-area path only when
@@ -938,8 +955,9 @@ cmake --build build --target onebit
   llama-server or llama-bench by hand, export that variable yourself.
 - **The runtime is named at init (engine#713).** Three `libhsa-runtime64.so.1` exist on a
   box (the release-shipped one, the pinned toolchain's, the distro's) and they are not
-  interchangeable: the release-shipped one does not register `HRX0` for a dev build. So the
-  first HRX backend `serve` starts logs the file HRX will dlopen and its digest, once:
+  interchangeable: the distro's ROCr is old enough to be missing an entry point the driver
+  resolves by name, and a copy without its `librocm_sysdeps_*` siblings cannot be loaded at
+  all. So the first HRX backend `serve` starts logs the file HRX will dlopen and its digest, once:
 
   ```
   1bit serve: HRX: HSA runtime /home/you/engine/third_party/toolchain/rocm-sdk-10.3.0a20261031-gfx1151/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 sha256 21a6682452e159cfcdc6bdc84676f6b7f9c1236f3a2957a97a2e7170889cdfa3
@@ -974,7 +992,13 @@ same build now passes `tests/serve_e2e.sh` on both devices through `1bit serve`.
 `tests/hrx_cpu_weight_parity.sh` (engine #674) is the row that compares placements instead of just checking that each one
 answers: the same greedy prompt through the CPU (`-dev none`), through the device with **every layer assigned to the CPU**
 (`-dev HRX0 -ngl 0`, the partial-offload path where the device still claims nodes and materializes their weights) and fully
-offloaded (`-ngl 99`) must come back byte-identical. It skips without a gfx1151, and it fails rather than skips when the
+offloaded (`-ngl 99`). It compares the **distributions**, not the text: the CPU path and the device paths are different
+arithmetic (f32 CPU kernels vs HRX's kernels over an f16 KV cache), their logits differ by ~0.1 nats, and at temperature 0 a
+coin flip between two candidates flips one token — measured on `ca1d42f`, where the *shipped* `-ngl 99` placement flips its
+own coin 24 tokens in. So each device arm must keep the CPU's top-5 distribution (overlap >= 0.30, median |dlogprob| <=
+0.50 nats, calibrated: 0.63-0.78 overlap and 0.038-0.094 nats on a correct stack, 0.00 overlap when placement actually
+corrupts the answer), compared over **at least 12 steps** — an arm that stops early (EOS, or a placement bug that ends the
+graph) is reported as a failure rather than compared over the one or two steps it managed. It skips without a gfx1151, and it fails rather than skips when the
 machine has a GPU but the HRX runtime cannot open it — the `IREE_HAL_AMDGPU_LIBHSA_PATH` case `scripts/hrx-env.sh` now
 resolves for hand-run tools.
 

@@ -19,8 +19,9 @@ limitations under the License.
 ## Which plan is v3
 
 **Puppy is v3, and Puppy is 1bit OS.** It is `ResolutePup64`, built with woof-CE on the Ubuntu 26.04
-"resolute" base, with our kernel (`7.3.0-rc4-1bit-perfopt`, MOK-signed), our drivers, the engine and
-Lemonade inside it. The same image is the live/try stick and the frugal install, `/data` is Puppy's save
+"resolute" base, with our kernel (MOK-signed; `7.4.0-rc1-1bit` since cycle 21, `7.3.0-rc4-1bit-perfopt`
+before it), our drivers, the engine and Lemonade inside it. The same image is the live/try stick and the
+frugal install, `/data` is Puppy's save
 layer on `1BIT-DATA`, the userland is `bash`, `sudo`, `apt` and `sshd`, and it boots **headless by
 default** - a console login, no X - with a second boot entry, `1bit OS (desktop)`, for Puppy's desktop.
 Secure Boot stays on: shim → our MOK-signed grub → our MOK-signed kernel → our signed modules.
@@ -38,10 +39,13 @@ and `mokutil` are in the image - and the appliance **boots on the Max+ 395 with 
 (2026-11-03) came back **33 `puppy-check` rows, 0 failed, 1 skipped** (the skip is `u2-desktop`, correct on
 a headless entry); cycle 20 (2026-11-04) booted and served three chats on the NPU at 88.06 / 80.91 /
 87.43 tok/s (TTFT 0.37 / 0.26 / 0.18 s), and its two red rows were traced to a defect in the acceptance
-script rather than the image (engine#945, fixed in #951). Since cycle 20 the appliance ships with **no
-API key** - `10lemonade` leaves `LEMONADE_API_KEY` unset and binds `0.0.0.0:13305` anyway, and console
-item 1 turns a key on (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62`). **Nothing is published**: the next
-release carries it.
+script rather than the image (engine#945, fixed in #951). The newest board, cycle 23 (2026-11-04), came back
+**41 rows, 40 PASS, 1 FAIL, 2 SKIP** with the image's own release check at **PASS (22 checks, 0 failures)** -
+the single red is a bug in the check's own `u7-mdns` row, not in the image - serving the NPU at 93.65 / 94.03
+tok/s and HRX at 305.09 tok/s, with 0 TDRs up a 400/600/1000-token ladder. Since cycle 20 the appliance
+ships with **no API key** - `10lemonade` leaves `LEMONADE_API_KEY` unset and binds `0.0.0.0:13305` anyway,
+and console item 1 turns a key on (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62`). **Nothing is
+published**: the next release carries it.
 
 **The Ubuntu Server `autoinstall` plan below is the documented fallback**, and it stays the
 reference for the parts both plans share. It is the fallback for two measured reasons: it has no

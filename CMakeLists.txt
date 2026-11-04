@@ -563,8 +563,10 @@ add_dependencies(npu_sampling_test systemone_route_test)
 # and the bytes it produces, which is the half of issue #832 a test can pin without a model.
 add_executable(npu_chatml_test tests/npu_chatml_test.cpp)
 target_include_directories(npu_chatml_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu)
-target_link_libraries(npu_chatml_test PRIVATE nlohmann_json::nlohmann_json)
-add_test(NAME npu_chatml COMMAND npu_chatml_test)
+target_link_libraries(npu_chatml_test PRIVATE onebit_npu nlohmann_json::nlohmann_json)
+# The #963 rows read the two fixtures: a tokenizer with ChatML anchors (served) and one without (refused).
+add_test(NAME npu_chatml COMMAND npu_chatml_test ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_chatml.json
+                                          ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_linear.json)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_chatml_test)

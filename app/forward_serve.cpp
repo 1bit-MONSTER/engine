@@ -20,7 +20,8 @@
 //
 //   GET  /health, /v1/health    200 once the model is on the device
 //   GET  /v1/models             the one model
-//   POST /v1/chat/completions   ChatML prompt, sampling controls, optional SSE stream
+//   POST /v1/chat/completions   ChatML prompt, sampling controls, optional SSE stream (400 when the
+//                               container's tokenizer cannot represent ChatML, app/npu_chatml.h)
 //   POST /v1/completions        raw prompt
 //   POST /v1/systemone          d3 decision questions (alias /v1/decisions), when the model
 //   GET  /v1/systemone/models   directory carries a decision head -- see docs/npu.md "Decisions"
@@ -81,6 +82,11 @@ struct ForwardEngine {
     int eos = -1;
     int endoftext = -1;
     int max_context = 0;   // config.json max_position_embeddings: prompt plus answer
+    // The chat route renders ChatML for every container (#832), so whether this container's
+    // tokenizer can represent that prompt is a property of the container: decided once at load
+    // (#963).  A refusal, not a load failure -- the id route stays usable on such a container.
+    bool chatml_ok = true;
+    std::string chatml_refusal;  // empty unless !chatml_ok; the 400's message
     // decode() of every vocabulary id, built on the first constrained request: the GBNF
     // mask tests each token's text against the grammar state, per token.
     std::vector<std::string> tok_text;
@@ -164,8 +170,10 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     std::vector<int> prompt_ids;
     bool prompt_is_ids = false;
     try {
-        if (chat) prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
-        else {
+        if (chat) {
+            if (!e.chatml_ok) throw std::runtime_error(e.chatml_refusal);
+            prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
+        } else {
             prompt_is_ids = npu::prompt_ids_from_body(body, e.tok->size(), prompt_ids);
             if (!prompt_is_ids) prompt = body.at("prompt").get<std::string>();
         }
@@ -727,6 +735,29 @@ int run_forward_serve(int argc, char** argv) {
     // q4nx_config_int finds the key at any depth (a text_config's too).
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
     if (e.max_context <= 0) e.max_context = 32768;
+
+    // #963: the chat route's prompt is ChatML for every container, and a tokenizer with no
+    // <|im_start|>/<|im_end|> added token cannot represent it -- the marker becomes ordinary pieces and
+    // the model reads text its own template never produces (zyphra/ZR1-1.5B: 33 tokens rendered
+    // against 15 under the model's template).  Refused per request rather than refused at load,
+    // because /v1/completions with token ids (#938) is the way to serve such a container correctly.
+    if (!npu::chatml_supported(*e.tok)) {
+        e.chatml_ok = false;
+        std::string specials;
+        const std::pair<const char*, int> named[] = {{"bos", e.bos_id}, {"eos", e.eos}};
+        for (const auto& [label, id] : named) {
+            const std::string text = id >= 0 ? e.tok->decode(id) : std::string();
+            if (text.empty()) continue;
+            specials += std::string(specials.empty() ? "" : ", ") + label + " " + text + " (" +
+                        std::to_string(id) + ")";
+        }
+        e.chatml_refusal =
+            "this container's tokenizer has no <|im_start|> / <|im_end|>, so the ChatML prompt the chat route "
+            "renders would be tokenized into pieces the model never sees (#963); send /v1/completions with "
+            "prompt as token ids (#938) and render the model's own template" +
+            (specials.empty() ? std::string() : " (model specials: " + specials + ")");
+        std::fprintf(stderr, "1bit forward-serve: chat route disabled: %s\n", e.chatml_refusal.c_str());
+    }
 
     // The prompt cache (#650): --prefix-slots 0 turns it off, and an invalid value is refused here
     // rather than clamped, like every other option on this command.

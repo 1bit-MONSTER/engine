@@ -466,6 +466,21 @@ case "$packed_nss" in
        exit 1 ;;
 esac
 echo "   ok: sudo, apt, sshd, mokutil, sfdisk, bash, avahi-daemon are in the image and .local resolves"
+# item 10: and the responder must actually be STARTED. rc.services runs every executable /etc/init.d script with
+# `start`, but skips any whose text contains the bus binary's name (`grep -qF`, see /etc/rc.d/rc.services - Puppy's
+# way of not starting the bus twice). Applied here to the packed script, i.e. the exact file a boot runs.
+packed_mdns=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/init.d/18onboard-mdns 2>/dev/null)
+if [ -z "$packed_mdns" ]; then
+    echo "build: REFUSED: the packed image has no etc/init.d/18onboard-mdns (1bit-os.local is never announced)" >&2
+    exit 1
+fi
+if printf '%s' "$packed_mdns" | grep -qF dbus-daemon; then
+    echo "build: REFUSED: etc/init.d/18onboard-mdns names the bus binary, so rc.services would SKIP it and the" >&2
+    echo "       responder would never start (measured on the c20 image's /etc/rc.d/rc.services). rc.sysinit already" >&2
+    echo "       starts that bus; this script must only wait for it." >&2
+    exit 1
+fi
+echo "   ok: etc/init.d/18onboard-mdns will be executed by rc.services (no bus-binary token, so no skip)"
 rc_country=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/rc.country 2>/dev/null |
     grep -c "^if false ; then # 1bit: a headless boot must not ask" || true)
 [ "${rc_country:-0}" = 1 ] || {

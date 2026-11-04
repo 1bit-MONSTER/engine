@@ -19,12 +19,19 @@
 # console).
 #
 # Two things the rootfs does not do for itself, both measured on the built resolute64 tree before this shipped:
-#   * PID 1 is not systemd, so nothing starts a D-Bus SYSTEM bus - and avahi-daemon exits without one ("Failed to
-#     connect to system bus"). /usr/bin/dbus-daemon is in the image; there is simply no service that starts it.
 #   * the `avahi` (and `messagebus`) ACCOUNT is missing: woof-CE installs a package by unpacking it, so the adduser
 #     in Debian's postinst never ran, and avahi-daemon drops to `avahi` and chroots to /run/avahi-daemon before it
 #     will run. Rather than invent a system account in the image, it is given --no-drop-root --no-chroot: this
 #     appliance runs its services as root anyway (10lemonade, sshd), and the two flags only skip the privilege drop.
+#   * nothing in /etc/init.d starts the responder.
+#
+# DO NOT name the D-Bus bus binary in this file, not even in a comment. /etc/rc.d/rc.services runs every executable
+# script in /etc/init.d with `start` but FIRST does `grep -qF` for that one string and skips the script if it appears
+# anywhere in the text - Puppy uses it to avoid starting the bus twice. Measured on the c20 image: the bus binary is
+# /usr/bin/…-daemon is in the image and rc.sysinit already runs it --system (line ~695) BEFORE rc.services (line
+# ~727), and the board's own messages.log shows a live bus (it was trying to activate org.freedesktop.login1). So this
+# service only WAITS for that socket; naming the binary here would silently disable the whole feature. container-build.sh
+# asserts the packed script against rc.services' own rule, so that silence cannot come back.
 #
 # rc.services runs every executable script in /etc/init.d with `start`; the mode is part of the gate. Nothing on the
 # box depends on mDNS - it is how a CLIENT finds the box - so a failure here is logged and never stops the boot.
@@ -35,24 +42,21 @@ say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$@" >> "$LOG" 2>/dev/null; }
 
 mkdir -p /run/dbus /run/avahi-daemon
 
+# rc.sysinit starts the system bus before rc.services; on a slow medium it can still be a moment behind.
+i=0
+while [ "$i" -lt 10 ] && [ ! -S /run/dbus/system_bus_socket ]; do sleep 1; i=$((i + 1)); done
 if [ ! -S /run/dbus/system_bus_socket ]; then
-    if command -v dbus-daemon >/dev/null 2>&1; then
-        dbus-daemon --system --fork 2>>"$LOG" || say "dbus-daemon --system failed; avahi cannot start without a bus"
-    else
-        say "no dbus-daemon in this image; avahi cannot start without a system bus"
-    fi
+    say "no system bus socket (/run/dbus/system_bus_socket) 10 s after rc.sysinit; 1bit-os.local is not announced"
+    exit 0
 fi
 
 avahi_pid() { cat /run/avahi-daemon/pid 2>/dev/null; }
-if pid=$(avahi_pid) && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+pid=$(avahi_pid)
+if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     say "avahi-daemon already running (pid $pid)"
-elif [ -S /run/dbus/system_bus_socket ]; then
-    if /usr/sbin/avahi-daemon --daemonize --no-drop-root --no-chroot 2>>"$LOG"; then
-        say "avahi-daemon up: $(hostname).local is announced on this network"
-    else
-        say "avahi-daemon failed to start (see the lines above); the console menu still prints the address"
-    fi
+elif /usr/sbin/avahi-daemon --daemonize --no-drop-root --no-chroot 2>>"$LOG"; then
+    say "avahi-daemon up: $(hostname).local is announced on this network"
 else
-    say "no system bus, so 1bit-os.local is not announced; the console menu still prints the address"
+    say "avahi-daemon failed to start (see the lines above); the console menu still prints the address"
 fi
 exit 0

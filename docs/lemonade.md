@@ -120,7 +120,7 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 
 | device | 2026-09-25, start | now |
 |---|---|---|
-| HRX | 19 / 31 | **29 / 29 run, all pass** (2 skipped; 2026-10-31, through the shipped `lemonade-onebit-rc-2026-10-31c` package: `test/server_llm.py --wrapped-server onebit --backend hrx`, exit status 0) |
+| HRX | 19 / 31 | **29 / 29 run, all pass** (2 skipped; 2026-11-04, through `lemonade-onebit-rc-2026-11-03-c22`, the package the board boots: `test/server_llm.py --wrapped-server onebit --backend hrx`, exit status 0, 104 s, every backend on `HRX0`) |
 | NPU | 3 / 31 | in progress ([npu.md](npu.md)); the suite's small test models are GGUF |
 | Vulkan (removed in RFC #213 stage 3) | 19 / 31 | 29 / 29 run, all pass, before its removal |
 

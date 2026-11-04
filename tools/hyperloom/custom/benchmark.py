@@ -221,14 +221,36 @@ def serve_lever_args():
     return args
 
 
+def build_identity(onebit, bin_dir):
+    """Name the binary that produced the measurement, inside the artifact itself.
+
+    A session report outlives the shell it was made in, and this workload is routinely measured on
+    more than one build of the same tree (out-of-tree `hl-engine-build` / `-c20`). Without this field
+    two results that differ only by build are indistinguishable, so a KEEP can be read against a binary
+    it was never measured on. ``1bit`` is far under ``sha256_head``'s 64 MiB head, so this is the whole
+    binary's hash, not a prefix.
+    """
+    onebit, bin_dir = pathlib.Path(onebit), pathlib.Path(bin_dir)
+    return {
+        "onebit": str(onebit),
+        "bin_dir": str(bin_dir),
+        "sha256": sha256_head(onebit),
+    }
+
+
 def levers():
-    """Echo the configuration into the report, so a KEEP is explicable months later."""
+    """Echo the configuration into the report, so a KEEP is explicable months later.
+
+    Every name here has to be one the engine actually reads: an echoed knob nothing consumes makes
+    a report claim a configuration the measurement never had (`GGML_HRX_TER_Q4_0` used to be listed
+    and appears nowhere in the engine or its llama.cpp pin).
+    """
     return {
         k: env(k)
         for k in ("HL_B", "HL_UB", "HL_FA", "HL_CTK", "HL_CTV", "HL_MTP_MAX", "HL_DFLASH",
                   "HL_PARALLEL", "HL_CTX", "HL_LONGCTX", "HL_LONGTOK",
                   "GGML_HRX_Q8_PREFILL_RELAX", "GGML_HRX_GRAPH_PROGRAM_CACHE",
-                  "GGML_HRX_TER_Q4_0", "ONEBIT_HRX_DECODE_SPLIT")
+                  "ONEBIT_HRX_DECODE_SPLIT")
         if env(k)
     }
 
@@ -457,7 +479,8 @@ def main():
         "completed": 0,
         "total_output_tokens": tokens,
         "quality_gate": {"passed": False, "reason": "not run"},
-        "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE")},
+        "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
+                          "build": build_identity(onebit, bin_dir)},
     }
 
     def finish(passed, reason, rc=0):

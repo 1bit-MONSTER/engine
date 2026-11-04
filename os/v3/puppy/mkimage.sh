@@ -242,4 +242,4 @@ fi
 ls -l "$img"
 echo "   kernel: ${kver:-unknown}, ESP ${esp_mb} MB, data ${data_mb} MB"
 echo "   write it: sudo dd if=$img of=/dev/sdX bs=4M conv=fsync   (then os/mini/prepare-stick.sh grows"
-echo "             1BIT-DATA to fill the stick and writes the API key and ssh keys)"
+echo "             1BIT-DATA to fill the stick, writes ssh keys, and keys Lemonade only if asked (--mint))"

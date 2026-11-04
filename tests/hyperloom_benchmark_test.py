@@ -24,6 +24,7 @@ leg scores zero rather than silently falling back to the geomean.
 
 Run directly (`python3 tests/hyperloom_benchmark_test.py`) or through ctest.
 """
+import hashlib
 import importlib.util
 import pathlib
 import sys
@@ -99,6 +100,19 @@ def main():
         os.environ["HL_LONGCTX"], os.environ["HL_DFLASH"] = str(longctx), dflash
         assert bench.longctx_drafter_conflict() is want, (longctx, dflash, want)
     os.environ.pop("HL_LONGCTX"), os.environ.pop("HL_DFLASH")
+
+    # The artifact has to name the binary it measured: this workload is run on more than one build of the
+    # same tree, and a two-result report is not decidable by build without this. (Untested, it was absent:
+    # the pair-of-record JSONs carried no build field at all.)
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        onebit = pathlib.Path(tmp) / "1bit"
+        onebit.write_bytes(b"#!/bin/sh\necho not really a build\n")
+        ident = bench.build_identity(onebit, pathlib.Path(tmp) / "hrx/llama/bin")
+        assert ident["onebit"] == str(onebit), ident
+        assert ident["bin_dir"].endswith("hrx/llama/bin"), ident
+        assert ident["sha256"] == hashlib.sha256(onebit.read_bytes()).hexdigest(), ident
 
     print("hyperloom_benchmark_test: OK")
     return 0

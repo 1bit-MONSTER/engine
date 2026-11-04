@@ -1073,6 +1073,41 @@ void test_post_attn_norm_header(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// The text artifacts are not universal: AMD's Qwen3 packs ship none (engine#1024), so `info` has to
+// say so before an import and `import` has to say so after it. A pack with them reports the split.
+void test_text_artifacts(const std::string& root) {
+    const fs::path dir = fs::path(root) / "text-artifacts";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    put_file((dir / "model.onnx.data").string(), std::string(4096, '\x11'));
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":16,"intermediate_size":32,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":true})");
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {8, 8}, "model.onnx.data", 0, 256)}, {}));
+
+    pi::TextArtifacts t = pi::scan_text_artifacts(dir.string());
+    check(t.present.empty() && t.missing.size() == 8 && !t.tokenizer,
+          "text artifacts: a pack with none reports all 8 missing and not servable");
+    check(json::parse(pi::plan(dir.string()).manifest())["text_artifacts"]["servable"] == false,
+          "text artifacts: info says the pack is not servable");
+
+    put_file((dir / "tokenizer.json").string(), "{}");
+    put_file((dir / "vocab.json").string(), "{}");
+    t = pi::scan_text_artifacts(dir.string());
+    check(t.present == std::vector<std::string>({"tokenizer.json", "vocab.json"}) && t.missing.size() == 6 &&
+              t.tokenizer,
+          "text artifacts: a pack with two reports those two present, the other six missing");
+    const json m = json::parse(pi::plan(dir.string()).manifest());
+    check(m["text_artifacts"]["servable"] == true && m["text_artifacts"]["present"].size() == 2 &&
+              m["text_artifacts"]["missing"].size() == 6,
+          "text artifacts: info lists present, missing and servable");
+    std::printf("text artifacts: %zu present, %zu missing, servable %s\n", t.present.size(),
+                t.missing.size(), t.tokenizer ? "yes" : "no");
+    fs::remove_all(dir);
+}
+
 void test_fconst_eps(const std::string& root) {    const fs::path dir = fs::path(root) / "fconst-eps";
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -1144,6 +1179,7 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
+        test_text_artifacts(golden_dir.empty() ? "." : golden_dir);
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

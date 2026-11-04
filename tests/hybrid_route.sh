@@ -37,7 +37,7 @@ trap cleanup EXIT
 start() {   # start <log> [env...]: serve on a free port with the fake backend, env applied to serve
     local log=$1; shift
     port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    env "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port "$port" --alias hybrid-model \
+    env FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port "$port" --alias hybrid-model \
         --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
     pid=$!
     api="http://127.0.0.1:$port"
@@ -69,6 +69,10 @@ check "cache_prompt on (fake_cache_prompt)" '[[ "$reply" == *"\"fake_cache_promp
 sleep 0.3
 check "stderr: the per-request line (prefill, restore, first byte)" 'grep -q "hybrid: 30 prompt tokens: prefill .* ms, restore .* ms, first byte .* ms" "$scratch/a.log"'
 check "stderr: the startup line names the provider" 'grep -q "hybrid: prefill by .*fake_prefill_provider.py" "$scratch/a.log"'
+# engine#941: the state file holds the prompt minus its last token, and restore says so, so the backend leaves
+# that token to evaluate instead of re-processing the prompt
+check "the provider was handed one token less than the prompt (29 of 30)" \
+    'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); b=d[\"body\"]; sys.exit(0 if d[\"action\"]==\"restore\" and b.get(\"leave_one_token\") is True and b.get(\"n_tokens_in_state_file\")==29 else 1)" "$scratch/slot.json" 2>/dev/null'
 reply=$(curl -s "$api/v1/completions" -H 'Content-Type: application/json' -d '{"model": "hybrid-model", "prompt": "Hello hybrid"}')
 check "/v1/completions goes through the handoff too" '[[ "$reply" == *"\"fake_id_slot\":0"* ]]'
 chunks=$(curl -sN "$api/v1/chat/completions" -H 'Content-Type: application/json' \

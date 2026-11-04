@@ -34,14 +34,22 @@ tested) on any machine.
 1. **Template and tokenize on the backend.** For `/v1/chat/completions` serve asks the llama-server
    child for the templated prompt (`/apply-template`) and its ids (`/tokenize`, `add_special` and
    `parse_special` on, as the server itself tokenizes); `/v1/completions` tokenizes its `prompt`
-   string. The provider sees exactly the ids the backend would have prefilled.
+   string. The provider is handed those ids **minus the prompt's last token** (engine#941): the backend
+   evaluates that last token itself, which is what a handoff needs to be worth anything on a model
+   whose memory cannot be trimmed back (see step 4).
 2. **The provider prefills.** serve writes the ids to a file in the backend's slot directory and runs
    the provider. It writes a llama.cpp sequence-state file for the prompt.
 3. **Restore into slot 0.** `POST /slots/0?action=restore` loads the file into the one slot; serve
-   checks the slot holds all the prompt's tokens.
+   checks the slot holds the tokens the provider prefilled (the prompt's, less its last). The request
+   carries `leave_one_token` so the backend records the handoff as an in-place context checkpoint - a
+   checkpoint with bookkeeping and no data (`common_prompt_checkpoint::load_tgt` returns at once for
+   it), which is what lets the prompt-cache search find the prefix instead of re-processing it.
 4. **Decode.** The request is forwarded with `id_slot` 0 and `cache_prompt` true. llama-server finds
-   the prompt in the slot, re-evaluates its last token (it always does, for the logits), and generates.
-   The reply, streamed or not, is relayed as for every device.
+   the prompt in the slot and evaluates its last token - one token, not the prompt. That one token is
+   not an artefact: a hybrid model's recurrent memory keeps its whole prefix in a single cell, so the
+   backend cannot trim a cell back the way it trims a KV position, and a handoff that covered the whole
+   prompt would leave it nothing legal to evaluate (it would re-process the prompt, or abort). The
+   reply, streamed or not, is relayed as for every device.
 
 One line per request on stderr: `hybrid: N prompt tokens: prefill X ms, restore Y ms, first byte Z ms`
 (the provider's own `prefill_ms` when it reports one, else its wall time; the restore from the backend's
@@ -108,8 +116,10 @@ it) replaces the file with two dma-buf fds:
 Per request: `POST /slots/0?action=share {"socket": PATH}` makes the decoder export its KV buffers and
 hand the fds over an AF_UNIX socket that serve is listening on (`SCM_RIGHTS`, one length-prefixed JSON
 message); serve passes them to the provider as inherited descriptors; the provider maps them as its own
-KV tensors and prefills the prompt into them; `POST /slots/0?action=adopt {"tokens": [...]}` makes the
-decoder take cells 0..N-1 as positions 0..N-1 with no data movement (`llama_kv_cells_adopt`). The
+KV tensors and prefills the prompt into them; `POST /slots/0?action=adopt {"tokens": [...],
+"share_id": N, "leave_one_token": true}` makes the
+decoder take cells 0..N-1 as positions 0..N-1 with no data movement (`llama_kv_cells_adopt`) and record
+them as an in-place checkpoint. The
 provider never writes a file, and the only bytes that cross a boundary are the fds and a few hundred
 bytes of JSON. `llama-kvshare-prefill` (llama.cpp `tools/kvshare-prefill`) is the reference provider:
 a CPU prefill, so the plumbing can be gated with no NPU; the NPU engine is the real one, mapping the

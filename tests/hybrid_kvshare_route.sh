@@ -41,7 +41,7 @@ trap cleanup EXIT
 start() {   # start <log> [env...]
     local log=$1; shift
     port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    env FAKE_KVSHARE_MARKER="$scratch/provider.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port "$port" --alias hybrid-model \
+    env FAKE_KVSHARE_MARKER="$scratch/provider.json" FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port "$port" --alias hybrid-model \
         --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
     pid=$!
     api="http://127.0.0.1:$port"
@@ -64,6 +64,11 @@ check "the handoff ran (share + adopt, not the file route)" 'grep -q "hybrid: .*
 check "no fallback happened" '! grep -q "the backend prefills this request itself" "$scratch/a.log"'
 check "the provider got one readable fd per region" \
     'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"fds\"]==1 and d[\"readable\"]==[16] and d[\"n_ctx\"]==4096 else 1)" "$scratch/provider.json" 2>/dev/null'
+# engine#941: the decoder is left the prompt's last token, so an in-place checkpoint is legal and adopt has to
+# say so - without the flag the decoder re-processes the whole prompt (the recurrent half of a hybrid memory
+# cannot be trimmed back to leave one)
+check "adopt asks the decoder to leave one token" \
+    'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"action\"]==\"adopt\" and d[\"body\"].get(\"leave_one_token\") is True else 1)" "$scratch/slot.json" 2>/dev/null'
 check "the socket is gone from the slot directory" '! ls /tmp/1bit-hybrid-*/kvshare-*.sock 2>/dev/null | grep -q .'
 stop
 

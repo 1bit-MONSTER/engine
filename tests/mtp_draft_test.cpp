@@ -28,6 +28,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 using onebit::npu::mtp::BaseModel;
@@ -467,6 +468,64 @@ int main() {
                     " denominator: %d)\n",
                     gs.drafted_at[0], gs.drafted_at[1], gs.drafted_at[2], gs.drafted_at[3], gs.accepted_at[0],
                     gs.accepted_at[1], gs.accepted_at[2], gs.accepted_at[3], scored, legacy_scored);
+    }
+
+    // [10] the head's matvec is n-blocked (npu/mtp/mtp_head.cpp): one column at a time walks the [k][n] code image
+    // with a 64-byte cache line per 1-byte code, which measured 135-331 ms for the eight matrices of one head step
+    // depending on box load (0.7-7 GF/s; tools/mtp_head_bench.cpp).  Blocking n fixes the access pattern and must NOT move a single float: the accumulation order
+    // per column (g ascending, k ascending, then the additive-min pass) is identical, so this is a bit-identity
+    // check, not a tolerance check.  The unblocked form is kept here as the reference, so a future rewrite has to
+    // delete the statement of the defect to pass.
+    {
+        auto matvec_unblocked = [](const onebit::npu::mtp::Matrix& m, const float* a, float* y) {
+            const int G = m.K / onebit::npu::mtp::kG;
+            for (int n = 0; n < m.N; n++) {
+                double acc_n = 0.0;
+                for (int g = 0; g < G; g++) {
+                    const int8_t* cg = &m.codes[(size_t)(g * onebit::npu::mtp::kG) * m.N + n];
+                    double P = 0.0;
+                    for (int k = 0; k < onebit::npu::mtp::kG; k++)
+                        P += (double)a[g * onebit::npu::mtp::kG + k] * (double)cg[(size_t)k * m.N];
+                    acc_n += P * ((double)m.ms[(size_t)g * m.N + n] * std::ldexp(1.0, (int)m.eref[(size_t)n]));
+                }
+                for (int g = 0; g < G; g++) {
+                    double s = 0.0;
+                    for (int k = 0; k < onebit::npu::mtp::kG; k++) s += a[g * onebit::npu::mtp::kG + k];
+                    acc_n += s * (double)m.add[(size_t)g * m.N + n];
+                }
+                y[n] = (float)acc_n;
+            }
+        };
+        // N covers the block tail (200 = 3 x 64 + 8), an exact block (64), one column, and a wide matrix; a
+        // wrong tail bound or an off-by-one in the block loop shows up as a disagreeing column.
+        const int shapes[][2] = {{64, 200}, {128, 64}, {32, 1}, {256, 127}, {96, 300}};
+        int bad_cols = 0, cols = 0;
+        for (const auto& sh : shapes) {
+            const int K = sh[0], N = sh[1], G = K / onebit::npu::mtp::kG;
+            onebit::npu::mtp::Matrix m;
+            m.K = K;
+            m.N = N;
+            m.codes.assign((size_t)K * N, 0);
+            m.ms.assign((size_t)G * N, 0);
+            m.eref.resize((size_t)N);
+            m.add.resize((size_t)G * N);
+            uint32_t st = 12345u + (uint32_t)(K * 131 + N);
+            for (auto& c : m.codes) { st = st * 1664525u + 1013904223u; c = (int8_t)((int)((st >> 16) % 16) - 8); }
+            for (auto& v : m.ms) { st = st * 1664525u + 1013904223u; v = (int16_t)(1000 + (int)((st >> 16) % 30000)); }
+            for (auto& e : m.eref) { st = st * 1664525u + 1013904223u; e = (int16_t)((int)((st >> 16) % 9) - 4); }
+            for (auto& v : m.add) { st = st * 1664525u + 1013904223u; v = (float)((int)((st >> 16) % 2001) - 1000) * 0.5f; }
+            std::vector<float> a((size_t)K), got((size_t)N), want((size_t)N);
+            for (auto& x : a) { st = st * 1664525u + 1013904223u; x = (float)((int)((st >> 16) % 2001) - 1000) * 0.001f; }
+            matvec_unblocked(m, a.data(), want.data());
+            m.matvec(a.data(), got.data());
+            for (int n = 0; n < N; n++) {
+                cols++;
+                if (std::memcmp(&got[(size_t)n], &want[(size_t)n], sizeof(float)) != 0) bad_cols++;
+            }
+        }
+        check(bad_cols == 0, "matvec: the blocked form is BIT-identical to the unblocked form on every column");
+        std::printf("INFO matvec: %d columns over 5 shapes, %d differ (K x N incl. a 200 = 3x64+8 block tail)\n", cols,
+                    bad_cols);
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

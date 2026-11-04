@@ -45,21 +45,27 @@ if(ONEBIT_EP_NPU)
     set(ONEBIT_NPU_ENGINE_INCS "${CMAKE_CURRENT_SOURCE_DIR}/../../npu/forward/engine-src;${CMAKE_CURRENT_SOURCE_DIR}/../../npu"
         CACHE STRING "Include dirs of the NPU tree holding npu_engine_i8ctx_inc.h (and its runtime)")
 
-    set(_npu_src
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../npu/ort/onebit_npu_gemm.cpp
-        # I8Ctx::args_fit_elf() (#869) calls q4nx_elf_arg_sizes(), implemented here.  The header is
-        # npu/forward/include (already on _npu_incs), the definition is not: without this the EP's
-        # targets compile and then fail to link, which is how #874 stayed green in CI.
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../npu/forward/src/q4nx_pack.c
+    # The sources and includes are npu_sources.cmake's, not a copy here: the root CMakeLists compiles
+    # the same list against a stub runtime so CI sees this leg (#874). Only the runtime's own private
+    # sources are added here, because the CI check substitutes the stub for them.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/npu_sources.cmake)
+    set(_npu_src ${ONEBIT_EP_NPU_COMMON_SRC}
         "${ONEBIT_NPU_RT_DIR}/npu_rt.cpp"
         "${ONEBIT_NPU_RT_DIR}/npu_rt_api.cpp")
-    set(_npu_incs ${ONEBIT_NPU_ENGINE_INCS} ${CMAKE_CURRENT_SOURCE_DIR}/../../npu/ort ${ONEBIT_NPU_RT_DIR})
-    set(_npu_defs ONEBIT_NPU_RUNTIME_OWN=1)
+    # ORDER MATTERS: the caller's ONEBIT_NPU_ENGINE_INCS comes first, because it is how a build
+    # selects *another* NPU tree (onnx/ep/README.md, "The NPU backend": the private tree the shipped
+    # engine builds against). The shared dirs after it are fallbacks for what that tree does not carry
+    # -- including npu/forward/include, where q4nx_pack.h lives. Reversing the two silently compiles
+    # the in-tree I8Ctx against a runtime the caller did not select (Copilot caught exactly that on
+    # #918; reproduced with an alternate tree whose header is a hard #error: reversed, the build
+    # succeeds, i.e. the configured tree lost).
+    set(_npu_incs ${ONEBIT_NPU_ENGINE_INCS} ${ONEBIT_EP_NPU_COMMON_INCS} ${ONEBIT_NPU_RT_DIR})
+    set(_npu_defs ${ONEBIT_EP_NPU_COMMON_DEFS})
     set(_npu_libs Threads::Threads)
 
     target_sources(onebit_ep PRIVATE ${_npu_src})
     target_include_directories(onebit_ep PRIVATE ${_npu_incs})
-    target_compile_definitions(onebit_ep PRIVATE ONEBIT_EP_NPU=1 ${_npu_defs})
+    target_compile_definitions(onebit_ep PRIVATE ${_npu_defs})
     target_link_libraries(onebit_ep PRIVATE ${_npu_libs})
 
     # The module's self-check and the deliverable-3 device proof: one MatMul on the NPU against a

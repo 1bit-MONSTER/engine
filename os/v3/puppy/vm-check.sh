@@ -518,7 +518,7 @@ rows = [
                      "n=0; while [ $n -lt 6 ]; do [ -n \"$(find $d -name BOOT 2> /dev/null)\" ] && break; "
                      "sleep 3; n=$((n + 1)); done; "
                      "post=$(find $d -name BOOT 2> /dev/null | wc -l); "
-                     "mnt=$(grep -c \" $d \" /proc/mounts); "
+                     "mnt=$(grep -c \" $(readlink -f $d) \" /proc/mounts); "
                      "alive=$(kill -0 $p 2> /dev/null && echo yes || echo no); "
                      "kill $p 2> /dev/null; umount $d 2> /dev/null; "
                      "echo \"logs-wait pre=$pre post=$post mount-rc=$mrc mount-lines=$mnt daemon-alive=$alive\"; "

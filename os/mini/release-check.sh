@@ -411,6 +411,10 @@ if [ -z "$KEY" ]; then
         fail lemonade "lemond did not answer $API within ${READY_WAIT}s (see /tmp/lemond.log)"
     else
         BODY=$(got "$API/api/v1/models")
+        # Every row below reads $MODELS, and in blank mode this keyless body IS the model list - #934 split the
+        # row into two branches and only the keyed one assigned it, so on the shipped blank default the models
+        # row failed with "Lemonade did not answer" on a healthy box and every chat/bench row skipped off it.
+        MODELS=$BODY
         WITHOUT=$(status "$API/api/v1/models")
         v=$(lemonade_verdict_blank "$WITHOUT" "$BODY")
         case "$v" in

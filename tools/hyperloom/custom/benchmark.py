@@ -173,7 +173,7 @@ def serve_batch_args():
     happens to be idle -- under another lane's GTT the engine's fit check aborts the server and every
     candidate fails for a reason that has nothing to do with the lever under test. `HL_CTX` overrides.
     """
-    args = ["-c", str(env_int("HL_CTX", 8192))]
+    args = ["-c", str(serve_ctx())]
     if env("HL_FA"):
         args += ["-fa", env("HL_FA")]
     return args
@@ -193,6 +193,29 @@ def longctx_drafter_conflict():
     candidate scores zero and says why, rather than loading a drafter nobody may measure.
     """
     return env_int("HL_LONGCTX", 0) > 0 and dflash_on()
+
+
+def serve_ctx():
+    """The context `1bit serve` is pinned to. One definition, so the two readers cannot drift.
+
+    A long-context arm measures the decode rate of a prompt of `HL_LONGCTX` tokens, so an `HL_CTX`
+    smaller than prompt+decode does not shorten the leg -- the server either rejects the request or
+    shifts the context and answers on the tail, which is a different measurement wearing the same
+    label. The refusal in ``longctx_exceeds_serve_ctx`` is what makes that impossible.
+    """
+    return env_int("HL_CTX", 8192)
+
+
+def longctx_exceeds_serve_ctx():
+    """True when the long leg cannot fit the context serve was pinned to.
+
+    ``HL_LONGCTX`` and ``HL_CTX`` are independent env vars, and the default (8192) is smaller than
+    every long-context value this workload was ever run with, so setting only ``HL_LONGCTX`` -- 18800,
+    the #679 shape -- asks for a 18.8k-token prompt on an 8192-token server. Refused before anything
+    loads, like the drafter refusal, because the alternative is a burned device window.
+    """
+    longctx = env_int("HL_LONGCTX", 0)
+    return bool(longctx) and longctx + env_int("HL_LONGTOK", 128) > serve_ctx()
 
 
 def serve_lever_args():
@@ -424,6 +447,13 @@ def main():
             "refusing HL_DFLASH with HL_LONGCTX>0: the drafter at long context is the arm that faulted the "
             "HRX graph on this box (27B, 18.8k, 2026-11-01 11:13 reset) and the box rule forbids it until "
             "engine#764's refusal guardrail is merged")
+    # Same class, other direction: a long leg that cannot fit the pinned context measures nothing.
+    if longctx_exceeds_serve_ctx():
+        raise SystemExit(
+            f"refusing HL_LONGCTX={env_int('HL_LONGCTX', 0)} with HL_CTX={serve_ctx()}: the long leg asks for "
+            f"{env_int('HL_LONGCTX', 0) + env_int('HL_LONGTOK', 128)} tokens (prompt + HL_LONGTOK) and serve is "
+            "pinned to a smaller context, so the server would reject the request or answer on a shifted "
+            "context; set HL_CTX >= prompt + decode (20480 with HL_LONGCTX=18800)")
     out_dir = pathlib.Path(env("RESULT_DIR") or ".").expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     name = env("RESULT_FILENAME") or "inferencex_result"

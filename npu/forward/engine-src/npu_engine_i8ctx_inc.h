@@ -498,7 +498,7 @@ struct I8Ctx {
     inline xrt::run launch_async_with_bo(xrt::bo& wbo, const float* A,
                                          int am, int ak, float ascale) {
         quantize_async(A, am, ak, ascale);
-        bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        sync_a_to_device();
         if (!gemv) poison_canary(ND, am);   // engine#666: so readback() can tell "not written" from "written as 0"
         if (gemv) return (*kext)(wbo, *bA, *bC);
         return (*kext)(*bA, wbo, *bC);
@@ -512,7 +512,7 @@ struct I8Ctx {
                                               int am, int ak,
                                               const float* ascales) {
         quantize_async_rows(A, am, ak, ascales);
-        bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        sync_a_to_device();
         poison_canary(ND, am);
         return (*kext)(*bA, wbo, *bC);
     }
@@ -568,15 +568,64 @@ struct I8Ctx {
         return Ag;
     }
 
+    // ── Activation BO bookkeeping (target 2) ──
+    // The M=128 stream reads rows [am, MD) on every launch, so those rows must be zero -- but they only need
+    // to become zero again when a previous launch wrote real data there. On the decode path am is always 1,
+    // so tracking which rows the host has written turns a per-launch memset of the whole BO into a one-off.
+    // Bytes left in the BO are identical either way: rows [0, am) are written by the quantiser, rows
+    // [am, a_written_rows_) are zeroed here, the rest are already zero.
+    //
+    // a_written_rows_ is set to `am` (not left at its old value) after every call: once rows [am, ...) have been
+    // zeroed and rows [0, am) quantised, the only rows that may hold host data are [0, am). Leaving it at MD was
+    // the bug in the first version of this change -- it re-zeroed 127 of 128 rows on every decode launch, i.e.
+    // 99.2 % of the memset it was written to remove, which the target-2 gate measured as no change at all.
+    //
+    // -1, not MD: MD is declared without an initialiser (`int MD, KD, ND, NL` above) and is only assigned in
+    // init_elf(), while a non-static member initialiser here runs at construction. Contexts are built with
+    // std::make_unique<I8Ctx>() and given their geometry afterwards (q4nx_forward.cpp:931, onnx/onebit_npu_gemm.cpp:205);
+    // make_unique value-initialises, so the zero-fill sets MD to 0 before this initialiser runs -- measured, not
+    // assumed: `Ctx{int MD; int w = MD;}` printed `MD=0 w=0` through make_unique and through placement-new on 0xAA.
+    // So `= MD` starts at 0, "no rows known", and the first ak == KD launch zeroes nothing, leaving the pad rows
+    // to whatever the BO was allocated with. That is the defect this line closes: -1 means "nothing known yet",
+    // which costs one whole-BO zero on the first launch and cannot depend on the allocation or on member order.
+    int a_written_rows_ = -1;   // rows [0, a_written_rows_) may hold host data; -1 = nothing known yet
+
+    inline void prepare_activation(int am, int ak) {
+        if (ak != KD || a_written_rows_ < 0) {
+            // (a) a K shorter than the padded geometry leaves a column tail in rows [0, am) that the quantiser does
+            //     not write, and (b) before the first launch nobody knows what the BO holds: both fall back to the
+            //     whole-BO zero, exactly as the code did unconditionally before this change
+            memset(Am, 0, (size_t)MD * KD);
+            a_written_rows_ = am;
+            return;
+        }
+        if (a_written_rows_ > am) {
+            memset(Am + (size_t)am * KD, 0, (size_t)(a_written_rows_ - am) * KD);
+        }
+        a_written_rows_ = am;
+    }
+
+    // ── Target 2: are the BO syncs required at all? ──
+    // An XDNA2 BO is cacheable host memory, so bo::sync() is `mfence; clflush ...; mfence` over the range
+    // (disassembled 2026-10-31) -- cache maintenance, not a copy. The brief's question is *when the XDNA
+    // cache model needs it*, and it can only be answered by running the same prompts with the syncs off and
+    // comparing logits. These switches exist for exactly that arm; both default to on (the shipped path is
+    // untouched) and both are only ever set inside an npu-hold window.
+    //   NPU_NO_A_FLUSH=1   skip bA's writeback before the launch (host wrote A, the array reads it)
+    //   NPU_NO_C_INVAL=1   skip bC's invalidate before the host reads it (the array wrote C)
+    static bool env_off(const char* name) {
+        const char* v = getenv(name);
+        return v != nullptr && atoi(v) != 0;
+    }
+    inline void sync_a_to_device() {
+        static const bool skip = env_off("NPU_NO_A_FLUSH");
+        if (!skip) bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+
     inline int8_t* quantize_async(const float* A, int am, int ak, float ascale) {
         if (gemv) { quantize_bf16(A, am, ak); return Am; }
         float ais = 1.0f / ascale;
-        // Zero-pad ALL MD rows: the M=128 stream reads rows
-        // [am, MD) every launch; zeroing only rows [0, am) left stale BO
-        // memory (the previous launch's A) in [am, MD) — an
-        // uninitialized-read-class hazard for any kernel with cross-row
-        // interaction.
-        memset(Am, 0, (size_t)MD * KD);
+        prepare_activation(am, ak);
         for (int m = 0; m < am; m++)
             q4nx_quant_i8::row(A + (size_t)m * ak, ak, ais, Am + (size_t)m * KD);
         return Am;
@@ -602,14 +651,14 @@ struct I8Ctx {
                     "must walk the prompt in MD-row blocks)\n", am, MD);
             return Am;
         }
-        memset(Am, 0, (size_t)MD * KD);
+        prepare_activation(am, ak);
         for (int m = 0; m < am; m++)
             q4nx_quant_i8::row(A + (size_t)m * ak, ak, 1.0f / ascales[m], Am + (size_t)m * KD);
         return Am;
     }
 
 
-    inline void sync_A(int /*l*/) { bA->sync(XCL_BO_SYNC_BO_TO_DEVICE); }
+    inline void sync_A(int /*l*/) { sync_a_to_device(); }
 
     // ── Launch kernel for layer l ──
     // Kernel signature: (opcode, instr_bo, ninstr, bo0, bo1, bo2, bo3, bo4)
@@ -636,7 +685,7 @@ struct I8Ctx {
     }
 
     inline xrt::run sync_and_launch(int l) {
-        bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        sync_a_to_device();
         if (!gemv) poison_canary(ND);   // the canary is an int32 sentinel; the gemv output is f32
         bochk(l);
         // The gemv family's argument order is (weights, activations, outputs); every int8 family
@@ -723,7 +772,8 @@ struct I8Ctx {
     // read before the launch, and if that row is still poisoned after the invalidate, re-issue the launch
     // once instead of dequantising garbage into a layer.
     inline void readback() {
-        bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        static const bool skip_inval = env_off("NPU_NO_C_INVAL");
+        if (!skip_inval) bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         if (canary_on_ && !gemv) verify_canary();
         if (getenv("NPU_DBG")) {
             static int n = 0;

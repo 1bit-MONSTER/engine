@@ -343,7 +343,15 @@ bad()  { printf '  FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
 
 printf '\nassertions (%s)\n' "$( [ "$CHECK" = 1 ] && echo --check || echo 'read-only remount' )"
 
-[ -f "$CONF" ] || bad "lemonade/lemond.conf is missing"
+# Cycle 20, the owner's "blank key": a stick with no key has NO lemond.conf at all - nothing mints one any more, and
+# 05onboard-data deliberately leaves the file absent (an empty one is the third state engine#867 guarded against).
+# So "absent" is a PASS that says so; everything inside the file is still asserted whenever it exists.
+if [ -f "$CONF" ]; then
+    ok "lemonade/lemond.conf is present"
+else
+    [ -n "${KEY:-}" ] && bad "lemonade/lemond.conf is missing, but a key was asked for (--mint/--key) and has nowhere to go" ||
+        ok "no lemonade/lemond.conf (blank mode: no API key; the console's item 1 creates it on the stick)"
+fi
 if [ -f "$CONF" ]; then
     confbytes=$(stat -c %s "$CONF")
     nonzero=$(tr -d '\000' < "$CONF" | wc -c)
@@ -390,8 +398,12 @@ if [ -f "$CONF" ]; then
 fi
 
 if [ -e "$MNT/ssh/authorized_keys" ]; then
-    [ "$(stat -c %a "$CONF")" = 600 ] && ok "lemonade/lemond.conf is 0600 (the key is in it)" ||
-        bad "lemonade/lemond.conf is $(stat -c %a "$CONF"), wanted 600"
+    # mode 600 is asserted only when the file exists: blank mode has none, and that case is decided above
+    [ -f "$CONF" ] || ok "lemonade/lemond.conf is absent (blank mode), so there is no key file to restrict"
+    if [ -f "$CONF" ]; then
+        [ "$(stat -c %a "$CONF")" = 600 ] && ok "lemonade/lemond.conf is 0600 (the key is in it)" ||
+            bad "lemonade/lemond.conf is $(stat -c %a "$CONF"), wanted 600"
+    fi
     [ "$(stat -c %a "$MNT/ssh")" = 700 ] && ok "ssh/ is 0700" || bad "ssh/ is $(stat -c %a "$MNT/ssh"), wanted 700"
     [ "$(stat -c %u "$MNT/ssh")" = 0 ] && ok "ssh/ is owned by root" || bad "ssh/ is owned by uid $(stat -c %u "$MNT/ssh"), wanted 0"
     [ "$(stat -c %a "$MNT/ssh/authorized_keys")" = 600 ] && ok "ssh/authorized_keys is 0600" ||

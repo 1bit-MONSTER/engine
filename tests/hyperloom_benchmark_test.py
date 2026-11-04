@@ -101,6 +101,24 @@ def main():
         assert ident["bin_dir"].endswith("hrx/llama/bin"), ident
         assert ident["sha256"] == hashlib.sha256(onebit.read_bytes()).hexdigest(), ident
 
+    # HL_LONGCTX and HL_CTX are independent variables and the 8192 default is smaller than every
+    # long-context value in use, so a run that set only HL_LONGCTX asked for an 18.8k prompt on an
+    # 8192-token server: rejected, or answered on a shifted context = a different measurement wearing
+    # the same label. One definition of the pinned context, and a refusal before anything loads.
+    for longctx, ctx, longtok, want in ((18800, "20480", 128, False), (18800, None, 128, True),
+                                        (18800, "18800", 128, True), (8000, None, 128, False),
+                                        (0, None, 128, False)):
+        os.environ["HL_LONGCTX"], os.environ["HL_LONGTOK"] = str(longctx), str(longtok)
+        if ctx is None:
+            os.environ.pop("HL_CTX", None)
+        else:
+            os.environ["HL_CTX"] = ctx
+        assert bench.longctx_exceeds_serve_ctx() is want, (longctx, ctx, longtok, want)
+        assert bench.serve_ctx() == (8192 if ctx is None else int(ctx))
+        assert bench.serve_batch_args()[0] == "-c" and bench.serve_batch_args()[1] == str(bench.serve_ctx())
+    for k in ("HL_LONGCTX", "HL_LONGTOK", "HL_CTX"):
+        os.environ.pop(k, None)
+
     # The artifact has to name the device stack too: the box reboots between series and the launcher
     # applies no kernel gate, so before this a report could not say which kernel/driver a number came
     # from (the pair-of-record JSONs carried no kernel field at all).

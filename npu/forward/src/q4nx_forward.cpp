@@ -24,6 +24,7 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
 #include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>   // mkstemp/close: the pb16i activation probe's dump
@@ -277,17 +278,14 @@ bool Q4nxNpuForward::snapshot_state(int tokens, StateSnapshot& out) const {
     out.tokens = tokens;
     out.per_pos = per;
     const size_t want = size_t(tokens) * per;
-    auto copy = [&](const std::vector<std::vector<float>>& src, std::vector<std::vector<float>>& dst) {
-        dst.resize(src.size());
-        for (size_t l = 0; l < src.size(); l++) {
-            const size_t n = std::min(want, src[l].size());
-            dst[l].assign(src[l].begin(), src[l].begin() + long(n));
-        }
-    };
-    copy(kcache_, out.k);
-    copy(vcache_, out.v);
-    copy(conv_state_, out.conv);
-    copy(rec_state_, out.rec);
+    // KV is per position, so a snapshot of the first `tokens` positions keeps exactly that many; the GDN conv
+    // window and recurrent state are fixed-size blocks updated per position, so they go in whole.  Cutting them
+    // with `want` truncated them (23 % of the recurrent plane at 180 tokens) and made restore_state refuse the
+    // snapshot -- the prefix cache's `slot has no usable state`, which cost a full re-prefill on every request.
+    q4nx_state::take_per_pos(kcache_, out.k, want);
+    q4nx_state::take_per_pos(vcache_, out.v, want);
+    q4nx_state::take_whole(conv_state_, out.conv);
+    q4nx_state::take_whole(rec_state_, out.rec);
     return true;
 }
 
@@ -296,24 +294,13 @@ bool Q4nxNpuForward::restore_state(const StateSnapshot& in, int tokens) {
     const size_t per = size_t(c_.NKV) * size_t(c_.HD);
     if (in.per_pos != per) return false;
     const size_t want = size_t(tokens) * per;
-    auto put = [&](const std::vector<std::vector<float>>& src, std::vector<std::vector<float>>& dst) {
-        if (dst.size() < src.size()) return false;
-        for (size_t l = 0; l < src.size(); l++) {
-            // A layer that holds KV must cover the positions being restored, or attention() would
-            // read past the end of a shorter array.
-            if (!src[l].empty() && src[l].size() < want) return false;
-            if (src[l].empty()) {
-                // A layer whose KV is shared (Gemma style) carries none of its own: leave it empty
-                // rather than filling it with the owner's, which attention() reads by kv_layer.
-                dst[l].clear();
-                continue;
-            }
-            dst[l].assign(src[l].begin(), src[l].begin() + long(std::min(want, src[l].size())));
-        }
-        return true;
-    };
-    if (!put(in.k, kcache_) || !put(in.v, vcache_)) return false;
-    if (!put(in.conv, conv_state_) || !put(in.rec, rec_state_)) return false;
+    // Same split as snapshot_state: KV is restored per position (a layer whose KV is shared carries none of its
+    // own, so an empty plane leaves the destination empty rather than filling it with the owner's), and the GDN
+    // planes are restored whole -- refusing a truncated one instead of installing it short.
+    if (!q4nx_state::give_per_pos(in.k, kcache_, want)) return false;
+    if (!q4nx_state::give_per_pos(in.v, vcache_, want)) return false;
+    if (!q4nx_state::give_whole(in.conv, conv_state_)) return false;
+    if (!q4nx_state::give_whole(in.rec, rec_state_)) return false;
     return true;
 }
 

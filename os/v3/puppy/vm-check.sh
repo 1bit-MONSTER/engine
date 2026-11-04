@@ -624,17 +624,27 @@ rows = [
                      "ls /bin/1bit-install; sfdisk --version 2>&1 | head -1; "
                      "command -v efibootmgr mkfs.vfat mkfs.ext4; echo installer-present", "installer-present"),
     # Cycle 21 (owner: "the stick moves to Linux 7.4-rc1"). What this row can say is what the ARTIFACT carries: its
-    # kernel release and its BTF. BTF is a 7.4 fact worth a row because the 7.4 board boot showed it working
-    # (systemd attaches bpf-restrict-fs instead of logging "Failed to load BPF object").
-    ("U4 kernel",   "uname -r; ls -l /sys/kernel/btf/vmlinux 2>&1 | awk '{print $5\" bytes\"}'; echo btf-present",
-                     "7.4.0-rc1-1bit"),
+    # kernel release. BTF gets its OWN row below, because a row passes on ONE substring (`want in body`): with the BTF
+    # probe folded in here, a board with no /sys/kernel/btf/vmlinux still printed PASS as long as uname matched - the
+    # report-without-failing class this row exists to close (pi-prs' #989 verdict, 4 Nov).
+    ("U4 kernel",   "uname -r", "7.4.0-rc1-1bit"),
+    # BTF is a 7.4 fact worth a row because the 7.4 board boot showed it working (systemd attaches bpf-restrict-fs
+    # instead of logging "Failed to load BPF object"). -s, not ls: an empty file is not a BTF blob.
+    ("U4 btf",      "ls -l /sys/kernel/btf/vmlinux 2>&1 | awk '{print $5\" bytes\"}'; "
+                    "[ -s /sys/kernel/btf/vmlinux ] && echo btf-vmlinux-present", "btf-vmlinux-present"),
     # OUR driver, never the in-tree one (owner word). The kernel ships an in-tree amdxdna as well, so presence proves
     # nothing: the assertion is the RESOLVED PATH - depmod gives updates/ priority, and a renamed or dropped module
-    # would silently load the in-tree driver. vermagic is the other half: a module built for another kernel is refused
-    # at load time on the board, with nothing here saying so. Measured on the 7.4 artifact: srcversion
-    # EBC78CDA6FD7F3F6E824064, signer strixhalo Secure Boot Kernel.
-    ("U4 our driver", "modinfo -n amdxdna; modinfo -F srcversion amdxdna; modinfo -F signer amdxdna; "
-                      "modinfo -F vermagic amdxdna | cut -d' ' -f1; modinfo -n ec_su_axb35", "/updates/amdxdna.ko"),
+    # would silently load the in-tree driver.
+    ("U4 our driver", "modinfo -n amdxdna; modinfo -F srcversion amdxdna; modinfo -n ec_su_axb35",
+                      "/updates/amdxdna.ko"),
+    # And the module has to be the one THIS kernel can load and this appliance trusts: vermagic must name the image's
+    # release and the signer must be our MOK. Both are asserted in one token, because one substring per row is all the
+    # harness compares - printing them and matching the path, as this row did before pi-prs' verdict, passed a module
+    # built for another kernel or signed by someone else.
+    ("U4 driver sig", "s=$(modinfo -F signer amdxdna); v=$(modinfo -F vermagic amdxdna | cut -d' ' -f1); "
+                      "echo signer=$s; echo vermagic=$v; "
+                      "[ \"$s\" = 'strixhalo Secure Boot Kernel' ] && [ \"$v\" = '7.4.0-rc1-1bit' ] && "
+                      "echo driver-signed-and-vermagic-ok", "driver-signed-and-vermagic-ok"),
     ("U3 log",       "tail -3 /var/log/lemond-onebit.log 2>&1", None),
     # BEFORE any in-VM fix runs: on an image that carries the fixes these two say so (root, and 1), on an
     # older image they say what is missing. The fix rows below then repair it so the login can still be

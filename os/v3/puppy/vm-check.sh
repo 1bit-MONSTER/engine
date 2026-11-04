@@ -638,6 +638,16 @@ rows = [
     ("U4 hrx path",   "ls -l /opt/1bit-llama/llama-server 2>&1 | tail -1; "
                       "/opt/1bit-llama/llama-server --version 2>&1 | head -2", None),
     ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels", None),
+    # Cycle 23 (c22 board, 4 Nov): a chat that crosses ~512 positions wedged the NPU deterministically - 400 and 480
+    # max_tokens clean, 600 -> `code 614 / state 8` and a TDR power-cycle - and the fix is the hang detector's
+    # timeout in /etc/modprobe.d/amdxdna.conf. The build asserts the FILE; this row loads the module and reads what
+    # the kernel actually took, which is the only form the board row also accepts. The module loads without NPU
+    # hardware, so the value is readable in the VM even though nothing can be dispatched here.
+    ("U5 npu tdr",    "modprobe amdxdna 2>&1 | head -2; "
+                     "grep -h 'tdr_timeout' /etc/modprobe.d/*.conf 2>&1; "
+                     "v=$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms 2>/dev/null); "
+                     "echo tdr-loaded=${v:-none}; modinfo -F filename amdxdna 2>&1",
+                     "tdr-loaded=15000"),
     # U3 says "reachable on the LAN", so whether the appliance has an address at all is a row, not a
     # footnote: the cycle-2 image booted with no /data and answered nothing on the forwarded port, and
     # these two lines say whether that was the listener or the interface.

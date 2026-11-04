@@ -784,11 +784,19 @@ that runs the phase is private, like the kernels it runs.
   ChatML anchors. One that does not is refused on the chat route rather than prompted anyway (#963).
 - **Decoding:** greedy, with a 1.1 repetition penalty over the last 64 ids by default.
   `repetition_penalty` in the request overrides it, and 1 gives plain greedy.
-- **One request at a time:** the model has one KV cache. A second **streamed** request queues for the device and is
-  answered when the first generation ends (`--queue-ms`, default 300000), sending an empty delta once a second while
-  it waits so a proxy's no-data timer does not read the queue as a hung backend (#1024). A **non-streamed** request
-  cannot be told anything while it waits, so it keeps a short bound (`--queue-ms-plain`, default 5000): past either
-  bound the request is refused with 503 + `Retry-After` rather than left waiting silently.
+- **One request at a time:** the model has one KV cache, so a second request waits for the first generation to end,
+  and the two kinds of request wait differently (#1024):
+  - a **streamed** request waits up to `--queue-ms` (default 300000, a full generation) and sends an empty content
+    delta once a second while it queues, so a proxy's no-data timer does not read the queue as a hung backend
+    (`app/npu_queue.h`). Its 200 and SSE headers are already on the wire, so a wait past `--queue-ms` is answered
+    with an `data: {"error":…}` frame inside the stream (and `[DONE]`), not with a status;
+  - a **non-streamed** request cannot be told anything while it waits, so it keeps a short bound of its own,
+    `--queue-ms-plain` (default 5000), and past it answers `503 + Retry-After: 1` with `{"type":"device_busy"}`,
+    which a client can act on. Until then its client sees nothing at all, so that bound is also how long it can
+    appear to hang.
+  A queued request occupies one HTTP worker for the whole wait (the server installs no task queue), so a long streamed
+  queue is bounded by the worker pool — irrelevant for one user, but it is why `/health` must never take the device
+  lock (it does not).
 - **Repeatable:** every generation starts from a zeroed KV cache (#400), so identical greedy
   requests give identical text, whatever ran before them.
 

@@ -982,7 +982,12 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     wait "$QPID" 2>/dev/null
     QLONG_BODY=$(cat "$QDIR/long.sse" 2>/dev/null)
     TDRQ1=$(tdr_count)
-    VQ=$(queue_verdict "$QLONG_BODY" "$QSHORT_BODY" "$TDRQ0" "$TDRQ1")
+    # Name the arm that failed: the long chat is the one in the background, so a refusal or a cut there would otherwise
+    # be reported under the short one's name and cost a round trip on the board.
+    case "$QLONG_BODY" in
+        *'data: '[[[]DONE]*) VQ=$(queue_verdict "$QLONG_BODY" "$QSHORT_BODY" "$TDRQ0" "$TDRQ1") ;;
+        *) VQ="FAIL the long (1000-token) chat, which owns the device, came back without data: [DONE]: $(printf '%.120s' "${QLONG_BODY:-no body}")" ;;
+    esac
     rm -rf "$QDIR"
     case "$VQ" in
         PASS*) pass chat-npu-queue "$NPU: $VQ" ;;

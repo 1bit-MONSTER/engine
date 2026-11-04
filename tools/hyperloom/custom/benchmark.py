@@ -239,13 +239,18 @@ def build_identity(onebit, bin_dir):
 
 
 def levers():
-    """Echo the configuration into the report, so a KEEP is explicable months later."""
+    """Echo the configuration into the report, so a KEEP is explicable months later.
+
+    Every name here has to be one the engine actually reads: an echoed knob nothing consumes makes
+    a report claim a configuration the measurement never had (`GGML_HRX_TER_Q4_0` used to be listed
+    and appears nowhere in the engine or its llama.cpp pin).
+    """
     return {
         k: env(k)
         for k in ("HL_B", "HL_UB", "HL_FA", "HL_CTK", "HL_CTV", "HL_MTP_MAX", "HL_DFLASH",
                   "HL_PARALLEL", "HL_CTX", "HL_LONGCTX", "HL_LONGTOK",
                   "GGML_HRX_Q8_PREFILL_RELAX", "GGML_HRX_GRAPH_PROGRAM_CACHE",
-                  "GGML_HRX_TER_Q4_0", "ONEBIT_HRX_DECODE_SPLIT")
+                  "ONEBIT_HRX_DECODE_SPLIT")
         if env(k)
     }
 

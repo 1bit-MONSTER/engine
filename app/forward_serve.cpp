@@ -92,6 +92,11 @@ struct ForwardEngine {
     // model: it is what turns this server into a decision endpoint as well as a chat one.
     std::unique_ptr<npu::DecisionHead> head;
     std::string head_error;  // why there is no head, for the 503 the decision route answers
+    // --dump-logits <dir>: write each generated position's raw logits (float32, vocabulary-wide)
+    // as step_<n>.bin.  The OpenAI API cannot express this -- it caps top_logprobs at 100 -- so a
+    // KL-divergence comparison against another stack (engine#671 gate b) needs the distribution
+    // itself.  Empty means off, which is the default: nothing is written unless asked.
+    std::string dump_logits;
     std::mutex mu;
 };
 
@@ -340,6 +345,16 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         for (int n = 0; n < limit; n++) {
             if (req.is_connection_closed()) break;  // the client is gone: free the NPU
             if (gram) refresh_allowed();
+            // Raw distribution for a reference comparison: sample_token() takes logits by const
+            // reference and the copy below happens before it runs, so what lands on disk is what
+            // the model produced, not what the sampler chose.
+            if (!e.dump_logits.empty()) {
+                const std::string path = e.dump_logits + "/step_" + std::to_string(n) + ".bin";
+                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(logits.data(), sizeof(float), logits.size(), f);
+                    std::fclose(f);
+                }
+            }
             const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr);
             // -1: the grammar allows no token here, so the answer ends where it is.  EOS is
             // not masked by the grammar on purpose: a constrained answer is still allowed to
@@ -662,7 +677,7 @@ void handle_systemone(ForwardEngine& e, const httplib::Request& req, httplib::Re
 }  // namespace
 
 int run_forward_serve(int argc, char** argv) {
-    std::string model, kernels, host = "127.0.0.1", alias;
+    std::string model, kernels, host = "127.0.0.1", alias, dump_logits;
     int port = 8000, streams = 1;
     npu::PrefixOptions prefix_opts;  // --prefix-slots / --prefix-cache-mb / --prefix-min-gain (#650)
     for (int i = 0; i < argc; i++) {
@@ -680,10 +695,11 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--prefix-cache-mb") prefix_opts.cache_mb = std::stoul(next());
         else if (a == "--prefix-min-gain") prefix_opts.min_gain = std::stoi(next());
         else if (a == "--npu-streams") streams = std::stoi(next());
+        else if (a == "--dump-logits") dump_logits = next();
         else throw std::runtime_error("unknown option " + a);
     }
     if (model.empty())
-        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N]");
+        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--dump-logits <dir>]");
     if (streams < 1 || streams > kNpuMaxStreams)
         throw std::runtime_error("--npu-streams takes 1.." + std::to_string(kNpuMaxStreams) +
                                  " (the device's hwctx limit), not " + std::to_string(streams));
@@ -695,6 +711,14 @@ int run_forward_serve(int argc, char** argv) {
 
     ForwardEngine e;
     e.id = alias.empty() ? std::filesystem::path(dir).filename().string() : alias;
+    if (!dump_logits.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(dump_logits, ec);
+        if (ec || !std::filesystem::is_directory(dump_logits))
+            throw std::runtime_error("--dump-logits: cannot use " + dump_logits + " as a directory");
+        e.dump_logits = dump_logits;
+        std::fprintf(stderr, "1bit forward-serve: dumping raw logits to %s\n", dump_logits.c_str());
+    }
     e.tok = std::make_unique<npu::Tokenizer>(tok_json);
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;

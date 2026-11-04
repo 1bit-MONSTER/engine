@@ -118,7 +118,9 @@ The gate is fail-closed and has two halves; a candidate that fails either is rej
 * **Greedy text**: the three replies must be byte-identical to the baseline's.
 
 Both references are recorded by the first measurement (the baseline) in `HL_STATE`
-(default `~/lb/hl-gate/<model-stem>`), outside the checkout. Every *compared* result names that state
+(default `~/lb/hl-gate/<model-stem>`), outside the checkout. Every result names the model file it measured
+in `bench_summary.model` (resolved path and its SHA-256 — the same `sha256_head` fingerprint that keys the
+references, so a result and a reference can be matched by hash), and every *compared* result names that state
 in `quality_gate.reference` (baseline model fingerprint and levers, plus the SHA-256 of `kld-base.kld`
 and `texts.json`) — the directory is per-box and the base logits are regenerated when missing, so the
 same KLD mean can read `PASS` against a reference the report never named. At 1e-4, a lever that

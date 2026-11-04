@@ -665,7 +665,9 @@ case "${1:-}" in
             CONF=$d/lemond.conf; LEMOND_INIT=true; NONINT=1
             rc=0
             printf 'LEMONADE_PORT=13305\n#LEMONADE_ADMIN_API_KEY=x\n' > "$CONF" || exit 2
-            key_on > /tmp/1bit-mint-selftest.log 2>&1 || rc=1
+            # the log goes INSIDE the scratch dir, not a fixed /tmp path: a vm-check row and a person running the
+            # selftest at the same time would interleave in one file (pi-prs on #936, the /tmp/oga_pack_import_test class)
+            key_on > "$d/mint.log" 2>&1 || rc=1
             # grep -c prints 0 AND exits 1 when it finds nothing, so `|| echo 0` would make the value "0\n0" -
             # measured here (the first run of this selftest failed on exactly that)
             n=$(grep -c '^LEMONADE_API_KEY=' "$CONF" 2>/dev/null || true)
@@ -674,7 +676,7 @@ case "${1:-}" in
             kept=$(grep -c '^LEMONADE_PORT=13305$' "$CONF" 2>/dev/null || true)
             say "mint: lines=$n hex=${#hex} mode=$mode other-lines-kept=$kept"
             [ "$n" = 1 ] && [ ${#hex} -eq 48 ] && [ "$mode" = 600 ] && [ "$kept" = 1 ] || rc=1
-            key_off > /tmp/1bit-mint-selftest.log 2>&1 || rc=1
+            key_off > "$d/mint.log" 2>&1 || rc=1
             n2=$(grep -c '^LEMONADE_API_KEY=' "$CONF" 2>/dev/null || true)
             left=$([ -e "$CONF.new" ] && echo temp-file-left || echo clean)
             say "off:  lines=$n2 $left"

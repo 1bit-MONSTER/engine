@@ -45,7 +45,8 @@ bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, in
 // A device call is dispatch-bound: 1.4-1.5 ms whatever the row count (docs/onnx.md), so below a few rows the
 // launch costs more than the host loop it replaces. `kDeviceMinRows` is the first row count that keeps more
 // margin than a busy box adds: at 12 rows the five measured Qwen3-0.6B projection shapes are 1.13-1.23x on a
-// quiet box but only break-even for k/v on a loaded one, and at 16 rows they are 1.53-1.64x either way.
+// quiet box but only break-even for k/v on a loaded one, and at 16 rows they are 1.53-1.64x on a quiet box and
+// 1.45-1.65x on a loaded one.
 // (A cell's own spread is 1.00-1.09x at load 1.7-2.7 and 1.51-3.45x at load 5-14; docs/onnx.md has both
 // tables.) gemm_q8 uses the host loop below it whatever designs are configured. It applies only with ONEBIT_EP_NPU. A host-routed call is not a
 // fallback: it logs `npu_qdq_host_rows`, so the absence of both that line and `npu_qdq_fallback` is what

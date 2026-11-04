@@ -221,6 +221,23 @@ def serve_lever_args():
     return args
 
 
+def build_identity(onebit, bin_dir):
+    """Name the binary that produced the measurement, inside the artifact itself.
+
+    A session report outlives the shell it was made in, and this workload is routinely measured on
+    more than one build of the same tree (out-of-tree `hl-engine-build` / `-c20`). Without this field
+    two results that differ only by build are indistinguishable, so a KEEP can be read against a binary
+    it was never measured on. ``1bit`` is far under ``sha256_head``'s 64 MiB head, so this is the whole
+    binary's hash, not a prefix.
+    """
+    onebit, bin_dir = pathlib.Path(onebit), pathlib.Path(bin_dir)
+    return {
+        "onebit": str(onebit),
+        "bin_dir": str(bin_dir),
+        "sha256": sha256_head(onebit),
+    }
+
+
 def levers():
     """Echo the configuration into the report, so a KEEP is explicable months later."""
     return {
@@ -443,7 +460,8 @@ def main():
         "completed": 0,
         "total_output_tokens": tokens,
         "quality_gate": {"passed": False, "reason": "not run"},
-        "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE")},
+        "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
+                          "build": build_identity(onebit, bin_dir)},
     }
 
     def finish(passed, reason, rc=0):

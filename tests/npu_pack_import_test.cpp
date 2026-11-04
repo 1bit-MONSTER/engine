@@ -656,6 +656,20 @@ void test_mlp_gu(const std::string& golden_dir) {
                 tiled.size() / onebit::npu::kTileBytes);
 }
 
+// A pack directory is only an OGA NPU pack if it ships the compiler's programs: `dd_metastate_*.fconst`.
+// The *hybrid* flavour of these packs (Qwen2.5-0.5B-Instruct_rai_1.8.0_hybrid) ships model.bin instead and
+// has no cache/ directory either -- it is a different on-disk layout, and the importer has nothing to read
+// from it. That is a skip, named, not a failure: before this, the leg died with
+// "FAIL exception: filesystem error: directory iterator cannot open directory: .../cache", which says
+// nothing about what the pack is.
+bool is_oga_npu_pack(const std::string& pack) {
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(pack, ec)) {
+        if (e.path().filename().string().rfind("dd_metastate_", 0) == 0) return true;
+    }
+    return false;
+}
+
 void test_pack(const std::string& pack, const std::string& golden_dir) {
     const pi::Plan p = pi::plan(pack);
     const int layers = p.dims.layers;
@@ -923,7 +937,11 @@ int main(int argc, char** argv) {
     // golden dir only (CMakeLists add_test npu_pack_import), so the leg self-skips. That skip must not
     // be reported as a pass: three of the four packs on this box were red behind a green
     // "all npu-pack checks passed" line (engine#842 review). The final line now says which legs ran.
-    const bool pack_ran = !pack.empty() && fs::exists(pack + "/model.onnx");
+    const bool pack_given = !pack.empty() && fs::exists(pack + "/model.onnx");
+    const bool pack_ran = pack_given && is_oga_npu_pack(pack);
+    if (pack_given && !pack_ran)
+        std::printf("skip pack: %s ships no dd_metastate_*.fconst, so it is the hybrid/model.bin flavour of "
+                    "these packs and not an OGA NPU pack this importer reads\n", pack.c_str());
     try {
         test_bounds();
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
@@ -943,6 +961,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("all npu-pack checks passed%s\n",
-                pack_ran ? " (including the pack leg)" : " -- pack leg SKIPPED, no pack directory given");
+                pack_ran ? " (including the pack leg)"
+                         : (pack_given ? " -- pack leg SKIPPED, not an OGA NPU pack"
+                                       : " -- pack leg SKIPPED, no pack directory given"));
     return 0;
 }

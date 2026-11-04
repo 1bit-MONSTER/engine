@@ -362,7 +362,21 @@ std::string op_to_projection(const std::string& op) {
 
 DeclaredMap read_declared(const std::string& pack_dir) {
     DeclaredMap out;
-    for (const auto& e : fs::directory_iterator(pack_dir + "/cache")) {
+    // `cache/` holds the compiler's per-op metadata (the JSON twin of the .meta protobuf) and is what makes
+    // the declared-N/K cross-checks possible.  It is absent in the *hybrid* flavour of these packs -- the
+    // ones that ship model.bin instead of dd_metastate_*.fconst -- and iterating a missing directory threw
+    // std::filesystem_error straight out of the importer, so an unsupported pack surfaced as
+    // "FAIL exception: filesystem error: directory iterator cannot open directory" instead of a diagnosis.
+    // No cache means no declarations, which is exactly what an empty map says.
+    const std::string cache_dir = pack_dir + "/cache";
+    std::error_code ec;
+    if (!fs::is_directory(cache_dir, ec)) {
+        std::fprintf(stderr,
+                     "note: %s has no cache/ (the compiler's per-op metadata), so the declared-N/K "
+                     "cross-checks are skipped for this pack\n", pack_dir.c_str());
+        return out;
+    }
+    for (const auto& e : fs::directory_iterator(cache_dir, ec)) {
         const std::string n = e.path().filename().string();
         if (n.size() < 10 || n.compare(n.size() - 10, 10, "_meta.json") != 0) continue;
         std::ifstream f(e.path());

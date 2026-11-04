@@ -191,6 +191,30 @@ def main():
     for k in ("HL_DFLASH", "HL_DFLASH_GGUF", "HL_MTP_HEAD", "HL_MTP_MAX"):
         os.environ.pop(k, None)
 
+    # The artifact has to say whether the graph stayed on HRX, and for a year of runs it could not: the
+    # report the parser reads only reaches serve.log when serve lifts llama-server's verbosity, so
+    # `placement` was null in 147 of 147 artifacts on this box while no serve.log carried the line.
+    # `--placement-report` is that lift; the parser is checked against the engine's own documented
+    # line (docs/serve.md, tests/hrx_placement_test.cpp), and a log without it stays None, not 0.
+    assert "--placement-report" in bench.serve_batch_args(), bench.serve_batch_args()
+    with tempfile.TemporaryDirectory() as tmp:
+        clean = pathlib.Path(tmp) / "clean.log"
+        clean.write_text("placement_observer: placement: 512 nodes, 0 off HRX (none), 1 graph splits\n",
+                         encoding="utf-8")
+        assert bench.placement_summary(clean) == {"graphs_reported": 1, "nodes": 512, "off_hrx": 0,
+                                                 "worst_graph_off_hrx": 0}, bench.placement_summary(clean)
+        worst = pathlib.Path(tmp) / "worst.log"
+        worst.write_text(
+            "placement_observer: placement: 512 nodes, 0 off HRX (none), 1 graph splits\n"
+            "placement_observer: placement: 354 nodes, 20 off HRX (MUL_MAT x 20), 5 graph splits\n",
+            encoding="utf-8")
+        got = bench.placement_summary(worst)
+        assert got["graphs_reported"] == 2 and got["off_hrx"] == 20, got
+        assert got["worst_graph_off_hrx"] == 20, got
+        silent = pathlib.Path(tmp) / "silent.log"
+        silent.write_text("I slot print_timing: id 0 | task 1 | eval time\n", encoding="utf-8")
+        assert bench.placement_summary(silent) is None, bench.placement_summary(silent)
+
     print("hyperloom_benchmark_test: OK")
     return 0
 

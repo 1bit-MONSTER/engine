@@ -162,7 +162,8 @@ def bench_args():
 
 
 def serve_batch_args():
-    """The batch levers `1bit serve` accepts.
+    """The arguments every serve leg carries: the batch levers `1bit serve` accepts, and the two
+    measurement conditions it has to be started with.
 
     `1bit serve` is a wrapper with its own argument parser: it takes `-fa` (forwarded to its
     llama-server child) but NOT `-b`/`-ub`/`-ctk`/`-ctv` -- it sets those itself per route, and it
@@ -173,8 +174,15 @@ def serve_batch_args():
     model's OWN context (262144 on Qwen3.8-27B = 16.1 GiB of KV), which only fits when the box
     happens to be idle -- under another lane's GTT the engine's fit check aborts the server and every
     candidate fails for a reason that has nothing to do with the lever under test. `HL_CTX` overrides.
+
+    `--placement-report` is the second one. It is what makes serve pass `-lv 4` to its llama-server,
+    and llama-server drops the library's INFO lines below that (`common/log.cpp`), so the report
+    `GGML_HRX_REPORT=2` asks ggml-hrx for never reached serve.log: `bench_summary.placement` was null
+    in every artifact this workload has ever written, and an unrecorded placement cannot be told
+    apart from a graph that left HRX (`docs/serve.md`, engine#390). It reports, it does not check:
+    serve's `--strict-device` is the one that refuses, and `GGML_HRX_STRICT=0` already opts out here.
     """
-    args = ["-c", str(serve_ctx())]
+    args = ["-c", str(serve_ctx()), "--placement-report"]
     if env("HL_FA"):
         args += ["-fa", env("HL_FA")]
     return args
@@ -420,8 +428,8 @@ def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir, longctx=0
     # GGML_HRX_STRICT=0: on this pin the MTP draft graph has one node (the head's PAD) off HRX, and
     # strict placement aborts the server on it -- the engine's own hardware gate runs its server the
     # same way (scripts/hw-gate.sh), counting placement instead of aborting. GGML_HRX_REPORT=2 asks
-    # ggml-hrx for the counts; `1bit serve` exposes no `-lv` passthrough, so they only surface when
-    # its own verbosity reaches the library's INFO level, and `placement` stays null otherwise.
+    # ggml-hrx for every graph's counts; `serve_batch_args` carries `--placement-report`, which is
+    # what lifts llama-server's verbosity enough for those lines to reach the log at all.
     run_env = dict(os.environ, GGML_HRX_STRICT="0", GGML_HRX_REPORT="2")
     logtext = (out_dir / "serve.log").open("w", encoding="utf-8")
     proc = subprocess.Popen(cmd, env=run_env, stdout=logtext, stderr=subprocess.STDOUT,

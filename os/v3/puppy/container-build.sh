@@ -52,20 +52,27 @@ cd /work/woof-CE
 # skeleton chown below, and mksquashfs keeps whatever ownership it finds - the frugalpup docs arrived owned by
 # 6975/2030 and the packed-SFS check refused exactly those three files on cycle 16d. So the trees are normalised
 # immediately before woof-CE packs them. -all-root is not available here (SFSCOMP is woof-CE's own), so the tree is
-# chowned; the patch is idempotent, counted, and `bash -n`'d, because a silently unapplied patch would be a silent
-# regression of a security fix.
+# chowned - but a bare `chown -R` ALSO strips every setuid/setgid bit it touches (POSIX: chown clears them), and
+# that is what the c20 board hit as "Activated service 'org.freedesktop.login1' failed: The permission of the setuid
+# helper is not correct" - measured, the built tree has 12 setuid helpers and the packed image had none, so passwd,
+# su and the dbus launch helper could not work. /recipe/fix-ownership.sh does chown+restore and refuses a tree whose
+# count changed. The patch is idempotent, counted, and `bash -n`'d, because a silently unapplied patch would be a
+# silent regression of a security fix.
 if ! grep -q '1bit: ownership before pack' woof-code/3builddistro; then
     sed -i \
-        -e 's@^\(\s*\)mksquashfs rootfs-complete @\1chown -R 0:0 rootfs-complete 2>/dev/null || true   # 1bit: ownership before pack\n\1mksquashfs rootfs-complete @' \
-        -e 's@^\(\s*\)mksquashfs sandbox3/devx @\1chown -R 0:0 sandbox3/devx 2>/dev/null || true   # 1bit: ownership before pack\n\1mksquashfs sandbox3/devx @' \
+        -e 's@^\(\s*\)mksquashfs rootfs-complete @\1sh /recipe/fix-ownership.sh rootfs-complete   # 1bit: ownership before pack\n\1mksquashfs rootfs-complete @' \
+        -e 's@^\(\s*\)mksquashfs sandbox3/devx @\1sh /recipe/fix-ownership.sh sandbox3/devx   # 1bit: ownership before pack\n\1mksquashfs sandbox3/devx @' \
         woof-code/3builddistro
 fi
 n=$(grep -c '1bit: ownership before pack' woof-code/3builddistro)
 [ "$n" = 2 ] || {
     echo "build: REFUSED: the woof-CE ownership patch landed $n times in woof-code/3builddistro (expected 2) - upstream changed, re-measure" >&2
     exit 1; }
+grep -q 'sh /recipe/fix-ownership.sh' woof-code/3builddistro || {
+    echo "build: REFUSED: 3builddistro still chowns with a bare chown -R, which strips the image's setuid bits" >&2
+    exit 1; }
 bash -n woof-code/3builddistro || { echo "build: REFUSED: the patched 3builddistro does not parse" >&2; exit 1; }
-echo "   ok: 3builddistro chowns rootfs-complete and devx before packing them"
+echo "   ok: 3builddistro normalises rootfs-complete and devx before packing, keeping their setuid bits"
 mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-output
 [ -e ../local-repositories ] || ln -s /work/local-repositories ../local-repositories
 [ -f local-repositories/vercmp ] || curl -fsSL https://raw.githubusercontent.com/puppylinux-woof-CE/initrd_progs/master/pkg/w_apps_static/w_apps/vercmp.c | gcc -x c -o local-repositories/vercmp -
@@ -184,10 +191,10 @@ echo "   ok: inittab tty1 -> /usr/local/bin/1bit-console (plogin on the desktop 
 # skeleton that already says 1bit-os is left alone - and /etc/hosts has to agree or sudo, sshd banners and
 # every log line carry a name that does not resolve. Both are edited here rather than shipped as whole
 # files, because /etc/hosts is woof-CE's and has two lines (v4 and v6).
-# mDNS (1bit-os.local) is NOT shipped: avahi-daemon is not in this rootfs and adding it would mean dbus
-# activation on a non-systemd Puppy, and QEMU's user-mode network forwards no multicast, so nothing here
-# could measure whether it worked. The board reads the address off the console menu instead - said plainly
-# in the hand-off rather than shipped blind.
+# mDNS (1bit-os.local, cycle 21 item 10): avahi-daemon + libnss-mdns are package rows, and 18onboard-mdns starts the
+# responder (and the D-Bus system bus it needs, which nothing else in a non-systemd image starts). Asserted here rather
+# than assumed, because woof-CE's package table is one line per package and a split that drops the binary fails at boot
+# on a machine nobody can log into. nsswitch gains the mdns line below so the name resolves ON the appliance too.
 echo "== hostname 1bit-os"
 [ -f "$skeleton/etc/hosts" ] || {
     echo "build: REFUSED: no rootfs-skeleton/etc/hosts - the appliance name would not resolve" >&2; exit 1; }
@@ -198,6 +205,31 @@ grep -q '^1bit-os$' "$skeleton/etc/hostname" || {
 grep -q '1bit-os' "$skeleton/etc/hosts" || {
     echo "build: REFUSED: /etc/hosts does not name the appliance" >&2; exit 1; }
 echo "   ok: hostname 1bit-os, and /etc/hosts agrees (rc.sysinit only renames a stock puppypc)"
+
+# item 10: the name a client clicks. The binary is a package row; its PRESENCE is asserted after packing (the
+# packages land in the rootfs at 2createpackages, which runs after this block - measured: checking here refused a
+# healthy build). The nss line is a file edit and has to happen now, before the sfs is packed.
+if [ -f "$skeleton/etc/nsswitch.conf" ] && ! grep -q 'mdns4_minimal' "$skeleton/etc/nsswitch.conf"; then
+    sed -i 's/^hosts:[[:space:]]*files[[:space:]]*dns[[:space:]]*$/hosts:          files mdns4_minimal [NOTFOUND=return] dns/' \
+        "$skeleton/etc/nsswitch.conf"
+fi
+grep -q 'mdns4_minimal' "$skeleton/etc/nsswitch.conf" 2>/dev/null || {
+    echo "build: REFUSED: nsswitch.conf has no mdns line, so `getent hosts 1bit-os.local` cannot work on the box" >&2
+    exit 1; }
+echo "   ok: nsswitch resolves .local (mdns4_minimal); avahi-daemon is asserted in the packed image"
+
+# ...and the account the bus runs as. /usr/share/dbus-1/system.conf carries <user>messagebus</user>, and woof-CE
+# installs a package by unpacking it, so Debian's postinst never ran adduser: measured in the c20 image, /etc/passwd has
+# no messagebus and dbus-daemon --system exits with "Failed to drop privileges". Restored here with a fixed id below
+# 1000, which is also what the packed-image uid refusal expects.
+if ! grep -q '^messagebus:' "$skeleton/etc/passwd"; then
+    printf 'messagebus:x:110:110::/nonexistent:/usr/sbin/nologin\n' >> "$skeleton/etc/passwd"
+fi
+grep -q '^messagebus:' "$skeleton/etc/group" || printf 'messagebus:x:110:\n' >> "$skeleton/etc/group"
+grep -q '^messagebus:' "$skeleton/etc/passwd" && grep -q '^messagebus:' "$skeleton/etc/group" || {
+    echo "build: REFUSED: could not create the messagebus account dbus-daemon --system needs (avahi would not start)" >&2
+    exit 1; }
+echo "   ok: messagebus account for the system bus (dbus-daemon refuses to run as root without it)"
 
 # U3/U4: the release package goes into the rootfs BEFORE 3builddistro, which packs it into the puppy SFS.
 # Nothing is installed into it - the payload is relocatable and lemond-onebit finds bin/ and 1bit/ beside
@@ -274,6 +306,8 @@ if [ -n "${PAYLOAD:-}" ]; then
     install -D -m 644 /recipe/embed/etc/1bit/palemoon-prefs.js "$skeleton/etc/1bit/palemoon-prefs.js"
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-lemonade-webapp "$skeleton/usr/local/bin/1bit-lemonade-webapp"
     install -D -m 755 /recipe/embed/etc/init.d/24onboard-webapp "$skeleton/etc/init.d/24onboard-webapp"
+    # item 10: the responder that makes http://1bit-os.local:13305 work from another machine (cycle 21, owner).
+    install -D -m 755 /recipe/embed/etc/init.d/18onboard-mdns "$skeleton/etc/init.d/18onboard-mdns"
     install -D -m 644 /recipe/embed/opt/1bit/webapp/index.html "$skeleton/opt/1bit/webapp/index.html"
     install -D -m 644 /recipe/embed/etc/xdg/autostart/1bit-lemonade-webapp.desktop \
         "$skeleton/etc/xdg/autostart/1bit-lemonade-webapp.desktop"
@@ -301,6 +335,7 @@ if [ -n "${PAYLOAD:-}" ]; then
     chmod 0755 "$skeleton"/etc/init.d/03onboard-efivars "$skeleton"/etc/init.d/05onboard-data \
         "$skeleton"/etc/init.d/06onboard-logs "$skeleton"/etc/init.d/08onboard-presets \
         "$skeleton"/etc/init.d/10lemonade \
+        "$skeleton"/etc/init.d/18onboard-mdns \
         "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console \
         "$skeleton"/etc/init.d/24onboard-webapp "$skeleton"/etc/init.d/26onboard-board \
         "$skeleton"/etc/init.d/27onboard-installer "$skeleton"/etc/init.d/zz-onboard-ports
@@ -422,15 +457,61 @@ if [ -s /tmp/1bit-bad-owners ]; then
     exit 1
 fi
 echo "   ok: every packed entry is owned by a system account (uid and gid < 1000)"
+# SECURITY, on the ARTIFACT: the chown that makes the ownership policy true also clears setuid/setgid (POSIX), so the
+# restore has to be proved in the packed image and not in the tree. A helper that lost its bit still LOOKS present,
+# and what it breaks (login1 activation, passwd, su) is not in the boot path, so nothing else would ever notice.
+echo "== setuid/setgid check on the packed SFS"
+: > /tmp/1bit-suid-report
+for f in sandbox3/build/*.sfs; do
+    unsquashfs -ll "$f" 2> /dev/null | awk -v F="$(basename "$f")" '$1 ~ /^-.{2}[sS]/ || $1 ~ /^d.{2}[sS]/ {print F": "$1" "$6}' >> /tmp/1bit-suid-report
+done
+suid_n=$(grep -cv "dbus-daemon-launch-helper" /tmp/1bit-suid-report 2> /dev/null || true)
+if ! grep -q 'dbus-daemon-launch-helper' /tmp/1bit-suid-report; then
+    echo "build: REFUSED: no setuid dbus-daemon-launch-helper in the packed image. The pre-pack chown stripped it," >&2
+    echo "       and without it D-Bus cannot activate login1/hostname1/wpa_supplicant (the c20 board's" >&2
+    echo "       'permission of the setuid helper is not correct'). Entries found: $suid_n" >&2
+    sed 's/^/   /' /tmp/1bit-suid-report >&2
+    exit 1
+fi
+[ "${suid_n:-0}" -ge 5 ] || {
+    echo "build: REFUSED: only ${suid_n:-0} setuid/setgid entries in the packed image (expected the 12 helpers the" >&2
+    echo "       packages ship: passwd, chsh, chfn, sudo, ssh-keysign, mount/umount/su-FULL, fusermount3, ntfs-3g," >&2
+    echo "       gpasswd, the dbus launch helper); the pre-pack chown stripped them again." >&2
+    sed 's/^/   /' /tmp/1bit-suid-report >&2
+    exit 1
+}
+echo "   ok: $suid_n setuid/setgid entries survive the pre-pack chown, incl. the D-Bus launch helper"
 # an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
 miss=""
 # the demo path needs a browser, a recorder and an encoder; an image without them cannot show or record itself
 for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil usr/sbin/sfdisk usr/bin/bash \
-         usr/bin/ffmpeg usr/bin/ffprobe usr/bin/python3 opt/palemoon/palemoon; do
+         usr/bin/ffmpeg usr/bin/ffprobe usr/bin/python3 opt/palemoon/palemoon usr/sbin/avahi-daemon; do
     in_image "$b" || miss="$miss $b"
 done
 [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss (packages-extra did not land)" >&2; exit 1; }
-echo "   ok: sudo, apt, sshd, mokutil, sfdisk, bash are in the image"
+# item 10: the responder AND the line that lets the box resolve the name it publishes, both read out of the packed sfs
+packed_nss=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/nsswitch.conf 2>/dev/null)
+case "$packed_nss" in
+    *mdns4_minimal*) ;;
+    *) echo "build: REFUSED: the packed nsswitch.conf has no mdns line (1bit-os.local would not resolve on the box)" >&2
+       exit 1 ;;
+esac
+echo "   ok: sudo, apt, sshd, mokutil, sfdisk, bash, avahi-daemon are in the image and .local resolves"
+# item 10: and the responder must actually be STARTED. rc.services runs every executable /etc/init.d script with
+# `start`, but skips any whose text contains the bus binary's name (`grep -qF`, see /etc/rc.d/rc.services - Puppy's
+# way of not starting the bus twice). Applied here to the packed script, i.e. the exact file a boot runs.
+packed_mdns=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/init.d/18onboard-mdns 2>/dev/null)
+if [ -z "$packed_mdns" ]; then
+    echo "build: REFUSED: the packed image has no etc/init.d/18onboard-mdns (1bit-os.local is never announced)" >&2
+    exit 1
+fi
+if printf '%s' "$packed_mdns" | grep -qF dbus-daemon; then
+    echo "build: REFUSED: etc/init.d/18onboard-mdns names the bus binary, so rc.services would SKIP it and the" >&2
+    echo "       responder would never start (measured on the c20 image's /etc/rc.d/rc.services). rc.sysinit already" >&2
+    echo "       starts that bus; this script must only wait for it." >&2
+    exit 1
+fi
+echo "   ok: etc/init.d/18onboard-mdns will be executed by rc.services (no bus-binary token, so no skip)"
 rc_country=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/rc.country 2>/dev/null |
     grep -c "^if false ; then # 1bit: a headless boot must not ask" || true)
 [ "${rc_country:-0}" = 1 ] || {

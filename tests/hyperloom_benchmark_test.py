@@ -165,6 +165,47 @@ def main():
         base.write_bytes(b"logits " * 999)
         assert bench.gate_reference({}, base, texts)["base_kld_sha256"] != ident["base_kld_sha256"]
 
+    # And it has to name what *drafted*: `--dflash` is handed `HL_DFLASH_GGUF` (relative default
+    # `dflash.gguf`, so the run's cwd decided it too) and this model has two drafter quants on the box,
+    # so `{"HL_DFLASH": "1"}` -- the arm that produced the 50.87 best of record -- is not a
+    # configuration. The tuner drops a drafter-quant variant because overwriting that env "would make
+    # its number incomparable to the baseline"; the result JSON never recorded it at all.
+    with tempfile.TemporaryDirectory() as tmp:
+        drafter = pathlib.Path(tmp) / "q4k.gguf"
+        drafter.write_bytes(b"GGUF not really a drafter\n")
+        os.environ["HL_DFLASH"], os.environ["HL_DFLASH_GGUF"] = "1", str(drafter)
+        ident = bench.drafting_identity()
+        assert ident["dflash"]["path"] == str(drafter), ident
+        assert ident["dflash"]["sha256"] == hashlib.sha256(drafter.read_bytes()).hexdigest(), ident
+        assert ident["dflash"]["env"] == "HL_DFLASH_GGUF", ident
+        assert bench.dflash_gguf_arg() == str(drafter)          # the value serve is really handed
+        # Same lever, other file: a different configuration, and the report says which one.
+        other = pathlib.Path(tmp) / "q8_0.gguf"
+        other.write_bytes(b"GGUF another drafter\n")
+        os.environ["HL_DFLASH_GGUF"] = str(other)
+        assert bench.drafting_identity()["dflash"]["path"] == str(other)
+        assert bench.drafting_identity()["dflash"]["sha256"] == \
+            hashlib.sha256(other.read_bytes()).hexdigest()
+        # Unset: the default is resolved and marked as the default, not left unnamed...
+        os.environ.pop("HL_DFLASH_GGUF")
+        assert bench.dflash_gguf_arg() == "dflash.gguf"
+        ident = bench.drafting_identity()
+        assert ident["dflash"]["env"] == "default", ident
+        assert pathlib.Path(ident["dflash"]["path"]).is_absolute(), ident
+        # ...and an absent file is a null hash, not a guess.
+        assert ident["dflash"]["sha256"] is None, ident
+        # Drafting off is an empty map: no claim about a drafter that never ran.
+        os.environ["HL_DFLASH"] = "0"
+        assert bench.drafting_identity() == {}, bench.drafting_identity()
+        # An external MTP head is the same class of input, and is reported when it is the one in use.
+        os.environ.pop("HL_DFLASH")
+        os.environ["HL_MTP_HEAD"], os.environ["HL_MTP_MAX"] = str(drafter), "6"
+        ident = bench.drafting_identity()
+        assert ident["mtp_head"]["sha256"] == hashlib.sha256(drafter.read_bytes()).hexdigest(), ident
+        assert ident["mtp_head"]["env"] == "HL_MTP_HEAD", ident
+    for k in ("HL_DFLASH", "HL_DFLASH_GGUF", "HL_MTP_HEAD", "HL_MTP_MAX"):
+        os.environ.pop(k, None)
+
     print("hyperloom_benchmark_test: OK")
     return 0
 

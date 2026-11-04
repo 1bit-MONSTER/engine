@@ -230,7 +230,7 @@ def serve_lever_args():
     args = serve_batch_args()
     mtp_max_raw = env("HL_MTP_MAX")
     if dflash_on():
-        args += ["--dflash", env("HL_DFLASH_GGUF", "dflash.gguf")]
+        args += ["--dflash", dflash_gguf_arg()]
     elif mtp_max_raw:
         mtp_max = env_int("HL_MTP_MAX", 0)
         if mtp_max <= 0:
@@ -243,6 +243,38 @@ def serve_lever_args():
     if parallel:
         args += ["--parallel", str(parallel)]
     return args
+
+
+def dflash_gguf_arg():
+    """The drafter path handed to `--dflash`. One definition, so the report cannot name another."""
+    return env("HL_DFLASH_GGUF", "dflash.gguf")
+
+
+def drafting_identity():
+    """Name the drafting files the serve leg actually used, as resolved paths with hashes.
+
+    Same class as ``build_identity``/``device_stack``, and the gap the tuner itself points at: it
+    *drops* a drafter-quant variant because overwriting `HL_DFLASH_GGUF` "would make its number
+    incomparable to the baseline" (`run-26030.log`, 2026-10-30 18:14), and this model has two drafter
+    quants on the box (`~/models/qwen38/DFlash2/{q8_0,q4k}.gguf`), yet a result echoed `HL_DFLASH`
+    alone -- so `{"HL_DFLASH": "1"}`, the arm that produced the 50.87 best of record, names no
+    drafter at all. `--dflash` is handed a *relative* path by default, so the run's cwd decided it
+    too: the path here is resolved, and `env` says whether it came from the environment or the
+    default rather than leaving the default unnamed.
+    """
+    ident = {}
+    if dflash_on():
+        raw = dflash_gguf_arg()
+        path = pathlib.Path(raw).expanduser().resolve()
+        ident["dflash"] = {"env": "HL_DFLASH_GGUF" if env("HL_DFLASH_GGUF") else "default",
+                          "path": str(path),
+                          "sha256": sha256_head(path) if path.is_file() else None}
+    external_head = env("HL_MTP_HEAD")
+    if external_head and not dflash_on():
+        path = pathlib.Path(external_head).expanduser().resolve()
+        ident["mtp_head"] = {"env": "HL_MTP_HEAD", "path": str(path),
+                            "sha256": sha256_head(path) if path.is_file() else None}
+    return ident
 
 
 def build_identity(onebit, bin_dir):
@@ -546,7 +578,9 @@ def main():
         "quality_gate": {"passed": False, "reason": "not run"},
         "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
                           "build": build_identity(onebit, bin_dir),
-                          "device_stack": device_stack()},
+                          "device_stack": device_stack(),
+                          "drafting": drafting_identity(),
+                          "llama_bench_reps": reps},
     }
 
     def finish(passed, reason, rc=0):

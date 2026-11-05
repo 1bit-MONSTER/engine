@@ -15,12 +15,17 @@
 
 // The NPU device lock (engine#612): who may have the XDNA 2 NPU.
 //
-// One process owns the device by default. The driver does not stop a second one --
-// amdxdna's npu4 sets hwctx_limit = 16 (drivers/accel/amdxdna/npu4_regs.c) and only
-// rejects a context past that -- but the two streams share one DMA engine and each
-// stream allocates its own copy of the weights, so a second serving process makes
-// the first slower and doubles the footprint: two engines on two models measured
-// 34.1 % and 70.4 % of solo, 0.41x aggregate (docs/npu.md, "Two streams on one NPU").
+// One process owns the device by default. hwctx_limit = 16 (drivers/accel/amdxdna/
+// npu5_regs.c:74; npu4_regs.c:174 says the same) is not the reason: that counts the contexts of one client, while the
+// limit on a second client is the array partition -- 8 columns, and the kernel set this
+// engine ships asks for all 8, so a second client has no columns to be given. Before
+// third_party/patches/amdxdna/0003 the solver shared the tiles anyway and took the array
+// down for every client (engine#1084, measured 2026-11-05); with it, the second client
+// is refused with -ENODEV / code 102. And even where a kernel set leaves columns free,
+// the two streams share one DMA engine and each allocates its own copy of the weights,
+// so a second serving process makes the first slower and doubles the footprint: two
+// engines on two models measured 34.1 % and 70.4 % of solo, 0.41x aggregate
+// (docs/npu.md, "Two streams on one NPU").
 //
 // So the lock is a policy, and the policy is exclusive unless the operator asks:
 //   streams <= 1  LOCK_EX  today's behaviour, and still what a bare run takes

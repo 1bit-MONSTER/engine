@@ -364,9 +364,15 @@ cause is stated as open rather than as dispatch.
 
 The next step is the one comparison these numbers cannot make, not a redesign: **both arms with
 `ONEBIT_EP_QDQ_PROF=1` in one window** — the device arm's `dev_call_ms/call` against the host arm's `host_ms/call` on
-the graph's own int8 bytes, which prices candidate 2 directly. `NPU_C_SYNC_PROF=1` (engine#988) prints the C-sync
-counters per call if the syncs inside `dev_call_ms` need separating further. What a *fix* would look like if
-(1) dominates is one launch covering many projections — a resident weight layout and a pass-level submission, rather
+the graph's own int8 bytes, which prices candidate 2 directly. The call's own sections are timed as well —
+the same line carries `dev_split_wpack` (weight pack into the BO + its upload, a cache miss), `dev_split_aupload`,
+`dev_split_async` (the A flush), `dev_split_launch` (launch + wait), `dev_split_readback` (C invalidation + the copy
+back) and `dev_split_other` (the device lock, the kernel lookup and the EP's own frame around the call, i.e. what the
+five named sections do not account for) — so `dev_call_ms` adds up on the face of the line rather than leaving a reader
+to attribute one residue by subtraction. `NPU_C_SYNC_PROF=1` (engine#988) still prints the C-sync counters per call
+if a section needs separating further. These sections are timed only when the knob is on (a plain call pays one branch
+per section), and **no device window has printed them yet** — they appear from the next one on. What a *fix* would
+look like if (1) dominates is one launch covering many projections — a resident weight layout and a pass-level submission, rather
 than the per-projection ELF this leg uses — which is also why the threshold discussion above stands unchanged:
 `kDeviceMinRows` is about one call, and the model-level question is about 196 of them. Worth knowing before anyone
 starts that work: the resident-weight half of it has now been measured and is worth 35 ms/pass for 568 MiB, i.e. the
@@ -518,7 +524,11 @@ its own wall time went, as one line per process at exit —
 `qdq_prof calls_dev=… calls_host=… rows_dev=… rows_host=… dev_call_ms=… dev_epi_ms=… host_ms=…`, split into
 the device call (kernel, BO writes, both syncs, the wait), the epilogue both legs share, and the host loop —
 so two runs that differ only in the leg price that leg on the graph's own int8 bytes, which is the one thing
-a per-call probe timing synthetic operands cannot do. It writes to the EP trace when `ONEBIT_EP_TRACE` is set
+a per-call probe timing synthetic operands cannot do. On the device leg the call is split further, by the device
+leg's own timers: `dev_split_wpack` (weight pack + upload, a cache miss — once per weight, not per call),
+`dev_split_aupload`, `dev_split_async` (the A flush), `dev_split_launch` (launch + wait), `dev_split_readback`
+(C invalidation + the copy back to the caller's buffer) and `dev_split_other`, which is `dev_call_ms` minus those
+five. The sections are timed only when the knob is on. The line writes to the EP trace when `ONEBIT_EP_TRACE` is set
 and to stderr when it is not: a knob whose only output can silently vanish is how a debugging session gets
 lost, and this file already paid for that once.
 

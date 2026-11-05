@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pi-hrx-fabric <fabric@1bit.local>
+Date: Thu, 5 Nov 2026 06:05:00 -0400
+Subject: [PATCH] accel/amdxdna: never share an array partition between two
+ clients
+
+The solver's partition node carried `exclusive = false` with the note "always set exclusive to false for
+now", so when no free column range was left, allocate_partition() fell back to sharing a live context's
+partition (nshared++). For the AIE2P designs this fleet runs, each design's CDO asks for all 8 columns
+(measured: `xrt-smi examine -r aie-partitions` shows two contexts of two different clients in
+"Partition Index 0, Columns [0..7]"), so the second client's configuration takes the array out from under
+the first - and from then on every client's dispatch hangs:
+
+  code 614 / "state 8, run 0 of 28", firmware capture Context ID 15, DPU PC 0xffffffff,
+  Context PC 0x28b060ad, "aie2_tdr_recover_all: Array stopped dispatching"
+
+Measured on strixhalo 2026-11-05 with the shipped payload, two NPU clients that had each dispatched once:
+3/3 wedge with their requests overlapping and 3/3 with the requests strictly sequential, while one context
+was clean in every row (1 000-3 408 positions, 3 851-token prefills x5) and a second serve that never
+dispatched was clean too (a loaded client holds no device context until its first dispatch).
+
+What must keep working is sharing *within* one client. The model-generic NPU route (ZR1 per-op forward)
+holds several hardware contexts from one process - one per design - and it ran 600 tokens / 67 200 submits
+with 0 TDR on 56AB9475, i.e. with the partitions shared.
+
+So make the owner explicit: `alloc_requests.owner` names the client (set from hwctx->client, one per open
+file), `partition_node.owner` records whose partition it is, and allocate_partition() only considers
+partitions whose owner matches. get_free_partition() is unchanged, so a distinct column range is still
+handed out whenever one is free and designs using fewer columns than the array keep running concurrently.
+Only the case that wedges the array - no free range, so a second *client* would share tiles - becomes a
+clean -ENODEV at context creation (client: "code 102, No such device"; kernel: "Allocate AIE resource
+failed, ret -19"), and the partition is released when the holder closes its contexts.
+
+Built against the pin + 0001 + 0002 on the 7.4.0-rc1 headers (rc 0, no warnings). NOT yet proven on
+hardware in this shape: a per-context version of this patch was, and it refused the second context of one
+client's multi-context route (measured by the ZR1 lane, 3/3), which is why the owner, and not the context,
+is the unit here.
+
+Signed-off-by: bong-water-water-bong <bong-water-water-bong@users.noreply.github.com>
+---
+ drivers/accel/amdxdna/aie2_ctx.c    |  2 ++
+ drivers/accel/amdxdna/aie2_solver.c | 22 ++++++++++++++++++++--
+ drivers/accel/amdxdna/aie2_solver.h |  1 +
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+--- a/drivers/accel/amdxdna/aie2_solver.h
++++ b/drivers/accel/amdxdna/aie2_solver.h
+@@ -52,6 +52,7 @@
+  */
+ struct alloc_requests {
+ 	u64			rid;
++	u64			owner;		/* who owns the request; only one owner may share a partition */
+ 	struct cdo_parts	cdo;
+ 	struct aie_qos		rqos;		/* Requested QoS */
+ };
+--- a/drivers/accel/amdxdna/aie2_solver.c
++++ b/drivers/accel/amdxdna/aie2_solver.c
+@@ -19,6 +19,7 @@
+ 	u32			start_col;	/* start column */
+ 	u32			ncols;		/* # columns */
+ 	bool			exclusive;	/* can not be shared if set */
++	u64			owner;		/* the client that shares it */
+ };
+ 
+ struct solver_node {
+@@ -215,9 +216,11 @@
+ 	pt_node->nshared = 1;
+ 	pt_node->start_col = col;
+ 	pt_node->ncols = ncols;
++	pt_node->owner = req->owner;
+ 
+ 	/*
+-	 * Always set exclusive to false for now.
++	 * Sharing is allowed, but only between requests of the same owner (one client, i.e. one
++	 * open file): see allocate_partition().
+ 	 */
+ 	pt_node->exclusive = false;
+ 
+@@ -241,11 +244,22 @@
+ 	if (!ret)
+ 		return ret;
+ 
+-	/* try to get a share-able partition */
++	/* try to get a partition this owner may share */
+ 	list_for_each_entry(pt_node, &xrs->rgp.pt_node_list, list) {
+ 		if (pt_node->exclusive)
+ 			continue;
+ 
++		/*
++		 * Never share a partition across owners. Measured on strixhalo 2026-11-05: two clients
++		 * whose contexts share one partition wedge the array for every client on its next
++		 * dispatch (code 614, DPU PC 0xffffffff), because each design's CDO asks for all 8
++		 * columns and configuring the second context overwrites the first one's tiles. Contexts
++		 * of *one* client sharing a partition is the normal multi-context route (ZR1 per-op
++		 * forward: 4 designs, 600 tokens, 67 200 submits, 0 TDR on 56AB9475) and stays allowed.
++		 */
++		if (pt_node->owner != req->owner)
++			continue;
++
+ 		if (rpt_node && pt_node->nshared >= rpt_node->nshared)
+ 			continue;
+ 
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -652,6 +652,8 @@
+ 	xrs_req->rqos.priority = hwctx->qos.priority;
+ 
+ 	xrs_req->rid = (uintptr_t)hwctx;
++	/* The solver lets contexts of one client share a partition, but never two clients. */
++	xrs_req->owner = (uintptr_t)hwctx->client;
+ 
+ 	ret = xrs_allocate_resource(xdna->xrs_hdl, xrs_req, hwctx);
+ 	if (ret)

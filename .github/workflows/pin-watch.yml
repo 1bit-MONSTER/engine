@@ -65,6 +65,10 @@ jobs:
           python3 tools/pin_watch.py --check --out pin-report.md --json pin-report.json || rc=$?
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then exit "$rc"; fi
           echo "moved=$(grep -c '^## `' pin-report.md || true)" >> "$GITHUB_OUTPUT"
+          # a pin nobody could read is not a clean pin: surface it on the run, keep the PR flow going
+          if head -1 pin-report.md | grep -q 'not checked'; then
+            echo "::warning::$(head -1 pin-report.md) — see **Not checked** in the summary"
+          fi
           cat pin-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Open one pin bump per changed repo

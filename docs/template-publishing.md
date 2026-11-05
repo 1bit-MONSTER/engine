@@ -137,3 +137,19 @@ instead of only checking a pin.
 
 No upstream filing, no vendor contact: this is a proposal for our own BOM output
 (`tools/` and the release packages) and for the cards we publish.
+
+**`tools/template_bom.py` emits exactly that component** for a `.gguf` or a model directory — the digest
+in `hashes`, the file it came from in `properties`, `--bom` for a whole CycloneDX 1.6 document, and a
+component with **no** hash and a description for a model that carries no template (so "no template" is a
+verifiable claim in the BOM too):
+
+```console
+$ tools/template_bom.py --bom ~/models/zaya1-8b-Q4_K_M.gguf
+{"bomFormat": "CycloneDX", "specVersion": "1.6", "version": 1, "components": [
+  {"type": "data", "bom-ref": "pkg:generic/zaya1-8b-Q4_K_M.gguf?chat-template",
+   "name": "tokenizer.chat_template",
+   "hashes": [{"alg": "SHA-256", "content": "b55ecfbbbcbb238a011465bfa139366db18790103f9205060cf2855a3f51b30f"}], …}]}
+```
+
+That digest is the same one `1bit serve` prints at load, so the BOM, the log and the card row agree by
+construction rather than by bookkeeping.

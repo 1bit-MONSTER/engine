@@ -120,7 +120,38 @@ int main() {
         expect(last_report.find("the driver refused") != std::string::npos, "and the reason: " + last_report);
     }
 
-    // 5. A zero window means one attempt: an operator who wants no retry gets none.
+    // 5. The one load failure that needs an operator action: the driver refusing a hardware context (ENODEV after a TDR
+    //    the driver could not recover). The give-up report must say what to do, because no retry and no supervisor
+    //    restart can fix it.
+    {
+        const onebit::LoadRetryPolicy p0;
+        expect(onebit::npu_contexts_refused("npu runtime: device error (code 102): No such device"),
+               "the measured ENODEV context-creation message is recognised");
+        expect(!onebit::npu_contexts_refused("npu runtime: invalid call (code 614): state 8, run 0 of 28"),
+               "a failed runlist (614) is not a refused context");
+        expect(!onebit::npu_contexts_refused("npu runtime: device error (code 102): Cannot allocate memory"),
+               "a different errno on the same code is not the reload case");
+        expect(std::string(onebit::npu_contexts_refused_hint()).find("modprobe") != std::string::npos,
+               "the hint names the one action that works");
+
+        LoadRetryPolicy p;
+        p.window_s = 0.05;
+        p.first_delay_s = 0.01;
+        p.max_delay_s = 0.02;
+        std::vector<std::string> said;
+        try {
+            open_with_retry(p, "opening",
+                            [] { throw std::runtime_error("npu runtime: device error (code 102): No such device"); },
+                            [&](const std::string& line) { said.push_back(line); }, [](double) {});
+        } catch (const std::exception&) {
+        }
+        bool hinted = false;
+        for (const auto& line : said)
+            if (line.find("modprobe -r amdxdna") != std::string::npos) hinted = true;
+        expect(hinted, "the give-up path prints the operator hint for a refused context");
+    }
+
+    // 6. A zero window means one attempt: an operator who wants no retry gets none.
     {
         LoadRetryPolicy p;
         p.window_s = 0.0;

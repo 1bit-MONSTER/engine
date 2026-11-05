@@ -87,7 +87,7 @@ FetchContent_Declare(httplib
     GIT_TAG fe332fa06bac76a1c6d402c08f414052999347da)  # v0.47.0
 FetchContent_MakeAvailable(json httplib)
 
-add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp)
+add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/laya_checkpoint.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -505,6 +505,8 @@ if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # `1bit route --serve`, the resident form the fork calls per request (docs/laya-first.md §8).
     add_test(NAME laya_route_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+    # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
+    add_test(NAME laya_checkpoint COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
              ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)

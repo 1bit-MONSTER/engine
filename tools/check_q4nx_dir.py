@@ -35,6 +35,13 @@ tile of the Q8 tensors **both** ways and correlates each against the tensor in t
 container was packed from, so the answer comes from the weights instead of from the container's
 own round trip (a packer/decoder pair that agrees on the wrong layout scores well against
 itself). That mode is opt-in and is the only one that needs numpy and gguf.
+
+A model directory's `config.json` also lets this tool compare each quantized tensor's **tile count**
+with the geometry the model's own dimensions imply, which catches a container whose weight grids were
+padded by a converter to a different grid than this engine reads (engine#1097: the FastFlowLM converter
+pads `intermediate_size` to a 512-column grid, 8960 -> 9216, while the reader derives the chunk size from
+the unpadded grid, so the container loads and every request fails with "dequant failed"). Those are
+warnings by default and failures under `--strict`; a directory without `config.json` skips the check.
 """
 import argparse
 import contextlib
@@ -119,6 +126,84 @@ def prod(shape):
     out = 1
     for v in shape:
         out *= v
+    return out
+
+
+# The tile grid the engine's readers assume (npu/forward/include/q4nx_dequant.h), and the two
+# padding grids a packer may have used (npu/forward/src/q4nx_pack.c: q4nx_pad_k 256, q4nx_pad_n 512).
+TILE_ROWS, TILE_COLS = 32, 256
+N_GRID = 512
+
+
+def dims_from_config(cfg):
+    """The model dimensions a tensor's tile grid follows, or None if config.json lacks them."""
+    try:
+        h = int(cfg["hidden_size"])
+        hd = int(cfg.get("head_dim", 0)) or h // int(cfg["num_attention_heads"])
+        qd = int(cfg["num_attention_heads"]) * hd
+        kvd = int(cfg.get("num_key_value_heads", cfg["num_attention_heads"])) * hd
+        im = int(cfg["intermediate_size"])
+        v = int(cfg["vocab_size"])
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    return {"H": h, "QD": qd, "KVD": kvd, "IM": im, "V": v}
+
+
+def expected_rc(name, d):
+    """(rows, cols) this weight must hold, from the model's dims; None for a tensor we cannot place."""
+    if name == "lm_head.weight":
+        return d["V"], d["H"]
+    tail = name.split(".", 3)[3] if name.startswith("model.layers.") and name.count(".") > 3 else ""
+    return {
+        "self_attn.q_proj.weight": (d["QD"], d["H"]),
+        "self_attn.k_proj.weight": (d["KVD"], d["H"]),
+        "self_attn.v_proj.weight": (d["KVD"], d["H"]),
+        "self_attn.o_proj.weight": (d["H"], d["QD"]),
+        "mlp.gate_proj.weight": (d["IM"], d["H"]),
+        "mlp.up_proj.weight": (d["IM"], d["H"]),
+        "mlp.down_proj.weight": (d["H"], d["IM"]),
+    }.get(tail)
+
+
+def geometry_warnings(table, d):
+    """Warnings for quantized tensors whose tile count disagrees with the model's dimensions.
+
+    A padded grid is not a chunk-layout error - the chunks are valid - but it is not the grid this
+    engine reads, so the container loads and fails on the first request (engine#1097)."""
+    if not d:
+        return []
+    out = []
+    for name, t in table.items():
+        if name == "__metadata__" or not isinstance(t, dict):
+            continue
+        if t.get("dtype") not in QUANT:
+            continue
+        shape = t.get("shape") or []
+        if len(shape) < 2 or any(not isinstance(v, int) or v <= 0 for v in shape):
+            continue
+        rc = expected_rc(name, d)
+        if rc is None:
+            continue
+        rows, cols = rc
+        if rows % TILE_ROWS or cols % TILE_COLS:
+            out.append(f"{name}: {rows}x{cols} is not on the {TILE_ROWS}x{TILE_COLS} tile grid")
+            continue
+        tiles = prod(shape[:-1])
+        want = (rows // TILE_ROWS) * (cols // TILE_COLS)
+        if tiles == want:
+            continue
+        ntr, ntc = rows // TILE_ROWS, cols // TILE_COLS
+        if tiles % ntr == 0:
+            pc = (tiles // ntr) * TILE_COLS
+            how = f"columns padded {cols} -> {pc} (the {N_GRID}-column grid)"
+        elif tiles % ntc == 0:
+            pr = (tiles // ntc) * TILE_ROWS
+            how = f"rows padded {rows} -> {pr} (the {N_GRID}-column grid)"
+        else:
+            how = "a grid the model's dimensions do not describe"
+        out.append(f"{name}: holds {tiles} tiles, the model's dimensions imply {want} - {how}; "
+                   f"this engine derives the chunk size from the unpadded grid, so the tensor "
+                   f"fails to decode (engine#1097)")
     return out
 
 
@@ -372,6 +457,26 @@ def self_test():
             bad.append(f"A-order tile does not decode back to itself: corr {corr(flat_a, want):.6f}")
         if corr(flat_b, want) > 0.5:
             bad.append(f"B scores {corr(flat_b, want):.4f} on an A-order tile, so the check is blind")
+
+    # Geometry: a tensor on the model's own grid is quiet, one a converter padded to the 512 grid
+    # warns (engine#1097 - the container loads, then every request fails with "dequant failed").
+    dims = dims_from_config({"hidden_size": 1536, "intermediate_size": 8960, "num_attention_heads": 12,
+                             "num_key_value_heads": 2, "head_dim": 128, "vocab_size": 151936})
+    if not dims:
+        bad.append("dims_from_config returned nothing for a complete config")
+    else:
+        ok_table = {"model.layers.0.mlp.down_proj.weight": {"dtype": "I8", "shape": [48, 35, 5120]}}
+        padded = {"model.layers.0.mlp.down_proj.weight": {"dtype": "I8", "shape": [1728, 5120]},
+                  "model.layers.0.mlp.gate_proj.weight": {"dtype": "I8", "shape": [1728, 5120]}}
+        if geometry_warnings(ok_table, dims):
+            bad.append(f"a 48x35 grid is the model's own grid but warned: {geometry_warnings(ok_table, dims)}")
+        gw = geometry_warnings(padded, dims)
+        if len(gw) != 2:
+            bad.append(f"a 512-padded MLP grid produced {len(gw)} warning(s), expected 2")
+        elif "columns padded 8960 -> 9216" not in gw[0] or "rows padded 8960 -> 9216" not in gw[1]:
+            bad.append(f"the padding explanation is not what the grids say: {gw}")
+        if geometry_warnings({"norm.weight": {"dtype": "F32", "shape": [1536]}}, dims):
+            bad.append("a non-quantized tensor produced a geometry warning")
     if bad:
         print("self-test FAILED:")
         for b in bad:
@@ -379,7 +484,8 @@ def self_test():
         return 1
     print("self-test passed: 3 chunk kinds counted, unknown chunk size refused, short tensor refused, "
           "directory scans every .q4nx, a Q8 tile written in A's order decodes as A and not as B, "
-          "and a no-Q8 container claims no code order")
+          "a no-Q8 container claims no code order, and a 512-padded grid is named as padded while "
+          "the model's own grid is quiet")
     return 0
 
 
@@ -393,6 +499,9 @@ def main():
                          "container was packed from (needs numpy and gguf)")
     ap.add_argument("--q8-samples", type=int, default=3, metavar="N",
                     help="how many Q8 tensors --against decodes (default 3)")
+    ap.add_argument("--strict", action="store_true",
+                    help="treat a geometry warning (a padded weight grid this engine cannot read) "
+                         "as a failure")
     args = ap.parse_args()
     if args.self_test:
         return self_test()
@@ -400,9 +509,25 @@ def main():
         ap.error("a model directory or .q4nx file is required (or --self-test)")
     out, rc = {}, 0
     compared = 0        # Q8 tensors actually decoded and correlated, across all files
+    warnings = 0        # geometry warnings (padded weight grids) across all files
     for path in targets(args.path):
         errors, summary = check(path)
         out[path] = summary
+        cfg_path = os.path.join(os.path.dirname(path) or ".", "config.json")
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+            except (OSError, ValueError) as e:
+                cfg = None
+                print(f"WARN {cfg_path}: unreadable ({e}), geometry not checked")
+            geoms = geometry_warnings(read_header(path)[0], dims_from_config(cfg) if cfg else None)
+            summary["geometry_warnings"] = len(geoms)
+            warnings += len(geoms)
+            for g in geoms:
+                print(f"WARN {g}")
+                if args.strict:
+                    errors.append(g)
         if args.against:
             print(f"{path}: Q8 code layout against {os.path.basename(args.against)}")
             q8_errors, rows = check_q8_layout(path, args.against, args.q8_samples)
@@ -426,6 +551,10 @@ def main():
               "against the source weights")
     else:
         print("chunk layout verified: every quantized tensor's shape names a known chunk kind")
+    if warnings and not rc:
+        print(f"but {warnings} quantization tensor(s) sit on a padded grid this engine reads at a "
+              f"different stride: the container will load and fail on the first request "
+              f"(engine#1097) - `--strict` fails on this")
     return rc
 
 

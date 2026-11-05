@@ -920,6 +920,8 @@ got before.
 | `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
+| `max_tokens` / `max_completion_tokens` | the reply's cap (`max_completion_tokens` wins); a value that is not a number is a 400 naming the field, and a fractional one is truncated |
+| `stream` | `true` streams SSE chunks; a value that is not a boolean is a 400 naming the field |
 | `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
@@ -957,8 +959,10 @@ dropped from a schema would leave the caller believing the answer was validated.
 the schema's order with the required ones first, so the object's key order is fixed for a given schema.
 
 A field the route cannot honour is a 400 whose `error.message` says why ("`json_schema`: pattern is not
-supported by this route's schema-to-GBNF converter", "`gbnf: unterminated literal at line 1`"),
-never a silently ignored key. `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
+supported by this route's schema-to-GBNF converter", "`gbnf: unterminated literal at line 1`",
+"`stream`: must be true or false", "`tools`: must be an array"),
+never a silently ignored key and never a 500: a wrong *type* is a client error like any other, including on the
+fields the route reads before it starts decoding (engine#1106). `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
 an end-of-sequence token, a stop sequence or a grammar that allows nothing more.
 
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
@@ -1150,14 +1154,18 @@ With that said, two streams do run, and the option is what says you meant it:
 
 ```
 # stream 1 of 2, then stream 2 of 2, in two shells (different ports, same model)
-./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8000
-./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8001
+./1bit forward-serve -m <model.q4nx> --kernels <dir> --npu-streams 2 -p 8000
+./1bit forward-serve -m <model.q4nx> --kernels <dir> --npu-streams 2 -p 8001
 ```
 
-`--npu-streams N` (1..16, default 1) is `forward-serve`'s flag too: N = 1 keeps the exclusive lock,
-N >= 2 takes a **shared** lock, so the opted-in streams co-exist while any exclusive holder -- an
-unflagged `1bit serve`, the per-process ELF runner (`npu_engine_universal`), another build's serve --
-still keeps them all out, in either order, because they share one file and one `flock(2)`.
+`--npu-streams` belongs to `forward-serve` (and to the GGUF-on-NPU model-generic forward `serve`
+starts for it): N = 1 keeps the exclusive lock, N >= 2 takes a **shared** lock, so the opted-in
+streams co-exist while any exclusive holder -- an unflagged serve, the in-process route, the
+per-process ELF runner (`npu_engine_universal`), another build's serve -- still keeps them all out, in
+either order, because they share one file and one `flock(2)`. The **in-process** route (a `.q4nx` model
+directory through `serve`, i.e. `app/unified.cpp`) always takes the exclusive lock and refuses
+`--npu-streams` by name: it keeps one context, so N streams there could only queue, and two of them
+dispatching at once is the measured wedge (engine#1051).
 
 **The lock is one file and one protocol, across runtimes, and it is advisory** -- that is what makes it
 usable beside another NPU engine, and what its limits are:
@@ -1167,8 +1175,9 @@ usable beside another NPU engine, and what its limits are:
   not wait for other shared holders"; `LOCK_EX` = "I want the device to myself". A holder keeps its fd
   open for the life of the process; closing or exiting releases it. `LOCK_EX` and `LOCK_SH` never
   overlap, in either order, on one file.
-- **Who may take what.** Anything that honours the file interlocks with us: our serves
-  (`--npu-streams` decides which mode), the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
+- **Who may take what.** Anything that honours the file interlocks with us: `forward-serve`
+  (`--npu-streams` decides which mode), the in-process route (`LOCK_EX`, always -- `app/unified.cpp`),
+  the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
   Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
   keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
   file is not slowed, not blocked and not detected.
@@ -1251,6 +1260,32 @@ so:
 
 A real failure is unchanged apart from being reported: the last attempt's exception still reaches the
 caller after the window closes, and the log now names the attempt count and the reason.
+
+#### A refusal is a queue, not a fault
+
+A second **client** on the NPU is refused with the same signature a dead array answers — `code 102` /
+`-ENODEV` from `aie2_message.c`'s context-create path — so the code alone cannot say which one it is. Time
+can: a client that holds the array frees it when it exits, a dead array never does. Since the per-client
+partition fix ([engine#1085](https://github.com/1bit-MONSTER/engine/pull/1085), decision 2026-11-05)
+makes that refusal the *normal* way a second client is turned away, a refused context is now **queued**
+rather than failed: the same retry schedule runs against a load queue budget instead of the 2.5 s race
+window, and the log says which of the two it is waiting for.
+
+```
+$ 1bit serve -m <model dir> --load-queue-ms 45000       # the default
+1bit unified: opening the private route's NPU context attempt 3 failed after 410 ms
+              (npu runtime: device error (code 102): No such device); retrying in 600 ms
+              (queued: another NPU client may hold the array)
+```
+
+`--load-queue-ms N` bounds that wait (default **45000**, `0` refuses at once, i.e. the pre-#1085
+behaviour). When the budget runs out the operator hint names both causes in the order to check them —
+another client first (wait for it, or stop it), the driver second (`modprobe -r amdxdna && modprobe
+amdxdna`) — because after a full budget the array is either genuinely busy elsewhere or genuinely dead.
+
+This is the load-side counterpart of `--queue-ms`, which bounds how long a *request* waits for the
+device lock; the two are separate because a request can be told it is queueing (an empty delta a second)
+and a load cannot.
 
 One NPU failure is not transient and says so: the driver deciding the array is dead, reported with
 `No such device` (ENODEV) and either `code 102` (`errc::ctx_create`) or `code 104` (`errc::submit`) —

@@ -1,0 +1,32 @@
+{
+ "pins": {
+  "qwen3-coder-30b-a3b-instruct-q4_k_m.gguf": {
+   "sha256": "87710339d25b4e789c1d723f93c91ee861a86d305bb3d20a845536f251d6ea8a",
+   "source": "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+  },
+  "qwen3.8-27b-dflash2-q4k.gguf": {
+   "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+   "source": "z-lab/Qwen3.8-27B-DFlash2"
+  },
+  "qwen3.8-27b-dflash2-q8_0.gguf": {
+   "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+   "source": "z-lab/Qwen3.8-27B-DFlash2"
+  },
+  "qwen3.8-27b-ud-q4_k_xl.gguf": {
+   "sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+   "source": "Qwen/Qwen3.8-27B"
+  },
+  "zaya1-8b-q4_k_m.gguf": {
+   "sha256": "b55ecfbbbcbb238a011465bfa139366db18790103f9205060cf2855a3f51b30f",
+   "source": "Zyphra/ZAYA1-8B"
+  },
+  "zr1-1.5b-q4_k_m.gguf": {
+   "sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1",
+   "source": "Zyphra/ZR1-1.5B"
+  },
+  "zr1-1.5b-q8_0.gguf": {
+   "sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1",
+   "source": "Zyphra/ZR1-1.5B"
+  }
+ }
+}

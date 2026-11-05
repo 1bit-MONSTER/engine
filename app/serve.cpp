@@ -14,7 +14,8 @@
 // limitations under the License.
 
 // `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|hybrid|cpu] [--mtp HEAD]`
-//                        [--npu-opt KEY=VALUE ...] [--npu-streams N] [--prefill-provider PATH]
+//                        [--npu-opt KEY=VALUE ...] [--npu-streams N] [--load-queue-ms N]
+//                        [--prefill-provider PATH]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -170,6 +171,7 @@ struct Options {
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
     std::string role;            // "embedding" or "reranking": the model itself is served in that role
     std::vector<std::string> npu_opts;   // --npu-opt KEY=VALUE, for a private NPU route
+    int load_queue_ms = 45000;           // --load-queue-ms N: how long a refused NPU context is queued
     int npu_streams = 1;   // --npu-streams N: N opted-in serves share the NPU (app/npu_device_lock.h)
     std::string prefill_provider;        // --prefill-provider PATH (or ONEBIT_HYBRID_PREFILL): --device hybrid's prefill (docs/hybrid.md)
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
@@ -2711,6 +2713,9 @@ void usage(FILE* out) {
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
                  "                  [--npu-streams N]   with --device npu: this serve is one of N sharing the NPU\n"
                  "                  (default 1, the device exclusive; docs/npu.md)\n"
+                 "                  [--load-queue-ms N]   a load refused because another client holds the NPU array\n"
+                 "                  waits at most N ms for it to free before the driver is called dead\n"
+                 "                  (default 45000; 0 refuses at once; docs/npu.md)\n"
                  "                  [--laya | --laya-model DIR] [--route-policy FILE]   with --device auto, Laya classifies\n"
                  "                  each conversation and the route policy picks its device (docs/laya.md)\n"
                  "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
@@ -2809,6 +2814,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--reranking") o.role = "reranking";
         else if (a == "--rerank") o.rerank = next();
         else if (a == "--npu-opt") o.npu_opts.push_back(next());
+        else if (a == "--load-queue-ms") o.load_queue_ms = std::stoi(next());
         else if (a == "--npu-streams") o.npu_streams = std::stoi(next());
         else if (a == "--prefill-provider") o.prefill_provider = next();
         else if (a == "--laya-model") o.laya_model = next();
@@ -2915,6 +2921,7 @@ int run_serve(int argc, char** argv) {
         // The NPU serves in process (unified.cpp).
         std::vector<std::string> args = {"-m", o.model, "-p", std::to_string(o.port), "--host", o.host};
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+        args.push_back("--load-queue-ms"); args.push_back(std::to_string(o.load_queue_ms));
         for (const auto& kv : o.npu_opts) { args.push_back("--opt"); args.push_back(kv); }
         std::vector<char*> av;
         for (auto& s : args) av.push_back(s.data());
@@ -2947,6 +2954,7 @@ int run_serve(int argc, char** argv) {
                                      o.model.c_str(), lane.c_str());
                         std::vector<std::string> args = {"-m", ldir, "-p", std::to_string(o.port), "--host", o.host};
                         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+                        args.push_back("--load-queue-ms"); args.push_back(std::to_string(o.load_queue_ms));
                         std::vector<char*> av;
                         for (auto& s : args) av.push_back(s.data());
                         return run_unified(int(av.size()), av.data());
@@ -2993,6 +3001,7 @@ int run_serve(int argc, char** argv) {
                                  o.model.c_str(), dxk.c_str());
                     std::vector<std::string> args = {"-m", ldir, "-p", std::to_string(o.port), "--host", o.host};
                     if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+                    args.push_back("--load-queue-ms"); args.push_back(std::to_string(o.load_queue_ms));
                     std::vector<char*> av;
                     for (auto& s : args) av.push_back(s.data());
                     return run_unified(int(av.size()), av.data());

@@ -102,6 +102,8 @@ def sandbox(tmp, report):
         fh.write("# Model pins: 4 of 4 moved (2026-11-05)\n\n")
         for c in report:
             fh.write(f"## `{c['repo']}`\n\n{c['body']}\n")
+    with open(os.path.join(work, "pin-report.json"), "w") as fh:
+        json.dump({"date": "2026-11-05", "changes": report}, fh)
     subprocess.run(["git", "-C", work, "add", "-A"], check=True)
     subprocess.run(["git", "-C", work, "commit", "-qm", "init"], check=True)
     subprocess.run(["git", "-C", work, "branch", "-M", "main"], check=True)
@@ -125,6 +127,8 @@ if [ "$1" = tools/pin_watch.py ] && [ "$2" = --bump ]; then
   exit 0
 fi
 if [ "$1" = tools/pin_watch.py ] && [ "$2" = --pr-body ]; then
+  # the JSON beside the report is the sweep this must read, so a missing --from fails the step here
+  if [ "$4" != --from ] || [ ! -s "$5" ]; then echo "pr-body without the sweep: $*" >&2; exit 7; fi
   echo "body for $3"; exit 0
 fi
 exec "$REAL" "$@"

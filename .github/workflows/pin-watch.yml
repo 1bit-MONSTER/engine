@@ -61,7 +61,8 @@ jobs:
           set -uo pipefail
           # exit 1 means "a pin moved", which is the normal case this workflow exists for
           rc=0
-          python3 tools/pin_watch.py --check --out pin-report.md || rc=$?
+          # the JSON beside the report is the same sweep, so the PR step below does not repeat it
+          python3 tools/pin_watch.py --check --out pin-report.md --json pin-report.json || rc=$?
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then exit "$rc"; fi
           echo "moved=$(grep -c '^## `' pin-report.md || true)" >> "$GITHUB_OUTPUT"
           cat pin-report.md >> "$GITHUB_STEP_SUMMARY"
@@ -98,7 +99,8 @@ jobs:
               echo "::error::$repo could not be bumped (rc=$rc): this run is not a clean one"
               exit 1
             fi
-            python3 tools/pin_watch.py --pr-body "$repo" > body.md || true
+            # no `|| true`: a body that could not be produced is a broken report, not an empty PR
+            python3 tools/pin_watch.py --pr-body "$repo" --from pin-report.json > body.md
             newsha=$(python3 -c 'import json,sys; print(json.load(open("models/pins.json"))["pins"][sys.argv[1]]["commit"][:8])' "$repo")
             git add models/pins.json
             git commit -q -m "pin: $repo at $newsha"

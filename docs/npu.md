@@ -363,6 +363,17 @@ is otherwise served a chat prompt with no BOS: measured on ZR1-1.5B, the forward
 5-token prompt where llama.cpp built 6, and the reply opened with the end-of-turn token.
 `tools/safetensors_to_q4nx.py` carries the same two keys from `tokenizer_config.json`.
 
+**A GGUF that declares a RoPE scaling block is refused.** This route has no scaling rule — the
+packed lane computes `theta^(-i/half)` and nothing else — and a container written from a scaled
+GGUF would carry `rope_theta` alone, be served plain RoPE, stay fluent and be wrong past the
+model's original window, with nothing in any log to say so ([engine#1087](https://github.com/1bit-MONSTER/engine/issues/1087)).
+So `pack` exits non-zero naming the type (`*.rope.scaling.type` = `yarn`/`linear`/`longrope`/…)
+before it creates the output directory. Two rules *are* implemented and are accepted on the
+forward route, which reads the block from `config.json`: `rope_type: "llama3"`
+(Llama-3.1/3.2/3.3) and LongRoPE's `short_factor` (MiniCPM4). The same refusal covers a
+declared-but-unusable `llama3` block, and every other declared type, at `1bit serve` /
+`forward-serve` load time rather than at request time.
+
 | GGUF type | To q4_1 | Error |
 |---|---|---|
 | Q4_0 | scale `d`, zero `-8d`, codes unchanged | bf16 rounding of scale and zero |

@@ -1138,8 +1138,9 @@ hardware contexts until `amdxdna` is reloaded, and says so in its own kernel mes
 One process owns the NPU by default: it takes an exclusive `flock` on
 `/tmp/1bit-npu-device.lock` for its lifetime (`app/npu_device_lock.h`), so a second serve of the
 NPU route waits instead of contending. The policy stays the default because a second stream buys
-much less than 2x -- and with the driver patch this tree now carries (`0003`) it is also the only
-shape the device accepts, which is worth stating precisely because the limit is *not* the hwctx count:
+much less than 2x -- and with the driver patch this tree carries (`0003`, running on strixhalo since
+2026-11-05 06:26 as `349FDC99CADC56900E0249A`) it is also the only shape the device accepts, which is worth
+stating precisely because the limit is *not* the hwctx count:
 
 - **The array partition is the real limit, and it is per client.** `hwctx_limit = 16`
   (`drivers/accel/amdxdna/npu5_regs.c:74`; `npu4_regs.c:174` says the same) bounds how many hardware
@@ -1155,8 +1156,12 @@ shape the device accepts, which is worth stating precisely because the limit is 
   a single context ([engine#1084](https://github.com/1bit-MONSTER/engine/issues/1084)).
 - **What it costs after it.** `third_party/patches/amdxdna/0003` shares a partition only between
   contexts of the *same* client, so the second client is refused with `code 102` / `-ENODEV` instead
-  of taking the array down, and the partition is released when the holder exits. Multi-context within
-  one process -- the per-op route, the per-block-count route -- is unchanged.
+  of taking the array down, and the partition is released when the holder exits. Measured on that
+  build: the holder kept its 1 099-chunk row while the second client was refused, a fresh client
+  answered once the holder exited, and one process held 2 contexts without trouble. Multi-context
+  within one process -- the per-op route, the per-block-count route -- is unchanged, and the
+  model-generic route that holds one context per design was re-measured on it with **8** contexts in
+  one process (engine#1084).
 
 So `--npu-streams N` **needs a kernel set that asks for fewer columns than the array has**: with the
 sets shipped today a second stream is refused rather than slow, and the throughput numbers below are

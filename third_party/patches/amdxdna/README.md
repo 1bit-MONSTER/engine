@@ -22,16 +22,17 @@ partition start column"). That pin is **pre-fix** for four defects that each tak
 none of the fixes is upstream, so **a module built from the pin alone has none of them**:
 
 0001 and 0002 are what the c22/c23 images run. 0004 and 0005 are the recovery pair the box and the c25 candidate run on
-top of them (`0008` and `0009` in `~/briefs/TKERNEL-74-STATE.md`'s numbering). 0003 is a different kind of row: a
-**candidate**, built but not yet proven on hardware (see its own row); it touches only `aie2_solver.c`,
-`aie2_solver.h` and `aie2_ctx.c`, so it applies on top of any of the TDR series and does not depend on which one is
-loaded.
+top of them (`0008` and `0009` in `~/briefs/TKERNEL-74-STATE.md`'s numbering). 0003 is the partition fix, and it is
+**measured on strixhalo since 2026-11-05 06:26** — but as `0011v2` on the kernel lane's tree, i.e. the build
+`349FDC99CADC56900E0249A`, not as the form in this directory (see its row and the fingerprint table). It touches
+`aie2_solver.c`, `aie2_solver.h` and `aie2_ctx.c` only, so it applies on top of any of the TDR series and does not depend
+on which one is loaded.
 
 | # | patch | fixes | where it is measured |
 |---|---|---|---|
 | 0001 | `accel/amdxdna: fix the bo_invalid_list use-after-free at close` (4 files, +48/−4) | a client that closes while a BO sits on `client->bo_invalid_list` frees the client and leaves the BO linked into it → `kernel BUG at lib/list_debug.c:32` in `amdxdna_hmm_invalidate` | the 2026-11-04 01:48 panic on strixhalo; shipped since ~03:0x; **#971** carries the image-side half of shipping it |
 | 0002 | `accel/amdxdna: recover the array after a TDR` (5 files, +91/−19) | a TDR restart gated on a condition a fully-wedged context never satisfies, so `aie2_hwctx_restart()` fails `-22` and every later request hangs until a reboot | provocation run 2026-11-04 10:48–10:50 on the loaded build: the recovery branch executes, the NPU is power-cycled, the array answers again **with no reboot**; **#1005** |
-| 0003 | `accel/amdxdna: never share an array partition between two clients` (3 files, +23/−2) — **candidate, not installed anywhere in this shape yet** | the solver marks every partition `exclusive = false` ("always set exclusive to false for now"), so a second *client* with no free column range is handed the *same* columns as a live one (`nshared++`) and its configuration takes the array out from under the first: every client then wedges (`614`, `DPU PC 0xffffffff`). The patch records the owning client in `alloc_requests.owner` and only shares a partition between contexts of the same client — the per-op route that holds one context per design keeps working, a second process is refused | measured 2026-11-05 on the c24 payload under `npu-hold`: two clients that had each dispatched once shared `Partition Index 0, Columns [0..7]` and the next dispatch wedged 3/3 sequential and 3/3 concurrent, while one context was clean in every row (1 000–3 408 positions) and a second serve that never dispatched was clean too. A **per-context** version of this patch was measured live and **refused the second context of one client's multi-context route (ZR1 per-op forward, 3/3)** — that is why the unit is the client, not the context. The per-client shape's own proof (second client refused while the first finishes; two contexts of one client still load) is owed — it needs this build installed |
+| 0003 | `accel/amdxdna: never share an array partition between two clients` (3 files, +23/−2) | the solver marks every partition `exclusive = false` ("always set exclusive to false for now"), so a second *client* with no free column range is handed the *same* columns as a live one (`nshared++`) and its configuration takes the array out from under the first: every client then wedges (`614`, `DPU PC 0xffffffff`). The patch records the owning client in `alloc_requests.owner` and only shares a partition between contexts of the same client — the per-op route that holds one context per design keeps working, a second process is refused | measured 2026-11-05: the **wedge**, shipped c24 payload under `npu-hold` — two clients that had each dispatched once shared `Partition Index 0, Columns [0..7]` and the next dispatch wedged 3/3 sequential and 3/3 concurrent (fabric's rows, `/home/bcloud/briefs/THRX-FABRIC-STATE.md`), while one client was clean in every row (1 000–3 408 positions) and a second serve that never dispatched was clean too; and the **fix**, as `0011v2` in `349FDC99CADC56900E0249A`, installed 06:26 — second client refused `code 102` while the holder kept its 1 099-chunk row (`~/lb/k74-ab/proof-0011-20261105-062629`), refusal not a lockout (partition released when the holder exits, `proof2-0011-20261105-063413`), one process with 2 contexts PASS 2/2 (`multictx-*`), the ZR1 per-op route creating **8** contexts and answering 200 (pi-onebp, engine#1084 comment 6655813656), single-client throughput unchanged (5/5 rows, median 82.37 tok/s) and 0 TDRs / power-cycles / latches across the day's tickets. A **per-context** version was measured first and refused the second context of one client's multi-context route (3/3) — that is why the unit is the client, not the context. **The file in this directory is the measured change**: applying it to the kernel lane's tree (0007+0008+0009+0010) and rebuilding reproduces `srcversion 349FDC99CADC56900E0249A` exactly — the build the rows above ran on — so this is byte-equivalent to the patch that was proven, not just the same idea |
 | 0004 | `accel/amdxdna: two TDR-recovery outcomes are not failures` (2 files, +36/−7) | 0002's recovery counted two non-failures as failures, and either one latched `hw_dead` (every later context refused `-ENODEV` until reload): a **throttled** power-cycle (`-EBUSY` inside `AIE2_HW_RESET_MIN_INTERVAL_MS`, two TDRs in 60 s were enough) and a **closing** context (`aie2_hwctx_restart()` `-ENODEV` for a context whose heap address is gone, now `-ESRCH` + `rarg.skipped`) | the kernel lane's `0008`; rebuilt from these files it is `6483D31718A008B3602114E`, the module installed at 23:2x on 2026-11-04; the two TDR-recovery proofs in `TKERNEL-74-STATE.md` ran on it |
 | 0005 | `accel/amdxdna: check the power-cycle throttle before touching any context` (1 file, +20) | 0004 stops the throttle being counted at the reset call, but the recovery still ran both context walks — stopping every context and restarting it against an array that was never power-cycled, which sets `rarg.failed` and latches `hw_dead` through the other path. Check the throttle first and return having touched nothing | the kernel lane's `0009`; 0004+0005 is the `0007+0008+0009` shipping stack, and the fleet's live record shows the branch executing 32× with **0 latches** (`TKERNEL-74-STATE.md`, 2026-11-05 03:45) |
 
@@ -102,15 +103,17 @@ All values below were produced on strixhalo against the `7.4.0-rc1-1bit` headers
 | pin + 0001 + 0002 + 0004 (the `0007+0008` intermediate) | `6483D31718A008B3602114E` |
 | pin + 0001 + 0002 + 0004 + 0005 (the `0007+0008+0009` shipping stack) | `BBE1E5F0EE7A5FB235CA811` |
 | pin + 0001 + 0002 + 0003 | `FA680E5F8334570CA318449` |
-| pin + 0001 + 0002 + 0003 + 0004 + 0005 (shipping stack + the partition candidate) | `EE1F36A2B9BA294CE11AD80` |
+| pin + 0001 + 0002 + 0003 + 0004 + 0005 (shipping stack + the partition fix) | `EE1F36A2B9BA294CE11AD80` |
+| *(not buildable from this directory alone)* `0007+0008+0009+0010` + the partition fix — the build that measured it on strixhalo. **Reproduced from these files**: applying `0003` to that tree instead of the scratch `0011v2` delta rebuilds to the same srcversion | `349FDC99CADC56900E0249A` |
 
 Every row above was produced by building the files in this directory, not inferred. `56AB94758C18FEEC838D18C` is
 `cat /sys/module/amdxdna/srcversion` on the box that ran that build from 2026-11-04 10:23; `6483D31718A008B3602114E` is
 the module pi-kernel-74 installed at 23:2x the same night; `BBE1E5F0EE7A5FB235CA811` is the recovery stack the box and
-the c25 candidate run. Two other values are worth knowing because they are *not* in the table: `646FFC305CAFF8F9BD736FF`
-is `0007+0008+0009` plus the 0010 debugfs test hook (deliberately not carried here), and `169C46E2BB5F58ADCD5C1EB` is that
-plus the **per-context** partition patch, which was rolled back after it was measured refusing the second context of a
-single client's multi-context route.
+the c25 candidate run. `349FDC99CADC56900E0249A` is the only row here that cannot be rebuilt from this directory, because it carries the
+0010 debugfs test hook (`0007+0008+0009+0010`) plus `0011v2`; it is listed because it is the build the partition rows above
+were measured on. `646FFC305CAFF8F9BD736FF` is the same stack without the partition fix, and `169C46E2BB5F58ADCD5C1EB` is the
+**per-context** version that was rolled back after it was measured refusing the second context of a single client's
+multi-context route.
 
 **Check the loaded module, never the file:**
 

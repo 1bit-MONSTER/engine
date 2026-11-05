@@ -85,7 +85,7 @@ def q4_k_blocks(rng, N, K):
     return b.reshape(N, nb * 144)
 
 
-def synthetic(path, rng):
+def synthetic(path, rng, rope_scaling=None):
     H, IM, NH, NKV, HD, V = 256, 512, 2, 1, 128, 512
     w = gguf.GGUFWriter(path, "qwen3")
     w.add_block_count(1)
@@ -97,6 +97,10 @@ def synthetic(path, rng):
     w.add_key_length(HD)
     w.add_value_length(HD)
     w.add_rope_freq_base(1e6)
+    if rope_scaling:
+        # what llama.cpp writes for a model whose config.json carries rope_scaling
+        w.add_rope_scaling_type(getattr(gguf.RopeScalingType, rope_scaling.upper()))
+        w.add_rope_scaling_factor(4.0)
     w.add_layer_norm_rms_eps(1e-6)
     w.add_eos_token_id(1)
     # The two flags app/forward_serve.cpp builds the prompt from; add_bos_token is the one a
@@ -446,6 +450,21 @@ def dense_3d_pack_check(gguf_path, out, ok):
     return ok and good and not left
 
 
+def rope_scaling_check(gguf_path, out, kind, ok):
+    """A declared rope scaling this route cannot apply is refused by name, not silently dropped."""
+    tool = os.path.join(HERE, "..", "tools", "gguf_to_q4nx.py")
+    r = subprocess.run([sys.executable, tool, "pack", gguf_path, out], capture_output=True, text=True)
+    msg = r.stdout + r.stderr
+    good = r.returncode != 0 and "rope.scaling.type" in msg and kind in msg
+    print(f"{'ok  ' if good else 'FAIL'} packing a {kind}-scaled GGUF exits non-zero and names the "
+          f"type (rc {r.returncode})")
+    if not good:
+        print(msg[-800:])
+    left = os.path.exists(os.path.join(out, "model.q4nx"))
+    print(f"{'ok  ' if not left else 'FAIL'} no model.q4nx was written for it")
+    return ok and good and not left
+
+
 def main():
     ok = golden_tile()
     ok = golden_tile8() and ok
@@ -462,6 +481,11 @@ def main():
                 print(r.stderr, end="")
                 print(f"FAIL {cmd[0]} exited {r.returncode}")
                 ok = False
+        yarn = os.path.join(d, "yarn.gguf")
+        for kind in ("yarn", "linear", "longrope"):
+            scaled = os.path.join(d, f"{kind}.gguf")
+            synthetic(scaled, rng, rope_scaling=kind)
+            ok = rope_scaling_check(scaled, os.path.join(d, f"{kind}-out"), kind, ok)
         mout = os.path.join(d, "moe")
         moe_synthetic(os.path.join(d, "tiny-moe.gguf"), rng)
         for cmd in (["pack", os.path.join(d, "tiny-moe.gguf"), mout],

@@ -40,6 +40,32 @@ list, with the facts that go stale marked as facts and the commands that do not.
   "The XDNA driver") and `ec_su_axb35` (the box's fan EC). Both live in
   `/lib/modules/<version>/updates/` and both must be rebuilt against the new kernel and signed.
 
+## 7.4 on the box: what changed, and what to watch
+
+`v7.4-rc1` is the first tag where the **PerfOpt series is upstream** (`iommu/amd` plus the `amdgpu`
+identity-domain enable), so nothing is carried: the tree is the plain tag, and the boot still reports
+`AMD-Vi: PerfOpt armed on IOMMU0`. Built from the same config with `CONFIG_DEBUG_INFO_BTF=y`
+(pahole 1.31, ~5 MiB of BTF in the image), which is also why the `bpf-restrict-fs: Failed to load BPF
+object` boot noise is gone — systemd now logs `LSM BPF program attached`. Compiler is **gcc 15.2.0**,
+the same as the 7.3 image; older notes that say clang were wrong.
+
+- **Throughput, 7.4 arm only:** Qwen3.8-27B UD-Q4_K_XL on HRX0, five repeats, at the current
+  90/90/105 W fan curve — pp512 239.6, pp2048 234.7, tg128 10.9 tok/s (medians). These do **not** line up
+  with the 7.3 table above, which was taken on a different machine and power profile; the 7.3 arm of
+  *this* recipe cannot be taken from inside a 7.4 boot (it needs its own one-shot `grub-reboot` window),
+  so no 7.3-vs-7.4 delta is claimed. Greedy output is byte-identical run to run, and the NPU
+  known-answer probe is bit-identical against its fp64 reference.
+- **Watched, not caused by 7.4:** the root NVMe logs `AMD-Vi: Event logged [IO_PAGE_FAULT]` under block
+  I/O (read-only translations, no `nvme` error / timeout / reset, no filesystem error, `smartctl` clean) —
+  a device-side read-after-unmap class of noise, monitored rather than normalised.
+- **Watched, and specifically not a 7.4 regression:** a MES `REMOVE_QUEUE` timeout that ends in a MODE2
+  GPU reset. The same chain is recorded on the 7.3 kernel four days earlier, and the MES wait budget is
+  unchanged between the two tags; on this box it has appeared with system memory exhausted and several
+  resident GPU clients, which is the regime to keep the box out of.
+- The two out-of-tree modules were rebuilt against 7.4 and signed the same way, and the NPU path loads
+  our `amdxdna` build, not the kernel's own copy — the installed `updates/` module wins the resolution
+  (`modinfo -n amdxdna`), which is the check that proves it after a reboot.
+
 ## What "ready" means
 
 1. an upstream tag to move to, and whether the PerfOpt series is **native** in it (then the

@@ -206,17 +206,35 @@ def chunks(args):
     return 0
 
 
+def manifest_padding(out):
+    """The per-projection padding chunks() used, read back from the manifest beside the chunks.
+
+    verify has to open each chunk at the width it was WRITTEN (`N_padded`), which is wider than the
+    container's own N whenever --pad-n was given - reading the container's N instead rejects a
+    perfectly good padded chunk with a byte-count message that reads like file corruption.
+    """
+    try:
+        with open(os.path.join(out, "manifest.json")) as f:
+            geo = json.load(f)["geometry"]
+        return {p: int(v["N_padded"]) for p, v in geo.items()}
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return {}
+
+
 def verify(args):
     q = Q4nx(args.model)
+    written = manifest_padding(args.out)
     bad = 0
     for proj, suffix in PROJ.items():
         name = q.layer_name(args.layer, suffix)
         info = q.moe_meta["tensors"][name]
         K, N = info["cols"], info["rows"]
+        n_out = max(N, args.pad_n or written.get(proj, N))
         worst = {"rel": 0.0, "cos": 1.0, "max": 0.0}
         for e in range(args.experts):
             ref = container_expert(q, name, e).astype(np.float64)
-            back = dequantise(*read_chunk(chunk_path(args.out, args.layer, proj, e), K, N))
+            # the padded columns are zero, so the comparison is the container's own N columns
+            back = dequantise(*read_chunk(chunk_path(args.out, args.layer, proj, e), K, n_out))[:, :N]
             err = np.abs(back.astype(np.float64) - ref)
             rel = float(np.sqrt((err ** 2).sum() / max((ref ** 2).sum(), 1e-30)))
             cos = float((back * ref).sum() / np.sqrt((back * back).sum() * (ref * ref).sum()))
@@ -224,8 +242,9 @@ def verify(args):
                      "max": max(worst["max"], float(err.max()))}
         ok = worst["cos"] > 0.98
         bad += not ok
+        pad_note = f" (written padded to {n_out}, compared in the container's {N})" if n_out > N else ""
         print(f"{'ok  ' if ok else 'BAD'} {proj:5s} {K} x {N}: worst of {args.experts} experts "
-              f"rel rms {worst['rel']:.4f}, cos {worst['cos']:.6f}, max |dw| {worst['max']:.4f}")
+              f"rel rms {worst['rel']:.4f}, cos {worst['cos']:.6f}, max |dw| {worst['max']:.4f}{pad_note}")
     return 1 if bad else 0
 
 
@@ -245,6 +264,9 @@ def main():
     v.add_argument("out")
     v.add_argument("--layer", type=int, default=0)
     v.add_argument("--experts", type=int, default=2)
+    v.add_argument("--pad-n", dest="pad_n", type=int, default=None,
+                   help="the padding these chunks were written with, if there is no manifest.json "
+                        "in the out dir to read it from")
     g = sub.add_parser("gate", help="expected int32 for one token, one layer, one projection "
                                      "(down's A is per expert)")
     g.add_argument("model")

@@ -62,8 +62,18 @@ roles from `layer_types` and projection shapes from the model's own dimensions, 
 `--check` re-generates and diffs against the file on disk, so a stale plan is a gate failure rather than a
 wrong number; `--print` shows it without writing.
 
+`container.tile_order` is the fourth decision written down, and it is the one that cannot be probed at all:
+it names the q4_1 tile order the payload is in (`engine-1`, what this repo's converter writes). A container
+from another converter can be a **different order**, and a wrong order decodes as noise *with no error
+anywhere* — every structural check passes (same tensor names, dtypes, byte counts, chunk kinds), the container
+loads, and the model simply answers badly (measured: one FLM converter checkout's containers answer the same
+token five times where ours answer " Paris."). Absent means `engine-1`, so every container written before the
+field existed keeps loading; an id this decoder does not implement is a refusal naming it, because the
+alternative is to guess a tile order at the one point where a guess is silent.
+
 The forward reads the plan with `npu/plan/plan.h` and **refuses by name** anything it cannot honour — a
-`kernels.tag` that disagrees with the container, a sealed ELF named outside the pb16i family, a decode dir
+`container.tile_order` other than `engine-1`, a `kernels.tag` that disagrees with the container, a sealed ELF
+named outside the pb16i family, a decode dir
 that is absolute or contains `..`, a layer count that disagrees with `layers[]`, or a kernel the plan names
 that is not in the directory (`forward init failed: plan <path>: this model's plan needs the QKV kernel
 "full_i8_QKV_K1024_N4096.elf" in <dir> (missing)`). A model directory **without** a plan keeps the probes,

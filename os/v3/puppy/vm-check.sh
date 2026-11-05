@@ -754,6 +754,18 @@ rows = [
                      "&& printf '%s' \"$t\" | grep -q '^/opt/1bit-package/1bit/hrx/llama/bin/llama-server$' "
                      "&& echo hrx-server-linked",
                      "hrx-server-linked"),
+    # Cycle 26, item 5: the path row above passes for a payload whose HRX backend cannot load, because the binary and its
+    # siblings live in one directory (`bin/` is BOTH the executable dir and the library dir, RUNPATH=$ORIGIN) and only the
+    # loader knows whether they are all there. Measured on the payload as a bug of the opposite kind - every NEEDED library
+    # resolves beside the binary (ldd: 0 `not found`, libggml-hrx.so.0 among them). A payload that loses one of them, or
+    # ships a binary whose RUNPATH points at a build machine (this one carries /work-c22/hrx-toolchain paths too), fails at
+    # the first HRX request with `invalid device: HRX0` - which is how the c25 take's downloaded backend failed, and the
+    # reason the recipe must use this binary rather than one it downloads.
+    ("U4 hrx libs",   "b=/opt/1bit-package/1bit/hrx/llama/bin/llama-server; "
+                     "n=$(ldd \"$b\" 2>/dev/null | grep -c 'not found'); echo not-found=$n; "
+                     "ldd \"$b\" 2>/dev/null | grep -c 'libggml-hrx' | sed 's/^/ggml-hrx-lines=/'; "
+                     "[ -x \"$b\" ] && [ \"$n\" = 0 ] && echo hrx-backend-loadable",
+                     "hrx-backend-loadable"),
     ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels 2>/dev/null; "
                      "n=$(ls -1d /opt/1bit-package/1bit/npu/kernels/*/ 2>/dev/null | wc -l); "
                      "s=$(ls -1 /opt/1bit-package/1bit/npu/kernels/*/manifest.sig 2>/dev/null | wc -l); "

@@ -50,6 +50,7 @@ usage() { sed -n '/^# g3-probe.sh/,/^# Exit/p' "$0" | sed 's/^# \{0,1\}//'; }
 fail=0
 want=""
 cert=""
+want_sv=""
 require_mok=0
 bad() { printf '  FAIL %s\n' "$*"; fail=$((fail + 1)); }
 ok() { printf '  ok   %s\n' "$*"; }
@@ -63,6 +64,7 @@ while [ $# -gt 0 ]; do
     case $1 in
     --kver) want=${2:-}; shift 2 || { usage >&2; exit 2; } ;;
     --cert) cert=${2:-}; shift 2 || { usage >&2; exit 2; } ;;
+    --srcversion) want_sv=${2:-}; shift 2 || { usage >&2; exit 2; } ;;
     --require-mok) require_mok=1; shift ;;
     -h | --help) usage; exit 0 ;;
     *) printf '%s: unknown option %s\n' "$prog" "$1" >&2; exit 2 ;;
@@ -152,6 +154,16 @@ for m in amdxdna ec_su_axb35; do
     signer=$(modinfo -F signer "$ko" 2> /dev/null)
     [ "$magic" = "$kver" ] && ok "$m.ko vermagic $magic" ||
         bad "$m.ko vermagic is '${magic:-<unreadable>}', the zdrv kernel is $kver"
+    # srcversion names the SOURCE the module was built from (it is not the kernel version): a vermagic and a MOK
+    # signature pass for every module we have ever built, so "c25 must carry patch 0008, not 0007" cannot be answered
+    # by presence at all. --srcversion makes the artifact answer it, and a mismatch is a FAIL by construction.
+    sv=$(modinfo -F srcversion "$ko" 2> /dev/null)
+    if [ "$m" = amdxdna ] && [ -n "$want_sv" ]; then
+        [ "$sv" = "$want_sv" ] && ok "amdxdna.ko srcversion $sv (the source this cut was built from)" ||
+            bad "amdxdna.ko srcversion is '${sv:-<none>}', this cut must carry $want_sv (a stale module)"
+    else
+        ok "$m.ko srcversion ${sv:-<none>}"
+    fi
     case $signer in
     *"Secure Boot"*) ok "$m.ko signed by $signer" ;;
     "") bad "$m.ko is unsigned (Secure Boot refuses it at load)" ;;

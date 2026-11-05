@@ -34,6 +34,8 @@
 #include <mutex>
 #include <vector>
 
+#include "q4nx_weight_layout.h"  // pack_int8_image(): the weight BO's byte order
+
 namespace onebit::npu {
 namespace {
 
@@ -312,11 +314,12 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
     // ONNX initializers are immutable, so the tensor's address is its identity: a graph that rewrote the bytes
     // in place would keep the old ones here, and re-uploading on every call would cost what this cache saves.
     if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
+        // Pack through the layout helper, which writes the same bytes a byte-at-a-time bpos() scatter
+        // would but in 8-byte microtile runs: this is the loop that a pass pays once per group (a kernel is
+        // keyed by (K, N), so a pass sends 28 different weights through each of 5 of them), and the scatter
+        // measured 1.44 ms for a 1024x2048 weight, 295 ms of a 1074 ms token.
         auto* Bm = (int8_t*)ctx.layerB[0]->map();
-        std::memset(Bm, 0, (size_t)ctx.KD * ctx.ND);
-        for (int64_t p = 0; p < k; ++p)
-            for (int64_t j = 0; j < n; ++j)
-                Bm[ctx.bpos((size_t)p, (size_t)j)] = b[p * n + j];
+        q4nx_layout::pack_int8_image(Bm, b, (int)k, (int)n, ctx.KD, ctx.ND, ctx.blocked_b);
         ctx.layerB[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         kern->w_ptr = b;
         kern->w_k = k;

@@ -70,6 +70,21 @@ Moe::Moe(const Model& model) : model_(model) {
             throw std::runtime_error(name + ": offsets does not list one entry per expert");
         const Tensor* tensor = model.find(name);
         if (!tensor) throw std::runtime_error(name + ": listed in __metadata__.moe but absent");
+        // The geometry is what a consumer reads a kernel's K and N out of (down_proj on
+        // Qwen3-30B-A3B is 768 x 2048 where gate/up are 2048 x 768), so it is checked against
+        // the tensor's own shape rather than trusted. A transposed pair is the mistake ggml's
+        // [cols, rows, experts] order invites and it leaves every byte count correct, so no
+        // check below can see it: tiles is 192 either way on that shape (24x8 and 64x3).
+        if (s.rows <= 0 || s.cols <= 0 || s.rows % 32 != 0 || s.cols % 256 != 0)
+            throw std::runtime_error(name +
+                                     ": rows/cols are not a whole number of 32x256 tiles");
+        if (s.tiles != (s.rows / 32) * (s.cols / 256))
+            throw std::runtime_error(name + ": tiles does not match rows x cols");
+        if (tensor->shape.size() != 3 ||
+            int64_t(tensor->shape[2]) != int64_t(kTileBytes) ||
+            tensor->shape[0] != int64_t(s.experts) * int64_t(s.rows / 32) ||
+            tensor->shape[1] != int64_t(s.cols / 256))
+            throw std::runtime_error(name + ": rows/cols disagree with the tensor's shape");
         // The offsets are measured from the data section, like every data_offsets in the
         // container, so expert 0's offset is the tensor's own start and the rest are relative
         // to it. Checking coverage here means a wrong list cannot reach a kernel.

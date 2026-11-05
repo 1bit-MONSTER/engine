@@ -91,6 +91,10 @@ counts and the coverage read against the registry and the checked results. The
 `census.yml` workflow runs daily at 05:17 UTC. It rebuilds the registry from the pins,
 sweeps HF, and opens a PR when anything changed.
 
+The census counts what the engine *can* run; which revision of each upstream model we actually run,
+ship or were built from is `models/pins.json`, checked daily by `tools/pin_watch.py`
+([model-pins.md](model-pins.md)).
+
 The census of 2026-10-17 (the first full sweep ran 2026-09-25), with `registry/census.json` holding the latest:
 
 | | models | share of those with an architecture |
@@ -185,5 +189,7 @@ tools/census.py --report           # recompute coverage from the saved counts
 tools/census_watch.py              # newest models vs the registry, plus FastFlowLM's org and
                                    # releases (--full to list all); exit 1 on an uncovered class
                                    # or an unmapped FastFlowLM family
+tools/pin_watch.py --check         # every pinned upstream revision vs its current main; exit 1 when
+                                   # one moved, with the chat template of anything that moved re-read
 scripts/census-watch.sh            # the same, with the log file and the origin/main refresh
 ```

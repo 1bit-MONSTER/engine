@@ -38,7 +38,8 @@ install itself onto a disk: `1bit-install` copies the system you booted, so an i
 | firmware | UEFI, Secure Boot **on** (see [6](#6-secure-boot-and-our-mok)) |
 
 The image is on Hugging Face, not on the GitHub release, because a GitHub release asset is capped at
-2 GiB and this one is 9,128,902,656 B written (**2,212,389,580 B** as `.img.xz`). That repository is
+2 GiB and this one is 9,128,902,656 B written (**about 2.2 GB** as `.img.xz`; the exact bytes change with every cut, so the size to
+check is the one `ls -l` prints after the download, not a number in this page). That repository is
 private until v2026.44 is published, so from that day the lines below are the download; an earlier
 release carries only the BusyBox `os/mini` image, which is the CI/VM target. Fetch both files, check
 the checksum, then write it and prepare it (the last line puts your SSH key and any models on the stick;

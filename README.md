@@ -31,7 +31,7 @@ Boot a USB stick, and the machine serves local LLMs on its GPU and NPU. That is 
 ## Get started
 
 1. Download the 1bit OS image from [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS):
-   `1bit-os-puppy.img.xz` (2,212,389,580 B compressed, 9.1 GB written) with the `SHA256SUMS` beside
+   `1bit-os-puppy.img.xz` (about 2.2 GB compressed, 9,128,902,656 B written) with the `SHA256SUMS` beside
    it. The image is served from Hugging Face because a GitHub release asset is capped at 2 GiB; the
    [releases page](https://github.com/1bit-MONSTER/engine/releases) stays the home of the
    `lemonade-onebit` package, the release notes and the release `SHA256SUMS`, and links there for the

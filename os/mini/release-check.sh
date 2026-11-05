@@ -1061,18 +1061,39 @@ fi
 # The class -> model pairs below mirror config/laya-first.json. If the table changes, this row fails
 # loudly instead of quietly checking yesterday's promise; the engine's `1bit laya-first --check`
 # validates the table itself.
-LAYA_ROUTER=1bit.Laya-First
+# The router's name comes from the engine itself: `1bit laya-first` prints the collection Lemonade
+# registers (user.Laya-First in the shipped table). Hardcoding it here would break the row the day the
+# table's name changes - and a name is not a detail, the server only registers `user.*` definitions.
+LAYA_ROUTER=user.Laya-First
+LAYA_BIN=
+for _b in $(command -v 1bit 2>/dev/null) /opt/1bit-engine/1bit /opt/1bit/1bit /opt/1bit-package/bin/1bit; do
+    [ -x "$_b" ] && { LAYA_BIN=$_b; break; }
+done
+if [ -n "$LAYA_BIN" ]; then
+    _n=$("$LAYA_BIN" laya-first 2>/dev/null | sed -n 's/.*"model_name": *"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$_n" ] && LAYA_ROUTER=$_n
+fi
 if ! printf '%s' "${MODELS:-}" | grep -q "\"$LAYA_ROUTER\""; then
-    skip laya-auto "no $LAYA_ROUTER router is registered (it needs a Laya checkpoint: scripts/fetch-laya.sh, then 1bit laya-first --policy)"
+    skip laya-auto "no $LAYA_ROUTER router is registered (it needs a Laya checkpoint - scripts/fetch-laya.sh - and the desugared policy registered: 1bit laya-first --policy FILE)"
 else
     LAYA_FAILS=0
     LAYA_SEEN=
+    # auth_post_watch, not auth_post: the latter spells its body as wget's `--post-data`, so on an image
+    # with curl but no wget it returns nothing and every post row reads as "no answer" (measured while
+    # exercising this row off the stick). This helper handles both fetchers and hands back the body.
+    LAYA_BODY=/tmp/1bit-laya-body.$$
+    : > "$LAYA_BODY"
     laya_probe() {  # <class> <prompt>
         _cls=$1
         _want=$(laya_class_model "$_cls")
         _body="{\"model\":\"$LAYA_ROUTER\",\"messages\":[{\"role\":\"user\",\"content\":$(json_text "$2" | sed 's/.*/"&"/')}],\"max_tokens\":16,\"temperature\":0,\"route_trace\":true}"
-        _out=$(auth_post "$_body" "$API/api/v1/chat/completions" slow)
-        _v=$(laya_verdict "$_out" "$_cls" "$_want")
+        _st=$(auth_post_watch "$_body" "$API/api/v1/chat/completions" "$LAYA_BODY")
+        case "${_st%% *}" in
+            200) ;;
+            *)   printf '      %s: the router did not answer (status %s)\n' "$_cls" "${_st%% *}"
+                 LAYA_FAILS=$((LAYA_FAILS + 1)); return ;;
+        esac
+        _v=$(laya_verdict "$(cat "$LAYA_BODY" 2>/dev/null)" "$_cls" "$_want")
         case "$_v" in
             PASS) LAYA_SEEN="$LAYA_SEEN ${_cls}->${_want}";;
             *)    printf '      %s: %s\n' "$_cls" "$_v"; LAYA_FAILS=$((LAYA_FAILS + 1));;

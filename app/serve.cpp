@@ -2911,6 +2911,13 @@ int run_serve(int argc, char** argv) {
             std::fprintf(stderr, "1bit serve: laya routes %s to %s (Q4NX model directory)\n", model_id(o).c_str(), dev.c_str());
         }
 #endif
+        // The in-process route keeps one context and takes the exclusive device lock (app/unified.cpp, engine#612),
+        // so --npu-streams could only queue here: refused by name instead of silently ignored.
+        if (o.npu_streams > 1)
+            throw std::runtime_error(
+                "--npu-streams is not supported on the in-process NPU route (a .q4nx model directory): it holds one "
+                "context and the exclusive NPU device lock (app/unified.cpp, engine#612), so N streams would only queue. "
+                "Drop --npu-streams.");
         // The NPU serves in process (unified.cpp).
         std::vector<std::string> args = {"-m", o.model, "-p", std::to_string(o.port), "--host", o.host};
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
@@ -2984,6 +2991,12 @@ int run_serve(int argc, char** argv) {
                 }
                 const std::string ldir = repack_gguf_lane(o.model, dxk);
                 if (!ldir.empty()) {
+                    if (o.npu_streams > 1)
+                        throw std::runtime_error(
+                            "--npu-streams is not supported on the fused dx route: it holds one context and the exclusive "
+                            "NPU device lock (app/unified.cpp, engine#612), so N streams would only queue. Drop "
+                            "--npu-streams, or drop ONEBIT_NPU_DX_KERNELS to use the model-generic forward, which does "
+                            "stream.");
                     std::fprintf(stderr, "1bit serve: routing %s to the fused dx route (one launch per layer) from %s\n",
                                  o.model.c_str(), dxk.c_str());
                     std::vector<std::string> args = {"-m", ldir, "-p", std::to_string(o.port), "--host", o.host};

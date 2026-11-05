@@ -415,6 +415,15 @@ must produce the same fingerprint whatever the slot count, which is what shows t
 content and not the configuration. Point it at an `hrx` serve under the GPU claim for the right-hand
 columns above. `--selftest` checks the fingerprint and comparator logic without a server.
 
+Add `--vs-solo` for the batched-versus-solo table: the tool takes one solo request first and scores every
+concurrent copy against it (`identical N/M`, `mean |dlogp|` min/median/max, median share of positions that
+keep the solo token), which is the number a cell should publish:
+
+```sh
+python3 tools/batched_repeat.py --url http://127.0.0.1:18110 --width 4 --rounds 4 --max-tokens 64 \
+    --vs-solo --json batched-vs-solo.json
+```
+
 With the NPU in the comparison, the same command with `--thinking off --match-by text`, on a build carrying
 #864: the forward path reports no token ids, so tokens are matched by text, and thinking off is what the
 last three-route row was taken with (`--thinking on` also works there and is what the earlier rows used).

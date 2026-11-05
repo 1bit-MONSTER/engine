@@ -104,6 +104,23 @@ def compare(a, b):
     return (ids_ok, first_bad, worst)
 
 
+def vs_solo(solo, copy):
+    """How far one concurrent copy is from the SOLO answer: the number a batched cell has to report when
+    its row next to a solo row is supposed to mean the same computation."""
+    n = min(len(solo), len(copy))
+    if n == 0:
+        return {"positions": 0, "mean_abs_dlogp": 0.0, "same_token": 0.0, "exact_bits": 0.0}
+    deltas = [abs(float(x[1]) - float(y[1])) for x, y in zip(solo[:n], copy[:n])
+              if x[1] is not None and y[1] is not None]
+    return {
+        "positions": n,
+        "mean_abs_dlogp": sum(deltas) / len(deltas) if deltas else 0.0,
+        "same_token": sum(1 for x, y in zip(solo[:n], copy[:n]) if x[0] == y[0]) / n,
+        "exact_bits": sum(1 for x, y in zip(solo[:n], copy[:n])
+                          if x[0] == y[0] and f32bits(x[1]) == f32bits(y[1])) / n,
+    }
+
+
 def round_of(url, model, prompt, max_tokens, top, width, join_timeout=900, request=None):
     """Issue `width` byte-identical requests through a barrier so they land in one decode batch.
 
@@ -160,6 +177,12 @@ def selftest():
     assert sum(e is None for e in err) == 2, f"two copies ok, one failed: {err}"
     assert sum(c is not None for c in out) == 2, "good copies recorded, failed copy is None"
     assert any("simulated backend error" in (e or "") for e in err), "the failure is reported, not swallowed"
+    # the vs-solo scorer: identical copy scores 1.0/1.0/0.0, a moved bit scores 1.0 on tokens but 0 exact
+    sc = vs_solo(base, base)
+    assert (sc["same_token"], sc["exact_bits"], sc["mean_abs_dlogp"]) == (1.0, 1.0, 0.0), sc
+    sc2 = vs_solo(base, [(5, -0.50000012, [(5, -0.5)]), (9, -0.25, [])])
+    assert sc2["same_token"] == 0.5 and sc2["exact_bits"] == 0.0 and sc2["mean_abs_dlogp"] > 0, sc2
+    assert vs_solo([], [])["positions"] == 0, "empty copies do not divide by zero"
     print("selftest: ok")
 
 
@@ -172,6 +195,8 @@ def main():
     ap.add_argument("--top-logprobs", type=int, default=5)
     ap.add_argument("--width", type=int, default=4, help="concurrent identical requests per round")
     ap.add_argument("--rounds", type=int, default=4)
+    ap.add_argument("--vs-solo", action="store_true",
+                    help="also score every concurrent copy against one solo request (the scoreboard number)")
     ap.add_argument("--json")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
@@ -186,7 +211,17 @@ def main():
 
     print(f"{a.url} model {model}: {a.rounds} rounds x {a.width} identical concurrent requests, "
           f"{a.max_tokens} tokens, greedy")
+
+    solo, solo_err = None, None
+    if a.vs_solo:
+        one, solo_err = round_of(a.url, a.model or model, a.prompt, a.max_tokens, a.top_logprobs, 1)
+        solo = one[0]
+        if solo is None or solo_err[0]:
+            print(f"  solo baseline failed: {solo_err[0]}")
+            a.vs_solo = False
+
     rounds, fps = [], []
+    scores = []
     for r in range(a.rounds):
         copies, err = round_of(a.url, a.model or model, a.prompt, a.max_tokens, a.top_logprobs, a.width)
         bad = [(i, e) for i, e in enumerate(err) if e]
@@ -198,9 +233,17 @@ def main():
         within = [compare(ok[0], c) for c in ok[1:]] if ok else []
         same = sum(1 for w in within if w[0] and w[2] == 0.0)
         worst = max([w[2] for w in within if w[2] != float("inf")] or [0.0])
+        extra = ""
+        if solo is not None:
+            got = [vs_solo(solo, c) for c in ok]
+            scores.extend(got)
+            extra = (f", vs solo mean |dlogp| {min(x['mean_abs_dlogp'] for x in got):.3e}"
+                     f"..{max(x['mean_abs_dlogp'] for x in got):.3e}"
+                     f", same token {min(x['same_token'] for x in got):.3f}"
+                     f"..{max(x['same_token'] for x in got):.3f}")
         print(f"  round {r}: copies agree with copy0: {same}/{max(len(ok)-1,0)} bitwise"
               f"{'' if not within else f', worst |dlogp| {worst:.3e}'}"
-              f", distinct fingerprints {len(set(f for f in fps[r] if f))}/{len(ok)}")
+              f", distinct fingerprints {len(set(f for f in fps[r] if f))}/{len(ok)}{extra}")
 
     n_cmp = n_same = 0
     worst_x = 0.0
@@ -221,12 +264,20 @@ def main():
           f" of {a.rounds * a.width} copies")
     verdict = "REPEATABLE (batched)" if n_cmp and n_same == n_cmp else "NOT repeatable (batched)"
     print(f"  ==> width {a.width}, {a.rounds} rounds: {verdict}")
+    if scores:
+        mid = lambda k: sorted(x[k] for x in scores)[len(scores) // 2]
+        ident = sum(1 for x in scores if x["exact_bits"] == 1.0)
+        print(f"  vs the SOLO answer ({len(scores)} copies): identical {ident}/{len(scores)},"
+              f" mean |dlogp| min {min(x['mean_abs_dlogp'] for x in scores):.3e}"
+              f" median {mid('mean_abs_dlogp'):.3e} max {max(x['mean_abs_dlogp'] for x in scores):.3e},"
+              f" same token median {mid('same_token'):.3f}")
     if a.json:
         with open(a.json, "w") as f:
             json.dump({"url": a.url, "model": model, "width": a.width, "rounds": a.rounds,
                        "max_tokens": a.max_tokens, "fingerprints": fps,
                        "round_to_round_identical": [n_same, n_cmp],
-                       "distinct_fingerprints": len(all_fps), "verdict": verdict}, f, indent=1)
+                       "distinct_fingerprints": len(all_fps), "verdict": verdict,
+                       "vs_solo": scores or None}, f, indent=1)
     return 0
 
 

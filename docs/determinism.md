@@ -490,8 +490,9 @@ how each arm above was run.
   moves them; re-run rather than extrapolate.
 - The concurrency numbers were measured on a 0.6B model on one host; they show the effect exists
   and is not small, not how large it gets for other shapes. The batched-repeat rows are one prompt,
-  32 tokens, 0.6B and 4B: they establish that a batched cell is not repeatable and that the outcome
-  set is small and per-engine, not how the dispersion scales with model size or prompt length.
+  32 tokens for the state tables and 64 for the batched-versus-solo ones, 0.6B and 4B: they establish
+  that a batched cell is not repeatable and that the outcome set is small and per-engine, not how the
+  dispersion scales with model size or prompt length.
 - The NPU agreement rows are 2 repeats (the other routes' 5 would be ~25 min of the array) and, over a
   *requantised* pack, they are not an arithmetic-only distance. The 64-token row removes the earlier
   budget difference, so all three columns can be read at one token count.

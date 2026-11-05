@@ -516,6 +516,18 @@ rows = [
                      "! grep -q 'GET /api/v1/models' /tmp/pane.txt && "
                      "grep -q 'POST /api/v1/chat' /tmp/pane.txt && echo pane-filtered",
                      "pane-filtered"),
+    # Cycle 26 item 1's *board* row, in the form a machine can check: the brief asks for "a tty1 screenshot that shows the
+    # TUI intact after 5 min of polling + 10 chats". /dev/vcs1 is that screenshot's text (the active VT is tty1), so the
+    # same two assertions work here and on the board over ssh: the TUI is drawn on the screen, and no page poll has been
+    # painted onto it. The static PANELS word is the layout; a poll line can only be there if something drew it.
+    ("U2 console screen", "sleep 20; tr -d '\\000' < /dev/vcs1 > /tmp/scr.txt 2>/dev/null; "
+                     "echo screen-chars=$(wc -c < /tmp/scr.txt) "
+                     "panels=$(grep -c 'FANS / TEMPS' /tmp/scr.txt) "
+                     "polls=$(grep -c 'GET /api/v1/models' /tmp/scr.txt) "
+                     "hidden=$(grep -c 'debug lines hidden' /tmp/scr.txt); "
+                     "grep -q 'FANS / TEMPS' /tmp/scr.txt && "
+                     "! grep -q 'GET /api/v1/models' /tmp/scr.txt && echo screen-unpainted",
+                     "screen-unpainted"),
     # The mechanism behind U3-lan and U7 (cycle 15's finding, and the row the c16 refactor folded away): inbound
     # connections from the LAN pass only if the appliance opened the ports AFTER Puppy's rc.firewall (which ends
     # in `-P INPUT DROP`) and let the RFC1918 ranges through tcpwrappers. Printing all three - the rules, the

@@ -54,7 +54,7 @@ DeepSeek V4.x, GLM 5.x and Qwen3.8-Flash-Next run on **HRX** here, and the catal
 | hrx-system | `82804197bcbe` |
 | HRX toolchain (ROCm/TheRock SDK) | `10.3.0a20261031`, `gfx1151` (`config/hrx-toolchain.config`), HSA runtime `21a6682452e159cf…` |
 | Lemonade Server | `2026.46.0~1.ef0f3b49` (our fork, the `onebit` recipe) |
-| kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
+| kernel in the image | `7.4.0-rc1-1bit` (Linux `v7.4-rc1`, IOMMU PerfOpt upstream, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
 
 The pinned toolchain's HSA runtime, so a bump is a diff here and a wrong runtime is visible

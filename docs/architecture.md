@@ -70,9 +70,9 @@ exits cleanly, so Lemonade can restart the model
 
 ## The kernel
 
-The box's Linux kernel is ours too: `v7.3-rc4` plus the IOMMU PerfOpt backports, built from our
-config, MOK-signed for Secure Boot, and gated like a pin bump. Moving it to the next upstream tag is
-a written step list ([kernel.md](kernel.md)).
+The box's Linux kernel is ours too: `v7.4-rc1`, plain upstream since the IOMMU PerfOpt series is
+native there, built from our config, MOK-signed for Secure Boot, and gated like a pin bump. Moving it
+to the next upstream tag is a written step list ([kernel.md](kernel.md)).
 
 ## Pinned sources
 

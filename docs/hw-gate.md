@@ -111,8 +111,8 @@ log with no report at all fails too: the check saw nothing. With `--phases place
 server answers one short chat request instead of the kat, so a prompt graph and decode graphs are
 scheduled. The judge's verdicts are in `tests/hw_gate_test.py` (ctest `hw_gate_judges`).
 
-One `test-backend-ops` case is a known intermittent failure (KNOWN-ISSUES.md, engine#370:
-`MUL_MAT(type_a=f32,type_b=f32,m=1,n=1,k=2048)`, about 1 run in 40). When that is the only
+One `test-backend-ops` case has a history of intermittency (KNOWN-ISSUES.md, engine#370, **closed as not
+reproducing**: `MUL_MAT(type_a=f32,type_b=f32,m=1,n=1,k=2048)`, about 1 run in 40 when it was seen). When that is the only
 failing case, the case runs alone three more times and the check passes if all three are clean;
 the summary says so.
 

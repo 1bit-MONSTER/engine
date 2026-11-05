@@ -17,7 +17,7 @@
 #
 # Measured 2026-11-01 (docs/os-v3-live-puppy-eval.md): Puppy's initrd mounts the medium and layers the
 # save file with these drivers and filesystems itself, so they must be in the image, not in a module the
-# initrd has no way to load yet. Our 7.3.0-rc4-1bit-perfopt+ has them as modules (Ubuntu's shape) and
+# initrd has no way to load yet. Our `7.4.0-rc1-1bit` has them as modules (Ubuntu's shape) and
 # the initrd stops 2.1 s into the boot with
 #
 #   *** /puppy_upup64n_24.04.sfs not found.   ... dropping out to console
@@ -31,7 +31,7 @@
 # --- the medium: CD (the ISO in QEMU, and a stick written as an ISO) -------------------------------
 # the chain UNDER the next four lines, and the reason they are here: kconfig will not let a tristate be
 # `=y` while a symbol it depends on is `=m` - `make olddefconfig` does not fail, it quietly reduces the
-# child back to `=m`. Ours are all `=m` today (measured in /boot/config-7.3.0-rc4-1bit-perfopt+: SCSI,
+# child back to `=m`. Ours are all `=m` today (measured in /boot/config-7.4.0-rc1-1bit: SCSI,
 # SCSI_MOD, SCSI_COMMON, CDROM, ATA, SATA_AHCI), so a fragment that set only the drivers would be
 # silently half-applied - the trap the per-symbol check in os/v3/puppy/README.md exists to catch.
 CONFIG_SCSI=y                           # [m]  every one of the medium drivers below depends on this

@@ -187,8 +187,28 @@ def remote_bytes(repo: str, rev: str, path: str, start: int, end: int) -> bytes:
         return r.read()
 
 
+def container_template(blob: bytes) -> bytes | None:
+    """The chat template a container's `tokenizer_config.json` carries, as the engine's NPU / model-directory
+    route reads it (docs/npu-chat-template.md): the `chat_template` **string**, whose bytes are what the
+    serve line names. Hashing the JSON file itself would be a second number for one template — the
+    disagreement #1131 was about."""
+    try:
+        doc = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise ValueError(f"tokenizer_config.json is not UTF-8 JSON ({e})")
+    t = doc.get("chat_template")
+    if t is None:
+        return None
+    if not isinstance(t, str):
+        # shortcut: a named-template list is not pinned; the engine's directory route reads one named
+        # template, so such a pack needs its served name decided first. Upgrade when one appears in a row.
+        raise ValueError(f"chat_template is a {type(t).__name__}, not the string the serve line reads")
+    return t.encode("utf-8")
+
+
 def remote_template(repo: str, rev: str, path: str, cap: int = 192 << 20) -> str | None:
-    """sha256 of the chat template PATH carries at REV: a GGUF's metadata key, or a text file verbatim.
+    """sha256 of the chat template PATH carries at REV: a GGUF's metadata key, a container's
+    `chat_template` string, or a text file (e.g. `chat_template.jinja`) verbatim.
 
     A GGUF's tokenizer arrays sit in the metadata, so the prefix starts at 4 MiB and doubles until the
     block parses; only the metadata is ever fetched, never a tensor."""
@@ -205,6 +225,9 @@ def remote_template(repo: str, rev: str, path: str, cap: int = 192 << 20) -> str
                 if size >= cap:
                     raise
                 size = min(size * 2, cap)
+    if path.endswith(".json"):
+        tpl = container_template(remote_bytes(repo, rev, path, 0, (1 << 20) - 1))
+        return hashlib.sha256(tpl).hexdigest() if tpl is not None else None
     return hashlib.sha256(remote_bytes(repo, rev, path, 0, 1 << 20)).hexdigest()
 
 
@@ -401,7 +424,7 @@ def pr_body(c: dict) -> str:
 
 
 def self_test() -> int:
-    global api, head, tree, remote_template, commits_since
+    global api, head, tree, remote_template, remote_bytes, commits_since
     failures = 0
 
     def expect(what, got, want):
@@ -421,6 +444,28 @@ def self_test() -> int:
     expect("gguf template read", hashlib.sha256(gguf_template(gguf)).hexdigest(), hashlib.sha256(tpl).hexdigest())
     bare = b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + kv("general.architecture", b"zamba2")
     expect("gguf without a template", gguf_template(bare), None)
+
+    # a container's template is the `chat_template` string inside tokenizer_config.json, the bytes the
+    # engine's serve line names — not the JSON file's own digest, which would be a second number for it
+    cfg = json.dumps({"model_type": "qwen3", "chat_template": tpl.decode()}).encode()
+    cfg_sha = hashlib.sha256(container_template(cfg)).hexdigest()
+    expect("a container's template is its chat_template string", cfg_sha, hashlib.sha256(tpl).hexdigest())
+    expect("...and not the file's own digest", cfg_sha == hashlib.sha256(cfg).hexdigest(), False)
+    expect("a container with no template", container_template(b'{"model_type": "qwen3"}'), None)
+    named = "not refused"
+    try:
+        container_template(json.dumps({"chat_template": [{"name": "default", "template": "x"}]}).encode())
+    except ValueError:
+        named = "refused"
+    expect("a named-template list is refused, not guessed", named, "refused")
+
+    def fake_remote_bytes(repo, rev, path, start, end):
+        return cfg if path.endswith(".json") else tpl
+
+    remote_bytes = fake_remote_bytes
+    expect("a .json path is read as a container template", remote_template("r", "v", "tokenizer_config.json"), cfg_sha)
+    expect("a .jinja path is hashed verbatim", remote_template("r", "v", "chat_template.jinja"),
+           hashlib.sha256(tpl).hexdigest())
 
     # a two-revision fake upstream: `old` holds the file, `new` replaces it and its template
     trees = {
@@ -550,8 +595,10 @@ def main(argv: list[str]) -> int:
     if a.pin:
         made = {}
         for repo in a.pin:
-            paths = sorted(e["path"] for e in tree(repo) if e.get("type") == "file" and e["path"].endswith(".gguf"))
-            made[repo] = entry(repo, paths, [f"pin: {repo}"])
+            now = head(repo)
+            paths = sorted(e["path"] for e in tree(repo, now) if e.get("type") == "file" and e["path"].endswith(".gguf"))
+            made[repo] = entry(repo, paths, [f"pin: {repo}"], commit=now,
+                               templates={p: remote_template(repo, now, p) for p in paths})
         print(json.dumps(made, indent=1, sort_keys=True))
         return 0
 
@@ -576,10 +623,7 @@ def main(argv: list[str]) -> int:
             print(f"pin_watch: {a.bump}: {len(missing)} tracked file(s) are gone upstream: "
                   + ", ".join(missing) + " — decide, then edit the pin", file=sys.stderr)
             return 1
-        tpls = {p: pin["files"][p].get("template_sha256") for p in pin["files"]}
-        for p in pin["files"]:
-            if pin["files"][p].get("template_sha256") is not None:
-                tpls[p] = remote_template(a.bump, now, p)
+        tpls = {p: remote_template(a.bump, now, p) for p in pin["files"]}
         doc["pins"][a.bump] = entry(a.bump, sorted(pin["files"]), pin["used_for"], templates=tpls)
         save(a.pins, doc)
         print(f"pin_watch: {a.bump} pinned at {doc['pins'][a.bump]['commit'][:8]}")

@@ -625,6 +625,12 @@
     "stick: Lemonade catalogue container ((Q4NX container))"
    ],
    "files": {
+    "chat_template.jinja": {
+     "oid": "a8755d827c0a7b614c246c4060dfd58ab352a8ff",
+     "size": 7764,
+     "lfs": false,
+     "template_sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+    },
     "tokenizer_config.json": {
      "oid": "3952ffef1dfabf76646d5f8a1a899e760db72cb4",
      "size": 8761,
@@ -1194,7 +1200,7 @@
      "oid": "c5e960f8f86088760f876dca70aba8e97bbe89f6",
      "size": 10055,
      "lfs": false,
-     "template_sha256": null
+     "template_sha256": "a136047ba140347b359d17b6ff8fa1bf8cb29d23f0c07bef7e0bf479b8680793"
     }
    }
   },
@@ -1209,7 +1215,7 @@
      "oid": "c5e960f8f86088760f876dca70aba8e97bbe89f6",
      "size": 10055,
      "lfs": false,
-     "template_sha256": null
+     "template_sha256": "a136047ba140347b359d17b6ff8fa1bf8cb29d23f0c07bef7e0bf479b8680793"
     }
    }
   },
@@ -1224,7 +1230,7 @@
      "oid": "c5e960f8f86088760f876dca70aba8e97bbe89f6",
      "size": 10055,
      "lfs": false,
-     "template_sha256": null
+     "template_sha256": "a136047ba140347b359d17b6ff8fa1bf8cb29d23f0c07bef7e0bf479b8680793"
     }
    }
   },

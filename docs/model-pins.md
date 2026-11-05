@@ -79,9 +79,11 @@ only appears when nothing was left unread: a watcher whose "clean" and "could no
 outcome is blind exactly when it matters.
 
 For a file that moved it also re-reads the **chat template** of the new revision — a GGUF's
-`tokenizer.chat_template` over an HTTP range request of the metadata header only, never a tensor — and
-reports one of: unchanged, `TEMPLATE CHANGED`, template added, template removed, or not checked
-(`--no-template`). That is the gate a re-quantization has to pass before anything may adopt it
+`tokenizer.chat_template` over an HTTP range request of the metadata header only, never a tensor; a
+container's `tokenizer_config.json` parsed and its `chat_template` **string** hashed, which is the byte
+sequence the engine's serve line names, not the JSON file's own digest; a `chat_template.jinja` hashed
+verbatim — and reports one of: unchanged, `TEMPLATE CHANGED`, template added, template removed, or not
+checked (`--no-template`). That is the gate a re-quantization has to pass before anything may adopt it
 ([template-publishing.md](template-publishing.md)): weights moving under a stable file name is ordinary,
 the instructions the model obeys on every request moving under it is not.
 

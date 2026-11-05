@@ -37,7 +37,11 @@ and the files we re-hosted are the old ones. This tool closes that gap (docs/mod
   --out FILE   where --check writes its report (default pin-report.md).
   --self-test  run against fixtures, no network.
 
-Exit codes: 0 nothing moved, 1 a pin moved (or --bump refused), 2 usage, 3 --self-test failed.
+Exit codes: 0 nothing moved, 1 a pin moved (or --check found nothing readable), 2 usage,
+3 --self-test failed, 4 --bump needs a human (the repo or a tracked file is gone upstream).
+
+The workflow reads 4 as "skip this repo and say so", and any other non-zero as an unread upstream:
+a bump that did not happen because the Hub was down is not a clean day either.
 """
 from __future__ import annotations
 
@@ -541,7 +545,8 @@ def self_test() -> int:
             return [v for k, v in trees["new"].items() if k != "tpl.gguf"]
 
         head, tree, commits_since = fake_head_new, fake_tree_missing, fake_commits
-        expect("--bump refuses a vanished file", main(["--bump", "fake/moved", "--pins", path]), 1)
+        expect("--bump refuses a vanished file (a human decides, not an error)",
+               main(["--bump", "fake/moved", "--pins", path]), 4)
         expect("--bump left the pin alone", load(path)["pins"]["fake/moved"]["commit"], "new")
 
         tree = fake_tree
@@ -561,7 +566,8 @@ def self_test() -> int:
         gone_md = report(gone_changes, gone_notes, 1, False)
         expect("the report says gone upstream", "Gone upstream" in gone_md, True)
         expect("no all-clear over a 404", "Every pinned upstream repo is at" in gone_md, False)
-        expect("--bump refuses a gone repo", main(["--bump", "fake/gone", "--pins", path]), 1)
+        expect("--bump refuses a gone repo (a human decides, not an error)",
+               main(["--bump", "fake/gone", "--pins", path]), 4)
         expect("the gone pin is untouched", load(path)["pins"]["fake/gone"]["commit"], "new")
 
         # a run that could read nothing is exit 2 (the workflow fails on anything outside 0/1) and its
@@ -616,13 +622,13 @@ def main(argv: list[str]) -> int:
             if e.code == 404:
                 print(f"pin_watch: {a.bump}: gone upstream (404) — a delete, a rename or a privatisation; "
                       f"decide, then edit or drop the pin", file=sys.stderr)
-                return 1
+                return 4
             raise
         missing = [p for p in pin["files"] if p not in at_new]
         if missing:
             print(f"pin_watch: {a.bump}: {len(missing)} tracked file(s) are gone upstream: "
                   + ", ".join(missing) + " — decide, then edit the pin", file=sys.stderr)
-            return 1
+            return 4
         tpls = {p: remote_template(a.bump, now, p) for p in pin["files"]}
         doc["pins"][a.bump] = entry(a.bump, sorted(pin["files"]), pin["used_for"], templates=tpls)
         save(a.pins, doc)

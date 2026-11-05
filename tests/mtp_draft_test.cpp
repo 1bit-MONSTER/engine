@@ -28,6 +28,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <cstring>
 #include <vector>
 
@@ -190,6 +191,32 @@ public:
         if (conf && !conf->empty()) (*conf)[0] = 1.0f;
         return (int)out.size();
     }
+};
+
+// A head with a drawn accuracy: right at each depth with probability `acc`, and it stops chaining after its first
+// wrong proposal the way the real head's tau gate does.  Used only by the randomised sweep in [14], where the point
+// is that no hand-picked accept shape (all, none, prefix, gated) is special.
+class RandomHead : public DraftHead {
+public:
+    RandomHead(double acc, unsigned seed) : acc_(acc), rng_(seed) {}
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
+              std::vector<float>* conf = nullptr) override {
+        const int have = (int)hidden[0];
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        out.clear();
+        if (conf) conf->clear();
+        for (int i = 0; i < k; i++) {
+            const double r = u(rng_);
+            out.push_back(r < acc_ ? truth(have + i) : (truth(have + i) + 1 + (int)(r * 977.0)) % V);
+            if (conf) conf->push_back((float)(r < acc_ ? 0.99 : 0.05));
+            if (r >= acc_) break;                      // a wrong draft ends the chain, as a low-confidence one does
+        }
+        return (int)out.size();
+    }
+
+private:
+    double acc_;
+    std::mt19937 rng_;
 };
 
 bool same(const std::vector<int>& a, const std::vector<int>& b) { return a == b; }
@@ -648,6 +675,42 @@ int main() {
         check(r.ok && sd.stream_mismatches() == 0, "whole-batch rows: no chain opened off the cursor");
         std::printf("INFO whole-batch rows: stream %d rows, accepted %d/%d, passes/token %.3f\n", sd.cache_rows(),
                     r.stats.accepted, r.stats.drafted, r.stats.passes_per_token());
+    }
+
+    // [14] the same properties over randomised inputs, because [1]-[13] are hand-picked shapes and the defects that
+    // survive them are the ones nobody chose.  600 deterministic cases over k, tau, budget, prompt, batch width,
+    // head accuracy and BOTH hidden-row shapes ([13]); every one must match plain decode, consume exactly
+    // prompt+emitted positions, never exceed max_batch_rows, and leave no verify rows uncommitted.
+    {
+        std::mt19937 rng(20261105u);
+        int cases = 0, bad = 0;
+        for (int it = 0; it < 600; it++) {
+            const int batch_rows = 1 + (int)(rng() % 6);
+            const int plen = 1 + (int)(rng() % 6);
+            std::vector<int> pr((size_t)plen);
+            for (auto& t : pr) t = (int)(rng() % (unsigned)V);
+            Options o;
+            o.k = (int)(rng() % 8);
+            o.max_tokens = 1 + (int)(rng() % 40);
+            o.tau = (it % 3 == 0) ? 0.0f : (it % 3 == 1 ? 0.6f : 0.95f);
+            const double acc = (double)(rng() % 101) / 100.0;
+            RandomHead h(acc, rng());
+            ToyBase m(batch_rows);
+            m.keep_batch_rows(it % 2 == 1);
+            ToyBase plain_m(batch_rows);
+            const Result live = onebit::npu::mtp::run(m, &h, pr, o);
+            const Result plain = onebit::npu::mtp::run_plain(plain_m, pr, o);
+            cases++;
+            const bool ok = live.ok && same(live.tokens, plain.tokens) &&
+                            (int)live.tokens.size() == o.max_tokens && m.bad_pos() == 0 &&
+                            m.consumed() == plen + (int)live.tokens.size() && m.over_batch() == 0 && m.pending() == 0;
+            if (!ok && ++bad <= 3)
+                std::printf("INFO sweep case %d: k=%d tau=%.2f budget=%d plen=%d rows=%d full_rows=%d acc=%.2f err=%s\n",
+                            it, o.k, (double)o.tau, o.max_tokens, plen, batch_rows, (int)(it % 2 == 1), acc,
+                            live.err.c_str());
+        }
+        check(bad == 0, "randomised: 600 cases keep text, position, batch width and commit invariants");
+        std::printf("INFO randomised: %d cases, %d violated an invariant\n", cases, bad);
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

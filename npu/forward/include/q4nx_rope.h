@@ -88,26 +88,41 @@ static inline void q4nx_rope_declared_type(const char* json, char* out, int cap)
     if (!json) return;
     const char* rs = strstr(json, "\"rope_scaling\"");
     if (!rs) return;
-    {
-        /* "rope_scaling": null declares nothing — and must not let the search below find some other
-         * block's "type": that is the one way this reader could refuse a model that asked for nothing. */
-        const char* c = strchr(rs, ':');
-        if (!c) return;
-        const char* v = c + 1;
-        while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') ++v;
-        if (*v != '{') return;
+    const char* v = strchr(rs, ':');
+    if (!v) return;
+    for (++v; *v == ' ' || *v == '\t' || *v == '\n' || *v == '\r'; ++v) {
     }
-    /* the block is a flat object in every config we read; 800 bytes is past its closing brace */
-    const char* end = rs + 800;
-    const char* p = strstr(rs, "\"rope_type\"");      /* current HF spelling */
-    if (!p || p > end) p = strstr(rs, "\"type\"");   /* pre-4.45 spelling: {"type": "yarn"} */
+    if (*v != '{') return;   /* null (or a non-object) declares nothing */
+    /* The window is the block's OWN closing brace, not a byte count.  A fixed window is wrong in both
+     * directions: a block that serialises its factor arrays before the type key can push "rope_type"
+     * past it (which would read as NO block, i.e. served plain — the failure this reader exists to
+     * stop), and a block that has no type at all can reach a NEIGHBOUR's "type" inside it (which would
+     * refuse a model that asked for nothing).  Braces are matched through strings, so a "}" inside a
+     * string cannot end the block early. */
+    int depth = 0, instr = 0, esc = 0;
+    const char* end = 0;
+    for (const char* q = v; *q; ++q) {
+        const char ch = *q;
+        if (instr) {
+            if (esc) esc = 0;
+            else if (ch == '\\') esc = 1;
+            else if (ch == '"') instr = 0;
+            continue;
+        }
+        if (ch == '"') instr = 1;
+        else if (ch == '{' || ch == '[') ++depth;
+        else if ((ch == '}' || ch == ']') && --depth == 0) { end = q; break; }
+    }
+    if (!end) return;   /* unterminated block: nothing trustworthy to refuse */
+    const char* p = strstr(v, "\"rope_type\"");      /* current HF spelling */
+    if (!p || p > end) p = strstr(v, "\"type\"");   /* pre-4.45 spelling: {"type": "yarn"} */
     if (!p || p > end) return;
     const char* c = strchr(p, ':');
     if (!c || c > end) return;
     const char* q = strchr(c, '"');
     if (!q || q > end) return;
     const char* e = strchr(q + 1, '"');
-    if (!e) return;
+    if (!e || e > end) return;
     int n = (int)(e - q - 1);
     if (n > cap - 1) n = cap - 1;
     memcpy(out, q + 1, (size_t)n);

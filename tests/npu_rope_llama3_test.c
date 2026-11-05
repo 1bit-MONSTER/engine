@@ -156,6 +156,40 @@ static void test_declared_type(void) {
                  cases[i].supported);
         check(got == cases[i].supported, buf);
     }
+    /* The review's two edges (PR #1090): the window is the block's own closing brace, not a byte count.
+     * (a) a type that sits past a fixed window must still be found — reading it as "no block" would
+     *     serve the model plain, which is the failure this reader exists to stop (it fails OPEN);
+     * (b) a block with no type must not take a neighbour's "type" — that refuses a model that asked
+     *     for nothing. */
+    {
+        char big[1600];
+        char pad[1000];
+        memset(pad, 'x', sizeof pad - 1);
+        pad[sizeof pad - 1] = '\0';
+        snprintf(big, sizeof big, "{\"rope_scaling\": {\"pad\": \"%s\", \"rope_type\": \"yarn\"}}", pad);
+        char type[64];
+        q4nx_rope_declared_type(big, type, (int)sizeof type);
+        check(!strcmp(type, "yarn"), "a type 1,000 bytes into the block is still read (fails closed)");
+        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0) == 0,
+              "... and is refused");
+    }
+    {
+        char type[64];
+        q4nx_rope_declared_type("{\"rope_scaling\": {\"factor\": 8.0}, "
+                                "\"quantization_config\": {\"type\": \"fp8\"}}", type, (int)sizeof type);
+        check(type[0] == '\0', "a block with no type does not take a neighbour's type");
+        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0) == 1, "... and is not refused");
+        /* nested arrays/objects before the type, and a '}' inside a string, both keep the block open */
+        q4nx_rope_declared_type("{\"rope_scaling\": {\"mrope_section\": [1, 2], \"rope_type\": \"yarn\"}}",
+                                type, (int)sizeof type);
+        check(!strcmp(type, "yarn"), "a nested array before the type does not end the block");
+        q4nx_rope_declared_type("{\"rope_scaling\": {\"note\": \"} not the end\", \"rope_type\": \"yarn\"}}",
+                                type, (int)sizeof type);
+        check(!strcmp(type, "yarn"), "a '}' inside a string does not end the block");
+        q4nx_rope_declared_type("{\"rope_scaling\": {\"rope_type\": \"yarn\"", type, (int)sizeof type);
+        check(type[0] == '\0', "an unterminated block declares nothing rather than guessing");
+    }
+
     /* no config text at all: nothing declared, nothing to refuse */
     char none[8];
     q4nx_rope_declared_type((const char*)0, none, (int)sizeof none);

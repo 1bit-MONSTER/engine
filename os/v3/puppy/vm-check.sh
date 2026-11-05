@@ -344,10 +344,14 @@ rows = [
     # Cycle 14, item 2: who owns tty1. `U2 tty1` reads what a person sees; this says which process put it
     # there, because the board run had a prompt in QEMU and none on the hardware and only this line names the
     # difference. 1bit-console is the appliance's own entry (inittab), plogin is what it replaced.
-    ("U2 tty1 owner", "for p in /proc/[0-9]*; do t=$(readlink \"$p/fd/0\" 2>/dev/null); "
-                     "case \"$t\" in /dev/tty1) echo \"tty1-owner: $(tr -d '\\000' < $p/cmdline | tr '\\000' ' ')\";; esac; done | head -2; "
-                     "pgrep -af 'getty|plogin|1bit-console' | head -3; "
-                     "grep -c '^tty1::respawn:/usr/local/bin/1bit-console$' /etc/inittab", None),
+    ("U2 tty1 owner", "own=$(for p in /proc/[0-9]*; do t=$(readlink \"$p/fd/0\" 2>/dev/null); "
+                     "case \"$t\" in /dev/tty1) tr -d '\\000' < $p/cmdline | tr '\\000' ' '; echo ;; esac; done | head -4); "
+                     "printf 'tty1-owners: %s\\n' \"$(printf '%s' \"$own\" | tr '\\n' '|')\"; "
+                     "pgrep -af 'getty|plogin' | head -3; "
+                     "i=$(grep -c '^tty1::respawn:/usr/local/bin/1bit-console$' /etc/inittab); echo \"inittab-console=$i\"; "
+                     "printf '%s' \"$own\" | grep -q '1bit-console' && ! printf '%s' \"$own\" | grep -qE 'getty|plogin' "
+                     "&& [ \"$i\" -eq 1 ] && echo console-owns-tty1",
+                     "console-owns-tty1"),
     # Cycle 14, item 5: release-check SKIPped `fans` on the board ("no /usr/sbin/1bit-board in this image").
     # The tool is os/mini/board.sh, installed as the path that row reads. On a machine whose EC it does not
     # know it must write nothing and say so - which is what this QEMU boot is.
@@ -566,7 +570,9 @@ rows = [
     ("U1 apt-any",   "for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x dpkg > /dev/null || break; sleep 3; done; "
                      "apt install -y --no-install-recommends cowsay 2>&1 | tail -3; "
                      "command -v cowsay && echo apt-install-works", "apt-install-works", 600),
-    ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
+    ("U3 service",   "n=$(ps | grep -c '[l]emond'); l=$(netstat -lntp 2>/dev/null | grep -c 13305); "
+                     "echo \"lemond-procs=$n listening=$l\"; [ \"$n\" -ge 1 ] && [ \"$l\" -ge 1 ] && echo service-up",
+                     "service-up"),
     ("U3 key",       "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
                      "if [ -n \"$k\" ]; then echo \"auth-mode=keyed (${#k} hex chars)\"; "
                      "else echo 'auth-mode=blank (no LEMONADE_API_KEY line)'; fi",
@@ -693,8 +699,18 @@ rows = [
     ("U4 engine sha", "sha256sum /opt/1bit-package/1bit/1bit | cut -c1-32", None),
     # the two paths pi-release asked for, asserted on a booted image rather than in a listing
     ("U4 hrx path",   "ls -l /opt/1bit-llama/llama-server 2>&1 | tail -1; "
-                      "/opt/1bit-llama/llama-server --version 2>&1 | head -2", None),
-    ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels", None),
+                     "t=$(readlink -f /opt/1bit-llama/llama-server 2>/dev/null); echo \"resolves-to=${t:-nothing}\"; "
+                     "/opt/1bit-llama/llama-server --version 2>&1 | head -2; "
+                     "[ -x /opt/1bit-llama/llama-server ] "
+                     "&& printf '%s' \"$t\" | grep -q '^/opt/1bit-package/1bit/hrx/llama/bin/llama-server$' "
+                     "&& echo hrx-server-linked",
+                     "hrx-server-linked"),
+    ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels 2>/dev/null; "
+                     "n=$(ls -1d /opt/1bit-package/1bit/npu/kernels/*/ 2>/dev/null | wc -l); "
+                     "s=$(ls -1 /opt/1bit-package/1bit/npu/kernels/*/manifest.sig 2>/dev/null | wc -l); "
+                     "echo \"sets=$n signed-manifests=$s\"; "
+                     "[ \"$n\" -ge 1 ] && [ \"$s\" -eq \"$n\" ] && echo npu-sets-sealed",
+                     "npu-sets-sealed"),
     # Cycle 23 (c22 board, 4 Nov): a chat that crosses ~512 positions wedged the NPU, and the fix is the hang
     # detector's timeout in /etc/modprobe.d/amdxdna.conf. The build asserts the FILE; this row asserts kmod's own
     # resolved view of it (`modprobe -c`), which is what the kernel will apply.
@@ -714,7 +730,9 @@ rows = [
     # the durable assertion is the RULE, not the policy: whether rc.firewall has finished at the moment a
     # row runs is a race, but an ACCEPT for tcp/13305 is what makes U3 reachable either way.
     ("U3 port rule", "iptables -C INPUT -p tcp --dport 13305 -j ACCEPT && echo port-13305-open; "
-                     "iptables -C INPUT -p tcp --dport 22 -j ACCEPT && echo port-22-open", None),
+                     "iptables -C INPUT -p tcp --dport 22 -j ACCEPT && echo port-22-open; "
+                     "iptables -C INPUT -p tcp --dport 13305 -j ACCEPT && echo port-rule-present",
+                     "port-rule-present"),
     # Cycle 23 (c22 board, 4 Nov): avahi logged "1bit-os.local is announced" and a raw mDNS query from ryzen got no
     # answer at all. The cause is in the same rc.firewall the two rows above work around: every NEW inbound UDP
     # packet goes to `udp_inbound`, which accepts only DHCP and RETURNs to the DROP policy, and a query on 5353 is

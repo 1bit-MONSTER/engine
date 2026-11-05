@@ -27,6 +27,16 @@ the fixes is upstream, so **a module built from the pin alone has none of them**
 | 0002 | `accel/amdxdna: recover the array after a TDR` (5 files, +91/−19) | a TDR restart gated on a condition a fully-wedged context never satisfies, so `aie2_hwctx_restart()` fails `-22` and every later request hangs until a reboot | provocation run 2026-11-04 10:48–10:50 on the loaded build: the recovery branch executes, the NPU is power-cycled, the array answers again **with no reboot**; **#1005** |
 | 0003 | `accel/amdxdna: two TDR-recovery outcomes are not failures` (3 files, +60/−4: `aie2_tdr.c`, `aie2_pci.c/h`) | 0002's recovery latches `hw_dead` — *"the NPU array is unusable until the driver is reloaded"*, every later open refused `-ENODEV` — for two cases that are not failures: **(a)** a power-cycle inside the 60 s rate-limit window answers `-EBUSY`, and with `tdr_timeout_ms=15000` the watchdog ticks four times inside that window, so **any two TDRs within 60 s killed the array** (the check is now `aie2_hw_reset_throttled()`, tested *before* any context is stopped: throttled = retry next tick); **(b)** a context whose client is already closing has no host buffer address, its restart is refused `-ENODEV`, and that one context condemned the array although the power-cycle had succeeded — it is now skipped (its jobs are already unpaused) | strixhalo 2026-11-04: **21:50:23** one closing context, **22:28** two TDRs inside 60 s, **22:40** two closing contexts — three `hw_dead` latches in 50 min, each costing every lane the NPU until a resume/reload (evidence `~/amd-oss/hrx-study/evidence/fabric/npu-longctx/incident-20261104-215023/`). Owner word 2026-11-04 ~23:5x: *"go A"* — built/signed/installed by the kernel-74 lane from the same patch (`~/wt/xdna-tdr-recover/patches/0008-…`) |
 
+> **What actually runs (2026-11-05 00:10 AST):** the fleet's installed series is the kernel lane's numbering —
+> **`0008`** (owner word "go A", installed, srcversion `6483D31718A008B3602114E`), **`0009`** (my throttle-ordering fix:
+> test the rate-limit window *before* stopping any context, because 0008 still restarted contexts against an array that was
+> never power-cycled and `rarg->failed` could latch `hw_dead` through that) and optionally **`0010`** (root-only debugfs
+> `tdr_test` hook that runs one recovery pass on demand). Files: `~/wt/xdna-tdr-recover/patches/`. This branch's `0003` is
+> the same defects in an earlier shape and is **not** byte-identical to what is installed; fingerprints for the installed
+> series with the pin's `MODULE_VER_STR` are `BBE1E5F0EE7A5FB235CA811` (0008+0009) and `646FFC305CAFF8F9BD736FF`
+> (0008+0009+0010).
+
+
 They are a **series**: 0002 applies after 0001 and 0003 after 0002, all against `526c6081`. Applying 0001+0002 to a clean
 checkout of the pin reproduces, byte for byte, the sources the module loaded on the box before 21:52 was built from
 (checked by `cmp` over every `drivers/accel/amdxdna/*.c` and `*.h`), and rebuilding that tree reproduces that module's

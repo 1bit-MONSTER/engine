@@ -147,6 +147,25 @@ At 4B the verdict is the same on both routes and the spread is wider on `cpu` (7
 against a modal rung at 0.6B), so the effect is a property of batching, not of the model size where these
 measurements were cheap enough to take.
 
+**How far is a batched copy from the row that was measured solo?** 0.6B, 64 tokens, every concurrent copy
+scored against one solo request on the same serve:
+
+| width | route | copies identical to solo | \|Δlogp\| vs solo, median | same token as solo, median |
+|---:|---|---:|---:|---:|
+| 1 | `cpu` | **3/3** | 0.000e+00 | **1.000** |
+| 1 | `hrx` | **3/3** | 0.000e+00 | **1.000** |
+| 4 | `cpu` | 0/16 | 2.52e-01 | **0.438** |
+| 4 | `hrx` | 0/16 | 7.19e-02 | 0.836 |
+| 8 | `cpu` | 0/32 | 2.52e-01 | **0.438** |
+| 8 | `hrx` | 0/32 | 1.89e-02 | **1.000** |
+
+The width-1 control is exact on both routes, so these are the batch and not the harness. Two asymmetries
+matter: **no batched copy equals the solo answer anywhere** (0 of 96 copies), while the *text* survives
+differently per route — at 64 tokens `cpu` has usually left the solo sequence (median 0.438 of positions
+keep the solo token) and `hrx` usually has not (0.836, and 1.000 at width 8). So "the greedy text gate still
+passes under batching" is an engine-specific accident, and the log-probability dispersion is the part that
+never survives.
+
 **Generated length decides how visible it is.** Width 4 on `cpu`, 0.6B, the same prompt decoded to four
 lengths, every concurrent copy scored against the solo answer. **No copy was identical to the solo answer
 at any length** (0 of 12 at each of 16/32/128 tokens, 0 of 16 at 64):

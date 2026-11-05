@@ -318,6 +318,9 @@ private:
                    bool proportional, int window, int kv_layer, bool append_kv,
                    int kv_len = 0);
     bool mlp(const std::vector<float>& gu, std::vector<float>& h, int im);
+    // The same elementwise gate*up on caller memory, so a batched pass can read its ACT row and write its HH
+    // row where they already are instead of staging both through a vector (a copy on each side).
+    bool mlp(const float* gu, float* h, int im);
     float rmsnorm(const float* x, const float* w, int n, float* out) const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;
     bool run_lm_head(const std::vector<float>& h, std::vector<float>& logits);

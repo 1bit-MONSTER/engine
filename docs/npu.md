@@ -354,6 +354,17 @@ the same fill is 0.47 s. A first request on a fresh serve therefore costs one fi
 cold) on top of its prefill, and every request after it on the same serve costs none. Do not read a
 per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments, and
 `[bs]` is the same partition for one batched pass (a verify batch), whose interior a per-token line cannot see.
+`NPU_COPY_PROF=1` adds a `[cp]` line to both: the **bytes and milliseconds the host moves at its own copy
+sites** (`qkv_split`, `attn_gate`, `ctx_row`), one figure per site and a `KiB/row` total for a batched pass.
+The phase lines above attribute device time only, so a host row copy lands in their `host=` residual with
+nothing to separate it; `[cp]` is the line that says how much is left to remove rather than time it as part of
+the layer's wall. The MLP row copies this line first counted (`mlp_in`, `mlp_out` — 12.75 MiB of a 15.38 MiB
+prefill row) are gone: the batched pass now runs `mlp()` on the ACT row and into the HH row in place.
+
+The counters are per **process**, single writer, like `[ph]`: a serve enters `step()`/`step_batch()` under
+its engine mutex (`app/forward_serve.cpp:258`, `:698`), so one pass is in flight, and `--npu-streams N` is
+N processes sharing the device by flock (`app/npu_device_lock.h`), each counting its own. A caller that
+parallelised the layer loop would need per-pass counters instead.
 
 ### From a GGUF
 

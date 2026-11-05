@@ -119,6 +119,12 @@ public:
     virtual const std::vector<float>& last_hidden() const = 0;
     // Every row's hidden of the last batched pass (M x hidden_size, row-major), or empty when the base does not
     // keep it -- then the drafter simply cannot be advanced and its commit_rows() is not called.
+    //
+    // TWO row counts are legal after commit_verify(accepted), and the loop reads only the first `accepted` rows of
+    // either: the whole batch's M rows (what "M x hidden_size" above says, and what a base that keeps its batch
+    // buffer most naturally returns), or the accepted prefix alone (what Q4nxNpuForward::commit_verify_rows does to
+    // last_hidden_rows_ since #820).  Any other count is a bug in the base and fails the run rather than silently
+    // skipping the advance -- that silence is what cost the live loop 1 token/pass for a day (#811).
     virtual const std::vector<float>& last_hidden_rows() const {
         static const std::vector<float> none;
         return none;
@@ -339,11 +345,18 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         if (!base.commit_verify(take)) { r.err = "commit_verify refused"; return r; }
         if (head && take > 0) {
             const std::vector<float>& rows = base.last_hidden_rows();
-            if (rows.size() != (size_t)take * (size_t)base.hidden_size()) {
-                // A base that keeps no rows at all is legal (the drafter simply cannot advance); a base that
-                // keeps the WRONG number of them is a bug, and silently skipping the advance is how the live
-                // loop lost 1 token/pass for a day.  Fail instead of drifting.
-                if (!rows.empty()) { r.err = "drafter rows: base returned a partial batch hidden"; return r; }
+            // Accepted prefix or the whole batch -- both are the base's own rows, and row m is the hidden after the
+            // token at start_pos+m either way, so the first `take` of them are the ones the drafter advances over.
+            const size_t h = (size_t)base.hidden_size();
+            const size_t got = (h && rows.size() % h == 0) ? rows.size() / h : 0;
+            if (rows.empty()) {
+                // A base that keeps no rows at all is legal: the drafter simply cannot advance.
+            } else if (got != (size_t)take && got != (size_t)nd) {
+                // A base that keeps the WRONG number of them is a bug, and silently skipping the advance is how the
+                // live loop lost 1 token/pass for a day.  Fail instead of drifting.
+                r.err = "drafter rows: base returned " + std::to_string(got) + " rows, want " +
+                        std::to_string(take) + " (committed prefix) or " + std::to_string(nd) + " (batch)";
+                return r;
             } else {
                 std::vector<int> accepted(d.begin(), d.begin() + take);
                 head->commit_rows(accepted, rows, take);

@@ -1150,14 +1150,18 @@ With that said, two streams do run, and the option is what says you meant it:
 
 ```
 # stream 1 of 2, then stream 2 of 2, in two shells (different ports, same model)
-./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8000
-./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8001
+./1bit forward-serve -m <model.q4nx> --kernels <dir> --npu-streams 2 -p 8000
+./1bit forward-serve -m <model.q4nx> --kernels <dir> --npu-streams 2 -p 8001
 ```
 
-`--npu-streams N` (1..16, default 1) is `forward-serve`'s flag too: N = 1 keeps the exclusive lock,
-N >= 2 takes a **shared** lock, so the opted-in streams co-exist while any exclusive holder -- an
-unflagged `1bit serve`, the per-process ELF runner (`npu_engine_universal`), another build's serve --
-still keeps them all out, in either order, because they share one file and one `flock(2)`.
+`--npu-streams` belongs to `forward-serve` (and to the GGUF-on-NPU model-generic forward `serve`
+starts for it): N = 1 keeps the exclusive lock, N >= 2 takes a **shared** lock, so the opted-in
+streams co-exist while any exclusive holder -- an unflagged serve, the in-process route, the
+per-process ELF runner (`npu_engine_universal`), another build's serve -- still keeps them all out, in
+either order, because they share one file and one `flock(2)`. The **in-process** route (a `.q4nx` model
+directory through `serve`, i.e. `app/unified.cpp`) always takes the exclusive lock and refuses
+`--npu-streams` by name: it keeps one context, so N streams there could only queue, and two of them
+dispatching at once is the measured wedge (engine#1051).
 
 **The lock is one file and one protocol, across runtimes, and it is advisory** -- that is what makes it
 usable beside another NPU engine, and what its limits are:
@@ -1167,8 +1171,9 @@ usable beside another NPU engine, and what its limits are:
   not wait for other shared holders"; `LOCK_EX` = "I want the device to myself". A holder keeps its fd
   open for the life of the process; closing or exiting releases it. `LOCK_EX` and `LOCK_SH` never
   overlap, in either order, on one file.
-- **Who may take what.** Anything that honours the file interlocks with us: our serves
-  (`--npu-streams` decides which mode), the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
+- **Who may take what.** Anything that honours the file interlocks with us: `forward-serve`
+  (`--npu-streams` decides which mode), the in-process route (`LOCK_EX`, always -- `app/unified.cpp`),
+  the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
   Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
   keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
   file is not slowed, not blocked and not detected.

@@ -205,12 +205,15 @@ the row ships `--template-pin-strict` (§9), and it catches one thing only — t
 different template. A file under a new name, or a row whose digest nobody recorded, is visible only as
 the load line; that is the gap step 3 closes.
 
-When step 3 lands, the digests are already measured — `models/pins.json` records the template of every
-file we serve and publish, including all four rows here (`57f1fd00f0…` short, `b55ecfbbbc…` prose,
-`87710339d2…` code, `12827f24b7…` long_doc; a Q4NX row is read from its `tokenizer_config.json`
-because it has no GGUF). Adding a row then means adding its digest: the table is not allowed to grow a
-row that skips that step, and the validator that fails one is part of step 3, not something to assume
-today.
+When step 3 lands it will need one digest per row, and three of the four are in the tree **today** in
+`config/template-pins.json` — `zaya1-8b-q4_k_m.gguf` `b55ecfbbbc…`,
+`qwen3-coder-30b-a3b-instruct-q4_k_m.gguf` `87710339d2…`, `qwen3.8-27b-ud-q4_k_xl.gguf` `12827f24b7…` —
+because those rows are the same files the load-time check already pins. The fourth, `short`'s
+`Qwen3-0.6B-Q8_0.gguf` `57f1fd00f0…`, is not in any table in this tree yet: it is measured, and it is added
+by #1158 (and recorded with every other file we serve and publish in `models/pins.json`, #1148). A Q4NX row
+is read from its `tokenizer_config.json` because it has no GGUF ([npu-chat-template.md](npu-chat-template.md)).
+Adding a row then means adding its digest: the table is not allowed to grow a row that skips that step, and
+the validator that fails one is part of step 3, not something to assume today.
 
 ### Device: HRX by default, and the NPU only when the GPU is busy or hot
 

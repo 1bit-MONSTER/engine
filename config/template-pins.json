@@ -8,6 +8,10 @@
    "sha256": "a136047ba140347b359d17b6ff8fa1bf8cb29d23f0c07bef7e0bf479b8680793",
    "source": "FastFlowLM/Qwen3-0.6B-NPU2"
   },
+  "qwen3-0.6b-q8_0.gguf": {
+   "sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361",
+   "source": "1bit-MONSTER/Qwen3-0.6B-GGUF"
+  },
   "qwen3-4b-instruct-2507-1bit": {
    "sha256": "c979e0e71a3e21b8f208e6ab120d5cb29327885f29d2a8b18fda67a723798e18",
    "source": "unsloth/Qwen3-4B-Instruct-2507-GGUF"

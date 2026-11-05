@@ -719,7 +719,12 @@ rows = [
     # the kernel, /var/lib/shim-signed/mok/MOK-Kernel.pem, SKI 27:68:3E:38:…) while the modules are signed by a
     # DIFFERENT certificate with the same CN (sig_key 35:5C:A4:8A:…). The board trusts it - it loads this module - so
     # the runtime reading belongs there: /sys/module/amdxdna/parameters/tdr_timeout_ms must be 15000 on the board.
-    ("U5 npu tdr",    "o=$(modprobe -c 2>/dev/null | grep -c 'amdxdna.*tdr_timeout_ms=15000'); "
+    # Measured and worth not misreading: in this VM `modprobe amdxdna` answers "Key was rejected by service", because
+    # sb-vars.sh enrols our certificate in the firmware's **db**, and it is a CA:FALSE code-signing leaf (Key Usage:
+    # Digital Signature, EKU: Code Signing). On the board the same certificate is in **MokList** (shim's import path) and the
+    # module loads - this box runs Secure Boot with amdxdna loaded. So the rejection is a property of how this harness
+    # enrols the key, not of the shipped driver, and the row asserts the watchdog CONFIG for that reason rather than a load.
+("U5 npu tdr",    "o=$(modprobe -c 2>/dev/null | grep -c 'amdxdna.*tdr_timeout_ms=15000'); "
                       "c=$(grep -h 'tdr_timeout_ms=15000' /etc/modprobe.d/*.conf 2>/dev/null | grep -c amdxdna); "
                       "echo kmod-view=$o conf-file=$c; modprobe amdxdna 2>&1 | head -1; "
                       "echo runtime=$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms 2>/dev/null || echo not-loaded); "

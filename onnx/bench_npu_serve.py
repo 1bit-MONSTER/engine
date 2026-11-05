@@ -28,6 +28,7 @@ import argparse
 import json
 import statistics
 import time
+import urllib.error
 import urllib.request
 
 PROMPT_WORD = "The quick brown fox jumps over the lazy dog, and then it does it again. "
@@ -38,11 +39,22 @@ def prompt_of_tokens(n_tokens: int) -> str:
     return PROMPT_WORD * max(1, n_tokens // 13)
 
 
-def one_run(host: str, model: str, prompt: str, gen: int, mode: str = "json") -> dict:
+def one_run(
+    host: str, model: str, prompt: str, gen: int, mode: str = "json", endpoint: str = "chat"
+) -> dict:
+    # `chat` renders a ChatML prompt, which a tokenizer with no ChatML tokens cannot be given (#963);
+    # `completions` sends the text as the prompt and renders nothing (#938), which is the only route a
+    # Llama-family container can be measured on. Both report `usage` and `timings`, so the stages below
+    # are the same quantity either way.
+    prompt_field = (
+        {"messages": [{"role": "user", "content": prompt}]}
+        if endpoint == "chat"
+        else {"prompt": prompt}
+    )
     body = json.dumps(
         {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            **prompt_field,
             "max_tokens": gen,
             "temperature": 0.0,
             "stream": mode == "stream",
@@ -50,7 +62,7 @@ def one_run(host: str, model: str, prompt: str, gen: int, mode: str = "json") ->
         }
     ).encode()
     req = urllib.request.Request(
-        f"http://{host}/v1/chat/completions",
+        f"http://{host}/v1/{'chat/completions' if endpoint == 'chat' else 'completions'}",
         data=body,
         headers={"Content-Type": "application/json"},
     )
@@ -59,7 +71,14 @@ def one_run(host: str, model: str, prompt: str, gen: int, mode: str = "json") ->
     stamps = []
     usage = {}
     timings = {}
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    try:
+        resp = urllib.request.urlopen(req, timeout=600)
+    except urllib.error.HTTPError as err:
+        # A refusing server answers 400 with the reason in the body (the chat route on a container with no
+        # ChatML tokens does exactly that); a traceback that drops the body leaves the user with no way to
+        # know that --endpoint completions is the route for this container.
+        raise SystemExit(f"HTTP {err.code} from {req.full_url}: {err.read().decode('utf-8', 'replace')[:300]}")
+    with resp:
         head = resp.readline().decode("utf-8", "replace")
         if head.lstrip().startswith("data:"):
             for raw in [head.encode()] + list(resp):
@@ -76,7 +95,8 @@ def one_run(host: str, model: str, prompt: str, gen: int, mode: str = "json") ->
                     # a reasoning model streams its visible tokens in `reasoning_content` and leaves
                     # `content` empty until it stops thinking; both are generated tokens, so count both
                     delta = choice.get("delta") or {}
-                    if delta.get("content") or delta.get("reasoning_content"):
+                    # `text` is /v1/completions' chunk shape; the other two are the chat shape
+                    if delta.get("content") or delta.get("reasoning_content") or choice.get("text"):
                         now = time.perf_counter()
                         if first is None:
                             first = now
@@ -136,6 +156,14 @@ def main() -> int:
         help="json reads the server's own prompt_ms/predicted_ms (our routes report only those; their "
         "streamed chunks all arrive after the generation); stream measures chunk arrival (flm/external)",
     )
+    ap.add_argument(
+        "--endpoint",
+        choices=("chat", "completions"),
+        default="chat",
+        help="chat renders a ChatML prompt; completions sends the prompt as text and renders no "
+        "template, which is the only way a container with no ChatML tokens can be measured (default "
+        "chat, so every row taken before this switch stays reproducible)",
+    )
     args = ap.parse_args()
 
     print("-----------------------------")
@@ -144,7 +172,7 @@ def main() -> int:
         ttft, tok, e2e = [], [], []
         n_prompt = 0
         for i in range(args.warmup + args.repeat):
-            r = one_run(args.host, args.model, prompt, args.gen, args.mode)
+            r = one_run(args.host, args.model, prompt, args.gen, args.mode, args.endpoint)
             if i < args.warmup:
                 continue
             n_prompt = r["prompt_tokens"]

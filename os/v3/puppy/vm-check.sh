@@ -481,6 +481,18 @@ rows = [
                      "printf '%s' \"$s\" | grep -qE 'web UI http://[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:13305' && "
                      "echo menu-connect-block",
                      "menu-connect-block"),
+    # #1041 (engine 0c862e64): the console names the engine that is serving. It must not be asserted off LIVE facts:
+    # measured on this box, `--status` with nothing loaded prints no engine line at all (the fact is `None` until a
+    # model is loaded), so a row that ran `--status` and grepped `engine:` would be red on a healthy appliance and
+    # nobody could act on it. The row renders the shipped binary's own frame with its own fixture instead: it proves
+    # the IMAGE carries a console that can name the engine, and it goes red on any pre-#1041 TUI - measured against
+    # the c24 image's own `/usr/local/bin/1bit-console-tui` (5261cf56...), whose frame carries no engine line, while
+    # 4b369c10... prints `engine: llamacpp (gpu)` here. The second half of #1041 is visible next to it: no invented
+    # `http://-:` on a box that has no address yet.
+    ("U2 console engine", "1bit-console-tui --snapshot 80x25 --fixture 2>&1 | grep -o 'engine: [a-z]* ([a-z]*)' | head -1; "
+                     "1bit-console-tui --status > /tmp/ct.txt 2>&1; echo status-rc=$?; "
+                     "echo invented-urls=$(grep -c 'http://-:' /tmp/ct.txt)",
+                     "engine: llamacpp (gpu)"),
     # The mechanism behind U3-lan and U7 (cycle 15's finding, and the row the c16 refactor folded away): inbound
     # connections from the LAN pass only if the appliance opened the ports AFTER Puppy's rc.firewall (which ends
     # in `-P INPUT DROP`) and let the RFC1918 ranges through tcpwrappers. Printing all three - the rules, the

@@ -745,9 +745,9 @@ std::string model_id(const Options& o) {
 // header-only fixtures of the route tests on their exact line counts (tests/mem_admit_route.sh).
 void announce_template(const Options& o) {
     namespace fs = std::filesystem;
-    // shortcut: a Q4NX model directory keeps its template in tokenizer_config.json, not a GGUF header;
-    // the checked pull path for those is Laya-first (docs/laya-first.md), not this line.
-    if (fs::path(o.model).extension() != ".gguf") return;
+    // A .gguf and a Q4NX model directory both carry a template (metadata key, tokenizer_config.json);
+    // anything else (a 1BP package) carries none this engine reads.
+    if (fs::path(o.model).extension() != ".gguf" && !fs::is_directory(o.model)) return;
     TemplatePins pins;
     if (!o.no_template_pin) {
         std::string text = kDefaultTemplatePinsJson;
@@ -767,7 +767,7 @@ void announce_template(const Options& o) {
     std::fprintf(stderr, "1bit serve: template sha256=%s (%s)\n", v.sha256.empty() ? "none" : v.sha256.c_str(),
                  id.c_str());
     if (!v.mismatch()) return;
-    const std::string msg = "template pin: " + id + " (" + v.key + ") expects " + v.pinned + ", the GGUF carries " +
+    const std::string msg = "template pin: " + id + " (" + v.key + ") expects " + v.pinned + ", the model carries " +
                             (v.sha256.empty() ? std::string("none") : v.sha256) +
                             " in tokenizer.chat_template (docs/serve.md \"Chat template\")";
     if (!o.template_pin_strict) {

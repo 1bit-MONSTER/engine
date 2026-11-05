@@ -27,6 +27,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 #include <vector>
@@ -42,9 +45,42 @@ inline std::string gguf_chat_template_sha(const std::string& path) {
     return sha256_hex(reinterpret_cast<const uint8_t*>(tpl.data()), tpl.size());
 }
 
+// A model directory (a Q4NX / NPU container) has no GGUF at all: its template is the "chat_template"
+// string in the container's tokenizer_config.json, or chat_template.jinja beside it.
+inline std::string container_chat_template_sha(const std::string& dir) {
+    auto read = [](const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        return in ? std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()) : std::string();
+    };
+    std::string tpl;
+    const std::string cfg = read(dir + "/tokenizer_config.json");
+    if (!cfg.empty()) {
+        try {
+            const nlohmann::json j = nlohmann::json::parse(cfg);
+            if (j.contains("chat_template") && j["chat_template"].is_string())
+                tpl = j["chat_template"].get<std::string>();
+        } catch (const std::exception&) {
+            // a container whose tokenizer_config.json does not parse has no readable template
+        }
+    }
+    if (tpl.empty()) tpl = read(dir + "/chat_template.jinja");
+    if (tpl.empty()) return "";
+    return sha256_hex(reinterpret_cast<const uint8_t*>(tpl.data()), tpl.size());
+}
+
+// sha256 of the template a model would run: a GGUF's metadata key, or a model directory's
+// tokenizer_config.json / chat_template.jinja. "" when the model carries none (or is neither, e.g. a
+// 1BP package).
+inline std::string template_sha_of(const std::string& model) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(model, ec)) return container_chat_template_sha(model);
+    if (std::filesystem::path(model).extension() == ".gguf") return gguf_chat_template_sha(model);
+    return "";
+}
+
 // The template pins: model key -> expected template sha256, or "none" for a model that must carry no
 // template. Keys are lower-cased and matched against the serve's model id (--alias, i.e. Lemonade's
-// catalog entry) and then the file's own name, so one row can serve either spelling.
+// catalog entry) and then the file's (or directory's) own name, so one row can serve either spelling.
 struct TemplatePins {
     std::map<std::string, std::string> by_key;
 
@@ -115,7 +151,7 @@ struct TemplateVerdict {
 inline TemplateVerdict template_verdict(const std::string& model, const std::vector<std::string>& id_keys,
                                         const TemplatePins& pins) {
     TemplateVerdict v;
-    v.sha256 = gguf_chat_template_sha(model);
+    v.sha256 = template_sha_of(model);
     std::vector<std::string> keys;
     for (const auto& k : id_keys) keys.push_back(lowercased(k));
     if (const std::string* p = pins.find(keys)) v.pinned = *p;

@@ -30,14 +30,29 @@ release in the same week gets `.1`.
 
 ## v2026.44 (1 Nov 2026) — the first release, a draft
 
-> **The candidate has moved on since this section was written.** Everything below from here to the end of this
-> section is the **1 Nov 2026 record** of c19 (software-gated, never booted) and c20, and stays as that record. The
-> medium in the machine today is **`rc-2026-11-05-c26`**: every software gate green on the frozen bytes
-> (`vm-check` **75 PASS / 0 FAIL / 3 SKIP**, UEFI + Secure Boot), the stick written with `READBACK: MATCH` for all
-> 9,128,902,656 bytes, and the artifact's own `1bit-puppy-stick.sh --check` **31 rows, 0 failed**. Its **board
-> boot and install run are unrun**, so v2026.44 is still a draft under the owner's order — the demo video on the
-> live USB first, then the install test, then publish. The last result that *is* measured on the board is cycle 24's
-> (`puppy-check` 42 rows: 40 PASS, 1 FAIL — the checker's own `u7-mdns` row — 2 SKIP).
+> **The candidate has moved on since this section was written.** Everything below to the end of this section is the
+> **1 Nov 2026 record** of c19 (software-gated, never booted on hardware) and c20, and stays as that record. What
+> has happened since, as of 2026-11-05 16:5x:
+>
+> - **c26** (`rc-2026-11-05-c26`) was written to a stick at 14:37 with every software gate green on its frozen
+>   bytes: `vm-check` **75 PASS / 0 FAIL / 3 SKIP** (UEFI + Secure Boot), the artifact's own
+>   `1bit-puppy-stick.sh --check` **31 rows, 0 failed**, and `READBACK: MATCH` for all 9,128,902,656 bytes.
+> - **Its board boot failed** at ~15:0x, before userspace: `Waiting for partition [1BIT-DATA]... failed`. The stick
+>   had enumerated at 3.8 s, but its SCSI probe did not finish until **45.7 s** — it sat behind two USB
+>   mass-storage reset cycles of the KVM's emulated drive — and Puppy's `wait_for_blkid()` polls for only **15 s**
+>   ([#1159](https://github.com/1bit-MONSTER/engine/issues/1159)). Not a c26 regression: c26's `vmlinuz` and
+>   `initrd.gz` are byte-identical to c25's, and c23-c25 won the same race.
+> - **c27** re-cuts the appliance with one file changed, `/1bit/initrd.gz`: the wait is **120 s**, the console says
+>   `*** 1bit: still waiting for [1BIT-DATA] - a slow medium is not a failure` where it used to give up, and the
+>   PR that carries the change makes the image build refuse any initrd whose wait is under 90 s
+>   ([#1160](https://github.com/1bit-MONSTER/engine/pull/1160), which closes #1159). On c27's bytes `vm-check` is
+>   the same **75 / 0 / 3**, the new `usbgate` (a USB-mass-storage boot with its budget asserted from the shipped
+>   image) passes, and `prepare-stick --check` passes. **Its board boot is the step still owed**, so v2026.44
+>   remains a draft under the owner's order — the demo video on the live USB first, then the install test, then
+>   publish.
+>
+> The last result *measured on the board* remains cycle 24's: `puppy-check` **42 rows: 40 PASS, 1 FAIL — the
+> checker's own `u7-mdns` row — 2 SKIP**.
 
 **Not published.** Candidate **c19** (`rc-2026-11-01a`, engine `bcb28cc8f573`) passed every software gate below and
 was written to a 64 GB stick — and that is where it stopped: it was **never booted on hardware and never installed on

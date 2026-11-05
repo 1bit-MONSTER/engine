@@ -23,8 +23,11 @@
  * silent. The forward now refuses such a container by name (the engine#1087 shape), and the name it quotes is what
  * these assertions check - the first unknown spelling, not the last, and not the count.
  *
- * The known kinds are checked at the same time so a future edit to the string matching (which uses strstr for
- * "sliding" and "linear", the spellings every container on this box uses) cannot pass this test by matching nothing.
+ * The known kinds are checked at the same time so a future edit to the string matching cannot pass this test by
+ * matching nothing.  The matching is EXACT (engine#1156): it used to be a substring test, which mapped
+ * "chunked_linear_attention", "mamba2_linear" and "nonlinear_attention" to the GDN recurrence because they
+ * contain "linear", and would have served attention math this forward does not have as a fluent, silent GDN
+ * layer.  Case 5 pins that: a spelling that only *contains* a known kind is refused, by name, like any other.
  */
 #define _POSIX_C_SOURCE 200809L  /* mkdtemp */
 #include "q4nx_semantics.h"
@@ -100,6 +103,26 @@ int main(void) {
                  cfg, sizeof cfg);
     q4nx_semantics_from_config(cfg, dir, &s);
     check(strcmp(s.unknown_layer_type, "mamba2") == 0, "the first unknown kind is the one quoted");
+
+    /* 5. A spelling that merely CONTAINS a known kind is not that kind (engine#1156).  Every one of these used to
+     * map to Q4NX_LAYER_LINEAR through strstr("linear"), i.e. the forward would have run the GDN recurrence over
+     * layers whose config names attention math it does not have - the silent-wrong-answer shape #1124 exists to
+     * remove, re-opened by the substring.  The whole list is refused, and the first spelling is the one quoted. */
+    write_config(dir,
+                 "{\"num_hidden_layers\": 5, \"layer_types\": [\"full_attention\", \"chunked_linear_attention\","
+                 " \"mamba2_linear\", \"nonlinear_attention\", \"sliding_window_attention\"]}",
+                 cfg, sizeof cfg);
+    q4nx_semantics_from_config(cfg, dir, &s);
+    check(s.n_layer_types == 5, "five entries parsed in the substring case");
+    check(s.layer_types[0] == Q4NX_LAYER_FULL, "full_attention is still full_attention");
+    check(s.layer_types[1] == Q4NX_LAYER_OTHER, "chunked_linear_attention -> OTHER, not the GDN path");
+    check(s.layer_types[2] == Q4NX_LAYER_OTHER, "mamba2_linear -> OTHER, not the GDN path");
+    check(s.layer_types[3] == Q4NX_LAYER_OTHER, "nonlinear_attention -> OTHER, not the GDN path");
+    check(s.layer_types[4] == Q4NX_LAYER_OTHER,
+          "sliding_window_attention -> OTHER (the HF spelling is sliding_attention)");
+    check(strcmp(s.unknown_layer_type, "chunked_linear_attention") == 0,
+          "a substring match is quoted by name, so the container is refused instead of served");
+    check(s.hybrid_layers == 4, "all four refused kinds count as hybrid, as any non-full layer does");
 
     unlink(cfg);
     rmdir(dir);

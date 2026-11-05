@@ -1,0 +1,15 @@
+== ticket 'clause55 p0' 20261105-115131  hold=16min  argv: --live --match --prompts 1 --prompt-base 0 --tokens 64 --k 4 --tau 0
+[  169s] forward ready: vocab 248320, max_batch_rows 16, hidden source post-final-norm
+[  252s] prompt 0: TEXT IDENTICAL, 64 tokens, accepted 44/80, passes/token 0.625, stream 72 rows, 0 mismatch
+[  258s]   match p0: 20 offline chains at this loop's own positions (stream 72 rows)
+[  258s]     depth 1: live  90.00 % (18/20, reached)  offline conditional  90.00 % (18/20)  delta  +0.00 pp   [live joint  90.00 %, offline marginal  90.00 %]
+[  258s]     depth 2: live  72.22 % (13/18, reached)  offline conditional  72.22 % (13/18)  delta  +0.00 pp   [live joint  65.00 %, offline marginal  65.00 %]
+[  258s]     depth 3: live  53.85 % (7/13, reached)  offline conditional  53.85 % (7/13)  delta  +0.00 pp   [live joint  35.00 %, offline marginal  35.00 %]
+[  258s]     depth 4: live  85.71 % (6/7, reached)  offline conditional  85.71 % (6/7)  delta  +0.00 pp   [live joint  30.00 %, offline marginal  35.00 %]
+[  258s]     first verdict difference on the same token: stream position 13, depth 4: live reject, offline accept
+[  258s]    == live vs offline at the SAME positions, per-depth acceptance CONDITIONAL on reaching the depth (the 2 pp bar):
+[  258s]      depth 1: live  90.00 % (18/20)  offline  90.00 % (18/20)  delta  +0.00 pp  PASS
+[  258s]      depth 2: live  72.22 % (13/18)  offline  72.22 % (13/18)  delta  +0.00 pp  PASS
+[  258s]      depth 3: live  53.85 % (7/13)  offline  53.85 % (7/13)  delta  +0.00 pp  PASS
+[  258s]      depth 4: live  85.71 % (6/7)  offline  85.71 % (6/7)  delta  +0.00 pp  PASS
+== ticket 'clause55 p0' exited 0; log: /home/bcloud/wt/mtp-window/ticket-clause55-p0-20261105-115131.log

@@ -1137,10 +1137,37 @@ hardware contexts until `amdxdna` is reloaded, and says so in its own kernel mes
 
 One process owns the NPU by default: it takes an exclusive `flock` on
 `/tmp/1bit-npu-device.lock` for its lifetime (`app/npu_device_lock.h`), so a second serve of the
-NPU route waits instead of contending. That is a policy, not a hardware limit -- the driver
-advertises 16 hardware contexts on this part (`hwctx_limit = 16`, `drivers/accel/amdxdna/npu4_regs.c`)
-and only refuses the 17th -- and the policy stays the default because a second stream buys much less
-than 2x:
+NPU route waits instead of contending. The policy stays the default because a second stream buys
+much less than 2x -- and with the driver patch this tree carries (`0003`, running on strixhalo since
+2026-11-05 06:26 as `349FDC99CADC56900E0249A`) it is also the only shape the device accepts, which is worth
+stating precisely because the limit is *not* the hwctx count:
+
+- **The array partition is the real limit, and it is per client.** `hwctx_limit = 16`
+  (`drivers/accel/amdxdna/npu5_regs.c:74`; `npu4_regs.c:174` says the same) bounds how many hardware
+  contexts **one** client may open;
+  it says nothing about a second client. The solver hands each client a column range, and the NPU
+  has 8 columns and the kernel set this engine ships asks for **all 8** (measured on the c24 set:
+  `xrt-smi examine -r aie-partitions` shows one partition, `Columns [0..7]`), so one client's contexts
+  share the whole array and a second client has nothing to be given.
+- **What that cost before the fix.** With the unpatched driver a second client was handed the same
+  columns instead, and its configuration took the array out from under the first: every client then
+  failed `614 state 8, run 0 of 28` with `DPU PC 0xffffffff` in the firmware capture -- measured
+  2026-11-05, 3/3 with the requests overlapping and 3/3 with them strictly sequential, and never with
+  a single context ([engine#1084](https://github.com/1bit-MONSTER/engine/issues/1084)).
+- **What it costs after it.** `third_party/patches/amdxdna/0003` shares a partition only between
+  contexts of the *same* client, so the second client is refused with `code 102` / `-ENODEV` instead
+  of taking the array down, and the partition is released when the holder exits. Measured on that
+  build: the holder kept its 1 099-chunk row while the second client was refused, a fresh client
+  answered once the holder exited, and one process held 2 contexts without trouble. Multi-context
+  within one process -- the per-op route, the per-block-count route -- is unchanged, and the
+  model-generic route that holds one context per design was re-measured on it with **8** contexts in
+  one process (engine#1084).
+
+So `--npu-streams N` **needs a kernel set that asks for fewer columns than the array has**: with the
+sets shipped today a second stream is refused rather than slow, and the throughput numbers below are
+what two streams cost *when the column request allows them* (they were measured on the LFM2 `m16`
+set, not on the 8-column sets this engine ships). The rest of this section is about that case, and the
+lock policy above still governs it:
 
 - **The DMA engine is shared.** Decode reads the model's int8 weights once per token (~24.3 GB at
   ~2.2 GB/s effective on the 27B, [engine#587](https://github.com/1bit-MONSTER/engine/issues/587));
@@ -1190,7 +1217,9 @@ usable beside another NPU engine, and what its limits are:
 **Partitioning, and what it would take.** Two whole-array streams share one DMA engine, so they
 serialise; the September prototype that scaled (~100 % each) did it by giving each stream a *disjoint
 half of the columns*, which halves per-stream weight reuse, and its xclbin pair is ABI-stale at this
-pin, so nothing in this tree can select a column split today: both of our instances run whole-array.
+pin, so nothing in this tree can select a column split today: both of our instances run whole-array --
+which is exactly the request the solver cannot satisfy twice (see the limit above), so a 4-column
+kernel set is the prerequisite for the numbers in this section, not a tuning option.
 What each engine costs is therefore the whole model per stream -- **one hwctx and one complete copy of
 the weight BOs, plus its own KV cache and scratch**, and the device's hwctx limit is 16. The accounting
 per engine is: `streams x (weights + KV + scratch)` must fit in the NPU's share of the box's LPDDR5X

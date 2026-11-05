@@ -824,11 +824,14 @@ int run_forward_serve(int argc, char** argv) {
     e.fwd = std::make_unique<Q4nxNpuForward>();
 
     // Who may have the NPU (app/npu_device_lock.h): one process by default, N when the
-    // operator asks with --npu-streams. It is a policy, not a hardware limit -- the
-    // driver's npu4 sets hwctx_limit = 16 -- and the default stays exclusive because a
-    // second stream takes the same DMA engine and its own copy of the weights: two
-    // engines on two models measured 34.1 % / 70.4 % of solo, 0.41x aggregate
-    // (docs/npu.md "Two streams on one NPU").
+    // operator asks with --npu-streams. hwctx_limit = 16 is not what bounds a second
+    // client -- the array partition is: 8 columns, and this build's kernel set asks for
+    // all 8, so a second client is refused (-ENODEV / code 102) once 0003 is in the
+    // driver, and shared the tiles and wedged the array before it (engine#1084). The
+    // default stays exclusive because a kernel set that does leave columns free still
+    // shares one DMA engine and copies the weights per stream: two engines on two models
+    // measured 34.1 % / 70.4 % of solo, 0.41x aggregate (docs/npu.md "Two streams on one
+    // NPU").
     // Held for the life of the process (fd not closed), exactly like the per-process
     // ELF runner (npu_engine_universal), which takes the same exclusive lock.
     if (!std::getenv("NPU_NO_DEVICE_LOCK"))

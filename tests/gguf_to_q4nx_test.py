@@ -25,6 +25,7 @@ usage: tests/gguf_to_q4nx_test.py        (needs numpy and gguf)
 """
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -261,6 +262,31 @@ def tokenizer_flags_check(src, out, ok):
     return ok
 
 
+def permute_q8_tile(path, tensor):
+    """Rewrite one Q8 tensor's first tile in the OTHER 8704-B code order (Qwen3.6-35B's).
+
+    The scales stay where they are, so the tile still decodes to numbers -- which is the failure
+    this test is about: a container in the wrong order serves noise, not an error.
+    """
+    import json
+    import struct
+    with open(path, "r+b") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+        base = 8 + n
+        off = hdr[tensor]["data_offsets"][0]
+        f.seek(base + off)
+        tile = bytearray(f.read(G.Q8))
+        codes = bytes(tile[512:])
+        moved = bytearray(8192)
+        for r in range(32):
+            for k in range(256):
+                moved[(r // 16) * 4096 + (k // 32) * 512 + (k % 32) * 16 + (r % 16)] = codes[k * 32 + r]
+        tile[512:] = moved
+        f.seek(base + off)
+        f.write(tile)
+
+
 def q8_check(gguf_path, out, ok):
     """--dtype8: the named tensors are 8704-B Q8 chunks, an exactly-4-bit one is left alone, and
     the Q8 tile re-encodes byte for byte from the source (so the encoder IS the decoder's inverse)."""
@@ -296,6 +322,30 @@ def q8_check(gguf_path, out, ok):
         rel = float(np.sqrt(((got - w) ** 2).sum() / (w ** 2).sum()))
         checks.append((f"{key}: Q8 tile re-encodes to the same bytes", again))
         checks.append((f"{key}: 8-bit error rel rms {rel:.4f} (<= 0.01)", rel <= 0.01))
+    for label, good in checks:
+        print(f"{'ok  ' if good else 'FAIL'} {label}")
+        ok = ok and good
+
+    # The same chunks judged against the SOURCE WEIGHTS instead of the packer's own round trip:
+    # check_q4nx_dir.py --against decodes every Q8 tile both ways and must find the order
+    # npu/q4nx.cpp decodes. The golden hash pins our encoder to our decoder; this pins the
+    # container to the model, so a packer that wrote the other 8704-B order cannot pass.
+    checker = os.path.join(HERE, "..", "tools", "check_q4nx_dir.py")
+
+    def against(container):
+        r = subprocess.run([sys.executable, checker, container, "--against", gguf_path,
+                            "--q8-samples", "2"], capture_output=True, text=True)
+        return r.returncode, r.stdout
+
+    rc, _ = against(os.path.join(out, "model.q4nx"))
+    checks = [("--against accepts the packed container (rc 0)", rc == 0)]
+    with tempfile.TemporaryDirectory() as t:
+        wrong = os.path.join(t, "model.q4nx")
+        shutil.copyfile(os.path.join(out, "model.q4nx"), wrong)
+        permute_q8_tile(wrong, o_proj)
+        rc_wrong, text = against(wrong)
+        checks.append(("--against refuses the other code order (rc 1)", rc_wrong == 1))
+        checks.append(("the refusal names the tensor", o_proj in text))
     for label, good in checks:
         print(f"{'ok  ' if good else 'FAIL'} {label}")
         ok = ok and good

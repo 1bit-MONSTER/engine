@@ -201,7 +201,29 @@ pub fn connect_block(f: &Facts, spin: &str, width: usize) -> Vec<Line<'static>> 
     };
     out.push(rule(&title, width));
 
-    let host = f.ip().unwrap_or("-");
+    // Before DHCP there is no address, and a URL with a `-` for a host is not a URL anybody can use: the first
+    // seconds of a boot used to read as broken output. There is exactly one honest thing to say then (owner
+    // decision 2026-11-04 20:19), so the block says it and nothing else - the address rows come back with the lease.
+    // `vm-check.sh`'s `U2 menu connect` row needs four dotted digits and is red in this state either way; it reads
+    // the booted box, where these rows are all present again.
+    let Some(host) = f.ip() else {
+        out.push(Line::from(vec![
+            Span::styled(IND, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "web UI: waiting for network".to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        out.push(Line::from(Span::styled(
+            format!(
+                "{IND}no address yet - press 3 (Network); DHCP is automatic once a cable is in"
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+        return out;
+    };
     let keyed = f.key.is_some();
     // Cycle 20 (owner: "blank key"): the appliance ships with NO API key, so the block says what that means for
     // whoever is reading it - anyone on this network can use Lemonade until item 1 mints one. Keyed mode keeps the
@@ -291,7 +313,16 @@ pub fn panels(f: &Facts) -> Vec<(&'static str, Vec<String>)> {
         Some(pid) => lemonade.push(format!("pid {pid}, not listening on 13305")),
         None => lemonade.push("DOWN (no lemond process)".to_string()),
     }
-    lemonade.push(format!("http://{}:13305", f.ip().unwrap_or("-")));
+    // same rule as the CONNECT block: no address yet is neither the address "-" nor a URL (see `connect_block`)
+    lemonade.push(match f.ip() {
+        Some(ip) => format!("http://{ip}:13305"),
+        None => "web UI: waiting for network".to_string(),
+    });
+    // Owner decision 2026-11-04 20:19: the console says which engine is serving, in Lemonade's own words - no
+    // marketing map. `engine: llamacpp (gpu)` is what the box reports, not what we would like it to say.
+    if let Some(e) = &f.engine {
+        lemonade.push(format!("engine: {e}"));
+    }
     lemonade.push(if f.key.is_some() {
         "API key: set, press 1".to_string()
     } else {
@@ -556,11 +587,17 @@ fn panel_grid(f: &Facts, width: usize) -> Vec<Line<'static>> {
 fn compact_status(f: &Facts, width: usize) -> Vec<Line<'static>> {
     let mut fields: Vec<String> = Vec::new();
 
-    fields.push(match (f.lemond_pid, f.lemond_listening) {
+    let mut lemonade = match (f.lemond_pid, f.lemond_listening) {
         (Some(pid), true) => format!("LEMONADE up {pid}"),
         (Some(pid), false) => format!("LEMONADE pid {pid} no answer"),
         (None, _) => "LEMONADE DOWN".to_string(),
-    });
+    };
+    // the same sentence the wide layout's LEMONADE panel carries, on the field it belongs to: a FIELD of its own
+    // would push the compact block to a third row at 80x25 and cost the log pane one (measured)
+    if let Some(e) = &f.engine {
+        lemonade.push_str(&format!(" engine: {e}"));
+    }
+    fields.push(lemonade);
 
     let g = &f.gpu;
     fields.push(match (&g.device, g.temp_c) {
@@ -1114,6 +1151,83 @@ mod tests {
             assert!(
                 joined.contains(want),
                 "CONNECT block does not mention {want:?}:\n{joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn before_dhcp_the_connect_block_waits_instead_of_inventing_an_address() {
+        // Measured on main before this: a box with no lease yet (the first screen of every boot) printed
+        // `web UI http://-:13305` / `api  http://-:13305/api/v1` / `ssh  root@-` - four URLs that cannot be used and
+        // a hostname of `-`. Owner decision 2026-11-04 20:19: say `web UI: waiting for network` until there is an
+        // address, so the block says one true thing instead of five false ones.
+        let mut f = c16_board();
+        f.ips.clear();
+        f.lemond_listening = false;
+        for (w, h) in [(240u16, 67u16), (80, 25)] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            assert!(
+                text.contains("web UI: waiting for network"),
+                "{w}x{h}: the waiting-for-network screen does not say so:\n{text}"
+            );
+            for bad in ["http://-:", "root@-", "<address>", "web UI http://"] {
+                assert!(
+                    !text.contains(bad),
+                    "{w}x{h}: {bad:?} is back on the no-address screen:\n{text}"
+                );
+            }
+            assert!(
+                text.contains("no address yet - press 3"),
+                "{w}x{h}: the row that says what to do is gone:\n{text}"
+            );
+        }
+        // ...and the moment there is an address, the whole block is back exactly as the gate row reads it
+        let text = render_snapshot(&app(c16_board()), 80, 25);
+        for want in [
+            "CONNECT",
+            "web UI http://192.168.50.110:13305",
+            "api  http://192.168.50.110:13305/api/v1",
+            "ssh  root@192.168.50.110",
+            "Lemonade Mobile",
+        ] {
+            assert!(
+                text.contains(want),
+                "the booted block lost {want:?}:\n{text}"
+            );
+        }
+        assert!(!text.contains("waiting for network"), "{text}");
+    }
+
+    #[test]
+    fn the_console_says_which_engine_is_serving() {
+        // Owner decision 2026-11-04 20:19 item 1: the console reports what Lemonade says serves the loaded model,
+        // in Lemonade's own words - no marketing map. The wide layout gets its own row, the compact layout carries
+        // it on the LEMONADE field (a field of its own costs the 80x25 log pane a row, measured).
+        let text240 = render_snapshot(&app(c16_board()), 240, 67);
+        assert!(
+            text240.contains("engine: llamacpp (gpu)"),
+            "the LEMONADE panel does not name the engine:\n{text240}"
+        );
+        let text80 = render_snapshot(&app(c16_board()), 80, 25);
+        assert!(
+            text80.contains("engine: llamacpp (gpu)"),
+            "the compact status does not name the engine:\n{text80}"
+        );
+        // the 80x25 log pane still pays for nothing: it keeps its three rows with the engine on the field
+        assert_eq!(
+            text80.lines().count(),
+            25,
+            "the frame is not the terminal:\n{text80}"
+        );
+        // nothing loaded (a box that has not served anything yet) -> no row, and no empty label either
+        let mut f = c16_board();
+        f.engine = None;
+        f.models.loaded.clear();
+        for (w, h) in [(240u16, 67u16), (80, 25)] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            assert!(
+                !text.contains("engine:"),
+                "{w}x{h}: an engine row with nothing loaded:\n{text}"
             );
         }
     }

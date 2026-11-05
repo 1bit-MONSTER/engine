@@ -22,7 +22,15 @@ binary, ratatui + crossterm, `x86_64-unknown-linux-musl`, no runtime dependency 
 Why it exists, in the owner's words: *"can we make that a tui instead of this style"* (the dialog-box console
 menu), then, on the cycle-18 board boot, *"when you first boot the headless there is no data to display on how to
 connect, just the menu"*. The first block on the screen is therefore **CONNECT**, and it is composed from live
-facts on every draw.
+facts on every draw. **Before DHCP there is no address**, so the block says the one true thing it can -
+`web UI: waiting for network`, with the row that says what to do (press 3) - instead of `http://-:13305`, which is
+what the first seconds of a boot used to show. The address rows come back with the lease.
+
+**The LEMONADE panel names the engine that is serving** - `engine: llamacpp (gpu)`, `engine: flm (npu)` - composed from
+what Lemonade reports (`recipe` in `/api/v1/models`, the device in `/api/v1/health`, falling back to the model's
+`recipe_options` backend). No marketing map: if the box says `llamacpp`, the screen says `llamacpp`. At 80x25 the same
+sentence rides on the compact `LEMONADE` field, because a fact field of its own would push the status block to a third
+row and cost the log pane one (owner decision 2026-11-04 20:19, item 1; `the_console_says_which_engine_is_serving`).
 
 ## The screen
 
@@ -177,7 +185,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 48 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
+cargo test                                    # 51 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

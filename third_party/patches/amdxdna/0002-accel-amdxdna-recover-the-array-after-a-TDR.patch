@@ -1,0 +1,254 @@
+From 294c95c222a54d06b51bc8076043bdd433ddae13 Mon Sep 17 00:00:00 2001
+From: pi-hrx-fabric <pi@1bit.gg>
+Date: Wed, 4 Nov 2026 20:14:14 -0400
+Subject: [PATCH 2/2] accel/amdxdna: recover the array after a TDR
+
+A TDR is detected and the hardware context is restarted, but the restart is
+gated on a condition that a fully-wedged context never satisfies, so
+aie2_hwctx_restart() fails -22 and every later request hangs until a reboot.
+Gate the restart on the TDR itself: when the recovery cannot bring the array
+back, stop dispatching, power-cycle the NPU (full firmware reload), and refuse
+new contexts and submissions with -ENODEV instead of hanging them.
+
+Measured on strixhalo (NPU 17f0:11, fw 17f0_11/npu_7.sbin): with
+tdr_timeout_ms=1 the TDR path executes, the NPU is power-cycled, and the array
+answers again with no reboot; srcversion with the 7.4.0-rc1-1bit headers is
+56AB94758C18FEEC838D18C.
+---
+ drivers/accel/amdxdna/aie2_ctx.c     | 19 +++++++++
+ drivers/accel/amdxdna/aie2_message.c |  6 +++
+ drivers/accel/amdxdna/aie2_pci.c     | 16 ++++++--
+ drivers/accel/amdxdna/aie2_pci.h     | 10 ++++-
+ drivers/accel/amdxdna/aie2_tdr.c     | 59 +++++++++++++++++++++-------
+ 5 files changed, 91 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index 4964dea0..2ab2b245 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -148,6 +148,19 @@ int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx)
+ 	kfree(hwctx->priv->cached_health);
+ 	hwctx->priv->cached_health = NULL;
+ 
++	/*
++	 * The heap's address is the client VA in PASID mode, and it is gone once
++	 * the process's VMAs are torn down (a close after the device was
++	 * runtime-suspended lands here). Sending that to the firmware produced a
++	 * bare -EINVAL from MAP_HOST_BUFFER with addr 0xffffffffffffffff; refuse
++	 * locally so the log says what actually went wrong.
++	 */
++	if (amdxdna_obj_dma_addr(heap) == AMDXDNA_INVALID_ADDR) {
++		XDNA_ERR(xdna, "%s has no host buffer address, cannot restart it", hwctx->name);
++		ret = -ENODEV;
++		goto out;
++	}
++
+ 	ret = aie2_create_context(xdna->dev_handle, hwctx);
+ 	if (ret) {
+ 		XDNA_ERR(xdna, "Create hwctx failed, ret %d", ret);
+@@ -1136,6 +1149,12 @@ int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job,
+ 	struct dma_fence_chain *chain;
+ 	int ret;
+ 
++	if (READ_ONCE(xdna->dev_handle->hw_dead)) {
++		XDNA_ERR(xdna, "NPU array is unusable until the driver is reloaded; refusing submission on %s",
++			 hwctx->name);
++		return -ENODEV;
++	}
++
+ 	ret = down_interruptible(&hwctx->priv->job_sem);
+ 	if (ret) {
+ 		XDNA_ERR(xdna, "Grab job sem failed, ret %d", ret);
+diff --git a/drivers/accel/amdxdna/aie2_message.c b/drivers/accel/amdxdna/aie2_message.c
+index 49945acf..eb763fad 100644
+--- a/drivers/accel/amdxdna/aie2_message.c
++++ b/drivers/accel/amdxdna/aie2_message.c
+@@ -320,6 +320,12 @@ int aie2_create_context(struct amdxdna_dev_hdl *ndev, struct amdxdna_hwctx *hwct
+ 	u32 intr_reg;
+ 	int ret;
+ 
++	if (READ_ONCE(ndev->hw_dead)) {
++		XDNA_ERR(xdna, "NPU array is unusable until the driver is reloaded; refusing to create a context for %s",
++			 hwctx->name);
++		return -ENODEV;
++	}
++
+ 	req.aie_type = 1;
+ 	req.start_col = hwctx->start_col;
+ 	req.num_col = hwctx->num_col;
+diff --git a/drivers/accel/amdxdna/aie2_pci.c b/drivers/accel/amdxdna/aie2_pci.c
+index a6a8fcd9..666f5a54 100644
+--- a/drivers/accel/amdxdna/aie2_pci.c
++++ b/drivers/accel/amdxdna/aie2_pci.c
+@@ -447,6 +447,7 @@ static int aie2_hw_start(struct amdxdna_dev *xdna)
+ 	}
+ 
+ 	ndev->dev_status = AIE2_DEV_START;
++	WRITE_ONCE(ndev->hw_dead, false);
+ 
+ 	return 0;
+ 
+@@ -512,22 +513,25 @@ static int aie2_hw_resume(struct amdxdna_dev *xdna)
+  * reset storm must not hammer the SMU power-cycle. One reset per window
+  * is enough; repeated timeouts after that indicate a deeper firmware
+  * problem and are reported to the log instead of resetting in a loop.
++ *
++ * Return: 0 if the firmware was reloaded (or there was nothing to reset),
++ * -EBUSY if the rate limit skipped it, or the error from the reload.
+  */
+-void aie2_hw_reset(struct amdxdna_dev *xdna)
++int aie2_hw_reset(struct amdxdna_dev *xdna)
+ {
+ 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+ 	int ret;
+ 
+ 	if (ndev->dev_status <= AIE2_DEV_INIT) {
+ 		XDNA_DBG(xdna, "device not started, nothing to reset");
+-		return;
++		return 0;
+ 	}
+ 
+ 	if (time_before(jiffies, ndev->last_reset_jiffies +
+ 				msecs_to_jiffies(AIE2_HW_RESET_MIN_INTERVAL_MS))) {
+ 		XDNA_WARN(xdna, "NPU reset skipped: last reset %d ms ago",
+ 			  jiffies_to_msecs(jiffies - ndev->last_reset_jiffies));
+-		return;
++		return -EBUSY;
+ 	}
+ 
+ 	/*
+@@ -541,8 +545,12 @@ void aie2_hw_reset(struct amdxdna_dev *xdna)
+ 	aie2_hw_stop(xdna);
+ 
+ 	ret = aie2_hw_start(xdna);
+-	if (ret)
++	if (ret) {
+ 		XDNA_ERR(xdna, "NPU power-cycle start failed: %d", ret);
++		return ret;
++	}
++
++	return 0;
+ }
+ 
+ static int aie2_init(struct amdxdna_dev *xdna)
+diff --git a/drivers/accel/amdxdna/aie2_pci.h b/drivers/accel/amdxdna/aie2_pci.h
+index 487b26d0..c5977f3b 100644
+--- a/drivers/accel/amdxdna/aie2_pci.h
++++ b/drivers/accel/amdxdna/aie2_pci.h
+@@ -151,6 +151,14 @@ struct amdxdna_dev_hdl {
+ 	enum aie2_dev_status		dev_status;
+ 	u32				hwctx_num;
+ 
++	/*
++	 * A TDR recovery could not bring the array back. Cleared only by a
++	 * successful full hardware start (aie2_hw_start), i.e. a firmware
++	 * reload. While set, new contexts and new submissions are refused with
++	 * -ENODEV instead of hanging every later request until a reboot.
++	 */
++	bool				hw_dead;
++
+ 	enum aie2_tdr_status		tdr_status;
+ 	struct aie2_tdr			tdr; /* TDR for device recovery */
+ 
+@@ -313,7 +321,7 @@ void aie2_hwctx_suspend(struct amdxdna_client *client);
+ int aie2_hwctx_resume(struct amdxdna_client *client);
+ int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx);
+ #define AIE2_HW_RESET_MIN_INTERVAL_MS	60000
+-void aie2_hw_reset(struct amdxdna_dev *xdna);
++int aie2_hw_reset(struct amdxdna_dev *xdna);
+ int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, u64 *seq);
+ int aie2_hwctx_heap_expand(struct amdxdna_hwctx *hwctx, struct amdxdna_gem_obj *heap);
+ 
+diff --git a/drivers/accel/amdxdna/aie2_tdr.c b/drivers/accel/amdxdna/aie2_tdr.c
+index 9362c6a2..4cc3d461 100644
+--- a/drivers/accel/amdxdna/aie2_tdr.c
++++ b/drivers/accel/amdxdna/aie2_tdr.c
+@@ -114,14 +114,21 @@ static int aie2_tdr_stop_hwctx(struct amdxdna_hwctx *hwctx, void *arg)
+ 	return 0;
+ }
+ 
++struct aie2_tdr_resume_arg {
++	struct amdxdna_dev *xdna;
++	bool failed;
++};
++
+ static int aie2_tdr_resume_hwctx(struct amdxdna_hwctx *hwctx, void *arg)
+ {
+-	struct amdxdna_dev *xdna = arg;
++	struct aie2_tdr_resume_arg *rarg = arg;
+ 	int ret;
+ 
+-	ret = aie2_hwctx_restart(xdna, hwctx);
+-	if (ret)
+-		XDNA_ERR(xdna, "%s restart failed, ret %d", hwctx->name, ret);
++	ret = aie2_hwctx_restart(rarg->xdna, hwctx);
++	if (ret) {
++		XDNA_ERR(rarg->xdna, "%s restart failed, ret %d", hwctx->name, ret);
++		rarg->failed = true;
++	}
+ 
+ 	/* Always return 0 so the walk visits every context. */
+ 	return 0;
+@@ -129,25 +136,49 @@ static int aie2_tdr_resume_hwctx(struct amdxdna_hwctx *hwctx, void *arg)
+ 
+ static void aie2_tdr_recover_all(struct amdxdna_dev *xdna)
+ {
++	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
++	struct aie2_tdr_resume_arg rarg = { .xdna = xdna };
+ 	struct amdxdna_client *client;
+ 	bool fw_dead = false;
++	int ret;
+ 
+ 	amdxdna_for_each_client(xdna, client)
+ 		amdxdna_hwctx_walk(client, &fw_dead, NULL, aie2_tdr_stop_hwctx);
+ 
+-	if (fw_dead) {
+-		/*
+-		 * Firmware did not respond — attempt a best-effort power-cycle.
+-		 * Context resume is always handled by the loop below regardless
+-		 * of whether the reset succeeds, so paused jobs are unblocked
+-		 * and can fail gracefully rather than stalling forever.
+-		 */
++	/*
++	 * A TDR means the array stopped dispatching, and recreating the contexts
++	 * does not clear that: in every capture we have (2026-11-01 12:26,
++	 * 2026-11-02 09:48 and 09:49, c21 board 2026-11-04 08:34) the restart
++	 * itself returned success and the same firmware state stayed wedged, so
++	 * every later request was inherited by a dead context. The recovery that
++	 * does work is the firmware reload this driver already implements, so it
++	 * runs for a stall as well — fw_dead only sharpens the reason in the log.
++	 * Context resume is always handled by the loop below regardless of
++	 * whether the reset succeeds, so paused jobs are unblocked and can fail
++	 * gracefully rather than stalling forever.
++	 */
++	if (fw_dead)
+ 		XDNA_WARN(xdna, "Firmware unresponsive, power-cycling NPU");
+-		aie2_hw_reset(xdna);
+-	}
++	else
++		XDNA_WARN(xdna, "Array stopped dispatching, power-cycling NPU to recover");
++
++	ret = aie2_hw_reset(xdna);
++	if (ret)
++		XDNA_ERR(xdna, "NPU power-cycle did not recover the array: %d", ret);
+ 
+ 	amdxdna_for_each_client(xdna, client)
+-		amdxdna_hwctx_walk(client, xdna, NULL, aie2_tdr_resume_hwctx);
++		amdxdna_hwctx_walk(client, &rarg, NULL, aie2_tdr_resume_hwctx);
++
++	if (ret || rarg.failed) {
++		/*
++		 * Do not leave a device that silently swallows every later
++		 * request: a new context or a new submission gets a real error.
++		 */
++		WRITE_ONCE(ndev->hw_dead, true);
++		XDNA_ERR(xdna,
++			 "NPU array is unusable until the driver is reloaded: TDR recovery failed (%d%s); new contexts and submissions are refused with -ENODEV",
++			 ret, rarg.failed ? ", a context could not be restarted" : "");
++	}
+ }
+ 
+ static void aie2_tdr_work_func(struct work_struct *work)
+-- 
+2.53.0
+

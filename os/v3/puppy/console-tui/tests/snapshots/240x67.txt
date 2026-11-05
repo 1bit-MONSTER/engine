@@ -20,8 +20,8 @@
  LEMONADE ---------------------------------------------------------------------- GPU --------------------------------------------------------------------------- NPU -------------------------------------------------------------------------
 up (pid 8882)                                                                   HRX0: AMD Radeon 8060S Graphics                                                 amdxdna loaded
 http://192.168.50.110:13305                                                     74158 MiB free                                                                  firmware present
-API key: set, press 1                                                           VRAM 2G of 120G used, GTT 512M of 61G                                           accel0 idle
-                                                                                43C
+engine: llamacpp (gpu)                                                          VRAM 2G of 120G used, GTT 512M of 61G                                           accel0 idle
+API key: set, press 1                                                           43C
  MODELS ------------------------------------------------------------------------ FANS / TEMPS ------------------------------------------------------------------ DATA ------------------------------------------------------------------------
 2 downloaded                                                                    fans: controlled (fan1 0 rpm fan2 0 rpm)                                        58G total, 52G free
 Qwen3-0.6B-NPU-1bit                                                             temps max 43C                                                                   last request 330.8 tok/s, first token 10 ms

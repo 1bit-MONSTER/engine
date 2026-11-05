@@ -71,6 +71,7 @@
 #include "hrx_strict.h"
 #include "mem_admit.h"
 #include "pm.h"
+#include "laya_checkpoint.h"
 #include "recipes.h"
 #include "serve_metrics.h"
 #include "serve_watchdog.h"
@@ -1271,30 +1272,6 @@ size_t conversation_key(const httplib::Request& req) {
 }
 
 #ifdef ONEBIT_LAYA
-// The Laya checkpoint for --laya-model DIR, or for --laya: $ONEBIT_LAYA_MODEL, else
-// ${XDG_DATA_HOME:-~/.local/share}/1bit/laya (where scripts/fetch-laya.sh installs it). A
-// directory holding the pinned repo's typed-decisions/ checkpoint uses that one: it classifies
-// requests best (95.5% against 92.0% for the root checkpoint, tests/laya_classify_eval).
-std::string laya_home(const std::string& given) {
-    std::string dir = given;
-    if (dir.empty()) {
-        if (const char* e = std::getenv("ONEBIT_LAYA_MODEL"); e && *e) dir = e;
-        else if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x) dir = std::string(x) + "/1bit/laya";
-        else if (const char* h = std::getenv("HOME"); h && *h) dir = std::string(h) + "/.local/share/1bit/laya";
-    }
-    return dir;
-}
-
-std::string laya_checkpoint(const std::string& given) {
-    namespace fs = std::filesystem;
-    const std::string dir = laya_home(given);
-    if (dir.empty() || !fs::is_directory(dir))
-        throw std::runtime_error("laya: no checkpoint at " + (dir.empty() ? std::string("~/.local/share/1bit/laya") : dir) +
-                                 " (install it with scripts/fetch-laya.sh, or pass --laya-model DIR)");
-    if (fs::exists(fs::path(dir) / "typed-decisions" / "model.safetensors")) return (fs::path(dir) / "typed-decisions").string();
-    return dir;
-}
-
 // The router's fast scorer: ggmlc's laya (our fork, third_party/ggmlc, -DONEBIT_LAYA_GGML=ON) on
 // HRX0, AMD's backend, built against third_party/llama.cpp's ggml (its HRX kernels for ModernBERT,
 // fork #31), with the typed-decisions checkpoint compiled to a GGUF (mys/laya-typed-decisions-GGUF,

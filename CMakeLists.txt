@@ -87,7 +87,7 @@ FetchContent_Declare(httplib
     GIT_TAG fe332fa06bac76a1c6d402c08f414052999347da)  # v0.47.0
 FetchContent_MakeAvailable(json httplib)
 
-add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp)
+add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/laya_checkpoint.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -505,6 +505,8 @@ if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # `1bit route --serve`, the resident form the fork calls per request (docs/laya-first.md §8).
     add_test(NAME laya_route_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+    # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
+    add_test(NAME laya_checkpoint COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
              ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)
@@ -947,9 +949,27 @@ if(ONEBIT_NPU)
     target_link_libraries(mtp_batch_all_test PRIVATE onebit_npu_forward)
     add_dependencies(npu_sampling_test mtp_batch_all_test)
     add_test(NAME mtp_batch_all COMMAND mtp_batch_all_test)
+    # The batched GDN recurrence is head-major (one parallel region per layer, not per layer AND row); the engine
+    # asserts the two nestings agree bit for bit under NPU_GDN_CHECK=1, so this test enables it and makes the
+    # batched path run.  Host-GEMM, no device; skips (77) unless ONEBIT_TEST_Q4NX names a linear-attention
+    # container.
+    add_executable(gdn_batch_order_test tests/gdn_batch_order_test.cpp)
+    target_include_directories(gdn_batch_order_test PRIVATE npu/forward/include)
+    target_link_libraries(gdn_batch_order_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test gdn_batch_order_test)
+    add_test(NAME gdn_batch_order COMMAND gdn_batch_order_test)
     # The MTP drafter measured against the real base model (tools/mtp_acceptance.cpp): draft, verify through
     # step_batch_all(), commit the accepted prefix, repeat.  The head runs on the host in the pb16i-exact
     # arithmetic, the base on the exact route.  Needs the device, so it is a tool, not a ctest.
+    # Device-free harness for the batched GDN recurrence: why gdn_layer_batch holds one parallel region per layer
+    # instead of one per layer AND row.  Times today's nesting against the exchanged one (both through one body,
+    # bit-identity required before any timing is printed) so the region-count claim can be reproduced without the
+    # device: 2.06 ms/row idle, 252-301 with spinners, 16.8 vs 4.1 between the two nestings at equal contention.
+    add_executable(gdn_row_bench tools/gdn_row_bench.cpp)
+    find_package(OpenMP COMPONENTS CXX QUIET)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(gdn_row_bench PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     add_executable(mtp_acceptance tools/mtp_acceptance.cpp npu/mtp/mtp_head.cpp)
     target_include_directories(mtp_acceptance PRIVATE npu npu/forward/include)
     target_link_libraries(mtp_acceptance PRIVATE onebit_npu_forward)
@@ -958,6 +978,7 @@ if(ONEBIT_NPU)
         target_link_libraries(mtp_acceptance PRIVATE OpenMP::OpenMP_CXX)
     endif()
     set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(gdn_batch_order PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source
     # check, outside this repository (docs/npu.md, "Checking the NPU").

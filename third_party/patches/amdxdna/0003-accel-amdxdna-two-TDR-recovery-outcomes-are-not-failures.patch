@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pi-hrx-fabric <fabric@1bit.local>
+Date: Wed, 4 Nov 2026 22:47:00 -0400
+Subject: [PATCH] accel/amdxdna: two TDR-recovery outcomes are not failures
+
+0007's recovery latches hw_dead ("the NPU array is unusable until the driver is
+reloaded", every later create_context/submit refused -ENODEV) for two cases that
+are not recovery failures:
+
+1. A power-cycle inside the 60 s rate-limit window. aie2_hw_reset() answers
+   -EBUSY, and aie2_tdr_recover_all() counted that as "recovery failed". With
+   tdr_timeout_ms=15000 the watchdog ticks four times inside the window, so any
+   two TDRs within 60 s killed the array (measured 2026-11-04 22:28 on
+   strixhalo). Throttled means "retry on the next watchdog tick": check it
+   before tearing any context down, touch nothing, and leave the pending jobs
+   pending - the array has not been power-cycled yet, so restarting contexts
+   against it is the one thing that must not happen.
+
+2. A context whose client is already closing: its heap has no host buffer
+   address left (the client's VMAs are gone), so aie2_hwctx_restart() refuses it
+   -ENODEV before talking to the firmware. That is a context being torn down,
+   not a failed recovery: skip it (its jobs were already unpaused by the restart
+   call, so a waiter fails rather than hangs) and keep the recovered array
+   usable. Measured 2026-11-04 21:50:23 (one context) and 22:40 (two) - ordinary
+   multi-client use - each time after a power-cycle that had SUCCEEDED.
+
+Both are the difference between "one request died" and "the NPU is gone for
+every lane until a reload". hw_dead is cleared only by aie2_start()
+(aie2_pci.c), i.e. by a device resume or a module reload, so leaving it latched
+costs every client on the box until then.
+
+The throttle predicate is factored out (aie2_hw_reset_throttled) so aie2_hw_reset()
+and the TDR path cannot disagree about what a -EBUSY means.
+
+Signed-off-by: bong-water-water-bong <bong-water-water-bong@users.noreply.github.com>
+---
+ drivers/accel/amdxdna/aie2_pci.c | 18 +++++++++++--
+ drivers/accel/amdxdna/aie2_pci.h |  1 +
+ drivers/accel/amdxdna/aie2_tdr.c | 45 ++++++++++++++++++++++++++++++--
+ 3 files changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_pci.c b/drivers/accel/amdxdna/aie2_pci.c
+index 666f5a54..ac4919e7 100644
+--- a/drivers/accel/amdxdna/aie2_pci.c
++++ b/drivers/accel/amdxdna/aie2_pci.c
+@@ -517,6 +517,21 @@ static int aie2_hw_resume(struct amdxdna_dev *xdna)
+  * Return: 0 if the firmware was reloaded (or there was nothing to reset),
+  * -EBUSY if the rate limit skipped it, or the error from the reload.
+  */
++/*
++ * aie2_hw_reset_throttled - is a power-cycle still inside the rate-limit window?
++ *
++ * The rate limit is a safety valve, not a recovery failure: a caller that is told
++ * "throttled" knows the array was power-cycled less than
++ * AIE2_HW_RESET_MIN_INTERVAL_MS ago and must retry later rather than conclude
++ * that recovery is impossible. aie2_hw_reset() and the TDR path ask this one
++ * predicate so the two can never disagree about which case a -EBUSY is.
++ */
++bool aie2_hw_reset_throttled(struct amdxdna_dev_hdl *ndev)
++{
++	return time_before(jiffies,
++			   ndev->last_reset_jiffies + msecs_to_jiffies(AIE2_HW_RESET_MIN_INTERVAL_MS));
++}
++
+ int aie2_hw_reset(struct amdxdna_dev *xdna)
+ {
+ 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+@@ -527,8 +542,7 @@ int aie2_hw_reset(struct amdxdna_dev *xdna)
+ 		return 0;
+ 	}
+ 
+-	if (time_before(jiffies, ndev->last_reset_jiffies +
+-				msecs_to_jiffies(AIE2_HW_RESET_MIN_INTERVAL_MS))) {
++	if (aie2_hw_reset_throttled(ndev)) {
+ 		XDNA_WARN(xdna, "NPU reset skipped: last reset %d ms ago",
+ 			  jiffies_to_msecs(jiffies - ndev->last_reset_jiffies));
+ 		return -EBUSY;
+diff --git a/drivers/accel/amdxdna/aie2_pci.h b/drivers/accel/amdxdna/aie2_pci.h
+index c5977f3b..13641108 100644
+--- a/drivers/accel/amdxdna/aie2_pci.h
++++ b/drivers/accel/amdxdna/aie2_pci.h
+@@ -321,6 +321,7 @@ void aie2_hwctx_suspend(struct amdxdna_client *client);
+ int aie2_hwctx_resume(struct amdxdna_client *client);
+ int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx);
+ #define AIE2_HW_RESET_MIN_INTERVAL_MS	60000
++bool aie2_hw_reset_throttled(struct amdxdna_dev_hdl *ndev);
+ int aie2_hw_reset(struct amdxdna_dev *xdna);
+ int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, u64 *seq);
+ int aie2_hwctx_heap_expand(struct amdxdna_hwctx *hwctx, struct amdxdna_gem_obj *heap);
+diff --git a/drivers/accel/amdxdna/aie2_tdr.c b/drivers/accel/amdxdna/aie2_tdr.c
+index 4cc3d461..8d0878e8 100644
+--- a/drivers/accel/amdxdna/aie2_tdr.c
++++ b/drivers/accel/amdxdna/aie2_tdr.c
+@@ -122,11 +122,33 @@ struct aie2_tdr_resume_arg {
+ static int aie2_tdr_resume_hwctx(struct amdxdna_hwctx *hwctx, void *arg)
+ {
+ 	struct aie2_tdr_resume_arg *rarg = arg;
++	struct amdxdna_dev *xdna = rarg->xdna;
+ 	int ret;
+ 
+-	ret = aie2_hwctx_restart(rarg->xdna, hwctx);
++	ret = aie2_hwctx_restart(xdna, hwctx);
+ 	if (ret) {
+-		XDNA_ERR(rarg->xdna, "%s restart failed, ret %d", hwctx->name, ret);
++		/*
++		 * A context whose client is already tearing down has no host buffer
++		 * address left to map (the client's VMAs are gone), so it cannot be
++		 * restarted - and does not need to be: the process it belongs to is
++		 * gone, and aie2_hwctx_restart() unpaused its jobs before returning,
++		 * so anything still waiting on it fails instead of hanging.
++		 *
++		 * Counting this as a recovery failure is what turned one dying
++		 * context into "the NPU array is unusable until the driver is
++		 * reloaded" for every other client on the box: measured 2026-11-04
++		 * 21:50:23 and again at 22:40 on strixhalo, a TDR recovery whose
++		 * power-cycle SUCCEEDED (ret 0) was reported as failed because of
++		 * one or two closing contexts, and every later open was refused
++		 * -ENODEV until a module reload.
++		 */
++		if (amdxdna_obj_dma_addr(hwctx->priv->heap) == AMDXDNA_INVALID_ADDR) {
++			XDNA_WARN(xdna,
++				  "%s has no host buffer address (client closing): not restarting it, the recovered array stays usable",
++				  hwctx->name);
++			return 0;
++		}
++		XDNA_ERR(xdna, "%s restart failed, ret %d", hwctx->name, ret);
+ 		rarg->failed = true;
+ 	}
+ 
+@@ -142,6 +164,25 @@ static void aie2_tdr_recover_all(struct amdxdna_dev *xdna)
+ 	bool fw_dead = false;
+ 	int ret;
+ 
++	/*
++	 * A power-cycle inside the rate-limit window is throttled, not failed
++	 * (aie2_hw_reset() would return -EBUSY). Check it before tearing anything
++	 * down: stopping the contexts and then discovering the array was not
++	 * power-cycled leaves every client holding a destroyed context, and
++	 * counting the -EBUSY as "recovery failed" latched hw_dead for the whole
++	 * array - two TDRs inside the 60 s window were enough, which is exactly
++	 * what happens with tdr_timeout_ms=15000 (measured 2026-11-04 22:28 on
++	 * strixhalo). Nothing is touched here; the next watchdog tick retries and
++	 * the pending jobs stay pending until then.
++	 */
++	if (aie2_hw_reset_throttled(ndev)) {
++		XDNA_WARN(xdna,
++			  "TDR recovery throttled: last power-cycle %u ms ago (< %d ms), retrying on the next watchdog tick",
++			  jiffies_to_msecs(jiffies - ndev->last_reset_jiffies),
++			  AIE2_HW_RESET_MIN_INTERVAL_MS);
++		return;
++	}
++
+ 	amdxdna_for_each_client(xdna, client)
+ 		amdxdna_hwctx_walk(client, &fw_dead, NULL, aie2_tdr_stop_hwctx);
+ 
+-- 
+2.53.0
+

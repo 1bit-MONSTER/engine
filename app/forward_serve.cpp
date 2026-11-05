@@ -111,6 +111,12 @@ struct ForwardEngine {
 struct CallStats {
     int prompt_tokens = 0;
     int completion_tokens = 0;
+    // AMD's model_benchmark protocol reports two stages per request -- prompt processing (to first
+    // token) and token generation -- and onnx/bench_npu_serve.py reads them from the reply's
+    // `timings` (app/unified.cpp has always emitted them; this route did not, so no NPU row from
+    // this route could be expressed in AMD's units at all).
+    double prompt_ms = 0;
+    double predicted_ms = 0;
     npu::PrefixDecision prefix{-1, 0, "off"};  // "off" when --prefix-slots 0
 };
 
@@ -241,6 +247,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         const int limit = std::clamp(max_tokens, 0, room);
         std::lock_guard<std::mutex> lock(e.mu);
 
+        const auto t_request = std::chrono::steady_clock::now();
         std::vector<float> logits;
         // Prefill in batched (M>1) passes of at most the kernel's row width: each
         // projection's weight stream is then read once per chunk instead of once
@@ -311,6 +318,12 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 off += take;
             }
         }
+
+        // Prompt processing ends here: every prompt token has been through the model and the first
+        // token's distribution is in `logits`.
+        const auto t_first = std::chrono::steady_clock::now();
+        stats.prompt_ms =
+            std::chrono::duration<double, std::milli>(t_first - t_request).count();
 
         // Sampler state: one generator per request, seeded so a run can be reproduced.
         std::mt19937_64 rng(npu::resolve_seed(opts.sample.seed));
@@ -424,8 +437,17 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             if (cut > 0) on_text(pending.substr(0, cut), take_held(cut));
         }
         stats.completion_tokens = produced;
+        stats.predicted_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_first).count();
         if (produced >= limit && !stopped_at_eos && !stopped_at_stop) finish = "length";
         return finish;
+    };
+
+    auto timings_json = [](const CallStats& st) {
+        return json{{"prompt_ms", st.prompt_ms},
+                    {"predicted_ms", st.predicted_ms},
+                    {"predicted_per_second",
+                     st.predicted_ms > 0.0 ? 1000.0 * double(st.completion_tokens) / st.predicted_ms : 0.0}};
     };
 
     // OpenAI's usage object plus the two fields issue #650 reports: how many prompt tokens came
@@ -496,6 +518,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             out["choices"] = json::array({{{"index", 0}, {"text", content}, {"finish_reason", finish}}});
         }
         out["usage"] = usage_json(stats);
+        out["timings"] = timings_json(stats);
         // A piece can be half a character and dump() throws on invalid UTF-8: replace rather than
         // turn a reported logprob into a 500.
         return out.dump(-1, ' ', false, json::error_handler_t::replace);
@@ -575,6 +598,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 json tail = chunk_tpl;
                 tail["choices"] = json::array();
                 tail["usage"] = usage_json(stats);
+            tail["timings"] = timings_json(stats);
                 chunks->push_back("data: " + tail.dump() + "\n\n");
             }
             auto cursor = std::make_shared<size_t>(0);

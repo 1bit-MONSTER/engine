@@ -717,6 +717,59 @@ pub fn json_bool(obj: &str, key: &str) -> Option<bool> {
     }
 }
 
+/// Text from a log line or an API answer, made safe to put in a cell.
+///
+/// A cell's symbol is written through to the terminal unchanged, so an escape sequence that arrives as *data* becomes an
+/// escape sequence on the console's own screen - measured: a log line containing `\x1b[2J\x1b[31m` put both sequences into the
+/// rendered frame byte for byte, and the engine's own progress bars end every line with `\x1b[K` (it reached the pane as a
+/// literal `[K`). Lemonade's log carries chat prompts, model names and engine output, so this is not hypothetical for a box
+/// someone is talking to.
+///
+/// CSI and OSC sequences are removed whole (the bytes after an escape are control, not text), a TAB becomes a space because
+/// the panes have no tab stops, and every other control character is dropped. Nothing else is touched: `°C`, `é` and the
+/// box-drawing the panes use are text and stay.
+pub fn screen_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\t' => out.push(' '),
+            '\x1b' => match it.peek() {
+                // CSI: ESC '[' then params, ending on a final byte in '@'..='~'
+                Some('[') => {
+                    it.next();
+                    for f in it.by_ref() {
+                        if ('@'..='~').contains(&f) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ']' then text, ending on BEL or ST
+                Some(']') => {
+                    it.next();
+                    while let Some(f) = it.next() {
+                        if f == '\x07' {
+                            break;
+                        }
+                        if f == '\x1b' && matches!(it.peek(), Some('\\')) {
+                            it.next();
+                            break;
+                        }
+                    }
+                }
+                // any other escape is short: drop the character after it too
+                Some(_) => {
+                    it.next();
+                }
+                None => {}
+            },
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// `/api/v1/models`: keep what is on the machine. The catalogue lists undownloaded entries too, and a picker
 /// that offered them would name a model this box cannot run.
 pub fn models_from(json: &str) -> Models {
@@ -725,16 +778,19 @@ pub fn models_from(json: &str) -> Models {
         let Some(id) = json_str(&obj, "id") else {
             continue;
         };
+        // a catalogue name comes from a Hub and is drawn: see screen_text
+        let id = screen_text(&id);
         if json_bool(&obj, "downloaded").unwrap_or(false) {
             m.downloaded.push(id.clone());
         }
         if let Some(recipe) = json_str(&obj, "recipe") {
             // the backend lives in recipe_options: `onebit_backend` on this image, `<recipe>_backend` on stock
             let backend = json_str(&obj, "onebit_backend")
-                .or_else(|| json_str(&obj, &format!("{recipe}_backend")));
+                .or_else(|| json_str(&obj, &format!("{recipe}_backend")))
+                .map(|b| screen_text(&b));
             m.engines.push(Engine {
                 model: id,
-                recipe,
+                recipe: screen_text(&recipe),
                 backend,
             });
         }
@@ -944,7 +1000,7 @@ fn logs() -> Vec<String> {
     let dmesg = Command::new("dmesg").output().ok();
     if let Some(o) = dmesg {
         for l in kernel_lines(&String::from_utf8_lossy(&o.stdout)) {
-            out.push(format!("KRN {l}"));
+            out.push(format!("KRN {}", screen_text(&l)));
         }
     }
     // Read more than the pane shows, because the filter below removes most of it: at log_level=debug (the c25
@@ -952,7 +1008,7 @@ fn logs() -> Vec<String> {
     // one [Debug] line. Measured on the c25 take: 553 of them, and on a booted c25 image the pane was 100 %
     // polling lines with a chat nowhere in sight (c26 item 1). The chats, the loads and the errors are kept.
     for l in tail_file(LEMLOG, 256 * 1024, LOG_LINES * 8) {
-        out.push(format!("LEM {l}"));
+        out.push(format!("LEM {}", screen_text(&l)));
     }
     pane_lines(out, LOG_LINES)
 }
@@ -1275,6 +1331,46 @@ mod tests {
             .as_deref(),
             Some("llamacpp (cpu)")
         );
+    }
+
+    #[test]
+    fn a_log_line_or_a_model_name_cannot_carry_an_escape_into_the_screen() {
+        // measured before this: a log line containing ESC[2J ESC[31m put both sequences into the rendered frame byte for
+        // byte, and the engine's progress bars end every line with ESC[K (which reached the pane as a literal `[K`)
+        assert_eq!(
+            screen_text("|=====| 9/9 - 1.24s/it\x1b[K"),
+            "|=====| 9/9 - 1.24s/it"
+        );
+        assert_eq!(
+            screen_text("name \"evil\x1b[2J\x1b[31mRED\" loaded"),
+            "name \"evilRED\" loaded"
+        );
+        // OSC 8 (what a terminal uses for links: ESC ] 8 ; ; uri ST, ST being ESC backslash) and the short two-byte escapes
+        assert_eq!(
+            screen_text("\x1b]8;;http://x\x1b\\seen\x1b]8;;\x1b\\"),
+            "seen"
+        );
+        assert_eq!(screen_text("\x1b]0;title\x07after-bel"), "after-bel");
+        assert_eq!(screen_text("a\x1bMb"), "ab");
+        // TAB has no tab stop in a pane; the rest of C0 and DEL are dropped
+        assert_eq!(screen_text("a\tb"), "a b");
+        assert_eq!(screen_text("a\x00\x07\x7fb"), "ab");
+        // text is left alone, including the non-ASCII a pane uses every day
+        for keep in ["SoC 78°C", "FANS 1200 rpm", "café", "┌─┐", "plain"] {
+            assert_eq!(screen_text(keep), keep);
+        }
+        assert_eq!(screen_text(""), "");
+        // and the catalogue is sanitised where it enters, because a model name is drawn: whatever bytes the JSON hands
+        // over, what is DRAWN is cleaned. (A literal ESC is used rather
+        // than a `\u001b` escape because this crate's JSON reader does not implement `\uXXXX` - see the note in json_raw.)
+        let esc = '\u{1b}';
+        let json = format!(
+            "{{\"data\":[{{\"id\":\"evil{esc}[2Jmodel\",\"created\":0,\"object\":\"model\",\"recipe\":\"llamacpp\",\"downloaded\":true,\"recipe_options\":{{\"onebit_backend\":\"gpu{esc}[31m\"}}}}]}}"
+        );
+        let m = models_from(&json);
+        // the whole CSI goes, not just its ESC: those bytes are control, not text
+        assert_eq!(m.downloaded, vec!["evilmodel"]);
+        assert_eq!(m.engines[0].backend.as_deref(), Some("gpu"));
     }
 
     #[test]

@@ -1231,10 +1231,11 @@ so:
 A real failure is unchanged apart from being reported: the last attempt's exception still reaches the
 caller after the window closes, and the log now names the attempt count and the reason.
 
-One load failure is not transient and says so: the driver refusing to create a hardware context
-(`code 102`, `errc::ctx_create`) with `No such device` means the array is in the state a TDR leaves
-behind when it could not restart a context, and it keeps refusing until the driver is reloaded. The
-give-up report adds the one action that works:
+One NPU failure is not transient and says so: the driver deciding the array is dead, reported with
+`No such device` (ENODEV) and either `code 102` (`errc::ctx_create`) or `code 104` (`errc::submit`) —
+whichever call was refused, which depends only on whether the process already had a hardware context
+when the array went. That is the state a TDR leaves behind when it could not restart a context, and the
+driver keeps refusing until it is reloaded. The report adds the one action that works:
 
 ```
 1bit unified: the NPU array is refusing hardware contexts: reload the driver (modprobe -r amdxdna && modprobe amdxdna)

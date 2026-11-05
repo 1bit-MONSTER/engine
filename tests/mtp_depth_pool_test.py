@@ -236,7 +236,24 @@ rc15, out15, _ = run([], [("n1.log", READY_NORM + ticket_k(0, 4)), ("n2.log", RE
 check("vocab 248320, max_batch_rows 16, hidden post-final-norm" in out15 and "MIXED run identity" not in out15,
       "a uniform run identity is stated in the header")
 
-# 15. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
+# 15. the recorded 8x64 window, from the three tickets shipped under tests/fixtures/mtp_clause55 (see its README).
+# Without this the known answer is only checkable on the machine that holds the original `npu-hold` logs, i.e. the tool
+# that produces the deliverable's published verdict could break it and CI would not notice.
+FIXTURES = os.path.join(ROOT, "tests", "fixtures", "mtp_clause55")
+CL = [os.path.join(FIXTURES, n) for n in ("p0.log", "p1-4.log", "p5-7.log")]
+if all(os.path.exists(p) for p in CL):
+    r16 = subprocess.run([sys.executable, TOOL, "--selftest"] + CL, capture_output=True, text=True)
+    check(r16.returncode == 0, f"the shipped fixtures reproduce the recorded 8x64 window (rc={r16.returncode})")
+    check("32 scored cells = 8 prompts x 4 depths" in r16.stdout, "the fixtures pool to the recorded 8 x 4 cells")
+    for want in ("136/181 = 75.14%", "86/136 = 63.24%", "63/86 = 73.26%", "53/63 = 84.13%"):
+        check(want in r16.stdout, f"fixture pool reports {want}")
+    check("4 of 4 scored depths within 2 pp" in r16.stdout, "all four depths are inside the bar on the fixtures")
+    check("selftest PASS: 4 depths reproduce the recorded 8x64 window" in r16.stdout,
+          "the tool's own known-answer check passes on them")
+else:
+    check(False, f"tests/fixtures/mtp_clause55 is incomplete: {CL}")
+
+# 16. the tool's own refusals, and (no logs) nothing else: this is what runs on a box without the ticket corpus.
 r = subprocess.run([sys.executable, TOOL, "--selftest"], capture_output=True, text=True)
 check(r.returncode == 0 and "selftest PASS tail repeat" in r.stdout, "the tool's refusal self-test passes")
 

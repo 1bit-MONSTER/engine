@@ -26,8 +26,10 @@
  * The known kinds are checked at the same time so a future edit to the string matching (which uses strstr for
  * "sliding" and "linear", the spellings every container on this box uses) cannot pass this test by matching nothing.
  */
+#define _POSIX_C_SOURCE 200809L  /* mkdtemp */
 #include "q4nx_semantics.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,10 +46,13 @@ static void check(int ok, const char* what) {
     }
 }
 
-/* Write <dir>/config.json holding exactly `json`; returns the path in `out`. */
+/* Write <dir>/config.json holding exactly `json`; returns the path in `out`. 0600, same as
+ * open_private() in npu_forward_loader_test.c: mkdtemp already gives 0700, but the file's own mode is what CodeQL
+ * cpp/world-writable-file-creation reads. */
 static void write_config(const char* dir, const char* json, char* out, size_t out_sz) {
     snprintf(out, out_sz, "%s/config.json", dir);
-    FILE* f = fopen(out, "w");
+    int fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    FILE* f = fd >= 0 ? fdopen(fd, "w") : NULL;
     if (!f) { printf("FAIL cannot write %s\n", out); failures++; return; }
     fputs(json, f);
     fclose(f);

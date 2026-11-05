@@ -1423,14 +1423,14 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         r.prefill_tail_seen = there;
                         r.final_norm_crosscheck =
                             there && std::memcmp(at(pf, ptail + kNormOff, H * 2), v, size_t(H * 2)) == 0;
-                        // The cross-check compares two copies the VENDOR ships; the one that matters is the
+                        // The cross-check compares the two copies a pack can ship; the one that matters is the
                         // Token_Token tail, because that is the program this importer reads the norm for and
                         // the one the device runs. So a mismatch is REPORTED, not fatal: refusing the import
                         // over a duplicated copy would make an otherwise complete pack unimportable for a
-                        // vendor-side inconsistency we cannot repair. (Measured on this box: the 0.5B pack's
-                        // prefill .fconst, rewritten 2026-11-03 15:10, differs from its Token copy in exactly
-                        // one bf16 of model.norm.weight -- index 895, 9.375 vs -0.1465 -- and every other one
-                        // of the 896 matches; the container is unaffected because the norm comes from Token.)
+                        // divergence we cannot repair, and the container is unaffected because the norm comes
+                        // from Token. (The shipped packs agree byte for byte here -- Qwen2.5-0.5B, Qwen3-1.7B,
+                        // Qwen3-4B and Llama-3.2-1B all report "identical in both .fconst tails" -- so this
+                        // guards against a divergent duplicate rather than describing the packs.)
                         if (!there)
                             std::fprintf(stderr,
                                          "1bit npu-pack: note: the prefill .fconst has no readable tail envelope at "

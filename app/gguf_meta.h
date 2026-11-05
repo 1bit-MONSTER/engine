@@ -25,9 +25,10 @@ namespace onebit {
 // Skipped bytes are read through (ignore), not seeked over: a seek drops the stream's buffer, and
 // a tokenizer's 150K strings then cost a read and an lseek each.
 
-// general.architecture from a GGUF's header, or "" when the file is not a GGUF or has none.
-// Reads only the key/value section (GGUF v2/v3, little endian); the tensors are never touched.
-inline std::string gguf_architecture(const std::string& path) {
+// The string value of metadata key `key` in a GGUF's header, or "" when the file is not a GGUF, lacks
+// the key, or stores something else under it. Reads only the key/value section (GGUF v2/v3, little
+// endian); the tensors are never touched.
+inline std::string gguf_string_meta(const std::string& path, const std::string& key) {
     std::ifstream f(path, std::ios::binary);
     auto rd = [&](void* p, size_t n) { return static_cast<bool>(f.read(static_cast<char*>(p), n)); };
     uint32_t magic = 0, version = 0;
@@ -48,13 +49,14 @@ inline std::string gguf_architecture(const std::string& path) {
         return t < 13 ? size[t] : -1;
     };
     for (uint64_t i = 0; i < n_kv && i < 4096; ++i) {
-        std::string key;
+        std::string k;
         uint32_t type = 0;
-        if (!str(&key) || !rd(&type, 4)) return "";
+        if (!str(&k) || !rd(&type, 4)) return "";
+        const bool want = k == key;
         if (type == 8) {  // string
             std::string v;
-            if (!str(key == "general.architecture" ? &v : nullptr)) return "";
-            if (key == "general.architecture") return v;
+            if (!str(want ? &v : nullptr)) return "";
+            if (want) return v;
         } else if (type == 9) {  // array: element type, count, elements
             uint32_t et = 0;
             uint64_t n = 0;
@@ -75,6 +77,11 @@ inline std::string gguf_architecture(const std::string& path) {
         if (!f) return "";
     }
     return "";
+}
+
+// general.architecture from a GGUF's header, or "" when the file is not a GGUF or has none.
+inline std::string gguf_architecture(const std::string& path) {
+    return gguf_string_meta(path, "general.architecture");
 }
 
 // True when every key in `wanted` appears in the file's metadata section (GGUF v2/v3, little

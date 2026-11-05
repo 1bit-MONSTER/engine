@@ -109,6 +109,13 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/pm_experts_default.h
      "// generated from config/pm-experts.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultPmExpertsJson[] = R\"ONEBITPM(${ONEBIT_PM_EXPERTS_JSON})ONEBITPM\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/pm-experts.json)
+# config/template-pins.json (the chat-template sha256 expected per model, docs/serve.md "Chat template") is
+# compiled in the same way; `serve --template-pin FILE` replaces it, `--no-template-pin` drops it.
+file(READ ${CMAKE_SOURCE_DIR}/config/template-pins.json ONEBIT_TEMPLATE_PINS_JSON)
+file(WRITE ${CMAKE_BINARY_DIR}/generated/template_pins_default.h
+     "// generated from config/template-pins.json by CMakeLists.txt\n#pragma once\n"
+     "static const char kDefaultTemplatePinsJson[] = R\"ONEBITTEMPLATE(${ONEBIT_TEMPLATE_PINS_JSON})ONEBITTEMPLATE\";\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/template-pins.json)
 target_include_directories(onebit PRIVATE ${CMAKE_BINARY_DIR}/generated)
 # The GGUF architectures the pinned llama.cpp fork builds a model for (registry/architectures.json,
 # gguf_architectures.hrx, from tools/registry_build.py): serve refuses any other on hrx and cpu.
@@ -152,6 +159,7 @@ add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
+add_test(NAME template_pin COMMAND ${CMAKE_SOURCE_DIR}/tests/template_pin.sh $<TARGET_FILE:onebit>)
 add_test(NAME greedy_shortcut COMMAND ${CMAKE_SOURCE_DIR}/tests/greedy_shortcut.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)
 # where --device npu finds the GGUF repack script: beside 1bit in a package (scripts/package-linux.sh),

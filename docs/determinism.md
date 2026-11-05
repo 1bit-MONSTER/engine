@@ -417,6 +417,10 @@ python3 tools/batched_repeat.py --url http://127.0.0.1:18110 --width 4 --rounds 
     --json batched-w4.json
 ```
 
+Start that serve with `--parallel N` matching `--width N` — the second column of every table in this
+section, and how each row was taken. A mismatch is not a measurement this page has: the one mismatch case
+it does have is the `--width 1` control below, where the slot count makes no difference to the answer.
+
 `--width 1` against a serve started with any `--parallel` is the control: it must be repeatable and it
 must produce the same fingerprint whatever the slot count, which is what shows the state is the batch
 content and not the configuration. Point it at an `hrx` serve under the GPU claim for the right-hand

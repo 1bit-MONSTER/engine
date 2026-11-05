@@ -195,6 +195,38 @@ Three properties the condition keeps:
   is **absent from the shipped table** and the gate row asserts the HRX landing only; when it ships, the rule gains a
   warm-up guard (no fallback in the first minute after boot, when the thermal guard itself is still settling).
 
+### The table in the binary: `1bit laya-first`
+
+`config/laya-first.json` ships compiled into the engine (like `config/recipes.json`), and
+`1bit laya-first` validates it and prints the `collection.router` policy it desugars into:
+
+```sh
+1bit laya-first --check                 # 4 classes, default Qwen3-0.6B-1bit
+1bit laya-first --policy laya-first.collection.json
+```
+
+```json
+{"version": "1", "model_name": "1bit.Laya-First", "recipe": "collection.router",
+ "components": ["Qwen3-0.6B-1bit", "ZAYA1-8B-1bit", ...],
+ "routing": {"candidates": [...], "default_model": "Qwen3-0.6B-1bit",
+   "classifiers": [{"id": "laya", "type": "laya",
+                    "labels": ["short", "prose", "code", "long_doc"]}],
+   "rules": [{"id": "laya-code", "match": {"classifier": "laya", "label": "code", "min_score": 0.0},
+              "route_to": "Qwen3-Coder-30B-A3B-Instruct-1bit"}, ...]}}
+```
+
+Two details are load-bearing rather than cosmetic. **`min_score: 0.0` on every class rule**: Laya's
+calibrated confidence for `code` is about 0.44, so the classifier band's default floor of 0.5 would drop
+exactly the decisions this table exists to route — confidence stays in the trace, and an unroutable
+request falls open to `default_model` because the rule did not match, not because the band rejected it.
+**Labels on the classifier entry**: declaring the four classes is what makes a typo in a rule's `label` a
+parse error in Lemonade instead of a rule that silently never matches.
+
+`tests/laya_first.sh` pins the desugaring (19 checks, including byte equality with
+`tests/laya_first_policy.json`), refuses a table with a device typo or a missing class by name, and — when
+a Lemonade checkout is reachable — validates the emitted policy against that repo's
+`route_policy.schema.json`, because the policy is for Lemonade and its schema is the contract.
+
 ## 5. Cold start
 
 Timeline of the first request on a box where nothing is downloaded, with the costs above and those of the model itself:

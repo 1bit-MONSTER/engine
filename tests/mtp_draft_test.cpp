@@ -28,6 +28,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <cstring>
 #include <vector>
 
@@ -51,10 +52,18 @@ public:
     int hidden_size() const override { return HD; }
     int max_batch_rows() const override { return batch_rows_; }
 
+    // Opt-in recurrent state: the GDN layer's slip from the original position-only bookkeeping.  A batched pass
+    // computes each row's state WITHOUT applying it and commit_verify() applies exactly the accepted prefix -- the
+    // deferred-commit contract of npu/mtp/draft.h -- so a commit that keeps the wrong rows leaves a state that
+    // disagrees with plain decode.  Off by default: [1]-[13] pin shapes that assume the position-only double.
+    void use_recurrence(bool on) { recurrent_ = on; }
+    double state() const { return st_; }
+
     bool step(int token, int pos, std::vector<float>& logits) override {
         if (pos != consumed_) { bad_pos_++; return false; }   // the loop must never skip a position
         consumed_++;
         steps_++;
+        st_ = mix(st_, token, pos);
         logits.assign((size_t)V, 0.0f);
         fill_logits(pos, logits, 0);
         hidden_.assign(HD, (float)consumed_);                 // the head reads the position from here
@@ -78,6 +87,10 @@ public:
         // after a batch" would have read a stale value from the last single step (found 2026-11-05 while pricing a
         // folded draft loop, which has no plain step and therefore no other hidden source).
         hidden_.assign(HD, rows_.back());
+        // provisional, not applied: commit_verify() decides which rows the state ever sees
+        prov_.resize(tokens.size());
+        double s = st_;
+        for (size_t m = 0; m < tokens.size(); m++) { s = mix(s, tokens[m], start_pos + (int)m); prov_[m] = s; }
         consumed_ += (int)tokens.size();
         pending_ = (int)tokens.size();     // these rows are a verify batch until commit_verify() decides
         batches_++;
@@ -87,10 +100,16 @@ public:
     // Toy base: no GDN deferral, so committing a verify prefix is the position bookkeeping a pure-attention
     // model needs (drop the rejected rows).  It records the call so the test can check the loop commits
     // exactly the accepted count and never more.
+    // The other documented shape: the base keeps its whole batch buffer and commit_verify() only truncates the
+    // position bookkeeping.  Legal per BaseModel::last_hidden_rows(), and what a new target most naturally writes.
+    void keep_batch_rows(bool on) { keep_batch_rows_ = on; }
+
     bool commit_verify(int accepted) override {
         if (accepted < 0 || accepted > pending_) return false;
+        if (recurrent_ && accepted > 0 && (int)prov_.size() >= accepted) st_ = prov_[(size_t)accepted - 1];
         consumed_ = consumed_ - pending_ + accepted;
-        rows_.resize((size_t)accepted);     // the accepted prefix only, as the engine's commit_verify_rows does now
+        if (!keep_batch_rows_)
+            rows_.resize((size_t)accepted);  // the accepted prefix only, as the engine's commit_verify_rows does now
         // ... and hidden_ is deliberately NOT touched here, because the engine does not touch it either:
         // commit_verify_rows() truncates last_hidden_rows_ to the accepted prefix and leaves last_hidden_ as the
         // FULL batch's last row.  So after a partial accept the two disagree by construction, and a reader of
@@ -125,7 +144,17 @@ private:
 
     int batch_rows_;
     int consumed_ = 0, steps_ = 0, batches_ = 0, commits_ = 0, last_commit_ = -1, pending_ = 0;
+    static double mix(double s, int tok, int pos) {
+        unsigned long long u = (unsigned long long)(s * 1e6) ^ ((unsigned long long)tok << 20) ^ (unsigned long long)pos;
+        u = u * 6364136223846793005ULL + 1442695040888963407ULL;
+        return (double)((u >> 11) % 1000000ULL) / 1000000.0;
+    }
+
     int bad_pos_ = 0, over_batch_ = 0;
+    bool keep_batch_rows_ = false;
+    bool recurrent_ = false;
+    double st_ = 0.0;
+    std::vector<double> prov_;
     std::vector<float> hidden_{0.0f};
     std::vector<float> rows_;
 };
@@ -186,6 +215,32 @@ public:
     }
 };
 
+// A head with a drawn accuracy: right at each depth with probability `acc`, and it stops chaining after its first
+// wrong proposal the way the real head's tau gate does.  Used only by the randomised sweep in [14], where the point
+// is that no hand-picked accept shape (all, none, prefix, gated) is special.
+class RandomHead : public DraftHead {
+public:
+    RandomHead(double acc, unsigned seed) : acc_(acc), rng_(seed) {}
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
+              std::vector<float>* conf = nullptr) override {
+        const int have = (int)hidden[0];
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        out.clear();
+        if (conf) conf->clear();
+        for (int i = 0; i < k; i++) {
+            const double r = u(rng_);
+            out.push_back(r < acc_ ? truth(have + i) : (truth(have + i) + 1 + (int)(r * 977.0)) % V);
+            if (conf) conf->push_back((float)(r < acc_ ? 0.99 : 0.05));
+            if (r >= acc_) break;                      // a wrong draft ends the chain, as a low-confidence one does
+        }
+        return (int)out.size();
+    }
+
+private:
+    double acc_;
+    std::mt19937 rng_;
+};
+
 bool same(const std::vector<int>& a, const std::vector<int>& b) { return a == b; }
 
 // ---- the drafter's own stream (MtpDrafter's cursor) ------------------------------------------------------------
@@ -215,6 +270,22 @@ public:
     }
     int cache_rows() const { return cache_.t; }
 
+    // Propose a wrong token now and then, so acceptance is partial: with full acceptance a whole-batch base returns
+    // exactly the accepted count and every slice of its rows looks identical, which is why the row handling could be
+    // broken in two different ways and stay green.
+    void set_flub(double p) { flub_ = p; }
+
+    // The hidden the loop handed over to be committed, in order.  Row i must be the row of the next stream position,
+    // so this sequence is 1,2,3,... when the cache IS the committed stream; a slice taken from the wrong place breaks
+    // the run of positions even though the row COUNT still matches.  Recorded here rather than in next_row(), because
+    // next_row() also writes the chain's provisional rows, which are not part of the stream.
+    const std::vector<int>& fed() const { return fed_; }
+
+    void commit_rows(const std::vector<int>& tokens, const std::vector<float>& hidden_rows, int M) override {
+        for (int m = 0; m < M && hidden_rows.size() > (size_t)m; m++) fed_.push_back((int)hidden_rows[(size_t)m]);
+        onebit::npu::mtp::MtpDrafter::commit_rows(tokens, hidden_rows, M);
+    }
+
 protected:
     bool next_row(const float* hidden, int, int pos, std::vector<float>& next, std::vector<float>& logits) override {
         const int rows = cache_.t + 1;                 // this row lands at index cache_.t
@@ -227,10 +298,16 @@ protected:
         const int pred = (int)hidden[0];
         const int t = truth(pred);
         (void)pos;
-        logits[(size_t)(rows == pred + 1 ? t : (t + 1) % V)] = 1.0f;   // right only if the stream is complete
+        const bool flub = flub_ > 0.0 && std::uniform_real_distribution<double>(0.0, 1.0)(rng_) < flub_;
+        logits[(size_t)(!flub && rows == pred + 1 ? t : (t + 1) % V)] = 1.0f;   // right only if the stream is complete
         next.assign(1, (float)(pred + 1));
         return true;
     }
+
+private:
+    double flub_ = 0.0;
+    std::mt19937 rng_{20261105u};
+    std::vector<int> fed_;
 };
 
 int fails = 0;
@@ -614,6 +691,109 @@ int main() {
               "budget: the base still consumed every emitted token (no position is skipped by the early stop)");
         std::printf("INFO budget: emitted %d, steps %d, batches %d, consumed %d for a prompt of %zu\n",
                     r.stats.emitted, m.steps(), m.batches(), m.consumed(), P.size());
+    }
+
+    // [13] both documented hidden-row shapes advance the drafter.  BaseModel::last_hidden_rows() documents M rows
+    // (the whole batch); Q4nxNpuForward truncates them to the accepted prefix in commit_verify_rows (#820).  The
+    // loop used to demand the second shape exactly, so a base that keeps its batch buffer -- the first shape, and
+    // the one the header's own wording describes -- failed the run outright with "base returned a partial batch
+    // hidden" on every partial accept, naming a partial buffer it had not received.  Found by randomising the
+    // loop's inputs (k, tau, budget, batch width, head accuracy) over a toy base that keeps its rows: 680 of 2000
+    // such cases aborted, while the same 2000 with the accepted-prefix shape all passed on text, state and
+    // position.  The drafter must also actually ADVANCE here, not just survive: an advance silently skipped is the
+    // same 1-token/pass drift in a new disguise.
+    {
+        ToyBase m(8);
+        m.keep_batch_rows(true);
+        StreamDrafter sd;
+        for (int i = 0; i < (int)P.size(); i++) sd.prime(std::vector<float>{(float)(i + 1)}, 0, i);
+        Options o = base_opt;
+        o.k = 4;
+        o.tau = 0.0f;
+        const Result r = onebit::npu::mtp::run(m, &sd, P, o);
+        check(r.ok, "whole-batch rows: the run completes instead of refusing the base's row buffer");
+        if (!r.ok) std::printf("INFO whole-batch rows: %s\n", r.err.c_str());
+        check(r.ok && same(r.tokens, ref.tokens), "whole-batch rows: text identical to plain decode");
+        check(r.ok && sd.cache_rows() == (int)P.size() + r.stats.emitted,
+              "whole-batch rows: the drafter's stream advanced over every committed row");
+        check(r.ok && sd.stream_mismatches() == 0, "whole-batch rows: no chain opened off the cursor");
+        std::printf("INFO whole-batch rows: stream %d rows, accepted %d/%d, passes/token %.3f\n", sd.cache_rows(),
+                    r.stats.accepted, r.stats.drafted, r.stats.passes_per_token());
+    }
+
+    // [14] the same properties over randomised inputs, because [1]-[13] are hand-picked shapes and the defects that
+    // survive them are the ones nobody chose.  600 deterministic cases over k, tau, budget, prompt, batch width,
+    // head accuracy and BOTH hidden-row shapes ([13]); every one must match plain decode, consume exactly
+    // prompt+emitted positions, never exceed max_batch_rows, and leave no verify rows uncommitted.
+    {
+        std::mt19937 rng(20261105u);
+        int cases = 0, bad = 0;
+        for (int it = 0; it < 600; it++) {
+            const int batch_rows = 1 + (int)(rng() % 6);
+            const int plen = 1 + (int)(rng() % 6);
+            std::vector<int> pr((size_t)plen);
+            for (auto& t : pr) t = (int)(rng() % (unsigned)V);
+            Options o;
+            o.k = (int)(rng() % 8);
+            o.max_tokens = 1 + (int)(rng() % 40);
+            o.tau = (it % 3 == 0) ? 0.0f : (it % 3 == 1 ? 0.6f : 0.95f);
+            const double acc = (double)(rng() % 101) / 100.0;
+            RandomHead h(acc, rng());
+            ToyBase m(batch_rows);
+            m.keep_batch_rows(it % 2 == 1);
+            m.use_recurrence(true);
+            ToyBase plain_m(batch_rows);
+            plain_m.use_recurrence(true);
+            const Result live = onebit::npu::mtp::run(m, &h, pr, o);
+            const Result plain = onebit::npu::mtp::run_plain(plain_m, pr, o);
+            cases++;
+            const bool ok = live.ok && same(live.tokens, plain.tokens) &&
+                            (int)live.tokens.size() == o.max_tokens && m.bad_pos() == 0 &&
+                            m.consumed() == plen + (int)live.tokens.size() && m.over_batch() == 0 && m.pending() == 0 &&
+                            // the deferred commit applied exactly the accepted rows: same state plain decode reaches
+                            std::abs(m.state() - plain_m.state()) < 1e-12;
+            if (!ok && ++bad <= 3)
+                std::printf("INFO sweep case %d: k=%d tau=%.2f budget=%d plen=%d rows=%d full_rows=%d acc=%.2f err=%s\n",
+                            it, o.k, (double)o.tau, o.max_tokens, plen, batch_rows, (int)(it % 2 == 1), acc,
+                            live.err.c_str());
+        }
+        check(bad == 0, "randomised: 600 cases keep text, position, batch width and deferred-commit state invariants");
+        std::printf("INFO randomised: %d cases, %d violated an invariant\n", cases, bad);
+    }
+
+    // [15] the drafter advances over the ACCEPTED PREFIX of the base's rows -- not over the whole batch, and not over
+    // its tail.  Both were invisible until now: [13] runs the whole-batch shape with a perfect drafter, so accepted ==
+    // nd and every slice looks identical, and [14]'s head has no rows to inspect.  Measured, with partial acceptance
+    // forced here: `head->commit_rows(accepted, rows, (int)got)` (advance over every row) and handing it
+    // `rows.end() - take*h` (the last rows instead of the prefix) both left the whole suite green before this check.
+    {
+        ToyBase m(8);
+        m.keep_batch_rows(true);      // the shape whose rows need slicing: the base keeps the whole batch
+        m.use_recurrence(true);
+        StreamDrafter sd;
+        sd.set_flub(0.4);             // wrong at depth 2-3 often enough that acceptance is partial
+        for (int i = 0; i < (int)P.size(); i++) sd.prime(std::vector<float>{(float)(i + 1)}, 0, i);
+        Options o = base_opt;          // the same budget as `ref`, so the two texts are comparable
+        o.k = 4;
+        o.tau = 0.0f;
+        const Result r = onebit::npu::mtp::run(m, &sd, P, o);
+        check(r.ok, "prefix rows: the run completes with partial acceptance on the whole-batch shape");
+        if (!r.ok) std::printf("INFO prefix rows: %s\n", r.err.c_str());
+        check(r.ok && same(r.tokens, ref.tokens), "prefix rows: text identical to plain decode");
+        check(r.ok && r.stats.accepted < r.stats.drafted,
+              "prefix rows: acceptance really is partial (otherwise this case proves nothing)");
+        check(r.ok && sd.cache_rows() == (int)P.size() + r.stats.emitted,
+              "prefix rows: the drafter's stream advanced over the committed rows only");
+        const std::vector<int>& fed = sd.fed();
+        // Strictly consecutive is the shape-agnostic test: the loop commits the accepted prefix, then one more token
+        // per iteration, so consecutive commits are consecutive positions.  A wrong count or a wrong slice breaks it.
+        bool consecutive = !fed.empty();
+        for (size_t i = 1; consecutive && i < fed.size(); i++) consecutive = fed[i] == fed[i - 1] + 1;
+        check(consecutive,
+              "prefix rows: every row the drafter committed is the next stream position (no gap, no reject)");
+        check(r.ok && sd.stream_mismatches() == 0, "prefix rows: no chain opened off the cursor");
+        std::printf("INFO prefix rows: stream %d rows, committed %zu, accepted %d/%d\n", sd.cache_rows(), fed.size(),
+                    r.stats.accepted, r.stats.drafted);
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

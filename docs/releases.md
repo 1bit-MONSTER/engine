@@ -450,7 +450,7 @@ rehearsal found these only after the build) and stops with a message naming what
 | PR | check beyond build + ctest |
 |---|---|
 | `bump-lemonade/*` | Lemonade's LLM suite through the onebit recipe on HRX ([lemonade.md](lemonade.md)) |
-| `bump-laya/*` | `tests/laya_route_e2e.sh` on the pinned checkpoint |
+| `bump-laya/*` | `tests/laya_route_e2e.sh` and `tests/laya_route_serve.sh` on the pinned checkpoint |
 | `bump-hrx/*` | every `hrx` row of `registry/check_models.tsv` through `tools/registry_check.py` (serve end to end per architecture, ZAYA1 and the Qwen MoE models included); any FAIL holds the bump |
 | `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device); the xdna-driver pin is the `amdxdna` kernel driver, which the release does not build: check it on Strix Halo with the module loaded ([npu.md](npu.md), "The XDNA driver") |
 

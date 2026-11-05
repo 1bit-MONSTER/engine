@@ -150,6 +150,43 @@ def main():
         assert bench.device_stack()["hsa_runtime"] is None, bench.device_stack()
     os.environ.pop("IREE_HAL_AMDGPU_LIBHSA_PATH")
 
+    # And the conditions it ran in: a score is measured on a shared box, and on 2026-11-01 the same
+    # workload at the same configuration produced 44.69 (quiet die, no swap) and 31.68 (85 GB of 122 GB
+    # in use, 37 GB of swap, die climbing) — both gate-passing, and the JSONs could not tell them apart.
+    # Read from this box rather than stubbed: these are the files the field reads, and every one of them
+    # has to come back a number here. Absent is a null, never a zero or a guess, so the fake root check
+    # below stands in for a box that exposes nothing.
+    box = bench.box_conditions()
+    assert box["tctl_c"] is None or 20.0 < box["tctl_c"] < 120.0, box
+    assert box["gtt_used_gib"] is not None and box["gtt_total_gib"] is not None, box
+    assert 0.0 <= box["gtt_used_gib"] <= box["gtt_total_gib"], box
+    assert box["mem_available_gib"] is not None and box["mem_available_gib"] > 0, box
+    # The hwmon channel is found by label, not by a hardcoded index: the k10temp Tctl has come back as
+    # hwmon2 and as hwmon4 across six reboots in three days. A root with no Tctl label yields null.
+    real_root = bench.HWMON_ROOT
+    with tempfile.TemporaryDirectory() as tmp:
+        bench.HWMON_ROOT = pathlib.Path(tmp)
+        assert bench.die_temp_c() is None, bench.die_temp_c()
+        (pathlib.Path(tmp) / "hwmon7").mkdir()
+        (pathlib.Path(tmp) / "hwmon7/temp1_label").write_text("edge\n", encoding="ascii")
+        (pathlib.Path(tmp) / "hwmon7/temp1_input").write_text("99000\n", encoding="ascii")
+        assert bench.die_temp_c() is None  # a different sensor is not the die
+        (pathlib.Path(tmp) / "hwmon7/temp1_label").write_text("Tctl\n", encoding="ascii")
+        assert bench.die_temp_c() == 99.0, bench.die_temp_c()
+        bench.HWMON_ROOT = real_root
+    # Same class, other direction: a counter the box does not expose is null, not 0.
+    assert bench.meminfo_gib(pathlib.Path("/nonexistent/mem_info_gtt_used"), 2 ** 30) is None
+    # The arm's own spread, not just its start: the aborted 2026-11-01 arm was claimed at 54 C and hit
+    # 93 C inside the run, so the summary keeps both ends and says how many samples it saw.
+    samples = [{"tctl_c": 54.0, "gtt_used_gib": 1.0, "gtt_total_gib": 120.0, "mem_available_gib": 9.0},
+               {"tctl_c": 93.0, "gtt_used_gib": 1.5, "gtt_total_gib": 120.0, "mem_available_gib": 8.0},
+               {"tctl_c": None, "gtt_used_gib": 2.0, "gtt_total_gib": 120.0, "mem_available_gib": 7.0}]
+    got = bench.box_summary(samples)
+    assert got["tctl_c"] == 54.0 and got["tctl_c_max"] == 93.0 and got["tctl_c_min"] == 54.0, got
+    assert got["tctl_samples"] == 2, got  # the unreadable sample counts as nothing, not as 0 C
+    assert got["gtt_used_gib"] == 1.0, got  # start GTT, not the last one
+    assert bench.box_summary([]) is None
+
     # And the verdict has to name what it was relative to: `HL_STATE` is per-box and the base logits are
     # regenerated when missing, so a KLD number reads PASS against a reference the JSON never named.
     with tempfile.TemporaryDirectory() as tmp:
@@ -243,6 +280,47 @@ def main():
         # A different file under the same name is a different model, which is the point.
         model.write_bytes(b"GGUF" + b"\0" * 4095)
         assert bench.model_identity(model)["sha256"] != ident["sha256"]
+
+    # The artifact has to say whether the decode it scored *drafted*, because on this pin it drafts with
+    # the model's own MTP head unless told not to, and the cap is worth ~18 % of 18.8k decode (~25 % of
+    # tg128). The lines below are verbatim from the arm that exposed this (2026-11-04 22:39, 27B
+    # UD-Q4_K_XL at 20,480 ctx): `drafting` was `{}` while serve.log reported drafting.
+    with tempfile.TemporaryDirectory() as tmp:
+        log = pathlib.Path(tmp) / "serve.log"
+        log.write_text(
+            "1bit serve: /m/model.gguf carries its own MTP head: drafting with it (--spec-type draft-mtp;"
+            " --no-mtp or ONEBIT_NO_MTP=1 turns it off)\n"
+            "1bit serve: recipe qwen35-mtp-max-3: --spec-draft-n-max 3\n"
+            "0.40.550.563 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (    5 accepted"
+            " /     5 generated), mean len =  3.50\n"
+            "4.04.014.149 I slot print_timing: id  0 | task 532 | draft acceptance = 0.67460 (   85 accepted"
+            " /   126 generated), mean len =  3.02\n",
+            encoding="utf-8")
+        got = bench.drafting_observed(log)
+        assert got["spec_type"] == "draft-mtp", got
+        assert got["recipe"] == "qwen35-mtp-max-3", got
+        assert got["recipe_args"] == "--spec-draft-n-max 3", got
+        assert got["tasks_reporting"] == 2, got
+        assert got["accept_rate_last"] == 0.67460 and got["mean_acc_len_last"] == 3.02, got
+        assert (got["accepted_last"], got["generated_last"]) == (85, 126), got
+        assert got["mean_acc_len_max"] == 3.50, got
+        # A log with no drafting at all reports nothing rather than an empty object that reads as "off".
+        silent = pathlib.Path(tmp) / "silent.log"
+        silent.write_text("I slot print_timing: id 0 | task 1 | eval time\n", encoding="utf-8")
+        assert bench.drafting_observed(silent) is None, bench.drafting_observed(silent)
+        assert bench.drafting_observed(pathlib.Path(tmp) / "missing.log") is None
+    # ...and "no lever was set" must not look like "no drafting": unset keeps serve's own MTP default,
+    # while HL_MTP_MAX=0 is an explicitly non-drafting measurement. Both used to serialise as {}.
+    for k in ("HL_DFLASH", "HL_DFLASH_GGUF", "HL_MTP_HEAD", "HL_MTP_MAX"):
+        os.environ.pop(k, None)
+    ident = bench.drafting_summary(pathlib.Path("/nonexistent/serve.log"))
+    assert ident["requested"] is None and "requested_note" in ident, ident
+    assert ident["serve"] is None, ident
+    os.environ["HL_MTP_MAX"] = "0"
+    ident = bench.drafting_summary(pathlib.Path("/nonexistent/serve.log"))
+    assert ident["requested"] == {"HL_MTP_MAX": "0"}, ident
+    assert "requested_note" not in ident, ident
+    os.environ.pop("HL_MTP_MAX", None)
 
     print("hyperloom_benchmark_test: OK")
     return 0

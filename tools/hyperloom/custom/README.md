@@ -127,6 +127,16 @@ same KLD mean can read `PASS` against a reference the report never named. At 1e-
 legitimately changes rounding (KV cache types, flash-attn, micro-batch) will usually fail the KLD half — that is
 the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 
+Every result also records the conditions it was measured in, in `bench_summary.box`: the die temperature
+(`tctl_c`, found by the hwmon channel's `Tctl` label, since the index moves between boots) with `tctl_c_min` /
+`tctl_c_max` over samples taken at each phase boundary and `tctl_samples` saying how many were readable, the
+box-wide GTT in use at start (`gtt_used_gib` of `gtt_total_gib`) and `mem_available_gib` at start. The score is
+measured on a shared box: the same configuration produced 44.69 with a quiet die and 31.68 with 85 GB in use
+and 37 GB of swap, and both passed the gate, which is about the output and not about comparability. Each field
+is `null` where the box does not expose it, so an unreadable sensor is never read back as a clean arm. An arm
+killed mid-run (the 2026-11-01 thermal abort at 93 C) still writes no result — the fields describe arms that
+finished, and a killed arm is reported by its absence.
+
 ## Levers
 
 `levers.json` seeds EXPLORE; the model can still propose its own. Each entry sets environment that
@@ -137,7 +147,7 @@ the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 | `HL_B`, `HL_UB` | `-b`, `-ub` | batch / micro-batch. `llama-bench` and the KLD leg only: `1bit serve` has its own parser and rejects them (`unknown option -ub`), setting batching per route itself. |
 | `HL_FA` | `-fa on\|off\|auto` | flash attention, on both legs. `off` reaches serve and then fails at decode (`decode() failed: Compute error`, HTTP 500) on this pin — a real finding, reported as a rejected candidate. |
 | `HL_CTK`, `HL_CTV` | `-ctk`, `-ctv` | KV cache types (`f16`, `q8_0`, ...), `llama-bench`/KLD only (serve has no such flag). A quantized cache implies `-fa on`: without it the bench dies in `graph_compute ... error -1`. |
-| `HL_MTP_MAX` | `--no-mtp` / `--mtp-max N` | A GGUF with its own MTP head drafts **by default** on HRX (`1bit serve` reports it); `0` turns drafting off, `N` caps the draft length, unset keeps serve's default (draft length 3 via its recipe). `HL_MTP_HEAD` names an external head instead. |
+| `HL_MTP_MAX` | `--no-mtp` / `--mtp-max N` | A GGUF with its own MTP head drafts **by default** on HRX (`1bit serve` reports it); `0` turns drafting off, `N` caps the draft length, unset keeps serve's default (draft length 3 via its recipe). `HL_MTP_HEAD` names an external head instead. Because the default *drafts*, `bench_summary.drafting.requested` is recorded explicitly — `null` means no lever was set and the pin's default applied, `{"HL_MTP_MAX": "0"}` means a deliberately non-drafting measurement — and `drafting.serve` carries what the server itself reported (`spec_type`, the draft `recipe`, and the accepted/generated counts with their mean accepted length). |
 | `HL_DFLASH`, `HL_DFLASH_GGUF` | `--dflash <drafter>` | block-diffusion drafter; exclusive with `--mtp`. `HL_DFLASH_GGUF` names the drafter file (default `dflash.gguf`, so relative to the run's cwd) and this model has two quants of it, so the arm's identity is the *pair*: `bench_summary.drafting` reports the resolved path and sha256 of the file the measurement really used, and of `HL_MTP_HEAD` when that is the head in use. Before that, a DFlash arm recorded `{"HL_DFLASH": "1"}` and the drafter was recoverable only from `serve.log`. |
 | `HL_PARALLEL` | `--parallel N` | HRX runs one gated-delta-net sequence at a time, so this is expected flat on Qwen3.8 |
 | `GGML_HRX_*` | environment only | the knobs `docs/hrx.md` names (`Q8_PREFILL_RELAX`, `GRAPH_PROGRAM_CACHE`, ...) |

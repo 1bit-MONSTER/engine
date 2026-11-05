@@ -342,7 +342,8 @@ because otherwise the second half reads from cache and the difference looks like
 **2.16 GB/s**, so 6.82 GB is **3.2 s** of device time the loader cannot avoid; with a warm page cache
 the same fill is 0.47 s. A first request on a fresh serve therefore costs one fill (0.5 s warm, ~3.2 s
 cold) on top of its prefill, and every request after it on the same serve costs none. Do not read a
-per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments.
+per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments, and
+`[bs]` is the same partition for one batched pass (a verify batch), whose interior a per-token line cannot see.
 
 ### From a GGUF
 
@@ -436,12 +437,15 @@ a kernel with the **expert ids held fixed** (A row + the router's own top-k + th
 expert, which is what `tools/moe_expert_chunks.py gate` emits), so the gate measures the kernel and
 not the model's own sensitivity. `verify` result: see the TMOE-NPU lane's state file.
 
-**A chunk-list dispatch shares ONE A across its chunks: exact for gate and up, impossible for down.**
-At batch 1 every selected expert of a layer sees the same activation row, so gate and up are one
-dispatch each — but `down_proj`'s input is each expert's own SwiGLU output, so it needs a per-chunk A
-or one dispatch per expert. On this model (48 layers; per layer q, gate, k, v, o in the pb16i split,
-then gate|up|down) that is **385 dispatches per token with the shared A and 721 without**, and that
-gap decides whether the case meets its own bar:
+**A chunk-list dispatch shares ONE A across its chunks: exact for gate and up, and reachable for down
+by row placement.** At batch 1 every selected expert of a layer sees the same activation row, so gate
+and up are one dispatch each. `down_proj`'s input is each expert's own SwiGLU output — but `A` is an
+`M`-row int8 buffer and the output is `M` rows per chunk, so with expert `j`'s row in row `j` of `A`
+(rows 8-15 zeroed) and `NCH=8`, chunk `j` carries that expert's answer in row `j`: a flag, not a new
+signature (the 10-BO dispatch and the `WIN = 3` per-channel ordering are unverified on the array).
+On this model (48 layers; per layer q, gate, k, v, o in the pb16i split, then gate|up|down) that is
+**385 dispatches per token**, against 721 if down cannot share one — and, two paragraphs down, the
+dispatch *rate* rather than the dispatch *shape* is what decides whether the case meets its own bar:
 
 | per-dispatch fixed cost | down shares one A | down per expert | Qwen3-4B dense, same arithmetic |
 |---|---|---|---|
@@ -451,10 +455,32 @@ gap decides whether the case meets its own bar:
 That is at 34 GB/s in-loop over a **1,703,854,080 B/token** stream — routed experts 1,019,215,872
 (8 of 128 x 3 projections, pb16 NW=16) + attention 509,607,936 + `lm_head` 175,030,272, with
 `--pad-n 1024` on gate/up taking it to 1,930,346,496 — and the ratio holds across 34-43.4 GB/s:
-**0.97-1.06x the 4B-dense bar when down shares the dispatch, 0.68-0.80x when it cannot.** So the
-deciding term is the down_proj A shape, not the expert stream: sizing a MoE case on the expert
-bytes alone understates the stream by 40 % (they are 60 % of it) and misses the term that decides
-it.
+**0.97-1.06x the 4B-dense bar when down shares the dispatch, 0.68-0.80x when it cannot.** So sizing
+a MoE case on the expert bytes alone understates the stream by 40 % (they are 60 % of it) and misses
+a term that matters — but it is not the term that decides the case. That is the dispatch *rate*:
+
+**Which submission path runs the loop decides the answer, and the bar pays the same term.** The
+0.086 ms in that table is a *marginal* cost inside one command list, measured on the arena player. An engine
+decode step submits one ELF per `npu_gemm`, and that per-invocation cost has since been measured on
+this box in the engine's own `npu/forward` route: the T1BP-ZYPHRA lane's device arm (M=16 family,
+112 launches/token, 95.0 % of the token spent waiting on the array) fits **2.8 / 3.7 / 5.91 ms** per
+invocation from three independent pairs (2026-11-04 20:1x-20:27). Pricing this model and the
+4B-dense bar on the *same* path — 385 and 253 dispatches/token, same 34 GB/s, same host terms:
+
+| per-dispatch fixed cost | this MoE | Qwen3-4B dense, same path | ratio |
+|---|---|---|---|
+| 0.086 ms (arena player) | **11.05 tok/s** | 10.45 | **1.06x** |
+| 2.8 ms (engine, driver-delta fit) | 0.88 | 1.28 | 0.69x |
+| 3.7 ms (engine, two-point fit) | 0.67 | 0.99 | 0.68x |
+| 5.91 ms (engine, launch-cost fit) | 0.43 | 0.64 | 0.67x |
+
+Setting the two expressions equal puts the **break-even at 0.126 ms per dispatch**: below it the MoE
+meets and beats the bar, above it it loses by ~1.45x and stays there, because 385 submissions against
+253 (1.52x) outweighs 1.70 GB against 2.26 GB of stream (1.33x). The engine's measured path is 22-47x
+over that threshold. So on the decode loop that exists today this case **misses** its own bar, and the
+lever is submission granularity — one command list per token instead of one per `npu_gemm` (engine#799)
+— not the chunk size (1.18-2.13 MB against the arena's 50 MB is a 1.3 % effect) and not a MoE-shaped
+ELF built for gate/up alone.
 
 The fixed cost above is measured, not assumed. Two runs of the same 50,135,040-B weight chunk in
 the arena's chunk-list design — 1.051 ms for one chunk, 2.016 ms for two — fit a marginal rate of
@@ -797,7 +823,19 @@ that runs the phase is private, like the kernels it runs.
   ChatML anchors. One that does not is refused on the chat route rather than prompted anyway (#963).
 - **Decoding:** greedy, with a 1.1 repetition penalty over the last 64 ids by default.
   `repetition_penalty` in the request overrides it, and 1 gives plain greedy.
-- **One request at a time:** the model has one KV cache.
+- **One request at a time:** the model has one KV cache, so a second request waits for the first generation to end,
+  and the two kinds of request wait differently (#1024):
+  - a **streamed** request waits up to `--queue-ms` (default 300000, a full generation) and sends an empty content
+    delta once a second while it queues, so a proxy's no-data timer does not read the queue as a hung backend
+    (`app/npu_queue.h`). Its 200 and SSE headers are already on the wire, so a wait past `--queue-ms` is answered
+    with an `data: {"error":…}` frame inside the stream (and `[DONE]`), not with a status;
+  - a **non-streamed** request cannot be told anything while it waits, so it keeps a short bound of its own,
+    `--queue-ms-plain` (default 5000), and past it answers `503 + Retry-After: 1` with `{"type":"device_busy"}`,
+    which a client can act on. Until then its client sees nothing at all, so that bound is also how long it can
+    appear to hang.
+  A queued request occupies one HTTP worker for the whole wait (the server installs no task queue), so a long streamed
+  queue is bounded by the worker pool — irrelevant for one user, but it is why `/health` must never take the device
+  lock (it does not).
 - **Repeatable:** every generation starts from a zeroed KV cache (#400), so identical greedy
   requests give identical text, whatever ran before them.
 
@@ -1045,6 +1083,31 @@ $ curl -sS localhost:8000/v1/systemone -H 'Content-Type: application/json' \
   "type":"choice"}},"model":"d3-lite","usage":{"input_tokens":96,"output_tokens":0}}
 ```
 
+### When a dispatch fails
+
+A token's work is one runlist of the model's layer runs. When the NPU runtime reports that one of those runs did not
+complete, `1bit unified` answers **the request that hit it** with an error frame and then exits non-zero — it does not
+keep serving on that hardware context:
+
+```
+{"error":{"message":"npu runtime: invalid call (code 614): state 8, run 0 of 28"}}
+```
+
+The code's category is its hundreds digit (`6xx`: a call made in the wrong state or on the wrong object) and `run N of
+M` is the index, inside the token's runlist, of the layer run that failed.
+
+Exiting is deliberate: after such a failure the context's own state is dead, and every later request on the same process
+fails the same way — measured on the c22 board, where the same backend answered 614 to every subsequent request while a
+fresh process answered normally on the same device. The supervisor (Lemonade's backend watchdog, a systemd unit, the OS
+menu's launcher) is the only one that can build a new context, so the engine hands it the problem instead of answering
+with something that looks like a result. A client sees **one failed request**, and the next one lands on a working
+backend.
+
+If a *fresh* backend also fails, the device is the thing to look at rather than the engine: the driver refuses new
+hardware contexts until `amdxdna` is reloaded, and says so in its own kernel message — restarting backends cannot fix it.
+`app/serve_watchdog.h`'s `npu_run_failed()` is the classifier for this (the runtime's failed-runlist message), and
+`tests/serve_watchdog_test.cpp` (ctest `serve_watchdog`, in CI) covers it without a device.
+
 ### Two streams on one NPU
 
 One process owns the NPU by default: it takes an exclusive `flock` on
@@ -1145,6 +1208,44 @@ last one to go.
 Qwen3-4B, whose kernel sets are on this box): each model solo, then both at once, three reps, every
 number stamped with the build that produced it.
 
+### When a load follows an evict
+
+On the appliance the NPU model is swapped by evicting it and starting a fresh `1bit` for the next
+one, and a load that starts *right* after an evict can fail at device / context creation while the
+previous backend's hardware context is still being torn down. Measured on the c22 board
+([engine#1010](https://github.com/1bit-MONSTER/engine/issues/1010)): two children exited 1 inside
+100 ms of starting, `POST /api/v1/load` answered 500, and the next request loaded the same model
+normally.
+
+That failure is transient by nature, so the NPU routes open with a **bounded retry**
+(`app/npu_load_retry.h`): up to 2.5 s, 150 ms doubling to a 500 ms cap, at most 12 attempts. Each
+attempt's reason goes to stderr — the line the appliance log never had — and a recovered start says
+so:
+
+```
+1bit unified: opening the private route's NPU context attempt 1 failed after 12 ms
+              (npu runtime: device error (code 102): No such device); retrying in 150 ms
+1bit unified: opening the private route's NPU context recovered on attempt 2 after 168 ms
+```
+
+A real failure is unchanged apart from being reported: the last attempt's exception still reaches the
+caller after the window closes, and the log now names the attempt count and the reason.
+
+One load failure is not transient and says so: the driver refusing to create a hardware context
+(`code 102`, `errc::ctx_create`) with `No such device` means the array is in the state a TDR leaves
+behind when it could not restart a context, and it keeps refusing until the driver is reloaded. The
+give-up report adds the one action that works:
+
+```
+1bit unified: the NPU array is refusing hardware contexts: reload the driver (modprobe -r amdxdna && modprobe amdxdna)
+```
+`tests/npu_load_retry_test.cpp` (ctest `npu_load_retry`, in CI) covers the schedule, the window, a
+transient recovery, a persistent failure, and a zero window (one attempt, no retry).
+
+Lemonade's half of the same race is its fixed 2 s wait after "waiting for GPU driver cleanup", which
+is a delay and not a readiness signal; that fix belongs to the appliance, this one keeps the engine
+from dying on a failure that clears in a few hundred milliseconds.
+
 ## Add-on routes
 
 The engine keeps a hook for closed-source NPU add-ons (`npu/private_route.h`). Qwen3.6-35B-A3B
@@ -1190,6 +1291,12 @@ The NPU needs the `amdxdna` kernel driver. `third_party/xdna-driver` pins upstre
 against (the kernel's own copy also works); nothing from the pin is built into or shipped with
 the release. `.github/workflows/bump-xdna.yml` moves the pin when run by hand, because a driver
 move means rebuilding the module on Strix Halo and checking the NPU there first.
+
+That pin is **pre-fix**, and the fixes are not upstream. The two patches every build of ours runs — the
+`bo_invalid_list` use-after-free at close (#971) and the array recovery after a TDR (#1005) — are carried in
+[`third_party/patches/amdxdna/`](../third_party/patches/amdxdna/README.md) with the build, sign, install and
+initramfs recipe, the `srcversion` each build must produce, and what a pin bump invalidates. A module built from the
+pin alone has neither defect fixed: it panics on that close path and it cannot bring the array back after a TDR.
 
 ### The MTP head (FastFlowLM's container -> ours)
 

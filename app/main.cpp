@@ -52,8 +52,10 @@ int onebit_ort_run_main(int argc, char** argv);
 #include "unified.h"
 #endif
 #ifdef ONEBIT_LAYA
+#include "laya_checkpoint.h"
 #include "policy.h"
 #include "route.h"
+#include "route_serve.h"
 #include "scorer.h"
 #endif
 #include "serve.h"
@@ -167,10 +169,11 @@ int run_npu(int argc, char** argv) {
 #ifdef ONEBIT_LAYA
 // One request in, one device out (RFC #186): Laya classifies the request (laya/route.h) and the
 // route policy (config/route-policy.json or --route-policy) picks among --devices. --classify
-// also prints the class and Laya's confidence.
+// also prints the class and Laya's confidence. --serve keeps the scorer resident and answers one
+// decision per stdin line (app/route_serve.cpp), which is the form the fork calls per request.
 int run_route(int argc, char** argv) {
     std::string laya_model, state, policy_path, devices_str = "npu,hrx,cpu";
-    bool classify = false;
+    bool classify = false, serve = false, json_out = false;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -182,26 +185,39 @@ int run_route(int argc, char** argv) {
         else if (a == "--devices") devices_str = next();
         else if (a == "--route-policy") policy_path = next();
         else if (a == "--classify") classify = true;
+        else if (a == "--json") json_out = true;
+        else if (a == "--serve") serve = true;
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: 1bit route --laya-model <dir> --state <text> [--devices npu,hrx,cpu]\n"
+            std::printf("usage: 1bit route [--laya-model <dir>] --state <text> [--devices npu,hrx,cpu]\n"
                         "                  [--route-policy FILE] [--classify]\n"
                         "  Laya classifies the request (code, prose, short, long_doc) and the route policy\n"
-                        "  picks one of the devices; --classify prints \"<class> <confidence> <device>\"\n");
+                        "  picks one of the devices; --classify prints \"<class> <confidence> <device>\"\n"
+                        "  and --json prints the same decision as one JSON line\n"
+                        "usage: 1bit route --serve [--laya-model <dir>] [--devices npu,hrx,cpu]\n"
+                        "                  [--route-policy FILE]\n"
+                        "  Resident: loads the scorer once, then reads one {\"state\": \"<text>\"} per line\n"
+                        "  on stdin and writes one {\"class\",\"confidence\",\"device\",\"decision_ms\"}\n"
+                        "  per line on stdout, after a first {\"ready\":true,\"load_ms\":N} line; EOF exits\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
     }
-    if (laya_model.empty()) throw std::runtime_error("--laya-model <dir> is required");
-    if (state.empty()) throw std::runtime_error("--state <text> is required");
+    if (!serve && state.empty()) throw std::runtime_error("--state <text> is required");
 
     std::vector<std::string> devices;
     std::string cur;
     for (std::istringstream ss(devices_str); std::getline(ss, cur, ',');)
         if (!cur.empty()) devices.push_back(cur);
     if (devices.empty()) throw std::runtime_error("--devices is empty");
+    if (serve) return onebit::run_route_serve(laya_model, devices, policy_path);
 
-    namespace fs = std::filesystem;
-    if (fs::exists(fs::path(laya_model) / "typed-decisions" / "model.safetensors"))
-        laya_model = (fs::path(laya_model) / "typed-decisions").string();
+    // One resolution chain for `serve --laya` and this command (app/laya_checkpoint.h), so the two
+    // cannot disagree about where the checkpoint is.
+    try {
+        laya_model = onebit::laya_checkpoint(laya_model);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "1bit route: %s\n", e.what());
+        return 1;
+    }
     const onebit::laya::RoutePolicy policy = onebit::laya::load_route_policy(policy_path);
     const auto t0 = std::chrono::steady_clock::now();
     onebit::laya::Scorer scorer;
@@ -217,9 +233,11 @@ int run_route(int argc, char** argv) {
     }
     const std::string device = policy.pick(cls.label, cls.confidence, devices);
     const auto t2 = std::chrono::steady_clock::now();
-    if (classify) std::printf("%s %.2f %s\n", cls.label.c_str(), cls.confidence, device.c_str());
-    else std::printf("%s\n", device.c_str());
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    if (json_out)
+        std::printf("%s\n", onebit::route_json_line(cls.label, cls.confidence, device, ms(t1, t2)).c_str());
+    else if (classify) std::printf("%s %.2f %s\n", cls.label.c_str(), cls.confidence, device.c_str());
+    else std::printf("%s\n", device.c_str());
     std::fprintf(stderr, "1bit route: scorer loaded in %.0f ms, decision in %.0f ms\n", ms(t0, t1), ms(t1, t2));
     return 0;
 }

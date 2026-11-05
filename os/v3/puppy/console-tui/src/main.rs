@@ -302,7 +302,8 @@ fn handle(
                 match yes {
                     Yes::ShowKey => {
                         let k = app.facts.key.clone().unwrap_or_default();
-                        let base = format!("http://{}:13305", app.facts.ip().unwrap_or("-"));
+                        let base =
+                            format!("http://{}:13305", app.facts.ip().unwrap_or("<address>"));
                         app.modal = Some(Modal::Info {
                             title: "Lemonade API key".into(),
                             body: vec![

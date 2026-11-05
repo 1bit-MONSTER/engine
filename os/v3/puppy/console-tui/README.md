@@ -22,7 +22,21 @@ binary, ratatui + crossterm, `x86_64-unknown-linux-musl`, no runtime dependency 
 Why it exists, in the owner's words: *"can we make that a tui instead of this style"* (the dialog-box console
 menu), then, on the cycle-18 board boot, *"when you first boot the headless there is no data to display on how to
 connect, just the menu"*. The first block on the screen is therefore **CONNECT**, and it is composed from live
-facts on every draw.
+facts on every draw. **Before DHCP there is no address**, so the block says the one true thing it can -
+`web UI: waiting for network`, with the row that says what to do (press 3) - instead of `http://-:13305`, which is
+what the first seconds of a boot used to show. The address rows come back with the lease.
+
+**The LEMONADE panel names the engine that is serving** - `engine: llamacpp (gpu)`, `engine: flm (npu)` - composed from
+what Lemonade reports (`recipe` in `/api/v1/models`, the device in `/api/v1/health`, falling back to the model's
+`recipe_options` backend). **Which model it names is the chat engine, not the first thing loaded**: Lemonade keeps one
+model per type in `all_models_loaded[]` (`max_models.llm = 1`), so the entry it types `llm` is the answer, with
+`model_loaded` ("most recently accessed", which an embedding request moves) only as the fallback when the type is not
+reported - `the_engine_is_the_model_answering_not_the_first_loaded`. No marketing map: if the box says `llamacpp`, the
+screen says `llamacpp`. At 80x25 the same sentence rides on the compact `LEMONADE` field, because a fact field of its
+own would push the status block to a third row and cost the log pane one (owner decision 2026-11-04 20:19, item 1;
+`the_console_says_which_engine_is_serving`). A hybrid value (`engine: ryzenai-llm (gpu npu)`, 83 columns with the rest
+of the field) re-wraps the facts block inside its existing two rows at 80x25 and costs the log pane nothing - measured,
+not assumed.
 
 ## The screen
 
@@ -64,6 +78,14 @@ then the log pane (a title needs a row under it), then the CONNECT block's own t
 ssh window at 80x18 still shows all nine actions and `Reboot / power off`; before this the menu itself was clipped
 and the footer went on promising "1-9 actions" (`a_short_window_keeps_the_nine_actions_and_the_footer_whole` sweeps
 ten sizes).
+
+**The same rule inside a dialog.** A confirmation box is `title | the question | the hint`, and the hint is the only
+row that says how to answer, so a frame too short for the whole box loses the question first, whole rows at a time,
+and then the title - never the hint. Before this the box was clamped to the frame and ratatui clipped its end: at
+40x11, 30x12 and 24x12 the key-confirm dialog drew no hint at all (`y mints one and restarts Lemonade, n cancels`),
+and at 40x12 half of one, while `y` still worked - for the reboot confirm that is `y reboots the box, n cancels`
+missing from the screen that is about to reboot
+(`the_modal_hint_is_never_the_row_that_goes` sweeps four dialogs at eight sizes).
 
 **When the frame is one row short of the menu itself** - 80x10, 56x11, 40x12, 30x16: a tmux split or an ssh window on
 a phone - the `MENU` rule goes before any action does. It is decoration, and it used to be charged first, so ratatui
@@ -131,7 +153,7 @@ Every number comes from where the rest of the image reads it - no second source 
 | panel | source |
 |---|---|
 | header | `/data/RELEASE-TAG` or `payload=` in `/etc/1bit/release-identity`, `/proc/sys/kernel/hostname`, `ip -4`, `/proc/uptime`, the `SecureBoot-*` efivar (the value byte is the fifth: efivarfs refuses partial reads, and a `dd skip=4` reads as "disabled" on a Secure Boot box) |
-| Lemonade | the process table, an actual TCP connect to 127.0.0.1:13305, `LEMONADE_API_KEY=` in `/etc/1bit/lemond.conf` |
+| Lemonade | the process table, an actual TCP connect to 127.0.0.1:13305, `LEMONADE_API_KEY=` in `/etc/1bit/lemond.conf`, and `/api/v1/health` for the loaded models and the engine (`all_models_loaded[]` `type`/`device`, `model_loaded`) |
 | GPU | `llama-server --list-devices`, i.e. the runtime's own answer, plus `/sys/class/drm/card*/device/mem_info_{vram,gtt}_{used,total}` and hwmon |
 | NPU | `/proc/modules` for `amdxdna`, `/lib/firmware/amdnpu`, `/dev/accel/*`, and Lemonade's health for busy/idle |
 | Models | `GET /api/v1/models` (downloaded only) and `GET /api/v1/health` (loaded) |
@@ -169,7 +191,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 47 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
+cargo test                                    # 52 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders, the engine row's model choice
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

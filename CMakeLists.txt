@@ -87,7 +87,7 @@ FetchContent_Declare(httplib
     GIT_TAG fe332fa06bac76a1c6d402c08f414052999347da)  # v0.47.0
 FetchContent_MakeAvailable(json httplib)
 
-add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp)
+add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/laya_checkpoint.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -212,10 +212,18 @@ add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
+# The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):
+# a load started right after an evict can hit the previous backend's hardware context still being torn down, which used
+# to be fatal on the first attempt. Header only, no device, no model.
+add_executable(npu_load_retry_test tests/npu_load_retry_test.cpp)
+target_include_directories(npu_load_retry_test PRIVATE app)
+add_test(NAME npu_load_retry COMMAND npu_load_retry_test)
+
 add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose target is
 # not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test serve_watchdog_test)
+add_dependencies(npu_sampling_test npu_load_retry_test)
 # The MTP draft loop (npu/mtp/draft.h): draft k tokens, verify them as one batch, keep the longest prefix
 # the base model agrees with, roll its state back.  Policy only -- a toy base model and toy draft heads stand
 # in for the forward and the MTP head, so the invariants (identical text whatever the head proposes, exact
@@ -495,6 +503,10 @@ endif()
 set(ONEBIT_LAYA_ROUTE_MODEL "" CACHE PATH "Laya checkpoint dir for the per-request routing e2e test")
 if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+    # `1bit route --serve`, the resident form the fork calls per request (docs/laya-first.md §8).
+    add_test(NAME laya_route_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+    # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
+    add_test(NAME laya_checkpoint COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_checkpoint.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
              ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)
@@ -595,6 +607,15 @@ add_test(NAME npu_chatml COMMAND npu_chatml_test ${CMAKE_SOURCE_DIR}/tests/data/
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_chatml_test)
 
+# `1bit unified`'s wait for the single NPU (app/npu_queue.h, engine#1024): bounded, and a queued request says so
+# instead of leaving a stream silent past the proxy's no-data timer. Device-free.
+add_executable(npu_queue_test tests/npu_queue_test.cpp)
+target_include_directories(npu_queue_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+add_test(NAME npu_queue COMMAND npu_queue_test)
+# Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
+# target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
+add_dependencies(npu_sampling_test npu_queue_test)
+
 # `forward-serve`'s /v1/completions prompt as text or as the caller's exact token ids (app/npu_prompt_ids.h):
 # the acceptance rules and the refusals that keep an out-of-vocabulary id from reaching the embedding
 # lookup.  Device-free, model-free.
@@ -605,6 +626,15 @@ add_test(NAME npu_prompt_ids COMMAND npu_prompt_ids_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_prompt_ids_test)
+
+# The ids that end a generation are a list, not an integer (app/npu_stop_tokens.h, engine#1044): a
+# Llama-3.2 container declares eos_token_id [128001, 128008, 128009] and forward-serve read that key as
+# one integer, so 128009 was served as text with finish_reason "length".
+add_executable(npu_stop_tokens_test tests/npu_stop_tokens_test.cpp)
+target_include_directories(npu_stop_tokens_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(npu_stop_tokens_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_stop_tokens COMMAND npu_stop_tokens_test)
+add_dependencies(npu_sampling_test npu_stop_tokens_test)
 
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
@@ -724,6 +754,14 @@ add_executable(npu_forward_loader_test tests/npu_forward_loader_test.c npu/forwa
 target_include_directories(npu_forward_loader_test PRIVATE npu/forward/include)
 target_link_libraries(npu_forward_loader_test PRIVATE m)
 add_test(NAME npu_forward_loader COMMAND npu_forward_loader_test)
+
+# rope_type "llama3" (npu/forward/include/q4nx_rope.h, engine#1048): the frequency band is fixed data.
+# Old code built theta^(-i/half) for every dim pair, and 17 of Llama-3.2-1B's 32 differ from that.
+add_executable(npu_rope_llama3_test tests/npu_rope_llama3_test.c)
+target_include_directories(npu_rope_llama3_test PRIVATE npu/forward/include)
+target_link_libraries(npu_rope_llama3_test PRIVATE m)
+add_test(NAME npu_rope_llama3 COMMAND npu_rope_llama3_test)
+add_dependencies(npu_sampling_test npu_rope_llama3_test)
 # The activation rotation a folded container needs (npu/forward/include/hadamard.h): its SIMD path must be
 # bit-identical to the shipped scalar loop on every shape a container carries, and the scalar loop must still
 # be the Hadamard transform.  Header only, no device, no model: runs in CI.
@@ -911,9 +949,27 @@ if(ONEBIT_NPU)
     target_link_libraries(mtp_batch_all_test PRIVATE onebit_npu_forward)
     add_dependencies(npu_sampling_test mtp_batch_all_test)
     add_test(NAME mtp_batch_all COMMAND mtp_batch_all_test)
+    # The batched GDN recurrence is head-major (one parallel region per layer, not per layer AND row); the engine
+    # asserts the two nestings agree bit for bit under NPU_GDN_CHECK=1, so this test enables it and makes the
+    # batched path run.  Host-GEMM, no device; skips (77) unless ONEBIT_TEST_Q4NX names a linear-attention
+    # container.
+    add_executable(gdn_batch_order_test tests/gdn_batch_order_test.cpp)
+    target_include_directories(gdn_batch_order_test PRIVATE npu/forward/include)
+    target_link_libraries(gdn_batch_order_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test gdn_batch_order_test)
+    add_test(NAME gdn_batch_order COMMAND gdn_batch_order_test)
     # The MTP drafter measured against the real base model (tools/mtp_acceptance.cpp): draft, verify through
     # step_batch_all(), commit the accepted prefix, repeat.  The head runs on the host in the pb16i-exact
     # arithmetic, the base on the exact route.  Needs the device, so it is a tool, not a ctest.
+    # Device-free harness for the batched GDN recurrence: why gdn_layer_batch holds one parallel region per layer
+    # instead of one per layer AND row.  Times today's nesting against the exchanged one (both through one body,
+    # bit-identity required before any timing is printed) so the region-count claim can be reproduced without the
+    # device: 2.06 ms/row idle, 252-301 with spinners, 16.8 vs 4.1 between the two nestings at equal contention.
+    add_executable(gdn_row_bench tools/gdn_row_bench.cpp)
+    find_package(OpenMP COMPONENTS CXX QUIET)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(gdn_row_bench PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     add_executable(mtp_acceptance tools/mtp_acceptance.cpp npu/mtp/mtp_head.cpp)
     target_include_directories(mtp_acceptance PRIVATE npu npu/forward/include)
     target_link_libraries(mtp_acceptance PRIVATE onebit_npu_forward)
@@ -922,6 +978,7 @@ if(ONEBIT_NPU)
         target_link_libraries(mtp_acceptance PRIVATE OpenMP::OpenMP_CXX)
     endif()
     set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(gdn_batch_order PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source
     # check, outside this repository (docs/npu.md, "Checking the NPU").

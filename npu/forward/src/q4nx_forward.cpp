@@ -188,6 +188,33 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
     return q4nx_dequant_tensor((const uint8_t*)data, nbytes, rows, cols, out);
 }
 
+// rope_type "llama3" (Llama-3.1/3.2/3.3) from config.json's rope_scaling: the frequency band that
+// transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
+// every other architecture builds exactly the table it built before.  Keys are searched with their
+// quotes, which is what keeps "factor" from matching inside "high_freq_factor".
+static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
+    Q4nxRopeLlama3 s{};
+    std::ifstream f(cfg_path);
+    if (!f) return s;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (!strstr(t.c_str(), "llama3")) return s;
+    auto num = [&t](const char* key, double def) -> double {
+        const char* p = strstr(t.c_str(), key);
+        if (!p) return def;
+        const char* c = strchr(p + strlen(key), ':');
+        if (!c) return def;
+        char* end = nullptr;
+        const double v = strtod(c + 1, &end);
+        return end == c + 1 ? def : v;
+    };
+    s.factor = num("\"factor\"", 0.0);
+    s.high_freq_factor = num("\"high_freq_factor\"", 0.0);
+    s.low_freq_factor = num("\"low_freq_factor\"", 0.0);
+    s.original_max_position = num("\"original_max_position_embeddings\"", 0.0);
+    s.on = s.factor > 0.0 && s.original_max_position > 0.0 && s.high_freq_factor > s.low_freq_factor;
+    return s;
+}
+
 // LongRoPE short_factor from config.json's rope_scaling (MiniCPM4): the
 // per-half-dim frequency multipliers.  Empty when the config declares none.
 // Ported from the engine route's npu/forward (commit 599ac77) so both copies of
@@ -516,6 +543,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         if (hd > 0) cfg.head_dim = hd;
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
+    rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
     embed_scale_ = read_config_float(cfg_path, "\"embedding_scale\"", 1.0f);
     residual_scale_ = read_config_float(cfg_path, "\"residual_scale\"", 1.0f);
     logit_scale_ = read_config_float(cfg_path, "\"logit_scale\"", 1.0f);
@@ -2364,11 +2392,23 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     const bool dump_gb = getenv("NPU_INFER_DUMP_LAYERS") != nullptr;
     const int rep = NVH / NKH;
     const float scale = 1.0f / sqrtf((float)KHD);
-    std::vector<float> co((size_t)CD), ah((size_t)NVH), bh((size_t)NVH);
-    std::vector<float> ql((size_t)NVH * KHD), kl((size_t)NVH * KHD), vv((size_t)NVH * VHD);
+    // ---- per-row preparation, then ONE parallel region for the whole layer ----
+    // The recurrence below used to sit inside the row loop, which opened one `#pragma omp parallel for` per
+    // (layer, row): 192 regions for an M=4 verify batch, 6144 for an M=128 prefill chunk.  A region is free when
+    // the box is idle and expensive when it is not -- measured on this box, the same recurrence went 2 ms/row
+    // idle to 252-301 ms/row with 8 background spinners, and region count alone (192 vs 48) was 16.8 vs 4.1
+    // ms/row at equal contention (bench: ~/briefs/mtploop-gdn-row-bench.cpp, arms A vs C, bit-identical).
+    // So the preparation stays row-major -- it carries conv_state_ and must stay in position order -- and the
+    // recurrence becomes head-major with the rows inside it, which preserves every element's per-row operation
+    // order.  NPU_GDN_CHECK=1 re-runs the old nesting through the same body and compares bit for bit.
+    std::vector<float> co((size_t)CD);
+    std::vector<float> AHS((size_t)M * NVH), BHS((size_t)M * NVH);
+    std::vector<float> QLS((size_t)M * NVH * KHD), KLS((size_t)M * NVH * KHD),
+        VVS((size_t)M * NVH * VHD);
+    std::vector<float> co_dump;   // NPU_INFER_DUMP_LAYERS only: keeps `co` per row for the [GB] line
+    if (dump_gb) co_dump.assign((size_t)M * CD, 0.0f);
     for (int m = 0; m < M; m++) {
         const float* qkv = QKV.data() + (size_t)m * CD;
-        const float* z = Z.data() + (size_t)m * VD;
         // depthwise causal conv1d (CK) + SiLU, state carried across positions
         float* st = conv_state_[l].data();
         for (int ch = 0; ch < CD; ch++) {
@@ -2392,110 +2432,159 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                 const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)hh * H;
                 float sa = 0, sb = 0;
                 for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
-                ah[(size_t)hh] = sa;
-                bh[(size_t)hh] = sb;
+                AHS[(size_t)m * NVH + hh] = sa;
+                BHS[(size_t)m * NVH + hh] = sb;
             }
         }
         if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l) {   // keep what a commit would need
             auto& rec = row_in_[(size_t)l][(size_t)m];
             rec.qkv.assign(qkv, qkv + CD);
-            rec.ah.assign(ah.begin(), ah.end());
-            rec.bh.assign(bh.begin(), bh.end());
+            rec.ah.assign(AHS.begin() + (size_t)m * NVH, AHS.begin() + (size_t)(m + 1) * NVH);
+            rec.bh.assign(BHS.begin() + (size_t)m * NVH, BHS.begin() + (size_t)(m + 1) * NVH);
         }
         // q/k L2-normalised with NVH/NKH head repetition; v per v-head
+        float* qlm = &QLS[(size_t)m * NVH * KHD];
+        float* klm = &KLS[(size_t)m * NVH * KHD];
+        float* vvm = &VVS[(size_t)m * NVH * VHD];
         for (int hh = 0; hh < NVH; hh++) {
             const int src = hh / rep;
-            for (int d = 0; d < KHD; d++) ql[(size_t)hh * KHD + d] = co[(size_t)src * KHD + d];
-            for (int d = 0; d < KHD; d++) kl[(size_t)hh * KHD + d] = co[KD + (size_t)src * KHD + d];
-            for (int d = 0; d < VHD; d++) vv[(size_t)hh * VHD + d] = co[2 * KD + (size_t)hh * VHD + d];
+            for (int d = 0; d < KHD; d++) qlm[(size_t)hh * KHD + d] = co[(size_t)src * KHD + d];
+            for (int d = 0; d < KHD; d++) klm[(size_t)hh * KHD + d] = co[KD + (size_t)src * KHD + d];
+            for (int d = 0; d < VHD; d++) vvm[(size_t)hh * VHD + d] = co[2 * KD + (size_t)hh * VHD + d];
         }
         for (int hh = 0; hh < NVH; hh++) {
             float sq = 0, sk = 0;
             for (int d = 0; d < KHD; d++) {
-                sq += ql[(size_t)hh * KHD + d] * ql[(size_t)hh * KHD + d];
-                sk += kl[(size_t)hh * KHD + d] * kl[(size_t)hh * KHD + d];
+                sq += qlm[(size_t)hh * KHD + d] * qlm[(size_t)hh * KHD + d];
+                sk += klm[(size_t)hh * KHD + d] * klm[(size_t)hh * KHD + d];
             }
             const float iq = 1.0f / sqrtf(sq + 1e-6f), ik = 1.0f / sqrtf(sk + 1e-6f);
             for (int d = 0; d < KHD; d++) {
-                ql[(size_t)hh * KHD + d] *= iq;
-                kl[(size_t)hh * KHD + d] *= ik;
+                qlm[(size_t)hh * KHD + d] *= iq;
+                klm[(size_t)hh * KHD + d] *= ik;
             }
         }
-        // recurrent gated delta rule + scale-free gated RMSNorm
-        // Heads are independent (disjoint rec_state_ rows, disjoint CORE rows), so this is the
-        // one loop in the GDN layer that parallelises: perf puts gdn_layer_batch at 76% of the
-        // host cycles and this state update at 2*KHD*VHD MACs per head.  kvm is per-head scratch.
-        float* rs = rec_state_[l].data();
-        // Never take the whole box.  The forward also needs a core for the array's submit thread and the serve
-        // needs one for HTTP, so 32 threads on 32 cores measured 25% SLOWER than 16 on a 149-token prefill and
-        // 24 was level with 16 (2026-11-04, same window, same binary).  OMP_NUM_THREADS still wins downward;
-        // this only stops the default from oversubscribing.
-        const int gdn_nt = omp_heads_threads();
-        {
+        if (dump_gb) std::copy(co.begin(), co.end(), co_dump.begin() + (size_t)m * CD);
+    }
+    // recurrent gated delta rule + scale-free gated RMSNorm.  One body for both nestings so that the check below
+    // compares the LOOPS and nothing else; the per-head operation order is identical in either nesting because
+    // rows are visited in order inside a head and heads own disjoint state rows and disjoint CORE slices.
+    auto head_row = [&](int hh, int m, float* sh, float* crow, float* sc) {
+        float* kvm = sc;
+        float* delta = kvm + VHD;
+        const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] *
+                              softplus_f(AHS[(size_t)m * NVH + hh] + gdn_small_[(size_t)l].dt[hh]));
+        const float beta = 1.0f / (1.0f + expf(-BHS[(size_t)m * NVH + hh]));
+        const float* kh = &KLS[((size_t)m * NVH + hh) * KHD];
+        const float* qh = &QLS[((size_t)m * NVH + hh) * KHD];
+        const float* vh = &VVS[((size_t)m * NVH + hh) * VHD];
+        const float* zv = Z.data() + (size_t)m * VD + (size_t)hh * VHD;
+#pragma omp simd
+        for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
+        // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
+        // gathering with stride VHD.  Each output element still accumulates over kd in increasing order, so
+        // the result is the same sequence of operations -- verified by the greedy text being byte-identical.
+        for (int vd = 0; vd < VHD; vd++) kvm[vd] = 0.0f;
+        for (int kd = 0; kd < KHD; kd++) {
+            const float k = kh[kd];
+            const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) kvm[vd] += srow[vd] * k;
+        }
+#pragma omp simd
+        for (int vd = 0; vd < VHD; vd++) delta[vd] = (vh[vd] - kvm[vd]) * beta;
+        for (int kd = 0; kd < KHD; kd++) {
+            const float k = kh[kd];
+            float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) srow[vd] += k * delta[vd];
+        }
+        float ss = 0;
+        for (int vd = 0; vd < VHD; vd++) crow[vd] = 0.0f;
+        for (int kd = 0; kd < KHD; kd++) {
+            const float q = qh[kd];
+            const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) crow[vd] += srow[vd] * q;
+        }
+        for (int vd = 0; vd < VHD; vd++) { crow[vd] *= scale; ss += crow[vd] * crow[vd]; }
+        const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
+        for (int vd = 0; vd < VHD; vd++) {
+            const float zz = zv[vd];
+            crow[vd] = crow[vd] * inv * gdn_small_[(size_t)l].norm[vd] * (zz / (1.0f + expf(-zz)));
+        }
+    };
+    // Never take the whole box.  The forward also needs a core for the array's submit thread and the serve
+    // needs one for HTTP, so 32 threads on 32 cores measured 25% SLOWER than 16 on a 149-token prefill and
+    // 24 was level with 16 (2026-11-04, same window, same binary).  OMP_NUM_THREADS still wins downward;
+    // this only stops the default from oversubscribing.
+    const int gdn_nt = omp_heads_threads();
+    float* rs = rec_state_[l].data();
+    const bool gdn_check = getenv("NPU_GDN_CHECK") != nullptr;
+    std::vector<float> core_ref;   // NPU_GDN_CHECK only
+    if (gdn_check) core_ref.assign(CORE.size(), 0.0f);
+    std::vector<float> state_pre;   // NPU_GDN_CHECK only: the state the old nesting must start from
+    if (gdn_check) state_pre = rec_state_[l];
+    {
         LhScope _t_core(LH_GDN_CORE);
-#pragma omp parallel for schedule(static) num_threads(gdn_nt)
-        for (int hh = 0; hh < NVH; hh++) {
-            // One scratch row for kvm and one for the delta, ONE allocation: this runs 48 heads x 48 layers x rows
-            // per token, and a per-head allocation inside a parallel region is the mistake that cost the mla
-            // attempt 2x on 2026-11-03.
+#pragma omp parallel num_threads(gdn_nt)
+        {
+            std::vector<float> scratch((size_t)2 * VHD);   // one allocation per thread, not per head
+            float* sc = scratch.data();
+#pragma omp for schedule(static)
+            for (int hh = 0; hh < NVH; hh++) {
+                float* sh = rs + (size_t)hh * KHD * VHD;
+                for (int m = 0; m < M; m++)   // rows in order: the state carries across them
+                    head_row(hh, m, sh, CORE.data() + (size_t)m * VD + (size_t)hh * VHD, sc);
+            }
+        }
+    }
+    if (gdn_check) {
+        // The old nesting, through the same body: one region per row.  Bit-exactness is the whole claim of this
+        // change, so it is asserted rather than argued -- the same form as NPU_REPLAY_CHECK in commit_verify_rows.
+        std::copy(state_pre.begin(), state_pre.end(), rec_state_[l].begin());
+#pragma omp parallel num_threads(gdn_nt)
+        {
             std::vector<float> scratch((size_t)2 * VHD);
-            float* kvm = scratch.data();
-            float* delta = kvm + VHD;
-            const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] * softplus_f(ah[(size_t)hh] + gdn_small_[(size_t)l].dt[hh]));
-            const float beta = 1.0f / (1.0f + expf(-bh[(size_t)hh]));
-            float* sh = rs + (size_t)hh * KHD * VHD;
-            const float* kh = &kl[(size_t)hh * KHD];
-            const float* qh = &ql[(size_t)hh * KHD];
-            const float* vh = &vv[(size_t)hh * VHD];
-#pragma omp simd
-            for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
-            // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
-            // gathering with stride VHD.  Each output element still accumulates over kd in increasing order, so
-            // the result is the same sequence of operations -- verified by the greedy text being byte-identical.
-            for (int vd = 0; vd < VHD; vd++) kvm[vd] = 0.0f;
-            for (int kd = 0; kd < KHD; kd++) {
-                const float k = kh[kd];
-                const float* srow = sh + (size_t)kd * VHD;
-#pragma omp simd
-                for (int vd = 0; vd < VHD; vd++) kvm[vd] += srow[vd] * k;
-            }
-#pragma omp simd
-            for (int vd = 0; vd < VHD; vd++) delta[vd] = (vh[vd] - kvm[vd]) * beta;
-            for (int kd = 0; kd < KHD; kd++) {
-                const float k = kh[kd];
-                float* srow = sh + (size_t)kd * VHD;
-#pragma omp simd
-                for (int vd = 0; vd < VHD; vd++) srow[vd] += k * delta[vd];
-            }
-            float ss = 0;
-            float* crow = CORE.data() + (size_t)m * VD + (size_t)hh * VHD;
-            for (int vd = 0; vd < VHD; vd++) crow[vd] = 0.0f;
-            for (int kd = 0; kd < KHD; kd++) {
-                const float q = qh[kd];
-                const float* srow = sh + (size_t)kd * VHD;
-#pragma omp simd
-                for (int vd = 0; vd < VHD; vd++) crow[vd] += srow[vd] * q;
-            }
-            for (int vd = 0; vd < VHD; vd++) { crow[vd] *= scale; ss += crow[vd] * crow[vd]; }
-            const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
-            for (int vd = 0; vd < VHD; vd++) {
-                const float zz = z[(size_t)hh * VHD + vd];
-                crow[vd] = crow[vd] * inv * gdn_small_[(size_t)l].norm[vd] * (zz / (1.0f + expf(-zz)));
+            float* sc = scratch.data();
+            for (int m = 0; m < M; m++) {
+#pragma omp for schedule(static)
+                for (int hh = 0; hh < NVH; hh++)
+                    head_row(hh, m, rs + (size_t)hh * KHD * VHD,
+                             core_ref.data() + (size_t)m * VD + (size_t)hh * VHD, sc);
             }
         }
+        int bad = 0;
+        double worst = 0.0;
+        for (size_t i = 0; i < CORE.size(); i++) {
+            const double d = std::fabs((double)CORE[i] - (double)core_ref[i]);
+            if (d > worst) worst = d;
+            if (CORE[i] != core_ref[i]) bad++;
         }
-        if (dump_gb && l == 0 && m < 2) {
+        fprintf(stderr, "[gdncheck] l=%d M=%d exchanged vs row-major: %d/%zu differ, max|d|=%.3e %s\n", l, M,
+                bad, CORE.size(), worst, bad ? "MISMATCH" : "identical");
+        // An invariant, not a report: NPU_GDN_CHECK exists so that a test (and a device run) can assert the loop
+        // exchange did not move a single element.  A mismatch must fail the call, not print a line nobody reads.
+        if (bad) {
+            err_ = "gdn check: the head-major nesting disagrees with row-major at layer " + std::to_string(l) +
+                   " (" + std::to_string(bad) + " of " + std::to_string(CORE.size()) + ", max|d|=" +
+                   std::to_string(worst) + ")";
+            return false;
+        }
+    }
+    if (dump_gb && l == 0) {
+        for (int m = 0; m < M && m < 2; m++) {
             auto d2 = [&](const char* nm, const float* v, int n) {
                 double sm = 0;
                 float mx = 0;
                 for (int i = 0; i < n; i++) { float a = fabsf(v[i]); sm += a; if (a > mx) mx = a; }
                 fprintf(stderr, "  [GB] m=%d %-5s %.6f %.4f\n", m, nm, sm / n, mx);
             };
-            d2("qkv", qkv, CD);
-            d2("co", co.data(), CD);
-            d2("z", z, VD);
-            d2("a", ah.data(), NVH);
-            d2("b", bh.data(), NVH);
+            d2("qkv", QKV.data() + (size_t)m * CD, CD);
+            d2("co", co_dump.data() + (size_t)m * CD, CD);
+            d2("z", Z.data() + (size_t)m * VD, VD);
+            d2("a", AHS.data() + (size_t)m * NVH, NVH);
+            d2("b", BHS.data() + (size_t)m * NVH, NVH);
             d2("core", CORE.data() + (size_t)m * VD, VD);
         }
     }
@@ -2718,9 +2807,9 @@ int32_t Q4nxNpuForward::m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float
 }
 
 // ---------------------------------------------------------------------------
-// Phase attribution (NPU_PHASE_PROF=1).  One line per decode step whose named
-// phases sum to that step's wall time.  Additive measurement only: nothing in
-// the compute path depends on it.
+// Phase attribution (NPU_PHASE_PROF=1).  One line per decode step ([ph]) and one
+// per batched pass ([bs]) whose named phases sum to that pass's wall time.
+// Additive measurement only: nothing in the compute path depends on it.
 // ---------------------------------------------------------------------------
 namespace {
 struct StepPhases {
@@ -2731,6 +2820,10 @@ struct StepPhases {
 };
 StepPhases g_ph;
 bool       g_in_head = false;
+// True for the whole batched body of step_batch(): a verify batch's M-row launches go through
+// prof_pre_ (M > 1), which the per-token accounting deliberately leaves alone, so this flag is what
+// routes their pack/launch/wait/readback split into the same g_ph the [ph] line reads.
+bool       g_in_batch = false;
 inline bool phprof_on() {
     static const bool on = getenv("NPU_PHASE_PROF") != nullptr;
     return on;
@@ -2739,15 +2832,72 @@ inline double ph_ms(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - t).count();
 }
+struct BatchPhaseScope {   // g_in_batch for the batched body, cleared on every return path
+    bool prev;
+    explicit BatchPhaseScope(bool on) : prev(g_in_batch) { if (on) g_in_batch = true; }
+    ~BatchPhaseScope() { g_in_batch = prev; }
+};
+// Ranked layer-loop host call sites: what the `host=` residual is made of.
+// Nested rows (of-which) are inside their parent; the TOP-LEVEL SUM is the
+// one the residual is compared against.
+// host part of npu_gemm = whole call minus the four device phases it times;
+// host part of gdn_layer = the scope minus the gemm launches it contains.
+// Shared by step() (unit "token") and step_batch() (unit "batch") so both residuals are read alike.
+void lh_dump_layer_host(const char* what, const char* unit) {
+    const double gs = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
+    const double gemm_all  = g_lh[LH_GEMM] + g_lh[LH_GEMM_GDN];
+    const double gemm_host = gemm_all - gs;
+    const double gdn_host  = g_lh[LH_GDN] - g_lh[LH_GEMM_GDN];
+    const double top = g_lh[LH_LOAD] + g_lh[LH_ASM] + g_lh[LH_ATTN] + g_lh[LH_RMS] +
+                       g_lh[LH_RES] + g_lh[LH_MLP] + gdn_host + gemm_host;
+    fprintf(stderr, "[lh] %s layer-loop host call sites, ms/%s (ranked):\n", what, unit);
+    bool done[LH_LAYER_N] = {false};
+    for (int r = 0; r < LH_LAYER_N; r++) {
+        int best = -1;
+        for (int i = 0; i < LH_LAYER_N; i++) {
+            if (done[i] || g_lh[i] <= 0.0) continue;
+            if (best < 0 || g_lh[i] > g_lh[best]) best = i;
+        }
+        if (best < 0) break;
+        done[best] = true;
+        const double n = g_lh_n[best] ? (double)g_lh_n[best] : 1.0;
+        fprintf(stderr, "[lh]   %-26s %8.2f ms  n=%4ld  %7.3f ms/call  %5.1f%%\n",
+                lh_name(best), g_lh[best], g_lh_n[best], g_lh[best] / n,
+                100.0 * g_lh[best] / (g_ph.layer > 0 ? g_ph.layer : 1.0));
+    }
+    // Deliberately not static: these are read from g_lh at call time.  A `static` array is initialised
+    // once, so the table froze on its first call and every later line reprinted that first pass's numbers
+    // (seen in ticket-batchprof-p0-before-20261104-142823.log: load_layer 8587.41 ms on every token while
+    // the live ACCOUNTED row moved 654 -> 690 ms).
+    const struct TlpRow { const char* n; double v; } tlp[] = {
+        {"load_layer",                g_lh[LH_LOAD]},
+        {"assemble_B",                g_lh[LH_ASM]},
+        {"gemm host (amax+deq)",      gemm_host},
+        {"gdn_layer (non-gemm)",      gdn_host},
+        {"mlp (act*up)",              g_lh[LH_MLP]},
+        {"rmsnorm",                   g_lh[LH_RMS]},
+        {"attention",                 g_lh[LH_ATTN]},
+        {"residual adds",             g_lh[LH_RES]},
+    };
+    fprintf(stderr, "[lh] TOP-LEVEL PARTITION (no double counting; npu_gemm %.2f "
+                    "- phases %.2f = %.2f host):\n", gemm_all, gs, gemm_host);
+    for (const TlpRow& r : tlp)
+        fprintf(stderr, "[lh]   %-26s %8.2f ms  %5.1f%% of gemm-free host\n", r.n, r.v,
+                100.0 * r.v / (g_ph.layer - gs > 0 ? g_ph.layer - gs : 1.0));
+    fprintf(stderr, "[lh]   %-26s %8.2f ms\n", "ACCOUNTED", top);
+    fprintf(stderr, "[lh]   %-26s %8.2f ms   (layers=%.2f gemm_phases=%.2f)\n",
+            "UNATTRIBUTED", g_ph.layer - gs - top, g_ph.layer, gs);
+}
 }  // namespace
 
 void Q4nxNpuForward::prof_add(ProfAcc* acc, int design, double pack, double quant,
                               double wait, double rb) {
-    if (phprof_on() && acc == prof_dec_ && !g_in_head) {
+    if (phprof_on() && !g_in_head && (g_in_batch || acc == prof_dec_)) {
         g_ph.g_pack += pack; g_ph.g_ql += quant;
         g_ph.g_wait += wait; g_ph.g_rb += rb;
         g_ph.launches++;
     }
+    if (!prof_) return;   // the per-role table belongs to NPU_PROFILE; NPU_PHASE_PROF has its own lines
     if (design < 0 || design >= Q4NX_MAX_DESIGNS) return;
     ProfAcc& a = acc[design];
     a.pack += pack; a.quant += quant; a.wait += wait; a.rb += rb;
@@ -2755,6 +2905,9 @@ void Q4nxNpuForward::prof_add(ProfAcc* acc, int design, double pack, double quan
 }
 
 void Q4nxNpuForward::prof_dump() {
+    // Reached with NPU_PHASE_PROF alone too, because the launch timers are shared: there is no per-role
+    // table to print in that case, and its [ph]/[bs] lines already carry the split.
+    if (!prof_) return;
     fprintf(stderr, "[prof] ---- per-role launch cost (ms, window since last dump) ----\n");
     fprintf(stderr, "[prof] %-5s %-5s %2s %8s %7s %9s %7s %9s %9s\n", "phase", "role",
             "M", "launches", "pack", "quant+lnch", "wait", "readback", "ms/launch");
@@ -3504,6 +3657,17 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     }
 
     BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
+    // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
+    // batch term's interior is read per phase instead of inferred from the loop's total.
+    const bool phb = phprof_on();
+    const auto tp_bs = phb ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto tp_lap = tp_bs;
+    BatchPhaseScope _batch_scope(phb);
+    if (phb) {
+        g_ph = StepPhases{};
+        for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
+    }
     const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
     const int i_o   = idx_of(Q4NX_DESIGN_O);
     const int i_gu  = idx_of(Q4NX_DESIGN_GU);
@@ -3521,6 +3685,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     for (int m = 0; m < M; m++)
         for (int k = 0; k < H; k++)
             X[(size_t)m * H + k] = embed_at(tokens[m], k) * embed_scale_;
+    if (phb) { g_ph.embed = ph_ms(tp_bs); tp_lap = std::chrono::steady_clock::now(); }
 
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row, act_row, hh;
     for (int l = 0; l < c_.NL; l++) {
@@ -3801,6 +3966,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         }
     }
 
+    if (phb) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
     // The next-token logits come from the last row of the batch, after the final
     // norm -- step() applies final_norm_ before run_lm_head, and feeding the raw
     // residual here produced garbage logits (the M=1 self-check caught it).
@@ -3852,6 +4018,24 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                      M, start_pos, c_.NL, (int)two_widths);
     }
     bph.print(M);
+    if (phb) {
+        // epilogue = final norm + the head rows; head= is run_lm_head_rows' own timer, so
+        // epilogue - head is the per-row final norm.  tail must be ~0: it is what the partition misses.
+        const double total = ph_ms(tp_bs);
+        const double epi = ph_ms(tp_lap);
+        const double gsum = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
+        const double hsum = g_ph.h_memcpy + g_ph.h_pack + g_ph.h_ql + g_ph.h_wait + g_ph.h_rb;
+        fprintf(stderr,
+                "[bs] M=%2d start=%4d wall=%7.1f | embed=%5.1f | layers=%7.1f (gemm pack=%6.1f "
+                "ql=%6.2f wait=%7.1f rb=%6.1f sum=%7.1f host=%7.1f n=%ld) | epilogue=%6.1f "
+                "(head=%6.1f sum=%6.1f host=%5.1f) | tail=%5.1f\n",
+                M, start_pos, total, g_ph.embed, g_ph.layer, g_ph.g_pack, g_ph.g_ql, g_ph.g_wait,
+                g_ph.g_rb, gsum, g_ph.layer - gsum, g_ph.launches, epi, g_ph.h_total, hsum,
+                g_ph.h_total - hsum, total - g_ph.embed - g_ph.layer - epi);
+        char what[48];
+        snprintf(what, sizeof what, "batch M=%d start=%d", M, start_pos);
+        lh_dump_layer_host(what, "batch");
+    }
     return ok;
 }
 
@@ -4368,6 +4552,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
                     if (mul && mul[0] == '1') inv *= (double)rope_scale_[i];
                     else                       inv /= (double)rope_scale_[i];
                 }
+                // llama3 (Llama-3.1/3.2/3.3): the wavelength-band rule, on the FREQUENCY, so it costs
+                // nothing per token.  No-op unless the config declares rope_type "llama3".
+                inv = q4nx_rope_llama3_inv_freq(inv, &rope_llama3_);
             }
             const double ang = (double)pos * inv;
             cos_[i] = (float)std::cos(ang);
@@ -4903,50 +5090,9 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         // delta between two lines, and the bytes are exact (bo::sync is a clflush loop over its range).
         if (getenv("NPU_C_SYNC_PROF")) I8Ctx::c_sync_print(token);
         if (getenv("NPU_A_SYNC_PROF")) I8Ctx::a_sync_print(token);
-        // Ranked layer-loop host call sites: what the `host=` residual is made of.
-        // Nested rows (of-which) are inside their parent; the TOP-LEVEL SUM is the
-        // one the residual is compared against.
-        // host part of npu_gemm = whole call minus the four device phases it times;
-        // host part of gdn_layer = the scope minus the gemm launches it contains.
-        const double gs = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
-        const double gemm_all  = g_lh[LH_GEMM] + g_lh[LH_GEMM_GDN];
-        const double gemm_host = gemm_all - gs;
-        const double gdn_host  = g_lh[LH_GDN] - g_lh[LH_GEMM_GDN];
-        const double top = g_lh[LH_LOAD] + g_lh[LH_ASM] + g_lh[LH_ATTN] + g_lh[LH_RMS] +
-                           g_lh[LH_RES] + g_lh[LH_MLP] + gdn_host + gemm_host;
-        fprintf(stderr, "[lh] tok %d layer-loop host call sites, ms/token (ranked):\n", token);
-        bool done[LH_LAYER_N] = {false};
-        for (int r = 0; r < LH_LAYER_N; r++) {
-            int best = -1;
-            for (int i = 0; i < LH_LAYER_N; i++) {
-                if (done[i] || g_lh[i] <= 0.0) continue;
-                if (best < 0 || g_lh[i] > g_lh[best]) best = i;
-            }
-            if (best < 0) break;
-            done[best] = true;
-            const double n = g_lh_n[best] ? (double)g_lh_n[best] : 1.0;
-            fprintf(stderr, "[lh]   %-26s %8.2f ms  n=%4ld  %7.3f ms/call  %5.1f%%\n",
-                    lh_name(best), g_lh[best], g_lh_n[best], g_lh[best] / n,
-                    100.0 * g_lh[best] / (g_ph.layer > 0 ? g_ph.layer : 1.0));
-        }
-        static const struct TlpRow { const char* n; double v; } tlp[] = {
-            {"load_layer",                g_lh[LH_LOAD]},
-            {"assemble_B",                g_lh[LH_ASM]},
-            {"gemm host (amax+deq)",      gemm_host},
-            {"gdn_layer (non-gemm)",      gdn_host},
-            {"mlp (act*up)",              g_lh[LH_MLP]},
-            {"rmsnorm",                   g_lh[LH_RMS]},
-            {"attention",                 g_lh[LH_ATTN]},
-            {"residual adds",             g_lh[LH_RES]},
-        };
-        fprintf(stderr, "[lh] TOP-LEVEL PARTITION (no double counting; npu_gemm %.2f "
-                        "- phases %.2f = %.2f host):\n", gemm_all, gs, gemm_host);
-        for (const TlpRow& r : tlp)
-            fprintf(stderr, "[lh]   %-26s %8.2f ms  %5.1f%% of gemm-free host\n", r.n, r.v,
-                    100.0 * r.v / (g_ph.layer - gs > 0 ? g_ph.layer - gs : 1.0));
-        fprintf(stderr, "[lh]   %-26s %8.2f ms\n", "ACCOUNTED", top);
-        fprintf(stderr, "[lh]   %-26s %8.2f ms   (layers=%.2f gemm_phases=%.2f)\n",
-                "UNATTRIBUTED", g_ph.layer - gs - top, g_ph.layer, gs);
+        char lhwhat[48];
+        snprintf(lhwhat, sizeof lhwhat, "tok %d", token);
+        lh_dump_layer_host(lhwhat, "token");
     }
     return true;
 }

@@ -481,6 +481,18 @@ rows = [
                      "printf '%s' \"$s\" | grep -qE 'web UI http://[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:13305' && "
                      "echo menu-connect-block",
                      "menu-connect-block"),
+    # #1041 (engine 0c862e64): the console names the engine that is serving. It must not be asserted off LIVE facts:
+    # measured on this box, `--status` with nothing loaded prints no engine line at all (the fact is `None` until a
+    # model is loaded), so a row that ran `--status` and grepped `engine:` would be red on a healthy appliance and
+    # nobody could act on it. The row renders the shipped binary's own frame with its own fixture instead: it proves
+    # the IMAGE carries a console that can name the engine, and it goes red on any pre-#1041 TUI - measured against
+    # the c24 image's own `/usr/local/bin/1bit-console-tui` (5261cf56...), whose frame carries no engine line, while
+    # 4b369c10... prints `engine: llamacpp (gpu)` here. The second half of #1041 is visible next to it: no invented
+    # `http://-:` on a box that has no address yet.
+    ("U2 console engine", "1bit-console-tui --snapshot 80x25 --fixture 2>&1 | grep -o 'engine: [a-z]* ([a-z]*)' | head -1; "
+                     "1bit-console-tui --status > /tmp/ct.txt 2>&1; echo status-rc=$?; "
+                     "echo invented-urls=$(grep -c 'http://-:' /tmp/ct.txt)",
+                     "engine: llamacpp (gpu)"),
     # The mechanism behind U3-lan and U7 (cycle 15's finding, and the row the c16 refactor folded away): inbound
     # connections from the LAN pass only if the appliance opened the ports AFTER Puppy's rc.firewall (which ends
     # in `-P INPUT DROP`) and let the RFC1918 ranges through tcpwrappers. Printing all three - the rules, the
@@ -714,6 +726,35 @@ rows = [
                      "udp-5353-open"),
     # cycle 24: the outbound half, a row of its own rather than a second substring in the row above (one row matches
     # ONE substring, so a second token there would print and never be compared - the #989 lesson).
+    # Cycle 25 (owner: "log verbose it all for proof"): four rows, one per claim that could otherwise be a sentence.
+    # (1) the kernel ring cannot wrap: c23's did, and 1bit-logs could only mark the loss.
+    ("boot ring",    "tr ' ' '\\n' < /proc/cmdline | grep '^log_buf_len='; "
+                     "grep -q 'log_buf_len=32M' /proc/cmdline && echo ring-sized",
+                     "ring-sized"),
+    # (2) the boot's identity is one file, written once, and it carries every label a reviewer needs. Reading the
+    # labels IS the check: a file that exists but says nothing is what a stub would produce.
+    ("U5 boot proof", "p=$(1bit-proof path 2>/dev/null)/boot-proof.txt; ls -l \"$p\" 2>&1 | tail -1; "
+                     "miss=\"\"; for k in cmdline uname secureboot.efivar module.amdxdna amdxdna.tdr_timeout_ms firmware pci.devices memtotal_kb timeline.dmesg sha256sums; do "
+                     "grep -q \"^$k  \" \"$p\" 2>/dev/null || miss=\"$miss $k\"; done; "
+                     "n=$(wc -l < \"$p\" 2>/dev/null); echo \"proof-lines=${n:-0} missing=${miss:-none}\"; "
+                     "[ -z \"$miss\" ] && [ \"${n:-0}\" -ge 20 ] && echo boot-proof-complete",
+                     "boot-proof-complete"),
+    # (3) thermals are sampled ONLY while something is serving - so the two files must agree, and an idle box must
+    # not be writing a power log all day. Both directions are failures the row names.
+    ("U5 thermal gate", "eng=$(pgrep -f '/opt/1bit-package/1bit/1bit' 2>/dev/null | wc -l); "
+                     "d=$(1bit-logs dir 2>/dev/null); n=$(wc -l < \"$d/thermal.log\" 2>/dev/null || echo 0); "
+                     "echo \"engine-children=$eng thermal-lines=$n\"; "
+                     "if [ \"$eng\" -gt 0 ]; then [ \"$n\" -gt 0 ] && echo thermal-gate-consistent; "
+                     "else [ \"$n\" -eq 0 ] && echo thermal-gate-consistent; fi",
+                     "thermal-gate-consistent"),
+    # (4) the artifact a release is attached to: the bundle exists, names this boot, and lists the boot proof inside
+    # it. tar -tf through zstd is the only proof that the archive is readable rather than merely present.
+    ("U5 proof bundle", "o=$(1bit-proof 2>&1); printf '%s\\n' \"$o\" | tail -3; "
+                     "f=$(printf '%s\\n' \"$o\" | head -1); ls -l \"$f\" 2>/dev/null | awk '{print \"bytes=\" $5}'; "
+                     "zstd -dc \"$f\" 2>/dev/null | tar -tf - 2>/dev/null | grep -c 'boot-proof.txt' | "
+                     "sed 's/^/boot-proof-in-bundle=/'; "
+                     "zstd -dc \"$f\" 2>/dev/null | tar -tf - 2>/dev/null | grep -q 'boot-proof.txt' && echo proof-bundle-ok",
+                     "proof-bundle-ok"),
     ("U3 mdns out",  "iptables -S OUTPUT | grep -E -- '-p udp.*--dport 5353.*-j ACCEPT' | head -2; "
                      "iptables -C OUTPUT -p udp --dport 5353 -d 224.0.0.251 -j ACCEPT 2>/dev/null && echo udp-5353-out",
                      "udp-5353-out"),

@@ -52,10 +52,18 @@ public:
     int hidden_size() const override { return HD; }
     int max_batch_rows() const override { return batch_rows_; }
 
+    // Opt-in recurrent state: the GDN layer's slip from the original position-only bookkeeping.  A batched pass
+    // computes each row's state WITHOUT applying it and commit_verify() applies exactly the accepted prefix -- the
+    // deferred-commit contract of npu/mtp/draft.h -- so a commit that keeps the wrong rows leaves a state that
+    // disagrees with plain decode.  Off by default: [1]-[13] pin shapes that assume the position-only double.
+    void use_recurrence(bool on) { recurrent_ = on; }
+    double state() const { return st_; }
+
     bool step(int token, int pos, std::vector<float>& logits) override {
         if (pos != consumed_) { bad_pos_++; return false; }   // the loop must never skip a position
         consumed_++;
         steps_++;
+        st_ = mix(st_, token, pos);
         logits.assign((size_t)V, 0.0f);
         fill_logits(pos, logits, 0);
         hidden_.assign(HD, (float)consumed_);                 // the head reads the position from here
@@ -79,6 +87,10 @@ public:
         // after a batch" would have read a stale value from the last single step (found 2026-11-05 while pricing a
         // folded draft loop, which has no plain step and therefore no other hidden source).
         hidden_.assign(HD, rows_.back());
+        // provisional, not applied: commit_verify() decides which rows the state ever sees
+        prov_.resize(tokens.size());
+        double s = st_;
+        for (size_t m = 0; m < tokens.size(); m++) { s = mix(s, tokens[m], start_pos + (int)m); prov_[m] = s; }
         consumed_ += (int)tokens.size();
         pending_ = (int)tokens.size();     // these rows are a verify batch until commit_verify() decides
         batches_++;
@@ -94,6 +106,7 @@ public:
 
     bool commit_verify(int accepted) override {
         if (accepted < 0 || accepted > pending_) return false;
+        if (recurrent_ && accepted > 0 && (int)prov_.size() >= accepted) st_ = prov_[(size_t)accepted - 1];
         consumed_ = consumed_ - pending_ + accepted;
         if (!keep_batch_rows_)
             rows_.resize((size_t)accepted);  // the accepted prefix only, as the engine's commit_verify_rows does now
@@ -131,8 +144,17 @@ private:
 
     int batch_rows_;
     int consumed_ = 0, steps_ = 0, batches_ = 0, commits_ = 0, last_commit_ = -1, pending_ = 0;
+    static double mix(double s, int tok, int pos) {
+        unsigned long long u = (unsigned long long)(s * 1e6) ^ ((unsigned long long)tok << 20) ^ (unsigned long long)pos;
+        u = u * 6364136223846793005ULL + 1442695040888963407ULL;
+        return (double)((u >> 11) % 1000000ULL) / 1000000.0;
+    }
+
     int bad_pos_ = 0, over_batch_ = 0;
     bool keep_batch_rows_ = false;
+    bool recurrent_ = false;
+    double st_ = 0.0;
+    std::vector<double> prov_;
     std::vector<float> hidden_{0.0f};
     std::vector<float> rows_;
 };
@@ -697,19 +719,23 @@ int main() {
             RandomHead h(acc, rng());
             ToyBase m(batch_rows);
             m.keep_batch_rows(it % 2 == 1);
+            m.use_recurrence(true);
             ToyBase plain_m(batch_rows);
+            plain_m.use_recurrence(true);
             const Result live = onebit::npu::mtp::run(m, &h, pr, o);
             const Result plain = onebit::npu::mtp::run_plain(plain_m, pr, o);
             cases++;
             const bool ok = live.ok && same(live.tokens, plain.tokens) &&
                             (int)live.tokens.size() == o.max_tokens && m.bad_pos() == 0 &&
-                            m.consumed() == plen + (int)live.tokens.size() && m.over_batch() == 0 && m.pending() == 0;
+                            m.consumed() == plen + (int)live.tokens.size() && m.over_batch() == 0 && m.pending() == 0 &&
+                            // the deferred commit applied exactly the accepted rows: same state plain decode reaches
+                            std::abs(m.state() - plain_m.state()) < 1e-12;
             if (!ok && ++bad <= 3)
                 std::printf("INFO sweep case %d: k=%d tau=%.2f budget=%d plen=%d rows=%d full_rows=%d acc=%.2f err=%s\n",
                             it, o.k, (double)o.tau, o.max_tokens, plen, batch_rows, (int)(it % 2 == 1), acc,
                             live.err.c_str());
         }
-        check(bad == 0, "randomised: 600 cases keep text, position, batch width and commit invariants");
+        check(bad == 0, "randomised: 600 cases keep text, position, batch width and deferred-commit state invariants");
         std::printf("INFO randomised: %d cases, %d violated an invariant\n", cases, bad);
     }
 

@@ -53,7 +53,9 @@ base = [st("general.architecture", "qwen3"), u32("qwen3.block_count", 28), u32("
         u32("qwen3.embedding_length", 1024), u32("qwen3.attention.head_count", 16),
         u32("qwen3.attention.head_count_kv", 8)]
 for name, kv in (("tpl", [st("tokenizer.chat_template", sys.argv[2])]), ("bare", []),
-                 ("zaya1-8b-q4_k_m", [st("tokenizer.chat_template", "{% for m in messages %}{{ m }}{% endfor %}")])):
+                 ("zaya1-8b-q4_k_m", [st("tokenizer.chat_template", "{% for m in messages %}{{ m }}{% endfor %}")]),
+                 ("qwen3-4b-instruct-2507-q4_k_m",
+                  [st("tokenizer.chat_template", "{% for m in messages %}{{ m }}{% endfor %}")])):
     all_kv = base + kv
     with open(f"{sys.argv[1]}/{name}.gguf", "wb") as f:
         f.write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(all_kv)) + b"".join(all_kv))
@@ -116,6 +118,12 @@ run zaya1-8b-q4_k_m; rc=$?
 check "the built-in pins compare without --template-pin (exit $rc)" \
     '[ "$rc" = 0 ] && grep -q "template sha256=" "$scratch/err" &&
      grep -q "warning: template pin: zaya1-8b-q4_k_m (zaya1-8b-q4_k_m.gguf) expects b55ecfbbbcbb238a011465bfa139366db18790103f9205060cf2855a3f51b30f" "$scratch/err"'
+
+# A row the appliance ships, so the stick's own chat model is covered by the built-in table rather than
+# only by the demo/scoreboard names (config/template-pins.json records unsloth/Qwen3-4B-Instruct-2507).
+run qwen3-4b-instruct-2507-q4_k_m; rc=$?
+check "the appliance's staged chat model is a built-in pin (exit $rc)" \
+    '[ "$rc" = 0 ] && grep -q "warning: template pin: qwen3-4b-instruct-2507-q4_k_m (qwen3-4b-instruct-2507-q4_k_m.gguf) expects c979e0e71a3e21b8f208e6ab120d5cb29327885f29d2a8b18fda67a723798e18" "$scratch/err"'
 
 # A model directory (a Q4NX / NPU container): the template is tokenizer_config.json's "chat_template",
 # or chat_template.jinja beside it. --print-backend on a directory exits 5 (the NPU runs in serve's own

@@ -370,7 +370,7 @@ def pr_body(c: dict) -> str:
 
 
 def self_test() -> int:
-    global api, head, tree, remote_template
+    global api, head, tree, remote_template, commits_since
     failures = 0
 
     def expect(what, got, want):
@@ -407,6 +407,9 @@ def self_test() -> int:
     def fake_tree(repo, rev="main"):
         return [v for k, v in trees["new" if rev == "new" else "old"].items()]
 
+    def fake_commits(repo, old, new, limit=100):
+        return [{"id": "deadbeef", "title": "Better UD 3.1 quants", "date": "2026-11-04"}]
+
     def fake_template(repo, rev, path, cap=0):
         return hashlib.sha256(new_tpl[0]).hexdigest() if rev == "new" else hashlib.sha256(tpl).hexdigest()
 
@@ -415,15 +418,17 @@ def self_test() -> int:
                                    "template_sha256": hashlib.sha256(tpl).hexdigest()}},
             "x": None}
     pins = {"pins": {"fake/moved": base, "fake/still": dict(base)}}
-    head, tree, remote_template = fake_head, fake_tree, fake_template
+    head, tree, remote_template, commits_since = fake_head, fake_tree, fake_template, fake_commits
     changes, notes = check(pins, want_template=True)
     expect("one repo moved", [c["repo"] for c in changes], ["fake/moved"])
     expect("the replacement is seen", changes[0]["files"][0]["state"], "upstream serves a different file")
     expect("the template change is named", "TEMPLATE CHANGED" in changes[0]["files"][0]["template"], True)
     expect("the new upstream file is listed", changes[0]["added"], ["extra-Q8_0.gguf"])
     expect("no notes for a readable repo", notes, [])
+    expect("the upstream commit title is carried", changes[0]["commits"][0]["title"], "Better UD 3.1 quants")
     md = report(changes, notes, 2, True)
     expect("report names the repo", "fake/moved" in md and "TEMPLATE CHANGED" in md, True)
+    expect("report carries the commit title", "Better UD 3.1 quants" in md, True)
     expect("pr body refuses a routine merge", "not a routine bump" in pr_body(changes[0]).lower(), True)
 
     # a repo that did not move is silent, and an unreadable repo is a note, not a change
@@ -435,7 +440,7 @@ def self_test() -> int:
     def fake_head_new(repo):
         return "new"
 
-    head, tree, remote_template = fake_head_new, fake_tree, fake_template
+    head, tree, remote_template, commits_since = fake_head_new, fake_tree, fake_template, fake_commits
     changes, _ = check({"pins": {"fake/moved": stale}}, want_template=False)
     expect("a stale copy is caught at the same commit", len(changes), 1)
     expect("held oid is reported", changes[0]["files"][0]["held"]["oid"][:4], "aaaa")
@@ -459,7 +464,7 @@ def self_test() -> int:
         def fake_tree_missing(repo, rev="main"):
             return [v for k, v in trees["new"].items() if k != "tpl.gguf"]
 
-        head, tree = fake_head_new, fake_tree_missing
+        head, tree, commits_since = fake_head_new, fake_tree_missing, fake_commits
         expect("--bump refuses a vanished file", main(["--bump", "fake/moved", "--pins", path]), 1)
         expect("--bump left the pin alone", load(path)["pins"]["fake/moved"]["commit"], "new")
 

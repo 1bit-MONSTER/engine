@@ -136,6 +136,17 @@ bits. Qwen3-0.6B Q4_K_M, 32 tokens, greedy, 4 rounds (3 where a width only neede
 Worst \|Δlogp\| seen inside those mixtures: `cpu` 9.81e-01 at width 4 and 9.81e-01 at width 8; `hrx`
 7.43e-02 at width 4 and 2.05e-01 at width 8.
 
+**Not a small-model artifact.** The same run on **Qwen3-4B-Q4_K_M**, same binary, same budget:
+
+| request width | `cpu` round-to-round identical | `cpu` states | `hrx` round-to-round identical | `hrx` states |
+|---:|---|---:|---|---:|
+| 4 | **4/12**, worst \|Δlogp\| 1.86e-01 | 7 of 16 | **4/12**, worst \|Δlogp\| 6.83e-02 | 4 of 16 (all four copies distinct, every round) |
+| 8 | **7/24**, worst \|Δlogp\| 1.80e-01 | 8 of 32 | **3/24**, worst \|Δlogp\| 1.02e-01 | 8 of 32 (all eight copies distinct, every round) |
+
+At 4B the verdict is the same on both routes and the spread is wider on `cpu` (7 states over 16 copies,
+against a modal rung at 0.6B), so the effect is a property of batching, not of the model size where these
+measurements were cheap enough to take.
+
 A **state** here is one complete 32-token answer: two copies are in the same state only if every token id
 and every compared float32 log-probability bit of all 32 tokens matches. A row's "states" column counts the
 distinct states over all copies of all rounds, so it is a lower bound (two different schedules can coincide)
@@ -424,7 +435,7 @@ how each arm above was run.
   moves them; re-run rather than extrapolate.
 - The concurrency numbers were measured on a 0.6B model on one host; they show the effect exists
   and is not small, not how large it gets for other shapes. The batched-repeat rows are one prompt,
-  32 tokens and one model: they establish that a batched cell is not repeatable and that the outcome
+  32 tokens, 0.6B and 4B: they establish that a batched cell is not repeatable and that the outcome
   set is small and per-engine, not how the dispersion scales with model size or prompt length.
 - The NPU agreement rows are 2 repeats (the other routes' 5 would be ~25 min of the array) and, over a
   *requantised* pack, they are not an arithmetic-only distance. The 64-token row removes the earlier

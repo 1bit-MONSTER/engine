@@ -87,10 +87,15 @@ public:
     // Toy base: no GDN deferral, so committing a verify prefix is the position bookkeeping a pure-attention
     // model needs (drop the rejected rows).  It records the call so the test can check the loop commits
     // exactly the accepted count and never more.
+    // The other documented shape: the base keeps its whole batch buffer and commit_verify() only truncates the
+    // position bookkeeping.  Legal per BaseModel::last_hidden_rows(), and what a new target most naturally writes.
+    void keep_batch_rows(bool on) { keep_batch_rows_ = on; }
+
     bool commit_verify(int accepted) override {
         if (accepted < 0 || accepted > pending_) return false;
         consumed_ = consumed_ - pending_ + accepted;
-        rows_.resize((size_t)accepted);     // the accepted prefix only, as the engine's commit_verify_rows does now
+        if (!keep_batch_rows_)
+            rows_.resize((size_t)accepted);  // the accepted prefix only, as the engine's commit_verify_rows does now
         // ... and hidden_ is deliberately NOT touched here, because the engine does not touch it either:
         // commit_verify_rows() truncates last_hidden_rows_ to the accepted prefix and leaves last_hidden_ as the
         // FULL batch's last row.  So after a partial accept the two disagree by construction, and a reader of
@@ -126,6 +131,7 @@ private:
     int batch_rows_;
     int consumed_ = 0, steps_ = 0, batches_ = 0, commits_ = 0, last_commit_ = -1, pending_ = 0;
     int bad_pos_ = 0, over_batch_ = 0;
+    bool keep_batch_rows_ = false;
     std::vector<float> hidden_{0.0f};
     std::vector<float> rows_;
 };
@@ -614,6 +620,34 @@ int main() {
               "budget: the base still consumed every emitted token (no position is skipped by the early stop)");
         std::printf("INFO budget: emitted %d, steps %d, batches %d, consumed %d for a prompt of %zu\n",
                     r.stats.emitted, m.steps(), m.batches(), m.consumed(), P.size());
+    }
+
+    // [13] both documented hidden-row shapes advance the drafter.  BaseModel::last_hidden_rows() documents M rows
+    // (the whole batch); Q4nxNpuForward truncates them to the accepted prefix in commit_verify_rows (#820).  The
+    // loop used to demand the second shape exactly, so a base that keeps its batch buffer -- the first shape, and
+    // the one the header's own wording describes -- failed the run outright with "base returned a partial batch
+    // hidden" on every partial accept, naming a partial buffer it had not received.  Found by randomising the
+    // loop's inputs (k, tau, budget, batch width, head accuracy) over a toy base that keeps its rows: 680 of 2000
+    // such cases aborted, while the same 2000 with the accepted-prefix shape all passed on text, state and
+    // position.  The drafter must also actually ADVANCE here, not just survive: an advance silently skipped is the
+    // same 1-token/pass drift in a new disguise.
+    {
+        ToyBase m(8);
+        m.keep_batch_rows(true);
+        StreamDrafter sd;
+        for (int i = 0; i < (int)P.size(); i++) sd.prime(std::vector<float>{(float)(i + 1)}, 0, i);
+        Options o = base_opt;
+        o.k = 4;
+        o.tau = 0.0f;
+        const Result r = onebit::npu::mtp::run(m, &sd, P, o);
+        check(r.ok, "whole-batch rows: the run completes instead of refusing the base's row buffer");
+        if (!r.ok) std::printf("INFO whole-batch rows: %s\n", r.err.c_str());
+        check(r.ok && same(r.tokens, ref.tokens), "whole-batch rows: text identical to plain decode");
+        check(r.ok && sd.cache_rows() == (int)P.size() + r.stats.emitted,
+              "whole-batch rows: the drafter's stream advanced over every committed row");
+        check(r.ok && sd.stream_mismatches() == 0, "whole-batch rows: no chain opened off the cursor");
+        std::printf("INFO whole-batch rows: stream %d rows, accepted %d/%d, passes/token %.3f\n", sd.cache_rows(),
+                    r.stats.accepted, r.stats.drafted, r.stats.passes_per_token());
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

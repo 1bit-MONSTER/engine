@@ -35,6 +35,7 @@
 #   ONEBIT_DX_KERNELS=~/wt/ross-npu-product/kern/1024x3072x16x8 onnx/bench_npu.sh
 #   onnx/bench_npu.sh --lens 1024,512,256,128 --gen 64 -w 1 -r 3
 #   onnx/bench_npu.sh --keep        # leave the server up (and print its port)
+#   onnx/bench_npu.sh --endpoint completions   # a container whose chat route is disabled (#963)
 #
 # ENV
 #   ONEBIT_BIN         the engine binary            (default ~/src/engine-laya-npu/build-npu/1bit)
@@ -58,7 +59,7 @@ while [ $# -gt 0 ]; do
         --model) MODEL="$2"; shift 2 ;;
         --kernels) KERNELS="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
-        --lens|--gen|-w|--warmup|-r|--repeat|--mode) BENCH_ARGS+=("$1" "$2"); shift 2 ;;
+        --lens|--gen|-w|--warmup|-r|--repeat|--mode|--endpoint) BENCH_ARGS+=("$1" "$2"); shift 2 ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "bench_npu.sh: unknown option $1" >&2; exit 2 ;;
     esac

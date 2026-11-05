@@ -62,8 +62,18 @@ roles from `layer_types` and projection shapes from the model's own dimensions, 
 `--check` re-generates and diffs against the file on disk, so a stale plan is a gate failure rather than a
 wrong number; `--print` shows it without writing.
 
+`container.tile_order` is the fourth decision written down, and it is the one that cannot be probed at all:
+it names the q4_1 tile order the payload is in (`engine-1`, what this repo's converter writes). A container
+from another converter can be a **different order**, and a wrong order decodes as noise *with no error
+anywhere* — every structural check passes (same tensor names, dtypes, byte counts, chunk kinds), the container
+loads, and the model simply answers badly (measured: one FLM converter checkout's containers answer the same
+token five times where ours answer " Paris."). Absent means `engine-1`, so every container written before the
+field existed keeps loading; an id this decoder does not implement is a refusal naming it, because the
+alternative is to guess a tile order at the one point where a guess is silent.
+
 The forward reads the plan with `npu/plan/plan.h` and **refuses by name** anything it cannot honour — a
-`kernels.tag` that disagrees with the container, a sealed ELF named outside the pb16i family, a decode dir
+`container.tile_order` other than `engine-1`, a `kernels.tag` that disagrees with the container, a sealed ELF
+named outside the pb16i family, a decode dir
 that is absolute or contains `..`, a layer count that disagrees with `layers[]`, or a kernel the plan names
 that is not in the directory (`forward init failed: plan <path>: this model's plan needs the QKV kernel
 "full_i8_QKV_K1024_N4096.elf" in <dir> (missing)`). A model directory **without** a plan keeps the probes,
@@ -344,6 +354,17 @@ the same fill is 0.47 s. A first request on a fresh serve therefore costs one fi
 cold) on top of its prefill, and every request after it on the same serve costs none. Do not read a
 per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments, and
 `[bs]` is the same partition for one batched pass (a verify batch), whose interior a per-token line cannot see.
+`NPU_COPY_PROF=1` adds a `[cp]` line to both: the **bytes and milliseconds the host moves at its own copy
+sites** (`qkv_split`, `attn_gate`, `ctx_row`), one figure per site and a `KiB/row` total for a batched pass.
+The phase lines above attribute device time only, so a host row copy lands in their `host=` residual with
+nothing to separate it; `[cp]` is the line that says how much is left to remove rather than time it as part of
+the layer's wall. The MLP row copies this line first counted (`mlp_in`, `mlp_out` — 12.75 MiB of a 15.38 MiB
+prefill row) are gone: the batched pass now runs `mlp()` on the ACT row and into the HH row in place.
+
+The counters are per **process**, single writer, like `[ph]`: a serve enters `step()`/`step_batch()` under
+its engine mutex (`app/forward_serve.cpp:258`, `:698`), so one pass is in flight, and `--npu-streams N` is
+N processes sharing the device by flock (`app/npu_device_lock.h`), each counting its own. A caller that
+parallelised the layer loop would need per-pass counters instead.
 
 ### From a GGUF
 

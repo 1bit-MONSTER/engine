@@ -225,6 +225,10 @@ def generate(model_dir: str, kernels: str) -> dict:
         "container": {
             "layout": layout,
             "chunk_kind": "pb16i" if layout in ("pb16i", "t2s") else "mode0",
+            # The tile order of the payload this plan describes (engine#1110).  Declared so a container
+            # from another converter -- a different order that would decode as noise with no error -- is
+            # refused by name at load instead of being served.  Absent means this same value.
+            "tile_order": "engine-1",
             "pb16i": layout in ("pb16i", "t2s"),
         },
         "fusion": {"gate_up": "fused" if fused_gu else "split"},
@@ -262,6 +266,28 @@ def moe_batched(cfg: dict, hidden: int, model_dir: str, kernels: str) -> dict:
     return {"enabled": False, "K": 0, "N": 0}
 
 
+def _only_defaulted_tile_order(on_disk: str, generated: str) -> bool:
+    """True when the ONLY difference is a container.tile_order the on-disk plan does not carry.
+
+    engine#1110 added `container.tile_order`; absent means "engine-1", which is what the generator writes,
+    so an older plan is not stale -- it is silent about a field whose default is the generated value.
+    """
+    try:
+        a = json.loads(on_disk)
+        b = json.loads(generated)
+    except ValueError:
+        return False
+    ca, cb = a.get("container"), b.get("container")
+    if not isinstance(ca, dict) or not isinstance(cb, dict):
+        return False
+    if "tile_order" in ca or cb.get("tile_order") != "engine-1":
+        return False
+    ca = dict(ca)
+    ca["tile_order"] = "engine-1"
+    a["container"] = ca
+    return a == b
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("model_dir", help="the model directory (config.json + model.q4nx)")
@@ -296,6 +322,13 @@ def main(argv=None) -> int:
         except OSError as exc:
             print(f"{out}: {exc.strerror} (run without --check to write it)", file=sys.stderr)
             return 1
+        if on_disk != text and _only_defaulted_tile_order(on_disk, text):
+            # A plan written before container.tile_order existed means exactly what the generated one says
+            # ("engine-1"), so a plan gate must not go red over a field whose absence has the same meaning.
+            # The loader makes the same assumption (npu/plan/plan.h), which is why this is not a fudge.
+            print(f'{out}: matches the model dir (written before container.tile_order, which defaults to '
+                  f'"engine-1" -- the value it generates)')
+            return 0
         if on_disk != text:
             print(f"{out}: differs from what the model dir generates -- regenerate it", file=sys.stderr)
             for line in __import__("difflib").unified_diff(

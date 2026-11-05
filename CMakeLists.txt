@@ -87,7 +87,14 @@ FetchContent_Declare(httplib
     GIT_TAG fe332fa06bac76a1c6d402c08f414052999347da)  # v0.47.0
 FetchContent_MakeAvailable(json httplib)
 
-add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/laya_checkpoint.cpp)
+# config/laya-first.json (the routing table, docs/laya-first.md §4) is compiled in like
+# config/recipes.json; `1bit laya-first --laya-first FILE` replaces it at run time.
+file(READ ${CMAKE_SOURCE_DIR}/config/laya-first.json ONEBIT_LAYA_FIRST_JSON)
+file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
+     "// generated from config/laya-first.json by CMakeLists.txt\n#pragma once\n"
+     "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
+add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/laya_checkpoint.cpp app/laya_first.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -173,6 +180,8 @@ add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FI
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
+# The routing table that ships and the collection.router policy it desugars into (docs/laya-first.md §4).
+add_test(NAME laya_first COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_first.sh $<TARGET_FILE:onebit>)
 add_test(NAME mem_admit_route COMMAND ${CMAKE_SOURCE_DIR}/tests/mem_admit_route.sh $<TARGET_FILE:onebit>)
 # engine#315: what --hrx-cwsr-placement puts in an HRX backend's environment (app/hrx_cwsr.h); fake backend, no GPU.
 add_test(NAME hrx_cwsr_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cwsr_route.sh $<TARGET_FILE:onebit>)

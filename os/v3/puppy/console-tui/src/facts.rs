@@ -83,7 +83,29 @@ impl Mode {
 
 /// `mode_in` against the real root. Read-only, and cheap enough for the once-a-second frame.
 pub fn mode() -> Mode {
-    mode_in(Path::new("/"))
+    resolve(mode_in(Path::new("/")), data_mounted())
+}
+
+/// Is `/data` the mounted data partition? init.sh's rule is `grep -q " /data " /proc/mounts`, and that half matters on
+/// its own: a boot with /data mounted and no `.installed` on it is LIVE in init's own words.
+fn data_mounted() -> bool {
+    fs::read_to_string("/proc/mounts")
+        .map(|s| {
+            s.lines()
+                .any(|l| l.split_whitespace().nth(1) == Some("/data"))
+        })
+        .unwrap_or(false)
+}
+
+/// init's ELSE branch. When no marker exists (an init that could not write one, or a console started by hand on the
+/// appliance), the header said nothing while init's banner would have said LIVE - measured: the `(none)` row of the
+/// marker matrix, where the menu said live and the header was silent. With /data mounted and no `.installed`, LIVE is
+/// the faithful answer; with /data not mounted the box cannot say, and still says nothing.
+fn resolve(seen: Mode, data_mounted: bool) -> Mode {
+    match seen {
+        Mode::Unknown if data_mounted => Mode::Live,
+        m => m,
+    }
 }
 
 pub fn mode_in(root: &Path) -> Mode {
@@ -1079,7 +1101,9 @@ pub fn pane_lines(all: Vec<String>, max: usize) -> Vec<String> {
     let keep = kept.len().saturating_sub(max - (polls > 0) as usize);
     let mut kept = kept.split_off(keep);
     if polls > 0 {
-        kept.push(format!("LEM ({polls} debug lines hidden: GET /api/v1 polling)"));
+        kept.push(format!(
+            "LEM ({polls} debug lines hidden: GET /api/v1 polling)"
+        ));
     }
     kept
 }
@@ -1323,6 +1347,17 @@ mod tests {
         assert_eq!(mode_in(&root2), Mode::Installed);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn a_boot_with_data_mounted_and_no_marker_is_live() {
+        // init.sh's else branch: INSTALLED needs /data + .installed; anything else is LIVE. The reason this matters is
+        // the `(none)` row of ~/wt/tui-vm/mode-agreement-check.sh: the menu said live, the header was silent.
+        assert_eq!(resolve(Mode::Unknown, true), Mode::Live);
+        assert_eq!(resolve(Mode::Unknown, false), Mode::Unknown); // no /data: the box cannot say, so it does not invent
+        assert_eq!(resolve(Mode::Installed, true), Mode::Installed);
+        assert_eq!(resolve(Mode::Installed, false), Mode::Installed); // the marker alone is still an answer
+        assert_eq!(resolve(Mode::Live, true), Mode::Live);
     }
 
     #[test]
@@ -1618,12 +1653,28 @@ mod tests {
         all.push("KRN [   12.1] amdxdna 0000:c6:00.1: TDR timeout detected".into());
 
         let pane = pane_lines(all.clone(), 400);
-        assert!(!pane.iter().any(|l| is_poll_noise(l)), "a poll reached the pane: {pane:?}");
-        assert!(pane.iter().any(|l| l.contains("POST /api/v1/chat/completions")), "the chat is gone");
+        assert!(
+            !pane.iter().any(|l| is_poll_noise(l)),
+            "a poll reached the pane: {pane:?}"
+        );
+        assert!(
+            pane.iter()
+                .any(|l| l.contains("POST /api/v1/chat/completions")),
+            "the chat is gone"
+        );
         assert!(pane.iter().any(|l| l.contains("Loading model")));
-        assert!(pane.iter().any(|l| l.contains("backend exited 1")), "an error is never hidden");
-        assert!(pane.iter().any(|l| l.contains("TDR timeout")), "a kernel line is never hidden");
-        assert_eq!(pane.last().unwrap(), "LEM (40 debug lines hidden: GET /api/v1 polling)");
+        assert!(
+            pane.iter().any(|l| l.contains("backend exited 1")),
+            "an error is never hidden"
+        );
+        assert!(
+            pane.iter().any(|l| l.contains("TDR timeout")),
+            "a kernel line is never hidden"
+        );
+        assert_eq!(
+            pane.last().unwrap(),
+            "LEM (40 debug lines hidden: GET /api/v1 polling)"
+        );
 
         // no polls, no marker: an honest pane says nothing about noise that never happened
         let quiet = pane_lines(

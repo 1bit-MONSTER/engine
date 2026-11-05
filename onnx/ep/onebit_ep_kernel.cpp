@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <vector>
 #ifdef ONEBIT_EP_NPU
@@ -50,6 +51,35 @@
 namespace onebit_ep {
 namespace {
 
+// Every note of this file goes through here.
+//
+// open(0600) + fdopen, not fopen("a"): fopen creates with 0666 & ~umask, so under a permissive umask the
+// note is world-writable in /tmp (CodeQL cpp/world-writable-file-creation), and it would follow a symlink
+// planted at that path. This is exactly what the EP's own trace does (onebit_ep.cpp, tracef), so the two
+// writers agree on the mode as well as the file.
+//
+// `stderr_too` exists for the one caller whose only output this is (ONEBIT_EP_QDQ_PROF): a knob that prints
+// nowhere when ONEBIT_EP_TRACE is off is the same footgun as the path-vs-flag bug above, so that line is
+// never silently dropped.
+void trace_line(const char* line, bool stderr_too) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/tmp/onebit_ep_trace.%ld.log", (long)::getpid());
+    bool written = false;
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        FILE* f = ::fdopen(fd, "a");
+        if (f) {
+            std::fputs(line, f);
+            std::fputc('\n', f);
+            std::fclose(f);
+            written = true;
+        } else {
+            ::close(fd);
+        }
+    }
+    if (!written || stderr_too) std::fprintf(stderr, "%s\n", line);
+}
+
 // ONEBIT_EP_TRACE is a *flag* -- onebit_ep.cpp opens /tmp/onebit_ep_trace.<pid>.log when it is set --
 // so a fallback note has to be appended to that same file. Reading the variable as a path (which this
 // file did until it cost me a debugging session) opens a file literally named "1" in whatever the
@@ -57,25 +87,39 @@ namespace {
 void trace_fallback(const char* fmt, ...) {
     const char* on = std::getenv("ONEBIT_EP_TRACE");
     if (!on || !*on || *on == '0') return;
-    char path[64];
-    std::snprintf(path, sizeof(path), "/tmp/onebit_ep_trace.%ld.log", (long)::getpid());
-    // open(0600) + fdopen, not fopen("a"): fopen creates with 0666 & ~umask, so under a permissive umask the
-    // note is world-writable in /tmp (CodeQL cpp/world-writable-file-creation), and it would follow a symlink
-    // planted at that path. This is exactly what the EP's own trace does (onebit_ep.cpp, tracef), so the two
-    // writers agree on the mode as well as the file.
-    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0) return;
-    FILE* f = ::fdopen(fd, "a");
-    if (!f) {
-        ::close(fd);
-        return;
-    }
+    char line[1024];
     va_list ap;
     va_start(ap, fmt);
-    std::vfprintf(f, fmt, ap);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    std::fputc('\n', f);
-    std::fclose(f);
+    trace_line(line, /*stderr_too=*/false);
+}
+
+// ONEBIT_EP_QDQ_PROF=1: where the fused group's wall time goes, as one running total written when the
+// process exits. #1023 measured the device arm 1.13-1.16x *slower* than the host arm at model level while
+// the per-design probe, at the same shapes, had the device kernels 1.7x ahead; the two readings reconcile
+// only if the per-call dispatch or the probe's synthetic operands account for the gap, and nothing
+// separated them. This does: the same clock on both legs, over the graph's own int8 bytes, in the arm that
+// runs them. Off unless asked, one line per process, so an unmeasured run pays one getenv and one branch.
+struct Q8Prof {
+    const bool on = std::getenv("ONEBIT_EP_QDQ_PROF") != nullptr;
+    double dev_call_ms = 0, dev_epi_ms = 0, host_ms = 0;
+    long calls_dev = 0, calls_host = 0, rows_dev = 0, rows_host = 0;
+    ~Q8Prof() {
+        if (!on || (calls_dev == 0 && calls_host == 0)) return;
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "qdq_prof calls_dev=%ld calls_host=%ld rows_dev=%ld rows_host=%ld"
+                      " dev_call_ms=%.1f dev_epi_ms=%.1f host_ms=%.1f",
+                      calls_dev, calls_host, rows_dev, rows_host, dev_call_ms, dev_epi_ms, host_ms);
+        // Bare stderr when ONEBIT_EP_TRACE is off: this line is the knob's whole output, and losing the one
+        // measurement that answers the question is not worth saving a trace file.
+        trace_line(line, /*stderr_too=*/std::getenv("ONEBIT_EP_TRACE") == nullptr);
+    }
+};
+Q8Prof& q8_prof() {
+    static Q8Prof p;
+    return p;
 }
 
 }  // namespace
@@ -170,8 +214,19 @@ void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, 
     } else {
         std::vector<int32_t> acc((size_t)m * (size_t)n);
         std::string why;
+        Q8Prof& p = q8_prof();
+        const auto t_dev = p.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (onebit::npu::gemm_q8_raw(a, m, k, n, b, acc.data(), &why)) {
+            const auto t_epi =
+                p.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             for (int64_t i = 0; i < m; ++i) epilogue_row(acc.data() + i * n, i, y + i * n);
+            if (p.on) {
+                const auto t_end = std::chrono::steady_clock::now();
+                p.dev_call_ms += std::chrono::duration<double, std::milli>(t_epi - t_dev).count();
+                p.dev_epi_ms += std::chrono::duration<double, std::milli>(t_end - t_epi).count();
+                p.calls_dev++;
+                p.rows_dev += m;
+            }
             return;
         }
         trace_fallback("npu_qdq_fallback k=%lld n=%lld why=%s", (long long)k, (long long)n,
@@ -179,6 +234,10 @@ void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, 
     }
 #endif
 
+    // Also where a refused or busy device call ends up, so host_ms is the whole host leg, not just the
+    // calls that were policy-routed here.
+    Q8Prof& p = q8_prof();
+    const auto t_host = p.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::vector<int32_t> acc((size_t)n);
     for (int64_t i = 0; i < m; ++i) {
         std::fill(acc.begin(), acc.end(), 0);
@@ -190,6 +249,12 @@ void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, 
             for (int64_t j = 0; j < n; ++j) acc[(size_t)j] += aik * brow[j];
         }
         epilogue_row(acc.data(), i, y + i * n);
+    }
+    if (p.on) {
+        p.host_ms += std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t_host).count();
+        p.calls_host++;
+        p.rows_host += m;
     }
 }
 

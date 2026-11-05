@@ -33,7 +33,7 @@
 //! still draws the screen. Nothing is clipped: every string goes through `wrap_words` before it reaches a widget,
 //! because the c16 board showed "firmware prese".
 
-use crate::facts::{human_bytes, human_uptime, wrap_words, Facts, SecureBoot};
+use crate::facts::{human_bytes, human_uptime, wrap_hanging, wrap_words, Facts, SecureBoot};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -447,11 +447,15 @@ pub fn menu_lines() -> Vec<String> {
 }
 
 /// The same rows as drawn: wrapped (never clipped) with a continuation indent, should the screen be narrower
-/// than the longest label.
+/// than the longest label. The indent is spent out of the wrap, not added after it: a row indented to the pane
+/// width is a row the widget clips (`wrap_hanging`).
 pub fn menu_rows(width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for row in menu_lines() {
-        for (i, part) in wrap_words(&row, width).into_iter().enumerate() {
+        for (i, part) in wrap_hanging(&row, width, width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
             let text = if i == 0 { part } else { format!("  {part}") };
             out.push(styled(text, Some(Color::Cyan), i == 0));
         }
@@ -486,7 +490,7 @@ fn log_lines(a: &App, height: usize, width: usize) -> Vec<Line<'static>> {
         } else {
             Some(Color::Gray)
         };
-        let block: Vec<(Option<Color>, String)> = wrap_words(rec, width)
+        let block: Vec<(Option<Color>, String)> = wrap_hanging(rec, width, width.saturating_sub(2))
             .into_iter()
             .enumerate()
             .map(|(i, w)| (color, if i == 0 { w } else { format!("  {w}") }))
@@ -630,14 +634,16 @@ fn compact_status(f: &Facts, width: usize) -> Vec<Line<'static>> {
         fields.push(format!("{t:.0} tok/s"));
     }
 
-    let text = pack_fields(&fields, width);
+    // the hanging indent belongs to the block, so `pack_fields` puts it on and this only colours the rows; two
+    // indents (one here, one there) put a wrapped field four cells in and two cells past the pane
+    let text = pack_fields(&fields, width, width.saturating_sub(2));
     text.into_iter()
         .enumerate()
         .map(|(i, l)| {
             if i == 0 {
                 styled(l, Some(Color::Gray), false)
             } else {
-                styled(format!("  {l}"), Some(Color::DarkGray), false)
+                styled(l, Some(Color::DarkGray), false)
             }
         })
         .collect()
@@ -645,11 +651,15 @@ fn compact_status(f: &Facts, width: usize) -> Vec<Line<'static>> {
 
 /// Pack `A | B | C` into as few rows as the width allows WITHOUT splitting a field: at 80 columns the six facts
 /// come out as two rows, and `DATA` never ends up alone at the end of the first one. A field wider than the whole
-/// screen (a long device name on a 40-column serial line) is wrapped by itself rather than cut.
-fn pack_fields(fields: &[String], width: usize) -> Vec<String> {
+/// screen (a long device name on a 40-column serial line) is wrapped by itself rather than cut. `first` is the
+/// opening row and `rest` the rows after it (`width - 2`: this function owns the two-cell hanging indent).
+fn pack_fields(fields: &[String], first: usize, rest: usize) -> Vec<String> {
+    let first = first.max(1);
+    let rest = rest.max(1);
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     for field in fields {
+        let width = if out.is_empty() { first } else { rest };
         if cur.is_empty() {
             cur = field.clone();
         } else if cur.chars().count() + 3 + field.chars().count() <= width {
@@ -659,19 +669,24 @@ fn pack_fields(fields: &[String], width: usize) -> Vec<String> {
             out.push(std::mem::take(&mut cur));
             cur = field.clone();
         }
+        // `cur` may start a row that is indented, so ask again after a push rather than reusing the old width
+        let width = if out.is_empty() { first } else { rest };
         if cur.chars().count() > width {
-            let mut parts = wrap_words(&cur, width).into_iter();
+            let mut parts = wrap_hanging(&cur, width, rest).into_iter();
             if let Some(first) = parts.next() {
                 out.push(first);
             }
-            out.extend(parts.map(|p| format!("  {p}")));
+            out.extend(parts);
             cur.clear();
         }
     }
     if !cur.is_empty() {
         out.push(cur);
     }
-    out
+    out.into_iter()
+        .enumerate()
+        .map(|(i, r)| if i == 0 { r } else { format!("  {r}") })
+        .collect()
 }
 
 /// `HRX0: AMD Radeon 8060S Graphics` -> `HRX0`: the colons separate the runtime's node from the marketing name.
@@ -1196,6 +1211,53 @@ mod tests {
             );
         }
         assert!(!text.contains("waiting for network"), "{text}");
+    }
+
+    fn span_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_log_continuation_fits_the_pane_it_is_drawn_on() {
+        // The defect this holds: `log_lines` wrapped a record to the pane width and THEN indented every
+        // continuation row by two, so those rows were drawn two cells wider than the pane and the widget clipped
+        // their end. Measured with the shipped binary at 80x25: a record of 4-char tokens drew `… a36 a37 a3` and
+        // then `a39 a40` - `a38` gone, `a3` a word cut in the middle. A record with one unbroken token is the
+        // case that fills a row exactly, so it is the one that fails when the indent is not in the budget.
+        let mut f = c16_board();
+        f.logs = vec![
+            format!("LEM {} tail", "x".repeat(200)),
+            "LEM 2026-11-03 12:07:41 lemond: POST /api/v1/chat/completions 200".to_string(),
+        ];
+        for w in 20..=240usize {
+            for (i, line) in log_lines(&app(f.clone()), 12, w).iter().enumerate() {
+                let text = span_text(line);
+                assert!(
+                    text.chars().count() <= w,
+                    "width {w}: drawn log row {i} is {} cells: {text:?}",
+                    text.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_packed_status_row_fits_the_pane_it_is_drawn_on() {
+        // Same class one block up: `pack_fields` packed to the width and `compact_status` indents the rows after the
+        // first by two. A field wider than the screen is hard-broken into exactly-width pieces, which is the case
+        // that overflowed. `w < 100` is the compact layout.
+        let mut f = c16_board();
+        f.engine = Some("e".repeat(120));
+        for w in 20..99usize {
+            for (i, line) in compact_status(&f, w).iter().enumerate() {
+                let text = span_text(line);
+                assert!(
+                    text.chars().count() <= w,
+                    "width {w}: drawn status row {i} is {} cells: {text:?}",
+                    text.chars().count()
+                );
+            }
+        }
     }
 
     #[test]

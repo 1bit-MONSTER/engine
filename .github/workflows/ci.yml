@@ -60,6 +60,10 @@ jobs:
           python3 tests/mtp_draft_vocab_test.py
           python3 tests/check_pins_test.py
           python3 tests/hrx_long_prompt_test.py
+          python3 tools/template_bom.py --self-test          # the chat-template BOM component
+      - name: Model pins
+        # fixtures only: models/pins.json itself is compared with the Hub by pin-watch.yml
+        run: python3 tools/pin_watch.py --self-test
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-16 -DCMAKE_CXX_COMPILER=g++-16
       - name: Build

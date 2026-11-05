@@ -1,0 +1,43 @@
+{
+  "version": "1",
+  "scorer": {
+    "hf_repo": "mys/laya-typed-decisions-GGUF",
+    "file": "laya_typed_decisions_q8_0.gguf",
+    "device": "hrx"
+  },
+  "pull_budget_s": 600,
+  "default_model": "Qwen3-0.6B-1bit",
+  "classes": {
+    "short": {
+      "model": "Qwen3-0.6B-1bit",
+      "hf_repo": "1bit-MONSTER/Qwen3-0.6B-GGUF",
+      "file": "Qwen3-0.6B-Q8_0.gguf",
+      "device": "hrx",
+      "ctx": 8192
+    },
+    "prose": {
+      "model": "ZAYA1-8B-1bit",
+      "hf_repo": "1bit-MONSTER/ZAYA1-8B-GGUF",
+      "file": "zaya1-8b-Q4_K_M.gguf",
+      "device": "hrx",
+      "ctx": 16384
+    },
+    "code": {
+      "model": "Qwen3-Coder-30B-A3B-Instruct-1bit",
+      "hf_repo": "1bit-MONSTER/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+      "file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+      "device": "hrx",
+      "ctx": 32768
+    },
+    "long_doc": {
+      "model": "Qwen3.8-27B-1bit",
+      "hf_repo": "1bit-MONSTER/Qwen3.8-27B-UD-Q4_K_XL-MTP",
+      "file": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "device": "hrx",
+      "ctx": 65536,
+      "extra_files": [
+        "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
+      ]
+    }
+  }
+}

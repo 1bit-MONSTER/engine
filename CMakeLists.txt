@@ -212,10 +212,18 @@ add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
+# The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):
+# a load started right after an evict can hit the previous backend's hardware context still being torn down, which used
+# to be fatal on the first attempt. Header only, no device, no model.
+add_executable(npu_load_retry_test tests/npu_load_retry_test.cpp)
+target_include_directories(npu_load_retry_test PRIVATE app)
+add_test(NAME npu_load_retry COMMAND npu_load_retry_test)
+
 add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose target is
 # not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test serve_watchdog_test)
+add_dependencies(npu_sampling_test npu_load_retry_test)
 # The MTP draft loop (npu/mtp/draft.h): draft k tokens, verify them as one batch, keep the longest prefix
 # the base model agrees with, roll its state back.  Policy only -- a toy base model and toy draft heads stand
 # in for the forward and the MTP head, so the invariants (identical text whatever the head proposes, exact
@@ -742,6 +750,14 @@ add_executable(npu_forward_loader_test tests/npu_forward_loader_test.c npu/forwa
 target_include_directories(npu_forward_loader_test PRIVATE npu/forward/include)
 target_link_libraries(npu_forward_loader_test PRIVATE m)
 add_test(NAME npu_forward_loader COMMAND npu_forward_loader_test)
+
+# rope_type "llama3" (npu/forward/include/q4nx_rope.h, engine#1048): the frequency band is fixed data.
+# Old code built theta^(-i/half) for every dim pair, and 17 of Llama-3.2-1B's 32 differ from that.
+add_executable(npu_rope_llama3_test tests/npu_rope_llama3_test.c)
+target_include_directories(npu_rope_llama3_test PRIVATE npu/forward/include)
+target_link_libraries(npu_rope_llama3_test PRIVATE m)
+add_test(NAME npu_rope_llama3 COMMAND npu_rope_llama3_test)
+add_dependencies(npu_sampling_test npu_rope_llama3_test)
 # The activation rotation a folded container needs (npu/forward/include/hadamard.h): its SIMD path must be
 # bit-identical to the shipped scalar loop on every shape a container carries, and the scalar loop must still
 # be the Hadamard transform.  Header only, no device, no model: runs in CI.

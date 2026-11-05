@@ -344,6 +344,11 @@ the same fill is 0.47 s. A first request on a fresh serve therefore costs one fi
 cold) on top of its prefill, and every request after it on the same serve costs none. Do not read a
 per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments, and
 `[bs]` is the same partition for one batched pass (a verify batch), whose interior a per-token line cannot see.
+`NPU_COPY_PROF=1` adds a `[cp]` line to both: the **bytes and milliseconds the host moves at its own copy
+sites** (`qkv_split`, `attn_gate`, `ctx_row`, `mlp_in`, `mlp_out`), one figure per site and a `KiB/row` total
+for a batched pass. The phase lines above attribute device time only, so a host row copy lands in their `host=`
+residual with nothing to separate it; `[cp]` is the line that says how much is left to remove rather than
+time it as part of the layer's wall.
 
 ### From a GGUF
 

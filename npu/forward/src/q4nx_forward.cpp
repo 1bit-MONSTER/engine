@@ -2871,6 +2871,58 @@ inline double ph_ms(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - t).count();
 }
+// Host-copy accounting (NPU_COPY_PROF=1).  The [ph]/[bs] lines say what the *device* did; these say what
+// the host moved into and out of its own vectors on the same pass, per site, in bytes and milliseconds.
+// That is the figure an audit of "what is left to remove" needs and a phase residual cannot give: the
+// sites are host-side row gathers whose cost is invisible inside gemm/wait/readback.  Additive
+// measurement only, exactly like the phases above: nothing in the compute path reads it, and with the
+// variable unset nothing is counted and nothing is printed.
+enum CopySite { CP_QKV, CP_GATE, CP_CTX, CP_MLP_IN, CP_MLP_OUT, CP_N };
+const char* const kCopySiteName[CP_N] = {"qkv_split", "attn_gate", "ctx_row", "mlp_in", "mlp_out"};
+struct CopySites {
+    double b[CP_N]{};
+    double ms[CP_N]{};
+    long   n[CP_N]{};
+    int    rows = 0;      // rows a batched pass accounted, so bytes/row is read, not divided
+};
+CopySites g_cp;
+inline bool cpprof_on() {
+    static const bool on = getenv("NPU_COPY_PROF") != nullptr;
+    return on;
+}
+inline void cp_count(int site, size_t bytes) {
+    if (!cpprof_on()) return;
+    g_cp.b[site] += (double)bytes; g_cp.n[site]++;
+}
+inline void cp_reset() {
+    if (!cpprof_on()) return;
+    g_cp = CopySites{};
+}
+// Times one site's region; its bytes are counted with cp_count() inside the same scope, so the site's
+// ms and its bytes describe the same work.
+struct CpScope {
+    int  site;
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    explicit CpScope(int s)
+        : site(s), on(cpprof_on()),
+          t0(on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~CpScope() { if (on) g_cp.ms[site] += ph_ms(t0); }
+};
+void cp_print(const char* what) {
+    if (!cpprof_on()) return;
+    double tb = 0, tm = 0;
+    fprintf(stderr, "[cp] %s host copies:", what);
+    for (int i = 0; i < CP_N; i++) {
+        if (!g_cp.n[i]) continue;
+        fprintf(stderr, " %s=%.1fKiB/%ld/%.3fms", kCopySiteName[i], g_cp.b[i] / 1024.0, g_cp.n[i],
+                g_cp.ms[i]);
+        tb += g_cp.b[i]; tm += g_cp.ms[i];
+    }
+    fprintf(stderr, " total=%.1fKiB %.3fms", tb / 1024.0, tm);
+    if (g_cp.rows > 1) fprintf(stderr, " (%.1fKiB/row)", tb / 1024.0 / (double)g_cp.rows);
+    fprintf(stderr, "\n");
+}
 struct BatchPhaseScope {   // g_in_batch for the batched body, cleared on every return path
     bool prev;
     explicit BatchPhaseScope(bool on) : prev(g_in_batch) { if (on) g_in_batch = true; }
@@ -3709,6 +3761,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         g_ph = StepPhases{};
         for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
     }
+    cp_reset();
+    if (cpprof_on()) g_cp.rows = M;
     BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
     const auto tp_bs = phb ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
@@ -3795,6 +3849,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 // Each of the four GEMMs wrote M rows of *its* design's N (padded, engine#854), so the
                 // reads go through the design's stride -- the same class as O/D/gate-up below.
                 const size_t sq = (size_t)gq->N, skv = (size_t)gk->N;
+                CpScope _cp(CP_QKV);
                 for (int m = 0; m < M; m++) {
                     float* d = QKV.data() + (size_t)m * n_on;
                     memcpy(d, qh0.data() + (size_t)m * sq, (size_t)nhd * sizeof(float));
@@ -3803,6 +3858,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                     memcpy(d + 2 * nhd + nkv, kvv.data() + (size_t)m * skv,
                            (size_t)nkv * sizeof(float));
                 }
+                cp_count(CP_QKV, (size_t)M * n_on * sizeof(float));
             } else {
                 npu_gemm_rows(*ctx_[i_qkv_l], XN.data(), M, g->K, g->N, B_.data(), QKV, 0, "attn_qkv",
                               g->real_k);
@@ -3843,8 +3899,12 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             // positions to read (0 = up to and including `pos`, i.e. causal), and `dst` receives the
             // context -- null when the pass only fills the cache (the noncausal first pass below).
             auto row_attn = [&](int m, float* dst, bool append, int kvlen) -> bool {
-                qkv_row.assign(QKV.begin() + (size_t)m * g->N,
-                               QKV.begin() + (size_t)(m + 1) * g->N);
+                {
+                    CpScope _cp(CP_QKV);
+                    qkv_row.assign(QKV.begin() + (size_t)m * g->N,
+                                   QKV.begin() + (size_t)(m + 1) * g->N);
+                    cp_count(CP_QKV, (size_t)g->N * sizeof(float));
+                }
                 // attn_output_gate: the fused QKV is [q | gate | k | v], so attention()
                 // must not see the gate half; the gate multiplies the context after.
                 const float* gate_ptr = nullptr;
@@ -3852,9 +3912,13 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 if (attn_gate_) {
                     const int kvsz = g->k_rows + g->v_rows;
                     qkv_use.assign((size_t)nhd + (size_t)kvsz, 0.0f);
-                    memcpy(qkv_use.data(), qkv_row.data(), (size_t)nhd * sizeof(float));
-                    memcpy(qkv_use.data() + nhd, qkv_row.data() + 2 * nhd,
-                           (size_t)kvsz * sizeof(float));
+                    {
+                        CpScope _cp(CP_GATE);
+                        memcpy(qkv_use.data(), qkv_row.data(), (size_t)nhd * sizeof(float));
+                        memcpy(qkv_use.data() + nhd, qkv_row.data() + 2 * nhd,
+                               (size_t)kvsz * sizeof(float));
+                        cp_count(CP_GATE, ((size_t)nhd + (size_t)kvsz) * sizeof(float));
+                    }
                     gate_ptr = qkv_row.data() + nhd;
                     in = &qkv_use;
                 }
@@ -3867,7 +3931,11 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 if (gate_ptr)
                     for (int i = 0; i < nhd; i++)
                         ctx_row[(size_t)i] *= 1.0f / (1.0f + expf(-gate_ptr[i]));
-                memcpy(dst, ctx_row.data(), (size_t)ctx_w * sizeof(float));
+                {
+                    CpScope _cp(CP_CTX);
+                    memcpy(dst, ctx_row.data(), (size_t)ctx_w * sizeof(float));
+                    cp_count(CP_CTX, (size_t)ctx_w * sizeof(float));
+                }
                 return true;
             };
             // A noncausal pack: every full-attention layer reads the whole prompt, so the cache has to
@@ -3972,10 +4040,18 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             // act_w is the stride both branches above leave ACT at; only the first 2*im columns of a
             // row are real (the rest is the kernel's zero column pad).
             for (int m = 0; m < M; m++) {
-                act_row.assign(ACT.begin() + (size_t)m * act_w,
-                               ACT.begin() + (size_t)m * act_w + (size_t)2 * im);
+                {
+                    CpScope _cp(CP_MLP_IN);
+                    act_row.assign(ACT.begin() + (size_t)m * act_w,
+                                   ACT.begin() + (size_t)m * act_w + (size_t)2 * im);
+                    cp_count(CP_MLP_IN, (size_t)2 * im * sizeof(float));
+                }
                 if (!mlp(act_row, hh, im)) { err_ = "mlp failed"; return false; }
-                memcpy(HH.data() + (size_t)m * im, hh.data(), (size_t)im * sizeof(float));
+                {
+                    CpScope _cp(CP_MLP_OUT);
+                    memcpy(HH.data() + (size_t)m * im, hh.data(), (size_t)im * sizeof(float));
+                    cp_count(CP_MLP_OUT, (size_t)im * sizeof(float));
+                }
             }
         }
         {
@@ -4064,6 +4140,11 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                      M, start_pos, c_.NL, (int)two_widths);
     }
     bph.print(M);
+    {
+        char cp_what[48];
+        snprintf(cp_what, sizeof cp_what, "batch M=%d start=%d", M, start_pos);
+        cp_print(cp_what);
+    }
     if (phb) {
         // epilogue = final norm + the head rows; head= is run_lm_head_rows' own timer, so
         // epilogue - head is the per-row final norm.  tail must be ~0: it is what the partition misses.
@@ -4711,6 +4792,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         g_ph = StepPhases{};
         for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
     }
+    cp_reset();
     const int H = c_.H;
     if (token < 0 || token >= c_.NV) { err_ = "token out of range"; return false; }
 
@@ -4881,10 +4963,14 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                     return false;
                 }
                 qkv.assign((size_t)2 * nhd + (size_t)2 * nkv, 0.0f);
-                memcpy(qkv.data(), qh0.data(), (size_t)nhd * sizeof(float));
-                memcpy(qkv.data() + nhd, qh1.data(), (size_t)nhd * sizeof(float));
-                memcpy(qkv.data() + 2 * nhd, kvk.data(), (size_t)nkv * sizeof(float));
-                memcpy(qkv.data() + 2 * nhd + nkv, kvv.data(), (size_t)nkv * sizeof(float));
+                {
+                    CpScope _cp(CP_QKV);
+                    memcpy(qkv.data(), qh0.data(), (size_t)nhd * sizeof(float));
+                    memcpy(qkv.data() + nhd, qh1.data(), (size_t)nhd * sizeof(float));
+                    memcpy(qkv.data() + 2 * nhd, kvk.data(), (size_t)nkv * sizeof(float));
+                    memcpy(qkv.data() + 2 * nhd + nkv, kvv.data(), (size_t)nkv * sizeof(float));
+                    cp_count(CP_QKV, ((size_t)2 * nhd + (size_t)2 * nkv) * sizeof(float));
+                }
             } else {
                 npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv, 0, "attn_qkv",
                          g->real_k);
@@ -4897,12 +4983,18 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             if (attn_gate_) {
                 const int kvsz = g->k_rows + g->v_rows;
                 qkv_use.resize((size_t)nhd + (size_t)kvsz);
-                memcpy(qkv_use.data(), qkv.data(), (size_t)nhd * sizeof(float));
-                memcpy(qkv_use.data() + nhd, qkv.data() + 2 * nhd,
-                       (size_t)kvsz * sizeof(float));
+                {
+                    CpScope _cp(CP_GATE);
+                    memcpy(qkv_use.data(), qkv.data(), (size_t)nhd * sizeof(float));
+                    memcpy(qkv_use.data() + nhd, qkv.data() + 2 * nhd,
+                           (size_t)kvsz * sizeof(float));
+                    cp_count(CP_GATE, ((size_t)nhd + (size_t)kvsz) * sizeof(float));
+                }
                 gate_ptr = qkv.data() + nhd;
             } else {
+                CpScope _cp(CP_GATE);
                 qkv_use = qkv;
+                cp_count(CP_GATE, qkv.size() * sizeof(float));
             }
             {
             LhScope _tlh(LH_ATTN);
@@ -5139,6 +5231,13 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         char lhwhat[48];
         snprintf(lhwhat, sizeof lhwhat, "tok %d", token);
         lh_dump_layer_host(lhwhat, "token");
+    }
+    // Independent of NPU_PHASE_PROF: the copy accounting answers a different question and must be readable
+    // with only NPU_COPY_PROF set.
+    {
+        char cp_what[48];
+        snprintf(cp_what, sizeof cp_what, "tok %d pos %d", token, pos);
+        cp_print(cp_what);
     }
     return true;
 }

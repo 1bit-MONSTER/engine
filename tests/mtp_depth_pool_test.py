@@ -240,7 +240,15 @@ check("vocab 248320, max_batch_rows 16, hidden post-final-norm" in out15 and "MI
 # Without this the known answer is only checkable on the machine that holds the original `npu-hold` logs, i.e. the tool
 # that produces the deliverable's published verdict could break it and CI would not notice.
 FIXTURES = os.path.join(ROOT, "tests", "fixtures", "mtp_clause55")
-CL = [os.path.join(FIXTURES, n) for n in ("p0.log", "p1-4.log", "p5-7.log")]
+CL = [os.path.join(FIXTURES, n) for n in ("p0.txt", "p1-4.txt", "p5-7.txt")]
+# A fixture that is present on the machine but not COMMITTED is the worse failure mode: the test passes locally and the
+# CI checkout has nothing to read. It happened with `.log` (`.gitignore:19`), so being tracked is checked here when the
+# tree is a git checkout, and the files carry a suffix the ignore rules do not match.
+if os.path.isdir(os.path.join(ROOT, ".git")) or os.path.exists(os.path.join(ROOT, ".git")):
+    listed = subprocess.run(["git", "-C", ROOT, "ls-files", "--"] + [os.path.relpath(p, ROOT) for p in CL],
+                            capture_output=True, text=True)
+    tracked = len([l for l in listed.stdout.splitlines() if l.strip()])
+    check(tracked == len(CL), f"the three fixtures are tracked by git ({tracked} of {len(CL)})")
 if all(os.path.exists(p) for p in CL):
     r16 = subprocess.run([sys.executable, TOOL, "--selftest"] + CL, capture_output=True, text=True)
     check(r16.returncode == 0, f"the shipped fixtures reproduce the recorded 8x64 window (rc={r16.returncode})")

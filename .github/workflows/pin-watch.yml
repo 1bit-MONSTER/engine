@@ -88,17 +88,26 @@ jobs:
             if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null 2>&1; then
               echo "$branch already exists"; continue
             fi
-            git switch -c "$branch" main --quiet
-            if ! python3 tools/pin_watch.py --bump "$repo"; then
-              # a tracked file vanished upstream: the report says so, and a human decides
-              echo "::warning::$repo could not be bumped automatically (see the report)"
+            # -C, not -c: a bump that failed earlier in this run left its branch behind, and a
+            # "branch already exists" abort here would leave every later repo unbumped
+            git switch -C "$branch" main --quiet
+            rc=0
+            python3 tools/pin_watch.py --bump "$repo" || rc=$?
+            if [ "$rc" -eq 4 ]; then
+              # gone upstream, or a tracked file did: the report says so, and a human decides
+              echo "::warning::$repo needs a human decision (see the report); no bump opened"
+              git checkout -- models/pins.json 2>/dev/null || true
               git switch main --quiet
               continue
+            elif [ "$rc" -ne 0 ]; then
+              # anything else is an unread upstream, which is not a clean day
+              echo "::error::$repo could not be bumped (rc=$rc): this run is not a clean one"
+              exit 1
             fi
             python3 tools/pin_watch.py --pr-body "$repo" > body.md || true
             newsha=$(python3 -c 'import json,sys; print(json.load(open("models/pins.json"))["pins"][sys.argv[1]]["commit"][:8])' "$repo")
             git add models/pins.json
-            git commit -q -m "pin: $repo at $newsha""
+            git commit -q -m "pin: $repo at $newsha"
             git push -q origin "$branch"
             gh pr create --base main --head "$branch" --title "Pin: $repo" --body-file body.md
             git switch main --quiet

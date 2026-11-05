@@ -40,6 +40,7 @@
 #include "model.h"
 #include "plan/plan.h"  // plan.json (engine #799 P1): the stream plan replaces the filename probes
 #include "q4nx_pack.h"        // Q4nxDesignGeom / Q4nxModelDims (derived design table)
+#include "q4nx_rope.h"        // rope_type "llama3" frequency scaling (engine#1048)
 #include "q4nx_semantics.h"   // Q4nxSemantics (config-derived architecture flags)
 #include <memory>
 #include <unordered_map>
@@ -475,6 +476,7 @@ private:
     std::vector<std::vector<float>> q_norm_, k_norm_;       // [NL][HD]
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
+    Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else
     // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
     // every other architecture.  MiniCPM4 scales the embedding by 12 and each
     // residual branch by scale_depth/sqrt(NL) (0.2475 for 32 layers); skipping

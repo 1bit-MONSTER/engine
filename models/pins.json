@@ -2175,6 +2175,21 @@
    ],
    "files": {}
   },
+  "stabilityai/sd-turbo": {
+   "commit": "b261bac6fd2cf515557d5d0707481eafa0485ec2",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: c25 image HF cache snapshot b261bac6 (image model, no chat template)"
+   ],
+   "files": {
+    "sd_turbo.safetensors": {
+     "oid": "3f067a1b943cf162f2b8f8588f6cf5824bd5b4c7d1d88d87164b9ca123616549",
+     "size": 5214561328,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
   "unsloth/Apertus-8B-Instruct-2509-GGUF": {
    "commit": "61c32783830424ac7a6d0fd80d4166e29dbaee06",
    "pinned": "2026-11-05",

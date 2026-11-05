@@ -1,3 +1,19 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
 # Model pins: the revision of every upstream model we depend on
 
 The census ([registry.md](registry.md)) counts what the engine *can* run. It does not record **which
@@ -26,6 +42,18 @@ three shards to four) and the files we re-hosted were still the 2026-11-02 ones,
   `size`, and `template_sha256`, the chat template that file carries at that revision.
 - `used_for` — why the repo is pinned: a `laya-first` serve class, a stick/Lemonade catalogue row, a
   published `1bit-MONSTER` re-host, or the upstream of one.
+
+A model **baked into a stick image** is pinned from the image's own Hugging Face cache, which records the
+snapshot commit the image was built from (`~/stage-c25/hf/models--<org>--<name>/snapshots/<commit>`). That
+is provenance rather than an assumption: the two chat models the c25 image bakes (`Qwen3-4B-Instruct-2507`,
+the FastFlowLM NPU pack) pin to exactly the commits the image's cache names, and `stabilityai/sd-turbo` —
+the image model, which carries no chat template — was added with its 5,214,561,328-byte safetensors hashed
+locally to confirm it is the file upstream serves at that commit.
+
+Of the 154 model files staged on this box, the 11 whose names match a pinned file are pinned at file
+level; the rest are test vocabularies (`ggml-vocab-*`), conversion intermediates, or additional quant
+variants of repos that are pinned at revision level — the revision check still catches a vendor re-push for
+those, which is the case that matters.
 
 `files` records what we hold rather than only what upstream said, because a pin taken *after* a vendor
 re-push would otherwise store our older copies under the newer commit and look clean. Both facts are

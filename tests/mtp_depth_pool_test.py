@@ -162,8 +162,8 @@ check("3 of 3 scored depths" in out6 and "1 of 4 depths unmeasured: 4" in out6,
 #
 # This lane runs one or two prompts per ticket, so prompts 0,1,5,6,7 is a normal pool -- but printed as
 # "prompts 0..7" it reads as the brief's whole window.
-def ticket(p):
-    return (f"prompt {p}: TEXT IDENTICAL, 64 tokens, accepted 4/16, passes/token 0.500, stream 72 rows, 0 mismatch\n"
+def ticket(p, tokens=64):
+    return (f"prompt {p}: TEXT IDENTICAL, {tokens} tokens, accepted 4/16, passes/token 0.500, stream 72 rows, 0 mismatch\n"
             f"depth 1: live  80.00 % (8/10, reached)  offline conditional  80.00 % (8/10)\n"
             f"depth 1: live  80.00 % (8/10)  offline  80.00 % (8/10)  delta  +0.00 pp  PASS\n")
 
@@ -172,10 +172,23 @@ rc7, out7, _ = run([], [(f"p{p}.log", ticket(p)) for p in (0, 1, 5)])
 check(rc7 == 0, "a gapped prompt set pools without a refusal (per-prompt tickets are the normal case)")
 check("NOT a contiguous window: 2,3,4 missing of 0..5" in out7,
       f"the header names the hole instead of spanning it: {out7.splitlines()[0]}")
+check("64 tokens/prompt" in out7, "a uniform budget is stated in the header")
 rc8, out8, _ = run([], [(f"q{p}.log", ticket(p)) for p in (0, 1, 2)])
 check("prompts 0..2" in out8 and "NOT a contiguous" not in out8, "a contiguous pool keeps the plain range form")
 
-# 8. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
+# 8. the generation budget is part of the window: 8 prompts x 64 tokens is the brief's, so a pool that mixes
+# budgets says so instead of inheriting the shape of whichever ticket it read first.
+rc9, out9, _ = run([], [("t64.log", ticket(0)), ("t128.log", ticket(1, tokens=128))])
+check(rc9 == 0, "mixed budgets still pool (a longer prompt is a legitimate measurement)")
+check("MIXED token budgets" in out9 and "64 on prompts 0" in out9 and "128 on prompts 1" in out9,
+      f"the mixed budget is named per prompt: {[l for l in out9.splitlines() if 'MIXED' in l]}")
+
+# 9. the same prompt at two lengths is a contradiction about the same cell, not a wider window.
+rc10, _, err10 = run([], [("same64.log", ticket(3)), ("same32.log", ticket(3, tokens=32))])
+check(rc10 == 1 and "two lengths of the same prompt" in err10,
+      f"prompt 3 at 64 and at 32 tokens is refused: {err10.strip()[:110]}")
+
+# 10. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
 r = subprocess.run([sys.executable, TOOL, "--selftest"], capture_output=True, text=True)
 check(r.returncode == 0 and "selftest PASS tail repeat" in r.stdout, "the tool's refusal self-test passes")
 

@@ -59,6 +59,11 @@ NOTSCORED = re.compile(r"depth (\d+):\s+n/a \(live (\d+)/(\d+) reached, offline 
 RUNLEVEL = re.compile(r"depth (\d+):\s+live\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+"
                       r"offline\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+delta")
 PROMPT = re.compile(r"(?:per-depth p|prompt )(\d+)\b")
+# The live per-prompt header carries the generation budget, and it is the only shape that carries it correctly:
+#     prompt 0: TEXT IDENTICAL, 64 tokens, accepted 44/80, passes/token 0.625, stream 72 rows, 0 mismatch
+# (the offline header's "N tokens" at the same position is the stream length, not the budget, so it is not read
+# here.)  The brief's window is 8 prompts x 64 tokens, so a pool mixing budgets is not one window.
+PROMPT_TOKENS = re.compile(r"prompt (\d+):\s+(?:TEXT IDENTICAL|TEXT DIVERGED),\s+(\d+) tokens,")
 
 # The numbers this tool must reproduce when it is pointed at the recorded window (TMTPLOOP-STATE.md,
 # 2026-11-05): live (num, den) and offline (num, den) per depth, over 8 prompts x 64 tokens.
@@ -66,18 +71,21 @@ RECORDED = {1: (136, 181, 136, 181), 2: (86, 136, 84, 134), 3: (63, 86, 60, 82),
 
 
 def parse_ticket(path):
-    """Return ({prompt, depth: (live_n, live_d, off_n, off_d)}, {depths the log says were not scored}).
+    """Return ({prompt, depth: counts}, {depths not scored}, {prompt: tokens emitted}) for one ticket log.
 
     Raises SystemExit on a log it must not pool: a depth row before any prompt header (nothing to key it to),
     a cell scored twice with different counts, or per-prompt rows that do not add up to the ticket's own
     run-level row (a short read)."""
-    cells, runlevel, prompt, not_scored = {}, {}, None, set()
+    cells, runlevel, prompt, not_scored, budget = {}, {}, None, set(), {}
     for ln in open(path, errors="replace").read().splitlines():
         if "== ticket exited" in ln:  # trap 1: everything after this is the harness echoing the summary
             break
         m = PROMPT.search(ln)
         if m and "depth " not in ln:
             prompt = int(m.group(1))
+            t = PROMPT_TOKENS.search(ln)
+            if t:
+                budget[prompt] = int(t.group(2))
             continue
         m = DETAIL.search(ln)
         if m:
@@ -108,7 +116,7 @@ def parse_ticket(path):
     if runlevel and len(runlevel) != len({d for _, d in cells}):
         raise SystemExit(f"mtp_depth_pool: {path}: run-level row covers {sorted(runlevel)} but per-prompt rows "
                          f"cover {sorted({d for _, d in cells})}")
-    return cells, not_scored
+    return cells, not_scored, budget
 
 
 def pool(paths):
@@ -117,9 +125,15 @@ def pool(paths):
     Returns (cells, unmeasured, sources); `unmeasured` holds the depths some ticket reported as `not scored`
     that no ticket scored a cell for -- kept, so the pool cannot report a pass over a depth it never saw."""
     seen, unmeasured, sources = {}, set(), 0
+    budget = {}
     for p in paths:
-        rows, not_scored = parse_ticket(p)
+        rows, not_scored, bud = parse_ticket(p)
         unmeasured |= not_scored
+        for pr, tk in bud.items():
+            if pr in budget and budget[pr] != tk:
+                raise SystemExit(f"mtp_depth_pool: {p} ran prompt {pr} for {tk} tokens but an earlier ticket ran "
+                                 f"it for {budget[pr]} -- two lengths of the same prompt are not one window")
+            budget.setdefault(pr, tk)
         if not rows:
             print(f"mtp_depth_pool: {p}: no matched rows (was it run with --live --match?)", file=sys.stderr)
             continue
@@ -129,7 +143,7 @@ def pool(paths):
                 raise SystemExit(f"mtp_depth_pool: {p} disagrees with an earlier ticket on prompt {k[0]} "
                                  f"depth {k[1]}: {seen[k]} then {v}")
             seen.setdefault(k, v)
-    return seen, unmeasured - {d for _, d in seen}, sources
+    return seen, unmeasured - {d for _, d in seen}, sources, budget
 
 
 def coverage(prompts):
@@ -145,12 +159,28 @@ def coverage(prompts):
             f"{','.join(str(p) for p in missing)} missing of {lo}..{hi}")
 
 
-def table(seen, sources, unmeasured=()):
+def token_coverage(budget, prompts):
+    """The generation budget the pool actually covers, per prompt, and an explicit note when it is not one value."""
+    got = {p: budget[p] for p in prompts if p in budget}
+    if not got:
+        return "unknown tokens/prompt", None
+    vals = sorted(set(got.values()))
+    if len(vals) == 1:
+        return f"{vals[0]} tokens/prompt", None
+    groups = "; ".join(f"{v} on prompts {','.join(str(p) for p in prompts if got.get(p) == v)}"
+                       for v in vals)
+    return "MIXED token budgets", f"MIXED token budgets: {groups} -- the pooled verdict is not one window"
+
+
+def table(seen, sources, unmeasured=(), budget=None):
     """Print the pooled per-depth table; return (inside, scored, totals per depth)."""
     depths = sorted({d for _, d in seen})
     prompts = sorted({p for p, _ in seen})
+    tokens_note, mixed = token_coverage(budget or {}, prompts)
     print(f"pooled {len(seen)} scored cells = {len(prompts)} prompts x {len(depths)} depths "
-          f"({coverage(prompts)}, {sources} ticket(s))")
+          f"({coverage(prompts)}, {tokens_note}, {sources} ticket(s))")
+    if mixed:
+        print(mixed)
     print(f"\n{'depth':>5}  {'live':>18}  {'offline (same positions)':>24}  {'delta':>9}  verdict")
     inside = scored = 0
     totals = {}
@@ -227,7 +257,7 @@ def refusal_selftest():
         fh.write("prompt 0: TEXT IDENTICAL\n" + d1 + run + tail)
         path = fh.name
     try:
-        cells, _ = parse_ticket(path)
+        cells, _, _ = parse_ticket(path)
         if cells != {(0, 1): (8, 10, 8, 10)}:
             print(f"selftest FAIL tail repeat: parsed {cells}, wanted only the first row", file=sys.stderr)
             return 1
@@ -245,11 +275,11 @@ def main(argv):
             return refusal_selftest()
         print(__doc__)
         return 2
-    seen, unmeasured, sources = pool(paths)
+    seen, unmeasured, sources, budget = pool(paths)
     if not seen:
         print("mtp_depth_pool: nothing to pool", file=sys.stderr)
         return 1
-    _, _, totals = table(seen, sources, unmeasured)
+    _, _, totals = table(seen, sources, unmeasured, budget)
     if not selftest:
         return 0
     bad = {d: (totals.get(d), RECORDED[d]) for d in RECORDED if totals.get(d) != RECORDED[d]}

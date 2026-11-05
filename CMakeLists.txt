@@ -837,6 +837,13 @@ target_link_libraries(npu_rmsnorm_offset_test PRIVATE m)
 add_test(NAME npu_rmsnorm_offset COMMAND npu_rmsnorm_offset_test)
 # Same ci.yml workaround as above: npu_sampling_test is in the workflow's target list, this binary is not.
 add_dependencies(npu_sampling_test npu_rmsnorm_offset_test)
+# layer_types -> per-layer kind, and the name the forward refuses an unimplemented kind by (q4nx_forward.cpp,
+# the engine#1087 shape).  Plain C, links the semantics TU directly, no model and no device.
+add_executable(q4nx_layer_kinds_test tests/q4nx_layer_kinds_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_layer_kinds_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_layer_kinds_test PRIVATE m)
+add_test(NAME q4nx_layer_kinds COMMAND q4nx_layer_kinds_test)
+add_dependencies(npu_sampling_test q4nx_layer_kinds_test)
 set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.json)")
 set(ONEBIT_NPU_MOE_GATE "" CACHE FILEPATH "gate.json from tools/moe_expert_chunks.py gate")
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")

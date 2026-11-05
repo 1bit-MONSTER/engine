@@ -61,7 +61,8 @@ class Moe {
 public:
     // Throws when the directory has no __metadata__.moe, or when that metadata and the tensor
     // shapes disagree (an expert count that does not divide the stack, an offset outside its
-    // tensor, a byte count that is not whole chunks). A kernel must never be handed a bad list.
+    // tensor, a byte count that is not whole chunks, a rows/cols/tiles geometry the tensor's
+    // own shape contradicts). A kernel must never be handed a bad list.
     explicit Moe(const Model& model);
 
     const MoeDims& dims() const { return dims_; }

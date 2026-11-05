@@ -2392,11 +2392,23 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     const bool dump_gb = getenv("NPU_INFER_DUMP_LAYERS") != nullptr;
     const int rep = NVH / NKH;
     const float scale = 1.0f / sqrtf((float)KHD);
-    std::vector<float> co((size_t)CD), ah((size_t)NVH), bh((size_t)NVH);
-    std::vector<float> ql((size_t)NVH * KHD), kl((size_t)NVH * KHD), vv((size_t)NVH * VHD);
+    // ---- per-row preparation, then ONE parallel region for the whole layer ----
+    // The recurrence below used to sit inside the row loop, which opened one `#pragma omp parallel for` per
+    // (layer, row): 192 regions for an M=4 verify batch, 6144 for an M=128 prefill chunk.  A region is free when
+    // the box is idle and expensive when it is not -- measured on this box, the same recurrence went 2 ms/row
+    // idle to 252-301 ms/row with 8 background spinners, and region count alone (192 vs 48) was 16.8 vs 4.1
+    // ms/row at equal contention (bench: ~/briefs/mtploop-gdn-row-bench.cpp, arms A vs C, bit-identical).
+    // So the preparation stays row-major -- it carries conv_state_ and must stay in position order -- and the
+    // recurrence becomes head-major with the rows inside it, which preserves every element's per-row operation
+    // order.  NPU_GDN_CHECK=1 re-runs the old nesting through the same body and compares bit for bit.
+    std::vector<float> co((size_t)CD);
+    std::vector<float> AHS((size_t)M * NVH), BHS((size_t)M * NVH);
+    std::vector<float> QLS((size_t)M * NVH * KHD), KLS((size_t)M * NVH * KHD),
+        VVS((size_t)M * NVH * VHD);
+    std::vector<float> co_dump;   // NPU_INFER_DUMP_LAYERS only: keeps `co` per row for the [GB] line
+    if (dump_gb) co_dump.assign((size_t)M * CD, 0.0f);
     for (int m = 0; m < M; m++) {
         const float* qkv = QKV.data() + (size_t)m * CD;
-        const float* z = Z.data() + (size_t)m * VD;
         // depthwise causal conv1d (CK) + SiLU, state carried across positions
         float* st = conv_state_[l].data();
         for (int ch = 0; ch < CD; ch++) {
@@ -2420,110 +2432,159 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                 const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)hh * H;
                 float sa = 0, sb = 0;
                 for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
-                ah[(size_t)hh] = sa;
-                bh[(size_t)hh] = sb;
+                AHS[(size_t)m * NVH + hh] = sa;
+                BHS[(size_t)m * NVH + hh] = sb;
             }
         }
         if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l) {   // keep what a commit would need
             auto& rec = row_in_[(size_t)l][(size_t)m];
             rec.qkv.assign(qkv, qkv + CD);
-            rec.ah.assign(ah.begin(), ah.end());
-            rec.bh.assign(bh.begin(), bh.end());
+            rec.ah.assign(AHS.begin() + (size_t)m * NVH, AHS.begin() + (size_t)(m + 1) * NVH);
+            rec.bh.assign(BHS.begin() + (size_t)m * NVH, BHS.begin() + (size_t)(m + 1) * NVH);
         }
         // q/k L2-normalised with NVH/NKH head repetition; v per v-head
+        float* qlm = &QLS[(size_t)m * NVH * KHD];
+        float* klm = &KLS[(size_t)m * NVH * KHD];
+        float* vvm = &VVS[(size_t)m * NVH * VHD];
         for (int hh = 0; hh < NVH; hh++) {
             const int src = hh / rep;
-            for (int d = 0; d < KHD; d++) ql[(size_t)hh * KHD + d] = co[(size_t)src * KHD + d];
-            for (int d = 0; d < KHD; d++) kl[(size_t)hh * KHD + d] = co[KD + (size_t)src * KHD + d];
-            for (int d = 0; d < VHD; d++) vv[(size_t)hh * VHD + d] = co[2 * KD + (size_t)hh * VHD + d];
+            for (int d = 0; d < KHD; d++) qlm[(size_t)hh * KHD + d] = co[(size_t)src * KHD + d];
+            for (int d = 0; d < KHD; d++) klm[(size_t)hh * KHD + d] = co[KD + (size_t)src * KHD + d];
+            for (int d = 0; d < VHD; d++) vvm[(size_t)hh * VHD + d] = co[2 * KD + (size_t)hh * VHD + d];
         }
         for (int hh = 0; hh < NVH; hh++) {
             float sq = 0, sk = 0;
             for (int d = 0; d < KHD; d++) {
-                sq += ql[(size_t)hh * KHD + d] * ql[(size_t)hh * KHD + d];
-                sk += kl[(size_t)hh * KHD + d] * kl[(size_t)hh * KHD + d];
+                sq += qlm[(size_t)hh * KHD + d] * qlm[(size_t)hh * KHD + d];
+                sk += klm[(size_t)hh * KHD + d] * klm[(size_t)hh * KHD + d];
             }
             const float iq = 1.0f / sqrtf(sq + 1e-6f), ik = 1.0f / sqrtf(sk + 1e-6f);
             for (int d = 0; d < KHD; d++) {
-                ql[(size_t)hh * KHD + d] *= iq;
-                kl[(size_t)hh * KHD + d] *= ik;
+                qlm[(size_t)hh * KHD + d] *= iq;
+                klm[(size_t)hh * KHD + d] *= ik;
             }
         }
-        // recurrent gated delta rule + scale-free gated RMSNorm
-        // Heads are independent (disjoint rec_state_ rows, disjoint CORE rows), so this is the
-        // one loop in the GDN layer that parallelises: perf puts gdn_layer_batch at 76% of the
-        // host cycles and this state update at 2*KHD*VHD MACs per head.  kvm is per-head scratch.
-        float* rs = rec_state_[l].data();
-        // Never take the whole box.  The forward also needs a core for the array's submit thread and the serve
-        // needs one for HTTP, so 32 threads on 32 cores measured 25% SLOWER than 16 on a 149-token prefill and
-        // 24 was level with 16 (2026-11-04, same window, same binary).  OMP_NUM_THREADS still wins downward;
-        // this only stops the default from oversubscribing.
-        const int gdn_nt = omp_heads_threads();
-        {
+        if (dump_gb) std::copy(co.begin(), co.end(), co_dump.begin() + (size_t)m * CD);
+    }
+    // recurrent gated delta rule + scale-free gated RMSNorm.  One body for both nestings so that the check below
+    // compares the LOOPS and nothing else; the per-head operation order is identical in either nesting because
+    // rows are visited in order inside a head and heads own disjoint state rows and disjoint CORE slices.
+    auto head_row = [&](int hh, int m, float* sh, float* crow, float* sc) {
+        float* kvm = sc;
+        float* delta = kvm + VHD;
+        const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] *
+                              softplus_f(AHS[(size_t)m * NVH + hh] + gdn_small_[(size_t)l].dt[hh]));
+        const float beta = 1.0f / (1.0f + expf(-BHS[(size_t)m * NVH + hh]));
+        const float* kh = &KLS[((size_t)m * NVH + hh) * KHD];
+        const float* qh = &QLS[((size_t)m * NVH + hh) * KHD];
+        const float* vh = &VVS[((size_t)m * NVH + hh) * VHD];
+        const float* zv = Z.data() + (size_t)m * VD + (size_t)hh * VHD;
+#pragma omp simd
+        for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
+        // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
+        // gathering with stride VHD.  Each output element still accumulates over kd in increasing order, so
+        // the result is the same sequence of operations -- verified by the greedy text being byte-identical.
+        for (int vd = 0; vd < VHD; vd++) kvm[vd] = 0.0f;
+        for (int kd = 0; kd < KHD; kd++) {
+            const float k = kh[kd];
+            const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) kvm[vd] += srow[vd] * k;
+        }
+#pragma omp simd
+        for (int vd = 0; vd < VHD; vd++) delta[vd] = (vh[vd] - kvm[vd]) * beta;
+        for (int kd = 0; kd < KHD; kd++) {
+            const float k = kh[kd];
+            float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) srow[vd] += k * delta[vd];
+        }
+        float ss = 0;
+        for (int vd = 0; vd < VHD; vd++) crow[vd] = 0.0f;
+        for (int kd = 0; kd < KHD; kd++) {
+            const float q = qh[kd];
+            const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) crow[vd] += srow[vd] * q;
+        }
+        for (int vd = 0; vd < VHD; vd++) { crow[vd] *= scale; ss += crow[vd] * crow[vd]; }
+        const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
+        for (int vd = 0; vd < VHD; vd++) {
+            const float zz = zv[vd];
+            crow[vd] = crow[vd] * inv * gdn_small_[(size_t)l].norm[vd] * (zz / (1.0f + expf(-zz)));
+        }
+    };
+    // Never take the whole box.  The forward also needs a core for the array's submit thread and the serve
+    // needs one for HTTP, so 32 threads on 32 cores measured 25% SLOWER than 16 on a 149-token prefill and
+    // 24 was level with 16 (2026-11-04, same window, same binary).  OMP_NUM_THREADS still wins downward;
+    // this only stops the default from oversubscribing.
+    const int gdn_nt = omp_heads_threads();
+    float* rs = rec_state_[l].data();
+    const bool gdn_check = getenv("NPU_GDN_CHECK") != nullptr;
+    std::vector<float> core_ref;   // NPU_GDN_CHECK only
+    if (gdn_check) core_ref.assign(CORE.size(), 0.0f);
+    std::vector<float> state_pre;   // NPU_GDN_CHECK only: the state the old nesting must start from
+    if (gdn_check) state_pre = rec_state_[l];
+    {
         LhScope _t_core(LH_GDN_CORE);
-#pragma omp parallel for schedule(static) num_threads(gdn_nt)
-        for (int hh = 0; hh < NVH; hh++) {
-            // One scratch row for kvm and one for the delta, ONE allocation: this runs 48 heads x 48 layers x rows
-            // per token, and a per-head allocation inside a parallel region is the mistake that cost the mla
-            // attempt 2x on 2026-11-03.
+#pragma omp parallel num_threads(gdn_nt)
+        {
+            std::vector<float> scratch((size_t)2 * VHD);   // one allocation per thread, not per head
+            float* sc = scratch.data();
+#pragma omp for schedule(static)
+            for (int hh = 0; hh < NVH; hh++) {
+                float* sh = rs + (size_t)hh * KHD * VHD;
+                for (int m = 0; m < M; m++)   // rows in order: the state carries across them
+                    head_row(hh, m, sh, CORE.data() + (size_t)m * VD + (size_t)hh * VHD, sc);
+            }
+        }
+    }
+    if (gdn_check) {
+        // The old nesting, through the same body: one region per row.  Bit-exactness is the whole claim of this
+        // change, so it is asserted rather than argued -- the same form as NPU_REPLAY_CHECK in commit_verify_rows.
+        std::copy(state_pre.begin(), state_pre.end(), rec_state_[l].begin());
+#pragma omp parallel num_threads(gdn_nt)
+        {
             std::vector<float> scratch((size_t)2 * VHD);
-            float* kvm = scratch.data();
-            float* delta = kvm + VHD;
-            const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] * softplus_f(ah[(size_t)hh] + gdn_small_[(size_t)l].dt[hh]));
-            const float beta = 1.0f / (1.0f + expf(-bh[(size_t)hh]));
-            float* sh = rs + (size_t)hh * KHD * VHD;
-            const float* kh = &kl[(size_t)hh * KHD];
-            const float* qh = &ql[(size_t)hh * KHD];
-            const float* vh = &vv[(size_t)hh * VHD];
-#pragma omp simd
-            for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
-            // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
-            // gathering with stride VHD.  Each output element still accumulates over kd in increasing order, so
-            // the result is the same sequence of operations -- verified by the greedy text being byte-identical.
-            for (int vd = 0; vd < VHD; vd++) kvm[vd] = 0.0f;
-            for (int kd = 0; kd < KHD; kd++) {
-                const float k = kh[kd];
-                const float* srow = sh + (size_t)kd * VHD;
-#pragma omp simd
-                for (int vd = 0; vd < VHD; vd++) kvm[vd] += srow[vd] * k;
-            }
-#pragma omp simd
-            for (int vd = 0; vd < VHD; vd++) delta[vd] = (vh[vd] - kvm[vd]) * beta;
-            for (int kd = 0; kd < KHD; kd++) {
-                const float k = kh[kd];
-                float* srow = sh + (size_t)kd * VHD;
-#pragma omp simd
-                for (int vd = 0; vd < VHD; vd++) srow[vd] += k * delta[vd];
-            }
-            float ss = 0;
-            float* crow = CORE.data() + (size_t)m * VD + (size_t)hh * VHD;
-            for (int vd = 0; vd < VHD; vd++) crow[vd] = 0.0f;
-            for (int kd = 0; kd < KHD; kd++) {
-                const float q = qh[kd];
-                const float* srow = sh + (size_t)kd * VHD;
-#pragma omp simd
-                for (int vd = 0; vd < VHD; vd++) crow[vd] += srow[vd] * q;
-            }
-            for (int vd = 0; vd < VHD; vd++) { crow[vd] *= scale; ss += crow[vd] * crow[vd]; }
-            const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
-            for (int vd = 0; vd < VHD; vd++) {
-                const float zz = z[(size_t)hh * VHD + vd];
-                crow[vd] = crow[vd] * inv * gdn_small_[(size_t)l].norm[vd] * (zz / (1.0f + expf(-zz)));
+            float* sc = scratch.data();
+            for (int m = 0; m < M; m++) {
+#pragma omp for schedule(static)
+                for (int hh = 0; hh < NVH; hh++)
+                    head_row(hh, m, rs + (size_t)hh * KHD * VHD,
+                             core_ref.data() + (size_t)m * VD + (size_t)hh * VHD, sc);
             }
         }
+        int bad = 0;
+        double worst = 0.0;
+        for (size_t i = 0; i < CORE.size(); i++) {
+            const double d = std::fabs((double)CORE[i] - (double)core_ref[i]);
+            if (d > worst) worst = d;
+            if (CORE[i] != core_ref[i]) bad++;
         }
-        if (dump_gb && l == 0 && m < 2) {
+        fprintf(stderr, "[gdncheck] l=%d M=%d exchanged vs row-major: %d/%zu differ, max|d|=%.3e %s\n", l, M,
+                bad, CORE.size(), worst, bad ? "MISMATCH" : "identical");
+        // An invariant, not a report: NPU_GDN_CHECK exists so that a test (and a device run) can assert the loop
+        // exchange did not move a single element.  A mismatch must fail the call, not print a line nobody reads.
+        if (bad) {
+            err_ = "gdn check: the head-major nesting disagrees with row-major at layer " + std::to_string(l) +
+                   " (" + std::to_string(bad) + " of " + std::to_string(CORE.size()) + ", max|d|=" +
+                   std::to_string(worst) + ")";
+            return false;
+        }
+    }
+    if (dump_gb && l == 0) {
+        for (int m = 0; m < M && m < 2; m++) {
             auto d2 = [&](const char* nm, const float* v, int n) {
                 double sm = 0;
                 float mx = 0;
                 for (int i = 0; i < n; i++) { float a = fabsf(v[i]); sm += a; if (a > mx) mx = a; }
                 fprintf(stderr, "  [GB] m=%d %-5s %.6f %.4f\n", m, nm, sm / n, mx);
             };
-            d2("qkv", qkv, CD);
-            d2("co", co.data(), CD);
-            d2("z", z, VD);
-            d2("a", ah.data(), NVH);
-            d2("b", bh.data(), NVH);
+            d2("qkv", QKV.data() + (size_t)m * CD, CD);
+            d2("co", co_dump.data() + (size_t)m * CD, CD);
+            d2("z", Z.data() + (size_t)m * VD, VD);
+            d2("a", AHS.data() + (size_t)m * NVH, NVH);
+            d2("b", BHS.data() + (size_t)m * NVH, NVH);
             d2("core", CORE.data() + (size_t)m * VD, VD);
         }
     }

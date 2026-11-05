@@ -807,6 +807,14 @@ where a model must be exactly the one that was validated. `--template-pin FILE` 
 table (a wrong sha256, or a file that is not a pin file, is refused by name) and `--no-template-pin`
 names the sha without comparing anything.
 
+A pin is keyed on the model id or the file name (a container: its directory name), so it catches
+exactly one thing — **the same name, a different template** — which is the re-pull and supply-chain
+case. Two consequences a reader should not have to infer: a model with **no pin is logged, not
+checked** (the line is all it gets), and a model that arrives under a **new name** bypasses the table
+by definition; pin what you can name. For a model directory the `.jinja` fallback is usually the live
+branch: the OGA packs we import carry no `chat_template` key in `tokenizer_config.json` at all, and the
+template sits only in `chat_template.jinja` beside it.
+
 The line and the pin are the engine half of a publishing rule: every model card lists its template's
 sha256 and where it came from, `SHA256SUMS` covers it, and the pull path checks it before a model is
 served ([template-publishing.md](template-publishing.md)). `tests/template_pin.sh` covers all of the

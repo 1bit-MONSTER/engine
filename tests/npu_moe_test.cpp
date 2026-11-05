@@ -72,6 +72,11 @@ struct Crafted {
     // router logits we want for a given h, by construction below
     bool break_offset = false, break_gap = false, break_bytes = false, break_experts = false;
     bool no_metadata = false;
+    // The metadata's rows/cols against the tensor's own shape. A transposed pair is the
+    // mistake ggml's [cols, rows, experts] order invites, and it leaves every byte count
+    // right: only shape[0]/shape[1] and rows/cols tell it apart (down_proj on Qwen3-30B-A3B
+    // is 768x2048 where gate/up are 2048x768, both 192 tiles).
+    bool break_geom_swap = false, break_geom_rows = false;
 };
 
 fs::path write_dir(const Crafted& m, const std::string& tag) {
@@ -105,11 +110,14 @@ fs::path write_dir(const Crafted& m, const std::string& tag) {
             // the tile-row count a stack declares: experts x rows/32, cast before the multiply
             const int64_t tile_rows = int64_t(m.experts) * int64_t(m.rows / 32);
             add(name, {tile_rows, m.cols / 256, 5120}, "I8", stack_bytes);
+            const int meta_rows = m.break_geom_swap ? m.cols
+                                 : (m.break_geom_rows ? m.rows * 2 : m.rows);
+            const int meta_cols = m.break_geom_swap ? m.rows : m.cols;
             tensors[name] = {{"experts", m.break_experts ? m.experts + 1 : m.experts},
-                             {"rows", m.rows},
-                             {"cols", m.cols},
-                             {"tile_rows", m.rows / 32},
-                             {"tile_cols", m.cols / 256},
+                             {"rows", meta_rows},
+                             {"cols", meta_cols},
+                             {"tile_rows", meta_rows / 32},
+                             {"tile_cols", meta_cols / 256},
                              {"tiles", m.tiles},
                              {"bytes", m.break_bytes ? chunk + 1 : chunk},
                              {"offsets", offs}};
@@ -319,7 +327,21 @@ int main(int argc, char** argv) {
         check(thrown([&] { const Moe m{Model(d5.string())}; }).find("__metadata__.moe") !=
                   std::string::npos,
               "a directory with no MoE metadata is refused");
-        for (const fs::path& d : {d1, d2, d3, d4, d5}) {
+        // The geometry itself: rows/cols are what a kernel's K and N come from, so they are
+        // checked against the tensor's shape and against tiles, not trusted as given.
+        Crafted swap;
+        swap.break_geom_swap = true;
+        const fs::path d6 = write_dir(swap, "_swap");
+        check(thrown([&] { const Moe m{Model(d6.string())}; }).find("tensor's shape") !=
+                  std::string::npos,
+              "rows/cols transposed in the metadata is refused (tiles alone cannot see it)");
+        Crafted grow;
+        grow.break_geom_rows = true;
+        const fs::path d7 = write_dir(grow, "_grow");
+        check(thrown([&] { const Moe m{Model(d7.string())}; }).find("tiles does not match") !=
+                  std::string::npos,
+              "a tile count that disagrees with rows x cols is refused");
+        for (const fs::path& d : {d1, d2, d3, d4, d5, d6, d7}) {
             std::remove((d / "model.q4nx").c_str());
             std::remove((d / "config.json").c_str());
             fs::remove_all(d);

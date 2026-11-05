@@ -524,6 +524,9 @@ int main(int argc, char** argv) {
         LiveDepths live_tot;      // hit[] + reached[] for every prompt so far, from the loop's own counters
         double hit_live[Stats::kMaxDepth] = {0};
         double tot_plain_s = 0, tot_spec_s = 0;
+        // Phase split totals (MTP_PHASE_SPLIT=1): summed across prompts so a multi-prompt ticket reports one table.
+        double tot_ms_step = 0, tot_ms_batch = 0, tot_ms_draft = 0, tot_ms_commit = 0;
+        const bool phase_split = std::getenv("MTP_PHASE_SPLIT") != nullptr;
         DepthCounts matched;      // --match: the offline protocol scored where THIS run opened its chains
         for (int p = 0; p < prompts; p++) {
             const int pi = prompt_base + p;
@@ -617,6 +620,23 @@ int main(int argc, char** argv) {
             std::printf("  logits calls %ld over %d iterations (%.2f/iter), %.1f ms of the whole draft phase per call\n", lm_used,
                         r.stats.iterations, r.stats.iterations ? (double)lm_used / r.stats.iterations : 0.0,
                         lm_used ? 1000.0 * spec_s / (double)lm_used : 0.0);
+            // Where the draft phase's wall clock goes, all four terms measured in this same run.  A loop change is
+            // priced on this split, not on a subtraction across windows: "two passes per iteration" is only the
+            // reason the route is slow if step + batch own the milliseconds, and after #968 they do not obviously.
+            tot_ms_step += r.stats.ms_step;
+            tot_ms_batch += r.stats.ms_batch;
+            tot_ms_draft += r.stats.ms_draft;
+            tot_ms_commit += r.stats.ms_commit;
+            if (phase_split) {
+                const double tot = r.stats.phase_ms();
+                const double pc = tot > 0 ? 100.0 / tot : 0.0;
+                std::printf("  phase split: step %8.1f ms (%4.1f%%) + batch %8.1f ms (%4.1f%%) + head %8.1f ms (%4.1f%%) "
+                            "+ commit %6.1f ms (%4.1f%%) = %8.1f ms over %d iterations (%.0f ms/iter)\n",
+                            r.stats.ms_step, r.stats.ms_step * pc, r.stats.ms_batch, r.stats.ms_batch * pc,
+                            r.stats.ms_draft, r.stats.ms_draft * pc, r.stats.ms_commit, r.stats.ms_commit * pc,
+                            tot, r.stats.iterations,
+                            r.stats.iterations ? tot / r.stats.iterations : 0.0);
+            }
             std::printf("  per-depth p%d:", pi);
             for (int d = 0; d < k && d < Stats::kMaxDepth; d++)
                 std::printf(" %d %d/%d", d + 1, r.stats.accepted_at[d], r.stats.drafted_at[d]);
@@ -767,6 +787,15 @@ int main(int argc, char** argv) {
                     tot_iter ? 1.0 + (double)tot_acc / tot_iter : 0.0,
                     tot_emitted ? (double)tot_emitted / (tot_steps + tot_batches) : 0.0, tot_plain_s, tot_spec_s,
                     tot_spec_s > 0 ? tot_plain_s / tot_spec_s : 0.0);
+        // The whole run's split, so the serve switch and any loop change are priced on one window's measurement.
+        if (phase_split && tot_ms_step + tot_ms_batch + tot_ms_draft + tot_ms_commit > 0) {
+            const double tot = tot_ms_step + tot_ms_batch + tot_ms_draft + tot_ms_commit;
+            const double pc = 100.0 / tot;
+            std::printf("   phase split (all prompts): step %.1f%% + batch %.1f%% + head %.1f%% + commit %.1f%%"
+                        "  = %.1f s of draft phase; of that, base passes %.1f%%\n",
+                        tot_ms_step * pc, tot_ms_batch * pc, tot_ms_draft * pc, tot_ms_commit * pc, tot / 1000.0,
+                        (tot_ms_step + tot_ms_batch) * pc);
+        }
         // The comparison the deliverable asks for: the same quantity the offline protocol prints, per depth.
         std::printf("   per-depth acceptance:\n");
         for (int d = 0; d < k && d < Stats::kMaxDepth; d++)

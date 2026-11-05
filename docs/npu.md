@@ -1203,6 +1203,12 @@ against (the kernel's own copy also works); nothing from the pin is built into o
 the release. `.github/workflows/bump-xdna.yml` moves the pin when run by hand, because a driver
 move means rebuilding the module on Strix Halo and checking the NPU there first.
 
+That pin is **pre-fix**, and the fixes are not upstream. The two patches every build of ours runs — the
+`bo_invalid_list` use-after-free at close (#971) and the array recovery after a TDR (#1005) — are carried in
+[`third_party/patches/amdxdna/`](../third_party/patches/amdxdna/README.md) with the build, sign, install and
+initramfs recipe, the `srcversion` each build must produce, and what a pin bump invalidates. A module built from the
+pin alone has neither defect fixed: it panics on that close path and it cannot bring the array back after a TDR.
+
 ### The MTP head (FastFlowLM's container -> ours)
 
 `tools/flm_head_import` (built as `flm-head-import`) turns a FastFlowLM MTP-head container

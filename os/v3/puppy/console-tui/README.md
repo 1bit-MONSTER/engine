@@ -134,6 +134,13 @@ visible repair: a cell is simply not the place to execute what a log file says.
 space and drops the other C0/DEL; everything else is untouched (`SoC 78°C`, `café`, `┌─┐`), and it is applied where
 external text enters, so no draw site can forget it (`a_log_line_or_a_model_name_cannot_carry_an_escape_into_the_screen`).
 
+**And the reader decodes a JSON escape before the sanitiser sees it.** Lemonade's catalogue arrives with `\uXXXX` in it
+whenever a serialiser escapes non-ASCII (Python's `json.dumps` does that by default), so `facts::json_unicode()` turns
+`caf\u00e9` into `café` - surrogate pairs into one character, a lone half into U+FFFD, a truncated escape into the bytes it
+had - and *then* `screen_text()` strips whatever control characters an escape decodes to (`\u001b[2J`). The order matters:
+before this the pane drew the escape's four characters (`cafu00e9`), and a `\u001b` body had nothing for the sanitiser to
+remove (`a_json_escape_is_decoded_before_it_becomes_a_cell`).
+
 **An interrupted paint repaints; a terminal that cannot be written still ends the console.** A paint that fails with
 `ErrorKind::Interrupted` drew nothing - a signal arrived before the write reached the terminal - so the next pass simply
 paints again instead of ending the screen. That is reachable in normal use: crossterm's event source installs a SIGWINCH
@@ -232,7 +239,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 58 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders, the engine row's model choice, the escape sanitiser, the interrupted paint, the rows that have to fit the pane
+cargo test                                    # the suite: the probe parsers (incl. the JSON escapes), the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders, the engine row's model choice, the escape sanitiser, the interrupted paint
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

@@ -37,10 +37,28 @@
 # the NPU through Lemonade, the installer writing an entry for a second disk, boot time and idle RAM) are
 # printed as SKIP with the reason.
 #
+# --verdict-selftest runs only the row-verdict arms (no image, no VM) and exits 0 when they hold.
+#
 # exit 0 = every row that can run here passed, 1 = a row failed, 2 = the VM never came up.
 set -uo pipefail
 prog=$(basename "$0")
+dir=$(cd "$(dirname "$0")" && pwd)
+# Cycle 26 (#1111): the verdict rule itself is tested before anything boots. The bug this exists for is a row that
+# reported PASS without running - a skip marker (`console-heals-skip-no-tui`) containing the row's own want string - so
+# the arms below are exactly the ones that would have caught it, and they cost no VM. `--verdict-selftest` alone runs
+# only these and exits, which is what a CI job should call.
+if [ "${1:-}" = --verdict-selftest ]; then
+    python3 "$dir/vm_check_verdict.py" || exit 1
+    exit 0
+fi
 [ $# -ge 2 ] || { sed -n "/^# $prog/,/^# exit 0/p" "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+if python3 "$dir/vm_check_verdict.py" > /dev/null 2>&1; then
+    echo "PASS U0 verdict    the row-verdict rule holds: a *-skip-* marker is SKIP, not PASS"
+else
+    python3 "$dir/vm_check_verdict.py" 2>&1 | sed 's/^/     /'
+    echo "FAIL U0 verdict    the row-verdict rule is broken - fix vm_check_verdict.py before trusting this run"
+    exit 2
+fi
 iso=$(cd "$(dirname "$1")" 2>/dev/null && pwd)/$(basename "$1")
 work=$2
 secs=${3:-600}
@@ -132,9 +150,13 @@ vm_gone() { echo "the VM was no longer running when this row ran (qemu budget ${
     qemu-system-x86_64 -m 4096 -smp 4 "${boot[@]}" -display none -vga std -no-reboot \
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
 
+VMCHECK_DIR=$(cd "$(dirname "$0")" && pwd) export VMCHECK_DIR
 ARTIFACT=$iso python3 - "$work" "$iso" > "$work/rows.txt" 2>&1 <<'PY'
 import socket, sys, time, os, re, subprocess, shutil
-
+# The row verdict lives in vm_check_verdict.py so this driver and `--verdict-selftest` cannot disagree about what a skip
+# is; #1111 is the bug that came from having it here alone (a `*-skip-*` marker contains the row's own want string).
+sys.path.insert(0, os.environ["VMCHECK_DIR"])
+import vm_check_verdict as V
 # The shipping driver's srcversion for the MEDIUM this harness is checking. Cycle 26 carries 0011v2: 0008+0009+0011+0011v2,
 # built WITHOUT the 0010 debugfs hook (srcversion EE1F36A2B9BA294CE11AD80, verified: no `tdr_test` string). This box also
 # holds the 0010 hook build for testing, and the two are indistinguishable by vermagic, signer or filename - only
@@ -909,13 +931,8 @@ for idx, row in enumerate(rows):
     if cmd[:24] in body:
         body = body[body.rindex(cmd[:24]):]
     body = "\n".join(l.strip() for l in body.splitlines() if l.strip() and cmd[:24] not in l)
-    flat = body.replace("\n", " | ")
-    if want is None:
-        print("INFO %-13s %s" % (name, flat), flush=True)
-    elif want in body:
-        print("PASS %-13s %s" % (name, flat), flush=True)
-    else:
-        print("FAIL %-13s %s" % (name, flat), flush=True)
+    level, flat = V.verdict(name, want, body)
+    print("%-4s %-13s %s" % (level, name, flat), flush=True)
 PY
 driver_rc=$?
 cat "$work/rows.txt"

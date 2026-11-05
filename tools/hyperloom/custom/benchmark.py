@@ -297,6 +297,33 @@ def drafting_identity():
     return ident
 
 
+def drafting_summary(serve_log):
+    """The drafting record for a served measurement: what the levers asked for, and what the serve says
+    it actually did.
+
+    `drafting_identity()` alone answers "which drafter file", and `{}` was its whole answer when no
+    drafting lever was set -- which on this pin is not "no drafting": the GGUF carries its own MTP head
+    and serve drafts with it unless told not to. Measured 2026-11-04 22:39 (27B UD-Q4_K_XL, 20,480 ctx):
+    the artifact said `drafting: {}` while serve.log reported `--spec-type draft-mtp`, recipe
+    `qwen35-mtp-max-3`, and the scored long leg drafted `mean len 3.02` at `0.67460` acceptance. The cap
+    is worth ~18 % of 18.8k decode and ~25 % of `tg128` here, so an unrecorded default makes two rows
+    incomparable -- the same rule as `model`/`build`/`placement`.
+
+    `requested` is therefore explicit (`null` = no lever set, i.e. the pin's own default applied;
+    `HL_MTP_MAX: "0"` = a deliberately non-drafting measurement), and `serve` is what the server itself
+    reported, so the record does not depend on reading the pin's defaults correctly.
+    """
+    ident = drafting_identity()
+    asked = {k: env(k) for k in ("HL_DFLASH", "HL_DFLASH_GGUF", "HL_MTP_MAX", "HL_MTP_HEAD") if env(k)}
+    ident["requested"] = asked or None
+    if not asked:
+        ident["requested_note"] = ("no drafting lever was set: the pin drafts with the model's own MTP "
+                                   "head unless --no-mtp/ONEBIT_NO_MTP=1; see drafting.serve for what the "
+                                   "server actually did")
+    ident["serve"] = drafting_observed(serve_log)
+    return ident
+
+
 def build_identity(onebit, bin_dir):
     """Name the binary that produced the measurement, inside the artifact itself.
 
@@ -588,6 +615,56 @@ def placement_summary(path):
             "worst_graph_off_hrx": max((o for _, o in hits), default=0)}
 
 
+# the flag is quoted mid-sentence in serve's own line ("--spec-type draft-mtp; --no-mtp ... turns it off"),
+# so the value stops at the punctuation rather than swallowing it.
+DRAFT_SPEC_RE = re.compile(r"--spec-type ([A-Za-z0-9._-]+)")
+DRAFT_RECIPE_RE = re.compile(r"1bit serve: recipe ([^:]+): (.*)$", re.M)
+DRAFT_ACC_RE = re.compile(
+    r"draft acceptance = ([0-9.]+) \(\s*(\d+) accepted /\s*(\d+) generated\), mean len =\s*([0-9.]+)")
+
+
+def drafting_observed(path):
+    """What the serve itself reported about drafting, so a result can say whether the decode it
+    scored drafted at all.
+
+    Measured on this box, 2026-11-04 22:39 (27B UD-Q4_K_XL, 20,480 ctx): `bench_summary.drafting` was
+    `{}` -- no `HL_DFLASH`, no `HL_MTP_HEAD` were set -- while the same run's serve.log said
+    `carries its own MTP head: drafting with it (--spec-type draft-mtp; --no-mtp or ONEBIT_NO_MTP=1
+    turns it off)`, `recipe qwen35-mtp-max-3: --spec-draft-n-max 3`, and the long leg's own timing
+    block reported `draft acceptance = 0.67460 (85 accepted / 126 generated), mean len = 3.02`. So the
+    number was produced by a drafting decode that the artifact described as no drafting at all.
+
+    That is not a cosmetic gap: the MTP cap is worth ~18 % of 18.8k decode on this box (pair-2,
+    2026-11-03 17:15) and `HL_MTP_MAX=0` moves `tg128` from 11.80 to 8.83 (2026-11-01), so two rows
+    differing only in an unset default are otherwise indistinguishable -- the same rule as
+    `placement`/`model`/`build`: the result names the input it was measured with. It reports, it does
+    not check.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    accs = [(float(a), int(acc), int(gen), float(ln))
+            for a, acc, gen, ln in DRAFT_ACC_RE.findall(text)]
+    spec, recipe = DRAFT_SPEC_RE.search(text), DRAFT_RECIPE_RE.search(text)
+    if not accs and not spec and not recipe:
+        return None
+    out = {}
+    if spec:
+        out["spec_type"] = spec.group(1)
+    if recipe:
+        out["recipe"] = recipe.group(1).strip()
+        out["recipe_args"] = recipe.group(2).strip()
+    if accs:
+        out.update({"tasks_reporting": len(accs),
+                    "accept_rate_last": accs[-1][0],
+                    "accepted_last": accs[-1][1],
+                    "generated_last": accs[-1][2],
+                    "mean_acc_len_last": accs[-1][3],
+                    "mean_acc_len_max": max(a[3] for a in accs)})
+    return out
+
+
 KLD_MEAN_RE = re.compile(r"^Mean\s+KLD\s*:\s*([-+0-9.eE]+)", re.M)
 
 
@@ -722,6 +799,7 @@ def main():
         return finish(False, f"serve leg failed: {exc}", rc=1)
     result["bench_summary"]["serve_tok_s"] = {k: round(v, 2) for k, v in tps.items()}
     result["bench_summary"]["placement"] = placement
+    result["bench_summary"]["drafting"] = drafting_summary(log_dir / "serve.log")
     conditions.append(box_conditions())
     if long_info:
         result["bench_summary"]["longctx"] = {k: (round(v, 2) if isinstance(v, float) else v)

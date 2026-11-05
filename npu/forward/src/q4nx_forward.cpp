@@ -2877,8 +2877,8 @@ inline double ph_ms(std::chrono::steady_clock::time_point t) {
 // sites are host-side row gathers whose cost is invisible inside gemm/wait/readback.  Additive
 // measurement only, exactly like the phases above: nothing in the compute path reads it, and with the
 // variable unset nothing is counted and nothing is printed.
-enum CopySite { CP_QKV, CP_GATE, CP_CTX, CP_MLP_IN, CP_MLP_OUT, CP_N };
-const char* const kCopySiteName[CP_N] = {"qkv_split", "attn_gate", "ctx_row", "mlp_in", "mlp_out"};
+enum CopySite { CP_QKV, CP_GATE, CP_CTX, CP_N };
+const char* const kCopySiteName[CP_N] = {"qkv_split", "attn_gate", "ctx_row"};
 struct CopySites {
     double b[CP_N]{};
     double ms[CP_N]{};
@@ -3787,7 +3787,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             X[(size_t)m * H + k] = embed_at(tokens[m], k) * embed_scale_;
     if (phb) { g_ph.embed = ph_ms(tp_bs); tp_lap = std::chrono::steady_clock::now(); }
 
-    std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row, act_row, hh;
+    std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
         cur_layer_ = l;
         const bool cached = weight_cached(0);
@@ -4038,21 +4038,13 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         HH.assign((size_t)M * (size_t)im, 0.0f);
         {
             // act_w is the stride both branches above leave ACT at; only the first 2*im columns of a
-            // row are real (the rest is the kernel's zero column pad).
-            for (int m = 0; m < M; m++) {
-                {
-                    CpScope _cp(CP_MLP_IN);
-                    act_row.assign(ACT.begin() + (size_t)m * act_w,
-                                   ACT.begin() + (size_t)m * act_w + (size_t)2 * im);
-                    cp_count(CP_MLP_IN, (size_t)2 * im * sizeof(float));
+            // row are real (the rest is the kernel's zero column pad), so the elementwise gate*up reads
+            // that row in place and writes HH's row in place: no staging copy on either side.  The two
+            // copies this replaces were 12.75 MiB of a 15.38 MiB row (NPU_COPY_PROF=1, 2026-11-05).
+            for (int m = 0; m < M; m++)
+                if (!mlp(ACT.data() + (size_t)m * act_w, HH.data() + (size_t)m * im, im)) {
+                    err_ = "mlp failed"; return false;
                 }
-                if (!mlp(act_row, hh, im)) { err_ = "mlp failed"; return false; }
-                {
-                    CpScope _cp(CP_MLP_OUT);
-                    memcpy(HH.data() + (size_t)m * im, hh.data(), (size_t)im * sizeof(float));
-                    cp_count(CP_MLP_OUT, (size_t)im * sizeof(float));
-                }
-            }
         }
         {
             const Q4nxDesignGeom* g = &designs_[i_d];
@@ -4748,8 +4740,12 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
 
 // SiLU(gate) * up from either a fused GU result or separate G and U results.
 bool Q4nxNpuForward::mlp(const std::vector<float>& gu, std::vector<float>& h, int im) {
-    LhScope _tlh(LH_MLP);
     h.resize(im);
+    return mlp(gu.data(), h.data(), im);
+}
+
+bool Q4nxNpuForward::mlp(const float* gu, float* h, int im) {
+    LhScope _tlh(LH_MLP);
     const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
     for (int i = 0; i < im; i++) {
         const float g = gu[i];

@@ -1261,6 +1261,32 @@ so:
 A real failure is unchanged apart from being reported: the last attempt's exception still reaches the
 caller after the window closes, and the log now names the attempt count and the reason.
 
+#### A refusal is a queue, not a fault
+
+A second **client** on the NPU is refused with the same signature a dead array answers — `code 102` /
+`-ENODEV` from `aie2_message.c`'s context-create path — so the code alone cannot say which one it is. Time
+can: a client that holds the array frees it when it exits, a dead array never does. Since the per-client
+partition fix ([engine#1085](https://github.com/1bit-MONSTER/engine/pull/1085), decision 2026-11-05)
+makes that refusal the *normal* way a second client is turned away, a refused context is now **queued**
+rather than failed: the same retry schedule runs against a load queue budget instead of the 2.5 s race
+window, and the log says which of the two it is waiting for.
+
+```
+$ 1bit serve -m <model dir> --load-queue-ms 45000       # the default
+1bit unified: opening the private route's NPU context attempt 3 failed after 410 ms
+              (npu runtime: device error (code 102): No such device); retrying in 600 ms
+              (queued: another NPU client may hold the array)
+```
+
+`--load-queue-ms N` bounds that wait (default **45000**, `0` refuses at once, i.e. the pre-#1085
+behaviour). When the budget runs out the operator hint names both causes in the order to check them —
+another client first (wait for it, or stop it), the driver second (`modprobe -r amdxdna && modprobe
+amdxdna`) — because after a full budget the array is either genuinely busy elsewhere or genuinely dead.
+
+This is the load-side counterpart of `--queue-ms`, which bounds how long a *request* waits for the
+device lock; the two are separate because a request can be told it is queueing (an empty delta a second)
+and a load cannot.
+
 One NPU failure is not transient and says so: the driver deciding the array is dead, reported with
 `No such device` (ENODEV) and either `code 102` (`errc::ctx_create`) or `code 104` (`errc::submit`) —
 whichever call was refused, which depends only on whether the process already had a hardware context

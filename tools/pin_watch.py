@@ -30,7 +30,9 @@ and the files we re-hosted are the old ones. This tool closes that gap (docs/mod
                every changed `.gguf` (the metadata header only, over an HTTP range request) and says
                whether the template changed, because a new revision may not be adopted before that is
                known. --no-template skips that read (the report then says it was not checked).
-  --pr-body R  print the bump PR's body for repo R from the report --check just wrote.
+  --pr-body R  print the bump PR's body for repo R and exit 0. With --from, it comes from the sweep
+               a --check wrote (`--json`); without it the sweep is repeated, one full Hub read per
+               repo. A repo that did not move is a usage error (3), not a body.
   --pin R...   print the pin entry for each repo at its current main (adding a pin, or re-deriving one).
   --bump R     rewrite repo R's entry in --pins to the current main, for the tracked files only; a
                tracked file that vanished upstream is refused rather than dropped silently.
@@ -38,6 +40,8 @@ and the files we re-hosted are the old ones. This tool closes that gap (docs/mod
                model or a chat template and is not in the table. A pin watches a repo we depend on; nothing
                watched the repos we publish, which is the audit's own subject.
   --out FILE   where --check writes its report (default pin-report.md).
+  --json FILE  with --check: also write the sweep as JSON, which is what --pr-body --from reads.
+  --from FILE  with --pr-body: read the sweep from that JSON instead of re-checking every pin.
   --self-test  run against fixtures, no network.
 
 Exit codes: 0 nothing moved, 1 a pin moved (or --check found nothing readable), 2 usage,
@@ -637,6 +641,25 @@ def self_test() -> int:
         expect("--bump left the pin alone", load(path)["pins"]["fake/moved"]["commit"], "new")
 
         tree = fake_tree
+
+        # one sweep, N PR bodies: the daily step must not re-read 147 repos per repo it opens a PR for
+        import contextlib
+        import io as _io
+        sweep = os.path.join(d, "sweep.json")
+        head, tree, commits_since = fake_head_new, fake_tree, fake_commits
+        expect("--check --json writes the sweep",
+               main(["--check", "--pins", path, "--out", os.path.join(d, "r.md"), "--json", sweep]), 1)
+
+        def no_read(*a, **k):
+            raise AssertionError("--pr-body --from must not read the Hub")
+
+        head, tree = no_read, no_read
+        body = _io.StringIO()
+        with contextlib.redirect_stdout(body):
+            body_rc = main(["--pr-body", "fake/moved", "--from", sweep])
+        expect("--pr-body --from needs no read, and succeeds", body_rc, 0)
+        expect("...and prints that repo's body", "fake/moved" in body.getvalue(), True)
+        head, tree = fake_head_new, fake_tree
         expect("--bump takes an intact pin", main(["--bump", "fake/moved", "--pins", path]), 0)
 
         # a container/LoRA repo has no `.gguf`: pinning it must still be possible, or the published
@@ -698,6 +721,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--pins", default=PINS)
     ap.add_argument("--orgs", metavar="A,B")
     ap.add_argument("--out", default="pin-report.md")
+    ap.add_argument("--json", metavar="FILE")
+    ap.add_argument("--from", dest="src", metavar="FILE")
     ap.add_argument("--no-template", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
@@ -718,6 +743,20 @@ def main(argv: list[str]) -> int:
     if not a.check and not a.bump and not a.pr_body:
         ap.print_help()
         return 2
+
+    if a.pr_body and a.src:
+        # The body for one repo out of a sweep that already happened: the daily step opens N PRs for one
+        # check, and re-checking 147 repos per PR was 78 s of Hub reads each time.
+        try:
+            with open(a.src, encoding="utf-8") as f:
+                swept = json.load(f)["changes"]
+        except (OSError, KeyError, ValueError) as e:
+            sys.exit(f"pin_watch: could not read {a.src}: {e}")
+        hit = next((c for c in swept if c["repo"] == a.pr_body), None)
+        if hit is None:
+            sys.exit(f"pin_watch: {a.pr_body} did not move (see {a.src})")
+        print(pr_body(hit))
+        return 0
 
     doc = load(a.pins)
     if a.bump:
@@ -750,12 +789,17 @@ def main(argv: list[str]) -> int:
     md = report(changes, notes, len(doc["pins"]), not a.no_template, fresh)
     with open(a.out, "w", encoding="utf-8") as f:
         f.write(md)
+    if a.json:
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump({"date": datetime.date.today().isoformat(), "pins": len(doc["pins"]),
+                       "changes": changes, "notes": notes}, f, indent=1)
+            f.write("\n")
     if a.pr_body:
         hit = next((c for c in changes if c["repo"] == a.pr_body), None)
         if hit is None:
             sys.exit(f"pin_watch: {a.pr_body} did not move (see {a.out})")
         print(pr_body(hit))
-        return 1
+        return 0
     print(md)
     if notes and len(notes) == len(doc["pins"]):
         # nothing was read: a failed run, not a clean one. The workflow fails on any code outside 0/1.

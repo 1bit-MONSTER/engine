@@ -13,8 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// gguf_architecture (app/gguf_meta.h) on GGUF headers written here: the key found after
-// scalars and arrays, and "" for files that are not GGUFs or carry no architecture.
+// gguf_architecture and gguf_string_meta (app/gguf_meta.h) on GGUF headers written here: the key found
+// after scalars and arrays, a string value longer than one read (the template case), and "" for files
+// that are not GGUFs, carry no such key, or store something else under it.
 #include "gguf_meta.h"
 
 #include <cstdio>
@@ -84,8 +85,36 @@ int main() {
     none.kv_u32("general.quantization_version", 2);
     expect("no architecture", onebit::gguf_architecture(none.write(dir / "none.gguf")), "");
 
+    // the template: a long string after arrays and scalars, which is what a real GGUF looks like
+    Gguf tpl;
+    tpl.kv_u32("general.quantization_version", 2);
+    tpl.kv_strs("tokenizer.ggml.tokens", {"<bos>", "\n", "hello"});
+    tpl.kv_str("general.architecture", "qwen3");
+    tpl.kv_str("tokenizer.chat_template", "{% for m in messages %}{{ m['role'] }}\n{% endfor %}");
+    tpl.kv_str("tokenizer.chat_template.tool_use", "{% if tools %}{{ tools }}{% endif %}");
+    tpl.kv_u32("qwen3.block_count", 28);
+    const std::string tpl_path = tpl.write(dir / "tpl.gguf");
+    expect("string value after arrays", onebit::gguf_string_meta(tpl_path, "tokenizer.chat_template"),
+           "{% for m in messages %}{{ m['role'] }}\n{% endfor %}");
+    expect("first match wins", onebit::gguf_string_meta(tpl_path, "general.architecture"), "qwen3");
+    expect("a named template keeps its own key",
+           onebit::gguf_string_meta(tpl_path, "tokenizer.chat_template.tool_use"),
+           "{% if tools %}{{ tools }}{% endif %}");
+    expect("key after the template", onebit::gguf_string_meta(tpl_path, "qwen3.block_count"), "");
+    expect("missing key", onebit::gguf_string_meta(tpl_path, "tokenizer.chat_template.nope"), "");
+    expect("an empty string value", onebit::gguf_string_meta((dir / "empty.gguf").string(), "x"), "");
+    Gguf empty_val;
+    empty_val.kv_str("tokenizer.chat_template", "");
+    expect("empty value reads as none", onebit::gguf_string_meta(empty_val.write(dir / "emptyval.gguf"),
+                                                                "tokenizer.chat_template"), "");
+    Gguf wrong_type;
+    wrong_type.kv_u32("tokenizer.chat_template", 7);
+    expect("an integer under the key", onebit::gguf_string_meta(wrong_type.write(dir / "int.gguf"),
+                                                               "tokenizer.chat_template"), "");
+
     { std::ofstream(dir / "text.gguf") << "not a gguf file at all"; }
     expect("not a GGUF", onebit::gguf_architecture((dir / "text.gguf").string()), "");
+    expect("not a GGUF, string key", onebit::gguf_string_meta((dir / "text.gguf").string(), "general.architecture"), "");
     expect("missing file", onebit::gguf_architecture((dir / "missing.gguf").string()), "");
 
     std::filesystem::remove_all(dir);

@@ -363,6 +363,17 @@ is otherwise served a chat prompt with no BOS: measured on ZR1-1.5B, the forward
 5-token prompt where llama.cpp built 6, and the reply opened with the end-of-turn token.
 `tools/safetensors_to_q4nx.py` carries the same two keys from `tokenizer_config.json`.
 
+**A GGUF that declares a RoPE scaling block is refused.** This route has no scaling rule — the
+packed lane computes `theta^(-i/half)` and nothing else — and a container written from a scaled
+GGUF would carry `rope_theta` alone, be served plain RoPE, stay fluent and be wrong past the
+model's original window, with nothing in any log to say so ([engine#1087](https://github.com/1bit-MONSTER/engine/issues/1087)).
+So `pack` exits non-zero naming the type (`*.rope.scaling.type` = `yarn`/`linear`/`longrope`/…)
+before it creates the output directory. Two rules *are* implemented and are accepted on the
+forward route, which reads the block from `config.json`: `rope_type: "llama3"`
+(Llama-3.1/3.2/3.3) and LongRoPE's `short_factor` (MiniCPM4). The same refusal covers a
+declared-but-unusable `llama3` block, and every other declared type, at `1bit serve` /
+`forward-serve` load time rather than at request time.
+
 | GGUF type | To q4_1 | Error |
 |---|---|---|
 | Q4_0 | scale `d`, zero `-8d`, codes unchanged | bf16 rounding of scale and zero |
@@ -555,7 +566,7 @@ What converts, and how faithfully:
 | `self_attn.{q,k,v}_proj.bias` (24 x 3) | `.fconst`, the tiles' bias subvolumes | bf16 | byte-exact; written only where the pack has one |
 | `mlp.{gate,up}_proj` (24 x 2) | `.fconst`, MLP section, 4,288-byte subvolumes | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
 | `mlp.down_proj` (24 x 1) | `.fconst`, MLP section, 2,176-byte subvolumes | q4_1 tiles | same as the attention tiles |
-| `model.norm` (final) | — | — | **refused**, see below |
+| `model.norm` (final) | `.fconst`, the tail envelope at `layers x stride` | bf16 | byte-exact |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
 An OGA pack keeps its tensors inside the `If` branches: the top-level graph has **no
@@ -672,11 +683,21 @@ v2`) reproduces the shipped tile from the arrays this decoder produces.
 importer cannot represent exits 3 and lists every tensor it refused with the reason, so a
 partial model never lands in a model directory by accident. With `--allow-incomplete` it writes
 what it can and records the rest in the container's `__metadata__` (`incomplete`) and in
-`config.json` (`q4nx_source.incomplete`). On the shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
-that is now **290 tensors, 67,088 tiles** (embedding, head, 48 layer norms, 96 attention
-projections, 72 attention biases, 72 MLP projections) and **one refusal**: the final norm, whose
-1,856-byte tail envelope turned out to be `[eps][pad][448 f32]` and not an RMSNorm weight on either
-`.fconst`.
+`config.json` (`q4nx_source.incomplete`). The shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
+now imports whole — **291 tensors, 67,088 tiles, no refusals**: embedding, head, the 48 layer
+norms, the final norm, 96 attention projections, 72 attention biases and 72 MLP projections.
+
+### The final norm, and the tail envelope
+
+The layer blocks stop at `layers x stride`; what follows in either `.fconst` is a 1,856-byte
+envelope `[eps bf16 1e-6][62 pad][hidden x bf16]` — the **final norm** — and, in the
+`Llm_Token_Token` file, the `lm_head` tile stream after it (which is why the head's payload was
+found verbatim at `tail + 1,856`). The position is not assumed: the epsilon has to be at
+`layers x stride`, and where the pack ships both files the two copies of the norm have to be
+byte-identical, which is what the import requires before it writes either. On the 0.5B pack the
+stored bytes equal the upstream checkpoint's `model.norm.weight` exactly. (The earlier reading —
+"the tail envelope is `[eps][pad][448 f32]`, so the final norm's position is unknown" — was the
+last 1,856 bytes of the *file*, which in the Token_Token program are tile padding.)
 
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
 opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as
@@ -899,6 +920,8 @@ got before.
 | `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
+| `max_tokens` / `max_completion_tokens` | the reply's cap (`max_completion_tokens` wins); a value that is not a number is a 400 naming the field, and a fractional one is truncated |
+| `stream` | `true` streams SSE chunks; a value that is not a boolean is a 400 naming the field |
 | `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
@@ -936,8 +959,10 @@ dropped from a schema would leave the caller believing the answer was validated.
 the schema's order with the required ones first, so the object's key order is fixed for a given schema.
 
 A field the route cannot honour is a 400 whose `error.message` says why ("`json_schema`: pattern is not
-supported by this route's schema-to-GBNF converter", "`gbnf: unterminated literal at line 1`"),
-never a silently ignored key. `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
+supported by this route's schema-to-GBNF converter", "`gbnf: unterminated literal at line 1`",
+"`stream`: must be true or false", "`tools`: must be an array"),
+never a silently ignored key and never a 500: a wrong *type* is a client error like any other, including on the
+fields the route reads before it starts decoding (engine#1106). `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
 an end-of-sequence token, a stop sequence or a grammar that allows nothing more.
 
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
@@ -1112,10 +1137,37 @@ hardware contexts until `amdxdna` is reloaded, and says so in its own kernel mes
 
 One process owns the NPU by default: it takes an exclusive `flock` on
 `/tmp/1bit-npu-device.lock` for its lifetime (`app/npu_device_lock.h`), so a second serve of the
-NPU route waits instead of contending. That is a policy, not a hardware limit -- the driver
-advertises 16 hardware contexts on this part (`hwctx_limit = 16`, `drivers/accel/amdxdna/npu4_regs.c`)
-and only refuses the 17th -- and the policy stays the default because a second stream buys much less
-than 2x:
+NPU route waits instead of contending. The policy stays the default because a second stream buys
+much less than 2x -- and with the driver patch this tree carries (`0003`, running on strixhalo since
+2026-11-05 06:26 as `349FDC99CADC56900E0249A`) it is also the only shape the device accepts, which is worth
+stating precisely because the limit is *not* the hwctx count:
+
+- **The array partition is the real limit, and it is per client.** `hwctx_limit = 16`
+  (`drivers/accel/amdxdna/npu5_regs.c:74`; `npu4_regs.c:174` says the same) bounds how many hardware
+  contexts **one** client may open;
+  it says nothing about a second client. The solver hands each client a column range, and the NPU
+  has 8 columns and the kernel set this engine ships asks for **all 8** (measured on the c24 set:
+  `xrt-smi examine -r aie-partitions` shows one partition, `Columns [0..7]`), so one client's contexts
+  share the whole array and a second client has nothing to be given.
+- **What that cost before the fix.** With the unpatched driver a second client was handed the same
+  columns instead, and its configuration took the array out from under the first: every client then
+  failed `614 state 8, run 0 of 28` with `DPU PC 0xffffffff` in the firmware capture -- measured
+  2026-11-05, 3/3 with the requests overlapping and 3/3 with them strictly sequential, and never with
+  a single context ([engine#1084](https://github.com/1bit-MONSTER/engine/issues/1084)).
+- **What it costs after it.** `third_party/patches/amdxdna/0003` shares a partition only between
+  contexts of the *same* client, so the second client is refused with `code 102` / `-ENODEV` instead
+  of taking the array down, and the partition is released when the holder exits. Measured on that
+  build: the holder kept its 1 099-chunk row while the second client was refused, a fresh client
+  answered once the holder exited, and one process held 2 contexts without trouble. Multi-context
+  within one process -- the per-op route, the per-block-count route -- is unchanged, and the
+  model-generic route that holds one context per design was re-measured on it with **8** contexts in
+  one process (engine#1084).
+
+So `--npu-streams N` **needs a kernel set that asks for fewer columns than the array has**: with the
+sets shipped today a second stream is refused rather than slow, and the throughput numbers below are
+what two streams cost *when the column request allows them* (they were measured on the LFM2 `m16`
+set, not on the 8-column sets this engine ships). The rest of this section is about that case, and the
+lock policy above still governs it:
 
 - **The DMA engine is shared.** Decode reads the model's int8 weights once per token (~24.3 GB at
   ~2.2 GB/s effective on the 27B, [engine#587](https://github.com/1bit-MONSTER/engine/issues/587));
@@ -1129,14 +1181,18 @@ With that said, two streams do run, and the option is what says you meant it:
 
 ```
 # stream 1 of 2, then stream 2 of 2, in two shells (different ports, same model)
-./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8000
-./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8001
+./1bit forward-serve -m <model.q4nx> --kernels <dir> --npu-streams 2 -p 8000
+./1bit forward-serve -m <model.q4nx> --kernels <dir> --npu-streams 2 -p 8001
 ```
 
-`--npu-streams N` (1..16, default 1) is `forward-serve`'s flag too: N = 1 keeps the exclusive lock,
-N >= 2 takes a **shared** lock, so the opted-in streams co-exist while any exclusive holder -- an
-unflagged `1bit serve`, the per-process ELF runner (`npu_engine_universal`), another build's serve --
-still keeps them all out, in either order, because they share one file and one `flock(2)`.
+`--npu-streams` belongs to `forward-serve` (and to the GGUF-on-NPU model-generic forward `serve`
+starts for it): N = 1 keeps the exclusive lock, N >= 2 takes a **shared** lock, so the opted-in
+streams co-exist while any exclusive holder -- an unflagged serve, the in-process route, the
+per-process ELF runner (`npu_engine_universal`), another build's serve -- still keeps them all out, in
+either order, because they share one file and one `flock(2)`. The **in-process** route (a `.q4nx` model
+directory through `serve`, i.e. `app/unified.cpp`) always takes the exclusive lock and refuses
+`--npu-streams` by name: it keeps one context, so N streams there could only queue, and two of them
+dispatching at once is the measured wedge (engine#1051).
 
 **The lock is one file and one protocol, across runtimes, and it is advisory** -- that is what makes it
 usable beside another NPU engine, and what its limits are:
@@ -1146,8 +1202,9 @@ usable beside another NPU engine, and what its limits are:
   not wait for other shared holders"; `LOCK_EX` = "I want the device to myself". A holder keeps its fd
   open for the life of the process; closing or exiting releases it. `LOCK_EX` and `LOCK_SH` never
   overlap, in either order, on one file.
-- **Who may take what.** Anything that honours the file interlocks with us: our serves
-  (`--npu-streams` decides which mode), the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
+- **Who may take what.** Anything that honours the file interlocks with us: `forward-serve`
+  (`--npu-streams` decides which mode), the in-process route (`LOCK_EX`, always -- `app/unified.cpp`),
+  the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
   Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
   keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
   file is not slowed, not blocked and not detected.
@@ -1160,7 +1217,9 @@ usable beside another NPU engine, and what its limits are:
 **Partitioning, and what it would take.** Two whole-array streams share one DMA engine, so they
 serialise; the September prototype that scaled (~100 % each) did it by giving each stream a *disjoint
 half of the columns*, which halves per-stream weight reuse, and its xclbin pair is ABI-stale at this
-pin, so nothing in this tree can select a column split today: both of our instances run whole-array.
+pin, so nothing in this tree can select a column split today: both of our instances run whole-array --
+which is exactly the request the solver cannot satisfy twice (see the limit above), so a 4-column
+kernel set is the prerequisite for the numbers in this section, not a tuning option.
 What each engine costs is therefore the whole model per stream -- **one hwctx and one complete copy of
 the weight BOs, plus its own KV cache and scratch**, and the device's hwctx limit is 16. The accounting
 per engine is: `streams x (weights + KV + scratch)` must fit in the NPU's share of the box's LPDDR5X
@@ -1231,10 +1290,37 @@ so:
 A real failure is unchanged apart from being reported: the last attempt's exception still reaches the
 caller after the window closes, and the log now names the attempt count and the reason.
 
-One load failure is not transient and says so: the driver refusing to create a hardware context
-(`code 102`, `errc::ctx_create`) with `No such device` means the array is in the state a TDR leaves
-behind when it could not restart a context, and it keeps refusing until the driver is reloaded. The
-give-up report adds the one action that works:
+#### A refusal is a queue, not a fault
+
+A second **client** on the NPU is refused with the same signature a dead array answers — `code 102` /
+`-ENODEV` from `aie2_message.c`'s context-create path — so the code alone cannot say which one it is. Time
+can: a client that holds the array frees it when it exits, a dead array never does. Since the per-client
+partition fix ([engine#1085](https://github.com/1bit-MONSTER/engine/pull/1085), decision 2026-11-05)
+makes that refusal the *normal* way a second client is turned away, a refused context is now **queued**
+rather than failed: the same retry schedule runs against a load queue budget instead of the 2.5 s race
+window, and the log says which of the two it is waiting for.
+
+```
+$ 1bit serve -m <model dir> --load-queue-ms 45000       # the default
+1bit unified: opening the private route's NPU context attempt 3 failed after 410 ms
+              (npu runtime: device error (code 102): No such device); retrying in 600 ms
+              (queued: another NPU client may hold the array)
+```
+
+`--load-queue-ms N` bounds that wait (default **45000**, `0` refuses at once, i.e. the pre-#1085
+behaviour). When the budget runs out the operator hint names both causes in the order to check them —
+another client first (wait for it, or stop it), the driver second (`modprobe -r amdxdna && modprobe
+amdxdna`) — because after a full budget the array is either genuinely busy elsewhere or genuinely dead.
+
+This is the load-side counterpart of `--queue-ms`, which bounds how long a *request* waits for the
+device lock; the two are separate because a request can be told it is queueing (an empty delta a second)
+and a load cannot.
+
+One NPU failure is not transient and says so: the driver deciding the array is dead, reported with
+`No such device` (ENODEV) and either `code 102` (`errc::ctx_create`) or `code 104` (`errc::submit`) —
+whichever call was refused, which depends only on whether the process already had a hardware context
+when the array went. That is the state a TDR leaves behind when it could not restart a context, and the
+driver keeps refusing until it is reloaded. The report adds the one action that works:
 
 ```
 1bit unified: the NPU array is refusing hardware contexts: reload the driver (modprobe -r amdxdna && modprobe amdxdna)

@@ -49,6 +49,14 @@ mkdir -p "$work" || exit 2
 work=$(cd "$work" && pwd)
 
 # The kernel and initrd come from the image, not from the build tree beside it.
+# The work dir caches vmlinuz/initrd, and an unkeyed cache grades the previous artifact: the same defect the zdrv cache
+# in g3-probe.sh had (found on c26, where a re-run reported the first cut's module). Key it to this image's sha256.
+sum=$(sha256sum "$iso" 2> /dev/null | cut -d' ' -f1)
+if [ -n "$sum" ] && [ "$(cat "$work/.artifact-sha256" 2> /dev/null)" != "$sum" ]; then
+    rm -f "$work/vmlinuz" "$work/initrd.gz"
+    printf '%s\n' "$sum" > "$work/.artifact-sha256" 2> /dev/null
+    echo "  cache: new artifact (${sum%"${sum#????????}"}…), extracted files cleared"
+fi
 [ -f "$work/vmlinuz" ] || xorriso -osirrox on -indev "$iso" \
     -extract /vmlinuz "$work/vmlinuz" -extract /initrd.gz "$work/initrd.gz" > /dev/null 2>&1
 [ -s "$work/vmlinuz" ] && [ -s "$work/initrd.gz" ] || { echo "$prog: cannot extract the kernel from $iso" >&2; exit 2; }

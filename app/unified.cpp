@@ -36,6 +36,7 @@
 
 #include <httplib.h>
 #include "http_guard.h"
+#include "npu_device_lock.h"  // engine#612: one process owns the array unless the operator says otherwise
 #include "npu_load_retry.h"   // engine #1010: an evict->load race is transient, a cold NPU context is not
 #include "serve_watchdog.h"  // npu_run_failed: a failed runlist means this process's NPU context is dead
 #include <nlohmann/json.hpp>
@@ -383,7 +384,7 @@ bool is_npu_model_dir(const std::string& dir, const npu::PrivateOptions& opts) {
 
 int run_unified(int argc, char** argv) {
     std::string model_dir, host = "127.0.0.1", alias;
-    int port = 8000, queue_ms = 300000, queue_ms_plain = 5000;
+    int port = 8000, queue_ms = 300000, queue_ms_plain = 5000, load_queue_ms = 45000;
     npu::PrivateOptions opts;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -398,6 +399,7 @@ int run_unified(int argc, char** argv) {
         else if (a == "--opt") npu::parse_private_option(next(), opts);
         else if (a == "--queue-ms") queue_ms = std::stoi(next());
         else if (a == "--queue-ms-plain") queue_ms_plain = std::stoi(next());
+        else if (a == "--load-queue-ms") load_queue_ms = std::stoi(next());
         else if (a == "--help" || a == "-h") {
             std::printf("usage: 1bit unified -m <model dir> [-p 8000] [--host 127.0.0.1] [--alias NAME]\n"
                         "                    [--opt KEY=VALUE ...]\n"
@@ -407,6 +409,10 @@ int run_unified(int argc, char** argv) {
                         "              (default 300000, a full generation; 0 refuses at once)\n"
                         "  --queue-ms-plain N the same for a non-streamed request, which cannot be told it is\n"
                         "              queueing, so it keeps a short bound (default 5000)\n"
+                        "  --load-queue-ms N a load refused because another client holds the NPU array waits at\n"
+                        "              most N ms for it to free before the driver is called dead (default 45000;\n"
+                        "              0 refuses at once). The refusal shares code 102 with a dead array, and only\n"
+                        "              time tells them apart (engine #1085, a per-client partition)\n"
                         "  --opt       an option for a private route (docs/npu.md, \"Private routes\")\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
@@ -415,6 +421,8 @@ int run_unified(int argc, char** argv) {
                                                std::to_string(queue_ms));
     if (queue_ms_plain < 0) throw std::runtime_error("--queue-ms-plain takes 0 (refuse at once) or more, not " +
                                                      std::to_string(queue_ms_plain));
+    if (load_queue_ms < 0) throw std::runtime_error("--load-queue-ms takes 0 (refuse at once) or more, not " +
+                                                    std::to_string(load_queue_ms));
     if (model_dir.empty()) throw std::runtime_error("-m <model dir> is required");
     // Lemonade hands over the checkpoint path, which may name the container file.
     if (std::filesystem::is_regular_file(model_dir)) model_dir = std::filesystem::path(model_dir).parent_path().string();
@@ -464,6 +472,17 @@ int run_unified(int argc, char** argv) {
         if (!ready) { r.status = 503; return; }
         handle_generate(e, q, r, false, on_run_failed);
     });
+    // Who may have the NPU (app/npu_device_lock.h, engine#612).  This route had no cross-process lock while
+    // `forward-serve` took one, and it is the SHIPPED front door: `1bit serve -m <q4nx dir> --device npu` lands
+    // here, and so does the payload's Lemonade backend.  Two such processes then dispatch at the same instant, which
+    // is the measured wedge: two serves, both `code 614 ... state 8, run 0 of 28`, one TDR (DPU PC 0xffffffff) and
+    // hwctx_num = 2 (evidence hrx-study/evidence/fabric/npu-longctx/two-client-20261105-034608, engine#1051).
+    // Exclusive, like every other route: a second backend waits HERE -- it does not dispatch on a live context -- and
+    // takes the device when this one exits, which a failed run makes it do (the exit-1 path above).  Taking it before
+    // the model is opened matters: opening a context is the other half of what the lock is protecting.  The fd stays
+    // open for the life of the process; closing it, or exiting, releases the lock.
+    const int lock_fd = std::getenv("NPU_NO_DEVICE_LOCK") ? -1 : take_npu_device_lock(1);
+    (void)lock_fd;
     if (!srv.bind_to_port(host, port)) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
     // Serve /v1/health (503 until ready) while the model loads.
     std::thread listener([&] { srv.listen_after_bind(); });
@@ -482,6 +501,10 @@ int run_unified(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     if (const std::string why = npu_model_problem(model_dir, opts); !why.empty()) throw std::runtime_error(why);
     const NpuModel kind = npu_model_kind(model_dir, opts);
+    // A context refused because another client owns the array waits this long before it is called dead
+    // (engine #1085 / decision 2026-11-05 item 2: code 102 is the same for "busy" and "dead", so we queue).
+    onebit::LoadRetryPolicy load_policy;
+    load_policy.refusal_window_s = load_queue_ms / 1000.0;
     e.model = std::make_unique<npu::Model>(model_dir);
     e.tok = std::make_unique<npu::Tokenizer>(model_dir + "/tokenizer.json");
     if (kind == NpuModel::Private) {
@@ -491,7 +514,7 @@ int run_unified(int argc, char** argv) {
         const npu::PrivateRoute& route = *rp;
         // Engine #1010: a load that starts right after an evict can hit the previous backend's hardware context still
         // being torn down. Retry briefly (and log each reason) instead of exiting 1 inside 100 ms with nothing to say.
-        open_with_retry(LoadRetryPolicy{}, "opening the private route's NPU context",
+        open_with_retry(load_policy, "opening the private route's NPU context",
                         [&] { e.priv = route.open(*e.model, *e.tok, model_dir, opts); });
         e.max_context = e.priv->max_context();
         e.default_penalty = e.priv->default_repetition_penalty();
@@ -502,7 +525,7 @@ int run_unified(int argc, char** argv) {
         const std::string type = e.model->dims().model_type;
         if (type != "qwen3" && type != "qwen2")
             throw std::runtime_error("model_type '" + type + "': the fast lane serves the Qwen2/Qwen3 layer kernel only");
-        open_with_retry(LoadRetryPolicy{}, "opening the layer lane's NPU context",
+        open_with_retry(load_policy, "opening the layer lane's NPU context",
                         [&] { e.lane = std::make_unique<npu::Lane>(*e.model, npu_kernel_dir(model_dir)); });
     }
     ready = true;

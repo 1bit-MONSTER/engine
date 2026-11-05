@@ -101,7 +101,8 @@ inline std::vector<Tool> read_tools(const nlohmann::json& tools) {
 inline std::string tool_call_gbnf(const nlohmann::json& tools, const nlohmann::json& tool_choice,
                                   bool parallel_tool_calls) {
     using tool_detail::read_tools;
-    if (!tools.is_array() || tools.empty()) return "";
+    if (!tools.is_array()) throw std::runtime_error("tools: must be an array");
+    if (tools.empty()) return "";
     std::vector<tool_detail::Tool> list = read_tools(tools);
 
     // tool_choice decides which names may appear.

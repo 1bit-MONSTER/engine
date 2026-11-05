@@ -134,6 +134,13 @@ vm_gone() { echo "the VM was no longer running when this row ran (qemu budget ${
 
 ARTIFACT=$iso python3 - "$work" "$iso" > "$work/rows.txt" 2>&1 <<'PY'
 import socket, sys, time, os, re, subprocess, shutil
+
+# The shipping driver's srcversion for the MEDIUM this harness is checking. Cycle 26 carries 0011v2: 0008+0009+0011+0011v2,
+# built WITHOUT the 0010 debugfs hook (srcversion EE1F36A2B9BA294CE11AD80, verified: no `tdr_test` string). This box also
+# holds the 0010 hook build for testing, and the two are indistinguishable by vermagic, signer or filename - only
+# srcversion separates them, so the medium has to answer for the build it is meant to carry.
+# Another cycle's medium: AMDXDNA_SRCVERSION=<its value> vm-check.sh <img> <work>.
+WANT_SV = os.environ.get("AMDXDNA_SRCVERSION", "EE1F36A2B9BA294CE11AD80")
 work = sys.argv[1]
 artifact = sys.argv[2]
 log = open(os.path.join(work, "serial.log"), "ab", buffering=0)
@@ -344,10 +351,14 @@ rows = [
     # Cycle 14, item 2: who owns tty1. `U2 tty1` reads what a person sees; this says which process put it
     # there, because the board run had a prompt in QEMU and none on the hardware and only this line names the
     # difference. 1bit-console is the appliance's own entry (inittab), plogin is what it replaced.
-    ("U2 tty1 owner", "for p in /proc/[0-9]*; do t=$(readlink \"$p/fd/0\" 2>/dev/null); "
-                     "case \"$t\" in /dev/tty1) echo \"tty1-owner: $(tr -d '\\000' < $p/cmdline | tr '\\000' ' ')\";; esac; done | head -2; "
-                     "pgrep -af 'getty|plogin|1bit-console' | head -3; "
-                     "grep -c '^tty1::respawn:/usr/local/bin/1bit-console$' /etc/inittab", None),
+    ("U2 tty1 owner", "own=$(for p in /proc/[0-9]*; do t=$(readlink \"$p/fd/0\" 2>/dev/null); "
+                     "case \"$t\" in /dev/tty1) tr -d '\\000' < $p/cmdline | tr '\\000' ' '; echo ;; esac; done | head -4); "
+                     "printf 'tty1-owners: %s\\n' \"$(printf '%s' \"$own\" | tr '\\n' '|')\"; "
+                     "pgrep -af 'getty|plogin' | head -3; "
+                     "i=$(grep -c '^tty1::respawn:/usr/local/bin/1bit-console$' /etc/inittab); echo \"inittab-console=$i\"; "
+                     "printf '%s' \"$own\" | grep -q '1bit-console' && ! printf '%s' \"$own\" | grep -qE 'getty|plogin' "
+                     "&& [ \"$i\" -eq 1 ] && echo console-owns-tty1",
+                     "console-owns-tty1"),
     # Cycle 14, item 5: release-check SKIPped `fans` on the board ("no /usr/sbin/1bit-board in this image").
     # The tool is os/mini/board.sh, installed as the path that row reads. On a machine whose EC it does not
     # know it must write nothing and say so - which is what this QEMU boot is.
@@ -493,6 +504,41 @@ rows = [
                      "1bit-console-tui --status > /tmp/ct.txt 2>&1; echo status-rc=$?; "
                      "echo invented-urls=$(grep -c 'http://-:' /tmp/ct.txt)",
                      "engine: llamacpp (gpu)"),
+    # Cycle 26 item 1, first half: NOTHING else may write to tty1 while the console owns it. The boot line carries no
+    # `loglevel=`, so console_loglevel is 7 and every kernel message printed onto tty0 - which IS the screen. The c25
+    # take proves the cost: 15 err + 5 warn lines (the 08:52:09Z NPU TDR and its ~18 `*ERROR* aie2_set_cmd_timeout:`
+    # firmware-report lines) landed on top of the TUI. 1bit-console sets `dmesg -n 1` before the TUI starts; the ring
+    # (32 MB) and /data/logs/dmesg.log are untouched, so the evidence is still there - only the screen is quiet.
+    ("U2 console quiet", "awk '{print \"console-loglevel=\" $1; exit}' /proc/sys/kernel/printk; "
+                     "pgrep -f '1bit-console-tui' > /dev/null && echo tui-running; "
+                     "dmesg | wc -l | sed 's/^/kernel-lines=/'", "console-loglevel=1"),
+    # Cycle 26 item 1, second half: the LOGS pane is the screen a person reads, so the 553 polling lines the pages
+    # produce (measured on the c25 take) must not be what is on it. Seeded with the same shape the demo produces, so
+    # the row measures the pane's rule rather than whether this boot happened to be polled.
+    ("U2 log pane", "for i in 1 2 3 4 5; do echo \"2026-11-05 00:00:0$i.000 [Debug] (Server) GET /api/v1/models\" "
+                     ">> /var/log/lemond-onebit.log; done; "
+                     "echo '2026-11-05 00:00:09.000 [Debug] (Server) POST /api/v1/chat/completions' "
+                     ">> /var/log/lemond-onebit.log; "
+                     "1bit-console-tui --snapshot 100x37 > /tmp/pane.txt 2>&1; "
+                     "echo hidden=$(grep -c 'debug lines hidden' /tmp/pane.txt) "
+                     "raw=$(grep -c 'GET /api/v1/models' /tmp/pane.txt) "
+                     "chat=$(grep -c 'POST /api/v1/chat' /tmp/pane.txt); "
+                     "grep -q 'debug lines hidden' /tmp/pane.txt && "
+                     "! grep -q 'GET /api/v1/models' /tmp/pane.txt && "
+                     "grep -q 'POST /api/v1/chat' /tmp/pane.txt && echo pane-filtered",
+                     "pane-filtered"),
+    # Cycle 26 item 1's *board* row, in the form a machine can check: the brief asks for "a tty1 screenshot that shows the
+    # TUI intact after 5 min of polling + 10 chats". /dev/vcs1 is that screenshot's text (the active VT is tty1), so the
+    # same two assertions work here and on the board over ssh: the TUI is drawn on the screen, and no page poll has been
+    # painted onto it. The static PANELS word is the layout; a poll line can only be there if something drew it.
+    ("U2 console screen", "sleep 20; tr -d '\\000' < /dev/vcs1 > /tmp/scr.txt 2>/dev/null; "
+                     "echo screen-chars=$(wc -c < /tmp/scr.txt) "
+                     "panels=$(grep -c 'FANS / TEMPS' /tmp/scr.txt) "
+                     "polls=$(grep -c 'GET /api/v1/models' /tmp/scr.txt) "
+                     "hidden=$(grep -c 'debug lines hidden' /tmp/scr.txt); "
+                     "grep -q 'FANS / TEMPS' /tmp/scr.txt && "
+                     "! grep -q 'GET /api/v1/models' /tmp/scr.txt && echo screen-unpainted",
+                     "screen-unpainted"),
     # The mechanism behind U3-lan and U7 (cycle 15's finding, and the row the c16 refactor folded away): inbound
     # connections from the LAN pass only if the appliance opened the ports AFTER Puppy's rc.firewall (which ends
     # in `-P INPUT DROP`) and let the RFC1918 ranges through tcpwrappers. Printing all three - the rules, the
@@ -566,7 +612,9 @@ rows = [
     ("U1 apt-any",   "for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x dpkg > /dev/null || break; sleep 3; done; "
                      "apt install -y --no-install-recommends cowsay 2>&1 | tail -3; "
                      "command -v cowsay && echo apt-install-works", "apt-install-works", 600),
-    ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
+    ("U3 service",   "n=$(ps | grep -c '[l]emond'); l=$(netstat -lntp 2>/dev/null | grep -c 13305); "
+                     "echo \"lemond-procs=$n listening=$l\"; [ \"$n\" -ge 1 ] && [ \"$l\" -ge 1 ] && echo service-up",
+                     "service-up"),
     ("U3 key",       "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
                      "if [ -n \"$k\" ]; then echo \"auth-mode=keyed (${#k} hex chars)\"; "
                      "else echo 'auth-mode=blank (no LEMONADE_API_KEY line)'; fi",
@@ -649,6 +697,13 @@ rows = [
     # would silently load the in-tree driver.
     ("U4 our driver", "modinfo -n amdxdna; modinfo -F srcversion amdxdna; modinfo -n ec_su_axb35",
                       "/updates/amdxdna.ko"),
+    # Cycle 26: `path` and `signed` cannot tell our two builds apart - the shipping 0011v2 and the 0010 debugfs-hook build
+    # share vermagic, signer and filename, and only srcversion differs (measured: EE1F36A2... vs 349FDC99... on the test
+    # box). So the medium has to answer for the build it is supposed to carry, the way pi-release's `u5-amdxdna-oot` row
+    # does; a hook build passing this gate is exactly the defect this row exists for. Any other cycle's medium passes its
+    # own value in: AMDXDNA_SRCVERSION=<sv> vm-check.sh ...
+    ("U4 driver build", f"sv=$(modinfo -F srcversion amdxdna 2> /dev/null); echo srcversion=$sv want={WANT_SV}; "
+                      f"[ \"$sv\" = \"{WANT_SV}\" ] && echo driver-is-the-cycle-build", "driver-is-the-cycle-build"),
     # And the module has to be the one THIS kernel can load and this appliance trusts: vermagic must name the image's
     # release and the signer must be our MOK. Both are asserted in one token, because one substring per row is all the
     # harness compares - printing them and matching the path, as this row did before pi-prs' verdict, passed a module
@@ -693,8 +748,30 @@ rows = [
     ("U4 engine sha", "sha256sum /opt/1bit-package/1bit/1bit | cut -c1-32", None),
     # the two paths pi-release asked for, asserted on a booted image rather than in a listing
     ("U4 hrx path",   "ls -l /opt/1bit-llama/llama-server 2>&1 | tail -1; "
-                      "/opt/1bit-llama/llama-server --version 2>&1 | head -2", None),
-    ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels", None),
+                     "t=$(readlink -f /opt/1bit-llama/llama-server 2>/dev/null); echo \"resolves-to=${t:-nothing}\"; "
+                     "/opt/1bit-llama/llama-server --version 2>&1 | head -2; "
+                     "[ -x /opt/1bit-llama/llama-server ] "
+                     "&& printf '%s' \"$t\" | grep -q '^/opt/1bit-package/1bit/hrx/llama/bin/llama-server$' "
+                     "&& echo hrx-server-linked",
+                     "hrx-server-linked"),
+    # Cycle 26, item 5: the path row above passes for a payload whose HRX backend cannot load, because the binary and its
+    # siblings live in one directory (`bin/` is BOTH the executable dir and the library dir, RUNPATH=$ORIGIN) and only the
+    # loader knows whether they are all there. Measured on the payload as a bug of the opposite kind - every NEEDED library
+    # resolves beside the binary (ldd: 0 `not found`, libggml-hrx.so.0 among them). A payload that loses one of them, or
+    # ships a binary whose RUNPATH points at a build machine (this one carries /work-c22/hrx-toolchain paths too), fails at
+    # the first HRX request with `invalid device: HRX0` - which is how the c25 take's downloaded backend failed, and the
+    # reason the recipe must use this binary rather than one it downloads.
+    ("U4 hrx libs",   "b=/opt/1bit-package/1bit/hrx/llama/bin/llama-server; "
+                     "n=$(ldd \"$b\" 2>/dev/null | grep -c 'not found'); echo not-found=$n; "
+                     "ldd \"$b\" 2>/dev/null | grep -c 'libggml-hrx' | sed 's/^/ggml-hrx-lines=/'; "
+                     "[ -x \"$b\" ] && [ \"$n\" = 0 ] && echo hrx-backend-loadable",
+                     "hrx-backend-loadable"),
+    ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels 2>/dev/null; "
+                     "n=$(ls -1d /opt/1bit-package/1bit/npu/kernels/*/ 2>/dev/null | wc -l); "
+                     "s=$(ls -1 /opt/1bit-package/1bit/npu/kernels/*/manifest.sig 2>/dev/null | wc -l); "
+                     "echo \"sets=$n signed-manifests=$s\"; "
+                     "[ \"$n\" -ge 1 ] && [ \"$s\" -eq \"$n\" ] && echo npu-sets-sealed",
+                     "npu-sets-sealed"),
     # Cycle 23 (c22 board, 4 Nov): a chat that crosses ~512 positions wedged the NPU, and the fix is the hang
     # detector's timeout in /etc/modprobe.d/amdxdna.conf. The build asserts the FILE; this row asserts kmod's own
     # resolved view of it (`modprobe -c`), which is what the kernel will apply.
@@ -703,7 +780,12 @@ rows = [
     # the kernel, /var/lib/shim-signed/mok/MOK-Kernel.pem, SKI 27:68:3E:38:…) while the modules are signed by a
     # DIFFERENT certificate with the same CN (sig_key 35:5C:A4:8A:…). The board trusts it - it loads this module - so
     # the runtime reading belongs there: /sys/module/amdxdna/parameters/tdr_timeout_ms must be 15000 on the board.
-    ("U5 npu tdr",    "o=$(modprobe -c 2>/dev/null | grep -c 'amdxdna.*tdr_timeout_ms=15000'); "
+    # Measured and worth not misreading: in this VM `modprobe amdxdna` answers "Key was rejected by service", because
+    # sb-vars.sh enrols our certificate in the firmware's **db**, and it is a CA:FALSE code-signing leaf (Key Usage:
+    # Digital Signature, EKU: Code Signing). On the board the same certificate is in **MokList** (shim's import path) and the
+    # module loads - this box runs Secure Boot with amdxdna loaded. So the rejection is a property of how this harness
+    # enrols the key, not of the shipped driver, and the row asserts the watchdog CONFIG for that reason rather than a load.
+("U5 npu tdr",    "o=$(modprobe -c 2>/dev/null | grep -c 'amdxdna.*tdr_timeout_ms=15000'); "
                       "c=$(grep -h 'tdr_timeout_ms=15000' /etc/modprobe.d/*.conf 2>/dev/null | grep -c amdxdna); "
                       "echo kmod-view=$o conf-file=$c; modprobe amdxdna 2>&1 | head -1; "
                       "echo runtime=$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms 2>/dev/null || echo not-loaded); "
@@ -714,7 +796,9 @@ rows = [
     # the durable assertion is the RULE, not the policy: whether rc.firewall has finished at the moment a
     # row runs is a race, but an ACCEPT for tcp/13305 is what makes U3 reachable either way.
     ("U3 port rule", "iptables -C INPUT -p tcp --dport 13305 -j ACCEPT && echo port-13305-open; "
-                     "iptables -C INPUT -p tcp --dport 22 -j ACCEPT && echo port-22-open", None),
+                     "iptables -C INPUT -p tcp --dport 22 -j ACCEPT && echo port-22-open; "
+                     "iptables -C INPUT -p tcp --dport 13305 -j ACCEPT && echo port-rule-present",
+                     "port-rule-present"),
     # Cycle 23 (c22 board, 4 Nov): avahi logged "1bit-os.local is announced" and a raw mDNS query from ryzen got no
     # answer at all. The cause is in the same rc.firewall the two rows above work around: every NEW inbound UDP
     # packet goes to `udp_inbound`, which accepts only DHCP and RETURNs to the DROP policy, and a query on 5353 is

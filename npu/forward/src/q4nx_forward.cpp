@@ -177,6 +177,7 @@ static bool valid_sidecar_dir(const std::string& d) {
 // derived from data_size rather than the declared shape so a 2-D [ntiles, N]
 // and a 3-D [ntr, ntc, N] tensor both work.  (src/q4nx_dequant.c; the Q4_K/Q8
 // layouts are in docs/qwen35-4b-weight-format.md.)
+
 static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
@@ -185,6 +186,12 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
     const int cb = (int)(nbytes / n);
     if (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8)
         return q4nx_dequant_tensor_chunked((const uint8_t*)data, nbytes, rows, cols, cb, out);
+    // The container may store this weight on a wider grid than the model's dimensions (engine#1097).
+    // Read it on the container's grid and write only the model's [rows, cols], so buffers, row
+    // strides and the kernel's B layout stay exactly what they were for an unpadded container.
+    int pcb = 0, prp = 0, pcp = 0;
+    if (q4nx_packed_grid(nbytes, rows, cols, &pcb, &prp, &pcp))
+        return q4nx_dequant_tensor_packed((const uint8_t*)data, nbytes, rows, cols, prp, pcp, pcb, out);
     return q4nx_dequant_tensor((const uint8_t*)data, nbytes, rows, cols, out);
 }
 
@@ -544,6 +551,27 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    {
+        // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
+        // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
+        // log to say so.  "" (no rope_scaling block) is every model that never declared one.
+        std::ifstream f(cfg_path);
+        std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        char declared[64];
+        q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
+        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1)) {
+            if (!std::strcmp(declared, "llama3"))
+                err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
+                       "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
+                       "scaling cannot be applied; serving it would run plain RoPE";
+            else
+                err_ = std::string("config.json declares rope scaling \"") + declared +
+                       "\", which this forward does not implement (only llama3 and longrope short_factor "
+                       "are), so it would be served plain RoPE and reply wrongly past the model's "
+                       "original window (engine#1048, #1087)";
+            return false;
+        }
+    }
     embed_scale_ = read_config_float(cfg_path, "\"embedding_scale\"", 1.0f);
     residual_scale_ = read_config_float(cfg_path, "\"residual_scale\"", 1.0f);
     logit_scale_ = read_config_float(cfg_path, "\"logit_scale\"", 1.0f);
@@ -1710,8 +1738,19 @@ bool Q4nxNpuForward::load_layer(int l) {
         return load_gdn_layer(l);
     auto deq = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-        if (!raw) return false;
-        return dequant_any(raw, (size_t)d->data_size, rows, cols, out) == 0;
+        if (!raw) { err_ = std::string("MLP tensor ") + d->name + " has no data"; return false; }
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out) != 0) {
+            // Name it: the bare "dequant failed" this used to leave cost an afternoon on engine#1097.
+            const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
+            char why[256];
+            snprintf(why, sizeof why, "MLP dequant %s: data_size %zu at geometry %dx%d = %zu tiles "
+                     "(chunk %zu B is not a kind, and no padded grid fits): the container and "
+                     "config.json disagree", d->name, (size_t)d->data_size, rows, cols, tiles,
+                     tiles ? (size_t)d->data_size / tiles : 0);
+            err_ = why;
+            return false;
+        }
+        return true;
     };
     const int H = c_.H, IM = c_.IM, NH = c_.NH;
     // Gemma4 varies the attention width by layer type, so the projection rows
@@ -3656,18 +3695,25 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
     }
 
-    BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
     // batch term's interior is read per phase instead of inferred from the loop's total.
+    //
+    // The counters are zeroed BEFORE BatchPhases snapshots them.  BatchPhases reports this call's cost as a
+    // delta against the values it saw at construction, so zeroing afterwards (the first version of this, #1056)
+    // made every [bl] field a difference against the *previous* pass: `core -4.3` and `gemm -355.7` on a real
+    // ticket (2026-11-05 01:31) are what that looks like.  The [bs] line never had the problem -- it reads the
+    // g_ph it zeroes itself -- so the conclusions drawn from [bs] stand; the [bl] medians between #1056 and this
+    // fix do not, and are re-taken.
     const bool phb = phprof_on();
-    const auto tp_bs = phb ? std::chrono::steady_clock::now()
-                           : std::chrono::steady_clock::time_point{};
-    auto tp_lap = tp_bs;
-    BatchPhaseScope _batch_scope(phb);
     if (phb) {
         g_ph = StepPhases{};
         for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
     }
+    BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
+    const auto tp_bs = phb ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto tp_lap = tp_bs;
+    BatchPhaseScope _batch_scope(phb);
     const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
     const int i_o   = idx_of(Q4NX_DESIGN_O);
     const int i_gu  = idx_of(Q4NX_DESIGN_GU);

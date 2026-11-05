@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pi-hrx-fabric <fabric@1bit.local>
+Date: Thu, 5 Nov 2026 06:20:00 -0400
+Subject: [PATCH 1/2] accel/amdxdna: two TDR-recovery outcomes are not failures
+
+0002's recovery counts two things as failure that are not, and either one latches hw_dead, which then
+refuses every later context with -ENODEV until the module is reloaded:
+
+1. A *throttled* power-cycle. aie2_hw_reset() returns -EBUSY inside AIE2_HW_RESET_MIN_INTERVAL_MS, and
+   the recovery reported it as "did not recover the array". With tdr_timeout_ms=15000 two TDRs inside
+   60 s were enough to take the array from every lane.
+2. A *closing* context. A context whose heap address is gone will never be restarted or dispatched on
+   again, so it must not fail the walk: -ENODEV from aie2_hwctx_restart() for that case is reported as
+   -ESRCH here, counted in rarg.skipped, logged (not at ERR level), and excluded from the latch. The
+   records that motivated it: hwctx.544293.15 at 21:50 and hwctx.2745944.15 / hwctx.2746567.14 at 22:40 on
+   strixhalo, and "restore data not reclaimed" on the c22 board.
+
+The latch condition becomes "(ret && ret != -EBUSY) || rarg.failed", i.e. the array is only condemned when
+the power-cycle actually failed or a live context could not be restarted.
+
+This is the kernel lane's 0008 (pi-kernel-74, 2026-11-04), reconstructed here from the sources the module
+they installed was built from; verified by rebuilding: pin + 0001 + 0002 + this patch produces
+srcversion 6483D31718A008B3602114E, which is exactly the module that was installed at 23:2x that night.
+
+Signed-off-by: bong-water-water-bong <bong-water-water-bong@users.noreply.github.com>
+---
+ drivers/accel/amdxdna/aie2_ctx.c | 14 ++++++++++----
+ drivers/accel/amdxdna/aie2_tdr.c | 29 ++++++++++++++++++++++-------
+ 2 files changed, 36 insertions(+), 7 deletions(-)
+
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -156,8 +156,18 @@
+ 	 * locally so the log says what actually went wrong.
+ 	 */
+ 	if (amdxdna_obj_dma_addr(heap) == AMDXDNA_INVALID_ADDR) {
+-		XDNA_ERR(xdna, "%s has no host buffer address, cannot restart it", hwctx->name);
+-		ret = -ENODEV;
++		/*
++		 * The address is gone, so the owner is tearing down: nobody
++		 * will restart this context or submit on it again. Report
++		 * -ESRCH so a recovery walk can tell "this one is gone" from
++		 * "the array is broken" -- with a plain -ENODEV one dying
++		 * client failed the whole array's TDR recovery and latched
++		 * hw_dead for every later client (2026-11-04: hwctx.544293.15
++		 * at 21:50, hwctx.2745944.15 and hwctx.2746567.14 at 22:40).
++		 */
++		XDNA_DBG(xdna, "%s has no host buffer address (torn down), not restarting it",
++			 hwctx->name);
++		ret = -ESRCH;
+ 		goto out;
+ 	}
+ 
+--- a/drivers/accel/amdxdna/aie2_tdr.c
++++ b/drivers/accel/amdxdna/aie2_tdr.c
+@@ -117,6 +117,7 @@
+ struct aie2_tdr_resume_arg {
+ 	struct amdxdna_dev *xdna;
+ 	bool failed;
++	unsigned int skipped;
+ };
+ 
+ static int aie2_tdr_resume_hwctx(struct amdxdna_hwctx *hwctx, void *arg)
+@@ -125,7 +126,15 @@
+ 	int ret;
+ 
+ 	ret = aie2_hwctx_restart(rarg->xdna, hwctx);
+-	if (ret) {
++	if (ret == -ESRCH) {
++		/*
++		 * The context is being torn down (its heap address is gone),
++		 * so no one will use it again. Skipping it is not a failed
++		 * recovery: counting it as one aborted the whole array for
++		 * one dying client.
++		 */
++		rarg->skipped++;
++	} else if (ret) {
+ 		XDNA_ERR(rarg->xdna, "%s restart failed, ret %d", hwctx->name, ret);
+ 		rarg->failed = true;
+ 	}
+@@ -163,13 +172,24 @@
+ 		XDNA_WARN(xdna, "Array stopped dispatching, power-cycling NPU to recover");
+ 
+ 	ret = aie2_hw_reset(xdna);
+-	if (ret)
++	if (ret == -EBUSY)
++		/*
++		 * Not reachable while dev_lock is held for the whole recovery (the throttle was
++		 * checked at the top), kept so a future caller cannot mistake a throttle for a
++		 * failure. -EBUSY must never set rarg.failed.
++		 */
++		XDNA_WARN(xdna, "NPU power-cycle throttled (last reset %d ms ago), retrying on a later tick",
++			  AIE2_HW_RESET_MIN_INTERVAL_MS);
++	else if (ret)
+ 		XDNA_ERR(xdna, "NPU power-cycle did not recover the array: %d", ret);
+ 
+ 	amdxdna_for_each_client(xdna, client)
+ 		amdxdna_hwctx_walk(client, &rarg, NULL, aie2_tdr_resume_hwctx);
+ 
+-	if (ret || rarg.failed) {
++	if (rarg.skipped)
++		XDNA_WARN(xdna, "TDR: %u context(s) skipped, being torn down", rarg.skipped);
++
++	if ((ret && ret != -EBUSY) || rarg.failed) {
+ 		/*
+ 		 * Do not leave a device that silently swallows every later
+ 		 * request: a new context or a new submission gets a real error.

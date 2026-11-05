@@ -87,7 +87,14 @@ FetchContent_Declare(httplib
     GIT_TAG fe332fa06bac76a1c6d402c08f414052999347da)  # v0.47.0
 FetchContent_MakeAvailable(json httplib)
 
-add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/laya_checkpoint.cpp)
+# config/laya-first.json (the routing table, docs/laya-first.md §4) is compiled in like
+# config/recipes.json; `1bit laya-first --laya-first FILE` replaces it at run time.
+file(READ ${CMAKE_SOURCE_DIR}/config/laya-first.json ONEBIT_LAYA_FIRST_JSON)
+file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
+     "// generated from config/laya-first.json by CMakeLists.txt\n#pragma once\n"
+     "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
+add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/laya_checkpoint.cpp app/laya_first.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -102,6 +109,13 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/pm_experts_default.h
      "// generated from config/pm-experts.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultPmExpertsJson[] = R\"ONEBITPM(${ONEBIT_PM_EXPERTS_JSON})ONEBITPM\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/pm-experts.json)
+# config/template-pins.json (the chat-template sha256 expected per model, docs/serve.md "Chat template") is
+# compiled in the same way; `serve --template-pin FILE` replaces it, `--no-template-pin` drops it.
+file(READ ${CMAKE_SOURCE_DIR}/config/template-pins.json ONEBIT_TEMPLATE_PINS_JSON)
+file(WRITE ${CMAKE_BINARY_DIR}/generated/template_pins_default.h
+     "// generated from config/template-pins.json by CMakeLists.txt\n#pragma once\n"
+     "static const char kDefaultTemplatePinsJson[] = R\"ONEBITTEMPLATE(${ONEBIT_TEMPLATE_PINS_JSON})ONEBITTEMPLATE\";\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/template-pins.json)
 target_include_directories(onebit PRIVATE ${CMAKE_BINARY_DIR}/generated)
 # The GGUF architectures the pinned llama.cpp fork builds a model for (registry/architectures.json,
 # gguf_architectures.hrx, from tools/registry_build.py): serve refuses any other on hrx and cpu.
@@ -145,6 +159,7 @@ add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
+add_test(NAME template_pin COMMAND ${CMAKE_SOURCE_DIR}/tests/template_pin.sh $<TARGET_FILE:onebit>)
 add_test(NAME greedy_shortcut COMMAND ${CMAKE_SOURCE_DIR}/tests/greedy_shortcut.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)
 # where --device npu finds the GGUF repack script: beside 1bit in a package (scripts/package-linux.sh),
@@ -173,6 +188,8 @@ add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FI
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
+# The routing table that ships and the collection.router policy it desugars into (docs/laya-first.md §4).
+add_test(NAME laya_first COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_first.sh $<TARGET_FILE:onebit>)
 add_test(NAME mem_admit_route COMMAND ${CMAKE_SOURCE_DIR}/tests/mem_admit_route.sh $<TARGET_FILE:onebit>)
 # engine#315: what --hrx-cwsr-placement puts in an HRX backend's environment (app/hrx_cwsr.h); fake backend, no GPU.
 add_test(NAME hrx_cwsr_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cwsr_route.sh $<TARGET_FILE:onebit>)
@@ -545,6 +562,10 @@ if(Python3_Interpreter_FOUND)
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
     add_test(NAME q4nx_pb16i COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_pb16i_test.py)
+    # The padded-grid read (engine#1097/#1110): tools/q4nx_diff.py decode reads a container whose weight sits on a
+    # WIDER tile grid than the model's dimensions (the FastFlowLM repack pads intermediate_size to 512 columns, IM
+    # 8960 -> 9216) instead of reporting it as an unreadable reshape.  Pure python + numpy, no model, no device.
+    add_test(NAME q4nx_diff_grid COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_diff_grid_test.py)
     # the t2 chunk kind (docs/npu.md "The t2 chunk kind"): synthetic only, because the real-model
     # leg needs 14 GB of Bonsai-2 images. Run tests/q4nx_t2_test.py without --no-model for the gate.
     add_test(NAME q4nx_t2 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2_test.py --no-model)
@@ -730,6 +751,16 @@ add_test(NAME npu_t2_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_t2_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}
                  ${CMAKE_SOURCE_DIR}/tests/npu_t2_layout_test.cpp)
+# The padded-grid contract (engine#1097): a container may store a weight on a WIDER tile grid than the
+# model's own dimensions -- the FastFlowLM repack pads intermediate_size up to its 512-column grid, so
+# an 8960-wide MLP arrives as 9216 and holds 1728 tiles where the model's dims imply 1680.  The
+# decoder reads the container's grid and writes the model's [rows, cols], so a caller's buffer, its
+# row stride and the kernel's B layout never move.  Self-compiling like the other layout contracts
+# (tests/npu_padded_grid_test.sh) so ctest needs no build target and CI cannot report "Not Run".
+add_test(NAME npu_padded_grid
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_padded_grid_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}
+                 ${CMAKE_SOURCE_DIR}/tests/npu_padded_grid_test.cpp)
 # The host side of a MoE container: __metadata__.moe, per-expert chunk pointers and the router.
 # Crafted directories at run time, so CI needs no 18 GB model; with two arguments it checks the
 # same code against a real container and a gate.json from tools/moe_expert_chunks.py gate.

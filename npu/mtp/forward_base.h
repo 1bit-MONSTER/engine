@@ -16,10 +16,18 @@
 // forward_base.h -- onebit::npu::mtp::BaseModel over the real Q4nxNpuForward, so the draft loop (#785, #798)
 // can drive the actual 27B instead of a toy.
 //
-// The one non-obvious part is commit_verify(): the forward has no GDN deferral yet, so this adapter takes a
-// state snapshot before the verify batch and restores the accepted prefix afterwards.  That is the honest
-// fallback documented in npu/mtp/draft.h -- correct, and slower than the deferred design (a snapshot per
-// iteration instead of k rows of update inputs).  When the engine grows deferral, only this file changes.
+// The one non-obvious part is commit_verify(): a GDN layer's recurrence cannot be re-indexed, so the verify batch
+// DEFERS it -- begin_verify() stores each row's recurrence inputs instead of applying them, and
+// commit_verify_rows(accepted) applies exactly the accepted prefix and drops the rest (#805 P6).  Nothing is
+// snapshotted per iteration and this adapter never restores: restore_state() ACCEPTS a prefix (`tokens < in.tokens`)
+// and installs the GDN planes whole from the snapshot (`q4nx_forward.cpp:326-341`; its only refusals are a plane of
+// the wrong size and a `tokens > in.tokens` extension), so a prefix restore here would leave KV at the prefix with
+// the recurrence still at the snapshot's last position -- the mixed state this deferral exists to avoid.  The
+// forward's snapshot_state()/StateSnapshot API exists and this adapter deliberately does not use it.
+//
+// last_hidden_rows() is `override` for a reason: the loop's advance over the accepted rows hangs on that one
+// signature, and a base whose method silently stops overriding reports no rows at all -- the failure mode that cost
+// the live loop 1 token/pass for a day (#811).
 #pragma once
 
 #include "mtp/draft.h"
@@ -27,7 +35,6 @@
 #include "q4nx_forward.h"
 
 #include <cstdio>
-#include <memory>
 
 namespace onebit::npu::mtp {
 
@@ -46,7 +53,6 @@ public:
         // recurrence inputs, so commit_verify() re-applies only the accepted rows.  No state copy per
         // iteration and no prefix restore (restore_state() refuses those on a GDN model).
         fwd_.begin_verify((int)tokens.size(), start_pos);
-        snap_pos_ = start_pos;
         pending_ = (int)tokens.size();
         last_tokens_ = tokens;
         return fwd_.step_batch_all(tokens, start_pos, logits_all);
@@ -65,7 +71,7 @@ public:
         return use_residual_ ? fwd_.last_residual() : fwd_.last_hidden();
     }
     void use_residual(bool on) { use_residual_ = on; }
-    const std::vector<float>& last_hidden_rows() const { return fwd_.last_hidden_rows(); }
+    const std::vector<float>& last_hidden_rows() const override { return fwd_.last_hidden_rows(); }
 
     // The drafter needs the base embedding of the token it is drafting from; the forward owns that table.
     void embed_into(int token, std::vector<float>& out) const { fwd_.embed_row(token, out); }
@@ -75,9 +81,8 @@ public:
 
 private:
     Q4nxNpuForward& fwd_;
-    std::unique_ptr<Q4nxNpuForward::StateSnapshot> snap_;
     std::vector<int> last_tokens_;
-    int snap_pos_ = 0, pending_ = 0, NV_ = 248320;
+    int pending_ = 0, NV_ = 248320;
     bool use_residual_ = false;
 };
 

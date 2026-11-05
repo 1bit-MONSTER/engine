@@ -342,7 +342,8 @@ because otherwise the second half reads from cache and the difference looks like
 **2.16 GB/s**, so 6.82 GB is **3.2 s** of device time the loader cannot avoid; with a warm page cache
 the same fill is 0.47 s. A first request on a fresh serve therefore costs one fill (0.5 s warm, ~3.2 s
 cold) on top of its prefill, and every request after it on the same serve costs none. Do not read a
-per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments.
+per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments, and
+`[bs]` is the same partition for one batched pass (a verify batch), whose interior a per-token line cannot see.
 
 ### From a GGUF
 

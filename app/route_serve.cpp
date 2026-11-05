@@ -23,6 +23,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "laya_checkpoint.h"
 #include "policy.h"
 #include "route.h"
 #include "scorer.h"
@@ -52,11 +53,8 @@ std::string route_json_line(const std::string& cls, float confidence, const std:
 
 int run_route_serve(const std::string& laya_model_arg, const std::vector<std::string>& devices,
                     const std::string& policy_path) {
-    namespace fs = std::filesystem;
-    // Same checkpoint resolution as the one-shot command: --laya-model may name the parent dir.
-    std::string laya_model = laya_model_arg;
-    if (fs::exists(fs::path(laya_model) / "typed-decisions" / "model.safetensors"))
-        laya_model = (fs::path(laya_model) / "typed-decisions").string();
+    // Same resolution chain as the one-shot command and `serve --laya` (app/laya_checkpoint.h).
+    const std::string laya_model = laya_checkpoint(laya_model_arg);
 
     const laya::RoutePolicy policy = laya::load_route_policy(policy_path);
     const auto t0 = std::chrono::steady_clock::now();

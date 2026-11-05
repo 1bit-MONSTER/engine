@@ -676,6 +676,18 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
         if (sem_.eps <= 0) sem_.eps = c_.eps;
         q4nx_semantics_dump(&sem_);
+        // A layer kind nothing implements is refused BY NAME, here beside the other precise refusals (engine#1087's
+        // shape): q4nx_semantics maps an unrecognised layer_types entry to Q4NX_LAYER_OTHER and the attention path
+        // treats OTHER as full attention, so a container declaring, say, a conv attention would be served as a plain
+        // decoder - fluent, wrong at every position, silent.  Every container on this box declares only
+        // full_attention / linear_attention (sliding-window included), so this refuses nothing that runs today.
+        if (sem_.unknown_layer_type[0]) {
+            err_ = std::string("config.json layer_types names \"") + sem_.unknown_layer_type +
+                   "\", a layer kind this forward does not implement (it runs full_attention, sliding-window and "
+                   "linear/GDN layers), so serving it would run those layers as full attention and be wrong at every "
+                   "position; file the kind you need instead of converting it";
+            return false;
+        }
         // Refuse rather than silently apply full-attention math to a model whose
         // config declares layer types (or RoPE variants) this forward lacks.
         // Refusal is now precise.  Only layers whose attention MATH we do not

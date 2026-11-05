@@ -69,6 +69,18 @@ DECODE_PROMPTS = {
 #: about that many tokens and the score becomes its decode rate -- the number #679 is about -- instead
 #: of the short-prompt geometric mean. The text is a fixed filler sentence repeated to length, so every
 #: candidate sees the same prompt; the real token count comes back from the server and is reported.
+HWMON_ROOT = pathlib.Path("/sys/class/hwmon")
+GPU_SYSFS = pathlib.Path("/sys/class/drm/card0/device")
+
+
+def meminfo_gib(path, unit):
+    """A counter from the GPU's sysfs, in GiB, or None when this box does not expose it."""
+    try:
+        return round(int(path.read_text(encoding="ascii").strip()) / unit, 2)
+    except (OSError, ValueError):
+        return None
+
+
 LONG_PROMPT_UNIT = ("The archive records a series of routine maintenance events on the northern line. "
                     "Each entry lists a date, a shift, an asset and the action taken. ")
 #: Measured on the box: this filler tokenises at ~4.85 characters per token (a 75,200-character prompt
@@ -337,6 +349,70 @@ def device_stack():
     }
 
 
+def die_temp_c():
+    """The die temperature, from the hwmon channel labelled Tctl.
+
+    The hwmon *index* is not stable across boots (this box has rebooted six times in three days and the
+    k10temp channel has come back as hwmon2 and as hwmon4), so the channel is found by its label instead
+    of by a hardcoded path. None when the box exposes no Tctl channel at all.
+    """
+    for label in sorted(HWMON_ROOT.glob("hwmon*/temp*_label")):
+        try:
+            if label.read_text(encoding="ascii", errors="replace").strip() != "Tctl":
+                continue
+            milli = (label.with_name(label.name.replace("_label", "_input"))
+                     .read_text(encoding="ascii").strip())
+        except OSError:
+            continue
+        try:
+            return round(float(milli) / 1000.0, 2)
+        except ValueError:
+            return None
+    return None
+
+
+def box_conditions():
+    """The conditions the measurement is running in, device-free (sysfs + /proc).
+
+    A score is a measurement *of a box*, and this box is shared. On 2026-11-01 the same workload at the
+    same configuration produced 44.69 with a quiet die and no swap, and 31.68 with 85 GB of 122 GB in use,
+    37 GB of swap in play and the die climbing; both passed the correctness gate, which is about the
+    output and says nothing about whether the two arms are comparable, and the result JSON recorded
+    nothing that could tell them apart. Every field is ``None`` where the box does not expose it, so an
+    unreadable die cannot be read back as a cool one.
+    """
+    gtt_used = meminfo_gib(GPU_SYSFS / "mem_info_gtt_used", 2 ** 30)
+    gtt_total = meminfo_gib(GPU_SYSFS / "mem_info_gtt_total", 2 ** 30)
+    available = None
+    try:
+        for line in pathlib.Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                available = round(int(line.split()[1]) / (1024 * 1024), 2)
+                break
+    except (OSError, ValueError, IndexError):
+        available = None
+    return {"tctl_c": die_temp_c(),
+            "gtt_used_gib": gtt_used, "gtt_total_gib": gtt_total,
+            "mem_available_gib": available}
+
+
+def box_summary(samples):
+    """The start snapshot plus how far the die moved while the arm ran.
+
+    The die at start alone cannot separate a clean arm from a loaded one: the arm that had to be aborted
+    on 2026-11-01 was at 54 C when it was claimed and hit 93 C inside the run. Kept in the same shape as
+    the start snapshot, so a reader that only wants the conditions reads the top three fields.
+    """
+    if not samples:
+        return None
+    summary = dict(samples[0])
+    die = [s["tctl_c"] for s in samples if s.get("tctl_c") is not None]
+    summary["tctl_c_min"] = min(die) if die else None
+    summary["tctl_c_max"] = max(die) if die else None
+    summary["tctl_samples"] = len(die)
+    return summary
+
+
 def levers():
     """Echo the configuration into the report, so a KEEP is explicable months later.
 
@@ -585,8 +661,13 @@ def main():
     deadline = time.time() + env_int("HL_BUDGET_SEC", 780 if not longctx else 1200)
 
     model_ident = model_identity(model)
+    # Conditions are sampled at start and at each phase boundary: the arm that had to be aborted on
+    # 2026-11-01 was claimed at 54 C and reached 93 C inside the run, so the start value alone is not
+    # the measurement's conditions. Nothing here touches the device.
+    conditions = [box_conditions()]
     log(f"model={model} bin={bin_dir} state={state}")
     log(f"device={device_stack()}")
+    log(f"box={conditions[0]}")
     log(f"levers={levers() or '{}'}")
     result = {
         "framework": "custom",
@@ -605,10 +686,12 @@ def main():
                           "build": build_identity(onebit, bin_dir),
                           "device_stack": device_stack(),
                           "drafting": drafting_identity(),
+                          "box": box_summary(conditions),
                           "llama_bench_reps": reps},
     }
 
     def finish(passed, reason, rc=0):
+        result["bench_summary"]["box"] = box_summary(conditions)
         result["quality_gate"]["passed"] = bool(passed)
         result["quality_gate"]["reason"] = reason
         result["completed"] = 1 if passed else 0
@@ -627,6 +710,7 @@ def main():
     if rc != 0 or not pp512 or not tg128:
         return finish(False, f"llama-bench failed (rc={rc}, rows={sorted(rows)})", rc=1)
     result["bench_summary"].update({"pp512_tok_s": round(pp512, 2), "tg128_tok_s": round(tg128, 2)})
+    conditions.append(box_conditions())
 
     # 2. serve: the decode-side legs and the greedy texts the gate compares.
     try:
@@ -638,6 +722,7 @@ def main():
         return finish(False, f"serve leg failed: {exc}", rc=1)
     result["bench_summary"]["serve_tok_s"] = {k: round(v, 2) for k, v in tps.items()}
     result["bench_summary"]["placement"] = placement
+    conditions.append(box_conditions())
     if long_info:
         result["bench_summary"]["longctx"] = {k: (round(v, 2) if isinstance(v, float) else v)
                                               for k, v in long_info.items()}
@@ -667,6 +752,7 @@ def main():
     establishing = not ref or not ref_texts or not base_kld.is_file()
 
     kld_stat = kld(ppl, model, bench_args(), base_kld, wiki, min(900, deadline - time.time()), log_dir)
+    conditions.append(box_conditions())
     result["quality_gate"].update({"kld_max_mean": kld_max, "kld_mean": kld_stat["mean"],
                                    "kld_recorded": kld_stat["recorded"]})
     if establishing and kld_stat["recorded"] and kld_stat["mean"] is None:

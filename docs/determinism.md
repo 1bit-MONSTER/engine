@@ -228,8 +228,12 @@ decide whether a given cross-route number means anything at all:
 
 1. **Only positions where both routes chose the same token are comparable.** Four of those eight prompts
 differed at width 1 (token match 0.267-0.923), and there a per-position delta compares *different* tokens —
-it measures the divergence, not the arithmetic. `tools/logprob_agree.py` already restricts deltas to common
-positions; `tools/batched_repeat.py --vs-solo` reports `same_token` beside every delta for the same reason.
+it measures the divergence, not the arithmetic. The size of that effect is measurable in the same run: at
+width 1 the cross-route delta is **3.670e-02** over the four agreeing prompts and **1.468e-01** over the four
+mismatching ones, so a figure quoted over all eight (**8.960e-02**, 2.4× the comparable subset) is mostly a
+statement about how often the two routes pick the same token. `tools/logprob_agree.py` already restricts deltas
+to common positions; `tools/batched_repeat.py --vs-solo` reports `same_token` beside every delta for the same
+reason.
 2. **The batched value is a dispersion, not a number**: the cell's own run is not repeatable (6/12 identical
 copies at width 4 on `cpu`), so what reproduces is the distribution over rounds.
 

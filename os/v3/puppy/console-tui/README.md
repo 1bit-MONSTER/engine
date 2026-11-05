@@ -100,6 +100,20 @@ whose pane is 12 rows, one keypress cost `9 Reboot / power off` for twelve secon
 rows the message wraps to (`a_message_gives_way_before_an_action_does`). At 80x25 and 240x67, where the gates read the
 screen, nothing is trimmed.
 
+**A frame is rebuilt in full once a second, because a tty cannot be made private.** Anything holding this terminal open
+can write to it, and ratatui writes only the cells whose *content* changed since its own last frame - correct only while
+the screen still holds that frame. So one stray line leaves a wrong screen that **a keypress does not fix**: measured on
+the shipped c25 artifact (`2fc6909c…`) in real ptys, three printk-shaped lines were still there at +2.2 s and after a
+keypress, at 80x25 and at 240x67 - and when the write ends on the last row the VT scrolls, which is how the log pane's
+own lines end up painted across the CONNECT block and the MENU (the cycle-25 screenshot: "`engint: o ebit`"). Who writes:
+kernel messages while `console_loglevel` allows them, `1bit-release-check`'s "holding the NPU" line and
+`puppy-check.sh`'s console note (both `/dev/tty1` on purpose), and any program a handoff runs. So the frame is rebuilt in
+full, from a cleared screen, at most once a second: the same write is gone at **+1.0 s**, and the cost is measured -
+`+3.5 KiB/s` at 240x67 (4.5 KiB/s, was 1.0). The `Clear` is one escape and the repaint lands right behind it, i.e. well
+inside a display frame by arithmetic - **not measured on the appliance's own VT**, which is the one thing here a pty
+cannot answer. This is insurance, not the fix for a noisy writer: a writer that paints this screen is still a defect in
+the writer.
+
 ## Keys
 
 | key | what it does |

@@ -122,6 +122,17 @@ fn suspend() {
     let _ = execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
 }
 
+/// Does this paint error end the console?
+///
+/// The module promises "a paint failure redraws", and `ErrorKind::Interrupted` is the failure that promise is about: a signal
+/// arrived before the write reached the terminal (crossterm installs a SIGWINCH handler for resize events, so an ssh user
+/// resizing the window is the realistic case), nothing was drawn, and the next pass paints again. Every other error means
+/// this terminal cannot be written at all - the right answer then is what `1bit-console` does with a non-zero exit: the
+/// dialog menu.
+fn paint_failed(e: &std::io::Error) -> bool {
+    e.kind() != std::io::ErrorKind::Interrupted
+}
+
 /// Was this process started from an ssh session? `sshd` sets both of these, and neither exists on tty1, which is
 /// what makes them the honest question (rather than "is there a terminal", which tty1 answers yes to).
 fn ssh_session(conn: Option<&str>, tty: Option<&str>) -> bool {
@@ -242,18 +253,23 @@ fn run() -> ExitCode {
         // Clear plus absolute positions (no full-screen flash on the VT) and the cost is one frame per second, which is
         // what a stray line can then cost the reader.
         if last_heal.elapsed() >= Duration::from_secs(1) {
-            if term.clear().is_err() {
-                break 1;
+            match term.clear() {
+                Ok(()) => last_heal = Instant::now(),
+                Err(e) if paint_failed(&e) => break 1,
+                // interrupted before a byte went out: the screen is untouched, and the next pass retries
+                Err(_) => {}
             }
-            last_heal = Instant::now();
         }
         let mut links = Vec::new();
-        if term.draw(|f| ui::draw(f, &app, &mut links)).is_err() {
-            break 1;
-        }
+        let painted = match term.draw(|f| ui::draw(f, &app, &mut links)) {
+            Ok(_) => true,
+            Err(e) if paint_failed(&e) => break 1,
+            // interrupted mid-paint: paint again on the next pass instead of ending the console over one EINTR
+            Err(_) => false,
+        };
         // over ssh the screen is a terminal emulator, so the CONNECT URLs can be clickable (OSC 8). On the VGA
         // console (TERM=linux) the same bytes would print as garbage - or worse, as text nobody can click.
-        if hyperlinks_wanted(std::env::var("TERM").ok().as_deref()) {
+        if painted && hyperlinks_wanted(std::env::var("TERM").ok().as_deref()) {
             emit_links(&links);
         }
 
@@ -457,7 +473,7 @@ fn handoff(app: &mut App, term: &mut Terminal<CrosstermBackend<std::io::Stdout>>
 
 #[cfg(test)]
 mod tests {
-    use super::{hyperlinks_wanted, parse_size, ssh_session};
+    use super::{hyperlinks_wanted, paint_failed, parse_size, ssh_session};
 
     #[test]
     fn q_is_the_way_out_only_where_a_prompt_is_harmless() {
@@ -484,6 +500,24 @@ mod tests {
             assert!(!hyperlinks_wanted(Some(term)), "{term}");
         }
         assert!(!hyperlinks_wanted(None));
+    }
+
+    #[test]
+    fn an_interrupted_paint_is_repainted_but_a_dead_terminal_ends_the_console() {
+        use std::io::{Error, ErrorKind};
+        // the failure the module's promise is about: a signal arrived (crossterm's SIGWINCH handler, i.e. an ssh user
+        // resizing the window), nothing reached the terminal, so the next pass paints again
+        assert!(!paint_failed(&Error::from(ErrorKind::Interrupted)));
+        // these mean the terminal cannot be written at all - `1bit-console` then shows the dialog menu, which is what a
+        // non-zero exit is for
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::Other,
+        ] {
+            assert!(paint_failed(&Error::from(kind)), "{kind:?}");
+        }
     }
 
     #[test]

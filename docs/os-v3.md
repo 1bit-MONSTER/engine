@@ -286,7 +286,7 @@ The screen covers the *whole* install, which for v3 means one list that spans bo
  1  target disk and identity          /dev/nvme0n1  YMTC PC41Q-2TB  1.9 TB   user onebit  host 1bit-strixhalo
  2  base system (Ubuntu 26.04 Server)   curtin: partitions, unpack, packages, bootloader
  3  our repository from the stick      8 debs: kernel, modules, rocm, xrt, engine, lemonade, appliance, keyring
- 4  kernel and modules                 vmlinuz-7.3.0-rc4-1bit-perfopt+, amdxdna, ec_su_axb35, initramfs
+ 4  kernel and modules                 vmlinuz-7.4.0-rc1-1bit, amdxdna, ec_su_axb35, initramfs
  5  Secure Boot key                    already enrolled  |  queued for MokManager at the next boot
  6  firmware boot entry                1bit OS -> \EFI\ubuntu\shimx64.efi   BootOrder 0000,...
  7  data partition                     adopted 1BIT-DATA (1.1 GB, 4 models)  |  created empty
@@ -317,7 +317,7 @@ Ubuntu entry, failed, and fell through to the stick.
 Three fixes, all in the installed system rather than in a special-case installer:
 
 1. **efivarfs exists.** Our kernel is built with `CONFIG_EFIVAR_FS=m` (measured in
-   `/boot/config-7.3.0-rc4-1bit-perfopt+`) and an Ubuntu base loads it, so `/sys/firmware/efi/efivars` is
+   `/boot/config-7.4.0-rc1-1bit`) and an Ubuntu base loads it, so `/sys/firmware/efi/efivars` is
    populated (97 entries on this box). The v2 image never staged the module and BusyBox never loaded it,
    which is why the live installer could not fix anything from *inside* the installed system either
    (engine#709). v3 installs from a full Ubuntu session, where `efibootmgr` works, and asks for `=y`
@@ -470,7 +470,9 @@ a console; everything after it is headless.
 
 ## What is measured now
 
-Reference box (strixhalo, 2026-11-01, the machine this design was written on):
+Reference box (strixhalo, 2026-11-01, the machine this design was written on). These are the readings
+the design was written against and stay as the record; the box and the stick have run
+`7.4.0-rc1-1bit` since 2026-11-04 (plain `v7.4-rc1`, `CONFIG_EFIVAR_FS=m` there too).
 
 | fact | measured |
 |---|---|

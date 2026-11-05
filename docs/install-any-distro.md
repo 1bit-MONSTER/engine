@@ -40,7 +40,15 @@ environment and for serve's architecture and memory checks, then `exec`s the eng
 filling in serve's defaults for what the argv left out (`-ngl 99`, `--cache-reuse 256`, `-kvu` above one
 slot).
 
-## Ubuntu 26.04 (resolute) / 24.04 (noble)
+## Ubuntu 26.04 (resolute)
+
+**The engine package needs glibc 2.43, so it is a 26.04-or-newer package.** Measured on the shipping
+package (`readelf -V` on the extracted `1bit`, 2026-11-05): its highest requirement is
+`GLIBC_2.43`, and it is **one symbol** — `sqrtf@GLIBC_2.43`. On Ubuntu 24.04 (noble, glibc 2.39) the
+deb installs and `ldd` is happy, and then the binary refuses to load with
+`version 'GLIBC_2.43' not found`. Lemonade's own PPA does publish noble builds, so the engine half is
+the one that pins the distribution: on noble, build `1bit` from source, or run it on a 26.04 box.
+The tarball below carries the same binary and therefore the same floor.
 
 ```bash
 # 1. Lemonade's own package. The archive is signed by key
@@ -94,8 +102,10 @@ everything else, and the appliance's own check is `1bit-release-check` / `puppy-
 
 ## Other distributions
 
-Unpack the tarball at `/opt/1bit/engine` and install Lemonade your distro's way (its `.deb`/`.rpm`,
-its container, or a source build — anything that reports `llamacpp-hrx` in `system-info`):
+Same floor as above: the tarball carries the same `1bit`, so the distribution needs glibc 2.43 or
+newer as well (measured: one symbol, `sqrtf@GLIBC_2.43`). Unpack it at `/opt/1bit/engine` and install
+Lemonade your distro's way (its `.deb`/`.rpm`, its container, or a source build — anything that reports
+`llamacpp-hrx` in `system-info`):
 
 ```bash
 sudo tar -C / --zstd -xf 1bit-engine-<version>-linux-x86_64.tar.zst opt

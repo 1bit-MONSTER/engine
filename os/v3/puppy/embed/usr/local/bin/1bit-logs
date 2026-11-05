@@ -26,6 +26,7 @@
 #   xerrs.log                /tmp/xerrs.log, xwin's own capture of the X server
 #   lemond.log               /var/log/lemond-onebit.log
 #   webapp.log               /var/log/1bit-webapp.log
+#   thermal.log              Tctl / fan rpm / package W every 10 s, but ONLY while a model is loaded (cycle 25)
 #   BOOT                     date, kernel command line, uptime, release - what machine and entry this was
 #
 # Usage:
@@ -115,6 +116,68 @@ append_new() {
     printf '%s' "$size" > "$d/.$name.off" 2> /dev/null
 }
 
+# thermal_snap <dir>: one line of thermals and power, sampled only while something is serving.
+# Cycle 25's brief: "Tctl, fan rpm, package W every 10 s while a model is loaded" - the condition is the point, an idle
+# appliance must not write a file for a day. "Loaded" is read as the engine's own child process existing (lemond spawns
+# `/opt/1bit-package/1bit/1bit serve` per loaded model), which needs no network and no API key.
+hwmon_read() {   # hwmon_read <file-glob> -> first readable value, or empty
+    for f in $1; do
+        [ -r "$f" ] || continue
+        v=$(cat "$f" 2> /dev/null) || continue
+        case $v in ''|*[!0-9-]*) continue ;; esac
+        printf '%s' "$v"
+        return 0
+    done
+    return 1
+}
+
+tctl_c() {       # the CPU/SoC edge temperature: k10temp's Tctl, else the first labeled temp with that name
+    for d in /sys/class/hwmon/hwmon*; do
+        [ -r "$d/name" ] || continue
+        [ "$(cat "$d/name" 2> /dev/null)" = k10temp ] || continue
+        for t in "$d"/temp*_input; do
+            [ -r "$t" ] || continue
+            [ "$(cat "${t%_input}_label" 2> /dev/null)" = Tctl ] || continue
+            v=$(cat "$t" 2> /dev/null)
+            [ -n "$v" ] && { echo $((v / 1000)); return 0; }
+        done
+    done
+    return 1
+}
+
+fan_rpm() {
+    for d in /sys/class/hwmon/hwmon*; do
+        v=$(hwmon_read "$d/fan1_input" 2> /dev/null) && { printf '%s' "$v"; return 0; }
+    done
+    return 1
+}
+
+pkg_watts() {    # whatever the board exposes as package power, in W with one decimal
+    for d in /sys/class/hwmon/hwmon*; do
+        [ -r "$d/power1_input" ] || continue
+        v=$(cat "$d/power1_input" 2> /dev/null)
+        case $v in ''|*[!0-9]*) continue ;; esac
+        printf '%s.%s' $((v / 1000000)) $(( (v / 100000) % 10 ))
+        return 0
+    done
+    return 1
+}
+
+model_loaded() {
+    pgrep -f '/opt/1bit-package/1bit/1bit' > /dev/null 2>&1
+}
+
+thermal_snap() {
+    d=$1
+    model_loaded || return 0
+    t=$(tctl_c) || t="n/a"
+    f=$(fan_rpm) || f="n/a"
+    w=$(pkg_watts) || w="n/a"
+    printf '%s tctl_c=%s fan_rpm=%s pkg_w=%s\n' "$(date -u +%FT%TZ 2> /dev/null)" "$t" "$f" "$w" \
+        >> "$d/thermal.log" 2> /dev/null
+    return 0
+}
+
 snap() {
     d=$(dir) || { say "1bit-logs: nothing persists ($DATA is not a mounted partition)"; return 1; }
     [ -n "${1:-}" ] && printf '%s %s\n' "$(date -u +%FT%TZ 2> /dev/null)" "$1" >> "$d/markers"
@@ -153,12 +216,21 @@ daemon() {
     done
     [ -n "$waited" ] && say "1bit-logs: $DATA is mounted after waiting, this boot's logs go to $d"
     prune
+    # Cycle 25: the boot's identity is written once, as soon as the partition is there. It lives here rather than in
+    # 06onboard-logs because this loop is the one that has already waited for the mount (and the one that knows the
+    # directory), so the proof cannot land in RAM and disappear.
+    if [ -x /usr/local/bin/1bit-proof ]; then
+        /usr/local/bin/1bit-proof boot > /dev/null 2>&1 || say "1bit-logs: boot proof not written (1bit-proof boot)"
+    fi
     n=0
     while : ; do
-        snap
+        # one loop, two cadences: the log copy every 15 s (3 x 5), thermals every 10 s (2 x 5). A separate sleep loop
+        # would drift against this one and, worse, run while this one is blocked in a slow tail.
+        if [ $((n % 3)) = 0 ]; then snap; fi
+        if [ $((n % 2)) = 0 ]; then thermal_snap "$d"; fi
         n=$((n + 1))
-        [ $((n % 40)) = 0 ] && prune
-        sleep 15
+        [ $((n % 120)) = 0 ] && prune
+        sleep 5
     done
 }
 

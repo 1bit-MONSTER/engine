@@ -2746,9 +2746,9 @@ int32_t Q4nxNpuForward::m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float
 }
 
 // ---------------------------------------------------------------------------
-// Phase attribution (NPU_PHASE_PROF=1).  One line per decode step whose named
-// phases sum to that step's wall time.  Additive measurement only: nothing in
-// the compute path depends on it.
+// Phase attribution (NPU_PHASE_PROF=1).  One line per decode step ([ph]) and one
+// per batched pass ([bs]) whose named phases sum to that pass's wall time.
+// Additive measurement only: nothing in the compute path depends on it.
 // ---------------------------------------------------------------------------
 namespace {
 struct StepPhases {
@@ -2759,6 +2759,10 @@ struct StepPhases {
 };
 StepPhases g_ph;
 bool       g_in_head = false;
+// True for the whole batched body of step_batch(): a verify batch's M-row launches go through
+// prof_pre_ (M > 1), which the per-token accounting deliberately leaves alone, so this flag is what
+// routes their pack/launch/wait/readback split into the same g_ph the [ph] line reads.
+bool       g_in_batch = false;
 inline bool phprof_on() {
     static const bool on = getenv("NPU_PHASE_PROF") != nullptr;
     return on;
@@ -2767,15 +2771,72 @@ inline double ph_ms(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - t).count();
 }
+struct BatchPhaseScope {   // g_in_batch for the batched body, cleared on every return path
+    bool prev;
+    explicit BatchPhaseScope(bool on) : prev(g_in_batch) { if (on) g_in_batch = true; }
+    ~BatchPhaseScope() { g_in_batch = prev; }
+};
+// Ranked layer-loop host call sites: what the `host=` residual is made of.
+// Nested rows (of-which) are inside their parent; the TOP-LEVEL SUM is the
+// one the residual is compared against.
+// host part of npu_gemm = whole call minus the four device phases it times;
+// host part of gdn_layer = the scope minus the gemm launches it contains.
+// Shared by step() (unit "token") and step_batch() (unit "batch") so both residuals are read alike.
+void lh_dump_layer_host(const char* what, const char* unit) {
+    const double gs = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
+    const double gemm_all  = g_lh[LH_GEMM] + g_lh[LH_GEMM_GDN];
+    const double gemm_host = gemm_all - gs;
+    const double gdn_host  = g_lh[LH_GDN] - g_lh[LH_GEMM_GDN];
+    const double top = g_lh[LH_LOAD] + g_lh[LH_ASM] + g_lh[LH_ATTN] + g_lh[LH_RMS] +
+                       g_lh[LH_RES] + g_lh[LH_MLP] + gdn_host + gemm_host;
+    fprintf(stderr, "[lh] %s layer-loop host call sites, ms/%s (ranked):\n", what, unit);
+    bool done[LH_LAYER_N] = {false};
+    for (int r = 0; r < LH_LAYER_N; r++) {
+        int best = -1;
+        for (int i = 0; i < LH_LAYER_N; i++) {
+            if (done[i] || g_lh[i] <= 0.0) continue;
+            if (best < 0 || g_lh[i] > g_lh[best]) best = i;
+        }
+        if (best < 0) break;
+        done[best] = true;
+        const double n = g_lh_n[best] ? (double)g_lh_n[best] : 1.0;
+        fprintf(stderr, "[lh]   %-26s %8.2f ms  n=%4ld  %7.3f ms/call  %5.1f%%\n",
+                lh_name(best), g_lh[best], g_lh_n[best], g_lh[best] / n,
+                100.0 * g_lh[best] / (g_ph.layer > 0 ? g_ph.layer : 1.0));
+    }
+    // Deliberately not static: these are read from g_lh at call time.  A `static` array is initialised
+    // once, so the table froze on its first call and every later line reprinted that first pass's numbers
+    // (seen in ticket-batchprof-p0-before-20261104-142823.log: load_layer 8587.41 ms on every token while
+    // the live ACCOUNTED row moved 654 -> 690 ms).
+    const struct TlpRow { const char* n; double v; } tlp[] = {
+        {"load_layer",                g_lh[LH_LOAD]},
+        {"assemble_B",                g_lh[LH_ASM]},
+        {"gemm host (amax+deq)",      gemm_host},
+        {"gdn_layer (non-gemm)",      gdn_host},
+        {"mlp (act*up)",              g_lh[LH_MLP]},
+        {"rmsnorm",                   g_lh[LH_RMS]},
+        {"attention",                 g_lh[LH_ATTN]},
+        {"residual adds",             g_lh[LH_RES]},
+    };
+    fprintf(stderr, "[lh] TOP-LEVEL PARTITION (no double counting; npu_gemm %.2f "
+                    "- phases %.2f = %.2f host):\n", gemm_all, gs, gemm_host);
+    for (const TlpRow& r : tlp)
+        fprintf(stderr, "[lh]   %-26s %8.2f ms  %5.1f%% of gemm-free host\n", r.n, r.v,
+                100.0 * r.v / (g_ph.layer - gs > 0 ? g_ph.layer - gs : 1.0));
+    fprintf(stderr, "[lh]   %-26s %8.2f ms\n", "ACCOUNTED", top);
+    fprintf(stderr, "[lh]   %-26s %8.2f ms   (layers=%.2f gemm_phases=%.2f)\n",
+            "UNATTRIBUTED", g_ph.layer - gs - top, g_ph.layer, gs);
+}
 }  // namespace
 
 void Q4nxNpuForward::prof_add(ProfAcc* acc, int design, double pack, double quant,
                               double wait, double rb) {
-    if (phprof_on() && acc == prof_dec_ && !g_in_head) {
+    if (phprof_on() && !g_in_head && (g_in_batch || acc == prof_dec_)) {
         g_ph.g_pack += pack; g_ph.g_ql += quant;
         g_ph.g_wait += wait; g_ph.g_rb += rb;
         g_ph.launches++;
     }
+    if (!prof_) return;   // the per-role table belongs to NPU_PROFILE; NPU_PHASE_PROF has its own lines
     if (design < 0 || design >= Q4NX_MAX_DESIGNS) return;
     ProfAcc& a = acc[design];
     a.pack += pack; a.quant += quant; a.wait += wait; a.rb += rb;
@@ -2783,6 +2844,9 @@ void Q4nxNpuForward::prof_add(ProfAcc* acc, int design, double pack, double quan
 }
 
 void Q4nxNpuForward::prof_dump() {
+    // Reached with NPU_PHASE_PROF alone too, because the launch timers are shared: there is no per-role
+    // table to print in that case, and its [ph]/[bs] lines already carry the split.
+    if (!prof_) return;
     fprintf(stderr, "[prof] ---- per-role launch cost (ms, window since last dump) ----\n");
     fprintf(stderr, "[prof] %-5s %-5s %2s %8s %7s %9s %7s %9s %9s\n", "phase", "role",
             "M", "launches", "pack", "quant+lnch", "wait", "readback", "ms/launch");
@@ -3532,6 +3596,17 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     }
 
     BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
+    // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
+    // batch term's interior is read per phase instead of inferred from the loop's total.
+    const bool phb = phprof_on();
+    const auto tp_bs = phb ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto tp_lap = tp_bs;
+    BatchPhaseScope _batch_scope(phb);
+    if (phb) {
+        g_ph = StepPhases{};
+        for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
+    }
     const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
     const int i_o   = idx_of(Q4NX_DESIGN_O);
     const int i_gu  = idx_of(Q4NX_DESIGN_GU);
@@ -3549,6 +3624,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     for (int m = 0; m < M; m++)
         for (int k = 0; k < H; k++)
             X[(size_t)m * H + k] = embed_at(tokens[m], k) * embed_scale_;
+    if (phb) { g_ph.embed = ph_ms(tp_bs); tp_lap = std::chrono::steady_clock::now(); }
 
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row, act_row, hh;
     for (int l = 0; l < c_.NL; l++) {
@@ -3829,6 +3905,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         }
     }
 
+    if (phb) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
     // The next-token logits come from the last row of the batch, after the final
     // norm -- step() applies final_norm_ before run_lm_head, and feeding the raw
     // residual here produced garbage logits (the M=1 self-check caught it).
@@ -3880,6 +3957,24 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                      M, start_pos, c_.NL, (int)two_widths);
     }
     bph.print(M);
+    if (phb) {
+        // epilogue = final norm + the head rows; head= is run_lm_head_rows' own timer, so
+        // epilogue - head is the per-row final norm.  tail must be ~0: it is what the partition misses.
+        const double total = ph_ms(tp_bs);
+        const double epi = ph_ms(tp_lap);
+        const double gsum = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
+        const double hsum = g_ph.h_memcpy + g_ph.h_pack + g_ph.h_ql + g_ph.h_wait + g_ph.h_rb;
+        fprintf(stderr,
+                "[bs] M=%2d start=%4d wall=%7.1f | embed=%5.1f | layers=%7.1f (gemm pack=%6.1f "
+                "ql=%6.2f wait=%7.1f rb=%6.1f sum=%7.1f host=%7.1f n=%ld) | epilogue=%6.1f "
+                "(head=%6.1f sum=%6.1f host=%5.1f) | tail=%5.1f\n",
+                M, start_pos, total, g_ph.embed, g_ph.layer, g_ph.g_pack, g_ph.g_ql, g_ph.g_wait,
+                g_ph.g_rb, gsum, g_ph.layer - gsum, g_ph.launches, epi, g_ph.h_total, hsum,
+                g_ph.h_total - hsum, total - g_ph.embed - g_ph.layer - epi);
+        char what[48];
+        snprintf(what, sizeof what, "batch M=%d start=%d", M, start_pos);
+        lh_dump_layer_host(what, "batch");
+    }
     return ok;
 }
 
@@ -4934,50 +5029,9 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         // delta between two lines, and the bytes are exact (bo::sync is a clflush loop over its range).
         if (getenv("NPU_C_SYNC_PROF")) I8Ctx::c_sync_print(token);
         if (getenv("NPU_A_SYNC_PROF")) I8Ctx::a_sync_print(token);
-        // Ranked layer-loop host call sites: what the `host=` residual is made of.
-        // Nested rows (of-which) are inside their parent; the TOP-LEVEL SUM is the
-        // one the residual is compared against.
-        // host part of npu_gemm = whole call minus the four device phases it times;
-        // host part of gdn_layer = the scope minus the gemm launches it contains.
-        const double gs = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
-        const double gemm_all  = g_lh[LH_GEMM] + g_lh[LH_GEMM_GDN];
-        const double gemm_host = gemm_all - gs;
-        const double gdn_host  = g_lh[LH_GDN] - g_lh[LH_GEMM_GDN];
-        const double top = g_lh[LH_LOAD] + g_lh[LH_ASM] + g_lh[LH_ATTN] + g_lh[LH_RMS] +
-                           g_lh[LH_RES] + g_lh[LH_MLP] + gdn_host + gemm_host;
-        fprintf(stderr, "[lh] tok %d layer-loop host call sites, ms/token (ranked):\n", token);
-        bool done[LH_LAYER_N] = {false};
-        for (int r = 0; r < LH_LAYER_N; r++) {
-            int best = -1;
-            for (int i = 0; i < LH_LAYER_N; i++) {
-                if (done[i] || g_lh[i] <= 0.0) continue;
-                if (best < 0 || g_lh[i] > g_lh[best]) best = i;
-            }
-            if (best < 0) break;
-            done[best] = true;
-            const double n = g_lh_n[best] ? (double)g_lh_n[best] : 1.0;
-            fprintf(stderr, "[lh]   %-26s %8.2f ms  n=%4ld  %7.3f ms/call  %5.1f%%\n",
-                    lh_name(best), g_lh[best], g_lh_n[best], g_lh[best] / n,
-                    100.0 * g_lh[best] / (g_ph.layer > 0 ? g_ph.layer : 1.0));
-        }
-        static const struct TlpRow { const char* n; double v; } tlp[] = {
-            {"load_layer",                g_lh[LH_LOAD]},
-            {"assemble_B",                g_lh[LH_ASM]},
-            {"gemm host (amax+deq)",      gemm_host},
-            {"gdn_layer (non-gemm)",      gdn_host},
-            {"mlp (act*up)",              g_lh[LH_MLP]},
-            {"rmsnorm",                   g_lh[LH_RMS]},
-            {"attention",                 g_lh[LH_ATTN]},
-            {"residual adds",             g_lh[LH_RES]},
-        };
-        fprintf(stderr, "[lh] TOP-LEVEL PARTITION (no double counting; npu_gemm %.2f "
-                        "- phases %.2f = %.2f host):\n", gemm_all, gs, gemm_host);
-        for (const TlpRow& r : tlp)
-            fprintf(stderr, "[lh]   %-26s %8.2f ms  %5.1f%% of gemm-free host\n", r.n, r.v,
-                    100.0 * r.v / (g_ph.layer - gs > 0 ? g_ph.layer - gs : 1.0));
-        fprintf(stderr, "[lh]   %-26s %8.2f ms\n", "ACCOUNTED", top);
-        fprintf(stderr, "[lh]   %-26s %8.2f ms   (layers=%.2f gemm_phases=%.2f)\n",
-                "UNATTRIBUTED", g_ph.layer - gs - top, g_ph.layer, gs);
+        char lhwhat[48];
+        snprintf(lhwhat, sizeof lhwhat, "tok %d", token);
+        lh_dump_layer_host(lhwhat, "token");
     }
     return true;
 }

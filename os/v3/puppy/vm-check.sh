@@ -726,6 +726,35 @@ rows = [
                      "udp-5353-open"),
     # cycle 24: the outbound half, a row of its own rather than a second substring in the row above (one row matches
     # ONE substring, so a second token there would print and never be compared - the #989 lesson).
+    # Cycle 25 (owner: "log verbose it all for proof"): four rows, one per claim that could otherwise be a sentence.
+    # (1) the kernel ring cannot wrap: c23's did, and 1bit-logs could only mark the loss.
+    ("boot ring",    "tr ' ' '\\n' < /proc/cmdline | grep '^log_buf_len='; "
+                     "grep -q 'log_buf_len=32M' /proc/cmdline && echo ring-sized",
+                     "ring-sized"),
+    # (2) the boot's identity is one file, written once, and it carries every label a reviewer needs. Reading the
+    # labels IS the check: a file that exists but says nothing is what a stub would produce.
+    ("U5 boot proof", "p=$(1bit-proof path 2>/dev/null)/boot-proof.txt; ls -l \"$p\" 2>&1 | tail -1; "
+                     "miss=\"\"; for k in cmdline uname secureboot.efivar module.amdxdna amdxdna.tdr_timeout_ms firmware pci.devices memtotal_kb timeline.dmesg sha256sums; do "
+                     "grep -q \"^$k  \" \"$p\" 2>/dev/null || miss=\"$miss $k\"; done; "
+                     "n=$(wc -l < \"$p\" 2>/dev/null); echo \"proof-lines=${n:-0} missing=${miss:-none}\"; "
+                     "[ -z \"$miss\" ] && [ \"${n:-0}\" -ge 20 ] && echo boot-proof-complete",
+                     "boot-proof-complete"),
+    # (3) thermals are sampled ONLY while something is serving - so the two files must agree, and an idle box must
+    # not be writing a power log all day. Both directions are failures the row names.
+    ("U5 thermal gate", "eng=$(pgrep -f '/opt/1bit-package/1bit/1bit' 2>/dev/null | wc -l); "
+                     "d=$(1bit-logs dir 2>/dev/null); n=$(wc -l < \"$d/thermal.log\" 2>/dev/null || echo 0); "
+                     "echo \"engine-children=$eng thermal-lines=$n\"; "
+                     "if [ \"$eng\" -gt 0 ]; then [ \"$n\" -gt 0 ] && echo thermal-gate-consistent; "
+                     "else [ \"$n\" -eq 0 ] && echo thermal-gate-consistent; fi",
+                     "thermal-gate-consistent"),
+    # (4) the artifact a release is attached to: the bundle exists, names this boot, and lists the boot proof inside
+    # it. tar -tf through zstd is the only proof that the archive is readable rather than merely present.
+    ("U5 proof bundle", "o=$(1bit-proof 2>&1); printf '%s\\n' \"$o\" | tail -3; "
+                     "f=$(printf '%s\\n' \"$o\" | head -1); ls -l \"$f\" 2>/dev/null | awk '{print \"bytes=\" $5}'; "
+                     "zstd -dc \"$f\" 2>/dev/null | tar -tf - 2>/dev/null | grep -c 'boot-proof.txt' | "
+                     "sed 's/^/boot-proof-in-bundle=/'; "
+                     "zstd -dc \"$f\" 2>/dev/null | tar -tf - 2>/dev/null | grep -q 'boot-proof.txt' && echo proof-bundle-ok",
+                     "proof-bundle-ok"),
     ("U3 mdns out",  "iptables -S OUTPUT | grep -E -- '-p udp.*--dport 5353.*-j ACCEPT' | head -2; "
                      "iptables -C OUTPUT -p udp --dport 5353 -d 224.0.0.251 -j ACCEPT 2>/dev/null && echo udp-5353-out",
                      "udp-5353-out"),

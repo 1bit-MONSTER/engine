@@ -566,6 +566,15 @@ if(Python3_Interpreter_FOUND)
     # WIDER tile grid than the model's dimensions (the FastFlowLM repack pads intermediate_size to 512 columns, IM
     # 8960 -> 9216) instead of reporting it as an unreadable reshape.  Pure python + numpy, no model, no device.
     add_test(NAME q4nx_diff_grid COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_diff_grid_test.py)
+    # The pooled per-depth live-vs-offline verdict (tools/mtp_depth_pool.py): the brief's "within 2 pp at every
+    # depth" is judged on 8 prompts x 64 tokens POOLED, which is two or three npu-hold tickets of <= 3 min, and
+    # pooling those logs by eye produced two wrong numbers in this lane.  Fixture tickets only -- no model, no
+    # device; the recorded 8x64 window is the tool's known-answer check and is run by hand with --selftest.
+    add_test(NAME mtp_depth_pool COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mtp_depth_pool_test.py)
+    # The repack's tile-order claim (engine#1110): `npu_plan.py` writes container.tile_order=engine-1 for every
+    # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
+    # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.
+    add_test(NAME repack_tile_order COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/repack_tile_order_test.py)
     # the t2 chunk kind (docs/npu.md "The t2 chunk kind"): synthetic only, because the real-model
     # leg needs 14 GB of Bonsai-2 images. Run tests/q4nx_t2_test.py without --no-model for the gate.
     add_test(NAME q4nx_t2 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2_test.py --no-model)

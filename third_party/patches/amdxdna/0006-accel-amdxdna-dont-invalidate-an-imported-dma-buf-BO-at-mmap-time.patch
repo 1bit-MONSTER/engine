@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pi-hrx-fabric <fabric@1bit.local>
+Date: Thu, 5 Nov 2026 13:2x:00 -0400
+Subject: [PATCH 1/2] accel/amdxdna: don't invalidate an imported dma-buf BO at
+ mmap time
+
+amdxdna_insert_pages() marks an imported (dma-buf) BO's mapping invalid right after dma_buf_mmap()
+returns. The invalidation puts the BO on client->bo_invalid_list, whose only drain path is
+amdxdna_populate_range() -> mmget_not_zero() + hmm_range_fault() over the mapped vma. An imported BO's
+vma is created by dma_buf_mmap() on the exporter's object, so it is not backed by the shmem pages
+vm_insert_pages() installs for non-import BOs, and HMM cannot fault it in. The -EFAULT from
+amdxdna_populate_range() is returned by the *next* aie2_cmd_submit() of the client, and because that
+function drains bo_invalid_list client-wide before it looks at the job's own BOs, one imported BO fails
+every later submission of that process - including the no-op admission transaction of a brand new
+hardware context.
+
+Measured on 0.18.0 (Linux 7.3.0-rc4, Strix Halo, NPU5/AIE2P): importing a GPU dma-buf and mapping it
+succeeds, then kernel_queue_create() of a fresh context fails with -EFAULT (0x30000000E in the userspace
+status) and the client stays poisoned for its lifetime. This is engine issue #812.
+
+Importing a foreign dma-buf is only useful if the range can be executed on, so stop marking the
+imported mapping invalid: population and migration of an imported range belong to its exporter, and the
+driver has nothing to refault here. amdxdna_mark_mapp_invalid() loses its last caller and goes with it
+(the driver builds with -Werror, which makes a dead static function a build failure), and the comment in
+amdxdna_client_cleanup() that named it is corrected.
+
+Provenance: this is the 2026-11-02 23:41 pair (ab885d8f, 412fdbc4) rebased onto the series this
+directory carries. NOT INSTALLED anywhere, deliberately: loading it is the owner's call (#812), and the
+runtime proof is the owner's run. Compile-proven here: pin + 0001..0005 + this + the next patch builds
+to srcversion 336751493A77C50DE0B50F7, rc 0, no warnings.
+
+Signed-off-by: bong-water-water-bong <bong-water-water-bong@users.noreply.github.com>
+---
+ drivers/accel/amdxdna/amdxdna_gem.c | 41 +++++++++--------------------------
+ 1 file changed, 10 insertions(+), 31 deletions(-)
+
+--- a/drivers/accel/amdxdna/amdxdna_gem.c
++++ b/drivers/accel/amdxdna/amdxdna_gem.c
+@@ -496,36 +496,6 @@
+ 	amdxdna_gem_destroy_obj(abo);
+ }
+ 
+-static void amdxdna_mark_mapp_invalid(struct amdxdna_gem_obj *abo,
+-				      struct vm_area_struct *vma)
+-{
+-	struct amdxdna_dev *xdna = to_xdna_dev(to_gobj(abo)->dev);
+-	struct amdxdna_client *client;
+-	struct amdxdna_umap *mapp;
+-	int srcu_idx;
+-
+-	mutex_lock(&abo->lock);
+-	client = abo->client;
+-	if (client)
+-		srcu_idx = srcu_read_lock(&client->hwctx_srcu);
+-	mutex_unlock(&abo->lock);
+-
+-	down_write(&xdna->notifier_lock);
+-	if (client && !abo->dying && list_empty(&abo->node))
+-		list_add_tail(&abo->node, &client->bo_invalid_list);
+-	abo->mem.map_invalid = true;
+-	list_for_each_entry(mapp, &abo->mem.umap_list, node) {
+-		if (compare_range(mapp, vma->vm_mm, vma->vm_start, vma->vm_end)) {
+-			mapp->invalid = true;
+-			break;
+-		}
+-	}
+-	up_write(&xdna->notifier_lock);
+-
+-	if (client)
+-		srcu_read_unlock(&client->hwctx_srcu, srcu_idx);
+-}
+-
+ static int amdxdna_insert_pages(struct amdxdna_gem_obj *abo,
+ 				struct vm_area_struct *vma)
+ {
+@@ -549,7 +519,16 @@
+ 			return ret;
+ 		}
+ 
+-		amdxdna_mark_mapp_invalid(abo, vma);
++		/*
++		 * Do not mark the mapping invalid. dma_buf_mmap() established the
++		 * mapping in the exporter's terms and the pages behind it are not
++		 * the shmem pages vm_insert_pages() would install below, so HMM
++		 * cannot refault them. Marking it invalid would put this BO on
++		 * client->bo_invalid_list, where amdxdna_populate_range() fails
++		 * with -EFAULT - and because that list is drained client-wide
++		 * before every submit, one imported BO would fail every later
++		 * submission of the process, not just the ones touching it.
++		 */
+ 
+ 		/* Drop the reference drm_gem_mmap_obj() acquired.*/
+ 		drm_gem_object_put(to_gobj(abo));

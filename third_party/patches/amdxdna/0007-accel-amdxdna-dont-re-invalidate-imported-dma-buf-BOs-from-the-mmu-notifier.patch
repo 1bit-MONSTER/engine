@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pi-hrx-fabric <fabric@1bit.local>
+Date: Thu, 5 Nov 2026 13:2x:30 -0400
+Subject: [PATCH 2/2] accel/amdxdna: don't re-invalidate imported dma-buf BOs
+ from the mmu notifier
+
+amdxdna_hmm_invalidate() applies the same marking that amdxdna_insert_pages() used to apply at mmap
+time. For an imported BO that is just as wrong: any real invalidation of the range - typically the
+exporter calling unmap_mapping_range() while it evicts or migrates the buffer - would put the BO back on
+client->bo_invalid_list, and the next submit would return -EFAULT for the entire client again.
+
+Skip the invalidation marking for imported BOs, but keep the sequence update and the MMU_NOTIFY_UNMAP
+cleanup for them: readers waiting in mmu_interval_read_retry() must still make progress, and the
+notifier must still be unregistered when the range is unmapped.
+
+Same provenance and the same status as the previous patch: rebased onto this directory's series, NOT
+installed, owner-gated (#812), compile-proven (srcversion 336751493A77C50DE0B50F7).
+
+Signed-off-by: bong-water-water-bong <bong-water-water-bong@users.noreply.github.com>
+---
+ drivers/accel/amdxdna/amdxdna_drm.c |  6 +++---
+ drivers/accel/amdxdna/amdxdna_gem.c | 14 +++++++++++---
+ 2 files changed, 13 insertions(+), 7 deletions(-)
+
+--- a/drivers/accel/amdxdna/amdxdna_gem.c
++++ b/drivers/accel/amdxdna/amdxdna_gem.c
+@@ -317,10 +317,19 @@
+ 		 client && amdxdna_client_has_pending_jobs(client));
+ 
+ 	down_write(&xdna->notifier_lock);
+-	if (client && !abo->dying && list_empty(&abo->node))
+-		list_add_tail(&abo->node, &client->bo_invalid_list);
+-	abo->mem.map_invalid = true;
+-	mapp->invalid = true;
++	/*
++	 * An imported BO's population and migration belong to its exporter: any real invalidation of that range
++	 * (typically the exporter calling unmap_mapping_range() while it evicts or migrates) would put the BO back on
++	 * client->bo_invalid_list, and the next submit of the process would fail -EFAULT for every job, not just for
++	 * the one touching the range. The sequence update and the unmap cleanup below stay: readers waiting in
++	 * mmu_interval_read_retry() must make progress, and the notifier must be unregistered on unmap.
++	 */
++	if (!is_import_bo(abo)) {
++		if (client && !abo->dying && list_empty(&abo->node))
++			list_add_tail(&abo->node, &client->bo_invalid_list);
++		abo->mem.map_invalid = true;
++		mapp->invalid = true;
++	}
+ 	mmu_interval_set_seq(&mapp->notifier, cur_seq);
+ 	if (range->event == MMU_NOTIFY_UNMAP && !mapp->unmapped) {
+ 		queue_work(xdna->notifier_wq, &mapp->hmm_unreg_work);
+--- a/drivers/accel/amdxdna/amdxdna_drm.c
++++ b/drivers/accel/amdxdna/amdxdna_drm.c
+@@ -166,10 +166,9 @@
+ 	list_del(&client->node);
+ 	amdxdna_hwctx_remove_all(client);
+ 	/*
+-	 * amdxdna_hmm_invalidate() and amdxdna_mark_mapp_invalid() copy
+-	 * abo->client and then hold client->hwctx_srcu while they link the BO
+-	 * into client->bo_invalid_list and wait for the hardware contexts to go
+-	 * idle.  amdxdna_hwctx_destroy_rcu() only waits for those readers when
++	 * amdxdna_hmm_invalidate() copies abo->client and then holds
++	 * client->hwctx_srcu while it links the BO into client->bo_invalid_list
++	 * and waits for the hardware contexts to go idle.  amdxdna_hwctx_destroy_rcu() only waits for those readers when
+ 	 * there was a hardware context left to destroy; a client that closes
+ 	 * with none (the normal XRT exit order destroys them by ioctl first)
+ 	 * got no grace period at all, so a reader that copied the pointer

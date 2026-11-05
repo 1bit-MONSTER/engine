@@ -615,6 +615,15 @@ add_test(NAME npu_prompt_ids COMMAND npu_prompt_ids_test)
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_prompt_ids_test)
 
+# The ids that end a generation are a list, not an integer (app/npu_stop_tokens.h, engine#1044): a
+# Llama-3.2 container declares eos_token_id [128001, 128008, 128009] and forward-serve read that key as
+# one integer, so 128009 was served as text with finish_reason "length".
+add_executable(npu_stop_tokens_test tests/npu_stop_tokens_test.cpp)
+target_include_directories(npu_stop_tokens_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(npu_stop_tokens_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_stop_tokens COMMAND npu_stop_tokens_test)
+add_dependencies(npu_sampling_test npu_stop_tokens_test)
+
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
 add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c)

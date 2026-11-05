@@ -37,6 +37,8 @@ own round trip (a packer/decoder pair that agrees on the wrong layout scores wel
 itself). That mode is opt-in and is the only one that needs numpy and gguf.
 """
 import argparse
+import contextlib
+import io
 import json
 import os
 import struct
@@ -316,6 +318,27 @@ def self_test():
         if not any("bad data_offsets" in e for e in errors):
             bad.append(f"short tensor not refused: {errors}")
 
+        # a container with no Q8 tiles: --against compared nothing, so the run must not
+        # print the success line for a code-order check that did not happen.
+        noq8 = os.path.join(tmp, "noq8")
+        os.mkdir(noq8)
+        write_q4nx(os.path.join(noq8, "model.q4nx"), [("proj.weight", [2, 4736], "I8", 0xAB)])
+        buf = io.StringIO()
+        argv = sys.argv
+        sys.argv = ["check_q4nx_dir.py", noq8, "--against", os.path.join(tmp, "unused.gguf")]
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc_noq8 = main()
+        finally:
+            sys.argv = argv
+        said = buf.getvalue()
+        if rc_noq8 != 0:
+            bad.append(f"no-Q8 container with --against returned {rc_noq8}: {said}")
+        if "hold the code order" in said:
+            bad.append(f"no-Q8 container claimed a code order was checked: {said}")
+        if "no Q8 tile was decoded" not in said:
+            bad.append(f"no-Q8 container did not say it compared nothing: {said}")
+
         # the directory case: every .q4nx in it is checked
         two = os.path.join(tmp, "two")
         os.mkdir(two)
@@ -355,7 +378,8 @@ def self_test():
             print("  " + b)
         return 1
     print("self-test passed: 3 chunk kinds counted, unknown chunk size refused, short tensor refused, "
-          "directory scans every .q4nx, a Q8 tile written in A's order decodes as A and not as B")
+          "directory scans every .q4nx, a Q8 tile written in A's order decodes as A and not as B, "
+          "and a no-Q8 container claims no code order")
     return 0
 
 
@@ -375,6 +399,7 @@ def main():
     if not args.path:
         ap.error("a model directory or .q4nx file is required (or --self-test)")
     out, rc = {}, 0
+    compared = 0        # Q8 tensors actually decoded and correlated, across all files
     for path in targets(args.path):
         errors, summary = check(path)
         out[path] = summary
@@ -382,6 +407,7 @@ def main():
             print(f"{path}: Q8 code layout against {os.path.basename(args.against)}")
             q8_errors, rows = check_q8_layout(path, args.against, args.q8_samples)
             summary["q8_layout"] = rows
+            compared += len(rows)
             errors += q8_errors
         for e in errors:
             print(f"FAIL {e}")
@@ -391,8 +417,13 @@ def main():
             json.dump(out, f, indent=1)
     if rc:
         print("chunk layout NOT verified")
-    elif args.against:
+    elif args.against and compared:
         print("chunk layout verified, and the Q8 tiles hold the code order npu/q4nx.cpp decodes")
+    elif args.against:
+        # No Q8 tensor was decoded, so nothing was compared: say that instead of
+        # printing the success line for a check that did not run.
+        print("chunk layout verified; no Q8 tile was decoded, so no code order was checked "
+              "against the source weights")
     else:
         print("chunk layout verified: every quantized tensor's shape names a known chunk kind")
     return rc

@@ -159,6 +159,31 @@ void test_valid() {
           "a _t2s2 tag on a pb16i container is refused by name");
 }
 
+void test_tile_order() {
+    // engine#1110: a container declares the q4_1 tile order its payload is in.  Absent means our order
+    // (every plan written before the field existed keeps loading); an id this decoder does not implement
+    // is refused by name, because a wrong order decodes as noise with no error anywhere else.
+    {
+        auto p = base_plan();
+        const Plan got = Plan::load(write_plan("tileorder_absent", p));
+        check(got.tile_order == "engine-1", "a plan without container.tile_order means engine-1");
+    }
+    {
+        auto p = base_plan();
+        p["container"]["tile_order"] = "engine-1";
+        check(Plan::load(write_plan("tileorder_ours", p)).tile_order == "engine-1",
+              "container.tile_order engine-1 loads");
+    }
+    {
+        auto p = base_plan();
+        p["container"]["tile_order"] = "flm-2026-10";
+        const std::string why = refusal(write_plan("tileorder_unknown", p));
+        check(has(why, "container.tile_order \"flm-2026-10\"") && has(why, "engine-1"),
+              "an unknown tile order is refused by name: " + why);
+        check(has(why, "engine#1110"), "the refusal points at the reason it exists");
+    }
+}
+
 void test_refusals() {
     // The whole point: nothing is defaulted, every refusal names the field.
     {
@@ -269,6 +294,7 @@ void test_refusals() {
 
 int main() {
     test_valid();
+    test_tile_order();
     test_refusals();
     std::printf("%s\n", failures ? "FAILED" : "npu_plan: ok");
     return failures ? 1 : 0;

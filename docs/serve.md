@@ -916,3 +916,8 @@ conversation on every turn instead of only the new tokens: on the 27B a follow-u
 after a ~1.6k-token conversation and from 676 ms to 12348 ms after ~5.4k tokens. It is off by default, and the
 token stream of a single turn is unchanged either way.
 
+This section covers the prefill half. The **decode** half — two requests decoding in the same step — is not
+repaired by `--precise` and has no switch: see "Can a *batched* cell be repeated?" in
+[determinism.md](determinism.md) for the measurements and the configuration that does reproduce
+(`--parallel 1`).
+

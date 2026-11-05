@@ -131,6 +131,10 @@ int main() {
                "a failed runlist (614) is not a refused context");
         expect(!onebit::npu_contexts_refused("npu runtime: device error (code 102): Cannot allocate memory"),
                "a different errno on the same code is not the reload case");
+        expect(onebit::npu_contexts_refused("npu runtime: device error (code 104): No such device"),
+               "a submit refused by a dead array is the same state as a refused context creation");
+        expect(!onebit::npu_contexts_refused("npu runtime: device error (code 104): Input/output error"),
+               "a submit that failed with an ordinary errno is not the dead-array case");
         expect(std::string(onebit::npu_contexts_refused_hint()).find("modprobe") != std::string::npos,
                "the hint names the one action that works");
 

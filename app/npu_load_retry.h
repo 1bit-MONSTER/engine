@@ -57,13 +57,18 @@ inline bool load_retry_more(const LoadRetryPolicy& p, int attempts, double elaps
     return elapsed_s + load_retry_delay(p, attempts) <= p.window_s;
 }
 
-// The one load failure an operator has to act on instead of waiting out: the driver refusing to create a hardware
-// context. The runtime reports it as code 102 (`errc::ctx_create`, npu_rt_errors.h) with the ioctl's errno in the
-// message, and "No such device" (ENODEV) is the state a TDR leaves behind when it could not restart a context: amdxdna
-// keeps refusing every new context until it is reloaded (measured on strixhalo 2026-11-04, the wedge in engine #1051).
-// A retry cannot fix that, and neither can the supervisor that restarts us -- so say what does.
+// The one NPU failure an operator has to act on instead of waiting out: the driver deciding the array is dead. The
+// runtime reports it with the ioctl's errno in the message -- "No such device" (ENODEV) -- and the code says which call
+// was refused: 102 `errc::ctx_create` (`aie2_message.c`) or 104 `errc::submit` (`aie2_ctx.c`). Both are the state a TDR
+// leaves behind when it could not restart a context, and amdxdna keeps refusing until it is reloaded (measured on
+// strixhalo 2026-11-04, the wedge in engine #1051). A retry cannot fix that, and neither can the supervisor that
+// restarts us -- so say what does.
 inline bool npu_contexts_refused(const std::string& reason) {
-    return reason.find("code 102") != std::string::npos && reason.find("No such device") != std::string::npos;
+    if (reason.find("No such device") == std::string::npos) return false;
+    // 102 ctx_create and 104 submit: the driver refuses BOTH once hw_dead is latched (aie2_message.c's create path and
+    // aie2_ctx.c's submit path both return -ENODEV), and which one you see depends only on whether this process already
+    // had a context when the array died -- a backend that was loaded fails at submit, a fresh one at create.
+    return reason.find("code 102") != std::string::npos || reason.find("code 104") != std::string::npos;
 }
 
 inline const char* npu_contexts_refused_hint() {

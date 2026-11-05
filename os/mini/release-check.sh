@@ -40,6 +40,22 @@ skip() {
     case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
+# A check that DIES must not take the evidence - or the NPU - with it. Measured on the c27 board (5 Nov 2026 21:52Z):
+# bash killed this script at `PPID=$!` (a readonly builtin), so five rows of a later run were refused with
+# `code 102: No such device` and the appliance's own u4-release-check row reded as "no RESULT line; rc=1" with nothing
+# to act on. The turn that was mid-flight when the script died kept a hwctx in the driver; the next backend's
+# `Init hwctx` was refused (ret -19, 21:55:37Z) and 20 s later the watchdog TDR'd and power-cycled the device
+# (21:55:52Z). So: the footer announces itself (a death before it says so in the log, so the RESULT line is never
+# silently missing), and a death ends the NPU turn (unload -> lemond stops the backend -> the context is released).
+RC_FOOTER=
+rc_on_exit() {
+    [ -n "$RC_FOOTER" ] && return 0        # a normal run already printed its RESULT and owns the device state
+    say "RESULT: FAIL (this check died before its footer: $ROWS row(s) ran, $FAILS failed - read the line above)"
+    [ -n "${NPU:-}" ] && [ -n "${API:-}" ] || return 0
+    got --header='Content-Type: application/json' --post-data='{}' "$API/api/v1/unload" >/dev/null 2>&1
+    return 0
+}
+trap rc_on_exit EXIT
 # A row that holds the NPU can hold it for a minute or two (a fresh backend per ladder rung, a 512-token turn),
 # and on the owner's console that is indistinguishable from a hung check - which is what the board operator
 # reported. So each NPU row announces itself before it starts. Not a row: the prefix is `info` so a harness that
@@ -1241,10 +1257,14 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     PLONG="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Write a long essay about the history of cartography, and about what map-making changed in how people understood the world.\"}],\"max_tokens\":1000,\"temperature\":0,\"stream\":true}"
     PSHORT="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":16,\"temperature\":0}"
     ( auth_post "$PLONG" "$API/api/v1/chat/completions" slow > "$PDIR/long.sse" 2>&1 ) &
-    PPID=$!
+    # NOT `PPID=$!`: PPID is a readonly bash builtin, so this line was a fatal error in the image's own shell (it
+    # printed "PPID: readonly variable" and exited 1, with no RESULT line - measured on the c27 board, and the row
+    # before this one had already passed). busybox ash does not have PPID readonly, which is why a shell that never
+    # ships the check could not catch it.
+    QPLPID=$!
     sleep 1
     PW=$(auth_post_watch "$PSHORT" "$API/api/v1/chat/completions" "$PDIR/short.json")
-    wait "$PPID" 2>/dev/null
+    wait "$QPLPID" 2>/dev/null
     PLONG_BODY=$(cat "$PDIR/long.sse" 2>/dev/null)
     PSHORT_BODY=$(cat "$PDIR/short.json" 2>/dev/null)
     TDRP1=$(tdr_count)
@@ -1371,6 +1391,7 @@ else
 fi
 
 say ""
+RC_FOOTER=1
 if [ "$FAILS" = 0 ]; then
     say "RESULT: PASS ($ROWS checks, no failures)"
     # Name only the rows that actually skipped. On the 2026-11-02 live boot four of these five PASSED on the board and

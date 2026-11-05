@@ -34,6 +34,9 @@ and the files we re-hosted are the old ones. This tool closes that gap (docs/mod
   --pin R...   print the pin entry for each repo at its current main (adding a pin, or re-deriving one).
   --bump R     rewrite repo R's entry in --pins to the current main, for the tracked files only; a
                tracked file that vanished upstream is refused rather than dropped silently.
+  --orgs A,B   with --check: also census our own Hugging Face orgs, and report a repo there that ships a
+               model or a chat template and is not in the table. A pin watches a repo we depend on; nothing
+               watched the repos we publish, which is the audit's own subject.
   --out FILE   where --check writes its report (default pin-report.md).
   --self-test  run against fixtures, no network.
 
@@ -249,6 +252,41 @@ def entry(repo: str, paths: list[str], used_for: list[str], templates: dict[str,
     return {"commit": commit, "pinned": datetime.date.today().isoformat(), "used_for": used_for, "files": files}
 
 
+# What a repo in our own orgs can ship that this table is about: a model artifact, or a chat template. A
+# repo of `.1bp` packs (the 1BP lane's own format) is not pinned here, and a bare adapter is only interesting
+# when it carries a template file.
+SHIPPED = (".gguf", ".q4nx", "chat_template.jinja", "tokenizer_config.json")
+
+
+def shipped(paths: list[str]) -> list[str]:
+    return sorted(p for p in paths if p.endswith(SHIPPED))
+
+
+def census(orgs: list[str], pins: dict) -> tuple[list[dict], list[str]]:
+    """Repos in our own orgs that ship a model or a template and are not in the table.
+
+    `--check` iterates over pins, so a repo that was never pinned is invisible to it: a model published
+    tomorrow would be watched by nobody, and the 2026-11-05 template audit was done by hand for exactly
+    that reason. One listing per org (`full=true` carries the siblings) keeps this two API calls.
+
+    Private repos are left out on purpose: this file is public (docs/model-pins.md), so a private model
+    is recorded in the lane state that owns it, not here."""
+    fresh, notes = [], []
+    for org in orgs:
+        try:
+            listed = api(f"/models?author={org}&limit=1000&full=true")
+        except Exception as e:
+            notes.append(f"{org}: could not be listed ({e}) — published repos were not checked")
+            continue
+        for m in listed:
+            if m.get("private") or m["id"] in pins["pins"]:
+                continue
+            files = shipped([s["rfilename"] for s in m.get("siblings", [])])
+            if files:
+                fresh.append({"repo": m["id"], "files": files[:12], "more": max(0, len(files) - 12)})
+    return fresh, notes
+
+
 def load(path: str) -> dict:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -325,18 +363,21 @@ def check(pins: dict, want_template: bool) -> tuple[list[dict], list[str]]:
     return changes, notes
 
 
-def report(changes: list[dict], notes: list[str], total: int, want_template: bool) -> str:
+def report(changes: list[dict], notes: list[str], total: int, want_template: bool,
+           fresh: list[dict] | None = None) -> str:
     day = datetime.date.today().isoformat()
     checked = total - len(notes)
+    fresh = fresh or []
     # The first line counts what was read. "Every pin is at the revision" must never be printed over a
     # repo that could not be read — a watcher whose "clean" and "could not check" are the same outcome
     # is blind exactly when it matters.
+    tail = f", {len(fresh)} published but not pinned" if fresh else ""
     if notes:
         out = [f"# Model pins: {checked} of {total} checked, {len(notes)} not checked, "
-               f"{len(changes)} moved ({day})", ""]
+               f"{len(changes)} moved{tail} ({day})", ""]
     else:
-        out = [f"# Model pins: {len(changes)} of {total} moved ({day})", ""]
-    if not changes and not notes:
+        out = [f"# Model pins: {len(changes)} of {total} moved{tail} ({day})", ""]
+    if not changes and not notes and not fresh:
         out += ["Every pinned upstream repo is at the revision `models/pins.json` records.", ""]
     elif not changes:
         out += [f"No pin moved among the {checked} repo(s) that could be read; {len(notes)} could not be "
@@ -372,6 +413,17 @@ def report(changes: list[dict], notes: list[str], total: int, want_template: boo
         if c["added"]:
             out += [f"{len(c['added'])} new `.gguf`/`.q4nx` file(s) upstream, not tracked by the pin: "
                     + ", ".join(f"`{p}`" for p in c["added"][:8]) + (" …" if len(c["added"]) > 8 else ""), ""]
+    if fresh:
+        out += ["## Published, not pinned", "",
+                "A repo in our own orgs ships a model or a chat template and is not in this table, so nothing "
+                "checks its bytes or its template from one day to the next. A pin is what makes it checkable: "
+                "`tools/pin_watch.py --pin REPO`, then a `used_for` that says what published it "
+                "(`docs/model-pins.md`).", "",
+                "| repo | ships |", "|---|---|"]
+        for f in fresh:
+            ships = ", ".join(f"`{p}`" for p in f["files"]) + (f" … (+{f['more']})" if f["more"] else "")
+            out.append(f"| `{f['repo']}` | {ships} |")
+        out.append("")
     if notes:
         out += ["## Not checked", ""] + [f"- {n}" for n in notes] + [""]
     if any(not c.get("gone") for c in changes):
@@ -425,6 +477,7 @@ def pr_body(c: dict) -> str:
 
 def self_test() -> int:
     global api, head, tree, remote_template, remote_bytes, commits_since
+    real_api = api
     failures = 0
 
     def expect(what, got, want):
@@ -507,6 +560,40 @@ def self_test() -> int:
     expect("report carries the commit title", "Better UD 3.1 quants" in md, True)
     expect("pr body refuses a routine merge", "not a routine bump" in pr_body(changes[0]).lower(), True)
 
+    # the repos we PUBLISH: `--check` iterates over pins, so a repo that was never pinned is invisible to
+    # it. Census one listing per org and report only what this table is for — a model artifact or a chat
+    # template, not an `.1bp` pack, and never a private repo (this file is public).
+    def fake_api(path):
+        if "author=our-org" in path:
+            return [
+                {"id": "our-org/new-container", "siblings": [{"rfilename": "model.q4nx"},
+                                                             {"rfilename": "chat_template.jinja"},
+                                                             {"rfilename": "README.md"}]},
+                {"id": "our-org/packs-only", "siblings": [{"rfilename": "Qwen3-4B.1bp"}]},
+                {"id": "our-org/private-weights", "private": True, "siblings": [{"rfilename": "w.gguf"}]},
+                {"id": "fake/moved", "siblings": [{"rfilename": "tpl.gguf"}]},
+            ]
+        if "author=unreadable-org" in path:
+            raise RuntimeError("HTTP Error 429: Too Many Requests")
+        return []
+
+    api = fake_api
+    fresh, org_notes = census(["our-org"], pins)
+    expect("a published repo that ships a template is not pinned", [f["repo"] for f in fresh],
+           ["our-org/new-container"])
+    expect("...with the files it ships", fresh[0]["files"], ["chat_template.jinja", "model.q4nx"])
+    expect("an `.1bp`-only repo is not this table's business", "our-org/packs-only" in str(fresh), False)
+    expect("a private repo stays out of a public pins file", "our-org/private-weights" in str(fresh), False)
+    expect("an already-pinned repo is not reported again", "fake/moved" in str(fresh), False)
+    fresh_md = report([], [], 2, False, fresh)
+    expect("the report names it", "Published, not pinned" in fresh_md and "our-org/new-container" in fresh_md, True)
+    expect("...and counts it in the first line",
+           "1 published but not pinned" in fresh_md.splitlines()[0], True)
+    _, unread_org = census(["unreadable-org"], pins)
+    expect("an org that cannot be listed is a note, not a clean day",
+           "could not be listed" in unread_org[0], True)
+    api = real_api
+
     # a repo that did not move is silent, and an unreadable repo is a note, not a change
     # the same commit, but the bytes we hold are not upstream's: a pin taken after a vendor re-push
     stale = {"commit": "new", "pinned": "2026-11-05", "used_for": ["test"],
@@ -546,6 +633,24 @@ def self_test() -> int:
 
         tree = fake_tree
         expect("--bump takes an intact pin", main(["--bump", "fake/moved", "--pins", path]), 0)
+
+        # a container/LoRA repo has no `.gguf`: pinning it must still be possible, or the published
+        # repos that carry a template could never be covered
+        container_tree = [{"path": p, "type": "file", "size": 1, "lfs": {"oid": "d" * 64}}
+                          for p in ("model.q4nx", "chat_template.jinja", "tokenizer_config.json", "README.md")]
+        tree = lambda repo, rev="main": list(container_tree)
+        remote_template = lambda repo, rev, path, cap=0: "e" * 64
+        import contextlib as _ctx
+        import io as _io2
+        pinned = _io2.StringIO()
+        with _ctx.redirect_stdout(pinned):
+            rc_pin = main(["--pin", "fake/container"])
+        made = json.loads(pinned.getvalue())
+        expect("--pin on a container repo succeeds", rc_pin, 0)
+        expect("--pin pins the model and both template files, not just a .gguf",
+               sorted(made["fake/container"]["files"]),
+               ["chat_template.jinja", "model.q4nx", "tokenizer_config.json"])
+        tree, remote_template = fake_tree, fake_template
         expect("--bump moved the commit", load(path)["pins"]["fake/moved"]["commit"], "new")
         expect("--bump took upstream's oid", load(path)["pins"]["fake/moved"]["files"]["tpl.gguf"]["oid"][:4] is not None, True)
 
@@ -585,6 +690,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--pin", nargs="+", metavar="REPO")
     ap.add_argument("--bump", metavar="REPO")
     ap.add_argument("--pins", default=PINS)
+    ap.add_argument("--orgs", metavar="A,B")
     ap.add_argument("--out", default="pin-report.md")
     ap.add_argument("--no-template", action="store_true")
     ap.add_argument("--self-test", action="store_true")
@@ -596,7 +702,8 @@ def main(argv: list[str]) -> int:
         made = {}
         for repo in a.pin:
             now = head(repo)
-            paths = sorted(e["path"] for e in tree(repo, now) if e.get("type") == "file" and e["path"].endswith(".gguf"))
+            paths = sorted(e["path"] for e in tree(repo, now)
+                           if e.get("type") == "file" and e["path"].endswith(SHIPPED))
             made[repo] = entry(repo, paths, [f"pin: {repo}"], commit=now,
                                templates={p: remote_template(repo, now, p) for p in paths})
         print(json.dumps(made, indent=1, sort_keys=True))
@@ -630,7 +737,11 @@ def main(argv: list[str]) -> int:
         return 0
 
     changes, notes = check(doc, want_template=not a.no_template)
-    md = report(changes, notes, len(doc["pins"]), not a.no_template)
+    fresh = []
+    if a.orgs:
+        fresh, org_notes = census([o.strip() for o in a.orgs.split(",") if o.strip()], doc)
+        notes += org_notes
+    md = report(changes, notes, len(doc["pins"]), not a.no_template, fresh)
     with open(a.out, "w", encoding="utf-8") as f:
         f.write(md)
     if a.pr_body:
@@ -645,7 +756,7 @@ def main(argv: list[str]) -> int:
         print(f"pin_watch: no pin could be checked ({len(notes)} unreadable) — this is not a clean run",
               file=sys.stderr)
         return 2
-    return 1 if changes else 0
+    return 1 if (changes or fresh) else 0
 
 
 if __name__ == "__main__":

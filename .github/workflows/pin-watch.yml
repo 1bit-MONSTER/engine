@@ -61,9 +61,15 @@ jobs:
           set -uo pipefail
           # exit 1 means "a pin moved", which is the normal case this workflow exists for
           rc=0
-          python3 tools/pin_watch.py --check --out pin-report.md || rc=$?
+          # --orgs also censuses our own orgs: a model published tomorrow is pinned by nobody until it is
+          python3 tools/pin_watch.py --check --orgs 1bit-MONSTER,bong-water-water-bong --out pin-report.md || rc=$?
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then exit "$rc"; fi
           echo "moved=$(grep -c '^## `' pin-report.md || true)" >> "$GITHUB_OUTPUT"
+          # a pin nobody could read, or a published repo nobody pinned, is not a clean day: annotate the
+          # run with the report's own first line instead of leaving it to whoever opens the summary
+          if head -1 pin-report.md | grep -Eq 'not checked|not pinned'; then
+            echo "::warning::$(head -1 pin-report.md)"
+          fi
           cat pin-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Open one pin bump per changed repo

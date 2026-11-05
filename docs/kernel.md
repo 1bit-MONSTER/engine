@@ -20,8 +20,11 @@ The Strix Halo box runs a kernel we build, not the distribution's: everything th
 need is pinned by hand, so the next kernel is a step list, not an investigation. This page is that
 list, with the facts that go stale marked as facts and the commands that do not.
 
-- **Runs today:** `7.3.0-rc4-1bit-perfopt` — Linux `v7.3-rc4` plus two backports of the IOMMU
-  PerfOpt series, built with clang (`LLVM=1`), debug info off.
+- **Runs today:** `7.4.0-rc1-1bit` — Linux `v7.4-rc1`, booted since 2026-11-04 05:45
+  (`/boot/vmlinuz-7.4.0-rc1-1bit`), and PerfOpt is present in it, measured: this box's boot prints
+  `amdgpu 0000:c5:00.0: AMD-Vi: PerfOpt armed on IOMMU0`. The 7.3 A/B below stays as the measurement
+  that motivated the backports. **The compiler is not what this page says** — see the "config of record"
+  bullet below.
 - **Why the backports:** with the GPU in its identity domain, PerfOpt is worth real prefill on HRX and
   costs nothing at decode. Qwen3.8-27B UD-Q4_K_XL on HRX0, same build pin, five repeats:
 
@@ -84,11 +87,21 @@ nice -n 19 make LLVM=1 -j12 bindeb-pkg
 
 - The **config of record** is the one the box's running kernel was built from
   (`/boot/config-$(uname -r)`): `CONFIG_AMD_IOMMU=y`, `CONFIG_DRM_AMDGPU=m`,
-  `CONFIG_MODULE_SIG{,_ALL,_SHA256}=y`, `CONFIG_CC_IS_CLANG=y`, `CONFIG_DEBUG_INFO_NONE=y`. Between
-  the base `7.3.0-rc4-1bit` config and `-perfopt` the only differences are the clang version and
-  debug info (28 lines, nothing workload-specific).
-- `bindeb-pkg` needs `debhelper`, `libelf-dev` and the LLVM tools (`llvm-21`, `lld-21`); the kernel
-  is clang-built, so a gcc-only host silently builds the wrong compiler unless `LLVM=1` is exported.
+  `CONFIG_MODULE_SIG{,_ALL,_SHA256}=y`, `CONFIG_DEBUG_INFO_NONE=y`. **It is not
+  `CONFIG_CC_IS_CLANG=y`.** Read off the running kernel on 2026-11-05, that file says
+  `CONFIG_CC_IS_GCC=y` with `CONFIG_GCC_VERSION=150200` and `CONFIG_CLANG_VERSION=0`; so does
+  `/proc/config.gz`; and so does the kernel's own version line,
+  `Linux version 7.4.0-rc1-1bit (bcloud@strixhalo) (gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0, …)`. The
+  `7.3.0-rc4-1bit-perfopt+` image it replaced reports the same three ways. So the `LLVM=1` recipe below
+  is **not** what built the kernels this box has booted — which is precisely the failure the next bullet
+  warns about. Whether the recipe or the images should change is a kernel-lane decision, not a docs edit,
+  so this bullet records the measurement and stops there. Between the base `7.3.0-rc4-1bit` config and
+  `-perfopt` the only differences were the compiler version and debug info (28 lines, nothing
+  workload-specific).
+- `bindeb-pkg` needs `debhelper`, `libelf-dev` and the LLVM tools (`llvm-21`, `lld-21`); this recipe
+  builds the kernel with clang, so a gcc-only host silently builds the wrong compiler unless `LLVM=1` is
+  exported — and the images this box has booted show that failure rather than the recipe (see the
+  config-of-record bullet above).
   On a host with the versioned tools only, put `/usr/lib/llvm-21/bin` on `PATH` (that is where the
   unversioned `llvm-objcopy` the modules step calls lives).
 - Artefacts land in the **parent** directory: `linux-image-<version>_<arch>.deb` and

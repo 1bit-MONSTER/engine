@@ -18,18 +18,21 @@ limitations under the License.
 # The amdxdna patches this fleet's builds run (not upstream)
 
 `third_party/xdna-driver` pins upstream `amd/xdna-driver` at **`526c6081974e`** ("accel/amdxdna: honour a user-requested
-partition start column"). That pin is **pre-fix** for two defects that both take the NPU down on this hardware, and
-neither fix is upstream, so **a module built from the pin alone has neither**:
+partition start column"). That pin is **pre-fix** for three defects that take the NPU down on this hardware, and none of
+the fixes is upstream, so **a module built from the pin alone has none of them**:
 
 | # | patch | fixes | where it is measured |
 |---|---|---|---|
 | 0001 | `accel/amdxdna: fix the bo_invalid_list use-after-free at close` (4 files, +48/−4) | a client that closes while a BO sits on `client->bo_invalid_list` frees the client and leaves the BO linked into it → `kernel BUG at lib/list_debug.c:32` in `amdxdna_hmm_invalidate` | the 2026-11-04 01:48 panic on strixhalo; shipped since ~03:0x; **#971** carries the image-side half of shipping it |
 | 0002 | `accel/amdxdna: recover the array after a TDR` (5 files, +91/−19) | a TDR restart gated on a condition a fully-wedged context never satisfies, so `aie2_hwctx_restart()` fails `-22` and every later request hangs until a reboot | provocation run 2026-11-04 10:48–10:50 on the loaded build: the recovery branch executes, the NPU is power-cycled, the array answers again **with no reboot**; **#1005** |
+| 0003 | `accel/amdxdna: a closing context must not condemn the recovered array` (`aie2_tdr.c`, +23/−2) | 0002's recovery walks every hwctx after the power-cycle; one of them can belong to a client that is already closing (no host buffer address left), whose restart is refused `-ENODEV`. That single context set `hw_dead`, so every later open on the box was refused `-ENODEV` until a module reload — although the power-cycle had succeeded | strixhalo 2026-11-04 21:50:23, a real TDR: power-cycle recovered the array, `aie2_hwctx_restart: hwctx.544293.15 has no host buffer address` → `NPU array is unusable until the driver is reloaded` → 10 refusals from other processes in the next 21 s (evidence: `~/amd-oss/hrx-study/evidence/fabric/npu-longctx/incident-20261104-215023/`) |
 
-They are a **series**: 0002 applies after 0001, both against `526c6081`. Applying them to a clean checkout of the pin
-reproduces, byte for byte, the sources the module currently loaded on the box was built from (checked by `cmp` over
-every `drivers/accel/amdxdna/*.c` and `*.h`), and rebuilding that tree reproduces the loaded module's fingerprint — see
-*Expected fingerprints* below.
+They are a **series**: 0002 applies after 0001 and 0003 after 0002, all against `526c6081`. Applying 0001+0002 to a clean
+checkout of the pin reproduces, byte for byte, the sources the module loaded on the box before 21:52 was built from
+(checked by `cmp` over every `drivers/accel/amdxdna/*.c` and `*.h`), and rebuilding that tree reproduces that module's
+fingerprint — see *Expected fingerprints* below. 0003 is **not installed or loaded anywhere yet**: it builds clean against
+this kernel (`make -C drivers/accel/amdxdna modules ARCH=x86_64` → rc 0, srcversion `1D629835819171EEEC2F0C8`) and waits
+for the owner's word to load, like 0002 did.
 
 ## Building, signing, installing, loading
 
@@ -42,6 +45,7 @@ git clone https://github.com/amd/xdna-driver && cd xdna-driver
 git checkout 526c6081974e                                  # the engine's pin
 git apply <engine>/third_party/patches/amdxdna/0001-*.patch # order matters
 git apply <engine>/third_party/patches/amdxdna/0002-*.patch
+git apply <engine>/third_party/patches/amdxdna/0003-*.patch # the 21:50:23 escalation fix
 
 make -C drivers/accel/amdxdna modules ARCH=x86_64 KERNEL_VER=$(uname -r) \
      MODULE_VER_STR='2.21.0_20261104,526c6081974ea4f0f7dd22329186c5d6adb8fad5'
@@ -87,6 +91,7 @@ Both values below were produced on strixhalo against the `7.4.0-rc1-1bit` header
 |---|---|
 | pin + 0001 | `EBC78CDA6FD7F3F6E824064` |
 | pin + 0001 + 0002 (what the box and the c22/c23 images run) | `56AB94758C18FEEC838D18C` |
+| pin + 0001 + 0002 + **0003** (built 2026-11-04 21:5x, **not loaded**) | `1D629835819171EEEC2F0C8` |
 
 Reproducing the second one is a measured result, not an inference: on 2026-11-04 the pin + the two patch files + the
 version string above built to `56AB94758C18FEEC838D18C`, which is exactly `cat /sys/module/amdxdna/srcversion` on the

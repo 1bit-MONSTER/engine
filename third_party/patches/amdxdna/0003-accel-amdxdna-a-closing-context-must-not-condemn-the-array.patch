@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pi-hrx-fabric <fabric@1bit.local>
+Date: Wed, 4 Nov 2026 21:53:07 -0400
+Subject: [PATCH] accel/amdxdna: a closing context must not condemn the
+ recovered array
+
+aie2_tdr_recover_all() power-cycles the NPU after a TDR and then walks every
+hwctx to restart it. One of them can be the context of a client that is
+already closing: its heap no longer has a host buffer address (the client's
+VMAs are gone), so aie2_hwctx_restart() refuses it with -ENODEV before it ever
+talks to the firmware. The walk counted that as a recovery failure, which sets
+hw_dead, and every later create_context/submit on the box is then refused
+-ENODEV until the module is reloaded - although the power-cycle itself
+succeeded and the array was healthy again.
+
+Measured on strixhalo 2026-11-04 21:50:23 (kernel 7.4.0-rc1-1bit, module
+56AB94758C18FEEC838D18C), real TDR under an NPU serve:
+
+  aie2_tdr_recover_all: Array stopped dispatching, power-cycling NPU to recover
+  aie2_hw_reset: NPU firmware unhealthy: power-cycling NPU
+  aie2_hwctx_restart: hwctx.544293.15 has no host buffer address, cannot restart it
+  aie2_tdr_resume_hwctx: hwctx.544293.15 restart failed, ret -19
+  aie2_tdr_recover_all: NPU array is unusable until the driver is reloaded:
+      TDR recovery failed (0, a context could not be restarted)
+
+followed by ten aie2_create_context refusals from other processes in the next
+21 s. The same firmware capture (Context ID 15, DPU PC 0xffffffff, Context PC
+0x28b060ad, sub command ID 0) is what the c21/c22/c24 appliance runs produce, so
+this escalation is the difference between "one request died" and "the NPU is
+gone for every lane until a reload".
+
+A context that is being torn down is not a recovery failure: skip its restart
+(aie2_hwctx_restart() has already unpaused its jobs, so a waiter fails rather
+than hangs) and keep the recovered array usable.
+
+Signed-off-by: bong-water-water-bong <bong-water-water-bong@users.noreply.github.com>
+---
+ drivers/accel/amdxdna/aie2_tdr.c | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_tdr.c b/drivers/accel/amdxdna/aie2_tdr.c
+index 4cc3d461..7fb950e6 100644
+--- a/drivers/accel/amdxdna/aie2_tdr.c
++++ b/drivers/accel/amdxdna/aie2_tdr.c
+@@ -122,11 +122,32 @@ struct aie2_tdr_resume_arg {
+ static int aie2_tdr_resume_hwctx(struct amdxdna_hwctx *hwctx, void *arg)
+ {
+ 	struct aie2_tdr_resume_arg *rarg = arg;
++	struct amdxdna_dev *xdna = rarg->xdna;
+ 	int ret;
+ 
+-	ret = aie2_hwctx_restart(rarg->xdna, hwctx);
++	ret = aie2_hwctx_restart(xdna, hwctx);
+ 	if (ret) {
+-		XDNA_ERR(rarg->xdna, "%s restart failed, ret %d", hwctx->name, ret);
++		/*
++		 * A context whose client is already tearing down has no host buffer
++		 * address left to map (the client's VMAs are gone), so it cannot be
++		 * restarted - and does not need to be: the process it belongs to is
++		 * gone, and aie2_hwctx_restart() unpaused its jobs before returning,
++		 * so anything still waiting on it fails instead of hanging.
++		 *
++		 * Counting this as a recovery failure is what turned one dying
++		 * context into "the NPU array is unusable until the driver is
++		 * reloaded" for every other client on the box: measured 2026-11-04
++		 * 21:50:23 on strixhalo, a TDR recovery whose power-cycle SUCCEEDED
++		 * (ret 0) was reported as failed because of this one context, and ten
++		 * later opens from other processes were refused -ENODEV.
++		 */
++		if (amdxdna_obj_dma_addr(hwctx->priv->heap) == AMDXDNA_INVALID_ADDR) {
++			XDNA_WARN(xdna,
++				  "%s has no host buffer address (client closing): not restarting it, the recovered array stays usable",
++				  hwctx->name);
++			return 0;
++		}
++		XDNA_ERR(xdna, "%s restart failed, ret %d", hwctx->name, ret);
+ 		rarg->failed = true;
+ 	}
+ 
+-- 
+2.53.0
+

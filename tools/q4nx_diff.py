@@ -112,6 +112,48 @@ def decode_flm(t, rows, cols, signed=True):
 
 DECODERS = {"ours": decode_ours, "flm": decode_flm}
 
+# A converter may pad a weight to a WIDER tile grid than the model's own dimensions (the FastFlowLM
+# repack pads intermediate_size up to its 512-column grid: IM 8960 becomes 9216).  The container then
+# holds more 5120-B tiles than the model's geometry implies, and a decoder that reshapes on the model's
+# grid cannot read it at all -- which is why every padded MLP tensor used to come back "cannot reshape".
+# npu/forward derives the grid the same way (engine#1097/#1107, `q4nx_packed_grid()`); this is that rule
+# for the checker.  It is deliberately the same logic in two places: the tool has to be able to check a
+# container without the engine, and tests/q4nx_diff_grid_test.py pins the same geometries and the same
+# tie refusal as npu/forward's ctest `npu_padded_grid`, so the two cannot drift apart silently.
+Q4NX_MAX_EXCESS = 64      # tiles: the fastest converter pads one axis by one step (IM 8960 -> +1 tile)
+
+
+def packed_grid(nbytes, rows, cols):
+    """(rows_packed, cols_packed) for a container padded wider than the model, or None.
+
+    Only the 5120-B q4_1 tile is considered: the decoders here unpack that layout and nothing else, so a
+    Q4K/Q8 chunk is "not this tool's container" rather than a padded grid (npu/forward's rule tries all
+    three chunk kinds because the forward decodes all three)."""
+    if rows % ROWS or cols % COLS or nbytes % TILE:
+        return None
+    ntr, ntc = rows // ROWS, cols // COLS
+    np_ = nbytes // TILE
+    best = None          # (excess, rows_p, cols_p)
+    ties = 0
+    d = 1
+    while d * d <= np_:
+        if np_ % d == 0:
+            for rpt, cpt in ((d, np_ // d), (np_ // d, d)):
+                if rpt < ntr or cpt < ntc:
+                    continue
+                excess = (rpt - ntr) + (cpt - ntc)
+                rp, cp = rpt * ROWS, cpt * COLS
+                if best is None or excess < best[0]:
+                    best, ties = (excess, rp, cp), 0
+                elif excess == best[0] and (rp, cp) != (best[1], best[2]):
+                    ties += 1
+        d += 1
+    if best is None or ties:
+        return None      # no grid fits, or the answer would be a guess
+    if best[0] > Q4NX_MAX_EXCESS or (best[1], best[2]) == (rows, cols):
+        return None      # not a padding this tool will trust, or nothing was padded
+    return best[1], best[2]
+
 
 def compare_cmd(args):
     ha, basea, ma = load(args.a)
@@ -219,33 +261,7 @@ def _decode_pass(args, layout, quiet=False):
     if not want:
         print("no tensors matched", file=sys.stderr)
         return 0, 0, 0.0
-    exact = inexact = skipped = 0
-    worst = (0.0, "")
-    # our converter's names, so a GGUF tensor can be looked up in the container
-    lay = {"attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj",
-           "attn_output": "self_attn.o_proj", "attn_q_norm": "self_attn.q_norm",
-           "attn_k_norm": "self_attn.k_norm", "ffn_gate": "mlp.gate_proj",
-           "ffn_up": "mlp.up_proj", "ffn_down": "mlp.down_proj", "attn_norm": "input_layernorm",
-           "ffn_norm": "post_attention_layernorm", "token_embd": "model.embed_tokens",
-           "output_norm": "model.norm", "output": "lm_head"}
-
-    def q4nx_name(n):
-        head, _, field = n.rpartition(".")
-        if head.startswith("blk."):
-            idx = head.split(".")[1]
-            return "model.layers.%s.%s.weight" % (idx, lay[head.split(".", 2)[2]])
-        return lay[head] + "." + field
-
-    hdr, base, mm = load(os.path.join(args.q4nx, "model.q4nx"))
-    dec = DECODERS[layout]
-    r = gguf.GGUFReader(args.gguf)
-    want = [t for t in r.tensors if t.name.endswith(".weight") or t.name in ("output.weight",)]
-    if args.tensor:
-        want = [t for t in want if args.tensor in t.name]
-    if not want:
-        print("no tensors matched", file=sys.stderr)
-        return 2
-    exact = inexact = skipped = 0
+    exact = inexact = skipped = padded_n = 0
     worst = (0.0, "")
     # our converter's names, so a GGUF tensor can be looked up in the container
     lay = {"attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj",
@@ -276,13 +292,20 @@ def _decode_pass(args, layout, quiet=False):
             skipped += 1
             continue
         raw = tensor_bytes(hdr, base, mm, name)
+        grid = packed_grid(int(raw.size), rows, cols)
+        rows_p, cols_p = grid if grid else (rows, cols)
         try:
-            got = dec(raw, rows, cols).astype(np.float64)
+            got = dec(raw, rows_p, cols_p).astype(np.float64)
         except ValueError as e:
             if not quiet:
                 print("skip %-46s %s" % (name, e))
             skipped += 1
             continue
+        padded = 0
+        if grid:                      # the container's tiles are wider; only the model's slice is the weight
+            got = got[:rows, :cols]
+            padded = 1
+            padded_n += 1
         ref = dequantize(t.data, t.tensor_type).astype(np.float64).reshape(rows, cols)
         err = np.abs(got - ref)
         ok = not err.any()
@@ -290,13 +313,14 @@ def _decode_pass(args, layout, quiet=False):
         inexact += (not ok)
         if err.max() > worst[0]:
             worst = (float(err.max()), t.name)
-        if not quiet and (args.verbose or not ok):
-            print("%s %-46s %-5s max|err| %.3e  rms %.3e"
+        if not quiet and (args.verbose or not ok or padded):
+            print("%s %-46s %-5s max|err| %.3e  rms %.3e%s"
                   % ("ok  " if ok else "BAD ", t.name, t.tensor_type.name, err.max(),
-                     float(np.sqrt((err ** 2).mean()))))
+                     float(np.sqrt((err ** 2).mean())),
+                     "  [padded %dx%d read as %dx%d]" % (rows, cols, rows_p, cols_p) if padded else ""))
     if not quiet:
-        print("layout=%s: exact=%d inexact=%d skipped=%d   worst max|err| %.3e (%s)"
-              % (layout, exact, inexact, skipped, worst[0], worst[1] or "-"))
+        print("layout=%s: exact=%d inexact=%d skipped=%d padded=%d   worst max|err| %.3e (%s)"
+              % (layout, exact, inexact, skipped, padded_n, worst[0], worst[1] or "-"))
     return exact, inexact, worst[0]
 
 

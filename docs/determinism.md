@@ -211,6 +211,37 @@ Consequence for a correctness gate: a batched cell cannot be gated on one number
 are a mixture over that ladder, the displaced rungs are 1-2 nats away on `cpu`, and a single run can be
 any rung — so the cell has to report the dispersion over its own rounds, or pin the schedule.
 
+**Cross-engine, both batched** — the question the tables above do not answer, and the one a scoreboard's
+"we win the batched column" claim rests on. Two routes at `--parallel 4`, each decoding 4 byte-identical
+copies *at the same time*, 8 prompts × 64 tokens × 3 rounds, shipped c24 payload, scored over the prompts
+where both routes choose the same greedy stream at width 1 **and** at width 4 (4 of the 8):
+
+| measured on | median \|Δlogp\| | against the width-1 delta |
+|---|---:|---:|
+| `cpu` vs `hrx`, width 1 | 3.670e-02 | — |
+| `cpu` vs `hrx`, both at width 4 | **3.685e-02** | **1.00×** |
+| a route vs its own batched answer | 1.054e-02 | 0.29× |
+
+So batching does **not** add noise on top of the between-engine difference: the cross-route delta is the
+same figure at width 1 and at width 4, and batching moves a single route by only ~0.3× of it. Two caveats
+decide whether a given cross-route number means anything at all:
+
+1. **Only positions where both routes chose the same token are comparable.** Four of those eight prompts
+differed at width 1 (token match 0.267-0.923), and there a per-position delta compares *different* tokens —
+it measures the divergence, not the arithmetic. The size of that effect is measurable in the same run: at
+width 1 the cross-route delta is **3.670e-02** over the four agreeing prompts and **1.468e-01** over the four
+mismatching ones, so a figure quoted over all eight (**8.960e-02**, 2.4× the comparable subset) is mostly a
+statement about how often the two routes pick the same token. `tools/logprob_agree.py` already restricts deltas
+to common positions; `tools/batched_repeat.py --vs-solo` reports `same_token` beside every delta for the same
+reason.
+2. **The batched value is a dispersion, not a number**: the cell's own run is not repeatable (6/12 identical
+copies at width 4 on `cpu`), so what reproduces is the distribution over rounds.
+
+Consequence: a cross-engine comparison *does* survive concurrency — it is the same ~0.037 nats it was at
+width 1 — so a batched cell can carry a log-prob column. It cannot carry a bitwise one, and the column is
+only defined over agreed tokens. (Scratch probe, not shipped: `cross_concurrent.py` imports this repo's
+comparators and `logprob_agree.py`'s prompts, so it measures what this page documents.)
+
 ### What the `hrx` width gate is, by name
 
 `GGML_HRX_LOG_DISPATCH=1` prints each dispatch registration the first time it matches

@@ -246,6 +246,26 @@ struct Options {
     bool tool_grammar = false;  // the grammar above came from tools[], not from the client
 };
 
+// A top-level integer field: absent (or null) is the default; anything that is not a number is a 400 naming
+// the field.  These two exist because `body.value(key, def)` on a wrong type throws nlohmann::json::type_error,
+// which is not the route's refusal type: read outside the handler's guard it escaped and answered **500 with an
+// empty body** (measured on engine#1106: `{"max_tokens": "8"}` -> 500, `{"stream": "yes"}` -> 500), i.e. a
+// client fault that looks like a server fault.  Inside the guard it is an ordinary 400.
+inline int int_field(const nlohmann::json& body, const char* key, int def) {
+    if (!body.contains(key) || body.at(key).is_null()) return def;
+    const auto& v = body.at(key);
+    if (v.is_number_float()) return int(v.get<double>());  // a fractional cap is truncated, as body.value did
+    if (!v.is_number_integer()) throw std::runtime_error(std::string(key) + ": must be an integer");
+    return v.get<int>();
+}
+
+inline bool bool_field(const nlohmann::json& body, const char* key, bool def = false) {
+    if (!body.contains(key) || body.at(key).is_null()) return def;
+    const auto& v = body.at(key);
+    if (!v.is_boolean()) throw std::runtime_error(std::string(key) + ": must be true or false");
+    return v.get<bool>();
+}
+
 // Read the decode options out of a request body.  A body that names none of them gets
 // the greedy defaults, so the parser stays backward compatible.  Every refusal throws
 // std::runtime_error("<field>: <what is wrong>"), which the caller turns into a 400 --

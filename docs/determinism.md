@@ -254,10 +254,12 @@ The NPU route is **bitwise repeatable**: 8 prompts × 24 tokens × 2 repeats (19
 It stays bitwise repeatable at the other routes' budget too: 8 prompts × **64** tokens × 2 repeats
 (512 tokens), `max |Δlogp| = 0`, 0 non-float32 values, text stable.
 
-The extra cost is time, not correctness. The per-op forward path measures ~0.5 s/token here, so the same
-8 × 64 × 2 matrix took **586 s of device time in one NPU claim** (against 34 s for `cpu` + `hrx` under one
-GPU claim). Five repeats — what the `cpu` and `hrx` columns use — would be ~25 min of the array, so the NPU
-column is 2 repeats at every budget.
+The extra cost is time, not correctness, and it depends on the thinking setting rather than on the route. The
+per-op forward path costs **~36 s per 64-token reply with thinking on** (the same 8 × 64 × 2 matrix took 586 s of
+device time in one NPU claim) against **~11.6 s per reply with thinking off** (8 prompts × 64 tokens × **5** repeats
+= 2 560 generated tokens in **464 s** of one claim). So the thinking-off 64-token row takes the *same* 5 repeats as
+the `cpu` and `hrx` columns; the thinking-on rows stay at 2 repeats, which is a cost limit of that setting and not of
+the device.
 
 It **can** join the agreement comparison — the earlier version of this page said it could not — with two
 adjustments, both of which are flags on the tool rather than changes to the engine:
@@ -332,7 +334,7 @@ rather than a merge sha. Qwen3-0.6B Q4_K_M, 8 prompts × 64 tokens, greedy, `--t
 |---|---|---|---|---|---|
 | `cpu` | 5 | **bitwise-identical** | 0 | 128 | yes |
 | `hrx` | 5 | **bitwise-identical** | 0 | 122 | yes |
-| `npu` (forward path) | 2 | **bitwise-identical** | 0 | 131 | yes |
+| `npu` (forward path) | 5 | **bitwise-identical** | 0 | 131 | yes |
 
 | pair | token match | top-1 | exact-bit match | max \|Δlogp\| | mean \|Δlogp\| | common tokens | prompts diverging |
 |---|---|---|---|---|---|---|---|
@@ -438,8 +440,9 @@ python3 tools/batched_repeat.py --url http://127.0.0.1:18110 --width 4 --rounds 
 With the NPU in the comparison, the same command with `--thinking off --match-by text`, on a build carrying
 #864: the forward path reports no token ids, so tokens are matched by text, and thinking off is what the
 last three-route row was taken with (`--thinking on` also works there and is what the earlier rows used).
-The NPU tries 2 repeats at the same 64-token budget — ~2.5 min in one claim with thinking off, ~10 min with
-thinking on, which is what its ~0.5 s/token allows. If the GPU and NPU claims cannot be held at once, run the pairs separately and
+The NPU takes 5 repeats at the 64-token budget with thinking off (464 s in one claim, the row below) — the same
+count as the other two routes — and 2 at the thinking-on rows, where a reply costs ~36 s. If the GPU and NPU claims
+cannot be held at once, run the pairs separately and
 compare the two reports with the tool's own comparator:
 
 ```sh
@@ -493,8 +496,9 @@ how each arm above was run.
   32 tokens for the state tables and 64 for the batched-versus-solo ones, 0.6B and 4B: they establish
   that a batched cell is not repeatable and that the outcome set is small and per-engine, not how the
   dispersion scales with model size or prompt length.
-- The NPU agreement rows are 2 repeats (the other routes' 5 would be ~25 min of the array) and, over a
-  *requantised* pack, they are not an arithmetic-only distance. The 64-token row removes the earlier
+- The NPU agreement rows are 5 repeats with thinking off at 64 tokens (the other routes' count) and 2 at the
+  thinking-on rows, where a reply costs ~36 s against ~11.6 s. Over a *requantised* pack they are not an
+  arithmetic-only distance either. The 64-token row removes the earlier
   budget difference, so all three columns can be read at one token count.
 - The NPU rows depend on the build. A binary at `44d849d` or later masks the think tokens, so a *thinking*
   reply reports no entries on it at all: the thinking-on rows come from a `main@1b3def2` build, which still

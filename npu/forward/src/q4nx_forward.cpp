@@ -178,44 +178,6 @@ static bool valid_sidecar_dir(const std::string& d) {
 // and a 3-D [ntr, ntc, N] tensor both work.  (src/q4nx_dequant.c; the Q4_K/Q8
 // layouts are in docs/qwen35-4b-weight-format.md.)
 
-// How many tiles a padded grid may add over the model's own before we call it something else: a
-// converter pads to its own grid step (FastFlowLM: 512 columns, so IM 8960 grows by one 256-column
-// tile, and gate/up grow by one tile-row per 512 rows of IM - 8 tile-rows for IM 8960).  Anything
-// larger is not a padding, and a wrong guess would decode garbage silently, so it is refused.
-#define Q4NX_PACKED_MAX_EXCESS 64
-
-// The (rows, cols) tile grid a container actually stores, when it is larger than the model's.
-// data_size pins it exactly: it is (rows_p/32)*(cols_p/256)*chunk_bytes for one of the three chunk
-// kinds, so the grid is recoverable without knowing the kind first (engine#1097).
-static int packed_grid(size_t nbytes, int rows, int cols, int* cb_out, int* rp_out, int* cp_out) {
-    static const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
-    const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
-    int best = -1, best_cb = 0, best_rp = 0, best_cp = 0;
-    for (int k = 0; k < 3; k++) {
-        if (nbytes % (size_t)kinds[k]) continue;
-        const size_t np = nbytes / (size_t)kinds[k];       // tiles in the container
-        for (size_t d = 1; d * d <= np; d++) {
-            if (np % d) continue;
-            const size_t cand[2][2] = {{d, np / d}, {np / d, d}};
-            for (int q = 0; q < 2; q++) {
-                const size_t rpt = cand[q][0], cpt = cand[q][1];
-                if (rpt < (size_t)ntr || cpt < (size_t)ntc) continue;
-                const size_t excess = (rpt - (size_t)ntr) + (cpt - (size_t)ntc);
-                if (best >= 0 && excess >= (size_t)best) continue;
-                best = (int)excess;
-                best_cb = kinds[k];
-                best_rp = (int)(rpt * Q4NX_TILE_ROWS);
-                best_cp = (int)(cpt * Q4NX_TILE_COLS);
-            }
-        }
-    }
-    if (best < 0 || best > Q4NX_PACKED_MAX_EXCESS || (best_rp == rows && best_cp == cols)) return 0;
-    *cb_out = best_cb;
-    *rp_out = best_rp;
-    *cp_out = best_cp;
-    return 1;
-}
-
 static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
@@ -228,7 +190,7 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
     // Read it on the container's grid and write only the model's [rows, cols], so buffers, row
     // strides and the kernel's B layout stay exactly what they were for an unpadded container.
     int pcb = 0, prp = 0, pcp = 0;
-    if (packed_grid(nbytes, rows, cols, &pcb, &prp, &pcp))
+    if (q4nx_packed_grid(nbytes, rows, cols, &pcb, &prp, &pcp))
         return q4nx_dequant_tensor_packed((const uint8_t*)data, nbytes, rows, cols, prp, pcp, pcb, out);
     return q4nx_dequant_tensor((const uint8_t*)data, nbytes, rows, cols, out);
 }

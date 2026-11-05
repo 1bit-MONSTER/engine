@@ -123,6 +123,45 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
     return 0;
 }
 
+int q4nx_packed_grid(size_t nbytes, int rows, int cols, int* cb_out, int* rp_out, int* cp_out) {
+    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
+    if (rows <= 0 || cols <= 0 || rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return 0;
+    const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
+    size_t best = 0;
+    int best_cb = 0, best_rp = 0, best_cp = 0, ties = 0;
+    for (int k = 0; k < 3; k++) {
+        if (nbytes % (size_t)kinds[k]) continue;
+        const size_t np = nbytes / (size_t)kinds[k];       /* tiles in the container */
+        for (size_t d = 1; d * d <= np; d++) {
+            if (np % d) continue;
+            const size_t cand[2][2] = {{d, np / d}, {np / d, d}};
+            for (int q = 0; q < 2; q++) {
+                const size_t rpt = cand[q][0], cpt = cand[q][1];
+                if (rpt < (size_t)ntr || cpt < (size_t)ntc) continue;
+                const size_t excess = (rpt - (size_t)ntr) + (cpt - (size_t)ntc);
+                if (best && excess > best) continue;
+                if (best && excess == best &&
+                    (best_rp != (int)(rpt * Q4NX_TILE_ROWS) || best_cp != (int)(cpt * Q4NX_TILE_COLS))) {
+                    ties++;                                     /* a different grid, same least excess */
+                    continue;
+                }
+                if (best && excess == best) continue;           /* the same grid seen twice */
+                best = excess;
+                best_cb = kinds[k];
+                best_rp = (int)(rpt * Q4NX_TILE_ROWS);
+                best_cp = (int)(cpt * Q4NX_TILE_COLS);
+                ties = 0;
+            }
+        }
+    }
+    if (!best || ties || best > Q4NX_PACKED_MAX_EXCESS) return 0;
+    if (best_rp == rows && best_cp == cols) return 0;           /* no padding: the plain decoder */
+    *cb_out = best_cb;
+    *rp_out = best_rp;
+    *cp_out = best_cp;
+    return 1;
+}
+
 int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int cols,
                                int rows_packed, int cols_packed, int chunk_bytes, float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;

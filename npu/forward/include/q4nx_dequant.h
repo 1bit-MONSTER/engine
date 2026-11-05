@@ -84,6 +84,22 @@ void q4nx_dequant_tile_q8(const uint8_t* chunk, float* out, int ld);
 int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                                 int cols, int chunk_bytes, float* out);
 
+/* The (rows, cols) tile grid a container actually stores, when it is LARGER than the model's.
+ *
+ * data_size pins it exactly -- it is (rows_p/32)*(cols_p/256)*chunk_bytes for one of the three chunk
+ * kinds -- so the grid is recoverable without knowing the kind first (engine#1097: the FastFlowLM
+ * repack pads intermediate_size to its 512-column grid, IM 8960 -> 9216, so a ZR1 MLP weight holds
+ * 1728 tiles where the model's dims imply 1680).
+ *
+ * Returns 1 and the grid when exactly one candidate fits, 0 otherwise. A container that needs no
+ * padding is 0 (the caller keeps the plain decoder), and so is anything unsuitable: no chunk kind
+ * dividing data_size, a grid smaller than the model's, more than Q4NX_PACKED_MAX_EXCESS extra tiles,
+ * or **two different grids with the same least excess**. That last one is not a guess worth making:
+ * (ntr, ntc+1) and (ntr+1, ntc) with equal excess are a transposed decode waiting to happen, so an
+ * ambiguous tile count is refused rather than resolved by loop order. */
+#define Q4NX_PACKED_MAX_EXCESS 64
+int q4nx_packed_grid(size_t nbytes, int rows, int cols, int* cb_out, int* rp_out, int* cp_out);
+
 /* Dequantize a [rows, cols] tensor out of a container whose tile grid is LARGER: (rows_packed,
  * cols_packed).  A converter may pad a weight to a wider grid than the model's dimensions
  * (engine#1097: the FastFlowLM repack pads intermediate_size to 512 columns, 8960 -> 9216, so the

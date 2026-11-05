@@ -109,6 +109,26 @@ int main() {
                                      Q4NX_CHUNK_Q8, out.data()) == -1,
           "a geometry off the tile grid is refused");
 
+    // q4nx_packed_grid(): the container's grid, recovered from data_size, and every case it refuses.
+    int cb = 0, rp_g = 0, cp_g = 0;
+    const size_t zr1_im_tiles = (size_t)(1536 / 32) * (size_t)(8960 / 256);   // 1680: the model's own grid
+    check(q4nx_packed_grid(1728 * Q4NX_TILE_BYTES, 1536, 8960, &cb, &rp_g, &cp_g) == 1 &&
+          cb == Q4NX_TILE_BYTES && rp_g == 1536 && cp_g == 9216,
+          "down_proj 1536x8960 in a 1728-tile container is read as 1536x9216 (columns padded)");
+    check(q4nx_packed_grid(1728 * Q4NX_TILE_BYTES, 8960, 1536, &cb, &rp_g, &cp_g) == 1 &&
+          cb == Q4NX_TILE_BYTES && rp_g == 9216 && cp_g == 1536,
+          "gate_proj 8960x1536 in the same container is read as 9216x1536 (rows padded)");
+    check(q4nx_packed_grid(zr1_im_tiles * Q4NX_TILE_BYTES, 1536, 8960, &cb, &rp_g, &cp_g) == 0,
+          "a container on the model's own grid needs no padding (0, not a grid)");
+    // A tile count that admits both (ntr, ntc+1) and (ntr+1, ntc) with equal excess: a transposed
+    // decode waiting to happen, so it must be refused rather than resolved by loop order.
+    check(q4nx_packed_grid(2 * Q4NX_TILE_BYTES, Q4NX_TILE_ROWS, Q4NX_TILE_COLS, &cb, &rp_g, &cp_g) == 0,
+          "an ambiguous padded grid (two grids, same excess) is refused");
+    check(q4nx_packed_grid(100 * Q4NX_TILE_BYTES, 1536, 8960, &cb, &rp_g, &cp_g) == 0,
+          "a grid smaller than the model's is refused");
+    check(q4nx_packed_grid(7, 1536, 8960, &cb, &rp_g, &cp_g) == 0,
+          "a size no chunk kind divides is refused");
+
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;

@@ -22,13 +22,16 @@ the shape of a component and the tools that already read a BOM start covering it
 is not" becomes a component difference instead of an invisible substitution
 (docs/template-publishing.md, "Proposal: the chat template as a signed part").
 
-usage: tools/template_bom.py [--bom] [--self-test] PATH...
+usage: tools/template_bom.py [--bom | --sums] [--self-test] PATH...
 
   PATH    a .gguf file, or a model directory (Q4NX/NPU container) — the template is read from the GGUF's
           metadata header, or from the directory's tokenizer_config.json `chat_template`, else
           `chat_template.jinja` beside it. Only the header is read; the tensors never are.
   --bom   emit one CycloneDX 1.6 document with a component per PATH; without it, one component per line
           (JSON Lines), so it composes with the other tools.
+  --sums  emit the `SHA256SUMS` lines instead — `<sha256>  <file>#tokenizer.chat_template` for a `.gguf`,
+          `<dir>/<source-file>#chat_template` for a container — the row a published file needs
+          (docs/template-publishing.md). 'none' models print nothing, so the file stays clean.
   --self-test  build two tiny fixtures (a GGUF with a template, a directory with chat_template.jinja) and
           check the components this tool derives from them.
 
@@ -96,6 +99,17 @@ def component(path: str) -> dict:
     }
 
 
+def sums_line(path: str) -> str | None:
+    """The `SHA256SUMS` line for PATH, or None when the model carries no template."""
+    tpl, source = read_template(path)
+    if tpl is None:
+        return None
+    sha = hashlib.sha256(tpl.encode()).hexdigest()
+    if os.path.isdir(path):
+        return f"{sha}  {os.path.join(path, os.path.basename(source)) if source else path}#chat_template"
+    return f"{sha}  {os.path.basename(path)}#tokenizer.chat_template"
+
+
 def self_test() -> int:
     import struct
 
@@ -147,6 +161,9 @@ def self_test() -> int:
         expect("no template: no hashes", "hashes" in c, False)
         expect("no template: source", next(p["value"] for p in c["properties"] if p["name"] == "onebit:template:source-file"),
                "none")
+        expect("gguf: sums key", sums_line(gguf_path).split("  ")[1], "tpl.gguf#tokenizer.chat_template")
+        expect("dir: sums key", sums_line(cont).split("  ")[1].endswith("cont/chat_template.jinja#chat_template"), True)
+        expect("no template: no sums line", sums_line(bare), None)
     return 3 if failures else 0
 
 
@@ -154,10 +171,11 @@ def main(argv: list[str]) -> int:
     if "--self-test" in argv:
         return self_test()
     as_bom = "--bom" in argv
+    as_sums = "--sums" in argv
     paths = [a for a in argv if not a.startswith("-")]
     if not paths:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
-        print("usage: tools/template_bom.py [--bom] [--self-test] PATH...", file=sys.stderr)
+        print("usage: tools/template_bom.py [--bom | --sums] [--self-test] PATH...", file=sys.stderr)
         return 2
     comps, failed = [], False
     for p in paths:
@@ -166,7 +184,15 @@ def main(argv: list[str]) -> int:
         except Exception as e:
             print(f"template_bom: {p}: {e}", file=sys.stderr)
             failed = True
-    if as_bom:
+    if as_sums:
+        for p in paths:
+            try:
+                line = sums_line(p)
+            except Exception:
+                line = None
+            if line:
+                print(line)
+    elif as_bom:
         print(json.dumps({"bomFormat": "CycloneDX", "specVersion": SPEC_VERSION, "version": 1,
                           "components": comps}, indent=1))
     else:

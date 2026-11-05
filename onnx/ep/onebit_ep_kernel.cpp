@@ -104,14 +104,23 @@ void trace_fallback(const char* fmt, ...) {
 struct Q8Prof {
     const bool on = std::getenv("ONEBIT_EP_QDQ_PROF") != nullptr;
     double dev_call_ms = 0, dev_epi_ms = 0, host_ms = 0;
+    // Where dev_call_ms goes, from the device leg's own timers (Q8RawSplit). `other` is what is left:
+    // the device lock, the kernel lookup, and the EP's own frame around the call. Printed rather than
+    // subtracted by a reader, so the line adds up on its face.
+    double dev_wpack_ms = 0, dev_aup_ms = 0, dev_async_ms = 0, dev_launch_ms = 0, dev_rdb_ms = 0;
     long calls_dev = 0, calls_host = 0, rows_dev = 0, rows_host = 0;
     ~Q8Prof() {
         if (!on || (calls_dev == 0 && calls_host == 0)) return;
-        char line[256];
+        const double split = dev_wpack_ms + dev_aup_ms + dev_async_ms + dev_launch_ms + dev_rdb_ms;
+        const double other = dev_call_ms > split ? dev_call_ms - split : 0.0;
+        char line[512];
         std::snprintf(line, sizeof(line),
                       "qdq_prof calls_dev=%ld calls_host=%ld rows_dev=%ld rows_host=%ld"
-                      " dev_call_ms=%.1f dev_epi_ms=%.1f host_ms=%.1f",
-                      calls_dev, calls_host, rows_dev, rows_host, dev_call_ms, dev_epi_ms, host_ms);
+                      " dev_call_ms=%.1f dev_epi_ms=%.1f host_ms=%.1f"
+                      " dev_split_wpack=%.1f dev_split_aupload=%.1f dev_split_async=%.1f"
+                      " dev_split_launch=%.1f dev_split_readback=%.1f dev_split_other=%.1f",
+                      calls_dev, calls_host, rows_dev, rows_host, dev_call_ms, dev_epi_ms, host_ms,
+                      dev_wpack_ms, dev_aup_ms, dev_async_ms, dev_launch_ms, dev_rdb_ms, other);
         // Bare stderr when ONEBIT_EP_TRACE is off: this line is the knob's whole output, and losing the one
         // measurement that answers the question is not worth saving a trace file.
         trace_line(line, /*stderr_too=*/std::getenv("ONEBIT_EP_TRACE") == nullptr);
@@ -215,8 +224,11 @@ void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, 
         std::vector<int32_t> acc((size_t)m * (size_t)n);
         std::string why;
         Q8Prof& p = q8_prof();
+        // Where the call's time goes, but only when the profiler is on: a plain run passes null and the
+        // device leg pays one branch per timed section instead of five clock reads per launch block.
+        onebit::npu::Q8RawSplit split;
         const auto t_dev = p.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (onebit::npu::gemm_q8_raw(a, m, k, n, b, acc.data(), &why)) {
+        if (onebit::npu::gemm_q8_raw(a, m, k, n, b, acc.data(), &why, p.on ? &split : nullptr)) {
             const auto t_epi =
                 p.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             for (int64_t i = 0; i < m; ++i) epilogue_row(acc.data() + i * n, i, y + i * n);
@@ -224,6 +236,11 @@ void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, 
                 const auto t_end = std::chrono::steady_clock::now();
                 p.dev_call_ms += std::chrono::duration<double, std::milli>(t_epi - t_dev).count();
                 p.dev_epi_ms += std::chrono::duration<double, std::milli>(t_end - t_epi).count();
+                p.dev_wpack_ms += split.wpack_ms;
+                p.dev_aup_ms += split.aupload_ms;
+                p.dev_async_ms += split.async_ms;
+                p.dev_launch_ms += split.launch_ms;
+                p.dev_rdb_ms += split.readback_ms;
                 p.calls_dev++;
                 p.rows_dev += m;
             }

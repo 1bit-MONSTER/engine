@@ -49,6 +49,7 @@ import os
 import struct
 import sys
 import time
+import urllib.error
 import urllib.request
 
 API = "https://huggingface.co/api"
@@ -248,6 +249,15 @@ def check(pins: dict, want_template: bool) -> tuple[list[dict], list[str]]:
         try:
             now = head(repo)
             at = {e["path"]: e for e in tree(repo, now) if e.get("type") == "file"}
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # "the upstream is gone" is the answer, not a failed read: a delete, a rename and a
+                # privatisation all look like this, and none of them may pass as a clean day.
+                changes.append({"repo": repo, "old": pin["commit"], "new": None, "pinned": pin["pinned"],
+                                "files": [], "added": [], "commits": [], "gone": True})
+            else:
+                notes.append(f"{repo}: could not be read ({e}) — the pin was not checked")
+            continue
         except Exception as e:
             notes.append(f"{repo}: could not be read ({e}) — the pin was not checked")
             continue
@@ -294,11 +304,28 @@ def check(pins: dict, want_template: bool) -> tuple[list[dict], list[str]]:
 
 def report(changes: list[dict], notes: list[str], total: int, want_template: bool) -> str:
     day = datetime.date.today().isoformat()
-    out = [f"# Model pins: {len(changes)} of {total} moved ({day})", ""]
-    if not changes:
+    checked = total - len(notes)
+    # The first line counts what was read. "Every pin is at the revision" must never be printed over a
+    # repo that could not be read — a watcher whose "clean" and "could not check" are the same outcome
+    # is blind exactly when it matters.
+    if notes:
+        out = [f"# Model pins: {checked} of {total} checked, {len(notes)} not checked, "
+               f"{len(changes)} moved ({day})", ""]
+    else:
+        out = [f"# Model pins: {len(changes)} of {total} moved ({day})", ""]
+    if not changes and not notes:
         out += ["Every pinned upstream repo is at the revision `models/pins.json` records.", ""]
+    elif not changes:
+        out += [f"No pin moved among the {checked} repo(s) that could be read; {len(notes)} could not be "
+                f"checked and are listed under **Not checked** — an unread repo is not a clean one.", ""]
     for c in changes:
         out += [f"## `{c['repo']}`", ""]
+        if c.get("gone"):
+            out += ["**Gone upstream** — the Hub answers `404` for this repository, so every pin on it is "
+                    "unverified: a delete, a rename and a privatisation look exactly like this. Nothing "
+                    "here can be bumped automatically; decide, then edit or drop the pin "
+                    "(`docs/model-pins.md`).", ""]
+            continue
         if c["old"] == c["new"]:
             out += [f"Head is still `{c['new'][:8]}`, but the bytes it serves are not the ones we hold at "
                     f"`models/pins.json`'s `{c['pinned']}` pin.", ""]
@@ -324,7 +351,7 @@ def report(changes: list[dict], notes: list[str], total: int, want_template: boo
                     + ", ".join(f"`{p}`" for p in c["added"][:8]) + (" …" if len(c["added"]) > 8 else ""), ""]
     if notes:
         out += ["## Not checked", ""] + [f"- {n}" for n in notes] + [""]
-    if changes:
+    if any(not c.get("gone") for c in changes):
         out += ["## Adopting a new revision", "",
                 "Never automatic. A new revision is adopted by merging that repo's pin bump, and only after:",
                 "1. the template row above is not `TEMPLATE CHANGED` (or the change has been audited —",
@@ -336,6 +363,10 @@ def report(changes: list[dict], notes: list[str], total: int, want_template: boo
 
 def pr_body(c: dict) -> str:
     """The body of one bump PR: the report's section for that repo, plus what the bump changes."""
+    if c.get("gone"):
+        return "\n".join([f"`{c['repo']}` answers `404` on the Hub, so its pin cannot be bumped: a delete, a",
+                           "rename and a privatisation are indistinguishable from here. Decide whether the pin moves to",
+                           "the new name or is dropped, then edit `models/pins.json` (`docs/model-pins.md`)."])
     if c["old"] == c["new"]:
         out = [f"The bytes we hold from `{c['repo']}` are not what it serves at `{c['new'][:8]}` — our copies "
                f"predate the head. Merging this re-pins the tracked files to the bytes upstream serves now, "
@@ -459,7 +490,7 @@ def self_test() -> int:
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "pins.json")
-        save(path, {"pins": {"fake/moved": dict(stale)}})
+        save(path, {"pins": {"fake/moved": dict(stale), "fake/gone": dict(stale)}})
 
         def fake_tree_missing(repo, rev="main"):
             return [v for k, v in trees["new"].items() if k != "tpl.gguf"]
@@ -472,6 +503,33 @@ def self_test() -> int:
         expect("--bump takes an intact pin", main(["--bump", "fake/moved", "--pins", path]), 0)
         expect("--bump moved the commit", load(path)["pins"]["fake/moved"]["commit"], "new")
         expect("--bump took upstream's oid", load(path)["pins"]["fake/moved"]["files"]["tpl.gguf"]["oid"][:4] is not None, True)
+
+        # a repository the Hub answers 404 for is the answer, not a failed read: a delete, a rename and a
+        # privatisation must not pass as a quiet day
+        def fake_head_404(repo):
+            raise urllib.error.HTTPError("https://huggingface.co/api/models/" + repo, 404, "Not Found", {}, None)
+
+        head, tree = fake_head_404, fake_tree
+        gone_changes, gone_notes = check({"pins": {"fake/gone": dict(stale)}}, want_template=False)
+        expect("a 404 is a finding, not a note", (len(gone_changes), len(gone_notes)), (1, 0))
+        expect("it is carried as gone", gone_changes[0].get("gone"), True)
+        gone_md = report(gone_changes, gone_notes, 1, False)
+        expect("the report says gone upstream", "Gone upstream" in gone_md, True)
+        expect("no all-clear over a 404", "Every pinned upstream repo is at" in gone_md, False)
+        expect("--bump refuses a gone repo", main(["--bump", "fake/gone", "--pins", path]), 1)
+        expect("the gone pin is untouched", load(path)["pins"]["fake/gone"]["commit"], "new")
+
+        # a run that could read nothing is exit 2 (the workflow fails on anything outside 0/1) and its
+        # first line counts what it read
+        def fake_head_flaky(repo):
+            raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+        head = fake_head_flaky
+        report_path = os.path.join(d, "unread.md")
+        expect("nothing checked -> exit 2", main(["--check", "--pins", path, "--out", report_path]), 2)
+        unread_md = open(report_path, encoding="utf-8").read()
+        expect("the count is in the first line", "0 of 2 checked, 2 not checked" in unread_md.splitlines()[0], True)
+        expect("and still no all-clear", "Every pinned upstream repo is at" in unread_md, False)
     return 3 if failures else 0
 
 
@@ -504,7 +562,15 @@ def main(argv: list[str]) -> int:
     doc = load(a.pins)
     if a.bump:
         pin = doc["pins"].get(a.bump) or sys.exit(f"pin_watch: {a.bump} is not pinned")
-        at_new = {e["path"]: e for e in tree(a.bump)}
+        try:
+            now = head(a.bump)
+            at_new = {e["path"]: e for e in tree(a.bump, now)}
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"pin_watch: {a.bump}: gone upstream (404) — a delete, a rename or a privatisation; "
+                      f"decide, then edit or drop the pin", file=sys.stderr)
+                return 1
+            raise
         missing = [p for p in pin["files"] if p not in at_new]
         if missing:
             print(f"pin_watch: {a.bump}: {len(missing)} tracked file(s) are gone upstream: "
@@ -513,7 +579,7 @@ def main(argv: list[str]) -> int:
         tpls = {p: pin["files"][p].get("template_sha256") for p in pin["files"]}
         for p in pin["files"]:
             if pin["files"][p].get("template_sha256") is not None:
-                tpls[p] = remote_template(a.bump, head(a.bump), p)
+                tpls[p] = remote_template(a.bump, now, p)
         doc["pins"][a.bump] = entry(a.bump, sorted(pin["files"]), pin["used_for"], templates=tpls)
         save(a.pins, doc)
         print(f"pin_watch: {a.bump} pinned at {doc['pins'][a.bump]['commit'][:8]}")
@@ -530,6 +596,11 @@ def main(argv: list[str]) -> int:
         print(pr_body(hit))
         return 1
     print(md)
+    if notes and len(notes) == len(doc["pins"]):
+        # nothing was read: a failed run, not a clean one. The workflow fails on any code outside 0/1.
+        print(f"pin_watch: no pin could be checked ({len(notes)} unreadable) — this is not a clean run",
+              file=sys.stderr)
+        return 2
     return 1 if changes else 0
 
 

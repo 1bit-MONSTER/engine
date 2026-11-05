@@ -66,6 +66,18 @@ therefore reconciled on every check: the commit for "did upstream move", and the
 current `main` and writes a Markdown report. It exits non-zero when anything moved, so the run is visible
 even if the PR is not opened.
 
+There are three outcomes, and the exit code keeps them apart:
+
+| exit | meaning | what the workflow does |
+|---|---|---|
+| 0 | every pin was read and is at the revision we record | nothing |
+| 1 | something moved, or a pinned repo is **gone upstream** (`404` — a delete, a rename and a privatisation look the same) | opens one bump PR per moved repo; a gone repo is reported and refused for bumping, a human decides |
+| 2 | **no pin could be read at all** — a Hub outage or rate-limit is not a quiet day | the job fails |
+
+The report's first line counts what was read (`N of M checked, K not checked`), and the all-clear sentence
+only appears when nothing was left unread: a watcher whose "clean" and "could not check" are the same
+outcome is blind exactly when it matters.
+
 For a file that moved it also re-reads the **chat template** of the new revision — a GGUF's
 `tokenizer.chat_template` over an HTTP range request of the metadata header only, never a tensor — and
 reports one of: unchanged, `TEMPLATE CHANGED`, template added, template removed, or not checked
@@ -89,7 +101,7 @@ a decision (re-take it under its new name, or drop the pin), not a diff.
 ## Commands
 
 ```bash
-tools/pin_watch.py --check                  # the daily comparison; writes pin-report.md, exit 1 if moved
+tools/pin_watch.py --check                  # the daily comparison; writes pin-report.md, exit 0/1/2 (above)
 tools/pin_watch.py --check --no-template    # same, without the template range reads
 tools/pin_watch.py --pr-body REPO           # the bump PR body for one moved repo
 tools/pin_watch.py --pin REPO [REPO...]     # print an entry for a repo at its current main (adding a pin)

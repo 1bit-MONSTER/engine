@@ -129,12 +129,12 @@ bits. Qwen3-0.6B Q4_K_M, 32 tokens, greedy, 4 rounds (3 where a width only neede
 | request width | serve `--parallel` | `cpu` round-to-round identical | `cpu` states | `hrx` round-to-round identical | `hrx` states |
 |---:|---:|---|---:|---|---:|
 | 1 | 2 and 8 | **2/2** | **1** | — | — |
-| 2 | 2 | 2/4 | 4 | — | — |
+| 2 | 2 | 2/4 | 4 | **2/6** | 2 of 8 (two states, swapped between rounds) |
 | 4 | 4 | 6/12 | 4 | **2/12** | 4 (all four copies distinct) |
 | 8 | 8 | 11/24 | 8 | **0/24** | 16 (all eight copies distinct) |
 
 Worst \|Δlogp\| seen inside those mixtures: `cpu` 9.81e-01 at width 4 and 9.81e-01 at width 8; `hrx`
-7.43e-02 at width 4 and 2.05e-01 at width 8.
+1.48e-01 at width 2, 7.43e-02 at width 4 and 2.05e-01 at width 8.
 
 **Not a small-model artifact.** The same run on **Qwen3-4B-Q4_K_M**, same binary, same budget:
 
@@ -154,17 +154,21 @@ scored against one solo request on the same serve:
 |---:|---|---:|---:|---:|
 | 1 | `cpu` | **3/3** | 0.000e+00 | **1.000** |
 | 1 | `hrx` | **3/3** | 0.000e+00 | **1.000** |
+| 2 | `hrx` | 0/8 | 1.21e-01 | **1.000** |
 | 4 | `cpu` | 0/16 | 2.52e-01 | **0.438** |
 | 4 | `hrx` | 0/16 | 7.19e-02 | 0.836 |
 | 8 | `cpu` | 0/32 | 2.52e-01 | **0.438** |
 | 8 | `hrx` | 0/32 | 1.89e-02 | **1.000** |
 
 The width-1 control is exact on both routes, so these are the batch and not the harness. Two asymmetries
-matter: **no batched copy equals the solo answer anywhere** (0 of 96 copies), while the *text* survives
+matter: **no batched copy equals the solo answer anywhere** (0 of 104 copies), while the *text* survives
 differently per route — at 64 tokens `cpu` has usually left the solo sequence (median 0.438 of positions
 keep the solo token) and `hrx` usually has not (0.836, and 1.000 at width 8). So "the greedy text gate still
 passes under batching" is an engine-specific accident, and the log-probability dispersion is the part that
-never survives.
+never survives. `hrx` width 2 is the sharpest case because it is exactly bimodal: its 8 copies split 4/4 over
+two states, one of which keeps the solo text at every position (mean \|Δlogp\| 1.91e-02) and one of which
+leaves it on a third of them (1.21e-01) — so a batched run's text result is decided by which state its
+schedule landed on, not by which engine served it.
 
 **Generated length decides how visible it is.** Width 4 on `cpu`, 0.6B, the same prompt decoded to four
 lengths, every concurrent copy scored against the solo answer. **No copy was identical to the solo answer
@@ -197,8 +201,11 @@ rounds each; the ladder is the width of the decode step that ran, which is the s
 round had one copy on the solo state and its partner on a displaced one, i.e. a step that carried one
 row for one sequence and two for the other. On `cpu` the full-batch state is modal (8 of 16 copies at
 width 4, 20 of 32 at width 8), so a batched run usually *does* look like its neighbours; on `hrx` every
-copy in a round is a distinct state (4/4 at width 4, 8/8 at width 8, 0/24 identical round-to-round) — no
-two copies shared a per-step row count across the whole run, so there is no modal rung to land on.
+copy in a round is a distinct state at width 4 and 8 (4/4 and 8/8, 0/24 identical round-to-round) — no two
+copies shared a per-step row count across those runs, so there is no modal rung to land on. Width 2 on
+`hrx` is the exception and shows the ladder directly: the two copies only ever produced **two** states over
+8 copies and swapped them for the first two rounds (2 of 8 distinct, 2/6 identical round-to-round), i.e.
+both per-step row counts occur for the same two requests, in both orders.
 
 Consequence for a correctness gate: a batched cell cannot be gated on one number. Its log-probabilities
 are a mixture over that ladder, the displaced rungs are 1-2 nats away on `cpu`, and a single run can be

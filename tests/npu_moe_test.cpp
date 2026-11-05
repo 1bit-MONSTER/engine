@@ -72,6 +72,11 @@ struct Crafted {
     // router logits we want for a given h, by construction below
     bool break_offset = false, break_gap = false, break_bytes = false, break_experts = false;
     bool no_metadata = false;
+    // engine#1152: the geometry a kernel takes K and N from.  ggml writes [cols, rows, experts], so a
+    // converter that keeps that field order swaps the pair here while the tensor keeps the shape the
+    // tile grid describes - no byte count, offset or coverage check can see it.
+    bool transpose_geometry = false;
+    bool double_rows = false;
 };
 
 fs::path write_dir(const Crafted& m, const std::string& tag) {
@@ -105,11 +110,14 @@ fs::path write_dir(const Crafted& m, const std::string& tag) {
             // the tile-row count a stack declares: experts x rows/32, cast before the multiply
             const int64_t tile_rows = int64_t(m.experts) * int64_t(m.rows / 32);
             add(name, {tile_rows, m.cols / 256, 5120}, "I8", stack_bytes);
+            // The TENSOR stays on the true geometry; only the metadata can be wrong (engine#1152).
+            const int meta_rows = m.transpose_geometry ? m.cols : (m.double_rows ? 2 * m.rows : m.rows);
+            const int meta_cols = m.transpose_geometry ? m.rows : m.cols;
             tensors[name] = {{"experts", m.break_experts ? m.experts + 1 : m.experts},
-                             {"rows", m.rows},
-                             {"cols", m.cols},
-                             {"tile_rows", m.rows / 32},
-                             {"tile_cols", m.cols / 256},
+                             {"rows", meta_rows},
+                             {"cols", meta_cols},
+                             {"tile_rows", meta_rows / 32},
+                             {"tile_cols", meta_cols / 256},
                              {"tiles", m.tiles},
                              {"bytes", m.break_bytes ? chunk + 1 : chunk},
                              {"offsets", offs}};
@@ -320,6 +328,32 @@ int main(int argc, char** argv) {
                   std::string::npos,
               "a directory with no MoE metadata is refused");
         for (const fs::path& d : {d1, d2, d3, d4, d5}) {
+            std::remove((d / "model.q4nx").c_str());
+            std::remove((d / "config.json").c_str());
+            fs::remove_all(d);
+        }
+    }
+    // 4. engine#1152: the GEOMETRY a kernel takes K and N from.  Offsets, byte counts and coverage
+    // cannot see a transposed rows/cols pair - a converter that keeps ggml's [cols, rows, experts]
+    // field order swaps them and changes no byte - and on a real model the tile count does not see
+    // it either: qwen3-coder's gate/up are 768x2048 and down is 2048x768, both 192 tiles (24x8 vs
+    // 64x3).  Only the tensor's own shape tells them apart, so the metadata is checked against it.
+    {
+        Crafted tr;
+        tr.transpose_geometry = true;
+        const fs::path d1 = write_dir(tr, "_transposed");
+        const std::string tr_why = thrown([&] { const Moe m{Model(d1.string())}; });
+        check(tr_why.find("transposed") != std::string::npos,
+              "rows/cols transposed in the metadata is refused and says so: " + tr_why);
+
+        Crafted rows2;
+        rows2.double_rows = true;
+        const fs::path d2 = write_dir(rows2, "_rows2x");
+        const std::string rows_why = thrown([&] { const Moe m{Model(d2.string())}; });
+        check(rows_why.find("tiles") != std::string::npos,
+              "a tile count that disagrees with rows x cols is refused: " + rows_why);
+
+        for (const fs::path& d : {d1, d2}) {
             std::remove((d / "model.q4nx").c_str());
             std::remove((d / "config.json").c_str());
             fs::remove_all(d);

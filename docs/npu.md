@@ -444,6 +444,10 @@ Qwen3-30B-A3B) without any gather.
 `tiles`, `bytes` and the **byte offset of every expert** (`offsets`, `[experts]` entries,
 relative to the data section like every `data_offsets`). Those offsets are the list a
 per-dispatch chunk-address kernel takes (docs/npu.md, the DMA path in the engine's NPU lane).
+`rows`/`cols` are not taken on trust: the loader checks them against the tensor's own shape, because
+a transposed pair (keeping ggml's `[cols, rows]` field order) changes no byte count, no offset and —
+when `(rows/32)*(cols/256)` happens to agree, as it does for 768x2048 against 2048x768, both 192
+tiles — no tile count either, and would hand a kernel K and N swapped (engine#1152).
 
 Measured on `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` (qwen3moe, 48 layers, 128 experts,
 top-8, expert_ffn 768, no shared expert): 579 tensors, 144 expert stacks x 128 expert

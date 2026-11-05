@@ -17,7 +17,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include "pack.h"  // bf16_to_f32
+#include "pack.h"   // bf16_to_f32
+#include "q4nx.h"   // q4nx::kRows/kCols: the chunk grid the geometry is expressed on
 
 #include <algorithm>
 #include <cmath>
@@ -66,10 +67,41 @@ Moe::Moe(const Model& model) : model_(model) {
             throw std::runtime_error(name + ": metadata disagrees with __metadata__.moe.experts");
         if (s.bytes != uint64_t(s.tiles) * kTileBytes)
             throw std::runtime_error(name + ": bytes is not a whole number of chunks");
+        // The GEOMETRY those three fields describe, checked against the tensor's own shape -- this is
+        // where a kernel's K and N come from.  A transposed rows/cols pair is the plausible converter
+        // mistake (ggml stores [cols, rows, experts], so keeping that field order swaps them) and it
+        // changes no byte count, no offset and no coverage; on a real model the tile count does not
+        // see it either, because gate/up 768x2048 and down 2048x768 are both 192 tiles (24x8 vs 64x3).
+        // Only the shape can tell them apart, and a swapped contraction must never reach a kernel
+        // (engine#1152).
+        if (s.rows <= 0 || s.cols <= 0 || s.rows % q4nx::kRows != 0 || s.cols % q4nx::kCols != 0)
+            throw std::runtime_error(name + ": metadata geometry " + std::to_string(s.rows) + "x" +
+                                     std::to_string(s.cols) + " is not on the " +
+                                     std::to_string(q4nx::kRows) + "x" +
+                                     std::to_string(q4nx::kCols) + " chunk grid");
+        const int want_tiles = (s.rows / q4nx::kRows) * (s.cols / q4nx::kCols);
+        if (s.tiles != want_tiles)
+            throw std::runtime_error(name + ": metadata tiles " + std::to_string(s.tiles) +
+                                     " is not (rows/" + std::to_string(q4nx::kRows) + ")*(cols/" +
+                                     std::to_string(q4nx::kCols) + ") = " + std::to_string(want_tiles) +
+                                     " for the geometry it declares");
         if (int(s.offsets.size()) != s.experts)
             throw std::runtime_error(name + ": offsets does not list one entry per expert");
         const Tensor* tensor = model.find(name);
         if (!tensor) throw std::runtime_error(name + ": listed in __metadata__.moe but absent");
+        const std::vector<int64_t> want_shape{int64_t(s.experts) * (s.rows / q4nx::kRows),
+                                              s.cols / q4nx::kCols, int64_t(kTileBytes)};
+        if (tensor->shape != want_shape)
+            throw std::runtime_error(
+                name + ": metadata geometry " + std::to_string(s.rows) + "x" +
+                std::to_string(s.cols) + " does not describe this tensor (it would be a [" +
+                std::to_string(want_shape[0]) + ", " + std::to_string(want_shape[1]) + ", " +
+                std::to_string(want_shape[2]) + "] stack, the tensor is [" +
+                std::to_string(tensor->shape.size() > 0 ? tensor->shape[0] : 0) + ", " +
+                std::to_string(tensor->shape.size() > 1 ? tensor->shape[1] : 0) + ", " +
+                std::to_string(tensor->shape.size() > 2 ? tensor->shape[2] : 0) +
+                "]): rows/cols look transposed, and a swapped pair hands the kernel K and N exchanged "
+                "(engine#1152)");
         // The offsets are measured from the data section, like every data_offsets in the
         // container, so expert 0's offset is the tensor's own start and the rest are relative
         // to it. Checking coverage here means a wrong list cannot reach a kernel.

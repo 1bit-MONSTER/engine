@@ -1457,6 +1457,67 @@ inside a column, where an int16 with an 11-bit mantissa allows about 16x. Forcin
 relative L1 residual, so the mode-1 or Q4_K forms are the ones to run; the script keeps the measurement next to
 the images it writes.
 
+### The draft loop, and whether to serve it
+
+`npu/mtp/` holds the loop as library code so a serve can drive it, and `tools/mtp_acceptance` is how it is measured:
+
+| file | what it is |
+|---|---|
+| `npu/mtp/draft.h` | the policy: draft `k`, verify as **one** `M = k+1` batch, commit the longest prefix the base agrees with, redraft |
+| `npu/mtp/mtp_head.{h,cpp}` | the drafter: one head step per proposed token, chained on its own hidden |
+| `npu/mtp/forward_base.h` | `BaseModel` over the real `Q4nxNpuForward`, with the deferred GDN commit |
+| `tools/mtp_acceptance` | the measurements: `--offline`, `--live`, `--live --match`, `--batchcheck` |
+
+`tools/mtp_acceptance --offline` scores the drafter alone on the base's own greedy stream, `--live` runs the loop,
+`--live --match` scores both **at the loop's own chain positions** (so the two per-depth tables are one measurement
+sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
+
+**The one thing that must be right**: the drafter attends over its own states, so its cache has to be the base
+model's *committed stream, row by row*. Feeding it only the current chain is silent — drafts get worse, the text
+stays correct — and it cost this project 69 % → 14 % first-draft acceptance until the cursor was made a checked
+object (`DraftStream`; engine#820). A run reports `stream N rows` (must be prompt + emitted) and `N mismatch` (must
+be 0) for exactly that reason.
+
+**Measured on 2026-11-05, on the 27B `bonsai2-27b-pb16i` with the pb16i-exact head, `k = 4`, 64 tokens,
+`tau = 0`:**
+
+* live acceptance equals the offline protocol **at every depth** over 8 prompts × 64 tokens: depth 1 **+0.00**,
+  depth 2 **+0.55**, depth 3 **+0.09**, depth 4 **+1.08** pp (75.14 / 63.24 / 73.26 / 84.13 %), with greedy text
+  byte-identical to plain decode on all 8 prompts and 0 stream mismatches.
+* the chain is **prompt-dependent**: 1.80 to 4.33 tokens per pass, mean **3.14** over the same 8 prompts.
+
+**Do not enable the draft route on a serve as it stands.** The loop pays a verify batch *and* a step per
+iteration, so it is faster only above a break-even chain, and that break-even is **3.2-4.1 tokens/pass** by two
+independent measurements: dividing the measured wall clock by the measured pass count (3.87), and the split of the
+8 prompts — faster on exactly the three above 4.12 (0.73-0.77×), slower on all five below 3.20 (1.08-1.74×, median
+1.14×). This head's mean chain is 3.14, so the expectation over prompts is a loss. `1bit forward-serve` has no
+draft route at all today (`app/forward_serve.cpp` runs one `step()` per token); `1bit serve --mtp` is the HRX/llama
+path with the GGUF's own head, a different thing.
+
+Two settings are worth knowing regardless, both measured in one window:
+
+* **`OMP_WAIT_POLICY=passive` is free and worth 1.2-2.4× on every batched pass** (verify batch 495 ms against
+  721-1187 ms; the `[bl]` core term 10.2 ms against 162-307 ms).
+* **`tau` redistributes cost, it does not move it.** `tau = 0.6` (the head's published setting) stops the chain
+  after the first draft and trades base passes for lm-head calls almost exactly one-for-one: 0.598-0.623 s/token
+  across arms that differ 2× in chain and 4× in head calls. It also leaves depths 3-4 with *no* offers, so any
+  per-depth measurement is at `tau = 0`.
+
+**Refuted, so nobody builds it again**: folding the per-iteration step into the next verify batch (one pass per
+iteration instead of two) collapses the chain from **2.82 to 1.07** tokens/pass and depth-1 acceptance from **82 %
+to 6.9 %** — the head needs the hidden of the token it drafts past, which a one-pass loop cannot produce. Lagging
+the hidden without lagging the cursor is worse: it accepts **0 of 92** while the mismatch counter stays at 0, i.e.
+a silently broken loop rather than a slow one.
+
+**What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
+lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
+6 measured 0 %).
+
+Reading these numbers has two traps that produced wrong figures here twice: plain decode is **host-bound**, so a
+loaded window inflates it and flatters the draft route — two arms of one ticket are comparable, two tickets are
+not; and "acceptance length" (`accepted/iterations`) is not "tokens per pass" (`1 + Σ hit[d]`). The tool prints
+both, named.
+
 ## FFN row sparsity: a stream question, answered before a kernel is written
 
 The FFN is the largest part of a dense model's per-token stream, so "skip most of the FFN" is a

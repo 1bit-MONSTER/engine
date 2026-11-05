@@ -71,6 +71,35 @@ start() {
         echo "10lemonade: no /data partition: Lemonade state is in RAM, nothing persists"
     fi
     mkdir -p "$LEM/cache" "$LEM/config"
+    # Cycle 25, owner: "log verbose it all for proof". lemond's verbosity is a config.json key, NOT a flag and NOT an
+    # env var (measured on the pinned build: `lemond --help` has only -v/--version, and the accepted strings come from
+    # AixLog::to_severity in runtime_config.cpp: trace|debug|info|warning|error|fatal|none, default info).
+    # debug, not trace: measured on this box, `log_level: debug` prints "Debug logging enabled - subprocess output will
+    # be visible" - that is the line that puts the ENGINE's own `1bit serve:` output into lemond.log, and so into
+    # /data/logs. trace is per-token chatter and would spend the whole 50 MB/hour evidence budget on itself.
+    # The rotation caps live in the same object: one laptop demo must not fill the data partition.
+    # A level somebody set is never overwritten - it is theirs, and the console's menu is where they set it.
+    CONFJSON=$LEM/config/config.json
+    if [ ! -f "$CONFJSON" ]; then
+        printf '%s\n' '{"log_level": "debug", "log_max_file_size_mb": 8, "log_max_files": 3}' > "$CONFJSON" \
+            && echo "10lemonade: seeded $CONFJSON (log_level=debug, 8 MB x 3 rotation)"
+    elif ! grep -q '"log_level"' "$CONFJSON" 2> /dev/null; then
+        if command -v python3 > /dev/null 2>&1; then
+            python3 - "$CONFJSON" <<'PY' && echo "10lemonade: added log_level=debug to $CONFJSON"
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.setdefault("log_level", "debug")
+d.setdefault("log_max_file_size_mb", 8)
+d.setdefault("log_max_files", 3)
+json.dump(d, open(p, "w"), indent=2)
+PY
+        else
+            echo "10lemonade: $CONFJSON has no log_level and python3 is missing - the demo runs at lemond's default" >&2
+        fi
+    else
+        echo "10lemonade: honouring the log_level already in $CONFJSON"
+    fi
     # lemond's positionals are cache_dir config_dir (lemond --help); the rest are the runtime overrides.
     # Blank mode is LAN-reachable on purpose: the appliance is a server, Lemonade's own web UI and Lemonade Mobile
     # are the two clients the owner demos, and neither asks for a key on stock Lemonade. The console's CONNECT block

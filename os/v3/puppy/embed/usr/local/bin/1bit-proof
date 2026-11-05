@@ -1,0 +1,231 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-proof - this boot's evidence, as one readable file and as one attachable archive.
+#
+# Cycle 25, owner: "make sure the live usb log verbose it all for proof that it works." 1bit-logs keeps the running
+# logs; this is the other half: the machine's identity as a short set of `label  value` lines (so a person and a gate
+# read the same thing), and a bundle of the whole boot directory that can be attached to a release as evidence.
+#
+#   boot-proof.txt  once per boot, in this boot's log directory: what machine and entry this was, what Secure Boot
+#                   said, which drivers and firmware were loaded (with the fingerprints that name their source), the
+#                   memory the demo had, how long the boot took, and whether the release's own SHA256SUMS verified.
+#
+# Usage:
+#   1bit-proof boot [--force]   write boot-proof.txt into this boot's directory (nothing is written twice)
+#   1bit-proof                  bundle this boot's directory + SHA256SUMS into /data/proof-<tag>-<date>.tar.zst
+#   1bit-proof path             print this boot's log directory, or nothing when it is not persisting
+#
+# Exit: 0 ok, 1 nothing to prove (no /data mount, or an empty boot directory), 2 usage.
+#
+# A value that cannot be read is written as `n/a <reason>` and never omitted: a missing line and a zero look the same
+# to a reviewer, and "we could not read the fan" is a different claim from "the fan reads 0 rpm".
+set -u
+DATA=${ONEBIT_LOG_DATA:-/data}
+ROOT=$DATA/logs
+LOGS=${ONEBIT_LOGS_BIN:-/usr/local/bin/1bit-logs}
+say() { printf '%s\n' "$*"; }
+
+bootdir() {
+    # 1bit-logs owns the directory (and the rule that /data must be a real mount, not a directory on the RAM root)
+    [ -x "$LOGS" ] || return 1
+    "$LOGS" dir 2> /dev/null
+}
+
+why_no_dir() {
+    # Two very different causes read the same from the caller, and saying the wrong one sends a person to the mount
+    # table for a missing script. Measured here: with 1bit-logs absent the message claimed /data was unmounted.
+    if [ ! -x "$LOGS" ]; then
+        say "$LOGS is missing"
+    else
+        say "$DATA is not a mounted partition"
+    fi
+}
+
+
+line() {  # line <label> <value...>
+    label=$1
+    shift
+    say "$label  $*"
+}
+
+firmware_section() {
+    dir=/lib/firmware/amdnpu
+    if [ ! -d "$dir" ]; then
+        line firmware "n/a no /lib/firmware/amdnpu"
+    else
+        n=$(ls -1 "$dir" 2> /dev/null | wc -l)
+        bytes=$(du -sk "$dir" 2> /dev/null | awk '{print $1}')
+        line firmware "files=$n kb=${bytes:-n/a}"
+        # The fingerprint of what is actually on the disk, not of what should be. Measured: each amdnpu entry is a
+        # DIRECTORY of .zst blobs (17f0_11 holds four), so a plain sha256sum of the entry fails and would have been
+        # reported as "unreadable" - a firmware section that cannot be read is not evidence.
+        for d in $(ls -1 "$dir" 2> /dev/null | sort | head -8); do
+            if [ -d "$dir/$d" ]; then
+                for f in $(ls -1 "$dir/$d" 2> /dev/null | sort); do
+                    h=$(sha256sum "$dir/$d/$f" 2> /dev/null | cut -d' ' -f1)
+                    line "firmware.amdnpu.$d/$f" "${h:-n/a unreadable}"
+                done
+            else
+                h=$(sha256sum "$dir/$d" 2> /dev/null | cut -d' ' -f1)
+                line "firmware.amdnpu.$d" "${h:-n/a unreadable}"
+            fi
+        done
+    fi
+    fw=$(dmesg 2> /dev/null | grep -iE 'amdgpu.*(firmware|fw)' | head -3 | tr '\n' ';')
+    line firmware.amdgpu "${fw:-n/a no amdgpu firmware line in dmesg}"
+}
+
+release_section() {
+    tag=$(head -1 "$DATA/RELEASE-TAG" 2> /dev/null)
+    line release "${tag:-n/a no $DATA/RELEASE-TAG}"
+    if [ -f "$DATA/SHA256SUMS" ]; then
+        # sha256sum -c prints one line per entry; count them instead of trusting the exit status alone
+        sum=$(cd "$DATA" && sha256sum -c SHA256SUMS 2>&1)
+        ok=$(printf '%s\n' "$sum" | grep -c ': OK$')
+        bad=$(printf '%s\n' "$sum" | grep -vc ': OK$')
+        rc=0
+        (cd "$DATA" && sha256sum -c SHA256SUMS > /dev/null 2>&1) || rc=$?
+        line sha256sums "ok=$ok bad=$bad rc=$rc"
+    else
+        line sha256sums "n/a no $DATA/SHA256SUMS"
+    fi
+    cfg=/data/lemonade/config/config.json
+    [ -f "$cfg" ] || cfg=/var/lib/lemonade/config/config.json
+    lvl=$(sed -n 's/.*"log_level"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' "$cfg" 2> /dev/null | head -1)
+    line lemond.log_level "${lvl:-n/a no log_level in $cfg}"
+}
+
+write_boot_proof() {
+    force=${1:-}
+    d=$(bootdir) || { say "1bit-proof: nothing persists ($(why_no_dir))" >&2; return 1; }
+    out=$d/boot-proof.txt
+    if [ -f "$out" ] && [ "$force" != --force ]; then
+        say "1bit-proof: $out already written this boot (--force rewrites it)"
+        return 0
+    fi
+    {
+        line written "$(date -u +%FT%TZ 2> /dev/null)"
+        line bootid "$(basename "$d")"
+        line hostname "$(hostname 2> /dev/null)"
+        line uptime_s "$(cut -d' ' -f1 /proc/uptime 2> /dev/null)"
+        line uname "$(uname -a 2> /dev/null)"
+        line cmdline "$(cat /proc/cmdline 2> /dev/null)"
+        ring=$(dmesg 2> /dev/null | wc -c)
+        if [ "${ring:-0}" -gt 0 ]; then
+            line kernel.ring "$ring bytes in the ring now"
+        else
+            line kernel.ring "n/a dmesg is empty or restricted to root (kernel.dmesg_restrict)"
+        fi
+        # Secure Boot, read the two ways userspace reads it: the tool and the firmware variable itself
+        line secureboot.mokutil "$(mokutil --sb-state 2>&1 | head -1)"
+        efivar=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2> /dev/null | head -1)
+        if [ -n "$efivar" ]; then
+            byte=$(od -An -tu1 -j4 -N1 "$efivar" 2> /dev/null | tr -d ' ')
+            line secureboot.efivar "byte=$byte (1 = enabled)"
+        else
+            line secureboot.efivar "n/a no SecureBoot efivar (not an EFI boot, or efivarfs is not mounted)"
+        fi
+        line lockdown "$(cat /sys/kernel/security/lockdown 2> /dev/null || echo 'n/a no /sys/kernel/security/lockdown')"
+        # the drivers, with the fingerprint that names the source they were built from (srcversion is what g3-probe
+        # and #1038 use; a module's mere presence says nothing about which tree it came from)
+        for m in amdxdna amdgpu ec_su_axb35; do
+            sv=$(modinfo -F srcversion "$m" 2> /dev/null)
+            vm=$(modinfo -F vermagic "$m" 2> /dev/null | cut -d' ' -f1)
+            loaded=no
+            [ -d "/sys/module/$m" ] && loaded=yes
+            line "module.$m" "loaded=$loaded srcversion=${sv:-n/a} vermagic=${vm:-n/a}"
+        done
+        # Present-but-unreadable (the parameter file is root-only) is a different fact from absent, and "not loaded"
+        # was wrong while the module WAS loaded (measured). Say which one it is.
+        tdrp=/sys/module/amdxdna/parameters/tdr_timeout_ms
+        if [ ! -e "$tdrp" ]; then
+            line amdxdna.tdr_timeout_ms "n/a no such parameter (amdxdna not loaded)"
+        else
+            tdrv=$(cat "$tdrp" 2> /dev/null)
+            line amdxdna.tdr_timeout_ms "${tdrv:-n/a unreadable as $(id -un 2> /dev/null)}"
+        fi
+        line amdgpu.cwsr_enable "$(cat /sys/module/amdgpu/parameters/cwsr_enable 2> /dev/null || echo 'n/a')"
+        firmware_section
+        # devices, as the kernel names them
+        line pci.devices "$(lspci -nn 2> /dev/null | grep -iE 'vga|display|accel|npu' | tr '\n' ';' || echo 'n/a no lspci')"
+        line dev.accel "$(ls -1 /dev/accel* 2> /dev/null | tr '\n' ' ' || true)"
+        line dev.kfd "$([ -c /dev/kfd ] && echo present || echo absent)"
+        # the memory a demo actually had
+        line memtotal_kb "$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2> /dev/null)"
+        line ttm.pages_limit "$(cat /sys/module/ttm/parameters/pages_limit 2> /dev/null || echo 'n/a')"
+        line ttm.page_pool_size "$(cat /sys/module/ttm/parameters/page_pool_size 2> /dev/null || echo 'n/a')"
+        vram_t=$(cat /sys/class/drm/card*/device/mem_info_vram_total 2> /dev/null | head -1)
+        vram_u=$(cat /sys/class/drm/card*/device/mem_info_vram_used 2> /dev/null | head -1)
+        line gpu.vram "used=${vram_u:-n/a} total=${vram_t:-n/a}"
+        # the boot's own timeline: the initrd says what it was doing and when, and dmesg anchors both ends
+        tl=$(dmesg 2> /dev/null | grep -m3 '^\[.*1bit: ' | tr '\n' ';')
+        line timeline.1bit "${tl:-n/a no 1bit: lines in the ring (nothing yet, or dmesg restricted)}"
+        tfirst=$(dmesg 2> /dev/null | head -1 | cut -c1-24)
+        tlast=$(dmesg 2> /dev/null | tail -1 | cut -c1-24)
+        if [ -n "$tfirst" ]; then
+            line timeline.dmesg "first=$tfirst last=$tlast"
+        else
+            line timeline.dmesg "n/a dmesg is empty or restricted to root"
+        fi
+        release_section
+    } > "$out" 2> /dev/null
+    say "$out"
+}
+
+bundle() {
+    d=$(bootdir) || { say "1bit-proof: nothing persists ($(why_no_dir))" >&2; return 1; }
+    n=$(ls -1 "$d" 2> /dev/null | wc -l)
+    if [ "${n:-0}" -lt 2 ]; then
+        say "1bit-proof: $d holds $n file(s) - refusing to bundle an empty proof" >&2
+        return 1
+    fi
+    # the file itself is part of the proof, and so is the release's own checksum list when the stick carries one
+    [ -f "$d/boot-proof.txt" ] || write_boot_proof > /dev/null 2>&1
+    tag=$(head -1 "$DATA/RELEASE-TAG" 2> /dev/null)
+    tag=$(printf '%s' "${tag:-$(hostname 2> /dev/null)}" | tr -c 'A-Za-z0-9._-' '_')
+    stamp=$(date -u +%Y%m%dT%H%M%SZ 2> /dev/null)
+    out=$DATA/proof-$tag-$stamp.tar.zst
+    if command -v zstd > /dev/null 2>&1; then
+        { if [ -f "$DATA/SHA256SUMS" ]; then
+              tar -C "$ROOT" -cf - "$(basename "$d")" -C "$DATA" SHA256SUMS 2> /dev/null
+          else
+              tar -C "$ROOT" -cf - "$(basename "$d")" 2> /dev/null
+          fi
+        } | zstd -q -3 -o "$out" || { say "1bit-proof: bundling failed" >&2; return 1; }
+    else
+        say "1bit-proof: no zstd in the image - bundling as .tar instead" >&2
+        out=${out%.zst}
+        if [ -f "$DATA/SHA256SUMS" ]; then
+            tar -C "$ROOT" -cf "$out" "$(basename "$d")" -C "$DATA" SHA256SUMS || return 1
+        else
+            tar -C "$ROOT" -cf "$out" "$(basename "$d")" || return 1
+        fi
+    fi
+    bytes=$(wc -c < "$out" 2> /dev/null)
+    sum=$(sha256sum "$out" 2> /dev/null | cut -d' ' -f1)
+    say "$out"
+    say "bytes ${bytes:-n/a}"
+    say "sha256 ${sum:-n/a}"
+    return 0
+}
+
+case ${1:-} in
+'')        bundle ;;
+boot)      shift; write_boot_proof "${1:-}" ;;
+path)      bootdir ;;
+*)         say "usage: $0 [boot [--force]|path]"; exit 2 ;;
+esac

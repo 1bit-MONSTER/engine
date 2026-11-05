@@ -31,6 +31,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 static int failures = 0;
 
@@ -95,6 +96,71 @@ static int test_table(const char* tag, int half, double theta, double factor, do
         check(seen == first_interp, buf);
     }
     return 0;
+}
+
+/* The declared scaling type, and whether it is one this forward applies (engine#1087).  A type it does
+ * not implement must be refused by name: served plain it stays fluent and is wrong past the original
+ * window.  The reader is exercised on the config shapes that exist in the wild, including the two
+ * spellings of the key and a config whose "model_type" must not be mistaken for a scaling type. */
+static void test_declared_type(void) {
+    struct {
+        const char* json;
+        const char* type;
+        int llama3_on;
+        int has_short;
+        int supported;
+    } cases[] = {
+        /* no rope_scaling at all: plain rope, and "model_type" is not a scaling type */
+        {"{\"model_type\": \"qwen3\", \"rope_theta\": 1000000.0}", "", 0, 0, 1},
+        /* the pack-imported Llama-3.2 config, verbatim shape */
+        {"{\"rope_theta\": 500000.0, \"rope_scaling\": {\"factor\": 32.0, \"high_freq_factor\": 4.0, "
+         "\"low_freq_factor\": 1.0, \"original_max_position_embeddings\": 8192, \"rope_type\": \"llama3\"}}",
+         "llama3", 1, 0, 1},
+        /* declared llama3 whose numbers are unusable: not the same thing as no block */
+        {"{\"rope_scaling\": {\"factor\": 0.0, \"high_freq_factor\": 4.0, \"low_freq_factor\": 1.0, "
+         "\"original_max_position_embeddings\": 8192, \"rope_type\": \"llama3\"}}",
+         "llama3", 0, 0, 0},
+        /* YaRN, both spellings: refused */
+        {"{\"rope_scaling\": {\"factor\": 4.0, \"original_max_position_embeddings\": 32768, "
+         "\"rope_type\": \"yarn\"}}",
+         "yarn", 0, 0, 0},
+        {"{\"rope_scaling\": {\"type\": \"yarn\", \"factor\": 4.0}}", "yarn", 0, 0, 0},
+        /* dynamic NTK and linear: refused */
+        {"{\"rope_scaling\": {\"type\": \"dynamic\", \"factor\": 2.0}}", "dynamic", 0, 0, 0},
+        {"{\"rope_scaling\": {\"type\": \"linear\", \"factor\": 8.0}}", "linear", 0, 0, 0},
+        /* explicit no-scaling spellings: supported */
+        {"{\"rope_scaling\": null}", "", 0, 0, 1},
+        /* null followed by another block that does carry a "type": still nothing declared */
+        {"{\"rope_scaling\": null, \"other\": {\"type\": \"yarn\"}}", "", 0, 0, 1},
+        {"{\"rope_scaling\": {\"type\": \"none\"}}", "none", 0, 0, 1},
+        {"{\"rope_scaling\": {\"rope_type\": \"default\"}}", "default", 0, 0, 1},
+        /* LongRoPE: only with the short_factor the forward reads */
+        {"{\"rope_scaling\": {\"rope_type\": \"longrope\", \"short_factor\": [1.0, 1.1]}}", "longrope", 0,
+         1, 1},
+        {"{\"rope_scaling\": {\"rope_type\": \"longrope\"}}", "longrope", 0, 0, 0},
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char type[64];
+        q4nx_rope_declared_type(cases[i].json, type, (int)sizeof type);
+        Q4nxRopeLlama3 s;
+        s.on = cases[i].llama3_on;
+        s.factor = 32.0;
+        s.high_freq_factor = 4.0;
+        s.low_freq_factor = 1.0;
+        s.original_max_position = 8192.0;
+        const int got = q4nx_rope_type_supported(type, &s, cases[i].has_short);
+        char buf[192];
+        snprintf(buf, sizeof buf, "declared type \"%s\" reads as \"%s\"", cases[i].type, type);
+        check(!strcmp(type, cases[i].type), buf);
+        snprintf(buf, sizeof buf, "declared \"%s\" supported %d == %d", cases[i].type, got,
+                 cases[i].supported);
+        check(got == cases[i].supported, buf);
+    }
+    /* no config text at all: nothing declared, nothing to refuse */
+    char none[8];
+    q4nx_rope_declared_type((const char*)0, none, (int)sizeof none);
+    check(none[0] == '\0', "null config declares no type");
+    check(q4nx_rope_type_supported(none, (const Q4nxRopeLlama3*)0, 0) == 1, "no type is supported");
 }
 
 int main(void) {
@@ -166,6 +232,8 @@ int main(void) {
         s.original_max_position = 0.0;
         check(q4nx_rope_llama3_inv_freq(1e-5, &s) == 1e-5, "original_max 0 is refused");
     }
+
+    test_declared_type();
 
     if (failures == 0) printf("all llama3 rope checks passed\n");
     return failures == 0 ? 0 : 1;

@@ -56,6 +56,13 @@ DETAIL = re.compile(r"depth (\d+):\s+live\s+-?[\d.]+ %\s+\((\d+)/(\d+), reached\
 # the run-level lines (npu/mtp/mtp_head.h:96 -- "0/0 is not agreement"):
 #     depth 4: n/a (live 0/0 reached, offline 15/20)  not scored
 NOTSCORED = re.compile(r"depth (\d+):\s+n/a \(live (\d+)/(\d+) reached, offline (\d+)/(\d+)\)")
+
+# The summary section, and with it the run-level rows, starts here in every log that has per-prompt rows:
+#     == live vs offline at the SAME positions (the 2 pp bar):
+# Before it, a `depth N: live .. (n/d) offline .. (n/d) delta ..` row is a PER-PROMPT row in the pre-`reached`
+# shape (2026-11-02 and earlier), whose live rate is the MARGINAL one rather than the rate conditional on reaching
+# the depth -- a different quantity from the current column, so such a log cannot be pooled at all.
+SUMMARY = "== live vs offline at the SAME positions"
 RUNLEVEL = re.compile(r"depth (\d+):\s+live\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+"
                       r"offline\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+delta")
 PROMPT = re.compile(r"(?:per-depth p|prompt )(\d+)\b")
@@ -77,9 +84,13 @@ def parse_ticket(path):
     a cell scored twice with different counts, or per-prompt rows that do not add up to the ticket's own
     run-level row (a short read)."""
     cells, runlevel, prompt, not_scored, budget = {}, {}, None, set(), {}
+    old_shape, summary = 0, False
     for ln in open(path, errors="replace").read().splitlines():
         if "== ticket exited" in ln:  # trap 1: everything after this is the harness echoing the summary
             break
+        if SUMMARY in ln:
+            summary = True
+            continue
         m = PROMPT.search(ln)
         if m and "depth " not in ln:
             prompt = int(m.group(1))
@@ -105,7 +116,17 @@ def parse_ticket(path):
             continue
         m = RUNLEVEL.search(ln)
         if m:
+            if not summary:
+                old_shape += 1
             runlevel[int(m.group(1))] = (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
+    # A log whose per-prompt rows are all in the pre-`reached` shape cannot be pooled: its live rate is marginal
+    # and its offline rate unconditional, so calling that "the log was read incompletely" would send the reader to
+    # re-run a ticket that is complete -- 2 of the 16 cell-bearing logs in this lane's corpus are that shape.
+    if runlevel and not cells and old_shape:
+        raise SystemExit(f"mtp_depth_pool: {path}: {old_shape} per-prompt row(s) in the pre-`reached` shape (live "
+                         f"rate marginal, not conditional on reaching the depth) -- this log predates the column, "
+                         f"so its cells are a different quantity; re-run it with a current build rather than "
+                         f"pooling it")
     # The ticket's own run-level row is the pool of its per-prompt rows, so a short read cannot pass as a
     # smaller window: the two have to agree before this log is allowed into the pool at all.
     for d, rl in runlevel.items():

@@ -188,7 +188,23 @@ rc10, _, err10 = run([], [("same64.log", ticket(3)), ("same32.log", ticket(3, to
 check(rc10 == 1 and "two lengths of the same prompt" in err10,
       f"prompt 3 at 64 and at 32 tokens is refused: {err10.strip()[:110]}")
 
-# 10. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
+# 10. a log whose per-prompt rows predate the `reached` column is a DIFFERENT quantity, and says so: its live
+# rate is marginal, not conditional, so "the log was read incompletely" would send a reader to re-run a complete
+# ticket.  (2 of the 16 cell-bearing logs in this lane's own corpus are this shape.)
+OLD_SHAPE = """prompt 0: TEXT IDENTICAL, 64 tokens, accepted 44/80, passes/token 0.625, stream 72 rows, 0 mismatch
+  match p0: 20 offline chains at this loop's own positions (stream 72 rows)
+    depth 1: live  90.00 % (18/20)  offline  90.00 % (18/20)  delta  +0.00 pp
+    depth 2: live  65.00 % (13/20)  offline  65.00 % (13/20)  delta  +0.00 pp
+    == live vs offline at the SAME positions (the 2 pp bar):
+      depth 1: live  90.00 % (18/20)  offline  90.00 % (18/20)  delta  +0.00 pp  PASS
+      depth 2: live  65.00 % (13/20)  offline  65.00 % (13/20)  delta  +0.00 pp  PASS
+"""
+rc11, _, err11 = run([], [("oldshape.log", OLD_SHAPE)])
+check(rc11 == 1, "a pre-`reached` log is refused rather than pooled as if it were the current shape")
+check("pre-`reached` shape" in err11 and "read incompletely" not in err11,
+      f"the refusal names the real cause, not a short read: {err11.strip()[-120:]}")
+
+# 11. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
 r = subprocess.run([sys.executable, TOOL, "--selftest"], capture_output=True, text=True)
 check(r.returncode == 0 and "selftest PASS tail repeat" in r.stdout, "the tool's refusal self-test passes")
 

@@ -453,11 +453,12 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         return finish;
     };
 
+    // AMD's two stages, as milliseconds, and nothing derived from them: the protocol's consumers
+    // (onnx/bench_npu_serve.py) compute their own rates, and a rate of ours would be a second
+    // definition of the same stage -- off by one token, because the first token belongs to TTFT in
+    // that protocol.  Two rates for one stage is exactly how two rows end up disagreeing later.
     auto timings_json = [](const CallStats& st) {
-        return json{{"prompt_ms", st.prompt_ms},
-                    {"predicted_ms", st.predicted_ms},
-                    {"predicted_per_second",
-                     st.predicted_ms > 0.0 ? 1000.0 * double(st.completion_tokens) / st.predicted_ms : 0.0}};
+        return json{{"prompt_ms", st.prompt_ms}, {"predicted_ms", st.predicted_ms}};
     };
 
     // OpenAI's usage object plus the two fields issue #650 reports: how many prompt tokens came
@@ -824,11 +825,14 @@ int run_forward_serve(int argc, char** argv) {
     e.fwd = std::make_unique<Q4nxNpuForward>();
 
     // Who may have the NPU (app/npu_device_lock.h): one process by default, N when the
-    // operator asks with --npu-streams. It is a policy, not a hardware limit -- the
-    // driver's npu4 sets hwctx_limit = 16 -- and the default stays exclusive because a
-    // second stream takes the same DMA engine and its own copy of the weights: two
-    // engines on two models measured 34.1 % / 70.4 % of solo, 0.41x aggregate
-    // (docs/npu.md "Two streams on one NPU").
+    // operator asks with --npu-streams. hwctx_limit = 16 is not what bounds a second
+    // client -- the array partition is: 8 columns, and this build's kernel set asks for
+    // all 8, so a second client is refused (-ENODEV / code 102) once 0003 is in the
+    // driver, and shared the tiles and wedged the array before it (engine#1084). The
+    // default stays exclusive because a kernel set that does leave columns free still
+    // shares one DMA engine and copies the weights per stream: two engines on two models
+    // measured 34.1 % / 70.4 % of solo, 0.41x aggregate (docs/npu.md "Two streams on one
+    // NPU").
     // Held for the life of the process (fd not closed), exactly like the per-process
     // ELF runner (npu_engine_universal), which takes the same exclusive lock.
     if (!std::getenv("NPU_NO_DEVICE_LOCK"))

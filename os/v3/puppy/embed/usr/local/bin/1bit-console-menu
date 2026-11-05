@@ -163,6 +163,29 @@ data_line() {
     d=$(df -h /data 2>/dev/null | awk 'NR == 2 {print $2", "$4" free"}')
     [ -n "$d" ] && echo "$d" || echo "not mounted"
 }
+# Which system is running, and on which disk - init.sh's own rule, so this console cannot disagree with the boot
+# banner (#711: "live usb is loaded up" while the facts came from the NVMe). init touches /etc/1bit/installed on an
+# installed boot and /etc/1bit/live on a stick boot; when neither marker was written it falls back to
+# /data/.installed, which is 1bit-install's own marker on the installed data partition.
+installed_mode() {
+    # init.sh's decision first, exactly as it makes it: /data mounted with .installed on it IS an installed boot, and
+    # the markers below are written FROM that decision. Checking the markers first let a stale `live` marker outrank a
+    # real installed data partition (measured in QEMU: the menu said live on a box whose /data carried .installed).
+    grep -q ' /data ' /proc/mounts 2>/dev/null && [ -e /data/.installed ] && return 0
+    [ -e /etc/1bit/installed ] && return 0
+    [ -e /etc/1bit/live ] && return 1
+    return 1
+}
+# The disk this boot came from. Deliberately the same question 1bit-console-install asks before it refuses a target,
+# so the screen cannot name a different disk from the one the installer would refuse.
+boot_disk() {
+    p=$(awk '$2 == "/data" { print $1; exit }' /proc/mounts 2>/dev/null)
+    [ "$p" ] || p=$(awk '$2 == "/initrd/mnt/dev_save" { print $1; exit }' /proc/mounts 2>/dev/null)
+    [ "$p" ] || p=$(blkid -L 1BIT-DATA 2> /dev/null | head -1)
+    [ "$p" ] || return 0
+    d=$(lsblk -no PKNAME "$p" 2> /dev/null | head -1)
+    [ "$d" ] && echo "/dev/$d" || echo "$p"
+}
 models_line() {
     list=""
     list=$(api_get "$API/v1/models" -s -m 5 2>/dev/null |
@@ -514,12 +537,39 @@ item_install() {
     if [ ! -x /usr/local/bin/1bit-console-install ]; then
         say "no /usr/local/bin/1bit-console-install in this image"; return 1
     fi
+    # INSTALLED: the brief's item 5 asks for this branch - the disk facts, not an install offer. Until now the console
+    # offered the install on an installed box and the guard then refused the boot disk, which reads as a broken
+    # install rather than as "this is already installed". NONINT still answers without a keyboard (vm-check's
+    # `U2 menu actions` row greps `install-guard-checked`), and it now says which branch it answered from.
     if [ "$NONINT" = 1 ]; then
+        if installed_mode; then
+            say "installed: $(boot_disk) (data $(data_line))"
+            say "install-guard-checked"; return 0
+        fi
         /usr/local/bin/1bit-console-install --list 2>&1 | head -6
         say "install-guard-checked"; return 0
     fi
-    yesno "Install 1bit OS to a disk?
+    if installed_mode; then
+        d=$(boot_disk)
+        say_text " 1bit OS - installed " "$(printf '%s\n' \
+            "" \
+            "1bit OS is INSTALLED on ${d:-this machine's disk}." \
+            "  $(lsblk -dpno SIZE,MODEL "${d:-/dev/null}" 2> /dev/null | head -1 | awk '{$1=$1; print}')" \
+            "  data: $(data_line)" \
+            "" \
+            "  The install is permanent and nothing on this screen erases it." \
+            "  Reboot to restart the installed system; remove the stick first." \
+            "" \
+            "  To install onto a DIFFERENT disk as well, answer yes next: ${d:-this disk}" \
+            "  is this system's own disk, and the installer refuses it by name.")"
+        yesno "Install 1bit OS onto a DIFFERENT disk as well?
+
+Every disk you name is wiped. ${d:-This system's own disk} is refused by the installer and cannot be chosen." || return 0
+    else
+        yesno "Install 1bit OS to a disk?
+
 The disk is wiped. The installer refuses this boot's own disk and asks for the whole device name." || return 0
+    fi
     /usr/local/bin/1bit-console-install
 }
 

@@ -281,6 +281,47 @@ def main():
         model.write_bytes(b"GGUF" + b"\0" * 4095)
         assert bench.model_identity(model)["sha256"] != ident["sha256"]
 
+    # The artifact has to say whether the decode it scored *drafted*, because on this pin it drafts with
+    # the model's own MTP head unless told not to, and the cap is worth ~18 % of 18.8k decode (~25 % of
+    # tg128). The lines below are verbatim from the arm that exposed this (2026-11-04 22:39, 27B
+    # UD-Q4_K_XL at 20,480 ctx): `drafting` was `{}` while serve.log reported drafting.
+    with tempfile.TemporaryDirectory() as tmp:
+        log = pathlib.Path(tmp) / "serve.log"
+        log.write_text(
+            "1bit serve: /m/model.gguf carries its own MTP head: drafting with it (--spec-type draft-mtp;"
+            " --no-mtp or ONEBIT_NO_MTP=1 turns it off)\n"
+            "1bit serve: recipe qwen35-mtp-max-3: --spec-draft-n-max 3\n"
+            "0.40.550.563 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (    5 accepted"
+            " /     5 generated), mean len =  3.50\n"
+            "4.04.014.149 I slot print_timing: id  0 | task 532 | draft acceptance = 0.67460 (   85 accepted"
+            " /   126 generated), mean len =  3.02\n",
+            encoding="utf-8")
+        got = bench.drafting_observed(log)
+        assert got["spec_type"] == "draft-mtp", got
+        assert got["recipe"] == "qwen35-mtp-max-3", got
+        assert got["recipe_args"] == "--spec-draft-n-max 3", got
+        assert got["tasks_reporting"] == 2, got
+        assert got["accept_rate_last"] == 0.67460 and got["mean_acc_len_last"] == 3.02, got
+        assert (got["accepted_last"], got["generated_last"]) == (85, 126), got
+        assert got["mean_acc_len_max"] == 3.50, got
+        # A log with no drafting at all reports nothing rather than an empty object that reads as "off".
+        silent = pathlib.Path(tmp) / "silent.log"
+        silent.write_text("I slot print_timing: id 0 | task 1 | eval time\n", encoding="utf-8")
+        assert bench.drafting_observed(silent) is None, bench.drafting_observed(silent)
+        assert bench.drafting_observed(pathlib.Path(tmp) / "missing.log") is None
+    # ...and "no lever was set" must not look like "no drafting": unset keeps serve's own MTP default,
+    # while HL_MTP_MAX=0 is an explicitly non-drafting measurement. Both used to serialise as {}.
+    for k in ("HL_DFLASH", "HL_DFLASH_GGUF", "HL_MTP_HEAD", "HL_MTP_MAX"):
+        os.environ.pop(k, None)
+    ident = bench.drafting_summary(pathlib.Path("/nonexistent/serve.log"))
+    assert ident["requested"] is None and "requested_note" in ident, ident
+    assert ident["serve"] is None, ident
+    os.environ["HL_MTP_MAX"] = "0"
+    ident = bench.drafting_summary(pathlib.Path("/nonexistent/serve.log"))
+    assert ident["requested"] == {"HL_MTP_MAX": "0"}, ident
+    assert "requested_note" not in ident, ident
+    os.environ.pop("HL_MTP_MAX", None)
+
     print("hyperloom_benchmark_test: OK")
     return 0
 

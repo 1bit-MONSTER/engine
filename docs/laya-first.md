@@ -195,6 +195,44 @@ Three properties the condition keeps:
   is **absent from the shipped table** and the gate row asserts the HRX landing only; when it ships, the rule gains a
   warm-up guard (no fallback in the first minute after boot, when the thermal guard itself is still settling).
 
+### The table in the binary: `1bit laya-first`
+
+`config/laya-first.json` ships compiled into the engine (like `config/recipes.json`), and
+`1bit laya-first` validates it and prints the `collection.router` policy it desugars into:
+
+```sh
+1bit laya-first --check                 # 4 classes, default Qwen3-0.6B-1bit
+1bit laya-first --policy laya-first.collection.json
+```
+
+```json
+{"version": "1", "model_name": "user.Laya-First", "recipe": "collection.router",
+ "components": ["Qwen3-0.6B-1bit", "ZAYA1-8B-1bit", ...],
+ "routing": {"candidates": [...], "default_model": "Qwen3-0.6B-1bit",
+   "classifiers": [{"id": "laya", "type": "laya",
+                    "labels": ["short", "prose", "code", "long_doc"]}],
+   "rules": [{"id": "laya-code", "match": {"classifier": "laya", "label": "code", "min_score": 0.0},
+              "route_to": "Qwen3-Coder-30B-A3B-Instruct-1bit"}, ...]}}
+```
+
+Two details are load-bearing rather than cosmetic. **`min_score: 0.01` on every class rule** — low, so
+the band's default floor of 0.5 cannot drop the decisions this table exists to route (Laya's confidence for
+`code` is about 0.44), but **not zero**: the classifier reports only the class Laya chose, so every other
+label scores exactly `0.0`, and a `0.0` floor matches `0.0 >= 0.0` — the *first* class rule then swallows
+every request. Measuring that cost one live run: a `short` prompt routed to the `code` model while every
+self-test stayed green, because a verdict can only see that *a* rule matched, not that it was the right one.
+**Labels on the classifier entry**: declaring the four classes is what makes a typo in a rule's `label` a
+parse error in Lemonade instead of a rule that silently never matches.
+
+The name is `user.Laya-First` because that is the only shape Lemonade will register at run time
+("Registered model definitions must use a non-empty `user.*` name", measured against a live lemond); the
+appliance registers the desugared policy at first boot, so the desugar has to emit a registrable name.
+
+`tests/laya_first.sh` pins the desugaring (19 checks, including byte equality with
+`tests/laya_first_policy.json`), refuses a table with a device typo or a missing class by name, and — when
+a Lemonade checkout is reachable — validates the emitted policy against that repo's
+`route_policy.schema.json`, because the policy is for Lemonade and its schema is the contract.
+
 ## 5. Cold start
 
 Timeline of the first request on a box where nothing is downloaded, with the costs above and those of the model itself:
@@ -260,3 +298,40 @@ condition is the classic untested branch.
    literally named `auto` (no code change, but it collides with any user model of that name)?
 4. **The code class's first pull is 18.6 GB.** Start `code` on ZAYA1-8B (5.6 GB) and treat Qwen3-Coder as an
    escalation, or accept the big pull on the first code request?
+
+### What measuring the implementation added to those four
+
+Each of these was found by running the code against a live server tonight, not by reading it. They narrow the
+answers; none of them decides anything for you.
+
+1. **The small NPU row: provenance matters more than size.** The row has to name a checkpoint the appliance can pull
+   *and* prove. An FLM checkpoint is a third party's artefact on a pinned FLM (v1.0.7 today), so the row would be
+   "our router, their model" — defensible for a small chat class, but it is a different claim from every other row in
+   the table, and the release check would need to say which kind of row it is looking at. A 0.6B-class Q4NX of our own
+   keeps one claim for the whole table and costs a conversion. **Recommendation: our own container**; if an FLM row
+   ships instead, the table needs a `provenance` field so the row and the release check cannot disagree about what
+   "ours" means.
+2. **Catalogue vs table: the table's names must be registrable, and that is now a hard constraint.** Measured: Lemonade
+   refuses to register a definition outside `user.*` — *"Registered model definitions must use a non-empty `user.*`
+   name. Received: 1bit.Laya-First"*. So whatever the row ids become, the **router collection** is registered as
+   `user.<something>` and the desugar emits that; the *components* keep their catalogue ids (they are ordinary pulled
+   models, not definitions). The table already names `1bit-MONSTER` mirrors, so the question is only whether the
+   catalogue rows are re-pointed at them — which the `hf_repo` field already answers independently, without moving ids.
+   **Recommendation: leave ids alone; treat `hf_repo`/`file` as the pull source.**
+3. **`auto`: the two options differ in who owns a name, and one of them is cheap to reverse.** A reserved name needs a
+   hook in `Router` and is invisible to the catalogue; a shipped collection named `auto` needs no code but squats the
+   name for every user. There is a third shape the work made obvious: keep the name `user.Laya-First` (what the desugar
+   already emits and what the release row now reads *from the engine*, not a constant) and let the **appliance** alias
+   `auto` to it — an alias is configuration, reversible, and does not squat anything in the product. **Recommendation:
+   alias at install time**, and raise the reserved-name hook only if a user-facing `auto` is wanted on stock Lemonade
+   too.
+4. **The 18.6 GB first pull: the table already made this a policy question, not a code question.** Nothing in the code
+   forces the big model to be `code`'s *first* choice: the class rule points wherever the table says, and
+   `tests/laya_first.sh` re-derives the policy from the table. So this can ship as ZAYA1-8B for `code` with
+   Qwen3-Coder as a second table entry to promote later, at the cost of one line in `config/laya-first.json` — and no
+   code change to reverse. **Recommendation: start small, promote with evidence.**
+
+**One measurement that changes how the table must be written, whichever way 1-4 go:** a class rule needs a floor
+*above* zero (`min_score: 0.01`, §4). At `0.0` the first rule matches every class, because the classifier reports only
+the class Laya chose and every other label scores exactly `0.0` — a `short` prompt routed to the `code` model while
+every test stayed green. Any table or hand-written policy built from this note has to carry that floor.

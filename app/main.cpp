@@ -53,6 +53,7 @@ int onebit_ort_run_main(int argc, char** argv);
 #endif
 #ifdef ONEBIT_LAYA
 #include "laya_checkpoint.h"
+#include "laya_first.h"
 #include "policy.h"
 #include "route.h"
 #include "route_serve.h"
@@ -306,6 +307,14 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+    if (cmd == "laya-first") {
+        try {
+            return onebit::run_laya_first(argc - 2, argv + 2);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "1bit laya-first: %s\n", e.what());
+            return 1;
+        }
+    }
 #ifdef ONEBIT_LAYA
     if (cmd == "route") {
         try {

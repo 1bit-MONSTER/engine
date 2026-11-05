@@ -52,6 +52,7 @@ int onebit_ort_run_main(int argc, char** argv);
 #include "unified.h"
 #endif
 #ifdef ONEBIT_LAYA
+#include "laya_checkpoint.h"
 #include "policy.h"
 #include "route.h"
 #include "route_serve.h"
@@ -187,12 +188,12 @@ int run_route(int argc, char** argv) {
         else if (a == "--json") json_out = true;
         else if (a == "--serve") serve = true;
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: 1bit route --laya-model <dir> --state <text> [--devices npu,hrx,cpu]\n"
+            std::printf("usage: 1bit route [--laya-model <dir>] --state <text> [--devices npu,hrx,cpu]\n"
                         "                  [--route-policy FILE] [--classify]\n"
                         "  Laya classifies the request (code, prose, short, long_doc) and the route policy\n"
                         "  picks one of the devices; --classify prints \"<class> <confidence> <device>\"\n"
                         "  and --json prints the same decision as one JSON line\n"
-                        "usage: 1bit route --serve --laya-model <dir> [--devices npu,hrx,cpu]\n"
+                        "usage: 1bit route --serve [--laya-model <dir>] [--devices npu,hrx,cpu]\n"
                         "                  [--route-policy FILE]\n"
                         "  Resident: loads the scorer once, then reads one {\"state\": \"<text>\"} per line\n"
                         "  on stdin and writes one {\"class\",\"confidence\",\"device\",\"decision_ms\"}\n"
@@ -200,7 +201,6 @@ int run_route(int argc, char** argv) {
             return 0;
         } else throw std::runtime_error("unknown option " + a);
     }
-    if (laya_model.empty()) throw std::runtime_error("--laya-model <dir> is required");
     if (!serve && state.empty()) throw std::runtime_error("--state <text> is required");
 
     std::vector<std::string> devices;
@@ -210,9 +210,14 @@ int run_route(int argc, char** argv) {
     if (devices.empty()) throw std::runtime_error("--devices is empty");
     if (serve) return onebit::run_route_serve(laya_model, devices, policy_path);
 
-    namespace fs = std::filesystem;
-    if (fs::exists(fs::path(laya_model) / "typed-decisions" / "model.safetensors"))
-        laya_model = (fs::path(laya_model) / "typed-decisions").string();
+    // One resolution chain for `serve --laya` and this command (app/laya_checkpoint.h), so the two
+    // cannot disagree about where the checkpoint is.
+    try {
+        laya_model = onebit::laya_checkpoint(laya_model);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "1bit route: %s\n", e.what());
+        return 1;
+    }
     const onebit::laya::RoutePolicy policy = onebit::laya::load_route_policy(policy_path);
     const auto t0 = std::chrono::steady_clock::now();
     onebit::laya::Scorer scorer;

@@ -88,7 +88,7 @@ appliance is blank ([os-v3.md](os-v3.md)).
 
 1. Put the stick in the machine. On the Bosgame BeyondMax use the **front USB-A** port
    ([7](#7-the-bosgame-beyondmax-has-one-usable-usb-port)).
-2. Boot it. The default entry, `1bit OS (headless console, 7.3.0-rc4-1bit-perfopt+)`, comes up headless:
+2. Boot it. The default entry, `1bit OS (headless console, 7.4.0-rc1-1bit)`, comes up headless:
    a console with no X, whose first screen prints the box's address and how to connect to it (web UI,
    API, `ssh`), above a menu whose item 1 turns the Lemonade API key on (the shipped default is no key)
    and prints it. The second, `1bit OS (desktop, JWM)`, starts
@@ -236,7 +236,7 @@ parked.
 ## 6. Secure Boot and our MOK
 
 The stick and the install boot with **Secure Boot on**: a Microsoft-signed shim → our MOK-signed grub →
-our MOK-signed kernel (`7.3.0-rc4-1bit-perfopt+`) → our signed modules (`amdgpu`, `amdxdna`,
+our MOK-signed kernel (`7.4.0-rc1-1bit`) → our signed modules (`amdgpu`, `amdxdna`,
 `ec_su_axb35`). That is a chain of signatures, and it is only trusted on a machine whose firmware already
 trusts our keys. Verified on the shipped image: `sbverify --cert MOK-Kernel.pem /1bit/vmlinuz` →
 `Signature verification OK`.

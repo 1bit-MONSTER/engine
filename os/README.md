@@ -27,9 +27,9 @@ catalog and downloads, its routing and its settings.
 | what the appliance is | |
 |---|---|
 | base | `ResolutePup64` (woof-CE on the Ubuntu 26.04 `resolute` base); the same image is the live/try stick and the frugal install |
-| kernel | `7.3.0-rc4-1bit-perfopt`, ours, MOK-signed, with `amdxdna` (NPU) and `ec_su_axb35` (fan and EC) signed the same way |
+| kernel | `7.4.0-rc1-1bit`, ours, MOK-signed, with `amdxdna` (NPU) and `ec_su_axb35` (fan and EC) signed the same way |
 | Secure Boot | on: shim → our MOK-signed grub → our MOK-signed kernel → our signed modules |
-| boot | **headless by default**, a console login with no X; a second boot entry, `1bit OS (desktop)`, starts Puppy's desktop on the same system |
+| boot | **headless by default**, a console login with no X; a second boot entry, `1bit OS (desktop, JWM)`, starts Puppy's desktop on the same system |
 | userland | `bash`, `sudo`, `apt`, `sshd`, `mokutil`: an ordinary Linux box, not an initramfs |
 | persistence | everything that has to last is on the `1BIT-DATA` partition, which is Puppy's save layer (`PUPMODE=12`): models, Lemonade's config and cache, SSH keys |
 

@@ -57,7 +57,7 @@ Boot a USB stick, and the machine serves local LLMs on its GPU and NPU. That is 
 
 **1bit OS is a Puppy Linux appliance**: `ResolutePup64`, built with woof-CE on the Ubuntu 26.04
 "resolute" base, with Lemonade Server and this engine embedded in it, running our MOK-signed
-`7.3.0-rc4-1bit-perfopt` kernel rather than the distribution's. It boots **headless** by default, to a
+`7.4.0-rc1-1bit` kernel rather than the distribution's. It boots **headless** by default, to a
 console of its own with no X, and a second boot entry, `1bit OS (desktop, JWM)`, starts Puppy's desktop
 on the same system. The userland is an ordinary one - `bash`, `sudo` and `apt` work - and everything that has
 to last (models, Lemonade's config and cache, SSH keys) lives on the `1BIT-DATA` partition

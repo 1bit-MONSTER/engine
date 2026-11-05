@@ -29,6 +29,12 @@ asked to serve it (docs/npu.md, "Q4NX chunks"). It is metadata only: nothing is 
 no numpy, no gguf, and it opens the file to read the header and the file size, never the data.
 It therefore cannot tell the two Q8 code layouts apart - the container does not record which
 one it holds - so it reports the Q8 tensors and says so, rather than guessing.
+
+`--against <source.gguf>` closes that gap the only way it can be closed: it decodes the first
+tile of the Q8 tensors **both** ways and correlates each against the tensor in the GGUF the
+container was packed from, so the answer comes from the weights instead of from the container's
+own round trip (a packer/decoder pair that agrees on the wrong layout scores well against
+itself). That mode is opt-in and is the only one that needs numpy and gguf.
 """
 import argparse
 import json
@@ -61,6 +67,50 @@ def read_header(path):
     if not isinstance(table, dict):
         raise ValueError(f"{path}: header is not a tensor table")
     return table, 8 + n, size
+
+
+# The two 8704-byte Q8 code orders in circulation (npu/q4nx.h): byte index of code (row, column).
+# A is what npu/q4nx.cpp's q4nx_dequant_tile_q8 decodes and what tools/gguf_to_q4nx.py --dtype8
+# writes; B is the Qwen3.6-35B container. Only a check against the source weights can say which
+# one a third-party container holds.
+Q8_LAYOUTS = {
+    "A": lambda r, k: k * 32 + r,
+    "B": lambda r, k: (r // 16) * 4096 + (k // 32) * 512 + (k % 32) * 16 + (r % 16),
+}
+Q8_TILE = 8704        # 512 B of bf16 per-32-column scale (8 groups x 32 rows) + 8192 int8 codes
+
+
+def q8_tile_floats(tile, layout):
+    """The 8192 values of one Q8 tile as 32 rows x 256 columns (npu/q4nx.cpp's tile)."""
+    if len(tile) != Q8_TILE:
+        raise ValueError(f"a Q8 tile is {Q8_TILE} B, got {len(tile)}")
+    index = Q8_LAYOUTS[layout]
+    rows = []
+    for r in range(32):
+        row = []
+        for k in range(256):
+            (s,) = struct.unpack_from("<H", tile, ((k // 32) * 32 + r) * 2)
+            (d,) = struct.unpack("<f", struct.pack("<I", s << 16))       # bf16 -> f32
+            (c,) = struct.unpack_from("<b", tile, 512 + index(r, k))
+            row.append(d * c)
+        rows.append(row)
+    return rows
+
+
+def corr(a, b):
+    """Pearson correlation of two equal-length sequences."""
+    n = len(a)
+    ma, mb = sum(a) / n, sum(b) / n
+    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    da = sum((x - ma) ** 2 for x in a) ** 0.5
+    db = sum((y - mb) ** 2 for y in b) ** 0.5
+    return num / (da * db) if da and db else 0.0
+
+
+def rel_rms(got, want):
+    num = sum((x - y) ** 2 for x, y in zip(got, want)) / len(want)
+    den = sum(y * y for y in want) / len(want)
+    return (num / den) ** 0.5 if den else 0.0
 
 
 def prod(shape):
@@ -138,6 +188,61 @@ def check(path, verbose=True):
 CHUNKS_REV = {v: k for k, v in CHUNKS.items()}
 
 
+def q8_ground_truth(gguf_path, container_name):
+    """The source tensor's top-left 32x256 values, or None if the GGUF has no such tensor.
+
+    Only this path needs numpy and gguf; the container side stays pure python.
+    """
+    import gguf
+    import numpy as np
+    from gguf.quants import dequantize
+    from gguf_to_q4nx import hf_name          # the packer's own GGUF -> Q4NX name mapping
+    reader = gguf.GGUFReader(gguf_path)
+    for t in reader.tensors:
+        if hf_name(t.name) != container_name:
+            continue
+        # ggml stores [rows, columns]; the tile is rows-major from the source's own order.
+        flat = np.asarray(dequantize(t.data, t.tensor_type), dtype="float32").reshape(-1)
+        cols = int(t.shape[0])
+        return [[float(flat[r * cols + c]) for c in range(256)] for r in range(32)], t.name
+    return None, None
+
+
+def check_q8_layout(path, gguf_path, samples=3):
+    """(errors, rows): which Q8 code order the container's tiles actually hold, versus the GGUF."""
+    table, base, _ = read_header(path)
+    q8 = [n for n, t in table.items()
+          if isinstance(t, dict) and t.get("dtype") == "I8" and (t.get("shape") or [0])[-1] == Q8_TILE]
+    if not q8:
+        print(f"{path}: no Q8 tensors, nothing to check against the source weights")
+        return [], []
+    errors, rows = [], []
+    for name in q8[:samples]:
+        off = table[name]["data_offsets"][0]
+        with open(path, "rb") as f:
+            f.seek(base + off)
+            tile = f.read(Q8_TILE)
+        want, gguf_name = q8_ground_truth(gguf_path, name)
+        if want is None:
+            print(f"  {name}: not in {os.path.basename(gguf_path)}, skipped")
+            continue
+        flat_want = [v for row in want for v in row]
+        scores = {}
+        for layout in ("A", "B"):
+            got = [v for row in q8_tile_floats(tile, layout) for v in row]
+            scores[layout] = (corr(got, flat_want), rel_rms(got, flat_want))
+        a, b = scores["A"], scores["B"]
+        rows.append({"tensor": name, "gguf": gguf_name, "A": a, "B": b})
+        print(f"  {name} vs {gguf_name}:")
+        for layout in ("A", "B"):
+            print(f"    layout {layout}: corr {scores[layout][0]:+.4f}  rel-rms {scores[layout][1]:.4f}")
+        # A is the order npu/q4nx.cpp decodes; anything else is served as noise, silently.
+        if not (a[0] >= 0.99 and a[1] <= 0.10 and a[0] > b[0]):
+            errors.append(f"{name}: not the layout npu/q4nx.cpp decodes "
+                          f"(A corr {a[0]:+.4f} rel-rms {a[1]:.4f}, B corr {b[0]:+.4f})")
+    return errors, rows
+
+
 def targets(arg):
     """The .q4nx files a directory names: model.q4nx plus any other (vision_weight.q4nx)."""
     if os.path.isdir(arg):
@@ -209,13 +314,39 @@ def self_test():
         write_q4nx(os.path.join(two, "vision_weight.q4nx"), [("patch.weight", [1, 5120], "I8", 0x99)])
         if len(targets(two)) != 2:
             bad.append(f"directory targets {targets(two)}")
+
+        # the two Q8 code orders: build a tile whose codes were written in A's order and prove
+        # A decodes it back and B does not, so --against's verdict cannot come from the decoder
+        # agreeing with itself (no gguf here: this pins the byte order, the GGUF supplies truth).
+        def bf16(x):
+            """Round a float through bf16 (the tile's scale type) and back."""
+            (u,) = struct.unpack("<I", struct.pack("<f", x))
+            return struct.unpack("<f", struct.pack("<I", (u >> 16) << 16))[0]
+
+        def bf16_bits(x):
+            return struct.unpack("<I", struct.pack("<f", x))[0] >> 16
+
+        scales = [bf16(1.0 + g + r * 1e-3) for g in range(8) for r in range(32)]
+        code = {(r, k): ((r * 7 + k * 13) % 251) - 125 for r in range(32) for k in range(256)}
+        payload = bytearray(Q8_TILE)
+        for i, s in enumerate(scales):
+            struct.pack_into("<H", payload, i * 2, bf16_bits(s))
+        for (r, k), c in code.items():
+            struct.pack_into("<b", payload, 512 + Q8_LAYOUTS["A"](r, k), c)
+        want = [scales[(k // 32) * 32 + r] * code[(r, k)] for r in range(32) for k in range(256)]
+        flat_a = [v for row in q8_tile_floats(bytes(payload), "A") for v in row]
+        flat_b = [v for row in q8_tile_floats(bytes(payload), "B") for v in row]
+        if corr(flat_a, want) < 0.9999 or rel_rms(flat_a, want) > 1e-3:
+            bad.append(f"A-order tile does not decode back to itself: corr {corr(flat_a, want):.6f}")
+        if corr(flat_b, want) > 0.5:
+            bad.append(f"B scores {corr(flat_b, want):.4f} on an A-order tile, so the check is blind")
     if bad:
         print("self-test FAILED:")
         for b in bad:
             print("  " + b)
         return 1
     print("self-test passed: 3 chunk kinds counted, unknown chunk size refused, short tensor refused, "
-          "directory scans every .q4nx")
+          "directory scans every .q4nx, a Q8 tile written in A's order decodes as A and not as B")
     return 0
 
 
@@ -224,6 +355,11 @@ def main():
     ap.add_argument("path", nargs="?", help="a Q4NX model directory (or one model.q4nx)")
     ap.add_argument("--json", help="write the per-file summary here")
     ap.add_argument("--self-test", action="store_true", help="synthetic containers: pass/fail cases")
+    ap.add_argument("--against", metavar="SOURCE.gguf",
+                    help="decode every Q8 tile both ways and correlate against the GGUF the "
+                         "container was packed from (needs numpy and gguf)")
+    ap.add_argument("--q8-samples", type=int, default=3, metavar="N",
+                    help="how many Q8 tensors --against decodes (default 3)")
     args = ap.parse_args()
     if args.self_test:
         return self_test()
@@ -233,6 +369,11 @@ def main():
     for path in targets(args.path):
         errors, summary = check(path)
         out[path] = summary
+        if args.against:
+            print(f"{path}: Q8 code layout against {os.path.basename(args.against)}")
+            q8_errors, rows = check_q8_layout(path, args.against, args.q8_samples)
+            summary["q8_layout"] = rows
+            errors += q8_errors
         for e in errors:
             print(f"FAIL {e}")
         rc = rc or (1 if errors else 0)
@@ -241,6 +382,8 @@ def main():
             json.dump(out, f, indent=1)
     if rc:
         print("chunk layout NOT verified")
+    elif args.against:
+        print("chunk layout verified, and the Q8 tiles hold the code order npu/q4nx.cpp decodes")
     else:
         print("chunk layout verified: every quantized tensor's shape names a known chunk kind")
     return rc

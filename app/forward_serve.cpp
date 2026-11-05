@@ -453,11 +453,12 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         return finish;
     };
 
+    // AMD's two stages, as milliseconds, and nothing derived from them: the protocol's consumers
+    // (onnx/bench_npu_serve.py) compute their own rates, and a rate of ours would be a second
+    // definition of the same stage -- off by one token, because the first token belongs to TTFT in
+    // that protocol.  Two rates for one stage is exactly how two rows end up disagreeing later.
     auto timings_json = [](const CallStats& st) {
-        return json{{"prompt_ms", st.prompt_ms},
-                    {"predicted_ms", st.predicted_ms},
-                    {"predicted_per_second",
-                     st.predicted_ms > 0.0 ? 1000.0 * double(st.completion_tokens) / st.predicted_ms : 0.0}};
+        return json{{"prompt_ms", st.prompt_ms}, {"predicted_ms", st.predicted_ms}};
     };
 
     // OpenAI's usage object plus the two fields issue #650 reports: how many prompt tokens came

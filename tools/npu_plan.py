@@ -177,7 +177,48 @@ def decode_dirs(model_dir: str, kernels: str) -> list[dict]:
     return dirs
 
 
+def tile_order_claim(model_dir: str) -> tuple[str, str]:
+    """(the tile_order this plan may declare, a note to print) from the directory's repack stamp.
+
+    The plan's `container.tile_order` is the only thing standing between a container whose tiles are
+    another order and a clean 200 with noise in it (engine#1110): `npu/plan/plan.h` refuses any value
+    but "engine-1".  So the value is a measurement, not a constant -- `scripts/repack_gguf.py` holds
+    both the source GGUF and the tiles and writes what it measured into `repack-stamp.txt`, including
+    on the path where it refuses the directory (measured: a refused dir planned anyway declared
+    "engine-1" and the loader accepted it).
+
+    No stamp is not evidence of anything: those directories predate the field, so they keep the
+    previous default silently rather than turning every plan run into a warning.
+    """
+    stamp = os.path.join(model_dir, "repack-stamp.txt")
+    if not os.path.isfile(stamp):
+        return "engine-1", ""
+    fields = {}
+    with open(stamp, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            k, sep, v = line.partition("=")
+            if sep:
+                fields[k.strip()] = v.strip()
+    order = fields.get("tile_order", "")
+    checked = fields.get("tile_check", "")
+    if order == "engine-1":
+        return "engine-1", f"tile order measured at repack: {checked}" if checked else ""
+    if order == "unverified":
+        return "engine-1", (f"tile order NOT measured ({checked or 'no reason recorded'}): the plan declares "
+                            f"engine-1 because that is the only order this loader accepts, not because anything "
+                            f"checked these tiles")
+    raise SystemExit(f"{stamp}: tile_order={order!r} -- the repack measured these tiles as NOT the engine-1 "
+                     f"order this engine decodes ({checked or 'no verdict line recorded'}), so this plan may not "
+                     f"declare engine-1.  Re-convert with a converter that writes the engine-1 order "
+                     f"(engine#1110; `scripts/repack_gguf.py --tile-check <dir> <model.gguf>` re-measures).")
+
+
 def generate(model_dir: str, kernels: str) -> dict:
+    # A measurement that contradicts the only order this loader decodes is refused before anything is
+    # derived from the directory (engine#1110): no plan for tiles the repack already rejected.
+    tile_order, tile_note = tile_order_claim(model_dir)
+    if tile_note:
+        print(f"{model_dir}: {tile_note}", file=sys.stderr)
     cfg = read_config(model_dir)
     hidden = cfg.get("hidden_size")
     if not isinstance(hidden, int) or hidden <= 0:
@@ -227,8 +268,9 @@ def generate(model_dir: str, kernels: str) -> dict:
             "chunk_kind": "pb16i" if layout in ("pb16i", "t2s") else "mode0",
             # The tile order of the payload this plan describes (engine#1110).  Declared so a container
             # from another converter -- a different order that would decode as noise with no error -- is
-            # refused by name at load instead of being served.  Absent means this same value.
-            "tile_order": "engine-1",
+            # refused by name at load instead of being served.  Absent means this same value.  Measured
+            # from the directory's repack stamp when one exists (see tile_order_claim), never assumed.
+            "tile_order": tile_order,
             "pb16i": layout in ("pb16i", "t2s"),
         },
         "fusion": {"gate_up": "fused" if fused_gu else "split"},

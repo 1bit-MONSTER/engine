@@ -319,6 +319,12 @@ def check(pins: dict, want_template: bool) -> tuple[list[dict], list[str]]:
             now = head(repo)
             at = {e["path"]: e for e in tree(repo, now) if e.get("type") == "file"}
         except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                # not transient and not "gone": the token cannot see it, so nobody checks this pin until a
+                # token that can read the repo is in place (a private or gated repo).
+                notes.append(f"{repo}: the token cannot see this repo ({e.code}) — a private or gated repo "
+                             f"needs a token with access; the pin was not checked")
+                continue
             if e.code == 404:
                 # "the upstream is gone" is the answer, not a failed read: a delete, a rename and a
                 # privatisation all look like this, and none of them may pass as a clean day.
@@ -700,6 +706,22 @@ def self_test() -> int:
 
         # a run that could read nothing is exit 2 (the workflow fails on anything outside 0/1) and its
         # first line counts what it read
+        def fake_head_one_401(repo):
+            if repo == "fake/gone":
+                raise urllib.error.HTTPError("https://huggingface.co/api/models/" + repo, 401, "Unauthorized", {}, None)
+            return "new"
+
+        path401 = os.path.join(d, "pins401.json")
+        save(path401, {"pins": {"fake/moved": dict(stale), "fake/gone": dict(stale)}})
+        head = fake_head_one_401
+        report_401 = os.path.join(d, "unauthorised.md")
+        expect("a 401 on one repo does not hide the other's move",
+               main(["--check", "--pins", path401, "--out", report_401]), 1)
+        unread = open(report_401, encoding="utf-8").read()
+        expect("...it is a permission note, not a clean pin", "the token cannot see this repo (401)" in unread, True)
+        expect("...and the first line counts it", "1 of 2 checked, 1 not checked" in unread.splitlines()[0], True)
+        head = fake_head_new
+
         def fake_head_flaky(repo):
             raise RuntimeError("HTTP Error 429: Too Many Requests")
 

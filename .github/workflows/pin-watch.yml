@@ -69,7 +69,7 @@ jobs:
           # a pin nobody could read, or a published repo nobody pinned, is not a clean day: annotate the
           # run with the report's own first line instead of leaving it to whoever opens the summary
           if head -1 pin-report.md | grep -Eq 'not checked|not pinned'; then
-            echo "::warning::$(head -1 pin-report.md)"
+            echo "::warning::$(head -1 pin-report.md) — see the summary"
           fi
           cat pin-report.md >> "$GITHUB_STEP_SUMMARY"
 

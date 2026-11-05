@@ -678,6 +678,12 @@ rows = [
     ("U3 catalogue", "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
                      "curl -s ${k:+-H \"Authorization: Bearer $k\"} http://127.0.0.1:13305/api/v1/models "
                      "| grep -o onebit | wc -l", None),
+    # Cycle 26: the image shipped no models directory in lemond's config, so anything staged in /data/models was invisible
+    # even though the files were on the medium (measured on the shipping payload: 213 catalogue rows without the key, 214
+    # with it, the extra one `source: extra_models_dir`). This asks the booted appliance the two things that make that true.
+    ("U3 models dir", "p=$(sed -n 's/.*\"extra_models_dir\": *\"\\([^\"]*\\)\".*/\\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1); "
+                     "echo \"path=${p:-<unset>}\"; "
+                     "[ -n \"$p\" ] && [ -d \"$p\" ] && echo models-dir-seeded", "models-dir-seeded"),
     ("U3 api local", "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
                      "curl -s -o /dev/null -w 'http=%{http_code}' ${k:+-H \"Authorization: Bearer $k\"} "
                      "http://127.0.0.1:13305/api/v1/models", "http=200"),

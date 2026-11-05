@@ -30,6 +30,30 @@ release in the same week gets `.1`.
 
 ## v2026.44 (1 Nov 2026) — the first release, a draft
 
+> **The candidate has moved on since this section was written.** Everything below to the end of this section is the
+> **1 Nov 2026 record** of c19 (software-gated, never booted on hardware) and c20, and stays as that record. What
+> has happened since, as of 2026-11-05 16:5x:
+>
+> - **c26** (`rc-2026-11-05-c26`) was written to a stick at 14:37 with every software gate green on its frozen
+>   bytes: `vm-check` **75 PASS / 0 FAIL / 3 SKIP** (UEFI + Secure Boot), the artifact's own
+>   `1bit-puppy-stick.sh --check` **31 rows, 0 failed**, and `READBACK: MATCH` for all 9,128,902,656 bytes.
+> - **Its board boot failed** at ~15:0x, before userspace: `Waiting for partition [1BIT-DATA]... failed`. The stick
+>   had enumerated at 3.8 s, but its SCSI probe did not finish until **45.7 s** — it sat behind two USB
+>   mass-storage reset cycles of the KVM's emulated drive — and Puppy's `wait_for_blkid()` polls for only **15 s**
+>   ([#1159](https://github.com/1bit-MONSTER/engine/issues/1159)). Not a c26 regression: c26's `vmlinuz` and
+>   `initrd.gz` are byte-identical to c25's, and c23-c25 won the same race.
+> - **c27** re-cuts the appliance with one file changed, `/1bit/initrd.gz`: the wait is **120 s**, the console says
+>   `*** 1bit: still waiting for [1BIT-DATA] - a slow medium is not a failure` where it used to give up, and the
+>   PR that carries the change makes the image build refuse any initrd whose wait is under 90 s
+>   ([#1160](https://github.com/1bit-MONSTER/engine/pull/1160), which closes #1159). On c27's bytes `vm-check` is
+>   the same **75 / 0 / 3**, the new `usbgate` (a USB-mass-storage boot with its budget asserted from the shipped
+>   image) passes, and `prepare-stick --check` passes. **Its board boot is the step still owed**, so v2026.44
+>   remains a draft under the owner's order — the demo video on the live USB first, then the install test, then
+>   publish.
+>
+> The last result *measured on the board* remains cycle 24's: `puppy-check` **42 rows: 40 PASS, 1 FAIL — the
+> checker's own `u7-mdns` row — 2 SKIP**.
+
 **Not published.** Candidate **c19** (`rc-2026-11-01a`, engine `bcb28cc8f573`) passed every software gate below and
 was written to a 64 GB stick — and that is where it stopped: it was **never booted on hardware and never installed on
 hardware**, so the owner pulled v2026.44 back to a draft. Nothing here is a hardware result for c19.
@@ -54,7 +78,7 @@ DeepSeek V4.x, GLM 5.x and Qwen3.8-Flash-Next run on **HRX** here, and the catal
 | hrx-system | `82804197bcbe` |
 | HRX toolchain (ROCm/TheRock SDK) | `10.3.0a20261031`, `gfx1151` (`config/hrx-toolchain.config`), HSA runtime `21a6682452e159cf…` |
 | Lemonade Server | `2026.46.0~1.ef0f3b49` (our fork, the `onebit` recipe) |
-| kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
+| kernel in the image | `7.4.0-rc1-1bit` (Linux `v7.4-rc1`, IOMMU PerfOpt upstream, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
 
 The pinned toolchain's HSA runtime, so a bump is a diff here and a wrong runtime is visible
@@ -82,7 +106,7 @@ not tell you, both measured:
   no device (engine#713's acceptance table). A payload dir may also carry the pin **relocated** (`f5462dc3…`: the
   same 5,141,585 B with 185 bytes changed, `DT_RPATH`→`DT_RUNPATH $ORIGIN`).
 
-The Lemonade pin is the sha (`ef0f3b49`), not the string around it: `tools/version.py` derives the dev version as
+The Lemonade pin is the sha (`ef0f3b49` at c19), not the string around it: `tools/version.py` derives the dev version as
 `<week>.0~<commit count>.<sha>`, and that count is the number of commits in the **checkout it was built in** —
 `third_party/lemonade` is a `shallow = true` submodule, so a depth-1 clone reports `~1` for the same commit while a
 full clone reports `~1752` (both measured on 2026-11-02; c18 printed `~5`, i.e. built from a deeper clone). The `~N` is

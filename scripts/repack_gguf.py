@@ -64,6 +64,19 @@ def tile_order_policy(rc, line):
     return "", True                      # another layout, or none: these tiles are not these weights
 
 
+def tile_check_exit(rc, line):
+    """Exit code for `--tile-check`: 0 ours, 1 another order or none, 2 nothing compared.
+
+    The checker's own rc is not this: `verdict()` returns 0 for ANY matching layout, including the
+    one this engine does not decode, so the CLI goes through the policy above instead of passing it
+    through (engine#1110 review, blocker 1).
+    """
+    order, fatal = tile_order_policy(rc, line)
+    if fatal:
+        return 1
+    return 2 if order == "unverified" else 0
+
+
 def tile_order_check(gguf, out_dir):
     """(rc, line) from the same verdict `tools/q4nx_diff.py decode --layout both` prints.
 
@@ -365,7 +378,7 @@ def main():
             return 2
         rc, line = tile_order_check(sys.argv[3], sys.argv[2])
         print(line)
-        return rc
+        return tile_check_exit(rc, line)
 
     os.makedirs(out_dir, exist_ok=True)
     convert_py = os.path.join(converter_dir, "convert.py")

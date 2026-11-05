@@ -72,5 +72,22 @@ for rc, line, want_order, want_fatal, why in CASES:
 check(R.tile_order_policy(2, "nothing was compared")[0] != "engine-1",
       "an unverified directory does not claim engine-1")
 
+# `--tile-check`'s exit codes are the policy's, not the checker's rc: verdict() returns 0 for ANY
+# matching layout, including the one this engine cannot decode (engine#1110 review, blocker 1).
+EXIT_CASES = [
+    ("matches layout ours (worst max|err| 5.600e-02, next layout flm worst max|err| 2.6e+00)", 0, 0,
+     "the engine-1 order exits 0"),
+    ("matches layout flm (worst max|err| 5.600e-02, next layout ours worst max|err| 2.6e+00)", 0, 1,
+     "a matching layout this decoder does not implement exits 1, not 0"),
+    # the exact line pi-prs measured: a 0-tensor pair used to come back as this 'match'
+    ("matches layout flm (worst max|err| 0.000e+00, next layout ours worst max|err| 0.000e+00)", 0, 1,
+     "the 0-vs-0 tie is not a pass"),
+    ("matches NO layout: closest is flm ...", 1, 1, "no match exits 1"),
+    ("nothing was compared", 2, 2, "nothing compared exits 2"),
+]
+for line, rc, want_exit, why in EXIT_CASES:
+    got = R.tile_check_exit(rc, line)
+    check(got == want_exit, f"--tile-check exit {want_exit} for {line[:40]!r}", why)
+
 print(f"repack_tile_order_test: {len(FAIL)} failure(s)")
 sys.exit(1 if FAIL else 0)

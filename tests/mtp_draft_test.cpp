@@ -270,6 +270,22 @@ public:
     }
     int cache_rows() const { return cache_.t; }
 
+    // Propose a wrong token now and then, so acceptance is partial: with full acceptance a whole-batch base returns
+    // exactly the accepted count and every slice of its rows looks identical, which is why the row handling could be
+    // broken in two different ways and stay green.
+    void set_flub(double p) { flub_ = p; }
+
+    // The hidden the loop handed over to be committed, in order.  Row i must be the row of the next stream position,
+    // so this sequence is 1,2,3,... when the cache IS the committed stream; a slice taken from the wrong place breaks
+    // the run of positions even though the row COUNT still matches.  Recorded here rather than in next_row(), because
+    // next_row() also writes the chain's provisional rows, which are not part of the stream.
+    const std::vector<int>& fed() const { return fed_; }
+
+    void commit_rows(const std::vector<int>& tokens, const std::vector<float>& hidden_rows, int M) override {
+        for (int m = 0; m < M && hidden_rows.size() > (size_t)m; m++) fed_.push_back((int)hidden_rows[(size_t)m]);
+        onebit::npu::mtp::MtpDrafter::commit_rows(tokens, hidden_rows, M);
+    }
+
 protected:
     bool next_row(const float* hidden, int, int pos, std::vector<float>& next, std::vector<float>& logits) override {
         const int rows = cache_.t + 1;                 // this row lands at index cache_.t
@@ -282,10 +298,16 @@ protected:
         const int pred = (int)hidden[0];
         const int t = truth(pred);
         (void)pos;
-        logits[(size_t)(rows == pred + 1 ? t : (t + 1) % V)] = 1.0f;   // right only if the stream is complete
+        const bool flub = flub_ > 0.0 && std::uniform_real_distribution<double>(0.0, 1.0)(rng_) < flub_;
+        logits[(size_t)(!flub && rows == pred + 1 ? t : (t + 1) % V)] = 1.0f;   // right only if the stream is complete
         next.assign(1, (float)(pred + 1));
         return true;
     }
+
+private:
+    double flub_ = 0.0;
+    std::mt19937 rng_{20261105u};
+    std::vector<int> fed_;
 };
 
 int fails = 0;
@@ -737,6 +759,41 @@ int main() {
         }
         check(bad == 0, "randomised: 600 cases keep text, position, batch width and deferred-commit state invariants");
         std::printf("INFO randomised: %d cases, %d violated an invariant\n", cases, bad);
+    }
+
+    // [15] the drafter advances over the ACCEPTED PREFIX of the base's rows -- not over the whole batch, and not over
+    // its tail.  Both were invisible until now: [13] runs the whole-batch shape with a perfect drafter, so accepted ==
+    // nd and every slice looks identical, and [14]'s head has no rows to inspect.  Measured, with partial acceptance
+    // forced here: `head->commit_rows(accepted, rows, (int)got)` (advance over every row) and handing it
+    // `rows.end() - take*h` (the last rows instead of the prefix) both left the whole suite green before this check.
+    {
+        ToyBase m(8);
+        m.keep_batch_rows(true);      // the shape whose rows need slicing: the base keeps the whole batch
+        m.use_recurrence(true);
+        StreamDrafter sd;
+        sd.set_flub(0.4);             // wrong at depth 2-3 often enough that acceptance is partial
+        for (int i = 0; i < (int)P.size(); i++) sd.prime(std::vector<float>{(float)(i + 1)}, 0, i);
+        Options o = base_opt;          // the same budget as `ref`, so the two texts are comparable
+        o.k = 4;
+        o.tau = 0.0f;
+        const Result r = onebit::npu::mtp::run(m, &sd, P, o);
+        check(r.ok, "prefix rows: the run completes with partial acceptance on the whole-batch shape");
+        if (!r.ok) std::printf("INFO prefix rows: %s\n", r.err.c_str());
+        check(r.ok && same(r.tokens, ref.tokens), "prefix rows: text identical to plain decode");
+        check(r.ok && r.stats.accepted < r.stats.drafted,
+              "prefix rows: acceptance really is partial (otherwise this case proves nothing)");
+        check(r.ok && sd.cache_rows() == (int)P.size() + r.stats.emitted,
+              "prefix rows: the drafter's stream advanced over the committed rows only");
+        const std::vector<int>& fed = sd.fed();
+        // Strictly consecutive is the shape-agnostic test: the loop commits the accepted prefix, then one more token
+        // per iteration, so consecutive commits are consecutive positions.  A wrong count or a wrong slice breaks it.
+        bool consecutive = !fed.empty();
+        for (size_t i = 1; consecutive && i < fed.size(); i++) consecutive = fed[i] == fed[i - 1] + 1;
+        check(consecutive,
+              "prefix rows: every row the drafter committed is the next stream position (no gap, no reject)");
+        check(r.ok && sd.stream_mismatches() == 0, "prefix rows: no chain opened off the cursor");
+        std::printf("INFO prefix rows: stream %d rows, committed %zu, accepted %d/%d\n", sd.cache_rows(), fed.size(),
+                    r.stats.accepted, r.stats.drafted);
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

@@ -42,6 +42,8 @@ using onebit::npu::kRandomSeed;
 using onebit::npu::PrefixOptions;
 using onebit::npu::PrefixCache;
 using onebit::npu::json_schema_to_gbnf;
+using onebit::npu::int_field;      // engine#1106: typed top-level fields
+using onebit::npu::bool_field;
 using onebit::npu::logprobs_of;
 using onebit::npu::options_from_body;
 using onebit::npu::SampleParams;
@@ -74,6 +76,17 @@ Feed run(const Grammar& g, const std::string& text) {
     r.alive = g.feed(st, text);
     r.can_stop = Grammar::can_stop(st);
     return r;
+}
+
+// engine#1106: a typed top-level field is a named refusal, not a json::type_error that escapes the route's guard.
+template <typename F>
+std::string throws_of(F f) {
+    try {
+        f();
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return {};
 }
 
 std::string error_of(const nlohmann::json& body) {
@@ -823,6 +836,40 @@ void test_content_mask() {
     }
 }
 
+void test_typed_fields() {
+    using nlohmann::json;
+    // Absent and null are the default; a number is taken; a fractional cap is truncated (body.value did that).
+    check(int_field(json::parse(R"({"a": 8})"), "a", 256) == 8, "an integer field is read");
+    check(int_field(json::parse(R"({})"), "a", 256) == 256, "an absent field is the default");
+    check(int_field(json::parse(R"({"a": null})"), "a", 256) == 256, "a null field is the default");
+    check(int_field(json::parse(R"({"a": 8.5})"), "a", 256) == 8, "a fractional cap is truncated, not refused");
+    check(throws_of([] { int_field(json::parse(R"({"max_tokens": "8"})"), "max_tokens", 256); }) ==
+              "max_tokens: must be an integer",
+          "a string max_tokens is a 400 naming the field (engine#1106: it used to be a 500 with no body)");
+    check(throws_of([] { int_field(json::parse(R"({"max_tokens": true})"), "max_tokens", 256); }) ==
+              "max_tokens: must be an integer",
+          "a boolean max_tokens is refused too");
+
+    check(bool_field(json::parse(R"({"stream": true})"), "stream"), "a boolean field is read");
+    check(!bool_field(json::parse(R"({"stream": false})"), "stream"), "false is false");
+    check(!bool_field(json::parse(R"({})"), "stream"), "an absent flag is false by default");
+    check(throws_of([] { bool_field(json::parse(R"({"stream": "yes"})"), "stream"); }) == "stream: must be true or false",
+          "a string stream is a 400 naming the field (engine#1106: it used to be a 500 with no body)");
+}
+
+void test_tools_type() {
+    using nlohmann::json;
+    // engine#1106: a wrong-typed tools used to short-circuit as if no tools were sent, in the default mode.
+    check(throws_of([] { options_from_body(json::parse(R"({"tools": "a string"})")); }) == "tools: must be an array",
+          "a non-array tools is refused even with the default tool_choice");
+    check(throws_of([] { options_from_body(json::parse(R"({"tools": 7})")); }) == "tools: must be an array",
+          "a numeric tools is refused too");
+    const auto none = options_from_body(json::parse(R"({"tools": []})"));
+    check(none.tools_sent && none.grammar.empty(), "an EMPTY tools array still means no tools, and still counts as sent");
+    const auto explicit_auto = options_from_body(json::parse(R"({"tools": [], "tool_choice": "auto"})"));
+    check(explicit_auto.grammar.empty(), "an empty tools array with an explicit auto installs no grammar");
+}
+
 void test_request_parsing() {
     const auto plain = options_from_body(nlohmann::json::parse(R"({"prompt": "hi", "max_tokens": 8})"));
     check(plain.sample.greedy(), "a body without sampling fields stays greedy");
@@ -891,6 +938,8 @@ int main() {
     test_tool_request_parsing();
     test_content_mask();
     test_request_parsing();
+    test_typed_fields();
+    test_tools_type();
     std::printf("%s\n", failures ? "FAILED" : "npu_sampling: ok");
     return failures ? 1 : 0;
 }

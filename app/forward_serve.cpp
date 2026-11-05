@@ -183,13 +183,16 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         res.set_content(json{{"error", {{"message", std::string("bad request: ") + ex.what()}}}}.dump(), "application/json");
         return;
     }
-    const int max_tokens = body.value("max_completion_tokens", body.value("max_tokens", 256));
     // Decode-time controls.  Every field is optional and absent means the greedy decode
     // this route has always done, so existing callers see no change; a field the route
     // cannot honour is a 400 rather than a silently ignored key.
     npu::Options opts;
     std::unique_ptr<npu::Grammar> grammar;
+    int max_tokens = 256;
     try {
+        // Both read here, not before: a wrong type must be the 400 below, not a json::type_error that escapes
+        // the guard and answers 500 with an empty body (engine#1106).
+        max_tokens = npu::int_field(body, "max_completion_tokens", npu::int_field(body, "max_tokens", 256));
         opts = npu::options_from_body(body);
         // logprobs is served in the chat shape; the legacy /v1/completions shape is a different
         // object this route does not implement, and a silently dropped field is what it must not do.
@@ -210,7 +213,14 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         res.set_content(R"({"error":{"message":"prompt longer than the context"}})", "application/json");
         return;
     }
-    const bool stream = body.value("stream", false);
+    bool stream = false;
+    try {
+        stream = npu::bool_field(body, "stream");  // engine#1106: a wrong type is a 400, not a 500 with no body
+    } catch (const std::exception& ex) {
+        res.status = 400;
+        res.set_content(json{{"error", {{"message", ex.what()}}}}.dump(), "application/json");
+        return;
+    }
     const std::string id = now_id(chat ? "chatcmpl-" : "cmpl-");
     const long created = long(std::chrono::duration_cast<std::chrono::seconds>(
                                   std::chrono::system_clock::now().time_since_epoch()).count());

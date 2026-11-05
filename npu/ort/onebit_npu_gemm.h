@@ -58,7 +58,19 @@ bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
 // device run and a host run of the same graph agree to the byte.
 // False means the device could not run it (no ELF for this K x N, device busy,
 // XRT failure); the caller keeps its host loop and must not claim the device.
+//
+// `split`, when not null, is filled with where that call's wall time went, in ms. It is a measurement
+// hook for the caller's own profiler (onnx/ep/onebit_ep_kernel.cpp, ONEBIT_EP_QDQ_PROF): a plain call
+// passes null and pays one branch per section, not a clock read.
+struct Q8RawSplit {
+    double wpack_ms = 0;     // weight pack into the BO + its upload -- a cache miss, once per weight
+    double aupload_ms = 0;   // activation memset/memcpy + A readback sizing, per launch block
+    double async_ms = 0;     // A flush (sync_A) per launch block
+    double launch_ms = 0;    // launch + wait_kernel: the device's own time, as the host sees it
+    double readback_ms = 0;  // C invalidation + the block's copy back to `c`
+};
+
 bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t* b,
-                 int32_t* c, std::string* err);
+                 int32_t* c, std::string* err, Q8RawSplit* split = nullptr);
 
 }  // namespace onebit::npu

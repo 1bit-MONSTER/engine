@@ -120,7 +120,7 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 
 | device | 2026-09-25, start | now |
 |---|---|---|
-| HRX | 19 / 31 | **31 / 31 run, all pass** (2 skipped; 2026-11-05, against the **ported** `lemond` `2026.47.0~1759.f44ff953` — the server this pin ships — not the c22 package that booted the board: `test/server_llm.py --wrapped-server onebit --backend hrx`, exit status 0, 110.6 s, every backend on `HRX0`, measured at load 28.5 with two foreign HRX clients resident, engine payload `lemonade-onebit-rc-2026-11-05-c25`) |
+| HRX | 19 / 31 | **31 / 31 run, all pass** (2 skipped; 2026-11-05, against the **ported** `lemond` `2026.47.0~1759.f44ff953` — the fork's `main` tip, which `bump-lemonade`'s PR #1126 pins, not the `ef0f3b49` that `third_party/lemonade` still points at, and not the c22 package that booted the board: `test/server_llm.py --wrapped-server onebit --backend hrx`, exit status 0, 110.6 s, every backend on `HRX0`, measured at load 28.5 with two foreign HRX clients resident, engine payload `lemonade-onebit-rc-2026-11-05-c25`) |
 | NPU | 3 / 31 | in progress ([npu.md](npu.md)); the suite's small test models are GGUF |
 | Vulkan (removed in RFC #213 stage 3) | 19 / 31 | 29 / 29 run, all pass, before its removal |
 

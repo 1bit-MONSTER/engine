@@ -110,12 +110,23 @@ def main():
             check(claim == "FATAL", f"tile_order={order} is fatal: the plan may not claim engine-1", claim)
             check(order in msg and "engine-1" in msg, f"and the refusal names {order!r} and what it would have claimed", msg)
 
-        # 4. No stamp: unchanged behaviour, and quiet (27 directories on this box predate the field).
+        # 4. A stamp written BEFORE the field existed is no evidence, not evidence against -- and this is
+        #    not hypothetical: both repack-cache directories on the box carry verbatim this stamp, so getting
+        #    it wrong means refusing two directories that work today (it did, before the sweep caught it).
+        old = stamp(os.path.join(tmp, "pre-field"),
+                    "converter_path=/home/bcloud/wt/npu-rt-753-pr/third_party/FLM_Q4NX_Converter\n"
+                    "converter_commit=81be119e\narch=qwen3\nmodel_type=qwen3\nq4nx_default_tensor_type=Q4_1\n"
+                    "repack_script=/home/bcloud/wt/onebp-zyphra/scripts/repack_gguf.py\n")
+        claim, note, _ = claim_of(old)
+        check(claim == "engine-1", "a pre-field stamp (no tile_order key) keeps the default", claim)
+        check(note == "", "and is silent: it says nothing about the tiles, so there is nothing to report", note)
+
+        # 5. No stamp: unchanged behaviour, and quiet (directories that predate the field).
         os.makedirs(os.path.join(tmp, "nostamp"))
         claim, note, _ = claim_of(os.path.join(tmp, "nostamp"))
         check(claim == "engine-1" and note == "", "a directory with no stamp keeps the old silent default", claim + "/" + note)
 
-        # 5. The id the repack stamps on its refusing path is one the planner refuses.  This is the
+        # 6. The id the repack stamps on its refusing path is one the planner refuses.  This is the
         #    joint that was open: the two files must agree on the vocabulary or the stamp is wasted.
         if R is not None:
             for line, want in (("matches layout flm (worst max|err| 2.474e+00)", "flm"),
@@ -125,7 +136,7 @@ def main():
                 d = stamp(os.path.join(tmp, "joint-" + want), f"tile_order={got}\ntile_check={line}\n")
                 check(claim_of(d)[0] == "FATAL", f"and the planner refuses a stamp of {got!r} (the joint)", "")
 
-        # 6. A real plan is not written for the fatal case: `generate` has to raise, not just warn.
+        # 7. A real plan is not written for the fatal case: `generate` has to raise, not just warn.
         #    Synthesised minimally so this stays stdlib: the refusal happens before any tensor is read.
         bad = stamp(os.path.join(tmp, "gen-fatal"), "tile_order=unknown\ntile_check=matches NO layout\n")
         with open(os.path.join(bad, "config.json"), "w", encoding="utf-8") as f:

@@ -201,6 +201,12 @@ def tile_order_claim(model_dir: str) -> tuple[str, str]:
                 fields[k.strip()] = v.strip()
     order = fields.get("tile_order", "")
     checked = fields.get("tile_check", "")
+    if not order:
+        # A stamp written before this field existed records provenance and says NOTHING about the tiles, so
+        # it is no evidence rather than evidence against: both repack-cache directories on this box
+        # (~/.cache/1bit/q4nx/Qwen3-0.6B-Q4_K_M and ZR1-1.5B-Q4_K_M) carry exactly that stamp, and treating
+        # it as a measurement would be this check breaking two working directories.
+        return "engine-1", ""
     if order == "engine-1":
         return "engine-1", f"tile order measured at repack: {checked}" if checked else ""
     if order == "unverified":

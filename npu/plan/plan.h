@@ -126,6 +126,16 @@ struct Plan {
     // "causal" is the default and the only mode that can generate; "noncausal_full_attention" is a
     // prompt-encoding mode (every full-attention layer sees the whole prompt, which is what a d3
     // readout pack is trained with), so the forward refuses to generate with it by name.
+    // The q4_1 tile ORDER the container's payload is written in (engine#1110).  A container from another
+    // converter can be a different order, and a wrong order decodes as *noise with no error at all* --
+    // measured: one FLM converter checkout's containers answer a repeated single token (five times the same
+    // character) where ours answers " Paris.", and every structural check passes either way (same tensor
+    // names, dtypes, byte counts and chunk kinds).  "engine-1" is what tools/npu_plan.py writes and
+    // the only order this decoder implements; absent means the same thing, so every container written
+    // before this field existed keeps loading, and present-but-unknown is a refusal naming the id --
+    // the only point at which a mis-ordered container can be caught before it answers confidently and
+    // wrongly.
+    std::string tile_order = "engine-1";
     std::string attention_mode = "causal";
     bool noncausal() const { return attention_mode == "noncausal_full_attention"; }
     // Where the decode family is looked for, in order: which given path it hangs off, and the
@@ -171,6 +181,15 @@ struct Plan {
             if (p.layout != "rm" && p.layout != "b8" && p.layout != "pb16i" && p.layout != "t2s")
                 throw PlanError("plan: " + path + " container.layout \"" + p.layout +
                                 "\" is not rm, b8, pb16i or t2s");
+            // Optional, defaulted on purpose: a container written before this field existed is in our
+            // order, so this is not a format bump.  An id we do not implement is refused rather than
+            // decoded at a guess (engine#1110).
+            p.tile_order = c.value("tile_order", "engine-1");
+            if (p.tile_order != "engine-1")
+                throw PlanError("plan: " + path + " container.tile_order \"" + p.tile_order +
+                                "\" is not \"engine-1\", the only q4_1 tile order this engine decodes: "
+                                "re-convert the model with this repo's tools/npu_plan.py rather than serving tiles "
+                                "whose order we would have to guess (engine#1110)");
         }
         if (j.contains("fusion")) {
             const auto& fz = obj(j, "fusion", path);

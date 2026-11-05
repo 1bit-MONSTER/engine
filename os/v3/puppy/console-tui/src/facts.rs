@@ -1045,43 +1045,52 @@ pub fn is_poll_noise(line: &str) -> bool {
 /// Wrap on spaces so nothing is ever cut inside a word. A single word longer than `width` is cut as a last
 /// resort (it is a path or a token, not prose).
 pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
+    wrap_hanging(text, width, width)
+}
+
+/// `wrap_words`, but the lines after the first get `rest` cells instead of `first`.
+///
+/// A caller that draws a continuation row with an indent (`"  …"`) must take those cells out of the wrap:
+/// wrapping to the pane width and THEN indenting makes the row two cells wider than the pane, and the widget
+/// clips the end of it - measured at 80x25 on a wrapped Lemonade record, which lost `a38` and drew `a3` (both
+/// a lost word and a word cut in the middle, the two things this module promises never happen). `rest` is the
+/// room left after the indent, so `wrap_hanging(t, w, w - 2)` is the shape every indenting caller wants.
+///
+/// Widths are counted in CHARS, not in terminal cells: a log or a model name that carries double-width glyphs
+/// can still overrun its row by one cell per glyph. Upgrade to a width table if a box carries CJK log text.
+pub fn wrap_hanging(text: &str, first: usize, rest: usize) -> Vec<String> {
+    let first = first.max(1);
+    let rest = rest.max(1);
+    let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     for word in text.split_whitespace() {
-        if word.chars().count() > width {
+        let mut todo = word.to_string();
+        loop {
+            // the limit of the row `cur` is being packed onto: the opening one, or one a caller will indent
+            let width = if out.is_empty() { first } else { rest };
+            let space = usize::from(!cur.is_empty());
+            if cur.chars().count() + space + todo.chars().count() <= width {
+                if space == 1 {
+                    cur.push(' ');
+                }
+                cur.push_str(&todo);
+                break;
+            }
             if !cur.is_empty() {
+                // it may still fit a line of its own, and that line's limit is the narrower one
                 out.push(std::mem::take(&mut cur));
+                continue;
             }
-            let mut w = word.chars();
-            loop {
-                let piece: String = w.by_ref().take(width).collect();
-                if piece.is_empty() {
-                    break;
-                }
-                let more = w.clone().next().is_some();
-                if more {
-                    out.push(piece);
-                } else {
-                    cur = piece;
-                    break;
-                }
+            // `cur` is empty and the word is wider than a whole line: cut it, as a last resort
+            let mut it = todo.chars();
+            let piece: String = it.by_ref().take(width).collect();
+            let tail: String = it.collect();
+            if tail.is_empty() {
+                cur = piece;
+                break;
             }
-            continue;
-        }
-        let extra = if cur.is_empty() {
-            word.chars().count()
-        } else {
-            word.chars().count() + 1
-        };
-        if cur.chars().count() + extra > width {
-            out.push(std::mem::take(&mut cur));
-            cur = word.to_string();
-        } else {
-            if !cur.is_empty() {
-                cur.push(' ');
-            }
-            cur.push_str(word);
+            out.push(piece);
+            todo = tail;
         }
     }
     if !cur.is_empty() {
@@ -1538,6 +1547,35 @@ mod tests {
         assert_eq!(human_uptime(2 * 3600 + 13 * 60), "2h 13m");
         assert_eq!(human_uptime(3 * 86400 + 60), "3d 0h 1m");
         assert_eq!(human_bytes(62277025792), "58G");
+    }
+
+    #[test]
+    fn a_continuation_fits_the_row_it_is_drawn_on() {
+        // The indent a caller adds to a continuation row is part of that row's budget. Wrapping to the full
+        // width and indenting afterwards put the row two cells past the pane, and the widget clipped the end:
+        // at 80x25 a wrapped Lemonade record lost `a38` and drew `a3`. This holds the two widths apart.
+        let text = "LEM a01 a02 a03 a04 a05 a06 a07 a08 a09 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22";
+        for w in 8..=120usize {
+            let lines = wrap_hanging(text, w, w.saturating_sub(2));
+            for (i, line) in lines.iter().enumerate() {
+                let room = if i == 0 { w } else { w.saturating_sub(2) };
+                assert!(
+                    line.chars().count() <= room.max(1),
+                    "width {w}: row {i} is {} cells in a {room}-cell row: {line:?}",
+                    line.chars().count()
+                );
+            }
+            // and nothing is lost on the way, which is the half the width check cannot see
+            let joined: Vec<&str> = lines.iter().flat_map(|l| l.split_whitespace()).collect();
+            assert_eq!(joined.join(" "), text, "width {w} lost or reordered text");
+        }
+        // the shape is unchanged when the two agree (every caller that does not indent keeps wrap_words)
+        for w in 1..=40usize {
+            assert_eq!(
+                wrap_words("alpha beta gamma delta", w),
+                wrap_hanging("alpha beta gamma delta", w, w)
+            );
+        }
     }
 
     #[test]

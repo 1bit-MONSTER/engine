@@ -301,7 +301,10 @@ kernel-level advantage is therefore at most **1.33×**, and it could be none at 
 cause is stated as open rather than as dispatch.
 
 The next step is a profile, not a redesign: `NPU_C_SYNC_PROF=1` (engine#988) prints the C-sync counters per call,
-and a per-call timer inside `gemm_q8` separates launch, wait, sync and epilogue. What a *fix* would look like if
+and `ONEBIT_EP_QDQ_PROF=1` (documented with the QDQ knobs) has `gemm_q8` sum its own wall time per leg — the
+device call (BO writes, launch, both syncs, the wait), the shared epilogue and the host loop — so two runs that
+differ only in the leg price that leg on the graph's own int8 bytes, which is the one thing the probe above
+could not do. What a *fix* would look like if
 (1) dominates is one launch covering many projections — a resident weight layout and a pass-level submission,
 rather than the per-projection ELF this leg uses — which is also why the threshold discussion above stands
 unchanged: `kDeviceMinRows` is about one call, and the model-level question is about 196 of them.
@@ -420,7 +423,14 @@ device is busy rather than failing someone else's run.
 ORT's graph transformations fold them back into float ops, which is what a quantised EP needs to see;
 `ONEBIT_EP_QDQ_ONLY=1` restricts the EP to the fused groups so a measurement of a real quantised model
 is not distorted by float matmuls landing on the host kernel. `ONEBIT_EP_QDQ_DEBUG=1` makes
-`GetCapability` log why each `MatMul` was refused.
+`GetCapability` log why each `MatMul` was refused. `ONEBIT_EP_QDQ_PROF=1` has the fused path report where
+its own wall time went, as one line per process at exit —
+`qdq_prof calls_dev=… calls_host=… rows_dev=… rows_host=… dev_call_ms=… dev_epi_ms=… host_ms=…`, split into
+the device call (kernel, BO writes, both syncs, the wait), the epilogue both legs share, and the host loop —
+so two runs that differ only in the leg price that leg on the graph's own int8 bytes, which is the one thing
+a per-call probe timing synthetic operands cannot do. It writes to the EP trace when `ONEBIT_EP_TRACE` is set
+and to stderr when it is not: a knob whose only output can silently vanish is how a debugging session gets
+lost, and this file already paid for that once.
 
 ## Status
 

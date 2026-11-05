@@ -186,7 +186,12 @@ impl Facts {
                     f.models.loaded = loaded;
                 }
                 f.npu.busy = busy_npu;
-                f.engine = engine_of(&f.models.loaded, &f.models.engines, &health_devices(&body));
+                f.engine = engine_of(
+                    &f.models.loaded,
+                    json_str(&body, "model_loaded").as_deref(),
+                    &f.models.engines,
+                    &health_devices(&body),
+                );
             }
             if let Some(body) = get("/api/v1/stats", key.as_deref(), Duration::from_secs(2)) {
                 f.stats = stats_from(&body);
@@ -742,14 +747,22 @@ pub fn models_from(json: &str) -> Models {
 /// no configured backend the recipe stands alone.
 pub fn engine_of(
     loaded: &[String],
+    serving: Option<&str>,
     engines: &[Engine],
     devices: &[(String, String)],
 ) -> Option<String> {
-    let name = loaded.first()?;
-    let e = engines.iter().find(|e| &e.model == name)?;
+    // Lemonade loads one model per type (`max_models`: llm, embedding, …), so `loaded` is load order and its first
+    // entry can be an embedding while the llm is the one answering: `model_loaded` is the box's "last used".
+    let e = serving
+        .and_then(|n| engines.iter().find(|e| e.model == n))
+        .or_else(|| {
+            loaded
+                .iter()
+                .find_map(|n| engines.iter().find(|e| &e.model == n))
+        })?;
     let device = devices
         .iter()
-        .find(|(n, _)| n == name)
+        .find(|(n, _)| n == &e.model)
         .map(|(_, d)| d.as_str());
     Some(match device.or(e.backend.as_deref()) {
         Some(backend) => format!("{} ({backend})", e.recipe),
@@ -1142,25 +1155,65 @@ mod tests {
         ],"status":"ok"}"#;
         // health's device wins over the configured backend: it is what is answering
         assert_eq!(
-            engine_of(&loaded, &m.engines, &health_devices(health)).as_deref(),
+            engine_of(&loaded, None, &m.engines, &health_devices(health)).as_deref(),
             Some("llamacpp (gpu)")
         );
         // no health entry -> the configured backend
         assert_eq!(
-            engine_of(&loaded, &m.engines, &[]).as_deref(),
+            engine_of(&loaded, None, &m.engines, &[]).as_deref(),
             Some("llamacpp (gpu)")
         );
         // a model the catalogue does not know, or nothing loaded at all
         let unknown = vec!["not-in-the-catalogue".to_string()];
-        assert_eq!(engine_of(&unknown, &m.engines, &[]), None);
-        assert_eq!(engine_of(&[], &m.engines, &[]), None);
+        assert_eq!(engine_of(&unknown, None, &m.engines, &[]), None);
+        assert_eq!(engine_of(&[], None, &m.engines, &[]), None);
         // a recipe with no backend reported at all: the recipe stands alone, nothing is invented
         let bare = r#"{"data":[{"id":"x","recipe":"llamacpp","downloaded":true}],"object":"list"}"#;
         let bm = models_from(bare);
         assert_eq!(bm.engines[0].backend, None);
         assert_eq!(
-            engine_of(&["x".to_string()], &bm.engines, &[]).as_deref(),
+            engine_of(&["x".to_string()], None, &bm.engines, &[]).as_deref(),
             Some("llamacpp")
+        );
+    }
+
+    #[test]
+    fn the_engine_is_the_model_answering_not_the_first_loaded() {
+        // Lemonade's own /v1/health shape: `max_models` allows one model per type, `all_models_loaded[]` carries
+        // the embedding beside the llm in load order, and `model_loaded` names the one last accessed.
+        let models = r#"{"data":[
+            {"id":"nomic-embed","recipe":"llamacpp","downloaded":true,"recipe_options":{"llamacpp_backend":"cpu"}},
+            {"id":"qwen3-0.6b-1bit","recipe":"flm","downloaded":true,"recipe_options":{"onebit_backend":"npu"}}
+        ],"object":"list"}"#;
+        let m = models_from(models);
+        let loaded = vec!["nomic-embed".to_string(), "qwen3-0.6b-1bit".to_string()];
+        let health = r#"{"model_loaded":"qwen3-0.6b-1bit","all_models_loaded":[
+            {"model_name":"nomic-embed","type":"embedding","device":"cpu"},
+            {"model_name":"qwen3-0.6b-1bit","type":"llm","device":"npu"}
+        ],"status":"ok"}"#;
+        let devices = health_devices(health);
+        // load order says embedding; the box says the NPU chat model is the one answering
+        assert_eq!(
+            engine_of(
+                &loaded,
+                json_str(health, "model_loaded").as_deref(),
+                &m.engines,
+                &devices
+            )
+            .as_deref(),
+            Some("flm (npu)")
+        );
+        // a `model_loaded` the catalogue no longer knows must not blank the row: the loaded list still resolves
+        let stale = r#"{"model_loaded":"gone","all_models_loaded":[]}"#;
+        assert_eq!(
+            engine_of(
+                &loaded,
+                json_str(stale, "model_loaded").as_deref(),
+                &m.engines,
+                &devices
+            )
+            .as_deref(),
+            Some("llamacpp (cpu)")
         );
     }
 

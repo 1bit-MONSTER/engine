@@ -1204,6 +1204,15 @@ so:
 
 A real failure is unchanged apart from being reported: the last attempt's exception still reaches the
 caller after the window closes, and the log now names the attempt count and the reason.
+
+One load failure is not transient and says so: the driver refusing to create a hardware context
+(`code 102`, `errc::ctx_create`) with `No such device` means the array is in the state a TDR leaves
+behind when it could not restart a context, and it keeps refusing until the driver is reloaded. The
+give-up report adds the one action that works:
+
+```
+1bit unified: the NPU array is refusing hardware contexts: reload the driver (modprobe -r amdxdna && modprobe amdxdna)
+```
 `tests/npu_load_retry_test.cpp` (ctest `npu_load_retry`, in CI) covers the schedule, the window, a
 transient recovery, a persistent failure, and a zero window (one attempt, no retry).
 

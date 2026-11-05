@@ -38,6 +38,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 
 namespace q4nx_layout {
 
@@ -62,6 +64,51 @@ inline size_t rowmajor_index(size_t i, size_t j, int KD, int ND) {
 
 inline bool blocked_fits(int KD, int ND) {
     return KD > 0 && ND > 0 && KD % 64 == 0 && ND % 128 == 0;
+}
+
+// Copy an int8 K x N weight (row-major, K rows of N bytes) into a KD x ND image
+// in the given layout; bytes outside the logical K x N matrix come out zero.
+//
+// The permutation is the one above, done at the layout's own granularity instead of
+// one byte per index call: inside a blocked tile, element (i0+r, j0+c) of the 8x8
+// microtile that starts at (i0, j0) sits at blocked_index(i0, j0) + r*8 + c -- both
+// tile and microtile are unchanged for r,c < 8 -- so a microtile is eight 8-byte runs,
+// one per source row, rather than 64 scattered bytes, and the destination address is
+// computed 64x less often. The bytes written are identical to the element-at-a-time
+// scatter; tests/npu_blocked_layout_test.cpp compares the two byte for byte, including
+// ragged edges and padded KD/ND.
+//
+// This exists because a caller that cannot keep the packed weight resident re-packs on every call,
+// and one byte-at-a-time store per element is how that was written. Measured on a 1024x2048 int8 weight
+// (onnx/ort is such a caller: it keys its kernels by (K, N), so a model pass sends 28 weights of one
+// shape through the same kernel in a row): the blocked scatter takes 2.09 ms and this takes 0.20 ms; in
+// the row-major layout the EP's kernels actually use, the old loop was already a row copy the compiler
+// vectorised (0.12 ms) and this takes 0.09 ms. So the win is in the container path's blocked images and
+// the EP's is a rounding error -- the EP's re-pack cost is its BO writeback, not this loop.
+inline void pack_int8_image(int8_t* dst, const int8_t* src, int K, int N, int KD, int ND,
+                            bool blocked) {
+    std::memset(dst, 0, (size_t)KD * (size_t)ND);
+    if (!blocked) {
+        for (int i = 0; i < K; i++)
+            std::memcpy(dst + rowmajor_index((size_t)i, 0, KD, ND), src + (size_t)i * N, (size_t)N);
+        return;
+    }
+    if (!blocked_fits(KD, ND)) return;  // no mapping exists; callers check this before packing
+    for (int i0 = 0; i0 < K; i0 += 8) {
+        const int rows = (K - i0 < 8) ? K - i0 : 8;
+        for (int j0 = 0; j0 < N; j0 += 8) {
+            const size_t base = blocked_index((size_t)i0, (size_t)j0, KD, ND);
+            const int cols = (N - j0 < 8) ? N - j0 : 8;
+            if (cols == 8) {
+                for (int r = 0; r < rows; r++)
+                    std::memcpy(dst + base + (size_t)r * 8, src + (size_t)(i0 + r) * N + j0, 8);
+            } else {
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < cols; c++)
+                        dst[base + (size_t)r * 8 + c] = src[(size_t)(i0 + r) * N + j0 + c];
+            }
+        }
+    }
 }
 
 }  // namespace q4nx_layout

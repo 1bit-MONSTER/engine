@@ -199,7 +199,11 @@ def q8_ground_truth(gguf_path, container_name):
     from gguf_to_q4nx import hf_name          # the packer's own GGUF -> Q4NX name mapping
     reader = gguf.GGUFReader(gguf_path)
     for t in reader.tensors:
-        if hf_name(t.name) != container_name:
+        try:
+            name = hf_name(t.name)
+        except (SystemExit, KeyError, ValueError):   # a GGUF entry with no Q4NX name: not ours
+            continue
+        if name != container_name:
             continue
         # ggml stores [rows, columns]; the tile is rows-major from the source's own order.
         flat = np.asarray(dequantize(t.data, t.tensor_type), dtype="float32").reshape(-1)
@@ -240,6 +244,11 @@ def check_q8_layout(path, gguf_path, samples=3):
         if not (a[0] >= 0.99 and a[1] <= 0.10 and a[0] > b[0]):
             errors.append(f"{name}: not the layout npu/q4nx.cpp decodes "
                           f"(A corr {a[0]:+.4f} rel-rms {a[1]:.4f}, B corr {b[0]:+.4f})")
+    if not rows:
+        # Nothing was compared: passing here would be the same silent success this mode exists to
+        # remove, e.g. the wrong GGUF for this container.
+        errors.append(f"no Q8 tensor of {path} matched a tensor in {os.path.basename(gguf_path)}: "
+                      f"nothing was verified")
     return errors, rows
 
 

@@ -3677,18 +3677,25 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
     }
 
-    BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
     // batch term's interior is read per phase instead of inferred from the loop's total.
+    //
+    // The counters are zeroed BEFORE BatchPhases snapshots them.  BatchPhases reports this call's cost as a
+    // delta against the values it saw at construction, so zeroing afterwards (the first version of this, #1056)
+    // made every [bl] field a difference against the *previous* pass: `core -4.3` and `gemm -355.7` on a real
+    // ticket (2026-11-05 01:31) are what that looks like.  The [bs] line never had the problem -- it reads the
+    // g_ph it zeroes itself -- so the conclusions drawn from [bs] stand; the [bl] medians between #1056 and this
+    // fix do not, and are re-taken.
     const bool phb = phprof_on();
-    const auto tp_bs = phb ? std::chrono::steady_clock::now()
-                           : std::chrono::steady_clock::time_point{};
-    auto tp_lap = tp_bs;
-    BatchPhaseScope _batch_scope(phb);
     if (phb) {
         g_ph = StepPhases{};
         for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
     }
+    BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
+    const auto tp_bs = phb ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto tp_lap = tp_bs;
+    BatchPhaseScope _batch_scope(phb);
     const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
     const int i_o   = idx_of(Q4NX_DESIGN_O);
     const int i_gu  = idx_of(Q4NX_DESIGN_GU);

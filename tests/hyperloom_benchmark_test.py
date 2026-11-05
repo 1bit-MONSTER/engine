@@ -150,6 +150,43 @@ def main():
         assert bench.device_stack()["hsa_runtime"] is None, bench.device_stack()
     os.environ.pop("IREE_HAL_AMDGPU_LIBHSA_PATH")
 
+    # And the conditions it ran in: a score is measured on a shared box, and on 2026-11-01 the same
+    # workload at the same configuration produced 44.69 (quiet die, no swap) and 31.68 (85 GB of 122 GB
+    # in use, 37 GB of swap, die climbing) — both gate-passing, and the JSONs could not tell them apart.
+    # Read from this box rather than stubbed: these are the files the field reads, and every one of them
+    # has to come back a number here. Absent is a null, never a zero or a guess, so the fake root check
+    # below stands in for a box that exposes nothing.
+    box = bench.box_conditions()
+    assert box["tctl_c"] is None or 20.0 < box["tctl_c"] < 120.0, box
+    assert box["gtt_used_gib"] is not None and box["gtt_total_gib"] is not None, box
+    assert 0.0 <= box["gtt_used_gib"] <= box["gtt_total_gib"], box
+    assert box["mem_available_gib"] is not None and box["mem_available_gib"] > 0, box
+    # The hwmon channel is found by label, not by a hardcoded index: the k10temp Tctl has come back as
+    # hwmon2 and as hwmon4 across six reboots in three days. A root with no Tctl label yields null.
+    real_root = bench.HWMON_ROOT
+    with tempfile.TemporaryDirectory() as tmp:
+        bench.HWMON_ROOT = pathlib.Path(tmp)
+        assert bench.die_temp_c() is None, bench.die_temp_c()
+        (pathlib.Path(tmp) / "hwmon7").mkdir()
+        (pathlib.Path(tmp) / "hwmon7/temp1_label").write_text("edge\n", encoding="ascii")
+        (pathlib.Path(tmp) / "hwmon7/temp1_input").write_text("99000\n", encoding="ascii")
+        assert bench.die_temp_c() is None  # a different sensor is not the die
+        (pathlib.Path(tmp) / "hwmon7/temp1_label").write_text("Tctl\n", encoding="ascii")
+        assert bench.die_temp_c() == 99.0, bench.die_temp_c()
+        bench.HWMON_ROOT = real_root
+    # Same class, other direction: a counter the box does not expose is null, not 0.
+    assert bench.meminfo_gib(pathlib.Path("/nonexistent/mem_info_gtt_used"), 2 ** 30) is None
+    # The arm's own spread, not just its start: the aborted 2026-11-01 arm was claimed at 54 C and hit
+    # 93 C inside the run, so the summary keeps both ends and says how many samples it saw.
+    samples = [{"tctl_c": 54.0, "gtt_used_gib": 1.0, "gtt_total_gib": 120.0, "mem_available_gib": 9.0},
+               {"tctl_c": 93.0, "gtt_used_gib": 1.5, "gtt_total_gib": 120.0, "mem_available_gib": 8.0},
+               {"tctl_c": None, "gtt_used_gib": 2.0, "gtt_total_gib": 120.0, "mem_available_gib": 7.0}]
+    got = bench.box_summary(samples)
+    assert got["tctl_c"] == 54.0 and got["tctl_c_max"] == 93.0 and got["tctl_c_min"] == 54.0, got
+    assert got["tctl_samples"] == 2, got  # the unreadable sample counts as nothing, not as 0 C
+    assert got["gtt_used_gib"] == 1.0, got  # start GTT, not the last one
+    assert bench.box_summary([]) is None
+
     # And the verdict has to name what it was relative to: `HL_STATE` is per-box and the base logits are
     # regenerated when missing, so a KLD number reads PASS against a reference the JSON never named.
     with tempfile.TemporaryDirectory() as tmp:

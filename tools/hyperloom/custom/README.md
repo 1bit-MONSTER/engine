@@ -127,6 +127,16 @@ same KLD mean can read `PASS` against a reference the report never named. At 1e-
 legitimately changes rounding (KV cache types, flash-attn, micro-batch) will usually fail the KLD half — that is
 the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 
+Every result also records the conditions it was measured in, in `bench_summary.box`: the die temperature
+(`tctl_c`, found by the hwmon channel's `Tctl` label, since the index moves between boots) with `tctl_c_min` /
+`tctl_c_max` over samples taken at each phase boundary and `tctl_samples` saying how many were readable, the
+box-wide GTT in use at start (`gtt_used_gib` of `gtt_total_gib`) and `mem_available_gib` at start. The score is
+measured on a shared box: the same configuration produced 44.69 with a quiet die and 31.68 with 85 GB in use
+and 37 GB of swap, and both passed the gate, which is about the output and not about comparability. Each field
+is `null` where the box does not expose it, so an unreadable sensor is never read back as a clean arm. An arm
+killed mid-run (the 2026-11-01 thermal abort at 93 C) still writes no result — the fields describe arms that
+finished, and a killed arm is reported by its absence.
+
 ## Levers
 
 `levers.json` seeds EXPLORE; the model can still propose its own. Each entry sets environment that

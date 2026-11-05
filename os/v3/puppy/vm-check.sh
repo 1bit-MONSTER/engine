@@ -428,6 +428,26 @@ rows = [
                      "if 1bit-tty1 1 | grep -q 'Show the API key' && 1bit-tty1 1 | grep -q 'Reboot / power off'; then "
                      "echo tty1-menu; elif 1bit-tty1 1 | grep -q 'root@'; then echo tty1-bare-shell; "
                      "else echo tty1-nothing; fi", "tty1-menu"),
+    # Cycle 26, item 1 (owner: "CONSOLE GARBLED ... painting over the TUI panels and the menu"): the row that would have
+    # caught it, and the one that keeps it caught. The console TUI repaints only the cells whose CONTENT changed since its
+    # own last frame, so before #1093 ONE line written to tty1 was a wrong screen for ever - measured on the shipped
+    # 2fc6909c…: two stray lines still on screen 4.3 s later AND after a keypress sent through the keyboard. The appliance
+    # keeps writers on this screen by design (`1bit-release-check` announces an NPU hold, `puppy-check.sh` does the same),
+    # so the answer is not "nobody may write" but "a stray line costs one second". This row writes two of them into the
+    # console the TUI owns, waits out one repaint, and asks for the same landmarks U2 menu asks for. On an image whose
+    # console is the dialog menu (no `1bit-console-tui`) it SKIPs: `dialog` repaints on input by nature, so the question does
+    # not apply there. Red/green proved in ~/wt/tui-vm/rowproof-console-heals.sh (one boot, both binaries): RED on
+    # 2fc6909c… ("console-garbled actions=9 stray=2"), GREEN on the merged artifact.
+    ("U2 console heals", "if ! pgrep -f 1bit-console-tui > /dev/null 2>&1; then echo console-heals-skip-no-tui; "
+                     "elif [ ! -w /dev/tty1 ]; then echo console-heals-skip-no-tty1; "
+                     "else printf '%s\\n' \"[  999.000000] amdxdna 0000:c6:00.1: [drm] *ERROR* stray line one\" "
+                     "\"[  999.100000] amdxdna 0000:c6:00.1: [drm] *ERROR* stray line two\" > /dev/tty1 2>/dev/null; "
+                     "sleep 2; scr=$(1bit-tty1 1 2>/dev/null); "
+                     "n=$(printf '%s\\n' \"$scr\" | grep -cE '^ ?[1-9] [A-Z]'); stray=$(printf '%s\\n' \"$scr\" | grep -c 'stray line'); "
+                     "echo \"actions=$n stray=$stray\"; "
+                     "if [ \"$n\" -ge 9 ] && [ \"$stray\" -eq 0 ] && printf '%s\\n' \"$scr\" | grep -q 'Reboot / power off' "
+                     "&& printf '%s\\n' \"$scr\" | grep -q 'Show the API key'; then echo console-heals; "
+                     "else echo console-garbled; fi; fi", "console-heals"),
     # every line the owner asked for, by name and present rather than at column 0 (two of them share a line);
     # `Secure` matches "Secure Boot", and the four-letter words are unambiguous in this block
     ("U2 menu status", "1bit-console-menu --status 2>&1 | head -10; "

@@ -134,6 +134,13 @@ vm_gone() { echo "the VM was no longer running when this row ran (qemu budget ${
 
 ARTIFACT=$iso python3 - "$work" "$iso" > "$work/rows.txt" 2>&1 <<'PY'
 import socket, sys, time, os, re, subprocess, shutil
+
+# The shipping driver's srcversion for the MEDIUM this harness is checking. Cycle 26 carries 0011v2: 0008+0009+0011+0011v2,
+# built WITHOUT the 0010 debugfs hook (srcversion EE1F36A2B9BA294CE11AD80, verified: no `tdr_test` string). This box also
+# holds the 0010 hook build for testing, and the two are indistinguishable by vermagic, signer or filename - only
+# srcversion separates them, so the medium has to answer for the build it is meant to carry.
+# Another cycle's medium: AMDXDNA_SRCVERSION=<its value> vm-check.sh <img> <work>.
+WANT_SV = os.environ.get("AMDXDNA_SRCVERSION", "EE1F36A2B9BA294CE11AD80")
 work = sys.argv[1]
 artifact = sys.argv[2]
 log = open(os.path.join(work, "serial.log"), "ab", buffering=0)
@@ -690,6 +697,13 @@ rows = [
     # would silently load the in-tree driver.
     ("U4 our driver", "modinfo -n amdxdna; modinfo -F srcversion amdxdna; modinfo -n ec_su_axb35",
                       "/updates/amdxdna.ko"),
+    # Cycle 26: `path` and `signed` cannot tell our two builds apart - the shipping 0011v2 and the 0010 debugfs-hook build
+    # share vermagic, signer and filename, and only srcversion differs (measured: EE1F36A2... vs 349FDC99... on the test
+    # box). So the medium has to answer for the build it is supposed to carry, the way pi-release's `u5-amdxdna-oot` row
+    # does; a hook build passing this gate is exactly the defect this row exists for. Any other cycle's medium passes its
+    # own value in: AMDXDNA_SRCVERSION=<sv> vm-check.sh ...
+    ("U4 driver build", f"sv=$(modinfo -F srcversion amdxdna 2> /dev/null); echo srcversion=$sv want={WANT_SV}; "
+                      f"[ \"$sv\" = \"{WANT_SV}\" ] && echo driver-is-the-cycle-build", "driver-is-the-cycle-build"),
     # And the module has to be the one THIS kernel can load and this appliance trusts: vermagic must name the image's
     # release and the signer must be our MOK. Both are asserted in one token, because one substring per row is all the
     # harness compares - printing them and matching the path, as this row did before pi-prs' verdict, passed a module

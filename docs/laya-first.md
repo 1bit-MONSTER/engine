@@ -173,7 +173,7 @@ So a GGUF row gains one required field, and a Q4NX row the same field read from 
 
 | field | meaning |
 |---|---|
-| `template_sha256` | the sha256 of the exact `tokenizer.chat_template` bytes the row expects (a GGUF's metadata key, or a Q4NX container's `tokenizer_config.json` string); `"none"` for a row that must carry no template. Omitting it is a table error, not a default — a row with no expectation is a row nothing checks ([template-publishing.md](template-publishing.md)) |
+| `template_sha256` | the sha256 of the exact `tokenizer.chat_template` bytes the row expects (a GGUF's metadata key, or a Q4NX container's `tokenizer_config.json` string); `"none"` for a row that must carry no template. Omitting it is a table error, not a default — a row with no expectation is a row nothing checks ([template-publishing.md](template-publishing.md)). **Required when §8 step 3 lands; no row carries it today — see the last paragraph of this section.** |
 
 Two checks, in order, and both are refusals of *that row*, never of the request:
 
@@ -193,12 +193,27 @@ the table), and the load-time check is the only one that covers a model loaded b
 router, months later. Neither is a trust anchor for a model nobody has pinned — for those the line is
 the deliverable, and it is what makes the difference visible in a log.
 
-`~/.local/share/1bit/laya-first.json` ships with the digests measured on 2026-11-05 for the rows above
-(`zaya1-8b-Q4_K_M.gguf`, `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` and `Qwen3.8-27B-UD-Q4_K_XL.gguf`
-are the same files the engine's `config/template-pins.json` already pins; a Q4NX row is checked from
-its `tokenizer_config.json` because it has no GGUF). Adding a row means adding its digest — the table
-is not allowed to grow a row that skips that step, and the table's validator (§8 step 3) fails one that
-does.
+**What runs today, and what does not.** The field and the pull-time check are §8 step 3, and neither is
+in the tree yet: `config/laya-first.json` (compiled in as `laya_first_default.h`) carries no
+`template_sha256`, nothing in `app/`, `src/`, `tests/` or `os/` reads one, and no installed
+`<laya home>/laya-first.json` ships with digests. So a routed pull is checked at exactly **one** place
+today — **load time**, against the engine's own `config/template-pins.json`, which pins 7 model names,
+three of them the rows above (`zaya1-8b-Q4_K_M.gguf` `b55ecfbbbc…`,
+`Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` `87710339d2…`, `Qwen3.8-27B-UD-Q4_K_XL.gguf`
+`12827f24b7…`; the `short` row's `Qwen3-0.6B-Q8_0.gguf` is not in that table). That check warns unless
+the row ships `--template-pin-strict` (§9), and it catches one thing only — the same name carrying a
+different template. A file under a new name, or a row whose digest nobody recorded, is visible only as
+the load line; that is the gap step 3 closes.
+
+When step 3 lands it will need one digest per row, and three of the four are in the tree **today** in
+`config/template-pins.json` — `zaya1-8b-q4_k_m.gguf` `b55ecfbbbc…`,
+`qwen3-coder-30b-a3b-instruct-q4_k_m.gguf` `87710339d2…`, `qwen3.8-27b-ud-q4_k_xl.gguf` `12827f24b7…` —
+because those rows are the same files the load-time check already pins. The fourth, `short`'s
+`Qwen3-0.6B-Q8_0.gguf` `57f1fd00f0…`, is not in any table in this tree yet: it is measured, and it is added
+by #1158 (and recorded with every other file we serve and publish in `models/pins.json`, #1148). A Q4NX row
+is read from its `tokenizer_config.json` because it has no GGUF ([npu-chat-template.md](npu-chat-template.md)).
+Adding a row then means adding its digest: the table is not allowed to grow a row that skips that step, and
+the validator that fails one is part of step 3, not something to assume today.
 
 ### Device: HRX by default, and the NPU only when the GPU is busy or hot
 

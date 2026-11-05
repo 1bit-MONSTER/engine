@@ -88,16 +88,17 @@ pub fn mode() -> Mode {
 
 pub fn mode_in(root: &Path) -> Mode {
     let bit = |p: &str| root.join(p).exists();
-    // init's own markers first, in its own order: an installed boot touches `installed`, a live one touches `live`
+    // init's OWN rule first, because that is the decision: /data mounted with .installed on it is an installed boot,
+    // and the markers below are written FROM that decision. Marker-first ordering let a stale `live` marker outrank a
+    // real installed data partition - the console then said live on an installed box (measured in QEMU).
+    if bit("data/.installed") {
+        return Mode::Installed;
+    }
     if bit("etc/1bit/installed") {
         return Mode::Installed;
     }
     if bit("etc/1bit/live") {
         return Mode::Live;
-    }
-    // no marker (init has not run, or could not write it): init's rule, which needs /data to be the mounted one
-    if bit("data/.installed") {
-        return Mode::Installed;
     }
     Mode::Unknown
 }
@@ -1300,6 +1301,16 @@ mod tests {
         );
         fs::write(root.join("etc/1bit/live"), "").unwrap();
         assert_eq!(mode_in(&root), Mode::Live);
+        // ... and a real installed data partition outranks a stale `live` marker: init's own rule is the decision,
+        // the markers are written from it (this ordering was wrong in the first version - measured in QEMU)
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(root.join("data/.installed"), "").unwrap();
+        assert_eq!(
+            mode_in(&root),
+            Mode::Installed,
+            "a stale live marker outranked /data/.installed"
+        );
+        fs::remove_file(root.join("data/.installed")).unwrap();
         // an installed boot that somehow kept the live marker still reads installed: the marker init writes wins,
         // and it writes `installed` after the MODE banner
         fs::write(root.join("etc/1bit/installed"), "").unwrap();

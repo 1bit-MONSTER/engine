@@ -38,6 +38,21 @@ Layouts (both are 32x256 tiles of 5120 B: 512 scale, 512 min, 4096 codes):
   flm   codes are plain column major [col(256)][row-pair(16)]; the official
         gguf->Q4NX converter keeps Q4_0 as min 0 with *signed* nibbles (q-8).
 
+Which layout is validated against what (2026-11-05, ZR1-1.5B Q4_K_M, no device; two tensors,
+`ours`/`flm(signed)`/`flm(unsigned)`):
+
+  ours  both converters we can run agree with it -- the FLM_Q4NX_Converter in third_party/
+        (npu-rt-753-pr) decodes at requant scale (max|err| 2.96e-02 / 2.31e-02) and so does
+        our own pack.  This is the layout to gate on: it is what npu/forward reads.
+  flm   NOT validated against any container here.  amd-oss/FLM_Q4NX_Converter @d1d5232
+        ("update converter for q4_k") writes something that matches neither layout
+        consistently: 5.48e+00 under `ours`, 3.46e+00 under `flm(signed)`, and its Q6_K-sourced
+        tensors reach requant scale only under `flm(unsigned)` (2.31e-02) while its Q4_K-sourced
+        ones match none of the three.  So `--layout flm` is the decoder for the *pre-q4_k*
+        converter, and a BAD row from it means "this file is not that layout", not "this file is
+        wrong" (engine#1110).  Deliberately not "fixed" blind: nothing on this box could tell a
+        fix from a guess.
+
 usage:
   tools/q4nx_diff.py compare A/model.q4nx B/model.q4nx [--summary]
   tools/q4nx_diff.py decode  --gguf model.gguf --q4nx DIR --layout ours|flm [-v]

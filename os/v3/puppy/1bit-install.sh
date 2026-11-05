@@ -91,7 +91,22 @@ done
 [ -d /sys/firmware/efi ] || die "not booted under UEFI: this installer writes an ESP and a firmware entry, and neither can be written or tested without EFI"
 [ -d /sys/firmware/efi/efivars ] || die "efivarfs is not mounted, so efibootmgr cannot write the firmware entry (the appliance mounts it in /etc/init.d/03onboard-efivars)"
 
-src_esp=$(findfs LABEL="$ESP_LABEL" 2> /dev/null)
+# The ESP of the disk THIS SYSTEM BOOTED FROM - not the first 1BIT-OS the kernel enumerates. A machine that already
+# carries an installed disk has a second partition with this same label, and `findfs` then answers with whichever one
+# it finds: measured, a re-install copied that disk's ESP tree, whose grub.cfg was already rewritten to the other
+# disk's UUID, so the step-5 rewrite matched nothing and the install died 5/7 with "grub.cfg does not search this
+# disk's UUID" (engine#1164). The boot disk's own partitions are tried first; `findfs` stays as the fallback for a
+# boot whose /data came from somewhere other than the install medium.
+src_esp=
+for p in /sys/block/"$bootdisk"/"$bootdisk"*; do
+    [ -e "$p" ] || continue
+    n=/dev/$(basename "$p")
+    if [ "$(blkid -o value -s LABEL "$n" 2> /dev/null)" = "$ESP_LABEL" ]; then
+        src_esp=$n
+        break
+    fi
+done
+[ -n "$src_esp" ] || src_esp=$(findfs LABEL="$ESP_LABEL" 2> /dev/null)
 [ -n "$src_esp" ] || die "no $ESP_LABEL partition on this boot: the stick's own shim + grub are what the installed disk has to chain to"
 src_data=
 if grep -q " /data " /proc/mounts; then src_data=/data; else src_data=/initrd/mnt/dev_save; fi
@@ -185,8 +200,10 @@ say "== 7/7 firmware boot entry (#709)"
 # headless box waits for input for ever. So the entry is created first, then found again by the two things that
 # identify THIS one: the label it was created with and this disk's ESP partition GUID, which is what the firmware
 # prints in `efibootmgr -v` as HD(1,GPT,<partuuid>,...).
-esppart=$(blkid -s PARTUUID -o value "${dev}1" 2> /dev/null | head -1)
-[ -n "$esppart" ] || fail "cannot read the ESP's PARTUUID on ${dev}1, so the created entry cannot be identified"
+# the ESP by the name computed above (`${dev}1` is /dev/nvme0n11 on an NVMe disk, which reads as no ESP at all -
+# measured: the install wrote the whole disk and then failed 7/7 on the internal NVMe, engine#1161)
+esppart=$(blkid -s PARTUUID -o value "$esp" 2> /dev/null | head -1)
+[ -n "$esppart" ] || fail "cannot read the ESP's PARTUUID on $esp, so the created entry cannot be identified"
 efibootmgr -c -d "$dev" -p 1 -L "1bit OS" -l '\EFI\BOOT\BOOTX64.EFI' >> "$LOG" 2>&1
 fwm=$(efibootmgr -v 2> /dev/null)
 new=$(printf '%s\n' "$fwm" | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\)\* 1bit OS.*${esppart}.*/\1/p" | head -1)

@@ -149,6 +149,16 @@ fan_rpm() {
     for d in /sys/class/hwmon/hwmon*; do
         v=$(hwmon_read "$d/fan1_input" 2> /dev/null) && { printf '%s' "$v"; return 0; }
     done
+    # This board has NO fan input in hwmon at all (measured 5 Nov: hwmon0 acpitz, 1 nvme, 2 k10temp, 3 mt7925_phy0,
+    # 4 amdgpu - zero fan*_input), so the loop above can never answer here and every thermal line of the c25 take
+    # said `fan_rpm=n/a`. The fans are the EC's (ec_su_axb35, the same node 1bit-board drives), so read them there:
+    # fan1+fan2 as `a/b`. A 0 is a real reading and the low-temperature stop, not a missing sensor (c26 item 3).
+    ec=/sys/class/ec_su_axb35
+    if [ -d "$ec" ]; then
+        a=$(hwmon_read "$ec/fan1/rpm") || a=""
+        b=$(hwmon_read "$ec/fan2/rpm") || b=""
+        [ -n "$a" ] && { printf '%s/%s' "$a" "${b:-n/a}"; return 0; }
+    fi
     return 1
 }
 

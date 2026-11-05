@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: pi-hrx-fabric <fabric@1bit.local>
+Date: Thu, 5 Nov 2026 06:22:00 -0400
+Subject: [PATCH 2/2] accel/amdxdna: check the power-cycle throttle before
+ touching any context
+
+0004 stops a throttled power-cycle (-EBUSY from aie2_hw_reset() inside the rate-limit window) from being
+counted as the reset's failure, but the recovery still runs both context walks: every context is stopped
+and then restarted against an array that was NOT power-cycled. A restart that fails for that reason sets
+rarg.failed, and rarg.failed latches hw_dead - so "any two TDRs inside 60 s take the array" stays
+reachable through the other latch.
+
+Check the throttle first, under the dev_lock the recovery already holds, and return having touched
+nothing: no context stopped, no restart attempted, no hw_dead. Pending jobs stay pending and the next
+watchdog tick (tdr_timeout_ms=15000) retries once the window has passed. The -EBUSY handling in 0004 stays
+as belt-and-braces with a comment, since with dev_lock held for the whole pass it is not reachable.
+
+This is patch 0009 on strixhalo (2026-11-04). Verified: adding it to pin + 0001 + 0002 + 0004 leaves every
+.c/.h byte-identical to the sources the shipping build came from, and rebuilds to
+srcversion BBE1E5F0EE7A5FB235CA811 - the 0007+0008+0009 module.
+
+Signed-off-by: bong-water-water-bong <bong-water-water-bong@users.noreply.github.com>
+---
+ drivers/accel/amdxdna/aie2_tdr.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+--- a/drivers/accel/amdxdna/aie2_tdr.c
++++ b/drivers/accel/amdxdna/aie2_tdr.c
+@@ -143,6 +143,20 @@
+ 	return 0;
+ }
+ 
++/*
++ * aie2_tdr_recovery_throttled - is a power-cycle still inside the rate-limit window?
++ *
++ * aie2_hw_reset() refuses a second power-cycle within AIE2_HW_RESET_MIN_INTERVAL_MS with -EBUSY. That is "not yet",
++ * so the recovery must not be attempted at all: the array has not been power-cycled, which means every context would be
++ * stopped and restarted against a still-wedged device - and a restart that fails for that reason sets rarg->failed,
++ * which latches hw_dead. Same predicate as aie2_hw_reset() so the two cannot disagree.
++ */
++static bool aie2_tdr_recovery_throttled(struct amdxdna_dev_hdl *ndev)
++{
++	return time_before(jiffies,
++			   ndev->last_reset_jiffies + msecs_to_jiffies(AIE2_HW_RESET_MIN_INTERVAL_MS));
++}
++
+ static void aie2_tdr_recover_all(struct amdxdna_dev *xdna)
+ {
+ 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+@@ -151,6 +165,14 @@
+ 	bool fw_dead = false;
+ 	int ret;
+ 
++	if (aie2_tdr_recovery_throttled(ndev)) {
++		XDNA_WARN(xdna,
++			  "TDR recovery throttled: last power-cycle %u ms ago (< %d ms), retrying on the next watchdog tick; no context touched",
++			  jiffies_to_msecs(jiffies - ndev->last_reset_jiffies),
++			  AIE2_HW_RESET_MIN_INTERVAL_MS);
++		return;
++	}
++
+ 	amdxdna_for_each_client(xdna, client)
+ 		amdxdna_hwctx_walk(client, &fw_dead, NULL, aie2_tdr_stop_hwctx);
+ 

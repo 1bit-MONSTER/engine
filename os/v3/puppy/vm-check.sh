@@ -722,10 +722,11 @@ rows = [
     # (2) the boot's identity is one file, written once, and it carries every label a reviewer needs. Reading the
     # labels IS the check: a file that exists but says nothing is what a stub would produce.
     ("U5 boot proof", "p=$(1bit-proof path 2>/dev/null)/boot-proof.txt; ls -l \"$p\" 2>&1 | tail -1; "
-                     "for k in cmdline uname secureboot.efivar module.amdxdna amdxdna.tdr_timeout_ms firmware pci.devices memtotal_kb timeline.dmesg sha256sums; do "
-                     "grep -q \"^$k  \" \"$p\" 2>/dev/null || echo \"missing-$k\"; done; "
-                     "echo \"proof-lines=$(wc -l < \"$p\" 2>/dev/null || echo 0)\"",
-                     None),
+                     "miss=\"\"; for k in cmdline uname secureboot.efivar module.amdxdna amdxdna.tdr_timeout_ms firmware pci.devices memtotal_kb timeline.dmesg sha256sums; do "
+                     "grep -q \"^$k  \" \"$p\" 2>/dev/null || miss=\"$miss $k\"; done; "
+                     "n=$(wc -l < \"$p\" 2>/dev/null); echo \"proof-lines=${n:-0} missing=${miss:-none}\"; "
+                     "[ -z \"$miss\" ] && [ \"${n:-0}\" -ge 20 ] && echo boot-proof-complete",
+                     "boot-proof-complete"),
     # (3) thermals are sampled ONLY while something is serving - so the two files must agree, and an idle box must
     # not be writing a power log all day. Both directions are failures the row names.
     ("U5 thermal gate", "eng=$(pgrep -f '/opt/1bit-package/1bit/1bit' 2>/dev/null | wc -l); "

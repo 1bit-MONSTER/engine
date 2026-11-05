@@ -1,5 +1,21 @@
 {
  "pins": {
+  "qwen3-0.6b-npu-1bit": {
+   "sha256": "a136047ba140347b359d17b6ff8fa1bf8cb29d23f0c07bef7e0bf479b8680793",
+   "source": "FastFlowLM/Qwen3-0.6B-NPU2"
+  },
+  "qwen3-0.6b-npu2": {
+   "sha256": "a136047ba140347b359d17b6ff8fa1bf8cb29d23f0c07bef7e0bf479b8680793",
+   "source": "FastFlowLM/Qwen3-0.6B-NPU2"
+  },
+  "qwen3-4b-instruct-2507-1bit": {
+   "sha256": "c979e0e71a3e21b8f208e6ab120d5cb29327885f29d2a8b18fda67a723798e18",
+   "source": "unsloth/Qwen3-4B-Instruct-2507-GGUF"
+  },
+  "qwen3-4b-instruct-2507-q4_k_m.gguf": {
+   "sha256": "c979e0e71a3e21b8f208e6ab120d5cb29327885f29d2a8b18fda67a723798e18",
+   "source": "unsloth/Qwen3-4B-Instruct-2507-GGUF"
+  },
   "qwen3-coder-30b-a3b-instruct-q4_k_m.gguf": {
    "sha256": "87710339d25b4e789c1d723f93c91ee861a86d305bb3d20a845536f251d6ea8a",
    "source": "Qwen/Qwen3-Coder-30B-A3B-Instruct"

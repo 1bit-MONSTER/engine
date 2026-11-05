@@ -72,6 +72,12 @@ public:
         // the hidden after the token at start_pos+m (this toy's hidden is "positions consumed so far").
         rows_.assign(tokens.size(), 0.0f);
         for (size_t m = 0; m < tokens.size(); m++) rows_[m] = (float)(consumed_ + (int)m + 1);
+        // The real forward updates last_hidden() from the batch's own last row (`last_hidden_ = fnorm`, i.e.
+        // norm_all[M-1], npu/forward/src/q4nx_forward.cpp:4040) -- a batched pass advances the visible hidden too.
+        // This toy did not, so it modelled a forward that cannot exist, and any test asking "what is the hidden
+        // after a batch" would have read a stale value from the last single step (found 2026-11-05 while pricing a
+        // folded draft loop, which has no plain step and therefore no other hidden source).
+        hidden_.assign(HD, rows_.back());
         consumed_ += (int)tokens.size();
         pending_ = (int)tokens.size();     // these rows are a verify batch until commit_verify() decides
         batches_++;
@@ -85,6 +91,11 @@ public:
         if (accepted < 0 || accepted > pending_) return false;
         consumed_ = consumed_ - pending_ + accepted;
         rows_.resize((size_t)accepted);     // the accepted prefix only, as the engine's commit_verify_rows does now
+        // ... and hidden_ is deliberately NOT touched here, because the engine does not touch it either:
+        // commit_verify_rows() truncates last_hidden_rows_ to the accepted prefix and leaves last_hidden_ as the
+        // FULL batch's last row.  So after a partial accept the two disagree by construction, and a reader of
+        // last_hidden() is reading a row that was rolled back -- last_hidden_rows() is the one that follows the
+        // commit.  Kept faithful (and asserted below) rather than quietly "fixed" here.
         pending_ = 0;
         commits_++;
         last_commit_ = accepted;
@@ -388,6 +399,31 @@ int main() {
             for (int i = 0; i < onebit::npu::mtp::Stats::kMaxDepth; i++) { d += r.stats.drafted_at[i]; a += r.stats.accepted_at[i]; }
             check(d == r.stats.drafted && a == r.stats.accepted, "stream: per-depth counters add up to the totals");
         }
+    }
+
+    // [12] the toy base follows the forward's hidden contract, because a test double that drifts from it silently
+    // certifies the wrong thing.  Two facts, both read from npu/forward/src/q4nx_forward.cpp:
+    //   * step_batch_all() sets last_hidden() to the batch's own last row (`last_hidden_ = fnorm`, :4040), so a
+    //     batched pass advances the visible hidden -- this toy used to leave it on the previous single step;
+    //   * commit_verify_rows() truncates last_hidden_rows() to the accepted prefix and leaves last_hidden() as the
+    //     FULL batch's last row (:4100).  After a partial accept the two therefore disagree by construction, and
+    //     last_hidden() names a row that was rolled back.  That asymmetry is asserted, not smoothed over: a drafter
+    //     that advanced from last_hidden() after a commit would commit a rejected row.
+    {
+        ToyBase m(8);
+        std::vector<float> lg;
+        for (int i = 0; i < 3; i++) check(m.step(1, i, lg), "toy contract: prefill step accepted");
+        const int before = m.consumed();
+        std::vector<float> all;
+        check(m.step_batch_all({1, 1, 1}, before, all), "toy contract: batch accepted");
+        check(m.last_hidden_rows().size() == 3, "toy contract: the batch exposes one hidden row per row");
+        check(m.last_hidden()[0] == m.last_hidden_rows().back(),
+              "toy contract: after a batch last_hidden() is the batch's last row, as the real forward's is");
+        const float full_last = m.last_hidden()[0];
+        check(m.commit_verify(1), "toy contract: a partial commit is accepted");
+        check(m.last_hidden_rows().size() == 1, "toy contract: the commit truncates the rows to the accepted prefix");
+        check(m.last_hidden()[0] == full_last,
+              "toy contract: a partial commit leaves last_hidden() on the FULL batch's last row, as the engine does");
     }
 
     // [9] the live-vs-offline depth verdict: a depth the loop never drafted is UNSCORED, not 0.00 %.

@@ -152,4 +152,6 @@ $ tools/template_bom.py --bom ~/models/zaya1-8b-Q4_K_M.gguf
 ```
 
 That digest is the same one `1bit serve` prints at load, so the BOM, the log and the card row agree by
-construction rather than by bookkeeping.
+construction rather than by bookkeeping. Both branches hash the bytes as stored — a container whose
+`chat_template.jinja` is CRLF gets its `sha256sum`, not a newline-normalised variant — because that is
+what the serve path hashes too.

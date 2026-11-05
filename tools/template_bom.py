@@ -32,8 +32,8 @@ usage: tools/template_bom.py [--bom | --sums] [--self-test] PATH...
   --sums  emit the `SHA256SUMS` lines instead — `<sha256>  <file>#tokenizer.chat_template` for a `.gguf`,
           `<dir>/<source-file>#chat_template` for a container — the row a published file needs
           (docs/template-publishing.md). 'none' models print nothing, so the file stays clean.
-  --self-test  build two tiny fixtures (a GGUF with a template, a directory with chat_template.jinja) and
-          check the components this tool derives from them.
+  --self-test  build three tiny fixtures (a GGUF with a template, a container directory whose template is
+          LF and CRLF, and a model that carries none) and check the components this tool derives from them.
 
 Exit codes: 0 all paths read, 1 a path could not be read, 3 --self-test failed.
 """
@@ -48,8 +48,13 @@ import tempfile
 SPEC_VERSION = "1.6"
 
 
-def read_template(path: str) -> tuple[str | None, str | None]:
-    """(template text, where it came from) — `(None, None)` when the model carries none."""
+def read_template(path: str) -> tuple[bytes | None, str | None]:
+    """(the template bytes as stored, where they came from) — `(None, None)` when the model carries none.
+
+    Bytes, never decoded text: the served side (`container_chat_template_sha()`, `app/template_pin.h`)
+    hashes the raw file and so does `sha256sum`, so a text read's newline translation would name a
+    digest the file does not have — on a CRLF container that is a different sha256 for one template.
+    """
     if os.path.isdir(path):
         cfg = os.path.join(path, "tokenizer_config.json")
         if os.path.exists(cfg):
@@ -57,12 +62,13 @@ def read_template(path: str) -> tuple[str | None, str | None]:
                 with open(cfg, encoding="utf-8") as f:
                     t = json.load(f).get("chat_template")
                 if isinstance(t, str) and t:
-                    return t, "tokenizer_config.json"
+                    # a JSON string value carries no raw newline, so this equals the C++ json read
+                    return t.encode(), "tokenizer_config.json"
             except Exception:
                 pass
         jinja = os.path.join(path, "chat_template.jinja")
         if os.path.exists(jinja):
-            with open(jinja, encoding="utf-8") as f:
+            with open(jinja, "rb") as f:
                 return f.read(), "chat_template.jinja"
         return None, None
     import gguf  # only for a .gguf: keeps --self-test's directory case dependency-free
@@ -71,7 +77,7 @@ def read_template(path: str) -> tuple[str | None, str | None]:
     field = reader.fields.get("tokenizer.chat_template")
     if field is None:
         return None, None
-    return bytes(field.parts[-1]).decode("utf-8", "replace"), "GGUF metadata (tokenizer.chat_template)"
+    return bytes(field.parts[-1]), "GGUF metadata (tokenizer.chat_template)"
 
 
 def component(path: str) -> dict:
@@ -89,12 +95,12 @@ def component(path: str) -> dict:
             "description": "no chat template in this model (a base model, an mmproj, or a container without one)",
             "properties": props,
         }
-    props.insert(1, {"name": "onebit:template:bytes", "value": str(len(tpl.encode()))})
+    props.insert(1, {"name": "onebit:template:bytes", "value": str(len(tpl))})
     return {
         "type": "data",
         "bom-ref": ref,
         "name": "tokenizer.chat_template",
-        "hashes": [{"alg": "SHA-256", "content": hashlib.sha256(tpl.encode()).hexdigest()}],
+        "hashes": [{"alg": "SHA-256", "content": hashlib.sha256(tpl).hexdigest()}],
         "properties": props,
     }
 
@@ -104,7 +110,7 @@ def sums_line(path: str) -> str | None:
     tpl, source = read_template(path)
     if tpl is None:
         return None
-    sha = hashlib.sha256(tpl.encode()).hexdigest()
+    sha = hashlib.sha256(tpl).hexdigest()
     if os.path.isdir(path):
         return f"{sha}  {os.path.join(path, os.path.basename(source)) if source else path}#chat_template"
     return f"{sha}  {os.path.basename(path)}#tokenizer.chat_template"
@@ -151,6 +157,22 @@ def self_test() -> int:
         expect("dir: sha256", c["hashes"][0]["content"], hashlib.sha256(tpl.encode()).hexdigest())
         expect("dir: source", next(p["value"] for p in c["properties"] if p["name"] == "onebit:template:source-file"),
                "chat_template.jinja")
+
+        # the same template with CRLF line endings, written as bytes: the digest must be the file's, not
+        # Python's universal-newline view of it (app/template_pin.h hashes the raw bytes too)
+        crlf_tpl = "{% for m in messages %}\r\n{{ '<s>' ~ m['role'] }}\r\n{% endfor %}\r\n"
+        raw = crlf_tpl.encode()
+        crlf = os.path.join(d, "crlf")
+        os.makedirs(crlf)
+        with open(os.path.join(crlf, "chat_template.jinja"), "wb") as f:
+            f.write(raw)
+        c = component(crlf)
+        expect("crlf: sha256 is the file's", c["hashes"][0]["content"], hashlib.sha256(raw).hexdigest())
+        expect("crlf: not the LF-normalised digest",
+               c["hashes"][0]["content"] != hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest(), True)
+        expect("crlf: bytes", next(p["value"] for p in c["properties"] if p["name"] == "onebit:template:bytes"),
+               str(len(raw)))
+        expect("crlf: sums digest", sums_line(crlf).split("  ")[0], hashlib.sha256(raw).hexdigest())
 
         # a model that carries no template: a component with no hash and a description that says why
         bare = os.path.join(d, "bare")

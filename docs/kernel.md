@@ -20,8 +20,10 @@ The Strix Halo box runs a kernel we build, not the distribution's: everything th
 need is pinned by hand, so the next kernel is a step list, not an investigation. This page is that
 list, with the facts that go stale marked as facts and the commands that do not.
 
-- **Runs today:** `7.4.0-rc1-1bit` — Linux `v7.4-rc1`, booted since 2026-11-04 05:45
-  (`/boot/vmlinuz-7.4.0-rc1-1bit`), and PerfOpt is present in it, measured: this box's boot prints
+- **Runs today:** `7.4.0-rc1-1bit` — Linux `v7.4-rc1`, in use since 2026-11-04 05:45
+  (`/boot/vmlinuz-7.4.0-rc1-1bit`); every boot since has loaded it, and the box reboots on each Puppy
+  board cycle, so read `uptime -s` for the boot you are looking at. PerfOpt is present in it,
+  measured: this box's boot prints
   `amdgpu 0000:c5:00.0: AMD-Vi: PerfOpt armed on IOMMU0`. The 7.3 A/B below stays as the measurement
   that motivated the backports. **The compiler is not what this page says** — see the "config of record"
   bullet below.

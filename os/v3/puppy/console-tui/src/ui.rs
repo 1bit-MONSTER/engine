@@ -33,7 +33,7 @@
 //! still draws the screen. Nothing is clipped: every string goes through `wrap_words` before it reaches a widget,
 //! because the c16 board showed "firmware prese".
 
-use crate::facts::{human_bytes, human_uptime, wrap_hanging, wrap_words, Facts, SecureBoot};
+use crate::facts::{human_bytes, human_uptime, wrap_hanging, wrap_words, Facts, Mode, SecureBoot};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -144,16 +144,35 @@ fn rule(title: &str, width: usize) -> Line<'static> {
     ])
 }
 
-fn header(f: &Facts) -> Line<'static> {
+fn header(f: &Facts, width: usize) -> Line<'static> {
     let ip = f.ip().unwrap_or("no address yet");
     let sb = match f.secure_boot {
         SecureBoot::Enabled => ("Secure Boot enabled", Some(Color::Green)),
         SecureBoot::Disabled => ("Secure Boot disabled", Some(Color::Yellow)),
         SecureBoot::Unknown => ("Secure Boot unknown", Some(Color::DarkGray)),
     };
-    let mut spans = vec![
+    // Which system is running comes first, beside the edition's own name: after an install the screen must not still
+    // look like a stick (#711 - "live usb is loaded up" while the facts came from the NVMe). The word is init.sh's
+    // (`MODE: LIVE` / `MODE: INSTALLED`), so the console and the boot banner cannot disagree.
+    let mut spans = vec![Span::styled(
+        "1bit OS".to_string(),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(w) = f.mode.word() {
+        let colour = match f.mode {
+            Mode::Installed => Color::Cyan,
+            _ => Color::Green,
+        };
+        spans.push(Span::styled(
+            format!(" {w}"),
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.extend([
         Span::styled(
-            format!("1bit OS {} ", f.release),
+            format!(" {} ", f.release),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -167,14 +186,27 @@ fn header(f: &Facts) -> Line<'static> {
             format!("up {}  ", human_uptime(f.uptime_s)),
             Style::default().fg(Color::Gray),
         ),
-        Span::styled(sb.0, Style::default().fg(sb.1.unwrap_or(Color::Gray))),
-    ];
+    ]);
+    // The two facts that may give way on a narrow screen, in the order they go: the temperature first, then Secure
+    // Boot. The mode, the release, the host and the address never do, and the blocks that may not be trimmed at all
+    // (the nine actions, the footer) are not this function's. Dropping them instead of letting ratatui clip the line
+    // is what keeps a 60-column ssh window from reading as `Secure Boot enab`.
+    let mut tail: Vec<Span<'static>> = vec![Span::styled(
+        sb.0,
+        Style::default().fg(sb.1.unwrap_or(Color::Gray)),
+    )];
     if let Some(t) = f.temp_c {
-        spans.push(Span::styled(
+        tail.push(Span::styled(
             format!("  SoC {t}C"),
             Style::default().fg(Color::Gray),
         ));
     }
+    let cells =
+        |s: &[Span<'static>]| -> usize { s.iter().map(|x| x.content.chars().count()).sum() };
+    while !tail.is_empty() && cells(&spans) + cells(&tail) > width {
+        tail.pop();
+    }
+    spans.extend(tail);
     Line::from(spans)
 }
 
@@ -846,7 +878,7 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
     }
 
     if !a.full_logs {
-        top.push(header(&a.facts));
+        top.push(header(&a.facts, w));
         top.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
         facts = if wide {
             panel_grid(&a.facts, w)
@@ -1082,7 +1114,9 @@ fn render_lines(f: &mut Frame, area: Rect, lines: &[Line<'static>]) {
 
 pub fn status_text(f: &Facts) -> Vec<String> {
     let mut out = Vec::new();
-    let h = header(f);
+    // `--status` is a transcript, not a frame: give the header room so every fact it carries is in the text a gate
+    // greps (`1bit-console-tui --status` prints what the screen says, and the mode is one of those facts now)
+    let h = header(f, 400);
     out.push(
         h.spans
             .iter()
@@ -1540,6 +1574,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_header_says_which_system_is_running() {
+        // #711: after an install the console must not still look like a stick. `init.sh` decides it at boot and leaves
+        // `installed` or `live` in /etc/1bit; the header says the same word, beside the edition's own name.
+        let mut f = c16_board();
+        f.mode = Mode::Installed;
+        let text = render_snapshot(&app(f.clone()), 240, 67);
+        assert!(
+            text.lines()
+                .next()
+                .unwrap_or("")
+                .contains("1bit OS INSTALLED"),
+            "the header does not say INSTALLED:\n{text}"
+        );
+        f.mode = Mode::Live;
+        let text = render_snapshot(&app(f.clone()), 240, 67);
+        assert!(
+            text.lines().next().unwrap_or("").contains("1bit OS LIVE"),
+            "the header does not say LIVE:\n{text}"
+        );
+        // a box that has not said (a console started by hand, or an init that could not write the marker) invents
+        // nothing: the word is absent rather than guessed
+        f.mode = Mode::Unknown;
+        let text = render_snapshot(&app(f), 240, 67);
+        let head = text.lines().next().unwrap_or("");
+        assert!(
+            !head.contains("LIVE") && !head.contains("INSTALLED"),
+            "a mode was invented:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_header_drops_a_fact_rather_than_letting_it_be_clipped() {
+        // The mode cost the header five cells, and at 80 columns it is the temperature and then Secure Boot that give
+        // way - both are readable elsewhere (`1bit-board status`, `mokutil --sb-state`) and neither may be clipped to
+        // `SoC 4` / `Secure Boot ena`. The mode, the release, the host and the address never go.
+        let f = c16_board();
+        // 65 is this fixture's mandatory prefix (mode + release + host + address + uptime): below that the line is
+        // longer than the window and ratatui clips its tail, exactly as it already did before the mode was added
+        for w in 65..=256usize {
+            let text = span_text(&header(&f, w));
+            assert!(
+                text.chars().count() <= w,
+                "width {w}: the header is {} cells: {text:?}",
+                text.chars().count()
+            );
+            assert!(
+                text.contains("LIVE"),
+                "width {w}: the mode was dropped: {text:?}"
+            );
+            assert!(
+                text.contains("rc-2026-11-03-c16"),
+                "width {w}: the release was dropped: {text:?}"
+            );
+            assert!(
+                text.contains("192.168.50.110"),
+                "width {w}: the address was dropped: {text:?}"
+            );
+        }
+        // the appliance's own tty1 has room for everything, so nothing is lost where the owner looks
+        let full = span_text(&header(&f, 240));
+        assert!(
+            full.contains("Secure Boot enabled") && full.contains("SoC 43C"),
+            "240 columns lost a fact: {full}"
+        );
     }
 
     #[test]

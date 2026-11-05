@@ -796,6 +796,12 @@ says nothing, because nothing runs (this keeps the header-only route fixtures on
 {"pins": {"zaya1-8b-q4_k_m.gguf": {"sha256": "b55ecfbbbcbb238a…", "source": "Zyphra/ZAYA1-8B"}}}
 ```
 
+The table carries the rows the appliance itself ships — the stick's `Qwen3-4B-Instruct-2507-1bit` GGUF and
+its `Qwen3-0.6B-NPU-1bit` container, whose digest is the `chat_template` string from
+`tokenizer_config.json` ([npu-chat-template.md](npu-chat-template.md)) — plus the demo and scoreboard rows and all four `laya-first` routing rows.
+A model with no row is logged, not checked, which is why a row is added with its measured digest rather
+than guessed (`models/pins.json` records that digest for every file we serve and publish).
+
 A pin is matched against the model id serve serves (`--alias`, i.e. Lemonade's catalog entry) first,
 then the file's own name, case-insensitively; `"none"` pins a model that must carry no template. A
 model whose pin does not match prints a second line and **still serves**:

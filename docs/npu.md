@@ -1082,6 +1082,31 @@ $ curl -sS localhost:8000/v1/systemone -H 'Content-Type: application/json' \
   "type":"choice"}},"model":"d3-lite","usage":{"input_tokens":96,"output_tokens":0}}
 ```
 
+### When a dispatch fails
+
+A token's work is one runlist of the model's layer runs. When the NPU runtime reports that one of those runs did not
+complete, `1bit unified` answers **the request that hit it** with an error frame and then exits non-zero — it does not
+keep serving on that hardware context:
+
+```
+{"error":{"message":"npu runtime: invalid call (code 614): state 8, run 0 of 28"}}
+```
+
+The code's category is its hundreds digit (`6xx`: a call made in the wrong state or on the wrong object) and `run N of
+M` is the index, inside the token's runlist, of the layer run that failed.
+
+Exiting is deliberate: after such a failure the context's own state is dead, and every later request on the same process
+fails the same way — measured on the c22 board, where the same backend answered 614 to every subsequent request while a
+fresh process answered normally on the same device. The supervisor (Lemonade's backend watchdog, a systemd unit, the OS
+menu's launcher) is the only one that can build a new context, so the engine hands it the problem instead of answering
+with something that looks like a result. A client sees **one failed request**, and the next one lands on a working
+backend.
+
+If a *fresh* backend also fails, the device is the thing to look at rather than the engine: the driver refuses new
+hardware contexts until `amdxdna` is reloaded, and says so in its own kernel message — restarting backends cannot fix it.
+`app/serve_watchdog.h`'s `npu_run_failed()` is the classifier for this (the runtime's failed-runlist message), and
+`tests/serve_watchdog_test.cpp` (ctest `serve_watchdog`, in CI) covers it without a device.
+
 ### Two streams on one NPU
 
 One process owns the NPU by default: it takes an exclusive `flock` on

@@ -100,6 +100,27 @@ whose pane is 12 rows, one keypress cost `9 Reboot / power off` for twelve secon
 rows the message wraps to (`a_message_gives_way_before_an_action_does`). At 80x25 and 240x67, where the gates read the
 screen, nothing is trimmed.
 
+**A frame is rebuilt in full once a second, because a tty cannot be made private.** Anything holding this terminal open
+can write to it, and ratatui writes only the cells whose *content* changed since its own last frame - correct only while
+the screen still holds that frame. So one stray line leaves a wrong screen that **a keypress does not fix**: measured on
+the shipped c25 artifact (`2fc6909c…`) in real ptys, three printk-shaped lines were still there at +2.2 s and after a
+keypress, at 80x25 and at 240x67 - and when the write ends on the last row the VT scrolls, which is how the log pane's
+own lines end up painted across the CONNECT block and the MENU (the cycle-25 screenshot: "`engint: o ebit`"). Who writes:
+kernel messages while `console_loglevel` allows them, `1bit-release-check`'s "holding the NPU" line and
+`puppy-check.sh`'s console note (both `/dev/tty1` on purpose), and any program a handoff runs. So the frame is rebuilt in
+full, from a cleared screen, at most once a second: the same write is gone at **+1.0 s**, and the cost is measured -
+`+3.5 KiB/s` at 240x67 (4.5 KiB/s, was 1.0).
+
+**Measured on a booted appliance, not just a pty** (QEMU, the frozen c25 image, its own `tty1::respawn:/usr/local/bin/1bit-console`,
+the guest's VGA text console at 160x50, screen read through `1bit-tty1` -> `/dev/vcsa1` the way the gates read it, plus QEMU
+`screendump`s): with the shipped `2fc6909c…` two stray lines written to `/dev/tty1` were still on the screen 4.3 s later
+**and after a keypress sent through QEMU's own keyboard**; with this binary the same write was gone by the next frame
+(0 stray rows at +0.3 s, +1.5 s, +3.5 s and after a keypress) and the healed frame was byte-identical to the clean one
+except the log pane's own new lines. What a screendump cannot catch is a sub-frame blank, so "the Clear is invisible"
+remains arithmetic (one escape plus 4.5 KiB) - a person at the monitor or a 60 fps capture is the only judge of that.
+
+This is insurance, not the fix for a noisy writer: a writer that paints this screen is still a defect in the writer.
+
 ## Keys
 
 | key | what it does |

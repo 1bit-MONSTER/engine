@@ -131,6 +131,10 @@ int main() {
                "a failed runlist (614) is not a refused context");
         expect(!onebit::npu_contexts_refused("npu runtime: device error (code 102): Cannot allocate memory"),
                "a different errno on the same code is not the reload case");
+        expect(onebit::npu_contexts_refused("npu runtime: device error (code 104): No such device"),
+               "a submit refused by a dead array is the same state as a refused context creation");
+        expect(!onebit::npu_contexts_refused("npu runtime: device error (code 104): Input/output error"),
+               "a submit that failed with an ordinary errno is not the dead-array case");
         expect(std::string(onebit::npu_contexts_refused_hint()).find("modprobe") != std::string::npos,
                "the hint names the one action that works");
 
@@ -162,6 +166,101 @@ int main() {
         } catch (const std::exception&) {
         }
         expect(calls == 1, "no retry with a zero window, attempts " + std::to_string(calls));
+    }
+
+    // 7. A REFUSED context is a QUEUE, not a fault (engine #1085 / orchestrator decision 2026-11-05 item 2): with the
+    //    per-client partition fix a second client is refused with the same code 102 / ENODEV a dead array answers, so
+    //    the load waits out the queue budget before calling the driver dead. Proof that the *queue* window is in force:
+    //    with the ordinary retry window closed (0 s, one attempt), a refused context still retries and succeeds.
+    {
+        LoadRetryPolicy p;
+        p.window_s = 0.0;            // nothing is retried on the ordinary path
+        p.refusal_window_s = 5.0;    // but a refusal is queued
+        p.first_delay_s = 0.01;
+        p.max_delay_s = 0.02;
+        int calls = 0;
+        std::vector<std::string> said;
+        bool opened = false;
+        open_with_retry(p, "opening",
+                        [&] {
+                            ++calls;
+                            if (calls < 4) throw std::runtime_error("npu runtime: device error (code 102): No such device");
+                            opened = true;
+                        },
+                        [&](const std::string& line) { said.push_back(line); }, [](double) {});
+        expect(opened, "a refused context is waited out, not failed on");
+        expect(calls == 4, "the queue window allows the retries the short window refuses, attempts " + std::to_string(calls));
+        expect(!said.empty() && said.back().find("recovered on attempt 4") != std::string::npos,
+               "the recovery line names the attempt");
+        bool queued_line = false;
+        for (const auto& line : said)
+            if (line.find("queued: another NPU client may hold the array") != std::string::npos) queued_line = true;
+        expect(queued_line, "the retry lines say why it is waiting (another client), not that the array is broken");
+    }
+
+    // 8. A refusal that never clears runs the QUEUE budget and then gives up with both causes named -- the operator's
+    //    first move is to look for another client, and only then to reload the driver.
+    {
+        LoadRetryPolicy p;
+        p.window_s = 0.05;
+        p.refusal_window_s = 0.20;
+        p.refusal_max_delay_s = 0.05;
+        p.refusal_max_attempts = 6;
+        p.first_delay_s = 0.01;
+        int calls = 0;
+        std::vector<std::string> said;
+        std::string thrown;
+        try {
+            open_with_retry(p, "opening",
+                            [&] { ++calls; throw std::runtime_error("npu runtime: device error (code 102): No such device"); },
+                            [&](const std::string& line) { said.push_back(line); }, [](double) {});
+        } catch (const std::exception& ex) {
+            thrown = ex.what();
+        }
+        expect(calls > 1, "a persistent refusal is retried before giving up, attempts " + std::to_string(calls));
+        expect(calls <= p.refusal_max_attempts, "and stops at the queue cap, attempts " + std::to_string(calls));
+        expect(thrown.find("code 102") != std::string::npos, "the caller sees the driver's own reason");
+        bool whole = false, another = false;
+        for (const auto& line : said) {
+            if (line.find("200 ms queue window") != std::string::npos) whole = true;
+            if (line.find("another client may hold the array") != std::string::npos) another = true;
+        }
+        expect(whole, "the give-up line names the queue window it spent");
+        expect(another, "the give-up hint names the other client before the reload advice");
+    }
+
+    // 9. `--load-queue-ms 0` is the operator refusing to wait: one attempt, as before the queue existed.
+    {
+        LoadRetryPolicy p;
+        p.window_s = 0.0;
+        p.refusal_window_s = 0.0;
+        int calls = 0;
+        try {
+            open_with_retry(p, "opening",
+                            [&] { ++calls; throw std::runtime_error("npu runtime: device error (code 102): No such device"); },
+                            [](const std::string&) {}, [](double) {});
+        } catch (const std::exception&) {
+        }
+        expect(calls == 1, "a zero queue budget refuses at once, attempts " + std::to_string(calls));
+    }
+
+    // 10. The queue budget is for refusals only: an ordinary failure still obeys the SHORT policy (its attempt cap
+    //     here, since the injected sleep does not advance the real clock), so a genuinely broken model cannot hang a
+    //     load for the queue budget.
+    {
+        LoadRetryPolicy p;
+        p.max_attempts = 3;            // the short path's cap
+        p.refusal_max_attempts = 9;    // the queued path's cap -- must NOT be the one used here
+        p.first_delay_s = 0.01;
+        p.max_delay_s = 0.02;
+        int calls = 0;
+        try {
+            open_with_retry(p, "opening",
+                            [&] { ++calls; throw std::runtime_error("the driver refused to create a context"); },
+                            [](const std::string&) {}, [](double) {});
+        } catch (const std::exception&) {
+        }
+        expect(calls == p.max_attempts, "an ordinary failure keeps the short policy, attempts " + std::to_string(calls));
     }
 
     if (failures == 0) std::printf("npu_load_retry_test: PASS\n");

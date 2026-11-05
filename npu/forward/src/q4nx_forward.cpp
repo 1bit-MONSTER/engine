@@ -544,6 +544,27 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    {
+        // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
+        // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
+        // log to say so.  "" (no rope_scaling block) is every model that never declared one.
+        std::ifstream f(cfg_path);
+        std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        char declared[64];
+        q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
+        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1)) {
+            if (!std::strcmp(declared, "llama3"))
+                err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
+                       "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
+                       "scaling cannot be applied; serving it would run plain RoPE";
+            else
+                err_ = std::string("config.json declares rope scaling \"") + declared +
+                       "\", which this forward does not implement (only llama3 and longrope short_factor "
+                       "are), so it would be served plain RoPE and reply wrongly past the model's "
+                       "original window (engine#1048, #1087)";
+            return false;
+        }
+    }
     embed_scale_ = read_config_float(cfg_path, "\"embedding_scale\"", 1.0f);
     residual_scale_ = read_config_float(cfg_path, "\"residual_scale\"", 1.0f);
     logit_scale_ = read_config_float(cfg_path, "\"logit_scale\"", 1.0f);

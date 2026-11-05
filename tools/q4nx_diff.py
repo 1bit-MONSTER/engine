@@ -244,6 +244,14 @@ def verdict(results):
     container. So name the layout that matched, and when none did, name the closest and say so instead
     of implying the container is broken.
     """
+    # A layout that compared NO tensor is not evidence of anything: `_decode_pass` returns
+    # (0, 0, 0.0) when every tensor was skipped, and worst=0.0 with rival=0.0 satisfies
+    # "rival >= worst * RATIO", so such a layout used to be reported as a MATCH on whichever one
+    # sorted first -- measured: a 0.6B container against a 4B GGUF came back
+    # `matches layout flm (worst max|err| 0.000e+00, ...)` with 0 tensors compared (engine#1110
+    # review).  Drop the layouts with no evidence before choosing, and if none is left say so:
+    # every caller already has a branch for rc=2.
+    results = {k: v for k, v in results.items() if v[0] + v[1] > 0}
     if not results:
         return 2, "nothing was compared"
     order = sorted(results, key=lambda k: results[k][2])
@@ -350,7 +358,7 @@ def decode_cmd(args):
 
 
 def self_test():
-    """The verdict logic, with the four cases this lane measured on real containers."""
+    """The verdict logic, with the cases measured on real containers plus the 0-tensor tie."""
     bad = []
     cases = [
         # what a correct container looks like: one layout exact (a round trip), the other noise
@@ -363,6 +371,10 @@ def self_test():
         # ambiguous: close to the tolerance and not clearly better than its rival
         ({"ours": (0, 12, 0.09), "flm": (0, 12, 0.12)}, 1, "NO", "not clearly better than the rival"),
         ({}, 2, "nothing", "nothing compared"),
+        # both layouts skipped every tensor: a 0-vs-0 tie is not a match (engine#1110 review)
+        ({"ours": (0, 0, 0.0), "flm": (0, 0, 0.0)}, 2, "nothing", "two layouts that compared no tensor"),
+        # one layout compared tensors and the other did not: the one with evidence decides
+        ({"ours": (0, 0, 0.0), "flm": (0, 12, 1.6)}, 1, "NO", "a layout with no evidence cannot win"),
     ]
     for results, want_rc, want_word, what in cases:
         rc, line = verdict(results)
@@ -374,7 +386,7 @@ def self_test():
             print("  " + b)
         return 1
     print("self-test passed: the verdict names the matching layout, accepts a lossy-but-correct pack, "
-          "and refuses tiles from other weights")
+          "refuses tiles from other weights, and treats a layout that compared nothing as no evidence")
     return 0
 
 

@@ -17,7 +17,8 @@ limitations under the License.
 # Lemonade
 
 **The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade)**, and its
-`onebit` recipe passes Lemonade's own LLM test suite on HRX: 29 of 29 tests run, all pass. Lemonade
+`onebit` recipe passes Lemonade's own LLM test suite on HRX: 31 of 31 tests run, all pass (2 skipped;
+2026-11-05). Lemonade
 is the server users talk to, with its own catalog, downloads, router and UI. For the models it
 serves with 1bit, it runs the engine as a backend, the same way it runs `llama-server`. For a GGUF
 it starts the engine's HRX `llama-server` directly, one HTTP hop

@@ -81,6 +81,7 @@ struct Outcome {
 struct Run {
     int code = -1;
     std::string out;
+    bool hard_kill = false;  // the grace window after SIGTERM expired and the provider had to be killed
 };
 
 inline Run run_provider(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int timeout_s) {
@@ -109,9 +110,18 @@ inline Run run_provider(const std::vector<std::string>& argv, const std::vector<
         ::_exit(127);
     }
     ::close(out[1]);
-    // read stdout to its end (the provider's exit closes it), then reap, with the timeout on the whole
+    // Read stdout to its end (the provider's exit closes it), then reap, with the timeout on the whole. The stop is
+    // two-stage: SIGTERM at the deadline, SIGKILL only after a grace window of its own. The grace is not politeness:
+    // an NPU provider tears down by releasing its BOs and destroying the hardware context, and killing it inside
+    // that window is the path that crashed this box on 2026-11-04 01:48 (~/briefs/NPU-LANE-RULE-20261104.md
+    // section 4 asks for >= 20 s). ONEBIT_HYBRID_PREFILL_GRACE_S sets the window (default 60 s); 0 asks for the
+    // old immediate kill. The clock is checked on every pass, not only when the provider is silent: a provider
+    // that prints forever is exactly the one that must not be able to outlive its budget.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
+    int grace_s = 60;
+    if (const char* g = std::getenv("ONEBIT_HYBRID_PREFILL_GRACE_S"); g && *g) grace_s = std::max(0, std::atoi(g));
     bool killed = false;
+    std::chrono::steady_clock::time_point term_at{};
     char buf[4096];
     for (;;) {
         fd_set fds;
@@ -124,12 +134,16 @@ inline Run run_provider(const std::vector<std::string>& argv, const std::vector<
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) break;
             r.out.append(buf, size_t(n));
-            continue;
         }
-        if (std::chrono::steady_clock::now() > deadline) {
-            ::kill(pid, killed ? SIGKILL : SIGTERM);
-            if (killed) break;
+        const auto now = std::chrono::steady_clock::now();
+        if (!killed && now > deadline) {
+            ::kill(pid, SIGTERM);
+            term_at = now;
             killed = true;
+        } else if (killed && (grace_s == 0 || now > term_at + std::chrono::seconds(grace_s))) {
+            ::kill(pid, SIGKILL);
+            r.hard_kill = true;
+            break;
         }
     }
     ::close(out[0]);
@@ -322,7 +336,8 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
         std::error_code ec;
         std::filesystem::remove(tokens, ec);
         if (run.code != 0) {
-            o.why = run.code == -2 ? "provider timed out after " + std::to_string(timeout_s_) + " s"
+            o.why = run.code == -2 ? "provider timed out after " + std::to_string(timeout_s_) + " s" +
+                                         (run.hard_kill ? " and had to be killed" : " and stopped on SIGTERM")
                                    : "provider exited " + std::to_string(run.code);
             std::filesystem::remove(state, ec);
             return o;
@@ -447,7 +462,8 @@ private:
         std::filesystem::remove(tokens, ec);
         std::filesystem::remove(layout, ec);
         if (run.code != 0) {
-            o.why = run.code == -2 ? "provider timed out after " + std::to_string(timeout_s_) + " s"
+            o.why = run.code == -2 ? "provider timed out after " + std::to_string(timeout_s_) + " s" +
+                                         (run.hard_kill ? " and had to be killed" : " and stopped on SIGTERM")
                                    : "provider exited " + std::to_string(run.code);
             return o;
         }

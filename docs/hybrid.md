@@ -90,7 +90,7 @@ would draft over a cache it did not compute.
 | stdout | one JSON line, last: `{"n_tokens": N, "argmax": id, "prefill_ms": x}`; `n_tokens` must equal the ids given (checked), `argmax` is the next-token argmax after the prompt (for diagnostics), `prefill_ms` is optional |
 | exit | 0 on success; anything else, or no file, is the fallback above |
 | environment | `ONEBIT_HYBRID_BACKEND_URL=http://127.0.0.1:<port>`, the decoding llama-server's address (a test provider makes its file through it; a real one has no use for it), plus serve's own environment |
-| time limit | `ONEBIT_HYBRID_PREFILL_TIMEOUT_S` (default 600): SIGTERM, then SIGKILL |
+| time limit | `ONEBIT_HYBRID_PREFILL_TIMEOUT_S` (default 600): SIGTERM at the limit, then SIGKILL only after `ONEBIT_HYBRID_PREFILL_GRACE_S` (default 60, `0` = immediately). The grace is for a provider that has teardown work of its own: an NPU provider releases its buffers and destroys its hardware context, and killing it inside that window is the path that crashed this box on 2026-11-04 (see `~/briefs/NPU-LANE-RULE-20261104.md`, not in the public tree). The stderr line says which of the two ended the provider |
 
 **The state file** is what `llama_state_seq_save_file` writes and `/slots/<id>?action=restore` reads
 (llama.cpp `src/llama-context.cpp`, `src/llama-kv-cache.cpp` `state_write_meta` / `state_write_data`):

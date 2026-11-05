@@ -783,10 +783,12 @@ Every load of a `.gguf` prints one line, the sha256 of the exact template bytes:
 1bit serve: template sha256=bc20c7bec8…
 ```
 
+A **Q4NX / NPU model directory** has no GGUF: its template is the `chat_template` string in the
+container's `tokenizer_config.json` (or a `chat_template.jinja` beside it), and the same line names it,
+pinned the same way by the directory's name or its model id.
+
 A model with no template prints `template sha256=none` only when it has a pin (below); otherwise it
 says nothing, because nothing runs (this keeps the header-only route fixtures on their line counts).
-A Q4NX model directory keeps its template in a `tokenizer_config.json` and is not covered here — the
-checked pull path for those is [Laya-first](laya-first.md).
 
 `config/template-pins.json` is compiled in as the expected template per model:
 
@@ -799,7 +801,7 @@ then the file's own name, case-insensitively; `"none"` pins a model that must ca
 model whose pin does not match prints a second line and **still serves**:
 
 ```
-1bit serve: warning: template pin: zaya1-8b-q4_k_m (zaya1-8b-q4_k_m.gguf) expects b55ecfbbbcbb238a…, the GGUF carries 4f2a… in tokenizer.chat_template
+1bit serve: warning: template pin: zaya1-8b-q4_k_m (zaya1-8b-q4_k_m.gguf) expects b55ecfbbbcbb238a…, the model carries 4f2a… in tokenizer.chat_template
 ```
 
 `--template-pin-strict` (or `ONEBIT_TEMPLATE_PIN_STRICT=1`) makes that a refusal, exit 1 — use it

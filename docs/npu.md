@@ -920,6 +920,8 @@ got before.
 | `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
+| `max_tokens` / `max_completion_tokens` | the reply's cap (`max_completion_tokens` wins); a value that is not a number is a 400 naming the field, and a fractional one is truncated |
+| `stream` | `true` streams SSE chunks; a value that is not a boolean is a 400 naming the field |
 | `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
@@ -957,8 +959,10 @@ dropped from a schema would leave the caller believing the answer was validated.
 the schema's order with the required ones first, so the object's key order is fixed for a given schema.
 
 A field the route cannot honour is a 400 whose `error.message` says why ("`json_schema`: pattern is not
-supported by this route's schema-to-GBNF converter", "`gbnf: unterminated literal at line 1`"),
-never a silently ignored key. `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
+supported by this route's schema-to-GBNF converter", "`gbnf: unterminated literal at line 1`",
+"`stream`: must be true or false", "`tools`: must be an array"),
+never a silently ignored key and never a 500: a wrong *type* is a client error like any other, including on the
+fields the route reads before it starts decoding (engine#1106). `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
 an end-of-sequence token, a stop sequence or a grammar that allows nothing more.
 
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of

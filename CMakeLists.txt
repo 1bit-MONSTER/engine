@@ -747,6 +747,16 @@ add_test(NAME npu_t2_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_t2_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}
                  ${CMAKE_SOURCE_DIR}/tests/npu_t2_layout_test.cpp)
+# The padded-grid contract (engine#1097): a container may store a weight on a WIDER tile grid than the
+# model's own dimensions -- the FastFlowLM repack pads intermediate_size up to its 512-column grid, so
+# an 8960-wide MLP arrives as 9216 and holds 1728 tiles where the model's dims imply 1680.  The
+# decoder reads the container's grid and writes the model's [rows, cols], so a caller's buffer, its
+# row stride and the kernel's B layout never move.  Self-compiling like the other layout contracts
+# (tests/npu_padded_grid_test.sh) so ctest needs no build target and CI cannot report "Not Run".
+add_test(NAME npu_padded_grid
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_padded_grid_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}
+                 ${CMAKE_SOURCE_DIR}/tests/npu_padded_grid_test.cpp)
 # The host side of a MoE container: __metadata__.moe, per-expert chunk pointers and the router.
 # Crafted directories at run time, so CI needs no 18 GB model; with two arguments it checks the
 # same code against a real container and a gate.json from tools/moe_expert_chunks.py gate.

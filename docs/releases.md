@@ -150,7 +150,7 @@ Release sha and pins (the submodules this candidate is built from):
 | engine | `7871c71d` (main when the last release-blocking PR merged; a later merge today re-runs only the stages it touches, and the run's record carries the final sha) |
 | llama.cpp (HRX fork) | `851fa6c8d8f2` |
 | hrx-system | `82804197bcbe` |
-| Lemonade (fork) | `27abcc24da99` |
+| Lemonade (fork) | `e58c9f111` (the fork's `main` tip; `bump-lemonade` re-pins `third_party/lemonade` to whatever it is at cut time, so re-read this row from `git ls-tree` then) |
 | private kernel add-on (HIP) | `744bd713d968` |
 | private NPU kernel set | `17ed5be7a28a` |
 | private NPU runtime | `ce9fa59adf95` |
@@ -227,9 +227,23 @@ prebuilt-library build are in the tree (`#467`, `#479`, `#469`).
 **Lemonade.** One hop for GGUFs: Lemonade starts the engine's `llama-server` directly, no shim
 (`#475`, fork `#15`), the engine's own warm-ups are sent in order (`#492`, fork `#16`, `#17`), and
 the Ubuntu 26.04 PPA's `lemond` runs our HRX server unchanged (`#483`). Synced to upstream `#3771`
-(fork `#21`, `#520`). The catalog has **22 HRX entries, each proven on the box** — strict placement,
-one request in role, `lemonade bench ... chat-short` — and 3 NPU entries (fork `#19`, `#20`, `#23`);
-chat-short spans 43.4 (Qwen3-8B) to 330.7 tok/s (Qwen3-0.6B), 0 faults in 16 holds.
+(fork `#21`, `#520`), and now to the GA release itself (`v2026.45.3`, fork `#29`) — the port carries our
+onebit backend, catalog and FLM context clamp into upstream's rebuilt server, so the suite evidence for
+this pin is a run against the **ported** `lemond`, not against a package built before it.
+
+The catalog has **23 HRX entries**, each with a proven row on the box (strict placement, one request in
+role, `lemonade bench ... chat-short`): fork `#23`'s 22 plus flint from `#24`. It also has **4 NPU
+entries** — `Qwen3-0.6B`, `Qwen3-1.7B` and `Qwen3-4B` (fork `#19`, `#20`, `#23`) and
+`Qwen3.6-35B-A3B` (`#8`). Chat-short spans 43.4 (Qwen3-8B) to 330.7 tok/s (Qwen3-0.6B), 0 faults in 16
+holds.
+
+Two behaviours are new on this pin, both from the fleet's NPU-exclusivity decision (2026-11-05): **an
+NPU model switch evicts the previous NPU model before the new one starts**, because the array runs one
+hardware context at a time (fork `#34`), and a *refused* context is queued on a budget instead of being
+called a dead array (engine `#1100`, `1bit serve --load-queue-ms`). The 31-test suite through the
+onebit recipe on HRX passes against the ported `lemond` (`Ran 31 tests in 110.6s`, `OK (skipped=2)`,
+measured at load 28.5 with two foreign HRX clients resident), and the catalogue covers 27 onebit rows
+in total (23 + 4).
 
 **1bit OS.** The image carries the sealed NPU sets and the new Lemonade (`#512`, `#523`), the UKI is
 signed with the enrolled MOK so a stick boots with Secure Boot on (`#513`), the USB4 v2 / Thunderbolt

@@ -411,6 +411,50 @@ json_str() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0
 json_text() { printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 
+laya_class_model() {  # <class> -> the model the shipped table names for it
+    case "$1" in
+        short)    printf 'Qwen3-0.6B-1bit' ;;
+        prose)    printf 'ZAYA1-8B-1bit' ;;
+        code)     printf 'Qwen3-Coder-30B-A3B-Instruct-1bit' ;;
+        long_doc) printf 'Qwen3.8-27B-1bit' ;;
+        *)        printf '' ;;
+    esac
+}
+
+# The laya-auto row, decided from the router's own decision (docs/laya-first.md §7). Pure, so
+# --self-test drives it: <response body carrying x_lemonade_route> <class> <model>. All four have to
+# hold: the class's Laya rule matched, the request went to that class's model, the request did NOT fall
+# open to default_model, and Laya's score is in the trace. A request that landed on the right model by
+# accident - a deterministic rule, or the default - is a FAIL: the row exists to prove Laya decided.
+#
+# Spaces are stripped before matching because the decision is embedded JSON whose spacing is the
+# server's business; none of the field names or values matched here carry spaces.
+laya_verdict() {
+    _b=$(printf '%s' "${1:-}" | tr -d ' \n\r\t')
+    _cls=${2:-} _want=${3:-}
+    # A gate fails closed on input it cannot interpret: a class this script has no model for would
+    # otherwise skip both the class and the model check and PASS on shape alone (a row added without
+    # touching laya_class_model is exactly how that happens).
+    if [ -n "$_cls" ] && [ -z "$(laya_class_model "$_cls")" ]; then
+        printf 'FAIL no model is named for class %s in this script' "$_cls"; return
+    fi
+    printf '%s' "$_b" | grep -q '"matched_rule":"laya-' || {
+        printf 'FAIL no Laya rule matched the request'; return; }
+    _rule=$(printf '%s' "$_b" | sed -n 's/.*"matched_rule":"laya-\([^"]*\)".*/\1/p')
+    if [ -n "$_cls" ] && [ "$_rule" != "$_cls" ]; then
+        printf 'FAIL matched the %s rule, not the %s one' "$_rule" "$_cls"; return
+    fi
+    printf '%s' "$_b" | grep -q '"default_used":true' && {
+        printf 'FAIL fell open to default_model, so Laya did not decide'; return; }
+    printf '%s' "$_b" | grep -q '"condition":"classifier:laya"' || {
+        printf 'FAIL no Laya score in the trace'; return; }
+    if [ -n "$_want" ]; then
+        printf '%s' "$_b" | grep -q "\"route_to\":\"$_want\"" || {
+            printf 'FAIL routed to another model than %s' "$_want"; return; }
+    fi
+    printf 'PASS'
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -522,6 +566,33 @@ next')
     rm -f "$ST/set/manifest.json"
     st FAIL "a sealed set with no manifest at all" "$ST/set"
     rm -rf "$ST"
+    # docs/laya-first.md §7: the laya-auto row. The second case is the one a status-only row misses - the
+    # request answered 200 on default_model, which looks like a healthy route until you read the decision.
+    LV='{"x_lemonade_route":{"route_to":"Qwen3-Coder-30B-A3B-Instruct-1bit","matched_rule":"laya-code","default_used":false,"trace":[{"condition":"classifier:laya","label":"code","score":0.46}]}}'
+    check PASS "$(laya_verdict "$LV" code Qwen3-Coder-30B-A3B-Instruct-1bit)"
+    check PASS "$(laya_verdict "$LV" '' '')"
+    check FAIL "$(laya_verdict '{"x_lemonade_route":{"route_to":"Qwen3-0.6B-1bit","matched_rule":"laya-code","default_used":true,"trace":[{"condition":"classifier:laya","score":0.46}]}}' code Qwen3-0.6B-1bit)"   # fell open
+    check FAIL "$(laya_verdict '{"x_lemonade_route":{"route_to":"Qwen3-0.6B-1bit","matched_rule":"long-input","default_used":false,"trace":[]}}' code Qwen3-0.6B-1bit)"   # a deterministic rule decided
+    check FAIL "$(laya_verdict "$LV" prose '')"                                        # the wrong class's rule matched
+    check FAIL "$(laya_verdict "$LV" code Qwen3-0.6B-1bit)"                            # the wrong model
+    check FAIL "$(laya_verdict '{"x_lemonade_route":{"route_to":"m","matched_rule":"laya-code","default_used":false,"trace":[]}}' code m)"   # no Laya score
+    check 'FAIL no model is named for class not-a-class' "$(laya_verdict "$LV" not-a-class '')"   # an unmapped class must not skip the checks
+    check FAIL "$(laya_verdict '' code m)"                                             # nothing answered
+    # the row's class -> model mapping mirrors config/laya-first.json; assert it here so a table change is
+    # a red self-test rather than a row that checks agreement with a mapping nobody updated
+    map_check() {  # <class> <want model>
+        _got=$(laya_class_model "$1")
+        if [ "$_got" = "$2" ]; then printf 'ok   %s -> %s\n' "$1" "$_got"
+        else printf 'FAIL %s -> %s (want %s)\n' "$1" "$_got" "$2"; rc=1; fi
+    }
+    map_check short Qwen3-0.6B-1bit
+    map_check prose ZAYA1-8B-1bit
+    map_check code Qwen3-Coder-30B-A3B-Instruct-1bit
+    map_check long_doc Qwen3.8-27B-1bit
+    map_check not-a-class ''
+    # a body with the answer text in front of the decision still decides on the decision
+    check PASS "$(laya_verdict '{"choices":[{"message":{"content":"Here you go"}}],"x_lemonade_route":{"route_to":"m","matched_rule":"laya-prose","default_used":false,"trace":[{"condition":"classifier:laya","score":0.77}]}}' prose m)"
+
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
     exit $rc
 fi
@@ -983,6 +1054,67 @@ elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
     skip chat-npu-followup "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
 else
     skip chat-npu-followup "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
+
+# ── the first request, decided by Laya (docs/laya-first.md §7) ───────────────────────────────────
+# A cold Lemonade loads no model; the first request must go through Laya's router, which classifies it
+# and picks one of OUR models. The row sends one prompt per class through the Laya-first router
+# (`1bit laya-first` emits that collection's policy) and reads the router's own decision back. What
+# makes it a row rather than a chat test: the decision has to say Laya decided - the class's own rule,
+# no fall-through to default_model, and Laya's score in the trace. A request that lands on the right
+# model by accident (a deterministic rule, or the default) fails laya_verdict, because the whole point
+# of the appliance's first request is who chose.
+#
+# The class -> model pairs below mirror config/laya-first.json. If the table changes, this row fails
+# loudly instead of quietly checking yesterday's promise; the engine's `1bit laya-first --check`
+# validates the table itself.
+# The router's name comes from the engine itself: `1bit laya-first` prints the collection Lemonade
+# registers (user.Laya-First in the shipped table). Hardcoding it here would break the row the day the
+# table's name changes - and a name is not a detail, the server only registers `user.*` definitions.
+LAYA_ROUTER=user.Laya-First
+LAYA_BIN=
+for _b in $(command -v 1bit 2>/dev/null) /opt/1bit-engine/1bit /opt/1bit/1bit /opt/1bit-package/bin/1bit; do
+    [ -x "$_b" ] && { LAYA_BIN=$_b; break; }
+done
+if [ -n "$LAYA_BIN" ]; then
+    _n=$("$LAYA_BIN" laya-first 2>/dev/null | sed -n 's/.*"model_name": *"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$_n" ] && LAYA_ROUTER=$_n
+fi
+if ! printf '%s' "${MODELS:-}" | grep -q "\"$LAYA_ROUTER\""; then
+    skip laya-auto "no $LAYA_ROUTER router is registered (it needs a Laya checkpoint - scripts/fetch-laya.sh - and the desugared policy registered: 1bit laya-first --policy FILE)"
+else
+    LAYA_FAILS=0
+    LAYA_SEEN=
+    # auth_post_watch, not auth_post: the latter spells its body as wget's `--post-data`, so on an image
+    # with curl but no wget it returns nothing and every post row reads as "no answer" (measured while
+    # exercising this row off the stick). This helper handles both fetchers and hands back the body.
+    LAYA_BODY=/tmp/1bit-laya-body.$$
+    : > "$LAYA_BODY"
+    laya_probe() {  # <class> <prompt>
+        _cls=$1
+        _want=$(laya_class_model "$_cls")
+        _body="{\"model\":\"$LAYA_ROUTER\",\"messages\":[{\"role\":\"user\",\"content\":$(json_text "$2" | sed 's/.*/"&"/')}],\"max_tokens\":16,\"temperature\":0,\"route_trace\":true}"
+        _st=$(auth_post_watch "$_body" "$API/api/v1/chat/completions" "$LAYA_BODY")
+        case "${_st%% *}" in
+            200) ;;
+            *)   printf '      %s: the router did not answer (status %s)\n' "$_cls" "${_st%% *}"
+                 LAYA_FAILS=$((LAYA_FAILS + 1)); return ;;
+        esac
+        _v=$(laya_verdict "$(cat "$LAYA_BODY" 2>/dev/null)" "$_cls" "$_want")
+        case "$_v" in
+            PASS) LAYA_SEEN="$LAYA_SEEN ${_cls}->${_want}";;
+            *)    printf '      %s: %s\n' "$_cls" "$_v"; LAYA_FAILS=$((LAYA_FAILS + 1));;
+        esac
+    }
+    # one prompt per class, each short enough to answer on a cold 0.6B and unmistakable to Laya
+    laya_probe short "Say hello in five words."
+    laya_probe prose "Summarise what tides are and why they happen, in two sentences."
+    laya_probe code "Write a Python function that reverses a linked list."
+    if [ "$LAYA_FAILS" = 0 ]; then
+        pass laya-auto "Laya decided all three:${LAYA_SEEN}"
+    else
+        fail laya-auto "$LAYA_FAILS of 3 classes were not decided by Laya (see the lines above)"
+    fi
 fi
 
 # ── NPU chat the way a person uses it: after a reload, streaming, thinking on (engine #911, c21 board) ──────

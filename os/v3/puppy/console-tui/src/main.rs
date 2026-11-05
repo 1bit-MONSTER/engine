@@ -218,6 +218,7 @@ fn run() -> ExitCode {
     // asked once: sshd sets SSH_CONNECTION/SSH_TTY for the whole session, tty1 respawn sets neither
     app.ssh = over_ssh();
     let mut last_spin = Instant::now();
+    let mut last_heal = Instant::now();
     let rc = loop {
         while let Ok(f) = rx.try_recv() {
             let keep = app.log_scroll;
@@ -232,6 +233,19 @@ fn run() -> ExitCode {
         if !app.facts.reachable() && last_spin.elapsed() >= Duration::from_millis(250) {
             app.spin = app.spin.wrapping_add(1);
             last_spin = Instant::now();
+        }
+        // Nothing keeps other writers off tty1: kernel printk (the board's cmdline is `console=ttyS0,115200 console=tty0`,
+        // so every amdgpu/amdxdna line is painted here), `1bit-release-check`'s NPU notice, a program the dialog menu ran.
+        // ratatui writes only the cells whose CONTENT changed since its own last frame, so one of those lines is a wrong
+        // screen that a keypress does not fix - measured: three stray lines and a keypress left every panel row showing
+        // the log pane's text. So the frame is rebuilt in full, from a cleared screen, once a second: the write is a
+        // Clear plus absolute positions (no full-screen flash on the VT) and the cost is one frame per second, which is
+        // what a stray line can then cost the reader.
+        if last_heal.elapsed() >= Duration::from_secs(1) {
+            if term.clear().is_err() {
+                break 1;
+            }
+            last_heal = Instant::now();
         }
         let mut links = Vec::new();
         if term.draw(|f| ui::draw(f, &app, &mut links)).is_err() {

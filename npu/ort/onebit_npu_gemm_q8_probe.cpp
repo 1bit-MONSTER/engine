@@ -21,6 +21,13 @@
 // accumulators to be identical — an exact integer sum cannot differ, so a difference here is a
 // wrong layout or a truncated K, not rounding.
 //
+// It also prices the one-slot weight cache: `gemm_q8_raw` re-packs and re-syncs the weight BO when
+// the call's weight pointer differs from the one cached on the kernel, which every call of a model
+// pass does (a kernel is keyed by (K, N), so 28 different weights of one shape go through it in a
+// row). A second timed pass calls with `nw` different weights in rotation and reports the difference
+// against the cached pass: that delta is what one-slot caching costs per call, and it is a unit
+// measurement on the device rather than a subtraction between two model runs.
+//
 //   onebit_npu_gemm_q8_probe <K> <N> <M> [repeats]      (repeats >= 2: it is the sample count)
 //
 // `repeats` is the number of calls *timed* on each leg, so both columns are an honest per-call
@@ -126,6 +133,39 @@ int main(int argc, char** argv) {
                 "speedup %.2fx\n",
                 (long long)m, (long long)k, (long long)n, repeats, dev_ms, host_ms,
                 dev_ms > 0.0 ? host_ms / dev_ms : 0.0);
+
+    // The one-slot cache priced: the same call, but every call arrives with a different weight, so
+    // gemm_q8_raw writes and syncs the whole weight BO each time. The difference from `dev_ms` is the
+    // re-pack + weight writeback per call — no model-level subtraction, and the shape, the rows and the
+    // launches are identical in both passes.
+    const int nw = 4;
+    std::vector<std::vector<int8_t>> weights((size_t)nw, std::vector<int8_t>((size_t)k * (size_t)n));
+    for (auto& w : weights)
+        for (auto& v : w) v = (int8_t)next();
+    const auto r0 = std::chrono::steady_clock::now();
+    for (int r = 0; r < repeats; r++) {
+        const int8_t* wr = weights[(size_t)r % (size_t)nw].data();
+        if (!onebit::npu::gemm_q8_raw(a.data(), m, k, n, wr, got.data(), &err)) {
+            std::printf("NPU q8 gemm failed on the rotating-weight repeat %d: %s\n", r, err.c_str());
+            return 3;
+        }
+    }
+    const auto r1 = std::chrono::steady_clock::now();
+    const double rot_ms = ms_per_call(r0, r1, repeats);
+    // `got` now holds the last rotation's weight, so re-check that one: a re-packed weight that lands in
+    // the wrong bytes has to fail here, not only in the cached pass.
+    const int8_t* last_w = weights[(size_t)(repeats - 1) % (size_t)nw].data();
+    host_gemm(a.data(), last_w, ref.data(), m, k, n);
+    for (size_t i = 0; i < got.size(); i++)
+        if (got[i] != ref[i]) {
+            bad++;
+            if (first < 0) first = (int64_t)i;
+            worst = std::max<int64_t>(worst, llabs((int64_t)got[i] - (int64_t)ref[i]));
+        }
+    std::printf("q8 gemm one-slot cache: same weight %.3f ms/call, a different weight every call "
+                "%.3f ms/call -> re-pack + weight BO sync %.3f ms/call\n",
+                dev_ms, rot_ms, rot_ms - dev_ms);
+
     if (bad != 0) {
         const size_t i = (size_t)first;
         std::printf("  %lld of %lld accumulators differ, worst |d|=%lld, first at [%lld,%lld]: "

@@ -34,8 +34,10 @@
 //      built before the blocked one).
 #include "q4nx_weight_layout.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -120,6 +122,56 @@ void test_row_major_unchanged() {
                       (size_t)i * 128 + (size_t)j, "row-major index moved");
 }
 
+// pack_int8_image() writes a whole weight image at microtile granularity (it is what
+// onnx/ort/onebit_npu_gemm.cpp re-runs on every call whose weight is not the one cached
+// on that kernel, so its cost is on the decode path).  Its contract is the scatter:
+// the same bytes as writing one element at a time through the index function, and zero
+// everywhere the logical K x N matrix does not reach.  Compared byte for byte, with
+// ragged K/N edges and with KD/ND padded past them, in both layouts.
+void test_pack_matches_scatter(int K, int N, int KD, int ND) {
+    std::vector<int8_t> src((size_t)K * (size_t)N);
+    for (size_t x = 0; x < src.size(); x++)  // mixed signs, zeros and +-127: a misplaced byte shows
+        src[x] = (int8_t)((int)((x * 37u + 11u) % 255u) - 127);
+    std::vector<int8_t> want((size_t)KD * (size_t)ND, 0), got((size_t)KD * (size_t)ND, 0);
+
+    for (int i = 0; i < K; i++)
+        for (int j = 0; j < N; j++)
+            want[q4nx_layout::blocked_index((size_t)i, (size_t)j, KD, ND)] = src[(size_t)i * N + j];
+    q4nx_layout::pack_int8_image(got.data(), src.data(), K, N, KD, ND, /*blocked=*/true);
+    for (size_t x = 0; x < want.size(); x++)
+        if (want[x] != got[x]) {
+            std::printf("FAIL blocked pack differs from the scatter at byte %zu (K=%d N=%d KD=%d ND=%d): "
+                        "%d, scatter says %d\n",
+                        x, K, N, KD, ND, (int)got[x], (int)want[x]);
+            failures++;
+            return;
+        }
+
+    std::fill(want.begin(), want.end(), 0);
+    std::fill(got.begin(), got.end(), 0);
+    for (int i = 0; i < K; i++)
+        for (int j = 0; j < N; j++)
+            want[q4nx_layout::rowmajor_index((size_t)i, (size_t)j, KD, ND)] = src[(size_t)i * N + j];
+    q4nx_layout::pack_int8_image(got.data(), src.data(), K, N, KD, ND, /*blocked=*/false);
+    for (size_t x = 0; x < want.size(); x++)
+        if (want[x] != got[x]) {
+            std::printf("FAIL row-major pack differs from the scatter at byte %zu (K=%d N=%d KD=%d ND=%d): "
+                        "%d, scatter says %d\n",
+                        x, K, N, KD, ND, (int)got[x], (int)want[x]);
+            failures++;
+            return;
+        }
+}
+
+void test_pack_geometries() {
+    // Whole tiles (the shapes the EP configures), padded past the logical matrix, and
+    // ragged on both axes (the 8- and 64/128-tile edges that the fast path skips over).
+    const int cases[][4] = {{64, 128, 64, 128},   {192, 384, 192, 384}, {1024, 2048, 1024, 2048},
+                            {6, 6, 64, 128},      {100, 200, 128, 256}, {40, 7, 64, 128},
+                            {1024, 1024, 1024, 1024}};
+    for (const auto& c : cases) test_pack_matches_scatter(c[0], c[1], c[2], c[3]);
+}
+
 }  // namespace
 
 int main() {
@@ -130,11 +182,12 @@ int main() {
     }
     test_refusals();
     test_row_major_unchanged();
+    test_pack_geometries();
     if (failures) {
         std::printf("npu_blocked_layout_test: %d failure(s)\n", failures);
         return 1;
     }
     std::printf("npu_blocked_layout_test: OK (bijection, tile windows, microkernel order, "
-                "refusals, row-major)\n");
+                "refusals, row-major, pack == scatter)\n");
     return 0;
 }

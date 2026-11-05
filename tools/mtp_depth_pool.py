@@ -28,6 +28,11 @@
 #      disagreement between two tickets (or a format change), never an average to be taken.
 # A ticket's own run-level row is the sum of its per-prompt rows, so it is checked too: a truncated log cannot
 # then pass silently as a smaller window.
+#   3. a depth the tool reported as "n/a ... not scored" is carried through as UNMEASURED instead of being
+#      dropped, and a pooled prompt set that is not contiguous says so.  Both are one failure: a pool that only
+#      reports the cells it scored can read as a complete pass over a window it never covered -- at tau>0 the
+#      chain gate stops before depths 3-4 (npu/mtp/mtp_head.h:96), and this lane's tickets are per-prompt slices,
+#      so a gap in either direction is normal and must be visible in the verdict.
 #
 #   tools/mtp_depth_pool.py ticket-a.log ticket-b.log ...   # pooled table + the 2 pp verdict per depth
 #   tools/mtp_depth_pool.py --selftest                      # the refusals and the arithmetic, no logs needed
@@ -47,6 +52,10 @@ BAR = 2.0  # the brief's bar, in percentage points
 #     depth 2: live  52.78 % (38/72)  offline  52.11 % (37/71)  delta  +0.67 pp  PASS
 DETAIL = re.compile(r"depth (\d+):\s+live\s+-?[\d.]+ %\s+\((\d+)/(\d+), reached\)\s+"
                     r"offline conditional\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)")
+# The third shape: the tool refuses to score a depth one side never reached and says so on both the per-prompt and
+# the run-level lines (npu/mtp/mtp_head.h:96 -- "0/0 is not agreement"):
+#     depth 4: n/a (live 0/0 reached, offline 15/20)  not scored
+NOTSCORED = re.compile(r"depth (\d+):\s+n/a \(live (\d+)/(\d+) reached, offline (\d+)/(\d+)\)")
 RUNLEVEL = re.compile(r"depth (\d+):\s+live\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+"
                       r"offline\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+delta")
 PROMPT = re.compile(r"(?:per-depth p|prompt )(\d+)\b")
@@ -57,12 +66,12 @@ RECORDED = {1: (136, 181, 136, 181), 2: (86, 136, 84, 134), 3: (63, 86, 60, 82),
 
 
 def parse_ticket(path):
-    """Return {prompt, depth: (live_n, live_d, off_n, off_d)} for one ticket log.
+    """Return ({prompt, depth: (live_n, live_d, off_n, off_d)}, {depths the log says were not scored}).
 
     Raises SystemExit on a log it must not pool: a depth row before any prompt header (nothing to key it to),
     a cell scored twice with different counts, or per-prompt rows that do not add up to the ticket's own
     run-level row (a short read)."""
-    cells, runlevel, prompt = {}, {}, None
+    cells, runlevel, prompt, not_scored = {}, {}, None, set()
     for ln in open(path, errors="replace").read().splitlines():
         if "== ticket exited" in ln:  # trap 1: everything after this is the harness echoing the summary
             break
@@ -82,6 +91,10 @@ def parse_ticket(path):
                                  f"different counts {cells[key]} then {got}")
             cells.setdefault(key, got)
             continue
+        m = NOTSCORED.search(ln)
+        if m:
+            not_scored.add(int(m.group(1)))
+            continue
         m = RUNLEVEL.search(ln)
         if m:
             runlevel[int(m.group(1))] = (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
@@ -95,14 +108,18 @@ def parse_ticket(path):
     if runlevel and len(runlevel) != len({d for _, d in cells}):
         raise SystemExit(f"mtp_depth_pool: {path}: run-level row covers {sorted(runlevel)} but per-prompt rows "
                          f"cover {sorted({d for _, d in cells})}")
-    return cells
+    return cells, not_scored
 
 
 def pool(paths):
-    """Union the tickets' cells, refusing any disagreement on a key.  Returns (cells, sources)."""
-    seen, sources = {}, 0
+    """Union the tickets' cells, refusing any disagreement on a key.
+
+    Returns (cells, unmeasured, sources); `unmeasured` holds the depths some ticket reported as `not scored`
+    that no ticket scored a cell for -- kept, so the pool cannot report a pass over a depth it never saw."""
+    seen, unmeasured, sources = {}, set(), 0
     for p in paths:
-        rows = parse_ticket(p)
+        rows, not_scored = parse_ticket(p)
+        unmeasured |= not_scored
         if not rows:
             print(f"mtp_depth_pool: {p}: no matched rows (was it run with --live --match?)", file=sys.stderr)
             continue
@@ -112,15 +129,28 @@ def pool(paths):
                 raise SystemExit(f"mtp_depth_pool: {p} disagrees with an earlier ticket on prompt {k[0]} "
                                  f"depth {k[1]}: {seen[k]} then {v}")
             seen.setdefault(k, v)
-    return seen, sources
+    return seen, unmeasured - {d for _, d in seen}, sources
 
 
-def table(seen, sources):
+def coverage(prompts):
+    """The pooled prompt set, saying out loud when it is a slice with holes rather than a contiguous window.
+
+    A missing prompt is not a formatting detail: the brief's window is prompts 0..7, so a pool over 0,1,5,6,7
+    printed as "prompts 0..7" reads as the whole window while five of eight prompts were measured."""
+    lo, hi, have = prompts[0], prompts[-1], set(prompts)
+    missing = [p for p in range(lo, hi + 1) if p not in have]
+    if not missing:
+        return f"prompts {lo}..{hi}"
+    return (f"prompts {','.join(str(p) for p in prompts)} -- NOT a contiguous window: "
+            f"{','.join(str(p) for p in missing)} missing of {lo}..{hi}")
+
+
+def table(seen, sources, unmeasured=()):
     """Print the pooled per-depth table; return (inside, scored, totals per depth)."""
     depths = sorted({d for _, d in seen})
     prompts = sorted({p for p, _ in seen})
     print(f"pooled {len(seen)} scored cells = {len(prompts)} prompts x {len(depths)} depths "
-          f"(prompts {prompts[0]}..{prompts[-1]}, {sources} ticket(s))")
+          f"({coverage(prompts)}, {sources} ticket(s))")
     print(f"\n{'depth':>5}  {'live':>18}  {'offline (same positions)':>24}  {'delta':>9}  verdict")
     inside = scored = 0
     totals = {}
@@ -142,7 +172,15 @@ def table(seen, sources):
         print(f"{d:>5}  {f'{live_n}/{live_d} = {100.0 * live_n / live_d:.2f}%':>18}  "
               f"{f'{off_n}/{off_d} = {100.0 * off_n / off_d:.2f}%':>24}  {f'{delta:+.2f} pp':>9}  "
               f"{'PASS' if ok else 'FAIL'}")
-    print(f"\n{inside} of {scored} scored depths within {BAR:g} pp at the same positions")
+    for d in sorted(unmeasured):
+        # Named, not omitted: the depth was asked for and no chain in any ticket reached it, so it is
+        # unmeasured -- and a table that simply lacks the row reads as a window that shrank to fit.
+        print(f"{d:>5}  unmeasured -- no chain reached this depth in any ticket; not scored")
+    tail = ""
+    if unmeasured:
+        tail = (f" ({len(unmeasured)} of {len(depths) + len(unmeasured)} depths unmeasured: "
+                f"{','.join(str(d) for d in sorted(unmeasured))})")
+    print(f"\n{inside} of {scored} scored depths within {BAR:g} pp at the same positions{tail}")
     return inside, scored, totals
 
 
@@ -189,7 +227,7 @@ def refusal_selftest():
         fh.write("prompt 0: TEXT IDENTICAL\n" + d1 + run + tail)
         path = fh.name
     try:
-        cells = parse_ticket(path)
+        cells, _ = parse_ticket(path)
         if cells != {(0, 1): (8, 10, 8, 10)}:
             print(f"selftest FAIL tail repeat: parsed {cells}, wanted only the first row", file=sys.stderr)
             return 1
@@ -207,11 +245,11 @@ def main(argv):
             return refusal_selftest()
         print(__doc__)
         return 2
-    seen, sources = pool(paths)
+    seen, unmeasured, sources = pool(paths)
     if not seen:
         print("mtp_depth_pool: nothing to pool", file=sys.stderr)
         return 1
-    _, _, totals = table(seen, sources)
+    _, _, totals = table(seen, sources, unmeasured)
     if not selftest:
         return 0
     bad = {d: (totals.get(d), RECORDED[d]) for d in RECORDED if totals.get(d) != RECORDED[d]}

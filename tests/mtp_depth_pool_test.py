@@ -133,7 +133,49 @@ check(rc5 == 0, "a depth with an empty denominator does not fail the run")
 check("no denominator" in out5 and "1 of 1 scored depths" in out5,
       "the empty depth is reported as unmeasured and excluded from the scored count")
 
-# 6. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
+# 6. a depth the LOG reported as `not scored` is carried through as unmeasured, not dropped.
+#
+# The tool prints `depth 4: n/a (live 0/0 reached, offline 15/20)  not scored` instead of a `%` row whenever one
+# side has no denominator (npu/mtp/mtp_head.h:96), and at tau>0 the chain gate stops before depths 3-4.  A pool
+# that only kept the rows it could score dropped the depth entirely, so the table and the verdict line read as a
+# complete pass over a table that had quietly lost a depth -- the phantom-depth read (#916) one layer up.
+NOTSCORED = """prompt 0: TEXT IDENTICAL, 64 tokens, accepted 20/40, passes/token 0.500, stream 72 rows, 0 mismatch
+  per-depth p0: 1 18/20 2 13/20 3 2/20 4 0/20
+  match p0: 20 offline chains at this loop's own positions (stream 72 rows)
+depth 1: live  90.00 % (18/20, reached)  offline conditional  90.00 % (18/20)
+depth 2: live  65.00 % (13/20, reached)  offline conditional  65.00 % (13/20)
+depth 3: live  10.00 % (2/20, reached)  offline conditional  10.00 % (2/20)
+depth 4: n/a (live 0/0 reached, offline 15/20)  not scored
+depth 1: live  90.00 % (18/20)  offline  90.00 % (18/20)  delta  +0.00 pp  PASS
+depth 2: live  65.00 % (13/20)  offline  65.00 % (13/20)  delta  +0.00 pp  PASS
+depth 3: live  10.00 % (2/20)  offline  10.00 % (2/20)  delta  +0.00 pp  PASS
+depth 4: n/a (live 0/0 reached, offline 15/20)  not scored
+"""
+rc6, out6, _ = run([], [("notscored.log", NOTSCORED)])
+check(rc6 == 0, "a log with a not-scored depth still pools")
+check("unmeasured -- no chain reached this depth" in out6, "the not-scored depth is printed as unmeasured")
+check("4  unmeasured" in out6, "... and it is depth 4, the one the log named")
+check("3 of 3 scored depths" in out6 and "1 of 4 depths unmeasured: 4" in out6,
+      f"the verdict says 3 of 4 depths, not a bare '3 of 3': {out6.strip().splitlines()[-1]}")
+
+# 7. a pooled prompt set with a hole says so, instead of printing the range it spans.
+#
+# This lane runs one or two prompts per ticket, so prompts 0,1,5,6,7 is a normal pool -- but printed as
+# "prompts 0..7" it reads as the brief's whole window.
+def ticket(p):
+    return (f"prompt {p}: TEXT IDENTICAL, 64 tokens, accepted 4/16, passes/token 0.500, stream 72 rows, 0 mismatch\n"
+            f"depth 1: live  80.00 % (8/10, reached)  offline conditional  80.00 % (8/10)\n"
+            f"depth 1: live  80.00 % (8/10)  offline  80.00 % (8/10)  delta  +0.00 pp  PASS\n")
+
+
+rc7, out7, _ = run([], [(f"p{p}.log", ticket(p)) for p in (0, 1, 5)])
+check(rc7 == 0, "a gapped prompt set pools without a refusal (per-prompt tickets are the normal case)")
+check("NOT a contiguous window: 2,3,4 missing of 0..5" in out7,
+      f"the header names the hole instead of spanning it: {out7.splitlines()[0]}")
+rc8, out8, _ = run([], [(f"q{p}.log", ticket(p)) for p in (0, 1, 2)])
+check("prompts 0..2" in out8 and "NOT a contiguous" not in out8, "a contiguous pool keeps the plain range form")
+
+# 8. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
 r = subprocess.run([sys.executable, TOOL, "--selftest"], capture_output=True, text=True)
 check(r.returncode == 0 and "selftest PASS tail repeat" in r.stdout, "the tool's refusal self-test passes")
 

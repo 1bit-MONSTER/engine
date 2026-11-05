@@ -65,12 +65,14 @@ start() {
     # lives in RAM and says so, rather than pretending to persist.
     if grep -q " /data " /proc/mounts 2> /dev/null; then
         LEM=/data/lemonade
+        MODELS=/data/models
         export GGML_HRX_JIT_CACHE_DIR=/data/cache/hrx-jit
     else
         LEM=/var/lib/lemonade
+        MODELS=$LEM/models
         echo "10lemonade: no /data partition: Lemonade state is in RAM, nothing persists"
     fi
-    mkdir -p "$LEM/cache" "$LEM/config"
+    mkdir -p "$LEM/cache" "$LEM/config" "$MODELS"
     # Cycle 25, owner: "log verbose it all for proof". lemond's verbosity is a config.json key, NOT a flag and NOT an
     # env var (measured on the pinned build: `lemond --help` has only -v/--version, and the accepted strings come from
     # AixLog::to_severity in runtime_config.cpp: trace|debug|info|warning|error|fatal|none, default info).
@@ -81,8 +83,8 @@ start() {
     # A level somebody set is never overwritten - it is theirs, and the console's menu is where they set it.
     CONFJSON=$LEM/config/config.json
     if [ ! -f "$CONFJSON" ]; then
-        printf '%s\n' '{"log_level": "debug", "log_max_file_size_mb": 8, "log_max_files": 3}' > "$CONFJSON" \
-            && echo "10lemonade: seeded $CONFJSON (log_level=debug, 8 MB x 3 rotation)"
+        printf '%s\n' "{\"log_level\": \"debug\", \"log_max_file_size_mb\": 8, \"log_max_files\": 3, \"extra_models_dir\": \"$MODELS\"}" > "$CONFJSON" \
+            && echo "10lemonade: seeded $CONFJSON (log_level=debug, 8 MB x 3 rotation, extra_models_dir=$MODELS)"
     elif ! grep -q '"log_level"' "$CONFJSON" 2> /dev/null; then
         if command -v python3 > /dev/null 2>&1; then
             python3 - "$CONFJSON" <<'PY' && echo "10lemonade: added log_level=debug to $CONFJSON"
@@ -99,6 +101,24 @@ PY
         fi
     else
         echo "10lemonade: honouring the log_level already in $CONFJSON"
+    fi
+    # Cycle 26: lemond only scans a models directory when `extra_models_dir` is set - ScanCatalog::enumerate() returns
+    # nothing for an empty setting - so files staged in /data/models were invisible and the catalogue read "none
+    # downloaded" while they sat on the medium. Measured on the shipping payload: 213 rows without the key, 214 with it,
+    # the extra row `Qwen3-0.6B-Q8_0 | source: extra_models_dir`. Seeded on its own and only when absent, so a config that
+    # already carries the key (the stick writer stages one) keeps the value it has.
+    if ! grep -q '"extra_models_dir"' "$CONFJSON" 2> /dev/null; then
+        if command -v python3 > /dev/null 2>&1; then
+            python3 - "$CONFJSON" "$MODELS" <<'PY' && echo "10lemonade: added extra_models_dir=$MODELS to $CONFJSON"
+import json, sys
+p, models = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d.setdefault("extra_models_dir", models)
+json.dump(d, open(p, "w"), indent=2)
+PY
+        else
+            echo "10lemonade: $CONFJSON has no extra_models_dir and python3 is missing - models in $MODELS stay invisible" >&2
+        fi
     fi
     # lemond's positionals are cache_dir config_dir (lemond --help); the rest are the runtime overrides.
     # Blank mode is LAN-reachable on purpose: the appliance is a server, Lemonade's own web UI and Lemonade Mobile

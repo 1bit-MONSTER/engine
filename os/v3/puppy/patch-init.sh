@@ -58,6 +58,17 @@ PROG2='*** 1bit: system in RAM after'
 # 1BIT-DATA partitions exist (engine#539/#711). --verify greps the packed initrd for this marker.
 UUID_MARK='1bit: pupsfs=UUID'
 
+# engine#1159: a slow USB medium is not a failure. Puppy's wait_for_blkid() polls blkid 15 times, one second apart,
+# and then gives up - which the cycle-26 board boot hit: the stick's own SCSI probe did not finish until 45.7 s
+# (kernel log: `scsi 0:0:0:0: Direct-Access General UDisk` at 3.8 s, two `usb 3-2: reset high-speed USB device`
+# cycles from the JetKVM's emulated media on the same xHCI controller, `sda: sda1 sda2` at 45.7 s), so the screen
+# said `Waiting for partition [1BIT-DATA]............... failed` on a medium blkid had already called healthy - and
+# every gate was green because QEMU answers in 3.7 s. The budget is now 120 s and the wait says out loud that it is
+# still waiting, so a slow medium is a slow boot instead of a failure.
+SLOW_MARK='1bit: a slow medium is not a failure'
+PART_TRIES=120
+PART_NEED=90
+
 rescue_block() {
 cat <<'ONEBLOCK'
 # 1bit: say it on every console a person might be watching. Since cycle 15 the boot line ends with
@@ -137,8 +148,15 @@ verify_initrd() {
     # rescue console instead of booting, so the packed initrd has to carry the resolver too
     grep -qF "$UUID_MARK" "$tmp/init" || {
         rm -rf "$tmp"; die "$gz: /init cannot resolve pupsfs=UUID=<uuid> (engine#865: an installed disk would not boot)"; }
+    # engine#1159: and its partition wait has to outlast a slow USB medium - see SLOW_MARK above
+    grep -qF "$SLOW_MARK" "$tmp/init" && grep -qF 'one_console "*** 1bit: still waiting' "$tmp/init" || {
+        rm -rf "$tmp"; die "$gz: /init's partition wait is the stock 15 s and says nothing while it waits (engine#1159: the board needed 45.7 s)"; }
+    tries=$(sed -n 's/^[[:space:]]*for NUM in \$(seq 1 \([0-9]\+\)); do$/\1/p' "$tmp/init" | head -1)
+    [ "${tries:-0}" -ge "$PART_NEED" ] || {
+        rm -rf "$tmp"; die "$gz: /init waits ${tries:-0}s for the partition, less than the ${PART_NEED}s this board needs (engine#1159)"; }
     rm -rf "$tmp"
-    echo "ok: $gz: /init carries the guard, all 3 failure paths reach it, both progress lines, and the pupsfs=UUID resolver"
+    echo "ok: $gz: /init carries the guard, all 3 failure paths reach it, both progress lines, the pupsfs=UUID resolver,"
+    echo "    and a ${tries}s partition wait that says it is still waiting"
 }
 
 if [ "${1:-}" = "--verify" ]; then
@@ -284,6 +302,40 @@ if ! patch_pupsfs_uuid "$init"; then
     die "could not teach init to resolve pupsfs=UUID=<uuid> (engine#865)"
 fi
 echo "   wait_for_blkid resolves UUID= and LABEL= tokens (engine#865)"
+
+# engine#1159: the stock wait gives up after 15 s and says nothing while it waits. Measured on the cycle-26 board
+# boot: healthy medium, partition published at 45.7 s, init gave up at 15 s -> `Waiting for partition [...]... failed`.
+patch_slow_medium() {
+    local f=$1 tmp
+    grep -qF "$SLOW_MARK" "$f" && return 0
+    grep -qF 'for NUM in $(seq 1 ' "$f" || {
+        echo "$prog: $f has no wait_for_blkid poll loop - upstream changed, re-measure" >&2; return 1; }
+    tmp=$(mktemp) || return 2
+    awk -v tries="$PART_TRIES" -v mark="$SLOW_MARK" '
+        index($0, "for NUM in $(seq 1 ") && !d1 {
+            sub(/\(seq 1 [0-9]+\)/, "(seq 1 " tries ")")
+            print
+            d1 = 1
+            next
+        }
+        index($0, "#yellow dot") && !d2 {
+            print "\t# " mark ": the kernel can take tens of seconds to publish the partition on USB, and a wait"
+            print "\t# that gives up quietly looks exactly like a hang (cycle-26 board boot: 45.7 s, engine#1159)"
+            print "\t[ $NUM -eq 15 ] && one_console \"*** 1bit: still waiting for [$1] - a slow medium is not a failure (the kernel has not published the partition yet)\""
+            print
+            print
+            d2 = 1
+            next
+        }
+        { print }
+    ' "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
+    grep -qF "$SLOW_MARK" "$tmp" && grep -qF 'one_console "*** 1bit: still waiting' "$tmp" || { rm -f "$tmp"; return 1; }
+    cat "$tmp" > "$f" && rm -f "$tmp"
+}
+if ! patch_slow_medium "$init"; then
+    die "could not make init's partition wait outlast a slow medium (engine#1159)"
+fi
+echo "   partition wait: ${PART_TRIES}s, and it says so at 15 s instead of looking hung (engine#1159)"
 
 if ! patch_progress "$init"; then
     die "could not add the 1bit boot-progress lines to $init"

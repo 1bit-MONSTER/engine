@@ -1,0 +1,35 @@
+== ticket 'clause55 p1-4' 20261105-115551  hold=16min  argv: --live --match --prompts 4 --prompt-base 1 --tokens 64 --k 4 --tau 0
+[   66s] forward ready: vocab 248320, max_batch_rows 16, hidden source post-final-norm
+[  177s] prompt 1: TEXT IDENTICAL, 64 tokens, accepted 28/140, passes/token 1.109, stream 72 rows, 0 mismatch
+[  190s]   match p1: 35 offline chains at this loop's own positions (stream 72 rows)
+[  190s]     depth 1: live  60.00 % (21/35, reached)  offline conditional  60.00 % (21/35)  delta  +0.00 pp   [live joint  60.00 %, offline marginal  60.00 %]
+[  190s]     depth 2: live  19.05 % (4/21, reached)  offline conditional  19.05 % (4/21)  delta  +0.00 pp   [live joint  11.43 %, offline marginal  22.86 %]
+[  191s]     depth 3: live  75.00 % (3/4, reached)  offline conditional  75.00 % (3/4)  delta  +0.00 pp   [live joint   8.57 %, offline marginal  26.47 %]
+[  191s]     depth 4: live   0.00 % (0/3, reached)  offline conditional   0.00 % (0/3)  delta  +0.00 pp   [live joint   0.00 %, offline marginal   8.82 %]
+[  191s]     first verdict difference on the same token: stream position 9, depth 2: live reject, offline accept
+[  302s] prompt 2: TEXT IDENTICAL, 64 tokens, accepted 36/112, passes/token 0.875, stream 72 rows, 0 mismatch
+[  313s]   match p2: 28 offline chains at this loop's own positions (stream 72 rows)
+[  313s]     depth 1: live  60.71 % (17/28, reached)  offline conditional  60.71 % (17/28)  delta  +0.00 pp   [live joint  60.71 %, offline marginal  60.71 %]
+[  313s]     depth 2: live  64.71 % (11/17, reached)  offline conditional  64.71 % (11/17)  delta  +0.00 pp   [live joint  39.29 %, offline marginal  42.86 %]
+[  313s]     depth 3: live  45.45 % (5/11, reached)  offline conditional  50.00 % (5/10)  delta  -4.55 pp  > 2 pp   [live joint  17.86 %, offline marginal  25.93 %]
+[  313s]     depth 4: live  60.00 % (3/5, reached)  offline conditional  60.00 % (3/5)  delta  +0.00 pp   [live joint  10.71 %, offline marginal  19.23 %]
+[  313s]     first verdict difference on the same token: stream position 13, depth 2: live reject, offline accept
+[  407s] prompt 3: TEXT IDENTICAL, 64 tokens, accepted 50/64, passes/token 0.500, stream 72 rows, 0 mismatch
+[  414s]   match p3: 16 offline chains at this loop's own positions (stream 72 rows)
+[  414s]     depth 1: live  87.50 % (14/16, reached)  offline conditional  87.50 % (14/16)  delta  +0.00 pp   [live joint  87.50 %, offline marginal  87.50 %]
+[  414s]     depth 2: live  85.71 % (12/14, reached)  offline conditional  85.71 % (12/14)  delta  +0.00 pp   [live joint  75.00 %, offline marginal  75.00 %]
+[  414s]     depth 3: live 100.00 % (12/12, reached)  offline conditional 100.00 % (11/11)  delta  +0.00 pp   [live joint  75.00 %, offline marginal  73.33 %]
+[  414s]     depth 4: live 100.00 % (12/12, reached)  offline conditional 100.00 % (11/11)  delta  +0.00 pp   [live joint  75.00 %, offline marginal  80.00 %]
+[  414s]     first verdict difference on the same token: stream position 9, depth 4: live reject, offline accept
+[  494s] prompt 4: TEXT IDENTICAL, 64 tokens, accepted 41/104, passes/token 0.812, stream 72 rows, 0 mismatch
+[  503s]   match p4: 26 offline chains at this loop's own positions (stream 72 rows)
+[  503s]     depth 1: live  76.92 % (20/26, reached)  offline conditional  76.92 % (20/26)  delta  +0.00 pp   [live joint  76.92 %, offline marginal  76.92 %]
+[  503s]     depth 2: live  55.00 % (11/20, reached)  offline conditional  52.63 % (10/19)  delta  +2.37 pp  > 2 pp   [live joint  42.31 %, offline marginal  40.00 %]
+[  503s]     depth 3: live  54.55 % (6/11, reached)  offline conditional  50.00 % (5/10)  delta  +4.55 pp  > 2 pp   [live joint  23.08 %, offline marginal  20.00 %]
+[  503s]     depth 4: live  66.67 % (4/6, reached)  offline conditional  60.00 % (3/5)  delta  +6.67 pp  > 2 pp   [live joint  15.38 %, offline marginal  12.50 %]
+[  503s]    == live vs offline at the SAME positions, per-depth acceptance CONDITIONAL on reaching the depth (the 2 pp bar):
+[  503s]      depth 1: live  68.57 % (72/105)  offline  68.57 % (72/105)  delta  +0.00 pp  PASS
+[  503s]      depth 2: live  52.78 % (38/72)  offline  52.11 % (37/71)  delta  +0.67 pp  PASS
+[  503s]      depth 3: live  68.42 % (26/38)  offline  68.57 % (24/35)  delta  -0.15 pp  PASS
+[  503s]      depth 4: live  73.08 % (19/26)  offline  70.83 % (17/24)  delta  +2.24 pp  FAIL
+== ticket 'clause55 p1-4' exited 0; log: /home/bcloud/wt/mtp-window/ticket-clause55-p1-4-20261105-115551.log

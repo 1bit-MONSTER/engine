@@ -566,7 +566,7 @@ What converts, and how faithfully:
 | `self_attn.{q,k,v}_proj.bias` (24 x 3) | `.fconst`, the tiles' bias subvolumes | bf16 | byte-exact; written only where the pack has one |
 | `mlp.{gate,up}_proj` (24 x 2) | `.fconst`, MLP section, 4,288-byte subvolumes | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
 | `mlp.down_proj` (24 x 1) | `.fconst`, MLP section, 2,176-byte subvolumes | q4_1 tiles | same as the attention tiles |
-| `model.norm` (final) | — | — | **refused**, see below |
+| `model.norm` (final) | `.fconst`, the tail envelope at `layers x stride` | bf16 | byte-exact |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
 An OGA pack keeps its tensors inside the `If` branches: the top-level graph has **no
@@ -683,11 +683,21 @@ v2`) reproduces the shipped tile from the arrays this decoder produces.
 importer cannot represent exits 3 and lists every tensor it refused with the reason, so a
 partial model never lands in a model directory by accident. With `--allow-incomplete` it writes
 what it can and records the rest in the container's `__metadata__` (`incomplete`) and in
-`config.json` (`q4nx_source.incomplete`). On the shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
-that is now **290 tensors, 67,088 tiles** (embedding, head, 48 layer norms, 96 attention
-projections, 72 attention biases, 72 MLP projections) and **one refusal**: the final norm, whose
-1,856-byte tail envelope turned out to be `[eps][pad][448 f32]` and not an RMSNorm weight on either
-`.fconst`.
+`config.json` (`q4nx_source.incomplete`). The shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
+now imports whole — **291 tensors, 67,088 tiles, no refusals**: embedding, head, the 48 layer
+norms, the final norm, 96 attention projections, 72 attention biases and 72 MLP projections.
+
+### The final norm, and the tail envelope
+
+The layer blocks stop at `layers x stride`; what follows in either `.fconst` is a 1,856-byte
+envelope `[eps bf16 1e-6][62 pad][hidden x bf16]` — the **final norm** — and, in the
+`Llm_Token_Token` file, the `lm_head` tile stream after it (which is why the head's payload was
+found verbatim at `tail + 1,856`). The position is not assumed: the epsilon has to be at
+`layers x stride`, and where the pack ships both files the two copies of the norm have to be
+byte-identical, which is what the import requires before it writes either. On the 0.5B pack the
+stored bytes equal the upstream checkpoint's `model.norm.weight` exactly. (The earlier reading —
+"the tail envelope is `[eps][pad][448 f32]`, so the final norm's position is unknown" — was the
+last 1,856 bytes of the *file*, which in the Token_Token program are tile padding.)
 
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
 opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as

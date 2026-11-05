@@ -81,6 +81,17 @@ work=$(cd "$work" && pwd)
 echo "== $iso"
 # the kernel: `file` reads the release string out of the setup header, which is what an appliance sees as
 # `uname -r` (mk-huge-kernel.sh checks the same string before packaging, for the same reason)
+# The work dir is a CACHE (vmlinuz, zdrv.sfs, the unpacked module tree) and it was not keyed to the artifact: running
+# this probe twice into the same dir graded the FIRST image's modules on the second run. Measured on c26 - an ISO whose
+# zdrv carries srcversion EE1F36A2… came back `FAIL amdxdna.ko srcversion is 'BBE1E5F0…' (a stale module)`, because the
+# zdrv.sfs and the extracted tree were the previous cut's. Reusing a work dir is the documented way to re-run, so the
+# cache has to prove it belongs to THIS image: a different sha256 wipes it, and the verdict is then about this artifact.
+sum=$(sha256sum "$iso" 2> /dev/null | cut -d' ' -f1)
+if [ -n "$sum" ] && [ "$(cat "$work/.artifact-sha256" 2> /dev/null)" != "$sum" ]; then
+    rm -rf "$work/vmlinuz" "$work/zdrv.sfs" "$work/zdrv"
+    printf '%s\n' "$sum" > "$work/.artifact-sha256" 2> /dev/null
+    echo "  cache: new artifact (${sum%"${sum#????????}"}…), work dir cleared"
+fi
 [ -s "$work/vmlinuz" ] || xorriso -osirrox on -indev "$iso" -extract /vmlinuz "$work/vmlinuz" > /dev/null 2>&1
 [ -s "$work/vmlinuz" ] || { echo "$prog: cannot extract /vmlinuz from the image" >&2; exit 2; }
 kver=$(file -b "$work/vmlinuz" | sed -n 's/.*version \([^ ]*\) .*/\1/p' | head -n 1)

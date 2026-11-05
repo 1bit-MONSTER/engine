@@ -117,6 +117,41 @@ batch width, not the build, is the variable.
 `hrx`, default `n_slots = 4`: copy0 vs alone `4/48` ids but **44/48** log-prob bits, i.e. the
 reported numbers move even where the tokens do not.
 
+### Can a *batched* cell be repeated? (`--parallel N`, the same N requests twice)
+
+Repeating one request answers the solo case. A `--parallel N` cell is measured by issuing **N concurrent
+requests**, so its reproducibility question is different: replay the same N requests and you do not get
+the same N answers. Measured with `tools/batched_repeat.py`, which releases N byte-identical requests
+through a barrier for R rounds and fingerprints each copy over its token ids and float32 log-probability
+bits. Qwen3-0.6B Q4_K_M, 32 tokens, greedy, 4 rounds (3 where a width only needed a control), shipped
+`lemonade-onebit-rc-2026-11-04-c24` payload:
+
+| request width | serve `--parallel` | `cpu` round-to-round identical | `cpu` states | `hrx` round-to-round identical | `hrx` states |
+|---:|---:|---|---:|---|---:|
+| 1 | 2 and 8 | **2/2** | **1** | — | — |
+| 2 | 2 | 2/4 | 4 | — | — |
+| 4 | 4 | 6/12 | 4 | **2/12** | 4 (all four copies distinct) |
+| 8 | 8 | 11/24 | 8 | **0/24** | 16 (all eight copies distinct) |
+
+Worst \|Δlogp\| seen inside those mixtures: `cpu` 9.81e-01 at width 4 and 9.81e-01 at width 8; `hrx`
+7.43e-02 at width 4 and 2.05e-01 at width 8. "States" counts distinct fingerprints over all copies of
+all rounds, so it is a lower bound (two scheduling states could coincide), and it widens with the width
+rather than settling.
+
+**The state is the per-step batch width, not the serve configuration.** A single request against a
+`--parallel 2` serve and against a `--parallel 8` serve produce the *same* fingerprint bit for bit, 3/3
+rounds each; the ladder is the width of the decode step that ran, which is the same op #751 localised
+(`ggml-cpu/repack.cpp`'s 4-row block vs 1-row gemv). The ladder is visible directly: at width 2 one
+round had one copy on the solo state and its partner on a displaced one, i.e. a step that carried one
+row for one sequence and two for the other. On `cpu` the full-batch state is modal (8 of 16 copies at
+width 4, 20 of 32 at width 8), so a batched run usually *does* look like its neighbours; on `hrx` every
+copy in a round is a distinct state (4/4 at width 4, 8/8 at width 8, 0/24 identical round-to-round) — no
+two copies shared a per-step row count across the whole run, so there is no modal rung to land on.
+
+Consequence for a correctness gate: a batched cell cannot be gated on one number. Its log-probabilities
+are a mixture over that ladder, the displaced rungs are 1-2 nats away on `cpu`, and a single run can be
+any rung — so the cell has to report the dispersion over its own rounds, or pin the schedule.
+
 ### What the `hrx` width gate is, by name
 
 `GGML_HRX_LOG_DISPATCH=1` prints each dispatch registration the first time it matches
@@ -315,6 +350,19 @@ python3 tools/logprob_agree.py \
     --repeat 5 --max-tokens 64 --json agree.json
 ```
 
+The batched question (does replaying the same N concurrent requests give the same N answers) is a
+different run against the same serves:
+
+```sh
+python3 tools/batched_repeat.py --url http://127.0.0.1:18110 --width 4 --rounds 4 --max-tokens 32 \
+    --json batched-w4.json
+```
+
+`--width 1` against a serve started with any `--parallel` is the control: it must be repeatable and it
+must produce the same fingerprint whatever the slot count, which is what shows the state is the batch
+content and not the configuration. Point it at an `hrx` serve under the GPU claim for the right-hand
+columns above. `--selftest` checks the fingerprint and comparator logic without a server.
+
 With the NPU in the comparison, the same command with `--thinking off --match-by text`, on a build carrying
 #864: the forward path reports no token ids, so tokens are matched by text, and thinking off is what the
 last three-route row was taken with (`--thinking on` also works there and is what the earlier rows used).
@@ -369,7 +417,9 @@ how each arm above was run.
 - The numbers are for one binary and one model quantisation. A change to a quantisation kernel
   moves them; re-run rather than extrapolate.
 - The concurrency numbers were measured on a 0.6B model on one host; they show the effect exists
-  and is not small, not how large it gets for other shapes.
+  and is not small, not how large it gets for other shapes. The batched-repeat rows are one prompt,
+  32 tokens and one model: they establish that a batched cell is not repeatable and that the outcome
+  set is small and per-engine, not how the dispersion scales with model size or prompt length.
 - The NPU agreement rows are 2 repeats (the other routes' 5 would be ~25 min of the array) and, over a
   *requantised* pack, they are not an arithmetic-only distance. The 64-token row removes the earlier
   budget difference, so all three columns can be read at one token count.

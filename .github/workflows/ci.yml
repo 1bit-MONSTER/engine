@@ -66,6 +66,15 @@ jobs:
         run: python3 tools/pin_watch.py --self-test
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-16 -DCMAKE_CXX_COMPILER=g++-16
+      - name: The draft-loop measurement tool still compiles
+        # tools/mtp_acceptance is the binary every draft-loop number is measured with, and it is not a
+        # build target here: it links the NPU forward, whose runtime is private (ONEBIT_NPU wants
+        # ONEBIT_NPU_RT_DIR). A rename in npu/mtp/ or npu/forward/include/ would therefore break it
+        # silently until someone built it on a device. Syntax-only, against the in-tree headers only.
+        run: |
+          g++ -std=c++26 -fsyntax-only -DONEBIT_NPU_RUNTIME_OWN \
+            -Inpu -Inpu/forward/include -Ibuild/_deps/json-src/include \
+            tools/mtp_acceptance.cpp
       - name: Build
         # Every target a ctest test invokes must be listed here: `ctest` runs whatever
         # binaries exist, so a test whose target is missing reports "Not Run" and never

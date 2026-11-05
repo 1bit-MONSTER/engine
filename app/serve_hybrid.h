@@ -82,6 +82,7 @@ struct Run {
     int code = -1;
     std::string out;
     bool hard_kill = false;  // the grace window after SIGTERM expired and the provider had to be killed
+    bool signalled = false;  // it was SIGTERMed at its deadline and still exited 0: the work landed, late
 };
 
 inline Run run_provider(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int timeout_s) {
@@ -150,7 +151,14 @@ inline Run run_provider(const std::vector<std::string>& argv, const std::vector<
     int status = 0;
     while (::waitpid(pid, &status, 0) < 0)
         if (errno != EINTR) break;
-    r.code = killed ? -2 : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    // The deadline starts a teardown, it is not a verdict on the work: a provider that took its SIGTERM and then
+    // finished (its state file or its region written, exit 0) has done what the handoff needed, and discarding it
+    // would charge the request for the provider's prefill *and* the backend's re-processing of the whole prompt.
+    // What lands is still validated by the callers (n_tokens in its JSON line, n_restored in the restore reply), so
+    // a provider that exits 0 with half its work done falls back there rather than being trusted here.
+    const bool exited_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    r.signalled = killed && exited_ok;
+    r.code = killed ? (exited_ok ? 0 : -2) : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return r;
 #endif
 }
@@ -333,6 +341,9 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
         const auto t0 = std::chrono::steady_clock::now();
         const Run run = run_provider(argv, {"ONEBIT_HYBRID_BACKEND_URL=http://127.0.0.1:" + std::to_string(port)}, timeout_s_);
         o.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        // said only when it happens, and only on a fallback: a provider that finished after its deadline is a
+        // slow provider, not a broken one, and the operator needs to be able to tell the two apart
+        const std::string late = run.signalled ? " (it was signalled at its " + std::to_string(timeout_s_) + " s deadline and still exited 0)" : "";
         std::error_code ec;
         std::filesystem::remove(tokens, ec);
         if (run.code != 0) {
@@ -342,7 +353,7 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
             std::filesystem::remove(state, ec);
             return o;
         }
-        if (!std::filesystem::exists(state)) { o.why = "provider wrote no state file"; return o; }
+        if (!std::filesystem::exists(state)) { o.why = "provider wrote no state file" + late; return o; }
         // the provider's own figures, from its last stdout line
         try {
             std::string last = run.out;
@@ -351,7 +362,7 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
             const json j = json::parse(last);
             if (j.contains("prefill_ms") && j["prefill_ms"].is_number()) o.prefill_ms = j["prefill_ms"].get<double>();
             if (j.contains("n_tokens") && j["n_tokens"].is_number_integer() && j["n_tokens"].get<size_t>() != head.size()) {
-                o.why = "provider prefilled " + std::to_string(j["n_tokens"].get<size_t>()) + " of " + std::to_string(head.size()) + " tokens";
+                o.why = "provider prefilled " + std::to_string(j["n_tokens"].get<size_t>()) + " of " + std::to_string(head.size()) + " tokens" + late;
                 std::filesystem::remove(state, ec);
                 return o;
             }
@@ -459,6 +470,7 @@ private:
         const auto t1 = std::chrono::steady_clock::now();
         const Run run = run_provider(argv, {"ONEBIT_HYBRID_BACKEND_URL=http://127.0.0.1:" + std::to_string(port)}, timeout_s_);
         o.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        const std::string late = run.signalled ? " (it was signalled at its " + std::to_string(timeout_s_) + " s deadline and still exited 0)" : "";
         std::filesystem::remove(tokens, ec);
         std::filesystem::remove(layout, ec);
         if (run.code != 0) {
@@ -474,14 +486,14 @@ private:
         auto ra = c.Post("/slots/0?action=adopt", adopt.dump(), "application/json");
         o.restore_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
         if (!ra || ra->status != 200) {
-            o.why = "adopt answered " + std::to_string(ra ? ra->status : -1) + (ra ? ": " + ra->body.substr(0, 200) : "");
+            o.why = "adopt answered " + std::to_string(ra ? ra->status : -1) + (ra ? ": " + ra->body.substr(0, 200) : "") + late;
             return o;
         }
         try {
             const json j = json::parse(ra->body);
             const size_t adopted = j.value("n_adopted", size_t(0));
             if (adopted != ids.size()) {
-                o.why = "adopt took " + std::to_string(adopted) + " of " + std::to_string(ids.size()) + " cells";
+                o.why = "adopt took " + std::to_string(adopted) + " of " + std::to_string(ids.size()) + " cells" + late;
                 return o;
             }
             if (j.contains("timings") && j["timings"].contains("adopt_ms")) o.restore_ms = j["timings"]["adopt_ms"].get<double>();

@@ -188,7 +188,7 @@ impl Facts {
                 f.npu.busy = busy_npu;
                 f.engine = engine_of(
                     &f.models.loaded,
-                    json_str(&body, "model_loaded").as_deref(),
+                    llm_model_of(&body).as_deref(),
                     &f.models.engines,
                     &health_devices(&body),
                 );
@@ -770,6 +770,20 @@ pub fn engine_of(
     })
 }
 
+/// The model behind the CHAT engine: the `all_models_loaded[]` entry Lemonade types `llm` (it keeps one per type),
+/// falling back to `model_loaded` where the type is not reported. `model_loaded` alone is "the most recently
+/// accessed" model, which a request to the embedding model moves - and the `engine:` row is about who answers chat.
+pub fn llm_model_of(json: &str) -> Option<String> {
+    for obj in json_objects(json, "all_models_loaded") {
+        if json_str(&obj, "type").as_deref() == Some("llm") {
+            if let Some(n) = json_str(&obj, "model_name").or_else(|| json_str(&obj, "checkpoint")) {
+                return Some(n);
+            }
+        }
+    }
+    json_str(json, "model_loaded")
+}
+
 /// `/v1/health`'s `all_models_loaded[]`: model name and the device each is on (`npu`, `gpu`).
 pub fn health_devices(json: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -1196,9 +1210,25 @@ mod tests {
         assert_eq!(
             engine_of(
                 &loaded,
-                json_str(health, "model_loaded").as_deref(),
+                llm_model_of(health).as_deref(),
                 &m.engines,
                 &devices
+            )
+            .as_deref(),
+            Some("flm (npu)")
+        );
+        // and `model_loaded` is only "most recently accessed": an embedding request moves it, the `llm` type does
+        // not - the row must still name the chat engine
+        let embed_last = r#"{"model_loaded":"nomic-embed","all_models_loaded":[
+            {"model_name":"nomic-embed","type":"embedding","device":"cpu"},
+            {"model_name":"qwen3-0.6b-1bit","type":"llm","device":"npu"}
+        ],"status":"ok"}"#;
+        assert_eq!(
+            engine_of(
+                &loaded,
+                llm_model_of(embed_last).as_deref(),
+                &m.engines,
+                &health_devices(embed_last)
             )
             .as_deref(),
             Some("flm (npu)")
@@ -1208,7 +1238,7 @@ mod tests {
         assert_eq!(
             engine_of(
                 &loaded,
-                json_str(stale, "model_loaded").as_deref(),
+                llm_model_of(stale).as_deref(),
                 &m.engines,
                 &devices
             )

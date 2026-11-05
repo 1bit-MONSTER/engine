@@ -2962,6 +2962,45 @@ int run_serve(int argc, char** argv) {
 #ifdef ONEBIT_NPU
         npu::PrivateOptions opts;
         for (const auto& kv : o.npu_opts) npu::parse_private_option(kv, opts);
+        // engine#1129: a THIRD shape of NPU model directory.  `npu_model_kind()` knows two -- a private
+        // route (a build-time addon, e.g. dx) and the fast lane (a fixed set of shape-specific lane
+        // kernels) -- so a MODEL-GENERIC container (model.q4nx + config.json + tokenizer.json + plan.json,
+        // i.e. exactly what our converter and packer emit, and what we publish) satisfied neither and was
+        // refused before the device was even opened.  Lemonade's onebit backend drives `serve -m <dir>`, so
+        // every container of that shape was invisible to it while `forward-serve -m model.q4nx --kernels
+        // <dir>` ran the very same directory correctly.  The kernels are the whole test: if a full-ELF
+        // directory resolves, this is the per-op forward's model and it goes to the same in-process route a
+        // GGUF repack takes; if none resolves the refusal below still names the way out.
+        if (npu_model_kind(o.model, opts) == NpuModel::None) {
+            std::string kernels;
+            if (const char* env = std::getenv("ONEBIT_NPU_KERNELS")) kernels = env;
+            if (kernels.empty() && fs::is_directory(fs::path(o.model) / "npu")) kernels = (fs::path(o.model) / "npu").string();
+#ifdef ONEBIT_NPU_KERNELS_DIR
+            if (kernels.empty()) kernels = ONEBIT_NPU_KERNELS_DIR;
+#endif
+            const bool model_generic = fs::exists(fs::path(o.model) / "model.q4nx") &&
+                                       fs::exists(fs::path(o.model) / "config.json") &&
+                                       fs::exists(fs::path(o.model) / "tokenizer.json");
+            if (model_generic && !kernels.empty() && fs::is_directory(kernels)) {
+                std::fprintf(stderr,
+                             "1bit serve: %s is a model-generic container: serving it through the per-op forward "
+                             "(kernels %s)\n", o.model.c_str(), kernels.c_str());
+                std::vector<std::string> fargs = {"-m", (fs::path(o.model) / "model.q4nx").string(),
+                                                  "--kernels", kernels, "-p", std::to_string(o.port),
+                                                  "--host", o.host};
+                if (!o.alias.empty()) { fargs.push_back("--alias"); fargs.push_back(o.alias); }
+                if (o.npu_streams > 1) { fargs.push_back("--npu-streams"); fargs.push_back(std::to_string(o.npu_streams)); }
+                std::vector<char*> fav;
+                for (auto& a : fargs) fav.push_back(a.data());
+                return run_forward_serve(int(fav.size()), fav.data());
+            }
+            if (model_generic)
+                throw std::runtime_error(
+                    o.model + " is a model-generic Q4NX container (model.q4nx + config.json + tokenizer.json), which the "
+                    "per-op forward serves, but no NPU kernel (full ELF) directory resolves for it: set ONEBIT_NPU_KERNELS "
+                    "to a directory of full_i8_*.elf designs (docs/npu.md), put one in " + o.model + "/npu, or configure the "
+                    "build with -DONEBIT_NPU_KERNELS_DIR=<dir>");
+        }
         if (const std::string why = npu_model_problem(o.model, opts); !why.empty()) throw std::runtime_error(why);
 #ifdef ONEBIT_LAYA
         // A Q4NX model directory runs on the NPU only; with --laya-model the router is still asked

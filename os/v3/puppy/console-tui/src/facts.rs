@@ -947,11 +947,41 @@ fn logs() -> Vec<String> {
             out.push(format!("KRN {l}"));
         }
     }
-    for l in tail_file(LEMLOG, 256 * 1024, LOG_LINES) {
+    // Read more than the pane shows, because the filter below removes most of it: at log_level=debug (the c25
+    // decision) every demo page open in a browser polls `GET /api/v1/models` about every 3 s, and each poll is
+    // one [Debug] line. Measured on the c25 take: 553 of them, and on a booted c25 image the pane was 100 %
+    // polling lines with a chat nowhere in sight (c26 item 1). The chats, the loads and the errors are kept.
+    for l in tail_file(LEMLOG, 256 * 1024, LOG_LINES * 8) {
         out.push(format!("LEM {l}"));
     }
-    let keep = out.len().saturating_sub(LOG_LINES);
-    out.split_off(keep)
+    pane_lines(out, LOG_LINES)
+}
+
+/// The pane's own rule, as a function so a row can check it without a running appliance.
+pub fn pane_lines(all: Vec<String>, max: usize) -> Vec<String> {
+    let mut polls = 0usize;
+    let mut kept: Vec<String> = all
+        .into_iter()
+        .filter(|l| {
+            let noise = is_poll_noise(l);
+            if noise {
+                polls += 1;
+            }
+            !noise
+        })
+        .collect();
+    let keep = kept.len().saturating_sub(max - (polls > 0) as usize);
+    let mut kept = kept.split_off(keep);
+    if polls > 0 {
+        kept.push(format!("LEM ({polls} debug lines hidden: GET /api/v1 polling)"));
+    }
+    kept
+}
+
+/// A page poll, not an event: a debug-level HTTP **GET** of the API. POSTs (the chats), model loads, engine lines and
+/// every warning/error pass through - none of them is debug level.
+pub fn is_poll_noise(line: &str) -> bool {
+    line.contains("[Debug]") && line.contains(" GET /api/v1/")
 }
 
 // ── formatting helpers, all of them word-safe ─────────────────────────────────────────────────────────────
@@ -1371,6 +1401,40 @@ mod tests {
         );
         assert_eq!(fans_from("", &[("fan1".into(), 1234)]), "fans: fan1=1234");
         assert!(fans_from("", &[]).contains("not readable"));
+    }
+
+    #[test]
+    fn log_pane_hides_polls_and_keeps_the_chats() {
+        // c26 item 1, the shape of the c25 take: the pages poll, a chat happens, something loads, something fails.
+        let mut all: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    "LEM 2026-11-05 05:21:{:02}.000 [Debug] (Server) GET /api/v1/models",
+                    i % 60
+                )
+            })
+            .collect();
+        all.push(
+            "LEM 2026-11-05 05:21:41.000 [Debug] (Server) POST /api/v1/chat/completions".into(),
+        );
+        all.push("LEM 2026-11-05 05:21:52.000 [Info] (ModelManager) Loading model".into());
+        all.push("LEM 2026-11-05 05:21:53.000 [Error] (Server) backend exited 1".into());
+        all.push("KRN [   12.1] amdxdna 0000:c6:00.1: TDR timeout detected".into());
+
+        let pane = pane_lines(all.clone(), 400);
+        assert!(!pane.iter().any(|l| is_poll_noise(l)), "a poll reached the pane: {pane:?}");
+        assert!(pane.iter().any(|l| l.contains("POST /api/v1/chat/completions")), "the chat is gone");
+        assert!(pane.iter().any(|l| l.contains("Loading model")));
+        assert!(pane.iter().any(|l| l.contains("backend exited 1")), "an error is never hidden");
+        assert!(pane.iter().any(|l| l.contains("TDR timeout")), "a kernel line is never hidden");
+        assert_eq!(pane.last().unwrap(), "LEM (40 debug lines hidden: GET /api/v1 polling)");
+
+        // no polls, no marker: an honest pane says nothing about noise that never happened
+        let quiet = pane_lines(vec!["KRN [ 1.0] amdgpu: HRX runtime registered".into()], 400);
+        assert_eq!(quiet.len(), 1);
+        // and the cap counts the marker, so the pane never grows by a line when there is noise
+        let many: Vec<String> = (0..50).map(|i| format!("LEM event {i}")).collect();
+        assert_eq!(pane_lines(many, 10).len(), 10);
     }
 
     #[test]

@@ -64,7 +64,7 @@ the `nsswitch` resolve line, `os/v3/puppy/container-build.sh:508,518-522`). The 
 own hostname plus `.local` (`18onboard-mdns:58`), so it follows a rename. Two things can still leave you
 reading an address: the responder, and your LAN — the CONNECT block prints
 `name http://1bit-os.local:13305 (mDNS)` only while `avahi-daemon` is running and
-`(mDNS - avahi not running)` when it is not (`os/v3/puppy/console-tui/src/ui.rs:213-216`), and a network
+`(mDNS - avahi not running)` when it is not (`os/v3/puppy/console-tui/src/ui.rs:236-238`), and a network
 that drops multicast does not resolve the name at all. Sticks through the cycle-20 image do not announce
 it. **The cycle-22 board also showed the name announced and never answered**: avahi logged
 `avahi-daemon up: … is announced on this network`, a query from another machine got nothing back, and the

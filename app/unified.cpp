@@ -36,6 +36,7 @@
 
 #include <httplib.h>
 #include "http_guard.h"
+#include "npu_device_lock.h"  // engine#612: one process owns the array unless the operator says otherwise
 #include "npu_load_retry.h"   // engine #1010: an evict->load race is transient, a cold NPU context is not
 #include "serve_watchdog.h"  // npu_run_failed: a failed runlist means this process's NPU context is dead
 #include <nlohmann/json.hpp>
@@ -464,6 +465,17 @@ int run_unified(int argc, char** argv) {
         if (!ready) { r.status = 503; return; }
         handle_generate(e, q, r, false, on_run_failed);
     });
+    // Who may have the NPU (app/npu_device_lock.h, engine#612).  This route had no cross-process lock while
+    // `forward-serve` took one, and it is the SHIPPED front door: `1bit serve -m <q4nx dir> --device npu` lands
+    // here, and so does the payload's Lemonade backend.  Two such processes then dispatch at the same instant, which
+    // is the measured wedge: two serves, both `code 614 ... state 8, run 0 of 28`, one TDR (DPU PC 0xffffffff) and
+    // hwctx_num = 2 (evidence hrx-study/evidence/fabric/npu-longctx/two-client-20261105-034608, engine#1051).
+    // Exclusive, like every other route: a second backend waits HERE -- it does not dispatch on a live context -- and
+    // takes the device when this one exits, which a failed run makes it do (the exit-1 path above).  Taking it before
+    // the model is opened matters: opening a context is the other half of what the lock is protecting.  The fd stays
+    // open for the life of the process; closing it, or exiting, releases the lock.
+    const int lock_fd = std::getenv("NPU_NO_DEVICE_LOCK") ? -1 : take_npu_device_lock(1);
+    (void)lock_fd;
     if (!srv.bind_to_port(host, port)) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
     // Serve /v1/health (503 until ready) while the model loads.
     std::thread listener([&] { srv.listen_after_bind(); });

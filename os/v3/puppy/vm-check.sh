@@ -493,6 +493,29 @@ rows = [
                      "1bit-console-tui --status > /tmp/ct.txt 2>&1; echo status-rc=$?; "
                      "echo invented-urls=$(grep -c 'http://-:' /tmp/ct.txt)",
                      "engine: llamacpp (gpu)"),
+    # Cycle 26 item 1, first half: NOTHING else may write to tty1 while the console owns it. The boot line carries no
+    # `loglevel=`, so console_loglevel is 7 and every kernel message printed onto tty0 - which IS the screen. The c25
+    # take proves the cost: 15 err + 5 warn lines (the 08:52:09Z NPU TDR and its ~18 `*ERROR* aie2_set_cmd_timeout:`
+    # firmware-report lines) landed on top of the TUI. 1bit-console sets `dmesg -n 1` before the TUI starts; the ring
+    # (32 MB) and /data/logs/dmesg.log are untouched, so the evidence is still there - only the screen is quiet.
+    ("U2 console quiet", "awk '{print \"console-loglevel=\" $1; exit}' /proc/sys/kernel/printk; "
+                     "pgrep -f '1bit-console-tui' > /dev/null && echo tui-running; "
+                     "dmesg | wc -l | sed 's/^/kernel-lines=/'", "console-loglevel=1"),
+    # Cycle 26 item 1, second half: the LOGS pane is the screen a person reads, so the 553 polling lines the pages
+    # produce (measured on the c25 take) must not be what is on it. Seeded with the same shape the demo produces, so
+    # the row measures the pane's rule rather than whether this boot happened to be polled.
+    ("U2 log pane", "for i in 1 2 3 4 5; do echo \"2026-11-05 00:00:0$i.000 [Debug] (Server) GET /api/v1/models\" "
+                     ">> /var/log/lemond-onebit.log; done; "
+                     "echo '2026-11-05 00:00:09.000 [Debug] (Server) POST /api/v1/chat/completions' "
+                     ">> /var/log/lemond-onebit.log; "
+                     "1bit-console-tui --snapshot 100x37 > /tmp/pane.txt 2>&1; "
+                     "echo hidden=$(grep -c 'debug lines hidden' /tmp/pane.txt) "
+                     "raw=$(grep -c 'GET /api/v1/models' /tmp/pane.txt) "
+                     "chat=$(grep -c 'POST /api/v1/chat' /tmp/pane.txt); "
+                     "grep -q 'debug lines hidden' /tmp/pane.txt && "
+                     "! grep -q 'GET /api/v1/models' /tmp/pane.txt && "
+                     "grep -q 'POST /api/v1/chat' /tmp/pane.txt && echo pane-filtered",
+                     "pane-filtered"),
     # The mechanism behind U3-lan and U7 (cycle 15's finding, and the row the c16 refactor folded away): inbound
     # connections from the LAN pass only if the appliance opened the ports AFTER Puppy's rc.firewall (which ends
     # in `-P INPUT DROP`) and let the RFC1918 ranges through tcpwrappers. Printing all three - the rules, the

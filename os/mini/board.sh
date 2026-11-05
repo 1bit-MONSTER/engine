@@ -138,13 +138,23 @@ status() {   # one line, for the banner, the health output and the release check
         return 1
     fi
     line=""
+    bad=0
     for f in $FANS; do
-        rpm=$(cat "$EC/$f/rpm" 2>/dev/null || echo 0)
-        line="$line $f $rpm rpm"
+        # An unreadable EC must not become a fan reading. It used to: `|| echo 0` printed "0 rpm" for a lost EC, which
+        # is the same number the EC legitimately reports below its curve's first step (45 C, FAN_UP) - so the one
+        # reading the owner asked about in c26 item 3 ("0 rpm at 43 C: stopped, or a lost EC?") could not be told
+        # apart from a dead driver. Now a 0 means the EC said 0.
+        if rpm=$(cat "$EC/$f/rpm" 2> /dev/null) && [ -n "$rpm" ]; then
+            line="$line $f $rpm rpm"
+        else
+            line="$line $f n/a"
+            bad=1
+        fi
     done
     # informational: at low temperatures the EC legitimately leaves the fans stopped (level 0), so a
     # 0 rpm reading here is not a fault. The release check forces level 4 and then expects rpm > 0.
     say "fans: controlled ($(printf '%s' "$line" | sed 's/^ //'))"
+    [ "$bad" = 0 ] || { say "1bit-board: the EC did not answer for at least one fan" >&2; return 1; }
     return 0
 }
 

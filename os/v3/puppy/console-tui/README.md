@@ -28,9 +28,15 @@ what the first seconds of a boot used to show. The address rows come back with t
 
 **The LEMONADE panel names the engine that is serving** - `engine: llamacpp (gpu)`, `engine: flm (npu)` - composed from
 what Lemonade reports (`recipe` in `/api/v1/models`, the device in `/api/v1/health`, falling back to the model's
-`recipe_options` backend). No marketing map: if the box says `llamacpp`, the screen says `llamacpp`. At 80x25 the same
-sentence rides on the compact `LEMONADE` field, because a fact field of its own would push the status block to a third
-row and cost the log pane one (owner decision 2026-11-04 20:19, item 1; `the_console_says_which_engine_is_serving`).
+`recipe_options` backend). **Which model it names is the chat engine, not the first thing loaded**: Lemonade keeps one
+model per type in `all_models_loaded[]` (`max_models.llm = 1`), so the entry it types `llm` is the answer, with
+`model_loaded` ("most recently accessed", which an embedding request moves) only as the fallback when the type is not
+reported - `the_engine_is_the_model_answering_not_the_first_loaded`. No marketing map: if the box says `llamacpp`, the
+screen says `llamacpp`. At 80x25 the same sentence rides on the compact `LEMONADE` field, because a fact field of its
+own would push the status block to a third row and cost the log pane one (owner decision 2026-11-04 20:19, item 1;
+`the_console_says_which_engine_is_serving`). A hybrid value (`engine: ryzenai-llm (gpu npu)`, 83 columns with the rest
+of the field) re-wraps the facts block inside its existing two rows at 80x25 and costs the log pane nothing - measured,
+not assumed.
 
 ## The screen
 
@@ -147,7 +153,7 @@ Every number comes from where the rest of the image reads it - no second source 
 | panel | source |
 |---|---|
 | header | `/data/RELEASE-TAG` or `payload=` in `/etc/1bit/release-identity`, `/proc/sys/kernel/hostname`, `ip -4`, `/proc/uptime`, the `SecureBoot-*` efivar (the value byte is the fifth: efivarfs refuses partial reads, and a `dd skip=4` reads as "disabled" on a Secure Boot box) |
-| Lemonade | the process table, an actual TCP connect to 127.0.0.1:13305, `LEMONADE_API_KEY=` in `/etc/1bit/lemond.conf` |
+| Lemonade | the process table, an actual TCP connect to 127.0.0.1:13305, `LEMONADE_API_KEY=` in `/etc/1bit/lemond.conf`, and `/api/v1/health` for the loaded models and the engine (`all_models_loaded[]` `type`/`device`, `model_loaded`) |
 | GPU | `llama-server --list-devices`, i.e. the runtime's own answer, plus `/sys/class/drm/card*/device/mem_info_{vram,gtt}_{used,total}` and hwmon |
 | NPU | `/proc/modules` for `amdxdna`, `/lib/firmware/amdnpu`, `/dev/accel/*`, and Lemonade's health for busy/idle |
 | Models | `GET /api/v1/models` (downloaded only) and `GET /api/v1/health` (loaded) |
@@ -185,7 +191,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 51 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
+cargo test                                    # 52 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders, the engine row's model choice
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

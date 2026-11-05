@@ -728,7 +728,7 @@ rows = [
                      None),
     # (3) thermals are sampled ONLY while something is serving - so the two files must agree, and an idle box must
     # not be writing a power log all day. Both directions are failures the row names.
-    ("U5 thermal gate", "eng=$(pgrep -fc '/opt/1bit-package/1bit/1bit' 2>/dev/null || echo 0); "
+    ("U5 thermal gate", "eng=$(pgrep -f '/opt/1bit-package/1bit/1bit' 2>/dev/null | wc -l); "
                      "d=$(1bit-logs dir 2>/dev/null); n=$(wc -l < \"$d/thermal.log\" 2>/dev/null || echo 0); "
                      "echo \"engine-children=$eng thermal-lines=$n\"; "
                      "if [ \"$eng\" -gt 0 ]; then [ \"$n\" -gt 0 ] && echo thermal-gate-consistent; "

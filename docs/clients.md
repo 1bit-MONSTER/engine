@@ -52,7 +52,7 @@ hostname                    # 1bit-os - the name the image sets in /etc/hostname
 cycle-13 image it still booted as `puppypc19108`, which is why older notes name it that way). A name that
 is neither is a person's rename, not a fault: console **3** (Network) then **3** (Set the hostname) writes
 `/etc/hostname` and applies it live (`1bit-console-menu:437,463-466`; the top-level row is
-`1bit-console-menu:632`). The cycle-16 board booted as
+`1bit-console-menu:645`). The cycle-16 board booted as
 `strix` for exactly that reason while the frozen bytes still read `1bit-os`, so check the address, not the
 name.
 
@@ -85,7 +85,7 @@ If you cannot get to a console, the router's client list shows the box
 network with the CLI installed) lists the beacons it hears.
 
 **The key, if there is one.** The shipped default has none — `10lemonade` starts with `LEMONADE_API_KEY`
-unset and binds `0.0.0.0:13305` anyway (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62`) — so the first
+unset and binds `0.0.0.0:13305` anyway (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62,107-108`) — so the first
 thing to check is the console's status block:
 
 ```
@@ -231,7 +231,7 @@ only matters once the box is keyed (blank mode has no key to pass).
 
 | | |
 |---|---|
-| the default | **no key** (cycle 20). `lemond` answers every `/api/*`, `/v0/*` and `/v1/*` request with no header — stock Lemonade — and it is reachable from the LAN by design (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62,78-81`). The console's CONNECT block says so in those words, `(no key: anyone, press 1)` |
+| the default | **no key** (cycle 20). `lemond` answers every `/api/*`, `/v0/*` and `/v1/*` request with no header — stock Lemonade — and it is reachable from the LAN by design (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62,104-108`). The console's CONNECT block says so in those words, `(no key: anyone, press 1)` |
 | turning it on | console **1 → Show the API key**: mints 48 hex into `/etc/1bit/lemond.conf` (`0600`, a symlink onto `/data`), restarts the service, prints it; run it again to turn it off. `prepare-stick --mint` does the offline half. From then on the key is the whole gate: every request needs it as a Bearer token, no key or a wrong key is **401** |
 | the web app's key | only the box's own page uses it, and `1bit-webapp-proxy` (the `127.0.0.1:8080` chat page) adds the header itself — a URL never carries the key, and a forward whose `Origin` is not that loopback page is refused before the key is attached (`os/v3/puppy/embed/usr/local/bin/1bit-webapp-proxy:45-49,74-77`) |
 | network | the appliance opens **13305** (Lemonade) and **22** (SSH) in its firewall, and allows the RFC1918 ranges through `/etc/hosts.allow`; everything else inbound is dropped. It is a LAN service, keyed or not |

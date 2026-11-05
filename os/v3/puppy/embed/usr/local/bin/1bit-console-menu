@@ -553,7 +553,7 @@ item_install() {
         d=$(boot_disk)
         say_text " 1bit OS - installed " "$(printf '%s\n' \
             "" \
-            "1bit OS is INSTALLED on ${d:-this machine's disk}." \
+            "1bit OS is INSTALLED on ${d:-the boot disk}." \
             "  $(lsblk -dpno SIZE,MODEL "${d:-/dev/null}" 2> /dev/null | head -1 | awk '{$1=$1; print}')" \
             "  data: $(data_line)" \
             "" \
@@ -564,7 +564,7 @@ item_install() {
             "  is this system's own disk, and the installer refuses it by name.")"
         yesno "Install 1bit OS onto a DIFFERENT disk as well?
 
-Every disk you name is wiped. ${d:-This system's own disk} is refused by the installer and cannot be chosen." || return 0
+Every disk you name is wiped. ${d:-The disk this system booted from} is refused by the installer and cannot be chosen." || return 0
     else
         yesno "Install 1bit OS to a disk?
 

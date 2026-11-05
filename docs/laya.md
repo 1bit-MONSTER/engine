@@ -105,6 +105,9 @@ scripts/fetch-laya.sh
 1bit serve -m model.gguf --device auto --laya            # or --laya-model DIR
 1bit route --laya-model DIR --classify --state "Write a Rust function that sums a slice."
 # code 0.44 hrx
+1bit route --laya-model DIR --json --state "Write a Rust function that sums a slice."
+# {"class":"code","confidence":0.44,"device":"hrx","decision_ms":412.7}
+1bit route --laya-model DIR --serve   # resident: the scorer loads once, then one decision per stdin line
 ```
 
 Every routed reply carries `X-1bit-Route: <class> <confidence> <device>`, and `serve` logs each
@@ -166,6 +169,27 @@ rows. Every sum keeps its order, so the gate output is byte-identical to the
 single-threaded scorer. Those figures are for the old device question on a short request.
 The request-class decision takes 0.4-0.6 s (the table above), and `serve` pays it once per
 conversation.
+
+**Why `--serve` exists.** That 2.7 s load is paid per *process*, so a caller that routes per
+request cannot shell out to the one-shot command: on this box a one-shot `1bit route` costs
+2.7-10 s of load (it grows with machine load) for a 0.4-0.8 s decision. `--serve` loads the scorer
+and the route policy once, prints `{"ready":true,"load_ms":N}`, and then answers one request per
+line:
+
+```sh
+1bit route --laya-model DIR --devices hrx,npu,cpu --serve
+# {"ready":true,"load_ms":2714.2}
+# in : {"state":"Write a Python function that reverses a linked list."}
+# out: {"class":"code","confidence":0.46,"device":"hrx","decision_ms":412.7}
+```
+
+A line that is not `{"state": "<text>"}` is answered with `{"error": ...}` and the service keeps
+serving; a state of `kLongDocChars` (1024) characters or more is `long_doc` at confidence 1.0
+without a model call, exactly as in the one-shot command. EOF on stdin exits 0 (the client closed
+its pipe); SIGTERM ends it where it stands, which is what a supervisor or `pkill` sees.
+`decision_ms` is then the routing cost alone, and `tests/laya_route_serve.sh` asserts it is below
+`load_ms`, that the same request asked five times gets five identical decisions, and that the
+served decision agrees with `1bit route --classify` for the same request.
 
 ## The GGUF scorer: ggmlc on HRX
 

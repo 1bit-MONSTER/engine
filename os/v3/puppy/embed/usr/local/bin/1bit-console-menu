@@ -582,6 +582,9 @@ item_logs() {
             ls -1 "$bootlogs" 2>/dev/null | tr '\n' ' '
             say ""
             [ -s "$bootlogs/xwin-console.log" ] && { say "--- xwin-console.log (tail 12)"; tail -12 "$bootlogs/xwin-console.log"; }
+            say ""
+            say "=== boot proof: $([ -s "$bootlogs/boot-proof.txt" ] && echo "$bootlogs/boot-proof.txt ($(wc -l < "$bootlogs/boot-proof.txt") lines)" || echo "not written yet")"
+            say "=== proof bundle: $(ls -1 /data/proof-*.tar.zst 2>/dev/null | tail -1 || true)"
         fi
     } > "$out"
     if [ "$NONINT" = 1 ]; then
@@ -589,6 +592,16 @@ item_logs() {
     fi
     show_text "Logs" "$out"
     rm -f "$out"
+    # Cycle 25, item 7: the bundle a release is published with. It is offered here, in the item about logs, rather
+    # than as a tenth key: the console's legend is 1-9 and a person looking for "the evidence" looks under Logs.
+    if [ -x /usr/local/bin/1bit-proof ]; then
+        if yesno "Bundle this boot's evidence for the release?"; then
+            clear
+            /usr/local/bin/1bit-proof 2>&1 | tee -a /var/log/1bit-proof.log
+            say ""
+            say "press Enter to return"; read -r _ || true
+        fi
+    fi
 }
 
 # 9 Reboot or power off, confirmed. In test mode it says what it would do and touches nothing.

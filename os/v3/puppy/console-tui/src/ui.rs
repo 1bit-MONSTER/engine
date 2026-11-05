@@ -1230,6 +1230,12 @@ mod tests {
                 "{w}x{h}: an engine row with nothing loaded:\n{text}"
             );
         }
+        // and `--status` carries the same line, which is what a booted-image gate row can read without a terminal
+        let status = status_text(&c16_board()).join("\n");
+        assert!(
+            status.contains("engine: llamacpp (gpu)"),
+            "--status does not name the engine:\n{status}"
+        );
     }
 
     #[test]

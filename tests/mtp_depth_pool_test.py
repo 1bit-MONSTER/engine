@@ -204,7 +204,27 @@ check(rc11 == 1, "a pre-`reached` log is refused rather than pooled as if it wer
 check("pre-`reached` shape" in err11 and "read incompletely" not in err11,
       f"the refusal names the real cause, not a short read: {err11.strip()[-120:]}")
 
-# 11. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
+# 12. k is part of the window too: a k=6 ticket pooled with k=4 ones builds a six-depth table whose depths 5-6
+# exist on the wider prompts only, and `N of N scored depths` then reads as a pass over depths the rest never tried.
+def ticket_k(p, k):
+    body = [f"prompt {p}: TEXT IDENTICAL, 64 tokens, accepted 4/16, passes/token 0.500, stream 72 rows, 0 mismatch"]
+    body += [f"    depth {d}: live  50.00 % (10/20, reached)  offline conditional  50.00 % (10/20)" for d in range(1, k + 1)]
+    body.append("    == live vs offline at the SAME positions (the 2 pp bar):")
+    body += [f"      depth {d}: live  50.00 % (10/20)  offline  50.00 % (10/20)  delta  +0.00 pp  PASS"
+             for d in range(1, k + 1)]
+    return "\n".join(body) + "\n"
+
+
+rc12, out12, _ = run([], [("k4.log", ticket_k(0, 4)), ("k6.log", ticket_k(1, 6))])
+check(rc12 == 0, "a pool of runs at different k still pools (the cells themselves are not in conflict)")
+check("MIXED chain width (k)" in out12 and "6 on prompts 1" in out12 and "4 on prompts 0" in out12,
+      f"the differing chain width is named per prompt: {[l for l in out12.splitlines() if 'MIXED chain' in l]}")
+check("the depths above 4 come from the wider prompts only" in out12,
+      "... and says what it means for the table (depths 5-6 are not the whole pool)")
+rc13, out13, _ = run([], [("k4a.log", ticket_k(0, 4)), ("k4b.log", ticket_k(1, 4))])
+check("k=4" in out13 and "MIXED chain width" not in out13, "a uniform chain width is stated once in the header")
+
+# 13. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
 r = subprocess.run([sys.executable, TOOL, "--selftest"], capture_output=True, text=True)
 check(r.returncode == 0 and "selftest PASS tail repeat" in r.stdout, "the tool's refusal self-test passes")
 

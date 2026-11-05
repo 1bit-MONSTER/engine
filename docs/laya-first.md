@@ -206,7 +206,7 @@ Three properties the condition keeps:
 ```
 
 ```json
-{"version": "1", "model_name": "1bit.Laya-First", "recipe": "collection.router",
+{"version": "1", "model_name": "user.Laya-First", "recipe": "collection.router",
  "components": ["Qwen3-0.6B-1bit", "ZAYA1-8B-1bit", ...],
  "routing": {"candidates": [...], "default_model": "Qwen3-0.6B-1bit",
    "classifiers": [{"id": "laya", "type": "laya",
@@ -215,12 +215,18 @@ Three properties the condition keeps:
               "route_to": "Qwen3-Coder-30B-A3B-Instruct-1bit"}, ...]}}
 ```
 
-Two details are load-bearing rather than cosmetic. **`min_score: 0.0` on every class rule**: Laya's
-calibrated confidence for `code` is about 0.44, so the classifier band's default floor of 0.5 would drop
-exactly the decisions this table exists to route — confidence stays in the trace, and an unroutable
-request falls open to `default_model` because the rule did not match, not because the band rejected it.
+Two details are load-bearing rather than cosmetic. **`min_score: 0.01` on every class rule** — low, so
+the band's default floor of 0.5 cannot drop the decisions this table exists to route (Laya's confidence for
+`code` is about 0.44), but **not zero**: the classifier reports only the class Laya chose, so every other
+label scores exactly `0.0`, and a `0.0` floor matches `0.0 >= 0.0` — the *first* class rule then swallows
+every request. Measuring that cost one live run: a `short` prompt routed to the `code` model while every
+self-test stayed green, because a verdict can only see that *a* rule matched, not that it was the right one.
 **Labels on the classifier entry**: declaring the four classes is what makes a typo in a rule's `label` a
 parse error in Lemonade instead of a rule that silently never matches.
+
+The name is `user.Laya-First` because that is the only shape Lemonade will register at run time
+("Registered model definitions must use a non-empty `user.*` name", measured against a live lemond); the
+appliance registers the desugared policy at first boot, so the desugar has to emit a registrable name.
 
 `tests/laya_first.sh` pins the desugaring (19 checks, including byte equality with
 `tests/laya_first_policy.json`), refuses a table with a device typo or a missing class by name, and — when

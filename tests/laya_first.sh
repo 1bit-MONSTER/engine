@@ -74,8 +74,9 @@ check(sorted(models) == sorted(classes), "one rule per class (%s)" % ", ".join(s
 check(len(routing["rules"]) == 4, "no extra rules: %d" % len(routing["rules"]))
 check(all(r["match"]["classifier"] == "laya" for r in routing["rules"]),
       "every rule matches the laya classifier")
-check(all(r["match"]["min_score"] == 0.0 for r in routing["rules"]),
-      "every class rule is min_score 0.0 (Laya's code confidence is ~0.44, below the default 0.5 band)")
+check(all(0.0 < r["match"]["min_score"] < 0.05 for r in routing["rules"]),
+      "every class rule has a low but NON-ZERO floor (0.0 would make the first rule match every class, "
+      "since a label Laya did not choose scores exactly 0.0)")
 check(all(r["route_to"] in routing["candidates"] for r in routing["rules"]),
       "every route_to is a candidate")
 check(routing["default_model"] in routing["candidates"], "default_model is a candidate")

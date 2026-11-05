@@ -1,6 +1,6 @@
 {
   "version": "1",
-  "model_name": "1bit.Laya-First",
+  "model_name": "user.Laya-First",
   "recipe": "collection.router",
   "components": [
     "Qwen3-0.6B-1bit",
@@ -34,7 +34,7 @@
         "match": {
           "classifier": "laya",
           "label": "short",
-          "min_score": 0.0
+          "min_score": 0.01
         },
         "route_to": "Qwen3-0.6B-1bit"
       },
@@ -43,7 +43,7 @@
         "match": {
           "classifier": "laya",
           "label": "prose",
-          "min_score": 0.0
+          "min_score": 0.01
         },
         "route_to": "ZAYA1-8B-1bit"
       },
@@ -52,7 +52,7 @@
         "match": {
           "classifier": "laya",
           "label": "code",
-          "min_score": 0.0
+          "min_score": 0.01
         },
         "route_to": "Qwen3-Coder-30B-A3B-Instruct-1bit"
       },
@@ -61,7 +61,7 @@
         "match": {
           "classifier": "laya",
           "label": "long_doc",
-          "min_score": 0.0
+          "min_score": 0.01
         },
         "route_to": "Qwen3.8-27B-1bit"
       }

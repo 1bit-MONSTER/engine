@@ -118,10 +118,17 @@ void validate(const json& table) {
         throw std::runtime_error("default_model '" + default_model + "' is not one of the classes' models");
 }
 
+// The floor a class rule needs. NOT 0.0: the classifier reports only the class Laya chose, so every
+// other label scores exactly 0.0, and a band with `min_score: 0.0` matches `0.0 >= 0.0` - which makes
+// the FIRST class rule swallow every request (measured against a live lemond: a `short` prompt routed
+// to the `code` model). A floor strictly above zero is what turns the band into "Laya chose this class",
+// and it still cannot drop a real decision, because Laya's confidence for a chosen class is never 0.
+constexpr double kClassFloor = 0.01;
+
 // The policy Lemonade already understands: one rule per class, `route_to` that class's model.
-// `min_score: 0` is deliberate — Laya's calibrated confidence for `code` is about 0.44, so the
-// default band (0.5) would drop the very decisions this table exists to route. A class is a class
-// whatever Laya's confidence in it; an unroutable request still falls open to default_model.
+// The floor is deliberately low - Laya's calibrated confidence for `code` is about 0.44, so the band's
+// default of 0.5 would drop the very decisions this table exists to route - but it is not zero, for the
+// reason on kClassFloor above.
 json desugar(const json& table) {
     json components = json::array();
     json rules = json::array();
@@ -130,15 +137,18 @@ json desugar(const json& table) {
         const std::string model = cls["model"].get<std::string>();
         components.push_back(model);
         rules.push_back(json{{"id", "laya-" + name},
-                             {"match", json{{"classifier", "laya"}, {"label", name}, {"min_score", 0.0}}},
+                             {"match", json{{"classifier", "laya"}, {"label", name}, {"min_score", kClassFloor}}},
                              {"route_to", model}});
     }
     // The `laya` classifier entry itself: labels are the four classes, which is also what makes a
     // typo in a rule's `label` a parse error rather than a rule that never matches.
     json classifier = json{{"id", "laya"}, {"type", "laya"}, {"labels", classes()}};
 
+    // `user.` is not decoration: Lemonade refuses to register a definition that is not under it
+    // ("Registered model definitions must use a non-empty `user.*` name") - measured against a live
+    // lemond while exercising the release-check row, which is why the name the row looks for changed.
     return json{{"version", "1"},
-                {"model_name", "1bit.Laya-First"},
+                {"model_name", "user.Laya-First"},
                 {"recipe", "collection.router"},
                 {"components", components},
                 {"routing",

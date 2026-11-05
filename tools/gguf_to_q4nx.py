@@ -172,11 +172,32 @@ def field(r, key, default=None):
     return default if f is None else f.contents()
 
 
+def refuse_unsupported_rope(r):
+    """A scaling this route cannot apply is refused before anything is written (engine#1087).
+
+    A declared block that is dropped is worse than a failed conversion: the container would carry
+    rope_theta and nothing else, be served plain RoPE, stay fluent and be wrong past the model's
+    original window, with no line anywhere saying so.  This route has no scaling rule at all (the packed
+    lane computes theta^(-i/half) and nothing else), so every declared type is refused by name.  The
+    forward implements llama3 and longrope short_factor, but only for a container whose config.json
+    carries the block, which is a different route (1bit npu-pack import, or a checkpoint's own config).
+    """
+    arch = field(r, "general.architecture")
+    scaling = field(r, f"{arch}.rope.scaling.type")
+    if scaling is not None and str(scaling) not in ("none", "default", ""):
+        raise SystemExit(
+            f"{arch}.rope.scaling.type is {str(scaling)!r}: this converter has no RoPE scaling rule, so the "
+            f"container would be served plain RoPE and reply wrongly past the model's original window. "
+            f"Convert from the checkpoint with its config.json (the forward route reads rope_scaling), or "
+            f"file the scaling type you need (engine#1087)")
+
+
 def config(r, vocab):
     arch = field(r, "general.architecture")
     if arch not in ("qwen3", "qwen2", "qwen3moe"):
         raise SystemExit(f"architecture {arch!r}: only qwen3, qwen2 and qwen3moe are supported")
     a = lambda k, d=None: field(r, f"{arch}.{k}", d)  # noqa: E731
+    refuse_unsupported_rope(r)
     heads = a("attention.head_count")
     tied = not any(t.name == "output.weight" for t in r.tensors)
     moe = arch == "qwen3moe"
@@ -353,6 +374,7 @@ def moe_meta(r, items, table):
 
 def pack(args):
     r = gguf.GGUFReader(args.gguf)
+    refuse_unsupported_rope(r)   # before the output directory exists: no half-written container
     os.makedirs(args.out, exist_ok=True)
     items = planned(r)
     # --dtype8 names tensors to store as Q8 chunks instead of q4_1. Selection is by Q4NX name,

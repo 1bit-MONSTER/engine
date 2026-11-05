@@ -933,10 +933,10 @@ uint64_t mem_available() {
 
 // The GGUF architectures our llama.cpp builds a model for, on HRX0 or on the CPU: generated from
 // registry/architectures.json (gguf_architectures.hrx, tools/registry_build.py), so a pin bump that
-// regenerates the registry moves this list too. Anything else (Qwen3.8-Flash-Next's qwen4exp, Zyphra
-// Zamba/Zamba2/BlackMamba, the upstream-only architectures the removed Vulkan build ran) serve
-// declines with a clear message, and Lemonade's own llamacpp backend serves it. An empty
-// architecture (a file serve cannot read) is left to llama-server.
+// regenerates the registry moves this list too - the 2026-11-05 bump to 817d0815b is what added the Zyphra
+// family (zamba2, zamba, blackmamba) to it. Anything else (Qwen3.8-Flash-Next's qwen4exp, the upstream-only
+// architectures the removed Vulkan build ran) serve declines with a clear message, and Lemonade's own
+// llamacpp backend serves it. An empty architecture (a file serve cannot read) is left to llama-server.
 bool hrx_missing_arch(const std::string& arch) {
     if (arch.empty()) return false;
     for (const char* a : kHrxGgufArchs)

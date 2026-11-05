@@ -55,6 +55,53 @@ pub enum SecureBoot {
     Unknown,
 }
 
+/// Which system is running: the live stick (everything in RAM, nothing installed) or this machine's own disk.
+///
+/// `init.sh` already decides this at boot - `grep -q " /data " /proc/mounts && [ -e /data/.installed ]` - and
+/// leaves the answer in `/etc/1bit` (`installed` or `live`, touched beside the MODE banner). The console reads those
+/// markers rather than re-deriving the rule, and falls back to the same test when they are absent (a box whose
+/// marker write failed, or a console started by hand). #711 is why the screen says it at all: the owner saw
+/// "live usb is loaded up" while the banner facts came from the NVMe, and the console is the screen a person
+/// looks at all day - after the install it must not still look like a stick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    Live,
+    Installed,
+    #[default]
+    Unknown,
+}
+
+impl Mode {
+    pub fn word(self) -> Option<&'static str> {
+        match self {
+            Mode::Live => Some("LIVE"),
+            Mode::Installed => Some("INSTALLED"),
+            Mode::Unknown => None,
+        }
+    }
+}
+
+/// `mode_in` against the real root. Read-only, and cheap enough for the once-a-second frame.
+pub fn mode() -> Mode {
+    mode_in(Path::new("/"))
+}
+
+pub fn mode_in(root: &Path) -> Mode {
+    let bit = |p: &str| root.join(p).exists();
+    // init's own markers first, in its own order: an installed boot touches `installed`, a live one touches `live`
+    if bit("etc/1bit/installed") {
+        return Mode::Installed;
+    }
+    if bit("etc/1bit/live") {
+        return Mode::Live;
+    }
+    // no marker (init has not run, or could not write it): init's rule, which needs /data to be the mounted one
+    if bit("data/.installed") {
+        return Mode::Installed;
+    }
+    Mode::Unknown
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Gpu {
     /// false until the runtime has answered (the probe is cached and may still be running on the first draw)
@@ -105,6 +152,7 @@ pub struct Stats {
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     pub release: String,
+    pub mode: Mode,
     pub hostname: String,
     pub uptime_s: u64,
     pub secure_boot: SecureBoot,
@@ -144,6 +192,7 @@ impl Facts {
     pub fn collect() -> Facts {
         let mut f = Facts {
             release: release_tag(),
+            mode: mode(),
             hostname: hostname(),
             uptime_s: uptime_s(),
             secure_boot: secure_boot(),
@@ -1136,6 +1185,8 @@ pub fn token(page: usize) -> &'static str {
 pub fn c16_board() -> Facts {
     Facts {
         release: "rc-2026-11-03-c16".into(),
+        // the c16 boot the fixtures freeze is the stick's (the demo path); INSTALLED is the other branch
+        mode: Mode::Live,
         hostname: "strix".into(),
         uptime_s: 2 * 3600 + 13 * 60,
         secure_boot: SecureBoot::Enabled,
@@ -1232,6 +1283,35 @@ mod tests {
         );
         assert_eq!(env.get("HRX_ALLOW_NO_SVM").map(String::as_str), Some("1"));
         assert_eq!(env.len(), 5);
+    }
+
+    #[test]
+    fn the_mode_is_what_init_wrote() {
+        // init.sh is the one that decides (its own rule: /data mounted and /data/.installed present), and it leaves
+        // the answer in /etc/1bit. The console reads that instead of re-deriving it, and falls back to init's rule
+        // when the marker is not there. Measured against dirs, not against this dev box.
+        let root = std::env::temp_dir().join(format!("mode-in-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("etc/1bit")).unwrap();
+        assert_eq!(
+            mode_in(&root),
+            Mode::Unknown,
+            "an empty box has no mode to report"
+        );
+        fs::write(root.join("etc/1bit/live"), "").unwrap();
+        assert_eq!(mode_in(&root), Mode::Live);
+        // an installed boot that somehow kept the live marker still reads installed: the marker init writes wins,
+        // and it writes `installed` after the MODE banner
+        fs::write(root.join("etc/1bit/installed"), "").unwrap();
+        assert_eq!(mode_in(&root), Mode::Installed);
+        // no markers at all (an init that could not write them) -> init's own fallback, /data/.installed
+        let root2 = std::env::temp_dir().join(format!("mode-in2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root2);
+        fs::create_dir_all(root2.join("data")).unwrap();
+        fs::write(root2.join("data/.installed"), "").unwrap();
+        assert_eq!(mode_in(&root2), Mode::Installed);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
     }
 
     #[test]
@@ -1535,7 +1615,10 @@ mod tests {
         assert_eq!(pane.last().unwrap(), "LEM (40 debug lines hidden: GET /api/v1 polling)");
 
         // no polls, no marker: an honest pane says nothing about noise that never happened
-        let quiet = pane_lines(vec!["KRN [ 1.0] amdgpu: HRX runtime registered".into()], 400);
+        let quiet = pane_lines(
+            vec!["KRN [ 1.0] amdgpu: HRX runtime registered".into()],
+            400,
+        );
         assert_eq!(quiet.len(), 1);
         // and the cap counts the marker, so the pane never grows by a line when there is noise
         let many: Vec<String> = (0..50).map(|i| format!("LEM event {i}")).collect();

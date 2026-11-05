@@ -30,8 +30,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 #include "q4nx_weight_layout.h"  // pack_int8_image(): the weight BO's byte order
@@ -61,6 +63,36 @@ struct Q8Kernel {
     std::unique_ptr<I8Ctx> ctx;
     const int8_t* w_ptr = nullptr;  // the graph's weights whose bytes are in layerB[0]
     int64_t w_k = 0, w_n = 0;
+    // Resident weights (ONEBIT_EP_QDQ_RESIDENT=1): one packed image per distinct weight, so a pass that
+    // cycles 28 weights of one shape through this kernel pays each image once instead of once per call.
+    // ONNX initializers are immutable, so the tensor's address is the identity, as in the one-slot cache.
+    struct Slot {
+        const int8_t* w = nullptr;
+        std::unique_ptr<xrt::bo> bo;
+    };
+    // A deque, not a vector: a slot's BO address is lent out for the duration of a call, and deque does not
+    // move elements when a later weight is appended.
+    std::deque<Slot> slots;
+};
+
+// Lends layerB[0] to a resident weight for the duration of a call: launch(0) reads the weight from
+// layerB[0], so the resident BO takes its place and the context's own BO goes back afterwards -- also if
+// a launch throws, which is why this is a destructor and not two lines around the call. Three unique_ptr
+// moves, no allocation.
+struct LendWeight {
+    std::unique_ptr<xrt::bo>& slot;
+    std::unique_ptr<xrt::bo>* theirs;
+    std::unique_ptr<xrt::bo> saved;
+    LendWeight(std::unique_ptr<xrt::bo>& s, std::unique_ptr<xrt::bo>* t) : slot(s), theirs(t) {
+        if (!theirs) return;
+        saved = std::move(slot);
+        slot = std::move(*theirs);
+    }
+    ~LendWeight() {
+        if (!theirs) return;
+        *theirs = std::move(slot);
+        slot = std::move(saved);
+    }
 };
 
 // One process-wide NPU context: the device, the kernels, and the lock that keeps other processes
@@ -76,6 +108,15 @@ struct State {
     // re-reading the environment or re-opening the device.
     std::vector<std::pair<std::string, std::string>> specs;
     std::vector<std::unique_ptr<Q8Kernel>> q8_kernels;
+    // Resident weights: off unless ONEBIT_EP_QDQ_RESIDENT is set, and bounded by ONEBIT_EP_QDQ_RESIDENT_MB
+    // (default 1024) so a graph with many distinct weights cannot turn a plugin inside someone's session
+    // into an unbounded allocation of device BOs. Past the cap a call uses the one-slot cache instead,
+    // which is correct and slower -- the same trade the knob exists to offer.
+    bool resident = false;
+    size_t resident_max = 1024u << 20;
+    size_t resident_used_bytes = 0;
+    bool resident_capped = false;
+    bool resident_failed = false;
     // Shapes whose QDQ kernel could not be built (a bad ELF, a design M that does not match it). Remembered
     // because building one means parsing an ELF and creating a hw_context -- ~50 ms -- and retrying that on
     // every call turns a fallback into a 20x slowdown: measured, 8 decode tokens went from 4 s to 87 s when
@@ -195,6 +236,12 @@ bool init(State& s) {
                                        : std::string("no XRT device (amdxdna): ") + dev_why);
 
     s.specs = spec;  // a QDQ kernel is built from these on first use
+    // The resident-weight knob is read once here, with the rest of the configuration.
+    if (const char* r = env("ONEBIT_EP_QDQ_RESIDENT")) {
+        s.resident = strcmp(r, "0") != 0;
+        int mb = 0;
+        if (s.resident && env_int("ONEBIT_EP_QDQ_RESIDENT_MB", &mb)) s.resident_max = (size_t)mb << 20;
+    }
     for (const auto& [dims, elf] : spec) {
         int m = 0, k = 0, n = 0;
         if (sscanf(dims.c_str(), "%dx%dx%d", &m, &k, &n) != 3 || m <= 0 || k <= 0 || n <= 0)
@@ -313,11 +360,56 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
     // per-column scale.
     // ONNX initializers are immutable, so the tensor's address is its identity: a graph that rewrote the bytes
     // in place would keep the old ones here, and re-uploading on every call would cost what this cache saves.
-    if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
+    //
+    // With ONEBIT_EP_QDQ_RESIDENT=1 each distinct weight gets its own packed BO instead, so a call whose
+    // weight has been seen before writes nothing at all: a model pass sends 28 weights of one shape through
+    // this kernel in a row, and the one-slot path below re-writes and re-syncs the whole image (KD*ND bytes,
+    // 2 MB at 1024x2048) for each of them. That writeback, not the pack loop, is what one slot costs.
+    std::unique_ptr<xrt::bo>* resident = nullptr;
+    if (s.resident) {
+        for (auto& sl : kern->slots)
+            if (sl.w == b) {
+                resident = &sl.bo;
+                break;
+            }
+        if (!resident) {
+            const size_t bytes = ctx.w_bytes();
+            if (s.resident_used_bytes + bytes <= s.resident_max) {
+                try {
+                    // zero=false: pack_int8_image zeroes the image itself, padding included.
+                    auto bo = ctx.make_weight_bo(*s.dev, /*zero=*/false);
+                    auto* Bm = (int8_t*)bo->map();
+                    if (!Bm) throw std::runtime_error("weight BO has no host mapping");
+                    q4nx_layout::pack_int8_image(Bm, b, (int)k, (int)n, ctx.KD, ctx.ND, ctx.blocked_b);
+                    bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    s.resident_used_bytes += bytes;
+                    kern->slots.push_back(Q8Kernel::Slot{b, std::move(bo)});
+                    resident = &kern->slots.back().bo;
+                } catch (const std::exception& e) {
+                    // A plugin inside someone's inference session must not turn a full device into a thrown
+                    // call: the one-slot cache below is slower and always correct.
+                    if (!s.resident_failed) {
+                        s.resident_failed = true;
+                        std::fprintf(stderr,
+                                     "  onebit_npu_gemm: resident weight BO failed (%s), falling back to the "
+                                     "one-slot cache\n",
+                                     e.what());
+                    }
+                }
+            } else if (!s.resident_capped) {
+                s.resident_capped = true;
+                // Once, on stderr like the runtime's own notes: a cap that silently changed behaviour would
+                // leave a run slower than its configuration says, with nothing to read.
+                std::fprintf(stderr,
+                             "  onebit_npu_gemm: resident weights capped at %zu kB (used %zu kB), further "
+                             "weights use the one-slot cache\n",
+                             s.resident_max / 1024, s.resident_used_bytes / 1024);
+            }
+        }
+    }
+    if (!resident && (kern->w_ptr != b || kern->w_k != k || kern->w_n != n)) {
         // Pack through the layout helper, which writes the same bytes a byte-at-a-time bpos() scatter
-        // would but in 8-byte microtile runs: this is the loop that a pass pays once per group (a kernel is
-        // keyed by (K, N), so a pass sends 28 different weights through each of 5 of them), and the scatter
-        // measured 1.44 ms for a 1024x2048 weight, 295 ms of a 1074 ms token.
+        // would but in 8-byte microtile runs.
         auto* Bm = (int8_t*)ctx.layerB[0]->map();
         q4nx_layout::pack_int8_image(Bm, b, (int)k, (int)n, ctx.KD, ctx.ND, ctx.blocked_b);
         ctx.layerB[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -325,6 +417,8 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
         kern->w_k = k;
         kern->w_n = n;
     }
+    // Hold the resident weight in layerB[0] for the whole call (launch() reads the weight from there).
+    LendWeight lend(ctx.layerB[0], resident);
 
     // Activations: the graph's int8 bytes, M rows per launch (the ELF's design). Rows past `rows` are
     // zeroed, which is what the kernel reads for them and what the host path also assumes.

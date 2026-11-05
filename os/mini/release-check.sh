@@ -102,13 +102,40 @@ auth_get() {  # <url>
 auth_status() {  # <url> -> HTTP status
     if [ -n "$KEY" ]; then status --header="Authorization: Bearer $KEY" "$1"; else status "$1"; fi
 }
-auth_post() {  # <json body> <url> [slow] -> the reply
-    if [ "${3:-}" = slow ]; then _ag=got_slow; else _ag=got; fi
-    if [ -n "$KEY" ]; then
-        $_ag --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" --post-data="$1" "$2"
-    else
-        $_ag --header='Content-Type: application/json' --post-data="$1" "$2"
+# The fetcher for a POST. `got`/`got_slow` try wget first and pass their arguments through unchanged, but
+# a POST body is spelled differently by the two tools: wget takes `--post-data`, curl takes `--data`.
+# Measured on this box while exercising the laya row: with wget absent and curl present, every POST row
+# read an empty body and reported "no answer" for a server that had answered - a false FAIL on exactly the
+# installed-to-disk run the release check is meant to prove. So the POST path picks its own fetcher.
+# RELEASE_CHECK_FETCHER=wget|curl forces one, which is how both branches get exercised.
+post_fetch() {  # <json body> <url> [slow]
+    _cap=20; [ "${3:-}" = slow ] && _cap=120
+    _f=${RELEASE_CHECK_FETCHER:-}
+    if [ -z "$_f" ]; then
+        if command -v wget >/dev/null 2>&1; then _f=wget; else _f=curl; fi
     fi
+    if [ -n "$KEY" ]; then _auth="Authorization: Bearer $KEY"; else _auth=; fi
+    if [ "$_f" = curl ]; then
+        if [ -n "$_auth" ]; then
+            curl -sf --connect-timeout 5 --max-time "$_cap" --header='Content-Type: application/json' \
+                 --header="$_auth" --data "$1" "$2" 2>/dev/null
+        else
+            curl -sf --connect-timeout 5 --max-time "$_cap" --header='Content-Type: application/json' \
+                 --data "$1" "$2" 2>/dev/null
+        fi
+    else
+        if [ -n "$_auth" ]; then
+            wget -q -T "$_cap" -t 1 -O - --header='Content-Type: application/json' \
+                 --header="$_auth" --post-data="$1" "$2" 2>/dev/null
+        else
+            wget -q -T "$_cap" -t 1 -O - --header='Content-Type: application/json' \
+                 --post-data="$1" "$2" 2>/dev/null
+        fi
+    fi
+}
+
+auth_post() {  # <json body> <url> [slow] -> the reply
+    post_fetch "$1" "$2" "${3:-}"
 }
 
 # A POST whose *status and headers* are the evidence (engine#1024's non-streamed arm answers 503 + Retry-After, so the

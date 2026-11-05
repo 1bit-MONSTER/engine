@@ -19,7 +19,10 @@
 // The one non-obvious part is commit_verify(): a GDN layer's recurrence cannot be re-indexed, so the verify batch
 // DEFERS it -- begin_verify() stores each row's recurrence inputs instead of applying them, and
 // commit_verify_rows(accepted) applies exactly the accepted prefix and drops the rest (#805 P6).  Nothing is
-// snapshotted per iteration and no prefix restore is attempted (restore_state() refuses those on a GDN model); the
+// snapshotted per iteration and this adapter never restores: restore_state() ACCEPTS a prefix (`tokens < in.tokens`)
+// and installs the GDN planes whole from the snapshot (`q4nx_forward.cpp:326-341`; its only refusals are a plane of
+// the wrong size and a `tokens > in.tokens` extension), so a prefix restore here would leave KV at the prefix with
+// the recurrence still at the snapshot's last position -- the mixed state this deferral exists to avoid.  The
 // forward's snapshot_state()/StateSnapshot API exists and this adapter deliberately does not use it.
 //
 // last_hidden_rows() is `override` for a reason: the loop's advance over the accepted rows hangs on that one

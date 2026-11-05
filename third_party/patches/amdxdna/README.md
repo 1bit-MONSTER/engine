@@ -74,6 +74,15 @@ version string is part of them — a rebuild of *identical sources* with a diffe
 `1184D9F60CB1099D47420E9` when measured on 2026-11-04, so a srcversion mismatch on its own does not mean the patches
 are missing. Check the source with `cmp`/`git diff`, and the fingerprint with the same string.
 
+**To reproduce the *carried* fingerprint row** (`…+0006+0007` → `336751493A77C50DE0B50F7`) rather than the one the fleet
+runs, apply the pair after `0003` and rebuild with the same `MODULE_VER_STR` — this is the compile proof, **not** an
+install path (see *What this directory deliberately does not install*):
+
+```sh
+git apply <engine>/third_party/patches/amdxdna/0006-*.patch   # #812 pair: carried, owner-gated
+git apply <engine>/third_party/patches/amdxdna/0007-*.patch
+```
+
 
 Under Secure Boot the module must be signed before it can load (`MOK-Kernel` here; the MOK must already be enrolled):
 

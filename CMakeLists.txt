@@ -562,6 +562,10 @@ if(Python3_Interpreter_FOUND)
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
     add_test(NAME q4nx_pb16i COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_pb16i_test.py)
+    # The padded-grid read (engine#1097/#1110): tools/q4nx_diff.py decode reads a container whose weight sits on a
+    # WIDER tile grid than the model's dimensions (the FastFlowLM repack pads intermediate_size to 512 columns, IM
+    # 8960 -> 9216) instead of reporting it as an unreadable reshape.  Pure python + numpy, no model, no device.
+    add_test(NAME q4nx_diff_grid COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_diff_grid_test.py)
     # the t2 chunk kind (docs/npu.md "The t2 chunk kind"): synthetic only, because the real-model
     # leg needs 14 GB of Bonsai-2 images. Run tests/q4nx_t2_test.py without --no-model for the gate.
     add_test(NAME q4nx_t2 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2_test.py --no-model)
@@ -833,6 +837,13 @@ target_link_libraries(npu_rmsnorm_offset_test PRIVATE m)
 add_test(NAME npu_rmsnorm_offset COMMAND npu_rmsnorm_offset_test)
 # Same ci.yml workaround as above: npu_sampling_test is in the workflow's target list, this binary is not.
 add_dependencies(npu_sampling_test npu_rmsnorm_offset_test)
+# layer_types -> per-layer kind, and the name the forward refuses an unimplemented kind by (q4nx_forward.cpp,
+# the engine#1087 shape).  Plain C, links the semantics TU directly, no model and no device.
+add_executable(q4nx_layer_kinds_test tests/q4nx_layer_kinds_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_layer_kinds_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_layer_kinds_test PRIVATE m)
+add_test(NAME q4nx_layer_kinds COMMAND q4nx_layer_kinds_test)
+add_dependencies(npu_sampling_test q4nx_layer_kinds_test)
 set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.json)")
 set(ONEBIT_NPU_MOE_GATE "" CACHE FILEPATH "gate.json from tools/moe_expert_chunks.py gate")
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")

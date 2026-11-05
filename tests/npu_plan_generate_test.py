@@ -83,6 +83,10 @@ with tempfile.TemporaryDirectory() as root:
     check(plan["layers"][0]["qkv"]["N"] == (16 + 2 * 8) * 128, "attn QKV N is (nh + 2*nkv) * hd")
     check(plan["layers"][1]["attn_gate"]["N"] == 8 * 128, "GDN gate N is the value width")
     check(plan["decode"]["dirs"][-1] == {"root": "kernels", "path": "."}, "the kernel dir is the last decode dir")
+    # engine#1110: the generator declares the payload's q4_1 tile order, so a container from another
+    # converter (a different order that would decode as noise with no error) is refused at load.
+    check(plan["container"]["tile_order"] == "engine-1",
+          "the plan declares container.tile_order = engine-1 (engine#1110)")
 
     # 2. --check agrees with what is on disk, and catches a kernel set that changed under it.
     r = run(d, "--check")

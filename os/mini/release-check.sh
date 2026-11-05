@@ -23,7 +23,7 @@
 #
 # Rows that cannot PASS without the hardware are marked SKIP in a VM (Lemonade hides its onebit
 # entries on a machine with no AMD GPU or NPU, and there is no HRX or NPU device to run them on):
-# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder, chat-npu-queue. Everything else - mode, kernel,
+# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder, chat-npu-queue, chat-npu-queue-plain. Everything else - mode, kernel,
 # Secure Boot, Lemonade up with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU
 # sets and the signed manifests over them, the licences and the image identity - is checked in the VM as well.
 set -u
@@ -37,7 +37,7 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1))
-    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
 # A row that holds the NPU can hold it for a minute or two (a fresh backend per ladder rung, a 512-token turn),
@@ -109,6 +109,28 @@ auth_post() {  # <json body> <url> [slow] -> the reply
     else
         $_ag --header='Content-Type: application/json' --post-data="$1" "$2"
     fi
+}
+
+# A POST whose *status and headers* are the evidence (engine#1024's non-streamed arm answers 503 + Retry-After, so the
+# body alone says nothing and got/get_slow hide both). Writes the body to $3 and prints "<status> <retry-after>".
+auth_post_watch() {  # <json body> <url> <file for the body>
+    : > "$3"
+    if command -v curl >/dev/null 2>&1; then
+        if [ -n "$KEY" ]; then
+            curl -s -m 200 -D "$3.headers" -o "$3" -w '%{http_code}' \
+                 --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
+                 --post-data="$1" "$2" 2>/dev/null
+        else
+            curl -s -m 200 -D "$3.headers" -o "$3" -w '%{http_code}' \
+                 --header='Content-Type: application/json' --post-data="$1" "$2" 2>/dev/null
+        fi
+    else
+        # No curl on this image: wget can still prove a refusal, but it discards the body, so say what is missing.
+        wget -S -O "$3" -T 200 --header='Content-Type: application/json' --post-data="$1" "$2" >"$3.headers" 2>&1
+        printf '%s' "$(sed -n 's/.*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' "$3.headers" | head -1)"
+    fi
+    printf ' '
+    sed -n 's/^[Rr]etry-[Aa]fter: *//p' "${3}.headers" 2>/dev/null | tr -d '\r' | head -1
 }
 
 # Readiness: on a cold stick lemond takes tens of seconds to answer its first request (catalog, web
@@ -313,6 +335,45 @@ queue_verdict() {
     printf 'PASS the second chat queued behind a 1000-token turn and answered (%s chunk(s), [DONE]), no TDR (still %s)' "$_qn" "$_t1"
 }
 
+# The same row's OTHER arm (engine#1024): a **non-streamed** request cannot be told it is queueing, so it must be
+# REFUSED at its own short bound (`--queue-ms-plain`, 5000 ms on the appliance) with `503 + Retry-After` - not parked
+# silently for the whole queue. Without this arm the row cannot see the path the fix's second half is about, because
+# both of its chats stream. Pure, so --self-test drives it: <long chat body> <status> <refusal body> <Retry-After>
+# <TDRs before> <TDRs after>.
+plain_queue_verdict() {
+    _p1=$1 _ps=$2 _pb=$3 _pr=$4 _t0=$5 _t1=$6
+    case "$_p1" in
+        *'data: '[[[]DONE]*) ;;
+        *) printf 'FAIL the long (1000-token) chat, which owns the device, came back without data: [DONE]: %.120s' "${_p1:-no body}"
+           return 0 ;;
+    esac
+    case "$_ps" in
+        503) ;;
+        000|'') printf 'FAIL the non-streamed chat got no HTTP status at all, so nothing can be said about its bound'
+                return 0 ;;
+        200) printf 'FAIL the non-streamed chat was ANSWERED while the device was still busy: the short bound did not apply'
+             return 0 ;;
+        *) printf 'FAIL the non-streamed chat answered %s, not the 503 + Retry-After a client can act on' "$_ps"
+           return 0 ;;
+    esac
+    case "$_pb" in
+        *device_busy*|*'the NPU is busy'*) ;;
+        *) printf 'FAIL the 503 did not say the device is busy, so a client cannot tell it from a broken model: %.120s' "${_pb:-empty body}"
+           return 0 ;;
+    esac
+    case "$_pr" in
+        ''|*[!0-9]*) printf 'FAIL the 503 carried no numeric Retry-After (got "%s"), so the refusal names no wait' "${_pr:-none}"
+                     return 0 ;;
+    esac
+    if [ -z "$_t0" ] || [ -z "$_t1" ]; then
+        printf 'PASS the non-streamed chat was refused at its short bound (503, Retry-After %s) instead of waiting silently; the kernel log was not readable, so no TDR was ruled out' "$_pr"
+        return 0
+    fi
+    [ "$_t1" -gt "$_t0" ] && { printf 'FAIL the NPU logged a TDR during the non-streamed arm (%s -> %s): see dmesg' "$_t0" "$_t1"
+                               return 0; }
+    printf 'PASS the non-streamed chat was refused at its short bound (503, Retry-After %s) instead of waiting silently, no TDR (still %s)' "$_pr" "$_t1"
+}
+
 # The first value of a JSON key - quoted or not, since usage counts are bare numbers - for the row's
 # small bodies (one line, one message: the same assumption chat() already makes).
 json_str() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\\1/p" | head -1; }
@@ -394,6 +455,16 @@ data: [DONE]' 0 0)"                                                             
 data: [DONE]' 0 1)"                                                                                    # a TDR while queueing
     check PASS "$(queue_verdict 'data: [DONE]' 'data: {"choices":[{"delta":{"reasoning_content":"OK"}}]}
 data: [DONE]' '' '')"                                                                                  # dmesg unreadable
+    # engine #1024, the non-streamed arm: it cannot be told it is queueing, so a 503 + Retry-After at its own bound is
+    # the pass, and being *answered* while the device is busy is the failure (that would mean the bound did not apply).
+    check PASS "$(plain_queue_verdict 'data: [DONE]' 503 '{"error":{"message":"the NPU is busy with another request","type":"device_busy"}}' 1 0 0)"
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"OK"}}]}' '' 0 0)"
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 503 '{"error":{"message":"the NPU is busy with another request","type":"device_busy"}}' '' 0 0)"   # no Retry-After
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 503 '{"error":{"message":"model failed to load"}}' 1 0 0)"                                        # no device_busy
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 000 '' '' 0 0)"                                                                                   # nothing answered
+    check FAIL "$(plain_queue_verdict 'data: {"choices":[{"delta":{"content":"long"}}]}' 503 '{"type":"device_busy"}' 1 0 0)"                           # long chat cut
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 503 '{"type":"device_busy"}' 1 0 1)"                                                               # a TDR
+    check PASS "$(plain_queue_verdict 'data: [DONE]' 503 '{"type":"device_busy"}' 1 '' '')"                                                             # dmesg unreadable
     # the history that goes back into the request has to survive a JSON string
     jt=$(json_text 'a "quoted" \\ line
 next')
@@ -997,6 +1068,37 @@ elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
     skip chat-npu-queue "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
 else
     skip chat-npu-queue "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
+
+# ── NPU chat from a NON-STREAMED client while the device is busy (engine#1024; measured 4 Nov 2026) ────────────
+# A non-streamed request has no way to say "queueing": no chunk, no comment, no header - so a long wait would be the
+# #911 shape again (nothing on the wire while the client's own no-data timer runs out). The serve therefore keeps a
+# short bound for it (`--queue-ms-plain`, 5000 ms) and answers `503 + Retry-After: 1` with `type: device_busy`, which a
+# client can act on; Lemonade's agentic tool loop is exactly such a call site. This arm exists because
+# `chat-npu-queue`'s two chats both stream, so it cannot see this path at all.
+if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    TDRP0=$(tdr_count)
+    PDIR=$(mktemp -d /tmp/npu-queue-plain.XXXXXX)
+    PLONG="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Write a long essay about the history of cartography, and about what map-making changed in how people understood the world.\"}],\"max_tokens\":1000,\"temperature\":0,\"stream\":true}"
+    PSHORT="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":16,\"temperature\":0}"
+    ( auth_post "$PLONG" "$API/api/v1/chat/completions" slow > "$PDIR/long.sse" 2>&1 ) &
+    PPID=$!
+    sleep 1
+    PW=$(auth_post_watch "$PSHORT" "$API/api/v1/chat/completions" "$PDIR/short.json")
+    wait "$PPID" 2>/dev/null
+    PLONG_BODY=$(cat "$PDIR/long.sse" 2>/dev/null)
+    PSHORT_BODY=$(cat "$PDIR/short.json" 2>/dev/null)
+    TDRP1=$(tdr_count)
+    VP=$(plain_queue_verdict "$PLONG_BODY" "${PW%% *}" "$PSHORT_BODY" "${PW#* }" "$TDRP0" "$TDRP1")
+    rm -rf "$PDIR"
+    case "$VP" in
+        PASS*) pass chat-npu-queue-plain "$NPU: $VP" ;;
+        *)     fail chat-npu-queue-plain "$NPU: $VP" ;;
+    esac
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-queue-plain "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+else
+    skip chat-npu-queue-plain "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────

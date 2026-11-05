@@ -298,3 +298,40 @@ condition is the classic untested branch.
    literally named `auto` (no code change, but it collides with any user model of that name)?
 4. **The code class's first pull is 18.6 GB.** Start `code` on ZAYA1-8B (5.6 GB) and treat Qwen3-Coder as an
    escalation, or accept the big pull on the first code request?
+
+### What measuring the implementation added to those four
+
+Each of these was found by running the code against a live server tonight, not by reading it. They narrow the
+answers; none of them decides anything for you.
+
+1. **The small NPU row: provenance matters more than size.** The row has to name a checkpoint the appliance can pull
+   *and* prove. An FLM checkpoint is a third party's artefact on a pinned FLM (v1.0.7 today), so the row would be
+   "our router, their model" — defensible for a small chat class, but it is a different claim from every other row in
+   the table, and the release check would need to say which kind of row it is looking at. A 0.6B-class Q4NX of our own
+   keeps one claim for the whole table and costs a conversion. **Recommendation: our own container**; if an FLM row
+   ships instead, the table needs a `provenance` field so the row and the release check cannot disagree about what
+   "ours" means.
+2. **Catalogue vs table: the table's names must be registrable, and that is now a hard constraint.** Measured: Lemonade
+   refuses to register a definition outside `user.*` — *"Registered model definitions must use a non-empty `user.*`
+   name. Received: 1bit.Laya-First"*. So whatever the row ids become, the **router collection** is registered as
+   `user.<something>` and the desugar emits that; the *components* keep their catalogue ids (they are ordinary pulled
+   models, not definitions). The table already names `1bit-MONSTER` mirrors, so the question is only whether the
+   catalogue rows are re-pointed at them — which the `hf_repo` field already answers independently, without moving ids.
+   **Recommendation: leave ids alone; treat `hf_repo`/`file` as the pull source.**
+3. **`auto`: the two options differ in who owns a name, and one of them is cheap to reverse.** A reserved name needs a
+   hook in `Router` and is invisible to the catalogue; a shipped collection named `auto` needs no code but squats the
+   name for every user. There is a third shape the work made obvious: keep the name `user.Laya-First` (what the desugar
+   already emits and what the release row now reads *from the engine*, not a constant) and let the **appliance** alias
+   `auto` to it — an alias is configuration, reversible, and does not squat anything in the product. **Recommendation:
+   alias at install time**, and raise the reserved-name hook only if a user-facing `auto` is wanted on stock Lemonade
+   too.
+4. **The 18.6 GB first pull: the table already made this a policy question, not a code question.** Nothing in the code
+   forces the big model to be `code`'s *first* choice: the class rule points wherever the table says, and
+   `tests/laya_first.sh` re-derives the policy from the table. So this can ship as ZAYA1-8B for `code` with
+   Qwen3-Coder as a second table entry to promote later, at the cost of one line in `config/laya-first.json` — and no
+   code change to reverse. **Recommendation: start small, promote with evidence.**
+
+**One measurement that changes how the table must be written, whichever way 1-4 go:** a class rule needs a floor
+*above* zero (`min_score: 0.01`, §4). At `0.0` the first rule matches every class, because the classifier reports only
+the class Laya chose and every other label scores exactly `0.0` — a `short` prompt routed to the `code` model while
+every test stayed green. Any table or hand-written policy built from this note has to carry that floor.

@@ -1182,6 +1182,35 @@ last one to go.
 Qwen3-4B, whose kernel sets are on this box): each model solo, then both at once, three reps, every
 number stamped with the build that produced it.
 
+### When a load follows an evict
+
+On the appliance the NPU model is swapped by evicting it and starting a fresh `1bit` for the next
+one, and a load that starts *right* after an evict can fail at device / context creation while the
+previous backend's hardware context is still being torn down. Measured on the c22 board
+([engine#1010](https://github.com/1bit-MONSTER/engine/issues/1010)): two children exited 1 inside
+100 ms of starting, `POST /api/v1/load` answered 500, and the next request loaded the same model
+normally.
+
+That failure is transient by nature, so the NPU routes open with a **bounded retry**
+(`app/npu_load_retry.h`): up to 2.5 s, 150 ms doubling to a 500 ms cap, at most 12 attempts. Each
+attempt's reason goes to stderr — the line the appliance log never had — and a recovered start says
+so:
+
+```
+1bit unified: opening the private route's NPU context attempt 1 failed after 12 ms
+              (npu runtime: device error (code 102): No such device); retrying in 150 ms
+1bit unified: opening the private route's NPU context recovered on attempt 2 after 168 ms
+```
+
+A real failure is unchanged apart from being reported: the last attempt's exception still reaches the
+caller after the window closes, and the log now names the attempt count and the reason.
+`tests/npu_load_retry_test.cpp` (ctest `npu_load_retry`, in CI) covers the schedule, the window, a
+transient recovery, a persistent failure, and a zero window (one attempt, no retry).
+
+Lemonade's half of the same race is its fixed 2 s wait after "waiting for GPU driver cleanup", which
+is a delay and not a readiness signal; that fix belongs to the appliance, this one keeps the engine
+from dying on a failure that clears in a few hundred milliseconds.
+
 ## Add-on routes
 
 The engine keeps a hook for closed-source NPU add-ons (`npu/private_route.h`). Qwen3.6-35B-A3B

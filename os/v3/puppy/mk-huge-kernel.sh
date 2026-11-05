@@ -18,8 +18,9 @@
 #
 # The 1bit OS kernel as a Puppy kernel package: woof-CE's `kernel-kit/output/huge-<kver>.tar.*`,
 # which `3builddistro` unpacks into `vmlinuz` and the `zdrv_<prefix>_<version>.sfs` it boots. This is
-# how the Puppy build carries OUR kernel (7.3.0-rc4-1bit-perfopt+ and its out-of-tree modules), with no
-# distribution kernel anywhere in the image - docs/os-v3-live-puppy-eval.md, and the owner's requirement
+# how the Puppy build carries OUR kernel (`7.4.0-rc1-1bit` today, built from upstream `v7.4-rc1`, and
+# its out-of-tree modules), with no distribution kernel anywhere in the image - docs/os-v3-live-puppy-eval.md,
+# and the owner's requirement
 # that the Puppy appliance boots our kernel, our modules and our firmware.
 #
 # <kernel-stage> is the release kernel as it sits on the build machine, the same shape os/v2/mkdebs.sh

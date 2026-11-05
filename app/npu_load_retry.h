@@ -57,6 +57,19 @@ inline bool load_retry_more(const LoadRetryPolicy& p, int attempts, double elaps
     return elapsed_s + load_retry_delay(p, attempts) <= p.window_s;
 }
 
+// The one load failure an operator has to act on instead of waiting out: the driver refusing to create a hardware
+// context. The runtime reports it as code 102 (`errc::ctx_create`, npu_rt_errors.h) with the ioctl's errno in the
+// message, and "No such device" (ENODEV) is the state a TDR leaves behind when it could not restart a context: amdxdna
+// keeps refusing every new context until it is reloaded (measured on strixhalo 2026-11-04, the wedge in engine #1051).
+// A retry cannot fix that, and neither can the supervisor that restarts us -- so say what does.
+inline bool npu_contexts_refused(const std::string& reason) {
+    return reason.find("code 102") != std::string::npos && reason.find("No such device") != std::string::npos;
+}
+
+inline const char* npu_contexts_refused_hint() {
+    return "the NPU array is refusing hardware contexts: reload the driver (modprobe -r amdxdna && modprobe amdxdna)";
+}
+
 // Run `open` until it succeeds, the window closes, or it has thrown `max_attempts` times. A caller that wants the log
 // silent can pass a no-op `report`; the default names each attempt with its own reason, which is the whole point.
 template <class Open, class Report, class Sleep>
@@ -75,6 +88,7 @@ void open_with_retry(const LoadRetryPolicy& p, const char* what, Open&& open, Re
             if (!load_retry_more(p, attempt, elapsed)) {
                 report(std::string(what) + " failed " + std::to_string(attempt) + " attempt(s) in " +
                        std::to_string(int(elapsed * 1000)) + " ms, last reason: " + ex.what());
+                if (npu_contexts_refused(ex.what())) report(npu_contexts_refused_hint());
                 throw;   // the caller's own error path; the reasons above are the evidence the appliance lacked
             }
             const double delay = load_retry_delay(p, attempt);

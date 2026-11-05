@@ -112,7 +112,7 @@ cat > "$scratch/slow_provider.py" <<'PY'
 import os, signal, sys, time
 
 def term(*_a):
-    time.sleep(3.0)                     # the teardown an NPU provider needs
+    time.sleep(8.0)                     # the teardown an NPU provider needs (>= the 3 s slack a loaded box can add)
     with open(os.environ["SLOW_MARKER"], "w") as f:
         f.write("clean\n")
     sys.exit(0)

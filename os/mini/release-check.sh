@@ -432,6 +432,12 @@ laya_class_model() {  # <class> -> the model the shipped table names for it
 laya_verdict() {
     _b=$(printf '%s' "${1:-}" | tr -d ' \n\r\t')
     _cls=${2:-} _want=${3:-}
+    # A gate fails closed on input it cannot interpret: a class this script has no model for would
+    # otherwise skip both the class and the model check and PASS on shape alone (a row added without
+    # touching laya_class_model is exactly how that happens).
+    if [ -n "$_cls" ] && [ -z "$(laya_class_model "$_cls")" ]; then
+        printf 'FAIL no model is named for class %s in this script' "$_cls"; return
+    fi
     printf '%s' "$_b" | grep -q '"matched_rule":"laya-' || {
         printf 'FAIL no Laya rule matched the request'; return; }
     _rule=$(printf '%s' "$_b" | sed -n 's/.*"matched_rule":"laya-\([^"]*\)".*/\1/p')
@@ -570,6 +576,7 @@ next')
     check FAIL "$(laya_verdict "$LV" prose '')"                                        # the wrong class's rule matched
     check FAIL "$(laya_verdict "$LV" code Qwen3-0.6B-1bit)"                            # the wrong model
     check FAIL "$(laya_verdict '{"x_lemonade_route":{"route_to":"m","matched_rule":"laya-code","default_used":false,"trace":[]}}' code m)"   # no Laya score
+    check 'FAIL no model is named for class not-a-class' "$(laya_verdict "$LV" not-a-class '')"   # an unmapped class must not skip the checks
     check FAIL "$(laya_verdict '' code m)"                                             # nothing answered
     # the row's class -> model mapping mirrors config/laya-first.json; assert it here so a table change is
     # a red self-test rather than a row that checks agreement with a mapping nobody updated

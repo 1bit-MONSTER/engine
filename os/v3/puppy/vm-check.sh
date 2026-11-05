@@ -37,10 +37,28 @@
 # the NPU through Lemonade, the installer writing an entry for a second disk, boot time and idle RAM) are
 # printed as SKIP with the reason.
 #
+# --verdict-selftest runs only the row-verdict arms (no image, no VM) and exits 0 when they hold.
+#
 # exit 0 = every row that can run here passed, 1 = a row failed, 2 = the VM never came up.
 set -uo pipefail
 prog=$(basename "$0")
+dir=$(cd "$(dirname "$0")" && pwd)
+# Cycle 26 (#1111): the verdict rule itself is tested before anything boots. The bug this exists for is a row that
+# reported PASS without running - a skip marker (`console-heals-skip-no-tui`) containing the row's own want string - so
+# the arms below are exactly the ones that would have caught it, and they cost no VM. `--verdict-selftest` alone runs
+# only these and exits, which is what a CI job should call.
+if [ "${1:-}" = --verdict-selftest ]; then
+    python3 "$dir/vm_check_verdict.py" || exit 1
+    exit 0
+fi
 [ $# -ge 2 ] || { sed -n "/^# $prog/,/^# exit 0/p" "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+if python3 "$dir/vm_check_verdict.py" > /dev/null 2>&1; then
+    echo "PASS U0 verdict    the row-verdict rule holds: a *-skip-* marker is SKIP, not PASS"
+else
+    python3 "$dir/vm_check_verdict.py" 2>&1 | sed 's/^/     /'
+    echo "FAIL U0 verdict    the row-verdict rule is broken - fix vm_check_verdict.py before trusting this run"
+    exit 2
+fi
 iso=$(cd "$(dirname "$1")" 2>/dev/null && pwd)/$(basename "$1")
 work=$2
 secs=${3:-600}
@@ -132,9 +150,13 @@ vm_gone() { echo "the VM was no longer running when this row ran (qemu budget ${
     qemu-system-x86_64 -m 4096 -smp 4 "${boot[@]}" -display none -vga std -no-reboot \
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
 
+VMCHECK_DIR=$(cd "$(dirname "$0")" && pwd) export VMCHECK_DIR
 ARTIFACT=$iso python3 - "$work" "$iso" > "$work/rows.txt" 2>&1 <<'PY'
 import socket, sys, time, os, re, subprocess, shutil
-
+# The row verdict lives in vm_check_verdict.py so this driver and `--verdict-selftest` cannot disagree about what a skip
+# is; #1111 is the bug that came from having it here alone (a `*-skip-*` marker contains the row's own want string).
+sys.path.insert(0, os.environ["VMCHECK_DIR"])
+import vm_check_verdict as V
 # The shipping driver's srcversion for the MEDIUM this harness is checking. Cycle 26 carries 0011v2: 0008+0009+0011+0011v2,
 # built WITHOUT the 0010 debugfs hook (srcversion EE1F36A2B9BA294CE11AD80, verified: no `tdr_test` string). This box also
 # holds the 0010 hook build for testing, and the two are indistinguishable by vermagic, signer or filename - only
@@ -428,6 +450,26 @@ rows = [
                      "if 1bit-tty1 1 | grep -q 'Show the API key' && 1bit-tty1 1 | grep -q 'Reboot / power off'; then "
                      "echo tty1-menu; elif 1bit-tty1 1 | grep -q 'root@'; then echo tty1-bare-shell; "
                      "else echo tty1-nothing; fi", "tty1-menu"),
+    # Cycle 26, item 1 (owner: "CONSOLE GARBLED ... painting over the TUI panels and the menu"): the row that would have
+    # caught it, and the one that keeps it caught. The console TUI repaints only the cells whose CONTENT changed since its
+    # own last frame, so before #1093 ONE line written to tty1 was a wrong screen for ever - measured on the shipped
+    # 2fc6909c…: two stray lines still on screen 4.3 s later AND after a keypress sent through the keyboard. The appliance
+    # keeps writers on this screen by design (`1bit-release-check` announces an NPU hold, `puppy-check.sh` does the same),
+    # so the answer is not "nobody may write" but "a stray line costs one second". This row writes two of them into the
+    # console the TUI owns, waits out one repaint, and asks for the same landmarks U2 menu asks for. On an image whose
+    # console is the dialog menu (no `1bit-console-tui`) it SKIPs: `dialog` repaints on input by nature, so the question does
+    # not apply there. Red/green proved in ~/wt/tui-vm/rowproof-console-heals.sh (one boot, both binaries): RED on
+    # 2fc6909c… ("console-garbled actions=9 stray=2"), GREEN on the merged artifact.
+    ("U2 console heals", "if ! pgrep -f 1bit-console-tui > /dev/null 2>&1; then echo console-heals-skip-no-tui; "
+                     "elif [ ! -w /dev/tty1 ]; then echo console-heals-skip-no-tty1; "
+                     "else printf '%s\\n' \"[  999.000000] amdxdna 0000:c6:00.1: [drm] *ERROR* stray line one\" "
+                     "\"[  999.100000] amdxdna 0000:c6:00.1: [drm] *ERROR* stray line two\" > /dev/tty1 2>/dev/null; "
+                     "sleep 2; scr=$(1bit-tty1 1 2>/dev/null); "
+                     "n=$(printf '%s\\n' \"$scr\" | grep -cE '^ ?[1-9] [A-Z]'); stray=$(printf '%s\\n' \"$scr\" | grep -c 'stray line'); "
+                     "echo \"actions=$n stray=$stray\"; "
+                     "if [ \"$n\" -ge 9 ] && [ \"$stray\" -eq 0 ] && printf '%s\\n' \"$scr\" | grep -q 'Reboot / power off' "
+                     "&& printf '%s\\n' \"$scr\" | grep -q 'Show the API key'; then echo console-heals; "
+                     "else echo console-garbled; fi; fi", "console-heals"),
     # every line the owner asked for, by name and present rather than at column 0 (two of them share a line);
     # `Secure` matches "Secure Boot", and the four-letter words are unambiguous in this block
     ("U2 menu status", "1bit-console-menu --status 2>&1 | head -10; "
@@ -889,13 +931,8 @@ for idx, row in enumerate(rows):
     if cmd[:24] in body:
         body = body[body.rindex(cmd[:24]):]
     body = "\n".join(l.strip() for l in body.splitlines() if l.strip() and cmd[:24] not in l)
-    flat = body.replace("\n", " | ")
-    if want is None:
-        print("INFO %-13s %s" % (name, flat), flush=True)
-    elif want in body:
-        print("PASS %-13s %s" % (name, flat), flush=True)
-    else:
-        print("FAIL %-13s %s" % (name, flat), flush=True)
+    level, flat = V.verdict(name, want, body)
+    print("%-4s %-13s %s" % (level, name, flat), flush=True)
 PY
 driver_rc=$?
 cat "$work/rows.txt"

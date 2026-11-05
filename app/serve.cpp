@@ -78,6 +78,7 @@
 #include "serve_watchdog.h"
 #include "serve_hybrid.h"
 #include "sysinfo.h"
+#include "template_pin.h"
 
 #ifdef ONEBIT_MOE
 #include "gguf_index.h"
@@ -179,6 +180,12 @@ struct Options {
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
     std::string recipes;                 // --recipes FILE: tuned backend settings (default: built in, docs/recipes.md)
     bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
+    // --template-pin FILE: expected chat-template sha256 per model (default: config/template-pins.json,
+    // built in); --no-template-pin logs the sha without comparing it; --template-pin-strict (or
+    // ONEBIT_TEMPLATE_PIN_STRICT=1) refuses a model whose template is not the pinned one (docs/serve.md)
+    std::string template_pin;
+    bool no_template_pin = false;
+    bool template_pin_strict = false;
     // --precise (or ONEBIT_PRECISE=1): every request re-prefills its whole conversation, so a follow-up turn
     // takes the same path a cold run of that conversation takes and comes out bitwise identical to it
     bool precise = false;
@@ -726,6 +733,48 @@ std::string model_id(const Options& o) {
     if (!p.has_filename()) p = p.parent_path();
     // Only a .gguf loses its extension: "Qwen3-0.6B-4bit" is a name, not a stem.
     return p.extension() == ".gguf" || p.extension() == ".1bp" ? p.stem().string() : p.filename().string();
+}
+
+// A GGUF's tokenizer.chat_template is a Jinja2 program that runs on every request, so it can rewrite
+// the system context with no weight change at all (app/template_pin.h). Every load therefore names its
+// sha256 in one line: a model re-pulled with a different template has to be visible in the log. When the
+// model has a pin (config/template-pins.json, docs/serve.md "Chat template"), the sha is compared with
+// the pinned one: a mismatch warns, and --template-pin-strict refuses the load.
+//
+// Silent for a model with no template and no pin: nothing runs, nothing to compare. That also keeps the
+// header-only fixtures of the route tests on their exact line counts (tests/mem_admit_route.sh).
+void announce_template(const Options& o) {
+    namespace fs = std::filesystem;
+    // shortcut: a Q4NX model directory keeps its template in tokenizer_config.json, not a GGUF header;
+    // the checked pull path for those is Laya-first (docs/laya-first.md), not this line.
+    if (fs::path(o.model).extension() != ".gguf") return;
+    TemplatePins pins;
+    if (!o.no_template_pin) {
+        std::string text = kDefaultTemplatePinsJson;
+        if (!o.template_pin.empty()) {
+            std::ifstream in(o.template_pin, std::ios::binary);
+            if (!in) throw std::runtime_error("--template-pin: cannot read " + o.template_pin);
+            text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        std::string err;
+        if (!pins.parse(text, err))
+            throw std::runtime_error((o.template_pin.empty() ? std::string("built-in template pins") : o.template_pin) +
+                                     ": " + err);
+    }
+    const std::string id = model_id(o);
+    const TemplateVerdict v = template_verdict(o.model, {id, fs::path(o.model).filename().string()}, pins);
+    if (v.sha256.empty() && v.key.empty()) return;
+    std::fprintf(stderr, "1bit serve: template sha256=%s (%s)\n", v.sha256.empty() ? "none" : v.sha256.c_str(),
+                 id.c_str());
+    if (!v.mismatch()) return;
+    const std::string msg = "template pin: " + id + " (" + v.key + ") expects " + v.pinned + ", the GGUF carries " +
+                            (v.sha256.empty() ? std::string("none") : v.sha256) +
+                            " in tokenizer.chat_template (docs/serve.md \"Chat template\")";
+    if (!o.template_pin_strict) {
+        std::fprintf(stderr, "1bit serve: warning: %s\n", msg.c_str());
+        return;
+    }
+    throw std::runtime_error(msg + ": refused, --template-pin-strict");
 }
 
 // Forwards an OpenAI POST to the child: the model id becomes the child's (a
@@ -2720,6 +2769,11 @@ void usage(FILE* out) {
                  "                  each conversation and the route policy picks its device (docs/laya.md)\n"
                  "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
                  "                  (default: config/recipes.json, built in; docs/recipes.md)\n"
+                 "                  [--template-pin FILE | --no-template-pin] [--template-pin-strict]   a GGUF's\n"
+                 "                  tokenizer.chat_template is a program that runs on every request: the load logs\n"
+                 "                  its sha256, and a pin (default: config/template-pins.json, built in) is compared\n"
+                 "                  with it -- a mismatch warns, --template-pin-strict (ONEBIT_TEMPLATE_PIN_STRICT=1)\n"
+                 "                  refuses the load (docs/serve.md, \"Chat template\")\n"
                  "                  [--pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url URL]]   Project Manager: the model answers or\n"
                  "                  delegates each chat to an expert model Lemonade runs (default experts:\n"
                  "                  config/pm-experts.json, built in; URL default http://127.0.0.1:8000; docs/pm.md)\n"
@@ -2757,6 +2811,8 @@ int run_serve(int argc, char** argv) {
     // ONEBIT_PRECISE=1 is the same as --precise (every request re-prefills its conversation in full)
     if (const char* e = std::getenv("ONEBIT_PRECISE"); e && *e && std::string(e) != "0") o.precise = true;
     if (const char* e = std::getenv("ONEBIT_WATCHDOG_SECS"); e && *e) o.watchdog.secs = std::atof(e);
+    // ONEBIT_TEMPLATE_PIN_STRICT=1 is the same as --template-pin-strict
+    if (const char* e = std::getenv("ONEBIT_TEMPLATE_PIN_STRICT"); e && *e && std::string(e) != "0") o.template_pin_strict = true;
     // ONEBIT_STRICT_DEVICE=0 / 1 (app/hrx_strict.h); a flag on the command line wins
     o.strict = strict_from_env(std::getenv("ONEBIT_STRICT_DEVICE"));
     bool strict_flag = false, no_strict = false;
@@ -2822,6 +2878,9 @@ int run_serve(int argc, char** argv) {
         else if (a == "--route-policy") o.route_policy = next();
         else if (a == "--recipes") o.recipes = next();
         else if (a == "--no-recipes") o.no_recipes = true;
+        else if (a == "--template-pin") o.template_pin = next();
+        else if (a == "--no-template-pin") o.no_template_pin = true;
+        else if (a == "--template-pin-strict") o.template_pin_strict = true;
         else if (a == "--pm") o.pm = true;
         else if (a == "--pm-experts") o.pm_experts = next();
         else if (a == "--pm-router") o.pm_router = next();
@@ -2853,6 +2912,9 @@ int run_serve(int argc, char** argv) {
     if (o.strict == StrictDevice::On && (o.device == "cpu" || o.device == "npu"))
         throw std::runtime_error("--strict-device needs --device hrx or auto: it refuses a graph that is not all on HRX");
     refuse_removed_device(o.device);
+    // A load names its GGUF's chat-template sha256 (and can refuse it): before every route below,
+    // including --print-backend, which names what would load (docs/serve.md "Chat template").
+    announce_template(o);
     // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend
     if (o.cwsr_placement == CwsrPlacement::On) (void) hrx_cwsr_env(o);
     // engine#715: both halves are for an HRX route only. --device cpu/npu/auto-with-no-HRX must not gain a line here,

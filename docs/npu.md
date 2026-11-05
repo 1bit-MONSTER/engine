@@ -1005,7 +1005,10 @@ supported by this route's schema-to-GBNF converter", "`gbnf: unterminated litera
 "`stream`: must be true or false", "`tools`: must be an array"),
 never a silently ignored key and never a 500: a wrong *type* is a client error like any other, including on the
 fields the route reads before it starts decoding (engine#1106). `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
-an end-of-sequence token, a stop sequence or a grammar that allows nothing more.
+an end-of-sequence token, a stop sequence, a grammar that allows nothing more, or a constrained answer the model
+ended itself once its grammar had reached an accepting state — the route puts the container's end tokens into the
+mask exactly there, so a complete JSON object reports `stop` instead of padding with whitespace to `max_tokens`
+(engine#1182).
 
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
 `third_party/llama.cpp/src/llama-sampler.cpp` (top_k, then top_p, then temperature, then the

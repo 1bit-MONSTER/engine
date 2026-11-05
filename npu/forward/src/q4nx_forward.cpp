@@ -188,6 +188,33 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
     return q4nx_dequant_tensor((const uint8_t*)data, nbytes, rows, cols, out);
 }
 
+// rope_type "llama3" (Llama-3.1/3.2/3.3) from config.json's rope_scaling: the frequency band that
+// transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
+// every other architecture builds exactly the table it built before.  Keys are searched with their
+// quotes, which is what keeps "factor" from matching inside "high_freq_factor".
+static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
+    Q4nxRopeLlama3 s{};
+    std::ifstream f(cfg_path);
+    if (!f) return s;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (!strstr(t.c_str(), "llama3")) return s;
+    auto num = [&t](const char* key, double def) -> double {
+        const char* p = strstr(t.c_str(), key);
+        if (!p) return def;
+        const char* c = strchr(p + strlen(key), ':');
+        if (!c) return def;
+        char* end = nullptr;
+        const double v = strtod(c + 1, &end);
+        return end == c + 1 ? def : v;
+    };
+    s.factor = num("\"factor\"", 0.0);
+    s.high_freq_factor = num("\"high_freq_factor\"", 0.0);
+    s.low_freq_factor = num("\"low_freq_factor\"", 0.0);
+    s.original_max_position = num("\"original_max_position_embeddings\"", 0.0);
+    s.on = s.factor > 0.0 && s.original_max_position > 0.0 && s.high_freq_factor > s.low_freq_factor;
+    return s;
+}
+
 // LongRoPE short_factor from config.json's rope_scaling (MiniCPM4): the
 // per-half-dim frequency multipliers.  Empty when the config declares none.
 // Ported from the engine route's npu/forward (commit 599ac77) so both copies of
@@ -516,6 +543,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         if (hd > 0) cfg.head_dim = hd;
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
+    rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
     embed_scale_ = read_config_float(cfg_path, "\"embedding_scale\"", 1.0f);
     residual_scale_ = read_config_float(cfg_path, "\"residual_scale\"", 1.0f);
     logit_scale_ = read_config_float(cfg_path, "\"logit_scale\"", 1.0f);
@@ -4368,6 +4396,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
                     if (mul && mul[0] == '1') inv *= (double)rope_scale_[i];
                     else                       inv /= (double)rope_scale_[i];
                 }
+                // llama3 (Llama-3.1/3.2/3.3): the wavelength-band rule, on the FREQUENCY, so it costs
+                // nothing per token.  No-op unless the config declares rope_type "llama3".
+                inv = q4nx_rope_llama3_inv_freq(inv, &rope_llama3_);
             }
             const double ang = (double)pos * inv;
             cos_[i] = (float)std::cos(ang);

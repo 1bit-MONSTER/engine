@@ -43,6 +43,7 @@
 #include "npu_prefix_cache.h"
 #include "npu_prompt_ids.h"
 #include "npu_sampling.h"
+#include "npu_stop_tokens.h"
 #include "npu_systemone.h"
 #include "tokenizer.h"
 #include "../npu/decision.h"  // the d3 readout head (npu/decision.h, issue #653)
@@ -79,7 +80,7 @@ struct ForwardEngine {
     int  bos_id  = -1;     // config.json bos_token_id (the chat template may open with it)
     bool add_bos = false;  // config.json add_bos_token: the rendered chat prompt needs BOS
     std::unique_ptr<Q4nxNpuForward> fwd;
-    int eos = -1;
+    std::vector<int> eos;   // config.json eos_token_id: one id or a list (app/npu_stop_tokens.h)
     int endoftext = -1;
     int max_context = 0;   // config.json max_position_embeddings: prompt plus answer
     // The chat route renders ChatML for every container (#832), so whether this container's
@@ -383,7 +384,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             // not masked by the grammar on purpose: a constrained answer is still allowed to
             // stop early (the client validates it), which beats a runaway inside the mask.
             if (next < 0) { stopped_at_eos = true; break; }
-            if (next == e.eos || (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; break; }
+            if (std::find(e.eos.begin(), e.eos.end(), next) != e.eos.end() ||
+                (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; break; }
             if (gram) gram->feed(grammar_state, e.tok_text[next]);
             const std::string piece = e.tok->decode(next);
             pending += piece;
@@ -745,7 +747,7 @@ int run_forward_serve(int argc, char** argv) {
     e.tok = std::make_unique<npu::Tokenizer>(tok_json);
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
-    e.eos = json_int(cfg, "eos_token_id", -1);
+    e.eos = npu::eos_token_ids_from_config(cfg);
     e.endoftext = e.tok->token_id("<|endoftext|>");
     // q4nx_config_int finds the key at any depth (a text_config's too).
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
@@ -759,7 +761,8 @@ int run_forward_serve(int argc, char** argv) {
     if (!npu::chatml_supported(*e.tok)) {
         e.chatml_ok = false;
         std::string specials;
-        const std::pair<const char*, int> named[] = {{"bos", e.bos_id}, {"eos", e.eos}};
+        std::vector<std::pair<const char*, int>> named = {{"bos", e.bos_id}};
+        for (int id : e.eos) named.emplace_back("eos", id);
         for (const auto& [label, id] : named) {
             const std::string text = id >= 0 ? e.tok->decode(id) : std::string();
             if (text.empty()) continue;

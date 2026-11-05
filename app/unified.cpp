@@ -36,6 +36,7 @@
 
 #include <httplib.h>
 #include "http_guard.h"
+#include "npu_load_retry.h"   // engine #1010: an evict->load race is transient, a cold NPU context is not
 #include "serve_watchdog.h"  // npu_run_failed: a failed runlist means this process's NPU context is dead
 #include <nlohmann/json.hpp>
 
@@ -488,7 +489,10 @@ int run_unified(int argc, char** argv) {
         const npu::PrivateRoute* rp = npu::route_for(model_dir, opts, &why);
         if (!rp) throw std::runtime_error(model_dir + ": the private route no longer serves it" + (why.empty() ? "" : ": " + why));
         const npu::PrivateRoute& route = *rp;
-        e.priv = route.open(*e.model, *e.tok, model_dir, opts);
+        // Engine #1010: a load that starts right after an evict can hit the previous backend's hardware context still
+        // being torn down. Retry briefly (and log each reason) instead of exiting 1 inside 100 ms with nothing to say.
+        open_with_retry(LoadRetryPolicy{}, "opening the private route's NPU context",
+                        [&] { e.priv = route.open(*e.model, *e.tok, model_dir, opts); });
         e.max_context = e.priv->max_context();
         e.default_penalty = e.priv->default_repetition_penalty();
         e.open_think = e.priv->opens_think();
@@ -498,7 +502,8 @@ int run_unified(int argc, char** argv) {
         const std::string type = e.model->dims().model_type;
         if (type != "qwen3" && type != "qwen2")
             throw std::runtime_error("model_type '" + type + "': the fast lane serves the Qwen2/Qwen3 layer kernel only");
-        e.lane = std::make_unique<npu::Lane>(*e.model, npu_kernel_dir(model_dir));
+        open_with_retry(LoadRetryPolicy{}, "opening the layer lane's NPU context",
+                        [&] { e.lane = std::make_unique<npu::Lane>(*e.model, npu_kernel_dir(model_dir)); });
     }
     ready = true;
     std::fprintf(stderr, "1bit unified: %s ready in %.0f ms on %s:%d\n", e.id.c_str(),

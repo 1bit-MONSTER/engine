@@ -134,9 +134,15 @@ bits. Qwen3-0.6B Q4_K_M, 32 tokens, greedy, 4 rounds (3 where a width only neede
 | 8 | 8 | 11/24 | 8 | **0/24** | 16 (all eight copies distinct) |
 
 Worst \|Δlogp\| seen inside those mixtures: `cpu` 9.81e-01 at width 4 and 9.81e-01 at width 8; `hrx`
-7.43e-02 at width 4 and 2.05e-01 at width 8. "States" counts distinct fingerprints over all copies of
-all rounds, so it is a lower bound (two scheduling states could coincide), and it widens with the width
-rather than settling.
+7.43e-02 at width 4 and 2.05e-01 at width 8.
+
+A **state** here is one complete 32-token answer: two copies are in the same state only if every token id
+and every compared float32 log-probability bit of all 32 tokens matches. A row's "states" column counts the
+distinct states over all copies of all rounds, so it is a lower bound (two different schedules can coincide)
+and it widens with the width rather than settling. Read a row like this: at width 8 on `cpu`, 32 copies
+produced 8 distinct answers and only 11 of the 24 same-index pairs between consecutive rounds matched.
+Each row is **one run**: the exact counts move between runs because *which* sequences share a decode step
+moves (a repeat of the width-4 `cpu` row gave 3/12 and 7 states instead of 6/12 and 4, same verdict).
 
 **The state is the per-step batch width, not the serve configuration.** A single request against a
 `--parallel 2` serve and against a `--parallel 8` serve produce the *same* fingerprint bit for bit, 3/3

@@ -66,15 +66,24 @@ def f32bits(x):
 
 
 def fingerprint(copy):
-    """One hash per copy over (token id, chosen logprob bits, top-5 bits). None ids are hashed as None,
-    which keeps the NPU-style text-only routes comparable instead of making them look identical."""
+    """One hash per copy over (token id, chosen logprob bits, top-5 bits).
+
+    Every field is tagged before it is hashed, so a missing value can never collide with a real one:
+    a route that omits token ids (the NPU forward path) or log-probabilities stays distinguishable
+    from a route whose id is 0 or whose log-probability is +0.0, instead of both hashing to the same 0.
+    """
+    def tag(kind, payload=b""):
+        h.update(bytes([kind]) + payload)
+
     h = hashlib.sha256()
     for tid, lp, top in copy:
-        h.update(repr(tid).encode())
-        h.update(struct.pack("<I", f32bits(lp) or 0))
+        tag(1, repr(tid).encode()) if tid is not None else tag(0)
+        bits = f32bits(lp)
+        tag(2, struct.pack("<I", bits)) if bits is not None else tag(3)
         for tid2, lp2 in top:
-            h.update(repr(tid2).encode())
-            h.update(struct.pack("<I", f32bits(lp2) or 0))
+            tag(1, repr(tid2).encode()) if tid2 is not None else tag(0)
+            bits2 = f32bits(lp2)
+            tag(2, struct.pack("<I", bits2)) if bits2 is not None else tag(3)
     return h.hexdigest()[:16]
 
 
@@ -95,24 +104,31 @@ def compare(a, b):
     return (ids_ok, first_bad, worst)
 
 
-def round_of(url, model, prompt, max_tokens, top, width):
-    """Issue `width` byte-identical requests through a barrier so they land in one decode batch."""
+def round_of(url, model, prompt, max_tokens, top, width, join_timeout=900):
+    """Issue `width` byte-identical requests through a barrier so they land in one decode batch.
+
+    The barrier is passed *before* the request is made, so a copy that fails cannot strand the others
+    waiting on it; the joins are bounded anyway and a copy that never returns is recorded as an error
+    rather than hanging the round. `round_join_check` in the selftest proves both properties.
+    """
     out = [None] * width
     err = [None] * width
     barrier = threading.Barrier(width)
 
     def one(i):
         try:
-            barrier.wait()
+            barrier.wait(timeout=join_timeout)
             out[i] = ask(url, model, prompt, max_tokens, top)
         except Exception as e:  # noqa: BLE001 - a failed copy is a result, not a crash
             err[i] = repr(e)
 
-    ts = [threading.Thread(target=one, args=(i,)) for i in range(width)]
+    ts = [threading.Thread(target=one, args=(i,), daemon=True) for i in range(width)]
     for t in ts:
         t.start()
-    for t in ts:
-        t.join()
+    for i, t in enumerate(ts):
+        t.join(join_timeout)
+        if t.is_alive() and err[i] is None:
+            err[i] = f"copy {i} did not finish within {join_timeout}s"
     return out, err
 
 
@@ -126,6 +142,28 @@ def selftest():
     assert ids is False and worst == 0.0, "id divergence without a delta"
     assert compare(base, [(5, -0.5000001, []), (7, -0.25, [])])[1] == 0, "first divergence index"
     assert f32bits(-0.5) == struct.unpack("<I", struct.pack("<f", -0.5))[0]
+    # a missing field must not collide with a real one (the reviewer's point on the old `or 0`)
+    assert fingerprint([(None, None, [])]) != fingerprint([(0, 0.0, [])]), "None vs 0/+0.0 must differ"
+    assert fingerprint([(5, None, [])]) != fingerprint([(5, 0.0, [])]), "missing logprob vs +0.0"
+    # a failing copy is a result, not a hang, and it must not strand its partners
+    global ask
+    real_ask = ask
+
+    def flaky(url, model, prompt, max_tokens, top):
+        if getattr(flaky, "n", 0) == 1:
+            flaky.n += 1
+            raise RuntimeError("simulated backend error")
+        flaky.n = getattr(flaky, "n", 0) + 1
+        return base
+
+    ask = flaky
+    try:
+        out, err = round_of("http://x", "m", "p", 2, 5, 3, join_timeout=30)
+    finally:
+        ask = real_ask
+    assert sum(e is None for e in err) == 2, f"two copies ok, one failed: {err}"
+    assert sum(c is not None for c in out) == 2, "good copies recorded, failed copy is None"
+    assert any("simulated backend error" in (e or "") for e in err), "the failure is reported, not swallowed"
     print("selftest: ok")
 
 

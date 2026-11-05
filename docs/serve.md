@@ -768,6 +768,58 @@ itself wins over a recipe. `--recipes FILE` replaces the built-in set and `--no-
 recipes off ([recipes.md](recipes.md)). To measure a setting before making it a recipe, use
 [`tools/bench.py`](bench.md).
 
+## Chat template (`--template-pin`, `--no-template-pin`, `--template-pin-strict`)
+
+A GGUF's `tokenizer.chat_template` is a Jinja2 program that the llama.cpp-family servers run on
+**every** request, and on our route that means the `llama-server` serve starts (the native `1bit`
+forward never reads a template at all). A template that is not the source model's can therefore
+rewrite the system context, add an instruction or point an agent at a URL with no weight change —
+which is why a template is part of the model as far as this engine is concerned, and why the load
+says what it is running.
+
+Every load of a `.gguf` prints one line, the sha256 of the exact template bytes:
+
+```
+1bit serve: template sha256=bc20c7bec8…
+```
+
+A model with no template prints `template sha256=none` only when it has a pin (below); otherwise it
+says nothing, because nothing runs (this keeps the header-only route fixtures on their line counts).
+A Q4NX model directory keeps its template in a `tokenizer_config.json` and is not covered here — the
+checked pull path for those is [Laya-first](laya-first.md).
+
+`config/template-pins.json` is compiled in as the expected template per model:
+
+```json
+{"pins": {"zaya1-8b-q4_k_m.gguf": {"sha256": "b55ecfbbbcbb238a…", "source": "Zyphra/ZAYA1-8B"}}}
+```
+
+A pin is matched against the model id serve serves (`--alias`, i.e. Lemonade's catalog entry) first,
+then the file's own name, case-insensitively; `"none"` pins a model that must carry no template. A
+model whose pin does not match prints a second line and **still serves**:
+
+```
+1bit serve: warning: template pin: zaya1-8b-q4_k_m (zaya1-8b-q4_k_m.gguf) expects b55ecfbbbcbb238a…, the GGUF carries 4f2a… in tokenizer.chat_template
+```
+
+`--template-pin-strict` (or `ONEBIT_TEMPLATE_PIN_STRICT=1`) makes that a refusal, exit 1 — use it
+where a model must be exactly the one that was validated. `--template-pin FILE` replaces the built-in
+table (a wrong sha256, or a file that is not a pin file, is refused by name) and `--no-template-pin`
+names the sha without comparing anything.
+
+A pin is keyed on the model id or the file name (a container: its directory name), so it catches
+exactly one thing — **the same name, a different template** — which is the re-pull and supply-chain
+case. Two consequences a reader should not have to infer: a model with **no pin is logged, not
+checked** (the line is all it gets), and a model that arrives under a **new name** bypasses the table
+by definition; pin what you can name. For a model directory the `.jinja` fallback is usually the live
+branch: the OGA packs we import carry no `chat_template` key in `tokenizer_config.json` at all, and the
+template sits only in `chat_template.jinja` beside it.
+
+The line and the pin are the engine half of a publishing rule: every model card lists its template's
+sha256 and where it came from, `SHA256SUMS` covers it, and the pull path checks it before a model is
+served ([template-publishing.md](template-publishing.md)). `tests/template_pin.sh` covers all of the
+above without a GPU.
+
 ## MoE models larger than memory: not in this build
 
 `--moe-slots` is kept (the option, `--moe-subst`, `--moe-prefetch` and

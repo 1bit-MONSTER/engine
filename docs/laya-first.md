@@ -154,6 +154,52 @@ classes have a first-party repo with the file named here). The two classes that 
 rather than a second device: `Qwen3.6-35B-A3B-NPU` for a heavy class on the NPU, and the FLM rows already in
 `server_models.json` for a small NPU chat model (see "Owner decisions").
 
+### A row is not served with an unexpected template
+
+A routed row is a **pull from the Hub and then a load**, so it inherits the template-backdoor problem
+twice over: the file arrives from a third party, and the template inside it is a program the
+llama.cpp server runs on every request (the engine's own forward never reads one). A pinned route
+table is a good place to close that, because it is the only place in the pull path that knows which
+model was *meant* to arrive.
+
+So a GGUF row gains one required field, and a Q4NX row the same field read from its container:
+
+```json
+"prose": {"model": "ZAYA1-8B-1bit",
+          "hf_repo": "1bit-MONSTER/ZAYA1-8B-GGUF",
+          "file": "zaya1-8b-Q4_K_M.gguf", "device": "hrx", "ctx": 16384,
+          "template_sha256": "b55ecfbbbcbb238a011465bfa139366db18790103f9205060cf2855a3f51b30f"}
+```
+
+| field | meaning |
+|---|---|
+| `template_sha256` | the sha256 of the exact `tokenizer.chat_template` bytes the row expects (a GGUF's metadata key, or a Q4NX container's `tokenizer_config.json` string); `"none"` for a row that must carry no template. Omitting it is a table error, not a default — a row with no expectation is a row nothing checks ([template-publishing.md](template-publishing.md)) |
+
+Two checks, in order, and both are refusals of *that row*, never of the request:
+
+1. **At pull time**, before the row is registered with Lemonade and before it is named in a decision:
+   hash the template of the file that landed (and of every `extra_files` entry that is served as a
+   model) and compare it with the row. On a mismatch the row is not registered, the class falls back
+   to `default_model`, and the reason is logged and carried in `x-lemonade-route` as
+   `why: template_mismatch` (the same shape as `why: gpu_busy`). Nothing is deleted and nothing is
+   re-uploaded: a mismatch is information for the operator, and the file may be perfectly good under a
+   different row.
+2. **At load time**, the engine names the template's sha256 in one line and compares it with its own
+   pin (`1bit serve --template-pin-strict` in the appliance's shipped row), so a file that changed
+   *after* the pull is refused at the load rather than served ([serve.md](serve.md#chat-template---template-pin---no-template-pin---template-pin-strict)).
+
+Why both: the pull-time check is the only one that knows what was expected (it is the only place with
+the table), and the load-time check is the only one that covers a model loaded by name, outside the
+router, months later. Neither is a trust anchor for a model nobody has pinned — for those the line is
+the deliverable, and it is what makes the difference visible in a log.
+
+`~/.local/share/1bit/laya-first.json` ships with the digests measured on 2026-11-05 for the rows above
+(`zaya1-8b-Q4_K_M.gguf`, `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` and `Qwen3.8-27B-UD-Q4_K_XL.gguf`
+are the same files the engine's `config/template-pins.json` already pins; a Q4NX row is checked from
+its `tokenizer_config.json` because it has no GGUF). Adding a row means adding its digest — the table
+is not allowed to grow a row that skips that step, and the table's validator (§8 step 3) fails one that
+does.
+
 ### Device: HRX by default, and the NPU only when the GPU is busy or hot
 
 Measured on Strix Halo on 2026-11-04 (`llama-bench`, same box, same file, `-r 2`): a dense 27B-class model —
@@ -274,7 +320,10 @@ no re-decision, and an explicit model name must produce no routing header at all
 which is the same shape as the existing `chat-hrx`/`chat-npu` rows. When `on_busy` ships (§4), the row gains a fifth
 case — a ticket held by another label makes the document prompt land on the NPU row, the header says `why: gpu_busy`,
 and the same prompt with the queue empty lands on `hrx` — because a fallback that only ever runs on one side of the
-condition is the classic untested branch.
+condition is the classic untested branch. It gains a sixth: a row whose `template_sha256` does not match
+the file on disk is not registered, the class lands on `default_model`, and the header says
+`why: template_mismatch` — a template gate that only ever passes is the same untested branch one layer
+down.
 
 ## 8. Order of work
 
@@ -282,7 +331,8 @@ condition is the classic untested branch.
    decision, `long_doc`'s size gate, a dead daemon, and determinism over 5 runs), plus `--json` on `1bit route`.
 2. **Fork**: `type: "laya"` classifier, `LayaClient`, parser/registry acceptance, policy-schema entry, docs (§3-§6
    contract), tests.
-3. **Engine**: `laya-first.json` + desugaring to a `collection.router` policy + packaging.
+3. **Engine**: `laya-first.json` + desugaring to a `collection.router` policy + packaging, with
+   `template_sha256` required per row and the pull-time check of the same section.
 4. **Fork**: `auto` resolving to the shipped router collection (this changes the line in the fork's `docs/dev/router-policy.md`
    that says there is no `auto` model).
 5. Release check row `laya-auto` (§7).

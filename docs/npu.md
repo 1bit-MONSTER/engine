@@ -351,6 +351,11 @@ nothing to separate it; `[cp]` is the line that says how much is left to remove 
 the layer's wall. The MLP row copies this line first counted (`mlp_in`, `mlp_out` — 12.75 MiB of a 15.38 MiB
 prefill row) are gone: the batched pass now runs `mlp()` on the ACT row and into the HH row in place.
 
+The counters are per **process**, single writer, like `[ph]`: a serve enters `step()`/`step_batch()` under
+its engine mutex (`app/forward_serve.cpp:258`, `:698`), so one pass is in flight, and `--npu-streams N` is
+N processes sharing the device by flock (`app/npu_device_lock.h`), each counting its own. A caller that
+parallelised the layer loop would need per-pass counters instead.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model

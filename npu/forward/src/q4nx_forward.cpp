@@ -2877,6 +2877,14 @@ inline double ph_ms(std::chrono::steady_clock::time_point t) {
 // sites are host-side row gathers whose cost is invisible inside gemm/wait/readback.  Additive
 // measurement only, exactly like the phases above: nothing in the compute path reads it, and with the
 // variable unset nothing is counted and nothing is printed.
+//
+// Single writer, like `g_ph` beside it, and that is a property of the callers rather than of these
+// globals: every serve-side entry into step()/step_batch() holds the engine's mutex
+// (app/forward_serve.cpp:258 and :698), so one pass is in flight per process, and `--npu-streams N`
+// is N processes sharing the device by flock (app/npu_device_lock.h), each with its own copy of this
+// struct -- not N threads.  A caller that ever parallelises the layer loop would make cp_count() and
+// the CpScope timings a data race and cp_reset() clear another pass's counts; the counters would
+// then have to become per-pass objects, as would `g_ph`.
 enum CopySite { CP_QKV, CP_GATE, CP_CTX, CP_N };
 const char* const kCopySiteName[CP_N] = {"qkv_split", "attn_gate", "ctx_row"};
 struct CopySites {

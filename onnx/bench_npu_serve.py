@@ -162,7 +162,9 @@ def main() -> int:
         default="chat",
         help="chat renders a ChatML prompt; completions sends the prompt as text and renders no "
         "template, which is the only way a container with no ChatML tokens can be measured (default "
-        "chat, so every row taken before this switch stays reproducible)",
+        "chat, so every row taken before this switch stays reproducible). Note: text is tokenized by "
+        "the server, so a completions row is not a #938 parity row -- that needs the prompt as token "
+        "ids, which the gate (c) scripts send and this harness cannot without a tokenizer",
     )
     args = ap.parse_args()
 

@@ -81,5 +81,55 @@ check "the fallback is named once" 'grep -q "the backend prefills this request i
 check "no share/adopt line was reported" '! grep -q "hybrid: .* share [0-9.]* ms, first byte" "$scratch/b.log"'
 stop
 
+# a provider that finishes its write into the region *after* its deadline: the deadline starts a teardown, it is
+# not a verdict on the work. The provider takes the SIGTERM, writes the region it was handed two seconds later and
+# exits 0 -- the handoff must still be adopted, or the request pays for the provider's prefill and then for the
+# decoder to re-process the whole prompt (engine#941).
+cat > "$scratch/late_provider.py" <<'PY'
+#!/usr/bin/env python3
+import json, os, signal, sys, time
+
+args = sys.argv[1:]
+opt = {args[i]: args[i + 1] for i in range(0, len(args) - 1, 2)}
+ids = [int(line) for line in open(opt["--tokens"]) if line.strip()]
+header = json.load(open(opt["--layout"]))
+fds = [int(x) for x in opt["--fds"].split(",") if x]
+
+
+def finish():
+    regions = header.get("regions") or []
+    readable = []
+    for fd, region in zip(fds, regions):
+        data = os.pread(fd, min(16, int(region.get("size", 1))), int(region.get("offset", 0)))
+        if not data:
+            sys.exit(1)
+        readable.append(len(data))
+    with open(os.environ["FAKE_KVSHARE_MARKER"], "w") as f:
+        json.dump({"fds": len(fds), "readable": readable, "n_ctx": (header.get("params") or {}).get("n_ctx")}, f)
+    print(json.dumps({"n_tokens": len(ids), "prefill_ms": 2000.0, "fds": len(fds)}), flush=True)
+    sys.exit(0)
+
+
+def term(*_a):
+    time.sleep(2.0)                     # the write into the decoder's region, completed inside the grace window
+    finish()
+
+
+signal.signal(signal.SIGTERM, term)
+time.sleep(30)
+finish()
+PY
+chmod +x "$scratch/late_provider.py"
+rm -f "$scratch/provider.json"
+check "serve starts with a provider that finishes after its deadline" \
+    'start "$scratch/c.log" ONEBIT_KV_SHARE=1 ONEBIT_HYBRID_PREFILL="$scratch/late_provider.py" ONEBIT_HYBRID_PREFILL_TIMEOUT_S=1'
+reply=$(ask)
+check "a late provider's cells are adopted, not discarded" '[[ "$reply" == *"\"fake_id_slot\":0"* ]]'
+check "no fallback for work that landed" '! grep -q "the backend prefills this request itself" "$scratch/c.log"'
+check "the share+adopt line was reported" 'grep -q "hybrid: .* share [0-9.]* ms, first byte" "$scratch/c.log"'
+check "the late provider could still read its region fd" \
+    'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"fds\"]==1 and d[\"readable\"]==[16] else 1)" "$scratch/provider.json" 2>/dev/null'
+stop
+
 if [ $fail -ne 0 ]; then echo "--- log (tail)"; tail -30 "$scratch/a.log"; echo FAIL; exit 1; fi
 echo PASS

@@ -94,9 +94,11 @@ release_section() {
     line release "${tag:-n/a no $DATA/RELEASE-TAG}"
     if [ -f "$DATA/SHA256SUMS" ]; then
         # sha256sum -c prints one line per entry; count them instead of trusting the exit status alone
+        # Count the per-entry markers, not the lines: `sha256sum -c` also prints a WARNING summary line, so counting
+        # "not OK" reported 2 bad for one bad file (measured here with one good and one deliberately wrong entry).
         sum=$(cd "$DATA" && sha256sum -c SHA256SUMS 2>&1)
         ok=$(printf '%s\n' "$sum" | grep -c ': OK$')
-        bad=$(printf '%s\n' "$sum" | grep -vc ': OK$')
+        bad=$(printf '%s\n' "$sum" | grep -c ': FAILED$')
         rc=0
         (cd "$DATA" && sha256sum -c SHA256SUMS > /dev/null 2>&1) || rc=$?
         line sha256sums "ok=$ok bad=$bad rc=$rc"

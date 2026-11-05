@@ -84,6 +84,17 @@ void q4nx_dequant_tile_q8(const uint8_t* chunk, float* out, int ld);
 int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                                 int cols, int chunk_bytes, float* out);
 
+/* Dequantize a [rows, cols] tensor out of a container whose tile grid is LARGER: (rows_packed,
+ * cols_packed).  A converter may pad a weight to a wider grid than the model's dimensions
+ * (engine#1097: the FastFlowLM repack pads intermediate_size to 512 columns, 8960 -> 9216, so the
+ * weight holds 1728 tiles where the model's dims imply 1680).  The container's grid is the read
+ * geometry; only the model's [rows, cols] are written, so the caller's buffers, its row stride and
+ * the kernel's B layout are unchanged.  rows_packed/cols_packed must be on the 32x256 tile grid and
+ * must dominate rows/cols; equal values make this exactly q4nx_dequant_tensor_chunked().
+ * Returns 0, or -1 on a geometry/size mismatch. */
+int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int cols,
+                               int rows_packed, int cols_packed, int chunk_bytes, float* out);
+
 /* Dequantize one 5120-byte tile into out[32][ld] (row-major, strided by ld). */
 void q4nx_dequant_tile(const uint8_t* tile, float* out, int ld);
 

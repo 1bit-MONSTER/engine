@@ -123,6 +123,43 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
     return 0;
 }
 
+int q4nx_dequant_tensor_packed(const uint8_t* data, size_t nbytes, int rows, int cols,
+                               int rows_packed, int cols_packed, int chunk_bytes, float* out) {
+    if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
+    if (rows_packed < rows || cols_packed < cols) return -1;
+    if (rows_packed % Q4NX_TILE_ROWS || cols_packed % Q4NX_TILE_COLS) return -1;
+    if (chunk_bytes != Q4NX_TILE_BYTES && chunk_bytes != Q4NX_CHUNK_Q4K &&
+        chunk_bytes != Q4NX_CHUNK_Q8)
+        return -1;
+    if (rows_packed == rows && cols_packed == cols)
+        return q4nx_dequant_tensor_chunked(data, nbytes, rows, cols, chunk_bytes, out);
+    const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
+    const int ntr_p = rows_packed / Q4NX_TILE_ROWS, ntc_p = cols_packed / Q4NX_TILE_COLS;
+    if (nbytes < (size_t)ntr_p * (size_t)ntc_p * (size_t)chunk_bytes) return -1;
+    // Read geometry is the container's grid (ntc_p is the tile-row stride); write geometry is the
+    // model's, so a caller's buffer and its row stride stay exactly what they were before.
+    #pragma omp parallel for collapse(2) schedule(static) if(ntr * ntc >= 4)
+    for (int tr = 0; tr < ntr; tr++) {
+        for (int tc = 0; tc < ntc; tc++) {
+            float tmp[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
+            const uint8_t* c = data + (size_t)(tr * ntc_p + tc) * (size_t)chunk_bytes;
+            if (chunk_bytes == Q4NX_CHUNK_Q4K)
+                q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
+            else if (chunk_bytes == Q4NX_CHUNK_Q8)
+                q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+            else
+                q4nx_dequant_tile(c, tmp, Q4NX_TILE_COLS);
+            for (int r = 0; r < Q4NX_TILE_ROWS; r++)
+                memcpy(out + (size_t)(tr * Q4NX_TILE_ROWS + r) * cols +
+                           (size_t)tc * Q4NX_TILE_COLS,
+                       tmp + (size_t)r * Q4NX_TILE_COLS,
+                       Q4NX_TILE_COLS * sizeof(float));
+        }
+    }
+    return 0;
+}
+
 int q4nx_dequant_plain_bf16(const uint8_t* data, int rows, int cols,
                            float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;

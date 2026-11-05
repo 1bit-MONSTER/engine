@@ -348,6 +348,14 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
                 if (strcmp(nm, "full_attention") == 0) kind = Q4NX_LAYER_FULL;
                 else if (strstr(nm, "sliding")) kind = Q4NX_LAYER_SLIDING;
                 else if (strstr(nm, "linear")) kind = Q4NX_LAYER_LINEAR;
+                else if (!s->unknown_layer_type[0]) {
+                    /* Remember the spelling: the forward refuses this container by name rather than serving an
+                     * unimplemented layer kind as full attention (engine#1087's shape). */
+                    size_t k = strlen(nm);
+                    if (k >= sizeof(s->unknown_layer_type)) k = sizeof(s->unknown_layer_type) - 1;
+                    memcpy(s->unknown_layer_type, nm, k);
+                    s->unknown_layer_type[k] = 0;
+                }
                 if (total < Q4NX_MAX_LAYERS) s->layer_types[total] = kind;
                 total++;
                 if (kind != Q4NX_LAYER_FULL) hybrid++;

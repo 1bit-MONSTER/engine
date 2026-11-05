@@ -82,7 +82,7 @@ not tell you, both measured:
   no device (engine#713's acceptance table). A payload dir may also carry the pin **relocated** (`f5462dc3…`: the
   same 5,141,585 B with 185 bytes changed, `DT_RPATH`→`DT_RUNPATH $ORIGIN`).
 
-The Lemonade pin is the sha (`ef0f3b49`), not the string around it: `tools/version.py` derives the dev version as
+The Lemonade pin is the sha (`ef0f3b49` at c19), not the string around it: `tools/version.py` derives the dev version as
 `<week>.0~<commit count>.<sha>`, and that count is the number of commits in the **checkout it was built in** —
 `third_party/lemonade` is a `shallow = true` submodule, so a depth-1 clone reports `~1` for the same commit while a
 full clone reports `~1752` (both measured on 2026-11-02; c18 printed `~5`, i.e. built from a deeper clone). The `~N` is

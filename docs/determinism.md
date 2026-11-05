@@ -147,6 +147,22 @@ At 4B the verdict is the same on both routes and the spread is wider on `cpu` (7
 against a modal rung at 0.6B), so the effect is a property of batching, not of the model size where these
 measurements were cheap enough to take.
 
+**Generated length decides how visible it is.** Width 4 on `cpu`, 0.6B, the same prompt decoded to four
+lengths, every concurrent copy scored against the solo answer. **No copy was identical to the solo answer
+at any length** (0 of 12 at each of 16/32/128 tokens, 0 of 16 at 64):
+
+| tokens generated | \|Δlogp\| vs solo, median | same token as solo, median |
+|---:|---:|---:|
+| 16 | 5.49e-02 | **1.000** |
+| 32 | 1.07e-01 | 0.844 |
+| 64 | 2.52e-01 | 0.438 |
+| 128 | 2.60e-01 | 0.394 |
+
+At 16 tokens the batched continuations usually still read the same as the solo one while their
+log-probabilities already differ; by 64 tokens the batch has usually left the solo sequence entirely. A
+short batched cell therefore hides this and a 180-token one cannot — which is the length a scoreboard cell
+actually decodes.
+
 A **state** here is one complete 32-token answer: two copies are in the same state only if every token id
 and every compared float32 log-probability bit of all 32 tokens matches. A row's "states" column counts the
 distinct states over all copies of all rounds, so it is a lower bound (two different schedules can coincide)

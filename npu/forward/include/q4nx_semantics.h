@@ -40,8 +40,9 @@ typedef enum {
     Q4NX_ACT_GELU,       /* hidden_act: "gelu*"/"geglu"   */
 } Q4nxAct;
 
-/* Attention layer kinds, from layer_types (and the only kinds this forward can
- * execute; Q4NX_LAYER_LINEAR is detected but not implemented). */
+/* Attention layer kinds, from layer_types.  FULL and SLIDING run the attention block, LINEAR runs the
+ * GDN recurrence (lin_kd_/conv_state_); OTHER is anything else, which nothing implements - the forward
+ * refuses a container whose layer_types contains one, by name (unknown_layer_type). */
 typedef enum {
     Q4NX_LAYER_FULL = 0,
     Q4NX_LAYER_SLIDING,
@@ -105,6 +106,12 @@ typedef struct {
      * so it is refused rather than approximated. */
     int layer_types[Q4NX_MAX_LAYERS];
     int n_layer_types;
+    /* The first layer_types entry whose kind this forward does not implement ("" if none).
+     * Source: layer_types.  The parser below maps anything it does not recognise to Q4NX_LAYER_OTHER and the
+     * forward treats OTHER as full attention, so without this name a config that names, say, a conv attention
+     * would be served as a plain decoder and be wrong everywhere - the same defect shape as the rope-scaling
+     * refusal (engine#1087).  Kept as the spelling found, so the refusal can say which kind it is. */
+    char unknown_layer_type[40];
     /* Per-layer-type RoPE, used by a layer whose type matches.  rotary_dim 0
      * means "full head_dim".  Source: rope_parameters.sliding_attention. */
     float rope_theta_sliding;

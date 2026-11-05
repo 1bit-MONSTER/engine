@@ -1,0 +1,70 @@
+{
+  "version": "1",
+  "model_name": "user.Laya-First",
+  "recipe": "collection.router",
+  "components": [
+    "Qwen3-0.6B-1bit",
+    "ZAYA1-8B-1bit",
+    "Qwen3-Coder-30B-A3B-Instruct-1bit",
+    "Qwen3.8-27B-1bit"
+  ],
+  "routing": {
+    "candidates": [
+      "Qwen3-0.6B-1bit",
+      "ZAYA1-8B-1bit",
+      "Qwen3-Coder-30B-A3B-Instruct-1bit",
+      "Qwen3.8-27B-1bit"
+    ],
+    "default_model": "Qwen3-0.6B-1bit",
+    "classifiers": [
+      {
+        "id": "laya",
+        "type": "laya",
+        "labels": [
+          "short",
+          "prose",
+          "code",
+          "long_doc"
+        ]
+      }
+    ],
+    "rules": [
+      {
+        "id": "laya-short",
+        "match": {
+          "classifier": "laya",
+          "label": "short",
+          "min_score": 0.01
+        },
+        "route_to": "Qwen3-0.6B-1bit"
+      },
+      {
+        "id": "laya-prose",
+        "match": {
+          "classifier": "laya",
+          "label": "prose",
+          "min_score": 0.01
+        },
+        "route_to": "ZAYA1-8B-1bit"
+      },
+      {
+        "id": "laya-code",
+        "match": {
+          "classifier": "laya",
+          "label": "code",
+          "min_score": 0.01
+        },
+        "route_to": "Qwen3-Coder-30B-A3B-Instruct-1bit"
+      },
+      {
+        "id": "laya-long_doc",
+        "match": {
+          "classifier": "laya",
+          "label": "long_doc",
+          "min_score": 0.01
+        },
+        "route_to": "Qwen3.8-27B-1bit"
+      }
+    ]
+  }
+}

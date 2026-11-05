@@ -260,6 +260,10 @@ the CPU EP. Correctness is exact where it matters: the device arm generated **th
 its KL against float is the same number (5.6787 nats both; the A8W8 CPU EP's own arm scores 7.2085 with a
 different continuation), and its trace is `qdq runs=1764` (= 196 groups × 9 passes), `host-rows policy=0`,
 `device fallbacks=0`, `device-busy=0` — every fused group went to the array, and nothing was dressed up as one.
+**These are the figures as published then, on a tree before #1047; the same two arms re-measured on the current tree
+are 930.5 against 972.9 ms/token in the device's favour — see "Where a pass actually goes, and the sign on the current
+tree" at the end of this section, which is the number to quote, and which explains the difference rather than
+overwriting it.**
 The 5-token counter-example is the other half of that claim: same binary, same designs, 8 tokens in 2159 ms
 (3.70 tok/s), trace `host-rows policy=1764` and no device call at all, because a 5-token prompt never reaches 16
 rows.
@@ -287,12 +291,70 @@ measurement: do not subtract the two rows above to explain the arms, compare arm
 **Which means the cause of the model-level loss is not established, only its sign.** Two explanations fit every
 number on this page, and these measurements do not separate them:
 
-1. **Dispatch.** 196 calls per pass, two launches each at 33–40 rows, each paying the A upload, two syncs and a
-   wait: at ~1.3 ms of non-kernel work per call that is 250 ms of a 1074 ms pass.
+1. **Non-kernel work per call.** 196 calls per pass, two launches each at 33–40 rows, each paying the A upload, two
+   syncs, a wait, the weight writeback and the shared epilogue. Three of those are now priced on the array (below) and
+   come to **0.43 ms/call** — 84 ms of a 1074 ms pass — so this candidate is no longer a guess, but it is also not yet
+   the answer: what is left of the call inside `dev_call_ms` is the kernel plus the A writeback, the launch, the two
+   syncs, the wait and the C readback, which that knob times as one number.
 2. **The host loop is faster on real data than on the probe's.** The probe's host column (5.629 ms for q at 36
    rows) is what makes "the kernels are 1.7× ahead" true in isolation; if the graph's sparser activations let the
    `aik == 0` skip cut that by 30 %, the host arm's kernel time falls to ~850 ms/pass, the device's 712 ms
    becomes a far smaller win, and the two arms land where they are measured — the device slightly behind.
+
+**What the per-call costs actually are, measured.** `onebit_npu_gemm_q8_probe` now prices a weight cache on the
+array as a unit measurement: it times the same call twice, once with one weight (the cache hits) and once with a
+different weight every call (the cache misses), which is what a model pass does — 28 weights of one shape go through
+one kernel in a row. On the M=32 designs, 40 repeats, load 9.2, both legs exact against the host accumulators over
+32768 values:
+
+| shape | one cache slot | one packed image per weight | delta |
+|---|---|---|---|
+| q 1024×2048 | 1.660 → 1.906 ms/call | 1.693 → 1.747 ms/call | **+0.246 → +0.054** |
+| o 2048×1024 | 1.839 → 2.076 ms/call | 1.875 → 1.942 ms/call | **+0.238 → +0.067** |
+
+So the one-slot cache costs **0.24 ms/call** — the BO writeback of the whole image — and the ~0.06 ms that survives
+resident weights is the pack loop itself. Keeping every weight resident removes the 0.24 ms (**~35 ms/pass**) for
+**568 MiB** of int8 images (588 MiB with the per-context A/C BOs; 140 MiB for the two shapes that have an ELF here),
+measured on the real export's 197 projected MatMuls, and the QDQ proof is bit-identical with and without it — that
+trade was built, verified and **not** taken, because 3 % of a token is not worth 0.5 GiB of a shared box.
+
+The shared epilogue, from `ONEBIT_EP_QDQ_PROF=1` on the device arm of the same export (two runs, identical ids, trace
+`qdq rows=1764  fallbacks=0  device-busy=0`):
+
+```
+qdq_prof calls_dev=1764 calls_host=0 rows_dev=63504 dev_call_ms=9964.1 dev_epi_ms=237.2 host_ms=0.0
+```
+
+`dev_call_ms` is **5.65 ms/call** (1107 ms/pass) and `dev_epi_ms` is **0.134 ms/call** (26.4 ms/pass) — taken at load
+11–14, so those absolute figures are not quotable as throughput, but the split is, since both terms come from one run.
+With the graph's other nodes (~194 ms/pass at that load) the three terms add to the measured 1327 ms/token exactly,
+which is what makes this a split rather than a guess: **the epilogue is 2.4 % of the arm, not the gap.**
+
+So of candidate 1's non-kernel work, 0.43 ms/call is measured (writeback 0.24, epilogue 0.134, pack 0.06) and the
+rest is not. **Candidate 2, on the other hand, can be measured without the array at all** — the host loop skips
+`aik == 0`, so what matters is how many zeros the graph's own activations carry. Exposing every projected MatMul's int8
+activation as a graph output and running one 32-token prefill at `ORT_ENABLE_BASIC` (which keeps the Q/DQ nodes) gives
+the real bytes, and the same host loop timed on them against the probe's synthetic draw:
+
+| host column for a whole pass, 196 groups | ms/pass |
+|---|---|
+| synthetic operands (the published probe column) | 1098.0 |
+| the graph's real activations | **770.6 (1.42× faster)** |
+
+The real tensors are **62.1 % nonzero** against the probe's ~99 %; layer 0 alone is 93.7 %, which is why one tensor is
+not a sample of the pass and the whole pass was dumped (112 distinct tensors behind 196 MatMuls — q/k/v share one,
+gate/up share one). `down_proj` is the extreme: its input is the SwiGLU product at 55.8 % nonzero, and the loop is
+**1.76×** faster on it.
+
+That is enough to price candidate 2 against the arms' own numbers, with one ratio named: the published synthetic
+column is 1209 ms/pass at m=36 while this dump is at its 32 rows, and on the synthetic draw the two agree at 1.10×
+(1098 here), so the graph's own operands put the **host loop at ~848 ms/pass** against a device multiply of
+712 + ~47 ms of weight writeback = 759. **The array's kernel advantage is therefore ~1.12× at model level, not the
+1.7× the synthetic column implies** — which is the direction the bound in the next paragraph allowed, and it is why the
+device arm does not win: it saves ~90 ms/pass on the multiply and the two arms differ by 127 ms/token in the other
+direction. What that 127 ms is made of is candidate 1's unpriced remainder, and it needs **both** arms profiled in one
+window (`dev_call_ms/call` against `host_ms/call`) rather than another single-leg profile: the multiply is no longer
+the place to look.
 
 The bound that *is* rigorous, and it is tight enough to matter: the probe's host column sums to 1209 ms/pass
 while the whole host arm — kernel plus every other node in the graph — is 947 ms/token, so the graph's real
@@ -300,14 +362,42 @@ operands make the host loop **at least 1.28× faster** than the probe's syntheti
 kernel-level advantage is therefore at most **1.33×**, and it could be none at all, which is the whole reason the
 cause is stated as open rather than as dispatch.
 
-The next step is a profile, not a redesign: `NPU_C_SYNC_PROF=1` (engine#988) prints the C-sync counters per call,
-and `ONEBIT_EP_QDQ_PROF=1` (documented with the QDQ knobs) has `gemm_q8` sum its own wall time per leg — the
-device call (BO writes, launch, both syncs, the wait), the shared epilogue and the host loop — so two runs that
-differ only in the leg price that leg on the graph's own int8 bytes, which is the one thing the probe above
-could not do. What a *fix* would look like if
-(1) dominates is one launch covering many projections — a resident weight layout and a pass-level submission,
-rather than the per-projection ELF this leg uses — which is also why the threshold discussion above stands
-unchanged: `kDeviceMinRows` is about one call, and the model-level question is about 196 of them.
+The next step is the one comparison these numbers cannot make, not a redesign: **both arms with
+`ONEBIT_EP_QDQ_PROF=1` in one window** — the device arm's `dev_call_ms/call` against the host arm's `host_ms/call` on
+the graph's own int8 bytes, which prices candidate 2 directly. `NPU_C_SYNC_PROF=1` (engine#988) prints the C-sync
+counters per call if the syncs inside `dev_call_ms` need separating further. What a *fix* would look like if
+(1) dominates is one launch covering many projections — a resident weight layout and a pass-level submission, rather
+than the per-projection ELF this leg uses — which is also why the threshold discussion above stands unchanged:
+`kDeviceMinRows` is about one call, and the model-level question is about 196 of them. Worth knowing before anyone
+starts that work: the resident-weight half of it has now been measured and is worth 35 ms/pass for 568 MiB, i.e. the
+sign of the model-level result does **not** turn on the weight path.
+
+**Where a pass actually goes, and the sign on the current tree.** The same two EP arms, two runs each, back to back in
+one `npu-hold` ticket (load 4.9–6.9, identical ids, `fallbacks=0`, `device-busy=0`), with `ONEBIT_EP_QDQ_PROF=1` on
+both:
+
+| arm | decode | per pass, from the profile |
+|---|---|---|
+| our EP, **array** | 953.3 / **930.5** ms/token | device calls 802.5 (`dev_call_ms` 7222.2 / 9), epilogue 19.0 (`dev_epi_ms` 171.2 / 9), other 109 |
+| our EP, host kernel | 970.4 / **972.9** ms/token | host loop 879.0 (`host_ms` 7911.2 / 9), other 94 |
+
+Both arms are fully accounted for (802.5 + 19.0 + 109 = 930.5; 879.0 + 93.9 = 972.9), and "other" — attention, norms,
+softmax, embed, ORT — is 94–109 ms/pass, the part neither leg touches. So on this tree the device arm is **4.4 % ahead**,
+not 1.13× behind as the four-arm table far above reports, and both runs of each arm agree on the sign. The host
+loop's 879 ms/pass also validates the CPU-only estimate of 848 from the section above to within 4 %.
+
+What differs between those two sessions is **not** the code, as far as the repository can say: since the build those
+figures came from, exactly two commits touch this path — #1032, which adds the profiling that produced the numbers above,
+and #1047, the weight re-pack, 0.24 ms/call = 47 ms/pass (~5 % of a token) — the private NPU runtime the EP links against
+is unchanged (files dated 2026-10-31), and the five design ELFs are byte-identical (md5s). It is not load in the obvious
+direction either: this run was at load 4.9-6.9 against 1.2-1.35 then, and the device arm gets *slower* under load (its
+calls measured 5.65 ms/call at load 11-14 against 4.09 here). So ~5 % of the 13 % is code and **the rest is
+unestablished**: the plausible shape of it is CPU-side contention in the earlier session that a one-minute load average
+did not capture, since half of a device call is host work (BO writes, two syncs, the readback), and the honest reading is
+that those are two sessions under different conditions rather than two builds. The kernel is unchanged either way — the
+probe in this same window still measures q at m=36 at 3.460 ms/call device against 5.836 host, the 1.69x the rows table
+reports. What moved is the model-level per-call cost, and a quiet-box repetition is what this number needs
+before anyone quotes it as the device leg's worth.
 
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the

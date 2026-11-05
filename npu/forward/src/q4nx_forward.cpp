@@ -544,6 +544,27 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    {
+        // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
+        // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
+        // log to say so.  "" (no rope_scaling block) is every model that never declared one.
+        std::ifstream f(cfg_path);
+        std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        char declared[64];
+        q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
+        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1)) {
+            if (!std::strcmp(declared, "llama3"))
+                err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
+                       "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
+                       "scaling cannot be applied; serving it would run plain RoPE";
+            else
+                err_ = std::string("config.json declares rope scaling \"") + declared +
+                       "\", which this forward does not implement (only llama3 and longrope short_factor "
+                       "are), so it would be served plain RoPE and reply wrongly past the model's "
+                       "original window (engine#1048, #1087)";
+            return false;
+        }
+    }
     embed_scale_ = read_config_float(cfg_path, "\"embedding_scale\"", 1.0f);
     residual_scale_ = read_config_float(cfg_path, "\"residual_scale\"", 1.0f);
     logit_scale_ = read_config_float(cfg_path, "\"logit_scale\"", 1.0f);
@@ -3656,18 +3677,25 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
     }
 
-    BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
     // batch term's interior is read per phase instead of inferred from the loop's total.
+    //
+    // The counters are zeroed BEFORE BatchPhases snapshots them.  BatchPhases reports this call's cost as a
+    // delta against the values it saw at construction, so zeroing afterwards (the first version of this, #1056)
+    // made every [bl] field a difference against the *previous* pass: `core -4.3` and `gemm -355.7` on a real
+    // ticket (2026-11-05 01:31) are what that looks like.  The [bs] line never had the problem -- it reads the
+    // g_ph it zeroes itself -- so the conclusions drawn from [bs] stand; the [bl] medians between #1056 and this
+    // fix do not, and are re-taken.
     const bool phb = phprof_on();
-    const auto tp_bs = phb ? std::chrono::steady_clock::now()
-                           : std::chrono::steady_clock::time_point{};
-    auto tp_lap = tp_bs;
-    BatchPhaseScope _batch_scope(phb);
     if (phb) {
         g_ph = StepPhases{};
         for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
     }
+    BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
+    const auto tp_bs = phb ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto tp_lap = tp_bs;
+    BatchPhaseScope _batch_scope(phb);
     const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
     const int i_o   = idx_of(Q4NX_DESIGN_O);
     const int i_gu  = idx_of(Q4NX_DESIGN_GU);

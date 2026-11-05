@@ -37,6 +37,8 @@
  */
 #pragma once
 
+#include <string.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -67,6 +69,76 @@ static inline double q4nx_rope_llama3_inv_freq(double inv, const Q4nxRopeLlama3*
     const double smooth = (s->original_max_position / wavelen - s->low_freq_factor) /
                           (s->high_freq_factor - s->low_freq_factor);
     return (1.0 - smooth) * inv / s->factor + smooth * inv;
+}
+
+/* The scaling a config.json DECLARES, and whether this forward implements it (engine#1087).
+ *
+ * A declared block that is not applied is worse than a failed load: the forward runs plain
+ * theta^(-i/half), the reply stays fluent and is wrong past the model's original window, and no line
+ * in the log says the model was served something other than it asked for.  Two rules are implemented
+ * — `llama3` (above) and LongRoPE's `short_factor` (read_rope_short_factor in q4nx_forward.cpp) — so
+ * every other declared type is refused at load BY NAME instead.
+ *
+ * q4nx_rope_declared_type() writes "" when the config declares no scaling block at all (the case for
+ * every model that has no rope_scaling key), and the declared type otherwise.
+ */
+static inline void q4nx_rope_declared_type(const char* json, char* out, int cap) {
+    if (!out || cap <= 0) return;
+    out[0] = '\0';
+    if (!json) return;
+    const char* rs = strstr(json, "\"rope_scaling\"");
+    if (!rs) return;
+    const char* v = strchr(rs, ':');
+    if (!v) return;
+    for (++v; *v == ' ' || *v == '\t' || *v == '\n' || *v == '\r'; ++v) {
+    }
+    if (*v != '{') return;   /* null (or a non-object) declares nothing */
+    /* The window is the block's OWN closing brace, not a byte count.  A fixed window is wrong in both
+     * directions: a block that serialises its factor arrays before the type key can push "rope_type"
+     * past it (which would read as NO block, i.e. served plain — the failure this reader exists to
+     * stop), and a block that has no type at all can reach a NEIGHBOUR's "type" inside it (which would
+     * refuse a model that asked for nothing).  Braces are matched through strings, so a "}" inside a
+     * string cannot end the block early. */
+    int depth = 0, instr = 0, esc = 0;
+    const char* end = 0;
+    for (const char* q = v; *q; ++q) {
+        const char ch = *q;
+        if (instr) {
+            if (esc) esc = 0;
+            else if (ch == '\\') esc = 1;
+            else if (ch == '"') instr = 0;
+            continue;
+        }
+        if (ch == '"') instr = 1;
+        else if (ch == '{' || ch == '[') ++depth;
+        else if ((ch == '}' || ch == ']') && --depth == 0) { end = q; break; }
+    }
+    if (!end) return;   /* unterminated block: nothing trustworthy to refuse */
+    const char* p = strstr(v, "\"rope_type\"");      /* current HF spelling */
+    if (!p || p > end) p = strstr(v, "\"type\"");   /* pre-4.45 spelling: {"type": "yarn"} */
+    if (!p || p > end) return;
+    const char* c = strchr(p, ':');
+    if (!c || c > end) return;
+    const char* q = strchr(c, '"');
+    if (!q || q > end) return;
+    const char* e = strchr(q + 1, '"');
+    if (!e || e > end) return;
+    int n = (int)(e - q - 1);
+    if (n > cap - 1) n = cap - 1;
+    memcpy(out, q + 1, (size_t)n);
+    out[n] = '\0';
+}
+
+/* 1 when the declared type is one this forward applies, 0 when it must be refused.  `llama3` needs
+ * usable numbers (a declared-but-unusable block is not the same thing as no block) and `longrope`
+ * needs the short_factor the forward reads. */
+static inline int q4nx_rope_type_supported(const char* type, const Q4nxRopeLlama3* llama3,
+                                           int has_short_factor) {
+    if (!type || !type[0]) return 1;                        /* no block declared: plain rope */
+    if (!strcmp(type, "default") || !strcmp(type, "none")) return 1;
+    if (!strcmp(type, "llama3")) return llama3 && llama3->on;
+    if (!strcmp(type, "longrope")) return has_short_factor ? 1 : 0;
+    return 0;                                               /* yarn, linear, dynamic, mrope, ... */
 }
 
 #ifdef __cplusplus

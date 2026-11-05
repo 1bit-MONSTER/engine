@@ -869,6 +869,55 @@ struct Launch {
     std::string slot_dir;    // hybrid: the backend's --slot-save-path, where the handoff files go
 };
 
+// One line per request, from the values this process actually has. `tokens` comes from the response's `usage` object,
+// which llama-server sends for a non-streamed reply; a streamed reply carries it only in its final SSE chunk, and parsing
+// the whole stream here to recover it would cost more than the line is worth - the backend's own line has it (lemond
+// surfaces that at log_level=debug). Status and wall time are always real.
+// the request body decides how the reply leaves this process, and that changes what the line can honestly say
+static bool request_is_stream(const std::string& body) {
+    if (body.find("stream") == std::string::npos) return false;
+    try {
+        return json::parse(body).value("stream", false);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+static void log_request_line(const std::string& path, const Launch& b, const httplib::Response& r,
+                             const std::chrono::steady_clock::time_point& t0, const char* how, bool stream) {
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (stream) {
+        // measured, not assumed: httplib runs the content provider after the handler returns, so here the status is
+        // still unset and the elapsed time is the hand-off. Reporting "-1 in 0.0 ms" for a healthy stream (the first cut
+        // did) looks exactly like a failure, so a stream says what it actually is.
+        std::fprintf(stderr, "1bit serve: request %s -> %s :%d stream handed over in %.1f ms | tokens n/a (the backend's"
+                             " own line has them) | %s\n", path.c_str(), b.device.c_str(), b.port, ms, how);
+        return;
+    }
+    long pt = -1, ct = -1;
+    if (!r.body.empty() && r.body.front() == '{') {
+        try {
+            const json out = json::parse(r.body);
+            if (out.contains("usage") && out["usage"].is_object()) {
+                const json& u = out["usage"];
+                if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number()) pt = u["prompt_tokens"].get<long>();
+                if (u.contains("completion_tokens") && u["completion_tokens"].is_number())
+                    ct = u["completion_tokens"].get<long>();
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    char tok[80] = "tokens n/a";
+    if (pt >= 0 && ct >= 0) {
+        // one decimal, formatted here: a raw double in a %s slot printed 17 digits in the first cut of this line
+        char tps[24] = "";
+        if (ct > 0 && ms > 0) std::snprintf(tps, sizeof tps, " %.1f tok/s", ct * 1000.0 / ms);
+        std::snprintf(tok, sizeof tok, "prompt %ld completion %ld%s", pt, ct, tps);
+    }
+    std::fprintf(stderr, "1bit serve: request %s -> %s :%d status %d in %.1f ms | %s | %s\n", path.c_str(),
+                 b.device.c_str(), b.port, r.status, ms, tok, how);
+}
+
 // A GGUF that carries its own MTP head (<architecture>.nextn_predict_layers > 0: Unsloth's Qwen3.8-27B
 // UD-Q4_K_XL holds it as blk.64.nextn.*) drafts with it by default on HRX. That is what Lemonade's own
 // llamacpp recipe does for a model with the "mtp" label (Lemonade reads the same key): `--spec-type
@@ -2003,6 +2052,10 @@ int serve_child(const Options& given) {
                 std::lock_guard<std::mutex> lock(class_mu);
                 if (const auto c = class_cache.find(key); c != class_cache.end()) cls = c->second;
             }
+            // item 5: the DECISION is what a demo shows, so it is timed and logged on every turn, not only the first one
+            // of a conversation (a cached class is still a routing decision, and its ms is the reason later turns are
+            // cheap - the scorer costs 15-25 ms and a cache hit costs nothing).
+            const auto t_laya = std::chrono::steady_clock::now();
             if (cls.label.empty()) {
                 std::lock_guard<std::mutex> lock(scorer_mu);  // the scorer is not reentrant
 #if defined(__linux__)
@@ -2012,6 +2065,7 @@ int serve_child(const Options& given) {
                 cls = onebit::laya::classify_request(*scorer, request_state(q, true));
                 fresh = true;
             }
+            const double laya_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_laya).count();
             if (cls.label.empty()) {
                 r.status = 502;
                 r.set_content(R"({"error":{"message":"laya routing failed"}})", "application/json");
@@ -2034,7 +2088,8 @@ int serve_child(const Options& given) {
             }
             char route_hdr[96];
             std::snprintf(route_hdr, sizeof route_hdr, "%s %.2f %s", cls.label.c_str(), cls.confidence, dev.c_str());
-            if (fresh) std::fprintf(stderr, "1bit serve: laya: %s\n", route_hdr);
+            std::fprintf(stderr, "1bit serve: laya: %s | %s %.1f ms\n", route_hdr,
+                         fresh ? "classified" : "cached", laya_ms);
             pick = size_t(it - laya_devices.begin());
             if (!ensure(pick)) {
                 r.status = 503;
@@ -2043,7 +2098,10 @@ int serve_child(const Options& given) {
             }
             held = std::make_shared<InFlight>(&inflight[pick]);
             ++routed[pick];
+            const auto t_laya_req = std::chrono::steady_clock::now();
             forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, o.precise, q, r, &watch);
+            // item 3 for the routed path: same line, with the class and confidence that chose this device
+            log_request_line(q.path, backends[pick], r, t_laya_req, route_hdr, request_is_stream(q.body));
             r.set_header("X-1bit-Route", route_hdr);  // class, Laya confidence, device
             return;
         }
@@ -2088,9 +2146,19 @@ int serve_child(const Options& given) {
                                      n, prefill_ms, restore_ms, share_ms, ttft);
                         if (slot->owns_lock()) slot->unlock();
                     });
+            log_request_line(q.path, backends[pick], r, t0, "hybrid", request_is_stream(q.body));
             return;
         }
+        const bool req_stream = request_is_stream(q.body);
+        const auto t_req = std::chrono::steady_clock::now();
         forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch);
+        // Cycle 25, TOS3-C25-VERBOSE item 3: one line per request with what THIS process can see - the backend it went to
+        // and that backend's device, the status, the wall time, and the token counts when the backend reported them.
+        // Queue wait is NOT here on purpose: the queue is Lemonade's (lemond, engine#1031), so by the time a request
+        // reaches this process it has already been dequeued, and inventing a number for a wait this side never sat in
+        // would be exactly the kind of claim that reads as evidence. llama-server's own line (visible at log_level=debug)
+        // carries the prefill/decode split, which is the finer-grained figure for the same request.
+        log_request_line(q.path, backends[pick], r, t_req, "direct", req_stream);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);

@@ -43,6 +43,7 @@
 #
 # Exit: 0 the pool was computed (individual depths may still read FAIL), 1 a refusal, 2 no input.
 """tools/mtp_depth_pool.py -- the per-depth live-vs-offline verdict over several mtp_acceptance tickets."""
+import os
 import re
 import sys
 
@@ -66,6 +67,13 @@ NOTSCORED = re.compile(r"depth (\d+):\s+n/a \(live (\d+)/(\d+) reached, offline 
 # shape (2026-11-02 and earlier), whose live rate is the MARGINAL one rather than the rate conditional on reaching
 # the depth -- a different quantity from the current column, so such a log cannot be pooled at all.
 SUMMARY = "== live vs offline at the SAME positions"
+
+# The run's own identity line, printed once per process at init:
+#     forward ready: vocab 248320, max_batch_rows 16, hidden source post-final-norm
+# All three change what a cell means -- a different vocabulary is a different model, a different batch width is a
+# different sealed ELF family, and the hidden source moves acceptance by more than the bar (this lane has measured
+# 2.1 vs 3.19 tokens/pass on that one switch alone).  A pool that mixes them is not one measurement.
+IDENTITY = re.compile(r"forward ready:\s+vocab (\d+),\s+max_batch_rows (\d+),\s+hidden source (\S+)")
 RUNLEVEL = re.compile(r"depth (\d+):\s+live\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+"
                       r"offline\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+delta")
 PROMPT = re.compile(r"(?:per-depth p|prompt )(\d+)\b")
@@ -87,12 +95,16 @@ def parse_ticket(path):
     a cell scored twice with different counts, or per-prompt rows that do not add up to the ticket's own
     run-level row (a short read)."""
     cells, runlevel, prompt, not_scored, budget = {}, {}, None, set(), {}
-    old_shape, summary, width = 0, False, {}
+    old_shape, summary, width, ident = 0, False, {}, None
     for ln in open(path, errors="replace").read().splitlines():
         if "== ticket exited" in ln:  # trap 1: everything after this is the harness echoing the summary
             break
         if SUMMARY in ln:
             summary = True
+            continue
+        m = IDENTITY.search(ln)
+        if m:
+            ident = (int(m.group(1)), int(m.group(2)), m.group(3))
             continue
         m = PROMPT.search(ln)
         if m and "depth " not in ln:
@@ -143,7 +155,7 @@ def parse_ticket(path):
     if runlevel and len(runlevel) != len({d for _, d in cells}):
         raise SystemExit(f"mtp_depth_pool: {path}: run-level row covers {sorted(runlevel)} but per-prompt rows "
                          f"cover {sorted({d for _, d in cells})}")
-    return cells, not_scored, budget, width
+    return cells, not_scored, budget, width, ident
 
 
 def pool(paths):
@@ -152,12 +164,14 @@ def pool(paths):
     Returns (cells, unmeasured, sources); `unmeasured` holds the depths some ticket reported as `not scored`
     that no ticket scored a cell for -- kept, so the pool cannot report a pass over a depth it never saw."""
     seen, unmeasured, sources = {}, set(), 0
-    budget, width = {}, {}
+    budget, width, idents = {}, {}, {}
     for p in paths:
-        rows, not_scored, bud, wid = parse_ticket(p)
+        rows, not_scored, bud, wid, ident = parse_ticket(p)
         unmeasured |= not_scored
         for pr, wid_k in wid.items():
             width[pr] = max(width.get(pr, 0), wid_k)   # a deeper second run of one prompt wins, as its cells do
+        if ident:
+            idents.setdefault(ident, []).append(p)
         for pr, tk in bud.items():
             if pr in budget and budget[pr] != tk:
                 raise SystemExit(f"mtp_depth_pool: {p} ran prompt {pr} for {tk} tokens but an earlier ticket ran "
@@ -172,7 +186,7 @@ def pool(paths):
                 raise SystemExit(f"mtp_depth_pool: {p} disagrees with an earlier ticket on prompt {k[0]} "
                                  f"depth {k[1]}: {seen[k]} then {v}")
             seen.setdefault(k, v)
-    return seen, unmeasured - {d for _, d in seen}, sources, budget, width
+    return seen, unmeasured - {d for _, d in seen}, sources, budget, width, idents
 
 
 def coverage(prompts):
@@ -218,15 +232,28 @@ def width_coverage(width, prompts):
                        f"only, not from the whole pool")
 
 
-def table(seen, sources, unmeasured=(), budget=None, width=None):
+def ident_coverage(idents):
+    """The run identity the pool covers (vocab, batch width, hidden source), and a note when it is not one run."""
+    if not idents:
+        return "run identity unstated", None
+    if len(idents) == 1:
+        v, m, h = next(iter(idents))
+        return f"vocab {v}, max_batch_rows {m}, hidden {h}", None
+    parts = "; ".join(f"vocab {v}/M{m}/{h} from {os.path.basename(ps[0])}" for (v, m, h), ps in idents.items())
+    return "MIXED run identity", (f"MIXED run identity: {parts} -- a different model, batch width or hidden source "
+                                  f"is a different measurement, not one pool")
+
+
+def table(seen, sources, unmeasured=(), budget=None, width=None, idents=None):
     """Print the pooled per-depth table; return (inside, scored, totals per depth)."""
     depths = sorted({d for _, d in seen})
     prompts = sorted({p for p, _ in seen})
     tokens_note, mixed = token_coverage(budget or {}, prompts)
     width_note, mixed_width = width_coverage(width or {}, prompts)
+    ident_note, mixed_ident = ident_coverage(idents or {})
     print(f"pooled {len(seen)} scored cells = {len(prompts)} prompts x {len(depths)} depths "
-          f"({coverage(prompts)}, {tokens_note}, {width_note}, {sources} ticket(s))")
-    for note in (mixed, mixed_width):
+          f"({coverage(prompts)}, {tokens_note}, {width_note}, {ident_note}, {sources} ticket(s))")
+    for note in (mixed, mixed_width, mixed_ident):
         if note:
             print(note)
     print(f"\n{'depth':>5}  {'live':>18}  {'offline (same positions)':>24}  {'delta':>9}  verdict")
@@ -305,7 +332,7 @@ def refusal_selftest():
         fh.write("prompt 0: TEXT IDENTICAL\n" + d1 + run + tail)
         path = fh.name
     try:
-        cells, _, _, _ = parse_ticket(path)
+        cells, _, _, _, _ = parse_ticket(path)
         if cells != {(0, 1): (8, 10, 8, 10)}:
             print(f"selftest FAIL tail repeat: parsed {cells}, wanted only the first row", file=sys.stderr)
             return 1
@@ -323,11 +350,11 @@ def main(argv):
             return refusal_selftest()
         print(__doc__)
         return 2
-    seen, unmeasured, sources, budget, width = pool(paths)
+    seen, unmeasured, sources, budget, width, idents = pool(paths)
     if not seen:
         print("mtp_depth_pool: nothing to pool", file=sys.stderr)
         return 1
-    _, _, totals = table(seen, sources, unmeasured, budget, width)
+    _, _, totals = table(seen, sources, unmeasured, budget, width, idents)
     if not selftest:
         return 0
     bad = {d: (totals.get(d), RECORDED[d]) for d in RECORDED if totals.get(d) != RECORDED[d]}

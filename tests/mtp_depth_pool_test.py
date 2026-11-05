@@ -224,7 +224,19 @@ check("the depths above 4 come from the wider prompts only" in out12,
 rc13, out13, _ = run([], [("k4a.log", ticket_k(0, 4)), ("k4b.log", ticket_k(1, 4))])
 check("k=4" in out13 and "MIXED chain width" not in out13, "a uniform chain width is stated once in the header")
 
-# 13. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
+# 14. the run identity (vocab, batch width, hidden source) is part of the window: 2.1 vs 3.19 tokens/pass on the
+# hidden-source switch alone is more than the bar, so pooling across it would average two measurements.
+READY_NORM = "forward ready: vocab 248320, max_batch_rows 16, hidden source post-final-norm\n"
+READY_RSD = "forward ready: vocab 248320, max_batch_rows 16, hidden source residual\n"
+rc14, out14, _ = run([], [("norm.log", READY_NORM + ticket_k(0, 4)), ("rsd.log", READY_RSD + ticket_k(1, 4))])
+check(rc14 == 0, "a pool across hidden sources still pools (the cells themselves are not in conflict)")
+check("MIXED run identity" in out14 and "post-final-norm" in out14 and "residual" in out14,
+      f"a differing hidden source is named rather than averaged: {[l for l in out14.splitlines() if 'MIXED run' in l]}")
+rc15, out15, _ = run([], [("n1.log", READY_NORM + ticket_k(0, 4)), ("n2.log", READY_NORM + ticket_k(1, 4))])
+check("vocab 248320, max_batch_rows 16, hidden post-final-norm" in out15 and "MIXED run identity" not in out15,
+      "a uniform run identity is stated in the header")
+
+# 15. the tool's own refusals, and (with logs) the recorded 8x64 known answer.
 r = subprocess.run([sys.executable, TOOL, "--selftest"], capture_output=True, text=True)
 check(r.returncode == 0 and "selftest PASS tail repeat" in r.stdout, "the tool's refusal self-test passes")
 

@@ -41,6 +41,8 @@ and the files we re-hosted are the old ones. This tool closes that gap (docs/mod
                watched the repos we publish, which is the audit's own subject.
   --out FILE   where --check writes its report (default pin-report.md).
   --json FILE  with --check: also write the sweep as JSON, which is what --pr-body --from reads.
+               The sweep is everything the run found, so with --orgs it carries the census rows
+               too (`published_not_pinned`), not only the pins that moved.
   --from FILE  with --pr-body: read the sweep from that JSON instead of re-checking every pin.
   --self-test  run against fixtures, no network.
 
@@ -450,6 +452,12 @@ def report(changes: list[dict], notes: list[str], total: int, want_template: boo
     return "\n".join(out)
 
 
+def census_refusal(repo: str, where: str) -> str:
+    """Why a repo the census found is not a bump PR, in the same words from both --pr-body paths."""
+    return (f"pin_watch: {repo} is published but not pinned (see {where}) — a pin is what makes it "
+            "checkable, so it needs `--pin`, not a bump PR")
+
+
 def pr_body(c: dict) -> str:
     """The body of one bump PR: the report's section for that repo, plus what the bump changes."""
     if c.get("gone"):
@@ -668,6 +676,42 @@ def self_test() -> int:
         head, tree = fake_head_new, fake_tree
         expect("--bump takes an intact pin", main(["--bump", "fake/moved", "--pins", path]), 0)
 
+        # --orgs and --json are two changes to the same sweep, and only together do they break it: the
+        # JSON is what the workflow's PR step reads, so if it carries the moved pins but not the census
+        # rows, "the sweep" describes half of what the run actually looked at (#1181 + #1193)
+        def union_api(path):
+            return ([{"id": "our-org/unpinned", "siblings": [{"rfilename": "model.gguf"}]}]
+                    if "author=our-org" in path else [])
+
+        upath = os.path.join(d, "union-pins.json")
+        with open(upath, "w", encoding="utf-8") as f:
+            json.dump({"pins": {"fake/moved": base}}, f, indent=1)
+        usweep = os.path.join(d, "union-sweep.json")
+        head, tree = fake_head, fake_tree
+        api = union_api
+        expect("--check --orgs --json runs one sweep with both halves",
+               main(["--check", "--orgs", "our-org", "--pins", upath,
+                     "--out", os.path.join(d, "union.md"), "--json", usweep]), 1)
+        api = real_api
+        with open(usweep, encoding="utf-8") as f:
+            sweep_doc = json.load(f)
+        expect("the JSON carries the census rows, not just the moved pins",
+               [x["repo"] for x in sweep_doc.get("published_not_pinned", [])], ["our-org/unpinned"])
+        expect("...and the pin that moved", [c["repo"] for c in sweep_doc["changes"]], ["fake/moved"])
+
+        def body_of(repo):
+            try:
+                with contextlib.redirect_stdout(_io.StringIO()):
+                    return main(["--pr-body", repo, "--from", usweep]), ""
+            except SystemExit as e:
+                return (e.code if isinstance(e.code, int) else 1), str(e.code)
+
+        rc_unpinned, msg_unpinned = body_of("our-org/unpinned")
+        expect("a census row is refused as a bump, in those words",
+               (rc_unpinned != 0 and "published but not pinned" in msg_unpinned), True)
+        expect("a pin that moved still prints its body", body_of("fake/moved"), (0, ""))
+        head, tree = fake_head_new, fake_tree
+
         # a container/LoRA repo has no `.gguf`: pinning it must still be possible, or the published
         # repos that carry a template could never be covered
         container_tree = [{"path": p, "type": "file", "size": 1, "lfs": {"oid": "d" * 64}}
@@ -771,11 +815,15 @@ def main(argv: list[str]) -> int:
         # check, and re-checking 147 repos per PR was 78 s of Hub reads each time.
         try:
             with open(a.src, encoding="utf-8") as f:
-                swept = json.load(f)["changes"]
+                sweep = json.load(f)
+            swept = sweep["changes"]
         except (OSError, KeyError, ValueError) as e:
             sys.exit(f"pin_watch: could not read {a.src}: {e}")
         hit = next((c for c in swept if c["repo"] == a.pr_body), None)
         if hit is None:
+            # a sweep from a run without --orgs carries no census rows, so it cannot answer this
+            if any(f["repo"] == a.pr_body for f in sweep.get("published_not_pinned", [])):
+                sys.exit(census_refusal(a.pr_body, a.src))
             sys.exit(f"pin_watch: {a.pr_body} did not move (see {a.src})")
         print(pr_body(hit))
         return 0
@@ -814,11 +862,14 @@ def main(argv: list[str]) -> int:
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"date": datetime.date.today().isoformat(), "pins": len(doc["pins"]),
-                       "changes": changes, "notes": notes}, f, indent=1)
+                       "changes": changes, "notes": notes,
+                       "published_not_pinned": fresh}, f, indent=1)
             f.write("\n")
     if a.pr_body:
         hit = next((c for c in changes if c["repo"] == a.pr_body), None)
         if hit is None:
+            if any(f["repo"] == a.pr_body for f in fresh):
+                sys.exit(census_refusal(a.pr_body, a.out))
             sys.exit(f"pin_watch: {a.pr_body} did not move (see {a.out})")
         print(pr_body(hit))
         return 0

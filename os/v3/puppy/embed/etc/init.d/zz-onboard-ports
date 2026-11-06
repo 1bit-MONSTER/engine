@@ -83,9 +83,19 @@ open_mdns
 # closed by remote host` while sshd is listening on 0.0.0.0:22 and the port rule above is in place.
 # The RFC1918 ranges are added, not the world: sshd still wants the owner's key, and Lemonade wants its API key
 # only when one was turned on (cycle 20: blank is the shipped mode, so the LAN reaches Lemonade without one).
-if [ -f /etc/hosts.allow ] && ! grep -q '1bit-lan' /etc/hosts.allow 2> /dev/null; then
-    printf 'ALL: LOCAL, 10.0.0.0/255.0.0.0, 172.16.0.0/255.240.0.0, 192.168.0.0/255.255.0.0  # 1bit-lan\n' \
-        >> /etc/hosts.allow
+# Cycle 30, measured on the c29 take: that append left Puppy's stock `ALL: LOCAL` as line 1, and libwrap
+# takes the FIRST rule that matches. `LOCAL` is a NAME test (a reverse name with no dot), so every connection
+# made libwrap reverse-resolve the client and then forward-verify the name it got back; with no DNS search
+# domain the verification fails and sshd writes, per connection,
+#   auth.err sshd-session[..]: warning: /etc/hosts.allow, line 1: can't verify hostname: getaddrinfo(ryzen, AF_INET) failed
+# - 780 of those in 19 minutes of demo use, and the connection was allowed only because the router answers a
+# dotless `ryzen`; a `ryzen.lan` answer would have made line 1 stop matching and hosts.deny refuse the owner's
+# own machine. So the file is WRITTEN, not appended to: one rule, addresses only, no name lookup at all.
+# 127.0.0.1 is spelled as an address because the LOCALHOST keyword is the same name machinery, and IPv6
+# loopback is not listed on purpose (this image has no IPv6 address; see the mDNS comment above).
+lan_rule='ALL: 127.0.0.1, 10.0.0.0/255.0.0.0, 172.16.0.0/255.240.0.0, 192.168.0.0/255.255.0.0  # 1bit-lan'
+if [ "$(cat /etc/hosts.allow 2> /dev/null)" != "$lan_rule" ]; then
+    printf '%s\n' "$lan_rule" > /etc/hosts.allow
 fi
 grep -q '1bit-lan' /etc/hosts.allow 2> /dev/null && \
     echo "zz-onboard-ports: the LAN is allowed through tcpwrappers (hosts.allow)" || \

@@ -153,6 +153,85 @@ split on the degraded boot is still 3x slower than 20.0 ms of iGPU-only on the h
 taken from a 3.3x loss is not a reason to build a split dispatcher; it is a reason to keep the iGPU
 numbers of this document dated, and to re-run the ratio before anyone quotes a ceiling from it.
 
+### Third measurement, 2026-11-06 15:09 (one 3-minute `gpu-hold` arm): #782 is fixed, so the ratio is back to the healthy boot — and the split's ceiling is ~1.03x again
+
+That is exactly what the paragraph above asked for. The 12.4 TFLOP-s boot was **engine#782**, attributed
+(2026-11-06 08:26Z) to the compiler that built the embedded device code — clang-23 objects in
+`rc-2026-10-31c` versus clang-24 `_sb` tiles that spill — and fixed by flipping the `m128_w8_f2_sb`
+dense-prefill tiles off by default in the pinned kernels. So the iGPU side of this ratio has to be
+re-read before any ceiling is quoted from it. Same box, same model as the anchor above
+(Qwen3-4B-Q4_K_M), `llama-bench -dev HRX0 -ngl 99`, no-SVM trio, one ticket, die 49-66 C:
+
+| pp | reference (3 reps) | profiled capture (1 rep) | device span of one prefill |
+|---|---:|---:|---:|
+| 2048 | **1563.9 ± 87.9 tok/s** | 1 360.3 | 389.1 ms (61.7 % busy) |
+| 16384 | **728.0 ± 35.1 tok/s** | 653.4 | 5 060.1 ms (86.2 % busy) |
+
+The pp2048 anchor is the comparable one (the document's own is **1372.8 tok/s** on the rc31c binaries),
+so today's binary is **13.9 % faster** than the anchor the "healthy boot" table was taken on: the
+regression is gone, and the split's premise is back to a 20-30x asymmetry rather than 8:1.
+
+**The per-shape number the ceiling actually needs**, read off the pp16384 capture rather than a
+microbenchmark (`HRX_PROFILE_MODE=dispatch`, 36 752 dispatches in 64 submissions):
+
+| kernel | device time | share of busy | dispatches |
+|---|---:|---:|---:|
+| `fa_prompt_f16_d128` (attention) | 2 083.1 ms | **47.7 %** | 2 304 |
+| `ggml_mul_mat_q4_k_f16_wmma_prefill_wave32` | 1 248.1 ms | 28.6 % | 9 216 |
+| `ggml_mul_mat_swiglu_q4_k_f16_wmma_prefill_wave32` | 644.5 ms | 14.8 % | 2 240 |
+| `ggml_mul_mat_q6_k_f16_wmma_prefill_wave32` | 284.9 ms | 6.5 % | 2 240 |
+
+`swiglu_q4_k` is the `up_gate` shape: 644.5 ms / 2 240 dispatches = **0.2877 ms per 512 rows**, and two
+dispatches per layer make the full 9 728-column `up_gate`, so **0.288 ms per 256 rows** — against the
+NPU's **8.61 ms** per 256-row tile for the same shape. That is a **30x** asymmetry, not the 20-25x of the
+first measurement, and it reproduces the healthy-boot figure from the other direction (the doc's own
+20.03 ms at M=16384 is 0.313 ms per 256 rows, 40.7 TFLOP-s; today's 0.288 ms is ~44 TFLOP-s, +8 %).
+The per-dispatch arithmetic is inferred from dispatch counts, and where it could be read either way
+(one dispatch per half of the fused pair, or one per full pair) the **slower** reading is used here, so
+the asymmetry below is a floor.
+
+**What that does to the bar.** Balancing the two sides row-group by row-group (iGPU 0.288 ms per 256
+rows, NPU 8.61 ms per 256-row tile, 64 row-groups at M=16384, iGPU-only = 18.43 ms): the optimum puts
+**2** row-groups on the NPU, which costs 17.2 ms to the iGPU's 17.9 ms, i.e. a **1.02-1.03x** ceiling —
+the same ceiling the pre-reset boot had, and 2 row-groups is the whole optimum. Meeting #754's own
+"~4x faster NPU GEMM" bar (2.15 ms per tile) moves the optimum to 7 row-groups and the ceiling to
+**~1.12x** for this shape, not the ~15 % the issue projects: that projection was written against the
+degraded boot, where the iGPU was 3.5x slower. A 15 % per-GEMM split against today's iGPU needs the NPU
+at **~1.9 ms per 256-row tile (~4.5x)** — and the end-to-end number is lower still, because attention
+is **47.7 %** of this model's pp16384 device time and is not split at all.
+
+**And the model where our prefill really is slow is not an NPU case either.** Measured the same day
+across the models the Supreme board compares (`~/lb/prefill-split/RANKED-FOR-SUPREME.md`): the worst
+prefill on the box is `bonsai2-27b-ternary` at **144-152 tok/s**, and its device time is **93-96 %** in
+three **f32** wmma kernels — a 1-bit model doing f32 prefill math. That is ~7.8 TFLOP-s of effective
+work, still **5x** what the NPU prefill GEMM delivers, so the fix there is the 1-bit prefill path, not
+a split.
+
+### The scheduling half, which the ratio alone does not cover
+
+The measurements above are per-GEMM ratios. A split has a second requirement the paper's design hides:
+the iGPU side must be able to run *while* the NPU side runs, and our iGPU cannot fill its own gaps.
+From the same capture and the lane's prefill work of 2026-11-06:
+
+- **Submissions never overlap on the iGPU**: 0.00 % of busy time has two dispatches in flight from
+  different submissions, in every one of 24 prefill captures across six models — consistent with
+  [docs/hybrid.md](hybrid.md) and with the queue-wide AQL barrier a wait edge inserts. So a split cannot
+  be "one engine taking the other's idle": on the iGPU side, the idle is *host* time between
+  submissions (57.3 % of this arm's 15.1 % idle sits in gaps > 200 us at pp16384; 40.3 % idle at pp2048
+  is the per-shape first pass, not steady state).
+- **The critical path is the slower side, per row-group.** With a 30x per-row asymmetry, handing the NPU
+  even one 256-row tile costs 8.61 ms to save at most 0.288 ms of iGPU time; the 1.02x ceiling above is
+  *already* the optimistic case where the NPU's tile lands entirely under the iGPU's remaining work.
+- **The join is free by construction, and that part does transfer**: disjoint row ranges into one output
+  tensor means no reduction pass (their `hetero_compute.cpp:111`, our equivalent is the same), which is
+  why the ratio — not the join — is the whole question.
+
+The verdict of this page is therefore unchanged, and now dated on both sides of #782: **on this box the
+split does not pay, the bar in [#754](https://github.com/1bit-MONSTER/engine/issues/754) stands, and on
+today's binary that bar is ~4.5x rather than ~4x for a per-GEMM 15 %, with less end-to-end because
+attention is half the cell.** Numbers above: one hold, `~/lb/prefill-split/qwen3-4b/` (bundles, CSVs,
+both stderr logs), harness `~/lb/exp50-split-ratio.sh`.
+
 ## What transfers, and what we will not do
 
 **Transfers (worth doing regardless of the split):**
@@ -175,7 +254,9 @@ numbers of this document dated, and to re-run the ratio before anyone quotes a c
 - **Build a split-prefill dispatcher before the NPU GEMM is faster.** A dispatcher around a 1.5 TFLOP/s
   NPU buys ≤ 1.3 %, measured. The precondition is an NPU prefill GEMM ~4x faster: our per-tile time is
   weight-fetch bound, so a T>256 tile with weight reuse across T is the work (roughly 4x at T=1024),
-  and only then does a ~15 % split at M=16384 become possible — still 0 at M≤2048.
+  and only then does a split at M=16384 become possible — still 0 at M≤2048. Re-derived against the
+  post-#782 iGPU (third measurement below), the 4x bar buys a **~1.12x per-GEMM ceiling**, not ~15 %,
+  and less end-to-end because attention is 47.7 % of a 4B's pp16384 device time.
 - **Copy the weights to give the NPU its own layout per layer.** Measured cost: 50 MiB of copies per
   layer for the 4B up_gate (~3.6 ms at 14 GB/s) against a 1.3 % best-case gain.
 
@@ -204,7 +285,8 @@ HeteroMosaic executes on imported handles only because it submits to amdxdna by 
   buffers the NPU cannot yet execute on.
 - [#754](https://github.com/1bit-MONSTER/engine/issues/754) — split-prefill in the hybrid route,
   **blocked on** an NPU prefill GEMM with T>256 weight reuse; the numbers above are the acceptance bar
-  it has to clear.
+  it has to clear, and the third measurement re-derives that bar against the post-#782 iGPU (`~4.5x`
+  for a per-GEMM 15 %, on a 30x per-row asymmetry).
 - `docs/hybrid.md`'s "Running beside the GPU" section already covers the other direction (an NPU stream
   under a busy GPU keeps 87 % of its bandwidth); this page adds the GPU-side view: the iGPU loses
   < 0.2 % when the NPU runs beside it.
@@ -222,6 +304,13 @@ HeteroMosaic executes on imported handles only because it submits to amdxdna by 
 rebuilt box the 2026-10-01 `~/.local/share/1bit-canonical` install cannot enumerate `HRX0` at all
 (`hrx_gpu_initialize` → NOT_FOUND); the rc31c libraries plus the TheRock `libhsa-runtime64.so.1` path
 can, and that is what the numbers above used.
+
+The third measurement's iGPU numbers come from the engine binary instead of the microbenchmark, which
+is why they cannot be skewed by the harness: `~/lb/exp50-split-ratio.sh` (reference row plus a
+`HRX_PROFILE_MODE=dispatch` capture per prompt length; `~/lb/exp34-gaps.py` and `~/lb/exp37-offline.py`
+read the captures). One caveat, because it is easy to misread: a single-rep capture includes the
+per-shape first pass, so its idle share at M=2048 (40.3 %) is host time in the prepared-program
+cache-miss path, not steady state.
 
 **Unrun, declared:** Qwen3-4B `q_proj` (4096×2560) and 0.6B `k`/`v` (1024×1024) — our prebuilt kernel
 set has no such shapes and the mlir-aie venvs that would build them are gone on this box

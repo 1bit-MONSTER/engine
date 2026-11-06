@@ -37,6 +37,7 @@
 #include <string>
 #include <vector>
 
+#include "moe_container.h"  // the two MoE container conventions (engine#1035)
 #include "model.h"
 #include "plan/plan.h"  // plan.json (engine #799 P1): the stream plan replaces the filename probes
 #include "q4nx_pack.h"        // Q4nxDesignGeom / Q4nxModelDims (derived design table)
@@ -499,6 +500,11 @@ private:
     int mla_ = 0;
     int q_lora_ = 0, kv_lora_ = 0, rope_dim_ = 0, qk_nope_ = 0, v_head_ = 0;
     int n_expert_ = 0, top_k_ = 0, expert_im_ = 0, dense_im_ = 0;
+    // Which MoE container convention this container uses, decided from its own tensors in
+    // init_impl (moe_container.h): the engine converter's `mlp.experts.*` names with a plain
+    // [N][K] per-expert tile grid, or the FLM-style `*_exps_proj` names whose writer transposes
+    // each expert's tiles.  The wrong choice is silent, so it is read, not assumed.
+    MoeFormat moe_format_ = MoeFormat::Flm;
     int leading_dense_ = 0;
     int expert_gating_sigmoid_ = 1;   // llama.cpp deepseek2: 2 = sigmoid, 1 = softmax
     float expert_w_scale_ = 1.0f;     // applied after the top-k weight normalisation

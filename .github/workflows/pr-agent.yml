@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# PR-Agent (qodo-ai/pr-agent) reviews every pull request with a local model: Qwen3-Coder-30B-A3B
+# PR-Agent (The-PR-Agent/pr-agent, formerly qodo-ai/pr-agent) reviews every pull request with a local model: Qwen3-Coder-30B-A3B
 # (Q4_K_M, about 18 GB resident, thinking off) served by the engine itself (`1bit serve`; it ran on Vulkan, which RFC #213 stage 3 removes: the service moves to HRX) on
 # the Strix Halo box, at 127.0.0.1:8090 (the coder-llm user service). The job runs on that box's self-hosted runner
 # (label pr-agent), so no code leaves it and there is no API key. Settings: .pr_agent.toml.
@@ -60,11 +60,15 @@ jobs:
           OPENAI__KEY: local
         run: |
           set -e
-          # PR-Agent 0.43.0 in ~/pr-agent-venv on the runner (installed on first use)
-          export PATH="$HOME/pr-agent-venv/bin:$PATH"
-          if ! command -v pr-agent > /dev/null 2>&1; then
-            python3 -m venv "$HOME/pr-agent-venv"
-            "$HOME/pr-agent-venv/bin/pip" install -q "pr-agent==0.43.0"
+          # PR-Agent from https://github.com/The-PR-Agent/pr-agent (PyPI pr-agent), one venv per version on the
+          # runner so a version bump installs fresh instead of reusing the old one. Since 0.49 the GitHub provider
+          # is an extra: without [github] every command fails with "Git provider 'github' could not be loaded".
+          PRA_VERSION=0.49.0
+          venv="$HOME/pr-agent-venv-$PRA_VERSION"
+          export PATH="$venv/bin:$PATH"
+          if ! "$venv/bin/pr-agent" --help > /dev/null 2>&1; then
+            python3 -m venv "$venv"
+            "$venv/bin/pip" install -q "pr-agent[github]==$PRA_VERSION"
           fi
           # a real one-token completion, not just /v1/models: the server answers that before the model is loaded
           ready=0
@@ -76,11 +80,11 @@ jobs:
             sleep 10
           done
           [ "$ready" = 1 ] || { echo "::error::the local model (coder-llm on :8090) does not answer"; exit 1; }
-          # PR-Agent exits 0 even when every model call failed, so check its log
+          # PR-Agent exits 0 even when every model call failed or the command never ran, so check its log
           run() {
             pr-agent --pr_url "$pr" "$@" 2>&1 | tee "$RUNNER_TEMP/pr-agent.log"
-            if grep -qE "Failed to generate prediction|Error during LLM inference|Failed to (review|describe|generate)" "$RUNNER_TEMP/pr-agent.log"; then
-              echo "::error::PR-Agent could not get an answer from the model"; exit 1
+            if grep -qE "Failed to generate prediction|Error during LLM inference|Failed to (review|describe|generate|process the command)|Failed to get git provider" "$RUNNER_TEMP/pr-agent.log"; then
+              echo "::error::PR-Agent failed (no model answer, or the command never ran): see the log above"; exit 1
             fi
           }
           pr="https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number || github.event.issue.number }}"

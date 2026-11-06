@@ -234,10 +234,12 @@ if [ -n "$nvme" ]; then
     # `|| true`: this script runs under `set -euo pipefail`, so a probe whose ssh exits non-zero (no efivarfs in
     # this image -> mount fails -> the whole ssh command fails) used to abort the run silently, right here, with no
     # summary line - which is what made c19's qemu-gate fail with 255 while every check before it had passed.
-    efi=$(ssh_vm "modprobe efivarfs 2>/dev/null; mkdir -p /sys/firmware/efi/efivars; mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null && echo efivars-ok" 2>/dev/null || true)
+    # init.sh already mounts efivarfs at boot when the variable exists; mounting it a second time fails EBUSY,
+    # so accept an existing BootOrder variable as "efivars are usable" instead of re-mounting unconditionally.
+    efi=$(ssh_vm "if [ -e /sys/firmware/efi/efivars/BootOrder-8be4df61-93ca-11d2-aa0d-00e098032b8c ]; then echo efivars-ok; else modprobe efivarfs 2>/dev/null; mkdir -p /sys/firmware/efi/efivars; mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null && echo efivars-ok; fi" 2>/dev/null || true)
     case "$efi" in
-        *efivars-ok*) boot=$(ssh_vm "efibootmgr 2>&1" 2>/dev/null || true);;
-        *) boot=""
+        *efivars-ok*) boot=$(ssh_vm "efibootmgr 2>&1" 2>/dev/null || true); bootv=$(ssh_vm "efibootmgr -v 2>&1" 2>/dev/null || true);;
+        *) boot=""; bootv=""
            echo "install boot entry: SKIP - this image's kernel has no efivarfs module, so the installer cannot write one (the disk still boots as \\EFI\\BOOT\\BOOTX64.EFI)";;
     esac
     # `|| true` for the same reason as the probe above: with no efivars the SKIP branch leaves $boot empty, the
@@ -256,6 +258,19 @@ if [ -n "$nvme" ]; then
             echo "install boot entry: Boot$num '1bit OS' is first in BootOrder ($order)"
         else
             echo "install boot entry: Boot$num '1bit OS' is not first in BootOrder ($order)"; ok=0
+        fi
+        # the entry must point at the file the disk actually carries, not just carry our label
+        entv=$(printf '%s\n' "$bootv" | grep -E "^Boot$num" | head -1 || true)
+        case "$entv" in
+            *'\EFI\BOOT\BOOTX64.EFI'*) echo "install boot entry: Boot$num points at \EFI\BOOT\BOOTX64.EFI";;
+            *) echo "install boot entry: Boot$num does not point at \EFI\BOOT\BOOTX64.EFI (got: $(printf '%s' "$entv" | cut -c1-160))"; ok=0;;
+        esac
+        nextv=$(printf '%s\n' "$boot" | sed -n 's/^BootNext: //p' | head -1 || true)
+        if [ "$nextv" = "$num" ]; then
+            echo "install boot entry: BootNext is $num"
+        else
+            [ -n "$nextv" ] || nextv=unset
+            echo "install boot entry: BootNext is $nextv, want $num"; ok=0
         fi
     fi
 else

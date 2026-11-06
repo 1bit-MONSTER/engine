@@ -39,7 +39,7 @@ release in the same week gets `.1`.
 
 > **The candidate has moved on since this section was written.** Everything below to the end of this section is the
 > **1 Nov 2026 record** of c19 (software-gated, never booted on hardware) and c20, and stays as that record. What
-> has happened since, as of 2026-11-05 16:5x:
+> has happened since, as of 2026-11-05 23:1x:
 >
 > - **c26** (`rc-2026-11-05-c26`) was written to a stick at 14:37 with every software gate green on its frozen
 >   bytes: `vm-check` **75 PASS / 0 FAIL / 3 SKIP** (UEFI + Secure Boot), the artifact's own
@@ -54,12 +54,28 @@ release in the same week gets `.1`.
 >   PR that carries the change makes the image build refuse any initrd whose wait is under 90 s
 >   ([#1160](https://github.com/1bit-MONSTER/engine/pull/1160), which closes #1159). On c27's bytes `vm-check` is
 >   the same **75 / 0 / 3**, the new `usbgate` (a USB-mass-storage boot with its budget asserted from the shipped
->   image) passes, and `prepare-stick --check` passes. **Its board boot is the step still owed**, so v2026.44
->   remains a draft under the owner's order — the demo video on the live USB first, then the install test, then
->   publish.
+>   image) passes, and `prepare-stick --check` passes.
+> - **c27's board boot ran on 2026-11-05 and the c26 failure is gone**: `sda1 sda2` at 3.86 s, behind the same
+>   two USB reset cycles that killed c26, and the 120 s wait carried it; boot to Lemonade serving took **50 s**.
+>   `puppy-check` **51 rows: 43 PASS, 1 FAIL, 7 SKIP**. The one FAIL is `u4-release-check : no RESULT line; rc=1`
+>   — the appliance's own release check dying at line 1244 on `PPID=$!`, a readonly bash builtin — which left a
+>   1000-token chat in the NPU driver, so the next backend's requests came back `code 102` behind 33
+>   `aie2_hwctx_init … ret -19` lines, and one TDR followed at kernel 319.2 s
+>   ([#1177](https://github.com/1bit-MONSTER/engine/pull/1177) carries the fix). Every row that run reached before
+>   the death was green — chat 94.26 tok/s on the NPU, the 400/600/1000 ladder answered, `TDRs 0 → 0 → 0 → 0` on
+>   the follow-up — and the five `u9-*` SKIPs were the checker's own log-path bug, fixed the same night.
+> - **c28** (`rc-2026-11-05-c28`) is c27's bytes with that one fix, and **c29** composes c28 with the console and
+>   installer fixes. **c28 booted the board on 2026-11-05 at 19:42**: `puppy-check` **52 rows: 49 PASS, 3 FAIL,
+>   2 SKIP**, boot to Lemonade serving in **50 s**, NPU 94.9–98.0 tok/s, HRX 85.4–87.1 tok/s. None of the three reds
+>   is the `PPID=$!` death: one is the appliance's release check reporting a non-streamed NPU chat that got no HTTP
+>   status at all, the second is that check's own follow-up run wedged on the same request (`code 102`, one TDR), and
+>   the third is `u9-degraded` firing for the first time, on a failed backend load. **c29** was written to a stick and
+>   booted on 2026-11-05 at 22:13 for the demo take — one `code 614` NPU turn, recovered to the fallback — which is
+>   not a `puppy-check` run. v2026.44 remains a draft under the owner's order: the demo video on the live USB first,
+>   then the install test, then publish.
 >
-> The last result *measured on the board* remains cycle 24's: `puppy-check` **42 rows: 40 PASS, 1 FAIL — the
-> checker's own `u7-mdns` row — 2 SKIP**.
+> The newest full row set *measured on the board* is c28's 52 rows above (2026-11-05 19:42); before it, c27's 51, and
+> before that cycle 24's `puppy-check` **42 rows: 40 PASS, 1 FAIL — the checker's own `u7-mdns` row — 2 SKIP**.
 
 **Not published.** Candidate **c19** (`rc-2026-11-01a`, engine `bcb28cc8f573`) passed every software gate below and
 was written to a 64 GB stick — and that is where it stopped: it was **never booted on hardware and never installed on
@@ -183,7 +199,7 @@ Release sha and pins (the submodules this candidate is built from):
 | engine | `7871c71d` (main when the last release-blocking PR merged; a later merge today re-runs only the stages it touches, and the run's record carries the final sha) |
 | llama.cpp (HRX fork) | `851fa6c8d8f2` |
 | hrx-system | `82804197bcbe` |
-| Lemonade (fork) | `f44ff953` (the fork's `main` tip, and the sha `bump-lemonade`'s PR #1126 pins; re-read this row from `git ls-tree third_party/lemonade` at cut time, because the workflow follows the tip) |
+| Lemonade (fork) | `f44ff953` (the fork's `main` tip, and the sha `bump-lemonade`'s PR #1126 pinned; re-read this row from `git ls-tree third_party/lemonade` at cut time, because the workflow follows the tip) |
 | private kernel add-on (HIP) | `744bd713d968` |
 | private NPU kernel set | `17ed5be7a28a` |
 | private NPU runtime | `ce9fa59adf95` |

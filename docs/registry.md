@@ -167,7 +167,10 @@ and sizes (`?blobs=true`, fetched only for a repo that is new or changed), its l
 base model, its architecture, whether `architectures.json` maps that architecture, and
 whether the npu route already serves the family. A family the registry does not map prints
 `!! NEW FLM` and is the alert, exactly like an uncovered class: exit 1 either way, so
-neither watch can turn the other's alert green. A repo with no config is one of the org's
+neither watch can turn the other's alert green. The NPU-route answer for an org family the
+registry maps only for hrx, or for a pack whose class no backend accepts, is recorded in
+[npu.md](npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve) rather than mapped
+as a GGUF alias. A repo with no config is one of the org's
 quantized `.gguf` drops — a derivative, reported but not an alert. A release whose notes or
 asset names mention `q4nx`, `chunk` or `layout` is marked `kernel-format` for a human to
 read before the pinned Q4NX decoder moves; that line alone does not alert ("chunk" also

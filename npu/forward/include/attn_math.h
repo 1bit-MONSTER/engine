@@ -1,0 +1,107 @@
+// Copyright 2026 bong-water-water-bong
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The two float kernels the per-op forward's host attention is made of: one score dot (q.k over the head
+// dimension) and one value accumulation (ctx += p * v).  Half of a prefill's attention flops each.
+//
+// Why they exist rather than an open-coded loop: the obvious single-accumulator `for (i) d += a[i]*b[i]`
+// is one float FMA latency chain per score, and gcc may not reassociate it without -ffast-math (the
+// engine sets none), so it stays scalar.  Measured that way, attention on the Phi-3.5-mini OGA pack ran
+// at 8.1 GFLOP/s, which is what a 2048-token prefill spent 208-398 s on while the same prompt's GEMMs
+// cost 2.1 s on the array.  Both kernels are the shape npu/forward/include/hadamard.h already uses:
+// an AVX2+FMA body behind a runtime check, and a portable body for every other host.
+//
+// Contract: the forms differ by float ROUNDING ORDER only -- they are the same sum, not the same bits.
+// tests/attn_math_test.cpp is what holds that line (each form against a double-precision direct sum, on
+// every width the forward passes, including the awkward ones either body's tail loop would mishandle).
+#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#define Q4NX_ATTN_X86 1
+#include <immintrin.h>
+#else
+#define Q4NX_ATTN_X86 0
+#endif
+
+namespace q4nx_attn {
+
+#if Q4NX_ATTN_X86
+inline bool have_avx2_fma() {
+    static const bool ok = __builtin_cpu_supports("avx2") != 0 && __builtin_cpu_supports("fma") != 0;
+    return ok;
+}
+
+__attribute__((target("avx2,fma"))) inline float dot_avx2(const float* a, const float* b, int n) {
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
+    }
+    for (; i + 8 <= n; i += 8)
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+    s0 = _mm256_add_ps(s0, s1);
+    __m128 t = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
+    t = _mm_hadd_ps(t, t);
+    t = _mm_hadd_ps(t, t);
+    float sum = _mm_cvtss_f32(t);
+    for (; i < n; i++) sum += a[i] * b[i];
+    return sum;
+}
+
+__attribute__((target("avx2,fma"))) inline void saxpy_avx2(float p, const float* x, float* y, int n) {
+    const __m256 pv = _mm256_set1_ps(p);
+    int i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(pv, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
+    for (; i < n; i++) y[i] += p * x[i];
+}
+#endif  // Q4NX_ATTN_X86
+
+// The portable bodies.  Four accumulators, so the dependency chain is a quarter as long and the compiler
+// has something to vectorize at whatever width the target actually has (this tree is built for the
+// baseline x86-64 ISA, i.e. 4-lane SSE2 without FMA).
+inline float dot_scalar(const float* a, const float* b, int n) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        s0 += a[i] * b[i];
+        s1 += a[i + 1] * b[i + 1];
+        s2 += a[i + 2] * b[i + 2];
+        s3 += a[i + 3] * b[i + 3];
+    }
+    for (; i < n; i++) s0 += a[i] * b[i];
+    return (s0 + s1) + (s2 + s3);
+}
+
+inline void saxpy_scalar(float p, const float* x, float* y, int n) {
+    for (int i = 0; i < n; i++) y[i] += p * x[i];
+}
+
+// One score: sum(a[i]*b[i]) over the head dimension.
+inline float dot(const float* a, const float* b, int n) {
+#if Q4NX_ATTN_X86
+    if (have_avx2_fma()) return dot_avx2(a, b, n);
+#endif
+    return dot_scalar(a, b, n);
+}
+
+// y[i] += p * x[i] over the head dimension.
+inline void saxpy(float p, const float* x, float* y, int n) {
+#if Q4NX_ATTN_X86
+    if (have_avx2_fma()) { saxpy_avx2(p, x, y, n); return; }
+#endif
+    saxpy_scalar(p, x, y, n);
+}
+
+}  // namespace q4nx_attn

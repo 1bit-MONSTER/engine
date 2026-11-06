@@ -72,7 +72,9 @@ jobs:
         # ONEBIT_NPU_RT_DIR). A rename in npu/mtp/ or npu/forward/include/ would therefore break it
         # silently until someone built it on a device. Syntax-only, against the in-tree headers only.
         run: |
-          g++ -std=c++26 -fsyntax-only -DONEBIT_NPU_RUNTIME_OWN \
+          # The image installs versioned binaries only (no /usr/bin/g++), and Configure above
+          # already picks g++-16, so the check compiles with the same compiler the build uses.
+          g++-16 -std=c++26 -fsyntax-only -DONEBIT_NPU_RUNTIME_OWN \
             -Inpu -Inpu/forward/include -Ibuild/_deps/json-src/include \
             tools/mtp_acceptance.cpp
       - name: Build

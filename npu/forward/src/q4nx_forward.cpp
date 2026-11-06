@@ -40,6 +40,7 @@
 
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx
 #include "hadamard.h"                // the activation rotation, SIMD path + scalar reference
+#include "attn_math.h"               // attention's score dot + value accumulation, SIMD + portable
 #include "q4nx_dequant.h"
 #include "q4nx_pack.h"
 
@@ -98,80 +99,6 @@ static inline float bf16_to_f32(uint16_t bf) {
 static inline float softplus_f(float x) {
     if (x > 20.0f) return x;
     return log1pf(expf(x));
-}
-
-// One attention score: sum(a[i]*b[i]).  The obvious single-accumulator loop is one float FMA latency
-// chain per score, and gcc may not reassociate it without -ffast-math (this build sets none), so it
-// stays scalar: attention on the Phi-3.5 pack then runs at ~2-8 GFLOP/s (measured device-free with
-// ~/ogaload/oga13/attn_ab.sh), which is what a long prefill spends its seconds on while the same
-// prompt's GEMMs cost 2.1 s on the array.
-//
-// Two forms, dispatched exactly like npu/forward/include/hadamard.h does it: AVX2+FMA when the CPU has
-// them (this file is built for the baseline x86-64 ISA, so plain C++ gets 4-lane SSE2), and a portable
-// four-accumulator loop otherwise.  Every form sums in a different order, i.e. they differ by float
-// rounding, not by value: the gate for that is a --dump-logits comparison (same argmax, max|dlogit|
-// ~1e-4 on a 28.5 max logit).
-#if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
-#include <immintrin.h>
-#define Q4NX_ATTN_X86 1
-
-inline bool have_avx2_fma() {
-    static const bool ok = __builtin_cpu_supports("avx2") != 0 && __builtin_cpu_supports("fma") != 0;
-    return ok;
-}
-
-__attribute__((target("avx2,fma"))) inline float dot_avx2(const float* a, const float* b, int n) {
-    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
-    int i = 0;
-    for (; i + 16 <= n; i += 16) {
-        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
-        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
-    }
-    for (; i + 8 <= n; i += 8)
-        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
-    s0 = _mm256_add_ps(s0, s1);
-    __m128 t = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
-    t = _mm_hadd_ps(t, t);
-    t = _mm_hadd_ps(t, t);
-    float sum = _mm_cvtss_f32(t);
-    for (; i < n; i++) sum += a[i] * b[i];
-    return sum;
-}
-
-// ctx[t] += p * v[t], the attention's value accumulation: half of a prefill's attention flops.
-__attribute__((target("avx2,fma"))) inline void saxpy_avx2(float p, const float* x, float* y, int n) {
-    const __m256 pv = _mm256_set1_ps(p);
-    int i = 0;
-    for (; i + 8 <= n; i += 8)
-        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(pv, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
-    for (; i < n; i++) y[i] += p * x[i];
-}
-#else
-#define Q4NX_ATTN_X86 0
-#endif
-
-static inline float dot_f32(const float* a, const float* b, int n) {
-#if Q4NX_ATTN_X86
-    if (have_avx2_fma()) return dot_avx2(a, b, n);
-#endif
-    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-    int i = 0;
-    for (; i + 4 <= n; i += 4) {
-        s0 += a[i] * b[i];
-        s1 += a[i + 1] * b[i + 1];
-        s2 += a[i + 2] * b[i + 2];
-        s3 += a[i + 3] * b[i + 3];
-    }
-    for (; i < n; i++) s0 += a[i] * b[i];
-    return (s0 + s1) + (s2 + s3);
-}
-
-static inline void saxpy_f32(float p, const float* x, float* y, int n) {
-#if Q4NX_ATTN_X86
-    if (have_avx2_fma()) { saxpy_avx2(p, x, y, n); return; }
-#endif
-#pragma omp simd
-    for (int i = 0; i < n; i++) y[i] += p * x[i];
 }
 
 // A tensor's data as n bf16 values, or null when the tensor holds fewer than n
@@ -4820,7 +4747,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
             for (int t = 0; t < T; t++) {
                 if (t < t0) { score[t] = -1e30f; continue; }
                 const float* kt = &kcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-                score[t] = dot_f32(qh, kt, HD) * scale;
+                score[t] = q4nx_attn::dot(qh, kt, HD) * scale;
                 if (score[t] > mx) mx = score[t];
             }
             float sum = 0.0f;
@@ -4834,7 +4761,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
             for (int t = t0; t < T; t++) {
                 const float p = score[t] * inv;
                 const float* vt = &vcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-                saxpy_f32(p, vt, out, HD);
+                q4nx_attn::saxpy(p, vt, out, HD);
             }
         }
     }

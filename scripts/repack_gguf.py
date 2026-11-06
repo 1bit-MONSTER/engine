@@ -19,9 +19,10 @@
 # model-generic forward reads. The converter emits only model.q4nx +
 # tokenizer.json; config.json is derived here from the GGUF metadata.
 #
-# Usage: python3 repack_gguf.py <model.gguf> <output_dir> [converter_dir]
+# Usage: python3 repack_gguf.py <model.gguf> <output_dir> [converter_dir] [--skip-verify]
 #        python3 repack_gguf.py --check-stamp <dir>      (converter still current?)
-#        python3 repack_gguf.py --tile-check <dir> <model.gguf>   (is this dir's tile order ours?)
+#        python3 repack_gguf.py --verify-source <dir> <model.gguf>  (does this dir decode to its GGUF?)
+#        python3 repack_gguf.py --tile-check <dir> <model.gguf>     (the same check under its old name)
 import json
 import os
 import re
@@ -89,12 +90,20 @@ def tile_check_exit(rc, line):
     return 2 if order == "unverified" else 0
 
 
-def tile_order_check(gguf, out_dir):
-    """(rc, line) from the same verdict `tools/q4nx_diff.py decode --layout both` prints.
+def verify_source(gguf, out_dir):
+    """(rc, line) verifying a converted container against the GGUF it was packed from (engine#1109).
 
-    Imported rather than reimplemented so the repack and the tool an operator runs cannot disagree;
-    the verdict's tolerance and ratio are that file's, and its logic is what tests/q4nx_diff_grid_test.py
-    and `q4nx_diff.py --self-test` already cover.
+    This is the same measurement `tools/q4nx_diff.py decode --layout both` prints, run on the directory
+    the converter just wrote: decode it under each tile layout and compare every comparable tensor with
+    the GGUF's own dequantized weight.  A converter checkout of the wrong VERSION packs the same values
+    permuted inside the 5120-B chunk, decodes as noise at HTTP 200 with nothing in the log, and neither
+    its path nor its commit can tell -- measured corr +0.0325 / max|err| 5.5 against the right checkout's
+    corr +0.9994 / 2.9e-02.  So the repack compares the container with its source instead of trusting
+    the name.  rc 0 one layout matched within the requant tolerance, 1 none did, 2 nothing comparable.
+
+    Imported rather than reimplemented so the repack, `--verify-source`, and the tool an operator runs
+    by hand cannot disagree; the verdict's tolerance, ratio and correlation are that file's, and its
+    logic is what tests/q4nx_diff_grid_test.py and `q4nx_diff.py --self-test` already cover.
     """
     tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "tools")
     sys.path.insert(0, os.path.abspath(tools))
@@ -115,6 +124,26 @@ def tile_order_check(gguf, out_dir):
         except Exception as e:
             return 2, f"tile check unavailable ({e})"
     return _D.verdict(results)
+
+
+# The name `--tile-check` used before the check was named for what it proves: it is not a declaration
+# about tile order, it is the container decoded against its source (engine#1109).  Kept so existing
+# notes and the npu_plan refusal message keep working.
+tile_order_check = verify_source
+
+
+def converter_note(model_dir):
+    """'path @ commit' from a directory's repack stamp, or '' -- who built these tiles.
+
+    Used on the failure path so a refusal names the converter that produced the container, which is
+    the one fact `repack-stamp.txt` has and the user needs (engine#1109).
+    """
+    try:
+        with open(os.path.join(model_dir, "repack-stamp.txt")) as f:
+            fields = dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+    except OSError:
+        return ""
+    return "%s @ %s" % (fields.get("converter_path", "?"), fields.get("converter_commit", "?"))
 
 
 def _field(reader, name):
@@ -284,12 +313,18 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("usage: repack_gguf.py <model.gguf> <output_dir> [converter_dir]")
+    # `--skip-verify` is a flag on the repack form, not a subcommand: the verification decodes the whole
+    # container against the GGUF and costs a GGUF pass, so the tight repack loops the payload builds run
+    # in can opt out (engine#1109).  Opting out is recorded in the stamp as unverified, never as engine-1.
+    skip_verify = "--skip-verify" in sys.argv[1:]
+    argv = [a for a in sys.argv[1:] if a != "--skip-verify"]
+    if len(argv) < 2:
+        print("usage: repack_gguf.py <model.gguf> <output_dir> [converter_dir] [--skip-verify]")
         print("       repack_gguf.py --check-stamp <dir>")
+        print("       repack_gguf.py --verify-source <dir> <model.gguf>")
         print("       repack_gguf.py --tile-check <dir> <model.gguf>")
         return 2
-    gguf, out_dir = sys.argv[1], sys.argv[2]
+    gguf, out_dir = argv[0], argv[1]
     # The Q4NX converter is not vendored in this repo. Resolve it in order:
     # ONEBIT_Q4NX_CONVERTER, the canonical npu-infer/model-generic checkout,
     # a sibling checkout next to the engine, the 1bit-MONSTER checkout that
@@ -321,7 +356,7 @@ def main():
     ]
     default_converter = os.environ.get("ONEBIT_Q4NX_CONVERTER") or next(
         (os.path.abspath(p) for p in candidates if os.path.exists(os.path.join(p, "convert.py"))), "")
-    converter_dir = os.path.abspath(sys.argv[3] if len(sys.argv) > 3 else default_converter)
+    converter_dir = os.path.abspath(argv[2] if len(argv) > 2 else default_converter)
 
     def pick_converter(arch):
         # Prefer a checkout that has a module for THIS arch.  The canonical
@@ -350,16 +385,24 @@ def main():
         except Exception:
             return "(unknown)"
 
-    if sys.argv[1] == "--check-stamp":
-        stamp_path = os.path.join(sys.argv[2], "repack-stamp.txt")
+    if argv[0] == "--check-stamp":
+        stamp_path = os.path.join(argv[1], "repack-stamp.txt")
         if not os.path.exists(stamp_path):
             print(f"stamp: none at {stamp_path} (dir predates the stamp)")
             return 1
         got = dict(l.rstrip("\n").split("=", 1) for l in open(stamp_path) if "=" in l)
+        # A directory the repack REFUSED must never be reused: the refusing path leaves model.q4nx on
+        # disk, so before this a cache hit reported `stamp: current` and served the container the repack
+        # had just rejected -- the wrong-converter container this issue is about, still served after a
+        # guard refused it (engine#1109).  Stale is the answer no matter what the other keys say.
+        if got.get("refused"):
+            print(f"stamp: stale, the repack refused this directory "
+                  f"({got.get('refused')}: {got.get('tile_check', '')})")
+            return 1
         # Re-resolve with the directory's own arch so a dir whose arch needs a
         # different converter keeps comparing against the right one.
         try:
-            _c = json.load(open(os.path.join(sys.argv[2], "config.json")))
+            _c = json.load(open(os.path.join(argv[1], "config.json")))
             _a = _c.get("arch") or _c.get("model_type", "")
         except Exception:
             _a = ""
@@ -378,17 +421,57 @@ def main():
             if got.get(key) != want:
                 print(f"stamp: stale, {key}='{got.get(key)}' != '{want}'")
                 return 1
+        # A stamp that never measured the container against its source is the same defect one step
+        # earlier, and a rebuild is the only way it becomes verified.  `unverified` is "cannot tell"
+        # (2): serve reuses it WITH a warning, and re-checking it would re-run the measurement that
+        # just failed on every start.
+        order = got.get("tile_order")
+        if order is None:
+            print("stamp: stale, no measured tile_order (dir predates the source check)")
+            return 1
+        if order == "unverified":
+            print(f"stamp: WARNING: this container was never verified against its source "
+                  f"({got.get('tile_check', 'no reason recorded')}); reusing it UNVERIFIED")
+            return 2
+        if order != "engine-1":
+            print(f"stamp: stale, tile_order='{order}' is not the order this engine decodes "
+                  f"({got.get('tile_check', '')})")
+            return 1
         print("stamp: current")
         return 0
 
-    # `--tile-check <dir> <model.gguf>`: the same measurement the repack runs, on a directory that
-    # already exists (a published container, a dir from another converter).  Same exit codes as the
-    # repack: 0 the engine-1 order, 1 another order or none, 2 nothing comparable.
-    if sys.argv[1] == "--tile-check":
-        if len(sys.argv) < 4:
+    # `--verify-source <dir> <model.gguf>`: the check the repack runs after the converter returns, on
+    # a directory that already exists -- a published container, one built by another converter, or one
+    # a cache is about to serve (engine#1109).  It decodes the container against the GGUF it was packed
+    # from, under both tile layouts, so a wrong converter checkout reads as a named tensor with its
+    # correlation instead of a 200.  Exit codes: 0 verified in the engine-1 order, 1 another order or
+    # none, 2 nothing comparable.
+    if argv[0] == "--verify-source":
+        if len(argv) < 3:
+            print("usage: repack_gguf.py --verify-source <dir> <model.gguf>")
+            return 2
+        rc, line = verify_source(argv[2], argv[1])
+        exit_rc = tile_check_exit(rc, line)
+        if exit_rc == 0:
+            print(f"verify-source: matches its source in the engine-1 order: {line}")
+            return 0
+        if exit_rc == 2:
+            print(f"verify-source: WARNING: cannot verify the container against {argv[2]}: {line}")
+            return 2
+        print(f"verify-source: FAIL: {line}")
+        print(f"verify-source: {argv[1]} does not decode to {argv[2]}")
+        note = converter_note(argv[1])
+        if note:
+            print(f"verify-source: built by {note}")
+        return 1
+
+    # `--tile-check`: the same check under the name #1110 introduced.  Kept as a separate spelling so
+    # scripts written against its exact output keep working; new callers should say --verify-source.
+    if argv[0] == "--tile-check":
+        if len(argv) < 3:
             print("usage: repack_gguf.py --tile-check <dir> <model.gguf>")
             return 2
-        rc, line = tile_order_check(sys.argv[3], sys.argv[2])
+        rc, line = verify_source(argv[2], argv[1])
         print(line)
         return tile_check_exit(rc, line)
 
@@ -419,7 +502,7 @@ def main():
     if isinstance(_arch, bytes):
         _arch = _arch.decode()
     _arch = str(_arch)
-    if not os.environ.get("ONEBIT_Q4NX_CONVERTER") and len(sys.argv) <= 3:
+    if not os.environ.get("ONEBIT_Q4NX_CONVERTER") and len(argv) <= 2:
         _picked = pick_converter(_arch)
         if _picked and _picked != converter_dir:
             print(f"repack: {_arch} has no module in {converter_dir}; using {_picked}")
@@ -485,14 +568,21 @@ def main():
 
     cfg = write_config(gguf, out_dir, arch, vocab_size)
 
-    # The tile order is measured before the directory is cached, for the same reason the scale scan
-    # below is: a wrong order is silent all the way to a 200 (engine#1110).  Cost is one dequantize of
-    # every comparable tensor per layout -- the same order as the repack itself, paid once per dir
-    # because a cache hit re-checks metadata only (docs/npu.md, "Declared scales are checked").
-    _tile_rc, _tile_line = tile_order_check(gguf, out_dir)
+    # The container is verified against the GGUF it came from before the directory is cached, for the
+    # same reason the scale scan below is: a converter checkout of the wrong version is silent all the
+    # way to a 200 (engine#1109), and only the source can tell (its own commit cannot).  Cost is one
+    # dequantize of every comparable tensor per layout, and `--skip-verify` opts out for the tight
+    # repack loops the payload builds run in; a skipped dir is stamped unverified, never engine-1.
+    # Paid once per dir because a cache hit re-checks metadata only (docs/npu.md, "Declared scales are
+    # checked").
+    if skip_verify:
+        _tile_rc, _tile_line = 2, "skipped (--skip-verify)"
+    else:
+        _tile_rc, _tile_line = verify_source(gguf, out_dir)
     tile_order, _tile_fatal = tile_order_policy(_tile_rc, _tile_line)
     if _tile_fatal:
-        print(f"repack: {_tile_line}")
+        print(f"repack: verify-source FAIL: {_tile_line}")
+        print(f"repack: converter: {converter_dir} @ {converter_commit()}")
         print("repack: the converter wrote q4_1 tiles in an order this engine does not decode -- refusing "
               "the directory.  Point --converter / ONEBIT_Q4NX_CONVERTER at a checkout that writes the "
               "engine-1 order (engine#1110; measured good: FLM_Q4NX_Converter 81be119e).")
@@ -508,9 +598,10 @@ def main():
             f.write("refused=tile order\n")
         return 1
     if tile_order == "unverified":
-        print(f"repack: tile order not verified: {_tile_line}; the stamp records that instead of claiming engine-1")
+        print(f"repack: WARNING: the container could not be verified against its source ({_tile_line}); "
+              f"the stamp records that instead of claiming the engine-1 order")
     else:
-        print(f"repack: tile order engine-1, measured: {_tile_line}")
+        print(f"repack: the container is verified against {gguf}: {_tile_line}")
 
     # Record the provenance the cache-hit gate needs (see --check-stamp above).
     with open(os.path.join(out_dir, "repack-stamp.txt"), "w") as f:

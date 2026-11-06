@@ -921,9 +921,9 @@ architecture the repo's config declares, and does the NPU route already serve th
 registry maps it, but only for a backend that cannot run a Q4NX directory. Both answers come from
 the registry, never from the repo name.
 
-The route serves the families `registry/architectures.json` marks `npu`: `qwen3` on the dense
-fast lane, and `qwen2`, `qwen3moe`, `qwen3_5_moe`, `deepseek2`, `minicpm` and `llama` through the
-GGUF-on-NPU forward ([registry.md](registry.md) has the table). Everything else in the org is an
+The route serves the families `registry/architectures.json` marks `npu`: `qwen3` and `qwen3_5` on
+the dense fast lane, and `qwen2`, `qwen3moe`, `qwen3_5_moe`, `deepseek2`, `minicpm` and `llama`
+through the GGUF-on-NPU forward ([registry.md](registry.md) has the table). Everything else in the org is an
 NPU-route gap, recorded here instead of as a GGUF alias: a class enters the registry only when a
 backend's code accepts it, so mapping an NPU pack to an hrx-only family would advertise a model
 the route refuses at load.
@@ -948,11 +948,12 @@ to one of these repos is a prompt to update this table rather than a namespace e
 The 2026-11-06 census body (engine#1253) read the whole org from a fresh state, so it also printed
 every pack whose family the registry maps for `hrx` only. Those are the `!! NPU FLM` rows: the
 architecture is covered on the CPU route, but a Q4NX directory needs the NPU route and `npu` is
-not in the entry's `backends`. Family by family:
+not in the entry's `backends`. Family by family (`qwen35` has since moved out of that set, because
+engine#587 measured the route on it):
 
 | family (`gguf`) | packs in the 2026-11-06 body | `backends` | NPU route answer |
 |---|---|---|---|
-| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx | not served: the dense qwen35 family has no NPU kernel set; the serving work is tracked in engine#587 (Qwen3.8-27B-NPU2) |
+| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx, npu | **served, and measured** (engine#587): the same `Qwen3.8-27B-NPU2` family runs on the NPU route — int8 Q4NX decodes at 63.1 s/token and takes 145.7 s to a first token (`bench/npu-leaderboard/27b-*.json`, 2026-10-27), a 5-token prefill chunk is 58.14 s, and the ternary sealed-ELF rung on the same container is 1.72 s/token with 3/3 text-identical output (engine#697, closed by #728). What a stock install still needs is a kernel set for the model's geometry — none ships in this repository — so the row read `not served` until the route itself was measured |
 | `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
 | `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |

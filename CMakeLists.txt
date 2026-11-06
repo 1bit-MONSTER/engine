@@ -257,7 +257,8 @@ add_test(NAME mtp_draft COMMAND mtp_draft_test)
 add_dependencies(npu_sampling_test mtp_draft_test)
 # Who may have the NPU (app/npu_device_lock.h, engine#612, docs/npu.md "Two streams on one
 # NPU"): the exclusive default and the shared --npu-streams >= 2 opt-in, on a lock file in a
-# temp dir; header only, no device, runs in CI.
+# temp dir; header only, no device, runs in CI. Since engine#1241 the same test forks a live
+# holder and proves the wait names it after ~2 s and ONEBIT_NPU_LOCK_WAIT_MAX fails fast with it.
 add_executable(npu_device_lock_test tests/npu_device_lock_test.cpp)
 target_include_directories(npu_device_lock_test PRIVATE app)
 add_test(NAME npu_device_lock COMMAND npu_device_lock_test)
@@ -419,7 +420,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp
                             npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
-                            npu/q4nx.cpp npu/tokenizer.cpp)
+                            npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
 
@@ -555,6 +556,10 @@ if(Python3_Interpreter_FOUND)
     # repo that went upstream stays a human decision: the step shipped with an unterminated quote that
     # nothing executed until a pin moved, i.e. until its first scheduled run (engine #1148)
     add_test(NAME workflow_shell COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/workflow_shell_test.py)
+    # engine#1070: every configured test that starts a server holds RESOURCE_LOCK route_ports, so
+    # the list at the end of this file cannot drift away from the tests it protects. Reads the
+    # configured test list (ctest -N --show-only=json-v1); no device, no model, no build products.
+    add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.
@@ -1013,7 +1018,11 @@ if(ONEBIT_NPU)
         npu/forward/include npu/forward/engine-src npu)
     # plan.json (npu/plan/plan.h, engine #799 P1) is read with nlohmann's parser, and the header is
     # part of this library's interface, so the dependency is PUBLIC.
-    target_link_libraries(onebit_npu_forward PUBLIC onebit_npu_rt nlohmann_json::nlohmann_json dl pthread m)
+    # engine#1185: the forward converts an imported q4nx-2 container to the device's 5,120-byte
+    # q4_1 form before model_load (npu/q4nx_device.cpp, onebit_npu), so the host layer is part of
+    # this library's link interface.
+    target_link_libraries(onebit_npu_forward PUBLIC onebit_npu onebit_npu_rt nlohmann_json::nlohmann_json dl
+                                                  pthread m)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
@@ -1084,3 +1093,28 @@ if(ONEBIT_NPU_PRIVATE)
         target_compile_definitions(onebit PRIVATE ONEBIT_NPU_DX_KERNELS_DEFAULT="${ONEBIT_NPU_DX_KERNELS}")
     endif()
 endif()
+
+# ── Loopback ports: route tests run one at a time (engine#1070) ──────────────
+# Every test named below starts a server on 127.0.0.1. Most pick a port by binding :0, closing the
+# socket, then letting the child bind that number; three use fixed 43xxx literals. Under `ctest -j`
+# two such tests can be handed the same port between the close and the child's bind, which surfaces
+# as EADDRINUSE in the child and a JSON decode error on an empty /health body in the parent (pm_route
+# did exactly that on PR #1065, and passed on the same commit's re-run). RESOURCE_LOCK makes the
+# collision impossible rather than unlikely, and serialises nothing else: the rest of the suite stays
+# parallel. A test that starts a server belongs in this list.
+# The scripts' own failure path says which port could not be bound, so a socket leaked by an aborted
+# run is still named when it bites.
+set(_onebit_route_tests
+    smoke_serve watchdog_serve metrics_serve print_backend lemonade_hrx parallel_args recipes_route
+    template_pin greedy_shortcut device_route npu_repack_path pm_route bench_selftest prism_route
+    laya_gguf_route mem_admit_route hrx_cwsr_route hrx_runtime_route hybrid_route
+    hybrid_kvshare_route)
+# Tests that only exist for some configurations (a model was passed, a device is built in).
+list(APPEND _onebit_route_tests hybrid_e2e laya_route_e2e pm_laya_route serve_e2e_cpu serve_e2e_hrx
+     hrx_cpu_weight_parity)
+foreach(_onebit_route_test IN LISTS _onebit_route_tests)
+    if(TEST ${_onebit_route_test})
+        set_tests_properties(${_onebit_route_test} PROPERTIES RESOURCE_LOCK route_ports)
+    endif()
+endforeach()
+

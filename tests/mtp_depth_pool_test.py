@@ -25,7 +25,8 @@ refusals in the tool, so they are tested here with fake tickets instead of only 
 2. the echoed summary a harness prints after its exit line is ignored, so a cell is never counted twice;
 3. a depth with no denominator on either side is reported as unmeasured, never as a +0.00 pp pass;
 4. the numbers the MTP leaderboard records publish (all-chains rates, hit rate, both tokens-per-pass figures) are
-   re-derived from the same fixtures and compared to the record JSON, so a record cannot drift from its evidence.
+   re-derived from the same fixtures and compared to the record JSON, so a record cannot drift from its evidence --
+   and every MTP record in the directory has to be one the guard names, so a new one cannot arrive uncovered.
 
 usage: tests/mtp_depth_pool_test.py        (pure python, no model, no device)
 """
@@ -325,6 +326,15 @@ if all(os.path.exists(p) for p in CL):
         wobbled[first] += 0.01
         check(record_mismatches(wobbled) != [],
               f"the record comparison bites: {first} +0.01 is reported, not accepted")
+        # ... and the guard covers the DIRECTORY, not just the seven ids it happens to name: an MTP record added
+        # later that nobody adds here would look exactly like a covered one, which is how the "one table row per
+        # record" hole was closed for the page (#1213) and how a check ends up reporting success on the records it
+        # was told about rather than the records that exist.
+        on_disk = sorted(f[:-5] for f in os.listdir(RECORDS)
+                         if f.startswith("27b-mtp-") and f.endswith(".json"))
+        check(len(on_disk) >= len(derived), f"the guard's record directory is readable ({len(on_disk)} MTP record(s))")
+        uncovered = [rid for rid in on_disk if rid not in derived]
+        check(not uncovered, f"every MTP record on disk is checked by this guard: uncovered {uncovered}")
 else:
     check(False, "tests/fixtures/mtp_clause55 is incomplete, so the records cannot be re-derived")
 

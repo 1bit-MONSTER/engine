@@ -885,6 +885,39 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
 
+### FastFlowLM's NPU2 drops: the families the route does not serve
+
+The daily census-watch (engine#588) prints one line per new or changed repo in FastFlowLM's HF
+org and answers two questions from `registry/architectures.json`: does a backend accept the
+architecture the repo's config declares, and does the NPU route already serve that family. A
+`!! NEW FLM` row means the registry does not map the class at all; a `!! NPU FLM` row means the
+registry maps it, but only for a backend that cannot run a Q4NX directory. Both answers come from
+the registry, never from the repo name.
+
+The route serves the families `registry/architectures.json` marks `npu`: `qwen3` on the dense
+fast lane, and `qwen2`, `qwen3moe`, `qwen3_5_moe`, `deepseek2`, `minicpm` and `llama` through the
+GGUF-on-NPU forward ([registry.md](registry.md) has the table). Everything else in the org is an
+NPU-route gap, recorded here instead of as a GGUF alias: a class enters the registry only when a
+backend's code accepts it, so mapping an NPU pack to an hrx-only family would advertise a model
+the route refuses at load.
+
+The 2026-11-05 census body (engine#619) asked about these packs. Each row is a recorded answer,
+not a mapping:
+
+| repo (2026-11-05 body) | architecture it declares | `registry/architectures.json` | NPU route |
+|---|---|---|---|
+| `FastFlowLM/MiniCPM-OCR-1.0-NPU2` | `MiniCPMOcrForConditionalGeneration` | none (the pin registers `MiniCPMForCausalLM`, `MiniCPM3` and `MiniCPMV4_6` only) | not served: an OCR/vision tower; the route claims text decoders only |
+| `FastFlowLM/MiniCPM-V-4.7-35B-A3B-NPU2`, `FastFlowLM/MiniCPM-V-4.7-1B-NPU2` | `MiniCPMV4_7ForConditionalGeneration` | none (V4_6's text tower maps through `qwen35`, a VLM wrapper the pin does not register) | not served: a vision-language pack; a converter registration for the text tower plus a vision scope decision come first |
+| `FastFlowLM/Qwen3.8-27B-DFlash2-NPU2` | `DFlash2DraftModel` | none; reviewed not-an-alias (docs/arch-gaps.md, `dflash2`) | not served: a speculative drafter, not a standalone decoder; it needs the reviewed dflash2 support, not a mapping |
+| `FastFlowLM/LFM3-1.7B-NPU2` | `Lfm3ForCausalLM` | none (LFM2 / LFM2-MoE are mapped; LFM3 is not registered at the pin) | not served: no LFM3 model type or kernels in the route |
+| `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | none on 2026-11-05 (no config); `HYV3ForCausalLM` / model_type `hy_v3` by 2026-11-06 | `HYV3ForCausalLM` -> `hy_v3`, hrx only | not served: an hrx-only family; the 2026-11-06 dev-box run prints it as `!! NPU FLM ... npu route: no` |
+| `FastFlowLM/smolvla-NPU2` | none (no config), no `*.q4nx` | none | not a pack: a config-less VLA repo. It prints as `!! NEW FLM` because its config carries no `library_name` for the custom-code rule, but there is no architecture to map and no Q4NX file to serve |
+
+A pack whose family the route should serve needs that family's model type and its kernels in the
+release before a registry entry means anything. Until then the row above is the record: the daily
+report prints a repo only when it is new or changed, so a quiet day is quiet, and the next change
+to one of these repos is a prompt to update this table rather than a namespace error.
+
 ### Sealed kernel sets: the manifest is what says a set is ours
 
 A set ships as `<set>/layout.json`, `<set>/layer1_*/layer1.elf` (each `1BPKCRYP` ciphertext, opened

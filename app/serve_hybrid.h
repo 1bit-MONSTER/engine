@@ -74,6 +74,8 @@ struct Outcome {
     double prefill_ms = 0;      // the provider's own figure when it gave one, else wall time
     double restore_ms = 0;      // file route: the restore; shared route: the adopt
     double share_ms = 0;        // shared route: export + fd handoff, before the provider runs
+    bool decoder_cannot_share = false;  // the export/adopt handshake failed before the provider ran, so the
+                                        // state-file route is still available and correct
     std::string why;            // when not handed over: the reason, for one stderr line
 };
 
@@ -325,7 +327,16 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
                 body["id_slot"] = 0;
                 body["cache_prompt"] = true;
             }
-            return shared;
+            // A decoder that cannot export its cache (a params or model mismatch, or a decoder pinned before
+            // the recurrent-state arm: docs/hybrid.md) leaves the shared route with nothing to hand over.
+            // Falling back to the state file keeps the prompt off the decoder's own prefill path, which is
+            // the whole reason this route exists; only the handshake failures fall back, never a provider
+            // that already wrote into the region or an adopt that failed after it.
+            if (shared.handed_over || !shared.decoder_cannot_share) return shared;
+            std::fprintf(stderr, "1bit serve: hybrid: %s; this decoder cannot share its KV, so the state-file route is used\n",
+                         shared.why.c_str());
+            o = Outcome{};
+            o.n_tokens = ids.size();
         }
         const unsigned n = ++seq_;
         const std::string stem = "hybrid-" + std::to_string(n);
@@ -417,7 +428,7 @@ private:
         // 1. listen, so the decoder has somewhere to hand the fds; 2. it exports and connects
         std::string why;
         const int lfd = kvshare_listen(sockpath.string(), &why);
-        if (lfd < 0) { o.why = "kv share: " + why; return o; }
+        if (lfd < 0) { o.decoder_cannot_share = true; o.why = "kv share: " + why; return o; }
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(600);
         const auto t0 = std::chrono::steady_clock::now();
@@ -427,6 +438,7 @@ private:
             std::error_code ec;
             std::filesystem::remove(tokens, ec);
             std::filesystem::remove(sockpath, ec);
+            o.decoder_cannot_share = true;
             o.why = "share answered " + std::to_string(r ? r->status : -1) + (r ? ": " + r->body.substr(0, 200) : "");
             return o;
         }
@@ -439,6 +451,7 @@ private:
             std::error_code ec;
             std::filesystem::remove(tokens, ec);
             std::filesystem::remove(sockpath, ec);
+            o.decoder_cannot_share = true;
             o.why = "share reply has no share_id";
             return o;
         }
@@ -478,6 +491,26 @@ private:
                                          (run.hard_kill ? " and had to be killed" : " and stopped on SIGTERM")
                                    : "provider exited " + std::to_string(run.code);
             return o;
+        }
+        // The provider's own figure, when it gave one. The adopt below takes ids.size() cells whatever happened, so
+        // this line is the only check that the region holds the whole prompt -- the same cross-check the file route
+        // makes on the state file (engine#941). A provider that wrote fewer rows would otherwise hand the decoder a
+        // prefix it never computed. No JSON line is not an error: on this route, like on the file route, the region is
+        // the result.
+        try {
+            std::string last = run.out;
+            while (!last.empty() && (last.back() == '\n' || last.back() == '\r')) last.pop_back();
+            if (const size_t nl = last.rfind('\n'); nl != std::string::npos) last = last.substr(nl + 1);
+            const json j = json::parse(last);
+            if (j.contains("n_tokens") && j["n_tokens"].is_number_integer() &&
+                    j["n_tokens"].get<size_t>() != ids.size()) {
+                o.why = "provider prefilled " + std::to_string(j["n_tokens"].get<size_t>()) + " of " +
+                        std::to_string(ids.size()) + " tokens into the shared region" + late;
+                return o;
+            }
+            if (j.contains("prefill_ms") && j["prefill_ms"].is_number()) o.prefill_ms = j["prefill_ms"].get<double>();
+        } catch (const std::exception&) {
+            // no JSON line: the region is the result
         }
 
         // 4. the decoder takes the cells over: no file, no copy (llama_kv_cells_adopt)

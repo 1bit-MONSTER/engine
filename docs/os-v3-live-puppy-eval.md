@@ -520,6 +520,11 @@ it, the whole device name typed twice), and `1bit-install` doing the writing.
 base, with our kernel and the `kernel-puppy.fragment`, and keep the Ubuntu Server autoinstall plan in
 [os-v3.md](os-v3.md) as the documented fallback.**
 
+> **Decided, and the fallback is withdrawn** (owner, 2026-11-06: *"puppy and we will offer install packages for
+> distros"*): Puppy is the one base, the installer puts it on the disk as a persistent OS
+> ([os-v3.md](os-v3.md#the-installed-machine-is-a-persistent-os-712)), and other distributions are reached with our
+> install packages, not with a second OS plan. The Ubuntu material stays as history.
+
 The reasons, in the order they decide it:
 
 1. Puppy is the only candidate that answers #706 (a persistent layer on the stick) and #704's needs
@@ -532,8 +537,9 @@ The reasons, in the order they decide it:
 3. The cost is size (1.25 GB medium, 1.3 GB root) and a root-only user model. The size is affordable;
    the root model must be an explicit decision in v3, not a discovery.
 
-**When the fallback wins**: if the kernel rebuild for the fragment turns up a perfopt/driver regression
-that would delay the release, the Ubuntu Server autoinstall plan has no such dependency (its kernel is
+**When the fallback wins** *(withdrawn — see the note above; kept as the record of the trade)*: if the kernel
+rebuild for the fragment turns up a perfopt/driver regression that would delay the release, the Ubuntu Server
+autoinstall plan has no such dependency (its kernel is
 the same one we ship today, and Ubuntu's userland brings sshd, apt, efivarfs, a normal user and
 `unattended-upgrades` for free). The two plans share the seed's *content* (user, keys, disk policy),
 the ESP chain, #709's boot entry and #710's install screen, so switching between them is a change of

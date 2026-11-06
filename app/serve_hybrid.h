@@ -492,6 +492,26 @@ private:
                                    : "provider exited " + std::to_string(run.code);
             return o;
         }
+        // The provider's own figure, when it gave one. The adopt below takes ids.size() cells whatever happened, so
+        // this line is the only check that the region holds the whole prompt -- the same cross-check the file route
+        // makes on the state file (engine#941). A provider that wrote fewer rows would otherwise hand the decoder a
+        // prefix it never computed. No JSON line is not an error: on this route, like on the file route, the region is
+        // the result.
+        try {
+            std::string last = run.out;
+            while (!last.empty() && (last.back() == '\n' || last.back() == '\r')) last.pop_back();
+            if (const size_t nl = last.rfind('\n'); nl != std::string::npos) last = last.substr(nl + 1);
+            const json j = json::parse(last);
+            if (j.contains("n_tokens") && j["n_tokens"].is_number_integer() &&
+                    j["n_tokens"].get<size_t>() != ids.size()) {
+                o.why = "provider prefilled " + std::to_string(j["n_tokens"].get<size_t>()) + " of " +
+                        std::to_string(ids.size()) + " tokens into the shared region" + late;
+                return o;
+            }
+            if (j.contains("prefill_ms") && j["prefill_ms"].is_number()) o.prefill_ms = j["prefill_ms"].get<double>();
+        } catch (const std::exception&) {
+            // no JSON line: the region is the result
+        }
 
         // 4. the decoder takes the cells over: no file, no copy (llama_kv_cells_adopt)
         json adopt = {{"tokens", ids}, {"share_id", share_id}, {"leave_one_token", true}};

@@ -146,6 +146,18 @@ check "the provider's state file was restored (share 0.000 ms, the file route)" 
 check "the decoder was not left to prefill the prompt itself" '! grep -q "the backend prefills this request itself" "$scratch/d.log"'
 stop
 
+# a provider that exits 0 but says it prefilled fewer tokens than it was handed: the region's last row was never
+# written, so the cells must NOT be adopted -- the decoder prefills the prompt itself instead. The file route has
+# carried this cross-check since #941; the shared route adopted on the cell count alone.
+check "serve starts with a provider that claims a short prefill" \
+    'start "$scratch/f.log" ONEBIT_KV_SHARE=1 FAKE_KVSHARE_SHORT=1 ONEBIT_HYBRID_PREFILL="$here/fake_kvshare_provider.py"'
+reply=$(ask)
+check "the reply still comes through" '[[ "$reply" == *Paris* ]]'
+check "a short claim is named" 'grep -q "provider prefilled [0-9]* of [0-9]* tokens into the shared region" "$scratch/f.log"'
+check "no cells were adopted from a short region" '! grep -q "share [0-9.]* ms, first byte" "$scratch/f.log"'
+check "the decoder prefills the prompt itself instead" 'grep -q "the backend prefills this request itself" "$scratch/f.log"'
+stop
+
 # the other side of the same boundary: the export worked and the provider wrote into the region, but the cells
 # cannot be adopted (the real refusal when another sequence holds them). That is not a handshake failure, so the
 # engine's designed behaviour is the plain fallback -- it must NOT re-run the prompt through the state-file route.

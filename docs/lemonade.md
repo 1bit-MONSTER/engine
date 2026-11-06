@@ -16,8 +16,9 @@ limitations under the License.
 -->
 # Lemonade
 
-**The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade)**, and its
-`onebit` recipe passes Lemonade's own LLM test suite on HRX: 31 of 31 tests run, all pass (2 skipped;
+**A Strix Halo machine gets its GPU and NPU paths inside [Lemonade](https://github.com/lemonade-sdk/lemonade) from the
+1bit engine**, which runs there as Lemonade's `onebit` backend; the `onebit` recipe passes Lemonade's own LLM
+test suite on HRX: 31 of 31 tests run, all pass (2 skipped;
 2026-11-05). Lemonade
 is the server users talk to, with its own catalog, downloads, router and UI. For the models it
 serves with 1bit, it runs the engine as a backend, the same way it runs `llama-server`. For a GGUF
@@ -30,6 +31,20 @@ Recovery stays Lemonade's: when a backend hangs, `1bit serve` answers `/health` 
 a request has had no progress for `--watchdog` seconds, kills its backend and exits non-zero
 ([serve.md, "When a backend hangs"](serve.md#when-a-backend-hangs)). Lemonade's BackendWatchdog
 then loads the model again.
+
+## Getting Lemonade with the engine
+
+Two ways, and the rest of this page is what sits under them.
+
+- **The appliance.** [1bit OS](os-v3.md) is Lemonade Server with the engine inside, on a USB stick that
+  boots a Ryzen AI MAX+ 395 with Secure Boot on, and `1bit-install` puts the same system on a disk
+  ([releases.md](releases.md)).
+- **An Ubuntu that already runs Lemonade.** The `lemonade-onebit` package adds the engine as a Lemonade
+  backend and nothing else changes; on Ubuntu 26.04 the engine plugs into the stock `lemond` from
+  Lemonade's own PPA ([below](#ubuntu-2604-the-ppas-lemond)).
+
+Either way, the models Lemonade routes to 1bit are served on the Radeon 8060S iGPU or on the XDNA 2 NPU
+([models.md](models.md), [npu.md](npu.md), [the Strix Halo guide](https://1bit.gg/strix-halo.html)).
 
 ## How it got here
 

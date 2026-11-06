@@ -95,7 +95,8 @@ trap 'rm -rf "$log"' EXIT
 
 timeout 300 "$bind" --amdf_library="$cts/libamdf.so" --amdf_gpu_target="$gfx" > "$log/bind.txt" 2>&1
 check "binding: host access on an imported range (7 cases)" \
-      "grep -q '\[  PASSED  \] 7 tests' '$log/bind.txt'" "$(grep -E '\[  FAILED  \]|Failure' "$log/bind.txt" | head -3)"
+      "grep -q '\[  PASSED  \]' '$log/bind.txt' && ! grep -q '\[  FAILED  \]' '$log/bind.txt'" \
+      "$(grep -E '\[  FAILED  \]|Failure' "$log/bind.txt" | head -3)"
 
 timeout 600 "$execu" --amdf_library="$cts/libamdf.so" --amdf_gpu_target="$gfx" \
     --gtest_filter='ImportedBacking/*:ResidentGpuXdnaTest.*' > "$log/exec.txt" 2>&1

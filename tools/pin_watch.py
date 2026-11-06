@@ -30,14 +30,22 @@ and the files we re-hosted are the old ones. This tool closes that gap (docs/mod
                every changed `.gguf` (the metadata header only, over an HTTP range request) and says
                whether the template changed, because a new revision may not be adopted before that is
                known. --no-template skips that read (the report then says it was not checked).
-  --pr-body R  print the bump PR's body for repo R from the report --check just wrote.
+  --pr-body R  print the bump PR's body for repo R and exit 0. With --from, it comes from the sweep
+               a --check wrote (`--json`); without it the sweep is repeated, one full Hub read per
+               repo. A repo that did not move is a usage error (3), not a body.
   --pin R...   print the pin entry for each repo at its current main (adding a pin, or re-deriving one).
   --bump R     rewrite repo R's entry in --pins to the current main, for the tracked files only; a
                tracked file that vanished upstream is refused rather than dropped silently.
   --out FILE   where --check writes its report (default pin-report.md).
+  --json FILE  with --check: also write the sweep as JSON, which is what --pr-body --from reads.
+  --from FILE  with --pr-body: read the sweep from that JSON instead of re-checking every pin.
   --self-test  run against fixtures, no network.
 
-Exit codes: 0 nothing moved, 1 a pin moved (or --bump refused), 2 usage, 3 --self-test failed.
+Exit codes: 0 nothing moved, 1 a pin moved (or --check found nothing readable), 2 usage,
+3 --self-test failed, 4 --bump needs a human (the repo or a tracked file is gone upstream).
+
+The workflow reads 4 as "skip this repo and say so", and any other non-zero as an unread upstream:
+a bump that did not happen because the Hub was down is not a clean day either.
 """
 from __future__ import annotations
 
@@ -273,6 +281,12 @@ def check(pins: dict, want_template: bool) -> tuple[list[dict], list[str]]:
             now = head(repo)
             at = {e["path"]: e for e in tree(repo, now) if e.get("type") == "file"}
         except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                # not transient and not "gone": the token cannot see it, so nobody checks this pin until a
+                # token that can read the repo is in place (a private or gated repo).
+                notes.append(f"{repo}: the token cannot see this repo ({e.code}) — a private or gated repo "
+                             f"needs a token with access; the pin was not checked")
+                continue
             if e.code == 404:
                 # "the upstream is gone" is the answer, not a failed read: a delete, a rename and a
                 # privatisation all look like this, and none of them may pass as a clean day.
@@ -541,10 +555,30 @@ def self_test() -> int:
             return [v for k, v in trees["new"].items() if k != "tpl.gguf"]
 
         head, tree, commits_since = fake_head_new, fake_tree_missing, fake_commits
-        expect("--bump refuses a vanished file", main(["--bump", "fake/moved", "--pins", path]), 1)
+        expect("--bump refuses a vanished file (a human decides, not an error)",
+               main(["--bump", "fake/moved", "--pins", path]), 4)
         expect("--bump left the pin alone", load(path)["pins"]["fake/moved"]["commit"], "new")
 
         tree = fake_tree
+
+        # one sweep, N PR bodies: the daily step must not re-read 147 repos per repo it opens a PR for
+        import contextlib
+        import io as _io
+        sweep = os.path.join(d, "sweep.json")
+        head, tree, commits_since = fake_head_new, fake_tree, fake_commits
+        expect("--check --json writes the sweep",
+               main(["--check", "--pins", path, "--out", os.path.join(d, "r.md"), "--json", sweep]), 1)
+
+        def no_read(*a, **k):
+            raise AssertionError("--pr-body --from must not read the Hub")
+
+        head, tree = no_read, no_read
+        body = _io.StringIO()
+        with contextlib.redirect_stdout(body):
+            body_rc = main(["--pr-body", "fake/moved", "--from", sweep])
+        expect("--pr-body --from needs no read, and succeeds", body_rc, 0)
+        expect("...and prints that repo's body", "fake/moved" in body.getvalue(), True)
+        head, tree = fake_head_new, fake_tree
         expect("--bump takes an intact pin", main(["--bump", "fake/moved", "--pins", path]), 0)
         expect("--bump moved the commit", load(path)["pins"]["fake/moved"]["commit"], "new")
         expect("--bump took upstream's oid", load(path)["pins"]["fake/moved"]["files"]["tpl.gguf"]["oid"][:4] is not None, True)
@@ -561,11 +595,28 @@ def self_test() -> int:
         gone_md = report(gone_changes, gone_notes, 1, False)
         expect("the report says gone upstream", "Gone upstream" in gone_md, True)
         expect("no all-clear over a 404", "Every pinned upstream repo is at" in gone_md, False)
-        expect("--bump refuses a gone repo", main(["--bump", "fake/gone", "--pins", path]), 1)
+        expect("--bump refuses a gone repo (a human decides, not an error)",
+               main(["--bump", "fake/gone", "--pins", path]), 4)
         expect("the gone pin is untouched", load(path)["pins"]["fake/gone"]["commit"], "new")
 
         # a run that could read nothing is exit 2 (the workflow fails on anything outside 0/1) and its
         # first line counts what it read
+        def fake_head_one_401(repo):
+            if repo == "fake/gone":
+                raise urllib.error.HTTPError("https://huggingface.co/api/models/" + repo, 401, "Unauthorized", {}, None)
+            return "new"
+
+        path401 = os.path.join(d, "pins401.json")
+        save(path401, {"pins": {"fake/moved": dict(stale), "fake/gone": dict(stale)}})
+        head = fake_head_one_401
+        report_401 = os.path.join(d, "unauthorised.md")
+        expect("a 401 on one repo does not hide the other's move",
+               main(["--check", "--pins", path401, "--out", report_401]), 1)
+        unread = open(report_401, encoding="utf-8").read()
+        expect("...it is a permission note, not a clean pin", "the token cannot see this repo (401)" in unread, True)
+        expect("...and the first line counts it", "1 of 2 checked, 1 not checked" in unread.splitlines()[0], True)
+        head = fake_head_new
+
         def fake_head_flaky(repo):
             raise RuntimeError("HTTP Error 429: Too Many Requests")
 
@@ -586,6 +637,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--bump", metavar="REPO")
     ap.add_argument("--pins", default=PINS)
     ap.add_argument("--out", default="pin-report.md")
+    ap.add_argument("--json", metavar="FILE")
+    ap.add_argument("--from", dest="src", metavar="FILE")
     ap.add_argument("--no-template", action="store_true")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
@@ -606,6 +659,20 @@ def main(argv: list[str]) -> int:
         ap.print_help()
         return 2
 
+    if a.pr_body and a.src:
+        # The body for one repo out of a sweep that already happened: the daily step opens N PRs for one
+        # check, and re-checking 147 repos per PR was 78 s of Hub reads each time.
+        try:
+            with open(a.src, encoding="utf-8") as f:
+                swept = json.load(f)["changes"]
+        except (OSError, KeyError, ValueError) as e:
+            sys.exit(f"pin_watch: could not read {a.src}: {e}")
+        hit = next((c for c in swept if c["repo"] == a.pr_body), None)
+        if hit is None:
+            sys.exit(f"pin_watch: {a.pr_body} did not move (see {a.src})")
+        print(pr_body(hit))
+        return 0
+
     doc = load(a.pins)
     if a.bump:
         pin = doc["pins"].get(a.bump) or sys.exit(f"pin_watch: {a.bump} is not pinned")
@@ -616,13 +683,13 @@ def main(argv: list[str]) -> int:
             if e.code == 404:
                 print(f"pin_watch: {a.bump}: gone upstream (404) — a delete, a rename or a privatisation; "
                       f"decide, then edit or drop the pin", file=sys.stderr)
-                return 1
+                return 4
             raise
         missing = [p for p in pin["files"] if p not in at_new]
         if missing:
             print(f"pin_watch: {a.bump}: {len(missing)} tracked file(s) are gone upstream: "
                   + ", ".join(missing) + " — decide, then edit the pin", file=sys.stderr)
-            return 1
+            return 4
         tpls = {p: remote_template(a.bump, now, p) for p in pin["files"]}
         doc["pins"][a.bump] = entry(a.bump, sorted(pin["files"]), pin["used_for"], templates=tpls)
         save(a.pins, doc)
@@ -633,12 +700,17 @@ def main(argv: list[str]) -> int:
     md = report(changes, notes, len(doc["pins"]), not a.no_template)
     with open(a.out, "w", encoding="utf-8") as f:
         f.write(md)
+    if a.json:
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump({"date": datetime.date.today().isoformat(), "pins": len(doc["pins"]),
+                       "changes": changes, "notes": notes}, f, indent=1)
+            f.write("\n")
     if a.pr_body:
         hit = next((c for c in changes if c["repo"] == a.pr_body), None)
         if hit is None:
             sys.exit(f"pin_watch: {a.pr_body} did not move (see {a.out})")
         print(pr_body(hit))
-        return 1
+        return 0
     print(md)
     if notes and len(notes) == len(doc["pins"]):
         # nothing was read: a failed run, not a clean one. The workflow fails on any code outside 0/1.

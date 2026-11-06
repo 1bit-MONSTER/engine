@@ -100,12 +100,19 @@ or a scoreboard row, each of which is its own reviewed change. So:
 `--bump` refuses a pin whose tracked file vanished upstream instead of dropping it: a file that is gone is
 a decision (re-take it under its new name, or drop the pin), not a diff.
 
+A repo the token cannot see (`401`/`403`) is reported as that, not as a clean pin: the daily run absorbs the
+`HF_TOKEN` secret, and a private or gated repo stays unverified until that token can read it. The report's
+first line counts what was read — `145 of 147 checked, 2 not checked` — and the workflow annotates the run
+with it, so "nobody could check this" never looks like "nothing moved".
+
 ## Commands
 
 ```bash
 tools/pin_watch.py --check                  # the daily comparison; writes pin-report.md, exit 0/1/2 (above)
 tools/pin_watch.py --check --no-template    # same, without the template range reads
-tools/pin_watch.py --pr-body REPO           # the bump PR body for one moved repo
+tools/pin_watch.py --check --json sweep.json   # ...and the same sweep as JSON
+tools/pin_watch.py --pr-body REPO --from sweep.json  # that repo's PR body, from that sweep: no second read
+tools/pin_watch.py --pr-body REPO           # without --from it repeats the sweep (one full read per repo)
 tools/pin_watch.py --pin REPO [REPO...]     # print an entry for a repo at its current main (adding a pin)
 tools/pin_watch.py --bump REPO              # rewrite one entry in models/pins.json (a reviewed change)
 tools/pin_watch.py --self-test              # fixtures, no network

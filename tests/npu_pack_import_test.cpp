@@ -1639,6 +1639,37 @@ void test_post_attn_norm_header(const std::string& root) {
 
 // The text artifacts are not universal: AMD's Qwen3 packs ship none (engine#1024), so `info` has to
 // say so before an import and `import` has to say so after it. A pack with them reports the split.
+// The kernel set a container is linked to has to be the family the container declares: the forward
+// looks up `full_i8_<role>_K<k>_N<n>[_b8][_m16].elf` by name, so a b8 container pointed at a row-major
+// set loads, finds no matching name and fails at serve time with "no ELF for K=.. N=..". Refusing at
+// import time is the difference between a named error and a container that looks broken.
+void test_kernel_set_refusal() {
+    const std::vector<std::string> b8 = {"full_i8_QKV_K3072_N9216_b8.elf",
+                                        "full_i8_QKV_K3072_N9216_b8_m16.elf",
+                                        "full_i8_GU_K3072_N16384_b8.elf"};
+    const std::vector<std::string> plain = {"full_i8_QKV_K3072_N9216.elf",
+                                           "full_i8_QKV_K3072_N9216_m16.elf"};
+    const std::vector<std::string> mixed = {"full_i8_QKV_K3072_N9216_b8.elf",
+                                           "full_i8_QKV_K3072_N9216_b8_m16.elf",
+                                           "full_i8_GU_K3072_N16384.elf"};
+    check(pi::kernel_set_refusal(b8, "b8").empty(), "kernels: a b8 set for a b8 container is accepted");
+    check(pi::kernel_set_refusal(plain, "").empty(),
+          "kernels: a row-major set for a container with no layout key is accepted");
+    check(pi::kernel_set_refusal(mixed, "").empty(),
+          "kernels: a set with row-major ELFs is accepted for a row-major container even if it also "
+          "carries b8 twins");
+    check(!pi::kernel_set_refusal(b8, "").empty(),
+          "kernels: a b8 set is refused when the container declares no layout (it needs --weight-layout "
+          "b8)");
+    check(!pi::kernel_set_refusal(plain, "b8").empty(),
+          "kernels: a row-major set is refused for a b8 container");
+    check(!pi::kernel_set_refusal({}, "").empty(), "kernels: an empty directory is refused");
+    check(!pi::kernel_set_refusal({"README.md", "notes.txt"}, "b8").empty(),
+          "kernels: a directory with no full_i8 ELF is refused");
+    check(!pi::kernel_set_refusal({"full_i8_QKV_K3072_N9216_b8.elf.bak"}, "b8").empty(),
+          "kernels: a file that is not an .elf is not a kernel");
+}
+
 void test_text_artifacts(const std::string& root) {
     const fs::path dir = fs::path(root) / "text-artifacts";
     fs::remove_all(dir);
@@ -1765,6 +1796,7 @@ int main(int argc, char** argv) {
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         test_import_fp32_params(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);
+        test_kernel_set_refusal();
         test_weight_layout();
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");

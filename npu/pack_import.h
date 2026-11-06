@@ -139,6 +139,11 @@ struct Options {
     // importer has written before this option existed. "b8" is the one layout a bare flag can
     // express: it needs no version and no sidecar image directory (see weight_layout_key).
     std::string weight_layout;
+    // A kernel set to link into the container as `<out>/npu` (`--kernels`). A model directory carries
+    // its own NPU kernels in `npu/`, and until now filling that in after an import was a hand-made
+    // symlink: the ONE step between `npu-pack import` and `1bit serve -m <dir> --device npu`, done by
+    // whoever read the docs closely enough. Empty means "don't", as every earlier import behaved.
+    std::string kernels;
 };
 
 // Why a layout name cannot be declared by `--weight-layout`, or "" when it can. Only "b8" and the
@@ -146,6 +151,14 @@ struct Options {
 // directory (`q4nx_pb16i_dir`), which an import cannot invent, so offering them here would produce a
 // container that refuses to load.
 std::string weight_layout_refusal(const std::string& want);
+
+// Why a directory cannot be linked in as this container's kernel set, or "" when it can. `layout` is the
+// same value `--weight-layout` took ("b8" or empty), because the container and the kernel set have to
+// agree on the family: a container declaring "b8" needs `_b8` ELFs (the forward looks for exactly those
+// names), and a container with no layout key needs the plain row-major ones. A set of the wrong family
+// links fine and then fails at load with "no ELF for K=.. N=.." -- the kind of error that reads like a
+// broken container, so it is refused here, by name, before anything is written.
+std::string kernel_set_refusal(const std::vector<std::string>& file_names, const std::string& layout);
 
 struct Report {
     std::string out_dir;

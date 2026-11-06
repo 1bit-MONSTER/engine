@@ -185,6 +185,24 @@ fn resume(t: &mut Terminal<CrosstermBackend<std::io::Stdout>>) {
     let _ = t.clear();
 }
 
+/// The exit code for "this terminal cannot be driven at all": no size, raw mode refused, no usable backend. One code for
+/// the class, so `1bit-console`'s line on tty1 (`1bit-console-tui exited (7)`) says which kind of failure it was; the
+/// wrapper runs the dialog menu for ANY non-zero exit, so nothing depends on the value beyond that readability.
+const EXIT_CANNOT_DRIVE: u8 = 7;
+
+/// Why a terminal of this size cannot be drawn on, if it cannot. Pure, so the rule is testable without a tty.
+///
+/// A terminal that reports no size is not a small terminal - it is one that answered nothing (a pty opened without
+/// TIOCSWINSZ, `ssh -tt` fed from a pipe, a serial line). ratatui then paints no cell at all: the screen stays
+/// blank while the console still reads keys, so 5 and 8 look like nothing happened and only `q` does anything.
+/// Measured on an ssh pty with no window size. Refusing is what `1bit-console` already knows how to handle - a
+/// non-zero exit runs the dialog menu and logs the reason - so the person gets a usable screen instead of a black
+/// one. tty1 itself always has a size (240x67 on the reference board).
+fn size_refusal(w: u16, h: u16) -> Option<String> {
+    (w == 0 || h == 0)
+        .then(|| format!("the terminal reports {w}x{h}, so nothing can be drawn on it"))
+}
+
 fn run() -> ExitCode {
     // a panic must leave a usable terminal behind: 1bit-console reads a non-zero exit and shows the dialog menu
     let hook = std::panic::take_hook();
@@ -197,14 +215,29 @@ fn run() -> ExitCode {
         Ok(t) => t,
         Err(e) => {
             eprintln!("1bit-console-tui: this terminal cannot be driven ({e}); the dialog menu is on tty1");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_CANNOT_DRIVE);
         }
     };
+    // ... and a terminal with no size at all is refused for the same reason, before the alternate screen is entered
+    match term.size() {
+        Ok(s) => {
+            if let Some(why) = size_refusal(s.width, s.height) {
+                eprintln!("1bit-console-tui: {why}; the dialog menu is on tty1");
+                return ExitCode::from(EXIT_CANNOT_DRIVE);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "1bit-console-tui: cannot read the terminal size ({e}); the dialog menu is on tty1"
+            );
+            return ExitCode::from(7);
+        }
+    }
     let _ = execute!(stdout(), EnterAlternateScreen, crossterm::cursor::Hide);
     if enable_raw_mode().is_err() {
         let _ = execute!(stdout(), LeaveAlternateScreen);
         eprintln!("1bit-console-tui: raw mode refused; the dialog menu is on tty1");
-        return ExitCode::FAILURE;
+        return ExitCode::from(EXIT_CANNOT_DRIVE);
     }
 
     // the facts are collected off the drawing thread: `llama-server --list-devices` takes seconds, and a screen
@@ -473,7 +506,22 @@ fn handoff(app: &mut App, term: &mut Terminal<CrosstermBackend<std::io::Stdout>>
 
 #[cfg(test)]
 mod tests {
-    use super::{hyperlinks_wanted, paint_failed, parse_size, ssh_session};
+    use super::{hyperlinks_wanted, paint_failed, parse_size, size_refusal, ssh_session};
+
+    #[test]
+    fn a_terminal_with_no_size_is_refused() {
+        // measured: an ssh pty with no window size drew nothing at all, and every key except q looked dead
+        for (w, h) in [(0u16, 0u16), (0, 25), (80, 0), (0, 240)] {
+            assert!(
+                size_refusal(w, h).is_some(),
+                "{w}x{h} must be refused, not drawn blank"
+            );
+        }
+        for (w, h) in [(1u16, 1u16), (80, 25), (240, 67), (132, 43)] {
+            assert!(size_refusal(w, h).is_none(), "{w}x{h} can be drawn on");
+        }
+        assert!(size_refusal(0, 0).unwrap().contains("0x0"));
+    }
 
     #[test]
     fn q_is_the_way_out_only_where_a_prompt_is_harmless() {

@@ -46,7 +46,10 @@ LINE_STYLES = [
       # program as root).
       "*.desktop",
       # cycle 30: udev rules are '#' comments (the NPU keepawake rule is the first one the image ships)
-      "*.rules"), "#"),
+      "*.rules",
+      # engine#1279: the packaging recipes. A PKGBUILD is bash makepkg sources and an rpm spec's
+      # header is '#!' preprocessor lines, so both take '#' comments
+      "*.spec", "PKGBUILD"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 

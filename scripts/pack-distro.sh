@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# pack-distro.sh <format> <root> <out-dir>
+#
+# One prepared payload tree, wrapped in one distribution format. <root> IS the installed tree: every
+# path in it is final (/opt/1bit/engine/1bit lands at /opt/1bit/engine/1bit), so the caller
+# assembles the payload once and every family installs the same bytes at the same paths.
+# mk-plugin-package.sh is the engine's caller; the kernel and driver packages call it the same way
+# (engine #1279, #1280).
+#
+# format: deb | rpm | arch | tarball
+#
+# What each family declares about the package - name, version, dependencies, licence - stays with
+# that family: the .rpm's and the Arch package's from the recipes in packaging/ (this repository's
+# own, so a maintainer of either family reads their file, not this script), the .deb's from the
+# environment, since Debian has no recipe file here.
+#
+# Environment:
+#   PKG_VERSION     the release version                           (required)
+#   PKG_RELEASE     rpm Release / pacman pkgrel                    (default 1)
+#   PKG_RPM_SPEC    default <repo>/packaging/rpm/<PKG_NAME>.spec   (for rpm)
+#   PKG_ARCH_PKGBUILD   default <repo>/packaging/arch/PKGBUILD     (for arch)
+#   and, for deb only:
+#   PKG_NAME, PKG_SUMMARY, PKG_DESC, PKG_MAINTAINER                (required)
+#   PKG_DEB_DEPENDS, PKG_DEB_RECOMMENDS                            (optional, comma separated)
+#
+# The version is normalized to what every family accepts: a leading "v" goes, and anything outside
+# [A-Za-z0-9._] becomes "." (rpm and pacman refuse "-" in a version, and the weekly's rehearsal tags
+# start with "rc-").
+#
+# deb and tarball are built here. rpm and arch are built in containers (fedora:latest,
+# archlinux:latest): rpmbuild and makepkg are the only correct builders for those two formats and the
+# release box has neither, and the image pins what builds them.
+#
+# The produced file's path is the only thing on stdout.
+set -euo pipefail
+
+[ $# -eq 3 ] || { sed -n '16,52p' "$0"; exit 2; }
+fmt=$1 root=$2 out=$3
+repo=$(cd "$(dirname "$0")/.." && pwd)
+
+need() { [ -n "${!1:-}" ] || { echo "pack-distro.sh: $1 is not set ($2)" >&2; exit 2; }; }
+need PKG_VERSION "the release version"
+[ -d "$root" ] || { echo "pack-distro.sh: no payload tree at $root" >&2; exit 2; }
+[ -n "$(ls -A "$root")" ] || { echo "pack-distro.sh: the payload tree at $root is empty" >&2; exit 2; }
+
+ver=$(printf '%s' "${PKG_VERSION#v}" | sed -e 's/[^A-Za-z0-9._]\+/./g' -e 's/^\.*//' -e 's/\.*$//')
+[[ $ver =~ ^[0-9] ]] || {
+    echo "pack-distro.sh: version '$PKG_VERSION' does not start with a digit even normalized ('$ver'); pass the release's version" >&2
+    exit 2; }
+rel=${PKG_RELEASE:-1}
+
+# The payload is a system tree, so its modes are the ones a distribution expects: 0755 directories,
+# 0755 programs, 0644 data. A tree staged under a 002 umask is group-writable, and rpm refuses that
+# outright - /usr/bin at 0775 conflicts with the filesystem package that already owns it (/usr/bin
+# 0755), which is how this was found: `dnf install` on fedora:latest failed on a payload that had
+# installed cleanly as a .deb and a pacman package.
+find "$root" -type d -exec chmod 0755 {} +
+find "$root" -type f -perm -u+x -exec chmod 0755 {} +
+find "$root" -type f ! -perm -u+x -exec chmod 0644 {} +
+
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
+
+# a working directory on the payload's own filesystem (the deb path hardlinks it, and the containers
+# mount it)
+work=$(mktemp -d "$(dirname "$root")/.pack-distro.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+case $fmt in
+deb)
+    need PKG_NAME "the package name"
+    need PKG_SUMMARY "the one-line summary"
+    need PKG_DESC "the description"
+    need PKG_MAINTAINER "the maintainer, \"Name <mail>\""
+    [ ! -e "$root/DEBIAN" ] || { echo "pack-distro.sh: $root already has a DEBIAN directory" >&2; exit 2; }
+    # hardlinked, not copied: DEBIAN/ is the only thing added, to this copy and not to the caller's tree
+    cp -al "$root" "$work/root"
+    size=$(du -sk "$work/root" | cut -f1)
+    mkdir -p "$work/root/DEBIAN"
+    {
+        echo "Package: $PKG_NAME"
+        echo "Version: $ver"
+        echo "Architecture: amd64"
+        echo "Maintainer: $PKG_MAINTAINER"
+        echo "Installed-Size: $size"
+        echo "Section: misc"
+        echo "Priority: optional"
+        if [ -n "${PKG_DEB_DEPENDS:-}" ]; then echo "Depends: ${PKG_DEB_DEPENDS}"; fi
+        if [ -n "${PKG_DEB_RECOMMENDS:-}" ]; then echo "Recommends: ${PKG_DEB_RECOMMENDS}"; fi
+        echo "Description: $PKG_SUMMARY"
+        # Debian continuation lines: one leading space, and a blank line is " ."
+        printf '%s\n' "$PKG_DESC" | sed -e 's/^[[:space:]]*$/./' -e 's/^/ /'
+    } > "$work/root/DEBIAN/control"
+    f="$out/${PKG_NAME}_${ver}_amd64.deb"
+    dpkg-deb --root-owner-group --build "$work/root" "$f" >/dev/null
+    ;;
+tarball)
+    # no wrapper directory, so `tar -C / -xf` puts the payload where it belongs; the name keeps the
+    # name the guide has always used for this route
+    f="$out/${PKG_NAME:-1bit}-${ver}-linux-x86_64.tar.zst"
+    tar -C "$root" -cf - . | zstd -q -T4 -19 -o "$f"
+    ;;
+rpm)
+    need PKG_NAME "the package name"
+    spec=${PKG_RPM_SPEC:-$repo/packaging/rpm/$PKG_NAME.spec}
+    [ -f "$spec" ] || { echo "pack-distro.sh: no spec at $spec" >&2; exit 2; }
+    p="$PKG_NAME-$ver"
+    mkdir -p "$work/$p"
+    cp -a "$root/." "$work/$p/"
+    tar -C "$work" -czf "$work/$p.tar.gz" "$p"
+    # %files -f: every path, directories included (rpm does not read a listed directory as its
+    # contents), built from the payload so it can never list a file the payload does not have - except
+    # the distribution's own skeleton. Its filesystem package owns /usr, /usr/bin, /usr/lib and the
+    # rest of the FHS bases (on Fedora /usr/bin and /usr/lib at 0555), so a package that lists them
+    # claims them at its own mode and rpm refuses to install it: "file /usr/bin from install of
+    # 1bit-engine conflicts with file from package filesystem". What is left is what the payload
+    # really creates.
+    skeleton='^(/usr|/usr/bin|/usr/sbin|/usr/lib|/usr/lib64|/usr/libexec|/usr/include|/usr/share|/usr/share/doc|/usr/share/man|/usr/local|/etc|/var|/var/lib|/opt|/run|/srv|/media|/mnt)$'
+    (cd "$work/$p" && find . -mindepth 1 | sed -e 's,^\./,/,' | LC_ALL=C sort | { grep -Ev "$skeleton" || true; }) > "$work/files.list"
+    [ -s "$work/files.list" ] || { echo "pack-distro.sh: the payload's file list came out empty" >&2; exit 1; }
+    cp "$spec" "$work/"
+    command -v docker >/dev/null ||
+        { echo "pack-distro.sh: the .rpm is built with rpmbuild in a fedora container: no docker on PATH" >&2; exit 3; }
+    # a script in the bind mount rather than a one-liner: it is what ran, and it is readable when it fails
+    cat > "$work/in-container.sh" <<'SH'
+set -euo pipefail
+# rpmbuild writes as root in here; hand the tree back so the caller can read its output and clean up
+trap 'chown -R "$HOSTUID:$HOSTGID" /build' EXIT
+command -v rpmbuild >/dev/null || dnf -y -q install rpm-build >/dev/null
+rpmbuild -bb --define "_topdir /build/rpmbuild" --define "_sourcedir /build" \
+    --define "ver $VER" --define "rel $REL" --define "chlogdate $CHLOGDATE" "/build/$SPEC"
+SH
+    docker run --rm -v "$work:/build" -w /build -e HOSTUID="$(id -u)" -e HOSTGID="$(id -g)" \
+        -e VER="$ver" -e REL="$rel" -e SPEC="$(basename "$spec")" \
+        -e CHLOGDATE="$(LC_ALL=C date '+%a %b %d %Y')" \
+        fedora:latest bash /build/in-container.sh > "$work/rpmbuild.log" 2>&1 ||
+        { tail -30 "$work/rpmbuild.log" >&2; exit 1; }
+    built=$(find "$work/rpmbuild/RPMS" -name '*.rpm' -type f | head -1)
+    [ -n "$built" ] || { echo "pack-distro.sh: rpmbuild produced no package" >&2; exit 1; }
+    f="$out/$(basename "$built")"
+    cp "$built" "$f"
+    ;;
+arch)
+    pkgbuild=${PKG_ARCH_PKGBUILD:-$repo/packaging/arch/PKGBUILD}
+    [ -f "$pkgbuild" ] || { echo "pack-distro.sh: no PKGBUILD at $pkgbuild" >&2; exit 2; }
+    mkdir -p "$work/payload"
+    cp -a "$root/." "$work/payload/"
+    cp "$pkgbuild" "$work/PKGBUILD"
+    command -v docker >/dev/null ||
+        { echo "pack-distro.sh: the Arch package is built with makepkg in an archlinux container: no docker on PATH" >&2; exit 3; }
+    cat > "$work/in-container.sh" <<'SH'
+set -euo pipefail
+# makepkg builds as an unprivileged user (it refuses root) and fakeroot gives the payload its root
+# ownership; the trap hands the tree back to the caller either way
+trap 'chown -R "$HOSTUID:$HOSTGID" /build' EXIT
+if ! command -v makepkg >/dev/null || ! command -v fakeroot >/dev/null || ! command -v zstd >/dev/null; then
+    pacman -Sy --noconfirm --needed base-devel zstd >/dev/null
+fi
+id -u builder >/dev/null 2>&1 || useradd -m builder
+chown -R builder /build
+su builder -c 'cd /build && makepkg -f --nodeps --noconfirm'
+SH
+    docker run --rm -v "$work:/build" -w /build -e HOSTUID="$(id -u)" -e HOSTGID="$(id -g)" \
+        -e PKGVER="$ver" -e PKGREL="$rel" \
+        archlinux:latest bash /build/in-container.sh > "$work/makepkg.log" 2>&1 ||
+        { tail -30 "$work/makepkg.log" >&2; exit 1; }
+    built=$(find "$work" -maxdepth 1 -name '*.pkg.tar.zst' -type f | head -1)
+    [ -n "$built" ] || { echo "pack-distro.sh: makepkg produced no package" >&2; exit 1; }
+    f="$out/$(basename "$built")"
+    cp "$built" "$f"
+    ;;
+*)
+    echo "pack-distro.sh: unknown format '$fmt' (deb, rpm, arch or tarball)" >&2
+    exit 2
+    ;;
+esac
+
+echo "$f"

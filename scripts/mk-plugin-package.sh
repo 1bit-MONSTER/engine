@@ -16,8 +16,14 @@
 #
 # mk-plugin-package.sh <1bit-bundle-dir> <out-dir> <version>
 #
-# Packs the engine as a SEPARATE package that plugs into a stock Lemonade (no fork, no patch):
-# <out-dir>/1bit-engine_<version>_amd64.deb and <out-dir>/1bit-engine-<version>-linux-x86_64.tar.zst.
+# Packs the engine as a SEPARATE package that plugs into a stock Lemonade (no fork, no patch), as a
+# native package for every family (scripts/pack-distro.sh), out of ONE payload tree:
+#   <out-dir>/1bit-engine_<version>_amd64.deb            Debian, Ubuntu
+#   <out-dir>/1bit-engine-<version>-1.x86_64.rpm         Fedora, openSUSE Tumbleweed
+#   <out-dir>/1bit-engine-<version>-1-x86_64.pkg.tar.zst Arch Linux
+#   <out-dir>/1bit-engine-<version>-linux-x86_64.tar.zst everything else
+# The four install the same files at the same paths, which is why they are built from the same tree:
+# only the wrapping differs.
 #
 # <1bit-bundle-dir> is the 1bit/ directory of a Lemonade + onebit package (it carries 1bit, the HRX
 # llama.cpp build with ggml-hrx, and the sealed NPU kernel sets). The package adds the two things a
@@ -151,28 +157,21 @@ verification steps.
 DOC
 cp "$bundle/NOTICE" "$bundle/LICENSE" "$root/usr/share/doc/$pkg/"
 
-size=$(du -sk --exclude=DEBIAN "$root" | cut -f1)
-mkdir -p "$root/DEBIAN"
-cat > "$root/DEBIAN/control" <<CTRL
-Package: $pkg
-Version: $ver
-Architecture: amd64
-Maintainer: bong-water-water-bong <bong-water-water-bong@1bit.gg>
-Installed-Size: $size
-Section: misc
-Priority: optional
-Depends: libc6 (>= 2.35), libstdc++6, libgomp1, libssl3t64 | libssl3, zlib1g, libzstd1, libpcre2-8-0
-Recommends: lemonade-server
-Description: 1bit engine - HRX GPU + sealed NPU kernels, plug-in for stock Lemonade
- The 1bit engine binary, its HRX llama.cpp build with the ggml-hrx backend and the HSA runtime
- library it dlopens, the sealed NPU kernel sets, and a shim that makes a stock Lemonade (its
- llamacpp-hrx recipe) run this engine with no patch and no fork.
- .
- Userspace only: no kernel modules, no Python at runtime.
-CTRL
+# What the .deb declares about the package. The .rpm and the Arch package declare their own in their
+# recipes (packaging/rpm/1bit-engine.spec, packaging/arch/PKGBUILD): the dependency names are each
+# family's, and a maintainer of one family should not have to read this script to find them.
+export PKG_NAME=$pkg PKG_VERSION=$ver
+export PKG_SUMMARY='1bit engine: HRX GPU kernels and the sealed NPU kernel sets, plug-in for stock Lemonade'
+export PKG_DESC="The 1bit engine binary, its HRX llama.cpp build with the ggml-hrx backend and the HSA runtime
+library it dlopens, the sealed NPU kernel sets, and a shim that makes a stock Lemonade (its
+llamacpp-hrx recipe) run this engine with no patch and no fork.
 
-dpkg-deb --root-owner-group --build "$root" "$out/${pkg}_${ver}_amd64.deb" >/dev/null
-tar -C "$root" --exclude=DEBIAN -I 'zstd -19 -T4' -cf "$out/${pkg}-${ver}-linux-x86_64.tar.zst" \
-    opt usr/bin usr/share/1bit usr/share/doc usr/lib/systemd
-echo "$out/${pkg}_${ver}_amd64.deb"
-echo "$out/${pkg}-${ver}-linux-x86_64.tar.zst"
+Userspace only: no kernel modules, no Python at runtime."
+export PKG_MAINTAINER='bong-water-water-bong <bong-water-water-bong@1bit.gg>'
+# The floor is what the payload really has, not a guess: readelf -V on its 1bit reads
+# sqrtf@GLIBC_2.43, so on an older distribution the .deb would install and then refuse to load
+# (docs/install-any-distro.md, "Ubuntu 26.04"). The .rpm gets the same floor from rpm itself.
+export PKG_DEB_DEPENDS='libc6 (>= 2.43), libstdc++6, libgomp1, libssl3t64 | libssl3, zlib1g, libzstd1, libpcre2-8-0'
+export PKG_DEB_RECOMMENDS='lemonade-server'
+
+for fmt in deb rpm arch tarball; do "$(cd "$(dirname "$0")" && pwd)/pack-distro.sh" "$fmt" "$root" "$out"; done

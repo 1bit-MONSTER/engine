@@ -28,9 +28,20 @@ Two packages, from two places:
 | piece | where it comes from | what it is |
 |---|---|---|
 | Lemonade server + CLI | Lemonade's own package (Ubuntu: its PPA, weekly) | `lemonade-server`, `lemond` |
-| the engine | `1bit-engine_<version>_amd64.deb`, or the `.tar.zst` on a non-deb distro | `1bit`, its HRX llama.cpp build (`hrx/llama/bin/llama-server`), the sealed NPU kernel sets, the HSA runtime it dlopens, and the engine's `lemonade-hrx` wrapper, which is what the recipe's `llama-server` name points at |
+| the engine | its own package for your distribution: `.deb` (Debian, Ubuntu), `.rpm` (Fedora, openSUSE Tumbleweed), `.pkg.tar.zst` (Arch), `.tar.zst` (anything else) | `1bit`, its HRX llama.cpp build (`hrx/llama/bin/llama-server`), the sealed NPU kernel sets, the HSA runtime it dlopens, and the engine's `lemonade-hrx` wrapper, which is what the recipe's `llama-server` name points at |
 
-The engine package is userspace only: no kernel module, no Python at runtime.
+The engine package is userspace only: no kernel module, no Python at runtime. The four packages are
+one payload in four wrappings (`scripts/pack-distro.sh`): they install the same files at the same
+paths, so everything below about the drop-in, the config key and the shim is the same on every family,
+and only the install command differs.
+
+| your distribution | the engine |
+|---|---|
+| Debian, Ubuntu 26.04 or newer | `sudo apt-get install -y ./1bit-engine_<version>_amd64.deb` ([walkthrough below](#ubuntu-2604-resolute)) |
+| Fedora (the current release) | `sudo dnf install ./1bit-engine-<version>-1.x86_64.rpm` |
+| openSUSE Tumbleweed | `sudo zypper install ./1bit-engine-<version>-1.x86_64.rpm` (unsigned local file: [below](#fedora-and-opensuse-tumbleweed)) |
+| Arch Linux | `sudo pacman -U 1bit-engine-<version>-1-x86_64.pkg.tar.zst` |
+| anything else | the `.tar.zst`, [below](#any-other-distribution) |
 
 One indirection carries the whole contract, and it matters: Lemonade's recipe hands a backend exactly one
 environment variable (`GGML_DISABLE_VULKAN=1`), so pointing `hrx_bin` at the engine's raw `llama-server`
@@ -44,11 +55,14 @@ slot).
 
 **The engine package needs glibc 2.43, so it is a 26.04-or-newer package.** Measured on the shipping
 package (`readelf -V` on the extracted `1bit`, 2026-11-05): its highest requirement is
-`GLIBC_2.43`, and it is **one symbol** — `sqrtf@GLIBC_2.43`. On Ubuntu 24.04 (noble, glibc 2.39) the
-deb installs and `ldd` is happy, and then the binary refuses to load with
+`GLIBC_2.43`, and it is **one symbol** — `sqrtf@GLIBC_2.43`. The package declares that floor
+(`Depends: libc6 (>= 2.43)`), so on Ubuntu 24.04 (noble, glibc 2.39) apt refuses it outright:
+`1bit-engine : Depends: libc6 (>= 2.43) but 2.39-0ubuntu8.9 is to be installed`. Before that floor
+was declared, the deb installed, `ldd` was happy, and the binary then refused to load with
 `version 'GLIBC_2.43' not found`. Lemonade's own PPA does publish noble builds, so the engine half is
 the one that pins the distribution: on noble, build `1bit` from source, or run it on a 26.04 box.
-The tarball below carries the same binary and therefore the same floor.
+The `.rpm` says the same thing as `libc.so.6(GLIBC_2.43)` and the Arch package as `glibc>=2.43`; the
+tarball carries the same binary and the same floor and is the one route that cannot refuse.
 
 ```bash
 # 1. Lemonade's own package. The archive is signed by key
@@ -100,21 +114,68 @@ Then one real chat per device is in "Verify" below.
 Nothing to do: the appliance already ships the engine and Lemonade. This page is the recipe for
 everything else, and the appliance's own check is `1bit-release-check` / `puppy-check`.
 
-## Other distributions
+## Fedora and openSUSE Tumbleweed
 
-Same floor as above: the tarball carries the same `1bit`, so the distribution needs glibc 2.43 or
-newer as well (measured: one symbol, `sqrtf@GLIBC_2.43`). Unpack it at `/opt/1bit/engine` and install
+One `.rpm` for both families, built without a distribution tag:
+
+```bash
+sudo dnf install ./1bit-engine-<version>-1.x86_64.rpm         # Fedora
+sudo zypper install ./1bit-engine-<version>-1.x86_64.rpm      # openSUSE Tumbleweed
+```
+
+The recipe (`packaging/rpm/1bit-engine.spec`) declares no dependencies: rpm reads the ELF files the
+package ships and requires the sonames that come from outside it (`libcrypto.so.3`, `libgomp.so.1`,
+`libzstd.so.1`, `libpcre2-8.so.0`, `libstdc++.so.6`), which dnf resolves to `openssl-libs`, `libgomp`,
+`libzstd`, `pcre2` and `libstdc++`, and zypper to the same packages under their own names. That also
+encodes the floor above as `libc.so.6(GLIBC_2.43)`, so on an older release the install is refused
+with `nothing provides libc.so.6(GLIBC_2.43)` instead of succeeding and then failing to load.
+
+zypper prints `Package header is not signed!` for the local file — the release signs assets with
+`SHA256SUMS`, not with an RPM key — so in a script pass `--allow-unsigned-rpm`, after
+`sha256sum -c SHA256SUMS --ignore-missing`.
+
+## Arch Linux
+
+```bash
+sudo pacman -U 1bit-engine-<version>-1-x86_64.pkg.tar.zst
+```
+
+Built from `packaging/arch/PKGBUILD` in this repository (an AUR entry can come later), with the
+family's own dependency names: `glibc>=2.43`, `gcc-libs` (which carries `libstdc++`, `libgcc_s` and
+`libgomp`), `openssl`, `zstd`, `pcre2`.
+## Any other distribution
+
+The same floor as above: the tarball carries the same `1bit`, so the distribution needs glibc 2.43 or
+newer as well (measured: one symbol, `sqrtf@GLIBC_2.43`); the native packages say so and refuse to
+install below it, and the tarball cannot. Unpack it at `/opt/1bit/engine` and install
 Lemonade your distro's way (its `.deb`/`.rpm`, its container, or a source build — anything that reports
 `llamacpp-hrx` in `system-info`):
 
 ```bash
-sudo tar -C / --zstd -xf 1bit-engine-<version>-linux-x86_64.tar.zst opt
+sudo tar -C / --zstd -xf 1bit-engine-<version>-linux-x86_64.tar.zst
 sudo ln -sf /opt/1bit/engine/1bit /usr/local/bin/1bit-engine
 # then the same two lines as above, in whatever runs lemond: the env var, or the config key.
 ```
 
+The tarball's members are `./opt`, `./usr/bin`, `./usr/share/...`, so `-C /` puts every file where the
+.deb and the .rpm put it. A tarball has no post-install, so on a systemd machine copy the drop-in
+in by hand instead (the packaged families install it for you):
+
+```bash
+sudo install -D -m 0644 /dev/stdin /usr/lib/systemd/system/lemond.service.d/10-1bit-engine.conf <<'EOF'
+[Service]
+Environment=LEMONADE_HRX_HRX_BIN=/opt/1bit/engine/lemonade-bin
+EOF
+```
+
 If your Lemonade runs under systemd, the drop-in from the deb applies verbatim; in a container or a
 hand-started `lemond`, export `LEMONADE_HRX_HRX_BIN=/opt/1bit/engine/lemonade-bin` in its environment.
+
+What every family installs, and where: `/opt/1bit/engine` (the engine, its backends, the sealed NPU
+kernel sets, the HSA runtime) with `/usr/bin/1bit-engine` pointing at it,
+`/usr/lib/systemd/system/lemond.service.d/10-1bit-engine.conf` (the env form),
+`/usr/share/1bit/lemonade-config-fragment.json` (the config-key form) and
+`/usr/share/doc/1bit-engine/` (README and licences).
 
 ## Host prerequisites, per device (measured on the Strix Halo development box)
 
@@ -184,6 +245,9 @@ registry model, since this Lemonade version has no local-file registration):
 
 | claim | where | result |
 |---|---|---|
+| **each family installs, runs and uninstalls** | clean containers, 2026-11-06, from the `rc-2026-11-06-c31` payload: `fedora:latest` (`dnf`, rpm 6.1.0, glibc 2.44), `opensuse/tumbleweed:latest` (`zypper`), `archlinux:latest` (`pacman -U`, pacman 7.1.0), `ubuntu:26.04` (`apt-get`) | all four: install, `1bit-engine --version` prints `1bit 0.0.1`, the shim `/opt/1bit/engine/lemonade-bin/llama-server --version` prints `version: 1 (32559003)` / `built with Clang 24.0.0 for Linux x86_64`, then remove and `/opt/1bit/engine/1bit` is gone. Fedora refused the first build and that was the payload's fault, not dnf's: the package listed `/usr/bin` and `/usr/lib` at 0755 while Fedora's `filesystem` owns them at 0555 (`file /usr/bin from install of 1bit-engine-2026.45-1.x86_64 conflicts with file from package filesystem-3.18-59.fc45.x86_64`); `scripts/pack-distro.sh` now normalises the payload's modes and leaves the distributions' own skeleton out of the file list |
+| **the four packages are one payload** | the `.deb`, `.rpm`, `.pkg.tar.zst` and `.tar.zst` of the same run, unpacked side by side | 80 files each, 60 MB: the sha256 of every file is identical across the four, and so is the mode and symlink target of every path |
+| the glibc floor is enforced, not just documented | clean `ubuntu:24.04` container (glibc 2.39), `apt-get install ./1bit-engine_<version>_amd64.deb` | refused: `1bit-engine : Depends: libc6 (>= 2.43) but 2.39-0ubuntu8.9 is to be installed`. Before the floor was declared, the same deb installed, `ldd` was happy and the binary then failed to load |
 | a stock Lemonade takes a backend binary from `hrx_bin` / `LEMONADE_HRX_HRX_BIN` | extracted PPA deb `2026.44.1~26.04` on the dev box, isolated cache/config | `llamacpp-hrx` backend `installable` → `installed`, both forms, with no fork and no patch |
 | the same recipe, both packages side by side | clean `ubuntu:26.04` container: PPA `lemonade-server` + this `.deb` | `lemond 2026.44.1` starts, `1bit-engine --version` and the shim run; the recipe's backend state is hardware-gated there (`unsupported: Unsupported GPU`), so the end-to-end chat is the hardware row below |
 | the shim is the engine's own wrapper | `1bit/lemonade-hrx` from this repo's package (`scripts/package-linux.sh`) | it runs `1bit serve --print-backend-env` and then `exec`s the engine with serve's environment and defaults; `lemonade-bin/llama-server` is a symlink to it |

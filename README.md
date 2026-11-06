@@ -30,12 +30,40 @@ Boot a USB stick, and the machine serves local LLMs on its GPU and NPU. That is 
 
 ## Get started
 
-1. Download `1bit-os-<version>.img.zst` from the [releases page](https://github.com/1bit-MONSTER/engine/releases).
-2. Write it to a USB stick (8 GB or more).
-3. Boot the machine from the stick. Secure Boot can stay on; the image is signed.
-4. Lemonade comes up with its catalog and web UI. Try it from the live session; to keep it, run `1bit-install <disk> --yes` there and the 1bit appliance is on the disk ([os/v2/README.md](os/v2/README.md#the-live-medium-and-what-an-install-writes)).
+1. Download the 1bit OS image from [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS):
+   `1bit-os-puppy.img.xz` (about 2.2 GB compressed, 9,128,902,656 B written) with the `SHA256SUMS` beside
+   it. The image is served from Hugging Face because a GitHub release asset is capped at 2 GiB; the
+   [releases page](https://github.com/1bit-MONSTER/engine/releases) stays the home of the
+   `lemonade-onebit` package, the release notes and the release `SHA256SUMS`, and links there for the
+   image. The Hugging Face repository is private until v2026.44 is published, so until then that link
+   answers 401; from publication day this step is the download.
+2. Verify it, then write it to a USB stick (16 GB or more):
 
-Already running Lemonade on Ubuntu? The `lemonade-onebit` package from the same releases page adds the engine as a Lemonade backend; nothing else changes ([docs/lemonade.md](docs/lemonade.md)).
+   ```sh
+   sha256sum -c SHA256SUMS --ignore-missing
+   xz -dc 1bit-os-puppy.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
+   ```
+
+   balenaEtcher and Rufus (DD mode) write the `.img.xz` directly.
+3. Boot the machine from the stick. Where our key is already enrolled, Secure Boot can stay on: the chain
+   is a Microsoft-signed shim → our MOK-signed grub → our MOK-signed kernel → our signed modules. A
+   machine that has never trusted our key refuses the kernel, and the certificates are not on the stick,
+   so enroll both public ones from the box that signed the image first — or turn Secure Boot off for now;
+   see [docs/install.md](docs/install.md#6-secure-boot-and-our-mok).
+4. Lemonade comes up with its catalog and web UI. Try it from the live session; to keep it, run
+   `1bit-install <disk> --yes` there and the same system is on the disk. The install options, what each
+   one erases and the Secure Boot notes are [docs/install.md](docs/install.md); connecting a client —
+   `curl`, the web app, the phone app, the OpenAI SDKs — is [docs/clients.md](docs/clients.md).
+
+**1bit OS is a Puppy Linux appliance**: `ResolutePup64`, built with woof-CE on the Ubuntu 26.04
+"resolute" base, with Lemonade Server and this engine embedded in it, running our MOK-signed
+`7.4.0-rc1-1bit` kernel rather than the distribution's. It boots **headless** by default, to a
+console of its own with no X, and a second boot entry, `1bit OS (desktop, JWM)`, starts Puppy's desktop
+on the same system. The userland is an ordinary one - `bash`, `sudo` and `apt` work - and everything that has
+to last (models, Lemonade's config and cache, SSH keys) lives on the `1BIT-DATA` partition
+([os/README.md](os/README.md), [docs/os-v3.md](docs/os-v3.md)).
+
+Already running Lemonade on Ubuntu? The `lemonade-onebit` package from the [releases page](https://github.com/1bit-MONSTER/engine/releases) adds the engine as a Lemonade backend; nothing else changes ([docs/lemonade.md](docs/lemonade.md)).
 
 ## What it is: one model-agnostic binary for the GPU and the NPU
 
@@ -52,6 +80,7 @@ One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face
 | 2026-10-25 | Microsoft BitNet b1.58 (TQ1_0 / TQ2_0) runs fully on HRX ([docs/models.md](docs/models.md)) |
 | 2026-10-30 | The HRX pin carries the DeepSeek-V4.1 port; ONNX Runtime runs in-process with our own execution provider on the NPU; the NPU and the GPU are measured running at the same time ([#672](https://github.com/1bit-MONSTER/engine/pull/672), [#647](https://github.com/1bit-MONSTER/engine/pull/647), [docs/hybrid.md](docs/hybrid.md)) |
 | 2026-11-01 | **v2026.44 is a draft**: candidate 19 is gated in software (1959/1959 kernel ops, NPU 82.03 tok/s, `VMTEST` pass through install and installed-disk boot, `VMTEST-RELEASE` 10 pass / 9 skip / 0 fail) but has **not** been booted or installed on hardware; candidate 20 takes the full gate, hardware boot and install included, before it is published ([docs/releases.md](docs/releases.md)) |
+| 2026-11-02 | **1bit OS becomes a Puppy Linux appliance**: `ResolutePup64` (woof-CE, Ubuntu 26.04 base) with our MOK-signed kernel, Lemonade and the engine embedded, headless by default with a `desktop` boot entry, `apt` and a persistent `1BIT-DATA`; it boots on the board with Secure Boot on ([docs/os-v3.md](docs/os-v3.md), [os/README.md](os/README.md)) |
 
 The release goes out when every item on the release checklist is done ([docs/releases.md](docs/releases.md)); the weekly Lemonade pin moves with Lemonade's releases.
 

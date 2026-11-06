@@ -584,6 +584,10 @@ if(Python3_Interpreter_FOUND)
     # plus the same bytes under the mapped name, which must be compared and refused.  numpy + gguf-py, no model.
     add_test(NAME tile_check_no_shared_tensor
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/tile_check_no_shared_tensor_test.py)
+    # The other half of that gate: the plan's container.tile_order is a measurement read from the repack's
+    # stamp, not a constant -- a plan written for a directory the repack refused would hand the loader the
+    # one value it accepts, undoing that refusal.  Stdlib only: no model, no numpy, no device.
+    add_test(NAME npu_plan_tile_order COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_plan_tile_order_test.py)
     # the t2 chunk kind (docs/npu.md "The t2 chunk kind"): synthetic only, because the real-model
     # leg needs 14 GB of Bonsai-2 images. Run tests/q4nx_t2_test.py without --no-model for the gate.
     add_test(NAME q4nx_t2 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2_test.py --no-model)

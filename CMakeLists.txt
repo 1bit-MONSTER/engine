@@ -588,6 +588,12 @@ if(Python3_Interpreter_FOUND)
     # stamp, not a constant -- a plan written for a directory the repack refused would hand the loader the
     # one value it accepts, undoing that refusal.  Stdlib only: no model, no numpy, no device.
     add_test(NAME npu_plan_tile_order COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_plan_tile_order_test.py)
+    # tools/onebp_import.py (a legacy .1bp package -> this engine's container): the v1 package's index
+    # claims Q4NX for every entry while its norms are raw f32, so both the import and --verify have to
+    # classify by rank and size -- verify reading the index quant reported 141 of 337 "differing" tensors
+    # on a container it had just written.  Synthetic: no gguf, no model.
+    add_test(NAME onebp_import
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/onebp_import_test.py)
     # the t2 chunk kind (docs/npu.md "The t2 chunk kind"): synthetic only, because the real-model
     # leg needs 14 GB of Bonsai-2 images. Run tests/q4nx_t2_test.py without --no-model for the gate.
     add_test(NAME q4nx_t2 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2_test.py --no-model)

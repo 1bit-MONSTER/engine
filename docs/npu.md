@@ -366,6 +366,20 @@ its engine mutex (`app/forward_serve.cpp:258`, `:698`), so one pass is in flight
 N processes sharing the device by flock (`app/npu_device_lock.h`), each counting its own. A caller that
 parallelised the layer loop would need per-pass counters instead.
 
+### From a 1BP package
+
+`tools/onebp_import.py <model.1bp> <out dir> --config <snapshot dir>` imports a legacy `.1bp` package
+(one file: a 256-byte header, a tensor index, the weights). Its 4-bit payload **is** this engine's tile
+layout already — 32 x 256 tiles of 5120 B — so the tiles are copied byte for byte and nothing is
+dequantized or re-quantized; `F16`/`F32` tensors become bf16. `--verify` proves it by comparing every
+byte the container holds against the package's own slice (and against the GGUF behind any tensor that
+came from `--embedding-from`). A v1 package carries no `token_embd`/`lm_head`, so importing one needs
+`--embedding-from <gguf>`; the tool stops rather than write a container that cannot answer. Any tensor
+with no Q4NX mapping is refused **by name** (`no Q4NX name for blk.0.cca_conv_grp.weight`) instead of
+guessed: Zaya1's grouped conv, EDA router and fused `ffn_gate_up_exps` have no op in `npu/forward` yet,
+so a package of that architecture is not importable — see `~/briefs/ZAYA-OPFAMILY-NOTE.md` for the op
+list and its cost.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model

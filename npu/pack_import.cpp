@@ -1245,6 +1245,27 @@ std::string weight_layout_refusal(const std::string& want) {
            "\"b8\" or nothing at all, which is the row-major default)";
 }
 
+std::string kernel_set_refusal(const std::vector<std::string>& file_names, const std::string& layout) {
+    bool any_elf = false, any_b8 = false, any_plain = false;
+    for (const std::string& n : file_names) {
+        if (n.rfind("full_i8_", 0) != 0 || n.size() < 9 || n.compare(n.size() - 4, 4, ".elf") != 0)
+            continue;
+        any_elf = true;
+        if (n.find("_b8") != std::string::npos) any_b8 = true;
+        else any_plain = true;
+    }
+    if (!any_elf)
+        return "no full_i8_*.elf in that directory: a kernel set is the forward's per-shape ELFs, named "
+               "full_i8_<role>_K<k>_N<n>[_b8][_m16].elf, and nothing was found to link in";
+    if (layout == "b8" && !any_b8)
+        return "the container declares q4nx_weight_layout \"b8\" but this set has no _b8 ELF, so the "
+               "forward would look for names that are not there";
+    if (layout != "b8" && !any_plain)
+        return "this set is the _b8 (blocked) family but the container declares no weight layout, so it "
+               "needs `--weight-layout b8` to say so";
+    return "";
+}
+
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
     const Plan p = plan(pack_dir);
     Report r;
@@ -1761,7 +1782,11 @@ int run(int argc, char** argv) {
         "              container's manifest instead of refusing\n"
         "  --weight-layout b8  declare the device weight layout the runtime will use, so the\n"
         "              container needs the _b8 / _b8_m16 kernel family (leaving the key out is\n"
-        "              the row-major default, which is what every earlier container has)\n";
+        "              the row-major default, which is what every earlier container has)\n"
+        "  --kernels <dir>     link a kernel set into the container as <out dir>/npu, which is where\n"
+        "              `1bit serve -m <out dir> --device npu` looks for it, instead of doing that by\n"
+        "              hand; the set's family is checked against --weight-layout before anything is\n"
+        "              written\n";
     if (argc < 1) {
         std::fprintf(stderr, "%s", usage.c_str());
         return 2;
@@ -1771,7 +1796,7 @@ int run(int argc, char** argv) {
         std::printf("%s", usage.c_str());
         return 0;
     }
-    std::string dir, out, layout;
+    std::string dir, out, layout, kernels;
     bool allow = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1779,6 +1804,10 @@ int run(int argc, char** argv) {
             if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
             out = argv[++i];
         } else if (a == "--allow-incomplete") allow = true;
+        else if (a == "--kernels") {
+            if (i + 1 >= argc) throw std::runtime_error("--kernels needs a value");
+            kernels = argv[++i];
+        }
         else if (a == "--weight-layout") {
             if (i + 1 >= argc) throw std::runtime_error("--weight-layout needs a value");
             layout = argv[++i];
@@ -1802,6 +1831,20 @@ int run(int argc, char** argv) {
     }
     if (cmd != "import") throw std::runtime_error("unknown subcommand " + cmd);
     if (out.empty()) throw std::runtime_error("import needs -o <out dir>");
+
+    // Checked before the import runs: a set of the wrong family (or a directory that is not a set at
+    // all) must refuse with nothing written, not leave a container behind that cannot be served.
+    if (!kernels.empty()) {
+        std::vector<std::string> names;
+        std::error_code ec;
+        for (fs::directory_iterator it(kernels, ec), end; !ec && it != end; it.increment(ec))
+            names.push_back(it->path().filename().string());
+        if (ec)
+            throw std::runtime_error("--kernels " + kernels + ": cannot read that directory (" +
+                                     ec.message() + ")");
+        const std::string why = kernel_set_refusal(names, layout == "rm" ? "" : layout);
+        if (!why.empty()) throw std::runtime_error("--kernels " + kernels + ": " + why);
+    }
 
     const Report r = import_pack(dir, out, Options{allow, layout});
     if (!r.refused.empty() && !allow) {
@@ -1856,6 +1899,39 @@ int run(int argc, char** argv) {
     if (!r.fconst_note.empty()) std::printf("  fconst:     %s\n", r.fconst_note.c_str());
     if (!r.refused.empty()) std::printf("  incomplete: %zu tensors, listed in %s/model.q4nx\n",
                                         r.refused.size(), out.c_str());
+    if (!kernels.empty()) {
+        // A model directory carries its own kernels in `npu/`; serve resolves the link, so the
+        // container stays usable from wherever it was written.  An existing `npu/` that is a real
+        // directory is left alone (and named), because deleting someone's kernels to make room for a
+        // link is not an importer's decision.
+        const std::string link = out + "/npu";
+        std::error_code ec;
+        const fs::file_status st = fs::symlink_status(link, ec);
+        size_t n = 0, n_m16 = 0, n_b8 = 0;
+        for (fs::directory_iterator it(kernels, ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string f = it->path().filename().string();
+            if (f.rfind("full_i8_", 0) != 0 || f.size() < 9 || f.compare(f.size() - 4, 4, ".elf") != 0)
+                continue;
+            n++;
+            if (f.find("_m16") != std::string::npos) n_m16++;
+            if (f.find("_b8") != std::string::npos) n_b8++;
+        }
+        if (fs::is_directory(st) && !fs::is_symlink(st)) {
+            std::printf("  kernels:    %s already holds its own kernels; --kernels %s not linked\n",
+                        link.c_str(), kernels.c_str());
+            std::fprintf(stderr,
+                         "WARNING: %s is a real directory, so the imported container keeps it. Remove\n"
+                         "  it and re-run the import if the set at %s is the one it should serve.\n",
+                         link.c_str(), kernels.c_str());
+        } else {
+            fs::remove(link, ec);  // a stale link (or a stray file) is replaced, not merged
+            fs::create_directory_symlink(fs::absolute(kernels), link, ec);
+            if (ec) throw std::runtime_error("cannot link " + link + " -> " + kernels + ": " + ec.message());
+            std::printf("  kernels:    %s -> %s  (%zu full_i8 ELFs: %zu M=16 twins, %zu %s)\n", link.c_str(),
+                        kernels.c_str(), n, n_m16, n_b8,
+                        layout == "b8" ? "of the _b8 family" : "of the row-major family");
+        }
+    }
     const TextArtifacts ta = scan_text_artifacts(dir);
     if (ta.tokenizer) {
         std::printf("  text:       %zu of %zu tokenizer/chat files copied", ta.present.size(),

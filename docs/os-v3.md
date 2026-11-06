@@ -47,15 +47,52 @@ ships with **no API key** - `10lemonade` leaves `LEMONADE_API_KEY` unset and bin
 and console item 1 turns a key on (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62`). **Nothing is
 published**: the next release carries it.
 
-**The Ubuntu Server `autoinstall` plan below is the documented fallback**, and it stays the
-reference for the parts both plans share. It is the fallback for two measured reasons: it has no
-dependency on a kernel rebuild (the Puppy plan needs `os/v3/puppy/kernel-puppy.fragment` built in, and
-that is one kernel gate away), and its userland brings sshd, apt, efivarfs, a normal user and
-`unattended-upgrades` for free, where the Puppy plan adds them as packages and runs as root by model.
-Neither plan is a redesign of the other; switching is a change of medium. Everything from
-[The Ubuntu plan](#the-ubuntu-plan-the-fallback) to the end of the page is that plan.
+**There is no Ubuntu `autoinstall` any more, and no second plan to fall back to** (owner, 2026-11-06: *"puppy and
+we will offer install packages for distros"*). Puppy is the one target, and `1bit-install` puts this same appliance
+on the disk as a persistent OS — [The installed machine](#the-installed-machine-is-a-persistent-os-712). Other
+distributions are reached with our **install packages**, not with this installer
+([install-any-distro.md](install-any-distro.md)). Everything from
+[The Ubuntu plan](#the-ubuntu-plan-history-not-a-target) to the end of the page is kept as the design history it
+is: the package set, the gates and the `os/v3` tree rows there are still the reference for what a full 1bit OS
+carries, but its layout, its `autoinstall` and its upgrade path describe a medium that is not built.
 
-## The Ubuntu plan (the fallback)
+## The installed machine is a persistent OS (#712)
+
+The installer's contract is still one line — `1bit-install /dev/sdX --yes` — and the shape it writes is still the
+stick's: a 512 MB `1BIT-OS` ESP carrying the stick's own shim → grub chain, and one `1BIT-DATA` ext4 taking the rest
+of the disk, holding the frugal install (`/1bit`) and the data contract (`/data`) on the same filesystem. What the
+install adds, and what makes the installed machine an OS instead of the live image, is **two things, both written at
+install time rather than left to a first boot**:
+
+| | live stick | installed disk |
+|---|---|---|
+| the writable root | RAM (`PUPMODE=5`) — the session is thrown away on power-off, which is what a *try it* medium is for | a **save layer** `/1bit/<DISTRO_FILE_PREFIX>save` on `1BIT-DATA` (`PUPMODE=12`) — every write lands on the disk as it is made |
+| the SFS | `pfix=copy`: copied into RAM, so a slow stick is read once | `pfix=nocopy`: mounted from the disk, ~1.4 GB of RAM not spent on a copy of the OS |
+
+The save layer is a save **folder**, which is Puppy's own write-through root: the init finds it by name
+(`find_save_file` looks for `<psubdir>/<DISTRO_FILE_PREFIX>save*`) and `setup_psave` makes `<folder>/upper` the
+overlay's upperdir. Its name therefore comes from the image's own `/etc/DISTRO_SPECS` and not from this page, and
+`1bit-install` **refuses to start** if it cannot read that — a guessed name installs cleanly and then boots with no
+persistence at all. Puppy's own creator does the same two things (`shutdownconfig`'s `save_directory`: `mkdir` plus a
+`.DirIcon`), and a layer with no `/initrd/DISTRO_SPECS` in it is a normal first boot: `rc.update`'s
+`rc_update_force_pm5` pass rebuilds `/etc` from the SFS. A `SAVESPEC` copied from an installed source is removed,
+because it names *that* machine's partition.
+
+Both facts are asserted on the **installed disk's own boots**, not on the installer's log line (`install-probe.sh`):
+`PUPMODE=12`, the root's upperdir under `/1bit/<prefix>save/upper`, no squashfs mount coming from `/mnt/tmpfs`, and
+a write to `/root` that is still there after the guest reboots itself.
+
+What the installed machine still is **not**, and what is therefore still open on #712: a **normal user** — the
+appliance is root-only by model (the console, sshd and the model keys all assume root; `sudo` is in the image and
+has no second account to serve), and there is no OS-level **update path** independent of a cycle (a new appliance
+is a new SFS plus the save layer that survives it, which is what the installed save layer buys; `apt` works and its
+packages land in that layer). Those are the remaining half of the issue, and each is a design decision rather than a
+package install.
+
+## The Ubuntu plan (history, not a target)
+
+*Kept for the measurements and the reasoning, not as a plan: the owner removed this target on 2026-11-06 (see the
+top of the page). Nothing below is built by any cycle.*
 
 This is the design for engine#712. Today one image serves both roles: the live stick and the disk it
 installs to are the same BusyBox initramfs, so the installed machine has no package manager, no users,

@@ -158,6 +158,20 @@ it through HMM, which an imported range cannot satisfy. **Address the exporter's
 patch that removes the invalidation is prepared and not installed (engine#812, and the patch set in
 engine#1134); until the owner authorises loading it, the exporter-mapping route is the only one that executes.
 
+That is also a contract question, and `tests/npu_import_contract.sh` (CTest `npu_import_contract`) is where
+it is checked instead of remembered. The pinned `libamdf` advertises
+`AMDF_EXTERNAL_MEMORY_SUPPORT_FLAG_FOREIGN_API` with device read/write on its import memory profile
+(ordinal 1, `libamdf/src/xdna/umd/drm/memory_profile.c`), i.e. "import a foreign dma-buf and execute on
+it". `libamdf`'s import path takes host access through an amdxdna `mmap` of the import, which is the
+poisoning path in the table above, so on the shipping module that capability is advertised and refused. The
+test reads the advertisement from the pin, measures the behaviour with `libamdf`'s own CTS (GPU export -> NPU
+import -> NPU executes on the imported range, plus registered caller pages as the control), and keys the
+expected pairing on the loaded module's `srcversion` against the fingerprint table in
+`third_party/patches/amdxdna/README.md`. Run it with `ONEBIT_IMPORT_CONTRACT=advertised` for the acceptance
+form: it is red while a module without `0006`/`0007` is loaded, and green when one that carries them is
+(measured 2026-11-06 on `EE1F36A2B9BA294CE11AD80`, the c26 driver: binding 7/7 pass, the array executes
+registered caller pages, and 8 of 8 imported-backing arms fail at `kernel_queue_create`).
+
 The NPU BO to dma-buf direction still does not exist: the export `PRIME_HANDLE_TO_FD` returns ENOENT for the
 handle the runtime produces, so an NPU-owned buffer cannot yet be handed to the GPU. Nothing on the serving
 paths needs that direction today.

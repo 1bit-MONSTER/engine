@@ -715,6 +715,10 @@ add_dependencies(npu_sampling_test npu_plan_test)
 add_test(NAME npu_plan_generate
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_plan_generate_test.py
                  ${CMAKE_SOURCE_DIR}/tools/npu_plan.py)
+# engine #709: the installer's firmware boot-entry rules, exercised with a fake efibootmgr and a fake
+# /sys/class/block, so CI covers selection/rollback without NVRAM. The OVMF install gate
+# (os/mini/vmtest.sh) is the end-to-end row and is run separately.
+add_test(NAME os_mini_efi_boot COMMAND ${CMAKE_SOURCE_DIR}/tests/os_mini_efi_boot_test.sh)
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
 target_link_libraries(npu_full_elf_test PRIVATE onebit_npu)
 add_test(NAME npu_full_elf_md5 COMMAND npu_full_elf_test)
@@ -800,6 +804,15 @@ add_test(NAME npu_padded_grid
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_padded_grid_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}
                  ${CMAKE_SOURCE_DIR}/tests/npu_padded_grid_test.cpp)
+# The MoE container-convention contract (npu/forward/include/moe_container.h, engine#1035): the
+# engine converter's `mlp.experts.*` names + [N][K] per-expert tile grid and HF-shaped config keys,
+# against the FLM-style `*_exps_proj` names + [K][N] grid and llama.cpp-shaped keys. A wrong
+# choice is silent (a missing tensor, or a permuted expert), so the test is a known-answer decode.
+# Self-compiling like the layout contracts, with the shipped chunk decoder, so CI needs no target.
+add_test(NAME npu_moe_container
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_moe_container_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}
+                 ${CMAKE_SOURCE_DIR}/tests/npu_moe_container_test.cpp)
 # The host side of a MoE container: __metadata__.moe, per-expert chunk pointers and the router.
 # Crafted directories at run time, so CI needs no 18 GB model; with two arguments it checks the
 # same code against a real container and a gate.json from tools/moe_expert_chunks.py gate.

@@ -429,6 +429,8 @@ cp "$here/1bit-menu" "$root/bin/1bit-menu"; chmod +x "$root/bin/1bit-menu"
 # the same sfdisk script this build uses for the stick, so an installed disk and a stick are the same
 # layout - so the image carries sfdisk (busybox fdisk is MBR-only and cannot make the GPT the stick has)
 cp "$here/install.sh" "$root/bin/1bit-install"; chmod +x "$root/bin/1bit-install"
+# #709: the boot-entry selection/rollback helper install.sh sources from its own directory
+cp "$here/efi-boot.sh" "$root/bin/efi-boot.sh"; chmod 0644 "$root/bin/efi-boot.sh"
 cp /usr/sbin/sfdisk "$root/bin/sfdisk"; chmod +x "$root/bin/sfdisk"
 copy_libs /usr/sbin/sfdisk
 # and the real mke2fs, for the same reason: busybox's is ext2-only and takes no -t, so the installer's

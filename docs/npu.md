@@ -32,6 +32,31 @@ and decrypts in memory at load (a wrong key fails cleanly, and nothing phones ho
 build and method are not in this repository or in any release. This page covers the public parts:
 the model format, how `1bit serve` runs an NPU model, and how to build.
 
+## What works today
+
+On Linux with the `amdxdna` kernel driver loaded, the engine serves Qwen3-0.6B on the XDNA 2 NPU at
+**88.6 tok/s** in the release gate, and it takes a GGUF directly: `1bit serve -m <model.gguf> --device npu`
+repacks it to the Q4NX directory this page describes and runs six architectures. Everything on the
+NPU is in progress — correctness first, speed next — so the iGPU through [HRX](hrx.md) remains the
+route for anything the NPU does not run, and `--device hybrid` puts one request's prompt on one
+device and its tokens on the other ([hybrid.md](hybrid.md)).
+
+## How to try it
+
+On a machine whose kernel has `amdxdna` (the [1bit OS](os-v3.md) appliance ships one):
+
+```bash
+1bit serve -m <NPU model dir> --device npu --alias npu      # a Q4NX model directory
+1bit serve -m <model.gguf> --device npu --alias npu         # or a GGUF, repacked on load
+```
+
+Then it is the same OpenAI-compatible API as every other route ([serve.md](serve.md)):
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"npu","messages":[{"role":"user","content":"Hello"}]}'
+```
+
 ## A model directory
 
 ```
@@ -1683,3 +1708,27 @@ pinned generator: the tool drops a half-written last line (a killed capture), re
 measurable column instead of printing an empty table, and exits non-zero on a malformed one. The
 `--self-test` builds a synthetic GGUF and capture with hand-computed answers, so the arithmetic is
 gated without a model on disk.
+
+## FAQ
+
+### Does the NPU run every model?
+
+No. It runs the dense Qwen3 family, including GGUF models it repacks to Q4NX on load (six
+architectures), plus the models whose kernel sets ship with the engine. Every other GGUF still runs
+on the iGPU through [HRX](hrx.md), and the models checked on this box are on [models.md](models.md).
+
+### Is the NPU faster than the iGPU?
+
+Not on the models it runs today: the route is correctness-first, speed next, and what it measures is
+on the [NPU leaderboard](npu-leaderboard.md). It is a second device beside the iGPU, not a
+replacement for it.
+
+### Can the GPU and the NPU run at the same time?
+
+Yes. The two were measured running together for forty repetitions with no hang and no corruption,
+and `--device hybrid` splits a single request across them ([hybrid.md](hybrid.md)).
+
+### Do I need a special kernel or driver?
+
+The NPU needs the `amdxdna` kernel driver. The [1bit OS](os-v3.md) appliance ships a kernel built
+with it, and the [Linux kernel](kernel.md) page covers building your own.

@@ -850,7 +850,25 @@ ModelWeights* model_load(const char* path, ModelConfig config) {
     }
     
     LOG_INFO("Found %d tensors in metadata", num_tensors);
-    
+
+    // engine#1185: a container imported from an OGA pack stores its I8 weights as 6,144-byte q4_1f
+    // chunks (fp32 scale/zero) instead of the 5,120-byte q4_1 the kernels here dequantise in-kernel.
+    // Reading one as the other would silently decode scale/zero bytes as codes, so refuse the
+    // container by name rather than load it: it must be repacked with q4nx::as_q4_1() first.
+    for (int i = 0; i < num_tensors; i++) {
+        if (tensors[i].ndim == 2 && tensors[i].shape[1] == 6144 &&
+            strcmp(tensors[i].dtype, "I8") == 0) {
+            LOG_ERROR("model.q4nx is a q4nx-2 container (I8 %s rows are 6,144-byte q4_1f chunks with "
+                      "fp32 parameters, engine#1185); the device path streams 5,120-byte q4_1 -- repack "
+                      "it with q4nx::as_q4_1() first: %s",
+                      tensors[i].name, path);
+            free(tensors);
+            munmap(mw->file_data, mw->file_size);
+            free(mw);
+            return NULL;
+        }
+    }
+
     // Embed tokens
     int idx_emb = find_tensor("model.embed_tokens.weight", tensors, num_tensors);
     // LFM2 names the embedding model.token_embd.weight (everything else it names the

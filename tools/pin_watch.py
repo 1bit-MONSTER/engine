@@ -32,7 +32,7 @@ and the files we re-hosted are the old ones. This tool closes that gap (docs/mod
                known. --no-template skips that read (the report then says it was not checked).
   --pr-body R  print the bump PR's body for repo R and exit 0. With --from, it comes from the sweep
                a --check wrote (`--json`); without it the sweep is repeated, one full Hub read per
-               repo. A repo that did not move is a usage error (3), not a body.
+               repo. A repo that did not move exits 1 with that message: no body exists for it.
   --pin R...   print the pin entry for each repo at its current main (adding a pin, or re-deriving one).
   --bump R     rewrite repo R's entry in --pins to the current main, for the tracked files only; a
                tracked file that vanished upstream is refused rather than dropped silently.
@@ -46,8 +46,9 @@ and the files we re-hosted are the old ones. This tool closes that gap (docs/mod
   --from FILE  with --pr-body: read the sweep from that JSON instead of re-checking every pin.
   --self-test  run against fixtures, no network.
 
-Exit codes: 0 nothing moved, 1 a pin moved (or --check found nothing readable), 2 usage,
-3 --self-test failed, 4 --bump needs a human (the repo or a tracked file is gone upstream).
+Exit codes: 0 nothing moved (or the requested output was printed), 1 a pin moved or the requested
+--pr-body repo did not move, 2 usage or --check could read no pin at all, 3 --self-test failed,
+4 --bump needs a human (the repo or a tracked file is gone upstream).
 
 The workflow reads 4 as "skip this repo and say so", and any other non-zero as an unread upstream:
 a bump that did not happen because the Hub was down is not a clean day either.
@@ -59,6 +60,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -710,6 +712,23 @@ def self_test() -> int:
         expect("a census row is refused as a bump, in those words",
                (rc_unpinned != 0 and "published but not pinned" in msg_unpinned), True)
         expect("a pin that moved still prints its body", body_of("fake/moved"), (0, ""))
+
+        # the header's exit codes are the ones the tool returns at the process level, not only in
+        # main(): a repo that did not move is 1 (the `sys.exit("…")` string branch), not the 3 this
+        # line used to claim, and a bare run is usage (2)
+        import subprocess
+        nomove = os.path.join(d, "sweep-nomove.json")
+        with open(nomove, "w", encoding="utf-8") as f:
+            json.dump({"date": "2026-11-05", "pins": 1, "changes": [], "notes": [],
+                       "published_not_pinned": []}, f)
+        ran = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "pin_watch.py"),
+                              "--pr-body", "fake/still", "--from", nomove],
+                             capture_output=True, text=True)
+        expect("a --pr-body repo that did not move exits 1", ran.returncode, 1)
+        expect("...and says no body exists for it", "did not move" in ran.stderr, True)
+        with contextlib.redirect_stdout(_io.StringIO()):
+            usage_rc = main([])
+        expect("a bare invocation is usage, exit 2", usage_rc, 2)
         head, tree = fake_head_new, fake_tree
 
         # a container/LoRA repo has no `.gguf`: pinning it must still be possible, or the published
@@ -775,6 +794,14 @@ def self_test() -> int:
         unread_md = open(report_path, encoding="utf-8").read()
         expect("the count is in the first line", "0 of 2 checked, 2 not checked" in unread_md.splitlines()[0], True)
         expect("and still no all-clear", "Every pinned upstream repo is at" in unread_md, False)
+    # the exit-code list in this file's header and the table in docs/model-pins.md are read by the same
+    # people in two places, and they disagreed once: the header called a repo that did not move a usage
+    # error (3) where the tool exits 1, and the table stopped at 2. Compared, not proofread.
+    header = " ".join((__doc__ or "").split("Exit codes:", 1)[1].split("\n\n", 1)[0].split())
+    listed = re.findall(r"(?<![-\w.])(\d)(?= )", header)
+    with open(os.path.join(ROOT, "docs", "model-pins.md"), encoding="utf-8") as f:
+        documented = re.findall(r"(?m)^\| (\d) \|", f.read())
+    expect("the header and docs/model-pins.md list the same exit codes", documented, listed)
     return 3 if failures else 0
 
 

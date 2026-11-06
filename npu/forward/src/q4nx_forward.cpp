@@ -42,6 +42,7 @@
 #include "hadamard.h"                // the activation rotation, SIMD path + scalar reference
 #include "attn_math.h"               // attention's score dot + value accumulation, SIMD + portable
 #include "q4nx_dequant.h"
+#include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_pack.h"
 
 #if defined(_OPENMP)
@@ -577,7 +578,20 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     residual_scale_ = read_config_float(cfg_path, "\"residual_scale\"", 1.0f);
     logit_scale_ = read_config_float(cfg_path, "\"logit_scale\"", 1.0f);
     if (logit_scale_ == 0.0f) logit_scale_ = 1.0f;
-    mw_ = model_load(model_path, cfg);
+    // engine#1185: an OGA-imported container stores its I8 weights as 6,144-byte q4_1f chunks
+    // (fp32 scale/zero), which the kernels this forward drives do not read. Load the device form:
+    // every q4_1f tensor repacked through q4nx::as_q4_1() into the Q4NX cache, logged once there.
+    // A directory already in the device's form -- every GGUF-derived container -- is returned
+    // unchanged and nothing is written.
+    std::string load_path(model_path);
+    try {
+        const onebit::npu::q4nx::DeviceForm form = onebit::npu::q4nx::device_form(model_path, std::string());
+        if (form.converted) load_path = form.model;
+    } catch (const std::exception& e) {
+        err_ = std::string("cannot put the imported container in the device's form: ") + e.what();
+        return false;
+    }
+    mw_ = model_load(load_path.c_str(), cfg);
     if (!mw_) { err_ = "model_load failed"; return false; }
     // model_load sized its layer table from the tensors; config.json may not promise more.
     if (cfg.num_layers <= 0 || cfg.num_layers > mw_->config.num_layers) {

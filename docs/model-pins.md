@@ -66,13 +66,15 @@ therefore reconciled on every check: the commit for "did upstream move", and the
 current `main` and writes a Markdown report. It exits non-zero when anything moved, so the run is visible
 even if the PR is not opened.
 
-There are three outcomes, and the exit code keeps them apart:
+The exit code keeps them apart (`tools/pin_watch.py`'s header carries the same five):
 
 | exit | meaning | what the workflow does |
 |---|---|---|
-| 0 | every pin was read and is at the revision we record | nothing |
-| 1 | something moved, or a pinned repo is **gone upstream** (`404` — a delete, a rename and a privatisation look the same) | opens one bump PR per moved repo; a gone repo is reported and refused for bumping, a human decides |
-| 2 | **no pin could be read at all** — a Hub outage or rate-limit is not a quiet day | the job fails |
+| 0 | every pin was read and is at the revision we record — or the requested output (`--pr-body`, `--pin`, `--bump`) was printed | nothing |
+| 1 | something moved, a pinned repo is **gone upstream** (`404` — a delete, a rename and a privatisation look the same), or `--pr-body` was asked for a repo that did not move | opens one bump PR per moved repo; a gone repo is reported and refused for bumping, a human decides |
+| 2 | a usage error, or **no pin could be read at all** — a Hub outage or rate-limit is not a quiet day | the job fails |
+| 3 | `--self-test` failed | nothing: this is CI's code, not the daily run's |
+| 4 | `--bump` needs a human: the repo or a tracked file is gone upstream | skips that repo and says so |
 
 The report's first line counts what was read (`N of M checked, K not checked`), and the all-clear sentence
 only appears when nothing was left unread: a watcher whose "clean" and "could not check" are the same
@@ -108,7 +110,7 @@ with it, so "nobody could check this" never looks like "nothing moved".
 ## Commands
 
 ```bash
-tools/pin_watch.py --check                  # the daily comparison; writes pin-report.md, exit 0/1/2 (above)
+tools/pin_watch.py --check                  # the daily comparison; writes pin-report.md, exit 0/1/2/3/4 (above)
 tools/pin_watch.py --check --orgs A,B       # ...and census our own orgs for a repo nobody pinned
 tools/pin_watch.py --check --no-template    # same, without the template range reads
 tools/pin_watch.py --check --json sweep.json   # ...and the same sweep as JSON

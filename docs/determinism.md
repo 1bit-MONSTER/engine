@@ -276,7 +276,15 @@ on HRX, 2 of 986 nodes off HRX). Disabling the width-1 fused add+norm alone move
 by 0.121 nats — as much as the width switch itself — so these fused kernels each reassociate a sum
 rather than being interchangeable extras. Contrast `cpu`, where one flag (`-DGGML_CPU_REPACK=OFF`)
 removes the width dependence entirely: on `hrx` the reproducible configuration is `--parallel 1`, and
-there is no equivalent env switch.
+there is no equivalent env switch. **That flag is not free, and what it costs is prompt processing,**
+which is where the 4-row block is actually reached: Qwen3-0.6B Q4_K_M, `-t 8`, one build with only
+`libggml-cpu.so` swapped between the two arms, prefill **984 → 612 tok/s (1.61×, −38 %)** over 6 requests
+per arm, interleaved so the box's other tenants load both equally. End to end, measured wall clock, 3 rounds
+each: a 1183-token prompt with a 32-token reply goes **2.10 s → 3.01 s (+43 %)**, while a 23-token chat
+prompt with a 75-token reply is a wash (**0.60 s vs 0.61 s**). Single-stream decode does not pay: 82 vs 85
+tok/s, the two sample ranges overlapping. So it is a switch to reach for when the numbers must be
+reproducible, not a free one, and a long (RAG-sized) prompt is where it shows. Under heavy load the
+absolute times move; the ratio does not — two independently run arms gave 1.607× and 1.618× on prefill.
 
 ### NPU: repeatable, and comparable with two adjustments
 

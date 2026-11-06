@@ -46,8 +46,10 @@ inline std::string gguf_chat_template_sha(const std::string& path) {
 }
 
 // A model directory (a Q4NX / NPU container) has no GGUF at all: its template is the "chat_template"
-// string in the container's tokenizer_config.json, or chat_template.jinja beside it.
-inline std::string container_chat_template_sha(const std::string& dir) {
+// string in the container's tokenizer_config.json, or chat_template.jinja beside it. `source` (when
+// asked for) names which of the two answered, because a 400 and the load line have to say which file
+// the prompt came from.
+inline std::string container_chat_template_text(const std::string& dir, std::string* source = nullptr) {
     auto read = [](const std::string& path) {
         std::ifstream in(path, std::ios::binary);
         return in ? std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()) : std::string();
@@ -62,8 +64,18 @@ inline std::string container_chat_template_sha(const std::string& dir) {
         } catch (const std::exception&) {
             // a container whose tokenizer_config.json does not parse has no readable template
         }
+        if (!tpl.empty()) {
+            if (source) *source = "tokenizer_config.json";
+            return tpl;
+        }
     }
-    if (tpl.empty()) tpl = read(dir + "/chat_template.jinja");
+    tpl = read(dir + "/chat_template.jinja");
+    if (source) *source = tpl.empty() ? "" : "chat_template.jinja";
+    return tpl;
+}
+
+inline std::string container_chat_template_sha(const std::string& dir) {
+    const std::string tpl = container_chat_template_text(dir);
     if (tpl.empty()) return "";
     return sha256_hex(reinterpret_cast<const uint8_t*>(tpl.data()), tpl.size());
 }

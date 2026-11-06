@@ -52,6 +52,13 @@ jobs:
         run: |
           git fetch -q --depth=1 origin "$BASE"
           python3 tools/check_pins.py "$BASE"
+      # engine #963 option 2: the NPU chat route renders the container's own chat template with the pinned
+      # llama.cpp fork's Jinja engine (app/npu_template.h), so the build needs that submodule's sources —
+      # shallow, one checkout, ~180 MB, 8 s, and it is the same commit the release build compiles. Without it
+      # CMake's ONEBIT_JINJA defaults off and `npu_template` would skip, i.e. the renderer would reach a green
+      # build without ever being compiled.
+      - name: The llama.cpp sources the chat-template renderer compiles
+        run: git submodule update --init --depth 1 third_party/llama.cpp
       - name: GGUF -> Q4NX repack, ternary -> Q4_0, MTP draft vocabulary
         run: |
           python3 -m pip install numpy gguf
@@ -90,6 +97,7 @@ jobs:
             laya_encoder_test http_guard_test moe_gguf_index_test laya_bounds_test \
             npu_model_bounds_test npu_forward_loader_test npu_design_grid_test npu_sampling_test \
             npu_flm_head_import_test npu_elf_args_test \
+            npu_template_test npu_chatml_test \
             tokenizer_linear_test hrx_placement_test hrx_cwsr_test hrx_runtime_test npu_device_lock_test -j
       - name: Test
         # One hung test must not hold the job for hours: each test gets 10 minutes.

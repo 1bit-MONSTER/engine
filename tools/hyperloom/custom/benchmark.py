@@ -341,6 +341,23 @@ def build_identity(onebit, bin_dir):
     }
 
 
+def scripts_identity():
+    """Name the workload code that computed the number, inside the artifact itself.
+
+    ``build_identity`` names the engine binary and ``model_identity`` the weights, but nothing named the
+    adapter script that runs the arms -- and this workload is measured from several checkouts of it. Two
+    measured consequences: on 2026-11-05 04:06 an arm ran from the #1034-only ``hl-boxcond`` worktree
+    instead of ``hl-main``, so the result it would have written could not have carried ``drafting`` at
+    all; and on 2026-11-05 20:13 this lane's own arm ran from an unmerged branch to test a field it was
+    adding. In both cases the JSON would have been indistinguishable from a run of ``main``.
+
+    The workload is a single file, so ``sha256`` is the whole code identity. ``sha256_head`` reads up to
+    64 MiB, and this file is ~60 KB, so it is the file's hash and not a prefix.
+    """
+    path = pathlib.Path(__file__).resolve()
+    return {"path": str(path), "sha256": sha256_head(path)}
+
+
 def model_identity(model):
     """Name the model file, with the fingerprint the quality gate itself compares against.
 
@@ -398,6 +415,37 @@ def die_temp_c():
     return None
 
 
+def npu_conditions():
+    """Whether another lane holds the NPU, read from the claim files (device-free).
+
+    Same class as the die temperature: a condition of the score, recorded rather than refused. The
+    fleet's policy for this box (okf policies/strixhalo-thermal-and-gpu-claims.md, 2026-11-05) is that
+    the two engines coexist safely -- the real cross-engine hazard is a shared dma-buf range, not
+    simultaneity -- but a GPU *arm* beside a running NPU *matrix* corrupts both lanes' numbers. This
+    lane's long-context arm was refused 27 times on 2026-11-05 for exactly this and produced no
+    number, and a result that did measure beside an NPU job could not have said so.
+
+    `npu-serve-keeper` is the owner's resident serve: baseline box state, not a job. Every field is
+    null/0/false where the box does not expose it, so an unreadable claim file cannot be read back as
+    a quiet NPU.
+    """
+    home = user_home()
+    holder = None
+    try:
+        lines = (home / "NPU-TOKEN").read_text(encoding="utf-8", errors="replace").splitlines()
+        holder = lines[0].strip() if lines and lines[0].strip() else None
+    except OSError:
+        holder = None
+    queued = 0
+    try:
+        queued = sum(1 for path in (home / "NPU-QUEUE").iterdir() if not path.name.startswith("."))
+    except OSError:
+        queued = 0
+    return {"npu_holder": holder,
+            "npu_job": bool(holder) and not holder.startswith("npu-serve-keeper"),
+            "npu_queued": queued}
+
+
 def box_conditions():
     """The conditions the measurement is running in, device-free (sysfs + /proc).
 
@@ -418,9 +466,11 @@ def box_conditions():
                 break
     except (OSError, ValueError, IndexError):
         available = None
-    return {"tctl_c": die_temp_c(),
-            "gtt_used_gib": gtt_used, "gtt_total_gib": gtt_total,
-            "mem_available_gib": available}
+    conditions = {"tctl_c": die_temp_c(),
+                  "gtt_used_gib": gtt_used, "gtt_total_gib": gtt_total,
+                  "mem_available_gib": available}
+    conditions.update(npu_conditions())
+    return conditions
 
 
 def box_summary(samples):
@@ -437,6 +487,10 @@ def box_summary(samples):
     summary["tctl_c_min"] = min(die) if die else None
     summary["tctl_c_max"] = max(die) if die else None
     summary["tctl_samples"] = len(die)
+    # Same reason as the die's spread: an NPU job can start after the arm is claimed, so the start
+    # snapshot alone does not say whether the number was measured beside one.
+    summary["npu_job_samples"] = sum(1 for s in samples if s.get("npu_job"))
+    summary["npu_samples"] = len(samples)
     return summary
 
 
@@ -761,6 +815,7 @@ def main():
         "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
                           "model": model_ident,
                           "build": build_identity(onebit, bin_dir),
+                          "scripts": scripts_identity(),
                           "device_stack": device_stack(),
                           "drafting": drafting_identity(),
                           "box": box_summary(conditions),

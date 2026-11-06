@@ -261,9 +261,9 @@ its KL against float is the same number (5.6787 nats both; the A8W8 CPU EP's own
 different continuation), and its trace is `qdq runs=1764` (= 196 groups × 9 passes), `host-rows policy=0`,
 `device fallbacks=0`, `device-busy=0` — every fused group went to the array, and nothing was dressed up as one.
 **These are the figures as published then, on a tree before #1047; the same two arms re-measured on the current tree
-are 930.5 against 972.9 ms/token in the device's favour — see "Where a pass actually goes, and the sign on the current
-tree" at the end of this section, which is the number to quote, and which explains the difference rather than
-overwriting it.**
+are 983.4–1000.2 against 1073.6–1088.8 ms/token in the device's favour on a quiet box (and 930.5 against 972.9 at
+load 4.9–6.9 before it) — see "Where a pass actually goes, and the sign on the current tree" at the end of this
+section, which is the number to quote, and which explains the difference rather than overwriting it.**
 The 5-token counter-example is the other half of that claim: same binary, same designs, 8 tokens in 2159 ms
 (3.70 tok/s), trace `host-rows policy=1764` and no device call at all, because a 5-token prompt never reaches 16
 rows.
@@ -371,7 +371,9 @@ back) and `dev_split_other` (the device lock, the kernel lookup and the EP's own
 five named sections do not account for) — so `dev_call_ms` adds up on the face of the line rather than leaving a reader
 to attribute one residue by subtraction. `NPU_C_SYNC_PROF=1` (engine#988) still prints the C-sync counters per call
 if a section needs separating further. These sections are timed only when the knob is on (a plain call pays one branch
-per section), and **no device window has printed them yet** — they appear from the next one on. What a *fix* would
+per section), and they have now printed once: on a quiet box the launch plus its wait is **3.90 of a 4.32 ms call**
+(90 %), the weight pack 0.25, the readback 0.036 and the epilogue 0.12 — the table below. So (1) is where the per-call
+cost is. What a *fix* would
 look like if (1) dominates is one launch covering many projections — a resident weight layout and a pass-level submission, rather
 than the per-projection ELF this leg uses — which is also why the threshold discussion above stands unchanged:
 `kDeviceMinRows` is about one call, and the model-level question is about 196 of them. Worth knowing before anyone
@@ -379,31 +381,60 @@ starts that work: the resident-weight half of it has now been measured and is wo
 sign of the model-level result does **not** turn on the weight path.
 
 **Where a pass actually goes, and the sign on the current tree.** The same two EP arms, two runs each, back to back in
-one `npu-hold` ticket (load 4.9–6.9, identical ids, `fallbacks=0`, `device-busy=0`), with `ONEBIT_EP_QDQ_PROF=1` on
-both:
+one `npu-hold` ticket with `ONEBIT_EP_QDQ_PROF=1` on both — this is the quiet-box repetition the rows above asked for,
+load1 1.3 and 1.6 for the host arm and 3.3 and 2.8 for the device arm (the gate is load1 < 4; the 15-minute average was
+still falling from 9.8, this lane's own build), identical ids, `fallbacks=0`, `device-busy=0`, and all 1764 fused calls
+= 196 groups × 9 passes on the array:
 
 | arm | decode | per pass, from the profile |
 |---|---|---|
-| our EP, **array** | 953.3 / **930.5** ms/token | device calls 802.5 (`dev_call_ms` 7222.2 / 9), epilogue 19.0 (`dev_epi_ms` 171.2 / 9), other 109 |
-| our EP, host kernel | 970.4 / **972.9** ms/token | host loop 879.0 (`host_ms` 7911.2 / 9), other 94 |
+| our EP, **array** | 1000.2 / **983.4** ms/token | device calls 846.5 (`dev_call_ms` 7618.2 / 9), epilogue 23.6 (`dev_epi_ms` 212.1 / 9), other 113.4 |
+| our EP, host kernel | 1073.6 / **1088.8** ms/token | host loop 978.9 (`host_ms` 8810.2 / 9), other 109.9 |
 
-Both arms are fully accounted for (802.5 + 19.0 + 109 = 930.5; 879.0 + 93.9 = 972.9), and "other" — attention, norms,
-softmax, embed, ORT — is 94–109 ms/pass, the part neither leg touches. So on this tree the device arm is **4.4 % ahead**,
-not 1.13× behind as the four-arm table far above reports, and both runs of each arm agree on the sign. The host
-loop's 879 ms/pass also validates the CPU-only estimate of 848 from the section above to within 4 %.
+Both arms are accounted for (846.5 + 23.6 + 113.4 = 983.4; 978.9 + 109.9 = 1088.8), and "other" — attention, norms,
+softmax, embed, ORT — is the part neither leg touches. It is also the noisiest row: 54 and 110 ms/pass on the host's two
+runs, 119 and 113 on the device's, so a one-minute window's non-EP work moves by ~50 ms. That does not weaken the sign —
+the 89 ms gap between the arms' means is larger than the spread on the row that is supposed to be identical — but it is
+why the claim is the mean of two runs and not one. At the load the claim needs the array is
+**8.3 % ahead** (mean of the two runs, 991.8 against 1081.2 ms/token; per call 4.32 against the host loop's 4.99), and the
+32-token prefill is ahead by more, 725.5 / 746.3 ms against 1409.1 / 878.9 — those two host numbers are 60 % apart, so
+prefill is "ahead, magnitude unsettled" rather than a ratio to quote. Two earlier windows reported 1.13–1.16× *behind*
+at load 1.2–1.4 and 4.4 % ahead at load 4.9–6.9; the sign is now measured at the load the claim needs, and its magnitude
+is small in every window.
 
-What differs between those two sessions is **not** the code, as far as the repository can say: since the build those
+**The call's own sections, first printing.** Per call over 1764 calls (run 2), against `dev_call_ms` = 4.32:
+
+| section | ms/call | share |
+|---|---|---|
+| `dev_split_launch` (launch + `wait_kernel`) | **3.90** | 90 % |
+| `dev_split_wpack` (weight pack + upload, a cache miss) | 0.25 | 5.8 % |
+| `dev_split_other` (device lock, kernel lookup, EP frame) | 0.13 | 3 % |
+| `dev_split_readback` (C invalidate + copy back) | 0.036 | 0.8 % |
+| `dev_split_aupload` (A flush) | 0.004 | 0.1 % |
+| `dev_split_async` | 0.004 | 0.1 % |
+
+Read that against the correction this file's history already carries, not as a headline: `launch` + wait **contains the
+kernel's own run time**, so 3.90 is not dispatch overhead waiting to be deleted — the probe prices q at m=36 at 3.460
+ms/call device against 5.836 host, i.e. most of that section *is* the multiply. What the split does establish, by
+subtraction, is that every other thing the leg does per call is **0.42 ms combined (9.8 % of `dev_call_ms`)** — the
+weight path 0.25, `other` 0.13, the readback 0.036, both flushes 0.008 — plus the 0.12 epilogue the device arm pays
+outside it; the weight path figure is corroborated independently (0.24 ms via #1047). Those are not where the
+model-level advantage leaks, and no fix aimed at them can recover more than that. The remaining lever is the shape of the
+submission — 196 per-projection ELF calls per pass — and its dispatch residue is what is left of that section once the
+multiply the probe prices (3.460 ms/call for one shape in the same window) is taken out of the 4.32.
+
+What differs between those sessions is **not** the code, as far as the repository can say: since the build the 1.13×
 figures came from, exactly two commits touch this path — #1032, which adds the profiling that produced the numbers above,
 and #1047, the weight re-pack, 0.24 ms/call = 47 ms/pass (~5 % of a token) — the private NPU runtime the EP links against
-is unchanged (files dated 2026-10-31), and the five design ELFs are byte-identical (md5s). It is not load in the obvious
-direction either: this run was at load 4.9-6.9 against 1.2-1.35 then, and the device arm gets *slower* under load (its
-calls measured 5.65 ms/call at load 11-14 against 4.09 here). So ~5 % of the 13 % is code and **the rest is
-unestablished**: the plausible shape of it is CPU-side contention in the earlier session that a one-minute load average
-did not capture, since half of a device call is host work (BO writes, two syncs, the readback), and the honest reading is
-that those are two sessions under different conditions rather than two builds. The kernel is unchanged either way — the
-probe in this same window still measures q at m=36 at 3.460 ms/call device against 5.836 host, the 1.69x the rows table
-reports. What moved is the model-level per-call cost, and a quiet-box repetition is what this number needs
-before anyone quotes it as the device leg's worth.
+is unchanged (files dated 2026-10-31), and the five design ELFs are byte-identical (md5s). Nor is the tree: the host arm
+of the window above ran at load1 1.3–1.6, the same load as the 1.2–1.4 the loss was taken at, and there the array is
+ahead — so the 1.13× loss does not reproduce at that load, although this window is not an arm-for-arm repeat of it
+(its device arm ran at 2.8–3.3), and what produced it in that session this lane cannot say: its build lived in `/tmp`,
+so it no longer exists to run beside this one. The
+kernel is unchanged either way — the probe in the same window still measures q at m=36 at 3.460 ms/call device against
+5.836 host, the 1.69× the rows table reports. So: the per-call multiply advantage is real, the model-level advantage is
+small and now measured on a quiet box, and the per-call non-multiply work is priced at 0.42 ms (0.54 with the epilogue)
+rather than guessed at.
 
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the
@@ -486,9 +517,14 @@ scales folded into one multiply per element. Per-tensor scales, the two per-axis
 can fold (`s_w[n]` along the weight's output axis, `s_x[m]` along the activation's row axis) and
 **asymmetric zero points** are all supported: `Σ_k (a−zx)(w−zw)` costs the GEMM's own sum plus a
 column sum of the weight (computed once per session), a row sum of the activation, and `K·zx·zw`, and
-the output zero point is added after the round. A per-axis scale or zero point along **K** cannot
+the output zero point is added after the round. A per-axis scale along **K** cannot
 fold — it weights the products inside the sum — so such a graph is refused and stays on the per-node
-path (see [onnx-pack.md](onnx-pack.md#a8w8-qdq-the-shape-quark-emits)). `ctest -R onebit_ep_qdq_proof`
+path (see [onnx-pack.md](onnx-pack.md#a8w8-qdq-the-shape-quark-emits)). A zero point along K is the
+same refusal by a shorter route: ONNX's `DequantizeLinear` requires the zero point and the scale to
+have the same shape, so a 1-D zero point along K only arrives beside a 1-D scale along K, which is the
+term above; and a K-long zero point beside a per-tensor scale is not a graph the CPU EP will run at all
+(`onnx-pack.md` carries the message).
+`ctest -R onebit_ep_qdq_proof`
 checks six cases end to end: per-tensor, per-axis, asymmetric and asymmetric-per-axis all
 int8-identical to the CPU EP (`worst |d| = 0` LSB, also on a 256×1024×1024 case), the per-K scale
 refused and correct anyway, and ~6-7 MB less peak RSS for the run, which is exactly the three float
@@ -544,10 +580,12 @@ is q, k and v). The device backend is still off by default and is not part of an
 enabling it on a box where another process owns the NPU must stay an explicit decision.
 
 The A8W8 QDQ group is claimed as one fused node and proven (`ctest -R onebit_ep_qdq_proof`, exact int8
-match for per-tensor, per-axis and asymmetric zero points, ~6-7 MB less peak RSS per run). One thing
-is still open and stays documented as such: the device leg of the fused path — today its int8 GEMM
-runs on the host, so a real model's shapes are still a CPU-EP story until the NPU kernel takes int8
-activations straight into its input BO.
+match for per-tensor, per-axis and asymmetric zero points, ~6-7 MB less peak RSS per run). The device
+leg of that group is built and measured (`ONEBIT_EP_NPU=ON`, see [onnx-pack.md](onnx-pack.md)): int8
+activations and int8 weights go straight into the kernel's BOs and the int8 output is bit-identical to
+the CPU EP's, so on that build a real model's shapes are the array's question and not the CPU's. A
+default build still runs the same fused group on the host loop — the device backend is off by default,
+which is the decision below, not a gap in the path.
 
 The two-engine order is implemented and exercised with a single library; a *second* EP library was
 not available to try it against (this ORT build ships no ROCM/HIP EP and there is no gfx1201 HIP EP

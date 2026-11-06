@@ -55,6 +55,76 @@ pub enum SecureBoot {
     Unknown,
 }
 
+/// Which system is running: the live stick (everything in RAM, nothing installed) or this machine's own disk.
+///
+/// `init.sh` already decides this at boot - `grep -q " /data " /proc/mounts && [ -e /data/.installed ]` - and
+/// leaves the answer in `/etc/1bit` (`installed` or `live`, touched beside the MODE banner). The console reads those
+/// markers rather than re-deriving the rule, and falls back to the same test when they are absent (a box whose
+/// marker write failed, or a console started by hand). #711 is why the screen says it at all: the owner saw
+/// "live usb is loaded up" while the banner facts came from the NVMe, and the console is the screen a person
+/// looks at all day - after the install it must not still look like a stick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    Live,
+    Installed,
+    #[default]
+    Unknown,
+}
+
+impl Mode {
+    pub fn word(self) -> Option<&'static str> {
+        match self {
+            Mode::Live => Some("LIVE"),
+            Mode::Installed => Some("INSTALLED"),
+            Mode::Unknown => None,
+        }
+    }
+}
+
+/// `mode_in` against the real root. Read-only, and cheap enough for the once-a-second frame.
+pub fn mode() -> Mode {
+    resolve(mode_in(Path::new("/")), data_mounted())
+}
+
+/// Is `/data` the mounted data partition? init.sh's rule is `grep -q " /data " /proc/mounts`, and that half matters on
+/// its own: a boot with /data mounted and no `.installed` on it is LIVE in init's own words.
+fn data_mounted() -> bool {
+    fs::read_to_string("/proc/mounts")
+        .map(|s| {
+            s.lines()
+                .any(|l| l.split_whitespace().nth(1) == Some("/data"))
+        })
+        .unwrap_or(false)
+}
+
+/// init's ELSE branch. When no marker exists (an init that could not write one, or a console started by hand on the
+/// appliance), the header said nothing while init's banner would have said LIVE - measured: the `(none)` row of the
+/// marker matrix, where the menu said live and the header was silent. With /data mounted and no `.installed`, LIVE is
+/// the faithful answer; with /data not mounted the box cannot say, and still says nothing.
+fn resolve(seen: Mode, data_mounted: bool) -> Mode {
+    match seen {
+        Mode::Unknown if data_mounted => Mode::Live,
+        m => m,
+    }
+}
+
+pub fn mode_in(root: &Path) -> Mode {
+    let bit = |p: &str| root.join(p).exists();
+    // init's OWN rule first, because that is the decision: /data mounted with .installed on it is an installed boot,
+    // and the markers below are written FROM that decision. Marker-first ordering let a stale `live` marker outrank a
+    // real installed data partition - the console then said live on an installed box (measured in QEMU).
+    if bit("data/.installed") {
+        return Mode::Installed;
+    }
+    if bit("etc/1bit/installed") {
+        return Mode::Installed;
+    }
+    if bit("etc/1bit/live") {
+        return Mode::Live;
+    }
+    Mode::Unknown
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Gpu {
     /// false until the runtime has answered (the probe is cached and may still be running on the first draw)
@@ -105,6 +175,7 @@ pub struct Stats {
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     pub release: String,
+    pub mode: Mode,
     pub hostname: String,
     pub uptime_s: u64,
     pub secure_boot: SecureBoot,
@@ -144,6 +215,7 @@ impl Facts {
     pub fn collect() -> Facts {
         let mut f = Facts {
             release: release_tag(),
+            mode: mode(),
             hostname: hostname(),
             uptime_s: uptime_s(),
             secure_boot: secure_boot(),
@@ -1029,7 +1101,9 @@ pub fn pane_lines(all: Vec<String>, max: usize) -> Vec<String> {
     let keep = kept.len().saturating_sub(max - (polls > 0) as usize);
     let mut kept = kept.split_off(keep);
     if polls > 0 {
-        kept.push(format!("LEM ({polls} debug lines hidden: GET /api/v1 polling)"));
+        kept.push(format!(
+            "LEM ({polls} debug lines hidden: GET /api/v1 polling)"
+        ));
     }
     kept
 }
@@ -1136,6 +1210,8 @@ pub fn token(page: usize) -> &'static str {
 pub fn c16_board() -> Facts {
     Facts {
         release: "rc-2026-11-03-c16".into(),
+        // the c16 boot the fixtures freeze is the stick's (the demo path); INSTALLED is the other branch
+        mode: Mode::Live,
         hostname: "strix".into(),
         uptime_s: 2 * 3600 + 13 * 60,
         secure_boot: SecureBoot::Enabled,
@@ -1232,6 +1308,56 @@ mod tests {
         );
         assert_eq!(env.get("HRX_ALLOW_NO_SVM").map(String::as_str), Some("1"));
         assert_eq!(env.len(), 5);
+    }
+
+    #[test]
+    fn the_mode_is_what_init_wrote() {
+        // init.sh is the one that decides (its own rule: /data mounted and /data/.installed present), and it leaves
+        // the answer in /etc/1bit. The console reads that instead of re-deriving it, and falls back to init's rule
+        // when the marker is not there. Measured against dirs, not against this dev box.
+        let root = std::env::temp_dir().join(format!("mode-in-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("etc/1bit")).unwrap();
+        assert_eq!(
+            mode_in(&root),
+            Mode::Unknown,
+            "an empty box has no mode to report"
+        );
+        fs::write(root.join("etc/1bit/live"), "").unwrap();
+        assert_eq!(mode_in(&root), Mode::Live);
+        // ... and a real installed data partition outranks a stale `live` marker: init's own rule is the decision,
+        // the markers are written from it (this ordering was wrong in the first version - measured in QEMU)
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(root.join("data/.installed"), "").unwrap();
+        assert_eq!(
+            mode_in(&root),
+            Mode::Installed,
+            "a stale live marker outranked /data/.installed"
+        );
+        fs::remove_file(root.join("data/.installed")).unwrap();
+        // an installed boot that somehow kept the live marker still reads installed: the marker init writes wins,
+        // and it writes `installed` after the MODE banner
+        fs::write(root.join("etc/1bit/installed"), "").unwrap();
+        assert_eq!(mode_in(&root), Mode::Installed);
+        // no markers at all (an init that could not write them) -> init's own fallback, /data/.installed
+        let root2 = std::env::temp_dir().join(format!("mode-in2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root2);
+        fs::create_dir_all(root2.join("data")).unwrap();
+        fs::write(root2.join("data/.installed"), "").unwrap();
+        assert_eq!(mode_in(&root2), Mode::Installed);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn a_boot_with_data_mounted_and_no_marker_is_live() {
+        // init.sh's else branch: INSTALLED needs /data + .installed; anything else is LIVE. The reason this matters is
+        // the `(none)` row of ~/wt/tui-vm/mode-agreement-check.sh: the menu said live, the header was silent.
+        assert_eq!(resolve(Mode::Unknown, true), Mode::Live);
+        assert_eq!(resolve(Mode::Unknown, false), Mode::Unknown); // no /data: the box cannot say, so it does not invent
+        assert_eq!(resolve(Mode::Installed, true), Mode::Installed);
+        assert_eq!(resolve(Mode::Installed, false), Mode::Installed); // the marker alone is still an answer
+        assert_eq!(resolve(Mode::Live, true), Mode::Live);
     }
 
     #[test]
@@ -1527,15 +1653,34 @@ mod tests {
         all.push("KRN [   12.1] amdxdna 0000:c6:00.1: TDR timeout detected".into());
 
         let pane = pane_lines(all.clone(), 400);
-        assert!(!pane.iter().any(|l| is_poll_noise(l)), "a poll reached the pane: {pane:?}");
-        assert!(pane.iter().any(|l| l.contains("POST /api/v1/chat/completions")), "the chat is gone");
+        assert!(
+            !pane.iter().any(|l| is_poll_noise(l)),
+            "a poll reached the pane: {pane:?}"
+        );
+        assert!(
+            pane.iter()
+                .any(|l| l.contains("POST /api/v1/chat/completions")),
+            "the chat is gone"
+        );
         assert!(pane.iter().any(|l| l.contains("Loading model")));
-        assert!(pane.iter().any(|l| l.contains("backend exited 1")), "an error is never hidden");
-        assert!(pane.iter().any(|l| l.contains("TDR timeout")), "a kernel line is never hidden");
-        assert_eq!(pane.last().unwrap(), "LEM (40 debug lines hidden: GET /api/v1 polling)");
+        assert!(
+            pane.iter().any(|l| l.contains("backend exited 1")),
+            "an error is never hidden"
+        );
+        assert!(
+            pane.iter().any(|l| l.contains("TDR timeout")),
+            "a kernel line is never hidden"
+        );
+        assert_eq!(
+            pane.last().unwrap(),
+            "LEM (40 debug lines hidden: GET /api/v1 polling)"
+        );
 
         // no polls, no marker: an honest pane says nothing about noise that never happened
-        let quiet = pane_lines(vec!["KRN [ 1.0] amdgpu: HRX runtime registered".into()], 400);
+        let quiet = pane_lines(
+            vec!["KRN [ 1.0] amdgpu: HRX runtime registered".into()],
+            400,
+        );
         assert_eq!(quiet.len(), 1);
         // and the cap counts the marker, so the pane never grows by a line when there is noise
         let many: Vec<String> = (0..50).map(|i| format!("LEM event {i}")).collect();

@@ -1389,6 +1389,23 @@ that is the trade, and it is why the exclusive default stays.
 device: exclusive excludes everything, three shared streams co-exist, and an exclusive waits for the
 last one to go.
 
+**When a live process holds it.** The lock is an `flock(2)`, so it dies with its holder and there is
+nothing to reap -- but a *live* holder (a serve left running with no client, engine#1241) keeps it for
+as long as it runs, and before #1241 the wait said only `waiting for the exclusive device lock` and
+then nothing for half an hour. After about 2 s the wait now names the holder, and repeats that at most
+once a minute:
+
+    [npu] device lock held by pid 2689658 (1bit serve --device npu ...) for 41 s
+
+The line comes from `/proc/locks` (the `FLOCK` entry on the lock file's `st_dev`/`st_ino`) plus the
+holder's `/proc/<pid>/cmdline`; where a container hides either, the wait says it cannot name the
+holder instead of failing. The same line is printed when the NPU refuses a context with `device error
+(code 102): No such device`: a held array answers exactly like a dead one, so that message on its own
+used to send operators looking at the device, the ELF or the container. `ONEBIT_NPU_LOCK_WAIT_MAX=<seconds>`
+bounds the wait (unset = unlimited, still the default, because ordinary contention is what the wait is
+for); on timeout it fails with the holder named rather than spending a device ticket. Nothing here
+reaps or signals the holder -- killing another lane's live serve is the box-crashing path.
+
 **The row this exists for.** On Linux the two engines are two instances of this runtime on two
 *different* models at the same time -- "all NPU models at once" -- and that is what
 `tools/showcase-612-npu-streams.sh` measures with `MODEL` and `MODEL_B` (default Qwen3-0.6B and

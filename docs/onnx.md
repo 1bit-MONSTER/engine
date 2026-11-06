@@ -468,9 +468,12 @@ python3 onnx/compare_logits.py --forward /tmp/fwd-logits --ort /tmp/ort-logits
 ```
 
 `--check` prints the operator census and every distinct `MatMul` `(K, N)` in the graph, which is both
-the EP's binding table and the coverage picture: 254 `MatMul` nodes in six shapes, of which this
-engine's kernels cover `1024 x 2048` (q) and `1024 x 1024` (k, v) — 84 nodes — and the rest stay on
-the CPU EP. `ort-run` therefore reports what it actually did: an EP-on-NPU run and an
+the EP's binding table and the coverage picture: 254 `MatMul` nodes in six shapes. With the two `m16`
+designs this engine shipped first, kernels cover `1024 x 2048` (q) and `1024 x 1024` (k, v) — 84 nodes;
+with a design for every projection (the five M=32 designs, see
+[onnx-pack.md](onnx-pack.md#what-the-graph-gives-us)) the EP claims all seven — **196 of 254**, which is
+measured, not read off the table: `capability nodes=2113 claimed=196`, `1764` `matmul … npu=1` lines over
+a nine-pass run (196 x 9). `ort-run` therefore reports what it actually did: an EP-on-NPU run and an
 `ONEBIT_EP_OPS=none` control on the same graph, both with the CPU EP last.
 
 The graph keeps no KV cache, so one decoding step re-runs the whole sequence: the tokens/s it prints
@@ -599,11 +602,23 @@ The host path is done: it is what the tests assert, and it needs no hardware. Th
 proven on XDNA 2 as well — the ELF loads, ORT hands the EP the `MatMul`, the kernel runs on the
 device, and three consecutive runs give the same answer inside the int8 tolerance:
 `max_abs = 9.893e-02` against `max|ref| = 20.414` (rel `4.846e-03`, gate `2e-2`), with the probe's
-scale fit at `0.9999`. What is *not* done is coverage: an ELF exists per `(M, K, N)`, so on a real
-model the EP takes the shapes it has a kernel for — on Qwen3-0.6B those are q, k and v, 84 of 254
-matmuls — and the CPU EP takes the rest, lm_head, gate/up, down and o among them. The device backend
-is still off by default and is not part of any release, because enabling it on a box where another
-process owns the NPU must stay an explicit decision.
+scale fit at `0.9999`. Coverage is a design per `(K, N)`, not a feature of the code: with the two `m16`
+designs the EP takes q, k and v (84 of Qwen3-0.6B's 254 matmuls), and with a design for every shape —
+the five M=32 designs on this box — it claims **196 of 254**, every one of which ran on the array.
+Measured on 2026-11-05 on the float32 graph, one thread, a 32-token prompt and 8 generated tokens:
+`capability nodes=2113 claimed=196`, then `1764` `matmul … npu=1` lines across nine passes (196 x 9 —
+q 252, k/v 504, gate/up 504, o 252, down 252), no `npu_declined`, and the two arms generated **the same
+ids** (`1096 6147 369 279 990 315 264 3175`), so the wider claim is a coverage result, not a tolerance
+one. What stays on the CPU EP either way is `lm_head` (`1024 × 151936`, which needs a tiling of its own, so
+no design exists for it) and attention's QK^T/AV, which the EP never claims because both operands are
+rank-4 activations and its rank check declines them before any kernel question arises. That window does
+**not** make the wider claim a speed claim: the control ran at load 16.07–16.47 and took 283.6 / 262.8 ms
+of prefill and 322.8 / 335.4 ms per token, while the five-design arm ran at load 20.81–32.81 and took
+2971.1 / 3374.0 ms and 3464.4 / 3863.6 ms per token. Both raw numbers are quoted with their load, and the
+ratio between them is not a result; the float leg's own per-call cost (host-side `amax/127`
+quantisation, then the readback and dequant) is what a fair window would have to price, and that window
+has not been taken. The device backend is still off by default and is not part of any release, because
+enabling it on a box where another process owns the NPU must stay an explicit decision.
 
 The A8W8 QDQ group is claimed as one fused node and proven (`ctest -R onebit_ep_qdq_proof`, exact int8
 match for per-tensor, per-axis and asymmetric zero points, ~6-7 MB less peak RSS per run). The device

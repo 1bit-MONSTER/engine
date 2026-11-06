@@ -486,9 +486,14 @@ scales folded into one multiply per element. Per-tensor scales, the two per-axis
 can fold (`s_w[n]` along the weight's output axis, `s_x[m]` along the activation's row axis) and
 **asymmetric zero points** are all supported: `Σ_k (a−zx)(w−zw)` costs the GEMM's own sum plus a
 column sum of the weight (computed once per session), a row sum of the activation, and `K·zx·zw`, and
-the output zero point is added after the round. A per-axis scale or zero point along **K** cannot
+the output zero point is added after the round. A per-axis scale along **K** cannot
 fold — it weights the products inside the sum — so such a graph is refused and stays on the per-node
-path (see [onnx-pack.md](onnx-pack.md#a8w8-qdq-the-shape-quark-emits)). `ctest -R onebit_ep_qdq_proof`
+path (see [onnx-pack.md](onnx-pack.md#a8w8-qdq-the-shape-quark-emits)). A zero point along K is the
+same refusal by a shorter route: ONNX's `DequantizeLinear` requires the zero point and the scale to
+have the same shape, so a 1-D zero point along K only arrives beside a 1-D scale along K, which is the
+term above; and a K-long zero point beside a per-tensor scale is not a graph the CPU EP will run at all
+(`onnx-pack.md` carries the message).
+`ctest -R onebit_ep_qdq_proof`
 checks six cases end to end: per-tensor, per-axis, asymmetric and asymmetric-per-axis all
 int8-identical to the CPU EP (`worst |d| = 0` LSB, also on a 256×1024×1024 case), the per-K scale
 refused and correct anyway, and ~6-7 MB less peak RSS for the run, which is exactly the three float
@@ -544,10 +549,12 @@ is q, k and v). The device backend is still off by default and is not part of an
 enabling it on a box where another process owns the NPU must stay an explicit decision.
 
 The A8W8 QDQ group is claimed as one fused node and proven (`ctest -R onebit_ep_qdq_proof`, exact int8
-match for per-tensor, per-axis and asymmetric zero points, ~6-7 MB less peak RSS per run). One thing
-is still open and stays documented as such: the device leg of the fused path — today its int8 GEMM
-runs on the host, so a real model's shapes are still a CPU-EP story until the NPU kernel takes int8
-activations straight into its input BO.
+match for per-tensor, per-axis and asymmetric zero points, ~6-7 MB less peak RSS per run). The device
+leg of that group is built and measured (`ONEBIT_EP_NPU=ON`, see [onnx-pack.md](onnx-pack.md)): int8
+activations and int8 weights go straight into the kernel's BOs and the int8 output is bit-identical to
+the CPU EP's, so on that build a real model's shapes are the array's question and not the CPU's. A
+default build still runs the same fused group on the host loop — the device backend is off by default,
+which is the decision below, not a gap in the path.
 
 The two-engine order is implemented and exercised with a single library; a *second* EP library was
 not available to try it against (this ORT build ships no ROCM/HIP EP and there is no gfx1201 HIP EP

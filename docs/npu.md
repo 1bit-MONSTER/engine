@@ -778,6 +778,33 @@ Two facts about what the container holds, both reported, not hidden:
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's
   manifest and in `config.json`, and nothing reads a padding column as a weight.
 
+### Linking the kernel set the container will be served with
+
+A model directory carries its own NPU kernels in `npu/` (see "A model directory"), and for an imported
+pack that set comes from this engine's kernel generator, not from the pack. Until now the last step
+between import and serve was a hand-made symlink, so `1bit npu-pack import` can now make it:
+
+    ./1bit npu-pack import ~/models/oga/Phi-3.5-mini-instruct_rai_1.8.0_npu_4K \
+        -o ctr-phi35-b8 --weight-layout b8 --kernels ~/ogaload/oga13/kernels-phi35-b8
+
+    kernels:    ctr-phi35-b8/npu -> /home/bcloud/ogaload/oga13/kernels-phi35-b8  (8 full_i8 ELFs: 4 M=16 twins, 8 of the _b8 family)
+
+and `1bit serve -m ctr-phi35-b8 --device npu` then finds them where it looks. Two properties are
+deliberate:
+
+* **The set is checked against `--weight-layout` before anything is written.** A `b8` container needs the
+  `_b8` ELF names and a container with no layout key needs the plain ones; the forward looks kernels up
+  by name, so the wrong family links cleanly and then fails at load with "no ELF for K=.. N=..". That
+  refusal happens before the import writes a byte, so a bad `--kernels` never leaves a container behind.
+* **An existing `npu/` that is a real directory is left alone** and named in a warning. Replacing someone's
+  kernels to make room for a link is not an importer's decision; a stale *link* is replaced, which is what
+  re-running an import over its own output does.
+
+The link is absolute, because the set normally lives outside the model directory; moving the container to
+another box means linking that box's set the same way. Leaving `--kernels` out is exactly the old behaviour
+(the container has no `npu/`, and `1bit forward-serve -m <model.q4nx> --kernels <dir>` still takes the set
+on the command line).
+
 ### The `.fconst` attention payload
 
 A layer block's attention payload sits between its two epsilon headers and is a whole number of

@@ -1,0 +1,72 @@
+From 88106e46c9b877d0ae8291af19a64fd1ee9f7e47 Mon Sep 17 00:00:00 2001
+From: pi-kernel-74 <kernel@1bit.local>
+Date: Fri, 6 Nov 2026 16:29:34 -0400
+Subject: [PATCH] accel/amdxdna: keep the array awake while a context exists
+
+---
+ drivers/accel/amdxdna/aie2_ctx.c | 35 ++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index 7333b15..76623a7 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -10,6 +10,7 @@
+ #include <drm/drm_print.h>
+ #include <drm/drm_syncobj.h>
+ #include <linux/limits.h>
++#include <linux/pm_runtime.h>
+ #include <linux/sched/mm.h>
+ #include <linux/types.h>
+ #include <linux/xarray.h>
+@@ -836,6 +837,32 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
+ 	}
+ 	amdxdna_pm_suspend_put(xdna);
+ 
++	/*
++	 * Keep the array out of runtime suspend for as long as this context exists.
++	 *
++	 * A runtime suspend destroys every firmware context (aie2_hwctx_stop) and the
++	 * resume recreates them (aie2_hwctx_restart). On this platform a context that
++	 * comes back that way is created, mapped and reported restarted without an
++	 * error, and then its first dispatch never reaches the DPU: the firmware
++	 * answers a health query with DPU PC 0xffffffff, TXN OP ID 0xffffffff and
++	 * "timed out sub command 0", and the array wedges until a power-cycle.
++	 * Measured on strixhalo 2026-11-06 (engine#1051): 3/3 requests that arrived
++	 * after a 20 s idle with power/control=auto failed that way, each log showing
++	 * `Destroyed fw ctx 15` -> suspend -> `Created fw ctx 15` + host buf ->
++	 * `restarted, ret 0` -> wedge, while the same request into a context created
++	 * *after* the resume succeeded (and XRT's own validate passed 5/5 across
++	 * resumes). So the defect is in the recreated context, not in the resume and
++	 * not in the dispatch, and the driver's part of it is that it lets the device
++	 * suspend under a live context at all.
++	 *
++	 * pm_runtime_get_noresume() only raises the usage count, so this neither
++	 * wakes anything nor changes the ordering of the create path; the matching
++	 * pm_runtime_put_autosuspend() in aie2_hwctx_fini() re-arms the 5 s autosuspend timer
++	 * once the last context of the device is gone. A context-less device still
++	 * suspends exactly as before.
++	 */
++	pm_runtime_get_noresume(xdna->ddev.dev);
++
+ 	XDNA_DBG(xdna, "hwctx %s init completed", hwctx->name);
+ 
+ 	return 0;
+@@ -886,6 +913,14 @@ void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx)
+ 
+ 	xdna = hwctx->client->xdna;
+ 
++	/*
++	 * Drop the runtime-PM reference aie2_hwctx_init() took to keep the array out of
++	 * suspend while this context existed. Only a successful init takes it (init's
++	 * error paths go to release_expanded_heap/kfree in the create ioctl and never
++	 * reach fini), so this is balanced with it.
++	 */
++	pm_runtime_put_autosuspend(xdna->ddev.dev);
++
+ 	XDNA_DBG(xdna, "%s sequence number %lld", hwctx->name, hwctx->priv->seq);
+ 	aie2_hwctx_job_unpause(hwctx);
+ 	aie2_hwctx_wait_for_idle(hwctx);
+-- 
+2.53.0
+

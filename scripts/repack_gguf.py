@@ -20,6 +20,8 @@
 # tokenizer.json; config.json is derived here from the GGUF metadata.
 #
 # Usage: python3 repack_gguf.py <model.gguf> <output_dir> [converter_dir]
+#        python3 repack_gguf.py --check-stamp <dir>      (converter still current?)
+#        python3 repack_gguf.py --tile-check <dir> <model.gguf>   (is this dir's tile order ours?)
 import json
 import os
 import subprocess
@@ -41,6 +43,66 @@ ARCH_TO_MODEL_TYPE = {
 
 # Arches whose attention projections carry a bias (the GGUF has no bias flag).
 ATTENTION_BIAS_ARCHES = {"qwen2"}
+
+
+def tile_order_policy(rc, line):
+    """(what the stamp may claim, is the repack fatal) from tools/q4nx_diff.py's verdict.
+
+    Why this exists here and not in the plan generator: `tools/npu_plan.py` writes
+    `container.tile_order = "engine-1"` for every plan it generates (engine#1130 carries that field
+    and refuses an id it does not implement at load time), so the load-time guard cannot catch a
+    container whose tiles are a DIFFERENT order -- the declaration is unconditional.  A converter
+    that writes another order repacks cleanly and decodes as noise at HTTP 200 with nothing in the
+    log (measured: FLM_Q4NX_Converter `d1d5232`, engine#1110).  The repack is the only step holding
+    both the source GGUF and the tiles, so the claim is either measured true here or the repack
+    fails; a directory nobody could check says `unverified` instead of claiming `engine-1`.
+    """
+    if rc == 0 and line.startswith("matches layout ours"):
+        return "engine-1", False          # the order npu/forward/src/q4nx.cpp decodes
+    if rc == 2:
+        return "unverified", False        # nothing comparable: say so, do not claim a layout
+    return "", True                      # another layout, or none: these tiles are not these weights
+
+
+def tile_check_exit(rc, line):
+    """Exit code for `--tile-check`: 0 ours, 1 another order or none, 2 nothing compared.
+
+    The checker's own rc is not this: `verdict()` returns 0 for ANY matching layout, including the
+    one this engine does not decode, so the CLI goes through the policy above instead of passing it
+    through (engine#1110 review, blocker 1).
+    """
+    order, fatal = tile_order_policy(rc, line)
+    if fatal:
+        return 1
+    return 2 if order == "unverified" else 0
+
+
+def tile_order_check(gguf, out_dir):
+    """(rc, line) from the same verdict `tools/q4nx_diff.py decode --layout both` prints.
+
+    Imported rather than reimplemented so the repack and the tool an operator runs cannot disagree;
+    the verdict's tolerance and ratio are that file's, and its logic is what tests/q4nx_diff_grid_test.py
+    and `q4nx_diff.py --self-test` already cover.
+    """
+    tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "tools")
+    sys.path.insert(0, os.path.abspath(tools))
+    try:
+        import q4nx_diff as _D
+    except Exception as e:                     # no numpy, no gguf-py, a pruned package
+        return 2, f"tile check unavailable ({e})"
+
+    class _Args:
+        pass
+
+    a = _Args()
+    a.q4nx, a.gguf, a.tensor = out_dir, gguf, None
+    results = {}
+    for layout in sorted(_D.DECODERS):
+        try:
+            results[layout] = _D._decode_pass(a, layout, quiet=True)
+        except Exception as e:
+            return 2, f"tile check unavailable ({e})"
+    return _D.verdict(results)
 
 
 def _field(reader, name):
@@ -212,6 +274,8 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
 def main():
     if len(sys.argv) < 3:
         print("usage: repack_gguf.py <model.gguf> <output_dir> [converter_dir]")
+        print("       repack_gguf.py --check-stamp <dir>")
+        print("       repack_gguf.py --tile-check <dir> <model.gguf>")
         return 2
     gguf, out_dir = sys.argv[1], sys.argv[2]
     # The Q4NX converter is not vendored in this repo. Resolve it in order:
@@ -304,6 +368,17 @@ def main():
                 return 1
         print("stamp: current")
         return 0
+
+    # `--tile-check <dir> <model.gguf>`: the same measurement the repack runs, on a directory that
+    # already exists (a published container, a dir from another converter).  Same exit codes as the
+    # repack: 0 the engine-1 order, 1 another order or none, 2 nothing comparable.
+    if sys.argv[1] == "--tile-check":
+        if len(sys.argv) < 4:
+            print("usage: repack_gguf.py --tile-check <dir> <model.gguf>")
+            return 2
+        rc, line = tile_order_check(sys.argv[3], sys.argv[2])
+        print(line)
+        return tile_check_exit(rc, line)
 
     os.makedirs(out_dir, exist_ok=True)
     convert_py = os.path.join(converter_dir, "convert.py")
@@ -398,6 +473,23 @@ def main():
 
     cfg = write_config(gguf, out_dir, arch, vocab_size)
 
+    # The tile order is measured before the directory is cached, for the same reason the scale scan
+    # below is: a wrong order is silent all the way to a 200 (engine#1110).  Cost is one dequantize of
+    # every comparable tensor per layout -- the same order as the repack itself, paid once per dir
+    # because a cache hit re-checks metadata only (docs/npu.md, "Declared scales are checked").
+    _tile_rc, _tile_line = tile_order_check(gguf, out_dir)
+    tile_order, _tile_fatal = tile_order_policy(_tile_rc, _tile_line)
+    if _tile_fatal:
+        print(f"repack: {_tile_line}")
+        print("repack: the converter wrote q4_1 tiles in an order this engine does not decode -- refusing "
+              "the directory.  Point --converter / ONEBIT_Q4NX_CONVERTER at a checkout that writes the "
+              "engine-1 order (engine#1110; measured good: FLM_Q4NX_Converter 81be119e).")
+        return 1
+    if tile_order == "unverified":
+        print(f"repack: tile order not verified: {_tile_line}; the stamp records that instead of claiming engine-1")
+    else:
+        print(f"repack: tile order engine-1, measured: {_tile_line}")
+
     # Record the provenance the cache-hit gate needs (see --check-stamp above).
     with open(os.path.join(out_dir, "repack-stamp.txt"), "w") as f:
         f.write(f"converter_path={converter_dir}\n")
@@ -405,6 +497,8 @@ def main():
         f.write(f"arch={arch}\n")
         f.write(f"model_type={cfg.get('model_type', '')}\n")
         f.write("q4nx_default_tensor_type=Q4_1\n")
+        f.write(f"tile_order={tile_order}\n")
+        f.write(f"tile_check={_tile_line}\n")
         f.write(f"repack_script={os.path.abspath(__file__)}\n")
 
     # Enforce the scale-key guard before the dir is cached (and before anyone

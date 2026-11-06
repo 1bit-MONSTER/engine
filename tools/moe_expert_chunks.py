@@ -56,7 +56,7 @@ GROUP = 128  # the arena's multiplier group: one d per 128 K-rows per column
 
 def container_expert(q, name, e):
     """One expert's weights as the container holds them: float32 [K][N]."""
-    info = q.moe_meta["tensors"][name]
+    info = q.expert_meta(name)
     rt, kt = q.shape(name)[0], q.shape(name)[1]
     rte = rt // info["experts"]
     chunk = q.shape(name)[-1]
@@ -96,7 +96,7 @@ def dequantise(codes, d):
 
 
 def info_n(q, name):
-    return q.moe_meta["tensors"][name]["rows"]
+    return q.expert_meta(name)["rows"]
 
 
 def chunk_path(out, layer, proj, e):
@@ -146,7 +146,7 @@ def geometry(q, layer, pad_n=None):
     """
     out = {}
     for proj, suffix in PROJ.items():
-        info = q.moe_meta["tensors"][q.layer_name(layer, suffix)]
+        info = q.expert_meta(q.layer_name(layer, suffix))
         K, N = info["cols"], info["rows"]
         n_out = max(N, pad_n or N)
         out[proj] = {
@@ -227,7 +227,7 @@ def verify(args):
     bad = 0
     for proj, suffix in PROJ.items():
         name = q.layer_name(args.layer, suffix)
-        info = q.moe_meta["tensors"][name]
+        info = q.expert_meta(name)
         K, N = info["cols"], info["rows"]
         n_out = max(N, args.pad_n or written.get(proj, N))
         worst = {"rel": 0.0, "cos": 1.0, "max": 0.0}
@@ -313,7 +313,7 @@ def gate(args):
     w = p[top] / p[top].sum() if q.norm_topk else p[top]
 
     name = q.layer_name(args.layer, PROJ[args.proj])
-    info = q.moe_meta["tensors"][name]
+    info = q.expert_meta(name)
     K, N = info["cols"], info["rows"]
 
     def a_row(e):

@@ -468,9 +468,12 @@ python3 onnx/compare_logits.py --forward /tmp/fwd-logits --ort /tmp/ort-logits
 ```
 
 `--check` prints the operator census and every distinct `MatMul` `(K, N)` in the graph, which is both
-the EP's binding table and the coverage picture: 254 `MatMul` nodes in six shapes, of which this
-engine's kernels cover `1024 x 2048` (q) and `1024 x 1024` (k, v) — 84 nodes — and the rest stay on
-the CPU EP. `ort-run` therefore reports what it actually did: an EP-on-NPU run and an
+the EP's binding table and the coverage picture: 254 `MatMul` nodes in six shapes. With the two `m16`
+designs this engine shipped first, kernels cover `1024 x 2048` (q) and `1024 x 1024` (k, v) — 84 nodes;
+with a design for every projection (the five M=32 designs, see
+[onnx-pack.md](onnx-pack.md#what-the-graph-gives-us)) the EP claims all seven — **196 of 254**, which is
+measured, not read off the table: `capability nodes=2113 claimed=196`, `1764` `matmul … npu=1` lines over
+a nine-pass run (196 x 9). `ort-run` therefore reports what it actually did: an EP-on-NPU run and an
 `ONEBIT_EP_OPS=none` control on the same graph, both with the CPU EP last.
 
 The graph keeps no KV cache, so one decoding step re-runs the whole sequence: the tokens/s it prints
@@ -568,17 +571,54 @@ five. The sections are timed only when the knob is on. The line writes to the EP
 and to stderr when it is not: a knob whose only output can silently vanish is how a debugging session gets
 lost, and this file already paid for that once.
 
+The **float** `MatMul` path reports under the same knob, as a second line — `f32_prof calls=… wpacks=…
+wpack_ms=… rows_ms=… call_ms=… other_ms=…` — and it exists for the same reason the fused one does: its per-call
+cost could not be read off the per-design probe, which times `gemm_f32` with synthetic operands and a warm
+weight cache (3.6 ms/call for q at m=36 above) while the graph hands the same function real 32-row activations.
+At model level that came out 12.0 ms/call (21096.1 ms over 1764 calls), and one counter says where it went. So
+the float leg counts `calls` and the **weight-cache misses** (`wpacks`), times `packB` and the runtime's own
+`go_rows` (quantise + upload,
+both syncs, launch, wait, readback, dequant — one number, because those steps live inside the runtime and are not
+re-implemented here the way `gemm_q8_raw` re-implements the int8 ones), and `call_ms` is this file's frame around
+it with `other` the difference. The fused leg's `qdq_prof` carries the same miss count as `dev_wpacks`.
+
+**What the counter showed: the weight cache never hits, and that is structural, not a bug in the key.** On the
+float32 graph with five M=32 designs, at load 1.2: `f32_prof calls=1764 wpacks=1764 wpack_ms=14103.7
+rows_ms=6949.3 call_ms=21096.1` — 1764 calls, **1764 re-packs, two thirds of the run (14.1 of 21.1 s) inside
+`packB`**. The fused A8W8 export on the same designs, same window: `calls_dev=1764 … dev_wpacks=1764
+dev_split_wpack=771.1 dev_split_launch=6063.1`, i.e. the same miss on every call, costing 10 % because packing
+int8 bytes is cheap and quantising floats is not. The first hypothesis — that ORT hands an EP node a different
+weight pointer per call — was wrong, and a fix was written and thrown away: the cache holds **one** packed weight
+per `(K, N)` kernel (`npu/ort/onebit_npu_gemm.cpp`, "one slot per kernel"), and Qwen3-0.6B has 196 weights across
+five shapes — 28 for q/o/down, 56 for k/v and gate/up — so consecutive calls of one shape evict each other, and
+keying the slot on the weight's identity changes nothing (196 packs per pass either way; measured). Making the
+cache hit needs a packed slot per weight (440 MB of int8 projection weights resident — the five shapes'
+196 weights — which the array does not have) or a cheaper `packB`; `wpack_ms` is the number that would price
+the second, and it is the largest single line the float leg has.
+
 ## Status
 
 The host path is done: it is what the tests assert, and it needs no hardware. The NPU path is
 proven on XDNA 2 as well — the ELF loads, ORT hands the EP the `MatMul`, the kernel runs on the
 device, and three consecutive runs give the same answer inside the int8 tolerance:
 `max_abs = 9.893e-02` against `max|ref| = 20.414` (rel `4.846e-03`, gate `2e-2`), with the probe's
-scale fit at `0.9999`. What is *not* done is coverage: an ELF exists per `(M, K, N)`, so on a real
-model the EP takes the shapes it has a kernel for — on Qwen3-0.6B those are q, k and v, 84 of 254
-matmuls — and the CPU EP takes the rest, lm_head, gate/up, down and o among them. The device backend
-is still off by default and is not part of any release, because enabling it on a box where another
-process owns the NPU must stay an explicit decision.
+scale fit at `0.9999`. Coverage is a design per `(K, N)`, not a feature of the code: with the two `m16`
+designs the EP takes q, k and v (84 of Qwen3-0.6B's 254 matmuls), and with a design for every shape —
+the five M=32 designs on this box — it claims **196 of 254**, every one of which ran on the array.
+Measured on 2026-11-05 on the float32 graph, one thread, a 32-token prompt and 8 generated tokens:
+`capability nodes=2113 claimed=196`, then `1764` `matmul … npu=1` lines across nine passes (196 x 9 —
+q 252, k/v 504, gate/up 504, o 252, down 252), no `npu_declined`, and the two arms generated **the same
+ids** (`1096 6147 369 279 990 315 264 3175`), so the wider claim is a coverage result, not a tolerance
+one. What stays on the CPU EP either way is `lm_head` (`1024 × 151936`, which needs a tiling of its own, so
+no design exists for it) and attention's QK^T/AV, which the EP never claims because both operands are
+rank-4 activations and its rank check declines them before any kernel question arises. That window does
+**not** make the wider claim a speed claim: the control ran at load 16.07–16.47 and took 283.6 / 262.8 ms
+of prefill and 322.8 / 335.4 ms per token, while the five-design arm ran at load 20.81–32.81 and took
+2971.1 / 3374.0 ms and 3464.4 / 3863.6 ms per token. Both raw numbers are quoted with their load, and the
+ratio between them is not a result; the float leg's own per-call cost (host-side `amax/127`
+quantisation, then the readback and dequant) is what a fair window would have to price, and that window
+has not been taken. The device backend is still off by default and is not part of any release, because
+enabling it on a box where another process owns the NPU must stay an explicit decision.
 
 The A8W8 QDQ group is claimed as one fused node and proven (`ctest -R onebit_ep_qdq_proof`, exact int8
 match for per-tensor, per-axis and asymmetric zero points, ~6-7 MB less peak RSS per run). The device

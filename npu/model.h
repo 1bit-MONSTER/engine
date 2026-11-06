@@ -16,7 +16,9 @@
 // A Q4NX model directory: model.q4nx (8-byte header length, JSON tensor table,
 // tensor data, as in safetensors) and the Hugging Face config.json next to it.
 // Projection weights are I8 tiles of 5120 bytes: 512 B bf16 scales, 512 B bf16
-// zeros, 4096 B packed int4, covering 32 x 256 weights.
+// zeros, 4096 B packed int4, covering 32 x 256 weights. A container imported from
+// an OGA pack uses the fp32 form of the same tile instead (6144 B, npu/q4nx.h
+// Q4_1F, engine#1185); the container's layout metadata says which form it holds.
 #pragma once
 
 #include <cstdint>
@@ -27,6 +29,9 @@
 namespace onebit::npu {
 
 constexpr size_t kTileBytes = 5120;
+// The imported-container q4_1 chunk (npu/q4nx.h Q4_1F): the same 32x256 tile with fp32 scale and
+// zero, so a pack import keeps the pack's own parameter values (engine#1185).
+constexpr size_t kTileBytesF32 = 6144;
 
 struct Tensor {
     std::string dtype;

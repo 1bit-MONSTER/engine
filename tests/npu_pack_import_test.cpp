@@ -37,6 +37,7 @@
 #include "pack.h"
 #include "pack_import.h"
 #include "q4nx.h"
+#include "q4nx_device.h"
 
 #include <nlohmann/json.hpp>
 
@@ -176,6 +177,29 @@ std::string model(const std::vector<std::string>& tensors, const std::vector<std
 void put_file(const std::string& path, const std::string& bytes) {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     f.write(bytes.data(), std::streamsize(bytes.size()));
+}
+
+// A model.q4nx tensor table, as npu/model.cpp reads it (8-byte header length, JSON, then data).
+json container_table(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    uint64_t hlen = 0;
+    f.read(reinterpret_cast<char*>(&hlen), 8);
+    std::string header(size_t(hlen), '\0');
+    f.read(header.data(), std::streamsize(hlen));
+    while (!header.empty() && (header.back() == ' ' || header.back() == '\0')) header.pop_back();
+    return json::parse(header);
+}
+
+// How many I8 tensors of a container are the imported 6,144-byte q4_1f form -- exactly the
+// trigger of the forward loader's refusal (npu/forward/src/model.c, engine#1185).
+int q4_1f_tensors(const json& table) {
+    int n = 0;
+    for (const auto& [name, t] : table.items()) {
+        if (name == "__metadata__" || !t.is_object() || t.value("dtype", std::string()) != "I8") continue;
+        const auto shape = t.value("shape", std::vector<int64_t>{});
+        if (!shape.empty() && shape.back() == int64_t(onebit::npu::kTileBytesF32)) ++n;
+    }
+    return n;
 }
 
 // The two overstatements the readers must catch: declared dims larger than the external file, and a
@@ -906,13 +930,14 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
                                      std::to_string(r.lmhead_corr) + ")");
     check(r.ctrl_corr_nibble < 0.5 && r.ctrl_corr_nozp < 0.95,
           "pack: both wrong decoders are rejected as controls");
-    // The container's q4_1 chunk holds a bf16 zero, and this pack's f32 zero is -zp*scale,
-    // which is bf16-exact for only ~43 % of groups; the residual is that rounding, measured
-    // at 3.3e-3 relative and <5e-4 absolute. Scales are exactly bf16 here, so no code moves.
-    check(r.q4nx_rel < 5e-3, "pack: container read back within the bf16 parameter bound (" +
-                                 std::to_string(r.q4nx_rel) + ")");
-    check(r.zero_exact_pct > 40.0 && r.zero_exact_pct < 50.0,
-          "pack: the bf16 zero point is exact for ~43 % of groups as measured (" +
+    // engine#1185: an imported container carries fp32 scale/zero (layout q4nx-2, npu/q4nx.h
+    // q4_1f), so the read-back is exact -- the bf16 bound this used to assert (3.3e-3 relative,
+    // ~43 % of groups) was the container's old format limit, not the import's.
+    check(r.q4nx_rel == 0.0 && r.q4nx_max_abs == 0.0,
+          "pack: container read back exactly, no bf16 parameter round trip (rel " +
+              std::to_string(r.q4nx_rel) + ", max " + std::to_string(r.q4nx_max_abs) + ")");
+    check(r.zero_exact_pct == 100.0 && r.attn_zero_inexact_pct == 0.0 && r.mlp_zero_inexact_pct == 0.0,
+          "pack: every per-32-group scale/zero is the pack's own f32 value (" +
               std::to_string(r.zero_exact_pct) + " %)");
     // engine#734: the geometry is MEASURED from the anchors, so it holds for any hidden size
     check(r.stride > 0 && r.second_header > 0 && r.second_header < r.stride,
@@ -983,8 +1008,8 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     }
     if (r.attn_projections) {
         const auto& qw = m.tensor("model.layers.0.self_attn.q_proj.weight");
-        check(qw.shape.at(1) == int64_t(onebit::npu::kTileBytes),
-              "pack: an imported projection is q4_1 chunks of the container's tile size");
+        check(qw.shape.at(1) == int64_t(onebit::npu::kTileBytesF32),
+              "pack: an imported projection is q4_1f chunks (fp32 scale/zero, engine#1185)");
         // Not every family carries attention biases: Llama-3.2 has none, and its attention section now
         // tiles (engine#979), so the check has to ask the pack rather than the geometry.
         if (r.attn_bias_tensors)
@@ -995,8 +1020,9 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     if (r.mlp_projections) {
         const auto& gw = m.tensor("model.layers.0.mlp.gate_proj.weight");
         const auto& dw = m.tensor("model.layers.0.mlp.down_proj.weight");
-        check(gw.shape.at(1) == int64_t(onebit::npu::kTileBytes) && dw.shape.at(1) == int64_t(onebit::npu::kTileBytes),
-              "pack: the MLP projections are q4_1 chunks of the container's tile size");
+        check(gw.shape.at(1) == int64_t(onebit::npu::kTileBytesF32) &&
+                  dw.shape.at(1) == int64_t(onebit::npu::kTileBytesF32),
+              "pack: the MLP projections are q4_1f chunks of the container's tile size");
         check(gw.shape.at(0) == int64_t((p.dims.intermediate / 32) * ((p.dims.hidden + 255) / 256)),
               "pack: gate_proj's tile count follows from its shape and the 256-column grid");
         check(dw.shape.at(0) == int64_t((p.dims.hidden / 32) * ((p.dims.intermediate + 255) / 256)),
@@ -1005,6 +1031,414 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     check(m.dims().hidden == p.dims.hidden && m.dims().layers == layers,
           "pack: config.json drives the loader");
     fs::remove_all(out);
+}
+
+// ── engine#1185: the imported container's parameters are the pack's, bit for bit ────────────────
+// The two q4_1 forms side by side: the 5,120-byte one every GGUF-derived container holds (and the
+// device streams), and the 6,144-byte fp32 one an OGA pack import writes. The bf16 form's loss is
+// the issue's measured floor; the fp32 form is what removes it, and the chunk's own shape is what
+// the decoder keys on, so a container with no layout metadata (all of them, before engine#1185)
+// still reads as the bf16 form.
+void test_q4_1f() {
+    const pi::Q4 q = synthetic();
+    const int RT = 2, KT = 2;  // 64x384 -> the 32x256 grid pads K to 512
+
+    std::vector<uint8_t> f32_tiles;
+    long long inexact = -1;
+    pi::tile_q4_1_f32(q, f32_tiles, &inexact);
+    check(f32_tiles.size() == size_t(RT) * KT * onebit::npu::kTileBytesF32,
+          "q4_1f: 64x384 is 2 x 2 tiles of 6,144 B");
+    check(inexact == 0, "q4_1f: every stored parameter is the source float, bit for bit (" +
+                            std::to_string(inexact) + " differ)");
+
+    // the loader keys the decoder off the tensor's own shape: 5,120 B is bf16, 6,144 B is fp32
+    onebit::npu::Tensor f32t;
+    f32t.shape = {int64_t(RT) * KT, int64_t(onebit::npu::kTileBytesF32)};
+    f32t.data = f32_tiles.data();
+    f32t.bytes = f32_tiles.size();
+    f32t.avail = f32_tiles.size();
+    check(onebit::npu::q4nx::chunk_of(f32t) == onebit::npu::q4nx::Chunk::Q4_1F,
+          "q4_1f: chunk_of([.., 6144]) is Q4_1F");
+    check(onebit::npu::q4nx::chunk_of(onebit::npu::q4nx::Params::F32) ==
+              onebit::npu::q4nx::Chunk::Q4_1F &&
+              onebit::npu::q4nx::chunk_of(onebit::npu::q4nx::Params::Bf16) ==
+                  onebit::npu::q4nx::Chunk::Q4_1,
+          "q4_1f: the parameter form names the chunk kind");
+
+    std::vector<uint8_t> bf16_tiles;
+    long long bf16_inexact = 0;
+    pi::tile_q4_1(q, bf16_tiles, &bf16_inexact);
+
+    // every group's scale and zero, read back out of both written tiles
+    std::vector<float> ws(256), wz(256), bs(256), bz(256);
+    bool params_ok = true, codes_ok = true;
+    long long groups = 0, bf16_lost = 0;
+    for (int i = 0; i < RT * KT; ++i) {
+        const uint8_t* ft = f32_tiles.data() + size_t(i) * onebit::npu::kTileBytesF32;
+        const uint8_t* bt = bf16_tiles.data() + size_t(i) * onebit::npu::kTileBytes;
+        onebit::npu::q4nx::q4_1_params(onebit::npu::q4nx::Chunk::Q4_1F, ft, ws.data(), wz.data());
+        onebit::npu::q4nx::q4_1_params(onebit::npu::q4nx::Chunk::Q4_1, bt, bs.data(), bz.data());
+        if (std::memcmp(ft + 2048, bt + 1024, 4096) != 0) codes_ok = false;
+        const int rt = i / KT, kt = i % KT;
+        for (int r = 0; r < 32; ++r)
+            for (int g = 0; g < 8; ++g) {
+                if ((kt * 8 + g) * 32 >= q.K) continue;
+                const size_t idx = size_t(rt * 32 + r) * (q.K / 32) + size_t(kt) * 8 + g;
+                const float want_s = q.scale[idx], want_z = q.zero[idx];
+                ++groups;
+                if (std::memcmp(&ws[g * 32 + r], &want_s, 4) != 0 ||
+                    std::memcmp(&wz[g * 32 + r], &want_z, 4) != 0)
+                    params_ok = false;
+                if (std::memcmp(&bs[g * 32 + r], &want_s, 4) != 0 ||
+                    std::memcmp(&bz[g * 32 + r], &want_z, 4) != 0)
+                    ++bf16_lost;
+            }
+    }
+    check(params_ok, "q4_1f: the stored scale/zero are the source's, bit for bit (" +
+                         std::to_string(groups) + " groups)");
+    check(codes_ok, "q4_1f: the code region is byte-identical to the bf16 form's");
+    check(bf16_lost > 0, "q4_1f control: the bf16 form loses " + std::to_string(bf16_lost) + " of " +
+                             std::to_string(groups) + " groups on this data, so the check is live");
+
+    // the device's 5,120-byte form still comes out of either chunk kind, one bf16 rounding away
+    const std::vector<uint8_t> back = onebit::npu::q4nx::as_q4_1(f32t);
+    check(back.size() == size_t(RT) * KT * onebit::npu::kTileBytes,
+          "q4_1f: as_q4_1 repacks it to the device's 5,120-byte q4_1 tiles");
+    std::vector<float> s32(256), z32(256), sb(256), zb(256);
+    bool repack_ok = true;
+    for (int i = 0; i < RT * KT; ++i) {
+        const uint8_t* ft = f32_tiles.data() + size_t(i) * 6144;
+        const uint8_t* bt = back.data() + size_t(i) * 5120;
+        if (std::memcmp(ft + 2048, bt + 1024, 4096) != 0) repack_ok = false;  // codes unchanged
+        onebit::npu::q4nx::q4_1_params(onebit::npu::q4nx::Chunk::Q4_1F, ft, s32.data(), z32.data());
+        onebit::npu::q4nx::q4_1_params(onebit::npu::q4nx::Chunk::Q4_1, bt, sb.data(), zb.data());
+        for (int j = 0; j < 256; ++j) {
+            const float want_s = onebit::npu::bf16_to_f32(onebit::npu::f32_to_bf16(s32[j]));
+            const float want_z = onebit::npu::bf16_to_f32(onebit::npu::f32_to_bf16(z32[j]));
+            if (std::memcmp(&sb[j], &want_s, 4) != 0 || std::memcmp(&zb[j], &want_z, 4) != 0)
+                repack_ok = false;
+        }
+    }
+    check(repack_ok, "q4_1f: the repack keeps the codes and rounds the parameters to bf16, nothing else");
+
+    // the container-level form: absent and q4nx-1 are the bf16 form every container on disk has
+    using onebit::npu::q4nx::Params;
+    check(onebit::npu::q4nx::params_of_layout("") == Params::Bf16,
+          "layout: an absent layout is the bf16 form");
+    check(onebit::npu::q4nx::params_of_layout("q4nx-1") == Params::Bf16, "layout: q4nx-1 is bf16");
+    check(onebit::npu::q4nx::params_of_layout("q4nx-2") == Params::F32, "layout: q4nx-2 is fp32");
+    check(std::string(onebit::npu::q4nx::layout_of(Params::F32)) == "q4nx-2",
+          "layout: the fp32 form writes q4nx-2");
+    bool threw = false;
+    try {
+        onebit::npu::q4nx::params_of_layout("q4nx-99");
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    check(threw, "layout: an unknown version is refused rather than read as the bf16 form");
+    std::printf("q4_1f: %lld groups bit-equal; the bf16 form loses %lld of them\n", groups, bf16_lost);
+}
+
+// ── engine#1185: an imported pack's scale/zero survive the container bit for bit ────────────────
+// The acceptance is bit equality, not a percentage. A real OGA pack is a ~6 GB download and the
+// shipped legs must stay device-free, so this builds the smallest pack whose .fconst has the 0.5B
+// pack's MEASURED second-header offset (1,115,968 B) and real quantized tiles in every section --
+// attention, the fused MLP and down_proj -- plus a MatMulNBits head with f32 scales. It imports the
+// pack and reads the container back through the engine's own loader: every per-group scale and zero
+// must equal the pack's, and every code must stay at its q4_1 index. The control is the issue's own
+// number: the 5,120-byte bf16 form loses these groups, which is why the fp32 form exists.
+void test_import_fp32_params(const std::string& root) {
+    const fs::path dir = fs::path(root) / "fp32-params";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    const int H = 896, L = 3, heads = 14, kv_heads = 2, hd = 64, inter = 256, V = 64;
+    const int n_kv = (kv_heads * hd) / 64, n_q = (heads * hd) / 64;
+    const int64_t tile = pi::attn_tile_bytes(H);              // 34,816 B, the 64-row tile
+    const int64_t attn_off = pi::attn_payload_off(H);         // 1,856 B
+    const int64_t second = attn_off + int64_t(2 * n_kv + 2 * n_q) * tile;
+    const int64_t gu_unit = pi::group_bytes(H, 128), down_group = pi::group_bytes(inter, 64);
+    const int64_t gu_units = inter / 64, down_units = H / 64;
+    const int64_t mlp_off = second + 64 + 2 * H;
+    const int64_t stride = mlp_off + gu_units * gu_unit + 64 + down_units * down_group;
+    check(second == 1115968, "fp32 import: the crafted .fconst has the 0.5B pack's second header (" +
+                                 std::to_string(second) + ")");
+
+    // Scales are bf16-storable f32 values and codes/zero points are in 0..7, so no tile byte pair
+    // can look like the 86 35 + ten-zero epsilon header: the locator must see exactly the headers
+    // this test writes, nothing else.
+    auto scale_of = [](int i) {
+        static const float v[8] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f};
+        return v[i & 7];
+    };
+    auto make_tile = [&](int rows, int k, int seed) {
+        pi::TileW t;
+        t.k = k;
+        t.rows = rows;
+        t.code.assign(size_t(rows) * size_t(k), 0);
+        t.scale.assign(size_t(rows) * size_t(k / 128), 0.0f);
+        t.zp.assign(size_t(rows) * size_t(k / 128), 0);
+        t.bias.assign(rows, 0);
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < k; ++c) t.code[size_t(r) * k + c] = uint8_t((r * 3 + c * 5 + seed) % 8);
+            for (int b = 0; b < k / 128; ++b) {
+                t.scale[size_t(r) * (k / 128) + b] = scale_of(r + b + seed);
+                t.zp[size_t(r) * (k / 128) + b] = uint8_t((r + b + seed) % 8);
+            }
+        }
+        return pi::encode_tile(t);
+    };
+    std::string fc(size_t(int64_t(L) * stride + 64 + H * 2), '\0');
+    auto put16 = [&](int64_t off, uint16_t v) {
+        fc[size_t(off)] = char(v & 0xFF);
+        fc[size_t(off) + 1] = char(v >> 8);
+    };
+    auto put_bytes = [&](int64_t off, const std::vector<uint8_t>& b) {
+        std::memcpy(&fc[size_t(off)], b.data(), b.size());
+    };
+    std::vector<pi::TileW> q_proj0, down0;
+    for (int l = 0; l < L; ++l) {
+        const int64_t base = int64_t(l) * stride;
+        put16(base, 0x3586);
+        put16(base + second, 0x3586);
+        for (int i = 0; i < H; ++i) {
+            put16(base + 64 + 2 * i, pi::bf16_bits_of(float(i + 1)));
+            put16(base + second + 64 + 2 * i, pi::bf16_bits_of(float(i + 1)));
+        }
+        // k, q, v, o share the one payload at K = hidden on a 2-header block
+        for (int i = 0; i < 2 * n_kv + 2 * n_q; ++i) {
+            const std::vector<uint8_t> b = make_tile(64, H, 40 + i);
+            put_bytes(base + attn_off + int64_t(i) * tile, b);
+            if (l == 0 && i >= n_kv && i < n_kv + n_q) q_proj0.push_back(pi::decode_tile(b.data(), H));
+        }
+        for (int u = 0; u < int(gu_units); ++u)
+            put_bytes(base + mlp_off + int64_t(u) * gu_unit, make_tile(128, H, 200 + u));
+        for (int u = 0; u < int(down_units); ++u) {
+            const std::vector<uint8_t> b = make_tile(64, inter, 300 + u);
+            put_bytes(base + mlp_off + gu_units * gu_unit + 64 + int64_t(u) * down_group, b);
+            if (l == 0) down0.push_back(pi::decode_tile(b.data(), inter));
+        }
+    }
+    const int64_t tail = int64_t(L) * stride;
+    put16(tail, 0x3586);
+    for (int i = 0; i < H; ++i) put16(tail + 64 + 2 * i, pi::bf16_bits_of(float(i + 1)));
+    put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+
+    // The head the importer reads from model.onnx: MatMulNBits, block 128, f32 scales (the other
+    // half of what the container has to keep; these are deliberately not bf16-representable).
+    const int block = 128, kblocks = H / block;
+    std::vector<uint8_t> qw(size_t(V) * size_t(kblocks) * size_t(block / 2), 0);
+    std::vector<float> scales(size_t(V) * size_t(kblocks), 0.0f);
+    std::vector<uint8_t> qz(size_t(V) * size_t((kblocks + 1) / 2), 0);
+    for (int n = 0; n < V; ++n)
+        for (int b = 0; b < kblocks; ++b) {
+            scales[size_t(n) * kblocks + b] = 0.017f * float(b + 1) + 0.0003f * float(n);
+            const uint8_t z = uint8_t((n + 2 * b) % 8);
+            qz[size_t(n) * ((kblocks + 1) / 2) + b / 2] |= uint8_t((b & 1) ? (z << 4) : (z & 0x0F));
+            for (int i = 0; i < block / 2; ++i) {
+                const int k = b * block + 2 * i;
+                const uint8_t lo = uint8_t((n * 3 + k * 5 + 1) % 8);
+                const uint8_t hi = uint8_t((n * 5 + k * 3 + 2) % 8);
+                qw[(size_t(n) * kblocks + b) * (block / 2) + i] = uint8_t(lo | (hi << 4));
+            }
+        }
+    std::string data;
+    auto append = [&](const void* p, size_t n) {
+        data.append(static_cast<const char*>(p), n);
+        return int64_t(data.size() - n);
+    };
+    std::vector<float> embed(size_t(V) * size_t(H));
+    for (size_t i = 0; i < embed.size(); ++i) embed[i] = 0.01f * float(i % 97) - 0.5f;
+    const int64_t embed_off = append(embed.data(), embed.size() * sizeof(float));
+    const int64_t qw_off = append(qw.data(), qw.size());
+    const int64_t sc_off = append(scales.data(), scales.size() * sizeof(float));
+    const int64_t qz_off = append(qz.data(), qz.size());
+    put_file((dir / "model.onnx.data").string(), data);
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":896,"intermediate_size":256,"num_hidden_layers":3,)"
+             R"("num_attention_heads":14,"num_key_value_heads":2,"head_dim":64,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":false,"rms_norm_eps":1e-06})");
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data",
+                                   uint64_t(embed_off), uint64_t(V) * H * 4),
+                        pb::tensor("lm_head_qweight", {}, "model.onnx.data", uint64_t(qw_off),
+                                   uint64_t(qw.size())),
+                        pb::tensor("lm_head_scales", {}, "model.onnx.data", uint64_t(sc_off),
+                                   uint64_t(scales.size()) * 4),
+                        pb::tensor("lm_head_zeros", {}, "model.onnx.data", uint64_t(qz_off),
+                                   uint64_t(qz.size()))},
+                       {pb::matmulnbits("lm_head", {"x", "lm_head_qweight", "lm_head_scales", "lm_head_zeros"},
+                                        H, V, 4, block)}));
+
+    const std::string out = (fs::temp_directory_path() /
+                             ("oga_pack_import_fp32." + std::to_string(::getpid()))).string();
+    fs::remove_all(out);
+    const pi::Report r = pi::import_pack(dir.string(), out, pi::Options{});
+    for (const auto& s : r.refused) std::fprintf(stderr, "  fp32 import refusal: %s\n", s.c_str());
+    check(r.refused.empty(), "fp32 import: the crafted pack is fully representable");
+    check(r.q4nx_rel == 0.0 && r.q4nx_max_abs == 0.0,
+          "fp32 import: the container's weights are the pack's exactly (rel " + std::to_string(r.q4nx_rel) +
+              ", max " + std::to_string(r.q4nx_max_abs) + ")");
+    check(r.zero_exact_pct == 100.0 && r.attn_zero_inexact_pct == 0.0 && r.mlp_zero_inexact_pct == 0.0,
+          "fp32 import: no stored parameter is a bf16 rounding of the pack's (" +
+              std::to_string(r.zero_exact_pct) + " %)");
+    check(r.attn_tiles_total == int64_t(L) * (2 * n_kv + 2 * n_q) && r.attn_tiles_ok == r.attn_tiles_total,
+          "fp32 import: every .fconst attention tile survives decode->encode (" +
+              std::to_string(r.attn_tiles_ok) + "/" + std::to_string(r.attn_tiles_total) + ")");
+    check(r.mlp_groups_total == int64_t(L) * (gu_units + down_units) && r.mlp_groups_ok == r.mlp_groups_total,
+          "fp32 import: every MLP group survives decode->encode (" + std::to_string(r.mlp_groups_ok) + "/" +
+              std::to_string(r.mlp_groups_total) + ")");
+    if (!r.refused.empty()) {
+        fs::remove_all(dir);
+        return;
+    }
+
+    {   // the container states its parameter form in the manifest and in config.json
+        std::ifstream f(out + "/model.q4nx", std::ios::binary);
+        uint64_t hlen = 0;
+        f.read(reinterpret_cast<char*>(&hlen), 8);
+        std::string header(size_t(hlen), '\0');
+        f.read(header.data(), std::streamsize(hlen));
+        while (!header.empty() && (header.back() == ' ' || header.back() == '\0')) header.pop_back();
+        const auto doc = json::parse(header);
+        const std::string layout = doc.at("__metadata__").at("layout").get<std::string>();
+        check(layout == "q4nx-2", "fp32 import: the manifest says layout q4nx-2 (got \"" + layout + "\")");
+        check(onebit::npu::q4nx::params_of_layout(layout) == onebit::npu::q4nx::Params::F32,
+              "fp32 import: that layout names the fp32 parameter form");
+    }
+    {
+        std::ifstream cf(out + "/config.json");
+        const auto c = json::parse(cf);
+        check(c.at("q4nx_source").at("layout") == "q4nx-2", "fp32 import: config.json agrees");
+    }
+
+    const onebit::npu::Model m(out);
+    const auto& head = m.tensor("lm_head.weight");
+    check(head.shape.size() == 2 && head.shape.at(1) == int64_t(onebit::npu::kTileBytesF32),
+          "fp32 import: I8 tensors are the 6,144-byte q4_1f chunks");
+    check(head.tiles() == int(head.shape.at(0)),
+          "fp32 import: the loader counts one tile per 6,144-byte row");
+
+    long long groups = 0, bf16_lost = 0;
+    auto verify = [&](const std::string& name, const pi::Q4& q) {
+        const auto& t = m.tensor(name);
+        const int K = q.K, KT = (K + 255) / 256;
+        check(t.shape.size() == 2 && t.shape.at(1) == int64_t(onebit::npu::kTileBytesF32),
+              name + ": is a q4_1f tensor (" + std::to_string(t.shape.at(1)) + " B rows)");
+        check(t.shape.at(0) == int64_t((q.N / 32) * KT), name + ": tile count follows from the 32x256 grid");
+        std::vector<float> sc(256), zr(256);
+        bool params_ok = true, codes_ok = true;
+        for (int i = 0; i < int(t.shape.at(0)); ++i) {
+            const int rt = i / KT, kt = i % KT;
+            const uint8_t* tl = t.data + size_t(i) * onebit::npu::kTileBytesF32;
+            onebit::npu::q4nx::q4_1_params(onebit::npu::q4nx::Chunk::Q4_1F, tl, sc.data(), zr.data());
+            for (int r = 0; r < 32; ++r)
+                for (int g = 0; g < 8; ++g) {
+                    const int k = kt * 256 + g * 32;
+                    if (k >= K) continue;
+                    const size_t idx = size_t(rt * 32 + r) * (K / 32) + size_t(kt * 8 + g);
+                    const float want_s = q.scale[idx], want_z = q.zero[idx];
+                    ++groups;
+                    if (std::memcmp(&sc[g * 32 + r], &want_s, 4) != 0 ||
+                        std::memcmp(&zr[g * 32 + r], &want_z, 4) != 0)
+                        params_ok = false;
+                    const float bs = onebit::npu::bf16_to_f32(onebit::npu::f32_to_bf16(want_s));
+                    const float bz = onebit::npu::bf16_to_f32(onebit::npu::f32_to_bf16(want_z));
+                    if (std::memcmp(&bs, &want_s, 4) != 0 || std::memcmp(&bz, &want_z, 4) != 0) ++bf16_lost;
+                }
+            for (int h = 0; h < 2; ++h)
+                for (int g = 0; g < 8; ++g)
+                    for (int j = 0; j < 32; ++j) {
+                        const int k = kt * 256 + g * 32 + j;
+                        if (k >= K) continue;
+                        for (int r2 = 0; r2 < 8; ++r2) {
+                            const uint8_t b = tl[2048 + size_t(h) * 2048 + size_t(g) * 256 + size_t(j) * 8 +
+                                                size_t(r2)];
+                            const size_t row = size_t(rt * 32 + h * 16 + r2 * 2);
+                            if ((b & 0x0F) != (q.codes[row * K + k] & 0x0F) ||
+                                (b >> 4) != (q.codes[(row + 1) * K + k] & 0x0F))
+                                codes_ok = false;
+                        }
+                    }
+        }
+        check(params_ok, name + ": every per-group scale and zero is the pack's, bit for bit");
+        check(codes_ok, name + ": every code is at its q4_1 index, unchanged");
+    };
+    verify("model.layers.0.self_attn.q_proj.weight", pi::q_from_tiles(q_proj0));
+    verify("model.layers.0.mlp.down_proj.weight", pi::q_from_tiles(down0));
+    verify("lm_head.weight", pi::decode_matmulnbits(qw.data(), scales.data(), qz.data(), V, H, block));
+    check(groups > 0 && bf16_lost > 0,
+          "fp32 import control: the bf16 form would have lost " + std::to_string(bf16_lost) + " of " +
+              std::to_string(groups) + " groups on this data, so the check is live");
+
+    // ── the serve boundary (engine#1185): the same container in the device's form ────────────────
+    // `1bit serve -m <imported dir> --device npu` loads an imported container through the per-op
+    // forward, whose loader streams 5,120-byte q4_1 chunks and refuses a q4nx-2 container rather
+    // than misread it (npu/forward/src/model.c). Q4nxNpuForward::init_impl converts first through
+    // npu/q4nx_device.cpp; this is that conversion, and the proof it changes only the parameter
+    // width: the device tiles are byte-identical to the old bf16 container's for the same weights.
+    const std::string cache = (fs::temp_directory_path() /
+                               ("oga_q4nx_device_form." + std::to_string(::getpid()))).string();
+    fs::remove_all(cache);
+    {
+        const auto form = onebit::npu::q4nx::device_form(out + "/model.q4nx", cache);
+        check(form.converted && !form.reused && form.tensors > 0 && form.tiles > 0,
+              "device form: the imported container converts (" + std::to_string(form.tensors) +
+                  " tensors, " + std::to_string(form.tiles) + " tiles)");
+        check(form.model != out + "/model.q4nx" && fs::exists(form.model),
+              "device form: a cache directory, not the imported container in place");
+        check(fs::exists(out + "/model.q4nx") &&
+                  q4_1f_tensors(container_table(out + "/model.q4nx")) > 0,
+              "device form: the imported container on disk is unchanged and still q4nx-2");
+        // (c) the forward loader's refusal trigger is absent from what it is handed ...
+        const json converted_table = container_table(form.model);
+        check(q4_1f_tensors(converted_table) == 0,
+              "device form: the converted container holds no q4_1f chunk, so the loader's refusal "
+              "cannot fire on it");
+        check(converted_table.at("__metadata__").at("layout") == "q4nx-1",
+              "device form: the converted container says it holds the bf16 q4_1 form");
+        // ... and the safety net still sees the trigger on the file it would otherwise load.
+        check(q4_1f_tensors(container_table(out + "/model.q4nx")) > 0,
+              "device form control: the unconverted container still trips the loader's refusal");
+
+        const onebit::npu::Model conv(form.dir);
+        check(conv.tensor("lm_head.weight").shape.at(1) == int64_t(onebit::npu::kTileBytes),
+              "device form: the converted I8 tensors are 5,120-byte q4_1 chunks");
+        auto same_tiles = [&](const std::string& name, const pi::Q4& q) {
+            std::vector<uint8_t> old_form;
+            pi::tile_q4_1(q, old_form);
+            const auto& t = conv.tensor(name);
+            check(t.bytes == old_form.size() && std::memcmp(t.data, old_form.data(), old_form.size()) == 0,
+                  name + ": the converted device tiles are byte-identical to the old bf16 container's (" +
+                      std::to_string(t.bytes) + " B)");
+        };
+        same_tiles("model.layers.0.self_attn.q_proj.weight", pi::q_from_tiles(q_proj0));
+        same_tiles("model.layers.0.mlp.down_proj.weight", pi::q_from_tiles(down0));
+        same_tiles("lm_head.weight", pi::decode_matmulnbits(qw.data(), scales.data(), qz.data(), V, H, block));
+
+        // the fast lane's boundary (npu/pack.cpp) does the same repack in memory
+        std::vector<uint8_t> lane;
+        const uint8_t* lane_tiles = onebit::npu::device_tiles(m.tensor("model.layers.0.self_attn.q_proj.weight"),
+                                                              lane);
+        std::vector<uint8_t> want_lane;
+        pi::tile_q4_1(pi::q_from_tiles(q_proj0), want_lane);
+        check(lane_tiles == lane.data() && lane == want_lane,
+              "lane: device_tiles repacks a q4_1f projection to the old bf16 form's tiles, bit for bit");
+
+        const auto again = onebit::npu::q4nx::device_form(out + "/model.q4nx", cache);
+        check(again.converted && again.reused && again.model == form.model,
+              "device form: a second load reuses the cached conversion");
+        const auto already = onebit::npu::q4nx::device_form(form.model, cache);
+        check(!already.converted && already.dir == form.dir,
+              "device form: a container already in the device form is returned unchanged");
+        std::printf("device form: %lld I8 tensor(s), %lld tile(s) repacked; %d q4_1f trigger(s) on "
+                    "the imported container, 0 on the converted one, and the device tiles are the old "
+                    "bf16 form's byte for byte\n",
+                    form.tensors, form.tiles, q4_1f_tensors(container_table(out + "/model.q4nx")));
+    }
+    fs::remove_all(cache);
+    fs::remove_all(out);
+    fs::remove_all(dir);
+    std::printf("fp32 import: %lld groups bit-equal to the pack; the bf16 form loses %lld\n", groups, bf16_lost);
 }
 
 }  // namespace
@@ -1321,6 +1755,7 @@ int main(int argc, char** argv) {
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);
+        test_q4_1f();
         test_attn_tile(golden_dir);
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
@@ -1328,6 +1763,7 @@ int main(int argc, char** argv) {
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
+        test_import_fp32_params(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);
         test_weight_layout();
         if (pack_ran) test_pack(pack, golden_dir);

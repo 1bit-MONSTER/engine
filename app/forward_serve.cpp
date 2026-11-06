@@ -40,6 +40,7 @@
 #include "npu_answer_parser.h"
 #include "npu_chatml.h"
 #include "npu_grammar.h"
+#include "npu_load_retry.h"  // engine#1241: a refused NPU context names another client, not a dead device
 #include "npu_prefix_cache.h"
 #include "npu_prompt_ids.h"
 #include "npu_sampling.h"
@@ -867,7 +868,17 @@ int run_forward_serve(int argc, char** argv) {
     std::unique_ptr<xrt::device> dev;
     if (!host_gemm) dev = std::make_unique<xrt::device>(0);
     const bool ok = dev ? e.fwd->init(*dev, model.c_str(), kernels) : e.fwd->init_host(model.c_str(), kernels);
-    if (!ok) throw std::runtime_error(std::string("forward init failed: ") + e.fwd->last_error());
+    if (!ok) {
+        const std::string why = std::string("forward init failed: ") + e.fwd->last_error();
+        // engine#1241 cure 2: the driver refuses a second client with code 102 / ENODEV, the same message a dead array
+        // answers, so "No such device" reads as a broken device or ELF. If another pid holds the device lock, say so
+        // now: the array is merely owned, and the fix is to wait for that process, not to rebuild anything.
+        if (npu_contexts_refused(why)) {
+            const std::string held = npu_lock_refusal_note();
+            if (!held.empty()) std::fprintf(stderr, "%s\n", held.c_str());
+        }
+        throw std::runtime_error(why);
+    }
 
     // A d3 pack keeps its decision head next to model.q4nx (npu/decision.h). Both files present means
     // the decision routes come up beside the chat ones; a pack without them is a chat model, which is

@@ -1477,6 +1477,21 @@ stating precisely because the limit is *not* the hwctx count:
   within one process -- the per-op route, the per-block-count route -- is unchanged, and the
   model-generic route that holds one context per design was re-measured on it with **8** contexts in
   one process (engine#1084).
+- **The "long context" hang was this, too.** The 2026-11-04 wedge that
+  [engine#1051](https://github.com/1bit-MONSTER/engine/issues/1051) first reported as a long-context
+  hang (prefill position 635, the per-block-count route, `power/control=on`) ran while other serves
+  held the device, on a module without `0003`. The per-block-count route destroys its context and
+  creates a new one every 32 positions, so a long prompt goes back to the solver ~19 times per 1 200
+  positions, and every trip was a chance to be handed a partition another client already held. On
+  the `0003` module (`EE1F36A2B9BA294CE11AD80`, 2026-11-06, one client, the issue's own payload and
+  kernel set, NPU held awake) both routes ran 300 / 640 / 1 200 / 2 150 positions with 0 TDRs, 8/8
+  rows. Position is not the variable, and there is no position below which it stays safe: the two-client wedges above happened at the
+  second chunk. One cost remains, and it is the per-block-count route's own. Between two block counts
+  that route holds no context, so the partition is free, and a client that arrives in that gap takes
+  it. The first client's next create is then refused (`code 102`) and its request fails part-way
+  (measured, 1/1). It fails with an error, not a hang. The resident route (the default, one
+  context for the process lifetime) keeps its partition and does not have this gap, and the engine's
+  exclusive lock keeps a second serve of ours out of it anyway.
 
 So `--npu-streams N` **needs a kernel set that asks for fewer columns than the array has**: with the
 sets shipped today a second stream is refused rather than slow, and the throughput numbers below are

@@ -153,7 +153,12 @@ def dims_from_config(cfg):
         v = int(cfg["vocab_size"])
     except (KeyError, TypeError, ValueError, ZeroDivisionError):
         return None
-    return {"H": h, "QD": qd, "KVD": kvd, "IM": im, "V": v}
+    # A gated attention layer's q_proj emits q AND the output gate, so it holds 2*QD rows; reading
+    # it as QD turns the real d3 pack into a phantom 512-padded grid (engine#796). A JSON bool is
+    # an int to the forward (q4nx_config_int), so both spellings mean the same thing.
+    gate = cfg.get("attn_output_gate")
+    qg = qd * 2 if (gate is True or gate == 1) else qd
+    return {"H": h, "QD": qd, "QG": qg, "KVD": kvd, "IM": im, "V": v}
 
 
 def expected_rc(name, d):
@@ -162,7 +167,7 @@ def expected_rc(name, d):
         return d["V"], d["H"]
     tail = name.split(".", 3)[3] if name.startswith("model.layers.") and name.count(".") > 3 else ""
     return {
-        "self_attn.q_proj.weight": (d["QD"], d["H"]),
+        "self_attn.q_proj.weight": (d["QG"], d["H"]),
         "self_attn.k_proj.weight": (d["KVD"], d["H"]),
         "self_attn.v_proj.weight": (d["KVD"], d["H"]),
         "self_attn.o_proj.weight": (d["H"], d["QD"]),
@@ -492,6 +497,22 @@ def self_test():
             bad.append(f"the padding explanation is not what the grids say: {gw}")
         if geometry_warnings({"norm.weight": {"dtype": "F32", "shape": [1536]}}, dims):
             bad.append("a non-quantized tensor produced a geometry warning")
+
+    # A gated attention layer's q_proj holds 2*QD rows (attn_output_gate, engine#796): the real d3
+    # pack's q_proj is 512 tiles of 32x256, i.e. 4096x1024 rows and cols. Reading it as QD rows
+    # made the shipped d3-lite-conv warn "columns padded 1024 -> 2048" on all six full-attention
+    # layers and fail --strict, i.e. the checker called a correct container broken.
+    d3cfg = {"hidden_size": 1024, "num_attention_heads": 8, "num_key_value_heads": 2,
+             "head_dim": 256, "intermediate_size": 3584, "vocab_size": 248320}
+    gated = dims_from_config(dict(d3cfg, attn_output_gate=True))
+    plain = dims_from_config(d3cfg)
+    qproj = {"model.layers.3.self_attn.q_proj.weight": {"dtype": "I8", "shape": [512, 5120]}}
+    if not gated or gated["QG"] != 2 * gated["QD"]:
+        bad.append(f"attn_output_gate did not double q_proj's rows: {gated}")
+    elif geometry_warnings(qproj, gated):
+        bad.append(f"a gated q_proj on its own grid warned: {geometry_warnings(qproj, gated)}")
+    elif not geometry_warnings(qproj, plain):
+        bad.append("the same q_proj is quiet without attn_output_gate, so the case proves nothing")
     if bad:
         print("self-test FAILED:")
         for b in bad:
@@ -499,8 +520,9 @@ def self_test():
         return 1
     print("self-test passed: 4 chunk kinds counted (q4_1, q4_1f, Q4_K, Q8), unknown chunk size "
           "refused, short tensor refused, directory scans every .q4nx, a Q8 tile written in A's order "
-          "decodes as A and not as B, a no-Q8 container claims no code order, and a 512-padded grid "
-          "is named as padded while the model's own grid is quiet")
+          "decodes as A and not as B, a no-Q8 container claims no code order, a 512-padded grid "
+          "is named as padded while the model's own grid is quiet, and a gated (attn_output_gate) "
+          "q_proj's 2*QD rows are the model's own grid")
     return 0
 
 

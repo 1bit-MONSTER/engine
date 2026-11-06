@@ -17,11 +17,15 @@
 # patch-sfs.sh <src.sfs> <path-in-sfs> <replacement> <out.sfs>
 # patch-sfs.sh --manifest <manifest> <src.sfs> <out.sfs>
 #
-# The manifest form is the same tool for a cycle that changes SEVERAL paths (c29: nine - the console menu and TUI, the
+# The manifest form is the same tool for a cycle that changes SEVERAL paths (c29: six - the console menu and TUI, the
 # release check, the installer, the selftest the image never shipped, the lemonade service's models dir, and the whole
 # embedded payload tree). One line per path, `<path-in-sfs><TAB><host-source>`, `#` and blank lines ignored. A source may
 # be a DIRECTORY (the payload roll: `opt/1bit-package<TAB>/home/.../lemonade-onebit-rc-...`), and a target the source SFS
 # does not have is an ADDITION rather than a refusal, because a new file is a normal thing for a cycle to carry.
+# A third, optional field is the MODE for a path the SFS does not have yet, and it is a fact about the image rather than
+# about the file it came from: the repo keeps `os/mini/selftest.sh` 0775 and the build installs it 0755, so an addition
+# that inherited the source mode shipped a group-writable executable in /usr/local/bin and looked fine in every log.
+#
 # Everything the single-file form proves is still proven, one target at a time: the trees must differ only inside the
 # declared set (and each declared target must actually differ), the repack must unpack to the tree that was packed, and
 # the metadata comparison covers the declared set in both directions. Additionally the packed SFS is refused if ANY
@@ -52,18 +56,19 @@ usage() { sed -n "/^# $prog /,/^# Run as root/p" "$0" | sed 's/^# \{0,1\}//'; }
 [ $# -eq 4 ] || { usage >&2; exit 1; }
 manifest=''
 if [ "${1:-}" = --manifest ]; then manifest=$2; src=$3; out=$4; target=''; repl=''; else src=$1 target=$2 repl=$3 out=$4; fi
-targets=(); repls=()
+targets=(); repls=(); modes=()
 if [ -n "$manifest" ]; then
     [ -f "$manifest" ] || { echo "$prog: no manifest at $manifest" >&2; exit 1; }
-    while IFS=$'\t' read -r t r; do
+    while IFS=$'\t' read -r t r m; do
         case ${t:-} in ''|'#'*) continue;; esac
         [ -n "${r:-}" ] || { echo "$prog: manifest line has a path and no source (TAB-separated): $t" >&2; exit 1; }
         case $t in /*|*..*) echo "$prog: manifest path must be relative and must not climb: $t" >&2; exit 1;; esac
-        targets+=("$t"); repls+=("$r")
+        case ${m:-} in ''|[0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;; *) echo "$prog: manifest mode for $t is not octal: $m" >&2; exit 1;; esac
+        targets+=("$t"); repls+=("$r"); modes+=("${m:-}")
     done < "$manifest"
     [ ${#targets[@]} -gt 0 ] || { echo "$prog: $manifest declares no paths" >&2; exit 1; }
 else
-    targets=("$target"); repls=("$repl")
+    targets=("$target"); repls=("$repl"); modes=("")
 fi
 for f in "$src" "${repls[@]}"; do [ -f "$f" ] || [ -d "$f" ] || { echo "$prog: no $f" >&2; exit 1; }; done
 [ "$(id -u)" = 0 ] || { echo "$prog: run as root (uid/gid and setuid bits are part of the artifact)" >&2; exit 1; }
@@ -112,8 +117,9 @@ for i in "${!targets[@]}"; do
         install -m "$(stat -c%a "$work/src/$t")" -o root -g root "$r" "$work/new/$t"   # inherit the mode
         echo "$prog: $t $old_sha -> $new_sha"
     else
-        install -D -m "$(stat -c%a "$r")" -o root -g root "$r" "$work/new/$t"
-        echo "$prog: $t (new, $(stat -c%s "$r") B, mode $(stat -c%a "$r"))"
+        m=${modes[$i]:-$(stat -c%a "$r")}   # the declared mode, or the source's when the manifest does not state one
+        install -D -m "$m" -o root -g root "$r" "$work/new/$t"
+        echo "$prog: $t (new, $(stat -c%s "$r") B, mode $m)"
     fi
 done
 

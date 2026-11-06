@@ -80,7 +80,7 @@ printf 'new selftest\n' > "$work/new-selftest"
 printf 'new lemonade service\n' > "$work/new-lemonade"
 printf 'lemond v2\n' > "$repl/payload/bin/lemond"
 printf 'brand new backend\n' > "$repl/payload/bin/new-backend"
-printf 'usr/local/bin/1bit-selftest\t%s\nopt/1bit-package\t%s\netc/init.d/10lemonade\t%s\n' \
+printf 'usr/local/bin/1bit-selftest\t%s\t0755\nopt/1bit-package\t%s\netc/init.d/10lemonade\t%s\n' \
     "$work/new-selftest" "$repl/payload" "$work/new-lemonade" > "$work/manifest"
 "$tool" --manifest "$work/manifest" "$work/base.sfs" "$work/two.sfs" >"$work/two.log" 2>&1
 is "manifest: rc" "$?" "0"
@@ -88,7 +88,9 @@ if [ -s "$work/two.sfs" ]; then
     u=$work/two-unpack; unsquashfs -q -n -d "$u" "$work/two.sfs" >/dev/null 2>&1
     is "manifest: new path added" "$(cat "$u/usr/local/bin/1bit-selftest" 2>/dev/null)" "new selftest"
     is "manifest: new path owner" "$(stat -c%u:%g "$u/usr/local/bin/1bit-selftest" 2>/dev/null)" "0:0"
-    is "manifest: added file mode" "$(stat -c%a "$u/usr/local/bin/1bit-selftest" 2>/dev/null)" "644"
+    # 0755 from the manifest, NOT the source file's mode: the repo keeps selftest.sh 0775 and the build installs it 0755,
+    # so an addition that inherited the source mode shipped a group-writable executable and no log said so.
+    is "manifest: added file mode" "$(stat -c%a "$u/usr/local/bin/1bit-selftest" 2>/dev/null)" "755"
     is "manifest: changed file" "$(cat "$u/etc/init.d/10lemonade")" "new lemonade service"
     is "manifest: changed file keeps its mode" "$(stat -c%a "$u/etc/init.d/10lemonade")" "750"
     is "manifest: directory replaced" "$(cat "$u/opt/1bit-package/bin/lemond")" "lemond v2"
@@ -120,6 +122,9 @@ if [ $? = 0 ]; then bad "identical bytes: exited 0"; else ok "identical bytes: r
 # a manifest row with no source
 printf 'usr/local/bin/1bit-selftest\n' > "$work/badman"
 refuse "manifest row with no source" "no source" "$tool" --manifest "$work/badman" "$work/base.sfs" "$work/bad.sfs"
+# a manifest mode that is not octal
+printf 'usr/local/bin/1bit-selftest\t%s\t07x5\n' "$work/new-selftest" > "$work/badmode"
+refuse "manifest mode is not octal" "is not octal" "$tool" --manifest "$work/badmode" "$work/base.sfs" "$work/bad3.sfs"
 # not an SFS
 printf 'not a filesystem\n' > "$work/bogus.sfs"
 refuse "source is not an SFS" "unsquashfs failed" "$tool" --manifest "$work/manifest" "$work/bogus.sfs" "$work/bad2.sfs"

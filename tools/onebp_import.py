@@ -16,7 +16,11 @@
 """Import a 1BP package (`.1bp`) as a model-generic NPU container (docs/npu.md).
 
 usage: tools/onebp_import.py <model.1bp> <out dir> --config <snapshot dir> [--embedding-from <gguf>]
-       tools/onebp_import.py --verify <model.1bp> <out dir>
+       tools/onebp_import.py --verify <model.1bp> <out dir> [--embedding-from <gguf>]
+
+`--verify` rebuilds the same plan as the import, so what the import needed it needs too: a v1 package
+is checked with `--embedding-from` again (the two tensors it lacks are part of the compared set), and
+`--config` is not read at all.
 
 A 1BP package is one file: a 256-byte header, a tensor index, then the weights.  Its 4-bit payload is a
 32 x 256 tile of 5120 B with the same *value* convention as this engine's (`scale*q + min`, unsigned q),
@@ -287,7 +291,9 @@ def main(argv=None):
     p.add_argument("--embedding-from", help="GGUF to take a missing token_embd.weight/lm_head from "
                                             "(v1 packages carry neither); bf16/f16 source recommended")
     p.add_argument("--verify", action="store_true",
-                   help="check the container on disk against the package, byte for byte, and exit")
+                   help="check the container on disk against the package, byte for byte, and exit -- "
+                        "takes the same --embedding-from the import took (a v1 package's plan includes "
+                        "the two tensors it does not carry), and no --config")
     args = p.parse_args(argv)
     if not args.verify and (not args.out_dir or not args.config):
         p.error("<out dir> and --config are required (or --verify)")

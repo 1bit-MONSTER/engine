@@ -380,7 +380,8 @@ the same permutation of the package's slice (and against the GGUF behind any ten
 on `ZR1-1.5B-1BP` the decoded weights then correlate 0.003 with the model — fluent noise that still looks
 like weights, the failure mode of [engine#1110](https://github.com/1bit-MONSTER/engine/issues/1110) —
 and 0.995-0.997 after the permutation. A v1 package carries no `token_embd`/`lm_head`, so importing one needs
-`--embedding-from <gguf>`; the tool stops rather than write a container that cannot answer. Any tensor
+`--embedding-from <gguf>` (and `--verify` of it takes the same flag: it rebuilds the same plan); the tool stops
+rather than write a container that cannot answer. Any tensor
 with no Q4NX mapping is refused **by name** (`no Q4NX name for blk.0.cca_conv_grp.weight`) instead of
 guessed: Zaya1's grouped conv, EDA router and fused `ffn_gate_up_exps` have no op in `npu/forward` yet,
 so a package of that architecture is not importable — see `~/briefs/ZAYA-OPFAMILY-NOTE.md` for the op

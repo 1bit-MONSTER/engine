@@ -17,8 +17,8 @@
     "stream_per_token_gb": 12.93,
     "tokens": 7
   },
-  "instrument": "NPU_PHASE_PROF=1, the serve's own [ph] tok wall= line, median of the 7 steady-state tokens (first token dropped); request walls are not this number, they pay the per-serve image fill once",
-  "repeats": 7,
+  "instrument": "NPU_PHASE_PROF=1, one run per arm: the serve's own [ph] tok wall= line, median of its 7 steady-state tokens (first token dropped); request walls are not this number, they pay the per-serve image fill once",
+  "repeats": 1,
   "timestamp": "2026-11-02T23:50:00Z",
   "source": "~/briefs/TBONSAI-SPEED-STATE.md, 2026-11-02 20:05 AST entry: three npu-hold tickets (19:47, 19:48, 19:49 AST) on :18099, amdxdna counter 0 in each, spread 409-412 ms/token",
   "notes": "control arm of the P3 (#802) pair: the same container file, the same binary and the same box one minute from bonsai2-27b-t2s2-20261102.json, so the ratio is a weight-format difference and nothing else. This is the 4.5 bpw path the 2-bit stream replaced; it is not a candidate, it is the denominator. What would make this wrong: measuring it in a different window than the t2s arm (the pair is only valid adjacent)."

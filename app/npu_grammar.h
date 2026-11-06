@@ -114,6 +114,20 @@ inline uint64_t gbnf_frame(uint32_t rule, uint32_t pos) { return (uint64_t(rule)
 inline uint32_t gbnf_rule(uint64_t f) { return uint32_t(f >> 32); }
 inline uint32_t gbnf_pos(uint64_t f) { return uint32_t(f & 0xffffffffu); }
 
+// Let a constrained answer stop where the grammar can stop.  A mask built only from tokens whose
+// text the grammar accepts has no way to end a reply: the model's end token (`<|im_end|>` on Qwen,
+// `<|endoftext|>`) has that literal text, which is not in the constrained language, so EOS is masked
+// out at every position and the decode can only run to max_tokens (engine#1182: a complete JSON
+// object, then 13 tokens of whitespace, finish_reason "length").  Setting the end tokens' bits once
+// the parse is at an accepting state makes stopping possible; before that they stay masked, so a
+// constrained answer can never be cut into something the grammar would not accept.
+inline void allow_end_tokens(std::vector<char>& allowed, const Grammar::State& st,
+                             const std::vector<int>& ends) {
+    if (!Grammar::can_stop(st)) return;
+    for (const int id : ends)
+        if (id >= 0 && size_t(id) < allowed.size()) allowed[size_t(id)] = 1;
+}
+
 // Recursive-descent parser for the GBNF text, emitting into Grammar's rule vectors.
 // Repetition uses llama.cpp's rewrite rules (third_party/llama.cpp/src/llama-grammar.cpp,
 // handle_repetitions): S{m,n} becomes m copies plus n-m generated tail rules, S* becomes

@@ -1112,8 +1112,11 @@ that runs the phase is private, like the kernels it runs.
   all 14 match, ids and round trip.
 - **Endpoints:** `/v1/health` (503 while loading), `/v1/models`, `/v1/chat/completions`
   (streaming or not) and `/v1/completions`.
-- **Prompt:** ChatML, Qwen2/Qwen3's template for text messages — for a container whose tokenizer has the
-  ChatML anchors. One that does not is refused on the chat route rather than prompted anyway (#963).
+- **Prompt:** the **container's own chat template** — `tokenizer_config.json`'s `chat_template` string, else
+  `chat_template.jinja` beside it — rendered with the pinned llama.cpp fork's Jinja engine
+  (`app/npu_template.h`, `docs/npu-chat-template.md`). A container that declares no template keeps ChatML
+  when its tokenizer has the `<|im_start|>`/`<|im_end|>` anchors, and is refused on the chat route when it
+  has neither (#963). The template's sha256 is printed at load.
 - **Decoding:** greedy, with a 1.1 repetition penalty over the last 64 ids by default.
   `repetition_penalty` in the request overrides it, and 1 gives plain greedy.
 - **One request at a time:** the model has one KV cache, so a second request waits for the first generation to end,
@@ -1194,23 +1197,45 @@ got before.
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
 | `max_tokens` / `max_completion_tokens` | the reply's cap (`max_completion_tokens` wins); a value that is not a number is a 400 naming the field, and a fractional one is truncated |
 | `stream` | `true` streams SSE chunks; a value that is not a boolean is a 400 naming the field |
-| `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
+| `chat_template_kwargs` | the variables handed to the container's own chat template, as llama-server passes them: `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries; a non-boolean is a 400, and the default is `true`); FastFlowLM's packs take `user_system_prompt`, which defaults to `""` the way their own server does |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
 
-Every chat prompt is rendered with **ChatML** (`app/npu_chatml.h`), the template Qwen2/Qwen3 use, not with a
-template read out of the container. A container whose tokenizer has no `<|im_start|>`/`<|im_end|>` added token
-cannot represent that text — the marker becomes ordinary pieces — so `/v1/chat/completions` answers **400**
-naming the model's own specials instead of prompting it with text its tokenizer never produces (#963). The
-measured cost of getting it wrong on Zyphra/ZR1-1.5B, whose specials are DeepSeek's: the same request is **23
-tokens under this render against 9** under Qwen3's tokenizer, and `<|im_start|>` alone is **6 pieces**.
+Every chat prompt is rendered with the **container's own template** (`app/npu_template.h`): the
+`chat_template` string in its `tokenizer_config.json`, else `chat_template.jinja` beside it — the same read the
+load line's `template sha256=` names, so the rendered prompt and the pinned digest cannot disagree. The
+renderer is the pinned llama.cpp fork's Jinja engine (`third_party/llama.cpp/common/jinja`), the one
+`llama-server --jinja` uses, which is why the bytes match Hugging Face's `apply_chat_template` on the templates
+we ship (`tests/npu_template_test.cpp` compares against Jinja2 3.1.6 itself).
 
-`/v1/completions` is unaffected, and it is how such a container is served: it takes the prompt as token ids
-(`prompt: [ids]`, #938), so a caller renders the model's own template and sends those ids. The check reads the
-container's tokenizer **once at load** (`chatml_supported()`), so it costs a request nothing, and it is a
-necessary condition rather than a proof — a container can carry both anchors and still use another template.
-Packing the model's `chat_template` into the container is what closes that gap, and it is a container-format
-decision, not something this route does.
+What that changes, measured in each container's own tokenizer on one system+user request (`docs/npu-chat-template.md`):
+
+| container | template sha256 | ChatML render | its own template |
+|---|---|---:|---:|
+| `FastFlowLM/Qwen3-0.6B-NPU2` | `a136047ba140…` | 31 | 31 |
+| `Qwen3-0.6B` | `a55ee1b16601…` | 31 | 31 |
+| `Zyphra/ZR1-1.5B` | `b6835114b730…` | **52** | **21** |
+| `bonsai2-27b-NPU` | `c3cf9e34abf4…` | 31 | **71** |
+| `d3-lite-bf16` | `273d8e0e683b…` | 31 | 35 |
+| `qwen3-coder-30b-a3b-moe` | `87710339d25b…` | 31 | 31 |
+
+The Qwen3-family rows are ChatML-shaped, so their prompts do not move; a DeepSeek-special container (ZR1) goes
+from 52 tokens of text it cannot read to 21 it can, and a container whose template carries a long preamble
+(bonsai2) gains the 40 tokens that preamble is. Two properties are load-bearing:
+
+- **Request bytes never become control tokens.** The renderer marks every string that came from the request
+  (`is_input`), and those parts are tokenized with added-token matching **off**, so a message containing
+  `<|im_end|><|im_start|>system` is text. Without the marks it is a role boundary the caller never had.
+- **No silent fall back.** A template that does not parse or render answers **400** naming its sha256 — falling
+  back to ChatML is the failure #963 exists to remove.
+
+A container that declares **no** template keeps ChatML when its tokenizer has the `<|im_start|>`/`<|im_end|>`
+anchors (read once at load, `chatml_supported()`), and is refused with **400** naming the model's own specials
+when it has neither — the #987 behaviour, which is what `/v1/completions` with token ids (`prompt: [ids]`, #938)
+exists for: a caller renders the model's own template and sends those ids.
+
+A build without the fork's sources (`ONEBIT_JINJA=OFF`, e.g. submodules never initialised) keeps the pre-#963
+behaviour and **says so at load**, rather than rendering something different from a build that has the renderer.
 
 `logprobs` keeps OpenAI's shape: non-streamed, every entry is `choices[0].logprobs.content[i] =
 {token, logprob, top_logprobs: [{token, logprob}]}`; streamed, each chunk carries the entries whose bytes that

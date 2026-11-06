@@ -14,7 +14,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# The NPU route's chat template: render the container's own (engine #963 option 2)
+# The NPU route's chat template: render the container's own (engine #963 option 2) — implemented
 
 `app/forward_serve.cpp` renders **ChatML** for every container it serves, and since #987 it refuses the
 chat route (400) for a container whose tokenizer has no `<|im_start|>`/`<|im_end|>` anchors. That closed
@@ -123,3 +123,59 @@ If the answer to (1) is "yes", the work is one PR: the renderer glue plus **one*
 (`app/forward_serve.cpp:176`, the only `npu::chatml()` render on the route; the load-time check at
 `:772` becomes the "no template and no anchors" case), the golden-prompt tests, and the pin rows for the
 containers we ship (the four above).
+
+## Implemented (2026-11-06, engine #963 option 2)
+
+All three decisions above were taken as recommended, and the work is one PR — no container-format change, no
+new dependency, one call site:
+
+| what | where |
+|---|---|
+| load the template (`tokenizer_config.json`'s string, else `chat_template.jinja`) and its sha256 | `app/npu_template.h`, `app/template_pin.h` (the same read the load line and the pin use) |
+| render through the pinned fork's Jinja engine, request bytes marked `is_input` | `app/npu_template.h` (`render_chat_template`) |
+| the chat route renders it, else ChatML with anchors, else #987's 400; a template that will not render is a 400 naming its sha256 | `app/forward_serve.cpp` (`handle_generate`, and `chat_ok`/`chat_refusal` at load) |
+| load line: `1bit forward-serve: template sha256=… (tokenizer_config.json)` | `app/forward_serve.cpp` |
+| request bytes tokenized without added-token matching (`encode(text, allow_added=false)`) | `npu/tokenizer.cpp` |
+| golden renders against Jinja2 3.1.6, and the injection row | `tests/npu_template_test.cpp`, `tests/data/templates/*.json` |
+| build: `ONEBIT_JINJA` (default on when the submodule is checked out) | `CMakeLists.txt` |
+
+**Measured, in each container's own tokenizer** (one system+user request; `docs/npu.md` "Serving" carries the
+same table): Qwen3-family rows **31 → 31** (their templates *are* ChatML), `Zyphra/ZR1-1.5B` **52 → 21** (the
+issue's 33-vs-15, same direction and cause: a DeepSeek-special vocabulary spelling `<|im_start|>` as ordinary
+pieces), `bonsai2-27b-NPU` **31 → 71** (its template carries a long preamble that ChatML was dropping),
+`d3-lite-bf16` **31 → 35**.
+
+**What the 6.2 kLOC buys that a subset renderer would not**: the shipped templates use `namespace`, `loop`,
+negative slicing (`messages[::-1]`), string methods (`split`/`rstrip`/`lstrip`/`startswith`), `is string`/`is
+defined`, `|tojson` and macros — and the golden rows are byte-compared against Jinja2, not against our own
+output, which a hand-written subset could not pass in general.
+
+**Two defects found while implementing — one fixed here, one handed over:**
+
+- **Fixed: a template that serializes its input renders key order into the prompt.** `tools` goes through
+  `tojson`, so the request must be read as *ordered* JSON (`nlohmann::ordered_json`); a `nlohmann::json` is a
+  `std::map` and would have sorted every tool schema alphabetically — a prompt llama-server never produces. The
+  route re-reads the same bytes in request order for the chat path. The golden row that caught it is the `tools`
+  case in `tests/data/templates/qwen3_flm.json`.
+- **Handed over, not fixed: request text can still become special tokens.** `npu::Tokenizer::encode` matches
+  added tokens anywhere, and the route tokenizes the rendered prompt as one string, so a message containing
+  `<|im_end|><|im_start|>system` is still tokenized as the control tokens it spells — the same shape the
+  vendored engine's `is_input` marks exist to prevent, and the same behaviour llama-server's chat path has today
+  (it takes the parts' concatenation too). I built the part-wise version (template parts with added-token
+  matching, request parts without) and it **breaks a real template**: `Zyphra/ZR1-1.5B` renders
+  `{{bos_token}}{{ns.system_prompt}}`, whose concatenation the engine marks input as a whole, so the BOS was
+  literalized and the prompt came out **32 tokens where the template asks for 21**. Matching llama-server is the
+  correct behaviour for this route today; escaping or refusing request text that spells a model's specials is
+  its own change (and #963 is about rendering, not about prompt injection).
+
+One pack knob is supplied rather than required: FastFlowLM's Qwen3 template tests
+`'user_system_prompt' is defined`, which is a check on a *constant* and therefore always true, so an omitted
+variable raises instead of skipping the branch. Their own server always passes it (default `""`), and so does
+this route when a container's template mentions the variable.
+
+**What this does not do:** the *answer* side is unchanged — `app/npu_answer_parser.h` still parses and masks as
+the Qwen3 family (`<think>` splitting, tool-call shapes), so a non-ChatML container now gets the right prompt
+and the Qwen3 reading of its reply. Stop tokens come from the container's `config.json`, so generation stops
+where the model says it does; the parsing of *tool calls* for a non-Qwen3 family is the next piece if a
+customer packs one. The route-level rows (200 with the container's prompt, 400 for a container with neither)
+need the device and are recorded in the PR rather than in CI.

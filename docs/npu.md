@@ -278,6 +278,47 @@ Converters: `from_pb16i` (the engine's integer-exact image), `from_ptq1_0` and `
 ternary with an fp16 scale, lossless). `from_tq2_0` is refused unless asked, because TQ2_0's code 3
 means **+2** — it is not a ternary format, and clamping it to +1 changes weights.
 
+#### Gating a t2 target: bit-exact, not close
+
+The t2 chunk is what the plan layer streams for a ternary model, so more than one thing will consume
+it: the XDNA path today, a Hexagon target next (engine #804), anything after that. A consumer is
+accepted when it produces **the same y a CPU oracle produces, bit for bit**. Close is not enough and
+the difference is not pedantry: the layer above the GEMV is compared against the oracle, so a target
+that is 1e-7 off makes every gate above it either fail or be weakened to a tolerance that hides real
+faults.
+
+The order a t2 target has to follow, per row:
+
+```
+for each 128-K group g, left to right:
+    s   = exact int32 sum over the group of code[r][c] * x[c]      # |s| <= 128*127, no rounding
+    y  += float32(s) * float32(scale[r][g])                        # two roundings: mul, then add
+```
+
+Three things follow, and each one is a way to get it wrong: the group sum is integer and exact (never
+accumulated in float); the scale multiplies the *group sum*, not each code; and the groups enter the
+f32 accumulator in K order. Below four groups a float64 accumulator and a reversed group order give
+identical bits — the arithmetic cannot round yet — which is why the gate tests the production width.
+
+`tests/npu_t2_target_gate.py` is that gate. Its always-on half is numpy only (no model, no device, no
+gguf): it accepts the oracle's own y for three shapes including a single tile, and it refuses four
+plausible near-misses — a one-bit change, a truncated dump, float64 accumulation and a reversed group
+order — plus a tensor carrying a reserved code, which must contribute 0 and never `2 * scale`. Given
+`--tensor`, `--dump`, `--x`, `--n` and `--k` it runs the same comparison against a real tensor and a
+target's dumped y, printing the bit-exact count, the SNR and the first mismatch:
+
+```
+tests/npu_t2_target_gate.py --tensor blk_0_attn_qkv_weight.t2 --dump /tmp/y.bin \
+                            --x /tmp/x.bin --n 10240 --k 5120
+```
+
+Measured on the six layer-0 projections of Bonsai-2 (the GDN block's `attn_qkv`, `attn_gate`,
+`ssm_out` and `ffn_{gate,up,down}`), with a Hexagon target against this oracle: bit-exact on
+10240/6144/5120/17408/17408/5120 values, 375.7-377.7 dB, 0 reserved codes. The same gate refused the
+first build of that target for reading the tile grid k-outer instead of n-outer — the rule two
+paragraphs up — which is the reason it exists: the target was self-consistent, bit-exact against its
+own scalar reference, and decoding a different matrix than the container meant.
+
 ### The t2s stream (what the XDNA decode kernel reads)
 
 t2 is the container format: the decoder's byte order, for any consumer. The device does not want that
@@ -1682,6 +1723,17 @@ Two settings are worth knowing regardless, both measured in one window:
   after the first draft and trades base passes for lm-head calls almost exactly one-for-one: 0.598-0.623 s/token
   across arms that differ 2× in chain and 4× in head calls. It also leaves depths 3-4 with *no* offers, so any
   per-depth measurement is at `tau = 0`.
+
+**`tau` is part of the window, and the tooling now says so.** Because the gate stops the chain, a `tau = 0.6` ticket
+offers one or two depths where a `tau = 0` one offers four, so the two must never be pooled into one table — yet until
+now `mtp_acceptance --live` printed its window (`k`, tokens, hidden) nowhere: `--offline` has always stated it, the
+live path only echoed it in the harness' argv. `--live` now prints the same
+`== N prompts x M tokens, k=K tau=T, hidden=H` line at **init** (so a ticket killed at its hold still states its
+window), and `tools/mtp_depth_pool.py` reads it and reports the chain gate in the window header, names a pool that
+mixes two gates (`MIXED chain gate (tau)`), and says `tau unstated` for a log that predates the line rather than
+assuming `tau = 0`. `Options::tau` defaults to 0.6, and the tau = 0.6 acceptance row is still **not measured** — the
+published rows above are all `tau = 0`; that row is the next ticket, and it is now impossible to publish it by
+pooling two regimes by accident.
 
 **Refuted, so nobody builds it again**: folding the per-iteration step into the next verify batch (one pass per
 iteration instead of two) collapses the chain from **2.82 to 1.07** tokens/pass and depth-1 acceptance from **82 %

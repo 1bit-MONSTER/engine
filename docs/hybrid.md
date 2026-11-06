@@ -109,7 +109,8 @@ Naming: `--prefill-provider PATH` or `ONEBIT_HYBRID_PREFILL=PATH`; `ONEBIT_HYBRI
 The contract above is the file route, and on Strix Halo the file is the whole cost: every byte of the
 prompt's KV is written by the provider and read back by the decoder, through the page cache, for a
 handoff that never leaves the box. `ONEBIT_KV_SHARE=1` on `1bit serve` (the child llama-server inherits
-it) replaces the file with two dma-buf fds:
+it) replaces the file with two dma-buf fds. Both sides read it as "set and non-empty": `ONEBIT_KV_SHARE=0`
+still turns the route on, so the opt-out is an *unset* variable, not a zero:
 
 ```
 <provider> --tokens <ids file> --model <model> --layout <header file> --fds <n[,n...]>
@@ -144,6 +145,15 @@ route** for that request (`share 0.000 ms` in the log line) instead of leaving t
 the prompt itself. A handoff by file still keeps the prompt off the decoder's prefill path, which is the
 whole reason either route exists; only the handshake falls back, never a provider that already wrote into
 the region or an adopt that failed after it.
+
+A decoder that simply *cannot* export is a separate case, and until fork #212 it was fatal: `ggml-hrx` is the only
+backend in this tree with a dma-buf exporter, so a CPU decoder with `ONEBIT_KV_SHARE=1` exited at load
+(`shared KV: CPU allocation or dma-buf export failed`) and was never alive to refuse anything. The pin
+`d70b67bf0` (1bit-MONSTER/llama.cpp#212) makes it degrade instead: the decoder starts normally, warns once
+naming the backend (`share_degrade: CPU cannot export its memory; ...`), answers `?action=share` with a 501
+that names both causes (the flag was not set, *or* the KV backend cannot export), and its requests take the
+state-file route above. A decoder pinned before #212 has none of that, so a hybrid deployment running the flag
+needs this pin or later on both sides.
 
 ## Tests
 

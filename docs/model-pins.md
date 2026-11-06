@@ -109,6 +109,7 @@ with it, so "nobody could check this" never looks like "nothing moved".
 
 ```bash
 tools/pin_watch.py --check                  # the daily comparison; writes pin-report.md, exit 0/1/2 (above)
+tools/pin_watch.py --check --orgs A,B       # ...and census our own orgs for a repo nobody pinned
 tools/pin_watch.py --check --no-template    # same, without the template range reads
 tools/pin_watch.py --check --json sweep.json   # ...and the same sweep as JSON
 tools/pin_watch.py --pr-body REPO --from sweep.json  # that repo's PR body, from that sweep: no second read
@@ -122,6 +123,16 @@ Adding a repo is `--pin` followed by a hand edit of `used_for`: a pin exists bec
 ships or was converted from it, and that reason is what makes the entry reviewable. The template digest is
 per **file**, never per model — `Qwen3-4B`'s GGUF in our org and the quant the box serves carry two
 different templates, both legitimate.
+
+## The repos we publish (the other direction)
+
+`--check` iterates over pins, so a repo that was never pinned is invisible to it — including one we publish
+ourselves. `--check --orgs 1bit-MONSTER,bong-water-water-bong` (what the daily workflow runs) censuses both
+orgs with one listing each and reports every repo that **ships a model artifact or a chat template and is not
+in the table**, under *Published, not pinned*. Such a repo changes no pin, so no bump PR opens for it; it
+makes the run's first line say so, and adding it is `--pin` plus a `used_for` that says what published it.
+A repo of `.1bp` packs is not pinned here, and a private repo never is (next section) — both are filtered
+out, so the census cannot go permanently red over something this file must not contain.
 
 ## What is not pinned, and why
 

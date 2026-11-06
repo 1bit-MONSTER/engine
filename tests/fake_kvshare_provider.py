@@ -62,5 +62,9 @@ marker = os.environ.get("FAKE_KVSHARE_MARKER")
 if marker:
     with open(marker, "w") as f:
         json.dump({"fds": len(fds), "readable": readable, "n_ctx": params.get("n_ctx")}, f)
-print(json.dumps({"n_tokens": len(ids), "prefill_ms": 1.0, "fds": len(fds), "readable": readable,
+# FAKE_KVSHARE_SHORT=1: a provider that exits 0 but says it wrote one token fewer than it was handed. The adopt
+# takes the cells by count, so without a cross-check the decoder would take a region whose last row was never
+# written. The file route has carried this check since #941; tests/hybrid_kvshare_route.sh
+claimed = len(ids) - 1 if os.environ.get("FAKE_KVSHARE_SHORT") else len(ids)
+print(json.dumps({"n_tokens": claimed, "prefill_ms": 1.0, "fds": len(fds), "readable": readable,
                   "n_ctx": params.get("n_ctx")}), flush=True)

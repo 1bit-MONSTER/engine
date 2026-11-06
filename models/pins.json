@@ -1934,6 +1934,51 @@
     }
    }
   },
+  "bong-water-water-bong/ZR1-1.5B-Strix": {
+   "commit": "64f092fe4fddba1030d4ef1531d3e33dd09d584a",
+   "files": {
+    "chat_template.jinja": {
+     "lfs": false,
+     "oid": "02a1c3bce33f46690b9c40a93512034a92855392",
+     "size": 2237,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "checkpoint-100/chat_template.jinja": {
+     "lfs": false,
+     "oid": "02a1c3bce33f46690b9c40a93512034a92855392",
+     "size": 2237,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "checkpoint-100/tokenizer_config.json": {
+     "lfs": false,
+     "oid": "53aca4fc5079a4a4f8dbbed6f91c8a6183b9c9c7",
+     "size": 459,
+     "template_sha256": null
+    },
+    "checkpoint-200/chat_template.jinja": {
+     "lfs": false,
+     "oid": "02a1c3bce33f46690b9c40a93512034a92855392",
+     "size": 2237,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "checkpoint-200/tokenizer_config.json": {
+     "lfs": false,
+     "oid": "53aca4fc5079a4a4f8dbbed6f91c8a6183b9c9c7",
+     "size": 459,
+     "template_sha256": null
+    },
+    "tokenizer_config.json": {
+     "lfs": false,
+     "oid": "53aca4fc5079a4a4f8dbbed6f91c8a6183b9c9c7",
+     "size": 459,
+     "template_sha256": null
+    }
+   },
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: ZR1-1.5B-Strix (LoRA/checkpoint repo we host, chat_template.jinja)"
+   ]
+  },
   "bong-water-water-bong/bitnet-ternary-moe-gguf": {
    "commit": "951711ae3ce145e10ff9589e1dd510e8294205c2",
    "pinned": "2026-11-05",

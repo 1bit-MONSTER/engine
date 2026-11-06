@@ -55,6 +55,13 @@ start() {   # start <log> [env...]: serve on a free port with the fake backend, 
         echo "FAIL serve did not answer $api/health within $((SECONDS - deadline + ${HYBRID_ROUTE_START_S:-60}))s: last code $code, pid $pid $(kill -0 "$pid" 2>/dev/null && echo alive || echo gone)"
         tail -5 "$log" 2>/dev/null
     fi
+    # This serve's OWN slot directory, read off its child's argv: /tmp/1bit-hybrid-* is shared with every other
+    # serve on the box -- another test under `ctest -j`, another lane's serve -- so a check that globs it reports
+    # someone else's file as this route leaking one (measured: `ctest -j2` failed "no handoff file left in the
+    # slot directory" with 2 slot dirs alive and ours clean).
+    slotdir=$(for c in $(pgrep -P "$pid" 2>/dev/null); do
+        tr '\0' '\n' <"/proc/$c/cmdline" 2>/dev/null | grep -m1 '^/tmp/1bit-hybrid-'
+    done | head -1)
     [ "$code" = 200 ]
 }
 stop() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=; }
@@ -78,11 +85,9 @@ check "/v1/completions goes through the handoff too" '[[ "$reply" == *"\"fake_id
 chunks=$(curl -sN "$api/v1/chat/completions" -H 'Content-Type: application/json' \
     -d '{"model": "hybrid-model", "stream": true, "messages": [{"role": "user", "content": "hi there"}]}' | grep -c '^data: {')
 check "streamed reply relayed ($chunks chunks)" '[ "$chunks" = 7 ]'
-check "no handoff file left in the slot directory" '[ -z "$(ls /tmp/1bit-hybrid-*/ 2>/dev/null)" ]'
-slot_dirs_before=$(ls -d /tmp/1bit-hybrid-* 2>/dev/null | wc -l)
+check "no handoff file left in the slot directory" '[ -n "$slotdir" ] && [ -z "$(ls "$slotdir" 2>/dev/null)" ]'
 stop
-slot_dirs_after=$(ls -d /tmp/1bit-hybrid-* 2>/dev/null | wc -l)
-check "the slot directory is removed at exit ($slot_dirs_before -> $slot_dirs_after)" '[ "$slot_dirs_after" -lt "$slot_dirs_before" ]'
+check "the slot directory is removed at exit" '[ -n "$slotdir" ] && [ ! -d "$slotdir" ]'
 
 # 2. no provider: the device serves, the backend prefills (said once)
 check "serve starts without a provider" 'start "$scratch/b.log"'

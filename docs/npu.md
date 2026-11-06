@@ -1484,7 +1484,10 @@ be 0) for exactly that reason.
 * live acceptance equals the offline protocol **at every depth** over 8 prompts × 64 tokens: depth 1 **+0.00**,
   depth 2 **+0.55**, depth 3 **+0.09**, depth 4 **+1.08** pp (75.14 / 63.24 / 73.26 / 84.13 %), with greedy text
   byte-identical to plain decode on all 8 prompts and 0 stream mismatches.
-* the chain is **prompt-dependent**: 1.80 to 4.33 tokens per pass, mean **3.14** over the same 8 prompts.
+* the chain is **prompt-dependent**: 1.80 to 4.33 tokens per pass, mean **3.14** over the same 8 prompts. That is the
+  unweighted mean of the eight per-prompt chains; pooled over the window's 181 chain iterations the same counts give
+  **2.87** tokens per pass (the figure in `docs/npu-leaderboard.md`), because the prompts with short chains take most
+  of the iterations. Both are the same measurement, weighted two ways — say which one a comparison is using.
 
 **Do not enable the draft route on a serve as it stands.** The loop pays a verify batch *and* a step per
 iteration, so it is faster only above a break-even chain, and that break-even is **3.2-4.1 tokens/pass** by two

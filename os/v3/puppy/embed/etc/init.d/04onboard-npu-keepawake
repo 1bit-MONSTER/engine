@@ -1,0 +1,67 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/04onboard-npu-keepawake - the early-boot fallback for the udev rule.
+#
+# Cycle 30, owner decision 2026-11-05 23:4x: the stick keeps the XDNA2 NPU out of runtime autosuspend
+# (/etc/udev/rules.d/90-1bit-npu-power.rules sets power/control=on on add|bind). That rule can miss - a module
+# loaded before udev is up, a coldplug that emits neither event, or an image whose rules.d was not installed -
+# and the failure mode is silent: the box looks healthy and the first request after a 5 s idle is the one that
+# dies with `code 614`. So every boot also checks by hand, and says what it found either way.
+#
+# Runs before 10lemonade (which starts the server that would open a device context), so the device is awake
+# before anything can dispatch into it. A machine with no NPU (every QEMU gate) is not an error: it prints one
+# line and exits 0, which is also what keeps this script safe to ship on hardware that has no XDNA2 at all.
+# rc.services calls every script with `start` at boot and rc.shutdown with `stop`: only `start` has anything to do
+# here, and answering `stop` with a 15 s wait for a device that is going away is not a check, it is a shutdown delay.
+case ${1:-start} in
+start) : ;;
+*) exit 0 ;;
+esac
+NPU_PCI_ID=0x17f0
+WAIT_SECS=15
+CTL_GLOB='/sys/bus/pci/devices/*/power/control'   # quoted: expanded by the loop below, not here
+
+found=''
+waited=0
+while [ "$waited" -lt "$WAIT_SECS" ]; do
+    for ctl in $CTL_GLOB; do
+        [ -e "$ctl" ] || continue
+        dev=${ctl%/power/control}
+        # compare the id as the kernel prints it ("0x17f0") so no case/format guessing is needed
+        [ "$(cat "$dev/device" 2> /dev/null)" = "$NPU_PCI_ID" ] || continue
+        found=$dev
+        break
+    done
+    [ -n "$found" ] && break
+    waited=$((waited + 1))
+    sleep 1
+done
+
+if [ -z "$found" ]; then
+    echo "04onboard-npu-keepawake: no PCI device $NPU_PCI_ID after ${WAIT_SECS}s - this machine has no XDNA2 NPU, nothing to keep awake"
+    exit 0
+fi
+
+control=$(cat "$found/power/control" 2> /dev/null)
+if [ "$control" = on ]; then
+    echo "04onboard-npu-keepawake: $found power/control already on (90-1bit-npu-power.rules did it)"
+elif [ -w "$found/power/control" ] && echo on > "$found/power/control" 2> /dev/null; then
+    echo "04onboard-npu-keepawake: $found power/control was '$control', wrote on (FALLBACK: the udev rule missed - measure this row on the next boot)"
+else
+    echo "04onboard-npu-keepawake: could not write $found/power/control (was '$control') - the NPU will autosuspend and the 614 can come back" >&2
+fi
+echo "04onboard-npu-keepawake: $found control=$(cat "$found/power/control" 2> /dev/null) runtime_status=$(cat "$found/power/runtime_status" 2> /dev/null)"

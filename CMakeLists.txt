@@ -715,6 +715,10 @@ add_dependencies(npu_sampling_test npu_plan_test)
 add_test(NAME npu_plan_generate
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_plan_generate_test.py
                  ${CMAKE_SOURCE_DIR}/tools/npu_plan.py)
+# engine #709: the installer's firmware boot-entry rules, exercised with a fake efibootmgr and a fake
+# /sys/class/block, so CI covers selection/rollback without NVRAM. The OVMF install gate
+# (os/mini/vmtest.sh) is the end-to-end row and is run separately.
+add_test(NAME os_mini_efi_boot COMMAND ${CMAKE_SOURCE_DIR}/tests/os_mini_efi_boot_test.sh)
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
 target_link_libraries(npu_full_elf_test PRIVATE onebit_npu)
 add_test(NAME npu_full_elf_md5 COMMAND npu_full_elf_test)
@@ -800,6 +804,15 @@ add_test(NAME npu_padded_grid
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_padded_grid_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}
                  ${CMAKE_SOURCE_DIR}/tests/npu_padded_grid_test.cpp)
+# The MoE container-convention contract (npu/forward/include/moe_container.h, engine#1035): the
+# engine converter's `mlp.experts.*` names + [N][K] per-expert tile grid and HF-shaped config keys,
+# against the FLM-style `*_exps_proj` names + [K][N] grid and llama.cpp-shaped keys. A wrong
+# choice is silent (a missing tensor, or a permuted expert), so the test is a known-answer decode.
+# Self-compiling like the layout contracts, with the shipped chunk decoder, so CI needs no target.
+add_test(NAME npu_moe_container
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_moe_container_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}
+                 ${CMAKE_SOURCE_DIR}/tests/npu_moe_container_test.cpp)
 # The host side of a MoE container: __metadata__.moe, per-expert chunk pointers and the router.
 # Crafted directories at run time, so CI needs no 18 GB model; with two arguments it checks the
 # same code against a real container and a gate.json from tools/moe_expert_chunks.py gate.
@@ -844,10 +857,18 @@ add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
 add_executable(quant_i8_row_test tests/quant_i8_row_test.cpp)
 target_include_directories(quant_i8_row_test PRIVATE npu/forward/include)
 add_test(NAME quant_i8_row COMMAND quant_i8_row_test)
+# The forward's two attention kernels (npu/forward/include/attn_math.h): the AVX2+FMA body and the portable
+# four-accumulator body must both be a float rounding of the same sum, checked against a double-precision
+# direct sum over the head dims the forward serves plus the widths where a vector body's tail runs.  This is
+# also the only thing that exercises the portable body on an AVX2 CI host, where production never takes it.
+# Header only, no device, no model: runs in CI.
+add_executable(attn_math_test tests/attn_math_test.cpp)
+target_include_directories(attn_math_test PRIVATE npu/forward/include)
+add_test(NAME attn_math COMMAND attn_math_test)
 # ci.yml's build step names its targets explicitly and needs the `workflow` scope to extend, so bind the new
 # binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add hadamard_rotate_test to the list itself.
-add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test)
+add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test)
 # The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.

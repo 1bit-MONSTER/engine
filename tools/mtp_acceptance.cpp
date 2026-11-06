@@ -364,6 +364,15 @@ int main(int argc, char** argv) {
     std::printf("forward ready: vocab %d, max_batch_rows %d, hidden source %s\n", base.vocab(),
                 base.max_batch_rows(), residual ? "pre-norm residual" : "post-final-norm");
 
+    // The window's identity, and the LIVE path's only statement of it: `--offline` prints the same line in its summary,
+    // but a live log stated k and tau only in the harness' argv echo (or not at all), so the pool tool could not tell a
+    // tau=0 ticket from a tau=0.6 one -- and tau is not a detail: at tau>0 the chain gate stops the chain after the
+    // first low-confidence draft (npu/mtp/mtp_head.cpp:373), so the deeper depths are never offered.  Printed at init,
+    // not in the summary, so a ticket killed at its hold still says what window it was.
+    if (live)
+        std::printf("== %d prompts x %d tokens, k=%d tau=%.2f, hidden=%s\n", prompts, tokens, k, (double)tau,
+                    residual ? "residual" : "post-norm");
+
     if (probe_lm > 0) {
         // What ONE full-vocab logits call costs on the array, measured rather than fitted.  The draft loop makes
         // k of them for its k drafts (plus 1 + accepted more that the logits-skip fix drops), so this single number

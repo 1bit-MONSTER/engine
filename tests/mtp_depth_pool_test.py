@@ -227,6 +227,37 @@ check("the depths above 4 come from the wider prompts only" in out12,
 rc13, out13, _ = run([], [("k4a.log", ticket_k(0, 4)), ("k4b.log", ticket_k(1, 4))])
 check("k=4" in out13 and "MIXED chain width" not in out13, "a uniform chain width is stated once in the header")
 
+# 13a. tau is part of the window too, and it is the setting the draft route actually ships with (`Options::tau = 0.6`,
+# npu/mtp/draft.h:162). At tau>0 the chain gate stops the chain after the first low-confidence draft, so a tau=0.6
+# ticket offers depths 1-2 while a tau=0 one offers 1-4: pooled together, the deeper rows read as a full pass over a
+# window where half the tickets never drafted them. That is the k hole one setting over, and it was real until the tool
+# started printing `== N prompts x M tokens, k=K tau=T, hidden=H` on the live path as well as the offline one.
+def ticket_tau(p, tau, settings=True):
+    body = []
+    if settings:
+        body.append(f"== 8 prompts x 64 tokens, k=4 tau={tau:.2f}, hidden=post-norm")
+    body += [f"prompt {p}: TEXT IDENTICAL, 64 tokens, accepted 4/16, passes/token 0.500, stream 72 rows, 0 mismatch",
+             "depth 1: live  80.00 % (8/10, reached)  offline conditional  80.00 % (8/10)",
+             "depth 1: live  80.00 % (8/10)  offline  80.00 % (8/10)  delta  +0.00 pp  PASS"]
+    return "\n".join(body) + "\n"
+
+
+rc16, out16, _ = run([], [("t0a.log", ticket_tau(0, 0.0)), ("t0b.log", ticket_tau(1, 0.0))])
+check(rc16 == 0 and "tau=0" in out16 and "MIXED chain gate" not in out16,
+      f"a uniform chain gate is stated in the header: {[l for l in out16.splitlines() if 'tau=' in l][:1]}")
+rc17, out17, _ = run([], [("t06a.log", ticket_tau(0, 0.6)), ("t06b.log", ticket_tau(1, 0.6))])
+check(rc17 == 0 and "tau=0.6" in out17, "a tau=0.6 window says so")
+rc18, out18, _ = run([], [("t0.log", ticket_tau(0, 0.0)), ("t06.log", ticket_tau(1, 0.6))])
+check(rc18 == 0, "a pool across chain gates still pools (the cells themselves are not in conflict)")
+check("MIXED chain gate (tau)" in out18 and "0, 0.6" in out18,
+      f"pooling tau=0 with tau=0.6 is named rather than averaged: {[l for l in out18.splitlines() if 'MIXED chain' in l]}")
+rc19, out19, _ = run([], [("old.log", ticket_tau(0, 0.0, settings=False))])
+check("tau unstated" in out19 and "cannot be told apart" in out19,
+      "a log without the settings line says its chain gate is unstated instead of assuming tau=0")
+rc20, out20, _ = run([], [("mixed1.log", ticket_tau(0, 0.6)), ("mixed2.log", ticket_tau(1, 0.6, settings=False))])
+check("is stated by 1 of 2 ticket(s)" in out20,
+      f"a partly-stated window says which tickets it read the gate from: {[l for l in out20.splitlines() if 'stated by' in l]}")
+
 # 14. the run identity (vocab, batch width, hidden source) is part of the window: 2.1 vs 3.19 tokens/pass on the
 # hidden-source switch alone is more than the bar, so pooling across it would average two measurements.
 READY_NORM = "forward ready: vocab 248320, max_batch_rows 16, hidden source post-final-norm\n"
@@ -279,16 +310,26 @@ import importlib.util  # noqa: E402  (section-local: the records are the last th
 import json  # noqa: E402
 
 RECORDS = os.path.join(ROOT, "bench", "npu-leaderboard")
-# record id -> the derived quantity it publishes
-MTP_RECORDS = {
-    "27b-mtp-live-depth1-20261105": lambda e: e["depth_rate"][1],
-    "27b-mtp-live-depth2-20261105": lambda e: e["depth_rate"][2],
-    "27b-mtp-live-depth3-20261105": lambda e: e["depth_rate"][3],
-    "27b-mtp-live-depth4-20261105": lambda e: e["depth_rate"][4],
-    "27b-mtp-hit-rate-20261105": lambda e: e["hit"],
-    "27b-mtp-live-tokens-per-pass-20261105": lambda e: e["tpp_live"],
-    "27b-mtp-offline-tokens-per-pass-20261105": lambda e: e["tpp_offline"],
-}
+FIXTURE_ROOT = os.path.join(ROOT, "tests", "fixtures")
+# One entry per measured WINDOW, because a record's value only means anything against the tickets measured at its own
+# setting: the window is (tau, k, tokens, prompts) and pooling two settings is the error the pool tool itself refuses
+# for k and for the generation budget.  A new row in a different regime adds a window here, not a lambda to a flat dict.
+WINDOWS = [
+    {
+        "name": "tau=0, k=4, 8 prompts x 64 tokens",
+        "dir": "mtp_clause55",
+        "files": ("p0.txt", "p1-4.txt", "p5-7.txt"),
+        "records": {
+            "27b-mtp-live-depth1-20261105": lambda e: e["depth_rate"][1],
+            "27b-mtp-live-depth2-20261105": lambda e: e["depth_rate"][2],
+            "27b-mtp-live-depth3-20261105": lambda e: e["depth_rate"][3],
+            "27b-mtp-live-depth4-20261105": lambda e: e["depth_rate"][4],
+            "27b-mtp-hit-rate-20261105": lambda e: e["hit"],
+            "27b-mtp-live-tokens-per-pass-20261105": lambda e: e["tpp_live"],
+            "27b-mtp-offline-tokens-per-pass-20261105": lambda e: e["tpp_offline"],
+        },
+    },
+]
 
 
 def record_mismatches(expect):
@@ -312,31 +353,36 @@ def record_mismatches(expect):
 spec = importlib.util.spec_from_file_location("mtp_depth_pool", TOOL)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-if all(os.path.exists(p) for p in CL):
-    _seen, _un, _src, _bud, _wid, _idt, _offered = mod.pool(CL)
+covered = set()
+for win in WINDOWS:
+    paths = [os.path.join(FIXTURE_ROOT, win["dir"], f) for f in win["files"]]
+    covered |= set(win["records"])
+    if not all(os.path.exists(p) for p in paths):
+        check(False, f"the {win['name']} window has its tickets on disk ({win['dir']})")
+        continue
+    _seen, _un, _src, _bud, _wid, _idt, _offered, _taus = mod.pool(paths)
     econ = mod.economics(_seen, _offered)
-    check("error" not in econ, f"the shipped fixtures support the derived block: {econ.get('error', 'ok')}")
-    if "error" not in econ:
-        derived = {rid: fn(econ) for rid, fn in MTP_RECORDS.items()}
-        bad = record_mismatches(derived)
-        check(not bad, f"all {len(derived)} MTP records equal what the fixtures derive: {bad[:2]}")
-        # anti-vacuity: a record one hundredth off must be caught, or the check above passes on anything.
-        wobbled = dict(derived)
-        first = sorted(wobbled)[0]
-        wobbled[first] += 0.01
-        check(record_mismatches(wobbled) != [],
-              f"the record comparison bites: {first} +0.01 is reported, not accepted")
-        # ... and the guard covers the DIRECTORY, not just the seven ids it happens to name: an MTP record added
-        # later that nobody adds here would look exactly like a covered one, which is how the "one table row per
-        # record" hole was closed for the page (#1213) and how a check ends up reporting success on the records it
-        # was told about rather than the records that exist.
-        on_disk = sorted(f[:-5] for f in os.listdir(RECORDS)
-                         if f.startswith("27b-mtp-") and f.endswith(".json"))
-        check(len(on_disk) >= len(derived), f"the guard's record directory is readable ({len(on_disk)} MTP record(s))")
-        uncovered = [rid for rid in on_disk if rid not in derived]
-        check(not uncovered, f"every MTP record on disk is checked by this guard: uncovered {uncovered}")
-else:
-    check(False, "tests/fixtures/mtp_clause55 is incomplete, so the records cannot be re-derived")
+    check("error" not in econ, f"{win['name']}: the tickets support the derived block: {econ.get('error', 'ok')}")
+    if "error" in econ:
+        continue
+    derived = {rid: fn(econ) for rid, fn in win["records"].items()}
+    bad = record_mismatches(derived)
+    check(not bad, f"{win['name']}: all {len(derived)} records equal what its tickets derive: {bad[:2]}")
+    # anti-vacuity: a record one hundredth off must be caught, or the check above passes on anything.
+    wobbled = dict(derived)
+    first = sorted(wobbled)[0]
+    wobbled[first] += 0.01
+    check(record_mismatches(wobbled) != [],
+          f"{win['name']}: the record comparison bites: {first} +0.01 is reported, not accepted")
+
+# ... and the guard covers the DIRECTORY, not just the ids some window happens to name: an MTP record added later that
+# nobody adds here would look exactly like a covered one, which is how the "one table row per record" hole was closed
+# for the page (#1213) and how a check ends up reporting success on the records it was told about rather than the ones
+# that exist.  A record from a regime nobody measured in-tree is therefore a red test, not a silent row.
+on_disk = sorted(f[:-5] for f in os.listdir(RECORDS) if f.startswith("27b-mtp-") and f.endswith(".json"))
+check(len(on_disk) >= len(covered), f"the guard's record directory is readable ({len(on_disk)} MTP record(s))")
+uncovered = [rid for rid in on_disk if rid not in covered]
+check(not uncovered, f"every MTP record on disk is checked by a window: uncovered {uncovered}")
 
 print(f"\n{'all checks passed' if not fails else f'{fails} CHECK(S) FAILED'}")
 sys.exit(1 if fails else 0)

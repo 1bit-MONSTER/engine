@@ -209,6 +209,9 @@ public:
     // tail of the batch.  The layer maths is the batched body step_batch already runs -- only the final
     // norm and the LM head are applied per row, and the head is launched once for all M rows (the M=16
     // twin streams its weights once for the batch, exactly like the layers).
+    //   A noncausal pack (`attention.mode noncausal_full_attention`) is refused by name: in such a batch
+    // every row attends to the rows after it, so these per-row logits are not the prefix-conditioned ones a
+    // draft is checked against.  See docs/npu.md, "attention.mode".
     bool step_batch_all(const std::vector<int>& tokens, int start_pos,
                         std::vector<float>& logits_all);
 

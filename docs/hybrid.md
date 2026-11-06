@@ -132,13 +132,26 @@ bytes of JSON. `llama-kvshare-prefill` (llama.cpp `tools/kvshare-prefill`) is th
 a CPU prefill, so the plumbing can be gated with no NPU; the NPU engine is the real one, mapping the
 same descriptors as XDNA BOs.
 
-Limits, so nobody reads more into the flag than it does: the region is `llama_kv_cache`, so a hybrid
-model's recurrent half (e.g. the 27B's GDN state) is not shared and `?action=share` refuses a hybrid
-cache rather than hand over half a prompt. Both sides must be the same pinned llama.cpp, the same model
-and `-fa`/`-c`/`-b`/`-ub`/KV types (`params` above); a mismatch is a refusal, not a wrong answer.
+Limits, so nobody reads more into the flag than it does: the region is the model's shared memory — the
+attention cache, plus the recurrent state for a hybrid model (fork 1bit-MONSTER/llama.cpp#181), so a
+27B's GDN state crosses by the same route as its KV. Both sides must be the same pinned llama.cpp, the
+same model and `-fa`/`-c`/`-b`/`-ub`/KV types (`params` above); a mismatch is a refusal, not a wrong
+answer — and a refusal is not a lost handoff: see below.
+
+If the decoder refuses to export (a params or model mismatch, or a decoder pinned before #181 handed a
+hybrid cache) or the handshake cannot start, serve says so once per request and uses the **state-file
+route** for that request (`share 0.000 ms` in the log line) instead of leaving the decoder to prefill
+the prompt itself. A handoff by file still keeps the prompt off the decoder's prefill path, which is the
+whole reason either route exists; only the handshake falls back, never a provider that already wrote into
+the region or an adopt that failed after it.
 
 ## Tests
 
+- `tests/hybrid_kvshare_route.sh` (CTest `hybrid_kvshare_route`, no model, no dma-buf): the same fake
+  backend speaks `?action=share`/`?action=adopt` and `tests/fake_kvshare_provider.py` plays the provider.
+  Checks the listen -> share -> fds -> provider -> adopt order, the inherited descriptors, the share_id on
+  adopt, the socket cleanup, a late provider's work being kept, and (`FAKE_KVSHARE_REFUSE=1`, a decoder
+  that cannot export) the fall back to the state-file route.
 - `tests/hybrid_route.sh` (CTest `hybrid_route`, no model, no NPU): `tests/fake_backend.py` stands in
   for llama-server and `tests/fake_prefill_provider.py` (`FAKE_PREFILL_COPY=1`) for the NPU engine.
   Checks what reaches the backend (`id_slot` 0, `cache_prompt` on, the slot directory), the stderr

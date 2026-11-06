@@ -406,6 +406,27 @@ rows = [
                      "rootsh=$(awk -F: '{if ($1 == \"root\") print $7}' /etc/passwd); echo root=$rootsh; "
                      "[ \"$rootsh\" = /bin/bash ] && echo login-shell-bash", "login-shell-bash"),
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
+    # Cycle 28 (@pi-tui, the class #1168 shipped for eight hours): every shell script the image ships must parse under
+    # BOTH parsers it meets in the field. `1bit-console-menu` is `#!/bin/sh`, so the appliance runs it with busybox ash,
+    # which reads an apostrophe inside a double-quoted ${...} as literal text. bash reads the same bytes as an opening
+    # quote and refuses the file - `${d:-this machine's disk}` gave `line 680: syntax error near unexpected token '('`,
+    # 620 lines below the cause - and nothing in the image runs those scripts through bash, so no other row could see it.
+    # The two parsers are the real ones: /etc/init.d runs under busybox sh at boot, while a person on the console gets
+    # bash, the gate rows run in bash, and dash is what a Debian-family host reads them with (== sh's behaviour here).
+    # Non-shell files (the two python helpers) are skipped by their own shebang rather than by a list that would rot.
+    # Red/green in one boot, ~/wt/tui-vm/rowproof-shellparse.sh: GREEN on the image (45 scripts), RED with the smallest
+    # instance of the class staged in /usr/local/bin (names the file and both parsers), RED again with the REAL pre-fix
+    # 1bit-console-menu from #1168 at 90c89f9 (`unparsable: /usr/local/bin/1bit-console-menu:bash`, ash alone is happy),
+    # and GREEN after restoring it.
+    ("U1 shipped shells", "n=0; bad=''; for f in /usr/local/bin/1bit-* /etc/init.d/*; do "
+                     "[ -f \"$f\" ] || continue; "
+                     "case \"$(sed -n 1p \"$f\")\" in '#!'*sh) ;; *) continue ;; esac; "
+                     "n=$((n+1)); "
+                     "bash -n \"$f\" 2>/dev/null || bad=\"$bad $f:bash\"; "
+                     "sh -n \"$f\" 2>/dev/null || bad=\"$bad $f:sh\"; done; "
+                     "if [ \"$n\" -eq 0 ]; then echo shells-skip-no-scripts; "
+                     "elif [ -n \"$bad\" ]; then echo \"unparsable:$bad\"; "
+                     "else echo \"shells-parse: $n scripts under bash and sh\"; fi", "shells-parse:"),
     # U2 headless (owner, cycle 12 item 7): the default entry boots with no X, and tty1 is a login prompt.
     # Puppy's own chain does the second half - /etc/inittab has tty1::respawn:plogin and plogin execs
     # `getty -n -l /bin/autologin ... tty1` - so the row asserts the getty, which is what a person sees.

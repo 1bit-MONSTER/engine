@@ -398,6 +398,37 @@ def die_temp_c():
     return None
 
 
+def npu_conditions():
+    """Whether another lane holds the NPU, read from the claim files (device-free).
+
+    Same class as the die temperature: a condition of the score, recorded rather than refused. The
+    fleet's policy for this box (okf policies/strixhalo-thermal-and-gpu-claims.md, 2026-11-05) is that
+    the two engines coexist safely -- the real cross-engine hazard is a shared dma-buf range, not
+    simultaneity -- but a GPU *arm* beside a running NPU *matrix* corrupts both lanes' numbers. This
+    lane's long-context arm was refused 27 times on 2026-11-05 for exactly this and produced no
+    number, and a result that did measure beside an NPU job could not have said so.
+
+    `npu-serve-keeper` is the owner's resident serve: baseline box state, not a job. Every field is
+    null/0/false where the box does not expose it, so an unreadable claim file cannot be read back as
+    a quiet NPU.
+    """
+    home = user_home()
+    holder = None
+    try:
+        lines = (home / "NPU-TOKEN").read_text(encoding="utf-8", errors="replace").splitlines()
+        holder = lines[0].strip() if lines and lines[0].strip() else None
+    except OSError:
+        holder = None
+    queued = 0
+    try:
+        queued = sum(1 for path in (home / "NPU-QUEUE").iterdir() if not path.name.startswith("."))
+    except OSError:
+        queued = 0
+    return {"npu_holder": holder,
+            "npu_job": bool(holder) and not holder.startswith("npu-serve-keeper"),
+            "npu_queued": queued}
+
+
 def box_conditions():
     """The conditions the measurement is running in, device-free (sysfs + /proc).
 
@@ -418,9 +449,11 @@ def box_conditions():
                 break
     except (OSError, ValueError, IndexError):
         available = None
-    return {"tctl_c": die_temp_c(),
-            "gtt_used_gib": gtt_used, "gtt_total_gib": gtt_total,
-            "mem_available_gib": available}
+    conditions = {"tctl_c": die_temp_c(),
+                  "gtt_used_gib": gtt_used, "gtt_total_gib": gtt_total,
+                  "mem_available_gib": available}
+    conditions.update(npu_conditions())
+    return conditions
 
 
 def box_summary(samples):
@@ -437,6 +470,10 @@ def box_summary(samples):
     summary["tctl_c_min"] = min(die) if die else None
     summary["tctl_c_max"] = max(die) if die else None
     summary["tctl_samples"] = len(die)
+    # Same reason as the die's spread: an NPU job can start after the arm is claimed, so the start
+    # snapshot alone does not say whether the number was measured beside one.
+    summary["npu_job_samples"] = sum(1 for s in samples if s.get("npu_job"))
+    summary["npu_samples"] = len(samples)
     return summary
 
 

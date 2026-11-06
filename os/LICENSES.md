@@ -14,9 +14,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# 1bit OS: third-party software on the image
+# Licences: third-party software on the images
 
-The 1bit OS image (`os/mini/mkimage.sh`) carries other projects' programs next to the engine:
+Two images come out of `os/`, and both carry other projects' programs next to the engine. **1bit OS**
+is the Puppy appliance (`os/v3/puppy/`): next to the engine it carries Puppy's own tree
+(GPL-2.0-or-later) and the packages its recipe builds, and each recipe's licences are carried into the
+built image ([os/v3/puppy/README.md](v3/puppy/README.md)). The **`os/mini`** image
+(`os/mini/mkimage.sh`, the CI/VM target, not 1bit OS) carries
 Lemonade and its backends, Mesa's Radeon Vulkan driver, LLVM, BusyBox, Dropbear, the Linux kernel
 and firmware, and the Ubuntu system libraries those programs link. Each keeps its own license.
 This file lists them, with the release on the image, the license and where its source is. It was

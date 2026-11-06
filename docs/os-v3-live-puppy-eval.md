@@ -20,6 +20,23 @@ The owner's direction (2026-11-01): build 1bit OS v3 on **Puppy Linux** instead 
 Puppy for both roles, the live/try stick and the installed system (frugal install on the NVMe with a
 persistent save layer), headless, with **our** kernel and **our** drivers, not the distribution's.
 
+> **Update (2026-11-02): the four blockers are closed and Puppy is 1bit OS.** `kernel-puppy.fragment`
+> is built into our kernel and the initrd finds and layers the SFS (G2 green); `amdxdna` and
+> `ec_su_axb35` are present, signed and verify against the enrolled MOK (G3 green); the save layer
+> persists across a reboot (G7 green, `PUPMODE=12` on `1BIT-DATA`); and `apt`, `sudo`, `sshd` and
+> `mokutil` are in the image, which was the one open question in Blocker 4. The appliance **booted on
+> the Max+ 395 with Secure Boot on** on 2026-11-02, which was **cycle 12, the first hardware boot**: 20 of
+> `puppy-check`'s 25 rows PASS, the 5 that do not being the cycle-12 list, Lemonade answers on `:13305` with its
+> key, chat 70.49 tok/s, TTFT 1.30 s, 0 `amdxdna` errors. It boots headless by default, with a second boot entry,
+> `1bit OS (desktop)`, for Puppy's JWM desktop. **Nothing is published**: the next release carries it. The body of
+> this page is kept as the measurement that decided it. *That cycle's image minted its own API key; since cycle 20
+> the appliance ships with none and console item 1 turns one on (`10lemonade:43-62`).*
+>
+> **The acceptance rows have moved every cycle since, so this page does not carry them:** [os-v3.md](os-v3.md) is
+> the page of record (cycle 19: 33 rows / 0 failed / 1 skipped; cycle 23: 41 rows / 40 PASS / 1 FAIL / 2 SKIP, the
+> FAIL being the checker's own `u7-mdns` row rather than the image). The numbers above are the first boot's, kept
+> because they are what decided the plan.
+
 This page is the measurement, and the recommendation. Everything below is measured on strixhalo
 (2026-11-01) or in QEMU here unless it says otherwise; the numbers that are not measured yet say so.
 
@@ -486,7 +503,7 @@ six. All six are closed in the image, and each one was a measurement rather than
 
 | row | the cause, measured | the fix |
 |---|---|---|
-| `hrx-device` (no `HRX0` at all), `chat-hrx` | **nothing opened `libhsa-runtime64.so.1`.** `ONEBIT_HRX_LIBHSA` is a CMake *compile definition* (`CMakeLists.txt:279`), not a variable, so the line in `/etc/1bit/libhsa.env` was inert; the engine resolves `--hrx-libhsa` → the path baked at build time → a recursive scan of `/opt/rocm-therock` (`app/serve.cpp:201`), and the baked path is the release builder's TheRock. Second defect on the same path: the pinned libhsa is `RUNPATH=$ORIGIN` with four `librocm_sysdeps_*` + `librocprofiler-register` NEEDED entries, and the image carried the one file (`ldd`: 4 `not found`) | `LIBHSA_DIR` installs the whole set at `/opt/rocm-therock/lib`, `/opt/1bit/libhsa` symlinks to it, `libhsa.env` exports the trio and `LD_LIBRARY_PATH`, and the build refuses an incomplete or unloadable set |
+| `hrx-device` (no `HRX0` at all), `chat-hrx` | **nothing opened `libhsa-runtime64.so.1`.** `ONEBIT_HRX_LIBHSA` is a CMake *compile definition* (`CMakeLists.txt:356`), not a variable, so the line in `/etc/1bit/libhsa.env` was inert; the engine resolves `--hrx-libhsa` → the path baked at build time → a recursive scan of `/opt/rocm-therock` (`app/serve.cpp:212-224`), and the baked path is the release builder's TheRock. Second defect on the same path: the pinned libhsa is `RUNPATH=$ORIGIN` with four `librocm_sysdeps_*` + `librocprofiler-register` NEEDED entries, and the image carried the one file (`ldd`: 4 `not found`) | `LIBHSA_DIR` installs the whole set at `/opt/rocm-therock/lib`, `/opt/1bit/libhsa` symlinks to it, `libhsa.env` exports the trio and `LD_LIBRARY_PATH`, and the build refuses an incomplete or unloadable set |
 | boot cmdline | the appliance booted `amdgpu cwsr_enable=1` with no TTM parameters, while the install the image was validated against boots `amdgpu.cwsr_enable=0 ttm.pages_limit=31457280 ttm.page_pool_size=31457280` — and an APU serves models out of GTT, whose ceiling is that limit | every grub entry carries all three; row `boot gtt` reads them off the running boot |
 | `u2-console` | inittab's tty1 entry is `plogin`, whose tail is `exec getty -n -l /bin/autologin … tty1`; on that boot nothing ended up on tty1, while the same image gave a prompt in QEMU | inittab's tty1 entry is the appliance's own `1bit-console`: that last step on a headless boot, `plogin` on every other |
 | `gguf` | not a registration bug: `05onboard-data` registers a `.gguf` under the catalogue's lower-cased id and `release-check.sh` compared the file's own spelling, case-sensitively | the row compares case-insensitively |

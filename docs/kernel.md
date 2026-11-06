@@ -222,9 +222,14 @@ or moves a node off HRX fails there rather than in a customer's run. Details:
 
 - The weekly release preflight needs a **readable** kernel image: `/boot/vmlinuz-$(uname -r)` is
   root-only on Ubuntu, so pass `VMLINUZ=<copy>` ([releases.md](releases.md), "The release run").
-- `os/mini/mkimage.sh` builds the unified kernel image from that `vmlinuz`, and with `MOK_KEY` +
-  `MOK_CERT` it signs the UKI with the same kernel key, so a 1bit OS stick boots with Secure Boot
-  left on instead of asking for it to be switched off.
+- 1bit OS takes the kernel as woof-CE's own kernel package: `os/v3/puppy/mk-huge-kernel.sh` writes
+  `huge-<kver>.tar.zst` (`vmlinuz-<kver>` plus the module zdrv, both from the signed tree), and
+  `os/v3/puppy/build.sh` builds the Puppy appliance with it inside, so the appliance boots our kernel
+  with Secure Boot left on instead of asking for it to be switched off
+  ([os/v3/puppy/README.md](../os/v3/puppy/README.md)).
+- The BusyBox `os/mini` image is separate and is **not** 1bit OS (it is the CI/VM target):
+  `os/mini/mkimage.sh` builds its unified kernel image from the same `vmlinuz`, and with `MOK_KEY` +
+  `MOK_CERT` signs that UKI with the same kernel key.
 - Record the kernel version in the release notes: a box that moves kernel is a release-visible
   change, and the gate result belongs next to it.
 

@@ -83,8 +83,8 @@ start() {
     # A level somebody set is never overwritten - it is theirs, and the console's menu is where they set it.
     CONFJSON=$LEM/config/config.json
     if [ ! -f "$CONFJSON" ]; then
-        printf '%s\n' "{\"log_level\": \"debug\", \"log_max_file_size_mb\": 8, \"log_max_files\": 3, \"extra_models_dir\": \"$MODELS\"}" > "$CONFJSON" \
-            && echo "10lemonade: seeded $CONFJSON (log_level=debug, 8 MB x 3 rotation, extra_models_dir=$MODELS)"
+        printf '%s\n' "{\"log_level\": \"debug\", \"log_max_file_size_mb\": 8, \"log_max_files\": 3, \"extra_models_dir\": \"$MODELS\", \"auto_check_model_updates\": false, \"inhibit_suspend\": false}" > "$CONFJSON" \
+            && echo "10lemonade: seeded $CONFJSON (log_level=debug, 8 MB x 3 rotation, extra_models_dir=$MODELS, no startup update check, no logind inhibitor)"
     elif ! grep -q '"log_level"' "$CONFJSON" 2> /dev/null; then
         if command -v python3 > /dev/null 2>&1; then
             python3 - "$CONFJSON" <<'PY' && echo "10lemonade: added log_level=debug to $CONFJSON"
@@ -118,6 +118,29 @@ json.dump(d, open(p, "w"), indent=2)
 PY
         else
             echo "10lemonade: $CONFJSON has no extra_models_dir and python3 is missing - models in $MODELS stay invisible" >&2
+        fi
+    fi
+    # Cycle 30, from the c29 take's own log (TNOTE-c29-take-review items 3 and 4): two lemond keys that turned a
+    # clean boot into noise, both read from the pinned payload's own strings (no flag and no env var: `lemond
+    # --help` has only -v/--version, so config.json is the only place these can be set).
+    #   auto_check_model_updates - the startup Hugging Face check. Offline it logs `Model update check failed for
+    #     <model>: CURL error: Could not resolve hostname` once per catalogue model (9 lines on the take); online
+    #     it can move a model under a demo that pinned one. The manual `models/check_updates` route still runs
+    #     with this false - the payload says so itself - so nothing becomes impossible to ask for.
+    #   inhibit_suspend - the logind inhibitor; Puppy has no logind, so it logs `logind Inhibit failed`.
+    # Seeded only when absent, like the keys above: a config a person edited keeps the value it was given.
+    if ! grep -q '"auto_check_model_updates"' "$CONFJSON" 2> /dev/null || ! grep -q '"inhibit_suspend"' "$CONFJSON" 2> /dev/null; then
+        if command -v python3 > /dev/null 2>&1; then
+            python3 - "$CONFJSON" <<'PY' && echo "10lemonade: added auto_check_model_updates=false and inhibit_suspend=false to $CONFJSON"
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.setdefault("auto_check_model_updates", False)
+d.setdefault("inhibit_suspend", False)
+json.dump(d, open(p, "w"), indent=2)
+PY
+        else
+            echo "10lemonade: $CONFJSON lacks auto_check_model_updates/inhibit_suspend and python3 is missing - lemond will log a failed update check and a logind warning at boot" >&2
         fi
     fi
     # lemond's positionals are cache_dir config_dir (lemond --help); the rest are the runtime overrides.

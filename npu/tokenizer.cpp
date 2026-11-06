@@ -66,6 +66,21 @@ void utf8_append(std::string& s, uint32_t cp) {
 // Length of the UTF-8 sequence a lead byte starts; 1 for a stray byte.
 size_t utf8_len(unsigned char c) { return (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E ? 4 : 1; }
 
+// True when the normalizer itself declares the metaspace prefix that spm() synthesises: a
+// {Prepend "\u2581"} step, bare or inside a Sequence. That is the exact condition for the
+// sentencepiece encoder to be right about an unmerged text -- a normalizer that only rewrites
+// spaces ({Replace " " -> "\u2581"}) does NOT ask for one and is left on its own path, as are the
+// byte-level vocabularies whose pieces are escape characters rather than text.
+bool spm_prepends_meta(const nlohmann::json& n) {
+    if (!n.is_object()) return false;
+    if (n.value("type", "") == "Prepend")
+        return n.value("prepend", "").find("\xE2\x96\x81") != std::string::npos;
+    if (n.contains("normalizers"))
+        for (const auto& sub : n["normalizers"])
+            if (spm_prepends_meta(sub)) return true;
+    return false;
+}
+
 // The pattern from tokenizer.json's pre_tokenizer (a Split with a Regex), if any.
 std::string split_pattern(const nlohmann::json& pre) {
     if (!pre.is_object()) return "";
@@ -201,7 +216,18 @@ Tokenizer::Tokenizer(const std::string& path) {
         bool has_meta = false;
         for (const auto& kv : vocab_)
             if (kv.first.rfind("\xE2\x96\x81", 0) == 0) { has_meta = true; break; }
-        spm_ = merges.empty() && has_meta;
+        // SentencePiece, not only when the merge list is EMPTY. A SentencePiece model exported to
+        // tokenizer.json keeps its merges as ["\u2581","t"] pairs, and its normalizer is what says
+        // those pieces are text: Phi-3.5-mini (measured 2026-11-05) declares 61,249 merges, no
+        // pre_tokenizer, and the {Prepend \u2581, Replace space} normalizer. Keying on an empty merge
+        // list sent it down the byte-level GPT-2 path, which byte-maps a metaspace the vocabulary
+        // does not spell byte-wise: "The capital of France is" became 11 ids instead of the pack's
+        // 5 (450 7483 310 3444 338), and the model answered "Awesome" for "The capital of France
+        // is" -- engine#1189. Measured on that pack's own vocabulary, greedy longest-match is not a
+        // substitute for the merges either (it disagrees with the reference on 6 of 20 strings), so
+        // a vocabulary that keeps its merges is merged by rank -- see spm_merged().
+        spm_ = has_meta && (merges.empty() || (root.contains("normalizer") && spm_prepends_meta(root["normalizer"])));
+        spm_merges_ = spm_ && !merges.empty();
         if (spm_) {
             for (const auto& [text, id] : vocab_) {
                 if (text.size() == 6 && text.compare(0, 3, "<0x") == 0 && text[5] == '>') {
@@ -225,7 +251,7 @@ Tokenizer::Tokenizer(const std::string& path) {
 
 Tokenizer::~Tokenizer() = default;
 
-std::vector<int> Tokenizer::bpe(const std::string& chars) const {
+std::vector<int> Tokenizer::bpe(const std::string& chars, bool byte_fallback) const {
     std::vector<std::string> word;
     for (size_t i = 0; i < chars.size();) {
         const size_t len = utf8_len(static_cast<unsigned char>(chars[i]));
@@ -270,9 +296,33 @@ std::vector<int> Tokenizer::bpe(const std::string& chars) const {
         push(p.left, next[p.left]);
     }
     std::vector<int> ids;
-    for (size_t i = 0; i < n; i = next[i])
-        if (auto it = vocab_.find(word[i]); it != vocab_.end()) ids.push_back(it->second);
+    for (size_t i = 0; i < n; i = next[i]) {
+        if (auto it = vocab_.find(word[i]); it != vocab_.end()) { ids.push_back(it->second); continue; }
+        // A SentencePiece vocabulary covers its text with <0xNN> pieces for anything its merges
+        // cannot spell (the byte fallback the model's decoder reverses); a byte-level vocabulary
+        // has no such pieces and drops the symbol, which is what it always did.
+        if (!byte_fallback) continue;
+        for (unsigned char b : word[i])
+            if (auto fb = byte_fallback_.find(b); fb != byte_fallback_.end()) ids.push_back(fb->second);
+    }
     return ids;
+}
+
+// SentencePiece WITH merges: the normalizer turns spaces into the metaspace symbol U+2581 and
+// prepends one for the whole text, and the pieces are then merged by rank exactly as a byte-level
+// BPE merges its characters -- same heap, same order, different symbols. Phi-3.5-mini's pack is
+// this shape (engine#1189): greedy longest-match is NOT a substitute, it disagrees with the
+// reference on 6 of 20 measured strings.
+std::vector<int> Tokenizer::spm_merged(const std::string& text) const {
+    static const char kMeta[] = "\xE2\x96\x81";
+    std::string s;
+    s.reserve(text.size() + 3);
+    s += kMeta;
+    for (char c : text) {
+        if (c == ' ') s += kMeta;
+        else s += c;
+    }
+    return bpe(s, /*byte_fallback=*/true);
 }
 
 // SentencePiece: spaces become U+2581 ("\xe2\x96\x81", the metaspace symbol) with a
@@ -281,6 +331,7 @@ std::vector<int> Tokenizer::bpe(const std::string& chars) const {
 // for the SPM models the converter emits as BPE-with-no-merges (MiniCPM4:
 // "The capital of France is" -> 1507 8107 1379 8360 1410, matching the oracle).
 std::vector<int> Tokenizer::spm(const std::string& text) const {
+    if (spm_merges_) return spm_merged(text);
     static const char kMeta[] = "\xE2\x96\x81";
     std::string s;
     s.reserve(text.size() + 3);

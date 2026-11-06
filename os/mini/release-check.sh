@@ -150,13 +150,45 @@ post_fetch() {  # <json body> <url> [slow]
     fi
 }
 
+# ── `code 102` is a WAIT, not a verdict (TOS3-C29 item 2; c28 board, 5 Nov 2026) ─────────────────
+# The NPU driver gives the accelerator to ONE client. When that client exits, 0011v2 frees the partition about
+# 2 s later, and for those seconds every new client is refused with
+#   npu runtime: device error (code 102): No such device
+# Measured on the c28 board: this check ran straight after its own NPU rows released the device and 8 of 25 rows
+# reded on that window, so a healthy appliance read as broken. (Worse, the failed run left a turn in flight and
+# the driver TDR'd 15 s later - see PR #1177.) So a reply carrying code 102 is retried with a 1 s back-off, up to
+# NPU_WAIT seconds, and the footer says how long was spent waiting. A 102 that outlives the window is reported
+# unchanged: the wait shortens a transient, it does not excuse a device that stays gone.
+NPU_WAIT=${NPU_WAIT:-10}
+# The counter has to be a FILE: every reply is read through $( ), so the retry runs in a subshell and a plain variable
+# set in there never reaches the footer (measured while proving this block - the wait worked and the footer said 0 s).
+NPU_WAITFILE=${NPU_WAITFILE:-/tmp/.1bit-npu-waited.$$}
+_npu_102() {  # <reply> -> 0 when the backend named the refusal, with its own words
+    case "$1" in *'code 102'*) return 0 ;; esac
+    return 1
+}
+_npu_waited() {  # <seconds spent backing off>
+    [ "${1:-0}" -gt 0 ] 2>/dev/null && printf '%s\n' "$1" >> "$NPU_WAITFILE" 2>/dev/null
+    return 0
+}
+
 auth_post() {  # <json body> <url> [slow] -> the reply
-    post_fetch "$1" "$2" "${3:-}"
+    _r=$(post_fetch "$1" "$2" "${3:-}")
+    _w=0
+    while _npu_102 "$_r" && [ "$_w" -lt "$NPU_WAIT" ]; do
+        sleep 1; _w=$((_w + 1))
+        _r=$(post_fetch "$1" "$2" "${3:-}")
+    done
+    _npu_waited "$_w"
+    printf '%s' "$_r"
 }
 
 # A POST whose *status and headers* are the evidence (engine#1024's non-streamed arm answers 503 + Retry-After, so the
 # body alone says nothing and got/get_slow hide both). Writes the body to $3 and prints "<status> <retry-after>".
-auth_post_watch() {  # <json body> <url> <file for the body>
+# The same back-off, for the arm whose evidence is the status and headers: a non-streamed client refused code 102
+# must be asked again rather than reported as "no HTTP status at all", which is what the c28 board said about a
+# request the partition had simply not freed for yet.
+post_watch_once() {  # <json body> <url> <file for the body>
     : > "$3"
     if command -v curl >/dev/null 2>&1; then
         if [ -n "$KEY" ]; then
@@ -174,6 +206,17 @@ auth_post_watch() {  # <json body> <url> <file for the body>
     fi
     printf ' '
     sed -n 's/^[Rr]etry-[Aa]fter: *//p' "${3}.headers" 2>/dev/null | tr -d '\r' | head -1
+}
+
+auth_post_watch() {  # <json body> <url> <file for the body>
+    _s=$(post_watch_once "$1" "$2" "$3")
+    _w=0
+    while _npu_102 "$(cat "$3" 2>/dev/null)" && [ "$_w" -lt "$NPU_WAIT" ]; do
+        sleep 1; _w=$((_w + 1))
+        _s=$(post_watch_once "$1" "$2" "$3")
+    done
+    _npu_waited "$_w"
+    printf '%s' "$_s"
 }
 
 # Readiness: on a cold stick lemond takes tens of seconds to answer its first request (catalog, web
@@ -610,6 +653,9 @@ next')
     check PASS "$(laya_verdict '{"choices":[{"message":{"content":"Here you go"}}],"x_lemonade_route":{"route_to":"m","matched_rule":"laya-prose","default_used":false,"trace":[{"condition":"classifier:laya","score":0.77}]}}' prose m)"
 
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
+    # A self-test is not a check run: without this the EXIT trap above appended "RESULT: FAIL (this check died
+    # before its footer)" to every green self-test, which reads exactly like the death the trap exists to report.
+    RC_FOOTER=1
     exit $rc
 fi
 
@@ -1391,6 +1437,10 @@ else
 fi
 
 say ""
+# The back-off leaves a trace: a run that only passed because the partition freed in time must say so, or the next
+# person reads a clean transcript and believes nothing was ever refused.
+NPU_WAITED=$(awk '{s += $1} END {print s + 0}' "$NPU_WAITFILE" 2>/dev/null)
+[ "${NPU_WAITED:-0}" -gt 0 ] 2>/dev/null && say "info  npu-wait : $NPU_WAITED s spent backing off on code 102 (a client had just released the partition; the window is ~2 s)"
 RC_FOOTER=1
 if [ "$FAILS" = 0 ]; then
     say "RESULT: PASS ($ROWS checks, no failures)"

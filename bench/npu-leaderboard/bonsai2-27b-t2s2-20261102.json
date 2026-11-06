@@ -17,9 +17,9 @@
     "stream_per_token_gb": 6.11,
     "tokens": 7
   },
-  "instrument": "NPU_PHASE_PROF=1, the serve's own [ph] tok wall= line, median of the 7 steady-state tokens (first token dropped); request walls are not this number, they pay the per-serve image fill once",
-  "repeats": 7,
+  "instrument": "NPU_PHASE_PROF=1, one run per arm: the serve's own [ph] tok wall= line, median of its 7 steady-state tokens (first token dropped); request walls are not this number, they pay the per-serve image fill once",
+  "repeats": 1,
   "timestamp": "2026-11-02T23:50:00Z",
   "source": "~/briefs/TBONSAI-SPEED-STATE.md, 2026-11-02 20:05 AST entry: three npu-hold tickets (19:47, 19:48, 19:49 AST) on :18099, amdxdna counter 0 in each, spread 311-317 ms/token",
-  "notes": "P3 (#802) 'after' arm against bonsai2-27b-pb16i-20261102.json: 1.31x per token and 1.42x on the device wait (209 vs 296 ms). Accept: every decode role byte-identical to the pb16i path (6/6 at layer 0, 8/8 at layer 3, seeds 1/2/3) and greedy text identical on the three-prompt window. Stream is 2.12x fewer bytes (431 images, 14.44 -> 6.82 GB). What would make this wrong: quoting a request wall instead of [ph] tok (a fresh serve adds the ~10.6 s weight-image fill), or comparing across boxes - the pb16i arm is the only valid control."
+  "notes": "P3 (#802) 'after' arm against bonsai2-27b-pb16i-20261102.json: 1.31x per token and 1.42x on the device wait (209 vs 296 ms). Accept is byte-exactness, not a text diff: every decode role matched the pb16i path byte for byte at layer 0 (6/6) and layer 3 (8/8) on three seeds, and greedy text is equal to the pb16i arm's on the prompt both were asked (' Paris.\\nThe capital of Germany is'). A three-prompt full-model text window on this pair was NOT run - the 2026-11-06 re-take was blocked by an unrelated serve holding the engine's device lock - so that remains the open acceptance step. Stream is 2.12x fewer bytes (431 images, 14.44 -> 6.82 GB). What would make this wrong: quoting a request wall instead of [ph] tok (a fresh serve adds the ~10.6 s weight-image fill), or comparing across boxes - the pb16i arm is the only valid control."
 }

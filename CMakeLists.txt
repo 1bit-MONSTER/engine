@@ -555,6 +555,10 @@ if(Python3_Interpreter_FOUND)
     # repo that went upstream stays a human decision: the step shipped with an unterminated quote that
     # nothing executed until a pin moved, i.e. until its first scheduled run (engine #1148)
     add_test(NAME workflow_shell COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/workflow_shell_test.py)
+    # engine#1070: every configured test that starts a server holds RESOURCE_LOCK route_ports, so
+    # the list at the end of this file cannot drift away from the tests it protects. Reads the
+    # configured test list (ctest -N --show-only=json-v1); no device, no model, no build products.
+    add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.
@@ -1072,3 +1076,27 @@ if(ONEBIT_NPU_PRIVATE)
         target_compile_definitions(onebit PRIVATE ONEBIT_NPU_DX_KERNELS_DEFAULT="${ONEBIT_NPU_DX_KERNELS}")
     endif()
 endif()
+
+# ── Loopback ports: route tests run one at a time (engine#1070) ──────────────
+# Every test named below starts a server on 127.0.0.1. Most pick a port by binding :0, closing the
+# socket, then letting the child bind that number; three use fixed 43xxx literals. Under `ctest -j`
+# two such tests can be handed the same port between the close and the child's bind, which surfaces
+# as EADDRINUSE in the child and a JSON decode error on an empty /health body in the parent (pm_route
+# did exactly that on PR #1065, and passed on the same commit's re-run). RESOURCE_LOCK makes the
+# collision impossible rather than unlikely, and serialises nothing else: the rest of the suite stays
+# parallel. A test that starts a server belongs in this list.
+# The scripts' own failure path says which port could not be bound, so a socket leaked by an aborted
+# run is still named when it bites.
+set(_onebit_route_tests
+    smoke_serve watchdog_serve metrics_serve print_backend lemonade_hrx parallel_args recipes_route
+    template_pin greedy_shortcut device_route npu_repack_path pm_route bench_selftest prism_route
+    laya_gguf_route mem_admit_route hrx_cwsr_route hrx_runtime_route hybrid_route
+    hybrid_kvshare_route hrx_cpu_weight_parity)
+# Tests that only exist for some configurations (a model was passed, a device is built in).
+list(APPEND _onebit_route_tests hybrid_e2e laya_route_e2e pm_laya_route serve_e2e_cpu serve_e2e_hrx)
+foreach(_onebit_route_test IN LISTS _onebit_route_tests)
+    if(TEST ${_onebit_route_test})
+        set_tests_properties(${_onebit_route_test} PROPERTIES RESOURCE_LOCK route_ports)
+    endif()
+endforeach()
+

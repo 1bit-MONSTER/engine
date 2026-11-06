@@ -590,6 +590,11 @@ if(Python3_Interpreter_FOUND)
     # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
     # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.
     add_test(NAME repack_tile_order COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/repack_tile_order_test.py)
+    # The M-split ceiling (engine#754): tools/split_ceiling.py turns two measured rates into the optimum NPU
+    # share, the per-GEMM ceiling and the end-to-end factor, and this pins it to the three iGPU states
+    # docs/hetero-prefill.md records (40.7 TFLOP/s, the engine#782 regression, post-#782) so the arithmetic
+    # cannot drift from the page.  Stdlib only: no model, no device.
+    add_test(NAME split_ceiling COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/split_ceiling_test.py)
     # The same gate end to end (engine#1110 review): a synthetic one-tensor GGUF and a synthetic container whose
     # only tensor is named for another layer, so nothing is comparable -- the pair that used to read as a match --
     # plus the same bytes under the mapped name, which must be compared and refused.  numpy + gguf-py, no model.

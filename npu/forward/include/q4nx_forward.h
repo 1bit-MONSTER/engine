@@ -160,6 +160,10 @@ public:
     bool init_host(const char* model_path, const std::string& artifact_dir);
     bool host_gemm() const { return host_gemm_; }
     bool ready() const { return ready_; }
+    // attention.mode as the loaded plan states it: false unless the plan says
+    // noncausal_full_attention, so a caller can check the served pack against its own declaration
+    // (app/forward_serve.cpp, engine#796).
+    bool noncausal() const { return noncausal_attn_; }
     const char* last_error() const { return err_.c_str(); }
 
     // Clear the KV cache (start a new sequence).

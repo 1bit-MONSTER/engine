@@ -196,6 +196,26 @@ PY
     # and the prompt's own text: `THINKING-ONLY` is a distinct failure from "no answer at all", because the client sees a
     # clean 200 in both cases and the picture page would then render the fallback's prompt without saying so
     if [ "$ic" = 200 ]; then iv=$(answer_check); [ "$iv" = ok ] || bad="$bad picture-$iv"; fi
+    # Cycle 30, measured by pi-release on THIS payload: Qwen3-0.6B-NPU-1bit answers with `reasoning_content` only - blank
+    # `content`, finish=length - unless the prompt carries the `/no_think` idiom, and it does so at 64 AND 256 tokens, so a
+    # bigger budget is not the fix. This probe still REDS the round (the demo page would render a blank beat and the client
+    # could not tell), but it names the cause with one extra request, so the red row says what to change. Only on a blank
+    # picture beat, so a healthy round costs nothing.
+    if [ "$iv" = blank-thinking-only ]; then
+        nt_body=$(post /chat/completions "$(python3 - "$npu" "$img_system" "$idea" <<'PYNT'
+import json, sys
+print(json.dumps({"model": sys.argv[1],
+                  "messages": [{"role": "system", "content": sys.argv[2]},
+                               {"role": "user", "content":
+                                "/no_think\nRewrite this idea as a detailed image prompt, with lighting, materials "
+                                "and mood: %s" % sys.argv[3]}],
+                  "max_tokens": 96, "temperature": 0.4,
+                  "chat_template_kwargs": {"enable_thinking": False}}))
+PYNT
+)")
+        nt=${nt_body%%$'\t'*} nt_v=$(answer_check)
+        say "    diagnosis: the same request with '/no_think' -> $([ "$nt" = 200 ] && echo "$nt_v" || echo "http=$nt")"
+    fi
     if [ -z "$bad" ]; then
         pass=$((pass + 1))
         say "  round $i/$(printf '%s' "$rounds"): PASS  game=$game_model picture=$ic_model  pic-answer='$ic_text'"

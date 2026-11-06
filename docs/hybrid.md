@@ -155,6 +155,8 @@ that names both causes (the flag was not set, *or* the KV backend cannot export)
 state-file route above. A decoder pinned before #212 has none of that, so a hybrid deployment running the flag
 needs this pin or later on both sides.
 
+What that route is worth, next to the file route it replaces, is measured in [docs/zero-copy.md](zero-copy.md).
+
 ## Tests
 
 - `tests/hybrid_kvshare_route.sh` (CTest `hybrid_kvshare_route`, no model, no dma-buf): the same fake
@@ -248,3 +250,41 @@ Caveats worth keeping: the GPU load was weight-streaming `pp512`, not a decode l
 cell is a couple of minutes of NPU time, not a soak; and this is one kernel/firmware pair. A long
 concurrent run with a real provider is still the last unmeasured thing on this route -- but nothing in
 the fleet needs to serialise NPU behind GPU while waiting for it.
+
+## Why the route does not split a prompt between the two engines
+
+An obvious question once the provider and the decoder are both real: instead of handing the **whole** prompt to
+the provider (step 2 above) and letting the decoder evaluate one token, why not hand it a *prefix* and let the
+decoder prefill the rest, so both engines work on one prompt? That is the M-split of
+[docs/hetero-prefill.md](hetero-prefill.md), and the answer is arithmetic rather than taste.
+
+**In this route the split cannot overlap.** The provider runs to completion, its state is restored into slot 0,
+and only then does the decoder evaluate the remaining tokens (steps 2-4). A prefix split therefore costs
+`provider(m) + decoder(M-m)`, and since the decoder's per-row cost is *lower* than the provider's on every shape
+we have measured, that sum is always larger than the decoder's own prefill - the optimum is `m = 0`, i.e. no
+provider at all, which is `--device hrx`. A split only pays in the **concurrent** shape the issue is about: two
+disjoint row ranges on the two engines at the same time, inside one process, which needs the shared weight layout
+and the buffer bridge first ([docs/hetero-prefill.md](hetero-prefill.md), "What transfers").
+
+**What it would be worth if it were built.** One formula covers every measurement on the page: with the iGPU at
+`g` ms per row and one NPU tile at `t` ms per 256 rows, the best concurrent split runs both sides to the same
+finish time, and `tools/split_ceiling.py` computes it (with `--gemm-share` for the end-to-end factor, because the
+split cannot touch attention):
+
+| iGPU state (Qwen3-4B `up_gate`, M=16384) | iGPU | per-GEMM ceiling | optimum NPU share | end to end |
+|---|---|---|---|---|
+| healthy boot, 40.7 TFLOP/s (2026-11-01) | 20.03 ms | 1.032x | 2 of 64 tiles | 1.017x |
+| engine#782 regression, 12.1-12.4 TFLOP/s | 65.71 ms | 1.103x | 6 of 64 tiles | 1.052x |
+| post-#782 pin, ~44 TFLOP/s | 18.4 ms | 1.032x | 2 of 64 tiles | 1.017x |
+
+The "end to end" column uses the measured attention share of this model's pp16384 device time (47.7 %, so 52.3 %
+is GEMM a split could touch). On the iGPU the box now ships, a perfect split dispatcher is worth **~1.7 % of
+prefill**, and on the bad build it was worth ~5 % - against a 3.3x regression that has since been fixed. That is
+the number engine#754 is blocked on, and it is why this route offers no split: not because the idea is wrong, but
+because at a 30:1 row-cost asymmetry between the two engines there is nothing left to win.
+
+Two honest caveats, both of which have moved the number before: the iGPU side is a *measurement*, so re-run it
+before quoting a ceiling (`docs/hetero-prefill.md` has done that three times); and the formula assumes the iGPU's
+time is linear in its row count, which holds well enough at M=16384 (it predicts 1.103x where the split measured
+1.134x) but not at M<=2048, where every split measured on this box *loses* 3-5x because the NPU's per-tile cost is
+flat while the prompt is too short to give it tiles.

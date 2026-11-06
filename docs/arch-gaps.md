@@ -774,6 +774,74 @@ inline `config` and the repo's own `config.json`; metadata only, no weights).
 * **Real support needs**: none planned. Serving it means implementing the repo's own memmap
   selection scheme, which the GGUF and Q4NX routes have no slot for.
 
+### 2026-11-06 batch (engine#1253)
+
+Two classes were reported `UNCOVERED` on 2026-11-06: `Lfm3ForCausalLM` (3 newest models, e.g.
+`D0zy/essay-model-merged`; `registry/census.json` counts 96 in the full sweep) and
+`NeedleForToolCalling` (1 newest, e.g. `Amdkn7/needle3`; 14 in the census). Neither is registered
+by the pin the registry was generated from, `third_party/llama.cpp 710c7c23` (2026-11-05):
+`git grep` over that tree for `Lfm3` / `lfm3` and for `Needle` returns nothing: `gguf-py` has
+`LFM2` / `LFM2MOE` but no `LFM3`, and no `NEEDLE` `MODEL_ARCH` at all, while `src/llama-arch.cpp`
+names `lfm2` / `lfm2moe` and neither new architecture.
+`registry/architectures.json`, generated from that pin, therefore has no entry to map
+(`tools/registry_build.py --check` is clean on it), and a hand-written mapping would claim a model
+no backend loads. Both are reviewed below as **not aliases** and their
+`registry/significant.json` entries carry `"watch": "report"`, so the watcher lists new uploads
+as `. REVIEWED` instead of alerting; remove that field and record `mapped_ok` when a pin learns the
+class.
+
+The configs were read on 2026-11-06 through the same HF routes the watcher uses (the listing's
+inline `config` and the repo's own `config.json`; metadata only, no weights).
+
+#### `lfm3` - `LiquidAI/LFM3-1.7B`, `D0zy/essay-model-merged`
+
+* **Class / model_type**: `Lfm3ForCausalLM` / `lfm3`, `library_name: transformers`, `auto_map` to
+  `configuration_lfm3` / `modeling_lfm3` (custom code). The 2026-11-06 walk counted 3 uploaders,
+  which is the threshold at which a custom-code class starts alerting, and LiquidAI's own
+  checkpoint is public, so the class was reviewable.
+* **Shape** (`LiquidAI/LFM3-1.7B`): 24 layers, hidden 2048, 16 heads / 4 kv, `head_dim` 128,
+  vocab 128000, tied embeddings, 262144 positions. `layer_types` is a 2-conv + one-attention
+  repeating schedule with both `full_attention` and `sliding_attention` (`sliding_window` 256),
+  `conv_L_cache` 7, `use_sandwich_norm` on, and per-attention-type `rope_parameters`
+  (`partial_rotary_factor` 0.5 with `rope_theta` 10^6 on full attention; 10^4 on sliding layers).
+* **Why an alias is wrong**: the mapped LFM family is LFM2 (`Lfm2ForCausalLM` -> `lfm2`,
+  `Lfm2MoEForCausalLM` -> `lfm2moe`) with `conv_L_cache` 3, no `sliding_attention` layers, no
+  partial rotary, no sandwich norm and untied embeddings. Loading an LFM3 checkpoint through the
+  LFM2 path would keep the conv/attention skeleton, normalise at the wrong points and drop the
+  sliding/partial-rotary attention, and still produce tokens - the silent substitution this page
+  exists to prevent.
+* **Why it is not mapped**: the pin has no `lfm3` (no converter class, no `MODEL_ARCH`, no
+  `LLM_ARCH_*`), so the generated registry has nothing to read the class from.
+* **Real support needs**: a new GGUF architecture (sandwich norm, sliding attention with partial
+  rotary, 7-tap conv) in the pinned backend, validated against HF reference logits. The family is
+  already 96 models in the census, so this is worth its own issue rather than an alias.
+
+#### `needle` - `Amdkn7/needle3`
+
+* **Class / model_type**: `NeedleForToolCalling` / `needle`, `library_name: cactus-compute`,
+  no `auto_map`, `name_or_path: Cactus-Compute/needle3`, `engine_version` 3.1.0. The library is
+  Cactus's own on-device runtime, which the watcher's non-Transformers list does not name, so the
+  census counts the class as native.
+* **Not a Transformer**: 20 layers, hidden 768, 12 heads / 2 kv with separate `qk_head_dim` 48 and
+  `value_head_dim` 64, vocab 8192, 121M params, GQA with a 1024-token sliding window and a
+  256-token KV window, `mlp: hadamard`, an `extras` block (`engram` sites/orders/slots 18432,
+  `global_attention_layers`, `qkv_conv_taps`, `mhc_lanes`, a `confidence` head), and a
+  `quantization` block (`cactus-quants`, `embedding=4,mhc=4,default=2`, 8-bit KV and activations).
+  It ships `needle3.cact` plus `checkpoints/needle3.safetensors`, and its deployment is a
+  "self-contained C++ / WebAssembly" runtime - the `.cact` container is the deployed format.
+* **Why an alias is wrong**: nothing in the pinned stack reads the `.cact` container or the cactus
+  quantisation, and the MLP is a Hadamard transform with engram lookups, not the gated MLP any
+  supported family has. Mapping it to another decoder would advertise a model whose weights this
+  engine cannot even dequantise.
+* **Why it is not mapped**: no pinned converter or runtime reads `needle` (the grep above), so the
+  generated registry has no entry.
+* **Not the `needle3` class reviewed above**: `Needle3ForCausalLM` (`model_type: needle3`) is a
+  different class from a different publisher, reviewed in its own section; this one declares
+  `model_type: needle` and is served by the Cactus runtime.
+* **Real support needs**: none planned for this engine - it would take the Cactus container format,
+  its quantisation and that runtime. Recorded as a reviewed gap, not an alias, so the family does
+  not file a daily issue.
+
 ## Unverifiable: gated configs
 
 A gated repository cannot be classified at all: the watcher's listing carries no config for it, so

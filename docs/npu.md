@@ -32,6 +32,31 @@ and decrypts in memory at load (a wrong key fails cleanly, and nothing phones ho
 build and method are not in this repository or in any release. This page covers the public parts:
 the model format, how `1bit serve` runs an NPU model, and how to build.
 
+## What works today
+
+On Linux with the `amdxdna` kernel driver loaded, the engine serves Qwen3-0.6B on the XDNA 2 NPU at
+**88.6 tok/s** in the release gate, and it takes a GGUF directly: `1bit serve -m <model.gguf> --device npu`
+repacks it to the Q4NX directory this page describes and runs six architectures. Everything on the
+NPU is in progress — correctness first, speed next — so the iGPU through [HRX](hrx.md) remains the
+route for anything the NPU does not run, and `--device hybrid` puts one request's prompt on one
+device and its tokens on the other ([hybrid.md](hybrid.md)).
+
+## How to try it
+
+On a machine whose kernel has `amdxdna` (the [1bit OS](os-v3.md) appliance ships one):
+
+```bash
+1bit serve -m <NPU model dir> --device npu --alias npu      # a Q4NX model directory
+1bit serve -m <model.gguf> --device npu --alias npu         # or a GGUF, repacked on load
+```
+
+Then it is the same OpenAI-compatible API as every other route ([serve.md](serve.md)):
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"npu","messages":[{"role":"user","content":"Hello"}]}'
+```
+
 ## A model directory
 
 ```
@@ -50,6 +75,8 @@ the model format, how `1bit serve` runs an NPU model, and how to build.
 
 A model directory may carry a **plan.json**: the decisions the runtime used to make by looking at which
 files happened to be in `--kernels`. Three of them, and each one used to be silent:
+
+The schema, the refusal rules and the generator flags are in [npu-plan.md](npu-plan.md).
 
 | decision | what the probe used to do |
 |---|---|
@@ -918,6 +945,29 @@ release before a registry entry means anything. Until then the row above is the 
 report prints a repo only when it is new or changed, so a quiet day is quiet, and the next change
 to one of these repos is a prompt to update this table rather than a namespace error.
 
+The 2026-11-06 census body (engine#1253) read the whole org from a fresh state, so it also printed
+every pack whose family the registry maps for `hrx` only. Those are the `!! NPU FLM` rows: the
+architecture is covered on the CPU route, but a Q4NX directory needs the NPU route and `npu` is
+not in the entry's `backends`. Family by family:
+
+| family (`gguf`) | packs in the 2026-11-06 body | `backends` | NPU route answer |
+|---|---|---|---|
+| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx | not served: the dense qwen35 family has no NPU kernel set; the serving work is tracked in engine#587 (Qwen3.8-27B-NPU2) |
+| `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
+| `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
+| `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
+| `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served |
+| `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2` | hrx | not served |
+| `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
+| `hy_v3` | `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | hrx | not served; the first table above records this one |
+
+Adding `npu` to one of those entries would claim kernels this build does not carry. A family leaves
+this list when `NPU_ARCHS` in `tools/registry_build.py` names its HF class with the model type the
+route loads and a captured `--device npu` run stands behind it; the regenerated entry then carries
+`npu` in `backends`. Note that the route does serve `qwen3_5_moe` (`Qwen3.6-35B-A3B` through the
+GGUF-on-NPU forward), while every D3-* pack in this body declares the dense `qwen3_5` family, so
+the two are not the same answer and the registry keeps them apart.
+
 ### Sealed kernel sets: the manifest is what says a set is ours
 
 A set ships as `<set>/layout.json`, `<set>/layer1_*/layer1.elf` (each `1BPKCRYP` ciphertext, opened
@@ -1658,3 +1708,27 @@ pinned generator: the tool drops a half-written last line (a killed capture), re
 measurable column instead of printing an empty table, and exits non-zero on a malformed one. The
 `--self-test` builds a synthetic GGUF and capture with hand-computed answers, so the arithmetic is
 gated without a model on disk.
+
+## FAQ
+
+### Does the NPU run every model?
+
+No. It runs the dense Qwen3 family, including GGUF models it repacks to Q4NX on load (six
+architectures), plus the models whose kernel sets ship with the engine. Every other GGUF still runs
+on the iGPU through [HRX](hrx.md), and the models checked on this box are on [models.md](models.md).
+
+### Is the NPU faster than the iGPU?
+
+Not on the models it runs today: the route is correctness-first, speed next, and what it measures is
+on the [NPU leaderboard](npu-leaderboard.md). It is a second device beside the iGPU, not a
+replacement for it.
+
+### Can the GPU and the NPU run at the same time?
+
+Yes. The two were measured running together for forty repetitions with no hang and no corruption,
+and `--device hybrid` splits a single request across them ([hybrid.md](hybrid.md)).
+
+### Do I need a special kernel or driver?
+
+The NPU needs the `amdxdna` kernel driver. The [1bit OS](os-v3.md) appliance ships a kernel built
+with it, and the [Linux kernel](kernel.md) page covers building your own.

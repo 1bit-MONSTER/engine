@@ -21,7 +21,7 @@ limitations under the License.
 
 **Status: CLOSED 2026-10-10 — closed as not reproducible, not as fixed at source.** The issue is closed
 (`completed`); the kernel still lives in the llama.cpp fork (`motifs/dequant.loom`, tip `e44c9d01a4d5` when this was
-filed, `4a375bf2d36f` today), which is not vendored here, so nothing engine-side changed it. What closed it is the
+filed, `d70b67bf0974` today), which is not vendored here, so nothing engine-side changed it. What closed it is the
 follow-up run at the bumped pin: **0 failures in 30 focused runs** (20 on the new pin, 10 on the old, warm and cold JIT
 cache) and **3 × 1141/1141** full-suite runs, on the same kernel in both trees. The rule that came out of it stands:
 treat a single failure of this case as a flake, not a regression — see the ops step's three-clean-runs rule in

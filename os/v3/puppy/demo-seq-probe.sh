@@ -108,6 +108,29 @@ print(eval(sys.argv[1], {"d": d, "json": json}))
 PY
 }
 
+# answer_check: is there text in the reply, or did the budget go somewhere the client cannot see?
+# Cycle 30, from pi-release's hardware rehearsal of their own demo-sequence row: a thinking model can spend the WHOLE
+# budget in `reasoning_content` and return an empty `content` - a 200 with nothing in it. Their row read that as "no
+# answer text" and their fix names the state; this probe had the same hole one level deeper (it judged a turn on the
+# HTTP status and the answering model, never on the text), so it would have passed a blank beat. Echoes one token:
+#   ok | blank-thinking-only (budget spent, no visible text) | blank (nothing at all)
+answer_check() {
+    python3 - 2> /dev/null <<'PY2'
+import json
+try:
+    d = json.load(open("/tmp/dsq.body"))
+except Exception:
+    print("blank"); raise SystemExit
+ch = (d.get("choices") or [{}])[0]
+msg = ch.get("message") or {}
+text = (msg.get("content") or "").strip()
+if text:
+    print("ok"); raise SystemExit
+used = ((d.get("usage") or {}).get("completion_tokens") or 0) + (len(msg.get("reasoning_content") or "") and 1 or 0)
+print("blank-thinking-only" if used else "blank")
+PY2
+}
+
 say() { printf '%s\n' "$*"; }
 say "demo-seq-probe: $rounds round(s) of <game NPU turn | big-model turn | picture prompt on the NPU>"
 say "  url=$url npu=$npu big=$big"
@@ -134,6 +157,9 @@ PY
     st=${st_body%%$'\t'*} game_model=$(field 'd.get("model","")')
     case $st_body in *614*) c614=$((c614 + 1)) ;; esac
     [ "$st" = 200 ] && [ -n "$game_model" ] || bad="$bad game-http=$st"
+    # the game beat's own text, not just its status: a 200 with an empty content is the take's "blank beat" one layer down.
+    # Judged only on a 200 - a non-200 has no content to judge, and naming it both would report one fault twice.
+    if [ "$st" = 200 ]; then gv=$(answer_check); [ "$gv" = ok ] || bad="$bad game-$gv"; fi
     # 2. a turn on the big model - the model switch that evicts the NPU (max_models.llm=1)
     bg_body=$(post /chat/completions "$(python3 - "$big" <<'PY'
 import json, sys
@@ -167,6 +193,9 @@ PY
         bad="$bad picture-answered-by=${ic_model:-none}"
         fallbacks=$((fallbacks + 1))
     fi
+    # and the prompt's own text: `THINKING-ONLY` is a distinct failure from "no answer at all", because the client sees a
+    # clean 200 in both cases and the picture page would then render the fallback's prompt without saying so
+    if [ "$ic" = 200 ]; then iv=$(answer_check); [ "$iv" = ok ] || bad="$bad picture-$iv"; fi
     if [ -z "$bad" ]; then
         pass=$((pass + 1))
         say "  round $i/$(printf '%s' "$rounds"): PASS  game=$game_model picture=$ic_model  pic-answer='$ic_text'"

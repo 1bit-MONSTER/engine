@@ -21,6 +21,8 @@ record that cannot say how it was measured is refused, not ranked.
 
     tools/npu_leaderboard.py            # rewrite docs/npu-leaderboard.md
     tools/npu_leaderboard.py --check    # validate records only, no write
+    tools/npu_leaderboard.py --out F    # write the generated page to F (tests/npu_leaderboard_test.py
+                                        #  regenerates to a temp file and compares it with the committed one)
 
 Records live in bench/npu-leaderboard/*.json, one run per file.
 """
@@ -109,7 +111,7 @@ def table(rows):
     return lines
 
 
-def build():
+def build(out_path=None):
     records = load_and_check()
     by_host = {}
     for rec, _ in sorted(records, key=lambda t: sort_key(t[0])):
@@ -129,8 +131,9 @@ def build():
             out.append(f"- `{rec['id']}` — {rec['timestamp']}; source: {rec['source']}"
                        + (f"; {rec['notes']}" if rec.get("notes") else ""))
         out.append("")
-    OUT.write_text("\n".join(out))
-    print(f"wrote {OUT.relative_to(ROOT)} with {len(records)} record(s)")
+    target = Path(out_path) if out_path else OUT
+    target.write_text("\n".join(out))
+    print(f"wrote {target if out_path else OUT.relative_to(ROOT)} with {len(records)} record(s)")
     return 0
 
 
@@ -139,7 +142,13 @@ def main(argv):
         records = load_and_check()
         print(f"{len(records)} record(s) valid")
         return 0
-    return build()
+    out_path = None
+    if "--out" in argv:
+        i = argv.index("--out")
+        if i + 1 >= len(argv):
+            raise SystemExit("npu_leaderboard: --out needs a path")
+        out_path = argv[i + 1]
+    return build(out_path)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@
 #include "npu_answer_parser.h"
 #include "npu_chatml.h"
 #include "npu_grammar.h"
+#include "npu_load_retry.h"  // engine#1241: a refused NPU context names another client, not a dead device
 #include "npu_prefix_cache.h"
 #include "npu_prompt_ids.h"
 #include "npu_sampling.h"
@@ -587,7 +588,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 }
                 return true;
             };
-            run(emit_pieces);
+            const std::string finish = run(emit_pieces);
             {
                 std::vector<std::pair<bool, std::string>> tail;
                 stream.finish(tail);
@@ -611,6 +612,18 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     json delta{{"tool_calls", calls}};
                     if (!chunk_tpl.contains("object") || chunk_tpl["object"].is_null()) chunk["object"] = "chat.completion.chunk";
                     chunk["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", "tool_calls"}}});
+                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                }
+                // OpenAI's stream ends with one choice that carries an empty delta and the reason the
+                // generation ended; without it a streaming client cannot tell a `length` cut from a
+                // natural `stop` (the per-delta chunks all say null, and the usage tail has no
+                // choices at all). The tool-call chunk above already reports `tool_calls`, so this is
+                // sent exactly once, and only for the text path.
+                if (stream.calls().empty()) {
+                    json chunk = chunk_tpl;
+                    chunk["choices"] = json::array({{{"index", 0},
+                                                     {"delta", json::object()},
+                                                     {"finish_reason", finish}}});
                     chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
                 }
             }
@@ -855,7 +868,17 @@ int run_forward_serve(int argc, char** argv) {
     std::unique_ptr<xrt::device> dev;
     if (!host_gemm) dev = std::make_unique<xrt::device>(0);
     const bool ok = dev ? e.fwd->init(*dev, model.c_str(), kernels) : e.fwd->init_host(model.c_str(), kernels);
-    if (!ok) throw std::runtime_error(std::string("forward init failed: ") + e.fwd->last_error());
+    if (!ok) {
+        const std::string why = std::string("forward init failed: ") + e.fwd->last_error();
+        // engine#1241 cure 2: the driver refuses a second client with code 102 / ENODEV, the same message a dead array
+        // answers, so "No such device" reads as a broken device or ELF. If another pid holds the device lock, say so
+        // now: the array is merely owned, and the fix is to wait for that process, not to rebuild anything.
+        if (npu_contexts_refused(why)) {
+            const std::string held = npu_lock_refusal_note();
+            if (!held.empty()) std::fprintf(stderr, "%s\n", held.c_str());
+        }
+        throw std::runtime_error(why);
+    }
 
     // A d3 pack keeps its decision head next to model.q4nx (npu/decision.h). Both files present means
     // the decision routes come up beside the chat ones; a pack without them is a chat model, which is

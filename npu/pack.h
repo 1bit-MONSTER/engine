@@ -32,6 +32,7 @@
 #include "model.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace onebit::npu {
 
@@ -41,6 +42,12 @@ float bf16_to_f32(uint16_t v);
 // Reorder n tiles in groups of G: within a group, even positions take the first
 // half and odd positions the second.
 void reorder_tiles(uint8_t* dst, const uint8_t* src, int n_tiles, int G);
+
+// The tile bytes of a projection as the lane's kernels read them: the tensor's own 5,120-byte
+// q4_1 chunks, or -- for an imported container's 6,144-byte q4_1f chunks (npu/q4nx.h, engine#1185)
+// -- the tiles repacked through q4nx::as_q4_1() into `converted`. The pointer stays valid as long
+// as the model (and `converted`). Throws when a q4_1f tensor is shorter than its declared tiles.
+const uint8_t* device_tiles(const Tensor& t, std::vector<uint8_t>& converted);
 
 // Bytes of the largest layer's weight buffer.
 size_t layer_weight_bytes(const Model& m);

@@ -33,6 +33,8 @@
 #include <string>
 #include <thread>
 
+#include "npu_device_lock.h"  // engine#1241: name another client holding the device on a refused context
+
 namespace onebit {
 
 struct LoadRetryPolicy {
@@ -118,7 +120,14 @@ void open_with_retry(const LoadRetryPolicy& p, const char* what, Open&& open, Re
                        std::to_string(int(elapsed * 1000)) + " ms" +
                        (queued ? " over a " + std::to_string(int(window * 1000)) + " ms queue window" : "") +
                        ", last reason: " + ex.what());
-                if (queued) report(npu_contexts_refused_hint());
+                if (queued) {
+                    // engine#1241 cure 2: a held array answers "code 102 / No such device" exactly like a dead one,
+                    // so if another pid holds the device lock, that pid is the first thing to name -- before the
+                    // reload advice, which is the wrong first move while a live holder exists.
+                    const std::string held = npu_lock_refusal_note();
+                    if (!held.empty()) report(held);
+                    report(npu_contexts_refused_hint());
+                }
                 throw;   // the caller's own error path; the reasons above are the evidence the appliance lacked
             }
             const double delay = load_retry_delay(p, attempt, max_delay);

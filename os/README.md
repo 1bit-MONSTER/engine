@@ -16,7 +16,41 @@ limitations under the License.
 -->
 # 1bit OS
 
-Lemonade on a USB stick, with the 1bit engine inside. 1bit OS boots a Strix Halo machine from
+**1bit OS is a Puppy Linux appliance.** It is `ResolutePup64`, built with
+[woof-CE](https://github.com/puppylinux-woof-CE/woof-CE) on the Ubuntu 26.04 "resolute" base, with
+[Lemonade](https://github.com/lemonade-sdk/lemonade)'s server and this engine embedded in it, running
+**our** kernel rather than the distribution's. The engine is one of Lemonade's backends, the `onebit`
+recipe (HRX0 and the NPU, [docs/lemonade.md](../docs/lemonade.md)), next to Lemonade's own (llama.cpp,
+whisper.cpp, stable-diffusion.cpp, Kokoro and the rest). Lemonade leads: its web app, its API, its model
+catalog and downloads, its routing and its settings.
+
+| what the appliance is | |
+|---|---|
+| base | `ResolutePup64` (woof-CE on the Ubuntu 26.04 `resolute` base); the same image is the live/try stick and the frugal install |
+| kernel | `7.4.0-rc1-1bit`, ours, MOK-signed, with `amdxdna` (NPU) and `ec_su_axb35` (fan and EC) signed the same way |
+| Secure Boot | on: shim → our MOK-signed grub → our MOK-signed kernel → our signed modules |
+| boot | **headless by default**, a console login with no X; a second boot entry, `1bit OS (desktop, JWM)`, starts Puppy's desktop on the same system |
+| userland | `bash`, `sudo`, `apt`, `sshd`, `mokutil`: an ordinary Linux box, not an initramfs |
+| persistence | everything that has to last is on the `1BIT-DATA` partition, which is Puppy's save layer (`PUPMODE=12`): models, Lemonade's config and cache, SSH keys |
+
+The recipe is [`os/v3/puppy/`](v3/puppy/README.md), the measurements behind it are
+[docs/os-v3-live-puppy-eval.md](../docs/os-v3-live-puppy-eval.md), and the design with its gates is
+[docs/os-v3.md](../docs/os-v3.md). **Nothing is published yet**: the next release carries it.
+
+## The three bases in this tree
+
+| where | what it is | shipped |
+|---|---|---|
+| [`os/v3/puppy/`](v3/puppy/README.md) | **1bit OS**, the Puppy appliance above | in the next release |
+| [`os/v2/`](v2/README.md) | the same appliance on a minimal Ubuntu 26.04 root filesystem with systemd, updated with `.deb`s from `1bit.gg/apt`; the documented fallback | no |
+| [`os/mini/`](mini/mkimage.sh) | the BusyBox image: one EFI file, everything in RAM. **Not 1bit OS**: it is the CI/VM target (`vmtest`, `vmtest-release`) and the medium the c18-c20 release candidates carried | no |
+
+Everything below this line is `os/mini`, the BusyBox image, and is kept because it is what the QEMU
+gates run against.
+
+## `os/mini`: the BusyBox image, in detail
+
+Lemonade on a USB stick, with the 1bit engine inside. The image boots a Strix Halo machine from
 the stick, runs entirely in RAM, never touches the internal disk, and starts
 [Lemonade](https://github.com/lemonade-sdk/lemonade)'s server, `lemond`, with Lemonade's own
 defaults. Lemonade leads: its web app, its API, its model catalog and downloads, its routing and its
@@ -120,7 +154,7 @@ Lemonade on `http://localhost:13305`: its web app, its OpenAI-compatible API und
 (`/v1` too), and `lemonade` on the shell.
 
 **Models.** Lemonade lists every GGUF in `models/` itself (`extra_models_dir` in its
-`config.json`), for its `llamacpp` recipe. At boot, 1bit OS also registers each GGUF there (not
+`config.json`), for its `llamacpp` recipe. At boot, `os/mini` also registers each GGUF there (not
 `mmproj` files; a split model by its first part) and each NPU model directory for the `onebit`
 recipe, as `user.<name>-1bit` in Lemonade's model registry (`lemonade/config/user_models.json`;
 entries it already has are left alone). Lemonade shows those only where one of the recipe's
@@ -141,7 +175,7 @@ LEMONADE_API_KEY=<a long random string>      # every /api, /v0 and /v1 request m
 
 `lemond.conf` is the file Lemonade's systemd unit reads as `/etc/default/lemond`; init reads it
 for `lemond` only. The rest of `config.json` follows Lemonade's documentation
-(`third_party/lemonade/docs/guide/configuration/README.md`); 1bit OS sets only `extra_models_dir`
+(`third_party/lemonade/docs/guide/configuration/README.md`); the image sets only `extra_models_dir`
 and `models_dir`. `/data/1bit.conf`, which earlier images read to start `1bit serve` at boot, is
 no longer read.
 
@@ -206,6 +240,8 @@ Power off, remove the stick, boot the machine from the disk. It boots the same i
 MODE: INSTALLED - 1bit OS runs from this machine's disk; /data is /dev/nvme0n1p2.
 ```
 
+(That banner is `os/mini`'s own; the Puppy appliance prints its own release identity.)
+
 and `/etc/1bit/installed` exists instead of `/etc/1bit/live` (the menu a stick shows is skipped -
 there is nothing to choose). Then `1bit-release-check` again: the same PASS/FAIL list as on the stick,
 now reporting the INSTALLED mode. `1bit-selftest` works too and must report `mode : INSTALLED`,
@@ -227,7 +263,7 @@ nvme`), not `virtio-blk-pci`; otherwise you are looking at this, not at a broken
 same MOK-signed files the stick booted; the machine's MOK enrolment (`mokutil --list-enrolled`) is
 not touched by an install. If the firmware does not offer the disk on its own, add an entry pointing
 at `\EFI\BOOT\BOOTX64.EFI` on its partition 1 (on a Linux box: `efibootmgr -c -d /dev/nvme0n1
--p 1 -L "1bit OS" -l '\EFI\BOOT\BOOTX64.EFI'`). Booting the stick again is unchanged and does not
+-p 1 -L "1bit mini" -l '\EFI\BOOT\BOOTX64.EFI'`). Booting the stick again is unchanged and does not
 touch the installed disk: that is how you get back to a live system (or to reinstall).
 
 What the VM proves (`os/mini/vmtest.sh`, which now also installs onto a virtual NVMe and boots from
@@ -267,8 +303,7 @@ being reused after a reboot, Lemonade's Vulkan backends on RADV, `llamacpp-hrx`,
 
 ## The v2 base (Ubuntu + apt)
 
-Everything above describes `os/mini`: one BusyBox image that runs from RAM, updated by reflashing the
-stick. `os/v2/` is the same appliance on a minimal Ubuntu 26.04 root filesystem with systemd, where what
+`os/v2/` is the same appliance on a minimal Ubuntu 26.04 root filesystem with systemd, where what
 we ship are `.deb` packages from the signed repository on `1bit.gg/apt` and the update path is
 `apt update && apt upgrade` - with the previous kernel and the cached debs as the rollback. The kernel,
 the EC board driver and ryzenadj are packages too; the live medium is the root filesystem as a squashfs
@@ -280,8 +315,9 @@ os/v2/proto.sh <work-dir> <engine-stage> <lemonade-prefix>   # everything, in on
 os/v2/README.md                                             # what each piece is, and what is proven
 ```
 
-`os/mini` keeps shipping until v2 passes the same checks on hardware. Both images keep the same `/data`
-layout and the same installer behaviour, so an owner's runbook does not change.
+It is in the tree and not shipped: 1bit OS is the Puppy appliance (`os/v3/puppy/`), whose userland
+brings `apt` and `/data` on `1BIT-DATA` without a second root filesystem design. `os/mini` stays as the
+CI/VM target either way.
 
 ## Next
 

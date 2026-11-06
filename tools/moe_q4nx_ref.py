@@ -91,6 +91,31 @@ class Q4nx:
     def shape(self, name):
         return self.table[name]["shape"]
 
+    def expert_meta(self, name):
+        """__metadata__.moe's entry for one routed stack, checked against the tensor's own shape.
+
+        The stacks come from ggml `[cols, rows, experts]` and are stored here as
+        `[experts x rows/32, cols/256, 5120]`, so a converter that keeps ggml's field order swaps
+        K and N and moves no byte: `bytes`, `tiles`, the offsets and the expert count all stay
+        valid (on this model gate/up are 24x8 and down 64x3 -- 192 tiles either way), which is
+        why every byte-count check in these tools passes on a transposed pair. Only the tensor's
+        own shape separates them, and a transposed down_proj is a GEMM contracting over the wrong
+        axis: noise, not an error. The engine's Moe makes the same three checks (npu/moe.cpp).
+        """
+        info = self.moe_meta.get("tensors", {}).get(name)
+        if info is None:
+            raise SystemExit(f"{name}: not listed in __metadata__.moe.tensors")
+        rows, cols = int(info["rows"]), int(info["cols"])
+        shape = self.shape(name)
+        if rows <= 0 or cols <= 0 or rows % 32 or cols % 256:
+            raise SystemExit(f"{name}: rows/cols are not a whole number of 32x256 tiles")
+        if int(info["tiles"]) != (rows // 32) * (cols // 256):
+            raise SystemExit(f"{name}: tiles does not match rows x cols")
+        if (len(shape) != 3 or shape[2] != TILE or shape[0] != int(info["experts"]) * (rows // 32)
+                or shape[1] != cols // 256):
+            raise SystemExit(f"{name}: rows/cols disagree with the tensor's shape {shape}")
+        return info
+
     def bf16(self, name):
         """A BF16 tensor as float32, its stored shape."""
         t = self.table[name]
@@ -120,7 +145,7 @@ class Q4nx:
         """Expert e of a routed stack as float32 [rows, cols]; not cached (streamed)."""
         t = self.table[name]
         rt, kt = t["shape"][0], t["shape"][1]
-        info = self.moe_meta["tensors"][name]
+        info = self.expert_meta(name)
         lo = info["offsets"][e]
         rows = info["rows"]
         rte = rt // info["experts"]
@@ -736,6 +761,27 @@ def selftest():
     h = rng.standard_normal((1, 16)).astype(np.float32)
     assert abs(float(np.sqrt((rmsnorm(h, np.ones(16, np.float32), 0.0) ** 2).mean())) - 1.0) < 1e-6
     print("ok   softmax / top-k renormalisation / RoPE / rmsnorm")
+    # The expert metadata is checked against the tensor's own shape, because a transposed pair of
+    # rows/cols moves no byte and leaves `tiles` identical (gate/up 24x8 and down 64x3 are both
+    # 192 on a 768-wide model), so nothing else in these tools can see it.
+    def stub(rows, cols, tiles, shape):
+        q = Q4nx.__new__(Q4nx)
+        q.table = {"w": {"shape": shape}}
+        q.moe_meta = {"tensors": {"w": {"experts": 2, "rows": rows, "cols": cols,
+                                        "tiles": tiles, "bytes": tiles * TILE,
+                                        "offsets": [0, tiles * TILE]}}}
+        return q
+
+    assert stub(768, 2048, 192, [48, 8, TILE]).expert_meta("w")["cols"] == 2048
+    for bad in (stub(2048, 768, 192, [48, 8, TILE]),     # rows/cols transposed, same tile count
+                stub(768, 2048, 191, [48, 8, TILE]),     # tiles inconsistent with rows x cols
+                stub(768, 2048, 192, [128, 3, TILE])):   # the shape a transposed tensor would have
+        try:
+            bad.expert_meta("w")
+        except SystemExit:
+            continue
+        raise AssertionError("a bogus expert geometry was accepted")
+    print("ok   expert metadata vs the tensor's shape")
     print("moe_q4nx_ref selftest: ok")
 
 

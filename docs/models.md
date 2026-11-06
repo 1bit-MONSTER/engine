@@ -34,3 +34,16 @@ formats.
 
 The numbers move with the pins; a row changes when its measurement is retaken. The Lemonade
 release the engine runs inside is the weekly pin in `third_party/lemonade` ([lemonade.md](lemonade.md)).
+
+## Our own models on Hugging Face
+
+Some of these files are ours, published under the **`1bit-MONSTER`** organization:
+[huggingface.co/1bit-MONSTER](https://huggingface.co/1bit-MONSTER). It carries re-hosted quantizations of
+upstream models, our own NPU packs, and the prebuilt kernels a pack needs beside it — `ZR1-1.5B-GGUF`, for
+one, holds its Q8 container's kernels in `npu-container-q8/npu/`. The model repositories are **public**: a
+download needs no account, no token, and no request to us. (The appliance image is separate: it is a
+release artifact and is not published yet — [releases.md](releases.md).)
+
+The organization is a catalogue, not an endorsement list. It holds more repositories than this page has
+measurements for, and publishing a file is not a claim that it runs well here. The rows above are that
+claim; the org is where the bytes come from.

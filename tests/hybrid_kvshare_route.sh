@@ -47,6 +47,18 @@ start() {   # start <log> [env...]
     api="http://127.0.0.1:$port"
     local code=000
     for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.1; done
+    # A server that never came up because it could not bind is a port collision, not a defect in
+    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
+        echo "FAIL: hybrid_kvshare_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
+        exit 1
+    fi
+    # this serve's OWN slot directory, from its child's argv: /tmp/1bit-hybrid-* is shared with every other serve
+    # on the box, so globbing it reports another test's in-flight socket as this route leaking one (see the same
+    # fix and the measurement in tests/hybrid_route.sh)
+    slotdir=$(for c in $(pgrep -P "$pid" 2>/dev/null); do
+        tr '\0' '\n' <"/proc/$c/cmdline" 2>/dev/null | grep -m1 '^/tmp/1bit-hybrid-'
+    done | head -1)
     [ "$code" = 200 ]
 }
 stop() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=; }
@@ -68,7 +80,7 @@ check "the provider got one readable fd per region" \
 # side of `leave_one_token` is fork 1bit-MONSTER/llama.cpp#189, which the pin does not carry yet
 check "adopt asks the decoder to leave one token" \
     'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"action\"]==\"adopt\" and d[\"body\"].get(\"leave_one_token\") is True else 1)" "$scratch/slot.json" 2>/dev/null'
-check "the socket is gone from the slot directory" '! ls /tmp/1bit-hybrid-*/kvshare-*.sock 2>/dev/null | grep -q .'
+check "the socket is gone from the slot directory" '[ -n "$slotdir" ] && ! ls "$slotdir"/kvshare-*.sock 2>/dev/null | grep -q .'
 stop
 
 # the adopt must carry the share_id: the fake backend refuses a wrong or missing one, so a provider that runs

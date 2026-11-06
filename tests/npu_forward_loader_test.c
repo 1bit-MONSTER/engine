@@ -152,6 +152,18 @@ int main(void) {
         ModelWeights* m = load(write_file("wide.q4nx", strlen(b), b, 98304));
         check(m != NULL, "a plain bf16 tensor 6,144 columns wide (not I8) still loads");
         if (m) model_free(m);
+        /* ... and the device form the serve layer hands it after q4nx::device_form()/as_q4_1()
+         * (npu/q4nx_device.cpp) -- 5,120-byte I8 tiles -- is what loads. */
+        const char* d = "{\"model.layers.0.self_attn.q_proj.weight\":{\"dtype\":\"I8\",\"shape\":[256,5120],"
+                        "\"data_offsets\":[0,1310720]}}";
+        ModelWeights* dm = load(write_file("devform.q4nx", strlen(d), d, 1310720));
+        check(dm != NULL, "the converted 5,120-byte q4_1 device form loads");
+        if (dm) {
+            TensorDesc* t = model_tensor_by_name(dm, "model.layers.0.self_attn.q_proj.weight");
+            check(t != NULL && t->ndim == 2 && t->shape[1] == 5120,
+                  "its I8 rows are one 5,120-byte tile wide");
+            model_free(dm);
+        }
     }
     char cmd[96];
     snprintf(cmd, sizeof cmd, "rm -rf %s", dir);

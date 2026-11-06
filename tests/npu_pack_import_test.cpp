@@ -37,6 +37,7 @@
 #include "pack.h"
 #include "pack_import.h"
 #include "q4nx.h"
+#include "q4nx_device.h"
 
 #include <nlohmann/json.hpp>
 
@@ -176,6 +177,29 @@ std::string model(const std::vector<std::string>& tensors, const std::vector<std
 void put_file(const std::string& path, const std::string& bytes) {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     f.write(bytes.data(), std::streamsize(bytes.size()));
+}
+
+// A model.q4nx tensor table, as npu/model.cpp reads it (8-byte header length, JSON, then data).
+json container_table(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    uint64_t hlen = 0;
+    f.read(reinterpret_cast<char*>(&hlen), 8);
+    std::string header(size_t(hlen), '\0');
+    f.read(header.data(), std::streamsize(hlen));
+    while (!header.empty() && (header.back() == ' ' || header.back() == '\0')) header.pop_back();
+    return json::parse(header);
+}
+
+// How many I8 tensors of a container are the imported 6,144-byte q4_1f form -- exactly the
+// trigger of the forward loader's refusal (npu/forward/src/model.c, engine#1185).
+int q4_1f_tensors(const json& table) {
+    int n = 0;
+    for (const auto& [name, t] : table.items()) {
+        if (name == "__metadata__" || !t.is_object() || t.value("dtype", std::string()) != "I8") continue;
+        const auto shape = t.value("shape", std::vector<int64_t>{});
+        if (!shape.empty() && shape.back() == int64_t(onebit::npu::kTileBytesF32)) ++n;
+    }
+    return n;
 }
 
 // The two overstatements the readers must catch: declared dims larger than the external file, and a
@@ -1345,6 +1369,73 @@ void test_import_fp32_params(const std::string& root) {
     check(groups > 0 && bf16_lost > 0,
           "fp32 import control: the bf16 form would have lost " + std::to_string(bf16_lost) + " of " +
               std::to_string(groups) + " groups on this data, so the check is live");
+
+    // ── the serve boundary (engine#1185): the same container in the device's form ────────────────
+    // `1bit serve -m <imported dir> --device npu` loads an imported container through the per-op
+    // forward, whose loader streams 5,120-byte q4_1 chunks and refuses a q4nx-2 container rather
+    // than misread it (npu/forward/src/model.c). Q4nxNpuForward::init_impl converts first through
+    // npu/q4nx_device.cpp; this is that conversion, and the proof it changes only the parameter
+    // width: the device tiles are byte-identical to the old bf16 container's for the same weights.
+    const std::string cache = (fs::temp_directory_path() /
+                               ("oga_q4nx_device_form." + std::to_string(::getpid()))).string();
+    fs::remove_all(cache);
+    {
+        const auto form = onebit::npu::q4nx::device_form(out + "/model.q4nx", cache);
+        check(form.converted && !form.reused && form.tensors > 0 && form.tiles > 0,
+              "device form: the imported container converts (" + std::to_string(form.tensors) +
+                  " tensors, " + std::to_string(form.tiles) + " tiles)");
+        check(form.model != out + "/model.q4nx" && fs::exists(form.model),
+              "device form: a cache directory, not the imported container in place");
+        check(fs::exists(out + "/model.q4nx") &&
+                  q4_1f_tensors(container_table(out + "/model.q4nx")) > 0,
+              "device form: the imported container on disk is unchanged and still q4nx-2");
+        // (c) the forward loader's refusal trigger is absent from what it is handed ...
+        const json converted_table = container_table(form.model);
+        check(q4_1f_tensors(converted_table) == 0,
+              "device form: the converted container holds no q4_1f chunk, so the loader's refusal "
+              "cannot fire on it");
+        check(converted_table.at("__metadata__").at("layout") == "q4nx-1",
+              "device form: the converted container says it holds the bf16 q4_1 form");
+        // ... and the safety net still sees the trigger on the file it would otherwise load.
+        check(q4_1f_tensors(container_table(out + "/model.q4nx")) > 0,
+              "device form control: the unconverted container still trips the loader's refusal");
+
+        const onebit::npu::Model conv(form.dir);
+        check(conv.tensor("lm_head.weight").shape.at(1) == int64_t(onebit::npu::kTileBytes),
+              "device form: the converted I8 tensors are 5,120-byte q4_1 chunks");
+        auto same_tiles = [&](const std::string& name, const pi::Q4& q) {
+            std::vector<uint8_t> old_form;
+            pi::tile_q4_1(q, old_form);
+            const auto& t = conv.tensor(name);
+            check(t.bytes == old_form.size() && std::memcmp(t.data, old_form.data(), old_form.size()) == 0,
+                  name + ": the converted device tiles are byte-identical to the old bf16 container's (" +
+                      std::to_string(t.bytes) + " B)");
+        };
+        same_tiles("model.layers.0.self_attn.q_proj.weight", pi::q_from_tiles(q_proj0));
+        same_tiles("model.layers.0.mlp.down_proj.weight", pi::q_from_tiles(down0));
+        same_tiles("lm_head.weight", pi::decode_matmulnbits(qw.data(), scales.data(), qz.data(), V, H, block));
+
+        // the fast lane's boundary (npu/pack.cpp) does the same repack in memory
+        std::vector<uint8_t> lane;
+        const uint8_t* lane_tiles = onebit::npu::device_tiles(m.tensor("model.layers.0.self_attn.q_proj.weight"),
+                                                              lane);
+        std::vector<uint8_t> want_lane;
+        pi::tile_q4_1(pi::q_from_tiles(q_proj0), want_lane);
+        check(lane_tiles == lane.data() && lane == want_lane,
+              "lane: device_tiles repacks a q4_1f projection to the old bf16 form's tiles, bit for bit");
+
+        const auto again = onebit::npu::q4nx::device_form(out + "/model.q4nx", cache);
+        check(again.converted && again.reused && again.model == form.model,
+              "device form: a second load reuses the cached conversion");
+        const auto already = onebit::npu::q4nx::device_form(form.model, cache);
+        check(!already.converted && already.dir == form.dir,
+              "device form: a container already in the device form is returned unchanged");
+        std::printf("device form: %lld I8 tensor(s), %lld tile(s) repacked; %d q4_1f trigger(s) on "
+                    "the imported container, 0 on the converted one, and the device tiles are the old "
+                    "bf16 form's byte for byte\n",
+                    form.tensors, form.tiles, q4_1f_tensors(container_table(out + "/model.q4nx")));
+    }
+    fs::remove_all(cache);
     fs::remove_all(out);
     fs::remove_all(dir);
     std::printf("fp32 import: %lld groups bit-equal to the pack; the bf16 form loses %lld\n", groups, bf16_lost);

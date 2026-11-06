@@ -419,7 +419,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp
                             npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
-                            npu/q4nx.cpp npu/tokenizer.cpp)
+                            npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
 
@@ -1017,7 +1017,11 @@ if(ONEBIT_NPU)
         npu/forward/include npu/forward/engine-src npu)
     # plan.json (npu/plan/plan.h, engine #799 P1) is read with nlohmann's parser, and the header is
     # part of this library's interface, so the dependency is PUBLIC.
-    target_link_libraries(onebit_npu_forward PUBLIC onebit_npu_rt nlohmann_json::nlohmann_json dl pthread m)
+    # engine#1185: the forward converts an imported q4nx-2 container to the device's 5,120-byte
+    # q4_1 form before model_load (npu/q4nx_device.cpp, onebit_npu), so the host layer is part of
+    # this library's link interface.
+    target_link_libraries(onebit_npu_forward PUBLIC onebit_npu onebit_npu_rt nlohmann_json::nlohmann_json dl
+                                                  pthread m)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")

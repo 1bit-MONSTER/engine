@@ -136,8 +136,8 @@ guessed mask is a different model.
 Q4NX is [FastFlowLM](https://github.com/ROCm/FastFlowLM)'s NPU model format (MIT), and its models on
 Hugging Face (`FastFlowLM/*-NPU2`) are Q4NX directories. A Q4NX weight is a grid of 32-row x
 256-column tiles, one chunk each, row-major over the grid. The chunk kind is the last dimension of
-the tensor's shape: `[tiles, 5120]`, or `[tile rows, tile cols, chunk bytes]` (`npu/q4nx.h` has the
-byte layouts).
+the tensor's shape: `[tiles, <chunk bytes>]` (5120, 6144, 4736 or 8704), or `[tile rows, tile cols,
+chunk bytes]` (`npu/q4nx.h` has the byte layouts).
 
 | Chunk | Kind | Weight | Seen in |
 |---|---|---|---|
@@ -153,9 +153,11 @@ The two q4_1 forms are a container property, named by the container's `layout` m
 one (the bf16 choice came from that path); `q4nx-2` is the fp32 form `1bit npu-pack import` writes,
 so an OGA pack's own scale and zero survive bit for bit. A decoder keys off the chunk's own last
 dimension either way, so a container with no metadata still loads; `q4nx::params_of_layout()` is for
-the caller that has to state the fidelity it holds, and `q4nx::as_q4_1()` repacks the fp32 form to
-the device's 5,120-byte bf16 q4_1 (the device kernels stream q4_1; the repack is where the bf16
-rounding reappears for the device, never in the container).
+the caller that has to state the fidelity it holds, and the forward converts such a container at
+load: `npu/q4nx_device.cpp` repacks every fp32 tensor through `q4nx::as_q4_1()` into the Q4NX
+cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader that copy, so the
+device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
+the bf16 rounding reappears for the device, never in the container.
 
 **Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
 embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors
@@ -671,10 +673,10 @@ Two facts about what the container holds, both reported, not hidden:
   2.4e-4 absolute on the weights), because `-zp*s` is an arbitrary f32 and bf16 rounds it. That
   floor is gone for imported containers -- the same measurement is now bit-equal, and
   `npu-pack import` prints "fp32 scale/zero exact for 100.00 % of 32-column groups (container
-  layout q4nx-2)". The device still streams bf16 q4_1, so a container repacked for the NPU takes
-  that rounding there (`q4nx::as_q4_1()`), and `npu/forward`'s loader refuses a q4nx-2 container
-  by name rather than reading its 6,144-byte rows as 5,120-byte tiles; GGUF-derived containers are
-  unchanged and keep the bf16 form.
+  layout q4nx-2)". The device still streams bf16 q4_1, so the forward repacks a q4nx-2 container at
+  load (`npu/q4nx_device.cpp` -> `q4nx::as_q4_1()`, cached once and logged; `npu/forward/src/model.c`
+  still refuses an unconverted one as a safety net), and the fast lane's packer does the same in
+  memory (`npu/pack.cpp`); GGUF-derived containers are unchanged and keep the bf16 form.
 * **K is padded to the 256-column grid.** Qwen2.5-0.5B has hidden 896 = 3.5 tiles, so
   `lm_head` and q/k/v/o are stored as 4 column tiles with the last one zero-padded (codes 0,
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's

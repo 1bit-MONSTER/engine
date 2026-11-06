@@ -227,6 +227,12 @@ constexpr int64_t kPostEpsOff = 1115968;  // the block's second epsilon
 constexpr int64_t kTailNorm = 1856;       // the .fconst tail envelope: [2 eps][62 pad][1792 norm]
 constexpr int64_t kFconstHidden = 896;    // the geometry both fconsts describe
 
+// The container this importer writes: fp32 q4_1f parameters (npu/q4nx.h), named by the container's
+// layout "q4nx-2". The bf16 q4_1 form stays the GGUF-derived containers' -- that is where the bf16
+// choice came from -- and an absent layout means it, so every container already on disk loads.
+constexpr q4nx::Params kContainerParams = q4nx::Params::F32;
+constexpr int64_t kImportTileBytes = int64_t(q4nx::Chunk::Q4_1F);
+
 struct Fconst {
     std::string path;
     const uint8_t* map = nullptr;
@@ -540,34 +546,60 @@ Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t
 }
 
 // ── (codes, scale, zero) → q4_1 chunks (docs/npu.md, "Q4NX chunks") ──────────
-void tile_q4_1(const Q4& q, std::vector<uint8_t>& out, long long* zero_inexact) {
+// One tiler, two parameter forms. q4_1 stores bf16 scale/zero: that is the GGUF-derived containers'
+// form, and where the bf16 choice came from. q4_1f stores them as f32 (npu/q4nx.h), which is what
+// `1bit npu-pack import` writes: an OGA pack's zero is -zp*scale, an arbitrary f32 that bf16 rounds
+// (measured 2.7-3.3e-3 relative on ~57 % of groups, engine#1185). `param_inexact` counts the groups
+// whose stored parameter is not the source's -- the bf16 loss for q4_1, and 0 for q4_1f, where the
+// values are copied bit for bit.
+namespace {
+
+void tile_q4_impl(const Q4& q, std::vector<uint8_t>& out, bool f32, long long* param_inexact) {
     if (q.N % q4nx::kRows) throw std::runtime_error("q4_1 tiles need N % 32 == 0");
     // The grid is 32 x 256, so a tensor whose K is not a whole number of 256-column
     // tiles (Qwen2.5-0.5B: hidden 896 = 3.5 tiles) is stored with the last column tile
     // zero-padded: codes 0, scale 0, zero 0, i.e. w = 0 in the padding. The real K is
     // in the manifest and the caller's config; nothing reads the padding as a weight.
+    const size_t tile_bytes = f32 ? size_t(q4nx::Chunk::Q4_1F) : size_t(q4nx::Chunk::Q4_1);
+    const size_t code_off = f32 ? 2048 : 1024;
     const int KP = ((q.K + q4nx::kCols - 1) / q4nx::kCols) * q4nx::kCols;
     const int RT = q.N / q4nx::kRows, KT = KP / q4nx::kCols;
-    out.assign(size_t(RT) * KT * kTileBytes, 0);
+    out.assign(size_t(RT) * KT * tile_bytes, 0);
     long long inexact = 0;
     for (int rt = 0; rt < RT; ++rt) {
         for (int kt = 0; kt < KT; ++kt) {
-            uint8_t* tile = out.data() + (size_t(rt) * KT + kt) * kTileBytes;
+            uint8_t* tile = out.data() + (size_t(rt) * KT + kt) * tile_bytes;
+            auto* sc32 = reinterpret_cast<float*>(tile);
+            auto* zr32 = reinterpret_cast<float*>(tile + 1024);
             auto* sc16 = reinterpret_cast<uint16_t*>(tile);
             auto* zr16 = reinterpret_cast<uint16_t*>(tile + 512);
             for (int r = 0; r < q4nx::kRows; ++r) {
                 const int row = rt * q4nx::kRows + r;
                 for (int g = 0; g < 8; ++g) {
-                    const int group = (kt * 8 + g) * 32;
-                    if (group >= q.K) {  // zero padding
-                        sc16[g * 32 + r] = 0;
-                        zr16[g * 32 + r] = 0;
+                    const size_t i = size_t(g * 32 + r);
+                    if ((kt * 8 + g) * 32 >= q.K) {  // zero padding
+                        if (f32) {
+                            sc32[i] = 0.0f;
+                            zr32[i] = 0.0f;
+                        } else {
+                            sc16[i] = 0;
+                            zr16[i] = 0;
+                        }
                         continue;
                     }
                     const size_t idx = size_t(row) * (q.K / 32) + size_t(kt) * 8 + g;
-                    sc16[g * 32 + r] = f32_to_bf16(q.scale[idx]);
-                    zr16[g * 32 + r] = f32_to_bf16(q.zero[idx]);
-                    if (zero_inexact && bf16_to_f32(zr16[g * 32 + r]) != q.zero[idx]) ++inexact;
+                    if (!f32) {
+                        sc16[i] = f32_to_bf16(q.scale[idx]);
+                        zr16[i] = f32_to_bf16(q.zero[idx]);
+                        if (param_inexact && bf16_to_f32(zr16[i]) != q.zero[idx]) ++inexact;
+                    } else {
+                        sc32[i] = q.scale[idx];
+                        zr32[i] = q.zero[idx];
+                        // read the written bytes back: a q4_1f parameter is the source float, bit for bit
+                        if (param_inexact && (std::memcmp(&sc32[i], &q.scale[idx], 4) != 0 ||
+                                              std::memcmp(&zr32[i], &q.zero[idx], 4) != 0))
+                            ++inexact;
+                    }
                 }
             }
             // codes: region h*8+g, byte 8*j + (r%16)/2, even row in the low nibble
@@ -577,18 +609,30 @@ void tile_q4_1(const Q4& q, std::vector<uint8_t>& out, long long* zero_inexact) 
                         const int k = kt * q4nx::kCols + g * 32 + j;
                         for (int r2 = 0; r2 < 8; ++r2) {
                             const int r_even = rt * q4nx::kRows + h * 16 + r2 * 2;
+                            uint8_t& byte = tile[code_off + size_t(h) * 2048 + size_t(g) * 256 +
+                                                size_t(j) * 8 + size_t(r2)];
                             if (k >= q.K) {  // zero padding column
-                                tile[1024 + h * 2048 + g * 256 + j * 8 + r2] = 0;
+                                byte = 0;
                                 continue;
                             }
                             const uint8_t even = q.codes[size_t(r_even) * q.K + k] & 0x0F;
                             const uint8_t odd = q.codes[size_t(r_even + 1) * q.K + k] & 0x0F;
-                            tile[1024 + h * 2048 + g * 256 + j * 8 + r2] = uint8_t(even | (odd << 4));
+                            byte = uint8_t(even | (odd << 4));
                         }
                     }
         }
     }
-    if (zero_inexact) *zero_inexact = inexact;
+    if (param_inexact) *param_inexact = inexact;
+}
+
+}  // namespace
+
+void tile_q4_1(const Q4& q, std::vector<uint8_t>& out, long long* zero_inexact) {
+    tile_q4_impl(q, out, false, zero_inexact);
+}
+
+void tile_q4_1_f32(const Q4& q, std::vector<uint8_t>& out, long long* param_inexact) {
+    tile_q4_impl(q, out, true, param_inexact);
 }
 
 // ── the .fconst attention payload: 64-row tiles of q/k/v/o ───────────────────
@@ -833,7 +877,11 @@ std::vector<std::string> Plan::refused() const {
 std::string Plan::manifest() const {
     json j;
     j["format"] = "q4nx";
-    j["layout"] = "q4nx-1";  // container layout version (npu/q4nx.h chunk kinds)
+    // Container layout version (npu/q4nx.h): q4nx-2 is the fp32 q4_1f parameter form this importer
+    // writes; absent or q4nx-1 (every container written before engine#1185, and every GGUF-derived
+    // one) is the bf16 q4_1 form. The string and the chunk bytes come from one constant each.
+    j["layout"] = q4nx::layout_of(kContainerParams);
+    j["parameters"] = "fp32 scale/zero per 32-column group, bit-equal to the pack's";
     j["source"] = {{"kind", "oga-npu-pack"}, {"pack", pack}, {"importer", "1bit npu-pack import"}};
     j["dims"] = {{"hidden_size", dims.hidden},
                  {"intermediate_size", dims.intermediate},
@@ -1184,6 +1232,19 @@ TextArtifacts scan_text_artifacts(const std::string& pack_dir) {
     return t;
 }
 
+// Why a layout name cannot be declared by `--weight-layout`, or "" when it can.
+std::string weight_layout_refusal(const std::string& want) {
+    if (want.empty() || want == "rm" || want == "b8") return "";
+    if (want == "t2s")
+        return "t2s also needs q4nx_weight_layout_version (5 or 6) and a directory of per-layer "
+               "t2s images; import cannot invent either";
+    if (want == "pb16i")
+        return "pb16i also needs version 4 and a directory of per-layer pb16i images; import cannot "
+               "invent either";
+    return "unknown weight layout \"" + want + "\" (the containers the forward reads declare "
+           "\"b8\" or nothing at all, which is the row-major default)";
+}
+
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
     const Plan p = plan(pack_dir);
     Report r;
@@ -1291,9 +1352,9 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         const Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
 
         std::vector<uint8_t> tiled;
-        long long zinexact = 0;
-        tile_q4_1(q, tiled, &zinexact);
-        r.zero_exact_pct = 100.0 * double(q.scale.size() - zinexact) / double(q.scale.size());
+        long long pinexact = 0;
+        tile_q4_1_f32(q, tiled, &pinexact);
+        r.zero_exact_pct = 100.0 * double(q.scale.size() - pinexact) / double(q.scale.size());
         r.codes_total = q.codes.size();
 
         // self-check 1: tie_word_embeddings makes the pack's own fp16 embedding an
@@ -1330,18 +1391,21 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         double scale_sum = 0;
         const int KT = (q.K + q4nx::kCols - 1) / q4nx::kCols;  // the padded grid
         std::vector<float> w32(q4nx::kRows * q4nx::kCols);
-        for (int i = 0; i < int(tiled.size() / kTileBytes); i += 97) {
+        for (int i = 0; i < int(tiled.size() / kImportTileBytes); i += 97) {
             const int rt = i / KT, kt = i % KT;
-            q4nx::dequant_tile(q4nx::Chunk::Q4_1, tiled.data() + size_t(i) * kTileBytes, w32.data(),
-                               q4nx::kCols);
+            q4nx::dequant_tile(q4nx::chunk_of(kContainerParams), tiled.data() + size_t(i) * kImportTileBytes,
+                               w32.data(), q4nx::kCols);
             for (int rr = 0; rr < q4nx::kRows; ++rr) {
                 const int row = rt * q4nx::kRows + rr;
                 for (int cc = 0; cc < q4nx::kCols; ++cc) {
                     const int k = kt * q4nx::kCols + cc;
                     if (k >= q.K) continue;  // padding column: not a weight
                     const size_t g = size_t(row) * (q.K / 32) + size_t(k) / 32;
-                    const double ref = double(q.codes[size_t(row) * q.K + k]) * q.scale[g] + q.zero[g];
-                    const double err = std::fabs(w32[size_t(rr) * q4nx::kCols + cc] - ref);
+                    // in f32, exactly as dequant_tile computes it: the stored parameters are the
+                    // source's floats, so the reconstruction must agree to the last bit
+                    const float ref =
+                        float(q.codes[size_t(row) * q.K + k]) * q.scale[g] + q.zero[g];
+                    const double err = std::fabs(double(w32[size_t(rr) * q4nx::kCols + cc]) - double(ref));
                     r.q4nx_max_abs = std::max(r.q4nx_max_abs, err);
                     r.q4nx_rel += err;
                     scale_sum += std::fabs(ref);
@@ -1351,9 +1415,9 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         r.q4nx_rel = scale_sum > 0 ? r.q4nx_rel / scale_sum : 0;
 
         // the count has to be taken before tiled is moved (argument order is unspecified)
-        const int64_t head_tiles = int64_t(tiled.size() / kTileBytes);
+        const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
         r.tiles += head_tiles;
-        w.add("lm_head.weight", "I8", {head_tiles, int64_t(kTileBytes)}, std::move(tiled));
+        w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
         ++r.tensors;
         break;
     }
@@ -1500,13 +1564,13 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         }
                         Q4 q = q_from_tiles(tiles);
                         std::vector<uint8_t> tiled;
-                        long long zinexact = 0;
-                        tile_q4_1(q, tiled, &zinexact);
-                        zero_inexact_all += zinexact;
+                        long long pinexact = 0;
+                        tile_q4_1_f32(q, tiled, &pinexact);
+                        zero_inexact_all += pinexact;
                         zero_groups_all += (long long)q.scale.size();
-                        const int64_t nt_tiles = int64_t(tiled.size() / kTileBytes);
+                        const int64_t nt_tiles = int64_t(tiled.size() / kImportTileBytes);
                         r.tiles += nt_tiles;
-                        w.add(name + ".weight", "I8", {nt_tiles, int64_t(kTileBytes)}, std::move(tiled));
+                        w.add(name + ".weight", "I8", {nt_tiles, kImportTileBytes}, std::move(tiled));
                         ++r.tensors;
                         ++r.attn_projections;
                         if (std::string(sl.proj) != "o_proj" && any_bias) {
@@ -1598,13 +1662,13 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             }
                             Q4 q = q_from_tiles(tiles);
                             std::vector<uint8_t> tiled;
-                            long long zinexact = 0;
-                            tile_q4_1(q, tiled, &zinexact);
-                            mlp_zero_inexact += zinexact;
+                            long long pinexact = 0;
+                            tile_q4_1_f32(q, tiled, &pinexact);
+                            mlp_zero_inexact += pinexact;
                             mlp_zero_groups += (long long)q.scale.size();
-                            const int64_t nt = int64_t(tiled.size() / kTileBytes);
+                            const int64_t nt = int64_t(tiled.size() / kImportTileBytes);
                             r.tiles += nt;
-                            w.add(name + ".weight", "I8", {nt, int64_t(kTileBytes)}, std::move(tiled));
+                            w.add(name + ".weight", "I8", {nt, kImportTileBytes}, std::move(tiled));
                             ++r.tensors;
                             ++r.mlp_projections;
                         };
@@ -1662,11 +1726,16 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries
         c["q4nx_source"] = {{"converter", "1bit npu-pack import"},
                             {"pack", p.pack},
-                            {"layout", "q4nx-1"},
+                            {"layout", q4nx::layout_of(kContainerParams)},
                             {"incomplete", r.refused.size()},
                             // so a container read months later states whether it ever had text
                             {"text_artifacts", ta.present.empty() ? "none in the pack"
                                                                   : "copied from the pack"}};
+        // The device weight layout, when the caller declared one (`--weight-layout b8`): the container
+        // then needs the `_b8` / `_b8_m16` kernel family and packB writes the blocked image host-side.
+        // The key stays absent for the default layout, exactly as every earlier container has it.
+        if (!opt.weight_layout.empty() && opt.weight_layout != "rm")
+            c["q4nx_weight_layout"] = opt.weight_layout;
         std::ofstream out(out_dir + "/config.json");
         out << c.dump(2) << "\n";
     }
@@ -1683,12 +1752,16 @@ int run(int argc, char** argv) {
     const std::string usage =
         "usage: 1bit npu-pack info   <pack dir>\n"
         "       1bit npu-pack import <pack dir> -o <out dir> [--allow-incomplete]\n"
+        "                           [--weight-layout b8]\n"
         "  <pack dir>  a Ryzen AI OGA NPU model pack (*_rai_*_npu_*: model.onnx,\n"
         "              model.onnx.data, dd_metastate_*.fconst, config.json, tokenizer)\n"
         "  info        print what the pack states as JSON; writes nothing\n"
         "  import      write <out dir>/model.q4nx + config.json (+ the pack's text files, if any)\n"
         "  --allow-incomplete  write what is representable and list the rest in the\n"
-        "              container's manifest instead of refusing\n";
+        "              container's manifest instead of refusing\n"
+        "  --weight-layout b8  declare the device weight layout the runtime will use, so the\n"
+        "              container needs the _b8 / _b8_m16 kernel family (leaving the key out is\n"
+        "              the row-major default, which is what every earlier container has)\n";
     if (argc < 1) {
         std::fprintf(stderr, "%s", usage.c_str());
         return 2;
@@ -1698,7 +1771,7 @@ int run(int argc, char** argv) {
         std::printf("%s", usage.c_str());
         return 0;
     }
-    std::string dir, out;
+    std::string dir, out, layout;
     bool allow = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1706,6 +1779,12 @@ int run(int argc, char** argv) {
             if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
             out = argv[++i];
         } else if (a == "--allow-incomplete") allow = true;
+        else if (a == "--weight-layout") {
+            if (i + 1 >= argc) throw std::runtime_error("--weight-layout needs a value");
+            layout = argv[++i];
+            const std::string why = weight_layout_refusal(layout);
+            if (!why.empty()) throw std::runtime_error("--weight-layout " + layout + ": " + why);
+        }
         else if (a == "--help" || a == "-h") {
             std::printf("%s", usage.c_str());
             return 0;
@@ -1724,7 +1803,7 @@ int run(int argc, char** argv) {
     if (cmd != "import") throw std::runtime_error("unknown subcommand " + cmd);
     if (out.empty()) throw std::runtime_error("import needs -o <out dir>");
 
-    const Report r = import_pack(dir, out, Options{allow});
+    const Report r = import_pack(dir, out, Options{allow, layout});
     if (!r.refused.empty() && !allow) {
         std::fprintf(stderr,
                      "1bit npu-pack: refusing to import %s: %zu of the pack's tensors cannot be "
@@ -1746,16 +1825,21 @@ int run(int argc, char** argv) {
     }
     std::printf("  container:  read back through q4nx::dequant_tile  rel_err %.3e  max |diff| %.3e\n",
                 r.q4nx_rel, r.q4nx_max_abs);
-    std::printf("  parameters: bf16 scale/zero exact for %.2f%% of 32-column groups (format limit)\n",
-                r.zero_exact_pct);
+    if (!layout.empty() && layout != "rm")
+        std::printf("  layout:     declares q4nx_weight_layout \"%s\" -- this container needs the "
+                    "_%s kernel family, and packB writes that image host-side\n",
+                    layout.c_str(), layout.c_str());
+    std::printf("  parameters: fp32 scale/zero exact for %.2f%% of 32-column groups "
+                "(container layout %s, the pack's own values; no bf16 round trip)\n",
+                r.zero_exact_pct, q4nx::layout_of(kContainerParams));
     if (r.attn_tiles_total)
         std::printf("  attention:  %lld/%lld .fconst tiles survive decode->encode byte for byte; "
-                    "%d projections + %d bias tensors imported, bf16 zero exact for %.2f%% of groups\n",
+                    "%d projections + %d bias tensors imported, fp32 scale/zero exact for %.2f%% of groups\n",
                     r.attn_tiles_ok, r.attn_tiles_total, r.attn_projections, r.attn_bias_tensors,
                     100.0 - r.attn_zero_inexact_pct);
     if (r.mlp_groups_total)
         std::printf("  MLP:        %lld/%lld .fconst groups survive decode->encode byte for byte; "
-                    "%d projections imported, bf16 zero exact for %.2f%% of groups\n",
+                    "%d projections imported, fp32 scale/zero exact for %.2f%% of groups\n",
                     r.mlp_groups_ok, r.mlp_groups_total, r.mlp_projections,
                     100.0 - r.mlp_zero_inexact_pct);
     if (r.stride)

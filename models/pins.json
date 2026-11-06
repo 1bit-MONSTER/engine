@@ -885,8 +885,8 @@
    }
   },
   "1bit-MONSTER/ZR1-1.5B-GGUF": {
-   "commit": "3252419078406e84b475d8976868b64812e9adb6",
-   "pinned": "2026-11-05",
+   "commit": "395bc83cc2179c5567b5fa42430d6a67469fff06",
+   "pinned": "2026-11-06",
    "used_for": [
     "published: conversion ({'general.name': 'ZR1 1.5B@6108a26d0cd7', 'general.basename': 'ZR1', 'general.architecture': 'qwen2', 'general.size_label': '1.8B', 'general.finetune': '1.5B@6108a26d0cd7', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
     "published: conversion ({'general.name': 'ZR1 1.5B@6108a26d0cd7', 'general.basename': 'ZR1', 'general.architecture': 'qwen2', 'general.size_label': '1.8B', 'general.finetune': '1.5B@6108a26d0cd7', 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"

@@ -1230,5 +1230,6 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
 - **First-request cost.** Lemonade's telemetry for the first short HRX chat shows
   18 tok/s against llama-bench's 303. It is probably first-use kernel
   compilation, not steady state, but this is not yet separated.
-- **CI.** CI has no AMD GPU and no TheRock, so `ONEBIT_HRX` is exercised on Strix
-  Halo only.
+- **CI.** The hosted CI has no AMD GPU and no TheRock. `ONEBIT_HRX=ON` is built at PR time by
+  `hrx-build.yml` on the Strix Halo runner (docs/hw-gate.md, "The HRX build check"), and run on
+  the hardware by the gate.

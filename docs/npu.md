@@ -1683,6 +1683,17 @@ Two settings are worth knowing regardless, both measured in one window:
   across arms that differ 2× in chain and 4× in head calls. It also leaves depths 3-4 with *no* offers, so any
   per-depth measurement is at `tau = 0`.
 
+**`tau` is part of the window, and the tooling now says so.** Because the gate stops the chain, a `tau = 0.6` ticket
+offers one or two depths where a `tau = 0` one offers four, so the two must never be pooled into one table — yet until
+now `mtp_acceptance --live` printed its window (`k`, tokens, hidden) nowhere: `--offline` has always stated it, the
+live path only echoed it in the harness' argv. `--live` now prints the same
+`== N prompts x M tokens, k=K tau=T, hidden=H` line at **init** (so a ticket killed at its hold still states its
+window), and `tools/mtp_depth_pool.py` reads it and reports the chain gate in the window header, names a pool that
+mixes two gates (`MIXED chain gate (tau)`), and says `tau unstated` for a log that predates the line rather than
+assuming `tau = 0`. `Options::tau` defaults to 0.6, and the tau = 0.6 acceptance row is still **not measured** — the
+published rows above are all `tau = 0`; that row is the next ticket, and it is now impossible to publish it by
+pooling two regimes by accident.
+
 **Refuted, so nobody builds it again**: folding the per-iteration step into the next verify batch (one pass per
 iteration instead of two) collapses the chain from **2.82 to 1.07** tokens/pass and depth-1 acceptance from **82 %
 to 6.9 %** — the head needs the hidden of the token it drafts past, which a one-pass loop cannot produce. Lagging

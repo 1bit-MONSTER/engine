@@ -61,6 +61,8 @@ tools/npu_plan.py <model dir> [--kernels DIR] [--out PATH] [--check] [--print]
 | `decode.sealed_elf` | pb16i only: the sealed ELF the decode roles run |
 | `kernels.tag` | artifact-name suffix: `""`, `_b8`, `_pb16i`, `_t2s` or `_t2s2`; must agree with the container layout and `container.pb16i` |
 | `attention.mode` | `causal` (default) or `noncausal_full_attention`. The latter is a prompt-encoding mode: every full-attention layer sees the whole prompt, and the forward refuses to generate with it |
+| `kv.key`, `kv.value` | what the KV cache is stored as, per side: `f16` (the meaning of an absent `kv` block, and of every plan written before P7) or `int8`. `int8` is int8 with **one fp32 scale per (head, token)**, taken *after* a per-head Hadamard rotation — the rotation is what makes one scale affordable, because it collapses the per-channel magnitude spread the scale would otherwise have to cover. `key` is the side that costs no un-rotation (`(QH)(KH)ᵀ = QKᵀ`), so storing K rotated and rotating Q needs no inverse transform; `value` is a separate choice because an int8 V needs one on the output, which is why K-only is the cheap variant to prove the path with. This is a description: a target without the capability must refuse `int8` **by name**, never serve f16 in its place |
+| `kv.hadamard.block`, `kv.hadamard.signs` | the rotation itself: `block` is `0` (no rotation) or a power of two in `[2, 65536]` — the head width the rotation runs over — and `signs` is an optional **bare file name** (no directory part, under the model dir) for per-channel signs. A `signs` file with `block: 0` is refused rather than ignored |
 | `moe.batched_expert_gu` | `{enabled, K, N}`; when enabled, K and N must be named |
 | `layers[]` | one entry per layer, in order: `index`, `role` (`attn`/`gdn`/`moe`/`mla`), and projections `qkv {K, N, fused}`, `attn_gate {K, N}`, `gate_up {K, N}`, `down {K, N}`. The count must equal `model.layers`. The projection shapes are recorded for P4’s `NpuModel`; the current forward reads only the count (for its [plan] log line) and derives designs from the container |
 
@@ -81,6 +83,9 @@ The loader never substitutes a default for something it cannot honour; every ref
   `_t2s`/`_t2s2` require `t2s`);
 - `decode.dirs` with an empty array, a `root` other than `model`/`kernels`, or a path that is empty,
   absolute, contains `..` or a backslash;
+- `kv.key`/`kv.value` outside `f16`/`int8`; a `kv.hadamard.block` that is not `0` or a power of two in
+  `[2, 65536]`; a `kv.hadamard.signs` that is a path rather than a bare name, or that names a file while
+  `kv.hadamard.block` is `0`;
 - `moe.batched_expert_gu.enabled` without positive K and N;
 - `layers` missing/out of order, a role outside the four, a projection naming only one of K and N, or a
   layer count that disagrees with `model.layers`;
@@ -89,6 +94,30 @@ The loader never substitutes a default for something it cannot honour; every ref
 
 The forward adds one more check on load: `kernels.tag` must equal the tag the container itself implies
 (`q4nx_forward.cpp:510-539`), so a plan and a container cannot disagree about the artifact family.
+
+## What the int8 KV contract is worth, measured
+
+The two claims `kv` rests on are arithmetic, not device behaviour, so they are gated in CI with no model and
+no device (`ctest -R npu_kv_int8`, `tests/npu_kv_int8_test.cpp`). Attention-weight **KLD against the f16
+cache**, head width 256, one scale per (head, token), 512 keys, 8 draws per cell:
+
+| KV vectors | f16 + rotation | int8 K, unrotated | int8 K + rotation | rotation's worth |
+|---|---:|---:|---:|---:|
+| uniform (control) | 3.9e-15 | 2.5e-05 | 2.4e-05 | **1.0x** — nothing to concentrate, nothing to claim |
+| 8x outlier channels | 8.6e-15 | 4.5e-04 | 4.7e-05 | **9.6x** |
+| 30x outlier channels | 4.5e-14 | **8.2e-03** | **1.5e-04** | **54.5x** |
+
+Two readings matter. The rotation is **free**: rotating both sides and taking the dot product preserves the
+score to 1.6e-09 relative, which is *smaller* than one f32 dot product's own rounding error (0.01x of it), so
+a rotated f16 cache is indistinguishable from today's. And the rotation is what **keeps int8 inside the
+plan's gate**: at 30x outliers an unrotated int8 K cache lands at 8.2e-03, an order of magnitude outside
+1e-03, while the rotated one stays at 1.5e-04. At 8x outliers the unrotated cache is already inside the gate
+— so on a model whose channels are mild, the rotation buys accuracy this gate does not ask for, and on one
+whose channels are not, it is the difference between passing and failing.
+
+What this does **not** establish is the gate itself: the vectors are synthetic and generated to the outlier
+structure this page describes, and #806's KLD is taken on real KV from a real model on the device. The test
+bounds the mechanism; the model run decides.
 
 ## How the forward consumes it
 
@@ -141,4 +170,10 @@ layers[0]     {"index": 0, "role": "gdn", "qkv": {"K": 5120, "N": 10240, "fused"
   until that interface lands.
 - **P5** (#804): Hexagon target (t2 gemv on HVX/HMX, QEMU v73 oracle) has no engine rows yet.
 - **P6** (#805): the shared drafter protocol is on main; tau=0.6 and Hexagon acceptance rows are still missing.
-- **P7** (#806): int8 KV with per-head Hadamard and NPU prefill chunks; the plan has no `kv.dtype` field yet.
+- **P7** (#806): the `kv` contract above is in the plan and its arithmetic is gated in CI (`ctest -R npu_kv_int8`,
+  which needs no device: see below). Still open, in the order it can be taken: the cache **writer/reader** in the
+  forward (an int8 K store plus its scale sidecar, the prefix-cache snapshot's byte accounting with it), the **KLD
+  gate on real KV from a model on the device** — the CI test bounds the mechanism on synthetic vectors, not the
+  model — and **part B**, prefill in 1024/2048-token chunks with block-fp expansion, which waits on P3's on-core
+  expansion, P4's `NpuModel`, and the `M>16` decision (prefill *is* M≫16; nothing in P7b asks for M>16 in the
+  decode path).

@@ -14,15 +14,17 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# 1bit OS v2 — the appliance on a minimal Ubuntu base, updated with `apt`
+# `os/v2` — the appliance on a minimal Ubuntu base, updated with `apt` (in tree, not shipped)
 
-`os/mini` builds the BusyBox image that ships today: everything in RAM, a reflash to update. v2 keeps the
-same appliance — Lemonade Server by AMD, running on the 1bit engine, our kernel, Secure Boot through the
-enrolled MOK — on a **minimal Ubuntu 26.04 root filesystem with systemd**, where everything we ship is a
-`.deb` from our own signed repository and `apt update && apt upgrade` is the update path.
+`os/mini` builds the BusyBox image, which is the CI/VM target (not 1bit OS: everything in RAM, a reflash to
+update). **1bit OS is the Puppy appliance** (`os/v3/puppy/`, [../README.md](../README.md)). v2 is the design
+that keeps the same appliance — Lemonade Server by AMD, running on the 1bit engine, our kernel, Secure Boot
+through the enrolled MOK — on a **minimal Ubuntu 26.04 root filesystem with systemd**, where everything we
+ship is a `.deb` from our own signed repository and `apt update && apt upgrade` is the update path. It stays
+in the tree as the documented fallback, not as the shipped medium.
 
 The design and the reasons are in `~/briefs/TOSAPT-DESIGN.md`; this file is what is in the tree and how to
-reproduce it. `os/mini` keeps shipping until v2 passes the same checks on hardware.
+reproduce it.
 
 ## Build it
 
@@ -184,7 +186,7 @@ the `secureboot` row answers; enrolling the MOK is the machine's step, not a VM'
   construction in these runs (the VM has no NPU either). A release stage always carries them.
 - **The optional `1bit-openwebui` package is not exercised by the vmtest runs.** Installing it needs a
   container runtime from the Ubuntu archive and its first start pulls a multi-GB image, so the VM would
-  spend the run on a download and prove nothing about 1bit OS. What is checked instead is `mkdebs.sh`
+  spend the run on a download and prove nothing about the appliance. What is checked instead is `mkdebs.sh`
   building the `.deb` and the unit/console scripts being syntax-clean; a box check of the whole thing is
   in `vmtest-install-v2.sh`'s style but is not run here — see engine#594.
 - **The v2 rootfs in these runs came from the archive mirror**, not the pinned snapshot, because

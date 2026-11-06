@@ -625,6 +625,12 @@ if(Python3_Interpreter_FOUND)
     # must reproduce the pb16i image's own int4 code bytes, block for block. Synthetic weights only -- the
     # real-image leg is the same check on 14 GB of Bonsai-2 images and is run by hand.
     add_test(NAME q4nx_t2s COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2s_test.py)
+    # the acceptance gate for a t2 consumer (docs/npu.md, "Gating a t2 target"): the pinned
+    # accumulation order, bit for bit -- it accepts the oracle and refuses four near-misses
+    # (float64 accumulation, a reversed group order, a one-bit change, a short dump).  numpy only;
+    # the real-tensor leg needs --tensor/--dump and runs by hand.  engine #804.
+    add_test(NAME npu_t2_target_gate
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_t2_target_gate.py --quiet)
     # the safetensors -> Q4NX converter and the d3 readout head it packs (engine #653): every
     # fixture is synthesised, so this needs numpy and nothing else — no gguf-py, no model, no
     # device, no download.

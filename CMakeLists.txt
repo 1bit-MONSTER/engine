@@ -133,6 +133,46 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/hrx_archs.h
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/registry/architectures.json)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
 target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+
+# ── The chat-template renderer (engine #963, docs/npu-chat-template.md) ──────
+# The NPU chat route renders the container's own `chat_template` (app/npu_template.h) with the pinned
+# llama.cpp fork's Jinja engine (`third_party/llama.cpp/common/jinja`, upstream's, the one
+# `llama-server --jinja` uses) rather than with a second, weaker interpreter of the same language.
+#
+# The sources are the fork's, so they exist exactly when the submodule is checked out: the option
+# defaults to that, and a tree that never initialised the submodules still builds -- without the
+# renderer, which the load line and the route say out loud rather than rendering something else
+# (app/npu_template.h). Nothing is downloaded at build time.
+if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/common/jinja/lexer.cpp)
+    set(_onebit_jinja_default ON)
+else()
+    set(_onebit_jinja_default OFF)
+endif()
+option(ONEBIT_JINJA "Build the Jinja chat-template renderer from the llama.cpp submodule" ${_onebit_jinja_default})
+if(ONEBIT_JINJA)
+    if(NOT EXISTS ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/common/jinja/lexer.cpp)
+        message(FATAL_ERROR "ONEBIT_JINJA=ON but third_party/llama.cpp/common/jinja is missing: "
+                            "git submodule update --init third_party/llama.cpp")
+    endif()
+    set(_onebit_jinja_dir ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/common)
+    add_library(onebit_jinja STATIC
+        ${_onebit_jinja_dir}/jinja/lexer.cpp
+        ${_onebit_jinja_dir}/jinja/parser.cpp
+        ${_onebit_jinja_dir}/jinja/runtime.cpp
+        ${_onebit_jinja_dir}/jinja/value.cpp
+        ${_onebit_jinja_dir}/jinja/string.cpp
+        ${_onebit_jinja_dir}/jinja/caps.cpp
+        # jinja/value.cpp includes the fork's unicode.h, and these are its implementation
+        ${_onebit_jinja_dir}/unicode.cpp)
+    target_include_directories(onebit_jinja PUBLIC ${_onebit_jinja_dir})
+    target_link_libraries(onebit_jinja PUBLIC nlohmann_json::nlohmann_json)
+    target_compile_definitions(onebit_jinja PUBLIC ONEBIT_JINJA=1)
+    target_compile_definitions(onebit PRIVATE ONEBIT_JINJA=1)
+    target_link_libraries(onebit PRIVATE onebit_jinja)
+    message(STATUS "ONEBIT_JINJA=ON — the NPU chat route renders the container's own chat template")
+else()
+    message(STATUS "ONEBIT_JINJA=OFF — no chat-template renderer: the NPU chat route keeps ChatML (#963 option 1)")
+endif()
 if(ONEBIT_ORT)
     add_subdirectory(onnx)
     target_link_libraries(onebit PRIVATE onebit_ort_info onebit_ort_run)
@@ -685,6 +725,28 @@ add_test(NAME npu_chatml COMMAND npu_chatml_test ${CMAKE_SOURCE_DIR}/tests/data/
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_chatml_test)
+
+# The container's own chat template rendered (app/npu_template.h, engine #963 option 2): the golden rows are
+# Jinja2 3.1.6's own renders of the fixtures' templates, so the assertion is a comparison against an oracle
+# that is not this code. Device-free.  Without the renderer (ONEBIT_JINJA=OFF) the two fixture rows cannot
+# pass, so the test says so in its first line rather than skipping quietly.
+add_executable(npu_template_test tests/npu_template_test.cpp)
+# app/template_pin.h includes the pins compiled in from config/template-pins.json (the same read the
+# load line does), which CMake writes into the build's generated/ at configure time.
+target_include_directories(npu_template_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu
+                            ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(npu_template_test PRIVATE onebit_npu nlohmann_json::nlohmann_json)
+if(ONEBIT_JINJA)
+    target_link_libraries(npu_template_test PRIVATE onebit_jinja)
+    target_compile_definitions(npu_template_test PRIVATE ONEBIT_JINJA=1)
+    add_test(NAME npu_template
+             COMMAND npu_template_test ${CMAKE_SOURCE_DIR}/tests/data/templates/qwen3_flm.json
+                                       ${CMAKE_SOURCE_DIR}/tests/data/templates/zr1.json
+                                       --tokenizer ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_chatml.json)
+else()
+    add_test(NAME npu_template COMMAND npu_template_test --no-renderer)
+    set_tests_properties(npu_template PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 # `1bit unified`'s wait for the single NPU (app/npu_queue.h, engine#1024): bounded, and a queued request says so
 # instead of leaving a stream silent past the proxy's no-data timer. Device-free.

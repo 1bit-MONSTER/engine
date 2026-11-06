@@ -116,6 +116,15 @@ def main():
         assert ident["bin_dir"].endswith("hrx/llama/bin"), ident
         assert ident["sha256"] == hashlib.sha256(onebit.read_bytes()).hexdigest(), ident
 
+    # Same class, one level up: nothing named the *workload script* that computed the number, so an arm run
+    # from another checkout (or from an unmerged branch) produced a JSON indistinguishable from `main`'s.
+    # Measured: 2026-11-05 04:06 ran from the #1034-only `hl-boxcond` tree, where the artifact could not
+    # have carried `drafting` at all. The hash is checked against an independently computed one, so a field
+    # that reads the wrong file (or a prefix) fails here.
+    scripts = bench.scripts_identity()
+    assert scripts["path"].endswith("tools/hyperloom/custom/benchmark.py"), scripts
+    assert scripts["sha256"] == hashlib.sha256(BENCH.read_bytes()).hexdigest(), scripts
+
     # HL_LONGCTX and HL_CTX are independent variables and the 8192 default is smaller than every
     # long-context value in use, so a run that set only HL_LONGCTX asked for an 18.8k prompt on an
     # 8192-token server: rejected, or answered on a shifted context = a different measurement wearing

@@ -341,6 +341,23 @@ def build_identity(onebit, bin_dir):
     }
 
 
+def scripts_identity():
+    """Name the workload code that computed the number, inside the artifact itself.
+
+    ``build_identity`` names the engine binary and ``model_identity`` the weights, but nothing named the
+    adapter script that runs the arms -- and this workload is measured from several checkouts of it. Two
+    measured consequences: on 2026-11-05 04:06 an arm ran from the #1034-only ``hl-boxcond`` worktree
+    instead of ``hl-main``, so the result it would have written could not have carried ``drafting`` at
+    all; and on 2026-11-05 20:13 this lane's own arm ran from an unmerged branch to test a field it was
+    adding. In both cases the JSON would have been indistinguishable from a run of ``main``.
+
+    The workload is a single file, so ``sha256`` is the whole code identity. ``sha256_head`` reads up to
+    64 MiB, and this file is ~60 KB, so it is the file's hash and not a prefix.
+    """
+    path = pathlib.Path(__file__).resolve()
+    return {"path": str(path), "sha256": sha256_head(path)}
+
+
 def model_identity(model):
     """Name the model file, with the fingerprint the quality gate itself compares against.
 
@@ -798,6 +815,7 @@ def main():
         "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
                           "model": model_ident,
                           "build": build_identity(onebit, bin_dir),
+                          "scripts": scripts_identity(),
                           "device_stack": device_stack(),
                           "drafting": drafting_identity(),
                           "box": box_summary(conditions),

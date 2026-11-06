@@ -1,0 +1,35 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/udev/rules.d/90-1bit-npu-power.rules - keep the XDNA2 NPU out of runtime autosuspend.
+#
+# Cycle 30, owner decision 2026-11-05 23:4x: this is the c30 fix for the take's `code 614` (the first dispatch
+# into a context that was suspended and resumed hangs, `state 8, run 0 of 28`, then an `aie2_set_cmd_timeout`
+# TDR). The 5 s autosuspend timer is what puts the array into that state, so the stick simply never suspends it:
+# with `power/control=on` the resume path is never entered and the defect cannot be reached, without waiting for
+# the driver-side fix (pi-kernel-74 owns that, off this cycle's critical path).
+#
+# The rule is the one this dev box has run since 2026-10-12 (owner, same reason: keep a persistent context, and it is
+# why Ubuntu on that box never showed the 614), so it is copied measured rather than invented. The box's own comment
+# line is kept above the rule, verbatim:
+#   1bit (owner 2026-10-12): keep the XDNA2 NPU (AMD 1022:17f0) out of runtime autosuspend so the lane can keep a persistent context. The `TEST` guard means the rule is inert on a kernel whose device has no
+# power/control attribute, and the vendor/device ids mean it never touches another device: PCI 1022:17f0 is the
+# Strix/Krackan/Strix Halo NPU, class 1180 ("Signal processing controller"), measured here at 0000:c6:00.1 with
+# driver amdxdna.
+#
+# `ACTION=="add|bind"`: on a normal boot the driver binds after udev is up, so `bind` fires; if the module were
+# loaded before udev (initrd, or a coldplug that emits only `add`), `add` fires instead. /etc/init.d/04onboard-npu-keepawake
+# is the fallback for the case where neither does, and it says so on the console when it has to act.
+ACTION=="add|bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x1022", ATTR{device}=="0x17f0", TEST=="power/control", ATTR{power/control}="on"

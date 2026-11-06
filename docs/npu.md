@@ -685,7 +685,11 @@ is trusted as published. Its chunk layout can be checked first, without
 dequantizing anything: `tools/check_q4nx_dir.py <dir>` reads the container header only, names each
 quantized tensor's chunk kind, and refuses an unknown chunk size or a tensor shorter than its layout
 needs. It cannot tell the two Q8 layouts apart ("Q4NX chunks", above), because the container does
-not record which one it holds.
+not record which one it holds. It also derives every weight's expected tile grid from `config.json`
+and names a weight whose converter padded that grid (engine#1097) — a gated attention layer's
+`q_proj` is counted at `2 * num_attention_heads * head_dim` rows, because with `attn_output_gate` it
+emits q **and** the output gate (engine#796: reading it as one head-width made the real d3 pack, and
+every 27B `qwen3_5` pack on this box, look like a padded grid and fail `--strict`).
 
 **The tile order is measured, not declared.** Two converters can write `q4_1` tiles in the two
 different orders this engine and FastFlowLM use, and a container in the wrong order repacks cleanly

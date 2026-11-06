@@ -50,20 +50,25 @@ does the binding at run time.**
 Census of `qwen3-0.6b.onnx` (from `onnx/export_qwen3.py --check`, opset 21, ai.onnx domain only,
 float32, seq dynamic):
 
-| MatMul (K, N) | count | projection | kernel today |
+| MatMul (K, N) | count | projection | design today |
 |---|---|---|---|
 | 1024 × 151936 | 1 | lm_head | none — CPU EP |
-| 1024 × 3072 | 56 | gate, up | none — CPU EP |
-| 3072 × 1024 | 28 | down | none — CPU EP |
-| 1024 × 2048 | 28 | q | `full_i8_QKV_K1024_N2048_m16.elf` |
-| 2048 × 1024 | 28 | o | none — CPU EP |
-| 1024 × 1024 | 56 | k, v | `full_i8_O_K1024_N1024_m16.elf` |
+| 1024 × 3072 | 56 | gate, up | `GU_K1024_N3072` (M=32) |
+| 3072 × 1024 | 28 | down | `D_K3072_N1024` (M=32) |
+| 1024 × 2048 | 28 | q | `Q_K1024_N2048` (M=32), `full_i8_QKV_K1024_N2048_m16.elf` |
+| 2048 × 1024 | 28 | o | `O_K2048_N1024` (M=32) |
+| 1024 × 1024 | 56 | k, v | `KV_K1024_N1024` (M=32), `full_i8_O_K1024_N1024_m16.elf` |
 
 254 MatMul nodes, 6 distinct shapes, zero custom domains. The binding is therefore a table lookup on
 `(K, N)`, which is exactly what `ONEBIT_EP_NPU_ELFS="16x1024x2048=<elf>,16x1024x1024=<elf>"` already
 expresses; a shape with no entry returns `ORT_NOT_IMPLEMENTED`, the EP falls back to the CPU for it,
 and the session still runs. That is why deliverable 4 can be honest about owning 84 of 254 matmuls
-rather than claiming the model.
+rather than claiming the model — 84 is what the two `m16` designs the iso-build tree shipped reach
+(q, and k/v). **The design column is not a feature column, and it has grown since that census:** with a
+design for every projection (the five M=32 designs, beside the other xclbins and never in this
+repository) the float path claims **196 of 254** — all seven projections — and every one of those
+shapes ran on the array, measured on 2026-11-05 rather than inferred from the table; the numbers and
+their window are in [onnx.md](onnx.md#status).
 
 ## The three layers of the pack
 

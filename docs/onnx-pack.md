@@ -203,7 +203,9 @@ intermediate float tensor then never exists.
   says `x_scale` and `x_zero_point` **must have the same shape**, so a 1-D zero point along K only comes
   beside a 1-D scale along K, which is the un-foldable term above (it weights the products inside the
   sum — SmoothQuant's job at export time). Built the one way that could carry the term alone, a K-long
-  zero point beside a per-tensor scale, the CPU EP refuses the session before any EP sees it:
+  zero point beside a per-tensor scale. `onnx.checker` accepts that graph, and the CPU EP's session
+  builds; the node is refused when the CPU EP first prepares it to run (`onnxruntime` 1.29.0, on the
+  first `run()`, not at session creation):
   `quantize_linear.cc:79 … x_zero_point must be null or a scalar or 1D tensor or size 1`. So the item
   closes as "cannot occur" rather than "not done": what this epilogue does not fold along the
   activation's K is what the arithmetic rules out.

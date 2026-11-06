@@ -283,6 +283,11 @@ prefill**, and on the bad build it was worth ~5 % - against a 3.3x regression th
 the number engine#754 is blocked on, and it is why this route offers no split: not because the idea is wrong, but
 because at a 30:1 row-cost asymmetry between the two engines there is nothing left to win.
 
+Across the models the scoreboard compares, the same arithmetic from the recorded per-kernel shares caps the split even
+lower, because attention is a larger share than on the 4B: using each model's largest measured prefill kernel as the split-able
+share (qwen38-27b 39.8 %, coder30b-a3b 46.2 %, qwen36-35b-a3b 30.8 %, zaya1-8b 43.8 %, Qwen3-0.6B at 16k 26.2 %), the
+end-to-end ceiling is **1.008x-1.015x** - i.e. **at most 1.5 % of prefill, everywhere**, before the pipeline cost.
+
 Two honest caveats, both of which have moved the number before: the iGPU side is a *measurement*, so re-run it
 before quoting a ceiling (`docs/hetero-prefill.md` has done that three times); and the formula assumes the iGPU's
 time is linear in its row count, which holds well enough at M=16384 (it predicts 1.103x where the split measured

@@ -77,6 +77,14 @@ IDENTITY = re.compile(r"forward ready:\s+vocab (\d+),\s+max_batch_rows (\d+),\s+
 RUNLEVEL = re.compile(r"depth (\d+):\s+live\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+"
                       r"offline\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+delta")
 PROMPT = re.compile(r"(?:per-depth p|prompt )(\d+)\b")
+# The tool's own statement of what a window was run at.  `--offline` has always printed it; the live path prints the
+# same line since engine#805's tau=0.6 row, because tau is part of the WINDOW and not a detail of one ticket: at tau>0
+# the chain gate stops the chain early (npu/mtp/mtp_head.cpp:373), so a tau=0.6 ticket offers one or two depths while a
+# tau=0 one offers four, and pooling them builds a table whose depths exist on the tau=0 prompts only -- the same error
+# the k and token-budget checks exist for, one setting over.  A log from before that line says so rather than being
+# assumed at tau=0.
+SETTINGS = re.compile(r"== (\d+) prompts x (\d+) tokens, k=(\d+) tau=([\d.]+), hidden=(\S+)")
+
 # The live per-prompt header carries the generation budget and the run's own accepted/offered draft counts, and it
 # is the only shape that carries them correctly:
 #     prompt 0: TEXT IDENTICAL, 64 tokens, accepted 44/80, passes/token 0.625, stream 72 rows, 0 mismatch
@@ -100,6 +108,7 @@ def parse_ticket(path):
     a cell scored twice with different counts, or per-prompt rows that do not add up to the ticket's own
     run-level row (a short read)."""
     cells, runlevel, prompt, not_scored, budget, offered = {}, {}, None, set(), {}, {}
+    tau = None
     old_shape, summary, width, ident = 0, False, {}, None
     for ln in open(path, errors="replace").read().splitlines():
         if "== ticket exited" in ln:  # trap 1: everything after this is the harness echoing the summary
@@ -110,6 +119,10 @@ def parse_ticket(path):
         m = IDENTITY.search(ln)
         if m:
             ident = (int(m.group(1)), int(m.group(2)), m.group(3))
+            continue
+        m = SETTINGS.search(ln)
+        if m:
+            tau = float(m.group(4))   # the run's own chain gate; None when the log predates the line
             continue
         m = PROMPT.search(ln)
         if m and "depth " not in ln:
@@ -161,7 +174,7 @@ def parse_ticket(path):
     if runlevel and len(runlevel) != len({d for _, d in cells}):
         raise SystemExit(f"mtp_depth_pool: {path}: run-level row covers {sorted(runlevel)} but per-prompt rows "
                          f"cover {sorted({d for _, d in cells})}")
-    return cells, not_scored, budget, width, ident, offered
+    return cells, not_scored, budget, width, ident, offered, tau
 
 
 def pool(paths):
@@ -170,9 +183,10 @@ def pool(paths):
     Returns (cells, unmeasured, sources); `unmeasured` holds the depths some ticket reported as `not scored`
     that no ticket scored a cell for -- kept, so the pool cannot report a pass over a depth it never saw."""
     seen, unmeasured, sources = {}, set(), 0
-    budget, width, idents, offered = {}, {}, {}, {}
+    budget, width, idents, offered, taus = {}, {}, {}, {}, []
     for p in paths:
-        rows, not_scored, bud, wid, ident, off = parse_ticket(p)
+        rows, not_scored, bud, wid, ident, off, tau = parse_ticket(p)
+        taus.append(tau)
         for pr, pair in off.items():
             if pr in offered and offered[pr] != pair:
                 raise SystemExit(f"mtp_depth_pool: {p} reports prompt {pr} accepted {pair[0]}/{pair[1]} but an "
@@ -198,7 +212,7 @@ def pool(paths):
                 raise SystemExit(f"mtp_depth_pool: {p} disagrees with an earlier ticket on prompt {k[0]} "
                                  f"depth {k[1]}: {seen[k]} then {v}")
             seen.setdefault(k, v)
-    return seen, unmeasured - {d for _, d in seen}, sources, budget, width, idents, offered
+    return seen, unmeasured - {d for _, d in seen}, sources, budget, width, idents, offered, taus
 
 
 def coverage(prompts):
@@ -244,6 +258,29 @@ def width_coverage(width, prompts):
                        f"only, not from the whole pool")
 
 
+def tau_coverage(taus, sources):
+    """The chain gate (tau) the pool covers, and a note when it is not one value or not stated at all.
+
+    tau belongs in the window for the same reason k does, only more so: at tau=0.6 the chain stops after the first draft
+    whose probability is below the gate, so a tau=0.6 ticket offers depths 1-2 while a tau=0 one offers 1-4.  A pool
+    that mixes them reads as a complete table over a window half of whose tickets never drafted those depths.  A log
+    from before the tool printed its settings line says `tau unstated` instead of being assumed at the default."""
+    stated = sorted({t for t in taus if t is not None})
+    unstated = len([t for t in taus if t is None])
+    if not stated:
+        return "tau unstated", (f"tau unstated: none of the {sources} ticket(s) states its chain gate (the settings line "
+                                 f"predates this build), so a tau=0 ticket and a tau=0.6 one cannot be told apart -- "
+                                 f"say which a window was run at before pooling a log into it")
+    if len(stated) > 1:
+        return "MIXED tau", (f"MIXED chain gate (tau): {', '.join(f'{t:g}' for t in stated)} -- at tau>0 the chain "
+                              f"gate stops before the deeper depths, so those rows exist on some prompts only")
+    note = None
+    if unstated:
+        note = (f"tau={stated[0]:g} is stated by {sources - unstated} of {sources} ticket(s); the rest predate the "
+                f"settings line, so their chain gate is assumed from the window rather than read")
+    return f"tau={stated[0]:g}", note
+
+
 def ident_coverage(idents):
     """The run identity the pool covers (vocab, batch width, hidden source), and a note when it is not one run."""
     if not idents:
@@ -256,16 +293,17 @@ def ident_coverage(idents):
                                   f"is a different measurement, not one pool")
 
 
-def table(seen, sources, unmeasured=(), budget=None, width=None, idents=None):
+def table(seen, sources, unmeasured=(), budget=None, width=None, idents=None, taus=None):
     """Print the pooled per-depth table; return (inside, scored, totals per depth)."""
     depths = sorted({d for _, d in seen})
     prompts = sorted({p for p, _ in seen})
     tokens_note, mixed = token_coverage(budget or {}, prompts)
     width_note, mixed_width = width_coverage(width or {}, prompts)
     ident_note, mixed_ident = ident_coverage(idents or {})
+    tau_note, mixed_tau = tau_coverage(taus or [], sources)
     print(f"pooled {len(seen)} scored cells = {len(prompts)} prompts x {len(depths)} depths "
-          f"({coverage(prompts)}, {tokens_note}, {width_note}, {ident_note}, {sources} ticket(s))")
-    for note in (mixed, mixed_width, mixed_ident):
+          f"({coverage(prompts)}, {tokens_note}, {width_note}, {tau_note}, {ident_note}, {sources} ticket(s))")
+    for note in (mixed, mixed_width, mixed_tau, mixed_ident):
         if note:
             print(note)
     print(f"\n{'depth':>5}  {'live':>18}  {'offline (same positions)':>24}  {'delta':>9}  verdict")
@@ -408,7 +446,7 @@ def refusal_selftest():
         fh.write("prompt 0: TEXT IDENTICAL\n" + d1 + run + tail)
         path = fh.name
     try:
-        cells, _, _, _, _, _ = parse_ticket(path)
+        cells, _, _, _, _, _, _ = parse_ticket(path)
         if cells != {(0, 1): (8, 10, 8, 10)}:
             print(f"selftest FAIL tail repeat: parsed {cells}, wanted only the first row", file=sys.stderr)
             return 1
@@ -426,11 +464,11 @@ def main(argv):
             return refusal_selftest()
         print(__doc__)
         return 2
-    seen, unmeasured, sources, budget, width, idents, offered = pool(paths)
+    seen, unmeasured, sources, budget, width, idents, offered, taus = pool(paths)
     if not seen:
         print("mtp_depth_pool: nothing to pool", file=sys.stderr)
         return 1
-    _, _, totals = table(seen, sources, unmeasured, budget, width, idents)
+    _, _, totals = table(seen, sources, unmeasured, budget, width, idents, taus)
     print_economics(economics(seen, offered))
     if not selftest:
         return 0

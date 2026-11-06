@@ -79,6 +79,12 @@ run() {  # <record> <model> [serve args]
     RECORD="$1" "$bin" serve -m "$scratch/$2.gguf" --port "$port" --llama-server "$scratch/backend.py" "${@:3}" >"$1.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do [ -s "$1" ] && break; sleep 0.1; done
+    # A server that never came up because it could not bind is a port collision, not a defect in
+    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$1.log"; then
+        echo "FAIL: device_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$1.log" | head -1))"
+        exit 1
+    fi
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 field() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$1" "$2"; }

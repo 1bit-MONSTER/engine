@@ -664,6 +664,58 @@ check("census.json records every engine#619 class",
 check("census.json shows granite switch is not a one-off",
       counts["GraniteSwitchForCausalLM"] > 1)
 
+
+# 25. The 2026-11-05 census batch (engine#619): two reviewed non-alias classes are recorded and
+#     report-only, and FastFlowLM's NPU2 families are answered in docs/npu.md instead of being
+#     mapped as GGUF aliases the pinned backends do not accept.
+batch_1105 = {
+    "Ernie5_5_MoeForCausalLM": ("ernie5_5_moe", "ml-resources/ERNIE-5.5-Flash-Base"),
+    "Factorial": ("Factorial", "bull220202/Factorial_Base_Tiny_300M_Ver_LM"),
+}
+for cls, (model_type, mid) in batch_1105.items():
+    entry = sig.get(cls) or {}
+    check(f"{cls} is reviewed report-only and documented",
+          entry.get("model_type") == model_type and entry.get("watch") == "report"
+          and cls not in archs and cls in gap_docs)
+    rc, res = rc_of([model(mid, cls)], archs, sig)
+    check(f"{cls} report-only -> exit 0, no alert",
+          rc == 0 and res["reviewed_report"] == [cls] and res["significant"] == []
+          and res[cw.UNCOVERED] == [mid])
+check("census.json records the 2026-11-05 classes",
+      counts.get("Ernie5_5_MoeForCausalLM", 0) > 0 and counts.get("Factorial", 0) > 0)
+
+with open(os.path.join(ROOT, "docs", "npu.md")) as f:
+    npu_docs = f.read()
+# [repo id, the architecture class its config declares ("" for a config-less drop)]
+flm_1105 = [
+    ("FastFlowLM/MiniCPM-OCR-1.0-NPU2", "MiniCPMOcrForConditionalGeneration"),
+    ("FastFlowLM/MiniCPM-V-4.7-35B-A3B-NPU2", "MiniCPMV4_7ForConditionalGeneration"),
+    ("FastFlowLM/MiniCPM-V-4.7-1B-NPU2", "MiniCPMV4_7ForConditionalGeneration"),
+    ("FastFlowLM/Qwen3.8-27B-DFlash2-NPU2", "DFlash2DraftModel"),
+    ("FastFlowLM/LFM3-1.7B-NPU2", "Lfm3ForCausalLM"),
+    ("FastFlowLM/Hy-Memory-30B-A3B-NPU2", "HYV3ForCausalLM"),
+    ("FastFlowLM/smolvla-NPU2", ""),
+]
+for repo_id, cls in flm_1105:
+    check(f"{repo_id} is recorded in docs/npu.md", repo_id in npu_docs)
+    if not cls:
+        continue
+    if cls == "HYV3ForCausalLM":
+        check("Hy-Memory's hy_v3 is mapped for hrx only, so its pack is an NPU gap",
+              archs[cls]["backends"] == ["hrx"] and "npu" not in archs[cls]["backends"]
+              and cls in npu_docs)
+        hy = cw.flm_repo({"id": repo_id, "config": {"architectures": [cls]},
+                          "siblings": [{"rfilename": "model.q4nx"}]}, archs)
+        check("Hy-Memory pack resolves to the recorded npu gap, not a mapping",
+              hy["mapped"] and cw.npu_gap(hy) and cw.unmapped(hy) and not hy["npu"])
+    else:
+        check(f"{cls} stays out of the registry (no GGUF alias claimed)",
+              cls not in archs and cls in npu_docs)
+        repo = cw.flm_repo({"id": repo_id, "config": {"architectures": [cls]},
+                            "siblings": [{"rfilename": "model.q4nx"}]}, archs)
+        check(f"{repo_id} still reads as an unserved family",
+              not repo["mapped"] and cw.unmapped(repo))
+
 shutil.rmtree(STATE_DIR, ignore_errors=True)
 # 16. Gated repos (engine#619): the request carries a token when one is in the environment, and
 #     the run says so instead of repeating "gated repos need a token" at a run that sent one.

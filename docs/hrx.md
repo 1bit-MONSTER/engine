@@ -387,15 +387,19 @@ also be resident raw. Measured against `6e42b51` (3 interleaved runs, `-b 512 -u
 ### Flash-Next prefill: where the 287 tok/s goes ([engine#572](https://github.com/1bit-MONSTER/engine/issues/572))
 
 Qwen3.8-Flash-Next (`qwen4exp A3B`, 512 experts, 176.9 B parameters, UD-IQ4_XS 93.7 GB) prefills at
-287 tok/s on Strix Halo where another stack reports 1,679 for the same class of model. Two candidate
-causes are ruled out before the profile below: the ubatch cap, and the expert GEMM's tile width.
+287 tok/s on Strix Halo where another stack reports 1,679 for the same class of model. The ubatch cap
+was one of the limiters and is now lifted (what it bought is measured below); the expert GEMM's
+tile width is not the lever.
 
 The ubatch cap is gone. An ubatch above 512 tokens used to fail the whole graph with
 `GGML_STATUS_FAILED` (engine#389); the token bounds in
 `ggml/src/ggml-hrx/ubatch-token-limits.h` are what removed it — `kSsmConvRollbackMaxTokens` 512
 chained by `dispatch-ssm-conv-chunked.cpp`, `kSetRowsKernelMaxTokens` 2048 by
-`dispatch-row-chunks.cpp`, `kUbatchMaxTokens` 65536. A bigger ubatch buys nothing on this model
-anyway, so it is not the limiter either.
+`dispatch-row-chunks.cpp`, `kUbatchMaxTokens` 65536. Lifting the cap did pay: `-ub 2048` is
+**2.03x** `-ub 512` at pp4096 on the product path (205.05 vs 101.05 tok/s, same library, same
+quant, ctx 16384, `-fa on --cache-reuse 0`, 2026-11-05 16:06 and 17:11, `~/lb/supreme/raw/
+llamasrv-q31-prep/` and `...-ub512/`), so the cap was one of the limiters and not a detail. It is
+still not the whole gap.
 
 Measured on Strix Halo, engine `0d0c846` + llama.cpp `8ee20a0`, `-ngl 99 -fa 1`, 2026-10-27T02:38Z,
 3 runs (`samples_ts` 287.384 / 286.933 / 285.578):
@@ -434,6 +438,64 @@ exists for this model in this tree, so there is no speculative-decode row. The p
 carries two multi-second gaps after `ggml_get_rows_f32` that the timed pass does not (1,786 ms ≈
 1,355 ms device + ~0.4 s host), so those are bundle-write or cold-start cost, not the steady-state
 host gap.
+
+#### The two flags and the chunk ladder that got the product path off 85 tok/s (2026-11-05)
+
+Everything above is the 2026-10-27 record, measured on the pre-loom kernel set. The same file goes
+much further through `llama-server`, and the difference is **flags a user has to set**, not code in
+the backend. Ladder run 2026-11-05T02:36-02:47 (`~/lb/supreme/raw/llamasrv-fork177*`, one binary
+`add45105`, q31 = UD 3.1 `d9620119`, ctx 16384, 5 reps, `--cache-reuse` default is 256):
+
+| config | load | pp512 | pp4096 (3,857 tok) | tg128@8k |
+|---|---:|---:|---:|---:|
+| product defaults (`-fa` auto, `--cache-reuse 256`) | 687 s | 300.83 | 85.05 | 10.00 |
+| `+ -fa on` | 976 s | 390.52 | 153.71 | 8.75 |
+| `+ -fa on --cache-reuse 0` | **439 s** | **419.43** | **444.89** | **12.99** |
+
+- **`--cache-reuse` is the dominant cost on this model**: 2.89x at pp4096, 1.48x at 8k decode, and it
+  is also why the load misses the front-end's 600 s readiness budget (687 s with the default, 439 s
+  without it). The likely mechanism — GDN recurrent state plus checkpoints every 256 tokens, paid on
+  every unique prompt and never earned back — is written down here but **was not traced in the
+  scheduler**.
+- **`-fa auto` resolves against this stack, not for it**: `-fa on` is a separate, smaller lever
+  (1.30x at pp4096, 1.81x at pp512) that also collapses the pp4096 spread from 68.8 % to 9.1 %.
+- The unpatched `llama-bench` cell (84.1 tok/s) equals the patched build **with product defaults**
+  (85.05), so the 6.5x that threaded `GET_ROWS` buys is invisible through `1bit serve` until these
+  two flags are set.
+
+Chunk size, measured on one library (`27e7d641…`) in two windows so the pair is not confounded by a
+rebuild, ctx 16384, `-fa on --cache-reuse 0`:
+
+| arm | pp512 | pp4096 | load→ready | JIT compiles |
+|---|---:|---:|---:|---:|
+| `-ub 2048` | 183.76 | **205.05** | 999 s | 540 + 287 |
+| `-ub 512` | 133.38 | 101.05 | 1025 s | 632 |
+
+Do not multiply the two tables together: they are different windows on different policies, and this
+file's own history has a 568.75-vs-272.61 pair for *identical* argv. Only the within-table rows are
+comparable.
+
+With the loom kernel set (2026-11-05T23:15, q31, `-ub 2048`, `HRX_PROFILE_MODE=dispatch`, 135 MB
+bundle, 63,176 dispatches, 33.27 s of device time) the pp4096 pass attributes like this — a bundle
+covers load, warmup and one cell, so the shares are indicative and its tok/s is not quotable:
+
+| kernel | share of device time |
+|---|---:|
+| `ggml_mul_mat_id_swiglu_f32_f32_wmma` (routed gate/up) | 39.6 % |
+| `hrx_dp_mm_q6_k_m128_w8_f2_sb` | 11.2 % |
+| `ggml_flash_attention_f32_f16_wmma` | 11.2 % |
+| `ggml_mul_mat_id_f32_f32_wmma` | 6.5 % |
+| `ggml_mul_mat_f32_f32_wmma` | 4.2 % |
+| `hrx_dp_mm_q8_0_m64_w8_f2_sb` / `_m128` | 3.3 % / 2.8 % |
+
+Two things this replaces in the 10-27 table above: the pre-loom `hrx_prefill_mmid_swiglu_iq3_s_m64_w4`
+row (27.1 % / 25.1 %) is now one kernel family at 39.6 %, and attention has grown to 11.2 % at this
+context where the 10-27 pp512 bundle had it at 3.6 %.
+
+Still open on #572, stated so nobody reads this as closed: the 1,679 tok/s gap is not explained; the
+ubatch lever was measured up to 2048 and 4096 was tried and does not fit this 87 GiB file; no MTP
+head exists in this tree for the decode side; and nothing here is a claim about released-flag
+defaults — the ladder above is what an operator sets today.
 
 #### Where a prefill forward's time goes, and the ~1.0 s that is not HRX ([engine#572](https://github.com/1bit-MONSTER/engine/issues/572))
 

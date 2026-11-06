@@ -226,6 +226,13 @@ is wrong:
 1bit-engine serve -m <model>.gguf --device npu          # NPU
 ```
 
+If that answers `HRX strict placement refused the model: "embd" is GET_ROWS f32 … and is not placed
+on HRX`, the model's graph has a node HRX cannot take under [serve's strict placement](serve.md)
+(measured 2026-11-06: `Qwen3-0.6B-Q4_K_M` has one, `1 of 986 nodes off HRX`, and
+`Qwen3-4B-Q4_K_M` has one too, `1 of 1266`). Add `--no-strict-device` to run those nodes on the CPU
+— the row below was measured that way — or use a model whose graph places fully (Lemonade's
+`*-HRX` rows are the ones we have measured end to end).
+
 What this route does **not** do, compared with the fork's `onebit` recipe: the model list is Lemonade's
 own catalog, not our 27 rows — ours can be added on the side through the config directory's
 `user_models.json`, below — and there are no NPU catalog rows, because Lemonade has no recipe for our
@@ -248,6 +255,7 @@ registry model, since this Lemonade version has no local-file registration):
 | **each family installs, runs and uninstalls** | clean containers, 2026-11-06, from the `rc-2026-11-06-c31` payload: `fedora:latest` (`dnf`, rpm 6.1.0, glibc 2.44), `opensuse/tumbleweed:latest` (`zypper`), `archlinux:latest` (`pacman -U`, pacman 7.1.0), `ubuntu:26.04` (`apt-get`) | all four: install, `1bit-engine --version` prints `1bit 0.0.1`, the shim `/opt/1bit/engine/lemonade-bin/llama-server --version` prints `version: 1 (32559003)` / `built with Clang 24.0.0 for Linux x86_64`, then remove and `/opt/1bit/engine/1bit` is gone. Fedora refused the first build and that was the payload's fault, not dnf's: the package listed `/usr/bin` and `/usr/lib` at 0755 while Fedora's `filesystem` owns them at 0555 (`file /usr/bin from install of 1bit-engine-2026.45-1.x86_64 conflicts with file from package filesystem-3.18-59.fc45.x86_64`); `scripts/pack-distro.sh` now normalises the payload's modes and leaves the distributions' own skeleton out of the file list |
 | **the four packages are one payload** | the `.deb`, `.rpm`, `.pkg.tar.zst` and `.tar.zst` of the same run, unpacked side by side | 80 files each, 60 MB: the sha256 of every file is identical across the four, and so is the mode and symlink target of every path |
 | the glibc floor is enforced, not just documented | clean `ubuntu:24.04` container (glibc 2.39), `apt-get install ./1bit-engine_<version>_amd64.deb` | refused: `1bit-engine : Depends: libc6 (>= 2.43) but 2.39-0ubuntu8.9 is to be installed`. Before the floor was declared, the same deb installed, `ldd` was happy and the binary then failed to load |
+| **the package's payload serves on the GPU** | strixhalo, the Fedora `.rpm` unpacked with `rpm2cpio` (so exactly the files the package installs), `1bit serve -m Qwen3-0.6B-Q4_K_M.gguf --device hrx --no-strict-device`, one chat | `1bit serve: HRX: HSA runtime …/_rocm_sdk_core/lib/libhsa-runtime64.so.1 sha256 21a66824…` — the runtime the package ships, not the box's — then `Qwen3-0.6B-Q4_K_M on hrx` and `request /v1/chat/completions -> hrx status 200 in 202.5 ms | prompt 16 completion 16 79.0 tok/s`. Both this model and `Qwen3-4B-Q4_K_M` are refused first by strict placement (`"embd" is GET_ROWS f32 … 1 of 986 nodes off HRX`), which is why the run passes `--no-strict-device` |
 | a stock Lemonade takes a backend binary from `hrx_bin` / `LEMONADE_HRX_HRX_BIN` | extracted PPA deb `2026.44.1~26.04` on the dev box, isolated cache/config | `llamacpp-hrx` backend `installable` → `installed`, both forms, with no fork and no patch |
 | the same recipe, both packages side by side | clean `ubuntu:26.04` container: PPA `lemonade-server` + this `.deb` | `lemond 2026.44.1` starts, `1bit-engine --version` and the shim run; the recipe's backend state is hardware-gated there (`unsupported: Unsupported GPU`), so the end-to-end chat is the hardware row below |
 | the shim is the engine's own wrapper | `1bit/lemonade-hrx` from this repo's package (`scripts/package-linux.sh`) | it runs `1bit serve --print-backend-env` and then `exec`s the engine with serve's environment and defaults; `lemonade-bin/llama-server` is a symlink to it |

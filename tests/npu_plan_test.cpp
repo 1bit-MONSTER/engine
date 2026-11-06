@@ -292,8 +292,77 @@ void test_refusals() {
 
 }  // namespace
 
+
+// P7 (#806) part A: the KV contract.  Absent means f16 with no rotation -- which is what every plan written
+// before this field meant -- and anything this build cannot honour is a refusal that names the field, so a
+// plan asking for an int8 cache on a target without one cannot be served as f16 by accident.
+void test_kv() {
+    {
+        const Plan p = Plan::load(write_plan("kv_absent", base_plan()));
+        check(p.kv_key == "f16" && p.kv_value == "f16" && p.kv_hadamard_block == 0,
+              "a plan with no kv block means f16 KV with no rotation");
+        check(!p.kv_int8(), "and reports itself as not int8");
+    }
+    {
+        auto j = base_plan();
+        j["kv"] = {{"key", "int8"}, {"value", "f16"}, {"hadamard", {{"block", 256}, {"signs", "had.signs"}}}};
+        const Plan p = Plan::load(write_plan("kv_variant4", j));
+        check(p.kv_key == "int8" && p.kv_value == "f16", "variant 4 (int8 K, f16 V) loads as written");
+        check(p.kv_int8(), "and reports itself as int8");
+        check(p.kv_hadamard_block == 256 && p.kv_hadamard_signs == "had.signs",
+              "the per-head rotation block and its sign file are read");
+    }
+    {
+        auto j = base_plan();
+        j["kv"] = {{"key", "f16"}, {"value", "f16"}, {"hadamard", {{"block", 0}}}};
+        const Plan p = Plan::load(write_plan("kv_plain", j));
+        check(!p.kv_int8() && p.kv_hadamard_block == 0, "an explicit f16/no-rotation block loads");
+    }
+    {
+        auto j = base_plan();
+        j["kv"] = {{"key", "int4"}};
+        const std::string why = refusal(write_plan("kv_bad_dtype", j));
+        check(has(why, "kv.key") && has(why, "int4"), "an unknown kv.key is refused, naming the field and value");
+    }
+    {
+        auto j = base_plan();
+        j["kv"] = {{"key", 8}};
+        const std::string why = refusal(write_plan("kv_key_not_string", j));
+        check(has(why, "kv.key") && has(why, "not a string"),
+              "a non-string kv.key is a named refusal, not a JSON exception escaping the loader");
+    }
+    {
+        auto j = base_plan();
+        j["kv"] = {{"key", "int8"}, {"value", "q8_0"}};
+        const std::string why = refusal(write_plan("kv_bad_value", j));
+        check(has(why, "kv.value"), "an unknown kv.value is refused, naming the field");
+    }
+    {
+        auto j = base_plan();
+        j["kv"] = {{"key", "int8"}, {"hadamard", {{"block", 250}}}};
+        const std::string why = refusal(write_plan("kv_bad_block", j));
+        check(has(why, "kv.hadamard.block"), "a rotation block that is not a power of two is refused");
+    }
+    {
+        auto j = base_plan();
+        j["kv"] = {{"key", "int8"}, {"hadamard", {{"block", 256}, {"signs", "../elsewhere.signs"}}}};
+        const std::string why = refusal(write_plan("kv_bad_signs", j));
+        check(has(why, "kv.hadamard.signs"),
+              "a sign file that is a path rather than a bare name is refused (a plan cannot point the "
+              "loader outside the dirs the command line named)");
+    }
+    {
+        auto j = base_plan();
+        j["kv"] = {{"key", "int8"}, {"hadamard", {{"block", 0}, {"signs", "had.signs"}}}};
+        const std::string why = refusal(write_plan("kv_signs_no_block", j));
+        check(has(why, "kv.hadamard.signs"),
+              "a sign file with no rotation block is refused as contradictory rather than ignored");
+    }
+}
+
 int main() {
     test_valid();
+    test_kv();
     test_tile_order();
     test_refusals();
     std::printf("%s\n", failures ? "FAILED" : "npu_plan: ok");

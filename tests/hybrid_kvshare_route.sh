@@ -131,5 +131,46 @@ check "the late provider could still read its region fd" \
     'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"fds\"]==1 and d[\"readable\"]==[16] else 1)" "$scratch/provider.json" 2>/dev/null'
 stop
 
+# a decoder that cannot share its cache: the real server refuses a params or model mismatch, and refuses a
+# hybrid cache on a pin without the recurrent-state arm. ONEBIT_KV_SHARE=1 must not turn that into "no
+# provider at all" -- the state-file route the decoder does support is used instead, because a handoff by
+# file still beats the decoder prefilling the prompt itself. share_ms separates the two routes in the log
+# line (0.000 = the file route).
+check "serve starts against a decoder that cannot share" \
+    'start "$scratch/d.log" ONEBIT_KV_SHARE=1 FAKE_KVSHARE_REFUSE=1 ONEBIT_HYBRID_PREFILL="$here/fake_prefill_provider.py" FAKE_PREFILL_COPY=1'
+reply=$(ask)
+check "the reply comes through on the state-file route" '[[ "$reply" == *Paris* ]]'
+check "the request was pinned to slot 0" '[[ "$reply" == *"\"fake_id_slot\":0"* ]]'
+check "the fallback to the state file is named" 'grep -q "cannot share its KV" "$scratch/d.log"'
+check "the provider's state file was restored (share 0.000 ms, the file route)" 'grep -q "hybrid: .* share 0\.000 ms, first byte" "$scratch/d.log"'
+check "the decoder was not left to prefill the prompt itself" '! grep -q "the backend prefills this request itself" "$scratch/d.log"'
+stop
+
+# a provider that exits 0 but says it prefilled fewer tokens than it was handed: the region's last row was never
+# written, so the cells must NOT be adopted -- the decoder prefills the prompt itself instead. The file route has
+# carried this cross-check since #941; the shared route adopted on the cell count alone.
+check "serve starts with a provider that claims a short prefill" \
+    'start "$scratch/f.log" ONEBIT_KV_SHARE=1 FAKE_KVSHARE_SHORT=1 ONEBIT_HYBRID_PREFILL="$here/fake_kvshare_provider.py"'
+reply=$(ask)
+check "the reply still comes through" '[[ "$reply" == *Paris* ]]'
+check "a short claim is named" 'grep -q "provider prefilled [0-9]* of [0-9]* tokens into the shared region" "$scratch/f.log"'
+check "no cells were adopted from a short region" '! grep -q "share [0-9.]* ms, first byte" "$scratch/f.log"'
+check "the decoder prefills the prompt itself instead" 'grep -q "the backend prefills this request itself" "$scratch/f.log"'
+stop
+
+# the other side of the same boundary: the export worked and the provider wrote into the region, but the cells
+# cannot be adopted (the real refusal when another sequence holds them). That is not a handshake failure, so the
+# engine's designed behaviour is the plain fallback -- it must NOT re-run the prompt through the state-file route.
+rm -f "$scratch/provider.json"
+check "serve starts with a decoder that refuses the adopt" \
+    'start "$scratch/e.log" ONEBIT_KV_SHARE=1 FAKE_KVSHARE_ADOPT_REFUSE=1 ONEBIT_HYBRID_PREFILL="$here/fake_kvshare_provider.py"'
+reply=$(ask)
+check "the reply comes through when the adopt is refused" '[[ "$reply" == *Paris* ]]'
+check "the provider did run and wrote into the region" \
+    'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"fds\"]==1 else 1)" "$scratch/provider.json" 2>/dev/null'
+check "the refused adopt is named" 'grep -q "adopt answered 400" "$scratch/e.log"'
+check "an adopt refusal does not fall back to the state file" '! grep -q "cannot share its KV" "$scratch/e.log"'
+stop
+
 if [ $fail -ne 0 ]; then echo "--- log (tail)"; tail -30 "$scratch/a.log"; echo FAIL; exit 1; fi
 echo PASS

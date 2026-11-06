@@ -366,6 +366,27 @@ its engine mutex (`app/forward_serve.cpp:258`, `:698`), so one pass is in flight
 N processes sharing the device by flock (`app/npu_device_lock.h`), each counting its own. A caller that
 parallelised the layer loop would need per-pass counters instead.
 
+### From a 1BP package
+
+`tools/onebp_import.py <model.1bp> <out dir> --config <snapshot dir>` imports a legacy `.1bp` package
+(one file: a 256-byte header, a tensor index, the weights). Its 4-bit payload is a 32 x 256 tile of 5120 B
+with this engine's value convention (`scale*q + min`), but **not** its intra-tile layout: `.1bp` stores
+the scales/mins row-major (`[r*8+g]`) and the codes adjacent-pair (even column low), while `npu/q4nx.h`
+stores them group-major (`[g*32+r]`) and lane-swizzled. The import permutes each tile's bytes — the
+inverse of the archived converter's own `q4nx_tile_to_onebp()` — and dequantizes and re-quantizes nothing;
+`F16`/`F32` tensors become bf16. `--verify` proves it by comparing every byte the container holds against
+the same permutation of the package's slice (and against the GGUF behind any tensor that came from
+`--embedding-from`). Reading a `.1bp` tile as if it were already this engine's tile is not a near miss:
+on `ZR1-1.5B-1BP` the decoded weights then correlate 0.003 with the model — fluent noise that still looks
+like weights, the failure mode of [engine#1110](https://github.com/1bit-MONSTER/engine/issues/1110) —
+and 0.995-0.997 after the permutation. A v1 package carries no `token_embd`/`lm_head`, so importing one needs
+`--embedding-from <gguf>` (and `--verify` of it takes the same flag: it rebuilds the same plan); the tool stops
+rather than write a container that cannot answer. Any tensor
+with no Q4NX mapping is refused **by name** (`no Q4NX name for blk.0.cca_conv_grp.weight`) instead of
+guessed: Zaya1's grouped conv, EDA router and fused `ffn_gate_up_exps` have no op in `npu/forward` yet,
+so a package of that architecture is not importable — see `~/briefs/ZAYA-OPFAMILY-NOTE.md` for the op
+list and its cost.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model

@@ -174,7 +174,7 @@ Release sha and pins (the submodules this candidate is built from):
 | engine | `7871c71d` (main when the last release-blocking PR merged; a later merge today re-runs only the stages it touches, and the run's record carries the final sha) |
 | llama.cpp (HRX fork) | `851fa6c8d8f2` |
 | hrx-system | `82804197bcbe` |
-| Lemonade (fork) | `f44ff953` (the fork's `main` tip, and the sha `bump-lemonade`'s PR #1126 pins; re-read this row from `git ls-tree third_party/lemonade` at cut time, because the workflow follows the tip) |
+| Lemonade (fork) | `f44ff953` (the fork's `main` tip, and the sha `bump-lemonade`'s PR #1126 pinned; re-read this row from `git ls-tree third_party/lemonade` at cut time, because the workflow follows the tip) |
 | private kernel add-on (HIP) | `744bd713d968` |
 | private NPU kernel set | `17ed5be7a28a` |
 | private NPU runtime | `ce9fa59adf95` |

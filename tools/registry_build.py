@@ -50,13 +50,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HRX = "third_party/llama.cpp"
 
 # The NPU serves these HF architectures (docs/npu.md):
-#  - the fast lane serves Qwen3 dense Q4NX directories (model_type from config.json);
+#  - the fast lane serves Qwen3 and Qwen3.5 dense Q4NX directories (model_type from
+#    config.json): Qwen3.8-27B-NPU2 is a `qwen3_5` directory and is measured on the NPU route
+#    (bench/npu-leaderboard/27b-*.json), so the dense family is served, not only the MoE;
 #  - the GGUF-on-NPU route repacks a .gguf and runs the model-generic forward, for six
 #    arches each verified by a captured `--device npu` run (goal muhz0s39-8c9l9o). Text
 #    decoders only; vision-language variants of these arches are not claimed.
 # HF architecture -> model_type the forward's config.json names.
 NPU_ARCHS = {
     "Qwen3ForCausalLM": "qwen3",            # fast lane (Q4NX directory)
+    # fast lane: Qwen3.8-27B-NPU2 (qwen3_5) — the text container of a VLM family; the vision
+    # tower is a separate `vision_weight.q4nx` that this route does not load, so the two text
+    # LM classes are claimed and `Qwen3_5Model` (the bare vision wrapper) is not.
+    "Qwen3_5ForCausalLM": "qwen3_5",
+    "Qwen3_5ForConditionalGeneration": "qwen3_5",
     "Qwen2ForCausalLM": "qwen2",            # GGUF-on-NPU: Qwen2.5-7B-Instruct
     "Qwen3MoeForCausalLM": "qwen3moe",      # GGUF-on-NPU: Qwen3-Coder-30B-A3B
     "Qwen3_5MoeForCausalLM": "qwen3_5_moe",  # GGUF-on-NPU: Qwen3.6-35B-A3B (gguf qwen35moe)

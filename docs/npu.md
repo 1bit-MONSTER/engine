@@ -377,6 +377,29 @@ carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's ow
 a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
 `plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
 
+#### What the stream is worth at the model level (measured)
+
+The phase numbers above are the kernel's. The number a user feels is a decode step, and it is the one that
+decided P3: same container file and same engine binary, two weight paths, adjacent windows on one quiet box
+(2026-11-02, three `npu-hold` tickets on `:18099`, `amdxdna` counter 0 in each, seven steady-state tokens per
+arm read from the serve's own `[ph] tok` lines):
+
+| container | decode | device wait | stream per token |
+|---|---|---|---|
+| pb16i (control) | 410 ms/token (409-412) = 2.44 tok/s | 296 ms | 12.93 GB |
+| **t2s2 sealed** | **313 ms/token (311-317) = 3.20 tok/s** | **209 ms** | **6.11 GB** |
+
+**1.31x per token and 1.42x on the device wait**, on 2.12x fewer bytes to stream (431 images, 14.44 -> 6.82 GB).
+The model keeps 1.31x of the kernel's 1.76x because a step is more than its GEMMs: the host half (quantise,
+rotation, GDN) and the lm head do not shrink with the wire, and in this pair they are 66 ms and 13.5 ms of it.
+
+Acceptance is byte-exactness, not a text diff: every decode role matched the pb16i path byte for byte at
+layer 0 (6/6) and layer 3 (8/8) on all three seeds, and greedy text is equal to the pb16i arm's on the prompt
+both were asked — `' Paris.\nThe capital of Germany is'`. **A request wall is not this number** — a fresh
+serve pays the image fill once, so a 32-token request measures 614/651 ms/token while the per-token instrument
+says 313/410; that correction, and why every request-wall figure in this file pays the fill, is in the chunk
+above.
+
 #### The image fill (what a fresh serve costs)
 
 A pb16i/t2s container's weights *are* the sidecar images, so a cold serve is a file read and nothing
@@ -926,9 +949,9 @@ architecture the repo's config declares, and does the NPU route already serve th
 registry maps it, but only for a backend that cannot run a Q4NX directory. Both answers come from
 the registry, never from the repo name.
 
-The route serves the families `registry/architectures.json` marks `npu`: `qwen3` on the dense
-fast lane, and `qwen2`, `qwen3moe`, `qwen3_5_moe`, `deepseek2`, `minicpm` and `llama` through the
-GGUF-on-NPU forward ([registry.md](registry.md) has the table). Everything else in the org is an
+The route serves the families `registry/architectures.json` marks `npu`: `qwen3` and `qwen3_5` on
+the dense fast lane, and `qwen2`, `qwen3moe`, `qwen3_5_moe`, `deepseek2`, `minicpm` and `llama`
+through the GGUF-on-NPU forward ([registry.md](registry.md) has the table). Everything else in the org is an
 NPU-route gap, recorded here instead of as a GGUF alias: a class enters the registry only when a
 backend's code accepts it, so mapping an NPU pack to an hrx-only family would advertise a model
 the route refuses at load.
@@ -953,11 +976,12 @@ to one of these repos is a prompt to update this table rather than a namespace e
 The 2026-11-06 census body (engine#1253) read the whole org from a fresh state, so it also printed
 every pack whose family the registry maps for `hrx` only. Those are the `!! NPU FLM` rows: the
 architecture is covered on the CPU route, but a Q4NX directory needs the NPU route and `npu` is
-not in the entry's `backends`. Family by family:
+not in the entry's `backends`. Family by family (`qwen35` has since moved out of that set, because
+engine#587 measured the route on it):
 
 | family (`gguf`) | packs in the 2026-11-06 body | `backends` | NPU route answer |
 |---|---|---|---|
-| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx | not served: the dense qwen35 family has no NPU kernel set; the serving work is tracked in engine#587 (Qwen3.8-27B-NPU2) |
+| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx, npu | **served, and measured** (engine#587): the same `Qwen3.8-27B-NPU2` family runs on the NPU route — int8 Q4NX decodes at 63.1 s/token and takes 145.7 s to a first token (`bench/npu-leaderboard/27b-*.json`, 2026-10-27), a 5-token prefill chunk is 58.14 s, and the ternary sealed-ELF rung on the same container is 1.72 s/token with 3/3 text-identical output (engine#697, closed by #728). What a stock install still needs is a kernel set for the model's geometry — none ships in this repository — so the row read `not served` until the route itself was measured |
 | `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
 | `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
@@ -1665,6 +1689,17 @@ Two settings are worth knowing regardless, both measured in one window:
   after the first draft and trades base passes for lm-head calls almost exactly one-for-one: 0.598-0.623 s/token
   across arms that differ 2× in chain and 4× in head calls. It also leaves depths 3-4 with *no* offers, so any
   per-depth measurement is at `tau = 0`.
+
+**`tau` is part of the window, and the tooling now says so.** Because the gate stops the chain, a `tau = 0.6` ticket
+offers one or two depths where a `tau = 0` one offers four, so the two must never be pooled into one table — yet until
+now `mtp_acceptance --live` printed its window (`k`, tokens, hidden) nowhere: `--offline` has always stated it, the
+live path only echoed it in the harness' argv. `--live` now prints the same
+`== N prompts x M tokens, k=K tau=T, hidden=H` line at **init** (so a ticket killed at its hold still states its
+window), and `tools/mtp_depth_pool.py` reads it and reports the chain gate in the window header, names a pool that
+mixes two gates (`MIXED chain gate (tau)`), and says `tau unstated` for a log that predates the line rather than
+assuming `tau = 0`. `Options::tau` defaults to 0.6, and the tau = 0.6 acceptance row is still **not measured** — the
+published rows above are all `tau = 0`; that row is the next ticket, and it is now impossible to publish it by
+pooling two regimes by accident.
 
 **Refuted, so nobody builds it again**: folding the per-iteration step into the next verify batch (one pass per
 iteration instead of two) collapses the chain from **2.82 to 1.07** tokens/pass and depth-1 acceptance from **82 %

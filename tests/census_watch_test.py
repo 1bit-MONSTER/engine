@@ -367,6 +367,22 @@ def flm_state():
     return cw.load_state(os.path.join(STATE_DIR, "state.json"))
 
 
+# A listing entry for the NPU-gap case: an FLM Q4NX pack whose family the live registry maps
+# for HRX only. It used to be D3-Mini (`qwen3_5_text` -> qwen35), until the dense qwen3_5 family
+# was registered as served on the NPU route (engine#587: Qwen3.8-27B-NPU2 is that family and is
+# measured there, bench/npu-leaderboard/27b-*.json), so the example moved to a family that is
+# still HRX-only - gemma3, which FLM also publishes Q4NX packs for. Reading the live registry is
+# the point: if gemma3 is ever registered for the NPU this check fails and the example moves again.
+HRX_ONLY_REPO = {
+    "id": "FastFlowLM/Gemma3-12B-NPU2",
+    "lastModified": "2026-10-20T00:00:00.000Z",
+    "tags": ["base_model:google/gemma-3-12b-it", "license:gemma"],
+    "config": {"architectures": ["Gemma3ForConditionalGeneration"], "model_type": "gemma3"},
+    "siblings": [{"rfilename": "config.json"}, {"rfilename": "model.q4nx"},
+                 {"rfilename": "vision_weight.q4nx"}],
+}
+
+
 # 16. The org listing is classified inline: tags, architecture, registry mapping and the
 #     npu route all come from the one listing response, no per-model fetch.
 live_archs = cw.load_registry()[0]
@@ -375,7 +391,9 @@ by_id = {r["id"]: r for r in repos}
 check("flm org: every recorded repo is read", len(repos) == 5)
 d3 = by_id["FastFlowLM/D3-Mini-NPU2"]
 check("flm org: a model_type-only repo still resolves (qwen3_5_text -> qwen35)",
-      d3["registry_class"] == "Qwen35ForCausalLM" and d3["mapped"])
+      d3["registry_class"] == "Qwen3_5ForCausalLM" and d3["mapped"])
+check("flm org: the dense qwen3_5 family is served on the NPU route (engine#587)",
+      d3["npu"] and d3["npu_model_type"] == "qwen3_5" and not cw.npu_gap(d3))
 check("flm org: license tag read", d3["license"] == "apache-2.0")
 check("flm org: base model tag read, relation prefix dropped",
       d3["base_models"] == ["vllm-sr/d3-mini"])
@@ -394,11 +412,13 @@ check("flm org: an unmapped architecture is unmapped, not a guess",
 gguf = by_id["FastFlowLM/Qwen3.5-0.8B-gguf"]
 check("flm org: a config-less gguf drop is a derivative, not a new family",
       gguf["derivative"] and not cw.unmapped(gguf) and not gguf["mapped"])
-# The NPU-pack case (2026-10): a Q4NX pack whose family IS mapped, but only for a backend
-# that cannot run a Q4NX directory. D3-Mini is `qwen3_5_text` -> qwen35 -> hrx in the live
-# registry, and it ships model.q4nx + vision_weight.q4nx, so the NPU route cannot serve it.
+# The NPU-pack case (2026-10): a Q4NX pack whose family IS mapped, but only for a backend that
+# cannot run a Q4NX directory. gemma3 in the live registry is exactly that, and FLM ships packs
+# for it, so the guard's firing path keeps a real example now that qwen3_5 is NPU-served.
+gap_repos = cw.sweep_org(live_archs, fetch=lambda url: [HRX_ONLY_REPO])
+gap = gap_repos[0]
 check("flm org: a Q4NX pack for an HRX-only family is an NPU gap",
-      d3["mapped"] and d3["q4nx"] and not d3["npu"] and cw.npu_gap(d3) and cw.unmapped(d3))
+      gap["mapped"] and gap["q4nx"] and not gap["npu"] and cw.npu_gap(gap) and cw.unmapped(gap))
 check("flm org: a family the NPU route serves is not a gap",
       not cw.npu_gap(qp) and not cw.unmapped(qp) and not cw.npu_gap(llama))
 check("flm org: a derivative drop is not an NPU gap", not cw.npu_gap(gguf))
@@ -442,11 +462,20 @@ check("flm report: a mapped family is not marked",
       "  + FLM FastFlowLM/Qwen3-8B-NPU2" in first and "!! NEW FLM FastFlowLM/Qwen3-8B-NPU2" not in first)
 check("flm report: the derivative drop does not alert",
       "!! NEW FLM FastFlowLM/Qwen3.5-0.8B-gguf" not in first)
+check("flm report: an NPU-served family is not marked !! NPU FLM (engine#587)",
+      "  + FLM FastFlowLM/D3-Mini-NPU2" in first
+      and "!! NPU FLM FastFlowLM/D3-Mini-NPU2" not in first)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    gap_all = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json") + [HRX_ONLY_REPO])
+    cw.report_flm(gap_all, cw.sweep_releases(fetch=flm_fetch),
+                  [r for r in gap_all if r["id"] == HRX_ONLY_REPO["id"]], [])
+gapfirst = buf.getvalue()
 check("flm report: an NPU pack for an HRX-only family is marked !! NPU FLM",
-      "  !! NPU FLM FastFlowLM/D3-Mini-NPU2" in first)
+      "  !! NPU FLM FastFlowLM/Gemma3-12B-NPU2" in gapfirst)
 check("flm report: the NPU gap is summarised by family",
-      "Q4NX (NPU) pack(s) for a family the NPU route does not serve" in first
-      and "qwen35 (1 pack(s))" in first)
+      "Q4NX (NPU) pack(s) for a family the NPU route does not serve" in gapfirst
+      and "gemma3 (1 pack(s))" in gapfirst)
 check("flm report: sizes are named in GiB, one line each",
       "GiB" in first and "npu route: qwen3" in first and "registry: none" in first)
 check("flm report: releases are listed with their tags",
@@ -463,17 +492,28 @@ check("flm delta: a second run is quiet and green",
       quiet_ok and quiet_rc == 0 and "nothing new since the last run" in second)
 check("flm delta: no repo line on a quiet day",
       not any(p[:7] in second for p in FLM_LINE_PREFIXES))
-moved = [dict(r) for r in fixture("org.json")]
-moved[0]["lastModified"] = "2026-11-02T00:00:00.000Z"   # D3-Mini: qwen35, Q4NX, no npu route
-moved_repos = cw.sweep_org(live_archs, fetch=lambda url: moved)
-fresh, fresh_rel = cw.flm_deltas(state, moved_repos, cw.sweep_releases(fetch=flm_fetch))
-check("flm delta: only the moved repo is new", [r["id"] for r in fresh] == [moved[0]["id"]])
+gap_moved = [HRX_ONLY_REPO]
+gap_repos2 = cw.sweep_org(live_archs, fetch=lambda url: gap_moved)
+fresh, fresh_rel = cw.flm_deltas(state, gap_repos2, cw.sweep_releases(fetch=flm_fetch))
+check("flm delta: only the moved repo is new", [r["id"] for r in fresh] == [gap_moved[0]["id"]])
 check("flm delta: known releases are not new", fresh_rel == [])
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    moved_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), fresh, fresh_rel)
-check("flm delta: a moved NPU-gap pack alerts (it is the 2026-10 D3 case)",
-      moved_rc == 1 and "  !! NPU FLM FastFlowLM/D3-Mini-NPU2" in buf.getvalue())
+    moved_rc = cw.report_flm(gap_repos2, cw.sweep_releases(fetch=flm_fetch), fresh, fresh_rel)
+check("flm delta: a moved NPU-gap pack alerts (an HRX-only family with a Q4NX pack)",
+      moved_rc == 1 and "  !! NPU FLM FastFlowLM/Gemma3-12B-NPU2" in buf.getvalue())
+# D3-Mini moving used to be that alert; it is the same move on a family the NPU route now serves,
+# so the delta reports it and does not alert on it (engine#587).
+moved = [dict(r) for r in fixture("org.json")]
+moved[0]["lastModified"] = "2026-11-02T00:00:00.000Z"   # D3-Mini: qwen35, Q4NX, npu route qwen3_5
+moved_repos = cw.sweep_org(live_archs, fetch=lambda url: moved)
+fresh1, _ = cw.flm_deltas(state, moved_repos, cw.sweep_releases(fetch=flm_fetch))
+check("flm delta: the moved repo is reported", [r["id"] for r in fresh1] == [moved[0]["id"]])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    served_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), fresh1, [])
+check("flm delta: a moved NPU-served pack does not alert",
+      "  !! NPU FLM FastFlowLM/D3-Mini-NPU2" not in buf.getvalue())
 served = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json"))
 fresh2 = [r for r in served if r["id"] == "FastFlowLM/Qwen3-8B-NPU2"]   # qwen3: served on the NPU
 buf = io.StringIO()
@@ -740,8 +780,9 @@ check("census.json records the NeedleForToolCalling family",
 
 # The 2026-11-06 body's `!! NPU FLM` rows: each family is mapped for hrx only, so its Q4NX pack is
 # an NPU gap and docs/npu.md has to carry the per-family answer.
+# qwen35 is deliberately absent: engine#587 measured the route on that family, so it is registered
+# for `npu` now and its pack is served instead of being a gap - pinned by the two checks below.
 npu_flm_families = {
-    "qwen35": ("Qwen3_5ForConditionalGeneration", "Qwen3.8-27B-NPU2"),
     "dflash": ("DFlashDraftModel", "Nemotron-3.5-Bolt-E4B-DFlash-NPU2"),
     "gemma4": ("Gemma4ForConditionalGeneration", "Gemma4-12B-IT-NPU2"),
     "hunyuan-dense": ("HunYuanDenseV1ForCausalLM", "Hy-MT2-1.8B-NPU2"),
@@ -755,11 +796,20 @@ for gguf, (cls, repo_id) in npu_flm_families.items():
           archs[cls]["gguf"] == gguf and archs[cls]["backends"] == ["hrx"])
     check(f"{gguf}: the NPU-route answer for {repo_id} is in docs/npu.md",
           f"`{gguf}`" in npu_docs and repo_id in npu_docs)
+check("qwen35: the dense family is registered for the NPU route (engine#587)",
+      archs["Qwen3_5ForConditionalGeneration"]["gguf"] == "qwen35"
+      and archs["Qwen3_5ForConditionalGeneration"]["backends"] == ["hrx", "npu"]
+      and archs["Qwen3_5ForConditionalGeneration"]["npu_model_type"] == "qwen3_5")
+check("qwen35: the bare vision wrapper is not claimed",
+      archs["Qwen3_5Model"]["backends"] == ["hrx"])
+check("qwen35: the NPU-route answer for Qwen3.8-27B-NPU2 is in docs/npu.md",
+      "`qwen35`" in npu_docs and "Qwen3.8-27B-NPU2" in npu_docs)
 pack = cw.flm_repo({"id": "FastFlowLM/Qwen3.8-27B-NPU2",
                     "config": {"architectures": ["Qwen3_5ForConditionalGeneration"]},
                     "siblings": [{"rfilename": "model.q4nx"}]}, archs)
-check("a qwen35 NPU pack is the recorded NPU gap, not a mapping",
-      pack["mapped"] and cw.npu_gap(pack) and cw.unmapped(pack) and not pack["npu"])
+check("a qwen35 NPU pack is served, not the recorded gap",
+      pack["mapped"] and pack["npu"] and pack["npu_model_type"] == "qwen3_5"
+      and not cw.npu_gap(pack) and not cw.unmapped(pack))
 
 shutil.rmtree(STATE_DIR, ignore_errors=True)
 # 16. Gated repos (engine#619): the request carries a token when one is in the environment, and

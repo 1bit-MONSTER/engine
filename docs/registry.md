@@ -34,7 +34,7 @@ hand:
 |---|---|
 | HF -> GGUF | a `@ModelBase.register(...)` class in our HRX fork's llama.cpp converter names it |
 | `hrx` | the GGUF architecture is in our HRX fork's `src/llama-arch.cpp`; the same llama-server runs it on the CPU (`--device cpu`), so `hrx` also means the CPU route |
-| `npu` | the NPU engine's model type: `qwen3` (its kernels are built for Qwen3-0.6B's shapes) |
+| `npu` | an NPU engine model type: the Q4NX directory route (`qwen3`, and `qwen3_5` for the dense Qwen3.8-27B-NPU2 family) and the GGUF-on-NPU route's types. `tools/registry_build.py`'s `NPU_ARCHS` is where the list comes from; a family is claimed only once it has a measured run |
 
 The `vulkan` column (the upstream llama.cpp release the engine built for Vulkan) left with that
 build in RFC #213 stage 3. With it went the HF class names only the upstream

@@ -52,6 +52,9 @@ Adding a row is adding a file. Then:
 ```sh
 tools/npu_leaderboard.py          # rewrite docs/npu-leaderboard.md
 tools/npu_leaderboard.py --check  # validate only
+tools/npu_leaderboard.py --out F  # write the page to F instead (what tests/npu_leaderboard_test.py does to compare)
 ```
 
-Do not edit `docs/npu-leaderboard.md` by hand; it says so at the top.
+Do not edit `docs/npu-leaderboard.md` by hand; it says so at the top. `ctest -R npu_leaderboard` fails when the page
+and the records disagree, so a record added, corrected or deleted without regenerating the page is caught in CI rather
+than by a reader who trusted the table.

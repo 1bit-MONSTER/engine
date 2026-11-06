@@ -1,0 +1,25 @@
+{
+  "id": "bonsai2-27b-pb16i-20261102",
+  "host": "strixhalo",
+  "model": "Bonsai-2-27B",
+  "route": "npu",
+  "quant": "pb16i (int4 codes + int16 magnitudes, 4.5 bpw)",
+  "metric": {
+    "name": "decode",
+    "value": 410.0,
+    "unit": "ms/token"
+  },
+  "settings": {
+    "device": "accel0",
+    "port": 18099,
+    "container": "~/models/npu/bonsai2-27b-pb16i (q4nx_weight_layout=pb16i, version 4, M=16)",
+    "binary": "~/wt/bonsai-speed-build2/1bit (2026-11-02, engine 916e90d + the Hadamard SIMD host path)",
+    "stream_per_token_gb": 12.93,
+    "tokens": 7
+  },
+  "instrument": "NPU_PHASE_PROF=1, the serve's own [ph] tok wall= line, median of the 7 steady-state tokens (first token dropped); request walls are not this number, they pay the per-serve image fill once",
+  "repeats": 7,
+  "timestamp": "2026-11-02T23:50:00Z",
+  "source": "~/briefs/TBONSAI-SPEED-STATE.md, 2026-11-02 20:05 AST entry: three npu-hold tickets (19:47, 19:48, 19:49 AST) on :18099, amdxdna counter 0 in each, spread 409-412 ms/token",
+  "notes": "control arm of the P3 (#802) pair: the same container file, the same binary and the same box one minute from bonsai2-27b-t2s2-20261102.json, so the ratio is a weight-format difference and nothing else. This is the 4.5 bpw path the 2-bit stream replaced; it is not a candidate, it is the denominator. What would make this wrong: measuring it in a different window than the t2s arm (the pair is only valid adjacent)."
+}

@@ -30,7 +30,7 @@ their status is at the top.
 
 | # | target | state |
 |---|---|---|
-| 1 | hybrid KV handoff without the file | **shipped**, opt-in: `ONEBIT_KV_SHARE=1` ([docs/hybrid.md](hybrid.md), "The shared route"). 0 bytes copied, 0.05-0.26 ms, flat in prompt length |
+| 1 | hybrid KV handoff without the file | **shipped**, opt-in: `ONEBIT_KV_SHARE=1` ([docs/hybrid.md](hybrid.md), "The shared route"). 0 bytes copied; the cost is cell metadata, **0.12 ms at 307 cells to 5.56 ms at 16 399** |
 | 2 | NPU runtime: activations live in BOs | **not done**. Measured price is ~4 % of a token on the 27B NPU path, and the two things that decide it are the M=128 pad and the XDNA cache model — both NPU-runtime work, not a transport fix |
 | 3 | ONNX EP IO binding onto BO memory | **not done**. Priced, not measured per-call here; ORT IO binding exists and is unused |
 | 4 | this audit | **this page** |
@@ -48,13 +48,25 @@ adds is the price.
 |---|---|---|
 | state file, 27B hybrid (Qwen3.5): 307 / 4 096 / 16 384 prompt tokens | **28.82 / 61.82 / 198.53 ms** | prompt KV (65 536 B/token) **plus** ~151 MB of GDN recurrent state on every handoff |
 | state file, 30B-A3B (full attention): 307 / 4 096 / 16 384 | **8.22 / 68.29 / 242.86 ms** | prompt KV only (98 304 B/token), no constant term |
-| shared region, same shapes | **0.048-0.258 ms, 0 bytes** | nothing — flat in prompt length |
+| shared region, 4B, 307 / 4 105 / 16 399 prompt tokens | **0.12 / 1.99 / 5.56 ms**, `n_read` 0 | the number of **cells**, not bytes: ~0.34 us per cell |
 
-The shared figure is 256 cells in 0.048 ms, 768 in 0.107 ms, 2 048 in 0.25 ms: cells bookkeeping, not bytes.
-Measured with a CPU prefill provider standing in for the NPU one, greedy text identical to `--device hrx` on
-every arm — the gate for this target is text identity, not a tolerance. Two properties that make it usable
-rather than a demo: a decoder that refuses to export now falls back to the state-file route for that request
-(engine#1203) instead of losing the handoff, and a decoder that *cannot* export (any backend but `ggml-hrx`:
+Measured in the shape that ships (2026-11-06, build at pin `d70b67bf0`): a *separate* provider process, the
+region exported over `SCM_RIGHTS`, an **AddressSanitizer-instrumented** provider mapping it and prefilling into
+it, the decoder adopting the cells. **0.122 / 1.988 / 5.558 ms** to adopt 307 / 4 105 / 16 399 cells, with
+`n_read` **0** and `prompt_n` **1** on every arm — the decoder decoded from the adopted cells instead of
+re-processing the prompt — and **0 ASan reports** in the provider. So the handoff is cells bookkeeping and it
+does grow with the prompt, just not with prompt *bytes*: 0.12 ms at 307 cells, 5.6 ms at 16 399. The shared
+figures are on a 4B because that is the model the ASan harness drives (a 30B under the sanitizer prefills for
+hours); the property being measured — cells, not bytes — does not depend on the model, and the file column
+beside it is the 8.2-242.9 ms that same handoff costs at those prompt lengths on 30B-A3B.
+
+The provider's own side of that handoff is **40.6 / 78.7 / 150.4 ms** to map and first-touch 648 MiB / 1.1 GiB
+/ 2.8 GiB of region — a page fault per page it writes, not a copy, and inflated by the sanitizer; an
+in-process run of the same adoption step measured 0.048-0.258 ms at 256-2 048 cells. The gate for this target
+is text identity, not a tolerance: greedy text identical to `--device hrx` on every arm.
+
+Two properties that make it usable rather than a demo: a decoder that refuses to export now falls back to the
+state-file route for that request (engine#1203) instead of losing the handoff, and a decoder that *cannot* export (any backend but `ggml-hrx`:
 the CPU, for instance) starts normally and warns once instead of dying at load (fork#212). `ONEBIT_KV_SHARE`
 is read as "set and non-empty" on both sides: `=0` still enables the route, an unset variable is the opt-out.
 
@@ -152,7 +164,9 @@ paths needs that direction today.
 
 ## How to re-measure
 
-- Handoff: `ONEBIT_KV_SHARE=1 ONEBIT_PREFILL_DEVICE=<dev> 1bit serve` logs one line per handoff —
+- Handoff: the cross-process harness is `t1_handoff_lengths.sh` + `t1_asan_import.py` in the zero-copy probe set (it
+  exports, shares over `SCM_RIGHTS`, runs an ASan provider and adopts). `ONEBIT_KV_SHARE=1 ONEBIT_PREFILL_DEVICE=<dev>
+  1bit serve` logs one line per handoff in the engine's own route —
   `shared KV handoff: N cells, X ms, 0 bytes copied`. The file route's price is `POST /slots/<id>?action=save`
   then `?action=restore`, timed; the sizes in the table above come from fitting the state file's size against
   prompt length.

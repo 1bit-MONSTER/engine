@@ -19,10 +19,16 @@ usage: tools/check_q4nx_dir.py <model dir | model.q4nx> [--json out.json]
        tools/check_q4nx_dir.py --self-test
 
 Reads the container exactly as npu/model.cpp does (8-byte header length, JSON tensor table,
-then the data) and, for every tensor, says which of the three chunk kinds its shape names
-(npu/q4nx.h: q4_1 5120 B, Q4_K 4736 B, Q8 8704 B) and whether the declared bytes are the
-tiles that kind needs. Unknown chunk sizes and short tensors are errors (exit 1): a file this
-tool cannot account for is a file the engine's decoders must not be pointed at.
+then the data) and, for every tensor, says which of the five chunk kinds its shape names
+(npu/q4nx.h: q4_1 5120 B, q4_1f 6144 B, Q4_K 4736 B, Q8 8704 B, t2 2176 B) and whether the
+declared bytes are the tiles that kind needs. Unknown chunk sizes and short tensors are errors
+(exit 1): a file this tool cannot account for is a file the engine's decoders must not be
+pointed at.
+
+q4_1f is the form `1bit npu-pack import` writes for an OGA pack (engine#1185): the same 32x256
+tile with fp32 scale/zero, so the pack's own parameters survive bit for bit. The device kernels
+stream 5,120-byte q4_1, so the forward converts such a directory at load
+(npu/q4nx_device.cpp, into the Q4NX cache); the directory itself is valid as written.
 
 This is the check a published FastFlowLM `*-NPU2` directory goes through before the engine is
 asked to serve it (docs/npu.md, "Q4NX chunks"). It is metadata only: nothing is dequantized,
@@ -52,8 +58,9 @@ import struct
 import sys
 import tempfile
 
-# npu/q4nx.h: Chunk::Q4_1 = 5120, Q4_K = 4736, Q8 = 8704
-CHUNKS = {5120: "q4_1", 4736: "Q4_K", 8704: "Q8"}
+# npu/q4nx.h: Chunk::Q4_1 = 5120, Q4_1F = 6144 (the imported-container form, engine#1185),
+# Q4_K = 4736, Q8 = 8704. t2 (2176) has its own contract test and is not a tensor dtype here.
+CHUNKS = {5120: "q4_1", 6144: "q4_1f", 4736: "Q4_K", 8704: "Q8"}
 ITEMSIZE = {"BF16": 2, "F16": 2, "F32": 4, "I8": 1}
 # The quantized tensors the engine decodes: int8 codes in 32x256 tiles (npu/q4nx.h).
 QUANT = ("I8",)
@@ -252,9 +259,14 @@ def check(path, verbose=True):
     if verbose:
         print(f"{path}: {sum(kinds.values())} quantized tensor(s) in {len(table)} table entries, "
               f"{chunk_bytes} chunk bytes, {size} B file")
-        for k in ("q4_1", "Q4_K", "Q8"):
+        for k in ("q4_1", "q4_1f", "Q4_K", "Q8"):
             if k in kinds:
                 print(f"  {k:5s} {CHUNKS_REV[k]:5d} B  {kinds[k]:4d} tensor(s)")
+        if "q4_1f" in kinds:
+            # The alternative is refusing an imported directory, which is a valid container: the
+            # engine converts it for the device at load (npu/q4nx_device.cpp, engine#1185).
+            print(f"  q4_1f: {kinds['q4_1f']} tensor(s) with fp32 scale/zero (an imported OGA "
+                  f"container); the engine repacks them to the device's 5,120-byte q4_1 at load")
         if q8:
             # Our own converter can say which of the two 8704-B Q8 layouts it wrote: it packs
             # code (row, column) at column*32 + row, the one npu/q4nx.cpp decodes, and records
@@ -372,21 +384,24 @@ def self_test():
             ("proj.weight", [2, 4736], "I8", 0x11),       # 2 Q4_K tiles
             ("lm_head.weight", [3, 8704], "I8", 0x22),    # 3 Q8 chunks
             ("mlp.down_proj.weight", [1, 2, 5120], "I8", 0x33),  # 2 q4_1 tiles
+            ("attn.q_proj.weight", [1, 6144], "I8", 0x66),       # an imported q4_1f tile
             ("norm.weight", [5120], "BF16", 0x44),
             ("ssm_a", [48], "F32", 0x55),
         ])
         errors, summary = check(os.path.join(good, "model.q4nx"), verbose=False)
         if errors:
             bad.append(f"good container reported {errors}")
-        if summary["tensors"] != 3 or summary["q8"] != 1:
+        if summary["tensors"] != 4 or summary["q8"] != 1:
             bad.append(f"good container counted {summary}")
-        if sorted(summary["kinds"]) != ["Q4_K", "Q8", "q4_1"]:
+        if sorted(summary["kinds"]) != ["Q4_K", "Q8", "q4_1", "q4_1f"]:
             bad.append(f"good container kinds {summary['kinds']}")
+        if summary["kinds"].get("q4_1f") != 1:
+            bad.append(f"the imported fp32 chunk was not counted: {summary['kinds']}")
 
         # an int8 tensor whose last dimension names no chunk kind: the engine cannot decode it
         unknown = os.path.join(tmp, "unknown")
         os.mkdir(unknown)
-        write_q4nx(os.path.join(unknown, "model.q4nx"), [("proj.weight", [4, 6144], "I8", 0x66)])
+        write_q4nx(os.path.join(unknown, "model.q4nx"), [("proj.weight", [4, 8192], "I8", 0x66)])
         errors, _ = check(os.path.join(unknown, "model.q4nx"), verbose=False)
         if not any("names no chunk kind" in e for e in errors):
             bad.append(f"unknown chunk size not refused: {errors}")
@@ -482,10 +497,10 @@ def self_test():
         for b in bad:
             print("  " + b)
         return 1
-    print("self-test passed: 3 chunk kinds counted, unknown chunk size refused, short tensor refused, "
-          "directory scans every .q4nx, a Q8 tile written in A's order decodes as A and not as B, "
-          "a no-Q8 container claims no code order, and a 512-padded grid is named as padded while "
-          "the model's own grid is quiet")
+    print("self-test passed: 4 chunk kinds counted (q4_1, q4_1f, Q4_K, Q8), unknown chunk size "
+          "refused, short tensor refused, directory scans every .q4nx, a Q8 tile written in A's order "
+          "decodes as A and not as B, a no-Q8 container claims no code order, and a 512-padded grid "
+          "is named as padded while the model's own grid is quiet")
     return 0
 
 

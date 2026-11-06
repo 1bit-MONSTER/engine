@@ -155,6 +155,8 @@ that names both causes (the flag was not set, *or* the KV backend cannot export)
 state-file route above. A decoder pinned before #212 has none of that, so a hybrid deployment running the flag
 needs this pin or later on both sides.
 
+What that route is worth, next to the file route it replaces, is measured in [docs/zero-copy.md](zero-copy.md).
+
 ## Tests
 
 - `tests/hybrid_kvshare_route.sh` (CTest `hybrid_kvshare_route`, no model, no dma-buf): the same fake

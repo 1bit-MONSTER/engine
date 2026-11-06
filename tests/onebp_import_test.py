@@ -13,16 +13,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`tools/onebp_import.py` on a synthetic package: the four behaviours a real 1BP file cannot show cheaply.
+"""`tools/onebp_import.py` on a synthetic package: the five behaviours a real 1BP file cannot show cheaply.
 
-1. a v1 package's index claims the header's Q4NX quant for EVERY entry, while its norms and biases are
+1. the package's tile is in the .1bp intra-tile layout (planes row-major, codes adjacent-pair) and the
+   container must hold it permuted into THIS engine's layout -- decoded here with the engine's own
+   reader (`tools/q4nx_diff.decode_ours`).  A verbatim copy decodes as noise: measured on
+   ZR1-1.5B-1BP, correlation 0.003 with the model; after the permutation, 0.995-0.997.
+2. a v1 package's index claims the header's Q4NX quant for EVERY entry, while its norms and biases are
    raw f32 -- the importer has to classify by rank and size, and `--verify` has to use that same
    classification.  (Verify read the raw index quant when this test was written and reported 141 of 337
    "differing" tensors on the ZR1-1.5B container it had just written itself.)
-2. the check is not vacuous: one flipped byte in a tile tensor is found and named.
-3. a name with no Q4NX mapping (Zaya1's `cca_conv_grp`) is refused by name and no container is written,
+3. the check is not vacuous: one flipped byte in a tile tensor is found and named.
+4. a name with no Q4NX mapping (Zaya1's `cca_conv_grp`) is refused by name and no container is written,
    which is the whole reason the packer for those models is blocked.
-4. a package whose quant is not Q4NX tiles is refused instead of decoded as noise.
+5. a package whose quant is not Q4NX tiles is refused instead of decoded as noise.
 
 usage: tests/onebp_import_test.py     (needs numpy; no gguf, no model, no device)
 """
@@ -69,6 +73,32 @@ def header(version=1, quant=Q4NX, tensor_count=0, **over):
     return struct.pack(HEADER_FMT, *vals) + b"\0" * (256 - struct.calcsize(HEADER_FMT))
 
 
+def onebp_tile(w):
+    """Encode a (32, 256) weight as a .1bp Q4NX tile: planes row-major [r*8+g], codes adjacent-pair
+    (even column = low nibble).  This is the layout a real package holds -- NOT this engine's."""
+    rows, cols = w.shape
+    g = w.reshape(rows, 8, 32)
+    mn, mx = g.min(axis=-1), g.max(axis=-1)
+    sc = np.where(mx == mn, 1.0, (mx - mn) / 15.0)
+    q = np.clip(np.rint((g - mn[..., None]) / sc[..., None]), 0, 15).astype(np.uint8).reshape(rows, cols)
+    planes = np.concatenate([bf16_bits(sc).reshape(-1), bf16_bits(mn + 8.0 * sc * 0).reshape(-1)])
+    codes = (q[:, 0::2] | (q[:, 1::2] << 4)).astype(np.uint8)          # [rows, cols/2]
+    return planes.tobytes() + codes.tobytes()
+
+
+def decode_engine_tile(tile_bytes, rows=32, cols=256):
+    """Decode a tile the way this ENGINE does (tools/q4nx_diff.decode_ours), to prove the import put it
+    in the engine's layout.  Imported here, not re-implemented: the engine's own reader is the judge."""
+    sys.path.insert(0, os.path.join(HERE, os.pardir, "tools"))
+    import q4nx_diff
+    return q4nx_diff.decode_ours(np.frombuffer(tile_bytes, dtype=np.uint8), rows, cols)
+
+
+def bf16_bits(x):
+    u = np.asarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+
+
 def write_package(path, tensors, quant=Q4NX):
     """tensors: [(name, ndim, dims, bytes)] -> a v1 package (no per-entry quant)."""
     h = header(1, quant, tensor_count=len(tensors))
@@ -102,9 +132,10 @@ def snapshot(dir_path):
 
 def main():
     rng = np.random.default_rng(5)
-    tile_q = rng.integers(0, 256, size=5120, dtype=np.uint8).tobytes()
-    tile_o = rng.integers(0, 256, size=5120, dtype=np.uint8).tobytes()
-    tile_e = rng.integers(0, 256, size=5120, dtype=np.uint8).tobytes()
+    w_q = rng.standard_normal((32, 256)) * 0.05           # the weight the tile must come back as
+    w_o = rng.standard_normal((32, 256)) * 0.05
+    w_e = rng.standard_normal((32, 256)) * 0.05
+    tile_q, tile_o, tile_e = (onebp_tile(w) for w in (w_q, w_o, w_e))
     norm = np.linspace(-1.0, 1.0, 256, dtype=np.float32).tobytes()      # 1-D f32: NOT tiles
     good = [("token_embd.weight", 2, (32, 256), tile_e),
             ("output.weight", 2, (32, 256), tile_o),
@@ -124,9 +155,21 @@ def main():
             n = struct.unpack("<Q", f.read(8))[0]
             table = json.loads(f.read(n))
         check(table["model.layers.0.self_attn.q_proj.weight"]["dtype"] == "I8",
-              "the tile tensor stays I8 (verbatim q4_1 tiles)")
+              "the tile tensor stays I8 tiles (permuted, not re-quantized)")
         check(table["model.layers.0.input_layernorm.weight"]["dtype"] == "BF16",
               "the f32 norm becomes bf16, and is NOT read as tiles")
+
+        # the import must have PERMUTED the tile into this engine's layout: decode it with the engine's
+        # own reader and compare against the weight the package encoded.  A verbatim copy (the first
+        # version of this tool) decodes as noise: measured on ZR1-1.5B-1BP, correlation 0.003.
+        lo = table["model.layers.0.self_attn.q_proj.weight"]["data_offsets"][0]
+        with open(os.path.join(out, "model.q4nx"), "rb") as f:
+            f.seek(8 + n + lo)
+            got = decode_engine_tile(f.read(5120))
+        # the tile round-trips the quantized weight, not w_q itself (q4_1 is lossy by construction)
+        err = np.abs(got - w_q).max()
+        check(err < 0.02, "the container's tile decodes to the package's weight through the engine's reader",
+              "max|err| %.3e" % err)
 
         rc, log = run([pkg, out, "--verify"])
         check(rc == 0 and "all identical" in log,

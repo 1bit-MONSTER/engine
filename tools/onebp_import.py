@@ -18,12 +18,17 @@
 usage: tools/onebp_import.py <model.1bp> <out dir> --config <snapshot dir> [--embedding-from <gguf>]
        tools/onebp_import.py --verify <model.1bp> <out dir>
 
-A 1BP package is one file: a 256-byte header, a tensor index, then the weights.  Its 4-bit payload is
-**already this engine's tile layout** -- 32 x 256 tiles of 5120 B, `bf16 scale[8*32+r] @0`,
-`bf16 zero[8*32+r] @512`, 4-bit codes @1024 (`npu/q4nx.h`) -- so the import copies tile bytes and
-neither dequantizes nor re-quantizes them; `--verify` proves it by comparing every byte the container
-holds against the package's own slice.  F16/F32 tensors (embeddings, norms, biases) become bf16, which
-is the container's storage for everything the host reads.
+A 1BP package is one file: a 256-byte header, a tensor index, then the weights.  Its 4-bit payload is a
+32 x 256 tile of 5120 B with the same *value* convention as this engine's (`scale*q + min`, unsigned q),
+but **not** the same intra-tile layout: `.1bp` stores the scales/mins row-major (`[r*8+g]`) and the codes
+adjacent-pair (even column in the low nibble), while `npu/q4nx.h` stores the planes group-major
+(`[g*32+r]`) and the codes lane-swizzled.  So the import permutes each tile's bytes (`tile_to_q4nx()`,
+the inverse of the archived converter's own `q4nx_tile_to_onebp()`) and neither dequantizes nor
+re-quantizes them; `--verify` proves it by comparing every byte the container holds against the same
+permutation of the package's slice.  This is not cosmetic: reading a `.1bp` tile as if it were already
+this engine's tile decodes the model as noise that still looks like weights, which is exactly the
+failure engine#1110 is about.  F16/F32 tensors (embeddings, norms, biases) become bf16, which is the
+container's storage for everything the host reads.
 
 Two things the format does not give you, both refused by name rather than papered over:
 
@@ -183,6 +188,19 @@ def copy_stream(src, dst, n):
         n -= len(b)
 
 
+def copy_tiles(src, dst, nbytes):
+    """Copy q4_1 tiles, permuting each into this engine's intra-tile layout (no requantization)."""
+    chunk = 256 * TILE
+    left = nbytes
+    while left:
+        k = min(left, chunk)
+        raw = src.read(k)
+        if len(raw) < k:
+            raise SystemExit("short read: the package is truncated")
+        dst.write(tile_to_q4nx(raw).tobytes())
+        left -= k
+
+
 def bf16_stream(src, dst, quant, elems):
     """F16/F32 -> bf16, chunked, nearest-even."""
     step = 1 << 23
@@ -196,6 +214,34 @@ def bf16_stream(src, dst, quant, elems):
         v = np.frombuffer(raw, dtype=np.float16 if quant == F16 else np.float32).astype(np.float32)
         dst.write(bf16_bits(v).tobytes())
         done += k
+
+
+def tile_to_q4nx(src):
+    """A .1bp Q4NX tile -> this engine's Q4NX tile. A byte permutation, so nothing is requantized.
+
+    The two layouts are both 32x256 4-bit asymmetric tiles with the same value convention
+    (`scale*q + min`, unsigned q), and differ in exactly two places -- the archived converter says so
+    itself (`src/gguf_to_onebp.cpp`, `q4nx_tile_to_onebp()`, which this function inverts):
+
+      .1bp : scales/mins row-major [r*8+g]; codes adjacent-pair, even column = low nibble
+      q4nx : scales/mins group-major [g*32+r]; codes lane-swizzled,
+             byte = lane*2048 + col*8 + (r%16)/2, nibble = (r%16)%2, lane = r/16
+
+    Reading a .1bp tile with the engine's decoder is therefore not a near miss: measured on
+    ZR1-1.5B-1BP, the decoded weights correlate 0.003 with the model and the container is fluent
+    noise. After this permutation the same file correlates 0.995-0.997 (the Q4_K_M -> q4_1 requant
+    error, rms ~3e-3).
+    """
+    s = np.frombuffer(src, dtype=np.uint8).reshape(-1, TILE)
+    n = s.shape[0]
+    planes = s[:, :1024].copy().view(np.uint16).reshape(n, 2, ROWS, 8)   # [scale|zero][r][g]
+    q4 = planes.transpose(0, 1, 3, 2).reshape(n, 512).view(np.uint8)     # [g][r] per plane
+    raw = s[:, 1024:].reshape(n, ROWS, COLS // 2)                        # even column = low nibble
+    col = np.arange(COLS)[None, :]
+    q = ((raw[:, :, col // 2] >> np.where(col % 2 == 0, 0, 4)) & 0x0F).astype(np.uint8)
+    pair = q[:, 0::2, :] | (q[:, 1::2, :] << 4)                          # rows 2j, 2j+1
+    lanes = pair.reshape(n, 2, ROWS // 4, COLS).transpose(0, 1, 3, 2)    # [n][lane][col][byte_idx]
+    return np.concatenate([q4, lanes.reshape(n, TILE - 1024)], axis=1).reshape(-1)
 
 
 def from_embedding_gguf(path, wanted):
@@ -337,7 +383,7 @@ def main(argv=None):
                     f.seek(base + lo)
                     src.seek(data_start + src_off)
                     if conv is None:
-                        copy_stream(src, f, nbytes)
+                        copy_tiles(src, f, nbytes)
                     else:
                         bf16_stream(src, f, conv[0], conv[1])
                     if f.tell() != base + hi:
@@ -386,11 +432,11 @@ def verify(args, h, plan, extra, table, header, data_start):
             lo, _hi = disk[cname]["data_offsets"]
             cf.seek(base + lo)
             sf.seek(data_start + src_off)
-            if conv is None:                       # q4_1 tiles: copied verbatim, compare them verbatim
+            if conv is None:                       # q4_1 tiles: permuted, so compare in the permuted form
                 left, same = nbytes, True
                 while left:
-                    k = min(left, 1 << 24)
-                    if cf.read(k) != sf.read(k):
+                    k = min(left, 256 * TILE)
+                    if cf.read(k) != tile_to_q4nx(sf.read(k)).tobytes():
                         same = False
                         break
                     left -= k

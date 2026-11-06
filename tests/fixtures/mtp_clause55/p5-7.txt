@@ -1,0 +1,28 @@
+== ticket 'clause55 p5-7' 20261105-120713  hold=16min  argv: --live --match --prompts 3 --prompt-base 5 --tokens 64 --k 4 --tau 0
+[   49s] forward ready: vocab 248320, max_batch_rows 16, hidden source post-final-norm
+[  110s] prompt 5: TEXT IDENTICAL, 64 tokens, accepted 48/60, passes/token 0.484, stream 72 rows, 0 mismatch
+[  114s]   match p5: 15 offline chains at this loop's own positions (stream 72 rows)
+[  114s]     depth 1: live  86.67 % (13/15, reached)  offline conditional  86.67 % (13/15)  delta  +0.00 pp   [live joint  86.67 %, offline marginal  86.67 %]
+[  114s]     depth 2: live  92.31 % (12/13, reached)  offline conditional  92.31 % (12/13)  delta  +0.00 pp   [live joint  80.00 %, offline marginal  80.00 %]
+[  114s]     depth 3: live 100.00 % (12/12, reached)  offline conditional 100.00 % (12/12)  delta  +0.00 pp   [live joint  80.00 %, offline marginal  80.00 %]
+[  114s]     depth 4: live  91.67 % (11/12, reached)  offline conditional  91.67 % (11/12)  delta  +0.00 pp   [live joint  73.33 %, offline marginal  80.00 %]
+[  114s]     first verdict difference on the same token: stream position 9, depth 4: live reject, offline accept
+[  165s] prompt 6: TEXT IDENTICAL, 64 tokens, accepted 50/60, passes/token 0.469, stream 72 rows, 0 mismatch
+[  169s]   match p6: 15 offline chains at this loop's own positions (stream 72 rows)
+[  169s]     depth 1: live  93.33 % (14/15, reached)  offline conditional  93.33 % (14/15)  delta  +0.00 pp   [live joint  93.33 %, offline marginal  93.33 %]
+[  169s]     depth 2: live  85.71 % (12/14, reached)  offline conditional  85.71 % (12/14)  delta  +0.00 pp   [live joint  80.00 %, offline marginal  80.00 %]
+[  169s]     depth 3: live 100.00 % (12/12, reached)  offline conditional 100.00 % (12/12)  delta  +0.00 pp   [live joint  80.00 %, offline marginal  80.00 %]
+[  169s]     depth 4: live 100.00 % (12/12, reached)  offline conditional 100.00 % (11/11)  delta  +0.00 pp   [live joint  80.00 %, offline marginal  78.57 %]
+[  231s] prompt 7: TEXT IDENTICAL, 64 tokens, accepted 41/104, passes/token 0.812, stream 72 rows, 0 mismatch
+[  237s]   match p7: 26 offline chains at this loop's own positions (stream 72 rows)
+[  237s]     depth 1: live  73.08 % (19/26, reached)  offline conditional  73.08 % (19/26)  delta  +0.00 pp   [live joint  73.08 %, offline marginal  73.08 %]
+[  237s]     depth 2: live  57.89 % (11/19, reached)  offline conditional  55.56 % (10/18)  delta  +2.34 pp  > 2 pp   [live joint  42.31 %, offline marginal  44.00 %]
+[  237s]     depth 3: live  54.55 % (6/11, reached)  offline conditional  50.00 % (5/10)  delta  +4.55 pp  > 2 pp   [live joint  23.08 %, offline marginal  28.00 %]
+[  237s]     depth 4: live  83.33 % (5/6, reached)  offline conditional  80.00 % (4/5)  delta  +3.33 pp  > 2 pp   [live joint  19.23 %, offline marginal  20.00 %]
+[  237s]     first verdict difference on the same token: stream position 11, depth 2: live reject, offline accept
+[  237s]    == live vs offline at the SAME positions, per-depth acceptance CONDITIONAL on reaching the depth (the 2 pp bar):
+[  237s]      depth 1: live  82.14 % (46/56)  offline  82.14 % (46/56)  delta  +0.00 pp  PASS
+[  237s]      depth 2: live  76.09 % (35/46)  offline  75.56 % (34/45)  delta  +0.53 pp  PASS
+[  237s]      depth 3: live  85.71 % (30/35)  offline  85.29 % (29/34)  delta  +0.42 pp  PASS
+[  237s]      depth 4: live  93.33 % (28/30)  offline  92.86 % (26/28)  delta  +0.48 pp  PASS
+== ticket 'clause55 p5-7' exited 0; log: /home/bcloud/wt/mtp-window/ticket-clause55-p5-7-20261105-120713.log

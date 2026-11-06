@@ -264,6 +264,12 @@ if [ -n "${PAYLOAD:-}" ]; then
     # were made layout-aware there rather than forked here, so one tool answers for both images.
     ln -sfn /opt/1bit-package/bin/lemonade "$skeleton/usr/local/bin/lemonade"
     install -D -m 755 /repo/os/mini/release-check.sh "$skeleton/usr/local/bin/1bit-release-check"
+    # The one-command proof that the engine answers from THIS boot (os/mini ships it as 1bit-selftest and the
+    # install sheet asks for it; the Puppy image never installed it, so pi-release's install gate has been
+    # reporting `NOT SHIPPED` since the appliance took over from os/mini at c15). selftest.sh is the SAME file
+    # both images ship, like release-check.sh above: its /data paths and its engine-log path are layout-aware
+    # rather than forked here.
+    install -D -m 755 /repo/os/mini/selftest.sh "$skeleton/usr/local/bin/1bit-selftest"
     install -D -m 755 /recipe/1bit-install.sh "$skeleton/usr/local/bin/1bit-install"
     # the board service the `fans` row of release-check reads (os/mini has shipped it all along), and the guarded
     # console installer the "Install 1bit OS to a disk" entry runs
@@ -632,6 +638,7 @@ if [ -n "${PAYLOAD:-}" ]; then
              etc/init.d/20onboard-ssh etc/init.d/21serial-console etc/init.d/zz-onboard-ports \
              opt/1bit-llama opt/1bit-package/1bit/hrx/llama/bin/llama-server \
              usr/local/bin/lemonade usr/local/bin/1bit-release-check usr/local/bin/1bit-install \
+             usr/local/bin/1bit-selftest \
              usr/local/bin/1bit-tty1 usr/local/bin/1bit-console usr/local/bin/1bit-console-install \
              usr/local/bin/1bit-console-menu \
              usr/sbin/1bit-board etc/init.d/26onboard-board \
@@ -650,7 +657,7 @@ if [ -n "${PAYLOAD:-}" ]; then
         in_image opt/rocm-therock/lib/librocm_sysdeps_elf.so.1 || miss="$miss the HRX libhsa sysdeps"; \
         in_image opt/1bit/libhsa || miss="$miss /opt/1bit/libhsa"; }
     [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss" >&2; exit 1; }
-    echo "   ok: engine, launcher, service, /usr/local/bin/{1bit,lemonade}, 1bit-release-check, 1bit-install"
+    echo "   ok: engine, launcher, service, /usr/local/bin/{1bit,lemonade}, 1bit-release-check, 1bit-install, 1bit-selftest"
     echo "      onebit-models: $(grep -c ^hrx "$skeleton/etc/1bit/onebit-models.txt") HRX + $(grep -c ^npu "$skeleton/etc/1bit/onebit-models.txt") NPU entries from the payload catalogue"
 fi
 echo "== output"

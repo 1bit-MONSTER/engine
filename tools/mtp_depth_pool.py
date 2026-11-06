@@ -77,11 +77,16 @@ IDENTITY = re.compile(r"forward ready:\s+vocab (\d+),\s+max_batch_rows (\d+),\s+
 RUNLEVEL = re.compile(r"depth (\d+):\s+live\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+"
                       r"offline\s+-?[\d.]+ %\s+\((\d+)/(\d+)\)\s+delta")
 PROMPT = re.compile(r"(?:per-depth p|prompt )(\d+)\b")
-# The live per-prompt header carries the generation budget, and it is the only shape that carries it correctly:
+# The live per-prompt header carries the generation budget and the run's own accepted/offered draft counts, and it
+# is the only shape that carries them correctly:
 #     prompt 0: TEXT IDENTICAL, 64 tokens, accepted 44/80, passes/token 0.625, stream 72 rows, 0 mismatch
 # (the offline header's "N tokens" at the same position is the stream length, not the budget, so it is not read
-# here.)  The brief's window is 8 prompts x 64 tokens, so a pool mixing budgets is not one window.
-PROMPT_TOKENS = re.compile(r"prompt (\d+):\s+(?:TEXT IDENTICAL|TEXT DIVERGED),\s+(\d+) tokens,")
+# here.)  The brief's window is 8 prompts x 64 tokens, so a pool mixing budgets is not one window; and `accepted
+# A/D` is the ONLY source of drafts offered -- the per-depth rows carry the conditional `reached` denominator,
+# which is smaller than the drafts offered because a chain that rejects draft 0 offered a draft at every depth
+# and reached only depth 1.  See economics().
+PROMPT_TOKENS = re.compile(r"prompt (\d+):\s+(?:TEXT IDENTICAL|TEXT DIVERGED),\s+(\d+) tokens,\s+"
+                           r"accepted (\d+)/(\d+),")
 
 # The numbers this tool must reproduce when it is pointed at the recorded window (TMTPLOOP-STATE.md,
 # 2026-11-05): live (num, den) and offline (num, den) per depth, over 8 prompts x 64 tokens.
@@ -94,7 +99,7 @@ def parse_ticket(path):
     Raises SystemExit on a log it must not pool: a depth row before any prompt header (nothing to key it to),
     a cell scored twice with different counts, or per-prompt rows that do not add up to the ticket's own
     run-level row (a short read)."""
-    cells, runlevel, prompt, not_scored, budget = {}, {}, None, set(), {}
+    cells, runlevel, prompt, not_scored, budget, offered = {}, {}, None, set(), {}, {}
     old_shape, summary, width, ident = 0, False, {}, None
     for ln in open(path, errors="replace").read().splitlines():
         if "== ticket exited" in ln:  # trap 1: everything after this is the harness echoing the summary
@@ -112,6 +117,7 @@ def parse_ticket(path):
             t = PROMPT_TOKENS.search(ln)
             if t:
                 budget[prompt] = int(t.group(2))
+                offered[prompt] = (int(t.group(3)), int(t.group(4)))
             continue
         m = DETAIL.search(ln)
         if m:
@@ -155,7 +161,7 @@ def parse_ticket(path):
     if runlevel and len(runlevel) != len({d for _, d in cells}):
         raise SystemExit(f"mtp_depth_pool: {path}: run-level row covers {sorted(runlevel)} but per-prompt rows "
                          f"cover {sorted({d for _, d in cells})}")
-    return cells, not_scored, budget, width, ident
+    return cells, not_scored, budget, width, ident, offered
 
 
 def pool(paths):
@@ -164,9 +170,15 @@ def pool(paths):
     Returns (cells, unmeasured, sources); `unmeasured` holds the depths some ticket reported as `not scored`
     that no ticket scored a cell for -- kept, so the pool cannot report a pass over a depth it never saw."""
     seen, unmeasured, sources = {}, set(), 0
-    budget, width, idents = {}, {}, {}
+    budget, width, idents, offered = {}, {}, {}, {}
     for p in paths:
-        rows, not_scored, bud, wid, ident = parse_ticket(p)
+        rows, not_scored, bud, wid, ident, off = parse_ticket(p)
+        for pr, pair in off.items():
+            if pr in offered and offered[pr] != pair:
+                raise SystemExit(f"mtp_depth_pool: {p} reports prompt {pr} accepted {pair[0]}/{pair[1]} but an "
+                                 f"earlier ticket reported {offered[pr][0]}/{offered[pr][1]} -- the same prompt "
+                                 f"measured twice with different counts is not one window")
+            offered.setdefault(pr, pair)
         unmeasured |= not_scored
         for pr, wid_k in wid.items():
             width[pr] = max(width.get(pr, 0), wid_k)   # a deeper second run of one prompt wins, as its cells do
@@ -186,7 +198,7 @@ def pool(paths):
                 raise SystemExit(f"mtp_depth_pool: {p} disagrees with an earlier ticket on prompt {k[0]} "
                                  f"depth {k[1]}: {seen[k]} then {v}")
             seen.setdefault(k, v)
-    return seen, unmeasured - {d for _, d in seen}, sources, budget, width, idents
+    return seen, unmeasured - {d for _, d in seen}, sources, budget, width, idents, offered
 
 
 def coverage(prompts):
@@ -289,6 +301,70 @@ def table(seen, sources, unmeasured=(), budget=None, width=None, idents=None):
     return inside, scored, totals
 
 
+def economics(seen, offered):
+    """The leaderboard's quantities, derived here so a record need not be typed from an ad-hoc parser.
+
+    The seven MTP records in bench/npu-leaderboard/ names this tool as their instrument, but the table above is the
+    CONDITIONAL per-depth view and cannot produce the all-chains rates, the hit rate or either tokens-per-pass
+    figure -- those were typed from a side parser, so the record named a tool that could not reproduce its own
+    number.  Definitions are the loop's (npu/mtp/draft.h, Stats):
+
+      chains            the depth-1 denominator: every iteration offers a first draft, so it is the count of chains
+      drafts offered    sum of the per-prompt `accepted A/D` headers (NOT the sum of reached[]: a chain that rejects
+                        draft 0 offered a draft at every depth and reached only depth 1)
+      accepted           sum of accepted_at[]; every accepted draft is counted at its own depth, so this must equal
+                        the header's accepted total -- if the two ever disagree the log was read incompletely
+      all-chains rate   accepted_at[d] / chains (the record's view: every chain is a trial at every depth)
+      hit rate          accepted / offered
+      tokens per pass   1 + accepted / chains (the base's own token plus the accepted drafts), same basis offline
+
+    Returns {} with an `error` key when the window cannot support them; a partial window is reported as missing a
+    prompt rather than silently scored over the prompts it happens to cover."""
+    prompts = sorted({p for p, _ in seen})
+    chains = sum(v[1] for (_, d), v in seen.items() if d == 1)
+    off_chains = sum(v[3] for (_, d), v in seen.items() if d == 1)
+    missing = [p for p in prompts if p not in offered]
+    if missing:
+        return {"error": f"no `accepted N/M` header for prompt(s) {','.join(str(p) for p in missing)} -- drafts "
+                         f"offered is not readable, so the hit rate and tokens/pass cannot be derived"}
+    if not chains or not off_chains:
+        return {"error": "no depth-1 denominator -- the window has no chain count to divide by"}
+    acc = sum(v[0] for (_, _d), v in seen.items())
+    off_acc = sum(v[2] for (_, _d), v in seen.items())
+    head_acc = sum(a for a, _ in offered.values())
+    drafted = sum(d for _, d in offered.values())
+    if acc != head_acc:
+        return {"error": f"per-depth accepted drafts sum to {acc} but the per-prompt headers sum to {head_acc} -- "
+                         f"the log was read incompletely"}
+    return {
+        "chains": chains,
+        "off_chains": off_chains,
+        "offered": drafted,
+        "accepted": acc,
+        "off_accepted": off_acc,
+        "depth_rate": {d: 100.0 * sum(v[0] for (_, dd), v in seen.items() if dd == d) / chains
+                       for d in sorted({d for _, d in seen})},
+        "hit": 100.0 * acc / drafted if drafted else 0.0,
+        "tpp_live": 1.0 + acc / chains,
+        "tpp_offline": 1.0 + off_acc / off_chains,
+    }
+
+
+def print_economics(econ):
+    """The derived block, printed under the table so `--selftest <logs>` carries the leaderboard's numbers too."""
+    if "error" in econ:
+        print(f"\nall-chains view and pass economics: NOT DERIVED -- {econ['error']}")
+        return
+    rates = "  ".join(f"{d}: {econ['depth_rate'][d]:.2f} % "
+                      f"({round(econ['depth_rate'][d] * econ['chains'] / 100.0)}/{econ['chains']})"
+                      for d in sorted(econ["depth_rate"]))
+    print(f"\nall chains ({econ['chains']} iterations, drafts offered {econ['offered']}, "
+          f"accepted {econ['accepted']}): {rates}")
+    print(f"hit rate {econ['hit']:.2f} % ({econ['accepted']}/{econ['offered']}); "
+          f"tokens per pass live {econ['tpp_live']:.2f} (1 + {econ['accepted']}/{econ['chains']}), "
+          f"offline {econ['tpp_offline']:.2f} (1 + {econ['off_accepted']}/{econ['off_chains']})")
+
+
 def refusal_selftest():
     """The refusals are why this tool exists, so they are tested and not only the happy path."""
     import os
@@ -332,7 +408,7 @@ def refusal_selftest():
         fh.write("prompt 0: TEXT IDENTICAL\n" + d1 + run + tail)
         path = fh.name
     try:
-        cells, _, _, _, _ = parse_ticket(path)
+        cells, _, _, _, _, _ = parse_ticket(path)
         if cells != {(0, 1): (8, 10, 8, 10)}:
             print(f"selftest FAIL tail repeat: parsed {cells}, wanted only the first row", file=sys.stderr)
             return 1
@@ -350,11 +426,12 @@ def main(argv):
             return refusal_selftest()
         print(__doc__)
         return 2
-    seen, unmeasured, sources, budget, width, idents = pool(paths)
+    seen, unmeasured, sources, budget, width, idents, offered = pool(paths)
     if not seen:
         print("mtp_depth_pool: nothing to pool", file=sys.stderr)
         return 1
     _, _, totals = table(seen, sources, unmeasured, budget, width, idents)
+    print_economics(economics(seen, offered))
     if not selftest:
         return 0
     bad = {d: (totals.get(d), RECORDED[d]) for d in RECORDED if totals.get(d) != RECORDED[d]}

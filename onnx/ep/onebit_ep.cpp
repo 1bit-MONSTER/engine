@@ -419,9 +419,10 @@ bool float_scalar_init(const OrtValueInfo* v) {
 // How many values a zero point contributes, or -1 when it cannot be folded. A zero point folds when
 // it is a scalar, or a 1-D vector along the same axis its operand's epilogue term uses (the rows for
 // the activation, the output columns for the weight) -- the axes the scales use too, which is also
-// what ONNX requires of a per-axis zero point. A zero point along K would weight the products inside
-// the sum (one column-weighted vector of the weight, which no kernel here precomputes), so a graph
-// with one keeps the per-node path.
+// what ONNX requires of a per-axis zero point. A zero point along K is refused too, and not because
+// its term would be expensive -- Sum_k zp_x[k]*w_q[k][n] is a constant-weighted column sum of the
+// weight, computed once like colsum_w -- but because ONNX matches a zero point's shape to its scale's:
+// a K-long zero point only arrives beside a K-long scale, which this epilogue cannot fold at all.
 int64_t zp_count(const OrtValueInfo* v, int64_t axis, int64_t required_axis, int64_t expected_len) {
     ONNXTensorElementDataType elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
     size_t rank = 0;

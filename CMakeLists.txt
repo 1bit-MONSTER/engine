@@ -551,6 +551,10 @@ if(Python3_Interpreter_FOUND)
     # pin while going red every day unnoticed. The step is driven against a stubbed gh, with and
     # without an open issue.
     add_test(NAME bump_workflow_report COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/bump_workflow_report_test.py)
+    # every workflow's `run:` must parse, and the pin bump step must open one PR per moved repo while a
+    # repo that went upstream stays a human decision: the step shipped with an unterminated quote that
+    # nothing executed until a pin moved, i.e. until its first scheduled run (engine #1148)
+    add_test(NAME workflow_shell COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/workflow_shell_test.py)
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.
@@ -575,6 +579,15 @@ if(Python3_Interpreter_FOUND)
     # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
     # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.
     add_test(NAME repack_tile_order COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/repack_tile_order_test.py)
+    # The same gate end to end (engine#1110 review): a synthetic one-tensor GGUF and a synthetic container whose
+    # only tensor is named for another layer, so nothing is comparable -- the pair that used to read as a match --
+    # plus the same bytes under the mapped name, which must be compared and refused.  numpy + gguf-py, no model.
+    add_test(NAME tile_check_no_shared_tensor
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/tile_check_no_shared_tensor_test.py)
+    # The other half of that gate: the plan's container.tile_order is a measurement read from the repack's
+    # stamp, not a constant -- a plan written for a directory the repack refused would hand the loader the
+    # one value it accepts, undoing that refusal.  Stdlib only: no model, no numpy, no device.
+    add_test(NAME npu_plan_tile_order COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_plan_tile_order_test.py)
     # the t2 chunk kind (docs/npu.md "The t2 chunk kind"): synthetic only, because the real-model
     # leg needs 14 GB of Bonsai-2 images. Run tests/q4nx_t2_test.py without --no-model for the gate.
     add_test(NAME q4nx_t2 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2_test.py --no-model)
@@ -862,6 +875,10 @@ target_link_libraries(tokenizer_test PRIVATE onebit_npu)
 add_executable(tokenizer_linear_test tests/tokenizer_linear_test.cpp)
 target_link_libraries(tokenizer_linear_test PRIVATE onebit_npu)
 add_test(NAME tokenizer_linear COMMAND tokenizer_linear_test ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_linear.json)
+# A SentencePiece-shaped vocabulary that KEEPS its merge list (engine#1189): the shape Phi-3.5-mini's
+# pack has, whose ids come from Hugging Face `tokenizers` on the same fixture. No model needed.
+add_test(NAME tokenizer_spm_bpe
+         COMMAND tokenizer_test ${CMAKE_SOURCE_DIR}/tests/data/spm_bpe_tokenizer.json ${CMAKE_SOURCE_DIR}/tests/data/spm_bpe_tokenizer_golden.json)
 if(ONEBIT_NPU_MODEL)
     add_test(NAME tokenizer_qwen3
              COMMAND tokenizer_test ${ONEBIT_NPU_MODEL}/tokenizer.json ${CMAKE_SOURCE_DIR}/tests/data/qwen3_tokenizer_golden.json)

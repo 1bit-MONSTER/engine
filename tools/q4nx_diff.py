@@ -331,14 +331,24 @@ def _decode_pass(args, layout, quiet=False):
             padded_n += 1
         ref = dequantize(t.data, t.tensor_type).astype(np.float64).reshape(rows, cols)
         err = np.abs(got - ref)
-        ok = not err.any()
+        # A tile whose scale/zero planes decode to inf or NaN (a corrupt container) must read as a
+        # MISMATCH, never as a 0.000e+00 error.  Note which value leaked: NaN is *truthy*, so
+        # `err.any()` already counted the tensor inexact -- the error was that `mx` was NaN and
+        # `nan > worst[0]` is False, so `worst` stayed 0.0 and verdict()'s `rival >= worst * RATIO`
+        # tie named the layout a match.  Measured on random tile bytes
+        # (tests/tile_check_no_shared_tensor_test.py): exact=0 inexact=1 worst=0.000e+00, "match".
+        finite = np.isfinite(err)
+        mx = float(err[finite].max()) if finite.any() else 0.0
+        if not finite.all():
+            mx = float("inf")
+        ok = bool(finite.all()) and not err.any()
         exact += ok
         inexact += (not ok)
-        if err.max() > worst[0]:
-            worst = (float(err.max()), t.name)
+        if mx > worst[0]:
+            worst = (mx, t.name)
         if not quiet and (args.verbose or not ok or padded):
             print("%s %-46s %-5s max|err| %.3e  rms %.3e%s"
-                  % ("ok  " if ok else "BAD ", t.name, t.tensor_type.name, err.max(),
+                  % ("ok  " if ok else "BAD ", t.name, t.tensor_type.name, mx,
                      float(np.sqrt((err ** 2).mean())),
                      "  [padded %dx%d read as %dx%d]" % (rows, cols, rows_p, cols_p) if padded else ""))
     if not quiet:

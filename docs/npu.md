@@ -51,6 +51,8 @@ the model format, how `1bit serve` runs an NPU model, and how to build.
 A model directory may carry a **plan.json**: the decisions the runtime used to make by looking at which
 files happened to be in `--kernels`. Three of them, and each one used to be silent:
 
+The schema, the refusal rules and the generator flags are in [npu-plan.md](npu-plan.md).
+
 | decision | what the probe used to do |
 |---|---|
 | `fusion.gate_up` (`fused`/`split`) | the fused `full_i8_GU_*` kernel won, and with no split kernel on disk the split layout was assumed |

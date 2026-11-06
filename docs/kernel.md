@@ -41,6 +41,10 @@ list, with the facts that go stale marked as facts and the commands that do not.
 - **Out-of-tree modules that must follow every kernel:** `amdxdna` (the NPU driver, [npu.md](npu.md),
   "The XDNA driver") and `ec_su_axb35` (the box's fan EC). Both live in
   `/lib/modules/<version>/updates/` and both must be rebuilt against the new kernel and signed.
+  Both are also packaged as dkms packages (`amdxdna-1bit-dkms`, `ec-su-axb35-dkms`) which do that
+  rebuild on any machine that installs them — `scripts/mk-kernel-packages.sh` builds the set for deb,
+  rpm and Arch, and [install-any-distro.md](install-any-distro.md), "Kernel and NPU driver packages",
+  is the install.
 
 ## 7.4 on the box: what changed, and what to watch
 

@@ -715,6 +715,10 @@ add_dependencies(npu_sampling_test npu_plan_test)
 add_test(NAME npu_plan_generate
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_plan_generate_test.py
                  ${CMAKE_SOURCE_DIR}/tools/npu_plan.py)
+# engine #709: the installer's firmware boot-entry rules, exercised with a fake efibootmgr and a fake
+# /sys/class/block, so CI covers selection/rollback without NVRAM. The OVMF install gate
+# (os/mini/vmtest.sh) is the end-to-end row and is run separately.
+add_test(NAME os_mini_efi_boot COMMAND ${CMAKE_SOURCE_DIR}/tests/os_mini_efi_boot_test.sh)
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
 target_link_libraries(npu_full_elf_test PRIVATE onebit_npu)
 add_test(NAME npu_full_elf_md5 COMMAND npu_full_elf_test)

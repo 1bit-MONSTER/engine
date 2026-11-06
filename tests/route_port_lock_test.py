@@ -98,6 +98,14 @@ class RoutePortLockTest(unittest.TestCase):
         self.assertGreaterEqual(len(found), 15,
                                 "fewer route tests found than the suite has: " + ", ".join(sorted(found)))
 
+    def test_indirect_server_tests_hold_the_lock_too(self):
+        # tools/bench.py starts its servers with its own free_port under this test's name, so the
+        # script text has no bind for the census to find; #1070 still requires the lock, and this is
+        # where that is pinned rather than left to the list's comment.
+        by_name = {test["name"]: test for test in self.tests}
+        self.assertIn("bench_selftest", by_name, "bench_selftest is a test in every configuration")
+        self.assertEqual(lock_of(by_name["bench_selftest"]), "route_ports")
+
     def test_every_route_test_holds_the_route_port_lock(self):
         missing = []
         for name, script in sorted(self.census().items()):

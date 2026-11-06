@@ -108,6 +108,8 @@ struct Q8Prof {
     // the device lock, the kernel lookup, and the EP's own frame around the call. Printed rather than
     // subtracted by a reader, so the line adds up on its face.
     double dev_wpack_ms = 0, dev_aup_ms = 0, dev_async_ms = 0, dev_launch_ms = 0, dev_rdb_ms = 0;
+    // Weight-cache misses: equal to calls_dev means the cache never hits, which is a bug rather than a cost.
+    long dev_wpacks = 0;
     long calls_dev = 0, calls_host = 0, rows_dev = 0, rows_host = 0;
     ~Q8Prof() {
         if (!on || (calls_dev == 0 && calls_host == 0)) return;
@@ -117,9 +119,10 @@ struct Q8Prof {
         std::snprintf(line, sizeof(line),
                       "qdq_prof calls_dev=%ld calls_host=%ld rows_dev=%ld rows_host=%ld"
                       " dev_call_ms=%.1f dev_epi_ms=%.1f host_ms=%.1f"
-                      " dev_split_wpack=%.1f dev_split_aupload=%.1f dev_split_async=%.1f"
+                      " dev_wpacks=%ld dev_split_wpack=%.1f dev_split_aupload=%.1f dev_split_async=%.1f"
                       " dev_split_launch=%.1f dev_split_readback=%.1f dev_split_other=%.1f",
                       calls_dev, calls_host, rows_dev, rows_host, dev_call_ms, dev_epi_ms, host_ms,
+                      dev_wpacks,
                       dev_wpack_ms, dev_aup_ms, dev_async_ms, dev_launch_ms, dev_rdb_ms, other);
         // Bare stderr when ONEBIT_EP_TRACE is off: this line is the knob's whole output, and losing the one
         // measurement that answers the question is not worth saving a trace file.
@@ -131,13 +134,51 @@ Q8Prof& q8_prof() {
     return p;
 }
 
+#ifdef ONEBIT_EP_NPU
+// The float leg's own numbers, under the same knob and in the same shape as the fused leg's, so the two
+// are read the same way. This exists because the float path's per-call cost could not be attributed: the
+// per-design probe times `gemm_f32` with synthetic operands and a warm weight cache, while the graph hands
+// it real 32-row activations and whatever address ORT's initializer has, and at model level those two
+// readings differ by 5x (3.6 ms/call in the probe's table against ~18 ms/call in the graph).
+//
+// Two of the sections are the device call's own (`F32Stats`: calls, weight-cache misses and the time in
+// `packB` against the time in `go_rows`); `call_ms` is this file's frame around it, and `other` is the
+// difference, printed rather than left for a reader to subtract, so the line adds up on its face.
+struct F32Prof {
+    const bool on = std::getenv("ONEBIT_EP_QDQ_PROF") != nullptr;
+    onebit::npu::F32Stats dev;
+    double call_ms = 0;
+    ~F32Prof() {
+        if (!on || dev.calls == 0) return;
+        const double timed = dev.wpack_ms + dev.rows_ms;
+        const double other = call_ms > timed ? call_ms - timed : 0.0;
+        char line[512];
+        std::snprintf(line, sizeof(line),
+                      "f32_prof calls=%ld wpacks=%ld wpack_ms=%.1f rows_ms=%.1f call_ms=%.1f other_ms=%.1f",
+                      dev.calls, dev.wpacks, dev.wpack_ms, dev.rows_ms, call_ms, other);
+        trace_line(line, /*stderr_too=*/std::getenv("ONEBIT_EP_TRACE") == nullptr);
+    }
+};
+F32Prof& f32_prof() {
+    static F32Prof p;
+    return p;
+}
+#endif
+
 }  // namespace
 
 // Returns true when the NPU did the multiply. Always writes all of C.
 bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, int64_t n) {
 #ifdef ONEBIT_EP_NPU
     std::string why;
-    if (onebit::npu::gemm_f32(a, m, k, n, b, c, &why)) return true;
+    F32Prof& p = f32_prof();
+    const auto t_call = p.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (onebit::npu::gemm_f32(a, m, k, n, b, c, &why, p.on ? &p.dev : nullptr)) {
+        if (p.on)
+            p.call_ms += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t_call).count();
+        return true;
+    }
     trace_fallback("npu_fallback k=%lld n=%lld why=%s", (long long)k, (long long)n, why.c_str());
 #endif
     std::memset(c, 0, (size_t)m * (size_t)n * sizeof(float));
@@ -237,6 +278,7 @@ void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, 
                 p.dev_call_ms += std::chrono::duration<double, std::milli>(t_epi - t_dev).count();
                 p.dev_epi_ms += std::chrono::duration<double, std::milli>(t_end - t_epi).count();
                 p.dev_wpack_ms += split.wpack_ms;
+                p.dev_wpacks += split.wpacks;
                 p.dev_aup_ms += split.aupload_ms;
                 p.dev_async_ms += split.async_ms;
                 p.dev_launch_ms += split.launch_ms;

@@ -294,6 +294,12 @@ def generate(model_dir: str, kernels: str) -> dict:
         },
         "kernels": {"tag": tag},
         "attention": {"mode": attention_mode(model_dir)},
+        # P7 (#806) part A: the KV contract.  f16 with no rotation is what every container shipped so
+        # far means; the generator states it rather than leaving it to a key's absence, so a plan reads
+        # as what its cache is.  Turning int8 on is a per-target decision (its rotation and scale
+        # sidecar are kernel-adjacent), so nothing here enables it -- a plan that asks for int8 is
+        # either written by hand or by a target-aware generator, and the plan loader validates it.
+        "kv": {"key": "f16", "value": "f16", "hadamard": {"block": 0, "signs": ""}},
         "moe": {"batched_expert_gu": moe_batched(cfg, hidden, model_dir, kernels)},
         "layers": layers,
     }

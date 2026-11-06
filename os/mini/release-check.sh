@@ -37,7 +37,7 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1))
-    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|npu-power|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
 # A check that DIES must not take the evidence - or the NPU - with it. Measured on the c27 board (5 Nov 2026 21:52Z):
@@ -514,6 +514,30 @@ laya_verdict() {
     printf 'PASS'
 }
 
+# The NPU must be held awake (owner decision 2026-11-05 23:4x ADT: "keep the npu awake on the stick"; this is c30's
+# `code 614` fix). The driver's runtime PM suspends the array between requests, and on the c29 take the request that
+# followed such a window died `npu runtime: invalid call (code 614): state 8, run 0 of 28` - the picture page's prompt
+# turn - and the fallback model wrote the prompt, so the client saw a clean answer and the demo lost the beat. The image
+# sets `power/control=on` with a udev rule plus an early-boot fallback (a module loaded before udev misses the rule), so
+# what this row reads is the state THIS boot has, not the intent of a rule file. `runtime_status` is asserted as well
+# because `control=on` alone can be set while the array is not running at all - two different faults, two different
+# messages. Pure, so --self-test drives it: <power/control> <runtime_status>
+npu_power_verdict() {
+    _c=$(printf '%s' "${1:-}" | tr -d ' \n\r\t') _s=$(printf '%s' "${2:-}" | tr -d ' \n\r\t')
+    if [ -z "$_c" ]; then
+        printf 'SKIP no power/control to read'; return 0
+    fi
+    if [ "$_c" != on ]; then
+        printf 'FAIL power/control=%s (runtime_status=%s): the array may runtime-suspend between requests, which is the state the demo'"'"'s prompt turn died in' "$_c" "${_s:-unreadable}"
+        return 0
+    fi
+    case "$_s" in
+        active) printf 'PASS power/control=on, runtime_status=active' ;;
+        '')     printf 'FAIL power/control=on but runtime_status is unreadable, so the array'"'"'s state is not proven' ;;
+        *)      printf 'FAIL power/control=on but runtime_status=%s: held awake and not running' "$_s" ;;
+    esac
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -553,6 +577,15 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(followup_verdict '{"error":{"message":"no answer"}}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 0)"
     check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT"}}]}' 0 0)"
     check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' '' '')"
+    # c30 (owner decision 2026-11-05): the NPU's power state. The c29 take's shape is the second case - the array was
+    # allowed to suspend between requests, and the prompt turn that followed it came back `code 614`.
+    check PASS "$(npu_power_verdict on active)"
+    check FAIL "$(npu_power_verdict auto suspended)"                     # the c29 take's state
+    check FAIL "$(npu_power_verdict auto active)"                        # suspended as soon as the work stops
+    check FAIL "$(npu_power_verdict on suspended)"                       # held awake but not running
+    check FAIL "$(npu_power_verdict on '')"                              # status unreadable
+    check SKIP "$(npu_power_verdict '' 'active')"                        # not an NPU boot
+    check SKIP "$(npu_power_verdict '' '')"
     # engine #911 / c21 board: the streaming row. The board's own failure is the second case - the status was
     # 200, the body carried the error and the stream still closed with [DONE], so only the body can tell.
     check PASS "$(stream_verdict 'data: {"choices":[{"delta":{"content":"1BIT"}}]}
@@ -756,6 +789,37 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -e /lib/firmware/amdnpu/17f0_11 ]; 
     pass npu "$(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')and the NPU firmware present"
 else
     skip npu "no NPU in this VM: /dev/accel and /lib/firmware/amdnpu only appear on the machine"
+fi
+# The NPU's power state (owner decision 2026-11-05, c30's `code 614` fix - see npu_power_verdict above). The device is
+# matched on its PCI id `17f0` - the same XDNA2 device the image's own udev rule matches (`pci 1022:17f0`) and the same
+# one the firmware row above tests for - rather than on a hardcoded 0000:c6:00.1, so a different board's NPU answers the
+# same row and a machine with no NPU says so in the image's own words (04onboard-npu-keepawake prints "no XDNA2 NPU,
+# nothing to keep awake").
+NPUDIR=
+for ctl in /sys/bus/pci/devices/*/power/control; do
+    [ -e "$ctl" ] || continue
+    [ "$(cat "${ctl%/power/control}/device" 2>/dev/null)" = 0x17f0 ] && NPUDIR=${ctl%/power/control}
+done
+if [ -z "$NPUDIR" ]; then
+    skip npu-power "no XDNA2 NPU (PCI device id 0x17f0) in this boot: there is no power state to read"
+else
+    # A device the udev rule just resumed can take a moment to report `active`, and that race is not a fault: wait for
+    # it rather than red a boot for the driver's own workqueue. Ten seconds, then the row says what it sees.
+    _i=0
+    while :; do
+        _c=$(cat "$NPUDIR/power/control" 2>/dev/null)
+        _s=$(cat "$NPUDIR/power/runtime_status" 2>/dev/null)
+        [ "$_c" = on ] && [ "$_s" = active ] && break
+        _i=$((_i + 1))
+        [ "$_i" -lt 10 ] || break
+        sleep 1
+    done
+    VP=$(npu_power_verdict "$_c" "$_s")
+    case "$VP" in
+        PASS*) pass npu-power "the NPU is held awake ($(basename "$NPUDIR")): ${VP#PASS }" ;;
+        SKIP*) skip npu-power "${VP#SKIP }" ;;
+        *)     fail npu-power "$(basename "$NPUDIR") ${VP#FAIL }" ;;
+    esac
 fi
 
 # ── fans (EC fan curve; only a board we know has one we drive) ──────────────────────────────────

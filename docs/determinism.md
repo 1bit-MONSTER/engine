@@ -278,6 +278,19 @@ rather than being interchangeable extras. Contrast `cpu`, where one flag (`-DGGM
 removes the width dependence entirely: on `hrx` the reproducible configuration is `--parallel 1`, and
 there is no equivalent env switch.
 
+**An arm's evidence is its own family disappearing, not the size of the diff.** Measured on payload
+`c26c` (Qwen3-0.6B Q4_K_M, `--parallel 4`, a 48-token probe, two concurrent 64-token fillers and a
+second 24-token probe): three runs of the *same* configuration logged the same **29** registrations,
+identical three ways with no name moving in or out. That control is what makes an arm's diff mean
+anything, because `GGML_HRX_LOG_DISPATCH` is a first-match-per-process log
+(`dispatch_registry/dispatch-registry.cpp`, the `std::set seen`) and a single run's set is a sample of
+which kernels ran. Against that baseline each of three arms (`hip.kquant_tokens.`,
+`common.rmsnorm_binary_f32`, `hip.gemv_add_norm`) removed its own names and left none of them logged
+(29 → 24, 26, 26 registrations). But the rest of the diff is **not** arm-specific: all three also
+dropped `common.rope.f32`, `common.rope_set_rows.f32` and `common.set_rows`, and all three gained
+`qwen.attention_postprocess_f32_f16` — disabling one fusion re-fuses its neighbours, so the arm-specific
+claim to check is that the named family is gone, not that the remaining set is otherwise unchanged.
+
 ### NPU: repeatable, and comparable with two adjustments
 
 The NPU route is **bitwise repeatable**: 8 prompts × 24 tokens × 2 repeats (192 tokens), `max |Δlogp| = 0`,

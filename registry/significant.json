@@ -127,6 +127,16 @@
    "model_type": "granite_switch",
    "family": "Granite Switch 4.1 (dense all-attention Granite with N embedded per-token LoRA adapters, a zero adapter slot and weightless switch layers; upstream llama.cpp 157b81fe, not in the pin)",
    "watch": "report"
+  },
+  "Ernie5_5_MoeForCausalLM": {
+   "model_type": "ernie5_5_moe",
+   "family": "ERNIE 5.5 Flash MoE (hybrid MLA + DSA indexer, hyper-connections, latent MoE, situ activation; not an alias of ernie4_5-moe, nothing at the pin registers it)",
+   "watch": "report"
+  },
+  "Factorial": {
+   "model_type": "Factorial",
+   "family": "Factorial selection/memmap LM (repo-local training and inference code, .pt + weights.dat, SentencePiece; not a Transformer decoder, so nothing to alias)",
+   "watch": "report"
   }
  }
 }

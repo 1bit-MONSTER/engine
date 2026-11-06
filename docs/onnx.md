@@ -575,9 +575,10 @@ proven on XDNA 2 as well — the ELF loads, ORT hands the EP the `MatMul`, the k
 device, and three consecutive runs give the same answer inside the int8 tolerance:
 `max_abs = 9.893e-02` against `max|ref| = 20.414` (rel `4.846e-03`, gate `2e-2`), with the probe's
 scale fit at `0.9999`. What is *not* done is coverage: an ELF exists per `(M, K, N)`, so on a real
-model the EP takes the shapes it has a kernel for and the CPU EP takes the rest (for Qwen3-0.6B that
-is q, k and v). The device backend is still off by default and is not part of any release, because
-enabling it on a box where another process owns the NPU must stay an explicit decision.
+model the EP takes the shapes it has a kernel for — on Qwen3-0.6B those are q, k and v, 84 of 254
+matmuls — and the CPU EP takes the rest, lm_head, gate/up, down and o among them. The device backend
+is still off by default and is not part of any release, because enabling it on a box where another
+process owns the NPU must stay an explicit decision.
 
 The A8W8 QDQ group is claimed as one fused node and proven (`ctest -R onebit_ep_qdq_proof`, exact int8
 match for per-tensor, per-axis and asymmetric zero points, ~6-7 MB less peak RSS per run). The device

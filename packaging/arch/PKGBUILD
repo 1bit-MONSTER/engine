@@ -1,0 +1,49 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# PKGBUILD: the engine as an Arch Linux package (`pacman -U 1bit-engine-<version>-1-x86_64.pkg.tar.zst`).
+#
+# Built by scripts/pack-distro.sh, which puts this recipe beside the payload tree it assembled for
+# every family (payload/) and passes the release version, so makepkg runs in an archlinux container
+# and the package installs exactly the files the .deb and the .rpm carry:
+#
+#   PKG_NAME=1bit-engine PKG_VERSION=2026.45 scripts/pack-distro.sh arch <payload> <out-dir>
+#
+# Nothing is downloaded and nothing is compiled, so there is no source array and no checksum to
+# verify: payload/ is the install tree. An AUR entry would replace it with the release's tarball.
+#
+# The dependencies are Arch's own names for what the payload links from outside itself: the glibc
+# floor is real (libc.so.6(GLIBC_2.43)), libstdc++/libgcc_s/libgomp all live in gcc-libs, and the
+# engine's own libraries (libhrx, libggml*, libhsa, libomp) ship inside the package.
+pkgname=1bit-engine
+# PKGVER is the release; pkgver may hold no "-", which scripts/pack-distro.sh has already seen to
+pkgver=${PKGVER:?PKGVER is the release version (scripts/pack-distro.sh sets it)}
+pkgrel=${PKGREL:-1}
+pkgdesc='1bit engine: HRX GPU kernels and the sealed NPU kernel sets, plug-in for stock Lemonade'
+arch=('x86_64')
+url='https://1bit.gg/'
+# Apache-2.0 is the engine's source and the HRX build; the compiled HIP and NPU kernels travel under
+# the 1bit Binary License beside them (/opt/1bit/engine/LICENSE-BINARY)
+license=('Apache-2.0' 'custom:1bit-Binary-License')
+depends=('glibc>=2.43' 'gcc-libs' 'openssl' 'zstd' 'pcre2')
+# the payload is already stripped, so !strip keeps it byte-identical to the other two packages and
+# !debug stops makepkg from writing a debug package for binaries we do not ship symbols for
+options=('!strip' '!debug')
+source=()
+
+package() {
+    # payload/ is the installed tree: /opt/1bit/engine, /usr/bin/1bit-engine, the Lemonade drop-in
+    cp -a "${startdir}/payload/." "$pkgdir/"
+}

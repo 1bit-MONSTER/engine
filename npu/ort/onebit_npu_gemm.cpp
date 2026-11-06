@@ -325,9 +325,11 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
         auto* Bm = (int8_t*)ctx.layerB[0]->map();
         q4nx_layout::pack_int8_image(Bm, b, (int)k, (int)n, ctx.KD, ctx.ND, ctx.blocked_b);
         ctx.layerB[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        if (split)
+        if (split) {
             split->wpack_ms += std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - t_w).count();
+            split->wpacks += 1;
+        }
         kern->w_ptr = b;
         kern->w_k = k;
         kern->w_n = n;
@@ -425,7 +427,7 @@ bool available(std::string* why) {
 }
 
 bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
-              float* c, std::string* err) {
+              float* c, std::string* err, F32Stats* stats) {
     State& s = state();
     std::lock_guard<std::mutex> g(s.mu);
     if (!init(s)) {
@@ -449,8 +451,17 @@ bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
     // Weights: int8 per column, one scale per column (packB).
     // ONNX initializers are immutable, so the tensor's address is its identity: a graph that rewrote the bytes
     // in place would keep the old ones here, and re-uploading on every call would cost what this cache saves.
+    // `stats->wpacks` counts the misses, which is the one number that separates "the cache works" from "this
+    // re-packs 196 weights per pass" without timing anything.
     if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
+        const auto t_pack = stats ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
         kern->ctx->packB(0, b, (int)k, (int)n, kern->w_scale);
+        if (stats) {
+            stats->wpacks += 1;
+            stats->wpack_ms += std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t_pack).count();
+        }
         kern->w_ptr = b;
         kern->w_k = k;
         kern->w_n = n;
@@ -458,6 +469,7 @@ bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
 
     // Activations: one row group of the kernel's M at a time. Rows past `rows` are zero-padded
     // inside quantize_async_rows and never read back.
+    if (stats) stats->calls += 1;
     std::vector<float> scales((size_t)kern->m);
     for (int64_t row0 = 0; row0 < m; row0 += kern->m) {
         const int rows = (int)std::min<int64_t>(kern->m, m - row0);
@@ -467,8 +479,14 @@ bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
             for (int64_t i = 0; i < k; i++) amax = std::max(amax, std::fabs(row[i]));
             scales[(size_t)r] = amax > 0.0f ? amax / 127.0f : 1.0f;
         }
-        if (!kern->ctx->go_rows(0, a + row0 * k, rows, (int)k, scales.data(), scales.data(),
-                                1.0f, c + row0 * n, (int)n)) {
+        const auto t_rows = stats ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+        const bool ok = kern->ctx->go_rows(0, a + row0 * k, rows, (int)k, scales.data(), scales.data(),
+                                           1.0f, c + row0 * n, (int)n);
+        if (stats)
+            stats->rows_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - t_rows).count();
+        if (!ok) {
             if (err) *err = "I8Ctx go_rows failed";
             return false;
         }

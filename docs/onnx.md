@@ -568,6 +568,31 @@ five. The sections are timed only when the knob is on. The line writes to the EP
 and to stderr when it is not: a knob whose only output can silently vanish is how a debugging session gets
 lost, and this file already paid for that once.
 
+The **float** `MatMul` path reports under the same knob, as a second line — `f32_prof calls=… wpacks=…
+wpack_ms=… rows_ms=… call_ms=… other_ms=…` — and it exists for the same reason the fused one does: its per-call
+cost could not be read off the per-design probe, which times `gemm_f32` with synthetic operands and a warm
+weight cache (3.6 ms/call for q at m=36 above) while the graph hands the same function real 32-row activations.
+At model level that came out 12.0 ms/call (21096.1 ms over 1764 calls), and one counter says where it went. So
+the float leg counts `calls` and the **weight-cache misses** (`wpacks`), times `packB` and the runtime's own
+`go_rows` (quantise + upload,
+both syncs, launch, wait, readback, dequant — one number, because those steps live inside the runtime and are not
+re-implemented here the way `gemm_q8_raw` re-implements the int8 ones), and `call_ms` is this file's frame around
+it with `other` the difference. The fused leg's `qdq_prof` carries the same miss count as `dev_wpacks`.
+
+**What the counter showed: the weight cache never hits, and that is structural, not a bug in the key.** On the
+float32 graph with five M=32 designs, at load 1.2: `f32_prof calls=1764 wpacks=1764 wpack_ms=14103.7
+rows_ms=6949.3 call_ms=21096.1` — 1764 calls, **1764 re-packs, two thirds of the run (14.1 of 21.1 s) inside
+`packB`**. The fused A8W8 export on the same designs, same window: `calls_dev=1764 … dev_wpacks=1764
+dev_split_wpack=771.1 dev_split_launch=6063.1`, i.e. the same miss on every call, costing 10 % because packing
+int8 bytes is cheap and quantising floats is not. The first hypothesis — that ORT hands an EP node a different
+weight pointer per call — was wrong, and a fix was written and thrown away: the cache holds **one** packed weight
+per `(K, N)` kernel (`npu/ort/onebit_npu_gemm.cpp`, "one slot per kernel"), and Qwen3-0.6B has 196 weights across
+five shapes — 28 for q/o/down, 56 for k/v and gate/up — so consecutive calls of one shape evict each other, and
+keying the slot on the weight's identity changes nothing (196 packs per pass either way; measured). Making the
+cache hit needs a packed slot per weight (440 MB of int8 projection weights resident — the five shapes'
+196 weights — which the array does not have) or a cheaper `packB`; `wpack_ms` is the number that would price
+the second, and it is the largest single line the float leg has.
+
 ## Status
 
 The host path is done: it is what the tests assert, and it needs no hardware. The NPU path is

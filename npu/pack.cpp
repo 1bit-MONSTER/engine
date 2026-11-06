@@ -15,6 +15,8 @@
 
 #include "pack.h"
 
+#include "q4nx.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -74,6 +76,17 @@ const char* const kProj[] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight
 
 }  // namespace
 
+const uint8_t* device_tiles(const Tensor& t, std::vector<uint8_t>& converted) {
+    // engine#1185: an imported container's projections are 6,144-byte q4_1f chunks (fp32
+    // scale/zero). The lane's kernels stream 5,120-byte q4_1, so repack through as_q4_1() --
+    // in memory, once per packed buffer. A GGUF-derived tensor is returned as it is.
+    if (t.shape.size() != 2 || size_t(t.shape[1]) != kTileBytesF32) return t.data;
+    if (uint64_t(t.tiles()) * kTileBytesF32 > t.bytes)
+        throw std::runtime_error("model.q4nx: a q4_1f tensor is shorter than its declared tiles");
+    converted = q4nx::as_q4_1(t);
+    return converted.data();
+}
+
 size_t layer_weight_bytes(const Model& m) {
     int most = 0;
     for (int L = 0; L < m.dims().layers; ++L) {
@@ -100,26 +113,31 @@ int pack_layer_weights(const Model& m, int L, uint8_t* dst) {
     if (up.tiles() != gate.tiles() || up_chunks * 2 * CH > up.tiles() + gate.tiles())
         throw std::runtime_error("model.q4nx: layer " + std::to_string(L) + " gate/up tiles do not fill whole chunks");
     std::memset(dst, 0, size_t(total) * kTileBytes);
-    auto proj = [&](const Tensor& t, int off, int G) {
+    // One converted buffer per projection: empty (and unused) for a tensor already in the
+    // device's 5,120-byte q4_1 form, the repacked tiles for an imported q4_1f one.
+    std::vector<uint8_t> cq, ck, cv, co, cup, cgate, cdown;
+    auto proj = [&](const Tensor& t, int off, int G, std::vector<uint8_t>& conv) {
         need(t, tiles_read(t.tiles(), G) * kTileBytes, "a projection");
-        reorder_tiles(dst + size_t(off) * kTileBytes, t.data, t.tiles(), G);
+        reorder_tiles(dst + size_t(off) * kTileBytes, device_tiles(t, conv), t.tiles(), G);
     };
-    proj(q, off_q, G_h);
-    proj(k, off_k, G_h);
-    proj(v, off_v, G_h);
-    proj(o, off_o, G_o);
+    proj(q, off_q, G_h, cq);
+    proj(k, off_k, G_h, ck);
+    proj(v, off_v, G_h, cv);
+    proj(o, off_o, G_o, co);
     // gate/up: alternating CH-tile chunks, up first.
     const int up_t = up.tiles(), gate_t = gate.tiles();
+    const uint8_t* up_src = device_tiles(up, cup);
+    const uint8_t* gate_src = device_tiles(gate, cgate);
     for (int c = 0; c < (up_t + CH - 1) / CH; ++c) {
         const int up_n = std::min(CH, up_t - c * CH), gate_n = std::min(CH, gate_t - c * CH);
         const size_t base = size_t(off_gu + c * 2 * CH);
         if (up_n > 0) need(up, (size_t(c) * CH + tiles_read(up_n, G_h)) * kTileBytes, "mlp.up_proj");
         if (gate_n > 0) need(gate, (size_t(c) * CH + tiles_read(gate_n, G_h)) * kTileBytes, "mlp.gate_proj");
-        if (up_n > 0) reorder_tiles(dst + base * kTileBytes, up.data + size_t(c) * CH * kTileBytes, up_n, G_h);
+        if (up_n > 0) reorder_tiles(dst + base * kTileBytes, up_src + size_t(c) * CH * kTileBytes, up_n, G_h);
         if (gate_n > 0)
-            reorder_tiles(dst + (base + CH) * kTileBytes, gate.data + size_t(c) * CH * kTileBytes, gate_n, G_h);
+            reorder_tiles(dst + (base + CH) * kTileBytes, gate_src + size_t(c) * CH * kTileBytes, gate_n, G_h);
     }
-    proj(down, off_d, G_d);
+    proj(down, off_d, G_d, cdown);
     return total;
 }
 
@@ -129,7 +147,8 @@ void pack_lmhead_weights(const Model& m, uint8_t* dst) {
     const Tensor& t = m.tensor("lm_head.weight");
     if (m.dims().hidden / 128 <= 0) throw std::runtime_error("config.json: hidden_size too small for the fast lane");
     need(t, tiles_read(t.tiles(), m.dims().hidden / 128) * kTileBytes, "lm_head.weight");
-    reorder_tiles(dst, t.data, t.tiles(), m.dims().hidden / 128);
+    std::vector<uint8_t> conv;
+    reorder_tiles(dst, device_tiles(t, conv), t.tiles(), m.dims().hidden / 128);
 }
 
 void fill_i5(const Model& m, int L, uint8_t* dst) {

@@ -818,10 +818,15 @@ rows = [
                      "ls -l /root/.ssh/authorized_keys | awk '{print $3\"/\"$4\"/\"$1}'; "
                      "/usr/sbin/sshd -t 2>&1 | head -2; echo key-owner-done", None),
     # the in-VM half of the fix, so it is measured before a rebuild: tcpwrappers is what closes the kex
+    # Cycle 30: the repair writes the SHIPPED rule (addresses only) rather than appending a second allow line
+    # behind Puppy's `ALL: LOCAL` - and it prints how many lines still carry a name test, which is **0** on a fixed
+    # image and **2** on c29's (the stock `ALL: LOCAL` rule and the LAN rule that repeats `LOCAL`; each one costs a
+    # reverse+forward lookup per connection, which is where the take's 780 auth.err lines came from).
     ("U7 hosts",     "grep -v '^#' /etc/hosts.deny | grep . ; grep -v '^#' /etc/hosts.allow | grep . ; "
                      "grep -q '1bit-lan' /etc/hosts.allow || "
-                     "printf 'ALL: LOCAL, 10.0.0.0/255.0.0.0, 172.16.0.0/255.240.0.0, 192.168.0.0/255.255.0.0  "
-                     "# 1bit-lan\\n' >> /etc/hosts.allow; "
+                     "printf 'ALL: 127.0.0.1, 10.0.0.0/255.0.0.0, 172.16.0.0/255.240.0.0, "
+                     "192.168.0.0/255.255.0.0  # 1bit-lan\\n' > /etc/hosts.allow; "
+                     "echo name-rules=$(grep -c LOCAL /etc/hosts.allow); "
                      "grep -c '1bit-lan' /etc/hosts.allow", None),
     ("U7 listen",    "netstat -lntp 2>/dev/null | grep ':22 ' | head -2; "
                      "grep -iE '^(PermitRootLogin|DenyUsers|AllowUsers|Port|PasswordAuthentication)' "

@@ -59,6 +59,12 @@ run() {  # <record> [serve args]: serve until the backend has recorded its start
     RECORD="$1" "$bin" serve -m "$scratch/m.gguf" --device cpu --port "$port" --llama-server "$scratch/backend.py" "${@:2}" >"$1.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do [ -s "$1" ] && break; sleep 0.1; done
+    # A server that never came up because it could not bind is a port collision, not a defect in
+    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$1.log"; then
+        echo "FAIL: parallel_args: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$1.log" | head -1))"
+        exit 1
+    fi
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 np() { python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["argv"]; print(a[a.index("-np")+1] if "-np" in a else "none")' "$1"; }

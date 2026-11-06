@@ -52,6 +52,12 @@ start() {   # start <log> [env...]: serve on a free port with the fake backend, 
         sleep 0.1
     done
     if [ "$code" != 200 ]; then
+        # A server that never came up because it could not bind is a port collision, not a defect in
+        # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+        if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
+            echo "FAIL: hybrid_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
+            exit 1
+        fi
         echo "FAIL serve did not answer $api/health within $((SECONDS - deadline + ${HYBRID_ROUTE_START_S:-60}))s: last code $code, pid $pid $(kill -0 "$pid" 2>/dev/null && echo alive || echo gone)"
         tail -5 "$log" 2>/dev/null
     fi

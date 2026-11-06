@@ -1,0 +1,81 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/07onboard-user - a normal account with sudo on an INSTALLED machine (engine#712).
+#
+# The appliance is root-only by model: the console, sshd and the keys in /data/ssh all assume root, and that is
+# right for a try-it stick. An installed machine is the owner's headless server, "managed over ssh with a normal
+# user" (engine#712), so this creates `onebit` on the first boot of an installed disk and keeps it afterwards.
+#
+# What it is, and what it deliberately is not:
+#   * the SAME keys the machine already trusts - /data/ssh/authorized_keys, re-applied at every installed boot
+#     exactly as 20onboard-ssh re-applies them to root (so the key file is /data's, not a copy that drifts).
+#   * NO password: useradd leaves the account locked, so `su` from another account and console login cannot use it,
+#     and a key is the only way in. Root keeps its own login untouched.
+#   * sudo through ONE appended rule. Puppy's /etc/sudoers grants `%users` sudo only with the ROOT password
+#     (`Defaults:users runaspw`), which is no use to an account with no password, so the rule is explicit:
+#     `onebit ALL=(ALL) NOPASSWD: ALL`. NOPASSWD adds no exposure here: a key authorised for this account is a key
+#     that root already accepts. The file is backed up and the rule is proved by running `sudo -n true` as the user;
+#     if that fails the backup is restored, because a broken sudoers costs root its own sudo.
+#
+# Runs after 05onboard-data (the keys are on /data by then) and before 20onboard-ssh.
+DATA=/data
+USER_NAME=onebit
+RULE="$USER_NAME ALL=(ALL) NOPASSWD: ALL"
+
+[ "${1:-start}" = "stop" ] && exit 0            # an account has nothing to stop
+
+# The installed-state rule the console menu uses (engine#1192): /data mounted AND 1bit-install's marker on it. On a
+# live stick this exits without touching anything - a machine that boots from RAM and forgets is root-only.
+grep -q " $DATA " /proc/mounts 2> /dev/null || { echo "07onboard-user: no $DATA: live boot, no account"; exit 0; }
+[ -e "$DATA/.installed" ] || { echo "07onboard-user: live boot (no $DATA/.installed): root-only, as on the stick"; exit 0; }
+
+if ! id "$USER_NAME" > /dev/null 2>&1; then
+    useradd -m -s /bin/bash -c "1bit OS" "$USER_NAME" || {
+        echo "07onboard-user: useradd $USER_NAME failed; the machine stays root-only" >&2; exit 1; }
+    echo "07onboard-user: created $(id "$USER_NAME")"
+fi
+GRP=$(id -gn "$USER_NAME")
+
+# the keys: /data's copy is the source of truth (the stick was prepped with it), root's file is the fallback for a
+# machine keyed before /data carried one
+src=$DATA/ssh/authorized_keys
+[ -s "$src" ] || src=/root/.ssh/authorized_keys
+if [ -s "$src" ]; then
+    install -d -m 700 -o "$USER_NAME" -g "$GRP" "/home/$USER_NAME/.ssh" || exit 1
+    if ! cmp -s "$src" "/home/$USER_NAME/.ssh/authorized_keys" 2> /dev/null; then
+        install -m 600 -o "$USER_NAME" -g "$GRP" "$src" "/home/$USER_NAME/.ssh/authorized_keys" || exit 1
+        echo "07onboard-user: $(wc -l < "$src") key(s) from $src"
+    fi
+else
+    echo "07onboard-user: no keys to authorise yet ($src): ssh as $USER_NAME will be refused, root's login is unchanged"
+fi
+
+# sudo: one rule, appended once, proved, and rolled back if it does not work
+if ! grep -qxF "$RULE" /etc/sudoers 2> /dev/null; then
+    cp -p /etc/sudoers /etc/sudoers.pre-1bit 2> /dev/null || { echo "07onboard-user: cannot back up /etc/sudoers" >&2; exit 1; }
+    printf '\n# engine#712: the installed machine'"'"'s normal account\n%s\n' "$RULE" >> /etc/sudoers || {
+        cp -p /etc/sudoers.pre-1bit /etc/sudoers; echo "07onboard-user: cannot write /etc/sudoers" >&2; exit 1; }
+    if su -s /bin/sh "$USER_NAME" -c "sudo -n true" > /dev/null 2>&1; then
+        echo "07onboard-user: sudo granted ($RULE)"
+    else
+        cp -p /etc/sudoers.pre-1bit /etc/sudoers
+        echo "07onboard-user: the sudo rule did not work and was rolled back; $USER_NAME is a plain account" >&2
+        exit 1
+    fi
+fi
+echo "07onboard-user: $USER_NAME ready (home /home/$USER_NAME, sudo, keys in $src)"
+exit 0

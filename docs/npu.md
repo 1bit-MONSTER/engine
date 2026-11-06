@@ -544,10 +544,13 @@ own, with a negative control.
 A cached directory is checked again on every hit, with the same metadata-only scan, and it is
 rebuilt if the scan fails or if its `repack-stamp.txt` (converter path and commit, architecture,
 the measured `tile_order`, repack script) names a different converter than this build would use (`repack_gguf.py
---check-stamp <dir>`: exit 0 current, 1 stale, 2 cannot tell). If the checker or the converter
-cannot be found, serve warns once per process and reuses the directory, so a missing script
-cannot stop serving. A Q4NX directory served as it is (`1bit serve -m <Q4NX dir>`), such as a
-published FastFlowLM model, is trusted as published. Its chunk layout can be checked first, without
+--check-stamp <dir>`: exit 0 current, 1 stale, 2 cannot tell). A stamp the repack itself refused,
+or one that predates the measured `tile_order`, is stale and is rebuilt once, so the directory
+becomes verified; `unverified` is "cannot tell", so serve reuses it with its warning instead of
+re-running the measurement that could not run. If the checker or the converter cannot be found,
+serve warns once per process and reuses the directory, so a missing script cannot stop serving. A
+Q4NX directory served as it is (`1bit serve -m <Q4NX dir>`), such as a published FastFlowLM model,
+is trusted as published. Its chunk layout can be checked first, without
 dequantizing anything: `tools/check_q4nx_dir.py <dir>` reads the container header only, names each
 quantized tensor's chunk kind, and refuses an unknown chunk size or a tensor shorter than its layout
 needs. It cannot tell the two Q8 layouts apart ("Q4NX chunks", above), because the container does
@@ -569,10 +572,16 @@ does match, so the claim in `plan.json` is measured rather than assumed;
 * records `tile_order=unverified` when nothing was comparable (an architecture the checker cannot
 dequantize) instead of asserting a layout nobody checked.
 
-The same measurement runs on its own over an existing directory:
-`python3 scripts/repack_gguf.py --tile-check <dir> <model.gguf>` (exit 0 ours, 1 another order or
-none, 2 nothing compared). A cache hit re-checks metadata only, so the cost is paid once per
-directory, on top of the converter's own pass.
+The same measurement runs on its own over an existing directory, under the name that says what it
+proves: `python3 scripts/repack_gguf.py --verify-source <dir> <model.gguf>` (exit 0 verified in the
+engine-1 order, 1 another order or none, 2 nothing comparable). The verdict names the worst source
+tensor and its correlation with the GGUF — a wrong converter checkout reads
+`corr +0.0325 on blk.14.attn_output.weight` where an honest pack reads `corr +0.9994` — so the
+number that separates them is in the line, not only the max|err|. `--tile-check` is the same
+function under its old name. The repack runs it after the converter and refuses the directory when
+it fails; `--skip-verify` opts out for the tight repack loops and stamps `tile_order=unverified`
+(never `engine-1`), so the cheaper path is recorded rather than silently trusted. A cache hit
+re-checks metadata only, so the cost is paid once per directory, on top of the converter's own pass.
 
 ### From a Ryzen AI OGA NPU pack
 

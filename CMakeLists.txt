@@ -167,6 +167,14 @@ add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<T
 add_test(NAME npu_repack_path COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_repack_path.sh $<TARGET_FILE:onebit>)
 # a build without the NPU lane has no repack path: the test says skip (77) there, not fail
 set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
+# engine#812: the XDNA import class advertises device execution on an imported dma-buf. This pairs that
+# advertisement (the pinned libamdf's import profile) with what the loaded driver actually does (libamdf's
+# own CTS: GPU export -> NPU import -> NPU executes on the imported range), keyed on the module's
+# fingerprint against third_party/patches/amdxdna/README.md. It skips (77) without the array or without a
+# CTS build (ONEBIT_LIBAMDF_CTS_DIR), so public CI neither runs nor fails it.
+add_test(NAME npu_import_contract
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_import_contract.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(npu_import_contract PROPERTIES SKIP_RETURN_CODE 77)
 # engine#876: the gate row for a folded (pb16i/t2s) container.  Its device half needs the array, but its
 # assertion does not: these are the accept/refuse cases of `scripts/npu-window11.sh --compare` on hand-written
 # logs -- folded against folded passes, one differing rotated activation fails, a folded log against a plain one

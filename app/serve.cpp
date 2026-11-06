@@ -174,6 +174,7 @@ struct Options {
     std::vector<std::string> npu_opts;   // --npu-opt KEY=VALUE, for a private NPU route
     int load_queue_ms = 45000;           // --load-queue-ms N: how long a refused NPU context is queued
     int npu_streams = 1;   // --npu-streams N: N opted-in serves share the NPU (app/npu_device_lock.h)
+    std::string npu_target;  // --npu-target NAME: which NPU target serves the per-op route (empty = the build's default)
     std::string prefill_provider;        // --prefill-provider PATH (or ONEBIT_HYBRID_PREFILL): --device hybrid's prefill (docs/hybrid.md)
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
     bool laya_auto = false;              // --laya: the same with the installed checkpoint (laya_checkpoint())
@@ -2872,6 +2873,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--npu-opt") o.npu_opts.push_back(next());
         else if (a == "--load-queue-ms") o.load_queue_ms = std::stoi(next());
         else if (a == "--npu-streams") o.npu_streams = std::stoi(next());
+        else if (a == "--npu-target") o.npu_target = next();
         else if (a == "--prefill-provider") o.prefill_provider = next();
         else if (a == "--laya-model") o.laya_model = next();
         else if (a == "--laya") o.laya_auto = true;
@@ -2990,6 +2992,9 @@ int run_serve(int argc, char** argv) {
                                                   "--host", o.host};
                 if (!o.alias.empty()) { fargs.push_back("--alias"); fargs.push_back(o.alias); }
                 if (o.npu_streams > 1) { fargs.push_back("--npu-streams"); fargs.push_back(std::to_string(o.npu_streams)); }
+                // The forward owns the list of compiled targets and the refusal (app/forward_serve.cpp); serve
+                // only carries the operator's choice through, so there is one place that says which names exist.
+                if (!o.npu_target.empty()) { fargs.push_back("--npu-target"); fargs.push_back(o.npu_target); }
                 std::vector<char*> fav;
                 for (auto& a : fargs) fav.push_back(a.data());
                 return run_forward_serve(int(fav.size()), fav.data());

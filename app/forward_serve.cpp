@@ -36,6 +36,7 @@
 #include "forward_serve.h"
 
 #include "../npu/forward/include/q4nx_forward.h"
+#include "../npu/target/xdna/xdna_target.h"  // XdnaTarget::kName for --npu-target
 #include "npu_device_lock.h"
 #include "npu_answer_parser.h"
 #include "npu_chatml.h"
@@ -788,6 +789,10 @@ void handle_systemone(ForwardEngine& e, const httplib::Request& req, httplib::Re
 int run_forward_serve(int argc, char** argv) {
     std::string model, kernels, host = "127.0.0.1", alias, dump_logits;
     int port = 8000, streams = 1;
+    // Which NPU target serves this route (engine#799 P4). A1 compiles one, xdna; the point of the option
+    // is that a name this build does not have is refused BY NAME below, before the device is opened,
+    // instead of being ignored and served by whatever target happened to be linked.
+    std::string npu_target = ::npu::target::xdna::XdnaTarget::kName;
     npu::PrefixOptions prefix_opts;  // --prefix-slots / --prefix-cache-mb / --prefix-min-gain (#650)
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
@@ -804,14 +809,23 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--prefix-cache-mb") prefix_opts.cache_mb = std::stoul(next());
         else if (a == "--prefix-min-gain") prefix_opts.min_gain = std::stoi(next());
         else if (a == "--npu-streams") streams = std::stoi(next());
+        else if (a == "--npu-target") npu_target = next();
         else if (a == "--dump-logits") dump_logits = next();
         else throw std::runtime_error("unknown option " + a);
     }
     if (model.empty())
-        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--dump-logits <dir>]");
+        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N] [--npu-target xdna] [--dump-logits <dir>]");
     if (streams < 1 || streams > kNpuMaxStreams)
         throw std::runtime_error("--npu-streams takes 1.." + std::to_string(kNpuMaxStreams) +
                                  " (the device's hwctx limit), not " + std::to_string(streams));
+    // The compiled target list, checked here rather than at open() so a typo cannot reach the device. A1 links
+    // exactly one target; a second (P5's hexagon) adds its name to this list and to npu/target/.
+    {
+        const std::vector<std::string> targets = {::npu::target::xdna::XdnaTarget::kName};
+        if (std::find(targets.begin(), targets.end(), npu_target) == targets.end())
+            throw std::runtime_error("--npu-target " + npu_target +
+                                     ": this build has no such target (compiled: " + targets.front() + ")");
+    }
     if (!std::filesystem::exists(model)) throw std::runtime_error(model + " does not exist");
 
     const std::string dir = std::filesystem::path(model).parent_path().string();
@@ -1039,6 +1053,8 @@ int run_forward_serve(int argc, char** argv) {
     std::fprintf(stderr, "1bit forward-serve: %s ready on http://%s:%d (%s)", e.id.c_str(), host.c_str(), port,
                  e.fwd->backend().c_str());
     if (streams > 1) std::fprintf(stderr, " [npu-streams=%d]", streams);
+    // The target that is actually serving, so a log says which one answered rather than leaving it to the build.
+    std::fprintf(stderr, " [npu-target=%s]", npu_target.c_str());
     std::fprintf(stderr, "\n");
 
     while (true) std::this_thread::sleep_for(std::chrono::seconds(3600));

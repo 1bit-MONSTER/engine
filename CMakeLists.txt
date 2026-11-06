@@ -1108,7 +1108,10 @@ if(ONEBIT_NPU)
         npu/forward/src/q4nx_dequant.c
         npu/forward/src/q4nx_pack.c
         npu/forward/src/q4nx_semantics.c
-        npu/forward/src/q4nx_forward.cpp)
+        npu/forward/src/q4nx_forward.cpp
+        # The NPU target interface and this box's target (engine#799 P4): the model keeps the maths, the
+        # target keeps the runtime, the kernels and the weight residency.
+        npu/target/xdna/xdna_target.cpp)
     # The Q4NX pack and dequant loops carry `#pragma omp parallel for`; without the
     # OpenMP flags those compile to serial code. Wire it in (both C and C++ sources)
     # so they actually use the cores.
@@ -1123,7 +1126,7 @@ if(ONEBIT_NPU)
         target_compile_definitions(onebit_npu_forward PRIVATE NPU_INFER_DEBUG_DUMPS)
     endif()
     target_include_directories(onebit_npu_forward SYSTEM PUBLIC
-        npu/forward/include npu/forward/engine-src npu)
+        npu/forward/include npu/forward/engine-src npu ${CMAKE_CURRENT_SOURCE_DIR})
     # plan.json (npu/plan/plan.h, engine #799 P1) is read with nlohmann's parser, and the header is
     # part of this library's interface, so the dependency is PUBLIC.
     # engine#1185: the forward converts an imported q4nx-2 container to the device's 5,120-byte

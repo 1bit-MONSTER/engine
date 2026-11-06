@@ -227,7 +227,7 @@ for an existing Linux:
 | | |
 |---|---|
 | Lemonade with the engine as its backend | the `lemonade-onebit` package from the releases page, for a machine already running Lemonade ([docs/lemonade.md](lemonade.md)) |
-| the engine alone, packaged for a distribution | `scripts/mk-plugin-package.sh` builds `1bit-engine_<version>_amd64.deb` and a tarball and wires a stock Lemonade to it. The script arrives with PR [#860](https://github.com/1bit-MONSTER/engine/pull/860), so it is **not in the tree until that merges** — until then an existing Linux has only the `lemonade-onebit` route above |
+| the engine alone, packaged for a distribution | `scripts/mk-plugin-package.sh` builds the engine as its own native package — `.deb`, `.rpm`, Arch package and tarball, one payload in four wrappings (`scripts/pack-distro.sh`) — and wires a stock Lemonade to it ([install-any-distro.md](install-any-distro.md)). The release publishes them next to `lemonade-onebit` |
 
 Both are **advanced, and not the supported path for this release**: they put the engine on a system whose
 kernel, `amdxdna` driver and HSA runtime we did not choose, so the device rows of

@@ -311,9 +311,17 @@ rehearsal at `v7.3` and linux-next `next-20261022` (`#525`).
 | `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend it ships: **HRX** (and the CPU, from the same llama-server) and the NPU engine's runtime. DwarfStar is out of the tree since 2026-11-02 (HIP kernels only, owner decision 2026-11-01); no Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `1bit-os-puppy.img.xz`, `SHA256SUMS` | **1bit OS image: [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS), not a GitHub release asset** — `1bit-os-puppy.img.xz` (about 2.2 GB compressed, 9,128,902,656 B written) with its `SHA256SUMS`, because a GitHub release asset is capped at 2 GiB. This GitHub release carries the notes, `changes.json` and the asset `SHA256SUMS`, and links there for the image; the Hugging Face repository is private until v2026.44 is published. 1bit OS is a Lemonade appliance with the engine inside as a bootable USB image ([os/README.md](../os/README.md)); the recipe builds a disk image containing an ESP plus the frugal-install files, so there is no standalone `.efi` for it. The `.efi`/`.img.zst` names belong to the earlier BusyBox `os/mini` candidates (c18-c20, see the gated-candidate table above), which is the CI/VM target now, not 1bit OS |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
+| `1bit-engine_<version>_amd64.deb` | **the engine on its own, as a native package**: `1bit`, its HRX llama.cpp build, the sealed NPU kernel sets, the HSA runtime it dlopens, and `lemonade-hrx`, the shim a stock Lemonade starts. Debian and Ubuntu (`apt-get install ./…deb`) |
+| `1bit-engine-<version>-1.x86_64.rpm` | the same payload for Fedora and openSUSE Tumbleweed (`dnf install ./…rpm`, `zypper install ./…rpm`) |
+| `1bit-engine-<version>-1-x86_64.pkg.tar.zst` | the same payload for Arch Linux (`pacman -U ./…pkg.tar.zst`), from `packaging/arch/PKGBUILD` |
+| `1bit-engine-<version>-linux-x86_64.tar.zst` | the same payload for every other distribution, unpacked at `/opt/1bit/engine` |
 
-The engine is embedded in Lemonade, so it ships only inside those two: there is no standalone
-engine tarball and no Windows package (Lemonade has its own Windows build). On the GPU the engine
+The engine is embedded in Lemonade, so it ships inside `lemonade-onebit-…` as `1bit/`; the three
+native packages and the tarball are the same tree for a machine that installs Lemonade its own way
+([install-any-distro.md](install-any-distro.md)), and they install identical files at identical paths
+(`scripts/pack-distro.sh` wraps one payload; only the packaging differs). The engine's build-tree
+tarball (`1bit-<tag>-linux-x86_64.tar.zst`) is still not published on its own. There is no Windows
+package (Lemonade has its own Windows build). On the GPU the engine
 is pure HRX with HIP kernels: no Vulkan, ROCm backend, Metal, ZINC or CUDA. Lemonade serves those
 with its own backends.
 
@@ -472,7 +480,9 @@ WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-private scripts/weekly.sh ~/.cache/1bit-we
    below. A PR that passes is brought up to date, waits for CI, and is merged. One that fails stays
    open, and the release lists it as held back.
 2. **build** and **test**: `main` at the merged pins, the same way.
-3. **package**: the two packages above. `scripts/package-linux.sh` packs the engine first; its
+3. **package**: the two packages above, plus the engine's own packages for every family
+   (`scripts/mk-plugin-package.sh`: the `.deb`, `.rpm`, Arch package and tarball, all built from one
+   payload tree by `scripts/pack-distro.sh`). `scripts/package-linux.sh` packs the engine first; its
    tarball goes into the Lemonade + onebit package as `1bit/`, not into the release on its own.
 4. **release**: `tools/weekly_changes.py` lists, for every pin that moved since the last release,
    the upstream commits (authors, PRs) and releases in between; that becomes the release notes and
@@ -488,7 +498,10 @@ rehearsal found these only after the build) and stops with a message naming what
   `scripts/fetch-rocm-sdk.sh` at the pin in `config/hrx-toolchain.config` (`-DONEBIT_HRX_TOOLCHAIN=<dir>` in
   `WEEKLY_CMAKE_ARGS` uses another, e.g. TheRock in `/opt/rocm-therock`); `hipcc` from that toolchain or `/opt/rocm`,
   or `ROCM_PATH`. (The optional DwarfStar build that also wanted it is gone since 2026-11-02.)
-- **package:** `patchelf` (`scripts/package-linux.sh`); `node` and `npm` for Lemonade's web app
+- **package:** `patchelf` (`scripts/package-linux.sh`); `dpkg-deb` and `docker`
+  (`scripts/pack-distro.sh` builds the `.rpm` with rpmbuild in a `fedora` container and the Arch
+  package with makepkg in an `archlinux` one, since the release box has neither toolchain); `node`
+  and `npm` for Lemonade's web app
   (`LEMONADE_WEB_APP=1 scripts/build-lemonade.sh`; its `npm ci` needs the network); a readable kernel image for the `os/mini` image,
   `/boot/vmlinuz-$(uname -r)` or `VMLINUZ=<copy>` (Ubuntu's `/boot/vmlinuz-*` is root-only).
   Which kernel that image should carry, and how a new one is built, signed and gated before it is

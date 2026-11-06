@@ -372,6 +372,29 @@ carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's ow
 a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
 `plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
 
+#### What the stream is worth at the model level (measured)
+
+The phase numbers above are the kernel's. The number a user feels is a decode step, and it is the one that
+decided P3: same container file and same engine binary, two weight paths, adjacent windows on one quiet box
+(2026-11-02, three `npu-hold` tickets on `:18099`, `amdxdna` counter 0 in each, seven steady-state tokens per
+arm read from the serve's own `[ph] tok` lines):
+
+| container | decode | device wait | stream per token |
+|---|---|---|---|
+| pb16i (control) | 410 ms/token (409-412) = 2.44 tok/s | 296 ms | 12.93 GB |
+| **t2s2 sealed** | **313 ms/token (311-317) = 3.20 tok/s** | **209 ms** | **6.11 GB** |
+
+**1.31x per token and 1.42x on the device wait**, on 2.12x fewer bytes to stream (431 images, 14.44 -> 6.82 GB).
+The model keeps 1.31x of the kernel's 1.76x because a step is more than its GEMMs: the host half (quantise,
+rotation, GDN) and the lm head do not shrink with the wire, and in this pair they are 66 ms and 13.5 ms of it.
+
+Acceptance is byte-exactness, not a text diff: every decode role matched the pb16i path byte for byte at
+layer 0 (6/6) and layer 3 (8/8) on all three seeds, and greedy text is equal to the pb16i arm's on the prompt
+both were asked — `' Paris.\nThe capital of Germany is'`. **A request wall is not this number** — a fresh
+serve pays the image fill once, so a 32-token request measures 614/651 ms/token while the per-token instrument
+says 313/410; that correction, and why every request-wall figure in this file pays the fill, is in the chunk
+above.
+
 #### The image fill (what a fresh serve costs)
 
 A pb16i/t2s container's weights *are* the sidecar images, so a cold serve is a file read and nothing

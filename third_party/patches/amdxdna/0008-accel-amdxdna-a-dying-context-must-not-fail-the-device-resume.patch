@@ -1,0 +1,85 @@
+From d5cbd7961c821fa92f1e93b75a9b6fffbdeb0fbd Mon Sep 17 00:00:00 2001
+From: pi-kernel-74 <kernel@1bit.local>
+Date: Fri, 6 Nov 2026 15:43:45 -0400
+Subject: [PATCH] accel/amdxdna: a dying context must not fail the device
+ resume
+
+---
+ drivers/accel/amdxdna/aie2_ctx.c | 23 ++++++++++++++++++++++-
+ drivers/accel/amdxdna/aie2_pci.c | 14 +++++++++++---
+ 2 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index eccb1c4..7333b15 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -265,8 +265,29 @@ void aie2_hwctx_suspend(struct amdxdna_client *client)
+ static int aie2_hwctx_resume_cb(struct amdxdna_hwctx *hwctx, void *arg)
+ {
+ 	struct amdxdna_dev *xdna = hwctx->client->xdna;
++	int ret;
+ 
+-	return aie2_hwctx_restart(xdna, hwctx);
++	ret = aie2_hwctx_restart(xdna, hwctx);
++	/*
++	 * -ESRCH is aie2_hwctx_restart()'s "this context is being torn down":
++	 * its heap address is gone because the process is closing, so nothing
++	 * will submit on it again and there is nothing to restore for it.
++	 *
++	 * Letting that fail the walk is what took the array away from every
++	 * other client: amdxdna_hwctx_walk() stops at the first error, so the
++	 * contexts of this client after the dying one and of every client after
++	 * it stayed destroyed, and pm_runtime_resume_and_get() then reported
++	 * failure for a resume that had in fact started the hardware. Seen on
++	 * strixhalo as `amdxdna_pm_resume_get: Resume failed: -3` followed by
++	 * "restore data not reclaimed" at a close (engine#1051).
++	 */
++	if (ret == -ESRCH) {
++		XDNA_DBG(xdna, "%s is going away, nothing to resume for it",
++			 hwctx->name);
++		return 0;
++	}
++
++	return ret;
+ }
+ 
+ int aie2_hwctx_resume(struct amdxdna_client *client)
+diff --git a/drivers/accel/amdxdna/aie2_pci.c b/drivers/accel/amdxdna/aie2_pci.c
+index 666f5a5..12faf12 100644
+--- a/drivers/accel/amdxdna/aie2_pci.c
++++ b/drivers/accel/amdxdna/aie2_pci.c
+@@ -484,6 +484,7 @@ static int aie2_hw_suspend(struct amdxdna_dev *xdna)
+ static int aie2_hw_resume(struct amdxdna_dev *xdna)
+ {
+ 	struct amdxdna_client *client;
++	int first_err = 0;
+ 	int ret;
+ 
+ 	ret = aie2_hw_start(xdna);
+@@ -492,13 +493,20 @@ static int aie2_hw_resume(struct amdxdna_dev *xdna)
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Do not stop at the first client that fails: its contexts are its own,
++	 * and the clients after it in the list had their contexts destroyed by
++	 * the matching suspend. Breaking out of this loop left them with no
++	 * firmware context at all, so a single client's bad restart cost every
++	 * later client its device until the module was reloaded (engine#1051).
++	 */
+ 	list_for_each_entry(client, &xdna->client_list, node) {
+ 		ret = aie2_hwctx_resume(client);
+-		if (ret)
+-			break;
++		if (ret && !first_err)
++			first_err = ret;
+ 	}
+ 
+-	return ret;
++	return first_err;
+ }
+ 
+ /*
+-- 
+2.53.0
+

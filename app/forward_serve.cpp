@@ -578,7 +578,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 }
                 return true;
             };
-            run(emit_pieces);
+            const std::string finish = run(emit_pieces);
             {
                 std::vector<std::pair<bool, std::string>> tail;
                 stream.finish(tail);
@@ -602,6 +602,18 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     json delta{{"tool_calls", calls}};
                     if (!chunk_tpl.contains("object") || chunk_tpl["object"].is_null()) chunk["object"] = "chat.completion.chunk";
                     chunk["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", "tool_calls"}}});
+                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                }
+                // OpenAI's stream ends with one choice that carries an empty delta and the reason the
+                // generation ended; without it a streaming client cannot tell a `length` cut from a
+                // natural `stop` (the per-delta chunks all say null, and the usage tail has no
+                // choices at all). The tool-call chunk above already reports `tool_calls`, so this is
+                // sent exactly once, and only for the text path.
+                if (stream.calls().empty()) {
+                    json chunk = chunk_tpl;
+                    chunk["choices"] = json::array({{{"index", 0},
+                                                     {"delta", json::object()},
+                                                     {"finish_reason", finish}}});
                     chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
                 }
             }

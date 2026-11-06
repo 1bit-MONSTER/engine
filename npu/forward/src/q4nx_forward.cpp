@@ -3726,6 +3726,18 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
 
 bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_pos,
                                     std::vector<float>& logits_all) {
+    // A noncausal pack's full-attention layers read the whole prompt, so in a batch every row attends to
+    // the rows after it.  The per-row logits this function exists to return are the prefix-conditioned ones
+    // a draft verifier compares against, and a noncausal pass cannot produce them -- refuse by name, as
+    // step() and step_batch(start_pos>0) do, instead of handing back rows that no draft may be checked
+    // against.  Unreachable while d3 packs ship no draft head, which is why it is six lines and not a mode.
+    if (noncausal_attn_) {
+        err_ = "attention.mode noncausal_full_attention is a prompt-encoding mode and step_batch_all() "
+               "verifies drafted tokens: every row of that batch attends to the rows after it, so its "
+               "per-row logits are not the prefix-conditioned ones a draft is checked against (use "
+               "step_batch() with the whole prompt at position 0)";
+        return false;
+    }
     std::vector<float> last;
     std::vector<float>* saved = batch_all_out_;
     batch_all_out_ = &logits_all;

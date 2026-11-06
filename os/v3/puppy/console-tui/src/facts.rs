@@ -55,6 +55,85 @@ pub enum SecureBoot {
     Unknown,
 }
 
+/// Which system is running: the live stick (everything in RAM, nothing installed) or this machine's own disk.
+///
+/// `init.sh` already decides this at boot - `grep -q " /data " /proc/mounts && [ -e /data/.installed ]` - and
+/// leaves the answer in `/etc/1bit` (`installed` or `live`, touched beside the MODE banner). The console reads those
+/// markers rather than re-deriving the rule, and falls back to the same test when they are absent (a box whose
+/// marker write failed, or a console started by hand). #711 is why the screen says it at all: the owner saw
+/// "live usb is loaded up" while the banner facts came from the NVMe, and the console is the screen a person
+/// looks at all day - after the install it must not still look like a stick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    Live,
+    Installed,
+    #[default]
+    Unknown,
+}
+
+impl Mode {
+    pub fn word(self) -> Option<&'static str> {
+        match self {
+            Mode::Live => Some("LIVE"),
+            Mode::Installed => Some("INSTALLED"),
+            Mode::Unknown => None,
+        }
+    }
+}
+
+/// `mode_in` against the real root. Read-only, and cheap enough for the once-a-second frame.
+pub fn mode() -> Mode {
+    let mounted = data_mounted();
+    resolve(mode_in(Path::new("/"), mounted), mounted)
+}
+
+/// Is `/data` the mounted data partition? init.sh's rule is `grep -q " /data " /proc/mounts`, and that half matters on
+/// its own: a boot with /data mounted and no `.installed` on it is LIVE in init's own words.
+fn data_mounted() -> bool {
+    fs::read_to_string("/proc/mounts")
+        .map(|s| {
+            s.lines()
+                .any(|l| l.split_whitespace().nth(1) == Some("/data"))
+        })
+        .unwrap_or(false)
+}
+
+/// init's ELSE branch. When no marker exists (an init that could not write one, or a console started by hand on the
+/// appliance), the header said nothing while init's banner would have said LIVE - measured: the `(none)` row of the
+/// marker matrix, where the menu said live and the header was silent. With /data mounted and no `.installed`, LIVE is
+/// the faithful answer; with /data not mounted the box cannot say, and still says nothing.
+fn resolve(seen: Mode, data_mounted: bool) -> Mode {
+    match seen {
+        Mode::Unknown if data_mounted => Mode::Live,
+        m => m,
+    }
+}
+
+/// The installed-state decision, from a root and whether `/data` is a mounted partition.
+///
+/// `data_mounted` is a parameter for init's sake: its whole rule is `grep -q " /data " /proc/mounts && [ -e
+/// /data/.installed ]`, and the first half is not decoration. Without it, a `/data/.installed` file left visible while
+/// `/data` is NOT mounted read as INSTALLED here while the console menu - which asks the mount first - offered an
+/// install: measured with `~/wt/os3i/tui-menu-mode-probe.sh`, one row outside the marker matrix that both halves
+/// otherwise agree on. A boot cannot reach that state (`/data/.installed` only exists on the mounted partition, and
+/// `/data` on the RAM root is mkdir'd empty), but the rule is init's and is now implemented once, in init's shape.
+pub fn mode_in(root: &Path, data_mounted: bool) -> Mode {
+    let bit = |p: &str| root.join(p).exists();
+    // init's OWN rule first, because that is the decision: /data mounted with .installed on it is an installed boot,
+    // and the markers below are written FROM that decision. Marker-first ordering let a stale `live` marker outrank a
+    // real installed data partition - the console then said live on an installed box (measured in QEMU).
+    if data_mounted && bit("data/.installed") {
+        return Mode::Installed;
+    }
+    if bit("etc/1bit/installed") {
+        return Mode::Installed;
+    }
+    if bit("etc/1bit/live") {
+        return Mode::Live;
+    }
+    Mode::Unknown
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Gpu {
     /// false until the runtime has answered (the probe is cached and may still be running on the first draw)
@@ -105,6 +184,7 @@ pub struct Stats {
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     pub release: String,
+    pub mode: Mode,
     pub hostname: String,
     pub uptime_s: u64,
     pub secure_boot: SecureBoot,
@@ -144,6 +224,7 @@ impl Facts {
     pub fn collect() -> Facts {
         let mut f = Facts {
             release: release_tag(),
+            mode: mode(),
             hostname: hostname(),
             uptime_s: uptime_s(),
             secure_boot: secure_boot(),
@@ -681,24 +762,75 @@ pub fn json_raw(obj: &str, key: &str) -> Option<String> {
         return Some(rest[..end].trim().to_string());
     };
     let mut out = String::new();
-    let mut esc = false;
-    for c in s.chars() {
-        if esc {
-            out.push(match c {
-                'n' => '\n',
-                't' => '\t',
-                other => other,
-            });
-            esc = false;
-        } else if c == '\\' {
-            esc = true;
-        } else if c == '"' {
-            return Some(out);
-        } else {
-            out.push(c);
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match it.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
+                Some('u') => out.push_str(&json_unicode(&mut it)),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            },
+            other => out.push(other),
         }
     }
     None
+}
+
+/// The `\uXXXX` escape (and a surrogate pair, which is two of them). A serialiser that escapes non-ASCII delivers
+/// `caf\u00e9` - Python's `json.dumps` does that by default - and a model name or a recipe from the catalogue is DRAWN,
+/// so before this the screen said `cafu00e9`. A code point that is not a character (a lone surrogate) becomes U+FFFD, and
+/// a truncated escape keeps the bytes it actually had and consumes only the hex digits it took.
+fn json_unicode(it: &mut std::str::Chars) -> String {
+    let mut probe = it.clone();
+    let mut digits = String::new();
+    for _ in 0..4 {
+        match probe.next() {
+            Some(d) if d.is_ascii_hexdigit() => digits.push(d),
+            // not a hex digit: it is the next character of the string, not part of this escape
+            _ => break,
+        }
+    }
+    if digits.len() != 4 {
+        for _ in 0..digits.chars().count() {
+            it.next();
+        }
+        return format!("u{digits}");
+    }
+    *it = probe;
+    let Ok(v) = u32::from_str_radix(&digits, 16) else {
+        return format!("u{digits}");
+    };
+    let cp = if (0xD800..0xDC00).contains(&v) {
+        // a high surrogate is one half of a pair: take the low one with it, or say so
+        let mut peek = it.clone();
+        let mut lo = String::new();
+        if peek.next() == Some('\\') && peek.next() == Some('u') {
+            for _ in 0..4 {
+                match peek.next() {
+                    Some(d) if d.is_ascii_hexdigit() => lo.push(d),
+                    _ => break,
+                }
+            }
+        }
+        match u32::from_str_radix(&lo, 16) {
+            Ok(w) if lo.len() == 4 && (0xDC00..0xE000).contains(&w) => {
+                *it = peek;
+                0x10000 + ((v - 0xD800) << 10) + (w - 0xDC00)
+            }
+            _ => 0xFFFD,
+        }
+    } else if (0xDC00..0xE000).contains(&v) {
+        0xFFFD
+    } else {
+        v
+    };
+    char::from_u32(cp).unwrap_or('\u{FFFD}').to_string()
 }
 
 pub fn json_str(obj: &str, key: &str) -> Option<String> {
@@ -1029,7 +1161,9 @@ pub fn pane_lines(all: Vec<String>, max: usize) -> Vec<String> {
     let keep = kept.len().saturating_sub(max - (polls > 0) as usize);
     let mut kept = kept.split_off(keep);
     if polls > 0 {
-        kept.push(format!("LEM ({polls} debug lines hidden: GET /api/v1 polling)"));
+        kept.push(format!(
+            "LEM ({polls} debug lines hidden: GET /api/v1 polling)"
+        ));
     }
     kept
 }
@@ -1045,43 +1179,52 @@ pub fn is_poll_noise(line: &str) -> bool {
 /// Wrap on spaces so nothing is ever cut inside a word. A single word longer than `width` is cut as a last
 /// resort (it is a path or a token, not prose).
 pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
+    wrap_hanging(text, width, width)
+}
+
+/// `wrap_words`, but the lines after the first get `rest` cells instead of `first`.
+///
+/// A caller that draws a continuation row with an indent (`"  …"`) must take those cells out of the wrap:
+/// wrapping to the pane width and THEN indenting makes the row two cells wider than the pane, and the widget
+/// clips the end of it - measured at 80x25 on a wrapped Lemonade record, which lost `a38` and drew `a3` (both
+/// a lost word and a word cut in the middle, the two things this module promises never happen). `rest` is the
+/// room left after the indent, so `wrap_hanging(t, w, w - 2)` is the shape every indenting caller wants.
+///
+/// Widths are counted in CHARS, not in terminal cells: a log or a model name that carries double-width glyphs
+/// can still overrun its row by one cell per glyph. Upgrade to a width table if a box carries CJK log text.
+pub fn wrap_hanging(text: &str, first: usize, rest: usize) -> Vec<String> {
+    let first = first.max(1);
+    let rest = rest.max(1);
+    let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     for word in text.split_whitespace() {
-        if word.chars().count() > width {
+        let mut todo = word.to_string();
+        loop {
+            // the limit of the row `cur` is being packed onto: the opening one, or one a caller will indent
+            let width = if out.is_empty() { first } else { rest };
+            let space = usize::from(!cur.is_empty());
+            if cur.chars().count() + space + todo.chars().count() <= width {
+                if space == 1 {
+                    cur.push(' ');
+                }
+                cur.push_str(&todo);
+                break;
+            }
             if !cur.is_empty() {
+                // it may still fit a line of its own, and that line's limit is the narrower one
                 out.push(std::mem::take(&mut cur));
+                continue;
             }
-            let mut w = word.chars();
-            loop {
-                let piece: String = w.by_ref().take(width).collect();
-                if piece.is_empty() {
-                    break;
-                }
-                let more = w.clone().next().is_some();
-                if more {
-                    out.push(piece);
-                } else {
-                    cur = piece;
-                    break;
-                }
+            // `cur` is empty and the word is wider than a whole line: cut it, as a last resort
+            let mut it = todo.chars();
+            let piece: String = it.by_ref().take(width).collect();
+            let tail: String = it.collect();
+            if tail.is_empty() {
+                cur = piece;
+                break;
             }
-            continue;
-        }
-        let extra = if cur.is_empty() {
-            word.chars().count()
-        } else {
-            word.chars().count() + 1
-        };
-        if cur.chars().count() + extra > width {
-            out.push(std::mem::take(&mut cur));
-            cur = word.to_string();
-        } else {
-            if !cur.is_empty() {
-                cur.push(' ');
-            }
-            cur.push_str(word);
+            out.push(piece);
+            todo = tail;
         }
     }
     if !cur.is_empty() {
@@ -1127,6 +1270,8 @@ pub fn token(page: usize) -> &'static str {
 pub fn c16_board() -> Facts {
     Facts {
         release: "rc-2026-11-03-c16".into(),
+        // the c16 boot the fixtures freeze is the stick's (the demo path); INSTALLED is the other branch
+        mode: Mode::Live,
         hostname: "strix".into(),
         uptime_s: 2 * 3600 + 13 * 60,
         secure_boot: SecureBoot::Enabled,
@@ -1223,6 +1368,64 @@ mod tests {
         );
         assert_eq!(env.get("HRX_ALLOW_NO_SVM").map(String::as_str), Some("1"));
         assert_eq!(env.len(), 5);
+    }
+
+    #[test]
+    fn the_mode_is_what_init_wrote() {
+        // init.sh is the one that decides (its own rule: /data mounted and /data/.installed present), and it leaves
+        // the answer in /etc/1bit. The console reads that instead of re-deriving it, and falls back to init's rule
+        // when the marker is not there. Measured against dirs, not against this dev box.
+        let root = std::env::temp_dir().join(format!("mode-in-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("etc/1bit")).unwrap();
+        assert_eq!(
+            mode_in(&root, true),
+            Mode::Unknown,
+            "an empty box has no mode to report"
+        );
+        fs::write(root.join("etc/1bit/live"), "").unwrap();
+        assert_eq!(mode_in(&root, true), Mode::Live);
+        // ... and a real installed data partition outranks a stale `live` marker: init's own rule is the decision,
+        // the markers are written from it (this ordering was wrong in the first version - measured in QEMU)
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(root.join("data/.installed"), "").unwrap();
+        assert_eq!(
+            mode_in(&root, true),
+            Mode::Installed,
+            "a stale live marker outranked /data/.installed"
+        );
+        // the mount half of init's rule, which this function used to drop: the same file with /data NOT mounted is
+        // not an installed boot (init would not have written the marker), and the menu agrees - measured in
+        // ~/wt/os3i/tui-menu-mode-probe.sh, where the header said INSTALLED and the menu offered an install.
+        assert_eq!(
+            mode_in(&root, false),
+            Mode::Live,
+            "/data/.installed without /data mounted read as INSTALLED"
+        );
+        fs::remove_file(root.join("data/.installed")).unwrap();
+        // an installed boot that somehow kept the live marker still reads installed: the marker init writes wins,
+        // and it writes `installed` after the MODE banner
+        fs::write(root.join("etc/1bit/installed"), "").unwrap();
+        assert_eq!(mode_in(&root, true), Mode::Installed);
+        // no markers at all (an init that could not write them) -> init's own fallback, /data/.installed
+        let root2 = std::env::temp_dir().join(format!("mode-in2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root2);
+        fs::create_dir_all(root2.join("data")).unwrap();
+        fs::write(root2.join("data/.installed"), "").unwrap();
+        assert_eq!(mode_in(&root2, true), Mode::Installed);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn a_boot_with_data_mounted_and_no_marker_is_live() {
+        // init.sh's else branch: INSTALLED needs /data + .installed; anything else is LIVE. The reason this matters is
+        // the `(none)` row of ~/wt/tui-vm/mode-agreement-check.sh: the menu said live, the header was silent.
+        assert_eq!(resolve(Mode::Unknown, true), Mode::Live);
+        assert_eq!(resolve(Mode::Unknown, false), Mode::Unknown); // no /data: the box cannot say, so it does not invent
+        assert_eq!(resolve(Mode::Installed, true), Mode::Installed);
+        assert_eq!(resolve(Mode::Installed, false), Mode::Installed); // the marker alone is still an answer
+        assert_eq!(resolve(Mode::Live, true), Mode::Live);
     }
 
     #[test]
@@ -1361,8 +1564,8 @@ mod tests {
         }
         assert_eq!(screen_text(""), "");
         // and the catalogue is sanitised where it enters, because a model name is drawn: whatever bytes the JSON hands
-        // over, what is DRAWN is cleaned. (A literal ESC is used rather
-        // than a `\u001b` escape because this crate's JSON reader does not implement `\uXXXX` - see the note in json_raw.)
+        // over, what is DRAWN is cleaned - first the escape is decoded (`\uXXXX`, see json_unicode), then the control
+        // bytes it decodes to are stripped, which is the order a real body arrives in.
         let esc = '\u{1b}';
         let json = format!(
             "{{\"data\":[{{\"id\":\"evil{esc}[2Jmodel\",\"created\":0,\"object\":\"model\",\"recipe\":\"llamacpp\",\"downloaded\":true,\"recipe_options\":{{\"onebit_backend\":\"gpu{esc}[31m\"}}}}]}}"
@@ -1371,6 +1574,67 @@ mod tests {
         // the whole CSI goes, not just its ESC: those bytes are control, not text
         assert_eq!(m.downloaded, vec!["evilmodel"]);
         assert_eq!(m.engines[0].backend.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    fn a_json_escape_is_decoded_before_it_becomes_a_cell() {
+        // The shape a serialiser actually produces for a non-ASCII name: Python's `json.dumps` escapes by default, so
+        // Lemonade's catalogue hands over `\u00e9` rather than the UTF-8 byte. Before this the row said `cafu00e9`.
+        assert_eq!(
+            json_str(r#"{"id":"caf\u00e9","recipe":"x"}"#, "id").as_deref(),
+            Some("café")
+        );
+        assert_eq!(
+            json_str(r#"{"id":"x","recipe":"\u65e5\u672c\u8a9e"}"#, "recipe").as_deref(),
+            Some("日本語")
+        );
+        // a surrogate pair is ONE character; a lone half of one is not a character at all
+        assert_eq!(
+            json_str(r#"{"id":"\ud83d\ude00"}"#, "id").as_deref(),
+            Some("\u{1F600}")
+        );
+        assert_eq!(
+            json_str(r#"{"id":"a\ud83db"}"#, "id").as_deref(),
+            Some("a\u{FFFD}b")
+        );
+        // escapes that are characters in their own right, which used to come through as the letter
+        assert_eq!(
+            json_str(r#"{"id":"a\rb\bc\fd"}"#, "id").as_deref(),
+            Some("a\rb\u{8}c\u{c}d")
+        );
+        // an escape this reader does not know, and a truncated one, keep what the bytes said
+        assert_eq!(json_str(r#"{"id":"a\qb"}"#, "id").as_deref(), Some("aqb"));
+        assert_eq!(json_str(r#"{"id":"a\u12"}"#, "id").as_deref(), Some("au12"));
+        // and nothing else moved
+        assert_eq!(
+            json_str(r#"{"id":"plain-1bit","recipe":"llamacpp"}"#, "id").as_deref(),
+            Some("plain-1bit")
+        );
+    }
+
+    #[test]
+    fn an_escaped_catalogue_name_reaches_the_engine_row_decoded() {
+        // The unit test above is about the reader; this is about the row a person reads: the escape is decoded, the
+        // sanitiser then has real bytes to clean, and what is drawn is the name the catalogue meant.
+        let json = r#"{"data":[{"id":"qwen3-caf\u00e9","created":0,"object":"model","recipe":"llamacpp","downloaded":true,
+            "recipe_options":{"onebit_backend":"gpu"}}]}"#;
+        let m = models_from(json);
+        assert_eq!(m.downloaded, vec!["qwen3-café"]);
+        assert_eq!(m.engines[0].recipe, "llamacpp");
+        assert_eq!(m.engines[0].backend.as_deref(), Some("gpu"));
+        // (loaded: the catalogue's own names; serving: what /api/v1/health says answered)
+        let loaded = m.downloaded.clone();
+        assert_eq!(
+            engine_of(&loaded, Some("qwen3-café"), &m.engines, &[]),
+            Some("llamacpp (gpu)".into())
+        );
+        // and a body that escapes a CONTROL character is decoded first and then stripped, in that order: the cell never
+        // sees the ESC. (`\u001b` used to arrive here as the four characters `u001b`, so the sanitiser had nothing to do.)
+        let evil = r#"{"data":[{"id":"evil\u001b[2Jmodel","created":0,"object":"model","recipe":"llamacpp","downloaded":true,
+            "recipe_options":{"onebit_backend":"gpu\u001b[31m"}}]}"#;
+        let e = models_from(evil);
+        assert_eq!(e.downloaded, vec!["evilmodel"]);
+        assert_eq!(e.engines[0].backend.as_deref(), Some("gpu"));
     }
 
     #[test]
@@ -1518,15 +1782,34 @@ mod tests {
         all.push("KRN [   12.1] amdxdna 0000:c6:00.1: TDR timeout detected".into());
 
         let pane = pane_lines(all.clone(), 400);
-        assert!(!pane.iter().any(|l| is_poll_noise(l)), "a poll reached the pane: {pane:?}");
-        assert!(pane.iter().any(|l| l.contains("POST /api/v1/chat/completions")), "the chat is gone");
+        assert!(
+            !pane.iter().any(|l| is_poll_noise(l)),
+            "a poll reached the pane: {pane:?}"
+        );
+        assert!(
+            pane.iter()
+                .any(|l| l.contains("POST /api/v1/chat/completions")),
+            "the chat is gone"
+        );
         assert!(pane.iter().any(|l| l.contains("Loading model")));
-        assert!(pane.iter().any(|l| l.contains("backend exited 1")), "an error is never hidden");
-        assert!(pane.iter().any(|l| l.contains("TDR timeout")), "a kernel line is never hidden");
-        assert_eq!(pane.last().unwrap(), "LEM (40 debug lines hidden: GET /api/v1 polling)");
+        assert!(
+            pane.iter().any(|l| l.contains("backend exited 1")),
+            "an error is never hidden"
+        );
+        assert!(
+            pane.iter().any(|l| l.contains("TDR timeout")),
+            "a kernel line is never hidden"
+        );
+        assert_eq!(
+            pane.last().unwrap(),
+            "LEM (40 debug lines hidden: GET /api/v1 polling)"
+        );
 
         // no polls, no marker: an honest pane says nothing about noise that never happened
-        let quiet = pane_lines(vec!["KRN [ 1.0] amdgpu: HRX runtime registered".into()], 400);
+        let quiet = pane_lines(
+            vec!["KRN [ 1.0] amdgpu: HRX runtime registered".into()],
+            400,
+        );
         assert_eq!(quiet.len(), 1);
         // and the cap counts the marker, so the pane never grows by a line when there is noise
         let many: Vec<String> = (0..50).map(|i| format!("LEM event {i}")).collect();
@@ -1538,6 +1821,35 @@ mod tests {
         assert_eq!(human_uptime(2 * 3600 + 13 * 60), "2h 13m");
         assert_eq!(human_uptime(3 * 86400 + 60), "3d 0h 1m");
         assert_eq!(human_bytes(62277025792), "58G");
+    }
+
+    #[test]
+    fn a_continuation_fits_the_row_it_is_drawn_on() {
+        // The indent a caller adds to a continuation row is part of that row's budget. Wrapping to the full
+        // width and indenting afterwards put the row two cells past the pane, and the widget clipped the end:
+        // at 80x25 a wrapped Lemonade record lost `a38` and drew `a3`. This holds the two widths apart.
+        let text = "LEM a01 a02 a03 a04 a05 a06 a07 a08 a09 a10 a11 a12 a13 a14 a15 a16 a17 a18 a19 a20 a21 a22";
+        for w in 8..=120usize {
+            let lines = wrap_hanging(text, w, w.saturating_sub(2));
+            for (i, line) in lines.iter().enumerate() {
+                let room = if i == 0 { w } else { w.saturating_sub(2) };
+                assert!(
+                    line.chars().count() <= room.max(1),
+                    "width {w}: row {i} is {} cells in a {room}-cell row: {line:?}",
+                    line.chars().count()
+                );
+            }
+            // and nothing is lost on the way, which is the half the width check cannot see
+            let joined: Vec<&str> = lines.iter().flat_map(|l| l.split_whitespace()).collect();
+            assert_eq!(joined.join(" "), text, "width {w} lost or reordered text");
+        }
+        // the shape is unchanged when the two agree (every caller that does not indent keeps wrap_words)
+        for w in 1..=40usize {
+            assert_eq!(
+                wrap_words("alpha beta gamma delta", w),
+                wrap_hanging("alpha beta gamma delta", w, w)
+            );
+        }
     }
 
     #[test]

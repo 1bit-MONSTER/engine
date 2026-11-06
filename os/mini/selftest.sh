@@ -27,6 +27,15 @@ KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf 2>/dev/null | 
 # before the first request: the models call below used to go out unauthenticated and get 401.
 AUTH=""; [ -n "$KEY" ] && AUTH="Authorization: Bearer $KEY"
 LOG=/data/selftest.log
+# The engine's own lines go to a different file on each image: os/mini's init runs lemond with /tmp/lemond.log,
+# while the Puppy appliance's /etc/init.d/10lemonade runs it with /var/log/lemond-onebit.log (measured in that
+# unit). Hard-coding one path made the NPU rows below fail on the other image for a path reason, not a real one.
+LEMLOG=""
+for L in /tmp/lemond.log /var/log/lemond-onebit.log; do
+    [ -f "$L" ] && { LEMLOG=$L; break; }
+done
+# where to send the reader when there is no log at all: both candidates, not a guess between them
+LEMHINT=${LEMLOG:-"neither /tmp/lemond.log nor /var/log/lemond-onebit.log"}
 say() { echo "$@"; [ -w /data ] && echo "$@" >> "$LOG" 2>/dev/null; }
 
 say "1bit OS self-test  $(date -u +%FT%TZ)"
@@ -40,9 +49,15 @@ if [ -e /etc/1bit/installed ]; then
 elif [ -e /etc/1bit/live ]; then
     MODE=LIVE
     MODEWHAT="RAM only, nothing installed, internal disks never mounted"
+elif [ -e /data/lemonade ] && [ ! -e /data/.installed ]; then
+    # The Puppy appliance has no os/mini init, so nothing writes /etc/1bit/live there; its data partition is
+    # still the live one. release-check.sh has carried this same fallback since c12 and passes on the board
+    # with it, so this is that rule, not a new one.
+    MODE=LIVE
+    MODEWHAT="RAM only, /data on the stick, internal disks never mounted"
 else
     MODE=UNKNOWN
-    MODEWHAT="no marker in /etc/1bit, so this boot cannot say where it came from"
+    MODEWHAT="no marker in /etc/1bit and no /data/lemonade, so this boot cannot say where it came from"
 fi
 say "  mode      : $MODE - $MODEWHAT"
 say "  kernel    : $(uname -r)"
@@ -53,7 +68,7 @@ say "  IP        : $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $
 
 MODELS=$(wget -q -O - ${AUTH:+--header="$AUTH"} "http://127.0.0.1:$PORT/api/v1/models" 2>/dev/null)
 if [ -z "$MODELS" ]; then
-    say "  Lemonade  : no answer on 127.0.0.1:$PORT (see /tmp/lemond.log)"
+    say "  Lemonade  : no answer on 127.0.0.1:$PORT (see $LEMHINT)"
     say "  hint      : if lemond is up this is usually the API key (401): grep LEMONADE_API_KEY /data/lemonade/lemond.conf"
     say "              otherwise run 'lemonade list'; models go in /data/models"
     exit 1
@@ -88,13 +103,16 @@ esac
 # a SECOND engine: the NPU takes one engine context at a time, and a second one poisons it - "npu runtime:
 # invalid call (code 614): state 8" - which left Lemonade unable to load a model until a reboot. Proving it
 # through Lemonade is also the thing the owner actually uses.
-ONNPU=$(grep -a "1bit unified: loading .* on the NPU" /tmp/lemond.log 2>/dev/null | tail -1)
-PLACE=$(grep -a "1bit unified: on the private route" /tmp/lemond.log 2>/dev/null | tail -1)
+ONNPU=; PLACE=
+if [ -n "$LEMLOG" ]; then
+    ONNPU=$(grep -a "1bit unified: loading .* on the NPU" "$LEMLOG" 2>/dev/null | tail -1)
+    PLACE=$(grep -a "1bit unified: on the private route" "$LEMLOG" 2>/dev/null | tail -1)
+fi
 if [ -n "$ONNPU" ] && [ -n "$PLACE" ]; then
     say "  NPU model  : $(printf '%s' "$ONNPU" | sed 's/.*1bit unified: loading //')"
     say "  placement  : $(printf '%s' "$PLACE" | sed 's/.*1bit unified: //' | cut -c1-100)"
     say "  RESULT-NPU : PASS - Lemonade ran the engine on the NPU (the engine's own log lines)"
 else
-    say "  RESULT-NPU : FAIL - the engine never reported loading on the NPU (see /tmp/lemond.log)"
+    say "  RESULT-NPU : FAIL - the engine never reported loading on the NPU (looked at $LEMHINT)"
 fi
 say "  evidence  : appended to $LOG"

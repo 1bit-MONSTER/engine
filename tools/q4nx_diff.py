@@ -244,6 +244,14 @@ def verdict(results):
     container. So name the layout that matched, and when none did, name the closest and say so instead
     of implying the container is broken.
     """
+    # A layout that compared NO tensor is not evidence of anything: `_decode_pass` returns
+    # (0, 0, 0.0) when every tensor was skipped, and worst=0.0 with rival=0.0 satisfies
+    # "rival >= worst * RATIO", so such a layout used to be reported as a MATCH on whichever one
+    # sorted first -- measured: a 0.6B container against a 4B GGUF came back
+    # `matches layout flm (worst max|err| 0.000e+00, ...)` with 0 tensors compared (engine#1110
+    # review).  Drop the layouts with no evidence before choosing, and if none is left say so:
+    # every caller already has a branch for rc=2.
+    results = {k: v for k, v in results.items() if v[0] + v[1] > 0}
     if not results:
         return 2, "nothing was compared"
     order = sorted(results, key=lambda k: results[k][2])
@@ -323,14 +331,24 @@ def _decode_pass(args, layout, quiet=False):
             padded_n += 1
         ref = dequantize(t.data, t.tensor_type).astype(np.float64).reshape(rows, cols)
         err = np.abs(got - ref)
-        ok = not err.any()
+        # A tile whose scale/zero planes decode to inf or NaN (a corrupt container) must read as a
+        # MISMATCH, never as a 0.000e+00 error.  Note which value leaked: NaN is *truthy*, so
+        # `err.any()` already counted the tensor inexact -- the error was that `mx` was NaN and
+        # `nan > worst[0]` is False, so `worst` stayed 0.0 and verdict()'s `rival >= worst * RATIO`
+        # tie named the layout a match.  Measured on random tile bytes
+        # (tests/tile_check_no_shared_tensor_test.py): exact=0 inexact=1 worst=0.000e+00, "match".
+        finite = np.isfinite(err)
+        mx = float(err[finite].max()) if finite.any() else 0.0
+        if not finite.all():
+            mx = float("inf")
+        ok = bool(finite.all()) and not err.any()
         exact += ok
         inexact += (not ok)
-        if err.max() > worst[0]:
-            worst = (float(err.max()), t.name)
+        if mx > worst[0]:
+            worst = (mx, t.name)
         if not quiet and (args.verbose or not ok or padded):
             print("%s %-46s %-5s max|err| %.3e  rms %.3e%s"
-                  % ("ok  " if ok else "BAD ", t.name, t.tensor_type.name, err.max(),
+                  % ("ok  " if ok else "BAD ", t.name, t.tensor_type.name, mx,
                      float(np.sqrt((err ** 2).mean())),
                      "  [padded %dx%d read as %dx%d]" % (rows, cols, rows_p, cols_p) if padded else ""))
     if not quiet:
@@ -350,7 +368,7 @@ def decode_cmd(args):
 
 
 def self_test():
-    """The verdict logic, with the four cases this lane measured on real containers."""
+    """The verdict logic, with the cases measured on real containers plus the 0-tensor tie."""
     bad = []
     cases = [
         # what a correct container looks like: one layout exact (a round trip), the other noise
@@ -363,6 +381,10 @@ def self_test():
         # ambiguous: close to the tolerance and not clearly better than its rival
         ({"ours": (0, 12, 0.09), "flm": (0, 12, 0.12)}, 1, "NO", "not clearly better than the rival"),
         ({}, 2, "nothing", "nothing compared"),
+        # both layouts skipped every tensor: a 0-vs-0 tie is not a match (engine#1110 review)
+        ({"ours": (0, 0, 0.0), "flm": (0, 0, 0.0)}, 2, "nothing", "two layouts that compared no tensor"),
+        # one layout compared tensors and the other did not: the one with evidence decides
+        ({"ours": (0, 0, 0.0), "flm": (0, 12, 1.6)}, 1, "NO", "a layout with no evidence cannot win"),
     ]
     for results, want_rc, want_word, what in cases:
         rc, line = verdict(results)
@@ -374,7 +396,7 @@ def self_test():
             print("  " + b)
         return 1
     print("self-test passed: the verdict names the matching layout, accepts a lossy-but-correct pack, "
-          "and refuses tiles from other weights")
+          "refuses tiles from other weights, and treats a layout that compared nothing as no evidence")
     return 0
 
 

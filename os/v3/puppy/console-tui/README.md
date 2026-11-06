@@ -121,6 +121,33 @@ remains arithmetic (one escape plus 4.5 KiB) - a person at the monitor or a 60 f
 
 This is insurance, not the fix for a noisy writer: a writer that paints this screen is still a defect in the writer.
 
+**Text from outside is cleaned before it becomes a cell.** Two of the pane's inputs are not ours - the tail of Lemonade's
+log and the catalogue's names - and a cell's symbol is written to the terminal unchanged, so a control byte that arrives
+as *data* is a control byte on the appliance's screen. It is reachable without malice: at `log_level: debug` that log
+carries the demo pages' prompts, and the engine's progress-bar lines carry `ESC[K` (erase to end of line) and a bare CR.
+Measured against the take's own log, the shipped c26 candidate (`5b21a0a8…`, which has the heal and not this) leaves
+**4 escape bytes in one frame**, and on a 240x67 pty its progress row is cut at the first `ESC[K` with the wrapped
+remainder gone; this build is **0 bytes**. On the appliance's own 160x50 text console the same line came back whole on
+both binaries - the once-a-second full paint rewrites the cells the erase cleared - so this is defence in depth, not a
+visible repair: a cell is simply not the place to execute what a log file says.
+`facts::screen_text()` removes CSI and OSC whole (the bytes after an escape are control, not text), turns TAB into a
+space and drops the other C0/DEL; everything else is untouched (`SoC 78°C`, `café`, `┌─┐`), and it is applied where
+external text enters, so no draw site can forget it (`a_log_line_or_a_model_name_cannot_carry_an_escape_into_the_screen`).
+
+**And the reader decodes a JSON escape before the sanitiser sees it.** Lemonade's catalogue arrives with `\uXXXX` in it
+whenever a serialiser escapes non-ASCII (Python's `json.dumps` does that by default), so `facts::json_unicode()` turns
+`caf\u00e9` into `café` - surrogate pairs into one character, a lone half into U+FFFD, a truncated escape into the bytes it
+had - and *then* `screen_text()` strips whatever control characters an escape decodes to (`\u001b[2J`). The order matters:
+before this the pane drew the escape's four characters (`cafu00e9`), and a `\u001b` body had nothing for the sanitiser to
+remove (`a_json_escape_is_decoded_before_it_becomes_a_cell`).
+
+**An interrupted paint repaints; a terminal that cannot be written still ends the console.** A paint that fails with
+`ErrorKind::Interrupted` drew nothing - a signal arrived before the write reached the terminal - so the next pass simply
+paints again instead of ending the screen. That is reachable in normal use: crossterm's event source installs a SIGWINCH
+handler, so an ssh user dragging a window edge is the realistic trigger. Every other error kind still exits, which is
+what hands tty1 to the `dialog` menu (`paint_failed()`;
+`an_interrupted_paint_is_repainted_but_a_dead_terminal_ends_the_console`).
+
 ## Keys
 
 | key | what it does |
@@ -212,7 +239,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 52 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders, the engine row's model choice
+cargo test                                    # the suite: the probe parsers (incl. the JSON escapes), the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders, the engine row's model choice, the escape sanitiser, the interrupted paint
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

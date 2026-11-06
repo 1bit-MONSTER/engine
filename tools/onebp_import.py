@@ -424,7 +424,15 @@ def verify(args, h, plan, extra, table, header, data_start):
     a verifier reading the index quant compares f32 source bytes against bf16 container bytes and
     reports 141 of 337 tensors "differing" on a container it just wrote itself.
     """
+    if not args.out_dir:
+        raise SystemExit("--verify needs the <out dir> of a container that is already on disk: it compares "
+                         "that container against this package instead of writing one. Run the import "
+                         "first, then --verify the same directory -- the two are separate runs because "
+                         "only the import reads --config.")
     path = os.path.join(args.out_dir, "model.q4nx")
+    if not os.path.exists(path):
+        raise SystemExit(f"--verify: no container at {path}. It checks one that is already there and writes "
+                         f"nothing; import first (without --verify), then --verify that directory.")
     bad, checked = 0, 0
     with open(path, "rb") as cf, open(args.onebp, "rb") as sf:
         (hlen,) = struct.unpack("<Q", cf.read(8))

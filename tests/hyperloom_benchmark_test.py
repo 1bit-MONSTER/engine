@@ -196,6 +196,41 @@ def main():
     assert got["gtt_used_gib"] == 1.0, got  # start GTT, not the last one
     assert bench.box_summary([]) is None
 
+    # And the NPU is a condition of the score, not just of the die: the 2026-11-05 policy entry for this
+    # box says the engines coexist safely but that a GPU arm beside a running NPU *matrix* corrupts both
+    # lanes' numbers. This lane's arm was refused 27 times on that gate, and a number measured beside a
+    # job has to be able to say so -- the owner's resident `npu-serve-keeper` is baseline, not a job.
+    real_home = os.environ.pop("HL_REAL_HOME", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            os.environ["HL_REAL_HOME"] = tmp
+            assert bench.npu_conditions() == {"npu_holder": None, "npu_job": False,
+                                              "npu_queued": 0}, bench.npu_conditions()
+            (home / "NPU-TOKEN").write_text("npu-serve-keeper pid 4675\n", encoding="utf-8")
+            assert bench.npu_conditions()["npu_job"] is False   # the resident serve is baseline
+            (home / "NPU-QUEUE").mkdir()
+            (home / "NPU-QUEUE/.log").write_text("noise\n", encoding="utf-8")
+            (home / "NPU-QUEUE/0179392.mosaic-regate9").write_text("pid=1\n", encoding="utf-8")
+            (home / "NPU-TOKEN").write_text("gpu-hold mosaic-regate9 pid 1584738 2026-11-05\n",
+                                             encoding="utf-8")
+            got = bench.npu_conditions()
+            assert got["npu_job"] is True and got["npu_queued"] == 1, got  # dotfiles are not tickets
+            assert got["npu_holder"].startswith("gpu-hold mosaic-regate9"), got
+            # A half-written or unreadable claim file is not a quiet NPU.
+            (home / "NPU-TOKEN").write_text("\n", encoding="utf-8")
+            assert bench.npu_conditions()["npu_holder"] is None, bench.npu_conditions()
+            # And the arm's own summary counts how many of its samples saw a job.
+            got = bench.box_summary([{"tctl_c": 60.0, "npu_job": False},
+                                     {"tctl_c": 61.0, "npu_job": True},
+                                     {"tctl_c": 62.0, "npu_job": True}])
+            assert (got["npu_job_samples"], got["npu_samples"]) == (2, 3), got
+            assert got["npu_job"] is False, got  # the start snapshot, same shape as gtt_used_gib
+    finally:
+        os.environ.pop("HL_REAL_HOME", None)
+        if real_home is not None:
+            os.environ["HL_REAL_HOME"] = real_home
+
     # And the verdict has to name what it was relative to: `HL_STATE` is per-box and the base logits are
     # regenerated when missing, so a KLD number reads PASS against a reference the JSON never named.
     with tempfile.TemporaryDirectory() as tmp:

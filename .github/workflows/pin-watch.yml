@@ -61,9 +61,16 @@ jobs:
           set -uo pipefail
           # exit 1 means "a pin moved", which is the normal case this workflow exists for
           rc=0
-          python3 tools/pin_watch.py --check --out pin-report.md || rc=$?
+          # --orgs also censuses our own orgs: a model published tomorrow is pinned by nobody until it is
+          # the JSON beside the report is the same sweep, so the PR step below does not repeat it
+          python3 tools/pin_watch.py --check --orgs 1bit-MONSTER,bong-water-water-bong --out pin-report.md --json pin-report.json || rc=$?
           if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then exit "$rc"; fi
           echo "moved=$(grep -c '^## `' pin-report.md || true)" >> "$GITHUB_OUTPUT"
+          # a pin nobody could read, or a published repo nobody pinned, is not a clean day: annotate the
+          # run with the report's own first line instead of leaving it to whoever opens the summary
+          if head -1 pin-report.md | grep -Eq 'not checked|not pinned'; then
+            echo "::warning::$(head -1 pin-report.md) — see the summary"
+          fi
           cat pin-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Open one pin bump per changed repo
@@ -82,17 +89,27 @@ jobs:
             if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null 2>&1; then
               echo "$branch already exists"; continue
             fi
-            git switch -c "$branch" main --quiet
-            if ! python3 tools/pin_watch.py --bump "$repo"; then
-              # a tracked file vanished upstream: the report says so, and a human decides
-              echo "::warning::$repo could not be bumped automatically (see the report)"
+            # -C, not -c: a bump that failed earlier in this run left its branch behind, and a
+            # "branch already exists" abort here would leave every later repo unbumped
+            git switch -C "$branch" main --quiet
+            rc=0
+            python3 tools/pin_watch.py --bump "$repo" || rc=$?
+            if [ "$rc" -eq 4 ]; then
+              # gone upstream, or a tracked file did: the report says so, and a human decides
+              echo "::warning::$repo needs a human decision (see the report); no bump opened"
+              git checkout -- models/pins.json 2>/dev/null || true
               git switch main --quiet
               continue
+            elif [ "$rc" -ne 0 ]; then
+              # anything else is an unread upstream, which is not a clean day
+              echo "::error::$repo could not be bumped (rc=$rc): this run is not a clean one"
+              exit 1
             fi
-            python3 tools/pin_watch.py --pr-body "$repo" > body.md || true
+            # no `|| true`: a body that could not be produced is a broken report, not an empty PR
+            python3 tools/pin_watch.py --pr-body "$repo" --from pin-report.json > body.md
             newsha=$(python3 -c 'import json,sys; print(json.load(open("models/pins.json"))["pins"][sys.argv[1]]["commit"][:8])' "$repo")
             git add models/pins.json
-            git commit -q -m "pin: $repo at $newsha""
+            git commit -q -m "pin: $repo at $newsha"
             git push -q origin "$branch"
             gh pr create --base main --head "$branch" --title "Pin: $repo" --body-file body.md
             git switch main --quiet

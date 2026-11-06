@@ -212,6 +212,17 @@ now reporting the INSTALLED mode. `1bit-selftest` works too and must report `mod
 `RESULT: PASS` and, on hardware with an NPU, `RESULT-NPU: PASS` with the placement line in
 `/data/selftest.log`.
 
+**Which disk it can be.** Any whole disk the init's own device scan covers: USB, SATA/AHCI and
+NVMe, which is every disk the appliance ships onto (the stick, the board's internal disk, an NVMe).
+A disk on a **virtio-blk** controller is *not* scanned, so an install onto one writes a correct disk
+and then does not boot from it: the kernel starts, `/init` cannot mount `1BIT-DATA` and leaves the
+rescue console up (`1bit rescue: this console stays alive`), with no ssh. Measured, not inferred
+(engine#1190): the *same* installed disk boots and reports `RESULT: PASS` on ahci, with **no USB
+controller in the VM at all**, and still fails on virtio-blk with an empty USB stick present - so it
+is the target bus, not the installed cmdline. If you wire a VM to test an install, give the target
+an **ahci or NVMe** controller (`-device ide-hd`/`-drive if=none,id=d0 -device ahci` or `-device
+nvme`), not `virtio-blk-pci`; otherwise you are looking at this, not at a broken image.
+
 **Secure Boot.** The install copies the ESP as it is, so the kernel and initramfs on the disk are the
 same MOK-signed files the stick booted; the machine's MOK enrolment (`mokutil --list-enrolled`) is
 not touched by an install. If the firmware does not offer the disk on its own, add an entry pointing
@@ -220,9 +231,10 @@ at `\EFI\BOOT\BOOTX64.EFI` on its partition 1 (on a Linux box: `efibootmgr -c -d
 touch the installed disk: that is how you get back to a live system (or to reinstall).
 
 What the VM proves (`os/mini/vmtest.sh`, which now also installs onto a virtual NVMe and boots from
-it with no stick attached): the installer's refusals, the install itself, the INSTALLED banner and
-`/etc/1bit/installed`, `/data` coming from the installed disk, Lemonade up with its key and answering
-a chat, and `1bit-selftest` reporting INSTALLED. What only the real machine can prove: that this
+it with no stick attached - the target is NVMe on purpose, see "Which disk it can be" above): the
+installer's refusals, the install itself, the INSTALLED banner and `/etc/1bit/installed`, `/data`
+coming from the installed disk, Lemonade up with its key and answering a chat, and `1bit-selftest`
+reporting INSTALLED. What only the real machine can prove: that this
 firmware boots the disk on its own, and the NPU on it.
 
 ## Check it without the hardware

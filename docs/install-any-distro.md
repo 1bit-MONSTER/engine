@@ -78,12 +78,11 @@ EOF
 sudo systemctl daemon-reload && sudo systemctl restart lemond
 ```
 
-**Do not install `amdxdna-dkms` from that archive on a machine whose kernel you did not build.** It is
-in the same PPA but nothing pulls it, and it is the wrong thing for this engine: its closure is
-`dkms` + `build-essential` + `linux-headers-<ver>-generic` and it builds a *stock* `amdxdna` module
-for the running kernel. Our boards reset with the stock driver (see `scripts/mkimage.sh`), which is
-why 1bit OS ships a private build of it, and a DKMS module lands in
-`/lib/modules/$(uname -r)/updates/`, i.e. in front of whatever the board was meant to load.
+**Do not install `amdxdna-dkms` from that archive.** It is in the same PPA but nothing pulls it, and it
+builds AMD's *stock* `amdxdna` for the running kernel. Our boards reset with the stock driver (see
+`scripts/mkimage.sh`), which is why every 1bit OS image and this box run a patched build. If you want
+the driver on another distribution, take our package instead: it is the same driver with the fleet's
+patch series, and the next section installs it.
 
 Verify the plug-in (no model needed):
 
@@ -115,6 +114,85 @@ sudo ln -sf /opt/1bit/engine/1bit /usr/local/bin/1bit-engine
 
 If your Lemonade runs under systemd, the drop-in from the deb applies verbatim; in a container or a
 hand-started `lemond`, export `LEMONADE_HRX_HRX_BIN=/opt/1bit/engine/lemonade-bin` in its environment.
+
+## Kernel and NPU driver packages (optional)
+
+The engine package is userspace only. The NPU and the board's ECU need three more pieces, and a machine
+that stays on its distribution's kernel only needs the second and third:
+
+| package | what it is | needed for |
+|---|---|---|
+| `linux-image-<rel>` / `linux-headers-<rel>` (deb), `1bit-kernel` + `1bit-kernel-devel` (rpm), `linux-1bit` + `linux-1bit-headers` (Arch) | the kernel 1bit OS boots: Linux 7.4-rc1 with this fleet's config, signed with the 1bit MOK | only if you want OUR kernel; the drivers build against yours as well |
+| `amdxdna-1bit-dkms` | `amd/xdna-driver` at `526c6081` plus the engine's patch series (`third_party/patches/amdxdna/0001-0005`), as DKMS source | the NPU. Any 6.10+ kernel, signed with **your** MOK |
+| `ec-su-axb35-dkms` | the AXB35-02 board's embedded-controller driver (fans, EC temperature, power mode), GPL-2.0, upstream `cmetz/ec-su_axb35-linux` at `f62c2c22`, plus a DMI gate so it attaches only on an AXB35 | the fans on a Bosgame AXB35; inert on any other board |
+| `1bit-npu-config` | `limits.d/99-amdnpu-memlock.conf` (unlimited memlock), `udev/rules.d/90-1bit-npu-power.rules` (NPU keep-awake), `modules-load.d/ec_su_axb35.conf`, and the public MOK certificate at `/usr/share/1bit/mok/MOK-Kernel.der` | the NPU runtime's locked command buffers, and engine#1051's suspend/resume hang |
+
+The three driver/config packages are the same set in all three families. They install to
+`/lib/modules/<ver>/updates/` (Debian, Arch) or `/extra/` (Fedora) through dkms, which is in front of
+the in-tree `amdxdna`, and uninstalling the package puts the in-tree driver back.
+
+```bash
+# Debian / Ubuntu: the kernel comes from 1bit OS's own build, the drivers build against your headers.
+sudo apt-get install -y ./amdxdna-1bit-dkms_<ver>_all.deb ./ec-su-axb35-dkms_<ver>_all.deb ./1bit-npu-config_<ver>_all.deb
+sudo apt-get install -y ./linux-image-7.4.0-rc1-1bit_<ver>_amd64.deb ./linux-headers-7.4.0-rc1-1bit_<ver>_amd64.deb  # optional
+
+# Fedora / openSUSE: the local files are unsigned until the release pipeline signs them, hence --nogpgcheck.
+sudo dnf install --nogpgcheck ./amdxdna-1bit-dkms-<ver>.x86_64.rpm ./ec-su-axb35-dkms-<ver>.x86_64.rpm ./1bit-npu-config-<ver>.x86_64.rpm
+sudo dnf install --nogpgcheck ./1bit-kernel-<ver>.x86_64.rpm ./1bit-kernel-devel-<ver>.x86_64.rpm   # optional
+sudo depmod -a 7.4.0-rc1-1bit && sudo dracut --kver 7.4.0-rc1-1bit   # if you installed the kernel
+# openSUSE: zypper install --allow-unsigned-rpm ./<file>.rpm, same files
+
+# Arch: pacman warns that a local package is unsigned and installs it.
+sudo pacman -U ./amdxdna-1bit-dkms-<ver>-x86_64.pkg.tar.zst ./ec-su-axb35-dkms-<ver>-x86_64.pkg.tar.zst ./1bit-npu-config-<ver>-x86_64.pkg.tar.zst
+sudo pacman -U ./linux-1bit-<ver>-x86_64.pkg.tar.zst ./linux-1bit-headers-<ver>-x86_64.pkg.tar.zst   # optional
+sudo mkinitcpio -P                                                  # if you installed the kernel
+```
+
+Every one of them needs the kernel's own module tree next to the headers (`linux-modules-<ver>` on
+Ubuntu, `kernel-core` on Fedora, `linux` on Arch) — dkms looks for
+`/lib/modules/<ver>/build`, which those packages provide and a headers-only container does not.
+
+**Secure Boot.** Our kernel and its modules are signed with the `1bit-MONSTER` kernel key, which no
+machine has enrolled. Enrol the public half once, from the config package:
+
+```bash
+sudo mokutil --test-key /usr/share/1bit/mok/MOK-Kernel.der          # "not enrolled" on a new machine
+openssl x509 -inform DER -in /usr/share/1bit/mok/MOK-Kernel.der -noout -subject
+#   subject=CN=strixhalo Secure Boot Kernel, O=1bit-MONSTER
+sudo mokutil --import /usr/share/1bit/mok/MOK-Kernel.der            # sets a password; reboot -> MokManager
+```
+
+The **private** half never leaves the machine that signs the release and is part of no package. The
+dkms packages are the other way round: dkms signs with *your* key (`/var/lib/shim-signed/mok` on
+Debian/Ubuntu, `/etc/dkms/` elsewhere), so a module built on your machine chains to the MOK you
+enrolled for it — on Fedora and Arch, dkms generates that key pair on first use.
+
+Verify (no model needed):
+
+```bash
+dkms status                                  # amdxdna-1bit/0.18.0 and ec-su-axb35/0.1, installed for your kernel
+modinfo -n amdxdna                           # .../updates/dkms/amdxdna.ko (Debian, Arch) or .../extra/amdxdna.ko.xz (Fedora)
+modinfo -F srcversion amdxdna                # EE1F36A2B9BA294CE11AD80 is the series this release ships
+cat /etc/security/limits.d/99-amdnpu-memlock.conf
+```
+
+Uninstall puts the in-tree driver back:
+
+```bash
+sudo apt-get remove amdxdna-1bit-dkms ec-su-axb35-dkms 1bit-npu-config   # or dnf remove / pacman -R
+```
+
+**Source.** Each driver package ships the source it builds (`/usr/src/amdxdna-1bit-0.18.0/`,
+`/usr/src/ec-su-axb35-0.1/`) with its LICENSE; the amdxdna patch series is
+`third_party/patches/amdxdna/` in the engine repository, and 0006/0007 are carried there but **not
+applied** (loading those two is a separate decision — engine#812). The kernel packages carry
+`/boot/config-7.4.0-rc1-1bit`, and the tree they were built from is `torvalds/linux` v7.4-rc1 plus that
+config, built by `scripts/build-kernel.sh` / `os/mini/mkimage.sh`.
+
+The packages are built by `scripts/mk-kernel-packages.sh` and proven per family by
+`scripts/pkg-proof.sh`, which installs them in a clean container of that family, builds both dkms
+modules against the container's own kernel headers, checks that `amdxdna` resolves to the dkms build
+rather than the in-tree one, and uninstalls everything again.
 
 ## Host prerequisites, per device (measured on the Strix Halo development box)
 
@@ -189,3 +267,9 @@ registry model, since this Lemonade version has no local-file registration):
 | the shim is the engine's own wrapper | `1bit/lemonade-hrx` from this repo's package (`scripts/package-linux.sh`) | it runs `1bit serve --print-backend-env` and then `exec`s the engine with serve's environment and defaults; `lemonade-bin/llama-server` is a symlink to it |
 | the recipe's env for its backend is one variable | this tree, `src/cpp/server/backends/hrx/hrx_server.cpp` `build_server_environment()` | Lemonade passes its backend `GGML_DISABLE_VULKAN=1` only — which is why the wrapper, not our binary, has to be what the recipe starts |
 | `amdxdna-dkms` from the PPA drags kernel bits | clean container, `apt-get -s install amdxdna-dkms` | `dkms`, `build-essential`, `linux-headers-7.0.0-42-generic`, `linux-headers-generic`, `amdxdna-dkms` |
+| the driver packages install, build and uninstall on Debian/Ubuntu | clean `ubuntu:26.04` container, `scripts/pkg-proof.sh deb` | 22/22 rows PASS: dkms builds both modules against `7.0.0-43-generic`, `modprobe --show-depends amdxdna` resolves to `/lib/modules/7.0.0-43-generic/updates/dkms/amdxdna.ko.zst` (in front of the in-tree one), the kernel debs' `vmlinuz` is `sbverify`-clean against the certificate in `1bit-npu-config`, purge removes the /etc files |
+| the same on Fedora | clean `fedora:latest` (fc45) container, `scripts/pkg-proof.sh rpm` | 22/22 rows PASS: modules under `/lib/modules/7.2.15-300.fc45.x86_64/extra/`, kernel rpms install `1bit-kernel` + `1bit-kernel-devel` with the build symlink at `/usr/src/kernels/7.4.0-rc1-1bit`, uninstall leaves nothing |
+| the same on Arch | clean `archlinux:latest` container, `scripts/pkg-proof.sh arch` | 22/22 rows PASS: the pacman dkms hook builds both modules at install time, `linux-1bit` + `linux-1bit-headers` install with the build tree at `/usr/lib/modules/7.4.0-rc1-1bit/build` and `/etc/mkinitcpio.d/1bit.preset` |
+| the dkms source reproduces the driver this box runs | `scripts/mk-kernel-packages.sh` payload built in a container against `7.0.0-43-generic` | `srcversion EE1F36A2B9BA294CE11AD80`, the srcversion of the `amdxdna.ko` installed at `/lib/modules/7.4.0-rc1-1bit/updates/` — the package's source *is* the fleet's series |
+| the kernel the packages ship is the kernel this box runs | `linux-image-7.4.0-rc1-1bit_7.4.0~rc1-1_amd64.deb` payload vs `/boot/vmlinuz-7.4.0-rc1-1bit` | `sha256 6f3c6764…` in both, and `sbverify --cert MOK-Kernel.der` reports `Signature verification OK` |
+| the shipped driver answers a known answer on the NPU | this box, `npu-hold`, `1bit serve --device npu` on Qwen3-0.6B | `GET /health` ok, greedy `The capital of France is` → the model's expected continuation, 0 `amdxdna` errors in the window (no install, no module or udev change) |

@@ -1,0 +1,48 @@
+From: bong-water-water-bong <bong-water-water-bong@1bit.gg>
+Subject: [PATCH] ec_su_axb35: attach only on an AXB35 board
+
+The driver talks to the board's embedded controller at fixed EC registers
+(0x21/0x23/0x25 for the fan modes, 0x35-0x38 for the tachometers). Those are
+the AXB35-02's registers; on any other machine the same addresses belong to a
+different chip, so loading it there writes blind into a stranger's EC.
+
+The dkms package is installed wherever the package set is, so ask the DMI
+board name first and touch nothing when it is not an AXB35. Returning 0
+rather than -ENODEV is deliberate: the package drops a modules-load.d entry,
+and a loaded-but-idle module is a quieter outcome on a non-AXB35 box than a
+failed unit at every boot.
+
+Signed-off-by: bong-water-water-bong <bong-water-water-bong@1bit.gg>
+---
+--- a/src/ec_su_axb35.c
++++ b/src/ec_su_axb35.c
+@@ -3,6 +3,7 @@
+ #include <linux/acpi.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
++#include <linux/dmi.h>
+ #include <linux/fs.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+@@ -529,9 +530,21 @@
+ 
+ static int __init ec_su_axb35_init(void)
+ {
++    const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+     int i;
+     int ret;
+ 
++    /*
++     * The EC registers this driver owns are the AXB35-02's; on any other
++     * board they belong to a different controller. Do not write to them:
++     * report the board found and leave the module loaded and idle.
++     */
++    if (!board || !strstr(board, "AXB35")) {
++        pr_info("ec_su_axb35: board is %s, not an AXB35: not attaching\n",
++                board ? board : "(no DMI board name)");
++        return 0;
++    }
++
+     ret = alloc_chrdev_region(&ec_su_axb35_dev, 0, ARRAY_SIZE(ec_fans) + 2,
+                               "ec_su_axb35");
+     if (ret < 0) {

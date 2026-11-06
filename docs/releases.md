@@ -16,6 +16,13 @@ limitations under the License.
 -->
 # Releases
 
+**1bit OS is the Puppy Linux appliance** (`ResolutePup64`, woof-CE on the Ubuntu 26.04 base, with
+Lemonade and the engine embedded, our MOK-signed kernel, headless by default and a `desktop` boot
+entry): [os/README.md](../os/README.md), [docs/os-v3.md](os-v3.md). The candidates below shipped the
+BusyBox `os/mini` image under the name `1bit-os-<tag>.img.zst`; that image is the CI/VM target now, not
+1bit OS. **Nothing here is published**: v2026.44 is a draft, and the next release carries the Puppy
+appliance.
+
 The first release, **v2026.44**, is a **draft**: it is not published, and nothing is tagged — see
 [v2026.44](#v202644-1-nov-2026--the-first-release-a-draft) for why, and for the candidate that replaces the one it was
 built from.
@@ -174,8 +181,10 @@ Known issues in this image:
 - **#709 is partial**: the shipped kernel has no `efivarfs` module, so the installer cannot register a firmware boot
   entry. It ships `efibootmgr`, does everything else, and says on screen that the disk boots as
   `\EFI\BOOT\BOOTX64.EFI` — pick the disk in the firmware menu once, or let the firmware fall back to it. The
-  complete fix lands with 1bit OS v3 (#712).
-- the installed appliance is still the live image on disk; the next release makes it a headless Ubuntu server (#712).
+  complete fix lands with the Puppy appliance, which writes the entry with `efibootmgr` (#712).
+- the installed appliance was still the live image on disk in these candidates; the next release carries the
+  Puppy appliance instead: headless by default, a `desktop` boot entry, `apt`, and `/data` as Puppy's save
+  layer on `1BIT-DATA` (#712).
 
 ## v2026.43 (candidate, 23 Oct)
 
@@ -285,7 +294,7 @@ onebit recipe on HRX passes against the ported `lemond` (`Ran 31 tests in 110.6s
 measured at load 28.5 with two foreign HRX clients resident), and the catalogue covers 27 onebit rows
 in total (23 + 4).
 
-**1bit OS.** The image carries the sealed NPU sets and the new Lemonade (`#512`, `#523`), the UKI is
+**1bit OS.** In these candidates the image is `os/mini`, the BusyBox one; it carries the sealed NPU sets and the new Lemonade (`#512`, `#523`), the UKI is
 signed with the enrolled MOK so a stick boots with Secure Boot on (`#513`), the USB4 v2 / Thunderbolt
 stack is loaded (`#514`), and `amd_pmf` sensors come up from the booted image (`#517`). The install
 step is not in this candidate (branch `1bit/os-install`).
@@ -300,13 +309,21 @@ rehearsal at `v7.3` and linux-next `next-20261022` (`#525`).
 | file | what |
 |---|---|
 | `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend it ships: **HRX** (and the CPU, from the same llama-server) and the NPU engine's runtime. DwarfStar is out of the tree since 2026-11-02 (HIP kernels only, owner decision 2026-11-01); no Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
-| `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, a Lemonade appliance with the engine as a bootable USB image ([os/README.md](../os/README.md)) |
+| `1bit-os-puppy.img.xz`, `SHA256SUMS` | **1bit OS image: [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS), not a GitHub release asset** — `1bit-os-puppy.img.xz` (about 2.2 GB compressed, 9,128,902,656 B written) with its `SHA256SUMS`, because a GitHub release asset is capped at 2 GiB. This GitHub release carries the notes, `changes.json` and the asset `SHA256SUMS`, and links there for the image; the Hugging Face repository is private until v2026.44 is published. 1bit OS is a Lemonade appliance with the engine inside as a bootable USB image ([os/README.md](../os/README.md)); the recipe builds a disk image containing an ESP plus the frugal-install files, so there is no standalone `.efi` for it. The `.efi`/`.img.zst` names belong to the earlier BusyBox `os/mini` candidates (c18-c20, see the gated-candidate table above), which is the CI/VM target now, not 1bit OS |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
 
 The engine is embedded in Lemonade, so it ships only inside those two: there is no standalone
 engine tarball and no Windows package (Lemonade has its own Windows build). On the GPU the engine
 is pure HRX with HIP kernels: no Vulkan, ROCm backend, Metal, ZINC or CUDA. Lemonade serves those
 with its own backends.
+
+The image is hosted on **[Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS)**, not among the
+release assets: GitHub caps one asset at 2 GiB, and the Puppy image is 9,128,902,656 B written,
+about 2.2 GB as `1bit-os-puppy.img.xz`. `SHA256SUMS` travels with it, so the write path is
+`sha256sum -c SHA256SUMS --ignore-missing` then
+`xz -dc 1bit-os-puppy.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress` (balenaEtcher and
+Rufus DD-mode take the `.img.xz` directly; stick 16 GB or more). The repository is private until
+v2026.44 is published.
 
 The engine in `1bit/` keeps the build tree's layout (`scripts/package-linux.sh`): `1bit` finds each
 backend at the same path relative to itself as in the build (`app/built_path.h`), and every program
@@ -436,7 +453,7 @@ amdclang builds them; credited in `NOTICE-BINARY`) packed in `hrx/llama/bin`. Af
   machine's `/usr/share/fonts/truetype/katex`; the package stage and `os/mini/mkimage.sh` copy
   every link that points out of the tree as a file (`pack_localize_links`, `scripts/pack-elf.sh`).
 - **Web app:** the Lemonade + onebit tarball carries Lemonade's web app
-  (`bin/resources/web-app/index.html`), the UI `lemond` serves at `/`, as 1bit OS does.
+  (`bin/resources/web-app/index.html`), the UI `lemond` serves at `/`, as `os/mini` does.
 
 `SHA256SUMS` is written again by the release stage, after `changes.json`, so it covers every file.
 
@@ -472,13 +489,15 @@ rehearsal found these only after the build) and stops with a message naming what
   `WEEKLY_CMAKE_ARGS` uses another, e.g. TheRock in `/opt/rocm-therock`); `hipcc` from that toolchain or `/opt/rocm`,
   or `ROCM_PATH`. (The optional DwarfStar build that also wanted it is gone since 2026-11-02.)
 - **package:** `patchelf` (`scripts/package-linux.sh`); `node` and `npm` for Lemonade's web app
-  (`LEMONADE_WEB_APP=1 scripts/build-lemonade.sh`; its `npm ci` needs the network); a readable kernel image for 1bit OS,
+  (`LEMONADE_WEB_APP=1 scripts/build-lemonade.sh`; its `npm ci` needs the network); a readable kernel image for the `os/mini` image,
   `/boot/vmlinuz-$(uname -r)` or `VMLINUZ=<copy>` (Ubuntu's `/boot/vmlinuz-*` is root-only).
   Which kernel that image should carry, and how a new one is built, signed and gated before it is
   allowed on the box, is [kernel.md](kernel.md).
   The image's licences step copies from the submodules of the run's own checkout (`<workdir>/src`,
   checked out by the build stage), so run `os/mini/mkimage.sh` from there, not from a plain
-  worktree without submodules.
+  worktree without submodules. That is the `os/mini` image, which `preflight` builds as its QEMU target;
+  1bit OS itself is the Puppy appliance (`os/v3/puppy/build.sh`, [os/README.md](../os/README.md)), built
+  from the same engine package.
 
 ### Bumps
 

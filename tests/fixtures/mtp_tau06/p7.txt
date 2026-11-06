@@ -1,0 +1,15 @@
+== ticket 'tau06 p7 try1' 20261106-175540  hold=9min  argv: --live --match --prompts 1 --prompt-base 7 --tokens 64 --k 4 --tau 0.6
+[   40s] forward ready: vocab 248320, max_batch_rows 16, hidden source post-final-norm
+[   40s] == 1 prompts x 64 tokens, k=4 tau=0.60, hidden=post-norm
+[  128s] prompt 7: TEXT IDENTICAL, 64 tokens, accepted 31/38, passes/token 1.031, stream 72 rows, 0 mismatch
+[  143s]   match p7: 33 offline chains at this loop's own positions (stream 72 rows)
+[  143s]     depth 1: live  78.79 % (26/33, reached)  offline conditional  78.79 % (26/33)  delta  +0.00 pp   [live joint  78.79 %, offline marginal  78.79 %]
+[  143s]     depth 2: live 100.00 % (5/5, reached)  offline conditional  60.00 % (15/25)  delta +40.00 pp  > 2 pp   [live joint 100.00 %, offline marginal  50.00 %]
+[  143s]     depth 3: n/a (live 0/0 reached, offline 9/15)  not scored   [live joint   0.00 %, offline marginal  34.38 %]
+[  143s]     depth 4: n/a (live 0/0 reached, offline 5/9)  not scored   [live joint   0.00 %, offline marginal  15.62 %]
+[  143s]    == live vs offline at the SAME positions, per-depth acceptance CONDITIONAL on reaching the depth (the 2 pp bar):
+[  143s]      depth 1: live  78.79 % (26/33)  offline  78.79 % (26/33)  delta  +0.00 pp  PASS
+[  143s]      depth 2: live 100.00 % (5/5)  offline  60.00 % (15/25)  delta +40.00 pp  FAIL
+[  143s]      depth 3: n/a (live 0/0 reached, offline 9/15)  not scored
+[  143s]      depth 4: n/a (live 0/0 reached, offline 5/9)  not scored
+== ticket 'tau06 p7 try1' exited 0; log: /home/bcloud/wt/mtp-window/ticket-tau06-p7-try1-20261106-175540.log

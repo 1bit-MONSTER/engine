@@ -38,6 +38,26 @@ added; the gate then ran normally).
 
 PRs from forks never run there: the runner is the owner's box.
 
+## The HRX build check
+
+The gate runs only when asked, and `ci.yml` builds the engine without `ONEBIT_HRX`. So until engine#1077 no job
+compiled `ggml/src/ggml-hrx` at PR time, and every pin bump merged that week read `hw_gate: skipping`.
+`.github/workflows/hrx-build.yml`, job `hrx_build`, closes that gap without the hardware: it configures the engine with
+`-DONEBIT_HRX=ON` and builds `onebit`. That builds `llama_hrx` (the pinned llama.cpp with `GGML_HRX=ON`, and the pinned
+hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
+
+- **When.** On every same-repo PR that changes an input of that build: the `third_party/llama.cpp` or
+  `third_party/hrx-system` gitlink, `CMakeLists.txt`, `cmake/hrx.cmake`, `config/hrx-toolchain.config`,
+  `config/hrx-system-hold.config`, `app/serve.cpp` (the HRX wiring) or the workflow itself. It also runs by hand
+  (Actions -> hrx-build -> Run workflow). It needs no label.
+- **Where.** On the same self-hosted runner as the gate (`[self-hosted, strixhalo, pr-agent]`), with TheRock at
+  `/opt/rocm-therock`, under `~/lb/thermal-run.sh`. It takes no GPU token and no NPU lock. Fork PRs never run it. It
+  costs no GitHub Actions minutes. The token is read-only, and the build tree persists in
+  `~/.cache/hrx-build/engine` on the box, so a later run rebuilds only what changed.
+- **What it is not.** It is a compile and link check of the public plumbing only. It does not build the private HIP
+  add-on (the gate builds that) and does not dispatch anything. Green means the pinned pair builds into the engine. It
+  does not replace the `hw-gate` label on a pin bump.
+
 ## What it checks
 
 `scripts/hw-gate.sh` builds this checkout's HRX pair (`third_party/llama.cpp` and

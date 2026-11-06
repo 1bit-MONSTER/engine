@@ -551,6 +551,10 @@ if(Python3_Interpreter_FOUND)
     # pin while going red every day unnoticed. The step is driven against a stubbed gh, with and
     # without an open issue.
     add_test(NAME bump_workflow_report COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/bump_workflow_report_test.py)
+    # every workflow's `run:` must parse, and the pin bump step must open one PR per moved repo while a
+    # repo that went upstream stays a human decision: the step shipped with an unterminated quote that
+    # nothing executed until a pin moved, i.e. until its first scheduled run (engine #1148)
+    add_test(NAME workflow_shell COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/workflow_shell_test.py)
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.

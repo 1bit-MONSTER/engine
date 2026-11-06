@@ -1238,6 +1238,24 @@ void test_text_artifacts(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// --weight-layout: the flag may only declare a layout this importer can actually produce a working
+// container for. b8 needs nothing else; the default (no key at all) is the row-major family; t2s and
+// pb16i need a version and a sidecar image directory, so accepting them here would write a container
+// that refuses to load (engine#1189 follow-up: the Phi-3.5 pack's kernel set is the _b8 family).
+void test_weight_layout() {
+    check(pi::weight_layout_refusal("").empty(), "weight layout: no flag is allowed (the default)");
+    check(pi::weight_layout_refusal("rm").empty(), "weight layout: rm (no key) is allowed");
+    check(pi::weight_layout_refusal("b8").empty(), "weight layout: b8 is allowed");
+    check(!pi::weight_layout_refusal("pb16i").empty(),
+          "weight layout: pb16i is refused (it also needs a version and sidecar images)");
+    check(!pi::weight_layout_refusal("t2s").empty(),
+          "weight layout: t2s is refused (it also needs a version and sidecar images)");
+    const std::string why = pi::weight_layout_refusal("b7");
+    check(!why.empty() && why.find("b7") != std::string::npos,
+          "weight layout: an unknown name is refused by name");
+    std::printf("weight layout: b8 allowed, pb16i/t2s/unknown refused\n");
+}
+
 void test_fconst_eps(const std::string& root) {    const fs::path dir = fs::path(root) / "fconst-eps";
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -1311,6 +1329,7 @@ int main(int argc, char** argv) {
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);
+        test_weight_layout();
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

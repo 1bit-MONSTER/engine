@@ -134,7 +134,18 @@ TextArtifacts scan_text_artifacts(const std::string& pack_dir);
 
 struct Options {
     bool allow_incomplete = false;  // write what is representable and name the rest
+    // The device weight layout the container will declare (`q4nx_weight_layout`). Empty means the
+    // default row-major family, in which case the key is left out entirely -- as every container the
+    // importer has written before this option existed. "b8" is the one layout a bare flag can
+    // express: it needs no version and no sidecar image directory (see weight_layout_key).
+    std::string weight_layout;
 };
+
+// Why a layout name cannot be declared by `--weight-layout`, or "" when it can. Only "b8" and the
+// default "rm" qualify: t2s and pb16i also need `q4nx_weight_layout_version` and/or a sidecar image
+// directory (`q4nx_pb16i_dir`), which an import cannot invent, so offering them here would produce a
+// container that refuses to load.
+std::string weight_layout_refusal(const std::string& want);
 
 struct Report {
     std::string out_dir;

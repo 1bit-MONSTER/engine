@@ -61,7 +61,14 @@ PM_RECORD="$scratch/backend.jsonl" "$bin" serve -m "$scratch/zaya.gguf" --device
     --lemonade-url "http://127.0.0.1:$lem_port" >"$scratch/pm.log" 2>&1 &
 pids+=($!)
 api="http://127.0.0.1:$port"
-for _ in $(seq 1 300); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$api/health")" = 200 ] && break; sleep 0.2; done
+code=000
+for _ in $(seq 1 300); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.2; done
+# A server that never came up because it could not bind is a port collision, not a defect in what this
+# test checks: name the port and stop, before an empty body turns into a JSON decode error (engine#1070).
+if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$scratch/pm.log"; then
+    echo "FAIL: pm_laya_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$scratch/pm.log" | head -1))"
+    exit 1
+fi
 check "serve --pm --pm-router laya comes up with the checkpoint" '[ "$(curl -s -o /dev/null -w "%{http_code}" "$api/health")" = 200 ]'
 check "  the log names the router and its table" 'grep -q "pm: router laya: .*code=coder" "$scratch/pm.log"'
 

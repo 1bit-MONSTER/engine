@@ -331,6 +331,191 @@ if assert_pupsfs:
               (why, os.path.join(work, "serial-installed.log")))
         ok = False
 
+    # ---- engine#712: the installed machine must be a full persistent OS and not the live RAM image. Measured on
+    # the installed disk's OWN boots, never on the installer's word: what PUPMODE the init settled on, where the
+    # root's writable layer and the SFS actually are, and whether a write made on one boot is still there on the
+    # next. The three ways an "installed" machine can still be the stick are: no save layer (PUPMODE=5, nothing
+    # persists), the SFS copied into RAM (pfix=copy), and a save layer that points at the other disk.
+    class Installed:
+        """One boot of the installed disk, driven over its serial console. The installed grub.cfg is the stick's
+        (headless console first, serial root shell last), so the shell is three arrows down - and this VM is
+        started WITHOUT -no-reboot, because the last row reboots the guest."""
+        def __init__(self, tag, shell):
+            self.tag = tag
+            self.s = None
+            self.text = ""
+            self.path = os.path.join(work, "ser-" + tag)
+            for f in (self.path, self.path + ".log"):
+                try: os.unlink(f)
+                except OSError: pass
+            q = ["qemu-system-x86_64", "-m", "4096", "-smp", "4",
+                 "-drive", "file=" + os.path.join(work, "target.img") + ",format=raw,if=none,id=d0",
+                 "-device", "qemu-xhci", "-device", "usb-storage,drive=d0",
+                 "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+                 "-drive", "if=pflash,format=raw,file=" + os.environ["PROBE_VARS"],
+                 "-machine", "q35,smm=on", "-global", "driver=cfi.pflash01,property=secure,value=on",
+                 "-display", "none", "-vga", "std",
+                 "-serial", "unix:" + self.path + ",server,nowait"]
+            self.proc = subprocess.Popen(["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=6G", "--"] + q,
+                                         stdout=open(os.path.join(work, "qemu-%s.out" % tag), "wb"),
+                                         stderr=subprocess.STDOUT)
+            t = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            end = time.time() + 90
+            while True:
+                try:
+                    t.connect(self.path); break
+                except OSError:
+                    if time.time() > end:
+                        print("FAIL %-12s the installed disk's VM never opened its serial socket" % tag)
+                        return
+                    time.sleep(0.2)
+            t.settimeout(0.5)
+            self.s, self.buf = t, b""
+            self.log = open(self.path + ".log", "ab", buffering=0)
+            if not shell:
+                return
+            if self.until(b"Press enter to boot the selected OS", 180) is None:
+                print("FAIL %-12s no grub menu on the installed disk" % tag); self.s = None; return
+            time.sleep(1.0)
+            self.s.sendall(b"\x1b[B" * 3 + b"\r")
+            for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
+                if self.until(token, 150) is not None:
+                    self.buf = b""
+                    self.s.sendall(b"\n")
+                    time.sleep(1)
+                    return
+            print("FAIL %-12s no root shell on the installed disk (transcript %s)" % (tag, self.path + ".log"))
+            self.s = None
+
+        def until(self, token, timeout):
+            end = time.time() + timeout
+            while time.time() < end:
+                i = self.buf.find(token)
+                if i >= 0:
+                    out, self.buf = self.buf[:i + len(token)], self.buf[i + len(token):]
+                    return out
+                self.s.settimeout(0.5)
+                try:
+                    d = self.s.recv(65536)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return None
+                if not d:
+                    return None
+                self.log.write(d); self.buf += d; self.text += d.decode("utf-8", "replace")
+            return None
+
+        def cmd(self, c, timeout=240):
+            """one line, its output. Bracketed by __S__/__E...__ on the SENTINEL only (the terminal echoes the
+            command back), and everything before the LAST __S__ is dropped: an installed boot runs services while
+            this reads, and their one-line notices land in the middle of a transcript (measured on the first run:
+            `24onboard-webapp: serving ...` arrived between the command and its output)."""
+            self.s.sendall(("echo __S__; " + c + "; echo __E$?__$(date +%s%N)\n").encode())
+            end = time.time() + timeout
+            while time.time() < end:
+                m = re.search(rb"__E[0-9]+__[0-9]{10,}", self.buf)
+                if m:
+                    out, self.buf = self.buf[:m.start()], self.buf[m.end():]
+                    body = clean(out.decode("utf-8", "replace"))
+                    i = body.rfind("__S__")
+                    if i >= 0:
+                        body = body[i + len("__S__"):]
+                    return "\n".join(l.strip() for l in body.splitlines() if l.strip())
+                self.s.settimeout(0.5)
+                try:
+                    d = self.s.recv(65536)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return None
+                if not d:
+                    return None
+                self.log.write(d); self.buf += d; self.text += d.decode("utf-8", "replace")
+            return None
+
+        def reboot(self):
+            """the guest's own reboot - not a new VM. The firmware comes back up on the installed entry."""
+            self.s.sendall(b"sync; reboot -f\n")
+            self.text = ""
+            if self.until(b"Press enter to boot the selected OS", 240) is None:
+                return False
+            time.sleep(1.0)
+            self.s.sendall(b"\x1b[B" * 3 + b"\r")
+            for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
+                if self.until(token, 150) is not None:
+                    self.buf = b""
+                    self.s.sendall(b"\n")
+                    time.sleep(1)
+                    return True
+            return False
+
+        def close(self):
+            try: self.log.close()
+            except Exception: pass
+            try: self.s.close()
+            except Exception: pass
+            subprocess.run(["pkill", "-f", "qemu-system-x86_64.*" + os.path.join(work, "target.img")],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try: self.proc.wait(timeout=10)
+            except Exception: pass
+
+    print("== the installed disk, its own boots: is it a persistent OS? (#712)")
+    v = Installed("persist", shell=True)
+    try:
+        if v.s is None:
+            ok = False
+        else:
+            def val(token, cmdline, timeout=240):
+                """the value behind `TOKEN=` in the command's output (last match). Every row prints its value
+                with its own prefix, because the console is shared with the running system's notices."""
+                out = v.cmd("echo %s=$(%s)" % (token, cmdline), timeout) or ""
+                m = re.findall(r"\b%s=(.*)" % token, out)
+                return (m[-1].strip() if m else "")
+
+            pm = val("PM", "sed -n 's/^PUPMODE=//p' /etc/rc.d/PUPSTATE | head -1")
+            rw = val("RW", "readlink /initrd/pup_rw")
+            lay = val("LAY", "ls -d /data/1bit/*save* 2>/dev/null | head -1")
+            # NOTE: one `%s`, not the escaped form - the cmdline is an ARGUMENT to val()'s "%s=$(%s)" formatting,
+            # so a `%%` here reaches awk literally and the row prints "%s,%s,%s,%s," while asserting nothing
+            # (measured on the previous run: it "passed" because that string cannot contain /mnt/tmpfs).
+            sfs = val("SFS", "awk '$3 == \"squashfs\" { printf \"%s \", $1 }' /proc/mounts")
+            room = val("ROOM", "df -h /data | tail -1")
+            loop = val("LOOP", "losetup -a 2>/dev/null | head -1")
+            print("INFO persist      PUPMODE=%s | root layer=%s | save layer=%s" % (pm, rw, lay))
+            print("INFO persist      SFS mounted from: %s" % sfs[:200])
+            print("INFO persist      backed by: %s" % loop[:200])
+            print("INFO persist      /data room: %s" % room[:120])
+            if pm != "12":
+                print("FAIL persist      PUPMODE=%s, not 12: the installed machine boots the live RAM image "
+                      "(no save layer, nothing persists)" % (pm or "<unread>")); ok = False
+            elif "/1bit/" not in rw or not rw.endswith("save/upper"):
+                print("FAIL persist      the root's writable layer is %s, not a save folder on the disk" % (rw or "<none>")); ok = False
+            elif "/mnt/tmpfs" in sfs:
+                print("FAIL persist      the SFS are copied into RAM (pfix=copy): %s" % sfs); ok = False
+            elif not sfs:
+                print("FAIL persist      no squashfs mount at all: cannot say where the OS came from"); ok = False
+            else:
+                print("PASS persist      PUPMODE=12, root writes through %s, SFS from %s" % (rw, sfs.strip()))
+            wrote = val("WROTE", "sh -c 'echo 712 > /root/712-persist; sync; cat /root/712-persist'")
+            if wrote != "712":
+                print("FAIL persist      could not write to the installed root (/root/712-persist: %s)" % (wrote or "<no answer>")); ok = False
+                v.close()
+            elif not v.reboot():
+                print("FAIL persist      the installed disk did not come back after its own reboot (transcript %s)" % (v.path + ".log")); ok = False
+                v.close()
+            else:
+                back = val("BACK", "cat /root/712-persist")
+                pm2 = val("PM", "sed -n 's/^PUPMODE=//p' /etc/rc.d/PUPSTATE | head -1")
+                if back == "712" and pm2 == "12":
+                    print("PASS persist      /root/712-persist still there after a reboot, PUPMODE=12 on both boots")
+                else:
+                    print("FAIL persist      after a reboot /root/712-persist=%s, PUPMODE=%s "
+                          "(the installed machine lost the write)" % (back or "<gone>", pm2 or "<unread>"))
+                    ok = False
+    finally:
+        v.close()
+
 print("== %s" % ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)
 PY

@@ -137,6 +137,16 @@
    "model_type": "Factorial",
    "family": "Factorial selection/memmap LM (repo-local training and inference code, .pt + weights.dat, SentencePiece; not a Transformer decoder, so nothing to alias)",
    "watch": "report"
+  },
+  "Lfm3ForCausalLM": {
+   "model_type": "lfm3",
+   "family": "LiquidAI LFM3 (sandwich norms, sliding-attention layers with partial rotary, 7-tap conv cache, tied embeddings; not an alias of lfm2/lfm2moe, nothing at the pin registers it)",
+   "watch": "report"
+  },
+  "NeedleForToolCalling": {
+   "model_type": "needle",
+   "family": "Cactus-Compute needle3 tool-calling model (hadamard MLP, engram slots, confidence head, cactus-quants, .cact container for its own on-device runtime; not a Transformer a pinned backend can load)",
+   "watch": "report"
   }
  }
 }

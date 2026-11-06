@@ -716,6 +716,51 @@ for repo_id, cls in flm_1105:
         check(f"{repo_id} still reads as an unserved family",
               not repo["mapped"] and cw.unmapped(repo))
 
+
+# 26. The 2026-11-06 census batch (engine#1253): the two new UNCOVERED classes are recorded,
+#     report-only, and the FastFlowLM NPU rows are answered family by family in docs/npu.md
+#     instead of being mapped as GGUF aliases or given an `npu` backend they do not have.
+batch_1106 = {
+    "Lfm3ForCausalLM": ("lfm3", "D0zy/essay-model-merged"),
+    "NeedleForToolCalling": ("needle", "Amdkn7/needle3"),
+}
+for cls, (model_type, mid) in batch_1106.items():
+    entry = sig.get(cls) or {}
+    check(f"{cls} is reviewed report-only and documented",
+          entry.get("model_type") == model_type and entry.get("watch") == "report"
+          and cls not in archs and cls in gap_docs)
+    rc, res = rc_of([model(mid, cls)], archs, sig)
+    check(f"{cls} report-only -> exit 0, no alert",
+          rc == 0 and res["reviewed_report"] == [cls] and res["significant"] == []
+          and res[cw.UNCOVERED] == [mid])
+check("census.json shows LFM3 is a family, not a one-off",
+      counts.get("Lfm3ForCausalLM", 0) > 1)
+check("census.json records the NeedleForToolCalling family",
+      counts.get("NeedleForToolCalling", 0) > 1)
+
+# The 2026-11-06 body's `!! NPU FLM` rows: each family is mapped for hrx only, so its Q4NX pack is
+# an NPU gap and docs/npu.md has to carry the per-family answer.
+npu_flm_families = {
+    "qwen35": ("Qwen3_5ForConditionalGeneration", "Qwen3.8-27B-NPU2"),
+    "dflash": ("DFlashDraftModel", "Nemotron-3.5-Bolt-E4B-DFlash-NPU2"),
+    "gemma4": ("Gemma4ForConditionalGeneration", "Gemma4-12B-IT-NPU2"),
+    "hunyuan-dense": ("HunYuanDenseV1ForCausalLM", "Hy-MT2-1.8B-NPU2"),
+    "gemma3": ("Gemma3ForCausalLM", "medgemma-1.5-4b-it-NPU2"),
+    "lfm2": ("Lfm2ForCausalLM", "LFM2-2.6B-NPU2"),
+    "gpt-oss": ("GptOssForCausalLM", "GPT-OSS-20B-NPU2"),
+    "hy_v3": ("HYV3ForCausalLM", "FastFlowLM/Hy-Memory-30B-A3B-NPU2"),
+}
+for gguf, (cls, repo_id) in npu_flm_families.items():
+    check(f"{gguf}: {cls} is mapped for hrx only",
+          archs[cls]["gguf"] == gguf and archs[cls]["backends"] == ["hrx"])
+    check(f"{gguf}: the NPU-route answer for {repo_id} is in docs/npu.md",
+          f"`{gguf}`" in npu_docs and repo_id in npu_docs)
+pack = cw.flm_repo({"id": "FastFlowLM/Qwen3.8-27B-NPU2",
+                    "config": {"architectures": ["Qwen3_5ForConditionalGeneration"]},
+                    "siblings": [{"rfilename": "model.q4nx"}]}, archs)
+check("a qwen35 NPU pack is the recorded NPU gap, not a mapping",
+      pack["mapped"] and cw.npu_gap(pack) and cw.unmapped(pack) and not pack["npu"])
+
 shutil.rmtree(STATE_DIR, ignore_errors=True)
 # 16. Gated repos (engine#619): the request carries a token when one is in the environment, and
 #     the run says so instead of repeating "gated repos need a token" at a run that sent one.

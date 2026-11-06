@@ -918,6 +918,29 @@ release before a registry entry means anything. Until then the row above is the 
 report prints a repo only when it is new or changed, so a quiet day is quiet, and the next change
 to one of these repos is a prompt to update this table rather than a namespace error.
 
+The 2026-11-06 census body (engine#1253) read the whole org from a fresh state, so it also printed
+every pack whose family the registry maps for `hrx` only. Those are the `!! NPU FLM` rows: the
+architecture is covered on the CPU route, but a Q4NX directory needs the NPU route and `npu` is
+not in the entry's `backends`. Family by family:
+
+| family (`gguf`) | packs in the 2026-11-06 body | `backends` | NPU route answer |
+|---|---|---|---|
+| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx | not served: the dense qwen35 family has no NPU kernel set; the serving work is tracked in engine#587 (Qwen3.8-27B-NPU2) |
+| `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
+| `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
+| `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
+| `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served |
+| `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2` | hrx | not served |
+| `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
+| `hy_v3` | `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | hrx | not served; the first table above records this one |
+
+Adding `npu` to one of those entries would claim kernels this build does not carry. A family leaves
+this list when `NPU_ARCHS` in `tools/registry_build.py` names its HF class with the model type the
+route loads and a captured `--device npu` run stands behind it; the regenerated entry then carries
+`npu` in `backends`. Note that the route does serve `qwen3_5_moe` (`Qwen3.6-35B-A3B` through the
+GGUF-on-NPU forward), while every D3-* pack in this body declares the dense `qwen3_5` family, so
+the two are not the same answer and the registry keeps them apart.
+
 ### Sealed kernel sets: the manifest is what says a set is ours
 
 A set ships as `<set>/layout.json`, `<set>/layer1_*/layer1.elf` (each `1BPKCRYP` ciphertext, opened

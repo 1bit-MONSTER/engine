@@ -124,7 +124,7 @@ sudo zypper install ./1bit-engine-<version>-1.x86_64.rpm      # openSUSE Tumblew
 
 The recipe (`packaging/rpm/1bit-engine.spec`) declares no dependencies: rpm reads the ELF files the
 package ships and requires the sonames that come from outside it (`libcrypto.so.3`, `libgomp.so.1`,
-`libzstd.so.1`, `libpcre2-8.so.0`, `libstdc++.so.6`), which dnf resolves to `openssl-libs`, `libgomp`,
+`libzstd.so.1`, `libpcre2-8.so.0`, `libstdc++.so.6`, `libm.so.6`), which dnf resolves to `openssl-libs`, `libgomp`,
 `libzstd`, `pcre2` and `libstdc++`, and zypper to the same packages under their own names. That also
 encodes the floor above as `libc.so.6(GLIBC_2.43)`, so on an older release the install is refused
 with `nothing provides libc.so.6(GLIBC_2.43)` instead of succeeding and then failing to load.
@@ -151,13 +151,28 @@ Lemonade your distro's way (its `.deb`/`.rpm`, its container, or a source build 
 `llamacpp-hrx` in `system-info`):
 
 ```bash
-sudo tar -C / --zstd -xf 1bit-engine-<version>-linux-x86_64.tar.zst
+sudo tar -C / --zstd --no-same-owner --no-overwrite-dir -xf 1bit-engine-<version>-linux-x86_64.tar.zst
 sudo ln -sf /opt/1bit/engine/1bit /usr/local/bin/1bit-engine
 # then the same two lines as above, in whatever runs lemond: the env var, or the config key.
 ```
 
-The tarball's members are `./opt`, `./usr/bin`, `./usr/share/...`, so `-C /` puts every file where the
-.deb and the .rpm put it. A tarball has no post-install, so on a systemd machine copy the drop-in
+The tarball's members are `opt/1bit/…`, `usr/bin/1bit-engine`, `usr/share/1bit/…`,
+`usr/share/doc/1bit-engine/…` and `usr/lib/systemd/system/lemond.service.d/…` — the same paths the
+`.deb` and the `.rpm` install, and no other, so `-C /` puts every file where they put it. Every member
+is owned by `root:root` in the archive (`tar --owner=0 --group=0 --numeric-owner`), and the
+filesystem's own directories (`/`, `/usr`, `/usr/bin`, `/usr/lib`, `/opt`, …) are not members at all:
+they belong to the distribution's `filesystem` package. The two flags above are belt and braces from
+the other side — a tarball of ours that ever carried a wrong owner, or a `./` member, would otherwise
+rewrite the ownership of directories that are not ours when extracted as root, which is a local
+root escalation on the machine (`#1292` review); `scripts/pack-distro.sh` also fails the build if a
+member is not `0/0` or a `./` member appears.
+
+A tarball also carries no dependency metadata, so nothing resolves what the native packages'
+`Depends`/`Requires` name. If the engine reports one missing, it is the set the `.deb` declares
+(`libgomp1`, `libssl3`, `libzstd1`, `libpcre2-8-0`; measured: a bare `ubuntu:26.04` container
+answers `libgomp.so.1: cannot open shared object file` until `libgomp1` is installed).
+
+A tarball has no post-install either, so on a systemd machine copy the drop-in
 in by hand instead (the packaged families install it for you):
 
 ```bash
@@ -331,7 +346,8 @@ registry model, since this Lemonade version has no local-file registration):
 | claim | where | result |
 |---|---|---|
 | **each family installs, runs and uninstalls** | clean containers, 2026-11-06, from the `rc-2026-11-06-c31` payload: `fedora:latest` (`dnf`, rpm 6.1.0, glibc 2.44), `opensuse/tumbleweed:latest` (`zypper`), `archlinux:latest` (`pacman -U`, pacman 7.1.0), `ubuntu:26.04` (`apt-get`) | all four: install, `1bit-engine --version` prints `1bit 0.0.1`, the shim `/opt/1bit/engine/lemonade-bin/llama-server --version` prints `version: 1 (32559003)` / `built with Clang 24.0.0 for Linux x86_64`, then remove and `/opt/1bit/engine/1bit` is gone. Fedora refused the first build and that was the payload's fault, not dnf's: the package listed `/usr/bin` and `/usr/lib` at 0755 while Fedora's `filesystem` owns them at 0555 (`file /usr/bin from install of 1bit-engine-2026.45-1.x86_64 conflicts with file from package filesystem-3.18-59.fc45.x86_64`); `scripts/pack-distro.sh` now normalises the payload's modes and leaves the distributions' own skeleton out of the file list |
-| **the four packages are one payload** | the `.deb`, `.rpm`, `.pkg.tar.zst` and `.tar.zst` of the same run, unpacked side by side | 80 files each, 60 MB: the sha256 of every file is identical across the four, and so is the mode and symlink target of every path |
+| **the four packages are one payload** | the `.deb`, `.rpm`, `.pkg.tar.zst` and `.tar.zst` of the same run, unpacked as root in one `ubuntu:26.04` container (so each archive's own owner and mode are what lands) | 80 files each, 60 MB: identical paths, modes, **owner (`0:0`)**, sizes and sha256 across the four. The owner column was the gap in the first version of this check — `tar -tvf` said `bcloud/bcloud` for the tarball while the other three said root, and only the owner comparison showed it |
+| the tarball cannot hand a system directory to uid 1000 | clean `ubuntu:26.04`, the documented `sudo tar -C / --no-same-owner --no-overwrite-dir -xf …` | `/`, `/usr`, `/usr/bin`, `/opt` read `0:0 755` before and after; the payload lands `0:0`, `0` of 75 files not owned by root, and the shim runs (`version: 1 (32559003)`). Before the fix the same extraction as root left uid 1000 owning `/`, `/usr`, `/usr/bin` and `/opt` — a local root escalation on every "any other distribution" install (#1292 review) |
 | the glibc floor is enforced, not just documented | clean `ubuntu:24.04` container (glibc 2.39), `apt-get install ./1bit-engine_<version>_amd64.deb` | refused: `1bit-engine : Depends: libc6 (>= 2.43) but 2.39-0ubuntu8.9 is to be installed`. Before the floor was declared, the same deb installed, `ldd` was happy and the binary then failed to load |
 | **the package's payload serves on the GPU** | strixhalo, the Fedora `.rpm` unpacked with `rpm2cpio` (so exactly the files the package installs), `1bit serve -m Qwen3-0.6B-Q4_K_M.gguf --device hrx --no-strict-device`, two chats | `1bit serve: HRX: HSA runtime …/_rocm_sdk_core/lib/libhsa-runtime64.so.1 sha256 21a66824…` — the runtime the package ships, not the box's — then `Qwen3-0.6B-Q4_K_M on hrx`, health `200`, and `request /v1/chat/completions -> hrx status 200 in 202.5 ms | prompt 16 completion 16 79.0 tok/s`; a second chat with `max_tokens: 200` came back `content: "5"` (109 completion tokens, 69.1 tok/s). The first one's content was empty because Qwen3 spends the opening tokens on its thinking trace, so a 16-token budget never reaches the answer. Both this model and `Qwen3-4B-Q4_K_M` are refused first by strict placement (`"embd" is GET_ROWS f32 … 1 of 986 nodes off HRX`), which is why the runs pass `--no-strict-device` |
 | a stock Lemonade takes a backend binary from `hrx_bin` / `LEMONADE_HRX_HRX_BIN` | extracted PPA deb `2026.44.1~26.04` on the dev box, isolated cache/config | `llamacpp-hrx` backend `installable` → `installed`, both forms, with no fork and no patch |

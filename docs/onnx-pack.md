@@ -195,9 +195,18 @@ intermediate float tensor then never exists.
   `zp_y`); the EP trace for those runs reads `zp_x=8 zp_w=6 zp_y=-7` with a one-off
   `qdq_colsum k=… n=…`. A symmetric graph never computes the column sums (its trace reads `zp_x=1
   zp_w=1 zp_y=0` and no `qdq_colsum`), which is the point of doing it lazily.
-- **Not done: a zero point along K.** Like a scale along K it would weight the products inside the sum
-  — it needs `Σ_k zp_x[k]·w_q[k][n]`, a column-weighted vector of the weight that no kernel here
-  precomputes — so a graph with one keeps the per-node path.
+- **Not a graph: a zero point along K.** The page's last "Not done" item was this one, and it is not
+  unfinished work — a QDQ graph cannot carry a *1-D* zero point along K. Two facts, one arithmetic and
+  one checked against the runtime: (1) its term is cheap, not a per-step pass — `Σ_k zp_x[k]·w_q[k][n]`
+  is a zero-point-weighted column sum of the weight and `zp_x` is a constant initializer, so it is
+  computed once beside `Σ_k w_q[k][n]` and kept, unlike the row sums; (2) ONNX's `DequantizeLinear`
+  says `x_scale` and `x_zero_point` **must have the same shape**, so a 1-D zero point along K only comes
+  beside a 1-D scale along K, which is the un-foldable term above (it weights the products inside the
+  sum — SmoothQuant's job at export time). Built the one way that could carry the term alone, a K-long
+  zero point beside a per-tensor scale, the CPU EP refuses the session before any EP sees it:
+  `quantize_linear.cc:79 … x_zero_point must be null or a scalar or 1D tensor or size 1`. So the item
+  closes as "cannot occur" rather than "not done": what this epilogue does not fold along the
+  activation's K is what the arithmetic rules out.
 - **Works: the fused group runs on the NPU, and its int8 output is bit-identical there too.** With
   `-DONEBIT_EP_NPU=ON` and `ONEBIT_EP_NPU_ELFS` naming the designs, `gemm_q8` writes the graph's int8
   activations and int8 weights straight into the kernel's BOs (no `packB`, no `amax/127` — those bytes

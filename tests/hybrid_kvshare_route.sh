@@ -131,5 +131,20 @@ check "the late provider could still read its region fd" \
     'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"fds\"]==1 and d[\"readable\"]==[16] else 1)" "$scratch/provider.json" 2>/dev/null'
 stop
 
+# a decoder that cannot share its cache: the real server refuses a params or model mismatch, and refuses a
+# hybrid cache on a pin without the recurrent-state arm. ONEBIT_KV_SHARE=1 must not turn that into "no
+# provider at all" -- the state-file route the decoder does support is used instead, because a handoff by
+# file still beats the decoder prefilling the prompt itself. share_ms separates the two routes in the log
+# line (0.000 = the file route).
+check "serve starts against a decoder that cannot share" \
+    'start "$scratch/d.log" ONEBIT_KV_SHARE=1 FAKE_KVSHARE_REFUSE=1 ONEBIT_HYBRID_PREFILL="$here/fake_prefill_provider.py" FAKE_PREFILL_COPY=1'
+reply=$(ask)
+check "the reply comes through on the state-file route" '[[ "$reply" == *Paris* ]]'
+check "the request was pinned to slot 0" '[[ "$reply" == *"\"fake_id_slot\":0"* ]]'
+check "the fallback to the state file is named" 'grep -q "cannot share its KV" "$scratch/d.log"'
+check "the provider's state file was restored (share 0.000 ms, the file route)" 'grep -q "hybrid: .* share 0\.000 ms, first byte" "$scratch/d.log"'
+check "the decoder was not left to prefill the prompt itself" '! grep -q "the backend prefills this request itself" "$scratch/d.log"'
+stop
+
 if [ $fail -ne 0 ]; then echo "--- log (tail)"; tail -30 "$scratch/a.log"; echo FAIL; exit 1; fi
 echo PASS

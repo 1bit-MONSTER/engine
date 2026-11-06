@@ -88,6 +88,12 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/slots/"):
             slot, _, action = self.path[len("/slots/"):].partition("?action=")
             if action == "share":
+                # FAKE_KVSHARE_REFUSE=1: a decoder that cannot share its cache, which is what the real
+                # server answers for a params/model mismatch (or for a hybrid cache on a pin without the
+                # recurrent-state arm). tests/hybrid_kvshare_route.sh
+                if os.environ.get("FAKE_KVSHARE_REFUSE"):
+                    self._json(400, {"error": {"message": "the KV cache of a hybrid model cannot be shared"}})
+                    return
                 # the shared-KV protocol (fork 1bit-MONSTER/llama.cpp#164, engine ONEBIT_KV_SHARE=1):
                 # connect to the engine's socket and send [uint32 length][JSON] with one fd, then report
                 # the export id. No dma-buf here -- any readable fd proves the plumbing (the real one is

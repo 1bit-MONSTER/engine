@@ -675,6 +675,11 @@ DRAFT_SPEC_RE = re.compile(r"--spec-type ([A-Za-z0-9._-]+)")
 DRAFT_RECIPE_RE = re.compile(r"1bit serve: recipe ([^:]+): (.*)$", re.M)
 DRAFT_ACC_RE = re.compile(
     r"draft acceptance = ([0-9.]+) \(\s*(\d+) accepted /\s*(\d+) generated\), mean len =\s*([0-9.]+)")
+# The OFF case is a line the server emits, not an absence: `1bit serve` says
+# "spec common_specu: no implementations specified for speculative decoding" when drafting is disabled. Reading
+# drafting off an absence is how a lost log came to look like a non-drafting measurement (see the status note in
+# drafting_observed).
+DRAFT_NONE_RE = re.compile(r"no implementations specified for speculative decoding", re.I)
 
 
 def drafting_observed(path):
@@ -693,17 +698,30 @@ def drafting_observed(path):
     differing only in an unset default are otherwise indistinguishable -- the same rule as
     `placement`/`model`/`build`: the result names the input it was measured with. It reports, it does
     not check.
+
+    The return value always says **which** of the four states it is in, because `null` used to cover
+    three of them and two of those are opposite claims. Measured 2026-11-05 22:53 on this box (27B
+    UD-Q4_K_XL, 20,480 ctx, `HL_MTP_MAX=0`, `window-20261105/arm_74_longctx_mtp0_repeat.json`): that arm's
+    serve.log says `spec common_specu: no implementations specified for speculative decoding` -- the server
+    stating drafting was off -- and the artifact recorded `drafting.serve: null`, the **same value** an
+    unreadable serve.log produced. So the headline non-drafting row and a row whose log was lost serialised
+    identically, and the only way to tell them apart was to read serve.log by hand:
+
+      drafted      evidence of a spec implementation / recipe / acceptance was found (keys as below)
+      not-drafted  the server itself said there was no spec implementation
+      no-evidence  the log was read and carries nothing either way (an older or quieter build)
+      unreadable   the log could not be read at all -- "nobody knows", which must never read as "did not draft"
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return None
+        return {"status": "unreadable"}
     accs = [(float(a), int(acc), int(gen), float(ln))
             for a, acc, gen, ln in DRAFT_ACC_RE.findall(text)]
     spec, recipe = DRAFT_SPEC_RE.search(text), DRAFT_RECIPE_RE.search(text)
     if not accs and not spec and not recipe:
-        return None
-    out = {}
+        return {"status": "not-drafted" if DRAFT_NONE_RE.search(text) else "no-evidence"}
+    out = {"status": "drafted"}
     if spec:
         out["spec_type"] = spec.group(1)
     if recipe:

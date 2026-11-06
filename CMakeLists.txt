@@ -257,7 +257,8 @@ add_test(NAME mtp_draft COMMAND mtp_draft_test)
 add_dependencies(npu_sampling_test mtp_draft_test)
 # Who may have the NPU (app/npu_device_lock.h, engine#612, docs/npu.md "Two streams on one
 # NPU"): the exclusive default and the shared --npu-streams >= 2 opt-in, on a lock file in a
-# temp dir; header only, no device, runs in CI.
+# temp dir; header only, no device, runs in CI. Since engine#1241 the same test forks a live
+# holder and proves the wait names it after ~2 s and ONEBIT_NPU_LOCK_WAIT_MAX fails fast with it.
 add_executable(npu_device_lock_test tests/npu_device_lock_test.cpp)
 target_include_directories(npu_device_lock_test PRIVATE app)
 add_test(NAME npu_device_lock COMMAND npu_device_lock_test)

@@ -123,6 +123,13 @@ class H(BaseHTTPRequestHandler):
                                  "timings": {"share_ms": 0.25}})
                 return
             if action == "adopt":
+                # FAKE_KVSHARE_ADOPT_REFUSE=1: the export happened and the provider wrote into it, but the cells
+                # cannot be taken -- the real refusal when another sequence holds them. That is NOT a handshake
+                # failure: the engine must not fall back to the file route and pay for the prompt twice.
+                if os.environ.get("FAKE_KVSHARE_ADOPT_REFUSE"):
+                    self._json(400, {"error": {"message": "Cannot adopt the shared cells: this slot's cache does not "
+                                                           "hold the provider's prompt"}})
+                    return
                 # the cells are only meaningful for the export they were written into
                 if req.get("share_id") != 7:
                     self._json(400, {"error": {"message": "adopt must quote the share_id"}})

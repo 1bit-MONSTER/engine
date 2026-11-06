@@ -146,5 +146,19 @@ check "the provider's state file was restored (share 0.000 ms, the file route)" 
 check "the decoder was not left to prefill the prompt itself" '! grep -q "the backend prefills this request itself" "$scratch/d.log"'
 stop
 
+# the other side of the same boundary: the export worked and the provider wrote into the region, but the cells
+# cannot be adopted (the real refusal when another sequence holds them). That is not a handshake failure, so the
+# engine's designed behaviour is the plain fallback -- it must NOT re-run the prompt through the state-file route.
+rm -f "$scratch/provider.json"
+check "serve starts with a decoder that refuses the adopt" \
+    'start "$scratch/e.log" ONEBIT_KV_SHARE=1 FAKE_KVSHARE_ADOPT_REFUSE=1 ONEBIT_HYBRID_PREFILL="$here/fake_kvshare_provider.py"'
+reply=$(ask)
+check "the reply comes through when the adopt is refused" '[[ "$reply" == *Paris* ]]'
+check "the provider did run and wrote into the region" \
+    'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"fds\"]==1 else 1)" "$scratch/provider.json" 2>/dev/null'
+check "the refused adopt is named" 'grep -q "adopt answered 400" "$scratch/e.log"'
+check "an adopt refusal does not fall back to the state file" '! grep -q "cannot share its KV" "$scratch/e.log"'
+stop
+
 if [ $fail -ne 0 ]; then echo "--- log (tail)"; tail -30 "$scratch/a.log"; echo FAIL; exit 1; fi
 echo PASS

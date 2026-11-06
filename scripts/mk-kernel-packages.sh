@@ -59,8 +59,12 @@ umask 022
 out=$1 ver=$2; shift 2
 repo=$(cd "$(dirname "$0")/.." && pwd)
 
-kdebs= driver_src=$repo/third_party/xdna-driver ec_src=$repo/os/licenses/ec_su_axb35/src
-mok_cert= families=deb,rpm,arch skip_kernel=0
+kdebs=''
+driver_src=$repo/third_party/xdna-driver
+ec_src=$repo/os/licenses/ec_su_axb35/src
+mok_cert=''
+families=deb,rpm,arch
+skip_kernel=0
 while [ $# -gt 0 ]; do
     case $1 in
         --kernel-debs) kdebs=$2; shift 2 ;;
@@ -404,7 +408,9 @@ mk_arch() {   # <name> <pkgver> <pkgdesc> <license> <root> [install-script]
     if [ -n "$inst" ]; then printf '%s\n' "$inst" > "$root/.INSTALL"; fi
     ( cd "$root" && bsdtar -cf - --format=mtree \
         --options='!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' . | gzip -9 > .MTREE )
-    ( cd "$root" && bsdtar --format=pax -cf - .PKGINFO .MTREE $( [ -z "$inst" ] || echo .INSTALL ) * \
+    local extra=()
+    [ -z "$inst" ] || extra=(.INSTALL)
+    ( cd "$root" && bsdtar --format=pax -cf - .PKGINFO .MTREE "${extra[@]}" * \
         | zstd -q -19 -T0 -o "$out/$name-$pkgver-x86_64.pkg.tar.zst" )
     echo "   $name-$pkgver-x86_64.pkg.tar.zst"
 }
@@ -576,7 +582,7 @@ if [ "$skip_kernel" = 0 ]; then
         } > "$kspec"
         rpmbuild -bb --quiet --define "_topdir $work/rpm" "$kspec" || die "rpmbuild failed for 1bit-kernel"
         cp "$work/rpm/RPMS"/*/1bit-kernel-*.rpm "$out"/
-        echo "   $(ls "$out"/1bit-kernel-*.rpm | xargs -n1 basename | tr '\n' ' ')"
+        echo "   1bit-kernel-${rpm_ver}-${rpm_rel}.x86_64.rpm 1bit-kernel-devel-${rpm_ver}-${rpm_rel}.x86_64.rpm"
         ;;
     esac
     case ",$families," in *,arch,*)

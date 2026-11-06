@@ -1178,6 +1178,64 @@ mod tests {
         App::new(f)
     }
 
+    /// The dialog menu's own item table: the `N "Label"` rows inside the `--menu` call of the main screen.
+    ///
+    /// That table is what `--action N` runs, so this screen's row N has to read the same words: keys 2-7 hand off by
+    /// NUMBER, and a label that drifts turns "5 Install 1bit OS to a disk" into a row that runs something else.
+    /// The anchor is the main dialog's own title - the script has three other `--menu` calls (network, models,
+    /// reboot) whose rows are a different thing, and `1bit OS console` appears exactly once in it.
+    fn menu_script_items(text: &str) -> Vec<String> {
+        let mut in_main_menu = false;
+        let mut items = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.contains("1bit OS console") {
+                in_main_menu = true;
+                continue;
+            }
+            if !in_main_menu {
+                continue;
+            }
+            let Some(number) = line.chars().next().filter(|c| ('1'..='9').contains(c)) else {
+                // the rows are contiguous: the first non-row line ends the table
+                if !items.is_empty() {
+                    break;
+                }
+                continue;
+            };
+            let Some(rest) = line[number.len_utf8()..].trim_start().strip_prefix('"') else {
+                break;
+            };
+            let Some(end) = rest.find('"') else { break };
+            items.push(rest[..end].to_string());
+        }
+        items
+    }
+
+    #[test]
+    fn every_menu_row_is_the_menu_scripts_own_item() {
+        // The nine labels exist twice - `ACTIONS` here and the dialog's --menu table in
+        // embed/usr/local/bin/1bit-console-menu - and nothing held them together: #935 and #1163 both reworded a
+        // label, and the gate (`vm-check.sh` `U2 menu`) reads the OTHER copy off tty1. A drift is not cosmetic:
+        // the hand-off runs `--action N`, so row N would say one thing and do another.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../embed/usr/local/bin/1bit-console-menu");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e} (this test reads the menu the image ships)",
+                path.display()
+            )
+        });
+        let items = menu_script_items(&text);
+        assert_eq!(
+            items,
+            ACTIONS.to_vec(),
+            "row-for-row parity with {} is broken: {items:?}",
+            path.display()
+        );
+        assert_eq!(items.len(), 9, "the dialog menu is nine items: {items:?}");
+    }
+
     #[test]
     fn connect_block_names_how_to_reach_the_box() {
         // the owner's cycle-18 complaint, as a test: the first screen must say how to connect

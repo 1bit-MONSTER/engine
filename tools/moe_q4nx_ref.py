@@ -91,6 +91,57 @@ class Q4nx:
     def shape(self, name):
         return self.table[name]["shape"]
 
+    def expert_meta(self, name):
+        """__metadata__.moe's entry for one routed stack, checked against the tensor's own shape.
+
+        The stacks come from ggml `[cols, rows, experts]` and are stored here as
+        `[experts x rows/32, cols/256, 5120]`, so a converter that keeps ggml's field order swaps
+        K and N and moves no byte: `bytes`, `tiles`, the offsets and the expert count all stay
+        valid (on this model gate/up are 24x8 and down 64x3 -- 192 tiles either way), which is
+        why every byte-count check in these tools passes on a transposed pair. Only the tensor's
+        own shape separates them, and a transposed down_proj is a GEMM contracting over the wrong
+        axis: noise, not an error. The engine's Moe makes the same three checks (npu/moe.cpp).
+
+        The offsets are the other half of the same contract, because they are where a chunk file's
+        bytes actually come from: one entry per expert, expert 0 at the tensor's own start, each
+        exactly `bytes` after its predecessor, the last one reaching the tensor's end. The
+        convention is the container's (data-section relative) and NOT free here: this reader
+        indexes the mmap absolutely, so a list written relative to the tensor would read another
+        tensor's bytes without moving a single byte count. npu/moe.cpp checks the same things
+        relative to offsets.front(), which is why it cannot see the convention -- and verify()
+        cannot see either, since it compares a chunk against a read driven by the same list.
+        """
+        info = self.moe_meta.get("tensors", {}).get(name)
+        if info is None:
+            raise SystemExit(f"{name}: not listed in __metadata__.moe.tensors")
+        rows, cols = int(info["rows"]), int(info["cols"])
+        shape = self.shape(name)
+        if rows <= 0 or cols <= 0 or rows % 32 or cols % 256:
+            raise SystemExit(f"{name}: rows/cols are not a whole number of 32x256 tiles")
+        if int(info["tiles"]) != (rows // 32) * (cols // 256):
+            raise SystemExit(f"{name}: tiles does not match rows x cols")
+        if (len(shape) != 3 or shape[2] != TILE or shape[0] != int(info["experts"]) * (rows // 32)
+                or shape[1] != cols // 256):
+            raise SystemExit(f"{name}: rows/cols disagree with the tensor's shape {shape}")
+        n, nb = int(info["experts"]), int(info["bytes"])
+        if nb != int(info["tiles"]) * TILE:
+            raise SystemExit(f"{name}: bytes is not a whole number of {TILE}-byte chunks")
+        off = [int(x) for x in info["offsets"]]
+        lo, hi = (int(x) for x in self.table[name]["data_offsets"])
+        if len(off) != n:
+            raise SystemExit(f"{name}: offsets lists {len(off)} entries for {n} experts")
+        if off[0] != lo:
+            raise SystemExit(f"{name}: offsets[0] is {off[0]} but the tensor starts at {lo}: the "
+                             "list is not measured from the data section")
+        for e in range(1, n):
+            if off[e] != off[0] + e * nb:
+                raise SystemExit(f"{name}: expert {e} at {off[e]} is not {nb} B after expert "
+                                 f"{e - 1} at {off[e - 1]}")
+        if off[-1] + nb != hi:
+            raise SystemExit(f"{name}: the offsets cover up to {off[-1] + nb}, the tensor ends at "
+                             f"{hi}")
+        return info
+
     def bf16(self, name):
         """A BF16 tensor as float32, its stored shape."""
         t = self.table[name]
@@ -120,7 +171,7 @@ class Q4nx:
         """Expert e of a routed stack as float32 [rows, cols]; not cached (streamed)."""
         t = self.table[name]
         rt, kt = t["shape"][0], t["shape"][1]
-        info = self.moe_meta["tensors"][name]
+        info = self.expert_meta(name)
         lo = info["offsets"][e]
         rows = info["rows"]
         rte = rt // info["experts"]
@@ -736,6 +787,34 @@ def selftest():
     h = rng.standard_normal((1, 16)).astype(np.float32)
     assert abs(float(np.sqrt((rmsnorm(h, np.ones(16, np.float32), 0.0) ** 2).mean())) - 1.0) < 1e-6
     print("ok   softmax / top-k renormalisation / RoPE / rmsnorm")
+    # The expert metadata is checked against the tensor's own shape, because a transposed pair of
+    # rows/cols moves no byte and leaves `tiles` identical (gate/up 24x8 and down 64x3 are both
+    # 192 on a 768-wide model), so nothing else in these tools can see it. The offsets are the other
+    # half - they are where the bytes come from, and a permuted or tensor-relative list reads
+    # another expert's (or another tensor's) weights with every byte count still balancing.
+    def stub(rows, cols, tiles, shape, data_lo=0, offsets=None):
+        b = tiles * TILE
+        q = Q4nx.__new__(Q4nx)
+        q.table = {"w": {"shape": shape, "data_offsets": [data_lo, data_lo + 2 * b]}}
+        q.moe_meta = {"tensors": {"w": {"experts": 2, "rows": rows, "cols": cols,
+                                        "tiles": tiles, "bytes": b,
+                                        "offsets": offsets or [data_lo, data_lo + b]}}}
+        return q
+
+    assert stub(768, 2048, 192, [48, 8, TILE]).expert_meta("w")["cols"] == 2048
+    for bad in (stub(2048, 768, 192, [48, 8, TILE]),     # rows/cols transposed, same tile count
+                stub(768, 2048, 191, [48, 8, TILE]),     # tiles inconsistent with rows x cols
+                stub(768, 2048, 192, [128, 3, TILE]),    # the shape a transposed tensor would have
+                stub(768, 2048, 192, [48, 8, TILE], data_lo=4096,
+                     offsets=[0, 192 * TILE]),           # tensor-relative offsets
+                stub(768, 2048, 192, [48, 8, TILE], offsets=[192 * TILE, 0]),   # reversed
+                stub(768, 2048, 192, [48, 8, TILE], offsets=[0])):   # one entry, two experts
+        try:
+            bad.expert_meta("w")
+        except SystemExit:
+            continue
+        raise AssertionError("a bogus expert geometry was accepted")
+    print("ok   expert metadata vs the tensor's shape and offsets")
     print("moe_q4nx_ref selftest: ok")
 
 

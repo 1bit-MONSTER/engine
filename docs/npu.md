@@ -543,7 +543,7 @@ own, with a negative control.
 
 A cached directory is checked again on every hit, with the same metadata-only scan, and it is
 rebuilt if the scan fails or if its `repack-stamp.txt` (converter path and commit, architecture,
-repack script) names a different converter than this build would use (`repack_gguf.py
+the measured `tile_order`, repack script) names a different converter than this build would use (`repack_gguf.py
 --check-stamp <dir>`: exit 0 current, 1 stale, 2 cannot tell). If the checker or the converter
 cannot be found, serve warns once per process and reuses the directory, so a missing script
 cannot stop serving. A Q4NX directory served as it is (`1bit serve -m <Q4NX dir>`), such as a
@@ -552,6 +552,27 @@ dequantizing anything: `tools/check_q4nx_dir.py <dir>` reads the container heade
 quantized tensor's chunk kind, and refuses an unknown chunk size or a tensor shorter than its layout
 needs. It cannot tell the two Q8 layouts apart ("Q4NX chunks", above), because the container does
 not record which one it holds.
+
+**The tile order is measured, not declared.** Two converters can write `q4_1` tiles in the two
+different orders this engine and FastFlowLM use, and a container in the wrong order repacks cleanly
+and decodes as noise — HTTP 200, nothing in the log (engine#1110; measured with FLM_Q4NX_Converter
+`d1d5232`, whose containers come back `matches NO layout`). The load-time field
+`container.tile_order` (engine#1130) cannot catch it, because `tools/npu_plan.py` writes `engine-1`
+for every plan: it guards against a future writer, not against the converter that produced the
+tiles. So the repack decodes a sample of the container against the source GGUF with
+`tools/q4nx_diff.py`'s own verdict — one pass per layout, once per directory — and:
+
+* **refuses** the directory (`rc=1`) when no layout matches, or when the layout that matches is not
+the `engine-1` order `npu/forward/src/q4nx.cpp` decodes;
+* records `tile_order=engine-1` and `tile_check=<the verdict line>` in `repack-stamp.txt` when it
+does match, so the claim in `plan.json` is measured rather than assumed;
+* records `tile_order=unverified` when nothing was comparable (an architecture the checker cannot
+dequantize) instead of asserting a layout nobody checked.
+
+The same measurement runs on its own over an existing directory:
+`python3 scripts/repack_gguf.py --tile-check <dir> <model.gguf>` (exit 0 ours, 1 another order or
+none, 2 nothing compared). A cache hit re-checks metadata only, so the cost is paid once per
+directory, on top of the converter's own pass.
 
 ### From a Ryzen AI OGA NPU pack
 
@@ -984,7 +1005,10 @@ supported by this route's schema-to-GBNF converter", "`gbnf: unterminated litera
 "`stream`: must be true or false", "`tools`: must be an array"),
 never a silently ignored key and never a 500: a wrong *type* is a client error like any other, including on the
 fields the route reads before it starts decoding (engine#1106). `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
-an end-of-sequence token, a stop sequence or a grammar that allows nothing more.
+an end-of-sequence token, a stop sequence, a grammar that allows nothing more, or a constrained answer the model
+ended itself once its grammar had reached an accepting state — the route puts the container's end tokens into the
+mask exactly there, so a complete JSON object reports `stop` instead of padding with whitespace to `max_tokens`
+(engine#1182).
 
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
 `third_party/llama.cpp/src/llama-sampler.cpp` (top_k, then top_p, then temperature, then the

@@ -140,6 +140,19 @@ int main(void) {
             check(load(write_file(cases[i][0], strlen(cases[i][1]), cases[i][1], 8)) == NULL, what);
         }
     }
+    {   /* engine#1185: an imported container's I8 weight rows are 6,144-byte q4_1f chunks (fp32
+         * scale/zero). The kernels here dequantise 5,120-byte q4_1 tiles in-kernel, so reading those
+         * bytes as one would silently decode parameters as codes; the loader must refuse by name. */
+        const char* h = "{\"model.layers.0.self_attn.q_proj.weight\":{\"dtype\":\"I8\",\"shape\":[256,6144],"
+                        "\"data_offsets\":[0,1572864]}}";
+        check(load(write_file("fp32.q4nx", strlen(h), h, 1572864)) == NULL,
+              "a 6,144-byte q4_1f (imported fp32) container is refused, not misdecoded");
+        const char* b = "{\"model.embed_tokens.weight\":{\"dtype\":\"BF16\",\"shape\":[8,6144],"
+                        "\"data_offsets\":[0,98304]}}";
+        ModelWeights* m = load(write_file("wide.q4nx", strlen(b), b, 98304));
+        check(m != NULL, "a plain bf16 tensor 6,144 columns wide (not I8) still loads");
+        if (m) model_free(m);
+    }
     char cmd[96];
     snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
     if (system(cmd) != 0) fprintf(stderr, "could not remove %s\n", dir);

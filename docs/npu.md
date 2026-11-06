@@ -142,9 +142,20 @@ byte layouts).
 | Chunk | Kind | Weight | Seen in |
 |---|---|---|---|
 | 5120 B | q4_1: bf16 scale and zero per 32 columns of a row | `code * scale + zero` | Qwen3, Llama, Gemma, Phi models |
+| 6144 B | q4_1f: **fp32** scale and zero per 32 columns of a row (imported containers, below) | `code * scale + zero` | `1bit npu-pack import` output |
 | 4736 B | Q4_K: u8 scale and min per 32 columns, bf16 `S`, `M` per row | `S * scale * code + M * min` | Qwen3.5-4B projections |
 | 8704 B | Q8: bf16 scale per 32 columns, int8 codes | `d * code` | Qwen3.5-4B `lm_head` and embedding |
 | 2176 B | **t2**: 2-bit ternary codes, one fp16 scale per 128 columns of a row | `code * scale` | ternary models (Bonsai-2, PTQ1_0/TQ1_0 sources) |
+
+The two q4_1 forms are a container property, named by the container's `layout` metadata
+(`__metadata__.layout` in `model.q4nx`, `q4nx_source.layout` in `config.json`): absent or
+`q4nx-1` is the bf16 form every container written before engine#1185 has, and every GGUF-derived
+one (the bf16 choice came from that path); `q4nx-2` is the fp32 form `1bit npu-pack import` writes,
+so an OGA pack's own scale and zero survive bit for bit. A decoder keys off the chunk's own last
+dimension either way, so a container with no metadata still loads; `q4nx::params_of_layout()` is for
+the caller that has to state the fidelity it holds, and `q4nx::as_q4_1()` repacks the fp32 form to
+the device's 5,120-byte bf16 q4_1 (the device kernels stream q4_1; the repack is where the bf16
+rounding reappears for the device, never in the container).
 
 **Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
 embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors
@@ -154,8 +165,9 @@ apart. Decoding tile (0, 0) of each lm_head and comparing with a GGUF of the sam
 gives correlation 0.9998 with the right layout and about 0.01 with the other. `npu/q4nx`
 decodes the first layout.
 
-`npu/q4nx.h` decodes all four, and repacks Q4_K into q4_1 (exact apart from rounding
-`S * scale` and `M * min` to bf16), so code that reads q4_1 runs Q4_K weights unchanged. Q8 does
+`npu/q4nx.h` decodes all five (the two q4_1 parameter forms included), and repacks Q4_K into q4_1
+(exact apart from rounding `S * scale` and `M * min` to bf16), so code that reads q4_1 runs Q4_K
+weights unchanged. Q8 does
 not fit q4_1, and neither does t2 (per-128 fp16 scale against q4_1's per-32 bf16 one): a t2 tensor
 is expanded on the target, never repacked. `tests/npu_q4nx_test.cpp` checks the decoders bit for bit
 against reference decoders on real Qwen3.5-4B and Qwen3-0.6B tiles (committed in
@@ -632,12 +644,12 @@ What converts, and how faithfully:
 | pack tensor | where | to | fidelity |
 |---|---|---|---|
 | `model.embed_tokens.weight` | `model.onnx.data`, fp16 | bf16 | fp16 → bf16 rounding (10 → 7 mantissa bits) |
-| `lm_head` `MatMulNBits` (bits 4, block 128, asym) | `model.onnx.data` | q4_1 tiles | codes unchanged; `scale = s` (exactly bf16 in this pack), `zero = -zp*s` (bf16 rounding) |
+| `lm_head` `MatMulNBits` (bits 4, block 128, asym) | `model.onnx.data` | q4_1f tiles | codes unchanged; `scale = s`, `zero = -zp*s`, both stored as f32 |
 | `input_layernorm`, `post_attention_layernorm` | `.fconst`, bf16 at a fixed offset | bf16 | byte-exact |
-| `self_attn.{q,k,v,o}_proj` (24 x 4) | `.fconst`, 34,816-byte 64-row tiles | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
+| `self_attn.{q,k,v,o}_proj` (24 x 4) | `.fconst`, 34,816-byte 64-row tiles | q4_1f tiles | codes unchanged; `scale = s` (the pack's bf16 value), `zero = -zp*s` stored as f32 |
 | `self_attn.{q,k,v}_proj.bias` (24 x 3) | `.fconst`, the tiles' bias subvolumes | bf16 | byte-exact; written only where the pack has one |
-| `mlp.{gate,up}_proj` (24 x 2) | `.fconst`, MLP section, 4,288-byte subvolumes | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
-| `mlp.down_proj` (24 x 1) | `.fconst`, MLP section, 2,176-byte subvolumes | q4_1 tiles | same as the attention tiles |
+| `mlp.{gate,up}_proj` (24 x 2) | `.fconst`, MLP section, 4,288-byte subvolumes | q4_1f tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` stored as f32 |
+| `mlp.down_proj` (24 x 1) | `.fconst`, MLP section, 2,176-byte subvolumes | q4_1f tiles | same as the attention tiles |
 | `model.norm` (final) | `.fconst`, the tail envelope at `layers x stride` | bf16 | byte-exact |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
@@ -650,13 +662,19 @@ because `tie_word_embeddings` makes `dequant(lm_head)` reproduce the fp16 embedd
     corr 0.999999, relative error 0.00070 on all 151936 x 896 weights
     controls: nibble-swapped corr -0.0008, no zero-point corr 0.8788   (both rejected)
 
-Two facts bound what the container can hold, and both are reported, not hidden:
+Two facts about what the container holds, both reported, not hidden:
 
-* **A bf16 zero does not always hold a f32 one.** A q4_1 chunk stores bf16 scale and zero. This
-  pack's scales are already bf16 values (0 % rounded), but `-zp*s` is bf16-exact for only
-  43.5 % of 32-column groups. The residual is that rounding: 3.34e-3 relative, 2.4e-4 absolute
-  on the dequantized weights, with no code moved. Read back through `q4nx::dequant_tile` the
-  container matches the pack to that bound.
+* **The pack's scale and zero are kept exactly (engine#1185).** An imported container uses the
+  fp32 `q4_1f` chunk (6,144 B), and its `layout` says `q4nx-2`; every written tile's scale/zero
+  planes are read back and compared with the pack's f32 values. What this replaces: the 5,120-byte
+  bf16 form kept only 43-48 % of the groups bit-equal on the four shipped packs (3.34e-3 relative,
+  2.4e-4 absolute on the weights), because `-zp*s` is an arbitrary f32 and bf16 rounds it. That
+  floor is gone for imported containers -- the same measurement is now bit-equal, and
+  `npu-pack import` prints "fp32 scale/zero exact for 100.00 % of 32-column groups (container
+  layout q4nx-2)". The device still streams bf16 q4_1, so a container repacked for the NPU takes
+  that rounding there (`q4nx::as_q4_1()`), and `npu/forward`'s loader refuses a q4nx-2 container
+  by name rather than reading its 6,144-byte rows as 5,120-byte tiles; GGUF-derived containers are
+  unchanged and keep the bf16 form.
 * **K is padded to the 256-column grid.** Qwen2.5-0.5B has hidden 896 = 3.5 tiles, so
   `lm_head` and q/k/v/o are stored as 4 column tiles with the last one zero-padded (codes 0,
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's

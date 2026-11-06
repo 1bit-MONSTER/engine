@@ -161,7 +161,9 @@ struct Report {
     bool selfcheck_reference = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
 
-    // Self-check 2: the written container, read back, against the pack's dequantised values.
+    // Self-check 2: the written container, read back, against the pack's dequantised values. With
+    // the fp32 q4_1f form (engine#1185) q4nx_rel and q4nx_max_abs are 0 and zero_exact_pct is 100:
+    // the bf16 floor described here before was the GGUF path's, not the import's.
     double q4nx_rel = 0, q4nx_max_abs = 0, zero_exact_pct = 0;
     long long codes_exact = 0, codes_total = 0;
 
@@ -185,7 +187,7 @@ struct Report {
     // bias slots) -- so it fails if any index, nibble order or field offset in decode_tile() is wrong.
     long long attn_tiles_ok = 0, attn_tiles_total = 0;
     int attn_projections = 0, attn_bias_tensors = 0;
-    double attn_zero_inexact_pct = 0;  // per-32-group zero points that are not bf16-exact in the container
+    double attn_zero_inexact_pct = 0;  // per-32-group parameters not stored exactly (0 with the fp32 form)
 
     // Self-check 4: the same round trip over the MLP section -- every 128-column gate/up unit and every
     // 64-column down_proj group decoded and re-encoded, which has to give the shipped bytes back.
@@ -278,7 +280,15 @@ Q4 q_from_tiles(const std::vector<TileW>& tiles);
 TileW gu_half(const TileW& group, bool up);
 
 // Q4NX q4_1 tiles of a Q4 tensor: [N/32 * K/256, 5120] bytes, plus the parameters
-// that were not exactly representable in bf16 (counted, not fixed up).
+// that were not exactly representable in bf16 (counted, not fixed up). This is the form every
+// GGUF-derived container holds (npu/q4nx.h q4_1), and the one the device streams.
 void tile_q4_1(const Q4& q, std::vector<uint8_t>& out, long long* zero_inexact = nullptr);
+
+// The same grid in the imported container's fp32 form: [N/32 * K/256, 6144] bytes (npu/q4nx.h
+// q4_1f). Scale and zero are stored as f32, so the pack's own values survive bit for bit -- the
+// difference engine#1185 is about: an OGA pack's zero is -zp*scale, an arbitrary f32, and the
+// 5120-byte form rounded it (2.7-3.3e-3 relative on ~57 % of groups). `param_inexact` counts the
+// groups whose stored bytes are not the source float; it is 0 unless the writer is wrong.
+void tile_q4_1_f32(const Q4& q, std::vector<uint8_t>& out, long long* param_inexact = nullptr);
 
 }  // namespace onebit::npu::pack_import

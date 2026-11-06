@@ -278,6 +278,47 @@ Converters: `from_pb16i` (the engine's integer-exact image), `from_ptq1_0` and `
 ternary with an fp16 scale, lossless). `from_tq2_0` is refused unless asked, because TQ2_0's code 3
 means **+2** — it is not a ternary format, and clamping it to +1 changes weights.
 
+#### Gating a t2 target: bit-exact, not close
+
+The t2 chunk is what the plan layer streams for a ternary model, so more than one thing will consume
+it: the XDNA path today, a Hexagon target next (engine #804), anything after that. A consumer is
+accepted when it produces **the same y a CPU oracle produces, bit for bit**. Close is not enough and
+the difference is not pedantry: the layer above the GEMV is compared against the oracle, so a target
+that is 1e-7 off makes every gate above it either fail or be weakened to a tolerance that hides real
+faults.
+
+The order a t2 target has to follow, per row:
+
+```
+for each 128-K group g, left to right:
+    s   = exact int32 sum over the group of code[r][c] * x[c]      # |s| <= 128*127, no rounding
+    y  += float32(s) * float32(scale[r][g])                        # two roundings: mul, then add
+```
+
+Three things follow, and each one is a way to get it wrong: the group sum is integer and exact (never
+accumulated in float); the scale multiplies the *group sum*, not each code; and the groups enter the
+f32 accumulator in K order. Below four groups a float64 accumulator and a reversed group order give
+identical bits — the arithmetic cannot round yet — which is why the gate tests the production width.
+
+`tests/npu_t2_target_gate.py` is that gate. Its always-on half is numpy only (no model, no device, no
+gguf): it accepts the oracle's own y for three shapes including a single tile, and it refuses four
+plausible near-misses — a one-bit change, a truncated dump, float64 accumulation and a reversed group
+order — plus a tensor carrying a reserved code, which must contribute 0 and never `2 * scale`. Given
+`--tensor`, `--dump`, `--x`, `--n` and `--k` it runs the same comparison against a real tensor and a
+target's dumped y, printing the bit-exact count, the SNR and the first mismatch:
+
+```
+tests/npu_t2_target_gate.py --tensor blk_0_attn_qkv_weight.t2 --dump /tmp/y.bin \
+                            --x /tmp/x.bin --n 10240 --k 5120
+```
+
+Measured on the six layer-0 projections of Bonsai-2 (the GDN block's `attn_qkv`, `attn_gate`,
+`ssm_out` and `ffn_{gate,up,down}`), with a Hexagon target against this oracle: bit-exact on
+10240/6144/5120/17408/17408/5120 values, 375.7-377.7 dB, 0 reserved codes. The same gate refused the
+first build of that target for reading the tile grid k-outer instead of n-outer — the rule two
+paragraphs up — which is the reason it exists: the target was self-consistent, bit-exact against its
+own scalar reference, and decoding a different matrix than the container meant.
+
 ### The t2s stream (what the XDNA decode kernel reads)
 
 t2 is the container format: the decoder's byte order, for any consumer. The device does not want that
@@ -371,6 +412,29 @@ carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's ow
 `q4nx_t2s_sealed_elf` (pb16i keeps `q4nx_pb16i_sealed_elf`; a layout never borrows the other's key, because
 a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
 `plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
+
+#### What the stream is worth at the model level (measured)
+
+The phase numbers above are the kernel's. The number a user feels is a decode step, and it is the one that
+decided P3: same container file and same engine binary, two weight paths, adjacent windows on one quiet box
+(2026-11-02, three `npu-hold` tickets on `:18099`, `amdxdna` counter 0 in each, seven steady-state tokens per
+arm read from the serve's own `[ph] tok` lines):
+
+| container | decode | device wait | stream per token |
+|---|---|---|---|
+| pb16i (control) | 410 ms/token (409-412) = 2.44 tok/s | 296 ms | 12.93 GB |
+| **t2s2 sealed** | **313 ms/token (311-317) = 3.20 tok/s** | **209 ms** | **6.11 GB** |
+
+**1.31x per token and 1.42x on the device wait**, on 2.12x fewer bytes to stream (431 images, 14.44 -> 6.82 GB).
+The model keeps 1.31x of the kernel's 1.76x because a step is more than its GEMMs: the host half (quantise,
+rotation, GDN) and the lm head do not shrink with the wire, and in this pair they are 66 ms and 13.5 ms of it.
+
+Acceptance is byte-exactness, not a text diff: every decode role matched the pb16i path byte for byte at
+layer 0 (6/6) and layer 3 (8/8) on all three seeds, and greedy text is equal to the pb16i arm's on the prompt
+both were asked — `' Paris.\nThe capital of Germany is'`. **A request wall is not this number** — a fresh
+serve pays the image fill once, so a 32-token request measures 614/651 ms/token while the per-token instrument
+says 313/410; that correction, and why every request-wall figure in this file pays the fill, is in the chunk
+above.
 
 #### The image fill (what a fresh serve costs)
 
@@ -921,9 +985,9 @@ architecture the repo's config declares, and does the NPU route already serve th
 registry maps it, but only for a backend that cannot run a Q4NX directory. Both answers come from
 the registry, never from the repo name.
 
-The route serves the families `registry/architectures.json` marks `npu`: `qwen3` on the dense
-fast lane, and `qwen2`, `qwen3moe`, `qwen3_5_moe`, `deepseek2`, `minicpm` and `llama` through the
-GGUF-on-NPU forward ([registry.md](registry.md) has the table). Everything else in the org is an
+The route serves the families `registry/architectures.json` marks `npu`: `qwen3` and `qwen3_5` on
+the dense fast lane, and `qwen2`, `qwen3moe`, `qwen3_5_moe`, `deepseek2`, `minicpm` and `llama`
+through the GGUF-on-NPU forward ([registry.md](registry.md) has the table). Everything else in the org is an
 NPU-route gap, recorded here instead of as a GGUF alias: a class enters the registry only when a
 backend's code accepts it, so mapping an NPU pack to an hrx-only family would advertise a model
 the route refuses at load.
@@ -948,11 +1012,12 @@ to one of these repos is a prompt to update this table rather than a namespace e
 The 2026-11-06 census body (engine#1253) read the whole org from a fresh state, so it also printed
 every pack whose family the registry maps for `hrx` only. Those are the `!! NPU FLM` rows: the
 architecture is covered on the CPU route, but a Q4NX directory needs the NPU route and `npu` is
-not in the entry's `backends`. Family by family:
+not in the entry's `backends`. Family by family (`qwen35` has since moved out of that set, because
+engine#587 measured the route on it):
 
 | family (`gguf`) | packs in the 2026-11-06 body | `backends` | NPU route answer |
 |---|---|---|---|
-| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx | not served: the dense qwen35 family has no NPU kernel set; the serving work is tracked in engine#587 (Qwen3.8-27B-NPU2) |
+| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx, npu | **served, and measured** (engine#587): the same `Qwen3.8-27B-NPU2` family runs on the NPU route — int8 Q4NX decodes at 63.1 s/token and takes 145.7 s to a first token (`bench/npu-leaderboard/27b-*.json`, 2026-10-27), a 5-token prefill chunk is 58.14 s, and the ternary sealed-ELF rung on the same container is 1.72 s/token with 3/3 text-identical output (engine#697, closed by #728). What a stock install still needs is a kernel set for the model's geometry — none ships in this repository — so the row read `not served` until the route itself was measured |
 | `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
 | `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
@@ -1223,6 +1288,15 @@ The remaining names come from `configs/q4nx/qwen3.5_0.8b.json`'s `q4nx_name` col
 load failures, not style: the embedding keeps its **2-D shape** (the loader reads vocab and hidden off
 `shape[0]`/`shape[1]`), and `text_config`'s keys are **lifted to the top level**, because the engine reads
 `config.json` at depth 1 only. A tensor with no mapping is a refusal, never a dropped one.
+
+Conversion is not the last step for a d3 pack: `decision` copies the pack's `decision_config.json` (which is
+where it declares `attention_mode`), and then `tools/npu_plan.py <model dir> --kernels <elf dir>` must write
+`plan.json`, because **`attention.mode` is read from the plan and nowhere else**. A pack without one is
+answered *causally*, which for a noncausal pack is a different model — the reference's own mask is worth
+0.2869 |Δp| (engine#847) — so the load refuses instead of serving those numbers: it names
+`decision_config.json`'s `noncausal_full_attention`, says whether `plan.json` is absent or stale, and prints
+the `tools/npu_plan.py` command that fixes it (engine#796). The plan is also what makes a *device* row find its
+`gate/up` fusion and its M=16 decode twins, so a converted pack is not otherwise ready for the array either.
 
 `--dtype bf16` writes the same tensor set with **no q4_1 tiles at all** (every tensor keeps its source
 bf16, or the F32 a transform forces; `verify` reports 0 error rather than a loss). It is the container for
@@ -1658,6 +1732,17 @@ Two settings are worth knowing regardless, both measured in one window:
   after the first draft and trades base passes for lm-head calls almost exactly one-for-one: 0.598-0.623 s/token
   across arms that differ 2× in chain and 4× in head calls. It also leaves depths 3-4 with *no* offers, so any
   per-depth measurement is at `tau = 0`.
+
+**`tau` is part of the window, and the tooling now says so.** Because the gate stops the chain, a `tau = 0.6` ticket
+offers one or two depths where a `tau = 0` one offers four, so the two must never be pooled into one table — yet until
+now `mtp_acceptance --live` printed its window (`k`, tokens, hidden) nowhere: `--offline` has always stated it, the
+live path only echoed it in the harness' argv. `--live` now prints the same
+`== N prompts x M tokens, k=K tau=T, hidden=H` line at **init** (so a ticket killed at its hold still states its
+window), and `tools/mtp_depth_pool.py` reads it and reports the chain gate in the window header, names a pool that
+mixes two gates (`MIXED chain gate (tau)`), and says `tau unstated` for a log that predates the line rather than
+assuming `tau = 0`. `Options::tau` defaults to 0.6, and the tau = 0.6 acceptance row is still **not measured** — the
+published rows above are all `tau = 0`; that row is the next ticket, and it is now impossible to publish it by
+pooling two regimes by accident.
 
 **Refuted, so nobody builds it again**: folding the per-iteration step into the next verify batch (one pass per
 iteration instead of two) collapses the chain from **2.82 to 1.07** tokens/pass and depth-1 acceptance from **82 %

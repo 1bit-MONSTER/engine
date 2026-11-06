@@ -43,8 +43,24 @@ bool has_kernel(int64_t k, int64_t n);
 // C[M,N] = A[M,K] @ B[K,N], all float32 row-major, B[K][N].
 // False means the NPU path could not run at all — the caller must fall back to
 // its CPU kernel and must not claim the device did the work.
+//
+// `stats`, when not null, is filled with a measurement hook for the caller's profiler (ONEBIT_EP_QDQ_PROF):
+// how many calls reached a kernel, how many of those had to re-pack the weight, and the wall time that went
+// to `packB` against the time that went to `go_rows` (quantise + upload, both syncs, launch, wait, readback,
+// dequant — one number, because those steps are the runtime's own and are timed inside it, not here).
+// The float leg's cost per call is otherwise unattributable: the per-design probe times the same function
+// with synthetic operands and a warm weight cache, so a graph that re-packs or that pays for real 32-row
+// activation quantisation looks identical to it. A plain call passes null and pays nothing.
+struct F32Stats {
+    long calls = 0;       // calls that reached a kernel
+    long wpacks = 0;      // packB runs, i.e. weight-cache misses (see Q8RawSplit::wpacks: equal to calls on a
+                          // model graph, because one packed weight per (K, N) is shared by 28-56 weights)
+    double wpack_ms = 0;  // packB time (one column-wise quantisation of a whole weight per miss)
+    double rows_ms = 0;   // go_rows time: quantise+upload, both syncs, launch, wait, readback, dequant
+};
+
 bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
-              float* c, std::string* err);
+              float* c, std::string* err, F32Stats* stats = nullptr);
 
 // The A8W8 QDQ path: int8 activations and int8 weights straight into the kernel's
 // input and weight BOs, exact int32 accumulators out (C[m][n], row major).
@@ -63,7 +79,12 @@ bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
 // hook for the caller's own profiler (onnx/ep/onebit_ep_kernel.cpp, ONEBIT_EP_QDQ_PROF): a plain call
 // passes null and pays one branch per section, not a clock read.
 struct Q8RawSplit {
-    double wpack_ms = 0;     // weight pack into the BO + its upload -- a cache miss, once per weight
+    // Weight-cache misses -- and on a real transformer graph this equals the call count, by design rather than by
+    // accident: the cache holds ONE packed weight per (K, N) kernel, while Qwen3-0.6B has 196 weights across five
+    // shapes (28 for q/o/down, 56 for k/v and gate/up), so successive calls of one shape evict each other. Measured
+    // with this counter: 1764 packs for 1764 calls, 771 ms of a 7646 ms device arm.
+    long wpacks = 0;
+    double wpack_ms = 0;     // weight pack into the BO + its upload
     double aupload_ms = 0;   // activation memset/memcpy + A readback sizing, per launch block
     double async_ms = 0;     // A flush (sync_A) per launch block
     double launch_ms = 0;    // launch + wait_kernel: the device's own time, as the host sees it

@@ -83,7 +83,8 @@ impl Mode {
 
 /// `mode_in` against the real root. Read-only, and cheap enough for the once-a-second frame.
 pub fn mode() -> Mode {
-    resolve(mode_in(Path::new("/")), data_mounted())
+    let mounted = data_mounted();
+    resolve(mode_in(Path::new("/"), mounted), mounted)
 }
 
 /// Is `/data` the mounted data partition? init.sh's rule is `grep -q " /data " /proc/mounts`, and that half matters on
@@ -108,12 +109,20 @@ fn resolve(seen: Mode, data_mounted: bool) -> Mode {
     }
 }
 
-pub fn mode_in(root: &Path) -> Mode {
+/// The installed-state decision, from a root and whether `/data` is a mounted partition.
+///
+/// `data_mounted` is a parameter for init's sake: its whole rule is `grep -q " /data " /proc/mounts && [ -e
+/// /data/.installed ]`, and the first half is not decoration. Without it, a `/data/.installed` file left visible while
+/// `/data` is NOT mounted read as INSTALLED here while the console menu - which asks the mount first - offered an
+/// install: measured with `~/wt/os3i/tui-menu-mode-probe.sh`, one row outside the marker matrix that both halves
+/// otherwise agree on. A boot cannot reach that state (`/data/.installed` only exists on the mounted partition, and
+/// `/data` on the RAM root is mkdir'd empty), but the rule is init's and is now implemented once, in init's shape.
+pub fn mode_in(root: &Path, data_mounted: bool) -> Mode {
     let bit = |p: &str| root.join(p).exists();
     // init's OWN rule first, because that is the decision: /data mounted with .installed on it is an installed boot,
     // and the markers below are written FROM that decision. Marker-first ordering let a stale `live` marker outrank a
     // real installed data partition - the console then said live on an installed box (measured in QEMU).
-    if bit("data/.installed") {
+    if data_mounted && bit("data/.installed") {
         return Mode::Installed;
     }
     if bit("etc/1bit/installed") {
@@ -1370,32 +1379,40 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("etc/1bit")).unwrap();
         assert_eq!(
-            mode_in(&root),
+            mode_in(&root, true),
             Mode::Unknown,
             "an empty box has no mode to report"
         );
         fs::write(root.join("etc/1bit/live"), "").unwrap();
-        assert_eq!(mode_in(&root), Mode::Live);
+        assert_eq!(mode_in(&root, true), Mode::Live);
         // ... and a real installed data partition outranks a stale `live` marker: init's own rule is the decision,
         // the markers are written from it (this ordering was wrong in the first version - measured in QEMU)
         fs::create_dir_all(root.join("data")).unwrap();
         fs::write(root.join("data/.installed"), "").unwrap();
         assert_eq!(
-            mode_in(&root),
+            mode_in(&root, true),
             Mode::Installed,
             "a stale live marker outranked /data/.installed"
+        );
+        // the mount half of init's rule, which this function used to drop: the same file with /data NOT mounted is
+        // not an installed boot (init would not have written the marker), and the menu agrees - measured in
+        // ~/wt/os3i/tui-menu-mode-probe.sh, where the header said INSTALLED and the menu offered an install.
+        assert_eq!(
+            mode_in(&root, false),
+            Mode::Live,
+            "/data/.installed without /data mounted read as INSTALLED"
         );
         fs::remove_file(root.join("data/.installed")).unwrap();
         // an installed boot that somehow kept the live marker still reads installed: the marker init writes wins,
         // and it writes `installed` after the MODE banner
         fs::write(root.join("etc/1bit/installed"), "").unwrap();
-        assert_eq!(mode_in(&root), Mode::Installed);
+        assert_eq!(mode_in(&root, true), Mode::Installed);
         // no markers at all (an init that could not write them) -> init's own fallback, /data/.installed
         let root2 = std::env::temp_dir().join(format!("mode-in2-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root2);
         fs::create_dir_all(root2.join("data")).unwrap();
         fs::write(root2.join("data/.installed"), "").unwrap();
-        assert_eq!(mode_in(&root2), Mode::Installed);
+        assert_eq!(mode_in(&root2, true), Mode::Installed);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&root2);
     }

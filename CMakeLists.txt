@@ -844,10 +844,18 @@ add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
 add_executable(quant_i8_row_test tests/quant_i8_row_test.cpp)
 target_include_directories(quant_i8_row_test PRIVATE npu/forward/include)
 add_test(NAME quant_i8_row COMMAND quant_i8_row_test)
+# The forward's two attention kernels (npu/forward/include/attn_math.h): the AVX2+FMA body and the portable
+# four-accumulator body must both be a float rounding of the same sum, checked against a double-precision
+# direct sum over the head dims the forward serves plus the widths where a vector body's tail runs.  This is
+# also the only thing that exercises the portable body on an AVX2 CI host, where production never takes it.
+# Header only, no device, no model: runs in CI.
+add_executable(attn_math_test tests/attn_math_test.cpp)
+target_include_directories(attn_math_test PRIVATE npu/forward/include)
+add_test(NAME attn_math COMMAND attn_math_test)
 # ci.yml's build step names its targets explicitly and needs the `workflow` scope to extend, so bind the new
 # binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add hadamard_rotate_test to the list itself.
-add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test)
+add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test)
 # The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.

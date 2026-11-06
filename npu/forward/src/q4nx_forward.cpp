@@ -40,6 +40,7 @@
 
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx
 #include "hadamard.h"                // the activation rotation, SIMD path + scalar reference
+#include "attn_math.h"               // attention's score dot + value accumulation, SIMD + portable
 #include "q4nx_dequant.h"
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_pack.h"
@@ -4742,31 +4743,40 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
     const int t0 = (window > 0 && T > window)
                        ? T - window : 0;
     ctx.assign((size_t)NH * HD, 0.0f);
-    std::vector<float> score(T);
-    for (int h = 0; h < NH; h++) {
-        const int kh = h / gqa;
-        const float* qh = &q[(size_t)h * HD];
-        float mx = -1e30f;
-        for (int t = 0; t < T; t++) {
-            if (t < t0) { score[t] = -1e30f; continue; }
-            const float* kt = &kcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-            float d = 0.0f;
-            for (int i = 0; i < HD; i++) d += qh[i] * kt[i];
-            score[t] = d * scale;
-            if (score[t] > mx) mx = score[t];
-        }
-        float sum = 0.0f;
-        for (int t = 0; t < T; t++) {
-            if (t < t0) { score[t] = 0.0f; continue; }
-            score[t] = std::exp(score[t] - mx);
-            sum += score[t];
-        }
-        const float inv = sum > 0 ? 1.0f / sum : 0.0f;
-        float* out = &ctx[(size_t)h * HD];
-        for (int t = t0; t < T; t++) {
-            const float p = score[t] * inv;
-            const float* vt = &vcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-            for (int i = 0; i < HD; i++) out[i] += p * vt[i];
+    // Heads are the unit the cores split here, and they are independent by construction: a head writes
+    // only its own ctx rows and reads its own q plus the read-only KV cache.  The score buffer is
+    // therefore per thread, and the ordering of nothing else changes.  The `if` keeps short contexts
+    // serial -- one team per layer per token is not worth it for a handful of cached positions -- and
+    // `omp_heads_threads()` is this file's existing convention (it leaves a core for the array-submit
+    // thread and the serve's HTTP thread).
+    const int nt = omp_heads_threads();
+#pragma omp parallel num_threads(nt) if (nt > 1 && NH > 1 && (long)T * HD >= 8192)
+    {
+        std::vector<float> score(T);
+#pragma omp for schedule(static)
+        for (int h = 0; h < NH; h++) {
+            const int kh = h / gqa;
+            const float* qh = &q[(size_t)h * HD];
+            float mx = -1e30f;
+            for (int t = 0; t < T; t++) {
+                if (t < t0) { score[t] = -1e30f; continue; }
+                const float* kt = &kcache_[kv_layer][((size_t)t * NKV + kh) * HD];
+                score[t] = q4nx_attn::dot(qh, kt, HD) * scale;
+                if (score[t] > mx) mx = score[t];
+            }
+            float sum = 0.0f;
+            for (int t = 0; t < T; t++) {
+                if (t < t0) { score[t] = 0.0f; continue; }
+                score[t] = std::exp(score[t] - mx);
+                sum += score[t];
+            }
+            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
+            float* out = &ctx[(size_t)h * HD];
+            for (int t = t0; t < T; t++) {
+                const float p = score[t] * inv;
+                const float* vt = &vcache_[kv_layer][((size_t)t * NKV + kh) * HD];
+                q4nx_attn::saxpy(p, vt, out, HD);
+            }
         }
     }
     return true;

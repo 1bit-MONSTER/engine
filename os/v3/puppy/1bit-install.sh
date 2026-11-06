@@ -27,6 +27,13 @@
 # so the installed grub.cfg searches this disk's data UUID and passes both pupsfs=UUID=<uuid> (Puppy's init,
 # which blkid-matches it) and 1bit.data=UUID=<uuid> (/etc/init.d/05onboard-data).
 #
+# The installed machine is a full persistent OS and not the live RAM image (engine#712), which is two changes to
+# what the stick does, both written here and not left to a first boot:
+#   * a save LAYER is created on the new disk (/1bit/<prefix>save), Puppy's own write-through root. The stick
+#     deliberately has none - a live stick writes to RAM - so the target would otherwise boot as the stick does;
+#   * the copied grub.cfg stops asking for pfix=copy, so the installed system mounts its SFS from its own disk
+#     instead of copying ~1.4 GB of them into RAM on every boot.
+#
 # Nothing is written before every refusal is checked, and the disk this boot came from is refused by
 # device, not by guesswork. The firmware entry (U6, #709) is written with efibootmgr and put first.
 #
@@ -90,6 +97,12 @@ for t in sfdisk mkfs.vfat mkfs.ext4 efibootmgr blkid; do
 done
 [ -d /sys/firmware/efi ] || die "not booted under UEFI: this installer writes an ESP and a firmware entry, and neither can be written or tested without EFI"
 [ -d /sys/firmware/efi/efivars ] || die "efivarfs is not mounted, so efibootmgr cannot write the firmware entry (the appliance mounts it in /etc/init.d/03onboard-efivars)"
+# The save layer's name is not ours to choose: the init finds it by prefix (find_save_file looks for
+# ${PSUBDIR}/${DISTRO_FILE_PREFIX}save*), so it comes from the image's own DISTRO_SPECS. A guessed name would
+# install cleanly and then boot with no persistence at all, which is the one failure this step exists to prevent.
+prefix=$(sed -n "s/^DISTRO_FILE_PREFIX='\([^']*\)'/\1/p" /etc/DISTRO_SPECS 2> /dev/null | head -1)
+[ -n "$prefix" ] || die "no DISTRO_FILE_PREFIX in /etc/DISTRO_SPECS: the save layer's name (what the init looks for) cannot be derived"
+save_name=${prefix}save
 
 # The ESP of the disk THIS SYSTEM BOOTED FROM - not the first 1BIT-OS the kernel enumerates. A machine that already
 # carries an installed disk has a second partition with this same label, and `findfs` then answers with whichever one
@@ -164,6 +177,23 @@ mount -t ext4 "$data" "$DATA_MOUNT" >> "$LOG" 2>&1 || fail "cannot mount the new
 # the whole data partition, not only /data: the frugal install is /1bit on this same filesystem (psubdir),
 # so copying /data carries the kernel, the initrd, the four SFS, the models and the keys in one go
 cp -a "$src_data/." "$DATA_MOUNT/" >> "$LOG" 2>&1 || fail "copying $src_data onto the new data partition failed"
+
+# ── the save layer (engine#712): this is what makes the installed machine an OS and not a RAM session ─────
+# On the stick /1bit carries the kernel, the initrd and the four SFS and nothing else, on purpose. Installed, that
+# is the wrong machine, so the layer Puppy writes through is created here, before the first boot. It is a save
+# FOLDER: the init finds it by that name under psubdir and setup_psave turns <folder>/upper into the overlay's
+# upperdir, i.e. every write lands on this partition as it is made (PUPMODE=12) instead of living in RAM. Puppy's
+# own creator does the same two things (shutdownconfig's save_directory: mkdir + .DirIcon), and a layer with no
+# /initrd/DISTRO_SPECS in it is a normal first boot - rc.update's rc_update_force_pm5 pass rebuilds /etc from the
+# SFS. Idempotent, so installing FROM an installed machine copies its layer rather than truncating it.
+if [ ! -d "$DATA_MOUNT/1bit/$save_name" ]; then
+    mkdir -p "$DATA_MOUNT/1bit/$save_name" >> "$LOG" 2>&1 || fail "cannot create the save layer /1bit/$save_name on $dev"
+    cp -f /usr/share/pixmaps/puppy/puppy_save.svg "$DATA_MOUNT/1bit/$save_name/.DirIcon" >> "$LOG" 2>&1 || true
+fi
+# A SAVESPEC copied from an installed source names THAT machine's partition. This disk's layer is found by name
+# under the pinned psubdir, so the stale file can only point the init at the wrong disk.
+rm -f "$DATA_MOUNT/1bit/SAVESPEC"
+say "   save layer /1bit/$save_name created on the new disk (its writable root)"
 : > "$DATA_MOUNT/.installed"
 cp -f "$LOG" "$DATA_MOUNT/install.log" 2> /dev/null || true
 
@@ -173,11 +203,23 @@ gcfg=$ESP_MOUNT/EFI/BOOT/grub.cfg
 sed -i \
     -e "s|search --no-floppy --label 1BIT-DATA --set=root|search --no-floppy --fs-uuid $datauuid --set=root|" \
     -e "s|pupsfs=1BIT-DATA|pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid|g" \
+    -e "s|pfix=copy|pfix=nocopy|g" \
     "$gcfg" >> "$LOG" 2>&1 || fail "could not point grub.cfg at this disk"
 grep -q "search --no-floppy --fs-uuid $datauuid --set=root" "$gcfg" || fail "grub.cfg does not search this disk's UUID"
 n=$(grep -c "pupsfs=UUID=$datauuid 1bit.data=UUID=$datauuid" "$gcfg")
 [ "$n" -ge 1 ] || fail "no grub entry pins this disk's data partition (pupsfs=UUID=...)"
 say "   $n entr(y/ies) pinned to UUID=$datauuid, root searched by uuid"
+# engine#712: pfix=copy is the stick's trick - it copies the SFS into RAM so a slow USB medium is read once - and
+# on an installed disk it is the live RAM image with a disk underneath it. nocopy makes the init mount them from
+# this disk; the init's own switch is the exact token `nocopy` (init's pfix parser is a case, so it is not a
+# variant of `copy`).
+# shortcut: the installed disk boots as a hard disk (pmedia=usbhd, so PUPMODE=12 and every write goes straight to the
+# layer); an install onto a plain flash stick gets the same direct writes instead of Puppy's flash-friendly
+# PUPMODE=13. Upgrade (pmedia=usbflash + the removable flag) if installing to bare flash sticks becomes a target.
+grep -Eq '^[[:space:]]*linux .*pfix=copy([ ,]|$)' "$gcfg" && fail "grub.cfg still has pfix=copy: the installed machine would boot the live RAM image"
+n=$(grep -Ec '^[[:space:]]*linux .*pfix=nocopy([ ,]|$)' "$gcfg")
+[ "$n" -ge 1 ] || fail "no boot line in grub.cfg carries pfix=nocopy, so the SFS would be copied into RAM"
+say "   $n boot line(s) mount the SFS from this disk (pfix=nocopy), no RAM copy"
 
 say "== 6/7 read back"
 sync
@@ -190,7 +232,9 @@ b=$(sha256sum "$DATA_MOUNT/1bit/vmlinuz" 2> /dev/null | cut -d' ' -f1)
 for f in initrd.gz puppy_*.sfs; do
     ls "$DATA_MOUNT"/1bit/$f > /dev/null 2>&1 || fail "the new data partition has no 1bit/$f"
 done
-say "   kernel $b, initrd and the SFS present, .installed written"
+[ -d "$DATA_MOUNT/1bit/$save_name" ] || fail "the new disk has no save layer /1bit/$save_name: the installed machine would boot the live RAM image"
+[ -e "$DATA_MOUNT/1bit/SAVESPEC" ] && fail "a SAVESPEC survived onto the new disk and would point the init at another partition"
+say "   kernel $b, initrd and the SFS present, save layer /1bit/$save_name, .installed written"
 umount "$ESP_MOUNT" || fail "cannot flush the new ESP"
 umount "$DATA_MOUNT" || fail "cannot flush the new data partition"
 
@@ -231,6 +275,7 @@ say "   Boot$new = 1bit OS on $dev, first in BootOrder, BootNext"
 
 say ""
 say "INSTALLED: 1bit OS on $dev (ESP $ESP_LABEL, data $DATA_LABEL, UUID=$datauuid)"
+say "  persistent: /1bit/$save_name is this machine's writable root (PUPMODE=12), SFS mounted from the disk"
 say "  reboot and remove the stick: the firmware boots Boot$new first."
 say "  then: 1bit-release-check   (it says INSTALLED and runs the same rows)"
 exit 0

@@ -1184,6 +1184,19 @@ TextArtifacts scan_text_artifacts(const std::string& pack_dir) {
     return t;
 }
 
+// Why a layout name cannot be declared by `--weight-layout`, or "" when it can.
+std::string weight_layout_refusal(const std::string& want) {
+    if (want.empty() || want == "rm" || want == "b8") return "";
+    if (want == "t2s")
+        return "t2s also needs q4nx_weight_layout_version (5 or 6) and a directory of per-layer "
+               "t2s images; import cannot invent either";
+    if (want == "pb16i")
+        return "pb16i also needs version 4 and a directory of per-layer pb16i images; import cannot "
+               "invent either";
+    return "unknown weight layout \"" + want + "\" (the containers the forward reads declare "
+           "\"b8\" or nothing at all, which is the row-major default)";
+}
+
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
     const Plan p = plan(pack_dir);
     Report r;
@@ -1667,6 +1680,11 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             // so a container read months later states whether it ever had text
                             {"text_artifacts", ta.present.empty() ? "none in the pack"
                                                                   : "copied from the pack"}};
+        // The device weight layout, when the caller declared one (`--weight-layout b8`): the container
+        // then needs the `_b8` / `_b8_m16` kernel family and packB writes the blocked image host-side.
+        // The key stays absent for the default layout, exactly as every earlier container has it.
+        if (!opt.weight_layout.empty() && opt.weight_layout != "rm")
+            c["q4nx_weight_layout"] = opt.weight_layout;
         std::ofstream out(out_dir + "/config.json");
         out << c.dump(2) << "\n";
     }
@@ -1683,12 +1701,16 @@ int run(int argc, char** argv) {
     const std::string usage =
         "usage: 1bit npu-pack info   <pack dir>\n"
         "       1bit npu-pack import <pack dir> -o <out dir> [--allow-incomplete]\n"
+        "                           [--weight-layout b8]\n"
         "  <pack dir>  a Ryzen AI OGA NPU model pack (*_rai_*_npu_*: model.onnx,\n"
         "              model.onnx.data, dd_metastate_*.fconst, config.json, tokenizer)\n"
         "  info        print what the pack states as JSON; writes nothing\n"
         "  import      write <out dir>/model.q4nx + config.json (+ the pack's text files, if any)\n"
         "  --allow-incomplete  write what is representable and list the rest in the\n"
-        "              container's manifest instead of refusing\n";
+        "              container's manifest instead of refusing\n"
+        "  --weight-layout b8  declare the device weight layout the runtime will use, so the\n"
+        "              container needs the _b8 / _b8_m16 kernel family (leaving the key out is\n"
+        "              the row-major default, which is what every earlier container has)\n";
     if (argc < 1) {
         std::fprintf(stderr, "%s", usage.c_str());
         return 2;
@@ -1698,7 +1720,7 @@ int run(int argc, char** argv) {
         std::printf("%s", usage.c_str());
         return 0;
     }
-    std::string dir, out;
+    std::string dir, out, layout;
     bool allow = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1706,6 +1728,12 @@ int run(int argc, char** argv) {
             if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
             out = argv[++i];
         } else if (a == "--allow-incomplete") allow = true;
+        else if (a == "--weight-layout") {
+            if (i + 1 >= argc) throw std::runtime_error("--weight-layout needs a value");
+            layout = argv[++i];
+            const std::string why = weight_layout_refusal(layout);
+            if (!why.empty()) throw std::runtime_error("--weight-layout " + layout + ": " + why);
+        }
         else if (a == "--help" || a == "-h") {
             std::printf("%s", usage.c_str());
             return 0;
@@ -1724,7 +1752,7 @@ int run(int argc, char** argv) {
     if (cmd != "import") throw std::runtime_error("unknown subcommand " + cmd);
     if (out.empty()) throw std::runtime_error("import needs -o <out dir>");
 
-    const Report r = import_pack(dir, out, Options{allow});
+    const Report r = import_pack(dir, out, Options{allow, layout});
     if (!r.refused.empty() && !allow) {
         std::fprintf(stderr,
                      "1bit npu-pack: refusing to import %s: %zu of the pack's tensors cannot be "
@@ -1746,6 +1774,10 @@ int run(int argc, char** argv) {
     }
     std::printf("  container:  read back through q4nx::dequant_tile  rel_err %.3e  max |diff| %.3e\n",
                 r.q4nx_rel, r.q4nx_max_abs);
+    if (!layout.empty() && layout != "rm")
+        std::printf("  layout:     declares q4nx_weight_layout \"%s\" -- this container needs the "
+                    "_%s kernel family, and packB writes that image host-side\n",
+                    layout.c_str(), layout.c_str());
     std::printf("  parameters: bf16 scale/zero exact for %.2f%% of 32-column groups (format limit)\n",
                 r.zero_exact_pct);
     if (r.attn_tiles_total)

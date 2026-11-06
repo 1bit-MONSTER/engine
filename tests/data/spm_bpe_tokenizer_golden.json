@@ -1,0 +1,78 @@
+{
+ "source": "Hugging Face `tokenizers` on tests/data/spm_bpe_tokenizer.json itself -- a SentencePiece-shaped vocabulary WITH a merge list, the shape Phi-3.5-mini's pack has and engine#1189 was about.",
+ "cases": [
+  {
+   "text": "ab",
+   "ids": [
+    266
+   ]
+  },
+  {
+   "text": "abc",
+   "ids": [
+    268
+   ]
+  },
+  {
+   "text": "a b",
+   "ids": [
+    264,
+    265
+   ]
+  },
+  {
+   "text": "ab c",
+   "ids": [
+    266,
+    267
+   ]
+  },
+  {
+   "text": "abc cc",
+   "ids": [
+    268,
+    267,
+    262
+   ]
+  },
+  {
+   "text": "a\tb",
+   "ids": [
+    264,
+    12,
+    261
+   ]
+  },
+  {
+   "text": "xyz",
+   "ids": [
+    259,
+    123,
+    124,
+    125
+   ]
+  },
+  {
+   "text": " ab",
+   "ids": [
+    259,
+    266
+   ]
+  },
+  {
+   "text": "Ab",
+   "ids": [
+    259,
+    68,
+    261
+   ]
+  },
+  {
+   "text": "abcabc",
+   "ids": [
+    268,
+    270
+   ]
+  }
+ ]
+}

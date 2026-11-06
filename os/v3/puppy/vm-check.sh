@@ -406,6 +406,29 @@ rows = [
                      "rootsh=$(awk -F: '{if ($1 == \"root\") print $7}' /etc/passwd); echo root=$rootsh; "
                      "[ \"$rootsh\" = /bin/bash ] && echo login-shell-bash", "login-shell-bash"),
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
+    # Cycle 28 (@pi-tui, the class #1168 shipped for eight hours): every shell script the image ships must parse under
+    # BOTH parsers it meets in the field. `1bit-console-menu` is `#!/bin/sh`, so the appliance runs it with busybox ash,
+    # which reads an apostrophe inside a double-quoted ${...} as literal text. bash reads the same bytes as an opening
+    # quote and refuses the file - `${d:-this machine's disk}` gave `line 680: syntax error near unexpected token '('`,
+    # 620 lines below the cause - and nothing in the image runs those scripts through bash, so no other row could see it.
+    # The two parsers are the real ones: /etc/init.d runs under busybox sh at boot, while a person on the console gets
+    # bash, the gate rows run in bash, and dash is what a Debian-family host reads them with (== sh's behaviour here).
+    # Non-shell files (the two python helpers) are skipped by their own shebang rather than by a list that would rot.
+    # Red/green in one boot, ~/wt/tui-vm/rowproof-shellparse.sh: GREEN on the image (45 scripts), RED with the smallest
+    # instance of the class staged in /usr/local/bin (names the file and both parsers), RED again with the REAL pre-fix
+    # 1bit-console-menu from #1168 at 90c89f9 (`unparsable: /usr/local/bin/1bit-console-menu:bash`, ash alone is happy),
+    # and GREEN after restoring it.
+    # (`shells-skip-no-scripts` is assembled from `m`/`sk` for the U4 selftest row's reason: written whole it matches
+    # `skipping()` through the ECHO of this command, and this row was measured coming back SKIP with n=0 that way.)
+    ("U1 shipped shells", "m=shells; sk=skip; n=0; bad=''; for f in /usr/local/bin/1bit-* /etc/init.d/*; do "
+                     "[ -f \"$f\" ] || continue; "
+                     "case \"$(sed -n 1p \"$f\")\" in '#!'*sh) ;; *) continue ;; esac; "
+                     "n=$((n+1)); "
+                     "bash -n \"$f\" 2>/dev/null || bad=\"$bad $f:bash\"; "
+                     "sh -n \"$f\" 2>/dev/null || bad=\"$bad $f:sh\"; done; "
+                     "if [ \"$n\" -eq 0 ]; then echo $m-$sk-no-scripts; "
+                     "elif [ -n \"$bad\" ]; then echo \"unparsable:$bad\"; "
+                     "else echo \"shells-parse: $n scripts under bash and sh\"; fi", "shells-parse:"),
     # U2 headless (owner, cycle 12 item 7): the default entry boots with no X, and tty1 is a login prompt.
     # Puppy's own chain does the second half - /etc/inittab has tty1::respawn:plogin and plogin execs
     # `getty -n -l /bin/autologin ... tty1` - so the row asserts the getty, which is what a person sees.
@@ -460,8 +483,11 @@ rows = [
     # console is the dialog menu (no `1bit-console-tui`) it SKIPs: `dialog` repaints on input by nature, so the question does
     # not apply there. Red/green proved in ~/wt/tui-vm/rowproof-console-heals.sh (one boot, both binaries): RED on
     # 2fc6909c… ("console-garbled actions=9 stray=2"), GREEN on the merged artifact.
-    ("U2 console heals", "if ! pgrep -f 1bit-console-tui > /dev/null 2>&1; then echo console-heals-skip-no-tui; "
-                     "elif [ ! -w /dev/tty1 ]; then echo console-heals-skip-no-tty1; "
+    # (both skip markers are assembled from `m`/`sk` for the reason the U4 selftest row above spells out: written whole,
+    # they match `skipping()` through the ECHO of this very command, and the row becomes a SKIP on every run.)
+    ("U2 console heals", "m=console-heals; sk=skip; "
+                     "if ! pgrep -f 1bit-console-tui > /dev/null 2>&1; then echo $m-$sk-no-tui; "
+                     "elif [ ! -w /dev/tty1 ]; then echo $m-$sk-no-tty1; "
                      "else printf '%s\\n' \"[  999.000000] amdxdna 0000:c6:00.1: [drm] *ERROR* stray line one\" "
                      "\"[  999.100000] amdxdna 0000:c6:00.1: [drm] *ERROR* stray line two\" > /dev/tty1 2>/dev/null; "
                      "sleep 2; scr=$(1bit-tty1 1 2>/dev/null); "
@@ -721,6 +747,25 @@ rows = [
                      "| tr '\\n' ' '; echo; "
                      "grep '^RESULT' /tmp/release-check.log; "
                      "grep -c '^PASS ' /tmp/release-check.log", "RESULT: PASS", 900),
+    # Cycle 29 (#1166): the appliance now SHIPS `1bit-selftest`, the one-command proof the install sheet asks for - and
+    # no row ran it, so a shipped-but-dead tool would have reached the board as a line in a document. This row does not
+    # require PASS: the image boots with an EMPTY /data/models, so the tool's own documented answer here is
+    # `RESULT: FAIL - no model to test`, and demanding PASS would red for correct behaviour. What it requires is that the
+    # tool RUNS TO A VERDICT: PASS when a model is staged, SKIP naming the no-model reason when none is, and red when the
+    # binary is absent or dies without a RESULT line - which is the failure this row exists for. Red/green proved on two
+    # real artifacts, not on a fixture: c28's image (no such file) reds with `selftest-broken-missing`, c29's skips with
+    # `selftest-skip-no-model` on its blank models dir.
+    # The skip marker is assembled from two variables, never written whole, and that is not style: Puppy's shell echoes
+    # the typed command into the row's own output, and `skipping()` matches a `*-skip-*` token ANYWHERE in the body - so a
+    # literal marker in the command makes every run of the row a SKIP whatever it answered. Measured on this row's first
+    # version, which printed `selftest-broken-missing` and still came back SKIP: the echo of its own command was the
+    # marker. `$m-$sk-no-model` echoes without a contiguous `-skip-` and prints as `selftest-skip-no-model`.
+    ("U4 selftest", "m=selftest; sk=skip; if [ ! -x /usr/local/bin/1bit-selftest ]; then echo $m-broken-missing; else "
+                    "/usr/local/bin/1bit-selftest > /tmp/st.log 2>&1; grep -E '^RESULT' /tmp/st.log | tail -2; "
+                    "v=$(sed -n 's/^RESULT: PASS.*/PASS/p;s/^RESULT: FAIL.*/FAIL/p' /tmp/st.log | head -1); "
+                    "if [ \"$v\" = PASS ]; then echo $m-ok; "
+                    "elif grep -q 'no model to test' /tmp/st.log; then echo $m-$sk-no-model; "
+                    "else echo $m-broken-no-verdict; fi; fi", "selftest-ok", 300),
     # Item 10 (owner 2026-11-04): the appliance announces itself as 1bit-os.local, so http://1bit-os.local:13305 is a
     # link a phone can click. Two halves are asserted HERE: a responder is up, and the name resolves on the box.
     # Whether a PEER on the LAN sees it needs multicast from outside the guest, which a QEMU user-mode network does

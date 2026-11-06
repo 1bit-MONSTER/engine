@@ -1934,6 +1934,51 @@
     }
    }
   },
+  "bong-water-water-bong/ZR1-1.5B-Strix": {
+   "commit": "64f092fe4fddba1030d4ef1531d3e33dd09d584a",
+   "files": {
+    "chat_template.jinja": {
+     "lfs": false,
+     "oid": "02a1c3bce33f46690b9c40a93512034a92855392",
+     "size": 2237,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "checkpoint-100/chat_template.jinja": {
+     "lfs": false,
+     "oid": "02a1c3bce33f46690b9c40a93512034a92855392",
+     "size": 2237,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "checkpoint-100/tokenizer_config.json": {
+     "lfs": false,
+     "oid": "53aca4fc5079a4a4f8dbbed6f91c8a6183b9c9c7",
+     "size": 459,
+     "template_sha256": null
+    },
+    "checkpoint-200/chat_template.jinja": {
+     "lfs": false,
+     "oid": "02a1c3bce33f46690b9c40a93512034a92855392",
+     "size": 2237,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "checkpoint-200/tokenizer_config.json": {
+     "lfs": false,
+     "oid": "53aca4fc5079a4a4f8dbbed6f91c8a6183b9c9c7",
+     "size": 459,
+     "template_sha256": null
+    },
+    "tokenizer_config.json": {
+     "lfs": false,
+     "oid": "53aca4fc5079a4a4f8dbbed6f91c8a6183b9c9c7",
+     "size": 459,
+     "template_sha256": null
+    }
+   },
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: ZR1-1.5B-Strix (LoRA/checkpoint repo we host, chat_template.jinja)"
+   ]
+  },
   "bong-water-water-bong/bitnet-ternary-moe-gguf": {
    "commit": "951711ae3ce145e10ff9589e1dd510e8294205c2",
    "pinned": "2026-11-05",
@@ -2363,38 +2408,38 @@
   },
   "unsloth/Qwen3.8-Flash-Next-GGUF": {
    "commit": "d96201194f103c906994f283f504209dc8d2a10c",
-   "pinned": "2026-11-05",
+   "pinned": "2026-11-06",
    "used_for": [
     "upstream: our copy predates the pinned revision"
    ],
    "files": {
     "MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf": {
-     "oid": "cd87e5d1a4dadaeed63e35929f3b2f28d13e081b4cd32e00f2835095ec09351e",
+     "oid": "58a47d6a216307e9b97172d5bfdc3436a8994b632f5e436b9bb6edf8951da8d1",
      "size": 4137429120,
      "lfs": true,
      "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
     },
     "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf": {
-     "oid": "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082",
-     "size": 10946624,
+     "oid": "acc44040f74d0e55fb89c3967056cce5dbda1bcc52e909c3ba6fc72b5e9c0858",
+     "size": 10946618,
      "lfs": true,
      "template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
     },
     "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf": {
-     "oid": "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9",
-     "size": 49859583136,
+     "oid": "45792ae869072d8229384c51c7c73dd959e191505252b41dd71852d9746f5ce4",
+     "size": 49720539552,
      "lfs": true,
      "template_sha256": null
     },
     "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf": {
-     "oid": "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3",
-     "size": 49376141504,
+     "oid": "8c76e79d444b16a663d9c8db54e585ed3b1da13eebd2619c37b0c355da803c82",
+     "size": 32803030176,
      "lfs": true,
      "template_sha256": null
     },
     "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf": {
-     "oid": "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a",
-     "size": 12087983520,
+     "oid": "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36",
+     "size": 28800138432,
      "lfs": true,
      "template_sha256": null
     }

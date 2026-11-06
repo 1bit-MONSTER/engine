@@ -56,10 +56,15 @@ private:
     std::unordered_map<std::string, int> merge_ranks_;       // "a\x1fb" -> rank
     // SentencePiece/unigram vocabularies (the converter emits model.type "BPE"
     // with no merges and a ByteLevel pre-tokenizer for these, but the tokens are
-    // SPM pieces like "\xe2\x96\x81Paris").  Detected from an empty merge list plus
-    // "\xe2\x96\x81"-prefixed pieces, then encoded with sentencepiece rules instead of
-    // byte-level BPE (which would emit one id per byte).
+    // SPM pieces like "\xe2\x96\x81Paris").  Detected from "\xe2\x96\x81"-prefixed pieces plus
+    // EITHER an empty merge list OR a SentencePiece normalizer (a pack that keeps its merges and
+    // still needs sentencepiece rules -- Phi-3.5, engine#1189), then encoded with sentencepiece
+    // rules instead of byte-level BPE (which would emit one id per byte).
     bool spm_ = false;
+    // SentencePiece AND a merge list (Phi-3.5, engine#1189): pieces are merged by rank over the
+    // normalised text instead of greedy longest-match, which is only right for a merge-less
+    // vocabulary.
+    bool spm_merges_ = false;
     size_t spm_max_piece_ = 0;
     std::unordered_map<uint8_t, int> byte_fallback_;         // byte -> <0xNN> id
     uint32_t byte_to_char_[256];
@@ -67,8 +72,9 @@ private:
     struct Regex;
     std::unique_ptr<Regex> split_;
 
-    std::vector<int> bpe(const std::string& chars) const;
+    std::vector<int> bpe(const std::string& chars, bool byte_fallback = false) const;
     std::vector<int> spm(const std::string& text) const;
+    std::vector<int> spm_merged(const std::string& text) const;
 };
 
 }  // namespace onebit::npu

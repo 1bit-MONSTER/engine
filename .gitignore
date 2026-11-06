@@ -30,3 +30,7 @@ Testing/
 # the HRX toolchain the build fetches (scripts/fetch-rocm-sdk.sh, config/hrx-toolchain.config):
 # a multi-gigabyte venv of TheRock's ROCm SDK at the pinned version, not part of the source
 third_party/toolchain/
+
+# the model-pin sweep writes these where it runs (tools/pin_watch.py --check --json)
+pin-report.md
+pin-report.json

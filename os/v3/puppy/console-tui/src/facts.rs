@@ -83,7 +83,8 @@ impl Mode {
 
 /// `mode_in` against the real root. Read-only, and cheap enough for the once-a-second frame.
 pub fn mode() -> Mode {
-    resolve(mode_in(Path::new("/")), data_mounted())
+    let mounted = data_mounted();
+    resolve(mode_in(Path::new("/"), mounted), mounted)
 }
 
 /// Is `/data` the mounted data partition? init.sh's rule is `grep -q " /data " /proc/mounts`, and that half matters on
@@ -108,12 +109,20 @@ fn resolve(seen: Mode, data_mounted: bool) -> Mode {
     }
 }
 
-pub fn mode_in(root: &Path) -> Mode {
+/// The installed-state decision, from a root and whether `/data` is a mounted partition.
+///
+/// `data_mounted` is a parameter for init's sake: its whole rule is `grep -q " /data " /proc/mounts && [ -e
+/// /data/.installed ]`, and the first half is not decoration. Without it, a `/data/.installed` file left visible while
+/// `/data` is NOT mounted read as INSTALLED here while the console menu - which asks the mount first - offered an
+/// install: measured with `~/wt/os3i/tui-menu-mode-probe.sh`, one row outside the marker matrix that both halves
+/// otherwise agree on. A boot cannot reach that state (`/data/.installed` only exists on the mounted partition, and
+/// `/data` on the RAM root is mkdir'd empty), but the rule is init's and is now implemented once, in init's shape.
+pub fn mode_in(root: &Path, data_mounted: bool) -> Mode {
     let bit = |p: &str| root.join(p).exists();
     // init's OWN rule first, because that is the decision: /data mounted with .installed on it is an installed boot,
     // and the markers below are written FROM that decision. Marker-first ordering let a stale `live` marker outrank a
     // real installed data partition - the console then said live on an installed box (measured in QEMU).
-    if bit("data/.installed") {
+    if data_mounted && bit("data/.installed") {
         return Mode::Installed;
     }
     if bit("etc/1bit/installed") {
@@ -753,24 +762,75 @@ pub fn json_raw(obj: &str, key: &str) -> Option<String> {
         return Some(rest[..end].trim().to_string());
     };
     let mut out = String::new();
-    let mut esc = false;
-    for c in s.chars() {
-        if esc {
-            out.push(match c {
-                'n' => '\n',
-                't' => '\t',
-                other => other,
-            });
-            esc = false;
-        } else if c == '\\' {
-            esc = true;
-        } else if c == '"' {
-            return Some(out);
-        } else {
-            out.push(c);
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match it.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
+                Some('u') => out.push_str(&json_unicode(&mut it)),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            },
+            other => out.push(other),
         }
     }
     None
+}
+
+/// The `\uXXXX` escape (and a surrogate pair, which is two of them). A serialiser that escapes non-ASCII delivers
+/// `caf\u00e9` - Python's `json.dumps` does that by default - and a model name or a recipe from the catalogue is DRAWN,
+/// so before this the screen said `cafu00e9`. A code point that is not a character (a lone surrogate) becomes U+FFFD, and
+/// a truncated escape keeps the bytes it actually had and consumes only the hex digits it took.
+fn json_unicode(it: &mut std::str::Chars) -> String {
+    let mut probe = it.clone();
+    let mut digits = String::new();
+    for _ in 0..4 {
+        match probe.next() {
+            Some(d) if d.is_ascii_hexdigit() => digits.push(d),
+            // not a hex digit: it is the next character of the string, not part of this escape
+            _ => break,
+        }
+    }
+    if digits.len() != 4 {
+        for _ in 0..digits.chars().count() {
+            it.next();
+        }
+        return format!("u{digits}");
+    }
+    *it = probe;
+    let Ok(v) = u32::from_str_radix(&digits, 16) else {
+        return format!("u{digits}");
+    };
+    let cp = if (0xD800..0xDC00).contains(&v) {
+        // a high surrogate is one half of a pair: take the low one with it, or say so
+        let mut peek = it.clone();
+        let mut lo = String::new();
+        if peek.next() == Some('\\') && peek.next() == Some('u') {
+            for _ in 0..4 {
+                match peek.next() {
+                    Some(d) if d.is_ascii_hexdigit() => lo.push(d),
+                    _ => break,
+                }
+            }
+        }
+        match u32::from_str_radix(&lo, 16) {
+            Ok(w) if lo.len() == 4 && (0xDC00..0xE000).contains(&w) => {
+                *it = peek;
+                0x10000 + ((v - 0xD800) << 10) + (w - 0xDC00)
+            }
+            _ => 0xFFFD,
+        }
+    } else if (0xDC00..0xE000).contains(&v) {
+        0xFFFD
+    } else {
+        v
+    };
+    char::from_u32(cp).unwrap_or('\u{FFFD}').to_string()
 }
 
 pub fn json_str(obj: &str, key: &str) -> Option<String> {
@@ -1319,32 +1379,40 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("etc/1bit")).unwrap();
         assert_eq!(
-            mode_in(&root),
+            mode_in(&root, true),
             Mode::Unknown,
             "an empty box has no mode to report"
         );
         fs::write(root.join("etc/1bit/live"), "").unwrap();
-        assert_eq!(mode_in(&root), Mode::Live);
+        assert_eq!(mode_in(&root, true), Mode::Live);
         // ... and a real installed data partition outranks a stale `live` marker: init's own rule is the decision,
         // the markers are written from it (this ordering was wrong in the first version - measured in QEMU)
         fs::create_dir_all(root.join("data")).unwrap();
         fs::write(root.join("data/.installed"), "").unwrap();
         assert_eq!(
-            mode_in(&root),
+            mode_in(&root, true),
             Mode::Installed,
             "a stale live marker outranked /data/.installed"
+        );
+        // the mount half of init's rule, which this function used to drop: the same file with /data NOT mounted is
+        // not an installed boot (init would not have written the marker), and the menu agrees - measured in
+        // ~/wt/os3i/tui-menu-mode-probe.sh, where the header said INSTALLED and the menu offered an install.
+        assert_eq!(
+            mode_in(&root, false),
+            Mode::Live,
+            "/data/.installed without /data mounted read as INSTALLED"
         );
         fs::remove_file(root.join("data/.installed")).unwrap();
         // an installed boot that somehow kept the live marker still reads installed: the marker init writes wins,
         // and it writes `installed` after the MODE banner
         fs::write(root.join("etc/1bit/installed"), "").unwrap();
-        assert_eq!(mode_in(&root), Mode::Installed);
+        assert_eq!(mode_in(&root, true), Mode::Installed);
         // no markers at all (an init that could not write them) -> init's own fallback, /data/.installed
         let root2 = std::env::temp_dir().join(format!("mode-in2-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root2);
         fs::create_dir_all(root2.join("data")).unwrap();
         fs::write(root2.join("data/.installed"), "").unwrap();
-        assert_eq!(mode_in(&root2), Mode::Installed);
+        assert_eq!(mode_in(&root2, true), Mode::Installed);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&root2);
     }
@@ -1496,8 +1564,8 @@ mod tests {
         }
         assert_eq!(screen_text(""), "");
         // and the catalogue is sanitised where it enters, because a model name is drawn: whatever bytes the JSON hands
-        // over, what is DRAWN is cleaned. (A literal ESC is used rather
-        // than a `\u001b` escape because this crate's JSON reader does not implement `\uXXXX` - see the note in json_raw.)
+        // over, what is DRAWN is cleaned - first the escape is decoded (`\uXXXX`, see json_unicode), then the control
+        // bytes it decodes to are stripped, which is the order a real body arrives in.
         let esc = '\u{1b}';
         let json = format!(
             "{{\"data\":[{{\"id\":\"evil{esc}[2Jmodel\",\"created\":0,\"object\":\"model\",\"recipe\":\"llamacpp\",\"downloaded\":true,\"recipe_options\":{{\"onebit_backend\":\"gpu{esc}[31m\"}}}}]}}"
@@ -1506,6 +1574,67 @@ mod tests {
         // the whole CSI goes, not just its ESC: those bytes are control, not text
         assert_eq!(m.downloaded, vec!["evilmodel"]);
         assert_eq!(m.engines[0].backend.as_deref(), Some("gpu"));
+    }
+
+    #[test]
+    fn a_json_escape_is_decoded_before_it_becomes_a_cell() {
+        // The shape a serialiser actually produces for a non-ASCII name: Python's `json.dumps` escapes by default, so
+        // Lemonade's catalogue hands over `\u00e9` rather than the UTF-8 byte. Before this the row said `cafu00e9`.
+        assert_eq!(
+            json_str(r#"{"id":"caf\u00e9","recipe":"x"}"#, "id").as_deref(),
+            Some("café")
+        );
+        assert_eq!(
+            json_str(r#"{"id":"x","recipe":"\u65e5\u672c\u8a9e"}"#, "recipe").as_deref(),
+            Some("日本語")
+        );
+        // a surrogate pair is ONE character; a lone half of one is not a character at all
+        assert_eq!(
+            json_str(r#"{"id":"\ud83d\ude00"}"#, "id").as_deref(),
+            Some("\u{1F600}")
+        );
+        assert_eq!(
+            json_str(r#"{"id":"a\ud83db"}"#, "id").as_deref(),
+            Some("a\u{FFFD}b")
+        );
+        // escapes that are characters in their own right, which used to come through as the letter
+        assert_eq!(
+            json_str(r#"{"id":"a\rb\bc\fd"}"#, "id").as_deref(),
+            Some("a\rb\u{8}c\u{c}d")
+        );
+        // an escape this reader does not know, and a truncated one, keep what the bytes said
+        assert_eq!(json_str(r#"{"id":"a\qb"}"#, "id").as_deref(), Some("aqb"));
+        assert_eq!(json_str(r#"{"id":"a\u12"}"#, "id").as_deref(), Some("au12"));
+        // and nothing else moved
+        assert_eq!(
+            json_str(r#"{"id":"plain-1bit","recipe":"llamacpp"}"#, "id").as_deref(),
+            Some("plain-1bit")
+        );
+    }
+
+    #[test]
+    fn an_escaped_catalogue_name_reaches_the_engine_row_decoded() {
+        // The unit test above is about the reader; this is about the row a person reads: the escape is decoded, the
+        // sanitiser then has real bytes to clean, and what is drawn is the name the catalogue meant.
+        let json = r#"{"data":[{"id":"qwen3-caf\u00e9","created":0,"object":"model","recipe":"llamacpp","downloaded":true,
+            "recipe_options":{"onebit_backend":"gpu"}}]}"#;
+        let m = models_from(json);
+        assert_eq!(m.downloaded, vec!["qwen3-café"]);
+        assert_eq!(m.engines[0].recipe, "llamacpp");
+        assert_eq!(m.engines[0].backend.as_deref(), Some("gpu"));
+        // (loaded: the catalogue's own names; serving: what /api/v1/health says answered)
+        let loaded = m.downloaded.clone();
+        assert_eq!(
+            engine_of(&loaded, Some("qwen3-café"), &m.engines, &[]),
+            Some("llamacpp (gpu)".into())
+        );
+        // and a body that escapes a CONTROL character is decoded first and then stripped, in that order: the cell never
+        // sees the ESC. (`\u001b` used to arrive here as the four characters `u001b`, so the sanitiser had nothing to do.)
+        let evil = r#"{"data":[{"id":"evil\u001b[2Jmodel","created":0,"object":"model","recipe":"llamacpp","downloaded":true,
+            "recipe_options":{"onebit_backend":"gpu\u001b[31m"}}]}"#;
+        let e = models_from(evil);
+        assert_eq!(e.downloaded, vec!["evilmodel"]);
+        assert_eq!(e.engines[0].backend.as_deref(), Some("gpu"));
     }
 
     #[test]

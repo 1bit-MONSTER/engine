@@ -341,6 +341,7 @@ def main():
             " /   126 generated), mean len =  3.02\n",
             encoding="utf-8")
         got = bench.drafting_observed(log)
+        assert got["status"] == "drafted", got
         assert got["spec_type"] == "draft-mtp", got
         assert got["recipe"] == "qwen35-mtp-max-3", got
         assert got["recipe_args"] == "--spec-draft-n-max 3", got
@@ -348,18 +349,34 @@ def main():
         assert got["accept_rate_last"] == 0.67460 and got["mean_acc_len_last"] == 3.02, got
         assert (got["accepted_last"], got["generated_last"]) == (85, 126), got
         assert got["mean_acc_len_max"] == 3.50, got
-        # A log with no drafting at all reports nothing rather than an empty object that reads as "off".
+        # Three states used to serialise as the same `None`: a log that says nothing about drafting, a log
+        # whose server says drafting is OFF, and a log that could not be read. The middle one is a measured
+        # claim and the last is the absence of one, so reading either off `null` is how a lost serve.log came
+        # to look like a non-drafting arm (measured 2026-11-05 22:53: the `HL_MTP_MAX=0` arm at 18.8k -- the
+        # box's own non-drafting row -- recorded `serve: null`, exactly what an unreadable log produced).
         silent = pathlib.Path(tmp) / "silent.log"
         silent.write_text("I slot print_timing: id 0 | task 1 | eval time\n", encoding="utf-8")
-        assert bench.drafting_observed(silent) is None, bench.drafting_observed(silent)
-        assert bench.drafting_observed(pathlib.Path(tmp) / "missing.log") is None
+        assert bench.drafting_observed(silent)["status"] == "no-evidence", bench.drafting_observed(silent)
+        # Verbatim from that arm's serve.log: the server stating there is no spec implementation at all.
+        off = pathlib.Path(tmp) / "off.log"
+        off.write_text("0.48.901.174 I spec common_specu: no implementations specified for speculative"
+                       " decoding\n0.48.901.156 I srv    load_model: speculative decoding will use"
+                       " checkpoints\n", encoding="utf-8")
+        not_drafted = bench.drafting_observed(off)
+        assert not_drafted["status"] == "not-drafted", not_drafted
+        unreadable = bench.drafting_observed(pathlib.Path(tmp) / "missing.log")
+        assert unreadable["status"] == "unreadable", unreadable
+        # The whole point, and the assertion that would have failed before the fix.
+        assert not_drafted != unreadable, (not_drafted, unreadable)
+        assert len({bench.drafting_observed(log)["status"], not_drafted["status"],
+                    bench.drafting_observed(silent)["status"], unreadable["status"]}) == 4
     # ...and "no lever was set" must not look like "no drafting": unset keeps serve's own MTP default,
     # while HL_MTP_MAX=0 is an explicitly non-drafting measurement. Both used to serialise as {}.
     for k in ("HL_DFLASH", "HL_DFLASH_GGUF", "HL_MTP_HEAD", "HL_MTP_MAX"):
         os.environ.pop(k, None)
     ident = bench.drafting_summary(pathlib.Path("/nonexistent/serve.log"))
     assert ident["requested"] is None and "requested_note" in ident, ident
-    assert ident["serve"] is None, ident
+    assert ident["serve"] == {"status": "unreadable"}, ident
     os.environ["HL_MTP_MAX"] = "0"
     ident = bench.drafting_summary(pathlib.Path("/nonexistent/serve.log"))
     assert ident["requested"] == {"HL_MTP_MAX": "0"}, ident

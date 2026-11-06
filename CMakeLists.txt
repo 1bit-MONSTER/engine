@@ -598,6 +598,11 @@ if(Python3_Interpreter_FOUND)
     # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
     # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.
     add_test(NAME repack_tile_order COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/repack_tile_order_test.py)
+    # The M-split ceiling (engine#754): tools/split_ceiling.py turns two measured rates into the optimum NPU
+    # share, the per-GEMM ceiling and the end-to-end factor, and this pins it to the three iGPU states
+    # docs/hetero-prefill.md records (40.7 TFLOP/s, the engine#782 regression, post-#782) so the arithmetic
+    # cannot drift from the page.  Stdlib only: no model, no device.
+    add_test(NAME split_ceiling COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/split_ceiling_test.py)
     # The same gate end to end (engine#1110 review): a synthetic one-tensor GGUF and a synthetic container whose
     # only tensor is named for another layer, so nothing is comparable -- the pair that used to read as a match --
     # plus the same bytes under the mapped name, which must be compared and refused.  numpy + gguf-py, no model.
@@ -859,6 +864,12 @@ add_dependencies(npu_sampling_test npu_rope_llama3_test)
 add_executable(hadamard_rotate_test tests/hadamard_rotate_test.cpp)
 target_include_directories(hadamard_rotate_test PRIVATE npu/forward/include)
 add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
+# The arithmetic P7 (#806) part A rests on: (QH)(KH)^T = QK^T to f32 rounding, and what the rotation is
+# worth against an f16 KV cache (attention-weight KLD) with and without outlier channels.  Header only, no
+# device, no model: runs in CI.
+add_executable(npu_kv_int8_test tests/npu_kv_int8_test.cpp)
+target_include_directories(npu_kv_int8_test PRIVATE npu/forward/include)
+add_test(NAME npu_kv_int8 COMMAND npu_kv_int8_test)
 # The A-row quantiser every NPU GEMM runs on the host before its launch (npu/forward/include/quant_i8.h): its
 # AVX2 path must be byte-identical to the shipped scalar loop, including the .5 boundaries, the NaN/inf inputs
 # and the values past 2^31 that the (int) cast saturates.  Header only, no device, no model: runs in CI.
@@ -876,7 +887,7 @@ add_test(NAME attn_math COMMAND attn_math_test)
 # ci.yml's build step names its targets explicitly and needs the `workflow` scope to extend, so bind the new
 # binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add hadamard_rotate_test to the list itself.
-add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test)
+add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test npu_kv_int8_test)
 # The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.

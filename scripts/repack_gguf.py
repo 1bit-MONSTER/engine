@@ -24,6 +24,7 @@
 #        python3 repack_gguf.py --tile-check <dir> <model.gguf>   (is this dir's tile order ours?)
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -62,6 +63,17 @@ def tile_order_policy(rc, line):
     if rc == 2:
         return "unverified", False        # nothing comparable: say so, do not claim a layout
     return "", True                      # another layout, or none: these tiles are not these weights
+
+
+def tile_order_id(line):
+    """The layout id a `q4nx_diff` verdict line names, for the stamp: `flm`, `ours`, or `unknown`.
+
+    Only used on the refusing path (a stamp that says `engine-1` is written as that word), so the id
+    exists to tell `tools/npu_plan.py` *which* order was measured -- any id but `engine-1` stops it
+    writing the claim the repack just disproved.
+    """
+    m = re.match(r"matches layout ([A-Za-z0-9_-]+)", line)
+    return m.group(1) if m else "unknown"
 
 
 def tile_check_exit(rc, line):
@@ -484,6 +496,16 @@ def main():
         print("repack: the converter wrote q4_1 tiles in an order this engine does not decode -- refusing "
               "the directory.  Point --converter / ONEBIT_Q4NX_CONVERTER at a checkout that writes the "
               "engine-1 order (engine#1110; measured good: FLM_Q4NX_Converter 81be119e).")
+        # The refusal leaves the tiles on disk, and `tools/npu_plan.py` writes container.tile_order for
+        # whatever directory it is pointed at -- so the measurement has to survive it, or one plan run
+        # hands the loader the "engine-1" claim this check just disproved (measured: npu_plan.py on a
+        # refused dir wrote tile_order="engine-1", and the loader accepts that).  Stamp the verdict.
+        with open(os.path.join(out_dir, "repack-stamp.txt"), "w") as f:
+            f.write(f"converter_path={converter_dir}\n")
+            f.write(f"converter_commit={converter_commit()}\n")
+            f.write(f"tile_order={tile_order_id(_tile_line)}\n")
+            f.write(f"tile_check={_tile_line}\n")
+            f.write("refused=tile order\n")
         return 1
     if tile_order == "unverified":
         print(f"repack: tile order not verified: {_tile_line}; the stamp records that instead of claiming engine-1")

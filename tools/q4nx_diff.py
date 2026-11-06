@@ -28,7 +28,10 @@ three questions that a byte comparison alone cannot:
            the GGUF and share not one min byte -- the planes say which.
   decode   decode a container under a named layout and compare against the GGUF
            ground truth, so "the files differ" becomes "each is exact under its
-           own decoder, and neither reads the other's".
+           own decoder, and neither reads the other's".  The verdict names the
+           worst tensor and its correlation with the source too (engine#1109: a
+           converter checkout of the wrong version measures corr +0.0325 against
+           an honest pack's +0.9994, which is how that defect was measured).
 
 Layouts (both are 32x256 tiles of 5120 B: 512 scale, 512 min, 4096 codes):
 
@@ -85,6 +88,28 @@ def tensor_bytes(hdr, base, mm, name):
 
 def bf16(u16):
     return (u16.astype(np.uint32) << 16).view(np.float32)
+
+
+def correlation(a, b):
+    """Pearson correlation between a decoded weight and its source weight, NaN if either is constant.
+
+    engine#1109's evidence is this number: a converter of the wrong version keeps the same values but
+    permutes them inside the 5120-B chunk, so the container decodes at corr +0.0325 / max|err| 5.5
+    while the honest checkout measures corr +0.9994 / 2.9e-02.  It is REPORTED, not gated: the gate
+    stays the measured max|err| rule below, because a correlation floor was not measured on honest
+    containers and a guessed one would refuse them (the same reason the `flm` decoder is not "fixed"
+    blind above).
+    """
+    a = np.asarray(a, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    a = a - a.mean()
+    b = b - b.mean()
+    den = float(np.sqrt(float((a * a).sum()) * float((b * b).sum())))
+    return float((a * b).sum()) / den if den > 0.0 else float("nan")
+
+
+def _corr_text(c):
+    return "n/a" if not np.isfinite(c) else "%+.4f" % c
 
 
 def tiles_of(raw, rows, cols):
@@ -238,14 +263,16 @@ LAYOUT_MATCH_RATIO = 3.0     # ... and it must beat the other layout by this muc
 
 
 def verdict(results):
-    """(rc, line) for {layout: (exact, inexact, worst_max_err)}.
+    """(rc, line) for {layout: (exact, inexact, worst_max_err, worst_tensor, corr_at_worst)}.
 
     A container is laid out ONE way, and a caller that guesses wrong gets a confident "BAD" for a good
     container. So name the layout that matched, and when none did, name the closest and say so instead
-    of implying the container is broken.
+    of implying the container is broken.  The line names the worst tensor and its correlation with the
+    source as well (engine#1109), so "the wrong converter checkout" reads as
+    `corr +0.0325 on blk.14.attn_output.weight` rather than as a bare error.
     """
     # A layout that compared NO tensor is not evidence of anything: `_decode_pass` returns
-    # (0, 0, 0.0) when every tensor was skipped, and worst=0.0 with rival=0.0 satisfies
+    # (0, 0, 0.0, "", nan) when every tensor was skipped, and worst=0.0 with rival=0.0 satisfies
     # "rival >= worst * RATIO", so such a layout used to be reported as a MATCH on whichever one
     # sorted first -- measured: a 0.6B container against a 4B GGUF came back
     # `matches layout flm (worst max|err| 0.000e+00, ...)` with 0 tensors compared (engine#1110
@@ -256,22 +283,32 @@ def verdict(results):
         return 2, "nothing was compared"
     order = sorted(results, key=lambda k: results[k][2])
     best = order[0]
-    worst = results[best][2]
+    exact, inexact, worst, worst_name, worst_corr = results[best]
     rival = results[order[1]][2] if len(order) > 1 else None
-    exact = results[best][0]
     took = (exact > 0 and worst == 0.0) or (
         worst <= LAYOUT_MATCH_MAX_ERR and (rival is None or rival >= worst * LAYOUT_MATCH_RATIO))
+    # Name the tensor and its correlation with the source in both verdicts: a wrong converter checkout
+    # is exactly "same geometry, permuted values", and corr +0.03 vs +0.999 is what tells a reader
+    # which side of that line a container is on (engine#1109).
+    corr = "corr %s" % _corr_text(worst_corr)
+    on = (" on " + worst_name) if worst_name else ""
     if took:
         other = "" if rival is None else ", next layout %s worst max|err| %.3e" % (order[1], rival)
-        how = "%d tensor(s) exactly" % exact if worst == 0.0 and exact else "worst max|err| %.3e" % worst
+        how = ("%d tensor(s) exactly, %s%s" % (exact, corr, on) if worst == 0.0 and exact
+               else "worst max|err| %.3e, %s%s" % (worst, corr, on))
         return 0, "matches layout %s (%s%s)" % (best, how, other)
-    return 1, ("matches NO layout: closest is %s with worst max|err| %.3e (> %.3e, or not %.0fx better "
-               "than %s) - the container's tiles are not these weights"
-               % (best, worst, LAYOUT_MATCH_MAX_ERR, LAYOUT_MATCH_RATIO, order[1] if rival is not None else "-"))
+    return 1, ("matches NO layout: closest is %s with worst max|err| %.3e, %s%s (> %.3e, or not %.0fx "
+               "better than %s) - the container's tiles are not these weights"
+               % (best, worst, corr, on, LAYOUT_MATCH_MAX_ERR, LAYOUT_MATCH_RATIO,
+                  order[1] if rival is not None else "-"))
 
 
 def _decode_pass(args, layout, quiet=False):
-    """One layout over every comparable tensor. Returns (exact, inexact, worst_max_err)."""
+    """One layout over every comparable tensor.
+
+    Returns (exact, inexact, worst_max_err, worst_tensor, corr_at_worst), the last being the correlation
+    of the worst tensor with the GGUF's own weight (engine#1109's measurement, see `correlation`).
+    """
     import gguf
     from gguf.quants import dequantize
 
@@ -283,9 +320,9 @@ def _decode_pass(args, layout, quiet=False):
         want = [t for t in want if args.tensor in t.name]
     if not want:
         print("no tensors matched", file=sys.stderr)
-        return 0, 0, 0.0
+        return 0, 0, 0.0, "", float("nan")
     exact = inexact = skipped = padded_n = 0
-    worst = (0.0, "")
+    worst = None          # (max|err|, GGUF tensor name, its correlation with the source)
     # our converter's names, so a GGUF tensor can be looked up in the container
     lay = {"attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj",
            "attn_output": "self_attn.o_proj", "attn_q_norm": "self_attn.q_norm",
@@ -344,17 +381,23 @@ def _decode_pass(args, layout, quiet=False):
         ok = bool(finite.all()) and not err.any()
         exact += ok
         inexact += (not ok)
-        if mx > worst[0]:
-            worst = (mx, t.name)
+        c = correlation(got, ref)
+        if not finite.all():
+            c = float("nan")          # a corrupt tile has no correlation to report
+        if worst is None or mx > worst[0]:
+            worst = (mx, t.name, c)
         if not quiet and (args.verbose or not ok or padded):
             print("%s %-46s %-5s max|err| %.3e  rms %.3e%s"
                   % ("ok  " if ok else "BAD ", t.name, t.tensor_type.name, mx,
                      float(np.sqrt((err ** 2).mean())),
                      "  [padded %dx%d read as %dx%d]" % (rows, cols, rows_p, cols_p) if padded else ""))
+    if worst is None:             # no tensor compared; verdict() drops this layout
+        worst = (0.0, "", float("nan"))
     if not quiet:
-        print("layout=%s: exact=%d inexact=%d skipped=%d padded=%d   worst max|err| %.3e (%s)"
-              % (layout, exact, inexact, skipped, padded_n, worst[0], worst[1] or "-"))
-    return exact, inexact, worst[0]
+        print("layout=%s: exact=%d inexact=%d skipped=%d padded=%d   worst max|err| %.3e (%s, corr %s)"
+              % (layout, exact, inexact, skipped, padded_n, worst[0], worst[1] or "-",
+                 _corr_text(worst[2])))
+    return exact, inexact, worst[0], worst[1], worst[2]
 
 
 def decode_cmd(args):
@@ -372,23 +415,37 @@ def self_test():
     bad = []
     cases = [
         # what a correct container looks like: one layout exact (a round trip), the other noise
-        ({"ours": (12, 0, 0.0), "flm": (0, 12, 1.6)}, 0, "ours", "an exact round trip picks its own layout"),
+        ({"ours": (12, 0, 0.0, "blk.0.attn_q.weight", 1.0),
+          "flm": (0, 12, 1.6, "blk.0.attn_q.weight", 0.04)}, 0,
+         ("ours", "tensor(s) exactly", "corr +1.0000", "blk.0.attn_q.weight"),
+         "an exact round trip picks its own layout and names the tensor and correlation"),
         # a correct requantized container: 4.1e-2 is the honest Q4_K_M -> q4_1 error, 1.6 is the other
-        ({"ours": (0, 12, 4.1e-2), "flm": (0, 12, 1.6)}, 0, "ours", "a lossy but correct pack still matches"),
-        ({"ours": (0, 12, 4.1e-2)}, 0, "ours", "a single layout under the tolerance matches"),
-        # a wrong converter: both layouts far above the tolerance, so the container is named as wrong
-        ({"ours": (0, 12, 2.0), "flm": (0, 12, 1.1)}, 1, "NO", "tiles from other weights match nothing"),
+        ({"ours": (0, 12, 4.1e-2, "blk.14.attn_output.weight", 0.9994),
+          "flm": (0, 12, 1.6, "blk.14.attn_output.weight", 0.05)}, 0, ("ours", "corr +0.9994"),
+         "a lossy but correct pack still matches and reports the source correlation"),
+        ({"ours": (0, 12, 4.1e-2, "blk.0.ffn_down.weight", 0.998)}, 0, "ours",
+         "a single layout under the tolerance matches"),
+        # the measured engine#1109 case: a wrong converter permutes the values inside the chunk, corr
+        # +0.0325 against the honest +0.9994, and both layouts land an order of magnitude over the bar
+        ({"ours": (0, 12, 2.0, "blk.14.attn_output.weight", 0.0325),
+          "flm": (0, 12, 2.1, "blk.14.attn_output.weight", 0.041)}, 1,
+         ("NO", "closest is ours", "corr +0.0325", "blk.14.attn_output.weight"),
+         "tiles from other weights match nothing, and the line names the tensor and the correlation"),
         # ambiguous: close to the tolerance and not clearly better than its rival
-        ({"ours": (0, 12, 0.09), "flm": (0, 12, 0.12)}, 1, "NO", "not clearly better than the rival"),
+        ({"ours": (0, 12, 0.09, "w", 0.9), "flm": (0, 12, 0.12, "w", 0.8)}, 1, "NO",
+         "not clearly better than the rival"),
         ({}, 2, "nothing", "nothing compared"),
         # both layouts skipped every tensor: a 0-vs-0 tie is not a match (engine#1110 review)
-        ({"ours": (0, 0, 0.0), "flm": (0, 0, 0.0)}, 2, "nothing", "two layouts that compared no tensor"),
+        ({"ours": (0, 0, 0.0, "", float("nan")), "flm": (0, 0, 0.0, "", float("nan"))}, 2, "nothing",
+         "two layouts that compared no tensor"),
         # one layout compared tensors and the other did not: the one with evidence decides
-        ({"ours": (0, 0, 0.0), "flm": (0, 12, 1.6)}, 1, "NO", "a layout with no evidence cannot win"),
+        ({"ours": (0, 0, 0.0, "", float("nan")), "flm": (0, 12, 1.6, "w", 0.05)}, 1, "NO",
+         "a layout with no evidence cannot win"),
     ]
     for results, want_rc, want_word, what in cases:
+        wants = (want_word,) if isinstance(want_word, str) else tuple(want_word)
         rc, line = verdict(results)
-        if rc != want_rc or want_word not in line:
+        if rc != want_rc or not all(w in line for w in wants):
             bad.append("%s: got rc=%d %r" % (what, rc, line))
     if bad:
         print("self-test FAILED:")

@@ -352,18 +352,27 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         // allowed[i] says token i can be appended without leaving the grammar.  The first
         // byte test rejects almost every token cheaply (a JSON object at the start accepts
         // a handful of first bytes out of 256), so only the survivors pay a full feed().
+        // The ids a constrained answer may end on: the container's own eos ids plus <|endoftext|>.
+        std::vector<int> end_ids = e.eos;
+        if (e.endoftext >= 0) end_ids.push_back(e.endoftext);
+        // Ids at or beyond the tokenizer's vocabulary are padding positions, not tokens: decode()
+        // returns "" for them, which used to make them indistinguishable from a byte fragment and so
+        // unconditionally allowed (engine#1182: the model drifts into them once the grammar leaves it
+        // nothing to say, and they emit no text and never end the reply).
+        const size_t vocab = size_t(e.tok->size());
         auto refresh_allowed = [&]() {
             allowed.assign(logits.size(), 0);
             const npu::ByteMask first = gram->next_bytes(grammar_state);
-            for (size_t i = 0; i < logits.size(); i++) {
+            for (size_t i = 0; i < logits.size() && i < vocab; i++) {
                 const std::string& t = e.tok_text[i];
                 if (t.empty()) {
-                    allowed[i] = 1;  // an empty piece cannot leave the grammar
+                    allowed[i] = 1;  // a half-character byte fragment cannot leave the grammar
                 } else if (first.has(static_cast<unsigned char>(t[0]))) {
                     npu::Grammar::State probe = grammar_state;
                     allowed[i] = gram->feed(probe, t) ? 1 : 0;
                 }
             }
+            npu::allow_end_tokens(allowed, grammar_state, end_ids);
         };
 
         std::string pending;  // decoded, not yet sent: a stop sequence may still match in it
@@ -403,9 +412,9 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 }
             }
             const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr);
-            // -1: the grammar allows no token here, so the answer ends where it is.  EOS is
-            // not masked by the grammar on purpose: a constrained answer is still allowed to
-            // stop early (the client validates it), which beats a runaway inside the mask.
+            // -1: the grammar allows no token here, so the answer ends where it is.  An end token is
+            // in the mask only where the grammar can stop (refresh_allowed), so a constrained reply
+            // that completes reports "stop" instead of padding to the budget (engine#1182).
             if (next < 0) { stopped_at_eos = true; break; }
             if (std::find(e.eos.begin(), e.eos.end(), next) != e.eos.end() ||
                 (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; break; }

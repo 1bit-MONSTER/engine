@@ -1,0 +1,29 @@
+{
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX pb16i (int8 GEMM) + MTP head pb16i-exact",
+  "settings": {
+    "device": "accel0",
+    "model_dir": "bonsai2-27b-pb16i",
+    "head": "pb16i-exact",
+    "k": 4,
+    "tau": 0,
+    "prompts": 8,
+    "tokens_per_prompt": 64,
+    "batch_rows": 16,
+    "vocab": 248320,
+    "hidden": "post-final-norm"
+  },
+  "instrument": "tools/mtp_depth_pool.py over the three in-tree tickets tests/fixtures/mtp_clause55/*.txt; counts summed over the window's 181 chain iterations",
+  "repeats": 3,
+  "timestamp": "2026-11-05T16:07:13Z",
+  "source": "tests/fixtures/mtp_clause55/{p0,p1-4,p5-7}.txt, verbatim extracts of npu-hold tickets clause55 p0|p1-4|p5-7 (20261105-115131|115551|120713)",
+  "id": "27b-mtp-live-depth1-20261105",
+  "metric": {
+    "name": "draft acceptance, depth 1 (live loop, all chains)",
+    "value": 75.14,
+    "unit": "%"
+  },
+  "notes": "136/181 chains. 8 prompts x 64 tokens, k=4, tau=0; greedy text byte-identical to plain decode on 8 of 8 prompts, 0 stream mismatches. The window is the union of three npu-hold tickets, not three repeats of one window. Per-depth rates conditional on reaching the depth (what the 2 pp clause compares): 75.14 / 63.24 / 73.26 / 84.13 % live against 75.14 / 62.69 / 73.17 / 83.05 % offline at the same positions -- deltas +0.00 / +0.55 / +0.09 / +1.08 pp, 4 of 4 PASS. The all-chains view recorded here (each depth over all 181 chains) reads +0.00 / +1.10 / +1.66 / +2.21 pp on the same counts, so the two conditionings disagree at depth 4; every rate in this row is the all-chains one."
+}

@@ -1289,6 +1289,15 @@ load failures, not style: the embedding keeps its **2-D shape** (the loader read
 `shape[0]`/`shape[1]`), and `text_config`'s keys are **lifted to the top level**, because the engine reads
 `config.json` at depth 1 only. A tensor with no mapping is a refusal, never a dropped one.
 
+Conversion is not the last step for a d3 pack: `decision` copies the pack's `decision_config.json` (which is
+where it declares `attention_mode`), and then `tools/npu_plan.py <model dir> --kernels <elf dir>` must write
+`plan.json`, because **`attention.mode` is read from the plan and nowhere else**. A pack without one is
+answered *causally*, which for a noncausal pack is a different model — the reference's own mask is worth
+0.2869 |Δp| (engine#847) — so the load refuses instead of serving those numbers: it names
+`decision_config.json`'s `noncausal_full_attention`, says whether `plan.json` is absent or stale, and prints
+the `tools/npu_plan.py` command that fixes it (engine#796). The plan is also what makes a *device* row find its
+`gate/up` fusion and its M=16 decode twins, so a converted pack is not otherwise ready for the array either.
+
 `--dtype bf16` writes the same tensor set with **no q4_1 tiles at all** (every tensor keeps its source
 bf16, or the F32 a transform forces; `verify` reports 0 error rather than a loss). It is the container for
 *measuring*, not for serving: it holds the weights fixed so an engine run and a reference run differ only in

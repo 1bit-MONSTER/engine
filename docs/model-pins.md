@@ -110,7 +110,7 @@ with it, so "nobody could check this" never looks like "nothing moved".
 ## Commands
 
 ```bash
-tools/pin_watch.py --check                  # the daily comparison; writes pin-report.md, exit 0/1/2/3/4 (above)
+tools/pin_watch.py --check                  # the daily comparison; writes pin-report.md, exit 0, 1 or 2 (above)
 tools/pin_watch.py --check --orgs A,B       # ...and census our own orgs for a repo nobody pinned
 tools/pin_watch.py --check --no-template    # same, without the template range reads
 tools/pin_watch.py --check --json sweep.json   # ...and the same sweep as JSON

@@ -225,35 +225,45 @@ intermediate float tensor then never exists.
   down_proj's ship beside the other xclbins, and q/k/v's and gate/up's came out of one `-M 128 -K <K>
   -N <N> -c 4` run of the iso-build generator each (`n1_core_i8_v26.py` through the IRON/MLIR-AIE
   `aiecc`), the artifacts living beside the other xclbins and never in this repository. It is a
-  **correctness** result — and at model level it is **not yet a speed one**, which is now measured rather
-  than suspected. Same export, a Release build of this tree, a quiet box (load 1.2–1.4), one thread, a
+  **correctness** result, and at model level it is a **small** speed one — 8.3 % on a quiet box on the
+  current tree, after the same export measured 1.13–1.16× *slower* on an earlier one; both are measured
+  rather than suspected, and the last row below is the number to quote. Same export, a Release build of
+  this tree, a quiet box (load 1.2–1.4), one thread, a
   32-token prompt and 8 generated tokens: the array's arm does **1074 / 1105 ms/token against the host
   kernel's 947 / 951**, i.e. 1.13–1.16× *slower* than the leg it replaces (and 1.7× behind the A8W8 CPU EP
   at 625 / 628, 4.8× behind float32 at 226); the 32-token prefill is a wash, 805 / 809 against 843 / 845.
   **Re-measured on the current tree those two arms are 930.5 against 972.9 ms/token, i.e. the array 4.4 %
   ahead** — same window, two runs each, both agreeing on the sign, and the profile now splits a pass into
   device calls 802.5 + epilogue 19.0 against the host loop's 879.0 with 94–109 ms of per-pass work that
-  neither leg touches. Not the code, as far as the repository can say: since those figures, only #1032
+  neither leg touches. **Repeated on a quiet box (load1 1.3–3.3) the same sign is larger and is now the
+  quotable one: 983.4 / 1000.2 against 1073.6 / 1088.8 ms/token, i.e. 8.3 % ahead**, per call 4.32 against
+  the host loop's 4.99. Not the code, as far as the repository can say: since those figures, only #1032
   (profiling) and #1047 (the re-pack, ~5 % of a token) touch this path, the NPU runtime the EP links
-  against is unchanged and the five ELFs are byte-identical — so ~5 % of the 13 % is code and the rest is
-  unestablished, most plausibly CPU-side contention in the earlier session, since half of a device call is
-  host work. So the sign is no longer the finding — the magnitude is, and it is small in both directions;
-  quote the number only with the session it came from (`docs/onnx.md`, "Where a pass actually goes").
+  against is unchanged and the five ELFs are byte-identical, so the 1.13× loss does not reproduce: the host arm
+  of the window above ran at load1 1.3–1.6, the same load as the 1.2–1.4 that loss was taken at, and there the
+  array is ahead — though that window is not an arm-for-arm repeat of it, since its device arm ran at 2.8–3.3.
+  So the sign is no longer the finding — the magnitude is,
+  and it is small in every window; quote the number only with the session it came from (`docs/onnx.md`,
+  "Where a pass actually goes").
   The kernels are ahead **in isolation** — 1.54–1.89× per call at a decode step's 36 rows and 3.1× at a
   32-row prefill block — and that advantage does not survive the model. These measurements do not, by
   themselves, say which of the two candidate reasons it is: non-kernel work per call (BO writes, two syncs,
   a wait, the weight writeback, the shared epilogue); or the host loop being faster on the graph's real
   operands than on the probe's synthetic ones (`docs/onnx.md` explains why the second cannot be excluded).
-  Three of those per-call costs are since measured on the array — weight writeback 0.24 ms, epilogue
-  0.134 ms, pack 0.06 ms, i.e. 0.43 ms/call or 84 ms of a 1074 ms pass — and the weight path is not worth
-  fixing: keeping every image resident returns 35 ms/pass for 568 MiB (`docs/onnx.md` carries both). The
-  second candidate turned out to be measurable without the array: dumped from one prefill, the graph's real
+  Three of those per-call costs were measured separately on the array (weight writeback 0.24 ms, epilogue
+  0.134 ms, pack 0.06 ms), and the weight path is not worth fixing: keeping every image resident returns
+  35 ms/pass for 568 MiB (`docs/onnx.md` carries both). The call's own sections then priced all of them in
+  one window: of a 4.32 ms call the launch plus its wait is 3.90 (90 %, and that section *contains* the
+  kernel's multiply), the weight pack plus upload 0.25, `other` 0.13, the readback 0.036, both flushes 0.008
+  — so every non-multiply thing the leg does per call is **0.42 ms (9.8 %)**, 0.54 with the 0.12 epilogue it
+  pays outside the call, and no fix aimed at them can recover more.
+  The second candidate turned out to be measurable without the array: dumped from one prefill, the graph's real
   int8 activations are 62.1 % nonzero against the probe's ~99 %, which makes its host loop **1.42× faster**
   per pass (1098 → 770.6 ms) and cuts the array's kernel advantage from 1.7× to **~1.12×**. So the multiply
-  is not where the model-level loss comes from, and what is left is the per-call work inside `dev_call_ms`
-  that the probe does not see — which the both-arms profile then measured: 4.09 ms/call at model level against
-  the probe's 3.460 for a single shape in the same window, i.e. the EP adds no structural per-call cost, and
-  the arms finished 930.5 against 972.9 ms/token in the array's favour. (Those arms, like every
+  is not where the *1.13× loss* of the figure above came from, and that loss does not reproduce on the
+  current tree at any load tried: what is there is the 8.3 % win above, whose per-call cost the probe also
+  prices (4.32 ms/call at model level against its 3.460 for a single shape in the same window, i.e. the EP
+  adds no structural per-call cost). (Those arms, like every
   number on this page, come from a Release build: the EP targets carry no `-O2` of their own, and an
   unoptimized host loop inflates the device-against-host ratio by ~25×.)
   `docs/onnx.md` ("What the device leg is worth at model level") carries the four-arm table, the per-shape

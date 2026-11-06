@@ -56,7 +56,7 @@ GROUP = 128  # the arena's multiplier group: one d per 128 K-rows per column
 
 def container_expert(q, name, e):
     """One expert's weights as the container holds them: float32 [K][N]."""
-    info = q.moe_meta["tensors"][name]
+    info = q.expert_meta(name)
     rt, kt = q.shape(name)[0], q.shape(name)[1]
     rte = rt // info["experts"]
     chunk = q.shape(name)[-1]
@@ -96,7 +96,7 @@ def dequantise(codes, d):
 
 
 def info_n(q, name):
-    return q.moe_meta["tensors"][name]["rows"]
+    return q.expert_meta(name)["rows"]
 
 
 def chunk_path(out, layer, proj, e):
@@ -146,7 +146,7 @@ def geometry(q, layer, pad_n=None):
     """
     out = {}
     for proj, suffix in PROJ.items():
-        info = q.moe_meta["tensors"][q.layer_name(layer, suffix)]
+        info = q.expert_meta(q.layer_name(layer, suffix))
         K, N = info["cols"], info["rows"]
         n_out = max(N, pad_n or N)
         out[proj] = {
@@ -206,17 +206,35 @@ def chunks(args):
     return 0
 
 
+def manifest_padding(out):
+    """The per-projection padding chunks() used, read back from the manifest beside the chunks.
+
+    verify has to open each chunk at the width it was WRITTEN (`N_padded`), which is wider than the
+    container's own N whenever --pad-n was given - reading the container's N instead rejects a
+    perfectly good padded chunk with a byte-count message that reads like file corruption.
+    """
+    try:
+        with open(os.path.join(out, "manifest.json")) as f:
+            geo = json.load(f)["geometry"]
+        return {p: int(v["N_padded"]) for p, v in geo.items()}
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return {}
+
+
 def verify(args):
     q = Q4nx(args.model)
+    written = manifest_padding(args.out)
     bad = 0
     for proj, suffix in PROJ.items():
         name = q.layer_name(args.layer, suffix)
-        info = q.moe_meta["tensors"][name]
+        info = q.expert_meta(name)
         K, N = info["cols"], info["rows"]
+        n_out = max(N, args.pad_n or written.get(proj, N))
         worst = {"rel": 0.0, "cos": 1.0, "max": 0.0}
         for e in range(args.experts):
             ref = container_expert(q, name, e).astype(np.float64)
-            back = dequantise(*read_chunk(chunk_path(args.out, args.layer, proj, e), K, N))
+            # the padded columns are zero, so the comparison is the container's own N columns
+            back = dequantise(*read_chunk(chunk_path(args.out, args.layer, proj, e), K, n_out))[:, :N]
             err = np.abs(back.astype(np.float64) - ref)
             rel = float(np.sqrt((err ** 2).sum() / max((ref ** 2).sum(), 1e-30)))
             cos = float((back * ref).sum() / np.sqrt((back * back).sum() * (ref * ref).sum()))
@@ -224,8 +242,9 @@ def verify(args):
                      "max": max(worst["max"], float(err.max()))}
         ok = worst["cos"] > 0.98
         bad += not ok
+        pad_note = f" (written padded to {n_out}, compared in the container's {N})" if n_out > N else ""
         print(f"{'ok  ' if ok else 'BAD'} {proj:5s} {K} x {N}: worst of {args.experts} experts "
-              f"rel rms {worst['rel']:.4f}, cos {worst['cos']:.6f}, max |dw| {worst['max']:.4f}")
+              f"rel rms {worst['rel']:.4f}, cos {worst['cos']:.6f}, max |dw| {worst['max']:.4f}{pad_note}")
     return 1 if bad else 0
 
 
@@ -245,7 +264,11 @@ def main():
     v.add_argument("out")
     v.add_argument("--layer", type=int, default=0)
     v.add_argument("--experts", type=int, default=2)
-    g = sub.add_parser("gate", help="expected int32 for one token, one layer, one projection")
+    v.add_argument("--pad-n", dest="pad_n", type=int, default=None,
+                   help="the padding these chunks were written with, if there is no manifest.json "
+                        "in the out dir to read it from")
+    g = sub.add_parser("gate", help="expected int32 for one token, one layer, one projection "
+                                     "(down's A is per expert)")
     g.add_argument("model")
     g.add_argument("out")
     g.add_argument("--prompt", required=True)
@@ -267,6 +290,10 @@ def gate(args):
     The kernel's contract is int8 A x int4 W -> int32 with per-row A scales, so the expected
     tensor is exact integer arithmetic, not a float comparison: this writes the activation row,
     its int8 form and scale, the router's choice, and each chosen expert's expected int32.
+
+    gate and up share one A (the layer's MoE input row). down does NOT: its input is each
+    expert's own SwiGLU activation, so it gets a row and a scale PER EXPERT, and a kernel that
+    hands one A to all of down's chunks computes the wrong thing.
     """
     import moe_q4nx_ref as R
 
@@ -285,21 +312,45 @@ def gate(args):
     top = np.argsort(-p, kind="stable")[:args.experts]
     w = p[top] / p[top].sum() if q.norm_topk else p[top]
 
-    # A: int8 per row with one scale, the convention the launch path takes (ascales)
-    ascale = float(np.abs(h).max() / 127.0) or 1.0
-    a8 = np.clip(np.rint(h / ascale), -127, 127).astype(np.int8)
-
     name = q.layer_name(args.layer, PROJ[args.proj])
-    info = q.moe_meta["tensors"][name]
+    info = q.expert_meta(name)
     K, N = info["cols"], info["rows"]
+
+    def a_row(e):
+        """The activation row expert e multiplies in `proj` - down's is per expert."""
+        if args.proj != "down":
+            return h
+        gate = container_expert(q, q.layer_name(args.layer, PROJ["gate"]), e)
+        up = container_expert(q, q.layer_name(args.layer, PROJ["up"]), e)
+        return (R.silu(gate.T @ h) * (up.T @ h)).astype(np.float32)
+
     os.makedirs(args.out, exist_ok=True)
-    expected = {}
-    for e in top:
-        codes, d = quantise(pad_n(container_expert(q, name, int(e)), args.pad_n))
-        exact = codes.astype(np.int32).T @ a8.astype(np.int32)      # [N]
-        expected[int(e)] = {"d_max": float(d.max()),
-                            "d_bits": d.astype(np.float16).view(np.uint16).tolist(),
-                            "int32": exact.tolist()}
+    expected, ascales, a8s, cosine = {}, {}, {}, {}
+    for e in (int(x) for x in top):
+        a = a_row(e)
+        if a.shape[0] != K:
+            raise SystemExit(f"{name}: expert {e}'s A row is {a.shape[0]}, the contraction is {K}")
+        ascales[e] = float(np.abs(a).max() / 127.0) or 1.0
+        a8s[e] = np.clip(np.rint(a / ascales[e]), -127, 127).astype(np.int8)
+        wq = pad_n(container_expert(q, name, e), args.pad_n)
+        codes, d = quantise(wq)
+        exact = codes.astype(np.int32).T @ a8s[e].astype(np.int32)      # [N]
+        expected[e] = {"d_max": float(d.max()),
+                       "d_bits": d.astype(np.float16).view(np.uint16).tolist(),
+                       "int32": exact.tolist()}
+        # This projection's OUTPUT for this token's row, int8 x int4 against the container's float
+        # weights. The int32 above is exact for the codes, so it cannot show this - it is the one
+        # number a gate has to be read against, and down's is per expert because its rows differ.
+        yq, yr = dequantise(codes, d).T @ a, wq.T @ a
+        cosine[e] = float(yq @ yr / (np.linalg.norm(yq) * np.linalg.norm(yr) + 1e-30))
+    shared = args.proj != "down"
+    # down's dispatch takes one M-row A: expert j's row in row j (docs/npu.md, "A chunk-list
+    # dispatch shares ONE A"), the ELF is M=16, and the rows past top-k stay zero.
+    M = 16
+    a_rows = np.zeros((M, K), np.int8)
+    for j, e in enumerate(int(x) for x in top):
+        if j < M:
+            a_rows[j] = a8s[e]
     out = {
         "layer": args.layer, "proj": args.proj, "K": K, "N": N,
         "N_padded": int(args.pad_n or N),
@@ -307,19 +358,30 @@ def gate(args):
         "router_top": [int(e) for e in top],
         "router_weights": [float(x) for x in w],
         "expert_weights": {int(e): float(x) for e, x in zip(top, w)},
-        "ascale": ascale,
+        # A_f32 is always the layer's MoE input row (what the router saw). ascale/A_int8 are the
+        # row every expert shares, so they exist only where there is one.
         "A_f32": h.tolist(),
-        "A_int8": a8.tolist(),
+        "ascale": ascales[int(top[0])] if shared else None,
+        "A_int8": a8s[int(top[0])].tolist() if shared else None,
+        "ascale_per_expert": ascales,
+        "A_int8_per_expert": {e: v.tolist() for e, v in a8s.items()},
+        "A_int8_M16": a_rows.tolist(),   # row j = the j-th selected expert, for down's placement
         "expected_int32": expected,
-        "how": "expected_int32 = codes^T . a8 in int32 (exact); scale by d and ascale on the host",
+        "proj_cosine_per_expert": cosine,
+        "how": "expected_int32 = codes^T . A_int8 in int32 (exact); scale by d and the expert's "
+               "ascale on the host. down's A differs per expert (A_int8_per_expert).",
     }
     with open(os.path.join(args.out, "gate.json"), "w") as f:
         json.dump(out, f)
     print(f"layer {args.layer} {args.proj}: experts {[int(e) for e in top]}, "
-          f"weights {[round(float(x), 4) for x in w]}, ascale {ascale:.6g}, K={K} N={N}")
-    print(f"A_int8 range [{a8.min()}, {a8.max()}], expected int32 range "
+          f"weights {[round(float(x), 4) for x in w]}, K={K} N={N}"
+          + (f", ascale {ascales[int(top[0])]:.6g}" if shared else ", one A per expert"))
+    print(f"A_int8 range [{min(int(v.min()) for v in a8s.values())}, "
+          f"{max(int(v.max()) for v in a8s.values())}], expected int32 range "
           f"[{min(min(v['int32']) for v in expected.values())}, "
           f"{max(max(v['int32']) for v in expected.values())}]")
+    print("int8 x int4 output cosine per expert: "
+          + ", ".join(f"{e}:{c:.6f}" for e, c in cosine.items()))
     print(f"wrote {args.out}/gate.json")
     return 0
 

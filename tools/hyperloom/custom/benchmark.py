@@ -69,6 +69,18 @@ DECODE_PROMPTS = {
 #: about that many tokens and the score becomes its decode rate -- the number #679 is about -- instead
 #: of the short-prompt geometric mean. The text is a fixed filler sentence repeated to length, so every
 #: candidate sees the same prompt; the real token count comes back from the server and is reported.
+HWMON_ROOT = pathlib.Path("/sys/class/hwmon")
+GPU_SYSFS = pathlib.Path("/sys/class/drm/card0/device")
+
+
+def meminfo_gib(path, unit):
+    """A counter from the GPU's sysfs, in GiB, or None when this box does not expose it."""
+    try:
+        return round(int(path.read_text(encoding="ascii").strip()) / unit, 2)
+    except (OSError, ValueError):
+        return None
+
+
 LONG_PROMPT_UNIT = ("The archive records a series of routine maintenance events on the northern line. "
                     "Each entry lists a date, a shift, an asset and the action taken. ")
 #: Measured on the box: this filler tokenises at ~4.85 characters per token (a 75,200-character prompt
@@ -285,6 +297,33 @@ def drafting_identity():
     return ident
 
 
+def drafting_summary(serve_log):
+    """The drafting record for a served measurement: what the levers asked for, and what the serve says
+    it actually did.
+
+    `drafting_identity()` alone answers "which drafter file", and `{}` was its whole answer when no
+    drafting lever was set -- which on this pin is not "no drafting": the GGUF carries its own MTP head
+    and serve drafts with it unless told not to. Measured 2026-11-04 22:39 (27B UD-Q4_K_XL, 20,480 ctx):
+    the artifact said `drafting: {}` while serve.log reported `--spec-type draft-mtp`, recipe
+    `qwen35-mtp-max-3`, and the scored long leg drafted `mean len 3.02` at `0.67460` acceptance. The cap
+    is worth ~18 % of 18.8k decode and ~25 % of `tg128` here, so an unrecorded default makes two rows
+    incomparable -- the same rule as `model`/`build`/`placement`.
+
+    `requested` is therefore explicit (`null` = no lever set, i.e. the pin's own default applied;
+    `HL_MTP_MAX: "0"` = a deliberately non-drafting measurement), and `serve` is what the server itself
+    reported, so the record does not depend on reading the pin's defaults correctly.
+    """
+    ident = drafting_identity()
+    asked = {k: env(k) for k in ("HL_DFLASH", "HL_DFLASH_GGUF", "HL_MTP_MAX", "HL_MTP_HEAD") if env(k)}
+    ident["requested"] = asked or None
+    if not asked:
+        ident["requested_note"] = ("no drafting lever was set: the pin drafts with the model's own MTP "
+                                   "head unless --no-mtp/ONEBIT_NO_MTP=1; see drafting.serve for what the "
+                                   "server actually did")
+    ident["serve"] = drafting_observed(serve_log)
+    return ident
+
+
 def build_identity(onebit, bin_dir):
     """Name the binary that produced the measurement, inside the artifact itself.
 
@@ -300,6 +339,23 @@ def build_identity(onebit, bin_dir):
         "bin_dir": str(bin_dir),
         "sha256": sha256_head(onebit),
     }
+
+
+def scripts_identity():
+    """Name the workload code that computed the number, inside the artifact itself.
+
+    ``build_identity`` names the engine binary and ``model_identity`` the weights, but nothing named the
+    adapter script that runs the arms -- and this workload is measured from several checkouts of it. Two
+    measured consequences: on 2026-11-05 04:06 an arm ran from the #1034-only ``hl-boxcond`` worktree
+    instead of ``hl-main``, so the result it would have written could not have carried ``drafting`` at
+    all; and on 2026-11-05 20:13 this lane's own arm ran from an unmerged branch to test a field it was
+    adding. In both cases the JSON would have been indistinguishable from a run of ``main``.
+
+    The workload is a single file, so ``sha256`` is the whole code identity. ``sha256_head`` reads up to
+    64 MiB, and this file is ~60 KB, so it is the file's hash and not a prefix.
+    """
+    path = pathlib.Path(__file__).resolve()
+    return {"path": str(path), "sha256": sha256_head(path)}
 
 
 def model_identity(model):
@@ -335,6 +391,107 @@ def device_stack():
         "hsa_runtime": str(libhsa) if libhsa.is_file() else None,
         "hsa_runtime_sha256": sha256_head(libhsa) if libhsa.is_file() else None,
     }
+
+
+def die_temp_c():
+    """The die temperature, from the hwmon channel labelled Tctl.
+
+    The hwmon *index* is not stable across boots (this box has rebooted six times in three days and the
+    k10temp channel has come back as hwmon2 and as hwmon4), so the channel is found by its label instead
+    of by a hardcoded path. None when the box exposes no Tctl channel at all.
+    """
+    for label in sorted(HWMON_ROOT.glob("hwmon*/temp*_label")):
+        try:
+            if label.read_text(encoding="ascii", errors="replace").strip() != "Tctl":
+                continue
+            milli = (label.with_name(label.name.replace("_label", "_input"))
+                     .read_text(encoding="ascii").strip())
+        except OSError:
+            continue
+        try:
+            return round(float(milli) / 1000.0, 2)
+        except ValueError:
+            return None
+    return None
+
+
+def npu_conditions():
+    """Whether another lane holds the NPU, read from the claim files (device-free).
+
+    Same class as the die temperature: a condition of the score, recorded rather than refused. The
+    fleet's policy for this box (okf policies/strixhalo-thermal-and-gpu-claims.md, 2026-11-05) is that
+    the two engines coexist safely -- the real cross-engine hazard is a shared dma-buf range, not
+    simultaneity -- but a GPU *arm* beside a running NPU *matrix* corrupts both lanes' numbers. This
+    lane's long-context arm was refused 27 times on 2026-11-05 for exactly this and produced no
+    number, and a result that did measure beside an NPU job could not have said so.
+
+    `npu-serve-keeper` is the owner's resident serve: baseline box state, not a job. Every field is
+    null/0/false where the box does not expose it, so an unreadable claim file cannot be read back as
+    a quiet NPU.
+    """
+    home = user_home()
+    holder = None
+    try:
+        lines = (home / "NPU-TOKEN").read_text(encoding="utf-8", errors="replace").splitlines()
+        holder = lines[0].strip() if lines and lines[0].strip() else None
+    except OSError:
+        holder = None
+    queued = 0
+    try:
+        queued = sum(1 for path in (home / "NPU-QUEUE").iterdir() if not path.name.startswith("."))
+    except OSError:
+        queued = 0
+    return {"npu_holder": holder,
+            "npu_job": bool(holder) and not holder.startswith("npu-serve-keeper"),
+            "npu_queued": queued}
+
+
+def box_conditions():
+    """The conditions the measurement is running in, device-free (sysfs + /proc).
+
+    A score is a measurement *of a box*, and this box is shared. On 2026-11-01 the same workload at the
+    same configuration produced 44.69 with a quiet die and no swap, and 31.68 with 85 GB of 122 GB in use,
+    37 GB of swap in play and the die climbing; both passed the correctness gate, which is about the
+    output and says nothing about whether the two arms are comparable, and the result JSON recorded
+    nothing that could tell them apart. Every field is ``None`` where the box does not expose it, so an
+    unreadable die cannot be read back as a cool one.
+    """
+    gtt_used = meminfo_gib(GPU_SYSFS / "mem_info_gtt_used", 2 ** 30)
+    gtt_total = meminfo_gib(GPU_SYSFS / "mem_info_gtt_total", 2 ** 30)
+    available = None
+    try:
+        for line in pathlib.Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                available = round(int(line.split()[1]) / (1024 * 1024), 2)
+                break
+    except (OSError, ValueError, IndexError):
+        available = None
+    conditions = {"tctl_c": die_temp_c(),
+                  "gtt_used_gib": gtt_used, "gtt_total_gib": gtt_total,
+                  "mem_available_gib": available}
+    conditions.update(npu_conditions())
+    return conditions
+
+
+def box_summary(samples):
+    """The start snapshot plus how far the die moved while the arm ran.
+
+    The die at start alone cannot separate a clean arm from a loaded one: the arm that had to be aborted
+    on 2026-11-01 was at 54 C when it was claimed and hit 93 C inside the run. Kept in the same shape as
+    the start snapshot, so a reader that only wants the conditions reads the top three fields.
+    """
+    if not samples:
+        return None
+    summary = dict(samples[0])
+    die = [s["tctl_c"] for s in samples if s.get("tctl_c") is not None]
+    summary["tctl_c_min"] = min(die) if die else None
+    summary["tctl_c_max"] = max(die) if die else None
+    summary["tctl_samples"] = len(die)
+    # Same reason as the die's spread: an NPU job can start after the arm is claimed, so the start
+    # snapshot alone does not say whether the number was measured beside one.
+    summary["npu_job_samples"] = sum(1 for s in samples if s.get("npu_job"))
+    summary["npu_samples"] = len(samples)
+    return summary
 
 
 def levers():
@@ -512,6 +669,74 @@ def placement_summary(path):
             "worst_graph_off_hrx": max((o for _, o in hits), default=0)}
 
 
+# the flag is quoted mid-sentence in serve's own line ("--spec-type draft-mtp; --no-mtp ... turns it off"),
+# so the value stops at the punctuation rather than swallowing it.
+DRAFT_SPEC_RE = re.compile(r"--spec-type ([A-Za-z0-9._-]+)")
+DRAFT_RECIPE_RE = re.compile(r"1bit serve: recipe ([^:]+): (.*)$", re.M)
+DRAFT_ACC_RE = re.compile(
+    r"draft acceptance = ([0-9.]+) \(\s*(\d+) accepted /\s*(\d+) generated\), mean len =\s*([0-9.]+)")
+# The OFF case is a line the server emits, not an absence: `1bit serve` says
+# "spec common_specu: no implementations specified for speculative decoding" when drafting is disabled. Reading
+# drafting off an absence is how a lost log came to look like a non-drafting measurement (see the status note in
+# drafting_observed).
+DRAFT_NONE_RE = re.compile(r"no implementations specified for speculative decoding", re.I)
+
+
+def drafting_observed(path):
+    """What the serve itself reported about drafting, so a result can say whether the decode it
+    scored drafted at all.
+
+    Measured on this box, 2026-11-04 22:39 (27B UD-Q4_K_XL, 20,480 ctx): `bench_summary.drafting` was
+    `{}` -- no `HL_DFLASH`, no `HL_MTP_HEAD` were set -- while the same run's serve.log said
+    `carries its own MTP head: drafting with it (--spec-type draft-mtp; --no-mtp or ONEBIT_NO_MTP=1
+    turns it off)`, `recipe qwen35-mtp-max-3: --spec-draft-n-max 3`, and the long leg's own timing
+    block reported `draft acceptance = 0.67460 (85 accepted / 126 generated), mean len = 3.02`. So the
+    number was produced by a drafting decode that the artifact described as no drafting at all.
+
+    That is not a cosmetic gap: the MTP cap is worth ~18 % of 18.8k decode on this box (pair-2,
+    2026-11-03 17:15) and `HL_MTP_MAX=0` moves `tg128` from 11.80 to 8.83 (2026-11-01), so two rows
+    differing only in an unset default are otherwise indistinguishable -- the same rule as
+    `placement`/`model`/`build`: the result names the input it was measured with. It reports, it does
+    not check.
+
+    The return value always says **which** of the four states it is in, because `null` used to cover
+    three of them and two of those are opposite claims. Measured 2026-11-05 22:53 on this box (27B
+    UD-Q4_K_XL, 20,480 ctx, `HL_MTP_MAX=0`, `window-20261105/arm_74_longctx_mtp0_repeat.json`): that arm's
+    serve.log says `spec common_specu: no implementations specified for speculative decoding` -- the server
+    stating drafting was off -- and the artifact recorded `drafting.serve: null`, the **same value** an
+    unreadable serve.log produced. So the headline non-drafting row and a row whose log was lost serialised
+    identically, and the only way to tell them apart was to read serve.log by hand:
+
+      drafted      evidence of a spec implementation / recipe / acceptance was found (keys as below)
+      not-drafted  the server itself said there was no spec implementation
+      no-evidence  the log was read and carries nothing either way (an older or quieter build)
+      unreadable   the log could not be read at all -- "nobody knows", which must never read as "did not draft"
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"status": "unreadable"}
+    accs = [(float(a), int(acc), int(gen), float(ln))
+            for a, acc, gen, ln in DRAFT_ACC_RE.findall(text)]
+    spec, recipe = DRAFT_SPEC_RE.search(text), DRAFT_RECIPE_RE.search(text)
+    if not accs and not spec and not recipe:
+        return {"status": "not-drafted" if DRAFT_NONE_RE.search(text) else "no-evidence"}
+    out = {"status": "drafted"}
+    if spec:
+        out["spec_type"] = spec.group(1)
+    if recipe:
+        out["recipe"] = recipe.group(1).strip()
+        out["recipe_args"] = recipe.group(2).strip()
+    if accs:
+        out.update({"tasks_reporting": len(accs),
+                    "accept_rate_last": accs[-1][0],
+                    "accepted_last": accs[-1][1],
+                    "generated_last": accs[-1][2],
+                    "mean_acc_len_last": accs[-1][3],
+                    "mean_acc_len_max": max(a[3] for a in accs)})
+    return out
+
+
 KLD_MEAN_RE = re.compile(r"^Mean\s+KLD\s*:\s*([-+0-9.eE]+)", re.M)
 
 
@@ -585,8 +810,13 @@ def main():
     deadline = time.time() + env_int("HL_BUDGET_SEC", 780 if not longctx else 1200)
 
     model_ident = model_identity(model)
+    # Conditions are sampled at start and at each phase boundary: the arm that had to be aborted on
+    # 2026-11-01 was claimed at 54 C and reached 93 C inside the run, so the start value alone is not
+    # the measurement's conditions. Nothing here touches the device.
+    conditions = [box_conditions()]
     log(f"model={model} bin={bin_dir} state={state}")
     log(f"device={device_stack()}")
+    log(f"box={conditions[0]}")
     log(f"levers={levers() or '{}'}")
     result = {
         "framework": "custom",
@@ -603,12 +833,15 @@ def main():
         "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
                           "model": model_ident,
                           "build": build_identity(onebit, bin_dir),
+                          "scripts": scripts_identity(),
                           "device_stack": device_stack(),
                           "drafting": drafting_identity(),
+                          "box": box_summary(conditions),
                           "llama_bench_reps": reps},
     }
 
     def finish(passed, reason, rc=0):
+        result["bench_summary"]["box"] = box_summary(conditions)
         result["quality_gate"]["passed"] = bool(passed)
         result["quality_gate"]["reason"] = reason
         result["completed"] = 1 if passed else 0
@@ -627,6 +860,7 @@ def main():
     if rc != 0 or not pp512 or not tg128:
         return finish(False, f"llama-bench failed (rc={rc}, rows={sorted(rows)})", rc=1)
     result["bench_summary"].update({"pp512_tok_s": round(pp512, 2), "tg128_tok_s": round(tg128, 2)})
+    conditions.append(box_conditions())
 
     # 2. serve: the decode-side legs and the greedy texts the gate compares.
     try:
@@ -638,6 +872,8 @@ def main():
         return finish(False, f"serve leg failed: {exc}", rc=1)
     result["bench_summary"]["serve_tok_s"] = {k: round(v, 2) for k, v in tps.items()}
     result["bench_summary"]["placement"] = placement
+    result["bench_summary"]["drafting"] = drafting_summary(log_dir / "serve.log")
+    conditions.append(box_conditions())
     if long_info:
         result["bench_summary"]["longctx"] = {k: (round(v, 2) if isinstance(v, float) else v)
                                               for k, v in long_info.items()}
@@ -667,6 +903,7 @@ def main():
     establishing = not ref or not ref_texts or not base_kld.is_file()
 
     kld_stat = kld(ppl, model, bench_args(), base_kld, wiki, min(900, deadline - time.time()), log_dir)
+    conditions.append(box_conditions())
     result["quality_gate"].update({"kld_max_mean": kld_max, "kld_mean": kld_stat["mean"],
                                    "kld_recorded": kld_stat["recorded"]})
     if establishing and kld_stat["recorded"] and kld_stat["mean"] is None:

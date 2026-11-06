@@ -31,6 +31,7 @@
 namespace {
 
 using onebit::npu::find_stop;
+using onebit::npu::allow_end_tokens;
 using onebit::npu::Grammar;
 using onebit::npu::AnswerFamily;
 using onebit::npu::AnswerStream;
@@ -42,6 +43,8 @@ using onebit::npu::kRandomSeed;
 using onebit::npu::PrefixOptions;
 using onebit::npu::PrefixCache;
 using onebit::npu::json_schema_to_gbnf;
+using onebit::npu::int_field;      // engine#1106: typed top-level fields
+using onebit::npu::bool_field;
 using onebit::npu::logprobs_of;
 using onebit::npu::options_from_body;
 using onebit::npu::SampleParams;
@@ -74,6 +77,17 @@ Feed run(const Grammar& g, const std::string& text) {
     r.alive = g.feed(st, text);
     r.can_stop = Grammar::can_stop(st);
     return r;
+}
+
+// engine#1106: a typed top-level field is a named refusal, not a json::type_error that escapes the route's guard.
+template <typename F>
+std::string throws_of(F f) {
+    try {
+        f();
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return {};
 }
 
 std::string error_of(const nlohmann::json& body) {
@@ -266,6 +280,48 @@ void test_json_grammar() {
     Grammar::State copy = st;
     check(!g.feed(copy, "x"), "a colon is required after a key");
     check(st.stacks.size() > 0, "the refused token left the state where it was");
+}
+
+// engine#1182: a mask built only from grammar-legal tokens drops the end token, so a constrained
+// answer could never stop and padded to max_tokens with finish_reason "length".
+void test_grammar_end_tokens() {
+    const std::vector<int> ends = {151645, 151643, -1};  // Qwen's <|im_end|>, <|endoftext|>, and a miss
+    {
+        // `root ::= "ab"`: mid-grammar there is no stopping point, so every end token stays masked.
+        const Grammar g(R"(root ::= "ab")");
+        Grammar::State st = g.start();
+        std::vector<char> allowed(200000, 0);
+        allow_end_tokens(allowed, st, ends);
+        check(allowed[151645] == 0 && allowed[151643] == 0,
+              "EOS is masked before the grammar can end, so a constrained answer cannot be truncated");
+        check(g.feed(st, "ab"), "the grammar's own text is accepted");
+        allow_end_tokens(allowed, st, ends);
+        check(allowed[151645] == 1 && allowed[151643] == 1,
+              "EOS is offered once the grammar is at an accepting state");
+        check(allowed[0] == 0 && allowed[151644] == 0, "only the end tokens are added, nothing else");
+    }
+    {
+        // The real case: the house JSON grammar after a complete object, where the reply must be
+        // able to stop even though more properties would still be legal.
+        const Grammar g(json_grammar());
+        Grammar::State st = g.start();
+        check(g.feed(st, R"({"a": 1})"), "a complete object is accepted");
+        check(Grammar::can_stop(st), "a complete object is an accepting state");
+        std::vector<char> allowed(200000, 0);
+        allow_end_tokens(allowed, st, ends);
+        check(allowed[151645] == 1, "json_schema/json_object replies may stop on EOS when the JSON is whole");
+    }
+    {
+        // An id outside the mask (a vocabulary smaller than the end ids) is ignored, not written.
+        const Grammar g(R"(root ::= "ab")");
+        Grammar::State st = g.start();
+        g.feed(st, "ab");
+        std::vector<char> small(8, 0);
+        allow_end_tokens(small, st, ends);
+        int set = 0;
+        for (char c : small) set += c ? 1 : 0;
+        check(set == 0, "an end token outside the mask vector is ignored rather than written out of bounds");
+    }
 }
 
 void test_gbnf() {
@@ -823,6 +879,40 @@ void test_content_mask() {
     }
 }
 
+void test_typed_fields() {
+    using nlohmann::json;
+    // Absent and null are the default; a number is taken; a fractional cap is truncated (body.value did that).
+    check(int_field(json::parse(R"({"a": 8})"), "a", 256) == 8, "an integer field is read");
+    check(int_field(json::parse(R"({})"), "a", 256) == 256, "an absent field is the default");
+    check(int_field(json::parse(R"({"a": null})"), "a", 256) == 256, "a null field is the default");
+    check(int_field(json::parse(R"({"a": 8.5})"), "a", 256) == 8, "a fractional cap is truncated, not refused");
+    check(throws_of([] { int_field(json::parse(R"({"max_tokens": "8"})"), "max_tokens", 256); }) ==
+              "max_tokens: must be an integer",
+          "a string max_tokens is a 400 naming the field (engine#1106: it used to be a 500 with no body)");
+    check(throws_of([] { int_field(json::parse(R"({"max_tokens": true})"), "max_tokens", 256); }) ==
+              "max_tokens: must be an integer",
+          "a boolean max_tokens is refused too");
+
+    check(bool_field(json::parse(R"({"stream": true})"), "stream"), "a boolean field is read");
+    check(!bool_field(json::parse(R"({"stream": false})"), "stream"), "false is false");
+    check(!bool_field(json::parse(R"({})"), "stream"), "an absent flag is false by default");
+    check(throws_of([] { bool_field(json::parse(R"({"stream": "yes"})"), "stream"); }) == "stream: must be true or false",
+          "a string stream is a 400 naming the field (engine#1106: it used to be a 500 with no body)");
+}
+
+void test_tools_type() {
+    using nlohmann::json;
+    // engine#1106: a wrong-typed tools used to short-circuit as if no tools were sent, in the default mode.
+    check(throws_of([] { options_from_body(json::parse(R"({"tools": "a string"})")); }) == "tools: must be an array",
+          "a non-array tools is refused even with the default tool_choice");
+    check(throws_of([] { options_from_body(json::parse(R"({"tools": 7})")); }) == "tools: must be an array",
+          "a numeric tools is refused too");
+    const auto none = options_from_body(json::parse(R"({"tools": []})"));
+    check(none.tools_sent && none.grammar.empty(), "an EMPTY tools array still means no tools, and still counts as sent");
+    const auto explicit_auto = options_from_body(json::parse(R"({"tools": [], "tool_choice": "auto"})"));
+    check(explicit_auto.grammar.empty(), "an empty tools array with an explicit auto installs no grammar");
+}
+
 void test_request_parsing() {
     const auto plain = options_from_body(nlohmann::json::parse(R"({"prompt": "hi", "max_tokens": 8})"));
     check(plain.sample.greedy(), "a body without sampling fields stays greedy");
@@ -880,6 +970,7 @@ int main() {
     test_stop();
     test_json_grammar();
     test_gbnf();
+    test_grammar_end_tokens();
     test_logprobs();
     test_logprob_options();
     test_prefix_cache();
@@ -891,6 +982,8 @@ int main() {
     test_tool_request_parsing();
     test_content_mask();
     test_request_parsing();
+    test_typed_fields();
+    test_tools_type();
     std::printf("%s\n", failures ? "FAILED" : "npu_sampling: ok");
     return failures ? 1 : 0;
 }

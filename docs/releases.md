@@ -30,6 +30,46 @@ release in the same week gets `.1`.
 
 ## v2026.44 (1 Nov 2026) — the first release, a draft
 
+> **The candidate has moved on since this section was written.** Everything below to the end of this section is the
+> **1 Nov 2026 record** of c19 (software-gated, never booted on hardware) and c20, and stays as that record. What
+> has happened since, as of 2026-11-05 23:1x:
+>
+> - **c26** (`rc-2026-11-05-c26`) was written to a stick at 14:37 with every software gate green on its frozen
+>   bytes: `vm-check` **75 PASS / 0 FAIL / 3 SKIP** (UEFI + Secure Boot), the artifact's own
+>   `1bit-puppy-stick.sh --check` **31 rows, 0 failed**, and `READBACK: MATCH` for all 9,128,902,656 bytes.
+> - **Its board boot failed** at ~15:0x, before userspace: `Waiting for partition [1BIT-DATA]... failed`. The stick
+>   had enumerated at 3.8 s, but its SCSI probe did not finish until **45.7 s** — it sat behind two USB
+>   mass-storage reset cycles of the KVM's emulated drive — and Puppy's `wait_for_blkid()` polls for only **15 s**
+>   ([#1159](https://github.com/1bit-MONSTER/engine/issues/1159)). Not a c26 regression: c26's `vmlinuz` and
+>   `initrd.gz` are byte-identical to c25's, and c23-c25 won the same race.
+> - **c27** re-cuts the appliance with one file changed, `/1bit/initrd.gz`: the wait is **120 s**, the console says
+>   `*** 1bit: still waiting for [1BIT-DATA] - a slow medium is not a failure` where it used to give up, and the
+>   PR that carries the change makes the image build refuse any initrd whose wait is under 90 s
+>   ([#1160](https://github.com/1bit-MONSTER/engine/pull/1160), which closes #1159). On c27's bytes `vm-check` is
+>   the same **75 / 0 / 3**, the new `usbgate` (a USB-mass-storage boot with its budget asserted from the shipped
+>   image) passes, and `prepare-stick --check` passes.
+> - **c27's board boot ran on 2026-11-05 and the c26 failure is gone**: `sda1 sda2` at 3.86 s, behind the same
+>   two USB reset cycles that killed c26, and the 120 s wait carried it; boot to Lemonade serving took **50 s**.
+>   `puppy-check` **51 rows: 43 PASS, 1 FAIL, 7 SKIP**. The one FAIL is `u4-release-check : no RESULT line; rc=1`
+>   — the appliance's own release check dying at line 1244 on `PPID=$!`, a readonly bash builtin — which left a
+>   1000-token chat in the NPU driver, so the next backend's requests came back `code 102` behind 33
+>   `aie2_hwctx_init … ret -19` lines, and one TDR followed at kernel 319.2 s
+>   ([#1177](https://github.com/1bit-MONSTER/engine/pull/1177) carries the fix). Every row that run reached before
+>   the death was green — chat 94.26 tok/s on the NPU, the 400/600/1000 ladder answered, `TDRs 0 → 0 → 0 → 0` on
+>   the follow-up — and the five `u9-*` SKIPs were the checker's own log-path bug, fixed the same night.
+> - **c28** (`rc-2026-11-05-c28`) is c27's bytes with that one fix, and **c29** composes c28 with the console and
+>   installer fixes. **c28 booted the board on 2026-11-05 at 19:42**: `puppy-check` **52 rows: 49 PASS, 3 FAIL,
+>   2 SKIP**, boot to Lemonade serving in **50 s**, NPU 94.9–98.0 tok/s, HRX 85.4–87.1 tok/s. None of the three reds
+>   is the `PPID=$!` death: one is the appliance's release check reporting a non-streamed NPU chat that got no HTTP
+>   status at all, the second is that check's own follow-up run wedged on the same request (`code 102`, one TDR), and
+>   the third is `u9-degraded` firing for the first time, on a failed backend load. **c29** was written to a stick and
+>   booted on 2026-11-05 at 22:13 for the demo take — one `code 614` NPU turn, recovered to the fallback — which is
+>   not a `puppy-check` run. v2026.44 remains a draft under the owner's order: the demo video on the live USB first,
+>   then the install test, then publish.
+>
+> The newest full row set *measured on the board* is c28's 52 rows above (2026-11-05 19:42); before it, c27's 51, and
+> before that cycle 24's `puppy-check` **42 rows: 40 PASS, 1 FAIL — the checker's own `u7-mdns` row — 2 SKIP**.
+
 **Not published.** Candidate **c19** (`rc-2026-11-01a`, engine `bcb28cc8f573`) passed every software gate below and
 was written to a 64 GB stick — and that is where it stopped: it was **never booted on hardware and never installed on
 hardware**, so the owner pulled v2026.44 back to a draft. Nothing here is a hardware result for c19.
@@ -54,7 +94,7 @@ DeepSeek V4.x, GLM 5.x and Qwen3.8-Flash-Next run on **HRX** here, and the catal
 | hrx-system | `82804197bcbe` |
 | HRX toolchain (ROCm/TheRock SDK) | `10.3.0a20261031`, `gfx1151` (`config/hrx-toolchain.config`), HSA runtime `21a6682452e159cf…` |
 | Lemonade Server | `2026.46.0~1.ef0f3b49` (our fork, the `onebit` recipe) |
-| kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
+| kernel in the image | `7.4.0-rc1-1bit` (Linux `v7.4-rc1`, IOMMU PerfOpt upstream, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
 
 The pinned toolchain's HSA runtime, so a bump is a diff here and a wrong runtime is visible
@@ -82,7 +122,7 @@ not tell you, both measured:
   no device (engine#713's acceptance table). A payload dir may also carry the pin **relocated** (`f5462dc3…`: the
   same 5,141,585 B with 185 bytes changed, `DT_RPATH`→`DT_RUNPATH $ORIGIN`).
 
-The Lemonade pin is the sha (`ef0f3b49`), not the string around it: `tools/version.py` derives the dev version as
+The Lemonade pin is the sha (`ef0f3b49` at c19), not the string around it: `tools/version.py` derives the dev version as
 `<week>.0~<commit count>.<sha>`, and that count is the number of commits in the **checkout it was built in** —
 `third_party/lemonade` is a `shallow = true` submodule, so a depth-1 clone reports `~1` for the same commit while a
 full clone reports `~1752` (both measured on 2026-11-02; c18 printed `~5`, i.e. built from a deeper clone). The `~N` is
@@ -150,7 +190,7 @@ Release sha and pins (the submodules this candidate is built from):
 | engine | `7871c71d` (main when the last release-blocking PR merged; a later merge today re-runs only the stages it touches, and the run's record carries the final sha) |
 | llama.cpp (HRX fork) | `851fa6c8d8f2` |
 | hrx-system | `82804197bcbe` |
-| Lemonade (fork) | `27abcc24da99` |
+| Lemonade (fork) | `f44ff953` (the fork's `main` tip, and the sha `bump-lemonade`'s PR #1126 pinned; re-read this row from `git ls-tree third_party/lemonade` at cut time, because the workflow follows the tip) |
 | private kernel add-on (HIP) | `744bd713d968` |
 | private NPU kernel set | `17ed5be7a28a` |
 | private NPU runtime | `ce9fa59adf95` |
@@ -227,9 +267,23 @@ prebuilt-library build are in the tree (`#467`, `#479`, `#469`).
 **Lemonade.** One hop for GGUFs: Lemonade starts the engine's `llama-server` directly, no shim
 (`#475`, fork `#15`), the engine's own warm-ups are sent in order (`#492`, fork `#16`, `#17`), and
 the Ubuntu 26.04 PPA's `lemond` runs our HRX server unchanged (`#483`). Synced to upstream `#3771`
-(fork `#21`, `#520`). The catalog has **22 HRX entries, each proven on the box** — strict placement,
-one request in role, `lemonade bench ... chat-short` — and 3 NPU entries (fork `#19`, `#20`, `#23`);
-chat-short spans 43.4 (Qwen3-8B) to 330.7 tok/s (Qwen3-0.6B), 0 faults in 16 holds.
+(fork `#21`, `#520`), and now to the GA release itself (`v2026.45.3`, fork `#29`) — the port carries our
+onebit backend, catalog and FLM context clamp into upstream's rebuilt server, so the suite evidence for
+this pin is a run against the **ported** `lemond`, not against a package built before it.
+
+The catalog has **23 HRX entries**, each with a proven row on the box (strict placement, one request in
+role, `lemonade bench ... chat-short`): fork `#23`'s 22 plus flint from `#24`. It also has **4 NPU
+entries** — `Qwen3-0.6B`, `Qwen3-1.7B` and `Qwen3-4B` (fork `#19`, `#20`, `#23`) and
+`Qwen3.6-35B-A3B` (`#8`). Chat-short spans 43.4 (Qwen3-8B) to 330.7 tok/s (Qwen3-0.6B), 0 faults in 16
+holds.
+
+Two behaviours are new on this pin, both from the fleet's NPU-exclusivity decision (2026-11-05): **an
+NPU model switch evicts the previous NPU model before the new one starts**, because the array runs one
+hardware context at a time (fork `#34`), and a *refused* context is queued on a budget instead of being
+called a dead array (engine `#1100`, `1bit serve --load-queue-ms`). The 31-test suite through the
+onebit recipe on HRX passes against the ported `lemond` (`Ran 31 tests in 110.6s`, `OK (skipped=2)`,
+measured at load 28.5 with two foreign HRX clients resident), and the catalogue covers 27 onebit rows
+in total (23 + 4).
 
 **1bit OS.** The image carries the sealed NPU sets and the new Lemonade (`#512`, `#523`), the UKI is
 signed with the enrolled MOK so a stick boots with Secure Boot on (`#513`), the USB4 v2 / Thunderbolt
@@ -431,7 +485,7 @@ rehearsal found these only after the build) and stops with a message naming what
 | PR | check beyond build + ctest |
 |---|---|
 | `bump-lemonade/*` | Lemonade's LLM suite through the onebit recipe on HRX ([lemonade.md](lemonade.md)) |
-| `bump-laya/*` | `tests/laya_route_e2e.sh` on the pinned checkpoint |
+| `bump-laya/*` | `tests/laya_route_e2e.sh` and `tests/laya_route_serve.sh` on the pinned checkpoint |
 | `bump-hrx/*` | every `hrx` row of `registry/check_models.tsv` through `tools/registry_check.py` (serve end to end per architecture, ZAYA1 and the Qwen MoE models included); any FAIL holds the bump |
 | `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device); the xdna-driver pin is the `amdxdna` kernel driver, which the release does not build: check it on Strix Halo with the module loaded ([npu.md](npu.md), "The XDNA driver") |
 

@@ -81,7 +81,56 @@ class Q4nx:
         self.top_k = c.get("num_experts_per_tok", 0)
         self.norm_topk = c.get("norm_topk_prob", True)
         self.moe_meta = self.table.get("__metadata__", {}).get("moe", {})
+        if self.moe_meta:
+            self.moe_topology()
         self._cache = {}
+
+    def moe_topology(self):
+        """The routed topology is the container's, and config.json has to say the same thing.
+
+        The engine reads experts/used/norm_topk from `__metadata__.moe` alone -- `meta.at
+        ("experts")`, `meta.at("used")`, `meta.value("norm_topk_prob")` in npu/moe.cpp -- and
+        never from config.json; this reader read them from config.json alone and compared the two
+        sources to nothing. A config.json that disagrees (a stale copy, a hand-edited
+        num_experts_per_tok, a config left beside the container from another model) therefore made
+        the oracle a different model from the one it judges, and nothing raised:
+        `num_experts_per_tok: 2` routes two experts where the engine routes eight, which reports a
+        quarter of the per-token decode stream (254,803,968 B vs 1,019,215,872 B on
+        qwen3-coder-30b-a3b) and different logits, while every byte of the container stays the
+        container's. The metadata is the container's statement about its own bytes, so it is the
+        source here too, and a disagreement is a refusal rather than a preference.
+        """
+        m = self.moe_meta
+        arch = m.get("arch")
+        if arch != "qwen3moe":
+            raise SystemExit(f"__metadata__.moe.arch is {arch!r}: this reference implements "
+                             "qwen3moe (gated top-k experts, no shared expert)")
+        if self.cfg.get("model_type") not in (None, arch):
+            raise SystemExit(f"config.json model_type is {self.cfg['model_type']!r}, the container "
+                             f"says {arch!r}")
+        for key, src, want in (("num_experts", "experts", int(m["experts"])),
+                               ("num_experts_per_tok", "used", int(m["used"]))):
+            got = self.cfg.get(key)
+            if got is None:
+                raise SystemExit(f"config.json has no {key}; __metadata__.moe.{src} is {want}")
+            if int(got) != want:
+                raise SystemExit(f"config.json {key} is {got}, __metadata__.moe.{src} is {want}: "
+                                 "the two describe different models")
+        if bool(self.cfg.get("norm_topk_prob", True)) != bool(m.get("norm_topk_prob", True)):
+            raise SystemExit(f"config.json norm_topk_prob is {self.cfg['norm_topk_prob']}, "
+                             f"__metadata__.moe.norm_topk_prob is {m['norm_topk_prob']}")
+        self.experts, self.top_k = int(m["experts"]), int(m["used"])
+        self.norm_topk = bool(m.get("norm_topk_prob", True))
+        # Every layer's router is [experts, hidden], which is what the engine requires before it
+        # routes (npu/moe.cpp: router.shape[0] == experts, bytes == experts*hidden*2). A router with
+        # fewer rows than the container's experts makes the extra experts unreachable rather than
+        # an error, so it is checked here for every layer, from the table, without decoding it.
+        for L in range(self.layers):
+            name = self.layer_name(L, "mlp.gate.weight")
+            sh = self.table.get(name, {}).get("shape")
+            if sh is None or len(sh) != 2 or [int(x) for x in sh] != [self.experts, self.hidden]:
+                raise SystemExit(f"{name}: shape {sh} is not [{self.experts}, {self.hidden}]"
+                                 " (experts, hidden)")
 
     # a tensor's raw bytes, as stored
     def raw(self, name):
@@ -90,6 +139,60 @@ class Q4nx:
 
     def shape(self, name):
         return self.table[name]["shape"]
+
+    def expert_meta(self, name):
+        """__metadata__.moe's entry for one routed stack, checked against the tensor's own shape.
+
+        The stacks come from ggml `[cols, rows, experts]` and are stored here as
+        `[experts x rows/32, cols/256, 5120]`, so a converter that keeps ggml's field order swaps
+        K and N and moves no byte: `bytes`, `tiles`, the offsets and the expert count all stay
+        valid (on this model gate/up are 24x8 and down 64x3 -- 192 tiles either way), which is
+        why every byte-count check in these tools passes on a transposed pair. Only the tensor's
+        own shape separates them, and a transposed down_proj is a GEMM contracting over the wrong
+        axis: noise, not an error. The engine's Moe makes the same three checks (npu/moe.cpp).
+
+        The offsets are the other half of the same contract, because they are where a chunk file's
+        bytes actually come from: one entry per expert, expert 0 at the tensor's own start, each
+        exactly `bytes` after its predecessor, the last one reaching the tensor's end. The
+        convention is the container's (data-section relative) and NOT free here: this reader
+        indexes the mmap absolutely, so a list written relative to the tensor would read another
+        tensor's bytes without moving a single byte count. npu/moe.cpp checks the same things
+        relative to offsets.front(), which is why it cannot see the convention -- and verify()
+        cannot see either, since it compares a chunk against a read driven by the same list.
+        """
+        info = self.moe_meta.get("tensors", {}).get(name)
+        if info is None:
+            raise SystemExit(f"{name}: not listed in __metadata__.moe.tensors")
+        rows, cols = int(info["rows"]), int(info["cols"])
+        shape = self.shape(name)
+        if rows <= 0 or cols <= 0 or rows % 32 or cols % 256:
+            raise SystemExit(f"{name}: rows/cols are not a whole number of 32x256 tiles")
+        if int(info["tiles"]) != (rows // 32) * (cols // 256):
+            raise SystemExit(f"{name}: tiles does not match rows x cols")
+        if (len(shape) != 3 or shape[2] != TILE or shape[0] != int(info["experts"]) * (rows // 32)
+                or shape[1] != cols // 256):
+            raise SystemExit(f"{name}: rows/cols disagree with the tensor's shape {shape}")
+        n, nb = int(info["experts"]), int(info["bytes"])
+        if n != int(self.moe_meta.get("experts", n)):
+            raise SystemExit(f"{name}: {n} experts in its metadata, __metadata__.moe.experts is "
+                             f"{self.moe_meta['experts']}")
+        if nb != int(info["tiles"]) * TILE:
+            raise SystemExit(f"{name}: bytes is not a whole number of {TILE}-byte chunks")
+        off = [int(x) for x in info["offsets"]]
+        lo, hi = (int(x) for x in self.table[name]["data_offsets"])
+        if len(off) != n:
+            raise SystemExit(f"{name}: offsets lists {len(off)} entries for {n} experts")
+        if off[0] != lo:
+            raise SystemExit(f"{name}: offsets[0] is {off[0]} but the tensor starts at {lo}: the "
+                             "list is not measured from the data section")
+        for e in range(1, n):
+            if off[e] != off[0] + e * nb:
+                raise SystemExit(f"{name}: expert {e} at {off[e]} is not {nb} B after expert "
+                                 f"{e - 1} at {off[e - 1]}")
+        if off[-1] + nb != hi:
+            raise SystemExit(f"{name}: the offsets cover up to {off[-1] + nb}, the tensor ends at "
+                             f"{hi}")
+        return info
 
     def bf16(self, name):
         """A BF16 tensor as float32, its stored shape."""
@@ -120,7 +223,7 @@ class Q4nx:
         """Expert e of a routed stack as float32 [rows, cols]; not cached (streamed)."""
         t = self.table[name]
         rt, kt = t["shape"][0], t["shape"][1]
-        info = self.moe_meta["tensors"][name]
+        info = self.expert_meta(name)
         lo = info["offsets"][e]
         rows = info["rows"]
         rte = rt // info["experts"]
@@ -736,6 +839,75 @@ def selftest():
     h = rng.standard_normal((1, 16)).astype(np.float32)
     assert abs(float(np.sqrt((rmsnorm(h, np.ones(16, np.float32), 0.0) ** 2).mean())) - 1.0) < 1e-6
     print("ok   softmax / top-k renormalisation / RoPE / rmsnorm")
+    # The expert metadata is checked against the tensor's own shape, because a transposed pair of
+    # rows/cols moves no byte and leaves `tiles` identical (gate/up 24x8 and down 64x3 are both
+    # 192 on a 768-wide model), so nothing else in these tools can see it. The offsets are the other
+    # half - they are where the bytes come from, and a permuted or tensor-relative list reads
+    # another expert's (or another tensor's) weights with every byte count still balancing.
+    def stub(rows, cols, tiles, shape, data_lo=0, offsets=None, top=None):
+        b = tiles * TILE
+        q = Q4nx.__new__(Q4nx)
+        q.table = {"w": {"shape": shape, "data_offsets": [data_lo, data_lo + 2 * b]}}
+        q.moe_meta = {"tensors": {"w": {"experts": 2, "rows": rows, "cols": cols,
+                                        "tiles": tiles, "bytes": b,
+                                        "offsets": offsets or [data_lo, data_lo + b]}}}
+        if top is not None:
+            q.moe_meta["experts"] = top
+        return q
+
+    assert stub(768, 2048, 192, [48, 8, TILE]).expert_meta("w")["cols"] == 2048
+    for bad in (stub(2048, 768, 192, [48, 8, TILE]),     # rows/cols transposed, same tile count
+                stub(768, 2048, 191, [48, 8, TILE]),     # tiles inconsistent with rows x cols
+                stub(768, 2048, 192, [128, 3, TILE]),    # the shape a transposed tensor would have
+                stub(768, 2048, 192, [48, 8, TILE], data_lo=4096,
+                     offsets=[0, 192 * TILE]),           # tensor-relative offsets
+                stub(768, 2048, 192, [48, 8, TILE], offsets=[192 * TILE, 0]),   # reversed
+                stub(768, 2048, 192, [48, 8, TILE], offsets=[0]),   # one entry, two experts
+                stub(768, 2048, 192, [48, 8, TILE], top=4)):        # 4 experts, metadata says 2
+        try:
+            bad.expert_meta("w")
+        except SystemExit:
+            continue
+        raise AssertionError("a bogus expert geometry was accepted")
+    print("ok   expert metadata vs the tensor's shape and offsets")
+    # The routed topology is the container's, and config.json has to agree with it, because the
+    # engine reads it from __metadata__.moe only (npu/moe.cpp) while this reader read it from
+    # config.json only. top-2 where the container is top-8 is a different model with no error.
+    def topo(cfg, meta):
+        q = Q4nx.__new__(Q4nx)
+        q.cfg, q.hidden, q.layers = cfg, cfg["hidden_size"], cfg["num_hidden_layers"]
+        q.moe_meta = meta
+        q.table = {f"model.layers.{L}.mlp.gate.weight": {"shape": [meta["experts"], 2048]}
+                   for L in range(cfg["num_hidden_layers"])}
+        return q
+
+    good = {"arch": "qwen3moe", "experts": 128, "used": 8, "norm_topk_prob": True}
+    ok_cfg = {"model_type": "qwen3moe", "num_experts": 128, "num_experts_per_tok": 8,
+              "norm_topk_prob": True, "hidden_size": 2048, "num_hidden_layers": 2}
+    t = topo(ok_cfg, good)
+    t.moe_topology()
+    assert (t.experts, t.top_k, t.norm_topk) == (128, 8, True)
+    for bad_cfg, bad_meta in (
+            ({**ok_cfg, "num_experts_per_tok": 2}, good),      # top-2 where the container is top-8
+            ({**ok_cfg, "num_experts": 64}, good),             # half the experts
+            ({k: v for k, v in ok_cfg.items() if k != "num_experts"}, good),  # field missing
+            ({**ok_cfg, "norm_topk_prob": False}, good),       # unnormalised where it is normalised
+            ({**ok_cfg, "model_type": "deepseek_v2"}, good),   # another architecture's config
+            (ok_cfg, {**good, "arch": "deepseek2"})):   # a shared-expert arch this does not run
+        try:
+            topo(bad_cfg, bad_meta).moe_topology()
+        except SystemExit:
+            continue
+        raise AssertionError("a config disagreeing with the container's topology was accepted")
+    t = topo(ok_cfg, good)
+    t.table["model.layers.1.mlp.gate.weight"]["shape"] = [64, 2048]   # router rows < experts
+    try:
+        t.moe_topology()
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("a router with fewer rows than the experts was accepted")
+    print("ok   the routed topology is the container's, and config.json has to agree")
     print("moe_q4nx_ref selftest: ok")
 
 

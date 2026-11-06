@@ -33,7 +33,7 @@
 //! still draws the screen. Nothing is clipped: every string goes through `wrap_words` before it reaches a widget,
 //! because the c16 board showed "firmware prese".
 
-use crate::facts::{human_bytes, human_uptime, wrap_words, Facts, SecureBoot};
+use crate::facts::{human_bytes, human_uptime, wrap_hanging, wrap_words, Facts, Mode, SecureBoot};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -144,16 +144,35 @@ fn rule(title: &str, width: usize) -> Line<'static> {
     ])
 }
 
-fn header(f: &Facts) -> Line<'static> {
+fn header(f: &Facts, width: usize) -> Line<'static> {
     let ip = f.ip().unwrap_or("no address yet");
     let sb = match f.secure_boot {
         SecureBoot::Enabled => ("Secure Boot enabled", Some(Color::Green)),
         SecureBoot::Disabled => ("Secure Boot disabled", Some(Color::Yellow)),
         SecureBoot::Unknown => ("Secure Boot unknown", Some(Color::DarkGray)),
     };
-    let mut spans = vec![
+    // Which system is running comes first, beside the edition's own name: after an install the screen must not still
+    // look like a stick (#711 - "live usb is loaded up" while the facts came from the NVMe). The word is init.sh's
+    // (`MODE: LIVE` / `MODE: INSTALLED`), so the console and the boot banner cannot disagree.
+    let mut spans = vec![Span::styled(
+        "1bit OS".to_string(),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(w) = f.mode.word() {
+        let colour = match f.mode {
+            Mode::Installed => Color::Cyan,
+            _ => Color::Green,
+        };
+        spans.push(Span::styled(
+            format!(" {w}"),
+            Style::default().fg(colour).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.extend([
         Span::styled(
-            format!("1bit OS {} ", f.release),
+            format!(" {} ", f.release),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -167,14 +186,27 @@ fn header(f: &Facts) -> Line<'static> {
             format!("up {}  ", human_uptime(f.uptime_s)),
             Style::default().fg(Color::Gray),
         ),
-        Span::styled(sb.0, Style::default().fg(sb.1.unwrap_or(Color::Gray))),
-    ];
+    ]);
+    // The two facts that may give way on a narrow screen, in the order they go: the temperature first, then Secure
+    // Boot. The mode, the release, the host and the address never do, and the blocks that may not be trimmed at all
+    // (the nine actions, the footer) are not this function's. Dropping them instead of letting ratatui clip the line
+    // is what keeps a 60-column ssh window from reading as `Secure Boot enab`.
+    let mut tail: Vec<Span<'static>> = vec![Span::styled(
+        sb.0,
+        Style::default().fg(sb.1.unwrap_or(Color::Gray)),
+    )];
     if let Some(t) = f.temp_c {
-        spans.push(Span::styled(
+        tail.push(Span::styled(
             format!("  SoC {t}C"),
             Style::default().fg(Color::Gray),
         ));
     }
+    let cells =
+        |s: &[Span<'static>]| -> usize { s.iter().map(|x| x.content.chars().count()).sum() };
+    while !tail.is_empty() && cells(&spans) + cells(&tail) > width {
+        tail.pop();
+    }
+    spans.extend(tail);
     Line::from(spans)
 }
 
@@ -201,7 +233,29 @@ pub fn connect_block(f: &Facts, spin: &str, width: usize) -> Vec<Line<'static>> 
     };
     out.push(rule(&title, width));
 
-    let host = f.ip().unwrap_or("-");
+    // Before DHCP there is no address, and a URL with a `-` for a host is not a URL anybody can use: the first
+    // seconds of a boot used to read as broken output. There is exactly one honest thing to say then (owner
+    // decision 2026-11-04 20:19), so the block says it and nothing else - the address rows come back with the lease.
+    // `vm-check.sh`'s `U2 menu connect` row needs four dotted digits and is red in this state either way; it reads
+    // the booted box, where these rows are all present again.
+    let Some(host) = f.ip() else {
+        out.push(Line::from(vec![
+            Span::styled(IND, Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "web UI: waiting for network".to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        out.push(Line::from(Span::styled(
+            format!(
+                "{IND}no address yet - press 3 (Network); DHCP is automatic once a cable is in"
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+        return out;
+    };
     let keyed = f.key.is_some();
     // Cycle 20 (owner: "blank key"): the appliance ships with NO API key, so the block says what that means for
     // whoever is reading it - anyone on this network can use Lemonade until item 1 mints one. Keyed mode keeps the
@@ -291,7 +345,16 @@ pub fn panels(f: &Facts) -> Vec<(&'static str, Vec<String>)> {
         Some(pid) => lemonade.push(format!("pid {pid}, not listening on 13305")),
         None => lemonade.push("DOWN (no lemond process)".to_string()),
     }
-    lemonade.push(format!("http://{}:13305", f.ip().unwrap_or("-")));
+    // same rule as the CONNECT block: no address yet is neither the address "-" nor a URL (see `connect_block`)
+    lemonade.push(match f.ip() {
+        Some(ip) => format!("http://{ip}:13305"),
+        None => "web UI: waiting for network".to_string(),
+    });
+    // Owner decision 2026-11-04 20:19: the console says which engine is serving, in Lemonade's own words - no
+    // marketing map. `engine: llamacpp (gpu)` is what the box reports, not what we would like it to say.
+    if let Some(e) = &f.engine {
+        lemonade.push(format!("engine: {e}"));
+    }
     lemonade.push(if f.key.is_some() {
         "API key: set, press 1".to_string()
     } else {
@@ -416,11 +479,15 @@ pub fn menu_lines() -> Vec<String> {
 }
 
 /// The same rows as drawn: wrapped (never clipped) with a continuation indent, should the screen be narrower
-/// than the longest label.
+/// than the longest label. The indent is spent out of the wrap, not added after it: a row indented to the pane
+/// width is a row the widget clips (`wrap_hanging`).
 pub fn menu_rows(width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for row in menu_lines() {
-        for (i, part) in wrap_words(&row, width).into_iter().enumerate() {
+        for (i, part) in wrap_hanging(&row, width, width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
             let text = if i == 0 { part } else { format!("  {part}") };
             out.push(styled(text, Some(Color::Cyan), i == 0));
         }
@@ -455,7 +522,7 @@ fn log_lines(a: &App, height: usize, width: usize) -> Vec<Line<'static>> {
         } else {
             Some(Color::Gray)
         };
-        let block: Vec<(Option<Color>, String)> = wrap_words(rec, width)
+        let block: Vec<(Option<Color>, String)> = wrap_hanging(rec, width, width.saturating_sub(2))
             .into_iter()
             .enumerate()
             .map(|(i, w)| (color, if i == 0 { w } else { format!("  {w}") }))
@@ -556,11 +623,17 @@ fn panel_grid(f: &Facts, width: usize) -> Vec<Line<'static>> {
 fn compact_status(f: &Facts, width: usize) -> Vec<Line<'static>> {
     let mut fields: Vec<String> = Vec::new();
 
-    fields.push(match (f.lemond_pid, f.lemond_listening) {
+    let mut lemonade = match (f.lemond_pid, f.lemond_listening) {
         (Some(pid), true) => format!("LEMONADE up {pid}"),
         (Some(pid), false) => format!("LEMONADE pid {pid} no answer"),
         (None, _) => "LEMONADE DOWN".to_string(),
-    });
+    };
+    // the same sentence the wide layout's LEMONADE panel carries, on the field it belongs to: a FIELD of its own
+    // would push the compact block to a third row at 80x25 and cost the log pane one (measured)
+    if let Some(e) = &f.engine {
+        lemonade.push_str(&format!(" engine: {e}"));
+    }
+    fields.push(lemonade);
 
     let g = &f.gpu;
     fields.push(match (&g.device, g.temp_c) {
@@ -593,14 +666,16 @@ fn compact_status(f: &Facts, width: usize) -> Vec<Line<'static>> {
         fields.push(format!("{t:.0} tok/s"));
     }
 
-    let text = pack_fields(&fields, width);
+    // the hanging indent belongs to the block, so `pack_fields` puts it on and this only colours the rows; two
+    // indents (one here, one there) put a wrapped field four cells in and two cells past the pane
+    let text = pack_fields(&fields, width, width.saturating_sub(2));
     text.into_iter()
         .enumerate()
         .map(|(i, l)| {
             if i == 0 {
                 styled(l, Some(Color::Gray), false)
             } else {
-                styled(format!("  {l}"), Some(Color::DarkGray), false)
+                styled(l, Some(Color::DarkGray), false)
             }
         })
         .collect()
@@ -608,11 +683,15 @@ fn compact_status(f: &Facts, width: usize) -> Vec<Line<'static>> {
 
 /// Pack `A | B | C` into as few rows as the width allows WITHOUT splitting a field: at 80 columns the six facts
 /// come out as two rows, and `DATA` never ends up alone at the end of the first one. A field wider than the whole
-/// screen (a long device name on a 40-column serial line) is wrapped by itself rather than cut.
-fn pack_fields(fields: &[String], width: usize) -> Vec<String> {
+/// screen (a long device name on a 40-column serial line) is wrapped by itself rather than cut. `first` is the
+/// opening row and `rest` the rows after it (`width - 2`: this function owns the two-cell hanging indent).
+fn pack_fields(fields: &[String], first: usize, rest: usize) -> Vec<String> {
+    let first = first.max(1);
+    let rest = rest.max(1);
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     for field in fields {
+        let width = if out.is_empty() { first } else { rest };
         if cur.is_empty() {
             cur = field.clone();
         } else if cur.chars().count() + 3 + field.chars().count() <= width {
@@ -622,19 +701,24 @@ fn pack_fields(fields: &[String], width: usize) -> Vec<String> {
             out.push(std::mem::take(&mut cur));
             cur = field.clone();
         }
+        // `cur` may start a row that is indented, so ask again after a push rather than reusing the old width
+        let width = if out.is_empty() { first } else { rest };
         if cur.chars().count() > width {
-            let mut parts = wrap_words(&cur, width).into_iter();
+            let mut parts = wrap_hanging(&cur, width, rest).into_iter();
             if let Some(first) = parts.next() {
                 out.push(first);
             }
-            out.extend(parts.map(|p| format!("  {p}")));
+            out.extend(parts);
             cur.clear();
         }
     }
     if !cur.is_empty() {
         out.push(cur);
     }
-    out
+    out.into_iter()
+        .enumerate()
+        .map(|(i, r)| if i == 0 { r } else { format!("  {r}") })
+        .collect()
 }
 
 /// `HRX0: AMD Radeon 8060S Graphics` -> `HRX0`: the colons separate the runtime's node from the marketing name.
@@ -794,7 +878,7 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
     }
 
     if !a.full_logs {
-        top.push(header(&a.facts));
+        top.push(header(&a.facts, w));
         top.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
         facts = if wide {
             panel_grid(&a.facts, w)
@@ -906,19 +990,39 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
 
     if let Some(m) = &a.modal {
         let (title, text, hint) = modal_box(m);
-        let lines: Vec<String> = std::iter::once(title)
-            .chain(text)
-            .chain(std::iter::once(hint))
+        let lines: Vec<String> = std::iter::once(title.clone())
+            .chain(text.iter().cloned())
+            .chain(std::iter::once(hint.clone()))
             .collect();
         // the box is the longest line plus its own padding: sizing it to the longest line and then wrapping
         // inside it made every hint wrap for no reason (measured: "any other key / cancels")
         let width = (lines.iter().map(|l| l.chars().count()).max().unwrap_or(10) + 4)
             .min(w.saturating_sub(4))
             .max(27);
-        let body: Vec<Line> = lines
-            .iter()
-            .flat_map(|l| wrap_words(l, width.saturating_sub(4)))
-            .map(|l| styled(l, Some(Color::White), false))
+        let wrap = |s: &str| -> Vec<Line<'static>> {
+            wrap_words(s, width.saturating_sub(4))
+                .into_iter()
+                .map(|l| styled(l, Some(Color::White), false))
+                .collect()
+        };
+        let mut title_rows = wrap(&title);
+        let mut text_rows: Vec<Line> = text.iter().flat_map(|l| wrap(l)).collect();
+        let hint_rows = wrap(&hint);
+        // The hint is the only row that says how to answer the question, so it is never the row that goes: a frame
+        // too short for the whole box loses the explanation first, whole rows at a time, and then the title. Before
+        // this the box was clamped to the frame and ratatui clipped the END - at 40x11 the reboot confirm drew
+        // `Reboot the appliance now?` with `y reboots the box, n cancels` off the screen while `y` still rebooted.
+        let room = (area.height as usize).saturating_sub(2);
+        while title_rows.len() + text_rows.len() + hint_rows.len() > room && !text_rows.is_empty() {
+            text_rows.pop();
+        }
+        while title_rows.len() + hint_rows.len() > room && !title_rows.is_empty() {
+            title_rows.pop();
+        }
+        let body: Vec<Line> = title_rows
+            .into_iter()
+            .chain(text_rows)
+            .chain(hint_rows)
             .collect();
         let bh = (body.len() as u16 + 2).min(area.height);
         let bw = (width as u16 + 4).min(area.width);
@@ -1010,7 +1114,9 @@ fn render_lines(f: &mut Frame, area: Rect, lines: &[Line<'static>]) {
 
 pub fn status_text(f: &Facts) -> Vec<String> {
     let mut out = Vec::new();
-    let h = header(f);
+    // `--status` is a transcript, not a frame: give the header room so every fact it carries is in the text a gate
+    // greps (`1bit-console-tui --status` prints what the screen says, and the mode is one of those facts now)
+    let h = header(f, 400);
     out.push(
         h.spans
             .iter()
@@ -1072,6 +1178,64 @@ mod tests {
         App::new(f)
     }
 
+    /// The dialog menu's own item table: the `N "Label"` rows inside the `--menu` call of the main screen.
+    ///
+    /// That table is what `--action N` runs, so this screen's row N has to read the same words: keys 2-7 hand off by
+    /// NUMBER, and a label that drifts turns "5 Install 1bit OS to a disk" into a row that runs something else.
+    /// The anchor is the main dialog's own title - the script has three other `--menu` calls (network, models,
+    /// reboot) whose rows are a different thing, and `1bit OS console` appears exactly once in it.
+    fn menu_script_items(text: &str) -> Vec<String> {
+        let mut in_main_menu = false;
+        let mut items = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.contains("1bit OS console") {
+                in_main_menu = true;
+                continue;
+            }
+            if !in_main_menu {
+                continue;
+            }
+            let Some(number) = line.chars().next().filter(|c| ('1'..='9').contains(c)) else {
+                // the rows are contiguous: the first non-row line ends the table
+                if !items.is_empty() {
+                    break;
+                }
+                continue;
+            };
+            let Some(rest) = line[number.len_utf8()..].trim_start().strip_prefix('"') else {
+                break;
+            };
+            let Some(end) = rest.find('"') else { break };
+            items.push(rest[..end].to_string());
+        }
+        items
+    }
+
+    #[test]
+    fn every_menu_row_is_the_menu_scripts_own_item() {
+        // The nine labels exist twice - `ACTIONS` here and the dialog's --menu table in
+        // embed/usr/local/bin/1bit-console-menu - and nothing held them together: #935 and #1163 both reworded a
+        // label, and the gate (`vm-check.sh` `U2 menu`) reads the OTHER copy off tty1. A drift is not cosmetic:
+        // the hand-off runs `--action N`, so row N would say one thing and do another.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../embed/usr/local/bin/1bit-console-menu");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e} (this test reads the menu the image ships)",
+                path.display()
+            )
+        });
+        let items = menu_script_items(&text);
+        assert_eq!(
+            items,
+            ACTIONS.to_vec(),
+            "row-for-row parity with {} is broken: {items:?}",
+            path.display()
+        );
+        assert_eq!(items.len(), 9, "the dialog menu is nine items: {items:?}");
+    }
+
     #[test]
     fn connect_block_names_how_to_reach_the_box() {
         // the owner's cycle-18 complaint, as a test: the first screen must say how to connect
@@ -1096,6 +1260,136 @@ mod tests {
                 "CONNECT block does not mention {want:?}:\n{joined}"
             );
         }
+    }
+
+    #[test]
+    fn before_dhcp_the_connect_block_waits_instead_of_inventing_an_address() {
+        // Measured on main before this: a box with no lease yet (the first screen of every boot) printed
+        // `web UI http://-:13305` / `api  http://-:13305/api/v1` / `ssh  root@-` - four URLs that cannot be used and
+        // a hostname of `-`. Owner decision 2026-11-04 20:19: say `web UI: waiting for network` until there is an
+        // address, so the block says one true thing instead of five false ones.
+        let mut f = c16_board();
+        f.ips.clear();
+        f.lemond_listening = false;
+        for (w, h) in [(240u16, 67u16), (80, 25)] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            assert!(
+                text.contains("web UI: waiting for network"),
+                "{w}x{h}: the waiting-for-network screen does not say so:\n{text}"
+            );
+            for bad in ["http://-:", "root@-", "<address>", "web UI http://"] {
+                assert!(
+                    !text.contains(bad),
+                    "{w}x{h}: {bad:?} is back on the no-address screen:\n{text}"
+                );
+            }
+            assert!(
+                text.contains("no address yet - press 3"),
+                "{w}x{h}: the row that says what to do is gone:\n{text}"
+            );
+        }
+        // ...and the moment there is an address, the whole block is back exactly as the gate row reads it
+        let text = render_snapshot(&app(c16_board()), 80, 25);
+        for want in [
+            "CONNECT",
+            "web UI http://192.168.50.110:13305",
+            "api  http://192.168.50.110:13305/api/v1",
+            "ssh  root@192.168.50.110",
+            "Lemonade Mobile",
+        ] {
+            assert!(
+                text.contains(want),
+                "the booted block lost {want:?}:\n{text}"
+            );
+        }
+        assert!(!text.contains("waiting for network"), "{text}");
+    }
+
+    fn span_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_log_continuation_fits_the_pane_it_is_drawn_on() {
+        // The defect this holds: `log_lines` wrapped a record to the pane width and THEN indented every
+        // continuation row by two, so those rows were drawn two cells wider than the pane and the widget clipped
+        // their end. Measured with the shipped binary at 80x25: a record of 4-char tokens drew `… a36 a37 a3` and
+        // then `a39 a40` - `a38` gone, `a3` a word cut in the middle. A record with one unbroken token is the
+        // case that fills a row exactly, so it is the one that fails when the indent is not in the budget.
+        let mut f = c16_board();
+        f.logs = vec![
+            format!("LEM {} tail", "x".repeat(200)),
+            "LEM 2026-11-03 12:07:41 lemond: POST /api/v1/chat/completions 200".to_string(),
+        ];
+        for w in 20..=240usize {
+            for (i, line) in log_lines(&app(f.clone()), 12, w).iter().enumerate() {
+                let text = span_text(line);
+                assert!(
+                    text.chars().count() <= w,
+                    "width {w}: drawn log row {i} is {} cells: {text:?}",
+                    text.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_packed_status_row_fits_the_pane_it_is_drawn_on() {
+        // Same class one block up: `pack_fields` packed to the width and `compact_status` indents the rows after the
+        // first by two. A field wider than the screen is hard-broken into exactly-width pieces, which is the case
+        // that overflowed. `w < 100` is the compact layout.
+        let mut f = c16_board();
+        f.engine = Some("e".repeat(120));
+        for w in 20..99usize {
+            for (i, line) in compact_status(&f, w).iter().enumerate() {
+                let text = span_text(line);
+                assert!(
+                    text.chars().count() <= w,
+                    "width {w}: drawn status row {i} is {} cells: {text:?}",
+                    text.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_console_says_which_engine_is_serving() {
+        // Owner decision 2026-11-04 20:19 item 1: the console reports what Lemonade says serves the loaded model,
+        // in Lemonade's own words - no marketing map. The wide layout gets its own row, the compact layout carries
+        // it on the LEMONADE field (a field of its own costs the 80x25 log pane a row, measured).
+        let text240 = render_snapshot(&app(c16_board()), 240, 67);
+        assert!(
+            text240.contains("engine: llamacpp (gpu)"),
+            "the LEMONADE panel does not name the engine:\n{text240}"
+        );
+        let text80 = render_snapshot(&app(c16_board()), 80, 25);
+        assert!(
+            text80.contains("engine: llamacpp (gpu)"),
+            "the compact status does not name the engine:\n{text80}"
+        );
+        // the 80x25 log pane still pays for nothing: it keeps its three rows with the engine on the field
+        assert_eq!(
+            text80.lines().count(),
+            25,
+            "the frame is not the terminal:\n{text80}"
+        );
+        // nothing loaded (a box that has not served anything yet) -> no row, and no empty label either
+        let mut f = c16_board();
+        f.engine = None;
+        f.models.loaded.clear();
+        for (w, h) in [(240u16, 67u16), (80, 25)] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            assert!(
+                !text.contains("engine:"),
+                "{w}x{h}: an engine row with nothing loaded:\n{text}"
+            );
+        }
+        // and `--status` carries the same line, which is what a booted-image gate row can read without a terminal
+        let status = status_text(&c16_board()).join("\n");
+        assert!(
+            status.contains("engine: llamacpp (gpu)"),
+            "--status does not name the engine:\n{status}"
+        );
     }
 
     #[test]
@@ -1338,6 +1632,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_header_says_which_system_is_running() {
+        // #711: after an install the console must not still look like a stick. `init.sh` decides it at boot and leaves
+        // `installed` or `live` in /etc/1bit; the header says the same word, beside the edition's own name.
+        let mut f = c16_board();
+        f.mode = Mode::Installed;
+        let text = render_snapshot(&app(f.clone()), 240, 67);
+        assert!(
+            text.lines()
+                .next()
+                .unwrap_or("")
+                .contains("1bit OS INSTALLED"),
+            "the header does not say INSTALLED:\n{text}"
+        );
+        f.mode = Mode::Live;
+        let text = render_snapshot(&app(f.clone()), 240, 67);
+        assert!(
+            text.lines().next().unwrap_or("").contains("1bit OS LIVE"),
+            "the header does not say LIVE:\n{text}"
+        );
+        // a box that has not said (a console started by hand, or an init that could not write the marker) invents
+        // nothing: the word is absent rather than guessed
+        f.mode = Mode::Unknown;
+        let text = render_snapshot(&app(f), 240, 67);
+        let head = text.lines().next().unwrap_or("");
+        assert!(
+            !head.contains("LIVE") && !head.contains("INSTALLED"),
+            "a mode was invented:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_header_drops_a_fact_rather_than_letting_it_be_clipped() {
+        // The mode cost the header five cells, and at 80 columns it is the temperature and then Secure Boot that give
+        // way - both are readable elsewhere (`1bit-board status`, `mokutil --sb-state`) and neither may be clipped to
+        // `SoC 4` / `Secure Boot ena`. The mode, the release, the host and the address never go.
+        let f = c16_board();
+        // 65 is this fixture's mandatory prefix (mode + release + host + address + uptime): below that the line is
+        // longer than the window and ratatui clips its tail, exactly as it already did before the mode was added
+        for w in 65..=256usize {
+            let text = span_text(&header(&f, w));
+            assert!(
+                text.chars().count() <= w,
+                "width {w}: the header is {} cells: {text:?}",
+                text.chars().count()
+            );
+            assert!(
+                text.contains("LIVE"),
+                "width {w}: the mode was dropped: {text:?}"
+            );
+            assert!(
+                text.contains("rc-2026-11-03-c16"),
+                "width {w}: the release was dropped: {text:?}"
+            );
+            assert!(
+                text.contains("192.168.50.110"),
+                "width {w}: the address was dropped: {text:?}"
+            );
+        }
+        // the appliance's own tty1 has room for everything, so nothing is lost where the owner looks
+        let full = span_text(&header(&f, 240));
+        assert!(
+            full.contains("Secure Boot enabled") && full.contains("SoC 43C"),
+            "240 columns lost a fact: {full}"
+        );
     }
 
     #[test]
@@ -1652,6 +2013,81 @@ mod tests {
                         "{w}x{h}: a log title with no log row under it:\n{text}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn the_modal_hint_is_never_the_row_that_goes() {
+        // A frame too short for the whole dialog used to clip its END - the hint, i.e. the only row that says how to
+        // answer. Measured on the shipped binary in ptys: at 40x11, 40x10, 30x12 and 24x12 the blank-key confirm
+        // (`API key` / `Require one from now on?` / `y mints one and restarts Lemonade, n cancels`) drew no hint at
+        // all, and at 40x12 it drew `y mints one and restarts`. For the reboot confirm that is
+        // `y reboots the box, n cancels` off the screen while `y` still reboots.
+        let dialogs = [
+            (
+                Modal::Confirm {
+                    title: "Reboot the box?".into(),
+                    question: "The console ends and the box comes back on its own.".into(),
+                    yes: Yes::Reboot,
+                },
+                "y reboots the box, n cancels",
+            ),
+            (
+                Modal::Confirm {
+                    title: "API key".into(),
+                    question: "No API key (blank mode): this appliance is stock Lemonade, so anyone on this network can use it.\nRequire one from now on? A key is minted into /etc/1bit/lemond.conf and Lemonade restarts.".into(),
+                    yes: Yes::MintKey,
+                },
+                "y mints one and restarts Lemonade, n cancels",
+            ),
+            (
+                Modal::Power,
+                "r reboots, p powers off, any other key cancels",
+            ),
+            (
+                Modal::Info {
+                    title: "Lemonade API key".into(),
+                    body: vec!["API key      0f3a".into(), String::new(), "as a header  Authorization: Bearer 0f3a".into()],
+                },
+                "any key returns to the dashboard",
+            ),
+        ];
+        for (modal, hint) in dialogs {
+            for (w, h) in [
+                (24u16, 12u16),
+                (30, 12),
+                (40, 10),
+                (40, 11),
+                (40, 12),
+                (60, 12),
+                (80, 25),
+                (240, 67),
+            ] {
+                let mut a = app(c16_board());
+                a.modal = Some(modal.clone());
+                let text = render_snapshot(&a, w, h);
+                let lines: Vec<&str> = text.lines().collect();
+                assert_eq!(
+                    lines.len(),
+                    h as usize,
+                    "{w}x{h}: frame is not the terminal:\n{text}"
+                );
+                // the box's borders sit between the wrapped words: drop them before looking for a phrase
+                let flat = text
+                    .replace(
+                        [
+                            '\u{2502}', '\u{250c}', '\u{2510}', '\u{2514}', '\u{2518}', '\u{2500}',
+                        ],
+                        " ",
+                    )
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    flat.contains(hint),
+                    "{w}x{h}: the dialog does not say how to answer it ({hint:?}):\n{text}"
+                );
             }
         }
     }

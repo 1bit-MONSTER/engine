@@ -62,6 +62,12 @@ serve() {
     pids+=($!)
     api="http://127.0.0.1:$port"
     for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$api/health")" = 200 ] && return 0; sleep 0.1; done
+    # A server that never came up because it could not bind is a port collision, not a defect in
+    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$scratch/$name.log"; then
+        echo "FAIL: pm_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$scratch/$name.log" | head -1))"
+        exit 1
+    fi
     echo "serve $name did not become ready"; cat "$scratch/$name.log"; return 1
 }
 ask() {  # ask [extra json fields] -- a coding question, non-stream

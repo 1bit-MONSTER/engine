@@ -23,7 +23,7 @@
 #
 # Rows that cannot PASS without the hardware are marked SKIP in a VM (Lemonade hides its onebit
 # entries on a machine with no AMD GPU or NPU, and there is no HRX or NPU device to run them on):
-# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder. Everything else - mode, kernel,
+# gpu, npu, models, chat-hrx, chat-npu, chat-npu-followup, chat-npu-stream, chat-npu-ladder, chat-npu-queue, chat-npu-queue-plain. Everything else - mode, kernel,
 # Secure Boot, Lemonade up with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU
 # sets and the signed manifests over them, the licences and the image identity - is checked in the VM as well.
 set -u
@@ -37,9 +37,25 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1))
-    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|npu-power|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
+# A check that DIES must not take the evidence - or the NPU - with it. Measured on the c27 board (5 Nov 2026 21:52Z):
+# bash killed this script at `PPID=$!` (a readonly builtin), so five rows of a later run were refused with
+# `code 102: No such device` and the appliance's own u4-release-check row reded as "no RESULT line; rc=1" with nothing
+# to act on. The turn that was mid-flight when the script died kept a hwctx in the driver; the next backend's
+# `Init hwctx` was refused (ret -19, 21:55:37Z) and 20 s later the watchdog TDR'd and power-cycled the device
+# (21:55:52Z). So: the footer announces itself (a death before it says so in the log, so the RESULT line is never
+# silently missing), and a death ends the NPU turn (unload -> lemond stops the backend -> the context is released).
+RC_FOOTER=
+rc_on_exit() {
+    [ -n "$RC_FOOTER" ] && return 0        # a normal run already printed its RESULT and owns the device state
+    say "RESULT: FAIL (this check died before its footer: $ROWS row(s) ran, $FAILS failed - read the line above)"
+    [ -n "${NPU:-}" ] && [ -n "${API:-}" ] || return 0
+    got --header='Content-Type: application/json' --post-data='{}' "$API/api/v1/unload" >/dev/null 2>&1
+    return 0
+}
+trap rc_on_exit EXIT
 # A row that holds the NPU can hold it for a minute or two (a fresh backend per ladder rung, a 512-token turn),
 # and on the owner's console that is indistinguishable from a hung check - which is what the board operator
 # reported. So each NPU row announces itself before it starts. Not a row: the prefix is `info` so a harness that
@@ -102,13 +118,105 @@ auth_get() {  # <url>
 auth_status() {  # <url> -> HTTP status
     if [ -n "$KEY" ]; then status --header="Authorization: Bearer $KEY" "$1"; else status "$1"; fi
 }
-auth_post() {  # <json body> <url> [slow] -> the reply
-    if [ "${3:-}" = slow ]; then _ag=got_slow; else _ag=got; fi
-    if [ -n "$KEY" ]; then
-        $_ag --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" --post-data="$1" "$2"
-    else
-        $_ag --header='Content-Type: application/json' --post-data="$1" "$2"
+# The fetcher for a POST. `got`/`got_slow` try wget first and pass their arguments through unchanged, but
+# a POST body is spelled differently by the two tools: wget takes `--post-data`, curl takes `--data`.
+# Measured on this box while exercising the laya row: with wget absent and curl present, every POST row
+# read an empty body and reported "no answer" for a server that had answered - a false FAIL on exactly the
+# installed-to-disk run the release check is meant to prove. So the POST path picks its own fetcher.
+# RELEASE_CHECK_FETCHER=wget|curl forces one, which is how both branches get exercised.
+post_fetch() {  # <json body> <url> [slow]
+    _cap=20; [ "${3:-}" = slow ] && _cap=120
+    _f=${RELEASE_CHECK_FETCHER:-}
+    if [ -z "$_f" ]; then
+        if command -v wget >/dev/null 2>&1; then _f=wget; else _f=curl; fi
     fi
+    if [ -n "$KEY" ]; then _auth="Authorization: Bearer $KEY"; else _auth=; fi
+    if [ "$_f" = curl ]; then
+        if [ -n "$_auth" ]; then
+            curl -sf --connect-timeout 5 --max-time "$_cap" --header='Content-Type: application/json' \
+                 --header="$_auth" --data "$1" "$2" 2>/dev/null
+        else
+            curl -sf --connect-timeout 5 --max-time "$_cap" --header='Content-Type: application/json' \
+                 --data "$1" "$2" 2>/dev/null
+        fi
+    else
+        if [ -n "$_auth" ]; then
+            wget -q -T "$_cap" -t 1 -O - --header='Content-Type: application/json' \
+                 --header="$_auth" --post-data="$1" "$2" 2>/dev/null
+        else
+            wget -q -T "$_cap" -t 1 -O - --header='Content-Type: application/json' \
+                 --post-data="$1" "$2" 2>/dev/null
+        fi
+    fi
+}
+
+# ── `code 102` is a WAIT, not a verdict (TOS3-C29 item 2; c28 board, 5 Nov 2026) ─────────────────
+# The NPU driver gives the accelerator to ONE client. When that client exits, 0011v2 frees the partition about
+# 2 s later, and for those seconds every new client is refused with
+#   npu runtime: device error (code 102): No such device
+# Measured on the c28 board: this check ran straight after its own NPU rows released the device and 8 of 25 rows
+# reded on that window, so a healthy appliance read as broken. (Worse, the failed run left a turn in flight and
+# the driver TDR'd 15 s later - see PR #1177.) So a reply carrying code 102 is retried with a 1 s back-off, up to
+# NPU_WAIT seconds, and the footer says how long was spent waiting. A 102 that outlives the window is reported
+# unchanged: the wait shortens a transient, it does not excuse a device that stays gone.
+NPU_WAIT=${NPU_WAIT:-10}
+# The counter has to be a FILE: every reply is read through $( ), so the retry runs in a subshell and a plain variable
+# set in there never reaches the footer (measured while proving this block - the wait worked and the footer said 0 s).
+NPU_WAITFILE=${NPU_WAITFILE:-/tmp/.1bit-npu-waited.$$}
+_npu_102() {  # <reply> -> 0 when the backend named the refusal, with its own words
+    case "$1" in *'code 102'*) return 0 ;; esac
+    return 1
+}
+_npu_waited() {  # <seconds spent backing off>
+    [ "${1:-0}" -gt 0 ] 2>/dev/null && printf '%s\n' "$1" >> "$NPU_WAITFILE" 2>/dev/null
+    return 0
+}
+
+auth_post() {  # <json body> <url> [slow] -> the reply
+    _r=$(post_fetch "$1" "$2" "${3:-}")
+    _w=0
+    while _npu_102 "$_r" && [ "$_w" -lt "$NPU_WAIT" ]; do
+        sleep 1; _w=$((_w + 1))
+        _r=$(post_fetch "$1" "$2" "${3:-}")
+    done
+    _npu_waited "$_w"
+    printf '%s' "$_r"
+}
+
+# A POST whose *status and headers* are the evidence (engine#1024's non-streamed arm answers 503 + Retry-After, so the
+# body alone says nothing and got/get_slow hide both). Writes the body to $3 and prints "<status> <retry-after>".
+# The same back-off, for the arm whose evidence is the status and headers: a non-streamed client refused code 102
+# must be asked again rather than reported as "no HTTP status at all", which is what the c28 board said about a
+# request the partition had simply not freed for yet.
+post_watch_once() {  # <json body> <url> <file for the body>
+    : > "$3"
+    if command -v curl >/dev/null 2>&1; then
+        if [ -n "$KEY" ]; then
+            curl -s -m 200 -D "$3.headers" -o "$3" -w '%{http_code}' \
+                 --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
+                 --post-data="$1" "$2" 2>/dev/null
+        else
+            curl -s -m 200 -D "$3.headers" -o "$3" -w '%{http_code}' \
+                 --header='Content-Type: application/json' --post-data="$1" "$2" 2>/dev/null
+        fi
+    else
+        # No curl on this image: wget can still prove a refusal, but it discards the body, so say what is missing.
+        wget -S -O "$3" -T 200 --header='Content-Type: application/json' --post-data="$1" "$2" >"$3.headers" 2>&1
+        printf '%s' "$(sed -n 's/.*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' "$3.headers" | head -1)"
+    fi
+    printf ' '
+    sed -n 's/^[Rr]etry-[Aa]fter: *//p' "${3}.headers" 2>/dev/null | tr -d '\r' | head -1
+}
+
+auth_post_watch() {  # <json body> <url> <file for the body>
+    _s=$(post_watch_once "$1" "$2" "$3")
+    _w=0
+    while _npu_102 "$(cat "$3" 2>/dev/null)" && [ "$_w" -lt "$NPU_WAIT" ]; do
+        sleep 1; _w=$((_w + 1))
+        _s=$(post_watch_once "$1" "$2" "$3")
+    done
+    _npu_waited "$_w"
+    printf '%s' "$_s"
 }
 
 # Readiness: on a cold stick lemond takes tens of seconds to answer its first request (catalog, web
@@ -275,6 +383,83 @@ stream_verdict() {
     printf 'PASS %s text chunk(s) and [DONE] over the stream, no TDR (still %s)' "$_n" "$_t1"
 }
 
+# The NPU row's BUSY decision (engine#1024, c23 board 2026-11-04). A single-user appliance's second chat has to
+# queue behind the first, not be refused. On the board the owner's chat got
+# `{"message":"the NPU is busy with another request"}` inside a 200, because the serve waited --queue-ms (5 s) for
+# the device and gave up while the check's own 1000-token ladder row held it for 14 s. The refusal is a frame in
+# the body, so a row that looks at the status passes it. Pure, so --self-test drives it and the row below uses the
+# same code: <the long chat's body> <the queued chat's body> <TDRs before> <TDRs after>.
+queue_verdict() {
+    _q1=$1 _q2=$2 _t0=$3 _t1=$4
+    case "$_q1" in
+        '') printf 'FAIL the long chat, which owns the device, came back empty'; return 0 ;;
+        *'"error"'*) printf 'FAIL the long chat answered an error: %.100s' "$_q1"; return 0 ;;
+    esac
+    case "$_q2" in
+        ''|'000') printf 'FAIL the queued chat came back empty: a refusal still has a body, so this is a dropped request'
+                   return 0 ;;
+    esac
+    case "$_q2" in
+        *'"error"'*) printf 'FAIL the second chat was refused while the device was busy: %.120s' \
+                          "$(printf '%s' "$_q2" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+                     return 0 ;;
+    esac
+    case "$_q2" in
+        *'data: '[[[]DONE]*) ;;
+        *) printf 'FAIL the queued chat ended without data: [DONE], so it was cut rather than answered: %.80s' "$_q2"
+           return 0 ;;
+    esac
+    _qn=$(printf '%s' "$_q2" | grep -oE '"(content|reasoning_content)":"[^"]' | wc -l | tr -d ' ')
+    [ "${_qn:-0}" -gt 0 ] || { printf 'FAIL the queued chat carried no text chunk at all: a queue that ends in silence is the #911 shape'
+                               return 0; }
+    if [ -z "$_t0" ] || [ -z "$_t1" ]; then
+        printf 'PASS the second chat queued behind a 1000-token turn and answered (%s chunk(s), [DONE]); the kernel log was not readable, so no TDR was ruled out' "$_qn"
+        return 0
+    fi
+    [ "$_t1" -gt "$_t0" ] && { printf 'FAIL the NPU logged a TDR while the second chat queued (%s -> %s): see dmesg' "$_t0" "$_t1"
+                               return 0; }
+    printf 'PASS the second chat queued behind a 1000-token turn and answered (%s chunk(s), [DONE]), no TDR (still %s)' "$_qn" "$_t1"
+}
+
+# The same row's OTHER arm (engine#1024): a **non-streamed** request cannot be told it is queueing, so it must be
+# REFUSED at its own short bound (`--queue-ms-plain`, 5000 ms on the appliance) with `503 + Retry-After` - not parked
+# silently for the whole queue. Without this arm the row cannot see the path the fix's second half is about, because
+# both of its chats stream. Pure, so --self-test drives it: <long chat body> <status> <refusal body> <Retry-After>
+# <TDRs before> <TDRs after>.
+plain_queue_verdict() {
+    _p1=$1 _ps=$2 _pb=$3 _pr=$4 _t0=$5 _t1=$6
+    case "$_p1" in
+        *'data: '[[[]DONE]*) ;;
+        *) printf 'FAIL the long (1000-token) chat, which owns the device, came back without data: [DONE]: %.120s' "${_p1:-no body}"
+           return 0 ;;
+    esac
+    case "$_ps" in
+        503) ;;
+        000|'') printf 'FAIL the non-streamed chat got no HTTP status at all, so nothing can be said about its bound'
+                return 0 ;;
+        200) printf 'FAIL the non-streamed chat was ANSWERED while the device was still busy: the short bound did not apply'
+             return 0 ;;
+        *) printf 'FAIL the non-streamed chat answered %s, not the 503 + Retry-After a client can act on' "$_ps"
+           return 0 ;;
+    esac
+    case "$_pb" in
+        *device_busy*|*'the NPU is busy'*) ;;
+        *) printf 'FAIL the 503 did not say the device is busy, so a client cannot tell it from a broken model: %.120s' "${_pb:-empty body}"
+           return 0 ;;
+    esac
+    case "$_pr" in
+        ''|*[!0-9]*) printf 'FAIL the 503 carried no numeric Retry-After (got "%s"), so the refusal names no wait' "${_pr:-none}"
+                     return 0 ;;
+    esac
+    if [ -z "$_t0" ] || [ -z "$_t1" ]; then
+        printf 'PASS the non-streamed chat was refused at its short bound (503, Retry-After %s) instead of waiting silently; the kernel log was not readable, so no TDR was ruled out' "$_pr"
+        return 0
+    fi
+    [ "$_t1" -gt "$_t0" ] && { printf 'FAIL the NPU logged a TDR during the non-streamed arm (%s -> %s): see dmesg' "$_t0" "$_t1"
+                               return 0; }
+    printf 'PASS the non-streamed chat was refused at its short bound (503, Retry-After %s) instead of waiting silently, no TDR (still %s)' "$_pr" "$_t1"
+}
+
 # The first value of a JSON key - quoted or not, since usage counts are bare numbers - for the row's
 # small bodies (one line, one message: the same assumption chat() already makes).
 json_str() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\\1/p" | head -1; }
@@ -284,6 +469,74 @@ json_str() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0
 # as the web page does.
 json_text() { printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
+
+laya_class_model() {  # <class> -> the model the shipped table names for it
+    case "$1" in
+        short)    printf 'Qwen3-0.6B-1bit' ;;
+        prose)    printf 'ZAYA1-8B-1bit' ;;
+        code)     printf 'Qwen3-Coder-30B-A3B-Instruct-1bit' ;;
+        long_doc) printf 'Qwen3.8-27B-1bit' ;;
+        *)        printf '' ;;
+    esac
+}
+
+# The laya-auto row, decided from the router's own decision (docs/laya-first.md §7). Pure, so
+# --self-test drives it: <response body carrying x_lemonade_route> <class> <model>. All four have to
+# hold: the class's Laya rule matched, the request went to that class's model, the request did NOT fall
+# open to default_model, and Laya's score is in the trace. A request that landed on the right model by
+# accident - a deterministic rule, or the default - is a FAIL: the row exists to prove Laya decided.
+#
+# Spaces are stripped before matching because the decision is embedded JSON whose spacing is the
+# server's business; none of the field names or values matched here carry spaces.
+laya_verdict() {
+    _b=$(printf '%s' "${1:-}" | tr -d ' \n\r\t')
+    _cls=${2:-} _want=${3:-}
+    # A gate fails closed on input it cannot interpret: a class this script has no model for would
+    # otherwise skip both the class and the model check and PASS on shape alone (a row added without
+    # touching laya_class_model is exactly how that happens).
+    if [ -n "$_cls" ] && [ -z "$(laya_class_model "$_cls")" ]; then
+        printf 'FAIL no model is named for class %s in this script' "$_cls"; return
+    fi
+    printf '%s' "$_b" | grep -q '"matched_rule":"laya-' || {
+        printf 'FAIL no Laya rule matched the request'; return; }
+    _rule=$(printf '%s' "$_b" | sed -n 's/.*"matched_rule":"laya-\([^"]*\)".*/\1/p')
+    if [ -n "$_cls" ] && [ "$_rule" != "$_cls" ]; then
+        printf 'FAIL matched the %s rule, not the %s one' "$_rule" "$_cls"; return
+    fi
+    printf '%s' "$_b" | grep -q '"default_used":true' && {
+        printf 'FAIL fell open to default_model, so Laya did not decide'; return; }
+    printf '%s' "$_b" | grep -q '"condition":"classifier:laya"' || {
+        printf 'FAIL no Laya score in the trace'; return; }
+    if [ -n "$_want" ]; then
+        printf '%s' "$_b" | grep -q "\"route_to\":\"$_want\"" || {
+            printf 'FAIL routed to another model than %s' "$_want"; return; }
+    fi
+    printf 'PASS'
+}
+
+# The NPU must be held awake (owner decision 2026-11-05 23:4x ADT: "keep the npu awake on the stick"; this is c30's
+# `code 614` fix). The driver's runtime PM suspends the array between requests, and on the c29 take the request that
+# followed such a window died `npu runtime: invalid call (code 614): state 8, run 0 of 28` - the picture page's prompt
+# turn - and the fallback model wrote the prompt, so the client saw a clean answer and the demo lost the beat. The image
+# sets `power/control=on` with a udev rule plus an early-boot fallback (a module loaded before udev misses the rule), so
+# what this row reads is the state THIS boot has, not the intent of a rule file. `runtime_status` is asserted as well
+# because `control=on` alone can be set while the array is not running at all - two different faults, two different
+# messages. Pure, so --self-test drives it: <power/control> <runtime_status>
+npu_power_verdict() {
+    _c=$(printf '%s' "${1:-}" | tr -d ' \n\r\t') _s=$(printf '%s' "${2:-}" | tr -d ' \n\r\t')
+    if [ -z "$_c" ]; then
+        printf 'SKIP no power/control to read'; return 0
+    fi
+    if [ "$_c" != on ]; then
+        printf 'FAIL power/control=%s (runtime_status=%s): the array may runtime-suspend between requests, which is the state the demo'"'"'s prompt turn died in' "$_c" "${_s:-unreadable}"
+        return 0
+    fi
+    case "$_s" in
+        active) printf 'PASS power/control=on, runtime_status=active' ;;
+        '')     printf 'FAIL power/control=on but runtime_status is unreadable, so the array'"'"'s state is not proven' ;;
+        *)      printf 'FAIL power/control=on but runtime_status=%s: held awake and not running' "$_s" ;;
+    esac
+}
 
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
@@ -324,6 +577,15 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(followup_verdict '{"error":{"message":"no answer"}}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 0)"
     check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT"}}]}' 0 0)"
     check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' '' '')"
+    # c30 (owner decision 2026-11-05): the NPU's power state. The c29 take's shape is the second case - the array was
+    # allowed to suspend between requests, and the prompt turn that followed it came back `code 614`.
+    check PASS "$(npu_power_verdict on active)"
+    check FAIL "$(npu_power_verdict auto suspended)"                     # the c29 take's state
+    check FAIL "$(npu_power_verdict auto active)"                        # suspended as soon as the work stops
+    check FAIL "$(npu_power_verdict on suspended)"                       # held awake but not running
+    check FAIL "$(npu_power_verdict on '')"                              # status unreadable
+    check SKIP "$(npu_power_verdict '' 'active')"                        # not an NPU boot
+    check SKIP "$(npu_power_verdict '' '')"
     # engine #911 / c21 board: the streaming row. The board's own failure is the second case - the status was
     # 200, the body carried the error and the stream still closed with [DONE], so only the body can tell.
     check PASS "$(stream_verdict 'data: {"choices":[{"delta":{"content":"1BIT"}}]}
@@ -340,6 +602,32 @@ data: [DONE]' 0 1)"
 data: [DONE]' 0 0)"
     check PASS "$(stream_verdict 'data: {"choices":[{"delta":{"content":"1BIT OK"}}]}
 data: [DONE]' '' '')"
+    # engine #1024 / c23 board: the busy row. The board's shape is the second case - the refusal is an `error`
+    # frame inside a 200, so a row that looks at a status stays green on it.
+    check PASS "$(queue_verdict 'data: {"choices":[{"delta":{"content":"long"}}]}
+data: [DONE]' 'data: {"choices":[{"delta":{"content":""}}]}
+data: {"choices":[{"delta":{"content":"1BIT OK"}}]}
+data: [DONE]' 0 0)"
+    check FAIL "$(queue_verdict 'data: [DONE]' 'data: {"error":{"message":"the NPU is busy with another request"}}
+data: [DONE]' 0 0)"
+    check FAIL "$(queue_verdict 'data: [DONE]' 'data: {"choices":[{"delta":{"content":""}}]}
+data: [DONE]' 0 0)"                                                                                   # queued, then nothing
+    check FAIL "$(queue_verdict 'data: [DONE]' 'data: {"choices":[{"delta":{"content":"OK"}}]}' 0 0)"   # no [DONE]
+    check FAIL "$(queue_verdict 'data: [DONE]' '' 0 0)"                                                  # no body at all
+    check FAIL "$(queue_verdict 'data: [DONE]' 'data: {"choices":[{"delta":{"content":"OK"}}]}
+data: [DONE]' 0 1)"                                                                                    # a TDR while queueing
+    check PASS "$(queue_verdict 'data: [DONE]' 'data: {"choices":[{"delta":{"reasoning_content":"OK"}}]}
+data: [DONE]' '' '')"                                                                                  # dmesg unreadable
+    # engine #1024, the non-streamed arm: it cannot be told it is queueing, so a 503 + Retry-After at its own bound is
+    # the pass, and being *answered* while the device is busy is the failure (that would mean the bound did not apply).
+    check PASS "$(plain_queue_verdict 'data: [DONE]' 503 '{"error":{"message":"the NPU is busy with another request","type":"device_busy"}}' 1 0 0)"
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 200 '{"choices":[{"message":{"content":"OK"}}]}' '' 0 0)"
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 503 '{"error":{"message":"the NPU is busy with another request","type":"device_busy"}}' '' 0 0)"   # no Retry-After
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 503 '{"error":{"message":"model failed to load"}}' 1 0 0)"                                        # no device_busy
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 000 '' '' 0 0)"                                                                                   # nothing answered
+    check FAIL "$(plain_queue_verdict 'data: {"choices":[{"delta":{"content":"long"}}]}' 503 '{"type":"device_busy"}' 1 0 0)"                           # long chat cut
+    check FAIL "$(plain_queue_verdict 'data: [DONE]' 503 '{"type":"device_busy"}' 1 0 1)"                                                               # a TDR
+    check PASS "$(plain_queue_verdict 'data: [DONE]' 503 '{"type":"device_busy"}' 1 '' '')"                                                             # dmesg unreadable
     # the history that goes back into the request has to survive a JSON string
     jt=$(json_text 'a "quoted" \\ line
 next')
@@ -370,7 +658,37 @@ next')
     rm -f "$ST/set/manifest.json"
     st FAIL "a sealed set with no manifest at all" "$ST/set"
     rm -rf "$ST"
+    # docs/laya-first.md §7: the laya-auto row. The second case is the one a status-only row misses - the
+    # request answered 200 on default_model, which looks like a healthy route until you read the decision.
+    LV='{"x_lemonade_route":{"route_to":"Qwen3-Coder-30B-A3B-Instruct-1bit","matched_rule":"laya-code","default_used":false,"trace":[{"condition":"classifier:laya","label":"code","score":0.46}]}}'
+    check PASS "$(laya_verdict "$LV" code Qwen3-Coder-30B-A3B-Instruct-1bit)"
+    check PASS "$(laya_verdict "$LV" '' '')"
+    check FAIL "$(laya_verdict '{"x_lemonade_route":{"route_to":"Qwen3-0.6B-1bit","matched_rule":"laya-code","default_used":true,"trace":[{"condition":"classifier:laya","score":0.46}]}}' code Qwen3-0.6B-1bit)"   # fell open
+    check FAIL "$(laya_verdict '{"x_lemonade_route":{"route_to":"Qwen3-0.6B-1bit","matched_rule":"long-input","default_used":false,"trace":[]}}' code Qwen3-0.6B-1bit)"   # a deterministic rule decided
+    check FAIL "$(laya_verdict "$LV" prose '')"                                        # the wrong class's rule matched
+    check FAIL "$(laya_verdict "$LV" code Qwen3-0.6B-1bit)"                            # the wrong model
+    check FAIL "$(laya_verdict '{"x_lemonade_route":{"route_to":"m","matched_rule":"laya-code","default_used":false,"trace":[]}}' code m)"   # no Laya score
+    check 'FAIL no model is named for class not-a-class' "$(laya_verdict "$LV" not-a-class '')"   # an unmapped class must not skip the checks
+    check FAIL "$(laya_verdict '' code m)"                                             # nothing answered
+    # the row's class -> model mapping mirrors config/laya-first.json; assert it here so a table change is
+    # a red self-test rather than a row that checks agreement with a mapping nobody updated
+    map_check() {  # <class> <want model>
+        _got=$(laya_class_model "$1")
+        if [ "$_got" = "$2" ]; then printf 'ok   %s -> %s\n' "$1" "$_got"
+        else printf 'FAIL %s -> %s (want %s)\n' "$1" "$_got" "$2"; rc=1; fi
+    }
+    map_check short Qwen3-0.6B-1bit
+    map_check prose ZAYA1-8B-1bit
+    map_check code Qwen3-Coder-30B-A3B-Instruct-1bit
+    map_check long_doc Qwen3.8-27B-1bit
+    map_check not-a-class ''
+    # a body with the answer text in front of the decision still decides on the decision
+    check PASS "$(laya_verdict '{"choices":[{"message":{"content":"Here you go"}}],"x_lemonade_route":{"route_to":"m","matched_rule":"laya-prose","default_used":false,"trace":[{"condition":"classifier:laya","score":0.77}]}}' prose m)"
+
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
+    # A self-test is not a check run: without this the EXIT trap above appended "RESULT: FAIL (this check died
+    # before its footer)" to every green self-test, which reads exactly like the death the trap exists to report.
+    RC_FOOTER=1
     exit $rc
 fi
 
@@ -471,6 +789,37 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -e /lib/firmware/amdnpu/17f0_11 ]; 
     pass npu "$(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')and the NPU firmware present"
 else
     skip npu "no NPU in this VM: /dev/accel and /lib/firmware/amdnpu only appear on the machine"
+fi
+# The NPU's power state (owner decision 2026-11-05, c30's `code 614` fix - see npu_power_verdict above). The device is
+# matched on its PCI id `17f0` - the same XDNA2 device the image's own udev rule matches (`pci 1022:17f0`) and the same
+# one the firmware row above tests for - rather than on a hardcoded 0000:c6:00.1, so a different board's NPU answers the
+# same row and a machine with no NPU says so in the image's own words (04onboard-npu-keepawake prints "no XDNA2 NPU,
+# nothing to keep awake").
+NPUDIR=
+for ctl in /sys/bus/pci/devices/*/power/control; do
+    [ -e "$ctl" ] || continue
+    [ "$(cat "${ctl%/power/control}/device" 2>/dev/null)" = 0x17f0 ] && NPUDIR=${ctl%/power/control}
+done
+if [ -z "$NPUDIR" ]; then
+    skip npu-power "no XDNA2 NPU (PCI device id 0x17f0) in this boot: there is no power state to read"
+else
+    # A device the udev rule just resumed can take a moment to report `active`, and that race is not a fault: wait for
+    # it rather than red a boot for the driver's own workqueue. Ten seconds, then the row says what it sees.
+    _i=0
+    while :; do
+        _c=$(cat "$NPUDIR/power/control" 2>/dev/null)
+        _s=$(cat "$NPUDIR/power/runtime_status" 2>/dev/null)
+        [ "$_c" = on ] && [ "$_s" = active ] && break
+        _i=$((_i + 1))
+        [ "$_i" -lt 10 ] || break
+        sleep 1
+    done
+    VP=$(npu_power_verdict "$_c" "$_s")
+    case "$VP" in
+        PASS*) pass npu-power "the NPU is held awake ($(basename "$NPUDIR")): ${VP#PASS }" ;;
+        SKIP*) skip npu-power "${VP#SKIP }" ;;
+        *)     fail npu-power "$(basename "$NPUDIR") ${VP#FAIL }" ;;
+    esac
 fi
 
 # ── fans (EC fan curve; only a board we know has one we drive) ──────────────────────────────────
@@ -833,6 +1182,67 @@ else
     skip chat-npu-followup "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
+# ── the first request, decided by Laya (docs/laya-first.md §7) ───────────────────────────────────
+# A cold Lemonade loads no model; the first request must go through Laya's router, which classifies it
+# and picks one of OUR models. The row sends one prompt per class through the Laya-first router
+# (`1bit laya-first` emits that collection's policy) and reads the router's own decision back. What
+# makes it a row rather than a chat test: the decision has to say Laya decided - the class's own rule,
+# no fall-through to default_model, and Laya's score in the trace. A request that lands on the right
+# model by accident (a deterministic rule, or the default) fails laya_verdict, because the whole point
+# of the appliance's first request is who chose.
+#
+# The class -> model pairs below mirror config/laya-first.json. If the table changes, this row fails
+# loudly instead of quietly checking yesterday's promise; the engine's `1bit laya-first --check`
+# validates the table itself.
+# The router's name comes from the engine itself: `1bit laya-first` prints the collection Lemonade
+# registers (user.Laya-First in the shipped table). Hardcoding it here would break the row the day the
+# table's name changes - and a name is not a detail, the server only registers `user.*` definitions.
+LAYA_ROUTER=user.Laya-First
+LAYA_BIN=
+for _b in $(command -v 1bit 2>/dev/null) /opt/1bit-engine/1bit /opt/1bit/1bit /opt/1bit-package/bin/1bit; do
+    [ -x "$_b" ] && { LAYA_BIN=$_b; break; }
+done
+if [ -n "$LAYA_BIN" ]; then
+    _n=$("$LAYA_BIN" laya-first 2>/dev/null | sed -n 's/.*"model_name": *"\([^"]*\)".*/\1/p' | head -1)
+    [ -n "$_n" ] && LAYA_ROUTER=$_n
+fi
+if ! printf '%s' "${MODELS:-}" | grep -q "\"$LAYA_ROUTER\""; then
+    skip laya-auto "no $LAYA_ROUTER router is registered (it needs a Laya checkpoint - scripts/fetch-laya.sh - and the desugared policy registered: 1bit laya-first --policy FILE)"
+else
+    LAYA_FAILS=0
+    LAYA_SEEN=
+    # auth_post_watch, not auth_post: the latter spells its body as wget's `--post-data`, so on an image
+    # with curl but no wget it returns nothing and every post row reads as "no answer" (measured while
+    # exercising this row off the stick). This helper handles both fetchers and hands back the body.
+    LAYA_BODY=/tmp/1bit-laya-body.$$
+    : > "$LAYA_BODY"
+    laya_probe() {  # <class> <prompt>
+        _cls=$1
+        _want=$(laya_class_model "$_cls")
+        _body="{\"model\":\"$LAYA_ROUTER\",\"messages\":[{\"role\":\"user\",\"content\":$(json_text "$2" | sed 's/.*/"&"/')}],\"max_tokens\":16,\"temperature\":0,\"route_trace\":true}"
+        _st=$(auth_post_watch "$_body" "$API/api/v1/chat/completions" "$LAYA_BODY")
+        case "${_st%% *}" in
+            200) ;;
+            *)   printf '      %s: the router did not answer (status %s)\n' "$_cls" "${_st%% *}"
+                 LAYA_FAILS=$((LAYA_FAILS + 1)); return ;;
+        esac
+        _v=$(laya_verdict "$(cat "$LAYA_BODY" 2>/dev/null)" "$_cls" "$_want")
+        case "$_v" in
+            PASS) LAYA_SEEN="$LAYA_SEEN ${_cls}->${_want}";;
+            *)    printf '      %s: %s\n' "$_cls" "$_v"; LAYA_FAILS=$((LAYA_FAILS + 1));;
+        esac
+    }
+    # one prompt per class, each short enough to answer on a cold 0.6B and unmistakable to Laya
+    laya_probe short "Say hello in five words."
+    laya_probe prose "Summarise what tides are and why they happen, in two sentences."
+    laya_probe code "Write a Python function that reverses a linked list."
+    if [ "$LAYA_FAILS" = 0 ]; then
+        pass laya-auto "Laya decided all three:${LAYA_SEEN}"
+    else
+        fail laya-auto "$LAYA_FAILS of 3 classes were not decided by Laya (see the lines above)"
+    fi
+fi
+
 # ── NPU chat the way a person uses it: after a reload, streaming, thinking on (engine #911, c21 board) ──────
 # The board's green check proved nothing about the shape the release onebit page actually uses: the page
 # loads the model on demand (after this check's own rows evicted it), leaves thinking ON and streams the
@@ -910,6 +1320,75 @@ else
     skip chat-npu-ladder "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
+# ── NPU chat while the device is busy: two concurrent chats, both complete (engine#1024; c23 board, 4 Nov 2026) ──
+# The c23 board refused the owner's chat with `the NPU is busy with another request` because THIS check's own
+# 1000-token ladder row held the device for 14 s: the serve waited --queue-ms (5 s) and gave up. On a single-user
+# appliance the second request has to queue, so a streamed 16-token chat started 1 s into a streamed 1000-token one
+# must be ANSWERED, and the long one must stay whole. The refusal arrives inside a 200 on the stream path, so the
+# bodies are read (queue_verdict), not the statuses.
+if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    TDRQ0=$(tdr_count)
+    QDIR=$(mktemp -d /tmp/npu-queue.XXXXXX)
+    QLONG="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Write a long essay about the history of cartography, and about what map-making changed in how people understood the world.\"}],\"max_tokens\":1000,\"temperature\":0,\"stream\":true}"
+    QSHORT="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":16,\"temperature\":0,\"stream\":true}"
+    ( auth_post "$QLONG" "$API/api/v1/chat/completions" slow > "$QDIR/long.sse" 2>&1 ) &
+    QPID=$!
+    sleep 1
+    QSHORT_BODY=$(auth_post "$QSHORT" "$API/api/v1/chat/completions" slow)
+    wait "$QPID" 2>/dev/null
+    QLONG_BODY=$(cat "$QDIR/long.sse" 2>/dev/null)
+    TDRQ1=$(tdr_count)
+    # Name the arm that failed: the long chat is the one in the background, so a refusal or a cut there would otherwise
+    # be reported under the short one's name and cost a round trip on the board.
+    case "$QLONG_BODY" in
+        *'data: '[[[]DONE]*) VQ=$(queue_verdict "$QLONG_BODY" "$QSHORT_BODY" "$TDRQ0" "$TDRQ1") ;;
+        *) VQ="FAIL the long (1000-token) chat, which owns the device, came back without data: [DONE]: $(printf '%.120s' "${QLONG_BODY:-no body}")" ;;
+    esac
+    rm -rf "$QDIR"
+    case "$VQ" in
+        PASS*) pass chat-npu-queue "$NPU: $VQ" ;;
+        *)     fail chat-npu-queue "$NPU: $VQ" ;;
+    esac
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-queue "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+else
+    skip chat-npu-queue "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
+
+# ── NPU chat from a NON-STREAMED client while the device is busy (engine#1024; measured 4 Nov 2026) ────────────
+# A non-streamed request has no way to say "queueing": no chunk, no comment, no header - so a long wait would be the
+# #911 shape again (nothing on the wire while the client's own no-data timer runs out). The serve therefore keeps a
+# short bound for it (`--queue-ms-plain`, 5000 ms) and answers `503 + Retry-After: 1` with `type: device_busy`, which a
+# client can act on; Lemonade's agentic tool loop is exactly such a call site. This arm exists because
+# `chat-npu-queue`'s two chats both stream, so it cannot see this path at all.
+if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    TDRP0=$(tdr_count)
+    PDIR=$(mktemp -d /tmp/npu-queue-plain.XXXXXX)
+    PLONG="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Write a long essay about the history of cartography, and about what map-making changed in how people understood the world.\"}],\"max_tokens\":1000,\"temperature\":0,\"stream\":true}"
+    PSHORT="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":16,\"temperature\":0}"
+    ( auth_post "$PLONG" "$API/api/v1/chat/completions" slow > "$PDIR/long.sse" 2>&1 ) &
+    # NOT `PPID=$!`: PPID is a readonly bash builtin, so this line was a fatal error in the image's own shell (it
+    # printed "PPID: readonly variable" and exited 1, with no RESULT line - measured on the c27 board, and the row
+    # before this one had already passed). busybox ash does not have PPID readonly, which is why a shell that never
+    # ships the check could not catch it.
+    QPLPID=$!
+    sleep 1
+    PW=$(auth_post_watch "$PSHORT" "$API/api/v1/chat/completions" "$PDIR/short.json")
+    wait "$QPLPID" 2>/dev/null
+    PLONG_BODY=$(cat "$PDIR/long.sse" 2>/dev/null)
+    PSHORT_BODY=$(cat "$PDIR/short.json" 2>/dev/null)
+    TDRP1=$(tdr_count)
+    VP=$(plain_queue_verdict "$PLONG_BODY" "${PW%% *}" "$PSHORT_BODY" "${PW#* }" "$TDRP0" "$TDRP1")
+    rm -rf "$PDIR"
+    case "$VP" in
+        PASS*) pass chat-npu-queue-plain "$NPU: $VP" ;;
+        *)     fail chat-npu-queue-plain "$NPU: $VP" ;;
+    esac
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-queue-plain "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+else
+    skip chat-npu-queue-plain "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────
 BENCH=$LEMDIR/bin/lemonade
@@ -1022,6 +1501,11 @@ else
 fi
 
 say ""
+# The back-off leaves a trace: a run that only passed because the partition freed in time must say so, or the next
+# person reads a clean transcript and believes nothing was ever refused.
+NPU_WAITED=$(awk '{s += $1} END {print s + 0}' "$NPU_WAITFILE" 2>/dev/null)
+[ "${NPU_WAITED:-0}" -gt 0 ] 2>/dev/null && say "info  npu-wait : $NPU_WAITED s spent backing off on code 102 (a client had just released the partition; the window is ~2 s)"
+RC_FOOTER=1
 if [ "$FAILS" = 0 ]; then
     say "RESULT: PASS ($ROWS checks, no failures)"
     # Name only the rows that actually skipped. On the 2026-11-02 live boot four of these five PASSED on the board and

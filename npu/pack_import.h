@@ -134,7 +134,18 @@ TextArtifacts scan_text_artifacts(const std::string& pack_dir);
 
 struct Options {
     bool allow_incomplete = false;  // write what is representable and name the rest
+    // The device weight layout the container will declare (`q4nx_weight_layout`). Empty means the
+    // default row-major family, in which case the key is left out entirely -- as every container the
+    // importer has written before this option existed. "b8" is the one layout a bare flag can
+    // express: it needs no version and no sidecar image directory (see weight_layout_key).
+    std::string weight_layout;
 };
+
+// Why a layout name cannot be declared by `--weight-layout`, or "" when it can. Only "b8" and the
+// default "rm" qualify: t2s and pb16i also need `q4nx_weight_layout_version` and/or a sidecar image
+// directory (`q4nx_pb16i_dir`), which an import cannot invent, so offering them here would produce a
+// container that refuses to load.
+std::string weight_layout_refusal(const std::string& want);
 
 struct Report {
     std::string out_dir;
@@ -150,7 +161,9 @@ struct Report {
     bool selfcheck_reference = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
 
-    // Self-check 2: the written container, read back, against the pack's dequantised values.
+    // Self-check 2: the written container, read back, against the pack's dequantised values. With
+    // the fp32 q4_1f form (engine#1185) q4nx_rel and q4nx_max_abs are 0 and zero_exact_pct is 100:
+    // the bf16 floor described here before was the GGUF path's, not the import's.
     double q4nx_rel = 0, q4nx_max_abs = 0, zero_exact_pct = 0;
     long long codes_exact = 0, codes_total = 0;
 
@@ -161,13 +174,20 @@ struct Report {
     int64_t stride = 0, second_header = 0;
     std::string fconst_note;
     int norm_anchors_ok = 0, norm_anchors_total = 0;
+    // The final norm is the last tensor the .fconst tail carries. `final_norm_crosscheck` is only
+    // meaningful when both facts below hold, so they are reported separately rather than inferred from it:
+    // false means "no agreeing duplicate", which also covers "no duplicate to compare" and "the norm was
+    // refused", and those are different things to say about an import.
+    bool final_norm_imported = false;      // model.norm.weight was written into the container
+    bool prefill_tail_seen = false;        // a second copy was readable in the prefill .fconst
+    bool final_norm_crosscheck = false;    // ... and it is byte-identical to the Token_Token copy
 
     // Self-check 3: the attention tiles' own round trip. Decoding a shipped tile and re-encoding it has to
     // give the same 34,816 bytes back, every field at once (quants, zero points, scales and the writer's
     // bias slots) -- so it fails if any index, nibble order or field offset in decode_tile() is wrong.
     long long attn_tiles_ok = 0, attn_tiles_total = 0;
     int attn_projections = 0, attn_bias_tensors = 0;
-    double attn_zero_inexact_pct = 0;  // per-32-group zero points that are not bf16-exact in the container
+    double attn_zero_inexact_pct = 0;  // per-32-group parameters not stored exactly (0 with the fp32 form)
 
     // Self-check 4: the same round trip over the MLP section -- every 128-column gate/up unit and every
     // 64-column down_proj group decoded and re-encoded, which has to give the shipped bytes back.
@@ -260,7 +280,15 @@ Q4 q_from_tiles(const std::vector<TileW>& tiles);
 TileW gu_half(const TileW& group, bool up);
 
 // Q4NX q4_1 tiles of a Q4 tensor: [N/32 * K/256, 5120] bytes, plus the parameters
-// that were not exactly representable in bf16 (counted, not fixed up).
+// that were not exactly representable in bf16 (counted, not fixed up). This is the form every
+// GGUF-derived container holds (npu/q4nx.h q4_1), and the one the device streams.
 void tile_q4_1(const Q4& q, std::vector<uint8_t>& out, long long* zero_inexact = nullptr);
+
+// The same grid in the imported container's fp32 form: [N/32 * K/256, 6144] bytes (npu/q4nx.h
+// q4_1f). Scale and zero are stored as f32, so the pack's own values survive bit for bit -- the
+// difference engine#1185 is about: an OGA pack's zero is -zp*scale, an arbitrary f32, and the
+// 5120-byte form rounded it (2.7-3.3e-3 relative on ~57 % of groups). `param_inexact` counts the
+// groups whose stored bytes are not the source float; it is 0 unless the writer is wrong.
+void tile_q4_1_f32(const Q4& q, std::vector<uint8_t>& out, long long* param_inexact = nullptr);
 
 }  // namespace onebit::npu::pack_import

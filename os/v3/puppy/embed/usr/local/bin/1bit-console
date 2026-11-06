@@ -37,6 +37,21 @@ fi
 if ! grep -q 'pfix=[^ ]*nox' /proc/cmdline 2> /dev/null; then
     exec /bin/plogin
 fi
+# Cycle 26, item 1: nothing else may write to tty1 while the console owns it. The boot line has no `loglevel=`,
+# so console_loglevel is 7 - every kernel message prints to tty0, and tty0 IS this screen. Measured on the c25 take:
+# the 04:52 NPU TDR printed 15 err + 5 warn lines (aie2_legacy_tdr_detect, then ~18 `*ERROR* aie2_set_cmd_timeout:`
+# firmware-report lines through 08:52:09Z) straight over the TUI. Quieter *console* does not lose the evidence: the
+# ring is 32 MB (log_buf_len=32M) and /data/logs/dmesg.log copies it, so `dmesg` and 1bit-proof keep every line.
+# Set before the TUI starts, not in the boot line, because the kernel's own boot transcript on both consoles is
+# what g2-probe reads; this only silences printk once a person-facing screen is up.
+#
+# This alone was NOT enough, and the gate caught it (`U2 console quiet` came back `console-loglevel=4`): Ubuntu's base
+# ships /usr/lib/sysctl.d/55-console-messages.conf with `kernel.printk = 4 4 1 7`, Puppy's rc.sysinit calls
+# `sysctl --system` late in boot, and it landed AFTER this line - so the level was 7 at t=44 s and 4 from t=50 s on,
+# which still prints KERN_ERR, i.e. exactly the TDR lines this item exists for. The fix is the drop-in beside this
+# script (embed/etc/sysctl.d/60-1bit-console.conf, measured to win: `sysctl --system` then ends `1 4 1 7`). Both are
+# kept: the drop-in wins whenever rc.sysinit runs, and this line covers the other order and re-asserts afterwards.
+dmesg -n 1 2> /dev/null || true
 # Cycle 18 (pi-tui, ~/briefs/TCONSOLE-TUI.md): the full-screen TUI is the console when the image has one. It does
 # not exit on `q` on purpose (a console that drops to a bare prompt is the cycle-13 defect), so BOTH a zero exit and
 # a non-zero one mean the same thing here: something went wrong or a person quit the screen, and the dialog menu is

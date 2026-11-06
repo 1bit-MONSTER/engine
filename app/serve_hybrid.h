@@ -74,6 +74,8 @@ struct Outcome {
     double prefill_ms = 0;      // the provider's own figure when it gave one, else wall time
     double restore_ms = 0;      // file route: the restore; shared route: the adopt
     double share_ms = 0;        // shared route: export + fd handoff, before the provider runs
+    bool decoder_cannot_share = false;  // the export/adopt handshake failed before the provider ran, so the
+                                        // state-file route is still available and correct
     std::string why;            // when not handed over: the reason, for one stderr line
 };
 
@@ -81,6 +83,8 @@ struct Outcome {
 struct Run {
     int code = -1;
     std::string out;
+    bool hard_kill = false;  // the grace window after SIGTERM expired and the provider had to be killed
+    bool signalled = false;  // it was SIGTERMed at its deadline and still exited 0: the work landed, late
 };
 
 inline Run run_provider(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int timeout_s) {
@@ -109,9 +113,18 @@ inline Run run_provider(const std::vector<std::string>& argv, const std::vector<
         ::_exit(127);
     }
     ::close(out[1]);
-    // read stdout to its end (the provider's exit closes it), then reap, with the timeout on the whole
+    // Read stdout to its end (the provider's exit closes it), then reap, with the timeout on the whole. The stop is
+    // two-stage: SIGTERM at the deadline, SIGKILL only after a grace window of its own. The grace is not politeness:
+    // an NPU provider tears down by releasing its BOs and destroying the hardware context, and killing it inside
+    // that window is the path that crashed this box on 2026-11-04 01:48 (~/briefs/NPU-LANE-RULE-20261104.md
+    // section 4 asks for >= 20 s). ONEBIT_HYBRID_PREFILL_GRACE_S sets the window (default 60 s); 0 asks for the
+    // old immediate kill. The clock is checked on every pass, not only when the provider is silent: a provider
+    // that prints forever is exactly the one that must not be able to outlive its budget.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_s);
+    int grace_s = 60;
+    if (const char* g = std::getenv("ONEBIT_HYBRID_PREFILL_GRACE_S"); g && *g) grace_s = std::max(0, std::atoi(g));
     bool killed = false;
+    std::chrono::steady_clock::time_point term_at{};
     char buf[4096];
     for (;;) {
         fd_set fds;
@@ -124,19 +137,30 @@ inline Run run_provider(const std::vector<std::string>& argv, const std::vector<
             if (n < 0 && errno == EINTR) continue;
             if (n <= 0) break;
             r.out.append(buf, size_t(n));
-            continue;
         }
-        if (std::chrono::steady_clock::now() > deadline) {
-            ::kill(pid, killed ? SIGKILL : SIGTERM);
-            if (killed) break;
+        const auto now = std::chrono::steady_clock::now();
+        if (!killed && now > deadline) {
+            ::kill(pid, SIGTERM);
+            term_at = now;
             killed = true;
+        } else if (killed && (grace_s == 0 || now > term_at + std::chrono::seconds(grace_s))) {
+            ::kill(pid, SIGKILL);
+            r.hard_kill = true;
+            break;
         }
     }
     ::close(out[0]);
     int status = 0;
     while (::waitpid(pid, &status, 0) < 0)
         if (errno != EINTR) break;
-    r.code = killed ? -2 : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    // The deadline starts a teardown, it is not a verdict on the work: a provider that took its SIGTERM and then
+    // finished (its state file or its region written, exit 0) has done what the handoff needed, and discarding it
+    // would charge the request for the provider's prefill *and* the backend's re-processing of the whole prompt.
+    // What lands is still validated by the callers (n_tokens in its JSON line, n_restored in the restore reply), so
+    // a provider that exits 0 with half its work done falls back there rather than being trusted here.
+    const bool exited_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    r.signalled = killed && exited_ok;
+    r.code = killed ? (exited_ok ? 0 : -2) : (WIFEXITED(status) ? WEXITSTATUS(status) : -1);
     return r;
 #endif
 }
@@ -303,7 +327,16 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
                 body["id_slot"] = 0;
                 body["cache_prompt"] = true;
             }
-            return shared;
+            // A decoder that cannot export its cache (a params or model mismatch, or a decoder pinned before
+            // the recurrent-state arm: docs/hybrid.md) leaves the shared route with nothing to hand over.
+            // Falling back to the state file keeps the prompt off the decoder's own prefill path, which is
+            // the whole reason this route exists; only the handshake failures fall back, never a provider
+            // that already wrote into the region or an adopt that failed after it.
+            if (shared.handed_over || !shared.decoder_cannot_share) return shared;
+            std::fprintf(stderr, "1bit serve: hybrid: %s; this decoder cannot share its KV, so the state-file route is used\n",
+                         shared.why.c_str());
+            o = Outcome{};
+            o.n_tokens = ids.size();
         }
         const unsigned n = ++seq_;
         const std::string stem = "hybrid-" + std::to_string(n);
@@ -319,15 +352,19 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
         const auto t0 = std::chrono::steady_clock::now();
         const Run run = run_provider(argv, {"ONEBIT_HYBRID_BACKEND_URL=http://127.0.0.1:" + std::to_string(port)}, timeout_s_);
         o.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        // said only when it happens, and only on a fallback: a provider that finished after its deadline is a
+        // slow provider, not a broken one, and the operator needs to be able to tell the two apart
+        const std::string late = run.signalled ? " (it was signalled at its " + std::to_string(timeout_s_) + " s deadline and still exited 0)" : "";
         std::error_code ec;
         std::filesystem::remove(tokens, ec);
         if (run.code != 0) {
-            o.why = run.code == -2 ? "provider timed out after " + std::to_string(timeout_s_) + " s"
+            o.why = run.code == -2 ? "provider timed out after " + std::to_string(timeout_s_) + " s" +
+                                         (run.hard_kill ? " and had to be killed" : " and stopped on SIGTERM")
                                    : "provider exited " + std::to_string(run.code);
             std::filesystem::remove(state, ec);
             return o;
         }
-        if (!std::filesystem::exists(state)) { o.why = "provider wrote no state file"; return o; }
+        if (!std::filesystem::exists(state)) { o.why = "provider wrote no state file" + late; return o; }
         // the provider's own figures, from its last stdout line
         try {
             std::string last = run.out;
@@ -336,7 +373,7 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
             const json j = json::parse(last);
             if (j.contains("prefill_ms") && j["prefill_ms"].is_number()) o.prefill_ms = j["prefill_ms"].get<double>();
             if (j.contains("n_tokens") && j["n_tokens"].is_number_integer() && j["n_tokens"].get<size_t>() != head.size()) {
-                o.why = "provider prefilled " + std::to_string(j["n_tokens"].get<size_t>()) + " of " + std::to_string(head.size()) + " tokens";
+                o.why = "provider prefilled " + std::to_string(j["n_tokens"].get<size_t>()) + " of " + std::to_string(head.size()) + " tokens" + late;
                 std::filesystem::remove(state, ec);
                 return o;
             }
@@ -391,7 +428,7 @@ private:
         // 1. listen, so the decoder has somewhere to hand the fds; 2. it exports and connects
         std::string why;
         const int lfd = kvshare_listen(sockpath.string(), &why);
-        if (lfd < 0) { o.why = "kv share: " + why; return o; }
+        if (lfd < 0) { o.decoder_cannot_share = true; o.why = "kv share: " + why; return o; }
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(600);
         const auto t0 = std::chrono::steady_clock::now();
@@ -401,6 +438,7 @@ private:
             std::error_code ec;
             std::filesystem::remove(tokens, ec);
             std::filesystem::remove(sockpath, ec);
+            o.decoder_cannot_share = true;
             o.why = "share answered " + std::to_string(r ? r->status : -1) + (r ? ": " + r->body.substr(0, 200) : "");
             return o;
         }
@@ -413,6 +451,7 @@ private:
             std::error_code ec;
             std::filesystem::remove(tokens, ec);
             std::filesystem::remove(sockpath, ec);
+            o.decoder_cannot_share = true;
             o.why = "share reply has no share_id";
             return o;
         }
@@ -444,12 +483,34 @@ private:
         const auto t1 = std::chrono::steady_clock::now();
         const Run run = run_provider(argv, {"ONEBIT_HYBRID_BACKEND_URL=http://127.0.0.1:" + std::to_string(port)}, timeout_s_);
         o.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        const std::string late = run.signalled ? " (it was signalled at its " + std::to_string(timeout_s_) + " s deadline and still exited 0)" : "";
         std::filesystem::remove(tokens, ec);
         std::filesystem::remove(layout, ec);
         if (run.code != 0) {
-            o.why = run.code == -2 ? "provider timed out after " + std::to_string(timeout_s_) + " s"
+            o.why = run.code == -2 ? "provider timed out after " + std::to_string(timeout_s_) + " s" +
+                                         (run.hard_kill ? " and had to be killed" : " and stopped on SIGTERM")
                                    : "provider exited " + std::to_string(run.code);
             return o;
+        }
+        // The provider's own figure, when it gave one. The adopt below takes ids.size() cells whatever happened, so
+        // this line is the only check that the region holds the whole prompt -- the same cross-check the file route
+        // makes on the state file (engine#941). A provider that wrote fewer rows would otherwise hand the decoder a
+        // prefix it never computed. No JSON line is not an error: on this route, like on the file route, the region is
+        // the result.
+        try {
+            std::string last = run.out;
+            while (!last.empty() && (last.back() == '\n' || last.back() == '\r')) last.pop_back();
+            if (const size_t nl = last.rfind('\n'); nl != std::string::npos) last = last.substr(nl + 1);
+            const json j = json::parse(last);
+            if (j.contains("n_tokens") && j["n_tokens"].is_number_integer() &&
+                    j["n_tokens"].get<size_t>() != ids.size()) {
+                o.why = "provider prefilled " + std::to_string(j["n_tokens"].get<size_t>()) + " of " +
+                        std::to_string(ids.size()) + " tokens into the shared region" + late;
+                return o;
+            }
+            if (j.contains("prefill_ms") && j["prefill_ms"].is_number()) o.prefill_ms = j["prefill_ms"].get<double>();
+        } catch (const std::exception&) {
+            // no JSON line: the region is the result
         }
 
         // 4. the decoder takes the cells over: no file, no copy (llama_kv_cells_adopt)
@@ -458,14 +519,14 @@ private:
         auto ra = c.Post("/slots/0?action=adopt", adopt.dump(), "application/json");
         o.restore_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
         if (!ra || ra->status != 200) {
-            o.why = "adopt answered " + std::to_string(ra ? ra->status : -1) + (ra ? ": " + ra->body.substr(0, 200) : "");
+            o.why = "adopt answered " + std::to_string(ra ? ra->status : -1) + (ra ? ": " + ra->body.substr(0, 200) : "") + late;
             return o;
         }
         try {
             const json j = json::parse(ra->body);
             const size_t adopted = j.value("n_adopted", size_t(0));
             if (adopted != ids.size()) {
-                o.why = "adopt took " + std::to_string(adopted) + " of " + std::to_string(ids.size()) + " cells";
+                o.why = "adopt took " + std::to_string(adopted) + " of " + std::to_string(ids.size()) + " cells" + late;
                 return o;
             }
             if (j.contains("timings") && j["timings"].contains("adopt_ms")) o.restore_ms = j["timings"]["adopt_ms"].get<double>();

@@ -1,12 +1,12 @@
-1bit OS rc-2026-11-03-c16 strix  192.168.50.110  up 2h 13m  Secure Boot enabled
+1bit OS LIVE rc-2026-11-03-c16 strix  192.168.50.110  up 2h 13m
  CONNECT -----------------------------------------------------------------------
   web UI http://192.168.50.110:13305
   name http://1bit-os.local:13305   (mDNS - avahi not running)
   api  http://192.168.50.110:13305/api/v1   (API key: press 1)
   ssh  root@192.168.50.110   (your key in /data/ssh/authorized_keys)
   app  Lemonade Mobile: server http://192.168.50.110:13305 + that key
-LEMONADE up 8882 | GPU HRX0 43C | NPU idle | MODELS 2 | FANS controlled
-  DATA 52G free | 331 tok/s
+LEMONADE up 8882 engine: llamacpp (gpu) | GPU HRX0 43C | NPU idle | MODELS 2
+  FANS controlled | DATA 52G free | 331 tok/s
  MENU --------------------------------------------------------------------------
 1 Show the API key
 2 Quick chat test (GPU and NPU)

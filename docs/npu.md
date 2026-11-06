@@ -32,6 +32,31 @@ and decrypts in memory at load (a wrong key fails cleanly, and nothing phones ho
 build and method are not in this repository or in any release. This page covers the public parts:
 the model format, how `1bit serve` runs an NPU model, and how to build.
 
+## What works today
+
+On Linux with the `amdxdna` kernel driver loaded, the engine serves Qwen3-0.6B on the XDNA 2 NPU at
+**88.6 tok/s** in the release gate, and it takes a GGUF directly: `1bit serve -m <model.gguf> --device npu`
+repacks it to the Q4NX directory this page describes and runs six architectures. Everything on the
+NPU is in progress — correctness first, speed next — so the iGPU through [HRX](hrx.md) remains the
+route for anything the NPU does not run, and `--device hybrid` puts one request's prompt on one
+device and its tokens on the other ([hybrid.md](hybrid.md)).
+
+## How to try it
+
+On a machine whose kernel has `amdxdna` (the [1bit OS](os-v3.md) appliance ships one):
+
+```bash
+1bit serve -m <NPU model dir> --device npu --alias npu      # a Q4NX model directory
+1bit serve -m <model.gguf> --device npu --alias npu         # or a GGUF, repacked on load
+```
+
+Then it is the same OpenAI-compatible API as every other route ([serve.md](serve.md)):
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"npu","messages":[{"role":"user","content":"Hello"}]}'
+```
+
 ## A model directory
 
 ```
@@ -51,6 +76,8 @@ the model format, how `1bit serve` runs an NPU model, and how to build.
 A model directory may carry a **plan.json**: the decisions the runtime used to make by looking at which
 files happened to be in `--kernels`. Three of them, and each one used to be silent:
 
+The schema, the refusal rules and the generator flags are in [npu-plan.md](npu-plan.md).
+
 | decision | what the probe used to do |
 |---|---|
 | `fusion.gate_up` (`fused`/`split`) | the fused `full_i8_GU_*` kernel won, and with no split kernel on disk the split layout was assumed |
@@ -62,8 +89,18 @@ roles from `layer_types` and projection shapes from the model's own dimensions, 
 `--check` re-generates and diffs against the file on disk, so a stale plan is a gate failure rather than a
 wrong number; `--print` shows it without writing.
 
+`container.tile_order` is the fourth decision written down, and it is the one that cannot be probed at all:
+it names the q4_1 tile order the payload is in (`engine-1`, what this repo's converter writes). A container
+from another converter can be a **different order**, and a wrong order decodes as noise *with no error
+anywhere* — every structural check passes (same tensor names, dtypes, byte counts, chunk kinds), the container
+loads, and the model simply answers badly (measured: one FLM converter checkout's containers answer the same
+token five times where ours answer " Paris."). Absent means `engine-1`, so every container written before the
+field existed keeps loading; an id this decoder does not implement is a refusal naming it, because the
+alternative is to guess a tile order at the one point where a guess is silent.
+
 The forward reads the plan with `npu/plan/plan.h` and **refuses by name** anything it cannot honour — a
-`kernels.tag` that disagrees with the container, a sealed ELF named outside the pb16i family, a decode dir
+`container.tile_order` other than `engine-1`, a `kernels.tag` that disagrees with the container, a sealed ELF
+named outside the pb16i family, a decode dir
 that is absolute or contains `..`, a layer count that disagrees with `layers[]`, or a kernel the plan names
 that is not in the directory (`forward init failed: plan <path>: this model's plan needs the QKV kernel
 "full_i8_QKV_K1024_N4096.elf" in <dir> (missing)`). A model directory **without** a plan keeps the probes,
@@ -126,15 +163,28 @@ guessed mask is a different model.
 Q4NX is [FastFlowLM](https://github.com/ROCm/FastFlowLM)'s NPU model format (MIT), and its models on
 Hugging Face (`FastFlowLM/*-NPU2`) are Q4NX directories. A Q4NX weight is a grid of 32-row x
 256-column tiles, one chunk each, row-major over the grid. The chunk kind is the last dimension of
-the tensor's shape: `[tiles, 5120]`, or `[tile rows, tile cols, chunk bytes]` (`npu/q4nx.h` has the
-byte layouts).
+the tensor's shape: `[tiles, <chunk bytes>]` (5120, 6144, 4736 or 8704), or `[tile rows, tile cols,
+chunk bytes]` (`npu/q4nx.h` has the byte layouts).
 
 | Chunk | Kind | Weight | Seen in |
 |---|---|---|---|
 | 5120 B | q4_1: bf16 scale and zero per 32 columns of a row | `code * scale + zero` | Qwen3, Llama, Gemma, Phi models |
+| 6144 B | q4_1f: **fp32** scale and zero per 32 columns of a row (imported containers, below) | `code * scale + zero` | `1bit npu-pack import` output |
 | 4736 B | Q4_K: u8 scale and min per 32 columns, bf16 `S`, `M` per row | `S * scale * code + M * min` | Qwen3.5-4B projections |
 | 8704 B | Q8: bf16 scale per 32 columns, int8 codes | `d * code` | Qwen3.5-4B `lm_head` and embedding |
 | 2176 B | **t2**: 2-bit ternary codes, one fp16 scale per 128 columns of a row | `code * scale` | ternary models (Bonsai-2, PTQ1_0/TQ1_0 sources) |
+
+The two q4_1 forms are a container property, named by the container's `layout` metadata
+(`__metadata__.layout` in `model.q4nx`, `q4nx_source.layout` in `config.json`): absent or
+`q4nx-1` is the bf16 form every container written before engine#1185 has, and every GGUF-derived
+one (the bf16 choice came from that path); `q4nx-2` is the fp32 form `1bit npu-pack import` writes,
+so an OGA pack's own scale and zero survive bit for bit. A decoder keys off the chunk's own last
+dimension either way, so a container with no metadata still loads; `q4nx::params_of_layout()` is for
+the caller that has to state the fidelity it holds, and the forward converts such a container at
+load: `npu/q4nx_device.cpp` repacks every fp32 tensor through `q4nx::as_q4_1()` into the Q4NX
+cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader that copy, so the
+device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
+the bf16 rounding reappears for the device, never in the container.
 
 **Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
 embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors
@@ -144,8 +194,9 @@ apart. Decoding tile (0, 0) of each lm_head and comparing with a GGUF of the sam
 gives correlation 0.9998 with the right layout and about 0.01 with the other. `npu/q4nx`
 decodes the first layout.
 
-`npu/q4nx.h` decodes all four, and repacks Q4_K into q4_1 (exact apart from rounding
-`S * scale` and `M * min` to bf16), so code that reads q4_1 runs Q4_K weights unchanged. Q8 does
+`npu/q4nx.h` decodes all five (the two q4_1 parameter forms included), and repacks Q4_K into q4_1
+(exact apart from rounding `S * scale` and `M * min` to bf16), so code that reads q4_1 runs Q4_K
+weights unchanged. Q8 does
 not fit q4_1, and neither does t2 (per-128 fp16 scale against q4_1's per-32 bf16 one): a t2 tensor
 is expanded on the target, never repacked. `tests/npu_q4nx_test.cpp` checks the decoders bit for bit
 against reference decoders on real Qwen3.5-4B and Qwen3-0.6B tiles (committed in
@@ -342,7 +393,40 @@ because otherwise the second half reads from cache and the difference looks like
 **2.16 GB/s**, so 6.82 GB is **3.2 s** of device time the loader cannot avoid; with a warm page cache
 the same fill is 0.47 s. A first request on a fresh serve therefore costs one fill (0.5 s warm, ~3.2 s
 cold) on top of its prefill, and every request after it on the same serve costs none. Do not read a
-per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments.
+per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments, and
+`[bs]` is the same partition for one batched pass (a verify batch), whose interior a per-token line cannot see.
+`NPU_COPY_PROF=1` adds a `[cp]` line to both: the **bytes and milliseconds the host moves at its own copy
+sites** (`qkv_split`, `attn_gate`, `ctx_row`), one figure per site and a `KiB/row` total for a batched pass.
+The phase lines above attribute device time only, so a host row copy lands in their `host=` residual with
+nothing to separate it; `[cp]` is the line that says how much is left to remove rather than time it as part of
+the layer's wall. The MLP row copies this line first counted (`mlp_in`, `mlp_out` — 12.75 MiB of a 15.38 MiB
+prefill row) are gone: the batched pass now runs `mlp()` on the ACT row and into the HH row in place.
+
+The counters are per **process**, single writer, like `[ph]`: a serve enters `step()`/`step_batch()` under
+its engine mutex (`app/forward_serve.cpp:258`, `:698`), so one pass is in flight, and `--npu-streams N` is
+N processes sharing the device by flock (`app/npu_device_lock.h`), each counting its own. A caller that
+parallelised the layer loop would need per-pass counters instead.
+
+### From a 1BP package
+
+`tools/onebp_import.py <model.1bp> <out dir> --config <snapshot dir>` imports a legacy `.1bp` package
+(one file: a 256-byte header, a tensor index, the weights). Its 4-bit payload is a 32 x 256 tile of 5120 B
+with this engine's value convention (`scale*q + min`), but **not** its intra-tile layout: `.1bp` stores
+the scales/mins row-major (`[r*8+g]`) and the codes adjacent-pair (even column low), while `npu/q4nx.h`
+stores them group-major (`[g*32+r]`) and lane-swizzled. The import permutes each tile's bytes — the
+inverse of the archived converter's own `q4nx_tile_to_onebp()` — and dequantizes and re-quantizes nothing;
+`F16`/`F32` tensors become bf16. `--verify` proves it by comparing every byte the container holds against
+the same permutation of the package's slice (and against the GGUF behind any tensor that came from
+`--embedding-from`). Reading a `.1bp` tile as if it were already this engine's tile is not a near miss:
+on `ZR1-1.5B-1BP` the decoded weights then correlate 0.003 with the model — fluent noise that still looks
+like weights, the failure mode of [engine#1110](https://github.com/1bit-MONSTER/engine/issues/1110) —
+and 0.995-0.997 after the permutation. A v1 package carries no `token_embd`/`lm_head`, so importing one needs
+`--embedding-from <gguf>` (and `--verify` of it takes the same flag: it rebuilds the same plan); the tool stops
+rather than write a container that cannot answer. Any tensor
+with no Q4NX mapping is refused **by name** (`no Q4NX name for blk.0.cca_conv_grp.weight`) instead of
+guessed: Zaya1's grouped conv, EDA router and fused `ffn_gate_up_exps` have no op in `npu/forward` yet,
+so a package of that architecture is not importable — see `~/briefs/ZAYA-OPFAMILY-NOTE.md` for the op
+list and its cost.
 
 ### From a GGUF
 
@@ -361,6 +445,17 @@ whose `tokenizer_config.json` sets `add_bos_token: true` — Zyphra/ZR1-1.5B, a 
 is otherwise served a chat prompt with no BOS: measured on ZR1-1.5B, the forward built a
 5-token prompt where llama.cpp built 6, and the reply opened with the end-of-turn token.
 `tools/safetensors_to_q4nx.py` carries the same two keys from `tokenizer_config.json`.
+
+**A GGUF that declares a RoPE scaling block is refused.** This route has no scaling rule — the
+packed lane computes `theta^(-i/half)` and nothing else — and a container written from a scaled
+GGUF would carry `rope_theta` alone, be served plain RoPE, stay fluent and be wrong past the
+model's original window, with nothing in any log to say so ([engine#1087](https://github.com/1bit-MONSTER/engine/issues/1087)).
+So `pack` exits non-zero naming the type (`*.rope.scaling.type` = `yarn`/`linear`/`longrope`/…)
+before it creates the output directory. Two rules *are* implemented and are accepted on the
+forward route, which reads the block from `config.json`: `rope_type: "llama3"`
+(Llama-3.1/3.2/3.3) and LongRoPE's `short_factor` (MiniCPM4). The same refusal covers a
+declared-but-unusable `llama3` block, and every other declared type, at `1bit serve` /
+`forward-serve` load time rather than at request time.
 
 | GGUF type | To q4_1 | Error |
 |---|---|---|
@@ -436,12 +531,15 @@ a kernel with the **expert ids held fixed** (A row + the router's own top-k + th
 expert, which is what `tools/moe_expert_chunks.py gate` emits), so the gate measures the kernel and
 not the model's own sensitivity. `verify` result: see the TMOE-NPU lane's state file.
 
-**A chunk-list dispatch shares ONE A across its chunks: exact for gate and up, impossible for down.**
-At batch 1 every selected expert of a layer sees the same activation row, so gate and up are one
-dispatch each — but `down_proj`'s input is each expert's own SwiGLU output, so it needs a per-chunk A
-or one dispatch per expert. On this model (48 layers; per layer q, gate, k, v, o in the pb16i split,
-then gate|up|down) that is **385 dispatches per token with the shared A and 721 without**, and that
-gap decides whether the case meets its own bar:
+**A chunk-list dispatch shares ONE A across its chunks: exact for gate and up, and reachable for down
+by row placement.** At batch 1 every selected expert of a layer sees the same activation row, so gate
+and up are one dispatch each. `down_proj`'s input is each expert's own SwiGLU output — but `A` is an
+`M`-row int8 buffer and the output is `M` rows per chunk, so with expert `j`'s row in row `j` of `A`
+(rows 8-15 zeroed) and `NCH=8`, chunk `j` carries that expert's answer in row `j`: a flag, not a new
+signature (the 10-BO dispatch and the `WIN = 3` per-channel ordering are unverified on the array).
+On this model (48 layers; per layer q, gate, k, v, o in the pb16i split, then gate|up|down) that is
+**385 dispatches per token**, against 721 if down cannot share one — and, two paragraphs down, the
+dispatch *rate* rather than the dispatch *shape* is what decides whether the case meets its own bar:
 
 | per-dispatch fixed cost | down shares one A | down per expert | Qwen3-4B dense, same arithmetic |
 |---|---|---|---|
@@ -451,10 +549,32 @@ gap decides whether the case meets its own bar:
 That is at 34 GB/s in-loop over a **1,703,854,080 B/token** stream — routed experts 1,019,215,872
 (8 of 128 x 3 projections, pb16 NW=16) + attention 509,607,936 + `lm_head` 175,030,272, with
 `--pad-n 1024` on gate/up taking it to 1,930,346,496 — and the ratio holds across 34-43.4 GB/s:
-**0.97-1.06x the 4B-dense bar when down shares the dispatch, 0.68-0.80x when it cannot.** So the
-deciding term is the down_proj A shape, not the expert stream: sizing a MoE case on the expert
-bytes alone understates the stream by 40 % (they are 60 % of it) and misses the term that decides
-it.
+**0.97-1.06x the 4B-dense bar when down shares the dispatch, 0.68-0.80x when it cannot.** So sizing
+a MoE case on the expert bytes alone understates the stream by 40 % (they are 60 % of it) and misses
+a term that matters — but it is not the term that decides the case. That is the dispatch *rate*:
+
+**Which submission path runs the loop decides the answer, and the bar pays the same term.** The
+0.086 ms in that table is a *marginal* cost inside one command list, measured on the arena player. An engine
+decode step submits one ELF per `npu_gemm`, and that per-invocation cost has since been measured on
+this box in the engine's own `npu/forward` route: the T1BP-ZYPHRA lane's device arm (M=16 family,
+112 launches/token, 95.0 % of the token spent waiting on the array) fits **2.8 / 3.7 / 5.91 ms** per
+invocation from three independent pairs (2026-11-04 20:1x-20:27). Pricing this model and the
+4B-dense bar on the *same* path — 385 and 253 dispatches/token, same 34 GB/s, same host terms:
+
+| per-dispatch fixed cost | this MoE | Qwen3-4B dense, same path | ratio |
+|---|---|---|---|
+| 0.086 ms (arena player) | **11.05 tok/s** | 10.45 | **1.06x** |
+| 2.8 ms (engine, driver-delta fit) | 0.88 | 1.28 | 0.69x |
+| 3.7 ms (engine, two-point fit) | 0.67 | 0.99 | 0.68x |
+| 5.91 ms (engine, launch-cost fit) | 0.43 | 0.64 | 0.67x |
+
+Setting the two expressions equal puts the **break-even at 0.126 ms per dispatch**: below it the MoE
+meets and beats the bar, above it it loses by ~1.45x and stays there, because 385 submissions against
+253 (1.52x) outweighs 1.70 GB against 2.26 GB of stream (1.33x). The engine's measured path is 22-47x
+over that threshold. So on the decode loop that exists today this case **misses** its own bar, and the
+lever is submission granularity — one command list per token instead of one per `npu_gemm` (engine#799)
+— not the chunk size (1.18-2.13 MB against the arena's 50 MB is a 1.3 % effect) and not a MoE-shaped
+ELF built for gate/up alone.
 
 The fixed cost above is measured, not assumed. Two runs of the same 50,135,040-B weight chunk in
 the arena's chunk-list design — 1.051 ms for one chunk, 2.016 ms for two — fit a marginal rate of
@@ -485,15 +605,45 @@ own, with a negative control.
 
 A cached directory is checked again on every hit, with the same metadata-only scan, and it is
 rebuilt if the scan fails or if its `repack-stamp.txt` (converter path and commit, architecture,
-repack script) names a different converter than this build would use (`repack_gguf.py
---check-stamp <dir>`: exit 0 current, 1 stale, 2 cannot tell). If the checker or the converter
-cannot be found, serve warns once per process and reuses the directory, so a missing script
-cannot stop serving. A Q4NX directory served as it is (`1bit serve -m <Q4NX dir>`), such as a
-published FastFlowLM model, is trusted as published. Its chunk layout can be checked first, without
+the measured `tile_order`, repack script) names a different converter than this build would use (`repack_gguf.py
+--check-stamp <dir>`: exit 0 current, 1 stale, 2 cannot tell). A stamp the repack itself refused,
+or one that predates the measured `tile_order`, is stale and is rebuilt once, so the directory
+becomes verified; `unverified` is "cannot tell", so serve reuses it with its warning instead of
+re-running the measurement that could not run. If the checker or the converter cannot be found,
+serve warns once per process and reuses the directory, so a missing script cannot stop serving. A
+Q4NX directory served as it is (`1bit serve -m <Q4NX dir>`), such as a published FastFlowLM model,
+is trusted as published. Its chunk layout can be checked first, without
 dequantizing anything: `tools/check_q4nx_dir.py <dir>` reads the container header only, names each
 quantized tensor's chunk kind, and refuses an unknown chunk size or a tensor shorter than its layout
 needs. It cannot tell the two Q8 layouts apart ("Q4NX chunks", above), because the container does
 not record which one it holds.
+
+**The tile order is measured, not declared.** Two converters can write `q4_1` tiles in the two
+different orders this engine and FastFlowLM use, and a container in the wrong order repacks cleanly
+and decodes as noise — HTTP 200, nothing in the log (engine#1110; measured with FLM_Q4NX_Converter
+`d1d5232`, whose containers come back `matches NO layout`). The load-time field
+`container.tile_order` (engine#1130) cannot catch it, because `tools/npu_plan.py` writes `engine-1`
+for every plan: it guards against a future writer, not against the converter that produced the
+tiles. So the repack decodes a sample of the container against the source GGUF with
+`tools/q4nx_diff.py`'s own verdict — one pass per layout, once per directory — and:
+
+* **refuses** the directory (`rc=1`) when no layout matches, or when the layout that matches is not
+the `engine-1` order `npu/forward/src/q4nx.cpp` decodes;
+* records `tile_order=engine-1` and `tile_check=<the verdict line>` in `repack-stamp.txt` when it
+does match, so the claim in `plan.json` is measured rather than assumed;
+* records `tile_order=unverified` when nothing was comparable (an architecture the checker cannot
+dequantize) instead of asserting a layout nobody checked.
+
+The same measurement runs on its own over an existing directory, under the name that says what it
+proves: `python3 scripts/repack_gguf.py --verify-source <dir> <model.gguf>` (exit 0 verified in the
+engine-1 order, 1 another order or none, 2 nothing comparable). The verdict names the worst source
+tensor and its correlation with the GGUF — a wrong converter checkout reads
+`corr +0.0325 on blk.14.attn_output.weight` where an honest pack reads `corr +0.9994` — so the
+number that separates them is in the line, not only the max|err|. `--tile-check` is the same
+function under its old name. The repack runs it after the converter and refuses the directory when
+it fails; `--skip-verify` opts out for the tight repack loops and stamps `tile_order=unverified`
+(never `engine-1`), so the cheaper path is recorded rather than silently trusted. A cache hit
+re-checks metadata only, so the cost is paid once per directory, on top of the converter's own pass.
 
 ### From a Ryzen AI OGA NPU pack
 
@@ -523,13 +673,13 @@ What converts, and how faithfully:
 | pack tensor | where | to | fidelity |
 |---|---|---|---|
 | `model.embed_tokens.weight` | `model.onnx.data`, fp16 | bf16 | fp16 → bf16 rounding (10 → 7 mantissa bits) |
-| `lm_head` `MatMulNBits` (bits 4, block 128, asym) | `model.onnx.data` | q4_1 tiles | codes unchanged; `scale = s` (exactly bf16 in this pack), `zero = -zp*s` (bf16 rounding) |
+| `lm_head` `MatMulNBits` (bits 4, block 128, asym) | `model.onnx.data` | q4_1f tiles | codes unchanged; `scale = s`, `zero = -zp*s`, both stored as f32 |
 | `input_layernorm`, `post_attention_layernorm` | `.fconst`, bf16 at a fixed offset | bf16 | byte-exact |
-| `self_attn.{q,k,v,o}_proj` (24 x 4) | `.fconst`, 34,816-byte 64-row tiles | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
+| `self_attn.{q,k,v,o}_proj` (24 x 4) | `.fconst`, 34,816-byte 64-row tiles | q4_1f tiles | codes unchanged; `scale = s` (the pack's bf16 value), `zero = -zp*s` stored as f32 |
 | `self_attn.{q,k,v}_proj.bias` (24 x 3) | `.fconst`, the tiles' bias subvolumes | bf16 | byte-exact; written only where the pack has one |
-| `mlp.{gate,up}_proj` (24 x 2) | `.fconst`, MLP section, 4,288-byte subvolumes | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
-| `mlp.down_proj` (24 x 1) | `.fconst`, MLP section, 2,176-byte subvolumes | q4_1 tiles | same as the attention tiles |
-| `model.norm` (final) | — | — | **refused**, see below |
+| `mlp.{gate,up}_proj` (24 x 2) | `.fconst`, MLP section, 4,288-byte subvolumes | q4_1f tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` stored as f32 |
+| `mlp.down_proj` (24 x 1) | `.fconst`, MLP section, 2,176-byte subvolumes | q4_1f tiles | same as the attention tiles |
+| `model.norm` (final) | `.fconst`, the tail envelope at `layers x stride` | bf16 | byte-exact |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
 An OGA pack keeps its tensors inside the `If` branches: the top-level graph has **no
@@ -541,13 +691,19 @@ because `tie_word_embeddings` makes `dequant(lm_head)` reproduce the fp16 embedd
     corr 0.999999, relative error 0.00070 on all 151936 x 896 weights
     controls: nibble-swapped corr -0.0008, no zero-point corr 0.8788   (both rejected)
 
-Two facts bound what the container can hold, and both are reported, not hidden:
+Two facts about what the container holds, both reported, not hidden:
 
-* **A bf16 zero does not always hold a f32 one.** A q4_1 chunk stores bf16 scale and zero. This
-  pack's scales are already bf16 values (0 % rounded), but `-zp*s` is bf16-exact for only
-  43.5 % of 32-column groups. The residual is that rounding: 3.34e-3 relative, 2.4e-4 absolute
-  on the dequantized weights, with no code moved. Read back through `q4nx::dequant_tile` the
-  container matches the pack to that bound.
+* **The pack's scale and zero are kept exactly (engine#1185).** An imported container uses the
+  fp32 `q4_1f` chunk (6,144 B), and its `layout` says `q4nx-2`; every written tile's scale/zero
+  planes are read back and compared with the pack's f32 values. What this replaces: the 5,120-byte
+  bf16 form kept only 43-48 % of the groups bit-equal on the four shipped packs (3.34e-3 relative,
+  2.4e-4 absolute on the weights), because `-zp*s` is an arbitrary f32 and bf16 rounds it. That
+  floor is gone for imported containers -- the same measurement is now bit-equal, and
+  `npu-pack import` prints "fp32 scale/zero exact for 100.00 % of 32-column groups (container
+  layout q4nx-2)". The device still streams bf16 q4_1, so the forward repacks a q4nx-2 container at
+  load (`npu/q4nx_device.cpp` -> `q4nx::as_q4_1()`, cached once and logged; `npu/forward/src/model.c`
+  still refuses an unconverted one as a safety net), and the fast lane's packer does the same in
+  memory (`npu/pack.cpp`); GGUF-derived containers are unchanged and keep the bf16 form.
 * **K is padded to the 256-column grid.** Qwen2.5-0.5B has hidden 896 = 3.5 tiles, so
   `lm_head` and q/k/v/o are stored as 4 column tiles with the last one zero-padded (codes 0,
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's
@@ -646,11 +802,21 @@ v2`) reproduces the shipped tile from the arrays this decoder produces.
 importer cannot represent exits 3 and lists every tensor it refused with the reason, so a
 partial model never lands in a model directory by accident. With `--allow-incomplete` it writes
 what it can and records the rest in the container's `__metadata__` (`incomplete`) and in
-`config.json` (`q4nx_source.incomplete`). On the shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
-that is now **290 tensors, 67,088 tiles** (embedding, head, 48 layer norms, 96 attention
-projections, 72 attention biases, 72 MLP projections) and **one refusal**: the final norm, whose
-1,856-byte tail envelope turned out to be `[eps][pad][448 f32]` and not an RMSNorm weight on either
-`.fconst`.
+`config.json` (`q4nx_source.incomplete`). The shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
+now imports whole — **291 tensors, 67,088 tiles, no refusals**: embedding, head, the 48 layer
+norms, the final norm, 96 attention projections, 72 attention biases and 72 MLP projections.
+
+### The final norm, and the tail envelope
+
+The layer blocks stop at `layers x stride`; what follows in either `.fconst` is a 1,856-byte
+envelope `[eps bf16 1e-6][62 pad][hidden x bf16]` — the **final norm** — and, in the
+`Llm_Token_Token` file, the `lm_head` tile stream after it (which is why the head's payload was
+found verbatim at `tail + 1,856`). The position is not assumed: the epsilon has to be at
+`layers x stride`, and where the pack ships both files the two copies of the norm have to be
+byte-identical, which is what the import requires before it writes either. On the 0.5B pack the
+stored bytes equal the upstream checkpoint's `model.norm.weight` exactly. (The earlier reading —
+"the tail envelope is `[eps][pad][448 f32]`, so the final norm's position is unknown" — was the
+last 1,856 bytes of the *file*, which in the Token_Token program are tile padding.)
 
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
 opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as
@@ -746,6 +912,62 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
 
+### FastFlowLM's NPU2 drops: the families the route does not serve
+
+The daily census-watch (engine#588) prints one line per new or changed repo in FastFlowLM's HF
+org and answers two questions from `registry/architectures.json`: does a backend accept the
+architecture the repo's config declares, and does the NPU route already serve that family. A
+`!! NEW FLM` row means the registry does not map the class at all; a `!! NPU FLM` row means the
+registry maps it, but only for a backend that cannot run a Q4NX directory. Both answers come from
+the registry, never from the repo name.
+
+The route serves the families `registry/architectures.json` marks `npu`: `qwen3` on the dense
+fast lane, and `qwen2`, `qwen3moe`, `qwen3_5_moe`, `deepseek2`, `minicpm` and `llama` through the
+GGUF-on-NPU forward ([registry.md](registry.md) has the table). Everything else in the org is an
+NPU-route gap, recorded here instead of as a GGUF alias: a class enters the registry only when a
+backend's code accepts it, so mapping an NPU pack to an hrx-only family would advertise a model
+the route refuses at load.
+
+The 2026-11-05 census body (engine#619) asked about these packs. Each row is a recorded answer,
+not a mapping:
+
+| repo (2026-11-05 body) | architecture it declares | `registry/architectures.json` | NPU route |
+|---|---|---|---|
+| `FastFlowLM/MiniCPM-OCR-1.0-NPU2` | `MiniCPMOcrForConditionalGeneration` | none (the pin registers `MiniCPMForCausalLM`, `MiniCPM3` and `MiniCPMV4_6` only) | not served: an OCR/vision tower; the route claims text decoders only |
+| `FastFlowLM/MiniCPM-V-4.7-35B-A3B-NPU2`, `FastFlowLM/MiniCPM-V-4.7-1B-NPU2` | `MiniCPMV4_7ForConditionalGeneration` | none (V4_6's text tower maps through `qwen35`, a VLM wrapper the pin does not register) | not served: a vision-language pack; a converter registration for the text tower plus a vision scope decision come first |
+| `FastFlowLM/Qwen3.8-27B-DFlash2-NPU2` | `DFlash2DraftModel` | none; reviewed not-an-alias (docs/arch-gaps.md, `dflash2`) | not served: a speculative drafter, not a standalone decoder; it needs the reviewed dflash2 support, not a mapping |
+| `FastFlowLM/LFM3-1.7B-NPU2` | `Lfm3ForCausalLM` | none (LFM2 / LFM2-MoE are mapped; LFM3 is not registered at the pin) | not served: no LFM3 model type or kernels in the route |
+| `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | none on 2026-11-05 (no config); `HYV3ForCausalLM` / model_type `hy_v3` by 2026-11-06 | `HYV3ForCausalLM` -> `hy_v3`, hrx only | not served: an hrx-only family; the 2026-11-06 dev-box run prints it as `!! NPU FLM ... npu route: no` |
+| `FastFlowLM/smolvla-NPU2` | none (no config), no `*.q4nx` | none | not a pack: a config-less VLA repo. It prints as `!! NEW FLM` because its config carries no `library_name` for the custom-code rule, but there is no architecture to map and no Q4NX file to serve |
+
+A pack whose family the route should serve needs that family's model type and its kernels in the
+release before a registry entry means anything. Until then the row above is the record: the daily
+report prints a repo only when it is new or changed, so a quiet day is quiet, and the next change
+to one of these repos is a prompt to update this table rather than a namespace error.
+
+The 2026-11-06 census body (engine#1253) read the whole org from a fresh state, so it also printed
+every pack whose family the registry maps for `hrx` only. Those are the `!! NPU FLM` rows: the
+architecture is covered on the CPU route, but a Q4NX directory needs the NPU route and `npu` is
+not in the entry's `backends`. Family by family:
+
+| family (`gguf`) | packs in the 2026-11-06 body | `backends` | NPU route answer |
+|---|---|---|---|
+| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx | not served: the dense qwen35 family has no NPU kernel set; the serving work is tracked in engine#587 (Qwen3.8-27B-NPU2) |
+| `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
+| `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
+| `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
+| `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served |
+| `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2` | hrx | not served |
+| `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
+| `hy_v3` | `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | hrx | not served; the first table above records this one |
+
+Adding `npu` to one of those entries would claim kernels this build does not carry. A family leaves
+this list when `NPU_ARCHS` in `tools/registry_build.py` names its HF class with the model type the
+route loads and a captured `--device npu` run stands behind it; the regenerated entry then carries
+`npu` in `backends`. Note that the route does serve `qwen3_5_moe` (`Qwen3.6-35B-A3B` through the
+GGUF-on-NPU forward), while every D3-* pack in this body declares the dense `qwen3_5` family, so
+the two are not the same answer and the registry keeps them apart.
+
 ### Sealed kernel sets: the manifest is what says a set is ours
 
 A set ships as `<set>/layout.json`, `<set>/layer1_*/layer1.elf` (each `1BPKCRYP` ciphertext, opened
@@ -797,7 +1019,19 @@ that runs the phase is private, like the kernels it runs.
   ChatML anchors. One that does not is refused on the chat route rather than prompted anyway (#963).
 - **Decoding:** greedy, with a 1.1 repetition penalty over the last 64 ids by default.
   `repetition_penalty` in the request overrides it, and 1 gives plain greedy.
-- **One request at a time:** the model has one KV cache.
+- **One request at a time:** the model has one KV cache, so a second request waits for the first generation to end,
+  and the two kinds of request wait differently (#1024):
+  - a **streamed** request waits up to `--queue-ms` (default 300000, a full generation) and sends an empty content
+    delta once a second while it queues, so a proxy's no-data timer does not read the queue as a hung backend
+    (`app/npu_queue.h`). Its 200 and SSE headers are already on the wire, so a wait past `--queue-ms` is answered
+    with an `data: {"error":…}` frame inside the stream (and `[DONE]`), not with a status;
+  - a **non-streamed** request cannot be told anything while it waits, so it keeps a short bound of its own,
+    `--queue-ms-plain` (default 5000), and past it answers `503 + Retry-After: 1` with `{"type":"device_busy"}`,
+    which a client can act on. Until then its client sees nothing at all, so that bound is also how long it can
+    appear to hang.
+  A queued request occupies one HTTP worker for the whole wait (the server installs no task queue), so a long streamed
+  queue is bounded by the worker pool — irrelevant for one user, but it is why `/health` must never take the device
+  lock (it does not).
 - **Repeatable:** every generation starts from a zeroed KV cache (#400), so identical greedy
   requests give identical text, whatever ran before them.
 
@@ -861,6 +1095,8 @@ got before.
 | `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
+| `max_tokens` / `max_completion_tokens` | the reply's cap (`max_completion_tokens` wins); a value that is not a number is a 400 naming the field, and a fractional one is truncated |
+| `stream` | `true` streams SSE chunks; a value that is not a boolean is a 400 naming the field |
 | `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
@@ -898,9 +1134,14 @@ dropped from a schema would leave the caller believing the answer was validated.
 the schema's order with the required ones first, so the object's key order is fixed for a given schema.
 
 A field the route cannot honour is a 400 whose `error.message` says why ("`json_schema`: pattern is not
-supported by this route's schema-to-GBNF converter", "`gbnf: unterminated literal at line 1`"),
-never a silently ignored key. `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
-an end-of-sequence token, a stop sequence or a grammar that allows nothing more.
+supported by this route's schema-to-GBNF converter", "`gbnf: unterminated literal at line 1`",
+"`stream`: must be true or false", "`tools`: must be an array"),
+never a silently ignored key and never a 500: a wrong *type* is a client error like any other, including on the
+fields the route reads before it starts decoding (engine#1106). `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
+an end-of-sequence token, a stop sequence, a grammar that allows nothing more, or a constrained answer the model
+ended itself once its grammar had reached an accepting state — the route puts the container's end tokens into the
+mask exactly there, so a complete JSON object reports `stop` instead of padding with whitespace to `max_tokens`
+(engine#1182).
 
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
 `third_party/llama.cpp/src/llama-sampler.cpp` (top_k, then top_p, then temperature, then the
@@ -1045,14 +1286,66 @@ $ curl -sS localhost:8000/v1/systemone -H 'Content-Type: application/json' \
   "type":"choice"}},"model":"d3-lite","usage":{"input_tokens":96,"output_tokens":0}}
 ```
 
+### When a dispatch fails
+
+A token's work is one runlist of the model's layer runs. When the NPU runtime reports that one of those runs did not
+complete, `1bit unified` answers **the request that hit it** with an error frame and then exits non-zero — it does not
+keep serving on that hardware context:
+
+```
+{"error":{"message":"npu runtime: invalid call (code 614): state 8, run 0 of 28"}}
+```
+
+The code's category is its hundreds digit (`6xx`: a call made in the wrong state or on the wrong object) and `run N of
+M` is the index, inside the token's runlist, of the layer run that failed.
+
+Exiting is deliberate: after such a failure the context's own state is dead, and every later request on the same process
+fails the same way — measured on the c22 board, where the same backend answered 614 to every subsequent request while a
+fresh process answered normally on the same device. The supervisor (Lemonade's backend watchdog, a systemd unit, the OS
+menu's launcher) is the only one that can build a new context, so the engine hands it the problem instead of answering
+with something that looks like a result. A client sees **one failed request**, and the next one lands on a working
+backend.
+
+If a *fresh* backend also fails, the device is the thing to look at rather than the engine: the driver refuses new
+hardware contexts until `amdxdna` is reloaded, and says so in its own kernel message — restarting backends cannot fix it.
+`app/serve_watchdog.h`'s `npu_run_failed()` is the classifier for this (the runtime's failed-runlist message), and
+`tests/serve_watchdog_test.cpp` (ctest `serve_watchdog`, in CI) covers it without a device.
+
 ### Two streams on one NPU
 
 One process owns the NPU by default: it takes an exclusive `flock` on
 `/tmp/1bit-npu-device.lock` for its lifetime (`app/npu_device_lock.h`), so a second serve of the
-NPU route waits instead of contending. That is a policy, not a hardware limit -- the driver
-advertises 16 hardware contexts on this part (`hwctx_limit = 16`, `drivers/accel/amdxdna/npu4_regs.c`)
-and only refuses the 17th -- and the policy stays the default because a second stream buys much less
-than 2x:
+NPU route waits instead of contending. The policy stays the default because a second stream buys
+much less than 2x -- and with the driver patch this tree carries (`0003`, running on strixhalo since
+2026-11-05 06:26 as `349FDC99CADC56900E0249A`) it is also the only shape the device accepts, which is worth
+stating precisely because the limit is *not* the hwctx count:
+
+- **The array partition is the real limit, and it is per client.** `hwctx_limit = 16`
+  (`drivers/accel/amdxdna/npu5_regs.c:74`; `npu4_regs.c:174` says the same) bounds how many hardware
+  contexts **one** client may open;
+  it says nothing about a second client. The solver hands each client a column range, and the NPU
+  has 8 columns and the kernel set this engine ships asks for **all 8** (measured on the c24 set:
+  `xrt-smi examine -r aie-partitions` shows one partition, `Columns [0..7]`), so one client's contexts
+  share the whole array and a second client has nothing to be given.
+- **What that cost before the fix.** With the unpatched driver a second client was handed the same
+  columns instead, and its configuration took the array out from under the first: every client then
+  failed `614 state 8, run 0 of 28` with `DPU PC 0xffffffff` in the firmware capture -- measured
+  2026-11-05, 3/3 with the requests overlapping and 3/3 with them strictly sequential, and never with
+  a single context ([engine#1084](https://github.com/1bit-MONSTER/engine/issues/1084)).
+- **What it costs after it.** `third_party/patches/amdxdna/0003` shares a partition only between
+  contexts of the *same* client, so the second client is refused with `code 102` / `-ENODEV` instead
+  of taking the array down, and the partition is released when the holder exits. Measured on that
+  build: the holder kept its 1 099-chunk row while the second client was refused, a fresh client
+  answered once the holder exited, and one process held 2 contexts without trouble. Multi-context
+  within one process -- the per-op route, the per-block-count route -- is unchanged, and the
+  model-generic route that holds one context per design was re-measured on it with **8** contexts in
+  one process (engine#1084).
+
+So `--npu-streams N` **needs a kernel set that asks for fewer columns than the array has**: with the
+sets shipped today a second stream is refused rather than slow, and the throughput numbers below are
+what two streams cost *when the column request allows them* (they were measured on the LFM2 `m16`
+set, not on the 8-column sets this engine ships). The rest of this section is about that case, and the
+lock policy above still governs it:
 
 - **The DMA engine is shared.** Decode reads the model's int8 weights once per token (~24.3 GB at
   ~2.2 GB/s effective on the 27B, [engine#587](https://github.com/1bit-MONSTER/engine/issues/587));
@@ -1066,14 +1359,18 @@ With that said, two streams do run, and the option is what says you meant it:
 
 ```
 # stream 1 of 2, then stream 2 of 2, in two shells (different ports, same model)
-./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8000
-./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8001
+./1bit forward-serve -m <model.q4nx> --kernels <dir> --npu-streams 2 -p 8000
+./1bit forward-serve -m <model.q4nx> --kernels <dir> --npu-streams 2 -p 8001
 ```
 
-`--npu-streams N` (1..16, default 1) is `forward-serve`'s flag too: N = 1 keeps the exclusive lock,
-N >= 2 takes a **shared** lock, so the opted-in streams co-exist while any exclusive holder -- an
-unflagged `1bit serve`, the per-process ELF runner (`npu_engine_universal`), another build's serve --
-still keeps them all out, in either order, because they share one file and one `flock(2)`.
+`--npu-streams` belongs to `forward-serve` (and to the GGUF-on-NPU model-generic forward `serve`
+starts for it): N = 1 keeps the exclusive lock, N >= 2 takes a **shared** lock, so the opted-in
+streams co-exist while any exclusive holder -- an unflagged serve, the in-process route, the
+per-process ELF runner (`npu_engine_universal`), another build's serve -- still keeps them all out, in
+either order, because they share one file and one `flock(2)`. The **in-process** route (a `.q4nx` model
+directory through `serve`, i.e. `app/unified.cpp`) always takes the exclusive lock and refuses
+`--npu-streams` by name: it keeps one context, so N streams there could only queue, and two of them
+dispatching at once is the measured wedge (engine#1051).
 
 **The lock is one file and one protocol, across runtimes, and it is advisory** -- that is what makes it
 usable beside another NPU engine, and what its limits are:
@@ -1083,8 +1380,9 @@ usable beside another NPU engine, and what its limits are:
   not wait for other shared holders"; `LOCK_EX` = "I want the device to myself". A holder keeps its fd
   open for the life of the process; closing or exiting releases it. `LOCK_EX` and `LOCK_SH` never
   overlap, in either order, on one file.
-- **Who may take what.** Anything that honours the file interlocks with us: our serves
-  (`--npu-streams` decides which mode), the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
+- **Who may take what.** Anything that honours the file interlocks with us: `forward-serve`
+  (`--npu-streams` decides which mode), the in-process route (`LOCK_EX`, always -- `app/unified.cpp`),
+  the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
   Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
   keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
   file is not slowed, not blocked and not detected.
@@ -1097,7 +1395,9 @@ usable beside another NPU engine, and what its limits are:
 **Partitioning, and what it would take.** Two whole-array streams share one DMA engine, so they
 serialise; the September prototype that scaled (~100 % each) did it by giving each stream a *disjoint
 half of the columns*, which halves per-stream weight reuse, and its xclbin pair is ABI-stale at this
-pin, so nothing in this tree can select a column split today: both of our instances run whole-array.
+pin, so nothing in this tree can select a column split today: both of our instances run whole-array --
+which is exactly the request the solver cannot satisfy twice (see the limit above), so a 4-column
+kernel set is the prerequisite for the numbers in this section, not a tuning option.
 What each engine costs is therefore the whole model per stream -- **one hwctx and one complete copy of
 the weight BOs, plus its own KV cache and scratch**, and the device's hwctx limit is 16. The accounting
 per engine is: `streams x (weights + KV + scratch)` must fit in the NPU's share of the box's LPDDR5X
@@ -1139,11 +1439,93 @@ that is the trade, and it is why the exclusive default stays.
 device: exclusive excludes everything, three shared streams co-exist, and an exclusive waits for the
 last one to go.
 
+**When a live process holds it.** The lock is an `flock(2)`, so it dies with its holder and there is
+nothing to reap -- but a *live* holder (a serve left running with no client, engine#1241) keeps it for
+as long as it runs, and before #1241 the wait said only `waiting for the exclusive device lock` and
+then nothing for half an hour. After about 2 s the wait now names the holder, and repeats that at most
+once a minute:
+
+    [npu] device lock held by pid 2689658 (1bit serve --device npu ...) for 41 s
+
+The line comes from `/proc/locks` (the `FLOCK` entry on the lock file's `st_dev`/`st_ino`) plus the
+holder's `/proc/<pid>/cmdline`; where a container hides either, the wait says it cannot name the
+holder instead of failing. The same line is printed when the NPU refuses a context with `device error
+(code 102): No such device`: a held array answers exactly like a dead one, so that message on its own
+used to send operators looking at the device, the ELF or the container. `ONEBIT_NPU_LOCK_WAIT_MAX=<seconds>`
+bounds the wait (unset = unlimited, still the default, because ordinary contention is what the wait is
+for); on timeout it fails with the holder named rather than spending a device ticket. Nothing here
+reaps or signals the holder -- killing another lane's live serve is the box-crashing path.
+
 **The row this exists for.** On Linux the two engines are two instances of this runtime on two
 *different* models at the same time -- "all NPU models at once" -- and that is what
 `tools/showcase-612-npu-streams.sh` measures with `MODEL` and `MODEL_B` (default Qwen3-0.6B and
 Qwen3-4B, whose kernel sets are on this box): each model solo, then both at once, three reps, every
 number stamped with the build that produced it.
+
+### When a load follows an evict
+
+On the appliance the NPU model is swapped by evicting it and starting a fresh `1bit` for the next
+one, and a load that starts *right* after an evict can fail at device / context creation while the
+previous backend's hardware context is still being torn down. Measured on the c22 board
+([engine#1010](https://github.com/1bit-MONSTER/engine/issues/1010)): two children exited 1 inside
+100 ms of starting, `POST /api/v1/load` answered 500, and the next request loaded the same model
+normally.
+
+That failure is transient by nature, so the NPU routes open with a **bounded retry**
+(`app/npu_load_retry.h`): up to 2.5 s, 150 ms doubling to a 500 ms cap, at most 12 attempts. Each
+attempt's reason goes to stderr — the line the appliance log never had — and a recovered start says
+so:
+
+```
+1bit unified: opening the private route's NPU context attempt 1 failed after 12 ms
+              (npu runtime: device error (code 102): No such device); retrying in 150 ms
+1bit unified: opening the private route's NPU context recovered on attempt 2 after 168 ms
+```
+
+A real failure is unchanged apart from being reported: the last attempt's exception still reaches the
+caller after the window closes, and the log now names the attempt count and the reason.
+
+#### A refusal is a queue, not a fault
+
+A second **client** on the NPU is refused with the same signature a dead array answers — `code 102` /
+`-ENODEV` from `aie2_message.c`'s context-create path — so the code alone cannot say which one it is. Time
+can: a client that holds the array frees it when it exits, a dead array never does. Since the per-client
+partition fix ([engine#1085](https://github.com/1bit-MONSTER/engine/pull/1085), decision 2026-11-05)
+makes that refusal the *normal* way a second client is turned away, a refused context is now **queued**
+rather than failed: the same retry schedule runs against a load queue budget instead of the 2.5 s race
+window, and the log says which of the two it is waiting for.
+
+```
+$ 1bit serve -m <model dir> --load-queue-ms 45000       # the default
+1bit unified: opening the private route's NPU context attempt 3 failed after 410 ms
+              (npu runtime: device error (code 102): No such device); retrying in 600 ms
+              (queued: another NPU client may hold the array)
+```
+
+`--load-queue-ms N` bounds that wait (default **45000**, `0` refuses at once, i.e. the pre-#1085
+behaviour). When the budget runs out the operator hint names both causes in the order to check them —
+another client first (wait for it, or stop it), the driver second (`modprobe -r amdxdna && modprobe
+amdxdna`) — because after a full budget the array is either genuinely busy elsewhere or genuinely dead.
+
+This is the load-side counterpart of `--queue-ms`, which bounds how long a *request* waits for the
+device lock; the two are separate because a request can be told it is queueing (an empty delta a second)
+and a load cannot.
+
+One NPU failure is not transient and says so: the driver deciding the array is dead, reported with
+`No such device` (ENODEV) and either `code 102` (`errc::ctx_create`) or `code 104` (`errc::submit`) —
+whichever call was refused, which depends only on whether the process already had a hardware context
+when the array went. That is the state a TDR leaves behind when it could not restart a context, and the
+driver keeps refusing until it is reloaded. The report adds the one action that works:
+
+```
+1bit unified: the NPU array is refusing hardware contexts: reload the driver (modprobe -r amdxdna && modprobe amdxdna)
+```
+`tests/npu_load_retry_test.cpp` (ctest `npu_load_retry`, in CI) covers the schedule, the window, a
+transient recovery, a persistent failure, and a zero window (one attempt, no retry).
+
+Lemonade's half of the same race is its fixed 2 s wait after "waiting for GPU driver cleanup", which
+is a delay and not a readiness signal; that fix belongs to the appliance, this one keeps the engine
+from dying on a failure that clears in a few hundred milliseconds.
 
 ## Add-on routes
 
@@ -1191,6 +1573,12 @@ against (the kernel's own copy also works); nothing from the pin is built into o
 the release. `.github/workflows/bump-xdna.yml` moves the pin when run by hand, because a driver
 move means rebuilding the module on Strix Halo and checking the NPU there first.
 
+That pin is **pre-fix**, and the fixes are not upstream. The two patches every build of ours runs — the
+`bo_invalid_list` use-after-free at close (#971) and the array recovery after a TDR (#1005) — are carried in
+[`third_party/patches/amdxdna/`](../third_party/patches/amdxdna/README.md) with the build, sign, install and
+initramfs recipe, the `srcversion` each build must produce, and what a pin bump invalidates. A module built from the
+pin alone has neither defect fixed: it panics on that close path and it cannot bring the array back after a TDR.
+
 ### The MTP head (FastFlowLM's container -> ours)
 
 `tools/flm_head_import` (built as `flm-head-import`) turns a FastFlowLM MTP-head container
@@ -1221,6 +1609,70 @@ per-group bias, while the source blocks are asymmetric (`w = q4*S + M`) and thei
 inside a column, where an int16 with an 11-bit mantissa allows about 16x. Forcing it costs a measured 11-18 %
 relative L1 residual, so the mode-1 or Q4_K forms are the ones to run; the script keeps the measurement next to
 the images it writes.
+
+### The draft loop, and whether to serve it
+
+`npu/mtp/` holds the loop as library code so a serve can drive it, and `tools/mtp_acceptance` is how it is measured:
+
+| file | what it is |
+|---|---|
+| `npu/mtp/draft.h` | the policy: draft `k`, verify as **one** `M = k+1` batch, commit the longest prefix the base agrees with, redraft |
+| `npu/mtp/mtp_head.{h,cpp}` | the drafter: one head step per proposed token, chained on its own hidden |
+| `npu/mtp/forward_base.h` | `BaseModel` over the real `Q4nxNpuForward`, with the deferred GDN commit |
+| `tools/mtp_acceptance` | the measurements: `--offline`, `--live`, `--live --match`, `--batchcheck` |
+
+`tools/mtp_acceptance --offline` scores the drafter alone on the base's own greedy stream, `--live` runs the loop,
+`--live --match` scores both **at the loop's own chain positions** (so the two per-depth tables are one measurement
+sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
+
+**The one thing that must be right**: the drafter attends over its own states, so its cache has to be the base
+model's *committed stream, row by row*. Feeding it only the current chain is silent — drafts get worse, the text
+stays correct — and it cost this project 69 % → 14 % first-draft acceptance until the cursor was made a checked
+object (`DraftStream`; engine#820). A run reports `stream N rows` (must be prompt + emitted) and `N mismatch` (must
+be 0) for exactly that reason.
+
+**Measured on 2026-11-05, on the 27B `bonsai2-27b-pb16i` with the pb16i-exact head, `k = 4`, 64 tokens,
+`tau = 0`:**
+
+* live acceptance equals the offline protocol **at every depth** over 8 prompts × 64 tokens: depth 1 **+0.00**,
+  depth 2 **+0.55**, depth 3 **+0.09**, depth 4 **+1.08** pp (75.14 / 63.24 / 73.26 / 84.13 %), with greedy text
+  byte-identical to plain decode on all 8 prompts and 0 stream mismatches.
+* the chain is **prompt-dependent**: 1.80 to 4.33 tokens per pass, mean **3.14** over the same 8 prompts. That is the
+  unweighted mean of the eight per-prompt chains; pooled over the window's 181 chain iterations the same counts give
+  **2.87** tokens per pass (the figure in `docs/npu-leaderboard.md`), because the prompts with short chains take most
+  of the iterations. Both are the same measurement, weighted two ways — say which one a comparison is using.
+
+**Do not enable the draft route on a serve as it stands.** The loop pays a verify batch *and* a step per
+iteration, so it is faster only above a break-even chain, and that break-even is **3.2-4.1 tokens/pass** by two
+independent measurements: dividing the measured wall clock by the measured pass count (3.87), and the split of the
+8 prompts — faster on exactly the three above 4.12 (0.73-0.77×), slower on all five below 3.20 (1.08-1.74×, median
+1.14×). This head's mean chain is 3.14, so the expectation over prompts is a loss. `1bit forward-serve` has no
+draft route at all today (`app/forward_serve.cpp` runs one `step()` per token); `1bit serve --mtp` is the HRX/llama
+path with the GGUF's own head, a different thing.
+
+Two settings are worth knowing regardless, both measured in one window:
+
+* **`OMP_WAIT_POLICY=passive` is free and worth 1.2-2.4× on every batched pass** (verify batch 495 ms against
+  721-1187 ms; the `[bl]` core term 10.2 ms against 162-307 ms).
+* **`tau` redistributes cost, it does not move it.** `tau = 0.6` (the head's published setting) stops the chain
+  after the first draft and trades base passes for lm-head calls almost exactly one-for-one: 0.598-0.623 s/token
+  across arms that differ 2× in chain and 4× in head calls. It also leaves depths 3-4 with *no* offers, so any
+  per-depth measurement is at `tau = 0`.
+
+**Refuted, so nobody builds it again**: folding the per-iteration step into the next verify batch (one pass per
+iteration instead of two) collapses the chain from **2.82 to 1.07** tokens/pass and depth-1 acceptance from **82 %
+to 6.9 %** — the head needs the hidden of the token it drafts past, which a one-pass loop cannot produce. Lagging
+the hidden without lagging the cursor is worse: it accepts **0 of 92** while the mismatch counter stays at 0, i.e.
+a silently broken loop rather than a slow one.
+
+**What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
+lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
+6 measured 0 %).
+
+Reading these numbers has two traps that produced wrong figures here twice: plain decode is **host-bound**, so a
+loaded window inflates it and flatters the draft route — two arms of one ticket are comparable, two tickets are
+not; and "acceptance length" (`accepted/iterations`) is not "tokens per pass" (`1 + Σ hit[d]`). The tool prints
+both, named.
 
 ## FFN row sparsity: a stream question, answered before a kernel is written
 
@@ -1256,3 +1708,27 @@ pinned generator: the tool drops a half-written last line (a killed capture), re
 measurable column instead of printing an empty table, and exits non-zero on a malformed one. The
 `--self-test` builds a synthetic GGUF and capture with hand-computed answers, so the arithmetic is
 gated without a model on disk.
+
+## FAQ
+
+### Does the NPU run every model?
+
+No. It runs the dense Qwen3 family, including GGUF models it repacks to Q4NX on load (six
+architectures), plus the models whose kernel sets ship with the engine. Every other GGUF still runs
+on the iGPU through [HRX](hrx.md), and the models checked on this box are on [models.md](models.md).
+
+### Is the NPU faster than the iGPU?
+
+Not on the models it runs today: the route is correctness-first, speed next, and what it measures is
+on the [NPU leaderboard](npu-leaderboard.md). It is a second device beside the iGPU, not a
+replacement for it.
+
+### Can the GPU and the NPU run at the same time?
+
+Yes. The two were measured running together for forty repetitions with no hang and no corruption,
+and `--device hybrid` splits a single request across them ([hybrid.md](hybrid.md)).
+
+### Do I need a special kernel or driver?
+
+The NPU needs the `amdxdna` kernel driver. The [1bit OS](os-v3.md) appliance ships a kernel built
+with it, and the [Linux kernel](kernel.md) page covers building your own.

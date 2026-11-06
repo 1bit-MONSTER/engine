@@ -52,9 +52,22 @@ start() {   # start <log> [env...]: serve on a free port with the fake backend, 
         sleep 0.1
     done
     if [ "$code" != 200 ]; then
+        # A server that never came up because it could not bind is a port collision, not a defect in
+        # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+        if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
+            echo "FAIL: hybrid_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
+            exit 1
+        fi
         echo "FAIL serve did not answer $api/health within $((SECONDS - deadline + ${HYBRID_ROUTE_START_S:-60}))s: last code $code, pid $pid $(kill -0 "$pid" 2>/dev/null && echo alive || echo gone)"
         tail -5 "$log" 2>/dev/null
     fi
+    # This serve's OWN slot directory, read off its child's argv: /tmp/1bit-hybrid-* is shared with every other
+    # serve on the box -- another test under `ctest -j`, another lane's serve -- so a check that globs it reports
+    # someone else's file as this route leaking one (measured: `ctest -j2` failed "no handoff file left in the
+    # slot directory" with 2 slot dirs alive and ours clean).
+    slotdir=$(for c in $(pgrep -P "$pid" 2>/dev/null); do
+        tr '\0' '\n' <"/proc/$c/cmdline" 2>/dev/null | grep -m1 '^/tmp/1bit-hybrid-'
+    done | head -1)
     [ "$code" = 200 ]
 }
 stop() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=; }
@@ -78,11 +91,9 @@ check "/v1/completions goes through the handoff too" '[[ "$reply" == *"\"fake_id
 chunks=$(curl -sN "$api/v1/chat/completions" -H 'Content-Type: application/json' \
     -d '{"model": "hybrid-model", "stream": true, "messages": [{"role": "user", "content": "hi there"}]}' | grep -c '^data: {')
 check "streamed reply relayed ($chunks chunks)" '[ "$chunks" = 7 ]'
-check "no handoff file left in the slot directory" '[ -z "$(ls /tmp/1bit-hybrid-*/ 2>/dev/null)" ]'
-slot_dirs_before=$(ls -d /tmp/1bit-hybrid-* 2>/dev/null | wc -l)
+check "no handoff file left in the slot directory" '[ -n "$slotdir" ] && [ -z "$(ls "$slotdir" 2>/dev/null)" ]'
 stop
-slot_dirs_after=$(ls -d /tmp/1bit-hybrid-* 2>/dev/null | wc -l)
-check "the slot directory is removed at exit ($slot_dirs_before -> $slot_dirs_after)" '[ "$slot_dirs_after" -lt "$slot_dirs_before" ]'
+check "the slot directory is removed at exit" '[ -n "$slotdir" ] && [ ! -d "$slotdir" ]'
 
 # 2. no provider: the device serves, the backend prefills (said once)
 check "serve starts without a provider" 'start "$scratch/b.log"'
@@ -103,11 +114,85 @@ check "not pinned when the provider failed" '[[ "$reply" == *"\"fake_id_slot\":-
 check "stderr: the failure named" 'grep -q "hybrid: provider exited 3; the backend prefills this request itself" "$scratch/c.log"'
 stop
 
+# 3b. a provider that outlives its budget: SIGTERM first, SIGKILL only after the grace window
+# An NPU provider tears down by releasing its BOs and destroying its hardware context, and ~/briefs/NPU-LANE-RULE-20261104.md
+# section 4 asks for >= 20 s of grace before a kill. The route used to send SIGTERM and then SIGKILL one second later,
+# so the two arms below are the check that separates them: the slow provider writes its marker only if it got to finish.
+cat > "$scratch/slow_provider.py" <<'PY'
+#!/usr/bin/env python3
+import os, signal, sys, time
+
+def term(*_a):
+    time.sleep(8.0)                     # the teardown an NPU provider needs (>= the 3 s slack a loaded box can add)
+    with open(os.environ["SLOW_MARKER"], "w") as f:
+        f.write("clean\n")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, term)
+time.sleep(30)
+PY
+chmod +x "$scratch/slow_provider.py"
+rm -f "$scratch/grace.marker"
+check "serve starts with a provider that ignores its budget" \
+    'start "$scratch/d.log" ONEBIT_HYBRID_PREFILL="$scratch/slow_provider.py" SLOW_MARKER="$scratch/grace.marker" ONEBIT_HYBRID_PREFILL_TIMEOUT_S=1'
+reply=$(curl -s "$api/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model": "hybrid-model", "messages": [{"role": "user", "content": "hi"}]}')
+check "a timed-out provider still leaves the request to the backend" '[[ "$reply" == *Paris* ]]'
+# the provider exits 0 after its teardown but writes no state file: that is a late completion with nothing to hand
+# over, not a timeout, and the line has to say so (a slow provider and a broken one are different diagnoses)
+check "stderr: the late completion is named, not a timeout" \
+    'grep -q "hybrid: provider wrote no state file (it was signalled at its 1 s deadline and still exited 0)" "$scratch/d.log"' 
+check "the provider got its grace window and tore down cleanly" '[ -s "$scratch/grace.marker" ]'
+stop
+
+# ...and the failure mode of that check: with the window set to 0 the same provider is killed before it can finish.
+rm -f "$scratch/kill.marker"
+check "serve starts with the grace window closed" \
+    'start "$scratch/e.log" ONEBIT_HYBRID_PREFILL="$scratch/slow_provider.py" SLOW_MARKER="$scratch/kill.marker" ONEBIT_HYBRID_PREFILL_TIMEOUT_S=1 ONEBIT_HYBRID_PREFILL_GRACE_S=0'
+reply=$(curl -s "$api/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model": "hybrid-model", "messages": [{"role": "user", "content": "hi"}]}')
+check "answers with the window closed too" '[[ "$reply" == *Paris* ]]'
+check "stderr: the kill is named as a kill" 'grep -q "hybrid: provider timed out after 1 s and had to be killed" "$scratch/e.log"'
+check "a killed provider never reached its teardown" '[ ! -e "$scratch/kill.marker" ]'
+stop
+
+# 3d. a provider that finishes *inside* its grace window: the deadline starts teardown, it is not a verdict on the work.
+# 3b's provider only writes a marker; this one completes the handoff (state file + its JSON line) and exits 0 two
+# seconds after the SIGTERM. Discarding that work would cost the request the provider's prefill *and* the backend's
+# re-processing of the whole prompt - the exact tax the grace window exists to avoid.
+cat > "$scratch/finishing_provider.py" <<'PY'
+#!/usr/bin/env python3
+import json, os, shutil, signal, sys, time
+
+args = sys.argv[1:]
+opt = {args[i]: args[i + 1] for i in range(0, len(args) - 1, 2)}
+
+def term(*_a):
+    time.sleep(2.0)                      # the teardown-and-finish a slow provider needs, inside the grace window
+    shutil.copyfile(opt["--tokens"], opt["--out"])
+    n = sum(1 for line in open(opt["--tokens"]) if line.strip())
+    print(json.dumps({"n_tokens": n, "argmax": -1, "prefill_ms": 2000.0}), flush=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, term)
+time.sleep(30)
+PY
+chmod +x "$scratch/finishing_provider.py"
+check "serve starts with a provider that finishes after its deadline" \
+    'start "$scratch/f.log" ONEBIT_HYBRID_PREFILL="$scratch/finishing_provider.py" ONEBIT_HYBRID_PREFILL_TIMEOUT_S=1'
+reply=$(curl -s "$api/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model": "hybrid-model", "messages": [{"role": "user", "content": "What is the capital of France?"}]}')
+check "a provider that finished inside its grace window hands the prompt over" '[[ "$reply" == *"\"fake_id_slot\":0"* ]]'
+check "no timeout is reported for work that landed" '! grep -q "provider timed out" "$scratch/f.log"'
+check "the handoff carries the prompt minus one token" \
+    'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"body\"].get(\"n_tokens_in_state_file\")==29 else 1)" "$scratch/slot.json" 2>/dev/null'
+stop
+
 # 4. refused combinations and --print-backend
 out=$("$bin" serve -m "$scratch/tiny.gguf" --device hybrid --parallel 2 --llama-server "$here/fake_backend.py" 2>&1)
 check "--parallel 2 is refused" '[[ "$out" == *"one slot"* ]]'
 "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --print-backend --llama-server "$here/fake_backend.py" >/dev/null 2>&1
 check "--print-backend says the route needs serve (exit 5)" '[ $? = 5 ]'
 
-if [ $fail -ne 0 ]; then for l in a b c; do echo "--- $l.log"; tail -20 "$scratch/$l.log" 2>/dev/null; done; echo FAIL; exit 1; fi
+if [ $fail -ne 0 ]; then for l in a b c d e; do echo "--- $l.log"; tail -20 "$scratch/$l.log" 2>/dev/null; done; echo FAIL; exit 1; fi
 echo PASS

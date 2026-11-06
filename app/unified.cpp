@@ -26,6 +26,7 @@
 // Requests run one at a time: the device holds one cache. The fast lane rewrites it from
 // position 0 per request; a private route may reuse it (usage.prompt_tokens_details).
 #include "unified.h"
+#include "npu_queue.h"
 #include "think_split.h"
 
 #include "generate.h"
@@ -35,6 +36,8 @@
 
 #include <httplib.h>
 #include "http_guard.h"
+#include "npu_device_lock.h"  // engine#612: one process owns the array unless the operator says otherwise
+#include "npu_load_retry.h"   // engine #1010: an evict->load race is transient, a cold NPU context is not
 #include "serve_watchdog.h"  // npu_run_failed: a failed runlist means this process's NPU context is dead
 #include <nlohmann/json.hpp>
 
@@ -72,14 +75,20 @@ struct Engine {
     float default_penalty = 1.1f;  // greedy 0.6B models loop without it
     bool open_think = false;       // the template opens "<think>\n" when thinking is on
     std::timed_mutex mu;  // timed: the wait for the device is bounded (engine#911)
-    // How long a request may wait for the device before it is told the device is busy (engine#911).
-    // The one-device lock below serialises generations, and an *unbounded* wait is what made a second
-    // request look like a hung answer: measured on this box, a 48-token probe queued 10.04 s behind an
-    // in-flight generation and then answered in 51 ms. Lemonade's streaming proxy gives up at ~6 s, so
-    // the pause reached its client as "0 chunks in 5.9 s / backend did not send [DONE]" -- the board's
-    // failure in issue #911 -- with no way to tell "queued" from "stuck". 5 s keeps a short queue
-    // working (a probe that finishes quickly is waited for) and still answers before that proxy does.
-    int queue_ms = 5000;
+    // How long a STREAMED request may wait for the device before it is told the device is busy (engine#1024).
+    // The one-device lock below serialises generations, and an *unbounded, silent* wait is what made a
+    // second request look like a hung answer: measured on this box, a 48-token probe queued 10.04 s with
+    // zero bytes on the wire and then answered in 51 ms, so Lemonade's proxy gave up at ~6 s ("0 chunks
+    // in 5.9 s / backend did not send [DONE]", engine#911). 5 s then answered before that proxy did - but
+    // on the appliance a single user's first request IS a whole generation (c23 board 2026-11-04: a
+    // 1000-token row held the device 14 s and the owner's chat got 503 "the NPU is busy"). So a stream, which
+    // can be told it is queueing (one empty delta a second, app/npu_queue.h), waits for a full generation; the
+    // 503 is only for a wait past this.
+    int queue_ms = 300000;
+    // How long a NON-STREAMED request may wait. It cannot be told anything while it waits - an empty body is not
+    // a signal - so a long wait would be exactly the #911 shape again, just longer. It keeps the old short bound
+    // and answers 503 + Retry-After, which a client (Lemonade's BackendWatchdog included) can act on.
+    int queue_ms_plain = 5000;
 
     // reused: prompt tokens already on the device (a private route's); cache: where from,
     // empty when none.
@@ -191,15 +200,15 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         res.set_content(R"({"error":{"message":"prompt longer than the context"}})", "application/json");
         return;
     }
-    auto run = [&e, prompt, opt](const std::function<bool(const std::string&)>& on_text) mutable {
+    auto run = [&e, prompt, opt](const std::function<bool(const std::string&)>& on_text,
+                                 const std::function<void()>& on_queue, int wait_ms) mutable {
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.
         const auto ids = e.tok->encode(prompt);
         if (ids.empty()) throw std::runtime_error("empty prompt");
         const int room = e.max_context - int(ids.size());
         if (room < 1) throw std::runtime_error("prompt longer than the context");
-        std::unique_lock<std::timed_mutex> lock(e.mu, std::defer_lock);
-        if (!lock.try_lock_for(std::chrono::milliseconds(e.queue_ms)))
-            throw DeviceBusy("the NPU is busy with another request");
+        if (!wait_for_device(e.mu, wait_ms, on_queue)) throw DeviceBusy("the NPU is busy with another request");
+        std::unique_lock<std::timed_mutex> lock(e.mu, std::adopt_lock);
         opt.max_tokens = std::min(opt.max_tokens, room);
         std::string pending;
         opt.on_token = [&](int t) {
@@ -246,6 +255,7 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
     if (stream) {
         res.set_chunked_content_provider("text/event-stream", [run, chunk, usage, timings, stream_usage, id, object, created,
                                                                split_reasoning, think_opened, on_run_failed,
+                                                               queue_ms = e.queue_ms,
                                                                model = e.id](size_t, httplib::DataSink& sink) mutable {
             try {
                 ThinkSplit split(think_opened);
@@ -254,11 +264,19 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
                     const std::string c = chunk(t, nullptr, reasoning);
                     ok = ok && sink.write(c.data(), c.size());
                 };
+                // The 200 and the SSE headers are already on the wire, so a request that has to queue says so:
+                // an empty content delta every second is inert for an OpenAI client and for the appliance page
+                // (which only counts a chunk it can print), and it keeps a proxy's no-data timer from firing
+                // while the device finishes the previous generation (engine#911, engine#1024).
+                auto queued = [&] {
+                    const std::string c = chunk("", nullptr);
+                    sink.write(c.data(), c.size());
+                };
                 auto [r, n_prompt, n_cached, cache] = run([&](const std::string& t) {
                     if (split_reasoning) split.feed(t, emit);
                     else emit(false, t);
                     return ok;
-                });
+                }, queued, queue_ms);
                 if (split_reasoning) split.flush(emit);
                 std::string end = chunk("", r.stopped_at_eos ? "stop" : "length");
                 if (stream_usage) {
@@ -297,7 +315,7 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
             if (split_reasoning) split.feed(t, emit);
             else text += t;
             return true;
-        });
+        }, nullptr, e.queue_ms_plain);
         if (split_reasoning) split.flush(emit);
         json out{{"id", id}, {"object", object}, {"created", created}, {"model", e.id}};
         const char* finish = r.stopped_at_eos ? "stop" : "length";
@@ -366,7 +384,7 @@ bool is_npu_model_dir(const std::string& dir, const npu::PrivateOptions& opts) {
 
 int run_unified(int argc, char** argv) {
     std::string model_dir, host = "127.0.0.1", alias;
-    int port = 8000, queue_ms = 5000;
+    int port = 8000, queue_ms = 300000, queue_ms_plain = 5000, load_queue_ms = 45000;
     npu::PrivateOptions opts;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -380,24 +398,38 @@ int run_unified(int argc, char** argv) {
         else if (a == "--alias") alias = next();
         else if (a == "--opt") npu::parse_private_option(next(), opts);
         else if (a == "--queue-ms") queue_ms = std::stoi(next());
+        else if (a == "--queue-ms-plain") queue_ms_plain = std::stoi(next());
+        else if (a == "--load-queue-ms") load_queue_ms = std::stoi(next());
         else if (a == "--help" || a == "-h") {
             std::printf("usage: 1bit unified -m <model dir> [-p 8000] [--host 127.0.0.1] [--alias NAME]\n"
                         "                    [--opt KEY=VALUE ...]\n"
                         "  <model dir> holds model.q4nx, config.json, tokenizer.json, and for the fast lane\n"
                         "              npu/ (its kernels); a model a private route serves needs no npu/\n"
-                        "  --queue-ms N a request waits at most N ms for the device before 503 (default 5000)\n"
+                        "  --queue-ms N a streamed request waits at most N ms for the device before 503\n"
+                        "              (default 300000, a full generation; 0 refuses at once)\n"
+                        "  --queue-ms-plain N the same for a non-streamed request, which cannot be told it is\n"
+                        "              queueing, so it keeps a short bound (default 5000)\n"
+                        "  --load-queue-ms N a load refused because another client holds the NPU array waits at\n"
+                        "              most N ms for it to free before the driver is called dead (default 45000;\n"
+                        "              0 refuses at once). The refusal shares code 102 with a dead array, and only\n"
+                        "              time tells them apart (engine #1085, a per-client partition)\n"
                         "  --opt       an option for a private route (docs/npu.md, \"Private routes\")\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
     }
     if (queue_ms < 0) throw std::runtime_error("--queue-ms takes 0 (refuse at once) or more, not " +
                                                std::to_string(queue_ms));
+    if (queue_ms_plain < 0) throw std::runtime_error("--queue-ms-plain takes 0 (refuse at once) or more, not " +
+                                                     std::to_string(queue_ms_plain));
+    if (load_queue_ms < 0) throw std::runtime_error("--load-queue-ms takes 0 (refuse at once) or more, not " +
+                                                    std::to_string(load_queue_ms));
     if (model_dir.empty()) throw std::runtime_error("-m <model dir> is required");
     // Lemonade hands over the checkpoint path, which may name the container file.
     if (std::filesystem::is_regular_file(model_dir)) model_dir = std::filesystem::path(model_dir).parent_path().string();
 
     Engine e;
     e.queue_ms = queue_ms;
+    e.queue_ms_plain = queue_ms_plain;
     e.id = alias.empty() ? std::filesystem::path(model_dir).filename().string() : alias;
     httplib::Server srv;
     install_request_guard(srv, host);  // Host / Origin (app/http_guard.h)
@@ -440,6 +472,17 @@ int run_unified(int argc, char** argv) {
         if (!ready) { r.status = 503; return; }
         handle_generate(e, q, r, false, on_run_failed);
     });
+    // Who may have the NPU (app/npu_device_lock.h, engine#612).  This route had no cross-process lock while
+    // `forward-serve` took one, and it is the SHIPPED front door: `1bit serve -m <q4nx dir> --device npu` lands
+    // here, and so does the payload's Lemonade backend.  Two such processes then dispatch at the same instant, which
+    // is the measured wedge: two serves, both `code 614 ... state 8, run 0 of 28`, one TDR (DPU PC 0xffffffff) and
+    // hwctx_num = 2 (evidence hrx-study/evidence/fabric/npu-longctx/two-client-20261105-034608, engine#1051).
+    // Exclusive, like every other route: a second backend waits HERE -- it does not dispatch on a live context -- and
+    // takes the device when this one exits, which a failed run makes it do (the exit-1 path above).  Taking it before
+    // the model is opened matters: opening a context is the other half of what the lock is protecting.  The fd stays
+    // open for the life of the process; closing it, or exiting, releases the lock.
+    const int lock_fd = std::getenv("NPU_NO_DEVICE_LOCK") ? -1 : take_npu_device_lock(1);
+    (void)lock_fd;
     if (!srv.bind_to_port(host, port)) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
     // Serve /v1/health (503 until ready) while the model loads.
     std::thread listener([&] { srv.listen_after_bind(); });
@@ -458,6 +501,10 @@ int run_unified(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     if (const std::string why = npu_model_problem(model_dir, opts); !why.empty()) throw std::runtime_error(why);
     const NpuModel kind = npu_model_kind(model_dir, opts);
+    // A context refused because another client owns the array waits this long before it is called dead
+    // (engine #1085 / decision 2026-11-05 item 2: code 102 is the same for "busy" and "dead", so we queue).
+    onebit::LoadRetryPolicy load_policy;
+    load_policy.refusal_window_s = load_queue_ms / 1000.0;
     e.model = std::make_unique<npu::Model>(model_dir);
     e.tok = std::make_unique<npu::Tokenizer>(model_dir + "/tokenizer.json");
     if (kind == NpuModel::Private) {
@@ -465,7 +512,10 @@ int run_unified(int argc, char** argv) {
         const npu::PrivateRoute* rp = npu::route_for(model_dir, opts, &why);
         if (!rp) throw std::runtime_error(model_dir + ": the private route no longer serves it" + (why.empty() ? "" : ": " + why));
         const npu::PrivateRoute& route = *rp;
-        e.priv = route.open(*e.model, *e.tok, model_dir, opts);
+        // Engine #1010: a load that starts right after an evict can hit the previous backend's hardware context still
+        // being torn down. Retry briefly (and log each reason) instead of exiting 1 inside 100 ms with nothing to say.
+        open_with_retry(load_policy, "opening the private route's NPU context",
+                        [&] { e.priv = route.open(*e.model, *e.tok, model_dir, opts); });
         e.max_context = e.priv->max_context();
         e.default_penalty = e.priv->default_repetition_penalty();
         e.open_think = e.priv->opens_think();
@@ -475,7 +525,8 @@ int run_unified(int argc, char** argv) {
         const std::string type = e.model->dims().model_type;
         if (type != "qwen3" && type != "qwen2")
             throw std::runtime_error("model_type '" + type + "': the fast lane serves the Qwen2/Qwen3 layer kernel only");
-        e.lane = std::make_unique<npu::Lane>(*e.model, npu_kernel_dir(model_dir));
+        open_with_retry(load_policy, "opening the layer lane's NPU context",
+                        [&] { e.lane = std::make_unique<npu::Lane>(*e.model, npu_kernel_dir(model_dir)); });
     }
     ready = true;
     std::fprintf(stderr, "1bit unified: %s ready in %.0f ms on %s:%d\n", e.id.c_str(),

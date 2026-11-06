@@ -23,8 +23,11 @@
 #     an open RFC #213 gate to check on ZAYA1-VL),
 #   - Qwen3.8-Flash-Next's qwen4exp (ported to HRX at llama.cpp pin e57beb97) takes the same route
 #     as a plain file,
+#   - a mapped architecture the registry lists for HRX takes the same route: Zyphra Zamba2 was the
+#     example of an *unmapped* one until the 2026-11-05 pin bump (817d0815b) mapped zamba2/zamba/
+#     blackmamba, so it is a positive row now,
 #   - an architecture our llama.cpp does not build (not in registry/architectures.json's
-#     gguf_architectures.hrx: Zyphra Zamba2, a made-up one) is refused with a pointer to Lemonade's
+#     gguf_architectures.hrx: a made-up one) is refused with a pointer to Lemonade's
 #     llamacpp backend, under auto and when asked for by name,
 #   - --moe-slots is refused as not in this build (it moves to HRX with Flash-Next),
 #   - --parallel 4 on a gated delta-net model: in a build with HRX, auto serves it on HRX0 with one
@@ -76,6 +79,12 @@ run() {  # <record> <model> [serve args]
     RECORD="$1" "$bin" serve -m "$scratch/$2.gguf" --port "$port" --llama-server "$scratch/backend.py" "${@:3}" >"$1.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do [ -s "$1" ] && break; sleep 0.1; done
+    # A server that never came up because it could not bind is a port collision, not a defect in
+    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$1.log"; then
+        echo "FAIL: device_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$1.log" | head -1))"
+        exit 1
+    fi
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 field() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$1" "$2"; }
@@ -107,9 +116,8 @@ check "--device auto runs --mmproj on $where" '[ "$(after "$scratch/mmproj.json"
 
 run "$scratch/flashnext.json" flashnext
 check "--device auto runs Flash-Next (qwen4exp) on $where" '[ "$(after "$scratch/flashnext.json" --device)" = "$expected" ]'
-check "an architecture our llama.cpp does not map (zamba2) is refused under auto" 'refused "Lemonade" zamba'
-check "  and on --device hrx" 'refused "architecture zamba2 is not in" zamba --device hrx'
-check "  and on --device cpu" 'refused "architecture zamba2 is not in" zamba --device cpu'
+run "$scratch/zamba.json" zamba
+check "Zyphra Zamba2 (mapped since the 817d0815b pin bump) routes like a plain file: $where" '[ "$(after "$scratch/zamba.json" --device)" = "$expected" ]'
 check "  and any architecture the registry does not list" 'refused "architecture not-an-arch is not in" madeup'
 check "an H32 file is refused by name" 'refused "H32 file" h32'
 check "  on --device hrx too" 'refused "dropped that format" h32 --device hrx'

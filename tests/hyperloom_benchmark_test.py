@@ -116,6 +116,15 @@ def main():
         assert ident["bin_dir"].endswith("hrx/llama/bin"), ident
         assert ident["sha256"] == hashlib.sha256(onebit.read_bytes()).hexdigest(), ident
 
+    # Same class, one level up: nothing named the *workload script* that computed the number, so an arm run
+    # from another checkout (or from an unmerged branch) produced a JSON indistinguishable from `main`'s.
+    # Measured: 2026-11-05 04:06 ran from the #1034-only `hl-boxcond` tree, where the artifact could not
+    # have carried `drafting` at all. The hash is checked against an independently computed one, so a field
+    # that reads the wrong file (or a prefix) fails here.
+    scripts = bench.scripts_identity()
+    assert scripts["path"].endswith("tools/hyperloom/custom/benchmark.py"), scripts
+    assert scripts["sha256"] == hashlib.sha256(BENCH.read_bytes()).hexdigest(), scripts
+
     # HL_LONGCTX and HL_CTX are independent variables and the 8192 default is smaller than every
     # long-context value in use, so a run that set only HL_LONGCTX asked for an 18.8k prompt on an
     # 8192-token server: rejected, or answered on a shifted context = a different measurement wearing
@@ -149,6 +158,78 @@ def main():
         os.environ["IREE_HAL_AMDGPU_LIBHSA_PATH"] = str(pathlib.Path(tmp) / "absent.so.1")
         assert bench.device_stack()["hsa_runtime"] is None, bench.device_stack()
     os.environ.pop("IREE_HAL_AMDGPU_LIBHSA_PATH")
+
+    # And the conditions it ran in: a score is measured on a shared box, and on 2026-11-01 the same
+    # workload at the same configuration produced 44.69 (quiet die, no swap) and 31.68 (85 GB of 122 GB
+    # in use, 37 GB of swap, die climbing) — both gate-passing, and the JSONs could not tell them apart.
+    # Read from this box rather than stubbed: these are the files the field reads, and every one of them
+    # has to come back a number here. Absent is a null, never a zero or a guess, so the fake root check
+    # below stands in for a box that exposes nothing.
+    box = bench.box_conditions()
+    assert box["tctl_c"] is None or 20.0 < box["tctl_c"] < 120.0, box
+    assert box["gtt_used_gib"] is not None and box["gtt_total_gib"] is not None, box
+    assert 0.0 <= box["gtt_used_gib"] <= box["gtt_total_gib"], box
+    assert box["mem_available_gib"] is not None and box["mem_available_gib"] > 0, box
+    # The hwmon channel is found by label, not by a hardcoded index: the k10temp Tctl has come back as
+    # hwmon2 and as hwmon4 across six reboots in three days. A root with no Tctl label yields null.
+    real_root = bench.HWMON_ROOT
+    with tempfile.TemporaryDirectory() as tmp:
+        bench.HWMON_ROOT = pathlib.Path(tmp)
+        assert bench.die_temp_c() is None, bench.die_temp_c()
+        (pathlib.Path(tmp) / "hwmon7").mkdir()
+        (pathlib.Path(tmp) / "hwmon7/temp1_label").write_text("edge\n", encoding="ascii")
+        (pathlib.Path(tmp) / "hwmon7/temp1_input").write_text("99000\n", encoding="ascii")
+        assert bench.die_temp_c() is None  # a different sensor is not the die
+        (pathlib.Path(tmp) / "hwmon7/temp1_label").write_text("Tctl\n", encoding="ascii")
+        assert bench.die_temp_c() == 99.0, bench.die_temp_c()
+        bench.HWMON_ROOT = real_root
+    # Same class, other direction: a counter the box does not expose is null, not 0.
+    assert bench.meminfo_gib(pathlib.Path("/nonexistent/mem_info_gtt_used"), 2 ** 30) is None
+    # The arm's own spread, not just its start: the aborted 2026-11-01 arm was claimed at 54 C and hit
+    # 93 C inside the run, so the summary keeps both ends and says how many samples it saw.
+    samples = [{"tctl_c": 54.0, "gtt_used_gib": 1.0, "gtt_total_gib": 120.0, "mem_available_gib": 9.0},
+               {"tctl_c": 93.0, "gtt_used_gib": 1.5, "gtt_total_gib": 120.0, "mem_available_gib": 8.0},
+               {"tctl_c": None, "gtt_used_gib": 2.0, "gtt_total_gib": 120.0, "mem_available_gib": 7.0}]
+    got = bench.box_summary(samples)
+    assert got["tctl_c"] == 54.0 and got["tctl_c_max"] == 93.0 and got["tctl_c_min"] == 54.0, got
+    assert got["tctl_samples"] == 2, got  # the unreadable sample counts as nothing, not as 0 C
+    assert got["gtt_used_gib"] == 1.0, got  # start GTT, not the last one
+    assert bench.box_summary([]) is None
+
+    # And the NPU is a condition of the score, not just of the die: the 2026-11-05 policy entry for this
+    # box says the engines coexist safely but that a GPU arm beside a running NPU *matrix* corrupts both
+    # lanes' numbers. This lane's arm was refused 27 times on that gate, and a number measured beside a
+    # job has to be able to say so -- the owner's resident `npu-serve-keeper` is baseline, not a job.
+    real_home = os.environ.pop("HL_REAL_HOME", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            os.environ["HL_REAL_HOME"] = tmp
+            assert bench.npu_conditions() == {"npu_holder": None, "npu_job": False,
+                                              "npu_queued": 0}, bench.npu_conditions()
+            (home / "NPU-TOKEN").write_text("npu-serve-keeper pid 4675\n", encoding="utf-8")
+            assert bench.npu_conditions()["npu_job"] is False   # the resident serve is baseline
+            (home / "NPU-QUEUE").mkdir()
+            (home / "NPU-QUEUE/.log").write_text("noise\n", encoding="utf-8")
+            (home / "NPU-QUEUE/0179392.mosaic-regate9").write_text("pid=1\n", encoding="utf-8")
+            (home / "NPU-TOKEN").write_text("gpu-hold mosaic-regate9 pid 1584738 2026-11-05\n",
+                                             encoding="utf-8")
+            got = bench.npu_conditions()
+            assert got["npu_job"] is True and got["npu_queued"] == 1, got  # dotfiles are not tickets
+            assert got["npu_holder"].startswith("gpu-hold mosaic-regate9"), got
+            # A half-written or unreadable claim file is not a quiet NPU.
+            (home / "NPU-TOKEN").write_text("\n", encoding="utf-8")
+            assert bench.npu_conditions()["npu_holder"] is None, bench.npu_conditions()
+            # And the arm's own summary counts how many of its samples saw a job.
+            got = bench.box_summary([{"tctl_c": 60.0, "npu_job": False},
+                                     {"tctl_c": 61.0, "npu_job": True},
+                                     {"tctl_c": 62.0, "npu_job": True}])
+            assert (got["npu_job_samples"], got["npu_samples"]) == (2, 3), got
+            assert got["npu_job"] is False, got  # the start snapshot, same shape as gtt_used_gib
+    finally:
+        os.environ.pop("HL_REAL_HOME", None)
+        if real_home is not None:
+            os.environ["HL_REAL_HOME"] = real_home
 
     # And the verdict has to name what it was relative to: `HL_STATE` is per-box and the base logits are
     # regenerated when missing, so a KLD number reads PASS against a reference the JSON never named.
@@ -243,6 +324,64 @@ def main():
         # A different file under the same name is a different model, which is the point.
         model.write_bytes(b"GGUF" + b"\0" * 4095)
         assert bench.model_identity(model)["sha256"] != ident["sha256"]
+
+    # The artifact has to say whether the decode it scored *drafted*, because on this pin it drafts with
+    # the model's own MTP head unless told not to, and the cap is worth ~18 % of 18.8k decode (~25 % of
+    # tg128). The lines below are verbatim from the arm that exposed this (2026-11-04 22:39, 27B
+    # UD-Q4_K_XL at 20,480 ctx): `drafting` was `{}` while serve.log reported drafting.
+    with tempfile.TemporaryDirectory() as tmp:
+        log = pathlib.Path(tmp) / "serve.log"
+        log.write_text(
+            "1bit serve: /m/model.gguf carries its own MTP head: drafting with it (--spec-type draft-mtp;"
+            " --no-mtp or ONEBIT_NO_MTP=1 turns it off)\n"
+            "1bit serve: recipe qwen35-mtp-max-3: --spec-draft-n-max 3\n"
+            "0.40.550.563 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (    5 accepted"
+            " /     5 generated), mean len =  3.50\n"
+            "4.04.014.149 I slot print_timing: id  0 | task 532 | draft acceptance = 0.67460 (   85 accepted"
+            " /   126 generated), mean len =  3.02\n",
+            encoding="utf-8")
+        got = bench.drafting_observed(log)
+        assert got["status"] == "drafted", got
+        assert got["spec_type"] == "draft-mtp", got
+        assert got["recipe"] == "qwen35-mtp-max-3", got
+        assert got["recipe_args"] == "--spec-draft-n-max 3", got
+        assert got["tasks_reporting"] == 2, got
+        assert got["accept_rate_last"] == 0.67460 and got["mean_acc_len_last"] == 3.02, got
+        assert (got["accepted_last"], got["generated_last"]) == (85, 126), got
+        assert got["mean_acc_len_max"] == 3.50, got
+        # Three states used to serialise as the same `None`: a log that says nothing about drafting, a log
+        # whose server says drafting is OFF, and a log that could not be read. The middle one is a measured
+        # claim and the last is the absence of one, so reading either off `null` is how a lost serve.log came
+        # to look like a non-drafting arm (measured 2026-11-05 22:53: the `HL_MTP_MAX=0` arm at 18.8k -- the
+        # box's own non-drafting row -- recorded `serve: null`, exactly what an unreadable log produced).
+        silent = pathlib.Path(tmp) / "silent.log"
+        silent.write_text("I slot print_timing: id 0 | task 1 | eval time\n", encoding="utf-8")
+        assert bench.drafting_observed(silent)["status"] == "no-evidence", bench.drafting_observed(silent)
+        # Verbatim from that arm's serve.log: the server stating there is no spec implementation at all.
+        off = pathlib.Path(tmp) / "off.log"
+        off.write_text("0.48.901.174 I spec common_specu: no implementations specified for speculative"
+                       " decoding\n0.48.901.156 I srv    load_model: speculative decoding will use"
+                       " checkpoints\n", encoding="utf-8")
+        not_drafted = bench.drafting_observed(off)
+        assert not_drafted["status"] == "not-drafted", not_drafted
+        unreadable = bench.drafting_observed(pathlib.Path(tmp) / "missing.log")
+        assert unreadable["status"] == "unreadable", unreadable
+        # The whole point, and the assertion that would have failed before the fix.
+        assert not_drafted != unreadable, (not_drafted, unreadable)
+        assert len({bench.drafting_observed(log)["status"], not_drafted["status"],
+                    bench.drafting_observed(silent)["status"], unreadable["status"]}) == 4
+    # ...and "no lever was set" must not look like "no drafting": unset keeps serve's own MTP default,
+    # while HL_MTP_MAX=0 is an explicitly non-drafting measurement. Both used to serialise as {}.
+    for k in ("HL_DFLASH", "HL_DFLASH_GGUF", "HL_MTP_HEAD", "HL_MTP_MAX"):
+        os.environ.pop(k, None)
+    ident = bench.drafting_summary(pathlib.Path("/nonexistent/serve.log"))
+    assert ident["requested"] is None and "requested_note" in ident, ident
+    assert ident["serve"] == {"status": "unreadable"}, ident
+    os.environ["HL_MTP_MAX"] = "0"
+    ident = bench.drafting_summary(pathlib.Path("/nonexistent/serve.log"))
+    assert ident["requested"] == {"HL_MTP_MAX": "0"}, ident
+    assert "requested_note" not in ident, ident
+    os.environ.pop("HL_MTP_MAX", None)
 
     print("hyperloom_benchmark_test: OK")
     return 0

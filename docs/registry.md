@@ -91,6 +91,10 @@ counts and the coverage read against the registry and the checked results. The
 `census.yml` workflow runs daily at 05:17 UTC. It rebuilds the registry from the pins,
 sweeps HF, and opens a PR when anything changed.
 
+The census counts what the engine *can* run; which revision of each upstream model we actually run,
+ship or were built from is `models/pins.json`, checked daily by `tools/pin_watch.py`
+([model-pins.md](model-pins.md)).
+
 The census of 2026-10-17 (the first full sweep ran 2026-09-25), with `registry/census.json` holding the latest:
 
 | | models | share of those with an architecture |
@@ -163,7 +167,10 @@ and sizes (`?blobs=true`, fetched only for a repo that is new or changed), its l
 base model, its architecture, whether `architectures.json` maps that architecture, and
 whether the npu route already serves the family. A family the registry does not map prints
 `!! NEW FLM` and is the alert, exactly like an uncovered class: exit 1 either way, so
-neither watch can turn the other's alert green. A repo with no config is one of the org's
+neither watch can turn the other's alert green. The NPU-route answer for an org family the
+registry maps only for hrx, or for a pack whose class no backend accepts, is recorded in
+[npu.md](npu.md#fastflowlms-npu2-drops-the-families-the-route-does-not-serve) rather than mapped
+as a GGUF alias. A repo with no config is one of the org's
 quantized `.gguf` drops — a derivative, reported but not an alert. A release whose notes or
 asset names mention `q4nx`, `chunk` or `layout` is marked `kernel-format` for a human to
 read before the pinned Q4NX decoder moves; that line alone does not alert ("chunk" also
@@ -185,5 +192,7 @@ tools/census.py --report           # recompute coverage from the saved counts
 tools/census_watch.py              # newest models vs the registry, plus FastFlowLM's org and
                                    # releases (--full to list all); exit 1 on an uncovered class
                                    # or an unmapped FastFlowLM family
+tools/pin_watch.py --check         # every pinned upstream revision vs its current main; exit 1 when
+                                   # one moved, with the chat template of anything that moved re-read
 scripts/census-watch.sh            # the same, with the log file and the origin/main refresh
 ```

@@ -40,8 +40,16 @@ void put16(uint8_t* p, uint16_t v) {
     p[1] = uint8_t(v >> 8);
 }
 
-// the q4_1 code byte and nibble of row r, column c
-size_t q41_code_at(int r, int c) { return 1024 + size_t((r / 16) * 8 + c / kGroup) * 256 + 8 * (c % kGroup) + (r % 16) / 2; }
+float f32(const uint8_t* p) {
+    float v;
+    std::memcpy(&v, p, 4);
+    return v;
+}
+
+// the code byte of row r, column c, relative to the tile's code region (q4_1: @1024, q4_1f: @2048)
+size_t q41_code_at(int r, int c) {
+    return size_t((r / 16) * 8 + c / kGroup) * 256 + 8 * (c % kGroup) + (r % 16) / 2;
+}
 
 // IEEE binary16 -> float, exactly (every finite half is a float; subnormals included, because a
 // scale of 1e-6 is a subnormal and decoding it as zero would be a silent weight of zero).
@@ -81,10 +89,40 @@ inline uint8_t t2_packed(const uint8_t* t, int r, int c) { return t[size_t(r) * 
 Chunk chunk_of(const Tensor& t) {
     const int64_t last = t.shape.empty() ? 0 : t.shape.back();
     if ((t.shape.size() == 2 || t.shape.size() == 3) &&
-        (last == int64_t(Chunk::Q4_1) || last == int64_t(Chunk::Q4K) || last == int64_t(Chunk::Q8) ||
-         last == int64_t(Chunk::T2)))
+        (last == int64_t(Chunk::Q4_1) || last == int64_t(Chunk::Q4_1F) || last == int64_t(Chunk::Q4K) ||
+         last == int64_t(Chunk::Q8) || last == int64_t(Chunk::T2)))
         return Chunk(last);
     throw std::runtime_error("not a Q4NX chunked tensor (last dimension " + std::to_string(last) + ")");
+}
+
+const char* layout_of(Params params) { return params == Params::F32 ? "q4nx-2" : "q4nx-1"; }
+
+Params params_of_layout(const std::string& layout) {
+    if (layout.empty() || layout == "q4nx-1") return Params::Bf16;
+    if (layout == "q4nx-2") return Params::F32;
+    // An unknown version is refused rather than read as the old form: guessing "bf16" here would
+    // silently decode a future container's parameters at the wrong width (engine#1185).
+    throw std::runtime_error("container layout \"" + layout + "\" is not a q4nx version this decoder knows");
+}
+
+Chunk chunk_of(Params params) { return params == Params::F32 ? Chunk::Q4_1F : Chunk::Q4_1; }
+
+void q4_1_params(Chunk kind, const uint8_t* t, float* scale, float* zero) {
+    const int n = kRows * (kCols / kGroup);  // 256 = one per 32-column group of every row
+    if (kind == Chunk::Q4_1F) {
+        for (int i = 0; i < n; ++i) {
+            scale[i] = f32(t + 4 * size_t(i));
+            zero[i] = f32(t + 1024 + 4 * size_t(i));
+        }
+    } else if (kind == Chunk::Q4_1) {
+        for (int i = 0; i < n; ++i) {
+            scale[i] = bf16(t + 2 * size_t(i));
+            zero[i] = bf16(t + 512 + 2 * size_t(i));
+        }
+    } else {
+        throw std::runtime_error("chunk kind " + std::to_string(uint32_t(kind)) +
+                                 " has no per-group scale/zero");
+    }
 }
 
 int t2_code(const uint8_t* t, int r, int c) {
@@ -115,9 +153,13 @@ void dequant_tile(Chunk kind, const uint8_t* t, float* out, int ld) {
             const int g = c / kGroup, i = g * kRows + r;
             float w;
             if (kind == Chunk::Q4_1) {
-                const uint8_t b = t[q41_code_at(r, c)];
+                const uint8_t b = t[1024 + q41_code_at(r, c)];
                 const int code = (r % 2 == 0) ? (b & 15) : (b >> 4);
                 w = float(code) * bf16(t + 2 * i) + bf16(t + 512 + 2 * i);
+            } else if (kind == Chunk::Q4_1F) {
+                const uint8_t b = t[2048 + q41_code_at(r, c)];
+                const int code = (r % 2 == 0) ? (b & 15) : (b >> 4);
+                w = float(code) * f32(t + 4 * i) + f32(t + 1024 + 4 * i);
             } else if (kind == Chunk::Q4K) {
                 const uint8_t b = t[512 + c * 16 + r / 2];
                 const int code = (r % 2 == 0) ? (b & 15) : (b >> 4);
@@ -160,7 +202,7 @@ void q4k_to_q4_1(const uint8_t* k, uint8_t* q) {
         for (int c = 0; c < kCols; c++) {
             const uint8_t b = k[512 + c * 16 + r / 2];
             const uint8_t code = (r % 2 == 0) ? (b & 15) : (b >> 4);
-            q[q41_code_at(r, c)] |= (r % 2 == 0) ? code : uint8_t(code << 4);
+            q[1024 + q41_code_at(r, c)] |= (r % 2 == 0) ? code : uint8_t(code << 4);
         }
     }
 }
@@ -169,6 +211,21 @@ std::vector<uint8_t> as_q4_1(const Tensor& t) {
     const Chunk kind = chunk_of(t);
     const size_t n = size_t(t.bytes / uint64_t(kind));
     if (kind == Chunk::Q4_1) return std::vector<uint8_t>(t.data, t.data + n * size_t(kind));
+    if (kind == Chunk::Q4_1F) {
+        // The device's q4_1 form: the same codes, the parameters rounded to bf16 -- the only loss an
+        // imported container takes when it is repacked for the device (engine#1185).
+        std::vector<uint8_t> out(n * size_t(Chunk::Q4_1), 0);
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t* f = t.data + i * size_t(kind);
+            uint8_t* q = out.data() + i * size_t(Chunk::Q4_1);
+            for (int j = 0; j < kRows * (kCols / kGroup); ++j) {
+                put16(q + 2 * size_t(j), to_bf16(f32(f + 4 * size_t(j))));
+                put16(q + 512 + 2 * size_t(j), to_bf16(f32(f + 1024 + 4 * size_t(j))));
+            }
+            std::memcpy(q + 1024, f + 2048, 4096);
+        }
+        return out;
+    }
     if (kind == Chunk::Q8) throw std::runtime_error("a Q8 tensor does not fit q4_1 (8-bit codes)");
     if (kind == Chunk::T2)
         throw std::runtime_error("a t2 tensor does not fit q4_1 (per-128 fp16 scale vs per-32 bf16); "

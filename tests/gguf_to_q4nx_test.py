@@ -25,6 +25,7 @@ usage: tests/gguf_to_q4nx_test.py        (needs numpy and gguf)
 """
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -84,7 +85,7 @@ def q4_k_blocks(rng, N, K):
     return b.reshape(N, nb * 144)
 
 
-def synthetic(path, rng):
+def synthetic(path, rng, rope_scaling=None):
     H, IM, NH, NKV, HD, V = 256, 512, 2, 1, 128, 512
     w = gguf.GGUFWriter(path, "qwen3")
     w.add_block_count(1)
@@ -96,6 +97,10 @@ def synthetic(path, rng):
     w.add_key_length(HD)
     w.add_value_length(HD)
     w.add_rope_freq_base(1e6)
+    if rope_scaling:
+        # what llama.cpp writes for a model whose config.json carries rope_scaling
+        w.add_rope_scaling_type(getattr(gguf.RopeScalingType, rope_scaling.upper()))
+        w.add_rope_scaling_factor(4.0)
     w.add_layer_norm_rms_eps(1e-6)
     w.add_eos_token_id(1)
     # The two flags app/forward_serve.cpp builds the prompt from; add_bos_token is the one a
@@ -261,6 +266,31 @@ def tokenizer_flags_check(src, out, ok):
     return ok
 
 
+def permute_q8_tile(path, tensor):
+    """Rewrite one Q8 tensor's first tile in the OTHER 8704-B code order (Qwen3.6-35B's).
+
+    The scales stay where they are, so the tile still decodes to numbers -- which is the failure
+    this test is about: a container in the wrong order serves noise, not an error.
+    """
+    import json
+    import struct
+    with open(path, "r+b") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+        base = 8 + n
+        off = hdr[tensor]["data_offsets"][0]
+        f.seek(base + off)
+        tile = bytearray(f.read(G.Q8))
+        codes = bytes(tile[512:])
+        moved = bytearray(8192)
+        for r in range(32):
+            for k in range(256):
+                moved[(r // 16) * 4096 + (k // 32) * 512 + (k % 32) * 16 + (r % 16)] = codes[k * 32 + r]
+        tile[512:] = moved
+        f.seek(base + off)
+        f.write(tile)
+
+
 def q8_check(gguf_path, out, ok):
     """--dtype8: the named tensors are 8704-B Q8 chunks, an exactly-4-bit one is left alone, and
     the Q8 tile re-encodes byte for byte from the source (so the encoder IS the decoder's inverse)."""
@@ -296,6 +326,30 @@ def q8_check(gguf_path, out, ok):
         rel = float(np.sqrt(((got - w) ** 2).sum() / (w ** 2).sum()))
         checks.append((f"{key}: Q8 tile re-encodes to the same bytes", again))
         checks.append((f"{key}: 8-bit error rel rms {rel:.4f} (<= 0.01)", rel <= 0.01))
+    for label, good in checks:
+        print(f"{'ok  ' if good else 'FAIL'} {label}")
+        ok = ok and good
+
+    # The same chunks judged against the SOURCE WEIGHTS instead of the packer's own round trip:
+    # check_q4nx_dir.py --against decodes every Q8 tile both ways and must find the order
+    # npu/q4nx.cpp decodes. The golden hash pins our encoder to our decoder; this pins the
+    # container to the model, so a packer that wrote the other 8704-B order cannot pass.
+    checker = os.path.join(HERE, "..", "tools", "check_q4nx_dir.py")
+
+    def against(container):
+        r = subprocess.run([sys.executable, checker, container, "--against", gguf_path,
+                            "--q8-samples", "2"], capture_output=True, text=True)
+        return r.returncode, r.stdout
+
+    rc, _ = against(os.path.join(out, "model.q4nx"))
+    checks = [("--against accepts the packed container (rc 0)", rc == 0)]
+    with tempfile.TemporaryDirectory() as t:
+        wrong = os.path.join(t, "model.q4nx")
+        shutil.copyfile(os.path.join(out, "model.q4nx"), wrong)
+        permute_q8_tile(wrong, o_proj)
+        rc_wrong, text = against(wrong)
+        checks.append(("--against refuses the other code order (rc 1)", rc_wrong == 1))
+        checks.append(("the refusal names the tensor", o_proj in text))
     for label, good in checks:
         print(f"{'ok  ' if good else 'FAIL'} {label}")
         ok = ok and good
@@ -396,6 +450,21 @@ def dense_3d_pack_check(gguf_path, out, ok):
     return ok and good and not left
 
 
+def rope_scaling_check(gguf_path, out, kind, ok):
+    """A declared rope scaling this route cannot apply is refused by name, not silently dropped."""
+    tool = os.path.join(HERE, "..", "tools", "gguf_to_q4nx.py")
+    r = subprocess.run([sys.executable, tool, "pack", gguf_path, out], capture_output=True, text=True)
+    msg = r.stdout + r.stderr
+    good = r.returncode != 0 and "rope.scaling.type" in msg and kind in msg
+    print(f"{'ok  ' if good else 'FAIL'} packing a {kind}-scaled GGUF exits non-zero and names the "
+          f"type (rc {r.returncode})")
+    if not good:
+        print(msg[-800:])
+    left = os.path.exists(os.path.join(out, "model.q4nx"))
+    print(f"{'ok  ' if not left else 'FAIL'} no model.q4nx was written for it")
+    return ok and good and not left
+
+
 def main():
     ok = golden_tile()
     ok = golden_tile8() and ok
@@ -412,6 +481,11 @@ def main():
                 print(r.stderr, end="")
                 print(f"FAIL {cmd[0]} exited {r.returncode}")
                 ok = False
+        yarn = os.path.join(d, "yarn.gguf")
+        for kind in ("yarn", "linear", "longrope"):
+            scaled = os.path.join(d, f"{kind}.gguf")
+            synthetic(scaled, rng, rope_scaling=kind)
+            ok = rope_scaling_check(scaled, os.path.join(d, f"{kind}-out"), kind, ok)
         mout = os.path.join(d, "moe")
         moe_synthetic(os.path.join(d, "tiny-moe.gguf"), rng)
         for cmd in (["pack", os.path.join(d, "tiny-moe.gguf"), mout],

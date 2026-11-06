@@ -40,9 +40,11 @@
 #include "npu_answer_parser.h"
 #include "npu_chatml.h"
 #include "npu_grammar.h"
+#include "npu_load_retry.h"  // engine#1241: a refused NPU context names another client, not a dead device
 #include "npu_prefix_cache.h"
 #include "npu_prompt_ids.h"
 #include "npu_sampling.h"
+#include "npu_stop_tokens.h"
 #include "npu_systemone.h"
 #include "tokenizer.h"
 #include "../npu/decision.h"  // the d3 readout head (npu/decision.h, issue #653)
@@ -79,7 +81,7 @@ struct ForwardEngine {
     int  bos_id  = -1;     // config.json bos_token_id (the chat template may open with it)
     bool add_bos = false;  // config.json add_bos_token: the rendered chat prompt needs BOS
     std::unique_ptr<Q4nxNpuForward> fwd;
-    int eos = -1;
+    std::vector<int> eos;   // config.json eos_token_id: one id or a list (app/npu_stop_tokens.h)
     int endoftext = -1;
     int max_context = 0;   // config.json max_position_embeddings: prompt plus answer
     // The chat route renders ChatML for every container (#832), so whether this container's
@@ -110,6 +112,12 @@ struct ForwardEngine {
 struct CallStats {
     int prompt_tokens = 0;
     int completion_tokens = 0;
+    // AMD's model_benchmark protocol reports two stages per request -- prompt processing (to first
+    // token) and token generation -- and onnx/bench_npu_serve.py reads them from the reply's
+    // `timings` (app/unified.cpp has always emitted them; this route did not, so no NPU row from
+    // this route could be expressed in AMD's units at all).
+    double prompt_ms = 0;
+    double predicted_ms = 0;
     npu::PrefixDecision prefix{-1, 0, "off"};  // "off" when --prefix-slots 0
 };
 
@@ -182,13 +190,16 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         res.set_content(json{{"error", {{"message", std::string("bad request: ") + ex.what()}}}}.dump(), "application/json");
         return;
     }
-    const int max_tokens = body.value("max_completion_tokens", body.value("max_tokens", 256));
     // Decode-time controls.  Every field is optional and absent means the greedy decode
     // this route has always done, so existing callers see no change; a field the route
     // cannot honour is a 400 rather than a silently ignored key.
     npu::Options opts;
     std::unique_ptr<npu::Grammar> grammar;
+    int max_tokens = 256;
     try {
+        // Both read here, not before: a wrong type must be the 400 below, not a json::type_error that escapes
+        // the guard and answers 500 with an empty body (engine#1106).
+        max_tokens = npu::int_field(body, "max_completion_tokens", npu::int_field(body, "max_tokens", 256));
         opts = npu::options_from_body(body);
         // logprobs is served in the chat shape; the legacy /v1/completions shape is a different
         // object this route does not implement, and a silently dropped field is what it must not do.
@@ -209,7 +220,14 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         res.set_content(R"({"error":{"message":"prompt longer than the context"}})", "application/json");
         return;
     }
-    const bool stream = body.value("stream", false);
+    bool stream = false;
+    try {
+        stream = npu::bool_field(body, "stream");  // engine#1106: a wrong type is a 400, not a 500 with no body
+    } catch (const std::exception& ex) {
+        res.status = 400;
+        res.set_content(json{{"error", {{"message", ex.what()}}}}.dump(), "application/json");
+        return;
+    }
     const std::string id = now_id(chat ? "chatcmpl-" : "cmpl-");
     const long created = long(std::chrono::duration_cast<std::chrono::seconds>(
                                   std::chrono::system_clock::now().time_since_epoch()).count());
@@ -240,6 +258,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         const int limit = std::clamp(max_tokens, 0, room);
         std::lock_guard<std::mutex> lock(e.mu);
 
+        const auto t_request = std::chrono::steady_clock::now();
         std::vector<float> logits;
         // Prefill in batched (M>1) passes of at most the kernel's row width: each
         // projection's weight stream is then read once per chunk instead of once
@@ -311,6 +330,12 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             }
         }
 
+        // Prompt processing ends here: every prompt token has been through the model and the first
+        // token's distribution is in `logits`.
+        const auto t_first = std::chrono::steady_clock::now();
+        stats.prompt_ms =
+            std::chrono::duration<double, std::milli>(t_first - t_request).count();
+
         // Sampler state: one generator per request, seeded so a run can be reproduced.
         std::mt19937_64 rng(npu::resolve_seed(opts.sample.seed));
         npu::Grammar::State grammar_state;
@@ -328,18 +353,27 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         // allowed[i] says token i can be appended without leaving the grammar.  The first
         // byte test rejects almost every token cheaply (a JSON object at the start accepts
         // a handful of first bytes out of 256), so only the survivors pay a full feed().
+        // The ids a constrained answer may end on: the container's own eos ids plus <|endoftext|>.
+        std::vector<int> end_ids = e.eos;
+        if (e.endoftext >= 0) end_ids.push_back(e.endoftext);
+        // Ids at or beyond the tokenizer's vocabulary are padding positions, not tokens: decode()
+        // returns "" for them, which used to make them indistinguishable from a byte fragment and so
+        // unconditionally allowed (engine#1182: the model drifts into them once the grammar leaves it
+        // nothing to say, and they emit no text and never end the reply).
+        const size_t vocab = size_t(e.tok->size());
         auto refresh_allowed = [&]() {
             allowed.assign(logits.size(), 0);
             const npu::ByteMask first = gram->next_bytes(grammar_state);
-            for (size_t i = 0; i < logits.size(); i++) {
+            for (size_t i = 0; i < logits.size() && i < vocab; i++) {
                 const std::string& t = e.tok_text[i];
                 if (t.empty()) {
-                    allowed[i] = 1;  // an empty piece cannot leave the grammar
+                    allowed[i] = 1;  // a half-character byte fragment cannot leave the grammar
                 } else if (first.has(static_cast<unsigned char>(t[0]))) {
                     npu::Grammar::State probe = grammar_state;
                     allowed[i] = gram->feed(probe, t) ? 1 : 0;
                 }
             }
+            npu::allow_end_tokens(allowed, grammar_state, end_ids);
         };
 
         std::string pending;  // decoded, not yet sent: a stop sequence may still match in it
@@ -379,11 +413,12 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 }
             }
             const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr);
-            // -1: the grammar allows no token here, so the answer ends where it is.  EOS is
-            // not masked by the grammar on purpose: a constrained answer is still allowed to
-            // stop early (the client validates it), which beats a runaway inside the mask.
+            // -1: the grammar allows no token here, so the answer ends where it is.  An end token is
+            // in the mask only where the grammar can stop (refresh_allowed), so a constrained reply
+            // that completes reports "stop" instead of padding to the budget (engine#1182).
             if (next < 0) { stopped_at_eos = true; break; }
-            if (next == e.eos || (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; break; }
+            if (std::find(e.eos.begin(), e.eos.end(), next) != e.eos.end() ||
+                (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; break; }
             if (gram) gram->feed(grammar_state, e.tok_text[next]);
             const std::string piece = e.tok->decode(next);
             pending += piece;
@@ -422,8 +457,18 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             if (cut > 0) on_text(pending.substr(0, cut), take_held(cut));
         }
         stats.completion_tokens = produced;
+        stats.predicted_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_first).count();
         if (produced >= limit && !stopped_at_eos && !stopped_at_stop) finish = "length";
         return finish;
+    };
+
+    // AMD's two stages, as milliseconds, and nothing derived from them: the protocol's consumers
+    // (onnx/bench_npu_serve.py) compute their own rates, and a rate of ours would be a second
+    // definition of the same stage -- off by one token, because the first token belongs to TTFT in
+    // that protocol.  Two rates for one stage is exactly how two rows end up disagreeing later.
+    auto timings_json = [](const CallStats& st) {
+        return json{{"prompt_ms", st.prompt_ms}, {"predicted_ms", st.predicted_ms}};
     };
 
     // OpenAI's usage object plus the two fields issue #650 reports: how many prompt tokens came
@@ -494,6 +539,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             out["choices"] = json::array({{{"index", 0}, {"text", content}, {"finish_reason", finish}}});
         }
         out["usage"] = usage_json(stats);
+        out["timings"] = timings_json(stats);
         // A piece can be half a character and dump() throws on invalid UTF-8: replace rather than
         // turn a reported logprob into a 500.
         return out.dump(-1, ' ', false, json::error_handler_t::replace);
@@ -542,7 +588,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 }
                 return true;
             };
-            run(emit_pieces);
+            const std::string finish = run(emit_pieces);
             {
                 std::vector<std::pair<bool, std::string>> tail;
                 stream.finish(tail);
@@ -568,11 +614,24 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     chunk["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", "tool_calls"}}});
                     chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
                 }
+                // OpenAI's stream ends with one choice that carries an empty delta and the reason the
+                // generation ended; without it a streaming client cannot tell a `length` cut from a
+                // natural `stop` (the per-delta chunks all say null, and the usage tail has no
+                // choices at all). The tool-call chunk above already reports `tool_calls`, so this is
+                // sent exactly once, and only for the text path.
+                if (stream.calls().empty()) {
+                    json chunk = chunk_tpl;
+                    chunk["choices"] = json::array({{{"index", 0},
+                                                     {"delta", json::object()},
+                                                     {"finish_reason", finish}}});
+                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                }
             }
             {
                 json tail = chunk_tpl;
                 tail["choices"] = json::array();
                 tail["usage"] = usage_json(stats);
+            tail["timings"] = timings_json(stats);
                 chunks->push_back("data: " + tail.dump() + "\n\n");
             }
             auto cursor = std::make_shared<size_t>(0);
@@ -745,7 +804,7 @@ int run_forward_serve(int argc, char** argv) {
     e.tok = std::make_unique<npu::Tokenizer>(tok_json);
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
-    e.eos = json_int(cfg, "eos_token_id", -1);
+    e.eos = npu::eos_token_ids_from_config(cfg);
     e.endoftext = e.tok->token_id("<|endoftext|>");
     // q4nx_config_int finds the key at any depth (a text_config's too).
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
@@ -759,7 +818,8 @@ int run_forward_serve(int argc, char** argv) {
     if (!npu::chatml_supported(*e.tok)) {
         e.chatml_ok = false;
         std::string specials;
-        const std::pair<const char*, int> named[] = {{"bos", e.bos_id}, {"eos", e.eos}};
+        std::vector<std::pair<const char*, int>> named = {{"bos", e.bos_id}};
+        for (int id : e.eos) named.emplace_back("eos", id);
         for (const auto& [label, id] : named) {
             const std::string text = id >= 0 ? e.tok->decode(id) : std::string();
             if (text.empty()) continue;
@@ -787,11 +847,14 @@ int run_forward_serve(int argc, char** argv) {
     e.fwd = std::make_unique<Q4nxNpuForward>();
 
     // Who may have the NPU (app/npu_device_lock.h): one process by default, N when the
-    // operator asks with --npu-streams. It is a policy, not a hardware limit -- the
-    // driver's npu4 sets hwctx_limit = 16 -- and the default stays exclusive because a
-    // second stream takes the same DMA engine and its own copy of the weights: two
-    // engines on two models measured 34.1 % / 70.4 % of solo, 0.41x aggregate
-    // (docs/npu.md "Two streams on one NPU").
+    // operator asks with --npu-streams. hwctx_limit = 16 is not what bounds a second
+    // client -- the array partition is: 8 columns, and this build's kernel set asks for
+    // all 8, so a second client is refused (-ENODEV / code 102) once 0003 is in the
+    // driver, and shared the tiles and wedged the array before it (engine#1084). The
+    // default stays exclusive because a kernel set that does leave columns free still
+    // shares one DMA engine and copies the weights per stream: two engines on two models
+    // measured 34.1 % / 70.4 % of solo, 0.41x aggregate (docs/npu.md "Two streams on one
+    // NPU").
     // Held for the life of the process (fd not closed), exactly like the per-process
     // ELF runner (npu_engine_universal), which takes the same exclusive lock.
     if (!std::getenv("NPU_NO_DEVICE_LOCK"))
@@ -805,7 +868,17 @@ int run_forward_serve(int argc, char** argv) {
     std::unique_ptr<xrt::device> dev;
     if (!host_gemm) dev = std::make_unique<xrt::device>(0);
     const bool ok = dev ? e.fwd->init(*dev, model.c_str(), kernels) : e.fwd->init_host(model.c_str(), kernels);
-    if (!ok) throw std::runtime_error(std::string("forward init failed: ") + e.fwd->last_error());
+    if (!ok) {
+        const std::string why = std::string("forward init failed: ") + e.fwd->last_error();
+        // engine#1241 cure 2: the driver refuses a second client with code 102 / ENODEV, the same message a dead array
+        // answers, so "No such device" reads as a broken device or ELF. If another pid holds the device lock, say so
+        // now: the array is merely owned, and the fix is to wait for that process, not to rebuild anything.
+        if (npu_contexts_refused(why)) {
+            const std::string held = npu_lock_refusal_note();
+            if (!held.empty()) std::fprintf(stderr, "%s\n", held.c_str());
+        }
+        throw std::runtime_error(why);
+    }
 
     // A d3 pack keeps its decision head next to model.q4nx (npu/decision.h). Both files present means
     // the decision routes come up beside the chat ones; a pack without them is a chat model, which is

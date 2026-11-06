@@ -195,9 +195,20 @@ intermediate float tensor then never exists.
   `zp_y`); the EP trace for those runs reads `zp_x=8 zp_w=6 zp_y=-7` with a one-off
   `qdq_colsum k=… n=…`. A symmetric graph never computes the column sums (its trace reads `zp_x=1
   zp_w=1 zp_y=0` and no `qdq_colsum`), which is the point of doing it lazily.
-- **Not done: a zero point along K.** Like a scale along K it would weight the products inside the sum
-  — it needs `Σ_k zp_x[k]·w_q[k][n]`, a column-weighted vector of the weight that no kernel here
-  precomputes — so a graph with one keeps the per-node path.
+- **Not a graph: a zero point along K.** The page's last "Not done" item was this one, and it is not
+  unfinished work — a QDQ graph cannot carry a *1-D* zero point along K. Two facts, one arithmetic and
+  one checked against the runtime: (1) its term is cheap, not a per-step pass — `Σ_k zp_x[k]·w_q[k][n]`
+  is a zero-point-weighted column sum of the weight and `zp_x` is a constant initializer, so it is
+  computed once beside `Σ_k w_q[k][n]` and kept, unlike the row sums; (2) ONNX's `DequantizeLinear`
+  says `x_scale` and `x_zero_point` **must have the same shape**, so a 1-D zero point along K only comes
+  beside a 1-D scale along K, which is the un-foldable term above (it weights the products inside the
+  sum — SmoothQuant's job at export time). Built the one way that could carry the term alone, a K-long
+  zero point beside a per-tensor scale. `onnx.checker` accepts that graph, and the CPU EP's session
+  builds; the node is refused when the CPU EP first prepares it to run (`onnxruntime` 1.29.0, on the
+  first `run()`, not at session creation):
+  `quantize_linear.cc:79 … x_zero_point must be null or a scalar or 1D tensor or size 1`. So the item
+  closes as "cannot occur" rather than "not done": what this epilogue does not fold along the
+  activation's K is what the arithmetic rules out.
 - **Works: the fused group runs on the NPU, and its int8 output is bit-identical there too.** With
   `-DONEBIT_EP_NPU=ON` and `ONEBIT_EP_NPU_ELFS` naming the designs, `gemm_q8` writes the graph's int8
   activations and int8 weights straight into the kernel's BOs (no `packB`, no `amax/127` — those bytes
@@ -216,17 +227,45 @@ intermediate float tensor then never exists.
   down_proj's ship beside the other xclbins, and q/k/v's and gate/up's came out of one `-M 128 -K <K>
   -N <N> -c 4` run of the iso-build generator each (`n1_core_i8_v26.py` through the IRON/MLIR-AIE
   `aiecc`), the artifacts living beside the other xclbins and never in this repository. It is a
-  **correctness** result — and at model level it is **not yet a speed one**, which is now measured rather
-  than suspected. Same export, a Release build of this tree, a quiet box (load 1.2–1.4), one thread, a
+  **correctness** result, and at model level it is a **small** speed one — 8.3 % on a quiet box on the
+  current tree, after the same export measured 1.13–1.16× *slower* on an earlier one; both are measured
+  rather than suspected, and the last row below is the number to quote. Same export, a Release build of
+  this tree, a quiet box (load 1.2–1.4), one thread, a
   32-token prompt and 8 generated tokens: the array's arm does **1074 / 1105 ms/token against the host
   kernel's 947 / 951**, i.e. 1.13–1.16× *slower* than the leg it replaces (and 1.7× behind the A8W8 CPU EP
   at 625 / 628, 4.8× behind float32 at 226); the 32-token prefill is a wash, 805 / 809 against 843 / 845.
+  **Re-measured on the current tree those two arms are 930.5 against 972.9 ms/token, i.e. the array 4.4 %
+  ahead** — same window, two runs each, both agreeing on the sign, and the profile now splits a pass into
+  device calls 802.5 + epilogue 19.0 against the host loop's 879.0 with 94–109 ms of per-pass work that
+  neither leg touches. **Repeated on a quiet box (load1 1.3–3.3) the same sign is larger and is now the
+  quotable one: 983.4 / 1000.2 against 1073.6 / 1088.8 ms/token, i.e. 8.3 % ahead**, per call 4.32 against
+  the host loop's 4.99. Not the code, as far as the repository can say: since those figures, only #1032
+  (profiling) and #1047 (the re-pack, ~5 % of a token) touch this path, the NPU runtime the EP links
+  against is unchanged and the five ELFs are byte-identical, so the 1.13× loss does not reproduce: the host arm
+  of the window above ran at load1 1.3–1.6, the same load as the 1.2–1.4 that loss was taken at, and there the
+  array is ahead — though that window is not an arm-for-arm repeat of it, since its device arm ran at 2.8–3.3.
+  So the sign is no longer the finding — the magnitude is,
+  and it is small in every window; quote the number only with the session it came from (`docs/onnx.md`,
+  "Where a pass actually goes").
   The kernels are ahead **in isolation** — 1.54–1.89× per call at a decode step's 36 rows and 3.1× at a
   32-row prefill block — and that advantage does not survive the model. These measurements do not, by
-  themselves, say which of the two candidate reasons it is: 196 dispatches per pass, each paying BO
-  writes, two syncs and a wait; or the host loop being faster on the graph's real operands than on the
-  probe's synthetic ones (`docs/onnx.md` explains why the second cannot be excluded). What is measured is
-  the sign, not the cause; `NPU_C_SYNC_PROF=1` on one call is the next step. (Those arms, like every
+  themselves, say which of the two candidate reasons it is: non-kernel work per call (BO writes, two syncs,
+  a wait, the weight writeback, the shared epilogue); or the host loop being faster on the graph's real
+  operands than on the probe's synthetic ones (`docs/onnx.md` explains why the second cannot be excluded).
+  Three of those per-call costs were measured separately on the array (weight writeback 0.24 ms, epilogue
+  0.134 ms, pack 0.06 ms), and the weight path is not worth fixing: keeping every image resident returns
+  35 ms/pass for 568 MiB (`docs/onnx.md` carries both). The call's own sections then priced all of them in
+  one window: of a 4.32 ms call the launch plus its wait is 3.90 (90 %, and that section *contains* the
+  kernel's multiply), the weight pack plus upload 0.25, `other` 0.13, the readback 0.036, both flushes 0.008
+  — so every non-multiply thing the leg does per call is **0.42 ms (9.8 %)**, 0.54 with the 0.12 epilogue it
+  pays outside the call, and no fix aimed at them can recover more.
+  The second candidate turned out to be measurable without the array: dumped from one prefill, the graph's real
+  int8 activations are 62.1 % nonzero against the probe's ~99 %, which makes its host loop **1.42× faster**
+  per pass (1098 → 770.6 ms) and cuts the array's kernel advantage from 1.7× to **~1.12×**. So the multiply
+  is not where the *1.13× loss* of the figure above came from, and that loss does not reproduce on the
+  current tree at any load tried: what is there is the 8.3 % win above, whose per-call cost the probe also
+  prices (4.32 ms/call at model level against its 3.460 for a single shape in the same window, i.e. the EP
+  adds no structural per-call cost). (Those arms, like every
   number on this page, come from a Release build: the EP targets carry no `-O2` of their own, and an
   unoptimized host loop inflates the device-against-host ratio by ~25×.)
   `docs/onnx.md` ("What the device leg is worth at model level") carries the four-arm table, the per-shape

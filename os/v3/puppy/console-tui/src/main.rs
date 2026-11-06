@@ -122,6 +122,17 @@ fn suspend() {
     let _ = execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
 }
 
+/// Does this paint error end the console?
+///
+/// The module promises "a paint failure redraws", and `ErrorKind::Interrupted` is the failure that promise is about: a signal
+/// arrived before the write reached the terminal (crossterm installs a SIGWINCH handler for resize events, so an ssh user
+/// resizing the window is the realistic case), nothing was drawn, and the next pass paints again. Every other error means
+/// this terminal cannot be written at all - the right answer then is what `1bit-console` does with a non-zero exit: the
+/// dialog menu.
+fn paint_failed(e: &std::io::Error) -> bool {
+    e.kind() != std::io::ErrorKind::Interrupted
+}
+
 /// Was this process started from an ssh session? `sshd` sets both of these, and neither exists on tty1, which is
 /// what makes them the honest question (rather than "is there a terminal", which tty1 answers yes to).
 fn ssh_session(conn: Option<&str>, tty: Option<&str>) -> bool {
@@ -174,6 +185,24 @@ fn resume(t: &mut Terminal<CrosstermBackend<std::io::Stdout>>) {
     let _ = t.clear();
 }
 
+/// The exit code for "this terminal cannot be driven at all": no size, raw mode refused, no usable backend. One code for
+/// the class, so `1bit-console`'s line on tty1 (`1bit-console-tui exited (7)`) says which kind of failure it was; the
+/// wrapper runs the dialog menu for ANY non-zero exit, so nothing depends on the value beyond that readability.
+const EXIT_CANNOT_DRIVE: u8 = 7;
+
+/// Why a terminal of this size cannot be drawn on, if it cannot. Pure, so the rule is testable without a tty.
+///
+/// A terminal that reports no size is not a small terminal - it is one that answered nothing (a pty opened without
+/// TIOCSWINSZ, `ssh -tt` fed from a pipe, a serial line). ratatui then paints no cell at all: the screen stays
+/// blank while the console still reads keys, so 5 and 8 look like nothing happened and only `q` does anything.
+/// Measured on an ssh pty with no window size. Refusing is what `1bit-console` already knows how to handle - a
+/// non-zero exit runs the dialog menu and logs the reason - so the person gets a usable screen instead of a black
+/// one. tty1 itself always has a size (240x67 on the reference board).
+fn size_refusal(w: u16, h: u16) -> Option<String> {
+    (w == 0 || h == 0)
+        .then(|| format!("the terminal reports {w}x{h}, so nothing can be drawn on it"))
+}
+
 fn run() -> ExitCode {
     // a panic must leave a usable terminal behind: 1bit-console reads a non-zero exit and shows the dialog menu
     let hook = std::panic::take_hook();
@@ -186,14 +215,29 @@ fn run() -> ExitCode {
         Ok(t) => t,
         Err(e) => {
             eprintln!("1bit-console-tui: this terminal cannot be driven ({e}); the dialog menu is on tty1");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_CANNOT_DRIVE);
         }
     };
+    // ... and a terminal with no size at all is refused for the same reason, before the alternate screen is entered
+    match term.size() {
+        Ok(s) => {
+            if let Some(why) = size_refusal(s.width, s.height) {
+                eprintln!("1bit-console-tui: {why}; the dialog menu is on tty1");
+                return ExitCode::from(EXIT_CANNOT_DRIVE);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "1bit-console-tui: cannot read the terminal size ({e}); the dialog menu is on tty1"
+            );
+            return ExitCode::from(7);
+        }
+    }
     let _ = execute!(stdout(), EnterAlternateScreen, crossterm::cursor::Hide);
     if enable_raw_mode().is_err() {
         let _ = execute!(stdout(), LeaveAlternateScreen);
         eprintln!("1bit-console-tui: raw mode refused; the dialog menu is on tty1");
-        return ExitCode::FAILURE;
+        return ExitCode::from(EXIT_CANNOT_DRIVE);
     }
 
     // the facts are collected off the drawing thread: `llama-server --list-devices` takes seconds, and a screen
@@ -218,6 +262,7 @@ fn run() -> ExitCode {
     // asked once: sshd sets SSH_CONNECTION/SSH_TTY for the whole session, tty1 respawn sets neither
     app.ssh = over_ssh();
     let mut last_spin = Instant::now();
+    let mut last_heal = Instant::now();
     let rc = loop {
         while let Ok(f) = rx.try_recv() {
             let keep = app.log_scroll;
@@ -233,13 +278,31 @@ fn run() -> ExitCode {
             app.spin = app.spin.wrapping_add(1);
             last_spin = Instant::now();
         }
-        let mut links = Vec::new();
-        if term.draw(|f| ui::draw(f, &app, &mut links)).is_err() {
-            break 1;
+        // Nothing keeps other writers off tty1: kernel printk (the board's cmdline is `console=ttyS0,115200 console=tty0`,
+        // so every amdgpu/amdxdna line is painted here), `1bit-release-check`'s NPU notice, a program the dialog menu ran.
+        // ratatui writes only the cells whose CONTENT changed since its own last frame, so one of those lines is a wrong
+        // screen that a keypress does not fix - measured: three stray lines and a keypress left every panel row showing
+        // the log pane's text. So the frame is rebuilt in full, from a cleared screen, once a second: the write is a
+        // Clear plus absolute positions (no full-screen flash on the VT) and the cost is one frame per second, which is
+        // what a stray line can then cost the reader.
+        if last_heal.elapsed() >= Duration::from_secs(1) {
+            match term.clear() {
+                Ok(()) => last_heal = Instant::now(),
+                Err(e) if paint_failed(&e) => break 1,
+                // interrupted before a byte went out: the screen is untouched, and the next pass retries
+                Err(_) => {}
+            }
         }
+        let mut links = Vec::new();
+        let painted = match term.draw(|f| ui::draw(f, &app, &mut links)) {
+            Ok(_) => true,
+            Err(e) if paint_failed(&e) => break 1,
+            // interrupted mid-paint: paint again on the next pass instead of ending the console over one EINTR
+            Err(_) => false,
+        };
         // over ssh the screen is a terminal emulator, so the CONNECT URLs can be clickable (OSC 8). On the VGA
         // console (TERM=linux) the same bytes would print as garbage - or worse, as text nobody can click.
-        if hyperlinks_wanted(std::env::var("TERM").ok().as_deref()) {
+        if painted && hyperlinks_wanted(std::env::var("TERM").ok().as_deref()) {
             emit_links(&links);
         }
 
@@ -302,7 +365,8 @@ fn handle(
                 match yes {
                     Yes::ShowKey => {
                         let k = app.facts.key.clone().unwrap_or_default();
-                        let base = format!("http://{}:13305", app.facts.ip().unwrap_or("-"));
+                        let base =
+                            format!("http://{}:13305", app.facts.ip().unwrap_or("<address>"));
                         app.modal = Some(Modal::Info {
                             title: "Lemonade API key".into(),
                             body: vec![
@@ -442,7 +506,22 @@ fn handoff(app: &mut App, term: &mut Terminal<CrosstermBackend<std::io::Stdout>>
 
 #[cfg(test)]
 mod tests {
-    use super::{hyperlinks_wanted, parse_size, ssh_session};
+    use super::{hyperlinks_wanted, paint_failed, parse_size, size_refusal, ssh_session};
+
+    #[test]
+    fn a_terminal_with_no_size_is_refused() {
+        // measured: an ssh pty with no window size drew nothing at all, and every key except q looked dead
+        for (w, h) in [(0u16, 0u16), (0, 25), (80, 0), (0, 240)] {
+            assert!(
+                size_refusal(w, h).is_some(),
+                "{w}x{h} must be refused, not drawn blank"
+            );
+        }
+        for (w, h) in [(1u16, 1u16), (80, 25), (240, 67), (132, 43)] {
+            assert!(size_refusal(w, h).is_none(), "{w}x{h} can be drawn on");
+        }
+        assert!(size_refusal(0, 0).unwrap().contains("0x0"));
+    }
 
     #[test]
     fn q_is_the_way_out_only_where_a_prompt_is_harmless() {
@@ -469,6 +548,24 @@ mod tests {
             assert!(!hyperlinks_wanted(Some(term)), "{term}");
         }
         assert!(!hyperlinks_wanted(None));
+    }
+
+    #[test]
+    fn an_interrupted_paint_is_repainted_but_a_dead_terminal_ends_the_console() {
+        use std::io::{Error, ErrorKind};
+        // the failure the module's promise is about: a signal arrived (crossterm's SIGWINCH handler, i.e. an ssh user
+        // resizing the window), nothing reached the terminal, so the next pass paints again
+        assert!(!paint_failed(&Error::from(ErrorKind::Interrupted)));
+        // these mean the terminal cannot be written at all - `1bit-console` then shows the dialog menu, which is what a
+        // non-zero exit is for
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::Other,
+        ] {
+            assert!(paint_failed(&Error::from(kind)), "{kind:?}");
+        }
     }
 
     #[test]

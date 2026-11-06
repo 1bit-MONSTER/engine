@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <type_traits>
 #include <cmath>
 #include <cstdio>
@@ -33,6 +34,8 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+
+#include "q4nx_weight_layout.h"  // pack_int8_image(): the weight BO's byte order
 
 namespace onebit::npu {
 namespace {
@@ -287,7 +290,7 @@ Q8Kernel* q8_kernel(State& s, int64_t k, int64_t n) {
 }  // namespace
 
 bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t* b, int32_t* c,
-                 std::string* err) {
+                 std::string* err, Q8RawSplit* split) {
     State& s = state();
     std::lock_guard<std::mutex> g(s.mu);
     if (!init(s)) {
@@ -312,12 +315,19 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
     // ONNX initializers are immutable, so the tensor's address is its identity: a graph that rewrote the bytes
     // in place would keep the old ones here, and re-uploading on every call would cost what this cache saves.
     if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
+        // Timed only for a caller that asked (the EP's ONEBIT_EP_QDQ_PROF); a null `split` costs one branch.
+        const auto t_w =
+            split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        // Pack through the layout helper, which writes the same bytes a byte-at-a-time bpos() scatter
+        // would but in 8-byte microtile runs: this is the loop that a pass pays once per group (a kernel is
+        // keyed by (K, N), so a pass sends 28 different weights through each of 5 of them), and the scatter
+        // measured 1.44 ms for a 1024x2048 weight, 295 ms of a 1074 ms token.
         auto* Bm = (int8_t*)ctx.layerB[0]->map();
-        std::memset(Bm, 0, (size_t)ctx.KD * ctx.ND);
-        for (int64_t p = 0; p < k; ++p)
-            for (int64_t j = 0; j < n; ++j)
-                Bm[ctx.bpos((size_t)p, (size_t)j)] = b[p * n + j];
+        q4nx_layout::pack_int8_image(Bm, b, (int)k, (int)n, ctx.KD, ctx.ND, ctx.blocked_b);
         ctx.layerB[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (split)
+            split->wpack_ms += std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t_w).count();
         kern->w_ptr = b;
         kern->w_k = k;
         kern->w_n = n;
@@ -327,21 +337,40 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
     // zeroed, which is what the kernel reads for them and what the host path also assumes.
     for (int64_t row0 = 0; row0 < m; row0 += ctx.MD) {
         const int rows = (int)std::min<int64_t>(ctx.MD, m - row0);
+        const auto t_a = split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::memset(ctx.Am, 0, (size_t)ctx.MD * ctx.KD);
         for (int r = 0; r < rows; ++r)
             std::memcpy(ctx.Am + (size_t)r * ctx.KD, a + (row0 + r) * k, (size_t)k);
         // This path writes A itself (no quantiser), so the context has no way to know how many rows the host
         // will read back: one row of the C BO is the default, and a batched block needs `rows` of them.
         ctx.set_activation_rows(rows);
+        if (split)
+            split->aupload_ms += std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t_a).count();
         // Only row 0 of a launch is watched (that is what #701's canary covers, and deliberately: poisoning
         // the padded last row of a batched launch fires on every prefill), so a block after the first is
         // protected exactly as much as the rest of this file's batched paths are.
-        auto launch_and_read = [&ctx, n] {
+        auto launch_and_read = [&ctx, n, split] {
+            const auto t_s =
+                split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             ctx.sync_A(0);
+            if (split)
+                split->async_ms += std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - t_s).count();
             poison_if_canaried(ctx, (int)n);
+            const auto t_l =
+                split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             auto run = ctx.launch(0);
             ctx.wait_kernel(run);
+            if (split)
+                split->launch_ms += std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - t_l).count();
+            const auto t_r =
+                split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             ctx.readback();
+            if (split)
+                split->readback_ms += std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - t_r).count();
         };
         launch_and_read();
         if (short_read(ctx)) {
@@ -354,8 +383,13 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
                 return false;  // gemm_q8 redoes every row on the host; never write a poisoned accumulator
             }
         }
+        const auto t_c =
+            split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (int r = 0; r < rows; ++r)
             for (int64_t j = 0; j < n; ++j) c[(row0 + r) * n + j] = ctx.Cm[(size_t)r * ctx.ND + j];
+        if (split)
+            split->readback_ms += std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t_c).count();
     }
     return true;
 }

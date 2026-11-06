@@ -117,6 +117,131 @@ batch width, not the build, is the variable.
 `hrx`, default `n_slots = 4`: copy0 vs alone `4/48` ids but **44/48** log-prob bits, i.e. the
 reported numbers move even where the tokens do not.
 
+### Can a *batched* cell be repeated? (`--parallel N`, the same N requests twice)
+
+Repeating one request answers the solo case. A `--parallel N` cell is measured by issuing **N concurrent
+requests**, so its reproducibility question is different: replay the same N requests and you do not get
+the same N answers. Measured with `tools/batched_repeat.py`, which releases N byte-identical requests
+through a barrier for R rounds and fingerprints each copy over its token ids and float32 log-probability
+bits. Qwen3-0.6B Q4_K_M, 32 tokens, greedy, 4 rounds (3 where a width only needed a control), shipped
+`lemonade-onebit-rc-2026-11-04-c24` payload:
+
+| request width | serve `--parallel` | `cpu` round-to-round identical | `cpu` states | `hrx` round-to-round identical | `hrx` states |
+|---:|---:|---|---:|---|---:|
+| 1 | 2 and 8 | **2/2** | **1** | — | — |
+| 2 | 2 | 2/4 | 4 | **2/6** | 2 of 8 (two states, swapped between rounds) |
+| 4 | 4 | 6/12 | 4 | **2/12** | 4 (all four copies distinct) |
+| 8 | 8 | 11/24 | 8 | **0/24** | 16 (all eight copies distinct) |
+
+Worst \|Δlogp\| seen inside those mixtures: `cpu` 9.81e-01 at width 4 and 9.81e-01 at width 8; `hrx`
+1.48e-01 at width 2, 7.43e-02 at width 4 and 2.05e-01 at width 8.
+
+**Not a small-model artifact.** The same run on **Qwen3-4B-Q4_K_M**, same binary, same budget:
+
+| request width | `cpu` round-to-round identical | `cpu` states | `hrx` round-to-round identical | `hrx` states |
+|---:|---|---:|---|---:|
+| 4 | **4/12**, worst \|Δlogp\| 1.86e-01 | 7 of 16 | **4/12**, worst \|Δlogp\| 6.83e-02 | 4 of 16 (all four copies distinct, every round) |
+| 8 | **7/24**, worst \|Δlogp\| 1.80e-01 | 8 of 32 | **3/24**, worst \|Δlogp\| 1.02e-01 | 8 of 32 (all eight copies distinct, every round) |
+
+At 4B the verdict is the same on both routes and the spread is wider on `cpu` (7 states over 16 copies,
+against a modal rung at 0.6B), so the effect is a property of batching, not of the model size where these
+measurements were cheap enough to take.
+
+**How far is a batched copy from the row that was measured solo?** 0.6B, 64 tokens, every concurrent copy
+scored against one solo request on the same serve:
+
+| width | route | copies identical to solo | \|Δlogp\| vs solo, median | same token as solo, median |
+|---:|---|---:|---:|---:|
+| 1 | `cpu` | **3/3** | 0.000e+00 | **1.000** |
+| 1 | `hrx` | **3/3** | 0.000e+00 | **1.000** |
+| 2 | `hrx` | 0/8 | 1.21e-01 | **1.000** |
+| 4 | `cpu` | 0/16 | 2.52e-01 | **0.438** |
+| 4 | `hrx` | 0/16 | 7.19e-02 | 0.836 |
+| 8 | `cpu` | 0/32 | 2.52e-01 | **0.438** |
+| 8 | `hrx` | 0/32 | 1.89e-02 | **1.000** |
+
+The width-1 control is exact on both routes, so these are the batch and not the harness. Two asymmetries
+matter: **no batched copy equals the solo answer anywhere** (0 of 104 copies), while the *text* survives
+differently per route — at 64 tokens `cpu` has usually left the solo sequence (median 0.438 of positions
+keep the solo token) and `hrx` usually has not (0.836, and 1.000 at width 8). So "the greedy text gate still
+passes under batching" is an engine-specific accident, and the log-probability dispersion is the part that
+never survives. `hrx` width 2 is the sharpest case because it is exactly bimodal: its 8 copies split 4/4 over
+two states, one of which keeps the solo text at every position (mean \|Δlogp\| 1.91e-02) and one of which
+leaves it on a third of them (1.21e-01) — so a batched run's text result is decided by which state its
+schedule landed on, not by which engine served it.
+
+**Generated length decides how visible it is.** Width 4 on `cpu`, 0.6B, the same prompt decoded to four
+lengths, every concurrent copy scored against the solo answer. **No copy was identical to the solo answer
+at any length** (0 of 12 at each of 16/32/128 tokens, 0 of 16 at 64):
+
+| tokens generated | \|Δlogp\| vs solo, median | same token as solo, median |
+|---:|---:|---:|
+| 16 | 5.49e-02 | **1.000** |
+| 32 | 1.07e-01 | 0.844 |
+| 64 | 2.52e-01 | 0.438 |
+| 128 | 2.60e-01 | 0.394 |
+
+At 16 tokens the batched continuations usually still read the same as the solo one while their
+log-probabilities already differ; by 64 tokens the batch has usually left the solo sequence entirely. A
+short batched cell therefore hides this and a 180-token one cannot — which is the length a scoreboard cell
+actually decodes.
+
+A **state** here is one complete 32-token answer: two copies are in the same state only if every token id
+and every compared float32 log-probability bit of all 32 tokens matches. A row's "states" column counts the
+distinct states over all copies of all rounds, so it is a lower bound (two different schedules can coincide)
+and it widens with the width rather than settling. Read a row like this: at width 8 on `cpu`, 32 copies
+produced 8 distinct answers and only 11 of the 24 same-index pairs between consecutive rounds matched.
+Each row is **one run**: the exact counts move between runs because *which* sequences share a decode step
+moves (a repeat of the width-4 `cpu` row gave 3/12 and 7 states instead of 6/12 and 4, same verdict).
+
+**The state is the per-step batch width, not the serve configuration.** A single request against a
+`--parallel 2` serve and against a `--parallel 8` serve produce the *same* fingerprint bit for bit, 3/3
+rounds each; the ladder is the width of the decode step that ran, which is the same op #751 localised
+(`ggml-cpu/repack.cpp`'s 4-row block vs 1-row gemv). The ladder is visible directly: at width 2 one
+round had one copy on the solo state and its partner on a displaced one, i.e. a step that carried one
+row for one sequence and two for the other. On `cpu` the full-batch state is modal (8 of 16 copies at
+width 4, 20 of 32 at width 8), so a batched run usually *does* look like its neighbours; on `hrx` every
+copy in a round is a distinct state at width 4 and 8 (4/4 and 8/8, 0/24 identical round-to-round) — no two
+copies shared a per-step row count across those runs, so there is no modal rung to land on. Width 2 on
+`hrx` is the exception and shows the ladder directly: the two copies only ever produced **two** states over
+8 copies and swapped them for the first two rounds (2 of 8 distinct, 2/6 identical round-to-round), i.e.
+both per-step row counts occur for the same two requests, in both orders.
+
+Consequence for a correctness gate: a batched cell cannot be gated on one number. Its log-probabilities
+are a mixture over that ladder, the displaced rungs are 1-2 nats away on `cpu`, and a single run can be
+any rung — so the cell has to report the dispersion over its own rounds, or pin the schedule.
+
+**Cross-engine, both batched** — the question the tables above do not answer, and the one a scoreboard's
+"we win the batched column" claim rests on. Two routes at `--parallel 4`, each decoding 4 byte-identical
+copies *at the same time*, 8 prompts × 64 tokens × 3 rounds, shipped c24 payload, scored over the prompts
+where both routes choose the same greedy stream at width 1 **and** at width 4 (4 of the 8):
+
+| measured on | median \|Δlogp\| | against the width-1 delta |
+|---|---:|---:|
+| `cpu` vs `hrx`, width 1 | 3.670e-02 | — |
+| `cpu` vs `hrx`, both at width 4 | **3.685e-02** | **1.00×** |
+| a route vs its own batched answer | 1.054e-02 | 0.29× |
+
+So batching does **not** add noise on top of the between-engine difference: the cross-route delta is the
+same figure at width 1 and at width 4, and batching moves a single route by only ~0.3× of it. Two caveats
+decide whether a given cross-route number means anything at all:
+
+1. **Only positions where both routes chose the same token are comparable.** Four of those eight prompts
+differed at width 1 (token match 0.267-0.923), and there a per-position delta compares *different* tokens —
+it measures the divergence, not the arithmetic. The size of that effect is measurable in the same run: at
+width 1 the cross-route delta is **3.670e-02** over the four agreeing prompts and **1.468e-01** over the four
+mismatching ones, so a figure quoted over all eight (**8.960e-02**, 2.4× the comparable subset) is mostly a
+statement about how often the two routes pick the same token. `tools/logprob_agree.py` already restricts deltas
+to common positions; `tools/batched_repeat.py --vs-solo` reports `same_token` beside every delta for the same
+reason.
+2. **The batched value is a dispersion, not a number**: the cell's own run is not repeatable (6/12 identical
+copies at width 4 on `cpu`), so what reproduces is the distribution over rounds.
+
+Consequence: a cross-engine comparison *does* survive concurrency — it is the same ~0.037 nats it was at
+width 1 — so a batched cell can carry a log-prob column. It cannot carry a bitwise one, and the column is
+only defined over agreed tokens. (Scratch probe, not shipped: `cross_concurrent.py` imports this repo's
+comparators and `logprob_agree.py`'s prompts, so it measures what this page documents.)
+
 ### What the `hrx` width gate is, by name
 
 `GGML_HRX_LOG_DISPATCH=1` prints each dispatch registration the first time it matches
@@ -151,7 +276,28 @@ on HRX, 2 of 986 nodes off HRX). Disabling the width-1 fused add+norm alone move
 by 0.121 nats — as much as the width switch itself — so these fused kernels each reassociate a sum
 rather than being interchangeable extras. Contrast `cpu`, where one flag (`-DGGML_CPU_REPACK=OFF`)
 removes the width dependence entirely: on `hrx` the reproducible configuration is `--parallel 1`, and
-there is no equivalent env switch.
+there is no equivalent env switch. **That flag is not free, and what it costs is prompt processing,**
+which is where the 4-row block is actually reached: Qwen3-0.6B Q4_K_M, `-t 8`, one build with only
+`libggml-cpu.so` swapped between the two arms, prefill **984 → 612 tok/s (1.61×, −38 %)** over 6 requests
+per arm, interleaved so the box's other tenants load both equally. End to end, measured wall clock, 3 rounds
+each: a 1183-token prompt with a 32-token reply goes **2.10 s → 3.01 s (+43 %)**, while a 23-token chat
+prompt with a 75-token reply is a wash (**0.60 s vs 0.61 s**). Single-stream decode does not pay: 82 vs 85
+tok/s, the two sample ranges overlapping. So it is a switch to reach for when the numbers must be
+reproducible, not a free one, and a long (RAG-sized) prompt is where it shows. Under heavy load the
+absolute times move; the ratio does not — two independently run arms gave 1.607× and 1.618× on prefill.
+
+**An arm's evidence is its own family disappearing, not the size of the diff.** Measured on payload
+`c26c` (Qwen3-0.6B Q4_K_M, `--parallel 4`, a 48-token probe, two concurrent 64-token fillers and a
+second 24-token probe): three runs of the *same* configuration logged the same **29** registrations,
+identical three ways with no name moving in or out. That control is what makes an arm's diff mean
+anything, because `GGML_HRX_LOG_DISPATCH` is a first-match-per-process log
+(`dispatch_registry/dispatch-registry.cpp`, the `std::set seen`) and a single run's set is a sample of
+which kernels ran. Against that baseline each of three arms (`hip.kquant_tokens.`,
+`common.rmsnorm_binary_f32`, `hip.gemv_add_norm`) removed its own names and left none of them logged
+(29 → 24, 26, 26 registrations). But the rest of the diff is **not** arm-specific: all three also
+dropped `common.rope.f32`, `common.rope_set_rows.f32` and `common.set_rows`, and all three gained
+`qwen.attention_postprocess_f32_f16` — disabling one fusion re-fuses its neighbours, so the arm-specific
+claim to check is that the named family is gone, not that the remaining set is otherwise unchanged.
 
 ### NPU: repeatable, and comparable with two adjustments
 
@@ -160,10 +306,12 @@ The NPU route is **bitwise repeatable**: 8 prompts × 24 tokens × 2 repeats (19
 It stays bitwise repeatable at the other routes' budget too: 8 prompts × **64** tokens × 2 repeats
 (512 tokens), `max |Δlogp| = 0`, 0 non-float32 values, text stable.
 
-The extra cost is time, not correctness. The per-op forward path measures ~0.5 s/token here, so the same
-8 × 64 × 2 matrix took **586 s of device time in one NPU claim** (against 34 s for `cpu` + `hrx` under one
-GPU claim). Five repeats — what the `cpu` and `hrx` columns use — would be ~25 min of the array, so the NPU
-column is 2 repeats at every budget.
+The extra cost is time, not correctness, and it depends on the thinking setting rather than on the route. The
+per-op forward path costs **~36 s per 64-token reply with thinking on** (the same 8 × 64 × 2 matrix took 586 s of
+device time in one NPU claim) against **~11.6 s per reply with thinking off** (8 prompts × 64 tokens × **5** repeats
+= 2 560 generated tokens in **464 s** of one claim). So the thinking-off 64-token row takes the *same* 5 repeats as
+the `cpu` and `hrx` columns; the thinking-on rows stay at 2 repeats, which is a cost limit of that setting and not of
+the device.
 
 It **can** join the agreement comparison — the earlier version of this page said it could not — with two
 adjustments, both of which are flags on the tool rather than changes to the engine:
@@ -238,7 +386,7 @@ rather than a merge sha. Qwen3-0.6B Q4_K_M, 8 prompts × 64 tokens, greedy, `--t
 |---|---|---|---|---|---|
 | `cpu` | 5 | **bitwise-identical** | 0 | 128 | yes |
 | `hrx` | 5 | **bitwise-identical** | 0 | 122 | yes |
-| `npu` (forward path) | 2 | **bitwise-identical** | 0 | 131 | yes |
+| `npu` (forward path) | 5 | **bitwise-identical** | 0 | 131 | yes |
 
 | pair | token match | top-1 | exact-bit match | max \|Δlogp\| | mean \|Δlogp\| | common tokens | prompts diverging |
 |---|---|---|---|---|---|---|---|
@@ -315,11 +463,38 @@ python3 tools/logprob_agree.py \
     --repeat 5 --max-tokens 64 --json agree.json
 ```
 
+The batched question (does replaying the same N concurrent requests give the same N answers) is a
+different run against the same serves:
+
+```sh
+python3 tools/batched_repeat.py --url http://127.0.0.1:18110 --width 4 --rounds 4 --max-tokens 32 \
+    --json batched-w4.json
+```
+
+Start that serve with `--parallel N` matching `--width N` — the second column of every table in this
+section, and how each row was taken. A mismatch is not a measurement this page has: the one mismatch case
+it does have is the `--width 1` control below, where the slot count makes no difference to the answer.
+
+`--width 1` against a serve started with any `--parallel` is the control: it must be repeatable and it
+must produce the same fingerprint whatever the slot count, which is what shows the state is the batch
+content and not the configuration. Point it at an `hrx` serve under the GPU claim for the right-hand
+columns above. `--selftest` checks the fingerprint and comparator logic without a server.
+
+Add `--vs-solo` for the batched-versus-solo table: the tool takes one solo request first and scores every
+concurrent copy against it (`identical N/M`, `mean |dlogp|` min/median/max, median share of positions that
+keep the solo token), which is the number a cell should publish:
+
+```sh
+python3 tools/batched_repeat.py --url http://127.0.0.1:18110 --width 4 --rounds 4 --max-tokens 64 \
+    --vs-solo --json batched-vs-solo.json
+```
+
 With the NPU in the comparison, the same command with `--thinking off --match-by text`, on a build carrying
 #864: the forward path reports no token ids, so tokens are matched by text, and thinking off is what the
 last three-route row was taken with (`--thinking on` also works there and is what the earlier rows used).
-The NPU tries 2 repeats at the same 64-token budget — ~2.5 min in one claim with thinking off, ~10 min with
-thinking on, which is what its ~0.5 s/token allows. If the GPU and NPU claims cannot be held at once, run the pairs separately and
+The NPU takes 5 repeats at the 64-token budget with thinking off (464 s in one claim, the row below) — the same
+count as the other two routes — and 2 at the thinking-on rows, where a reply costs ~36 s. If the GPU and NPU claims
+cannot be held at once, run the pairs separately and
 compare the two reports with the tool's own comparator:
 
 ```sh
@@ -369,9 +544,13 @@ how each arm above was run.
 - The numbers are for one binary and one model quantisation. A change to a quantisation kernel
   moves them; re-run rather than extrapolate.
 - The concurrency numbers were measured on a 0.6B model on one host; they show the effect exists
-  and is not small, not how large it gets for other shapes.
-- The NPU agreement rows are 2 repeats (the other routes' 5 would be ~25 min of the array) and, over a
-  *requantised* pack, they are not an arithmetic-only distance. The 64-token row removes the earlier
+  and is not small, not how large it gets for other shapes. The batched-repeat rows are one prompt,
+  32 tokens for the state tables and 64 for the batched-versus-solo ones, 0.6B and 4B: they establish
+  that a batched cell is not repeatable and that the outcome set is small and per-engine, not how the
+  dispersion scales with model size or prompt length.
+- The NPU agreement rows are 5 repeats with thinking off at 64 tokens (the other routes' count) and 2 at the
+  thinking-on rows, where a reply costs ~36 s against ~11.6 s. Over a *requantised* pack they are not an
+  arithmetic-only distance either. The 64-token row removes the earlier
   budget difference, so all three columns can be read at one token count.
 - The NPU rows depend on the build. A binary at `44d849d` or later masks the think tokens, so a *thinking*
   reply reports no entries on it at all: the thinking-on rows come from a `main@1b3def2` build, which still

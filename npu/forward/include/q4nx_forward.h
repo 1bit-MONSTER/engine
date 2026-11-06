@@ -37,9 +37,11 @@
 #include <string>
 #include <vector>
 
+#include "moe_container.h"  // the two MoE container conventions (engine#1035)
 #include "model.h"
 #include "plan/plan.h"  // plan.json (engine #799 P1): the stream plan replaces the filename probes
 #include "q4nx_pack.h"        // Q4nxDesignGeom / Q4nxModelDims (derived design table)
+#include "q4nx_rope.h"        // rope_type "llama3" frequency scaling (engine#1048)
 #include "q4nx_semantics.h"   // Q4nxSemantics (config-derived architecture flags)
 #include <memory>
 #include <unordered_map>
@@ -317,6 +319,9 @@ private:
                    bool proportional, int window, int kv_layer, bool append_kv,
                    int kv_len = 0);
     bool mlp(const std::vector<float>& gu, std::vector<float>& h, int im);
+    // The same elementwise gate*up on caller memory, so a batched pass can read its ACT row and write its HH
+    // row where they already are instead of staging both through a vector (a copy on each side).
+    bool mlp(const float* gu, float* h, int im);
     float rmsnorm(const float* x, const float* w, int n, float* out) const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;
     bool run_lm_head(const std::vector<float>& h, std::vector<float>& logits);
@@ -475,6 +480,7 @@ private:
     std::vector<std::vector<float>> q_norm_, k_norm_;       // [NL][HD]
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
+    Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else
     // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
     // every other architecture.  MiniCPM4 scales the embedding by 12 and each
     // residual branch by scale_depth/sqrt(NL) (0.2475 for 32 layers); skipping
@@ -494,6 +500,11 @@ private:
     int mla_ = 0;
     int q_lora_ = 0, kv_lora_ = 0, rope_dim_ = 0, qk_nope_ = 0, v_head_ = 0;
     int n_expert_ = 0, top_k_ = 0, expert_im_ = 0, dense_im_ = 0;
+    // Which MoE container convention this container uses, decided from its own tensors in
+    // init_impl (moe_container.h): the engine converter's `mlp.experts.*` names with a plain
+    // [N][K] per-expert tile grid, or the FLM-style `*_exps_proj` names whose writer transposes
+    // each expert's tiles.  The wrong choice is silent, so it is read, not assumed.
+    MoeFormat moe_format_ = MoeFormat::Flm;
     int leading_dense_ = 0;
     int expert_gating_sigmoid_ = 1;   // llama.cpp deepseek2: 2 = sigmoid, 1 = softmax
     float expert_w_scale_ = 1.0f;     // applied after the top-k weight normalisation

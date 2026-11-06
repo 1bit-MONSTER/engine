@@ -1,0 +1,2515 @@
+{
+ "about": "Which revision of each upstream model this engine serves, ships or was built from. One entry per Hugging Face repo: the commit we pinned, the files we take from it with the identity of the bytes we hold, and what uses it. Rule and adoption flow: docs/model-pins.md. Checked daily by .github/workflows/pin-watch.yml (tools/pin_watch.py --check); a change is adopted by a reviewed pin bump, never automatically.",
+ "pins": {
+  "1bit-MONSTER/Apertus-8B-Instruct-2509-GGUF": {
+   "commit": "91b2ce8ce94eb54c66040c32fa7eea05635ad87f",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Apertus-8B-Instruct-2509', 'general.basename': 'Apertus-8B-Instruct-2509', 'general.architecture': 'apertus', 'general.size_label': '8B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Apertus-8B-Instruct-2509-Q4_K_M.gguf": {
+     "oid": "87e7f0eb5a1d33e1a8ea4e7fdd2363764e0465061dd92962e0073aec31a7944d",
+     "size": 5057885440,
+     "lfs": true,
+     "template_sha256": "695a11092219943af254a5a1a6f34ecccd33e7bd28c593ab67e1c95dcd77b210"
+    }
+   }
+  },
+  "1bit-MONSTER/BlackMamba-1.5B-GGUF": {
+   "commit": "a2656d8b610dae54283a7a135fb26c321dc601a3",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'BlackMamba 1.5B', 'general.basename': 'BlackMamba', 'general.architecture': 'blackmamba', 'general.size_label': '1.5B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "BlackMamba-1.5B-Q8_0.gguf": {
+     "oid": "d1ca5507bdeee51a8d6a56c0a550aab2a136bcd2da02acaf4dd9dd5ce3867b8f",
+     "size": 1556582240,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/BlackMamba-2.8B-GGUF": {
+   "commit": "5c3090a269d819aec07c66ca2d1446bd14b22d1b",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'BlackMamba 2.8B', 'general.basename': 'BlackMamba', 'general.architecture': 'blackmamba', 'general.size_label': '2.8B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "BlackMamba-2.8B-Q8_0.gguf": {
+     "oid": "0c0976294fff2afe5653d85c39d8e6b89f73ff0f5db2b487191159c0d04ba3da",
+     "size": 2967889376,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/DeepSeek-Coder-V2-Lite-Instruct-GGUF": {
+   "commit": "c3e84d2d0581dc279d60b83ddca519c463a74774",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'DeepSeek-Coder-V2-Lite-Instruct', 'general.basename': None, 'general.architecture': 'deepseek2', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf": {
+     "oid": "603bd3f8a0281d16571da7c08bd661ee17ff0d1be6fcbd1b42242da257ef0bb8",
+     "size": 10364416768,
+     "lfs": true,
+     "template_sha256": "8aeba567270fa9a8d5372caf4b04affea947c4421d96adc01e3ff94021b0ae8e"
+    }
+   }
+  },
+  "1bit-MONSTER/DeepSeek-R1-Distill-Qwen-1.5B-GGUF": {
+   "commit": "06cbde218615c90b79af0d2fb6595d0ec9fceae9",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'DeepSeek R1 Distill Qwen 1.5B', 'general.basename': 'DeepSeek-R1-Distill-Qwen', 'general.architecture': 'qwen2', 'general.size_label': '1.5B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf": {
+     "oid": "1741e5b2d062b07acf048bf0d2c514dadf2a48f94e2b4aa0cfe069af3838ee2f",
+     "size": 1117320800,
+     "lfs": true,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    }
+   }
+  },
+  "1bit-MONSTER/DeepSeek-R1-Distill-Qwen-32B-GGUF": {
+   "commit": "5c86be75473d15ccd2c9175b00e9d5665a023105",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'DeepSeek R1 Distill Qwen 32B', 'general.basename': 'DeepSeek-R1-Distill-Qwen', 'general.architecture': 'qwen2', 'general.size_label': '32B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf": {
+     "oid": "bed9b0f551f5b95bf9da5888a48f0f87c37ad6b72519c4cbd775f54ac0b9fc62",
+     "size": 19851335840,
+     "lfs": true,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    }
+   }
+  },
+  "1bit-MONSTER/GLM-4.7-Flash-GGUF": {
+   "commit": "b6e60552acdf65a536dae5c5ac29104f63a71de7",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Glm-4.7-Flash', 'general.basename': 'Glm-4.7-Flash', 'general.architecture': 'deepseek2', 'general.size_label': '64x2.6B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "GLM-4.7-Flash-UD-Q4_K_XL.gguf": {
+     "oid": "b0d4fbc1211f891b4cfbf2a497160bfe06a49412420068904d426b7a13f4ba7f",
+     "size": 17520169312,
+     "lfs": true,
+     "template_sha256": "d63ad536c3c81880043e22ec7fd08db42b4d8fb7c89c7138bc562bfa25281375"
+    }
+   }
+  },
+  "1bit-MONSTER/LFM2.5-2.6B-GGUF": {
+   "commit": "91413b8646fe4e10b3de163d36d44fd476c3e943",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Ab00687315Bc1298E9D54E9C4B611Dde9867Ccc2', 'general.basename': None, 'general.architecture': 'lfm2', 'general.size_label': '2.7B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "LFM2.5-2.6B-Q4_K_M.gguf": {
+     "oid": "02a8b7e17487d326e46d68ce0ba24211e1b80a14c4cd0597fa73c1cd697f52ed",
+     "size": 1674455040,
+     "lfs": true,
+     "template_sha256": "ea663864491de7ade391839479860ca95541f892f72665c73251fbd4643b1bef"
+    }
+   }
+  },
+  "1bit-MONSTER/LFM2.5-8B-A1B-GGUF": {
+   "commit": "22c9b9fb797d52f782962a22ae46a2667e82c32d",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Feb5E04Da4910Dd56D33F0Cd03747Ff298C1E801', 'general.basename': None, 'general.architecture': 'lfm2moe', 'general.size_label': '32x959M', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "LFM2.5-8B-A1B-Q4_K_M.gguf": {
+     "oid": "4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0",
+     "size": 5155564768,
+     "lfs": true,
+     "template_sha256": "6d65c8804847ad74eea912dd7eca3dc1cf7a457b53a77f47d841a14121910963"
+    }
+   }
+  },
+  "1bit-MONSTER/Llama-3.1-8B-Instruct-GGUF": {
+   "commit": "e9a8d3a0636c68b25eb67396e0e7fdc8a3defca4",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Meta Llama 3.1 8B Instruct', 'general.basename': 'Meta-Llama-3.1', 'general.architecture': 'llama', 'general.size_label': '8B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf": {
+     "oid": "7b064f5842bf9532c91456deda288a1b672397a54fa729aa665952863033557c",
+     "size": 4920739232,
+     "lfs": true,
+     "template_sha256": "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65"
+    }
+   }
+  },
+  "1bit-MONSTER/Llama-3.2-1B-Instruct-GGUF": {
+   "commit": "24f8b4a0028e1bb12e80d780f6aa754872250d33",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Llama 3.2 1B Instruct', 'general.basename': 'Llama-3.2', 'general.architecture': 'llama', 'general.size_label': '1B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Llama-3.2-1B-Instruct-Q4_K_M.gguf": {
+     "oid": "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83",
+     "size": 807694464,
+     "lfs": true,
+     "template_sha256": "5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4"
+    }
+   }
+  },
+  "1bit-MONSTER/Llama-3.2-3B-Instruct-GGUF": {
+   "commit": "154c1a6735fa2a42ebc0e2c6c04a3d655910282b",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Llama 3.2 3B Instruct', 'general.basename': 'Llama-3.2', 'general.architecture': 'llama', 'general.size_label': '3B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Llama-3.2-3B-Instruct-Q4_K_M.gguf": {
+     "oid": "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+     "size": 2019377696,
+     "lfs": true,
+     "template_sha256": "5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4"
+    }
+   }
+  },
+  "1bit-MONSTER/Llama-3.3-70B-Instruct-GGUF": {
+   "commit": "4f75c1722f54dae7fce271595205b17107c02147",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Llama 3.3 70B Instruct', 'general.basename': 'Llama-3.3', 'general.architecture': 'llama', 'general.size_label': '70B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Llama-3.3-70B-Instruct-Q4_K_M.gguf": {
+     "oid": "32df3baccb556f9840059b2528b2dee4d3d516b24afdfb9d0c56ff5f63e3a664",
+     "size": 42520398816,
+     "lfs": true,
+     "template_sha256": "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65"
+    }
+   }
+  },
+  "1bit-MONSTER/Mamba-370M-GGUF": {
+   "commit": "c98089464a20c5cfa9539f9da97f81ee9b00421d",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Mamba 370m Hf', 'general.basename': 'mamba', 'general.architecture': 'mamba', 'general.size_label': '370M', 'general.finetune': 'hf', 'general.quantization_version': 2, 'general.file_type': 1, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "mamba-370m-f16.gguf": {
+     "oid": "d77303b0e3063c0e329265d3c2bed501d64c3e465f9dab3a57f17f4737b46465",
+     "size": 749450528,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/MiniCPM5-2B-GGUF": {
+   "commit": "a35b8d8b5d1a994869f3d5d61808fbbcb352a115",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'MiniCPM5 2.6B', 'general.basename': 'MiniCPM5', 'general.architecture': 'llama', 'general.size_label': '2.6B', 'general.finetune': '0822_job_758798.iter_000144.opd.C26_mopd_v4_fv_pg_rkl_lr1e6.16tch.mg2hf', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "MiniCPM5-2B-Q4_K_M.gguf": {
+     "oid": "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
+     "size": 1561318368,
+     "lfs": true,
+     "template_sha256": "cc945752db555d60949b16989df4ccfeb52a313d6b4b5c5229dd786e2e9fcf1c"
+    }
+   }
+  },
+  "1bit-MONSTER/Mistral-7B-Instruct-v0.2-GGUF": {
+   "commit": "17a30876e6f488e65ed7bacdb1ed7adbfc76c386",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'mistralai_mistral-7b-instruct-v0.2', 'general.basename': None, 'general.architecture': 'llama', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "mistral-7b-instruct-v0.2.Q4_K_M.gguf": {
+     "oid": "3e0039fd0273fcbebb49228943b17831aadd55cbcbf56f0af00499be2040ccf9",
+     "size": 4368439584,
+     "lfs": true,
+     "template_sha256": "26a59556925c987317ce5291811ba3b7f32ec4c647c400c6cc7e3a9993007ba7"
+    }
+   }
+  },
+  "1bit-MONSTER/NVIDIA-Nemotron-3-Nano-4B-GGUF": {
+   "commit": "42bd773da0adbf86a927b260c2e486a010c5e7d1",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Hf', 'general.basename': None, 'general.architecture': 'nemotron_h', 'general.size_label': '4.0B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf": {
+     "oid": "be5d9a656a51922f24f1f09a759cebb694e1f5d9728bf0ef9f8c972c5a0b5ef2",
+     "size": 2837072864,
+     "lfs": true,
+     "template_sha256": "ab7813c3abdd9cb655905a410728b26c7884eca45ddfab8d9f931553485a7862"
+    }
+   }
+  },
+  "1bit-MONSTER/OLMo-2-0425-1B-Instruct-GGUF": {
+   "commit": "27584e279b720d3988b4287add93e8ef9761939f",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'OLMo 2 0425 1B Instruct', 'general.basename': 'OLMo-2-0425', 'general.architecture': 'olmo2', 'general.size_label': '1B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "OLMo-2-0425-1B-Instruct-Q4_K_M.gguf": {
+     "oid": "abd8187934a438fbf7cfff0a1de5b9d2793ce913f158794df1951dcba6c93cc6",
+     "size": 935515296,
+     "lfs": true,
+     "template_sha256": "fe689ffbd6a4e2d0532d7480696b065b10e0e1eff3f9b9fc4bea415761e4bf4a"
+    }
+   }
+  },
+  "1bit-MONSTER/OpenELM-1.1B-Instruct-GGUF": {
+   "commit": "51d91670c9117be64412d068da4d2d4d2f8dbdf6",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'OpenELM-1_1B-Instruct', 'general.basename': None, 'general.architecture': 'openelm', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "OpenELM-1_1B-Instruct.Q4_K_M.gguf": {
+     "oid": "3b5247b98a6f8b13449759419027a2ac574892d71e9e1a0b46093e91869193e6",
+     "size": 672919616,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen1.5-MoE-A2.7B-Chat-GGUF": {
+   "commit": "0a4299d79d99527045ff060dedf10f842f37b006",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen1.5-MoE-A2.7B-Chat', 'general.basename': None, 'general.architecture': 'qwen2moe', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "Qwen1.5-MoE-A2.7B-Chat.Q4_K_M.gguf": {
+     "oid": "3dcfb1032781788bf373edb49b888fcac5b6093ea0fe0edf5e23a977390b3eea",
+     "size": 9496236768,
+     "lfs": true,
+     "template_sha256": "793202280c0910ab26bc6eb57c8212c2417324c6d8c4efd0d10d59092ab3e3eb"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen2.5-0.5B-Instruct-GGUF": {
+   "commit": "096a46afd8d62caf78afc0e5d07383c3e96c60b2",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'qwen2.5-0.5b-instruct', 'general.basename': None, 'general.architecture': 'qwen2', 'general.size_label': '630M', 'general.finetune': 'qwen2.5-0.5b-instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "qwen2.5-0.5b-instruct-q4_k_m.gguf": {
+     "oid": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+     "size": 491400032,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen2.5-1.5B-Instruct-GGUF": {
+   "commit": "7ac2f1fad8164d460247a42033f0cb6806ef3c0e",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'qwen2.5-1.5b-instruct', 'general.basename': None, 'general.architecture': 'qwen2', 'general.size_label': '1.8B', 'general.finetune': 'qwen2.5-1.5b-instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "qwen2.5-1.5b-instruct-q4_k_m.gguf": {
+     "oid": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+     "size": 1117320736,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen2.5-14B-Instruct-GGUF": {
+   "commit": "69e5595f101d1494b94ce9cba05f308658ee71df",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'qwen2.5-14b-instruct', 'general.basename': None, 'general.architecture': 'qwen2', 'general.size_label': '15B', 'general.finetune': 'qwen2.5-14b-instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: re-host ({'general.name': None, 'general.basename': None, 'general.architecture': None, 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': None, 'general.file_type': None, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf": {
+     "oid": "a09ea5e7b1eafb1b30b241726c3cc3c905c96f14ad41e246ffa5f44e53904f68",
+     "size": 3991999872,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    },
+    "qwen2.5-14b-instruct-q4_k_m-00002-of-00003.gguf": {
+     "oid": "21b9457d079680d284e90ef69607c4b2d8ef64a09d4729cb7b5e1357bdba41ae",
+     "size": 3989373504,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "qwen2.5-14b-instruct-q4_k_m-00003-of-00003.gguf": {
+     "oid": "c8d37006760a387a35216e070e6664d7da927f10be8eb870fef2e3d4833d9976",
+     "size": 1006737120,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen2.5-32B-Instruct-GGUF": {
+   "commit": "fb89cd33d8141f6f93a0a776773152625eed7d8c",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'qwen2.5-32b-instruct', 'general.basename': None, 'general.architecture': 'qwen2', 'general.size_label': '33B', 'general.finetune': 'qwen2.5-32b-instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: re-host ({'general.name': None, 'general.basename': None, 'general.architecture': None, 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': None, 'general.file_type': None, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "qwen2.5-32b-instruct-q4_k_m-00001-of-00005.gguf": {
+     "oid": "403434e5c845452c013661d586b97d5a53cf207462d180a07c301eafa9390d05",
+     "size": 3961498272,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    },
+    "qwen2.5-32b-instruct-q4_k_m-00002-of-00005.gguf": {
+     "oid": "7371e5c5d717a8c20f526dbfce5d3f201dc3f02140d1c836314cd0756e02e8d7",
+     "size": 3948996064,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "qwen2.5-32b-instruct-q4_k_m-00003-of-00005.gguf": {
+     "oid": "f023ccc294c3bd3b2eac5b2dd40dea3aa4ca1d06c7460ead67c36386cd62e8fc",
+     "size": 3993478688,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "qwen2.5-32b-instruct-q4_k_m-00004-of-00005.gguf": {
+     "oid": "05fe76d941454390cd7aa0de3b342f83a1d1226a959479af85bbfae7cd93e771",
+     "size": 3950347744,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "qwen2.5-32b-instruct-q4_k_m-00005-of-00005.gguf": {
+     "oid": "8c2e8ecc686129c37821bd9f3b3e251e6ae80deadd3d3348f7e3e84492a63c24",
+     "size": 3997015616,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen2.5-3B-Instruct-GGUF": {
+   "commit": "68519983947f548906c6e8531501d65c804f185a",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'qwen2.5-3b-instruct', 'general.basename': None, 'general.architecture': 'qwen2', 'general.size_label': '3.4B', 'general.finetune': 'qwen2.5-3b-instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "qwen2.5-3b-instruct-q4_k_m.gguf": {
+     "oid": "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d",
+     "size": 2104932768,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen2.5-7B-Instruct-GGUF": {
+   "commit": "8394959e43652754d718f11ad74c1de098c24c55",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'qwen2.5-7b-instruct', 'general.basename': None, 'general.architecture': 'qwen2', 'general.size_label': '7.6B', 'general.finetune': 'qwen2.5-7b-instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: re-host ({'general.name': None, 'general.basename': None, 'general.architecture': None, 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': None, 'general.file_type': None, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf": {
+     "oid": "dfce12e3862a5283ccfb88221b48480e58745165de856439950d0f22590580db",
+     "size": 3993201344,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    },
+    "qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf": {
+     "oid": "539cf93f78e887edea1c04e2d7d8cdaca9d01dae9c9025bcb8accbe29df3d72a",
+     "size": 689872288,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen2.5-Coder-14B-Instruct-GGUF": {
+   "commit": "28176c6e87613c680565754e47b4832a07e5a815",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen2.5 Coder 14B Instruct AWQ', 'general.basename': 'Qwen2.5-Coder', 'general.architecture': 'qwen2', 'general.size_label': '14B', 'general.finetune': 'Instruct-AWQ', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "qwen2.5-coder-14b-instruct-q4_k_m.gguf": {
+     "oid": "c1e659736d89ac1065fb495330fb824d94001974a4bfa78e7270e43476a8d940",
+     "size": 8988110272,
+     "lfs": true,
+     "template_sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen2.5-Coder-32B-Instruct-GGUF": {
+   "commit": "2a75128ebc2b08f52f26c4316c91fc643dc5e4c6",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen2.5 Coder 32B Instruct AWQ', 'general.basename': 'Qwen2.5-Coder', 'general.architecture': 'qwen2', 'general.size_label': '32B', 'general.finetune': 'Instruct-AWQ', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "qwen2.5-coder-32b-instruct-q4_k_m.gguf": {
+     "oid": "4d64b316b5e6319d9613e0d97935d9ebd631fc7e334da400d00085eca749d085",
+     "size": 19851335872,
+     "lfs": true,
+     "template_sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF": {
+   "commit": "4425774a9ea3606c3b770fb9284514c305ebb0a8",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen2.5 Coder 7B Instruct GGUF', 'general.basename': 'Qwen2.5-Coder', 'general.architecture': 'qwen2', 'general.size_label': '7B', 'general.finetune': 'Instruct-GGUF', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "qwen2.5-coder-7b-instruct-q4_k_m.gguf": {
+     "oid": "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c",
+     "size": 4683073536,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3-0.6B-GGUF": {
+   "commit": "0ab432bfa20eef76c54daadb1aef38cf3c60de29",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3 0.6B Instruct', 'general.basename': 'Qwen3', 'general.architecture': 'qwen3', 'general.size_label': '0.6B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "serve: laya-first class short"
+   ],
+   "files": {
+    "Qwen3-0.6B-Q8_0.gguf": {
+     "oid": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+     "size": 639446688,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3-1.7B-GGUF": {
+   "commit": "008c59e014d2d7ff15de68570025debd8c4c8d10",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3 1.7B Instruct', 'general.basename': 'Qwen3', 'general.architecture': 'qwen3', 'general.size_label': '1.7B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Qwen3-1.7B-Q8_0.gguf": {
+     "oid": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+     "size": 1834426016,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3-14B-GGUF": {
+   "commit": "35bd73c5af9de2073e03339e86c059c236519abb",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3 14B Awq Compatible Instruct', 'general.basename': 'Qwen3', 'general.architecture': 'qwen3', 'general.size_label': '14B', 'general.finetune': 'awq-compatible-Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Qwen3-14B-Q4_K_M.gguf": {
+     "oid": "500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0",
+     "size": 9001752960,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3-30B-A3B-GGUF": {
+   "commit": "5b1cc4b3623f206dbde1e95b31785e47d8a5a327",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3 30B Gptq Fp16', 'general.basename': 'Qwen3', 'general.architecture': 'qwen3moe', 'general.size_label': '30B', 'general.finetune': 'gptq', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Qwen3-30B-A3B-Q4_K_M.gguf": {
+     "oid": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+     "size": 18556685824,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3-32B-GGUF": {
+   "commit": "488ee71152d8c68195ca30897f19dcf9e5c7e3f5",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3 32B Awq Compatible Instruct', 'general.basename': 'Qwen3', 'general.architecture': 'qwen3', 'general.size_label': '32B', 'general.finetune': 'awq-compatible-Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Qwen3-32B-Q4_K_M.gguf": {
+     "oid": "efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689",
+     "size": 19762149024,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3-4B-GGUF": {
+   "commit": "279ae7968b9f2c7ad3cde82b0fe6865d3a0281a1",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3 4B Instruct Awq', 'general.basename': 'Qwen3', 'general.architecture': 'qwen3', 'general.size_label': '4B', 'general.finetune': 'Instruct-awq', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Qwen3-4B-Q4_K_M.gguf": {
+     "oid": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+     "size": 2497280256,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3-8B-GGUF": {
+   "commit": "dd397bf0b262d02eef5159a3bcc46c1abc7a6884",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3 8B Awq Compatible Instruct', 'general.basename': 'Qwen3', 'general.architecture': 'qwen3', 'general.size_label': '8B', 'general.finetune': 'awq-compatible-Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Qwen3-8B-Q4_K_M.gguf": {
+     "oid": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+     "size": 5027783488,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3-Coder-30B-A3B-Instruct-GGUF": {
+   "commit": "8dad5bd33f7ea1116f4fc9a7942faf717e7fe4ba",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3-Coder-30B-A3B-Instruct', 'general.basename': 'Qwen3-Coder-30B-A3B-Instruct', 'general.architecture': 'qwen3moe', 'general.size_label': '30B-A3B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "serve: laya-first class code"
+   ],
+   "files": {
+    "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf": {
+     "oid": "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad",
+     "size": 18556689568,
+     "lfs": true,
+     "template_sha256": "87710339d25b4e789c1d723f93c91ee861a86d305bb3d20a845536f251d6ea8a"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3-Coder-30B-A3B-Q4_0-H32-GGUF": {
+   "commit": "f426a5cf7af4118092f6770959fcaaba1cb02241",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3-Coder-30B-A3B-Instruct', 'general.basename': 'Qwen3-Coder-30B-A3B-Instruct', 'general.architecture': 'qwen3moe', 'general.size_label': '30B-A3B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 2, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Qwen3-Coder-30B-A3B-Q4_0-H32.gguf": {
+     "oid": "8aa9bf38cc9fd47cfd0b6e68ef40b79d69fde45ff3c1c903ffeec71de16b6b5f",
+     "size": 17304493248,
+     "lfs": true,
+     "template_sha256": "87710339d25b4e789c1d723f93c91ee861a86d305bb3d20a845536f251d6ea8a"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3.6-35B-A3B-NPU": {
+   "commit": "126ec0636cc07246aeafc86a184fce56a4e163b8",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue container ((Q4NX container))"
+   ],
+   "files": {
+    "chat_template.jinja": {
+     "oid": "a8755d827c0a7b614c246c4060dfd58ab352a8ff",
+     "size": 7764,
+     "lfs": false,
+     "template_sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+    },
+    "tokenizer_config.json": {
+     "oid": "3952ffef1dfabf76646d5f8a1a899e760db72cb4",
+     "size": 8761,
+     "lfs": false,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3.8-27B-DFlash2-GGUF": {
+   "commit": "38528d8281f3651370a1f30b8136f5b073e2dd44",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'DFlash2', 'general.basename': None, 'general.architecture': 'dflash', 'general.size_label': '1.9B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: conversion ({'general.name': 'DFlash2', 'general.basename': None, 'general.architecture': 'dflash', 'general.size_label': '1.9B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Qwen3.8-27B-DFlash2-q4k.gguf": {
+     "oid": "d0bdda550dd18dd73185cb267973aab56ad45a85eafa136fde856834f6c5270a",
+     "size": 1207231840,
+     "lfs": true,
+     "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    },
+    "Qwen3.8-27B-DFlash2-q8_0.gguf": {
+     "oid": "6f939962045a3cbe42b5e416584aa7bb8af689e7b892c88317f2bce4f73a1a9d",
+     "size": 2056414560,
+     "lfs": true,
+     "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3.8-27B-Q4_0-H32-GGUF": {
+   "commit": "eacb90f1f9d58d89fa43c1db4d936dd19624b6e5",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3.8-27B', 'general.basename': 'Qwen3.8-27B', 'general.architecture': 'qwen35', 'general.size_label': '27B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 2, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Qwen3.8-27B-Q4_0-H32.gguf": {
+     "oid": "fd61323dd0f78deeb65f7af5a5b2dcd8468af1edb531a9cd37d156bf49e37df4",
+     "size": 15930813504,
+     "lfs": true,
+     "template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3.8-27B-UD-Q4_K_XL-MTP": {
+   "commit": "2f45a4d45112290e8157a8e5c94d62931a1b79a2",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Qwen3.8-27B', 'general.basename': 'Qwen3.8-27B', 'general.architecture': 'qwen35', 'general.size_label': '27B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 14, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: re-host ({'general.name': 'Qwen3.8-27B', 'general.basename': 'Qwen3.8-27B', 'general.architecture': 'qwen35', 'general.size_label': '27B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "serve: laya-first class long_doc",
+    "serve: laya-first extra file"
+   ],
+   "files": {
+    "Qwen3.8-27B-UD-Q4_K_XL.gguf": {
+     "oid": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
+     "size": 17559178144,
+     "lfs": true,
+     "template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
+    },
+    "MTP/mtp-Qwen3.8-27B-Q4_0.gguf": {
+     "oid": "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e",
+     "size": 1369590656,
+     "lfs": true,
+     "template_sha256": "701ba13a085c0c1b5e05414dec1aa3069904f962beee36f0899e441720b83974"
+    }
+   }
+  },
+  "1bit-MONSTER/Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP": {
+   "commit": "b8f62ca8bd24c27cc7d233b441ec156dc93f14a6",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Ckpt_Q38', 'general.basename': None, 'general.architecture': 'qwen4exp', 'general.size_label': '512x1.4B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: re-host ({'general.name': 'Qwen3.8 Flash Next', 'general.basename': None, 'general.architecture': 'qwen4exp', 'general.size_label': '512x56B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: re-host ({'general.name': None, 'general.basename': None, 'general.architecture': None, 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': None, 'general.file_type': None, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf": {
+     "oid": "cd87e5d1a4dadaeed63e35929f3b2f28d13e081b4cd32e00f2835095ec09351e",
+     "size": 4137429120,
+     "lfs": true,
+     "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    },
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf": {
+     "oid": "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082",
+     "size": 10946624,
+     "lfs": true,
+     "template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
+    },
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf": {
+     "oid": "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9",
+     "size": 49859583136,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf": {
+     "oid": "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3",
+     "size": 49376141504,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf": {
+     "oid": "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a",
+     "size": 12087983520,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/SmolLM2-135M-Instruct-GGUF": {
+   "commit": "7005e441bbf4adb9a17e4ab18e1989f2f932f369",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'SmolLM2 135M Instruct', 'general.basename': 'SmolLM2', 'general.architecture': 'llama', 'general.size_label': '135M', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "SmolLM2-135M-Instruct-Q4_K_M.gguf": {
+     "oid": "ed5fa30c487b282ec156c29062f1222e5c20875a944ac98289dbd242e947f747",
+     "size": 105454144,
+     "lfs": true,
+     "template_sha256": "872be49dbb638044ad01b60388f48d469ff2980e5f0dccdc22ec907db54d0788"
+    }
+   }
+  },
+  "1bit-MONSTER/SmolLM3-3B-GGUF": {
+   "commit": "f4a6a5c91a5c289b19af20a9a37219b34551fbc5",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': None, 'general.basename': None, 'general.architecture': 'smollm3', 'general.size_label': '3.1B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "SmolLM3-Q4_K_M.gguf": {
+     "oid": "8334b850b7bd46238c16b0c550df2138f0889bf433809008cc17a8b05761863e",
+     "size": 1915305312,
+     "lfs": true,
+     "template_sha256": "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e"
+    }
+   }
+  },
+  "1bit-MONSTER/TinyLlama-1.1B-Chat-v1.0-GGUF": {
+   "commit": "37beeb801a30a7744055eb0dd103f710c03aaa52",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'tinyllama_tinyllama-1.1b-chat-v1.0', 'general.basename': None, 'general.architecture': 'llama', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf": {
+     "oid": "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0",
+     "size": 668788096,
+     "lfs": true,
+     "template_sha256": "66291cf0045c2425a3a667cf3cbb7af2b11f09e025c02f97245323ab79119362"
+    }
+   }
+  },
+  "1bit-MONSTER/ZAYA1-74B-preview-GGUF": {
+   "commit": "336e6655df38808e56d8de581499e74c015ef578",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'ZAYA1 74B Preview', 'general.basename': 'ZAYA1', 'general.architecture': 'zaya', 'general.size_label': '74B', 'general.finetune': 'preview', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gemma4', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "ZAYA1-74B-preview-Q4_K_M.gguf": {
+     "oid": "95c42025201b5292b90a18abf9fde0005671027ddac56add4f8a4681a3f0a4dd",
+     "size": 45722931008,
+     "lfs": true,
+     "template_sha256": "b55ecfbbbcbb238a011465bfa139366db18790103f9205060cf2855a3f51b30f"
+    }
+   }
+  },
+  "1bit-MONSTER/ZAYA1-8B-GGUF": {
+   "commit": "61186e7567edceb646bcd09e9d7526065685f73e",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Zaya Hf', 'general.basename': None, 'general.architecture': 'zaya', 'general.size_label': '16x1.3B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 1, 'tokenizer.ggml.model': 'gemma4', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: conversion ({'general.name': 'Zaya Hf', 'general.basename': None, 'general.architecture': 'zaya', 'general.size_label': '16x1.3B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gemma4', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "serve: laya-first class prose",
+    "stick: Lemonade catalogue (zaya1-8b-Q4_K_M.gguf)"
+   ],
+   "files": {
+    "zaya1-8b-Q4_K_M.gguf": {
+     "oid": "339cac3addcf2b61abdb171a45f29dd11bb986a6741cf9119ae9a615edd44dcc",
+     "size": 5567582048,
+     "lfs": true,
+     "template_sha256": "b55ecfbbbcbb238a011465bfa139366db18790103f9205060cf2855a3f51b30f"
+    },
+    "zaya1-8b-f16.gguf": {
+     "oid": "8130331f50be1bd2fc4755676ed43af6dd6775ed1afa301f0082c0d3461b6ab4",
+     "size": 17740429984,
+     "lfs": true,
+     "template_sha256": "b55ecfbbbcbb238a011465bfa139366db18790103f9205060cf2855a3f51b30f"
+    }
+   }
+  },
+  "1bit-MONSTER/ZAYA1-VL-8B-GGUF": {
+   "commit": "00a876d967f2aadcda4cc997e151953fb41dcb46",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Hf', 'general.basename': None, 'general.architecture': 'clip', 'general.size_label': '669M', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 1, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': 'mmproj'})",
+    "published: conversion ({'general.name': 'Zyphra/ZAYA1-VL-8B', 'general.basename': None, 'general.architecture': 'zaya', 'general.size_label': '16x1.5B', 'general.finetune': '2967258fbdfdf8c9358dc52b3451db24fe45dfcd', 'general.quantization_version': 2, 'general.file_type': 1, 'tokenizer.ggml.model': 'gemma4', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: conversion ({'general.name': 'Zyphra/ZAYA1-VL-8B', 'general.basename': None, 'general.architecture': 'zaya', 'general.size_label': '16x1.5B', 'general.finetune': '2967258fbdfdf8c9358dc52b3451db24fe45dfcd', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gemma4', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "ZAYA1-VL-8B-F16.gguf": {
+     "oid": "28e0ab587839e8e6d6de5f74283a2966ff2857a286dac7c9581950d65558272f",
+     "size": 18168092320,
+     "lfs": true,
+     "template_sha256": "bc20c7bec83c3bbb0a5a24f43d2eb45c5207e3b6c7c88b6cf106a3bf44f49dba"
+    },
+    "ZAYA1-VL-8B-Q4_K_M.gguf": {
+     "oid": "819da27ba461bb7bd618a41a2a07d45a73ca9e5f32c4e63d589bb02dde79725b",
+     "size": 5705263232,
+     "lfs": true,
+     "template_sha256": "bc20c7bec83c3bbb0a5a24f43d2eb45c5207e3b6c7c88b6cf106a3bf44f49dba"
+    },
+    "mmproj-ZAYA1-VL-8B-F16.gguf": {
+     "oid": "96ec57085a770b33c52c602b2fbf2caedf2e316b1faef1165fe70d4ae237fb4d",
+     "size": 1338428384,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/ZAYA1-base-GGUF": {
+   "commit": "aeafb231ce73674236f76ff1b9bf5977f14882d7",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'ZAYA1 Base', 'general.basename': None, 'general.architecture': 'zaya', 'general.size_label': '16x1.3B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gemma4', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "ZAYA1-base-Q4_K_M.gguf": {
+     "oid": "55bbf16aa995805feb797b1946101ddda4f0d9d8afce865e440000f020f78c1e",
+     "size": 5567572800,
+     "lfs": true,
+     "template_sha256": "7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4"
+    }
+   }
+  },
+  "1bit-MONSTER/ZAYA1-reasoning-base-GGUF": {
+   "commit": "1bd9aebafbcc5eb356f3456534693a97fecaf3ac",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Zyphra/ZAYA1-reasoning-base', 'general.basename': None, 'general.architecture': 'zaya', 'general.size_label': '16x1.3B', 'general.finetune': '7c6397678f86557e82a4637c35e4c35cc76e8d08', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gemma4', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "ZAYA1-reasoning-base-Q4_K_M.gguf": {
+     "oid": "107c6ca9143640c7830af75ba640a7bf15a60105f7d0a8edd0f09d117f84b73c",
+     "size": 5555286272,
+     "lfs": true,
+     "template_sha256": "3deb83b149b0b51571531f6c044e6c8992550b716ef720ba00586084b1e4f25d"
+    }
+   }
+  },
+  "1bit-MONSTER/ZR1-1.5B-GGUF": {
+   "commit": "3252419078406e84b475d8976868b64812e9adb6",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'ZR1 1.5B@6108a26d0cd7', 'general.basename': 'ZR1', 'general.architecture': 'qwen2', 'general.size_label': '1.8B', 'general.finetune': '1.5B@6108a26d0cd7', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: conversion ({'general.name': 'ZR1 1.5B@6108a26d0cd7', 'general.basename': 'ZR1', 'general.architecture': 'qwen2', 'general.size_label': '1.8B', 'general.finetune': '1.5B@6108a26d0cd7', 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "ZR1-1.5B-Q4_K_M.gguf": {
+     "oid": "9457f6baa4b557d933980d690cd45f24f6406d3599b94a548a213ffa92b92541",
+     "size": 1117322144,
+     "lfs": true,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "ZR1-1.5B-Q8_0.gguf": {
+     "oid": "dd3419dd33a40f0e1b05439fb92bcd5e169d745db1b72942448cd2f389a1eedf",
+     "size": 1894533536,
+     "lfs": true,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    }
+   }
+  },
+  "1bit-MONSTER/Zamba-7B-v1-GGUF": {
+   "commit": "e41a596835168d4adc1044731a7749b43665a648",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Zamba 7B v1', 'general.basename': 'Zamba', 'general.architecture': 'zamba', 'general.size_label': '7B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Zamba-7B-v1-Q8_0.gguf": {
+     "oid": "d90121934d350e09607d2616bae4f86d587494bb43124773ea016d437f79b746",
+     "size": 7846996128,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/Zamba2-1.2B-instruct-GGUF": {
+   "commit": "e4341961d1db2bc43a0a7e32df801628aa89f6f5",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Zamba2 1.2B Instruct', 'general.basename': 'Zamba2', 'general.architecture': 'zamba2', 'general.size_label': '1.2B', 'general.finetune': 'instruct', 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Zamba2-1.2B-instruct-Q8_0.gguf": {
+     "oid": "9c2fc8bca881fb444b65110111c107be279a803adf6b49363c3d1039519c0079",
+     "size": 1839274432,
+     "lfs": true,
+     "template_sha256": "153280e3ff55d19da1398bdb3914ee2a51b80429bfaedde11d7d216c39db80f3"
+    }
+   }
+  },
+  "1bit-MONSTER/Zamba2-2.7B-instruct-GGUF": {
+   "commit": "0942a6dd0b910253343a6cadad951380f70b9413",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Zyphra/Zamba2-2.7B-instruct', 'general.basename': None, 'general.architecture': 'zamba2', 'general.size_label': '3.8B', 'general.finetune': '699f349b3636e892b0a138e929f9d51c8684cb6f', 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Zamba2-2.7B-instruct-Q8_0.gguf": {
+     "oid": "b5e9e17dd3f5189d96848b7f789794483d6e4179e40a28d7f27c61057b1ae978",
+     "size": 4074143264,
+     "lfs": true,
+     "template_sha256": "153280e3ff55d19da1398bdb3914ee2a51b80429bfaedde11d7d216c39db80f3"
+    }
+   }
+  },
+  "1bit-MONSTER/Zamba2-7B-Instruct-GGUF": {
+   "commit": "85e0c311f15b1be6c85d4f3f8c74c223398b4486",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Zamba2 7B Instruct', 'general.basename': 'Zamba2', 'general.architecture': 'zamba2', 'general.size_label': '7B', 'general.finetune': 'Instruct', 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Zamba2-7B-Instruct-Q8_0.gguf": {
+     "oid": "a9a10b17fe9544f836e4fbe487d8ec81520cee0b7b4d52aeb50818c54423e53a",
+     "size": 11675594080,
+     "lfs": true,
+     "template_sha256": "153280e3ff55d19da1398bdb3914ee2a51b80429bfaedde11d7d216c39db80f3"
+    }
+   }
+  },
+  "1bit-MONSTER/Zamba2-VL-1.2B-GGUF": {
+   "commit": "d7c77fab4ff89db15658f9f786030e7b18605e8c",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Zamba2 VL 1.2B', 'general.basename': 'Zamba2-VL', 'general.architecture': 'clip', 'general.size_label': '1.2B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 1, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': 'mmproj'})",
+    "published: conversion ({'general.name': 'Zamba2 VL 1.2B', 'general.basename': 'Zamba2-VL', 'general.architecture': 'zamba2', 'general.size_label': '1.2B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Zamba2-VL-1.2B-Q8_0.gguf": {
+     "oid": "60f0afb915108748c26622d407723059569a89e3195baa4a6e5f96c37d2af076",
+     "size": 1839416448,
+     "lfs": true,
+     "template_sha256": "9df322391abffe14587e6f3cfaea42420eaffec364835debfcb13c0e4c6eeab6"
+    },
+    "mmproj-Zamba2-VL-1.2B-F16.gguf": {
+     "oid": "8aaf0f0244c413e955e51627f12bd6f24481746c750034b0ba3a81830b04a447",
+     "size": 1338428352,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/Zamba2-VL-2.7B-GGUF": {
+   "commit": "eff1bc1a5c1bb7c45e5a4133735fb803527b3965",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Zamba2 VL 2.7B', 'general.basename': 'Zamba2-VL', 'general.architecture': 'clip', 'general.size_label': '671M', 'general.finetune': '2.7b', 'general.quantization_version': 2, 'general.file_type': 1, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': 'mmproj'})",
+    "published: conversion ({'general.name': 'Zamba2 VL 2.7B', 'general.basename': 'Zamba2-VL', 'general.architecture': 'zamba2', 'general.size_label': '2.7B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Zamba2-VL-2.7B-Q8_0.gguf": {
+     "oid": "457019c64fbe7db2a7943b0f5939fee4ecf17fc1b72bb3b1ca9574c62507df74",
+     "size": 4074318720,
+     "lfs": true,
+     "template_sha256": "9df322391abffe14587e6f3cfaea42420eaffec364835debfcb13c0e4c6eeab6"
+    },
+    "mmproj-Zamba2-VL-2.7B-F16.gguf": {
+     "oid": "db5306a0d342d087e28a683f3718d60b75eb50f78fb88ce9ecaa5be9b35a2037",
+     "size": 1343673312,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/Zamba2-VL-7B-GGUF": {
+   "commit": "521e8f34188f2eb10c6db76c8a92f45d21c2e6c8",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Zamba2 VL 7B', 'general.basename': 'Zamba2-VL', 'general.architecture': 'clip', 'general.size_label': '677M', 'general.finetune': '7b', 'general.quantization_version': 2, 'general.file_type': 1, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': 'mmproj'})",
+    "published: conversion ({'general.name': 'Zamba2 VL 7B', 'general.basename': 'Zamba2-VL', 'general.architecture': 'zamba2', 'general.size_label': '7B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 7, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Zamba2-VL-7B-Q8_0.gguf": {
+     "oid": "5d9d5c9845233aff5bd77f36b277942693f9ffd2c8275d623276e4945328302c",
+     "size": 11675840288,
+     "lfs": true,
+     "template_sha256": "9df322391abffe14587e6f3cfaea42420eaffec364835debfcb13c0e4c6eeab6"
+    },
+    "mmproj-Zamba2-VL-7B-F16.gguf": {
+     "oid": "64288d4e64077ba4f03f4e4b2431ac70b8f967f8d316b237938638855f7ddab7",
+     "size": 1354163168,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/gemma-2-2b-it-GGUF": {
+   "commit": "22f9d7d1b672483f69c6744277d87019440815b7",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Gemma 2 2b It', 'general.basename': 'gemma-2', 'general.architecture': 'gemma2', 'general.size_label': '2B', 'general.finetune': 'it', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "gemma-2-2b-it-Q4_K_M.gguf": {
+     "oid": "e0aee85060f168f0f2d8473d7ea41ce2f3230c1bc1374847505ea599288a7787",
+     "size": 1708582752,
+     "lfs": true,
+     "template_sha256": "ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6"
+    }
+   }
+  },
+  "1bit-MONSTER/gemma-2-9b-it-GGUF": {
+   "commit": "41f5449a1825f32ca9618f54844d00e80347b0aa",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'gemma-2-9b-it', 'general.basename': None, 'general.architecture': 'gemma2', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "gemma-2-9b-it-Q4_K_M.gguf": {
+     "oid": "13b2a7b4115bbd0900162edcebe476da1ba1fc24e718e8b40d32f6e300f56dfe",
+     "size": 5761057728,
+     "lfs": true,
+     "template_sha256": "ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6"
+    }
+   }
+  },
+  "1bit-MONSTER/gemma-3-1b-it-GGUF": {
+   "commit": "c83edd092ad930e389440d591f1aefbb3739d2db",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Gemma 3 1b It', 'general.basename': 'gemma-3', 'general.architecture': 'gemma3', 'general.size_label': '1B', 'general.finetune': 'it', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'llama', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "gemma-3-1b-it-Q4_K_M.gguf": {
+     "oid": "8ccc5cd1f1b3602548715ae25a66ed73fd5dc68a210412eea643eb20eb75a135",
+     "size": 806058240,
+     "lfs": true,
+     "template_sha256": "7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4"
+    }
+   }
+  },
+  "1bit-MONSTER/gpt-neox-20b-GGUF": {
+   "commit": "df40def21dc8b6d0048981c81bd40d4aeb51c85b",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Gpt Neox 20b', 'general.basename': 'gpt-neox', 'general.architecture': 'gptneox', 'general.size_label': '20B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "gpt-neox-20b.Q4_K_M.gguf": {
+     "oid": "dd9666047d23f063f9222550e9fcb47ff171891b2b30d8e9b38068c09b59ba7b",
+     "size": 13135032096,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/gpt-oss-120b-GGUF": {
+   "commit": "2732e996c7814fbe9a8735655ed017fd8fb76352",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Gpt-Oss-120B', 'general.basename': 'Gpt-Oss-120B', 'general.architecture': 'gpt-oss', 'general.size_label': '120B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: re-host ({'general.name': None, 'general.basename': None, 'general.architecture': None, 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': None, 'general.file_type': None, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "UD-Q4_K_XL/gpt-oss-120b-UD-Q4_K_XL-00001-of-00002.gguf": {
+     "oid": "c7b59d68c889ada280736d9b82685baeb6152f4d7423a169a369bb3492b3056e",
+     "size": 49866326912,
+     "lfs": true,
+     "template_sha256": "acaa726974dadda7844c6607c59554bca390645b94705cfdc2e78bb34895717c"
+    },
+    "UD-Q4_K_XL/gpt-oss-120b-UD-Q4_K_XL-00002-of-00002.gguf": {
+     "oid": "7c77ca781792a28565c311ace40620ef7fb1cf67d123db347aa34f30ff48ad16",
+     "size": 13149984480,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/gpt-oss-20b-GGUF": {
+   "commit": "824986fa01a31f5de0977398671c5a6de7f86df4",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Gpt-Oss-20B', 'general.basename': 'Gpt-Oss-20B', 'general.architecture': 'gpt-oss', 'general.size_label': '20B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "gpt-oss-20b-UD-Q4_K_XL.gguf": {
+     "oid": "10fe673de12c20b74b8d670a9fdf0fd36b43b0a86ffc04daeb175c0a2b98c4f9",
+     "size": 11872347328,
+     "lfs": true,
+     "template_sha256": "70da0d2348e40aaf8dad05f04a316835fd10547bd7e3392ce337e4c79ba91c01"
+    }
+   }
+  },
+  "1bit-MONSTER/granite-4.1-30b-GGUF": {
+   "commit": "9be9ca9ddffae24063a6ba1c90dc739e13660ce0",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Granite 4.1 30b', 'general.basename': 'granite-4.1', 'general.architecture': 'granite', 'general.size_label': '30B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "granite-4.1-30b-Q4_K_M.gguf": {
+     "oid": "b33e4376e3581d11236ea53ced6b38399f6e91c0a391488486dc0827972f23f6",
+     "size": 17490240736,
+     "lfs": true,
+     "template_sha256": "fed2756d2d24e127b951dcf139d0b03ab7db8ef23a456128ebc9c2db4901d476"
+    }
+   }
+  },
+  "1bit-MONSTER/granite-4.1-3b-GGUF": {
+   "commit": "fe51b6f852e7005ae6c509b12a69cbf319212084",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Granite 4.1 3b', 'general.basename': 'granite-4.1', 'general.architecture': 'granite', 'general.size_label': '3B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "granite-4.1-3b-Q4_K_M.gguf": {
+     "oid": "662b0626cd58f443baea23559b469df6576a81d349649c59413b36a9fb32eb29",
+     "size": 2099501664,
+     "lfs": true,
+     "template_sha256": "fed2756d2d24e127b951dcf139d0b03ab7db8ef23a456128ebc9c2db4901d476"
+    }
+   }
+  },
+  "1bit-MONSTER/phi-2-GGUF": {
+   "commit": "c143b19663de0923ea1ec3b6ab4fc8efed85d7fc",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Phi2', 'general.basename': None, 'general.architecture': 'phi2', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "phi-2.Q4_K_M.gguf": {
+     "oid": "324356668fa5ba9f4135de348447bb2bbe2467eaa1b8fcfb53719de62fbd2499",
+     "size": 1789239136,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "1bit-MONSTER/phi-4-GGUF": {
+   "commit": "fed158dd5f550d51ea34b25fd635d1579bd70e2c",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Phi 4', 'general.basename': 'phi', 'general.architecture': 'phi3', 'general.size_label': '15B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "phi-4-Q4_K.gguf": {
+     "oid": "5652b9be0ea4ae2842130d04fe31bc869fcb99a2b7106c53b4e754a343fd688f",
+     "size": 9053114560,
+     "lfs": true,
+     "template_sha256": "fe4120415a3858b873955c92ce3a103a95bc97c2cb00b72e62659aaf0f891ee5"
+    }
+   }
+  },
+  "FastFlowLM/Qwen3-0.6B-NPU2": {
+   "commit": "b584799232c962f693e0e5be99606fc4eca6811e",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue container ((Q4NX container))"
+   ],
+   "files": {
+    "tokenizer_config.json": {
+     "oid": "c5e960f8f86088760f876dca70aba8e97bbe89f6",
+     "size": 10055,
+     "lfs": false,
+     "template_sha256": "a136047ba140347b359d17b6ff8fa1bf8cb29d23f0c07bef7e0bf479b8680793"
+    }
+   }
+  },
+  "FastFlowLM/Qwen3-1.7B-NPU2": {
+   "commit": "1b452c9ab53dcc580fab244d3dc4d808185ceaca",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue container ((Q4NX container))"
+   ],
+   "files": {
+    "tokenizer_config.json": {
+     "oid": "c5e960f8f86088760f876dca70aba8e97bbe89f6",
+     "size": 10055,
+     "lfs": false,
+     "template_sha256": "a136047ba140347b359d17b6ff8fa1bf8cb29d23f0c07bef7e0bf479b8680793"
+    }
+   }
+  },
+  "FastFlowLM/Qwen3-4B-NPU2": {
+   "commit": "07651f11cac70ff5b7a81731643dee6f6e7baee1",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue container ((Q4NX container))"
+   ],
+   "files": {
+    "tokenizer_config.json": {
+     "oid": "c5e960f8f86088760f876dca70aba8e97bbe89f6",
+     "size": 10055,
+     "lfs": false,
+     "template_sha256": "a136047ba140347b359d17b6ff8fa1bf8cb29d23f0c07bef7e0bf479b8680793"
+    }
+   }
+  },
+  "LiquidAI/LFM2-1.2B-GGUF": {
+   "commit": "5399e76c648f4eb8c053feb1ab747277dea5bf8b",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (LFM2-1.2B-Q4_K_M.gguf)"
+   ],
+   "files": {
+    "LFM2-1.2B-Q4_K_M.gguf": {
+     "oid": "55175400e3f509a9616227afeffd58d87e80b9f628a5d3d54ada884d85221fed",
+     "size": 730893248,
+     "lfs": true,
+     "template_sha256": "a805e50fed68938a076b07e2e602639611b50b1ced0e50f11eb92f1ba25be4dc"
+    }
+   }
+  },
+  "LiquidAI/LFM2.5-2.6B-GGUF": {
+   "commit": "e7caca5d835a3901a8e0d63e94009429bafafdfc",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/LFM2.5-2.6B-GGUF"
+   ],
+   "files": {
+    "LFM2.5-2.6B-Q4_K_M.gguf": {
+     "oid": "02a8b7e17487d326e46d68ce0ba24211e1b80a14c4cd0597fa73c1cd697f52ed",
+     "size": 1674455040,
+     "lfs": true,
+     "template_sha256": "ea663864491de7ade391839479860ca95541f892f72665c73251fbd4643b1bef"
+    }
+   }
+  },
+  "LiquidAI/LFM2.5-8B-A1B-GGUF": {
+   "commit": "49c14831707011e64d70b2ebd8462ba08d608434",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/LFM2.5-8B-A1B-GGUF"
+   ],
+   "files": {
+    "LFM2.5-8B-A1B-Q4_K_M.gguf": {
+     "oid": "4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0",
+     "size": 5155564768,
+     "lfs": true,
+     "template_sha256": "6d65c8804847ad74eea912dd7eca3dc1cf7a457b53a77f47d841a14121910963"
+    }
+   }
+  },
+  "OpenBMB/MiniCPM-V-4.6-gguf": {
+   "commit": "afe9accb78d2995d214cd912920c9c92f4015faa",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (MiniCPM-V-4_6-Q4_K_M.gguf)"
+   ],
+   "files": {
+    "MiniCPM-V-4_6-Q4_K_M.gguf": {
+     "oid": "6b0c74962c44bc6bf4b655b9b02c13eda9d5a0491543ae976d1ac18e4b7892e2",
+     "size": 529101504,
+     "lfs": true,
+     "template_sha256": "dfe1fa43a3444f065406d3a2b9aa315602f5c146b80cf22e0426a6c1466d85aa"
+    }
+   }
+  },
+  "OpenBMB/MiniCPM5-1B-GGUF": {
+   "commit": "3d55fac80935ae6456986ad2384b5cbcc4d6c948",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (MiniCPM5-1B-Q4_K_M.gguf)"
+   ],
+   "files": {
+    "MiniCPM5-1B-Q4_K_M.gguf": {
+     "oid": "81b64d05a23b17b34c475f42b3e72fbde62d4b92cc34541f7a8031d0752deafa",
+     "size": 688065920,
+     "lfs": true,
+     "template_sha256": "7451a05cf1e28a79d97d7c0bc951028c0b1915119bf9046acd06a0e3d931f47c"
+    }
+   }
+  },
+  "Qwen/Qwen2.5-0.5B-Instruct-GGUF": {
+   "commit": "9217f5db79a29953eb74d5343926648285ec7e67",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen2.5-0.5B-Instruct-GGUF"
+   ],
+   "files": {
+    "qwen2.5-0.5b-instruct-q4_k_m.gguf": {
+     "oid": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+     "size": 491400032,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    }
+   }
+  },
+  "Qwen/Qwen2.5-1.5B-Instruct-GGUF": {
+   "commit": "91cad51170dc346986eccefdc2dd33a9da36ead9",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen2.5-1.5B-Instruct-GGUF"
+   ],
+   "files": {
+    "qwen2.5-1.5b-instruct-q4_k_m.gguf": {
+     "oid": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
+     "size": 1117320736,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    }
+   }
+  },
+  "Qwen/Qwen2.5-14B-Instruct-GGUF": {
+   "commit": "b466e1f8c07172155743e8e1307507d8a4f91fbd",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen2.5-14B-Instruct-GGUF"
+   ],
+   "files": {
+    "qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf": {
+     "oid": "a09ea5e7b1eafb1b30b241726c3cc3c905c96f14ad41e246ffa5f44e53904f68",
+     "size": 3991999872,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    },
+    "qwen2.5-14b-instruct-q4_k_m-00002-of-00003.gguf": {
+     "oid": "21b9457d079680d284e90ef69607c4b2d8ef64a09d4729cb7b5e1357bdba41ae",
+     "size": 3989373504,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "qwen2.5-14b-instruct-q4_k_m-00003-of-00003.gguf": {
+     "oid": "c8d37006760a387a35216e070e6664d7da927f10be8eb870fef2e3d4833d9976",
+     "size": 1006737120,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "Qwen/Qwen2.5-32B-Instruct-GGUF": {
+   "commit": "a15e3cc10f8bbb2c0af6f8f1f34a32e3b060c09d",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen2.5-32B-Instruct-GGUF"
+   ],
+   "files": {
+    "qwen2.5-32b-instruct-q4_k_m-00001-of-00005.gguf": {
+     "oid": "403434e5c845452c013661d586b97d5a53cf207462d180a07c301eafa9390d05",
+     "size": 3961498272,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    },
+    "qwen2.5-32b-instruct-q4_k_m-00002-of-00005.gguf": {
+     "oid": "7371e5c5d717a8c20f526dbfce5d3f201dc3f02140d1c836314cd0756e02e8d7",
+     "size": 3948996064,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "qwen2.5-32b-instruct-q4_k_m-00003-of-00005.gguf": {
+     "oid": "f023ccc294c3bd3b2eac5b2dd40dea3aa4ca1d06c7460ead67c36386cd62e8fc",
+     "size": 3993478688,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "qwen2.5-32b-instruct-q4_k_m-00004-of-00005.gguf": {
+     "oid": "05fe76d941454390cd7aa0de3b342f83a1d1226a959479af85bbfae7cd93e771",
+     "size": 3950347744,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "qwen2.5-32b-instruct-q4_k_m-00005-of-00005.gguf": {
+     "oid": "8c2e8ecc686129c37821bd9f3b3e251e6ae80deadd3d3348f7e3e84492a63c24",
+     "size": 3997015616,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "Qwen/Qwen2.5-3B-Instruct-GGUF": {
+   "commit": "7dabda4d13d513e3e842b20f0d435c732f172cbe",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen2.5-3B-Instruct-GGUF"
+   ],
+   "files": {
+    "qwen2.5-3b-instruct-q4_k_m.gguf": {
+     "oid": "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d",
+     "size": 2104932768,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    }
+   }
+  },
+  "Qwen/Qwen2.5-7B-Instruct-GGUF": {
+   "commit": "bb5d59e06d9551d752d08b292a50eb208b07ab1f",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen2.5-7B-Instruct-GGUF"
+   ],
+   "files": {
+    "qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf": {
+     "oid": "dfce12e3862a5283ccfb88221b48480e58745165de856439950d0f22590580db",
+     "size": 3993201344,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    },
+    "qwen2.5-7b-instruct-q4_k_m-00002-of-00002.gguf": {
+     "oid": "539cf93f78e887edea1c04e2d7d8cdaca9d01dae9c9025bcb8accbe29df3d72a",
+     "size": 689872288,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF": {
+   "commit": "f86cb2c1fa58255f8052cc32aeede1b7482d4361",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (qwen2.5-coder-1.5b-instruct-q4_k_m.gguf)"
+   ],
+   "files": {
+    "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf": {
+     "oid": "cc324af070c2ecbfd324a30884d2f951a7ff756aba85cb811a6ec436933bb046",
+     "size": 1117320768,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    }
+   }
+  },
+  "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF": {
+   "commit": "d0a692ef765eefbf2fabb130b3cb2e8917e3d225",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen2.5-Coder-14B-Instruct-GGUF"
+   ],
+   "files": {
+    "qwen2.5-coder-14b-instruct-q4_k_m.gguf": {
+     "oid": "c1e659736d89ac1065fb495330fb824d94001974a4bfa78e7270e43476a8d940",
+     "size": 8988110272,
+     "lfs": true,
+     "template_sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
+    }
+   }
+  },
+  "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF": {
+   "commit": "9d3053fce650fe1cdbdb75998c2a87add9d178ef",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen2.5-Coder-32B-Instruct-GGUF"
+   ],
+   "files": {
+    "qwen2.5-coder-32b-instruct-q4_k_m.gguf": {
+     "oid": "4d64b316b5e6319d9613e0d97935d9ebd631fc7e334da400d00085eca749d085",
+     "size": 19851335872,
+     "lfs": true,
+     "template_sha256": "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"
+    }
+   }
+  },
+  "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF": {
+   "commit": "13fb94bfda8c8cf22497dc57b78f391a9acb426a",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (qwen2.5-coder-7b-instruct-q4_k_m.gguf)",
+    "upstream of 1bit-MONSTER/Qwen2.5-Coder-7B-Instruct-GGUF"
+   ],
+   "files": {
+    "qwen2.5-coder-7b-instruct-q4_k_m.gguf": {
+     "oid": "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c",
+     "size": 4683073536,
+     "lfs": true,
+     "template_sha256": "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4"
+    }
+   }
+  },
+  "Qwen/Qwen3-0.6B-GGUF": {
+   "commit": "23749fefcc72300e3a2ad315e1317431b06b590a",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen3-0.6B-GGUF"
+   ],
+   "files": {
+    "Qwen3-0.6B-Q8_0.gguf": {
+     "oid": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+     "size": 639446688,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "Qwen/Qwen3-1.7B-GGUF": {
+   "commit": "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen3-1.7B-GGUF"
+   ],
+   "files": {
+    "Qwen3-1.7B-Q8_0.gguf": {
+     "oid": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+     "size": 1834426016,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "Qwen/Qwen3-14B-GGUF": {
+   "commit": "530227a7d994db8eca5ab5ced2fb692b614357fd",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen3-14B-GGUF"
+   ],
+   "files": {
+    "Qwen3-14B-Q4_K_M.gguf": {
+     "oid": "500a8806e85ee9c83f3ae08420295592451379b4f8cf2d0f41c15dffeb6b81f0",
+     "size": 9001752960,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "Qwen/Qwen3-30B-A3B-GGUF": {
+   "commit": "e4d4bafdfb96a411a163846265362aceb0b9c63a",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen3-30B-A3B-GGUF"
+   ],
+   "files": {
+    "Qwen3-30B-A3B-Q4_K_M.gguf": {
+     "oid": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+     "size": 18556685824,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "Qwen/Qwen3-32B-GGUF": {
+   "commit": "938a7432affaec9157f883a87164e2646ae17555",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen3-32B-GGUF"
+   ],
+   "files": {
+    "Qwen3-32B-Q4_K_M.gguf": {
+     "oid": "efd971561896866f0e910cce52761ca77b1b138090c7f15fe284676d57d1f689",
+     "size": 19762149024,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "Qwen/Qwen3-4B-GGUF": {
+   "commit": "bc640142c66e1fdd12af0bd68f40445458f3869b",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen3-4B-GGUF"
+   ],
+   "files": {
+    "Qwen3-4B-Q4_K_M.gguf": {
+     "oid": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+     "size": 2497280256,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "Qwen/Qwen3-8B-GGUF": {
+   "commit": "7c41481f57cb95916b40956ab2f0b139b296d974",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen3-8B-GGUF"
+   ],
+   "files": {
+    "Qwen3-8B-Q4_K_M.gguf": {
+     "oid": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+     "size": 5027783488,
+     "lfs": true,
+     "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361"
+    }
+   }
+  },
+  "Qwen/Qwen3-Embedding-0.6B-GGUF": {
+   "commit": "370f27d7550e0def9b39c1f16d3fbaa13aa67728",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3-Embedding-0.6B-Q8_0.gguf)"
+   ],
+   "files": {
+    "Qwen3-Embedding-0.6B-Q8_0.gguf": {
+     "oid": "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439",
+     "size": 639150592,
+     "lfs": true,
+     "template_sha256": "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5"
+    }
+   }
+  },
+  "RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf": {
+   "commit": "947580e7b3904cd4081810d0efec4520a75609c7",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Qwen1.5-MoE-A2.7B-Chat-GGUF"
+   ],
+   "files": {
+    "Qwen1.5-MoE-A2.7B-Chat.Q4_K.gguf": {
+     "oid": "3dcfb1032781788bf373edb49b888fcac5b6093ea0fe0edf5e23a977390b3eea",
+     "size": 9496236768,
+     "lfs": true,
+     "template_sha256": "793202280c0910ab26bc6eb57c8212c2417324c6d8c4efd0d10d59092ab3e3eb"
+    },
+    "Qwen1.5-MoE-A2.7B-Chat.Q4_K_M.gguf": {
+     "oid": "3dcfb1032781788bf373edb49b888fcac5b6093ea0fe0edf5e23a977390b3eea",
+     "size": 9496236768,
+     "lfs": true,
+     "template_sha256": "793202280c0910ab26bc6eb57c8212c2417324c6d8c4efd0d10d59092ab3e3eb"
+    }
+   }
+  },
+  "RichardErkhov/apple_-_OpenELM-1_1B-Instruct-gguf": {
+   "commit": "a3bd6141a13695472539e1f2adf9f4042fe3032d",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/OpenELM-1.1B-Instruct-GGUF"
+   ],
+   "files": {
+    "OpenELM-1_1B-Instruct.Q4_K.gguf": {
+     "oid": "3b5247b98a6f8b13449759419027a2ac574892d71e9e1a0b46093e91869193e6",
+     "size": 672919616,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "OpenELM-1_1B-Instruct.Q4_K_M.gguf": {
+     "oid": "3b5247b98a6f8b13449759419027a2ac574892d71e9e1a0b46093e91869193e6",
+     "size": 672919616,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "TheBloke/Mistral-7B-Instruct-v0.2-GGUF": {
+   "commit": "3a6fbf4a41a1d52e415a4958cde6856d34b2db93",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Mistral-7B-Instruct-v0.2-GGUF"
+   ],
+   "files": {
+    "mistral-7b-instruct-v0.2.Q4_K_M.gguf": {
+     "oid": "3e0039fd0273fcbebb49228943b17831aadd55cbcbf56f0af00499be2040ccf9",
+     "size": 4368439584,
+     "lfs": true,
+     "template_sha256": "26a59556925c987317ce5291811ba3b7f32ec4c647c400c6cc7e3a9993007ba7"
+    }
+   }
+  },
+  "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF": {
+   "commit": "52e7645ba7c309695bec7ac98f4f005b139cf465",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/TinyLlama-1.1B-Chat-v1.0-GGUF"
+   ],
+   "files": {
+    "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf": {
+     "oid": "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0",
+     "size": 668788096,
+     "lfs": true,
+     "template_sha256": "66291cf0045c2425a3a667cf3cbb7af2b11f09e025c02f97245323ab79119362"
+    }
+   }
+  },
+  "TheBloke/phi-2-GGUF": {
+   "commit": "5a454d977c6438bb9fb2df233c8ca70f21c87420",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/phi-2-GGUF"
+   ],
+   "files": {
+    "phi-2.Q4_K_M.gguf": {
+     "oid": "324356668fa5ba9f4135de348447bb2bbe2467eaa1b8fcfb53719de62fbd2499",
+     "size": 1789239136,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "allenai/OLMo-2-0425-1B-Instruct-GGUF": {
+   "commit": "62f8c199538474c3e33ed5d7e0580abd66686a27",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/OLMo-2-0425-1B-Instruct-GGUF"
+   ],
+   "files": {
+    "OLMo-2-0425-1B-Instruct-Q4_K_M.gguf": {
+     "oid": "abd8187934a438fbf7cfff0a1de5b9d2793ce913f158794df1951dcba6c93cc6",
+     "size": 935515296,
+     "lfs": true,
+     "template_sha256": "fe689ffbd6a4e2d0532d7480696b065b10e0e1eff3f9b9fc4bea415761e4bf4a"
+    }
+   }
+  },
+  "bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF": {
+   "commit": "8f248fa2072348f77a8bc37754e470de1f61866e",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/DeepSeek-Coder-V2-Lite-Instruct-GGUF"
+   ],
+   "files": {
+    "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf": {
+     "oid": "603bd3f8a0281d16571da7c08bd661ee17ff0d1be6fcbd1b42242da257ef0bb8",
+     "size": 10364416768,
+     "lfs": true,
+     "template_sha256": "8aeba567270fa9a8d5372caf4b04affea947c4421d96adc01e3ff94021b0ae8e"
+    }
+   }
+  },
+  "bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF": {
+   "commit": "9cc28b17e86fa2415fcb070f8ee5ec27c965aa61",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/DeepSeek-R1-Distill-Qwen-1.5B-GGUF"
+   ],
+   "files": {
+    "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf": {
+     "oid": "1741e5b2d062b07acf048bf0d2c514dadf2a48f94e2b4aa0cfe069af3838ee2f",
+     "size": 1117320800,
+     "lfs": true,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    }
+   }
+  },
+  "bartowski/DeepSeek-R1-Distill-Qwen-32B-GGUF": {
+   "commit": "1dc8cf9ffa5dd333057ea1b09ccf4772d8726dec",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/DeepSeek-R1-Distill-Qwen-32B-GGUF"
+   ],
+   "files": {
+    "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf": {
+     "oid": "bed9b0f551f5b95bf9da5888a48f0f87c37ad6b72519c4cbd775f54ac0b9fc62",
+     "size": 19851335840,
+     "lfs": true,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    }
+   }
+  },
+  "bartowski/Llama-3.2-1B-Instruct-GGUF": {
+   "commit": "067b946cf014b7c697f3654f621d577a3e3afd1c",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Llama-3.2-1B-Instruct-GGUF"
+   ],
+   "files": {
+    "Llama-3.2-1B-Instruct-Q4_K_M.gguf": {
+     "oid": "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83",
+     "size": 807694464,
+     "lfs": true,
+     "template_sha256": "5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4"
+    }
+   }
+  },
+  "bartowski/Llama-3.2-3B-Instruct-GGUF": {
+   "commit": "5ab33fa94d1d04e903623ae72c95d1696f09f9e8",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Llama-3.2-3B-Instruct-GGUF"
+   ],
+   "files": {
+    "Llama-3.2-3B-Instruct-Q4_K_M.gguf": {
+     "oid": "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
+     "size": 2019377696,
+     "lfs": true,
+     "template_sha256": "5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4"
+    }
+   }
+  },
+  "bartowski/Llama-3.3-70B-Instruct-GGUF": {
+   "commit": "b6c5c9f176f3279204034e1d16d393105e95cb88",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Llama-3.3-70B-Instruct-GGUF"
+   ],
+   "files": {
+    "Llama-3.3-70B-Instruct-Q4_K_M.gguf": {
+     "oid": "32df3baccb556f9840059b2528b2dee4d3d516b24afdfb9d0c56ff5f63e3a664",
+     "size": 42520398816,
+     "lfs": true,
+     "template_sha256": "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65"
+    }
+   }
+  },
+  "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF": {
+   "commit": "bf5b95e96dac0462e2a09145ec66cae9a3f12067",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Llama-3.1-8B-Instruct-GGUF"
+   ],
+   "files": {
+    "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf": {
+     "oid": "7b064f5842bf9532c91456deda288a1b672397a54fa729aa665952863033557c",
+     "size": 4920739232,
+     "lfs": true,
+     "template_sha256": "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65"
+    }
+   }
+  },
+  "bartowski/gemma-2-2b-it-GGUF": {
+   "commit": "855f67caed130e1befc571b52bd181be2e858883",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/gemma-2-2b-it-GGUF"
+   ],
+   "files": {
+    "gemma-2-2b-it-Q4_K_M.gguf": {
+     "oid": "e0aee85060f168f0f2d8473d7ea41ce2f3230c1bc1374847505ea599288a7787",
+     "size": 1708582752,
+     "lfs": true,
+     "template_sha256": "ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6"
+    }
+   }
+  },
+  "bartowski/gemma-2-9b-it-GGUF": {
+   "commit": "d731033f3dc4018261fd39896e50984d398b4ac5",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/gemma-2-9b-it-GGUF"
+   ],
+   "files": {
+    "gemma-2-9b-it-Q4_K_M.gguf": {
+     "oid": "13b2a7b4115bbd0900162edcebe476da1ba1fc24e718e8b40d32f6e300f56dfe",
+     "size": 5761057728,
+     "lfs": true,
+     "template_sha256": "ecd6ae513fe103f0eb62e8ab5bfa8d0fe45c1074fa398b089c93a7e70c15cfd6"
+    }
+   }
+  },
+  "bong-water-water-bong/BlackMamba-1.5B-GGUF": {
+   "commit": "179f7777408ab0d800ad034d4715b7bccd10c857",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': None, 'general.basename': None, 'general.architecture': 'mamba', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': None, 'general.file_type': None, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': None})"
+   ],
+   "files": {
+    "blackmamba-1.5b.gguf": {
+     "oid": "32fb66b8c4c71da9fb8ea8037ee7fc9ca6bb86915b505a5ca3d131d862ee5d4d",
+     "size": 947720160,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "bong-water-water-bong/BlackMamba-2.8B-GGUF": {
+   "commit": "0331c53eb81bd51e0e0a0cf2117de77c074e1692",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion (n/a)"
+   ],
+   "files": {
+    "blackmamba-2.8b.gguf": {
+     "oid": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+     "size": 0,
+     "lfs": false,
+     "template_sha256": null
+    }
+   }
+  },
+  "bong-water-water-bong/Ternary-Bonsai-2-27B-unrotated-Q4_0": {
+   "commit": "ab895e624fb8666ac79233f8ad0b2d1b24e158df",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: re-host ({'general.name': 'Hf', 'general.basename': 'folded', 'general.architecture': 'qwen35', 'general.size_label': '27B', 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': 2, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "Ternary-Bonsai-2-27B-unrotated-Q4_0.gguf": {
+     "oid": "4bb92798ef9280dea3a4ff4168513e7775773969bd5c0619656f500d53709bc6",
+     "size": 15183001920,
+     "lfs": true,
+     "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    }
+   }
+  },
+  "bong-water-water-bong/ZAYA1-8B-Q4_K_M-GGUF": {
+   "commit": "05ca1d6e28a82b11c6a2d73212381375ac309e18",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'zaya1-8b', 'general.basename': None, 'general.architecture': 'zaya', 'general.size_label': '16x1.3B', 'general.finetune': '67d34da515b30409ee8daa67c3605c4402d03f6f', 'general.quantization_version': 2, 'general.file_type': 15, 'tokenizer.ggml.model': 'gemma4', 'tokenizer.ggml.pre': None, 'general.type': 'model'})"
+   ],
+   "files": {
+    "zaya1-8b-Q4_K_M.gguf": {
+     "oid": "64d0b2b6eadc3674a0480d85ab4875a7f891e58389469a5c743debd7528dbcd9",
+     "size": 5567131712,
+     "lfs": true,
+     "template_sha256": "b55ecfbbbcbb238a011465bfa139366db18790103f9205060cf2855a3f51b30f"
+    }
+   }
+  },
+  "bong-water-water-bong/ZAYA1-8B-QLoRA-GGUF": {
+   "commit": "273b4ab854145a7932bb4ebc354849bfc6b105e7",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Best', 'general.basename': None, 'general.architecture': 'zaya', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': None, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': 'adapter'})"
+   ],
+   "files": {
+    "zaya1-8b-qlora-f16.gguf": {
+     "oid": "3f1e3eaf78affda54e0a92173b39b8504886bdba9d85a3f683290999c842057b",
+     "size": 13785440,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "bong-water-water-bong/ZR1-1.5B-Strix": {
+   "commit": "64f092fe4fddba1030d4ef1531d3e33dd09d584a",
+   "files": {
+    "chat_template.jinja": {
+     "lfs": false,
+     "oid": "02a1c3bce33f46690b9c40a93512034a92855392",
+     "size": 2237,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "checkpoint-100/chat_template.jinja": {
+     "lfs": false,
+     "oid": "02a1c3bce33f46690b9c40a93512034a92855392",
+     "size": 2237,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "checkpoint-100/tokenizer_config.json": {
+     "lfs": false,
+     "oid": "53aca4fc5079a4a4f8dbbed6f91c8a6183b9c9c7",
+     "size": 459,
+     "template_sha256": null
+    },
+    "checkpoint-200/chat_template.jinja": {
+     "lfs": false,
+     "oid": "02a1c3bce33f46690b9c40a93512034a92855392",
+     "size": 2237,
+     "template_sha256": "b6835114b7303ddd78919a82e4d9f7d8c26ed0d7dfc36beeb12d524f6144eab1"
+    },
+    "checkpoint-200/tokenizer_config.json": {
+     "lfs": false,
+     "oid": "53aca4fc5079a4a4f8dbbed6f91c8a6183b9c9c7",
+     "size": 459,
+     "template_sha256": null
+    },
+    "tokenizer_config.json": {
+     "lfs": false,
+     "oid": "53aca4fc5079a4a4f8dbbed6f91c8a6183b9c9c7",
+     "size": 459,
+     "template_sha256": null
+    }
+   },
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: ZR1-1.5B-Strix (LoRA/checkpoint repo we host, chat_template.jinja)"
+   ]
+  },
+  "bong-water-water-bong/bitnet-ternary-moe-gguf": {
+   "commit": "951711ae3ce145e10ff9589e1dd510e8294205c2",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "published: conversion ({'general.name': 'Bitnet 2b 4t Packed', 'general.basename': 'bitnet', 'general.architecture': 'bitnet', 'general.size_label': '2B', 'general.finetune': '4t-packed', 'general.quantization_version': 2, 'general.file_type': 36, 'tokenizer.ggml.model': 'gpt2', 'tokenizer.ggml.pre': None, 'general.type': 'model'})",
+    "published: conversion ({'general.name': 'Mult Peft', 'general.basename': None, 'general.architecture': 'bitnet', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': None, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': 'adapter'})",
+    "published: conversion ({'general.name': 'Roman Peft', 'general.basename': None, 'general.architecture': 'bitnet', 'general.size_label': None, 'general.finetune': None, 'general.quantization_version': 2, 'general.file_type': None, 'tokenizer.ggml.model': None, 'tokenizer.ggml.pre': None, 'general.type': 'adapter'})"
+   ],
+   "files": {
+    "bitnet-2b-tq1_0.gguf": {
+     "oid": "42f9b84bcc3904d52a6d2a991675673128c1b50af8d37a95feadd9eb79138613",
+     "size": 1105874016,
+     "lfs": true,
+     "template_sha256": "dae57a011117d68afc11906cd5bfe7124df8027a2fcfe5134a7184aaba26fc1b"
+    },
+    "mult-f16.gguf": {
+     "oid": "16b0c4a4bed99176234adacc27e425af9c70571bf4b7bfe1eab4750d1a0ee158",
+     "size": 54571232,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "roman-f16.gguf": {
+     "oid": "3c474b536583ac80d9af350bf37f174099f3f539d2c8ecddbb37a079c928a835",
+     "size": 54571616,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "ggml-org/SmolLM3-3B-GGUF": {
+   "commit": "4965cb60b150737b68a0408c36aeefb65078f894",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/SmolLM3-3B-GGUF"
+   ],
+   "files": {
+    "SmolLM3-Q4_K_M.gguf": {
+     "oid": "8334b850b7bd46238c16b0c550df2138f0889bf433809008cc17a8b05761863e",
+     "size": 1915305312,
+     "lfs": true,
+     "template_sha256": "b9b66f04c64fbb8695cf5b35c37780efd0b8e0829fbfe3e30fafb9f469b7d30e"
+    }
+   }
+  },
+  "ggml-org/gemma-3-1b-it-GGUF": {
+   "commit": "f9c28bcd85737ffc5aef028638d3341d49869c27",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/gemma-3-1b-it-GGUF"
+   ],
+   "files": {
+    "gemma-3-1b-it-Q4_K_M.gguf": {
+     "oid": "8ccc5cd1f1b3602548715ae25a66ed73fd5dc68a210412eea643eb20eb75a135",
+     "size": 806058240,
+     "lfs": true,
+     "template_sha256": "7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4"
+    }
+   }
+  },
+  "ggml-org/gpt-oss-20b-GGUF": {
+   "commit": "15dcfc7e7c608c6161507211ed43c5b590801b4b",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (gpt-oss-20b-MXFP4.gguf)"
+   ],
+   "files": {
+    "gpt-oss-20b-MXFP4.gguf": {
+     "oid": "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901",
+     "size": 12109566624,
+     "lfs": true,
+     "template_sha256": "a4c9919cbbd4acdd51ccffe22da049264b1b73e59055fa58811a99efbd7c8146"
+    }
+   }
+  },
+  "ibm-granite/granite-4.1-30b-GGUF": {
+   "commit": "26a44ffe9923eea39af3ad811b56c9b0071e4347",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/granite-4.1-30b-GGUF"
+   ],
+   "files": {
+    "granite-4.1-30b-Q4_K_M.gguf": {
+     "oid": "b33e4376e3581d11236ea53ced6b38399f6e91c0a391488486dc0827972f23f6",
+     "size": 17490240736,
+     "lfs": true,
+     "template_sha256": "fed2756d2d24e127b951dcf139d0b03ab7db8ef23a456128ebc9c2db4901d476"
+    }
+   }
+  },
+  "ibm-granite/granite-4.1-3b-GGUF": {
+   "commit": "ab4701481089b58a082ef63cc1cee738887293ff",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/granite-4.1-3b-GGUF"
+   ],
+   "files": {
+    "granite-4.1-3b-Q4_K_M.gguf": {
+     "oid": "662b0626cd58f443baea23559b469df6576a81d349649c59413b36a9fb32eb29",
+     "size": 2099501664,
+     "lfs": true,
+     "template_sha256": "fed2756d2d24e127b951dcf139d0b03ab7db8ef23a456128ebc9c2db4901d476"
+    }
+   }
+  },
+  "microsoft/phi-4-gguf": {
+   "commit": "6edc2ef6664b739a8e11e62f2672ff6afe0c15ac",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/phi-4-GGUF"
+   ],
+   "files": {
+    "phi-4-Q4_K.gguf": {
+     "oid": "5652b9be0ea4ae2842130d04fe31bc869fcb99a2b7106c53b4e754a343fd688f",
+     "size": 9053114560,
+     "lfs": true,
+     "template_sha256": "fe4120415a3858b873955c92ce3a103a95bc97c2cb00b72e62659aaf0f891ee5"
+    }
+   }
+  },
+  "mradermacher/Qwen3-Reranker-0.6B-GGUF": {
+   "commit": "6727da811d2cc45b078b744bffaaab122a0691da",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3-Reranker-0.6B.Q8_0.gguf)"
+   ],
+   "files": {
+    "Qwen3-Reranker-0.6B.Q8_0.gguf": {
+     "oid": "c525a7449243f690a7062e6377d6cf5adbb289354bd4316312367cd20e187ab7",
+     "size": 639150752,
+     "lfs": true,
+     "template_sha256": "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5"
+    }
+   }
+  },
+  "mradermacher/gpt-neox-20b-GGUF": {
+   "commit": "25e46ca846af35af8abb3eb364f7ef070c9b2783",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/gpt-neox-20b-GGUF"
+   ],
+   "files": {
+    "gpt-neox-20b.Q4_K_M.gguf": {
+     "oid": "dd9666047d23f063f9222550e9fcb47ff171891b2b30d8e9b38068c09b59ba7b",
+     "size": 13135032096,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "mradermacher/jina-reranker-v1-tiny-en-GGUF": {
+   "commit": "a76777c8b117dd01f69f76af506578c67884ca0a",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (jina-reranker-v1-tiny-en.Q8_0.gguf)"
+   ],
+   "files": {
+    "jina-reranker-v1-tiny-en.Q8_0.gguf": {
+     "oid": "865f470f0115b33b744e85b0db1353ba91b2c47f20fda66f9709b2a5f21fe4a4",
+     "size": 36676672,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "mys/laya-typed-decisions-GGUF": {
+   "commit": "1e9e8ba1f5271316601e0fefd940786660bd6964",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "serve: laya-first scorer"
+   ],
+   "files": {
+    "laya_typed_decisions_q8_0.gguf": {
+     "oid": "6eb6ef58bc4f99bd9db40381604108af782ffc314aa00da6641f429991ca1f18",
+     "size": 455179648,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "nomic-ai/nomic-embed-text-v2-moe-GGUF": {
+   "commit": "ffbcf4c99e5d617dda10ec8c0e9f75754b0cbb80",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (nomic-embed-text-v2-moe.Q8_0.gguf)"
+   ],
+   "files": {
+    "nomic-embed-text-v2-moe.Q8_0.gguf": {
+     "oid": "06e7a7e594a26985523c18383aba4aad39fe6e14f08ffc6ab5b554e1ccdc3cff",
+     "size": 512225120,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF": {
+   "commit": "ba223d14e45525f7fae81db77ea8cabeb2fc6c25",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/NVIDIA-Nemotron-3-Nano-4B-GGUF"
+   ],
+   "files": {
+    "NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf": {
+     "oid": "be5d9a656a51922f24f1f09a759cebb694e1f5d9728bf0ef9f8c972c5a0b5ef2",
+     "size": 2837072864,
+     "lfs": true,
+     "template_sha256": "ab7813c3abdd9cb655905a410728b26c7884eca45ddfab8d9f931553485a7862"
+    }
+   }
+  },
+  "openbmb/MiniCPM5-2B-GGUF": {
+   "commit": "2079a22f3beaa4e306449978533478fe0522f4b3",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/MiniCPM5-2B-GGUF"
+   ],
+   "files": {
+    "MiniCPM5-2B-Q4_K_M.gguf": {
+     "oid": "ec2d5801640099e97d8d7e8003ad4d81f336e757811f03a26173dddf386602fd",
+     "size": 1561318368,
+     "lfs": true,
+     "template_sha256": "cc945752db555d60949b16989df4ccfeb52a313d6b4b5c5229dd786e2e9fcf1c"
+    }
+   }
+  },
+  "pqnet/bge-reranker-v2-m3-Q8_0-GGUF": {
+   "commit": "40b702f058a57439f4206f27140d05dadb9c6c10",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (bge-reranker-v2-m3-q8_0.gguf)"
+   ],
+   "files": {
+    "bge-reranker-v2-m3-q8_0.gguf": {
+     "oid": "ad1a16cbec026ae2a7625ac9f6055d993591acaea64783be595323a508d38042",
+     "size": 635674304,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "prism-ml/Ternary-Bonsai-2-27B-gguf": {
+   "commit": "839bd57023c1558945afea70a74fa83c054f35f9",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream: our copy predates the pinned revision"
+   ],
+   "files": {}
+  },
+  "stabilityai/sd-turbo": {
+   "commit": "b261bac6fd2cf515557d5d0707481eafa0485ec2",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: c25 image HF cache snapshot b261bac6 (image model, no chat template)"
+   ],
+   "files": {
+    "sd_turbo.safetensors": {
+     "oid": "3f067a1b943cf162f2b8f8588f6cf5824bd5b4c7d1d88d87164b9ca123616549",
+     "size": 5214561328,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "unsloth/Apertus-8B-Instruct-2509-GGUF": {
+   "commit": "61c32783830424ac7a6d0fd80d4166e29dbaee06",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/Apertus-8B-Instruct-2509-GGUF"
+   ],
+   "files": {
+    "Apertus-8B-Instruct-2509-Q4_K_M.gguf": {
+     "oid": "87e7f0eb5a1d33e1a8ea4e7fdd2363764e0465061dd92962e0073aec31a7944d",
+     "size": 5057885440,
+     "lfs": true,
+     "template_sha256": "695a11092219943af254a5a1a6f34ecccd33e7bd28c593ab67e1c95dcd77b210"
+    }
+   }
+  },
+  "unsloth/GLM-4.7-Flash-GGUF": {
+   "commit": "0d32489ecb9db6d2a4fc93bd27ef01519f95474d",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (GLM-4.7-Flash-Q4_K_M.gguf)",
+    "upstream of 1bit-MONSTER/GLM-4.7-Flash-GGUF"
+   ],
+   "files": {
+    "GLM-4.7-Flash-Q4_K_M.gguf": {
+     "oid": "29837ed2c0fc5f51981adf8ac8083fcf80743c598381f13e9f06cbad0498b174",
+     "size": 18312339808,
+     "lfs": true,
+     "template_sha256": "d63ad536c3c81880043e22ec7fd08db42b4d8fb7c89c7138bc562bfa25281375"
+    },
+    "GLM-4.7-Flash-UD-Q4_K_XL.gguf": {
+     "oid": "b0d4fbc1211f891b4cfbf2a497160bfe06a49412420068904d426b7a13f4ba7f",
+     "size": 17520169312,
+     "lfs": true,
+     "template_sha256": "d63ad536c3c81880043e22ec7fd08db42b4d8fb7c89c7138bc562bfa25281375"
+    }
+   }
+  },
+  "unsloth/Qwen3-0.6B-GGUF": {
+   "commit": "50968a4468ef4233ed78cd7c3de230dd1d61a56b",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3-0.6B-Q4_K_M.gguf)"
+   ],
+   "files": {
+    "Qwen3-0.6B-Q4_K_M.gguf": {
+     "oid": "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a",
+     "size": 396705472,
+     "lfs": true,
+     "template_sha256": "5da44855ab7e0641774d5ed0ff0b4f89671d01df7d316e54d06557a962211cb4"
+    }
+   }
+  },
+  "unsloth/Qwen3-1.7B-GGUF": {
+   "commit": "d7f544eead698dbd1f15126ef60b45a1e1933222",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3-1.7B-Q4_K_M.gguf)"
+   ],
+   "files": {
+    "Qwen3-1.7B-Q4_K_M.gguf": {
+     "oid": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897",
+     "size": 1107409472,
+     "lfs": true,
+     "template_sha256": "8428c815ac94d82064e35ff1e841dcbe260e7e53a8d0bd3b94afa2eefa9bccab"
+    }
+   }
+  },
+  "unsloth/Qwen3-4B-GGUF": {
+   "commit": "22c9fc8a8c7700b76a1789366280a6a5a1ad1120",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3-4B-Q4_K_M.gguf)"
+   ],
+   "files": {
+    "Qwen3-4B-Q4_K_M.gguf": {
+     "oid": "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a",
+     "size": 2497281312,
+     "lfs": true,
+     "template_sha256": "5da44855ab7e0641774d5ed0ff0b4f89671d01df7d316e54d06557a962211cb4"
+    }
+   }
+  },
+  "unsloth/Qwen3-4B-Instruct-2507-GGUF": {
+   "commit": "a06e946bb6b655725eafa393f4a9745d460374c9",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3-4B-Instruct-2507-Q4_K_M.gguf)"
+   ],
+   "files": {
+    "Qwen3-4B-Instruct-2507-Q4_K_M.gguf": {
+     "oid": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
+     "size": 2497281120,
+     "lfs": true,
+     "template_sha256": "c979e0e71a3e21b8f208e6ab120d5cb29327885f29d2a8b18fda67a723798e18"
+    }
+   }
+  },
+  "unsloth/Qwen3-8B-GGUF": {
+   "commit": "a6adef130ffb23ddaf1a62fec9dced968c9bc482",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3-8B-Q4_K_M.gguf)"
+   ],
+   "files": {
+    "Qwen3-8B-Q4_K_M.gguf": {
+     "oid": "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4",
+     "size": 5027784512,
+     "lfs": true,
+     "template_sha256": "5da44855ab7e0641774d5ed0ff0b4f89671d01df7d316e54d06557a962211cb4"
+    }
+   }
+  },
+  "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF": {
+   "commit": "b17cb02dd882d5b6ab62fc777ad2995f19668350",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf)",
+    "upstream of 1bit-MONSTER/Qwen3-Coder-30B-A3B-Instruct-GGUF"
+   ],
+   "files": {
+    "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf": {
+     "oid": "fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad",
+     "size": 18556689568,
+     "lfs": true,
+     "template_sha256": "87710339d25b4e789c1d723f93c91ee861a86d305bb3d20a845536f251d6ea8a"
+    }
+   }
+  },
+  "unsloth/Qwen3.5-4B-GGUF": {
+   "commit": "e87f176479d0855a907a41277aca2f8ee7a09523",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3.5-4B-UD-Q4_K_XL.gguf)"
+   ],
+   "files": {
+    "Qwen3.5-4B-UD-Q4_K_XL.gguf": {
+     "oid": "b252c5610a42ca82d20fe2a12813e9d069eed89292907e26c783eeb0bc961bc7",
+     "size": 2912109728,
+     "lfs": true,
+     "template_sha256": "7f0e529032c25183bcd66c7f238da2d377f43be754a94e2725a58c4e16d2ed67"
+    }
+   }
+  },
+  "unsloth/Qwen3.8-27B-GGUF": {
+   "commit": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (Qwen3.8-27B-UD-Q4_K_XL.gguf)",
+    "upstream of 1bit-MONSTER/Qwen3.8-27B-UD-Q4_K_XL-MTP"
+   ],
+   "files": {
+    "Qwen3.8-27B-UD-Q4_K_XL.gguf": {
+     "oid": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
+     "size": 17559178144,
+     "lfs": true,
+     "template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
+    },
+    "MTP/mtp-Qwen3.8-27B-Q4_0.gguf": {
+     "oid": "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e",
+     "size": 1369590656,
+     "lfs": true,
+     "template_sha256": "701ba13a085c0c1b5e05414dec1aa3069904f962beee36f0899e441720b83974"
+    }
+   }
+  },
+  "unsloth/Qwen3.8-Flash-Next-GGUF": {
+   "commit": "d96201194f103c906994f283f504209dc8d2a10c",
+   "pinned": "2026-11-06",
+   "used_for": [
+    "upstream: our copy predates the pinned revision"
+   ],
+   "files": {
+    "MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf": {
+     "oid": "58a47d6a216307e9b97172d5bfdc3436a8994b632f5e436b9bb6edf8951da8d1",
+     "size": 4137429120,
+     "lfs": true,
+     "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    },
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf": {
+     "oid": "acc44040f74d0e55fb89c3967056cce5dbda1bcc52e909c3ba6fc72b5e9c0858",
+     "size": 10946618,
+     "lfs": true,
+     "template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
+    },
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf": {
+     "oid": "45792ae869072d8229384c51c7c73dd959e191505252b41dd71852d9746f5ce4",
+     "size": 49720539552,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf": {
+     "oid": "8c76e79d444b16a663d9c8db54e585ed3b1da13eebd2619c37b0c355da803c82",
+     "size": 32803030176,
+     "lfs": true,
+     "template_sha256": null
+    },
+    "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf": {
+     "oid": "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36",
+     "size": 28800138432,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "unsloth/SmolLM2-135M-Instruct-GGUF": {
+   "commit": "9e6855bc4be717fca1ef21360a1db4b29d5c559a",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/SmolLM2-135M-Instruct-GGUF"
+   ],
+   "files": {
+    "SmolLM2-135M-Instruct-Q4_K_M.gguf": {
+     "oid": "ed5fa30c487b282ec156c29062f1222e5c20875a944ac98289dbd242e947f747",
+     "size": 105454144,
+     "lfs": true,
+     "template_sha256": "872be49dbb638044ad01b60388f48d469ff2980e5f0dccdc22ec907db54d0788"
+    }
+   }
+  },
+  "unsloth/flint-GGUF": {
+   "commit": "20468edfc38ab43d6914cc88b08cbecb05d0fc62",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "stick: Lemonade catalogue (flint-UD-Q4_K_XL.gguf)"
+   ],
+   "files": {
+    "flint-UD-Q4_K_XL.gguf": {
+     "oid": "63c2ecc461ca545134b670c660e76fa20f47240f8d39b6510bfd21c4dd6e072f",
+     "size": 25054688704,
+     "lfs": true,
+     "template_sha256": "7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466"
+    }
+   }
+  },
+  "unsloth/gpt-oss-120b-GGUF": {
+   "commit": "ff1a82da6ad466e32284fa3d2b86694db3204789",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/gpt-oss-120b-GGUF"
+   ],
+   "files": {
+    "UD-Q4_K_XL/gpt-oss-120b-UD-Q4_K_XL-00001-of-00002.gguf": {
+     "oid": "c7b59d68c889ada280736d9b82685baeb6152f4d7423a169a369bb3492b3056e",
+     "size": 49866326912,
+     "lfs": true,
+     "template_sha256": "acaa726974dadda7844c6607c59554bca390645b94705cfdc2e78bb34895717c"
+    },
+    "UD-Q4_K_XL/gpt-oss-120b-UD-Q4_K_XL-00002-of-00002.gguf": {
+     "oid": "7c77ca781792a28565c311ace40620ef7fb1cf67d123db347aa34f30ff48ad16",
+     "size": 13149984480,
+     "lfs": true,
+     "template_sha256": null
+    }
+   }
+  },
+  "unsloth/gpt-oss-20b-GGUF": {
+   "commit": "d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4",
+   "pinned": "2026-11-05",
+   "used_for": [
+    "upstream of 1bit-MONSTER/gpt-oss-20b-GGUF"
+   ],
+   "files": {
+    "gpt-oss-20b-UD-Q4_K_XL.gguf": {
+     "oid": "10fe673de12c20b74b8d670a9fdf0fd36b43b0a86ffc04daeb175c0a2b98c4f9",
+     "size": 11872347328,
+     "lfs": true,
+     "template_sha256": "70da0d2348e40aaf8dad05f04a316835fd10547bd7e3392ce337e4c79ba91c01"
+    }
+   }
+  }
+ }
+}

@@ -14,7 +14,8 @@
 // limitations under the License.
 
 // `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|hybrid|cpu] [--mtp HEAD]`
-//                        [--npu-opt KEY=VALUE ...] [--npu-streams N] [--prefill-provider PATH]
+//                        [--npu-opt KEY=VALUE ...] [--npu-streams N] [--load-queue-ms N]
+//                        [--prefill-provider PATH]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -71,11 +72,13 @@
 #include "hrx_strict.h"
 #include "mem_admit.h"
 #include "pm.h"
+#include "laya_checkpoint.h"
 #include "recipes.h"
 #include "serve_metrics.h"
 #include "serve_watchdog.h"
 #include "serve_hybrid.h"
 #include "sysinfo.h"
+#include "template_pin.h"
 
 #ifdef ONEBIT_MOE
 #include "gguf_index.h"
@@ -169,6 +172,7 @@ struct Options {
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
     std::string role;            // "embedding" or "reranking": the model itself is served in that role
     std::vector<std::string> npu_opts;   // --npu-opt KEY=VALUE, for a private NPU route
+    int load_queue_ms = 45000;           // --load-queue-ms N: how long a refused NPU context is queued
     int npu_streams = 1;   // --npu-streams N: N opted-in serves share the NPU (app/npu_device_lock.h)
     std::string prefill_provider;        // --prefill-provider PATH (or ONEBIT_HYBRID_PREFILL): --device hybrid's prefill (docs/hybrid.md)
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
@@ -176,6 +180,12 @@ struct Options {
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
     std::string recipes;                 // --recipes FILE: tuned backend settings (default: built in, docs/recipes.md)
     bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
+    // --template-pin FILE: expected chat-template sha256 per model (default: config/template-pins.json,
+    // built in); --no-template-pin logs the sha without comparing it; --template-pin-strict (or
+    // ONEBIT_TEMPLATE_PIN_STRICT=1) refuses a model whose template is not the pinned one (docs/serve.md)
+    std::string template_pin;
+    bool no_template_pin = false;
+    bool template_pin_strict = false;
     // --precise (or ONEBIT_PRECISE=1): every request re-prefills its whole conversation, so a follow-up turn
     // takes the same path a cold run of that conversation takes and comes out bitwise identical to it
     bool precise = false;
@@ -725,6 +735,48 @@ std::string model_id(const Options& o) {
     return p.extension() == ".gguf" || p.extension() == ".1bp" ? p.stem().string() : p.filename().string();
 }
 
+// A GGUF's tokenizer.chat_template is a Jinja2 program that runs on every request, so it can rewrite
+// the system context with no weight change at all (app/template_pin.h). Every load therefore names its
+// sha256 in one line: a model re-pulled with a different template has to be visible in the log. When the
+// model has a pin (config/template-pins.json, docs/serve.md "Chat template"), the sha is compared with
+// the pinned one: a mismatch warns, and --template-pin-strict refuses the load.
+//
+// Silent for a model with no template and no pin: nothing runs, nothing to compare. That also keeps the
+// header-only fixtures of the route tests on their exact line counts (tests/mem_admit_route.sh).
+void announce_template(const Options& o) {
+    namespace fs = std::filesystem;
+    // A .gguf and a Q4NX model directory both carry a template (metadata key, tokenizer_config.json);
+    // anything else (a 1BP package) carries none this engine reads.
+    if (fs::path(o.model).extension() != ".gguf" && !fs::is_directory(o.model)) return;
+    TemplatePins pins;
+    if (!o.no_template_pin) {
+        std::string text = kDefaultTemplatePinsJson;
+        if (!o.template_pin.empty()) {
+            std::ifstream in(o.template_pin, std::ios::binary);
+            if (!in) throw std::runtime_error("--template-pin: cannot read " + o.template_pin);
+            text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        std::string err;
+        if (!pins.parse(text, err))
+            throw std::runtime_error((o.template_pin.empty() ? std::string("built-in template pins") : o.template_pin) +
+                                     ": " + err);
+    }
+    const std::string id = model_id(o);
+    const TemplateVerdict v = template_verdict(o.model, {id, fs::path(o.model).filename().string()}, pins);
+    if (v.sha256.empty() && v.key.empty()) return;
+    std::fprintf(stderr, "1bit serve: template sha256=%s (%s)\n", v.sha256.empty() ? "none" : v.sha256.c_str(),
+                 id.c_str());
+    if (!v.mismatch()) return;
+    const std::string msg = "template pin: " + id + " (" + v.key + ") expects " + v.pinned + ", the model carries " +
+                            (v.sha256.empty() ? std::string("none") : v.sha256) +
+                            " in tokenizer.chat_template (docs/serve.md \"Chat template\")";
+    if (!o.template_pin_strict) {
+        std::fprintf(stderr, "1bit serve: warning: %s\n", msg.c_str());
+        return;
+    }
+    throw std::runtime_error(msg + ": refused, --template-pin-strict");
+}
+
 // Forwards an OpenAI POST to the child: the model id becomes the child's (a
 // child that rejects ids it did not load gets none), and replies carry ours.
 // Counts a request against a backend from the moment it is routed until its reply
@@ -868,6 +920,55 @@ struct Launch {
     std::string slot_dir;    // hybrid: the backend's --slot-save-path, where the handoff files go
 };
 
+// One line per request, from the values this process actually has. `tokens` comes from the response's `usage` object,
+// which llama-server sends for a non-streamed reply; a streamed reply carries it only in its final SSE chunk, and parsing
+// the whole stream here to recover it would cost more than the line is worth - the backend's own line has it (lemond
+// surfaces that at log_level=debug). Status and wall time are always real.
+// the request body decides how the reply leaves this process, and that changes what the line can honestly say
+static bool request_is_stream(const std::string& body) {
+    if (body.find("stream") == std::string::npos) return false;
+    try {
+        return json::parse(body).value("stream", false);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+static void log_request_line(const std::string& path, const Launch& b, const httplib::Response& r,
+                             const std::chrono::steady_clock::time_point& t0, const char* how, bool stream) {
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (stream) {
+        // measured, not assumed: httplib runs the content provider after the handler returns, so here the status is
+        // still unset and the elapsed time is the hand-off. Reporting "-1 in 0.0 ms" for a healthy stream (the first cut
+        // did) looks exactly like a failure, so a stream says what it actually is.
+        std::fprintf(stderr, "1bit serve: request %s -> %s :%d stream handed over in %.1f ms | tokens n/a (the backend's"
+                             " own line has them) | %s\n", path.c_str(), b.device.c_str(), b.port, ms, how);
+        return;
+    }
+    long pt = -1, ct = -1;
+    if (!r.body.empty() && r.body.front() == '{') {
+        try {
+            const json out = json::parse(r.body);
+            if (out.contains("usage") && out["usage"].is_object()) {
+                const json& u = out["usage"];
+                if (u.contains("prompt_tokens") && u["prompt_tokens"].is_number()) pt = u["prompt_tokens"].get<long>();
+                if (u.contains("completion_tokens") && u["completion_tokens"].is_number())
+                    ct = u["completion_tokens"].get<long>();
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    char tok[80] = "tokens n/a";
+    if (pt >= 0 && ct >= 0) {
+        // one decimal, formatted here: a raw double in a %s slot printed 17 digits in the first cut of this line
+        char tps[24] = "";
+        if (ct > 0 && ms > 0) std::snprintf(tps, sizeof tps, " %.1f tok/s", ct * 1000.0 / ms);
+        std::snprintf(tok, sizeof tok, "prompt %ld completion %ld%s", pt, ct, tps);
+    }
+    std::fprintf(stderr, "1bit serve: request %s -> %s :%d status %d in %.1f ms | %s | %s\n", path.c_str(),
+                 b.device.c_str(), b.port, r.status, ms, tok, how);
+}
+
 // A GGUF that carries its own MTP head (<architecture>.nextn_predict_layers > 0: Unsloth's Qwen3.8-27B
 // UD-Q4_K_XL holds it as blk.64.nextn.*) drafts with it by default on HRX. That is what Lemonade's own
 // llamacpp recipe does for a model with the "mtp" label (Lemonade reads the same key): `--spec-type
@@ -933,10 +1034,10 @@ uint64_t mem_available() {
 
 // The GGUF architectures our llama.cpp builds a model for, on HRX0 or on the CPU: generated from
 // registry/architectures.json (gguf_architectures.hrx, tools/registry_build.py), so a pin bump that
-// regenerates the registry moves this list too. Anything else (Qwen3.8-Flash-Next's qwen4exp, Zyphra
-// Zamba/Zamba2/BlackMamba, the upstream-only architectures the removed Vulkan build ran) serve
-// declines with a clear message, and Lemonade's own llamacpp backend serves it. An empty
-// architecture (a file serve cannot read) is left to llama-server.
+// regenerates the registry moves this list too - the 2026-11-05 bump to 817d0815b is what added the Zyphra
+// family (zamba2, zamba, blackmamba) to it. Anything else (Qwen3.8-Flash-Next's qwen4exp, the upstream-only
+// architectures the removed Vulkan build ran) serve declines with a clear message, and Lemonade's own
+// llamacpp backend serves it. An empty architecture (a file serve cannot read) is left to llama-server.
 bool hrx_missing_arch(const std::string& arch) {
     if (arch.empty()) return false;
     for (const char* a : kHrxGgufArchs)
@@ -1271,30 +1372,6 @@ size_t conversation_key(const httplib::Request& req) {
 }
 
 #ifdef ONEBIT_LAYA
-// The Laya checkpoint for --laya-model DIR, or for --laya: $ONEBIT_LAYA_MODEL, else
-// ${XDG_DATA_HOME:-~/.local/share}/1bit/laya (where scripts/fetch-laya.sh installs it). A
-// directory holding the pinned repo's typed-decisions/ checkpoint uses that one: it classifies
-// requests best (95.5% against 92.0% for the root checkpoint, tests/laya_classify_eval).
-std::string laya_home(const std::string& given) {
-    std::string dir = given;
-    if (dir.empty()) {
-        if (const char* e = std::getenv("ONEBIT_LAYA_MODEL"); e && *e) dir = e;
-        else if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x) dir = std::string(x) + "/1bit/laya";
-        else if (const char* h = std::getenv("HOME"); h && *h) dir = std::string(h) + "/.local/share/1bit/laya";
-    }
-    return dir;
-}
-
-std::string laya_checkpoint(const std::string& given) {
-    namespace fs = std::filesystem;
-    const std::string dir = laya_home(given);
-    if (dir.empty() || !fs::is_directory(dir))
-        throw std::runtime_error("laya: no checkpoint at " + (dir.empty() ? std::string("~/.local/share/1bit/laya") : dir) +
-                                 " (install it with scripts/fetch-laya.sh, or pass --laya-model DIR)");
-    if (fs::exists(fs::path(dir) / "typed-decisions" / "model.safetensors")) return (fs::path(dir) / "typed-decisions").string();
-    return dir;
-}
-
 // The router's fast scorer: ggmlc's laya (our fork, third_party/ggmlc, -DONEBIT_LAYA_GGML=ON) on
 // HRX0, AMD's backend, built against third_party/llama.cpp's ggml (its HRX kernels for ModernBERT,
 // fork #31), with the typed-decisions checkpoint compiled to a GGUF (mys/laya-typed-decisions-GGUF,
@@ -2026,6 +2103,10 @@ int serve_child(const Options& given) {
                 std::lock_guard<std::mutex> lock(class_mu);
                 if (const auto c = class_cache.find(key); c != class_cache.end()) cls = c->second;
             }
+            // item 5: the DECISION is what a demo shows, so it is timed and logged on every turn, not only the first one
+            // of a conversation (a cached class is still a routing decision, and its ms is the reason later turns are
+            // cheap - the scorer costs 15-25 ms and a cache hit costs nothing).
+            const auto t_laya = std::chrono::steady_clock::now();
             if (cls.label.empty()) {
                 std::lock_guard<std::mutex> lock(scorer_mu);  // the scorer is not reentrant
 #if defined(__linux__)
@@ -2035,6 +2116,7 @@ int serve_child(const Options& given) {
                 cls = onebit::laya::classify_request(*scorer, request_state(q, true));
                 fresh = true;
             }
+            const double laya_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_laya).count();
             if (cls.label.empty()) {
                 r.status = 502;
                 r.set_content(R"({"error":{"message":"laya routing failed"}})", "application/json");
@@ -2057,7 +2139,8 @@ int serve_child(const Options& given) {
             }
             char route_hdr[96];
             std::snprintf(route_hdr, sizeof route_hdr, "%s %.2f %s", cls.label.c_str(), cls.confidence, dev.c_str());
-            if (fresh) std::fprintf(stderr, "1bit serve: laya: %s\n", route_hdr);
+            std::fprintf(stderr, "1bit serve: laya: %s | %s %.1f ms\n", route_hdr,
+                         fresh ? "classified" : "cached", laya_ms);
             pick = size_t(it - laya_devices.begin());
             if (!ensure(pick)) {
                 r.status = 503;
@@ -2066,7 +2149,10 @@ int serve_child(const Options& given) {
             }
             held = std::make_shared<InFlight>(&inflight[pick]);
             ++routed[pick];
+            const auto t_laya_req = std::chrono::steady_clock::now();
             forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, o.precise, q, r, &watch);
+            // item 3 for the routed path: same line, with the class and confidence that chose this device
+            log_request_line(q.path, backends[pick], r, t_laya_req, route_hdr, request_is_stream(q.body));
             r.set_header("X-1bit-Route", route_hdr);  // class, Laya confidence, device
             return;
         }
@@ -2111,9 +2197,19 @@ int serve_child(const Options& given) {
                                      n, prefill_ms, restore_ms, share_ms, ttft);
                         if (slot->owns_lock()) slot->unlock();
                     });
+            log_request_line(q.path, backends[pick], r, t0, "hybrid", request_is_stream(q.body));
             return;
         }
+        const bool req_stream = request_is_stream(q.body);
+        const auto t_req = std::chrono::steady_clock::now();
         forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch);
+        // Cycle 25, TOS3-C25-VERBOSE item 3: one line per request with what THIS process can see - the backend it went to
+        // and that backend's device, the status, the wall time, and the token counts when the backend reported them.
+        // Queue wait is NOT here on purpose: the queue is Lemonade's (lemond, engine#1031), so by the time a request
+        // reaches this process it has already been dequeued, and inventing a number for a wait this side never sat in
+        // would be exactly the kind of claim that reads as evidence. llama-server's own line (visible at log_level=debug)
+        // carries the prefill/decode split, which is the finer-grained figure for the same request.
+        log_request_line(q.path, backends[pick], r, t_req, "direct", req_stream);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
@@ -2666,10 +2762,18 @@ void usage(FILE* out) {
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
                  "                  [--npu-streams N]   with --device npu: this serve is one of N sharing the NPU\n"
                  "                  (default 1, the device exclusive; docs/npu.md)\n"
+                 "                  [--load-queue-ms N]   a load refused because another client holds the NPU array\n"
+                 "                  waits at most N ms for it to free before the driver is called dead\n"
+                 "                  (default 45000; 0 refuses at once; docs/npu.md)\n"
                  "                  [--laya | --laya-model DIR] [--route-policy FILE]   with --device auto, Laya classifies\n"
                  "                  each conversation and the route policy picks its device (docs/laya.md)\n"
                  "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
                  "                  (default: config/recipes.json, built in; docs/recipes.md)\n"
+                 "                  [--template-pin FILE | --no-template-pin] [--template-pin-strict]   a GGUF's\n"
+                 "                  tokenizer.chat_template is a program that runs on every request: the load logs\n"
+                 "                  its sha256, and a pin (default: config/template-pins.json, built in) is compared\n"
+                 "                  with it -- a mismatch warns, --template-pin-strict (ONEBIT_TEMPLATE_PIN_STRICT=1)\n"
+                 "                  refuses the load (docs/serve.md, \"Chat template\")\n"
                  "                  [--pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url URL]]   Project Manager: the model answers or\n"
                  "                  delegates each chat to an expert model Lemonade runs (default experts:\n"
                  "                  config/pm-experts.json, built in; URL default http://127.0.0.1:8000; docs/pm.md)\n"
@@ -2707,6 +2811,8 @@ int run_serve(int argc, char** argv) {
     // ONEBIT_PRECISE=1 is the same as --precise (every request re-prefills its conversation in full)
     if (const char* e = std::getenv("ONEBIT_PRECISE"); e && *e && std::string(e) != "0") o.precise = true;
     if (const char* e = std::getenv("ONEBIT_WATCHDOG_SECS"); e && *e) o.watchdog.secs = std::atof(e);
+    // ONEBIT_TEMPLATE_PIN_STRICT=1 is the same as --template-pin-strict
+    if (const char* e = std::getenv("ONEBIT_TEMPLATE_PIN_STRICT"); e && *e && std::string(e) != "0") o.template_pin_strict = true;
     // ONEBIT_STRICT_DEVICE=0 / 1 (app/hrx_strict.h); a flag on the command line wins
     o.strict = strict_from_env(std::getenv("ONEBIT_STRICT_DEVICE"));
     bool strict_flag = false, no_strict = false;
@@ -2764,6 +2870,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--reranking") o.role = "reranking";
         else if (a == "--rerank") o.rerank = next();
         else if (a == "--npu-opt") o.npu_opts.push_back(next());
+        else if (a == "--load-queue-ms") o.load_queue_ms = std::stoi(next());
         else if (a == "--npu-streams") o.npu_streams = std::stoi(next());
         else if (a == "--prefill-provider") o.prefill_provider = next();
         else if (a == "--laya-model") o.laya_model = next();
@@ -2771,6 +2878,9 @@ int run_serve(int argc, char** argv) {
         else if (a == "--route-policy") o.route_policy = next();
         else if (a == "--recipes") o.recipes = next();
         else if (a == "--no-recipes") o.no_recipes = true;
+        else if (a == "--template-pin") o.template_pin = next();
+        else if (a == "--no-template-pin") o.no_template_pin = true;
+        else if (a == "--template-pin-strict") o.template_pin_strict = true;
         else if (a == "--pm") o.pm = true;
         else if (a == "--pm-experts") o.pm_experts = next();
         else if (a == "--pm-router") o.pm_router = next();
@@ -2802,6 +2912,9 @@ int run_serve(int argc, char** argv) {
     if (o.strict == StrictDevice::On && (o.device == "cpu" || o.device == "npu"))
         throw std::runtime_error("--strict-device needs --device hrx or auto: it refuses a graph that is not all on HRX");
     refuse_removed_device(o.device);
+    // A load names its GGUF's chat-template sha256 (and can refuse it): before every route below,
+    // including --print-backend, which names what would load (docs/serve.md "Chat template").
+    announce_template(o);
     // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend
     if (o.cwsr_placement == CwsrPlacement::On) (void) hrx_cwsr_env(o);
     // engine#715: both halves are for an HRX route only. --device cpu/npu/auto-with-no-HRX must not gain a line here,
@@ -2849,6 +2962,45 @@ int run_serve(int argc, char** argv) {
 #ifdef ONEBIT_NPU
         npu::PrivateOptions opts;
         for (const auto& kv : o.npu_opts) npu::parse_private_option(kv, opts);
+        // engine#1129: a THIRD shape of NPU model directory.  `npu_model_kind()` knows two -- a private
+        // route (a build-time addon, e.g. dx) and the fast lane (a fixed set of shape-specific lane
+        // kernels) -- so a MODEL-GENERIC container (model.q4nx + config.json + tokenizer.json + plan.json,
+        // i.e. exactly what our converter and packer emit, and what we publish) satisfied neither and was
+        // refused before the device was even opened.  Lemonade's onebit backend drives `serve -m <dir>`, so
+        // every container of that shape was invisible to it while `forward-serve -m model.q4nx --kernels
+        // <dir>` ran the very same directory correctly.  The kernels are the whole test: if a full-ELF
+        // directory resolves, this is the per-op forward's model and it goes to the same in-process route a
+        // GGUF repack takes; if none resolves the refusal below still names the way out.
+        if (npu_model_kind(o.model, opts) == NpuModel::None) {
+            std::string kernels;
+            if (const char* env = std::getenv("ONEBIT_NPU_KERNELS")) kernels = env;
+            if (kernels.empty() && fs::is_directory(fs::path(o.model) / "npu")) kernels = (fs::path(o.model) / "npu").string();
+#ifdef ONEBIT_NPU_KERNELS_DIR
+            if (kernels.empty()) kernels = ONEBIT_NPU_KERNELS_DIR;
+#endif
+            const bool model_generic = fs::exists(fs::path(o.model) / "model.q4nx") &&
+                                       fs::exists(fs::path(o.model) / "config.json") &&
+                                       fs::exists(fs::path(o.model) / "tokenizer.json");
+            if (model_generic && !kernels.empty() && fs::is_directory(kernels)) {
+                std::fprintf(stderr,
+                             "1bit serve: %s is a model-generic container: serving it through the per-op forward "
+                             "(kernels %s)\n", o.model.c_str(), kernels.c_str());
+                std::vector<std::string> fargs = {"-m", (fs::path(o.model) / "model.q4nx").string(),
+                                                  "--kernels", kernels, "-p", std::to_string(o.port),
+                                                  "--host", o.host};
+                if (!o.alias.empty()) { fargs.push_back("--alias"); fargs.push_back(o.alias); }
+                if (o.npu_streams > 1) { fargs.push_back("--npu-streams"); fargs.push_back(std::to_string(o.npu_streams)); }
+                std::vector<char*> fav;
+                for (auto& a : fargs) fav.push_back(a.data());
+                return run_forward_serve(int(fav.size()), fav.data());
+            }
+            if (model_generic)
+                throw std::runtime_error(
+                    o.model + " is a model-generic Q4NX container (model.q4nx + config.json + tokenizer.json), which the "
+                    "per-op forward serves, but no NPU kernel (full ELF) directory resolves for it: set ONEBIT_NPU_KERNELS "
+                    "to a directory of full_i8_*.elf designs (docs/npu.md), put one in " + o.model + "/npu, or configure the "
+                    "build with -DONEBIT_NPU_KERNELS_DIR=<dir>");
+        }
         if (const std::string why = npu_model_problem(o.model, opts); !why.empty()) throw std::runtime_error(why);
 #ifdef ONEBIT_LAYA
         // A Q4NX model directory runs on the NPU only; with --laya-model the router is still asked
@@ -2860,9 +3012,17 @@ int run_serve(int argc, char** argv) {
             std::fprintf(stderr, "1bit serve: laya routes %s to %s (Q4NX model directory)\n", model_id(o).c_str(), dev.c_str());
         }
 #endif
+        // The in-process route keeps one context and takes the exclusive device lock (app/unified.cpp, engine#612),
+        // so --npu-streams could only queue here: refused by name instead of silently ignored.
+        if (o.npu_streams > 1)
+            throw std::runtime_error(
+                "--npu-streams is not supported on the in-process NPU route (a .q4nx model directory): it holds one "
+                "context and the exclusive NPU device lock (app/unified.cpp, engine#612), so N streams would only queue. "
+                "Drop --npu-streams.");
         // The NPU serves in process (unified.cpp).
         std::vector<std::string> args = {"-m", o.model, "-p", std::to_string(o.port), "--host", o.host};
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+        args.push_back("--load-queue-ms"); args.push_back(std::to_string(o.load_queue_ms));
         for (const auto& kv : o.npu_opts) { args.push_back("--opt"); args.push_back(kv); }
         std::vector<char*> av;
         for (auto& s : args) av.push_back(s.data());
@@ -2895,6 +3055,7 @@ int run_serve(int argc, char** argv) {
                                      o.model.c_str(), lane.c_str());
                         std::vector<std::string> args = {"-m", ldir, "-p", std::to_string(o.port), "--host", o.host};
                         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+                        args.push_back("--load-queue-ms"); args.push_back(std::to_string(o.load_queue_ms));
                         std::vector<char*> av;
                         for (auto& s : args) av.push_back(s.data());
                         return run_unified(int(av.size()), av.data());
@@ -2931,10 +3092,17 @@ int run_serve(int argc, char** argv) {
                 }
                 const std::string ldir = repack_gguf_lane(o.model, dxk);
                 if (!ldir.empty()) {
+                    if (o.npu_streams > 1)
+                        throw std::runtime_error(
+                            "--npu-streams is not supported on the fused dx route: it holds one context and the exclusive "
+                            "NPU device lock (app/unified.cpp, engine#612), so N streams would only queue. Drop "
+                            "--npu-streams, or drop ONEBIT_NPU_DX_KERNELS to use the model-generic forward, which does "
+                            "stream.");
                     std::fprintf(stderr, "1bit serve: routing %s to the fused dx route (one launch per layer) from %s\n",
                                  o.model.c_str(), dxk.c_str());
                     std::vector<std::string> args = {"-m", ldir, "-p", std::to_string(o.port), "--host", o.host};
                     if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+                    args.push_back("--load-queue-ms"); args.push_back(std::to_string(o.load_queue_ms));
                     std::vector<char*> av;
                     for (auto& s : args) av.push_back(s.data());
                     return run_unified(int(av.size()), av.data());

@@ -50,7 +50,9 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <string>
@@ -117,6 +119,12 @@ public:
     virtual const std::vector<float>& last_hidden() const = 0;
     // Every row's hidden of the last batched pass (M x hidden_size, row-major), or empty when the base does not
     // keep it -- then the drafter simply cannot be advanced and its commit_rows() is not called.
+    //
+    // TWO row counts are legal after commit_verify(accepted), and the loop reads only the first `accepted` rows of
+    // either: the whole batch's M rows (what "M x hidden_size" above says, and what a base that keeps its batch
+    // buffer most naturally returns), or the accepted prefix alone (what Q4nxNpuForward::commit_verify_rows does to
+    // last_hidden_rows_ since #820).  Any other count is a bug in the base and fails the run rather than silently
+    // skipping the advance -- that silence is what cost the live loop 1 token/pass for a day (#811).
     virtual const std::vector<float>& last_hidden_rows() const {
         static const std::vector<float> none;
         return none;
@@ -187,6 +195,15 @@ struct Stats {
     double mean_accept_len() const { return iterations ? double(accepted) / double(iterations) : 0.0; }
     // Passes per emitted token: the number that has to fall for speculation to be a speed win at all.
     double passes_per_token() const { return emitted ? double(steps + batches) / double(emitted) : 0.0; }
+    // Where the draft phase's wall clock actually goes, in milliseconds.  "Two passes per iteration" only prices
+    // a loop change if the passes carry the cost: the head's own chain and each pass' host work are separate
+    // terms, and the arithmetic that decides a change (fold a pass, widen the batch, move the head to the array)
+    // needs all four measured in ONE window rather than one of them subtracted across two.
+    double ms_step = 0.0;      // single-token passes (the pass this loop pays for the token past the prefix)
+    double ms_batch = 0.0;     // verify batches, array + host
+    double ms_draft = 0.0;     // the head's chain: its matvecs and the lm head per draft
+    double ms_commit = 0.0;    // commit_verify (snapshot restore + replay) and the drafter's row advance
+    double phase_ms() const { return ms_step + ms_batch + ms_draft + ms_commit; }
 };
 
 // The live loop's side of the per-depth comparison, built in ONE place so the report sites and the tests cannot
@@ -222,6 +239,17 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
     if (prompt.empty()) { r.err = "empty prompt"; return r; }
     const int k = head ? std::min(std::max(0, opt.k), base.max_batch_rows()) : 0;
 
+    // Phase timing: always accumulated (steady_clock::now() is ~20 ns against a ~0.5 s pass), printed by the
+    // caller when it wants the split.  Measurement only -- nothing here is read back into the loop's decisions.
+    using Clock = std::chrono::steady_clock;
+    auto lap = [](Clock::time_point& t0) {
+        const auto t1 = Clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        t0 = t1;
+        return ms;
+    };
+    Clock::time_point tp = Clock::now();
+
     std::vector<float> logits, all;
     int pos = 0;
     for (int t : prompt)
@@ -239,12 +267,14 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         if (k <= 0) {                       // plain decode
             if (!base.step(t1, pos++, logits)) { r.err = "step failed"; return r; }
             r.stats.steps++;
+            r.stats.ms_step += lap(tp);
             continue;
         }
 
         // Consume t1 so the head sees the state after it; `have` is the position the drafts start at.
         if (!base.step(t1, pos, logits)) { r.err = "step failed"; return r; }
         r.stats.steps++;
+        r.stats.ms_step += lap(tp);
         const int have = ++pos;
         // The drafter must advance over t1 too: it keeps its own stream (the MTP layer attends over its own
         // states), so a position the base consumed outside the batch still has to reach it -- otherwise its cache
@@ -259,6 +289,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         std::vector<float> conf;
         r.stats.chain_at.push_back(have);
         int nd = head->draft(base.last_hidden(), t1, have, k, d, &conf);
+        r.stats.ms_draft += lap(tp);
         if (nd <= 0) continue;
         nd = std::min(nd, k);
         d.resize((size_t)nd);
@@ -271,6 +302,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         }
 
         if (!base.step_batch_all(d, have, all)) { r.err = "verify batch failed"; return r; }
+        r.stats.ms_batch += lap(tp);
         r.stats.iterations++;
         r.stats.batches++;
         r.stats.rows_verified += nd;
@@ -313,16 +345,24 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         if (!base.commit_verify(take)) { r.err = "commit_verify refused"; return r; }
         if (head && take > 0) {
             const std::vector<float>& rows = base.last_hidden_rows();
-            if (rows.size() != (size_t)take * (size_t)base.hidden_size()) {
-                // A base that keeps no rows at all is legal (the drafter simply cannot advance); a base that
-                // keeps the WRONG number of them is a bug, and silently skipping the advance is how the live
-                // loop lost 1 token/pass for a day.  Fail instead of drifting.
-                if (!rows.empty()) { r.err = "drafter rows: base returned a partial batch hidden"; return r; }
+            // Accepted prefix or the whole batch -- both are the base's own rows, and row m is the hidden after the
+            // token at start_pos+m either way, so the first `take` of them are the ones the drafter advances over.
+            const size_t h = (size_t)base.hidden_size();
+            const size_t got = (h && rows.size() % h == 0) ? rows.size() / h : 0;
+            if (rows.empty()) {
+                // A base that keeps no rows at all is legal: the drafter simply cannot advance.
+            } else if (got != (size_t)take && got != (size_t)nd) {
+                // A base that keeps the WRONG number of them is a bug, and silently skipping the advance is how the
+                // live loop lost 1 token/pass for a day.  Fail instead of drifting.
+                r.err = "drafter rows: base returned " + std::to_string(got) + " rows, want " +
+                        std::to_string(take) + " (committed prefix) or " + std::to_string(nd) + " (batch)";
+                return r;
             } else {
                 std::vector<int> accepted(d.begin(), d.begin() + take);
                 head->commit_rows(accepted, rows, take);
             }
         }
+        r.stats.ms_commit += lap(tp);
         if (take > 0)
             logits.assign(all.begin() + (size_t)(take - 1) * (size_t)V,
                           all.begin() + (size_t)take * (size_t)V);

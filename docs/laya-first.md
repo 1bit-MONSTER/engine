@@ -154,6 +154,67 @@ classes have a first-party repo with the file named here). The two classes that 
 rather than a second device: `Qwen3.6-35B-A3B-NPU` for a heavy class on the NPU, and the FLM rows already in
 `server_models.json` for a small NPU chat model (see "Owner decisions").
 
+### A row is not served with an unexpected template
+
+A routed row is a **pull from the Hub and then a load**, so it inherits the template-backdoor problem
+twice over: the file arrives from a third party, and the template inside it is a program the
+llama.cpp server runs on every request (the engine's own forward never reads one). A pinned route
+table is a good place to close that, because it is the only place in the pull path that knows which
+model was *meant* to arrive.
+
+So a GGUF row gains one required field, and a Q4NX row the same field read from its container:
+
+```json
+"prose": {"model": "ZAYA1-8B-1bit",
+          "hf_repo": "1bit-MONSTER/ZAYA1-8B-GGUF",
+          "file": "zaya1-8b-Q4_K_M.gguf", "device": "hrx", "ctx": 16384,
+          "template_sha256": "b55ecfbbbcbb238a011465bfa139366db18790103f9205060cf2855a3f51b30f"}
+```
+
+| field | meaning |
+|---|---|
+| `template_sha256` | the sha256 of the exact `tokenizer.chat_template` bytes the row expects (a GGUF's metadata key, or a Q4NX container's `tokenizer_config.json` string); `"none"` for a row that must carry no template. Omitting it is a table error, not a default — a row with no expectation is a row nothing checks ([template-publishing.md](template-publishing.md)). **Required when §8 step 3 lands; no row carries it today — see the last paragraph of this section.** |
+
+Two checks, in order, and both are refusals of *that row*, never of the request:
+
+1. **At pull time**, before the row is registered with Lemonade and before it is named in a decision:
+   hash the template of the file that landed (and of every `extra_files` entry that is served as a
+   model) and compare it with the row. On a mismatch the row is not registered, the class falls back
+   to `default_model`, and the reason is logged and carried in `x-lemonade-route` as
+   `why: template_mismatch` (the same shape as `why: gpu_busy`). Nothing is deleted and nothing is
+   re-uploaded: a mismatch is information for the operator, and the file may be perfectly good under a
+   different row.
+2. **At load time**, the engine names the template's sha256 in one line and compares it with its own
+   pin (`1bit serve --template-pin-strict` in the appliance's shipped row), so a file that changed
+   *after* the pull is refused at the load rather than served ([serve.md](serve.md#chat-template---template-pin---no-template-pin---template-pin-strict)).
+
+Why both: the pull-time check is the only one that knows what was expected (it is the only place with
+the table), and the load-time check is the only one that covers a model loaded by name, outside the
+router, months later. Neither is a trust anchor for a model nobody has pinned — for those the line is
+the deliverable, and it is what makes the difference visible in a log.
+
+**What runs today, and what does not.** The field and the pull-time check are §8 step 3, and neither is
+in the tree yet: `config/laya-first.json` (compiled in as `laya_first_default.h`) carries no
+`template_sha256`, nothing in `app/`, `src/`, `tests/` or `os/` reads one, and no installed
+`<laya home>/laya-first.json` ships with digests. So a routed pull is checked at exactly **one** place
+today — **load time**, against the engine's own `config/template-pins.json`, which pins 7 model names,
+three of them the rows above (`zaya1-8b-Q4_K_M.gguf` `b55ecfbbbc…`,
+`Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` `87710339d2…`, `Qwen3.8-27B-UD-Q4_K_XL.gguf`
+`12827f24b7…`; the `short` row's `Qwen3-0.6B-Q8_0.gguf` is not in that table). That check warns unless
+the row ships `--template-pin-strict` (§9), and it catches one thing only — the same name carrying a
+different template. A file under a new name, or a row whose digest nobody recorded, is visible only as
+the load line; that is the gap step 3 closes.
+
+When step 3 lands it will need one digest per row, and three of the four are in the tree **today** in
+`config/template-pins.json` — `zaya1-8b-q4_k_m.gguf` `b55ecfbbbc…`,
+`qwen3-coder-30b-a3b-instruct-q4_k_m.gguf` `87710339d2…`, `qwen3.8-27b-ud-q4_k_xl.gguf` `12827f24b7…` —
+because those rows are the same files the load-time check already pins. The fourth, `short`'s
+`Qwen3-0.6B-Q8_0.gguf` `57f1fd00f0…`, is not in any table in this tree yet: it is measured, and it is added
+by #1158 (and recorded with every other file we serve and publish in `models/pins.json`, #1148). A Q4NX row
+is read from its `tokenizer_config.json` because it has no GGUF ([npu-chat-template.md](npu-chat-template.md)).
+Adding a row then means adding its digest: the table is not allowed to grow a row that skips that step, and
+the validator that fails one is part of step 3, not something to assume today.
+
 ### Device: HRX by default, and the NPU only when the GPU is busy or hot
 
 Measured on Strix Halo on 2026-11-04 (`llama-bench`, same box, same file, `-r 2`): a dense 27B-class model —
@@ -194,6 +255,44 @@ Three properties the condition keeps:
   power and package heat, and what pinning the iGPU for 33 s costs the lanes sharing it. Until that lands, `on_busy`
   is **absent from the shipped table** and the gate row asserts the HRX landing only; when it ships, the rule gains a
   warm-up guard (no fallback in the first minute after boot, when the thermal guard itself is still settling).
+
+### The table in the binary: `1bit laya-first`
+
+`config/laya-first.json` ships compiled into the engine (like `config/recipes.json`), and
+`1bit laya-first` validates it and prints the `collection.router` policy it desugars into:
+
+```sh
+1bit laya-first --check                 # 4 classes, default Qwen3-0.6B-1bit
+1bit laya-first --policy laya-first.collection.json
+```
+
+```json
+{"version": "1", "model_name": "user.Laya-First", "recipe": "collection.router",
+ "components": ["Qwen3-0.6B-1bit", "ZAYA1-8B-1bit", ...],
+ "routing": {"candidates": [...], "default_model": "Qwen3-0.6B-1bit",
+   "classifiers": [{"id": "laya", "type": "laya",
+                    "labels": ["short", "prose", "code", "long_doc"]}],
+   "rules": [{"id": "laya-code", "match": {"classifier": "laya", "label": "code", "min_score": 0.0},
+              "route_to": "Qwen3-Coder-30B-A3B-Instruct-1bit"}, ...]}}
+```
+
+Two details are load-bearing rather than cosmetic. **`min_score: 0.01` on every class rule** — low, so
+the band's default floor of 0.5 cannot drop the decisions this table exists to route (Laya's confidence for
+`code` is about 0.44), but **not zero**: the classifier reports only the class Laya chose, so every other
+label scores exactly `0.0`, and a `0.0` floor matches `0.0 >= 0.0` — the *first* class rule then swallows
+every request. Measuring that cost one live run: a `short` prompt routed to the `code` model while every
+self-test stayed green, because a verdict can only see that *a* rule matched, not that it was the right one.
+**Labels on the classifier entry**: declaring the four classes is what makes a typo in a rule's `label` a
+parse error in Lemonade instead of a rule that silently never matches.
+
+The name is `user.Laya-First` because that is the only shape Lemonade will register at run time
+("Registered model definitions must use a non-empty `user.*` name", measured against a live lemond); the
+appliance registers the desugared policy at first boot, so the desugar has to emit a registrable name.
+
+`tests/laya_first.sh` pins the desugaring (19 checks, including byte equality with
+`tests/laya_first_policy.json`), refuses a table with a device typo or a missing class by name, and — when
+a Lemonade checkout is reachable — validates the emitted policy against that repo's
+`route_policy.schema.json`, because the policy is for Lemonade and its schema is the contract.
 
 ## 5. Cold start
 
@@ -236,7 +335,10 @@ no re-decision, and an explicit model name must produce no routing header at all
 which is the same shape as the existing `chat-hrx`/`chat-npu` rows. When `on_busy` ships (§4), the row gains a fifth
 case — a ticket held by another label makes the document prompt land on the NPU row, the header says `why: gpu_busy`,
 and the same prompt with the queue empty lands on `hrx` — because a fallback that only ever runs on one side of the
-condition is the classic untested branch.
+condition is the classic untested branch. It gains a sixth: a row whose `template_sha256` does not match
+the file on disk is not registered, the class lands on `default_model`, and the header says
+`why: template_mismatch` — a template gate that only ever passes is the same untested branch one layer
+down.
 
 ## 8. Order of work
 
@@ -244,7 +346,8 @@ condition is the classic untested branch.
    decision, `long_doc`'s size gate, a dead daemon, and determinism over 5 runs), plus `--json` on `1bit route`.
 2. **Fork**: `type: "laya"` classifier, `LayaClient`, parser/registry acceptance, policy-schema entry, docs (§3-§6
    contract), tests.
-3. **Engine**: `laya-first.json` + desugaring to a `collection.router` policy + packaging.
+3. **Engine**: `laya-first.json` + desugaring to a `collection.router` policy + packaging, with
+   `template_sha256` required per row and the pull-time check of the same section.
 4. **Fork**: `auto` resolving to the shipped router collection (this changes the line in the fork's `docs/dev/router-policy.md`
    that says there is no `auto` model).
 5. Release check row `laya-auto` (§7).
@@ -260,3 +363,40 @@ condition is the classic untested branch.
    literally named `auto` (no code change, but it collides with any user model of that name)?
 4. **The code class's first pull is 18.6 GB.** Start `code` on ZAYA1-8B (5.6 GB) and treat Qwen3-Coder as an
    escalation, or accept the big pull on the first code request?
+
+### What measuring the implementation added to those four
+
+Each of these was found by running the code against a live server tonight, not by reading it. They narrow the
+answers; none of them decides anything for you.
+
+1. **The small NPU row: provenance matters more than size.** The row has to name a checkpoint the appliance can pull
+   *and* prove. An FLM checkpoint is a third party's artefact on a pinned FLM (v1.0.7 today), so the row would be
+   "our router, their model" — defensible for a small chat class, but it is a different claim from every other row in
+   the table, and the release check would need to say which kind of row it is looking at. A 0.6B-class Q4NX of our own
+   keeps one claim for the whole table and costs a conversion. **Recommendation: our own container**; if an FLM row
+   ships instead, the table needs a `provenance` field so the row and the release check cannot disagree about what
+   "ours" means.
+2. **Catalogue vs table: the table's names must be registrable, and that is now a hard constraint.** Measured: Lemonade
+   refuses to register a definition outside `user.*` — *"Registered model definitions must use a non-empty `user.*`
+   name. Received: 1bit.Laya-First"*. So whatever the row ids become, the **router collection** is registered as
+   `user.<something>` and the desugar emits that; the *components* keep their catalogue ids (they are ordinary pulled
+   models, not definitions). The table already names `1bit-MONSTER` mirrors, so the question is only whether the
+   catalogue rows are re-pointed at them — which the `hf_repo` field already answers independently, without moving ids.
+   **Recommendation: leave ids alone; treat `hf_repo`/`file` as the pull source.**
+3. **`auto`: the two options differ in who owns a name, and one of them is cheap to reverse.** A reserved name needs a
+   hook in `Router` and is invisible to the catalogue; a shipped collection named `auto` needs no code but squats the
+   name for every user. There is a third shape the work made obvious: keep the name `user.Laya-First` (what the desugar
+   already emits and what the release row now reads *from the engine*, not a constant) and let the **appliance** alias
+   `auto` to it — an alias is configuration, reversible, and does not squat anything in the product. **Recommendation:
+   alias at install time**, and raise the reserved-name hook only if a user-facing `auto` is wanted on stock Lemonade
+   too.
+4. **The 18.6 GB first pull: the table already made this a policy question, not a code question.** Nothing in the code
+   forces the big model to be `code`'s *first* choice: the class rule points wherever the table says, and
+   `tests/laya_first.sh` re-derives the policy from the table. So this can ship as ZAYA1-8B for `code` with
+   Qwen3-Coder as a second table entry to promote later, at the cost of one line in `config/laya-first.json` — and no
+   code change to reverse. **Recommendation: start small, promote with evidence.**
+
+**One measurement that changes how the table must be written, whichever way 1-4 go:** a class rule needs a floor
+*above* zero (`min_score: 0.01`, §4). At `0.0` the first rule matches every class, because the classifier reports only
+the class Laya chose and every other label scores exactly `0.0` — a `short` prompt routed to the `code` model while
+every test stayed green. Any table or hand-written policy built from this note has to carry that floor.

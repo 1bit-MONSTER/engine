@@ -56,12 +56,28 @@ jobs:
         run: |
           python3 -m pip install numpy gguf
           python3 tests/gguf_to_q4nx_test.py
+          python3 tests/repack_verify_source_test.py
           python3 tests/ternary_to_q4_0_test.py
           python3 tests/mtp_draft_vocab_test.py
           python3 tests/check_pins_test.py
           python3 tests/hrx_long_prompt_test.py
+          python3 tools/template_bom.py --self-test          # the chat-template BOM component
+      - name: Model pins
+        # fixtures only: models/pins.json itself is compared with the Hub by pin-watch.yml
+        run: python3 tools/pin_watch.py --self-test
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-16 -DCMAKE_CXX_COMPILER=g++-16
+      - name: The draft-loop measurement tool still compiles
+        # tools/mtp_acceptance is the binary every draft-loop number is measured with, and it is not a
+        # build target here: it links the NPU forward, whose runtime is private (ONEBIT_NPU wants
+        # ONEBIT_NPU_RT_DIR). A rename in npu/mtp/ or npu/forward/include/ would therefore break it
+        # silently until someone built it on a device. Syntax-only, against the in-tree headers only.
+        run: |
+          # The image installs versioned binaries only (no /usr/bin/g++), and Configure above
+          # already picks g++-16, so the check compiles with the same compiler the build uses.
+          g++-16 -std=c++26 -fsyntax-only -DONEBIT_NPU_RUNTIME_OWN \
+            -Inpu -Inpu/forward/include -Ibuild/_deps/json-src/include \
+            tools/mtp_acceptance.cpp
       - name: Build
         # Every target a ctest test invokes must be listed here: `ctest` runs whatever
         # binaries exist, so a test whose target is missing reports "Not Run" and never

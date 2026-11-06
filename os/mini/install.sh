@@ -29,6 +29,10 @@
 # Exit: 0 installed, 1 usage, 2 refused (nothing written), 3 failed while writing.
 set -u
 
+# #709: the firmware boot-entry rules live in one file so tests/os_mini_efi_boot_test.sh can run the
+# selection and rollback without a device; mkimage.sh ships it beside this script.
+. "${0%/*}/efi-boot.sh"
+
 ESP_MB=512
 DATA_LABEL=1BIT-DATA
 ESP_LABEL=1BIT-OS
@@ -369,35 +373,23 @@ elif [ ! -e /sys/firmware/efi/efivars/BootOrder-8be4df61-93ca-11d2-aa0d-00e09803
     log "    the disk still boots as \\EFI\\BOOT\\BOOTX64.EFI - point the firmware at it, or boot it once"
     step_end 9 OK "no efivarfs in this kernel: firmware fallback"
 else
-    # the target ESP's partition GUID, so only entries for THIS disk are ever removed
-    esp_guid=$(sed -n 's/^PARTUUID=//p' "/sys/class/block/${esp##*/}/uevent" 2>/dev/null | head -n 1)
+    esp_guid=$(efi_esp_guid "$esp")
     mkdir -p /tmp/install/esp-ro
     mount -t vfat -o ro "$esp" /tmp/install/esp-ro 2>/dev/null || fail 9 "cannot mount the new ESP read-only"
-    removed=0
-    efibootmgr -v 2>/dev/null | while IFS= read -r line; do
-        case "$line" in Boot*File\(*\)*) ;; *) continue ;; esac
-        num=$(printf '%s\n' "$line" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')
-        file=$(printf '%s\n' "$line" | sed -n 's/.*File(\([^)]*\)).*/\1/p' | tr '\\' '/' | tr 'A-Z' 'a-z')
-        # only an entry that points into THIS ESP, and only when the file it names is not there any more
-        [ -n "$esp_guid" ] || continue
-        case "$line" in *"$esp_guid"*) ;; *) continue ;; esac
-        [ -n "$file" ] || continue
-        if [ ! -e "/tmp/install/esp-ro/$file" ]; then
-            efibootmgr -b "$num" -B >/dev/null 2>&1 && { echo "efibootmgr: removed stale Boot$num ($file)" >> /tmp/install-step.log; removed=$((removed + 1)); }
-        fi
-    done
-    new=$(efibootmgr -c -d "$DEV" -p 1 -L "1bit OS" -l '\EFI\BOOT\BOOTX64.EFI' 2>/tmp/install-step.log |
-          sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*.*1bit OS.*/\1/p' | head -n 1)
-    [ -n "$new" ] || fail 9 "efibootmgr could not create the 1bit OS entry"
-    order=$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p' | head -n 1)
-    rest=$(printf '%s\n' "$order" | tr ',' '\n' | grep -v -x -i "$new" | tr '\n' ',' | sed 's/,$//')
-    efibootmgr -o "$new${rest:+,$rest}" >/dev/null 2>>/tmp/install-step.log || fail 9 "efibootmgr could not set BootOrder"
-    efibootmgr -n "$new" >/dev/null 2>>/tmp/install-step.log || true
-    sync
-    log "    Boot$new* 1bit OS -> \\EFI\\BOOT\\BOOTX64.EFI on $DEV, BootNext set"
-    log "    BootOrder: $(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p' | head -n 1)"
-    umount /tmp/install/esp-ro 2>/dev/null || true
-    step_end 9 OK "Boot$new first"
+    # create \EFI\BOOT\BOOTX64.EFI for this disk, put it first, BootNext, and remove only entries
+    # whose loader is provably gone (ours with the file missing, or a partition that no longer exists).
+    # On failure the helper deletes the entry it made and restores the original BootOrder.
+    if efi_register_boot_entry "$DEV" /tmp/install/esp-ro "$esp_guid"; then
+        [ -n "$EFI_REMOVED" ] && log "    removed stale firmware entries: $EFI_REMOVED"
+        sync
+        log "    Boot$EFI_ENTRY_NUM* 1bit OS -> \\EFI\\BOOT\\BOOTX64.EFI on $DEV, BootNext set"
+        log "    BootOrder: $EFI_BOOT_ORDER"
+        umount /tmp/install/esp-ro 2>/dev/null || true
+        step_end 9 OK "Boot$EFI_ENTRY_NUM first; BootOrder $EFI_BOOT_ORDER"
+    else
+        umount /tmp/install/esp-ro 2>/dev/null || true
+        fail 9 "could not register the firmware boot entry (BootOrder restored to ${EFI_ORIG_ORDER:-its previous value})"
+    fi
 fi
 
 # 10: both partitions, read-only, the way the firmware will see them

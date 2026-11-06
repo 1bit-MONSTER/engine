@@ -40,7 +40,9 @@
 
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx
 #include "hadamard.h"                // the activation rotation, SIMD path + scalar reference
+#include "attn_math.h"               // attention's score dot + value accumulation, SIMD + portable
 #include "q4nx_dequant.h"
+#include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_pack.h"
 
 #if defined(_OPENMP)
@@ -177,6 +179,7 @@ static bool valid_sidecar_dir(const std::string& d) {
 // derived from data_size rather than the declared shape so a 2-D [ntiles, N]
 // and a 3-D [ntr, ntc, N] tensor both work.  (src/q4nx_dequant.c; the Q4_K/Q8
 // layouts are in docs/qwen35-4b-weight-format.md.)
+
 static int dequant_any(const void* data, size_t nbytes, int rows, int cols, float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
@@ -185,7 +188,40 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
     const int cb = (int)(nbytes / n);
     if (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8)
         return q4nx_dequant_tensor_chunked((const uint8_t*)data, nbytes, rows, cols, cb, out);
+    // The container may store this weight on a wider grid than the model's dimensions (engine#1097).
+    // Read it on the container's grid and write only the model's [rows, cols], so buffers, row
+    // strides and the kernel's B layout stay exactly what they were for an unpadded container.
+    int pcb = 0, prp = 0, pcp = 0;
+    if (q4nx_packed_grid(nbytes, rows, cols, &pcb, &prp, &pcp))
+        return q4nx_dequant_tensor_packed((const uint8_t*)data, nbytes, rows, cols, prp, pcp, pcb, out);
     return q4nx_dequant_tensor((const uint8_t*)data, nbytes, rows, cols, out);
+}
+
+// rope_type "llama3" (Llama-3.1/3.2/3.3) from config.json's rope_scaling: the frequency band that
+// transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
+// every other architecture builds exactly the table it built before.  Keys are searched with their
+// quotes, which is what keeps "factor" from matching inside "high_freq_factor".
+static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
+    Q4nxRopeLlama3 s{};
+    std::ifstream f(cfg_path);
+    if (!f) return s;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (!strstr(t.c_str(), "llama3")) return s;
+    auto num = [&t](const char* key, double def) -> double {
+        const char* p = strstr(t.c_str(), key);
+        if (!p) return def;
+        const char* c = strchr(p + strlen(key), ':');
+        if (!c) return def;
+        char* end = nullptr;
+        const double v = strtod(c + 1, &end);
+        return end == c + 1 ? def : v;
+    };
+    s.factor = num("\"factor\"", 0.0);
+    s.high_freq_factor = num("\"high_freq_factor\"", 0.0);
+    s.low_freq_factor = num("\"low_freq_factor\"", 0.0);
+    s.original_max_position = num("\"original_max_position_embeddings\"", 0.0);
+    s.on = s.factor > 0.0 && s.original_max_position > 0.0 && s.high_freq_factor > s.low_freq_factor;
+    return s;
 }
 
 // LongRoPE short_factor from config.json's rope_scaling (MiniCPM4): the
@@ -516,12 +552,58 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         if (hd > 0) cfg.head_dim = hd;
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
+    rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    {
+        // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
+        // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
+        // log to say so.  "" (no rope_scaling block) is every model that never declared one.
+        std::ifstream f(cfg_path);
+        std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        char declared[64];
+        q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
+        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1)) {
+            if (!std::strcmp(declared, "llama3"))
+                err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
+                       "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
+                       "scaling cannot be applied; serving it would run plain RoPE";
+            else
+                err_ = std::string("config.json declares rope scaling \"") + declared +
+                       "\", which this forward does not implement (only llama3 and longrope short_factor "
+                       "are), so it would be served plain RoPE and reply wrongly past the model's "
+                       "original window (engine#1048, #1087)";
+            return false;
+        }
+    }
     embed_scale_ = read_config_float(cfg_path, "\"embedding_scale\"", 1.0f);
     residual_scale_ = read_config_float(cfg_path, "\"residual_scale\"", 1.0f);
     logit_scale_ = read_config_float(cfg_path, "\"logit_scale\"", 1.0f);
     if (logit_scale_ == 0.0f) logit_scale_ = 1.0f;
-    mw_ = model_load(model_path, cfg);
+    // engine#1185: an OGA-imported container stores its I8 weights as 6,144-byte q4_1f chunks
+    // (fp32 scale/zero), which the kernels this forward drives do not read. Load the device form:
+    // every q4_1f tensor repacked through q4nx::as_q4_1() into the Q4NX cache, logged once there.
+    // A directory already in the device's form -- every GGUF-derived container -- is returned
+    // unchanged and nothing is written.
+    std::string load_path(model_path);
+    try {
+        const onebit::npu::q4nx::DeviceForm form = onebit::npu::q4nx::device_form(model_path, std::string());
+        if (form.converted) load_path = form.model;
+    } catch (const std::exception& e) {
+        err_ = std::string("cannot put the imported container in the device's form: ") + e.what();
+        return false;
+    }
+    mw_ = model_load(load_path.c_str(), cfg);
     if (!mw_) { err_ = "model_load failed"; return false; }
+    // engine#1035: two MoE container conventions exist on disk.  The engine's own converter
+    // (tools/gguf_to_q4nx.py) names the routed stacks model.layers.N.mlp.experts.*_proj.weight with
+    // a plain [N][K] per-expert tile grid and a mlp.gate.weight router; FastFlowLM-style containers
+    // use *_exps_proj names whose writer transposes each expert's tiles.  Which one this is, and
+    // therefore how an expert slice decodes, is read from the container's own layer-0 tensor
+    // (moe_container.h) rather than assumed -- either mistake is silent.
+    moe_format_ = moe_format(
+        model_tensor_by_name(mw_, "model.layers.0.mlp.gate_exps_proj.weight") != nullptr,
+        model_tensor_by_name(mw_, "model.layers.0.mlp.experts.gate_proj.weight") != nullptr);
+    if (moe_format_ == MoeFormat::EngineConverter)
+        fprintf(stderr, "  [moe] container layout: engine-converter names, per-expert [N][K] tiles\n");
     // model_load sized its layer table from the tensors; config.json may not promise more.
     if (cfg.num_layers <= 0 || cfg.num_layers > mw_->config.num_layers) {
         err_ = "config.json num_hidden_layers (" + std::to_string(cfg.num_layers) + ") does not match the " +
@@ -620,6 +702,18 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
         if (sem_.eps <= 0) sem_.eps = c_.eps;
         q4nx_semantics_dump(&sem_);
+        // A layer kind nothing implements is refused BY NAME, here beside the other precise refusals (engine#1087's
+        // shape): q4nx_semantics maps an unrecognised layer_types entry to Q4NX_LAYER_OTHER and the attention path
+        // treats OTHER as full attention, so a container declaring, say, a conv attention would be served as a plain
+        // decoder - fluent, wrong at every position, silent.  Every container on this box declares only
+        // full_attention / linear_attention (sliding-window included), so this refuses nothing that runs today.
+        if (sem_.unknown_layer_type[0]) {
+            err_ = std::string("config.json layer_types names \"") + sem_.unknown_layer_type +
+                   "\", a layer kind this forward does not implement (it runs full_attention, sliding-window and "
+                   "linear/GDN layers), so serving it would run those layers as full attention and be wrong at every "
+                   "position; file the kind you need instead of converting it";
+            return false;
+        }
         // Refuse rather than silently apply full-attention math to a model whose
         // config declares layer types (or RoPE variants) this forward lacks.
         // Refusal is now precise.  Only layers whose attention MATH we do not
@@ -709,10 +803,19 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // left n_expert_/top_k_/expert_im_ zero and the standard MoE path dead.
     // expert_im_ is the per-EXPERT intermediate, which c_.IM already holds for a MoE
     // config (the converter writes the per-expert FFN width as intermediate_size).
-    n_expert_ = q4nx_config_int(cfg_path.c_str(), "n_expert", 0);
+    // MoE containers name these keys in one of two conventions: llama.cpp-style `n_expert`/`top_k`
+    // (FastFlowLM-style containers) or the HF names the engine's own converter writes --
+    // `num_experts`/`num_experts_per_tok` (engine#1035).  Reading only the first made a converted
+    // Qwen3-Coder-30B-A3B run as a dense model, whose first layer then asked for a
+    // mlp.gate_proj.weight the container does not carry: it surfaced as
+    // "MLP dequant : data_size 0 at geometry 768x2048 ... the container and config.json disagree".
+    n_expert_ = moe_expert_count(q4nx_config_int(cfg_path.c_str(), "n_expert", 0),
+                                 q4nx_config_int(cfg_path.c_str(), "num_experts", 0));
     if (n_expert_ > 0) {
-        top_k_ = q4nx_config_int(cfg_path.c_str(), "top_k", 0);
-        expert_im_ = c_.IM;
+        top_k_ = moe_top_k(q4nx_config_int(cfg_path.c_str(), "top_k", 0),
+                           q4nx_config_int(cfg_path.c_str(), "num_experts_per_tok", 0));
+        const int moe_im = q4nx_config_int(cfg_path.c_str(), "moe_intermediate_size", 0);
+        expert_im_ = moe_im > 0 ? moe_im : c_.IM;
         dense_im_ = q4nx_config_int(cfg_path.c_str(), "dense_intermediate_size", 0);
         leading_dense_ = q4nx_config_int(cfg_path.c_str(), "leading_dense_block_count", 0);
         expert_gating_sigmoid_ =
@@ -1682,8 +1785,19 @@ bool Q4nxNpuForward::load_layer(int l) {
         return load_gdn_layer(l);
     auto deq = [&](TensorDesc* d, float* out, int rows, int cols) -> bool {
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
-        if (!raw) return false;
-        return dequant_any(raw, (size_t)d->data_size, rows, cols, out) == 0;
+        if (!raw) { err_ = std::string("MLP tensor ") + d->name + " has no data"; return false; }
+        if (dequant_any(raw, (size_t)d->data_size, rows, cols, out) != 0) {
+            // Name it: the bare "dequant failed" this used to leave cost an afternoon on engine#1097.
+            const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
+            char why[256];
+            snprintf(why, sizeof why, "MLP dequant %s: data_size %zu at geometry %dx%d = %zu tiles "
+                     "(chunk %zu B is not a kind, and no padded grid fits): the container and "
+                     "config.json disagree", d->name, (size_t)d->data_size, rows, cols, tiles,
+                     tiles ? (size_t)d->data_size / tiles : 0);
+            err_ = why;
+            return false;
+        }
+        return true;
     };
     const int H = c_.H, IM = c_.IM, NH = c_.NH;
     // Gemma4 varies the attention width by layer type, so the projection rows
@@ -1720,13 +1834,19 @@ bool Q4nxNpuForward::load_layer(int l) {
         // instead of a dense gate/up/down.  The router is bf16; its bias is OPTIONAL
         // (Qwen MoE has none, deepseek2 does).  The experts stay pooled -- one
         // [N][K] slice is dequantized per selected expert at decode.
+        // Two container conventions spell these tensors differently (engine#1035, moe_container.h):
+        // the engine converter's `mlp.experts.*_proj.weight` + `mlp.gate.weight` with a plain
+        // [N][K] per-expert grid, or the FLM-style `*_exps_proj.weight` + `moe_router.weight`.
+        // Which one this container is was read from layer 0 in init_impl, so the names come from
+        // one table rather than being assumed here.
+        const MoeNames mn = moe_names(moe_format_);
         char nm2[160];
-        auto td2 = [&](const char* fmt) -> TensorDesc* {
-            snprintf(nm2, sizeof(nm2), fmt, l);
+        auto td_named = [&](const char* suffix) -> TensorDesc* {
+            snprintf(nm2, sizeof(nm2), "model.layers.%d.%s", l, suffix);
             return model_tensor_by_name(mw_, nm2);
         };
-        auto load_bf16_opt = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
-            TensorDesc* d = td2(fmt);
+        auto load_bf16_named = [&](const char* suffix, std::vector<float>& v, int n) -> bool {
+            TensorDesc* d = td_named(suffix);
             if (!d || n < 0) return false;
             const uint16_t* p = bf16_data(mw_, d, (size_t)n);
             if (!p) return false;
@@ -1734,34 +1854,32 @@ bool Q4nxNpuForward::load_layer(int l) {
             for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
             return true;
         };
-        if (!load_bf16_opt("model.layers.%d.moe_router.weight", moe_router_, n_expert_ * H))
-            { err_ = "moe router"; return false; }
-        if (!load_bf16_opt("model.layers.%d.moe_router.bias", moe_router_b_, n_expert_))
-            moe_router_b_.clear();
-        auto pool = [&](const char* fmt, const uint8_t** p, size_t* bytes) -> bool {
-            TensorDesc* d = td2(fmt);
+        if (!load_bf16_named(mn.router, moe_router_, n_expert_ * H)) { err_ = "moe router"; return false; }
+        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) moe_router_b_.clear();
+        auto pool = [&](const char* suffix, const uint8_t** p, size_t* bytes) -> bool {
+            TensorDesc* d = td_named(suffix);
             if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
             if (!raw) return false;
             *p = raw; *bytes = (size_t)d->data_size / (size_t)n_expert_;
             return true;
         };
-        if (!pool("model.layers.%d.mlp.gate_exps_proj.weight", &exp_g_, &exp_g_bytes_)) return false;
-        if (!pool("model.layers.%d.mlp.up_exps_proj.weight", &exp_u_, &exp_u_bytes_)) return false;
-        if (!pool("model.layers.%d.mlp.down_exps_proj.weight", &exp_d_, &exp_d_bytes_)) return false;
+        if (!pool(mn.gate, &exp_g_, &exp_g_bytes_)) return false;
+        if (!pool(mn.up, &exp_u_, &exp_u_bytes_)) return false;
+        if (!pool(mn.down, &exp_d_, &exp_d_bytes_)) return false;
         // Optional shared expert (qwen35moe): a 2D [expert_im][H] / [H][expert_im] pair
         // plus its [H] gate.  Cleared when absent (qwen3moe has none).
-        auto load_share = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
-            TensorDesc* d = td2(fmt);
+        auto load_share = [&](const char* suffix, std::vector<float>& v, int rows, int cols) -> bool {
+            TensorDesc* d = td_named(suffix);
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
             return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
         };
-        if (!load_share("model.layers.%d.mlp.share_gate_exps_proj.weight", share_g_, expert_im_, H)) share_g_.clear();
-        if (!load_share("model.layers.%d.mlp.share_up_exps_proj.weight", share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
-        if (!load_share("model.layers.%d.mlp.share_down_exps_proj.weight", share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
-        if (!load_bf16_opt("model.layers.%d.mlp.share_router.weight", share_router_, H)) share_router_.clear();
+        if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
+        if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_share(mn.share_down, share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_bf16_named(mn.share_router, share_router_, H)) share_router_.clear();
         return true;
     }
     if (!pb16i_ && !ffn_tail_cached()) {
@@ -1876,13 +1994,15 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         // qwen35moe: a GDN layer's FFN is MoE, not a dense gate/up/down.  The
         // loading mirrors the standard path's MoE branch; the FFN itself is run by
         // the common MLP section (which sees n_expert_ > 0 and calls moe_mlp).
+        // Same two conventions as the standard MoE branch (moe_container.h, engine#1035).
+        const MoeNames mn = moe_names(moe_format_);
         char nm2[160];
-        auto td2 = [&](const char* fmt) -> TensorDesc* {
-            snprintf(nm2, sizeof(nm2), fmt, l);
+        auto td_named = [&](const char* suffix) -> TensorDesc* {
+            snprintf(nm2, sizeof(nm2), "model.layers.%d.%s", l, suffix);
             return model_tensor_by_name(mw_, nm2);
         };
-        auto load_bf16_opt = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
-            TensorDesc* d = td2(fmt);
+        auto load_bf16_named = [&](const char* suffix, std::vector<float>& v, int n) -> bool {
+            TensorDesc* d = td_named(suffix);
             if (!d || n < 0) return false;
             const uint16_t* p = bf16_data(mw_, d, (size_t)n);
             if (!p) return false;
@@ -1890,34 +2010,32 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
             for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
             return true;
         };
-        if (!load_bf16_opt("model.layers.%d.moe_router.weight", moe_router_, n_expert_ * H))
-            { err_ = "moe router"; return false; }
-        if (!load_bf16_opt("model.layers.%d.moe_router.bias", moe_router_b_, n_expert_))
-            moe_router_b_.clear();
-        auto pool = [&](const char* fmt, const uint8_t** p, size_t* bytes) -> bool {
-            TensorDesc* d = td2(fmt);
+        if (!load_bf16_named(mn.router, moe_router_, n_expert_ * H)) { err_ = "moe router"; return false; }
+        if (!load_bf16_named(mn.router_b, moe_router_b_, n_expert_)) moe_router_b_.clear();
+        auto pool = [&](const char* suffix, const uint8_t** p, size_t* bytes) -> bool {
+            TensorDesc* d = td_named(suffix);
             if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
             if (!raw) return false;
             *p = raw; *bytes = (size_t)d->data_size / (size_t)n_expert_;
             return true;
         };
-        if (!pool("model.layers.%d.mlp.gate_exps_proj.weight", &exp_g_, &exp_g_bytes_)) return false;
-        if (!pool("model.layers.%d.mlp.up_exps_proj.weight", &exp_u_, &exp_u_bytes_)) return false;
-        if (!pool("model.layers.%d.mlp.down_exps_proj.weight", &exp_d_, &exp_d_bytes_)) return false;
+        if (!pool(mn.gate, &exp_g_, &exp_g_bytes_)) return false;
+        if (!pool(mn.up, &exp_u_, &exp_u_bytes_)) return false;
+        if (!pool(mn.down, &exp_d_, &exp_d_bytes_)) return false;
         // Optional shared expert (qwen35moe): a 2D [expert_im][H] / [H][expert_im] pair
         // plus its [H] gate.  Cleared when absent.
-        auto load_share = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
-            TensorDesc* d = td2(fmt);
+        auto load_share = [&](const char* suffix, std::vector<float>& v, int rows, int cols) -> bool {
+            TensorDesc* d = td_named(suffix);
             if (!d) return false;
             v.resize((size_t)rows * (size_t)cols);
             const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
             return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
         };
-        if (!load_share("model.layers.%d.mlp.share_gate_exps_proj.weight", share_g_, expert_im_, H)) share_g_.clear();
-        if (!load_share("model.layers.%d.mlp.share_up_exps_proj.weight", share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
-        if (!load_share("model.layers.%d.mlp.share_down_exps_proj.weight", share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
-        if (!load_bf16_opt("model.layers.%d.mlp.share_router.weight", share_router_, H)) share_router_.clear();
+        if (!load_share(mn.share_gate, share_g_, expert_im_, H)) share_g_.clear();
+        if (!load_share(mn.share_up, share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_share(mn.share_down, share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_bf16_named(mn.share_router, share_router_, H)) share_router_.clear();
         return true;
     }
     if (!ffn_tail_cached()) {
@@ -2364,11 +2482,23 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     const bool dump_gb = getenv("NPU_INFER_DUMP_LAYERS") != nullptr;
     const int rep = NVH / NKH;
     const float scale = 1.0f / sqrtf((float)KHD);
-    std::vector<float> co((size_t)CD), ah((size_t)NVH), bh((size_t)NVH);
-    std::vector<float> ql((size_t)NVH * KHD), kl((size_t)NVH * KHD), vv((size_t)NVH * VHD);
+    // ---- per-row preparation, then ONE parallel region for the whole layer ----
+    // The recurrence below used to sit inside the row loop, which opened one `#pragma omp parallel for` per
+    // (layer, row): 192 regions for an M=4 verify batch, 6144 for an M=128 prefill chunk.  A region is free when
+    // the box is idle and expensive when it is not -- measured on this box, the same recurrence went 2 ms/row
+    // idle to 252-301 ms/row with 8 background spinners, and region count alone (192 vs 48) was 16.8 vs 4.1
+    // ms/row at equal contention (bench: ~/briefs/mtploop-gdn-row-bench.cpp, arms A vs C, bit-identical).
+    // So the preparation stays row-major -- it carries conv_state_ and must stay in position order -- and the
+    // recurrence becomes head-major with the rows inside it, which preserves every element's per-row operation
+    // order.  NPU_GDN_CHECK=1 re-runs the old nesting through the same body and compares bit for bit.
+    std::vector<float> co((size_t)CD);
+    std::vector<float> AHS((size_t)M * NVH), BHS((size_t)M * NVH);
+    std::vector<float> QLS((size_t)M * NVH * KHD), KLS((size_t)M * NVH * KHD),
+        VVS((size_t)M * NVH * VHD);
+    std::vector<float> co_dump;   // NPU_INFER_DUMP_LAYERS only: keeps `co` per row for the [GB] line
+    if (dump_gb) co_dump.assign((size_t)M * CD, 0.0f);
     for (int m = 0; m < M; m++) {
         const float* qkv = QKV.data() + (size_t)m * CD;
-        const float* z = Z.data() + (size_t)m * VD;
         // depthwise causal conv1d (CK) + SiLU, state carried across positions
         float* st = conv_state_[l].data();
         for (int ch = 0; ch < CD; ch++) {
@@ -2392,110 +2522,159 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                 const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)hh * H;
                 float sa = 0, sb = 0;
                 for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
-                ah[(size_t)hh] = sa;
-                bh[(size_t)hh] = sb;
+                AHS[(size_t)m * NVH + hh] = sa;
+                BHS[(size_t)m * NVH + hh] = sb;
             }
         }
         if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l) {   // keep what a commit would need
             auto& rec = row_in_[(size_t)l][(size_t)m];
             rec.qkv.assign(qkv, qkv + CD);
-            rec.ah.assign(ah.begin(), ah.end());
-            rec.bh.assign(bh.begin(), bh.end());
+            rec.ah.assign(AHS.begin() + (size_t)m * NVH, AHS.begin() + (size_t)(m + 1) * NVH);
+            rec.bh.assign(BHS.begin() + (size_t)m * NVH, BHS.begin() + (size_t)(m + 1) * NVH);
         }
         // q/k L2-normalised with NVH/NKH head repetition; v per v-head
+        float* qlm = &QLS[(size_t)m * NVH * KHD];
+        float* klm = &KLS[(size_t)m * NVH * KHD];
+        float* vvm = &VVS[(size_t)m * NVH * VHD];
         for (int hh = 0; hh < NVH; hh++) {
             const int src = hh / rep;
-            for (int d = 0; d < KHD; d++) ql[(size_t)hh * KHD + d] = co[(size_t)src * KHD + d];
-            for (int d = 0; d < KHD; d++) kl[(size_t)hh * KHD + d] = co[KD + (size_t)src * KHD + d];
-            for (int d = 0; d < VHD; d++) vv[(size_t)hh * VHD + d] = co[2 * KD + (size_t)hh * VHD + d];
+            for (int d = 0; d < KHD; d++) qlm[(size_t)hh * KHD + d] = co[(size_t)src * KHD + d];
+            for (int d = 0; d < KHD; d++) klm[(size_t)hh * KHD + d] = co[KD + (size_t)src * KHD + d];
+            for (int d = 0; d < VHD; d++) vvm[(size_t)hh * VHD + d] = co[2 * KD + (size_t)hh * VHD + d];
         }
         for (int hh = 0; hh < NVH; hh++) {
             float sq = 0, sk = 0;
             for (int d = 0; d < KHD; d++) {
-                sq += ql[(size_t)hh * KHD + d] * ql[(size_t)hh * KHD + d];
-                sk += kl[(size_t)hh * KHD + d] * kl[(size_t)hh * KHD + d];
+                sq += qlm[(size_t)hh * KHD + d] * qlm[(size_t)hh * KHD + d];
+                sk += klm[(size_t)hh * KHD + d] * klm[(size_t)hh * KHD + d];
             }
             const float iq = 1.0f / sqrtf(sq + 1e-6f), ik = 1.0f / sqrtf(sk + 1e-6f);
             for (int d = 0; d < KHD; d++) {
-                ql[(size_t)hh * KHD + d] *= iq;
-                kl[(size_t)hh * KHD + d] *= ik;
+                qlm[(size_t)hh * KHD + d] *= iq;
+                klm[(size_t)hh * KHD + d] *= ik;
             }
         }
-        // recurrent gated delta rule + scale-free gated RMSNorm
-        // Heads are independent (disjoint rec_state_ rows, disjoint CORE rows), so this is the
-        // one loop in the GDN layer that parallelises: perf puts gdn_layer_batch at 76% of the
-        // host cycles and this state update at 2*KHD*VHD MACs per head.  kvm is per-head scratch.
-        float* rs = rec_state_[l].data();
-        // Never take the whole box.  The forward also needs a core for the array's submit thread and the serve
-        // needs one for HTTP, so 32 threads on 32 cores measured 25% SLOWER than 16 on a 149-token prefill and
-        // 24 was level with 16 (2026-11-04, same window, same binary).  OMP_NUM_THREADS still wins downward;
-        // this only stops the default from oversubscribing.
-        const int gdn_nt = omp_heads_threads();
-        {
+        if (dump_gb) std::copy(co.begin(), co.end(), co_dump.begin() + (size_t)m * CD);
+    }
+    // recurrent gated delta rule + scale-free gated RMSNorm.  One body for both nestings so that the check below
+    // compares the LOOPS and nothing else; the per-head operation order is identical in either nesting because
+    // rows are visited in order inside a head and heads own disjoint state rows and disjoint CORE slices.
+    auto head_row = [&](int hh, int m, float* sh, float* crow, float* sc) {
+        float* kvm = sc;
+        float* delta = kvm + VHD;
+        const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] *
+                              softplus_f(AHS[(size_t)m * NVH + hh] + gdn_small_[(size_t)l].dt[hh]));
+        const float beta = 1.0f / (1.0f + expf(-BHS[(size_t)m * NVH + hh]));
+        const float* kh = &KLS[((size_t)m * NVH + hh) * KHD];
+        const float* qh = &QLS[((size_t)m * NVH + hh) * KHD];
+        const float* vh = &VVS[((size_t)m * NVH + hh) * VHD];
+        const float* zv = Z.data() + (size_t)m * VD + (size_t)hh * VHD;
+#pragma omp simd
+        for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
+        // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
+        // gathering with stride VHD.  Each output element still accumulates over kd in increasing order, so
+        // the result is the same sequence of operations -- verified by the greedy text being byte-identical.
+        for (int vd = 0; vd < VHD; vd++) kvm[vd] = 0.0f;
+        for (int kd = 0; kd < KHD; kd++) {
+            const float k = kh[kd];
+            const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) kvm[vd] += srow[vd] * k;
+        }
+#pragma omp simd
+        for (int vd = 0; vd < VHD; vd++) delta[vd] = (vh[vd] - kvm[vd]) * beta;
+        for (int kd = 0; kd < KHD; kd++) {
+            const float k = kh[kd];
+            float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) srow[vd] += k * delta[vd];
+        }
+        float ss = 0;
+        for (int vd = 0; vd < VHD; vd++) crow[vd] = 0.0f;
+        for (int kd = 0; kd < KHD; kd++) {
+            const float q = qh[kd];
+            const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) crow[vd] += srow[vd] * q;
+        }
+        for (int vd = 0; vd < VHD; vd++) { crow[vd] *= scale; ss += crow[vd] * crow[vd]; }
+        const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
+        for (int vd = 0; vd < VHD; vd++) {
+            const float zz = zv[vd];
+            crow[vd] = crow[vd] * inv * gdn_small_[(size_t)l].norm[vd] * (zz / (1.0f + expf(-zz)));
+        }
+    };
+    // Never take the whole box.  The forward also needs a core for the array's submit thread and the serve
+    // needs one for HTTP, so 32 threads on 32 cores measured 25% SLOWER than 16 on a 149-token prefill and
+    // 24 was level with 16 (2026-11-04, same window, same binary).  OMP_NUM_THREADS still wins downward;
+    // this only stops the default from oversubscribing.
+    const int gdn_nt = omp_heads_threads();
+    float* rs = rec_state_[l].data();
+    const bool gdn_check = getenv("NPU_GDN_CHECK") != nullptr;
+    std::vector<float> core_ref;   // NPU_GDN_CHECK only
+    if (gdn_check) core_ref.assign(CORE.size(), 0.0f);
+    std::vector<float> state_pre;   // NPU_GDN_CHECK only: the state the old nesting must start from
+    if (gdn_check) state_pre = rec_state_[l];
+    {
         LhScope _t_core(LH_GDN_CORE);
-#pragma omp parallel for schedule(static) num_threads(gdn_nt)
-        for (int hh = 0; hh < NVH; hh++) {
-            // One scratch row for kvm and one for the delta, ONE allocation: this runs 48 heads x 48 layers x rows
-            // per token, and a per-head allocation inside a parallel region is the mistake that cost the mla
-            // attempt 2x on 2026-11-03.
+#pragma omp parallel num_threads(gdn_nt)
+        {
+            std::vector<float> scratch((size_t)2 * VHD);   // one allocation per thread, not per head
+            float* sc = scratch.data();
+#pragma omp for schedule(static)
+            for (int hh = 0; hh < NVH; hh++) {
+                float* sh = rs + (size_t)hh * KHD * VHD;
+                for (int m = 0; m < M; m++)   // rows in order: the state carries across them
+                    head_row(hh, m, sh, CORE.data() + (size_t)m * VD + (size_t)hh * VHD, sc);
+            }
+        }
+    }
+    if (gdn_check) {
+        // The old nesting, through the same body: one region per row.  Bit-exactness is the whole claim of this
+        // change, so it is asserted rather than argued -- the same form as NPU_REPLAY_CHECK in commit_verify_rows.
+        std::copy(state_pre.begin(), state_pre.end(), rec_state_[l].begin());
+#pragma omp parallel num_threads(gdn_nt)
+        {
             std::vector<float> scratch((size_t)2 * VHD);
-            float* kvm = scratch.data();
-            float* delta = kvm + VHD;
-            const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] * softplus_f(ah[(size_t)hh] + gdn_small_[(size_t)l].dt[hh]));
-            const float beta = 1.0f / (1.0f + expf(-bh[(size_t)hh]));
-            float* sh = rs + (size_t)hh * KHD * VHD;
-            const float* kh = &kl[(size_t)hh * KHD];
-            const float* qh = &ql[(size_t)hh * KHD];
-            const float* vh = &vv[(size_t)hh * VHD];
-#pragma omp simd
-            for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
-            // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
-            // gathering with stride VHD.  Each output element still accumulates over kd in increasing order, so
-            // the result is the same sequence of operations -- verified by the greedy text being byte-identical.
-            for (int vd = 0; vd < VHD; vd++) kvm[vd] = 0.0f;
-            for (int kd = 0; kd < KHD; kd++) {
-                const float k = kh[kd];
-                const float* srow = sh + (size_t)kd * VHD;
-#pragma omp simd
-                for (int vd = 0; vd < VHD; vd++) kvm[vd] += srow[vd] * k;
-            }
-#pragma omp simd
-            for (int vd = 0; vd < VHD; vd++) delta[vd] = (vh[vd] - kvm[vd]) * beta;
-            for (int kd = 0; kd < KHD; kd++) {
-                const float k = kh[kd];
-                float* srow = sh + (size_t)kd * VHD;
-#pragma omp simd
-                for (int vd = 0; vd < VHD; vd++) srow[vd] += k * delta[vd];
-            }
-            float ss = 0;
-            float* crow = CORE.data() + (size_t)m * VD + (size_t)hh * VHD;
-            for (int vd = 0; vd < VHD; vd++) crow[vd] = 0.0f;
-            for (int kd = 0; kd < KHD; kd++) {
-                const float q = qh[kd];
-                const float* srow = sh + (size_t)kd * VHD;
-#pragma omp simd
-                for (int vd = 0; vd < VHD; vd++) crow[vd] += srow[vd] * q;
-            }
-            for (int vd = 0; vd < VHD; vd++) { crow[vd] *= scale; ss += crow[vd] * crow[vd]; }
-            const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
-            for (int vd = 0; vd < VHD; vd++) {
-                const float zz = z[(size_t)hh * VHD + vd];
-                crow[vd] = crow[vd] * inv * gdn_small_[(size_t)l].norm[vd] * (zz / (1.0f + expf(-zz)));
+            float* sc = scratch.data();
+            for (int m = 0; m < M; m++) {
+#pragma omp for schedule(static)
+                for (int hh = 0; hh < NVH; hh++)
+                    head_row(hh, m, rs + (size_t)hh * KHD * VHD,
+                             core_ref.data() + (size_t)m * VD + (size_t)hh * VHD, sc);
             }
         }
+        int bad = 0;
+        double worst = 0.0;
+        for (size_t i = 0; i < CORE.size(); i++) {
+            const double d = std::fabs((double)CORE[i] - (double)core_ref[i]);
+            if (d > worst) worst = d;
+            if (CORE[i] != core_ref[i]) bad++;
         }
-        if (dump_gb && l == 0 && m < 2) {
+        fprintf(stderr, "[gdncheck] l=%d M=%d exchanged vs row-major: %d/%zu differ, max|d|=%.3e %s\n", l, M,
+                bad, CORE.size(), worst, bad ? "MISMATCH" : "identical");
+        // An invariant, not a report: NPU_GDN_CHECK exists so that a test (and a device run) can assert the loop
+        // exchange did not move a single element.  A mismatch must fail the call, not print a line nobody reads.
+        if (bad) {
+            err_ = "gdn check: the head-major nesting disagrees with row-major at layer " + std::to_string(l) +
+                   " (" + std::to_string(bad) + " of " + std::to_string(CORE.size()) + ", max|d|=" +
+                   std::to_string(worst) + ")";
+            return false;
+        }
+    }
+    if (dump_gb && l == 0) {
+        for (int m = 0; m < M && m < 2; m++) {
             auto d2 = [&](const char* nm, const float* v, int n) {
                 double sm = 0;
                 float mx = 0;
                 for (int i = 0; i < n; i++) { float a = fabsf(v[i]); sm += a; if (a > mx) mx = a; }
                 fprintf(stderr, "  [GB] m=%d %-5s %.6f %.4f\n", m, nm, sm / n, mx);
             };
-            d2("qkv", qkv, CD);
-            d2("co", co.data(), CD);
-            d2("z", z, VD);
-            d2("a", ah.data(), NVH);
-            d2("b", bh.data(), NVH);
+            d2("qkv", QKV.data() + (size_t)m * CD, CD);
+            d2("co", co_dump.data() + (size_t)m * CD, CD);
+            d2("z", Z.data() + (size_t)m * VD, VD);
+            d2("a", AHS.data() + (size_t)m * NVH, NVH);
+            d2("b", BHS.data() + (size_t)m * NVH, NVH);
             d2("core", CORE.data() + (size_t)m * VD, VD);
         }
     }
@@ -2718,9 +2897,9 @@ int32_t Q4nxNpuForward::m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float
 }
 
 // ---------------------------------------------------------------------------
-// Phase attribution (NPU_PHASE_PROF=1).  One line per decode step whose named
-// phases sum to that step's wall time.  Additive measurement only: nothing in
-// the compute path depends on it.
+// Phase attribution (NPU_PHASE_PROF=1).  One line per decode step ([ph]) and one
+// per batched pass ([bs]) whose named phases sum to that pass's wall time.
+// Additive measurement only: nothing in the compute path depends on it.
 // ---------------------------------------------------------------------------
 namespace {
 struct StepPhases {
@@ -2731,6 +2910,10 @@ struct StepPhases {
 };
 StepPhases g_ph;
 bool       g_in_head = false;
+// True for the whole batched body of step_batch(): a verify batch's M-row launches go through
+// prof_pre_ (M > 1), which the per-token accounting deliberately leaves alone, so this flag is what
+// routes their pack/launch/wait/readback split into the same g_ph the [ph] line reads.
+bool       g_in_batch = false;
 inline bool phprof_on() {
     static const bool on = getenv("NPU_PHASE_PROF") != nullptr;
     return on;
@@ -2739,15 +2922,132 @@ inline double ph_ms(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - t).count();
 }
+// Host-copy accounting (NPU_COPY_PROF=1).  The [ph]/[bs] lines say what the *device* did; these say what
+// the host moved into and out of its own vectors on the same pass, per site, in bytes and milliseconds.
+// That is the figure an audit of "what is left to remove" needs and a phase residual cannot give: the
+// sites are host-side row gathers whose cost is invisible inside gemm/wait/readback.  Additive
+// measurement only, exactly like the phases above: nothing in the compute path reads it, and with the
+// variable unset nothing is counted and nothing is printed.
+//
+// Single writer, like `g_ph` beside it, and that is a property of the callers rather than of these
+// globals: every serve-side entry into step()/step_batch() holds the engine's mutex
+// (app/forward_serve.cpp:258 and :698), so one pass is in flight per process, and `--npu-streams N`
+// is N processes sharing the device by flock (app/npu_device_lock.h), each with its own copy of this
+// struct -- not N threads.  A caller that ever parallelises the layer loop would make cp_count() and
+// the CpScope timings a data race and cp_reset() clear another pass's counts; the counters would
+// then have to become per-pass objects, as would `g_ph`.
+enum CopySite { CP_QKV, CP_GATE, CP_CTX, CP_N };
+const char* const kCopySiteName[CP_N] = {"qkv_split", "attn_gate", "ctx_row"};
+struct CopySites {
+    double b[CP_N]{};
+    double ms[CP_N]{};
+    long   n[CP_N]{};
+    int    rows = 0;      // rows a batched pass accounted, so bytes/row is read, not divided
+};
+CopySites g_cp;
+inline bool cpprof_on() {
+    static const bool on = getenv("NPU_COPY_PROF") != nullptr;
+    return on;
+}
+inline void cp_count(int site, size_t bytes) {
+    if (!cpprof_on()) return;
+    g_cp.b[site] += (double)bytes; g_cp.n[site]++;
+}
+inline void cp_reset() {
+    if (!cpprof_on()) return;
+    g_cp = CopySites{};
+}
+// Times one site's region; its bytes are counted with cp_count() inside the same scope, so the site's
+// ms and its bytes describe the same work.
+struct CpScope {
+    int  site;
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    explicit CpScope(int s)
+        : site(s), on(cpprof_on()),
+          t0(on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~CpScope() { if (on) g_cp.ms[site] += ph_ms(t0); }
+};
+void cp_print(const char* what) {
+    if (!cpprof_on()) return;
+    double tb = 0, tm = 0;
+    fprintf(stderr, "[cp] %s host copies:", what);
+    for (int i = 0; i < CP_N; i++) {
+        if (!g_cp.n[i]) continue;
+        fprintf(stderr, " %s=%.1fKiB/%ld/%.3fms", kCopySiteName[i], g_cp.b[i] / 1024.0, g_cp.n[i],
+                g_cp.ms[i]);
+        tb += g_cp.b[i]; tm += g_cp.ms[i];
+    }
+    fprintf(stderr, " total=%.1fKiB %.3fms", tb / 1024.0, tm);
+    if (g_cp.rows > 1) fprintf(stderr, " (%.1fKiB/row)", tb / 1024.0 / (double)g_cp.rows);
+    fprintf(stderr, "\n");
+}
+struct BatchPhaseScope {   // g_in_batch for the batched body, cleared on every return path
+    bool prev;
+    explicit BatchPhaseScope(bool on) : prev(g_in_batch) { if (on) g_in_batch = true; }
+    ~BatchPhaseScope() { g_in_batch = prev; }
+};
+// Ranked layer-loop host call sites: what the `host=` residual is made of.
+// Nested rows (of-which) are inside their parent; the TOP-LEVEL SUM is the
+// one the residual is compared against.
+// host part of npu_gemm = whole call minus the four device phases it times;
+// host part of gdn_layer = the scope minus the gemm launches it contains.
+// Shared by step() (unit "token") and step_batch() (unit "batch") so both residuals are read alike.
+void lh_dump_layer_host(const char* what, const char* unit) {
+    const double gs = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
+    const double gemm_all  = g_lh[LH_GEMM] + g_lh[LH_GEMM_GDN];
+    const double gemm_host = gemm_all - gs;
+    const double gdn_host  = g_lh[LH_GDN] - g_lh[LH_GEMM_GDN];
+    const double top = g_lh[LH_LOAD] + g_lh[LH_ASM] + g_lh[LH_ATTN] + g_lh[LH_RMS] +
+                       g_lh[LH_RES] + g_lh[LH_MLP] + gdn_host + gemm_host;
+    fprintf(stderr, "[lh] %s layer-loop host call sites, ms/%s (ranked):\n", what, unit);
+    bool done[LH_LAYER_N] = {false};
+    for (int r = 0; r < LH_LAYER_N; r++) {
+        int best = -1;
+        for (int i = 0; i < LH_LAYER_N; i++) {
+            if (done[i] || g_lh[i] <= 0.0) continue;
+            if (best < 0 || g_lh[i] > g_lh[best]) best = i;
+        }
+        if (best < 0) break;
+        done[best] = true;
+        const double n = g_lh_n[best] ? (double)g_lh_n[best] : 1.0;
+        fprintf(stderr, "[lh]   %-26s %8.2f ms  n=%4ld  %7.3f ms/call  %5.1f%%\n",
+                lh_name(best), g_lh[best], g_lh_n[best], g_lh[best] / n,
+                100.0 * g_lh[best] / (g_ph.layer > 0 ? g_ph.layer : 1.0));
+    }
+    // Deliberately not static: these are read from g_lh at call time.  A `static` array is initialised
+    // once, so the table froze on its first call and every later line reprinted that first pass's numbers
+    // (seen in ticket-batchprof-p0-before-20261104-142823.log: load_layer 8587.41 ms on every token while
+    // the live ACCOUNTED row moved 654 -> 690 ms).
+    const struct TlpRow { const char* n; double v; } tlp[] = {
+        {"load_layer",                g_lh[LH_LOAD]},
+        {"assemble_B",                g_lh[LH_ASM]},
+        {"gemm host (amax+deq)",      gemm_host},
+        {"gdn_layer (non-gemm)",      gdn_host},
+        {"mlp (act*up)",              g_lh[LH_MLP]},
+        {"rmsnorm",                   g_lh[LH_RMS]},
+        {"attention",                 g_lh[LH_ATTN]},
+        {"residual adds",             g_lh[LH_RES]},
+    };
+    fprintf(stderr, "[lh] TOP-LEVEL PARTITION (no double counting; npu_gemm %.2f "
+                    "- phases %.2f = %.2f host):\n", gemm_all, gs, gemm_host);
+    for (const TlpRow& r : tlp)
+        fprintf(stderr, "[lh]   %-26s %8.2f ms  %5.1f%% of gemm-free host\n", r.n, r.v,
+                100.0 * r.v / (g_ph.layer - gs > 0 ? g_ph.layer - gs : 1.0));
+    fprintf(stderr, "[lh]   %-26s %8.2f ms\n", "ACCOUNTED", top);
+    fprintf(stderr, "[lh]   %-26s %8.2f ms   (layers=%.2f gemm_phases=%.2f)\n",
+            "UNATTRIBUTED", g_ph.layer - gs - top, g_ph.layer, gs);
+}
 }  // namespace
 
 void Q4nxNpuForward::prof_add(ProfAcc* acc, int design, double pack, double quant,
                               double wait, double rb) {
-    if (phprof_on() && acc == prof_dec_ && !g_in_head) {
+    if (phprof_on() && !g_in_head && (g_in_batch || acc == prof_dec_)) {
         g_ph.g_pack += pack; g_ph.g_ql += quant;
         g_ph.g_wait += wait; g_ph.g_rb += rb;
         g_ph.launches++;
     }
+    if (!prof_) return;   // the per-role table belongs to NPU_PROFILE; NPU_PHASE_PROF has its own lines
     if (design < 0 || design >= Q4NX_MAX_DESIGNS) return;
     ProfAcc& a = acc[design];
     a.pack += pack; a.quant += quant; a.wait += wait; a.rb += rb;
@@ -2755,6 +3055,9 @@ void Q4nxNpuForward::prof_add(ProfAcc* acc, int design, double pack, double quan
 }
 
 void Q4nxNpuForward::prof_dump() {
+    // Reached with NPU_PHASE_PROF alone too, because the launch timers are shared: there is no per-role
+    // table to print in that case, and its [ph]/[bs] lines already carry the split.
+    if (!prof_) return;
     fprintf(stderr, "[prof] ---- per-role launch cost (ms, window since last dump) ----\n");
     fprintf(stderr, "[prof] %-5s %-5s %2s %8s %7s %9s %7s %9s %9s\n", "phase", "role",
             "M", "launches", "pack", "quant+lnch", "wait", "readback", "ms/launch");
@@ -3503,7 +3806,27 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
     }
 
+    // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
+    // batch term's interior is read per phase instead of inferred from the loop's total.
+    //
+    // The counters are zeroed BEFORE BatchPhases snapshots them.  BatchPhases reports this call's cost as a
+    // delta against the values it saw at construction, so zeroing afterwards (the first version of this, #1056)
+    // made every [bl] field a difference against the *previous* pass: `core -4.3` and `gemm -355.7` on a real
+    // ticket (2026-11-05 01:31) are what that looks like.  The [bs] line never had the problem -- it reads the
+    // g_ph it zeroes itself -- so the conclusions drawn from [bs] stand; the [bl] medians between #1056 and this
+    // fix do not, and are re-taken.
+    const bool phb = phprof_on();
+    if (phb) {
+        g_ph = StepPhases{};
+        for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
+    }
+    cp_reset();
+    if (cpprof_on()) g_cp.rows = M;
     BatchPhases bph;  // measurement only (NPU_PHASE_PROF=1); prints this call's own delta at the end
+    const auto tp_bs = phb ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto tp_lap = tp_bs;
+    BatchPhaseScope _batch_scope(phb);
     const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
     const int i_o   = idx_of(Q4NX_DESIGN_O);
     const int i_gu  = idx_of(Q4NX_DESIGN_GU);
@@ -3521,8 +3844,9 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     for (int m = 0; m < M; m++)
         for (int k = 0; k < H; k++)
             X[(size_t)m * H + k] = embed_at(tokens[m], k) * embed_scale_;
+    if (phb) { g_ph.embed = ph_ms(tp_bs); tp_lap = std::chrono::steady_clock::now(); }
 
-    std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row, act_row, hh;
+    std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
         cur_layer_ = l;
         const bool cached = weight_cached(0);
@@ -3584,6 +3908,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 // Each of the four GEMMs wrote M rows of *its* design's N (padded, engine#854), so the
                 // reads go through the design's stride -- the same class as O/D/gate-up below.
                 const size_t sq = (size_t)gq->N, skv = (size_t)gk->N;
+                CpScope _cp(CP_QKV);
                 for (int m = 0; m < M; m++) {
                     float* d = QKV.data() + (size_t)m * n_on;
                     memcpy(d, qh0.data() + (size_t)m * sq, (size_t)nhd * sizeof(float));
@@ -3592,6 +3917,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                     memcpy(d + 2 * nhd + nkv, kvv.data() + (size_t)m * skv,
                            (size_t)nkv * sizeof(float));
                 }
+                cp_count(CP_QKV, (size_t)M * n_on * sizeof(float));
             } else {
                 npu_gemm_rows(*ctx_[i_qkv_l], XN.data(), M, g->K, g->N, B_.data(), QKV, 0, "attn_qkv",
                               g->real_k);
@@ -3632,8 +3958,12 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             // positions to read (0 = up to and including `pos`, i.e. causal), and `dst` receives the
             // context -- null when the pass only fills the cache (the noncausal first pass below).
             auto row_attn = [&](int m, float* dst, bool append, int kvlen) -> bool {
-                qkv_row.assign(QKV.begin() + (size_t)m * g->N,
-                               QKV.begin() + (size_t)(m + 1) * g->N);
+                {
+                    CpScope _cp(CP_QKV);
+                    qkv_row.assign(QKV.begin() + (size_t)m * g->N,
+                                   QKV.begin() + (size_t)(m + 1) * g->N);
+                    cp_count(CP_QKV, (size_t)g->N * sizeof(float));
+                }
                 // attn_output_gate: the fused QKV is [q | gate | k | v], so attention()
                 // must not see the gate half; the gate multiplies the context after.
                 const float* gate_ptr = nullptr;
@@ -3641,9 +3971,13 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 if (attn_gate_) {
                     const int kvsz = g->k_rows + g->v_rows;
                     qkv_use.assign((size_t)nhd + (size_t)kvsz, 0.0f);
-                    memcpy(qkv_use.data(), qkv_row.data(), (size_t)nhd * sizeof(float));
-                    memcpy(qkv_use.data() + nhd, qkv_row.data() + 2 * nhd,
-                           (size_t)kvsz * sizeof(float));
+                    {
+                        CpScope _cp(CP_GATE);
+                        memcpy(qkv_use.data(), qkv_row.data(), (size_t)nhd * sizeof(float));
+                        memcpy(qkv_use.data() + nhd, qkv_row.data() + 2 * nhd,
+                               (size_t)kvsz * sizeof(float));
+                        cp_count(CP_GATE, ((size_t)nhd + (size_t)kvsz) * sizeof(float));
+                    }
                     gate_ptr = qkv_row.data() + nhd;
                     in = &qkv_use;
                 }
@@ -3656,7 +3990,11 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 if (gate_ptr)
                     for (int i = 0; i < nhd; i++)
                         ctx_row[(size_t)i] *= 1.0f / (1.0f + expf(-gate_ptr[i]));
-                memcpy(dst, ctx_row.data(), (size_t)ctx_w * sizeof(float));
+                {
+                    CpScope _cp(CP_CTX);
+                    memcpy(dst, ctx_row.data(), (size_t)ctx_w * sizeof(float));
+                    cp_count(CP_CTX, (size_t)ctx_w * sizeof(float));
+                }
                 return true;
             };
             // A noncausal pack: every full-attention layer reads the whole prompt, so the cache has to
@@ -3706,7 +4044,10 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             for (int m = 0; m < M; m++) {
                 xn_row.assign(XN.begin() + (size_t)m * H,
                               XN.begin() + (size_t)(m + 1) * H);
-                if (!moe_mlp(l, xn_row, d_row)) { err_ = "moe failed"; return false; }
+                // Keep moe_mlp's own reason ("expert gate", "assemble expert down", "MoE designs
+                // missing", ...): the bare "moe failed" this used to leave cost a whole ticket when
+                // the expert tensors' convention was wrong (engine#1035).
+                if (!moe_mlp(l, xn_row, d_row)) { err_ = "moe failed: " + err_; return false; }
                 for (int k = 0; k < H; k++)
                     X[(size_t)m * H + k] += d_row[(size_t)k] * residual_scale_;
             }
@@ -3759,13 +4100,13 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         HH.assign((size_t)M * (size_t)im, 0.0f);
         {
             // act_w is the stride both branches above leave ACT at; only the first 2*im columns of a
-            // row are real (the rest is the kernel's zero column pad).
-            for (int m = 0; m < M; m++) {
-                act_row.assign(ACT.begin() + (size_t)m * act_w,
-                               ACT.begin() + (size_t)m * act_w + (size_t)2 * im);
-                if (!mlp(act_row, hh, im)) { err_ = "mlp failed"; return false; }
-                memcpy(HH.data() + (size_t)m * im, hh.data(), (size_t)im * sizeof(float));
-            }
+            // row are real (the rest is the kernel's zero column pad), so the elementwise gate*up reads
+            // that row in place and writes HH's row in place: no staging copy on either side.  The two
+            // copies this replaces were 12.75 MiB of a 15.38 MiB row (NPU_COPY_PROF=1, 2026-11-05).
+            for (int m = 0; m < M; m++)
+                if (!mlp(ACT.data() + (size_t)m * act_w, HH.data() + (size_t)m * im, im)) {
+                    err_ = "mlp failed"; return false;
+                }
         }
         {
             const Q4nxDesignGeom* g = &designs_[i_d];
@@ -3801,6 +4142,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         }
     }
 
+    if (phb) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
     // The next-token logits come from the last row of the batch, after the final
     // norm -- step() applies final_norm_ before run_lm_head, and feeding the raw
     // residual here produced garbage logits (the M=1 self-check caught it).
@@ -3852,6 +4194,29 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                      M, start_pos, c_.NL, (int)two_widths);
     }
     bph.print(M);
+    {
+        char cp_what[48];
+        snprintf(cp_what, sizeof cp_what, "batch M=%d start=%d", M, start_pos);
+        cp_print(cp_what);
+    }
+    if (phb) {
+        // epilogue = final norm + the head rows; head= is run_lm_head_rows' own timer, so
+        // epilogue - head is the per-row final norm.  tail must be ~0: it is what the partition misses.
+        const double total = ph_ms(tp_bs);
+        const double epi = ph_ms(tp_lap);
+        const double gsum = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
+        const double hsum = g_ph.h_memcpy + g_ph.h_pack + g_ph.h_ql + g_ph.h_wait + g_ph.h_rb;
+        fprintf(stderr,
+                "[bs] M=%2d start=%4d wall=%7.1f | embed=%5.1f | layers=%7.1f (gemm pack=%6.1f "
+                "ql=%6.2f wait=%7.1f rb=%6.1f sum=%7.1f host=%7.1f n=%ld) | epilogue=%6.1f "
+                "(head=%6.1f sum=%6.1f host=%5.1f) | tail=%5.1f\n",
+                M, start_pos, total, g_ph.embed, g_ph.layer, g_ph.g_pack, g_ph.g_ql, g_ph.g_wait,
+                g_ph.g_rb, gsum, g_ph.layer - gsum, g_ph.launches, epi, g_ph.h_total, hsum,
+                g_ph.h_total - hsum, total - g_ph.embed - g_ph.layer - epi);
+        char what[48];
+        snprintf(what, sizeof what, "batch M=%d start=%d", M, start_pos);
+        lh_dump_layer_host(what, "batch");
+    }
     return ok;
 }
 
@@ -3918,13 +4283,18 @@ bool Q4nxNpuForward::mla_expert(const uint8_t* pool, size_t per_expert, int e,
     // and then copied it -- an extra (K*N) allocation plus a full copy per expert,
     // ~960 experts/token.
     out.resize((size_t)N * (size_t)K);
-    // Do NOT transpose.  The tile decode at (rows=K, cols=N) already reproduces the
-    // GGUF's flat order, and that flat sequence IS the logical [N][K] = [out][in]
-    // weight.  Verified elementwise against the GGUF per expert: reshape(N,K) gives
-    // corr 0.999198 (gate) / 0.996949 (down), while transposing gives -0.001079 /
-    // 0.000417 -- i.e. the transpose destroyed the expert entirely, making every
-    // routed expert's contribution ~10-20x wrong and flipping the top-k selection.
-    if (dequant_any(pool + (size_t)e * per_expert, per_expert, K, N, out.data()) != 0)
+    // Do NOT transpose: both conventions decode straight into the [N][K] weight, but the tile GRID
+    // differs with who wrote the container (moe_container.h, engine#1035).  The engine converter
+    // writes a plain [N][K] grid over each expert; the FLM-style containers this path was written
+    // for transpose each expert, so their slice decodes at (rows=K, cols=N) and that flat order IS
+    // the logical [N][K] = [out][in] weight (verified elementwise against the GGUF per expert:
+    // reshape(N,K) corr 0.999198 gate / 0.996949 down, transposing -0.001079 / 0.000417).
+    // Reading the wrong grid is a silent permutation, not a rounding difference: on a converted
+    // Qwen3-Coder-30B expert 0 the converter slice correlates 0.99999 with the GGUF on [N][K] and
+    // 0.00855 on [K][N].
+    int rows = K, cols = N;
+    moe_slice_geometry(moe_format_, N, K, &rows, &cols);
+    if (dequant_any(pool + (size_t)e * per_expert, per_expert, rows, cols, out.data()) != 0)
         return false;
     return true;
 }
@@ -4075,7 +4445,17 @@ bool Q4nxNpuForward::mla_rope(std::vector<float>& q, int NH, int qh, int nope,
 bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<float>& d) {
     const int H = c_.H;
     const int i_g = idx_of(Q4NX_DESIGN_G), i_u = idx_of(Q4NX_DESIGN_U), i_d = idx_of(Q4NX_DESIGN_D);
-    if (i_g < 0 || i_u < 0 || i_d < 0) { err_ = "MoE designs missing"; return false; }
+    // The FFN needs D, and gate/up either split (G, U) or batched (GB, UB: one GEMM over the top-k
+    // experts).  A fused-GU plan is the common case on a converted MoE container and has neither G
+    // nor U, only GB/UB, so requiring G/U unconditionally refused a model whose kernels were all
+    // there (engine#1035: "MoE designs missing" on a 6-design load).
+    const int i_gb = idx_of(Q4NX_DESIGN_GB), i_ub = idx_of(Q4NX_DESIGN_UB);
+    const bool expert_batched = i_gb >= 0 && i_ub >= 0 && !getenv("NPU_NO_EXPERT_BATCH");
+    if (i_d < 0 || (!expert_batched && (i_g < 0 || i_u < 0))) {
+        err_ = expert_batched ? std::string("MoE designs missing (D)")
+                              : std::string("MoE designs missing (need D, and G+U or the batched GB/UB)");
+        return false;
+    }
     d.assign(H, 0.0f);
 
     // Router.  llama.cpp: probs = sigmoid(logits) UNBIASED; selection_probs =
@@ -4133,8 +4513,7 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
     }
     std::vector<float> g, u, dd, go, uo;
     double moe_g = 0, moe_u = 0, moe_sw = 0, moe_dn = 0;
-    const int i_gb = idx_of(Q4NX_DESIGN_GB), i_ub = idx_of(Q4NX_DESIGN_UB);
-    if (i_gb >= 0 && i_ub >= 0 && !getenv("NPU_NO_EXPERT_BATCH")) {
+    if (expert_batched) {
         // One gate GEMM and one up GEMM over ALL selected experts (they share xn),
         // instead of 2*top_k dispatches.  Expert j's weights occupy columns
         // [j*IM, (j+1)*IM) of a [K][top_k*IM] B; the design's N is wider, so
@@ -4368,6 +4747,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
                     if (mul && mul[0] == '1') inv *= (double)rope_scale_[i];
                     else                       inv /= (double)rope_scale_[i];
                 }
+                // llama3 (Llama-3.1/3.2/3.3): the wavelength-band rule, on the FREQUENCY, so it costs
+                // nothing per token.  No-op unless the config declares rope_type "llama3".
+                inv = q4nx_rope_llama3_inv_freq(inv, &rope_llama3_);
             }
             const double ang = (double)pos * inv;
             cos_[i] = (float)std::cos(ang);
@@ -4402,31 +4784,40 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
     const int t0 = (window > 0 && T > window)
                        ? T - window : 0;
     ctx.assign((size_t)NH * HD, 0.0f);
-    std::vector<float> score(T);
-    for (int h = 0; h < NH; h++) {
-        const int kh = h / gqa;
-        const float* qh = &q[(size_t)h * HD];
-        float mx = -1e30f;
-        for (int t = 0; t < T; t++) {
-            if (t < t0) { score[t] = -1e30f; continue; }
-            const float* kt = &kcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-            float d = 0.0f;
-            for (int i = 0; i < HD; i++) d += qh[i] * kt[i];
-            score[t] = d * scale;
-            if (score[t] > mx) mx = score[t];
-        }
-        float sum = 0.0f;
-        for (int t = 0; t < T; t++) {
-            if (t < t0) { score[t] = 0.0f; continue; }
-            score[t] = std::exp(score[t] - mx);
-            sum += score[t];
-        }
-        const float inv = sum > 0 ? 1.0f / sum : 0.0f;
-        float* out = &ctx[(size_t)h * HD];
-        for (int t = t0; t < T; t++) {
-            const float p = score[t] * inv;
-            const float* vt = &vcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-            for (int i = 0; i < HD; i++) out[i] += p * vt[i];
+    // Heads are the unit the cores split here, and they are independent by construction: a head writes
+    // only its own ctx rows and reads its own q plus the read-only KV cache.  The score buffer is
+    // therefore per thread, and the ordering of nothing else changes.  The `if` keeps short contexts
+    // serial -- one team per layer per token is not worth it for a handful of cached positions -- and
+    // `omp_heads_threads()` is this file's existing convention (it leaves a core for the array-submit
+    // thread and the serve's HTTP thread).
+    const int nt = omp_heads_threads();
+#pragma omp parallel num_threads(nt) if (nt > 1 && NH > 1 && (long)T * HD >= 8192)
+    {
+        std::vector<float> score(T);
+#pragma omp for schedule(static)
+        for (int h = 0; h < NH; h++) {
+            const int kh = h / gqa;
+            const float* qh = &q[(size_t)h * HD];
+            float mx = -1e30f;
+            for (int t = 0; t < T; t++) {
+                if (t < t0) { score[t] = -1e30f; continue; }
+                const float* kt = &kcache_[kv_layer][((size_t)t * NKV + kh) * HD];
+                score[t] = q4nx_attn::dot(qh, kt, HD) * scale;
+                if (score[t] > mx) mx = score[t];
+            }
+            float sum = 0.0f;
+            for (int t = 0; t < T; t++) {
+                if (t < t0) { score[t] = 0.0f; continue; }
+                score[t] = std::exp(score[t] - mx);
+                sum += score[t];
+            }
+            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
+            float* out = &ctx[(size_t)h * HD];
+            for (int t = t0; t < T; t++) {
+                const float p = score[t] * inv;
+                const float* vt = &vcache_[kv_layer][((size_t)t * NKV + kh) * HD];
+                q4nx_attn::saxpy(p, vt, out, HD);
+            }
         }
     }
     return true;
@@ -4434,8 +4825,12 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
 
 // SiLU(gate) * up from either a fused GU result or separate G and U results.
 bool Q4nxNpuForward::mlp(const std::vector<float>& gu, std::vector<float>& h, int im) {
-    LhScope _tlh(LH_MLP);
     h.resize(im);
+    return mlp(gu.data(), h.data(), im);
+}
+
+bool Q4nxNpuForward::mlp(const float* gu, float* h, int im) {
+    LhScope _tlh(LH_MLP);
     const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
     for (int i = 0; i < im; i++) {
         const float g = gu[i];
@@ -4478,6 +4873,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         g_ph = StepPhases{};
         for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
     }
+    cp_reset();
     const int H = c_.H;
     if (token < 0 || token >= c_.NV) { err_ = "token out of range"; return false; }
 
@@ -4648,10 +5044,14 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                     return false;
                 }
                 qkv.assign((size_t)2 * nhd + (size_t)2 * nkv, 0.0f);
-                memcpy(qkv.data(), qh0.data(), (size_t)nhd * sizeof(float));
-                memcpy(qkv.data() + nhd, qh1.data(), (size_t)nhd * sizeof(float));
-                memcpy(qkv.data() + 2 * nhd, kvk.data(), (size_t)nkv * sizeof(float));
-                memcpy(qkv.data() + 2 * nhd + nkv, kvv.data(), (size_t)nkv * sizeof(float));
+                {
+                    CpScope _cp(CP_QKV);
+                    memcpy(qkv.data(), qh0.data(), (size_t)nhd * sizeof(float));
+                    memcpy(qkv.data() + nhd, qh1.data(), (size_t)nhd * sizeof(float));
+                    memcpy(qkv.data() + 2 * nhd, kvk.data(), (size_t)nkv * sizeof(float));
+                    memcpy(qkv.data() + 2 * nhd + nkv, kvv.data(), (size_t)nkv * sizeof(float));
+                    cp_count(CP_QKV, ((size_t)2 * nhd + (size_t)2 * nkv) * sizeof(float));
+                }
             } else {
                 npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv, 0, "attn_qkv",
                          g->real_k);
@@ -4664,12 +5064,18 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             if (attn_gate_) {
                 const int kvsz = g->k_rows + g->v_rows;
                 qkv_use.resize((size_t)nhd + (size_t)kvsz);
-                memcpy(qkv_use.data(), qkv.data(), (size_t)nhd * sizeof(float));
-                memcpy(qkv_use.data() + nhd, qkv.data() + 2 * nhd,
-                       (size_t)kvsz * sizeof(float));
+                {
+                    CpScope _cp(CP_GATE);
+                    memcpy(qkv_use.data(), qkv.data(), (size_t)nhd * sizeof(float));
+                    memcpy(qkv_use.data() + nhd, qkv.data() + 2 * nhd,
+                           (size_t)kvsz * sizeof(float));
+                    cp_count(CP_GATE, ((size_t)nhd + (size_t)kvsz) * sizeof(float));
+                }
                 gate_ptr = qkv.data() + nhd;
             } else {
+                CpScope _cp(CP_GATE);
                 qkv_use = qkv;
+                cp_count(CP_GATE, qkv.size() * sizeof(float));
             }
             {
             LhScope _tlh(LH_ATTN);
@@ -4903,50 +5309,16 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         // delta between two lines, and the bytes are exact (bo::sync is a clflush loop over its range).
         if (getenv("NPU_C_SYNC_PROF")) I8Ctx::c_sync_print(token);
         if (getenv("NPU_A_SYNC_PROF")) I8Ctx::a_sync_print(token);
-        // Ranked layer-loop host call sites: what the `host=` residual is made of.
-        // Nested rows (of-which) are inside their parent; the TOP-LEVEL SUM is the
-        // one the residual is compared against.
-        // host part of npu_gemm = whole call minus the four device phases it times;
-        // host part of gdn_layer = the scope minus the gemm launches it contains.
-        const double gs = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
-        const double gemm_all  = g_lh[LH_GEMM] + g_lh[LH_GEMM_GDN];
-        const double gemm_host = gemm_all - gs;
-        const double gdn_host  = g_lh[LH_GDN] - g_lh[LH_GEMM_GDN];
-        const double top = g_lh[LH_LOAD] + g_lh[LH_ASM] + g_lh[LH_ATTN] + g_lh[LH_RMS] +
-                           g_lh[LH_RES] + g_lh[LH_MLP] + gdn_host + gemm_host;
-        fprintf(stderr, "[lh] tok %d layer-loop host call sites, ms/token (ranked):\n", token);
-        bool done[LH_LAYER_N] = {false};
-        for (int r = 0; r < LH_LAYER_N; r++) {
-            int best = -1;
-            for (int i = 0; i < LH_LAYER_N; i++) {
-                if (done[i] || g_lh[i] <= 0.0) continue;
-                if (best < 0 || g_lh[i] > g_lh[best]) best = i;
-            }
-            if (best < 0) break;
-            done[best] = true;
-            const double n = g_lh_n[best] ? (double)g_lh_n[best] : 1.0;
-            fprintf(stderr, "[lh]   %-26s %8.2f ms  n=%4ld  %7.3f ms/call  %5.1f%%\n",
-                    lh_name(best), g_lh[best], g_lh_n[best], g_lh[best] / n,
-                    100.0 * g_lh[best] / (g_ph.layer > 0 ? g_ph.layer : 1.0));
-        }
-        static const struct TlpRow { const char* n; double v; } tlp[] = {
-            {"load_layer",                g_lh[LH_LOAD]},
-            {"assemble_B",                g_lh[LH_ASM]},
-            {"gemm host (amax+deq)",      gemm_host},
-            {"gdn_layer (non-gemm)",      gdn_host},
-            {"mlp (act*up)",              g_lh[LH_MLP]},
-            {"rmsnorm",                   g_lh[LH_RMS]},
-            {"attention",                 g_lh[LH_ATTN]},
-            {"residual adds",             g_lh[LH_RES]},
-        };
-        fprintf(stderr, "[lh] TOP-LEVEL PARTITION (no double counting; npu_gemm %.2f "
-                        "- phases %.2f = %.2f host):\n", gemm_all, gs, gemm_host);
-        for (const TlpRow& r : tlp)
-            fprintf(stderr, "[lh]   %-26s %8.2f ms  %5.1f%% of gemm-free host\n", r.n, r.v,
-                    100.0 * r.v / (g_ph.layer - gs > 0 ? g_ph.layer - gs : 1.0));
-        fprintf(stderr, "[lh]   %-26s %8.2f ms\n", "ACCOUNTED", top);
-        fprintf(stderr, "[lh]   %-26s %8.2f ms   (layers=%.2f gemm_phases=%.2f)\n",
-                "UNATTRIBUTED", g_ph.layer - gs - top, g_ph.layer, gs);
+        char lhwhat[48];
+        snprintf(lhwhat, sizeof lhwhat, "tok %d", token);
+        lh_dump_layer_host(lhwhat, "token");
+    }
+    // Independent of NPU_PHASE_PROF: the copy accounting answers a different question and must be readable
+    // with only NPU_COPY_PROF set.
+    {
+        char cp_what[48];
+        snprintf(cp_what, sizeof cp_what, "tok %d pos %d", token, pos);
+        cp_print(cp_what);
     }
     return true;
 }

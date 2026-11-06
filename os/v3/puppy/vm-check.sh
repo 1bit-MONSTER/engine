@@ -37,10 +37,28 @@
 # the NPU through Lemonade, the installer writing an entry for a second disk, boot time and idle RAM) are
 # printed as SKIP with the reason.
 #
+# --verdict-selftest runs only the row-verdict arms (no image, no VM) and exits 0 when they hold.
+#
 # exit 0 = every row that can run here passed, 1 = a row failed, 2 = the VM never came up.
 set -uo pipefail
 prog=$(basename "$0")
+dir=$(cd "$(dirname "$0")" && pwd)
+# Cycle 26 (#1111): the verdict rule itself is tested before anything boots. The bug this exists for is a row that
+# reported PASS without running - a skip marker (`console-heals-skip-no-tui`) containing the row's own want string - so
+# the arms below are exactly the ones that would have caught it, and they cost no VM. `--verdict-selftest` alone runs
+# only these and exits, which is what a CI job should call.
+if [ "${1:-}" = --verdict-selftest ]; then
+    python3 "$dir/vm_check_verdict.py" || exit 1
+    exit 0
+fi
 [ $# -ge 2 ] || { sed -n "/^# $prog/,/^# exit 0/p" "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+if python3 "$dir/vm_check_verdict.py" > /dev/null 2>&1; then
+    echo "PASS U0 verdict    the row-verdict rule holds: a *-skip-* marker is SKIP, not PASS"
+else
+    python3 "$dir/vm_check_verdict.py" 2>&1 | sed 's/^/     /'
+    echo "FAIL U0 verdict    the row-verdict rule is broken - fix vm_check_verdict.py before trusting this run"
+    exit 2
+fi
 iso=$(cd "$(dirname "$1")" 2>/dev/null && pwd)/$(basename "$1")
 work=$2
 secs=${3:-600}
@@ -132,8 +150,19 @@ vm_gone() { echo "the VM was no longer running when this row ran (qemu budget ${
     qemu-system-x86_64 -m 4096 -smp 4 "${boot[@]}" -display none -vga std -no-reboot \
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
 
+VMCHECK_DIR=$(cd "$(dirname "$0")" && pwd) export VMCHECK_DIR
 ARTIFACT=$iso python3 - "$work" "$iso" > "$work/rows.txt" 2>&1 <<'PY'
 import socket, sys, time, os, re, subprocess, shutil
+# The row verdict lives in vm_check_verdict.py so this driver and `--verdict-selftest` cannot disagree about what a skip
+# is; #1111 is the bug that came from having it here alone (a `*-skip-*` marker contains the row's own want string).
+sys.path.insert(0, os.environ["VMCHECK_DIR"])
+import vm_check_verdict as V
+# The shipping driver's srcversion for the MEDIUM this harness is checking. Cycle 26 carries 0011v2: 0008+0009+0011+0011v2,
+# built WITHOUT the 0010 debugfs hook (srcversion EE1F36A2B9BA294CE11AD80, verified: no `tdr_test` string). This box also
+# holds the 0010 hook build for testing, and the two are indistinguishable by vermagic, signer or filename - only
+# srcversion separates them, so the medium has to answer for the build it is meant to carry.
+# Another cycle's medium: AMDXDNA_SRCVERSION=<its value> vm-check.sh <img> <work>.
+WANT_SV = os.environ.get("AMDXDNA_SRCVERSION", "EE1F36A2B9BA294CE11AD80")
 work = sys.argv[1]
 artifact = sys.argv[2]
 log = open(os.path.join(work, "serial.log"), "ab", buffering=0)
@@ -344,10 +373,14 @@ rows = [
     # Cycle 14, item 2: who owns tty1. `U2 tty1` reads what a person sees; this says which process put it
     # there, because the board run had a prompt in QEMU and none on the hardware and only this line names the
     # difference. 1bit-console is the appliance's own entry (inittab), plogin is what it replaced.
-    ("U2 tty1 owner", "for p in /proc/[0-9]*; do t=$(readlink \"$p/fd/0\" 2>/dev/null); "
-                     "case \"$t\" in /dev/tty1) echo \"tty1-owner: $(tr -d '\\000' < $p/cmdline | tr '\\000' ' ')\";; esac; done | head -2; "
-                     "pgrep -af 'getty|plogin|1bit-console' | head -3; "
-                     "grep -c '^tty1::respawn:/usr/local/bin/1bit-console$' /etc/inittab", None),
+    ("U2 tty1 owner", "own=$(for p in /proc/[0-9]*; do t=$(readlink \"$p/fd/0\" 2>/dev/null); "
+                     "case \"$t\" in /dev/tty1) tr -d '\\000' < $p/cmdline | tr '\\000' ' '; echo ;; esac; done | head -4); "
+                     "printf 'tty1-owners: %s\\n' \"$(printf '%s' \"$own\" | tr '\\n' '|')\"; "
+                     "pgrep -af 'getty|plogin' | head -3; "
+                     "i=$(grep -c '^tty1::respawn:/usr/local/bin/1bit-console$' /etc/inittab); echo \"inittab-console=$i\"; "
+                     "printf '%s' \"$own\" | grep -q '1bit-console' && ! printf '%s' \"$own\" | grep -qE 'getty|plogin' "
+                     "&& [ \"$i\" -eq 1 ] && echo console-owns-tty1",
+                     "console-owns-tty1"),
     # Cycle 14, item 5: release-check SKIPped `fans` on the board ("no /usr/sbin/1bit-board in this image").
     # The tool is os/mini/board.sh, installed as the path that row reads. On a machine whose EC it does not
     # know it must write nothing and say so - which is what this QEMU boot is.
@@ -373,6 +406,29 @@ rows = [
                      "rootsh=$(awk -F: '{if ($1 == \"root\") print $7}' /etc/passwd); echo root=$rootsh; "
                      "[ \"$rootsh\" = /bin/bash ] && echo login-shell-bash", "login-shell-bash"),
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
+    # Cycle 28 (@pi-tui, the class #1168 shipped for eight hours): every shell script the image ships must parse under
+    # BOTH parsers it meets in the field. `1bit-console-menu` is `#!/bin/sh`, so the appliance runs it with busybox ash,
+    # which reads an apostrophe inside a double-quoted ${...} as literal text. bash reads the same bytes as an opening
+    # quote and refuses the file - `${d:-this machine's disk}` gave `line 680: syntax error near unexpected token '('`,
+    # 620 lines below the cause - and nothing in the image runs those scripts through bash, so no other row could see it.
+    # The two parsers are the real ones: /etc/init.d runs under busybox sh at boot, while a person on the console gets
+    # bash, the gate rows run in bash, and dash is what a Debian-family host reads them with (== sh's behaviour here).
+    # Non-shell files (the two python helpers) are skipped by their own shebang rather than by a list that would rot.
+    # Red/green in one boot, ~/wt/tui-vm/rowproof-shellparse.sh: GREEN on the image (45 scripts), RED with the smallest
+    # instance of the class staged in /usr/local/bin (names the file and both parsers), RED again with the REAL pre-fix
+    # 1bit-console-menu from #1168 at 90c89f9 (`unparsable: /usr/local/bin/1bit-console-menu:bash`, ash alone is happy),
+    # and GREEN after restoring it.
+    # (`shells-skip-no-scripts` is assembled from `m`/`sk` for the U4 selftest row's reason: written whole it matches
+    # `skipping()` through the ECHO of this command, and this row was measured coming back SKIP with n=0 that way.)
+    ("U1 shipped shells", "m=shells; sk=skip; n=0; bad=''; for f in /usr/local/bin/1bit-* /etc/init.d/*; do "
+                     "[ -f \"$f\" ] || continue; "
+                     "case \"$(sed -n 1p \"$f\")\" in '#!'*sh) ;; *) continue ;; esac; "
+                     "n=$((n+1)); "
+                     "bash -n \"$f\" 2>/dev/null || bad=\"$bad $f:bash\"; "
+                     "sh -n \"$f\" 2>/dev/null || bad=\"$bad $f:sh\"; done; "
+                     "if [ \"$n\" -eq 0 ]; then echo $m-$sk-no-scripts; "
+                     "elif [ -n \"$bad\" ]; then echo \"unparsable:$bad\"; "
+                     "else echo \"shells-parse: $n scripts under bash and sh\"; fi", "shells-parse:"),
     # U2 headless (owner, cycle 12 item 7): the default entry boots with no X, and tty1 is a login prompt.
     # Puppy's own chain does the second half - /etc/inittab has tty1::respawn:plogin and plogin execs
     # `getty -n -l /bin/autologin ... tty1` - so the row asserts the getty, which is what a person sees.
@@ -417,6 +473,29 @@ rows = [
                      "if 1bit-tty1 1 | grep -q 'Show the API key' && 1bit-tty1 1 | grep -q 'Reboot / power off'; then "
                      "echo tty1-menu; elif 1bit-tty1 1 | grep -q 'root@'; then echo tty1-bare-shell; "
                      "else echo tty1-nothing; fi", "tty1-menu"),
+    # Cycle 26, item 1 (owner: "CONSOLE GARBLED ... painting over the TUI panels and the menu"): the row that would have
+    # caught it, and the one that keeps it caught. The console TUI repaints only the cells whose CONTENT changed since its
+    # own last frame, so before #1093 ONE line written to tty1 was a wrong screen for ever - measured on the shipped
+    # 2fc6909c…: two stray lines still on screen 4.3 s later AND after a keypress sent through the keyboard. The appliance
+    # keeps writers on this screen by design (`1bit-release-check` announces an NPU hold, `puppy-check.sh` does the same),
+    # so the answer is not "nobody may write" but "a stray line costs one second". This row writes two of them into the
+    # console the TUI owns, waits out one repaint, and asks for the same landmarks U2 menu asks for. On an image whose
+    # console is the dialog menu (no `1bit-console-tui`) it SKIPs: `dialog` repaints on input by nature, so the question does
+    # not apply there. Red/green proved in ~/wt/tui-vm/rowproof-console-heals.sh (one boot, both binaries): RED on
+    # 2fc6909c… ("console-garbled actions=9 stray=2"), GREEN on the merged artifact.
+    # (both skip markers are assembled from `m`/`sk` for the reason the U4 selftest row above spells out: written whole,
+    # they match `skipping()` through the ECHO of this very command, and the row becomes a SKIP on every run.)
+    ("U2 console heals", "m=console-heals; sk=skip; "
+                     "if ! pgrep -f 1bit-console-tui > /dev/null 2>&1; then echo $m-$sk-no-tui; "
+                     "elif [ ! -w /dev/tty1 ]; then echo $m-$sk-no-tty1; "
+                     "else printf '%s\\n' \"[  999.000000] amdxdna 0000:c6:00.1: [drm] *ERROR* stray line one\" "
+                     "\"[  999.100000] amdxdna 0000:c6:00.1: [drm] *ERROR* stray line two\" > /dev/tty1 2>/dev/null; "
+                     "sleep 2; scr=$(1bit-tty1 1 2>/dev/null); "
+                     "n=$(printf '%s\\n' \"$scr\" | grep -cE '^ ?[1-9] [A-Z]'); stray=$(printf '%s\\n' \"$scr\" | grep -c 'stray line'); "
+                     "echo \"actions=$n stray=$stray\"; "
+                     "if [ \"$n\" -ge 9 ] && [ \"$stray\" -eq 0 ] && printf '%s\\n' \"$scr\" | grep -q 'Reboot / power off' "
+                     "&& printf '%s\\n' \"$scr\" | grep -q 'Show the API key'; then echo console-heals; "
+                     "else echo console-garbled; fi; fi", "console-heals"),
     # every line the owner asked for, by name and present rather than at column 0 (two of them share a line);
     # `Secure` matches "Secure Boot", and the four-letter words are unambiguous in this block
     ("U2 menu status", "1bit-console-menu --status 2>&1 | head -10; "
@@ -481,6 +560,53 @@ rows = [
                      "printf '%s' \"$s\" | grep -qE 'web UI http://[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:13305' && "
                      "echo menu-connect-block",
                      "menu-connect-block"),
+    # #1041 (engine 0c862e64): the console names the engine that is serving. It must not be asserted off LIVE facts:
+    # measured on this box, `--status` with nothing loaded prints no engine line at all (the fact is `None` until a
+    # model is loaded), so a row that ran `--status` and grepped `engine:` would be red on a healthy appliance and
+    # nobody could act on it. The row renders the shipped binary's own frame with its own fixture instead: it proves
+    # the IMAGE carries a console that can name the engine, and it goes red on any pre-#1041 TUI - measured against
+    # the c24 image's own `/usr/local/bin/1bit-console-tui` (5261cf56...), whose frame carries no engine line, while
+    # 4b369c10... prints `engine: llamacpp (gpu)` here. The second half of #1041 is visible next to it: no invented
+    # `http://-:` on a box that has no address yet.
+    ("U2 console engine", "1bit-console-tui --snapshot 80x25 --fixture 2>&1 | grep -o 'engine: [a-z]* ([a-z]*)' | head -1; "
+                     "1bit-console-tui --status > /tmp/ct.txt 2>&1; echo status-rc=$?; "
+                     "echo invented-urls=$(grep -c 'http://-:' /tmp/ct.txt)",
+                     "engine: llamacpp (gpu)"),
+    # Cycle 26 item 1, first half: NOTHING else may write to tty1 while the console owns it. The boot line carries no
+    # `loglevel=`, so console_loglevel is 7 and every kernel message printed onto tty0 - which IS the screen. The c25
+    # take proves the cost: 15 err + 5 warn lines (the 08:52:09Z NPU TDR and its ~18 `*ERROR* aie2_set_cmd_timeout:`
+    # firmware-report lines) landed on top of the TUI. 1bit-console sets `dmesg -n 1` before the TUI starts; the ring
+    # (32 MB) and /data/logs/dmesg.log are untouched, so the evidence is still there - only the screen is quiet.
+    ("U2 console quiet", "awk '{print \"console-loglevel=\" $1; exit}' /proc/sys/kernel/printk; "
+                     "pgrep -f '1bit-console-tui' > /dev/null && echo tui-running; "
+                     "dmesg | wc -l | sed 's/^/kernel-lines=/'", "console-loglevel=1"),
+    # Cycle 26 item 1, second half: the LOGS pane is the screen a person reads, so the 553 polling lines the pages
+    # produce (measured on the c25 take) must not be what is on it. Seeded with the same shape the demo produces, so
+    # the row measures the pane's rule rather than whether this boot happened to be polled.
+    ("U2 log pane", "for i in 1 2 3 4 5; do echo \"2026-11-05 00:00:0$i.000 [Debug] (Server) GET /api/v1/models\" "
+                     ">> /var/log/lemond-onebit.log; done; "
+                     "echo '2026-11-05 00:00:09.000 [Debug] (Server) POST /api/v1/chat/completions' "
+                     ">> /var/log/lemond-onebit.log; "
+                     "1bit-console-tui --snapshot 100x37 > /tmp/pane.txt 2>&1; "
+                     "echo hidden=$(grep -c 'debug lines hidden' /tmp/pane.txt) "
+                     "raw=$(grep -c 'GET /api/v1/models' /tmp/pane.txt) "
+                     "chat=$(grep -c 'POST /api/v1/chat' /tmp/pane.txt); "
+                     "grep -q 'debug lines hidden' /tmp/pane.txt && "
+                     "! grep -q 'GET /api/v1/models' /tmp/pane.txt && "
+                     "grep -q 'POST /api/v1/chat' /tmp/pane.txt && echo pane-filtered",
+                     "pane-filtered"),
+    # Cycle 26 item 1's *board* row, in the form a machine can check: the brief asks for "a tty1 screenshot that shows the
+    # TUI intact after 5 min of polling + 10 chats". /dev/vcs1 is that screenshot's text (the active VT is tty1), so the
+    # same two assertions work here and on the board over ssh: the TUI is drawn on the screen, and no page poll has been
+    # painted onto it. The static PANELS word is the layout; a poll line can only be there if something drew it.
+    ("U2 console screen", "sleep 20; tr -d '\\000' < /dev/vcs1 > /tmp/scr.txt 2>/dev/null; "
+                     "echo screen-chars=$(wc -c < /tmp/scr.txt) "
+                     "panels=$(grep -c 'FANS / TEMPS' /tmp/scr.txt) "
+                     "polls=$(grep -c 'GET /api/v1/models' /tmp/scr.txt) "
+                     "hidden=$(grep -c 'debug lines hidden' /tmp/scr.txt); "
+                     "grep -q 'FANS / TEMPS' /tmp/scr.txt && "
+                     "! grep -q 'GET /api/v1/models' /tmp/scr.txt && echo screen-unpainted",
+                     "screen-unpainted"),
     # The mechanism behind U3-lan and U7 (cycle 15's finding, and the row the c16 refactor folded away): inbound
     # connections from the LAN pass only if the appliance opened the ports AFTER Puppy's rc.firewall (which ends
     # in `-P INPUT DROP`) and let the RFC1918 ranges through tcpwrappers. Printing all three - the rules, the
@@ -554,7 +680,9 @@ rows = [
     ("U1 apt-any",   "for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x dpkg > /dev/null || break; sleep 3; done; "
                      "apt install -y --no-install-recommends cowsay 2>&1 | tail -3; "
                      "command -v cowsay && echo apt-install-works", "apt-install-works", 600),
-    ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
+    ("U3 service",   "n=$(ps | grep -c '[l]emond'); l=$(netstat -lntp 2>/dev/null | grep -c 13305); "
+                     "echo \"lemond-procs=$n listening=$l\"; [ \"$n\" -ge 1 ] && [ \"$l\" -ge 1 ] && echo service-up",
+                     "service-up"),
     ("U3 key",       "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
                      "if [ -n \"$k\" ]; then echo \"auth-mode=keyed (${#k} hex chars)\"; "
                      "else echo 'auth-mode=blank (no LEMONADE_API_KEY line)'; fi",
@@ -576,6 +704,12 @@ rows = [
     ("U3 catalogue", "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
                      "curl -s ${k:+-H \"Authorization: Bearer $k\"} http://127.0.0.1:13305/api/v1/models "
                      "| grep -o onebit | wc -l", None),
+    # Cycle 26: the image shipped no models directory in lemond's config, so anything staged in /data/models was invisible
+    # even though the files were on the medium (measured on the shipping payload: 213 catalogue rows without the key, 214
+    # with it, the extra one `source: extra_models_dir`). This asks the booted appliance the two things that make that true.
+    ("U3 models dir", "p=$(sed -n 's/.*\"extra_models_dir\": *\"\\([^\"]*\\)\".*/\\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1); "
+                     "echo \"path=${p:-<unset>}\"; "
+                     "[ -n \"$p\" ] && [ -d \"$p\" ] && echo models-dir-seeded", "models-dir-seeded"),
     ("U3 api local", "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
                      "curl -s -o /dev/null -w 'http=%{http_code}' ${k:+-H \"Authorization: Bearer $k\"} "
                      "http://127.0.0.1:13305/api/v1/models", "http=200"),
@@ -613,6 +747,25 @@ rows = [
                      "| tr '\\n' ' '; echo; "
                      "grep '^RESULT' /tmp/release-check.log; "
                      "grep -c '^PASS ' /tmp/release-check.log", "RESULT: PASS", 900),
+    # Cycle 29 (#1166): the appliance now SHIPS `1bit-selftest`, the one-command proof the install sheet asks for - and
+    # no row ran it, so a shipped-but-dead tool would have reached the board as a line in a document. This row does not
+    # require PASS: the image boots with an EMPTY /data/models, so the tool's own documented answer here is
+    # `RESULT: FAIL - no model to test`, and demanding PASS would red for correct behaviour. What it requires is that the
+    # tool RUNS TO A VERDICT: PASS when a model is staged, SKIP naming the no-model reason when none is, and red when the
+    # binary is absent or dies without a RESULT line - which is the failure this row exists for. Red/green proved on two
+    # real artifacts, not on a fixture: c28's image (no such file) reds with `selftest-broken-missing`, c29's skips with
+    # `selftest-skip-no-model` on its blank models dir.
+    # The skip marker is assembled from two variables, never written whole, and that is not style: Puppy's shell echoes
+    # the typed command into the row's own output, and `skipping()` matches a `*-skip-*` token ANYWHERE in the body - so a
+    # literal marker in the command makes every run of the row a SKIP whatever it answered. Measured on this row's first
+    # version, which printed `selftest-broken-missing` and still came back SKIP: the echo of its own command was the
+    # marker. `$m-$sk-no-model` echoes without a contiguous `-skip-` and prints as `selftest-skip-no-model`.
+    ("U4 selftest", "m=selftest; sk=skip; if [ ! -x /usr/local/bin/1bit-selftest ]; then echo $m-broken-missing; else "
+                    "/usr/local/bin/1bit-selftest > /tmp/st.log 2>&1; grep -E '^RESULT' /tmp/st.log | tail -2; "
+                    "v=$(sed -n 's/^RESULT: PASS.*/PASS/p;s/^RESULT: FAIL.*/FAIL/p' /tmp/st.log | head -1); "
+                    "if [ \"$v\" = PASS ]; then echo $m-ok; "
+                    "elif grep -q 'no model to test' /tmp/st.log; then echo $m-$sk-no-model; "
+                    "else echo $m-broken-no-verdict; fi; fi", "selftest-ok", 300),
     # Item 10 (owner 2026-11-04): the appliance announces itself as 1bit-os.local, so http://1bit-os.local:13305 is a
     # link a phone can click. Two halves are asserted HERE: a responder is up, and the name resolves on the box.
     # Whether a PEER on the LAN sees it needs multicast from outside the guest, which a QEMU user-mode network does
@@ -637,6 +790,13 @@ rows = [
     # would silently load the in-tree driver.
     ("U4 our driver", "modinfo -n amdxdna; modinfo -F srcversion amdxdna; modinfo -n ec_su_axb35",
                       "/updates/amdxdna.ko"),
+    # Cycle 26: `path` and `signed` cannot tell our two builds apart - the shipping 0011v2 and the 0010 debugfs-hook build
+    # share vermagic, signer and filename, and only srcversion differs (measured: EE1F36A2... vs 349FDC99... on the test
+    # box). So the medium has to answer for the build it is supposed to carry, the way pi-release's `u5-amdxdna-oot` row
+    # does; a hook build passing this gate is exactly the defect this row exists for. Any other cycle's medium passes its
+    # own value in: AMDXDNA_SRCVERSION=<sv> vm-check.sh ...
+    ("U4 driver build", f"sv=$(modinfo -F srcversion amdxdna 2> /dev/null); echo srcversion=$sv want={WANT_SV}; "
+                      f"[ \"$sv\" = \"{WANT_SV}\" ] && echo driver-is-the-cycle-build", "driver-is-the-cycle-build"),
     # And the module has to be the one THIS kernel can load and this appliance trusts: vermagic must name the image's
     # release and the signer must be our MOK. Both are asserted in one token, because one substring per row is all the
     # harness compares - printing them and matching the path, as this row did before pi-prs' verdict, passed a module
@@ -658,10 +818,15 @@ rows = [
                      "ls -l /root/.ssh/authorized_keys | awk '{print $3\"/\"$4\"/\"$1}'; "
                      "/usr/sbin/sshd -t 2>&1 | head -2; echo key-owner-done", None),
     # the in-VM half of the fix, so it is measured before a rebuild: tcpwrappers is what closes the kex
+    # Cycle 30: the repair writes the SHIPPED rule (addresses only) rather than appending a second allow line
+    # behind Puppy's `ALL: LOCAL` - and it prints how many lines still carry a name test, which is **0** on a fixed
+    # image and **2** on c29's (the stock `ALL: LOCAL` rule and the LAN rule that repeats `LOCAL`; each one costs a
+    # reverse+forward lookup per connection, which is where the take's 780 auth.err lines came from).
     ("U7 hosts",     "grep -v '^#' /etc/hosts.deny | grep . ; grep -v '^#' /etc/hosts.allow | grep . ; "
                      "grep -q '1bit-lan' /etc/hosts.allow || "
-                     "printf 'ALL: LOCAL, 10.0.0.0/255.0.0.0, 172.16.0.0/255.240.0.0, 192.168.0.0/255.255.0.0  "
-                     "# 1bit-lan\\n' >> /etc/hosts.allow; "
+                     "printf 'ALL: 127.0.0.1, 10.0.0.0/255.0.0.0, 172.16.0.0/255.240.0.0, "
+                     "192.168.0.0/255.255.0.0  # 1bit-lan\\n' > /etc/hosts.allow; "
+                     "echo name-rules=$(grep -c LOCAL /etc/hosts.allow); "
                      "grep -c '1bit-lan' /etc/hosts.allow", None),
     ("U7 listen",    "netstat -lntp 2>/dev/null | grep ':22 ' | head -2; "
                      "grep -iE '^(PermitRootLogin|DenyUsers|AllowUsers|Port|PasswordAuthentication)' "
@@ -681,8 +846,30 @@ rows = [
     ("U4 engine sha", "sha256sum /opt/1bit-package/1bit/1bit | cut -c1-32", None),
     # the two paths pi-release asked for, asserted on a booted image rather than in a listing
     ("U4 hrx path",   "ls -l /opt/1bit-llama/llama-server 2>&1 | tail -1; "
-                      "/opt/1bit-llama/llama-server --version 2>&1 | head -2", None),
-    ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels", None),
+                     "t=$(readlink -f /opt/1bit-llama/llama-server 2>/dev/null); echo \"resolves-to=${t:-nothing}\"; "
+                     "/opt/1bit-llama/llama-server --version 2>&1 | head -2; "
+                     "[ -x /opt/1bit-llama/llama-server ] "
+                     "&& printf '%s' \"$t\" | grep -q '^/opt/1bit-package/1bit/hrx/llama/bin/llama-server$' "
+                     "&& echo hrx-server-linked",
+                     "hrx-server-linked"),
+    # Cycle 26, item 5: the path row above passes for a payload whose HRX backend cannot load, because the binary and its
+    # siblings live in one directory (`bin/` is BOTH the executable dir and the library dir, RUNPATH=$ORIGIN) and only the
+    # loader knows whether they are all there. Measured on the payload as a bug of the opposite kind - every NEEDED library
+    # resolves beside the binary (ldd: 0 `not found`, libggml-hrx.so.0 among them). A payload that loses one of them, or
+    # ships a binary whose RUNPATH points at a build machine (this one carries /work-c22/hrx-toolchain paths too), fails at
+    # the first HRX request with `invalid device: HRX0` - which is how the c25 take's downloaded backend failed, and the
+    # reason the recipe must use this binary rather than one it downloads.
+    ("U4 hrx libs",   "b=/opt/1bit-package/1bit/hrx/llama/bin/llama-server; "
+                     "n=$(ldd \"$b\" 2>/dev/null | grep -c 'not found'); echo not-found=$n; "
+                     "ldd \"$b\" 2>/dev/null | grep -c 'libggml-hrx' | sed 's/^/ggml-hrx-lines=/'; "
+                     "[ -x \"$b\" ] && [ \"$n\" = 0 ] && echo hrx-backend-loadable",
+                     "hrx-backend-loadable"),
+    ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels 2>/dev/null; "
+                     "n=$(ls -1d /opt/1bit-package/1bit/npu/kernels/*/ 2>/dev/null | wc -l); "
+                     "s=$(ls -1 /opt/1bit-package/1bit/npu/kernels/*/manifest.sig 2>/dev/null | wc -l); "
+                     "echo \"sets=$n signed-manifests=$s\"; "
+                     "[ \"$n\" -ge 1 ] && [ \"$s\" -eq \"$n\" ] && echo npu-sets-sealed",
+                     "npu-sets-sealed"),
     # Cycle 23 (c22 board, 4 Nov): a chat that crosses ~512 positions wedged the NPU, and the fix is the hang
     # detector's timeout in /etc/modprobe.d/amdxdna.conf. The build asserts the FILE; this row asserts kmod's own
     # resolved view of it (`modprobe -c`), which is what the kernel will apply.
@@ -691,7 +878,12 @@ rows = [
     # the kernel, /var/lib/shim-signed/mok/MOK-Kernel.pem, SKI 27:68:3E:38:…) while the modules are signed by a
     # DIFFERENT certificate with the same CN (sig_key 35:5C:A4:8A:…). The board trusts it - it loads this module - so
     # the runtime reading belongs there: /sys/module/amdxdna/parameters/tdr_timeout_ms must be 15000 on the board.
-    ("U5 npu tdr",    "o=$(modprobe -c 2>/dev/null | grep -c 'amdxdna.*tdr_timeout_ms=15000'); "
+    # Measured and worth not misreading: in this VM `modprobe amdxdna` answers "Key was rejected by service", because
+    # sb-vars.sh enrols our certificate in the firmware's **db**, and it is a CA:FALSE code-signing leaf (Key Usage:
+    # Digital Signature, EKU: Code Signing). On the board the same certificate is in **MokList** (shim's import path) and the
+    # module loads - this box runs Secure Boot with amdxdna loaded. So the rejection is a property of how this harness
+    # enrols the key, not of the shipped driver, and the row asserts the watchdog CONFIG for that reason rather than a load.
+("U5 npu tdr",    "o=$(modprobe -c 2>/dev/null | grep -c 'amdxdna.*tdr_timeout_ms=15000'); "
                       "c=$(grep -h 'tdr_timeout_ms=15000' /etc/modprobe.d/*.conf 2>/dev/null | grep -c amdxdna); "
                       "echo kmod-view=$o conf-file=$c; modprobe amdxdna 2>&1 | head -1; "
                       "echo runtime=$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms 2>/dev/null || echo not-loaded); "
@@ -702,7 +894,9 @@ rows = [
     # the durable assertion is the RULE, not the policy: whether rc.firewall has finished at the moment a
     # row runs is a race, but an ACCEPT for tcp/13305 is what makes U3 reachable either way.
     ("U3 port rule", "iptables -C INPUT -p tcp --dport 13305 -j ACCEPT && echo port-13305-open; "
-                     "iptables -C INPUT -p tcp --dport 22 -j ACCEPT && echo port-22-open", None),
+                     "iptables -C INPUT -p tcp --dport 22 -j ACCEPT && echo port-22-open; "
+                     "iptables -C INPUT -p tcp --dport 13305 -j ACCEPT && echo port-rule-present",
+                     "port-rule-present"),
     # Cycle 23 (c22 board, 4 Nov): avahi logged "1bit-os.local is announced" and a raw mDNS query from ryzen got no
     # answer at all. The cause is in the same rc.firewall the two rows above work around: every NEW inbound UDP
     # packet goes to `udp_inbound`, which accepts only DHCP and RETURNs to the DROP policy, and a query on 5353 is
@@ -714,6 +908,35 @@ rows = [
                      "udp-5353-open"),
     # cycle 24: the outbound half, a row of its own rather than a second substring in the row above (one row matches
     # ONE substring, so a second token there would print and never be compared - the #989 lesson).
+    # Cycle 25 (owner: "log verbose it all for proof"): four rows, one per claim that could otherwise be a sentence.
+    # (1) the kernel ring cannot wrap: c23's did, and 1bit-logs could only mark the loss.
+    ("boot ring",    "tr ' ' '\\n' < /proc/cmdline | grep '^log_buf_len='; "
+                     "grep -q 'log_buf_len=32M' /proc/cmdline && echo ring-sized",
+                     "ring-sized"),
+    # (2) the boot's identity is one file, written once, and it carries every label a reviewer needs. Reading the
+    # labels IS the check: a file that exists but says nothing is what a stub would produce.
+    ("U5 boot proof", "p=$(1bit-proof path 2>/dev/null)/boot-proof.txt; ls -l \"$p\" 2>&1 | tail -1; "
+                     "miss=\"\"; for k in cmdline uname secureboot.efivar module.amdxdna amdxdna.tdr_timeout_ms firmware pci.devices memtotal_kb timeline.dmesg sha256sums; do "
+                     "grep -q \"^$k  \" \"$p\" 2>/dev/null || miss=\"$miss $k\"; done; "
+                     "n=$(wc -l < \"$p\" 2>/dev/null); echo \"proof-lines=${n:-0} missing=${miss:-none}\"; "
+                     "[ -z \"$miss\" ] && [ \"${n:-0}\" -ge 20 ] && echo boot-proof-complete",
+                     "boot-proof-complete"),
+    # (3) thermals are sampled ONLY while something is serving - so the two files must agree, and an idle box must
+    # not be writing a power log all day. Both directions are failures the row names.
+    ("U5 thermal gate", "eng=$(pgrep -f '/opt/1bit-package/1bit/1bit' 2>/dev/null | wc -l); "
+                     "d=$(1bit-logs dir 2>/dev/null); n=$(wc -l < \"$d/thermal.log\" 2>/dev/null || echo 0); "
+                     "echo \"engine-children=$eng thermal-lines=$n\"; "
+                     "if [ \"$eng\" -gt 0 ]; then [ \"$n\" -gt 0 ] && echo thermal-gate-consistent; "
+                     "else [ \"$n\" -eq 0 ] && echo thermal-gate-consistent; fi",
+                     "thermal-gate-consistent"),
+    # (4) the artifact a release is attached to: the bundle exists, names this boot, and lists the boot proof inside
+    # it. tar -tf through zstd is the only proof that the archive is readable rather than merely present.
+    ("U5 proof bundle", "o=$(1bit-proof 2>&1); printf '%s\\n' \"$o\" | tail -3; "
+                     "f=$(printf '%s\\n' \"$o\" | head -1); ls -l \"$f\" 2>/dev/null | awk '{print \"bytes=\" $5}'; "
+                     "zstd -dc \"$f\" 2>/dev/null | tar -tf - 2>/dev/null | grep -c 'boot-proof.txt' | "
+                     "sed 's/^/boot-proof-in-bundle=/'; "
+                     "zstd -dc \"$f\" 2>/dev/null | tar -tf - 2>/dev/null | grep -q 'boot-proof.txt' && echo proof-bundle-ok",
+                     "proof-bundle-ok"),
     ("U3 mdns out",  "iptables -S OUTPUT | grep -E -- '-p udp.*--dport 5353.*-j ACCEPT' | head -2; "
                      "iptables -C OUTPUT -p udp --dport 5353 -d 224.0.0.251 -j ACCEPT 2>/dev/null && echo udp-5353-out",
                      "udp-5353-out"),
@@ -764,13 +987,8 @@ for idx, row in enumerate(rows):
     if cmd[:24] in body:
         body = body[body.rindex(cmd[:24]):]
     body = "\n".join(l.strip() for l in body.splitlines() if l.strip() and cmd[:24] not in l)
-    flat = body.replace("\n", " | ")
-    if want is None:
-        print("INFO %-13s %s" % (name, flat), flush=True)
-    elif want in body:
-        print("PASS %-13s %s" % (name, flat), flush=True)
-    else:
-        print("FAIL %-13s %s" % (name, flat), flush=True)
+    level, flat = V.verdict(name, want, body)
+    print("%-4s %-13s %s" % (level, name, flat), flush=True)
 PY
 driver_rc=$?
 cat "$work/rows.txt"

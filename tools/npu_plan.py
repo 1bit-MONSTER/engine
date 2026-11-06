@@ -177,7 +177,54 @@ def decode_dirs(model_dir: str, kernels: str) -> list[dict]:
     return dirs
 
 
+def tile_order_claim(model_dir: str) -> tuple[str, str]:
+    """(the tile_order this plan may declare, a note to print) from the directory's repack stamp.
+
+    The plan's `container.tile_order` is the only thing standing between a container whose tiles are
+    another order and a clean 200 with noise in it (engine#1110): `npu/plan/plan.h` refuses any value
+    but "engine-1".  So the value is a measurement, not a constant -- `scripts/repack_gguf.py` holds
+    both the source GGUF and the tiles and writes what it measured into `repack-stamp.txt`, including
+    on the path where it refuses the directory (measured: a refused dir planned anyway declared
+    "engine-1" and the loader accepted it).
+
+    No stamp is not evidence of anything: those directories predate the field, so they keep the
+    previous default silently rather than turning every plan run into a warning.
+    """
+    stamp = os.path.join(model_dir, "repack-stamp.txt")
+    if not os.path.isfile(stamp):
+        return "engine-1", ""
+    fields = {}
+    with open(stamp, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            k, sep, v = line.partition("=")
+            if sep:
+                fields[k.strip()] = v.strip()
+    order = fields.get("tile_order", "")
+    checked = fields.get("tile_check", "")
+    if not order:
+        # A stamp written before this field existed records provenance and says NOTHING about the tiles, so
+        # it is no evidence rather than evidence against: both repack-cache directories on this box
+        # (~/.cache/1bit/q4nx/Qwen3-0.6B-Q4_K_M and ZR1-1.5B-Q4_K_M) carry exactly that stamp, and treating
+        # it as a measurement would be this check breaking two working directories.
+        return "engine-1", ""
+    if order == "engine-1":
+        return "engine-1", f"tile order measured at repack: {checked}" if checked else ""
+    if order == "unverified":
+        return "engine-1", (f"tile order NOT measured ({checked or 'no reason recorded'}): the plan declares "
+                            f"engine-1 because that is the only order this loader accepts, not because anything "
+                            f"checked these tiles")
+    raise SystemExit(f"{stamp}: tile_order={order!r} -- the repack measured these tiles as NOT the engine-1 "
+                     f"order this engine decodes ({checked or 'no verdict line recorded'}), so this plan may not "
+                     f"declare engine-1.  Re-convert with a converter that writes the engine-1 order "
+                     f"(engine#1110; `scripts/repack_gguf.py --tile-check <dir> <model.gguf>` re-measures).")
+
+
 def generate(model_dir: str, kernels: str) -> dict:
+    # A measurement that contradicts the only order this loader decodes is refused before anything is
+    # derived from the directory (engine#1110): no plan for tiles the repack already rejected.
+    tile_order, tile_note = tile_order_claim(model_dir)
+    if tile_note:
+        print(f"{model_dir}: {tile_note}", file=sys.stderr)
     cfg = read_config(model_dir)
     hidden = cfg.get("hidden_size")
     if not isinstance(hidden, int) or hidden <= 0:
@@ -225,6 +272,11 @@ def generate(model_dir: str, kernels: str) -> dict:
         "container": {
             "layout": layout,
             "chunk_kind": "pb16i" if layout in ("pb16i", "t2s") else "mode0",
+            # The tile order of the payload this plan describes (engine#1110).  Declared so a container
+            # from another converter -- a different order that would decode as noise with no error -- is
+            # refused by name at load instead of being served.  Absent means this same value.  Measured
+            # from the directory's repack stamp when one exists (see tile_order_claim), never assumed.
+            "tile_order": tile_order,
             "pb16i": layout in ("pb16i", "t2s"),
         },
         "fusion": {"gate_up": "fused" if fused_gu else "split"},
@@ -262,6 +314,28 @@ def moe_batched(cfg: dict, hidden: int, model_dir: str, kernels: str) -> dict:
     return {"enabled": False, "K": 0, "N": 0}
 
 
+def _only_defaulted_tile_order(on_disk: str, generated: str) -> bool:
+    """True when the ONLY difference is a container.tile_order the on-disk plan does not carry.
+
+    engine#1110 added `container.tile_order`; absent means "engine-1", which is what the generator writes,
+    so an older plan is not stale -- it is silent about a field whose default is the generated value.
+    """
+    try:
+        a = json.loads(on_disk)
+        b = json.loads(generated)
+    except ValueError:
+        return False
+    ca, cb = a.get("container"), b.get("container")
+    if not isinstance(ca, dict) or not isinstance(cb, dict):
+        return False
+    if "tile_order" in ca or cb.get("tile_order") != "engine-1":
+        return False
+    ca = dict(ca)
+    ca["tile_order"] = "engine-1"
+    a["container"] = ca
+    return a == b
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("model_dir", help="the model directory (config.json + model.q4nx)")
@@ -296,6 +370,13 @@ def main(argv=None) -> int:
         except OSError as exc:
             print(f"{out}: {exc.strerror} (run without --check to write it)", file=sys.stderr)
             return 1
+        if on_disk != text and _only_defaulted_tile_order(on_disk, text):
+            # A plan written before container.tile_order existed means exactly what the generated one says
+            # ("engine-1"), so a plan gate must not go red over a field whose absence has the same meaning.
+            # The loader makes the same assumption (npu/plan/plan.h), which is why this is not a fudge.
+            print(f'{out}: matches the model dir (written before container.tile_order, which defaults to '
+                  f'"engine-1" -- the value it generates)')
+            return 0
         if on_disk != text:
             print(f"{out}: differs from what the model dir generates -- regenerate it", file=sys.stderr)
             for line in __import__("difflib").unified_diff(

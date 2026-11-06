@@ -20,8 +20,13 @@ The Strix Halo box runs a kernel we build, not the distribution's: everything th
 need is pinned by hand, so the next kernel is a step list, not an investigation. This page is that
 list, with the facts that go stale marked as facts and the commands that do not.
 
-- **Runs today:** `7.3.0-rc4-1bit-perfopt` — Linux `v7.3-rc4` plus two backports of the IOMMU
-  PerfOpt series, built with clang (`LLVM=1`), debug info off.
+- **Runs today:** `7.4.0-rc1-1bit` — Linux `v7.4-rc1`, in use since 2026-11-04 05:45
+  (`/boot/vmlinuz-7.4.0-rc1-1bit`); every boot since has loaded it, and the box reboots on each Puppy
+  board cycle, so read `uptime -s` for the boot you are looking at. PerfOpt is present in it,
+  measured: this box's boot prints
+  `amdgpu 0000:c5:00.0: AMD-Vi: PerfOpt armed on IOMMU0`. The 7.3 A/B below stays as the measurement
+  that motivated the backports. **The compiler is not what this page says** — see the "config of record"
+  bullet below.
 - **Why the backports:** with the GPU in its identity domain, PerfOpt is worth real prefill on HRX and
   costs nothing at decode. Qwen3.8-27B UD-Q4_K_XL on HRX0, same build pin, five repeats:
 
@@ -36,6 +41,32 @@ list, with the facts that go stale marked as facts and the commands that do not.
 - **Out-of-tree modules that must follow every kernel:** `amdxdna` (the NPU driver, [npu.md](npu.md),
   "The XDNA driver") and `ec_su_axb35` (the box's fan EC). Both live in
   `/lib/modules/<version>/updates/` and both must be rebuilt against the new kernel and signed.
+
+## 7.4 on the box: what changed, and what to watch
+
+`v7.4-rc1` is the first tag where the **PerfOpt series is upstream** (`iommu/amd` plus the `amdgpu`
+identity-domain enable), so nothing is carried: the tree is the plain tag, and the boot still reports
+`AMD-Vi: PerfOpt armed on IOMMU0`. Built from the same config with `CONFIG_DEBUG_INFO_BTF=y`
+(pahole 1.31, ~5 MiB of BTF in the image), which is also why the `bpf-restrict-fs: Failed to load BPF
+object` boot noise is gone — systemd now logs `LSM BPF program attached`. Compiler is **gcc 15.2.0**,
+the same as the 7.3 image; older notes that say clang were wrong.
+
+- **Throughput, 7.4 arm only:** Qwen3.8-27B UD-Q4_K_XL on HRX0, five repeats, at the current
+  90/90/105 W fan curve — pp512 239.6, pp2048 234.7, tg128 10.9 tok/s (medians). These do **not** line up
+  with the 7.3 table above, which was taken on a different machine and power profile; the 7.3 arm of
+  *this* recipe cannot be taken from inside a 7.4 boot (it needs its own one-shot `grub-reboot` window),
+  so no 7.3-vs-7.4 delta is claimed. Greedy output is byte-identical run to run, and the NPU
+  known-answer probe is bit-identical against its fp64 reference.
+- **Watched, not caused by 7.4:** the root NVMe logs `AMD-Vi: Event logged [IO_PAGE_FAULT]` under block
+  I/O (read-only translations, no `nvme` error / timeout / reset, no filesystem error, `smartctl` clean) —
+  a device-side read-after-unmap class of noise, monitored rather than normalised.
+- **Watched, and specifically not a 7.4 regression:** a MES `REMOVE_QUEUE` timeout that ends in a MODE2
+  GPU reset. The same chain is recorded on the 7.3 kernel four days earlier, and the MES wait budget is
+  unchanged between the two tags; on this box it has appeared with system memory exhausted and several
+  resident GPU clients, which is the regime to keep the box out of.
+- The two out-of-tree modules were rebuilt against 7.4 and signed the same way, and the NPU path loads
+  our `amdxdna` build, not the kernel's own copy — the installed `updates/` module wins the resolution
+  (`modinfo -n amdxdna`), which is the check that proves it after a reboot.
 
 ## What "ready" means
 
@@ -84,11 +115,21 @@ nice -n 19 make LLVM=1 -j12 bindeb-pkg
 
 - The **config of record** is the one the box's running kernel was built from
   (`/boot/config-$(uname -r)`): `CONFIG_AMD_IOMMU=y`, `CONFIG_DRM_AMDGPU=m`,
-  `CONFIG_MODULE_SIG{,_ALL,_SHA256}=y`, `CONFIG_CC_IS_CLANG=y`, `CONFIG_DEBUG_INFO_NONE=y`. Between
-  the base `7.3.0-rc4-1bit` config and `-perfopt` the only differences are the clang version and
-  debug info (28 lines, nothing workload-specific).
-- `bindeb-pkg` needs `debhelper`, `libelf-dev` and the LLVM tools (`llvm-21`, `lld-21`); the kernel
-  is clang-built, so a gcc-only host silently builds the wrong compiler unless `LLVM=1` is exported.
+  `CONFIG_MODULE_SIG{,_ALL,_SHA256}=y`, `CONFIG_DEBUG_INFO_NONE=y`. **It is not
+  `CONFIG_CC_IS_CLANG=y`.** Read off the running kernel on 2026-11-05, that file says
+  `CONFIG_CC_IS_GCC=y` with `CONFIG_GCC_VERSION=150200` and `CONFIG_CLANG_VERSION=0`; so does
+  `/proc/config.gz`; and so does the kernel's own version line,
+  `Linux version 7.4.0-rc1-1bit (bcloud@strixhalo) (gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0, …)`. The
+  `7.3.0-rc4-1bit-perfopt+` image it replaced reports the same three ways. So the `LLVM=1` recipe below
+  is **not** what built the kernels this box has booted — which is precisely the failure the next bullet
+  warns about. Whether the recipe or the images should change is a kernel-lane decision, not a docs edit,
+  so this bullet records the measurement and stops there. Between the base `7.3.0-rc4-1bit` config and
+  `-perfopt` the only differences were the compiler version and debug info (28 lines, nothing
+  workload-specific).
+- `bindeb-pkg` needs `debhelper`, `libelf-dev` and the LLVM tools (`llvm-21`, `lld-21`); this recipe
+  builds the kernel with clang, so a gcc-only host silently builds the wrong compiler unless `LLVM=1` is
+  exported — and the images this box has booted show that failure rather than the recipe (see the
+  config-of-record bullet above).
   On a host with the versioned tools only, put `/usr/lib/llvm-21/bin` on `PATH` (that is where the
   unversioned `llvm-objcopy` the modules step calls lives).
 - Artefacts land in the **parent** directory: `linux-image-<version>_<arch>.deb` and

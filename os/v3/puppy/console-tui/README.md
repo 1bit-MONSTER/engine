@@ -22,7 +22,21 @@ binary, ratatui + crossterm, `x86_64-unknown-linux-musl`, no runtime dependency 
 Why it exists, in the owner's words: *"can we make that a tui instead of this style"* (the dialog-box console
 menu), then, on the cycle-18 board boot, *"when you first boot the headless there is no data to display on how to
 connect, just the menu"*. The first block on the screen is therefore **CONNECT**, and it is composed from live
-facts on every draw.
+facts on every draw. **Before DHCP there is no address**, so the block says the one true thing it can -
+`web UI: waiting for network`, with the row that says what to do (press 3) - instead of `http://-:13305`, which is
+what the first seconds of a boot used to show. The address rows come back with the lease.
+
+**The LEMONADE panel names the engine that is serving** - `engine: llamacpp (gpu)`, `engine: flm (npu)` - composed from
+what Lemonade reports (`recipe` in `/api/v1/models`, the device in `/api/v1/health`, falling back to the model's
+`recipe_options` backend). **Which model it names is the chat engine, not the first thing loaded**: Lemonade keeps one
+model per type in `all_models_loaded[]` (`max_models.llm = 1`), so the entry it types `llm` is the answer, with
+`model_loaded` ("most recently accessed", which an embedding request moves) only as the fallback when the type is not
+reported - `the_engine_is_the_model_answering_not_the_first_loaded`. No marketing map: if the box says `llamacpp`, the
+screen says `llamacpp`. At 80x25 the same sentence rides on the compact `LEMONADE` field, because a fact field of its
+own would push the status block to a third row and cost the log pane one (owner decision 2026-11-04 20:19, item 1;
+`the_console_says_which_engine_is_serving`). A hybrid value (`engine: ryzenai-llm (gpu npu)`, 83 columns with the rest
+of the field) re-wraps the facts block inside its existing two rows at 80x25 and costs the log pane nothing - measured,
+not assumed.
 
 ## The screen
 
@@ -65,6 +79,14 @@ ssh window at 80x18 still shows all nine actions and `Reboot / power off`; befor
 and the footer went on promising "1-9 actions" (`a_short_window_keeps_the_nine_actions_and_the_footer_whole` sweeps
 ten sizes).
 
+**The same rule inside a dialog.** A confirmation box is `title | the question | the hint`, and the hint is the only
+row that says how to answer, so a frame too short for the whole box loses the question first, whole rows at a time,
+and then the title - never the hint. Before this the box was clamped to the frame and ratatui clipped its end: at
+40x11, 30x12 and 24x12 the key-confirm dialog drew no hint at all (`y mints one and restarts Lemonade, n cancels`),
+and at 40x12 half of one, while `y` still worked - for the reboot confirm that is `y reboots the box, n cancels`
+missing from the screen that is about to reboot
+(`the_modal_hint_is_never_the_row_that_goes` sweeps four dialogs at eight sizes).
+
 **When the frame is one row short of the menu itself** - 80x10, 56x11, 40x12, 30x16: a tmux split or an ssh window on
 a phone - the `MENU` rule goes before any action does. It is decoration, and it used to be charged first, so ratatui
 clipped the end of the menu: `9 Reboot / power off` (a `vm-check.sh` string) was off the screen while the footer still
@@ -77,6 +99,54 @@ message alone cannot share the frame with the nine actions does the message go. 
 whose pane is 12 rows, one keypress cost `9 Reboot / power off` for twelve seconds - the footer had grown by the two
 rows the message wraps to (`a_message_gives_way_before_an_action_does`). At 80x25 and 240x67, where the gates read the
 screen, nothing is trimmed.
+
+**A frame is rebuilt in full once a second, because a tty cannot be made private.** Anything holding this terminal open
+can write to it, and ratatui writes only the cells whose *content* changed since its own last frame - correct only while
+the screen still holds that frame. So one stray line leaves a wrong screen that **a keypress does not fix**: measured on
+the shipped c25 artifact (`2fc6909c…`) in real ptys, three printk-shaped lines were still there at +2.2 s and after a
+keypress, at 80x25 and at 240x67 - and when the write ends on the last row the VT scrolls, which is how the log pane's
+own lines end up painted across the CONNECT block and the MENU (the cycle-25 screenshot: "`engint: o ebit`"). Who writes:
+kernel messages while `console_loglevel` allows them, `1bit-release-check`'s "holding the NPU" line and
+`puppy-check.sh`'s console note (both `/dev/tty1` on purpose), and any program a handoff runs. So the frame is rebuilt in
+full, from a cleared screen, at most once a second: the same write is gone at **+1.0 s**, and the cost is measured -
+`+3.5 KiB/s` at 240x67 (4.5 KiB/s, was 1.0).
+
+**Measured on a booted appliance, not just a pty** (QEMU, the frozen c25 image, its own `tty1::respawn:/usr/local/bin/1bit-console`,
+the guest's VGA text console at 160x50, screen read through `1bit-tty1` -> `/dev/vcsa1` the way the gates read it, plus QEMU
+`screendump`s): with the shipped `2fc6909c…` two stray lines written to `/dev/tty1` were still on the screen 4.3 s later
+**and after a keypress sent through QEMU's own keyboard**; with this binary the same write was gone by the next frame
+(0 stray rows at +0.3 s, +1.5 s, +3.5 s and after a keypress) and the healed frame was byte-identical to the clean one
+except the log pane's own new lines. What a screendump cannot catch is a sub-frame blank, so "the Clear is invisible"
+remains arithmetic (one escape plus 4.5 KiB) - a person at the monitor or a 60 fps capture is the only judge of that.
+
+This is insurance, not the fix for a noisy writer: a writer that paints this screen is still a defect in the writer.
+
+**Text from outside is cleaned before it becomes a cell.** Two of the pane's inputs are not ours - the tail of Lemonade's
+log and the catalogue's names - and a cell's symbol is written to the terminal unchanged, so a control byte that arrives
+as *data* is a control byte on the appliance's screen. It is reachable without malice: at `log_level: debug` that log
+carries the demo pages' prompts, and the engine's progress-bar lines carry `ESC[K` (erase to end of line) and a bare CR.
+Measured against the take's own log, the shipped c26 candidate (`5b21a0a8…`, which has the heal and not this) leaves
+**4 escape bytes in one frame**, and on a 240x67 pty its progress row is cut at the first `ESC[K` with the wrapped
+remainder gone; this build is **0 bytes**. On the appliance's own 160x50 text console the same line came back whole on
+both binaries - the once-a-second full paint rewrites the cells the erase cleared - so this is defence in depth, not a
+visible repair: a cell is simply not the place to execute what a log file says.
+`facts::screen_text()` removes CSI and OSC whole (the bytes after an escape are control, not text), turns TAB into a
+space and drops the other C0/DEL; everything else is untouched (`SoC 78°C`, `café`, `┌─┐`), and it is applied where
+external text enters, so no draw site can forget it (`a_log_line_or_a_model_name_cannot_carry_an_escape_into_the_screen`).
+
+**And the reader decodes a JSON escape before the sanitiser sees it.** Lemonade's catalogue arrives with `\uXXXX` in it
+whenever a serialiser escapes non-ASCII (Python's `json.dumps` does that by default), so `facts::json_unicode()` turns
+`caf\u00e9` into `café` - surrogate pairs into one character, a lone half into U+FFFD, a truncated escape into the bytes it
+had - and *then* `screen_text()` strips whatever control characters an escape decodes to (`\u001b[2J`). The order matters:
+before this the pane drew the escape's four characters (`cafu00e9`), and a `\u001b` body had nothing for the sanitiser to
+remove (`a_json_escape_is_decoded_before_it_becomes_a_cell`).
+
+**An interrupted paint repaints; a terminal that cannot be written still ends the console.** A paint that fails with
+`ErrorKind::Interrupted` drew nothing - a signal arrived before the write reached the terminal - so the next pass simply
+paints again instead of ending the screen. That is reachable in normal use: crossterm's event source installs a SIGWINCH
+handler, so an ssh user dragging a window edge is the realistic trigger. Every other error kind still exits, which is
+what hands tty1 to the `dialog` menu (`paint_failed()`;
+`an_interrupted_paint_is_repainted_but_a_dead_terminal_ends_the_console`).
 
 ## Keys
 
@@ -131,7 +201,7 @@ Every number comes from where the rest of the image reads it - no second source 
 | panel | source |
 |---|---|
 | header | `/data/RELEASE-TAG` or `payload=` in `/etc/1bit/release-identity`, `/proc/sys/kernel/hostname`, `ip -4`, `/proc/uptime`, the `SecureBoot-*` efivar (the value byte is the fifth: efivarfs refuses partial reads, and a `dd skip=4` reads as "disabled" on a Secure Boot box) |
-| Lemonade | the process table, an actual TCP connect to 127.0.0.1:13305, `LEMONADE_API_KEY=` in `/etc/1bit/lemond.conf` |
+| Lemonade | the process table, an actual TCP connect to 127.0.0.1:13305, `LEMONADE_API_KEY=` in `/etc/1bit/lemond.conf`, and `/api/v1/health` for the loaded models and the engine (`all_models_loaded[]` `type`/`device`, `model_loaded`) |
 | GPU | `llama-server --list-devices`, i.e. the runtime's own answer, plus `/sys/class/drm/card*/device/mem_info_{vram,gtt}_{used,total}` and hwmon |
 | NPU | `/proc/modules` for `amdxdna`, `/lib/firmware/amdnpu`, `/dev/accel/*`, and Lemonade's health for busy/idle |
 | Models | `GET /api/v1/models` (downloaded only) and `GET /api/v1/health` (loaded) |
@@ -169,7 +239,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 47 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders
+cargo test                                    # the suite: the probe parsers (incl. the JSON escapes), the QR drawing (incl. a literal known answer), the links, the short-window degradation, the two renders, the engine row's model choice, the escape sanitiser, the interrupted paint
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

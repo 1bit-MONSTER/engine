@@ -51,7 +51,14 @@ start() {  # <log> [serve args]: starts serve on $port, waits for /health 200
     pid=$!
     pids+=("$pid")
     api="http://127.0.0.1:$port"
-    for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$api/health")" = 200 ] && break; sleep 0.1; done
+    local code=000
+    for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.1; done
+    # A server that never came up because it could not bind is a port collision, not a defect in
+    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+    if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$1"; then
+        echo "FAIL: watchdog_serve: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$1" | head -1))"
+        exit 1
+    fi
     child=$(pgrep -P "$pid" | head -1)
 }
 gone_within() {  # <pid> <seconds>

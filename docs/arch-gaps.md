@@ -704,6 +704,144 @@ family already ships GGUFs (`ibm-granite/granite-switch-4.1-8b-GGUF`, whose
   uploads as `. REVIEWED` instead of filing an issue; remove that field (and record `mapped_ok`)
   when the pin gains `graniteswitch`.
 
+### 2026-11-05 batch (engine#619)
+
+Two classes were reported `UNCOVERED` on 2026-11-05: `Ernie5_5_MoeForCausalLM` (3 models in
+`registry/census.json`, e.g. `ml-resources/ERNIE-5.5-Flash-Base`) and `Factorial` (2 models, e.g.
+`bull220202/Factorial_Base_Tiny_300M_Ver_LM`). Neither is registered by the pin the registry was
+generated from, `third_party/llama.cpp 4a375bf2d` (2026-11-05): `git grep` over that tree for
+`Ernie5_5` / `ernie5_5` returns nothing, and `Factorial` matches neither a converter class nor a
+`MODEL_ARCH` constant. `registry/architectures.json`, generated from that pin, therefore has no
+entry to map (`tools/registry_build.py --check` is clean on it), and a mapping added by hand would
+claim a model no backend loads. Both are reviewed below as **not aliases**. Their
+`registry/significant.json` entries carry `"watch": "report"`, so the watcher prints new uploads
+as `. REVIEWED` instead of alerting; remove that field and record `mapped_ok` when a pin learns the
+class.
+
+The configs were read on 2026-11-06 through the same HF routes the watcher uses (the listing's
+inline `config` and the repo's own `config.json`; metadata only, no weights).
+
+#### `ernie5_5_moe` - `ml-resources/ERNIE-5.5-Flash-Base`
+
+* **Class / model_type**: `Ernie5_5_MoeForCausalLM` / `ernie5_5_moe`, `library_name:
+  transformers`, no `auto_map`. Shape: 43 layers, hidden 4096, 64 heads / 1 kv, `head_dim` 512,
+  vocab 201216.
+* **What it adds**: hybrid MLA + sparse attention (`hybrid_mla_attention: mqa_dsa`,
+  `q_lora_rank` 1024, `kv_lora_rank` 512, an `index_topk` 2048 indexer with 64 heads at
+  `index_head_dim` 128, `experimental_attention_variant: dsv4_hybrid`), hyper-connections
+  (`enable_hyper_connections`, `hc_mult` 4, `hc_sinkhorn_iters` 20), latent MoE (512 routed
+  experts, top-10, one 2048-wide shared expert, `moe_latent_size` 2048,
+  `moe_split_feature_routing`), `situ` activation, a per-layer `compress_ratios` list (128,
+  with -2 marking the layers that compress none), `o_groups` 8 with `o_lora_rank` 1024, one
+  NextN/MTP layer, 1048576-position YaRN (`factor` 16) and fp8 weights.
+* **Why an alias is wrong**: the only mapped ERNIE family is `Ernie4_5_MoeForCausalLM` ->
+  `ernie4_5-moe` (`conversion/ernie.py:75`, `src/llama-arch.cpp:122`), a plain transformer: its
+  converter reads `moe_num_experts` / `moe_k` / `moe_layer_interval` and splits `qkv_proj`, and
+  it has no DSA indexer, no hyper-connection residuals, no latent MoE and no `situ`. Loading an
+  ERNIE 5.5 checkpoint through it would keep the dense/MoE skeleton, silently drop all of that,
+  and produce tokens - the silent substitution this page exists to prevent.
+* **Why it is not mapped**: the pin has no `ernie5_5` anywhere - `conversion/ernie.py` registers
+  `Ernie4_5_*` and the OCR classes only, `gguf-py` has `ERNIE4_5` / `ERNIE4_5_MOE`, and
+  `src/llama-arch.cpp` has `ernie4_5` / `ernie4_5-moe` - so the generated registry has nothing
+  to read the class from.
+* **Real support needs**: a new architecture (hybrid MLA + DSA indexer, hyper-connections, latent
+  MoE, `situ`) validated against reference logits; the text tower is what a decoder route would
+  take.
+
+#### `factorial` - `bull220202/Factorial_Base_*`
+
+* **Class / model_type**: `Factorial` / `Factorial` (the config's own spelling), no
+  `library_name` and no `auto_map`. `registry/census.json` counts 2 models:
+  `bull220202/Factorial_Base_Tiny_300M_Ver_LM` (302,239,232 params) and
+  `bull220202/Factorial_Base_1.8B_Semi_Tiny` (1,889,656,832).
+* **Not a decoder at all**: the config carries no attention, head or embedding wiring. It has
+  `TotalParam`, `input_dim` / `hidden_dim` 256, `num_hidden_layers` 384, `block_size` 16,
+  `weight_dim` (32768 / 4166668), `selection_size` 1024 and a `factorial_config`
+  (`selection_method: factorial`, `weight_storage: memmap`, `memmap_enabled`). The weights are
+  `Factorial_Pretrain.pt` plus a `factorial_weights.dat` memmap segment, the repo carries its own
+  `factorial_train.py` / `chat.py`, and the tokenizer is SentencePiece (`spm.model`,
+  `spm.vocab`). No Transformers implementation exists or is implied: the repo's code is what
+  runs it.
+* **Why an alias is wrong**: there is no attention stack to map to. The nearest thing the
+  registry can name is some other decoder, and a checkpoint with none of that decoder's tensors
+  loaded through it is not a quantisation or a rename, it is a different computation.
+* **Why it is not mapped**: no pinned converter or runtime reads `Factorial` (the grep above
+  returns nothing), so the generated registry has no entry.
+* **Watcher note**: the class alerts as `!! UNCOVERED (new class)` rather than `. REMOTE-CODE`
+  because the config omits `library_name`: the watcher's custom-code rule needs either
+  `auto_map` or a non-Transformers `library_name` to classify it as repo code. It is recorded
+  here as reviewed, report-only, so a re-upload of the family does not file a new issue.
+* **Real support needs**: none planned. Serving it means implementing the repo's own memmap
+  selection scheme, which the GGUF and Q4NX routes have no slot for.
+
+### 2026-11-06 batch (engine#1253)
+
+Two classes were reported `UNCOVERED` on 2026-11-06: `Lfm3ForCausalLM` (3 newest models, e.g.
+`D0zy/essay-model-merged`; `registry/census.json` counts 96 in the full sweep) and
+`NeedleForToolCalling` (1 newest, e.g. `Amdkn7/needle3`; 14 in the census). Neither is registered
+by the pin the registry was generated from, `third_party/llama.cpp 710c7c23` (2026-11-05):
+`git grep` over that tree for `Lfm3` / `lfm3` and for `Needle` returns nothing: `gguf-py` has
+`LFM2` / `LFM2MOE` but no `LFM3`, and no `NEEDLE` `MODEL_ARCH` at all, while `src/llama-arch.cpp`
+names `lfm2` / `lfm2moe` and neither new architecture.
+`registry/architectures.json`, generated from that pin, therefore has no entry to map
+(`tools/registry_build.py --check` is clean on it), and a hand-written mapping would claim a model
+no backend loads. Both are reviewed below as **not aliases** and their
+`registry/significant.json` entries carry `"watch": "report"`, so the watcher lists new uploads
+as `. REVIEWED` instead of alerting; remove that field and record `mapped_ok` when a pin learns the
+class.
+
+The configs were read on 2026-11-06 through the same HF routes the watcher uses (the listing's
+inline `config` and the repo's own `config.json`; metadata only, no weights).
+
+#### `lfm3` - `LiquidAI/LFM3-1.7B`, `D0zy/essay-model-merged`
+
+* **Class / model_type**: `Lfm3ForCausalLM` / `lfm3`, `library_name: transformers`, `auto_map` to
+  `configuration_lfm3` / `modeling_lfm3` (custom code). The 2026-11-06 walk counted 3 uploaders,
+  which is the threshold at which a custom-code class starts alerting, and LiquidAI's own
+  checkpoint is public, so the class was reviewable.
+* **Shape** (`LiquidAI/LFM3-1.7B`): 24 layers, hidden 2048, 16 heads / 4 kv, `head_dim` 128,
+  vocab 128000, tied embeddings, 262144 positions. `layer_types` is a 2-conv + one-attention
+  repeating schedule with both `full_attention` and `sliding_attention` (`sliding_window` 256),
+  `conv_L_cache` 7, `use_sandwich_norm` on, and per-attention-type `rope_parameters`
+  (`partial_rotary_factor` 0.5 with `rope_theta` 10^6 on full attention; 10^4 on sliding layers).
+* **Why an alias is wrong**: the mapped LFM family is LFM2 (`Lfm2ForCausalLM` -> `lfm2`,
+  `Lfm2MoEForCausalLM` -> `lfm2moe`) with `conv_L_cache` 3, no `sliding_attention` layers, no
+  partial rotary, no sandwich norm and untied embeddings. Loading an LFM3 checkpoint through the
+  LFM2 path would keep the conv/attention skeleton, normalise at the wrong points and drop the
+  sliding/partial-rotary attention, and still produce tokens - the silent substitution this page
+  exists to prevent.
+* **Why it is not mapped**: the pin has no `lfm3` (no converter class, no `MODEL_ARCH`, no
+  `LLM_ARCH_*`), so the generated registry has nothing to read the class from.
+* **Real support needs**: a new GGUF architecture (sandwich norm, sliding attention with partial
+  rotary, 7-tap conv) in the pinned backend, validated against HF reference logits. The family is
+  already 96 models in the census, so this is worth its own issue rather than an alias.
+
+#### `needle` - `Amdkn7/needle3`
+
+* **Class / model_type**: `NeedleForToolCalling` / `needle`, `library_name: cactus-compute`,
+  no `auto_map`, `name_or_path: Cactus-Compute/needle3`, `engine_version` 3.1.0. The library is
+  Cactus's own on-device runtime, which the watcher's non-Transformers list does not name, so the
+  census counts the class as native.
+* **Not a Transformer**: 20 layers, hidden 768, 12 heads / 2 kv with separate `qk_head_dim` 48 and
+  `value_head_dim` 64, vocab 8192, 121M params, GQA with a 1024-token sliding window and a
+  256-token KV window, `mlp: hadamard`, an `extras` block (`engram` sites/orders/slots 18432,
+  `global_attention_layers`, `qkv_conv_taps`, `mhc_lanes`, a `confidence` head), and a
+  `quantization` block (`cactus-quants`, `embedding=4,mhc=4,default=2`, 8-bit KV and activations).
+  It ships `needle3.cact` plus `checkpoints/needle3.safetensors`, and its deployment is a
+  "self-contained C++ / WebAssembly" runtime - the `.cact` container is the deployed format.
+* **Why an alias is wrong**: nothing in the pinned stack reads the `.cact` container or the cactus
+  quantisation, and the MLP is a Hadamard transform with engram lookups, not the gated MLP any
+  supported family has. Mapping it to another decoder would advertise a model whose weights this
+  engine cannot even dequantise.
+* **Why it is not mapped**: no pinned converter or runtime reads `needle` (the grep above), so the
+  generated registry has no entry.
+* **Not the `needle3` class reviewed above**: `Needle3ForCausalLM` (`model_type: needle3`) is a
+  different class from a different publisher, reviewed in its own section; this one declares
+  `model_type: needle` and is served by the Cactus runtime.
+* **Real support needs**: none planned for this engine - it would take the Cactus container format,
+  its quantisation and that runtime. Recorded as a reviewed gap, not an alias, so the family does
+  not file a daily issue.
+
 ## Unverifiable: gated configs
 
 A gated repository cannot be classified at all: the watcher's listing carries no config for it, so

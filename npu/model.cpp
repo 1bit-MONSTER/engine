@@ -29,9 +29,9 @@ int Tensor::tiles() const {
     // [tile rows, tile cols, chunk bytes] (Q4NX with Q4_K or Q8 chunks, npu/q4nx.h)
     if (shape.size() == 3 && shape[0] > 0 && shape[1] > 0) return int(shape[0] * shape[1]);
     if (shape.size() != 2 || shape[0] <= 0) return 0;
-    // A row is one tile only when it is 5120 bytes wide; narrower rows pack
-    // several to a tile.
-    if (shape[1] > 0 && size_t(shape[1]) != kTileBytes)
+    // A row is one tile when it is one whole chunk wide: 5120 (q4_1) or 6144 (the imported
+    // container's fp32 q4_1f, engine#1185). Narrower rows pack several to a tile.
+    if (shape[1] > 0 && size_t(shape[1]) != kTileBytes && size_t(shape[1]) != kTileBytesF32)
         return int((shape[0] * shape[1] + int64_t(kTileBytes) - 1) / int64_t(kTileBytes));
     return int(shape[0]);
 }

@@ -23,7 +23,10 @@ refusals in the tool, so they are tested here with fake tickets instead of only 
 1. two tickets that agree pool; a ticket whose per-prompt rows disagree on a shared cell, or that does not add
    up to its own run-level row (a short read), is refused rather than averaged;
 2. the echoed summary a harness prints after its exit line is ignored, so a cell is never counted twice;
-3. a depth with no denominator on either side is reported as unmeasured, never as a +0.00 pp pass.
+3. a depth with no denominator on either side is reported as unmeasured, never as a +0.00 pp pass;
+4. the numbers the MTP leaderboard records publish (all-chains rates, hit rate, both tokens-per-pass figures) are
+   re-derived from the same fixtures and compared to the record JSON, so a record cannot drift from its evidence --
+   and every MTP record in the directory has to be one the guard names, so a new one cannot arrive uncovered.
 
 usage: tests/mtp_depth_pool_test.py        (pure python, no model, no device)
 """
@@ -264,6 +267,76 @@ else:
 # 16. the tool's own refusals, and (no logs) nothing else: this is what runs on a box without the ticket corpus.
 r = subprocess.run([sys.executable, TOOL, "--selftest"], capture_output=True, text=True)
 check(r.returncode == 0 and "selftest PASS tail repeat" in r.stdout, "the tool's refusal self-test passes")
+
+# 17. the MTP leaderboard records are reproducible from the tree.
+#
+# The records name tools/mtp_depth_pool.py as their instrument, but the tool computed the CONDITIONAL per-depth table
+# only: the all-chains rates, the hit rate and both tokens-per-pass figures were typed from a side parser, so the
+# record named a tool that could not produce its own number -- the generated-artifact hole (#1213) one layer down, in
+# a number rather than a file.  Every value is re-derived here from the three shipped tickets and compared to the
+# record JSON, and the comparison is proved to bite before it is trusted.
+import importlib.util  # noqa: E402  (section-local: the records are the last thing this file checks)
+import json  # noqa: E402
+
+RECORDS = os.path.join(ROOT, "bench", "npu-leaderboard")
+# record id -> the derived quantity it publishes
+MTP_RECORDS = {
+    "27b-mtp-live-depth1-20261105": lambda e: e["depth_rate"][1],
+    "27b-mtp-live-depth2-20261105": lambda e: e["depth_rate"][2],
+    "27b-mtp-live-depth3-20261105": lambda e: e["depth_rate"][3],
+    "27b-mtp-live-depth4-20261105": lambda e: e["depth_rate"][4],
+    "27b-mtp-hit-rate-20261105": lambda e: e["hit"],
+    "27b-mtp-live-tokens-per-pass-20261105": lambda e: e["tpp_live"],
+    "27b-mtp-offline-tokens-per-pass-20261105": lambda e: e["tpp_offline"],
+}
+
+
+def record_mismatches(expect):
+    """Every record whose published value is not the derived one, as one line each (empty list = all agree)."""
+    out = []
+    for rid, want in expect.items():
+        path = os.path.join(RECORDS, rid + ".json")
+        if not os.path.exists(path):
+            out.append(f"{rid}: no record at {os.path.relpath(path, ROOT)}")
+            continue
+        with open(path) as fh:
+            rec = json.load(fh)
+        if rec["metric"]["value"] != round(want, 2):
+            out.append(f"{rid}: record says {rec['metric']['value']} {rec['metric']['unit']}, "
+                       f"the fixtures derive {round(want, 2)}")
+        elif "mtp_depth_pool.py" not in rec.get("instrument", ""):
+            out.append(f"{rid}: value agrees but the instrument it names is not the tool that derived it")
+    return out
+
+
+spec = importlib.util.spec_from_file_location("mtp_depth_pool", TOOL)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+if all(os.path.exists(p) for p in CL):
+    _seen, _un, _src, _bud, _wid, _idt, _offered = mod.pool(CL)
+    econ = mod.economics(_seen, _offered)
+    check("error" not in econ, f"the shipped fixtures support the derived block: {econ.get('error', 'ok')}")
+    if "error" not in econ:
+        derived = {rid: fn(econ) for rid, fn in MTP_RECORDS.items()}
+        bad = record_mismatches(derived)
+        check(not bad, f"all {len(derived)} MTP records equal what the fixtures derive: {bad[:2]}")
+        # anti-vacuity: a record one hundredth off must be caught, or the check above passes on anything.
+        wobbled = dict(derived)
+        first = sorted(wobbled)[0]
+        wobbled[first] += 0.01
+        check(record_mismatches(wobbled) != [],
+              f"the record comparison bites: {first} +0.01 is reported, not accepted")
+        # ... and the guard covers the DIRECTORY, not just the seven ids it happens to name: an MTP record added
+        # later that nobody adds here would look exactly like a covered one, which is how the "one table row per
+        # record" hole was closed for the page (#1213) and how a check ends up reporting success on the records it
+        # was told about rather than the records that exist.
+        on_disk = sorted(f[:-5] for f in os.listdir(RECORDS)
+                         if f.startswith("27b-mtp-") and f.endswith(".json"))
+        check(len(on_disk) >= len(derived), f"the guard's record directory is readable ({len(on_disk)} MTP record(s))")
+        uncovered = [rid for rid in on_disk if rid not in derived]
+        check(not uncovered, f"every MTP record on disk is checked by this guard: uncovered {uncovered}")
+else:
+    check(False, "tests/fixtures/mtp_clause55 is incomplete, so the records cannot be re-derived")
 
 print(f"\n{'all checks passed' if not fails else f'{fails} CHECK(S) FAILED'}")
 sys.exit(1 if fails else 0)

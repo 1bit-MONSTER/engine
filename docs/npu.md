@@ -32,6 +32,31 @@ and decrypts in memory at load (a wrong key fails cleanly, and nothing phones ho
 build and method are not in this repository or in any release. This page covers the public parts:
 the model format, how `1bit serve` runs an NPU model, and how to build.
 
+## What works today
+
+On Linux with the `amdxdna` kernel driver loaded, the engine serves Qwen3-0.6B on the XDNA 2 NPU at
+**88.6 tok/s** in the release gate, and it takes a GGUF directly: `1bit serve -m <model.gguf> --device npu`
+repacks it to the Q4NX directory this page describes and runs six architectures. Everything on the
+NPU is in progress — correctness first, speed next — so the iGPU through [HRX](hrx.md) remains the
+route for anything the NPU does not run, and `--device hybrid` puts one request's prompt on one
+device and its tokens on the other ([hybrid.md](hybrid.md)).
+
+## How to try it
+
+On a machine whose kernel has `amdxdna` (the [1bit OS](os-v3.md) appliance ships one):
+
+```bash
+1bit serve -m <NPU model dir> --device npu --alias npu      # a Q4NX model directory
+1bit serve -m <model.gguf> --device npu --alias npu         # or a GGUF, repacked on load
+```
+
+Then it is the same OpenAI-compatible API as every other route ([serve.md](serve.md)):
+
+```bash
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"npu","messages":[{"role":"user","content":"Hello"}]}'
+```
+
 ## A model directory
 
 ```
@@ -50,6 +75,8 @@ the model format, how `1bit serve` runs an NPU model, and how to build.
 
 A model directory may carry a **plan.json**: the decisions the runtime used to make by looking at which
 files happened to be in `--kernels`. Three of them, and each one used to be silent:
+
+The schema, the refusal rules and the generator flags are in [npu-plan.md](npu-plan.md).
 
 | decision | what the probe used to do |
 |---|---|
@@ -136,15 +163,28 @@ guessed mask is a different model.
 Q4NX is [FastFlowLM](https://github.com/ROCm/FastFlowLM)'s NPU model format (MIT), and its models on
 Hugging Face (`FastFlowLM/*-NPU2`) are Q4NX directories. A Q4NX weight is a grid of 32-row x
 256-column tiles, one chunk each, row-major over the grid. The chunk kind is the last dimension of
-the tensor's shape: `[tiles, 5120]`, or `[tile rows, tile cols, chunk bytes]` (`npu/q4nx.h` has the
-byte layouts).
+the tensor's shape: `[tiles, <chunk bytes>]` (5120, 6144, 4736 or 8704), or `[tile rows, tile cols,
+chunk bytes]` (`npu/q4nx.h` has the byte layouts).
 
 | Chunk | Kind | Weight | Seen in |
 |---|---|---|---|
 | 5120 B | q4_1: bf16 scale and zero per 32 columns of a row | `code * scale + zero` | Qwen3, Llama, Gemma, Phi models |
+| 6144 B | q4_1f: **fp32** scale and zero per 32 columns of a row (imported containers, below) | `code * scale + zero` | `1bit npu-pack import` output |
 | 4736 B | Q4_K: u8 scale and min per 32 columns, bf16 `S`, `M` per row | `S * scale * code + M * min` | Qwen3.5-4B projections |
 | 8704 B | Q8: bf16 scale per 32 columns, int8 codes | `d * code` | Qwen3.5-4B `lm_head` and embedding |
 | 2176 B | **t2**: 2-bit ternary codes, one fp16 scale per 128 columns of a row | `code * scale` | ternary models (Bonsai-2, PTQ1_0/TQ1_0 sources) |
+
+The two q4_1 forms are a container property, named by the container's `layout` metadata
+(`__metadata__.layout` in `model.q4nx`, `q4nx_source.layout` in `config.json`): absent or
+`q4nx-1` is the bf16 form every container written before engine#1185 has, and every GGUF-derived
+one (the bf16 choice came from that path); `q4nx-2` is the fp32 form `1bit npu-pack import` writes,
+so an OGA pack's own scale and zero survive bit for bit. A decoder keys off the chunk's own last
+dimension either way, so a container with no metadata still loads; `q4nx::params_of_layout()` is for
+the caller that has to state the fidelity it holds, and the forward converts such a container at
+load: `npu/q4nx_device.cpp` repacks every fp32 tensor through `q4nx::as_q4_1()` into the Q4NX
+cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader that copy, so the
+device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
+the bf16 rounding reappears for the device, never in the container.
 
 **Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
 embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors
@@ -154,8 +194,9 @@ apart. Decoding tile (0, 0) of each lm_head and comparing with a GGUF of the sam
 gives correlation 0.9998 with the right layout and about 0.01 with the other. `npu/q4nx`
 decodes the first layout.
 
-`npu/q4nx.h` decodes all four, and repacks Q4_K into q4_1 (exact apart from rounding
-`S * scale` and `M * min` to bf16), so code that reads q4_1 runs Q4_K weights unchanged. Q8 does
+`npu/q4nx.h` decodes all five (the two q4_1 parameter forms included), and repacks Q4_K into q4_1
+(exact apart from rounding `S * scale` and `M * min` to bf16), so code that reads q4_1 runs Q4_K
+weights unchanged. Q8 does
 not fit q4_1, and neither does t2 (per-128 fp16 scale against q4_1's per-32 bf16 one): a t2 tensor
 is expanded on the target, never repacked. `tests/npu_q4nx_test.cpp` checks the decoders bit for bit
 against reference decoders on real Qwen3.5-4B and Qwen3-0.6B tiles (committed in
@@ -366,6 +407,27 @@ its engine mutex (`app/forward_serve.cpp:258`, `:698`), so one pass is in flight
 N processes sharing the device by flock (`app/npu_device_lock.h`), each counting its own. A caller that
 parallelised the layer loop would need per-pass counters instead.
 
+### From a 1BP package
+
+`tools/onebp_import.py <model.1bp> <out dir> --config <snapshot dir>` imports a legacy `.1bp` package
+(one file: a 256-byte header, a tensor index, the weights). Its 4-bit payload is a 32 x 256 tile of 5120 B
+with this engine's value convention (`scale*q + min`), but **not** its intra-tile layout: `.1bp` stores
+the scales/mins row-major (`[r*8+g]`) and the codes adjacent-pair (even column low), while `npu/q4nx.h`
+stores them group-major (`[g*32+r]`) and lane-swizzled. The import permutes each tile's bytes — the
+inverse of the archived converter's own `q4nx_tile_to_onebp()` — and dequantizes and re-quantizes nothing;
+`F16`/`F32` tensors become bf16. `--verify` proves it by comparing every byte the container holds against
+the same permutation of the package's slice (and against the GGUF behind any tensor that came from
+`--embedding-from`). Reading a `.1bp` tile as if it were already this engine's tile is not a near miss:
+on `ZR1-1.5B-1BP` the decoded weights then correlate 0.003 with the model — fluent noise that still looks
+like weights, the failure mode of [engine#1110](https://github.com/1bit-MONSTER/engine/issues/1110) —
+and 0.995-0.997 after the permutation. A v1 package carries no `token_embd`/`lm_head`, so importing one needs
+`--embedding-from <gguf>` (and `--verify` of it takes the same flag: it rebuilds the same plan); the tool stops
+rather than write a container that cannot answer. Any tensor
+with no Q4NX mapping is refused **by name** (`no Q4NX name for blk.0.cca_conv_grp.weight`) instead of
+guessed: Zaya1's grouped conv, EDA router and fused `ffn_gate_up_exps` have no op in `npu/forward` yet,
+so a package of that architecture is not importable — see `~/briefs/ZAYA-OPFAMILY-NOTE.md` for the op
+list and its cost.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model
@@ -544,10 +606,13 @@ own, with a negative control.
 A cached directory is checked again on every hit, with the same metadata-only scan, and it is
 rebuilt if the scan fails or if its `repack-stamp.txt` (converter path and commit, architecture,
 the measured `tile_order`, repack script) names a different converter than this build would use (`repack_gguf.py
---check-stamp <dir>`: exit 0 current, 1 stale, 2 cannot tell). If the checker or the converter
-cannot be found, serve warns once per process and reuses the directory, so a missing script
-cannot stop serving. A Q4NX directory served as it is (`1bit serve -m <Q4NX dir>`), such as a
-published FastFlowLM model, is trusted as published. Its chunk layout can be checked first, without
+--check-stamp <dir>`: exit 0 current, 1 stale, 2 cannot tell). A stamp the repack itself refused,
+or one that predates the measured `tile_order`, is stale and is rebuilt once, so the directory
+becomes verified; `unverified` is "cannot tell", so serve reuses it with its warning instead of
+re-running the measurement that could not run. If the checker or the converter cannot be found,
+serve warns once per process and reuses the directory, so a missing script cannot stop serving. A
+Q4NX directory served as it is (`1bit serve -m <Q4NX dir>`), such as a published FastFlowLM model,
+is trusted as published. Its chunk layout can be checked first, without
 dequantizing anything: `tools/check_q4nx_dir.py <dir>` reads the container header only, names each
 quantized tensor's chunk kind, and refuses an unknown chunk size or a tensor shorter than its layout
 needs. It cannot tell the two Q8 layouts apart ("Q4NX chunks", above), because the container does
@@ -569,10 +634,16 @@ does match, so the claim in `plan.json` is measured rather than assumed;
 * records `tile_order=unverified` when nothing was comparable (an architecture the checker cannot
 dequantize) instead of asserting a layout nobody checked.
 
-The same measurement runs on its own over an existing directory:
-`python3 scripts/repack_gguf.py --tile-check <dir> <model.gguf>` (exit 0 ours, 1 another order or
-none, 2 nothing compared). A cache hit re-checks metadata only, so the cost is paid once per
-directory, on top of the converter's own pass.
+The same measurement runs on its own over an existing directory, under the name that says what it
+proves: `python3 scripts/repack_gguf.py --verify-source <dir> <model.gguf>` (exit 0 verified in the
+engine-1 order, 1 another order or none, 2 nothing comparable). The verdict names the worst source
+tensor and its correlation with the GGUF — a wrong converter checkout reads
+`corr +0.0325 on blk.14.attn_output.weight` where an honest pack reads `corr +0.9994` — so the
+number that separates them is in the line, not only the max|err|. `--tile-check` is the same
+function under its old name. The repack runs it after the converter and refuses the directory when
+it fails; `--skip-verify` opts out for the tight repack loops and stamps `tile_order=unverified`
+(never `engine-1`), so the cheaper path is recorded rather than silently trusted. A cache hit
+re-checks metadata only, so the cost is paid once per directory, on top of the converter's own pass.
 
 ### From a Ryzen AI OGA NPU pack
 
@@ -602,12 +673,12 @@ What converts, and how faithfully:
 | pack tensor | where | to | fidelity |
 |---|---|---|---|
 | `model.embed_tokens.weight` | `model.onnx.data`, fp16 | bf16 | fp16 → bf16 rounding (10 → 7 mantissa bits) |
-| `lm_head` `MatMulNBits` (bits 4, block 128, asym) | `model.onnx.data` | q4_1 tiles | codes unchanged; `scale = s` (exactly bf16 in this pack), `zero = -zp*s` (bf16 rounding) |
+| `lm_head` `MatMulNBits` (bits 4, block 128, asym) | `model.onnx.data` | q4_1f tiles | codes unchanged; `scale = s`, `zero = -zp*s`, both stored as f32 |
 | `input_layernorm`, `post_attention_layernorm` | `.fconst`, bf16 at a fixed offset | bf16 | byte-exact |
-| `self_attn.{q,k,v,o}_proj` (24 x 4) | `.fconst`, 34,816-byte 64-row tiles | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
+| `self_attn.{q,k,v,o}_proj` (24 x 4) | `.fconst`, 34,816-byte 64-row tiles | q4_1f tiles | codes unchanged; `scale = s` (the pack's bf16 value), `zero = -zp*s` stored as f32 |
 | `self_attn.{q,k,v}_proj.bias` (24 x 3) | `.fconst`, the tiles' bias subvolumes | bf16 | byte-exact; written only where the pack has one |
-| `mlp.{gate,up}_proj` (24 x 2) | `.fconst`, MLP section, 4,288-byte subvolumes | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
-| `mlp.down_proj` (24 x 1) | `.fconst`, MLP section, 2,176-byte subvolumes | q4_1 tiles | same as the attention tiles |
+| `mlp.{gate,up}_proj` (24 x 2) | `.fconst`, MLP section, 4,288-byte subvolumes | q4_1f tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` stored as f32 |
+| `mlp.down_proj` (24 x 1) | `.fconst`, MLP section, 2,176-byte subvolumes | q4_1f tiles | same as the attention tiles |
 | `model.norm` (final) | `.fconst`, the tail envelope at `layers x stride` | bf16 | byte-exact |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
@@ -620,13 +691,19 @@ because `tie_word_embeddings` makes `dequant(lm_head)` reproduce the fp16 embedd
     corr 0.999999, relative error 0.00070 on all 151936 x 896 weights
     controls: nibble-swapped corr -0.0008, no zero-point corr 0.8788   (both rejected)
 
-Two facts bound what the container can hold, and both are reported, not hidden:
+Two facts about what the container holds, both reported, not hidden:
 
-* **A bf16 zero does not always hold a f32 one.** A q4_1 chunk stores bf16 scale and zero. This
-  pack's scales are already bf16 values (0 % rounded), but `-zp*s` is bf16-exact for only
-  43.5 % of 32-column groups. The residual is that rounding: 3.34e-3 relative, 2.4e-4 absolute
-  on the dequantized weights, with no code moved. Read back through `q4nx::dequant_tile` the
-  container matches the pack to that bound.
+* **The pack's scale and zero are kept exactly (engine#1185).** An imported container uses the
+  fp32 `q4_1f` chunk (6,144 B), and its `layout` says `q4nx-2`; every written tile's scale/zero
+  planes are read back and compared with the pack's f32 values. What this replaces: the 5,120-byte
+  bf16 form kept only 43-48 % of the groups bit-equal on the four shipped packs (3.34e-3 relative,
+  2.4e-4 absolute on the weights), because `-zp*s` is an arbitrary f32 and bf16 rounds it. That
+  floor is gone for imported containers -- the same measurement is now bit-equal, and
+  `npu-pack import` prints "fp32 scale/zero exact for 100.00 % of 32-column groups (container
+  layout q4nx-2)". The device still streams bf16 q4_1, so the forward repacks a q4nx-2 container at
+  load (`npu/q4nx_device.cpp` -> `q4nx::as_q4_1()`, cached once and logged; `npu/forward/src/model.c`
+  still refuses an unconverted one as a safety net), and the fast lane's packer does the same in
+  memory (`npu/pack.cpp`); GGUF-derived containers are unchanged and keep the bf16 form.
 * **K is padded to the 256-column grid.** Qwen2.5-0.5B has hidden 896 = 3.5 tiles, so
   `lm_head` and q/k/v/o are stored as 4 column tiles with the last one zero-padded (codes 0,
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's
@@ -834,6 +911,62 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
+
+### FastFlowLM's NPU2 drops: the families the route does not serve
+
+The daily census-watch (engine#588) prints one line per new or changed repo in FastFlowLM's HF
+org and answers two questions from `registry/architectures.json`: does a backend accept the
+architecture the repo's config declares, and does the NPU route already serve that family. A
+`!! NEW FLM` row means the registry does not map the class at all; a `!! NPU FLM` row means the
+registry maps it, but only for a backend that cannot run a Q4NX directory. Both answers come from
+the registry, never from the repo name.
+
+The route serves the families `registry/architectures.json` marks `npu`: `qwen3` on the dense
+fast lane, and `qwen2`, `qwen3moe`, `qwen3_5_moe`, `deepseek2`, `minicpm` and `llama` through the
+GGUF-on-NPU forward ([registry.md](registry.md) has the table). Everything else in the org is an
+NPU-route gap, recorded here instead of as a GGUF alias: a class enters the registry only when a
+backend's code accepts it, so mapping an NPU pack to an hrx-only family would advertise a model
+the route refuses at load.
+
+The 2026-11-05 census body (engine#619) asked about these packs. Each row is a recorded answer,
+not a mapping:
+
+| repo (2026-11-05 body) | architecture it declares | `registry/architectures.json` | NPU route |
+|---|---|---|---|
+| `FastFlowLM/MiniCPM-OCR-1.0-NPU2` | `MiniCPMOcrForConditionalGeneration` | none (the pin registers `MiniCPMForCausalLM`, `MiniCPM3` and `MiniCPMV4_6` only) | not served: an OCR/vision tower; the route claims text decoders only |
+| `FastFlowLM/MiniCPM-V-4.7-35B-A3B-NPU2`, `FastFlowLM/MiniCPM-V-4.7-1B-NPU2` | `MiniCPMV4_7ForConditionalGeneration` | none (V4_6's text tower maps through `qwen35`, a VLM wrapper the pin does not register) | not served: a vision-language pack; a converter registration for the text tower plus a vision scope decision come first |
+| `FastFlowLM/Qwen3.8-27B-DFlash2-NPU2` | `DFlash2DraftModel` | none; reviewed not-an-alias (docs/arch-gaps.md, `dflash2`) | not served: a speculative drafter, not a standalone decoder; it needs the reviewed dflash2 support, not a mapping |
+| `FastFlowLM/LFM3-1.7B-NPU2` | `Lfm3ForCausalLM` | none (LFM2 / LFM2-MoE are mapped; LFM3 is not registered at the pin) | not served: no LFM3 model type or kernels in the route |
+| `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | none on 2026-11-05 (no config); `HYV3ForCausalLM` / model_type `hy_v3` by 2026-11-06 | `HYV3ForCausalLM` -> `hy_v3`, hrx only | not served: an hrx-only family; the 2026-11-06 dev-box run prints it as `!! NPU FLM ... npu route: no` |
+| `FastFlowLM/smolvla-NPU2` | none (no config), no `*.q4nx` | none | not a pack: a config-less VLA repo. It prints as `!! NEW FLM` because its config carries no `library_name` for the custom-code rule, but there is no architecture to map and no Q4NX file to serve |
+
+A pack whose family the route should serve needs that family's model type and its kernels in the
+release before a registry entry means anything. Until then the row above is the record: the daily
+report prints a repo only when it is new or changed, so a quiet day is quiet, and the next change
+to one of these repos is a prompt to update this table rather than a namespace error.
+
+The 2026-11-06 census body (engine#1253) read the whole org from a fresh state, so it also printed
+every pack whose family the registry maps for `hrx` only. Those are the `!! NPU FLM` rows: the
+architecture is covered on the CPU route, but a Q4NX directory needs the NPU route and `npu` is
+not in the entry's `backends`. Family by family:
+
+| family (`gguf`) | packs in the 2026-11-06 body | `backends` | NPU route answer |
+|---|---|---|---|
+| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx | not served: the dense qwen35 family has no NPU kernel set; the serving work is tracked in engine#587 (Qwen3.8-27B-NPU2) |
+| `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
+| `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
+| `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
+| `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served |
+| `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2` | hrx | not served |
+| `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
+| `hy_v3` | `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | hrx | not served; the first table above records this one |
+
+Adding `npu` to one of those entries would claim kernels this build does not carry. A family leaves
+this list when `NPU_ARCHS` in `tools/registry_build.py` names its HF class with the model type the
+route loads and a captured `--device npu` run stands behind it; the regenerated entry then carries
+`npu` in `backends`. Note that the route does serve `qwen3_5_moe` (`Qwen3.6-35B-A3B` through the
+GGUF-on-NPU forward), while every D3-* pack in this body declares the dense `qwen3_5` family, so
+the two are not the same answer and the registry keeps them apart.
 
 ### Sealed kernel sets: the manifest is what says a set is ours
 
@@ -1306,6 +1439,23 @@ that is the trade, and it is why the exclusive default stays.
 device: exclusive excludes everything, three shared streams co-exist, and an exclusive waits for the
 last one to go.
 
+**When a live process holds it.** The lock is an `flock(2)`, so it dies with its holder and there is
+nothing to reap -- but a *live* holder (a serve left running with no client, engine#1241) keeps it for
+as long as it runs, and before #1241 the wait said only `waiting for the exclusive device lock` and
+then nothing for half an hour. After about 2 s the wait now names the holder, and repeats that at most
+once a minute:
+
+    [npu] device lock held by pid 2689658 (1bit serve --device npu ...) for 41 s
+
+The line comes from `/proc/locks` (the `FLOCK` entry on the lock file's `st_dev`/`st_ino`) plus the
+holder's `/proc/<pid>/cmdline`; where a container hides either, the wait says it cannot name the
+holder instead of failing. The same line is printed when the NPU refuses a context with `device error
+(code 102): No such device`: a held array answers exactly like a dead one, so that message on its own
+used to send operators looking at the device, the ELF or the container. `ONEBIT_NPU_LOCK_WAIT_MAX=<seconds>`
+bounds the wait (unset = unlimited, still the default, because ordinary contention is what the wait is
+for); on timeout it fails with the holder named rather than spending a device ticket. Nothing here
+reaps or signals the holder -- killing another lane's live serve is the box-crashing path.
+
 **The row this exists for.** On Linux the two engines are two instances of this runtime on two
 *different* models at the same time -- "all NPU models at once" -- and that is what
 `tools/showcase-612-npu-streams.sh` measures with `MODEL` and `MODEL_B` (default Qwen3-0.6B and
@@ -1487,7 +1637,10 @@ be 0) for exactly that reason.
 * live acceptance equals the offline protocol **at every depth** over 8 prompts × 64 tokens: depth 1 **+0.00**,
   depth 2 **+0.55**, depth 3 **+0.09**, depth 4 **+1.08** pp (75.14 / 63.24 / 73.26 / 84.13 %), with greedy text
   byte-identical to plain decode on all 8 prompts and 0 stream mismatches.
-* the chain is **prompt-dependent**: 1.80 to 4.33 tokens per pass, mean **3.14** over the same 8 prompts.
+* the chain is **prompt-dependent**: 1.80 to 4.33 tokens per pass, mean **3.14** over the same 8 prompts. That is the
+  unweighted mean of the eight per-prompt chains; pooled over the window's 181 chain iterations the same counts give
+  **2.87** tokens per pass (the figure in `docs/npu-leaderboard.md`), because the prompts with short chains take most
+  of the iterations. Both are the same measurement, weighted two ways — say which one a comparison is using.
 
 **Do not enable the draft route on a serve as it stands.** The loop pays a verify batch *and* a step per
 iteration, so it is faster only above a break-even chain, and that break-even is **3.2-4.1 tokens/pass** by two
@@ -1555,3 +1708,27 @@ pinned generator: the tool drops a half-written last line (a killed capture), re
 measurable column instead of printing an empty table, and exits non-zero on a malformed one. The
 `--self-test` builds a synthetic GGUF and capture with hand-computed answers, so the arithmetic is
 gated without a model on disk.
+
+## FAQ
+
+### Does the NPU run every model?
+
+No. It runs the dense Qwen3 family, including GGUF models it repacks to Q4NX on load (six
+architectures), plus the models whose kernel sets ship with the engine. Every other GGUF still runs
+on the iGPU through [HRX](hrx.md), and the models checked on this box are on [models.md](models.md).
+
+### Is the NPU faster than the iGPU?
+
+Not on the models it runs today: the route is correctness-first, speed next, and what it measures is
+on the [NPU leaderboard](npu-leaderboard.md). It is a second device beside the iGPU, not a
+replacement for it.
+
+### Can the GPU and the NPU run at the same time?
+
+Yes. The two were measured running together for forty repetitions with no hang and no corruption,
+and `--device hybrid` splits a single request across them ([hybrid.md](hybrid.md)).
+
+### Do I need a special kernel or driver?
+
+The NPU needs the `amdxdna` kernel driver. The [1bit OS](os-v3.md) appliance ships a kernel built
+with it, and the [Linux kernel](kernel.md) page covers building your own.

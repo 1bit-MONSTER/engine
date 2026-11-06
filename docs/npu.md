@@ -154,6 +154,11 @@ too), a sliding layer stays causal, and the mode reads the same numbers only in 
   that starts above 0 is refused by name — its earlier positions were already encoded causally.
 - **it cannot generate.** `step()` (one position at a time, keys only in the past) refuses with the mode's
   name, so a d3 pack served on the chat route is an error rather than a silently causal answer.
+- **nor can it verify a draft.** `step_batch_all()` returns the logits of *every* row of a batch, which a
+  speculative decoder compares against the tokens it drafted at those positions. In a noncausal batch each
+  row attends to the rows after it, so those are not prefix-conditioned logits and the call is refused with
+  the same mode name. Unreachable today (the d3 packs ship no draft head), refused now so a pack that grows
+  one cannot be silently verified through a mask it was not trained with.
 
 An unknown mode string is a plan refusal, never a default: the two modes give different numbers, and a
 guessed mask is a different model.
@@ -1394,8 +1399,10 @@ The limit is the smaller of the text path's 32,768 tokens per question and the b
 Not served, and refused by name rather than ignored: `images`/`videos` (the vision tower and FFmpeg are a
 separate issue), so `box`/`track`/`assets` questions cannot be asked. Also not implemented: upstream's
 "state computed once per request" optimisation (a state read once and shared by every question — it is the
-prefix cache's job, #650) and the pack's `noncausal_full_attention` attention mode, so a d3 row measured
-here is not claimed to be upstream-equal in accuracy until it is measured against it.
+prefix cache's job, #650). The pack's `noncausal_full_attention` mode *is* implemented (above, engine#861);
+what is not measured is **accuracy against upstream**, which needs a labelled evaluation and is a separate
+exercise (engine#796's third rung), so a d3 row measured here is not claimed to be upstream-equal in
+accuracy.
 
 Send the body as JSON (`Content-Type: application/json`): httplib parses an
 `application/x-www-form-urlencoded` body as a form and caps it at 8 KB, which is a 413 before this route

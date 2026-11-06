@@ -40,6 +40,22 @@ skip() {
     case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
+# A check that DIES must not take the evidence - or the NPU - with it. Measured on the c27 board (5 Nov 2026 21:52Z):
+# bash killed this script at `PPID=$!` (a readonly builtin), so five rows of a later run were refused with
+# `code 102: No such device` and the appliance's own u4-release-check row reded as "no RESULT line; rc=1" with nothing
+# to act on. The turn that was mid-flight when the script died kept a hwctx in the driver; the next backend's
+# `Init hwctx` was refused (ret -19, 21:55:37Z) and 20 s later the watchdog TDR'd and power-cycled the device
+# (21:55:52Z). So: the footer announces itself (a death before it says so in the log, so the RESULT line is never
+# silently missing), and a death ends the NPU turn (unload -> lemond stops the backend -> the context is released).
+RC_FOOTER=
+rc_on_exit() {
+    [ -n "$RC_FOOTER" ] && return 0        # a normal run already printed its RESULT and owns the device state
+    say "RESULT: FAIL (this check died before its footer: $ROWS row(s) ran, $FAILS failed - read the line above)"
+    [ -n "${NPU:-}" ] && [ -n "${API:-}" ] || return 0
+    got --header='Content-Type: application/json' --post-data='{}' "$API/api/v1/unload" >/dev/null 2>&1
+    return 0
+}
+trap rc_on_exit EXIT
 # A row that holds the NPU can hold it for a minute or two (a fresh backend per ladder rung, a 512-token turn),
 # and on the owner's console that is indistinguishable from a hung check - which is what the board operator
 # reported. So each NPU row announces itself before it starts. Not a row: the prefix is `info` so a harness that
@@ -134,13 +150,45 @@ post_fetch() {  # <json body> <url> [slow]
     fi
 }
 
+# ── `code 102` is a WAIT, not a verdict (TOS3-C29 item 2; c28 board, 5 Nov 2026) ─────────────────
+# The NPU driver gives the accelerator to ONE client. When that client exits, 0011v2 frees the partition about
+# 2 s later, and for those seconds every new client is refused with
+#   npu runtime: device error (code 102): No such device
+# Measured on the c28 board: this check ran straight after its own NPU rows released the device and 8 of 25 rows
+# reded on that window, so a healthy appliance read as broken. (Worse, the failed run left a turn in flight and
+# the driver TDR'd 15 s later - see PR #1177.) So a reply carrying code 102 is retried with a 1 s back-off, up to
+# NPU_WAIT seconds, and the footer says how long was spent waiting. A 102 that outlives the window is reported
+# unchanged: the wait shortens a transient, it does not excuse a device that stays gone.
+NPU_WAIT=${NPU_WAIT:-10}
+# The counter has to be a FILE: every reply is read through $( ), so the retry runs in a subshell and a plain variable
+# set in there never reaches the footer (measured while proving this block - the wait worked and the footer said 0 s).
+NPU_WAITFILE=${NPU_WAITFILE:-/tmp/.1bit-npu-waited.$$}
+_npu_102() {  # <reply> -> 0 when the backend named the refusal, with its own words
+    case "$1" in *'code 102'*) return 0 ;; esac
+    return 1
+}
+_npu_waited() {  # <seconds spent backing off>
+    [ "${1:-0}" -gt 0 ] 2>/dev/null && printf '%s\n' "$1" >> "$NPU_WAITFILE" 2>/dev/null
+    return 0
+}
+
 auth_post() {  # <json body> <url> [slow] -> the reply
-    post_fetch "$1" "$2" "${3:-}"
+    _r=$(post_fetch "$1" "$2" "${3:-}")
+    _w=0
+    while _npu_102 "$_r" && [ "$_w" -lt "$NPU_WAIT" ]; do
+        sleep 1; _w=$((_w + 1))
+        _r=$(post_fetch "$1" "$2" "${3:-}")
+    done
+    _npu_waited "$_w"
+    printf '%s' "$_r"
 }
 
 # A POST whose *status and headers* are the evidence (engine#1024's non-streamed arm answers 503 + Retry-After, so the
 # body alone says nothing and got/get_slow hide both). Writes the body to $3 and prints "<status> <retry-after>".
-auth_post_watch() {  # <json body> <url> <file for the body>
+# The same back-off, for the arm whose evidence is the status and headers: a non-streamed client refused code 102
+# must be asked again rather than reported as "no HTTP status at all", which is what the c28 board said about a
+# request the partition had simply not freed for yet.
+post_watch_once() {  # <json body> <url> <file for the body>
     : > "$3"
     if command -v curl >/dev/null 2>&1; then
         if [ -n "$KEY" ]; then
@@ -158,6 +206,17 @@ auth_post_watch() {  # <json body> <url> <file for the body>
     fi
     printf ' '
     sed -n 's/^[Rr]etry-[Aa]fter: *//p' "${3}.headers" 2>/dev/null | tr -d '\r' | head -1
+}
+
+auth_post_watch() {  # <json body> <url> <file for the body>
+    _s=$(post_watch_once "$1" "$2" "$3")
+    _w=0
+    while _npu_102 "$(cat "$3" 2>/dev/null)" && [ "$_w" -lt "$NPU_WAIT" ]; do
+        sleep 1; _w=$((_w + 1))
+        _s=$(post_watch_once "$1" "$2" "$3")
+    done
+    _npu_waited "$_w"
+    printf '%s' "$_s"
 }
 
 # Readiness: on a cold stick lemond takes tens of seconds to answer its first request (catalog, web
@@ -594,6 +653,9 @@ next')
     check PASS "$(laya_verdict '{"choices":[{"message":{"content":"Here you go"}}],"x_lemonade_route":{"route_to":"m","matched_rule":"laya-prose","default_used":false,"trace":[{"condition":"classifier:laya","score":0.77}]}}' prose m)"
 
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
+    # A self-test is not a check run: without this the EXIT trap above appended "RESULT: FAIL (this check died
+    # before its footer)" to every green self-test, which reads exactly like the death the trap exists to report.
+    RC_FOOTER=1
     exit $rc
 fi
 
@@ -1241,10 +1303,14 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     PLONG="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Write a long essay about the history of cartography, and about what map-making changed in how people understood the world.\"}],\"max_tokens\":1000,\"temperature\":0,\"stream\":true}"
     PSHORT="{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":16,\"temperature\":0}"
     ( auth_post "$PLONG" "$API/api/v1/chat/completions" slow > "$PDIR/long.sse" 2>&1 ) &
-    PPID=$!
+    # NOT `PPID=$!`: PPID is a readonly bash builtin, so this line was a fatal error in the image's own shell (it
+    # printed "PPID: readonly variable" and exited 1, with no RESULT line - measured on the c27 board, and the row
+    # before this one had already passed). busybox ash does not have PPID readonly, which is why a shell that never
+    # ships the check could not catch it.
+    QPLPID=$!
     sleep 1
     PW=$(auth_post_watch "$PSHORT" "$API/api/v1/chat/completions" "$PDIR/short.json")
-    wait "$PPID" 2>/dev/null
+    wait "$QPLPID" 2>/dev/null
     PLONG_BODY=$(cat "$PDIR/long.sse" 2>/dev/null)
     PSHORT_BODY=$(cat "$PDIR/short.json" 2>/dev/null)
     TDRP1=$(tdr_count)
@@ -1371,6 +1437,11 @@ else
 fi
 
 say ""
+# The back-off leaves a trace: a run that only passed because the partition freed in time must say so, or the next
+# person reads a clean transcript and believes nothing was ever refused.
+NPU_WAITED=$(awk '{s += $1} END {print s + 0}' "$NPU_WAITFILE" 2>/dev/null)
+[ "${NPU_WAITED:-0}" -gt 0 ] 2>/dev/null && say "info  npu-wait : $NPU_WAITED s spent backing off on code 102 (a client had just released the partition; the window is ~2 s)"
+RC_FOOTER=1
 if [ "$FAILS" = 0 ]; then
     say "RESULT: PASS ($ROWS checks, no failures)"
     # Name only the rows that actually skipped. On the 2026-11-02 live boot four of these five PASSED on the board and

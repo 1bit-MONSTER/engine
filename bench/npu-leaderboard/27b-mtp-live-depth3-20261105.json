@@ -1,0 +1,29 @@
+{
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX pb16i (int8 GEMM) + MTP head pb16i-exact",
+  "settings": {
+    "device": "accel0",
+    "model_dir": "bonsai2-27b-pb16i",
+    "head": "pb16i-exact",
+    "k": 4,
+    "tau": 0,
+    "prompts": 8,
+    "tokens_per_prompt": 64,
+    "batch_rows": 16,
+    "vocab": 248320,
+    "hidden": "post-final-norm"
+  },
+  "instrument": "tools/mtp_depth_pool.py over the three in-tree tickets tests/fixtures/mtp_clause55/*.txt; counts summed over the window's 181 chain iterations",
+  "repeats": 3,
+  "timestamp": "2026-11-05T16:07:13Z",
+  "source": "tests/fixtures/mtp_clause55/{p0,p1-4,p5-7}.txt, verbatim extracts of npu-hold tickets clause55 p0|p1-4|p5-7 (20261105-115131|115551|120713)",
+  "id": "27b-mtp-live-depth3-20261105",
+  "metric": {
+    "name": "draft acceptance, depth 3 (live loop, all chains)",
+    "value": 34.81,
+    "unit": "%"
+  },
+  "notes": "63/181 chains; 63 of 86 reached = 73.26 % conditional, against offline 60/82 = 73.17 % (60/181 = 33.15 % all-chains)."
+}

@@ -1,0 +1,29 @@
+{
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX pb16i (int8 GEMM) + MTP head pb16i-exact",
+  "settings": {
+    "device": "accel0",
+    "model_dir": "bonsai2-27b-pb16i",
+    "head": "pb16i-exact",
+    "k": 4,
+    "tau": 0,
+    "prompts": 8,
+    "tokens_per_prompt": 64,
+    "batch_rows": 16,
+    "vocab": 248320,
+    "hidden": "post-final-norm"
+  },
+  "instrument": "tools/mtp_depth_pool.py over the three in-tree tickets tests/fixtures/mtp_clause55/*.txt; counts summed over the window's 181 chain iterations",
+  "repeats": 3,
+  "timestamp": "2026-11-05T16:07:13Z",
+  "source": "tests/fixtures/mtp_clause55/{p0,p1-4,p5-7}.txt, verbatim extracts of npu-hold tickets clause55 p0|p1-4|p5-7 (20261105-115131|115551|120713)",
+  "id": "27b-mtp-offline-tokens-per-pass-20261105",
+  "metric": {
+    "name": "tokens per pass (offline protocol, same positions, k=4)",
+    "value": 2.82,
+    "unit": "tokens/pass"
+  },
+  "notes": "1 + 329/181: the offline protocol restricted to the live loop's own chain positions, which is the pair the 2 pp clause compares. Not the published offline bar, which scores every position and gives 3.19 tokens/pass on this pack (engine#805) -- a different position sample, not a better measurement."
+}

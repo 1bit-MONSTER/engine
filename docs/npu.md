@@ -366,6 +366,27 @@ its engine mutex (`app/forward_serve.cpp:258`, `:698`), so one pass is in flight
 N processes sharing the device by flock (`app/npu_device_lock.h`), each counting its own. A caller that
 parallelised the layer loop would need per-pass counters instead.
 
+### From a 1BP package
+
+`tools/onebp_import.py <model.1bp> <out dir> --config <snapshot dir>` imports a legacy `.1bp` package
+(one file: a 256-byte header, a tensor index, the weights). Its 4-bit payload is a 32 x 256 tile of 5120 B
+with this engine's value convention (`scale*q + min`), but **not** its intra-tile layout: `.1bp` stores
+the scales/mins row-major (`[r*8+g]`) and the codes adjacent-pair (even column low), while `npu/q4nx.h`
+stores them group-major (`[g*32+r]`) and lane-swizzled. The import permutes each tile's bytes — the
+inverse of the archived converter's own `q4nx_tile_to_onebp()` — and dequantizes and re-quantizes nothing;
+`F16`/`F32` tensors become bf16. `--verify` proves it by comparing every byte the container holds against
+the same permutation of the package's slice (and against the GGUF behind any tensor that came from
+`--embedding-from`). Reading a `.1bp` tile as if it were already this engine's tile is not a near miss:
+on `ZR1-1.5B-1BP` the decoded weights then correlate 0.003 with the model — fluent noise that still looks
+like weights, the failure mode of [engine#1110](https://github.com/1bit-MONSTER/engine/issues/1110) —
+and 0.995-0.997 after the permutation. A v1 package carries no `token_embd`/`lm_head`, so importing one needs
+`--embedding-from <gguf>` (and `--verify` of it takes the same flag: it rebuilds the same plan); the tool stops
+rather than write a container that cannot answer. Any tensor
+with no Q4NX mapping is refused **by name** (`no Q4NX name for blk.0.cca_conv_grp.weight`) instead of
+guessed: Zaya1's grouped conv, EDA router and fused `ffn_gate_up_exps` have no op in `npu/forward` yet,
+so a package of that architecture is not importable — see `~/briefs/ZAYA-OPFAMILY-NOTE.md` for the op
+list and its cost.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model
@@ -1005,7 +1026,10 @@ supported by this route's schema-to-GBNF converter", "`gbnf: unterminated litera
 "`stream`: must be true or false", "`tools`: must be an array"),
 never a silently ignored key and never a 500: a wrong *type* is a client error like any other, including on the
 fields the route reads before it starts decoding (engine#1106). `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
-an end-of-sequence token, a stop sequence or a grammar that allows nothing more.
+an end-of-sequence token, a stop sequence, a grammar that allows nothing more, or a constrained answer the model
+ended itself once its grammar had reached an accepting state — the route puts the container's end tokens into the
+mask exactly there, so a complete JSON object reports `stop` instead of padding with whitespace to `max_tokens`
+(engine#1182).
 
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
 `third_party/llama.cpp/src/llama-sampler.cpp` (top_k, then top_p, then temperature, then the
@@ -1484,7 +1508,10 @@ be 0) for exactly that reason.
 * live acceptance equals the offline protocol **at every depth** over 8 prompts × 64 tokens: depth 1 **+0.00**,
   depth 2 **+0.55**, depth 3 **+0.09**, depth 4 **+1.08** pp (75.14 / 63.24 / 73.26 / 84.13 %), with greedy text
   byte-identical to plain decode on all 8 prompts and 0 stream mismatches.
-* the chain is **prompt-dependent**: 1.80 to 4.33 tokens per pass, mean **3.14** over the same 8 prompts.
+* the chain is **prompt-dependent**: 1.80 to 4.33 tokens per pass, mean **3.14** over the same 8 prompts. That is the
+  unweighted mean of the eight per-prompt chains; pooled over the window's 181 chain iterations the same counts give
+  **2.87** tokens per pass (the figure in `docs/npu-leaderboard.md`), because the prompts with short chains take most
+  of the iterations. Both are the same measurement, weighted two ways — say which one a comparison is using.
 
 **Do not enable the draft route on a serve as it stands.** The loop pays a verify batch *and* a step per
 iteration, so it is faster only above a break-even chain, and that break-even is **3.2-4.1 tokens/pass** by two

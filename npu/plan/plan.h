@@ -138,6 +138,21 @@ struct Plan {
     std::string tile_order = "engine-1";
     std::string attention_mode = "causal";
     bool noncausal() const { return attention_mode == "noncausal_full_attention"; }
+    // P7 (#806) part A: what the KV cache is stored as.  `f16` is every plan written before this field
+    // existed, and stays the default for that reason.  `int8` stores that side as int8 with one fp32
+    // scale per (head, token), taken AFTER a per-head Hadamard rotation -- the rotation is what makes one
+    // scale affordable, because it collapses the per-channel magnitude spread the quantizer would
+    // otherwise have to cover (docs/npu-plan.md).  `key` is the side that pays no un-rotation, since
+    // (QH)(KH)^T = QK^T; `value` is a separate choice because an int8 V needs its own inverse transform
+    // on the output, so K-only is the cheapest variant to prove the path with.
+    //
+    // This is a description, not an implementation: a target that cannot honour `int8` must refuse it by
+    // name.  Falling back to f16 would answer with the right text and a different cache contract, which
+    // is the failure mode the plan layer exists to remove.
+    std::string kv_key = "f16", kv_value = "f16";
+    int kv_hadamard_block = 0;       // 0 = no rotation
+    std::string kv_hadamard_signs;   // optional per-channel sign file, bare name under the model dir
+    bool kv_int8() const { return kv_key == "int8" || kv_value == "int8"; }
     // Where the decode family is looked for, in order: which given path it hangs off, and the
     // relative directory under it ("." = that directory itself).
     struct DecodeDir { bool under_model = false; std::string path; };
@@ -210,6 +225,40 @@ struct Plan {
             if (p.attention_mode != "causal" && p.attention_mode != "noncausal_full_attention")
                 throw PlanError("plan: " + path + " attention.mode \"" + p.attention_mode +
                                 "\" is not causal or noncausal_full_attention");
+        }
+        // Optional and defaulted on purpose, for the same reason as attention.mode: a plan written
+        // before P7 existed describes f16 KV, which is what every plan meant then.
+        if (j.contains("kv")) {
+            const auto& kv = obj(j, "kv", path);
+            // Type before value: a number where a dtype belongs is a refusal that names the field, not a
+            // JSON exception escaping the loader.
+            for (const char* side : {"key", "value"})
+                if (kv.contains(side) && !kv.at(side).is_string())
+                    throw PlanError("plan: " + path + " kv." + side + " is not a string");
+            p.kv_key = kv.value("key", "f16");
+            p.kv_value = kv.value("value", "f16");
+            if (p.kv_key != "f16" && p.kv_key != "int8")
+                throw PlanError("plan: " + path + " kv.key \"" + p.kv_key + "\" is not f16 or int8");
+            if (p.kv_value != "f16" && p.kv_value != "int8")
+                throw PlanError("plan: " + path + " kv.value \"" + p.kv_value + "\" is not f16 or int8");
+            if (kv.contains("hadamard")) {
+                const auto& h = obj(kv, "hadamard", path);
+                p.kv_hadamard_block = positive_or_zero(h, "block", path);
+                const int b = p.kv_hadamard_block;
+                if (b != 0 && (b < 2 || b > 65536 || (b & (b - 1)) != 0))
+                    throw PlanError("plan: " + path + " kv.hadamard.block " + std::to_string(b) +
+                                    " is not 0 or a power of two in [2, 65536]");
+                p.kv_hadamard_signs = h.value("signs", "");
+                // A bare file name, never a path: a plan must not be able to point the loader at a file
+                // the command line did not name (the same rule decode.dirs follows).
+                if (p.kv_hadamard_signs.find('/') != std::string::npos ||
+                    p.kv_hadamard_signs.find("..") != std::string::npos)
+                    throw PlanError("plan: " + path + " kv.hadamard.signs \"" + p.kv_hadamard_signs +
+                                    "\" must be a bare file name (no directory part)");
+                if (b == 0 && !p.kv_hadamard_signs.empty())
+                    throw PlanError("plan: " + path +
+                                    " kv.hadamard.signs names a file but kv.hadamard.block is 0 (no rotation)");
+            }
         }
         if (j.contains("kernels")) {
             const auto& k = obj(j, "kernels", path);

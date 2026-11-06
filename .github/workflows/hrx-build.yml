@@ -1,0 +1,96 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# The HRX build at PR time (engine#1077, docs/hw-gate.md "The HRX build check"). ci.yml configures
+# the engine without ONEBIT_HRX, so it never enters cmake/hrx.cmake, and hw-gate.yml runs only on a
+# labelled PR or a bump-hrx/* branch: before this job, ggml/src/ggml-hrx in the pinned
+# third_party/llama.cpp was compiled by no job at PR time, pin bumps included.
+#
+# What it runs: the engine configured with -DONEBIT_HRX=ON and `cmake --build --target onebit`,
+# which builds llama_hrx (llama.cpp with GGML_HRX=ON, and hrx-system from the pinned tree, through
+# cmake/hrx.cmake) and then links onebit with its HRX wiring. A compile and a link only: no device,
+# no GPU token, no NPU lock. The public plumbing only: the private HIP add-on is the hardware
+# gate's job (hw-gate.yml), so this log never shows private source.
+#
+# Cost: $0 Actions spend. It is a self-hosted job on the box's engine runner, never a hosted one.
+# The build tree persists under ~/.cache/hrx-build on the box and llama_hrx is BUILD_ALWAYS, so a
+# PR rebuilds what it changed; a pin bump pays the full build once. It runs on the build's own
+# inputs only (the paths below), not on every PR.
+#
+# Runner: [self-hosted, strixhalo, pr-agent], the runner hw-gate.yml uses: it has TheRock at
+# /opt/rocm-therock (cmake/hrx.cmake's default without a fetched SDK) and runs one job at a time, so the persistent tree is never shared by two runs.
+# The build runs under ~/lb/thermal-run.sh (4 cores, paused at 78 C) like every build on the box.
+# Fork PRs never reach the box: the `if:` requires the head repository to be this one.
+name: hrx-build
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - third_party/llama.cpp
+      - third_party/hrx-system
+      - CMakeLists.txt
+      - cmake/hrx.cmake
+      - config/hrx-toolchain.config
+      - config/hrx-system-hold.config
+      - app/serve.cpp
+      - .github/workflows/hrx-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hrx_build:
+    runs-on: [self-hosted, strixhalo, pr-agent]
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    concurrency:
+      group: hrx-build-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    # a cold build (both pins moved) on 4 throttled cores; an incremental one takes minutes
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Check out the HRX pair (llama.cpp + hrx-system)
+        run: |
+          set -euo pipefail
+          git submodule sync -- third_party/llama.cpp third_party/hrx-system
+          git -c protocol.version=2 submodule update --init --depth 1 third_party/llama.cpp third_party/hrx-system
+          git submodule status -- third_party/llama.cpp third_party/hrx-system
+          # outside the checkout, which actions/checkout cleans: the tree persists across runs
+          echo "HRX_BUILD=$HOME/.cache/hrx-build/engine" >> "$GITHUB_ENV"
+
+      - name: Configure with ONEBIT_HRX=ON
+        run: |
+          set -euo pipefail
+          ~/lb/thermal-run.sh cmake -S . -B "$HRX_BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DONEBIT_HRX=ON
+
+      - name: Build llama_hrx and onebit
+        env:
+          CCACHE_BASEDIR: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          ~/lb/thermal-run.sh cmake --build "$HRX_BUILD" --target onebit -j 4
+          # the build must have produced the HRX backend and the server onebit runs
+          ls -l "$HRX_BUILD"/hrx/llama/bin/llama-server
+          find "$HRX_BUILD"/hrx/llama -name 'libggml-hrx.so*' -print -quit | grep .

@@ -57,6 +57,12 @@ start() {   # start <device> <log> [env...]
         code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break
         kill -0 "$pid" 2>/dev/null || break; sleep 0.5
     done
+    # A server that never came up because it could not bind is a port collision, not a defect in
+    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
+        echo "FAIL: hybrid_e2e: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
+        exit 1
+    fi
     [ "$code" = 200 ]
 }
 stop() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=; }

@@ -14,7 +14,8 @@
 # limitations under the License.
 #
 # PR-Agent settings (.github/workflows/pr-agent.yml): a local coding model through the engine's
-# own OpenAI-compatible server, no cloud API.
+# own OpenAI-compatible server, no cloud API. The endpoint (OPENAI__API_BASE, OPENAI__KEY) is set in the
+# workflow's env: since PR-Agent 0.49 an [openai] api_base/key in this file is ignored as host-only.
 
 [config]
 model = "openai/qwen3-coder"
@@ -22,10 +23,6 @@ fallback_models = []
 custom_model_max_tokens = 65536
 temperature = 0.2
 ai_timeout = 900
-
-[openai]
-api_base = "http://127.0.0.1:8090/v1"
-key = "local"
 
 [pr_agent]
 publish_output = true

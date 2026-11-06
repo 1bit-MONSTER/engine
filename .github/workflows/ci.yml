@@ -56,6 +56,7 @@ jobs:
         run: |
           python3 -m pip install numpy gguf
           python3 tests/gguf_to_q4nx_test.py
+          python3 tests/repack_verify_source_test.py
           python3 tests/ternary_to_q4_0_test.py
           python3 tests/mtp_draft_vocab_test.py
           python3 tests/check_pins_test.py

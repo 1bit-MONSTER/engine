@@ -47,6 +47,12 @@ start() {   # start <log> [env...]
     api="http://127.0.0.1:$port"
     local code=000
     for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.1; done
+    # A server that never came up because it could not bind is a port collision, not a defect in
+    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
+        echo "FAIL: hybrid_kvshare_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
+        exit 1
+    fi
     # this serve's OWN slot directory, from its child's argv: /tmp/1bit-hybrid-* is shared with every other serve
     # on the box, so globbing it reports another test's in-flight socket as this route leaking one (see the same
     # fix and the measurement in tests/hybrid_route.sh)

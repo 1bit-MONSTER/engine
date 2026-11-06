@@ -44,7 +44,9 @@ LINE_STYLES = [
       # os/v3 Puppy image, cycle 16: XDG desktop entries are ini-shaped with '#' line comments. The autostart
       # that opens the appliance's chat screen is one, and CI is right to want a notice on it (it runs a
       # program as root).
-      "*.desktop"), "#"),
+      "*.desktop",
+      # cycle 30: udev rules are '#' comments (the NPU keepawake rule is the first one the image ships)
+      "*.rules"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 

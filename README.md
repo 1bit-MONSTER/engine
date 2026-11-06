@@ -90,6 +90,7 @@ The release goes out when every item on the release checklist is done ([docs/rel
 - [HRX on the Radeon 8060S](https://1bit.gg/hrx.html) and [the NPU engine](https://1bit.gg/npu.html): the two device routes, on the site.
 - [docs/architecture.md](docs/architecture.md): how the engine is built, what runs where, the hardware gate, the kernel, the direction.
 - [docs/serve.md](docs/serve.md): `1bit serve` and its options.
+- [docs/zero-copy.md](docs/zero-copy.md): the copies left on the serving paths, what each one costs per token, and why it stays.
 - [Measured results](https://github.com/1bit-MONSTER/engine/wiki): every number with how it was taken.
 - [Site repository](https://github.com/1bit-MONSTER/site): builds 1bit.gg from this repository.
 

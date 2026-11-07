@@ -966,6 +966,14 @@ add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
+# The host fallback GEMM reads a padded design's activations at stride a_k, inside the caller's buffer
+# (engine#808 review: the split moved the engine#845 pad into the target and left the host branch on the
+# raw A). The test's activation buffer carries a NaN guard tail, so an implementation that reads past the
+# buffer fails even when its numbers look plausible. Host-only, no model, no device.
+add_executable(host_gemm_pad_test tests/host_gemm_pad_test.c npu/forward/src/q4nx_pack.c)
+target_include_directories(host_gemm_pad_test PRIVATE npu/forward/include)
+target_link_libraries(host_gemm_pad_test PRIVATE m)
+add_test(NAME host_gemm_pad COMMAND host_gemm_pad_test)
 # A PLAIN bf16 tensor (rows*cols*2 bytes, no tile header) must decode as bf16, not as 5120-byte
 # q4_1 tiles, and a buffer of any other size must be refused (engine#875).  Plain C, no device.
 add_executable(npu_dequant_bf16_test tests/npu_dequant_bf16_test.c npu/forward/src/q4nx_dequant.c)

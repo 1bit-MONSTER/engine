@@ -150,6 +150,23 @@ Runs go through `npu-hold` tickets; a new ELF is not involved (no kernel changes
 kind. The reference binary is the `c20`-era build with the same model dir, so a difference can only be the
 split.
 
+### The one place the move is not a pure copy, and why it is not a dropped safety
+
+`main`'s `npu_gemm_rows` checks `kctx.canary_short()` unconditionally after a launch, and again through the
+engine#666 retry. In the target both checks read `!kctx.gemv && kctx.canary_short()`: `I8Ctx::readback()`
+runs `verify_canary()` only for a non-gemv context (`npu_engine_i8ctx_inc.h`), so `short_row_` is never set on
+a gemv context and `main`'s unconditional check was dead there. The guard is identical on the contexts that
+can set it; the conditional just says so. Everything else in `npu_gemm`/`npu_gemm_rows` is the same code with
+the mechanical renames (`cur_layer_` → `ar.layer`, `err_` → `err`, `LhScope` → `q4nx_lh::`,
+`hadamard_rotate` → `q4nx_hadamard::rotate`).
+
+The host fallback is **not** part of the move, and that is where review found a real defect: the engine#845
+activation pad (`q4nx_pad_a_f32`) lives in the target for the device leg, so the host branch had to keep its own
+pad — and it did not, reading `A[real_k .. K)` past the caller's buffer and, in the rows form, at stride `K`
+from a buffer laid out at stride `real_k`. Both host branches now call `q4nx_host_gemm_f32_padded()`, which owns
+the pad-and-read pair so a caller cannot separate them, and `tests/host_gemm_pad_test.c` pins it with a NaN guard
+tail after the activation buffer.
+
 ## 5. Deliberately not in A1
 
 - The int8-activation contract for `gemv` (see §2). Separate step, byte-exact gate.

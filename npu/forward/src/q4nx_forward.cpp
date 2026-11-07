@@ -3001,13 +3001,12 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
                               std::vector<float>& out, int wkey, const char* sc, int a_k) {
     if (host_gemm_) {
+        // The fallback reads A[k] for k < K exactly as the kernel does, so it needs the engine#845 pad
+        // too: q4nx_host_gemm_f32_padded() owns the pad-and-read pair so neither leg can be handed an
+        // unpadded A. (In review of this PR the split moved the pad into the target and left this
+        // branch reading past the caller's buffer at a padded design.)
         out.assign((size_t)N, 0.0f);
-        for (int k = 0; k < K; k++) {
-            const float a = A[k];
-            if (a == 0.0f) continue;
-            const float* row = Bmat + (size_t)k * N;
-            for (int n = 0; n < N; n++) out[(size_t)n] += a * row[n];
-        }
+        q4nx_host_gemm_f32_padded(A, a_k, 1, K, N, Bmat, out.data());
         return;
     }
     npu::target::GemvArgs a;
@@ -3023,16 +3022,10 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
                                    const float* Bmat, std::vector<float>& out, int wkey,
                                    const char* sc, int a_k, bool decode_twin) {
     if (host_gemm_) {
+        // Same pad, and here it is also a stride: the rows form used to index A at `m * K` while the
+        // caller's buffer is laid out at `m * a_k`, so every row past the first read the wrong row.
         out.assign((size_t)M * N, 0.0f);
-        for (int m = 0; m < M; m++) {
-            float* o = out.data() + (size_t)m * N;
-            for (int k = 0; k < K; k++) {
-                const float av = A[(size_t)m * K + k];
-                if (av == 0.0f) continue;
-                const float* row = Bmat + (size_t)k * N;
-                for (int n = 0; n < N; n++) o[n] += av * row[n];
-            }
-        }
+        q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
         return;
     }
     npu::target::GemvArgs a;

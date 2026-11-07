@@ -94,7 +94,8 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
      "// generated from config/laya-first.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
-add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp)
+add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp
+                     app/embed_serve.cpp app/embed_model.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -189,6 +190,9 @@ endfunction()
 
 # Runs everywhere, CI included: serve's proxy against a fake backend.
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
+# The embedding role served in-process from a 1-bit container (engine#1311): /v1/embeddings for a string and an
+# array, the OpenAI shape, and the refusals named. Device-free on the 32-token fixture.
+add_test(NAME embed_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/embed_serve.sh $<TARGET_FILE:onebit>)
 # serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
 add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
 # serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.
@@ -374,7 +378,8 @@ set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 option(ONEBIT_ORT "Link ONNX Runtime 1.23.2 in-process (1bit ort-info + the plugin EP)" OFF)
 
 # ── the ONNX EP's NPU leg compiles and links without ORT, the device or the runtime (#874) ───────
-# npu/ort/onebit_npu_gemm.cpp is built only by onnx/ep when ONEBIT_EP_NPU=ON, and that needs ONNX
+# npu/ort/onebit_npu_gemm.cpp is built by onebit_npu_forward (the embedding route's device path, engine#1311)
+# and by onnx/ep when ONEBIT_EP_NPU=ON, which needs ONNX
 # Runtime *and* the private NPU runtime -- so no configuration CI has ever built it, and #874 (a call
 # to q4nx_elf_arg_sizes with no declaration, then the file defining it missing from the link) was
 # green for a week. This target compiles onnx/ep's own source list (onnx/ep/npu_sources.cmake, the
@@ -1203,6 +1208,9 @@ if(ONEBIT_NPU)
 endif()
 
     add_library(onebit_npu_forward STATIC
+        # gemm_q8_raw / gemm_f32: the int8 GEMM the ONNX EP's QDQ leg uses, and now the embedding route's
+        # ternary linears on the array (engine#1311). Its own probe checks the accumulators are exact.
+        npu/ort/onebit_npu_gemm.cpp
         npu/forward/src/model.c
         npu/forward/src/q4nx_dequant.c
         npu/forward/src/q4nx_pack.c
@@ -1234,6 +1242,10 @@ endif()
     target_link_libraries(onebit_npu_forward PUBLIC onebit_npu onebit_npu_rt nlohmann_json::nlohmann_json dl
                                                   pthread m)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
+    # app/embed_serve.cpp's device path includes npu/embed/embed_npu.h (engine#1311): the embedding route's
+    # ternary linears on the array, through the same int8 GEMM the forward links.
+    target_include_directories(onebit PRIVATE ${CMAKE_SOURCE_DIR}/npu/embed ${CMAKE_SOURCE_DIR}/app
+        ${CMAKE_SOURCE_DIR}/npu/ort)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
     # step_batch_all(): per-row logits from ONE batched pass -- the contract speculative verification

@@ -1525,8 +1525,11 @@ Exiting is deliberate: after such a failure the context's own state is dead, and
 fails the same way — measured on the c22 board, where the same backend answered 614 to every subsequent request while a
 fresh process answered normally on the same device. The supervisor (Lemonade's backend watchdog, a systemd unit, the OS
 menu's launcher) is the only one that can build a new context, so the engine hands it the problem instead of answering
-with something that looks like a result. A client sees **one failed request**, and the next one lands on a working
-backend.
+with something that looks like a result. What the client sees next depends on the supervisor: Lemonade reloads the backend
+and **replays a non-streamed request once** on the new context, so that turn still gets an answer (fork #42: 200 in
+2.2-5.4 s where the same request used to be a 500, measured with a stand-in engine on strixhalo 2026-11-06); a **streamed**
+request keeps the error frame, because bytes may already have reached the client, and the next request lands on the working
+backend. Under any other supervisor (a systemd unit, the OS menu's launcher) a client sees one failed request and retries.
 
 If a *fresh* backend also fails, the device is the thing to look at rather than the engine: the driver refuses new
 hardware contexts until `amdxdna` is reloaded, and says so in its own kernel message — restarting backends cannot fix it.

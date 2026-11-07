@@ -633,6 +633,19 @@ def request_body(prompt, max_tokens, ignore_eos=False):
     gate, which compares them against a stored reference, so changing how many tokens they may run would change
     the gate's own inputs. The long reply is deliberately outside that gate (it depends on the context, not on
     the lever), which is what makes pinning its length safe.
+
+    **The flag is speed-neutral on this pin, and that was measured rather than assumed**, because the cost of
+    getting it wrong is a silent shift in every future row. Two in-window pairs on 2026-11-07, each issuing the
+    same 18,762-token request twice against one `1bit serve` inside a single GPU claim:
+
+      order pinned -> natural :  9.95 tok/s pinned, 13.29 natural   (a 25 % gap -- but see the next line)
+      order natural -> pinned : 13.32 tok/s natural, 13.39 pinned   (no gap, and the pinned side ran second)
+
+    The first pair's gap was the *window*, not the body: the second pair inverted the order and the difference
+    vanished, which is the confound a single-order probe cannot see. Sequential arms never resolved it either --
+    across three arms on the same day prefill and decode moved together by 1.2-1.8x (prefill cannot be touched by
+    a decode-sampling field), so the box's own mood dominated. If you change this flag, re-run the pair in BOTH
+    orders before believing a difference.
     """
     body = {
         "messages": [{"role": "user", "content": prompt}],

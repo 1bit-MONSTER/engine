@@ -237,6 +237,14 @@ os/v3/puppy/console-tui/build-static.sh        # cargo test + musl release build
 CONSOLE_TUI_BIN=<that path> bash os/v3/puppy/build.sh resolute64
 ```
 
+The last line it prints in the clean case is `build-static: ok <hash> <bytes> (HEAD <sha>, tree clean)`. **That hash
+names a commit, and only a clean tree produces it**: with uncommitted changes under this crate it prints
+`build-static: DIRTY <hash>-dirty <bytes> - NOT <sha>'s artifact …` on stderr and exits 1, while still printing the
+binary path (it is fine to test with). The reason is engine#1326: `cargo fmt` re-wrapping one line moved the binary by
+24 bytes - rustc embeds `file:line` in panic messages - and a hash built from the tree *before* that `cargo fmt` was
+quoted as if it were the commit's, which the release lane had no way to tell from a real difference. Quote the clean
+number, or rebuild from the merged tree.
+
 `container-build.sh` installs the binary as `/usr/local/bin/1bit-console-tui`, refuses a `CONSOLE_TUI_BIN` that
 does not *run* (`--version` must print `1bit-console-tui ...` - a program init cannot exec is how a console
 becomes a dead screen), refuses a packed copy that is not executable, and merely notes the binary's absence:

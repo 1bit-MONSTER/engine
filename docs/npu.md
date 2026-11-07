@@ -1868,6 +1868,25 @@ a silently broken loop rather than a slow one.
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).
 
+**Leaf fill is resolved, and the answer is that this verifier cannot use it.** The plan's last protocol item (#805) asks
+for "spare verify rows filled with the drafts' 2nd/3rd candidates". The acceptance rule here is
+`argmax(logits[i-1]) == draft[i]` (`npu/mtp/draft.h:317`): a draft is accepted iff it **is** the base's own argmax at
+that position, and the argmax that grades depth *i* is produced by row *i-1* of the same batch. Two consequences,
+both measured in `tests/mtp_draft_test.cpp` [16] against a toy base that is given a real two-level ranking:
+
+* a candidate at the **same position** that is not the argmax is refused with certainty, however many rows carry it —
+  the base's rank-2 token is accepted **0 of 92** times, and the control that makes that number mean something (the
+  same head against the same base with the argmax moved onto the runner-up) accepts **20 of 20**;
+* a **correct candidate deeper in the chain** is never scored while its parent is refused: a head that is right at
+  depths 2..k and wrong at depth 1 accepts **0**, `reached_at[1] == 0`, and widening the batch to `k = 8` / `M = 16`
+  rows changes it by **nothing** (0 accepted of 184 rows). The batch's rows are the *chain*, not candidate tests.
+
+An alternative at a depth is graded by its parent's row, so it cannot even be placed in the same batch; placing it
+would need per-row positions and an attention mask in the forward — a tree verifier — and with a recurrent GDN state
+carried row by row that also needs a state per branch, which is the "no per-token state banks" constraint the same plan
+imposes. So the spare rows buy nothing here, and the two levers that did move this loop are the ones already recorded:
+the hidden variant (post-final-norm) and the drafter's stream cursor.
+
 Reading these numbers has two traps that produced wrong figures here twice: plain decode is **host-bound**, so a
 loaded window inflates it and flatters the draft route — two arms of one ticket are comparable, two tickets are
 not; and "acceptance length" (`accepted/iterations`) is not "tokens per pass" (`1 + Σ hit[d]`). The tool prints

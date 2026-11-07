@@ -45,10 +45,55 @@
 # so public CI neither runs nor fails it:
 #   ONEBIT_LIBAMDF_CTS_DIR=<build>/libamdf ctest -R npu_import_contract
 #
+# The advertisement read is a parse of the pin, so it has its own device-free test:
+#   tests/npu_import_contract.sh --self-test     (CTest `npu_import_advert`)
+# whose fixtures are the two shapes that decide it: the advertising pin, and the same pin with the flag
+# dropped from the import class' dma-buf entry -- the narrowing this test is supposed to notice, and the
+# case that read as `advertised=yes` while the scan was a whole-file search (engine#1283's review).
+#
 # usage: tests/npu_import_contract.sh <repo root>   [env: ONEBIT_LIBAMDF_CTS_DIR, AMDF_GPU_TARGET]
+#        tests/npu_import_contract.sh --self-test
 set -uo pipefail
 
-root=${1:?usage: npu_import_contract.sh <repo root>}
+fail=0
+check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; [ -n "${3:-}" ] && echo "     $3"; fail=1; fi; }
+
+# The advertisement: AMDF_EXTERNAL_MEMORY_SUPPORT_FLAG_FOREIGN_API *set* on an entry of the ordinal-1
+# (import) branch of libamdf's XDNA memory profile. Two bounds, and both are load-bearing:
+#   - the branch, because the ordinal-0 (create) class advertises the same flag, so a whole-file search
+#     cannot tell a pin that narrowed the import class from one that did not;
+#   - negated uses, because the import branch clears the flag on the opaque-fd entry it clones from the
+#     dma-buf one (`flags &= ~AMDF_..._FOREIGN_API`), which a plain grep reads as an advertisement.
+advertises_foreign_api() {
+    awk '
+        /memory_profile_ordinal == 1/ { in_branch = 1; next }
+        in_branch && /^  } else/     { exit }
+        in_branch && /FOREIGN_API/ && !/~[[:space:]]*AMDF_EXTERNAL_MEMORY_SUPPORT_FLAG_FOREIGN_API/ {
+            print "yes"; exit
+        }
+    ' "$1"
+}
+
+if [ "${1:-}" = --self-test ]; then
+    here=$(cd "$(dirname "$0")" && pwd)
+    check "an advertising pin reads as advertised" \
+          "[ -n \"\$(advertises_foreign_api '$here/fixtures/import_profile_foreign_api.c')\" ]" \
+          "the fixture that sets FOREIGN_API on the import class' dma-buf entry read as not advertised"
+    check "a pin that drops it from the import class reads as narrowed" \
+          "[ -z \"\$(advertises_foreign_api '$here/fixtures/import_profile_narrowed.c')\" ]" \
+          "the flag was still found: the scan is reading the ordinal-0 class or the opaque-fd clear"
+    pinned=$here/../third_party/hrx-system/libamdf/src/xdna/umd/drm/memory_profile.c
+    if [ -f "$pinned" ]; then
+        check "the pinned libamdf advertises it today" \
+              "[ -n \"\$(advertises_foreign_api '$pinned')\" ]" \
+              "$pinned no longer sets FOREIGN_API on the import class: re-read docs/zero-copy.md's contract"
+    else
+        echo "note: $pinned is not checked out (submodule), so only the fixtures were read"
+    fi
+    exit $((fail))
+fi
+
+root=${1:?usage: npu_import_contract.sh <repo root> | --self-test}
 cts=${ONEBIT_LIBAMDF_CTS_DIR:-}
 gfx=${AMDF_GPU_TARGET:-gfx1151}
 strict=${ONEBIT_IMPORT_CONTRACT:-table}
@@ -60,9 +105,6 @@ if [ -z "$cts" ] || [ ! -x "$cts/libamdf_cts_interop_gpu_xdna_recipes_execution_
     exit 77
 fi
 
-fail=0
-check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; [ -n "${3:-}" ] && echo "     $3"; fail=1; fi; }
-
 loaded=$(cat /sys/module/amdxdna/srcversion 2>/dev/null)
 [ -n "$loaded" ] || { echo "skip: amdxdna is not loaded"; exit 77; }
 
@@ -70,9 +112,7 @@ loaded=$(cat /sys/module/amdxdna/srcversion 2>/dev/null)
 profile=$root/third_party/hrx-system/libamdf/src/xdna/umd/drm/memory_profile.c
 [ -f "$profile" ] || { echo "skip: $profile is not checked out (submodule)"; exit 77; }
 advertised=no
-if awk '/memory_profile_ordinal == 1/{f=1} f&&/FOREIGN_API/{print "yes"; exit}' "$profile" | grep -q yes; then
-    advertised=yes
-fi
+[ -n "$(advertises_foreign_api "$profile")" ] && advertised=yes
 check "the pinned libamdf advertises FOREIGN_API on the import class" "[ '$advertised' = yes ]" \
       "no FOREIGN_API in $profile's ordinal-1 branch: the contract below is the narrowed one"
 
@@ -106,14 +146,28 @@ check "control: the array executes (registered caller pages)" \
       "$(grep -A2 'RUN.*RegisteredCausalRoundTrip' "$log/exec.txt" | head -3)"
 imported=$(grep -cE '^\[ RUN      \] ImportedBacking/' "$log/exec.txt")
 imported_ok=$(grep -cE '^\[       OK \] ImportedBacking/' "$log/exec.txt")
+# 8 is the count at the pinned hrx-system (7f4236924a): four arms per transport. Additive on purpose --
+# a pin that grows the CTS raises this floor rather than failing the test.
 check "the run covered the imported-backing cases" "[ '$imported' -ge 8 ]" "only $imported arm(s) ran"
 
+# The two transports are advertised differently and the review of #1283 is right that the labels have to
+# say so: the dma-buf-fd entry carries FOREIGN_API, the opaque-fd entry is cloned from it and then has the
+# flag cleared, carrying the direct-host provenance instead. Both are required here -- they are two
+# descriptors for the same execution -- but they are counted and reported apart.
+dma_buf=$(grep -cE '^\[ RUN      \] ImportedBacking/.*/DmaBuf' "$log/exec.txt")
+opaque=$(grep -cE '^\[ RUN      \] ImportedBacking/.*/Opaque' "$log/exec.txt")
+dma_buf_ok=$(grep -cE '^\[       OK \] ImportedBacking/.*/DmaBuf' "$log/exec.txt")
+opaque_ok=$(grep -cE '^\[       OK \] ImportedBacking/.*/Opaque' "$log/exec.txt")
+
 if [ "$carrier" = yes ] && [ "$advertised" = yes ]; then
-    # The pair is loaded: the advertisement must be true, arm by arm.
-    check "execution on an imported dma-buf ($imported arms, the advertised capability)" \
-          "[ '$imported_ok' = '$imported' ]" \
-          "$(grep -E '^\[  FAILED  \] ImportedBacking/' "$log/exec.txt" | head -3)"
-    verdict="delivers what it advertises"
+    # The pair is loaded: the advertised capability must hold, and both transports must execute.
+    check "the dma-buf fd transport executes ($dma_buf arms: what FOREIGN_API advertises)" \
+          "[ '$dma_buf_ok' = '$dma_buf' ] && [ '$dma_buf' -ge 1 ]" \
+          "$(grep -E '^\[  FAILED  \] ImportedBacking/.*/DmaBuf' "$log/exec.txt" | head -3)"
+    check "the opaque fd transport executes ($opaque arms: direct-host provenance)" \
+          "[ '$opaque_ok' = '$opaque' ] && [ '$opaque' -ge 1 ]" \
+          "$(grep -E '^\[  FAILED  \] ImportedBacking/.*/Opaque' "$log/exec.txt" | head -3)"
+    verdict="delivers what it advertises (both transports)"
 elif [ "$carrier" = yes ]; then
     # Loaded and no longer advertised (the pin narrowed it): either result is honest, so only record it.
     echo "note: $imported_ok of $imported imported arms pass and the pin no longer advertises execution"
@@ -122,14 +176,16 @@ elif [ "$strict" = advertised ] && [ "$advertised" = yes ]; then
     # The acceptance form: this is engine#812 itself -- a capability advertised and not delivered.
     echo "FAIL the pinned libamdf advertises FOREIGN_API dma-buf execution and amdxdna $loaded"
     echo "     refuses it: $((imported - imported_ok)) of $imported imported arms failed"
+    echo "     ($dma_buf_ok/$dma_buf dma-buf fd arms, $opaque_ok/$opaque opaque fd arms)"
     grep -m1 -A3 'kernel_queue_create' "$log/exec.txt" | sed 's/^/     /'
     fail=1
     verdict="advertises execution it does not deliver (#812)"
 else
     # Documented state of a driver without the pair: imported execution is refused, and it must be
     # refused at the same place every time -- a different failure would be a different bug.
-    check "execution on an imported dma-buf is refused (module has no 0006/0007)" \
-          "[ '$imported_ok' = 0 ]" "$imported_ok of $imported arms passed on a module without the pair"
+    check "execution on an imported range is refused (module has no 0006/0007)" \
+          "[ '$imported_ok' = 0 ]" \
+          "$imported_ok of $imported arms passed on a module without the pair ($dma_buf_ok/$dma_buf dma-buf, $opaque_ok/$opaque opaque)"
     check "the refusal is the import's, at kernel_queue_create" \
           "grep -q 'kernel_queue_create' '$log/exec.txt'" \
           "$(grep -E '^\[  PASSED  \]|Failure' "$log/exec.txt" | head -3)"

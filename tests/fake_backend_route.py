@@ -36,6 +36,8 @@ def device():
 
 
 dev = device()
+# the model file's stem, so a test serving several models (tests/laya_models_e2e.sh) sees which answered
+model = argv[argv.index("-m") + 1].rsplit("/", 1)[-1].rsplit(".", 1)[0] if "-m" in argv else "fake"
 port = None
 for i, a in enumerate(argv):
     if a in ("--port", "-p") and i + 1 < len(argv):
@@ -65,10 +67,13 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n)) if n else {}
-        text = "device:" + dev
+        text = "device:" + dev + " model:" + model
         if not req.get("stream"):
             msg = {"message": {"role": "assistant", "content": text}} if "chat" in self.path else {"text": text}
-            self._json(200, {"id": "x", "model": "fake", "choices": [dict(index=0, finish_reason="stop", **msg)]})
+            # usage and timings in llama-server's shape (fixed numbers: the test checks they are relayed)
+            self._json(200, {"id": "x", "model": "fake", "choices": [dict(index=0, finish_reason="stop", **msg)],
+                             "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+                             "timings": {"prompt_per_second": 400.0, "predicted_per_second": 50.0}})
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")

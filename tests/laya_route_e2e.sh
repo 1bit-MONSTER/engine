@@ -82,10 +82,10 @@ min_distinct=1
 check "the policy routed to $distinct distinct devices" '[ "$distinct" -ge "$min_distinct" ]'
 
 # a second turn of the first conversation: same class, no new decision
-decisions_before=$(grep -c "1bit serve: laya: [a-z_]* [0-9.]* " "$scratch/serve.log")
+decisions_before=$(grep -c "1bit serve: laya: .* | classified " "$scratch/serve.log")
 body=$(python3 -c 'import json,sys; print(json.dumps({"messages":[{"role":"user","content":sys.argv[1]},{"role":"assistant","content":"fn reverse() {}"},{"role":"user","content":"thanks, now add a test"}]}))' "${states[0]}")
 curl -s -o "$scratch/reply2.json" "$api/v1/chat/completions" -H 'Content-Type: application/json' -d "$body"
-decisions_after=$(grep -c "1bit serve: laya: [a-z_]* [0-9.]* " "$scratch/serve.log")
+decisions_after=$(grep -c "1bit serve: laya: .* | classified " "$scratch/serve.log")
 first=$(echo "$seen" | awk '{print $1}')
 check "second turn reuses the decision (decisions $decisions_before -> $decisions_after)" '[ "$decisions_after" = "$decisions_before" ]'
 check "  and goes to the same device ($first)" 'grep -q "device:$first" "$scratch/reply2.json"'

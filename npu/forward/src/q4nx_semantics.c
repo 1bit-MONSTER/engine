@@ -524,3 +524,21 @@ void q4nx_semantics_dump(const Q4nxSemantics* s) {
                 s->extra_layer_norms, s->double_wide_mlp);
     }
 }
+
+int q4nx_attention_mode(const char* declared, int plan_loaded, int plan_noncausal, char* why, size_t why_len) {
+    if (why && why_len) why[0] = '\0';
+    const int declared_noncausal = declared && strcmp(declared, "noncausal_full_attention") == 0;
+    if (plan_loaded && declared && *declared && declared_noncausal != plan_noncausal) {
+        if (why && why_len)
+            snprintf(why, why_len,
+                     "plan.json says attention.mode %s but decision_config.json declares %s: the plan is "
+                     "stale, since tools/npu_plan.py writes it from that declaration. Rerun "
+                     "tools/npu_plan.py <model dir> --kernels <elf dir>; for a deliberate measurement arm "
+                     "change the pack's own decision_config.json, not the plan",
+                     plan_noncausal ? "noncausal_full_attention" : "causal", declared);
+        return -1;
+    }
+    if (declared_noncausal) return 1;
+    if (declared && *declared) return 0;    /* the pack declares causal, and any plan agrees */
+    return plan_noncausal ? 1 : 0;          /* no declaration: the plan decides */
+}

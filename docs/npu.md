@@ -1406,14 +1406,21 @@ load failures, not style: the embedding keeps its **2-D shape** (the loader read
 `shape[0]`/`shape[1]`), and `text_config`'s keys are **lifted to the top level**, because the engine reads
 `config.json` at depth 1 only. A tensor with no mapping is a refusal, never a dropped one.
 
-Conversion is not the last step for a d3 pack: `decision` copies the pack's `decision_config.json` (which is
-where it declares `attention_mode`), and then `tools/npu_plan.py <model dir> --kernels <elf dir>` must write
-`plan.json`, because **`attention.mode` is read from the plan and nowhere else**. A pack without one is
-answered *causally*, which for a noncausal pack is a different model — the reference's own mask is worth
-0.2869 |Δp| (engine#847) — so the load refuses instead of serving those numbers: it names
-`decision_config.json`'s `noncausal_full_attention`, says whether `plan.json` is absent or stale, and prints
-the `tools/npu_plan.py` command that fixes it (engine#796). The plan is also what makes a *device* row find its
-`gate/up` fusion and its M=16 decode twins, so a converted pack is not otherwise ready for the array either.
+**`attention.mode` comes from the pack's own declaration.** A d3 pack states the mask it was trained with in
+its `decision_config.json` (`attention_mode: noncausal_full_attention`), and the forward honours that
+declaration directly, so the two conversion steps above are enough: a freshly converted pack is answered the
+way it was trained, with no plan step in between. Measured on the real pack, host GEMM, against its own
+`d3_runtime.py`: with the declaration honoured the worst |Δp| is **0.0246**; a directory answered without it
+is **0.3702** with a choice flip — the reference's own mask is worth 0.2869 (engine#847), so a causal answer to
+a noncausal pack is a different model, not a smaller one.
+
+`tools/npu_plan.py <model dir> --kernels <elf dir>` still writes `plan.json`, and it copies the same
+declaration into `attention.mode`. A plan that **disagrees** with `decision_config.json` is refused by name as
+stale, in either direction, because it would answer a noncausal pack causally (or a causal one
+bidirectionally); the fix it names is to re-run the generator — or, for a deliberate measurement arm (an
+engine causal-vs-noncausal row on a noncausal pack), to change the pack's `decision_config.json`, so the
+container and the mask cannot drift apart. The plan is also what a *device* row needs for its `gate/up` fusion
+and its M=16 decode twins, so a converted pack still wants one before it runs on the array.
 
 `--dtype bf16` writes the same tensor set with **no q4_1 tiles at all** (every tensor keeps its source
 bf16, or the F32 a transform forces; `verify` reports 0 error rather than a loss). It is the container for

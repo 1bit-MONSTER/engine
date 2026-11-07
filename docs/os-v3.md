@@ -99,11 +99,34 @@ authorised for this account is a key root already accepts. Puppy's own rules gra
 password (`Defaults:users runaspw`), which is no use to an account that has none — hence the explicit rule. The **live
 stick stays root-only**: a machine that boots from RAM and forgets should not mint an account either.
 
-Still open on #712, and each an owner-shaped decision rather than a package install: an **OS-level update path** — a
-supported way to take the next appliance (kernel, initrd, SFS) with the save layer surviving it and a rollback if it
-does not boot; today that is "write the next image", and `apt` updates packages into the save layer but not the OS —
-and the **server-shaped rest** (a firewall default, NTP, hostname and an optional static address in the installer's
-answers, logging that survives without systemd).
+### Updating an installed machine
+
+An installed machine carries **two slots** on its data partition and **one** save layer:
+
+| | |
+|---|---|
+| `/1bit` | `psubdir=1bit` — the appliance the machine was installed with |
+| `/1bit-alt` | `psubdir=1bit-alt` — created by the first update; both slots' entries carry the same UUID-pinned boot line, so nothing else about the disk changes |
+| the save layer | stays where the machine was installed (`/1bit/<prefix>save`) and the other slot reaches it through a **relative `upup64rsave` symlink** — Puppy's init finds a save folder under its own `psubdir`, follows the link and writes through it (`PUPMODE=12`), so both sets share one machine's state instead of forking it |
+
+`1bit-update <release-dir | image.img>` writes the next appliance into the slot that is **not** running. It checks the
+release first (it must carry the running set's own file names, and a `SHA256SUMS` is verified for those files when the
+release has one), copies, then compares every byte, links the save layer, adds that slot's GRUB entries built from the
+running entry's own boot line, and flips `set default` to the new headless entry — re-reading the config the way GRUB
+counts entries before it reports success. The running set is never touched, so the previous appliance stays bootable:
+that is the rollback. `1bit-update --rollback` flips `set default` back; `1bit-update --status` says which slot is
+running, what each holds, and which entry GRUB boots.
+
+Which is not the same as package updates: `apt` (and the appliance's own payload) update **inside** the running set and
+land in the save layer. An OS change — kernel, initrd, SFS — is this, and it is the only thing that writes a slot.
+
+**Measured** (`os/v3/puppy/update-gate.sh`, three boots of one installed disk, the "next release" being that disk's own
+SFS with one added file): the update reports `UPDATED`, the machine comes back on `psubdir=1bit-alt` with `PUPMODE=12`,
+the new set's marker file present and the marker written before the update still there; `--rollback` brings it back to
+`psubdir=1bit` with the previous appliance intact and the state unchanged.
+
+Still open on #712: the **server-shaped rest** (a firewall default, NTP, hostname and an optional static address in the
+installer's answers, logging that survives without systemd).
 
 ## The Ubuntu plan (history, not a target)
 

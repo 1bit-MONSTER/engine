@@ -48,6 +48,13 @@ import check_q4nx_dir as C       # noqa: E402
 import q4nx_diff as D            # noqa: E402
 
 FAIL = []
+
+
+def split_errs(errors):
+    """Per-tensor rows versus the single container-level verdict the checker appends."""
+    per = [e for e in errors if not e.startswith("container: ")]
+    box = [e for e in errors if e.startswith("container: ")]
+    return per, box
 ROWS, COLS, GROUP, TILE = 32, 256, 32, 5120
 NAME = "blk.0.attn_q.weight"                      # gguf name -> model.layers.0.self_attn.q_proj.weight
 
@@ -160,10 +167,13 @@ with tempfile.TemporaryDirectory() as td:
     foreign = os.path.join(td, "flm")
     container(foreign, encode_tile(W, "flm"))
     errors, rows = C.check_q4_1_layout(os.path.join(foreign, "model.q4nx"), gguf)
-    check(len(errors) == 1 and "NOT in the order" in errors[0],
+    per, box = split_errs(errors)
+    check(len(per) == 1 and "NOT in the order" in per[0],
           "a container in the foreign order is REFUSED (engine#1110)", f"errors={errors}")
-    check(len(errors) == 1 and "model.layers.0.self_attn.q_proj.weight" in errors[0],
+    check(len(per) == 1 and "model.layers.0.self_attn.q_proj.weight" in per[0],
           "and the refusal names the tensor", f"errors={errors}")
+    check(len(box) == 1 and "flm-unsigned order" in box[0],
+          "and ONE container-level line names the order the tiles are actually in", f"box={box}")
     check(len(rows) == 1 and rows[0]["flm-unsigned"][0] > 0.99 and rows[0]["ours"][0] < 0.5,
           "with the foreign reading identified, so the message can say what the bytes look like",
           f"rows={rows}")
@@ -173,7 +183,8 @@ with tempfile.TemporaryDirectory() as td:
     renamed = os.path.join(td, "flm-renamed")
     container(renamed, encode_tile(W, "flm"), "model.layers.0.self_attn.k_proj.weight")
     errors, _ = C.check_q4_1_layout(os.path.join(renamed, "model.q4nx"), gguf)
-    check(len(errors) == 1 and "NOT in the order" in errors[0],
+    per, _box = split_errs(errors)
+    check(len(per) == 1 and "NOT in the order" in per[0],
           "a foreign order under the OTHER tensor's name is still refused", f"errors={errors}")
 
     # a container that shares no tensor with the GGUF cannot be silently accepted
@@ -206,10 +217,18 @@ with tempfile.TemporaryDirectory() as td:
     gguf_other = os.path.join(td, "other.gguf")
     tiny_gguf(gguf_other, other, other)
     errors, _ = C.check_q4_1_layout(os.path.join(good, "model.q4nx"), gguf_other)
-    check(len(errors) == 1 and "no reading of these tiles matches" in errors[0],
+    per, box = split_errs(errors)
+    check(per and all("no reading of these tiles matches" in e for e in per),
           "a container checked against the WRONG source says 'no reading matches'", f"errors={errors}")
-    check(len(errors) == 1 and "NOT in the order" not in errors[0],
+    check(all("NOT in the order" not in e for e in errors),
           "and does not claim a foreign order it cannot identify", f"errors={errors}")
+    check(all("probably not the GGUF" not in e for e in per),
+          "and no per-tensor line guesses the cause -- that refrain on 168 of 196 tensors is the "
+          "review's nit", f"per={per[:1]}")
+    # the hint about the source belongs to the container, once -- and NOT on 196 per-tensor lines,
+    # which is the review's nit: on a genuinely foreign container most tensors match no reading.
+    check(len(box) == 1 and "check that it is the GGUF" in box[0],
+          "the wrong-source hint is one container line, not a per-tensor refrain", f"box={box}")
 
 print(f"check_q4nx_tile_order_test: {len(FAIL)} failure(s)")
 sys.exit(1 if FAIL else 0)

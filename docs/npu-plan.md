@@ -23,8 +23,9 @@ alongside `config.json` and `tokenizer.json` (see [npu.md](npu.md), "plan.json: 
 The file is **generated, not hand-written**: `tools/npu_plan.py` writes it from the container's own
 tensor table and `config.json`, and `--check` re-generates and diffs against the file on disk. A model
 directory **without** a `plan.json` keeps the old filename probes, which is what makes the plan additive.
-The loader is `npu/plan/plan.h`; the forward reads the plan at init (`npu/forward/src/q4nx_forward.cpp:510-539`)
-and derives its designs from it instead of probing the kernel directory (`...:833`).
+The loader is `npu/plan/plan.h`; the forward reads the plan at init (`Q4nxNpuForward::init_impl`, the
+`plan.json` block in `npu/forward/src/q4nx_forward.cpp`) and derives its designs from it instead of probing the
+kernel directory.
 
 Four generated plans are checked in next to the code in `configs/plans/` (one per model directory on the
 build box); `tools/npu_plan.py <dir> --check` proves a directory's copy still matches.
@@ -61,7 +62,7 @@ tools/npu_plan.py <model dir> [--kernels DIR] [--out PATH] [--check] [--print]
 | `decode.sealed_elf` | pb16i only: the sealed ELF the decode roles run |
 | `kernels.tag` | artifact-name suffix: `""`, `_b8`, `_pb16i`, `_t2s` or `_t2s2`; must agree with the container layout and `container.pb16i` |
 | `attention.mode` | `causal` (default) or `noncausal_full_attention`. The latter is a prompt-encoding mode: every full-attention layer sees the whole prompt, and the forward refuses to generate with it |
-| `kv.key`, `kv.value` | what the KV cache is stored as, per side: `f16` (the meaning of an absent `kv` block, and of every plan written before P7) or `int8`. `int8` is int8 with **one fp32 scale per (head, token)**, taken *after* a per-head Hadamard rotation — the rotation is what makes one scale affordable, because it collapses the per-channel magnitude spread the scale would otherwise have to cover. `key` is the side that costs no un-rotation (`(QH)(KH)ᵀ = QKᵀ`), so storing K rotated and rotating Q needs no inverse transform; `value` is a separate choice because an int8 V needs one on the output, which is why K-only is the cheap variant to prove the path with. This is a description: a target without the capability must refuse `int8` **by name**, never serve f16 in its place |
+| `kv.key`, `kv.value` | what the KV cache is stored as, per side: `f16` (the meaning of an absent `kv` block, and of every plan written before P7) or `int8`. `int8` is int8 with **one fp32 scale per (head, token)**, taken *after* a per-head Hadamard rotation — the rotation is what makes one scale affordable, because it collapses the per-channel magnitude spread the scale would otherwise have to cover. `key` is the side that costs no un-rotation (`(QH)(KH)ᵀ = QKᵀ`), so storing K rotated and rotating Q needs no inverse transform; `value` is a separate choice because an int8 V needs one on the output, which is why K-only is the cheap variant to prove the path with. This is a description until a target opens it: a target without the capability refuses `int8` **by name**, never serves f16 in its place. That check is `check_kv_caps` in `npu/target/target.h`, called from every target's `open()`, and it is gated device-free (`ctest -R npu_target_caps`) |
 | `kv.hadamard.block`, `kv.hadamard.signs` | the rotation itself: `block` is `0` (no rotation) or a power of two in `[2, 65536]` — the head width the rotation runs over — and `signs` is an optional **bare file name** (no directory part, under the model dir) for per-channel signs. A `signs` file with `block: 0` is refused rather than ignored |
 | `moe.batched_expert_gu` | `{enabled, K, N}`; when enabled, K and N must be named |
 | `layers[]` | one entry per layer, in order: `index`, `role` (`attn`/`gdn`/`moe`/`mla`), and projections `qkv {K, N, fused}`, `attn_gate {K, N}`, `gate_up {K, N}`, `down {K, N}`. The count must equal `model.layers`. The projection shapes are recorded for P4’s `NpuModel`; the current forward reads only the count (for its [plan] log line) and derives designs from the container |
@@ -86,6 +87,11 @@ The loader never substitutes a default for something it cannot honour; every ref
 - `kv.key`/`kv.value` outside `f16`/`int8`; a `kv.hadamard.block` that is not `0` or a power of two in
   `[2, 65536]`; a `kv.hadamard.signs` that is a path rather than a bare name, or that names a file while
   `kv.hadamard.block` is `0`;
+- `kv.key`/`kv.value` asking for `int8` on a target whose caps say `int8_kv` is false — this one is the
+  **target's** refusal, not the loader's (the loader accepts the plan; the target refuses to run it), and it
+  names both the plan fields and the missing capability. Today every target reports `int8_kv = false`, so
+  every `int8` plan is refused: the cache writer does not exist yet (see P7 below), and the refusal is what
+  keeps a request for it from being answered out of an f16 cache;
 - `moe.batched_expert_gu.enabled` without positive K and N;
 - `layers` missing/out of order, a role outside the four, a projection naming only one of K and N, or a
   layer count that disagrees with `model.layers`;
@@ -93,7 +99,10 @@ The loader never substitutes a default for something it cannot honour; every ref
   or a non-empty `sealed_elf` on a non-pb16i container.
 
 The forward adds one more check on load: `kernels.tag` must equal the tag the container itself implies
-(`q4nx_forward.cpp:510-539`), so a plan and a container cannot disagree about the artifact family.
+(same block, `Q4nxNpuForward::init_impl` in `npu/forward/src/q4nx_forward.cpp`), so a plan and a container cannot
+disagree about the artifact family. `attention.mode` is the one plan field the container can also state on its own:
+`decision_config.json`'s `attention_mode` decides when there is no plan, and a plan that disagrees with it is refused
+as stale (see [npu.md](npu.md), "the pack's own declaration").
 
 ## What the int8 KV contract is worth, measured
 
@@ -166,12 +175,16 @@ layers[0]     {"index": 0, "role": "gdn", "qkv": {"K": 5120, "N": 10240, "fused"
 
 ## Not yet
 
-- **P4** (#803): `NpuTarget`/`NpuModel` extraction is in PR #808 (open); the plan stays the description
-  until that interface lands.
+- **P4** (#803): **landed** in #808 (`0a2cbb9`) as **A1** — the `NpuTarget` interface (`npu/target/target.h`),
+  the XDNA target behind it, and `open()` consuming the plan instead of duplicating the derivation. **A2** is what
+  remains: the design derivation moves out of the forward and into the target, so `open()` becomes the source rather
+  than the check (and `load_block`, which is a named no-op today).
 - **P5** (#804): Hexagon target (t2 gemv on HVX/HMX, QEMU v73 oracle) has no engine rows yet.
 - **P6** (#805): the shared drafter protocol is on main; tau=0.6 and Hexagon acceptance rows are still missing.
 - **P7** (#806): the `kv` contract above is in the plan and its arithmetic is gated in CI (`ctest -R npu_kv_int8`,
-  which needs no device: see below). Still open, in the order it can be taken: the cache **writer/reader** in the
+  which needs no device: see below), and the **target-side refusal** is enforced as well (`npu_target_caps`, so an
+  `int8` plan cannot be run as f16 by any target, including P5's Hexagon). Still open, in the order it can be taken:
+  the cache **writer/reader** in the
   forward (an int8 K store plus its scale sidecar, the prefix-cache snapshot's byte accounting with it), the **KLD
   gate on real KV from a model on the device** — the CI test bounds the mechanism on synthetic vectors, not the
   model — and **part B**, prefill in 1024/2048-token chunks with block-fp expansion, which waits on P3's on-core

@@ -28,8 +28,9 @@
 #
 # No Requires either, and that is deliberate: the libraries this payload links (libhrx, libggml*,
 # libhsa, libomp) ship inside it, so rpm's own ELF dependency generator reads only the sonames that
-# are left - glibc, libstdc++, libgcc_s, libgomp, libcrypto/libssl, libzstd, libpcre2 - and resolves
-# each to whatever the family calls that package. It also encodes the glibc floor the binary really
+# are left - libc.so.6, libm.so.6, libstdc++.so.6, libgcc_s.so.1, libgomp.so.1, libcrypto.so.3,
+# libssl.so.3, libzstd.so.1, libpcre2-8.so.0 - and resolves each to whatever the family calls that
+# package. It also encodes the glibc floor the binary really
 # has (libc.so.6(GLIBC_2.43)), so the package refuses to install on a distribution where it could not
 # run instead of installing and failing to load.
 

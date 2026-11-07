@@ -883,6 +883,23 @@ hrxp_gtt() {  # <pid>... -> that process tree's own drm-total-gtt, in MiB
     done
     [ "$_k" -gt 0 ] && printf '%s' $(( _k / 1024 / 1024 )) || printf '0'
 }
+# Which mechanism does the SHIPPED engine have? Fork #231 (engine #1343) added the import switch and made it opt-in;
+# fork #234 (engine #1351, which also closed #1339) REMOVED it - that build reads the weights into their buffers and drops
+# their page cache instead. On the second kind the env var is ignored, both arms take the same path and their GTT readings
+# are identical, so a verdict would red a correct image. The row therefore asks the shipped code, and SKIPs with the reason
+# when the switch is not in it: a gate that fails a correct build is its own defect. Measuring the read+DONTNEED mechanism
+# needs its own row (#1351 measured page-cache residency 16.5 GiB -> nothing, peak RSS 16.4 -> 2.9 GiB, load 14.3 -> 18.6 s),
+# and it must be built and measured on a pin that has it before it can gate one.
+hrxp_has_switch() {  # <engine binary> -> 0 when the shipped libs carry GGML_HRX_WEIGHT_HOST_PLACEMENT
+    case "${HRXP_SWITCH:-}" in 1) return 0 ;; 0) return 1 ;; esac
+    _d=$(dirname "${1:-}" 2>/dev/null) _l=
+    for _cand in "$_d/libggml-hrx.so" "$_d"/libggml-hrx.so.* "$_d/../lib/ggml/libggml-hrx.so" "$_d"/../lib/ggml/libggml-hrx.so.* "$_d"/hrx/llama/bin/libggml-hrx.so; do
+        [ -f "$_cand" ] || continue
+        if grep -q 'GGML_HRX_WEIGHT_HOST_PLACEMENT' "$_cand" 2>/dev/null; then _l=$_cand; break; fi
+    done
+    [ -n "$_l" ]
+}
+
 hrxp_arm() {  # <port> <optin 0|1> -> "<own GTT MiB>" on stdout; non-zero when the arm did not come up
     if [ -n "${HRXP_SERVE:-}" ]; then
         _g=$($HRXP_SERVE "$1" "$2" 2>/dev/null | tail -1)
@@ -928,6 +945,8 @@ else
     fi
     if [ -z "$ONEBIT_BIN" ] && [ -z "${HRXP_SERVE:-}" ]; then
         skip hrx-placement "no 1bit engine binary in the image, so the two arms cannot be started"
+    elif ! hrxp_has_switch "$ONEBIT_BIN"; then
+        skip hrx-placement "this build does not carry the weight-mapping import switch (fork #234 / engine #1351 removed it: weights are read into their buffers and their page cache is dropped), so both arms would take the same path and the two-arm GTT measurement cannot distinguish anything - #1339's current mechanism needs its own row, measured on a pin that has it"
     else
         export HRXP_MODEL_PATH
         DFLT=$(hrxp_arm 18301 0) || _drc=$?

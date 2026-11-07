@@ -1619,7 +1619,14 @@ usable beside another NPU engine, and what its limits are:
   overlap, in either order, on one file.
 - **Who may take what.** Anything that honours the file interlocks with us: `forward-serve`
   (`--npu-streams` decides which mode), the in-process route (`LOCK_EX`, always -- `app/unified.cpp`),
-  the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
+  the ELF runner (`LOCK_EX`, always). **A run that never opens the device takes no lock**: with
+  `NPU_INFER_HOST_GEMM=1` the forward runs the model with host GEMMs and makes no `xrt::device`, so it
+  holds nothing the lock protects (`npu_lock_taken()`, engine#1353). That matters because the lock is
+  exclusive for the process's life: a host-GEMM serve that took it would block every lane that *does*
+  use the array -- measured on this box, one orphaned host-GEMM serve held it **4 h 52 m** with zero
+  `/dev/accel*` handles and no CPU, and during that window a second lane's serve and two device tickets
+  waited on it. `NPU_NO_DEVICE_LOCK=1` remains the operator's escape hatch for the runs that do open
+  the device. A foreign NPU runtime --
   Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
   keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
   file is not slowed, not blocked and not detected.

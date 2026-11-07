@@ -269,27 +269,32 @@ and the buffer bridge first ([docs/hetero-prefill.md](hetero-prefill.md), "What 
 **What it would be worth if it were built.** One formula covers every measurement on the page: with the iGPU at
 `g` ms per row and one NPU tile at `t` ms per 256 rows, the best concurrent split runs both sides to the same
 finish time, and `tools/split_ceiling.py` computes it (with `--gemm-share` for the end-to-end factor, because the
-split cannot touch attention):
+split cannot touch attention). **Which iGPU rate goes in decides the answer**, and there are two honest ones:
 
-| iGPU state (Qwen3-4B `up_gate`, M=16384) | iGPU | per-GEMM ceiling | optimum NPU share | end to end |
+| iGPU rate for the 4B `up_gate` (M=16384) | iGPU | per-GEMM ceiling | optimum NPU share | end to end |
 |---|---|---|---|---|
-| healthy boot, 40.7 TFLOP/s (2026-11-01) | 20.03 ms | 1.032x | 2 of 64 tiles | 1.017x |
-| engine#782 regression, 12.1-12.4 TFLOP/s | 65.71 ms | 1.103x | 6 of 64 tiles | 1.052x |
-| post-#782 pin, ~44 TFLOP/s | 18.4 ms | 1.032x | 2 of 64 tiles | 1.017x |
+| microbenchmark, healthy boot (0.313 ms/256 rows) | 20.03 ms | 1.032x | 2 of 64 tiles | 1.017x |
+| microbenchmark, engine#782 build (1.027 ms/256) | 65.71 ms | 1.103x | 6 of 64 tiles | 1.052x |
+| **in-engine prefill capture (1.441 ms/256)** | 92.22 ms | **1.164x** | 9 of 64 tiles | **1.078x** |
+| in-engine, cross-checked by matmul FLOPs (1.055 ms/256) | 67.52 ms | 1.120x | 7 of 64 tiles | 1.059x |
+| in-engine at #754's 4x NPU bar (2.15 ms/tile) | 92.22 ms | **1.650x** | 26 of 64 tiles | **1.254x** |
 
-The "end to end" column uses the measured attention share of this model's pp16384 device time (47.7 %, so 52.3 %
-is GEMM a split could touch). On the iGPU the box now ships, a perfect split dispatcher is worth **~1.7 % of
-prefill**, and on the bad build it was worth ~5 % - against a 3.3x regression that has since been fixed. That is
-the number engine#754 is blocked on, and it is why this route offers no split: not because the idea is wrong, but
-because at a 30:1 row-cost asymmetry between the two engines there is nothing left to win.
+The "end to end" column uses the measured attention share of this model's pp16384 device time (48.5 %, so 51.5 %
+is GEMM a split could touch). The first two rows are the microbenchmark this page's older sections used; the
+engine's own prefill runs the same shapes **3.4-4.6x slower** than that loop (see `docs/hetero-prefill.md`'s
+corrected third measurement), and against the rate a split would actually run beside, a perfect concurrent split
+is worth **6-8 % of prefill at M=16384**, or ~25 % if the NPU GEMM reaches the 4x bar. That is no longer a
+"nothing to win" answer, which is why this route's missing concurrent path is now the thing that blocks the
+split - not the kernel.
 
-Across the models the scoreboard compares, the same arithmetic from the recorded per-kernel shares caps the split even
-lower, because attention is a larger share than on the 4B: using each model's largest measured prefill kernel as the split-able
-share (qwen38-27b 39.8 %, coder30b-a3b 46.2 %, qwen36-35b-a3b 30.8 %, zaya1-8b 43.8 %, Qwen3-0.6B at 16k 26.2 %), the
-end-to-end ceiling is **1.008x-1.015x** - i.e. **at most 1.5 % of prefill, everywhere**, before the pipeline cost.
+Across the models the scoreboard compares, the same arithmetic from the recorded per-kernel shares gives the
+end-to-end factor, using each model's largest measured prefill kernel as the split-able share (qwen38-27b 39.8 %,
+coder30b-a3b 46.2 %, qwen36-35b-a3b 30.8 %, zaya1-8b 43.8 %, Qwen3-0.6B at 16k 26.2 %): **1.038x-1.070x** at the
+in-engine ceiling, i.e. **4-7 % of prefill**, before the pipeline cost.
 
-Two honest caveats, both of which have moved the number before: the iGPU side is a *measurement*, so re-run it
-before quoting a ceiling (`docs/hetero-prefill.md` has done that three times); and the formula assumes the iGPU's
-time is linear in its row count, which holds well enough at M=16384 (it predicts 1.103x where the split measured
-1.134x) but not at M<=2048, where every split measured on this box *loses* 3-5x because the NPU's per-tile cost is
-flat while the prompt is too short to give it tiles.
+Three caveats, all of which have moved the number before: the iGPU side is a *measurement*, so re-run it before
+quoting a ceiling (`docs/hetero-prefill.md` has now done that four times, the last one correcting a device-tick
+unit error that had made every millisecond 10x too small); the formula assumes the iGPU's time is linear in its
+row count, which it is not (it under-predicts the measured split by ~3 points at M=16384); and M<=2048 is
+unresolved rather than closed - 1.00x at the 1.055 ms reading, 1.143x at 1.441 ms, against measured splits that
+lost 3-5x when the microbenchmark rate was the input.

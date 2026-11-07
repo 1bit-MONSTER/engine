@@ -547,6 +547,15 @@ stage_package() {
     LEMONADE_WEB_APP=1 guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
     rm -rf "$W/lemonade/1bit" && mkdir -p "$W/lemonade/1bit"
     zstd -dc "$W/engine-pkg/1bit-$tag-linux-x86_64.tar.zst" | tar -C "$W/lemonade/1bit" --strip-components=1 -xf -
+    say "package $tag: the engine's own packages (deb, rpm, Arch, tarball)"
+    # One payload tree, four wrappings, so a machine that installs Lemonade its own way
+    # (docs/install-any-distro.md) gets the engine from its own package manager: the files and paths are
+    # the same in all four (scripts/pack-distro.sh). LIBHSA is the release's gfx1151 runtime out of the
+    # pinned toolchain: the packer refuses a runtime that would register no device, and the engine
+    # bundle carries none (HRX dlopens it).
+    LIBHSA=$(ls -d "$HRX_TOOLCHAIN"/lib/python3*/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 2>/dev/null | head -1) \
+        "$SRC/scripts/mk-plugin-package.sh" "$W/lemonade/1bit" "$OUT" "$tag" > "$LOGS/distro-packages.log" 2>&1 ||
+        { cat "$LOGS/distro-packages.log"; return 1; }
     install -m 755 "$SRC/scripts/lemond-onebit.sh" "$W/lemonade/lemond-onebit"
     # links out of the tree (the web app's KaTeX fonts -> the build machine's fonts-katex) become
     # copies of their targets; the links inside it stay links
@@ -613,6 +622,12 @@ preflight() {
                 # scripts/package-linux.sh rewrites RPATHs with patchelf
                 command -v patchelf > /dev/null ||
                     { echo "preflight: patchelf is not installed (scripts/package-linux.sh needs it): apt install patchelf"; bad=1; }
+                # scripts/pack-distro.sh wraps the engine for every family: dpkg-deb for the .deb here,
+                # rpmbuild and makepkg in containers for the .rpm and the Arch package
+                for d in dpkg-deb docker; do
+                    command -v "$d" > /dev/null ||
+                        { echo "preflight: no $d on PATH (scripts/mk-plugin-package.sh: the .deb, the .rpm and the Arch package)"; bad=1; }
+                done
                 # Lemonade's web app (LEMONADE_WEB_APP=1 scripts/build-lemonade.sh): node and npm, and
                 # the network for its `npm ci`
                 for d in node npm; do

@@ -133,6 +133,46 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/hrx_archs.h
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/registry/architectures.json)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
 target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+
+# ── The chat-template renderer (engine #963, docs/npu-chat-template.md) ──────
+# The NPU chat route renders the container's own `chat_template` (app/npu_template.h) with the pinned
+# llama.cpp fork's Jinja engine (`third_party/llama.cpp/common/jinja`, upstream's, the one
+# `llama-server --jinja` uses) rather than with a second, weaker interpreter of the same language.
+#
+# The sources are the fork's, so they exist exactly when the submodule is checked out: the option
+# defaults to that, and a tree that never initialised the submodules still builds -- without the
+# renderer, which the load line and the route say out loud rather than rendering something else
+# (app/npu_template.h). Nothing is downloaded at build time.
+if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/common/jinja/lexer.cpp)
+    set(_onebit_jinja_default ON)
+else()
+    set(_onebit_jinja_default OFF)
+endif()
+option(ONEBIT_JINJA "Build the Jinja chat-template renderer from the llama.cpp submodule" ${_onebit_jinja_default})
+if(ONEBIT_JINJA)
+    if(NOT EXISTS ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/common/jinja/lexer.cpp)
+        message(FATAL_ERROR "ONEBIT_JINJA=ON but third_party/llama.cpp/common/jinja is missing: "
+                            "git submodule update --init third_party/llama.cpp")
+    endif()
+    set(_onebit_jinja_dir ${CMAKE_SOURCE_DIR}/third_party/llama.cpp/common)
+    add_library(onebit_jinja STATIC
+        ${_onebit_jinja_dir}/jinja/lexer.cpp
+        ${_onebit_jinja_dir}/jinja/parser.cpp
+        ${_onebit_jinja_dir}/jinja/runtime.cpp
+        ${_onebit_jinja_dir}/jinja/value.cpp
+        ${_onebit_jinja_dir}/jinja/string.cpp
+        ${_onebit_jinja_dir}/jinja/caps.cpp
+        # jinja/value.cpp includes the fork's unicode.h, and these are its implementation
+        ${_onebit_jinja_dir}/unicode.cpp)
+    target_include_directories(onebit_jinja PUBLIC ${_onebit_jinja_dir})
+    target_link_libraries(onebit_jinja PUBLIC nlohmann_json::nlohmann_json)
+    target_compile_definitions(onebit_jinja PUBLIC ONEBIT_JINJA=1)
+    target_compile_definitions(onebit PRIVATE ONEBIT_JINJA=1)
+    target_link_libraries(onebit PRIVATE onebit_jinja)
+    message(STATUS "ONEBIT_JINJA=ON — the NPU chat route renders the container's own chat template")
+else()
+    message(STATUS "ONEBIT_JINJA=OFF — no chat-template renderer: the NPU chat route keeps ChatML (#963 option 1)")
+endif()
 if(ONEBIT_ORT)
     add_subdirectory(onnx)
     target_link_libraries(onebit PRIVATE onebit_ort_info onebit_ort_run)
@@ -167,6 +207,14 @@ add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<T
 add_test(NAME npu_repack_path COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_repack_path.sh $<TARGET_FILE:onebit>)
 # a build without the NPU lane has no repack path: the test says skip (77) there, not fail
 set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
+# engine#812: the XDNA import class advertises device execution on an imported dma-buf. This pairs that
+# advertisement (the pinned libamdf's import profile) with what the loaded driver actually does (libamdf's
+# own CTS: GPU export -> NPU import -> NPU executes on the imported range), keyed on the module's
+# fingerprint against third_party/patches/amdxdna/README.md. It skips (77) without the array or without a
+# CTS build (ONEBIT_LIBAMDF_CTS_DIR), so public CI neither runs nor fails it.
+add_test(NAME npu_import_contract
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_import_contract.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(npu_import_contract PROPERTIES SKIP_RETURN_CODE 77)
 # engine#876: the gate row for a folded (pb16i/t2s) container.  Its device half needs the array, but its
 # assertion does not: these are the accept/refuse cases of `scripts/npu-window11.sh --compare` on hand-written
 # logs -- folded against folded passes, one differing rotated activation fails, a folded log against a plain one
@@ -590,6 +638,11 @@ if(Python3_Interpreter_FOUND)
     # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
     # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.
     add_test(NAME repack_tile_order COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/repack_tile_order_test.py)
+    # The M-split ceiling (engine#754): tools/split_ceiling.py turns two measured rates into the optimum NPU
+    # share, the per-GEMM ceiling and the end-to-end factor, and this pins it to the three iGPU states
+    # docs/hetero-prefill.md records (40.7 TFLOP/s, the engine#782 regression, post-#782) so the arithmetic
+    # cannot drift from the page.  Stdlib only: no model, no device.
+    add_test(NAME split_ceiling COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/split_ceiling_test.py)
     # The same gate end to end (engine#1110 review): a synthetic one-tensor GGUF and a synthetic container whose
     # only tensor is named for another layer, so nothing is comparable -- the pair that used to read as a match --
     # plus the same bytes under the mapped name, which must be compared and refused.  numpy + gguf-py, no model.
@@ -612,6 +665,12 @@ if(Python3_Interpreter_FOUND)
     # must reproduce the pb16i image's own int4 code bytes, block for block. Synthetic weights only -- the
     # real-image leg is the same check on 14 GB of Bonsai-2 images and is run by hand.
     add_test(NAME q4nx_t2s COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2s_test.py)
+    # the acceptance gate for a t2 consumer (docs/npu.md, "Gating a t2 target"): the pinned
+    # accumulation order, bit for bit -- it accepts the oracle and refuses four near-misses
+    # (float64 accumulation, a reversed group order, a one-bit change, a short dump).  numpy only;
+    # the real-tensor leg needs --tensor/--dump and runs by hand.  engine #804.
+    add_test(NAME npu_t2_target_gate
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_t2_target_gate.py --quiet)
     # the safetensors -> Q4NX converter and the d3 readout head it packs (engine #653): every
     # fixture is synthesised, so this needs numpy and nothing else — no gguf-py, no model, no
     # device, no download.
@@ -666,6 +725,28 @@ add_test(NAME npu_chatml COMMAND npu_chatml_test ${CMAKE_SOURCE_DIR}/tests/data/
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_chatml_test)
+
+# The container's own chat template rendered (app/npu_template.h, engine #963 option 2): the golden rows are
+# Jinja2 3.1.6's own renders of the fixtures' templates, so the assertion is a comparison against an oracle
+# that is not this code. Device-free.  Without the renderer (ONEBIT_JINJA=OFF) the two fixture rows cannot
+# pass, so the test says so in its first line rather than skipping quietly.
+add_executable(npu_template_test tests/npu_template_test.cpp)
+# app/template_pin.h includes the pins compiled in from config/template-pins.json (the same read the
+# load line does), which CMake writes into the build's generated/ at configure time.
+target_include_directories(npu_template_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu
+                            ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(npu_template_test PRIVATE onebit_npu nlohmann_json::nlohmann_json)
+if(ONEBIT_JINJA)
+    target_link_libraries(npu_template_test PRIVATE onebit_jinja)
+    target_compile_definitions(npu_template_test PRIVATE ONEBIT_JINJA=1)
+    add_test(NAME npu_template
+             COMMAND npu_template_test ${CMAKE_SOURCE_DIR}/tests/data/templates/qwen3_flm.json
+                                       ${CMAKE_SOURCE_DIR}/tests/data/templates/zr1.json
+                                       --tokenizer ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_chatml.json)
+else()
+    add_test(NAME npu_template COMMAND npu_template_test --no-renderer)
+    set_tests_properties(npu_template PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 
 # `1bit unified`'s wait for the single NPU (app/npu_queue.h, engine#1024): bounded, and a queued request says so
 # instead of leaving a stream silent past the proxy's no-data timer. Device-free.
@@ -851,6 +932,12 @@ add_dependencies(npu_sampling_test npu_rope_llama3_test)
 add_executable(hadamard_rotate_test tests/hadamard_rotate_test.cpp)
 target_include_directories(hadamard_rotate_test PRIVATE npu/forward/include)
 add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
+# The arithmetic P7 (#806) part A rests on: (QH)(KH)^T = QK^T to f32 rounding, and what the rotation is
+# worth against an f16 KV cache (attention-weight KLD) with and without outlier channels.  Header only, no
+# device, no model: runs in CI.
+add_executable(npu_kv_int8_test tests/npu_kv_int8_test.cpp)
+target_include_directories(npu_kv_int8_test PRIVATE npu/forward/include)
+add_test(NAME npu_kv_int8 COMMAND npu_kv_int8_test)
 # The A-row quantiser every NPU GEMM runs on the host before its launch (npu/forward/include/quant_i8.h): its
 # AVX2 path must be byte-identical to the shipped scalar loop, including the .5 boundaries, the NaN/inf inputs
 # and the values past 2^31 that the (int) cast saturates.  Header only, no device, no model: runs in CI.
@@ -868,7 +955,7 @@ add_test(NAME attn_math COMMAND attn_math_test)
 # ci.yml's build step names its targets explicitly and needs the `workflow` scope to extend, so bind the new
 # binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add hadamard_rotate_test to the list itself.
-add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test)
+add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test npu_kv_int8_test)
 # The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.

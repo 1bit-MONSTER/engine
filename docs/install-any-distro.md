@@ -28,9 +28,20 @@ Two packages, from two places:
 | piece | where it comes from | what it is |
 |---|---|---|
 | Lemonade server + CLI | Lemonade's own package (Ubuntu: its PPA, weekly) | `lemonade-server`, `lemond` |
-| the engine | `1bit-engine_<version>_amd64.deb`, or the `.tar.zst` on a non-deb distro | `1bit`, its HRX llama.cpp build (`hrx/llama/bin/llama-server`), the sealed NPU kernel sets, the HSA runtime it dlopens, and the engine's `lemonade-hrx` wrapper, which is what the recipe's `llama-server` name points at |
+| the engine | its own package for your distribution: `.deb` (Debian, Ubuntu), `.rpm` (Fedora, openSUSE Tumbleweed), `.pkg.tar.zst` (Arch), `.tar.zst` (anything else) | `1bit`, its HRX llama.cpp build (`hrx/llama/bin/llama-server`), the sealed NPU kernel sets, the HSA runtime it dlopens, and the engine's `lemonade-hrx` wrapper, which is what the recipe's `llama-server` name points at |
 
-The engine package is userspace only: no kernel module, no Python at runtime.
+The engine package is userspace only: no kernel module, no Python at runtime. The four packages are
+one payload in four wrappings (`scripts/pack-distro.sh`): they install the same files at the same
+paths, so everything below about the drop-in, the config key and the shim is the same on every family,
+and only the install command differs.
+
+| your distribution | the engine |
+|---|---|
+| Debian, Ubuntu 26.04 or newer | `sudo apt-get install -y ./1bit-engine_<version>_amd64.deb` ([walkthrough below](#ubuntu-2604-resolute)) |
+| Fedora (the current release) | `sudo dnf install ./1bit-engine-<version>-1.x86_64.rpm` |
+| openSUSE Tumbleweed | `sudo zypper install ./1bit-engine-<version>-1.x86_64.rpm` (unsigned local file: [below](#fedora-and-opensuse-tumbleweed)) |
+| Arch Linux | `sudo pacman -U 1bit-engine-<version>-1-x86_64.pkg.tar.zst` |
+| anything else | the `.tar.zst`, [below](#any-other-distribution) |
 
 One indirection carries the whole contract, and it matters: Lemonade's recipe hands a backend exactly one
 environment variable (`GGML_DISABLE_VULKAN=1`), so pointing `hrx_bin` at the engine's raw `llama-server`
@@ -44,11 +55,14 @@ slot).
 
 **The engine package needs glibc 2.43, so it is a 26.04-or-newer package.** Measured on the shipping
 package (`readelf -V` on the extracted `1bit`, 2026-11-05): its highest requirement is
-`GLIBC_2.43`, and it is **one symbol** — `sqrtf@GLIBC_2.43`. On Ubuntu 24.04 (noble, glibc 2.39) the
-deb installs and `ldd` is happy, and then the binary refuses to load with
+`GLIBC_2.43`, and it is **one symbol** — `sqrtf@GLIBC_2.43`. The package declares that floor
+(`Depends: libc6 (>= 2.43)`), so on Ubuntu 24.04 (noble, glibc 2.39) apt refuses it outright:
+`1bit-engine : Depends: libc6 (>= 2.43) but 2.39-0ubuntu8.9 is to be installed`. Before that floor
+was declared, the deb installed, `ldd` was happy, and the binary then refused to load with
 `version 'GLIBC_2.43' not found`. Lemonade's own PPA does publish noble builds, so the engine half is
 the one that pins the distribution: on noble, build `1bit` from source, or run it on a 26.04 box.
-The tarball below carries the same binary and therefore the same floor.
+The `.rpm` says the same thing as `libc.so.6(GLIBC_2.43)` and the Arch package as `glibc>=2.43`; the
+tarball carries the same binary and the same floor and is the one route that cannot refuse.
 
 ```bash
 # 1. Lemonade's own package. The archive is signed by key
@@ -78,12 +92,11 @@ EOF
 sudo systemctl daemon-reload && sudo systemctl restart lemond
 ```
 
-**Do not install `amdxdna-dkms` from that archive on a machine whose kernel you did not build.** It is
-in the same PPA but nothing pulls it, and it is the wrong thing for this engine: its closure is
-`dkms` + `build-essential` + `linux-headers-<ver>-generic` and it builds a *stock* `amdxdna` module
-for the running kernel. Our boards reset with the stock driver (see `scripts/mkimage.sh`), which is
-why 1bit OS ships a private build of it, and a DKMS module lands in
-`/lib/modules/$(uname -r)/updates/`, i.e. in front of whatever the board was meant to load.
+**Do not install `amdxdna-dkms` from that archive.** It is in the same PPA but nothing pulls it, and it
+builds AMD's *stock* `amdxdna` for the running kernel. Our boards reset with the stock driver (see
+`scripts/mkimage.sh`), which is why every 1bit OS image and this box run a patched build. If you want
+the driver on another distribution, take our package instead: it is the same driver with the fleet's
+patch series, and the next section installs it.
 
 Verify the plug-in (no model needed):
 
@@ -100,21 +113,162 @@ Then one real chat per device is in "Verify" below.
 Nothing to do: the appliance already ships the engine and Lemonade. This page is the recipe for
 everything else, and the appliance's own check is `1bit-release-check` / `puppy-check`.
 
-## Other distributions
+## Fedora and openSUSE Tumbleweed
 
-Same floor as above: the tarball carries the same `1bit`, so the distribution needs glibc 2.43 or
-newer as well (measured: one symbol, `sqrtf@GLIBC_2.43`). Unpack it at `/opt/1bit/engine` and install
+One `.rpm` for both families, built without a distribution tag:
+
+```bash
+sudo dnf install ./1bit-engine-<version>-1.x86_64.rpm         # Fedora
+sudo zypper install ./1bit-engine-<version>-1.x86_64.rpm      # openSUSE Tumbleweed
+```
+
+The recipe (`packaging/rpm/1bit-engine.spec`) declares no dependencies: rpm reads the ELF files the
+package ships and requires the sonames that come from outside it (`libcrypto.so.3`, `libgomp.so.1`,
+`libzstd.so.1`, `libpcre2-8.so.0`, `libstdc++.so.6`, `libm.so.6`), which dnf resolves to `openssl-libs`, `libgomp`,
+`libzstd`, `pcre2` and `libstdc++`, and zypper to the same packages under their own names. That also
+encodes the floor above as `libc.so.6(GLIBC_2.43)`, so on an older release the install is refused
+with `nothing provides libc.so.6(GLIBC_2.43)` instead of succeeding and then failing to load.
+
+zypper prints `Package header is not signed!` for the local file — the release signs assets with
+`SHA256SUMS`, not with an RPM key — so in a script pass `--allow-unsigned-rpm`, after
+`sha256sum -c SHA256SUMS --ignore-missing`.
+
+## Arch Linux
+
+```bash
+sudo pacman -U 1bit-engine-<version>-1-x86_64.pkg.tar.zst
+```
+
+Built from `packaging/arch/PKGBUILD` in this repository (an AUR entry can come later), with the
+family's own dependency names: `glibc>=2.43`, `gcc-libs` (which carries `libstdc++`, `libgcc_s` and
+`libgomp`), `openssl`, `zstd`, `pcre2`.
+## Any other distribution
+
+The same floor as above: the tarball carries the same `1bit`, so the distribution needs glibc 2.43 or
+newer as well (measured: one symbol, `sqrtf@GLIBC_2.43`); the native packages say so and refuse to
+install below it, and the tarball cannot. Unpack it at `/opt/1bit/engine` and install
 Lemonade your distro's way (its `.deb`/`.rpm`, its container, or a source build — anything that reports
 `llamacpp-hrx` in `system-info`):
 
 ```bash
-sudo tar -C / --zstd -xf 1bit-engine-<version>-linux-x86_64.tar.zst opt
+sudo tar -C / --zstd --no-same-owner --no-overwrite-dir -xf 1bit-engine-<version>-linux-x86_64.tar.zst
 sudo ln -sf /opt/1bit/engine/1bit /usr/local/bin/1bit-engine
 # then the same two lines as above, in whatever runs lemond: the env var, or the config key.
 ```
 
+The tarball's members are `opt/1bit/…`, `usr/bin/1bit-engine`, `usr/share/1bit/…`,
+`usr/share/doc/1bit-engine/…` and `usr/lib/systemd/system/lemond.service.d/…` — the same paths the
+`.deb` and the `.rpm` install, and no other, so `-C /` puts every file where they put it. Every member
+is owned by `root:root` in the archive (`tar --owner=0 --group=0 --numeric-owner`), and the
+filesystem's own directories (`/`, `/usr`, `/usr/bin`, `/usr/lib`, `/opt`, …) are not members at all:
+they belong to the distribution's `filesystem` package. The two flags above are belt and braces from
+the other side — a tarball of ours that ever carried a wrong owner, or a `./` member, would otherwise
+rewrite the ownership of directories that are not ours when extracted as root, which is a local
+root escalation on the machine (`#1292` review); `scripts/pack-distro.sh` also fails the build if a
+member is not `0/0` or a `./` member appears.
+
+A tarball also carries no dependency metadata, so nothing resolves what the native packages'
+`Depends`/`Requires` name. If the engine reports one missing, it is the set the `.deb` declares
+(`libgomp1`, `libssl3`, `libzstd1`, `libpcre2-8-0`; measured: a bare `ubuntu:26.04` container
+answers `libgomp.so.1: cannot open shared object file` until `libgomp1` is installed).
+
+A tarball has no post-install either, so on a systemd machine copy the drop-in
+in by hand instead (the packaged families install it for you):
+
+```bash
+sudo install -D -m 0644 /dev/stdin /usr/lib/systemd/system/lemond.service.d/10-1bit-engine.conf <<'EOF'
+[Service]
+Environment=LEMONADE_HRX_HRX_BIN=/opt/1bit/engine/lemonade-bin
+EOF
+```
+
 If your Lemonade runs under systemd, the drop-in from the deb applies verbatim; in a container or a
 hand-started `lemond`, export `LEMONADE_HRX_HRX_BIN=/opt/1bit/engine/lemonade-bin` in its environment.
+
+What every family installs, and where: `/opt/1bit/engine` (the engine, its backends, the sealed NPU
+kernel sets, the HSA runtime) with `/usr/bin/1bit-engine` pointing at it,
+`/usr/lib/systemd/system/lemond.service.d/10-1bit-engine.conf` (the env form),
+`/usr/share/1bit/lemonade-config-fragment.json` (the config-key form) and
+`/usr/share/doc/1bit-engine/` (README and licences).
+
+## Kernel and NPU driver packages (optional)
+
+The engine package is userspace only. The NPU and the board's ECU need three more pieces, and a machine
+that stays on its distribution's kernel only needs the second and third:
+
+| package | what it is | needed for |
+|---|---|---|
+| `linux-image-<rel>` / `linux-headers-<rel>` (deb), `1bit-kernel` + `1bit-kernel-devel` (rpm), `linux-1bit` + `linux-1bit-headers` (Arch) | the kernel 1bit OS boots: Linux 7.4-rc1 with this fleet's config, signed with the 1bit MOK | only if you want OUR kernel; the drivers build against yours as well |
+| `amdxdna-1bit-dkms` | `amd/xdna-driver` at `526c6081` plus the engine's patch series (`third_party/patches/amdxdna/0001-0005`), as DKMS source | the NPU. Any 6.10+ kernel, signed with **your** MOK |
+| `ec-su-axb35-dkms` | the AXB35-02 board's embedded-controller driver (fans, EC temperature, power mode), GPL-2.0, upstream `cmetz/ec-su_axb35-linux` at `f62c2c22`, plus a DMI gate so it attaches only on an AXB35 | the fans on a Bosgame AXB35; inert on any other board |
+| `1bit-npu-config` | `limits.d/99-amdnpu-memlock.conf` (unlimited memlock), `udev/rules.d/90-1bit-npu-power.rules` (NPU keep-awake), `modules-load.d/ec_su_axb35.conf`, and the public MOK certificate at `/usr/share/1bit/mok/MOK-Kernel.der` | the NPU runtime's locked command buffers, and engine#1051's suspend/resume hang |
+
+The three driver/config packages are the same set in all three families. They install to
+`/lib/modules/<ver>/updates/` (Debian, Arch) or `/extra/` (Fedora) through dkms, which is in front of
+the in-tree `amdxdna`, and uninstalling the package puts the in-tree driver back.
+
+```bash
+# Debian / Ubuntu: the kernel comes from 1bit OS's own build, the drivers build against your headers.
+sudo apt-get install -y ./amdxdna-1bit-dkms_<ver>_all.deb ./ec-su-axb35-dkms_<ver>_all.deb ./1bit-npu-config_<ver>_all.deb
+sudo apt-get install -y ./linux-image-7.4.0-rc1-1bit_<ver>_amd64.deb ./linux-headers-7.4.0-rc1-1bit_<ver>_amd64.deb  # optional
+
+# Fedora / openSUSE: the local files are unsigned until the release pipeline signs them, hence --nogpgcheck.
+sudo dnf install --nogpgcheck ./amdxdna-1bit-dkms-<ver>.x86_64.rpm ./ec-su-axb35-dkms-<ver>.x86_64.rpm ./1bit-npu-config-<ver>.x86_64.rpm
+sudo dnf install --nogpgcheck ./1bit-kernel-<ver>.x86_64.rpm ./1bit-kernel-devel-<ver>.x86_64.rpm   # optional
+sudo depmod -a 7.4.0-rc1-1bit && sudo dracut --kver 7.4.0-rc1-1bit   # if you installed the kernel
+# openSUSE: zypper install --allow-unsigned-rpm ./<file>.rpm, same files
+
+# Arch: pacman warns that a local package is unsigned and installs it.
+sudo pacman -U ./amdxdna-1bit-dkms-<ver>-x86_64.pkg.tar.zst ./ec-su-axb35-dkms-<ver>-x86_64.pkg.tar.zst ./1bit-npu-config-<ver>-x86_64.pkg.tar.zst
+sudo pacman -U ./linux-1bit-<ver>-x86_64.pkg.tar.zst ./linux-1bit-headers-<ver>-x86_64.pkg.tar.zst   # optional
+sudo mkinitcpio -P                                                  # if you installed the kernel
+```
+
+Every one of them needs the kernel's own module tree next to the headers (`linux-modules-<ver>` on
+Ubuntu, `kernel-core` on Fedora, `linux` on Arch) — dkms looks for
+`/lib/modules/<ver>/build`, which those packages provide and a headers-only container does not.
+
+**Secure Boot.** Our kernel and its modules are signed with the `1bit-MONSTER` kernel key, which no
+machine has enrolled. Enrol the public half once, from the config package:
+
+```bash
+sudo mokutil --test-key /usr/share/1bit/mok/MOK-Kernel.der          # "not enrolled" on a new machine
+openssl x509 -inform DER -in /usr/share/1bit/mok/MOK-Kernel.der -noout -subject
+#   subject=CN=strixhalo Secure Boot Kernel, O=1bit-MONSTER
+sudo mokutil --import /usr/share/1bit/mok/MOK-Kernel.der            # sets a password; reboot -> MokManager
+```
+
+The **private** half never leaves the machine that signs the release and is part of no package. The
+dkms packages are the other way round: dkms signs with *your* key (`/var/lib/shim-signed/mok` on
+Debian/Ubuntu, `/etc/dkms/` elsewhere), so a module built on your machine chains to the MOK you
+enrolled for it — on Fedora and Arch, dkms generates that key pair on first use.
+
+Verify (no model needed):
+
+```bash
+dkms status                                  # amdxdna-1bit/0.18.0 and ec-su-axb35/0.1, installed for your kernel
+modinfo -n amdxdna                           # .../updates/dkms/amdxdna.ko (Debian, Arch) or .../extra/amdxdna.ko.xz (Fedora)
+modinfo -F srcversion amdxdna                # EE1F36A2B9BA294CE11AD80 is the series this release ships
+cat /etc/security/limits.d/99-amdnpu-memlock.conf
+```
+
+Uninstall puts the in-tree driver back:
+
+```bash
+sudo apt-get remove amdxdna-1bit-dkms ec-su-axb35-dkms 1bit-npu-config   # or dnf remove / pacman -R
+```
+
+**Source.** Each driver package ships the source it builds (`/usr/src/amdxdna-1bit-0.18.0/`,
+`/usr/src/ec-su-axb35-0.1/`) with its LICENSE; the amdxdna patch series is
+`third_party/patches/amdxdna/` in the engine repository, and 0006/0007 are carried there but **not
+applied** (loading those two is a separate decision — engine#812). The kernel packages carry
+`/boot/config-7.4.0-rc1-1bit`, and the tree they were built from is `torvalds/linux` v7.4-rc1 plus that
+config, built by `scripts/build-kernel.sh` / `os/mini/mkimage.sh`.
+
+The packages are built by `scripts/mk-kernel-packages.sh` and proven per family by
+`scripts/pkg-proof.sh`, which installs them in a clean container of that family, builds both dkms
+modules against the container's own kernel headers, checks that `amdxdna` resolves to the dkms build
+rather than the in-tree one, and uninstalls everything again.
 
 ## Host prerequisites, per device (measured on the Strix Halo development box)
 
@@ -165,6 +319,13 @@ is wrong:
 1bit-engine serve -m <model>.gguf --device npu          # NPU
 ```
 
+If that answers `HRX strict placement refused the model: "embd" is GET_ROWS f32 … and is not placed
+on HRX`, the model's graph has a node HRX cannot take under [serve's strict placement](serve.md)
+(measured 2026-11-06: `Qwen3-0.6B-Q4_K_M` has one, `1 of 986 nodes off HRX`, and
+`Qwen3-4B-Q4_K_M` has one too, `1 of 1266`). Add `--no-strict-device` to run those nodes on the CPU
+— the row below was measured that way — or use a model whose graph places fully (Lemonade's
+`*-HRX` rows are the ones we have measured end to end).
+
 What this route does **not** do, compared with the fork's `onebit` recipe: the model list is Lemonade's
 own catalog, not our 27 rows — ours can be added on the side through the config directory's
 `user_models.json`, below — and there are no NPU catalog rows, because Lemonade has no recipe for our
@@ -184,8 +345,19 @@ registry model, since this Lemonade version has no local-file registration):
 
 | claim | where | result |
 |---|---|---|
+| **each family installs, runs and uninstalls** | clean containers, 2026-11-06, from the `rc-2026-11-06-c31` payload: `fedora:latest` (`dnf`, rpm 6.1.0, glibc 2.44), `opensuse/tumbleweed:latest` (`zypper`), `archlinux:latest` (`pacman -U`, pacman 7.1.0), `ubuntu:26.04` (`apt-get`) | all four: install, `1bit-engine --version` prints `1bit 0.0.1`, the shim `/opt/1bit/engine/lemonade-bin/llama-server --version` prints `version: 1 (32559003)` / `built with Clang 24.0.0 for Linux x86_64`, then remove and `/opt/1bit/engine/1bit` is gone. Fedora refused the first build and that was the payload's fault, not dnf's: the package listed `/usr/bin` and `/usr/lib` at 0755 while Fedora's `filesystem` owns them at 0555 (`file /usr/bin from install of 1bit-engine-2026.45-1.x86_64 conflicts with file from package filesystem-3.18-59.fc45.x86_64`); `scripts/pack-distro.sh` now normalises the payload's modes and leaves the distributions' own skeleton out of the file list |
+| **the four packages are one payload** | the `.deb`, `.rpm`, `.pkg.tar.zst` and `.tar.zst` of the same run, unpacked as root in one `ubuntu:26.04` container (so each archive's own owner and mode are what lands) | 80 files each, 60 MB: identical paths, modes, **owner (`0:0`)**, sizes and sha256 across the four. The owner column was the gap in the first version of this check — `tar -tvf` said `bcloud/bcloud` for the tarball while the other three said root, and only the owner comparison showed it |
+| the tarball cannot hand a system directory to uid 1000 | clean `ubuntu:26.04`, the documented `sudo tar -C / --no-same-owner --no-overwrite-dir -xf …` | `/`, `/usr`, `/usr/bin`, `/opt` read `0:0 755` before and after; the payload lands `0:0`, `0` of 75 files not owned by root, and the shim runs (`version: 1 (32559003)`). Before the fix the same extraction as root left uid 1000 owning `/`, `/usr`, `/usr/bin` and `/opt` — a local root escalation on every "any other distribution" install (#1292 review) |
+| the glibc floor is enforced, not just documented | clean `ubuntu:24.04` container (glibc 2.39), `apt-get install ./1bit-engine_<version>_amd64.deb` | refused: `1bit-engine : Depends: libc6 (>= 2.43) but 2.39-0ubuntu8.9 is to be installed`. Before the floor was declared, the same deb installed, `ldd` was happy and the binary then failed to load |
+| **the package's payload serves on the GPU** | strixhalo, the Fedora `.rpm` unpacked with `rpm2cpio` (so exactly the files the package installs), `1bit serve -m Qwen3-0.6B-Q4_K_M.gguf --device hrx --no-strict-device`, two chats | `1bit serve: HRX: HSA runtime …/_rocm_sdk_core/lib/libhsa-runtime64.so.1 sha256 21a66824…` — the runtime the package ships, not the box's — then `Qwen3-0.6B-Q4_K_M on hrx`, health `200`, and `request /v1/chat/completions -> hrx status 200 in 202.5 ms | prompt 16 completion 16 79.0 tok/s`; a second chat with `max_tokens: 200` came back `content: "5"` (109 completion tokens, 69.1 tok/s). The first one's content was empty because Qwen3 spends the opening tokens on its thinking trace, so a 16-token budget never reaches the answer. Both this model and `Qwen3-4B-Q4_K_M` are refused first by strict placement (`"embd" is GET_ROWS f32 … 1 of 986 nodes off HRX`), which is why the runs pass `--no-strict-device` |
 | a stock Lemonade takes a backend binary from `hrx_bin` / `LEMONADE_HRX_HRX_BIN` | extracted PPA deb `2026.44.1~26.04` on the dev box, isolated cache/config | `llamacpp-hrx` backend `installable` → `installed`, both forms, with no fork and no patch |
 | the same recipe, both packages side by side | clean `ubuntu:26.04` container: PPA `lemonade-server` + this `.deb` | `lemond 2026.44.1` starts, `1bit-engine --version` and the shim run; the recipe's backend state is hardware-gated there (`unsupported: Unsupported GPU`), so the end-to-end chat is the hardware row below |
 | the shim is the engine's own wrapper | `1bit/lemonade-hrx` from this repo's package (`scripts/package-linux.sh`) | it runs `1bit serve --print-backend-env` and then `exec`s the engine with serve's environment and defaults; `lemonade-bin/llama-server` is a symlink to it |
 | the recipe's env for its backend is one variable | this tree, `src/cpp/server/backends/hrx/hrx_server.cpp` `build_server_environment()` | Lemonade passes its backend `GGML_DISABLE_VULKAN=1` only — which is why the wrapper, not our binary, has to be what the recipe starts |
 | `amdxdna-dkms` from the PPA drags kernel bits | clean container, `apt-get -s install amdxdna-dkms` | `dkms`, `build-essential`, `linux-headers-7.0.0-42-generic`, `linux-headers-generic`, `amdxdna-dkms` |
+| the driver packages install, build and uninstall on Debian/Ubuntu | clean `ubuntu:26.04` container, `scripts/pkg-proof.sh deb` | 22/22 rows PASS: dkms builds both modules against `7.0.0-43-generic`, `modprobe --show-depends amdxdna` resolves to `/lib/modules/7.0.0-43-generic/updates/dkms/amdxdna.ko.zst` (in front of the in-tree one), the kernel debs' `vmlinuz` is `sbverify`-clean against the certificate in `1bit-npu-config`, purge removes the /etc files |
+| the same on Fedora | clean `fedora:latest` (fc45) container, `scripts/pkg-proof.sh rpm` | 22/22 rows PASS: modules under `/lib/modules/7.2.15-300.fc45.x86_64/extra/`, kernel rpms install `1bit-kernel` + `1bit-kernel-devel` with the build symlink at `/usr/src/kernels/7.4.0-rc1-1bit`, uninstall leaves nothing |
+| the same on Arch | clean `archlinux:latest` container, `scripts/pkg-proof.sh arch` | 22/22 rows PASS: the pacman dkms hook builds both modules at install time, `linux-1bit` + `linux-1bit-headers` install with the build tree at `/usr/lib/modules/7.4.0-rc1-1bit/build` and `/etc/mkinitcpio.d/1bit.preset` |
+| the dkms source reproduces the driver this box runs | `scripts/mk-kernel-packages.sh` payload built in a container against `7.0.0-43-generic` | `srcversion EE1F36A2B9BA294CE11AD80`, the srcversion of the `amdxdna.ko` installed at `/lib/modules/7.4.0-rc1-1bit/updates/` — the package's source *is* the fleet's series |
+| the kernel the packages ship is the kernel this box runs | `linux-image-7.4.0-rc1-1bit_7.4.0~rc1-1_amd64.deb` payload vs `/boot/vmlinuz-7.4.0-rc1-1bit` | `sha256 6f3c6764…` in both, and `sbverify --cert MOK-Kernel.der` reports `Signature verification OK` |
+| the shipped driver answers a known answer on the NPU | this box, `npu-hold`, `1bit serve --device npu` on Qwen3-0.6B | `GET /health` ok, greedy `The capital of France is` → the model's expected continuation, 0 `amdxdna` errors in the window (no install, no module or udev change) |

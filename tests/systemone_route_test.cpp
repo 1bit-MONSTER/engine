@@ -29,6 +29,7 @@
 #include <vector>
 
 using nlohmann::ordered_json;
+using onebit::npu::systemone_attention_disagreement;
 using onebit::npu::SystemOneParsed;
 using onebit::npu::SystemOneRefusal;
 using onebit::npu::systemone_length_message;
@@ -183,12 +184,36 @@ void test_reply_shape() {
     check(contains(mtext, "Typed decisions with a probability for every option"), "upstream's description");
 }
 
+// engine#796: the pack's declared mask versus the forward's plan. A noncausal pack answered causally is the
+// silent failure this refusal exists to prevent, so each of the four combinations is pinned here rather
+// than only exercised by the serve path (which needs a model and a host-GEMM build).
+void test_attention_agreement() {
+    check(systemone_attention_disagreement("noncausal_full_attention", true, true, "/m").empty(),
+          "a noncausal pack with a noncausal plan loads");
+    check(systemone_attention_disagreement("noncausal_full_attention", true, false, "/m").empty(),
+          "the plan's own attention.mode is what decides, not the presence of the file");
+    check(systemone_attention_disagreement("causal", false, true, "/m").empty(),
+          "a causal pack is untouched by the check");
+    check(systemone_attention_disagreement("", false, false, "/m").empty(),
+          "a pack that declares no mask is untouched by the check");
+
+    const std::string absent = systemone_attention_disagreement("noncausal_full_attention", false, false, "/m");
+    check(contains(absent, "noncausal_full_attention") && contains(absent, "but the forward is causal"),
+          "a noncausal pack with a causal forward is refused, naming the declaration");
+    check(contains(absent, "/m/plan.json is absent") && contains(absent, "tools/npu_plan.py /m"),
+          "the refusal names the missing file and the command that writes it");
+    const std::string stale = systemone_attention_disagreement("noncausal_full_attention", false, true, "/m");
+    check(contains(stale, "/m/plan.json is stale"),
+          "a plan that disagrees with the container is named stale, not missing");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     test_request_envelope();
     test_questions_and_invalid();
     test_reply_shape();
+    test_attention_agreement();
     if (argc > 1)
         test_prompt_bytes(argv[1]);
     else

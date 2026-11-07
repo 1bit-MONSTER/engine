@@ -39,6 +39,7 @@
 #include "npu_device_lock.h"
 #include "npu_answer_parser.h"
 #include "npu_chatml.h"
+#include "npu_template.h"  // the container's own chat template (#963 option 2)
 #include "npu_grammar.h"
 #include "npu_load_retry.h"  // engine#1241: a refused NPU context names another client, not a dead device
 #include "npu_prefix_cache.h"
@@ -87,8 +88,16 @@ struct ForwardEngine {
     // The chat route renders ChatML for every container (#832), so whether this container's
     // tokenizer can represent that prompt is a property of the container: decided once at load
     // (#963).  A refusal, not a load failure -- the id route stays usable on such a container.
-    bool chatml_ok = true;
-    std::string chatml_refusal;  // empty unless !chatml_ok; the 400's message
+    // Since #963 option 2 the route renders the container's own template when it declares one, so
+    // the flag is "this container can be served on the chat route at all", not "its template is
+    // ChatML": a container with a template needs only that the build carries a renderer.
+    bool chat_ok = true;
+    std::string chat_refusal;  // empty unless !chat_ok; the 400's message
+    // The template the container declares, its sha256 and where it came from: rendered per request
+    // when present (app/npu_template.h), else ChatML when the tokenizer has the anchors.
+    npu::ChatTemplate tmpl;
+    std::string bos_text;  // the bos/eos *strings* the template's {{ bos_token }} renders
+    std::string eos_text;
     // decode() of every vocabulary id, built on the first constrained request: the GBNF
     // mask tests each token's text against the grammar state, per token.
     std::vector<std::string> tok_text;
@@ -179,8 +188,23 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     bool prompt_is_ids = false;
     try {
         if (chat) {
-            if (!e.chatml_ok) throw std::runtime_error(e.chatml_refusal);
-            prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
+            if (!e.chat_ok) throw std::runtime_error(e.chat_refusal);
+            if (e.tmpl.present() && npu::renderer_built()) {
+                // The request's own knobs reach the template as variables, the way llama-server hands
+                // `chat_template_kwargs` over: FastFlowLM's packs branch on `user_system_prompt`, Qwen3's
+                // on `enable_thinking`.  Ordered re-read of the same bytes: `body` is a std::map, and a
+                // template that serializes its input (a tools block through `tojson`) renders the
+                // request's key order into the prompt, so it has to be the caller's order, not ours.
+                const nlohmann::ordered_json ordered = nlohmann::ordered_json::parse(req.body);
+                nlohmann::ordered_json extra = nlohmann::ordered_json::object();
+                if (ordered.contains("chat_template_kwargs") && ordered["chat_template_kwargs"].is_object())
+                    extra = ordered["chat_template_kwargs"];
+                extra["enable_thinking"] = npu::thinking_from_body(body);
+                prompt = npu::render_chat_template(e.tmpl, ordered.at("messages"), /*add_generation_prompt=*/true,
+                                                   extra, e.bos_text, e.eos_text);
+            } else {
+                prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
+            }
         } else {
             prompt_is_ids = npu::prompt_ids_from_body(body, e.tok->size(), prompt_ids);
             if (!prompt_is_ids) prompt = body.at("prompt").get<std::string>();
@@ -247,8 +271,11 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         std::vector<int> ids = prompt_is_ids ? prompt_ids : e.tok->encode(prompt);
         // A chat template that opens with {{- bos_token }} (MiniCPM5 and other
         // llama-class models) needs the BOS id: the ChatML prompt built above never
-        // carries it, and those models derail into their special tokens without it.
-        if (!prompt_is_ids && chat && e.add_bos && e.bos_id >= 0) ids.insert(ids.begin(), e.bos_id);
+        // carries it, and those models derail into their special tokens without it.  A rendered
+        // template may already have emitted it, and a second BOS is a prompt no HF tokenizer
+        // produces.
+        if (!prompt_is_ids && chat && e.add_bos && e.bos_id >= 0 && (ids.empty() || ids.front() != e.bos_id))
+            ids.insert(ids.begin(), e.bos_id);
         if (ids.empty()) throw std::runtime_error("empty prompt");
         stats.prompt_tokens = int(ids.size());
         // The KV cache grows with every position: the prompt and the answer together stay
@@ -810,13 +837,27 @@ int run_forward_serve(int argc, char** argv) {
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
     if (e.max_context <= 0) e.max_context = 32768;
 
-    // #963: the chat route's prompt is ChatML for every container, and a tokenizer with no
+    // #963: the chat route's prompt was ChatML for every container, and a tokenizer with no
     // <|im_start|>/<|im_end|> added token cannot represent it -- the marker becomes ordinary pieces and
     // the model reads text its own template never produces (zyphra/ZR1-1.5B: 33 tokens rendered
-    // against 15 under the model's template).  Refused per request rather than refused at load,
-    // because /v1/completions with token ids (#938) is the way to serve such a container correctly.
-    if (!npu::chatml_supported(*e.tok)) {
-        e.chatml_ok = false;
+    // against 15 under the model's template).  Since option 2 the container's own template is rendered
+    // when it declares one, so the anchors are only needed by a container that declares none; a
+    // container with neither is still refused per request rather than failed at load, because
+    // /v1/completions with token ids (#938) serves it correctly.
+    e.tmpl = npu::load_chat_template(dir);
+    // The load names the template's identity, the same number a pin or a 400 quotes (#1089, #1095):
+    // one line per load, and "none" is a fact worth printing rather than an absence.
+    std::fprintf(stderr, "1bit forward-serve: template sha256=%s (%s)%s\n",
+                 e.tmpl.sha256.empty() ? "none" : e.tmpl.sha256.c_str(),
+                 e.tmpl.present() ? e.tmpl.source.c_str() : "no template",
+                 e.tmpl.present() ? "" : " -- the chat route uses ChatML with anchors, else refuses");
+    const bool can_render = e.tmpl.present() && npu::renderer_built();
+    if (e.tmpl.present() && !npu::renderer_built())
+        std::fprintf(stderr,
+                     "1bit forward-serve: this build has no chat-template renderer (ONEBIT_JINJA=OFF), so the "
+                     "container's template is NOT used and the chat route falls back to ChatML\n");
+    if (!can_render && !npu::chatml_supported(*e.tok)) {
+        e.chat_ok = false;
         std::string specials;
         std::vector<std::pair<const char*, int>> named = {{"bos", e.bos_id}};
         for (int id : e.eos) named.emplace_back("eos", id);
@@ -826,13 +867,18 @@ int run_forward_serve(int argc, char** argv) {
             specials += std::string(specials.empty() ? "" : ", ") + label + " " + text + " (" +
                         std::to_string(id) + ")";
         }
-        e.chatml_refusal =
+        e.chat_refusal =
             "this container's tokenizer has no <|im_start|> / <|im_end|>, so the ChatML prompt the chat route "
             "renders would be tokenized into pieces the model never sees (#963); send /v1/completions with "
             "prompt as token ids (#938) and render the model's own template" +
             (specials.empty() ? std::string() : " (model specials: " + specials + ")");
-        std::fprintf(stderr, "1bit forward-serve: chat route disabled: %s\n", e.chatml_refusal.c_str());
+        std::fprintf(stderr, "1bit forward-serve: chat route disabled: %s\n", e.chat_refusal.c_str());
     }
+    // The template variables `{{ bos_token }}`/`{{ eos_token }}` render: the strings the tokenizer
+    // actually has (a null bos_token in tokenizer_config.json is "", and the engine's -1 is the same
+    // fact), not a second read of the JSON that could disagree with the tokenizer.
+    if (e.bos_id >= 0) e.bos_text = e.tok->decode(e.bos_id);
+    if (!e.eos.empty() && e.eos.front() >= 0) e.eos_text = e.tok->decode(e.eos.front());
 
     // The prompt cache (#650): --prefix-slots 0 turns it off, and an invalid value is refused here
     // rather than clamped, like every other option on this command.
@@ -899,6 +945,14 @@ int run_forward_serve(int argc, char** argv) {
         }
     } else {
         e.head_error = "no decision_config.json + decision.q4nx next to " + model;
+    }
+    // engine#796: a d3 pack's declared mask and the forward's plan have to agree before a request runs, or
+    // the route answers a noncausal pack causally with nothing in the log saying so.
+    if (e.head) {
+        const std::string why = npu::systemone_attention_disagreement(
+            e.head->config().attention_mode, e.fwd->noncausal(),
+            std::filesystem::exists(dir + "/plan.json"), dir);
+        if (!why.empty()) throw std::runtime_error(why);
     }
 
     std::atomic<bool> ready{false};

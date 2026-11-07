@@ -160,6 +160,10 @@ public:
     bool init_host(const char* model_path, const std::string& artifact_dir);
     bool host_gemm() const { return host_gemm_; }
     bool ready() const { return ready_; }
+    // attention.mode as the loaded plan states it: false unless the plan says
+    // noncausal_full_attention, so a caller can check the served pack against its own declaration
+    // (app/forward_serve.cpp, engine#796).
+    bool noncausal() const { return noncausal_attn_; }
     const char* last_error() const { return err_.c_str(); }
 
     // Clear the KV cache (start a new sequence).
@@ -209,6 +213,9 @@ public:
     // tail of the batch.  The layer maths is the batched body step_batch already runs -- only the final
     // norm and the LM head are applied per row, and the head is launched once for all M rows (the M=16
     // twin streams its weights once for the batch, exactly like the layers).
+    //   A noncausal pack (`attention.mode noncausal_full_attention`) is refused by name: in such a batch
+    // every row attends to the rows after it, so these per-row logits are not the prefix-conditioned ones a
+    // draft is checked against.  See docs/npu.md, "attention.mode".
     bool step_batch_all(const std::vector<int>& tokens, int start_pos,
                         std::vector<float>& logits_all);
 

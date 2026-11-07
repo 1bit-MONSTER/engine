@@ -5,7 +5,7 @@
  },
  "counts": {
   "hrx": 298,
-  "npu": 7,
+  "npu": 9,
   "architectures": 298,
   "mapped": 298
  },
@@ -1441,14 +1441,18 @@
   "Qwen3_5ForCausalLM": {
    "gguf": "qwen35",
    "backends": [
-    "hrx"
-   ]
+    "hrx",
+    "npu"
+   ],
+   "npu_model_type": "qwen3_5"
   },
   "Qwen3_5ForConditionalGeneration": {
    "gguf": "qwen35",
    "backends": [
-    "hrx"
-   ]
+    "hrx",
+    "npu"
+   ],
+   "npu_model_type": "qwen3_5"
   },
   "Qwen3_5MoEForCausalLM": {
    "gguf": "qwen35moe",

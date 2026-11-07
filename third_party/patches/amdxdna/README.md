@@ -38,11 +38,23 @@ on which one is loaded.
 `srcversion EE1F36A2B9BA294CE11AD80`, sha256 `3c040833…`) has all **40 content sections byte-identical** to a build of this
 directory's `0001+0002+0003+0004+0005` (checked 2026-11-05 with `objcopy --only-section` per section, `.signature` excluded) —
 only the signature and the ELF container layout differ, which is what signing does. So the shipping board driver is
-reproducible from this directory rather than from a scratch tree |
+reproducible from this directory rather than from a scratch tree **It is also the fix for the long-context reading of
+engine#1051** (the 2026-11-04 per-block-count wedge at position 635 ran beside other clients on a pre-0003 module): on
+`EE1F36A2…` (2026-11-06) one client ran 300-2 150 positions in both context routes with 0 TDRs (8/8), and the pre-0003
+two-client shape (3/3 wedges on `646FFC30…`) now refuses the second client `code 102`, 0 TDRs, sequential and concurrent
+(`docs/npu.md`, *Two streams on one NPU*) |
 | 0004 | `accel/amdxdna: two TDR-recovery outcomes are not failures` (2 files, +36/−7) | 0002's recovery counted two non-failures as failures, and either one latched `hw_dead` (every later context refused `-ENODEV` until reload): a **throttled** power-cycle (`-EBUSY` inside `AIE2_HW_RESET_MIN_INTERVAL_MS`, two TDRs in 60 s were enough) and a **closing** context (`aie2_hwctx_restart()` `-ENODEV` for a context whose heap address is gone, now `-ESRCH` + `rarg.skipped`) | the kernel lane's `0008`; rebuilt from these files it is `6483D31718A008B3602114E`, the module installed at 23:2x on 2026-11-04; the two TDR-recovery proofs in `TKERNEL-74-STATE.md` ran on it |
 | 0005 | `accel/amdxdna: check the power-cycle throttle before touching any context` (1 file, +20) | 0004 stops the throttle being counted at the reset call, but the recovery still ran both context walks — stopping every context and restarting it against an array that was never power-cycled, which sets `rarg.failed` and latches `hw_dead` through the other path. Check the throttle first and return having touched nothing | the kernel lane's `0009`; 0004+0005 is the `0007+0008+0009` shipping stack, and the fleet's live record shows the branch executing 32× with **0 latches** (`TKERNEL-74-STATE.md`, 2026-11-05 03:45) |
-| 0006 | `accel/amdxdna: don't invalidate an imported dma-buf BO at mmap time` (1 file, +10/−31) — **carried, NOT installed, owner-gated** | `amdxdna_insert_pages()` marked an imported dma-buf BO's mapping invalid right after `dma_buf_mmap()`, which put it on `client->bo_invalid_list`; that list is drained client-wide by `amdxdna_populate_range()` → `hmm_range_fault()`, which cannot fault a mapping the exporter created, so the *next* submit of the process returned `-EFAULT` for every job — including a fresh context's admission. Imported BOs are left alone (their population is the exporter's); `amdxdna_mark_mapp_invalid()` loses its last caller and goes with it | measured 2026-11-02 on 0.18.0: import + map succeed, then `kernel_queue_create()` fails `0x30000000E` (EFAULT) and the client stays poisoned — engine#812, CTS cases in `FACTS-libamdf.md` §9; **the fix has never been loaded** (`/lib/modules` untouched, no `modprobe`, no parameter changed) |
+| 0006 | `accel/amdxdna: don't invalidate an imported dma-buf BO at mmap time` (1 file, +10/−31) — **carried, NOT installed, owner-gated** | `amdxdna_insert_pages()` marked an imported dma-buf BO's mapping invalid right after `dma_buf_mmap()`, which put it on `client->bo_invalid_list`; that list is drained client-wide by `amdxdna_populate_range()` → `hmm_range_fault()`, which cannot fault a mapping the exporter created, so the *next* submit of the process returned `-EFAULT` for every job — including a fresh context's admission. Imported BOs are left alone (their population is the exporter's); `amdxdna_mark_mapp_invalid()` loses its last caller and goes with it | measured 2026-11-02 on 0.18.0: import + map succeed, then `kernel_queue_create()` fails `0x30000000E` (EFAULT) and the client stays poisoned — engine#812, CTS cases in `FACTS-libamdf.md` §9; **the fix has never been loaded** (`/lib/modules` untouched, no `modprobe`, no parameter changed). Re-measured 2026-11-06 on the module the c26 image ships (`EE1F36A2B9BA294CE11AD80`): CTS binding **7/7 PASSED**, and of the 13 execution arms 4 pass / **9 fail**, all 8 `ImportedBacking/*` arms at `kernel_queue_create` with `aie2_cmd_submit: Populate ranges failed, ret -14` in dmesg while the registered-pages control passes — i.e. the array is fine and the import is what is refused. `tests/npu_import_contract.sh` is that pairing as a test (`ONEBIT_IMPORT_CONTRACT=advertised` is its acceptance form: red on this module, green on one carrying the pair) |
 | 0007 | `accel/amdxdna: don't re-invalidate imported dma-buf BOs from the mmu notifier` (2 files, +13/−7) — **carried, NOT installed, owner-gated** | the same marking was applied again by `amdxdna_hmm_invalidate()`, so any real invalidation of that range (the exporter calling `unmap_mapping_range()` while it evicts) re-poisoned the client. Skips the marking for imported BOs and keeps the sequence update plus the `MMU_NOTIFY_UNMAP` cleanup for them | same measurement; the kept half is why this is not simply "return early" |
+
+| 0008 | `accel/amdxdna: a dying context must not fail the device resume` (2 files, +33/−4) | `aie2_hwctx_resume_cb()` failed the whole walk on the `-ESRCH` that `aie2_hwctx_restart()` returns for a context whose heap address is gone (a client closing while the device is runtime-suspended), and `aie2_hw_resume()` then `break`s out of the **client** loop: every context of every later client stayed destroyed with no firmware context at all, and `pm_runtime_resume_and_get()` reported failure for a resume that had in fact started the hardware, so `amdxdna_pm_resume_get()` called `pm_runtime_set_suspended()` on a started device | the c29 take's own log: `amdxdna_pm_resume_get: Resume failed: -3` then `amdxdna_drm_close: Resume failed (-3), pid 11374 restore data not reclaimed`, followed immediately by `device is already started` — the resume ran, the dying context made it report failure (engine#1051) |
+| 0009 | `accel/amdxdna: keep the array awake while a context exists` (1 file, +35/−0) | a runtime suspend destroys every firmware context and the resume recreates them; on this platform a recreated context is created and host-buffer-mapped with the same messages, the same fw ctx id and the same address, `aie2_hwctx_restart()` returns 0 — and its first dispatch still never reaches the DPU (`DPU PC 0xffffffff`, `TXN OP ID 0xffffffff`, `timed out sub command 0`), after which the array wedges until a power-cycle. Take a runtime-PM usage reference for the life of each hw_context (`pm_runtime_get_noresume()` in `aie2_hwctx_init()`, released with `pm_runtime_put_autosuspend()` in `aie2_hwctx_fini()`), so the array cannot enter that state under any client; a device with no contexts still autosuspends at 5 s | the engine#1051 ladder on strixhalo 2026-11-06: **3/3 wedge** with `power/control=auto` on the shipping module, each log showing `Destroyed fw ctx 15` → suspend → `Created fw ctx 15` + host buffer → `restarted, ret 0` → wedge, while the same request into a context created after the resume succeeded and XRT's own validate passed 5/5 across resumes. This is the driver-level form of the c30 keep-awake policy, so it protects every client, not only the payload that polls GET_INFO |
+
+**Numbering note (2026-11-06):** the kernel lane's `~/briefs/TKERNEL-74-STATE.md` uses its own series names
+(`0007`-`0012`) for what is `0004`/`0005`/`0003` here. The numbers in *this* directory are the ones the install order and
+the fingerprint table use. The engine#1051 pair added on 2026-11-06 is `0008` (resume: a dying context must not fail the
+device resume) and `0009` (runtime PM: no suspend under a live context) — those two exist only in this numbering.
 
 They are a **series** — apply them in numeric order against `526c6081`. Applying them to a clean checkout of the pin
 reproduces, byte for byte, the sources each shipped build was built from (checked by `cmp` over every
@@ -63,6 +75,8 @@ git apply <engine>/third_party/patches/amdxdna/0002-*.patch
 git apply <engine>/third_party/patches/amdxdna/0004-*.patch
 git apply <engine>/third_party/patches/amdxdna/0005-*.patch
 git apply <engine>/third_party/patches/amdxdna/0003-*.patch # a candidate, order does not matter
+git apply <engine>/third_party/patches/amdxdna/0008-*.patch # resume: a dying context must not fail the resume
+git apply <engine>/third_party/patches/amdxdna/0009-*.patch # runtime PM: no suspend under a live context (engine#1051)
 
 make -C drivers/accel/amdxdna modules ARCH=x86_64 KERNEL_VER=$(uname -r) \
      MODULE_VER_STR='2.21.0_20261104,526c6081974ea4f0f7dd22329186c5d6adb8fad5'
@@ -122,6 +136,9 @@ All values below were produced on strixhalo against the `7.4.0-rc1-1bit` headers
 | pin + 0001 + 0002 + 0003 | `FA680E5F8334570CA318449` |
 | pin + 0001 + 0002 + 0003 + 0004 + 0005 (shipping stack + the partition fix) — **this is the c26 image's driver**: its 40 content sections are byte-identical to the signed module on the artifact | `EE1F36A2B9BA294CE11AD80` |
 | pin + 0001 + 0002 + 0003 + 0004 + 0005 + 0006 + 0007 (the above + the #812 pair, compile-proven, not installed) | `336751493A77C50DE0B50F7` |
+| pin + 0001 + 0002 + 0003 + 0004 + 0005 + 0008 (**the shipped stack + #1051's resume fix, built 2026-11-06**) | `F77B98053D0D680105B251F` |
+| pin + … + 00008 only (#1051 resume half) | `F77B98053D0D680105B251F` |
+| pin + … + 0008 + 0009 (both #1051 halves, built 2026-11-06) | `F87D0BDF248067862F83BA3` |
 | *(not buildable from this directory alone)* `0007+0008+0009+0010` + the partition fix — the build that measured it on strixhalo. **Reproduced from these files**: applying `0003` to that tree instead of the scratch `0011v2` delta rebuilds to the same srcversion | `349FDC99CADC56900E0249A` |
 
 Every row above was produced by building the files in this directory, not inferred. `56AB94758C18FEEC838D18C` is
@@ -159,6 +176,16 @@ it, and it carries neither fix.
 The **#812 pair (0006, 0007)** is carried and compile-proven but never loaded: the owner decides whether the imported-dma-buf
 execution path is enabled, and the runtime proof is the owner's run (`FACTS-libamdf.md` §9 has the failure it fixes). No image
 may pick them up until that word exists.
+
+The acceptance is written down as a test rather than as this paragraph: `tests/npu_import_contract.sh` (CTest
+`npu_import_contract`) reads the advertised capability from the pinned libamdf, runs the imported-backing CTS arms plus
+the registered-pages control, and keys the expected result on the loaded module's `srcversion` against the fingerprint
+table above — so a module that is nobody's measured build is reported, not assumed. `ONEBIT_IMPORT_CONTRACT=advertised` is
+the gate form: on this directory's pair it must be green, and on a driver without it the run fails naming this directory.
+
+To load the pair (owner's call; strixhalo, 2026-11-06): the module built from the pin + `0001..0007` for
+`7.4.0-rc1-1bit` reports `336751493A77C50DE0B50F7`, and the install has to sign it, `depmod`, and **`update-initramfs`** —
+the initramfs copy is what boots (2026-11-04: three reboots on the old module without that step).
 
 ## What this directory deliberately does not carry
 

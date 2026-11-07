@@ -25,6 +25,14 @@ This page exists because three separate investigations re-derived the same two f
 #528, #1251's successor #973), and one of them was written down wrong once already (#973's "0.3 % HRX offset"
 is a property of a *pin*, not of HRX — see "Trap 1").
 
+**Verified at the pin** `third_party/llama.cpp` = `ed43da0b4` (what engine main carried when this page was
+written): the four `llama_adapter_lora_*` entry points are in `include/llama.h` (`set_factors` at `:725`,
+`_multi` at `:745`, `n_factors` at `:751`, `factor_name_by_index` just below) and `--lora` / `--lora-scaled` /
+`--lora-init-without-apply` are in `common/arg.cpp`. The factor write itself arrived in fork commit `c729177bc`,
+an ancestor of that pin. A pin bump re-checks in two commands:
+`grep -n 'llama_adapter_lora_set_factors' third_party/llama.cpp/include/llama.h` and
+`grep -c -- '--lora' third_party/llama.cpp/common/arg.cpp`.
+
 ## The lifecycle
 
 1. `llama_adapter_lora_init(model, path)` parses the adapter GGUF, validates each `lora_a`/`lora_b` pair against

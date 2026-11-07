@@ -1,0 +1,29 @@
+{
+  "id": "27b-t2s2-prefill-20261106",
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX ternary sidecars, sealed single-ELF decode",
+  "metric": {
+    "name": "prefill",
+    "value": 19.55,
+    "unit": "tok/s"
+  },
+  "settings": {
+    "device": "accel0",
+    "engine": "1bit t2s2-20261104 (serve-bin)",
+    "model_dir": "~/models/npu/bonsai2-27b-t2s2-serve",
+    "container": "Qwen3.8-27B-NPU2 (qwen3_5, 64 layers, H=5120, ternary sidecars, sealed single-ELF decode set)",
+    "ticket": "npu-hold -t 14 -l 587-27b-row4",
+    "port": "18099",
+    "sampling": "temperature 0, top_k 1, seed 1234, stream=false",
+    "prompt_tokens": 13,
+    "prompts": "13-token and 37-token prompts, 1 completion token, 3 repeats each",
+    "slopes": "(t37 - t13) / 24 prompt tokens = 51.1 ms/token"
+  },
+  "instrument": "wall clock per request at n=1 for two prompt lengths; prefill is the difference over the 24 extra prompt tokens, with the single decode step and the fixed per-request overhead cancelling; t13 0.9537 s +- 0.0038, t37 2.1810 s +- 0.0344",
+  "repeats": 3,
+  "timestamp": "2026-11-06T20:53:40Z",
+  "source": "~/evidence/tmoe-npu/587-27b-row-20261106/r2 (this session; per-request JSON kept), task b9e132438",
+  "notes": "This is the per-op NPU path, not a batched prefill: the plan declares M=128 for prefill but this serve answers one prompt at a time, so the figure is the marginal cost of a prompt token and should not be read as 32-token-chunk throughput. Context: the int8 rung measured 58.14 s for a 5-token chunk (27b-prefill-batched-20261027). HRX prefill on the same box is ~287 tok/s, so the NPU is far behind on this axis - which is why the hybrid answer in engine#587 has always been 'recommended against'."
+}

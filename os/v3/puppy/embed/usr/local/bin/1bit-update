@@ -54,6 +54,60 @@ fail() { say "1bit-update: FAILED: $*" >&2; logtail; exit 3; }
 
 usage() { sed -n '/^# 1bit-update /,/^# Exit:/p' "$0" | sed 's/^# \{0,1\}//'; }
 
+# ── the save layer and the target slot: pure functions of the data partition, so a test can run them ───────────
+# find_save_layer DATA ACTIVE: sets save_slot and savename to the layer the RUNNING slot uses - a real
+# <prefix>save directory in ACTIVE, or the slot its relative link points at - because that is the layer Puppy's init
+# mounted for this boot. It is not "whichever real layer a scan meets last": with a second, foreign layer in the
+# other slot that picked the wrong one. After the first update the machine runs /1bit-alt, whose link still points
+# at /1bit, so save_slot stays 1bit and both slots keep reaching one layer.
+find_save_layer() {
+    save_slot=
+    savename=
+    for s in "$1/$2"/*save*; do
+        [ -e "$s" ] || continue
+        if [ -L "$s" ]; then
+            to=$(readlink "$s")
+            case $to in
+                ../1bit/*|../"$ALT"/*) ;;
+                *) continue ;;     # a link this script did not write
+            esac
+            slot=${to#../}; slot=${slot%%/*}
+            [ -d "$1/$slot/${to##*/}" ] && [ ! -L "$1/$slot/${to##*/}" ] || continue
+            save_slot=$slot; savename=${to##*/}
+        elif [ -d "$s" ]; then
+            save_slot=$2; savename=$(basename "$s")
+        fi
+        return 0
+    done
+}
+
+# prepare_target_layer DATA TARGET: makes the target slot ready to reach the save layer, or names why it cannot.
+# The layer a machine shares between its slots lives in ONE of them. When the target is the slot that holds it, which
+# is every second update (the machine runs from /1bit-alt and writes /1bit again), that directory is this machine's
+# own state: it is kept, and it needs no link. Any OTHER real layer in the target is another machine's state, which an
+# update cannot merge. A stale link is replaced. Prints the refusal reason and returns 1; returns 0 otherwise.
+prepare_target_layer() {
+    for s in "$1/$2"/*save*; do
+        [ -e "$s" ] || [ -L "$s" ] || continue
+        if [ -d "$s" ] && [ ! -L "$s" ]; then
+            [ "$2" = "$save_slot" ] && [ "$(basename "$s")" = "$savename" ] && continue
+            echo "/$2 already holds a save layer ($(basename "$s")): two layers cannot be merged by an update - pick the slot by hand if that is really what you want"
+            return 1
+        fi
+        rm -f "$s"
+    done
+    return 0
+}
+
+# link_target_layer DATA TARGET: the target reaches the layer through a relative link, unless it holds the layer.
+link_target_layer() {
+    [ "$2" = "$save_slot" ] && return 0
+    ln -sfn "../$save_slot/$savename" "$1/$2/$savename"
+}
+
+# sourced by tests/one_bit_update_slots_test.sh with ONEBIT_UPDATE_LIB=1: the functions above, nothing below
+if [ "${ONEBIT_UPDATE_LIB:-}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
+
 src=''
 mode=install
 case "${1:---help}" in
@@ -93,16 +147,7 @@ for p in /sys/block/"$bootdisk"/"$bootdisk"*; do
     [ "$(blkid -o value -s LABEL "$n" 2> /dev/null)" = 1BIT-OS ] && { esp=$n; break; }
 done
 [ -n "$esp" ] || die "no 1BIT-OS partition on $bootdisk: this machine did not boot from an installed disk"
-save_slot=
-savename=
-for d in "$DATA"/1bit "$DATA"/"$ALT"; do
-    [ -d "$d" ] || continue
-    for s in "$d"/*save*; do
-        [ -e "$s" ] || continue
-        # -L: a symlink to the layer counts, but only a REAL directory is where the layer lives
-        if [ -d "$s" ] && [ ! -L "$s" ]; then save_slot=$(basename "$d"); savename=$(basename "$s"); fi
-    done
-done
+find_save_layer "$DATA" "$active"
 
 # ── GRUB: read the config, find a slot's entries, write the default ──────────────────────────────────────────
 esp_mount=/tmp/1bit-update/esp
@@ -231,14 +276,9 @@ szk=$(du -sk "$src" | cut -f 1)
 freek=$(df -Pk "$DATA" | awk 'NR == 2 { print $4 }')
 [ "$freek" -gt $((szk + 262144)) ] || die "only ${freek} KiB free on $DATA, the set needs ${szk} KiB plus 256 MiB of slack"
 
-# a slot that already owns a save layer is another machine's state, not something to overwrite
-for s in "$DATA/$target"/*save*; do
-    [ -e "$s" ] || continue
-    if [ -d "$s" ] && [ ! -L "$s" ]; then
-        die "/$target already holds a save layer ($(basename "$s")): two layers cannot be merged by an update - pick the slot by hand if that is really what you want"
-    fi
-    rm -f "$s"
-done
+# a slot that already owns a save layer is another machine's state, not something to overwrite - unless it is the
+# slot holding THIS machine's shared layer, which is every second update (engine#1334 review)
+why=$(prepare_target_layer "$DATA" "$target") || die "$why"
 
 # ── write the other slot ─────────────────────────────────────────────────────────────────────────────────────
 say "== install $src into /$target (the running set is /$active and is not touched)"
@@ -246,12 +286,13 @@ for f in $need; do
     cp -f "$src/$f" "$DATA/$target/$f" >> "$LOG" 2>&1 || fail "copying $f into /$target failed"
 done
 [ -s "$src/SHA256SUMS" ] && cp -f "$src/SHA256SUMS" "$DATA/$target/SHA256SUMS" 2> /dev/null
-ln -sfn "../$save_slot/$savename" "$DATA/$target/$savename" || fail "cannot link the save layer into /$target"
+link_target_layer "$DATA" "$target" || fail "cannot link the save layer into /$target"
 for f in $need; do
     cmp -s "$src/$f" "$DATA/$target/$f" || fail "/$target/$f does not match the source after copying"
 done
 sync
-say "   $(ls "$DATA/$target"/*.sfs | wc -l) SFS, kernel and initrd in /$target; save layer -> $(readlink "$DATA/$target/$savename")"
+if [ "$target" = "$save_slot" ]; then layer_note="held here (both slots share it)"; else layer_note="-> $(readlink "$DATA/$target/$savename")"; fi
+say "   $(ls "$DATA/$target"/*.sfs | wc -l) SFS, kernel and initrd in /$target; save layer $layer_note"
 
 # ── GRUB: the other slot needs its entries, and they become the default ─────────────────────────────────────
 mount_esp || fail "cannot mount the ESP $esp"

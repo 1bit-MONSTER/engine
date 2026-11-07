@@ -226,6 +226,19 @@ FLM_Q4NX_Converter configuration files (17 JSON files under configs/q4nx/)
   no code is copied from that project; see configs/q4nx/README.md.
 
 -------------------------------------------------------------------------------
+Models the engine serves (downloaded separately, not redistributed)
+-------------------------------------------------------------------------------
+
+trit-embed-3l (Cyronius/trit-embed-3l)
+  https://huggingface.co/Cyronius/trit-embed-3l
+  Copyright (c) 2026 Cyronius
+  License: MIT. A 3-layer BERT sentence-embedding model with 2-bit ternary weights, 384-dim unit vectors,
+  128 tokens, mean pooling, which `1bit` serves as a 1-bit encoder container (tools/trit_embed_pack.py,
+  app/embed_model.cpp; engine#1311). The weights are not in this repository. The checkpoint is based on
+  bge-micro-v2, whose lineage the model card records; the conversion widens the ternary codes to int8 and
+  keeps the model's own per-output-row scale (see docs/npu.md, "Sentence embeddings").
+
+-------------------------------------------------------------------------------
 Tools that scripts under tools/ drive (installed separately, not redistributed)
 -------------------------------------------------------------------------------
 

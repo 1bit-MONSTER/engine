@@ -239,6 +239,32 @@ def longctx_exceeds_serve_ctx():
     return bool(longctx) and longctx + env_int("HL_LONGTOK", 128) > serve_ctx()
 
 
+def decode_unit(ctx_actual, decoded=None, requested=None):
+    """The score's unit, naming **both** dimensions that change the number.
+
+    A long-context result's score is a decode rate, so two things set its value: the context the server
+    actually prefilled, and **the number of tokens the decode actually produced** -- that count is the
+    score's own denominator, and it is not the number the caller asked for, because the model can stop at
+    EOS first unless the request sets ``ignore_eos``. Measured on this box 2026-11-07: the same lever and the
+    same configuration gave 13.3986 tok/s over 128 decoded tokens and 14.1784 over 278 (`HL_LONGTOK=512`
+    requested, 278 produced), and both rows carried the **identical** unit string
+    `tok/s (decode at 18762-token ctx)`. A reader -- or a scoreboard -- comparing those two numbers had
+    nothing in the unit to say their denominators differed by more than 2x.
+
+    When the decode stopped short the unit says the request it stopped short of (`278 of 512 requested`),
+    so an incomplete row is visible in the one field that travels with the number.
+
+    One definition, used both for the pre-measurement placeholder and for the measured result, so the two
+    cannot drift apart the way the README and the gate did in engine#769.
+    """
+    base = f"tok/s (decode at {ctx_actual}-token ctx"
+    if not decoded:
+        return f"{base})"
+    if requested and int(decoded) < int(requested):
+        return f"{base}, {decoded} of {requested} requested)"
+    return f"{base}, {decoded} decoded)"
+
+
 def serve_lever_args():
     """The levers that only `1bit serve` has: drafting and slots.
 
@@ -581,17 +607,10 @@ def wait_healthy(port, proc, deadline):
     return False
 
 
-def ask(port, prompt, max_tokens, timeout):
-    body = {
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "cache_prompt": False,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
+def ask(port, prompt, max_tokens, timeout, ignore_eos=False):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
-        json.dumps(body).encode(),
+        json.dumps(request_body(prompt, max_tokens, ignore_eos)).encode(),
         {"content-type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -599,6 +618,44 @@ def ask(port, prompt, max_tokens, timeout):
     if "timings" not in reply:
         raise RuntimeError("backend reported no timings")
     return reply["timings"]["predicted_per_second"], reply["choices"][0]["message"]["content"], reply["timings"]
+
+
+def request_body(prompt, max_tokens, ignore_eos=False):
+    """The chat request this workload sends.
+
+    ``ignore_eos`` pins the decode length: without it ``max_tokens`` is only a ceiling, because the model can
+    stop at EOS first, so the numbers a rate is divided by differ between two runs of the same configuration.
+    Measured on this box 2026-11-07: the same arm with ``HL_LONGTOK=512`` decoded **278** tokens (serve:
+    ``stop processing: n_tokens = 19039, truncated = 0``) while a sibling requested the same 512 and produced
+    282 -- and the long score is a rate, so that difference is in the score.
+
+    Requested only for the **long-context leg**, never for the short legs: those replies feed the greedy-text
+    gate, which compares them against a stored reference, so changing how many tokens they may run would change
+    the gate's own inputs. The long reply is deliberately outside that gate (it depends on the context, not on
+    the lever), which is what makes pinning its length safe.
+    """
+    body = {
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "cache_prompt": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    if ignore_eos:
+        body["ignore_eos"] = True
+    return body
+
+
+def decode_completeness(requested, actual):
+    """True when the decode produced at least the requested number of tokens.
+
+    The score is a rate, so its denominator is part of the measurement: a row that requested 512 tokens and
+    produced 278 is not the same measurement as one that produced 512, and `throughput_unit` names the count so
+    the two cannot read alike. This is the same fact as a boolean, for callers that want to filter rather than
+    parse the unit string -- and a missing count is **not** complete, because "nobody knows" must never read as
+    "it finished".
+    """
+    return bool(actual) and bool(requested) and int(actual) >= int(requested)
 
 
 def long_prompt(n_tokens):
@@ -635,11 +692,17 @@ def serve_measure(onebit, model, args, reps, tokens, timeout, log_dir, longctx=0
         if longctx:
             # One request, not a median: the long leg costs a full prefill of the whole history, and a
             # decode rate at 18.8k is what #679 compares. The server reports the prompt it actually saw.
-            value, text, timings = ask(port, long_prompt(longctx), longtok, timeout)
+            # ignore_eos pins the decode length so the rate's denominator is the one we asked for; the
+            # artifact still records what actually came back, because the flag is a request to the backend,
+            # not a guarantee from it (this is the only leg that may set it -- the short legs' texts are the
+            # gate's inputs).
+            value, text, timings = ask(port, long_prompt(longctx), longtok, timeout, ignore_eos=True)
             tps["long"] = value
             texts["long"] = text
+            decoded = timings.get("predicted_n")
             long_info.update({"ctx_tokens_requested": longctx, "ctx_tokens_actual": timings.get("prompt_n"),
-                              "decode_tokens": timings.get("predicted_n"),
+                              "decode_tokens_requested": longtok, "decode_tokens": decoded,
+                              "decode_complete": decode_completeness(longtok, decoded),
                               "prefill_tok_s": timings.get("prompt_per_second")})
     finally:
         proc.terminate()
@@ -822,7 +885,7 @@ def main():
         "framework": "custom",
         "workload_kind": "scriptable",
         "model_id": f"{model.name} (HRX0, gfx1151)",
-        "throughput_unit": (f"tok/s (decode at {longctx}-token ctx)" if longctx
+        "throughput_unit": (decode_unit(longctx) if longctx
                             else "tok/s (geomean of pp512, tg128, serve code)"),
         "output_throughput": 0.0,
         "total_token_throughput": 0.0,
@@ -878,8 +941,12 @@ def main():
         result["bench_summary"]["longctx"] = {k: (round(v, 2) if isinstance(v, float) else v)
                                               for k, v in long_info.items()}
         if long_info.get("ctx_tokens_actual"):
-            # Label the unit with the context the server actually saw, not the one we asked for.
-            result["throughput_unit"] = f"tok/s (decode at {long_info['ctx_tokens_actual']}-token ctx)"
+            # Label the unit with the context the server actually saw, not the one we asked for, **and** with
+            # the decoded token count, because that count is the score's denominator and differs from the
+            # requested one whenever the model stops at EOS first (engine#1268).
+            result["throughput_unit"] = decode_unit(long_info["ctx_tokens_actual"],
+                                                   long_info.get("decode_tokens"),
+                                                   long_info.get("decode_tokens_requested"))
     result["total_token_throughput"] = round(tps["long"] if longctx else tps["code"], 2)
     result["request_throughput"] = round(result["total_token_throughput"] / tokens, 4)
 

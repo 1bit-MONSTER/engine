@@ -89,6 +89,8 @@
 #include "forward_serve.h"
 #include "unified.h"
 #endif
+
+#include "embed_serve.h"  // the embedding role served in-process from a 1-bit container (engine#1311)
 #ifdef ONEBIT_LAYA
 #include "encoder.h"
 #include "models.h"
@@ -2229,8 +2231,39 @@ int serve_child(const Options& given) {
     }
 
     std::vector<Launch> rag;   // [0] embedding, then rerank, if given
-    if (!o.embed.empty()) rag.push_back(rag_launch(o, o.embed, "embedding", free_port()));
-    if (!o.rerank.empty()) rag.push_back(rag_launch(o, o.rerank, "reranking", free_port()));
+    // A 1-bit encoder container has no llama-server: it is served by this process (app/embed_serve.h), so it
+    // takes a placeholder entry with port 0 and rag_route answers it here. Everything else is unchanged.
+    std::vector<std::string> rag_inproc;   // index-aligned with rag: container dir, or empty for a child
+    auto rag_add = [&](const std::string& model, const char* role) {
+        if (embed_serve::container(model)) {
+            Launch inproc;
+            const std::string want = o.device == "auto" ? "" : o.device;
+            if (!want.empty() && want != "npu" && want != "cpu")
+                throw std::runtime_error(std::string("--") + role + " of a 1-bit embedding container runs on "
+                                         "--device npu or cpu, not " + want);
+            inproc.device = (want.empty() ? std::string("cpu") : want) + " " + role;
+            inproc.port = 0;
+            rag.push_back(std::move(inproc));
+            rag_inproc.push_back(model);
+        } else {
+            rag.push_back(rag_launch(o, model, role, free_port()));
+            rag_inproc.emplace_back();
+        }
+    };
+    if (!o.embed.empty()) rag_add(o.embed, "embedding");
+    if (!o.rerank.empty()) rag_add(o.rerank, "reranking");
+    std::vector<std::unique_ptr<onebit::embed_serve::Backend>> rag_embed(rag.size());
+    for (size_t i = 0; i < rag.size(); ++i) {
+        if (rag_inproc[i].empty()) continue;
+        auto be = std::make_unique<onebit::embed_serve::Backend>();
+        const std::string want = rag[i].device.substr(0, rag[i].device.find(' '));
+        std::string why;
+        if (!be->load(rag_inproc[i], want, why))
+            throw std::runtime_error(rag_inproc[i] + ": " + why);
+        std::fprintf(stderr, "1bit serve: %s on %s (%s), in-process: /v1/embeddings\n", be->id().c_str(),
+                     be->device().c_str(), rag_inproc[i].c_str());
+        rag_embed[i] = std::move(be);
+    }
     auto stem = [](const std::string& m) { return fs::path(m).stem().string(); };
 
     const std::string id = model_id(o);
@@ -2356,7 +2389,9 @@ int serve_child(const Options& given) {
     srv.Get("/v1/health", health);
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         json data = json::array({{{"id", id}, {"object", "model"}, {"owned_by", "1bit"}, {"device", device}}});
-        if (!o.embed.empty()) data.push_back({{"id", stem(o.embed)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", rag_device()}, {"role", "embedding"}});
+        if (!o.embed.empty()) data.push_back({{"id", stem(o.embed)}, {"object", "model"}, {"owned_by", "1bit"},
+                                              {"device", rag.empty() ? rag_device() : rag[0].device.substr(0, rag[0].device.find(' '))},
+                                              {"role", "embedding"}});
         if (!o.rerank.empty()) data.push_back({{"id", stem(o.rerank)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", rag_device()}, {"role", "rerank"}});
         res.set_content(json{{"object", "list"}, {"data", data}}.dump(), "application/json");
     });
@@ -2591,6 +2626,12 @@ int serve_child(const Options& given) {
                 r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
                 return;
             }
+            if (i < rag_embed.size() && rag_embed[i]) {   // a 1-bit embedding container: no llama-server
+                int status = 500;
+                r.set_content(rag_embed[i]->embeddings(q.body, status), "application/json");
+                r.status = status;
+                return;
+            }
             forward(rag[i].port, nullptr, -1, stem(model), true, "", false, q, r);
         };
     };
@@ -2643,6 +2684,7 @@ int serve_child(const Options& given) {
         children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line, b.env_override));
     }
     for (const auto& b : rag) {
+        if (b.port == 0) continue;   // in-process: the encoder is this process (app/embed_serve.h)
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
         children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
     }
@@ -3277,6 +3319,21 @@ int run_serve(int argc, char** argv) {
         if (o.device == "npu") return serve_only("--device npu runs in serve's own process");
     }
 
+    if (embed_serve::container(o.model)) {
+        // `--embedding -m <container> [--device npu|cpu]`: a 1-bit encoder container is served in-process by the
+        // engine's own encoder, so it must be dispatched BEFORE the NPU-directory rules below (those are about
+        // q4nx/forward-serve directories, which do not run on the host). app/embed_serve.h.
+        if (!o.role.empty() && o.role != "embedding")
+            throw std::runtime_error(o.model + " is a 1-bit embedding container: it serves as --embedding, not as --" +
+                                     o.role);
+        const std::string want = o.device == "auto" ? "" : o.device;
+#ifdef ONEBIT_NPU
+        const std::string dev = want.empty() ? "npu" : want;
+#else
+        const std::string dev = want.empty() ? "cpu" : want;
+#endif
+        return embed_serve::serve_only(o.model, o.host, o.port, dev, o.alias);
+    }
     if (fs::is_directory(o.model)) {
         if (!o.mmproj.empty()) throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
         if (o.device != "auto" && o.device != "npu")

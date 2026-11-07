@@ -1,0 +1,29 @@
+{
+  "id": "27b-decode-cot-20261107",
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX ternary sidecars, sealed single-ELF decode",
+  "metric": {
+    "name": "decode, chain-of-thought answers (per token, prefill included)",
+    "value": 0.3857,
+    "unit": "s/token"
+  },
+  "settings": {
+    "device": "accel0",
+    "engine": "1bit t2s2-20261104 (serve-bin)",
+    "model_dir": "~/models/npu/bonsai2-27b-t2s2-serve",
+    "container": "Qwen3.8-27B-NPU2 (qwen3_5, 64 layers, H=5120, ternary sidecars, sealed single-ELF decode set)",
+    "tickets": "npu-hold -t 25, labels 587-gsm8k-{pilot,0-7,8,16,24,32}, port 18099",
+    "sampling": "temperature 0, top_k 1, seed 1234, stream=false, max_tokens 512",
+    "prompt": "Solve this grade-school maths problem. Reason step by step, then write your final answer on the last line as\\n#### <number>\\n\\nProblem: {q}",
+    "n": 40,
+    "answer_lengths": "106 to 512 completion tokens (mean 331)",
+    "per_question_ratio": "mean 0.3909, median 0.3458, aggregate (total wall / total tokens) 0.3857"
+  },
+  "instrument": "the same 40 requests as 27b-gsm8k-20261107: per-request wall clock / usage.completion_tokens, summed over the run (13,226 tokens in 5,101.4 s)",
+  "repeats": 1,
+  "timestamp": "2026-11-07T13:49:36Z",
+  "source": "~/evidence/tmoe-npu/587-gsm8k-20261107/transcript-40.json",
+  "notes": "Context sensitivity, measured rather than assumed: the same route is 0.2902 s/token on a 13-token prompt (27b-t2s2-decode-20261106) and 0.3857 s/token over 106-512-token answers, i.e. ~1.33x - so quoting the short-prompt figure as an end-to-end rate would be wrong by a third. This figure also carries each request's prefill (~60-100 prompt tokens at 19.55 tok/s, a few seconds of the ~127 s per question), which is why it is labelled end-to-end per token rather than a kernel-stream rate."
+}

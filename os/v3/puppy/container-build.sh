@@ -311,6 +311,8 @@ if [ -n "${PAYLOAD:-}" ]; then
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-webapp-proxy "$skeleton/usr/local/bin/1bit-webapp-proxy"
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-desktop "$skeleton/usr/local/bin/1bit-desktop"
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-logs "$skeleton/usr/local/bin/1bit-logs"
+    # engine#712: the installed machine's OS-level update (the other slot plus one GRUB default flip)
+    install -D -m 755 /recipe/embed/usr/local/bin/1bit-update "$skeleton/usr/local/bin/1bit-update"
     install -D -m 755 /recipe/embed/etc/init.d/06onboard-logs "$skeleton/etc/init.d/06onboard-logs"
     install -D -m 755 /recipe/embed/etc/init.d/08onboard-presets "$skeleton/etc/init.d/08onboard-presets"
     install -D -m 755 /recipe/embed/root/Startup/1bit-lemonade-webapp \
@@ -639,7 +641,7 @@ if [ -n "${PAYLOAD:-}" ]; then
              etc/init.d/20onboard-ssh etc/init.d/21serial-console etc/init.d/zz-onboard-ports \
              opt/1bit-llama opt/1bit-package/1bit/hrx/llama/bin/llama-server \
              usr/local/bin/lemonade usr/local/bin/1bit-release-check usr/local/bin/1bit-install \
-             usr/local/bin/1bit-selftest \
+             usr/local/bin/1bit-selftest usr/local/bin/1bit-update \
              usr/local/bin/1bit-tty1 usr/local/bin/1bit-console usr/local/bin/1bit-console-install \
              usr/local/bin/1bit-console-menu \
              usr/sbin/1bit-board etc/init.d/26onboard-board \
@@ -659,7 +661,7 @@ if [ -n "${PAYLOAD:-}" ]; then
         in_image opt/rocm-therock/lib/librocm_sysdeps_elf.so.1 || miss="$miss the HRX libhsa sysdeps"; \
         in_image opt/1bit/libhsa || miss="$miss /opt/1bit/libhsa"; }
     [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss" >&2; exit 1; }
-    echo "   ok: engine, launcher, service, /usr/local/bin/{1bit,lemonade}, 1bit-release-check, 1bit-install, 1bit-selftest"
+    echo "   ok: engine, launcher, service, /usr/local/bin/{1bit,lemonade}, 1bit-release-check, 1bit-install, 1bit-selftest, 1bit-update"
     echo "      onebit-models: $(grep -c ^hrx "$skeleton/etc/1bit/onebit-models.txt") HRX + $(grep -c ^npu "$skeleton/etc/1bit/onebit-models.txt") NPU entries from the payload catalogue"
 fi
 echo "== output"

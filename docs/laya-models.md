@@ -95,7 +95,12 @@ scorer (`ONEBIT_LAYA_DEVICE=npu` with the NPU add-on puts its encoder on the NPU
 `GET /v1/route/decisions?since=ID&limit=N` returns the last decisions (up to 512 kept) after `since`,
 oldest first: the fields above plus the reply's `prompt_tokens`, `completion_tokens`, `prompt_tok_s` and
 `decode_tok_s` from its `usage` and `timings` (llama-server and the NPU routes both send them; a streamed
-reply has none of them, and no status). `GET /v1/route/table` returns the table's question and each class's
+reply has none of them, and no status). A **classified** decision also carries `state` — the text Laya was
+asked about, i.e. the last user message — and `state_len`, its full length in bytes. `state` is bounded to
+4 KiB: `state_len > len(state)` means what is in the log is a prefix, so a long prompt cannot grow the log
+without bound and a reader cannot mistake a truncated state for the whole one. A `pinned` request has no
+`state` at all: it was never a decision, and `state_len` is `-1` rather than `0` so that "classified an empty
+state" and "not classified" cannot be read as the same thing. `GET /v1/route/table` returns the table's question and each class's
 model and device. `GET /v1/models` lists `auto` and every alias. `GET /metrics` adds, by class, model and
 device: `onebit_route_decisions_total`, `onebit_route_router_ms_sum` / `_count` (Laya decisions only),
 `onebit_route_request_ms_sum` / `_count`, `onebit_route_completion_tokens_total`,
@@ -121,8 +126,24 @@ numbers a demo HUD reads; every one was measured by serve or reported by the bac
 ```
 
 A case is one JSON line, `{"state": TEXT, "label": CLASS, "src": optional id}`, where `state` is exactly what
-serve classified (the last user message). A line without a `label` is skipped by `--eval`, so a decision log
-whose newest lines have no outcome yet can be passed as it is.
+serve classified (the last user message). A line without a `label` is skipped by `--eval`.
+
+**From a decision log to cases.** `/v1/route/decisions` carries the `state` for every classified request, so a
+demo's log is data. It does *not* carry the true label — the engine knows what it asked, only the game knows
+whether the step worked — so the join is explicit:
+
+```sh
+curl -s 'localhost:8000/v1/route/decisions?limit=512' | jq '.data' > decisions.json
+# keep the states and the router's own answer (self-agreement, NOT accuracy -- `--eval` skips these)
+jq -c '.[] | select(.state) | {state, label: .laya_class, src: .id}' decisions.json > self.jsonl
+# or attach the outcome: labels.json is {"<id>": "reflex"|"plan", ...} written by the demo
+jq -c --slurpfile L labels.json '.[] | select(.state) | select($L[0][(.id|tostring)])
+       | {state, label: $L[0][(.id|tostring)], src: .id}' decisions.json > cases.jsonl
+```
+
+A line whose decision was cached still carries the state it was cached under, so replaying a log measures the
+same decisions serve made. A decision whose `state_len` exceeds `len(state)` must be dropped or re-sent with a
+shorter prompt: `--eval` would otherwise classify a prefix the demo never sent.
 
 `--eval` prints accuracy, per-class support, recall and precision, the confusion matrix (rows true, columns
 chosen), serve's mean confidence, the mean top probability, ECE (10 equal bins over the top probability), log

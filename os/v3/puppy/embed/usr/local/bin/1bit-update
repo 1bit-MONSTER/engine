@@ -95,13 +95,16 @@ done
 [ -n "$esp" ] || die "no 1BIT-OS partition on $bootdisk: this machine did not boot from an installed disk"
 save_slot=
 savename=
-for d in "$DATA"/1bit "$DATA"/"$ALT"; do
+# engine#1376: the ACTIVE slot's layer is the one this machine is running, so it is found first and wins. Scanning both slots
+# and letting the last real directory win meant a foreign layer in the other slot could be adopted as "this machine's layer".
+for d in "$DATA/$active" "$DATA/1bit" "$DATA/$ALT"; do
     [ -d "$d" ] || continue
     for s in "$d"/*save*; do
         [ -e "$s" ] || continue
         # -L: a symlink to the layer counts, but only a REAL directory is where the layer lives
-        if [ -d "$s" ] && [ ! -L "$s" ]; then save_slot=$(basename "$d"); savename=$(basename "$s"); fi
+        if [ -d "$s" ] && [ ! -L "$s" ]; then save_slot=$(basename "$d"); savename=$(basename "$s"); break; fi
     done
+    [ -n "$savename" ] && break
 done
 
 # ── GRUB: read the config, find a slot's entries, write the default ──────────────────────────────────────────
@@ -235,7 +238,11 @@ freek=$(df -Pk "$DATA" | awk 'NR == 2 { print $4 }')
 for s in "$DATA/$target"/*save*; do
     [ -e "$s" ] || continue
     if [ -d "$s" ] && [ ! -L "$s" ]; then
-        die "/$target already holds a save layer ($(basename "$s")): two layers cannot be merged by an update - pick the slot by hand if that is really what you want"
+        if [ -n "$savename" ] && [ "$s" -ef "$DATA/$save_slot/$savename" ]; then
+            say "   $(basename "$s") in /$target is this machine's own layer (same file as /$save_slot/$savename): kept"
+            continue
+        fi
+        die "/$target already holds a save layer ($(basename "$s")) that is not this machine's ($save_slot/$savename): two layers cannot be merged by an update - pick the slot by hand if that is really what you want"
     fi
     rm -f "$s"
 done
@@ -246,7 +253,18 @@ for f in $need; do
     cp -f "$src/$f" "$DATA/$target/$f" >> "$LOG" 2>&1 || fail "copying $f into /$target failed"
 done
 [ -s "$src/SHA256SUMS" ] && cp -f "$src/SHA256SUMS" "$DATA/$target/SHA256SUMS" 2> /dev/null
-ln -sfn "../$save_slot/$savename" "$DATA/$target/$savename" || fail "cannot link the save layer into /$target"
+if [ -z "$savename" ]; then
+    # engine#1376: a machine with no save layer at all (a fresh installed root, or a --check tree) has nothing to link, and
+    # the old line would have run `ln -sfn "../$save_slot/$savename"` with both empty - i.e. linked the target slot to its own
+    # parent. Found by this selftest's no-layer case.
+    say "   no save layer on this machine: nothing to link into /$target"
+elif [ "$DATA/$target/$savename" -ef "$DATA/$save_slot/$savename" ] 2> /dev/null; then
+    # already this machine's layer where it belongs (target is the slot the layer really lives in): nothing to link, and
+    # linking here would point the layer at itself
+    say "   save layer stays where it is (/$save_slot/$savename); /$target needs no link"
+else
+    ln -sfn "../$save_slot/$savename" "$DATA/$target/$savename" || fail "cannot link the save layer into /$target"
+fi
 for f in $need; do
     cmp -s "$src/$f" "$DATA/$target/$f" || fail "/$target/$f does not match the source after copying"
 done

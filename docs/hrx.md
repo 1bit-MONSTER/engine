@@ -492,6 +492,33 @@ Two things this replaces in the 10-27 table above: the pre-loom `hrx_prefill_mmi
 row (27.1 % / 25.1 %) is now one kernel family at 39.6 %, and attention has grown to 11.2 % at this
 context where the 10-27 pp512 bundle had it at 3.6 %.
 
+#### `GGML_HRX_IQ3S_TABLE_DECODE` and the IQ3_XXS expert blocks ([engine#572](https://github.com/1bit-MONSTER/engine/issues/572))
+
+Flash-Next's 48 MoE blocks are a mix of quant formats — for the UD-IQ4_XS build, `ffn_gate_exps`/`ffn_up_exps` are
+IQ3_XXS on 28 blocks and IQ4_XS on 17 — and on identical geometry the IQ3_XXS blocks cost about **2.4x** what the
+IQ4_XS blocks cost (79.94 ms vs 33.34 ms per dispatch at a 10x639 grid, from the dispatch profiler). The IQ3_XXS grid
+decode was the reason: it selected a 12-bit grid code out of 256 inline constants, once per 4-value packet.
+
+`GGML_HRX_IQ3S_TABLE_DECODE=1` selects a second router-expert kernel that reads that grid from a small per-workgroup
+table instead. It is **off by default**; unset or `0` is the shipping path. Measured with it on, in one hold against a
+control arm on the same binary:
+
+| cell | control | `=1` | |
+|---|---:|---:|---|
+| pp4096 (product path) | 270.62 tok/s | **318.52** | 1.18x |
+| pp4096, second window | 140.84 | **182.10** | 1.29x |
+| pp512 | 177.62 | **221.38** | 1.25x |
+| PPL 8x512 | 1.7198 | **1.7198** | identical |
+
+The PPL row is the point: the value is unchanged to four decimals, measured in three separate windows, so the faster
+decode is the same arithmetic. The absolute tok/s above are one box's state on one day — the same arm has read 182-318
+tok/s across windows for identical flags, which is why only the paired ratios are quoted.
+
+It stays opt-in because the two windows above ran on a fork commit that predates the SET_ROWS fix (#227), and a
+3,858-token prompt on that commit intermittently died in the CPU fallback (engine #1251). Before this becomes a default
+it needs the long-prompt cell plus `test-backend-ops -o MUL_MAT -b HRX0` on the current pin, neither of which this lane
+has run.
+
 Still open on #572, stated so nobody reads this as closed: the 1,679 tok/s gap is not explained; the
 ubatch lever was measured up to 2048 and 4096 was tried and does not fit this 87 GiB file; no MTP
 head exists in this tree for the decode side; and nothing here is a claim about released-flag

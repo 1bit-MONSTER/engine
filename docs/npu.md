@@ -206,8 +206,29 @@ ternary decode is *exactly* the reference's `codes * scale` (worst |Δw| 0, not 
 vectors against the model's own `trit_embed.py` on 1,000 fixed sentences have **min cosine 0.9997** (mean
 0.99999); on STS-B the C++ forward scores within 0.3 of the model card's 82.87.
 
-The NPU runs the same math with its int8 GEMM in place of the per-row dot product; that path is engine#1311's
-second step and not part of this container's description.
+**Serving it.** A container is served **in-process**, not through a llama-server (there is none for it):
+
+```
+1bit serve --embedding -m <container> --device npu|cpu          # the model itself is the embedding model
+1bit serve --embed <container> --device npu|cpu -m <gguf>       # beside a chat model, in the RAG slot
+```
+
+`/v1/embeddings` (and `/embeddings`) take OpenAI's body: `input` as a string **or an array of strings**, one reply
+entry per input with its `index`, `usage.prompt_tokens` from the model's own tokenizer, and L2-normalised
+`embedding` vectors. An array of token-id arrays is refused **by name** (it would need the caller's ids to be this
+vocabulary's ids), as is an empty array and an out-of-vocabulary one. `--device auto` means npu in an NPU build and
+cpu otherwise; any other device is refused with the reason. `/health` and `/v1/models` answer in the shapes the
+rest of serve uses, so Lemonade's watchdog and model list work unchanged.
+
+Measured on this box through that route, 1,000 fixed sentences (the gate's own set) with the container above:
+
+| route | min cosine vs the reference | sentences/s |
+|---|---|---|
+| `--device npu` | **0.9997062** (0 below 0.999) | **35.1** |
+| `--device cpu` | 0.9997062 | 3.5 |
+
+and STS-B through the same route: **Spearman ×100 82.9412** (the model card's 82.87, its own runtime 82.75 on the
+same evaluator).
 
 ### Q4NX chunks
 

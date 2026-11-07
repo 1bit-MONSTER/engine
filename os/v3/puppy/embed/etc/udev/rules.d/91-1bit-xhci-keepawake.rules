@@ -37,9 +37,11 @@
 # let the device enter the state the board cannot leave. The NPU rule is the precedent, including the `TEST` guard
 # (inert on a kernel whose device has no `power/control`) and the narrow match so no other device is touched.
 #
-# Matched by BOARD, not by PCI id alone: the four Strix Halo xHCI functions (1022:1587/1588/1589/158b) exist on
-# every Strix Halo machine, and on a machine whose firmware does wire port wake there is no reason to spend their
-# idle power. The DMI match keeps this board-specific, which is what the measurement covers.
+# Matched by BOARD, not by PCI id alone: the four Strix Halo xHCI functions exist on every Strix Halo machine, and on a
+# machine whose firmware does wire port wake there is no reason to spend their idle power. The DMI match keeps this
+# board-specific, which is what the measurement covers. The four, with the function numbers the PORTSC table above uses:
+# 1022:1587 = c5:00.4, 1022:1588 = c7:00.0 (the awake one), 1022:1589 = c7:00.3, 1022:158b = c7:00.4. The two USB4 Host
+# Routers (1022:158d = c7:00.5, 1022:158e = c7:00.6) are deliberately NOT in the alternation.
 #
 # `ACTION=="add|bind"`: on a normal boot xhci_hcd binds after udev is up; a module loaded before udev (initrd,
 # coldplug) emits only `add`. If neither fires, `power/control` stays `auto` and the ports stay dark - the failure

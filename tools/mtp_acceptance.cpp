@@ -486,7 +486,10 @@ int main(int argc, char** argv) {
             // How a verify batch's cost scales with its row count.  The loop's own accounting calls an iteration "two
             // passes" (one step + one M=nd batch), which is only true if a batch costs a step.  The kernels are sealed at
             // M=16, so either a 5-row batch is free (pad rows are idle) or it is linear in rows (the GDN/conv work is per
-            // row) -- and that decides whether the draft route's cost is the base (batch it harder, #805's leaf fill) or
+            // row) -- and that decides whether the draft route's cost is the base or the head.  (P6's "leaf fill", which
+            // proposed spending spare rows on 2nd/3rd candidates, cannot help here: acceptance is the base's argmax at
+            // that position, so a non-argmax candidate is refused with certainty and a deeper right candidate is never
+            // scored under a refused parent -- tested in tests/mtp_draft_test.cpp [16].)
             // the head.  Measured here, on the same stream, at nd = 1, 2, k+1 and max_batch_rows.
             {
                 const int widths[] = {1, 2, std::min(k + 1, base.max_batch_rows()), base.max_batch_rows()};

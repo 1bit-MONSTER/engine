@@ -31,8 +31,8 @@ their status is at the top.
 | # | target | state |
 |---|---|---|
 | 1 | hybrid KV handoff without the file | **shipped**, opt-in: `ONEBIT_KV_SHARE=1` ([docs/hybrid.md](hybrid.md), "The shared route"). 0 bytes copied; the cost is cell metadata, **0.12 ms at 307 cells to 5.56 ms at 16 399** |
-| 2 | NPU runtime: activations live in BOs | **not done**. Measured price is ~4 % of a token on the 27B NPU path, and the two things that decide it are the M=128 pad and the XDNA cache model — both NPU-runtime work, not a transport fix |
-| 3 | ONNX EP IO binding onto BO memory | **not done**. Priced, not measured per-call here; ORT IO binding exists and is unused |
+| 2 | NPU runtime: activations live in BOs | **closed**. A is quantised on an AVX2 path straight into the mapped BO, the pad memset is gone, and both cache sweeps are narrowed to the rows the host touches: C invalidate **1 065.09 → 66.57 MB/token**, A writeback **1 908.62 → 321.59 MB/run** (engine#908, #873, #988, #1004). Both syncs are **required** — the kill switches emit garbage |
+| 3 | ONNX EP IO binding onto BO memory | **closed for this tree**: the node boundary moves **0 bytes** (1 983 trace lines, never a `copy bytes=` line), and the inputs are the graph's own host tensors, which on XDNA2 *are* BO-backed. The largest pure copy left is the cached graph's own `Concat` — 458 KB/position, 41-58 us/position — an op/kernel problem, measured and handed to the ONNX lane |
 | 4 | this audit | **this page** |
 
 ## Target 1 — the hybrid handoff moves no bytes
@@ -76,27 +76,33 @@ engine#753, which is parked until that writer exists.
 
 ## Target 2 — the NPU runtime's copies, measured
 
-Per launch on the shipped int8 path the runtime memsets and quantises one row into the activation BO, flushes
-it, waits, invalidates the result BO and dequantises row 0 back to host floats. On the 27B (Qwen3.5 hybrid,
-64 layers, 48 of them GDN, H=5120, intermediate 17 408, vocab 248 320, M=128 int8 kernels) that is:
+Per launch the runtime quantises one row into the activation BO, flushes it, waits, invalidates the result BO
+and dequantises row 0 back to host floats. What that cost *before* this target was worked is what the
+2026-10-31 measurements below were taken on — they are the starting point, not the current state:
 
-| | measured | inside |
+| | then (1 330 ms/token build) | now |
 |---|---|---|
-| A stage: 128-row zero pad + scalar quantise of one row | **50 ms/token** | `[ph]` "A quantise+launch", 1.33 s/token build |
-| C invalidate + dequantise | **9 ms/token** (≈0.1 ms per launch, 368 launches) | `[ph]` "C readback" |
-| same two rows on the live 400 ms int8 token | quant+launch **15-20 ms**, readback **~1.5 ms** | `[prof]` |
+| A stage: 128-row zero pad + quantise of one row | 50 ms/token | quantise writes straight into the mapped BO on an AVX2 path (#908), and the pad rows are only re-zeroed when a previous launch wrote them (#873) |
+| A writeback per launch | whole BO: 1 908.62 MB/run | rows the host touched: **321.59 MB/run** (#1004) |
+| C invalidate per launch | whole BO: 1 065.09 MB/token | rows the host reads: **66.57 MB/token** (#988), 11.0-11.3 → **2.0-4.0 ms/token** on the same instrument |
+| host-side share of a token | ~1.5 % | a few percent at most, and what is left is the launch count, not bytes |
 
-So the host-side copies are **~1.5 %** of a 1.33 s token and a few percent of the live one. That is the honest
-ceiling for this target as it is written: the money is in the 128-row pad (the shipping container registers
-**0** kernel roles at M=16, so the pad is 8x larger than the work) and in the launch count, not in the memcpy.
+Each of those was gated byte-identical at token, logprob and head level, on two containers and two rounds, and
+the narrowed ranges were re-proven on a later driver (6/6 arms). So this target is **closed**, and the honest
+residue is not a copy: when the pad tile was measured (2026-10-31) the pack registered **0** kernel roles at
+M=16, so a decode launch padded one row to M=128 — 8x the work. The M=16 twins exist now (7 ELFs in the 27B
+pack, 18 in the pack the fleet's serve runs, which is launched with `--kernels …/kernels-m16`), so what is left
+there is which tile a decode step *selects*, which is the NPU runtime's business and not a memory fix.
 
-Two facts from measuring the readback that decide how a zero-copy version must be built:
+Two facts from measuring the readback, which are why the sweeps were narrowed rather than deleted:
 
 - `bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE)` is a real cache sweep (`_mm_mfence; clflush` per 64 B, then
   `_mm_mfence` — disassembled from the shipping runtime), not a copy. It is already paid on every launch.
 - A dirty host cache line over the result BO **clobbers the NPU's output**: poisoning the row before the
   launch and not writing it back leaves the sentinel to be evicted over real results, which reads exactly like
-  the dropped-write fault in engine#666. Any "skip the flush" arm has to respect that ordering.
+  the dropped-write fault in engine#666. That ordering is also why both sweeps are still there: the arms that
+skip them (`NPU_NO_A_FLUSH=1`, `NPU_NO_C_INVAL=1`) **emit garbage**, so the answer to "when does the cache model
+need a sync" is "on every launch, over the rows the host touches" — measured, not assumed.
 
 Nothing here needs the file: this is all in-BO traffic.
 
@@ -104,10 +110,14 @@ Nothing here needs the file: this is all in-BO traffic.
 
 The EP reads and writes `OrtKernelContext` in place inside its own host nodes, and copies at the node boundary
 (`DT_CopyTensors`, `onnx/ep/onebit_ep.cpp:206`): per fused QDQ GEMM node, an `M x K` f32 input and an `M x N`
-f32 output — 20 KB + 0.6 MB per node for a 0.6B decode step at M=1. ORT's IO binding would let inputs and
-outputs live in BO-backed `OrtValue`s and remove the boundary copies entirely; it exists in the ORT version
-this tree builds against and nothing calls it. Not measured per-call on this box: the numbers above are the
-bytes, and the per-call cost is what target 3 owes.
+f32 output — 20 KB + 0.6 MB per node for a 0.6B decode step at M=1. That was the target: bind inputs and
+outputs to BO-backed `OrtValue`s and remove the boundary copies. **It was measured and the boundary is already
+empty**: a profile of the fused path never prints a `copy bytes=` line at all (1 983 trace lines), because the
+group is handed the graph's own host tensors and XDNA2 BOs *are* host memory — binding would be the same bytes
+to the same place. What a copy could still buy is the readback leg, **0.044 ms of a 4.32 ms call (0.9 %)**.
+The largest pure copy left on this route is the cached graph's own `Concat` (458 KB/position, 41-58 us/position
+at 4 threads, ~2.1x linear at 4 096 positions) — that is how `present` is produced, so it needs an op/kernel to
+write the cache in place, not a binding change. Both numbers come from the ONNX lane's measurements.
 
 ## The audit: every copy still on the serving paths
 
@@ -116,22 +126,23 @@ read and written per decoded token; a row marked *no memcpy* is arithmetic over 
 
 | # | copy | where | bytes/token | ms/token | why it stays |
 |---|---|---|---|---|---|
-| 1 | A stage: `memset` the 128-row pad + int8-quantise one row, straight into the mapped BO | `npu/forward/engine-src/npu_engine_i8ctx_inc.h` `quantize_async` | 347 MB memset + 10.6 MB write, no memcpy | **50** | the pad, not the copy: an M=16 twin exists in the code but the shipping container has no M=16 roles. NPU-runtime work (target 2) |
-| 2 | A flush: `sync(TO_DEVICE)` per launch | same file | 347 MB range swept | inside the 50 | cache writeback, not a copy; required while the CPU writes A and the array reads it in the same launch. Removing it needs the "who wrote it" analysis in target 2 |
-| 3 | C invalidate: `sync(FROM_DEVICE)` per launch | `readback()` | 2.07 GB range swept | **9** (0.1 ms/launch) | cache sweep, not a copy; already paid. Cheap per byte, so not where the money is |
-| 4 | C dequantise: int32 row 0 of C to a host float vector | `dequant_only` | 16.2 MB read + 16.2 MB written | inside the 9 | the next launch's A could be filled from C row 0 without a float round trip — that is target 2's "consumed in place" |
+| 1 | A stage: quantise one row into the mapped BO (was: `memset` the 128-row pad first) | `npu/forward/engine-src/npu_engine_i8ctx_inc.h` (`quantize_async` -> `prepare_activation`) | one KD row written; the pad memset is gone (#873), and the quantiser is an AVX2 path writing straight into the mapping (#908) | 50 on the pre-#908 build; not re-quoted | the pad, not the copy: at measurement time the pack had **0** kernel roles at M=16 (M=16 twins ship now), so this row is about which tile a decode step selects, not about a memcpy |
+| 2 | A writeback: `sync(TO_DEVICE)` per launch | `sync_a_to_device()` | whole BO, 1 908.62 MB/run -> **321.59 MB/run**: the rows the host touched (#1004) | inside row 1 | cache sweep, not a copy, and **required** — `NPU_NO_A_FLUSH=1` emits garbage |
+| 3 | C invalidate: `sync(FROM_DEVICE)` per launch | `readback()` | whole BO, 1 065.09 MB/token -> **66.57 MB/token**: the rows the host reads (#988) | 11.0-11.3 -> **2.0-4.0** per token | cache sweep, not a copy, and **required** — `NPU_NO_C_INVAL=1` emits garbage |
+| 4 | C dequantise: int32 rows of C to a host float vector | `dequant_only` | `am x an` elements per launch (one row on decode), not the whole BO | inside row 3 | the host reads those rows once anyway; folding the next launch's quantise into it is kernel work, not a copy fix |
 | 5 | LM head: 15 packed tiles, 15 launches, an invalidate per tile | `run_lm_head` | 1.0 MB of logits to host | **180** (`[ph]` "head") | the per-token 356 MB f32 tile memcpy is already gone on the shipped path; what is left is the device streaming the int8 head, not a copy |
 | 6 | GDN recurrent state swept on the host, in place, per layer | `gdn_layer`, `rec_state_[l]` | **604 MB** read+written (48 layers x 3.14 MB x ~4 passes) | part of `[ph]` "host-inside-layers" **190** | the largest copy-shaped cost on this path and no zero-copy fixes it: a recurrence has to run somewhere. Removing it moves the recurrence into an NPU kernel — kernel work, private tree |
 | 7 | QKV rope per-head row staging | `attention()`, `step()` | ~0.4 MB | ~0.3 | per-head rope needs contiguous rows; the copies are L1-sized |
 | 8 | hybrid KV handoff, file route | `app/serve_hybrid.h`, `llama_state_seq_save_file` + `?action=restore` | 65 536 B/token + 151 MB once (27B) or 98 304 B/token (30B) | **28.8 / 61.8 / 198.5** at 307/4k/16k (27B) | replaced by target 1 wherever both sides can share; kept as the fallback for a decoder that cannot |
 | 9 | KV cell adopt after the handoff | the pinned fork's `src/llama-kv-share.cpp` (`llama_kv_cells_copy`) | **0** | **0** | already zero copy: metadata only |
-| 10 | ONNX EP node boundary | `onnx/ep/onebit_ep.cpp` (`DT_CopyTensors`, `:206`) | `M x K` in + `M x N` out per node | not measured here | target 3 |
+| 10 | ONNX EP node boundary | `onnx/ep/onebit_ep.cpp` (`DT_CopyTensors`, `:206`) | **0** on the fused path: it is handed the graph's own host tensors, and a 1 983-line profile never prints a `copy bytes=` line | **0.044**/call, the readback leg only | measured, and target 3 is closed: the copies it named are not there. The copy that remains is the graph's own `Concat` when it writes `present` — an op/kernel problem |
 
 Two conclusions the table forces, written down so they are decisions rather than leftovers:
 
-- **Rows 1 and 3 total ~59 ms of a 1 330 ms token** on the measured build (rows 2 and 4 are inside them, so
-they do not add): zero-copy on the NPU runtime is worth a few percent there, not the 20 % it sounds like. The lever that pays is the number of
-  launches and the M=128 pad, and both are NPU-runtime work.
+- **Rows 1 and 3 were ~59 ms of a 1 330 ms token** on the pre-optimisation build (rows 2 and 4 are inside them,
+  so they do not add). That is why target 2 paid off as range narrowing rather than as an architecture change:
+  #988 and #1004 took ~90 % of the traffic out of rows 2 and 3, which is why those rows read as bytes-per-run
+  above now. What is left that pays is the launch count and the M=128 pad — kernel-set work, not a copy fix.
 - **Row 6 is the biggest single cost and no memory recipe removes it.** A GDN recurrence is host arithmetic
   over 604 MB per token; only moving the recurrence into a kernel changes the number.
 

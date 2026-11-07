@@ -145,6 +145,14 @@ int main() {
     expect(onebit::npu_lock_mode_for(2) == onebit::NpuLockMode::Shared, "streams=2 is shared");
     expect(onebit::npu_lock_mode_for(onebit::kNpuMaxStreams) == onebit::NpuLockMode::Shared, "16 is shared");
 
+    // Whether the lock is taken at all (engine#1353): a run that never opens the device takes none,
+    // because the lock is exclusive for the process's life and a host-GEMM serve that held it would
+    // block every lane that does use the array (measured: 4 h 52 m, two other lanes' work waiting).
+    expect(onebit::npu_lock_taken(true, false), "a run that opens the device takes the lock");
+    expect(!onebit::npu_lock_taken(false, false), "a run that never opens the device (host GEMM) takes none");
+    expect(!onebit::npu_lock_taken(true, true), "NPU_NO_DEVICE_LOCK=1 still skips it for a run that does open the device");
+    expect(!onebit::npu_lock_taken(false, true), "and for one that does not");
+
     // Exclusive: one holder at a time, and it keeps the shared streams out.
     int ex = onebit::take_npu_device_lock(1, lk, false);
     expect(ex >= 0, "exclusive on a free device");

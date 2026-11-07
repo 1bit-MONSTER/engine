@@ -47,8 +47,11 @@ namespace onebit::embed {
 
 class NpuGemm {
 public:
-    // The hook for Model::set_gemm(). A device failure returns false with `why`; the caller keeps its host
-    // result, and `fell_back` says whether that happened (so a report cannot claim the array when it did not run).
+    // The hook for Model::set_gemm(). A device failure returns false and fills `why`, which makes the encoder
+    // return an empty vector with that reason -- there is no silent host fallback: a caller that wants the host
+    // dot must not install this hook (the probe's --host arm does exactly that). `status()` keeps the device's
+    // own words for the report, and `used_device()` is false once a launch has failed, so a row cannot claim
+    // the array when it did not run.
     Model::Gemm hook() {
         return [this](const Tern& t, const Quantised& q, std::vector<float>& x, int rows, std::string& why) {
             return run(t, q, x, rows, why);

@@ -766,7 +766,8 @@ add_dependencies(npu_sampling_test npu_queue_test)
 
 # 1-bit sentence embeddings (engine#1311): the container the importer writes and the encoder that reads it.
 # Device-free on a tiny fixture -- the real model's gate (min cosine 0.9997 vs the reference on 1,000
-# sentences) needs the 13.9 MB container and stays a measured row in the PR.
+# sentences) needs the 17.9 MB container the importer writes (the source safetensors is 13.9 MB) and stays
+# a measured row in the PR.
 add_executable(embed_model_test tests/embed_model_test.cpp app/embed_model.cpp)
 target_include_directories(embed_model_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
 target_link_libraries(embed_model_test PRIVATE nlohmann_json::nlohmann_json)

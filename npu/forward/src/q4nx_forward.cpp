@@ -232,9 +232,10 @@ static std::string read_json_string(const std::string& path, const char* key) {
     std::ifstream f(path);
     if (!f) return std::string();
     std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    const char* p = strstr(s.c_str(), key);
+    const std::string needle = std::string("\"") + key + "\"";   // the key, not a mention of it in a prompt string
+    const char* p = strstr(s.c_str(), needle.c_str());
     if (!p) return std::string();
-    const char* c = strchr(p + strlen(key), ':');
+    const char* c = strchr(p + needle.size(), ':');
     if (!c) return std::string();
     const char* b = strchr(c, '"');
     if (!b) return std::string();

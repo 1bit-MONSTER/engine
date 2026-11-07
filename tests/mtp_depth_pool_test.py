@@ -258,6 +258,29 @@ rc20, out20, _ = run([], [("mixed1.log", ticket_tau(0, 0.6)), ("mixed2.log", tic
 check("is stated by 1 of 2 ticket(s)" in out20,
       f"a partly-stated window says which tickets it read the gate from: {[l for l in out20.splitlines() if 'stated by' in l]}")
 
+# 13b. a depth with too few chains to carry the bar says so, and a depth with enough says nothing extra.  One chain
+# moves its rate by 100/n pp, so below 50 chains a single accepted draft is worth more than the whole 2 pp bar -- which is
+# exactly the tau=0.6 window's depths 2 and 3 (13 and 2 chains), where the table used to print bare FAILs that a reader
+# could take for a drafter regression.
+def ticket_n(p, n, hits, off_hits=None, off_n=None):
+    off_hits = hits if off_hits is None else off_hits
+    off_n = n if off_n is None else off_n
+    return (f"prompt {p}: TEXT IDENTICAL, 64 tokens, accepted 4/16, passes/token 0.500, stream 72 rows, 0 mismatch\n"
+            f"depth 1: live  80.00 % ({hits}/{n}, reached)  offline conditional  80.00 % ({off_hits}/{off_n})\n"
+            f"depth 1: live  80.00 % ({hits}/{n})  offline  80.00 % ({off_hits}/{off_n})  "
+            f"delta  +0.00 pp  PASS\n")
+
+
+rc21, out21, _ = run([], [("thin.log", ticket_n(0, 3, 3))])
+check(rc21 == 0 and "thin: 3 live chain(s), one chain = 33.3 pp" in out21,
+      f"a 3-chain depth is marked thin instead of passing silently: {[l for l in out21.splitlines() if 'thin:' in l]}")
+check("0 of 1 scored depths have a denominator a 2 pp bar can survive" in out21,
+      "the summary counts the thin depth out of the supported ones")
+rc22, out22, _ = run([], [("solid.log", ticket_n(0, 120, 90))])
+check(rc22 == 0 and "thin:" not in out22 and "can survive" not in out22,
+      "a 120-chain depth prints its verdict and nothing about thin denominators")
+check("PASS" in out22, "... and the verdict itself is unchanged")
+
 # 14. the run identity (vocab, batch width, hidden source) is part of the window: 2.1 vs 3.19 tokens/pass on the
 # hidden-source switch alone is more than the bar, so pooling across it would average two measurements.
 READY_NORM = "forward ready: vocab 248320, max_batch_rows 16, hidden source post-final-norm\n"

@@ -103,6 +103,14 @@ public:
     // The other documented shape: the base keeps its whole batch buffer and commit_verify() only truncates the
     // position bookkeeping.  Legal per BaseModel::last_hidden_rows(), and what a new target most naturally writes.
     void keep_batch_rows(bool on) { keep_batch_rows_ = on; }
+    // A ranked distribution instead of a one-hot one: the true token keeps argmax 1.0 and a runner-up gets 0.5, so a
+    // head can propose "the 2nd candidate at this position" and the base still has an exact argmax.  Off by default:
+    // a one-hot toy cannot tell a ranked alternative from garbage, and [16] needs that difference.
+    void rank_two(bool on) { runner_up_ = on; }
+    // Control for [16]: the same two-level ranking with the argmax on the OTHER token, so the very head that is refused
+    // everywhere above is accepted everywhere here.  Without it, "accepted 0" could be a broken harness instead of the
+    // measurement it claims to be.
+    void swap_top_two(bool on) { swap_top_ = on; }
 
     bool commit_verify(int accepted) override {
         if (accepted < 0 || accepted > pending_) return false;
@@ -138,8 +146,11 @@ private:
     // Writes into a caller-sized buffer (a batch is rows*V; resizing here would wipe the earlier rows).
     // The model consumes the token AT `pos` and then predicts the token at pos+1 -- the same convention as
     // the real forward (logits after a step are the next token's logits).
-    static void fill_logits(int pos, std::vector<float>& out, size_t off) {
-        out[off + (size_t)truth(pos + 1)] = 1.0f;
+    void fill_logits(int pos, std::vector<float>& out, size_t off) const {
+        const int top = swap_top_ ? (truth(pos + 1) + 1) % V : truth(pos + 1);
+        const int second = swap_top_ ? truth(pos + 1) : (truth(pos + 1) + 1) % V;
+        out[off + (size_t)top] = 1.0f;
+        if (runner_up_) out[off + (size_t)second] = 0.5f;   // rank 2, still under the argmax
     }
 
     int batch_rows_;
@@ -152,6 +163,8 @@ private:
 
     int bad_pos_ = 0, over_batch_ = 0;
     bool keep_batch_rows_ = false;
+    bool runner_up_ = false;
+    bool swap_top_ = false;
     bool recurrent_ = false;
     double st_ = 0.0;
     std::vector<double> prov_;
@@ -211,6 +224,38 @@ public:
         out.clear();
         for (int i = 0; i < k; i++) out.push_back(truth(have + i));
         if (conf && !conf->empty()) (*conf)[0] = 1.0f;
+        return (int)out.size();
+    }
+};
+
+// [16]'s heads.  `SecondBestThenRight` is right about every position EXCEPT the first one of each chain: it proposes a
+// non-argmax token at depth 1 and the true token at depths 2..k.  The true token it proposes deeper is unreachable in
+// this loop, and that is the point: acceptance at depth i is decided by row i-1, which only exists if depth i-1 was
+// accepted, so a correct candidate below a refused parent is never even scored.
+class SecondBestThenRight : public DraftHead {
+public:
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
+              std::vector<float>* conf = nullptr) override {
+        if (conf) conf->assign((size_t)k, 0.1f);
+        const int have = (int)hidden[0];
+        out.clear();
+        if (k > 0) out.push_back((truth(have) + 1) % V);                  // refused: not the base's argmax
+        for (int i = 1; i < k; i++) out.push_back(truth(have + i));       // right, and never reached
+        return (int)out.size();
+    }
+};
+
+// Proposes the base's RANK 2 token at every depth (the base runs with rank_two()).  Correct rank, correct position,
+// still refused with certainty -- acceptance is the argmax, not a ranking, so "fill spare rows with the 2nd/3rd
+// candidates" can only add rows that are certain to be rejected.
+class RunnerUpHead : public DraftHead {
+public:
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
+              std::vector<float>* conf = nullptr) override {
+        if (conf) conf->assign((size_t)k, 0.9f);
+        const int have = (int)hidden[0];
+        out.clear();
+        for (int i = 0; i < k; i++) out.push_back((truth(have + i) + 1) % V);
         return (int)out.size();
     }
 };
@@ -794,6 +839,75 @@ int main() {
         check(r.ok && sd.stream_mismatches() == 0, "prefix rows: no chain opened off the cursor");
         std::printf("INFO prefix rows: stream %d rows, committed %zu, accepted %d/%d\n", sd.cache_rows(), fed.size(),
                     r.stats.accepted, r.stats.drafted);
+    }
+
+    // [16] P6's last plan item, "spare verify rows filled with the drafts' 2nd/3rd candidates" (#805), and why this
+    // loop cannot bank it -- measured here rather than argued in a doc.  The acceptance rule is
+    // `argmax(logits_{i-1}) == draft_i` (npu/mtp/draft.h:317): a draft is accepted iff it IS the base's own argmax at
+    // that position, and the argmax that grades depth i comes from row i-1 of the same batch.  Two consequences, both
+    // checked below, and together they close the item:
+    //   1. a candidate at the same position that is not the argmax is refused with certainty, however many rows carry
+    //      it -- so "2nd/3rd candidates" at a depth can only add rows that are certain to be rejected;
+    //   2. the base's argmax at a depth is only known after its PARENT row has run, so an alternative at that depth
+    //      cannot even be placed in the same batch: it needs another batch, i.e. exactly the pass the loop already
+    //      pays to re-draft.  A correct candidate under a refused parent is never scored at all.
+    {
+        // (1) same-position alternative, at every depth, with the base ranking it #2.
+        ToyBase m(8);
+        m.rank_two(true);
+        RunnerUpHead ru;
+        Options o;
+        o.k = 4;
+        o.tau = 0.0f;                 // no gate: every depth is offered, so nothing hides behind tau
+        o.max_tokens = 24;
+        const std::vector<int> Q{truth(0), truth(1), truth(2), truth(3)};
+        const Result ref = onebit::npu::mtp::run_plain(m, Q, o);
+        ToyBase m2(8);
+        m2.rank_two(true);
+        RunnerUpHead ru2;
+        const Result r1 = onebit::npu::mtp::run(m2, &ru2, Q, o);
+        check(r1.ok, "leaf fill (1): the run completes against a ranked base");
+        check(r1.ok && same(r1.tokens, ref.tokens), "leaf fill (1): text identical to plain decode");
+        check(r1.ok && r1.stats.drafted > 0 && r1.stats.accepted == 0,
+              "leaf fill (1): the base's rank-2 candidate at the SAME position is refused every time");
+        // ... and the control that makes that zero mean something: move the argmax onto the runner-up and the SAME head
+        // is accepted everywhere.  So the refusal above is about the argmax, not about the head or the harness.
+        ToyBase m1c(8);
+        m1c.rank_two(true);
+        m1c.swap_top_two(true);
+        RunnerUpHead ruc;
+        const Result rc = onebit::npu::mtp::run(m1c, &ruc, Q, o);
+        check(rc.ok && rc.stats.drafted > 0 && rc.stats.accepted == rc.stats.drafted,
+              "leaf fill (1) control: with the argmax on the runner-up, the same head is accepted every time");
+        std::printf("INFO leaf fill (1) control: same head, argmax moved -- accepted %d/%d\n", rc.stats.accepted,
+                    rc.stats.drafted);
+        std::printf("INFO leaf fill (1): rank-2 candidate at every depth, accepted %d/%d\n", r1.stats.accepted,
+                    r1.stats.drafted);
+
+        // (2) a correct candidate below a refused parent.  Depth 1 is wrong, depths 2..k are exactly right: if spare
+        //     rows could bank a deeper right candidate, this head would show acceptance at depth 2 -- it shows none,
+        //     because depth 2 is never reached, and `reached_at[1]` says so in the loop's own accounting.
+        ToyBase m3(8);
+        SecondBestThenRight sbr;
+        const Result r2 = onebit::npu::mtp::run(m3, &sbr, Q, o);
+        check(r2.ok, "leaf fill (2): the run completes with a right-deeper wrong-first head");
+        check(r2.ok && same(r2.tokens, ref.tokens), "leaf fill (2): text identical to plain decode");
+        check(r2.ok && r2.stats.accepted == 0 && r2.stats.accepted_at[1] == 0 && r2.stats.reached_at[1] == 0,
+              "leaf fill (2): a correct depth-2 candidate is never scored while depth 1 is refused");
+        check(r2.ok && r2.stats.first_reject == r2.stats.iterations,
+              "leaf fill (2): every chain is refused at its first draft, which is the shape under test");
+        // ... and spending more rows cannot change it: k=8 accepts exactly what k=4 does, because the batch width was
+        // never the constraint -- the parent row was.
+        ToyBase m4(16), m5(16);
+        SecondBestThenRight sbr4, sbr5;
+        Options o8 = o;
+        o8.k = 8;
+        const Result r4 = onebit::npu::mtp::run(m4, &sbr4, Q, o);
+        const Result r8 = onebit::npu::mtp::run(m5, &sbr5, Q, o8);
+        check(r4.ok && r8.ok && r8.stats.accepted == r4.stats.accepted && r8.stats.emitted == r4.stats.emitted,
+              "leaf fill (2): widening the batch (k=8, M=16 rows) buys exactly nothing when the parent is refused");
+        std::printf("INFO leaf fill (2): correct deeper candidates, accepted %d at k=4, %d at k=8 (of %d / %d rows)\n",
+                    r4.stats.accepted, r8.stats.accepted, r4.stats.drafted, r8.stats.drafted);
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

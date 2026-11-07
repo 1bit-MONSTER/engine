@@ -1,0 +1,29 @@
+{
+  "id": "27b-t2s2-decode-20261106",
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX ternary sidecars, sealed single-ELF decode",
+  "metric": {
+    "name": "decode",
+    "value": 0.2902,
+    "unit": "s/token"
+  },
+  "settings": {
+    "device": "accel0",
+    "engine": "1bit t2s2-20261104 (serve-bin)",
+    "model_dir": "~/models/npu/bonsai2-27b-t2s2-serve",
+    "container": "Qwen3.8-27B-NPU2 (qwen3_5, 64 layers, H=5120, ternary sidecars, sealed single-ELF decode set)",
+    "ticket": "npu-hold -t 14 -l 587-27b-row4",
+    "port": "18099",
+    "sampling": "temperature 0, top_k 1, seed 1234, stream=false",
+    "prompt_tokens": 13,
+    "batches": "n=1, n=5, n=9 completions on the same 13-token prompt, 3 repeats each",
+    "slopes": "(n5-n1)/4 = 0.2884, (n9-n1)/8 = 0.2920, spread +1.3 %"
+  },
+  "instrument": "wall clock per request (curl, HTTP 200, usage.completion_tokens read back); decode is the slope between completion lengths, not a single mixed request; n=1 0.9537 s +- 0.0038, n=5 2.1073 s +- 0.0150, n=9 3.2900 s +- 0.0105",
+  "repeats": 3,
+  "timestamp": "2026-11-06T20:53:40Z",
+  "source": "~/evidence/tmoe-npu/587-27b-row-20261106/r2 (this session; per-request JSON kept), task bc791346c/b9e132438",
+  "notes": "3.45 tok/s. One 13-token prompt, one box, one serve, no batching; the served route reported `flm_prefix_cache: no slot shares a prefix` on every request, so no prefix cache is inside these numbers. The two slopes agreeing is what makes this a decode figure rather than a prefill+decode mix. The model answers in `reasoning_content` (content is empty at these budgets), so the token counts, not the text, are what is measured. Earlier rungs on the same container, for context: 63.1 s/token int8 (27b-npudx-20261027) and 1.72 s/token on the per-role PB16i set (engine#697)."
+}

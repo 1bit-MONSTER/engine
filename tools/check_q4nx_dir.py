@@ -42,6 +42,15 @@ container was packed from, so the answer comes from the weights instead of from 
 own round trip (a packer/decoder pair that agrees on the wrong layout scores well against
 itself). That mode is opt-in and is the only one that needs numpy and gguf.
 
+The same mode answers the q4_1 question, which was engine#1110's hole: two FastFlowLM converter
+checkouts write the **same 5120-byte q4_1 tile in two different element orders**, both pass every
+metadata check here (right chunk kind, right byte count), and the wrong one decodes as fluent
+noise with no error line anywhere. No metadata can tell them apart, so `--against` decodes the
+first tile of the q4_1 tensors under all three orders this repo can name (`ours`, the engine's
+own; `flm` signed and `flm` unsigned, the two foreign readings of the same bytes) and says which
+one the source weights agree with. A container whose tiles are not `ours` is a failure naming the
+tensor, exactly like a wrong Q8 layout.
+
 A model directory's `config.json` also lets this tool compare each quantized tensor's **tile count**
 with the geometry the model's own dimensions imply, which catches a container whose weight grids were
 padded by a converter to a different grid than this engine reads (engine#1097: the FastFlowLM converter
@@ -292,10 +301,12 @@ def check(path, verbose=True):
 CHUNKS_REV = {v: k for k, v in CHUNKS.items()}
 
 
-def q8_ground_truth(gguf_path, container_name):
+def source_block(gguf_path, container_name):
     """The source tensor's top-left 32x256 values, or None if the GGUF has no such tensor.
 
-    Only this path needs numpy and gguf; the container side stays pure python.
+    Both tile kinds start at the weight's origin (a converter that pads a grid pads right/bottom),
+    so this block is the ground truth for the first 5120-byte tile of either kind. Only the
+    `--against` path needs numpy and gguf; the container side stays pure python.
     """
     import gguf
     import numpy as np
@@ -330,7 +341,7 @@ def check_q8_layout(path, gguf_path, samples=3):
         with open(path, "rb") as f:
             f.seek(base + off)
             tile = f.read(Q8_TILE)
-        want, gguf_name = q8_ground_truth(gguf_path, name)
+        want, gguf_name = source_block(gguf_path, name)
         if want is None:
             print(f"  {name}: not in {os.path.basename(gguf_path)}, skipped")
             continue
@@ -353,6 +364,124 @@ def check_q8_layout(path, gguf_path, samples=3):
         # remove, e.g. the wrong GGUF for this container.
         errors.append(f"no Q8 tensor of {path} matched a tensor in {os.path.basename(gguf_path)}: "
                       f"nothing was verified")
+    return errors, rows
+
+
+Q4_1_TILE = CHUNKS_REV["q4_1"]
+# Every q4_1 order this repo can name. `ours` is what npu/q4nx.cpp decodes; the two `flm` readings
+# are the foreign converter's, whose nibble is either the plain q of `scale*q + min` (unsigned) or
+# the signed q-8 the official Q4_0 path stores. A container is accepted only when the weights say
+# it is `ours` -- the others are named so the failure says what the bytes look like.
+Q4_1_LAYOUTS = ("ours", "flm", "flm-unsigned")
+
+
+def q4_1_tile_floats(tile, layout):
+    """One 5120-byte q4_1 tile, decoded 32x256 under one named order."""
+    import q4nx_diff as D                            # the same decoders q4nx_diff --layout uses
+    if layout == "ours":
+        return D.decode_ours(tile, 32, 256)
+    return D.decode_flm(tile, 32, 256, signed=(layout == "flm"))
+
+
+def q4_1_names(table):
+    """The container's q4_1 tensors (I8 codes in 5120-byte tiles), in table order."""
+    return [n for n, t in table.items()
+            if isinstance(t, dict) and t.get("dtype") in QUANT
+            and (t.get("shape") or [0])[-1] == Q4_1_TILE]
+
+
+def spread(names, samples):
+    """Evenly spaced names across the whole table, not the first N.
+
+    A foreign converter's order can vary tensor to tensor (measured: the `d1d5232` checkout matches
+    `flm-unsigned` on some tensors and only partially on others), so reading the first three names in
+    table order samples one layer and a bias-free prefix.  Spreading costs the same and covers the
+    model, including the outlier-heavy `down_proj` tensors that sit lowest.
+    """
+    if samples <= 0 or samples >= len(names):
+        return list(names)
+    if samples == 1:
+        return [names[0]]
+    step = (len(names) - 1) / (samples - 1)
+    return [names[int(round(i * step))] for i in range(samples)]
+
+
+def check_q4_1_layout(path, gguf_path, samples=3):
+    """(errors, rows): which q4_1 tile order the container's tiles hold, versus the source weights.
+
+    engine#1110: the chunk kind, the byte count and the tensor names are identical under both
+    orders, so nothing in the container can say which one it holds -- only the source weights can.
+    The block is decoded under every order this repo names and the winner is compared with the
+    engine's own; `ours` must win by a wide margin, because "closest of three wrong readings" is
+    still a container that would be served as noise.
+    """
+    table, base, _ = read_header(path)
+    q4 = q4_1_names(table)
+    if not q4:
+        print(f"  {path}: no q4_1 tensors, nothing to check against the source weights")
+        return [], []
+    errors, rows = [], []
+    import numpy as np
+    for name in spread(q4, samples):
+        want, gguf_name = source_block(gguf_path, name)
+        if want is None:
+            print(f"  {name}: not in {os.path.basename(gguf_path)}, skipped")
+            continue
+        with open(path, "rb") as f:      # this tensor's OWN first tile, not the file's first one
+            f.seek(base + table[name]["data_offsets"][0])
+            tile = np.frombuffer(f.read(Q4_1_TILE), dtype=np.uint8)
+        flat_want = [v for row in want for v in row]
+        scores = {}
+        for layout in Q4_1_LAYOUTS:
+            got = [float(v) for row in q4_1_tile_floats(tile, layout) for v in row]
+            scores[layout] = (corr(got, flat_want), rel_rms(got, flat_want))
+        rows.append({"tensor": name, "gguf": gguf_name,
+                     **{k: v for k, v in scores.items()}})
+        print(f"  {name} vs {gguf_name}:")
+        for layout in Q4_1_LAYOUTS:
+            print(f"    order {layout:13s} corr {scores[layout][0]:+.4f}  "
+                  f"rel-rms {scores[layout][1]:.4f}")
+        ours = scores["ours"][0]
+        others = max(v[0] for k, v in scores.items() if k != "ours")
+        # Decided on the MARGIN, not on an absolute nearness cut. Quantization error is per-tensor:
+        # on a published FastFlowLM directory (the fleet serves it as it is) the order is beyond
+        # doubt at a margin of ~0.95 while `layers.2.mlp.down_proj` -- outlier-heavy, packed from a
+        # different source -- reads corr only +0.9890, so an absolute >= 0.99 floor refuses a good
+        # container and then says "NOT in the order, best is ours", which contradicts itself. The
+        # margin is what identifies an order: >= 0.95 on every correct container measured here, and
+        # <= 0.05 when the winning reading is a foreign one. The floor at 0.9 rules out the other
+        # failure -- no reading matching at all, which means the GGUF is not this container's
+        # source -- and is not an order decision.
+        closest = max(Q4_1_LAYOUTS, key=lambda k: scores[k][0])
+        if ours - others < 0.5 or ours < 0.9:
+            best = scores[closest][0]
+            if best < 0.9:
+                # No reading matches: the wrong GGUF, or an order this repo cannot name. Saying "not
+                # the engine's order, closest is flm" here would be a claim about a correlation of
+                # -0.003, i.e. about nothing.
+                errors.append(
+                    f"{name}: no reading of these tiles matches the source weights (best is {closest} "
+                    f"at corr {best:+.4f}): {os.path.basename(gguf_path)} is probably not the GGUF this "
+                    f"container was packed from, or the tiles are in an order this repo cannot name")
+            elif closest != "ours":
+                errors.append(
+                    f"{name}: the q4_1 tiles are NOT in the order npu/q4nx.cpp decodes (ours corr "
+                    f"{ours:+.4f} rel-rms {scores['ours'][1]:.4f}, best of the three is {closest} at "
+                    f"corr {best:+.4f}). This container would load and answer as noise "
+                    f"(engine#1110): re-pack it with scripts/repack_gguf.py and a converter that writes "
+                    f"this engine's tile order")
+            else:
+                # ours wins but not by the margin: a container that is partly foreign, or one whose
+                # tiles are in a fourth order that happens to be nearer ours. Refused, and said so.
+                second = max((k for k in Q4_1_LAYOUTS if k != "ours"), key=lambda k: scores[k][0])
+                errors.append(
+                    f"{name}: the tile order is ambiguous -- ours reads corr {ours:+.4f} (rel-rms "
+                    f"{scores['ours'][1]:.4f}) but {second} reads {scores[second][0]:+.4f}: the margin "
+                    f"is {ours - scores[second][0]:.4f}, under the 0.5 this check needs to call the "
+                    f"order. Treated as foreign (engine#1110)")
+    if not rows:
+        errors.append(f"no q4_1 tensor of {path} matched a tensor in {os.path.basename(gguf_path)}: "
+                      f"nothing was verified about the tile order")
     return errors, rows
 
 
@@ -441,8 +570,18 @@ def self_test():
             bad.append(f"no-Q8 container with --against returned {rc_noq8}: {said}")
         if "hold the code order" in said:
             bad.append(f"no-Q8 container claimed a code order was checked: {said}")
-        if "no Q8 tile was decoded" not in said:
+        if "no Q8 or q4_1 tile was decoded" not in said:
             bad.append(f"no-Q8 container did not say it compared nothing: {said}")
+        # the q4_1 selector itself, pure python: a 5120-B I8 tensor is q4_1, a 4736-B (Q4_K) and an
+        # 8704-B (Q8) one are not, so a container of only those must not be read as q4_1 either.
+        mixed = {"a.weight": {"dtype": "I8", "shape": [2, 5120], "data_offsets": [0, 10240]},
+                 "b.weight": {"dtype": "I8", "shape": [2, 4736], "data_offsets": [10240, 19712]},
+                 "c.weight": {"dtype": "I8", "shape": [2, 8704], "data_offsets": [19712, 37120]},
+                 "__metadata__": {"x": 1}}
+        if q4_1_names(mixed) != ["a.weight"]:
+            bad.append(f"q4_1 selector picked {q4_1_names(mixed)} out of a mixed table")
+        if spread([str(i) for i in range(10)], 3) != ["0", "4", "9"]:
+            bad.append(f"spread is not across the table: {spread([str(i) for i in range(10)], 3)}")
 
         # the directory case: every .q4nx in it is checked
         two = os.path.join(tmp, "two")
@@ -532,10 +671,11 @@ def main():
     ap.add_argument("--json", help="write the per-file summary here")
     ap.add_argument("--self-test", action="store_true", help="synthetic containers: pass/fail cases")
     ap.add_argument("--against", metavar="SOURCE.gguf",
-                    help="decode every Q8 tile both ways and correlate against the GGUF the "
-                         "container was packed from (needs numpy and gguf)")
+                    help="decode the first Q8 and q4_1 tiles every way this repo can read them and "
+                         "correlate against the GGUF the container was packed from -- the only mode "
+                         "that can tell the q4_1 tile orders apart (engine#1110); needs numpy and gguf")
     ap.add_argument("--q8-samples", type=int, default=3, metavar="N",
-                    help="how many Q8 tensors --against decodes (default 3)")
+                    help="how many Q8 and how many q4_1 tensors --against decodes (default 3)")
     ap.add_argument("--strict", action="store_true",
                     help="treat a geometry warning (a padded weight grid this engine cannot read) "
                          "as a failure")
@@ -545,7 +685,7 @@ def main():
     if not args.path:
         ap.error("a model directory or .q4nx file is required (or --self-test)")
     out, rc = {}, 0
-    compared = 0        # Q8 tensors actually decoded and correlated, across all files
+    compared = 0        # tiles actually decoded and correlated (Q8 layouts + q4_1 orders)
     warnings = 0        # geometry warnings (padded weight grids) across all files
     for path in targets(args.path):
         errors, summary = check(path)
@@ -571,6 +711,11 @@ def main():
             summary["q8_layout"] = rows
             compared += len(rows)
             errors += q8_errors
+            print(f"{path}: q4_1 tile order against {os.path.basename(args.against)}")
+            q4_errors, rows = check_q4_1_layout(path, args.against, args.q8_samples)
+            summary["q4_1_order"] = rows
+            compared += len(rows)
+            errors += q4_errors
         for e in errors:
             print(f"FAIL {e}")
         rc = rc or (1 if errors else 0)
@@ -580,12 +725,13 @@ def main():
     if rc:
         print("chunk layout NOT verified")
     elif args.against and compared:
-        print("chunk layout verified, and the Q8 tiles hold the code order npu/q4nx.cpp decodes")
+        print("chunk layout verified, and the tiles hold the code order and tile order "
+              "npu/q4nx.cpp decodes")
     elif args.against:
-        # No Q8 tensor was decoded, so nothing was compared: say that instead of
-        # printing the success line for a check that did not run.
-        print("chunk layout verified; no Q8 tile was decoded, so no code order was checked "
-              "against the source weights")
+        # No tile was decoded, so nothing was compared: say that instead of printing the success
+        # line for a check that did not run.
+        print("chunk layout verified; no Q8 or q4_1 tile was decoded, so no layout or order was "
+              "checked against the source weights")
     else:
         print("chunk layout verified: every quantized tensor's shape names a known chunk kind")
     if warnings and not rc:

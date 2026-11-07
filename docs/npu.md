@@ -691,6 +691,16 @@ and names a weight whose converter padded that grid (engine#1097) — a gated at
 emits q **and** the output gate (engine#796: reading it as one head-width made the real d3 pack, and
 every 27B `qwen3_5` pack on this box, look like a padded grid and fail `--strict`).
 
+`--against <source.gguf>` closes both of those gaps for a directory that was never repacked here: it
+decodes the first tile of the Q8 tensors under both Q8 layouts *and* the first tile of the `q4_1`
+tensors under all three `q4_1` orders this repo can name (`ours`, `flm` signed, `flm` unsigned),
+correlates each against the source GGUF, and refuses a container whose winner is not the engine's own
+(`--q8-samples` sets how many tensors per chunk kind). That is the offline row engine#1110 asked
+for — a directory imported from a foreign converter carries no stamp and no plan, so nothing but the
+weights can say which order it holds, and the separation is wide: `ours` reads `corr +1.0000` on a
+container packed from `Q4_K_M` and `+0.996` on one packed from BF16, while every foreign order sits at
+`|corr| < 0.05`.
+
 **The tile order is measured, not declared.** Two converters can write `q4_1` tiles in the two
 different orders this engine and FastFlowLM use, and a container in the wrong order repacks cleanly
 and decodes as noise — HTTP 200, nothing in the log (engine#1110; measured with FLM_Q4NX_Converter
@@ -1053,7 +1063,7 @@ engine#587 measured the route on it):
 
 | family (`gguf`) | packs in the 2026-11-06 body | `backends` | NPU route answer |
 |---|---|---|---|
-| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx, npu | **served, and measured** (engine#587): the same `Qwen3.8-27B-NPU2` family runs on the NPU route — int8 Q4NX decodes at 63.1 s/token and takes 145.7 s to a first token (`bench/npu-leaderboard/27b-*.json`, 2026-10-27), a 5-token prefill chunk is 58.14 s, and the ternary sealed-ELF rung on the same container is 1.72 s/token with 3/3 text-identical output (engine#697, closed by #728). What a stock install still needs is a kernel set for the model's geometry — none ships in this repository — so the row read `not served` until the route itself was measured |
+| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx, npu | **served, and measured** (engine#587): the same `Qwen3.8-27B-NPU2` family runs on the NPU route — 0.2902 s/token (3.45 tok/s) and 19.55 tok/s of prefill on the sealed single-ELF ternary rung, 22.811 s to a first token with the weight load in it (`bench/npu-leaderboard/27b-t2s2-*-20261106.json`) — int8 Q4NX decodes at 63.1 s/token and takes 145.7 s to a first token (`bench/npu-leaderboard/27b-*.json`, 2026-10-27), a 5-token prefill chunk is 58.14 s, and the ternary sealed-ELF rung on the same container is 1.72 s/token with 3/3 text-identical output (engine#697, closed by #728). What a stock install still needs is a kernel set for the model's geometry — none ships in this repository — so the row read `not served` until the route itself was measured |
 | `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
 | `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
@@ -1850,6 +1860,25 @@ a silently broken loop rather than a slow one.
 **What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).
+
+**Leaf fill is resolved, and the answer is that this verifier cannot use it.** The plan's last protocol item (#805) asks
+for "spare verify rows filled with the drafts' 2nd/3rd candidates". The acceptance rule here is
+`argmax(logits[i-1]) == draft[i]` (`npu/mtp/draft.h:317`): a draft is accepted iff it **is** the base's own argmax at
+that position, and the argmax that grades depth *i* is produced by row *i-1* of the same batch. Two consequences,
+both measured in `tests/mtp_draft_test.cpp` [16] against a toy base that is given a real two-level ranking:
+
+* a candidate at the **same position** that is not the argmax is refused with certainty, however many rows carry it —
+  the base's rank-2 token is accepted **0 of 92** times, and the control that makes that number mean something (the
+  same head against the same base with the argmax moved onto the runner-up) accepts **20 of 20**;
+* a **correct candidate deeper in the chain** is never scored while its parent is refused: a head that is right at
+  depths 2..k and wrong at depth 1 accepts **0**, `reached_at[1] == 0`, and widening the batch to `k = 8` / `M = 16`
+  rows changes it by **nothing** (0 accepted of 184 rows). The batch's rows are the *chain*, not candidate tests.
+
+An alternative at a depth is graded by its parent's row, so it cannot even be placed in the same batch; placing it
+would need per-row positions and an attention mask in the forward — a tree verifier — and with a recurrent GDN state
+carried row by row that also needs a state per branch, which is the "no per-token state banks" constraint the same plan
+imposes. So the spare rows buy nothing here, and the two levers that did move this loop are the ones already recorded:
+the hidden variant (post-final-norm) and the drafter's stream cursor.
 
 Reading these numbers has two traps that produced wrong figures here twice: plain decode is **host-bound**, so a
 loaded window inflates it and flatters the draft route — two arms of one ticket are comparable, two tickets are

@@ -277,8 +277,10 @@ explanation for anything.
 So the fourth measurement lands between the two earlier answers and closer to the page's original one: a perfect concurrent
 split is worth **2-3.5 % of prefill** on a post-fix engine, because as the matmuls got 2.3x faster the attention share grew
 from 48.5 % to 57.1 % and the split can only touch the other 42.9 %. The bar in #754 therefore still stands, and the M<=2048
-cell is answered rather than closed: at pp2048 the same capture gives 0.435 ms per `q4_k` dispatch and 1.661 ms per `swiglu`
-dispatch (8 row-groups), i.e. 13.3 ms of iGPU work against one 8.61 ms NPU tile - one tile helps by ~1.1x there, and no more.
+cell is now **closed as "no"** rather than left unresolved: at pp2048 the same capture gives 1.661 ms per `swiglu` dispatch,
+i.e. 0.83 ms per 256-row group, so the whole `up_gate` GEMM (8 row-groups) is **6.6 ms** of iGPU work - *less* than one
+8.61 ms NPU tile, which makes the split 1.00x there. The earlier "1.143x at M=2048" came from the pre-fix library's
+1.441 ms per group, i.e. from the same stale reading as the 1.164x row.
 
 **One caveat that is not about the kernels**: that hw-gate build's *wall clock* is far below the shipped runtime's
 (660 tok/s at pp2048 against 1564 on the Nov-2 runtime, with **79.9 %** of the pp2048 device span idle). Its per-kernel

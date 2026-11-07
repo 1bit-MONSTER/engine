@@ -311,4 +311,5 @@ pre-fix library's 1.164x would give 1.038-1.070x; quoted only so the two cannot 
 Three caveats, all of which have moved the number: the iGPU side is a *measurement*, and a measurement is a claim
 about a build, so print the library path, its mtime and its kernel-generation marker next to it; the formula
 assumes the iGPU's time is linear in its row count, which it is not (it under-predicts the measured split by ~3
-points at M=16384); and M<=2048 is unresolved rather than closed.
+points at M=16384); and at M<=2048 the answer is **no** on the post-fix runtime - the whole `up_gate` GEMM is
+6.6 ms of iGPU work against one 8.61 ms NPU tile, so the split is 1.00x there.

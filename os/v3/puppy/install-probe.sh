@@ -190,6 +190,7 @@ grub = row("grub.cfg", "grep -h '^ *linux ' /tmp/x 2>/dev/null; "
                        "ls /mnt 2>/dev/null >/dev/null; "
                        "mkdir -p /mnt/e; mount -o ro /dev/vda1 /mnt/e 2>/dev/null && "
                        "grep '^ *linux ' /mnt/e/EFI/BOOT/grub.cfg | head -1; umount /mnt/e 2>/dev/null", 120)
+stick_acct = row("stick acct", "id onebit 2>&1 | tail -1")
 espuuid = (row("esp uuid", "blkid -s PARTUUID -o value /dev/vda1") or "").strip()
 espuuid = [l.strip() for l in espuuid.splitlines() if re.match(r"^[0-9a-fA-F-]{8,}$", l.strip())]
 espuuid = espuuid[-1] if espuuid else ""
@@ -207,6 +208,11 @@ for st, name, body in rows:
 ok = True
 if "INSTALLED" not in (install or ""):
     print("FAIL install      the installer did not report INSTALLED"); ok = False
+if "uid=" in (stick_acct or ""):
+    print("FAIL stick acct   the live stick carries a onebit account (%s): a machine that forgets should stay "
+          "root-only" % stick_acct.strip()); ok = False
+else:
+    print("PASS stick acct   no onebit account on the live stick (%s)" % (stick_acct or "").strip()[:80])
 if len(onebit) != 1:
     print("FAIL fw entries   expected exactly one '1bit OS' entry, found %d: %s" % (len(onebit), entries))
     ok = False
@@ -497,6 +503,32 @@ if assert_pupsfs:
                 print("FAIL persist      no squashfs mount at all: cannot say where the OS came from"); ok = False
             else:
                 print("PASS persist      PUPMODE=12, root writes through %s, SFS from %s" % (rw, sfs.strip()))
+            # ---- engine#712's second half: a normal account with sudo, created by 07onboard-user on THIS boot,
+            # read off the running machine (id, an actual `sudo -n` as that user, and the keys it was given).
+            acct = val("ACCT", "id onebit 2>&1 | head -1")
+            sugr = val("SUDO", "su -s /bin/sh onebit -c 'sudo -n id -un' 2>&1 | tail -1")
+            keys = val("KEYS", "stat -c '%a %U' /home/onebit/.ssh/authorized_keys 2>&1")
+            # the account is given the machine's keys from /data/ssh/authorized_keys, and from the image's own
+            # /root/.ssh/authorized_keys when /data has none (a stock image ships only the host key there; a
+            # prepared stick is the one that puts authorized_keys on /data). Compare against the same choice.
+            same = val("SAME", "s=/data/ssh/authorized_keys; [ -s \"$s\" ] || s=/root/.ssh/authorized_keys; "
+                               "cmp -s \"$s\" /home/onebit/.ssh/authorized_keys && echo same-from-$s || echo differ")
+            nkey = val("NKEY", "grep -c . /home/onebit/.ssh/authorized_keys 2>/dev/null || echo 0")
+            print("INFO account      %s | sudo -n -> %s | keys %s (%s line(s)) | %s"
+                  % (acct, sugr, keys, nkey, same))
+            if "uid=" not in acct or "onebit" not in acct:
+                print("FAIL account      no onebit account on the installed machine (id: %s)" % (acct or "<none>")); ok = False
+            elif sugr != "root":
+                print("FAIL account      sudo as onebit answered %s, not root" % (sugr or "<nothing>")); ok = False
+            elif not keys.startswith("600 onebit"):
+                print("FAIL account      /home/onebit/.ssh/authorized_keys is %s, want 600 onebit" % (keys or "<missing>")); ok = False
+            elif not same.startswith("same-from-"):
+                print("FAIL account      the account's keys are not the machine's keys (cmp: %s)" % (same or "no answer")); ok = False
+            elif nkey == "0":
+                print("FAIL account      the account's key file is empty"); ok = False
+            else:
+                print("PASS account      %s, sudo -> root, keys 600 onebit, %s key line(s) from %s"
+                      % (acct, nkey, same[len("same-from-"):]))
             wrote = val("WROTE", "sh -c 'echo 712 > /root/712-persist; sync; cat /root/712-persist'")
             if wrote != "712":
                 print("FAIL persist      could not write to the installed root (/root/712-persist: %s)" % (wrote or "<no answer>")); ok = False
@@ -507,8 +539,16 @@ if assert_pupsfs:
             else:
                 back = val("BACK", "cat /root/712-persist")
                 pm2 = val("PM", "sed -n 's/^PUPMODE=//p' /etc/rc.d/PUPSTATE | head -1")
+                acct2 = val("ACCT", "id -u onebit 2>&1 | head -1")
+                nacc = val("NACC", "awk -F: '$1 == \"onebit\" { n++ } END { print n+0 }' /etc/passwd")
                 if back == "712" and pm2 == "12":
                     print("PASS persist      /root/712-persist still there after a reboot, PUPMODE=12 on both boots")
+                    if acct2.isdigit() and nacc == "1":
+                        print("PASS account      onebit still uid %s after the reboot, and one account in /etc/passwd" % acct2)
+                    else:
+                        print("FAIL account      after the reboot onebit=%s, %s entries in /etc/passwd "
+                              "(the account did not persist, or was created twice)" % (acct2 or "<gone>", nacc or "<unread>"))
+                        ok = False
                 else:
                     print("FAIL persist      after a reboot /root/712-persist=%s, PUPMODE=%s "
                           "(the installed machine lost the write)" % (back or "<gone>", pm2 or "<unread>"))

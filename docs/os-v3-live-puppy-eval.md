@@ -184,7 +184,7 @@ From the noble64 SFS (measured by extraction) and ResolutePup64's own release no
 | persistent layer on the stick (#706) | pupmode 5/12/13, save **file** or **folder** — the initrd's own machinery (`sbin/load_ext_file`, `validate_pupsave_upgrade`) | same | size it (`psave=`/`pupsave`) and document it as the answer to #706 |
 | release identity (#704) | none | none | `/etc/1bit/release-identity`, written by our package/first boot |
 | headless | first-run wizard asks keyboard/locale/X even with `pfix=nox` | same | pre-answer it (`/etc/rc.d/rc.local` hook or a seeded `PUPSTATE`) |
-| user model | **root only**, no `onebit` user, no sudo model | same | decide honestly: run as root and say so, or add a user + `su`/`doas`; Puppy's tools assume root |
+| user model | **root only**, no `onebit` user, no sudo model | same | **decided (engine#712): root-only on the stick, and an installed machine gets `onebit` with sudo and the machine's keys** (`os/v3/puppy/embed/etc/init.d/07onboard-user`: locked password, one `NOPASSWD` rule, keys from `/data/ssh`) — Puppy's own tools still assume root, so root stays |
 | X11 baggage | X.Org, GTK3, JWM, Roxfiler, Palemoon (~1 GB unpacked) | same | not started when headless (`pfix=nox`), but it is on the disk |
 
 That table is the real cost of the Puppy plan: the appliance's identity (a user, sshd, mokutil, a

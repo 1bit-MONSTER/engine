@@ -562,6 +562,14 @@ add_test(NAME laya_encoder COMMAND laya_encoder_test)
 add_executable(laya_models_test tests/laya_models_test.cpp)
 target_link_libraries(laya_models_test PRIVATE onebit_laya)
 add_test(NAME laya_models COMMAND laya_models_test ${CMAKE_SOURCE_DIR}/config/laya-models-game.json)
+# The decision record itself (app/route_log.h): the classified state a decision keeps, so a
+# /v1/route/decisions log can become `--eval` cases and fine-tune data (engine#1313, docs/laya-models.md
+# "Measuring and fine-tuning the router").  Header only: no checkpoint, no device.
+add_executable(route_log_test tests/route_log_test.cpp)
+target_include_directories(route_log_test PRIVATE app)
+target_link_libraries(route_log_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME route_log COMMAND route_log_test)
+add_dependencies(onebit route_log_test)
 # CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
 # keeps the laya_models ctest from reporting "Not Run" without a workflow change.
 add_dependencies(onebit laya_models_test)

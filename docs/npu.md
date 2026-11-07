@@ -1525,8 +1525,11 @@ Exiting is deliberate: after such a failure the context's own state is dead, and
 fails the same way — measured on the c22 board, where the same backend answered 614 to every subsequent request while a
 fresh process answered normally on the same device. The supervisor (Lemonade's backend watchdog, a systemd unit, the OS
 menu's launcher) is the only one that can build a new context, so the engine hands it the problem instead of answering
-with something that looks like a result. A client sees **one failed request**, and the next one lands on a working
-backend.
+with something that looks like a result. What the client sees next depends on the supervisor: Lemonade reloads the backend
+and **replays a non-streamed request once** on the new context, so that turn still gets an answer (fork #42: 200 in
+2.2-5.4 s where the same request used to be a 500, measured with a stand-in engine on strixhalo 2026-11-06); a **streamed**
+request keeps the error frame, because bytes may already have reached the client, and the next request lands on the working
+backend. Under any other supervisor (a systemd unit, the OS menu's launcher) a client sees one failed request and retries.
 
 If a *fresh* backend also fails, the device is the thing to look at rather than the engine: the driver refuses new
 hardware contexts until `amdxdna` is reloaded, and says so in its own kernel message — restarting backends cannot fix it.
@@ -1619,7 +1622,14 @@ usable beside another NPU engine, and what its limits are:
   overlap, in either order, on one file.
 - **Who may take what.** Anything that honours the file interlocks with us: `forward-serve`
   (`--npu-streams` decides which mode), the in-process route (`LOCK_EX`, always -- `app/unified.cpp`),
-  the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
+  the ELF runner (`LOCK_EX`, always). **A run that never opens the device takes no lock**: with
+  `NPU_INFER_HOST_GEMM=1` the forward runs the model with host GEMMs and makes no `xrt::device`, so it
+  holds nothing the lock protects (`npu_lock_taken()`, engine#1353). That matters because the lock is
+  exclusive for the process's life: a host-GEMM serve that took it would block every lane that *does*
+  use the array -- measured on this box, one orphaned host-GEMM serve held it **4 h 52 m** with zero
+  `/dev/accel*` handles and no CPU, and during that window a second lane's serve and two device tickets
+  waited on it. `NPU_NO_DEVICE_LOCK=1` remains the operator's escape hatch for the runs that do open
+  the device. A foreign NPU runtime --
   Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
   keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
   file is not slowed, not blocked and not detected.

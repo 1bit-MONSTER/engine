@@ -950,3 +950,46 @@ upload of the class appears:
   purpose: it is a remote-code one-off until a second uploader uses it, which is why the census
   reports it as `. REMOTE-CODE` and starts alerting at `REMOTE_CODE_SPREAD` (3) uploaders - that
   alert is the prompt to review it for a variant shape, not to silence it now.
+
+## Reviewed 2026-11-07 — the #1328 census sweep: nine classes, and why only one is a decline
+
+The watcher's 2026-11-07 run named nine architecture classes it could not map. Each is recorded below with the
+evidence that decided it, because "decline" and "leave alone" are different answers and only one of them belongs
+in `registry/significant.json`.
+
+| class | models (`registry/census.json`) | disposition |
+|---|---|---|
+| `GRTForCausalLM` | 8 | **declined** — research decoder, nothing at the pin registers it |
+| `GravityMoEForCausalLM` | 12 | left as `. REMOTE-CODE` — one uploader, review at `REMOTE_CODE_SPREAD` |
+| `RicursiveForCausalLM` | 17 | left as `. REMOTE-CODE` — same |
+| `K2HorizonForCausalLM` | 150 | left as `. REMOTE-CODE` — same, but the count is the one worth watching |
+| `Lfm3OmniForConditionalGeneration` | 5 | left as `. REMOTE-CODE`; the LFM3 family is already declined by name |
+| `MiniCPMV4_7ForConditionalGeneration` | 4 | **not declined** — same family as a mapped class, one converter registration away |
+| `MiniCPMOcrForConditionalGeneration` | FastFlowLM pack only | **declined for now** — custom `minicpm-ocr` library, nothing at the pin reads it |
+| `DFlash2DraftModel` | — | already declined (`significant.json`, `watch: report`) |
+| `Lfm3ForCausalLM` | — | already declined (`significant.json`, `watch: report`) |
+
+* `GRTForCausalLM` (`MatterWaveAI/grt-30m-code` and 7 others) is **not an alias**. Its config was read on
+  2026-11-07: `model_type: grt`, `n_qkv_rotations: 11`, `n_mixer_rotations: 1`, `mor_router_mode: rotational`,
+  `mor_delta_scale: 0.5`, `coupling_init_mode: diagonal`, `learnable_rope: true` with `rope_placement: stream`,
+  `residual_gate_mode: bounded_depth`, no residual norm, and `transformers_version: 5.23.0.dev0`. That is a
+  rotational coupling mixer, not a llama/qwen shape with extra keys, and neither `conversion/` nor
+  `src/llama-arch.cpp` at the pin has a `grt` name. It carries `"watch": "report"` in
+  `registry/significant.json`, so the census prints `. REVIEWED` instead of `!! UNCOVERED`; mapping it would claim
+  a graph the engine cannot run.
+* The four `. REMOTE-CODE` classes are **deliberately not** in `significant.json`. They run their own modelling
+  code, each was seen from a single uploader in this run, and the policy above (`KeuralMoECausalLM`) is that the
+  `. REMOTE-CODE` line plus the alert at `REMOTE_CODE_SPREAD` uploaders *is* the review trigger — silencing it
+  now would remove the prompt. `K2HorizonForCausalLM` is the exception worth a look on count alone (150 models);
+  if it reaches three uploaders it will alert and get its own review, and its config should be read before
+  anyone maps it.
+* `MiniCPMV4_7ForConditionalGeneration` is the LNewq pattern, not a decline: its `text_config.model_type` is
+  **`qwen3_5_moe_text`** (read 2026-11-07), i.e. the same text tower that makes `MiniCPMV4_6ForConditionalGeneration`
+  map to `qwen35`. `conversion/minicpm.py` registers only the `V4_6` class, so what is missing is **one converter
+  registration in the fork**, not an architecture. It is left unmapped on purpose: a registry entry without a
+  converter class would claim the engine can convert a file it cannot.
+* `MiniCPMOcrForConditionalGeneration` (`openbmb/MiniCPM-OCR-1.0`, base `MiniCPM-V-4.6`) declined for now: its
+  `library_name` is `minicpm-ocr`, a custom library — the GGUF conversions that exist upstream come from that
+  project's own pipeline, and nothing at the pin registers the class. The V4.6 text tower is supported, so this
+  is a converter-and-proof job rather than an architecture gap, but it is not one registration: the head and the
+  vision side would both have to be verified.

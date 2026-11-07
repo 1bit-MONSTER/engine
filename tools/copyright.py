@@ -57,10 +57,12 @@ EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*",
           # engine#315 evidence artefacts that cannot carry a comment: diffs must stay byte-applicable
           # and data files have no comment syntax. Matches the existing "patches/*" exemption.
           "*.patch", "*.csv", "*.cfg",
-          # engine#1146: the clause-55 acceptance tickets are DATA a parser reads byte-verbatim (like
-          # tests/golden/*/tokens.txt), so a notice comment would make the fixture no longer the log it claims
-          # to be; the directory README carries the notice instead
-          "tests/fixtures/mtp_clause55/*.txt",
+          # engine#1146, generalised by engine#805: an acceptance ticket under tests/fixtures/ is DATA that a parser
+          # reads byte-verbatim (like tests/golden/*/tokens.txt), so a notice comment would make the fixture no longer
+          # the log it claims to be; each fixture directory's README carries the notice instead. By kind, not by
+          # directory: the clause-55 window needed this exemption first and the tau=0.6 window then failed the check
+          # for the same reason one directory over.
+          "tests/fixtures/*/*.txt",
           # os/v2 packages: dpkg control files, apt/dpkg list files and the console banner are data
           # with no comment syntax - the same exemption patches/* and *.cfg get
           "os/v2/debian/*/control", "os/v2/debian/*/conffiles", "*.list",

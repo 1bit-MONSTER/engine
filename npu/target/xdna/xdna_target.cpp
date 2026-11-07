@@ -1,0 +1,901 @@
+// Copyright 2026 bong-water-water-bong
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+// npu/target/xdna/xdna_target.cpp — the XDNA2 launch layer (engine#799 P4 / #803).
+//
+// Moved out of npu/forward/src/q4nx_forward.cpp without a numerics change: the same quantisation, the same
+// packed-weight BO cache, the same pb16i image path and Hadamard fold, the same kernel selection.  What
+// changed is only who owns the state: the model keeps the maths and hands activations in here.
+//
+// docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
+#include "target/xdna/xdna_target.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <fstream>
+#include <unistd.h>   // mkstemp/close: the pb16i activation probe's dump
+
+#include "hadamard.h"                // the activation rotation: one implementation, shared with the model
+#include "npu_engine_i8ctx_inc.h"   // I8Ctx
+#include "q4nx_lh.h"                // q4nx_lh::LhScope, the phase accounting the model also writes
+#include "q4nx_pack.h"
+
+namespace npu::target::xdna {
+using namespace q4nx_lh;   // the phase slots and g_ph are shared with the model (q4nx_lh.h)
+namespace {
+
+// The probe dump's own file: mkstemp() gives O_CREAT|O_EXCL and mode 0600 with a unique name in one step.
+static FILE* open_probe_dump() {
+    char path[] = "/tmp/a0-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0) return nullptr;
+    FILE* f = fdopen(fd, "wb");
+    if (!f) {
+        close(fd);
+        return nullptr;
+    }
+    fprintf(stderr, "[pb16i-dump] %s\n", path);
+    return f;
+}
+
+static const char* role_tag(Q4nxDesign r) {
+    switch (r) {
+        case Q4NX_DESIGN_QKV: return "QKV";
+        case Q4NX_DESIGN_QKV2: return "QKV2";
+        case Q4NX_DESIGN_O:   return "O";
+        case Q4NX_DESIGN_O2:  return "O2";
+        case Q4NX_DESIGN_GU:  return "GU";
+        case Q4NX_DESIGN_G:   return "G";
+        case Q4NX_DESIGN_U:   return "U";
+        case Q4NX_DESIGN_PLEGATE: return "PLEGATE";
+        case Q4NX_DESIGN_PLEPROJ: return "PLEPROJ";
+        case Q4NX_DESIGN_GU2: return "GU2";
+        case Q4NX_DESIGN_D2:  return "D2";
+        case Q4NX_DESIGN_QKVLIN: return "QKV";
+        case Q4NX_DESIGN_Z:   return "Z";
+        case Q4NX_DESIGN_QKVFA_Q:  return "QKVFAQ";
+        case Q4NX_DESIGN_QKVFA_KV: return "QKVFAKV";
+        default:              return "D";
+    }
+}
+
+}  // namespace
+
+XdnaTarget::XdnaTarget() = default;
+XdnaTarget::~XdnaTarget() = default;
+
+// --------------------------------------------------------------------------
+// NpuTarget
+// --------------------------------------------------------------------------
+bool XdnaTarget::open(const onebit::npu::plan::Plan& plan, const std::string& kernels_dir,
+                      const char* family, std::string& err) {
+    // A1 consumes the plan where it overlaps with what this target was handed: the geometry it is about
+    // to launch on must be the geometry the plan describes, or the run is a different model than the one
+    // the directory says it is.  A model directory with no plan keeps the legacy probing in the forward,
+    // and this stays a "device attached?" check (that is what makes the plan additive).
+    //
+    // A2 (#803 §3) moves the derivation in here: then this becomes the source rather than the check.
+    kernels_dir_ = kernels_dir;
+    plan_ = plan;
+    if (!dev_) { err = "xdna: no device attached (host-GEMM mode has no target)"; return false; }
+    if (ndesigns_ == 0) { err = "xdna: no design adopted yet (A2: the plan supplies it)"; return false; }
+    if (!plan_.loaded()) return true;
+
+    if (plan_.layers > 0 && n_layers_ > 0 && plan_.layers != n_layers_)
+        { err = "plan: " + std::to_string(plan_.layers) + " layers but the container has " +
+                std::to_string(n_layers_); return false; }
+    // The decode family is what this target picks between per launch, so a plan that states an M this
+    // target has no kernel for is a refusal rather than a silent M=128 (or M=16) launch.
+    int adopted_prefill = 0, adopted_decode = 0;
+    for (int i = 0; i < ndesigns_; i++) {
+        if (ctx_[i] && ctx_[i]->MD > adopted_prefill) adopted_prefill = ctx_[i]->MD;
+        if (ctx16_[i] && ctx16_[i]->MD > adopted_decode) adopted_decode = ctx16_[i]->MD;
+    }
+    if (plan_.prefill_m > 0 && adopted_prefill > 0 && plan_.prefill_m != adopted_prefill)
+        { err = "plan: prefill M=" + std::to_string(plan_.prefill_m) + " but the adopted kernels run M=" +
+                std::to_string(adopted_prefill); return false; }
+    if (plan_.decode_enabled && plan_.decode_m > 0 && adopted_decode > 0 &&
+        plan_.decode_m != adopted_decode)
+        { err = "plan: decode M=" + std::to_string(plan_.decode_m) + " but the adopted twin runs M=" +
+                std::to_string(adopted_decode); return false; }
+    // No refusal for "plan says decode is enabled but no M=16 twin was adopted": that is the normal case
+    // for an rm container whose kernel set carries no _m16 twins, and the forward's own probe already
+    // decided it (`skipped++; continue;   // stay on M=128`). plan.decode is a static field of P1's
+    // generator (tools/npu_plan.py always writes enabled/M=16), not a claim that the files exist, so a
+    // third refusal here would turn "no twins on disk" into a failed load. For pb16i the same condition
+    // is already fatal earlier, by name, in the forward (`decode role ... needs "..." (missing)`).
+    // Found by the #808 gate on 2026-11-02: the shipped Qwen3-0.6B plan (decode.M=16) plus a kernel set
+    // with no m16 twins refused to load with this check in place.
+    // The kernel family the plan names has to be the one this target was configured for.  Asked for by
+    // name rather than recomputed from `pb16i_`/`weight_layout_b8_`: a t2s container sets `pb16i_` too
+    // (its weights are the integer-exact ternary family), so a local copy of this rule refused every
+    // `_t2s`/`_t2s2` plan as "this target runs family _pb16i".  Found by reading the tree against
+    // main's #837/#843, which is where the t2s family tag stopped being a constant.
+    const std::string want = family ? family : "";
+    if (plan_.tag != want)
+        { err = "plan: kernels.tag \"" + plan_.tag + "\" but this target runs family \"" +
+                want + "\""; return false; }
+    // The sealed ELF is plan-derived at the seam already (the forward takes it from the plan when the plan
+    // names one), so there is nothing to reconcile here; A2 moves that decision in with the derivation.
+    return true;
+}
+
+bool XdnaTarget::load_block(int, int, std::string& err) {
+    // A2: weight residency per layer block (it is what npu_gemm's cache-miss path does today, one
+    // projection at a time).  A1 keeps the lazy per-projection fill, so this is a no-op that says why.
+    err = "xdna: load_block is A2 (weights still fill lazily per projection)";
+    return false;
+}
+
+bool XdnaTarget::gemv(const GemvArgs& ar, std::vector<float>& out, std::string& err) {
+    std::string e;
+    if (ar.rows) npu_gemm_rows(ar, out, e);
+    else         npu_gemm(ar, out, e);
+    if (!e.empty()) { err = e; return false; }
+    return true;
+}
+
+Caps XdnaTarget::caps() const {
+    Caps c;
+    c.max_rows = m16_ ? Q4NX_DESIGN_M_DECODE : Q4NX_DESIGN_M_PREFILL;
+    c.prefill_rows = Q4NX_DESIGN_M_PREFILL;
+    c.t2_expansion = false;      // P3 brings it
+    c.gdn = false;               // the GDN recurrence is the model's today
+    c.attn = false;
+    c.lm_head = false;           // the head borrows a GEMM kernel; it is not a target op yet
+    c.int8_kv = false;
+    return c;
+}
+
+// --------------------------------------------------------------------------
+// setup (the forward still derives; A2 moves this behind open())
+// --------------------------------------------------------------------------
+void XdnaTarget::set_device(xrt::device* dev, bool weight_layout_b8, bool weight_cache, int n_layers) {
+    dev_ = dev;
+    weight_layout_b8_ = weight_layout_b8;
+    weight_cache_ = weight_cache;
+    n_layers_ = n_layers;
+}
+
+void XdnaTarget::set_pb16i(bool on, std::string dir, std::string sealed) {
+    pb16i_ = on;
+    pb16i_dir_ = std::move(dir);
+    pb16i_sealed_ = std::move(sealed);
+}
+
+bool XdnaTarget::weight_cached(int layer, int key) const {
+    return weight_cache_ && layer >= 0 && layer < (int)wcache_.size() &&
+           wcache_[(size_t)layer].find(key) != wcache_[(size_t)layer].end();
+}
+
+int XdnaTarget::max_rows() const {
+    if (pb16i_) { for (int i = 0; i < ndesigns_; i++) if (ctx16_[i]) return ctx16_[i]->MD; }
+    for (int i = 0; i < ndesigns_; i++) if (ctx_[i]) return ctx_[i]->MD;
+    return 1;
+}
+
+int XdnaTarget::rows_for(int role, int want) const {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS) return want;
+    if (m16_ && want >= 1 && want <= 16 && ctx16_[role]) return ctx16_[role]->MD;
+    return ctx_[role] ? ctx_[role]->MD : want;
+}
+
+I8Ctx* XdnaTarget::make_ctx(int role) {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS) return nullptr;
+    ctx_[role] = std::make_unique<I8Ctx>();
+    return ctx_[role].get();
+}
+I8Ctx* XdnaTarget::ctx(int role) const {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS) return nullptr;
+    return ctx_[role].get();
+}
+std::unique_ptr<I8Ctx>& XdnaTarget::ctx_ref(int role) { return ctx_[role]; }
+
+I8Ctx* XdnaTarget::make_ctx16(int role, const Q4nxDesignGeom& geom) {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS) return nullptr;
+    designs16_[role] = geom;
+    ctx16_[role] = std::make_unique<I8Ctx>();
+    return ctx16_[role].get();
+}
+I8Ctx* XdnaTarget::ctx16(int role) const {
+    if (role < 0 || role >= Q4NX_MAX_DESIGNS) return nullptr;
+    return ctx16_[role].get();
+}
+void XdnaTarget::drop_ctx16(int role) {
+    if (role >= 0 && role < Q4NX_MAX_DESIGNS) ctx16_[role].reset();
+}
+I8Ctx* XdnaTarget::make_head_ctx() {
+    ctx_head_ = std::make_unique<I8Ctx>();
+    return ctx_head_.get();
+}
+I8Ctx* XdnaTarget::head_ctx() const { return ctx_head_.get(); }
+std::unique_ptr<I8Ctx>& XdnaTarget::head_ctx_ref() { return ctx_head_; }
+
+void XdnaTarget::dump_profile() { prof_dump(); }
+
+void XdnaTarget::note_head(int M, double dpk, double dql, double dwt, double drb) {
+    prof_head_M_ = M;
+    prof_add(&prof_head_, 0, dpk, dql, dwt, drb);
+    prof_dec_n_++;
+}
+
+// --------------------------------------------------------------------------
+// the moved launch layer
+// --------------------------------------------------------------------------
+int XdnaTarget::design_index(I8Ctx* c) const {
+    if (!c) return -1;
+    for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++)
+        if (ctx_[i].get() == c || (ctx16_[i] && ctx16_[i].get() == c)) return i;
+    return -1;
+}
+
+I8Ctx* XdnaTarget::ctx_for(I8Ctx* prefill, int rows, bool decode_twin) {
+    // Rows that fit one M=16 row-block (decode's 1 row, or a short prompt's
+    // prefill chunk of <= 16) run the cheap twin: the M=128 kernel streams the
+    // same weights but walks 128 baked MAC rows to deliver <= 16, and a request
+    // pays one full weight pass in prefill whatever its prompt length.  Chunks
+    // wider than 16 keep M=128 (one launch per chunk), so long prefill is
+    // unchanged.
+    // decode_twin forces the narrow kernel even for a wide launch: the pb16i prefill path uses it for a
+    // projection that has no M=128 kernel at all.
+    if (!m16_) return prefill;
+    if (!decode_twin && (rows < 1 || rows > 16)) return prefill;
+    for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++)
+        if (ctx_[i].get() == prefill && ctx16_[i]) return ctx16_[i].get();
+    return prefill;
+}
+
+int64_t XdnaTarget::m16_check_gemm(I8Ctx& ref, I8Ctx& fast, const float* A, int K,
+                                   int N, const float* Bmat, xrt::bo* wbo, float as) {
+    // Same activation, same quantizer, same weight BO as the launch that just ran on
+    // the M=16 kernel -- only the ELF differs, so any output difference is the
+    // kernel's, not the plumbing's.
+    xrt::run r;
+    if (wbo) {
+        r = ref.launch_async_with_bo(*wbo, A, 1, K, as);
+    } else {
+        float s = 1.0f;
+        ref.packB(0, Bmat, K, N, s);
+        ref.quantize_async(A, 1, K, as);
+        r = ref.sync_and_launch(0);
+    }
+    ref.wait_kernel(r);
+    ref.readback();
+    // engine#666: a short read of the REFERENCE row would look like a kernel mismatch and be blamed on the
+    // M=16 twin. Re-issue the reference once before comparing.
+    if (ref.canary_short()) {
+        ref.canary_retries_++;
+        if (wbo) {
+            r = ref.launch_async_with_bo(*wbo, A, 1, K, as);
+        } else {
+            float s = 1.0f;
+            ref.packB(0, Bmat, K, N, s);
+            ref.quantize_async(A, 1, K, as);
+            r = ref.sync_and_launch(0);
+        }
+        ref.wait_kernel(r);
+        ref.readback();
+    }
+    int64_t maxd = 0;
+    long nmis = 0;
+    for (int n = 0; n < N; n++) {
+        const int64_t d = (int64_t)ref.Cm[n] - (int64_t)fast.Cm[n];
+        const int64_t ad = d < 0 ? -d : d;
+        if (ad) { nmis++; if (ad > maxd) maxd = ad; }
+    }
+    m16_checked_++;
+    if (maxd > m16_worst_) m16_worst_ = maxd;
+    if (maxd) {
+        m16_bad_++;
+        fprintf(stderr, "[m16check] MISMATCH N=%d maxdiff=%lld mismatched_cols=%ld "
+                        "(K=%d)\n", N, (long long)maxd, nmis, K);
+    } else if (m16_checked_ % 250 == 0) {
+        fprintf(stderr, "[m16check] n=%ld maxdiff=0 (bit-exact)\n", m16_checked_);
+    }
+    return maxd;
+}
+
+int64_t XdnaTarget::m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float* A,
+                                        int M, int K, int N, xrt::bo* wbo,
+                                        const std::vector<float>& ascales) {
+    // Same M rows, same per-row scales, same weight BO: only the ELF differs.
+    xrt::run r = wbo ? ref.launch_async_with_bo_rows(*wbo, A, M, K, ascales.data())
+                     : ref.launch_async_rows(0, A, M, K, ascales.data());
+    ref.wait_kernel(r);
+    ref.readback();
+    if (ref.canary_short()) {   // engine#666, same reasoning as m16_check_gemm
+        ref.canary_retries_++;
+        r = wbo ? ref.launch_async_with_bo_rows(*wbo, A, M, K, ascales.data())
+                : ref.launch_async_rows(0, A, M, K, ascales.data());
+        ref.wait_kernel(r);
+        ref.readback();
+    }
+    int64_t maxd = 0;
+    long nmis = 0;
+    for (int m = 0; m < M; m++) {
+        const int32_t* a = ref.Cm + (size_t)m * ref.ND;
+        const int32_t* b = fast.Cm + (size_t)m * fast.ND;
+        for (int n = 0; n < N; n++) {
+            const int64_t d = (int64_t)a[n] - (int64_t)b[n];
+            const int64_t ad = d < 0 ? -d : d;
+            if (ad) { nmis++; if (ad > maxd) maxd = ad; }
+        }
+    }
+    m16_checked_++;
+    if (maxd > m16_worst_) m16_worst_ = maxd;
+    if (maxd) {
+        m16_bad_++;
+        fprintf(stderr, "[m16check] MISMATCH rows=%d N=%d maxdiff=%lld "
+                        "mismatched_cols=%ld (K=%d)\n", M, N, (long long)maxd, nmis, K);
+    } else if (m16_checked_ % 250 == 0) {
+        fprintf(stderr, "[m16check] n=%ld maxdiff=0 (bit-exact)\n", m16_checked_);
+    }
+    return maxd;
+}
+
+void XdnaTarget::prof_add(ProfAcc* acc, int design, double pack, double quant,
+                              double wait, double rb) {
+    if (q4nx_lh::phprof_on() && acc == prof_dec_ && !q4nx_lh::g_in_head) {
+        q4nx_lh::g_ph.g_pack += pack; q4nx_lh::g_ph.g_ql += quant;
+        q4nx_lh::g_ph.g_wait += wait; q4nx_lh::g_ph.g_rb += rb;
+        q4nx_lh::g_ph.launches++;
+    }
+    if (design < 0 || design >= Q4NX_MAX_DESIGNS) return;
+    ProfAcc& a = acc[design];
+    a.pack += pack; a.quant += quant; a.wait += wait; a.rb += rb;
+    a.n++;
+}
+
+void XdnaTarget::prof_dump() {
+    fprintf(stderr, "[prof] ---- per-role launch cost (ms, window since last dump) ----\n");
+    fprintf(stderr, "[prof] %-5s %-5s %2s %8s %7s %9s %7s %9s %9s\n", "phase", "role",
+            "M", "launches", "pack", "quant+lnch", "wait", "readback", "ms/launch");
+    for (int ph = 0; ph < 2; ph++) {
+        ProfAcc* acc = ph ? prof_pre_ : prof_dec_;
+        for (int i = 0; i < ndesigns_; i++) {
+            const ProfAcc& a = acc[i];
+            if (!a.n) continue;
+            const double n = (double)a.n;
+            const int M = (ctx16_[i] && ph == 0) ? designs16_[i].M : designs_[i].M;
+            fprintf(stderr, "[prof] %-5s %-5s %2d %8ld %7.2f %9.2f %7.3f %9.3f %9.3f\n",
+                    ph ? "pre" : "dec", role_tag(designs_[i].role), M, a.n,
+                    a.pack / n, a.quant / n, a.wait / n, a.rb / n,
+                    (a.pack + a.quant + a.wait + a.rb) / n);
+        }
+    }
+    if (prof_head_.n) {
+        const double n = (double)prof_head_.n;
+        fprintf(stderr, "[prof] %-5s %-5s %2d %8ld %7.2f %9.2f %7.3f %9.3f %9.3f\n", "dec",
+                "HEAD", prof_head_M_, prof_head_.n, prof_head_.pack / n, prof_head_.quant / n,
+                prof_head_.wait / n, prof_head_.rb / n,
+                (prof_head_.pack + prof_head_.quant + prof_head_.wait + prof_head_.rb) / n);
+    }
+    fprintf(stderr, "[prof] dispatch decode=%ld prefill=%ld tokens=%ld (decode/token=%.1f)"
+                    " m16=%d\n", prof_dec_n_, prof_pre_n_, prof_tok_n_,
+            prof_tok_n_ ? (double)prof_dec_n_ / (double)prof_tok_n_ : 0.0, (int)m16_);
+    if (had_n_)
+        fprintf(stderr, "[prof] hadamard host: %.1f ms over %ld row-launch(es) = %.1f ms/token\n",
+                had_ms_, had_n_, prof_tok_n_ ? had_ms_ / (double)prof_tok_n_ : 0.0);
+    if (m16_check_)
+        fprintf(stderr, "[m16check] ---- checks=%ld mismatched=%ld worst_maxdiff=%lld"
+                        " ----\n", m16_checked_, m16_bad_, (long long)m16_worst_);
+    /* Window semantics: each dump reports the launches since the previous dump,
+       so one burst of device contention cannot bias a whole run.  The dispatch /
+       token totals above stay cumulative. */
+    for (int i = 0; i < Q4NX_MAX_DESIGNS; i++) {
+        prof_dec_[i] = ProfAcc{};
+        prof_pre_[i] = ProfAcc{};
+    }
+    prof_head_ = ProfAcc{};
+}
+
+std::string XdnaTarget::pb16i_stem(int layer, const char* tag) const {
+    return pb16i_dir_ + "/" + q4nx_pb16i::sidecar_stem(layer, tag);
+}
+
+bool XdnaTarget::load_hadamard(const std::string& path, std::string& err) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err = "q4nx_hadamard: cannot open " + path; return false; }
+    char magic[4] = {0};
+    uint32_t n = 0;
+    f.read(magic, 4);
+    f.read(reinterpret_cast<char*>(&n), 4);
+    if (!f || std::memcmp(magic, "HAD1", 4) != 0 || n == 0 || n > 16) {
+        err = "q4nx_hadamard: " + path + " is not a HAD1 sign table";
+        return false;
+    }
+    std::vector<uint32_t> width(n), off(n);
+    for (uint32_t i = 0; i < n; i++) {
+        f.read(reinterpret_cast<char*>(&width[i]), 4);
+        f.read(reinterpret_cast<char*>(&off[i]), 4);
+    }
+    std::vector<float> all;
+    float v = 0.0f;
+    while (f.read(reinterpret_cast<char*>(&v), 4)) all.push_back(v);
+    for (uint32_t i = 0; i < n; i++) {
+        if ((size_t)off[i] + width[i] > all.size()) { err = "q4nx_hadamard: short sign table"; return false; }
+        had_signs_[int(width[i])].assign(all.begin() + off[i], all.begin() + off[i] + width[i]);
+    }
+    hadamard_ = true;
+    fprintf(stderr, "  [forward] hadamard: %zu width(s) from %s, block %d (activations rotated "
+                    "into the folded basis)\n", had_signs_.size(), path.c_str(), had_block_);
+    return true;
+}
+
+void XdnaTarget::npu_gemm(const GemvArgs& ar, std::vector<float>& out, std::string& err) {
+    I8Ctx* ctxp = ctx(ar.role);
+    // A ternary-only design (the pb16i/t2s full-attention QKV halves) has no wide M=128 context: its own
+    // entry IS the decode design, so ctx16_ is the only thing that can launch it.  Resolving that here rather
+    // than at the call site is what keeps the model from having to know which roles the kernel set gave a wide
+    // kernel to (main did it by passing *ctx16_[i] directly, and the move dropped that).
+    if (!ctxp) ctxp = ctx16(ar.role);
+    if (!ctxp) { err = "no context for role " + std::to_string(ar.role); out.assign((size_t)ar.N, 0.0f); return; }
+    I8Ctx& ctx = *ctxp;
+    const float* A = ar.x; const int K = ar.K, N = ar.N;
+    std::vector<float> a_pad;   // keeps every A read inside the caller's buffer at a padded K
+    if (ar.a_k > 0 && ar.a_k < K) {
+        a_pad.resize((size_t)K);
+        q4nx_pad_a_f32(A, 1, ar.a_k, K, a_pad.data());
+        A = a_pad.data();
+    }
+    const float* Bmat = ar.Bmat; const int wkey = ar.wkey; const char* sc = ar.tag;
+    q4nx_lh::LhScope _tlh_gemm(q4nx_lh::lh_in_gdn() ? LH_GEMM_GDN : LH_GEMM);  // amax scan, A quant, out deq
+    float amax = 0.0f;
+    for (int i = 0; i < K; i++) {
+        float a = std::fabs(A[i]);
+        if (a > amax) amax = a;
+    }
+    const float as = amax > 0.0f ? amax / 127.0f : 1.0f;
+    // Phase-selected activation tile: a one-row call is decode, so it runs this
+    // role's M=16 twin (one core row instead of 128 rows / 8 live tiles).
+    I8Ctx& kctx = *ctx_for(&ctx, 1, ar.decode_twin);
+    const bool prof = prof_;
+    const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+    // pb16i: the weight BO holds the sidecar image unchanged, so a cache miss is a
+    // file read (no dequant, no quantise, no pack) and the result is dequantised with
+    // the sidecar's own per-column 2^e_ref table.  `sc` names the tensor; a pb16i
+    // context without one is a caller bug, not a fallback.
+    if (pb16i_ && kctx.pb16i) {
+        out.assign((size_t)N, 0.0f);   // sized before every refusal path below
+        if (!sc) { err = "pb16i: no sidecar tag for this projection"; return; }
+        PackedWeight* slot = nullptr;
+        if (weight_cache_ && wkey >= 0 && ar.layer >= 0 && ar.layer < n_layers_ && dev_) {
+            if (int(wcache_.size()) <= ar.layer) wcache_.resize(size_t(ar.layer) + 1);
+            auto& m = wcache_[size_t(ar.layer)];
+            auto  it = m.find(wkey);
+            if (it == m.end()) {
+                q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
+                PackedWeight pw;
+                pw.bo = kctx.make_weight_bo(*dev_, /*zero=*/false);
+                std::vector<int16_t> eref;
+                int mode = 0;
+                const std::string stem = pb16i_stem(ar.layer, sc);
+                if (!kctx.load_pb16i_into(*pw.bo, stem, eref, mode)) {
+                    err = "pb16i: cannot load " + stem;
+                    return;
+                }
+                pw.eref = std::move(eref);
+                pw.pb16i_mode = mode;
+                it = m.emplace(wkey, std::move(pw)).first;
+            }
+            slot = &it->second;
+        } else {
+            err = "pb16i needs the weight cache (routed or unlocked weights have no image)";
+            return;
+        }
+        if (slot->pb16i_mode > kctx.pb16i_planes) {
+            err = std::string("pb16i: ") + sc + " needs the two-plane accumulator but this "
+                   "role's ELF is the int32 one";
+            return;
+        }
+        // Folded basis: A' = H (A . s) with the sign vector of this input width, then the int8
+        // scale is taken from the rotated vector (that is the vector the kernel actually sees).
+        const float* Ab = A;
+        float asb = as;
+        if (hadamard_) {
+            auto hs = had_signs_.find(K);
+            if (hs == had_signs_.end()) {
+                err = "pb16i: no Hadamard sign vector for K=" + std::to_string(K);
+                return;
+            }
+            const auto h0 = std::chrono::steady_clock::now();
+            had_buf_.assign(A, A + K);
+            q4nx_hadamard::rotate(hs->second.data(), had_buf_.data(), K, had_block_);
+            float am = 0.0f;
+            for (int i = 0; i < K; i++) {
+                const float a = std::fabs(had_buf_[(size_t)i]);
+                if (a > am) am = a;
+            }
+            asb = am > 0.0f ? am / 127.0f : 1.0f;
+            Ab = had_buf_.data();
+            had_ms_ += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - h0).count();
+            had_n_++;
+        }
+        if (const char* dump = getenv("NPU_PB16I_DUMP")) {
+            static bool done = false;
+            if (!done && ar.layer == atoi(dump) && sc && std::string(sc) == "attn_qkv") {
+                done = true;
+                FILE* f = open_probe_dump();
+                if (f) {
+                    fwrite(&K, sizeof(int), 1, f);
+                    fwrite(A, sizeof(float), (size_t)K, f);
+                    fwrite(Ab, sizeof(float), (size_t)K, f);
+                    fwrite(kctx.Am, sizeof(int8_t), (size_t)K, f);
+                    fwrite(&asb, sizeof(float), 1, f);
+                    fclose(f);
+                }
+                fprintf(stderr, "[pb16i-dump] wrote the dump for %s K=%d\n", sc, K);
+            }
+        }
+        const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        xrt::run r = kctx.launch_async_with_bo(*slot->bo, Ab, 1, K, asb);
+        const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        kctx.wait_kernel(r);
+        const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        kctx.readback();
+        const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        out.resize((size_t)N);
+        kctx.dequant_pb16i(out.data(), 1, N, &asb, slot->eref, kctx.pb16i_planes);
+        // NPU_PB16I_TRACE=<layer>: one line for the named layer's launch in the MODEL LOOP, with
+        // the exact inputs and outputs, so the same A can be replayed through the frozen
+        // harness.  If the harness reproduces C, the kernel and the images are fine and the bug
+        // is what happens to C afterwards; if it does not, the activation quantisation is wrong.
+        if (const char* tl = getenv("NPU_PB16I_TRACE")) {
+            if (ar.layer == atoi(tl) && sc) {
+                fprintf(stderr, "[pb16i-trace] %s raw[0..3]=", sc);
+                for (int i = 0; i < 4; i++) fprintf(stderr, "%.9g ", (double)A[(size_t)i]);
+                fprintf(stderr, " rot[0..3]=");
+                for (int i = 0; i < 4; i++) fprintf(stderr, "%.9g ", (double)Ab[(size_t)i]);
+                fprintf(stderr, " as=%.9g planes=%d A[0..7]=", (double)asb,
+                        kctx.pb16i_planes);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int)kctx.Am[i]);
+                fprintf(stderr, " Cm[0..7]=");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int)kctx.Cm[i]);
+                fprintf(stderr, " out[0..7]=");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.9g ", (double)out[(size_t)i]);
+                fprintf(stderr, " eref[0..3]=%d %d %d %d\n", (int)slot->eref[0], (int)slot->eref[1],
+                        (int)slot->eref[2], (int)slot->eref[3]);
+            }
+        }
+        if (prof) {
+            const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
+            const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
+            const double dwt = std::chrono::duration<double, std::milli>(tw - tq).count();
+            const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
+            prof_add(prof_dec_, design_index(&kctx), dpk, dql, dwt, drb);
+            if (++prof_dec_n_ % 100 == 0) prof_dump();
+        }
+        return;
+    }
+
+    // Token-invariant weights (wkey >= 0) get their own BO, packed once and
+    // reused; every other call (wkey < 0: routed experts, whose weights change
+    // per token) re-packs into layerB[0] as before.
+    PackedWeight*             slot = nullptr;
+    const std::vector<float>* gs = nullptr;
+    if (weight_cache_ && wkey >= 0 && ar.layer >= 0 && ar.layer < n_layers_ && dev_) {
+        if (int(wcache_.size()) <= ar.layer) wcache_.resize(size_t(ar.layer) + 1);
+        auto& m = wcache_[size_t(ar.layer)];
+        auto  it = m.find(wkey);
+        if (it == m.end()) {
+            // Cache miss only: this is the per-request re-pack/re-upload the
+            // `prefill` row would hide.  It must be zero for a warm process.
+            q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
+            PackedWeight pw;
+            pw.bo = kctx.make_weight_bo(*dev_);
+            if (kctx.gemv) {
+                // The gemv family dequantises from the container's own tiles: upload them unchanged.
+                if (!ar.tiles) { err = "gemv: the model has no tile stream for this container"; return; }
+                std::vector<uint8_t> blob;
+                if (!ar.tiles(ar.tiles_self, ar.layer, ar.role, blob, err)) return;
+                if (!kctx.upload_tiles_into(*pw.bo, blob.data(), blob.size())) {
+                    err = "gemv: tile upload failed"; return;
+                }
+            } else {
+                float sout = 1.0f;
+                kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            }
+            it = m.emplace(wkey, std::move(pw)).first;
+        }
+        slot = &it->second;
+        gs = &slot->scales;
+    } else if (kctx.gemv) {
+        err = "gemv: this family needs the weight cache (NPU_NO_WCACHE=1 is not supported with it)";
+        return;
+    } else {
+        float sout = 1.0f;
+        kctx.packB(0, Bmat, K, N, sout);
+        kctx.quantize_async(A, 1, K, as);
+        gs = &kctx.group_scales[0];
+    }
+
+    const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto issue = [&]() -> xrt::run {
+        return slot ? kctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
+                    : kctx.sync_and_launch(0);
+    };
+    xrt::run r = issue();
+    const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    kctx.wait_kernel(r);
+    const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    kctx.readback();
+    // engine#666: the row about to be dequantised is still the poison the launch was supposed to overwrite,
+    // so the writes are not in memory after the invalidate. Re-issue this launch once and read again, rather
+    // than silently pushing zeros into the layer. The retry is counted and reported (NPU_CANARY_STATS=1).
+    if (!kctx.gemv && kctx.canary_short()) {
+        kctx.canary_retries_++;
+        r = issue();
+        kctx.wait_kernel(r);
+        kctx.readback();
+        if (q4nx_lh::phprof_on()) g_ph.h_rb += 0.0;   // the retry's cost is already inside the readback timer below
+    }
+    const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+    out.resize((size_t)N);
+    if (kctx.gemv) {
+        for (int n = 0; n < N; n++) out[(size_t)n] = kctx.Cg[n];
+    } else {
+        for (int n = 0; n < N; n++)
+            out[(size_t)n] = (float)kctx.Cm[n] * as * (*gs)[(size_t)n];
+    }
+
+    if (!kctx.gemv && kctx.canary_short()) {
+        // twice in a row: say so, loudly, and keep going -- an empty row here is a wrong activation either way
+        fprintf(stderr, "[canary] SHORT RESULT twice: role K=%d N=%d layer=%d short=%d retries=%ld\n",
+                K, N, ar.layer, kctx.short_row_, kctx.canary_retries_);
+    }
+
+    if (m16_check_ && &kctx != &ctx)
+        m16_check_gemm(ctx, kctx, A, K, N, Bmat, slot ? slot->bo.get() : nullptr, as);
+
+    if (prof) {
+        const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
+        const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
+        const double dwt = std::chrono::duration<double, std::milli>(tw - tq).count();
+        const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
+        prof_add(prof_dec_, design_index(&kctx), dpk, dql, dwt, drb);
+        if (++prof_dec_n_ % 100 == 0) prof_dump();
+    }
+}
+
+void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std::string& err) {
+    I8Ctx* ctxp = ctx(ar.role);
+    if (!ctxp) ctxp = ctx16(ar.role);   // same reason as npu_gemm: a ternary-only design lives in ctx16_
+    if (!ctxp) { err = "no context for role " + std::to_string(ar.role); out.assign((size_t)ar.M * ar.N, 0.0f); return; }
+    I8Ctx& ctx = *ctxp;
+    const int M = ar.M, K = ar.K, N = ar.N;
+    if (ctx.gemv) {
+        // The gemv family is one row per launch (its `_m16` ELFs are the same one-row design), so a
+        // batch is a loop of single-row launches.  Correct, and slower per row than a batched
+        // kernel -- that gap is issue #671 item 2's m128 work, not something to hide here.
+        out.assign((size_t)M * (size_t)N, 0.0f);
+        const int astride = (ar.a_k > 0 && ar.a_k < K) ? ar.a_k : K;
+        for (int m = 0; m < M; m++) {
+            GemvArgs one = ar;
+            one.rows = false;
+            one.M = 1;
+            one.x = ar.x + (size_t)m * (size_t)astride;
+            std::vector<float> got;
+            std::string e;
+            npu_gemm(one, got, e);
+            if (!e.empty()) { err = e; return; }
+            std::copy(got.begin(), got.end(), out.begin() + (size_t)m * (size_t)N);
+        }
+        return;
+    }
+    const float* A = ar.x;
+    std::vector<float> a_pad;   // as in npu_gemm(): A holds real_k columns, the kernel reads K
+    if (ar.a_k > 0 && ar.a_k < K) {
+        a_pad.resize((size_t)M * (size_t)K);
+        q4nx_pad_a_f32(A, M, ar.a_k, K, a_pad.data());
+        A = a_pad.data();
+    }
+    const float* Bmat = ar.Bmat; const int wkey = ar.wkey; const char* sc = ar.tag;
+    // Per-row activation scales: row m is quantized with its own amax/127 so a
+    // batch's rows each keep their dynamic range (issue #1699: a single shared
+    // scale zeroed low-magnitude rows when one token's activations dwarfed the
+    // rest).
+    std::vector<float> ascales((size_t)M);
+    for (int m = 0; m < M; m++) {
+        const float* row = A + (size_t)m * K;
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            const float a = std::fabs(row[k]);
+            if (a > amax) amax = a;
+        }
+        ascales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
+    }
+    // Rows > 1 is prefill and keeps the M=128 kernel (one launch per chunk); a
+    // single row here is a decode step and gets the M=16 twin, exactly like
+    // npu_gemm().
+    I8Ctx& kctx = *ctx_for(&ctx, M, ar.decode_twin);
+    const bool prof = prof_;
+    const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (pb16i_ && kctx.pb16i) {
+        out.assign((size_t)M * (size_t)N, 0.0f);   // sized before every refusal path below
+        if (!sc) { err = "pb16i: no sidecar tag for this projection"; return; }
+        PackedWeight* slot = nullptr;
+        if (weight_cache_ && wkey >= 0 && ar.layer >= 0 && ar.layer < n_layers_ && dev_) {
+            if (int(wcache_.size()) <= ar.layer) wcache_.resize(size_t(ar.layer) + 1);
+            auto& m = wcache_[size_t(ar.layer)];
+            auto  it = m.find(wkey);
+            if (it == m.end()) {
+                q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
+                PackedWeight pw;
+                pw.bo = kctx.make_weight_bo(*dev_, /*zero=*/false);
+                std::vector<int16_t> eref;
+                int mode = 0;
+                const std::string stem = pb16i_stem(ar.layer, sc);
+                if (!kctx.load_pb16i_into(*pw.bo, stem, eref, mode)) {
+                    err = "pb16i: cannot load " + stem;
+                    return;
+                }
+                pw.eref = std::move(eref);
+                pw.pb16i_mode = mode;
+                it = m.emplace(wkey, std::move(pw)).first;
+            }
+            slot = &it->second;
+        } else {
+            err = "pb16i needs the weight cache (routed or unlocked weights have no image)";
+            return;
+        }
+        if (slot->pb16i_mode > kctx.pb16i_planes) {
+            err = std::string("pb16i: ") + sc + " needs the two-plane accumulator but this "
+                   "role's ELF is the int32 one";
+            return;
+        }
+        // Folded basis, batched form: rotate every row of A into the container's basis and take
+        // each row's int8 scale from the rotated vector, exactly as npu_gemm() does per launch.
+        const float* Ab = A;
+        if (hadamard_) {
+            auto hs = had_signs_.find(K);
+            if (hs == had_signs_.end()) {
+                err = "pb16i: no Hadamard sign vector for K=" + std::to_string(K);
+                return;
+            }
+            const auto h0 = std::chrono::steady_clock::now();
+            had_buf_.assign(A, A + (size_t)M * (size_t)K);
+            for (int m = 0; m < M; m++) {
+                float* row = had_buf_.data() + (size_t)m * (size_t)K;
+                q4nx_hadamard::rotate(hs->second.data(), row, K, had_block_);
+                float am = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    const float a = std::fabs(row[(size_t)k]);
+                    if (a > am) am = a;
+                }
+                ascales[(size_t)m] = am > 0.0f ? am / 127.0f : 1.0f;
+            }
+            Ab = had_buf_.data();
+            had_ms_ += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - h0).count();
+            had_n_ += M;
+        }
+        const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        xrt::run r = kctx.launch_async_with_bo_rows(*slot->bo, Ab, M, K, ascales.data());
+        const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        kctx.wait_kernel(r);
+        const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        kctx.readback();
+        const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        out.assign((size_t)M * (size_t)N, 0.0f);
+        kctx.dequant_pb16i(out.data(), M, N, ascales.data(), slot->eref, kctx.pb16i_planes);
+        // The batched (prefill) twin of the trace above: a short prompt runs step_batch, so this
+        // is the path a 1-token request actually takes.
+        if (const char* tl = getenv("NPU_PB16I_TRACE")) {
+            if (ar.layer == atoi(tl) && sc) {
+                fprintf(stderr, "[pb16i-trace] %s M=%d as[0]=%.9g planes=%d A[0..7]=", sc, M,
+                        (double)ascales[0], kctx.pb16i_planes);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int)kctx.Am[i]);
+                fprintf(stderr, " Cm[0..7]=");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int)kctx.Cm[i]);
+                fprintf(stderr, " out[0..7]=");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.9g ", (double)out[(size_t)i]);
+                fprintf(stderr, " eref[0..3]=%d %d %d %d\n", (int)slot->eref[0], (int)slot->eref[1],
+                        (int)slot->eref[2], (int)slot->eref[3]);
+            }
+        }
+        if (prof) {
+            const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
+            const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
+            const double dwt = std::chrono::duration<double, std::milli>(tw - tq).count();
+            const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
+            const int di = design_index(&kctx);
+            if (M == 1) {
+                prof_add(prof_dec_, di, dpk, dql, dwt, drb);
+                prof_dec_n_++;
+            } else {
+                prof_add(prof_pre_, di, dpk, dql, dwt, drb);
+                prof_pre_n_++;
+            }
+            if (prof_dec_n_ && (prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();
+        }
+        return;
+    }
+    PackedWeight*             slot = nullptr;
+    const std::vector<float>* gs = nullptr;
+    if (weight_cache_ && wkey >= 0 && ar.layer >= 0 && ar.layer < n_layers_ && dev_) {
+        if (int(wcache_.size()) <= ar.layer) wcache_.resize(size_t(ar.layer) + 1);
+        auto& m = wcache_[size_t(ar.layer)];
+        auto  it = m.find(wkey);
+        if (it == m.end()) {
+            q4nx_lh::LhScope _tlh_pk(LH_PACK_UPLOAD);
+            PackedWeight pw;
+            pw.bo = kctx.make_weight_bo(*dev_);
+            float sout = 1.0f;
+            kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            it = m.emplace(wkey, std::move(pw)).first;
+        }
+        slot = &it->second;
+        gs = &slot->scales;
+    } else {
+        float sout = 1.0f;
+        kctx.packB(0, Bmat, K, N, sout);
+        gs = &kctx.group_scales[0];
+    }
+    const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto issue = [&]() -> xrt::run {
+        return slot ? kctx.launch_async_with_bo_rows(*slot->bo, A, M, K, ascales.data())
+                    : kctx.launch_async_rows(0, A, M, K, ascales.data());
+    };
+    xrt::run r = issue();
+    const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    kctx.wait_kernel(r);
+    const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    kctx.readback();
+    if (kctx.canary_short()) {   // engine#666: re-issue once rather than dequantise an unwritten row
+        kctx.canary_retries_++;
+        r = issue();
+        kctx.wait_kernel(r);
+        kctx.readback();
+        if (kctx.canary_short())
+            fprintf(stderr, "[canary] SHORT RESULT (rows) twice: M=%d K=%d N=%d layer=%d short=%d\n",
+                    M, K, N, ar.layer, kctx.short_row_);
+    }
+    const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    out.resize((size_t)M * N);
+    for (int m = 0; m < M; m++) {
+        const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
+        const float asc = ascales[(size_t)m];
+        float* o = out.data() + (size_t)m * N;
+        for (int n = 0; n < N; n++)
+            o[n] = (float)cm[n] * asc * (*gs)[(size_t)n];
+    }
+    if (m16_check_ && &kctx != &ctx)
+        m16_check_gemm_rows(ctx, kctx, A, M, K, N, slot ? slot->bo.get() : nullptr,
+                            ascales);
+    if (prof) {
+        const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
+        const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
+        const double dwt = std::chrono::duration<double, std::milli>(tw - tq).count();
+        const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
+        const int di = design_index(&kctx);
+        if (M == 1) {
+            prof_add(prof_dec_, di, dpk, dql, dwt, drb);
+            prof_dec_n_++;
+        } else {
+            prof_add(prof_pre_, di, dpk, dql, dwt, drb);
+            prof_pre_n_++;
+        }
+        if (prof_dec_n_ && (prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();
+    }
+}
+
+}  // namespace npu::target::xdna

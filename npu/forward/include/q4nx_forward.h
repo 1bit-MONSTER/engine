@@ -43,12 +43,15 @@
 #include "q4nx_pack.h"        // Q4nxDesignGeom / Q4nxModelDims (derived design table)
 #include "q4nx_rope.h"        // rope_type "llama3" frequency scaling (engine#1048)
 #include "q4nx_semantics.h"   // Q4nxSemantics (config-derived architecture flags)
+// The launch layer: this class owns the maths and the model state, the target owns the device, the kernels
+// and the weight residency (engine#799 P4).  A future non-XDNA NPU is a different implementation of the same
+// interface (npu/target/target.h) and nothing else in this file changes.
+#include "target/xdna/xdna_target.h"  // npu-relative: CI's syntax-only target has no tree root on its path
 #include <memory>
 #include <unordered_map>
 
 struct I8Ctx;
 
-#include "rt.h"  // xrt::device, xrt::bo: the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
 #include <chrono>
 #include <cstdlib>
@@ -62,80 +65,7 @@ struct I8Ctx;
 //
 // Slot order matters: the first LH_LAYER_N entries are the layer-loop rows the
 // per-token [lh] table ranks, the rest are request-level rows.
-namespace q4nx_lh {
-enum LhSlot {
-    LH_LOAD = 0,        // load_layer(): per-token f32 re-dequant
-    LH_LOAD_PROJ,       //   of which: GDN qkv/z/out projections
-    LH_LOAD_FFN,        //   of which: dense FFN tail (gate/up/down)
-    LH_LOAD_GDN_SMALL,  //   of which: alpha/beta, conv1d, norm, ssm_a/dt
-    LH_ASM,             // q4nx_assemble_B()
-    LH_GEMM,            // npu_gemm() total outside gdn_layer, incl. amax scan + out deq
-    LH_GEMM_GDN,        //   of which: npu_gemm() time spent inside gdn_layer()
-    LH_ATTN,            // attention(): rope, softmax, KV append
-    LH_GDN,             // gdn_layer() total
-    LH_GDN_AB,          //   of which: host alpha/beta dot products
-    LH_GDN_CORE,        //   of which: delta-rule recurrence + gated rmsnorm
-    LH_RMS,             // rmsnorm()
-    LH_RES,             // residual adds / layer_scale
-    LH_MLP,             // mlp(): SiLU/GELU * up
-    LH_LAYER_N,         // ---- end of the layer-loop slots ----
-    // Request-level rows (forward_serve.cpp handle_generate).
-    LH_RQ_ACCEPT = LH_LAYER_N,  // body parse + validate + options/grammar
-    LH_RQ_TOKENIZE,     // prompt -> token ids
-    LH_RQ_LOCK,         // wait for the engine mutex
-    LH_RQ_RESET,        //   of which (inside prefill): KV/conv/recurrent reset
-    LH_RQ_PREFILL,      // prefill chunk loop (contains reset + weight packs)
-    LH_RQ_DECODE,       // decode step() total
-    LH_RQ_SAMPLE,       //   of which: grammar mask + sample_token
-    LH_RQ_EMIT,         //   of which: detokenise the emitted token
-    LH_RQ_RESP,         // response serialise + write
-    LH_PACK_UPLOAD,     // weight BO create + pack + upload (wcache_ miss only)
-    LH_HEAD_ROWS,       // run_lm_head_rows(): the head for a batched verify pass
-    LH_N
-};
-inline bool lh_on() {
-    static const bool on = std::getenv("NPU_PHASE_PROF") != nullptr;
-    return on;
-}
-inline double g_lh[LH_N];
-inline long   g_lh_n[LH_N];
-inline int    g_gdn_d = 0;   // >0 while inside a gdn_layer() scope
-inline bool lh_in_gdn() { return g_gdn_d > 0; }
-struct LhScope {
-    int  s; bool on;
-    std::chrono::steady_clock::time_point t;
-    explicit LhScope(int s_)
-        : s(s_), on(lh_on()),
-          t(on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {
-        if (on && s == LH_GDN) g_gdn_d++;
-    }
-    void stop() {
-        if (!on) return;
-        g_lh[s] += std::chrono::duration<double, std::milli>(
-                       std::chrono::steady_clock::now() - t).count();
-        g_lh_n[s]++;
-        if (s == LH_GDN) g_gdn_d--;
-        on = false;
-    }
-    ~LhScope() { stop(); }
-};
-// Table names, indexed by slot (shared by the per-token and per-request tables).
-inline const char* lh_name(int s) {
-    static const char* const kn[LH_N] = {
-        "load_layer", "  of-which: GDN proj deq", "  of-which: FFN tail deq",
-        "  of-which: GDN small deq", "assemble_B", "npu_gemm (total)",
-        "  of-which: gemm in gdn", "attention", "gdn_layer",
-        "  of-which: gdn alpha/beta", "  of-which: gdn recurrence", "rmsnorm",
-        "residual adds", "mlp (act*up)",
-        "request accept/validate", "tokenisation", "engine lock wait",
-        "  of-which: KV/rec state reset", "prefill (chunks)",
-        "decode (step loop)", "  of-which: sample+grammar",
-        "  of-which: detokenise token", "response write",
-        "  of-which: weight pack+upload (wcache miss)",
-        "lm head (batch rows)"};
-    return (s >= 0 && s < LH_N) ? kn[s] : "?";
-}
-}  // namespace q4nx_lh
+#include "q4nx_lh.h"   // the phase accounting both the forward and a target write
 
 struct Q4nxForwardConfig {
     int H = 1024, NH = 16, NKV = 8, HD = 128, IM = 3072, NL = 28, NV = 151936;
@@ -270,50 +200,18 @@ private:
     // intermediate size).  It is K whenever the model is already on the container's 256-column K
     // grid, and smaller when it is not (Qwen2.5-0.5B: 896 of 1024), in which case the activation is
     // zero-padded to K before the kernel sees it -- see q4nx_pad_a_f32() for why that is exact.
-    void npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
-                  const float* Bmat, std::vector<float>& out, int wkey = -1,
-                  const char* sc = nullptr, int a_k = 0);
+    // One projection GEMM. `role` indexes the design table; the launch itself (phase-selected M=16/M=128
+    // kernel, packed-weight BO cache, pb16i images, the Hadamard fold, the a_k pad) lives in the target
+    // (npu/target/xdna/xdna_target.h).  The host-GEMM path of init_host() stays here: it is the model's
+    // fallback, not the target's op.
+    void npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
+                  std::vector<float>& out, int wkey = -1, const char* sc = nullptr, int a_k = 0);
     // Batched (M>1) GEMM: M rows in one launch, with per-row activation scales.
-    void npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
-                       const float* Bmat, std::vector<float>& out, int wkey = -1,
-                       const char* sc = nullptr, int a_k = 0);
-    // pb16i sidecar stem for (layer, tensor tag): <pb16i_dir>/blk_<l>_<tag>_weight
-    std::string pb16i_stem(int layer, const char* tag) const;
-    // Phase-selected activation tile.  A one-row launch is decode, so it runs
-    // this design's M=16 twin (cheap single-row kernel); anything wider is
-    // prefill and keeps the M=128 kernel so a chunk still lands in one array
-    // pass.  Returns `prefill` unchanged when the twin is unavailable, so the
-    // callers never have to test for it.
-    I8Ctx* ctx_for(I8Ctx* prefill, int rows);
-    // Which role a context belongs to (prefill or decode twin); -1 if unknown.
-    int design_index(I8Ctx* c) const;
-    // Bit-equality gate for the decode family (NPU_M16_CHECK=1): run the same
-    // quantized activation and the same weight BO through both kernels and
-    // compare the int32 outputs, which must match exactly (int32 accumulation is
-    // exact, so a difference is a bug, never rounding).  Returns the int32
-    // maxdiff; records the worst case across the run.
-    int32_t m16_check_gemm(I8Ctx& ref, I8Ctx& fast, const float* A, int K, int N,
-                           const float* Bmat, xrt::bo* wbo, float as);
-    // The same gate for a multi-row pass (a prefill chunk of <= 16 rows also runs
-    // the twin): row m of both kernels must agree exactly.
-    int32_t m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float* A, int M, int K,
-                                int N, xrt::bo* wbo, const std::vector<float>& ascales);
-    // NPU_PROFILE per-role dispatch + timing accumulators, one per phase.
-    struct ProfAcc {
-        double pack = 0, quant = 0, wait = 0, rb = 0;
-        long   n = 0;
-    };
-    void prof_add(ProfAcc* acc, int design, double pack, double quant, double wait,
-                  double rb);
-    void prof_dump();
-    bool load_hadamard(const std::string& path);
-    // True when this layer's projection `wkey` is already packed in its own BO,
-    // so the caller can skip both the Q4NX dequant (load_layer) and the f32->B
-    // assembly for the rest of the run.
-    bool weight_cached(int key) const {
-        return weight_cache_ && cur_layer_ >= 0 && cur_layer_ < (int)wcache_.size() &&
-               wcache_[(size_t)cur_layer_].find(key) != wcache_[(size_t)cur_layer_].end();
-    }
+    void npu_gemm_rows(int role, const float* A, int M, int K, int N, const float* Bmat,
+                       std::vector<float>& out, int wkey = -1, const char* sc = nullptr,
+                       int a_k = 0, bool decode_twin = false);
+    // True when this layer's projection `wkey` is already resident in the target.
+    bool weight_cached(int key) const { return xd_ && xd_->weight_cached(cur_layer_, key); }
     // True when this layer's dense FFN tail (the f32 wg_/wu_/wd_ buffers) can be
     // skipped: they are read only by q4nx_assemble_B(), which the MLP sections
     // skip once the layer's packed weights are resident.  See the definition.
@@ -340,8 +238,14 @@ private:
     // I8Ctx detects that family from each ELF's declared argument widths; when it is in use the
     // weight BO holds the container's own q4_1 tiles instead of an int8 packing, because the kernel
     // dequantises with each tile's bf16 scale/zero and repacking would throw those away.
-    static int role_from_tag(const char* sc);
-    bool gemv_tiles(int role, std::vector<uint8_t>& out);
+    //
+    // The image is container state (the chunks live in `mw_`), so it is built here and handed to the
+    // target through GemvArgs::tiles on a residency miss; the launch is the target's.  main's
+    // role_from_tag() is gone with the move: GemvArgs::role already is the design index, which is the
+    // one thing that mapping was producing.
+    bool gemv_tiles(int layer, int role, std::vector<uint8_t>& out, std::string& err);
+    static bool gemv_tile_cb(void* self, int layer, int role, std::vector<uint8_t>& out,
+                             std::string& err);
     bool run_lm_head_gemv(const std::vector<float>& h, std::vector<float>& logits);
 
     Q4nxForwardConfig c_;
@@ -358,13 +262,10 @@ private:
     // kernels for fused gate/up, five when gate and up are split.
     Q4nxDesignGeom designs_[Q4NX_MAX_DESIGNS];
     int ndesigns_ = 0;
-    std::unique_ptr<I8Ctx> ctx_[Q4NX_MAX_DESIGNS];
-    // M=16 decode twins of the same roles (empty/skipped where no ELF or no legal
-    // geometry).  Index-aligned with designs_/ctx_ so ctx_for() can pair them.
+    // M=16 decode twins of the same roles (empty/skipped where no ELF or no legal geometry).  The geometry
+    // stays here because the model needs it (max_batch_rows, the layer loop's row count); the contexts
+    // themselves live in the target.
     Q4nxDesignGeom designs16_[Q4NX_MAX_DESIGNS];
-    std::unique_ptr<I8Ctx> ctx16_[Q4NX_MAX_DESIGNS];
-    bool m16_ = false;          // at least one role has a working twin
-    bool m16_check_ = false;    // NPU_M16_CHECK=1: cross-check every decode launch
     // Weight image "pb16i" (container config q4nx_weight_layout): the decode family
     // reads sidecar images instead of packing int8 from the f32 weights, so no
     // f32 weight buffer is needed for a covered projection at all.  pb16i_dir_ is
@@ -398,11 +299,21 @@ private:
     // hw_contexts.  Config `q4nx_pb16i_sealed_elf` names it in the kernels dir; without
     // it the per-role `_pb16i.elf` files are used as before.
     std::string pb16i_sealed_;
+    // ---- the NPU target (engine#799 P4) ----
+    // Everything that talks to a device lives behind this: the ELF contexts (M=128 prefill and the M=16
+    // decode twin), the phase-selected launch, the packed-weight BO cache, the pb16i sidecar images, the
+    // Hadamard fold of the activation, the M=16 bit-equality gate and the NPU_PROFILE accumulators.
+    // A1 keeps the design table and the container parsing here; A2 (docs/npu-p4-target-split.md) hands the
+    // target a plan instead.  `pb16i_dir_` above stays because the lm head's own images are named from it.
+    std::unique_ptr<npu::target::xdna::XdnaTarget> xd_;
     // plan.json (engine #799 P1), when the model directory carries one.  It states the three things
     // this class used to decide by looking at which files exist in --kernels: fused gate/up, the
     // artifact family (""/_b8/_pb16i), and where the M=16 decode twins live.  Absent = the legacy
     // probes below, unchanged -- that is what makes the plan additive.  plan_path_ is kept for the
     // refusals, which name the plan that asked for a kernel that is not there.
+    //
+    // P4 (this branch) hands the same plan to the target: XdnaTarget::open(plan, dir) checks the
+    // geometry it was given against it, so a plan and a launch layer cannot disagree silently.
     onebit::npu::plan::Plan plan_;
     std::string plan_path_;
     // attention.mode from the plan: a noncausal pack's full-attention layers see the whole prompt, so a
@@ -412,41 +323,6 @@ private:
     // The refusal for a kernel a design needs but the directory does not have.  With a plan it names
     // the plan file and the role, so "which description asked for this" needs no log reading.
     std::string missing_kernel(const std::string& dir, const char* elf_name, Q4nxDesign role) const;
-    //  [[hadamard]]
-    // The PTQ1 fold: a folded container's weights are W_true rotated by a block-`had_block_`
-    // normalized Hadamard with a per-input-width sign vector, so an activation entering one of
-    // those GEMMs is rotated first, A' = H (A . s).  Config key `q4nx_hadamard` names the binary
-    // sign table (magic "HAD1", u32 count, count x (u32 width, u32 offset), f32 signs).
-    bool hadamard_ = false;
-    int had_block_ = 1024;
-    std::vector<float> had_buf_;
-    double had_ms_ = 0.0;      // host cost of the rotation, accumulated for the profile line
-    long had_n_ = 0;
-    std::unordered_map<int, std::vector<float>> had_signs_;   // input width -> signs
-    // Full-attention QKV as pb16i: the one 14336-wide fused launch has no kernel
-    // (its int64 q needs 448 columns per core), so it runs as the two q halves plus
-    // k and v -- the four launches the arena measured at 1.49 ms per layer.
-    int i_qhalf_ = -1, i_kv_ = -1;
-    // The lm head is not a PTQ1_0 tensor (the container stores it I8), so it has no
-    // pb16i image and keeps an int8 context of its own: the M=16 twin of the widest
-    // K=H design when one is on disk, else the M=128 ELF.  Without this, a pb16i
-    // container ran the head on the M=128 kernel and paid 30 ms a launch (~0.55 s a
-    // token, measured 2026-10-31 08:00).
-    std::unique_ptr<I8Ctx> ctx_head_;
-    int32_t m16_worst_ = 0;     // worst int32 maxdiff seen by the check
-    long m16_bad_ = 0, m16_checked_ = 0;
-    std::vector<int32_t> m16_ref_;   // reference C row, reused per check
-    bool prof_ = false;              // NPU_PROFILE=1
-    ProfAcc prof_dec_[Q4NX_MAX_DESIGNS], prof_pre_[Q4NX_MAX_DESIGNS];
-    // The lm head has no design of its own (it borrows a K=H geometry and, under pb16i, an
-    // int8 context of its own), so it gets its own row: attributing it to a design put
-    // 15-16 launches of ~27 ms into the G row and made any per-role budget wrong by 0.4 s.
-    ProfAcc prof_head_;
-    int     prof_head_M_ = 0;
-    long prof_dec_n_ = 0;            // decode launches (dispatches/token)
-    long prof_pre_n_ = 0;
-    long prof_tok_n_ = 0;
-    int  prof_tick_ = 0;
     // Index of the design playing a role, or -1 when the model has no such
     // kernel (e.g. GU is absent on split models, G/U absent on fused ones).
     int idx_of(Q4nxDesign role) const;
@@ -548,15 +424,7 @@ private:
     // ~8 min/token on the 8B, which makes a served answer impractical.  Only
     // token-INVARIANT weights may be cached (dense projections, GDN, MLA, the
     // shared expert); routed-expert weights vary per token and pass wkey < 0.
-    struct PackedWeight {
-        std::unique_ptr<xrt::bo> bo;
-        std::vector<float>       scales;
-        // pb16i: the sidecar's host side table.  Empty eref = an int8 pack.
-        std::vector<int16_t>     eref;
-        int                      pb16i_mode = 0;
-    };
-    std::vector<std::unordered_map<int, PackedWeight>> wcache_;   // [layer][wkey]
-    bool weight_cache_ = true;    // NPU_NO_WCACHE=1 disables (A/B)
+    using PackedWeight = npu::target::xdna::PackedWeight;
     // Skip the per-token re-dequant of a layer's dense FFN tail once its packed
     // weights are resident (see ffn_tail_cached()).  -1 asks
     // ffn_cache_default(), which is on for a GDN model on the NPU route; init
@@ -569,8 +437,9 @@ private:
     // (lm_head_tiles_, 5.35 GB) are both dead on the NPU path and are released.
     std::vector<PackedWeight> lm_head_packed_;
     int                       lm_head_packed_T_ = 0;
-    // gemv family: the head's tile stream is the whole image in one BO, copied once.
-    std::vector<uint8_t>      gemv_blob_;   // one design's tile stream, reused per upload
+    // gemv family: the head's tile stream is the whole image in one BO, copied once.  (The per-projection
+    // tile image is not kept here: the target asks for it on a residency miss and uploads it straight into
+    // the weight BO.)
     std::vector<uint8_t>      gemv_head_;
     // The plan's resolved decode directories, when it names any. The head ELF lives in the same place as
     // the projections' ELFs, so it is looked for there rather than in the built-in guesses only.

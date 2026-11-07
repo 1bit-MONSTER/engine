@@ -25,12 +25,15 @@
 # gate's job (hw-gate.yml), so this log never shows private source.
 #
 # Cost: $0 Actions spend. It is a self-hosted job on the box's engine runner, never a hosted one.
-# The build tree persists under ~/.cache/hrx-build on the box and llama_hrx is BUILD_ALWAYS, so a
+# The build tree persists under ~/.cache/hrx-build/bench on the box and llama_hrx is BUILD_ALWAYS, so a
 # PR rebuilds what it changed; a pin bump pays the full build once. It runs on the build's own
 # inputs only (the paths below), not on every PR.
 #
-# Runner: [self-hosted, strixhalo, pr-agent], the runner hw-gate.yml uses: it has TheRock at
-# /opt/rocm-therock (cmake/hrx.cmake's default without a fetched SDK) and runs one job at a time, so the persistent tree is never shared by two runs.
+# Runner: [self-hosted, strixhalo, bench], the box's bench runner, not the pr-agent one: a cold build
+# holds its runner for a while, and on the pr-agent runner it queued every PR-Agent review behind it
+# (engine#1077; owner 2026-11-06: move it to bench). Same box, so TheRock at /opt/rocm-therock
+# (cmake/hrx.cmake's default without a fetched SDK). The runner runs one job at a time, and the tree
+# is its own (~/.cache/hrx-build/bench), so no two runs share a tree.
 # The build runs under ~/lb/thermal-run.sh (4 cores, paused at 78 C) like every build on the box.
 # Fork PRs never reach the box: the `if:` requires the head repository to be this one.
 name: hrx-build
@@ -54,7 +57,7 @@ permissions:
 
 jobs:
   hrx_build:
-    runs-on: [self-hosted, strixhalo, pr-agent]
+    runs-on: [self-hosted, strixhalo, bench]
     if: |
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -76,7 +79,7 @@ jobs:
           git -c protocol.version=2 submodule update --init --depth 1 third_party/llama.cpp third_party/hrx-system
           git submodule status -- third_party/llama.cpp third_party/hrx-system
           # outside the checkout, which actions/checkout cleans: the tree persists across runs
-          echo "HRX_BUILD=$HOME/.cache/hrx-build/engine" >> "$GITHUB_ENV"
+          echo "HRX_BUILD=$HOME/.cache/hrx-build/bench" >> "$GITHUB_ENV"
 
       - name: Configure with ONEBIT_HRX=ON
         run: |

@@ -100,6 +100,13 @@ bool ModelTable::parse(const std::string& json_text, const std::string& base_dir
                 row.args.push_back(a.get<std::string>());
             }
         }
+        if (r.contains("bin")) {
+            if (!r["bin"].is_string() || r["bin"].get<std::string>().empty()) {
+                err = "model table: class \"" + cls + "\": \"bin\" is the path of a 1bit binary";
+                return false;
+            }
+            row.bin = resolve_path(r["bin"].get<std::string>(), base_dir);
+        }
         rows.emplace_back(cls, std::move(row));
     }
     for (const auto& [cls, desc] : classes) {
@@ -114,7 +121,7 @@ bool ModelTable::parse(const std::string& json_text, const std::string& base_dir
         for (size_t b = a + 1; b < rows.size(); ++b)
             if (rows[a].second.alias == rows[b].second.alias &&
                 (rows[a].second.model != rows[b].second.model || rows[a].second.device != rows[b].second.device ||
-                 rows[a].second.args != rows[b].second.args)) {
+                 rows[a].second.args != rows[b].second.args || rows[a].second.bin != rows[b].second.bin)) {
                 err = "model table: classes \"" + rows[a].first + "\" and \"" + rows[b].first +
                       "\" name different backends with one alias \"" + rows[a].second.alias + "\"";
                 return false;
@@ -175,7 +182,7 @@ const ModelRow* ModelTable::by_alias(const std::string& name) const {
 }
 
 static bool same_backend(const ModelRow& a, const ModelRow& b) {
-    return a.model == b.model && a.device == b.device && a.args == b.args;
+    return a.model == b.model && a.device == b.device && a.args == b.args && a.bin == b.bin;
 }
 
 std::vector<ModelRow> ModelTable::backends() const {

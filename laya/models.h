@@ -34,6 +34,7 @@ struct ModelRow {
     std::string device;              // npu, hrx, cpu or hybrid: passed to the row's `1bit serve --device`
     std::string alias;               // the name replies carry; a request naming it skips Laya
     std::vector<std::string> args;   // extra `1bit serve` arguments for this row
+    std::string bin;                 // the `1bit` binary that serves this row ("" = this one), e.g. a release build
 };
 
 struct ModelTable {

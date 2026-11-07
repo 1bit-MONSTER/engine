@@ -1824,10 +1824,11 @@ int serve_models(const Options& o) {
     std::vector<Backend> backends;
     for (const auto& r : rows) {
         if (!fs::exists(r.model)) throw std::runtime_error("--laya-models: " + r.alias + ": no such model " + r.model);
+        if (!r.bin.empty() && !fs::exists(r.bin)) throw std::runtime_error("--laya-models: " + r.alias + ": no such binary " + r.bin);
         Backend b;
         b.row = r;
         b.port = free_port();
-        b.argv = {self, "serve", "-m", r.model, "--device", r.device, "--port", std::to_string(b.port),
+        b.argv = {r.bin.empty() ? self : r.bin, "serve", "-m", r.model, "--device", r.device, "--port", std::to_string(b.port),
                   "--host", "127.0.0.1", "--alias", r.alias};
         b.argv.insert(b.argv.end(), r.args.begin(), r.args.end());
         backends.push_back(std::move(b));
@@ -2007,7 +2008,8 @@ int serve_models(const Options& o) {
     ::sigaction(SIGINT, &sa, nullptr);
     auto line = [&metrics](const std::string& l) { metrics.backend_line(l); };
     for (const auto& b : backends) {
-        std::fprintf(stderr, "1bit serve: laya-models: starting %s on %s (port %d)\n", b.row.alias.c_str(), b.row.device.c_str(), b.port);
+        std::fprintf(stderr, "1bit serve: laya-models: starting %s on %s (port %d%s%s)\n", b.row.alias.c_str(), b.row.device.c_str(),
+                     b.port, b.row.bin.empty() ? "" : ", ", b.row.bin.c_str());
         children.push_back(std::make_unique<Child>(b.argv, std::vector<std::string>{}, b.port, "/health", line));
     }
     for (size_t i = 0; i < children.size(); ++i)

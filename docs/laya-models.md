@@ -61,6 +61,7 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
 | `classes.<c>.device` | `npu`, `hrx`, `cpu` or `hybrid`, passed to the row's `1bit serve --device` |
 | `classes.<c>.alias` | the name replies carry (default: the file name); a request naming it skips Laya |
 | `classes.<c>.args` | extra `1bit serve` arguments for that row |
+| `classes.<c>.bin` | optional: the `1bit` binary that serves that row (default: this one), e.g. a release build that carries the sealed NPU kernels while this one is a source build |
 
 Every class needs a row, and every row a class; an unknown device, a missing model file, or one alias for
 two different backends is refused by name at start. Two classes may name the same model, device and args:

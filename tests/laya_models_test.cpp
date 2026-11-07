@@ -34,8 +34,8 @@ const char* kTable = R"({
  "size_gate": {"chars": 100, "class": "plan"},
  "classes": {
   "reflex": {"model": "small.gguf", "device": "npu", "alias": "small"},
-  "plan": {"model": "/abs/big.gguf", "device": "hrx", "args": ["--ctx-size", "4096"]},
-  "chat": {"model": "/abs/big.gguf", "device": "hrx", "args": ["--ctx-size", "4096"]}
+  "plan": {"model": "/abs/big.gguf", "device": "hrx", "args": ["--ctx-size", "4096"], "bin": "rel/1bit"},
+  "chat": {"model": "/abs/big.gguf", "device": "hrx", "args": ["--ctx-size", "4096"], "bin": "rel/1bit"}
  }})";
 
 bool refuses(const std::string& text, const std::string& needle) {
@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
                                                t.backend_index(t.pick("plan", 1.f)) == t.backend_index(t.pick("chat", 1.f)));
     check("row_for is the class's own row", t.row_for("reflex") && t.row_for("reflex")->device == "npu" && !t.row_for("x"));
     check("size_gated by length", t.size_gated(std::string(100, 'a')) && !t.size_gated(std::string(99, 'a')));
+    check("bin resolves against the table dir", t.pick("plan", 1.f).bin == "/base/rel/1bit" && t.pick("reflex", 1.f).bin.empty());
     check("size gate read", t.size_gate_chars == 100 && t.size_gate_class == "plan");
 
     check("refuses one class", refuses(R"({"question":{"instructions":"x","classes":{"a":"d"}},"classes":{"a":{"model":"m","device":"hrx"}}})",
@@ -83,6 +84,9 @@ int main(int argc, char** argv) {
     check("refuses an unknown default",
           refuses(R"({"question":{"instructions":"x","classes":{"a":"d","b":"e"}},"default":"z","classes":{"a":{"model":"m","device":"hrx"},"b":{"model":"m","device":"hrx"}}})",
                   "\"default\""));
+    check("refuses an empty bin",
+          refuses(R"({"question":{"instructions":"x","classes":{"a":"d","b":"e"}},"classes":{"a":{"model":"m","device":"hrx","bin":""},"b":{"model":"m","device":"hrx"}}})",
+                  "\"bin\""));
     check("refuses one alias for two backends",
           refuses(R"({"question":{"instructions":"x","classes":{"a":"d","b":"e"}},"classes":{"a":{"model":"m","device":"hrx","alias":"s"},"b":{"model":"n","device":"npu","alias":"s"}}})",
                   "one alias"));

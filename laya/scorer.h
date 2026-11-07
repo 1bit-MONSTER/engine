@@ -61,6 +61,14 @@ struct Answer {
 struct RawOutput {
     std::vector<std::vector<float>> logits;      // per question, per marker (masked = -1e4)
     std::vector<std::vector<float>> act_logits;  // per question, 2 entries
+    // Set keep_encoder to also get the decision head's input: per question, the encoder output after the
+    // final norm (its own length x d floats, no padding), the option marker positions and the question type.
+    // `1bit route --dump-encoder` writes these for a head-only fine-tune.
+    bool keep_encoder = false;
+    int d = 0;
+    std::vector<std::vector<float>> encoder;
+    std::vector<std::vector<int>> markers;
+    std::vector<int> qtype;
 };
 
 class Scorer {

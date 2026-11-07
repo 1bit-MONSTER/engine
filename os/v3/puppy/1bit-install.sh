@@ -273,6 +273,41 @@ efibootmgr -o "$new${rest:+,$rest}" >> "$LOG" 2>&1 || fail "efibootmgr could not
 efibootmgr -n "$new" >> "$LOG" 2>&1 || true
 say "   Boot$new = 1bit OS on $dev, first in BootOrder, BootNext"
 
+# engine#709: entries the firmware will walk BEFORE ours, whose partition is gone. The issue was filed from the first real
+# install: the wiped Ubuntu's `\EFI\ubuntu\shimx64.efi` entry survived, the firmware tried it, failed, and fell through to
+# the stick. Step 7 pushed it down the order and left it, so it was still there to fail on the next boot.
+#
+# What is safe to remove is decided by the firmware's own device path, not by a label: `efibootmgr -v` prints
+# HD(<part>,GPT,<partition-guid>,...) for a GPT entry, and that GUID either exists in a partition table attached right now or
+# it does not. A GUID that exists nowhere is a DANGLING entry - its partition was deleted, by this install or by whoever wiped
+# the disk - and the firmware can only fail through it. Entries without a parseable GUID are left alone, and so is the one we
+# just created: this removes proof, not guesses. (A reinstall is the common case: sfdisk gives the new ESP a new GUID, so the
+# previous install's own entry is dangling too.)
+partguids=$(blkid 2> /dev/null | sed -n 's/.*PARTUUID="\([^"]*\)".*/\1/p' | tr 'A-F' 'a-f')
+fwf=$(efibootmgr -v 2> /dev/null)
+dangling=''
+for id in $(printf '%s\n' "$fwf" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*.*HD([0-9]*,GPT,\([0-9a-fA-F-]\{36\}\),.*/\1/p'); do
+    [ "$id" = "$new" ] && continue
+    guid=$(printf '%s\n' "$fwf" | sed -n "s/^Boot$id\*.*HD([0-9]*,GPT,\([0-9a-fA-F-]\{36\}\),.*/\1/p" | head -1 | tr 'A-F' 'a-f')
+    [ -n "$guid" ] || continue
+    printf '%s\n' "$partguids" | grep -qx "$guid" && continue   # its partition is still here: not ours to touch
+    efibootmgr -b "$id" -B >> "$LOG" 2>&1 && dangling="$dangling $id"
+done
+if [ -n "$dangling" ]; then
+    say "   removed dangling firmware entr(y/ies), partition no longer exists:$dangling"
+else
+    say "   no dangling firmware entries to remove"
+fi
+
+# engine#709: print the order the firmware will actually walk, with labels - not just our own id. This is what a person reads
+# to believe the machine will come up, and it is also what the install gate compares against.
+fwf=$(efibootmgr 2> /dev/null)
+say "   firmware boot order now:"
+printf '%s\n' "$fwf" | sed -n 's/^BootOrder: //p' | head -1 | tr ',' '\n' | while read -r id; do
+    [ -n "$id" ] || continue
+    printf '%s\n' "$fwf" | sed -n "s/^Boot$id\* /      $id  /p" | head -1
+done
+
 say ""
 say "INSTALLED: 1bit OS on $dev (ESP $ESP_LABEL, data $DATA_LABEL, UUID=$datauuid)"
 say "  persistent: /1bit/$save_name is this machine's writable root (PUPMODE=12), SFS mounted from the disk"

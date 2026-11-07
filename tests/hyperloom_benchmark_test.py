@@ -52,6 +52,18 @@ def main():
     assert prompt == bench.long_prompt(18800)
     assert len(bench.long_prompt(512)) < len(prompt)
 
+    # The score's unit has to name BOTH dimensions that set its value: the context, and the number of tokens
+    # the decode actually produced (its denominator -- not the number requested, because the model can stop at
+    # EOS first). Measured on this box 2026-11-07: 13.3986 tok/s over 128 decoded tokens and 14.1784 over 278,
+    # both carrying the same unit string, so the two rows read as the same measurement. (engine#1268)
+    assert bench.decode_unit(18762) == "tok/s (decode at 18762-token ctx)", bench.decode_unit(18762)
+    assert bench.decode_unit(18762, 128) == "tok/s (decode at 18762-token ctx, 128 decoded)", \
+        bench.decode_unit(18762, 128)
+    # The regression itself: two rows whose denominators differ must not serialise to the same unit.
+    assert bench.decode_unit(18762, 128) != bench.decode_unit(18762, 278)
+    # An unknown decode count must not fabricate "0 decoded" or a KeyError.
+    assert bench.decode_unit(18762, None) == bench.decode_unit(18762)
+
     # Score: the long leg replaces the geomean when it ran...
     tps = {"code": 28.0, "prose": 16.0, "short": 17.0, "long": 12.67}
     assert bench.score_of(400.0, 12.0, tps, 18800) == 12.67

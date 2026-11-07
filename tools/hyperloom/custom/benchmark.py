@@ -239,6 +239,25 @@ def longctx_exceeds_serve_ctx():
     return bool(longctx) and longctx + env_int("HL_LONGTOK", 128) > serve_ctx()
 
 
+def decode_unit(ctx_actual, decoded=None):
+    """The score's unit, naming **both** dimensions that change the number.
+
+    A long-context result's score is a decode rate, so two things set its value: the context the server
+    actually prefilled, and **the number of tokens the decode actually produced** -- that count is the
+    score's own denominator, and it is not the number the caller asked for, because the model can stop at
+    EOS first. Measured on this box 2026-11-07: the same lever and the same configuration gave 13.3986
+    tok/s over 128 decoded tokens and 14.1784 over 278 (`HL_LONGTOK=512` requested, 278 produced), and
+    both rows carried the **identical** unit string `tok/s (decode at 18762-token ctx)`. A reader -- or a
+    scoreboard -- comparing those two numbers had nothing in the unit to say their denominators differed
+    by more than 2x. Naming one dimension and not the other is how a rate becomes silently ambiguous.
+
+    One definition, used both for the pre-measurement placeholder and for the measured result, so the two
+    cannot drift apart the way the README and the gate did in engine#769.
+    """
+    base = f"tok/s (decode at {ctx_actual}-token ctx"
+    return f"{base}, {decoded} decoded)" if decoded else f"{base})"
+
+
 def serve_lever_args():
     """The levers that only `1bit serve` has: drafting and slots.
 
@@ -822,7 +841,7 @@ def main():
         "framework": "custom",
         "workload_kind": "scriptable",
         "model_id": f"{model.name} (HRX0, gfx1151)",
-        "throughput_unit": (f"tok/s (decode at {longctx}-token ctx)" if longctx
+        "throughput_unit": (decode_unit(longctx) if longctx
                             else "tok/s (geomean of pp512, tg128, serve code)"),
         "output_throughput": 0.0,
         "total_token_throughput": 0.0,
@@ -878,8 +897,11 @@ def main():
         result["bench_summary"]["longctx"] = {k: (round(v, 2) if isinstance(v, float) else v)
                                               for k, v in long_info.items()}
         if long_info.get("ctx_tokens_actual"):
-            # Label the unit with the context the server actually saw, not the one we asked for.
-            result["throughput_unit"] = f"tok/s (decode at {long_info['ctx_tokens_actual']}-token ctx)"
+            # Label the unit with the context the server actually saw, not the one we asked for, **and** with
+            # the decoded token count, because that count is the score's denominator and differs from the
+            # requested one whenever the model stops at EOS first (engine#1268).
+            result["throughput_unit"] = decode_unit(long_info["ctx_tokens_actual"],
+                                                   long_info.get("decode_tokens"))
     result["total_token_throughput"] = round(tps["long"] if longctx else tps["code"], 2)
     result["request_throughput"] = round(result["total_token_throughput"] / tokens, 4)
 

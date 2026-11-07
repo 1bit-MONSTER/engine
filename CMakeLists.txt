@@ -612,6 +612,7 @@ if(Python3_Interpreter_FOUND)
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.
     add_test(NAME q4nx_dir_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_q4nx_dir.py --self-test)
+    add_test(NAME trit_embed_pack COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/trit_embed_pack_test.py)
     # the FFN row/block sparsity measurements (docs/npu.md, "FFN row sparsity"): a synthetic GGUF and
     # a synthetic capture, so the byte budget and the capture arithmetic are gated without a model
     add_test(NAME ffn_sparsity COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ffn_sparsity.py --self-test)
@@ -762,6 +763,22 @@ add_test(NAME npu_queue COMMAND npu_queue_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_queue_test)
+
+# 1-bit sentence embeddings (engine#1311): the container the importer writes and the encoder that reads it.
+# Device-free on a tiny fixture -- the real model's gate (min cosine 0.9997 vs the reference on 1,000
+# sentences) needs the 13.9 MB container and stays a measured row in the PR.
+add_executable(embed_model_test tests/embed_model_test.cpp app/embed_model.cpp)
+target_include_directories(embed_model_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_link_libraries(embed_model_test PRIVATE nlohmann_json::nlohmann_json)
+target_compile_definitions(embed_model_test PRIVATE SRC_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME embed_model COMMAND embed_model_test)
+# The WordPiece pipeline an embedding model's ids depend on (cleaning, lowercase, accents, punctuation, CJK,
+# "##" continuations, [CLS]/[SEP], truncation). Device-free.
+add_executable(embed_wordpiece_test tests/embed_wordpiece_test.cpp)
+target_include_directories(embed_wordpiece_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+add_test(NAME embed_wordpiece COMMAND embed_wordpiece_test)
+add_dependencies(npu_sampling_test embed_model_test)
+add_dependencies(npu_sampling_test embed_wordpiece_test)
 
 # `forward-serve`'s /v1/completions prompt as text or as the caller's exact token ids (app/npu_prompt_ids.h):
 # the acceptance rules and the refusals that keep an out-of-vocabulary id from reaching the embedding

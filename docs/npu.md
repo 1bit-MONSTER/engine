@@ -163,6 +163,52 @@ too), a sliding layer stays causal, and the mode reads the same numbers only in 
 An unknown mode string is a plan refusal, never a default: the two modes give different numbers, and a
 guessed mask is a different model.
 
+### Sentence embeddings (1-bit encoder containers)
+
+`1bit` serves a small BERT-family encoder as **sentence embeddings**: 384-dim unit vectors, mean-pooled over the
+tokens, from a container the importer writes (`tools/trit_embed_pack.py`). The first model is
+**Cyronius/trit-embed-3l** (MIT; see NOTICE): 3 post-norm BERT layers, width 384, 12 heads, FFN 1536, WordPiece
+vocabulary 30522, at most 128 tokens.
+
+**Why the container is not a q4nx one.** A q4nx quantised tensor is a grid of 32x256 chunks, and this model's
+rows are 384/1536 wide with **one scale per output row** and 2-bit ternary weights. Tiling them would pad K to
+512 and re-round the scale into per-128-block fp16, which moves numbers the correctness gate compares exactly.
+The importer therefore widens the ternary codes {-1,0,+1} to **int8** (the value is unchanged; XDNA2 has no
+ternary datapath, which is why the widening is the format's job and not the kernel's) and keeps the model's own
+per-row scale in f32. `model.embed` holds a 16 KiB JSON header and the tensor payload it names:
+
+| tensor | dtype | shape | meaning |
+|---|---|---|---|
+| `<layer>.{q,k,v,o,fc1,fc2}.weight` | `i8` | [N, K] | ternary codes widened to int8, values in {-1, 0, +1} |
+| `<layer>.*.scale` | `f32` | [N] | one scale per output row: `w = code * scale` |
+| `<layer>.*.bias`, `ln1.*`, `ln2.*`, `ln_e.*` | `f32` | [width] | biases and LayerNorm parameters |
+| `word.qweight`, `pos.qweight` | `i8` | [rows, 384] | int8 embedding tables |
+| `word.scale`, `pos.scale` | `f32` | [rows] | one scale per embedding row |
+| `tok_type.weight` | `f32` | [2, 384] | the token-type embedding (row 0 is used) |
+| `out.weight` | `f32` | [384, 384] | the output projection applied after pooling |
+
+**The forward is the reference's arithmetic, not an approximation of it.** Every ternary linear sees an
+**int8 activation with a power-of-two scale per token** (per 256-channel block when the width is a multiple of
+256 and wider), rounded half to even, clamped to ±127 and dequantised — because the model was trained that way,
+and a float activation would move the vectors off the gate. Layers are post-norm: `LN_e` on the embedding sum,
+then per layer attention over q/k/v with `LN1` on the residual and a GELU(tanh) FFN with `LN2` on the residual.
+Then masked mean pooling, the output projection, and L2.
+
+**The tokenizer is the contract, so it is the reference's `BertTokenizer` pipeline**: clean (control characters
+and NUL/0xFFFD dropped, whitespace to single spaces), one token per CJK character, lowercase, strip accents,
+split punctuation, then greedy longest-match WordPiece with `##` continuations, and `[UNK]` for a word whose
+*first* piece cannot be matched. `[CLS]`/`[SEP]` frame the ids and truncation counts both. Unicode work is
+table-driven (ASCII, Latin-1, Latin Extended-A, the common punctuation blocks, the CJK ranges); measured on the
+2,552 distinct STS-B test sentences the ids are **identical to the reference tokenizer's, 0 mismatches**.
+
+**Correctness, as measured** (`tests/trit_embed_pack_test.py` and the rows in engine#1311): the importer's
+ternary decode is *exactly* the reference's `codes * scale` (worst |Δw| 0, not a tolerance), and the encoder's
+vectors against the model's own `trit_embed.py` on 1,000 fixed sentences have **min cosine 0.9997** (mean
+0.99999); on STS-B the C++ forward scores within 0.3 of the model card's 82.87.
+
+The NPU runs the same math with its int8 GEMM in place of the per-row dot product; that path is engine#1311's
+second step and not part of this container's description.
+
 ### Q4NX chunks
 
 Q4NX is [FastFlowLM](https://github.com/ROCm/FastFlowLM)'s NPU model format (MIT), and its models on

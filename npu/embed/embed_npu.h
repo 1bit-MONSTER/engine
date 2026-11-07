@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,23 +59,60 @@ public:
         };
     }
 
-    bool used_device() const { return launches_ > 0 && !failed_; }
-    std::string status() const { return status_; }
-    long launches() const { return launches_; }
+    // Build every transposed weight block ONCE, before any request can run. A served route answers from
+    // cpp-httplib's worker pool, so a lazily filled cache shared by those threads is a data race: the first
+    // concurrent burst after start could insert into the map from two threads (UB) or launch with a block that
+    // another thread had sized but not yet filled -- a silently wrong embedding, which is the one failure this
+    // route must never have. Preparing here makes the map read-only for the life of the process; `m_` then
+    // covers the counters below and keeps two launches from interleaving their host-side scaling.
+    bool prepare(const Model& m, std::string& why) {
+        std::lock_guard<std::mutex> g(m_);
+        for (const Layer& L : m.layers()) {
+            for (const Tern* t : {&L.q, &L.k, &L.v, &L.o, &L.fc1, &L.fc2}) {
+                const int blocks = t->k > 256 && t->k % 256 == 0 ? t->k / 256 : 1;
+                const int block = blocks == 1 ? t->k : 256;
+                for (int b = 0; b < blocks; ++b) {
+                    auto& dst = bt_[{t, b * block}];
+                    dst.resize(size_t(block) * t->n);
+                    for (int n = 0; n < t->n; ++n)
+                        for (int i = 0; i < block; ++i)
+                            dst[size_t(i) * t->n + n] = t->code[size_t(n) * t->k + b * block + i];
+                }
+            }
+        }
+        prepared_ = !bt_.empty();
+        if (!prepared_) why = "npu gemm: the model has no ternary linears to pack";
+        return prepared_;
+    }
+
+    bool used_device() const { return launches() > 0 && !failed(); }
+    std::string status() const {
+        std::lock_guard<std::mutex> g(m_);
+        return status_;
+    }
+    long launches() const {
+        std::lock_guard<std::mutex> g(m_);
+        return launches_;
+    }
+    bool failed() const {
+        std::lock_guard<std::mutex> g(m_);
+        return failed_;
+    }
 
 private:
-    // codes transposed to the kernel's [k][n] row-major, once per (weight, k-block)
-    const std::vector<int8_t>& weight(const Tern& t, int k0, int k) {
-        auto& b = bt_[{&t, k0}];
-        if (b.empty()) {
-            b.resize(size_t(k) * t.n);
-            for (int n = 0; n < t.n; ++n)
-                for (int i = 0; i < k; ++i) b[size_t(i) * t.n + n] = t.code[size_t(n) * t.k + k0 + i];
-        }
-        return b;
+    // codes transposed to the kernel's [k][n] row-major, one entry per (weight, k-block). Filled by prepare()
+    // only; a miss here means prepare() was skipped, which is a programming error and is reported as one.
+    const std::vector<int8_t>* weight(const Tern& t, int k0) const {
+        const auto it = bt_.find({&t, k0});
+        return it == bt_.end() ? nullptr : &it->second;
     }
 
     bool run(const Tern& t, const Quantised& q, std::vector<float>& x, int rows, std::string& why) {
+        std::lock_guard<std::mutex> g(m_);
+        if (!prepared_) {
+            why = "npu gemm: prepare() was not called before the first request";
+            return false;
+        }
         if (rows <= 0 || rows > 128) {  // the design's M; a longer prompt is refused, never truncated
             why = "npu gemm: " + std::to_string(rows) + " rows does not fit the 128-row design";
             return false;
@@ -95,7 +133,12 @@ private:
                                 a_block.data() + size_t(r) * q.block);
                 a = a_block.data();
             }
-            if (!onebit::npu::gemm_q8_raw(a, rows, q.block, t.n, weight(t, b * q.block, q.block).data(), c.data(), &why)) {
+            const std::vector<int8_t>* w = weight(t, b * q.block);
+            if (!w) {
+                why = "npu gemm: no packed weight for this linear (prepare() did not cover it)";
+                return false;
+            }
+            if (!onebit::npu::gemm_q8_raw(a, rows, q.block, t.n, w->data(), c.data(), &why)) {
                 failed_ = true;
                 status_ = why;
                 return false;
@@ -114,6 +157,8 @@ private:
     }
 
     std::map<std::pair<const Tern*, int>, std::vector<int8_t>> bt_;
+    bool prepared_ = false;
+    mutable std::mutex m_;   // counters, status, and the launch sequence (bt_ is read-only after prepare)
     long launches_ = 0;
     bool failed_ = false;
     std::string status_;

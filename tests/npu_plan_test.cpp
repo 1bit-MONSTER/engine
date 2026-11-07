@@ -360,11 +360,122 @@ void test_kv() {
     }
 }
 
+// ---- designs: the per-role kernel set the plan may name (engine#803 A2) ----
+//
+// Two halves, both device-free: the loader accepts and rejects the section by field, and
+// designs_agree() is the comparison the forward runs against what the container derives.
+void test_designs() {
+    auto with_designs = [](bool second) {
+        auto p = base_plan();
+        p["designs"] = nlohmann::json::array();
+        p["designs"].push_back({{"role", "QKV"}, {"M", 128}, {"K", 1024}, {"N", 2048},
+                                {"elf", "full_i8_QKV_K1024_N2048.elf"}});
+        if (second)
+            p["designs"].push_back({{"role", "O"}, {"M", 128}, {"K", 2048}, {"N", 1024},
+                                    {"elf", "full_i8_O_K2048_N1024.elf"}});
+        return p;
+    };
+    const Plan p = Plan::load(write_plan("designs2", with_designs(true)));
+    check(p.designs.size() == 2, "designs: two entries parsed");
+    check(p.designs[0].role == "QKV" && p.designs[0].M == 128 && p.designs[0].K == 1024 &&
+              p.designs[0].N == 2048 && p.designs[0].elf == "full_i8_QKV_K1024_N2048.elf",
+          "designs: role/M/K/N/elf are what the plan says");
+
+    // A fresh derived set per case, so a case cannot inherit an earlier mutation.
+    auto derived = [] {
+        return std::vector<Plan::Design>{
+            {"QKV", 128, 1024, 2048, "full_i8_QKV_K1024_N2048.elf"},
+            {"O", 128, 2048, 1024, "full_i8_O_K2048_N1024.elf"},
+        };
+    };
+    std::string why;
+    check(p.designs_agree(derived(), why), "designs: the same set agrees");
+    {
+        auto swapped = derived();
+        std::swap(swapped[0], swapped[1]);
+        check(p.designs_agree(swapped, why), "designs: the comparison is by role, not by position");
+    }
+    // The refusal that matters: same shape, wrong artifact -- the ELF the weights were not written for.
+    {
+        auto d = derived();
+        d[1].elf = "full_i8_O_K2048_N1024_b8.elf";
+        why.clear();
+        check(!p.designs_agree(d, why), "designs: a different artifact is refused");
+        check(has(why, "O") && has(why, "_b8"),
+              "designs: the artifact refusal names the role and the file: " + why);
+    }
+    {
+        auto d = derived();
+        d[1].N = 512;
+        why.clear();
+        check(!p.designs_agree(d, why), "designs: a different geometry is refused");
+        check(has(why, "N=512") && has(why, "N=1024"),
+              "designs: the geometry refusal carries both sides: " + why);
+    }
+    // Both directions: a role the container derives and the plan omits is a kernel the plan would not open.
+    {
+        auto d = derived();
+        d.push_back({"D", 128, 3072, 1024, "full_i8_D_K3072_N1024.elf"});
+        why.clear();
+        check(!p.designs_agree(d, why), "designs: a derived role the plan omits is refused");
+        check(has(why, "D"), "designs: the omission names the role: " + why);
+    }
+
+    // The role tags are NOT unique: a qwen3_5 pack derives an attention QKV and a GDN QKVLIN design,
+    // and both are logged as "QKV".  A role-keyed comparison would compare the wrong pair, so the
+    // agreement is a multiset of (role, M, K, N, elf) and this case is the one that proves it.
+    {
+        auto two_qkv = with_designs(true);
+        two_qkv["designs"] = nlohmann::json::array({
+            {{"role", "QKV"}, {"M", 128}, {"K", 1024}, {"N", 4096}, {"elf", "full_i8_QKV_K1024_N4096.elf"}},
+            {{"role", "QKV"}, {"M", 128}, {"K", 1024}, {"N", 2048}, {"elf", "full_i8_QKVLIN_K1024_N2048.elf"}},
+        });
+        const Plan q = Plan::load(write_plan("twosame", two_qkv));
+        std::string w;
+        check(q.designs_agree({{"QKV", 128, 1024, 4096, "full_i8_QKV_K1024_N4096.elf"},
+                               {"QKV", 128, 1024, 2048, "full_i8_QKVLIN_K1024_N2048.elf"}},
+                              w),
+              "designs: two roles that share a tag are matched as a multiset");
+        // Swapping the geometries must be refused: same role, wrong one-to-one pairing.
+        w.clear();
+        check(!q.designs_agree({{"QKV", 128, 1024, 2048, "full_i8_QKVLIN_K1024_N2048.elf"},
+                                {"QKV", 128, 1024, 4096, "full_i8_QKV_K1024_N4096.elf"},
+                                {"QKV", 128, 1024, 4096, "full_i8_QKV_K1024_N4096.elf"}},
+                               w),
+              "designs: a duplicated geometry cannot stand in for an omitted one");
+    }
+    // No section: the probes' behaviour, and every plan written before the field keeps loading.
+    const Plan plain = Plan::load(write_plan("nodesigns", base_plan()));
+    check(plain.designs.empty(), "designs: an absent section parses to empty");
+    why.clear();
+    check(plain.designs_agree({{"QKV", 128, 1024, 2048, "x.elf"}}, why),
+          "designs: an absent section agrees with anything");
+
+    // Refusals, each naming the field.
+    {
+        auto bad = with_designs(false);
+        bad["designs"][0]["elf"] = "";
+        check(has(refusal(write_plan("dnoelf", bad)), ".elf is empty"), "designs: an empty elf is refused");
+    }
+    {
+        auto bad = with_designs(false);
+        bad["designs"][0]["M"] = 0;
+        check(has(refusal(write_plan("dnom", bad)), "designs[0]"), "designs: a non-positive M is refused by index");
+    }
+    {
+        auto bad = with_designs(false);
+        bad["designs"] = 7;
+        check(has(refusal(write_plan("dnotarray", bad)), "designs is not an array"),
+              "designs: a non-array section is refused");
+    }
+}
+
 int main() {
     test_valid();
     test_kv();
     test_tile_order();
     test_refusals();
+    test_designs();
     std::printf("%s\n", failures ? "FAILED" : "npu_plan: ok");
     return failures ? 1 : 0;
 }

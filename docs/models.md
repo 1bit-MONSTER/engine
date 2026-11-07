@@ -47,3 +47,9 @@ release artifact and is not published yet — [releases.md](releases.md).)
 The organization is a catalogue, not an endorsement list. It holds more repositories than this page has
 measurements for, and publishing a file is not a claim that it runs well here. The rows above are that
 claim; the org is where the bytes come from.
+
+The **Zyphra** family — Zamba2, Zamba v1 and BlackMamba — has its own page, because those files carry a
+conversion property worth knowing before you download one: a Zamba2 GGUF is now the size of its checkpoint
+(the shared block and the per-layer MLP adapters are no longer expanded), the two Zamba2 models changed
+quantization pick as a result, and a quantizer older than that change drops the adapter off HRX. Sizes, picks
+and the `--tensor-type` note are in [zyphra-models.md](zyphra-models.md).

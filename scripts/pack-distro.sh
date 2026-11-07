@@ -39,9 +39,9 @@
 #   PKG_NAME, PKG_SUMMARY, PKG_DESC, PKG_MAINTAINER                (required)
 #   PKG_DEB_DEPENDS, PKG_DEB_RECOMMENDS                            (optional, comma separated)
 #
-# The version is normalized to what every family accepts: a leading "v" goes, and anything outside
-# [A-Za-z0-9._] becomes "." (rpm and pacman refuse "-" in a version, and the weekly's rehearsal tags
-# start with "rc-").
+# The version is normalized to what every family accepts, because the tag a cut carries is not one
+# (scripts/pack-version.sh: rc-2026-11-07-c32 packs as 2026.11.07.c32, and a tag with no digit at all as
+# 0.<tag>). It is the same function scripts/pack-proof.sh uses to find the packages again.
 #
 # deb and tarball are built here. rpm and arch are built in containers (fedora:latest,
 # archlinux:latest): rpmbuild and makepkg are the only correct builders for those two formats and the
@@ -53,16 +53,17 @@ set -euo pipefail
 [ $# -eq 3 ] || { sed -n '16,52p' "$0"; exit 2; }
 fmt=$1 root=$2 out=$3
 repo=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=scripts/pack-version.sh
+. "$(dirname "$0")/pack-version.sh"
 
 need() { [ -n "${!1:-}" ] || { echo "pack-distro.sh: $1 is not set ($2)" >&2; exit 2; }; }
 need PKG_VERSION "the release version"
 [ -d "$root" ] || { echo "pack-distro.sh: no payload tree at $root" >&2; exit 2; }
 [ -n "$(ls -A "$root")" ] || { echo "pack-distro.sh: the payload tree at $root is empty" >&2; exit 2; }
 
-ver=$(printf '%s' "${PKG_VERSION#v}" | sed -e 's/[^A-Za-z0-9._]\+/./g' -e 's/^\.*//' -e 's/\.*$//')
-[[ $ver =~ ^[0-9] ]] || {
-    echo "pack-distro.sh: version '$PKG_VERSION' does not start with a digit even normalized ('$ver'); pass the release's version" >&2
-    exit 2; }
+# the version and how a tag becomes one lives in one place, shared with the proof that looks the
+# packages up by name (scripts/pack-version.sh)
+ver=$(pack_version "$PKG_VERSION") || exit 2
 rel=${PKG_RELEASE:-1}
 
 # The distribution's own filesystem skeleton: its filesystem package owns these paths, so no package

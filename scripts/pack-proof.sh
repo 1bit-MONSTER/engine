@@ -26,7 +26,10 @@
 # family it is for, and the host is left with one temporary directory. Run from the release's package
 # stage (scripts/weekly.sh) or by hand:
 #
-#   scripts/pack-proof.sh <out-dir with the four packages> 2026.45
+#   scripts/pack-proof.sh <out-dir with the four packages> <tag or version>
+#
+# The version is normalized exactly as the packer normalizes it (scripts/pack-version.sh), so the tag a
+# cut carries works here too: rc-2026-11-07-c32 finds 1bit-engine_2026.11.07.c32_amd64.deb.
 #
 # The rows and what each one means:
 #   deb      ubuntu:26.04          apt-get install ./1bit-engine_<version>_amd64.deb
@@ -43,7 +46,9 @@ set -uo pipefail
 
 [ $# -eq 2 ] || { sed -n '16,43p' "$0"; exit 2; }
 dir=$(cd "$1" && pwd) || exit 2
-ver=${2#v}
+# shellcheck source=scripts/pack-version.sh
+. "$(dirname "$0")/pack-version.sh"
+ver=$(pack_version "$2") || exit 2
 deb=1bit-engine_${ver}_amd64.deb
 rpm=1bit-engine-${ver}-1.x86_64.rpm
 arch_pkg=1bit-engine-${ver}-1-x86_64.pkg.tar.zst

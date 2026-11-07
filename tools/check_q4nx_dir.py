@@ -383,6 +383,29 @@ def q4_1_tile_floats(tile, layout):
     return D.decode_flm(tile, 32, 256, signed=(layout == "flm"))
 
 
+def q4_1_names(table):
+    """The container's q4_1 tensors (I8 codes in 5120-byte tiles), in table order."""
+    return [n for n, t in table.items()
+            if isinstance(t, dict) and t.get("dtype") in QUANT
+            and (t.get("shape") or [0])[-1] == Q4_1_TILE]
+
+
+def spread(names, samples):
+    """Evenly spaced names across the whole table, not the first N.
+
+    A foreign converter's order can vary tensor to tensor (measured: the `d1d5232` checkout matches
+    `flm-unsigned` on some tensors and only partially on others), so reading the first three names in
+    table order samples one layer and a bias-free prefix.  Spreading costs the same and covers the
+    model, including the outlier-heavy `down_proj` tensors that sit lowest.
+    """
+    if samples <= 0 or samples >= len(names):
+        return list(names)
+    if samples == 1:
+        return [names[0]]
+    step = (len(names) - 1) / (samples - 1)
+    return [names[int(round(i * step))] for i in range(samples)]
+
+
 def check_q4_1_layout(path, gguf_path, samples=3):
     """(errors, rows): which q4_1 tile order the container's tiles hold, versus the source weights.
 
@@ -393,15 +416,13 @@ def check_q4_1_layout(path, gguf_path, samples=3):
     still a container that would be served as noise.
     """
     table, base, _ = read_header(path)
-    q4 = [n for n, t in table.items()
-          if isinstance(t, dict) and t.get("dtype") in QUANT
-          and (t.get("shape") or [0])[-1] == Q4_1_TILE]
+    q4 = q4_1_names(table)
     if not q4:
         print(f"  {path}: no q4_1 tensors, nothing to check against the source weights")
         return [], []
     errors, rows = [], []
     import numpy as np
-    for name in q4[:samples]:
+    for name in spread(q4, samples):
         want, gguf_name = source_block(gguf_path, name)
         if want is None:
             print(f"  {name}: not in {os.path.basename(gguf_path)}, skipped")
@@ -422,17 +443,42 @@ def check_q4_1_layout(path, gguf_path, samples=3):
                   f"rel-rms {scores[layout][1]:.4f}")
         ours = scores["ours"][0]
         others = max(v[0] for k, v in scores.items() if k != "ours")
-        # Measured on this box: a correct container scores corr +1.0000 (packed from Q4_K) and
-        # +0.9962 (packed from BF16), while every foreign order sits at |corr| <= 0.05. So both
-        # conditions are wide, and neither is a proximity call on real data.
-        if not (ours >= 0.99 and ours - others >= 0.5):
-            closest = max(Q4_1_LAYOUTS, key=lambda k: scores[k][0])
-            errors.append(
-                f"{name}: the q4_1 tiles are NOT in the order npu/q4nx.cpp decodes (ours corr "
-                f"{ours:+.4f} rel-rms {scores['ours'][1]:.4f}, best of the three is {closest} at "
-                f"corr {scores[closest][0]:+.4f}). This container would load and answer as noise "
-                f"(engine#1110): re-pack it with scripts/repack_gguf.py and a converter that writes "
-                f"this engine's tile order")
+        # Decided on the MARGIN, not on an absolute nearness cut. Quantization error is per-tensor:
+        # on a published FastFlowLM directory (the fleet serves it as it is) the order is beyond
+        # doubt at a margin of ~0.95 while `layers.2.mlp.down_proj` -- outlier-heavy, packed from a
+        # different source -- reads corr only +0.9890, so an absolute >= 0.99 floor refuses a good
+        # container and then says "NOT in the order, best is ours", which contradicts itself. The
+        # margin is what identifies an order: >= 0.95 on every correct container measured here, and
+        # <= 0.05 when the winning reading is a foreign one. The floor at 0.9 rules out the other
+        # failure -- no reading matching at all, which means the GGUF is not this container's
+        # source -- and is not an order decision.
+        closest = max(Q4_1_LAYOUTS, key=lambda k: scores[k][0])
+        if ours - others < 0.5 or ours < 0.9:
+            best = scores[closest][0]
+            if best < 0.9:
+                # No reading matches: the wrong GGUF, or an order this repo cannot name. Saying "not
+                # the engine's order, closest is flm" here would be a claim about a correlation of
+                # -0.003, i.e. about nothing.
+                errors.append(
+                    f"{name}: no reading of these tiles matches the source weights (best is {closest} "
+                    f"at corr {best:+.4f}): {os.path.basename(gguf_path)} is probably not the GGUF this "
+                    f"container was packed from, or the tiles are in an order this repo cannot name")
+            elif closest != "ours":
+                errors.append(
+                    f"{name}: the q4_1 tiles are NOT in the order npu/q4nx.cpp decodes (ours corr "
+                    f"{ours:+.4f} rel-rms {scores['ours'][1]:.4f}, best of the three is {closest} at "
+                    f"corr {best:+.4f}). This container would load and answer as noise "
+                    f"(engine#1110): re-pack it with scripts/repack_gguf.py and a converter that writes "
+                    f"this engine's tile order")
+            else:
+                # ours wins but not by the margin: a container that is partly foreign, or one whose
+                # tiles are in a fourth order that happens to be nearer ours. Refused, and said so.
+                second = max((k for k in Q4_1_LAYOUTS if k != "ours"), key=lambda k: scores[k][0])
+                errors.append(
+                    f"{name}: the tile order is ambiguous -- ours reads corr {ours:+.4f} (rel-rms "
+                    f"{scores['ours'][1]:.4f}) but {second} reads {scores[second][0]:+.4f}: the margin "
+                    f"is {ours - scores[second][0]:.4f}, under the 0.5 this check needs to call the "
+                    f"order. Treated as foreign (engine#1110)")
     if not rows:
         errors.append(f"no q4_1 tensor of {path} matched a tensor in {os.path.basename(gguf_path)}: "
                       f"nothing was verified about the tile order")
@@ -524,8 +570,18 @@ def self_test():
             bad.append(f"no-Q8 container with --against returned {rc_noq8}: {said}")
         if "hold the code order" in said:
             bad.append(f"no-Q8 container claimed a code order was checked: {said}")
-        if "no Q8 tile was decoded" not in said:
+        if "no Q8 or q4_1 tile was decoded" not in said:
             bad.append(f"no-Q8 container did not say it compared nothing: {said}")
+        # the q4_1 selector itself, pure python: a 5120-B I8 tensor is q4_1, a 4736-B (Q4_K) and an
+        # 8704-B (Q8) one are not, so a container of only those must not be read as q4_1 either.
+        mixed = {"a.weight": {"dtype": "I8", "shape": [2, 5120], "data_offsets": [0, 10240]},
+                 "b.weight": {"dtype": "I8", "shape": [2, 4736], "data_offsets": [10240, 19712]},
+                 "c.weight": {"dtype": "I8", "shape": [2, 8704], "data_offsets": [19712, 37120]},
+                 "__metadata__": {"x": 1}}
+        if q4_1_names(mixed) != ["a.weight"]:
+            bad.append(f"q4_1 selector picked {q4_1_names(mixed)} out of a mixed table")
+        if spread([str(i) for i in range(10)], 3) != ["0", "4", "9"]:
+            bad.append(f"spread is not across the table: {spread([str(i) for i in range(10)], 3)}")
 
         # the directory case: every .q4nx in it is checked
         two = os.path.join(tmp, "two")

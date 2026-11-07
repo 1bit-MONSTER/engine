@@ -105,13 +105,13 @@ def encode_tile(w, order):
     return tile
 
 
-def tiny_gguf(path, w):
-    """Two layer-0 weights holding the same values: q_proj and k_proj, so a tile can be renamed
-    between two tensors that DO have ground truth (the order must not depend on the name)."""
+def tiny_gguf(path, w, k=None):
+    """Two layer-0 weights: q_proj = `w` and k_proj = `k` (default: the same values), so a tile can be
+    renamed between two tensors that DO have ground truth (the order must not depend on the name)."""
     from gguf import GGUFWriter
     wr = GGUFWriter(path, "qwen3")
     wr.add_tensor(NAME, w.astype(np.float32))
-    wr.add_tensor("blk.0.attn_k.weight", w.astype(np.float32))
+    wr.add_tensor("blk.0.attn_k.weight", (w if k is None else k).astype(np.float32))
     wr.write_header_to_file()
     wr.write_kv_data_to_file()
     wr.write_tensors_to_file()
@@ -183,6 +183,33 @@ with tempfile.TemporaryDirectory() as td:
     check(len(errors) == 1 and "nothing was verified" in errors[0],
           "a container with no tensor in common is 'nothing was verified', not a pass",
           f"errors={errors} rows={rows}")
+
+    # A correct container can sit BELOW 0.99: q4_1 error is per-tensor, and a real published
+    # FastFlowLM directory reads corr +0.9890 on its outlier-heavy `layers.2.mlp.down_proj` with a
+    # margin of ~0.95 over every foreign reading. An absolute `ours >= 0.99` floor refused exactly
+    # that container (the review's blocker 2), so this case must pass -- it is the regression test.
+    noisy = W + rng.standard_normal(W.shape).astype(np.float32) * 0.0035
+    gguf_noisy = os.path.join(td, "noisy.gguf")
+    tiny_gguf(gguf_noisy, noisy, noisy)
+    errors, rows = C.check_q4_1_layout(os.path.join(good, "model.q4nx"), gguf_noisy)
+    ours = rows[0]["ours"][0]
+    check(0.90 <= ours < 0.99,
+          f"the fixture reaches the band below the old floor (ours corr {ours:+.4f})",
+          f"corr {ours:+.4f} -- outside (0.90, 0.99), so it does not exercise the regression")
+    check(not errors, "a correct container BELOW corr 0.99 still passes on the margin (blocker 2)",
+          f"{len(errors)} error(s): {errors[:1]}")
+
+    # The other failure the margin must not blur: nothing matches at all (wrong GGUF, or an order
+    # this repo cannot name).  The message has to say that, not claim a foreign order on a
+    # correlation of ~0.
+    other = rng.standard_normal(W.shape).astype(np.float32) * 0.02
+    gguf_other = os.path.join(td, "other.gguf")
+    tiny_gguf(gguf_other, other, other)
+    errors, _ = C.check_q4_1_layout(os.path.join(good, "model.q4nx"), gguf_other)
+    check(len(errors) == 1 and "no reading of these tiles matches" in errors[0],
+          "a container checked against the WRONG source says 'no reading matches'", f"errors={errors}")
+    check(len(errors) == 1 and "NOT in the order" not in errors[0],
+          "and does not claim a foreign order it cannot identify", f"errors={errors}")
 
 print(f"check_q4nx_tile_order_test: {len(FAIL)} failure(s)")
 sys.exit(1 if FAIL else 0)

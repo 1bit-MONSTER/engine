@@ -4742,6 +4742,83 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
         if (!run_lm_head(last, lg)) return false;
         std::copy(lg.begin(), lg.end(), logits_all.begin() + (size_t)(M - 1) * (size_t)NV);
     }
+    // ── the int8 packed head, one launch per vocabulary tile for the whole batch (engine#1341) ──
+    // The fallback below issues M x ntiles SINGLE-ROW launches, and a single-row launch is latency-bound:
+    // measured on the 0.5B b8 pack, a 1-row head launch streams its 9.96 MB tile at 0.33 GB/s where a
+    // 16-row launch of the same tile reaches 4.9 GB/s, so a 16-row verify pass spent 536 of its 678 ms in
+    // the head.  This is the batching the layers already do, and the one the ternary head (rows_supported,
+    // below) already had; the int8 packed head never got it.
+    //
+    // The arithmetic is per-row identical to the single-row path: each row keeps its own activation scale
+    // (amax/127 of that row), the tile's per-column weight scales are shared, and the dequantisation
+    // multiplies the same three factors -- measured bit-identical (0/16 rows differ in argmax).
+    if (!host_gemm_ && xd_ && !head_pb16i_ && xd_->weight_cache_on() && !lm_head_packed_.empty() &&
+        M > 1 && h_rows.size() == (size_t)M * (size_t)H) {
+        int i_wide = -1;
+        for (int d = 0; d < ndesigns_; d++) {
+            if (designs_[d].K != kpad_ || designs_[d].N <= 0) continue;
+            if (i_wide < 0 || designs_[d].N > designs_[i_wide].N) i_wide = d;
+        }
+        const int T = i_wide >= 0 ? designs_[i_wide].N : 0;
+        const int ntiles = T > 0 ? (NV + T - 1) / T : 0;
+        I8Ctx* hctx = i_wide >= 0 ? xd_->pick_ctx(i_wide, M) : nullptr;
+        if (hctx && !hctx->gemv && M <= hctx->MD && (int)lm_head_packed_.size() == ntiles &&
+            lm_head_packed_T_ == T) {
+            I8Ctx& lctx = *hctx;
+            const float inv_es = (sem_.tie_embeddings && sem_.embed_scale > 0)
+                                     ? 1.0f / sem_.embed_scale : 1.0f;
+            std::vector<float> scales((size_t)M, 1.0f);
+            std::vector<float> hs((size_t)M * (size_t)H);
+            for (int m = 0; m < M; m++) {
+                const float* hrow = &h_rows[(size_t)m * H];
+                float amax = 0.0f;
+                for (int k = 0; k < H; k++) {
+                    const float a = std::fabs(hrow[(size_t)k] * inv_es);
+                    hs[(size_t)m * (size_t)H + (size_t)k] = hrow[(size_t)k] * inv_es;
+                    if (a > amax) amax = a;
+                }
+                scales[(size_t)m] = amax > 0 ? amax / 127.0f : 1.0f;
+            }
+            bool ok_all = true;
+            for (int t = 0; t < ntiles && ok_all; t++) {
+                const int n0 = t * T, n1 = std::min(NV, n0 + T);
+                const auto t0 = std::chrono::steady_clock::now();
+                xrt::run r = lctx.launch_async_with_bo_rows(*lm_head_packed_[(size_t)t].bo, hs.data(),
+                                                           M, H, scales.data());
+                const auto t1 = std::chrono::steady_clock::now();
+                lctx.wait_kernel(r);
+                const auto t2 = std::chrono::steady_clock::now();
+                lctx.readback();
+                const auto t3 = std::chrono::steady_clock::now();
+                if (xd_->profiling())
+                    xd_->note_head(lctx.MD, 0.0,
+                                   std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                                   std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                                   std::chrono::duration<double, std::milli>(t3 - t2).count());
+                if (lctx.canary_short()) {
+                    fprintf(stderr, "[canary] SHORT RESULT (head rows): tile=%d M=%d short=%d\n", t, M,
+                            lctx.short_row_);
+                    ok_all = false;
+                    break;
+                }
+                const std::vector<float>& gs = lm_head_packed_[(size_t)t].scales;
+                for (int m = 0; m < M; m++) {
+                    const int32_t* cr = lctx.Cm + (size_t)m * (size_t)lctx.ND;
+                    float* dst = &logits_all[(size_t)m * (size_t)NV];
+                    const float as = scales[(size_t)m];
+                    for (int n = n0; n < n1; n++) {
+                        float v = (float)cr[n - n0] * as * gs[(size_t)(n - n0)];
+                        if (sem_.logit_softcap > 0)
+                            v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                        dst[(size_t)n] = v;
+                    }
+                }
+            }
+            if (ok_all) return true;
+            std::fill(logits_all.begin(), logits_all.end(), 0.0f);  // a short tile: fall through, don't half-fill
+        }
+    }
+
     const bool rows_supported = !host_gemm_ && head_pb16i_ && xd_->head_ctx() != nullptr && !lm_head_packed_.empty();
     if (!rows_supported) {
         // host_gemm and the int8 head have no per-row launcher; the rows are rare (speculative verify only),

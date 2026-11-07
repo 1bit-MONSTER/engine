@@ -31,6 +31,7 @@ so it also works on its own with any OpenAI client.
            [--hrx-cwsr-placement=auto|on|off]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf | --no-mtp] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--laya | --laya-model DIR] [--route-policy FILE]
+           [--laya-models FILE --laya]                       # no -m: model auto per request (docs/laya-models.md)
            [--pm [--pm-experts FILE] [--lemonade-url URL]]
            [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N] [--moe-predict off|router|block]
                                                               # refused in this build, below
@@ -294,7 +295,7 @@ two processes (lemond, llama-server) instead of two hops and three.
 |---|---|---|
 | 0 | the plan is on stdout | starts it |
 | 3 | the model does not fit ([above](#will-it-fit)) | fails the load with serve's line in its log |
-| 5 | the route needs serve in the request path: an NPU model directory, `--device npu`, `hybrid`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
+| 5 | the route needs serve in the request path: an NPU model directory, `--device npu`, `hybrid`, `--pm`, `--laya`, `--laya-models`, `--embed` or `--rerank` | runs `1bit serve` as before |
 
 Any other exit (an older engine without the flag) also falls back to `1bit serve`, and
 `LEMONADE_ONEBIT_ONE_HOP=0` in lemond's environment turns one hop off. `env` lists only variables
@@ -526,7 +527,9 @@ it is the engine's only GPU route. With `--laya` (or
 `--laya-model DIR`), Laya classifies each conversation and the route policy picks the device:
 the built-in policy sends every class to HRX, long documents included, since HRX prefills
 Qwen3.8-27B at 335 tok/s pp512 (docs/laya.md). The first turn of
-a conversation pays about 0.5 s for the decision.
+a conversation pays about 0.5 s for the decision. With `--laya-models FILE` (and no `-m`), one
+`serve` runs several models, each row of the table as its own child, and Laya picks the model and its
+device for every request with `"model": "auto"` ([laya-models.md](laya-models.md)).
 
 HRX needs TheRock's HSA runtime: the distro `libhsa` rejects gfx1151's
 PM4-emulation probe, and then HRX registers no device. `serve` sets

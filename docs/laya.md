@@ -21,6 +21,8 @@ or long document (95.5% right), and a measured policy picks the device. The test
 labelled requests. This is step 4 of the port (docs/PORTING.md).
 [Laya first](laya-first.md) is what comes next: Laya deciding the first request on a cold
 Lemonade, and which of our models answers it.
+[`--laya-models`](laya-models.md) puts several models behind one `serve`: Laya picks the model and
+its device for each request with `"model": "auto"`, from a table with its own classes and question.
 [Laya](https://github.com/NandhaKishorM/laya) (Apache-2.0) is a
 non-autoregressive decision model: a ModernBERT-style encoder plus an RLCD
 decision head. It answers typed questions (`choice`, `score`, `noul`) about a

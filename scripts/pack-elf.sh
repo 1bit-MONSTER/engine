@@ -214,6 +214,39 @@ $f: embedded build-machine path"
     [ -z "$out" ] || printf "%b\n" "$out"
 }
 
+# Every regular file in the package is group- or other-writable (prints "<path> <mode>", empty when clean).
+#
+# c31 and c32 both shipped 134 of the 195 files under opt/1bit-package writable this way (engine#1352): the packer used
+# `cp -a`, so every mode came from the build tree or the builder's umask.  Nothing was exploitable -- every file is
+# root:root and no appliance user is in group root -- but a 0775 root-owned binary in a public tarball reads as
+# deliberate to anyone auditing it.
+#
+# A reporter, not a fixer, on purpose: a function that normalises and then checks its own work can never fail, so the
+# regression it is supposed to catch would have to be invisible.  `pack_normalise_modes` below fixes; this one is what
+# the package asserts with afterwards, and what can be pointed at an unpacked tarball by anything that did not pack it.
+# Directories are included -- a world-writable directory in an installed tree is the worse of the two.
+pack_writable_files() {
+    local tree=$1 f rel
+    while IFS= read -r -d '' f; do
+        rel=${f#"$tree"/}
+        [ "$rel" = "$f" ] && rel=.     # the tree root itself, which find yields without a trailing slash
+        printf '%s %s\n' "$rel" "$(stat -c %a "$f")"
+    done < <(find "$tree" \( -type f -o -type d \) \( -perm -0020 -o -perm -0002 \) -print0)
+}
+
+# Give every staged file a mode the packer decided, rather than the one it was built with.  The executable bit as
+# staged decides the class, so behaviour cannot change: what was executable stays executable (0755) and everything else
+# is data (0644).  It also clears setuid/setgid/sticky, which `cp -a` was faithfully carrying in from the build tree.
+# Symlinks are skipped on purpose: their mode is not used by the kernel, and chmod would follow the link to whatever it
+# points at -- and `install -m` cannot be used for this at all, because it dereferences and would replace the package's
+# `lib*.so.0 -> lib*.so.0.x.y` sets with a second copy of each library.
+pack_normalise_modes() {
+    local stage=$1
+    find "$stage" -type d -exec chmod 0755 {} + 2>/dev/null || true
+    find "$stage" -type f -perm -u+x -exec chmod 0755 {} + 2>/dev/null || true
+    find "$stage" -type f ! -perm -u+x -exec chmod 0644 {} + 2>/dev/null || true
+}
+
 pack_build_rpaths() {
     local f
     find "$1" -type f -print0 | while IFS= read -r -d '' f; do

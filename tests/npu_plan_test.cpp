@@ -444,6 +444,22 @@ void test_designs() {
                                w),
               "designs: a duplicated geometry cannot stand in for an omitted one");
     }
+    // A wrong TYPE is a refusal naming the field, not nlohmann's type_error with no position in it.
+    {
+        auto bad = with_designs(true);
+        bad["designs"][0]["M"] = "128";
+        const std::string why = refusal(write_plan("dtype", bad));
+        check(has(why, "designs[0].M") && has(why, "must be an integer"),
+              "designs: a wrongly typed M is refused by field: " + why);
+    }
+    // ... and an exact duplicate says which entry it repeats, rather than naming the same elf on both sides.
+    {
+        auto dup = with_designs(true);
+        dup["designs"].push_back(dup["designs"][0]);
+        const std::string why = refusal(write_plan("ddup2", dup));
+        check(has(why, "designs[2] repeats designs[0]"),
+              "designs: an exact duplicate names the entry it repeats: " + why);
+    }
     // No section: the probes' behaviour, and every plan written before the field keeps loading.
     const Plan plain = Plan::load(write_plan("nodesigns", base_plan()));
     check(plain.designs.empty(), "designs: an absent section parses to empty");

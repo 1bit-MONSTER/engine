@@ -623,6 +623,18 @@ length peak at 8.7 GiB instead of growing; greedy answers are identical, and lla
 is unchanged. A repeated prompt length right after a flush costs 1.75 s instead of 1.12 s, since its
 program is rebuilt.
 
+### Server memory: the weight-mapping import is opt-in ([engine#856](https://github.com/1bit-MONSTER/engine/issues/856), [engine#1339](https://github.com/1bit-MONSTER/engine/issues/1339))
+
+At `-ngl 99` the loader copies every offloaded weight into one device buffer, and HRX then serves each dense
+matmul from its own repacked copy, so the weights were resident twice in GTT. Since
+[llama.cpp #226](https://github.com/1bit-MONSTER/llama.cpp/pull/226) HRX can import the loader's file mapping
+instead of taking that copy (Qwen3-4B-Q4_K_M: 3925 -> 1243 MiB of the process's GTT, wikitext perplexity
+16.3000 in both arms). On larger files the import never finishes: a dense Qwen3.8-27B (16.4 GiB) pages the
+whole file in, then waits with no error and no progress. Qwen3.8-Flash-Next (76.3 GiB) does the same.
+Since [llama.cpp #231](https://github.com/1bit-MONSTER/llama.cpp/pull/231) the import is **off by default**.
+`GGML_HRX_WEIGHT_HOST_PLACEMENT=1` turns it on for models that load with it (zaya1-8b and smaller,
+measured); unset or `0` keeps the device copy and a read-only mapping. The 27B loads in 24 s with it off.
+
 ### Known issues on `HRX0`
 
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
@@ -919,6 +931,10 @@ in [hrx.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/
   P = 0 x V depend on that V's sign, so identical requests gave different logits (up to 0.13 on Qwen3-0.6B,
   13.5 on GLM-4.7-Flash). Masked rows now reach P x V as exactly +0; Qwen3-0.6B and Qwen3.8-27B repeat
   bit-identically. Cost: pp512 -4.7% on Qwen3-0.6B, the rest within noise.
+- **Weight-mapping import, opt-in** ([llama.cpp #226](https://github.com/1bit-MONSTER/llama.cpp/pull/226),
+  [#231](https://github.com/1bit-MONSTER/llama.cpp/pull/231)): `GGML_HRX_WEIGHT_HOST_PLACEMENT=1` imports the loader's
+  mapping instead of a second device copy; off by default because it hangs large loads
+  ([section above](#server-memory-the-weight-mapping-import-is-opt-in-engine856-engine1339)).
 - **A cap on the graph program cache** ([llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63)):
   `GGML_HRX_GRAPH_PROGRAM_CACHE`, default 64 ([section above](#server-memory-the-graph-program-cache-cap-llamacpp-63)).
 - **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):

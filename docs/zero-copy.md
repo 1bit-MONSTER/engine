@@ -70,9 +70,20 @@ state-file route for that request (engine#1203) instead of losing the handoff, a
 the CPU, for instance) starts normally and warns once instead of dying at load (fork#212). `ONEBIT_KV_SHARE`
 is read as "set and non-empty" on both sides: `=0` still enables the route, an unset variable is the opt-out.
 
-What is **not** proven: the NPU is not yet the provider that writes that region (the provider in the gate
-above prefills with the CPU). That needs an NPU-side K/V writer — kernel work in the private tree, tracked in
-engine#753, which is parked until that writer exists.
+What is **not** proven: the NPU is not yet the *provider* that writes that region — the provider in the gate
+above prefills with the CPU. The piece that was missing under it, a device-side K/V writer, now exists in the
+private tree (engine#753): the NPU writes a prefill's K/V rows straight into the region, both halves of the row
+landing in the decoder's own tensors at the decoder's offsets and strides, and it is verified byte-for-byte
+against a CPU reference, including the bytes it does not write (a writer that runs long must fail there). What
+is left is the provider binary around it, which is the same handoff contract as the CPU provider's.
+
+Two facts from that work belong here because they bound what a device provider can do:
+
+- the region is the decoder's cache, so a provider writes **two destinations per layer, not one**: `cache_k_l<L>`
+  and `cache_v_l<L>` are separate tensors and a token's K|V row is contiguous in the compute but not in the
+  cache (row stride `n_embd_k_gqa`, K and V at different tensor offsets);
+- it must write through **its own mapping** of the dma-buf. Asking the driver for a mapping of the import is the
+  route that makes every later submission fail (engine#812); the pages are the same either way.
 
 ## Target 2 — the NPU runtime's copies, measured
 

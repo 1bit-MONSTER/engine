@@ -146,7 +146,8 @@ the plain row keeps its tolerance.
 **`attention.mode`** (optional, default `causal`) is the mask, not a kernel decision. A pack that declares
 `noncausal_full_attention` in its own `decision_config.json` — a d3 readout pack, trained with every
 full-attention layer seeing the whole prompt — is generated as such, and the forward then encodes a prompt
-bidirectionally: `step_batch()` fills the K/V cache for every row of the batch first and only then attends,
+bidirectionally (the plan is a copy of that declaration: with no plan the container's own word decides, and a plan
+that disagrees with it is refused — [Decisions](#decisions-v1systemone-issue-653)): `step_batch()` fills the K/V cache for every row of the batch first and only then attends,
 so row *r* sees rows after it. The GDN layers keep their causal recurrence (the pack's own runtime keeps it
 too), a sliding layer stays causal, and the mode reads the same numbers only in one shape:
 
@@ -1839,6 +1840,13 @@ the images it writes.
 `tools/mtp_acceptance --offline` scores the drafter alone on the base's own greedy stream, `--live` runs the loop,
 `--live --match` scores both **at the loop's own chain positions** (so the two per-depth tables are one measurement
 sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
+
+`tools/mtp_depth_pool.py` pools those tickets. It refuses a pool it cannot read (a repeated tail, a cell scored twice, a
+short read, a mixed budget, a mixed window identity) and, since the tau=0.6 window, it also says when a depth is too
+**thin** to carry the 2 pp bar: one chain moves a depth's rate by `100/n` pp, so under 50 chains a single accepted draft
+is worth more than the whole bar. Those depths keep their PASS/FAIL (the bar is the brief's criterion) but print
+`(thin: N live chain(s), one chain = X pp > the 2 pp bar)` and are counted out of the summary line, because a bare FAIL
+on 2 chains reads as a drafter regression when it is arithmetic.
 
 **The one thing that must be right**: the drafter attends over its own states, so its cache has to be the base
 model's *committed stream, row by row*. Feeding it only the current chain is silent — drafts get worse, the text

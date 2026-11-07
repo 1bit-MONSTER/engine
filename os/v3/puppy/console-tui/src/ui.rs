@@ -334,6 +334,15 @@ pub fn connect_block(f: &Facts, spin: &str, width: usize) -> Vec<Line<'static>> 
 /// Each panel's content, one logical line per fact. The layout below decides how many columns and how wide;
 /// this function never knows the screen size, so the two layouts cannot disagree about what is true.
 pub fn panels(f: &Facts) -> Vec<(&'static str, Vec<String>)> {
+    // Before the first probe answers there is nothing truthful to put in these panels: the empty defaults
+    // would read as "DOWN", "absent", "not mounted" about a box that is still coming up. One panel that
+    // says which question is being asked, and the collector's frame replaces it within a second.
+    if f.idle {
+        return vec![(
+            "STARTING",
+            vec!["asking Lemonade, the GPU, the NPU and the model list".to_string()],
+        )];
+    }
     let mut p = Vec::new();
 
     let mut lemonade = Vec::new();
@@ -502,11 +511,13 @@ pub fn menu_rows(width: usize) -> Vec<Line<'static>> {
 fn log_lines(a: &App, height: usize, width: usize) -> Vec<Line<'static>> {
     let total = a.facts.logs.len();
     if total == 0 {
-        return vec![styled(
-            " (no Lemonade log and no kernel GPU/NPU lines yet)",
-            Some(Color::DarkGray),
-            false,
-        )];
+        // idle: nothing has been read yet, which is not the same statement as "there is nothing in it"
+        let empty = if a.facts.idle {
+            " (reading the Lemonade log and the kernel ring now)"
+        } else {
+            " (no Lemonade log and no kernel GPU/NPU lines yet)"
+        };
+        return vec![styled(empty, Some(Color::DarkGray), false)];
     }
     let end = total.saturating_sub(a.log_scroll.min(total.saturating_sub(1)));
     // collected BACKWARDS and stopped as soon as the pane is full: drawing the log then costs what is on screen
@@ -621,6 +632,12 @@ fn panel_grid(f: &Facts, width: usize) -> Vec<Line<'static>> {
 /// fact the panel shows at 240x67, never a truncated field: `wrap_words` breaks the line if the screen is narrower
 /// than the whole thing.
 fn compact_status(f: &Facts, width: usize) -> Vec<Line<'static>> {
+    if f.idle {
+        return wrap_words("STARTING - the probes have not answered yet", width)
+            .into_iter()
+            .map(|l| styled(l, Some(Color::DarkGray), false))
+            .collect();
+    }
     let mut fields: Vec<String> = Vec::new();
 
     let mut lemonade = match (f.lemond_pid, f.lemond_listening) {
@@ -1698,6 +1715,70 @@ mod tests {
         assert!(
             full.contains("Secure Boot enabled") && full.contains("SoC 43C"),
             "240 columns lost a fact: {full}"
+        );
+    }
+
+    #[test]
+    fn the_first_frame_is_the_menu_before_any_probe() {
+        // Cycle 31, measured on the take stick `666c8ab5`: two boots of the same bytes, 76 PASS / 1 FAIL each, and
+        // the failing row was `U2 tty1 … tty1-screen-empty` on one and `U2 menu …` on the other - a scrape that ar-
+        // rived before the first frame landed. The first `App` used to be built from `Facts::collect()`, which waits
+        // on lemond's three HTTP gets, `llama-server --list-devices` and `ps`/`netstat`; now it is `Facts::idle()`
+        // (file reads plus one `ip`). This renders exactly that frame, at both sizes, and holds the two gate rows:
+        // non-empty tty1 (`U2 tty1`), and both labels `U2 menu` greps.
+        for (w, h) in [(80u16, 25u16), (240, 67)] {
+            let text = render_snapshot(&app(Facts::idle()), w, h);
+            assert!(
+                text.chars().any(|c| !c.is_whitespace()),
+                "{w}x{h}: the first frame is blank, which is the row that reds"
+            );
+            assert!(text.contains("1bit OS"), "{w}x{h}: no header\n{text}");
+            for want in ["Show the API key", "Reboot / power off"] {
+                assert!(
+                    text.contains(want),
+                    "{w}x{h}: `{want}` is not on the first frame\n{text}"
+                );
+            }
+            let rows = text.lines().filter(|l| {
+                let t = l.trim_start();
+                t.len() > 2 && t.as_bytes()[0].is_ascii_digit() && t.as_bytes()[1] == b' '
+            });
+            assert_eq!(rows.count(), 9, "{w}x{h}: not the nine actions\n{text}");
+            // ...and it must not state a fact it has not asked for. "LEMONADE DOWN" / "DATA not mounted"
+            // about a box that is still starting is the same defect as `web UI http://-:13305`.
+            assert!(
+                text.contains("STARTING"),
+                "{w}x{h}: the first frame does not say it is starting\n{text}"
+            );
+            for lie in [
+                "DOWN",
+                "DATA not mounted",
+                "amdxdna absent",
+                "no HRX device",
+            ] {
+                assert!(
+                    !text.contains(lie),
+                    "{w}x{h}: the first frame asserts `{lie}` before probing\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn main_paints_an_idle_frame_before_the_first_collect() {
+        // The frame test above holds what the screen says; this holds that `main` actually paints it
+        // FIRST. No behavioural test can see this without a boot, and the regression is silent: a
+        // `Facts::collect()` here costs seconds at boot (engine#1318, cycle 31's `tty1-screen-empty`)
+        // and every other test still passes, because the frame is correct - just late.
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("let mut app = App::new(Facts::idle());"),
+            "main() no longer paints the first frame from Facts::idle(): the first screen now waits on the probes"
+        );
+        let first_app = src.split("let mut app = App::new(").nth(1).unwrap_or("");
+        assert!(
+            first_app.starts_with("Facts::idle())"),
+            "the first App is built from something other than Facts::idle(): {first_app:.40}"
         );
     }
 

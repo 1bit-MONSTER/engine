@@ -562,6 +562,14 @@ add_test(NAME laya_encoder COMMAND laya_encoder_test)
 add_executable(laya_models_test tests/laya_models_test.cpp)
 target_link_libraries(laya_models_test PRIVATE onebit_laya)
 add_test(NAME laya_models COMMAND laya_models_test ${CMAKE_SOURCE_DIR}/config/laya-models-game.json)
+# The decision record itself (app/route_log.h): the classified state a decision keeps, so a
+# /v1/route/decisions log can become `--eval` cases and fine-tune data (engine#1313, docs/laya-models.md
+# "Measuring and fine-tuning the router").  Header only: no checkpoint, no device.
+add_executable(route_log_test tests/route_log_test.cpp)
+target_include_directories(route_log_test PRIVATE app)
+target_link_libraries(route_log_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME route_log COMMAND route_log_test)
+add_dependencies(onebit route_log_test)
 # CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
 # keeps the laya_models ctest from reporting "Not Run" without a workflow change.
 add_dependencies(onebit laya_models_test)
@@ -1026,6 +1034,10 @@ add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test 
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.
 add_test(NAME npu_window11_policy COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/npu-window11.sh --self-test)
+# The package's file modes (engine#1352): a release artifact's modes are the packer's decision, so every staged file is
+# 0755 (was executable) or 0644 (was not), no file or directory is group/other-writable, and the reporter that catches a
+# staging line added below the normalisation still fires on a tree nobody normalised.  Fixture tree: no build, no tar.
+add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.sh)
 # The GEMM designs are derived on the container's K grid and the kernel's N grid (engine#845); a
 # model already on both is unchanged.  Pure arithmetic + one assemble_B, so it runs without a model.
 # The engine's derived design set for a set of dims, as `ROLE M K N elf` lines.  The instrument the

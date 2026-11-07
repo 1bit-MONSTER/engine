@@ -90,6 +90,16 @@ dec=$(curl -s "$api/v1/route/decisions?since=0")
 check "decisions: 4 recorded" '[ "$(echo "$dec" | python3 -c "import json,sys; print(len(json.load(sys.stdin)[\"data\"]))")" = 4 ]'
 check "decisions: usage and timings relayed" 'echo "$dec" | python3 -c "import json,sys; d=json.load(sys.stdin)[\"data\"][0]; sys.exit(0 if d[\"completion_tokens\"]==3 and d[\"decode_tok_s\"]==50.0 and d[\"request_ms\"]>0 else 1)"'
 check "decisions: since filters" '[ "$(curl -s "$api/v1/route/decisions?since=3" | python3 -c "import json,sys; print(len(json.load(sys.stdin)[\"data\"]))")" = 1 ]'
+# The classified state travels with the decision, so a log can become --eval cases / fine-tune data
+# (engine#1313).  The pinned request must NOT carry one: it was never a decision.
+check "decisions: a classified decision carries the state Laya saw" \
+  'curl -s "$api/v1/route/decisions?since=0" | python3 -c "import json,sys
+d=[x for x in json.load(sys.stdin)[\"data\"] if x[\"class\"]!=\"pinned\"]
+sys.exit(0 if d and d[0][\"state\"]==\"A tree is in front of you. What do you do now?\" and d[0][\"state_len\"]==len(d[0][\"state\"].encode()) else 1)"'
+check "decisions: a pinned decision carries no state" \
+  'curl -s "$api/v1/route/decisions?since=0" | python3 -c "import json,sys
+d=[x for x in json.load(sys.stdin)[\"data\"] if x[\"class\"]==\"pinned\"]
+sys.exit(0 if d and \"state\" not in d[0] else 1)"'
 tab=$(curl -s "$api/v1/route/table")
 check "table: two classes with their rows" 'echo "$tab" | python3 -c "import json,sys; t=json.load(sys.stdin); sys.exit(0 if [c[\"model\"] for c in t[\"classes\"]]==[\"small-npu\",\"big-hrx\"] else 1)"'
 check "/v1/models lists auto and both aliases" '[ "$(curl -s "$api/v1/models" | python3 -c "import json,sys; print(\" \".join(m[\"id\"] for m in json.load(sys.stdin)[\"data\"]))")" = "auto small-npu big-hrx" ]'

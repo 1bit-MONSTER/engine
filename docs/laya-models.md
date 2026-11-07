@@ -120,3 +120,21 @@ llama-servers behind real `1bit serve` children; the reply comes from the row th
 cached requests, the decisions log, the table, `/v1/models` and `/metrics`, and the refusals.
 
 ## Measured
+
+Strix Halo, 2026-11-07, `config/laya-models-game.json` with this box's paths: Qwen3-0.6B (Q4NX) on the NPU and
+Qwen3-Coder-30B-A3B Q4_K_M on HRX, the C++ scorer on the `typed-decisions/` checkpoint (CPU), and 20
+hand-labelled game steps (12 reflex, 8 plan) sent as `model: auto`, `max_tokens 48`, temperature 0.
+The NPU row ran from a release build (`bin`), because the source build had no NPU add-on.
+
+| | result |
+|---|---|
+| ready, both rows (the 30B from the page cache) | 16 s |
+| class right, zero-shot | **19/20**: reflex 11/12, plan 8/8. The one miss, "place a wall block here", went to plan at confidence 0.01 |
+| confidence | low throughout: 0.01-0.57, median 0.13. `min_confidence` stays 0 until the fine-tune |
+| Laya decision (`router_ms`) | p50 **302 ms** (259-358): the CPU scorer on a shared box. ggmlc's GGUF scorer on HRX (25 ms p50 in [laya.md](laya.md)) is the fast path |
+| decode, from the replies' `timings` | NPU p50 85.2 tok/s, HRX p50 86.8 tok/s |
+| headers, `route` object, `/v1/route/decisions` and `/metrics` | agree on all 20 (11 decisions npu, 9 hrx) |
+
+Qwen3-0.6B thinks by default, so a 48-token budget can end inside the thinking: every NPU reply above had an empty
+`content` with all 48 tokens in `reasoning_content`. A request with `"chat_template_kwargs":{"enable_thinking":false}`
+gets the answer in `content` (checked on the same row). Routing does not depend on it.

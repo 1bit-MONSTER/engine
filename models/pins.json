@@ -2407,8 +2407,8 @@
    }
   },
   "unsloth/Qwen3.8-Flash-Next-GGUF": {
-   "commit": "d96201194f103c906994f283f504209dc8d2a10c",
-   "pinned": "2026-11-06",
+   "commit": "084c631ac221016019d6e0a863afe92d90edd3b0",
+   "pinned": "2026-11-07",
    "used_for": [
     "upstream: our copy predates the pinned revision"
    ],

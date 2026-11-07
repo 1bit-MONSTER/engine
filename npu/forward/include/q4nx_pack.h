@@ -239,6 +239,13 @@ int q4nx_derive_designs(const Q4nxModelDims* d, Q4nxDesignGeom* designs);
 int q4nx_derive_decode_designs(const Q4nxDesignGeom* designs, int count,
                                Q4nxDesignGeom* out);
 
+/* The UNIQUE name of a design role -- not the display tag the forward logs.
+ *
+ * They differ where a model carries two roles that read the same in a log: a qwen3_5 pack derives an
+ * attention QKV and a GDN QKVLIN, which the forward both prints as "QKV".  A plan's `designs[].role`
+ * is a key (engine#803 A2), so it uses these; the log keeps the short tag. */
+const char* q4nx_design_role_name(Q4nxDesign role);
+
 /* Look up the entry for a role in a derived set; NULL if absent. */
 const Q4nxDesignGeom* q4nx_find_design(const Q4nxDesignGeom* designs, int count,
                                        Q4nxDesign role);

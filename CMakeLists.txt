@@ -94,7 +94,8 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
      "// generated from config/laya-first.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
-add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp)
+add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp
+                     app/embed_serve.cpp app/embed_model.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -189,6 +190,9 @@ endfunction()
 
 # Runs everywhere, CI included: serve's proxy against a fake backend.
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
+# The embedding role served in-process from a 1-bit container (engine#1311): /v1/embeddings for a string and an
+# array, the OpenAI shape, and the refusals named. Device-free on the 32-token fixture.
+add_test(NAME embed_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/embed_serve.sh $<TARGET_FILE:onebit>)
 # serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
 add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
 # serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.
@@ -374,7 +378,8 @@ set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 option(ONEBIT_ORT "Link ONNX Runtime 1.23.2 in-process (1bit ort-info + the plugin EP)" OFF)
 
 # ── the ONNX EP's NPU leg compiles and links without ORT, the device or the runtime (#874) ───────
-# npu/ort/onebit_npu_gemm.cpp is built only by onnx/ep when ONEBIT_EP_NPU=ON, and that needs ONNX
+# npu/ort/onebit_npu_gemm.cpp is built by onebit_npu_forward (the embedding route's device path, engine#1311)
+# and by onnx/ep when ONEBIT_EP_NPU=ON, which needs ONNX
 # Runtime *and* the private NPU runtime -- so no configuration CI has ever built it, and #874 (a call
 # to q4nx_elf_arg_sizes with no declaration, then the file defining it missing from the link) was
 # green for a week. This target compiles onnx/ep's own source list (onnx/ep/npu_sources.cmake, the
@@ -656,6 +661,12 @@ if(Python3_Interpreter_FOUND)
     # it self-checks the comparison with a one-value change so a comparator that always passed cannot look the same.
     # Pure python, no model, no device, no network.
     add_test(NAME npu_leaderboard COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_leaderboard_test.py)
+    # An accuracy figure is the easiest number here to produce wrongly and the hardest to notice (tools/gsm8k_eval.py):
+    # a scorer that reads the wrong number out of a completion, or that counts a completion cut off by the token
+    # budget as a clean miss, still prints a plausible percentage.  This drives the extractor, the gold normaliser and
+    # the whole run loop against canned completions, and re-derives the summary from the written transcript.  Stdlib
+    # only, with no route, no socket, no dataset fetch and no device.
+    add_test(NAME gsm8k_eval COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gsm8k_eval_test.py)
     # The repack's tile-order claim (engine#1110): `npu_plan.py` writes container.tile_order=engine-1 for every
     # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
     # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.
@@ -835,6 +846,14 @@ add_test(NAME npu_plan COMMAND npu_plan_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635).  This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_plan_test)
+# The plan-vs-target rule (npu/target/target.h, check_kv_caps): a plan that asks for a cache the target
+# cannot store is a refusal by name, never a silent f16 store.  Device-free: the refusal happens before any
+# kernel is touched, and it is the same answer for a target that does not exist yet (engine#806 P7a).
+add_executable(npu_target_caps_test tests/npu_target_caps_test.cpp)
+target_include_directories(npu_target_caps_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(npu_target_caps_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_target_caps COMMAND npu_target_caps_test)
+add_dependencies(npu_sampling_test npu_target_caps_test)
 
 # The generator behind that loader: a synthetic model dir, so the fused/split decision and --check are
 # tested without a model or a kernel build.
@@ -1002,17 +1021,29 @@ add_test(NAME attn_math COMMAND attn_math_test)
 # workflow is next touched with that scope and add these to the list itself. `host_gemm_pad_test` is here for the
 # same reason: without it ctest reports the row as "Not Run" and the job fails after every other test passes.
 add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test npu_kv_int8_test
-                 host_gemm_pad_test)
+                 host_gemm_pad_test npu_derive_designs_dump)
 # The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.
 add_test(NAME npu_window11_policy COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/npu-window11.sh --self-test)
 # The GEMM designs are derived on the container's K grid and the kernel's N grid (engine#845); a
 # model already on both is unchanged.  Pure arithmetic + one assemble_B, so it runs without a model.
+# The engine's derived design set for a set of dims, as `ROLE M K N elf` lines.  The instrument the
+# parity test above needs: the plan generator must state the same kernels q4nx_derive_designs() does, and
+# comparing the two is the only way that can be checked rather than assumed (engine#803 A2a).
+add_executable(npu_derive_designs_dump tests/npu_derive_designs_dump.c npu/forward/src/q4nx_pack.c)
+target_include_directories(npu_derive_designs_dump PRIVATE npu/forward/include)
+target_link_libraries(npu_derive_designs_dump PRIVATE m)
 add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
+# The plan's `designs` section against the engine's own derivation (engine#803 A2a): the generator and
+# q4nx_derive_designs() must state the same kernels, because a section that disagreed would be refused at
+# load for every model that carried one.  Runs the dump binary, so it is a build dependency above.
+add_test(NAME npu_plan_designs_parity
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_plan_designs_parity_test.py
+                 ${CMAKE_SOURCE_DIR}/tools/npu_plan.py $<TARGET_FILE:npu_derive_designs_dump>)
 # The host fallback GEMM reads a padded design's activations at stride a_k, inside the caller's buffer
 # (engine#808 review: the split moved the engine#845 pad into the target and left the host branch on the
 # raw A). The test's activation buffer carries a NaN guard tail, so an implementation that reads past the
@@ -1177,6 +1208,9 @@ if(ONEBIT_NPU)
 endif()
 
     add_library(onebit_npu_forward STATIC
+        # gemm_q8_raw / gemm_f32: the int8 GEMM the ONNX EP's QDQ leg uses, and now the embedding route's
+        # ternary linears on the array (engine#1311). Its own probe checks the accumulators are exact.
+        npu/ort/onebit_npu_gemm.cpp
         npu/forward/src/model.c
         npu/forward/src/q4nx_dequant.c
         npu/forward/src/q4nx_pack.c
@@ -1208,6 +1242,10 @@ endif()
     target_link_libraries(onebit_npu_forward PUBLIC onebit_npu onebit_npu_rt nlohmann_json::nlohmann_json dl
                                                   pthread m)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
+    # app/embed_serve.cpp's device path includes npu/embed/embed_npu.h (engine#1311): the embedding route's
+    # ternary linears on the array, through the same int8 GEMM the forward links.
+    target_include_directories(onebit PRIVATE ${CMAKE_SOURCE_DIR}/npu/embed ${CMAKE_SOURCE_DIR}/app
+        ${CMAKE_SOURCE_DIR}/npu/ort)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
     # step_batch_all(): per-row logits from ONE batched pass -- the contract speculative verification

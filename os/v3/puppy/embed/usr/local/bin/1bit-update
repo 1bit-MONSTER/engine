@@ -1,0 +1,293 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-update <release-dir> | <image.img>   install the next appliance into the OTHER slot and boot it next
+# 1bit-update --rollback                    boot the other slot next (both sets stay on the disk)
+# 1bit-update --status                      which slot is active, what each slot holds, which one GRUB boots
+#
+# An installed 1bit OS is a frugal set (kernel, initrd, SFS) plus ONE save layer, and the only way to change the OS
+# used to be "write a new image", which throws the layer's machine away with it. So an installed machine carries TWO
+# slots on the same data partition:
+#
+#   /1bit        psubdir=1bit       set A
+#   /1bit-alt    psubdir=1bit-alt   set B, empty until the first update
+#
+# The save layer stays where the machine was installed (inside the slot that created it) and every other slot reaches
+# it through a RELATIVE `upup64rsave` symlink: Puppy's init finds a save folder under its own psubdir
+# (`find_save_file`), follows the link, and writes through it (`setup_psave` makes <folder>/upper the overlay's
+# upperdir), so both sets share one machine's worth of state - home, services, /etc - instead of forking it.
+#
+# What an update writes is the slot that is NOT running, so the running set is never touched and the previous
+# appliance stays bootable: that is the rollback. GRUB's `set default` is the switch, and both slots' entries carry
+# the same UUID-pinned boot line, so nothing else about the disk changes.
+#
+# Refusals are the point of this script: a half-written slot that GRUB then boots is worse than no update at all. It
+# refuses a source that does not carry the set the running image is made of, a source whose SHA256SUMS does not
+# verify, a target slot with too little space, a target slot holding a save layer of its own (that is two machines'
+# state and not something a script may merge), and it re-reads the GRUB config after writing it.
+#
+# Exit: 0 done, 1 usage, 2 refused (nothing written), 3 failed while writing.
+set -u
+
+DATA=/data
+ALT=1bit-alt
+LOG=/var/log/1bit-update.log
+say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+# the log is the record of an OS change and is APPENDED, never truncated: a failed update followed by a `--rollback`
+# used to destroy the only trace of why it failed (measured on the first gate run)
+logtail() { [ "$LOG" = /dev/null ] || tail -n 5 "$LOG" >&2; }
+die() { say "1bit-update: REFUSED: $*" >&2; exit 2; }
+fail() { say "1bit-update: FAILED: $*" >&2; logtail; exit 3; }
+
+usage() { sed -n '/^# 1bit-update /,/^# Exit:/p' "$0" | sed 's/^# \{0,1\}//'; }
+
+src=''
+mode=install
+case "${1:---help}" in
+    -h|--help) usage; exit 0 ;;
+    --status) mode=status ;;
+    --rollback) mode=rollback ;;
+    /*) src=$1 ;;
+    *) usage >&2; exit 1 ;;
+esac
+[ -n "$src" ] || [ "$mode" != install ] || { usage >&2; exit 1; }
+mkdir -p /tmp/1bit-update 2> /dev/null
+: >> "$LOG" 2> /dev/null || LOG=/dev/null
+
+[ "$(id -u)" = 0 ] || die "run as root (it writes the other slot and the ESP)"
+[ -d "$DATA" ] && grep -q " $DATA " /proc/mounts 2> /dev/null || die "no $DATA: this is not an installed system"
+[ -e "$DATA/.installed" ] || die "no $DATA/.installed: this is a live stick, not an installed machine (a stick is replaced by writing the next image, it is not updated in place)"
+
+# ── which slot is running, and where the disk and its ESP are ────────────────────────────────────────────────
+psub=$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^psubdir=//p' | head -1)
+psub=${psub#/}
+[ -n "$psub" ] || die "the boot line carries no psubdir=, so the running slot cannot be named"
+active=$psub
+case $active in
+    "$ALT") target=1bit ;;
+    1bit) target=$ALT ;;
+    *) die "psubdir=$active is neither 1bit nor $ALT: this disk was not laid out by 1bit-install" ;;
+esac
+bootpart=$(awk '$2 == "/initrd/mnt/dev_save" { print $1; exit }' /proc/mounts 2> /dev/null)
+[ -n "$bootpart" ] || bootpart=$(awk '$2 == "/data" { print $1; exit }' /proc/mounts 2> /dev/null)
+[ -n "$bootpart" ] || die "cannot tell which partition this machine booted from"
+bootdisk=$(basename "$(readlink -f "/sys/class/block/${bootpart##*/}/.." 2> /dev/null)" 2> /dev/null)
+[ -n "$bootdisk" ] || die "cannot resolve the disk behind $bootpart"
+esp=
+for p in /sys/block/"$bootdisk"/"$bootdisk"*; do
+    [ -e "$p" ] || continue
+    n=/dev/$(basename "$p")
+    [ "$(blkid -o value -s LABEL "$n" 2> /dev/null)" = 1BIT-OS ] && { esp=$n; break; }
+done
+[ -n "$esp" ] || die "no 1BIT-OS partition on $bootdisk: this machine did not boot from an installed disk"
+save_slot=
+savename=
+for d in "$DATA"/1bit "$DATA"/"$ALT"; do
+    [ -d "$d" ] || continue
+    for s in "$d"/*save*; do
+        [ -e "$s" ] || continue
+        # -L: a symlink to the layer counts, but only a REAL directory is where the layer lives
+        if [ -d "$s" ] && [ ! -L "$s" ]; then save_slot=$(basename "$d"); savename=$(basename "$s"); fi
+    done
+done
+
+# ── GRUB: read the config, find a slot's entries, write the default ──────────────────────────────────────────
+esp_mount=/tmp/1bit-update/esp
+# Is it mounted? Compare against /proc/mounts' OWN spelling of the path, not the one we used: Puppy's /tmp is a
+# symlink to /initrd/mnt/tmpfs/tmp, so `/proc/mounts` says /initrd/mnt/tmpfs/tmp/1bit-update/esp while the guard looked
+# for /tmp/1bit-update/esp, missed, and the second `mount` died with "already mounted" - which is how a `--status` call
+# could break the update that followed it (measured in the gate).
+esp_mounted() { grep -q " $(readlink -f "$esp_mount") " /proc/mounts 2> /dev/null; }
+mount_esp() {
+    mkdir -p "$esp_mount"
+    esp_mounted && return 0
+    mount -t vfat "$esp" "$esp_mount" >> "$LOG" 2>&1 || { tail -n 2 "$LOG" >&2; return 1; }
+}
+unmount_esp() { esp_mounted && umount "$esp_mount" 2> /dev/null; return 0; }
+cfg=$esp_mount/EFI/BOOT/grub.cfg
+# the on-disk GRUB order is the index order: entry N is the Nth `menuentry` line, and `set default=N` picks it
+slot_index() {   # $1 slot, $2 headless|serial -> index, or empty
+    # BEGIN n = 0: an uninitialised awk number is the EMPTY STRING, so `i = n; n++` gave the FIRST entry an empty
+    # index - `set default=` with nothing after it, and a read-back that could never match index 0 (measured: the
+    # status line printed `1bit headless = ` and a rollback to /1bit would have written an empty default)
+    awk -v slot="$1" -v kind="$2" '
+        BEGIN { n = 0; i = 0 }
+        /^[[:space:]]*menuentry/ { i = n; n++ }
+        /^[[:space:]]*linux / {
+            sp = ($0 ~ ("psubdir=" slot "([[:space:]]|$)"))
+            ser = ($0 ~ /1bit\.serial=1/)
+            if (sp && ((kind == "serial" && ser) || (kind == "headless" && !ser))) { print i; exit }
+        }' "$cfg"
+}
+set_default() {   # $1 index
+    sed -i "s/^set default=.*/set default=$1/" "$cfg" || return 1
+    grep -qx "set default=$1" "$cfg"
+}
+
+if [ "$mode" = status ]; then
+    say "1bit-update: active slot = $active (data partition on $bootdisk, ESP $esp)"
+    for d in 1bit "$ALT"; do
+        if [ -d "$DATA/$d" ]; then
+            n=$(ls "$DATA/$d"/*.sfs 2> /dev/null | wc -l)
+            set=$(ls -l "$DATA/$d/vmlinuz" 2> /dev/null | awk '{ print $6, $7, $8 }')
+            link=$(readlink "$DATA/$d"/*save* 2> /dev/null | head -1)
+            say "  /$d: $n SFS, kernel dated ${set:-<none>}${link:+, save layer -> $link}"
+        else
+            say "  /$d: absent"
+        fi
+    done
+    [ -n "$savename" ] && say "  save layer: $DATA/$save_slot/$savename (one layer, shared by both slots)"
+    if mount_esp; then
+        say "  GRUB: default index $(sed -n 's/^set default=//p' "$cfg" | head -1) of $(grep -c '^[[:space:]]*menuentry' "$cfg") entries" \
+            "| $active headless = $(slot_index "$active" headless), $target headless = $(slot_index "$target" headless)"
+        unmount_esp
+    fi
+    exit 0
+fi
+
+if [ "$mode" = rollback ]; then
+    mount_esp || fail "cannot mount the ESP $esp"
+    idx=$(slot_index "$target" headless)
+    [ -n "$idx" ] || { unmount_esp; die "slot $target has no GRUB entry to roll back to"; }
+    [ -s "$DATA/$target/initrd.gz" ] || { unmount_esp; die "slot $target has no appliance in it: nothing to roll back to"; }
+    set_default "$idx" || { unmount_esp; fail "could not set default=$idx in $cfg"; }
+    unmount_esp
+    say "rolled back: GRUB now boots /$target (entry $idx). Reboot to use it; the save layer is untouched."
+    exit 0
+fi
+
+# ── install mode ─────────────────────────────────────────────────────────────────────────────────────────────
+[ -d "$src" ] || [ -f "$src" ] || die "no such release: $src"
+[ -n "$savename" ] || die "the running set has no save layer (/1bit or /$ALT with a real <prefix>save folder): this image predates engine#712's persistence, so there is no state to carry across - reinstall with 1bit-install"
+# the second slot is created on first use: the installer lays out one set and the update adds the other, so a disk
+# installed before this script existed can still be updated
+if [ ! -d "$DATA/$target" ]; then
+    mkdir -p "$DATA/$target" || fail "cannot create /$target on the data partition"
+    say "   created /$target (the second slot)"
+fi
+
+# the shape of the running set is what an update must deliver: same names, so the init finds them
+need='vmlinuz initrd.gz'
+for f in "$DATA/$active"/*.sfs; do
+    [ -e "$f" ] && need="$need $(basename "$f")"
+done
+
+srcimg=
+cleanup() {
+    [ -n "$srcimg" ] && { umount "$srcimg" 2> /dev/null; [ -n "${srcloop:-}" ] && losetup -d "$srcloop" 2> /dev/null; }
+    unmount_esp
+}
+trap 'cleanup' EXIT INT TERM
+
+# a release image is what a user actually has: use the frugal set on its own data partition
+if [ ! -d "$src" ]; then
+    srcloop=$(losetup -f --show -r "$src" 2> /dev/null) || die "cannot loop-mount $src"
+    dataoff=$(sfdisk -d "$src" 2> /dev/null | awk '/name="1BIT-DATA"/ { for (i = 1; i <= NF; i++) if ($i ~ /^start=/) { sub(/start=/, "", $i); sub(/,/, "", $i); print $i; exit } }')
+    [ -n "$dataoff" ] || { losetup -d "$srcloop"; die "$src has no 1BIT-DATA partition (not a 1bit OS image)"; }
+    srcloop=$(losetup -d "$srcloop" > /dev/null 2>&1; losetup -f --show -r -o $((dataoff * 512)) "$src" 2> /dev/null) \
+        || die "cannot loop-mount $src's data partition"
+    srcimg=/tmp/1bit-update/src
+    mkdir -p "$srcimg"
+    mount -t ext4 -o ro "$srcloop" "$srcimg" >> "$LOG" 2>&1 || die "cannot mount the data partition in $src"
+    src=$srcimg/1bit
+    [ -d "$src" ] || die "$src has no /1bit on its data partition"
+fi
+
+for f in $need; do
+    [ -s "$src/$f" ] || die "$src does not carry $f, which the running image is built from ($need)"
+done
+if [ -s "$src/SHA256SUMS" ]; then
+    sums=/tmp/1bit-update/sums
+    : > "$sums"
+    for f in $need; do
+        awk -v b="$f" '$2 == b || $2 == "*" b { print }' "$src/SHA256SUMS" >> "$sums"
+    done
+    if [ -s "$sums" ]; then
+        ( cd "$src" && sha256sum -c --quiet "$sums" ) >> "$LOG" 2>&1 \
+            || die "SHA256SUMS does not verify for the set's own files - the release is damaged"
+        say "hashes: $(grep -c . "$sums") file(s) of the set verified against $src/SHA256SUMS"
+    else
+        say "hashes: $src/SHA256SUMS has no line for any file of this set; sizes are checked, the bytes are not"
+    fi
+else
+    say "hashes: $src has no SHA256SUMS; sizes are checked, the bytes are not"
+fi
+
+# space: the new set, with room for the checksums and the GRUB rewrite
+szk=$(du -sk "$src" | cut -f 1)
+freek=$(df -Pk "$DATA" | awk 'NR == 2 { print $4 }')
+[ "$freek" -gt $((szk + 262144)) ] || die "only ${freek} KiB free on $DATA, the set needs ${szk} KiB plus 256 MiB of slack"
+
+# a slot that already owns a save layer is another machine's state, not something to overwrite
+for s in "$DATA/$target"/*save*; do
+    [ -e "$s" ] || continue
+    if [ -d "$s" ] && [ ! -L "$s" ]; then
+        die "/$target already holds a save layer ($(basename "$s")): two layers cannot be merged by an update - pick the slot by hand if that is really what you want"
+    fi
+    rm -f "$s"
+done
+
+# ── write the other slot ─────────────────────────────────────────────────────────────────────────────────────
+say "== install $src into /$target (the running set is /$active and is not touched)"
+for f in $need; do
+    cp -f "$src/$f" "$DATA/$target/$f" >> "$LOG" 2>&1 || fail "copying $f into /$target failed"
+done
+[ -s "$src/SHA256SUMS" ] && cp -f "$src/SHA256SUMS" "$DATA/$target/SHA256SUMS" 2> /dev/null
+ln -sfn "../$save_slot/$savename" "$DATA/$target/$savename" || fail "cannot link the save layer into /$target"
+for f in $need; do
+    cmp -s "$src/$f" "$DATA/$target/$f" || fail "/$target/$f does not match the source after copying"
+done
+sync
+say "   $(ls "$DATA/$target"/*.sfs | wc -l) SFS, kernel and initrd in /$target; save layer -> $(readlink "$DATA/$target/$savename")"
+
+# ── GRUB: the other slot needs its entries, and they become the default ─────────────────────────────────────
+mount_esp || fail "cannot mount the ESP $esp"
+[ -f "$cfg" ] || { unmount_esp; fail "no EFI/BOOT/grub.cfg on $esp"; }
+cp -p "$cfg" "$cfg.pre-1bit-update" 2> /dev/null || { unmount_esp; fail "cannot back up $cfg"; }
+tmpl=$(awk -v slot="$active" '$1 == "linux" && $0 ~ ("psubdir=" slot "([[:space:]]|$)") && $0 !~ /1bit\.serial=1/ {
+                                  sub(/^[[:space:]]*linux[[:space:]]+[^[:space:]]+[[:space:]]+/, ""); print; exit }' "$cfg")
+[ -n "$tmpl" ] || { unmount_esp; fail "no headless linux line for the running slot ($active) in $cfg to copy the boot parameters from"; }
+params=$(printf '%s' "$tmpl" | sed "s|psubdir=[^ ]*|psubdir=$target|")
+if [ -z "$(slot_index "$target" headless)" ]; then
+    {
+        printf 'menuentry "1bit OS (headless console, %s)" {\n' "$target"
+        printf '    linux /%s/vmlinuz %s\n' "$target" "$params"
+        printf '    initrd /%s/initrd.gz\n}\n' "$target"
+        printf 'menuentry "1bit OS (%s - serial root shell, 1bit.serial=1)" {\n' "$target"
+        printf '    linux /%s/vmlinuz %s 1bit.serial=1\n' "$target" "$params"
+        printf '    initrd /%s/initrd.gz\n}\n' "$target"
+    } >> "$cfg" || { unmount_esp; fail "cannot append the /$target entries to $cfg"; }
+    sync
+    say "   GRUB: added the /$target entries"
+fi
+idx=$(slot_index "$target" headless)
+[ -n "$idx" ] || { unmount_esp; fail "the /$target headless entry is not in $cfg after writing it"; }
+set_default "$idx" || { unmount_esp; fail "could not set default=$idx in $cfg"; }
+# read it back the way GRUB counts: the Nth menuentry line must be the one carrying /$target's boot line
+awk -v want="$idx" -v slot="$target" '
+    BEGIN { n = 0; i = 0 }
+    /^[[:space:]]*menuentry/ { i = n; n++ }
+    /^[[:space:]]*linux / && i == want { if ($0 ~ ("psubdir=" slot "([[:space:]]|$)") && $0 !~ /1bit\.serial=1/) ok = 1 }
+    END { exit(ok ? 0 : 1) }' "$cfg" || { cp -p "$cfg.pre-1bit-update" "$cfg"; unmount_esp; fail "entry $idx is not /$target's headless boot line; $cfg restored"; }
+unmount_esp || fail "cannot flush the ESP"
+sync
+say "   GRUB: entry $idx = /$target headless, first (set default=$idx); the /$active entries stay, so the previous appliance is the rollback"
+
+say ""
+say "UPDATED: /$target now holds the new appliance set. Reboot to run it."
+say "  roll back at any time:  1bit-update --rollback   (or pick the /$active entry in the GRUB menu)"
+say "  what is on this disk:   1bit-update --status"
+exit 0

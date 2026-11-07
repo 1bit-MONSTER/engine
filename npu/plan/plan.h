@@ -161,6 +161,39 @@ struct Plan {
     struct { bool enabled = false; int K = 0, N = 0; } moe_batched_gu;
     std::vector<LayerPlan> layer_plans;
 
+    // One kernel the plan expects: the role it serves, the geometry it launches at and the artifact
+    // that implements it.  `role` is the forward's own role tag ("QKV", "O", "GU", "G", "U", "D",
+    // "GB", "UB", the Gemma4 second attention type, the MLA and GDN roles), so a reader can match a
+    // design to the code that launches it without a second name table.
+    //
+    // It is the unique name (q4nx_design_role_name(): "QKV", "QKVLIN", "QA", "GB", ...), NOT the
+    // forward's short log tag -- those differ exactly where a model carries two roles that read alike,
+    // since a qwen3_5 pack derives an attention QKV and a GDN QKVLIN and both log as "QKV".
+    // designs_agree() still compares a multiset of (role, M, K, N, elf) rather than a role-keyed
+    // lookup: that is what makes a duplicated or mispaired set a refusal instead of a match, and it
+    // keeps the check honest if a future role name is ever reused.
+    //
+    // Why the plan carries this at all (engine#803 A2): the design set is what a target opens, and
+    // while it was derived in the forward, "which ELF does this role run" was answered by
+    // q4nx_derive_designs() plus filename probes inside one file.  A plan that names the set makes
+    // the kernel identity part of the model's description -- and the engine then refuses a plan whose
+    // designs are not the ones the container derives, instead of silently running whatever the probes
+    // find.  An absent section is the old behaviour (the probes), so every plan written before this
+    // field existed keeps loading.
+    struct Design {
+        std::string role;
+        int M = 0, K = 0, N = 0;
+        std::string elf;
+    };
+    std::vector<Design> designs;
+
+    // True when the plan's `designs` and a derived set name the same kernels: same roles, same M/K/N,
+    // same artifact, both directions (a role the plan omits is a kernel the model needs and the plan
+    // would not open).  An empty section agrees with anything.  On disagreement `err` names the role
+    // and both sides -- never a default, because a plan that names a different ELF than the weights
+    // need is exactly the silent divergence this layer exists to remove.
+    bool designs_agree(const std::vector<Design>& derived, std::string& err) const;
+
     bool loaded() const { return !format.empty(); }
 
     // Load and validate.  Throws PlanError naming the field for anything this build cannot run --
@@ -351,6 +384,32 @@ struct Plan {
         if (ternary_tag != p.pb16i)
             throw PlanError("plan: " + path + " kernels.tag \"" + p.tag + "\" and container.pb16i " +
                             (p.pb16i ? "true" : "false") + " disagree");
+        // The per-role kernel set (engine#803 A2).  Optional: absent means the engine keeps deriving it
+        // from the container's dims, which is what every plan written before this field means.
+        if (j.contains("designs")) {
+            const auto& ds = j.at("designs");
+            if (!ds.is_array()) throw PlanError("plan: " + path + " designs is not an array");
+            for (size_t i = 0; i < ds.size(); i++) {
+                const auto& d = ds.at(i);
+                const std::string where = "designs[" + std::to_string(i) + "]";
+                if (!d.is_object()) throw PlanError("plan: " + path + " " + where + " is not an object");
+                Design des;
+                des.role = d.value("role", "");
+                if (des.role.empty()) throw PlanError("plan: " + path + " " + where + ".role is empty");
+                // Named with the index, not just the field: a plan can carry a dozen of these and
+                // "M must be positive" without a position is a hunt.
+                des.M = d.value("M", 0);
+                if (des.M <= 0) throw PlanError("plan: " + path + " " + where + ".M must be positive");
+                des.K = d.value("K", 0);
+                if (des.K <= 0) throw PlanError("plan: " + path + " " + where + ".K must be positive");
+                des.N = d.value("N", 0);
+                if (des.N <= 0) throw PlanError("plan: " + path + " " + where + ".N must be positive");
+                des.elf = d.value("elf", "");
+                if (des.elf.empty())
+                    throw PlanError("plan: " + path + " " + where + ".elf is empty (the artifact the role runs)");
+                p.designs.push_back(des);
+            }
+        }
         return p;
     }
 
@@ -396,5 +455,57 @@ private:
         return out;
     }
 };
+
+// Out of line for readability: the comparison is the whole point of the section.  `derived` is what
+// the container's own geometry produces (q4nx_derive_designs() plus the MoE pair), so this is the
+// check that keeps a plan and the artifacts its weights need from drifting apart silently.
+inline bool Plan::designs_agree(const std::vector<Design>& derived, std::string& err) const {
+    if (designs.empty()) return true;   // no section: the engine derives, as it always did
+    // Compared as a MULTISET of (role, M, K, N, elf), not by role alone: the role tags are not unique --
+    // a qwen3_5 pack derives both an attention QKV and a GDN QKVLIN design, and both are logged as
+    // "QKV" -- so a role-keyed lookup would compare the wrong pair and, worse, report agreement.
+    auto same = [](const Design& a, const Design& b) {
+        return a.role == b.role && a.M == b.M && a.K == b.K && a.N == b.N && a.elf == b.elf;
+    };
+    std::vector<bool> used(derived.size(), false);
+    for (const auto& mine : designs) {
+        bool found = false;
+        for (size_t i = 0; i < derived.size(); i++) {
+            if (used[i] || !same(mine, derived[i])) continue;
+            used[i] = found = true;
+            break;
+        }
+        if (found) continue;
+        // Not found: is it a role the container does not derive at all, or the same role at a different
+        // geometry / artifact?  The second is the dangerous one, so it says both sides.
+        const Design* near = nullptr;
+        for (const auto& d : derived)
+            if (d.role == mine.role) near = &d;
+        if (!near) {
+            err = "plan designs: role \"" + mine.role + "\" is not a design this container derives";
+            return false;
+        }
+        if (near->M != mine.M || near->K != mine.K || near->N != mine.N) {
+            err = "plan designs(" + mine.role + "): M=" + std::to_string(mine.M) + " K=" +
+                  std::to_string(mine.K) + " N=" + std::to_string(mine.N) + ", the container derives M=" +
+                  std::to_string(near->M) + " K=" + std::to_string(near->K) + " N=" +
+                  std::to_string(near->N);
+            return false;
+        }
+        err = "plan designs(" + mine.role + "): elf \"" + mine.elf + "\", the container derives \"" +
+              near->elf + "\"";
+        return false;
+    }
+    // Both directions: a derived design the plan does not name is a kernel the model needs and the plan
+    // would not open once the target takes its set from here.
+    for (size_t i = 0; i < derived.size(); i++) {
+        if (!used[i]) {
+            err = "plan designs: the container derives " + derived[i].role + " (" + derived[i].elf +
+                  ") but the plan does not name it";
+            return false;
+        }
+    }
+    return true;
+}
 
 }  // namespace onebit::npu::plan

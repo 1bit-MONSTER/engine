@@ -93,6 +93,10 @@ bool XdnaTarget::open(const onebit::npu::plan::Plan& plan, const std::string& ke
     // A2 (#803 §3) moves the derivation in here: then this becomes the source rather than the check.
     kernels_dir_ = kernels_dir;
     plan_ = plan;
+    // Before the device checks: a plan that asks for a cache this target cannot store is refused whatever
+    // the device is doing, and the refusal names the field.  Without this an int8 KV plan loads and is
+    // quietly served an f16 cache -- the plan layer's own documented trap.
+    if (!::npu::target::check_kv_caps(plan_.kv_key, plan_.kv_value, caps(), err)) return false;
     if (!dev_) { err = "xdna: no device attached (host-GEMM mode has no target)"; return false; }
     if (ndesigns_ == 0) { err = "xdna: no design adopted yet (A2: the plan supplies it)"; return false; }
     if (!plan_.loaded()) return true;

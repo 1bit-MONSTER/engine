@@ -975,31 +975,6 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
     }
 
-    // The plan may name this very set (engine#803 A2).  When it does, it has to be the set the
-    // container derives -- same roles, same M/K/N, same artifact -- or the run would take an ELF the
-    // weights were not written for.  A plan without the section agrees trivially, which is what keeps
-    // every plan written before the field meaningful.
-    if (plan_.loaded()) {
-        std::vector<onebit::npu::plan::Plan::Design> derived;
-        derived.reserve((size_t)ndesigns_);
-        for (int i = 0; i < ndesigns_; i++) {
-            onebit::npu::plan::Plan::Design d;
-            // The plan's role is a key, so it takes the unique name; the log keeps role_tag()'s
-            // short tag (where QKVLIN prints as "QKV").
-            d.role = q4nx_design_role_name(designs_[i].role);
-            d.M = designs_[i].M;
-            d.K = designs_[i].K;
-            d.N = designs_[i].N;
-            d.elf = designs_[i].elf_name;
-            derived.push_back(std::move(d));
-        }
-        std::string why;
-        if (!plan_.designs_agree(derived, why)) {
-            err_ = "plan " + plan_path_ + ": " + why;
-            return false;
-        }
-    }
-
     size_t maxB = 0;
     for (int i = 0; i < ndesigns_; i++)
         maxB = std::max(maxB, (size_t)designs_[i].K * (size_t)designs_[i].N);
@@ -1112,6 +1087,34 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
     }
 
+
+    // The plan may name this very set (engine#803 A2a).  Checked HERE and not at the end of the
+    // derivation: the pb16i family appends its split designs and the b8 family rewrites every name
+    // with the _b8 suffix between the derivation and this loop, so this is the first point at
+    // which designs_[] is what a target would actually open.  When it does, it has to be the set the
+    // container derives -- same roles, same M/K/N, same artifact -- or the run would take an ELF the
+    // weights were not written for.  A plan without the section agrees trivially, which is what keeps
+    // every plan written before the field meaningful.
+    if (plan_.loaded()) {
+        std::vector<onebit::npu::plan::Plan::Design> derived;
+        derived.reserve((size_t)ndesigns_);
+        for (int i = 0; i < ndesigns_; i++) {
+            onebit::npu::plan::Plan::Design d;
+            // The plan's role is a key, so it takes the unique name; the log keeps role_tag()'s
+            // short tag (where QKVLIN prints as "QKV").
+            d.role = q4nx_design_role_name(designs_[i].role);
+            d.M = designs_[i].M;
+            d.K = designs_[i].K;
+            d.N = designs_[i].N;
+            d.elf = designs_[i].elf_name;
+            derived.push_back(std::move(d));
+        }
+        std::string why;
+        if (!plan_.designs_agree(derived, why)) {
+            err_ = "plan " + plan_path_ + ": " + why;
+            return false;
+        }
+    }
 
     for (int i = 0; i < ndesigns_; i++) {
         const Q4nxDesignGeom* g = &designs_[i];

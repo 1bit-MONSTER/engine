@@ -1,0 +1,28 @@
+{
+  "id": "27b-t2s2-first-token-20261106",
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX ternary sidecars, sealed single-ELF decode",
+  "metric": {
+    "name": "first token (weight load included)",
+    "value": 22.811,
+    "unit": "s"
+  },
+  "settings": {
+    "device": "accel0",
+    "engine": "1bit t2s2-20261104 (serve-bin)",
+    "model_dir": "~/models/npu/bonsai2-27b-t2s2-serve",
+    "container": "Qwen3.8-27B-NPU2 (qwen3_5, 64 layers, H=5120, ternary sidecars, sealed single-ELF decode set)",
+    "ticket": "npu-hold -t 14 -l 587-27b-row4",
+    "port": "18099",
+    "sampling": "temperature 0, top_k 1, seed 1234, stream=false",
+    "prompt_tokens": 13,
+    "note": "/health answers 4 s after launch, before the container is loaded; the load lands inside the first request"
+  },
+  "instrument": "wall clock of the first request after the serve answered /health, 13-token prompt, 1 completion token",
+  "repeats": 1,
+  "timestamp": "2026-11-06T20:52:41Z",
+  "source": "~/evidence/tmoe-npu/587-27b-row-20261106/r2 warm_1 (this session), task b9e132438",
+  "notes": "Cold only by construction: the serve reports healthy before it loads, so this is load + prefill + one token. Warm 1-token requests on the same prompt are 0.9537 s. Compare the int8 rung's 145.7 s (27b-first-token-after-transpose-20261027) and 435.9 s before the tiled transpose."
+}

@@ -82,12 +82,28 @@ Both facts are asserted on the **installed disk's own boots**, not on the instal
 `PUPMODE=12`, the root's upperdir under `/1bit/<prefix>save/upper`, no squashfs mount coming from `/mnt/tmpfs`, and
 a write to `/root` that is still there after the guest reboots itself.
 
-What the installed machine still is **not**, and what is therefore still open on #712: a **normal user** — the
-appliance is root-only by model (the console, sshd and the model keys all assume root; `sudo` is in the image and
-has no second account to serve), and there is no OS-level **update path** independent of a cycle (a new appliance
-is a new SFS plus the save layer that survives it, which is what the installed save layer buys; `apt` works and its
-packages land in that layer). Those are the remaining half of the issue, and each is a design decision rather than a
-package install.
+### The installed machine's account
+
+An installed machine gets a normal account (`07onboard-user`), created on its first installed boot and kept after:
+`onebit` with a home and bash, **the machine's own keys** (`/data/ssh/authorized_keys`, `0600`, re-applied at every
+installed boot exactly as `20onboard-ssh` does for root), a **locked password** — a key is the only way in, there is no
+console login for it and no `su` from another account — and **one** sudo rule,
+
+```
+onebit ALL=(ALL) NOPASSWD: ALL
+```
+
+appended to Puppy's `/etc/sudoers` once, backed up first and proved by running `sudo -n true` as that account, then
+rolled back if it does not work (a broken sudoers costs root its own sudo). `NOPASSWD` widens nothing here: a key
+authorised for this account is a key root already accepts. Puppy's own rules grant `%users` sudo only with the **root**
+password (`Defaults:users runaspw`), which is no use to an account that has none — hence the explicit rule. The **live
+stick stays root-only**: a machine that boots from RAM and forgets should not mint an account either.
+
+Still open on #712, and each an owner-shaped decision rather than a package install: an **OS-level update path** — a
+supported way to take the next appliance (kernel, initrd, SFS) with the save layer surviving it and a rollback if it
+does not boot; today that is "write the next image", and `apt` updates packages into the save layer but not the OS —
+and the **server-shaped rest** (a firewall default, NTP, hostname and an optional static address in the installer's
+answers, logging that survives without systemd).
 
 ## The Ubuntu plan (history, not a target)
 

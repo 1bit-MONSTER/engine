@@ -23,8 +23,9 @@ alongside `config.json` and `tokenizer.json` (see [npu.md](npu.md), "plan.json: 
 The file is **generated, not hand-written**: `tools/npu_plan.py` writes it from the container's own
 tensor table and `config.json`, and `--check` re-generates and diffs against the file on disk. A model
 directory **without** a `plan.json` keeps the old filename probes, which is what makes the plan additive.
-The loader is `npu/plan/plan.h`; the forward reads the plan at init (`npu/forward/src/q4nx_forward.cpp:510-539`)
-and derives its designs from it instead of probing the kernel directory (`...:833`).
+The loader is `npu/plan/plan.h`; the forward reads the plan at init (`Q4nxNpuForward::init_impl`, the
+`plan.json` block in `npu/forward/src/q4nx_forward.cpp`) and derives its designs from it instead of probing the
+kernel directory.
 
 Four generated plans are checked in next to the code in `configs/plans/` (one per model directory on the
 build box); `tools/npu_plan.py <dir> --check` proves a directory's copy still matches.
@@ -93,7 +94,10 @@ The loader never substitutes a default for something it cannot honour; every ref
   or a non-empty `sealed_elf` on a non-pb16i container.
 
 The forward adds one more check on load: `kernels.tag` must equal the tag the container itself implies
-(`q4nx_forward.cpp:510-539`), so a plan and a container cannot disagree about the artifact family.
+(same block, `Q4nxNpuForward::init_impl` in `npu/forward/src/q4nx_forward.cpp`), so a plan and a container cannot
+disagree about the artifact family. `attention.mode` is the one plan field the container can also state on its own:
+`decision_config.json`'s `attention_mode` decides when there is no plan, and a plan that disagrees with it is refused
+as stale (see [npu.md](npu.md), "the pack's own declaration").
 
 ## What the int8 KV contract is worth, measured
 

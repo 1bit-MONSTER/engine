@@ -146,7 +146,8 @@ the plain row keeps its tolerance.
 **`attention.mode`** (optional, default `causal`) is the mask, not a kernel decision. A pack that declares
 `noncausal_full_attention` in its own `decision_config.json` — a d3 readout pack, trained with every
 full-attention layer seeing the whole prompt — is generated as such, and the forward then encodes a prompt
-bidirectionally: `step_batch()` fills the K/V cache for every row of the batch first and only then attends,
+bidirectionally (the plan is a copy of that declaration: with no plan the container's own word decides, and a plan
+that disagrees with it is refused — [Decisions](#decisions-v1systemone-issue-653)): `step_batch()` fills the K/V cache for every row of the batch first and only then attends,
 so row *r* sees rows after it. The GDN layers keep their causal recurrence (the pack's own runtime keeps it
 too), a sliding layer stays causal, and the mode reads the same numbers only in one shape:
 

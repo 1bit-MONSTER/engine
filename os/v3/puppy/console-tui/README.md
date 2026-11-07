@@ -220,6 +220,16 @@ Nothing is clipped. Every string the widgets see has already been through `wrap_
 `firmware present` cannot become `firmware prese` (cycle 16's board) at any width - there is a test that walks
 widths 8..60 and fails on any output word that is not an input word.
 
+**The first frame is painted before anything is probed**, and that is deliberate (engine#1318). `collect()`
+waits on lemond's three HTTP endpoints (2 s timeout each while the payload is still starting), on
+`llama-server --list-devices` and on `ps`/`netstat`, so building the first `App` from it meant the screen could
+be blank for seconds at boot - on the cycle-31 take stick one of two identical boots had a row scrape tty1 as
+`tty1-screen-empty` (`U2 menu` took the red on the other run). `main` now paints `Facts::idle()` first (file
+reads plus one `ip`: release, mode, hostname, uptime, Secure Boot, addresses, the key hint, the max temperature)
+and the collector thread's first result replaces it on the loop's first pass. The idle frame does not state
+what it has not asked: the panels read `STARTING - the probes have not answered yet` and the log pane says it is
+reading, instead of announcing `LEMONADE DOWN` / `DATA not mounted` about a box that is merely still coming up.
+
 ## Build and install
 
 ```sh

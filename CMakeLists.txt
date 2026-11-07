@@ -835,6 +835,14 @@ add_test(NAME npu_plan COMMAND npu_plan_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
 # target is not built reports "Not Run" (#635).  This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_plan_test)
+# The plan-vs-target rule (npu/target/target.h, check_kv_caps): a plan that asks for a cache the target
+# cannot store is a refusal by name, never a silent f16 store.  Device-free: the refusal happens before any
+# kernel is touched, and it is the same answer for a target that does not exist yet (engine#806 P7a).
+add_executable(npu_target_caps_test tests/npu_target_caps_test.cpp)
+target_include_directories(npu_target_caps_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(npu_target_caps_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_target_caps COMMAND npu_target_caps_test)
+add_dependencies(npu_sampling_test npu_target_caps_test)
 
 # The generator behind that loader: a synthetic model dir, so the fused/split decision and --check are
 # tested without a model or a kernel build.

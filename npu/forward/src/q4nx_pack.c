@@ -158,6 +158,36 @@ void q4nx_host_gemm_f32_padded(const float* A, int a_k, int M, int K, int N, con
     free(pad);
 }
 
+const char* q4nx_design_role_name(Q4nxDesign role) {
+    switch (role) {
+        case Q4NX_DESIGN_QKV: return "QKV";
+        case Q4NX_DESIGN_QKV2: return "QKV2";
+        case Q4NX_DESIGN_O: return "O";
+        case Q4NX_DESIGN_O2: return "O2";
+        case Q4NX_DESIGN_GU: return "GU";
+        case Q4NX_DESIGN_G: return "G";
+        case Q4NX_DESIGN_U: return "U";
+        case Q4NX_DESIGN_D: return "D";
+        case Q4NX_DESIGN_PLEGATE: return "PLEGATE";
+        case Q4NX_DESIGN_PLEPROJ: return "PLEPROJ";
+        case Q4NX_DESIGN_GU2: return "GU2";
+        case Q4NX_DESIGN_D2: return "D2";
+        case Q4NX_DESIGN_QKVLIN: return "QKVLIN";
+        case Q4NX_DESIGN_Z: return "Z";
+        case Q4NX_DESIGN_QA: return "QA";
+        case Q4NX_DESIGN_QB: return "QB";
+        case Q4NX_DESIGN_KVA: return "KVA";
+        case Q4NX_DESIGN_DG: return "DG";
+        case Q4NX_DESIGN_DU: return "DU";
+        case Q4NX_DESIGN_DD: return "DD";
+        case Q4NX_DESIGN_GB: return "GB";
+        case Q4NX_DESIGN_UB: return "UB";
+        case Q4NX_DESIGN_QKVFA_Q: return "QKVFAQ";
+        case Q4NX_DESIGN_QKVFA_KV: return "QKVFAKV";
+        default: return "?";
+    }
+}
+
 /* One standard design: the model's real K and N in, the kernel's grids out, the real widths kept
  * beside them.  Role-specific row counts (q_rows/k_rows/v_rows, gate_rows/up_rows) are the
  * caller's, because only it knows what fills N.  MLA keeps its own derivation: its KVA pad is the

@@ -133,6 +133,17 @@ bytes of JSON. `llama-kvshare-prefill` (llama.cpp `tools/kvshare-prefill`) is th
 a CPU prefill, so the plumbing can be gated with no NPU; the NPU engine is the real one, mapping the
 same descriptors as XDNA BOs.
 
+**What a device-side provider has to write.** The region is the decoder's cache, so its layout is llama.cpp's,
+not ours: per layer, `cache_k_l<L>` and `cache_v_l<L>` are separate tensors, position-major
+`[token][n_embd_k_gqa]`, and the region carries each of them at a 4 KiB boundary in tensor order
+(`src/llama-kv-share.cpp`, `share_layout`). A token's K|V row is contiguous in a prefill's output and is *not*
+contiguous in the cache, so the write has two destinations per layer at two different offsets and the row stride
+inside a tensor is `n_embd_k_gqa`. The provider addresses its **own mapping** of the dma-buf it was handed
+(a driver-made mapping of the imported buffer is the route that poisons the submission, engine#812), and the
+bytes it writes are the bytes the decoder reads: the handoff is `llama_kv_cells_adopt`, so nothing re-checks
+them. Engine#753 is that writer; the engine side of this contract (`?action=share`, `?action=adopt`,
+`llama_kv_cells_adopt`) needs no change for it.
+
 Limits, so nobody reads more into the flag than it does: the region is the model's shared memory — the
 attention cache, plus the recurrent state for a hybrid model (fork 1bit-MONSTER/llama.cpp#181), so a
 27B's GDN state crosses by the same route as its KV. Both sides must be the same pinned llama.cpp, the
@@ -269,32 +280,32 @@ and the buffer bridge first ([docs/hetero-prefill.md](hetero-prefill.md), "What 
 **What it would be worth if it were built.** One formula covers every measurement on the page: with the iGPU at
 `g` ms per row and one NPU tile at `t` ms per 256 rows, the best concurrent split runs both sides to the same
 finish time, and `tools/split_ceiling.py` computes it (with `--gemm-share` for the end-to-end factor, because the
-split cannot touch attention). **Which iGPU rate goes in decides the answer**, and there are two honest ones:
+split cannot touch attention). **Which iGPU rate goes in decides the answer**, and the page has had to correct
+that number twice - once for a device-tick unit (100 MHz, so the ms column had been 10x small) and once for the
+library it was measured on (a Nov-2 install, four days older than the #782 fix in the pin). The rows, with what
+each one is entitled to claim:
 
 | iGPU rate for the 4B `up_gate` (M=16384) | iGPU | per-GEMM ceiling | optimum NPU share | end to end |
 |---|---|---|---|---|
 | microbenchmark, healthy boot (0.313 ms/256 rows) | 20.03 ms | 1.032x | 2 of 64 tiles | 1.017x |
 | microbenchmark, engine#782 build (1.027 ms/256) | 65.71 ms | 1.103x | 6 of 64 tiles | 1.052x |
-| **in-engine prefill capture (1.441 ms/256)** | 92.22 ms | **1.164x** | 9 of 64 tiles | **1.078x** |
-| in-engine, cross-checked by matmul FLOPs (1.055 ms/256) | 67.52 ms | 1.120x | 7 of 64 tiles | 1.059x |
-| in-engine at #754's 4x NPU bar (2.15 ms/tile) | 92.22 ms | **1.650x** | 26 of 64 tiles | **1.254x** |
+| **post-fix pin `fd69590`, microbenchmark (0.313 ms/256)** | **20.03 ms** | **1.032x** | **2 of 64 tiles** | **1.017x** |
+| engine's own prefill, **pre-#782 library** (1.441 ms/256) | 92.22 ms | 1.164x | 9 of 64 tiles | 1.078x |
+| engine's own prefill, **pre-#782 library**, at the 4x NPU bar | 92.22 ms | 1.650x | 26 of 64 tiles | 1.254x |
 
-The "end to end" column uses the measured attention share of this model's pp16384 device time (48.5 %, so 51.5 %
-is GEMM a split could touch). The first two rows are the microbenchmark this page's older sections used; the
-engine's own prefill runs the same shapes **3.4-4.6x slower** than that loop (see `docs/hetero-prefill.md`'s
-corrected third measurement), and against the rate a split would actually run beside, a perfect concurrent split
-is worth **6-8 % of prefill at M=16384**, or ~25 % if the NPU GEMM reaches the 4x bar. That is no longer a
-"nothing to win" answer, which is why this route's missing concurrent path is now the thing that blocks the
-split - not the kernel.
+The row the shipped engine is entitled to is the **third**: main pins `fd69590c`, which carries the kernel fix, and
+the capture the fourth row comes from ran on a library that still referenced the spilling `m128_w8_f2_sb` tiles 24
+times. On that build a perfect concurrent split is worth **~1.7 % of prefill**, which is the number engine#754 is
+blocked on. What is *unrun* is an engine-side capture with the post-fix install - until someone takes it, the best
+estimate is the microbenchmark's rate on the post-fix build, not the stale capture's.
 
 Across the models the scoreboard compares, the same arithmetic from the recorded per-kernel shares gives the
 end-to-end factor, using each model's largest measured prefill kernel as the split-able share (qwen38-27b 39.8 %,
-coder30b-a3b 46.2 %, qwen36-35b-a3b 30.8 %, zaya1-8b 43.8 %, Qwen3-0.6B at 16k 26.2 %): **1.038x-1.070x** at the
-in-engine ceiling, i.e. **4-7 % of prefill**, before the pipeline cost.
+coder30b-a3b 46.2 %, qwen36-35b-a3b 30.8 %, zaya1-8b 43.8 %, Qwen3-0.6B at 16k 26.2 %): **1.008x-1.015x** at the
+post-fix ceiling, i.e. **at most 1.5 % of prefill**, before the pipeline cost. (On the pre-fix library's 1.164x it
+would be 1.038-1.070x - quoted here only so the two cannot be confused again.)
 
-Three caveats, all of which have moved the number before: the iGPU side is a *measurement*, so re-run it before
-quoting a ceiling (`docs/hetero-prefill.md` has now done that four times, the last one correcting a device-tick
-unit error that had made every millisecond 10x too small); the formula assumes the iGPU's time is linear in its
-row count, which it is not (it under-predicts the measured split by ~3 points at M=16384); and M<=2048 is
-unresolved rather than closed - 1.00x at the 1.055 ms reading, 1.143x at 1.441 ms, against measured splits that
-lost 3-5x when the microbenchmark rate was the input.
+Three caveats, all of which have moved the number: the iGPU side is a *measurement*, and a measurement is a claim
+about a build, so print the library path, its mtime and its kernel-generation marker next to it; the formula
+assumes the iGPU's time is linear in its row count, which it is not (it under-predicts the measured split by ~3
+points at M=16384); and M<=2048 is unresolved rather than closed.

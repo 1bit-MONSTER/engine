@@ -94,7 +94,7 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
      "// generated from config/laya-first.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
-add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/laya_checkpoint.cpp app/laya_first.cpp)
+add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -534,7 +534,7 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/route_policy_default.h
      "static const char kDefaultRoutePolicyJson[] = R\"ONEBITPOLICY(${ONEBIT_ROUTE_POLICY_JSON})ONEBITPOLICY\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/route-policy.json)
 add_library(onebit_laya STATIC laya/scorer.cpp laya/safetensors.cpp laya/route.cpp laya/policy.cpp laya/encoder.cpp
-            laya/models.cpp)
+            laya/models.cpp laya/eval.cpp)
 target_include_directories(onebit_laya PUBLIC laya PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(onebit_laya PUBLIC onebit_npu nlohmann_json::nlohmann_json)
 # The engine binary gets `1bit route` and per-request routing through the scorer.
@@ -560,6 +560,11 @@ add_test(NAME laya_models COMMAND laya_models_test ${CMAKE_SOURCE_DIR}/config/la
 # CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
 # keeps the laya_models ctest from reporting "Not Run" without a workflow change.
 add_dependencies(onebit laya_models_test)
+# The routing eval's arithmetic (laya/eval.cpp): accuracy, recall, precision, confusion, ECE, log loss.
+add_executable(laya_eval_test tests/laya_eval_test.cpp)
+target_link_libraries(laya_eval_test PRIVATE onebit_laya nlohmann_json::nlohmann_json)
+add_test(NAME laya_eval COMMAND laya_eval_test)
+add_dependencies(onebit laya_eval_test)
 # Crafted Laya checkpoints the reader and the scorer must refuse (written at run time); runs in CI.
 add_executable(laya_bounds_test tests/laya_bounds_test.cpp)
 target_link_libraries(laya_bounds_test PRIVATE onebit_laya nlohmann_json::nlohmann_json)
@@ -583,6 +588,8 @@ if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # --laya-models: model auto picked per request among the table's rows (docs/laya-models.md)
     add_test(NAME laya_models_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_models_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+    # `1bit route --laya-models --eval / --dump-encoder`: the table's routing measured, the head's input written
+    add_test(NAME laya_eval_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_eval_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # `1bit route --serve`, the resident form the fork calls per request (docs/laya-first.md §8).
     add_test(NAME laya_route_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).

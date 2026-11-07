@@ -111,10 +111,54 @@ numbers a demo HUD reads; every one was measured by serve or reported by the bac
   table's accuracy is measured below, and a fine-tune on the game's own logged decisions is the plan for
   raising it (engine #1313).
 
+## Measuring and fine-tuning the router
+
+```sh
+# accuracy of the table's question over labelled states, by the path serve takes (size gate, then Laya)
+1bit route --laya-models table.json --laya-model DIR --eval cases.jsonl [--json] [--per-case per.jsonl]
+# the decision head's input for each state, for a head-only fine-tune
+1bit route --laya-models table.json --laya-model DIR --dump-encoder cases.jsonl --out dump/ [--rotate]
+```
+
+A case is one JSON line, `{"state": TEXT, "label": CLASS, "src": optional id}`, where `state` is exactly what
+serve classified (the last user message). A line without a `label` is skipped by `--eval`, so a decision log
+whose newest lines have no outcome yet can be passed as it is.
+
+`--eval` prints accuracy, per-class support, recall and precision, the confusion matrix (rows true, columns
+chosen), serve's mean confidence, the mean top probability, ECE (10 equal bins over the top probability), log
+loss and the decision time p50 and p90. Size-gated cases are counted (`gated`), since serve would gate them too.
+
+`--dump-encoder` writes three files to `--out`:
+
+| file | content |
+|---|---|
+| `h.f32` | every sequence's encoder output after the final norm, float32 little-endian rows of `d`, back to back |
+| `cases.jsonl` | per sequence: `src`, `rotation`, `label` (an index into `options`, -1 unlabelled), `options` (the order the sequence carried them), `qtype`, `offset` and `len` (rows in `h.f32`), `markers`, and the engine's own `logits` and `probabilities` |
+| `dump.json` | `d`, `rows`, `cases`, `skipped_size_gated`, `rotate`, the question and the checkpoint |
+
+The head (`type_emb`, the two head layers and `scorer`) maps these rows to the option logits, so a trainer
+needs neither the encoder nor a second tokenizer. The engine's logits in each line let it check first that its
+head reproduces the engine. Size-gated cases are skipped because serve never asks Laya about them. `--rotate`
+writes every rotation of the options with the label moved along, so a fine-tune cannot learn "the first option
+wins".
+
+Measured on this box (`typed-decisions/`, the 20 game steps of the measurement below, the CPU scorer under
+`thermal-run`, 4 cores at nice 19):
+
+| | result |
+|---|---|
+| `--eval` | 19/20, the same single miss as serve's run below; reflex recall 0.917, plan recall 1.000; mean confidence 0.154, ECE 0.248, log loss 0.373; decision p50 1159 ms on 4 cores at nice 19 |
+| `--dump-encoder --rotate` | 40 sequences, 4,404 rows (18 MB) |
+| a torch copy of the head over the dump | reproduces the engine's probabilities within 2.4e-7 (logits 1.3e-6) on all 40 |
+| option order | mean \|p(reflex) in one order - the other\| 0.065 (max 0.171); 1 of 20 decisions flips with the order |
+
 ## Tests
 
 `tests/laya_models_test.cpp` (ctest `laya_models`, no checkpoint): parsing, the question, the pick and
 its fallback, aliases, shared backends, the size gate, the refusals, and the shipped game table.
+`tests/laya_eval_test.cpp` (ctest `laya_eval`, no checkpoint): the eval's arithmetic on hand-computed cases.
+`tests/laya_eval_e2e.sh` (ctest `laya_eval_e2e`, with `ONEBIT_LAYA_ROUTE_MODEL`): `--eval` and `--dump-encoder`
+on the real scorer, the report's counts, the dump's files against each other, the refusals.
 `tests/laya_models_e2e.sh` (ctest `laya_models_e2e`, with `ONEBIT_LAYA_ROUTE_MODEL`): two rows on fake
 llama-servers behind real `1bit serve` children; the reply comes from the row the headers name, pinned and
 cached requests, the decisions log, the table, `/v1/models` and `/metrics`, and the refusals.

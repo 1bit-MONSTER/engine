@@ -57,6 +57,7 @@ int onebit_ort_run_main(int argc, char** argv);
 #include "policy.h"
 #include "route.h"
 #include "route_serve.h"
+#include "route_eval.h"
 #include "scorer.h"
 #endif
 #include "serve.h"
@@ -175,6 +176,7 @@ int run_npu(int argc, char** argv) {
 int run_route(int argc, char** argv) {
     std::string laya_model, state, policy_path, devices_str = "npu,hrx,cpu";
     bool classify = false, serve = false, json_out = false;
+    onebit::RouteEvalOptions ev;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -188,6 +190,12 @@ int run_route(int argc, char** argv) {
         else if (a == "--classify") classify = true;
         else if (a == "--json") json_out = true;
         else if (a == "--serve") serve = true;
+        else if (a == "--laya-models") ev.table = next();
+        else if (a == "--eval") ev.eval_cases = next();
+        else if (a == "--dump-encoder") ev.dump_cases = next();
+        else if (a == "--out") ev.out_dir = next();
+        else if (a == "--per-case") ev.per_case = next();
+        else if (a == "--rotate") ev.rotate = true;
         else if (a == "--help" || a == "-h") {
             std::printf("usage: 1bit route [--laya-model <dir>] --state <text> [--devices npu,hrx,cpu]\n"
                         "                  [--route-policy FILE] [--classify]\n"
@@ -198,10 +206,27 @@ int run_route(int argc, char** argv) {
                         "                  [--route-policy FILE]\n"
                         "  Resident: loads the scorer once, then reads one {\"state\": \"<text>\"} per line\n"
                         "  on stdin and writes one {\"class\",\"confidence\",\"device\",\"decision_ms\"}\n"
-                        "  per line on stdout, after a first {\"ready\":true,\"load_ms\":N} line; EOF exits\n");
+                        "  per line on stdout, after a first {\"ready\":true,\"load_ms\":N} line; EOF exits\n"
+                        "usage: 1bit route --laya-models FILE [--laya-model <dir>] --eval CASES.jsonl [--json]\n"
+                        "                  [--per-case OUT.jsonl]\n"
+                        "  The table's question over labelled states ({\"state\",\"label\"} per line), the path\n"
+                        "  serve --laya-models takes: accuracy, per-class recall and precision, confusion,\n"
+                        "  confidence, ECE, log loss and decision time\n"
+                        "usage: 1bit route --laya-models FILE [--laya-model <dir>] --dump-encoder CASES.jsonl\n"
+                        "                  --out DIR [--rotate]\n"
+                        "  Writes the decision head's input for each case (DIR/h.f32, DIR/cases.jsonl,\n"
+                        "  DIR/dump.json) for a head-only fine-tune; --rotate adds every option order\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
     }
+    if (!ev.table.empty()) {
+        if (serve || !state.empty() || classify)
+            throw std::runtime_error("--laya-models takes --eval or --dump-encoder, not --state, --classify or --serve");
+        ev.laya_model = laya_model;
+        ev.json = json_out;
+        return onebit::run_route_eval(ev);
+    }
+    if (!ev.eval_cases.empty() || !ev.dump_cases.empty()) throw std::runtime_error("--eval and --dump-encoder need --laya-models FILE");
     if (!serve && state.empty()) throw std::runtime_error("--state <text> is required");
 
     std::vector<std::string> devices;

@@ -560,6 +560,17 @@ bool Scorer::score(const std::string& state, const std::vector<Question>& questi
         layernorm(h.data(), final_norm_.data(), nullptr, N * L, D, tmp.data());
         h.swap(tmp);
     }
+    if (raw && raw->keep_encoder) {
+        raw->d = D;
+        raw->encoder.assign(N, {});
+        raw->markers.assign(N, {});
+        raw->qtype.assign(qtype.begin(), qtype.end());
+        for (int b = 0; b < N; ++b) {
+            const float* row = h.data() + (size_t)b * L * D;
+            raw->encoder[b].assign(row, row + seqs[b].size() * D);
+            raw->markers[b] = markers[b];
+        }
+    }
 
     // ---- decision head ----
     for (int b = 0; b < N; ++b) {

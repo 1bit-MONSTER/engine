@@ -4762,7 +4762,16 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
         const int T = i_wide >= 0 ? designs_[i_wide].N : 0;
         const int ntiles = T > 0 ? (NV + T - 1) / T : 0;
         I8Ctx* hctx = i_wide >= 0 ? xd_->pick_ctx(i_wide, M) : nullptr;
-        if (hctx && !hctx->gemv && M <= hctx->MD && (int)lm_head_packed_.size() == ntiles &&
+        // A verify batch may be wider than the twin's row capacity (mtp_acceptance measures up to 128 rows).
+        // The launch is then made in CHUNKS of at most MD rows rather than falling back to one launch per
+        // row: the weights are already resident, so a chunk costs one launch, and M=128 becomes 8 launches
+        // instead of 128.  A row's activation scale is its own either way, so the chunking cannot move a
+        // value -- the numeric gate is the same per-row comparison.
+        // NPU_HEAD_NO_CHUNK=1 runs the same code with one row per chunk, which is what this path did before
+        // chunking existed: the A/B for the claim, on the same artifacts and in the same process.
+        static const bool chunk_on = getenv("NPU_HEAD_NO_CHUNK") == nullptr;
+        const int chunk = (!chunk_on || !hctx || hctx->MD <= 0) ? (chunk_on ? 0 : 1) : hctx->MD;
+        if (hctx && !hctx->gemv && chunk > 0 && (int)lm_head_packed_.size() == ntiles &&
             lm_head_packed_T_ == T) {
             I8Ctx& lctx = *hctx;
             const float inv_es = (sem_.tie_embeddings && sem_.embed_scale > 0)
@@ -4780,11 +4789,14 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
                 scales[(size_t)m] = amax > 0 ? amax / 127.0f : 1.0f;
             }
             bool ok_all = true;
-            for (int t = 0; t < ntiles && ok_all; t++) {
+            for (int r0 = 0; r0 < M && ok_all; r0 += chunk) {
+                const int rows = std::min(chunk, M - r0);
+                for (int t = 0; t < ntiles && ok_all; t++) {
                 const int n0 = t * T, n1 = std::min(NV, n0 + T);
                 const auto t0 = std::chrono::steady_clock::now();
-                xrt::run r = lctx.launch_async_with_bo_rows(*lm_head_packed_[(size_t)t].bo, hs.data(),
-                                                           M, H, scales.data());
+                xrt::run r = lctx.launch_async_with_bo_rows(*lm_head_packed_[(size_t)t].bo,
+                                                           hs.data() + (size_t)r0 * (size_t)H,
+                                                           rows, H, scales.data() + r0);
                 const auto t1 = std::chrono::steady_clock::now();
                 lctx.wait_kernel(r);
                 const auto t2 = std::chrono::steady_clock::now();
@@ -4802,16 +4814,17 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
                     break;
                 }
                 const std::vector<float>& gs = lm_head_packed_[(size_t)t].scales;
-                for (int m = 0; m < M; m++) {
+                for (int m = 0; m < rows; m++) {
                     const int32_t* cr = lctx.Cm + (size_t)m * (size_t)lctx.ND;
-                    float* dst = &logits_all[(size_t)m * (size_t)NV];
-                    const float as = scales[(size_t)m];
+                    float* dst = &logits_all[(size_t)(r0 + m) * (size_t)NV];
+                    const float as = scales[(size_t)(r0 + m)];
                     for (int n = n0; n < n1; n++) {
                         float v = (float)cr[n - n0] * as * gs[(size_t)(n - n0)];
                         if (sem_.logit_softcap > 0)
                             v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
                         dst[(size_t)n] = v;
                     }
+                }
                 }
             }
             if (ok_all) return true;

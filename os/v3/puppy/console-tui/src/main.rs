@@ -258,7 +258,12 @@ fn run() -> ExitCode {
         }
     });
 
-    let mut app = App::new(Facts::collect());
+    // The first frame is painted from `Facts::idle()`, not from a collect: `collect()` waits on lemond's
+    // HTTP endpoints and on `llama-server --list-devices`, so at boot the first paint could land seconds
+    // later - long enough for a scrape of tty1 to read an empty screen (cycle 31: `tty1-screen-empty` on
+    // one of two identical boots, `U2 menu` on the other). The collector thread's first result replaces
+    // these facts on the loop's first pass, so the screen is truthful as soon as the payload answers.
+    let mut app = App::new(Facts::idle());
     // asked once: sshd sets SSH_CONNECTION/SSH_TTY for the whole session, tty1 respawn sets neither
     app.ssh = over_ssh();
     let mut last_spin = Instant::now();

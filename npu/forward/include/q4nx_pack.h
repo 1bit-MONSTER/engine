@@ -156,6 +156,20 @@ int q4nx_pad_n(int n);
  * designs (they do not set real_k) on their existing path. */
 void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out);
 
+/* The model's own fallback GEMM: C[M,N] = A[M,a_k] x B[K,N], with the activation rows READ AT STRIDE
+ * `a_k` and PADDED to the design's K before the multiply.  `out` gets M*N floats (written, not
+ * accumulated into).
+ *
+ * It exists because the padding above and this loop are one decision, not two: a caller that pads for
+ * the kernel but not for the host fallback runs the `for (k < K) A[k]` read past the end of the
+ * model's real-width activation buffer -- and in the rows form at stride K from a buffer laid out at
+ * stride a_k, so every row after the first is misaligned as well as overrun (engine#845's contract;
+ * found in review of engine#808, where the split moved the pad into the XDNA target and left the host
+ * branch behind on the raw A).  Keeping the pad and the loop in one function is what makes that class
+ * of mistake unavailable to a future caller. */
+void q4nx_host_gemm_f32_padded(const float* A, int a_k, int M, int K, int N, const float* Bmat,
+                              float* out);
+
 
 /* Architecture dims a design set is derived from. */
 typedef struct {

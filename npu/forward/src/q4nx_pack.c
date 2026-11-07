@@ -21,6 +21,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* A model whose attention width varies by layer type (Gemma4 full vs sliding)
  * needs a second QKV and O geometry derived from its other head_dim. */
@@ -128,6 +129,33 @@ void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
         memcpy(d, A + (size_t)m * (size_t)w, sizeof(float) * (size_t)w);
         if (w < K) memset(d + w, 0, sizeof(float) * (size_t)(K - w));
     }
+}
+
+void q4nx_host_gemm_f32_padded(const float* A, int a_k, int M, int K, int N, const float* Bmat,
+                              float* out) {
+    if (!A || !Bmat || !out || M <= 0 || K <= 0 || N <= 0) return;
+    /* Same rule as the pad helper: real_k <= 0 (MLA designs) or >= K means nothing to pad. */
+    const int w = (a_k <= 0 || a_k > K) ? K : a_k;
+    float* pad = NULL;
+    const float* src = A;
+    if (w < K) {
+        pad = (float*)malloc(sizeof(float) * (size_t)M * (size_t)K);
+        if (!pad) return;   /* out stays as the caller left it; the forward reports a failed init */
+        q4nx_pad_a_f32(A, M, w, K, pad);
+        src = pad;
+    }
+    for (int m = 0; m < M; m++) {
+        const float* arow = src + (size_t)m * (size_t)K;
+        float* orow = out + (size_t)m * (size_t)N;
+        memset(orow, 0, sizeof(float) * (size_t)N);
+        for (int k = 0; k < K; k++) {
+            const float a = arow[k];
+            if (a == 0.0f) continue;
+            const float* brow = Bmat + (size_t)k * (size_t)N;
+            for (int n = 0; n < N; n++) orow[n] += a * brow[n];
+        }
+    }
+    free(pad);
 }
 
 /* One standard design: the model's real K and N in, the kernel's grids out, the real widths kept

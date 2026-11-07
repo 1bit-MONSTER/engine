@@ -57,7 +57,8 @@ for label, gpu_ms, want, tol in (
 #     actually run beside -- the microbenchmark is 3-4x faster than the engine -- so a regression here is the
 #     difference between "the split cannot pay" and "it pays".
 for label, gpu_ms, tile_ms, want, want_tiles in (
-    ("in-engine 1.441 ms/256 rows, today's tile", 92.224, 8.61, 1.164, 9),
+    ("post-fix runtime 0.855 ms/256 rows", 54.72, 8.61, 1.085, 5),
+    ("in-engine 1.441 ms/256 rows, pre-#782 library", 92.224, 8.61, 1.164, 9),
     ("in-engine at the 4x bar (2.15 ms/tile)", 92.224, 2.15, 1.650, 26),
     ("in-engine, slower per-dispatch reading 2.883 ms/256 rows", 184.512, 8.61, 1.333, 16),
 ):

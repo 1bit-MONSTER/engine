@@ -290,20 +290,23 @@ each one is entitled to claim:
 | microbenchmark, healthy boot (0.313 ms/256 rows) | 20.03 ms | 1.032x | 2 of 64 tiles | 1.017x |
 | microbenchmark, engine#782 build (1.027 ms/256) | 65.71 ms | 1.103x | 6 of 64 tiles | 1.052x |
 | **post-fix pin `fd69590`, microbenchmark (0.313 ms/256)** | **20.03 ms** | **1.032x** | **2 of 64 tiles** | **1.017x** |
+| **post-fix runtime, engine's own capture (0.855 ms/256)** | **54.72 ms** | **1.085x** | **5 of 64 tiles** | **1.035x** |
 | engine's own prefill, **pre-#782 library** (1.441 ms/256) | 92.22 ms | 1.164x | 9 of 64 tiles | 1.078x |
 | engine's own prefill, **pre-#782 library**, at the 4x NPU bar | 92.22 ms | 1.650x | 26 of 64 tiles | 1.254x |
 
-The row the shipped engine is entitled to is the **third**: main pins `fd69590c`, which carries the kernel fix, and
-the capture the fourth row comes from ran on a library that still referenced the spilling `m128_w8_f2_sb` tiles 24
-times. On that build a perfect concurrent split is worth **~1.7 % of prefill**, which is the number engine#754 is
-blocked on. What is *unrun* is an engine-side capture with the post-fix install - until someone takes it, the best
-estimate is the microbenchmark's rate on the post-fix build, not the stale capture's.
+The rows the shipped engine is entitled to are the **third and the fifth**, and they bracket the answer: main pins
+`fd69590c`, which carries the kernel fix, and on that runtime the engine's own capture (2026-11-07, `docs/hetero-prefill.md`
+"Fourth measurement") puts the iGPU at **0.43-0.86 ms per 256-row group**, i.e. a **1.085x** per-GEMM ceiling and
+**1.035x** end to end - because attention grew to **57.1 %** of the cell once the matmuls got 2.3x faster. So a perfect
+concurrent split is worth **2-3.5 % of prefill**, and the microbenchmark's 1.017x is the optimistic edge of the same answer,
+not a different one. The fourth row (1.164x, the pre-#782 library) is kept only as the record of a measurement that was right
+about its own binary and wrong about the engine.
 
-Across the models the scoreboard compares, the same arithmetic from the recorded per-kernel shares gives the
-end-to-end factor, using each model's largest measured prefill kernel as the split-able share (qwen38-27b 39.8 %,
-coder30b-a3b 46.2 %, qwen36-35b-a3b 30.8 %, zaya1-8b 43.8 %, Qwen3-0.6B at 16k 26.2 %): **1.008x-1.015x** at the
-post-fix ceiling, i.e. **at most 1.5 % of prefill**, before the pipeline cost. (On the pre-fix library's 1.164x it
-would be 1.038-1.070x - quoted here only so the two cannot be confused again.)
+Across the models the scoreboard compares, the same arithmetic gives the end-to-end factor from each model's measured
+split-able share - which on the post-fix runtime is **smaller** than the older shares because attention grew: Qwen3-4B is
+57.1 % attention at pp16384, and the other models' largest prefill kernel was 26.2-46.2 % of busy. At the post-fix
+engine's own ceiling (1.085x) that is **1.021x-1.036x**, i.e. **2-3.5 % of prefill**, before the pipeline cost. (The
+pre-fix library's 1.164x would give 1.038-1.070x; quoted only so the two cannot be confused again.)
 
 Three caveats, all of which have moved the number: the iGPU side is a *measurement*, and a measurement is a claim
 about a build, so print the library path, its mtime and its kernel-generation marker next to it; the formula

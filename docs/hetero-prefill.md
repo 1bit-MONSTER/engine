@@ -178,9 +178,10 @@ numbers of this document dated, and to re-run the ratio before anyone quotes a c
 > So the 1.441 ms and 1.055 ms per 256-row group below are the **regressed** kernel selection, the "3.4-4.6x slower than the
 > microbenchmark" is #782 seen through a stale install rather than a dispatch-side gap, and on a post-fix library the iGPU
 > side of the ratio is the microbenchmark's own 0.29-0.31 ms per group (27-30x from the NPU) unless a post-fix **capture**
-> says otherwise - which is unrun. What that restores is the page's original verdict: **on a fixed build the split does not
-> pay** (ceiling ~1.03x), and #754's bar stands. The genuinely new finding of the whole exercise is the deployment one: a
-> capture harness can silently measure a four-day-old runtime, and the wall clock (653 tok/s) looked plausible on both.
+> says otherwise - and the post-fix capture below now says it does not: **0.855 ms per 256-row group, a 10x asymmetry,
+> 1.085x per GEMM, 1.035x end to end**. What that restores is the page's original verdict: **on a fixed build the split does
+> not pay**, and #754's bar stands. The genuinely new finding of the whole exercise is the deployment one: a capture harness
+> can silently measure a four-day-old runtime, and the wall clock (653 tok/s) looked plausible on both.
 
 That is exactly what the paragraph above asked for. The 12.4 TFLOP-s boot was **engine#782**, attributed
 (2026-11-06 08:26Z) to the compiler that built the embedded device code — clang-23 objects in
@@ -225,9 +226,8 @@ Either reading puts **that build's** iGPU at **1.06-1.44 ms per 256-row group** 
 per tile: an asymmetry of **6-8x** - and it is **3.4-4.6x slower than the microbenchmark this page's first two
 measurements used** (0.313 ms per 256-row group, 40.7 TFLOP-s). Reading that as a "loop-to-engine gap" was my
 first conclusion and it was wrong: the capture ran on the pre-#782 library (second correction above), and the
-post-fix library does not contain those tiles at all. **A post-fix capture is unrun**, so what is known is the
-microbenchmark's rate on the post-fix build and nothing about the engine's own prefill on it - which is the one
-measurement this page still owes.
+post-fix library does not contain those tiles at all. That capture was the last thing this page owed, and it has
+now been taken (next subsection).
 
 **What that does to the bar**, stated for both builds so neither can be quoted alone. On the **pre-#782 library
 the capture ran**: iGPU 1.441 ms per 256 rows, NPU 8.61 ms per tile, 64 row-groups at M=16384, iGPU-only =
@@ -243,6 +243,47 @@ across the models the Supreme board compares (`~/lb/prefill-split/RANKED-FOR-SUP
 prefill on the box is `bonsai2-27b-ternary` at **144-152 tok/s**, and its device time is **93-96 %** in
 three **f32** wmma kernels — a 1-bit model doing f32 prefill math. That is ~7.8 TFLOP-s of effective
 work, from wall clock rather than the capture, so the unit correction does not touch it.
+
+### Fourth measurement, 2026-11-07 18:34 (`gpu-hold`, 217 s): the post-fix capture, and it is the last number this page owed
+
+Taken on the runtime the *pin* builds, not the one the earlier captures were pointed at: `llama-bench` built into
+`~/.cache/hw-gate/build-13a7fda57a` (2026-11-06, gpu-kernels `fd69590`, `strings … | grep -c m128_w8_f2_sb` = **0**), with
+`libhrx` from `~/wt/c6-control` (`b99203c2`, the pin + #895's event ring) so a 36 688-dispatch pp16384 session captures at
+all. `llama-bench -dev HRX0 -ngl 99`, no-SVM trio, pp2048 and pp16384, one profiled rep each:
+
+| pp16384 | device time | share of busy | dispatches | per dispatch |
+|---|---:|---:|---:|---:|
+| attention (`fa_prompt_f16_d128`, now `k_c8f927eca76a`) | 12 364.7 ms | **57.1 %** | 2 304 | 5.367 ms |
+| `ggml_mul_mat_q4_k_f16_wmma_prefill_wave32` | 4 069.9 ms | 18.8 % | 9 216 | 0.442 ms |
+| `ggml_mul_mat_swiglu_q4_k_f16_wmma_prefill_wave32` | 3 830.2 ms | 17.7 % | 2 240 | **1.710 ms** |
+| `ggml_mul_mat_q6_k_f16_wmma_prefill_wave32` | 1 443.8 ms | 6.7 % | 2 240 | 0.645 ms |
+
+**The engine's matmuls on the post-fix runtime**, three readings of the same capture: `swiglu_q4_k` at 1.710 ms per
+dispatch is **0.855 ms per 256-row group** (the page's conservative reading), the total weight-matmul time (9 343.9 ms for
+two prefills) against 131.8 TFLOP is **28.2 TFLOP-s**, which is 0.452 ms per group. So the in-engine rate is
+**0.43-0.86 ms per group** - and the microbenchmark on the same pin (0.313 ms) is only **1.4x** faster, not the 3.4-4.6x
+that the stale library implied. That is the "loop-to-engine gap" as it actually stands: real, modest, and no longer an
+explanation for anything.
+
+| | pre-fix library (Nov-2) | **post-fix runtime (this capture)** | microbenchmark on the pin |
+|---|---:|---:|---:|
+| iGPU per 256-row group | 1.441 ms | **0.855 ms** (0.43-0.45 by FLOPs) | 0.313 ms |
+| weight matmuls | 12.1 TFLOP-s | **28.2 TFLOP-s** | 40.7 TFLOP-s |
+| asymmetry vs the 8.61 ms NPU tile | 6x | **10x** | 27x |
+| per-GEMM ceiling, M=16384 | 1.164x | **1.085x** (1.049x on the faster reading) | 1.032x |
+| attention share of busy | 48.5 % | **57.1 %** | - |
+| end to end | 1.078x | **1.035x** (1.021x) | 1.017x |
+
+So the fourth measurement lands between the two earlier answers and closer to the page's original one: a perfect concurrent
+split is worth **2-3.5 % of prefill** on a post-fix engine, because as the matmuls got 2.3x faster the attention share grew
+from 48.5 % to 57.1 % and the split can only touch the other 42.9 %. The bar in #754 therefore still stands, and the M<=2048
+cell is answered rather than closed: at pp2048 the same capture gives 0.435 ms per `q4_k` dispatch and 1.661 ms per `swiglu`
+dispatch (8 row-groups), i.e. 13.3 ms of iGPU work against one 8.61 ms NPU tile - one tile helps by ~1.1x there, and no more.
+
+**One caveat that is not about the kernels**: that hw-gate build's *wall clock* is far below the shipped runtime's
+(660 tok/s at pp2048 against 1564 on the Nov-2 runtime, with **79.9 %** of the pp2048 device span idle). Its per-kernel
+*busy-time* numbers are the usable part - shares and per-dispatch times - and this subsection uses only those. The build is a
+gate build, not a release build, and the idle says so.
 
 ### The scheduling half, which the ratio alone does not cover
 

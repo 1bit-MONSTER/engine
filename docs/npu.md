@@ -1840,6 +1840,13 @@ the images it writes.
 `--live --match` scores both **at the loop's own chain positions** (so the two per-depth tables are one measurement
 sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
 
+`tools/mtp_depth_pool.py` pools those tickets. It refuses a pool it cannot read (a repeated tail, a cell scored twice, a
+short read, a mixed budget, a mixed window identity) and, since the tau=0.6 window, it also says when a depth is too
+**thin** to carry the 2 pp bar: one chain moves a depth's rate by `100/n` pp, so under 50 chains a single accepted draft
+is worth more than the whole bar. Those depths keep their PASS/FAIL (the bar is the brief's criterion) but print
+`(thin: N live chain(s), one chain = X pp > the 2 pp bar)` and are counted out of the summary line, because a bare FAIL
+on 2 chains reads as a drafter regression when it is arithmetic.
+
 **The one thing that must be right**: the drafter attends over its own states, so its cache has to be the base
 model's *committed stream, row by row*. Feeding it only the current chain is silent — drafts get worse, the text
 stays correct — and it cost this project 69 % → 14 % first-draft acceptance until the cursor was made a checked

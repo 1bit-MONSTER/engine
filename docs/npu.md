@@ -1987,6 +1987,16 @@ Not on the models it runs today: the route is correctness-first, speed next, and
 on the [NPU leaderboard](npu-leaderboard.md). It is a second device beside the iGPU, not a
 replacement for it.
 
+### How accurate is the NPU route?
+
+Measured, not assumed: `tools/gsm8k_eval.py` posts the first N GSM8K test questions to any
+OpenAI-compatible route with greedy decoding, reads the number the model writes after `####` (the
+dataset's own answer format), and keeps a per-question transcript so a claimed percentage can be
+re-graded offline without the device. Answers cut off by the token budget are counted **separately**
+from wrong answers — a reasoning model stopped mid-thought is not a maths error — and the summary
+prints both, so "95 % with 2 of 40 cut off" cannot be read as "95 %". The rows it produces are on the
+[NPU leaderboard](npu-leaderboard.md).
+
 ### Can the GPU and the NPU run at the same time?
 
 Yes. The two were measured running together for forty repetitions with no hang and no corruption,

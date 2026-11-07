@@ -414,6 +414,13 @@ def check_q4_1_layout(path, gguf_path, samples=3):
     The block is decoded under every order this repo names and the winner is compared with the
     engine's own; `ours` must win by a wide margin, because "closest of three wrong readings" is
     still a container that would be served as noise.
+
+    Each per-tensor row states only what that tensor showed.  The cause is a property of the whole
+    container, so after the samples it is decided once and appended as a single `container:` line:
+    the order the tiles are actually in when any sample identified a foreign one, "nothing matched
+    the source" when none did, or "partly foreign" when some read as ours and others did not.  That
+    split exists because a foreign converter's order matches cleanly on some tensors and not on
+    others, and a per-tensor "probably not the GGUF" then repeats a wrong diagnosis on most of them.
     """
     table, base, _ = read_header(path)
     q4 = q4_1_names(table)
@@ -421,6 +428,8 @@ def check_q4_1_layout(path, gguf_path, samples=3):
         print(f"  {path}: no q4_1 tensors, nothing to check against the source weights")
         return [], []
     errors, rows = [], []
+    identified = {k: 0 for k in Q4_1_LAYOUTS if k != "ours"}   # samples that named a foreign order
+    accepted = 0                                               # samples that read as the engine's order
     import numpy as np
     for name in spread(q4, samples):
         want, gguf_name = source_block(gguf_path, name)
@@ -456,14 +465,17 @@ def check_q4_1_layout(path, gguf_path, samples=3):
         if ours - others < 0.5 or ours < 0.9:
             best = scores[closest][0]
             if best < 0.9:
-                # No reading matches: the wrong GGUF, or an order this repo cannot name. Saying "not
-                # the engine's order, closest is flm" here would be a claim about a correlation of
-                # -0.003, i.e. about nothing.
+                # No reading matches this tensor: either the tiles are in an order this repo cannot
+                # name, or the GGUF is not the container's source. Which one it is is a property of
+                # the whole container, not of this tensor, so the per-tensor line states the fact and
+                # the container line below decides the cause (a foreign converter's order matches
+                # cleanly on some tensors and not on others, and calling that "probably not the GGUF"
+                # on 168 of 196 tensors is what the review caught).
                 errors.append(
                     f"{name}: no reading of these tiles matches the source weights (best is {closest} "
-                    f"at corr {best:+.4f}): {os.path.basename(gguf_path)} is probably not the GGUF this "
-                    f"container was packed from, or the tiles are in an order this repo cannot name")
+                    f"at corr {best:+.4f})")
             elif closest != "ours":
+                identified[closest] += 1
                 errors.append(
                     f"{name}: the q4_1 tiles are NOT in the order npu/q4nx.cpp decodes (ours corr "
                     f"{ours:+.4f} rel-rms {scores['ours'][1]:.4f}, best of the three is {closest} at "
@@ -479,9 +491,36 @@ def check_q4_1_layout(path, gguf_path, samples=3):
                     f"{scores['ours'][1]:.4f}) but {second} reads {scores[second][0]:+.4f}: the margin "
                     f"is {ours - scores[second][0]:.4f}, under the 0.5 this check needs to call the "
                     f"order. Treated as foreign (engine#1110)")
+        else:
+            accepted += 1
     if not rows:
         errors.append(f"no q4_1 tensor of {path} matched a tensor in {os.path.basename(gguf_path)}: "
                       f"nothing was verified about the tile order")
+    elif errors:
+        # The diagnosis belongs to the container, and it is decided by the evidence rather than
+        # assumed per tensor: if any sample identified a foreign order, the container is in that
+        # order -- including the tensors that match no reading, which are the same order read
+        # imperfectly. Only when nothing at all identified does the source GGUF become the suspect.
+        named = {k: v for k, v in identified.items() if v}
+        if accepted and not named:
+            # Some tiles read as the engine's order and others match nothing: a container assembled
+            # from two sources, or one with a corrupt region -- neither is what this check accepts.
+            errors.append(
+                f"container: {accepted} of {len(rows)} sampled tiles read as the engine's q4_1 order "
+                f"and the rest match no reading at all -- a partly foreign or partly corrupt "
+                f"container (engine#1110); re-pack it from the source GGUF rather than serving it")
+        elif named:
+            worst = max(named, key=lambda k: named[k])
+            errors.append(
+                f"container: the q4_1 tiles are in {worst} order, not the engine's (identified on "
+                f"{named[worst]} of {len(rows)} sampled tensors). This container would load and answer "
+                f"as noise (engine#1110): re-pack it with scripts/repack_gguf.py and a converter that "
+                f"writes this engine's tile order")
+        else:
+            errors.append(
+                f"container: no reading of any sampled tile matched {os.path.basename(gguf_path)} "
+                f"({len(rows)} tensors sampled) -- check that it is the GGUF this container was packed "
+                f"from; if it is, the tiles are in an order this repo cannot name")
     return errors, rows
 
 

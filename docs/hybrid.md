@@ -133,6 +133,17 @@ bytes of JSON. `llama-kvshare-prefill` (llama.cpp `tools/kvshare-prefill`) is th
 a CPU prefill, so the plumbing can be gated with no NPU; the NPU engine is the real one, mapping the
 same descriptors as XDNA BOs.
 
+**What a device-side provider has to write.** The region is the decoder's cache, so its layout is llama.cpp's,
+not ours: per layer, `cache_k_l<L>` and `cache_v_l<L>` are separate tensors, position-major
+`[token][n_embd_k_gqa]`, and the region carries each of them at a 4 KiB boundary in tensor order
+(`src/llama-kv-share.cpp`, `share_layout`). A token's K|V row is contiguous in a prefill's output and is *not*
+contiguous in the cache, so the write has two destinations per layer at two different offsets and the row stride
+inside a tensor is `n_embd_k_gqa`. The provider addresses its **own mapping** of the dma-buf it was handed
+(a driver-made mapping of the imported buffer is the route that poisons the submission, engine#812), and the
+bytes it writes are the bytes the decoder reads: the handoff is `llama_kv_cells_adopt`, so nothing re-checks
+them. Engine#753 is that writer; the engine side of this contract (`?action=share`, `?action=adopt`,
+`llama_kv_cells_adopt`) needs no change for it.
+
 Limits, so nobody reads more into the flag than it does: the region is the model's shared memory — the
 attention cache, plus the recurrent state for a hybrid model (fork 1bit-MONSTER/llama.cpp#181), so a
 27B's GDN state crosses by the same route as its KV. Both sides must be the same pinned llama.cpp, the

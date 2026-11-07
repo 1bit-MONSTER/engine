@@ -116,10 +116,12 @@ SELF_TEST = [
     # measured 1.134x at 4 tiles with mosaic_bench --mode split; the model says 1.104x, so this entry asserts
     # the *gap* rather than the number: the model must stay below the measurement and within 4 points of it
     ("2026-11-06 release-rc libs, 4B down M=16384 (77.97 ms, 10.22 ms/tile)", 77.97, 10.22, 16384, 1.104, 0.04),
-    # The corrected third measurement (review of #1270 at d0122cec): the engine's own prefill capture, read with
-    # the bundle's 99.81 MHz `timestamp_frequency_hz` instead of assuming nanoseconds. These are the three rows
-    # the review recomputed by hand, and they are the numbers a real split would run beside -- the microbenchmark
-    # above is 3.4-4.6x faster than the engine, which is why quoting a ceiling from it was wrong.
+    # The corrected third measurement (review of #1270 at d0122cec), read with the bundle's 99.81 MHz
+    # `timestamp_frequency_hz` instead of assuming nanoseconds. These three rows are what the review recomputed by
+    # hand -- and they are a measurement of a *pre-#782 library*: the capture's `libggml-hrx` was four days older
+    # than the pin and still contained the spilling `m128_w8_f2_sb` tiles (24 references against 0 in the
+    # post-fix build). They are pinned here because they are the arithmetic the discussion quotes, not because
+    # they describe the shipped engine; the row that does is the microbenchmark on the post-fix pin above.
     ("in-engine capture, 1.441 ms/256 rows, today's tile (92.22 ms, 8.61 ms/tile)", 92.224, 8.61, 16384, 1.164, 0.004),
     ("in-engine at #754's 4x bar (2.15 ms/tile)", 92.224, 2.15, 16384, 1.650, 0.01),
     ("in-engine, slower per-dispatch reading 2.883 ms/256 rows", 184.512, 8.61, 16384, 1.333, 0.004),

@@ -557,6 +557,9 @@ add_test(NAME laya_encoder COMMAND laya_encoder_test)
 add_executable(laya_models_test tests/laya_models_test.cpp)
 target_link_libraries(laya_models_test PRIVATE onebit_laya)
 add_test(NAME laya_models COMMAND laya_models_test ${CMAKE_SOURCE_DIR}/config/laya-models-game.json)
+# CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
+# keeps the laya_models ctest from reporting "Not Run" without a workflow change.
+add_dependencies(onebit laya_models_test)
 # Crafted Laya checkpoints the reader and the scorer must refuse (written at run time); runs in CI.
 add_executable(laya_bounds_test tests/laya_bounds_test.cpp)
 target_link_libraries(laya_bounds_test PRIVATE onebit_laya nlohmann_json::nlohmann_json)

@@ -227,10 +227,29 @@ printf 'node     %s\n' "$PART"
 # ext4 grows in place; the filesystem is not mounted yet, so this is an offline resize - the quick path.
 if [ "$GREW" = 1 ]; then
     command -v resize2fs >/dev/null 2>&1 || die "resize2fs is missing; the data partition grew but its filesystem did not"
-    resize2fs "$PART" >/dev/null 2>&1 || die "resize2fs failed on $PART; the partition grew but the filesystem did not"
-    printf 'grown    %s now holds %.1f GiB of ext4 (was %.1f GiB)\n' "$PART" \
-        "$(awk -v s="$SIZE" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')" \
-        "$(awk -v s="$SIZE0" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')"
+    # engine#1374: an ext4 that needs journal recovery makes resize2fs refuse, and the operator's workaround on c32 was exactly
+    # `e2fsck -f` then resize2fs - the tool should do that itself rather than hand it back as a failed stage. The partition is not
+    # mounted here, so the fsck is offline and safe.
+    if ! resize2fs "$PART" >/dev/null 2>&1; then
+        printf 'grow     resize2fs refused %s; fscking it offline and retrying once (engine#1374)\n' "$PART"
+        command -v e2fsck >/dev/null 2>&1 || die "resize2fs failed on $PART and e2fsck is missing; the partition grew but the filesystem did not"
+        e2fsck -f -y "$PART" >/dev/null 2>&1 || die "e2fsck failed on $PART; the partition grew but the filesystem did not"
+        resize2fs "$PART" >/dev/null 2>&1 || die "resize2fs failed on $PART even after an offline fsck; the partition grew but the filesystem did not"
+    fi
+    # the SIZE in the partition table is the PARTITION's; what a person needs to know is what the FILESYSTEM can hold, which is
+    # the number whose absence made the c32 failure confusing (58.1 GiB partition, 7.8 GiB fs, and a message that claimed both)
+    fsblocks=$(dumpe2fs -h "$PART" 2>/dev/null | sed -n 's/^Block count:[[:space:]]*//p' | head -1)
+    fsbytes=$(dumpe2fs -h "$PART" 2>/dev/null | sed -n 's/^Block size:[[:space:]]*//p' | head -1)
+    if [ -n "${fsblocks:-}" ] && [ -n "${fsbytes:-}" ]; then
+        printf 'grown    %s filesystem now holds %.1f GiB of ext4 (was %.1f GiB); partition %.1f GiB\n' "$PART" \
+            "$(awk -v b="$fsblocks" -v s="$fsbytes" 'BEGIN { print b * s / 1073741824 }')" \
+            "$(awk -v s="$SIZE0" 'BEGIN { print s * 512 / 1073741824 }')" \
+            "$(awk -v s="$SIZE" 'BEGIN { print s * 512 / 1073741824 }')"
+    else
+        printf 'grown    %s partition now holds %.1f GiB (was %.1f GiB); the filesystem size could not be read\n' "$PART" \
+            "$(awk -v s="$SIZE" 'BEGIN { print s * 512 / 1073741824 }')" \
+            "$(awk -v s="$SIZE0" 'BEGIN { print s * 512 / 1073741824 }')"
+    fi
 fi
 
 # ---- mount ---------------------------------------------------------------------------------------
@@ -311,12 +330,41 @@ if [ "$CHECK" = 0 ]; then
         esac
         write_key "$KEY"
     fi
+    # engine#1374: refuse BEFORE writing if the staging will not fit. Without this the first sign of a data partition that did not
+    # grow (or whose filesystem did not resize) is a `cp` that fails part way - and the failure leaves a TRUNCATED model file
+    # behind, which `du -sb` on a partially merged tree does not reliably show. Measured on c32: 6.6 of 7.9 GB landed and
+    # sd_turbo.safetensors was truncated; only a byte comparison against the source found it. 5 % headroom covers ext4's
+    # metadata for many small files; the number is a refusal threshold, not a reservation.
+    want=0
+    for m in $MODELS; do
+        [ -s "$m" ] || die "model $m is empty or missing"
+        sz=$(stat -Lc %s "$m" 2>/dev/null || echo 0)
+        want=$((want + sz))
+    done
+    for d in $NPUMODELS; do
+        sz=$(du -sb "$d" 2>/dev/null | cut -f1)
+        want=$((want + ${sz:-0}))
+    done
+    if [ "$want" -gt 0 ]; then
+        avail=$(df -B1 --output=avail "$MNT" 2>/dev/null | awk 'NR==2 {print $1}')
+        need=$((want + want / 20))
+        if [ -z "${avail:-}" ] || [ "$avail" -lt "$need" ]; then
+            die "the staging needs $((need / 1048576)) MiB (models + 5 % headroom) but $PART has $(( ${avail:-0} / 1048576 )) MiB free: the data partition or its filesystem did not grow. Refusing rather than truncating a model file (engine#1374)"
+        fi
+        printf 'fit      staging needs %s MiB, %s MiB free on %s\n' "$((need / 1048576))" "$((avail / 1048576))" "$PART"
+    fi
     for m in $MODELS; do
         [ -s "$m" ] || die "model $m is empty or missing"
         [ -d "$MNT/models" ] || mkdir -p "$MNT/models"
         cp -f "$m" "$MNT/models/$(basename "$m")" || die "could not copy $m into $MNT/models"
         chown 0:0 "$MNT/models" "$MNT/models/$(basename "$m")" 2>/dev/null
-        printf 'model    models/%s (%s bytes)\n' "$(basename "$m")" "$(stat -Lc %s "$m")"
+        # engine#1374: prove the staged bytes, do not assume them. `cp` returning 0 is not evidence that what is on the medium is
+        # what was asked for - measured on main: a 20 GiB model was "prepared and proved" onto an 8 GiB partition with zero blocks
+        # written, and neither the exit code, `df`, nor the directory entry could tell. cmp is byte-exact and reads neither twice
+        # more than the copy did.
+        cmp -s "$m" "$MNT/models/$(basename "$m")" ||
+            die "the staged models/$(basename "$m") is not byte-identical to $m (a short write, a truncated copy, or the source changed while staging)"
+        printf 'model    models/%s (%s bytes, byte-identical to the source)\n' "$(basename "$m")" "$(stat -Lc %s "$m")"
     done
     for d in $NPUMODELS; do
         name=${d%/}; name=${name##*/}
@@ -326,6 +374,10 @@ if [ "$CHECK" = 0 ]; then
         # -L: on a build box the model directory is symlinks into the FLM install; the stick needs the bytes
         cp -fRL "$d"/. "$MNT/models/$name"/ || die "could not copy the NPU model $d into $MNT/models/$name"
         chown -R 0:0 "$MNT/models/$name" 2>/dev/null
+        # the same proof for a directory of files: every staged file byte-identical to its source (diff -r compares contents and
+        # reports a missing or extra file as a difference too)
+        diff -r -q "$d" "$MNT/models/$name" > /dev/null 2>&1 ||
+            die "the staged models/$name is not byte-identical to $d (run: diff -r $d $MNT/models/$name)"
         printf 'npu      models/%s (%s files, %s bytes)\n' "$name" \
             "$(find "$MNT/models/$name" -type f | wc -l)" "$(du -sb "$MNT/models/$name" | cut -f1)"
     done

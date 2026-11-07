@@ -313,7 +313,6 @@ done
 say ""
 say "INSTALLED: 1bit OS on $dev (ESP $ESP_LABEL, data $DATA_LABEL, UUID=$datauuid)"
 say "  persistent: /1bit/$save_name is this machine's writable root (PUPMODE=12), SFS mounted from the disk"
-say "  reboot and remove the stick: the firmware boots Boot$new first."
 say "  the firmware boots Boot$new first."
 say "  then: 1bit-release-check   (it says INSTALLED and runs the same rows)"
 

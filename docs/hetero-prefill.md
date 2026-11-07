@@ -153,7 +153,7 @@ split on the degraded boot is still 3x slower than 20.0 ms of iGPU-only on the h
 taken from a 3.3x loss is not a reason to build a split dispatcher; it is a reason to keep the iGPU
 numbers of this document dated, and to re-run the ratio before anyone quotes a ceiling from it.
 
-### Third measurement, 2026-11-06 15:09, **corrected 20:5x** (one 3-minute `gpu-hold` arm): #782 is fixed, the in-engine iGPU is 3.4-4.6x slower than the microbenchmark, and the split's ceiling is ~1.12-1.16x, not ~1.03x
+### Third measurement, 2026-11-06 15:09 — corrected twice: the device-tick unit (10x), and then the library it ran on (pre-#782, so the split does **not** pay after all)
 
 > **Correction, 2026-11-06 20:5x, from the review of #1270 at `d0122cec`.** The first version of this section read
 > the capture's `start_tick`/`end_tick` as nanoseconds. They are `device_tick` units: the bundle's own
@@ -163,6 +163,24 @@ numbers of this document dated, and to re-run the ratio before anyone quotes a c
 > the same bundles with `iree-profile export --format=ireeperf-jsonl` and
 > `~/lb/prefill-split/review-1270-recompute.py`. The tok/s rows and the kernel *shares* are ratio-only and never
 > depended on the unit; the ms columns, the gaps line and every derived ceiling did.
+>
+> **Second correction, 2026-11-07 07:0x.** The unit fix stands, and so does every corrected number *for the binary it was
+> taken on* - but that binary was running a **pre-#782 library**, so the conclusion drawn from it was wrong. The harness
+> (`~/lb/exp50-split-ratio.sh`) sets `LD_LIBRARY_PATH=~/wt/c6-control`, which contains **only `libhrx`**; `libggml-hrx`
+> therefore comes from the binary's RUNPATH, `~/wt/release-rc/work/build/hrx/llama/bin/libggml-hrx.so.0.18.0`, and that file is
+> dated **2026-11-02 07:03** - four days before the #782 fix. Two device-free checks settle it: that library references
+> `m128_w8_f2_sb` **24 times**, while the post-fix build at `~/.cache/hw-gate/build-13a7fda57a/bin` (2026-11-06 16:12,
+> gpu-kernels `fd69590`) references it **0 times**, and `origin/main`'s `config/gpu-kernels.config` pins
+> `fd69590c6c471507f6d804751f38473261436350` - i.e. **the pin already carries the fix; the installed runtime the capture
+> used was stale**. The pp2048 anchor could not have caught this: pp2048 is below the M=2048 knee, which is why it is fast
+> on both builds.
+>
+> So the 1.441 ms and 1.055 ms per 256-row group below are the **regressed** kernel selection, the "3.4-4.6x slower than the
+> microbenchmark" is #782 seen through a stale install rather than a dispatch-side gap, and on a post-fix library the iGPU
+> side of the ratio is the microbenchmark's own 0.29-0.31 ms per group (27-30x from the NPU) unless a post-fix **capture**
+> says otherwise - which is unrun. What that restores is the page's original verdict: **on a fixed build the split does not
+> pay** (ceiling ~1.03x), and #754's bar stands. The genuinely new finding of the whole exercise is the deployment one: a
+> capture harness can silently measure a four-day-old runtime, and the wall clock (653 tok/s) looked plausible on both.
 
 That is exactly what the paragraph above asked for. The 12.4 TFLOP-s boot was **engine#782**, attributed
 (2026-11-06 08:26Z) to the compiler that built the embedded device code — clang-23 objects in
@@ -203,22 +221,22 @@ A second reading from the same capture agrees with that within 30 %: the three w
 16 384 tokens are 2 x 4.02e9 x 16 384 = **131.8 TFLOP**, i.e. **12.1 TFLOP-s** in the engine - which is
 **1.055 ms** per 12.75-GFLOP 256-row `up_gate` group.
 
-Either reading puts the in-engine iGPU at **1.06-1.44 ms per 256-row group** against the NPU's **8.61 ms**
-per tile: an asymmetry of **6-8x**, not 30x. And it is **3.4-4.6x slower than the microbenchmark this page's
-first two measurements used** (0.313 ms per 256-row group, 40.7 TFLOP-s). That gap is the interesting result
-of the correction: `mosaic_bench` times a bare `ggml_hrx` MUL_MAT in a loop, while the engine's prefill runs
-the same shapes through its own dispatch chain, and the engine is several times off it. Prefill wall time
-agrees with the engine side (653 tok/s on a 4B is ~5.9 TFLOP-s end to end, ~12 TFLOP-s of matmul), not with
-the loop.
+Either reading puts **that build's** iGPU at **1.06-1.44 ms per 256-row group** against the NPU's **8.61 ms**
+per tile: an asymmetry of **6-8x** - and it is **3.4-4.6x slower than the microbenchmark this page's first two
+measurements used** (0.313 ms per 256-row group, 40.7 TFLOP-s). Reading that as a "loop-to-engine gap" was my
+first conclusion and it was wrong: the capture ran on the pre-#782 library (second correction above), and the
+post-fix library does not contain those tiles at all. **A post-fix capture is unrun**, so what is known is the
+microbenchmark's rate on the post-fix build and nothing about the engine's own prefill on it - which is the one
+measurement this page still owes.
 
-**What that does to the bar.** Balancing the two sides row-group by row-group (in-engine iGPU 1.441 ms per
-256 rows, NPU 8.61 ms per tile, 64 row-groups at M=16384, iGPU-only = 92.2 ms): the optimum puts **9**
-row-groups on the NPU and runs both sides to **79.3 ms**, a **1.164x** ceiling; the 1.055 ms reading gives
-7 groups and **1.120x**. So the split clears #754's per-GEMM target at today's NPU, with no faster kernel at
-all - and #754's own "~4x faster NPU GEMM" bar (2.15 ms per tile) would put 26 row-groups on the NPU and the
-ceiling at **1.650x**, with an end-to-end **~1.25x** because attention is 48.5 % of the cell. At M=2048 the
-answer depends on the reading (1.00x at 1.055 ms, 1.143x at 1.441 ms), so the small-M cell is unresolved
-rather than closed.
+**What that does to the bar**, stated for both builds so neither can be quoted alone. On the **pre-#782 library
+the capture ran**: iGPU 1.441 ms per 256 rows, NPU 8.61 ms per tile, 64 row-groups at M=16384, iGPU-only =
+92.2 ms -> 9 row-groups on the NPU, both sides at 79.3 ms, **1.164x** (1.120x on the 1.055 ms reading), and
+**1.650x** at #754's 2.15 ms/tile bar. On the **post-fix pin** (`fd69590`, the microbenchmark's 0.313 ms per
+group, iGPU-only 20.03 ms): 2 row-groups -> **1.032x**, and **~1.12x** at the same 2.15 ms bar. The second row
+is the one the shipped engine is entitled to, so the page's bar stands: a per-GEMM 15 % needs the NPU near
+1.9 ms per tile (~4.5x), and less end to end because attention is 48.5 % of the cell. M<=2048 stays unresolved:
+1.00x / 1.143x on the pre-fix build, and no measurement on the post-fix one.
 
 **And the model where our prefill really is slow is not an NPU case either.** Measured the same day
 across the models the Supreme board compares (`~/lb/prefill-split/RANKED-FOR-SUPREME.md`): the worst
@@ -247,18 +265,16 @@ From the same capture and the lane's prefill work of 2026-11-06:
   tensor means no reduction pass (their `hetero_compute.cpp:111`, our equivalent is the same), which is
   why the ratio — not the join — is the whole question.
 
-The verdict of this page therefore **changes with the correction**, and it is worth being blunt about
-which way: the first two measurements were microbenchmarks of `ggml-hrx`'s MUL_MAT and said the split
-cannot pay (1.01-1.13x, and only on a degraded boot); the engine's own prefill runs those same shapes
-**3.4-4.6x slower**, and against that rate the split pays **1.12-1.16x per GEMM at M=16384** with today's NPU
-kernel, and ~1.65x per GEMM / ~1.25x end to end if the NPU reaches #754's 4x bar. So the bar in
-[#754](https://github.com/1bit-MONSTER/engine/issues/754) is **not** the blocker it was written as, and the
-microbenchmark is not the rate a split would run beside. What blocks the split now is (a) the hybrid route
-has no concurrent path at all ([docs/hybrid.md](hybrid.md)), (b) the iGPU loses 3.4-4.6x between the loop and
-the engine, which is a dispatch-side question with its own value, and (c) M<=2048 remains unresolved
-(1.00-1.14x depending on which reading of the per-group cost is used). Numbers above: one hold,
-`~/lb/prefill-split/qwen3-4b/` (bundles, CSVs, both stderr logs), harness `~/lb/exp50-split-ratio.sh`,
-recompute `~/lb/prefill-split/review-1270-recompute.py`.
+The verdict of this page is therefore **back where it started, and now for two reasons rather than one**: on a
+build that carries the pinned kernel fix, the split's ceiling is **~1.03x** (2 of 64 row-groups) and the bar in
+[#754](https://github.com/1bit-MONSTER/engine/issues/754) stands. The intermediate reading - "the split pays
+1.12-1.16x, the bar is met" - was a **stale-library artefact**, not a dispatch gap: the capture ran on the Nov-2
+`libggml-hrx`, which still contained the `m128_w8_f2_sb` tiles the pin had already turned off. Two things do
+survive as findings: the **unit correction** (device ticks are 100 MHz, so that page's ms column was 10x out),
+and the **deployment trap** - a harness can measure a four-day-old runtime and produce a plausible wall clock
+(653 tok/s) while doing it. Numbers above: one hold, `~/lb/prefill-split/qwen3-4b/` (bundles, CSVs, both
+stderr logs), harness `~/lb/exp50-split-ratio.sh`, recompute `~/lb/prefill-split/review-1270-recompute.py`,
+and the library evidence is `strings <lib> | grep -c m128_w8_f2_sb` (24 on the capture's, 0 on the pin's).
 
 ## What transfers, and what we will not do
 
@@ -279,12 +295,11 @@ recompute `~/lb/prefill-split/review-1270-recompute.py`.
 - **Port their NPU binaries or their stack.** Prebuilt `.pdi`/instruction blobs are theirs to ship, not
   ours to run; our NPU route is our own full-ELF kernel sets (docs/npu.md). Their ROCm 7.1.1 / kernel
   6.11 / AOCL pins are not this box's.
-- **Quote a ceiling from the microbenchmark alone.** The corrected third measurement is the lesson: a
-  split's payoff is set by the rate the engine *actually* runs at (1.06-1.44 ms per 256-row group, 6-8x
-  from the NPU), not by a loop over one `MUL_MAT` (0.313 ms, 27-45x). The dispatcher itself is no longer
-  ruled out on NPU grounds - at today's NPU kernel the engine-side rate gives a 1.12-1.16x per-GEMM
-  ceiling - it is blocked by the route (no concurrent path), by the 3.4-4.6x loop-to-engine gap, and by the
-  small-M cell being unresolved.
+- **Quote a ceiling from a runtime you have not identified.** That is the real lesson of the two corrections
+  above: the first was a unit error, the second a library four days older than the pin, and either one alone
+  changes the answer by 3-10x. Print the library's path, mtime and kernel-generation marker next to the
+  number (`ldd` plus `strings … | grep -c m128_w8_f2_sb` is enough), the way the capture already prints the
+  model, the pin and the die temperature.
 - **Copy the weights to give the NPU its own layout per layer.** Measured cost: 50 MiB of copies per
   layer for the 4B up_gate (~3.6 ms at 14 GB/s) against a 1.3 % best-case gain.
 
@@ -311,12 +326,11 @@ HeteroMosaic executes on imported handles only because it submits to amdxdna by 
 - [#753](https://github.com/1bit-MONSTER/engine/issues/753) — dma-buf import for the NPU submission
   path: XRT cannot bind an imported BO, so today only iGPU→NPU sharing is possible, and only for
   buffers the NPU cannot yet execute on.
-- [#754](https://github.com/1bit-MONSTER/engine/issues/754) — split-prefill in the hybrid route. Its
-  acceptance bar was "an NPU prefill GEMM ~4x faster", derived from the **microbenchmark** rate; the
-  corrected third measurement re-derives it against the engine's own prefill and the answer is that
-  today's NPU already clears a per-GEMM 15 % (1.12-1.16x at M=16384, 1.65x at the 4x bar). What blocks
-  the split is the route and the loop-to-engine gap, not the kernel -
-  `tools/split_ceiling.py --npu-tile-ms 8.61 --gpu-tile-ms 1.06..1.44 --rows 16384` recomputes it.
+- [#754](https://github.com/1bit-MONSTER/engine/issues/754) — split-prefill in the hybrid route, **blocked
+  on** an NPU prefill GEMM with T>256 weight reuse; on a build that carries the pinned kernel set the
+  ceiling is ~1.03x, and the 4x bar buys ~1.12x per GEMM. What the thread's last round did add is the
+  measurement discipline: the pre-fix-library reading (1.12-1.16x) is reproducible and wrong for this box,
+  and `tools/split_ceiling.py --gpu-tile-ms 0.313 --npu-tile-ms 8.61 --rows 16384` is the post-fix number.
 - `docs/hybrid.md`'s "Running beside the GPU" section already covers the other direction (an NPU stream
   under a busy GPU keeps 87 % of its bandwidth); this page adds the GPU-side view: the iGPU loses
   < 0.2 % when the NPU runs beside it.

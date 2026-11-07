@@ -50,6 +50,11 @@ K_GRID = 256
 N_GRID = 512
 
 
+def mla_config(cfg: dict) -> bool:
+    """The MLA family, which the C side flags from the same keys (q4nx_pack.c derive_mla's caller)."""
+    return bool(cfg.get("q_lora_rank") or cfg.get("kv_lora_rank"))
+
+
 def pad_k(k: int) -> int:
     return (k + K_GRID - 1) // K_GRID * K_GRID
 
@@ -303,7 +308,69 @@ def generate(model_dir: str, kernels: str) -> dict:
         "moe": {"batched_expert_gu": moe_batched(cfg, hidden, model_dir, kernels)},
         "layers": layers,
     }
+    # The per-role kernel set (engine#803 A2a).  Written only when this tool can state the WHOLE set:
+    # the plan's section is checked both ways, so a partial one would be refused at load and a missing
+    # one is exactly today's behaviour (the engine derives it).
+    designs = designs_from_config(cfg, prefill_tag if layout == "b8" else "", fused_gu)
+    if designs is not None:
+        plan["designs"] = designs
     return plan
+
+
+def designs_from_config(cfg: dict, prefill_tag: str, fused_gu: bool) -> list[dict] | None:
+    """The engine's per-role kernel set for this config, or None when this tool cannot state it fully.
+
+    These are the rules q4nx_derive_designs() applies (npu/forward/src/q4nx_pack.c), ported here so a
+    plan can NAME the set instead of the engine re-deriving it (engine#803 A2a).  The port is checked
+    against the C derivation by tests/npu_plan_designs_parity_test.py, which runs both on the same
+    dims and requires identical sets -- the reason this function exists as a function.
+
+    WHY IT RETURNS None FOR SOME MODELS: the plan's `designs` section is checked BOTH ways, so a
+    section that omitted a role the container derives would be refused at load. The families below
+    derive roles this tool does not model yet (MLA's q_a/q_b/kv_a, Gemma4's second attention type and
+    per-layer embeddings and double-wide MLP, GDN's fused q|k|v / z / ssm_out), and for those the right
+    output is NO section -- absent means the engine keeps deriving, which is what every plan written
+    before this field means. Emitting a partial set would be worse than emitting nothing.
+    """
+    if mla_config(cfg) or cfg.get("layer_types") or cfg.get("global_head_dim") or cfg.get("ple_dim") \
+            or cfg.get("use_double_wide_mlp") or cfg.get("linear_num_key_heads"):
+        return None
+    hidden = cfg.get("hidden_size")
+    im = cfg.get("intermediate_size")
+    nh = cfg.get("num_attention_heads", 0)
+    nkv = cfg.get("num_key_value_heads", nh)
+    hd = cfg.get("head_dim") or (hidden // nh if nh else 0)
+    if not (hidden and im and nh and hd and nkv):
+        return None
+
+    def elf(tag: str, k: int, n: int) -> str:
+        return f"full_i8_{tag}_K{pad_k(k)}_N{pad_n(n)}{prefill_tag}.elf"
+
+    # q_rows is the attention width WITHOUT the output gate: attn_output_gate doubles what the q
+    # projection emits (so it doubles QKV's N), but O still reads one head width per head
+    # (q4nx_derive_designs: `q_rows = NH*HD` for O's K, `q_rows * (gate?2:1)` for QKV's N).
+    q_rows = nh * hd
+    qkv_rows = q_rows * (2 if cfg.get("attn_output_gate") else 1)
+    kv_rows = nkv * hd
+    out = [
+        {"role": "QKV", "M": 128, "K": pad_k(hidden), "N": pad_n(qkv_rows + 2 * kv_rows),
+         "elf": elf("QKV", hidden, qkv_rows + 2 * kv_rows)},
+        {"role": "O", "M": 128, "K": pad_k(q_rows), "N": pad_n(hidden),
+         "elf": elf("O", q_rows, hidden)},
+    ]
+    # gate/up is a plan decision the caller already made (the artifact probe above), so it is passed in
+    # rather than probed a second time here: two copies of that rule is how a plan and its images drift.
+    if fused_gu:
+        out.append({"role": "GU", "M": 128, "K": pad_k(hidden), "N": pad_n(2 * im),
+                    "elf": elf("GU", hidden, 2 * im)})
+    else:
+        out.append({"role": "G", "M": 128, "K": pad_k(hidden), "N": pad_n(im),
+                    "elf": elf("G", hidden, im)})
+        out.append({"role": "U", "M": 128, "K": pad_k(hidden), "N": pad_n(im),
+                    "elf": elf("U", hidden, im)})
+    out.append({"role": "D", "M": 128, "K": pad_k(im), "N": pad_n(hidden),
+                "elf": elf("D", im, hidden)})
+    return out
 
 
 def moe_batched(cfg: dict, hidden: int, model_dir: str, kernels: str) -> dict:

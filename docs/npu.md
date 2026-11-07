@@ -146,7 +146,8 @@ the plain row keeps its tolerance.
 **`attention.mode`** (optional, default `causal`) is the mask, not a kernel decision. A pack that declares
 `noncausal_full_attention` in its own `decision_config.json` — a d3 readout pack, trained with every
 full-attention layer seeing the whole prompt — is generated as such, and the forward then encodes a prompt
-bidirectionally: `step_batch()` fills the K/V cache for every row of the batch first and only then attends,
+bidirectionally (the plan is a copy of that declaration: with no plan the container's own word decides, and a plan
+that disagrees with it is refused — [Decisions](#decisions-v1systemone-issue-653)): `step_batch()` fills the K/V cache for every row of the batch first and only then attends,
 so row *r* sees rows after it. The GDN layers keep their causal recurrence (the pack's own runtime keeps it
 too), a sliding layer stays causal, and the mode reads the same numbers only in one shape:
 
@@ -1130,7 +1131,7 @@ engine#587 measured the route on it):
 
 | family (`gguf`) | packs in the 2026-11-06 body | `backends` | NPU route answer |
 |---|---|---|---|
-| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx, npu | **served, and measured** (engine#587): the same `Qwen3.8-27B-NPU2` family runs on the NPU route — 0.2902 s/token (3.45 tok/s) and 19.55 tok/s of prefill on the sealed single-ELF ternary rung, 22.811 s to a first token with the weight load in it (`bench/npu-leaderboard/27b-t2s2-*-20261106.json`) — int8 Q4NX decodes at 63.1 s/token and takes 145.7 s to a first token (`bench/npu-leaderboard/27b-*.json`, 2026-10-27), a 5-token prefill chunk is 58.14 s, and the ternary sealed-ELF rung on the same container is 1.72 s/token with 3/3 text-identical output (engine#697, closed by #728). What a stock install still needs is a kernel set for the model's geometry — none ships in this repository — so the row read `not served` until the route itself was measured |
+| `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx, npu | **served, and measured** (engine#587): the same `Qwen3.8-27B-NPU2` family runs on the NPU route — 0.2902 s/token (3.45 tok/s) and 19.55 tok/s of prefill on the sealed single-ELF ternary rung, 22.811 s to a first token with the weight load in it (`bench/npu-leaderboard/27b-t2s2-*-20261106.json`) — int8 Q4NX decodes at 63.1 s/token and takes 145.7 s to a first token (`bench/npu-leaderboard/27b-*.json`, 2026-10-27), a 5-token prefill chunk is 58.14 s, and the ternary sealed-ELF rung on the same container is 1.72 s/token with 3/3 text-identical output (engine#697, closed by #728). Quality on the same route: **GSM8K 97.5 % (39/40)** with greedy decoding, **6 of the 40 answers cut off by the 512-token budget and exactly 1 of those 6 also wrong** — so among answers that finished, 34/34 were right (`27b-gsm8k-20261107`); and the per-token cost at those answer lengths is 0.3857 s/token against 0.2902 on a 13-token prompt, i.e. it grows ~1.33x with context (`27b-decode-cot-20261107`). What a stock install still needs is a kernel set for the model's geometry — none ships in this repository — so the row read `not served` until the route itself was measured |
 | `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
 | `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
@@ -1861,6 +1862,13 @@ the images it writes.
 `--live --match` scores both **at the loop's own chain positions** (so the two per-depth tables are one measurement
 sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
 
+`tools/mtp_depth_pool.py` pools those tickets. It refuses a pool it cannot read (a repeated tail, a cell scored twice, a
+short read, a mixed budget, a mixed window identity) and, since the tau=0.6 window, it also says when a depth is too
+**thin** to carry the 2 pp bar: one chain moves a depth's rate by `100/n` pp, so under 50 chains a single accepted draft
+is worth more than the whole bar. Those depths keep their PASS/FAIL (the bar is the brief's criterion) but print
+`(thin: N live chain(s), one chain = X pp > the 2 pp bar)` and are counted out of the summary line, because a bare FAIL
+on 2 chains reads as a drafter regression when it is arithmetic.
+
 **The one thing that must be right**: the drafter attends over its own states, so its cache has to be the base
 model's *committed stream, row by row*. Feeding it only the current chain is silent — drafts get worse, the text
 stays correct — and it cost this project 69 % → 14 % first-draft acceptance until the cursor was made a checked
@@ -2007,6 +2015,16 @@ on the iGPU through [HRX](hrx.md), and the models checked on this box are on [mo
 Not on the models it runs today: the route is correctness-first, speed next, and what it measures is
 on the [NPU leaderboard](npu-leaderboard.md). It is a second device beside the iGPU, not a
 replacement for it.
+
+### How accurate is the NPU route?
+
+Measured, not assumed: `tools/gsm8k_eval.py` posts the first N GSM8K test questions to any
+OpenAI-compatible route with greedy decoding, reads the number the model writes after `####` (the
+dataset's own answer format), and keeps a per-question transcript so a claimed percentage can be
+re-graded offline without the device. Answers cut off by the token budget are counted **separately**
+from wrong answers — a reasoning model stopped mid-thought is not a maths error — and the summary
+prints both, so "95 % with 2 of 40 cut off" cannot be read as "95 %". The rows it produces are on the
+[NPU leaderboard](npu-leaderboard.md).
 
 ### Can the GPU and the NPU run at the same time?
 

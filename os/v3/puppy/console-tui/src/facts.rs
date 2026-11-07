@@ -209,6 +209,11 @@ pub struct Facts {
     pub engine: Option<String>,
     /// "LEM " / "KRN " prefixed, oldest first
     pub logs: Vec<String>,
+    /// Painted from [`Facts::idle`], i.e. before any probe has answered. The screen says so instead of
+    /// reading the empty defaults as facts: a first frame that announced "LEMONADE DOWN" or "DATA not
+    /// mounted" about a box that is merely still starting would be the same defect as the `web UI
+    /// http://-:13305` row the console used to print before a lease (engine#1040).
+    pub idle: bool,
 }
 
 impl Facts {
@@ -219,6 +224,30 @@ impl Facts {
 
     pub fn ip(&self) -> Option<&str> {
         self.ips.first().map(String::as_str)
+    }
+
+    /// The facts a screen can be painted with immediately: what the box answers from a file read, plus
+    /// one `ip` call, and nothing that waits on another process. `main` paints this frame before the
+    /// collector thread's first result arrives, because `collect()` waits on lemond's HTTP endpoints
+    /// (three gets, 2 s timeout each), on `llama-server --list-devices` and on `ps`/`netstat` - so at
+    /// boot, while the payload is still starting, the first frame could arrive too late and a scrape of
+    /// tty1 read an empty screen (cycle 31's `tty1-screen-empty`, one of two identical boots).
+    ///
+    /// Deliberately NOT the values a probe answers (Lemonade/models/GPU/NPU/fans/logs): those stay empty
+    /// until `collect()` lands, which is what the panels already draw for "starting".
+    pub fn idle() -> Facts {
+        Facts {
+            release: release_tag(),
+            mode: mode(),
+            hostname: hostname(),
+            uptime_s: uptime_s(),
+            secure_boot: secure_boot(),
+            ips: ips(),
+            key: api_key(),
+            temp_c: max_temp(),
+            idle: true,
+            ..Facts::default()
+        }
     }
 
     pub fn collect() -> Facts {
@@ -243,6 +272,7 @@ impl Facts {
             stats: Stats::default(),
             engine: None,
             logs: Vec::new(),
+            idle: false,
         };
         // one `ps` for both questions: lemond and the mDNS responder are looked up in the same snapshot
         let ps = ps_snapshot();
@@ -1323,6 +1353,7 @@ pub fn c16_board() -> Facts {
             "LEM 2026-11-03 12:07:38 llama-server: listening on 127.0.0.1:8001".into(),
             "LEM 2026-11-03 12:07:41 lemond: POST /api/v1/chat/completions 200 (327 tokens, 330.75 tok/s)".into(),
         ],
+        idle: false,
     }
 }
 

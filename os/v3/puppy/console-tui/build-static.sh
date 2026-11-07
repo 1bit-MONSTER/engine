@@ -27,7 +27,9 @@
 # cannot start because of a loader is a dead screen. The musl target links with the bundled rust-lld, so no
 # musl-gcc is needed. `--selftest` proves the binary answers without a terminal.
 #
-# Exit: 0 built and static, 1 the toolchain or the resulting binary is not what the image needs.
+# Exit: 0 built and static, 1 the toolchain or the resulting binary is not what the image needs, or the tree has
+# uncommitted changes in this crate - in that last case the hash it prints is marked `-dirty`, because a hash from a
+# dirty tree is not the artifact of any commit and cannot be quoted in a hand-off (engine#1326).
 set -eu
 
 cd "$(dirname "$0")"
@@ -63,5 +65,22 @@ fi
 "$OUT" --version > /dev/null
 "$OUT" --snapshot 80x25 --fixture > /dev/null
 
-echo "build-static: ok $(sha256sum "$OUT" | cut -c1-16) $(stat -c %s "$OUT") bytes"
+# An artifact hash is quoted in cycle hand-offs and pinned as CONSOLE_TUI_BIN, so it has to belong to a COMMIT.
+# A dirty tree produces a hash nobody else can reproduce - and not only by a little: rustc embeds `file:line` in
+# panic messages, so `cargo fmt` re-wrapping a line moved this binary by 24 bytes (engine#1326, where the hash of a
+# pre-`cargo fmt` tree was quoted as if it were #1323's head, and the release lane could not tell it apart from a
+# real difference). The check is scoped to this crate: those are the only files that can change these bytes, and
+# the engine tree is big enough that an unrelated edit elsewhere must not block a console build.
+hash=$(sha256sum "$OUT" | cut -c1-16)
+bytes=$(stat -c %s "$OUT")
+head=$(git rev-parse --short HEAD 2> /dev/null || echo unknown)
+dirty=$(git status --porcelain -- . 2> /dev/null || true)
+if [ -n "$dirty" ]; then
+    echo "build-static: DIRTY $hash-dirty $bytes bytes - NOT $head's artifact: $(printf '%s\n' "$dirty" | wc -l | tr -d ' ') uncommitted path(s) under $PWD" >&2
+    echo "build-static: commit them and run this again to get a hash that names a commit (the binary below is fine to test with)" >&2
+    echo "$PWD/$OUT"
+    exit 1
+fi
+
+echo "build-static: ok $hash $bytes bytes (HEAD $head, tree clean)"
 echo "$PWD/$OUT"

@@ -1136,6 +1136,24 @@ if(ONEBIT_NPU)
     # The model-generic forward (npu/forward): the GGUF-on-NPU serve route
     # (docs/npu.md, "Open"). q4nx_forward.cpp + its Q4NX dequant/pack/semantics
     # + model loader, against the engine tree's I8Ctx header.
+# ── 1-bit sentence embeddings on the NPU (engine#1311) ────────────────────────────────────────
+# The encoder's ternary linears run as int8 GEMMs through the engine's own NPU GEMM (npu/ort/
+# onebit_npu_gemm.cpp, the same call the ONNX EP's QDQ leg uses), so a device row can be produced from the
+# tree: encode a fixed sentence list and compare with the reference vectors.
+if(ONEBIT_NPU)
+    add_executable(embed_npu_gate_probe npu/embed/embed_gate_probe.cpp app/embed_model.cpp
+                   npu/ort/onebit_npu_gemm.cpp)
+    target_include_directories(embed_npu_gate_probe PRIVATE ${CMAKE_SOURCE_DIR}/app
+        ${CMAKE_SOURCE_DIR}/npu ${CMAKE_SOURCE_DIR}/npu/forward/include
+        ${CMAKE_SOURCE_DIR}/npu/forward/engine-src ${CMAKE_SOURCE_DIR}/npu/ort ${CMAKE_SOURCE_DIR}/npu/embed)
+    target_compile_definitions(embed_npu_gate_probe PRIVATE ONEBIT_NPU_RUNTIME_OWN)
+    target_link_libraries(embed_npu_gate_probe PRIVATE onebit_npu_forward onebit_npu_rt
+        nlohmann_json::nlohmann_json)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(embed_npu_gate_probe PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+endif()
+
     add_library(onebit_npu_forward STATIC
         npu/forward/src/model.c
         npu/forward/src/q4nx_dequant.c

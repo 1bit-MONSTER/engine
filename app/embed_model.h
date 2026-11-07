@@ -34,6 +34,7 @@
 #include "wordpiece.h"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,16 @@ struct Tern {
     int n = 0, k = 0;
     std::vector<int8_t> code;
     std::vector<float> scale, bias;
+};
+
+// One activation row set, quantised the way the reference does: int8 codes plus the power-of-two scale that
+// produced them, per token and (when the width calls for it) per 256-channel block. The host path dequantises
+// and multiplies; a device path sends the codes as they are and applies the scales to its int32 sums, which is
+// why the scales travel with the codes instead of being folded into the floats.
+struct Quantised {
+    int width = 0, block = 0;          // block = 256 when the width is a multiple of it and wider, else width
+    std::vector<int8_t> q;             // [rows][width]
+    std::vector<float> scale;          // [rows][width/block]
 };
 
 struct Layer {
@@ -74,6 +85,25 @@ public:
     // sentence per forward, mean over the tokens that exist).
     std::vector<float> encode_ids(const std::vector<int>& ids, std::string& why) const;
 
+    // Where the ternary linears run. The host dot below is the default; the NPU path (engine#1311 step 2)
+    // installs a hook that runs the same int8 codes on the array's GEMM. It returns false and fills `why` on
+    // failure, and must produce `y[r][n] = scale_n * sum_k q[r][k]*code[n][k] + bias_n` for the Quantised
+    // activation it is handed.
+    using Gemm = std::function<bool(const struct Tern&, const Quantised&, std::vector<float>& x, int rows,
+                                    std::string&)>;
+    void set_gemm(Gemm g) { gemm_ = std::move(g); }
+
+    // Read-only views for a device backend that packs the same codes into its own weight buffers.
+    const std::vector<Layer>& layers() const { return layers_; }
+    const std::vector<int8_t>& word_q() const { return word_q_; }
+    const std::vector<float>& word_s() const { return word_s_; }
+    const std::vector<int8_t>& pos_q() const { return pos_q_; }
+    const std::vector<float>& pos_s() const { return pos_s_; }
+    const std::vector<float>& tok_type() const { return tok_type_; }
+    const std::vector<float>& ln_e_w() const { return ln_e_w_; }
+    const std::vector<float>& ln_e_b() const { return ln_e_b_; }
+    const std::vector<float>& out_w() const { return out_w_; }
+
     // Convenience: tokenise + encode. The reference truncates to max_tokens, so does this.
     std::vector<float> encode(const std::string& text, std::string& why) const {
         return encode_ids(tokenize(text), why);
@@ -88,6 +118,7 @@ private:
     std::vector<float> ln_e_w_, ln_e_b_, out_w_;  // out_w_ is [out_dim, d]
     std::vector<Layer> layers_;
     wordpiece::BertTokenizer tok_;
+    Gemm gemm_;
 };
 
 }  // namespace onebit::embed

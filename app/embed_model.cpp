@@ -98,10 +98,16 @@ bool read_tensor(Reader& r, const std::string& name, const char* want, int64_t c
 
 // `quant_act`: int8 with a power-of-two scale per token, or per 256-channel block when the width is a multiple
 // of 256 and wider than it; round half to even; clamp +-127; return the dequantised value, as the reference does.
-void quant_act(std::vector<float>& x, int width) {
+void quant_act(std::vector<float>& x, int width, Quantised* out) {
     const int rows = static_cast<int>(x.size()) / width;
     const bool grouped = width > 256 && width % 256 == 0;
     const int group = grouped ? 256 : width;
+    if (out) {
+        out->width = width;
+        out->block = group;
+        out->q.assign(x.size(), 0);
+        out->scale.assign(size_t(rows) * size_t(width / group), 0.0f);
+    }
     for (int r = 0; r < rows; ++r) {
         for (int g = 0; g < width; g += group) {
             float m = 1e-5f;
@@ -110,10 +116,13 @@ void quant_act(std::vector<float>& x, int width) {
             const float f = std::frexp(m, &e);
             const int carry = (2.0f * f > 127.0f / 64.0f) ? 1 : 0;
             const float s = std::ldexp(1.0f, e - 7 + carry);
+            if (out) out->scale[size_t(r) * size_t(width / group) + size_t(g / group)] = s;
             for (int k = g; k < g + group; ++k) {
                 float& v = x[size_t(r) * width + k];
                 const float q = std::nearbyint(v / s);  // FE_TONEAREST: half to even, like torch.round
-                v = std::fmin(127.0f, std::fmax(-128.0f, q)) * s;
+                const float clamped = std::fmin(127.0f, std::fmax(-128.0f, q));
+                if (out) out->q[size_t(r) * width + k] = static_cast<int8_t>(clamped);
+                v = clamped * s;
             }
         }
     }
@@ -138,11 +147,26 @@ void layer_norm(std::vector<float>& x, int width, const std::vector<float>& w, c
     }
 }
 
-// The reference's activation: quantise (int8, power-of-two per token), then the ternary matmul, then the bias.
-// code is int8 {-1,0,+1}, so the dot is a signed sum; the per-output-row scale comes out of the sum.
-void tern_linear(const Tern& t, std::vector<float>& x, int width) {
+// The host dot: code is int8 {-1,0,+1}, so the product is a signed sum and the per-output-row scale comes out
+// of it. This is also the reference implementation a device GEMM is measured against.
+std::vector<float> tern_host(const Tern& t, const std::vector<float>& a_in, int width, int rows);
+
+// The reference's activation (quantise int8 with a power-of-two scale, exactly as `quant_act` does), then either
+// the installed device hook or the host dot.
+bool tern_linear(const Tern& t, std::vector<float>& x, int width, const Model::Gemm& gemm,
+                 std::string& why) {
     const int rows = static_cast<int>(x.size()) / width;
-    quant_act(x, width);
+    Quantised q;
+    quant_act(x, width, gemm ? &q : nullptr);
+    if (gemm) {
+        if (!gemm(t, q, x, rows, why)) return false;
+    } else {
+        x = tern_host(t, x, width, rows);
+    }
+    return true;
+}
+
+std::vector<float> tern_host(const Tern& t, const std::vector<float>& x, int width, int rows) {
     std::vector<float> out(size_t(rows) * t.n);
     for (int r = 0; r < rows; ++r) {
         const float* a = x.data() + size_t(r) * width;
@@ -157,7 +181,7 @@ void tern_linear(const Tern& t, std::vector<float>& x, int width) {
             out[size_t(r) * t.n + n] = acc * t.scale[size_t(n)] + t.bias[size_t(n)];
         }
     }
-    x.swap(out);
+    return out;
 }
 
 inline float gelu_tanh(float v) {
@@ -285,11 +309,12 @@ std::vector<float> Model::encode_ids(const std::vector<int>& ids, std::string& w
     const float scale = 1.0f / std::sqrt(float(hd));
     for (const Layer& L : layers_) {
         q = x;
-        tern_linear(L.q, q, D);
+        if (!tern_linear(L.q, q, D, gemm_, why)) return {};
         k_ = x;
-        tern_linear(L.k, k_, D);
+        if (!tern_linear(L.k, k_, D, gemm_, why)) return {};
         v = x;
-        tern_linear(L.v, v, D);
+        if (!tern_linear(L.v, v, D, gemm_, why)) return {};
+
         // attention: no mask needed -- one sentence, no padding, so every token attends to every token
         for (int h = 0; h < nh; ++h) {
             for (int t = 0; t < T; ++t) {
@@ -315,14 +340,14 @@ std::vector<float> Model::encode_ids(const std::vector<int>& ids, std::string& w
             }
         }
         tmp = o;
-        tern_linear(L.o, tmp, D);
+        if (!tern_linear(L.o, tmp, D, gemm_, why)) return {};
         for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
         layer_norm(x, D, L.ln1_w, L.ln1_b, cfg_.eps);
         // MLP: fc1 -> GELU(tanh) -> fc2, each ternary linear quantising its own input
         tmp = x;
-        tern_linear(L.fc1, tmp, D);
+        if (!tern_linear(L.fc1, tmp, D, gemm_, why)) return {};
         for (float& val : tmp) val = gelu_tanh(val);
-        tern_linear(L.fc2, tmp, cfg_.ffn);
+        if (!tern_linear(L.fc2, tmp, cfg_.ffn, gemm_, why)) return {};
         for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
         layer_norm(x, D, L.ln2_w, L.ln2_b, cfg_.eps);
     }

@@ -1,0 +1,119 @@
+// Copyright 2026 bong-water-water-bong
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// The embedding encoder's ternary linears, run on the XDNA2 through the engine's own int8 GEMM (engine#1311).
+//
+// The container already holds the encoder as int8: ternary codes in {-1,0,+1} with one f32 scale per output
+// row. The array executes int8*int8 -> int32, which is exactly the product the reference forms, so the device
+// path is not a re-quantisation: the codes go to the weight buffer as they are, the int8 activation the
+// reference's `quant_act` produced goes to the activation buffer as it is, and the scales are applied to the
+// int32 sums on the host. `gemm_q8_raw` (npu/ort/onebit_npu_gemm.h) is that call: it writes both buffers
+// verbatim and hands back exact accumulators, and its own probe checks them against the host's integer sum.
+//
+// Two shapes of call, and the second one is a measured requirement rather than a convenience:
+//   * widths 384 (q, k, v, o, fc1) are quantised per token, so one launch per linear;
+//   * fc2's input is 1536 wide and the reference quantises it **per 256-channel block** -- replacing that with
+//     one per-token scale moves the vectors enough to put 73 of 1,000 gate sentences below a 0.999 cosine
+//     (measured), so fc2 runs as six K=256 launches and the per-block scales are applied to the partial sums.
+//
+// The design M is a property of the ELF (128 here), so a launch costs the same for a 6-token sentence as for a
+// 128-token one; the ELFs are named for the engine's own convention and pointed at by ONEBIT_EP_NPU_ELFS:
+//   128x384x384=<full_i8_Q_K384_N384.elf>,128x384x1536=<full_i8_GU_K384_N1536.elf>,128x256x384=<full_i8_D_K256_N384.elf>
+#pragma once
+
+#include "embed_model.h"
+#include "onebit_npu_gemm.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace onebit::embed {
+
+class NpuGemm {
+public:
+    // The hook for Model::set_gemm(). A device failure returns false with `why`; the caller keeps its host
+    // result, and `fell_back` says whether that happened (so a report cannot claim the array when it did not run).
+    Model::Gemm hook() {
+        return [this](const Tern& t, const Quantised& q, std::vector<float>& x, int rows, std::string& why) {
+            return run(t, q, x, rows, why);
+        };
+    }
+
+    bool used_device() const { return launches_ > 0 && !failed_; }
+    std::string status() const { return status_; }
+    long launches() const { return launches_; }
+
+private:
+    // codes transposed to the kernel's [k][n] row-major, once per (weight, k-block)
+    const std::vector<int8_t>& weight(const Tern& t, int k0, int k) {
+        auto& b = bt_[{&t, k0}];
+        if (b.empty()) {
+            b.resize(size_t(k) * t.n);
+            for (int n = 0; n < t.n; ++n)
+                for (int i = 0; i < k; ++i) b[size_t(i) * t.n + n] = t.code[size_t(n) * t.k + k0 + i];
+        }
+        return b;
+    }
+
+    bool run(const Tern& t, const Quantised& q, std::vector<float>& x, int rows, std::string& why) {
+        if (rows <= 0 || rows > 128) {  // the design's M; a longer prompt is refused, never truncated
+            why = "npu gemm: " + std::to_string(rows) + " rows does not fit the 128-row design";
+            return false;
+        }
+        std::vector<int32_t> c(size_t(rows) * t.n);
+        x.assign(size_t(rows) * t.n, 0.0f);
+        const int blocks = q.width / q.block;
+        std::vector<int8_t> a_block;
+        for (int b = 0; b < blocks; ++b) {
+            const int8_t* a = nullptr;
+            if (blocks == 1) {
+                a = q.q.data();
+            } else {
+                // gather this 256-channel block's columns into contiguous rows: the GEMM takes one stride
+                a_block.resize(size_t(rows) * q.block);
+                for (int r = 0; r < rows; ++r)
+                    std::copy_n(q.q.data() + size_t(r) * q.width + size_t(b) * q.block, q.block,
+                                a_block.data() + size_t(r) * q.block);
+                a = a_block.data();
+            }
+            if (!onebit::npu::gemm_q8_raw(a, rows, q.block, t.n, weight(t, b * q.block, q.block).data(), c.data(), &why)) {
+                failed_ = true;
+                status_ = why;
+                return false;
+            }
+            launches_++;
+            // int32 sums -> floats with the activation scale of this block/row and the weight's row scale
+            for (int r = 0; r < rows; ++r) {
+                const float as = q.scale[size_t(r) * size_t(blocks) + size_t(b)];
+                for (int n = 0; n < t.n; ++n)
+                    x[size_t(r) * t.n + n] += float(c[size_t(r) * t.n + n]) * as * t.scale[size_t(n)];
+            }
+        }
+        for (int r = 0; r < rows; ++r)
+            for (int n = 0; n < t.n; ++n) x[size_t(r) * t.n + n] += t.bias[size_t(n)];
+        return true;
+    }
+
+    std::map<std::pair<const Tern*, int>, std::vector<int8_t>> bt_;
+    long launches_ = 0;
+    bool failed_ = false;
+    std::string status_;
+};
+
+}  // namespace onebit::embed

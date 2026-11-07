@@ -74,6 +74,7 @@
 #include "pm.h"
 #include "laya_checkpoint.h"
 #include "recipes.h"
+#include "route_log.h"
 #include "serve_metrics.h"
 #include "serve_watchdog.h"
 #include "serve_hybrid.h"
@@ -90,6 +91,7 @@
 #endif
 #ifdef ONEBIT_LAYA
 #include "encoder.h"
+#include "models.h"
 #include "policy.h"
 #include "route.h"
 #include "scorer.h"
@@ -179,6 +181,7 @@ struct Options {
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
     bool laya_auto = false;              // --laya: the same with the installed checkpoint (laya_checkpoint())
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
+    std::string laya_models;             // --laya-models FILE: model auto routed per request (docs/laya-models.md)
     std::string recipes;                 // --recipes FILE: tuned backend settings (default: built in, docs/recipes.md)
     bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
     // --template-pin FILE: expected chat-template sha256 per model (default: config/template-pins.json,
@@ -1493,22 +1496,12 @@ private:
     std::mutex mu_;
 };
 
-// classify_request (laya/route.cpp) through the daemon: the same size gate for long_doc and the
-// same question, asked of the GGUF
-onebit::laya::RequestClass classify_request_gguf(LayaDaemon& d, const std::string& state) {
+// One choice question asked of the GGUF daemon, as the C++ scorer's score() asks it: the answer's
+// class, confidence and probabilities in the question's option order (empty label on failure).
+onebit::laya::RequestClass classify_question_gguf(LayaDaemon& d, const onebit::laya::Question& q, const std::string& state) {
     onebit::laya::RequestClass out;
-    if (state.size() >= onebit::laya::kLongDocChars) {
-        out.label = "long_doc";
-        out.confidence = 1.0f;
-        out.probabilities = {{"long_doc", 1.0f}};
-        return out;
-    }
-    int variant = 0;
-    if (const char* v = std::getenv("ONEBIT_LAYA_CLASS_VARIANT")) variant = std::atoi(v);
-    const onebit::laya::Question q = onebit::laya::request_class_question(variant);
     nlohmann::ordered_json criteria = nlohmann::ordered_json::object();
-    for (const auto& [key, desc] : q.criteria)
-        if (key != "long_doc") criteria[key] = desc;
+    for (const auto& [key, desc] : q.criteria) criteria[key] = desc;
     nlohmann::ordered_json req = {{"state", state},
                                   {"questions", {{"cls", {{"type", q.type}, {"instructions", q.instructions}, {"criteria", criteria}}}}}};
     json answer;
@@ -1521,6 +1514,36 @@ onebit::laya::RequestClass classify_request_gguf(LayaDaemon& d, const std::strin
         for (const auto& [key, desc] : q.criteria)
             if ((*a)["probabilities"].contains(key)) out.probabilities.emplace_back(key, (*a)["probabilities"][key].get<float>());
     return out;
+}
+
+// classify_request (laya/route.cpp) through the daemon: the same size gate for long_doc and the
+// same question, asked of the GGUF
+onebit::laya::RequestClass classify_request_gguf(LayaDaemon& d, const std::string& state) {
+    if (state.size() >= onebit::laya::kLongDocChars) {
+        onebit::laya::RequestClass out;
+        out.label = "long_doc";
+        out.confidence = 1.0f;
+        out.probabilities = {{"long_doc", 1.0f}};
+        return out;
+    }
+    int variant = 0;
+    if (const char* v = std::getenv("ONEBIT_LAYA_CLASS_VARIANT")) variant = std::atoi(v);
+    onebit::laya::Question q = onebit::laya::request_class_question(variant);
+    q.criteria.erase(std::remove_if(q.criteria.begin(), q.criteria.end(), [](const auto& c) { return c.first == "long_doc"; }),
+                     q.criteria.end());
+    return classify_question_gguf(d, q, state);
+}
+
+// classify_with_table (laya/models.cpp) through the daemon: the table's size gate, then its question
+onebit::laya::RequestClass classify_table_gguf(LayaDaemon& d, const onebit::laya::ModelTable& t, const std::string& state) {
+    if (t.size_gated(state)) {
+        onebit::laya::RequestClass out;
+        out.label = t.size_gate_class;
+        out.confidence = 1.0f;
+        out.probabilities = {{t.size_gate_class, 1.0f}};
+        return out;
+    }
+    return classify_question_gguf(d, t.laya_question(), state);
 }
 #endif
 #endif
@@ -1559,6 +1582,62 @@ std::string request_state(const httplib::Request& req, bool head_only = false) {
         }
     return out;
 }
+
+#ifdef ONEBIT_LAYA
+// The Laya scorer serve routes with (docs/laya.md): with ONEBIT_LAYA_DEVICE=npu the C++ scorer with
+// its encoder on the NPU (a private add-on, laya/encoder.h); else ggmlc's GGUF scorer as a daemon on
+// HRX0 when the binary and the GGUF are there; else the C++ scorer on the CPU. `note` ends the log line.
+#if defined(__linux__)
+void start_laya_scorer(const Options& o, const std::string& policy_note, std::unique_ptr<onebit::laya::Scorer>& scorer,
+                       std::unique_ptr<LayaDaemon>& laya_daemon) {
+#else
+void start_laya_scorer(const Options& o, const std::string& policy_note, std::unique_ptr<onebit::laya::Scorer>& scorer) {
+#endif
+    // ONEBIT_LAYA_DEVICE=npu: the C++ scorer with its encoder on the NPU, from a private add-on
+    // (laya/encoder.h, docs/laya.md); else the GGUF scorer, on HRX0 unless it names another
+    const char* dev = std::getenv("ONEBIT_LAYA_DEVICE");
+    const bool laya_npu = dev && std::string(dev) == "npu";
+    const std::string gguf = laya_npu ? "" : laya_gguf(o.laya_model), bin = laya_npu ? "" : laya_ggml_bin();
+#if defined(__linux__)
+    if (!gguf.empty() && !bin.empty()) {
+        // the GGUF scorer, with the HSA runtime HRX needs (docs/hrx.md)
+        std::vector<std::string> env;
+        if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+        if (!dev || !*dev || std::string(dev) == "hrx") {
+            announce_hrx_runtime(o);
+            announce_cwsr_env(o);
+        }
+        for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
+        laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
+            bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "hrx"}, env);
+        std::fprintf(stderr, "1bit serve: laya: %s through %s%s\n", gguf.c_str(), bin.c_str(), policy_note.c_str());
+    }
+#endif
+    if (!gguf.empty() && gguf == o.laya_model && bin.empty())
+        throw std::runtime_error("laya: a GGUF needs ggmlc's laya (build with -DONEBIT_LAYA_GGML=ON, or set ONEBIT_LAYA_GGML)");
+#if defined(__linux__)
+    if (!laya_daemon)
+#endif
+    {
+        const onebit::laya::EncoderFactory* f = laya_npu ? onebit::laya::find_encoder("npu") : nullptr;
+        if (laya_npu && !f)
+            throw std::runtime_error("laya: ONEBIT_LAYA_DEVICE=npu needs a build with the NPU add-on "
+                                     "(-DONEBIT_NPU_PRIVATE=<npu-kernels checkout>, docs/laya.md)");
+        const std::string ckpt = laya_checkpoint(o.laya_model);
+        scorer = std::make_unique<onebit::laya::Scorer>();
+        if (!scorer->load(ckpt)) throw std::runtime_error("laya: " + scorer->error());
+        if (f) {
+            std::string err;
+            onebit::laya::EncoderFn fn = (*f)(ckpt, &err);
+            if (!fn) throw std::runtime_error("laya: the NPU encoder: " + err);
+            scorer->set_encoder(std::move(fn));
+        }
+        std::fprintf(stderr, "1bit serve: laya: checkpoint %s%s%s\n", ckpt.c_str(),
+                     laya_npu ? " (encoder on the NPU)" : "", policy_note.c_str());
+    }
+}
+
+#endif
 
 // --print-backend (docs/serve.md, "One hop from Lemonade"): a route that needs serve in the
 // request path. Exit 5 tells Lemonade's onebit recipe to run `1bit serve` as before.
@@ -1690,6 +1769,274 @@ static void warm_backend(int port, const std::string& device) {
     }
 }
 
+#if defined(ONEBIT_LAYA) && !defined(_WIN32)
+// The text Laya decides a --laya-models request on: the last user message (each game step is its own
+// decision; the system prompt is the same on every one), or a completion's prompt.
+std::string last_user_text(const json& body) {
+    if (body.contains("prompt") && body["prompt"].is_string()) return body["prompt"].get<std::string>();
+    if (!body.contains("messages") || !body["messages"].is_array()) return "";
+    for (auto it = body["messages"].rbegin(); it != body["messages"].rend(); ++it) {
+        const json& m = *it;
+        if (!m.is_object() || !m.contains("role") || !m["role"].is_string() || m["role"].get<std::string>() != "user") continue;
+        if (!m.contains("content")) return "";
+        const json& c = m["content"];
+        if (c.is_string()) return c.get<std::string>();
+        std::string out;
+        if (c.is_array())
+            for (const auto& part : c)
+                if (part.is_object() && part.value("type", "") == "text") out += (out.empty() ? "" : "\n") + part.value("text", "");
+        return out;
+    }
+    return "";
+}
+
+// --laya-models FILE (docs/laya-models.md): several models behind one port. Each table row is its own
+// `1bit serve -m <model> --device <device>` child (so the NPU and HRX routes are exactly what they are
+// alone); a request with any model name that is not a row's alias (`auto` by convention) is classified
+// by Laya with the table's own question, and the class's row answers it. The decision is in the
+// reply's X-1bit-Route* headers, its `route` object (non-streamed), GET /v1/route/decisions and /metrics.
+int serve_models(const Options& o) {
+    if (!o.model.empty()) throw std::runtime_error("--laya-models names its models in the table; drop -m");
+    if (o.pm || !o.role.empty() || !o.embed.empty() || !o.rerank.empty())
+        throw std::runtime_error("--laya-models does not combine with --pm, --embedding/--reranking, --embed or --rerank");
+    if (o.device != "auto") throw std::runtime_error("--laya-models: each row names its device; drop --device");
+    if (o.print_backend) return serve_only("--laya-models routes each request in serve");
+    const onebit::laya::ModelTable table = onebit::laya::load_model_table(o.laya_models);
+    std::unique_ptr<onebit::laya::Scorer> scorer;
+#if defined(__linux__)
+    std::unique_ptr<LayaDaemon> laya_daemon;
+    start_laya_scorer(o, ", models " + o.laya_models, scorer, laya_daemon);
+#else
+    start_laya_scorer(o, ", models " + o.laya_models, scorer);
+#endif
+    const std::vector<onebit::laya::ModelRow> rows = table.backends();
+    std::string self;
+    {
+        std::error_code ec;
+        self = fs::read_symlink("/proc/self/exe", ec).string();
+        if (ec || self.empty()) throw std::runtime_error("--laya-models: cannot find this binary (/proc/self/exe)");
+    }
+    struct Backend {
+        onebit::laya::ModelRow row;
+        int port = 0;
+        std::vector<std::string> argv;
+    };
+    std::vector<Backend> backends;
+    for (const auto& r : rows) {
+        if (!fs::exists(r.model)) throw std::runtime_error("--laya-models: " + r.alias + ": no such model " + r.model);
+        if (!r.bin.empty() && !fs::exists(r.bin)) throw std::runtime_error("--laya-models: " + r.alias + ": no such binary " + r.bin);
+        Backend b;
+        b.row = r;
+        b.port = free_port();
+        b.argv = {r.bin.empty() ? self : r.bin, "serve", "-m", r.model, "--device", r.device, "--port", std::to_string(b.port),
+                  "--host", "127.0.0.1", "--alias", r.alias};
+        b.argv.insert(b.argv.end(), r.args.begin(), r.args.end());
+        backends.push_back(std::move(b));
+    }
+    std::fprintf(stderr, "1bit serve: laya-models: %zu classes, %zu backends (%s)\n", table.classes.size(), backends.size(),
+                 o.laya_models.c_str());
+    for (const auto& [cls, r] : table.rows)
+        std::fprintf(stderr, "1bit serve: laya-models: %s -> %s on %s\n", cls.c_str(), r.alias.c_str(), r.device.c_str());
+
+    std::atomic<bool> ready{false};
+    ServeMetrics metrics("laya-models");
+    Lifecycle lifecycle("laya-models");
+    RouteLog log;
+    httplib::Server srv;
+    install_request_guard(srv, o.host);
+    std::vector<std::unique_ptr<Child>> children;
+    std::mutex scorer_mu, cache_mu;
+    std::unordered_map<std::string, onebit::laya::RequestClass> cache;  // state -> class
+    std::deque<std::string> cache_order;
+    std::vector<std::atomic<int>> inflight(backends.size());
+
+    auto health = [&](const httplib::Request&, httplib::Response& res) {
+        if (!ready) {
+            res.status = 503;
+            res.set_content(R"({"status":"loading"})", "application/json");
+            return;
+        }
+        for (const auto& c : children)
+            if (!c->alive()) {
+                res.status = 503;
+                res.set_content(json{{"status", "error"}, {"error", "backend on port " + std::to_string(c->port()) + " exited"}}.dump(),
+                                "application/json");
+                return;
+            }
+        res.set_content(R"({"status":"ok"})", "application/json");
+    };
+    srv.Get("/health", health);
+    srv.Get("/v1/health", health);
+    srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
+        json data = json::array({{{"id", "auto"}, {"object", "model"}, {"owned_by", "1bit"}, {"device", "laya"}}});
+        for (const auto& b : backends)
+            data.push_back({{"id", b.row.alias}, {"object", "model"}, {"owned_by", "1bit"}, {"device", b.row.device}});
+        res.set_content(json{{"object", "list"}, {"data", data}}.dump(), "application/json");
+    });
+    srv.Get("/v1/route/table", [&](const httplib::Request&, httplib::Response& res) {
+        json classes = json::array();
+        for (const auto& [cls, desc] : table.classes) {
+            const auto& r = *table.row_for(cls);
+            classes.push_back({{"class", cls}, {"description", desc}, {"model", r.alias}, {"device", r.device}});
+        }
+        res.set_content(json{{"question", table.question}, {"default", table.fallback},
+                             {"min_confidence", table.min_confidence}, {"classes", classes}}.dump(), "application/json");
+    });
+    srv.Get("/v1/route/decisions", [&](const httplib::Request& q, httplib::Response& res) {
+        long since = 0;
+        size_t limit = 100;
+        try {
+            if (q.has_param("since")) since = std::stol(q.get_param_value("since"));
+            if (q.has_param("limit")) limit = size_t(std::max(1L, std::min(512L, std::stol(q.get_param_value("limit")))));
+        } catch (const std::exception&) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"since and limit are integers"}})", "application/json");
+            return;
+        }
+        res.set_content(log.recent(since, limit).dump(), "application/json");
+    });
+    srv.Get("/metrics", [&](const httplib::Request&, httplib::Response& r) {
+        r.set_content(metrics.render(lifecycle) + log.render(), "text/plain; version=0.0.4; charset=utf-8");
+    });
+    auto post = [&](const httplib::Request& q, httplib::Response& r) {
+        if (!ready) {
+            r.status = 503;
+            r.set_content(R"({"error":{"message":"models are loading"}})", "application/json");
+            return;
+        }
+        RouteDecision d;
+        d.id = log.next_id();
+        d.t_unix = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+        const json body = json::parse(q.body, nullptr, false);
+        if (!body.is_object()) {
+            r.status = 400;
+            r.set_content(R"({"error":{"message":"request body is not JSON"}})", "application/json");
+            return;
+        }
+        d.stream = body.value("stream", false);
+        const std::string asked = body.contains("model") && body["model"].is_string() ? body["model"].get<std::string>() : "";
+        const onebit::laya::ModelRow* row = table.by_alias(asked);
+        if (row) {
+            d.cls = "pinned";
+        } else {
+            const std::string state = last_user_text(body);
+            onebit::laya::RequestClass cls;
+            {
+                std::lock_guard<std::mutex> lock(cache_mu);
+                if (const auto c = cache.find(state); c != cache.end()) {
+                    cls = c->second;
+                    d.cached = true;
+                }
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!d.cached) {
+                std::lock_guard<std::mutex> lock(scorer_mu);  // the scorer is not reentrant
+#if defined(__linux__)
+                if (laya_daemon) cls = classify_table_gguf(*laya_daemon, table, state);
+                else
+#endif
+                cls = onebit::laya::classify_with_table(*scorer, table, state);
+            }
+            d.router_ms = d.cached ? 0.0 : std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (cls.label.empty()) {
+                r.status = 502;
+                r.set_content(R"({"error":{"message":"laya routing failed"}})", "application/json");
+                return;
+            }
+            if (!d.cached) {
+                std::lock_guard<std::mutex> lock(cache_mu);
+                if (cache.size() >= 4096) {
+                    cache.erase(cache_order.front());
+                    cache_order.pop_front();
+                }
+                if (cache.emplace(state, cls).second) cache_order.push_back(state);
+            }
+            d.laya_class = cls.label;
+            d.confidence = cls.confidence;
+            if (table.size_gated(state)) {
+                // the gate decides by size alone: min_confidence is for Laya's answers
+                d.cls = cls.label;
+                row = table.row_for(cls.label);
+            } else {
+                row = &table.pick(cls.label, cls.confidence, &d.cls);
+            }
+        }
+        const size_t i = table.backend_index(*row);
+        d.model = row->alias;
+        d.device = row->device;
+        char route_hdr[160], ms_hdr[32];
+        std::snprintf(route_hdr, sizeof route_hdr, "%s %.2f %s", d.cls.c_str(), d.confidence, d.device.c_str());
+        std::snprintf(ms_hdr, sizeof ms_hdr, "%.1f", d.router_ms);
+        std::fprintf(stderr, "1bit serve: laya-models: #%ld %s -> %s | %s %.1f ms\n", d.id, route_hdr, d.model.c_str(),
+                     d.cls == "pinned" ? "pinned" : d.cached ? "cached" : "classified", d.router_ms);
+        auto held = std::make_shared<InFlight>(&inflight[i]);
+        const auto t_req = std::chrono::steady_clock::now();
+        forward(backends[i].port, held, -1, d.model, false, "", o.precise, q, r);
+        r.set_header("X-1bit-Route", route_hdr);  // class, Laya confidence, device (the --laya format)
+        r.set_header("X-1bit-Route-Model", d.model);
+        r.set_header("X-1bit-Route-Ms", ms_hdr);
+        r.set_header("X-1bit-Route-Id", std::to_string(d.id));
+        if (!d.stream) {
+            d.status = r.status;
+            d.request_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_req).count();
+            read_reply_stats(r.body, d);
+            json out = json::parse(r.body, nullptr, false);
+            if (out.is_object()) {
+                json route = {{"id", d.id}, {"class", d.cls}, {"laya_class", d.laya_class}, {"confidence", d.confidence},
+                              {"model", d.model}, {"device", d.device}, {"router_ms", d.router_ms}, {"cached", d.cached},
+                              {"request_ms", d.request_ms}};
+                out["route"] = route;
+                r.set_content(out.dump(), "application/json");
+            }
+        }
+        log.add(d);
+    };
+    srv.Post("/v1/chat/completions", post);
+    srv.Post("/v1/completions", post);
+
+    if (!srv.bind_to_port(o.host, o.port))
+        throw std::runtime_error("cannot listen on " + o.host + ":" + std::to_string(o.port));
+    std::thread listener([&] { srv.listen_after_bind(); });
+    struct Stop {
+        httplib::Server& s;
+        std::thread& t;
+        ~Stop() { s.stop(); if (t.joinable()) t.join(); }
+    } stop{srv, listener};
+    struct sigaction sa{};
+    sa.sa_handler = on_stop_signal;
+    ::sigaction(SIGTERM, &sa, nullptr);
+    ::sigaction(SIGINT, &sa, nullptr);
+    auto line = [&metrics](const std::string& l) { metrics.backend_line(l); };
+    for (const auto& b : backends) {
+        std::fprintf(stderr, "1bit serve: laya-models: starting %s on %s (port %d%s%s)\n", b.row.alias.c_str(), b.row.device.c_str(),
+                     b.port, b.row.bin.empty() ? "" : ", ", b.row.bin.c_str());
+        children.push_back(std::make_unique<Child>(b.argv, std::vector<std::string>{}, b.port, "/health", line));
+    }
+    for (size_t i = 0; i < children.size(); ++i)
+        if (!children[i]->wait_ready(std::chrono::seconds(900), g_stop)) {
+            if (g_stop) return 0;
+            std::fprintf(stderr, "1bit serve: laya-models: %s did not become ready\n", backends[i].row.alias.c_str());
+            return 1;
+        }
+    ready = true;
+    lifecycle.count_start();
+    std::fprintf(stderr, "1bit serve: ready on http://%s:%d (laya-models: model auto is routed per request)\n", o.host.c_str(), o.port);
+    auto all_alive = [&] {
+        for (auto& c : children) if (!c->alive()) return false;
+        return true;
+    };
+    while (all_alive() && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (!g_stop) {
+        for (size_t i = 0; i < children.size(); ++i)
+            if (!children[i]->alive())
+                std::fprintf(stderr, "1bit serve: laya-models: %s exited (%s)\n", backends[i].row.alias.c_str(),
+                             children[i]->exit_text().c_str());
+        return 1;
+    }
+    return 0;
+}
+#endif
+
 int serve_child(const Options& given) {
     Options o = given;
     if (hadamard_q4_0(o.model))
@@ -1779,50 +2126,13 @@ int serve_child(const Options& given) {
         if (laya && !o.role.empty())
             throw std::runtime_error("--laya does not combine with --embedding/--reranking");
         if (laya) policy = onebit::laya::load_route_policy(o.route_policy);
-        // ONEBIT_LAYA_DEVICE=npu: the C++ scorer with its encoder on the NPU, from a private add-on
-        // (laya/encoder.h, docs/laya.md); else the GGUF scorer, on HRX0 unless it names another
-        const char* dev = std::getenv("ONEBIT_LAYA_DEVICE");
-        const bool laya_npu = dev && std::string(dev) == "npu";
         // the route policy is the device router's; --pm-router laya only uses the classifier
         const std::string policy_note = laya ? (o.route_policy.empty() ? ", policy built in" : ", policy " + o.route_policy) : "";
-        const std::string gguf = laya_npu ? "" : laya_gguf(o.laya_model), bin = laya_npu ? "" : laya_ggml_bin();
 #if defined(__linux__)
-        if (!gguf.empty() && !bin.empty()) {
-            // the GGUF scorer, with the HSA runtime HRX needs (docs/hrx.md)
-            std::vector<std::string> env;
-            if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
-            if (!dev || !*dev || std::string(dev) == "hrx") {
-                announce_hrx_runtime(o);
-                announce_cwsr_env(o);
-            }
-            for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
-            laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
-                bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "hrx"}, env);
-            std::fprintf(stderr, "1bit serve: laya: %s through %s%s\n", gguf.c_str(), bin.c_str(), policy_note.c_str());
-        }
+        start_laya_scorer(o, policy_note, scorer, laya_daemon);
+#else
+        start_laya_scorer(o, policy_note, scorer);
 #endif
-        if (!gguf.empty() && gguf == o.laya_model && bin.empty())
-            throw std::runtime_error("laya: a GGUF needs ggmlc's laya (build with -DONEBIT_LAYA_GGML=ON, or set ONEBIT_LAYA_GGML)");
-#if defined(__linux__)
-        if (!laya_daemon)
-#endif
-        {
-            const onebit::laya::EncoderFactory* f = laya_npu ? onebit::laya::find_encoder("npu") : nullptr;
-            if (laya_npu && !f)
-                throw std::runtime_error("laya: ONEBIT_LAYA_DEVICE=npu needs a build with the NPU add-on "
-                                         "(-DONEBIT_NPU_PRIVATE=<npu-kernels checkout>, docs/laya.md)");
-            const std::string ckpt = laya_checkpoint(o.laya_model);
-            scorer = std::make_unique<onebit::laya::Scorer>();
-            if (!scorer->load(ckpt)) throw std::runtime_error("laya: " + scorer->error());
-            if (f) {
-                std::string err;
-                onebit::laya::EncoderFn fn = (*f)(ckpt, &err);
-                if (!fn) throw std::runtime_error("laya: the NPU encoder: " + err);
-                scorer->set_encoder(std::move(fn));
-            }
-            std::fprintf(stderr, "1bit serve: laya: checkpoint %s%s%s\n", ckpt.c_str(),
-                         laya_npu ? " (encoder on the NPU)" : "", policy_note.c_str());
-        }
         if (laya) {
             for (const std::string& dev : gguf_devices()) {
                 try {
@@ -2768,7 +3078,8 @@ void usage(FILE* out) {
                  "                  (default 45000; 0 refuses at once; docs/npu.md)\n"
                  "                  [--laya | --laya-model DIR] [--route-policy FILE]   with --device auto, Laya classifies\n"
                  "                  each conversation and the route policy picks its device (docs/laya.md)\n"
-                 "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
+                 "                  [--laya-models FILE (no -m) --laya]   several models behind one port: Laya picks\n"
+                 "                  the model and its device for each request with model auto (docs/laya-models.md)\n"                 "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
                  "                  (default: config/recipes.json, built in; docs/recipes.md)\n"
                  "                  [--template-pin FILE | --no-template-pin] [--template-pin-strict]   a GGUF's\n"
                  "                  tokenizer.chat_template is a program that runs on every request: the load logs\n"
@@ -2878,6 +3189,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--laya-model") o.laya_model = next();
         else if (a == "--laya") o.laya_auto = true;
         else if (a == "--route-policy") o.route_policy = next();
+        else if (a == "--laya-models") o.laya_models = next();
         else if (a == "--recipes") o.recipes = next();
         else if (a == "--no-recipes") o.no_recipes = true;
         else if (a == "--template-pin") o.template_pin = next();
@@ -2907,6 +3219,14 @@ int run_serve(int argc, char** argv) {
         else if (a == "--lemonade-url") o.lemonade_url = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
+    }
+    if (!o.laya_models.empty()) {
+#if defined(ONEBIT_LAYA) && !defined(_WIN32)
+        if (o.laya_model.empty() && !o.laya_auto) throw std::runtime_error("--laya-models needs --laya or --laya-model DIR");
+        return serve_models(o);
+#else
+        throw std::runtime_error("--laya-models is not part of this build (Linux, -DONEBIT_LAYA=ON; docs/laya-models.md)");
+#endif
     }
     if (o.model.empty()) { usage(stderr); return 2; }
     if (o.watchdog.secs < 0 || o.watchdog.prompt_tps < 0)

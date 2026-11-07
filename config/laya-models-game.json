@@ -1,0 +1,17 @@
+{
+ "about": "Model table for the game agent demo (engine #1313, docs/laya-models.md): 1bit serve --laya-models config/laya-models-game.json --laya. Each request with model auto is classified by Laya as reflex or plan; reflex steps go to a small model on the NPU, planning to a bigger model on HRX. Model paths are this box's; copy the file and change them for another.",
+ "question": {
+  "instructions": "What does the game agent need to answer this step?",
+  "classes": {
+   "reflex": "one quick action from what is in view right now: move, turn, jump, mine or place the block ahead, attack, eat, pick up an item",
+   "plan": "planning: a crafting tree, a build plan, choosing the next goals, writing a reusable skill, or recovering after a death or a failed step"
+  }
+ },
+ "default": "plan",
+ "min_confidence": 0.0,
+ "classes": {
+  "reflex": {"model": "~/models/npu/Qwen3-0.6B", "device": "npu", "alias": "Qwen3-0.6B-NPU"},
+  "plan": {"model": "~/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf", "device": "hrx",
+           "alias": "Qwen3-Coder-30B-A3B-HRX", "args": ["--ctx-size", "16384"]}
+ }
+}

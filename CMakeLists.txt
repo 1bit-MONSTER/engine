@@ -533,7 +533,8 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/route_policy_default.h
      "// generated from config/route-policy.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultRoutePolicyJson[] = R\"ONEBITPOLICY(${ONEBIT_ROUTE_POLICY_JSON})ONEBITPOLICY\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/route-policy.json)
-add_library(onebit_laya STATIC laya/scorer.cpp laya/safetensors.cpp laya/route.cpp laya/policy.cpp laya/encoder.cpp)
+add_library(onebit_laya STATIC laya/scorer.cpp laya/safetensors.cpp laya/route.cpp laya/policy.cpp laya/encoder.cpp
+            laya/models.cpp)
 target_include_directories(onebit_laya PUBLIC laya PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(onebit_laya PUBLIC onebit_npu nlohmann_json::nlohmann_json)
 # The engine binary gets `1bit route` and per-request routing through the scorer.
@@ -553,6 +554,12 @@ add_executable(laya_gate tests/laya_gate.cpp)
 add_executable(laya_encoder_test tests/laya_encoder_test.cpp)
 target_link_libraries(laya_encoder_test PRIVATE onebit_laya)
 add_test(NAME laya_encoder COMMAND laya_encoder_test)
+add_executable(laya_models_test tests/laya_models_test.cpp)
+target_link_libraries(laya_models_test PRIVATE onebit_laya)
+add_test(NAME laya_models COMMAND laya_models_test ${CMAKE_SOURCE_DIR}/config/laya-models-game.json)
+# CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
+# keeps the laya_models ctest from reporting "Not Run" without a workflow change.
+add_dependencies(onebit laya_models_test)
 # Crafted Laya checkpoints the reader and the scorer must refuse (written at run time); runs in CI.
 add_executable(laya_bounds_test tests/laya_bounds_test.cpp)
 target_link_libraries(laya_bounds_test PRIVATE onebit_laya nlohmann_json::nlohmann_json)
@@ -574,6 +581,8 @@ endif()
 set(ONEBIT_LAYA_ROUTE_MODEL "" CACHE PATH "Laya checkpoint dir for the per-request routing e2e test")
 if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+    # --laya-models: model auto picked per request among the table's rows (docs/laya-models.md)
+    add_test(NAME laya_models_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_models_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # `1bit route --serve`, the resident form the fork calls per request (docs/laya-first.md §8).
     add_test(NAME laya_route_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_serve.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
     # One checkpoint resolution for serve --laya and 1bit route (app/laya_checkpoint.h).
@@ -1242,7 +1251,7 @@ set(_onebit_route_tests
     laya_gguf_route mem_admit_route hrx_cwsr_route hrx_runtime_route hybrid_route
     hybrid_kvshare_route)
 # Tests that only exist for some configurations (a model was passed, a device is built in).
-list(APPEND _onebit_route_tests hybrid_e2e laya_route_e2e pm_laya_route serve_e2e_cpu serve_e2e_hrx
+list(APPEND _onebit_route_tests hybrid_e2e laya_route_e2e laya_models_e2e pm_laya_route serve_e2e_cpu serve_e2e_hrx
      hrx_cpu_weight_parity)
 foreach(_onebit_route_test IN LISTS _onebit_route_tests)
     if(TEST ${_onebit_route_test})

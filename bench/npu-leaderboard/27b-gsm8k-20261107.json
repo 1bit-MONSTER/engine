@@ -1,0 +1,31 @@
+{
+  "id": "27b-gsm8k-20261107",
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX ternary sidecars, sealed single-ELF decode",
+  "metric": {
+    "name": "GSM8K accuracy (n=40)",
+    "value": 97.5,
+    "unit": "%"
+  },
+  "settings": {
+    "device": "accel0",
+    "engine": "1bit t2s2-20261104 (serve-bin)",
+    "model_dir": "~/models/npu/bonsai2-27b-t2s2-serve",
+    "container": "Qwen3.8-27B-NPU2 (qwen3_5, 64 layers, H=5120, ternary sidecars, sealed single-ELF decode set)",
+    "tickets": "npu-hold -t 25, labels 587-gsm8k-{pilot,0-7,8,16,24,32}, port 18099",
+    "sampling": "temperature 0, top_k 1, seed 1234, stream=false, max_tokens 512",
+    "prompt": "Solve this grade-school maths problem. Reason step by step, then write your final answer on the last line as\\n#### <number>\\n\\nProblem: {q}",
+    "n": 40,
+    "split": "openai/gsm8k main/test, questions 0-39 in dataset order",
+    "accuracy": "39/40",
+    "truncated": 6,
+    "truncated_and_wrong": 1
+  },
+  "instrument": "tools/gsm8k_eval.py against the served route: greedy, answer read from the model's own `#### <number>` line, gold from the dataset's `####` field, both normalised; per-question transcript kept (gold, prediction, finish_reason, tokens, wall)",
+  "repeats": 1,
+  "timestamp": "2026-11-07T13:49:36Z",
+  "source": "~/evidence/tmoe-npu/587-gsm8k-20261107/ (chunk-{0,8,16,24,32}.json + merge.py + transcript-40.json), tasks bc2f26ddb / b51b849c3",
+  "notes": "97.5 % (39/40) with **6 of the 40 answers cut off by the 512-token budget** (finish_reason=length) and **exactly 1 of those 6 also wrong** (q12: gold 13, predicted 12 from a partial derivation) - so among answers that finished, 34/34 were right. That split is the point of the tool: a truncated answer is not evidence about the model's maths, and a bare '97.5 %' would have hidden it. n=40 of 1319 test questions: +-~5 % at 95 % confidence, so read it as 'about 40 of 40', not as a fourth significant figure. 0 route errors. One relabelling caveat, stated because it is real: the tool's --offset numbered each chunk's rows 0..n-1 at the time, so the transcript's absolute question numbers are derived from each chunk file's own 'questions k-k+7' line (merge.py asserts the result is exactly 0-39); the answers, tokens and wall times are the measured ones and the tool is fixed and pinned by tests/gsm8k_eval_test.py."
+}

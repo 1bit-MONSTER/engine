@@ -656,6 +656,12 @@ if(Python3_Interpreter_FOUND)
     # it self-checks the comparison with a one-value change so a comparator that always passed cannot look the same.
     # Pure python, no model, no device, no network.
     add_test(NAME npu_leaderboard COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_leaderboard_test.py)
+    # An accuracy figure is the easiest number here to produce wrongly and the hardest to notice (tools/gsm8k_eval.py):
+    # a scorer that reads the wrong number out of a completion, or that counts a completion cut off by the token
+    # budget as a clean miss, still prints a plausible percentage.  This drives the extractor, the gold normaliser and
+    # the whole run loop against canned completions, and re-derives the summary from the written transcript.  Stdlib
+    # only, with no route, no socket, no dataset fetch and no device.
+    add_test(NAME gsm8k_eval COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gsm8k_eval_test.py)
     # The repack's tile-order claim (engine#1110): `npu_plan.py` writes container.tile_order=engine-1 for every
     # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
     # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.

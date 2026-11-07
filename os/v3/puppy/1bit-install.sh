@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# 1bit-install /dev/sdX --yes
+# 1bit-install /dev/sdX --yes [--no-reboot]
 #
 # Installs this booted 1bit OS (Puppy appliance) onto ONE disk, laid out exactly as the stick is: an EFI
 # system partition (the stick's own shim + grub + grub.cfg) and a 1BIT-DATA ext4 partition carrying the
@@ -57,9 +57,11 @@ fail() { say "1bit-install: FAILED: $*" >&2; exit 3; }
 
 dev=
 yes=
+noreboot=
 for a in "$@"; do
     case $a in
         --yes|-y) yes=1 ;;
+        --no-reboot) noreboot=1 ;;
         -h|--help) usage; exit 0 ;;
         /dev/*) dev=$a ;;
         *) die "unknown argument '$a' (usage: 1bit-install /dev/sdX --yes)" ;;
@@ -312,5 +314,40 @@ say ""
 say "INSTALLED: 1bit OS on $dev (ESP $ESP_LABEL, data $DATA_LABEL, UUID=$datauuid)"
 say "  persistent: /1bit/$save_name is this machine's writable root (PUPMODE=12), SFS mounted from the disk"
 say "  reboot and remove the stick: the firmware boots Boot$new first."
+say "  the firmware boots Boot$new first."
 say "  then: 1bit-release-check   (it says INSTALLED and runs the same rows)"
-exit 0
+
+# engine#709 item (4), owner 2026-11-06: the install ends by rebooting, because it is not finished until the machine has
+# come up on the new disk and nobody should have to remember to pull the stick. Ten seconds, any key cancels it (that is
+# the path a person takes when they want to read the firmware output above, or to keep the stick in for a second install),
+# and `--no-reboot` keeps the old "the disk is written, you reboot" behaviour for scripts - the install gate uses it,
+# because it reads the firmware state after the install and a reboot would take that away mid-row.
+if [ -n "$noreboot" ]; then
+    say ""
+    say "  not rebooting (--no-reboot): remove the stick and reboot when you are ready."
+    exit 0
+fi
+[ -x /bin/bash ] || say "  (no /bin/bash on this machine: the countdown cannot be cancelled by a key, let it run out or Ctrl-C)"
+say ""
+sync
+n=10
+while [ "$n" -gt 0 ]; do
+    printf '\r  remove the stick, rebooting into the installed system in %2d s (press any key to cancel) ' "$n"
+    # The countdown needs a 1 s timed read of ONE key, with no Enter - POSIX sh has no syntax for that (`read -t` is
+    # undefined, and dash's read rejects it outright: measured "sh: read: Illegal option -t"). /bin/sh IS bash in this
+    # image (bin/sh -> bash, BusyBox present only as busybox), but the loop does not lean on that: it asks bash directly,
+    # and on a machine with no bash the countdown simply runs out with the reason printed - so a changed /bin/sh gives a
+    # missing cancel with an explanation instead of a key that silently does nothing.
+    # shellcheck disable=SC3045  # read -t/-n below runs in bash, which is asked for explicitly
+    if [ -x /bin/bash ] && /bin/bash -c 'IFS= read -r -t 1 -n 1 _' 2> /dev/null; then
+        printf '\r  reboot cancelled: the disk is written, remove the stick and reboot when you are ready.%*s\n' 12 ''
+        exit 0
+    else
+        [ -x /bin/bash ] || sleep 1      # no bash: keep the countdown at one second per line, cancel unavailable
+    fi
+    n=$((n - 1))
+done
+printf '\r  rebooting now%*s\n' 74 ''
+say "  (the stick can come out; the firmware boots Boot$new first)"
+sync
+reboot

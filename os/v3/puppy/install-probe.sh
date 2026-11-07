@@ -183,7 +183,10 @@ def row(name, cmdline, timeout=600):
 # 1. the firmware as it is BEFORE the install, so the "first Boot####" trap is visible by name
 row("fw before", "efibootmgr | head -6")
 # 2. install onto the second disk, non-interactively
-install = row("install", "1bit-install /dev/vda --yes; echo rc=$?", 900)
+# engine#709 item (4): the installer now ends with a 10 s countdown and a reboot. This gate reads the firmware
+# state AFTER the install, so it needs the flag that keeps the old behaviour - and that makes `--no-reboot` one of
+# the two paths the owner asked to have tested, not a convenience.
+install = row("install", "1bit-install /dev/vda --yes --no-reboot; echo rc=$?", 900)
 # 3. the firmware AFTER - the whole question of #866
 after = row("fw after", "efibootmgr; echo ---; efibootmgr -v | grep -i '1bit OS'", 120)
 grub = row("grub.cfg", "grep -h '^ *linux ' /tmp/x 2>/dev/null; "
@@ -203,8 +206,21 @@ espuuid = espuuid[-1] if espuuid else ""
 # firmware cannot boot through, and the installer is expected to remove it while writing this disk.
 seed = row("seed stale", "efibootmgr -c -d /dev/vda -p 1 -L ubuntu -l '\\EFI\\ubuntu\\shimx64.efi' > /dev/null 2>&1; "
                   "efibootmgr 2>/dev/null | grep -i ubuntu | head -2")
-reinstall = row("reinstall", "1bit-install /dev/vda --yes; echo rc=$?", 900)
+reinstall = row("reinstall", "1bit-install /dev/vda --yes --no-reboot; echo rc=$?", 900)
 cleaned = row("fw cleaned", "efibootmgr 2>/dev/null; echo ---; efibootmgr -v 2>/dev/null | grep -iE '1bit OS|ubuntu'", 120)
+
+# ---- engine#709 item (4)'s other path: the countdown, cancelled by a keypress. A serial gate cannot wait out a real
+# reboot (it would lose its shell), so the arm takes the path a person takes - it watches for the countdown line and sends
+# ONE byte, no Enter, which is what `read -n 1` takes.
+s.sendall(b"1bit-install /dev/vda --yes; echo __E$?__$(date +%s%N)\n")
+countdown = ""
+if read_until(b"rebooting into the installed system in", 900) is None:
+    rows.append(("FAIL", "countdown", "the installer never printed the countdown line"))
+else:
+    s.sendall(b"x")                       # the keypress
+    raw = read_until_re(rb"__E[0-9]+__[0-9]{10,}", 120)
+    countdown = re.sub(r"__E[0-9]+__[0-9]{10,}\s*$", "", (raw or b"").decode("utf-8", "replace")).strip()
+    rows.append(("INFO", "countdown", (countdown or "no output").replace("\n", " | ")[-300:]))
 
 # ---- the verdicts, on the firmware state rather than on the installer's log line
 bootnext = re.search(r"BootNext: ([0-9A-Fa-f]{4})", after or "")
@@ -242,6 +258,19 @@ else:
         ok = False
     if entries.get(want, "").startswith("BootManagerMenuApp"):
         print("FAIL fw entries   Boot%s is BootManagerMenuApp, not 1bit OS" % want); ok = False
+
+# ---- engine#709 item (4): both endings. `--no-reboot` must skip the countdown entirely and leave the shell in place; a
+# key during the countdown must cancel the reboot and do the same.
+if "rebooting into the installed system in" in (install or ""):
+    print("FAIL no-reboot    --no-reboot still counted down"); ok = False
+elif "--no-reboot" in (install or "") and "not rebooting" not in (install or ""):
+    print("FAIL no-reboot    the installer did not report that --no-reboot was honoured"); ok = False
+else:
+    print("PASS no-reboot    --no-reboot skipped the countdown and returned to the shell")
+if "cancelled" not in (countdown or ""):
+    print("FAIL countdown    a keypress during the countdown did not cancel the reboot"); ok = False
+else:
+    print("PASS countdown    a keypress during the countdown cancelled the reboot")
 
 # ---- engine#709: the seeded dangling entry, and that the reinstall left a bootable order behind it
 entries2 = dict(re.findall(r"Boot([0-9A-Fa-f]{4})\* ([^\r\n]+)", cleaned or ""))

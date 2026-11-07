@@ -160,17 +160,27 @@ engine#1134); until the owner authorises loading it, the exporter-mapping route 
 
 That is also a contract question, and `tests/npu_import_contract.sh` (CTest `npu_import_contract`) is where
 it is checked instead of remembered. The pinned `libamdf` advertises
-`AMDF_EXTERNAL_MEMORY_SUPPORT_FLAG_FOREIGN_API` with device read/write on its import memory profile
-(ordinal 1, `libamdf/src/xdna/umd/drm/memory_profile.c`), i.e. "import a foreign dma-buf and execute on
-it". `libamdf`'s import path takes host access through an amdxdna `mmap` of the import, which is the
-poisoning path in the table above, so on the shipping module that capability is advertised and refused. The
-test reads the advertisement from the pin, measures the behaviour with `libamdf`'s own CTS (GPU export -> NPU
-import -> NPU executes on the imported range, plus registered caller pages as the control), and keys the
-expected pairing on the loaded module's `srcversion` against the fingerprint table in
-`third_party/patches/amdxdna/README.md`. Run it with `ONEBIT_IMPORT_CONTRACT=advertised` for the acceptance
-form: it is red while a module without `0006`/`0007` is loaded, and green when one that carries them is
-(measured 2026-11-06 on `EE1F36A2B9BA294CE11AD80`, the c26 driver: binding 7/7 pass, the array executes
-registered caller pages, and 8 of 8 imported-backing arms fail at `kernel_queue_create`).
+`AMDF_EXTERNAL_MEMORY_SUPPORT_FLAG_FOREIGN_API` with device read/write on the **dma-buf-fd entry** of its
+import memory profile (ordinal 1, `libamdf/src/xdna/umd/drm/memory_profile.c`), i.e. "import a foreign
+dma-buf and execute on it". The **opaque-fd entry** in the same profile is cloned from that one and then has
+the flag cleared, carrying the direct-host provenance instead -- a different advertisement for the same
+execution, which is why the acceptance below covers both transports and reports them apart. `libamdf`'s
+import path takes host access through an amdxdna `mmap` of the import, which is the poisoning path in the
+table above, so on the shipping module that capability is advertised and refused. The test reads the
+advertisement from the pin, measures the behaviour with `libamdf`'s own CTS (GPU export -> NPU import -> NPU
+executes on the imported range, plus registered caller pages as the control), and keys the expected pairing on
+the loaded module's `srcversion` against the fingerprint table in `third_party/patches/amdxdna/README.md`.
+Run it with `ONEBIT_IMPORT_CONTRACT=advertised` for the acceptance form: it is red while a module without
+`0006`/`0007` is loaded, and green when one that carries them is (measured 2026-11-06 on
+`EE1F36A2B9BA294CE11AD80`, the c26 driver: binding 7/7 pass, the array executes registered caller pages, and
+8 of 8 imported-backing arms fail at `kernel_queue_create`).
+
+The advertisement half is a parse of the pin, so it has a device-free test of its own: CTest
+`npu_import_advert` (`tests/npu_import_contract.sh --self-test`) reads two fixtures — an advertising pin and
+the same pin with the flag dropped from the import class' dma-buf entry — and requires `advertised` on the
+first and *not* on the second. Both bounds it needs are load-bearing and were both wrong in the first
+version: the ordinal-0 class advertises the same flag, and the import class clears it on the opaque-fd entry
+it clones, so a whole-file search reports a narrowed pin as advertising (engine#1283's review).
 
 The NPU BO to dma-buf direction still does not exist: the export `PRIME_HANDLE_TO_FD` returns ENOENT for the
 handle the runtime produces, so an NPU-owned buffer cannot yet be handed to the GPU. Nothing on the serving

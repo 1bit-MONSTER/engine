@@ -26,7 +26,8 @@ re-published Qwen3.8-Flash-Next-GGUF's UD quants on 2026-11-04 (UD-IQ4_XS went f
 and the files we re-hosted are the old ones. This tool closes that gap (docs/model-pins.md).
 
   --check      compare every pin with the repo's current main; write a Markdown report and exit 1 when
-               anything moved, 0 when nothing did. For a moved pin it re-reads the chat template of
+               a pin's bytes moved, 0 when nothing did (a HEAD move that leaves every tracked file
+               unchanged is reported under "Head moved, no tracked file changed" and is not a bump). For a moved pin it re-reads the chat template of
                every changed `.gguf` (the metadata header only, over an HTTP range request) and says
                whether the template changed, because a new revision may not be adopted before that is
                known. --no-template skips that read (the report then says it was not checked).
@@ -376,8 +377,18 @@ def check(pins: dict, want_template: bool) -> tuple[list[dict], list[str]]:
                            and (p.endswith(".gguf") or p.endswith(".q4nx")))[:40]
         if not rows and now == pin["commit"]:
             continue
-        changes.append({"repo": repo, "old": pin["commit"], "new": now, "pinned": pin["pinned"], "files": rows, "added": added,
-                        "commits": commits_since(repo, pin["commit"], now) if now != pin["commit"] else []})
+        entry = {"repo": repo, "old": pin["commit"], "new": now, "pinned": pin["pinned"], "files": rows,
+                 "added": added,
+                 "commits": commits_since(repo, pin["commit"], now) if now != pin["commit"] else []}
+        if not rows:
+            # HEAD moved and every file we track still has the oid we hold: a README edit, or a new upstream
+            # quant under a name this pin does not take. Reported (the commit titles and the new files are
+            # how a re-quant shows up first) but not a *bump*: a PR per README commit is a queue item a
+            # human has to approve, and approving pin PRs reflexively is how a TEMPLATE CHANGED row would
+            # get waved through. Measured 2026-11-07: unsloth/Qwen3.8-Flash-Next-GGUF, three "Update
+            # README.md" commits and 40 new BF16 shards, and all five pinned files unchanged.
+            entry["head_only"] = True
+        changes.append(entry)
     return changes, notes
 
 
@@ -389,18 +400,29 @@ def report(changes: list[dict], notes: list[str], total: int, want_template: boo
     # The first line counts what was read. "Every pin is at the revision" must never be printed over a
     # repo that could not be read — a watcher whose "clean" and "could not check" are the same outcome
     # is blind exactly when it matters.
+    real = [c for c in changes if not c.get("head_only")]
+    head_only = [c for c in changes if c.get("head_only")]
     tail = f", {len(fresh)} published but not pinned" if fresh else ""
+    if head_only:
+        tail += f", {len(head_only)} head moved without a file change"
     if notes:
         out = [f"# Model pins: {checked} of {total} checked, {len(notes)} not checked, "
-               f"{len(changes)} moved{tail} ({day})", ""]
+               f"{len(real)} moved{tail} ({day})", ""]
     else:
-        out = [f"# Model pins: {len(changes)} of {total} moved{tail} ({day})", ""]
-    if not changes and not notes and not fresh:
+        out = [f"# Model pins: {len(real)} of {total} moved{tail} ({day})", ""]
+    if not real and not notes and not fresh and not head_only:
         out += ["Every pinned upstream repo is at the revision `models/pins.json` records.", ""]
-    elif not changes:
-        out += [f"No pin moved among the {checked} repo(s) that could be read; {len(notes)} could not be "
-                f"checked and are listed under **Not checked** — an unread repo is not a clean one.", ""]
-    for c in changes:
+    elif not real:
+        if notes:
+            out += [f"No pin moved among the {checked} repo(s) that could be read; {len(notes)} could not be "
+                    f"checked and are listed under **Not checked** — an unread repo is not a clean one.", ""]
+        else:
+            # Nothing was left unread, so the "not a clean one" sentence above would be false: the only
+            # thing to say is the head move, if there is one.
+            extra = (f"; {len(head_only)} moved its HEAD without touching a tracked file (below)"
+                     if head_only else "")
+            out += [f"No pin's bytes moved among the {checked} repo(s) that could be read{extra}.", ""]
+    for c in real:
         out += [f"## `{c['repo']}`", ""]
         if c.get("gone"):
             out += ["**Gone upstream** — the Hub answers `404` for this repository, so every pin on it is "
@@ -431,6 +453,17 @@ def report(changes: list[dict], notes: list[str], total: int, want_template: boo
         if c["added"]:
             out += [f"{len(c['added'])} new `.gguf`/`.q4nx` file(s) upstream, not tracked by the pin: "
                     + ", ".join(f"`{p}`" for p in c["added"][:8]) + (" …" if len(c["added"]) > 8 else ""), ""]
+    if head_only:
+        out += ["## Head moved, no tracked file changed", "",
+                "The repository's `main` moved, but every file this pin tracks still has the oid we hold, so "
+                "there is nothing to adopt and no bump PR to open. Listed because the commit titles and the new "
+                "upstream files are how a re-quant or a rewrite shows up first (`docs/model-pins.md`).", "",
+                "| repo | head | commits | new untracked files |", "|---|---|---|---|"]
+        for c in head_only:
+            titles = "; ".join(f"`{x['id'][:8]}` {x['title'][:60]}" for x in c["commits"][:4]) or "—"
+            out.append(f"| `{c['repo']}` | `{c['old'][:8]}` -> `{c['new'][:8]}` | {titles} | "
+                       f"{len(c['added'])} |")
+        out.append("")
     if fresh:
         out += ["## Published, not pinned", "",
                 "A repo in our own orgs ships a model or a chat template and is not in this table, so nothing "
@@ -444,7 +477,7 @@ def report(changes: list[dict], notes: list[str], total: int, want_template: boo
         out.append("")
     if notes:
         out += ["## Not checked", ""] + [f"- {n}" for n in notes] + [""]
-    if any(not c.get("gone") for c in changes):
+    if any(not c.get("gone") for c in real):
         out += ["## Adopting a new revision", "",
                 "Never automatic. A new revision is adopted by merging that repo's pin bump, and only after:",
                 "1. the template row above is not `TEMPLATE CHANGED` (or the change has been audited —",
@@ -458,6 +491,13 @@ def census_refusal(repo: str, where: str) -> str:
     """Why a repo the census found is not a bump PR, in the same words from both --pr-body paths."""
     return (f"pin_watch: {repo} is published but not pinned (see {where}) — a pin is what makes it "
             "checkable, so it needs `--pin`, not a bump PR")
+
+
+def head_only_refusal(repo: str) -> str:
+    """Why a repo whose HEAD moved but whose tracked files did not is not a bump PR, in one wording for
+    both --pr-body paths."""
+    return (f"pin_watch: {repo} moved its HEAD but no file we track changed, so there is nothing to adopt "
+            f"and no bump PR to open")
 
 
 def pr_body(c: dict) -> str:
@@ -713,6 +753,66 @@ def self_test() -> int:
                (rc_unpinned != 0 and "published but not pinned" in msg_unpinned), True)
         expect("a pin that moved still prints its body", body_of("fake/moved"), (0, ""))
 
+        # A HEAD move that leaves every tracked file alone is not a bump: the repo is alive (README edits,
+        # a new upstream quant we do not take) but the bytes we hold are the bytes it serves. Reported in
+        # its own section and in the JSON, exit 0, and `--pr-body` refuses it in one wording -- measured
+        # 2026-11-07 on unsloth/Qwen3.8-Flash-Next-GGUF, where a whole day of pin PRs would have been
+        # "Update README.md" (3 commits, 40 untracked BF16 shards, all 5 pinned files unchanged).
+        def fake_tree_mixed(repo, rev="main"):
+            # fake/still: the bytes we hold, plus a new upstream file we do not track.
+            # anything else: the replacement tree.
+            if repo == "fake/still":
+                return list(trees["old"].values()) + [trees["new"]["extra-Q8_0.gguf"]]
+            return list(trees["new"].values())
+
+        head, tree, commits_since = fake_head_new, fake_tree_mixed, fake_commits
+        hopath = os.path.join(d, "head-only-pins.json")
+        save(hopath, {"pins": {"fake/still": dict(base)}})
+        ho_changes, ho_notes = check({"pins": {"fake/still": dict(base)}}, want_template=False)
+        expect("a HEAD move with no file change is carried as head_only",
+               [(c["repo"], c.get("head_only", False)) for c in ho_changes], [("fake/still", True)])
+        expect("...and its files list is empty", ho_changes[0]["files"], [])
+        expect("...while the new upstream file is still reported", ho_changes[0]["added"], ["extra-Q8_0.gguf"])
+        ho_md = report(ho_changes, ho_notes, 1, False)
+        expect("the first line counts 0 moved", ho_md.splitlines()[0].startswith("# Model pins: 0 of 1 moved"),
+               True)
+        expect("...and names the head move separately",
+               "1 head moved without a file change" in ho_md.splitlines()[0], True)
+        expect("the report has its own section", "## Head moved, no tracked file changed" in ho_md, True)
+        expect("...and no bump heading the workflow would count", "## `fake/still`" in ho_md, False)
+        expect("...and does not offer to adopt anything", "Adopting a new revision" in ho_md, False)
+        expect("...and does not claim an unread repo it never had",
+               "0 could not be checked" in ho_md, False)
+        expect("...stating the head move instead",
+               "1 moved its HEAD without touching a tracked file (below)" in ho_md, True)
+        hosweep = os.path.join(d, "head-only-sweep.json")
+        expect("a head-only day exits 0, not 1",
+               main(["--check", "--pins", hopath, "--out", os.path.join(d, "ho.md"), "--json", hosweep]), 0)
+        with open(hosweep, encoding="utf-8") as f:
+            ho_doc = json.load(f)
+        expect("the JSON names it too", ho_doc.get("head_moved_no_file_change"), ["fake/still"])
+        expect("the JSON keeps it out of the moved list",
+               [c["repo"] for c in ho_doc["changes"] if not c.get("head_only")], [])
+        def body_from(repo, sweep):
+            try:
+                with contextlib.redirect_stdout(_io.StringIO()):
+                    return main(["--pr-body", repo, "--from", sweep]), ""
+            except SystemExit as e:
+                return (e.code if isinstance(e.code, int) else 1), str(e.code)
+
+        expect("--pr-body refuses a head-only repo",
+               body_from("fake/still", hosweep),
+               (1, "pin_watch: fake/still moved its HEAD but no file we track changed, "
+                   "so there is nothing to adopt and no bump PR to open"))
+        # The guard against "ignore head moves": the same fake repo, with one tracked file's bytes changed,
+        # is still a real bump in the same run.
+        head, tree = fake_head_new, fake_tree_mixed
+        both_changes, _ = check({"pins": {"fake/moved": dict(base), "fake/still": dict(base)}},
+                                want_template=False)
+        expect("a byte change is still a bump while a head-only move is not",
+               [(c["repo"], bool(c.get("head_only"))) for c in both_changes],
+               [("fake/moved", False), ("fake/still", True)])
+
         # the header's exit codes are the ones the tool returns at the process level, not only in
         # main(): a repo that did not move is 1 (the `sys.exit("…")` string branch), not the 3 this
         # line used to claim, and a bare run is usage (2)
@@ -847,6 +947,8 @@ def main(argv: list[str]) -> int:
         except (OSError, KeyError, ValueError) as e:
             sys.exit(f"pin_watch: could not read {a.src}: {e}")
         hit = next((c for c in swept if c["repo"] == a.pr_body), None)
+        if hit is not None and hit.get("head_only"):
+            sys.exit(head_only_refusal(a.pr_body))
         if hit is None:
             # a sweep from a run without --orgs carries no census rows, so it cannot answer this
             if any(f["repo"] == a.pr_body for f in sweep.get("published_not_pinned", [])):
@@ -890,10 +992,14 @@ def main(argv: list[str]) -> int:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump({"date": datetime.date.today().isoformat(), "pins": len(doc["pins"]),
                        "changes": changes, "notes": notes,
-                       "published_not_pinned": fresh}, f, indent=1)
+                       "published_not_pinned": fresh,
+                       "head_moved_no_file_change": [c["repo"] for c in changes if c.get("head_only")]},
+                      f, indent=1)
             f.write("\n")
     if a.pr_body:
         hit = next((c for c in changes if c["repo"] == a.pr_body), None)
+        if hit is not None and hit.get("head_only"):
+            sys.exit(head_only_refusal(a.pr_body))
         if hit is None:
             if any(f["repo"] == a.pr_body for f in fresh):
                 sys.exit(census_refusal(a.pr_body, a.out))
@@ -906,7 +1012,9 @@ def main(argv: list[str]) -> int:
         print(f"pin_watch: no pin could be checked ({len(notes)} unreadable) — this is not a clean run",
               file=sys.stderr)
         return 2
-    return 1 if (changes or fresh) else 0
+    # A head-only move is not a "moved": nothing we hold changed, and a nonzero exit with nothing to open
+    # would fail the workflow over a README commit (docs/model-pins.md).
+    return 1 if (fresh or any(not c.get("head_only") for c in changes)) else 0
 
 
 if __name__ == "__main__":

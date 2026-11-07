@@ -71,10 +71,19 @@ The exit code keeps them apart (`tools/pin_watch.py`'s header carries the same f
 | exit | meaning | what the workflow does |
 |---|---|---|
 | 0 | every pin was read and is at the revision we record — or the requested output (`--pr-body`, `--pin`, `--bump`) was printed | nothing |
-| 1 | something moved, a pinned repo is **gone upstream** (`404` — a delete, a rename and a privatisation look the same), or `--pr-body` was asked for a repo that did not move | opens one bump PR per moved repo; a gone repo is reported and refused for bumping, a human decides |
+| 1 | a pin's **bytes** moved, a pinned repo is **gone upstream** (`404` — a delete, a rename and a privatisation look the same), or `--pr-body` was asked for a repo that did not move | opens one bump PR per moved repo; a gone repo is reported and refused for bumping, a human decides |
 | 2 | a usage error, or **no pin could be read at all** — a Hub outage or rate-limit is not a quiet day | the job fails |
 | 3 | `--self-test` failed | nothing: this is CI's code, not the daily run's |
 | 4 | `--bump` needs a human: the repo or a tracked file is gone upstream | skips that repo and says so |
+
+**A move of the repository's `main` is not a move of the bytes** — since 2026-11-07 the two are counted
+apart. If the HEAD moved but every file the pin tracks still has the `lfs.oid` we hold, the run reports it
+under **Head moved, no tracked file changed** (with the commit titles and any new untracked `.gguf`/`.q4nx`
+files), exits **0**, and opens **no PR**: there is nothing to adopt, and a daily PR per `README.md` edit is a
+queue item a human has to approve — approving pin PRs reflexively is how a `TEMPLATE CHANGED` row would get
+waved through. Measured on `unsloth/Qwen3.8-Flash-Next-GGUF`: three `Update README.md` commits, 40 new BF16
+shards upstream, and all five pinned files unchanged. A byte change in the same run is still a real bump, and
+the new upstream files are still listed, so "did they re-quant" stays visible without a PR.
 
 The report's first line counts what was read (`N of M checked, K not checked`), and the all-clear sentence
 only appears when nothing was left unread: a watcher whose "clean" and "could not check" are the same

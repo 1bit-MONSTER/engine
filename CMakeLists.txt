@@ -1010,17 +1010,29 @@ add_test(NAME attn_math COMMAND attn_math_test)
 # workflow is next touched with that scope and add these to the list itself. `host_gemm_pad_test` is here for the
 # same reason: without it ctest reports the row as "Not Run" and the job fails after every other test passes.
 add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test npu_kv_int8_test
-                 host_gemm_pad_test)
+                 host_gemm_pad_test npu_derive_designs_dump)
 # The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.
 add_test(NAME npu_window11_policy COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/npu-window11.sh --self-test)
 # The GEMM designs are derived on the container's K grid and the kernel's N grid (engine#845); a
 # model already on both is unchanged.  Pure arithmetic + one assemble_B, so it runs without a model.
+# The engine's derived design set for a set of dims, as `ROLE M K N elf` lines.  The instrument the
+# parity test above needs: the plan generator must state the same kernels q4nx_derive_designs() does, and
+# comparing the two is the only way that can be checked rather than assumed (engine#803 A2a).
+add_executable(npu_derive_designs_dump tests/npu_derive_designs_dump.c npu/forward/src/q4nx_pack.c)
+target_include_directories(npu_derive_designs_dump PRIVATE npu/forward/include)
+target_link_libraries(npu_derive_designs_dump PRIVATE m)
 add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
+# The plan's `designs` section against the engine's own derivation (engine#803 A2a): the generator and
+# q4nx_derive_designs() must state the same kernels, because a section that disagreed would be refused at
+# load for every model that carried one.  Runs the dump binary, so it is a build dependency above.
+add_test(NAME npu_plan_designs_parity
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_plan_designs_parity_test.py
+                 ${CMAKE_SOURCE_DIR}/tools/npu_plan.py $<TARGET_FILE:npu_derive_designs_dump>)
 # The host fallback GEMM reads a padded design's activations at stride a_k, inside the caller's buffer
 # (engine#808 review: the split moved the engine#845 pad into the target and left the host branch on the
 # raw A). The test's activation buffer carries a NaN guard tail, so an implementation that reads past the

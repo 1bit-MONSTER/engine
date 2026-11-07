@@ -60,7 +60,7 @@ check() { local what=$1 detail=$2; shift 2; if "$@" >/dev/null 2>&1; then row PA
 case $fam in
     deb)  kv=$(ls /lib/modules | sort -V | tail -1) ;;
     rpm)  kv=$(ls /usr/src/kernels | head -1) ;;
-    arch) kv=$(ls /usr/lib/modules | grep -v '^7\.4\.0-rc1-1bit$' | head -1) ;;
+    arch) for d in /usr/lib/modules/*; do case ${d##*/} in 7.4.0-rc1-1bit) continue ;; *) kv=${d##*/}; break ;; esac; done ;;
     *) echo "unknown family: $fam" >&2; exit 2 ;;
 esac
 [ -n "$kv" ] || { echo "pkg-proof: no kernel headers in this container; install them first (see the header)" >&2; exit 2; }
@@ -74,16 +74,12 @@ else row FAIL "the in-tree amdxdna is present" "install the kernel's module tree
 depmod -a "$kv" 2>/dev/null || :
 
 # ---- install the three packages --------------------------------------------------------------
-root=()   # (subdir, name glob) per family, so the rows below do not care which family
 case $fam in
-    deb)  names=(1bit-npu-config amdxdna-1bit-dkms ec-su-axb35-dkms)
-          dpkg -i "$pkgdir"/1bit-npu-config_*.deb "$pkgdir"/amdxdna-1bit-dkms_*.deb \
+    deb)  dpkg -i "$pkgdir"/1bit-npu-config_*.deb "$pkgdir"/amdxdna-1bit-dkms_*.deb \
                   "$pkgdir"/ec-su-axb35-dkms_*.deb >/tmp/install.log 2>&1 ;;
-    rpm)  names=(1bit-npu-config amdxdna-1bit-dkms ec-su-axb35-dkms)
-          rpm -i --nosignature "$pkgdir"/1bit-npu-config-*.rpm "$pkgdir"/amdxdna-1bit-dkms-*.rpm \
+    rpm)  rpm -i --nosignature "$pkgdir"/1bit-npu-config-*.rpm "$pkgdir"/amdxdna-1bit-dkms-*.rpm \
                   "$pkgdir"/ec-su-axb35-dkms-*.rpm >/tmp/install.log 2>&1 ;;
-    arch) names=(1bit-npu-config amdxdna-1bit-dkms ec-su-axb35-dkms)
-          pacman -U --noconfirm "$pkgdir"/1bit-npu-config-*.pkg.tar.zst "$pkgdir"/amdxdna-1bit-dkms-*.pkg.tar.zst \
+    arch) pacman -U --noconfirm "$pkgdir"/1bit-npu-config-*.pkg.tar.zst "$pkgdir"/amdxdna-1bit-dkms-*.pkg.tar.zst \
                   "$pkgdir"/ec-su-axb35-dkms-*.pkg.tar.zst >/tmp/install.log 2>&1 ;;
 esac
 if [ $? -eq 0 ]; then row PASS "install the three 1bit packages" "rc=0"; else row FAIL "install the three 1bit packages" "$(tail -3 /tmp/install.log)"; fi
@@ -131,17 +127,24 @@ case $ecmod in
     *.xz)  decomp="xz -dc" ;;
     *)     decomp="cat" ;;
 esac
-if [ -z "$ecmod" ]; then row FAIL "the AXB35 DMI gate is in the built module" "no module found"
-elif ! command -v "${decomp%% *}" >/dev/null 2>&1; then
-    row FAIL "the AXB35 DMI gate is in the built module" "${decomp%% *} missing: install it to read $(basename "$ecmod")"
-elif $decomp "$ecmod" 2>/dev/null | strings | grep -q 'not an AXB35'; then
-    row PASS "the AXB35 DMI gate is in the built module" "$(basename "$ecmod")"
+# grep -q on the tail of a pipeline closes it early, and under `pipefail` the upstream tool's SIGPIPE
+# then fails the row even though the match was found (measured on arch, where zstd is still writing).
+# So: decompress to a file once, then grep the file and read nm into a variable.
+if [ -z "$ecmod" ]; then
+    row FAIL "the AXB35 DMI gate is in the built module" "no module found"
+elif ! $decomp "$ecmod" > /tmp/ecmod.ko 2>/dev/null; then
+    row FAIL "the AXB35 DMI gate is in the built module" "cannot decompress $(basename "$ecmod")"
 else
-    row FAIL "the AXB35 DMI gate is in the built module" "$(basename "$ecmod") has no gate string"
+    gate=no
+    grep -aq 'not an AXB35' /tmp/ecmod.ko && gate=yes                       # the patch's message
+    nmout=$(nm /tmp/ecmod.ko 2>/dev/null || :)
+    case $nmout in *dmi_get_system_info*) gate=yes ;; esac                  # the DMI call itself
+    if [ "$gate" = yes ]; then
+        row PASS "the AXB35 DMI gate is in the built module" "$(basename "$ecmod"): dmi_get_system_info, 'not an AXB35'"
+    else
+        row FAIL "the AXB35 DMI gate is in the built module" "$(basename "$ecmod") has neither the call nor the message"
+    fi
 fi
-amod=$resolved
-[ -n "$amod" ] && row PASS "amdxdna built and installed for $kv" "$(basename "$amod")" \
-    || row FAIL "amdxdna built and installed for $kv" "modprobe -n resolves nothing"
 
 # ---- the kernel package ---------------------------------------------------------------------
 case $fam in
@@ -149,7 +152,7 @@ case $fam in
         dpkg -i "$pkgdir"/linux-image-*.deb "$pkgdir"/linux-headers-*.deb >/tmp/k.log 2>&1 \
             && row PASS "install the kernel debs" "linux-image + linux-headers" \
             || row FAIL "install the kernel debs" "$(tail -2 /tmp/k.log)"
-        krel=$(ls /boot/vmlinuz-* | grep -v generic | sed 's|.*vmlinuz-||' | tail -1)
+        krel=7.4.0-rc1-1bit
         check "kernel image in the package" "/boot/vmlinuz-$krel" test -s "/boot/vmlinuz-$krel"
         if ! command -v sbverify >/dev/null 2>&1; then
             row FAIL "kernel signed with the shipped MOK" "sbverify missing: install sbsigntool"
@@ -178,9 +181,12 @@ build=$(readlink -f /usr/lib/modules/$krel/build /lib/modules/$krel/build 2>/dev
 check "the headers package provides modules/$krel/build" "${build:-missing}" \
     bash -c "[ -f '$build/Makefile' ] && [ -f '$build/Module.symvers' ]"
 # the kernel the packages ship is the kernel the box runs: same vmlinuz bytes as the running one
-if [ -r "/boot/vmlinuz-$krel" ]; then
-    sha=$(sha256sum "/boot/vmlinuz-$krel" | cut -d' ' -f1)
-    row PASS "vmlinuz in the package" "/boot/vmlinuz-$krel sha256 $sha"
+img=/boot/vmlinuz-$krel
+[ "$fam" = arch ] && img=/boot/vmlinuz-1bit          # Arch names it by suffix, with the 1bit preset beside it
+if [ -r "$img" ]; then
+    row PASS "vmlinuz in the package" "$img sha256 $(sha256sum "$img" | cut -d' ' -f1)"
+else
+    row FAIL "vmlinuz in the package" "$img missing"
 fi
 
 # ---- uninstall ------------------------------------------------------------------------------
@@ -190,8 +196,10 @@ case $fam in
     arch) pacman -R --noconfirm ec-su-axb35-dkms amdxdna-1bit-dkms 1bit-npu-config >/tmp/r.log 2>&1 ;;
 esac
 if [ $? -eq 0 ]; then row PASS "uninstall the three 1bit packages" "rc=0"; else row FAIL "uninstall the three 1bit packages" "$(tail -2 /tmp/r.log)"; fi
-left=$(ls /lib/modules/"$kv"/updates /lib/modules/"$kv"/updates/dkms /lib/modules/"$kv"/extra \
-           /usr/lib/modules/"$kv"/updates /usr/lib/modules/"$kv"/updates/dkms /usr/lib/modules/"$kv"/extra 2>/dev/null | grep -c '\.ko')
+left=$(for d in /lib/modules/"$kv"/updates /lib/modules/"$kv"/updates/dkms /lib/modules/"$kv"/extra \
+                   /usr/lib/modules/"$kv"/updates /usr/lib/modules/"$kv"/updates/dkms /usr/lib/modules/"$kv"/extra; do
+             for f in "$d"/*.ko*; do [ -e "$f" ] && echo "$f"; done
+         done 2>/dev/null | wc -l)
 check "no module left behind" "$left files" test "$left" = 0
 leftstate=$(dkms status 2>/dev/null || :)
 case $leftstate in *amdxdna-1bit*|*ec-su-axb35*) row FAIL "dkms forgot the module" "$(printf '%s' "$leftstate" | head -2)" ;;

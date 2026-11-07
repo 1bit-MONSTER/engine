@@ -129,21 +129,6 @@ inline std::string systemone_length_message(size_t tokens, size_t limit) {
            std::to_string(limit) + " tokens; nothing was truncated";
 }
 
-// The mask a d3 pack was trained with is declared in its own `decision_config.json`, and the forward learns
-// it from `plan.json` -- `tools/npu_plan.py` copies the declaration there, because the plan is the one place
-// the runtime reads `attention.mode`. A pack that says `noncausal_full_attention` while the forward runs
-// causal is not a small difference: on this pack the reference's own mask is worth 0.2869 |dp| (engine#847),
-// and nothing in the log would say the served answer was computed causally. So the load refuses, and names
-// the command that supplies the missing plan (engine#796). Empty string = the two agree.
-inline std::string systemone_attention_disagreement(const std::string& declared, bool forward_noncausal,
-                                                   bool plan_present, const std::string& dir) {
-    if (declared != "noncausal_full_attention" || forward_noncausal) return "";
-    return "this pack declares attention_mode \"noncausal_full_attention\" in its decision_config.json, but the "
-           "forward is causal: " + dir + "/plan.json is " + (plan_present ? "stale" : "absent") +
-           ". Run tools/npu_plan.py " + dir + " --kernels <elf dir>, whose attention.mode is what the forward "
-           "reads; answering a noncausal pack causally is a different model, not a smaller one";
-}
-
 // {"model", "answers", "usage"} -- the reply the d3 server returns. `output_tokens` is 0 because a
 // decision generates no text; `input_tokens` is the sum of every answered question's prompt length.
 inline nlohmann::ordered_json systemone_reply(const std::string& model, const nlohmann::ordered_json& answers,

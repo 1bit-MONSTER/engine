@@ -123,7 +123,30 @@ check("run: the instrument is in the record, not just in the code",
       s["prompt"] == g.PROMPT and s["max_tokens"] == 512
       and "temperature 0" in s["decoding"] and "test" in s["dataset"])
 
-# 3. The cache rule: a cache that already holds n questions is used without any fetch, and a
+# 3. A split run: `--offset` must label the transcript with ABSOLUTE question numbers. The first
+#    version of the tool sliced the dataset by offset and then numbered the rows 0..n-1 in every
+#    chunk, which made five per-ticket transcripts indistinguishable from each other - the run was
+#    fine and the record was not, so the labelling is pinned here rather than trusted.
+with tempfile.TemporaryDirectory() as td:
+    out2 = os.path.join(td, "split.json")
+    argv = ["gsm8k_eval.py", "--url", "http://route.invalid:18099", "--n", "2", "--offset", "2",
+            "--dataset-json", os.path.join(td, "cache.json"), "--out", out2]
+    old = sys.argv
+    sys.argv = argv
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            g.main()
+    finally:
+        sys.argv = old
+    split = json.load(open(out2))
+check("split: --offset asks for the block after the offset",
+      [c[1] for c in calls[-2:]] == ["q3", "q4"])
+check("split: the transcript numbers its rows absolutely, not from zero",
+      [q["i"] for q in split["questions"]] == [2, 3])
+check("split: the record says which block it covers",
+      "questions 2-3" in split["summary"]["dataset"])
+
+# 4. The cache rule: a cache that already holds n questions is used without any fetch, and a
 #    shorter one is topped up rather than silently shrinking the run.
 with tempfile.TemporaryDirectory() as td:
     cache = os.path.join(td, "c.json")

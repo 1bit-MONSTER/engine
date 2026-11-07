@@ -186,13 +186,13 @@ def main():
         text, fin, ctok, wall = ask(a.url, PROMPT.format(q=q), a.max_tokens, a.timeout)
         if text is None:
             errs += 1
-            res.append(dict(i=i, gold=gold, pred=None, correct=False, finish_reason=fin,
+            res.append(dict(i=a.offset + i, gold=gold, pred=None, correct=False, finish_reason=fin,
                             completion_tokens=0, wall_s=round(wall, 3), error=True))
             print(f"[{i + 1}/{len(rows)}] ERROR {fin}", flush=True)
             continue
         pred = extract(text)
         ok = pred is not None and pred == gold
-        res.append(dict(i=i, gold=gold, pred=pred, correct=ok, finish_reason=fin,
+        res.append(dict(i=a.offset + i, gold=gold, pred=pred, correct=ok, finish_reason=fin,
                         completion_tokens=ctok, wall_s=round(wall, 3)))
         print(f"[{i + 1}/{len(rows)}] {'ok ' if ok else 'MISS'} gold {gold} pred {pred} "
               f"({fin}, {ctok} tok, {wall:.1f} s)", flush=True)

@@ -492,6 +492,14 @@ lemonade_package_checks() {  # lemonade_package_checks <tarball>
     n=${n%%$'\n'*}
     if [ "${n:-0}" != 0 ]; then echo "ok   lemond-onebit loads sealed NPU kernels only (ONEBIT_KCRYPT_REQUIRE_SEALED=1)"
     else echo "FAIL lemond-onebit does not export ONEBIT_KCRYPT_REQUIRE_SEALED=1"; rc=1; fi
+    # engine #1352: the packed tree's modes. The packer normalises (0755/0644) before it tars, so this asserts it stayed
+    # normalised - it is the check that notices if a future staging step brings an inherited mode back.
+    n=$(find "$t" -type f \( -perm -g+w -o -perm -o+w \) | wc -l)
+    if [ "$n" = 0 ]; then echo "ok   no group/other-writable file in $(basename "$1") (engine #1352: modes are the package's decision)"
+    else
+        echo "FAIL $n file(s) in $(basename "$1") are group/other-writable (engine #1352)"; rc=1
+        find "$t" -type f \( -perm -g+w -o -perm -o+w \) | head -5 | sed 's/^/     /'
+    fi
     rm -rf "$t"
     return $rc
 }

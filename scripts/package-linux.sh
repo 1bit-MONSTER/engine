@@ -164,5 +164,22 @@ Keep the directory layout: 1bit finds its backends beside itself.
 HRX needs TheRock in /opt/rocm-therock; the NPU needs the amdxdna
 kernel driver. Docs: https://1bit.gg/  Code: https://github.com/1bit-MONSTER/engine
 EOF
+# Modes are the package's decision, not the builder's umask or the source tree's (engine #1352). Measured in a released
+# payload before this existed: 134 of 195 files were group- or other-writable - 1bit at 0775, libhrx/libggml-hrx/libllama/
+# libloomc/libmtmd at 0775, LICENSE/NOTICE at 0664. All root:root, so nothing non-root could reach those bits, but a mode in
+# a release artifact should not be inherited from whatever the build left behind, and 0775 on a shipped binary reads as
+# deliberate to anyone auditing it. Rule: directories 0755, everything 0644, and anything that was executable (plus every
+# shared object, which the loader maps) 0755.
+_execs=$(mktemp)
+find "$stage" -type f -perm /111 -print0 > "$_execs"
+find "$stage" -type d -exec chmod 0755 {} +
+find "$stage" -type f -exec chmod 0644 {} +
+xargs -0 -r chmod 0755 < "$_execs"
+find "$stage" -type f \( -name '*.so' -o -name '*.so.*' \) -exec chmod 0755 {} +
+rm -f "$_execs"
+_pkgw=$(find "$stage" -type f \( -perm -g+w -o -perm -o+w \) | wc -l)
+[ "$_pkgw" = 0 ] || { echo "package-linux: $_pkgw staged file(s) are still group/other-writable after normalisation" >&2; exit 1; }
+echo "modes normalised: $(find "$stage" -type f -perm /111 | wc -l) executable, $(find "$stage" -type f ! -perm /111 | wc -l) read-only, 0 group/other-writable"
+
 tar -C "$(dirname "$stage")" -cf - "$name" | zstd -q -T4 -19 -o "$out/$name.tar.zst"
 ls -la "$out/$name.tar.zst"

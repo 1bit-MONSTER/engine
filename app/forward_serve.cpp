@@ -960,14 +960,6 @@ int run_forward_serve(int argc, char** argv) {
     } else {
         e.head_error = "no decision_config.json + decision.q4nx next to " + model;
     }
-    // engine#796: a d3 pack's declared mask and the forward's plan have to agree before a request runs, or
-    // the route answers a noncausal pack causally with nothing in the log saying so.
-    if (e.head) {
-        const std::string why = npu::systemone_attention_disagreement(
-            e.head->config().attention_mode, e.fwd->noncausal(),
-            std::filesystem::exists(dir + "/plan.json"), dir);
-        if (!why.empty()) throw std::runtime_error(why);
-    }
 
     std::atomic<bool> ready{false};
     httplib::Server srv;

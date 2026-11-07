@@ -215,6 +215,11 @@ set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME npu_import_contract
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_import_contract.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(npu_import_contract PROPERTIES SKIP_RETURN_CODE 77)
+# The advertisement half of that test is a parse of the pinned libamdf, so it is tested device-free here: the
+# two fixtures are an advertising import profile and the same profile with the flag dropped from its dma-buf
+# entry. Runs everywhere, needs no array, no GPU and no submodule (the pinned file is read only if present).
+add_test(NAME npu_import_advert
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_import_contract.sh --self-test)
 # engine#876: the gate row for a folded (pb16i/t2s) container.  Its device half needs the array, but its
 # assertion does not: these are the accept/refuse cases of `scripts/npu-window11.sh --compare` on hand-written
 # logs -- folded against folded passes, one differing rotated activation fails, a folded log against a plain one

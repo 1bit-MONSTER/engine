@@ -43,6 +43,7 @@
 #include "attn_math.h"               // attention's score dot + value accumulation, SIMD + portable
 #include "q4nx_dequant.h"
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
+#include "q4nx_semantics.h"
 #include "q4nx_pack.h"
 
 #if defined(_OPENMP)
@@ -222,6 +223,25 @@ static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
     s.original_max_position = num("\"original_max_position_embeddings\"", 0.0);
     s.on = s.factor > 0.0 && s.original_max_position > 0.0 && s.high_freq_factor > s.low_freq_factor;
     return s;
+}
+
+// One top-level string field out of a small sidecar JSON (decision_config.json's `attention_mode`).
+// Empty when the file, the key or the value is absent -- the same "absent means not declared" reading
+// tools/npu_plan.py uses, so the two cannot disagree about what a missing field means.
+static std::string read_json_string(const std::string& path, const char* key) {
+    std::ifstream f(path);
+    if (!f) return std::string();
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const std::string needle = std::string("\"") + key + "\"";   // the key, not a mention of it in a prompt string
+    const char* p = strstr(s.c_str(), needle.c_str());
+    if (!p) return std::string();
+    const char* c = strchr(p + needle.size(), ':');
+    if (!c) return std::string();
+    const char* b = strchr(c, '"');
+    if (!b) return std::string();
+    const char* e = strchr(b + 1, '"');
+    if (!e) return std::string();
+    return std::string(b + 1, e);
 }
 
 // LongRoPE short_factor from config.json's rope_scaling (MiniCPM4): the
@@ -541,6 +561,29 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         if (noncausal_attn_)
             fprintf(stderr, "  [plan] attention.mode noncausal_full_attention: full-attention layers read "
                             "the whole prompt (a prompt-encoding model; it cannot generate)\n");
+    }
+    // The pack's own decision_config.json is where a d3 pack declares the mask it was trained with
+    // (`attention_mode`), and tools/npu_plan.py copies that declaration into plan.json. A directory
+    // converted with `pack` + `decision` and no plan step therefore used to be answered causally --
+    // measured on the real d3 pack, worst |dp| 0.3702 and a choice flip against 0.0246 with the plan
+    // (engine#796) -- so the declaration decides when there is no plan, and a plan that contradicts it
+    // is refused as stale (the rule lives in q4nx_semantics.c, tests/npu_rmsnorm_offset_test.c covers it).
+    {
+        const std::string mode = read_json_string(mdir + "/decision_config.json", "attention_mode");
+        char why[512];
+        const int nc = q4nx_attention_mode(mode.empty() ? nullptr : mode.c_str(), plan_.loaded() ? 1 : 0,
+                                           noncausal_attn_ ? 1 : 0, why, sizeof why);
+        if (nc < 0) {
+            err_ = why;
+            return false;
+        }
+        if (nc && !noncausal_attn_) {
+            noncausal_attn_ = true;
+            fprintf(stderr, "  [plan] attention.mode noncausal_full_attention from %s/decision_config.json "
+                            "(no plan.json): full-attention layers read the whole prompt; run "
+                            "tools/npu_plan.py <model dir> --kernels <elf dir> for the kernel-set decisions\n",
+                    mdir.c_str());
+        }
     }
     // The plan is the runtime's copy of the sealed-ELF decision; when it names one it wins, so a plan
     // and a container cannot disagree about which file the decode roles run.

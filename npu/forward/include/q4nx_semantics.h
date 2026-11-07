@@ -209,6 +209,24 @@ int q4nx_semantics_uses_ple(const Q4nxSemantics* s);
  * (1 + w) form, 0 for the plain w form. Exported so the rule is testable with no model present. */
 int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
 
+/* attention.mode for one container, from the two places that can state it (engine#796).
+
+ * A d3 pack declares the mask it was trained with in its own `decision_config.json`
+ * (`attention_mode: noncausal_full_attention`), and `tools/npu_plan.py` copies that declaration into
+ * `plan.json`, which is where this forward reads `attention.mode`.  A directory converted with
+ * `pack` + `decision` and no plan therefore used to be answered causally -- measured on the real d3
+ * pack, worst |dp| 0.3702 and a choice flip against 0.0246 with the plan -- with nothing in the log
+ * saying so.  So the declaration decides when there is no plan, and a plan that disagrees with it is
+ * refused rather than obeyed (a plan written before the pack declared its mask, or hand-edited).
+
+ *   declared        the pack's attention_mode, or NULL when the directory has no decision_config.json
+ *   plan_loaded     1 when plan.json was read
+ *   plan_noncausal  1 when that plan says noncausal_full_attention
+
+ * Returns 1 (noncausal_full_attention), 0 (causal), or -1 when the two disagree, with the reason in
+ * `why`.  Exported so the rule is testable with no model and no device. */
+int q4nx_attention_mode(const char* declared, int plan_loaded, int plan_noncausal, char* why, size_t why_len);
+
 /* Description of the layer-type mix, for error messages. */
 void q4nx_semantics_layer_mix(const Q4nxSemantics* s, char* out, size_t out_sz);
 

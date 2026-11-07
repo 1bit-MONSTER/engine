@@ -29,6 +29,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 static int failures = 0;
 
@@ -75,6 +76,29 @@ int main(void) {
     float real_27b[4] = {0.9704f, 0.8711f, 1.2344f, 0.9500f};
     check(q4nx_rmsnorm_offset_from_norm(real_d3, 4) == 1, "d3-lite layer-0 head -> (1 + w)");
     check(q4nx_rmsnorm_offset_from_norm(real_27b, 4) == 0, "bonsai 27B layer-0 head -> plain w");
+
+    /* The mask rule (engine#796). A d3 pack declares `noncausal_full_attention` in its own
+     * decision_config.json; that declaration has to decide when there is no plan, and a plan that
+     * contradicts it has to be refused. Measured on the real pack: honouring the declaration gives
+     * worst |dp| 0.0246 against the pack's d3_runtime.py, ignoring it 0.3702 with a choice flip. */
+    char why[512];
+    check(q4nx_attention_mode("noncausal_full_attention", 0, 0, why, sizeof why) == 1,
+          "a noncausal declaration with no plan is honoured (the pack's own word)");
+    check(q4nx_attention_mode("noncausal_full_attention", 1, 1, why, sizeof why) == 1,
+          "a noncausal declaration and a noncausal plan agree");
+    check(q4nx_attention_mode(NULL, 1, 1, why, sizeof why) == 1,
+          "no declaration: the plan decides (noncausal)");
+    check(q4nx_attention_mode(NULL, 0, 0, why, sizeof why) == 0,
+          "no declaration and no plan: causal, every other model on the box");
+    check(q4nx_attention_mode("causal", 0, 0, why, sizeof why) == 0,
+          "a causal declaration is causal");
+    check(q4nx_attention_mode("", 0, 0, why, sizeof why) == 0,
+          "an empty declaration (a decision_config.json with no attention_mode) is causal");
+    check(q4nx_attention_mode("noncausal_full_attention", 1, 0, why, sizeof why) == -1 &&
+          strstr(why, "stale") && strstr(why, "tools/npu_plan.py"),
+          "a plan that says causal for a noncausal pack is refused, naming itself stale and the command");
+    check(q4nx_attention_mode("causal", 1, 1, why, sizeof why) == -1 && strstr(why, "stale"),
+          "the disagreement is refused in both directions, not only the one this issue measured");
 
     printf(failures ? "npu_rmsnorm_offset: %d FAILED\n" : "npu_rmsnorm_offset: ok\n", failures);
     return failures ? 1 : 0;

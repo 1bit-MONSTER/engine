@@ -39,8 +39,15 @@ Both are exact given the inputs; nothing here is a model of the hardware, and th
 one: every argument is a measurement and the provenance is echoed with the answer.
 
     split_ceiling.py --gpu-ms 18.4 --npu-tile-ms 8.61 --rows 16384
+    split_ceiling.py --gpu-tile-ms 1.441 --npu-tile-ms 8.61 --rows 16384 --gemm-share 0.515
     split_ceiling.py --gpu-ms 65.71 --npu-tile-ms 8.61 --rows 16384 --gemm-share 0.523 --json
     split_ceiling.py --self-test
+
+Which iGPU rate is fed in decides the answer, and both are defensible only if named: the microbenchmark
+(`mosaic_bench`, 0.313 ms per 256-row group at M=16384) is 3.4-4.6x faster than the engine's own prefill
+capture (1.06-1.44 ms per group, read with the bundle's timestamp_frequency_hz). A split runs beside the
+engine, so the ceiling should be quoted from the engine's rate; `SELF_TEST` carries both, and the third
+measurement's rows are the ones the #1270 review recomputed by hand.
 
 --self-test replays the four points docs/hetero-prefill.md records (pre-reset, engine#782 regression,
 post-#782, and the end-to-end factor at the measured attention share) and fails if the arithmetic stops
@@ -109,6 +116,13 @@ SELF_TEST = [
     # measured 1.134x at 4 tiles with mosaic_bench --mode split; the model says 1.104x, so this entry asserts
     # the *gap* rather than the number: the model must stay below the measurement and within 4 points of it
     ("2026-11-06 release-rc libs, 4B down M=16384 (77.97 ms, 10.22 ms/tile)", 77.97, 10.22, 16384, 1.104, 0.04),
+    # The corrected third measurement (review of #1270 at d0122cec): the engine's own prefill capture, read with
+    # the bundle's 99.81 MHz `timestamp_frequency_hz` instead of assuming nanoseconds. These are the three rows
+    # the review recomputed by hand, and they are the numbers a real split would run beside -- the microbenchmark
+    # above is 3.4-4.6x faster than the engine, which is why quoting a ceiling from it was wrong.
+    ("in-engine capture, 1.441 ms/256 rows, today's tile (92.22 ms, 8.61 ms/tile)", 92.224, 8.61, 16384, 1.164, 0.004),
+    ("in-engine at #754's 4x bar (2.15 ms/tile)", 92.224, 2.15, 16384, 1.650, 0.01),
+    ("in-engine, slower per-dispatch reading 2.883 ms/256 rows", 184.512, 8.61, 16384, 1.333, 0.004),
 ]
 
 
@@ -152,6 +166,9 @@ def self_test() -> int:
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="What an iGPU+NPU M-split can buy, from two measured rates.")
     ap.add_argument("--gpu-ms", type=float, help="the iGPU's measured time for all --rows, in ms")
+    ap.add_argument("--gpu-tile-ms", type=float,
+                    help="the iGPU's measured time per --tile rows (the unit the prefill captures report); "
+                         "an alternative to --gpu-ms")
     ap.add_argument("--npu-tile-ms", type=float, help="the NPU kernel's measured time for one --tile-row launch, in ms")
     ap.add_argument("--rows", type=int, default=TILE_ROWS, help=f"rows in the GEMM (default {TILE_ROWS})")
     ap.add_argument("--tile", type=int, default=TILE_ROWS, help=f"rows per NPU launch (default {TILE_ROWS})")
@@ -162,8 +179,15 @@ def main(argv: list[str]) -> int:
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
+    if a.gpu_ms is not None and a.gpu_tile_ms is not None:
+        ap.error("give --gpu-ms or --gpu-tile-ms, not both")
+    if a.gpu_tile_ms is not None:
+        if a.gpu_tile_ms <= 0 or a.rows <= 0:
+            print("split_ceiling: --gpu-tile-ms and --rows must be > 0", file=sys.stderr)
+            return 2
+        a.gpu_ms = a.gpu_tile_ms * a.rows / a.tile
     if a.gpu_ms is None or a.npu_tile_ms is None:
-        ap.error("--gpu-ms and --npu-tile-ms are required (or --self-test)")
+        ap.error("--gpu-ms (or --gpu-tile-ms) and --npu-tile-ms are required (or --self-test)")
     try:
         out = ceiling(a.gpu_ms, a.npu_tile_ms, a.rows, a.tile)
         if a.gemm_share is not None:

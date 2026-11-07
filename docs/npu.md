@@ -691,6 +691,16 @@ and names a weight whose converter padded that grid (engine#1097) — a gated at
 emits q **and** the output gate (engine#796: reading it as one head-width made the real d3 pack, and
 every 27B `qwen3_5` pack on this box, look like a padded grid and fail `--strict`).
 
+`--against <source.gguf>` closes both of those gaps for a directory that was never repacked here: it
+decodes the first tile of the Q8 tensors under both Q8 layouts *and* the first tile of the `q4_1`
+tensors under all three `q4_1` orders this repo can name (`ours`, `flm` signed, `flm` unsigned),
+correlates each against the source GGUF, and refuses a container whose winner is not the engine's own
+(`--q8-samples` sets how many tensors per chunk kind). That is the offline row engine#1110 asked
+for — a directory imported from a foreign converter carries no stamp and no plan, so nothing but the
+weights can say which order it holds, and the separation is wide: `ours` reads `corr +1.0000` on a
+container packed from `Q4_K_M` and `+0.996` on one packed from BF16, while every foreign order sits at
+`|corr| < 0.05`.
+
 **The tile order is measured, not declared.** Two converters can write `q4_1` tiles in the two
 different orders this engine and FastFlowLM use, and a container in the wrong order repacks cleanly
 and decodes as noise — HTTP 200, nothing in the log (engine#1110; measured with FLM_Q4NX_Converter

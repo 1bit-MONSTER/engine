@@ -648,6 +648,12 @@ if(Python3_Interpreter_FOUND)
     # plus the same bytes under the mapped name, which must be compared and refused.  numpy + gguf-py, no model.
     add_test(NAME tile_check_no_shared_tensor
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/tile_check_no_shared_tensor_test.py)
+    # The offline half (engine#1110): a container whose q4_1 TILE ORDER is foreign has no metadata signature at
+    # all -- same chunk kind, same bytes, same names -- so the fixture encodes one known weight in the engine's
+    # order and in the foreign one and requires check_q4nx_dir.py --against to accept the first and refuse the
+    # second by name.  numpy + gguf-py, no model, no device.
+    add_test(NAME check_q4nx_tile_order
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/check_q4nx_tile_order_test.py)
     # The other half of that gate: the plan's container.tile_order is a measurement read from the repack's
     # stamp, not a constant -- a plan written for a directory the repack refused would hand the loader the
     # one value it accepts, undoing that refusal.  Stdlib only: no model, no numpy, no device.

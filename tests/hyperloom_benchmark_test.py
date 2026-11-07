@@ -52,6 +52,41 @@ def main():
     assert prompt == bench.long_prompt(18800)
     assert len(bench.long_prompt(512)) < len(prompt)
 
+    # The score's unit has to name BOTH dimensions that set its value: the context, and the number of tokens
+    # the decode actually produced (its denominator -- not the number requested, because the model can stop at
+    # EOS first unless the request pins the length). Measured on this box 2026-11-07: 13.3986 tok/s over 128
+    # decoded tokens and 14.1784 over 278, both carrying the same unit string, so the two rows read as the
+    # same measurement. (engine#1337)
+    assert bench.decode_unit(18762) == "tok/s (decode at 18762-token ctx)", bench.decode_unit(18762)
+    assert bench.decode_unit(18762, 128) == "tok/s (decode at 18762-token ctx, 128 decoded)", \
+        bench.decode_unit(18762, 128)
+    # The regression itself: two rows whose denominators differ must not serialise to the same unit...
+    assert bench.decode_unit(18762, 128) != bench.decode_unit(18762, 278)
+    # ...and a decode that stopped short of what was asked says so, in the field that travels with the number.
+    assert bench.decode_unit(18762, 278, 512) == "tok/s (decode at 18762-token ctx, 278 of 512 requested)", \
+        bench.decode_unit(18762, 278, 512)
+    assert bench.decode_unit(18762, 512, 512) == "tok/s (decode at 18762-token ctx, 512 decoded)", \
+        bench.decode_unit(18762, 512, 512)
+    # An unknown decode count must not fabricate "0 decoded" or a KeyError.
+    assert bench.decode_unit(18762, None) == bench.decode_unit(18762)
+    assert bench.decode_unit(18762, None, 512) == bench.decode_unit(18762)
+
+    # And the score's denominator itself: the long leg asks the backend to ignore EOS so the decode runs the
+    # requested number of tokens, and the artifact records whether the backend honoured that, because the flag
+    # is a request to the backend and not a guarantee from it.
+    pinned = bench.request_body("p", 512, ignore_eos=True)
+    assert pinned["ignore_eos"] is True and pinned["max_tokens"] == 512, pinned
+    # The short legs must NOT pin it: their replies are the greedy-text gate's inputs, compared against a
+    # stored reference, so a different decode length would change the gate's own evidence.
+    assert "ignore_eos" not in bench.request_body("p", 128), bench.request_body("p", 128)
+    assert bench.request_body("p", 128)["messages"] == [{"role": "user", "content": "p"}]
+    # Completeness, including the two "we do not know" cases, which must not read as "it finished".
+    assert bench.decode_completeness(512, 512) is True
+    assert bench.decode_completeness(512, 513) is True
+    assert bench.decode_completeness(512, 278) is False
+    assert bench.decode_completeness(512, None) is False
+    assert bench.decode_completeness(0, 128) is False
+
     # Score: the long leg replaces the geomean when it ran...
     tps = {"code": 28.0, "prose": 16.0, "short": 17.0, "long": 12.67}
     assert bench.score_of(400.0, 12.0, tps, 18800) == 12.67

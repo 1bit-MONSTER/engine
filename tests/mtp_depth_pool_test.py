@@ -316,6 +316,19 @@ FIXTURE_ROOT = os.path.join(ROOT, "tests", "fixtures")
 # for k and for the generation budget.  A new row in a different regime adds a window here, not a lambda to a flat dict.
 WINDOWS = [
     {
+        "name": "tau=0.6 (the default), k=4, 8 prompts x 64 tokens",
+        "dir": "mtp_tau06",
+        "files": ("p0.txt", "p1.txt", "p2.txt", "p3.txt", "p4.txt", "p5.txt", "p6.txt", "p7.txt"),
+        "records": {
+            "27b-mtp-tau06-depth1-20261106": lambda e: e["depth_rate"][1],
+            "27b-mtp-tau06-depth2-20261106": lambda e: e["depth_rate"][2],
+            "27b-mtp-tau06-depth3-20261106": lambda e: e["depth_rate"][3],
+            "27b-mtp-tau06-hit-rate-20261106": lambda e: e["hit"],
+            "27b-mtp-tau06-tokens-per-pass-20261106": lambda e: e["tpp_live"],
+            "27b-mtp-tau06-offline-tokens-per-pass-20261106": lambda e: e["tpp_offline"],
+        },
+    },
+    {
         "name": "tau=0, k=4, 8 prompts x 64 tokens",
         "dir": "mtp_clause55",
         "files": ("p0.txt", "p1-4.txt", "p5-7.txt"),

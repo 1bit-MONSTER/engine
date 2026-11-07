@@ -26,6 +26,7 @@
 #ifndef ONEBIT_NPU_TARGET_TARGET_H
 #define ONEBIT_NPU_TARGET_TARGET_H
 
+#include <cstdint>   // uint8_t: TileFn's tile buffer.  Listed rather than relied on from an includer.
 #include <string>
 #include <vector>
 
@@ -124,6 +125,23 @@ public:
     virtual bool supports(Op op) const { return op == Op::gemv; }
     virtual Caps caps() const = 0;
 };
+
+// The plan describes what the model directory asks for; a target's caps describe what it can actually run.
+// A plan that asks for something the caps do not cover is a refusal BY NAME, never a silent downgrade --
+// for the KV cache the downgrade would be a model that answers the same text out of a different contract,
+// which is the failure this whole layer exists to remove.
+//
+// One function rather than a check inside each target: the xdna target is not the last one (P5 adds
+// Hexagon), and a rule that has to be re-remembered per target is a rule that will be missing from one.
+// Takes the plan's two dtype strings rather than the Plan so this header stays free of nlohmann/json.
+inline bool check_kv_caps(const std::string& key, const std::string& value, const Caps& caps, std::string& err) {
+    if (key != "int8" && value != "int8") return true;
+    if (caps.int8_kv) return true;
+    err = "plan asks for an int8 KV cache (kv.key=\"" + key + "\", kv.value=\"" + value +
+          "\") but this target has no int8 KV path (caps().int8_kv is false): refusing rather than "
+          "storing f16 in its place";
+    return false;
+}
 
 }  // namespace npu::target
 

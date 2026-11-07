@@ -36,6 +36,9 @@
 #      over a window it never covered -- at tau>0 the chain gate stops before depths 3-4 (npu/mtp/mtp_head.h:96),
 #      this lane's tickets are per-prompt slices, and a k=6 ticket pooled with k=4 ones adds depths 5-6 that only
 #      its own prompts ever attempted.
+#   4. a depth with too few chains to carry the bar says so: one chain moves its rate by 100/n pp, so under 50 chains a
+#      single accepted draft is worth more than the whole 2 pp bar, and the tau=0.6 window's depths 2-3 (13 and 2 chains)
+#      would otherwise have read as a drafter regression.
 #
 #   tools/mtp_depth_pool.py ticket-a.log ticket-b.log ...   # pooled table + the 2 pp verdict per depth
 #   tools/mtp_depth_pool.py --selftest                      # the refusals and the arithmetic, no logs needed
@@ -48,6 +51,12 @@ import re
 import sys
 
 BAR = 2.0  # the brief's bar, in percentage points
+
+# A depth whose denominator is this small cannot support the bar at all, and the arithmetic says why without any
+# statistics: ONE chain moves the rate by 100/n percentage points, so below 100/BAR = 50 chains a single accepted draft
+# is worth more than the whole bar.  At tau=0.6 that is exactly the shape of the published window (depth 2 has 13 live
+# chains = 7.7 pp per chain, depth 3 has 2 = 50 pp per chain), and the table used to print those as bare PASS/FAIL.
+THIN_CHAINS = 100.0 / BAR   # chains below which one accepted draft is worth more than the whole bar (50 at 2 pp)
 
 # The tool prints the per-depth table in two shapes, and confusing them is what this file exists not to repeat:
 #   per PROMPT (keyed, poolable):
@@ -307,7 +316,7 @@ def table(seen, sources, unmeasured=(), budget=None, width=None, idents=None, ta
         if note:
             print(note)
     print(f"\n{'depth':>5}  {'live':>18}  {'offline (same positions)':>24}  {'delta':>9}  verdict")
-    inside = scored = 0
+    inside = scored = substantial = 0
     totals = {}
     for d in depths:
         live_n = sum(v[0] for (_, dd), v in seen.items() if dd == d)
@@ -324,9 +333,18 @@ def table(seen, sources, unmeasured=(), budget=None, width=None, idents=None, ta
         ok = abs(delta) <= BAR
         scored += 1
         inside += ok
+        # Can this depth support the bar?  One chain moves the live rate by 100/live_d pp, so a denominator under
+        # 100/BAR chains means a single draft is worth more than the whole bar: the depth keeps its PASS/FAIL (the bar is
+        # the brief's criterion) but says that the verdict rests on too few chains to mean anything.  Arithmetic, not a
+        # test -- and it is the shape that made the tau=0.6 window read as a regression at depths 2-3.
+        note = ""
+        if live_d < THIN_CHAINS:
+            note = (f"  (thin: {live_d} live chain(s), one chain = {100.0 / live_d:.1f} pp > the {BAR:g} pp bar)")
+        else:
+            substantial += 1
         print(f"{d:>5}  {f'{live_n}/{live_d} = {100.0 * live_n / live_d:.2f}%':>18}  "
               f"{f'{off_n}/{off_d} = {100.0 * off_n / off_d:.2f}%':>24}  {f'{delta:+.2f} pp':>9}  "
-              f"{'PASS' if ok else 'FAIL'}")
+              f"{'PASS' if ok else 'FAIL'}{note}")
     for d in sorted(unmeasured):
         # Named, not omitted: the depth was asked for and no chain in any ticket reached it, so it is
         # unmeasured -- and a table that simply lacks the row reads as a window that shrank to fit.
@@ -336,6 +354,12 @@ def table(seen, sources, unmeasured=(), budget=None, width=None, idents=None, ta
         tail = (f" ({len(unmeasured)} of {len(depths) + len(unmeasured)} depths unmeasured: "
                 f"{','.join(str(d) for d in sorted(unmeasured))})")
     print(f"\n{inside} of {scored} scored depths within {BAR:g} pp at the same positions{tail}")
+    if scored and substantial < scored:
+        # Separate line, never folded into the bar verdict: `inside of scored` answers "is the point estimate inside the
+        # bar", this answers "does the denominator carry a bar of this size" -- and at tau>0 the honest answer is no for
+        # the deeper depths.
+        print(f"{substantial} of {scored} scored depths have a denominator a {BAR:g} pp bar can survive "
+              f"(>= {THIN_CHAINS:g} live chains; below that one chain moves the rate by more than the bar)")
     return inside, scored, totals
 
 

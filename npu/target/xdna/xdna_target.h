@@ -128,6 +128,14 @@ public:
         bool t2s = false;           // 2-bit ternary stream
         bool t2s_v2 = false;
         bool host_gemm = false;     // offline: open no ELF at all
+        // The lm-head context needs the container's own naming, which is the forward's to compute and not
+        // the target's: the sidecar directory, whether the head's ternary image exists at all (the test is
+        // `head_pb16i_stem(0) + image_ext()` on the forward's side), and where decode twins are looked for.
+        std::string pb16i_dir;
+        bool head_pb16i_images = false;
+        std::vector<std::string> decode_dirs;
+        // The head geometry: hidden width, vocabulary, and the container's padded K.
+        int hidden = 0, vocab = 0, kpad = 0;
         const onebit::npu::plan::Plan* plan = nullptr;   // copied into plan_ by configure(); null = none
     };
     // Setup carries a pointer to the forward's Plan; this copies it, so from here on the target's own
@@ -148,6 +156,16 @@ public:
     // the message a user sees is the same one the forward produced before this moved (an empty string
     // means no plan, i.e. a purely derived set).
     bool open_prefill(const Q4nxDesignGeom* designs, int n, std::string& err);
+
+    // The lm-head context (engine#803 A2b, the last setup block): pb16i ternary images first, then the int8
+    // ladder, then the q4_1 gemv head -- the body moved verbatim out of Q4nxNpuForward::open_lm_head_context.
+    // It is a context and its refusals, which is what a target owns; the container's *naming* stayed in the
+    // forward and arrives through Setup, because deciding which sidecar file the head has is the container's
+    // rule and not a target's.
+    bool open_head(const Q4nxDesignGeom* designs, int n, std::string& err);
+    // Whether open_head() found and opened the pb16i ternary head.  The model path reads this flag in four
+    // places, so it stays the forward's; the target writes it.
+    bool head_is_pb16i() const { return head_pb16i_; }
 
     // Context construction: the caller configures and initialises the I8Ctx, then it stays here.
     I8Ctx* make_ctx(int role);
@@ -189,6 +207,7 @@ private:
     std::string pb16i_stem(int layer, const char* tag) const;
 
     xrt::device* dev_ = nullptr;
+    bool head_pb16i_ = false;   // written by open_head(), read back by the forward
     Setup setup_;   // see configure(): what the setup side reads, in one place
     int          n_layers_ = 0;
     std::string  kernels_dir_;

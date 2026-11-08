@@ -485,6 +485,143 @@ void XdnaTarget::prof_dump() {
     prof_head_ = ProfAcc{};
 }
 
+bool XdnaTarget::open_head(const Q4nxDesignGeom* designs, int n, std::string& err) {
+    // run_lm_head packs int8 B tiles from the f32 head and launches them itself, so it
+    // needs an int8 context with K=H.  Under pb16i every decode context is a pb16i one,
+    // so build it here: the widest K=H design, at M=16 if its int8 twin is on disk.
+    if (setup_.pb16i && !setup_.host_gemm) {
+        int i_head = -1;
+        for (int i = 0; i < n; i++) {
+            if (!ctx(i) || designs[i].K != setup_.hidden || designs_[i].N <= 0) continue;
+            if (i_head < 0 || designs[i].N > designs[i_head].N) i_head = i;
+        }
+        // The head's ternary images come first, when the converter produced them: output.weight
+        // is PTQ1_0 (type 143) in the folded GGUF, so the image is exact rather than a
+        // requantisation, it is 0.75 GB against the int8 head's 1.33 GB, and it runs the same
+        // K=H kernel the MLP's GU launch runs.  Missing images are not an error: the head then
+        // keeps the int8 family below.
+        if (i_head >= 0 && !setup_.pb16i_dir.empty() && setup_.head_pb16i_images) {
+            const Q4nxDesignGeom& g = designs[i_head];
+            std::string stem(g.elf_name);
+            stem.resize(stem.size() - 4);                     // drop ".elf"
+            const std::string ft = setup_.family;
+            const std::string cands[] = {stem + ft + "_m16.elf", stem + ft + ".elf"};
+            std::string pelf;
+            for (const std::string& c : cands) {
+                for (const std::string& d : setup_.decode_dirs) {
+                    if (elf_present(d + "/" + c)) { pelf = d + "/" + c; break; }
+                }
+                if (!pelf.empty()) break;
+            }
+            if (!pelf.empty()) {
+                I8Ctx* hc = make_head_ctx();
+                if (!hc) { err = "cannot create the lm-head context"; return false; }
+                hc->MD = Q4NX_DESIGN_M_DECODE;
+                hc->KD = g.K;
+                hc->ND = g.N;
+                hc->pb16i = true;
+                hc->t2s = setup_.t2s;
+                hc->pb16i_planes = 1;   // the K=H design is the arena's one-plane family
+                if (hc->init_elf(*dev_, pelf.c_str(), Q4NX_DESIGN_M_DECODE, g.K, g.N, 1)) {
+                    head_pb16i_ = true;
+                    fprintf(stderr, "  [forward] lm head M=%d K=%d N=%d  %s (pb16i ternary "
+                                    "images)\n", hc->MD, g.K, g.N, pelf.c_str());
+                } else {
+                    head_ctx_ref().reset();
+                }
+            }
+        }
+        if (!head_ctx() && i_head >= 0) {
+            const Q4nxDesignGeom& g = designs[i_head];
+            // The head streams 1.33 GB of int8 weights a token, so its layout matters more
+            // than its row count: a blocked (_b8) ELF walks 8 KiB forward per tile at
+            // 8.25 GB/s where the row-major one runs 128 separate 128-byte reads at
+            // 3.3 GB/s (measured: 27 ms a launch either way for M=16 and M=128).  Try the
+            // blocked M=16 twin first, then whatever int8 family is on disk.
+            std::string stem(g.elf_name);
+            stem.resize(stem.size() - 4);                     // drop ".elf"
+            const std::string cands[] = {stem + "_b8_m16.elf", stem + "_m16.elf",
+                                         stem + "_b8.elf", g.elf_name};
+            std::string elf;
+            bool blocked = setup_.b8;
+            for (const std::string& c : cands) {
+                for (const std::string& d : setup_.decode_dirs) {
+                    if (elf_present(d + "/" + c)) { elf = d + "/" + c; break; }
+                }
+                if (!elf.empty()) {
+                    blocked = c.find("_b8") != std::string::npos;
+                    break;
+                }
+            }
+            int m = elf.find("_m16.elf") != std::string::npos ? Q4NX_DESIGN_M_DECODE : g.M;
+            if (elf.empty()) { elf = setup_.kernels_dir + "/" + g.elf_name; m = g.M; }
+            I8Ctx* hc = make_head_ctx();
+            if (!hc) { err = "cannot create the lm-head context"; return false; }
+            hc->MD = m; hc->KD = g.K; hc->ND = g.N;
+            hc->blocked_b = blocked;
+            if (!hc->init_elf(*dev_, elf.c_str(), m, g.K, g.N, 1)) {
+                fprintf(stderr, "  [forward] lm head: cannot load %s; the head keeps the "
+                                "decode family\n", elf.c_str());
+                head_ctx_ref().reset();
+            } else {
+                fprintf(stderr, "  [forward] lm head M=%d K=%d N=%d  %s\n", m, g.K, g.N,
+                        elf.c_str());
+            }
+        }
+    }
+
+    // ---- the lm head on the q4_1 gemv family ----
+    // That family has no int8 packer: its weight BO holds the container's own q4_1 tile stream and the
+    // launch dequantises from those tiles, so the tiled int8 head above cannot express it -- packing an
+    // int8 image into a tile BO both overruns the BO by (KD*ND - tile bytes) and means nothing to the
+    // kernel.  The head is therefore ONE launch whose N is the vocabulary: the only width whose output
+    // is the whole logits row, which is what run_lm_head_gemv() gathers the container's head tiles for.
+    if (!setup_.host_gemm && !head_ctx()) {
+        bool any_gemv = false;
+        for (int i = 0; i < ndesigns_ && !any_gemv; i++)
+            any_gemv = (ctx(i) && ctx(i)->gemv) || (ctx16(i) && ctx16(i)->gemv);
+        if (any_gemv) {
+            // The head ELF's N is on the gemv column grid, so try the padded vocabulary first and the
+            // raw one after: the pack's vocab 151936 is 152064 on the grid.
+            std::string elf;
+            for (int nn : {q4nx_pad_n(setup_.vocab), setup_.vocab}) {
+                for (const char* suf : {"_m16.elf", ".elf"}) {
+                    const std::string n = "full_i8_LMHEAD_K" + std::to_string(setup_.kpad) + "_N" +
+                                          std::to_string(nn) + suf;
+                    for (const std::string& d : setup_.decode_dirs) {
+                        if (elf_present(d + "/" + n)) { elf = d + "/" + n; break; }
+                    }
+                    if (!elf.empty()) break;
+                }
+                if (!elf.empty()) break;
+            }
+            if (elf.empty()) {
+                err = "lm head: this container's kernels are the q4_1 gemv family, whose head is one "
+                       "launch at N=vocab, and no head ELF is on disk (want full_i8_LMHEAD_K" +
+                       std::to_string(setup_.kpad) + "_N" + std::to_string(q4nx_pad_n(setup_.vocab)) + "[_m16].elf)";
+                return false;
+            }
+            const int m = elf.find("_m16.elf") != std::string::npos ? Q4NX_DESIGN_M_DECODE
+                                                                   : Q4NX_DESIGN_M_PREFILL;
+            const int n = (elf.find("_N" + std::to_string(q4nx_pad_n(setup_.vocab))) != std::string::npos)
+                              ? q4nx_pad_n(setup_.vocab) : setup_.vocab;
+            I8Ctx* hc = make_head_ctx();
+            if (!hc) { err = "lm head: cannot create the gemv head context"; return false; }
+            hc->MD = m; hc->KD = setup_.kpad; hc->ND = n;
+            if (!hc->init_elf(*dev_, elf.c_str(), m, setup_.kpad, n, 1) || !hc->gemv) {
+                err = "lm head: " + elf + " does not load as the gemv head (K=" +
+                       std::to_string(setup_.kpad) + " N=" + std::to_string(n) + ")";
+                head_ctx_ref().reset();
+                return false;
+            }
+            fprintf(stderr, "  [forward] lm head M=%d K=%d N=%d  %s (q4_1 gemv tiles)\n", m, setup_.kpad, n,
+                    elf.c_str());
+        }
+    }
+
+    return true;
+}
+
 std::string XdnaTarget::pb16i_stem(int layer, const char* tag) const {
     return pb16i_dir_ + "/" + q4nx_pb16i::sidecar_stem(layer, tag);
 }

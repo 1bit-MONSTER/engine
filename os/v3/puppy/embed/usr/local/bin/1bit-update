@@ -281,7 +281,10 @@ if [ -s "$src/SHA256SUMS" ]; then
     sums=/tmp/1bit-update/sums
     : > "$sums"
     for f in $need; do
-        awk -v b="$f" '$2 == b || $2 == "*" b { print }' "$src/SHA256SUMS" >> "$sums"
+        # strip a leading "./": `sha256sum ./*.sfs` writes "./name", and a membership test on the bare name then
+        # matched only the two files that were listed without the prefix (measured: "2 file(s) of the set verified"
+        # for a set of six - the SFS were copied but not hash-checked)
+        awk -v b="$f" '{ n = $2; sub(/^\.\//, "", n); if (n == b) print }' "$src/SHA256SUMS" >> "$sums"
     done
     if [ -s "$sums" ]; then
         ( cd "$src" && sha256sum -c --quiet "$sums" ) >> "$LOG" 2>&1 \

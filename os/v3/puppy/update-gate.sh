@@ -373,6 +373,10 @@ if os.environ.get("MODE") == "image":
                 say("FAIL", "update", "the image-form update failed: %s" % (upi[-300:] or "<no output>")); ok = False
             elif "1bit/SHA256SUMS" not in upi:
                 say("FAIL", "update", "it did not verify against the image's own SHA256SUMS: %s" % upi[-400:]); ok = False
+            elif not re.search(r"hashes: ([5-9]|[1-9][0-9]) file\(s\) of the set verified", upi):
+                # the count matters: a filter that matches only some names verifies only those bytes (measured: 2 of 6)
+                say("FAIL", "update", "the image's hashes were not verified for the whole set: %s"
+                    % upi[upi.find("hashes:"):upi.find("hashes:") + 120]); ok = False
             else:
                 say("PASS", "update", "an .img updated the machine, verified against the image's own SHA256SUMS")
             if not v.reboot(downs=5):

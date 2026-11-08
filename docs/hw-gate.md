@@ -63,6 +63,11 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   while every PR-Agent review queued behind it. It takes no GPU token and no NPU lock. Fork PRs never run it. It costs
   no GitHub Actions minutes. The token is read-only, and the build tree persists in `~/.cache/hrx-build/bench` on the
   box, so a later run rebuilds only what changed.
+- **Memory.** The box is shared, and on Strix Halo GTT is host RAM. Before it compiles, the job waits for 24 GB of
+  `MemAvailable` (`scripts/mem-wait.sh`, polled once a minute for up to 15 minutes). If memory doesn't free up, the job
+  fails with the reading, and a re-run is the fix. The compile itself runs under `scripts/mem-guard.sh --term 12`,
+  which stops the whole `thermal-run` scope if `MemAvailable` falls below 12 GB. On 2026-11-08 both self-hosted
+  runners were OOM-killed, the second time 76 s after a restart handed this job a compile (engine#1504).
 - **What it is not.** It is a compile and link check of the public plumbing only. It does not build the private HIP
   add-on (the gate builds that) and does not dispatch anything. Green means the pinned pair builds into the engine. It
   does not replace the `hw-gate` label on a pin bump.

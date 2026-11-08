@@ -39,6 +39,11 @@
 # comments, blanks) configures with ONEBIT_HRX=ON and skips the compile: such a line creates no target and sets
 # no flag, but it is still evaluated at configure time, including inside if(ONEBIT_HRX) blocks ci.yml never
 # configures. tools/ci/hrx_build_scope.py decides; anything it does not recognise builds.
+# Memory (engine#1504): the box is shared and its GTT is host RAM, and on 2026-11-08 both runners were OOM-killed,
+# the second time 76 s after a restart that handed this job a compile. So the compile waits for MemAvailable to
+# reach a floor (scripts/mem-wait.sh, up to 15 min, then the job fails and says why), and it runs under
+# scripts/mem-guard.sh --term, which ends the whole thermal-run scope before the kernel's OOM killer picks
+# someone else's process.
 # Fork PRs never reach the box: the `if:` requires the head repository to be this one.
 name: hrx-build
 
@@ -111,13 +116,20 @@ jobs:
         if: steps.scope.outputs.build != 'true'
         run: echo "only test registration changed in CMakeLists.txt; the ONEBIT_HRX=ON configure above passed, the compile is skipped" | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: Wait for memory (or refuse)
+        if: steps.scope.outputs.build == 'true'
+        timeout-minutes: 20
+        # 24 GB free before a 4-core compile starts; it is stopped if the box drops under 12 GB (hw-gate's floor)
+        run: scripts/mem-wait.sh 24 15
+
       - name: Build llama_hrx and onebit
         if: steps.scope.outputs.build == 'true'
         env:
           CCACHE_BASEDIR: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          ~/lb/thermal-run.sh cmake --build "$HRX_BUILD" --target onebit -j 4
+          # the guard outside thermal-run: SIGTERM makes thermal-run end its whole scope (ninja and the compilers)
+          scripts/mem-guard.sh --term 12 ~/lb/thermal-run.sh cmake --build "$HRX_BUILD" --target onebit -j 4
           # the build must have produced the HRX backend and the server onebit runs
           ls -l "$HRX_BUILD"/hrx/llama/bin/llama-server
           find "$HRX_BUILD"/hrx/llama -name 'libggml-hrx.so*' -print -quit | grep .

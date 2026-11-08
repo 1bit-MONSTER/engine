@@ -31,6 +31,11 @@
 # The "next release" is built here, not shipped: the installed disk's own puppy SFS with ONE added file
 # (etc/1bit/set-alt), so "which set am I running" is a fact read off the running system rather than a date or a size.
 #
+# RESET=1 puts the disk back to the post-install state first (no /1bit-alt, no release directories, the installed
+# grub.cfg with default=0) so the gate can be re-run on an already-used target.img instead of re-installing:
+#
+#   RESET=1 update-gate.sh target.img work     # after a failed or a successful run
+#
 # Exit: 0 the update and the rollback both measured, 1 a check failed, 2 the harness could not run.
 set -uo pipefail
 prog=$(basename "$0")
@@ -74,6 +79,11 @@ if set(parts) != {"1", "2"}:
 mnt = os.path.join(work, "mnt")
 os.makedirs(mnt + "/data", exist_ok=True)
 loops = []
+def detach(i):
+    """stop tracking a loop device and free it now (the `finally` block detaches whatever is still in the list)"""
+    dev = loops.pop(i)
+    subprocess.run(["sudo", "-n", "losetup", "-d", dev], capture_output=True)
+
 def mount_part(n, where, rw=True):
     start, size = parts[n]
     dev = subprocess.run(["sudo", "-n", "losetup", "-f", "--show", "--offset", str(start * 512),
@@ -83,8 +93,42 @@ def mount_part(n, where, rw=True):
     loops.append(dev)
     sdo("mount", "-o", "rw" if rw else "ro", dev, where)
 
+def esp_path():
+    return mnt + "/esp"
+
 try:
-    # ---- build the "next release" ON the data partition, the way a release would arrive
+    # ---- RESET=1: back to the post-install state, so a re-run does not need a re-install
+    if os.environ.get("RESET") == "1":
+        os.makedirs(esp_path(), exist_ok=True)
+        mount_part("2", mnt + "/data")
+        for d in ("1bit-alt", "update-set-alt", "update-set-alt2"):
+            sdo("rm", "-rf", os.path.join(mnt + "/data", d))
+        subprocess.run(["sudo", "-n", "umount", mnt + "/data"], capture_output=True)
+        while loops:
+            detach(len(loops) - 1)
+        loops_before = 0
+        mount_part("1", esp_path())
+        cfg = os.path.join(esp_path(), "EFI/BOOT/grub.cfg")
+        text = open(cfg).read().splitlines()
+        cut = next((i for i, l in enumerate(text) if l.startswith("menuentry ") and "1bit-alt" in l), None)
+        if cut is not None:
+            text = text[:cut]
+            while text and not text[-1].strip():
+                text.pop()
+        text = [("set default=0" if l.startswith("set default=") else l) for l in text]
+        # the ESP is vfat owned by root: write the computed file as root, not as the invoking user
+        tmp = os.path.join(work, "grub.cfg.reset")
+        open(tmp, "w").write("\n".join(text) + "\n")
+        sdo("cp", "-f", tmp, cfg)
+        say("INFO", "reset", "removed /1bit-alt and the release dirs; grub.cfg back to %d entries, default=0"
+            % sum(1 for l in text if l.startswith("menuentry ")))
+        subprocess.run(["sudo", "-n", "umount", esp_path()], capture_output=True)
+        while len(loops) > loops_before:
+            detach(len(loops) - 1)
+
+    # ---- build TWO "next releases" ON the data partition, the way a release would arrive. Two, because the claim this
+    # gate has to prove is that a machine can keep updating: the first update moves it to the other slot, and the second
+    # one - from that other slot - updates the slot the layer lives in, which is where "exactly one update" used to die.
     mount_part("2", mnt + "/data")
     data = mnt + "/data"
     src = os.path.join(data, "1bit")
@@ -94,26 +138,34 @@ try:
     base = os.path.join(work, "base-" + sfs[0])
     if not os.path.exists(base):
         sdo("cp", os.path.join(src, sfs[0]), base)
-    marker = os.path.join(work, "set-alt-marker")
-    open(marker, "w").write("this file exists only in the updated appliance set\n")
-    patched = os.path.join(work, sfs[0])
-    if not os.path.exists(patched):
-        # the MANIFEST form, with the mode stated: the single-file form refuses an ADDITION (its one-difference check
-        # compares the raw `Only in <dir>: <name>` line against the target path, and the manifest branch is the one
-        # with `matches_target` for that shape - measured here, and reported to patch-sfs's owner rather than patched
-        # in passing). 0644 is also explicit, because a copied host file arrives group-writable.
-        man = os.path.join(work, "manifest")
-        open(man, "w").write("etc/1bit/set-alt\t%s\t0644\n" % marker)
-        sdo("bash", os.path.join(tree, "os/v3/puppy/patch-sfs.sh"),
-            "--manifest", man, base, patched)
-    up = os.path.join(data, "update-src")
-    sdo("mkdir", "-p", up)
-    for f in [f for f in sorted(os.listdir(src)) if f.endswith(".sfs") or f in ("vmlinuz", "initrd.gz")]:
-        sdo("cp", "-f", os.path.join(src, f), os.path.join(up, f))
-    sdo("cp", "-f", patched, os.path.join(up, sfs[0]))
-    sdo("bash", "-c", "cd '%s' && sha256sum * > SHA256SUMS" % up)
-    say("INFO", "update-src", "%s: %d files + SHA256SUMS, puppy SFS patched with etc/1bit/set-alt"
-        % (up, len(os.listdir(up)) - 1))
+    setfiles = [f for f in sorted(os.listdir(src)) if f.endswith(".sfs") or f in ("vmlinuz", "initrd.gz")]
+
+    def build_release(name, marker_text):
+        """a release directory on /data: the set's own files, the patched puppy SFS, and a real SHA256SUMS. The
+        marker file in the SFS is the only difference between the two releases."""
+        marker = os.path.join(work, name + ".marker")
+        open(marker, "w").write(marker_text)
+        patched = os.path.join(work, name + ".sfs")
+        if not os.path.exists(patched):
+            # the MANIFEST form, with the mode stated: the single-file form refuses an ADDITION (its one-difference
+            # check compares the raw `Only in <dir>: <name>` line against the target path, and the manifest branch is
+            # the one with `matches_target` for that shape - measured here, reported to patch-sfs's owner).
+            man = os.path.join(work, "manifest-" + name)
+            open(man, "w").write("etc/1bit/%s\t%s\t0644\n" % (name, marker))
+            sdo("bash", os.path.join(tree, "os/v3/puppy/patch-sfs.sh"), "--manifest", man, base, patched)
+        up = os.path.join(data, "update-" + name)
+        sdo("mkdir", "-p", up)
+        for f in setfiles:
+            # real copies, NOT hard links: a release directory whose files are the same inodes as the running slot's
+            # would make the update's `cp -f src dst` fail ("are the same file") - a hard link is not what a release is
+            sdo("cp", "-f", os.path.join(src, f), os.path.join(up, f))
+        sdo("cp", "-f", patched, os.path.join(up, sfs[0]))
+        sdo("bash", "-c", "cd '%s' && sha256sum * > SHA256SUMS" % up)
+        say("INFO", "release", "%s: %d files + SHA256SUMS, puppy SFS carrying etc/1bit/%s" % (up, len(setfiles) + 1, name))
+        return up
+
+    src1 = build_release("set-alt", "this file exists only in the first updated appliance set\n")
+    src2 = build_release("set-alt2", "this file exists only in the second updated appliance set\n")
 finally:
     subprocess.run(["sudo", "-n", "umount", mnt + "/data"], capture_output=True)
     for dev in loops:
@@ -154,16 +206,31 @@ class Vm:
         self.log = open(self.path + ".log", "ab", buffering=0)
         if self.until(b"Press enter to boot the selected OS", 240) is None:
             say("FAIL", tag, "no GRUB menu on the installed disk"); self.s = None; return
-        time.sleep(1.0)
-        self.s.sendall(b"\x1b[B" * downs + b"\r")
-        for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
-            if self.until(token, 240) is not None:
-                self.buf = b""
-                self.s.sendall(b"\n")
-                time.sleep(1)
-                return
-        say("FAIL", tag, "no root shell (is entry %d the serial one?)" % downs)
-        self.s = None
+        if not self.select(downs, 240):
+            say("FAIL", tag, "no root shell (is entry %d the serial one?)" % downs)
+            self.s = None      # INSIDE the failure branch: at function level it cleared a boot that had worked, and
+                               # every later row saw "no VM" and the gate failed silently after its prep rows (measured)
+
+    def select(self, downs, timeout):
+        """walk `downs` entries at the menu and press Enter. The arrows CANCEL GRUB's countdown, so an Enter lost while
+        the menu is still drawing leaves the machine sitting there for ever (measured: one boot of the second-update
+        run) - hence a pause and a second Enter, and one more try if nothing boots."""
+        for attempt in (1, 2):
+            self.s.sendall(b"\x1b[B" * downs)
+            time.sleep(0.5)
+            self.s.sendall(b"\r")
+            time.sleep(0.5)
+            self.s.sendall(b"\r")
+            for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
+                got = self.until(token, 60 if attempt == 1 else timeout)
+                if got is not None:
+                    self.buf = b""
+                    self.s.sendall(b"\n")
+                    time.sleep(1)
+                    return True
+            if attempt == 1:
+                say("INFO", self.tag, "nothing booted after the first Enter; pressing it again at the menu")
+        return False
 
     def until(self, token, timeout):
         end = time.time() + timeout
@@ -217,14 +284,7 @@ class Vm:
         if self.until(b"Press enter to boot the selected OS", 300) is None:
             return False
         time.sleep(1.0)
-        self.s.sendall(b"\x1b[B" * downs + b"\r")
-        for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
-            if self.until(token, 300) is not None:
-                self.buf = b""
-                self.s.sendall(b"\n")
-                time.sleep(1)
-                return True
-        return False
+        return self.select(downs, 300)
 
     def close(self):
         try: self.log.close()
@@ -236,8 +296,8 @@ class Vm:
         try: self.proc.wait(timeout=10)
         except Exception: pass
 
-# ---- boot 1: the installed machine updates itself
-v = Vm("update", downs=3)
+# ---- boot 1 (/1bit): the installed machine updates itself into the other slot
+v = Vm("b1-update", downs=3)
 try:
     if v.s is None:
         ok = False
@@ -247,66 +307,135 @@ try:
             say("FAIL", "pre-marker", "cannot write into the save layer (%s)" % (pre or "<nothing>")); ok = False
         st = v.val("STATUS", "1bit-update --status 2>&1 | tr '\\n' '; '")
         say("INFO", "status", st[:400])
-        up = v.val("UPDATE", "1bit-update /data/update-src 2>&1 | tr '\\n' '; '", timeout=2400)
-        say("INFO", "update", up[:1200])
+        up = v.val("UPDATE", "1bit-update /data/update-set-alt 2>&1 | tr '\\n' '; '", timeout=2400)
+        say("INFO", "update1", up[:1200])
         if "UPDATED" not in up:
-            # the last part is where a failure's cause is: the script logs and prints its own reason
-            say("FAIL", "update", "1bit-update did not report UPDATED: %s" % (up[-300:] or "<no output>")); ok = False
+            say("FAIL", "update1", "the first 1bit-update did not report UPDATED: %s" % (up[-300:] or "<no output>")); ok = False
         st2 = v.val("STATUS2", "1bit-update --status 2>&1 | tr '\\n' '; '")
         say("INFO", "status2", st2[:400])
         if "default index 4" not in st2:
-            say("FAIL", "status2", "after the update GRUB's default is not the updated slot's headless entry "
+            say("FAIL", "status2", "after the first update GRUB's default is not the updated slot's headless entry "
                                    "(want index 4): %s" % (st2[:160] or "<no answer>")); ok = False
         else:
             say("PASS", "status2", "GRUB default is index 4, the updated slot's headless entry")
+        # the release just installed is not needed any more, and the disk is 8 GB: free it for the second one
+        v.val("RM1", "rm -rf /data/update-set-alt; echo gone")
+
+        # ---- boot 2 (/1bit-alt): the FIRST update's set, on the same layer - and then the SECOND update, which is the
+        # one that used to be refused: from here the target slot holds the real save layer directory
         if not v.reboot(downs=5):
             say("FAIL", "boot-alt", "the machine did not come back on the updated slot"); ok = False
             v.close()
         else:
-            # ---- boot 2: it must be the OTHER set, on the SAME save layer
             sub = v.val("SUB", "tr ' ' '\\n' < /proc/cmdline | sed -n 's/^psubdir=//p'")
             pm = v.val("PM", "sed -n 's/^PUPMODE=//p' /etc/rc.d/PUPSTATE | head -1")
             mark = v.val("MARK", "cat /etc/1bit/set-alt 2>&1 | head -1")
             premark = v.val("PRE", "cat /root/pre-update-marker 2>&1 | head -1")
             rw = v.val("RW", "readlink /initrd/pup_rw")
             say("INFO", "boot-alt", "psubdir=%s PUPMODE=%s rw=%s" % (sub, pm, rw))
-            say("INFO", "boot-alt", "new set's marker: %s | previous marker: %s" % (mark[:60], premark))
+            say("INFO", "boot-alt", "first set's marker: %s | boot-1 marker: %s" % (mark[:60], premark))
             if sub != "1bit-alt":
                 say("FAIL", "boot-alt", "booted psubdir=%s, not 1bit-alt" % (sub or "<none>")); ok = False
             elif pm != "12":
                 say("FAIL", "boot-alt", "PUPMODE=%s: the shared save layer was not found through the slot" % (pm or "<unread>")); ok = False
-            elif "only in the updated appliance" not in mark:
-                say("FAIL", "boot-alt", "the new set's marker file is not there: this is not the updated set"); ok = False
+            elif "only in the first updated" not in mark:
+                say("FAIL", "boot-alt", "the first set's marker file is not there: this is not the updated set"); ok = False
             elif premark != "712-pre-update":
                 say("FAIL", "boot-alt", "the pre-update marker is gone: the save layer forked"); ok = False
             else:
-                say("PASS", "boot-alt", "psubdir=1bit-alt, PUPMODE=12, the new set's marker present, and the "
+                say("PASS", "boot-alt", "psubdir=1bit-alt, PUPMODE=12, the first set's marker present, and the "
                                         "machine's own state carried over from /1bit")
-            rb = v.val("ROLLBACK", "1bit-update --rollback 2>&1 | tr '\\n' '; '")
-            say("INFO", "rollback", rb[:300])
-            if "rolled back" not in rb:
-                say("FAIL", "rollback", "1bit-update --rollback did not report a rollback"); ok = False
+
+            up2 = v.val("UPDATE2", "1bit-update /data/update-set-alt2 2>&1 | tr '\\n' '; '", timeout=2400)
+            say("INFO", "update2", up2[:1200])
+            if "UPDATED" not in up2:
+                say("FAIL", "update2", "the SECOND 1bit-update was refused or failed: %s" % (up2[-300:] or "<no output>"))
+                ok = False
+            elif "left in place, no link needed" not in up2:
+                say("FAIL", "update2", "the second update did not recognise the target slot's layer as the machine's own: %s"
+                    % up2[-300:]); ok = False
+            else:
+                say("PASS", "update2", "the second update wrote /1bit around the machine's own layer "
+                                       "(left in place, no link made over it)")
+            st3 = v.val("STATUS3", "1bit-update --status 2>&1 | tr '\\n' '; '")
+            say("INFO", "status3", st3[:400])
+            if "default index 0" not in st3:
+                say("FAIL", "status3", "after the second update GRUB's default is not the other slot (want index 0): %s"
+                    % (st3[:160] or "<no answer>")); ok = False
+            else:
+                say("PASS", "status3", "GRUB default is index 0, the headless entry of the other slot")
+            v.val("RM2", "rm -rf /data/update-set-alt2; echo gone")
+
+            # ---- boot 3 (/1bit again): the SECOND update's set, the boot-1 marker still there, and no link nested
+            # inside the layer (the failure mode the fix exists for)
             if not v.reboot(downs=3):
-                say("FAIL", "boot-old", "the machine did not come back on /1bit after the rollback"); ok = False
+                say("FAIL", "boot-2nd", "the machine did not come back on /1bit after the second update"); ok = False
                 v.close()
             else:
-                # ---- boot 3: the previous appliance, intact, with the state the update carried
                 sub3 = v.val("SUB", "tr ' ' '\\n' < /proc/cmdline | sed -n 's/^psubdir=//p'")
                 pm3 = v.val("PM", "sed -n 's/^PUPMODE=//p' /etc/rc.d/PUPSTATE | head -1")
-                mark3 = v.val("MARK", "ls /etc/1bit/set-alt 2>&1 | head -1")
+                m2 = v.val("MARK2", "cat /etc/1bit/set-alt2 2>&1 | head -1")
+                m1 = v.val("MARK1", "cat /etc/1bit/set-alt 2>&1 | head -1")
                 pre3 = v.val("PRE", "cat /root/pre-update-marker 2>&1 | head -1")
-                say("INFO", "boot-old", "psubdir=%s PUPMODE=%s | set-alt: %s | marker: %s"
-                    % (sub3, pm3, mark3[:40], pre3[:40]))
+                # /data/1bit, NOT /1bit: the frugal set lives on the data partition, which the running system sees at
+                # /data (and at /initrd/mnt/dev_save); `/1bit` is grub's spelling of it, not a path in this filesystem
+                # (measured: the first version of these two rows asked for /1bit and "passed" only because the negative
+                # it looks for is also what a missing directory prints)
+                nested = v.val("NESTED", "ls -d /data/1bit/upup64rsave/upup64rsave 2>&1 | head -1")
+                lay = v.val("LAY", "sh -c 'test -d /data/1bit/upup64rsave && test ! -L /data/1bit/upup64rsave && echo real-dir || echo not-a-real-dir'")
+                link = v.val("LINK", "sh -c '[ -L /data/1bit-alt/upup64rsave ] && [ -d /data/1bit-alt/upup64rsave/upper ] && echo link-ok || echo link-broken'")
+                say("INFO", "boot-2nd", "psubdir=%s PUPMODE=%s | set-alt2: %s | set-alt: %s | layer: %s"
+                    % (sub3, pm3, m2[:40], m1[:40], lay))
+                say("INFO", "boot-2nd", "boot-1 marker: %s | nested link: %s | the other slot's link: %s"
+                    % (pre3[:40], nested[:60], link))
                 if sub3 != "1bit" or pm3 != "12":
-                    say("FAIL", "boot-old", "after the rollback the machine is psubdir=%s PUPMODE=%s"
+                    say("FAIL", "boot-2nd", "after the second update the machine is psubdir=%s PUPMODE=%s"
                         % (sub3 or "<none>", pm3 or "<unread>")); ok = False
-                elif "No such file" not in mark3 and "cannot access" not in mark3:
-                    say("FAIL", "boot-old", "the updated set's marker is visible while running /1bit"); ok = False
+                elif "only in the second updated" not in m2:
+                    say("FAIL", "boot-2nd", "the second set's marker is not there: /1bit does not hold the new set"); ok = False
+                elif "No such file" not in m1 and "cannot access" not in m1:
+                    say("FAIL", "boot-2nd", "/1bit still carries the first set's marker: the set was not replaced"); ok = False
                 elif pre3 != "712-pre-update":
-                    say("FAIL", "boot-old", "the marker written before the update is gone after the rollback"); ok = False
+                    say("FAIL", "boot-2nd", "the boot-1 marker is gone after the second update"); ok = False
+                elif lay != "real-dir":
+                    say("FAIL", "boot-2nd", "the save layer in /1bit is not a real directory after the second update"); ok = False
+                elif "upup64rsave/upup64rsave" in nested and "No such file" not in nested:
+                    say("FAIL", "boot-2nd", "a link was made INSIDE the layer (upup64rsave/upup64rsave): %s" % nested); ok = False
+                elif link != "link-ok":
+                    say("FAIL", "boot-2nd", "the other slot's save-layer link does not resolve after the second update: %s" % link); ok = False
                 else:
-                    say("PASS", "boot-old", "rolled back to /1bit with PUPMODE=12, the previous appliance intact "
-                                            "and the machine's state unchanged")
+                    say("PASS", "boot-2nd", "second update booted: psubdir=1bit, PUPMODE=12, the new set in place, the "
+                                            "boot-1 marker intact, the layer a real directory with no nested link")
+
+                rb = v.val("ROLLBACK", "1bit-update --rollback 2>&1 | tr '\\n' '; '")
+                say("INFO", "rollback", rb[:300])
+                if "rolled back" not in rb:
+                    say("FAIL", "rollback", "1bit-update --rollback did not report a rollback"); ok = False
+
+                # ---- boot 4 (/1bit-alt): the FIRST update's set is still the rollback, untouched by the second update
+                if not v.reboot(downs=5):
+                    say("FAIL", "boot-old", "the machine did not come back on the other slot after the rollback"); ok = False
+                    v.close()
+                else:
+                    sub4 = v.val("SUB", "tr ' ' '\\n' < /proc/cmdline | sed -n 's/^psubdir=//p'")
+                    pm4 = v.val("PM", "sed -n 's/^PUPMODE=//p' /etc/rc.d/PUPSTATE | head -1")
+                    m1b = v.val("MARK1", "cat /etc/1bit/set-alt 2>&1 | head -1")
+                    m2b = v.val("MARK2", "cat /etc/1bit/set-alt2 2>&1 | head -1")
+                    pre4 = v.val("PRE", "cat /root/pre-update-marker 2>&1 | head -1")
+                    say("INFO", "boot-old", "psubdir=%s PUPMODE=%s | set-alt: %s | set-alt2: %s | marker: %s"
+                        % (sub4, pm4, m1b[:40], m2b[:40], pre4[:40]))
+                    if sub4 != "1bit-alt" or pm4 != "12":
+                        say("FAIL", "boot-old", "after the rollback the machine is psubdir=%s PUPMODE=%s"
+                            % (sub4 or "<none>", pm4 or "<unread>")); ok = False
+                    elif "only in the first updated" not in m1b:
+                        say("FAIL", "boot-old", "the rollback slot does not hold the first updated set"); ok = False
+                    elif "No such file" not in m2b and "cannot access" not in m2b:
+                        say("FAIL", "boot-old", "the second set's marker is visible in the rollback slot"); ok = False
+                    elif pre4 != "712-pre-update":
+                        say("FAIL", "boot-old", "the boot-1 marker is gone after the rollback"); ok = False
+                    else:
+                        say("PASS", "boot-old", "rolled back to the first updated set on psubdir=1bit-alt, PUPMODE=12, "
+                                                "the machine's state unchanged - both sets still on the disk")
 finally:
     v.close()
 

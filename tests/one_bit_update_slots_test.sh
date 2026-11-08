@@ -87,7 +87,19 @@ why=$(prepare_target_layer "$DATA" 1bit-alt); check "a stale link in the target 
 link_target_layer "$DATA" 1bit-alt
 [ "$(readlink "$DATA/1bit-alt/upup64rsave")" = ../1bit/upup64rsave ]; check "and the new link points at the shared layer" $?
 
-# 6. no layer at all leaves savename empty, which the install path refuses (pre-#1291 image)
+# 6. a layer with THIS machine's NAME but a DIFFERENT directory is another machine's state, and must be refused.
+# `-ef` compares device+inode, so "same name" cannot pass for "same layer" - the case a name-only comparison would
+# silently accept (pi-os3's correction on this decision, 2026-11-07).
+fresh; mkdir -p "$DATA/1bit-alt/upup64rsave/upper/root"; echo other > "$DATA/1bit-alt/upup64rsave/upper/root/marker"
+active=1bit
+find_save_layer "$DATA" "$active"
+[ "$save_slot" = 1bit ] && [ "$savename" = upup64rsave ]; check "a same-named layer in the other slot is not taken for ours" $?
+why=$(prepare_target_layer "$DATA" 1bit-alt); rc=$?
+[ $rc -ne 0 ] && case $why in *"two layers cannot be merged"*) true ;; *) false ;; esac
+check "a same-named FOREIGN directory in the target is refused (name is not identity) [$why]" $?
+[ "$(cat "$DATA/1bit-alt/upup64rsave/upper/root/marker")" = other ]; check "and its contents were not touched" $?
+
+# 7. no layer at all leaves savename empty, which the install path refuses (pre-#1291 image)
 rm -rf "$DATA"; mkdir -p "$DATA/1bit"
 active=1bit
 find_save_layer "$DATA" "$active"

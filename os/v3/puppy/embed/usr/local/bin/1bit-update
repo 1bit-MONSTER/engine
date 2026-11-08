@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 # 1bit-update <release-dir> | <image.img>   install the next appliance into the OTHER slot and boot it next
+# 1bit-update --no-verify <release>         the same, for a release that carries no SHA256SUMS
 # 1bit-update --rollback                    boot the other slot next (both sets stay on the disk)
 # 1bit-update --status                      which slot is active, what each slot holds, which one GRUB boots
 #
@@ -90,7 +91,11 @@ prepare_target_layer() {
     for s in "$1/$2"/*save*; do
         [ -e "$s" ] || [ -L "$s" ] || continue
         if [ -d "$s" ] && [ ! -L "$s" ]; then
-            [ "$2" = "$save_slot" ] && [ "$(basename "$s")" = "$savename" ] && continue
+            # THE SAME FILE, not the same name: a hand-copied or restored <prefix>save in the target carries this
+            # machine's name and is a different directory, and refusing exactly that is what this guard is for. `-ef`
+            # compares device+inode, so the second update's own layer (the directory the running slot reaches) passes
+            # and a same-named stranger does not (pi-os3's correction on this decision).
+            [ "$s" -ef "$1/$save_slot/$savename" ] && continue
             echo "/$2 already holds a save layer ($(basename "$s")): two layers cannot be merged by an update - pick the slot by hand if that is really what you want"
             return 1
         fi
@@ -110,13 +115,18 @@ if [ "${ONEBIT_UPDATE_LIB:-}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
 
 src=''
 mode=install
-case "${1:---help}" in
-    -h|--help) usage; exit 0 ;;
-    --status) mode=status ;;
-    --rollback) mode=rollback ;;
-    /*) src=$1 ;;
-    *) usage >&2; exit 1 ;;
-esac
+novfy=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        --status) mode=status ;;
+        --rollback) mode=rollback ;;
+        --no-verify) novfy=1 ;;
+        /*) src=$1 ;;
+        *) usage >&2; exit 1 ;;
+    esac
+    shift
+done
 [ -n "$src" ] || [ "$mode" != install ] || { usage >&2; exit 1; }
 mkdir -p /tmp/1bit-update 2> /dev/null
 : >> "$LOG" 2> /dev/null || LOG=/dev/null
@@ -265,10 +275,10 @@ if [ -s "$src/SHA256SUMS" ]; then
             || die "SHA256SUMS does not verify for the set's own files - the release is damaged"
         say "hashes: $(grep -c . "$sums") file(s) of the set verified against $src/SHA256SUMS"
     else
-        say "hashes: $src/SHA256SUMS has no line for any file of this set; sizes are checked, the bytes are not"
+        [ -n "$novfy" ] || die "$src/SHA256SUMS has no line for any file of this set: nothing proves the bytes are the release's own (this path replaces the appliance the machine boots; use --no-verify only if you trust the copy)"
     fi
 else
-    say "hashes: $src has no SHA256SUMS; sizes are checked, the bytes are not"
+    [ -n "$novfy" ] || die "$src carries no SHA256SUMS: nothing proves the bytes are the release's own. This path replaces the appliance the machine boots, so pass --no-verify only if you trust the copy (a stick's /data carries SHA256SUMS at its root)"
 fi
 
 # space: the new set, with room for the checksums and the GRUB rewrite
@@ -279,6 +289,9 @@ freek=$(df -Pk "$DATA" | awk 'NR == 2 { print $4 }')
 # a slot that already owns a save layer is another machine's state, not something to overwrite - unless it is the
 # slot holding THIS machine's shared layer, which is every second update (engine#1334 review)
 why=$(prepare_target_layer "$DATA" "$target") || die "$why"
+# the operator-facing half of the same decision: when the target is the slot holding the layer, say so (the function
+# itself stays silent on success, so its stdout remains "the reason" for the tests that call it)
+[ "$target" = "$save_slot" ] && say "   /$target holds this machine's save layer ($savename): left in place, no link needed"
 
 # ── write the other slot ─────────────────────────────────────────────────────────────────────────────────────
 say "== install $src into /$target (the running set is /$active and is not touched)"
@@ -297,6 +310,9 @@ say "   $(ls "$DATA/$target"/*.sfs | wc -l) SFS, kernel and initrd in /$target; 
 # ── GRUB: the other slot needs its entries, and they become the default ─────────────────────────────────────
 mount_esp || fail "cannot mount the ESP $esp"
 [ -f "$cfg" ] || { unmount_esp; fail "no EFI/BOOT/grub.cfg on $esp"; }
+# the ESP is the one place a half-write is not recoverable without a rescue stick, so it gets its own check
+espfree=$(df -Pk "$esp_mount" | awk 'NR == 2 { print $4 }')
+[ "${espfree:-0}" -gt 1024 ] || { unmount_esp; die "only ${espfree:-0} KiB free on the ESP $esp: refusing to rewrite grub.cfg there"; }
 cp -p "$cfg" "$cfg.pre-1bit-update" 2> /dev/null || { unmount_esp; fail "cannot back up $cfg"; }
 tmpl=$(awk -v slot="$active" '$1 == "linux" && $0 ~ ("psubdir=" slot "([[:space:]]|$)") && $0 !~ /1bit\.serial=1/ {
                                   sub(/^[[:space:]]*linux[[:space:]]+[^[:space:]]+[[:space:]]+/, ""); print; exit }' "$cfg")

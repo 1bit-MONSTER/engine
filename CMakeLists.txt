@@ -246,6 +246,9 @@ add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-chec
 # the handoff driver must not orphan its server on SIGKILL (PR_SET_PDEATHSIG); no GPU, no model
 add_test(NAME kvshare_orphan COMMAND ${CMAKE_SOURCE_DIR}/tests/kvshare_orphan_test.sh)
 add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
+# engine#1564: which files the copyright gate looks at -- a staged file is seen, an untracked one is seen (that is why
+# running it before `git add` is useful), an ignored one is not. A throwaway repo in a temp dir: no build, no device.
+add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_test.sh)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The

@@ -62,8 +62,8 @@ need PKG_VERSION "the release version"
 [ -n "$(ls -A "$root")" ] || { echo "pack-distro.sh: the payload tree at $root is empty" >&2; exit 2; }
 
 # the version and how a tag becomes one lives in one place, shared with the proof that looks the
-# packages up by name (scripts/pack-version.sh)
-ver=$(pack_version "$PKG_VERSION") || exit 2
+# packages up by name (scripts/pack-version.sh); it is per family, because a candidate's version has to
+# sort below its release and only pacman needs a different spelling to do that
 rel=${PKG_RELEASE:-1}
 
 # The distribution's own filesystem skeleton: its filesystem package owns these paths, so no package
@@ -104,6 +104,7 @@ deb)
     need PKG_DESC "the description"
     need PKG_MAINTAINER "the maintainer, \"Name <mail>\""
     [ ! -e "$root/DEBIAN" ] || { echo "pack-distro.sh: $root already has a DEBIAN directory" >&2; exit 2; }
+    ver=$(pack_version "$PKG_VERSION" deb) || exit 2
     # a real copy, not hardlinks: the modes are normalised inside it, and the caller's tree is left as
     # it was
     cp -a "$root" "$work/root"
@@ -129,6 +130,7 @@ deb)
     ;;
 tarball)
     # the name keeps the name the guide has always used for this route
+    ver=$(pack_version "$PKG_VERSION" tarball) || exit 2
     f="$out/${PKG_NAME:-1bit}-${ver}-linux-x86_64.tar.zst"
     cp -a "$root" "$work/root"
     normalize_modes "$work/root"
@@ -149,6 +151,7 @@ rpm)
     need PKG_NAME "the package name"
     spec=${PKG_RPM_SPEC:-$repo/packaging/rpm/$PKG_NAME.spec}
     [ -f "$spec" ] || { echo "pack-distro.sh: no spec at $spec" >&2; exit 2; }
+    ver=$(pack_version "$PKG_VERSION" rpm) || exit 2
     p="$PKG_NAME-$ver"
     mkdir -p "$work/$p"
     cp -a "$root/." "$work/$p/"
@@ -188,6 +191,7 @@ SH
 arch)
     pkgbuild=${PKG_ARCH_PKGBUILD:-$repo/packaging/arch/PKGBUILD}
     [ -f "$pkgbuild" ] || { echo "pack-distro.sh: no PKGBUILD at $pkgbuild" >&2; exit 2; }
+    ver=$(pack_version "$PKG_VERSION" arch) || exit 2
     mkdir -p "$work/payload"
     cp -a "$root/." "$work/payload/"
     normalize_modes "$work/payload"

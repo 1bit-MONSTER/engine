@@ -48,11 +48,16 @@ set -uo pipefail
 dir=$(cd "$1" && pwd) || exit 2
 # shellcheck source=scripts/pack-version.sh
 . "$(dirname "$0")/pack-version.sh"
-ver=$(pack_version "$2") || exit 2
-deb=1bit-engine_${ver}_amd64.deb
-rpm=1bit-engine-${ver}-1.x86_64.rpm
-arch_pkg=1bit-engine-${ver}-1-x86_64.pkg.tar.zst
-tarball=1bit-engine-${ver}-linux-x86_64.tar.zst
+# one version per family: a candidate's has to sort below its release, and pacman spells that
+# differently from deb and rpm (scripts/pack-version.sh)
+v_deb=$(pack_version "$2" deb) || exit 2
+v_rpm=$(pack_version "$2" rpm) || exit 2
+v_arch=$(pack_version "$2" arch) || exit 2
+v_tar=$(pack_version "$2" tarball) || exit 2
+deb=1bit-engine_${v_deb}_amd64.deb
+rpm=1bit-engine-${v_rpm}-1.x86_64.rpm
+arch_pkg=1bit-engine-${v_arch}-1-x86_64.pkg.tar.zst
+tarball=1bit-engine-${v_tar}-linux-x86_64.tar.zst
 for f in "$deb" "$rpm" "$arch_pkg" "$tarball"; do
     [ -f "$dir/$f" ] || { echo "pack-proof: no $f in $dir (the release builds all four: scripts/mk-plugin-package.sh)" >&2; exit 2; }
 done
@@ -139,8 +144,10 @@ run_row "the four packages are one payload" ubuntu:26.04 "
 apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq rpm2cpio cpio zstd >/dev/null 2>&1 ||
     { echo 'installing rpm2cpio/cpio/zstd failed'; exit 1; }
 w=\$(mktemp -d); cd \"\$w\"; mkdir deb rpm arch tar
-dpkg-deb -x /pkg/$deb deb || { echo 'dpkg-deb -x failed'; exit 1; }
-rpm2cpio /pkg/$rpm | (cd rpm && cpio -idm --quiet) || { echo 'cpio failed'; exit 1; }
+dpkg-deb -x /pkg/$deb deb || { echo \"dpkg-deb -x failed on $deb\"; exit 1; }
+# one step per command, so a failure names the step that failed rather than the pair
+rpm2cpio /pkg/$rpm > payload.cpio || { echo \"rpm2cpio failed on $rpm (is the rpm package installed?)\"; exit 1; }
+(cd rpm && cpio -idm --quiet < ../payload.cpio) || { echo \"cpio failed on $rpm\"; exit 1; }
 tar --numeric-owner -C arch -xf <(zstd -dc /pkg/$arch_pkg) --exclude=.PKGINFO --exclude=.MTREE --exclude=.BUILDINFO ||
     { echo 'pacman package extraction failed'; exit 1; }
 tar --numeric-owner -C tar -xf <(zstd -dc /pkg/$tarball) || { echo 'tarball extraction failed'; exit 1; }

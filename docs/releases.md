@@ -489,7 +489,11 @@ WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-private scripts/weekly.sh ~/.cache/1bit-we
    the guide says; and compares the four as root so a package carrying a different payload fails the
    release instead of a user. A failing row stops the release. `scripts/package-linux.sh` packs the
    engine first; its tarball goes into the Lemonade + onebit package as `1bit/`, not into the release
-   on its own.
+   on its own. A candidate cut's tag is not a version, so it is mapped to one by
+   `scripts/pack-version.sh`: `rc-2026-11-07-c32` becomes `2026.45~c32` in the `.deb`, `.rpm` and
+   tarball names and `2026.45c32` in the Arch one, which is the week of the release it is a candidate
+   for and sorts after the previous release and before that one, so installing a candidate is an
+   upgrade (the property `tests/pack_version_test.sh` pins).
 4. **release**: `tools/weekly_changes.py` lists, for every pin that moved since the last release,
    the upstream commits (authors, PRs) and releases in between; that becomes the release notes and
    `changes.json`, and `gh release create` publishes it all.

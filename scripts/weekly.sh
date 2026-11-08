@@ -556,10 +556,26 @@ stage_package() {
     LIBHSA=$(ls -d "$HRX_TOOLCHAIN"/lib/python3*/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 2>/dev/null | head -1) \
         "$SRC/scripts/mk-plugin-package.sh" "$W/lemonade/1bit" "$OUT" "$tag" > "$LOGS/distro-packages.log" 2>&1 ||
         { cat "$LOGS/distro-packages.log"; return 1; }
+    say "package $tag: proof, one clean container per family"
+    # Nothing is published that nobody installed: every family is installed in a throwaway container of
+    # its distribution, the engine is asked for its version and the shim is run, the removal is checked,
+    # the tarball is unpacked as root the way the guide says, and the four are compared as root so a
+    # package that carries a different payload fails here rather than on a user's machine
+    # (scripts/pack-proof.sh). docker is already required to build the .rpm and the Arch package.
+    "$SRC/scripts/pack-proof.sh" "$OUT" "$tag" > "$LOGS/pack-proof.log" 2>&1 ||
+        { cat "$LOGS/pack-proof.log"; return 1; }
     install -m 755 "$SRC/scripts/lemond-onebit.sh" "$W/lemonade/lemond-onebit"
     # links out of the tree (the web app's KaTeX fonts -> the build machine's fonts-katex) become
     # copies of their targets; the links inside it stay links
     pack_localize_links "$W/lemonade/bin"
+    # engine#1352, the second packing site: package-linux.sh normalises the ENGINE tarball (#1361), but this payload is packed
+    # here and carries its own modes - measured in the shipped c32 image, opt/1bit-package/bin/lemond was 0775 and bin/ itself
+    # a 0775 directory, straight from the build's umask. Same rule and the same helpers as the engine tarball, so the two
+    # tarballs cannot drift: pack_normalise_modes fixes, pack_writable_files reports, and the fold refuses rather than shipping.
+    # It runs after pack_localize_links because that is the last step that writes into the staging tree.
+    pack_normalise_modes "$W/lemonade"
+    fold_bad=$(pack_writable_files "$W/lemonade")
+    [ -z "$fold_bad" ] || { printf 'REFUSED: group/other-writable path(s) in the lemonade staging:\n%s\n' "$fold_bad" >&2; return 1; }
     # the S flag: member names only; GNU tar otherwise rewrites symlink targets too, and every
     # libggml*.so.0 -> libggml*.so.0.18.0 link in 1bit/hrx/llama/bin pointed into a directory that is not there
     tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/,S" -cf - bin 1bit lemond-onebit | zstd -q -T4 -19 \

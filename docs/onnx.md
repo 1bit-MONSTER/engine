@@ -582,6 +582,40 @@ refused and correct anyway, and ~6-7 MB less peak RSS for the run, which is exac
 tensors it no longer allocates. The control, `ONEBIT_EP_QDQ=0`, runs the same graph through the
 per-node path and asserts that the float kernel — not the fused one — is what ran.
 
+### Integer-op exports (`ConvInteger`, `MatMulInteger`)
+
+"Quantised ONNX" comes in two flavours, and only one of them is the QDQ graph above:
+
+| flavour | ops | example | here |
+|---|---|---|---|
+| float weights + in-graph **Q/DQ** | `QuantizeLinear` / `DequantizeLinear` around float ops | Quark A8W8, AMD's `*_amdgpu` exports | runs; the EP claims the groups above |
+| ONNX's own **integer ops** | `ConvInteger`, `MatMulInteger`, `DynamicQuantizeLinear` | Hugging Face Optimum / `Xenova` `model_int8.onnx` | loads only where the pin has the kernel |
+
+The pinned runtime (1.23.2, CPU EP) has these kernels, measured by one-node graphs through `ort-run`
+(activation x weight):
+
+| op | uint8 x uint8 | uint8 x int8 | int8 x uint8 | int8 x int8 |
+|---|---|---|---|---|
+| `ConvInteger` | runs | **no kernel** | no kernel | no kernel |
+| `MatMulInteger` | runs | runs | **no kernel** | runs |
+
+`DynamicQuantizeLinear` always produces uint8, and these exporters write int8 weights, so a
+`ConvInteger` export cannot create a session. `Xenova/yolov8n-pose`'s `onnx/model_int8.onnx` (73
+`ConvInteger`, all int8 weights) is one; its `onnx/model.onnx` (fp32, 73 `Conv`) runs in 66 ms on the
+CPU. This is the runtime's op coverage, not the model's or an EP's, and our EP would not claim a
+convolution anyway (its seam is `MatMul`). `ort-run` says so when a session fails for a missing kernel,
+and lists the other exports in the same directory, without checking them:
+
+```
+onebit-ort-run: FAIL create session: Could not find an implementation for ConvInteger(10) node with name '/model.0/conv/Conv_quant'
+onebit-ort-run: the pinned ONNX Runtime has no CPU kernel for ConvInteger at this graph's input types: a runtime coverage gap, not a model or EP failure
+onebit-ort-run:   ConvInteger runs only uint8 x uint8; DynamicQuantizeLinear feeds uint8, so an int8-weight export cannot load
+onebit-ort-run:   other exports in .../onnx: model.onnx (not checked; a float or QDQ one uses no integer ops)
+```
+
+`ctest -R ort_run_generic` checks both sides: the uint8 x int8 graph is refused with those lines, and
+the uint8 x uint8 graph runs and equals a numpy convolution.
+
 ## Verifying
 
 ```bash

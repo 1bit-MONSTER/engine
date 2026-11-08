@@ -887,29 +887,19 @@ another box means linking that box's set the same way. Leaving `--kernels` out i
 (the container has no `npu/`, and `1bit forward-serve -m <model.q4nx> --kernels <dir>` still takes the set
 on the command line).
 
-### Rebuilding the prefill GEMM at another T, and gating it
+### Prefill beyond T=256
 
-`tools/npu_prefill_tgate.sh` builds the prefill GEMM kernel at one or more T values and runs the design's own
-numeric gate on each build (`make_test.py`'s fp64 reference from the same q4_1 pool bytes → `run_kernel` →
-`compare.py`'s per-token cosine). It exists because the three things it needs were each rediscovered by hand:
-the toolchain that actually builds our designs, the fixture generator, and the device gate.
+The prefill GEMM's kernel builds at T values above the 256 rows the shipped sets use, and each build passes the
+kernel tree's own numeric gate (fp64 reference from the same quantised pool bytes, per-token cosine ≥ 0.99999) —
+so `T > 256` is a capability, not a hazard. What it does **not** buy is throughput: per-row time is flat in T,
+because the weight stream is re-read once per T-tile, and the kernel's own tiling is what bounds a run at this
+size. The gate tool, the toolchain pins it needs, and the per-T rows live in the private kernel repository
+(`1bit-MONSTER/npu-kernels`, `tools/npu_prefill_tgate.sh`, `docs/npu-prefill-tgate.md`), as does the design.
 
-    npu-hold -l <label> -t 10 -- T_LIST="256 512 1024" tools/npu_prefill_tgate.sh
+For this engine, the consequence is the one recorded in [engine#1421](https://github.com/1bit-MONSTER/engine/issues/1421):
+a faster NPU prefill is an inner-loop and layout question in the kernels, not a parameter this page can set.
 
-The **toolchain pin is load-bearing** and is printed by every run: `aiecc` **20a9c2fb2dc** with Peano
-**22.0.0 (llvm-aie 773413fb18d0)**, both inside `~/amd-oss/iron-venv` (the Peano install is in that venv's
-`site-packages/llvm-aie`, which is why a plain `find` for `clang++` does not turn it up). The other venv on
-this box, `~/amd-oss/iron-upstream-venv` (aiecc `d53582d3e0f`), does **not** build these designs — it rejects
-`--alloc-scheme=basic-sequential` — so a build that fails with that message is a wrong venv, not a wrong design.
-
-What the gate showed on 2026-11-08 for shape `qkv` (N=2560, K=2560), three runs per build: T=256 **2.415 ms**,
-T=512 **4.766 ms**, T=1024 **9.832 ms**, all three numerically PASS (per-token cosine min 0.9999947-0.9999949).
-Per-run time scales **linearly with T**, which is the design's documented weight refetch: the weight column is
-re-streamed once per T-tile, so a bigger T buys no weight reuse. That is also why the flat per-tile time in
-`docs/hetero-prefill.md` is not evidence of a kernel that keeps weights resident — it is evidence of the
-opposite, and a reuse restructure is the measured follow-up (engine#1421).
-
-### The `.fconst` attention payload
+### The `.fconst` attention payload### The `.fconst` attention payload
 
 A layer block's attention payload sits between its two epsilon headers and is a whole number of
 **64-row tiles**: one tile is `2*(K/128) + 2` subvolumes of 2,176 B, a pair per (column half, K

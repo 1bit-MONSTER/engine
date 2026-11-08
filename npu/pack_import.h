@@ -183,6 +183,10 @@ struct Report {
     // An untied pack has no such reference and the numbers are left at 0 with
     // selfcheck_reference false -- a wrong number would be worse than none.
     bool selfcheck_reference = false;
+    // Whether that reference is a real one: a tied pack's head must reproduce its embedding, so the correlation is a
+    // check; an untied pack's head and embedding are separate matrices by construction, and the same number is
+    // meaningless -- reported as such rather than left looking like a failed import.
+    bool selfcheck_tied = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
 
     // Self-check 2: the written container, read back, against the pack's dequantised values. With

@@ -2094,6 +2094,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             std::fprintf(stderr, "[pack-dbg] matmul %s N=%d K=%d block=%d | V=%d H=%d -> head=%d\n",
                          mm.weight.c_str(), q.N, q.K, mm.block, int(V), int(H), (int)head_geometry);
         if (tied || head_geometry) r.selfcheck_reference = true;
+        if (tied || head_geometry) r.selfcheck_tied = tied;
         if (tied || head_geometry) {
             double sum_abs = 0, sum_ref = 0;
             for (int n = 0; n < q.N; ++n)
@@ -2235,6 +2236,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             r.lmhead_rel = sum_abs / sum_ref;
                             r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
                             r.selfcheck_reference = true;
+                            r.selfcheck_tied = tied;
                         }
                         const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
                         r.tiles += head_tiles;
@@ -2767,8 +2769,17 @@ int run(int argc, char** argv) {
         return 3;
     }
     std::printf("imported %d tensors, %lld q4_1 tiles into %s\n", r.tensors, r.tiles, out.c_str());
-    if (r.selfcheck_reference) {
+    if (r.selfcheck_reference && r.selfcheck_tied) {
         std::printf("  self-check: lm_head vs the pack's fp16 embedding  corr %.6f  rel_err %.6f\n",
+                    r.lmhead_corr, r.lmhead_rel);
+        std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
+                    r.ctrl_corr_nibble, r.ctrl_corr_nozp);
+    } else if (r.selfcheck_reference) {
+        // An untied pack: lm_head and model.embed_tokens are separate matrices, so correlating them is not a test of
+        // anything. Say so, with the number, so the line cannot be read as a decoding failure.
+        std::printf("  self-check: not a check here -- this pack is untied (lm_head and the embedding are separate\n"
+                    "              matrices), so their correlation %.6f and rel_err %.6f are what an untied pack\n"
+                    "              looks like, not a decode failure; the controls still run\n",
                     r.lmhead_corr, r.lmhead_rel);
         std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
                     r.ctrl_corr_nibble, r.ctrl_corr_nozp);

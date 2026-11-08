@@ -76,4 +76,51 @@ export HSA_USE_SVM=${HSA_USE_SVM:-0}
 export HSA_USERPTR_FOR_PAGED_MEM=${HSA_USERPTR_FOR_PAGED_MEM:-0}
 export HRX_ALLOW_NO_SVM=${HRX_ALLOW_NO_SVM:-1}
 
-exec "$GPU_HOLD" -l hyperloom -t "$HOLD_MIN" -- python3 "$HERE/benchmark.py"
+# --- Room: before the claim, and again inside it ------------------------------------------------
+# gpu-hold admits a measurement on the die's temperature and the FIFO's order. It has no idea how much
+# GTT the workload needs, and the engine's own guardrail (ggml_hrx, engine #680) refuses a load whose
+# device buffers do not fit in what is left -- correctly, and *after* the claim is already ours. On
+# 2026-11-08 that difference cost two claims in a row, both taken at 48.9 / 59.9 C while other lanes
+# held 89.1 / 89.6 GiB of GTT, both dying in the first leg:
+#   HRX0 guardrail: ... pool budget 14.4 GiB - a launch that needs more is refused here
+#   llama_model_load: error loading model: unable to allocate HRX0 buffer
+# and both artifacts recorded `llama-bench failed (rc=1, rows=[])`, score 0.0 -- which reads like a
+# broken workload and is really a claim taken for work that could not fit. So the entrypoint waits for
+# room *before* claiming and re-checks the moment the claim is ours, because the box moves while queued
+# (the window harness learned the same lesson the same week: a pre-claim check alone is a race).
+GTT_NEED=${HL_GTT_NEED_GIB:-24}     # 27B at 20480 ctx needs 20.21 GiB by its own load line, plus margin
+GTT_RULE=${HL_GTT_RULE_GIB:-95}     # this box's GTT rule; the engine's own ceiling is 104 with a 16 GiB reserve
+GTT_WAIT=${HL_GTT_ROOM_WAIT:-1800}
+export HL_GTT_NEED_GIB="$GTT_NEED" HL_GTT_RULE_GIB="$GTT_RULE"
+gtt_gib() {
+  local f=/sys/class/drm/card0/device/mem_info_gtt_used
+  [ -r "$f" ] || { echo 0; return; }          # unreadable sysfs must not be read as "full"
+  echo $(( $(cat "$f") / 1073741824 ))
+}
+waited=0
+while :; do
+  g=$(gtt_gib)
+  if [ $(( g + GTT_NEED )) -le "$GTT_RULE" ]; then
+    echo "[1bit-hl] room ok: GTT ${g} GiB in use + ${GTT_NEED} GiB needed = $(( g + GTT_NEED )) GiB <= ${GTT_RULE} GiB rule"
+    break
+  fi
+  if [ "$waited" -ge "$GTT_WAIT" ]; then
+    echo "[1bit-hl] REFUSING: GTT ${g} GiB in use + ${GTT_NEED} GiB needed = $(( g + GTT_NEED )) GiB > ${GTT_RULE} GiB, and it did not clear in ${GTT_WAIT}s -- not claiming a measurement the engine would refuse (HL_GTT_NEED_GIB / HL_GTT_RULE_GIB / HL_GTT_ROOM_WAIT)" >&2
+    exit 3
+  fi
+  echo "[1bit-hl] waiting for room: GTT ${g} GiB + ${GTT_NEED} GiB = $(( g + GTT_NEED )) GiB > ${GTT_RULE} GiB (${waited}s of ${GTT_WAIT}s)"
+  sleep 20; waited=$((waited + 20))
+done
+
+# Inside the claim the same check runs again, before the workload loads anything: whatever the queue
+# promised, the box is shared and the grant can arrive into a pool that has since filled up.
+exec "$GPU_HOLD" -l hyperloom -t "$HOLD_MIN" -- bash -c '
+  f=/sys/class/drm/card0/device/mem_info_gtt_used
+  g=$([ -r "$f" ] && echo $(( $(cat "$f") / 1073741824 )) || echo 0)
+  if [ $(( g + ${HL_GTT_NEED_GIB} )) -gt "${HL_GTT_RULE_GIB}" ]; then
+    echo "[1bit-hl] REFUSING after the grant: GTT ${g} GiB + ${HL_GTT_NEED_GIB} GiB = $(( g + ${HL_GTT_NEED_GIB} )) GiB > ${HL_GTT_RULE_GIB} GiB; releasing the claim instead of starting a load the engine will refuse" >&2
+    exit 3
+  fi
+  echo "[1bit-hl] room ok inside the claim: GTT ${g} GiB in use"
+  exec python3 "$1"
+' _ "$HERE/benchmark.py"

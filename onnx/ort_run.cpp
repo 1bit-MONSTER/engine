@@ -91,7 +91,7 @@ void explain_missing_kernel(const char* msg, const char* model_path) {
     if (!other.empty()) {
         std::string list;
         for (const auto& n : other) list += (list.empty() ? "" : ", ") + n;
-        std::fprintf(stderr, "onebit-ort-run:   other exports in %s: %s (a float or QDQ export uses no integer ops)\n",
+        std::fprintf(stderr, "onebit-ort-run:   other exports in %s: %s (not checked; a float or QDQ one uses no integer ops)\n",
                      dir.c_str(), list.c_str());
     }
 }

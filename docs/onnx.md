@@ -604,13 +604,13 @@ The pinned runtime (1.23.2, CPU EP) has these kernels, measured by one-node grap
 `ConvInteger`, all int8 weights) is one; its `onnx/model.onnx` (fp32, 73 `Conv`) runs in 66 ms on the
 CPU. This is the runtime's op coverage, not the model's or an EP's, and our EP would not claim a
 convolution anyway (its seam is `MatMul`). `ort-run` says so when a session fails for a missing kernel,
-and lists the other exports in the same directory:
+and lists the other exports in the same directory, without checking them:
 
 ```
 onebit-ort-run: FAIL create session: Could not find an implementation for ConvInteger(10) node with name '/model.0/conv/Conv_quant'
 onebit-ort-run: the pinned ONNX Runtime has no CPU kernel for ConvInteger at this graph's input types: a runtime coverage gap, not a model or EP failure
 onebit-ort-run:   ConvInteger runs only uint8 x uint8; DynamicQuantizeLinear feeds uint8, so an int8-weight export cannot load
-onebit-ort-run:   other exports in .../onnx: model.onnx (a float or QDQ export uses no integer ops)
+onebit-ort-run:   other exports in .../onnx: model.onnx (not checked; a float or QDQ one uses no integer ops)
 ```
 
 `ctest -R ort_run_generic` checks both sides: the uint8 x int8 graph is refused with those lines, and

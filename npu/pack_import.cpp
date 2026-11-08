@@ -1776,13 +1776,16 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     if (!r.refused.empty() && !opt.allow_incomplete) return r;  // refuse by name, write nothing
 
     bool tied = false;
+    bool tie_declared = false;   // whether the pack states it at all (a genre-A pack ships no config.json)
     {
         std::ifstream cf(pack_dir + "/config.json");
         if (cf) {
             const auto c = json::parse(cf);
+            tie_declared = c.contains("tie_word_embeddings");
             tied = c.value("tie_word_embeddings", false);
         }
     }
+    bool head_written = false;
     // The graph's own name, the same resolution plan() uses: on the 1.9/hybrid lines it is `model_jit.onnx` and
     // `genai_config.json` says so. Opening "model.onnx" here made an import of exactly the packs plan() had just
     // learned to read fail at the first byte, with "cannot open <pack>/model.onnx".
@@ -2094,7 +2097,6 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             std::fprintf(stderr, "[pack-dbg] matmul %s N=%d K=%d block=%d | V=%d H=%d -> head=%d\n",
                          mm.weight.c_str(), q.N, q.K, mm.block, int(V), int(H), (int)head_geometry);
         if (tied || head_geometry) r.selfcheck_reference = true;
-        if (tied || head_geometry) r.selfcheck_tied = tied;
         if (tied || head_geometry) {
             double sum_abs = 0, sum_ref = 0;
             for (int n = 0; n < q.N; ++n)
@@ -2114,6 +2116,10 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 }
             r.lmhead_rel = sum_abs / sum_ref;
             r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+            // The diagnostic follows the NUMBER, not the pack's declaration: a genre-A pack ships no config.json, so
+            // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
+            // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
+            r.selfcheck_tied = r.lmhead_corr > 0.99;
             const Q4 swap = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K),
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
@@ -2154,6 +2160,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         r.tiles += head_tiles;
         w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
         ++r.tensors;
+        head_written = true;
         break;
     }
 
@@ -2236,12 +2243,13 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             r.lmhead_rel = sum_abs / sum_ref;
                             r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
                             r.selfcheck_reference = true;
-                            r.selfcheck_tied = tied;
+                            r.selfcheck_tied = r.lmhead_corr > 0.99;
                         }
                         const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
                         r.tiles += head_tiles;
                         w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
                         ++r.tensors;
+                        head_written = true;
                     }
                 }
             }
@@ -2657,6 +2665,21 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         const TextArtifacts ta = scan_text_artifacts(pack_dir);
         c["vocab_size"] = V;
         c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries
+        // The forward picks between "logits from the token embedding" and "logits from a separate head tensor" on this
+        // key, and defaults to TIED when it is absent (npu/forward/src/q4nx_semantics.c). An untied pack that ships no
+        // config.json -- every genre-A hybrid, e.g. Phi-3-mini -- therefore used to look tied, and the forward decoded
+        // its logits from the embedding matrix: fluent-looking garbage ('slower slower slower'), with the head tensor
+        // sitting unused in the container. The pack's own declaration wins where it has one; otherwise the head we
+        // actually imported decides, by the same correlation the self-check reports.
+        if (tie_declared) {
+            c["tie_word_embeddings"] = tied;
+        } else if (head_written) {
+            c["tie_word_embeddings"] = r.lmhead_corr > 0.99;
+            c["q4nx_tie_note"] = "this pack states no tie_word_embeddings, so it is taken from the data: the " +
+                                 std::string(r.lmhead_corr > 0.99 ? "imported head reproduces the embedding"
+                                                                  : "imported head is a separate matrix") +
+                                 " (correlation " + std::to_string(r.lmhead_corr) + ")";
+        }
         c["q4nx_source"] = {{"converter", "1bit npu-pack import"},
                             {"pack", p.pack},
                             {"layout", q4nx::layout_of(kContainerParams)},
@@ -2770,7 +2793,8 @@ int run(int argc, char** argv) {
     }
     std::printf("imported %d tensors, %lld q4_1 tiles into %s\n", r.tensors, r.tiles, out.c_str());
     if (r.selfcheck_reference && r.selfcheck_tied) {
-        std::printf("  self-check: lm_head vs the pack's fp16 embedding  corr %.6f  rel_err %.6f\n",
+        std::printf("  self-check: the head reproduces the pack's fp16 embedding  corr %.6f  rel_err %.6f\n"
+                    "              (tied: this correlation is the check, and it passed)\n",
                     r.lmhead_corr, r.lmhead_rel);
         std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
                     r.ctrl_corr_nibble, r.ctrl_corr_nozp);

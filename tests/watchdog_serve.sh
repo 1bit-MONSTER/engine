@@ -30,6 +30,8 @@ set -uo pipefail
 
 bin=${1:?usage: watchdog_serve.sh path/to/1bit}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound instead of guessing one (engine #1485)
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
 pids=()
@@ -41,24 +43,19 @@ cleanup() {
 trap cleanup EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
-newport() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 export FAKE_BACKEND_EVENTS="$scratch/events"
 
-start() {  # <log> [serve args]: starts serve on $port, waits for /health 200
-    port=$(newport)
-    "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port" --alias wd \
+start() {  # <log> [serve args]: starts serve on a port it reports, waits for /health 200
+    # --port 0: the kernel picks and serve reports it (engine #1485); nothing is picked and released here, so a bind
+    # failure can no longer be this test colliding with itself
+    "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port 0 --alias wd \
         --llama-server "$here/fake_backend.py" "${@:2}" >"$1" 2>&1 &
     pid=$!
     pids+=("$pid")
+    port=$(serve_port_wait "$1" "$pid") || { echo "FAIL serve never reported a port"; cat "$1"; exit 1; }
     api="http://127.0.0.1:$port"
     local code=000
     for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.1; done
-    # A server that never came up because it could not bind is a port collision, not a defect in
-    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
-    if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$1"; then
-        echo "FAIL: watchdog_serve: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$1" | head -1))"
-        exit 1
-    fi
     child=$(pgrep -P "$pid" | head -1)
 }
 gone_within() {  # <pid> <seconds>

@@ -38,6 +38,8 @@ set -uo pipefail
 
 bin=${1:?usage: pm_route.sh path/to/1bit}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound instead of guessing one (engine #1485)
 scratch=$(mktemp -d)
 touch "$scratch/zaya.gguf"
 pids=()
@@ -56,18 +58,16 @@ lemonade="http://127.0.0.1:$lem_port"
 # serve NAME [serve args...]: a `1bit serve --pm` on the fake PM backend, ready, api in $api
 serve() {
     local name=$1; shift
-    local port; port=$(freeport)
-    PM_RECORD="$scratch/$name.backend.jsonl" "$bin" serve -m "$scratch/zaya.gguf" --device cpu --port "$port" --alias ZAYA1-8B-PM \
+    local port
+    # --port 0: the kernel picks and serve reports it (engine #1485), so nothing is picked and released before serve
+    # binds; freeport() stays where it is used for the fake lemonade python process, which is not serve.
+    PM_RECORD="$scratch/$name.backend.jsonl" "$bin" serve -m "$scratch/zaya.gguf" --device cpu --port 0 --alias ZAYA1-8B-PM \
         --llama-server "$here/fake_pm_backend.py" --pm "$@" >"$scratch/$name.log" 2>&1 &
-    pids+=($!)
+    local spid=$!
+    pids+=("$spid")
+    port=$(serve_port_wait "$scratch/$name.log" "$spid") || { echo "serve $name never reported a port"; cat "$scratch/$name.log"; return 1; }
     api="http://127.0.0.1:$port"
     for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$api/health")" = 200 ] && return 0; sleep 0.1; done
-    # A server that never came up because it could not bind is a port collision, not a defect in
-    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
-    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$scratch/$name.log"; then
-        echo "FAIL: pm_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$scratch/$name.log" | head -1))"
-        exit 1
-    fi
     echo "serve $name did not become ready"; cat "$scratch/$name.log"; return 1
 }
 ask() {  # ask [extra json fields] -- a coding question, non-stream

@@ -90,12 +90,16 @@ class RoutePortLockTest(unittest.TestCase):
     def test_the_census_finds_the_route_tests(self):
         # A regex that stopped matching would pass the lock check vacuously; name what must be found.
         found = self.census()
-        for name in ("pm_route", "print_backend", "recipes_route", "smoke_serve"):
+        # recipes_route is no longer here on purpose: it runs `serve --port 0` since engine #1485, so it picks nothing
+        # and releases nothing and the lock protects it from nothing. The names below are the ones that still choose
+        # their port before launching.
+        for name in ("pm_route", "print_backend", "smoke_serve"):
             self.assertIn(name, found, f"{name} starts a server; the census must find it")
-        # 19 in a build with no model passed; a model-enabled build configures three more
-        # (hybrid_e2e, laya_route_e2e, pm_laya_route) and serve_e2e_<dev>, so the floor is the
-        # number the CI build has, not the number a developer's build may have.
-        self.assertGreaterEqual(len(found), 15,
+        # 12 in a build with no model passed; a model-enabled build configures more (hybrid_e2e,
+        # laya_route_e2e, laya_models_e2e, pm_laya_route, hrx_cpu_weight_parity and serve_e2e_<dev>), so the floor is
+        # the number the CI build has, not the number a developer's build may have. It counted 15 before engine #1485
+        # moved seven scripts to `serve --port 0`.
+        self.assertGreaterEqual(len(found), 12,
                                 "fewer route tests found than the suite has: " + ", ".join(sorted(found)))
 
     def test_indirect_server_tests_hold_the_lock_too(self):

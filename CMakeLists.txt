@@ -272,6 +272,7 @@ add_test(NAME hybrid_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_route.sh $<T
 # run it (the GPU gate in ~/wt/zc-probes cannot).
 add_test(NAME hybrid_kvshare_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_kvshare_route.sh $<TARGET_FILE:onebit>)
 set(ONEBIT_SERVE_TEST_LLAMA_SERVER "" CACHE FILEPATH "llama-server for hybrid_e2e (default: the build's own)")
+set(ONEBIT_KVSHARE_PREFILL "" CACHE FILEPATH "reference provider for hybrid_kvshare_e2e (the fork's llama-kvshare-prefill; empty skips)")
 if(ONEBIT_SERVE_TEST_GGUF)
     add_test(NAME hybrid_e2e
              COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${ONEBIT_SERVE_TEST_LLAMA_SERVER})
@@ -436,6 +437,15 @@ if(ONEBIT_HRX)
         add_test(NAME hrx_cpu_weight_parity
                  COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cpu_weight_parity.sh ${ONEBIT_HRX_SERVER} ${ONEBIT_SERVE_TEST_GGUF})
         set_tests_properties(hrx_cpu_weight_parity PROPERTIES SKIP_RETURN_CODE 77)
+        # Target 1 with real dma-bufs (docs/zero-copy.md, "Target 1"): the decoder exports its KV region, a
+        # separate provider process receives the fds over SCM_RIGHTS and prefills into them, and the decoder
+        # adopts the cells with no data movement. Registered here, after include(cmake/hrx.cmake), because
+        # ONEBIT_HRX_SERVER is only defined there -- reading it earlier drops the argument on a first configure
+        # and shifts the rest. Needs the fork's reference provider, which this build does not produce: pass
+        # ONEBIT_KVSHARE_PREFILL or the test skips (77), as it does without a gfx1151.
+        add_test(NAME hybrid_kvshare_e2e
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_kvshare_e2e.sh "${ONEBIT_HRX_SERVER}" "${ONEBIT_SERVE_TEST_GGUF}" "${ONEBIT_KVSHARE_PREFILL}")
+        set_tests_properties(hybrid_kvshare_e2e PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endif()
 

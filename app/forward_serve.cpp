@@ -917,14 +917,18 @@ int run_forward_serve(int argc, char** argv) {
     // NPU").
     // Held for the life of the process (fd not closed), exactly like the per-process
     // ELF runner (npu_engine_universal), which takes the same exclusive lock.
-    if (!std::getenv("NPU_NO_DEVICE_LOCK"))
-        e.lock_fd = take_npu_device_lock(streams);
-
+    //
     // Offline mode (npu/forward/include/q4nx_forward.h, init_host): with
     // NPU_INFER_HOST_GEMM=1 the forward runs the model with host GEMMs and never opens
     // the device, which is how the sampling and grammar path is exercised without an
-    // NPU.  Open the device only when the forward is going to use it.
+    // NPU.  Such a run takes no lock (engine#1353): the lock is what protects the array,
+    // and a run that holds it without ever opening the device blocks every lane that
+    // does -- measured, one orphaned host-GEMM serve held it 4 h 52 m and stopped two
+    // other lanes' device work.  Open the device, and the lock, only when the forward is
+    // going to use it.
     const bool host_gemm = std::getenv("NPU_INFER_HOST_GEMM") != nullptr;
+    if (npu_lock_taken(!host_gemm, std::getenv("NPU_NO_DEVICE_LOCK") != nullptr))
+        e.lock_fd = take_npu_device_lock(streams);
     std::unique_ptr<xrt::device> dev;
     if (!host_gemm) dev = std::make_unique<xrt::device>(0);
     const bool ok = dev ? e.fwd->init(*dev, model.c_str(), kernels) : e.fwd->init_host(model.c_str(), kernels);

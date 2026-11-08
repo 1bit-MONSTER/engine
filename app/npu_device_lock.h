@@ -81,6 +81,17 @@ inline NpuLockMode npu_lock_mode_for(int streams) {
     return streams >= 2 ? NpuLockMode::Shared : NpuLockMode::Exclusive;
 }
 
+// Whether a run takes the lock at all (engine#1353). A run that never opens the device takes no
+// lock: NPU_INFER_HOST_GEMM=1 is exactly that run (app/forward_serve.cpp initialises the forward
+// with init_host and makes no xrt::device), and the lock is exclusive for the process's life, so an
+// idle host-GEMM serve blocks every lane that does use the array. Measured 2026-11-06: one orphaned
+// host-GEMM serve held it 4 h 52 m with 0 /dev/accel* handles and no CPU, and during that window a
+// second lane's serve and two device tickets waited on it. NPU_NO_DEVICE_LOCK=1 remains the
+// operator's escape hatch for the runs that do open the device.
+inline bool npu_lock_taken(bool opens_device, bool escape_hatch) {
+    return opens_device && !escape_hatch;
+}
+
 // --- engine#1241: naming the holder --------------------------------------------------------------
 // The wait prints the holder line after this many seconds, and not again for this long. Both are
 // diagnostic only: they never decide whether the lock is taken or who takes it.

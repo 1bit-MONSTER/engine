@@ -1854,6 +1854,31 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                          mm.weight.c_str(), (int)(wi != onnx.index.end()), mm.scales.c_str(),
                          (int)(si != onnx.index.end()), onnx.tensors.size(), onnx.index.size());
         if (wi == onnx.index.end() || si == onnx.index.end()) continue;
+        // Every node's declared geometry is checked against the bytes its qweight actually carries, BEFORE the head
+        // filter below: a node that demands more qweight than the tensor holds is a broken pack and must be refused
+        // by tensor name, not skipped for the accident of not being the head's geometry (the crafted-pack test in
+        // tests/npu_pack_import_test.cpp is exactly that shape).
+        {
+            const auto& wt = onnx.tensors[wi->second];
+            // A 0-dim tensor is either a genre-A *placeholder* (nothing beside it: no location, no length -- the
+            // packs ship one next to every real weight) or an OVERSTATED qweight that declares bytes it does not
+            // carry. Only the second is a refusal; the first is simply not this node's weight.
+            if (wt.dims.empty() && wt.location.empty() && wt.length == 0 && wt.raw == nullptr)
+                continue;   // a genre-A placeholder: nothing beside it, so it is not this node's weight
+            // else: fall through -- a 0-dim tensor that DOES declare data is legitimate when the byte count
+            // matches the geometry (the crafted tests carry both shapes), and bytes_of() below is what decides.
+            if (mm.bits != 4)
+                throw std::runtime_error(mm.weight + ": MatMulNBits is " + std::to_string(mm.bits) + "-bit, not 4-bit");
+            if (mm.N <= 0 || mm.K <= 0 || mm.block <= 0 || mm.K % mm.block)
+                throw std::runtime_error(mm.weight + ": bad MatMulNBits geometry N=" + std::to_string(mm.N) +
+                                         " K=" + std::to_string(mm.K) + " block=" + std::to_string(mm.block));
+            uint64_t groups_n = 0, qw_need = 0;
+            if (!mul_ok(uint64_t(mm.N), uint64_t(mm.K) / uint64_t(mm.block), groups_n) ||
+                !mul_ok(groups_n, uint64_t(mm.block) / 2, qw_need) ||
+                !mul_ok(uint64_t(mm.N), (uint64_t(mm.K) / uint64_t(mm.block) + 1) / 2, groups_n))
+                throw std::runtime_error(mm.weight + ": declared geometry overflows");
+            bytes_of(wt, qw_need);   // throws, naming the tensor, when the bytes are not there
+        }
         // This loop visits EVERY MatMulNBits node -- on the genre-A packs that is 24-31 fused qkv nodes plus the head
         // -- and it ends in a `break` (it was written when a pack had exactly one). So the first node was taken as
         // the head and the loop exited: a *qkv* matrix went into lm_head.weight and the real head was never read,

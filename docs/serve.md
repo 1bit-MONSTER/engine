@@ -723,6 +723,10 @@ on Hugging Face (for example
 threshold for either; without `--mtp-max`, `--dflash` drafts full blocks (llama-server's own
 default of 3 throws most of the gain away).
 
+AMD's own drafter families are a separate decision: PARD/PARD-2 are token-level drafts that run here
+and pay on the device, while Gumiho needs a tree verifier this engine does not have — what each needs
+is in [amd-drafters.md](amd-drafters.md).
+
 Convert the drafter with upstream llama.cpp's converter. It needs only the target's
 `config.json` and tokenizer files, not its weights:
 

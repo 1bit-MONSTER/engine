@@ -49,6 +49,7 @@ usage() {
 }
 die() { echo "$me: $*" >&2; exit 1; }
 # shellcheck source=scripts/pack-elf.sh
+sdir=$(cd "$(dirname "$0")" && pwd)
 . "$(cd "$(dirname "$0")" && pwd)/pack-elf.sh"
 
 src=${1:-}; out=${2:-}
@@ -155,8 +156,11 @@ missing=$(pack_missing_libs "$stage")
 # the private HIP kernels really are compiled into the HRX ggml library
 n=$(nm -D --defined-only "$stage/hrx/llama/bin/libggml-hrx.so" | grep -c ggml_hrx_hip_addon_register || true)
 [ "$n" != 0 ] || fail "libggml-hrx.so does not export ggml_hrx_hip_addon_register"
-n=$(strings -a "$stage/hrx/llama/bin/libggml-hrx.so" | grep -c amdgcn-amd-amdhsa || true)
-[ "$n" != 0 ] || fail "libggml-hrx.so carries no HIP code objects"
+# engine#1443: the bundled code objects, counted from the file itself. The old test here grepped for the
+# string "amdgcn-amd-amdhsa", which the libraries this box ships do not contain at all (56 bundled objects,
+# 0 matches), so the drop was refused on a real build and would have passed one with a third of the kernels.
+n=$("$sdir/code-objects.sh" "$stage/hrx/llama/bin/libggml-hrx.so")
+[ "${n:-0}" != 0 ] || fail "libggml-hrx.so carries no bundled code objects ($n): the HIP kernels are not in the drop"
 
 # the NPU library exposes the public API and nothing that names the private sources
 n=$(nm -g --defined-only "$stage/npu/libnpu_rt_api.a" 2>/dev/null | grep -c ' T ' || true)

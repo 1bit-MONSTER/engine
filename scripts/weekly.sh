@@ -54,6 +54,7 @@ HRX_TOOLCHAIN=
 mkdir -p "$LOGS"
 # pack_missing_libs (package_checks); this script's own copy, so it works before build checks out $SRC
 # shellcheck source=scripts/pack-elf.sh
+sdir=$(cd "$(dirname "$0")" && pwd)
 . "$(cd "$(dirname "$0")" && pwd)/pack-elf.sh"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
@@ -346,7 +347,7 @@ package_checks() {  # package_checks <linux tarball>
     f=${f%%$'\n'*}
     n=0; [ -n "$f" ] && n=$(nm -D --defined-only "$f" | grep -c ggml_hrx_hip_addon_register || true)
     if [ "$n" != 0 ]; then
-        echo "ok   private HIP kernels compiled into $(basename "$f") ($(strings -a "$f" | grep -c amdgcn-amd-amdhsa || true) code object targets)"
+        echo "ok   private HIP kernels compiled into $(basename "$f") ($("$sdir/code-objects.sh" "$f") bundled code objects)"
     else echo "FAIL no private HIP kernels in the HRX ggml library (${f:-missing})"; bad=1; fi
     # The packed install runs the GGUF-on-NPU path with the engine's own public helper scripts
     # (scripts/package-linux.sh). They are Apache-2.0 source that is already public, so they are the

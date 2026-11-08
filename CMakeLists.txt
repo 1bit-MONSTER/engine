@@ -241,6 +241,9 @@ add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-chec
 # of the ciphertext, Ed25519 over the manifest) and checks it; the test is a throwaway set in a temp
 # dir, so no key, no device and no build: the four refusals are a set with no manifest, a file the
 # manifest does not list, a ciphertext byte flipped after signing, and a manifest signed by another key.
+# scripts/code-objects.sh: the count of code objects bundled into a fat library, which is what the packers assert
+# (engine#1443: they used to grep for a string that real libraries do not carry).
+add_test(NAME code_objects COMMAND ${CMAKE_SOURCE_DIR}/tests/code_objects_test.sh)
 add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that

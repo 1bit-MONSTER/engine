@@ -1807,8 +1807,14 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             std::vector<uint8_t> tiled;
             long long pinexact = 0;
             tile_q4_1_f32(part, tiled, &pinexact);
-            w.add(out_name, "q4_1", {rows, K}, std::move(tiled));
-            r.tiles += part.N * (part.K / 32);
+            // Stored in the SAME form the .fconst route writes (raw tile chunks, dtype I8, shape [ntiles,
+            // chunk_bytes]) -- not the semantic ("q4_1", [rows, K]) form. Both carry identical bytes, but only
+            // this one tells the reader how to walk them: the semantic form made the forward recompute the grid
+            // from shape and reject a 6,144-byte chunk ("chunk 6144 B is not a kind"), while the identical
+            // geometry from a 1.8 pack served fine.
+            const int64_t nt = int64_t(tiled.size() / kImportTileBytes);
+            r.tiles += nt;
+            w.add(out_name, "I8", {nt, kImportTileBytes}, std::move(tiled));
             ++r.tensors;
             return true;
         };
@@ -1871,8 +1877,19 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
 
         // self-check 1: tie_word_embeddings makes the pack's own fp16 embedding an
         // independent reference for the decode, with two wrong decoders as controls.
-        r.selfcheck_reference = tied;
-        if (tied) {
+        // A genre-A pack states `tie_word_embeddings` in a config.json it does not ship, so `tied` is false and the
+        // one independent reference these packs carry goes unused. Run the same check whenever the head's geometry
+        // allows it and REPORT the correlation instead of gating on a flag: for a tied pack the pack's own F16
+        // embedding must reproduce its 4-bit head (pi-inferzo measured +0.9957 on SmolLM2-135M rai_1.7.1_hybrid),
+        // and for an untied one the number simply comes out low -- either way it is evidence, not a silent skip.
+        // NB: this loop visits every MatMulNBits node (the fused qkv at 24-30 of them AND the head), so the flag is
+        // only ever SET here -- assigning it per iteration left the last qkv node clearing the result of the head.
+        const bool head_geometry = (q.N == int(V) && q.K == int(H));
+        if (getenv("NPU_PACK_DEBUG"))
+            std::fprintf(stderr, "[pack-dbg] matmul %s N=%d K=%d block=%d | V=%d H=%d -> head=%d\n",
+                         mm.weight.c_str(), q.N, q.K, mm.block, int(V), int(H), (int)head_geometry);
+        if (tied || head_geometry) r.selfcheck_reference = true;
+        if (tied || head_geometry) {
             double sum_abs = 0, sum_ref = 0;
             for (int n = 0; n < q.N; ++n)
                 for (int k = 0; k < q.K; ++k) {
@@ -2267,6 +2284,73 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             }
         }
         c["rms_norm_eps"] = p.dims.rms_norm_eps;
+        // ── the RoPE base, verified against the pack's own cache ──
+        // These packs ship precomputed cos_cache/sin_cache, and their genai_config.json is not a trustworthy source
+        // for theta (pi-inferzo measured 10000 declared where the model needs 1e6). Our forward COMPUTES RoPE from
+        // theta instead of reading a cache, so a wrong base is a silent wrong answer at long context. The cache is
+        // the pack's own statement of its base, so the loader tests candidates against it and adopts the winner:
+        // correlation against cos(p * inv_freq_i) over p, which is invariant to the per-pack scaling of the cache
+        // (the 1.8 packs store pre-scaled cosines -- pos-0 reads 1.875, not 1.0).
+        if (onnx.index.count("cos_cache")) {
+            const OnnxTensor& cc = onnx.tensors[onnx.index.at("cos_cache")];
+            if (!cc.dims.empty() && cc.dims.size() == 2 && cc.dims.at(2 % cc.dims.size()) > 0) {
+                const int64_t rows = cc.dims.at(0), half = cc.dims.at(1);
+                const size_t n = size_t(rows) * size_t(half);
+                uint64_t need = 0;
+                if (mul_ok(n, cc.type == kF32 ? 4u : 2u, need)) {
+                    std::vector<float> cache(n);
+                    if (cc.type == kF32) std::memcpy(cache.data(), bytes_of(cc, need), n * 4);
+                    else {
+                        const auto b = as_bf16(bytes_of(cc, need), cc.type, n);
+                        const auto* d = reinterpret_cast<const uint16_t*>(b.data());
+                        for (size_t i = 0; i < n; ++i) cache[i] = bf16_to_f32(d[i]);
+                    }
+                    // candidates: what the metadata says first, then the values these families actually use
+                    std::vector<double> cands{p.dims.rope_theta, 1e4, 5e4, 1e5, 5e5, 1e6, 1e7, 1.6e6, 3.2e6};
+                    double best_corr = -2.0, best_theta = p.dims.rope_theta;
+                    const int HD2 = int(half) * 2;          // head_dim implied by the cache
+                    const int64_t pmax = std::min<int64_t>(rows, 4096);
+                    std::vector<double> ang(pmax), cs(size_t(pmax));
+                    for (double th : cands) {
+                        if (!(th > 0)) continue;
+                        double acc = 0.0;
+                        int used = 0;
+                        for (int64_t i = 0; i < half; ++i) {
+                            const double inv = 1.0 / std::pow(th, 2.0 * double(i) / double(HD2));
+                            // Pearson r between the cache column and cos(p * inv_freq_i); scaling-invariant, so the
+                            // packs' pre-scaled cosines do not matter.
+                            double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+                            for (int64_t pp = 0; pp < pmax; ++pp) {
+                                const double y = cache[size_t(pp) * size_t(half) + size_t(i)];
+                                const double x = std::cos(double(pp) * inv);
+                                sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+                            }
+                            const double np = double(pmax);
+                            const double cx = sxx - sx * sx / np, cy = syy - sy * sy / np;
+                            if (cx > 1e-12 && cy > 1e-12) {
+                                const double r = (sxy - sx * sy / np) / std::sqrt(cx * cy);
+                                if (r == r) { acc += r; used++; }
+                            }
+                        }
+                        if (used > 0) {
+                            const double corr = acc / used;
+                            if (corr > best_corr) { best_corr = corr; best_theta = th; }
+                        }
+                    }
+                    if (best_corr > 0.99 && std::fabs(best_theta - p.dims.rope_theta) > 1e-9) {
+                        std::fprintf(stderr,
+                                     "note: rope_theta %.6g declared, %.6g adopted (correlation %.4f against the "
+                                     "pack's own cos_cache)\n", (double)p.dims.rope_theta, best_theta, best_corr);
+                        c["rope_theta"] = best_theta;
+                        c.erase("q4nx_rope_note");
+                    } else if (best_corr > 0.99) {
+                        std::fprintf(stderr, "note: rope_theta %.6g verified against the pack's cos_cache (corr %.4f)\n",
+                                     (double)p.dims.rope_theta, best_corr);
+                        c.erase("q4nx_rope_note");
+                    }
+                }
+            }
+        }
         const TextArtifacts ta = scan_text_artifacts(pack_dir);
         c["vocab_size"] = V;
         c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries

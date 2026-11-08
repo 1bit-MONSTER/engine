@@ -422,6 +422,26 @@ if [ -z "$BIN" ]; then
     hip_flags="-O3"
     [ -n "$device_lib" ] && hip_flags="-O3 --rocm-device-lib-path=$device_lib"
     export HIP_DEVICE_LIB_PATH=${HIP_DEVICE_LIB_PATH:-$device_lib}
+    # The kernel corpus is embedded in one of two forms (ggml/src/ggml-hrx/CMakeLists.txt): `binary`,
+    # the default, is what a release ships and needs the Loom assembler (`loom-link` and `loom-format`
+    # on PATH); `text` embeds the .loom sources and needs neither. A box without the Loom tools cannot
+    # configure the default at all -- it stops at "requires loom-link and loom-format" before anything
+    # is built -- which is what the gate hit on strixhalo (2026-11-09): loom-link is present under
+    # ~/lb/fnpre/tools and loom-format is not on the box. So pick the form from what is installed and
+    # say which one, rather than failing where the message looks like a broken checkout. A release
+    # still builds `binary` because a release box has the tools; HW_GATE_CORPUS_FORMAT forces either.
+    corpus=${HW_GATE_CORPUS_FORMAT:-}
+    if [ -z "$corpus" ]; then
+      if command -v loom-link > /dev/null 2>&1 && command -v loom-format > /dev/null 2>&1; then corpus=binary
+      else corpus=text; fi
+    fi
+    case "$corpus" in
+      binary) command -v loom-link > /dev/null 2>&1 && command -v loom-format > /dev/null 2>&1 || {
+                 note "::error::HW_GATE_CORPUS_FORMAT=binary needs loom-link and loom-format on PATH"; exit 2; } ;;
+      text)   ;;
+      *)      note "::error::HW_GATE_CORPUS_FORMAT=$corpus is neither binary nor text"; exit 2 ;;
+    esac
+    note "kernel corpus: $corpus${corpus:+}"
     # a changed flag set must not be read from an existing cache
     [ "$(cat "$build/.hip-flags" 2>/dev/null)" = "$hip_flags" ] || rm -f "$build/CMakeCache.txt"
     # the same configuration as cmake/hrx.cmake (llama_hrx), plus the two test tools
@@ -435,6 +455,7 @@ if [ -z "$BIN" ]; then
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DHRX_SOURCE_DIR="$ROOT/third_party/hrx-system" "${addon_args[@]}" \
           -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON \
+          -DGGML_HRX_KERNEL_CORPUS_SOURCE_FORMAT="$corpus" \
           -DGGML_HRX_HIP_COMPILER="$TOOLCHAIN/bin/amdclang++" "-DGGML_HRX_HIP_FLAGS=$hip_flags" \
           -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF >> "$OUT/build.log" 2>&1 &&
           echo "$addon_pin" > "$build/.gpu-kernels-pin" && echo "$hip_flags" > "$build/.hip-flags"; }; } &&

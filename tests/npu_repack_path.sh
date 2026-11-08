@@ -47,7 +47,6 @@ open(os.environ["REPACK_MARKER"], "w").write(" ".join(sys.argv[1:]))
 sys.exit(1)
 PY
 
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 
 # a copy of 1bit on its own, the way a package installs it (the binary and the libraries beside it)
 install() {  # install <dir>
@@ -63,7 +62,9 @@ serve_npu() {
     # caller's working directory must not decide whether the script is found
     local cwd=$scratch/cwd; mkdir -p "$cwd"
     ( cd "$cwd" && env REPACK_MARKER="$marker" ONEBIT_Q4NX_CACHE="$scratch/cache" "$@" \
-        timeout 60 "$dir/1bit" serve -m "$scratch/m.gguf" --device npu --port "$port" > "$scratch/out.log" 2>&1 )
+        # --port 0: nothing here calls the server, so no port is needed at all - it just must not be one that was
+        # picked and released before serve binds it (engine #1444/#1485)
+        timeout 60 "$dir/1bit" serve -m "$scratch/m.gguf" --device npu --port 0 > "$scratch/out.log" 2>&1 )
     echo $?
 }
 

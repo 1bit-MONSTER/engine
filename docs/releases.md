@@ -474,6 +474,16 @@ To exercise only the private builds and the packaging without releasing, on Stri
 WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-private scripts/weekly.sh ~/.cache/1bit-weekly build package
 ```
 
+That example runs `build` before `package` for a reason, and it is not only the build: **a `package`-only run
+needs a workdir that has already built.** `stage_package` starts by signing the sealed NPU sets, and it signs
+them with `<workdir>/src/tools/seal_manifest.py` — the source checkout that the `build` stage's `checkout()`
+creates. On a workdir that has never built, `weekly.sh <workdir> package` therefore stops on its first line
+with `can't open file '…/src/tools/seal_manifest.py'`, and on one whose `src` is older than `main` it packs
+with that older packer (measured 2026-11-08: three attempts, each stopped by one of those two, plus a `src`
+whose pre-#1361 `package-linux.sh` refused the build tree's tools). What a re-pack does *not* need a build
+for is the HSA runtime: `stage_package` resolves the pinned toolchain itself with
+`scripts/fetch-rocm-sdk.sh` (`config/hrx-toolchain.config`), which reuses the tree when its `.pin` matches.
+
 ## The release run
 
 `scripts/weekly.sh <workdir>` on Strix Halo, in stages:

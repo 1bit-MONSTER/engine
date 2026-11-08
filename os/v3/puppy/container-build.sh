@@ -350,7 +350,19 @@ if [ -n "${PAYLOAD:-}" ]; then
         "$skeleton/etc/1bit/onebit-models.txt" || {
         echo "build: REFUSED: could not write /etc/1bit/onebit-models.txt from the payload catalogue" >&2
         exit 1; }
+    # engine#1557: `payload=` names the payload, and a name is only a claim. This records a fact about the same
+    # /payload tree - the sorted list of its file paths - so release-check can compare the identity with the tree
+    # the image actually carries. Cheap on both sides (metadata only, and the image-side walk already happens for
+    # the payload-modes row), and it needs no packer: the build is what has the payload, so the build is the writer.
+# The payload's own identity, algorithmically: relative file paths, sorted, hashed. release-check.sh recomputes it
+# over /opt/1bit-package with the SAME expression (grep for "engine#1557" there); the two must stay identical, which
+# is why it is one line of find|sed|sort|sha256sum and not a script.
+payload_manifest() {   # <payload dir>
+    find "$1" -type f 2>/dev/null | sed "s|^$1/||" | LC_ALL=C sort | sha256sum | cut -d' ' -f1
+}
+
     { echo "payload=${PAYLOAD_NAME:-unknown}"
+      echo "payload_manifest=$(payload_manifest /payload)"
       echo "engine_sha256=$(sha256sum /payload/1bit/1bit | cut -c1-64)"
       if [ -n "${LIBHSA_DIR:-}" ]; then
           echo "libhsa_sha256=$(sha256sum /libhsa-runtime/libhsa-runtime64.so.1 | cut -c1-64)"

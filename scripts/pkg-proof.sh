@@ -323,6 +323,17 @@ if [ -r "$img" ]; then
 else
     row FAIL "vmlinuz in the package" "$img missing"
 fi
+    # The acceptance test #1487 asks for, and a guard nothing had: build a module against OUR headers
+    # package. Installing them and reading a path out of them is not the same thing — `make prepare` runs
+    # tools/objtool and scripts/Makefile.lib uses it on every module compiled, so a future "tidy" that
+    # excludes it (it is one of the four files carrying build-machine paths) would break every DKMS build
+    # on a user's machine and every row above would still pass.
+    dkms build -m amdxdna-1bit -v 0.18.0 -k "$krel" >/tmp/hb.log 2>&1
+    if [ $? -eq 0 ]; then
+        row PASS "a DKMS build works against OUR headers package" "amdxdna-1bit/0.18.0 for $krel"
+    else
+        row FAIL "a DKMS build works against OUR headers package" "$(grep -m2 -E 'error|Error' /tmp/hb.log | tr '\n' ' ')"
+    fi
 fi          # [ -n "$krel" ]
 fi   # have_kernel
 

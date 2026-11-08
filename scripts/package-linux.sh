@@ -143,6 +143,44 @@ bad=$(pack_build_rpaths "$stage" "$build")
 hygiene=$(pack_artifact_hygiene "$stage")
 [ -z "$hygiene" ] || { echo "artifact hygiene:"; echo "$hygiene"; exit 1; }
 
+# engine #1411: the HSA runtime set ships beside the backend, because the backend opens it BY NAME at run
+# time (ggml-hrx-dmabuf.cpp:29, dlopen("libhsa-runtime64.so.1")) and the runtime opens the aqlprofile agent
+# the same way - so ldd sees none of it and a payload without the set resolves it from wherever the machine
+# happens to have one. That is what the c22 install does: 64 files mapped out of a builder's /work-c22
+# toolchain, which nobody would keep. The set is TheRock's, taken from the toolchain THIS build used, and
+# staged last so it lands as built (scripts/pack-elf.sh has already localized and stripped ours by now, and
+# NOTICE-BINARY promises these unmodified).
+# Staging it here rather than in mk-plugin-package.sh is what makes both payloads self-contained: the engine
+# package does its own overlay, and the Lemonade + onebit package carries this tarball as 1bit/.
+if [ -f "$stage/hrx/llama/bin/llama-server" ]; then
+    tc=$(sed -n 's/^ONEBIT_HRX_TOOLCHAIN[^=]*=//p' "$build/CMakeCache.txt" 2>/dev/null | head -1)
+    [ -n "$tc" ] || { echo "no ONEBIT_HRX_TOOLCHAIN in $build/CMakeCache.txt: the HSA runtime set cannot be staged beside the backend (engine #1411)" >&2; exit 1; }
+    core=$(ls -d "$tc"/lib/python3*/site-packages/_rocm_sdk_core/lib 2>/dev/null | head -1)
+    [ -n "$core" ] || { echo "no _rocm_sdk_core/lib under $tc (ONEBIT_HRX_TOOLCHAIN): the HSA runtime set cannot be staged (engine #1411)" >&2; exit 1; }
+    # The set is the transitive NEEDED closure of the three roots, not every file in rocm_sysdeps/lib: the
+    # runtime links what it needs (elf, drm, drm_amdgpu, numa, z, zstd, bz2, liblzma, the profiling shim),
+    # and the toolchain's directory also holds libraries nothing here opens. Copying the closure keeps the
+    # payload to the set the owner named and keeps it self-maintaining - the same rule mk-plugin-package.sh
+    # applies to the engine package, and ldd is the arbiter in both.
+    rt=0
+    search=$core:$core/rocm_sysdeps/lib
+    for root in libhsa-runtime64.so.1 libhsa-amd-aqlprofile64.so.1 librocprofiler-register.so.0; do
+        f=$(ls "$core"/$root 2>/dev/null | head -1)
+        [ -n "$f" ] || { echo "the toolchain at $tc has no $root: the HRX backend opens it by name at run time, so the payload would resolve one from outside the install (engine #1411)" >&2; exit 1; }
+        install -m 0644 "$f" "$stage/hrx/llama/bin/$root"
+        rt=$((rt + 1))
+        while IFS= read -r so; do
+            case "$so" in /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*) continue ;; esac  # the distro's own
+            [ -f "$stage/hrx/llama/bin/$(basename "$so")" ] && continue
+            install -m 0644 "$so" "$stage/hrx/llama/bin/$(basename "$so")"
+            rt=$((rt + 1))
+        done < <(LD_LIBRARY_PATH=$search ldd "$f" 2>/dev/null | awk '/=> \// {print $3}' | sort -u)
+    done
+    missing_set=$(LD_LIBRARY_PATH=$stage/hrx/llama/bin ldd "$stage/hrx/llama/bin/libhsa-runtime64.so.1" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')
+    [ -z "${missing_set// /}" ] || { echo "the staged HSA runtime still needs $missing_set beside it (engine #1411)" >&2; exit 1; }
+    echo "  hrx/llama/bin: + the HSA runtime set ($rt files: the runtime, its aqlprofile agent, the profiling shim and rocm_sysdeps)"
+fi
+
 cp "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$stage/"
 # the stock Lemonade PPA's lemond (Ubuntu 26.04) runs our HRX llama-server through lemonade-hrx
 # (docs/lemonade.md, "Ubuntu 26.04: the PPA's lemond"); install-lemonade-ppa.sh wires its drop-in

@@ -20,7 +20,9 @@ code objects and zero such strings. So the cases below are the ones that separat
 
   1. a fat library whose own header is x86-64 and which embeds two EM_AMDGPU ELF images -> 2 code objects, passes;
   2. embedded ELF images of another machine (x86-64) -> 0, refused: the check must not be "count ELF magics";
-  3. only the file's own header -> 0, refused (the 5.1 MB build on this box, which really has no code objects);
+  3. only the file's own header -> 0, refused (the 5.1 MB build on this box, which really has no code objects --
+     distinct from a build with ONEBIT_HRX on and ONEBIT_GPU_PRIVATE empty: that one carries 4, so the drop's
+     addon-symbol test is the one that separates "private kernels in" from "HIP codegen only", not this count);
   4. a bare code object (the file itself is EM_AMDGPU) -> 1, passes;
   5. a truncated header at the end -> not a code object, and no crash;
   6. `--min N` is honoured.

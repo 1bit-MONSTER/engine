@@ -26,6 +26,13 @@ four real libraries on one box:
     hrx-a5271d9       11,427,720 B   52 ELF headers   50 EM_AMDGPU   (0 strings -> old check: FAIL)
     canonical          5,129,432 B    1 ELF header     0 EM_AMDGPU   (a build with no code objects: correctly refused)
 
+What this does *not* answer: whether the **private** kernels are in the build. A tree configured `ONEBIT_HRX=ON` with
+`ONEBIT_GPU_PRIVATE` empty still embeds AMDGPU code objects -- measured on this box, that library is 5,615,208 B with 5
+ELF headers and **4** `EM_AMDGPU` images, so it passes this tool while carrying none of the private addon. "Are *our*
+kernels in it" is the `nm -D ... ggml_hrx_hip_addon_register` test beside this one in `make-binary-drop.sh`; that symbol
+separated all four libraries above (yes, no, yes, ...) where the code-object count did not. Keep both: this one says "the
+file carries HIP code at all", the addon symbol says "and it is the kernels the drop promises".
+
 usage: code_objects.py <file> [--min N] [--quiet]
 exit:  0 when the file carries at least N (default 1) AMDGPU code objects, 1 when it carries fewer, 2 on a read error
 """

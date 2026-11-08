@@ -214,14 +214,16 @@ if [ "$mode" = reset ]; then
         if [ -n "$svc" ]; then
             if connmanctl config "$svc" --ipv4 dhcp >> "$LOG" 2>&1; then
                 say "1bit-network: $svc back to DHCP"
+                # ONLY here: with the file already gone, a failed hand-back that also dropped the marker would leave no
+                # file, no marker and connman still applying the old address for ever - the hole this marker exists for
+                rm -f "$MARK" 2> /dev/null
             else
-                say "1bit-network: connman refused to put $svc back on DHCP (see $LOG); restart it: /etc/init.d/connman restart"
+                say "1bit-network: connman refused to put $svc back on DHCP (see $LOG); the marker stays and the next boot retries"
             fi
         else
-            say "1bit-network: connman has no service for $iface; the link keeps its address until reconnect"
+            say "1bit-network: connman has no service for $iface; the marker stays and the next boot retries"
         fi
     fi
-    rm -f "$MARK" 2> /dev/null
     say "1bit-network: reset - $CONF removed, the next boot and this one use DHCP"
     say "  (if the link still carries the old address, restart the network:  /etc/init.d/connman restart)"
     exit 0

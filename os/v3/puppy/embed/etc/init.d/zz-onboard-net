@@ -51,24 +51,43 @@ mkdir -p /tmp 2> /dev/null
 
 MARK=$DATA/.net-manual
 
-# No file: nothing to apply. But connman keeps a manual configuration in its OWN state, so if this machine ever set one
-# and the file is now gone (someone deleted /data/net.conf by hand - the recovery the docs promise), hand the link back
-# to DHCP here. Only configurations this box wrote are undone: the marker says so, and a service we never touched is left
-# alone.
+# load the library first: it defines the format parse AND the service lookup, and the hand-back below needs both
+NETWORK=/usr/local/bin/1bit-network
+if [ -r "$NETWORK" ]; then
+    # shellcheck disable=SC1090  # the image's own path; one definition of the format and of the service lookup
+    ONEBIT_NETWORK_LIB=1 . "$NETWORK"
+fi
+
+# hand_back REASON: give the interface this box configured back to DHCP. connman keeps a manual configuration in its OWN
+# state, so removing /data/net.conf is not enough - without this the old address comes back at every boot and the recovery
+# the docs promise does not recover (measured, and the review found the two paths that skipped it).
+# The marker is removed ONLY when connman actually took the change: a failed hand-back has to stay visible to the next boot.
+hand_back() {
+    miface=$(head -1 "$MARK" 2> /dev/null)
+    [ -n "$miface" ] || { log "zz-onboard-net: $1: $MARK is empty, so there is nothing to hand back"; return 1; }
+    # connman starts late (it sorts under "c"), so wait for it to publish a service for that interface before asking -
+    # the first version looked it up immediately and logged "will retry next boot" at every boot on a slow box
+    i=0
+    while [ $i -lt 30 ]; do
+        [ -n "$(connman_service_for_iface "$miface" 2> /dev/null)" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+    svc=$(connman_service_for_iface "$miface" 2> /dev/null)
+    if [ -n "$svc" ] && connmanctl config "$svc" --ipv4 dhcp >> "$LOG" 2>&1; then
+        rm -f "$MARK"
+        log "zz-onboard-net: $1: $svc handed back to DHCP (that manual config was this box's)"
+        return 0
+    fi
+    log "zz-onboard-net: $1: $miface could not be handed back to DHCP (see $LOG); the marker stays, the next boot retries"
+    return 1
+}
+
+# No file: nothing to apply - except undoing a manual configuration this box set earlier, which is the recovery the docs
+# promise for `rm /data/net.conf`. A service this box never touched is left alone.
 if [ ! -f "$CONF" ]; then
     if [ -f "$MARK" ]; then
-        miface=$(head -1 "$MARK" 2> /dev/null)
-        [ -n "$miface" ] || { log "zz-onboard-net: $MARK is empty; nothing to hand back"; exit 0; }
-        NETWORK=/usr/local/bin/1bit-network
-        # shellcheck disable=SC1090  # the image's own path; one definition of the format and the service lookup
-        [ -r "$NETWORK" ] && ONEBIT_NETWORK_LIB=1 . "$NETWORK"
-        svc=$(connman_service_for_iface "$miface" 2> /dev/null)
-        if [ -n "$svc" ] && connmanctl config "$svc" --ipv4 dhcp >> "$LOG" 2>&1; then
-            rm -f "$MARK"
-            log "zz-onboard-net: no $CONF and a manual config was ours: $svc handed back to DHCP"
-        else
-            log "zz-onboard-net: no $CONF, and $miface could not be handed back to DHCP (see $LOG); will retry next boot"
-        fi
+        hand_back "no $CONF"
         exit 0
     fi
     log "zz-onboard-net: no $CONF: the interface stays on DHCP (connman)"
@@ -88,7 +107,13 @@ fi
 
 read_conf "$CONF"
 if ! why=$(conf_ok 2>&1); then
-    log "zz-onboard-net: $CONF is not usable ($why): leaving the network on DHCP. Recovery: 1bit-network reset"
+    # A broken file must not leave connman applying an address nobody can see: undo our own manual config, and say which
+    # case this is (the header promised exactly this, and it did not do it - review finding on #1527)
+    if [ -f "$MARK" ]; then
+        hand_back "$CONF is not usable ($why)"
+    else
+        log "zz-onboard-net: $CONF is not usable ($why): leaving the network on DHCP. Recovery: 1bit-network reset"
+    fi
     exit 0
 fi
 

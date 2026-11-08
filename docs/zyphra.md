@@ -101,9 +101,12 @@ change a pick.
   this family **8-bit is the only honest bit-width below BF16 for ZAYA1 and ZR1** (both precision-sensitive architectures), while the
   SSM models are near-lossless at 8 bits and **all of them clear the bar at 6 bits** (`Q6_K`: Zamba-7B-v1 0.00269 / 97.16 %,
   Zamba2-2.7B 0.00730 / 95.66 %, Zamba2-7B-Instruct 0.008048 / 96.64 %) — so the 6-bit tier is real for the SSM half and nowhere
-  else in the family. Zamba2-7B-Instruct does not even need 6 bits: its `Q5_K_M` clears at 0.01936 / 95.03 %, the only model here
-  whose sweet spot sits below 6 bits, which is one more reason "Zyphra needs 8 bits" is a ZAYA1/ZR1 statement, not a family one.
-- **Zamba2-7B-Instruct (the fifth model): `Q5_K_M` is the sweet spot, decided on a 32-chunk run rather than on a 0.025-point
+  else in the family. *(Superseded by cause 2.)* This bullet used to say Zamba2-7B-Instruct did not even need 6 bits, on `Q5_K_M` at
+  0.01936 / 95.03 %. Under the adapter form (fork #218) that pick **falls off the top-1 bar** — 0.019383 / 94.792 % at 32 chunks — and the
+  sweet spot moved up to `Q6_K` (0.010430 / 96.593 %), so **every model whose sweet spot is below BF16 now sits at 6 bits or higher**, and
+  the sentence that "Zyphra needs 8 bits" is a ZAYA1/ZR1 statement is still the point, just without the 5-bit exception.
+- *(Historical — the merged-form record. The adapter form superseded this pick; see that model's section.)*
+  **Zamba2-7B-Instruct (the fifth model): `Q5_K_M` was the sweet spot of the merged form, decided on a 32-chunk run rather than on a 0.025-point
   margin.** At 16 chunks `Q5_K_M` was 0.026074 / 95.025 % while being 1265 MiB smaller than `Q6_K` (0.010801 / 96.446 %), which is
   noise rather than a decision, so both were re-measured over 32 × 512 windows: **0.019890 / 95.061 %** against 0.008048 /
   96.642 %. It held, and it is the smallest arm that clears either half of the bar. The two arms also re-quantized to

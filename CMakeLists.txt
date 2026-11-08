@@ -1089,6 +1089,11 @@ add_test(NAME npu_window11_policy COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/npu-w
 # 0755 (was executable) or 0644 (was not), no file or directory is group/other-writable, and the reporter that catches a
 # staging line added below the normalisation still fires on a tree nobody normalised.  Fixture tree: no build, no tar.
 add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.sh)
+# patch-sfs must not destroy the artifact it was asked to replace (#1491: two pre-pack refusals did `rm -f "$out"` before the
+# output had been reassigned to its .partial name, so a failed cut deleted the previous good SFS). Skips without root, since
+# patch-sfs needs uid/gid and setuid bits - this is the only test here that does, hence the property.
+add_test(NAME patch_sfs_atomic COMMAND ${CMAKE_SOURCE_DIR}/tests/patch_sfs_atomic_test.sh)
+set_tests_properties(patch_sfs_atomic PROPERTIES SKIP_RETURN_CODE 77)
 # The GEMM designs are derived on the container's K grid and the kernel's N grid (engine#845); a
 # model already on both is unchanged.  Pure arithmetic + one assemble_B, so it runs without a model.
 # The engine's derived design set for a set of dims, as `ROLE M K N elf` lines.  The instrument the

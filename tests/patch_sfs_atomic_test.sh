@@ -10,6 +10,13 @@
 # real failed cut, which is the only way that half had ever been run. This test is that failed cut: a post-pack refusal
 # (a source SFS carrying uid >= 1000, which the ownership row refuses) with --replace naming the source itself.
 #
+# What CANNOT be tested here, stated so the widening is not left looking untested: a change outside the declared set is not
+# expressible through the manifest interface. patch-sfs hard-links the source tree, replaces only the declared targets, and packs
+# what is left - so the only differences that can appear are (a) a declared target, (b) a declared target's subtree when the
+# target is a directory, and (c) a directory created to hold a declared addition. The ancestor rule added for finding 2 accepts
+# exactly (c); it cannot reach a path the manifest never named. The negative case below therefore asserts the nearest reachable
+# refusal instead: a declared target whose bytes cannot differ must be REFUSED rather than silently accepted.
+#
 # Exit 77 (skip) when not root: patch-sfs requires root for uid/gid/setuid bits, and so does building the fixture.
 set -uo pipefail
 
@@ -62,12 +69,22 @@ printf 'a\n' > "$work/tree2/a.txt"
 printf 'z\n' > "$work/withdir/NEWDIR/newfile.txt"
 chown -R 0:0 "$work/tree2" "$work/withdir"
 mksquashfs "$work/tree2" "$work/nd.sfs" -noappend -comp zstd > /dev/null 2>&1
-nd_before=$(sha256sum "$work/nd.sfs" | cut -d' ' -f1)
 printf 'NEWDIR/newfile.txt\t%s\n' "$work/withdir/NEWDIR/newfile.txt" > "$work/man-nd"
 "$tool" --replace --manifest "$work/man-nd" "$work/nd.sfs" "$work/nd.sfs" > "$work/nd.log" 2>&1
 check "new-directory manifest: the artifact is still present and non-empty" \
     "$([ -s "$work/nd.sfs" ] && echo present || echo gone)" "present"
 check "no .partial left behind (new directory)" "$(ls "$work"/*.partial 2>/dev/null | wc -l)" "0"
+
+# The negative direction: the ancestor rule widens what counts as declared, so something must still be REFUSED. A manifest row
+# whose replacement already matches the source cannot differ, and the tool must say so instead of packing a cut that changes
+# nothing - and with --replace naming an existing artifact, it must not touch that artifact either.
+printf 'a\n' > "$work/same-a.txt"
+printf 'a.txt\t%s\n' "$work/same-a.txt" > "$work/man-same"
+same_before=$(sha256sum "$work/clean.sfs" | cut -d' ' -f1)
+"$tool" --replace --manifest "$work/man-same" "$work/clean.sfs" "$work/clean.sfs" > "$work/same.log" 2>&1
+same_rc=$?
+check "a target that cannot differ is refused" "$([ "$same_rc" != 0 ] && echo refused || echo ok)" "refused"
+check "and the artifact keeps its bytes" "$(sha256sum "$work/clean.sfs" | cut -d' ' -f1)" "$same_before"
 
 echo "patch_sfs_atomic: $checks checks, $fails failed"
 [ "$fails" = 0 ] || exit 1

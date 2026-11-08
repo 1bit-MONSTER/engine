@@ -578,6 +578,19 @@ hrx_placement_verdict() {
 # os/v3/puppy/mkimage.sh - what a payload roll like c33 runs - writes neither, so a cut reusing a base SFS inherits whatever the
 # SFS was born with. This row used to `pass identity "$(tr '\n' ' ' < $ID)"`: it printed the lie and called it a PASS. It now
 # compares the claims with the shipped bytes. Pure, so --self-test drives it: <claimed engine> <actual launcher> <claimed libhsa> <actual libhsa>
+# Which file's bytes does an `engine_sha256` claim have to match? Two schemas, two layouts (engine#1481/#1541):
+#   * v3 (`container-build.sh`): the payload launcher at /opt/1bit-package/1bit/1bit;
+#   * mini (`os/mini/mkimage.sh`): the engine the image RUNS, /bin/1bit - a symlink to the image's own copy. Inside the
+#     booted image that symlink resolves to the image copy, which is why reading it here is right; on the build host the
+#     same expression escapes to the build tree, so the WRITER hashes $root$bin instead of hashing the symlink.
+# An empty first argument means "no checkable claim"; then the git short sha (if any) decides whether the row SKIPs.
+# Pure, so --self-test drives it: <claimed engine_sha256|""> <git sha|"">
+identity_launcher_path() {
+    [ -n "${1:-}" ] || return 0
+    if [ -n "${2:-}" ]; then printf '%s\n' "${MINI_LAUNCHER:-/bin/1bit}"
+    else printf '%s\n' "${PAYLOAD_DIR:-/opt/1bit-package}/1bit/1bit"; fi
+}
+
 identity_verdict() {
     _ce=${1:-} _ae=${2:-} _ch=${3:-} _ah=${4:-}
     case "$_ce" in ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s engine_sha256 is not a hex digest (%s) - malformed, not merely old' "${_ce:-empty}"; return 0 ;; esac
@@ -586,17 +599,6 @@ identity_verdict() {
     # absence: it is true only if nothing /etc/1bit/libhsa.env names on the loader path is actually there. A cut that writes `none`
     # while libhsa.env still names a runtime has written a false statement, and the board's u5-hrxenv row pins its comparison to this
     # same field, so a `none` there fails that row too - with a message that blames the runtime instead of the file.
-    case "$_ch" in
-        none)
-            if [ -n "$_ah" ]; then
-                printf 'FAIL the identity file says libhsa_sha256=none but the image loads a runtime libhsa.env names, sha256 %.16s - either write that sha or say why the two disagree' "$_ah"
-            else
-                printf 'PASS consistent: engine_sha256=%.16s is the shipped launcher and libhsa_sha256=none is true (libhsa.env names no runtime that exists here)' "$_ce"
-            fi
-            return 0 ;;
-        ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s libhsa_sha256 is neither a hex digest nor none (%s) - malformed, not merely old' "${_ch:-empty}"; return 0 ;;
-    esac
-    [ "${#_ch}" = 64 ] || { printf 'FAIL the identity file'"'"'s libhsa_sha256 is %s characters, not 64 - malformed, not merely old' "${_ch}"; return 0; }
     if [ -z "$_ae" ]; then
         printf 'FAIL the identity file claims engine_sha256=%.16s but there is no payload launcher to compare it with - an uncheckable claim is not evidence' "$_ce"
         return 0
@@ -609,6 +611,22 @@ identity_verdict() {
         printf 'FAIL the identity file says libhsa_sha256=%.16s but the shipped runtime is %.16s - the image would name a runtime it does not carry' "$_ch" "$_ah"
         return 0
     fi
+    case "$_ch" in
+        not-stated)   # the mini schema writes tag/lemonade/engine/engine_sha256/built and no libhsa_sha256 at all, so there is
+                      # nothing to check in that field. "Not stated" is not "none" (which claims the image ships no runtime) and
+                      # it is not malformed - but it is only acceptable when the engine half IS checkable, or the row would PASS
+                      # on a file with nothing in it.
+            printf 'PASS consistent: engine_sha256=%.16s is the shipped engine; this schema states no libhsa_sha256, so that half is not claimed' "$_ce"
+            return 0 ;;
+        none)
+            if [ -n "$_ah" ]; then
+                printf 'FAIL the identity file says libhsa_sha256=none but the image loads a runtime libhsa.env names, sha256 %.16s - either write that sha or say why the two disagree' "$_ah"
+            else
+                printf 'PASS consistent: engine_sha256=%.16s is the shipped launcher and libhsa_sha256=none is true (libhsa.env names no runtime that exists here)' "$_ce"
+            fi
+            return 0 ;;
+        ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s libhsa_sha256 is neither a hex digest nor none (%s) - malformed, not merely old' "${_ch:-empty}"; return 0 ;;
+    esac
     printf 'PASS consistent: engine_sha256=%.16s and libhsa_sha256=%.16s are the shipped bytes, read off the payload rather than out of the file' "$_ce" "$_ch"
 }
 
@@ -724,6 +742,15 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"          # nothing to check the claim against
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none '')"           # `none` and nothing on the loader path: consistent
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"        # `none` while the image loads a runtime: false statement
+    # `check` matches by PREFIX, so a path helper is asserted by giving the expected path as <want>
+    check PASS "$(identity_verdict aaaa$(printf 'a%.0s' {1..60}) aaaa$(printf 'a%.0s' {1..60}) not-stated '')"   # mini: no libhsa claim
+    check FAIL "$(identity_verdict '' '' not-stated '')"                                                          # nothing checkable: still a FAIL
+    check /opt/1bit-package/1bit/1bit "$(PAYLOAD_DIR= identity_launcher_path aaaa '')"      # v3: no git sha -> the payload launcher
+    check /bin/1bit "$(MINI_LAUNCHER= identity_launcher_path aaaa bbbb)"                   # mini: both keys -> /bin/1bit
+    check /x/1bit "$(MINI_LAUNCHER=/x/1bit identity_launcher_path aa bb)"                  # the seam is honoured
+    check /y/1bit/1bit "$(PAYLOAD_DIR=/y identity_launcher_path aa '')"                    # PAYLOAD_DIR is honoured
+    if [ -z "$(identity_launcher_path '' bbbb)" ]; then printf 'ok   no claim yields no path (the row SKIPs)\n'
+    else printf 'FAIL no claim should yield no path\n'; rc=1; fi
     check PASS "$(memlock_verdict unlimited lemond)"
     check FAIL "$(memlock_verdict 65536 lemond /etc/security/limits.d/99-amdnpu-memlock.conf)"   # a user's 99- winning over our 90-
     check FAIL "$(memlock_verdict 4294967296 1bit)"                                             # finite is not what the driver asks for
@@ -1772,19 +1799,30 @@ ID=${RELEASE_IDENTITY:-/etc/1bit/release-identity}
 if [ -f "$ID" ]; then
     _id_name=$(sed -n 's/^payload=//p' "$ID" 2>/dev/null | head -1)
     _id_built=$(sed -n 's/^built=//p' "$ID" 2>/dev/null | head -1)
-    _id_engine=$(sed -n 's/^engine_sha256 *= *//p' "$ID" 2>/dev/null | head -1)
+    # BOTH separators: os/v3/puppy/container-build.sh writes `engine_sha256=<sha>` (key=value) and os/mini/mkimage.sh
+    # writes `engine_sha256: <sha>` (key: value) beside its `engine:` git sha (engine#1541). Reading only `=` made a mini
+    # image's claim arrive empty, which sent it down the SKIP branch for ever - found by a fixture built the way the
+    # writer writes it, not the way the reader expected it.
+    _id_engine=$(sed -n 's/^engine_sha256 *[=:] *//p' "$ID" 2>/dev/null | head -1 | tr -d '[:space:]')
     # Two schemas write this file and only one of them is checkable against a payload (engine#1481): os/v3/puppy/
     # container-build.sh writes `engine_sha256=<sha256 of the launcher>` (key=value), while os/mini/mkimage.sh writes
     # `engine: <git short sha>` (key: value). Without this branch the mini schema reaches identity_verdict with an empty
     # claim and reds as "malformed, not merely old" - a false red on every mini image. A git short sha is not a file
     # hash, so the honest answer there is a SKIP that says why, not a FAIL and not a pass by absence.
     _id_gitsha=$(sed -n 's/^engine: *//p' "$ID" 2>/dev/null | head -1)
-    _id_hsasha=$(sed -n 's/^libhsa_sha256=//p' "$ID" 2>/dev/null | head -1)
-    _id_launcher="${PAYLOAD_DIR:-/opt/1bit-package}/1bit/1bit"
-    _id_act_engine=; [ -f "$_id_launcher" ] && _id_act_engine=$(sha256sum "$_id_launcher" 2>/dev/null | cut -d' ' -f1)
+    _id_hsasha=$(sed -n 's/^libhsa_sha256 *[=:] *//p' "$ID" 2>/dev/null | head -1 | tr -d '[:space:]')
+    # the mini schema has no libhsa field: say "not stated" rather than letting the strict verdict call it malformed
+    [ -z "$_id_hsasha" ] && [ -n "${_id_gitsha:-}" ] && _id_hsasha=not-stated
+    _id_launcher=$(identity_launcher_path "${_id_engine:-}" "${_id_gitsha:-}")
+    _id_act_engine=
+    # sha256sum follows the symlink, so a mini image's /bin/1bit is hashed as the image copy it points at - which is the
+    # file the writer hashed ($root$bin). The resolved path goes into the message, because "/bin/1bit" and the file it
+    # names are different facts on a build host.
+    [ -n "$_id_launcher" ] && [ -f "$_id_launcher" ] && _id_act_engine=$(sha256sum "$_id_launcher" 2>/dev/null | cut -d' ' -f1)
+    _id_where=${_id_launcher:+$(readlink -f "$_id_launcher" 2>/dev/null || printf '%s' "$_id_launcher")}
     _id_hsadir=$(sed -n 's/^\(export \)\{0,1\}LD_LIBRARY_PATH=//p' "${LIBHSA_ENV:-/etc/1bit/libhsa.env}" 2>/dev/null | sed 's/\$.*//' | cut -d: -f1)
     _id_act_hsasha=; [ -n "$_id_hsadir" ] && [ -f "${_id_hsadir%/}/libhsa-runtime64.so.1" ] && _id_act_hsasha=$(sha256sum "${_id_hsadir%/}/libhsa-runtime64.so.1" 2>/dev/null | cut -d' ' -f1)
-    _idinfo="payload=${_id_name:-?} built=${_id_built:-?}"
+    _idinfo="payload=${_id_name:-?} built=${_id_built:-?}${_id_where:+ launcher=${_id_where}}"
     if [ -z "$_id_engine" ] && [ -n "$_id_gitsha" ]; then
         skip identity "this image's identity is the mini schema: it records engine: $_id_gitsha, a git short sha rather than the launcher's sha256, so the payload it carries cannot be checked from it (engine#1481)"
     else

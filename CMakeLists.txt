@@ -1465,10 +1465,10 @@ endif()
 # engine #1485: a script that runs `serve --port 0` no longer picks a port and releases it, so there is no window to
 # collide in and nothing for the lock to prevent - those are gone from this list (watchdog_serve, metrics_serve,
 # parallel_args, recipes_route, greedy_shortcut, prism_route, hrx_runtime_route, laya_gguf_route, mem_admit_route,
-# serve_e2e_<dev>), and the list now names exactly the
+# npu_repack_path, serve_e2e_<dev>, laya_route_e2e, laya_models_e2e), and the list now names exactly the
 # tests that still choose their port up front. bench_selftest stays: tools/bench.py picks its own free_port under it.
 set(_onebit_route_tests
-    smoke_serve print_backend lemonade_hrx template_pin device_route npu_repack_path pm_route bench_selftest
+    smoke_serve print_backend lemonade_hrx template_pin device_route pm_route bench_selftest
     hrx_cwsr_route hybrid_route hybrid_kvshare_route)
 # Tests that only exist for some configurations (a model was passed, a device is built in).
 # serve_e2e_<dev>, laya_route_e2e and laya_models_e2e left this list with engine #1485: they run `serve --port 0`

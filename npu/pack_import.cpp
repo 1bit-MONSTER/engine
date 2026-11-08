@@ -1633,8 +1633,15 @@ Plan plan(const std::string& pack_dir) {
             for (const char* nm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
                 auto x = make("model.layers." + std::to_string(L) + "." + nm, norm_source, "BF16", {d.head_dim});
                 if (graph_qk_norm) {
-                    const std::string leaf = std::string(nm).substr(11, 1);   // "q" or "k"
-                    x.source = "graph:model.layers." + std::to_string(L) + ".attn." + leaf + "_norm.layernorm.weight";
+                    // Derive the leaf from the name rather than by index arithmetic: "self_attn." is TEN characters,
+                    // and substr(11, 1) here produced '_', so the source named `…attn._norm.layernorm.weight`, which
+                    // exists in no pack. Nothing failed, because the import reads the norms by its own correct name --
+                    // the manifest simply recorded a source that is not there, which is the "compiles, never runs"
+                    // shape and exactly the kind of label a later reader would trust. A substring test cannot be off
+                    // by one.
+                    const bool is_q = std::string(nm).find("q_norm") != std::string::npos;
+                    x.source = "graph:model.layers." + std::to_string(L) + ".attn." +
+                               (is_q ? "q_norm" : "k_norm") + ".layernorm.weight";
                     x.refusal.clear();
                 }
                 p.tensors.push_back(std::move(x));

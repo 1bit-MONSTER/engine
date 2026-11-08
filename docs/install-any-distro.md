@@ -408,9 +408,13 @@ registry model, since this Lemonade version has no local-file registration):
 ## What has been measured where
 
 The row counts below move whenever a row is added, and they are the numbers a reader reproduces by running
-`scripts/pkg-proof.sh` themselves. **Last reconciled 2026-11-08 at `421487af`** by running all four families
-in the same session — deb 34, Fedora 32, openSUSE 32, Arch 32 — after the collision rows (#1495) and the
-headers acceptance row (#1514) landed. If you add a row, re-run and update all four.
+`scripts/pkg-proof.sh` themselves. **Last reconciled 2026-11-08 at `345deef7` (on `main`)**: deb 34 and Arch
+32 were re-run at that commit; Fedora 32 and openSUSE 32 were measured earlier the same day on the same
+harness — the script at `345deef7` is `e351cce4`'s (#1514), which contains #1495's collision rows and
+#1511's `mkdir -p` guard, so all four numbers come from one harness. Cite a commit **on `main`**, never a PR
+head: an earlier version of this note cited `421487af`, which is `refs/pull/1514/head` and predates #1511 —
+a harness in which the Arch collision rows could fail for want of a directory. If you add a row, re-run and
+update all four.
 
 | claim | where | result |
 |---|---|---|

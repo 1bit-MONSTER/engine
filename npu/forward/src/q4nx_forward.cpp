@@ -3025,6 +3025,11 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
 // then the f32 signs those offsets index (the GGUF's prism.hadamard.sign_widths/sign_values).
 bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int start_pos,
                                       std::vector<float>& logits) {
+    return step_batch_embeds(embeds, std::vector<int>(), start_pos, logits);
+}
+
+bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, const std::vector<int>& position_ids,
+                                      int start_pos, std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
     const size_t H = (size_t)c_.H;
     if (H == 0 || embeds.empty() || embeds.size() % H != 0) {
@@ -3035,15 +3040,35 @@ bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int sta
     for (float v : embeds)
         if (!std::isfinite(v)) { err_ = "step_batch_embeds: a row holds a non-finite value"; return false; }
     const int rows = int(embeds.size() / H);
+    if (!position_ids.empty()) {
+        if (!sem_.mrope) {
+            err_ = "step_batch_embeds: position_ids given but this pack does not declare interleaved MRoPE";
+            return false;
+        }
+        if (sem_.n_mrope_section < 3) {
+            err_ = "step_batch_embeds: the pack declares MRoPE but no mrope_section, so the axis layout is "
+                   "unknown; refusing rather than guessing which frequencies are (t, h, w)";
+            return false;
+        }
+        if (position_ids.size() != size_t(3) * size_t(rows)) {
+            err_ = "step_batch_embeds: position_ids is " + std::to_string(position_ids.size()) + " values, expected 3 x " +
+                   std::to_string(rows);
+            return false;
+        }
+    }
     // The body indexes tokens[m] only when nothing is injected, but it still needs the row count and the guards
     // above it read tokens; a zero vector of the right length keeps every check honest (0 is a valid id) while
     // the fill itself takes the injected rows.
     const std::vector<int> placeholder(size_t(rows), 0);
     struct Restore {
         const float*& p;
-        ~Restore() { p = nullptr; }
-    } restore{inject_embeds_};
+        const int*& q;
+        int& n;
+        ~Restore() { p = nullptr; q = nullptr; n = 0; }
+    } restore{inject_embeds_, pos3_, pos3_rows_};
     inject_embeds_ = embeds.data();
+    pos3_ = position_ids.empty() ? nullptr : position_ids.data();
+    pos3_rows_ = rows;
     return step_batch(placeholder, start_pos, logits);
 }
 
@@ -3328,7 +3353,16 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                     in = &qkv_use;
                 }
                 LhScope _t_attn(LH_ATTN);
-                if (!attention(*in, start_pos + m, dst ? ctx_row : ctx_scratch, l_hd, l_nkv, l_theta,
+                // pos3_ is plane-major (3 x rows): row m's three positions are three strided reads, not a pointer
+                // offset, so they are gathered here into the trio attention() expects.
+                int trio[3] = {0, 0, 0};
+                if (pos3_) {
+                    trio[0] = pos3_[m];
+                    trio[1] = pos3_[pos3_rows_ + m];
+                    trio[2] = pos3_[2 * pos3_rows_ + m];
+                }
+                if (!attention(*in, start_pos + m, pos3_ ? trio : nullptr, dst ? ctx_row : ctx_scratch,
+                               l_hd, l_nkv, l_theta,
                                l_rot, l_prop, l_win, l, append, kvlen)) {
                     err_ = "attention failed"; return false;
                 }
@@ -4011,7 +4045,7 @@ bool Q4nxNpuForward::dense_mlp(int l, const std::vector<float>& xn, std::vector<
     return true;
 }
 
-bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
+bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int* pos3,
                                std::vector<float>& ctx, int head_dim,
                                int n_kv_heads, float theta, int rotary_dim,
                                bool proportional, int window,
@@ -4088,7 +4122,10 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
                 // nothing per token.  No-op unless the config declares rope_type "llama3".
                 inv = q4nx_rope_llama3_inv_freq(inv, &rope_llama3_);
             }
-            const double ang = (double)pos * inv;
+            // Interleaved MRoPE: each rotary frequency rotates by its own axis's position (t, h or w). With the
+            // three planes equal this is exactly `pos * inv`, which is why text-only prompts are bit-identical
+            // to plain RoPE (measured: 0 angle difference over positions 0..262143, engine#1311/TQVL).
+            const double ang = (double)(pos3 ? pos3[mrope_plane(i)] : pos) * inv;
             cos_[i] = (float)std::cos(ang);
             sin_[i] = (float)std::sin(ang);
         }
@@ -4413,7 +4450,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             }
             {
             LhScope _tlh(LH_ATTN);
-            if (!attention(qkv_use, pos, ctx, l_hd, l_nkv_heads, l_theta, l_rot, l_prop,
+            if (!attention(qkv_use, pos, nullptr, ctx, l_hd, l_nkv_heads, l_theta, l_rot, l_prop,
                            l_win, kv_layer, !kv_shared)) {
                 err_ = "attention failed";
                 return false;

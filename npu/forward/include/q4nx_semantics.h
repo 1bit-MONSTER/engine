@@ -95,6 +95,12 @@ typedef struct {
     /* Interleaved/multimodal RoPE variant that this forward does not implement.
      * Source: rope_parameters.mrope_interleaved (or rope_type != "default"). */
     int mrope;
+    /* MVROPE sections: how many of the rotary frequencies belong to each of the (t, h, w) axes.  Read from
+     * rope_scaling.mrope_section (Hugging Face) or rope_parameters.mrope_section (OGA/Qwen3.5); zeros and
+     * n_mrope_section == 0 mean "declared mrope without sections", which a consumer must refuse rather than
+     * guess a layout for. */
+    int mrope_section[3];
+    int n_mrope_section;
     /* RoPE is configured PER LAYER TYPE (Gemma4 nests rope_parameters.
      * full_attention and .sliding_attention with different thetas and types).
      * Source: presence of rope_parameters.{full,sliding}_attention sub-blocks. */

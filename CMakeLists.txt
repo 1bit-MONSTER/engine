@@ -1267,6 +1267,12 @@ if(ONEBIT_NPU)
 if(ONEBIT_NPU)
     # The decoder's precomputed-embedding entry point (npu/forward/embeds_equiv_probe.cpp): rows built from the
     # model's own table must give byte-identical logits to the token-id path, on the host and on the array.
+    # The three-plane (MRoPE) position input: equal planes must be byte-identical to plain RoPE, different planes
+    # must move the logits (npu/forward/mrope_planes_probe.cpp).
+    add_executable(mrope_planes_probe npu/forward/mrope_planes_probe.cpp)
+    target_include_directories(mrope_planes_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
+        ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)
+    target_link_libraries(mrope_planes_probe PRIVATE onebit_npu_forward onebit_npu_rt)
     add_executable(embeds_equiv_probe npu/forward/embeds_equiv_probe.cpp)
     target_include_directories(embeds_equiv_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
         ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)

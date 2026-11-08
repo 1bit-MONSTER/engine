@@ -148,6 +148,14 @@ public:
     // The per-token fallback path (MLA/MoE/GDN/... models) needs ids and is refused by name.
     bool step_batch_embeds(const std::vector<float>& embeds, int start_pos,
                            std::vector<float>& logits);
+    // The same, with the three position planes an interleaved-MRoPE pack needs (engine#1311/TQVL, plan P4's
+    // `rope.planes`).  `position_ids` is 3 x rows, plane-major (t, then h, then w) — exactly the layout the
+    // reference's `get_rope_index` produces and AMD's `text.onnx` takes.  Empty means "the usual start_pos + row".
+    // Text rows have all three planes equal, which is bit-identical to plain RoPE (measured, 0 difference over
+    // positions 0..262143); image rows differ per axis and that difference is the whole point.  A pack that
+    // declares mrope without sections is refused by name.
+    bool step_batch_embeds(const std::vector<float>& embeds, const std::vector<int>& position_ids, int start_pos,
+                           std::vector<float>& logits);
 
     // The same batched pass, but returning the logits of EVERY row (M x NV, row-major) instead of only
     // the last one.  Speculative decoding needs them: a draft token is accepted only if the model's own
@@ -231,7 +239,7 @@ private:
     // The default for the above when NPU_FFN_CACHE says nothing: on for a GDN
     // model on the NPU route, with a size guard.  See the definition.
     bool ffn_cache_default() const;
-    bool attention(const std::vector<float>& qkv, int pos, std::vector<float>& ctx,
+    bool attention(const std::vector<float>& qkv, int pos, const int* pos3, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
                    bool proportional, int window, int kv_layer, bool append_kv,
                    int kv_len = 0);
@@ -354,6 +362,15 @@ private:
     std::vector<uint16_t> embed_;                 // [NV*H] bf16
     // Set only while step_batch_embeds() runs: the row source for the batched body's embedding fill.
     const float* inject_embeds_ = nullptr;
+    // Set only while step_batch_embeds(..., position_ids, ...) runs: 3 x rows, plane-major, or null.
+    const int* pos3_ = nullptr;
+    int pos3_rows_ = 0;
+    // Which plane a rotary frequency belongs to under interleaved MRoPE (semantics' mrope_section, contiguous).
+    int mrope_plane(int freq) const {
+        if (sem_.n_mrope_section < 3) return 0;
+        const int a = sem_.mrope_section[0], b = sem_.mrope_section[0] + sem_.mrope_section[1];
+        return freq < a ? 0 : (freq < b ? 1 : 2);
+    }
     // Some models store the embedding QUANTIZED (Gemma4-E2B/E4B: dtype I8), and
     // reading it as bf16 yields ~zero - which invalidated the whole forward and
     // the tied LM head (all-zero logits).  When the dtype is not BF16 the

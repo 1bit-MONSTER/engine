@@ -88,8 +88,9 @@ link_target_layer "$DATA" 1bit-alt
 [ "$(readlink "$DATA/1bit-alt/upup64rsave")" = ../1bit/upup64rsave ]; check "and the new link points at the shared layer" $?
 
 # 6. a layer with THIS machine's NAME but a DIFFERENT directory is another machine's state, and must be refused.
-# `-ef` compares device+inode, so "same name" cannot pass for "same layer" - the case a name-only comparison would
-# silently accept (pi-os3's correction on this decision, 2026-11-07).
+# Regression guard for the identity test: `-ef` compares device+inode, so "same name" cannot pass for "same layer".
+# (The older name-based form refused this too - it required the slot to match as well - so this arm guards the property,
+# it does not separate the two implementations; measured by the #1385 review.)
 fresh; mkdir -p "$DATA/1bit-alt/upup64rsave/upper/root"; echo other > "$DATA/1bit-alt/upup64rsave/upper/root/marker"
 active=1bit
 find_save_layer "$DATA" "$active"

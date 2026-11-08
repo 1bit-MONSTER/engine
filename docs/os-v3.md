@@ -121,15 +121,18 @@ running, what each holds, and which entry GRUB boots.
 update (running `/1bit-alt`, whose link points at `/1bit`) the second one targets `/1bit` — the slot that *holds* the
 layer. That directory is this machine's own state: it is kept as it is and not re-linked. Only a real layer that is
 **not** the running one (another machine's, in the target slot) is refused, because two layers cannot be merged by
-an update. "The running one" is decided by **file**, not by name (`-ef`, device and inode): a hand-copied or restored
-`<prefix>save` carries this machine's name and is a different directory, and refusing exactly that is what the guard is
-for. The decision is a set of functions in `1bit-update` that `tests/one_bit_update_slots_test.sh` runs over fake data
-partitions on every CI run (updates 1, 2 and 3; a foreign layer; a same-named foreign layer; a stale link), without root
-or a VM.
+an update. "The running one" is decided by **file** (`-ef`, device and inode), which says "the directory the running
+slot reaches" as one test instead of two — a clarification rather than a hole being closed: the slot name had to match as
+well, and a foreign layer is by definition in another slot, so the name form refused it too (pi-os3 raised the case, the
+#1385 review measured that the older form already refused it; the test arm is the regression guard either way). The
+decision is a set of functions in `1bit-update` that `tests/one_bit_update_slots_test.sh` runs over fake data partitions
+on every CI run (updates 1, 2 and 3; a foreign layer; a same-named foreign layer; a stale link), without root or a VM.
 
 An update also refuses an unhashed release unless `--no-verify` says otherwise — this path replaces the appliance the
-machine boots, so a `SHA256SUMS` is the default requirement — and it checks the ESP has room for the `grub.cfg` rewrite
-before touching it, because the ESP is the one place a half-write is not recoverable without a rescue stick.
+machine boots, so a `SHA256SUMS` is the default requirement — and the **image form verifies against the image's own**
+`/1bit/SHA256SUMS`, which `mkimage.sh` writes from the bytes it just copied (before that, every weekly image would have
+needed `--no-verify`). The ESP's free space is checked **before** the copy, next to the data partition's own check,
+because the ESP is the one place a half-write is not recoverable without a rescue stick.
 
 Which is not the same as package updates: `apt` (and the appliance's own payload) update **inside** the running set and
 land in the save layer. An OS change — kernel, initrd, SFS — is this, and it is the only thing that writes a slot.

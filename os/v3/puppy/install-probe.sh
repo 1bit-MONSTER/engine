@@ -515,13 +515,24 @@ if assert_pupsfs:
             if self.until(b"Press enter to boot the selected OS", 240) is None:
                 return False
             time.sleep(1.0)
-            self.s.sendall(b"\x1b[B" * 3 + b"\r")
-            for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
-                if self.until(token, 150) is not None:
-                    self.buf = b""
-                    self.s.sendall(b"\n")
-                    time.sleep(1)
-                    return True
+            # an arrow key CANCELS GRUB's countdown, so an Enter lost while the menu is still drawing leaves the
+            # machine waiting at it for ever (measured in update-gate.sh, and again here): pause, press it twice, and
+            # give it one more try before reporting a machine that "did not come back"
+            for attempt in (1, 2):
+                self.s.sendall(b"\x1b[B" * 3)
+                time.sleep(0.5)
+                self.s.sendall(b"\r")
+                time.sleep(0.5)
+                self.s.sendall(b"\r")
+                for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
+                    if self.until(token, 60 if attempt == 1 else 150) is not None:
+                        self.buf = b""
+                        self.s.sendall(b"\n")
+                        time.sleep(1)
+                        return True
+                if attempt == 1:
+                    print("INFO reboot         nothing booted after the first Enter; pressing it again at the menu",
+                          flush=True)
             return False
 
         def close(self):

@@ -91,10 +91,11 @@ prepare_target_layer() {
     for s in "$1/$2"/*save*; do
         [ -e "$s" ] || [ -L "$s" ] || continue
         if [ -d "$s" ] && [ ! -L "$s" ]; then
-            # THE SAME FILE, not the same name: a hand-copied or restored <prefix>save in the target carries this
-            # machine's name and is a different directory, and refusing exactly that is what this guard is for. `-ef`
-            # compares device+inode, so the second update's own layer (the directory the running slot reaches) passes
-            # and a same-named stranger does not (pi-os3's correction on this decision).
+            # THE SAME FILE, stated directly: `-ef` is device+inode, so "this is the layer the running slot reaches"
+            # is one test and not two (slot name and directory name). It is a clarification, not a hole being closed:
+            # the name form also refused a same-named stranger, because it required the slot to match as well and a
+            # foreign layer is by definition in another slot (pi-os3 raised the case, the #1385 review measured that
+            # the old form already refused it - the test arm below is the regression guard either way).
             [ "$s" -ef "$1/$save_slot/$savename" ] && continue
             echo "/$2 already holds a save layer ($(basename "$s")): two layers cannot be merged by an update - pick the slot by hand if that is really what you want"
             return 1
@@ -278,13 +279,20 @@ if [ -s "$src/SHA256SUMS" ]; then
         [ -n "$novfy" ] || die "$src/SHA256SUMS has no line for any file of this set: nothing proves the bytes are the release's own (this path replaces the appliance the machine boots; use --no-verify only if you trust the copy)"
     fi
 else
-    [ -n "$novfy" ] || die "$src carries no SHA256SUMS: nothing proves the bytes are the release's own. This path replaces the appliance the machine boots, so pass --no-verify only if you trust the copy (a stick's /data carries SHA256SUMS at its root)"
+    [ -n "$novfy" ] || die "$src carries no SHA256SUMS: nothing proves the bytes are the release's own. Every 1bit OS image writes one beside the set (engine#1385: mkimage does), so this is a hand-made release directory - pass --no-verify only if you trust the copy"
 fi
 
 # space: the new set, with room for the checksums and the GRUB rewrite
 szk=$(du -sk "$src" | cut -f 1)
 freek=$(df -Pk "$DATA" | awk 'NR == 2 { print $4 }')
 [ "$freek" -gt $((szk + 262144)) ] || die "only ${freek} KiB free on $DATA, the set needs ${szk} KiB plus 256 MiB of slack"
+# and the ESP, where the two GRUB entries go: it is the one place a half-write is not recoverable without a rescue
+# stick, so it is checked up front rather than after the copy has already run (the #1385 review: a full ESP used to be
+# refused after ~1.5 GB had been written into the other slot)
+mount_esp || fail "cannot mount the ESP $esp"
+espfree=$(df -Pk "$esp_mount" | awk 'NR == 2 { print $4 }')
+[ "${espfree:-0}" -gt 1024 ] || { unmount_esp; die "only ${espfree:-0} KiB free on the ESP $esp: refusing to write there"; }
+unmount_esp
 
 # a slot that already owns a save layer is another machine's state, not something to overwrite - unless it is the
 # slot holding THIS machine's shared layer, which is every second update (engine#1334 review)
@@ -310,9 +318,7 @@ say "   $(ls "$DATA/$target"/*.sfs | wc -l) SFS, kernel and initrd in /$target; 
 # ── GRUB: the other slot needs its entries, and they become the default ─────────────────────────────────────
 mount_esp || fail "cannot mount the ESP $esp"
 [ -f "$cfg" ] || { unmount_esp; fail "no EFI/BOOT/grub.cfg on $esp"; }
-# the ESP is the one place a half-write is not recoverable without a rescue stick, so it gets its own check
-espfree=$(df -Pk "$esp_mount" | awk 'NR == 2 { print $4 }')
-[ "${espfree:-0}" -gt 1024 ] || { unmount_esp; die "only ${espfree:-0} KiB free on the ESP $esp: refusing to rewrite grub.cfg there"; }
+# (the ESP's free space is checked before the copy, next to the data partition's own check)
 cp -p "$cfg" "$cfg.pre-1bit-update" 2> /dev/null || { unmount_esp; fail "cannot back up $cfg"; }
 tmpl=$(awk -v slot="$active" '$1 == "linux" && $0 ~ ("psubdir=" slot "([[:space:]]|$)") && $0 !~ /1bit\.serial=1/ {
                                   sub(/^[[:space:]]*linux[[:space:]]+[^[:space:]]+[[:space:]]+/, ""); print; exit }' "$cfg")

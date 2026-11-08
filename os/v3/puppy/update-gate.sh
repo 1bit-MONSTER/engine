@@ -132,9 +132,11 @@ try:
     mount_part("2", mnt + "/data")
     data = mnt + "/data"
     src = os.path.join(data, "1bit")
+    global sfsname
     sfs = [f for f in sorted(os.listdir(src)) if f.endswith(".sfs") and f.startswith("puppy_")]
     if not sfs:
         sys.exit("update-gate: no puppy SFS in the installed /1bit")
+    sfsname = sfs[0]
     base = os.path.join(work, "base-" + sfs[0])
     if not os.path.exists(base):
         sdo("cp", os.path.join(src, sfs[0]), base)
@@ -166,6 +168,18 @@ try:
 
     src1 = build_release("set-alt", "this file exists only in the first updated appliance set\n")
     src2 = build_release("set-alt2", "this file exists only in the second updated appliance set\n")
+    # a THIRD set, as one file on /data: the guest builds an .img around it for the image-form update (the #1385 review:
+    # "add one gate row that updates from an .img the way a user would" - and the image form is where the hashes come
+    # from the image's own SHA256SUMS, which is the fix that review asked for)
+    marker3 = os.path.join(work, "set-alt3.marker")
+    open(marker3, "w").write("this file exists only in the image-updated appliance set\n")
+    patched3 = os.path.join(work, "set-alt3.sfs")
+    if not os.path.exists(patched3):
+        man3 = os.path.join(work, "manifest-set-alt3")
+        open(man3, "w").write("etc/1bit/set-alt3\t%s\t0644\n" % marker3)
+        sdo("bash", os.path.join(tree, "os/v3/puppy/patch-sfs.sh"), "--manifest", man3, base, patched3)
+    sdo("cp", "-f", patched3, os.path.join(data, "set-alt3.sfs"))
+    say("INFO", "release", "%s/set-alt3.sfs: the set the third (image-form) update will carry" % data)
 finally:
     subprocess.run(["sudo", "-n", "umount", mnt + "/data"], capture_output=True)
     for dev in loops:
@@ -364,7 +378,24 @@ try:
                     % (st3[:160] or "<no answer>")); ok = False
             else:
                 say("PASS", "status3", "GRUB default is index 0, the headless entry of the other slot")
-            v.val("RM2", "rm -rf /data/update-set-alt2; echo gone")
+            # ---- the IMAGE form: build a release image in the guest out of the second release's files around the third
+            # SFS, so the last boot can update the way a user does - from an .img, with the hashes read out of the
+            # image's own /1bit/SHA256SUMS (mkimage writes that now; without it this form needed --no-verify)
+            mk = ("rm -rf /data/imgstage /data/update.img; mkdir -p /data/imgstage/1bit; "
+                  "cp -f /data/update-set-alt2/vmlinuz /data/update-set-alt2/initrd.gz /data/imgstage/1bit/; "
+                  "for f in /data/update-set-alt2/*.sfs; do b=$(basename \"$f\"); "
+                  "[ \"$b\" = \"" + sfsname + "\" ] && continue; cp -f \"$f\" /data/imgstage/1bit/; done; "
+                  "cp -f /data/set-alt3.sfs /data/imgstage/1bit/" + sfsname + "; "
+                  "( cd /data/imgstage/1bit && sha256sum vmlinuz initrd.gz ./*.sfs > SHA256SUMS ); "
+                  "truncate -s 1700M /data/update.img; "
+                  "printf 'label: gpt\\nstart=2048, type=L, name=\"1BIT-DATA\"\\n' | sfdisk -q /data/update.img; "
+                  "mkfs.ext4 -q -F -L 1BIT-DATA -d /data/imgstage /data/update.img 1664M; "
+                  "rm -rf /data/imgstage; echo image-ok $(stat -c%s /data/update.img)")
+            img = v.val("MKIMG", mk, timeout=1800)
+            say("INFO", "mkimg", (img or "<no answer>")[-120:])
+            if "image-ok" not in (img or ""):
+                say("FAIL", "mkimg", "could not build the test image: %s" % ((img or "")[-200:] or "<no output>")); ok = False
+            v.val("RM2", "rm -rf /data/update-set-alt2 /data/set-alt3.sfs; echo gone")
 
             # ---- boot 3 (/1bit again): the SECOND update's set, the boot-1 marker still there, and no link nested
             # inside the layer (the failure mode the fix exists for)
@@ -436,6 +467,40 @@ try:
                     else:
                         say("PASS", "boot-old", "rolled back to the first updated set on psubdir=1bit-alt, PUPMODE=12, "
                                                 "the machine's state unchanged - both sets still on the disk")
+
+                    # ---- image form: the same command a user runs, against an .img, with the hashes taken from the
+                    # image's own /1bit/SHA256SUMS (mkimage writes it now; before that every image needed --no-verify)
+                    upi = v.val("UPDATE3", "1bit-update /data/update.img 2>&1 | tr '\\n' '; '", timeout=2400)
+                    say("INFO", "update3", upi[:900])
+                    if "UPDATED" not in upi:
+                        say("FAIL", "update3", "the image-form update failed: %s" % (upi[-300:] or "<no output>")); ok = False
+                    elif "1bit/SHA256SUMS" not in upi:
+                        say("FAIL", "update3", "the image-form update did not verify against the image's own "
+                              "SHA256SUMS: %s" % upi[-400:]); ok = False
+                    else:
+                        say("PASS", "update3", "an .img updated the machine, with the set's bytes verified against the "
+                                               "image's own SHA256SUMS")
+                    if not v.reboot(downs=3):
+                        say("FAIL", "boot-img", "the machine did not come back after the image-form update"); ok = False
+                        v.close()
+                    else:
+                        # ---- boot 5: the set the image carried
+                        sub5 = v.val("SUB", "tr ' ' '\\n' < /proc/cmdline | sed -n 's/^psubdir=//p'")
+                        pm5 = v.val("PM", "sed -n 's/^PUPMODE=//p' /etc/rc.d/PUPSTATE | head -1")
+                        m3 = v.val("MARK3", "cat /etc/1bit/set-alt3 2>&1 | head -1")
+                        pre5 = v.val("PRE", "cat /root/pre-update-marker 2>&1 | head -1")
+                        say("INFO", "boot-img", "psubdir=%s PUPMODE=%s | set-alt3: %s | marker: %s"
+                            % (sub5, pm5, m3[:44], pre5[:40]))
+                        if sub5 != "1bit" or pm5 != "12":
+                            say("FAIL", "boot-img", "after the image-form update the machine is psubdir=%s PUPMODE=%s"
+                                % (sub5 or "<none>", pm5 or "<unread>")); ok = False
+                        elif "only in the image-updated" not in m3:
+                            say("FAIL", "boot-img", "the image's set is not running (set-alt3: %s)" % (m3[:60] or "<none>")); ok = False
+                        elif pre5 != "712-pre-update":
+                            say("FAIL", "boot-img", "the boot-1 marker is gone after the image-form update"); ok = False
+                        else:
+                            say("PASS", "boot-img", "the image's set booted: psubdir=1bit, PUPMODE=12, its marker "
+                                                    "present, the machine's state intact")
 finally:
     v.close()
 

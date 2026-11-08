@@ -25,13 +25,15 @@ set -uo pipefail
 
 bin=${1:?usage: smoke_serve.sh path/to/1bit}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"     # serve_port_wait: read back the port serve bound instead of guessing one (engine #1485)
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 export FAKE_BACKEND_EVENTS="$scratch/events"
-"$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port" --alias smoke-model \
+"$bin" serve -m "$scratch/tiny.gguf" --device cpu --port 0 --alias smoke-model \
     --llama-server "$here/fake_backend.py" >"$scratch/serve.log" 2>&1 &
 pid=$!
+port=$(serve_port_wait "$scratch/serve.log" "$pid") || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
 epid=
 cleanup() {
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
@@ -89,11 +91,12 @@ if [ "$(uname)" = Linux ]; then
     # A backend that exits on its own (a crash): serve reaps it where it noticed, says how it
     # ended, and its stop path neither waits the SIGTERM grace for the dead pid nor signals it
     # (the grace is set to 20 s here so a regression shows as a slow exit, not a hang).
-    port3=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
     start=$(date +%s)
-    ONEBIT_BACKEND_STOP_GRACE_S=20 timeout 60 "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port3" \
+    ONEBIT_BACKEND_STOP_GRACE_S=20 timeout 60 "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port 0 \
         --alias smoke-model --llama-server "$here/fake_backend.py" >"$scratch/exit.log" 2>&1 &
     epid=$!
+    # the timeout wrapper is the pid that dies with serve, so it is what serve_port_wait watches
+    port3=$(serve_port_wait "$scratch/exit.log" "$epid") || { echo "FAIL serve never reported a port (exit test)"; cat "$scratch/exit.log"; exit 1; }
     for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port3/health")" = 200 ] && break; sleep 0.1; done
     curl -s -o /dev/null "http://127.0.0.1:$port3/v1/chat/completions" -H 'Content-Type: application/json' \
         -d '{"model": "smoke-model", "fake_exit": 3, "messages": [{"role": "user", "content": "hi"}]}'

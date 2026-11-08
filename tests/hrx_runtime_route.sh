@@ -64,17 +64,12 @@ chmod +x "$scratch/backend.py"
 
 run() {  # <record> [serve args]: the backend's env, as JSON, in <record>; serve's log in <record>.log
     local port
-    port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    RECORD="$1" "$bin" serve -m "$scratch/plain.gguf" --port "$port" --llama-server "$scratch/backend.py" \
+    # --port 0: the kernel picks and serve reports the port it bound, so nothing here picks a port and releases
+    # it before serve binds (engine #1444/#1485). A bind failure can no longer be our own port collision.
+    RECORD="$1" "$bin" serve -m "$scratch/plain.gguf" --port 0 --llama-server "$scratch/backend.py" \
         --no-mem-check "${@:2}" >"$1.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do [ -s "$1" ] && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-    # A server that never came up because it could not bind is a port collision, not a defect in
-    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
-    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$1.log"; then
-        echo "FAIL: hrx_runtime_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$1.log" | head -1))"
-        exit 1
-    fi
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 env_is() { [ "$(cat "$1" 2>/dev/null)" = "$2" ]; }

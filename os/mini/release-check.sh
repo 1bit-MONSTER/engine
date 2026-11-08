@@ -673,7 +673,7 @@ payload_name_verdict() {
     case "$_n" in
         '')      printf 'FAIL the identity file states no payload= at all, so nothing in the image says which payload it carries' ;;
         unknown) printf 'FAIL the identity file states payload=unknown - the cut did not pass PAYLOAD_NAME (os/v3/puppy/container-build.sh:349 writes %%s), so the name is unset while the engine_sha256 beside it is computed and correct: a half-true identity' '${PAYLOAD_NAME:-unknown}' ;;
-        *)       printf 'PASS the identity file names the payload it carries (%s); that name is DECLARED by the cut, not checked against the bytes - this row catches "not stated", and "stated wrongly" needs an authority the image does not carry (engine#1557)' "$_n" ;;
+        *)       printf 'PASS the identity file names the payload it carries (%s); that name is DECLARED by the cut, not checked against the bytes - this row catches "not stated", NOT "stated wrongly": the c26 incident (payload=lemonade-onebit-rc-2026-11-05-c26c in c32 and c33) passes here, because it is a plausible non-empty name, and "stated wrongly" needs an authority the image does not carry (engine#1557)' "$_n" ;;
     esac
 }
 
@@ -786,6 +786,7 @@ if [ "${1:-}" = --self-test ]; then
     check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33)"
     check FAIL "$(payload_name_verdict unknown)"          # the PAYLOAD_NAME-unset shape: half-true identity
     check FAIL "$(payload_name_verdict '')"               # nothing stated
+    check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26c)"   # the INCIDENT string still passes: this row is not its gate
     if printf '%s' "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33)" | grep -q 'DECLARED'; then
         printf 'ok   the PASS line says the name is declared, not checked\n'
     else printf 'FAIL the PASS line should say the name is declared\n'; rc=1; fi

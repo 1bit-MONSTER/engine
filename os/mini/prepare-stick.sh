@@ -287,7 +287,7 @@ if [ "$CHECK" = 0 ]; then
     need=0
     for m in $MODELS; do
         [ -s "$m" ] || continue
-        new=$(stat -Lc %s "$m")
+        new=$(stat -Lc %s "$m" 2> /dev/null || echo 0); new=${new:-0}
         # cp -f truncates a file that is already there, so only the GROWTH has to be allocated: a re-run,
         # or the recovery path after a failed stage, must not be refused for space it already occupies
         old=$(stat -Lc %s "$MNT/models/$(basename "$m")" 2> /dev/null || echo 0)
@@ -504,6 +504,12 @@ for m in $MODELS; do
     [ -f "$f" ] && [ "$(stat -c %s "$f")" = "$(stat -Lc %s "$m")" ] &&
         ok "models/$(basename "$m") is there, same size as the source" ||
         bad "models/$(basename "$m") is missing or a different size"
+    # the same size is not the same bytes: the staging run now proves each copy with cmp, and this proves a
+    # medium that was staged earlier - or by an older tool - including under --check, where nothing is written
+    if [ -f "$f" ]; then
+        cmp -s "$f" "$m" && ok "models/$(basename "$m") is byte-identical to the source (cmp)" ||
+            bad "models/$(basename "$m") is the same size but NOT the same bytes as the source (cmp)"
+    fi
 done
 
 # An NPU model directory is only usable if init.sh will find model.q4nx in it and the engine can read every
@@ -524,6 +530,12 @@ for d in $NPUMODELS; do
         bad "models/$name holds symlinks that point nowhere on the stick: $broken"
     [ "$(find "$f" -type l | wc -l)" = 0 ] && ok "models/$name is real files, no symlinks (init.sh + the engine read it as is)" ||
         bad "models/$name still holds symlinks; copy it with -L (or re-run --npu-model)"
+    # and the bytes, not just the names: `diff -r` reports a missing file, an extra one, and a changed one
+    if [ -d "$d" ] && [ -d "$f" ]; then
+        diff -r -q "$d" "$f" > /dev/null 2>&1 &&
+            ok "models/$name is byte-identical to the source tree (diff -r)" ||
+            bad "models/$name differs from the source tree: $(diff -r -q "$d" "$f" 2>&1 | head -3 | tr '\n' ' ')"
+    fi
     ok "models/$name registers as the entry '$name-1bit' (onebit_backend npu, by init.sh) and 1bit-release-check asks the NPU through it"
 done
 

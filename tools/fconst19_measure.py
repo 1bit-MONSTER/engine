@@ -13,8 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
 """Measure a Ryzen AI 1.9 Token .fconst against its 1.8 twin, and print the table line to add.
 
 An importer cannot derive a 1.9 pack's layout from the pack: the q/k/v bundle's tile shape is not a

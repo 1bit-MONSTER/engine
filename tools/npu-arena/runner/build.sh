@@ -13,8 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
 #
 # runner/build.sh -- build the arena's host-side on-device scorer.
 # Links the engine's own NPU runtime (pinned in TOOLCHAIN.lock); no XRT.

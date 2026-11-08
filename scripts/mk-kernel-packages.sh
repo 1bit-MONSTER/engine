@@ -141,6 +141,9 @@ chmod 0644 "$cfg"/etc/security/limits.d/*.conf "$cfg"/etc/udev/rules.d/*.rules \
          "$cfg"/etc/modules-load.d/*.conf
 install -m 0644 "$work/MOK-Kernel.der" "$cfg/usr/share/1bit/mok/MOK-Kernel.der"
 cp "$repo/LICENSE" "$cfg/usr/share/licenses/1bit-npu-config/LICENSE"
+# The <!-- ... --> block below is EMITTED into the package's README, not this script's own header (which is
+# at the top). Deleting it as a duplicate ships a package whose documentation carries no licence
+# (engine#1547, one of the three exemptions there).
 cat > "$cfg/usr/share/doc/1bit-npu-config/README.md" <<'EOF'
 <!--
 Copyright 2026 bong-water-water-bong

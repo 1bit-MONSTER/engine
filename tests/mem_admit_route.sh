@@ -27,6 +27,8 @@ set -uo pipefail
 
 bin=${1:?usage: mem_admit_route.sh path/to/1bit}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound instead of guessing one (engine #1485)
 scratch=$(mktemp -d)
 pids=()
 cleanup() {
@@ -37,7 +39,6 @@ cleanup() {
 trap cleanup EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
-newport() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 export FAKE_BACKEND_EVENTS="$scratch/events"
 
 if [ ! -r /proc/meminfo ]; then echo "SKIP: no /proc/meminfo, serve does not check memory here"; exit 0; fi
@@ -57,9 +58,9 @@ for name, size in (("huge", 4 << 40), ("small", 0)):
         os.truncate(p, size)
 PY
 
-port=$(newport)
 t0=$(date +%s%N)
-"$bin" serve -m "$scratch/huge.gguf" --device cpu -c 4096 --port "$port" \
+# --port 0 and no readiness parse: this serve is refused before it binds anything, so the port is irrelevant
+"$bin" serve -m "$scratch/huge.gguf" --device cpu -c 4096 --port 0 \
     --llama-server "$here/fake_backend.py" >"$scratch/huge.log" 2>&1
 rc=$?
 ms=$((($(date +%s%N) - t0) / 1000000))
@@ -68,25 +69,25 @@ check "  in one line with the numbers" '[ "$(wc -l < "$scratch/huge.log")" = 1 ]
 check "  before any backend started" '[ ! -e "$scratch/events" ] && ! grep -q "on cpu" "$scratch/huge.log"'
 
 for how in flag env; do
-    port=$(newport)
     if [ $how = flag ]; then
-        "$bin" serve -m "$scratch/huge.gguf" --device cpu --port "$port" --no-mem-check \
+        "$bin" serve -m "$scratch/huge.gguf" --device cpu --port 0 --no-mem-check \
             --llama-server "$here/fake_backend.py" >"$scratch/skip-$how.log" 2>&1 &
     else
-        ONEBIT_MEM_CHECK=0 "$bin" serve -m "$scratch/huge.gguf" --device cpu --port "$port" \
+        ONEBIT_MEM_CHECK=0 "$bin" serve -m "$scratch/huge.gguf" --device cpu --port 0 \
             --llama-server "$here/fake_backend.py" >"$scratch/skip-$how.log" 2>&1 &
     fi
     pid=$!; pids+=("$pid")
+    port=$(serve_port_wait "$scratch/skip-$how.log" "$pid") || { echo "FAIL serve never reported a port ($how)"; cat "$scratch/skip-$how.log"; exit 1; }
     code=000
     for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health"); [ "$code" = 200 ] && break; sleep 0.1; done
     check "--no-mem-check ($how) skips the check: the backend starts ($code)" '[ "$code" = 200 ] && ! grep -q "does not fit" "$scratch/skip-$how.log"'
     kill "$pid"; wait "$pid" 2>/dev/null
 done
 
-port=$(newport)
-"$bin" serve -m "$scratch/small.gguf" --device cpu -c 4096 --port "$port" \
+"$bin" serve -m "$scratch/small.gguf" --device cpu -c 4096 --port 0 \
     --llama-server "$here/fake_backend.py" >"$scratch/small.log" 2>&1 &
 pid=$!; pids+=("$pid")
+port=$(serve_port_wait "$scratch/small.log" "$pid") || { echo "FAIL serve never reported a port"; cat "$scratch/small.log"; exit 1; }
 code=000
 for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health"); [ "$code" = 200 ] && break; sleep 0.1; done
 check "a small model starts ($code)" '[ "$code" = 200 ]'

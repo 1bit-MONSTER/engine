@@ -3023,6 +3023,16 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
 
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
 // then the f32 signs those offsets index (the GGUF's prism.hadamard.sign_widths/sign_values).
+// The plain-text overload. It is declared in q4nx_forward.h and used by npu/forward/embeds_equiv_probe.cpp, but only the
+// HybridInputs-taking definition existed, so every full build stopped at `undefined reference to
+// Q4nxNpuForward::step_batch_embeds(std::vector<float>, int, std::vector<float>&)` — the onebit target links because it
+// does not pull the probe in, which is why the breakage survived a release-ish build. Defaulting `in` is exactly the
+// documented meaning of the three-argument form: no position planes, no deepstack sets, nothing vision-conditioned.
+bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int start_pos,
+                                      std::vector<float>& logits) {
+    return step_batch_embeds(embeds, start_pos, logits, HybridInputs{});
+}
+
 bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int start_pos,
                                       std::vector<float>& logits, const HybridInputs& in) {
     if (!ready_) { err_ = "not initialised"; return false; }
@@ -3638,6 +3648,22 @@ std::string Q4nxNpuForward::missing_kernel(const std::string& dir, const char* e
     if (plan_.loaded())
         return "plan " + plan_path_ + ": this model's plan needs the " + role_tag(role) + " kernel \"" +
                elf_name + "\" in " + dir + " (missing)";
+    // engine#1503: a container imported without `--weight-layout b8` is row-major, so it asks for plain kernel names while
+    // the only kernels on the box carry the _b8 suffix. Naming the layout instead of only the missing file is the
+    // difference between "re-fetch the artifact" and "re-import the pack with a flag" - measured on a Ryzen AI 1.9 pack,
+    // where the same container ran correctly with the b8 set and the flag.
+    {
+        const std::string name(elf_name);
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".elf") == 0) {
+            const std::string b8 = name.substr(0, name.size() - 4) + "_b8.elf";
+            if (file_exists(dir + "/" + b8))
+                return "missing full ELF " + dir + "/" + elf_name +
+                       " - but the b8 variant \"" + b8 + "\" is there: this container's weight layout is row-major " +
+                       "(q4nx_weight_layout absent), so it asks for row-major kernels and the directory holds the b8 " +
+                       "family. Re-import the pack with `npu-pack import --weight-layout b8`, or supply row-major ELFs " +
+                       "(engine#1503).";
+        }
+    }
     return "missing full ELF " + dir + "/" + elf_name;
 }
 

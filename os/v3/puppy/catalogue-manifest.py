@@ -13,8 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
 #
 # catalogue-manifest.py <server_models.json> <out.txt>
 #

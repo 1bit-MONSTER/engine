@@ -65,8 +65,12 @@ for line in sys.stdin:
 PY
 chmod +x "$scratch/laya-daemon.py"
 
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-api="http://127.0.0.1:$port"
+# --port 0 for every serve below: the kernel picks and serve reports the port it bound, so nothing is picked and
+# released before serve binds (engine #1444/#1485). The two refusal cases need no port at all; the daemon case reads
+# the port back from serve's ready line.
+# shellcheck source=tests/serve_port.sh
+. "$(dirname "$0")/serve_port.sh"
+api=
 
 # A build with -DONEBIT_LAYA_GGML=ON always finds its own laya, so "without ggmlc's laya" cannot
 # happen there.
@@ -74,19 +78,21 @@ if grep -q "^ONEBIT_LAYA_GGML:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev
     echo "skip --laya-model FILE.gguf without ggmlc's laya says how to build it (skipped: built-in laya present)"
 else
     nobin=$(env -u ONEBIT_LAYA_GGML "$bin" serve -m "$scratch/tiny.gguf" --device auto \
-        --laya-model "$scratch/laya/gguf/laya_typed_decisions_q8_0.gguf" --port "$port" \
+        --laya-model "$scratch/laya/gguf/laya_typed_decisions_q8_0.gguf" --port 0 \
         --llama-server "$here/fake_backend_route.py" 2>&1)
     check "--laya-model FILE.gguf without ggmlc's laya says how to build it" '[[ "$nobin" == *ONEBIT_LAYA_GGML* ]]'
 fi
 nonpu=$(ONEBIT_LAYA_DEVICE=npu ONEBIT_LAYA_MODEL="$scratch/laya" "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya \
-    --port "$port" --llama-server "$here/fake_backend_route.py" 2>&1)
+    --port 0 --llama-server "$here/fake_backend_route.py" 2>&1)
 check "ONEBIT_LAYA_DEVICE=npu without the NPU add-on says how to build it" '[[ "$nonpu" == *ONEBIT_NPU_PRIVATE* ]]'
 
 LAYA_LOG="$scratch/daemon.log" ONEBIT_LAYA_GGML="$scratch/laya-daemon.py" ONEBIT_LAYA_MODEL="$scratch/laya" \
     "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya --route-policy "$here/route-policy-e2e.json" \
-    --port "$port" --llama-server "$here/fake_backend_route.py" \
+    --port 0 --llama-server "$here/fake_backend_route.py" \
     --hrx-libhsa "$scratch/libhsa-runtime64.so.1" >"$scratch/serve.log" 2>&1 &
 pid=$!
+port=$(serve_port_wait "$scratch/serve.log" "$pid") || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
+api="http://127.0.0.1:$port"
 for _ in $(seq 1 300); do curl -sf -o /dev/null "$api/health" && break; sleep 0.1; done
 
 argv=$(head -1 "$scratch/daemon.log" 2>/dev/null)

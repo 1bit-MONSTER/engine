@@ -4898,21 +4898,41 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
         scales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
     }
     I8Ctx& lctx = *xd_->head_ctx();
-    std::vector<float> got((size_t)M * (size_t)T);
-    for (int t = 0; t < ntiles; t++) {
-        const int n0 = t * T, n1 = std::min(NV, n0 + T);
-        xrt::run run = lctx.launch_async_with_bo_rows(*lm_head_packed_[(size_t)t].bo, hr.data(), M, H,
-                                                      scales.data());
-        lctx.wait_kernel(run);
-        lctx.readback();
-        std::fill(got.begin(), got.end(), 0.0f);
-        lctx.dequant_pb16i(got.data(), M, T, scales.data(), lm_head_packed_[(size_t)t].eref,
-                           xd_->head_ctx()->pb16i_planes);
-        for (int m = 0; m < M; m++) {
-            for (int n = n0; n < n1; n++) {
-                float v = got[(size_t)m * T + (n - n0)];
-                if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
-                logits_all[(size_t)m * (size_t)NV + (size_t)n] = v;
+    // A verify batch can be wider than this head context's row capacity -- the tri-ternary head context is
+    // built on the decode design (MD = 16 rows) -- and the launcher's quantiser refuses am > MD while the
+    // launch still runs, so rows MD..M-1 were read and written past the activation BO (engine#1386, the
+    // same failure as #1372 on the head instead of the layers). Chunk at MD exactly as the int8 head does
+    // (engine#1364): the weights are already resident, so a chunk is one launch, and a row keeps its own
+    // activation scale either way, so the chunking cannot move a value.
+    const int chunk = lctx.MD > 0 ? lctx.MD : M;
+    std::vector<float> got((size_t)std::min(chunk, M) * (size_t)T);
+    for (int r0 = 0; r0 < M; r0 += chunk) {
+        const int rows = std::min(chunk, M - r0);
+        for (int t = 0; t < ntiles; t++) {
+            const int n0 = t * T, n1 = std::min(NV, n0 + T);
+            xrt::run run = lctx.launch_async_with_bo_rows(*lm_head_packed_[(size_t)t].bo,
+                                                         hr.data() + (size_t)r0 * (size_t)H, rows, H,
+                                                         scales.data() + r0);
+            lctx.wait_kernel(run);
+            lctx.readback();
+            // Mirror the int8 head's guard: this is the change that makes it worth having, because a chunk
+            // that comes back short would otherwise feed dequant_pb16i rows nobody wrote -- poison_canary()
+            // and a zeroed buffer make a plausible-looking row, so the logits go quietly wrong. Named here.
+            if (lctx.canary_short()) {
+                fprintf(stderr, "[canary] SHORT RESULT (head rows, pb16i): tile=%d M=%d rows=%d short=%d\n", t,
+                        M, rows, lctx.short_row_);
+                err_ = "LM head rows: a pb16i chunk came back short (" + std::to_string(rows) +
+                       " rows asked, row " + std::to_string(lctx.short_row_) + " short)";
+                return false;
+            }
+            lctx.dequant_pb16i(got.data(), rows, T, scales.data() + r0, lm_head_packed_[(size_t)t].eref,
+                               xd_->head_ctx()->pb16i_planes);
+            for (int m = 0; m < rows; m++) {
+                for (int n = n0; n < n1; n++) {
+                    float v = got[(size_t)m * T + (n - n0)];
+                    if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                    logits_all[(size_t)(r0 + m) * (size_t)NV + (size_t)n] = v;
+                }
             }
         }
     }

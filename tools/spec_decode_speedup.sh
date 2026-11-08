@@ -57,7 +57,12 @@ cleanup() {   # a server must never outlive the arm that started it -- an orphan
     [ -n "$CUR_PID" ] && kill -9 "$CUR_PID" 2>/dev/null
     CUR_PID=""
 }
-trap cleanup EXIT INT TERM HUP
+# A handler for INT/TERM/HUP runs and then execution CONTINUES: with one combined trap the signalled run killed its server,
+# walked the rest of the arm loop against a dead port, and started the NEXT arm's server with no ticket left -- the same
+# orphan the trap exists to prevent, one arm later (found in review of engine#1509 by pi-verify). So a signal exits, and only
+# a normal exit leaves through plain EXIT.
+trap 'cleanup; exit 130' INT TERM HUP
+trap cleanup EXIT
 
 waitup() {
     local port=$1 label=$2 t0=$(date +%s)

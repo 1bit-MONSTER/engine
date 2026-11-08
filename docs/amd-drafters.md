@@ -88,7 +88,8 @@ cp ~/models/npu/Qwen3-0.6B/{tokenizer.json,tokenizer_config.json} /tmp/pard2-in/
 python3 convert_hf_to_gguf.py /tmp/pard2-in --outfile /tmp/pard2-f16.gguf --outtype f16
 ```
 
-Two further facts from the same measurement: **`warp_model.bin` (34-70 MB) is not in the GGUF** — it is PARD-2's extra
+Two further facts from the same measurement: **`warp_model.bin` (33.6 MB for the Qwen3-8B repo, 41.9 MB for Qwen3-14B, 70 MB
+for Llama-3.1-8B) is not in the GGUF** — it is PARD-2's extra
 module, so a converted artifact gives AR-mode drafting only, and a parallel-mode implementation needs that file; and the same
 1024-hidden / 28-layer draft serves both the 8B and 14B targets, which is what "target-aligned but target-independent" looks
 like in practice. Measured with it: `PARD2-Qwen3-8B` → `Qwen3-4B` gives **2.18 tokens/round** (1.36 accepted drafts/round,

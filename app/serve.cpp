@@ -1997,7 +1997,12 @@ int serve_models(const Options& o) {
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
 
-    if (!srv.bind_to_port(o.host, o.port))
+    // --port 0 means "whatever the kernel gives me", and this is the only place that knows which port that was. cpp-httplib's
+    // bind_to_port() answers bool; the port comes back from bind_to_any_port(), which is the same bind_internal(host, 0, ...)
+    // path. Tests use it so that nothing picks a port and releases it before serve binds (the release-then-bind race behind
+    // engine #1444/#1485).
+    const int bound_port = o.port == 0 ? srv.bind_to_any_port(o.host) : (srv.bind_to_port(o.host, o.port) ? o.port : -1);
+    if (bound_port < 0)
         throw std::runtime_error("cannot listen on " + o.host + ":" + std::to_string(o.port));
     std::thread listener([&] { srv.listen_after_bind(); });
     struct Stop {
@@ -2023,7 +2028,8 @@ int serve_models(const Options& o) {
         }
     ready = true;
     lifecycle.count_start();
-    std::fprintf(stderr, "1bit serve: ready on http://%s:%d (laya-models: model auto is routed per request)\n", o.host.c_str(), o.port);
+    std::fprintf(stderr, "1bit serve: ready on http://%s:%d (laya-models: model auto is routed per request)\n", o.host.c_str(),
+                 bound_port);
     auto all_alive = [&] {
         for (auto& c : children) if (!c->alive()) return false;
         return true;
@@ -2662,7 +2668,12 @@ int serve_child(const Options& given) {
         srv.Post("/rerank", h);
     }
 
-    if (!srv.bind_to_port(o.host, o.port))
+    // --port 0 means "whatever the kernel gives me", and this is the only place that knows which port that was. cpp-httplib's
+    // bind_to_port() answers bool; the port comes back from bind_to_any_port(), which is the same bind_internal(host, 0, ...)
+    // path. Tests use it so that nothing picks a port and releases it before serve binds (the release-then-bind race behind
+    // engine #1444/#1485).
+    const int bound_port = o.port == 0 ? srv.bind_to_any_port(o.host) : (srv.bind_to_port(o.host, o.port) ? o.port : -1);
+    if (bound_port < 0)
         throw std::runtime_error("cannot listen on " + o.host + ":" + std::to_string(o.port));
     std::thread listener([&] { srv.listen_after_bind(); });
     struct Stop {
@@ -2732,7 +2743,7 @@ int serve_child(const Options& given) {
     }
     ready = true;
     lifecycle.count_start();
-    std::fprintf(stderr, "1bit serve: ready on http://%s:%d%s\n", o.host.c_str(), o.port,
+    std::fprintf(stderr, "1bit serve: ready on http://%s:%d%s\n", o.host.c_str(), bound_port,
                  laya ? " (laya routes each request; a device's backend starts when first picked)" : "");
     if (o.pm) {
         std::string experts;

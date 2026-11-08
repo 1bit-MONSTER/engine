@@ -600,3 +600,18 @@ int q4nx_attention_mode(const char* declared, int plan_loaded, int plan_noncausa
     if (declared && *declared) return 0;    /* the pack declares causal, and any plan agrees */
     return plan_noncausal ? 1 : 0;          /* no declaration: the plan decides */
 }
+
+const char* q4nx_block_note(int rows, int block, int prefill_rows) {
+    static char note[320];
+    note[0] = '\0';
+    if (block <= 0 || rows <= block) return note;              /* fits: nothing blocked */
+    if (prefill_rows <= 0 || block >= prefill_rows) return note; /* already the prefill width */
+    const int launches = (rows + block - 1) / block;
+    const int at_prefill = (rows + prefill_rows - 1) / prefill_rows;
+    snprintf(note, sizeof note,
+             "prefill M=%d blocked at %d rows/launch (%d launch(es) per projection): the loaded context set accepts %d "
+             "rows, not the %d the prefill designs are built for. The family's %d-row prefill ELFs would make it %d "
+             "(engine#1582)",
+             rows, block, launches, block, prefill_rows, prefill_rows, at_prefill);
+    return note;
+}

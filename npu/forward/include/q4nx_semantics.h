@@ -261,6 +261,19 @@ int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
  * `why`.  Exported so the rule is testable with no model and no device. */
 int q4nx_attention_mode(const char* declared, int plan_loaded, int plan_noncausal, char* why, size_t why_len);
 
+/* Why a wide prefill was blocked below the prefill design's width, or "" when it was not (engine#1582).
+
+ * npu_gemm_rows() cannot launch more rows than the loaded activation BO holds, and that width is the
+ * *loaded context's* MD -- 128 for a prefill set, 16 for a decode-only ("_m16") set, 1 when no context
+ * is loaded at all. A 219-row prefill at 16 rows/launch is 14 launches per projection instead of 2, and
+ * the cost lands in per-launch host packing, which is what a phase profile then reports as "host". A
+ * reader looking at such a log has no way to tell "the device ran it in blocks" from "the device did not
+ * run it", so the block width is said out loud, once, with the launch count it implies.
+
+ * Returns "" when the batch fits the prefill width (nothing to say), else a one-line note. Pure, so
+ * tests/npu_rmsnorm_offset_test.c pins it with no model and no device. */
+const char* q4nx_block_note(int rows, int block, int prefill_rows);
+
 /* Description of the layer-type mix, for error messages. */
 void q4nx_semantics_layer_mix(const Q4nxSemantics* s, char* out, size_t out_sz);
 

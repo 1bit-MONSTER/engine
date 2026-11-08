@@ -100,6 +100,18 @@ int main(void) {
     check(q4nx_attention_mode("causal", 1, 1, why, sizeof why) == -1 && strstr(why, "stale"),
           "the disagreement is refused in both directions, not only the one this issue measured");
 
+    /* The prefill block width (engine#1582): a note only when the batch was blocked BELOW the prefill width, and
+     * it must carry the launch counts that make the cost legible (14 launches per projection for 219 rows at 16). */
+    check(strstr(q4nx_block_note(219, 128, 128), "blocked") == NULL,
+          "a 219-row prefill at the 128-row width says nothing (it was not blocked)");
+    const char* blocked = q4nx_block_note(219, 16, 128);
+    check(strstr(blocked, "M=219") && strstr(blocked, "14 launch") && strstr(blocked, "make it 2"),
+          "a 219-row prefill at 16 rows/launch names the width, the launch count and the prefill alternative");
+    check(strstr(q4nx_block_note(219, 1, 128), "219 launch") != NULL,
+          "at one row per launch the note says 219, which is the pathological case");
+    check(q4nx_block_note(0, 16, 128)[0] == '\0' && q4nx_block_note(10, 16, 128)[0] == '\0',
+          "a batch inside the block, or an empty one, prints nothing");
+
     printf(failures ? "npu_rmsnorm_offset: %d FAILED\n" : "npu_rmsnorm_offset: ok\n", failures);
     return failures ? 1 : 0;
 }

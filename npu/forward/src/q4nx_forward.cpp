@@ -2997,6 +2997,13 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     // recurrence) never needed the whole prompt in one launch, only the GEMMs did.
     const int blk = max_batch_rows();
     if (blk > 0 && M > blk) {
+        // engine#1582: say the block width out loud, once. A log that reads "0 launches, 93 s host" cannot be told
+        // apart from a device that never ran the batch, and the width the batch was blocked at is the whole answer.
+        static bool note_said = false;
+        if (!note_said) {
+            const char* note = q4nx_block_note(M, blk, xd_ ? xd_->caps().prefill_rows : 0);
+            if (note && note[0]) { std::fprintf(stderr, "  [batch] %s\n", note); note_said = true; }
+        }
         out.assign((size_t)M * N, 0.0f);
         for (int b0 = 0; b0 < M && err_.empty(); b0 += blk) {
             const int rows = std::min(blk, M - b0);

@@ -672,6 +672,47 @@ payload_runpath_verdict() {
     fi
 }
 
+# The mini image's engine path (engine #1543). `os/mini/mkimage.sh` copies the engine at its BUILD path - `/home/<user>/.../build/1bit`
+# - and points `/bin/1bit` at it, because the binary's RUNPATH is absolute and keeping the path is what makes its libraries resolve.
+# The disclosure is a side effect nobody chose: a shipped image names the builder's username, working directory and build-directory
+# name. It is a fourth leak class, and the guard that watches the other three (`build_path_strings`) reads the CONTENTS of packed
+# ELFs and generated text, so it cannot see a path delivered as the filesystem layout itself. Measured 2026-11-08 on
+# `~/wt/issue-709-img/initramfs.img`: `bin/1bit -> /home/bcloud/wt/issue-709-build/1bit` plus the `home/bcloud/...` directories.
+# Pure, so --self-test drives it: <resolved /bin/1bit> <entries under /home> [<sample>]
+mini_engine_path_verdict() {
+    _r=${1:-} _h=${2:-} _sample=${3:-}
+    case "$_h" in
+        ''|*[!0-9]*) printf 'FAIL the image'"'"'s /home entries could not be counted (%s)' "${_h:-empty}"; return 0 ;;
+    esac
+    if [ "$_h" != 0 ]; then
+        printf 'FAIL the image carries %s path(s) under /home%s - the builder'"'"'s home tree is in the shipped layout, so the image names the person and the build directory that produced it (engine #1543: mkimage.sh copies the engine at its build path and links /bin/1bit to it)' \
+            "$_h" "${_sample:+: $_sample}"
+        return 0
+    fi
+    case "$_r" in
+        '') printf 'SKIP no /bin/1bit in this image, so there is no engine path to resolve (a mini image links or installs it; a payload image keeps the engine under /opt/1bit-package)'; return 0 ;;
+        /home/*) printf 'FAIL /bin/1bit resolves to %s - the shipped symlink names the builder'"'"'s home directory (engine #1543)' "$_r"; return 0 ;;
+    esac
+    printf 'PASS /bin/1bit resolves to %s, inside the image, and nothing in the shipped layout sits under /home' "$_r"
+}
+
+# The scan behind that verdict, taking a ROOT so it can be driven against a fabricated tree in the tests (no image, no boot).
+# Sets MLK_RES (resolved /bin/1bit), MLK_HOME (entries directly under /home) and MLK_SAMPLE.
+mini_leak_scan() {
+    _root=${1:-}
+    MLK_RES= MLK_HOME=0 MLK_SAMPLE=
+    if [ -e "$_root/bin/1bit" ] || [ -L "$_root/bin/1bit" ]; then
+        MLK_RES=$(readlink -f "$_root/bin/1bit" 2>/dev/null || true)
+        [ -n "$_root" ] && MLK_RES=${MLK_RES#"$_root"}      # the in-image path, not the fixture's prefix
+    fi
+    if [ -d "$_root/home" ]; then
+        MLK_HOME=$(ls -A "$_root/home" 2>/dev/null | wc -l | tr -d ' ')
+        MLK_SAMPLE=$(ls -A "$_root/home" 2>/dev/null | head -1)
+        [ -n "$MLK_SAMPLE" ] && MLK_SAMPLE="home/$MLK_SAMPLE"
+    fi
+    return 0
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -712,6 +753,14 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT"}}]}' 0 0)"
     check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' '' '')"
     # the RUNPATH rule (2026-11-08 incident): $ORIGIN only, and RPATH is always a fail.
+    # engine #1543: the mini image's engine path. The FAIL case is the artifact measured on 8 Nov (bin/1bit -> /home/bcloud/wt/...),
+    # and the PASS cases are the two shapes the fix can produce: a real file at /bin/1bit, or a link that stays inside the image.
+    check PASS "$(mini_engine_path_verdict /bin/1bit 0)"
+    check PASS "$(mini_engine_path_verdict /opt/1bit/bin/1bit 0)"
+    check FAIL "$(mini_engine_path_verdict /home/bcloud/wt/issue-709-build/1bit 0)"
+    check FAIL "$(mini_engine_path_verdict /bin/1bit 1 home/bcloud)"
+    check FAIL "$(mini_engine_path_verdict /bin/1bit '' )"          # a count that could not be read is not a pass
+    check SKIP "$(mini_engine_path_verdict '' 0)"                   # no engine link in this image: say so
     check PASS "$(payload_runpath_verdict 0)"
     check FAIL "$(payload_runpath_verdict 3 '/opt/1bit-package/1bit/1bit runs /home/x/wt/release-rc/work/build')"
     check FAIL "$(payload_runpath_verdict 1)"
@@ -1803,6 +1852,18 @@ if [ -f "$ID" ]; then
 else
     skip identity "no /etc/1bit/release-identity in this image build; the tag and the image sha256 are in the release table beside the .img.zst"
 fi
+
+# ── the mini image's engine path (engine #1543) ────────────────────────────────────────────────────
+# Runs in the image it describes, so it needs no cpio/zstd and no host: `/bin/1bit` is either a link into the builder's home
+# (the defect) or a file inside the image (the fix). The FAIL case is the artifact measured on 8 Nov; the row exists because
+# the three-class leak guard reads file CONTENTS and a symlink target in a cpio is not a file's bytes.
+mini_leak_scan ""
+_mleak=$(mini_engine_path_verdict "$MLK_RES" "$MLK_HOME" "$MLK_SAMPLE")
+case "$_mleak" in
+    PASS*) pass engine-path "${_mleak#PASS }" ;;
+    SKIP*) skip engine-path "${_mleak#SKIP }" ;;
+    *)     fail engine-path "${_mleak#FAIL }" ;;
+esac
 
 # ── the payload's modes (engine #1352) ─────────────────────────────────────────────────────────────
 # The board-side half of #1361: the packer now normalises and asserts at pack time, and this proves it on the shipped tree. It

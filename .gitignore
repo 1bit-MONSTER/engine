@@ -34,3 +34,7 @@ third_party/toolchain/
 # the model-pin sweep writes these where it runs (tools/pin_watch.py --check --json)
 pin-report.md
 pin-report.json
+
+# Run output of the probes (dumpcheck, long, mlockall) - data, not source. The copyright gate sees
+# untracked-but-not-ignored files (#1414), so an un-ignored run log reds a developer clone (#1564).
+.hrx123/

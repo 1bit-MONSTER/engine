@@ -591,6 +591,29 @@ identity_launcher_path() {
     else printf '%s\n' "${PAYLOAD_DIR:-/opt/1bit-package}/1bit/1bit"; fi
 }
 
+# Does the identity's `payload=` name a payload the image actually carries? engine#1557: it was a DECLARED value
+# (PAYLOAD_NAME from the build's environment, container-build.sh:352) and nothing compared it, so c32 and c33 both
+# shipped `payload=lemonade-onebit-rc-2026-11-05-c26c` beside later payloads.
+#
+# The authority is the data partition's own checksum table: /data/SHA256SUMS lists the payload tarball(s) the image
+# was built with, so `<stem>.tar.zst` present there is a fact about the image, not about the build's environment.
+# Deliberately NOT the payload directory's name: the tree is always /opt/1bit-package, so comparing against it
+# would pass for any claim at all - the vacuous check the issue warns about.
+#
+# SKIP, never a pass, when the image carries no payload tarball in its table (an image-only cut, or a stick whose
+# data partition was written by an older layout): a row that cannot see the bytes must not call the claim true.
+payload_verdict() {   # <claimed stem> <stems present, one per line>
+    _pc=${1:-} _pp=${2:-}
+    if [ -z "$_pp" ]; then printf 'SKIP no payload tarball named in /data/SHA256SUMS, so payload= cannot be compared with the bytes'; return 0; fi
+    case "$_pc" in
+        ''|unknown) printf 'FAIL the identity names no payload (payload=%s) while the data partition carries %s - a declaration that cannot be true' "${_pc:-empty}" "$(printf '%s' "$_pp" | tr '\n' ' ')"; return 0 ;;
+    esac
+    _hit=0
+    for _s in $_pp; do [ "$_s" = "$_pc" ] && _hit=1; done
+    if [ "$_hit" = 1 ]; then printf 'PASS payload=%s is the payload this image carries' "$_pc"
+    else printf 'FAIL the identity claims payload=%s but the data partition carries %s - the c32/c33 shape' "$_pc" "$(printf '%s' "$_pp" | tr '\n' ' ')"; fi
+}
+
 identity_verdict() {
     _ce=${1:-} _ae=${2:-} _ch=${3:-} _ah=${4:-}
     case "$_ce" in ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s engine_sha256 is not a hex digest (%s) - malformed, not merely old' "${_ce:-empty}"; return 0 ;; esac
@@ -759,6 +782,11 @@ if [ "${1:-}" = --self-test ]; then
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 7ba2110811111111111111111111111111111111111111111111111111111111 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"       # the c26-in-a-c32-image shape: engine claim vs shipped launcher
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"       # libhsa claim vs the runtime the image carries
+    # engine#1557: payload= against the payload tarball the data partition names
+    check PASS "$(payload_verdict lemonade-onebit-rc-2026-11-08-c33 'lemonade-onebit-rc-2026-11-08-c33')"
+    check FAIL "$(payload_verdict lemonade-onebit-rc-2026-11-05-c26c 'lemonade-onebit-rc-2026-11-08-c33')"   # the c32/c33 shape: an inherited name beside a later payload
+    check FAIL "$(payload_verdict unknown 'lemonade-onebit-rc-2026-11-08-c33')"                              # the writer's default, with a payload present
+    check SKIP "$(payload_verdict lemonade-onebit-rc-2026-11-08-c33 '')"                                    # no tarball in the table: not a pass by absence
     check FAIL "$(identity_verdict 89a6c386 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"    # malformed claim is FAIL, not unknown
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"          # nothing to check the claim against
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none '')"           # `none` and nothing on the loader path: consistent
@@ -1868,6 +1896,18 @@ if [ -f "$ID" ]; then
             *)     fail identity "${_idv#FAIL } (${_idinfo})" ;;
         esac
     fi
+    # engine#1557: payload= was the one field of this file nothing checked. The stems come from the data partition's
+    # own table, the same file the sha256sums row verifies beside it.
+    _pv_stems=
+    if [ -f /data/SHA256SUMS ]; then
+        _pv_stems=$(sed -n 's|.*[ 	]||p' /data/SHA256SUMS 2>/dev/null | sed -n 's|\.tar\.zst$||p' | sort -u)
+    fi
+    _pvv=$(payload_verdict "${_id_name:-}" "$_pv_stems")
+    case "$_pvv" in
+        PASS*) pass identity-payload "${_pvv#PASS }" ;;
+        SKIP*) skip identity-payload "${_pvv#SKIP }" ;;
+        *)     fail identity-payload "${_pvv#FAIL }" ;;
+    esac
     if [ -f /data/SHA256SUMS ]; then
         if (cd /data && sha256sum -c SHA256SUMS >/dev/null 2>&1); then pass sha256sums "/data/SHA256SUMS verifies"
         else fail sha256sums "/data/SHA256SUMS does not verify (cd /data && sha256sum -c SHA256SUMS)"; fi

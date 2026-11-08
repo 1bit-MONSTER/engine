@@ -67,6 +67,19 @@ def merge_rows(rows, cache_path, rows_path):
     return False
 
 
+def workdir():
+    """A temp dir on the REAL disk, not on the system temp.
+
+    /tmp on this fleet is a 62 GB tmpfs that other lanes fill with build artifacts (56 GB used / 5 GB free on
+    2026-11-08), and an AMD Whisper pack is up to 7 GB: a download into tempfile.mkdtemp() died with ENOSPC at ~5 GB
+    and the driver reported it as a task error rather than "the box has no room where you put it". Cache dirs live
+    under $HOME for exactly this reason; honour TMPDIR when it is set to something else.
+    """
+    base = os.environ.get("AMD_RAI_SWEEP_TMP") or os.path.join(os.path.expanduser("~"), ".cache", "amd-rai-sweep")
+    os.makedirs(base, exist_ok=True)
+    return tempfile.mkdtemp(prefix="pull-", dir=base)
+
+
 def fetch_with_data(repo, name, tmp, names):
     """Download an .onnx AND its .onnx.data sidecar if the repo has one (see the module docstring)."""
     path = hf_hub_download(repo, name, local_dir=tmp)
@@ -84,7 +97,7 @@ def sweep_whisper(repo, rows, cache_path, rows_path, wav, expect):
         rows[f"result:{repo}"] = {"status": "fails", "numbers": "",
                                   "note": f"no ONNX encoder/decoder pair (graphs: {graphs}) - nothing runs outside AMD's .rai path"}
         return merge_rows(rows, cache_path, rows_path)
-    tmp = tempfile.mkdtemp(prefix="amd-rai-whisper-")
+    tmp = workdir()
     try:
         pe = fetch_with_data(repo, enc, tmp, names)
         pd = fetch_with_data(repo, dec, tmp, names)
@@ -124,7 +137,7 @@ def sweep_image(repo, rows, cache_path, rows_path, src):
         return merge_rows(rows, cache_path, rows_path)
     pick = cand[0]
     pre = next((v for k, v in IMG_PRE.items() if k in repo.lower()), "no255")
-    tmp = tempfile.mkdtemp(prefix="amd-rai-image-")
+    tmp = workdir()
     try:
         path = fetch_with_data(repo, pick, tmp, names)
         out = subprocess.run([PY, f"{HERE}/run_onnx_image.py", path, src, os.path.join(tmp, "out.png"),

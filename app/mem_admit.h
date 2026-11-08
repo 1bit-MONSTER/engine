@@ -231,6 +231,12 @@ inline ModelNeed model_need(const std::string& path, long long n_ctx, int n_seq,
         else if (h.arch == "gemma3n") every = 5;
         else if (h.arch == "gemma3") every = 6;
         full_share = every > 0 ? 1.0 / double(every) : 0.0;
+        // flint's split is not "one layer in N": 49 layers, 35 windowed and 14 full (engine#1425, from the
+        // lemonade#45 catalog row).  Pricing every layer as windowed made the estimate context-independent —
+        // measured as the same 24.07 GiB at ctx 4096, 8192 and 262144 — which is a lower bound that grows
+        // wrong as the context does.  The ratio is what matters, so a future pack with a different split
+        // needs its own entry (or, better, an `attention.sliding_window_pattern` array, which wins below).
+        if (h.arch == "flint") full_share = 14.0 / 49.0;
         if (const auto* pat = h.array("attention.sliding_window_pattern"); pat && !pat->empty()) {
             long long windowed = 0;
             for (long long x : *pat) windowed += x != 0;

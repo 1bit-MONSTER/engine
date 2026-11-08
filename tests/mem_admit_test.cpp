@@ -145,6 +145,27 @@ int main() {
     expect_mib("gpt-oss: 12 full layers at 131072 + 12 windowed at 128 + 512", admit::model_need(oss, 131072, 1).kv,
                (12.0 * 131072 + 12.0 * 640) * 8 * 128 * 2 / (1 << 20));
 
+    // flint: 49 layers, 35 windowed and 14 full (engine#1425).  Before the entry existed every layer was
+    // priced as windowed, so the estimate did not move with the context at all — the lemonade#45 row measured
+    // the same 24.07 GiB at ctx 4096, 8192 and 262144.  Two rows: the share is 14/49, and the estimate grows
+    // with the context again.
+    const auto flint = Gguf().s("general.architecture", "flint").u32("flint.block_count", 49)
+        .u32("flint.embedding_length", 2048).u32("flint.attention.head_count", 16)
+        .u32("flint.attention.head_count_kv", 8)
+        .u32("flint.attention.key_length", 128).u32("flint.attention.value_length", 128)
+        .u32("flint.attention.sliding_window", 4096).write(d + "/flint.gguf");
+    {
+        const double kv_per_layer = 8.0 * 256 * 2;              // 8 kv heads, 128 + 128, f16
+        const double small = admit::model_need(flint, 8192, 1).kv;      // bytes; expect_mib divides
+        const double big = admit::model_need(flint, 262144, 1).kv;
+        const double windowed = 4608.0;                          // min(ctx, 4096 * 1 + 512)
+        const double small_want = (14.0 / 49 * 8192 + 35.0 / 49 * windowed) * kv_per_layer * 49 / (1 << 20);
+        const double big_want = (14.0 / 49 * 262144 + 35.0 / 49 * windowed) * kv_per_layer * 49 / (1 << 20);
+        expect_mib("flint: 14 of 49 layers at 8192, the rest windowed", small, small_want);
+        expect_mib("flint: the 14 full layers at 262144", big, big_want);
+        expect("flint: the estimate grows with the context (it was flat before engine#1425)", big > small * 3);
+    }
+
     // a split model counts every shard
     Gguf().s("general.architecture", "qwen3").write(d + "/big-00001-of-00002.gguf", 3ull << 30);
     Gguf().write(d + "/big-00002-of-00002.gguf", 2ull << 30);

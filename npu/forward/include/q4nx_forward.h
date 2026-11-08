@@ -137,6 +137,18 @@ public:
     bool step_batch(const std::vector<int>& tokens, int start_pos,
                     std::vector<float>& logits);
 
+    // The same batched pass, fed **precomputed embeddings** instead of token ids (engine#1311/TQVL, and the
+    // shape AMD's reference pack exposes as `embedding.onnx` -> `inputs_embeds` -> `text.onnx`).
+    //
+    // `embeds` is rows x H row-major, each row the model's own embedding for that position **before**
+    // `embed_scale` (the forward applies its own scale, as it does on the token path), so a caller that builds
+    // rows with embed_row() gets byte-identical logits to step_batch(ids) -- npu/forward/embeds_equiv_probe.cpp
+    // (target `embeds_equiv_probe`, run under npu-hold or with NPU_INFER_HOST_GEMM=1) checks exactly that. This exists so a hybrid can put image-feature rows where the image tokens are, without the
+    // decoder needing to know what a vision encoder is; it is NOT a way to skip the embedding table for text.
+    // The per-token fallback path (MLA/MoE/GDN/... models) needs ids and is refused by name.
+    bool step_batch_embeds(const std::vector<float>& embeds, int start_pos,
+                           std::vector<float>& logits);
+
     // The same batched pass, but returning the logits of EVERY row (M x NV, row-major) instead of only
     // the last one.  Speculative decoding needs them: a draft token is accepted only if the model's own
     // choice AT THAT POSITION is that token, so the verifier has to see each row's logits, not just the
@@ -340,6 +352,8 @@ private:
     int lm_w_ = 0;
     // BF16 host-side tensors
     std::vector<uint16_t> embed_;                 // [NV*H] bf16
+    // Set only while step_batch_embeds() runs: the row source for the batched body's embedding fill.
+    const float* inject_embeds_ = nullptr;
     // Some models store the embedding QUANTIZED (Gemma4-E2B/E4B: dtype I8), and
     // reading it as bf16 yields ~zero - which invalidated the whole forward and
     // the tied LM head (all-zero logits).  When the dtype is not BF16 the

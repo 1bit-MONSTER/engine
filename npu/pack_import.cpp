@@ -263,6 +263,123 @@ const uint8_t* at(const Fconst& f, int64_t off, int64_t len) {
     return f.map + off;
 }
 
+// ── Ryzen AI 1.9 Token .fconst: a measured shape, not a derivable one ────────
+// A 1.9 pack of the same model differs from its 1.8 twin in exactly two ways: a 4*NH-byte header is
+// inserted after the q/k/v bundle (the four bytes 00 00 7f ff, once per head), and that bundle is stored
+// q,k,v where 1.8 stores k,q,v. Everything else in the block is verbatim, and the stream after the header
+// reads at -4*NH. The tile shape cannot be derived from the pack itself -- it is not a subset sum of the
+// pack's own const sizes -- so each rule below was measured against the 1.8 pack of the SAME model by
+// whole-file diff. A 1.9 pack whose geometry is not in this table is refused rather than decoded on a guess.
+struct Fconst19Rule {
+    int hidden, heads, layers, n_tiles, tile, rot;
+};
+constexpr Fconst19Rule kFconst19Rules[] = {
+    // Qwen2.5-0.5B-Instruct: normalises to its 1.8 twin byte for byte, whole file, all 24 blocks.
+    {896, 14, 24, 16, 34816, 2},
+};
+
+// The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes
+// it a test rather than a magic number. 0x00007fff is the big-endian reading of those four bytes; the bytes
+// are what is compared, because the little-endian reading of the same bytes is 0xff7f0000.
+std::vector<uint8_t> fconst19_header(int heads) {
+    std::vector<uint8_t> h(size_t(heads) * 4, 0);
+    for (int i = 0; i < heads; ++i) {
+        h[size_t(i) * 4 + 2] = 0x7f;
+        h[size_t(i) * 4 + 3] = 0xff;
+    }
+    return h;
+}
+
+// True when `fc` is a 1.9 Token .fconst of this geometry: exactly `layers` headers, evenly spaced.
+// Fills the first header's offset and the block stride. False means the 1.8 form (or a shape this
+// importer does not know, which the caller decides about).
+bool fconst19_detect(const Fconst& fc, int heads, int layers, int64_t* hdr_off, int64_t* stride) {
+    if (heads <= 0 || layers < 2) return false;
+    const std::vector<uint8_t> pat = fconst19_header(heads);
+    std::vector<int64_t> runs;
+    for (size_t i = 0; i + pat.size() <= fc.size;) {
+        if (fc.map[i] == pat[0] && fc.map[i + 2] == 0x7f && fc.map[i + 3] == 0xff &&
+            std::memcmp(fc.map + i, pat.data(), pat.size()) == 0) {
+            runs.push_back(int64_t(i));
+            i += pat.size();
+        } else {
+            ++i;
+        }
+    }
+    if (int(runs.size()) != layers) return false;
+    const int64_t s = runs[1] - runs[0];
+    if (s <= int64_t(pat.size())) return false;
+    for (size_t k = 0; k + 1 < runs.size(); ++k)
+        if (runs[k + 1] - runs[k] != s) return false;
+    *hdr_off = runs[0];
+    *stride = s;
+    return true;
+}
+
+// The 1.8-equivalent form of a Token .fconst. A pack already in the 1.8 form comes back unchanged (the same
+// path, no copy); a 1.9 pack comes back as a file of canonical bytes, so every offset below the two forms is
+// one set of numbers and the whole importer above needs no second arithmetic. `work` is where the canonical
+// copy is written -- the caller removes it.
+//
+// The q/k/v bundle is normalised here, which is what makes the tiles line up: 1.9 stores q first and k last.
+std::string canonical_token_fconst(const std::string& path, int hidden, int heads, int layers, const std::string& work) {
+    if (path.empty()) return path;
+    Fconst fc = open_fconst(path);
+    int64_t hdr_off = 0, stride9 = 0;
+    if (!fconst19_detect(fc, heads, layers, &hdr_off, &stride9)) {
+        unmap_file(fc.map, fc.size);
+        return path;
+    }
+    const Fconst19Rule* rule = nullptr;
+    for (const auto& r : kFconst19Rules)
+        if (r.hidden == hidden && r.heads == heads && r.layers == layers) rule = &r;
+    if (!rule) {
+        unmap_file(fc.map, fc.size);
+        throw std::runtime_error(
+            path + ": this is a Ryzen AI 1.9 Token .fconst (it carries " + std::to_string(layers) +
+            " headers of " + std::to_string(heads * 4) + " B, one per layer, 00 00 7f ff per head), and its block "
+            "shape has not been measured for hidden " + std::to_string(hidden) + ", " + std::to_string(heads) +
+            " heads, " + std::to_string(layers) + " layers. The tile shape cannot be derived from the pack, so "
+            "decoding it would be a guess: the 1.8 pack of the same model is what establishes it.");
+    }
+    const int64_t hdr_len = int64_t(heads) * 4;
+    const int64_t stride8 = stride9 - hdr_len;
+    const int64_t prefix = attn_payload_off(hidden);
+    const int64_t bundle = int64_t(rule->n_tiles) * rule->tile;
+    if (rule->n_tiles < 2 || rule->tile <= 0 || prefix + bundle > hdr_off ||
+        hdr_off + hdr_len > stride9 || stride8 <= 0) {
+        unmap_file(fc.map, fc.size);
+        throw std::runtime_error(path + ": the measured 1.9 block shape does not fit this file");
+    }
+    const int64_t tail_off = int64_t(layers) * stride9;
+    if (tail_off > int64_t(fc.size)) {
+        unmap_file(fc.map, fc.size);
+        throw std::runtime_error(path + ": fewer bytes than " + std::to_string(layers) + " blocks of " +
+                                 std::to_string(stride9) + " B");
+    }
+    std::vector<uint8_t> out;
+    out.reserve(size_t(fc.size - int64_t(layers) * hdr_len));
+    for (int L = 0; L < layers; ++L) {
+        const uint8_t* b = at(fc, int64_t(L) * stride9, stride9);
+        out.insert(out.end(), b, b + prefix);
+        for (int i = 0; i < rule->n_tiles; ++i) {   // canonical i is stored at (i - rot) mod n
+            const int64_t j = ((int64_t(i) - rule->rot) % rule->n_tiles + rule->n_tiles) % rule->n_tiles;
+            out.insert(out.end(), b + prefix + j * rule->tile, b + prefix + (j + 1) * rule->tile);
+        }
+        out.insert(out.end(), b + prefix + bundle, b + hdr_off);
+        out.insert(out.end(), b + hdr_off + hdr_len, b + stride9);
+    }
+    out.insert(out.end(), fc.map + tail_off, fc.map + fc.size);
+    unmap_file(fc.map, fc.size);
+    {
+        std::ofstream os(work, std::ios::binary | std::ios::trunc);
+        if (!os) throw std::runtime_error(work + ": cannot write the canonical copy of the 1.9 .fconst");
+        os.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+        if (!os) throw std::runtime_error(work + ": short write of the canonical copy of the 1.9 .fconst");
+    }
+    return work;
+}
+
 std::string find_one(const std::string& dir, const std::string& prefix, const std::string& suffix) {
     for (const auto& e : fs::directory_iterator(dir)) {
         const std::string n = e.path().filename().string();
@@ -313,6 +430,22 @@ std::string find_token_fconst(const std::string& dir, std::string* why = nullptr
         }
     }
     return {};
+}
+
+// The Token .fconst as the rest of this file reads it. A Ryzen AI 1.9 pack comes back normalised to its 1.8
+// form (see canonical_token_fconst); a 1.8 pack comes back as itself, at no cost. `plan` and `import_pack`
+// both resolve through here so the two cannot disagree about which bytes they are reading.
+std::string resolve_token_fconst(const std::string& pack_dir, const Dims& dims) {
+    const std::string found = find_token_fconst(pack_dir);
+    if (found.empty()) return found;
+    // Named by pack and geometry, so a rerun overwrites its own copy instead of filling the temp dir.
+    const std::string tag =
+        std::to_string(std::hash<std::string>{}(fs::path(pack_dir).lexically_normal().string()) % 100000000);
+    const std::string work = (fs::temp_directory_path() /
+                              ("1bit-fconst19-" + tag + "-" + std::to_string(dims.hidden) + "-" +
+                               std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst"))
+                                 .string();
+    return canonical_token_fconst(found, dims.hidden, dims.heads, dims.layers, work);
 }
 
 
@@ -1173,7 +1306,7 @@ Plan plan(const std::string& pack_dir) {
     // The Token .fconst, found once (see find_token_fconst) and used by the attention block below. Empty means this
     // pack keeps no weights there -- which for the rai_1.3/1.6/1.7.1 line is the normal case, not a fault.
     std::string tok_why;
-    std::string tok_path = find_token_fconst(pack_dir, &tok_why);
+    std::string tok_path = resolve_token_fconst(pack_dir, p.dims);
     const bool no_fconst = tok_path.empty();
     const bool graph_weights = p.graph_real_weights > 0 && no_fconst;
     // The projections the graph carries as real initializers, by their own names (`.MatMulNBits.` marks one).
@@ -1203,9 +1336,9 @@ Plan plan(const std::string& pack_dir) {
         break;
     }
     if (onnx.matmuls.empty()) {
-        auto x = make("lm_head.weight", "fconst:Llm_Token_Token", "q4_1", {d.vocab, d.hidden});
-        x.refusal = "the pack has no host-side MatMulNBits head; lm_head is only in the .fconst tail";
-        p.tensors.push_back(std::move(x));
+        // The head is in the .fconst tail (the Ryzen AI 1.9 lines). The importer reads it, and refuses by name
+        // there if the tail's arithmetic does not come out, so the plan does not refuse it here.
+        p.tensors.push_back(make("lm_head.weight", "fconst:tail", "q4_1", {d.vocab, d.hidden}));
     }
 
     // norms: the layer blocks are located by their epsilon anchors at import time, so the offsets work
@@ -2016,7 +2149,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
 
     {
         std::string path_why;
-        const std::string path = find_token_fconst(pack_dir, &path_why);
+        const std::string path = resolve_token_fconst(pack_dir, p.dims);
         const FconstGeom g = locate_fconst(path, p.dims.eps_bits);
         // refusals decided while reading the payload (a tile that does not survive its own round trip,
         // or an o_proj bias the container has nowhere to put); they land before anything is written
@@ -2029,6 +2162,49 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             r.stride = g.stride;
             r.second_header = g.h1;
             Fconst fc = open_fconst(path);
+            // A Ryzen AI 1.9 line carries no host-side MatMulNBits head at all: lm_head is the .fconst tail. Its
+            // layout, measured to the byte on Qwen2.5-0.5B: the same 1,856-byte envelope the final norm opens
+            // with, then the head's own 64-row tiles at K = hidden -- so `1,856 + (vocab/64) x tile(hidden)` has
+            // to equal the tail length exactly. When that arithmetic does not hold the head is refused by name,
+            // because reading the wrong offsets with confidence is worse than not reading them.
+            if (onnx.matmuls.empty()) {
+                const int64_t tail_off = int64_t(p.dims.layers) * g.stride;
+                const int64_t tile = attn_tile_bytes(H);
+                const int64_t rows = V / kTileRows;
+                const int64_t want = kTailNorm + rows * tile;
+                const int64_t have = int64_t(fc.size) - tail_off;
+                if (V % kTileRows != 0 || want != have) {
+                    late.push_back("lm_head.weight: the .fconst tail is " + std::to_string(have) + " B, not the " +
+                                   std::to_string(want) + " B its envelope and head tiles would take (" +
+                                   std::to_string(kTailNorm) + " + " + std::to_string(rows) + " x " +
+                                   std::to_string(tile) + " B), so the head's offsets are not established");
+                } else {
+                    std::vector<TileW> tiles;
+                    tiles.reserve(size_t(rows));
+                    bool exact = true;
+                    for (int64_t i = 0; i < rows; ++i) {
+                        const uint8_t* src = at(fc, tail_off + kTailNorm + i * tile, tile);
+                        tiles.push_back(decode_tile(src, int(H)));
+                        const std::vector<uint8_t> back = encode_tile(tiles.back());
+                        if (std::memcmp(back.data(), src, size_t(tile)) != 0) exact = false;
+                    }
+                    if (!exact) {
+                        late.push_back("lm_head.weight: the .fconst tail's tiles do not survive decode->encode, "
+                                       "so their fields are not understood");
+                    } else {
+                        Q4 q = q_from_tiles(tiles);
+                        std::vector<uint8_t> tiled;
+                        long long pinexact = 0;
+                        tile_q4_1_f32(q, tiled, &pinexact);
+                        r.codes_total = q.codes.size();
+                        r.zero_exact_pct = 100.0 * double(q.scale.size() - pinexact) / double(q.scale.size());
+                        const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
+                        r.tiles += head_tiles;
+                        w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
+                        ++r.tensors;
+                    }
+                }
+            }
             auto add_norm = [&](int64_t off, const std::string& name) {
                 w.add(name, "BF16", {H}, as_bf16(at(fc, off, H * 2), kBF16, size_t(H)));
                 ++r.tensors;

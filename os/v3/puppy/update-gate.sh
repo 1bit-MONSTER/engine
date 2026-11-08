@@ -142,6 +142,15 @@ try:
         sdo("cp", os.path.join(src, sfs[0]), base)
     setfiles = [f for f in sorted(os.listdir(src)) if f.endswith(".sfs") or f in ("vmlinuz", "initrd.gz")]
 
+    # A disk that a previous run already updated is NOT post-install any more: `RESET=1` can put the slots and the GRUB
+    # config back, but it cannot un-patch the SFS the machine is running - so the next run's "base" would already carry
+    # a marker, patch-sfs refuses (correctly) and the gate looks broken. Say that plainly instead.
+    for stale in ("update-set-alt", "update-set-alt2", "set-alt3.sfs", "update.img"):
+        if os.path.exists(os.path.join(data, stale)):
+            sys.exit("update-gate: /data still carries %s from a previous run - this disk has been used. The gate needs a "
+                     "FRESH install (run install-probe.sh against a candidate first); RESET=1 only restores the slots and "
+                     "grub.cfg, not the SFS the machine is running." % stale)
+
     def build_release(name, marker_text):
         """a release directory on /data: the set's own files, the patched puppy SFS, and a real SHA256SUMS. The
         marker file in the SFS is the only difference between the two releases."""
@@ -154,7 +163,12 @@ try:
             # the one with `matches_target` for that shape - measured here, reported to patch-sfs's owner).
             man = os.path.join(work, "manifest-" + name)
             open(man, "w").write("etc/1bit/%s\t%s\t0644\n" % (name, marker))
-            sdo("bash", os.path.join(tree, "os/v3/puppy/patch-sfs.sh"), "--manifest", man, base, patched)
+            r = subprocess.run(["sudo", "-n", "bash", os.path.join(tree, "os/v3/puppy/patch-sfs.sh"),
+                                "--manifest", man, base, patched], capture_output=True, text=True)
+            if r.returncode != 0:
+                sys.exit("update-gate: patch-sfs refused to build the %s set:\n%s\nIf it says the bytes are already "
+                         "there, the disk under test was already updated by an earlier run: install a fresh one."
+                         % (name, (r.stdout + r.stderr)[-600:]))
         up = os.path.join(data, "update-" + name)
         sdo("mkdir", "-p", up)
         for f in setfiles:

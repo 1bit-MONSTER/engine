@@ -242,6 +242,11 @@ add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-chec
 # dir, so no key, no device and no build: the four refusals are a set with no manifest, a file the
 # manifest does not list, a ciphertext byte flipped after signing, and a manifest signed by another key.
 add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
+# engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
+# it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
+# release, and the ordering a candidate needs: previous release < candidate < its release. The
+# ordering is the row dpkg, rpm and pacman had to agree on; no container, no build, dpkg only.
+add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.

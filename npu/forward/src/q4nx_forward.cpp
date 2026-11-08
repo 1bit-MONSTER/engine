@@ -3099,6 +3099,29 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
         return;
     }
+    // The device's activation BO holds exactly max_batch_rows() rows (the M=128 prefill design), and a wider
+    // launch is not quantized at all -- the kernel then reads and poisons past the BO, which is memory
+    // corruption, not a slow path (engine#1372: 4 of 4 segfaults on the d3 pack's real questions, and one run
+    // that answered from rows the layers never processed). So a wider GEMM is walked in blocks here, at the one
+    // choke point every batched projection goes through: the same launches in the same order, each within the
+    // BO. Each row's result is independent of the others -- the row loops downstream (`row_attn`, the GDN
+    // recurrence) never needed the whole prompt in one launch, only the GEMMs did.
+    const int blk = max_batch_rows();
+    if (blk > 0 && M > blk) {
+        out.assign((size_t)M * N, 0.0f);
+        for (int b0 = 0; b0 < M && err_.empty(); b0 += blk) {
+            const int rows = std::min(blk, M - b0);
+            std::vector<float> part;
+            // A's row stride is the caller's a_k, not the padded K (the same stride trap the host path documents).
+            npu_gemm_rows(role, A + (size_t)b0 * a_k, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
+            if (part.size() < (size_t)rows * N) {
+                if (err_.empty()) err_ = std::string("npu_gemm_rows: a blocked ") + sc + " launch returned short";
+                return;
+            }
+            std::copy(part.begin(), part.begin() + (size_t)rows * N, out.begin() + (size_t)b0 * N);
+        }
+        return;
+    }
     npu::target::GemvArgs a;
     a.role = role; a.layer = cur_layer_; a.M = M; a.K = K; a.N = N;
     a.x = A; a.Bmat = Bmat; a.wkey = wkey; a.tag = sc;
@@ -3150,23 +3173,6 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     for (int t : tokens)
         if (t < 0 || t >= c_.NV) { err_ = "token out of range"; return false; }
 
-    // The device's activation buffer holds exactly max_batch_rows() rows (the M=128 prefill design). A
-    // larger batch is not quantized at all -- I8Ctx::quantize_async_rows refuses and hands the plain
-    // buffer back -- and the launch then reads and poisons past the BO: measured on the d3 pack at its
-    // real question length, 4/4 SIGSEGVs at a fixed offset plus one run that answered from rows the
-    // layers never processed (engine#1372). Refuse here instead of corrupting: a causal caller chunks,
-    // which forward_serve's chat path already does at max_batch_rows(); a noncausal pack cannot chunk --
-    // it encodes the whole prompt in one pass by contract -- so it is told that is the limit.
-    if (!host_gemm_ && M > max_batch_rows()) {
-        err_ = "a batch of " + std::to_string(M) + " rows exceeds this geometry's M=" +
-               std::to_string(max_batch_rows()) + " activation block";
-        err_ += noncausal_attn_
-                    ? ", and attention.mode noncausal_full_attention encodes the whole prompt in one pass, so it "
-                      "cannot be chunked: this pack cannot be answered at this prompt length on the NPU (blocked "
-                      "noncausal prefill is missing, engine#1372). NPU_INFER_HOST_GEMM=1 answers it"
-                    : " -- chunk the prefill at max_batch_rows() (forward_serve's chat path does)";
-        return false;
-    }
 
     // A new request starts at position 0: clear the KV cache.  The cache is
     // append-only (kcache_[l].insert(end, ...)) but the attention indexes it by

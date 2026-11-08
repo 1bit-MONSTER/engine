@@ -485,8 +485,18 @@ WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-private scripts/weekly.sh ~/.cache/1bit-we
 2. **build** and **test**: `main` at the merged pins, the same way.
 3. **package**: the two packages above, plus the engine's own packages for every family
    (`scripts/mk-plugin-package.sh`: the `.deb`, `.rpm`, Arch package and tarball, all built from one
-   payload tree by `scripts/pack-distro.sh`). `scripts/package-linux.sh` packs the engine first; its
-   tarball goes into the Lemonade + onebit package as `1bit/`, not into the release on its own.
+   payload tree by `scripts/pack-distro.sh`), and then the proof of them:
+   `scripts/pack-proof.sh` installs each one in a throwaway container of its distribution
+   (`ubuntu:26.04`, `fedora:latest`, `opensuse/tumbleweed`, `archlinux:latest`), asks the engine its
+   version, runs the shim, removes it and checks nothing is left; unpacks the tarball as root the way
+   the guide says; and compares the four as root so a package carrying a different payload fails the
+   release instead of a user. A failing row stops the release. `scripts/package-linux.sh` packs the
+   engine first; its tarball goes into the Lemonade + onebit package as `1bit/`, not into the release
+   on its own. A candidate cut's tag is not a version, so it is mapped to one by
+   `scripts/pack-version.sh`: `rc-2026-11-07-c32` becomes `2026.45~c32` in the `.deb`, `.rpm` and
+   tarball names and `2026.45c32` in the Arch one, which is the week of the release it is a candidate
+   for and sorts after the previous release and before that one, so installing a candidate is an
+   upgrade (the property `tests/pack_version_test.sh` pins).
 4. **release**: `tools/weekly_changes.py` lists, for every pin that moved since the last release,
    the upstream commits (authors, PRs) and releases in between; that becomes the release notes and
    `changes.json`, and `gh release create` publishes it all.
@@ -503,7 +513,9 @@ rehearsal found these only after the build) and stops with a message naming what
   or `ROCM_PATH`. (The optional DwarfStar build that also wanted it is gone since 2026-11-02.)
 - **package:** `patchelf` (`scripts/package-linux.sh`); `dpkg-deb` and `docker`
   (`scripts/pack-distro.sh` builds the `.rpm` with rpmbuild in a `fedora` container and the Arch
-  package with makepkg in an `archlinux` one, since the release box has neither toolchain); `node`
+  package with makepkg in an `archlinux` one, since the release box has neither toolchain, and
+  `scripts/pack-proof.sh` installs all four in `ubuntu:26.04`, `fedora:latest`,
+  `opensuse/tumbleweed` and `archlinux:latest`, so the network has to reach those four images); `node`
   and `npm` for Lemonade's web app
   (`LEMONADE_WEB_APP=1 scripts/build-lemonade.sh`; its `npm ci` needs the network); a readable kernel image for the `os/mini` image,
   `/boot/vmlinuz-$(uname -r)` or `VMLINUZ=<copy>` (Ubuntu's `/boot/vmlinuz-*` is root-only).

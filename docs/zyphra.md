@@ -235,12 +235,18 @@ have been measured in three windows and answered differently every time.
   same-top-1 row on this page is CPU (`GGML_HRX=OFF`). What is affected is the meaning of `tok/s` — it is what those kernels produced, and it has
   not been validated against a known-answer. (2) The bench build these rows cite (`work/zarch/i1036@9ad387fb9/build-hrx`) **has been removed from
   the box**, so the rows are not re-derivable without rebuilding that tree; the tree itself is still at `9ad387fb9`. A future re-bench should
-  take the dispatch histogram first (`GGML_HRX_LOG_DISPATCH=1`, count registrations by name) and run the MUL_MAT gate before quoting a ratio.
+  take the dispatch histogram first (`GGML_HRX_LOG_DISPATCH=1`, count registrations by name) and run the MUL_MAT gate before quoting a ratio — but note
+  what that histogram **cannot** tell you: in the A/B above the two arms' registration sets were near-identical (the difference was one extra line, none
+  missing), because the log names registrations that *did* run and an op that never dispatched on HRX simply leaves no line. A fallback shows up in the
+  **timing**, not in the registration set.
   (3) **And the quantizer that produced the file decides whether these numbers mean anything at all**: a `llama-quantize` older than the F16 default
   quantizes the rank-128 adapter pair, whose `B` matmul then leaves HRX on every hybrid layer — the block formats want `input_size >= 256` while the
   float path only needs `% 4` — with no error and a large prefill cost. That mechanism is documented, with the measured numbers and the
   `--tensor-type ffn_gate_up_adapter=f16` remedy, in [`zyphra-models.md`](zyphra-models.md); it is the most likely explanation for the unexplained
-  prefill drop noted below, and it is why a throughput row here is inseparable from *which quantizer built it*.
+  prefill drop noted below, and it is why a throughput row here is inseparable from *which quantizer built it*. **Measured here on 2026-11-08**: two arms
+  that differ *only* in the adapter tensors' type, benefiched back to back in one ticket — F16 pairs `114.19` tok/s against Q6_K/Q8_0 pairs `14.03` at
+  `-p 8`, i.e. **8.1× for a 50 MiB file difference**. That is a launch-dominated shape, so it is not the ~1.3× that the same trap costs at `pp512`; it is the
+  honest number for "how bad can this get", and the reason a card must name the quantizer, not just the arm.
   **And when reporting which file suffered it, quote the types read out of the produced GGUF, never the ones you asked for** — the quantizer substitutes
   per tensor: asking for `ffn_gate_up_adapter=q6_K` yields `_a` = Q6_K but `_b` = **Q8_0**, because the `[128, 28672]` pair's contraction has
   `input_size = 128` and HRX's block-format admission needs `>= 256` while the float predicate needs only `>= 4`. So the pair leaves the device for *any*

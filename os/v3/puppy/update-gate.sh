@@ -407,8 +407,13 @@ try:
                   # partition table - and the updater refused it CORRECTLY ("not a 1bit OS image") while the gate called
                   # the product broken (measured on the guest: "does not contain a recognized partition table")
                   "printf 'label: gpt\\nstart=2048, type=L, name=\"1BIT-DATA\"\\n' | sfdisk -q /data/update.img; "
-                  "mkfs.ext4 -q -F -L 1BIT-DATA -d /data/imgstage /data/update.img 1664M; "
-                  "rm -rf /data/imgstage; echo image-ok $(stat -c%s /data/update.img)")
+                  # the filesystem goes into its OWN file and is dd'ed in at the partition offset, exactly as
+                  # mkimage.sh does: mkfs on the image itself would format over the partition table just written
+                  # (measured - the gate's check row caught it: "the image's partition table names 1BIT-DATA: 0")
+                  "truncate -s 1664M /data/data.part; "
+                  "mkfs.ext4 -q -F -L 1BIT-DATA -d /data/imgstage /data/data.part; "
+                  "dd if=/data/data.part of=/data/update.img bs=1M seek=1 conv=notrunc status=none; "
+                  "rm -rf /data/imgstage /data/data.part; echo image-ok $(stat -c%s /data/update.img)")
             img = v.val("MKIMG", mk, timeout=1800)
             say("INFO", "mkimg", (img or "<no answer>")[-120:])
             if "image-ok" not in (img or ""):

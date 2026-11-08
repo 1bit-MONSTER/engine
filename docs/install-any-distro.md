@@ -282,9 +282,13 @@ kernel, only the machine differing (`ubuntu:26.04`, headers `7.0.0-43-generic`):
 
 So **with Secure Boot on and no MOK of your own, the driver installs, builds, and then will not load** —
 `modprobe` refuses an unsigned module, and nothing in the package can help, because a key it shipped
-would not be trusted. Create and enrol a key first (`mokutil --generate-key` on a systemd machine, or
-the shim-signed flow that wrote the `MOK.priv`/`MOK.der` above), then `dkms autoinstall` rebuilds and
-re-signs. With Secure Boot off, the unsigned module loads and none of this matters.
+would not be trusted. Create and enrol a key first: `sudo update-secureboot-policy --new-key` writes
+`/var/lib/shim-signed/mok/{MOK.priv,MOK.der}` — the pair the table above signs with — then
+`sudo update-secureboot-policy --enroll-key` (or `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der`)
+queues it, and you confirm it in MokManager on the next boot. Then `sudo dkms autoinstall` rebuilds and
+re-signs. On a distribution without `update-secureboot-policy`, generate a pair with
+`openssl req -new -x509 …` and enrol it with `mokutil --import`. With Secure Boot off, the unsigned module
+loads and none of this matters.
 
 Verify (no model needed):
 

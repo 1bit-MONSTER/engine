@@ -447,7 +447,14 @@ int64_t XdnaTarget::m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float* A,
 
 void XdnaTarget::prof_add(ProfAcc* acc, int design, double pack, double quant,
                               double wait, double rb) {
-    if (q4nx_lh::phprof_on() && acc == prof_dec_ && !q4nx_lh::g_in_head) {
+    // g_ph is what the [bs] (batch) and [ph] (decode step) lines print, and both read it. Only the DECODE
+    // accumulator used to be counted, so a 219-row prefill -- which launches through prof_pre_ -- reported
+    // "n=0 launches, host=93113 ms" for 224 launches and 93 s of device wait: the wait fell into the line's
+    // host= residual and the launch count stayed zero, which reads exactly like a host fallback and sent one
+    // lane (engine #1582) looking for a fallback that does not exist. The batched body sets g_in_batch for
+    // its whole duration, so accepting prof_pre_ there counts those launches and keeps a decode-only
+    // measurement decode-only.
+    if (q4nx_lh::phprof_on() && (acc == prof_dec_ || q4nx_lh::g_in_batch) && !q4nx_lh::g_in_head) {
         q4nx_lh::g_ph.g_pack += pack; q4nx_lh::g_ph.g_ql += quant;
         q4nx_lh::g_ph.g_wait += wait; q4nx_lh::g_ph.g_rb += rb;
         q4nx_lh::g_ph.launches++;

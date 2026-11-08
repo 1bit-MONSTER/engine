@@ -58,6 +58,10 @@ Both are two to three orders of magnitude below the family bar below, so a quant
 
 ## What to publish per model
 
+**Which arm to publish, and what each arm measures**, is the other half of this pair: [`zyphra.md`](zyphra.md) carries the per-arm KLD and
+same-top-1 on wikitext-2 and on a code slice for every pick, the arm-labelling caveats, and the numbers' provenance. This page owns what the files
+are and how to build them; that one owns what they measure.
+
 The family bar is **mean KLD ≤ 0.03 AND same-top-1 ≥ 95 %**, and each model gets a sweet spot, a max-quality
 and a smallest-usable pick. The Zamba2 rows are the adapter form; the others are unchanged.
 

@@ -1751,6 +1751,11 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 std::vector<uint8_t> bytes(bf.begin() + off * 2, bf.begin() + (off + cnt) * 2);
                 w.add(out, "BF16", {int64_t(cnt)}, std::move(bytes));
                 ++r.tensors;
+                // the container's `attention_bias` is derived from this counter, and the forward only ADDS the q/k/v
+                // biases when the flag is set: without this the container carried bias tensors that the forward
+                // silently ignored, which is exactly the difference between this container and the 1.8 one for the
+                // same model (True vs False, byte-identical weights).
+                ++r.attn_bias_tensors;
             };
             slice(0, rkq, base + ".self_attn.q_proj.bias");
             slice(rkq, rkv, base + ".self_attn.k_proj.bias");

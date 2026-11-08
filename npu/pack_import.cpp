@@ -270,12 +270,35 @@ const uint8_t* at(const Fconst& f, int64_t off, int64_t len) {
 // reads at -4*NH. The tile shape cannot be derived from the pack itself -- it is not a subset sum of the
 // pack's own const sizes -- so each rule below was measured against the 1.8 pack of the SAME model by
 // whole-file diff. A 1.9 pack whose geometry is not in this table is refused rather than decoded on a guess.
+// The correlation above which an imported head is taken to BE the embedding (tied). Named because the container's
+// field, the readout and the note all have to agree on it: three copies of 0.99 is how they drifted apart before.
+constexpr double kTieCorr = 0.99;
+
 struct Fconst19Rule {
-    int hidden, heads, layers, n_tiles, tile, rot;
+    int hidden, heads, layers;
+    int64_t prefix;   // bytes before the q/k/v bundle: the norms, and on Qwen3 the per-head QK gains too
+    int n_tiles, rot;
+    int64_t tile;
 };
+// Every entry was measured by diffing the 1.9 pack against the 1.8 pack of the SAME model: the bundle's tile shape and
+// its rotation are not derivable from the pack, and neither is `prefix`. It was tempting to read the extra bytes as
+// Qwen3's per-head QK norm gains, but Llama-3.2-1B -- which has no QK norms at all -- carries the same +4,352 at hidden
+// 2,048, so the extra is a property of the geometry, not of the architecture. Measured anyway, because a plausible
+// explanation that survives one model is how this table would get a wrong row.
 constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen2.5-0.5B-Instruct: normalises to its 1.8 twin byte for byte, whole file, all 24 blocks.
-    {896, 14, 24, 16, 34816, 2},
+    {896, 14, 24, 1856, 16, 2, 34816},
+    // Qwen3-1.7B: same rule at hidden 2048 / 16 heads / 28 layers; 535 code bytes of the two builds differ, all in
+    // layer 24, which is content rather than layout (every block still lines up).
+    {2048, 16, 28, 8512, 3, 1, 1183744},
+    // Qwen3-4B: 2,933 of 2,208,061,248 bytes differ (1.3e-6), again content not layout. The prefix corroborates the
+    // Qwen3 offset seen at 1.7B -- 64 + 2*hidden + 4,352, so 8,512 at hidden 2,048 and 9,536 at 2,560 -- and the tile
+    // count differs from 1.7B's 3, which is why this is measured per pack and never derived.
+    {2560, 32, 36, 9536, 5, 1, 1462272},
+    // Llama-3.2-1B-Instruct: hidden 2,048 with 32/16 heads and no QK norms -- the first non-Qwen family here. Same
+    // prefix as Qwen3-1.7B at this hidden size (8,512), a different bundle (5 tiles of 591,872, not 3 of 1,183,744),
+    // and 1,857 of 686,518,336 bytes differ (2.7e-6). This row is the one that disproved the QK-norm explanation above.
+    {2048, 32, 16, 8512, 5, 1, 591872},
 };
 
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes
@@ -344,7 +367,7 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     }
     const int64_t hdr_len = int64_t(heads) * 4;
     const int64_t stride8 = stride9 - hdr_len;
-    const int64_t prefix = attn_payload_off(hidden);
+    const int64_t prefix = rule->prefix;
     const int64_t bundle = int64_t(rule->n_tiles) * rule->tile;
     if (rule->n_tiles < 2 || rule->tile <= 0 || prefix + bundle > hdr_off ||
         hdr_off + hdr_len > stride9 || stride8 <= 0) {
@@ -1767,13 +1790,16 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     if (!r.refused.empty() && !opt.allow_incomplete) return r;  // refuse by name, write nothing
 
     bool tied = false;
+    bool tie_declared = false;   // whether the pack states it at all (a genre-A pack ships no config.json)
     {
         std::ifstream cf(pack_dir + "/config.json");
         if (cf) {
             const auto c = json::parse(cf);
+            tie_declared = c.contains("tie_word_embeddings");
             tied = c.value("tie_word_embeddings", false);
         }
     }
+    bool head_written = false;
     // The graph's own name, the same resolution plan() uses: on the 1.9/hybrid lines it is `model_jit.onnx` and
     // `genai_config.json` says so. Opening "model.onnx" here made an import of exactly the packs plan() had just
     // learned to read fail at the first byte, with "cannot open <pack>/model.onnx".
@@ -2104,6 +2130,10 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 }
             r.lmhead_rel = sum_abs / sum_ref;
             r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+            // The diagnostic follows the NUMBER, not the pack's declaration: a genre-A pack ships no config.json, so
+            // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
+            // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
+            r.selfcheck_tied = r.lmhead_corr > kTieCorr;
             const Q4 swap = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K),
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
@@ -2144,6 +2174,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         r.tiles += head_tiles;
         w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
         ++r.tensors;
+        head_written = true;
         break;
     }
 
@@ -2171,19 +2202,23 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 const int64_t tail_off = int64_t(p.dims.layers) * g.stride;
                 const int64_t tile = attn_tile_bytes(H);
                 const int64_t rows = V / kTileRows;
-                const int64_t want = kTailNorm + rows * tile;
+                // The envelope is the same `64 + 2*hidden` the layer blocks open with (eps, padding, the norm), not a
+                // constant: 1,856 is only its qwen2.5-0.5B value. Qwen3-1.7B's tail is 4,160 + 2,374 x 73,984 to the
+                // byte, which the constant would have missed by 2,304.
+                const int64_t env = attn_payload_off(H);
+                const int64_t want = env + rows * tile;
                 const int64_t have = int64_t(fc.size) - tail_off;
                 if (V % kTileRows != 0 || want != have) {
                     late.push_back("lm_head.weight: the .fconst tail is " + std::to_string(have) + " B, not the " +
                                    std::to_string(want) + " B its envelope and head tiles would take (" +
-                                   std::to_string(kTailNorm) + " + " + std::to_string(rows) + " x " +
+                                   std::to_string(env) + " + " + std::to_string(rows) + " x " +
                                    std::to_string(tile) + " B), so the head's offsets are not established");
                 } else {
                     std::vector<TileW> tiles;
                     tiles.reserve(size_t(rows));
                     bool exact = true;
                     for (int64_t i = 0; i < rows; ++i) {
-                        const uint8_t* src = at(fc, tail_off + kTailNorm + i * tile, tile);
+                        const uint8_t* src = at(fc, tail_off + env + i * tile, tile);
                         tiles.push_back(decode_tile(src, int(H)));
                         const std::vector<uint8_t> back = encode_tile(tiles.back());
                         if (std::memcmp(back.data(), src, size_t(tile)) != 0) exact = false;
@@ -2198,10 +2233,60 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         tile_q4_1_f32(q, tiled, &pinexact);
                         r.codes_total = q.codes.size();
                         r.zero_exact_pct = 100.0 * double(q.scale.size() - pinexact) / double(q.scale.size());
+                        // The pack's own fp16 embedding is an independent reference for this decode: on a tied
+                        // model it must reproduce the 4-bit head, and on an untied one the number simply comes
+                        // out low. Report it rather than skipping: it is evidence either way (same rule the host
+                        // head path uses).
+                        if (q.N == int(V) && q.K == int(H)) {
+                            double sum_abs = 0, sum_ref = 0;
+                            for (int n = 0; n < q.N; ++n)
+                                for (int k = 0; k < q.K; ++k) {
+                                    const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
+                                    const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
+                                    double e;
+                                    if (embed->type == kF16) {
+                                        uint16_t h;
+                                        std::memcpy(&h, embed_bytes + (size_t(n) * H + k) * 2, 2);
+                                        e = f16_to_f32(h);
+                                    } else {
+                                        e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
+                                    }
+                                    sum_abs += std::fabs(x - e);
+                                    sum_ref += std::fabs(e);
+                                }
+                            r.lmhead_rel = sum_abs / sum_ref;
+                            r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+                            r.selfcheck_reference = true;
+                            r.selfcheck_tied = r.lmhead_corr > kTieCorr;
+                            // The control this path can actually run: the same tiles and the same decoder, with each
+                            // head row matched against the NEXT embedding row. If a misaligned head still correlated,
+                            // the number above would be measuring the vocabulary's mean brightness rather than the
+                            // head. (The host path's controls mis-decode its MatMulNBits bytes instead; there are no
+                            // such bytes here, and printing its numbers from struct defaults -- which is what this
+                            // path did until review -- is worse than printing none.)
+                            {
+                                double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
+                                const int n = std::min(2048, q.N - 1);
+                                for (int rr = 0; rr < n; ++rr)
+                                    for (int k = 0; k < q.K; ++k) {
+                                        const size_t g = size_t(rr) * (q.K / 32) + size_t(k) / 32;
+                                        const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[g] + q.zero[g];
+                                        uint16_t hb;
+                                        std::memcpy(&hb, embed_bytes + ((size_t(rr) + 1) * H + k) * 2, 2);
+                                        const double y = f16_to_f32(hb);
+                                        sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
+                                    }
+                                const double m = double(n) * q.K;
+                                const double cx = sxx - sx * sx / m, cy = syy - sy * sy / m;
+                                if (m > 0 && cx > 1e-12 && cy > 1e-12)
+                                    r.ctrl_corr_rowshift = (sxy - sx * sy / m) / std::sqrt(cx * cy);
+                            }
+                        }
                         const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
                         r.tiles += head_tiles;
                         w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
                         ++r.tensors;
+                        head_written = true;
                     }
                 }
             }
@@ -2537,8 +2622,13 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             auto pad_n = [](int n) { return (n + 511) / 512 * 512; };
             const int kpad = pad_k(p.dims.hidden);
             const int q_out = p.dims.heads * p.dims.head_dim, kv_out = p.dims.kv_heads * p.dims.head_dim;
+            // o_proj's K is q_proj's OUTPUT width, which is hidden only when heads*head_dim == hidden. On
+            // Qwen3-4B it is 32 x 128 = 4096 against a hidden of 2560, and declaring pad_k(hidden) there made the
+            // forward refuse this container ("declares O:2560x2560, this model derives O:4096x2560") -- the family
+            // guard doing exactly its job, since the mismatch would otherwise have been wrong text.
+            const int kpad_o = pad_k(int64_t(p.dims.heads) * p.dims.head_dim);
             c["q4nx_designs"] = "QKV:" + std::to_string(kpad) + "x" + std::to_string(pad_n(q_out + 2 * kv_out)) +
-                                ",O:" + std::to_string(kpad) + "x" + std::to_string(pad_n(p.dims.hidden)) +
+                                ",O:" + std::to_string(kpad_o) + "x" + std::to_string(pad_n(p.dims.hidden)) +
                                 ",GU:" + std::to_string(kpad) + "x" + std::to_string(pad_n(2 * p.dims.intermediate)) +
                                 ",D:" + std::to_string(pad_k(p.dims.intermediate)) + "x" +
                                 std::to_string(pad_n(p.dims.hidden));
@@ -2617,6 +2707,21 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         const TextArtifacts ta = scan_text_artifacts(pack_dir);
         c["vocab_size"] = V;
         c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries
+        // The forward picks between "logits from the token embedding" and "logits from a separate head tensor" on this
+        // key, and defaults to TIED when it is absent (npu/forward/src/q4nx_semantics.c). An untied pack that ships no
+        // config.json -- every genre-A hybrid, e.g. Phi-3-mini -- therefore used to look tied, and the forward decoded
+        // its logits from the embedding matrix: fluent-looking garbage ('slower slower slower'), with the head tensor
+        // sitting unused in the container. The pack's own declaration wins where it has one; otherwise the head we
+        // actually imported decides, by the same correlation the self-check reports.
+        if (tie_declared) {
+            c["tie_word_embeddings"] = tied;
+        } else if (head_written) {
+            c["tie_word_embeddings"] = r.lmhead_corr > kTieCorr;
+            c["q4nx_tie_note"] = "this pack states no tie_word_embeddings, so it is taken from the data: the " +
+                                 std::string(r.lmhead_corr > kTieCorr ? "imported head reproduces the embedding"
+                                                                      : "imported head is a separate matrix") +
+                                 " (correlation " + std::to_string(r.lmhead_corr) + ")";
+        }
         c["q4nx_source"] = {{"converter", "1bit npu-pack import"},
                             {"pack", p.pack},
                             {"layout", q4nx::layout_of(kContainerParams)},
@@ -2729,11 +2834,27 @@ int run(int argc, char** argv) {
         return 3;
     }
     std::printf("imported %d tensors, %lld q4_1 tiles into %s\n", r.tensors, r.tiles, out.c_str());
-    if (r.selfcheck_reference) {
-        std::printf("  self-check: lm_head vs the pack's fp16 embedding  corr %.6f  rel_err %.6f\n",
+    if (r.selfcheck_reference && r.selfcheck_tied) {
+        std::printf("  self-check: the head reproduces the pack's fp16 embedding  corr %.6f  rel_err %.6f\n"
+                    "              (tied: this correlation is the check, and it passed)\n",
                     r.lmhead_corr, r.lmhead_rel);
-        std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
-                    r.ctrl_corr_nibble, r.ctrl_corr_nozp);
+        if (r.ctrl_corr_rowshift >= 0)
+            std::printf("  controls:   row-shifted corr %.4f (must fail)\n", r.ctrl_corr_rowshift);
+        else
+            std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
+                        r.ctrl_corr_nibble, r.ctrl_corr_nozp);
+    } else if (r.selfcheck_reference) {
+        // An untied pack: lm_head and model.embed_tokens are separate matrices, so correlating them is not a test of
+        // anything. Say so, with the number, so the line cannot be read as a decoding failure.
+        std::printf("  self-check: not a check here -- this pack is untied (lm_head and the embedding are separate\n"
+                    "              matrices), so their correlation %.6f and rel_err %.6f are what an untied pack\n"
+                    "              looks like, not a decode failure; the controls still run\n",
+                    r.lmhead_corr, r.lmhead_rel);
+        if (r.ctrl_corr_rowshift >= 0)
+            std::printf("  controls:   row-shifted corr %.4f (must fail)\n", r.ctrl_corr_rowshift);
+        else
+            std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
+                        r.ctrl_corr_nibble, r.ctrl_corr_nozp);
     } else {
         std::printf("  self-check: skipped -- the head is not tied to the embedding, so the pack\n"
                     "              carries no independent reference to test the decode against\n");

@@ -477,12 +477,12 @@ lemver=$("$lem/bin/lemond" --version 2>/dev/null | sed -n 's/^lemond version \([
     # actually carries, and release-check's identity row SKIPped every mini image for that reason (engine#1481). The engine's
     # own sha256 is checkable, so it is written BESIDE the git sha rather than replacing it.
     #
-    # WHICH file, though: a mini image does not carry the Lemonade package's 1bit/1bit (that layout is os/v3's) - `copy_elf`
-    # puts this build's engine at "$root$bin" and /bin/1bit is a symlink to that same absolute path. So the bytes to hash are
-    # the IMAGE's copy, not the build tree's and not the payload's: hashing "$root$bin" is post-`cp -L`, and nothing rewrites it
-    # afterwards (the only `relocate`/patchelf calls are on the data-partition llama set). Hashing the build file would name
-    # bytes the image may not carry, and hashing `$root/bin/1bit` would follow the symlink out to the host's build tree.
-    launcher=${bin:+$root$bin}
+    # WHICH file, though: a mini image does not carry the Lemonade package's 1bit/1bit (that layout is os/v3's). The engine is
+    # staged at /bin/1bit as a REAL file (engine#1543 — the build path used to hold it, and the path was the leak), so the
+    # bytes to hash are the IMAGE's copy, not the build tree's and not the payload's: `$root/bin/1bit` is post-`cp -L`, and
+    # nothing rewrites it afterwards (the only `relocate`/patchelf calls are on the data-partition llama set). Hashing the build
+    # file would name bytes the image may not carry; that is why this reads the staged copy and not "$bin".
+    launcher=${bin:+$root/bin/1bit}
     if [ -n "${launcher:-}" ] && [ -f "$launcher" ]; then
         echo "engine_sha256: $(sha256sum "$launcher" | cut -c1-64)"
     else

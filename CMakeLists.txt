@@ -423,7 +423,19 @@ if(ONEBIT_HRX)
         add_dependencies(onebit llama_hrx)
     endif()
     onebit_build_relative(ONEBIT_HRX_SERVER _onebit_hrx_server)
-    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${_onebit_hrx_server}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}"
+    # ONEBIT_HRX_LIBHSA (the auto-detected path in the cache) is NOT compiled in. It is a *build-machine* path by
+    # construction - cmake/hrx.cmake globs it out of ONEBIT_HRX_TOOLCHAIN - so baking it (a) makes the bytes depend
+    # on where the build ran, (b) writes the builder's tree into a public tarball (the c33 roll of 2026-11-08 failed
+    # its own package gate on the one string /home/<builder>/wt/.../libhsa-runtime64.so.1), and (c) names a location
+    # the target does not have: the appliance installs the runtime at /opt/rocm-therock/lib and the distro packages
+    # at /opt/1bit/engine/hrx/llama/bin, so the baked path never resolves there and serve falls through to its scan
+    # anyway (app/serve.cpp:212-224; docs/hrx.md). The cache value stays build metadata - os/mini/mkimage.sh reads
+    # it to decide which runtime to SHIP - and ONEBIT_HRX_LIBHSA_BAKE is the explicit way to put a path into the
+    # binary, for a builder whose layout is the target's.
+    if(ONEBIT_HRX_LIBHSA_BAKE)
+        target_compile_definitions(onebit PRIVATE ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA_BAKE}")
+    endif()
+    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${_onebit_hrx_server}"
                                ONEBIT_HRX_ALLOW_NO_SVM=${ONEBIT_HRX_ALLOW_NO_SVM})
     if(ONEBIT_SERVE_TEST_GGUF)
         foreach(_dev hrx cpu)

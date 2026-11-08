@@ -1063,6 +1063,16 @@ cmake --build build --target onebit
   llama-server as `IREE_HAL_AMDGPU_LIBHSA_PATH`, unless it is already set. Without a
   build path it searches the pinned toolchain, then `/opt/rocm-therock`. To run
   llama-server or llama-bench by hand, export that variable yourself.
+- **The found path is build metadata, not a literal (engine#1453).** CMake records the
+  toolchain's `libhsa-runtime64.so.1` in the cache so `os/mini/mkimage.sh` knows which
+  runtime to *ship*, but nothing is compiled into the binary: baked in, it is a
+  build-machine path by construction - it makes the tarball's bytes depend on where the
+  build ran, writes the builder's tree into a public artifact (the c33 roll of 2026-11-08
+  failed its own package gate on `/home/<builder>/wt/.../libhsa-runtime64.so.1`), and names
+  a location the target does not have, since the appliance installs the runtime at
+  `/opt/rocm-therock/lib` and the distro packages at `/opt/1bit/engine/hrx/llama/bin`. So
+  `serve` resolves `--hrx-libhsa`, then a path baked on purpose with
+  `-DONEBIT_HRX_LIBHSA_BAKE=<path>`, then the scan.
 - **The runtime is named at init (engine#713).** Three `libhsa-runtime64.so.1` exist on a
   box (the release-shipped one, the pinned toolchain's, the distro's) and they are not
   interchangeable: the distro's ROCr is old enough to be missing an entry point the driver

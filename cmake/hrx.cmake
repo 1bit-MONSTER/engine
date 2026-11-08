@@ -96,8 +96,12 @@ if(ONEBIT_BINARY_DROP_HRX_BIN AND EXISTS "${ONEBIT_BINARY_DROP_HRX_BIN}/llama-se
             list(GET _drop_libhsa 0 _drop_libhsa_first)
         endif()
         if(_drop_libhsa_first)
+            # A cache value, not a compile definition: CMakeLists.txt compiles nothing from it (engine#1453 - baking a
+            # build-machine path put /home/<builder>/.../libhsa-runtime64.so.1 in the c33 tarball and failed its own
+            # package gate), but os/mini/mkimage.sh reads it to know which runtime to ship. ONEBIT_HRX_LIBHSA_BAKE is
+            # the opt-in that does go into the binary.
             set(ONEBIT_HRX_LIBHSA "${_drop_libhsa_first}" CACHE FILEPATH
-                "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH)" FORCE)
+                "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH); build metadata, not baked in" FORCE)
         else()
             set(ONEBIT_HRX_LIBHSA "" CACHE FILEPATH
                 "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH)" FORCE)

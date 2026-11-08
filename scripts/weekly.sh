@@ -450,8 +450,16 @@ package_checks() {  # package_checks <linux tarball>
                   done | grep -E '\.(c|cc|cpp|cxx|h|hpp|py)$' | xargs -r -n1 basename | LC_ALL=C sort -u)
         n=0; [ -z "$privsrc" ] || n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$privsrc") || true)
         [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a private source file ($n strings)"; b1=1; }
-        n=$(strings -a "$f" | grep -c '/home/' || true)
-        [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a build-machine home ($n strings)"; b1=1; }
+        # Any path that names THIS machine's tree, not just /home/: a build under /build or /opt/ci leaks the builder
+        # the same way, and a /home/-only row let c32 ship a builder path under /opt. Measured 2026-11-08: the c32 and
+        # c33 tarballs baked /opt/rocm-therock/... and /home/<builder>/wt/.../libhsa-runtime64.so.1 respectively, and
+        # only the second tripped this row - the row was right about the leak and too narrow about where it lives.
+        _badpats=$(printf '%s\n' /home/ "${SRC:-/nonexistent-build-src}" "${W:-/nonexistent-build-w}")
+        n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$_badpats") || true)
+        [ "$n" = 0 ] || {
+            echo "FAIL the packed 1bit names a build-machine path ($n strings): $(strings -a "$f" | grep -F -f <(printf '%s\n' "$_badpats") | head -2 | tr '\n' ' ')"
+            b1=1
+        }
         if [ $b1 = 0 ]; then echo "ok   the packed 1bit: no symbol table, no private source names, no build-machine paths"; else bad=1; fi
     fi
     for f in LICENSE NOTICE LICENSE-BINARY NOTICE-BINARY; do

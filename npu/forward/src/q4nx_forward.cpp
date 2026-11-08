@@ -3118,6 +3118,30 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
 
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
 // then the f32 signs those offsets index (the GGUF's prism.hadamard.sign_widths/sign_values).
+bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int start_pos,
+                                      std::vector<float>& logits) {
+    if (!ready_) { err_ = "not initialised"; return false; }
+    const size_t H = (size_t)c_.H;
+    if (H == 0 || embeds.empty() || embeds.size() % H != 0) {
+        err_ = "step_batch_embeds: " + std::to_string(embeds.size()) + " floats is not a whole number of " +
+               std::to_string(H) + "-wide rows";
+        return false;
+    }
+    for (float v : embeds)
+        if (!std::isfinite(v)) { err_ = "step_batch_embeds: a row holds a non-finite value"; return false; }
+    const int rows = int(embeds.size() / H);
+    // The body indexes tokens[m] only when nothing is injected, but it still needs the row count and the guards
+    // above it read tokens; a zero vector of the right length keeps every check honest (0 is a valid id) while
+    // the fill itself takes the injected rows.
+    const std::vector<int> placeholder(size_t(rows), 0);
+    struct Restore {
+        const float*& p;
+        ~Restore() { p = nullptr; }
+    } restore{inject_embeds_};
+    inject_embeds_ = embeds.data();
+    return step_batch(placeholder, start_pos, logits);
+}
+
 bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_pos,
                                     std::vector<float>& logits_all) {
     // A noncausal pack's full-attention layers read the whole prompt, so in a batch every row attends to
@@ -3185,6 +3209,11 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     const bool simple_dense =
         !mla_ && ple_dim_ == 0 && !gemma4_layer_ && kv_self;
     if (!simple_dense || getenv("NPU_NO_BATCH")) {
+        if (inject_embeds_) {
+            err_ = "step_batch_embeds: this model's batched body falls back to per-token step(), which needs "
+                   "token ids to look up; precomputed embeddings are refused rather than run on placeholders";
+            return false;
+        }
         if (getenv("NPU_BATCH_DBG"))
             std::fprintf(stderr,
                          "[batch] M=%d fallback: mla=%d lin=%d ple=%d gemma4=%d experts=%d "
@@ -3250,7 +3279,9 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     std::vector<float> X((size_t)M * H), XN((size_t)M * H);
     for (int m = 0; m < M; m++)
         for (int k = 0; k < H; k++)
-            X[(size_t)m * H + k] = embed_at(tokens[m], k) * embed_scale_;
+            X[(size_t)m * H + k] = (inject_embeds_ ? inject_embeds_[(size_t)m * H + k]
+                                                   : embed_at(tokens[m], k)) *
+                                   embed_scale_;
     if (phb) { g_ph.embed = ph_ms(tp_bs); tp_lap = std::chrono::steady_clock::now(); }
 
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;

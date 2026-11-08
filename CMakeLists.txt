@@ -1245,6 +1245,12 @@ if(ONEBIT_NPU)
 # onebit_npu_gemm.cpp, the same call the ONNX EP's QDQ leg uses), so a device row can be produced from the
 # tree: encode a fixed sentence list and compare with the reference vectors.
 if(ONEBIT_NPU)
+    # The decoder's precomputed-embedding entry point (npu/forward/embeds_equiv_probe.cpp): rows built from the
+    # model's own table must give byte-identical logits to the token-id path, on the host and on the array.
+    add_executable(embeds_equiv_probe npu/forward/embeds_equiv_probe.cpp)
+    target_include_directories(embeds_equiv_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
+        ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)
+    target_link_libraries(embeds_equiv_probe PRIVATE onebit_npu_forward onebit_npu_rt)
     add_executable(embed_npu_gate_probe npu/embed/embed_gate_probe.cpp app/embed_model.cpp
                    npu/ort/onebit_npu_gemm.cpp)
     target_include_directories(embed_npu_gate_probe PRIVATE ${CMAKE_SOURCE_DIR}/app

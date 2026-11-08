@@ -31,6 +31,8 @@
 
 #include <onnxruntime_c_api.h>
 
+#include "ort_diagnose.h"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -538,7 +540,13 @@ int onebit_ort_run_main(int argc, char** argv) {
 
     OrtSession* session = nullptr;
     if (OrtStatus* st = make_session(env, a.model, a.eps, a.threads, a.basic, a.profile, &session)) {
+        // ORT's own message names the op and nothing else; engine#1436 asks for one line that says
+        // whether the model, our EP or the pinned runtime's op coverage stopped it, and which route
+        // does work.  Printed after ORT's message, so both are on the line a reader sees.
+        const std::string hint = onebit_ep::session_failure_hint(
+            api->GetErrorMessage(st) ? api->GetErrorMessage(st) : "", base->GetVersionString());
         int rc = fail("create session", st);
+        if (!hint.empty()) std::fprintf(stderr, "%s\n", hint.c_str());
         api->ReleaseMemoryInfo(mi);
         api->ReleaseEnv(env);
         return rc;

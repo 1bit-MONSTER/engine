@@ -42,10 +42,17 @@ target_compile_options(ort_info PRIVATE -O2 -Wall -std=c++17)
 
 # ort-run: a plain ONNX model through ORT with our plugin EP registered first (docs/onnx.md,
 # "Qwen3-0.6B"). In-tree the root links this object into `1bit` as `1bit ort-run`.
-add_library(onebit_ort_run STATIC ort_run.cpp)
+add_library(onebit_ort_run STATIC ort_run.cpp ort_diagnose.cpp)
 target_link_libraries(onebit_ort_run PUBLIC PkgConfig::ONEBIT_ORT_PC)
 set_target_properties(onebit_ort_run PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_options(onebit_ort_run PRIVATE -O2 -Wall -std=c++17)
+
+# engine#1436: the one-line explanation a session failure gets. Pure string work over ORT's own message,
+# so it is testable without a session, a model or a device.
+add_executable(ort_diagnose_test ort_diagnose_test.cpp ort_diagnose.cpp)
+target_include_directories(ort_diagnose_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(ort_diagnose_test PRIVATE -O2 -Wall -std=c++17)
+add_test(NAME ort_diagnose COMMAND ort_diagnose_test)
 
 add_executable(ort_run ort_run_main.cpp)
 target_link_libraries(ort_run PRIVATE onebit_ort_run)

@@ -506,6 +506,33 @@ rules make this work, and one of them is a bug we hit:
   the rank check, into a graph that refused to run at all (`only rank-2 and rank-3 MatMul are
   supported yet` on a rank-4 attention matmul).
 
+### Quantized ONNX is two formats, and only one of them runs here
+
+"Quantized ONNX" on Hugging Face is at least two different things, and they fail differently:
+
+| flavour | example | op vocabulary | what this engine does |
+|---|---|---|---|
+| fp32 weights + in-graph **Q/DQ** | AMD's `*_amdgpu` / `aws` exports, the Quark A8W8 export below | `QuantizeLinear`/`DequantizeLinear` around float ops | **runs**; the EP claims the `MatMul` groups |
+| **ONNX-native integer ops** | `Xenova/yolov8n-pose` `model_int8.onnx`, many Optimum exports | `ConvInteger`, `MatMulInteger`, `QLinearConv`, `DynamicQuantizeLinear` | **cannot create a session**: the pinned ORT has no CPU kernel for those ops |
+
+Neither case is a model failure and neither is this EP's: the second one is the *runtime's* op coverage, and the
+first thing worth knowing is that the same repository almost always ships an fp32 export that does run.
+
+Because the pinned ORT's own message names the op and nothing else, `1bit ort-run` prints one line after it:
+
+```
+onebit-ort-run: FAIL create session: Could not find an implementation for ConvInteger(10) node with name …
+onebit-ort-run: 'ConvInteger' is not a kernel the pinned ORT has (1.23.2), so the session cannot start. This
+  graph is ONNX-native int8 …, which is a different format from fp32 weights with in-graph Q/DQ … Use the
+  repository's fp32 export for this measurement (docs/onnx.md, "Quantized ONNX is two formats").
+```
+
+Reproduced without downloading anything: a 139-byte synthetic graph holding a single `ConvInteger` node (opset 17,
+`x`/`w` int8, `y` int32) fails exactly as the public export does, which is what makes the message a property of
+the runtime rather than of one AGPL model. The check itself is `ctest -R ort_diagnose` (pure string work over
+ORT's message, so it needs no session and no model), and the runner prints the second line for any missing kernel,
+naming the op — only the integer-op case is additionally told it is the ONNX-native int8 format.
+
 ### Quantised graphs (Quark A8W8 QDQ)
 
 A Quark-quantised ONNX model is a *QDQ* graph (`DequantizeLinear` → `MatMul` → `QuantizeLinear` with

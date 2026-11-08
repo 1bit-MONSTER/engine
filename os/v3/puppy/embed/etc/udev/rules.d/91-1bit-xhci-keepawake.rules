@@ -1,0 +1,53 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/udev/rules.d/91-1bit-xhci-keepawake.rules - keep the Strix Halo xHCI controllers out of runtime suspend on
+# the Bosgame BeyondMax (AXB35-02), where three of the four of them are otherwise dead ports (engine#823).
+#
+# Cycle 32, engine#823. Measured on the board (AXB35-02, BIOS 1.09, kernel 7.4.0-rc1-1bit) with nothing plugged into
+# the rear ports or the Type-C ports:
+#
+#   controller   power state   PORTSC of every port
+#   0000:c5:00.4  D3cold        0xffffffff     <- the function is off, the register block is unreadable
+#   0000:c7:00.3  D3cold        0xffffffff
+#   0000:c7:00.4  D3cold        0xffffffff
+#   0000:c7:00.0  D0            0x2a0 RxDetect PP on the empty ports (this one carries the front USB-A, BT, JetKVM)
+#
+# and the SAME ports of 0000:c7:00.3, with only `power/control` forced to `on` at runtime, read
+# `0x0a0002a0 Speed=0 Link=RxDetect PP WCE WOE` - port power on, SuperSpeed PHY up, wake-on-connect armed. So the
+# ports are not electrically dead: the controller is switched off, and a controller that is off cannot raise a
+# connect event, which is exactly the reported symptom (no kernel event at all, 0 interrupts since boot). The
+# platform offers no way back either: the ACPI nodes (`XHC1` = \_SB_.PCI0.GPPA.XHC1, `XHC0/XHC3/XHC4` under
+# \_SB_.PCI0.GPPC) declare power resources for D0/D3hot and no `_PR3`, and USB remote wake is disabled on every root
+# hub, so nothing is armed to wake them.
+#
+# This rule is the same shape as 90-1bit-npu-power.rules one cycle earlier: instead of waiting for firmware, do not
+# let the device enter the state the board cannot leave. The NPU rule is the precedent, including the `TEST` guard
+# (inert on a kernel whose device has no `power/control`) and the narrow match so no other device is touched.
+#
+# Matched by BOARD, not by PCI id alone: the four Strix Halo xHCI functions exist on every Strix Halo machine, and on a
+# machine whose firmware does wire port wake there is no reason to spend their idle power. The DMI match keeps this
+# board-specific, which is what the measurement covers. The four, with the function numbers the PORTSC table above uses:
+# 1022:1587 = c5:00.4, 1022:1588 = c7:00.0 (the awake one), 1022:1589 = c7:00.3, 1022:158b = c7:00.4. The two USB4 Host
+# Routers (1022:158d = c7:00.5, 1022:158e = c7:00.6) are deliberately NOT in the alternation.
+#
+# `ACTION=="add|bind"`: on a normal boot xhci_hcd binds after udev is up; a module loaded before udev (initrd,
+# coldplug) emits only `add`. If neither fires, `power/control` stays `auto` and the ports stay dark - the failure
+# is silent (the box looks healthy, the ports are just absent), so the way to prove this rule ran is to read the four
+# attributes back, not to trust the file's presence.
+#
+# One line on purpose: udev rules are parsed line by line and a trailing backslash is not a continuation here, so a
+# wrapped rule silently matches nothing - which is how a fix like this looks like it shipped and does nothing.
+ACTION=="add|bind", SUBSYSTEM=="pci", DRIVER=="xhci_hcd", ATTR{[dmi/id]board_name}=="AXB35-02", ATTR{vendor}=="0x1022", ATTR{device}=="0x1587|0x1588|0x1589|0x158b", TEST=="power/control", ATTR{power/control}="on"

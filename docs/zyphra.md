@@ -1,3 +1,10 @@
+> **Scope of this page: what the arms measure.** This is the showcase half of two Zyphra docs and it owns exactly one job — the per-arm
+> measurements (KLD, same-top-1, the two corpora, arm-label findings, what the numbers do and do not support). **What the files *are*, and how to
+> convert and quantize them** — ref sizes and tensor counts, the `--tensor-type ffn_gate_up_adapter=f16` trap for quantizers older than the F16 default,
+> the layout asserts worth running before a PPL, and input-layer placement — lives in [`docs/zyphra-models.md`](zyphra-models.md), which is where a
+> reader who wants to *produce* a Zamba2 file should start. The split exists so the two pages cannot drift: neither repeats the other's tables, and
+> each links here. If you are looking for the adapter-form size deltas or the quantizer trap, that is the other page.
+
 <!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0

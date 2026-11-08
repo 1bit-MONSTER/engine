@@ -115,13 +115,26 @@ proved by the byte-exact gate rather than assumed. It is listed in §5.
   isolates the *declaration* of the interface (this step) from the *derivation* rewrite (A2/P1), which is
   the part with the filename-probe trap in it.
 
-**A2 (P1-dependent)** — the setup side:
+**A2 (P1-dependent)** — the setup side, and its state in the tree:
 
-- `engine-src`/`init_impl()`'s design derivation (`q4nx_derive_designs` + `file_exists()` probes) is
-  replaced by `plan.json`; the target's `open(plan, kernels_dir, err)` does the ELF/manifest loading and
-  the refusals, and `adopt_ctx*` disappears.
+- the design set is **named by the plan** (`designs[]`, `Plan::designs_agree()`): when the section is
+  present the engine refuses a plan that disagrees with what the container derives, naming the role and
+  both sides. `tools/npu_plan.py` writes the section for the families it can state completely and writes
+  **nothing** for the ones it cannot (MLA, GDN mixes, Gemma4's second attention type / PLE / double-wide
+  MLP), because an incomplete section would be refused at load. **Done** (#1330, #1333).
+- **the M=128 ELF set is the target's** (`XdnaTarget::open_prefill()`): it adopts each geometry, probes
+  the artifact, refuses by name, and owns `init_elf`; the forward no longer creates an `I8Ctx` for the
+  prefill set. The device is passed at construction (`XdnaTarget(xrt::device*)`), which keeps
+  `NpuTarget::open(plan, kernels_dir, family, err)` exactly as documented here. **Done** (#1380).
+- **still in the forward, and therefore still owed**: the M=16 decode family and the lm-head context.
+  Moving them needs only the setup state that `configure(Setup)` already carries (dirs, family, plan,
+  layout flags), which is why that struct exists.
 - `load_block(first_layer, n_layers, err)` takes over the weight residency role of `load_layer()`'s
   packing half (`wcache_` fill + pb16i image load), so a target that maps weights zero-copy can do it.
+  **Not started.**
+- the filename probes are gone for everything the plan names, and **`adopt_geometry`/`make_ctx` are still
+  on the target's surface** because the decode family and the lm head use them; they become private with
+  the move above.
 
 **A3** — `NpuModel`:
 
@@ -166,6 +179,23 @@ pad — and it did not, reading `A[real_k .. K)` past the caller's buffer and, i
 from a buffer laid out at stride `real_k`. Both host branches now call `q4nx_host_gemm_f32_padded()`, which owns
 the pad-and-read pair so a caller cannot separate them, and `tests/host_gemm_pad_test.c` pins it with a NaN guard
 tail after the activation buffer.
+
+## 4b. The two plan-layer rules the owner added after this split (engine#799)
+
+Both are in the tree and both are about *not* discovering a problem at a launch:
+
+- **every op a plan may name ships a host reference with known answers** — `npu/plan/op_registry.{h,cpp}`,
+  `ctest: npu_plan_op_reference`. `gemv` and `lm_head` are registered with hand-computed cases (including a
+  zero row, negative operands and `m=2`, so the reference is checked on a path the easy case misses); the
+  test walks the whole `OpId` vocabulary, so an op added with no entry fails it rather than passing silently.
+  `gdn_step` and `attn_step` are the remaining gap, and the contract above them now says why: their
+  signatures carry none of the layer's parameters or state, which a reference has to take explicitly.
+- **completeness at load, never a silent host fallback** — `Plan::check_artifacts()` refuses a plan whose
+  `designs[]` names an artifact no kernel directory has (present and non-empty, first hit wins), naming the
+  design, the role and the artifact, **before any context is opened**; `tools/npu_plan.py --check` asks the
+  same question with the same rule at import time. What the plan layer deliberately does not check is a
+  tensor's quantisation — that is the container's (`npu/q4nx.h`), and a second opinion is how two answers
+  start disagreeing.
 
 ## 5. Deliberately not in A1
 

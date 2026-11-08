@@ -105,12 +105,19 @@ QWEN35_GDN = {
 
 
 def qwen35_rename(name):
-    """A d3 pack's HF tensor name -> the name Q4nxNpuForward loads (engine #796)."""
-    if name.startswith("visual."):
+    """A VL pack's HF tensor name -> the name Q4nxNpuForward loads (engine #796, and Qwen3-VL's layout).
+
+    Two spellings reach us and both mean the same thing: a FastFlowLM/OGA-style pack nests the language model
+    under `language_model.*`, and a Hugging Face `Qwen3VLForConditionalGeneration` nests the same tensors under
+    `model.language_model.*` beside `model.visual.*` (the vision half, which the NPU text decoder never reads).
+    """
+    if name.startswith("model.visual.") or name.startswith("visual."):
         return None                      # the text path: the forward never reads these
-    if not name.startswith("language_model."):
-        raise SystemExit(f"{name}: not a qwen3_5 tensor; expected language_model.* or visual.*")
-    rest = name[len("language_model."):]
+    prefix = "model.language_model." if name.startswith("model.language_model.") else "language_model."
+    if not name.startswith(prefix):
+        raise SystemExit(f"{name}: not a qwen3_5 or qwen3_vl text tensor; expected "
+                         f"language_model.*, model.language_model.* or (model.)visual.*")
+    rest = name[len(prefix):]
     if rest in ("embed_tokens.weight", "norm.weight"):
         return "model." + rest
     m = re.match(r"layers\.(\d+)\.(.+)$", rest)
@@ -274,7 +281,7 @@ def pack(args):
         print(f"attn_output_gate: q_proj rows de-interleaved per head ({gate[0]} heads, head_dim {gate[1]})")
     skipped = 0
     for name, path, header, data_off in entries:
-        if arch == "qwen3_5" and name.startswith("visual."):
+        if arch == "qwen3_5" and (name.startswith("visual.") or name.startswith("model.visual.")):
             skipped += 1                    # decided from the name, before reading its bytes
             continue
         w = read_tensor(path, header, data_off, name)

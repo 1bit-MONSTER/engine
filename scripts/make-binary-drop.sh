@@ -155,7 +155,9 @@ missing=$(pack_missing_libs "$stage")
 # the private HIP kernels really are compiled into the HRX ggml library
 n=$(nm -D --defined-only "$stage/hrx/llama/bin/libggml-hrx.so" | grep -c ggml_hrx_hip_addon_register || true)
 [ "$n" != 0 ] || fail "libggml-hrx.so does not export ggml_hrx_hip_addon_register"
-n=$(strings -a "$stage/hrx/llama/bin/libggml-hrx.so" | grep -c amdgcn-amd-amdhsa || true)
+# counted as embedded AMDGPU ELFs, not as the "amdgcn-amd-amdhsa" string: the release build's library carries 54
+# code objects and no such string, while a 2-object build happens to carry it (engine#1443)
+n=$(pack_amdgpu_objects "$stage/hrx/llama/bin/libggml-hrx.so")
 [ "$n" != 0 ] || fail "libggml-hrx.so carries no HIP code objects"
 
 # the NPU library exposes the public API and nothing that names the private sources

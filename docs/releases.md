@@ -422,7 +422,9 @@ It takes the HRX tree from a release build (`--build <dir>`, packed the way `pac
 packs it: the same `scripts/pack-elf.sh` steps copy the libraries it loads beside it, set RUNPATH
 to `$ORIGIN` and strip it) or from an already packed release (`--from-package <tar.zst>`), and the NPU library either prebuilt (`--npu-lib`) or built from the
 pinned private sources (`--npu-rt <dir>`, its `build-api-lib.sh`). It then runs the same class of
-checks the release package runs: the NPU runtime compiled in, the kernels really are compiled in, no source files,
+checks the release package runs: the NPU runtime compiled in, the kernels really are compiled in (the add-on's
+register symbol, and at least one AMDGPU code object embedded in `libggml-hrx.so`, counted as ELF headers with
+`e_machine` 224 rather than as a target-triple string, which a release build's library does not carry: #1443), no source files,
 nothing named like the private sources, both binary licenses present, every library found. It publishes nothing; the
 orchestrator publishes the tarball and adds its line to `config/binary-drop.config`.
 

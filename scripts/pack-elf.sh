@@ -26,6 +26,11 @@
 #                                   when TheRock's amdclang builds llama.cpp) is copied beside it,
 #                                   and its RUNPATH becomes $ORIGIN plus the entries outside the
 #                                   build tree and $HOME (TheRock in /opt, which HRX needs anyway)
+#   pack_amdgpu_objects <file>      prints how many AMDGPU code objects (ELF64, e_machine 224 =
+#                                   EM_AMDGPU) are embedded in <file>. The property, not a string:
+#                                   HRX embeds its kernels as raw code objects in .rodata, and the
+#                                   target triple string is absent from a library that carries 54
+#                                   of them (engine#1443)
 #   pack_strip <dir>                strips symbol tables and debug info from every ELF under <dir>
 #   pack_build_rpaths <dir> <build> prints each ELF under <dir> whose RPATH/RUNPATH still points
 #                                   into <build> or $HOME
@@ -47,6 +52,11 @@ PACK_BUNDLE_LIBS=${PACK_BUNDLE_LIBS:-'libomp.so libomp.so.*'}
 PACK_EXTERNAL_LIBS=${PACK_EXTERNAL_LIBS:-'libamdhip64.so* libhipblas.so* libhipblaslt.so* librocblas.so* libhsa-runtime64.so* librocm_smi64.so* librocsolver.so* libroctx64.so*'}
 
 pack_is_elf() { [ -f "$1" ] && [ "$(head -c 4 "$1" | od -An -c | tr -d ' ')" = '177ELF' ]; }
+# ELF magic, ELFCLASS64, little-endian, then e_machine at offset 18 = 0xe0 0x00. The outer x86-64 ELF has
+# e_machine 62, so it is not counted. grep is line-oriented, so newlines become 0xff first (a byte none of the
+# fixed header bytes use): a header with a 0x0a in its skipped bytes would otherwise be split and missed.
+# Measured equal to a full header parse on five shipped/built libraries.
+pack_amdgpu_objects() { [ -f "$1" ] || { echo 0; return; }; LC_ALL=C tr '\n' '\377' < "$1" | LC_ALL=C grep -oaP '\x7fELF\x02\x01[\s\S]{12}\xe0\x00' | wc -l; }
 # only an ELF with a .dynamic section can carry an RPATH/RUNPATH; a static ELF (an AIE kernel
 # object, an intermediate link) must be left alone rather than fed to patchelf
 pack_is_dynelf() { pack_is_elf "$1" && readelf -S "$1" 2>/dev/null | grep -c '\.dynamic' | grep -qv '^0$'; }

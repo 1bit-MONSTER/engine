@@ -1069,6 +1069,7 @@ add_test(NAME npu_window11_policy COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/npu-w
 # 0755 (was executable) or 0644 (was not), no file or directory is group/other-writable, and the reporter that catches a
 # staging line added below the normalisation still fires on a tree nobody normalised.  Fixture tree: no build, no tar.
 add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.sh)
+add_test(NAME pack_amdgpu_objects COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_amdgpu_objects_test.sh)
 # The GEMM designs are derived on the container's K grid and the kernel's N grid (engine#845); a
 # model already on both is unchanged.  Pure arithmetic + one assemble_B, so it runs without a model.
 # The engine's derived design set for a set of dims, as `ROLE M K N elf` lines.  The instrument the

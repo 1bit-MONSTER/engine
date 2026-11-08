@@ -36,24 +36,35 @@ trap cleanup EXIT
 
 start() {   # start <log> [env...]: serve on a free port with the fake backend, env applied to serve
     local log=$1; shift
-    port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    env FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port "$port" --alias hybrid-model \
-        --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
-    pid=$!
-    api="http://127.0.0.1:$port"
-    # A deadline in seconds, not a try count: the old 100-try loop took 6.7 s on a quiet box and 15.2 s on the
-    # same commit on a loaded CI runner, so a slow runner exhausted it and four checks failed as if routing had
-    # broken (engine #850).
-    local code=000 deadline=$((SECONDS + ${HYBRID_ROUTE_START_S:-60}))
-    while :; do
-        code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health")
-        [ "$code" = 200 ] && break
-        [ $SECONDS -lt $deadline ] || break
-        sleep 0.1
+    local attempt port code deadline
+    for attempt in 1 2 3; do
+        port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+        env FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port "$port" --alias hybrid-model \
+            --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
+        pid=$!
+        api="http://127.0.0.1:$port"
+        # A deadline in seconds, not a try count: the old 100-try loop took 6.7 s on a quiet box and 15.2 s on the
+        # same commit on a loaded CI runner, so a slow runner exhausted it and four checks failed as if routing had
+        # broken (engine #850).
+        code=000 deadline=$((SECONDS + ${HYBRID_ROUTE_START_S:-60}))
+        while :; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health")
+            [ "$code" = 200 ] && break
+            [ $SECONDS -lt $deadline ] || break
+            sleep 0.1
+        done
+        if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log" && [ "$attempt" -lt 3 ]; then
+            # A server that never came up because it could not bind is a port collision, not a defect in what
+            # this test checks: serve picks the port, releases it, and launches its backends before it binds, so on
+            # a -j runner another serve can take it inside that window. Re-pick a bounded number of times; the FAIL
+            # message below stays for a collision that will not go away (engine #1444).
+            echo "     note: port $port was taken before serve bound it; retrying with a fresh port (attempt $((attempt + 1))/3)"
+            stop
+            continue
+        fi
+        break
     done
     if [ "$code" != 200 ]; then
-        # A server that never came up because it could not bind is a port collision, not a defect in
-        # what this test checks: name the port and stop, before an empty body turns into a JSON error.
         if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
             echo "FAIL: hybrid_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
             exit 1

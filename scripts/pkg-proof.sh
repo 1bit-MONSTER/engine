@@ -81,6 +81,13 @@ row() {   # <PASS|FAIL> <what> <detail>
     [ "$1" = PASS ] || fail=1
 }
 check() { local what=$1 detail=$2; shift 2; if "$@" >/dev/null 2>&1; then row PASS "$what" "$detail"; else row FAIL "$what" "$detail"; fi; }
+# The sentence a document cites, defined HERE rather than typed at the end of the run and again in the
+# self-test: the first version of the test re-typed it, so editing the real one left the test green
+# (pi-release's second review of #1538, measured by mutating the summary line).
+summary() {   # <family>
+    if [ "$fail" = 0 ]; then echo "== $1: ALL ROWS PASS ($rows rows)"
+    else echo "== $1: FAILURES ABOVE ($rows rows)"; fi
+}
 
 # --self-test exercises the row/summary accounting on stubs and exits: the counter this run prints is only worth
 # something if it has been seen to count, in both directions, without four containers. Same rule as the guard audits -
@@ -96,9 +103,13 @@ if [ "${1:-}" = --self-test ]; then
     [ "$rows" = 3 ] && [ "$fail" = 1 ] || { echo "self-test: FAIL - a failure should be the 3rd row and set fail (rows=$rows fail=$fail)"; exit 1; }
     check "check() routes through row()" "stub" true
     [ "$rows" = 4 ] || { echo "self-test: FAIL - check() should have counted a 4th row (rows=$rows)"; exit 1; }
-    s=$(if [ "$fail" = 0 ]; then echo "ALL ROWS PASS ($rows rows)"; else echo "FAILURES ABOVE ($rows rows)"; fi)
-    [ "$s" = "FAILURES ABOVE (4 rows)" ] || { echo "self-test: FAIL - summary reads '$s'"; exit 1; }
-    echo "pkg-proof self-test: ok (4 rows through the shipped row()/check(); summary 'FAILURES ABOVE (4 rows)')"
+    s=$(summary selftest)
+    [ "$s" = "== selftest: FAILURES ABOVE (4 rows)" ] || { echo "self-test: FAIL - summary() reads '$s'"; exit 1; }
+    # and the passing branch of the same function, after clearing the failure flag
+    fail=0; s=$(summary selftest)
+    [ "$s" = "== selftest: ALL ROWS PASS (4 rows)" ] || { echo "self-test: FAIL - passing summary() reads '$s'"; exit 1; }
+    fail=1
+    echo "pkg-proof self-test: ok (4 rows through the shipped row()/check(); summary() '== selftest: FAILURES ABOVE (4 rows)')"
     exit 0
 fi
 
@@ -435,5 +446,5 @@ echo
 # The count travels WITH the verdict (engine#1522 review): every table that quotes these families is a derived count -
 # `grep -c` over a log or a human counting - and a derived count drifts one merge at a time. Printing it here makes the
 # document cite the harness's own sentence, the same shape as the appliance check's "RESULT: PASS (30 checks)".
-if [ "$fail" = 0 ]; then echo "== $fam: ALL ROWS PASS ($rows rows)"; else echo "== $fam: FAILURES ABOVE ($rows rows)"; fi
+summary "$fam"
 exit "$fail"

@@ -115,6 +115,9 @@ git commit -qam "iommu/amd: the IOMMU PerfOpt backports"
 make LLVM=1 olddefconfig
 export LLVM=1                    # dpkg-buildpackage re-enters make: export it, do not just pass it
 nice -n 19 make LLVM=1 -j12 bindeb-pkg
+# and before either .deb is published: drop the one build artefact the headers package carries that nothing reads,
+# so the published package stops naming the builder's home path and build tree (engine#1487)
+./scripts/prune-kernel-headers-deb.sh ../linux-headers-<rel>_<ver>_amd64.deb ../linux-headers-<rel>_<ver>_amd64.deb
 ```
 
 - The **config of record** is the one the box's running kernel was built from
@@ -242,6 +245,8 @@ or moves a node off HRX fails there rather than in a customer's run. Details:
 - [ ] tag chosen; is the PerfOpt series native (drop the backports) or not (re-apply, and note any rebase)?
 - [ ] config of record copied from the box, `olddefconfig` clean, no prompts
 - [ ] `bindeb-pkg` produced image + headers `.deb` with the intended `LOCALVERSION`
+- [ ] the headers `.deb` went through `scripts/prune-kernel-headers-deb.sh`: no `scripts/mod/*.s`, and the
+      only files still carrying a `/home/...` path are the two host tools and upstream's own example text
 - [ ] `amdxdna` and `ec_su_axb35` rebuilt against the new `/lib/modules/<version>/build`
 - [ ] kernel signed by `MOK-Kernel`, modules by `MOK`, both verified with `sbverify`/`modinfo -F signer`
 - [ ] fallback kernel and `GRUB_DEFAULT` untouched

@@ -1585,8 +1585,13 @@ Plan plan(const std::string& pack_dir) {
             std::string ga_proj;
             if (attention) {
                 const std::string leaf = std::string(pr.suffix).substr(10);   // q_proj / k_proj / v_proj / o_proj
-                ga_proj = "model.layers." + std::to_string(L) + ".attn." +
-                          (leaf == "o_proj" ? leaf : std::string("qkv_proj"));
+                // The fused node is what most packs carry, but not all: 11 genre-A packs (Qwen3 x7, gemma-2 x3,
+                // Qwen2.5-14B) ship q/k/v as three separate MatMulNBits joined by Concat, so the split spelling is
+                // tried when the fused one is not in the graph. The container stores q/k/v separately either way.
+                const std::string fused = "model.layers." + std::to_string(L) + ".attn.qkv_proj";
+                const std::string split = "model.layers." + std::to_string(L) + ".attn." + leaf;
+                ga_proj = (leaf == "o_proj") ? split
+                                             : (graph_projs.count(fused) ? fused : split);
             } else {
                 ga_proj = "model.layers." + std::to_string(L) + "." + std::string(pr.suffix);
             }
@@ -1628,9 +1633,13 @@ Plan plan(const std::string& pack_dir) {
             // readable (and split by the same row ranges as the weight) rather than a tile subvolume.
             const std::string fused_bias =
                 "model.layers." + std::to_string(L) + ".attn.qkv_proj.MatMulNBits.bias";
-            if (graph_weights && onnx.index.count(fused_bias) &&
-                !onnx.tensors[onnx.index.at(fused_bias)].dims.empty()) {
-                b.source = "graph:model.layers." + std::to_string(L) + ".attn.qkv_proj.MatMulNBits.bias";
+            // A split pack carries one bias per projection instead of the fused [q|k|v] one.
+            const std::string own_bias =
+                "model.layers." + std::to_string(L) + ".attn." + suffix + ".MatMulNBits.bias";
+            const std::string& bias_name = onnx.index.count(fused_bias) ? fused_bias : own_bias;
+            if (graph_weights && onnx.index.count(bias_name) &&
+                !onnx.tensors[onnx.index.at(bias_name)].dims.empty()) {
+                b.source = "graph:" + bias_name;
                 b.refusal.clear();
             } else if (!p.attn_note.empty()) b.refusal = p.attn_note;
             b.declared_check = "written only when the tile's bias subvolumes are not all zero";
@@ -1638,11 +1647,28 @@ Plan plan(const std::string& pack_dir) {
         }
     // per-head QK RMSNorm gains (Qwen3 and later): bf16 [head_dim], in the two sections that sit between
     // q/k/v and o_proj. Planned only when the block measured those two sections (engine#979).
-    if (p.knorm_off)
+    // Genre A states them as `model.layers.N.attn.q_norm.layernorm.weight` (F16 [head_dim]), which is a different
+    // source from the .fconst's two per-head sections but the same tensor in the container.
+    const bool graph_qk_norm = graph_weights && !onnx.index.empty() &&
+                               onnx.index.count("model.layers.0.attn.q_norm.layernorm.weight");
+    if (p.knorm_off || graph_qk_norm)
         for (int L = 0; L < d.layers; ++L)
-            for (const char* nm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"})
-                p.tensors.push_back(make("model.layers." + std::to_string(L) + "." + nm, norm_source,
-                                         "BF16", {d.head_dim}));
+            for (const char* nm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
+                auto x = make("model.layers." + std::to_string(L) + "." + nm, norm_source, "BF16", {d.head_dim});
+                if (graph_qk_norm) {
+                    // Derive the leaf from the name rather than by index arithmetic: "self_attn." is TEN characters,
+                    // and substr(11, 1) here produced '_', so the source named `…attn._norm.layernorm.weight`, which
+                    // exists in no pack. Nothing failed, because the import reads the norms by its own correct name --
+                    // the manifest simply recorded a source that is not there, which is the "compiles, never runs"
+                    // shape and exactly the kind of label a later reader would trust. A substring test cannot be off
+                    // by one.
+                    const bool is_q = std::string(nm).find("q_norm") != std::string::npos;
+                    x.source = "graph:model.layers." + std::to_string(L) + ".attn." +
+                               (is_q ? "q_norm" : "k_norm") + ".layernorm.weight";
+                    x.refusal.clear();
+                }
+                p.tensors.push_back(std::move(x));
+            }
     return p;
 }
 
@@ -1888,6 +1914,23 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             const std::string base = "model.layers." + std::to_string(L);
             add_norm_init(base + ".input_layernorm.weight", base + ".input_layernorm.weight");
             add_norm_init(base + ".post_attention_layernorm.weight", base + ".post_attention_layernorm.weight");
+            // Per-head QK RMSNorm gains (Qwen3 and later). They are graph initializers on this line
+            // (`attn.q_norm.layernorm.weight`, F16 [head_dim]) rather than the .fconst's two sections. The forward
+            // turns QK norm on from model_type alone, so a pack that ships these gains and an import that dropped them
+            // served fluent garbage: the Qwen3-1.7B hybrid pack has them, and without them q and k come out of an
+            // uninitialised gain. (Found after this block was first written inside the .fconst payload section, which
+            // a genre-A pack never enters, so it silently did nothing.)
+            for (const char* leaf : {"q", "k"}) {
+                const auto gi = onnx.index.find(base + ".attn." + leaf + "_norm.layernorm.weight");
+                if (gi == onnx.index.end()) continue;
+                const OnnxTensor& gt = onnx.tensors[gi->second];
+                if (gt.dims.empty() || int(gt.dims.at(0)) != p.dims.head_dim) continue;
+                const size_t gn = size_t(p.dims.head_dim);
+                const uint64_t need = uint64_t(gn) * (gt.type == kF16 || gt.type == kBF16 ? 2u : 4u);
+                w.add(base + ".self_attn." + leaf + "_norm.weight", "BF16", {int64_t(gn)},
+                      as_bf16(bytes_of(gt, need), gt.type, gn));
+                ++r.tensors;
+            }
         }
         // The final norm is NOT `model.norm.weight` on this line: measured, both packs name it after a virtual
         // (layers)-th block — `model.layers.30.final_norm_layernorm.weight` on SmolLM2-135M (30 layers) and
@@ -1902,10 +1945,30 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                          "WARNING: no final RMSNorm found (tried model.norm.weight, model.layers.%s, "
                          "model.final_layernorm.weight); the container will have none and the head will read "
                          "garbage\n", suffix_norm.c_str());
-        // the fused qkv bias, split by the same row ranges the fused qweight uses
+        // the qkv bias: one fused [q|k|v] initializer on most packs, one per projection on a split pack
         for (int L = 0; L < p.dims.layers; ++L) {
             const std::string base = "model.layers." + std::to_string(L);
             const std::string bn = base + ".attn.qkv_proj.MatMulNBits.bias";
+            // A split pack (11 genre-A packs: Qwen3 / gemma-2 / Qwen2.5-14B) carries q/k/v biases separately. Each is
+            // the length of its own projection, which is what the fused test below cannot accept.
+            if (!onnx.index.count(bn)) {
+                const auto rkq = size_t(p.dims.heads) * size_t(p.dims.head_dim);
+                const auto rkv = size_t(p.dims.kv_heads) * size_t(p.dims.head_dim);
+                for (const auto& [leaf, want] : {std::pair<const char*, size_t>{"q_proj", rkq},
+                                                 std::pair<const char*, size_t>{"k_proj", rkv},
+                                                 std::pair<const char*, size_t>{"v_proj", rkv}}) {
+                    const auto bi = onnx.index.find(base + ".attn." + leaf + ".MatMulNBits.bias");
+                    if (bi == onnx.index.end()) continue;
+                    const OnnxTensor& bt = onnx.tensors[bi->second];
+                    if (bt.dims.empty() || size_t(bt.dims.at(0)) != want) continue;
+                    const auto rawb = bytes_of(bt, uint64_t(want) * 2);
+                    w.add(base + ".self_attn." + leaf + ".bias", "BF16", {int64_t(want)},
+                          as_bf16(rawb, bt.type, want));
+                    ++r.tensors;
+                    ++r.attn_bias_tensors;
+                }
+                continue;
+            }
             const auto it = onnx.index.find(bn);
             if (it == onnx.index.end()) continue;
             const OnnxTensor& t = onnx.tensors[it->second];
@@ -2015,10 +2078,19 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             decode_rows(m + "gate_proj", 0, p.dims.intermediate, base + ".mlp.gate_proj.weight", 0);
             decode_rows(m + "up_proj", 0, p.dims.intermediate, base + ".mlp.up_proj.weight", 0);
             decode_rows(m + "down_proj", 0, p.dims.hidden, base + ".mlp.down_proj.weight", 0);
-            // fused qkv: rows are [q (heads*head_dim) | k (kv*head_dim) | v (kv*head_dim)], in that order
-            decode_rows(a + "qkv_proj", 0, q_rows, base + ".self_attn.q_proj.weight", 0);
-            decode_rows(a + "qkv_proj", q_rows, kv_rows, base + ".self_attn.k_proj.weight", 0);
-            decode_rows(a + "qkv_proj", q_rows + kv_rows, kv_rows, base + ".self_attn.v_proj.weight", 0);
+            // Fused qkv: rows are [q (heads*head_dim) | k (kv*head_dim) | v (kv*head_dim)], in that order. A split
+            // pack (Qwen3 / gemma-2 / Qwen2.5-14B genre-A: 11 packs) carries the three as separate nodes joined by
+            // Concat, so each is read whole; the container stores q/k/v separately either way, so nothing downstream
+            // can tell the two apart.
+            if (init_of(a + "qkv_proj.MatMulNBits.qweight")) {
+                decode_rows(a + "qkv_proj", 0, q_rows, base + ".self_attn.q_proj.weight", 0);
+                decode_rows(a + "qkv_proj", q_rows, kv_rows, base + ".self_attn.k_proj.weight", 0);
+                decode_rows(a + "qkv_proj", q_rows + kv_rows, kv_rows, base + ".self_attn.v_proj.weight", 0);
+            } else {
+                decode_rows(a + "q_proj", 0, q_rows, base + ".self_attn.q_proj.weight", 0);
+                decode_rows(a + "k_proj", 0, kv_rows, base + ".self_attn.k_proj.weight", 0);
+                decode_rows(a + "v_proj", 0, kv_rows, base + ".self_attn.v_proj.weight", 0);
+            }
         }
     }
 
@@ -2598,13 +2670,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         {
             const bool has_cache = onnx.index.count("cos_cache") && onnx.index.count("sin_cache");
             if (has_cache) {
+                // The note stands until the cache check below proves or refutes the declared theta: printing the
+                // warning here made the log contradict itself on packs that then verified (Qwen3-1.7B hybrid prints
+                // "unverified" and "adopted 1e6" two lines apart).
                 c["q4nx_rope_note"] =
                     "the pack ships precomputed cos_cache/sin_cache; rope_theta here comes from the pack's metadata "
                     "and has NOT been verified against those caches, and this forward computes RoPE from theta";
-                std::fprintf(stderr,
-                             "WARNING: this pack ships precomputed RoPE caches, so its declared rope_theta (%.6g) is "
-                             "unverified; the engine computes RoPE from theta, so long-context output may be wrong\n",
-                             (double)p.dims.rope_theta);
             }
         }
         c["rms_norm_eps"] = p.dims.rms_norm_eps;
@@ -2666,28 +2737,28 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     std::vector<double> ang(pmax), cs(size_t(pmax));
                     for (double th : cands) {
                         if (!(th > 0)) continue;
-                        double acc = 0.0;
-                        int used = 0;
+                        // ONE Pearson r over the whole cache matrix, not a mean of per-column r's. For a large
+                        // head_dim the last columns barely vary -- cos(p * inv) is nearly flat over the positions the
+                        // cache holds -- so their per-column r is noise, and averaging it in drags a CORRECT theta
+                        // below the 0.99 gate. Measured on Qwen3-1.7B-awq-quant-onnx-hybrid (head_dim 128): the mean
+                        // of the 57 usable columns gives 0.9826 at the right theta 1e6, while the flat r gives
+                        // 1.000000 and the declared 1e4 sits at 0.17 either way.
+                        double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+                        int64_t used = 0;
                         for (int64_t i = 0; i < half; ++i) {
                             const double inv = 1.0 / std::pow(th, 2.0 * double(i) / double(HD2));
-                            // Pearson r between the cache column and cos(p * inv_freq_i); scaling-invariant, so the
-                            // packs' pre-scaled cosines do not matter.
-                            double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
                             for (int64_t pp = 0; pp < pmax; ++pp) {
                                 const double y = cache[size_t(pp) * size_t(half) + size_t(i)];
                                 const double x = std::cos(double(pp) * inv);
                                 sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
-                            }
-                            const double np = double(pmax);
-                            const double cx = sxx - sx * sx / np, cy = syy - sy * sy / np;
-                            if (cx > 1e-12 && cy > 1e-12) {
-                                const double r = (sxy - sx * sy / np) / std::sqrt(cx * cy);
-                                if (r == r) { acc += r; used++; }
+                                ++used;
                             }
                         }
-                        if (used > 0) {
-                            const double corr = acc / used;
-                            if (corr > best_corr) { best_corr = corr; best_theta = th; }
+                        const double np = double(used);
+                        const double cx = sxx - sx * sx / np, cy = syy - sy * sy / np;
+                        if (used > 0 && cx > 1e-12 && cy > 1e-12) {
+                            const double corr = (sxy - sx * sy / np) / std::sqrt(cx * cy);
+                            if (corr == corr && corr > best_corr) { best_corr = corr; best_theta = th; }
                         }
                     }
                     if (best_corr > 0.99 && std::fabs(best_theta - p.dims.rope_theta) > 1e-9) {
@@ -2700,6 +2771,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         std::fprintf(stderr, "note: rope_theta %.6g verified against the pack's cos_cache (corr %.4f)\n",
                                      (double)p.dims.rope_theta, best_corr);
                         c.erase("q4nx_rope_note");
+                    } else {
+                        std::fprintf(stderr,
+                                     "WARNING: this pack ships precomputed RoPE caches that no plain theta explains "
+                                     "(best %.4f at %.6g, declared %.6g); this forward computes RoPE from theta, so "
+                                     "attention may be wrong from the first token\n",
+                                     best_corr, best_theta, (double)p.dims.rope_theta);
                     }
                 }
             }

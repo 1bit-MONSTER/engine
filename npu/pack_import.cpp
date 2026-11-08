@@ -1218,8 +1218,19 @@ Plan plan(const std::string& pack_dir) {
         auto a = make("model.layers." + std::to_string(L) + ".input_layernorm.weight", norm_source, "BF16", {H});
         auto b = make("model.layers." + std::to_string(L) + ".post_attention_layernorm.weight", norm_source,
                       "BF16", {H});
-        a.refusal = graph_norm_refusal("model.layers." + std::to_string(L) + ".input_layernorm.weight");
-        b.refusal = graph_norm_refusal("model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");
+        const std::string ia = "model.layers." + std::to_string(L) + ".input_layernorm.weight";
+        const std::string ib = "model.layers." + std::to_string(L) + ".post_attention_layernorm.weight";
+        if (graph_weights && onnx.index.count(ia) && onnx.index.count(ib) &&
+            !onnx.tensors[onnx.index.at(ia)].dims.empty() && !onnx.tensors[onnx.index.at(ib)].dims.empty()) {
+            // genre A: ordinary F16 initializers with real offsets -> readable now, no refusal
+            a.source = onnx.tensors[onnx.index.at(ia)].location;
+            b.source = onnx.tensors[onnx.index.at(ib)].location;
+            a.refusal.clear();
+            b.refusal.clear();
+        } else {
+            a.refusal = graph_norm_refusal(ia);
+            b.refusal = graph_norm_refusal(ib);
+        }
         p.tensors.push_back(std::move(a));
         p.tensors.push_back(std::move(b));
     }
@@ -1386,8 +1397,11 @@ Plan plan(const std::string& pack_dir) {
             const OnnxTensor& t = onnx.tensors[ti->second];
             if (!t.location.empty())
                 where = t.location + " + " + std::to_string((unsigned long long)t.offset) + " B";
-            if (t.dims.size() == 3)   // [N, K/block, block/2]: 64 B = 128 four-bit codes
-                where += " [N=" + std::to_string(t.dims[0]) + " K=" + std::to_string(t.dims[1] * 128) + "]";
+            if (t.dims.size() == 3) {   // [N, K/block, block/2 bytes]: two four-bit codes per byte
+                const int64_t blk = t.dims[2] * 2;
+                where += " [N=" + std::to_string(t.dims[0]) + " K=" + std::to_string(t.dims[1] * blk) + " block=" +
+                         std::to_string(blk) + "]";
+            }
         }
         return "weights are in " + where + " -- the graph-initializer reader is not implemented yet (this pack is "
                "not a .fconst pack)";
@@ -1410,7 +1424,16 @@ Plan plan(const std::string& pack_dir) {
                 ga_proj = "model.layers." + std::to_string(L) + "." + std::string(pr.suffix);
             }
             const std::string ga = graph_weight_refusal(ga_proj);
-            if (graph_weights) x.refusal = ga;
+            if (graph_weights) {
+                // the import reads these from the graph's initializers; the refusal only stands when the
+                // initializer is genuinely not there
+                if (graph_projs.count(ga_proj)) {
+                    x.source = "graph:" + ga_proj;
+                    x.refusal.clear();
+                } else {
+                    x.refusal = ga;
+                }
+            }
             else if (!attention) x.refusal = p.mlp_note;
             else if (!p.attn_note.empty()) x.refusal = p.attn_note;
             const std::string key = "model.layers." + std::to_string(L) + "." + pr.suffix;
@@ -1434,7 +1457,15 @@ Plan plan(const std::string& pack_dir) {
                                            std::pair<const char*, int>{"v_proj", kv_out}}) {
             auto b = make("model.layers." + std::to_string(L) + ".self_attn." + suffix + ".bias",
                           "fconst:Llm_Token_Token", "BF16", {rows});
-            if (!p.attn_note.empty()) b.refusal = p.attn_note;
+            // genre A carries the qkv bias as ONE fused [q|k|v] F16 initializer beside the fused qweight, so it is
+            // readable (and split by the same row ranges as the weight) rather than a tile subvolume.
+            const std::string fused_bias =
+                "model.layers." + std::to_string(L) + ".attn.qkv_proj.MatMulNBits.bias";
+            if (graph_weights && onnx.index.count(fused_bias) &&
+                !onnx.tensors[onnx.index.at(fused_bias)].dims.empty()) {
+                b.source = "graph:model.layers." + std::to_string(L) + ".attn.qkv_proj.MatMulNBits.bias";
+                b.refusal.clear();
+            } else if (!p.attn_note.empty()) b.refusal = p.attn_note;
             b.declared_check = "written only when the tile's bias subvolumes are not all zero";
             p.tensors.push_back(std::move(b));
         }
@@ -1599,7 +1630,11 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             tied = c.value("tie_word_embeddings", false);
         }
     }
-    const OnnxModel onnx = parse_onnx(pack_dir + "/model.onnx");
+    // The graph's own name, the same resolution plan() uses: on the 1.9/hybrid lines it is `model_jit.onnx` and
+    // `genai_config.json` says so. Opening "model.onnx" here made an import of exactly the packs plan() had just
+    // learned to read fail at the first byte, with "cannot open <pack>/model.onnx".
+    const bool tok_present = !find_token_fconst(pack_dir).empty();
+    const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph_filename(pack_dir));
     std::map<std::string, const uint8_t*> ext;
     std::map<std::string, size_t> ext_size;
     for (const auto& t : onnx.tensors) {
@@ -1655,6 +1690,144 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     const uint8_t* embed_bytes = bytes_of(*embed, embed_need);
     w.add("model.embed_tokens.weight", "BF16", {V, H}, as_bf16(embed_bytes, embed->type, size_t(elems)));
     ++r.tensors;
+
+    // genre A = the graph carries real weights and there is no .fconst to read (the same test plan() uses)
+    auto has_real_graph_weight = [&]() {
+        for (const auto& mm : onnx.matmuls) {
+            const auto wi = onnx.index.find(mm.weight);
+            if (wi != onnx.index.end() && !onnx.tensors[wi->second].dims.empty()) return true;
+        }
+        return false;
+    };
+    const bool graph_weights_a = !tok_present && has_real_graph_weight();
+    // genre A's norms: ordinary F16 [hidden] initializers named after themselves, plus the final norm. The 1.8
+    // route reads them from the .fconst tail envelope; this pack has no tail, so they come from the graph.
+    if (graph_weights_a) {
+        auto add_norm_init = [&](const std::string& name, const std::string& out_name) {
+            const auto it = onnx.index.find(name);
+            if (it == onnx.index.end()) return false;
+            const OnnxTensor& t = onnx.tensors[it->second];
+            if (t.dims.empty()) return false;
+            const size_t n = size_t(t.dims.at(0));
+            const uint64_t need = uint64_t(n) * (t.type == kF16 || t.type == kBF16 ? 2u : 4u);
+            w.add(out_name, "BF16", {int64_t(n)}, as_bf16(bytes_of(t, need), t.type, n));
+            ++r.tensors;
+            return true;
+        };
+        for (int L = 0; L < p.dims.layers; ++L) {
+            const std::string base = "model.layers." + std::to_string(L);
+            add_norm_init(base + ".input_layernorm.weight", base + ".input_layernorm.weight");
+            add_norm_init(base + ".post_attention_layernorm.weight", base + ".post_attention_layernorm.weight");
+        }
+        add_norm_init("model.norm.weight", "model.norm.weight");
+        // the fused qkv bias, split by the same row ranges the fused qweight uses
+        for (int L = 0; L < p.dims.layers; ++L) {
+            const std::string base = "model.layers." + std::to_string(L);
+            const std::string bn = base + ".attn.qkv_proj.MatMulNBits.bias";
+            const auto it = onnx.index.find(bn);
+            if (it == onnx.index.end()) continue;
+            const OnnxTensor& t = onnx.tensors[it->second];
+            if (t.dims.empty()) continue;
+            const size_t n = size_t(t.dims.at(0));
+            const uint64_t need = uint64_t(n) * 2;
+            const auto raw = bytes_of(t, need);
+            const auto bf = as_bf16(raw, t.type, n);
+            const size_t rkq = size_t(p.dims.heads) * size_t(p.dims.head_dim);
+            const size_t rkv = size_t(p.dims.kv_heads) * size_t(p.dims.head_dim);
+            if (rkq + 2 * rkv != n) continue;                     // an unexpected split: leave the refusal standing
+            auto slice = [&](size_t off, size_t cnt, const std::string& out) {
+                std::vector<uint8_t> bytes(bf.begin() + off * 2, bf.begin() + (off + cnt) * 2);
+                w.add(out, "BF16", {int64_t(cnt)}, std::move(bytes));
+                ++r.tensors;
+            };
+            slice(0, rkq, base + ".self_attn.q_proj.bias");
+            slice(rkq, rkv, base + ".self_attn.k_proj.bias");
+            slice(rkq + rkv, rkv, base + ".self_attn.v_proj.bias");
+        }
+    }
+
+    // ── genre A: the layer projections are graph initializers, not .fconst tiles (engine#1410 / TAMDCOL) ──
+    // The rai_1.3/1.6/1.7.1 line carries each projection as `<proj>.MatMulNBits.{qweight,scales,qzeros,bias}` with a
+    // location+offset, and plan() has already located them by those names. The decode is the SAME code the 1.8
+    // lm_head below uses -- Q4 codes + scales + zeros -> q4_1 tiles -- applied per projection instead of once, so
+    // this is a loop, not a second reader. The one projection that needs arithmetic is the fused qkv: one
+    // [q|k|v] tensor that has to be split by head geometry, since only it is fused.
+    if (graph_weights_a) {
+        auto init_of = [&](const std::string& n) -> const OnnxTensor* {
+            const auto it = onnx.index.find(n);
+            return it == onnx.index.end() ? nullptr : &onnx.tensors[it->second];
+        };
+        // Decode rows [row0, row0+rows) of a projection's MatMulNBits weight into q4_1 tiles.
+        auto decode_rows = [&](const std::string& proj, int row0, int rows, const std::string& out_name,
+                               int k_override) -> bool {
+            const OnnxTensor* qw = init_of(proj + ".MatMulNBits.qweight");
+            const OnnxTensor* sc = init_of(proj + ".MatMulNBits.scales");
+            if (!qw || !sc || qw->dims.size() != 3 || sc->dims.empty()) return false;
+            const int N = int(qw->dims[0]);
+            const int block = int(qw->dims[2]) * 2;            // 64 B holds 128 four-bit codes
+            const int K = k_override > 0 ? k_override : int(qw->dims[1]) * block;
+            // NB: no block==128 test here. That constant governs the .fconst *tile* layout (2*(K/block)+2
+            // subvolumes); after decode_matmulnbits every weight is in 32-column groups regardless of the
+            // block the pack used, which is why a block-32 SmolLM-class pack tiles identically (pi-inferzo
+            // verified the recipe on amd/SmolLM2-135M-Instruct_rai_1.7.1_hybrid, corr +0.9957 against the
+            // pack's own tied embedding).
+            if (block <= 0 || N <= 0 || K <= 0 || K % block || row0 < 0 || row0 + rows > N) return false;
+            const uint64_t groups = uint64_t(K) / uint64_t(block), nrows = uint64_t(N);
+            uint64_t groups_n = 0;
+            if (!mul_ok(nrows, groups, groups_n)) return false;
+            std::vector<float> scales(static_cast<std::vector<float>::size_type>(groups_n));
+            const uint64_t sw = sc->type == kF32 ? 4 : 2;
+            uint64_t s_need = 0;
+            if (!mul_ok(groups_n, sw, s_need)) return false;
+            if (sc->type == kF32) std::memcpy(scales.data(), bytes_of(*sc, s_need), scales.size() * 4);
+            else {
+                const auto b = as_bf16(bytes_of(*sc, s_need), sc->type, scales.size());
+                const auto* d = reinterpret_cast<const uint16_t*>(b.data());
+                for (size_t i = 0; i < scales.size(); ++i) scales[i] = bf16_to_f32(d[i]);
+            }
+            const OnnxTensor* zt = init_of(proj + ".MatMulNBits.qzeros");
+            uint64_t z_need = 0;
+            if (!mul_ok(nrows, (groups + 1) / 2, z_need)) return false;
+            const uint8_t* zp = zt ? bytes_of(*zt, z_need) : nullptr;
+            uint64_t qw_need = 0;
+            if (!mul_ok(groups_n, uint64_t(block) / 2, qw_need)) return false;
+            const Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
+            // the row slice, re-tiled exactly as the whole tensor would be
+            Q4 part;
+            part.N = rows; part.K = K;
+            const size_t rk = size_t(K), kg = size_t(K / 32);
+            part.codes.resize(size_t(rows) * rk);
+            part.scale.resize(size_t(rows) * kg);
+            part.zero.resize(size_t(rows) * kg);
+            for (int r = 0; r < rows; ++r) {
+                std::memcpy(&part.codes[size_t(r) * rk], &q.codes[size_t(row0 + r) * rk], rk);
+                std::memcpy(&part.scale[size_t(r) * kg], &q.scale[size_t(row0 + r) * kg], kg * sizeof(float));
+                std::memcpy(&part.zero[size_t(r) * kg], &q.zero[size_t(row0 + r) * kg], kg * sizeof(float));
+            }
+            std::vector<uint8_t> tiled;
+            long long pinexact = 0;
+            tile_q4_1_f32(part, tiled, &pinexact);
+            w.add(out_name, "q4_1", {rows, K}, std::move(tiled));
+            r.tiles += part.N * (part.K / 32);
+            ++r.tensors;
+            return true;
+        };
+        const std::string GN = graph_filename(pack_dir);
+        const int q_rows = int(p.dims.heads) * int(p.dims.head_dim);
+        const int kv_rows = int(p.dims.kv_heads) * int(p.dims.head_dim);
+        for (int L = 0; L < p.dims.layers; ++L) {
+            const std::string base = "model.layers." + std::to_string(L);
+            const std::string a = base + ".attn.", m = base + ".mlp.";
+            decode_rows(a + "o_proj", 0, p.dims.hidden, base + ".self_attn.o_proj.weight", 0);
+            decode_rows(m + "gate_proj", 0, p.dims.intermediate, base + ".mlp.gate_proj.weight", 0);
+            decode_rows(m + "up_proj", 0, p.dims.intermediate, base + ".mlp.up_proj.weight", 0);
+            decode_rows(m + "down_proj", 0, p.dims.hidden, base + ".mlp.down_proj.weight", 0);
+            // fused qkv: rows are [q (heads*head_dim) | k (kv*head_dim) | v (kv*head_dim)], in that order
+            decode_rows(a + "qkv_proj", 0, q_rows, base + ".self_attn.q_proj.weight", 0);
+            decode_rows(a + "qkv_proj", q_rows, kv_rows, base + ".self_attn.k_proj.weight", 0);
+            decode_rows(a + "qkv_proj", q_rows + kv_rows, kv_rows, base + ".self_attn.v_proj.weight", 0);
+        }
+    }
 
     for (const auto& mm : onnx.matmuls) {
         const auto wi = onnx.index.find(mm.weight), si = onnx.index.find(mm.scales);
@@ -2059,8 +2232,41 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     w.finish(json::parse(manifest));
 
     {
-        std::ifstream cf(pack_dir + "/config.json");
-        json c = json::parse(cf);
+        // The container's config.json is built from the pack's geometry -- which on 1.6 (`config.json = {}`) and
+        // 1.7/1.7.1 (no config.json at all) comes from genai_config.json. Parsing `<pack>/config.json` directly
+        // here threw "parse error ... empty input" on exactly those packs, after every tensor had been written.
+        std::string geom_src;
+        json c = load_geometry(pack_dir, &geom_src);
+        // The container states the geometry the *import* resolved, not just what one metadata file happened to
+        // carry: plan() derives intermediate_size from the graph on packs whose metadata has none (1.6/1.7/1.7.1),
+        // and without these keys the forward re-derives them from whatever tensors it finds -- on
+        // SmolLM2-135M rai_1.7.1_hybrid that came out as IM=3072 against the pack's 1536.
+        c["hidden_size"] = p.dims.hidden;
+        c["intermediate_size"] = p.dims.intermediate;
+        c["num_hidden_layers"] = p.dims.layers;
+        c["num_attention_heads"] = p.dims.heads;
+        c["num_key_value_heads"] = p.dims.kv_heads;
+        c["head_dim"] = p.dims.head_dim;
+        c["vocab_size"] = p.dims.vocab;
+        c["model_type"] = p.dims.model_type;
+        c["rope_theta"] = p.dims.rope_theta;
+        // A pack that ships its own precomputed RoPE (cos_cache/sin_cache) is not necessarily built for the theta
+        // its genai_config.json states -- pi-inferzo measured 10000 declared against a model that needs 1e6 on
+        // Qwen2.5 rai_1.7.1_hybrid, and our forward computes RoPE from theta rather than reading a cache. That is a
+        // silent-wrong-answer risk, so the container says so rather than serving garbage quietly.
+        {
+            const bool has_cache = onnx.index.count("cos_cache") && onnx.index.count("sin_cache");
+            if (has_cache) {
+                c["q4nx_rope_note"] =
+                    "the pack ships precomputed cos_cache/sin_cache; rope_theta here comes from the pack's metadata "
+                    "and has NOT been verified against those caches, and this forward computes RoPE from theta";
+                std::fprintf(stderr,
+                             "WARNING: this pack ships precomputed RoPE caches, so its declared rope_theta (%.6g) is "
+                             "unverified; the engine computes RoPE from theta, so long-context output may be wrong\n",
+                             (double)p.dims.rope_theta);
+            }
+        }
+        c["rms_norm_eps"] = p.dims.rms_norm_eps;
         const TextArtifacts ta = scan_text_artifacts(pack_dir);
         c["vocab_size"] = V;
         c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries

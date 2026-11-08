@@ -43,8 +43,10 @@ before=$(grep -rlE '/home/[a-z]+/' "$hdrs" 2>/dev/null | wc -l)
 removed=0
 while IFS= read -r f; do rm -f "$f"; removed=$((removed+1)); done < <(find "$hdrs/scripts/mod" -maxdepth 1 -name '*.s' 2>/dev/null)
 [ "$removed" -gt 0 ] || { echo "nothing to prune (no scripts/mod/*.s) - refusing to rewrite the package" >&2; exit 5; }
+# dpkg writes this file with paths relative to the package root and no "./" prefix; a leading "./" is not the format
+# (caught in review of #1501, where it merged anyway), so strip it rather than emit a file dpkg's own tools parse oddly.
 rm -f "$work/pkg/DEBIAN/md5sums"
-( cd "$work/pkg" && find . -path ./DEBIAN -prune -o -type f -print0 | xargs -0 md5sum > DEBIAN/md5sums )
+( cd "$work/pkg" && find . -path ./DEBIAN -prune -o -type f -print0 | xargs -0 md5sum | sed 's|^\([0-9a-f]*\)  \./|\1  |' > DEBIAN/md5sums )
 after=$(grep -rlE '/home/[a-z]+/' "$hdrs" 2>/dev/null | wc -l)
 dpkg-deb --root-owner-group -b "$work/pkg" "$OUT" >/dev/null || { echo "repack failed" >&2; exit 6; }
 echo "pruned $removed file(s) from $(basename "$hdrs")"

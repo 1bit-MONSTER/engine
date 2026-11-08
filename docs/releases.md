@@ -335,7 +335,10 @@ v2026.44 is published.
 
 The engine in `1bit/` keeps the build tree's layout (`scripts/package-linux.sh`): `1bit` finds each
 backend at the same path relative to itself as in the build (`app/built_path.h`), and every program
-finds its libraries beside itself. Unpack the package anywhere and start Lemonade through
+finds its libraries beside itself. File modes in the package are the **packer's** decision, not the build tree's:
+the packer normalises every staged file to `0755` (if it was executable) or `0644`, clears setgid/sticky, and refuses
+to write a tarball in which anything is group- or other-writable (`pack_normalise_modes` / `pack_writable_files`,
+`scripts/pack-elf.sh`, engine#1352). The symlink sets (`lib*.so.0` -> `lib*.so.0.x.y`) are preserved as symlinks. Unpack the package anywhere and start Lemonade through
 `lemond-onebit`, which points Lemonade's onebit backend at the packaged `1bit`
 (`LEMONADE_ONEBIT_BIN`):
 

@@ -76,9 +76,13 @@ printf '{"log": 1}\n' > "$tmp/run-output/probe.jsonl"
 check "an ignored output directory is not reported" "! gate_has 'run-output'" "$(gate)"
 check "and it does not make the gate red" "[ $(gate >/dev/null; echo $?) -eq 0 ]" "$(gate)"
 
-# 5. the same file, NOT ignored, is reported -- which is what #1564 measured in a developer clone
+# 5. once such an output file is TRACKED it is reported, whatever the ignore rule says -- and this is the arm that
+#    survives #1580, which makes an *untracked* file of unknown comment style a skip (a file nobody has committed
+#    should not fail the gate) while a tracked one stays an error. The untracked case is therefore deliberately NOT
+#    asserted here: #1580 owns that verdict, and asserting it would make whichever PR lands second turn CI red.
 rm -f "$tmp/.gitignore" && git -C "$tmp" rm -q --cached .gitignore 2>/dev/null; git -C "$tmp" commit -qm noignore --allow-empty
-check "the same output file IS reported once nothing ignores it" "gate_has 'run-output/probe.jsonl'" "$(gate)"
+git -C "$tmp" add -f run-output/probe.jsonl
+check "a TRACKED output file is reported even though nothing ignores it" "gate_has 'run-output/probe.jsonl'" "$(gate)"
 
 echo "$([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 exit $((fail))

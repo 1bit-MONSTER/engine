@@ -216,6 +216,11 @@ set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
 # own CTS: GPU export -> NPU import -> NPU executes on the imported range), keyed on the module's
 # fingerprint against third_party/patches/amdxdna/README.md. It skips (77) without the array or without a
 # CTS build (ONEBIT_LIBAMDF_CTS_DIR), so public CI neither runs nor fails it.
+# 1bit-update's slot decisions (engine#1334 review): the second update targets the slot holding the machine's own
+# save layer and must keep it, a foreign layer is still refused. The script sourced as a library over fake /data
+# layouts: no root, no mounts, no device, no VM.
+add_test(NAME one_bit_update_slots
+         COMMAND sh ${CMAKE_SOURCE_DIR}/tests/one_bit_update_slots_test.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME npu_import_contract
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_import_contract.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(npu_import_contract PROPERTIES SKIP_RETURN_CODE 77)

@@ -596,8 +596,11 @@ stage_release() {
     # stages run one at a time (docs/releases.md): without the bumps stage there is no bumps.json
     [ -f "$W/bumps.json" ] || echo "[]" > "$W/bumps.json"
     say "release $tag: changes ${from:0:12}..$(git -C "$SRC" rev-parse --short HEAD) (previous: ${prev:-none})"
+    # --out-dir: the notes list every package the release carries, read off what the package stage
+    # actually wrote (engine#1279 item 5), so a package that is added or missing shows up in them
     python3 "$SRC/tools/weekly_changes.py" --src "$SRC" --from "$from" --to HEAD --tag "$tag" \
-        --previous "$prev" --bumps "$W/bumps.json" --json "$OUT/changes.json" --md "$W/notes.md"
+        --previous "$prev" --bumps "$W/bumps.json" --json "$OUT/changes.json" --md "$W/notes.md" \
+        --out-dir "$OUT"
     # the checksums cover changes.json too (package wrote them before it existed)
     (cd "$OUT" && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS)
     if [ "$DRY" = 1 ]; then say "dry run: not publishing"; return; fi

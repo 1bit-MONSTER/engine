@@ -59,10 +59,12 @@ ONEBIT_LAYA_MODEL="$laya_model" "$bin" serve -m "$scratch/tiny.gguf" --device au
     --llama-server "$here/fake_backend_route.py" \
     >"$scratch/serve.log" 2>&1 &
 pid=$!
-port=$(serve_port_wait "$scratch/serve.log" "$pid" 1200) || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
-api="http://127.0.0.1:$port"
+# trap first: serve_port_wait's failure case is a serve that is still alive, so exiting before this line would leave it
+# running with the device open (engine #1485 review; the 14 h llama-server is the same failure mode)
 cleanup() { kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$scratch"; }
 trap cleanup EXIT
+port=$(serve_port_wait "$scratch/serve.log" "$pid" 1200) || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
+api="http://127.0.0.1:$port"
 for _ in $(seq 1 1200); do curl -s -o /dev/null "$api/health" && break; sleep 0.1; done
 
 states=(

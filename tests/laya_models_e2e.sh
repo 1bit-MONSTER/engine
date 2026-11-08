@@ -57,10 +57,13 @@ check "a table with a class and no row is refused by name" '[[ "$out" == *"\"b\"
 
 "$bin" serve --laya-models "$scratch/table.json" --laya-model "$laya_model" --port 0 >"$scratch/serve.log" 2>&1 &
 pid=$!
-port=$(serve_port_wait "$scratch/serve.log" "$pid" 1200) || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
-api="http://127.0.0.1:$port"
+# The trap goes in BEFORE the wait below: serve_port_wait returns 1 while the process is still alive (it only breaks early
+# on a dead pid), so the failure path is exactly the case where a live serve would be left behind - and a serve left behind
+# on this box holds the HRX device and its GTT. Same rule the fleet learned from the 14 h llama-server (engine #1485 review).
 cleanup() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$scratch"; }
 trap cleanup EXIT
+port=$(serve_port_wait "$scratch/serve.log" "$pid" 1200) || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
+api="http://127.0.0.1:$port"
 for _ in $(seq 1 1200); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$api/health")" = 200 ] && break; sleep 0.1; done
 check "ready" '[ "$(curl -s -o /dev/null -w "%{http_code}" "$api/health")" = 200 ]'
 

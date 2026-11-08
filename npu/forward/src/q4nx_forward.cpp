@@ -3099,6 +3099,29 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
         return;
     }
+    // The device's activation BO holds exactly max_batch_rows() rows (the M=128 prefill design), and a wider
+    // launch is not quantized at all -- the kernel then reads and poisons past the BO, which is memory
+    // corruption, not a slow path (engine#1372: 4 of 4 segfaults on the d3 pack's real questions, and one run
+    // that answered from rows the layers never processed). So a wider GEMM is walked in blocks here, at the one
+    // choke point every batched projection goes through: the same launches in the same order, each within the
+    // BO. Each row's result is independent of the others -- the row loops downstream (`row_attn`, the GDN
+    // recurrence) never needed the whole prompt in one launch, only the GEMMs did.
+    const int blk = max_batch_rows();
+    if (blk > 0 && M > blk) {
+        out.assign((size_t)M * N, 0.0f);
+        for (int b0 = 0; b0 < M && err_.empty(); b0 += blk) {
+            const int rows = std::min(blk, M - b0);
+            std::vector<float> part;
+            // A's row stride is the caller's a_k, not the padded K (the same stride trap the host path documents).
+            npu_gemm_rows(role, A + (size_t)b0 * a_k, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
+            if (part.size() < (size_t)rows * N) {
+                if (err_.empty()) err_ = std::string("npu_gemm_rows: a blocked ") + sc + " launch returned short";
+                return;
+            }
+            std::copy(part.begin(), part.begin() + (size_t)rows * N, out.begin() + (size_t)b0 * N);
+        }
+        return;
+    }
     npu::target::GemvArgs a;
     a.role = role; a.layer = cur_layer_; a.M = M; a.K = K; a.N = N;
     a.x = A; a.Bmat = Bmat; a.wkey = wkey; a.tag = sc;

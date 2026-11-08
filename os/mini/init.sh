@@ -157,9 +157,11 @@ fi
 
 # The sealed NPU kernels live on the stick (they used to be inside the RAM image, which made it too big
 # to load): link them to the path the engine looks for, beside itself.
-if [ -d /data/npu/kernels ] && [ -d /home ]; then
-    mkdir -p /home/bcloud/wt/npupkg-build/npu 2>/dev/null
-    ln -sfn /data/npu/kernels /home/bcloud/wt/npupkg-build/npu/kernels 2>/dev/null
+# engine #1543: the link used to name the BUILDER's home directory - a username and a build path compiled
+# into this script, and re-created as a directory on every boot. The engine is installed at /opt/1bit with its
+# backends beside it (mkimage.sh), so the sets are linked beside the engine there and no /home path exists.
+if [ -d /data/npu/kernels ] && [ -d /opt/1bit ]; then
+    ln -sfn /data/npu/kernels /opt/1bit/npu/kernels 2>/dev/null
     say "[kernels] $(ls /data/npu/kernels | wc -l) sealed NPU sets linked beside the engine"
 fi
 

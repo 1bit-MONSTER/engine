@@ -108,5 +108,26 @@ printf 'const char *p = "/home/builder/wt/roll/src/app/serve.cpp";\nint g(void) 
 "$cc" -shared -fPIC -o "$w/buildpath/hrx/llama/bin/libbp.so.0" "$w/bp.c" || exit 2
 arm "#1461: a build-machine path in a packed ELF fails" fail "names a build-machine path" "$w/buildpath"
 
+# 6. engine #1543: the layout row. A build-machine path as a DIRECTORY NAME and as a SYMLINK TARGET - the
+#    two shapes the content rows cannot see, because they read file bytes and these are not bytes a grep
+#    reaches in the same way (a symlink target is not the link's contents).
+mkdir -p "$w/layout/home/builder/wt/roll"
+cp "$w/clean/hrx/llama/bin/libhrx.so.0" "$w/layout/home/builder/wt/roll/1bit"
+ln -s /home/builder/wt/roll/1bit "$w/layout/bin-1bit-link"
+arm_layout() {  # arm_layout <want> <phrase> <tree>
+    local want=$1 phrase=$2 t=$3 out rc=0
+    out=$(layout_build_paths "$t" 2>&1) || rc=1
+    if [ "$want" = pass ]; then
+        [ "$rc" = 0 ] && echo "PASS  layout: a tree with no build-machine path passes"
+        [ "$rc" = 0 ] || { echo "FAIL  layout: expected pass, got rc=$rc"; printf '%s\n' "$out" | head -3 | sed 's/^/      /'; fail=$((fail+1)); }
+    else
+        if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q -- "$phrase"; then echo "PASS  $want"
+        else echo "FAIL  $want: expected a FAIL naming '$phrase', got rc=$rc"; printf '%s\n' "$out" | head -3 | sed 's/^/      /'; fail=$((fail+1)); fi
+    fi
+}
+arm_layout "#1543: a directory named after the builder fails" "is a path naming a build machine" "$w/layout"
+arm_layout "#1543: a symlink into the builder's home fails" "the target names a build machine" "$w/layout"
+arm_layout pass "" "$w/clean"
+
 if [ "$fail" = 0 ]; then echo "pack_check: all rows PASS"; else echo "pack_check: $fail row(s) FAILED"; fi
 [ "$fail" = 0 ]

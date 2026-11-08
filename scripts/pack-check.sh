@@ -145,3 +145,28 @@ runtime_selfcontained() {  # runtime_selfcontained <unpacked tree>  -> FAIL line
     [ "$rc" = 0 ] && echo "ok   every packed ELF resolves inside the payload or the system loader, declares no absolute RUNPATH, and the HSA runtime set it dlopens ships beside it"
     return $rc
 }
+
+# engine #1543: the FOURTH leak class - a build-machine path delivered as the filesystem LAYOUT rather than as
+# a string inside a file. The rows above read packed ELFs, so neither a directory named after the builder nor
+# a symlink pointing into their home is visible to them; the mini image shipped
+# /bin/1bit -> /home/<user>/.../build/1bit and a whole /home/<user> tree carrying a 4.7 MB binary.
+layout_build_paths() {  # layout_build_paths <tree> [pattern ...]   (default pattern: /home/)
+    local t=$1 rc=0 f p l pat
+    shift
+    [ $# -gt 0 ] || set -- /home/
+    while IFS= read -r -d '' f; do
+        p=${f#"$t"}
+        for pat in "$@"; do
+            case $p in *"$pat"*) printf 'FAIL %s is a path naming a build machine\n' "$p"; rc=1 ;; esac
+        done
+        # a symlink's TARGET is not file content: it has to be read, not searched
+        if [ -L "$f" ]; then
+            l=$(readlink "$f")
+            for pat in "$@"; do
+                case $l in *"$pat"*) printf 'FAIL %s -> %s: the target names a build machine\n' "$p" "$l"; rc=1 ;; esac
+            done
+        fi
+    done < <(find "$t" -print0)
+    [ "$rc" = 0 ] && echo "ok   no path in the layout (name or symlink target) names a build machine ($*)"
+    return $rc
+}

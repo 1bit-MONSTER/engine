@@ -2198,6 +2198,31 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         tile_q4_1_f32(q, tiled, &pinexact);
                         r.codes_total = q.codes.size();
                         r.zero_exact_pct = 100.0 * double(q.scale.size() - pinexact) / double(q.scale.size());
+                        // The pack's own fp16 embedding is an independent reference for this decode: on a tied
+                        // model it must reproduce the 4-bit head, and on an untied one the number simply comes
+                        // out low. Report it rather than skipping: it is evidence either way (same rule the host
+                        // head path uses).
+                        if (q.N == int(V) && q.K == int(H)) {
+                            double sum_abs = 0, sum_ref = 0;
+                            for (int n = 0; n < q.N; ++n)
+                                for (int k = 0; k < q.K; ++k) {
+                                    const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
+                                    const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
+                                    double e;
+                                    if (embed->type == kF16) {
+                                        uint16_t h;
+                                        std::memcpy(&h, embed_bytes + (size_t(n) * H + k) * 2, 2);
+                                        e = f16_to_f32(h);
+                                    } else {
+                                        e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
+                                    }
+                                    sum_abs += std::fabs(x - e);
+                                    sum_ref += std::fabs(e);
+                                }
+                            r.lmhead_rel = sum_abs / sum_ref;
+                            r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+                            r.selfcheck_reference = true;
+                        }
                         const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
                         r.tiles += head_tiles;
                         w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));

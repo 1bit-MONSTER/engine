@@ -37,7 +37,7 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1))
-    case "$1" in gpu|npu|npu-power|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|npu-power|hrx-placement|models|chat-hrx|chat-npu|chat-npu-followup|chat-npu-stream|chat-npu-ladder|chat-npu-queue|chat-npu-queue-plain) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
 # A check that DIES must not take the evidence - or the NPU - with it. Measured on the c27 board (5 Nov 2026 21:52Z):
@@ -538,6 +538,31 @@ npu_power_verdict() {
     esac
 }
 
+# The HRX weight placement (engine #1339's mitigation), decided from two measurements of the same model.
+# Importing the loader's mapping instead of copying it to the device (fork #226, engine #856) saves GTT - Qwen3-4B goes
+# from 3925 to 1243 MiB of the process's own GTT - but on large files the import never finishes: a dense 16.4 GiB 27B and
+# a 76.3 GiB Flash-Next sat in it for 72 minutes with no error, while the device copy loads in 20-75 s (#1339). Fork
+# #231 (pinned since engine #1343) makes the import OPT-IN: `GGML_HRX_WEIGHT_HOST_PLACEMENT=1` asks for it, unset or 0
+# keeps the device copy, which is what a stick needs. Nothing prints that switch - not `--list-devices` (name and size
+# only), not the backend (no log at the decision), not `1bit serve --print-backend-env` - so the row measures the thing
+# itself, the way the issue did: load one model twice and weigh each serve process's own GTT.
+# Pure, so --self-test drives it: <default arm MiB> <opt-in arm MiB> [required % more].
+hrx_placement_verdict() {
+    _d=${1:-} _i=${2:-} _f=${3:-15}
+    case "$_d" in ''|*[!0-9]*) printf 'FAIL the default arm'"'"'s own GTT is unreadable (%s)' "${_d:-empty}"; return 0 ;; esac
+    case "$_i" in ''|*[!0-9]*) printf 'FAIL the opt-in arm'"'"'s own GTT is unreadable (%s)' "${_i:-empty}"; return 0 ;; esac
+    if [ "$_d" -le 0 ] || [ "$_i" -le 0 ]; then
+        printf 'FAIL an arm reported %s / %s MiB of own GTT: that is not a measurement' "$_d" "$_i"; return 0
+    fi
+    # the issue's own arms are 1.89x (4B, 5692 -> 3010 MiB) and 3.16x (4B, docs); 15 % is a conservative floor that
+    # cannot be reached by noise, and being relative it needs no absolute MiB threshold to drift with ctx or slots.
+    if [ "$_d" -ge $(( _i + _i * _f / 100 )) ]; then
+        printf 'PASS the default arm costs %s MiB of its own GTT against %s MiB with GGML_HRX_WEIGHT_HOST_PLACEMENT=1 (%s%% more): the shipped default takes the device copy, and the import still works when it is asked for' "$_d" "$_i" "$_f"
+    else
+        printf 'FAIL the default arm used %s MiB and the opt-in arm %s MiB - the default is not the device copy that loads a large model (#1339); check that this build carries fork #231' "$_d" "$_i"
+    fi
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -577,6 +602,17 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(followup_verdict '{"error":{"message":"no answer"}}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 0)"
     check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT"}}]}' 0 0)"
     check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' '' '')"
+    # c32: the HRX weight placement. The measured arms from #1339 are the first two; the failure shapes are a default
+    # that already imported (2), an unreadable arm, and a zero.
+    check PASS "$(hrx_placement_verdict 5692 3010)"        # 4B perplexity, #1339
+    check PASS "$(hrx_placement_verdict 3925 1243)"        # 4B, docs/hrx.md
+    check FAIL "$(hrx_placement_verdict 3010 5692)"        # default imported: the wrong way round
+    check FAIL "$(hrx_placement_verdict 1000 1000)"        # no difference at all
+    check FAIL "$(hrx_placement_verdict 0 3010)"           # a zero is not a measurement
+    check FAIL "$(hrx_placement_verdict '' 3010)"          # unreadable default
+    check FAIL "$(hrx_placement_verdict 5692 '')"          # unreadable opt-in
+    check PASS "$(hrx_placement_verdict 2000 1000)"        # exactly the floor is enough
+    check FAIL "$(hrx_placement_verdict 1140 1000)"        # just under it is not
     # c30 (owner decision 2026-11-05): the NPU's power state. The c29 take's shape is the second case - the array was
     # allowed to suspend between requests, and the prompt turn that followed it came back `code 614`.
     check PASS "$(npu_power_verdict on active)"
@@ -822,6 +858,116 @@ else
     esac
 fi
 
+# ── the HRX weight placement, measured (engine #1339's mitigation - see hrx_placement_verdict) ────────────
+# The model is NAMED in the row on purpose: it has to be UNTIED. Fork #233 (engine #1316) changes where a TIED
+# embedding lands, so a tied model would move between the two arms for a second reason and prove nothing about this
+# switch. The shipped demo 4B carries both token_embd.weight and output.weight and no tie_word_embeddings key.
+# Seams for measurement off a stick: HRXP_SERVE (a command that stands in for `1bit serve`), HRXP_GTT (a command that
+# prints the MiB of own GTT for the pids given), HRXP_MODEL (a model path), HRXP_WAIT (seconds to wait for /health).
+hrxp_model() {  # the staged 4B GGUF, if this medium has one
+    if [ -n "${HRXP_MODEL:-}" ]; then printf '%s' "$HRXP_MODEL"; return 0; fi
+    for _g in /data/lemonade/huggingface/models--unsloth--Qwen3-4B-Instruct-2507-GGUF/snapshots/*/Qwen3-4B-Instruct-2507-Q4_K_M.gguf; do
+        [ -f "$_g" ] && { printf '%s' "$_g"; return 0; }
+    done
+    return 1
+}
+hrxp_gtt() {  # <pid>... -> that process tree's own drm-total-gtt, in MiB
+    if [ -n "${HRXP_GTT:-}" ]; then "$HRXP_GTT" "$@"; return 0; fi
+    _k=0
+    for _p in "$@"; do
+        for _fd in /proc/"$_p"/fdinfo/*; do
+            [ -r "$_fd" ] || continue
+            _b=$(sed -n 's/^drm-total-gtt:[[:space:]]*\([0-9]*\).*/\1/p' "$_fd" 2>/dev/null | head -1)
+            [ -n "$_b" ] && _k=$((_k + _b))
+        done
+    done
+    [ "$_k" -gt 0 ] && printf '%s' $(( _k / 1024 / 1024 )) || printf '0'
+}
+# Which mechanism does the SHIPPED engine have? Fork #231 (engine #1343) added the import switch and made it opt-in;
+# fork #234 (engine #1351, which also closed #1339) REMOVED it - that build reads the weights into their buffers and drops
+# their page cache instead. On the second kind the env var is ignored, both arms take the same path and their GTT readings
+# are identical, so a verdict would red a correct image. The row therefore asks the shipped code, and SKIPs with the reason
+# when the switch is not in it: a gate that fails a correct build is its own defect. Measuring the read+DONTNEED mechanism
+# needs its own row (#1351 measured page-cache residency 16.5 GiB -> nothing, peak RSS 16.4 -> 2.9 GiB, load 14.3 -> 18.6 s),
+# and it must be built and measured on a pin that has it before it can gate one.
+hrxp_has_switch() {  # <engine binary> -> 0 when the shipped libs carry GGML_HRX_WEIGHT_HOST_PLACEMENT
+    case "${HRXP_SWITCH:-}" in 1) return 0 ;; 0) return 1 ;; esac
+    _d=$(dirname "${1:-}" 2>/dev/null) _l=
+    for _cand in "$_d/libggml-hrx.so" "$_d"/libggml-hrx.so.* "$_d/../lib/ggml/libggml-hrx.so" "$_d"/../lib/ggml/libggml-hrx.so.* "$_d"/hrx/llama/bin/libggml-hrx.so; do
+        [ -f "$_cand" ] || continue
+        if grep -q 'GGML_HRX_WEIGHT_HOST_PLACEMENT' "$_cand" 2>/dev/null; then _l=$_cand; break; fi
+    done
+    [ -n "$_l" ]
+}
+
+hrxp_arm() {  # <port> <optin 0|1> -> "<own GTT MiB>" on stdout; non-zero when the arm did not come up
+    if [ -n "${HRXP_SERVE:-}" ]; then
+        _g=$($HRXP_SERVE "$1" "$2" 2>/dev/null | tail -1)
+        case "${_g:-}" in ''|*[!0-9]*) return 1 ;; esac
+        printf '%s' "$_g"; return 0
+    fi
+    set -- "$1" "$2"
+    _port=$1 _optin=$2
+    if [ "$_optin" = 1 ]; then export GGML_HRX_WEIGHT_HOST_PLACEMENT=1; else unset GGML_HRX_WEIGHT_HOST_PLACEMENT; fi
+    setsid "$ONEBIT_BIN" serve -m "$HRXP_MODEL_PATH" --device hrx --ctx-size 512 --host 127.0.0.1 --port "$_port" \
+        >/tmp/1bit-hrxp-$_port.log 2>&1 &
+    _pgid=$!
+    _i=0; _w=${HRXP_WAIT:-120}
+    while [ "$_i" -lt "$_w" ]; do
+        if command -v curl >/dev/null 2>&1; then
+            curl -sf -m 2 "http://127.0.0.1:$_port/health" >/dev/null 2>&1 && break
+        else
+            wget -q -O /dev/null --timeout=2 -t 1 "http://127.0.0.1:$_port/health" 2>/dev/null && break
+        fi
+        kill -0 "$_pgid" 2>/dev/null || break
+        sleep 2; _i=$((_i + 2))
+    done
+    if ! kill -0 "$_pgid" 2>/dev/null; then
+        kill -TERM -- -"$_pgid" 2>/dev/null; return 1
+    fi
+    # the child (llama-server) holds the device; sample the group, then stop it and let the GTT go
+    _pids=$(pgrep -g "$_pgid" 2>/dev/null | tr '\n' ' ')
+    _g=$(hrxp_gtt "$_pgid" $_pids)
+    kill -TERM -- -"$_pgid" 2>/dev/null; sleep 2; kill -KILL -- -"$_pgid" 2>/dev/null
+    case "${_g:-}" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$_g"
+}
+if [ ! -e "${HRXP_KFD:-/dev/kfd}" ]; then
+    skip hrx-placement "no /dev/kfd: this machine has no AMD GPU, so there is no HRX placement to measure"
+elif ! HRXP_MODEL_PATH=$(hrxp_model); then
+    skip hrx-placement "no staged Qwen3-4B-Instruct-2507-Q4_K_M.gguf under /data/lemonade/huggingface: the row measures one named model twice and will not substitute another"
+else
+    ONEBIT_BIN=${ONEBIT_BIN:-}
+    if [ -z "$ONEBIT_BIN" ]; then
+        for _b in $(command -v 1bit 2>/dev/null) /opt/1bit-package/1bit/1bit /opt/1bit-engine/1bit /opt/1bit/1bit; do
+            [ -x "$_b" ] && { ONEBIT_BIN=$_b; break; }
+        done
+    fi
+    if [ -z "$ONEBIT_BIN" ] && [ -z "${HRXP_SERVE:-}" ]; then
+        skip hrx-placement "no 1bit engine binary in the image, so the two arms cannot be started"
+    elif ! hrxp_has_switch "$ONEBIT_BIN"; then
+        skip hrx-placement "this build does not carry the weight-mapping import switch (fork #234 / engine #1351 removed it: weights are read into their buffers and their page cache is dropped), so both arms would take the same path and the two-arm GTT measurement cannot distinguish anything - #1339's current mechanism needs its own row, measured on a pin that has it"
+    else
+        export HRXP_MODEL_PATH
+        DFLT=$(hrxp_arm 18301 0) || _drc=$?
+        OPTIN=$(hrxp_arm 18302 1) || _orc=$?
+        if [ -n "${_drc:-}" ] || [ -n "${_orc:-}" ]; then
+            # an arm that never answered /health is not a measurement of the placement: name which one, and why, rather
+            # than reporting "unreadable GTT" and sending the reader after the wrong fault
+            VM="FAIL an arm did not come up (default${_drc:+ rc=$_drc} ${DFLT:-no-answer} / opt-in${_orc:+ rc=$_orc} ${OPTIN:-no-answer}); see /tmp/1bit-hrxp-1830{1,2}.log"
+        else
+            VM=$(hrx_placement_verdict "${DFLT:-}" "${OPTIN:-}")
+        fi
+        case "$VM" in
+            PASS*) pass hrx-placement "$(basename "$HRXP_MODEL_PATH") (untied): ${VM#PASS }" ;;
+            *)     fail hrx-placement "$(basename "$HRXP_MODEL_PATH"): ${VM#FAIL }" ;;
+        esac
+        unset HRXP_MODEL_PATH GGML_HRX_WEIGHT_HOST_PLACEMENT
+    fi
+fi
+
+# Placed BEFORE the chat rows on purpose: lemond loads a model for those, and this row wants the device to itself -
+# two arms that load while another serve holds the NPU/GPU would differ for the wrong reason.
 # ── fans (EC fan curve; only a board we know has one we drive) ──────────────────────────────────
 if [ ! -x /usr/sbin/1bit-board ]; then
     skip fans "no /usr/sbin/1bit-board in this image: the fans stay on the firmware curve"

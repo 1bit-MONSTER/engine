@@ -467,6 +467,16 @@ lemver=$("$lem/bin/lemond" --version 2>/dev/null | sed -n 's/^lemond version \([
     hrx=$(git -C "$repo" ls-tree HEAD third_party/hrx-system 2>/dev/null | awk '{print substr($3, 1, 12)}')
     echo "hrx-system: ${hrx:-unknown}"
     echo "kernel: $kver"
+    # `engine:` above is a git short sha, which is not a file hash - so a reader cannot check it against the payload the image
+    # actually carries, and release-check's identity row SKIPped every mini image for exactly that reason (engine#1481). The
+    # launcher's own sha256 is checkable, so it is written BESIDE the git sha rather than replacing it: `engine:` keeps its
+    # readers, and a check that can now compare prefers this one and says PASS or FAIL instead of skipping.
+    launcher=$lem/1bit/1bit
+    if [ -f "$launcher" ]; then
+        echo "engine_sha256: $(sha256sum "$launcher" | cut -c1-64)"
+    else
+        echo "engine_sha256: none"
+    fi
     echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$root/etc/1bit/release-identity"
 # The onebit entries this image ships, so 1bit-release-check can prove Lemonade registers them. The

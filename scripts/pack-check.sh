@@ -47,13 +47,23 @@
 # of lemonade's 13 does not begin a line and `grep -c` reports 12 for a file carrying 13 (measured
 # 2026-11-08 on c32's own bytes). /home/ covers any builder's home; the source tree, the workdir and the
 # build tree cover a build that ran elsewhere on this machine.
-# A GENUINE_TEXT file is one no build writes by accident and no licence needs: compiler output that records the source
-# path it was generated from. `gcc -S` emits `.file "/abs/path"`, `cmd_*.c` records the whole command line, and
-# Module.symvers carries the tree. Keep the list bounded and explained - NOT every text file, because a licence or a
-# man page may legitimately name a path, and a guard that reds those is a guard people turn off.
-# Measured 2026-11-09 (engine#1487): two builds of linux-headers-7.4.0-rc1-1bit produced devicetable-offsets.s with the
-# SAME 1,182 lines, one 62,895 B and one 49,425 B - the 13,470 B difference is exactly 449 lines x 30 B, the absolute
-# paths in `.file` directives. Reproducible given the path; leaking without a prefix map.
+# A GENERATED_TEXT file is compiler output that records a path, and the set is bounded and explained because the files in
+# it do NOT all have the same remedy - that distinction is the reason this comment exists:
+#
+#   *.s, *.mod.c, Module.symvers, modules.order   what a PREFIX MAP can fix. `gcc -S` writes `.file "<abs path>"`, and the
+#                                                 map rewrites those. Measured 2026-11-09 (engine#1487): two builds of
+#                                                 linux-headers-7.4.0-rc1-1bit produced devicetable-offsets.s with the SAME
+#                                                 1,182 lines, one 62,895 B and one 49,425 B - the 13,470 B difference is
+#                                                 exactly 449 lines x 30 B of absolute paths. Reproducible given the path.
+#   *.cmd, *.d                                    what a prefix map CANNOT fix, by design: a .cmd records the compiler's
+#                                                 argv as executed and a .d records dependency paths, both absolute on purpose.
+#                                                 A red here means a BUILD TREE was packaged, whose remedy is to stop packaging
+#                                                 it - not to map it. Written down because the day this guard meets a real
+#                                                 kernel build tree it will red on files the map cannot touch, and the next
+#                                                 reader must not conclude the guard is wrong.
+#
+# NOT every text file: a licence, a NOTICE or a man page may legitimately name a path, and a guard that reds those is a
+# guard people turn off.
 gen_text() {
     case ${1##*/} in
         *.s|*.cmd|*.mod.c|Module.symvers|modules.order|*.d) return 0 ;;

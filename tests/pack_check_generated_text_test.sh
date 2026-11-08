@@ -38,6 +38,10 @@ check "a licence naming a path is NOT refused (the bounded set)" \
     "$(build_path_strings "$work/licence" > /dev/null 2>&1; echo $?)" "0"
 check "gen_text accepts the six generated shapes" \
     "$(for n in a.s b.cmd c.mod.c Module.symvers modules.order d.d; do gen_text "$n" && printf y; done)" "yyyyyy"
+# The two shapes a prefix map CANNOT fix are accepted on purpose: a red on them means a build tree was packaged, and the
+# remedy is to stop packaging it. This check exists so that distinction is not "tidied away" by someone narrowing the list.
+check "the shapes only 'do not package the tree' can fix are accepted, not narrowed out" \
+    "$(for n in x.cmd y.d; do gen_text "$n" && printf y; done)" "yy"
 check "gen_text refuses a licence and a man page" \
     "$(for n in LICENSE NOTICE 1bit.1 README.md; do gen_text "$n" && printf y; done)" ""
 

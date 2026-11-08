@@ -32,6 +32,8 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <algorithm>
+#include <utility>
 #include <vector>
 
 template <class T>
@@ -51,9 +53,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s <model.q4nx> <kernels dir> <input dir> [--decode N]\n", argv[0]);
         return 2;
     }
-    int decode = 8;
+    int decode = 8, top_k_n = 0;
     for (int i = 4; i + 1 < argc; i++)
         if (!std::strcmp(argv[i], "--decode")) decode = std::atoi(argv[i + 1]);
+        else if (!std::strcmp(argv[i], "--top-k") && i + 1 < argc) top_k_n = std::atoi(argv[++i]);
     const std::string dir = argv[3];
 
     Q4nxNpuForward f;
@@ -131,11 +134,29 @@ int main(int argc, char** argv) {
             if (v[i] > v[(size_t)b]) b = (int)i;
         return b;
     };
+    // --top-k N prints the top-N logits wherever an argmax is taken, so a decode step can be diffed against the
+    // reference number for number instead of token for token (two decoders that agree on the argmax can still differ by
+    // a lot underneath, and that is what decides whether the next step is off).
+    auto top_k = [&](const char* where) {
+        if (top_k_n <= 0) return;
+        std::vector<std::pair<float, int>> v;
+        v.reserve(logits.size());
+        for (size_t i = 0; i < logits.size(); i++) v.emplace_back(logits[i], (int)i);
+        const size_t k = std::min((size_t)top_k_n, v.size());
+        std::partial_sort(v.begin(), v.begin() + (long)k, v.end(),
+                          [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+        std::printf("top%d %s:", top_k_n, where);
+        for (size_t i = 0; i < k; i++) std::printf(" %d:%.4f", v[i].second, v[i].first);
+        std::printf("\n");
+        std::fflush(stdout);
+    };
     std::vector<int> out;
+    top_k("prefill");
     out.push_back(argmax(logits));
     int pos = int(positions[0 * rows + rows - 1]) + 1;   // the generation step's position (delta already applied)
     for (int i = 1; i < decode; i++) {
         if (!f.step(out.back(), pos + i - 1, logits)) { std::fprintf(stderr, "step: %s\n", f.last_error()); return 1; }
+        top_k(i == 1 ? "step1" : "step");
         out.push_back(argmax(logits));
     }
     std::printf("prompt %d tokens (%zu image rows), deepstack %d set(s)\n", rows, rows_img, in.deepstack_sets);

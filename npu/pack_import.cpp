@@ -285,6 +285,10 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen3-1.7B: same rule at hidden 2048 / 16 heads / 28 layers; 535 code bytes of the two builds differ, all in
     // layer 24, which is content rather than layout (every block still lines up).
     {2048, 16, 28, 8512, 3, 1, 1183744},
+    // Qwen3-4B: 2,933 of 2,208,061,248 bytes differ (1.3e-6), again content not layout. The prefix corroborates the
+    // Qwen3 offset seen at 1.7B -- 64 + 2*hidden + 4,352, so 8,512 at hidden 2,048 and 9,536 at 2,560 -- and the tile
+    // count differs from 1.7B's 3, which is why this is measured per pack and never derived.
+    {2560, 32, 36, 9536, 5, 1, 1462272},
 };
 
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes
@@ -2585,8 +2589,13 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             auto pad_n = [](int n) { return (n + 511) / 512 * 512; };
             const int kpad = pad_k(p.dims.hidden);
             const int q_out = p.dims.heads * p.dims.head_dim, kv_out = p.dims.kv_heads * p.dims.head_dim;
+            // o_proj's K is q_proj's OUTPUT width, which is hidden only when heads*head_dim == hidden. On
+            // Qwen3-4B it is 32 x 128 = 4096 against a hidden of 2560, and declaring pad_k(hidden) there made the
+            // forward refuse this container ("declares O:2560x2560, this model derives O:4096x2560") -- the family
+            // guard doing exactly its job, since the mismatch would otherwise have been wrong text.
+            const int kpad_o = pad_k(int64_t(p.dims.heads) * p.dims.head_dim);
             c["q4nx_designs"] = "QKV:" + std::to_string(kpad) + "x" + std::to_string(pad_n(q_out + 2 * kv_out)) +
-                                ",O:" + std::to_string(kpad) + "x" + std::to_string(pad_n(p.dims.hidden)) +
+                                ",O:" + std::to_string(kpad_o) + "x" + std::to_string(pad_n(p.dims.hidden)) +
                                 ",GU:" + std::to_string(kpad) + "x" + std::to_string(pad_n(2 * p.dims.intermediate)) +
                                 ",D:" + std::to_string(pad_k(p.dims.intermediate)) + "x" +
                                 std::to_string(pad_n(p.dims.hidden));

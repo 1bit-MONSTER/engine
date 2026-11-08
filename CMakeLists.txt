@@ -857,6 +857,12 @@ add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_
 target_include_directories(npu_elf_args_test PRIVATE npu/forward/include)
 target_link_libraries(npu_elf_args_test PRIVATE m)
 add_test(NAME npu_elf_args COMMAND npu_elf_args_test)
+# Every op a plan may name must ship a host reference with known answers, and the test walks the table
+# (engine#799): an op without one is named by op_coverage() and asserted here, so the gap is a decision in
+# the test rather than an omission.  Host-only, no model, no device.
+add_executable(npu_plan_op_reference_test tests/npu_plan_op_reference.cpp npu/plan/op_registry.cpp)
+target_include_directories(npu_plan_op_reference_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
+add_test(NAME npu_plan_op_reference COMMAND npu_plan_op_reference_test)
 add_executable(npu_plan_test tests/npu_plan_test.cpp)
 target_include_directories(npu_plan_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
 target_link_libraries(npu_plan_test PRIVATE nlohmann_json::nlohmann_json)
@@ -1039,7 +1045,7 @@ add_test(NAME attn_math COMMAND attn_math_test)
 # workflow is next touched with that scope and add these to the list itself. `host_gemm_pad_test` is here for the
 # same reason: without it ctest reports the row as "Not Run" and the job fails after every other test passes.
 add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test npu_kv_int8_test
-                 host_gemm_pad_test npu_derive_designs_dump)
+                 host_gemm_pad_test npu_derive_designs_dump npu_plan_op_reference_test)
 # The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.

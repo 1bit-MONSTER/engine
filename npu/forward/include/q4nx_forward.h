@@ -148,14 +148,24 @@ public:
     // The per-token fallback path (MLA/MoE/GDN/... models) needs ids and is refused by name.
     bool step_batch_embeds(const std::vector<float>& embeds, int start_pos,
                            std::vector<float>& logits);
-    // The same, with the three position planes an interleaved-MRoPE pack needs (engine#1311/TQVL, plan P4's
-    // `rope.planes`).  `position_ids` is 3 x rows, plane-major (t, then h, then w) — exactly the layout the
-    // reference's `get_rope_index` produces and AMD's `text.onnx` takes.  Empty means "the usual start_pos + row".
-    // Text rows have all three planes equal, which is bit-identical to plain RoPE (measured, 0 difference over
-    // positions 0..262143); image rows differ per axis and that difference is the whole point.  A pack that
-    // declares mrope without sections is refused by name.
-    bool step_batch_embeds(const std::vector<float>& embeds, const std::vector<int>& position_ids, int start_pos,
-                           std::vector<float>& logits);
+    // What a vision-conditioned prompt adds on top of the embeddings (engine#1311/TQVL; plan P4's `rope.planes`
+    // and a per-layer feature injection):
+    //   position_ids 3 x rows, plane-major (t, h, w) — the layout the reference's `get_rope_index` produces and
+    //                AMD's `text.onnx` takes. Text rows have all three equal, which is bit-identical to plain RoPE
+    //                (measured: 0 difference over positions 0..262143; image rows differ per axis and that is the
+    //                whole point). A pack that declares mrope without sections is refused by name.
+    //   deepstack   sets x rows x H, one set per `vision_config.deepstack_visual_indexes` entry (Qwen3-VL: 5/11/17);
+    //                set s is added to the hidden state when the layer loop reaches deepstack_layers[s]. This is how
+    //                the reference injects the vision tower's extra features, and an answer cannot match it without.
+    struct HybridInputs {
+        const std::vector<int>* position_ids = nullptr;
+        const float* deepstack = nullptr;
+        int deepstack_sets = 0;
+    };
+    const int* deepstack_layers() const { return sem_.deepstack_layers; }
+    int n_deepstack_layers() const { return sem_.n_deepstack; }
+    bool step_batch_embeds(const std::vector<float>& embeds, int start_pos, std::vector<float>& logits,
+                           const HybridInputs& in);
 
     // The same batched pass, but returning the logits of EVERY row (M x NV, row-major) instead of only
     // the last one.  Speculative decoding needs them: a draft token is accepted only if the model's own
@@ -365,6 +375,9 @@ private:
     // Set only while step_batch_embeds(..., position_ids, ...) runs: 3 x rows, plane-major, or null.
     const int* pos3_ = nullptr;
     int pos3_rows_ = 0;
+    // Set only while a step_batch_embeds() call carries deepstack sets: sets x rows x H.
+    const float* deepstack_ = nullptr;
+    int deepstack_rows_ = 0;
     // Which plane a rotary frequency belongs to under interleaved MRoPE (semantics' mrope_section, contiguous).
     int mrope_plane(int freq) const {
         if (sem_.n_mrope_section < 3) return 0;

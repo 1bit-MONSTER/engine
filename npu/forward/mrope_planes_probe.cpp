@@ -58,8 +58,11 @@ int main(int argc, char** argv) {
         planes_img[rows + r] = r / 2;                                           // h (a 2-wide image grid)
         planes_img[2 * rows + r] = r % 2;                                       // w
     }
-    f.reset(); if (!f.step_batch_embeds(embeds, planes_eq, 0, eq)) { std::fprintf(stderr, "eq: %s\n", f.last_error()); return 1; }
-    f.reset(); if (!f.step_batch_embeds(embeds, planes_img, 0, diff)) { std::fprintf(stderr, "img: %s\n", f.last_error()); return 1; }
+    Q4nxNpuForward::HybridInputs in_eq, in_img;
+    in_eq.position_ids = &planes_eq;
+    in_img.position_ids = &planes_img;
+    f.reset(); if (!f.step_batch_embeds(embeds, 0, eq, in_eq)) { std::fprintf(stderr, "eq: %s\n", f.last_error()); return 1; }
+    f.reset(); if (!f.step_batch_embeds(embeds, 0, diff, in_img)) { std::fprintf(stderr, "img: %s\n", f.last_error()); return 1; }
 
     int eq_diff = 0; double img_delta = 0.0;
     for (size_t i = 0; i < plain.size(); i++) {
@@ -70,6 +73,37 @@ int main(int argc, char** argv) {
                 eq_diff, plain.size());
     std::printf("image-style planes vs plain : mean |dlogit| %.4f (they must differ)\n", img_delta / double(plain.size()));
     const bool pass = eq_diff == 0 && img_delta > 0.0;
-    std::printf("%s\n", pass ? "PASS" : "FAIL");
-    return pass ? 0 : 1;
+    // Deepstack: the pack's own layer list must be read (Qwen3-VL declares three), a set count that disagrees must be
+    // refused by name, and non-zero sets must move the logits -- the same control/effect shape as the planes above.
+    const int n_ds = f.n_deepstack_layers();
+    std::printf("deepstack layers declared by the pack: %d\n", n_ds);
+    bool ds_ok = true;
+    if (n_ds > 0) {
+        const int Hd = int(embeds.size() / size_t(rows));
+        std::vector<float> sets(size_t(n_ds) * size_t(rows) * size_t(Hd), 0.05f);
+        Q4nxNpuForward::HybridInputs in_ds;
+        in_ds.deepstack = sets.data();
+        in_ds.deepstack_sets = n_ds;
+        std::vector<float> with_ds;
+        f.reset();
+        if (!f.step_batch_embeds(embeds, 0, with_ds, in_ds)) {
+            std::fprintf(stderr, "deepstack: %s\n", f.last_error());
+            return 1;
+        }
+        double ds_delta = 0.0;
+        for (size_t i = 0; i < plain.size(); i++) ds_delta += std::abs(double(plain[i]) - double(with_ds[i]));
+        ds_delta /= double(plain.size());
+        std::printf("deepstack sets vs plain  : mean |dlogit| %.4f (they must differ)\n", ds_delta);
+        Q4nxNpuForward::HybridInputs bad;
+        bad.deepstack = sets.data();
+        bad.deepstack_sets = n_ds + 1;
+        std::vector<float> refused;
+        f.reset();
+        const bool ran = f.step_batch_embeds(embeds, 0, refused, bad);
+        std::printf("wrong set count          : %s (%s)\n", ran ? "RAN" : "refused by name", f.last_error());
+        ds_ok = ds_delta > 0.0 && !ran;
+    }
+    const bool all = pass && ds_ok;
+    std::printf("%s\n", all ? "PASS" : "FAIL");
+    return all ? 0 : 1;
 }

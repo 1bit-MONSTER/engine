@@ -229,6 +229,20 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
      * picking one of the two. */
     double d = 0;
     double prf_rope = 0;   /* partial_rotary_factor found inside rope_parameters */
+    /* Deepstack layers: the vision tower emits extra feature sets that the decoder adds at these layer indexes. */
+    {
+        const char* vc = value_for_top(json, "vision_config");
+        const char* at = vc ? strstr(vc, "deepstack_visual_indexes") : nullptr;
+        if (at) at = strchr(at, '[');
+        if (at) {
+            int got = 0;
+            const char* p3 = at + 1;
+            for (; p3 && *p3 && *p3 != ']' && got < 8; p3++) {
+                if (*p3 >= '0' && *p3 <= '9') s->deepstack_layers[got++] = (int)strtol(p3, (char**)&p3, 10);
+            }
+            s->n_deepstack = got;
+        }
+    }
     /* The sections say WHICH rotary frequencies belong to the (t, h, w) axes; without them an interleaved-MRoPE
      * consumer has nothing but a guess, so they are read next to the flag (both spellings) and a model that
      * declares mrope without them is refused by the consumer rather than assumed. */

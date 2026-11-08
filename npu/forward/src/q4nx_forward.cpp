@@ -3024,12 +3024,7 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
 // then the f32 signs those offsets index (the GGUF's prism.hadamard.sign_widths/sign_values).
 bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int start_pos,
-                                      std::vector<float>& logits) {
-    return step_batch_embeds(embeds, std::vector<int>(), start_pos, logits);
-}
-
-bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, const std::vector<int>& position_ids,
-                                      int start_pos, std::vector<float>& logits) {
+                                      std::vector<float>& logits, const HybridInputs& in) {
     if (!ready_) { err_ = "not initialised"; return false; }
     const size_t H = (size_t)c_.H;
     if (H == 0 || embeds.empty() || embeds.size() % H != 0) {
@@ -3040,6 +3035,7 @@ bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, const s
     for (float v : embeds)
         if (!std::isfinite(v)) { err_ = "step_batch_embeds: a row holds a non-finite value"; return false; }
     const int rows = int(embeds.size() / H);
+    const std::vector<int>& position_ids = in.position_ids ? *in.position_ids : std::vector<int>();
     if (!position_ids.empty()) {
         if (!sem_.mrope) {
             err_ = "step_batch_embeds: position_ids given but this pack does not declare interleaved MRoPE";
@@ -3059,16 +3055,28 @@ bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, const s
     // The body indexes tokens[m] only when nothing is injected, but it still needs the row count and the guards
     // above it read tokens; a zero vector of the right length keeps every check honest (0 is a valid id) while
     // the fill itself takes the injected rows.
+    if (in.deepstack_sets > 0) {
+        if (in.deepstack_sets != sem_.n_deepstack) {
+            err_ = "step_batch_embeds: " + std::to_string(in.deepstack_sets) + " deepstack set(s) given but the pack "
+                   "declares " + std::to_string(sem_.n_deepstack) + " deepstack layer(s)";
+            return false;
+        }
+        if (!in.deepstack) { err_ = "step_batch_embeds: deepstack_sets without a buffer"; return false; }
+    }
     const std::vector<int> placeholder(size_t(rows), 0);
     struct Restore {
         const float*& p;
         const int*& q;
         int& n;
-        ~Restore() { p = nullptr; q = nullptr; n = 0; }
-    } restore{inject_embeds_, pos3_, pos3_rows_};
+        const float*& d;
+        int& dn;
+        ~Restore() { p = nullptr; q = nullptr; n = 0; d = nullptr; dn = 0; }
+    } restore{inject_embeds_, pos3_, pos3_rows_, deepstack_, deepstack_rows_};
     inject_embeds_ = embeds.data();
     pos3_ = position_ids.empty() ? nullptr : position_ids.data();
     pos3_rows_ = rows;
+    deepstack_ = in.deepstack;
+    deepstack_rows_ = rows;
     return step_batch(placeholder, start_pos, logits);
 }
 
@@ -3220,6 +3228,17 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
         cur_layer_ = l;
+        // Deepstack (Qwen3-VL's vision tower emits three extra sets, added at these layers): the reference adds set
+        // s to the hidden state before the layer runs. With no sets (text-only, or the control arm) this is skipped
+        // and the pass is byte-identical to before.
+        if (deepstack_ && sem_.n_deepstack > 0) {
+            for (int s2 = 0; s2 < sem_.n_deepstack; s2++) {
+                if (sem_.deepstack_layers[s2] != l) continue;
+                const float* add = deepstack_ + size_t(s2) * size_t(deepstack_rows_) * size_t(H);
+                for (size_t i = 0; i < X.size(); i++) X[i] += add[i];
+                break;
+            }
+        }
         const bool cached = weight_cached(0);
         const int lt0 = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
         // A GDN layer's host parameters (conv window, alpha/beta, ssm_a/dt, gated

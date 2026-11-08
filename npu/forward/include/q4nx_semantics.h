@@ -101,6 +101,11 @@ typedef struct {
      * guess a layout for. */
     int mrope_section[3];
     int n_mrope_section;
+    /* DEEPSTACK: which decoder layers take one of the vision tower's extra feature sets.  Read from
+     * vision_config.deepstack_visual_indexes (Qwen3-VL: [5, 11, 17]); the consumer adds set s to the hidden state at
+     * layer deepstack_layers[s].  Empty means the pack has none. */
+    int deepstack_layers[8];
+    int n_deepstack;
     /* RoPE is configured PER LAYER TYPE (Gemma4 nests rope_parameters.
      * full_attention and .sliding_attention with different thetas and types).
      * Source: presence of rope_parameters.{full,sliding}_attention sub-blocks. */

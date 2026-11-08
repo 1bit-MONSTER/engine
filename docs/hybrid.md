@@ -141,9 +141,11 @@ contiguous in the cache, so the write has two destinations per layer at two diff
 inside a tensor is `n_embd_k_gqa`. The provider writes through **a mapping it made itself** of the dma-buf it was
 handed — `mmap` of the fd it received is enough, and it aliases the decoder's pages (engine#753 measured both) —
 and never through a mapping the *driver* makes of the imported buffer, which is the route that poisons the
-submission (engine#812). One trap that costs a silent wrong answer: that mapping is lazy, so **touch the whole
-region before the device writes it**; a device DMA into pages the process has not faulted in is dropped with no
-error and no fault, and the write looks like it never happened. The bytes the provider writes are the bytes the
+submission (engine#812). One trap that costs a silent wrong answer: that mapping is lazy, so **fault the whole
+region in before the device writes it** — one byte per page is enough (`for (p = buf; p < buf + len; p += 4096)
+*p = *p;`), or `mmap` it with `MAP_POPULATE`, or `madvise(MADV_WILLNEED)`. A device DMA into pages the process has
+not faulted is dropped with no error and no fault, and the write looks like it never happened — touching a single
+byte of the region is *not* enough, and looks identical to having done the right thing. The bytes the provider writes are the bytes the
 decoder reads — the handoff is `llama_kv_cells_adopt`, so nothing re-checks them. Engine#753 is that writer; the
 engine side of this contract (`?action=share`, `?action=adopt`, `llama_kv_cells_adopt`) needs no change for it.
 

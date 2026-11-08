@@ -85,8 +85,9 @@ Two facts from that work belong here because they bound what a device provider c
 - it must write through **a mapping it makes itself** of the dma-buf. Asking the driver for a mapping of the
   import is the route that makes every later submission fail (engine#812); the pages are the same either way. A
   second process can `mmap` the fd it is handed and gets the decoder's pages, but that mapping is lazy: pages it
-  has not touched are not there, and a device write into them is dropped silently, so the region has to be
-  touched first (both measured, engine#753).
+  has not faulted in are not there, and a device write into them is dropped silently, so every page of the region
+  has to be faulted first — one byte per page, or `MAP_POPULATE` / `MADV_WILLNEED`; touching one byte of the region
+  is not enough (both measured, engine#753).
 
 ### The arm a device provider replaces, and the model to run it on
 

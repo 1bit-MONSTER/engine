@@ -71,6 +71,34 @@ valid_addr() {   # $1 addr/prefix -> 0 when it is IPv4 with a prefix 1..32
 valid_ip() {     # $1 plain IPv4
     valid_addr "$1/32" 2> /dev/null
 }
+# prefix_to_mask 24 -> 255.255.255.0. connman's manual IPv4 config takes an ADDRESS and a NETMASK separately (not a
+# CIDR), and handing it a CIDR silently configures nonsense - the address field gets "10.0.2.15/24".
+prefix_to_mask() {
+    bits=${1:?}
+    mask=''
+    i=4
+    left=$bits
+    while [ $i -gt 0 ]; do
+        if [ $left -ge 8 ]; then octet=255; left=$((left - 8))
+        elif [ $left -le 0 ]; then octet=0
+        else
+            # a partial octet, by table: dash has no `**`, and a wrong netmask is a misconfigured interface
+            case $left in
+                1) octet=128 ;;
+                2) octet=192 ;;
+                3) octet=224 ;;
+                4) octet=240 ;;
+                5) octet=248 ;;
+                6) octet=252 ;;
+                7) octet=254 ;;
+            esac
+            left=0
+        fi
+        mask=${mask:+$mask.}$octet
+        i=$((i - 1))
+    done
+    echo "$mask"
+}
 valid_iface() {  # $1 interface name that the kernel knows
     [ -n "$1" ] || return 1
     case $1 in

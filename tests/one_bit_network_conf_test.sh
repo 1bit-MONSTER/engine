@@ -52,6 +52,18 @@ done
 valid_ip 10.0.2.2; check "valid_ip accepts a plain address" $?
 valid_ip 10.0.2.2/24 && { check "valid_ip refuses a CIDR (a gateway is not a prefix)" 1; } || check "valid_ip refuses a CIDR (a gateway is not a prefix)" 0
 
+# 3b. prefix_to_mask: connman's manual IPv4 config wants an ADDRESS and a NETMASK, never a CIDR, so this function is what
+# keeps "10.0.2.50/24" from being handed to connman as the address (the defect review found on #1513)
+for pair in "24:255.255.255.0" "16:255.255.0.0" "8:255.0.0.0" "12:255.240.0.0" "25:255.255.255.128" \
+            "26:255.255.255.192" "30:255.255.255.252" "31:255.255.255.254" "32:255.255.255.255" "1:128.0.0.0"; do
+    want=${pair#*:}; got=$(prefix_to_mask "${pair%%:*}")
+    [ "$got" = "$want" ] && check "prefix_to_mask ${pair%%:*} = $want" 0 || check "prefix_to_mask ${pair%%:*} = $want (got $got)" 1
+done
+# and the split the applier does: address without the prefix, mask from it
+static=10.0.2.50/24
+[ "${static%/*}" = 10.0.2.50 ] && [ "$(prefix_to_mask "${static#*/}")" = 255.255.255.0 ]
+check "a CIDR splits into the address and the netmask connman needs" $?
+
 # 4. the file itself: comments, blank lines, an unknown key (ignored with a warning), and the four keys it uses
 cat > "$t/good.conf" <<'CONF'
 # written by hand in this test

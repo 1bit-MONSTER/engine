@@ -1094,6 +1094,14 @@ add_test(NAME npu_rmsnorm_offset COMMAND npu_rmsnorm_offset_test)
 add_dependencies(npu_sampling_test npu_rmsnorm_offset_test)
 # layer_types -> per-layer kind, and the name the forward refuses an unimplemented kind by (q4nx_forward.cpp,
 # the engine#1087 shape).  Plain C, links the semantics TU directly, no model and no device.
+# Interleaved MRoPE is declarable in two spellings (rope_parameters for OGA/Qwen3.5 packs, rope_scaling for a
+# Hugging Face qwen3_vl config); the flag is what a route or a refusal can act on, so both are pinned here, with
+# the controls that keep a yarn/linear rope_scaling block from being read as mrope.  Plain C, no model, no device.
+add_executable(q4nx_mrope_test tests/q4nx_mrope_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_mrope_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_mrope_test PRIVATE m)
+add_test(NAME q4nx_mrope COMMAND q4nx_mrope_test)
+add_dependencies(npu_sampling_test q4nx_mrope_test)
 add_executable(q4nx_layer_kinds_test tests/q4nx_layer_kinds_test.c npu/forward/src/q4nx_semantics.c)
 target_include_directories(q4nx_layer_kinds_test PRIVATE npu/forward/include)
 target_link_libraries(q4nx_layer_kinds_test PRIVATE m)

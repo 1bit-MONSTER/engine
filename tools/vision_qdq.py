@@ -230,7 +230,7 @@ def _run(a):
 
 
 def self_check(fp32_path, qdq_path, images=3, bar=0.999):
-    """Cosine of every output against the fp32 graph on the same images; 1 if it clears `bar`, 0 if it does not.
+    """Cosine of every output against the fp32 graph on the same images; returns 0 if it clears `bar`, 1 if not.
 
     The ORT path in export_qwen3vl_vision.py gates itself the same way, and the point is that a graph below the bar must
     not exit 0: the A8W8 output measures 0.61-0.91, so this path has to be able to fail.

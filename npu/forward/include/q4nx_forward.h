@@ -127,7 +127,12 @@ public:
     bool extend_context(int n_tokens);
 
     // Run one token at absolute position pos; fills logits (size NV).
-    bool step(int token, int pos, std::vector<float>& logits);
+    // `pos` is the ROTARY position; `cache_pos` is the slot the new K/V lands in, which is the only thing that
+    // decides how many cached rows attention reads.  They are the same number only while positions equal indices:
+    // after an image they are not (an image's rows walk a small h/w grid, so the MRoPE position is far below the
+    // cache length), and using the rotary position as the window dropped the prompt's tail -- the question -- and
+    // every token after the first never saw what it had generated.  -1 keeps the old behaviour for text prompts.
+    bool step(int token, int pos, std::vector<float>& logits, int cache_pos = -1);
 
     // Batched prefill: run the whole prompt in one pass so each projection's
     // weight stream is read once per batch instead of once per token. The kernels

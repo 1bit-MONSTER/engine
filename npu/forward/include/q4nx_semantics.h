@@ -215,8 +215,8 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
  *           = 2 if i % 3 == 2 && i < 3 * section[2]
  *           = 0 otherwise
  *
- * For [24, 20, 20] that is 24 t / 20 h / 20 w frequencies, 40 of the 64 in positions a contiguous split would not put
- * them in -- which is why treating the sections as contiguous runs left every image prompt's answer bad while all
+ * For [24, 20, 20] that is 24 t / 20 h / 20 w frequencies, and 43 of the 64 sit where a contiguous split would not put
+ * them -- which is why treating the sections as contiguous runs left every image prompt's answer bad while all
  * equal-plane (text-only) prompts stayed exact.  Frequency index is the index within head_dim/2.
  */
 static inline int q4nx_mrope_axis(int freq, int n_section, const int* section) {

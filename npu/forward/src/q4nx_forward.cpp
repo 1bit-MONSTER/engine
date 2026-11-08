@@ -3234,9 +3234,22 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                                    embed_scale_;
     if (phb) { g_ph.embed = ph_ms(tp_bs); tp_lap = std::chrono::steady_clock::now(); }
 
+    // Deepstack, in the reference's place (transformers Qwen3VLTextModel.forward: `_deepstack_process` is called
+    // after `decoder_layer(...)`, for layer_idx < len(sets)). Set `l` of `deepstack_` goes to the image rows of the
+    // residual stream after text layer `l` runs. It is a lambda because a MoE layer ends in `continue`, which used to
+    // skip the add entirely -- latent for this dense pack, wrong for the Qwen3-VL-*-A3B MoE models.
+    auto deepstack_add = [&](int l) {
+        if (!deepstack_ || l < 0 || l >= sem_.n_deepstack) return;
+        const float* add = deepstack_ + size_t(l) * size_t(deepstack_rows_) * size_t(H);
+        const int lo = std::max(0, deepstack_lo_), hi = std::min((int)M, deepstack_hi_);
+        for (int r = lo; r < hi; r++)
+            for (size_t k = 0; k < (size_t)H; k++)
+                X[size_t(r) * (size_t)H + k] += add[size_t(r - lo) * (size_t)H + k];
+    };
+
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
-        cur_layer_ = l;   // (removed with the old pre-layer deepstack block by accident; every layer read the last one)
+        cur_layer_ = l;   // the layer index the per-layer helpers read
         const bool cached = weight_cached(0);
         const int lt0 = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
         // A GDN layer's host parameters (conv window, alpha/beta, ssm_a/dt, gated
@@ -3448,6 +3461,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 for (int k = 0; k < H; k++)
                     X[(size_t)m * H + k] += d_row[(size_t)k] * residual_scale_;
             }
+            deepstack_add(l);   // a MoE layer's tail still owes the layer its set
             continue;
         }
         // ACT is read below at the *fused* design's N, so both branches have to hand it rows at that
@@ -3537,21 +3551,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 fprintf(stderr, "  [LB] m=%d l=%d %.6f %.4f\n", m, l, ms / H, mmx);
             }
         }
-        // Deepstack, in the reference's place: set `l` is added to the hidden state AFTER text decoder layer `l`
-        // runs, for l < number of sets (transformers Qwen3VLTextModel.forward: "add visual features to the hidden
-        // states of first several layers", `hidden_states = _deepstack_process(hidden_states, mask, sets[layer_idx])`
-        // inside the loop, after the call). The pack's `deepstack_visual_indexes` are the VISION tower's layers the
-        // sets are tapped from (5/11/17 for this model) and are not text layer indexes -- using them here put the
-        // three sets at text layers 8/16/24, before the layer, which is why the image prompts answered "A\n".
-        if (deepstack_ && l < sem_.n_deepstack) {
-            // Only the image rows: a set has rows_img rows, and the reference adds it at the image-token positions,
-            // not across the prompt.
-            const float* add = deepstack_ + size_t(l) * size_t(deepstack_rows_) * size_t(H);
-            const int lo = std::max(0, deepstack_lo_), hi = std::min((int)M, deepstack_hi_);
-            for (int r = lo; r < hi; r++)
-                for (size_t k = 0; k < (size_t)H; k++)
-                    X[size_t(r) * (size_t)H + k] += add[size_t(r - lo) * (size_t)H + k];
-        }
+        deepstack_add(l);
     }
 
     if (phb) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
@@ -4257,7 +4257,7 @@ bool Q4nxNpuForward::mlp(const float* gu, float* h, int im) {
 // --------------------------------------------------------------------------
 // step
 // --------------------------------------------------------------------------
-bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
+bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // Generation is causal by construction (one position at a time, keys only in the past), so a pack
     // whose full-attention layers read the whole prompt cannot be run this way.  Refused by name
@@ -4482,8 +4482,13 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             }
             {
             LhScope _tlh(LH_ATTN);
+            // The rotary position rotates q; the cache slot decides the window.  Passing the rotary position as the
+            // window is what broke every image prompt: an image's rows walk a small h/w grid, so the position after the
+            // image is far below the cache length, and attention then read only the first `pos + 1` rows -- dropping
+            // the prompt's tail (the question) and never seeing the tokens it had just generated.
+            const int kv_window = cache_pos >= 0 ? cache_pos + 1 : 0;
             if (!attention(qkv_use, pos, nullptr, ctx, l_hd, l_nkv_heads, l_theta, l_rot, l_prop,
-                           l_win, kv_layer, !kv_shared)) {
+                           l_win, kv_layer, !kv_shared, kv_window)) {
                 err_ = "attention failed";
                 return false;
             }

@@ -153,9 +153,17 @@ int main(int argc, char** argv) {
     std::vector<int> out;
     top_k("prefill");
     out.push_back(argmax(logits));
-    int pos = int(positions[0 * rows + rows - 1]) + 1;   // the generation step's position (delta already applied)
+    int pos = int(positions[0 * rows + rows - 1]) + 1;   // the generation step's ROTARY position (delta applied)
+    // ...and the slot the token lands in, which is the prompt's length, not that position.  They coincide for a text
+    // prompt and do not after an image: the image rows walk a small h/w grid, so `pos` is far below the cache length and
+    // a step that used it as the window read only the first `pos + 1` rows -- losing the question and never attending to
+    // what it had just generated (the review of engine #1498 caught this; it is why every image answer was bad).
     for (int i = 1; i < decode; i++) {
-        if (!f.step(out.back(), pos + i - 1, logits)) { std::fprintf(stderr, "step: %s\n", f.last_error()); return 1; }
+        const int cache_pos = rows + i - 1;
+        if (!f.step(out.back(), pos + i - 1, logits, cache_pos)) {
+            std::fprintf(stderr, "step: %s\n", f.last_error());
+            return 1;
+        }
         top_k(i == 1 ? "step1" : "step");
         out.push_back(argmax(logits));
     }

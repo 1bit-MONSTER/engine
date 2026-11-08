@@ -23,15 +23,20 @@
 # then uninstalls everything and checks nothing is left behind. Prints one PASS/FAIL row per check and
 # exits non-zero if any row fails.
 #
-#   deb   docker run --rm -v <pkgs>:/pkg:ro ubuntu:26.04 bash -c \
+#   deb   docker run --rm --cap-add=sys_resource -v <pkgs>:/pkg:ro ubuntu:26.04 bash -c \
 #           'apt-get update -qq && apt-get install -y -qq dkms udev kmod sbsigntool linux-headers-generic \
 #              && apt-get install -y -qq linux-modules-$(ls /lib/modules | sort -V | tail -1) \
 #              && bash /pkg/pkg-proof.sh deb /pkg'
-#   rpm   docker run --rm -v <pkgs>:/pkg:ro fedora:latest bash -c \
+#   rpm   docker run --rm --cap-add=sys_resource -v <pkgs>:/pkg:ro fedora:latest bash -c \
 #           'dnf -y install dkms kernel-devel kernel-core kmod binutils xz; bash /pkg/pkg-proof.sh rpm /pkg'
-#   arch  docker run --rm -v <pkgs>:/pkg:ro archlinux:latest bash -c \
+#   arch  docker run --rm --cap-add=sys_resource -v <pkgs>:/pkg:ro archlinux:latest bash -c \
 #           'pacman -Sy --noconfirm && pacman -S --noconfirm dkms linux linux-headers kmod binutils zstd; \
 #            bash /pkg/pkg-proof.sh arch /pkg'
+#
+# `--cap-add=sys_resource` is for the two memlock rows: a container's default capability set excludes
+# CAP_SYS_RESOURCE, so raising the hard memlock limit to `unlimited` fails there and the login session
+# keeps the container's inherited 8192 KB. A real machine's root has the capability; the flag makes the
+# container behave like one.
 #
 # `linux-modules-<ver>` / `kernel-core` / `linux` are the container's way of having the kernel's own
 # module tree, which a real machine always has. Without it there is no in-tree amdxdna for the DKMS
@@ -96,6 +101,34 @@ check "public MOK certificate (kernel key)" \
     test -s /usr/share/1bit/mok/MOK-Kernel.der
 check "config files are 0644" "not group-writable" \
     bash -c '! find /etc/security/limits.d/99-amdnpu-memlock.conf /etc/udev/rules.d/90-1bit-npu-power.rules -perm /022 | grep -q .'
+
+# Is the memlock file actually READ by the login path, or only present? The NPU runtime locks command
+# buffers and fails without it, so a right-looking file at a path pam_limits does not read would be a
+# confusing user-facing failure. Proof: write a distinctive finite limit into the installed file, log in
+# as a fresh user, and see that value come back; then restore the shipped content and read it again.
+if id kpkgprobe >/dev/null 2>&1 || useradd -m -s /bin/bash kpkgprobe >/dev/null 2>&1; then
+    lim=/etc/security/limits.d/99-amdnpu-memlock.conf
+    keep=$(mktemp); cp "$lim" "$keep"
+    # 4096, not 8192: LOWERING a limit is always permitted, so the value can only come from the file.
+    # (The first version of this row wrote 8192, which happened to equal the container's inherited
+    # memlock and so passed without proving anything.)
+    printf '*    soft    memlock    4096\n*    hard    memlock    4096\n' > "$lim"
+    probe=$(su - kpkgprobe -c 'ulimit -l' 2>/dev/null | tr -d ' ')
+    if [ "$probe" = 4096 ]; then
+        row PASS "the memlock file is what pam_limits reads" "a probe login came back with 4096 KB"
+    else
+        row FAIL "the memlock file is what pam_limits reads" "probe login reports '${probe:-nothing}'"
+    fi
+    cp "$keep" "$lim"; rm -f "$keep"
+    shipped=$(su - kpkgprobe -c 'ulimit -l' 2>/dev/null | tr -d ' ')
+    case $shipped in
+        unlimited) row PASS "the shipped limit reaches a login session" "ulimit -l: unlimited" ;;
+        *) row FAIL "the shipped limit reaches a login session" \
+               "ulimit -l: '${shipped:-nothing}' — raising a hard limit needs CAP_SYS_RESOURCE: run the container with --cap-add=sys_resource (a real machine's root has it)" ;;
+    esac
+else
+    row FAIL "the memlock file is what pam_limits reads" "could not create a probe user"
+fi
 
 # ---- the DKMS modules -----------------------------------------------------------------------
 dkmsstate=$(dkms status 2>/dev/null || :)

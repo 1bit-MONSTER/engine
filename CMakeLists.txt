@@ -682,6 +682,15 @@ if(Python3_Interpreter_FOUND)
     # only real pair verified on the first candidate, so the line never ran) and the residual tolerance it
     # accepts and refuses at. Fixtures are ~200 KB each and built from the rule, so they can be wrong on purpose.
     add_test(NAME fconst19_measure COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/fconst19_measure_test.py)
+    # A member declared in npu/forward/include/q4nx_forward.h and never defined keeps `main` green while a full
+    # `cmake --build` fails at link time (engine#1573: the 3-argument step_batch_embeds).  CI cannot catch it --
+    # .github/workflows/ci.yml builds `--target onebit` only, because a full build wants the private NPU runtime --
+    # and `-fsyntax-only` cannot see a link-time fact.  This pairs the two lists by (name, arity): device-free, no
+    # runtime, no build, milliseconds.
+    add_test(NAME npu_decl_check
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/npu_decl_check.py --check --root ${CMAKE_SOURCE_DIR})
+    add_test(NAME npu_decl_check_self
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/npu_decl_check.py --self-test)
     # the new-model watcher's alert contract (offline: synthetic batches against the
     # committed registry, plus FastFlowLM's org listing and releases from the recorded
     # payloads under tests/fixtures/fflm/ — engine #588), so a regression cannot leave the

@@ -30,8 +30,16 @@ here=$(cd "$(dirname "$0")" && pwd)
 . "$here/../scripts/pack-elf.sh"
 # shellcheck source=scripts/pack-check.sh
 . "$here/../scripts/pack-check.sh"
-cc=${CC:-cc}
-command -v "$cc" >/dev/null || { echo "pack_check_test: no C compiler ($cc) to build the tree with"; exit 2; }
+# the CI build job compiles with gcc-16 and has no bare `cc`, so the compiler is probed rather than assumed;
+# a tree with none at all cannot build this repository either, so that is a failure and not a skip
+cc=${CC:-}
+if [ -z "$cc" ]; then
+    for cand in cc gcc gcc-16 gcc-15 clang; do
+        command -v "$cand" >/dev/null 2>&1 && { cc=$cand; break; }
+    done
+fi
+[ -n "$cc" ] || { echo "pack_check_test: no C compiler found (tried \$CC, cc, gcc, gcc-16, gcc-15, clang)"; exit 2; }
+echo "pack_check_test: building the synthetic trees with $cc"
 
 w=$(mktemp -d); trap 'rm -rf "$w"' EXIT
 fail=0

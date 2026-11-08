@@ -1,0 +1,40 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Paths in the BASE Puppy layer that must stay group/other-writable (engine#1474). One prefix per line, relative to the
+# root of the layered tree; `#` and blank lines are ignored. Everything not listed here has `go-w` applied by
+# `pack_normalise_base_modes` -- the group and other WRITE bits only, never any other bit: setting "other files 0644" the
+# way the payload's normaliser does would make /etc/shadow world-readable, and this is an operating system's base layer.
+# A prefix covers the path itself as well as everything below it, which is why `tmp/` keeps /tmp's 1777.
+#
+# The list is short on purpose and every entry is a place where the running system WRITES at boot or at runtime. A
+# missing entry breaks the appliance in ways a boot finds late, which is why the release row prints this file: a change
+# here is visible instead of silent.
+tmp/
+var/tmp/
+var/run/
+var/lock/
+var/spool/
+var/log/
+run/
+dev/
+proc/
+sys/
+# The payload is NOT this list's business: it has its own normaliser (pack_normalise_modes) and its own release row,
+# and since c33 it ships 0 group/other-writable files (engine#1352). Keeping it here means the base row can be read as
+# "the base layer outside the payload", which is the number engine#1474 is about.
+opt/1bit-package/

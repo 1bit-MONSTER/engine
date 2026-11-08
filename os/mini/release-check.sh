@@ -673,6 +673,27 @@ payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
     fi
 }
 
+# The BASE layer's modes (engine#1474). The payload row above closes the same class for opt/1bit-package; this one is one
+# layer down, where woof-CE's build left 2,176 group/other-writable paths (1,814 of them files) inherited from the
+# builder's umask. The appliance runs as root, so none of them was reachable by anything that should not have it - the
+# defect is the same one: a mode in a release artifact that nobody decided.
+#
+# The keep-list is the point of the row as much as the count: eight classes of path DO need to stay writable (tmp,
+# var/tmp, var/run, var/lock, var/spool, var/log, run, dev, proc, sys), and a cycle that silently changes that list is
+# exactly what a row should make visible. So the row PRINTS it, and the verdict takes its size.
+# Pure, so --self-test drives it: <writable count> <keep-list entries> [<sample>]
+base_modes_verdict() {   # <writable> <keeplist entries> [<sample>]
+    _b=${1:-} _k=${2:-} _bs=${3:-}
+    case "$_b" in ''|*[!0-9]*) printf 'FAIL the base layer'"'"'s modes could not be counted (%s)' "${_b:-empty}"; return 0 ;; esac
+    case "$_k" in ''|*[!0-9]*) printf 'FAIL the base keep-list could not be read (%s)' "${_k:-empty}"; return 0 ;; esac
+    if [ "$_b" = 0 ]; then
+        printf 'PASS no path in the BASE layer is group- or other-writable outside the %s keep-list entr(y/ies) - the packer normalises them and this is the proof (engine #1474)' "$_k"
+    else
+        printf 'FAIL %s path(s) in the BASE layer are group- or other-writable outside the keep-list%s - a packing site is not normalising (engine #1474: scripts/base-modes.sh / pack-elf.sh)' \
+            "$_b" "${_bs:+: $_bs}"
+    fi
+}
+
 # The payload's RUNPATH (the orchestrator's rule of 2026-11-08, after an installed engine's RUNPATH into a build tree made a
 # rebuild swap the libraries under two running services: coder-llm on :8090 crash-looped 154 times and 1bit-canonical on :8095
 # 755 times). An installed package must carry `$ORIGIN` ONLY: it finds its own libraries beside itself, and a path into a build
@@ -769,6 +790,16 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_modes_verdict '' 0)"
     check FAIL "$(payload_modes_verdict 0 '')"
     check FAIL "$(payload_modes_verdict x 0)"
+    # engine #1474: the base layer's row - clean only when the count is 0 AND a keep-list was read
+    check PASS "$(base_modes_verdict 0 11)"   # 11: the entry count in os/v3/puppy/base-modes-keep today
+    check FAIL "$(base_modes_verdict 2166 10 'drwxrwxr-x usr/share')"   # c33's base layer, the shape this closes
+    check FAIL "$(base_modes_verdict 1 10 'drwxrwxr-x usr')"
+    check FAIL "$(base_modes_verdict '' 10)"                            # unreadable count
+    check FAIL "$(base_modes_verdict 0 '')"                             # no keep-list to judge against
+    check FAIL "$(base_modes_verdict 0 x)"                              # a non-numeric keep count
+    # a ZERO keep count is not a verdict failure: the row SKIPs when the keep-list file is absent, and a present-but-empty
+    # one is a repository error rather than a machine state, so it is covered at the call site (documented here so the
+    # split is not mistaken for a gap)
     # c32: the HRX weight placement. The measured arms from #1339 are the first two; the failure shapes are a default
     # that already imported (2), an unreadable arm, and a zero.
     check PASS "$(hrx_placement_verdict 5692 3010)"        # 4B perplexity, #1339
@@ -1871,6 +1902,48 @@ else
     case "$PM" in
         PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
         *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+    esac
+fi
+
+# ── the BASE layer's modes (engine#1474) ────────────────────────────────────────────────────────────────────────
+# The scan is the root filesystem only, and the keep-list is the ONE source of truth for what may stay writable: the prune
+# list is BUILT from it rather than copied beside it (the first version hardcoded the same eleven entries by hand, so the
+# next cycle to edit the keep-list - the file whose whole purpose is to be edited - would have had no prune for its new
+# entry, and the row would have failed on a path the keep-list explicitly allows). The four paths pruned for a DIFFERENT
+# reason are named separately, because "not part of the OS image" is not "allowed to be writable".
+#
+# The scan root is overridable for the same reason PAYLOAD_DIR is above: a row that can only be judged by booting an image
+# cannot be tested. `BASE_SCAN_ROOT=<tree>` points it at any tree of the same shape.
+BKEEP=${BASE_KEEP:-/etc/1bit/base-modes-keep}
+if [ ! -f "$BKEEP" ]; then
+    skip base-modes "no $BKEEP on this system: this image predates the base-layer row (engine #1474), so there is no keep-list to judge against"
+else
+    _bm_keep=$(awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if ($0 != "") print }' "$BKEEP")
+    _bm_n=$(printf '%s\n' "$_bm_keep" | grep -c . || true)
+    BROOT=${BASE_SCAN_ROOT:-/}
+    BROOT=${BROOT%/}
+    # the rows that are not the OS image at all (a mounted data partition, the initramfs, removable media)
+    _bm_excl='data initrd mnt media'
+    _bm_prune=
+    for _p in $_bm_excl; do
+        _bm_prune="$_bm_prune -path $BROOT/$_p -prune -o"
+    done
+    # and everything the keep-list names, from the keep-list itself
+    for _p in $_bm_keep; do
+        _bm_prune="$_bm_prune -path $BROOT/${_p%/} -prune -o"
+    done
+    # COUNT the whole set, then sample from it: `find … | head -40` before the count capped the number at 40, so the one
+    # sentence a reader uses to judge severity said "40 path(s)" for a base layer with 2,176 of them (review on #1544)
+    _bm_list=${TMPDIR:-/tmp}/.1bit-base-modes.$$
+    # shellcheck disable=SC2086  # the prune expression is built as separate words on purpose
+    find "${BROOT:-/}" $_bm_prune \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) -print 2> /dev/null > "$_bm_list" || true
+    _bm_n_paths=$(wc -l < "$_bm_list" | tr -d ' ')
+    _bm_s=$(head -3 "$_bm_list" | while IFS= read -r _p; do [ -n "$_p" ] && printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "$_p"; done)
+    rm -f "$_bm_list"
+    BM=$(base_modes_verdict "$_bm_n_paths" "$_bm_n" "$_bm_s")
+    case "$BM" in
+        PASS*) pass base-modes "${BM#PASS } (keep-list: $(printf '%s' "$_bm_keep" | tr '\n' ' '))" ;;
+        *)     fail base-modes "${BM#FAIL }" ;;
     esac
 fi
 

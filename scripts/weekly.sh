@@ -553,8 +553,27 @@ stage_package() {
     # the same in all four (scripts/pack-distro.sh). LIBHSA is the release's gfx1151 runtime out of the
     # pinned toolchain: the packer refuses a runtime that would register no device, and the engine
     # bundle carries none (HRX dlopens it).
-    LIBHSA=$(ls -d "$HRX_TOOLCHAIN"/lib/python3*/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 2>/dev/null | head -1) \
-        "$SRC/scripts/mk-plugin-package.sh" "$W/lemonade/1bit" "$OUT" "$tag" > "$LOGS/distro-packages.log" 2>&1 ||
+    # The four packages need the release's gfx1151 HSA runtime and the engine bundle does not carry one (HRX
+    # dlopens it). preflight fetches the pinned toolchain for the bumps and build stages only, so a cut that
+    # runs package (and release) against an existing build - which is what re-packaging a candidate is - gets
+    # here with HRX_TOOLCHAIN empty, the glob below matches nothing, and the packer aborts with "no
+    # libhsa-runtime64.so.1 ... set LIBHSA=": the c32 cut of 2026-11-07 did exactly that, and the four
+    # packages the docs promise were missing from the candidate. Resolve it here instead: fetch-rocm-sdk.sh
+    # reuses the tree when its .pin matches (so it costs nothing in a workdir that built) and fetches the
+    # pinned runtime in one that did not. LIBHSA from the environment still wins, for another runtime.
+    if [ -z "${HRX_TOOLCHAIN:-}" ]; then
+        HRX_TOOLCHAIN=$("$SRC/scripts/fetch-rocm-sdk.sh" "$SRC/config/hrx-toolchain.config" "$W/hrx-toolchain" 2>> "$LOGS/hrx-toolchain.log") ||
+            { say "no pinned HRX toolchain for the packages' HSA runtime: see $LOGS/hrx-toolchain.log (or set LIBHSA)"; return 1; }
+    fi
+    if [ -z "${LIBHSA:-}" ]; then
+        # `|| true`: a failing glob in a standalone assignment is fatal under this script's `set -e`, and
+        # would abort the stage with rc 2 and no message at all instead of reaching the line below (checked:
+        # that is what this line did before the `|| true` was added)
+        LIBHSA=$(ls -d "$HRX_TOOLCHAIN"/lib/python3*/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 2>/dev/null | head -1 || true)
+        [ -n "$LIBHSA" ] ||
+            { say "no libhsa-runtime64.so.1 under $HRX_TOOLCHAIN: set LIBHSA to the release's gfx1151 runtime"; return 1; }
+    fi
+    LIBHSA=$LIBHSA "$SRC/scripts/mk-plugin-package.sh" "$W/lemonade/1bit" "$OUT" "$tag" > "$LOGS/distro-packages.log" 2>&1 ||
         { cat "$LOGS/distro-packages.log"; return 1; }
     say "package $tag: proof, one clean container per family"
     # Nothing is published that nobody installed: every family is installed in a throwaway container of

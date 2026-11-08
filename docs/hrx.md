@@ -121,8 +121,12 @@ fails a pin that leaves a gate model's node off HRX.
   `loom/binding/c/include`, and moves llama.cpp only. The hand move of 2026-10-18 (#441) was validated
   the same way at the pinned pair: `onebit`, `llama_hrx`, `test-backend-ops`, `llama-server`,
   `llama-bench`, `llama-perplexity`, `libamdhip64` and `libhip_intercept` all build and
-  `generate_stubs.py --check` passes against the built `libamdhip64.so`. `hrx-backend-test` still
-  fails to build on either pin (#422), so that check is not covered yet.
+  `generate_stubs.py --check` passes against the built `libamdhip64.so`. `hrx-backend-test` builds at
+  the pinned pair again since f2099e9b deleted the stale `dispatch-symmetric-i4.h` include that broke it
+  (#422, closed 2026-10-18), but **nothing runs it yet**: it carries no ctest label (the fork's
+  `build-*.yml` workflows run `ctest -L main`) and `hw-gate.sh`'s target list is `llama-server test-backend-ops
+  llama-perplexity`, so its cases only execute when someone builds and runs the binary by hand. Until one
+  of those two lists carries it, a case added there is correct and dark.
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.
@@ -650,17 +654,19 @@ length peak at 8.7 GiB instead of growing; greedy answers are identical, and lla
 is unchanged. A repeated prompt length right after a flush costs 1.75 s instead of 1.12 s, since its
 program is rebuilt.
 
-### Server memory: the weight-mapping import is opt-in ([engine#856](https://github.com/1bit-MONSTER/engine/issues/856), [engine#1339](https://github.com/1bit-MONSTER/engine/issues/1339))
+### Server memory: HRX reads the weights instead of mapping them ([engine#856](https://github.com/1bit-MONSTER/engine/issues/856), [engine#1339](https://github.com/1bit-MONSTER/engine/issues/1339))
 
-At `-ngl 99` the loader copies every offloaded weight into one device buffer, and HRX then serves each dense
-matmul from its own repacked copy, so the weights were resident twice in GTT. Since
-[llama.cpp #226](https://github.com/1bit-MONSTER/llama.cpp/pull/226) HRX can import the loader's file mapping
-instead of taking that copy (Qwen3-4B-Q4_K_M: 3925 -> 1243 MiB of the process's GTT, wikitext perplexity
-16.3000 in both arms). On larger files the import never finishes: a dense Qwen3.8-27B (16.4 GiB) pages the
-whole file in, then waits with no error and no progress. Qwen3.8-Flash-Next (76.3 GiB) does the same.
-Since [llama.cpp #231](https://github.com/1bit-MONSTER/llama.cpp/pull/231) the import is **off by default**.
-`GGML_HRX_WEIGHT_HOST_PLACEMENT=1` turns it on for models that load with it (zaya1-8b and smaller,
-measured); unset or `0` keeps the device copy and a read-only mapping. The 27B loads in 24 s with it off.
+With a model on HRX (`-ngl` > 0), the loader reads the weights into their device buffers with `read()` and drops each weight's
+page-cache pages as soon as it is read ([llama.cpp #234](https://github.com/1bit-MONSTER/llama.cpp/pull/234)). A mapped load
+left the whole file in the page cache next to the device copy. On Qwen3.8-27B UD-Q4_K_XL (16.4 GiB), from a cold cache:
+peak RSS 2.9 GiB instead of 16.4 GiB, nothing of the file left cached instead of up to 16.5 GiB, and a load of 18.6 s instead
+of 14.3 s. Output and wikitext perplexity are unchanged. `--mlock` with mmap keeps the mapping.
+
+The earlier weight-mapping import ([llama.cpp #226](https://github.com/1bit-MONSTER/llama.cpp/pull/226), opt-in since
+[#231](https://github.com/1bit-MONSTER/llama.cpp/pull/231)) is gone, and `GGML_HRX_WEIGHT_HOST_PLACEMENT` does nothing.
+It registered the file mapping as a KFD userptr, which the kernel always write-faults, so it dirtied the file, changed
+its mtime, and never finished on large models while writeback kept invalidating it (engine#1339). HRX's repacked copy of the
+dense weights still sits next to the device buffer in GTT.
 
 ### Known issues on `HRX0`
 
@@ -958,10 +964,9 @@ in [hrx.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/
   P = 0 x V depend on that V's sign, so identical requests gave different logits (up to 0.13 on Qwen3-0.6B,
   13.5 on GLM-4.7-Flash). Masked rows now reach P x V as exactly +0; Qwen3-0.6B and Qwen3.8-27B repeat
   bit-identically. Cost: pp512 -4.7% on Qwen3-0.6B, the rest within noise.
-- **Weight-mapping import, opt-in** ([llama.cpp #226](https://github.com/1bit-MONSTER/llama.cpp/pull/226),
-  [#231](https://github.com/1bit-MONSTER/llama.cpp/pull/231)): `GGML_HRX_WEIGHT_HOST_PLACEMENT=1` imports the loader's
-  mapping instead of a second device copy; off by default because it hangs large loads
-  ([section above](#server-memory-the-weight-mapping-import-is-opt-in-engine856-engine1339)).
+- **Weights read, page cache dropped** ([llama.cpp #234](https://github.com/1bit-MONSTER/llama.cpp/pull/234)): with a model
+  on HRX the loader reads the weights instead of mapping the file and drops their page cache; replaces the weight-mapping
+  import of #226/#231 ([section above](#server-memory-hrx-reads-the-weights-instead-of-mapping-them-engine856-engine1339)).
 - **A cap on the graph program cache** ([llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63)):
   `GGML_HRX_GRAPH_PROGRAM_CACHE`, default 64 ([section above](#server-memory-the-graph-program-cache-cap-llamacpp-63)).
 - **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):

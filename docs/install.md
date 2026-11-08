@@ -231,8 +231,10 @@ for an existing Linux:
 
 Both are **advanced, and not the supported path for this release**: they put the engine on a system whose
 kernel, `amdxdna` driver and HSA runtime we did not choose, so the device rows of
-[1bit-release-check](../os/README.md) are yours to run. There is **no PPA route in this release** — it is
-parked.
+[1bit-release-check](../os/README.md) are yours to run. There is **no PPA carrying the engine or
+`lemonade-onebit`** — both come from the releases page. Lemonade's own PPA still carries `lemond`
+on Ubuntu 26.04, and the engine plugs into it through the `llamacpp-hrx` recipe
+([install-any-distro.md](install-any-distro.md), [lemonade.md](lemonade.md#ubuntu-2604-the-ppas-lemond)).
 
 ## 6. Secure Boot and our MOK
 

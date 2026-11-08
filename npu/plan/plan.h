@@ -394,19 +394,33 @@ struct Plan {
                 const std::string where = "designs[" + std::to_string(i) + "]";
                 if (!d.is_object()) throw PlanError("plan: " + path + " " + where + " is not an object");
                 Design des;
-                des.role = d.value("role", "");
+                // Every field is read through typed()/int_field() so a wrongly typed value ("M": "128")
+                // is a refusal that names plans[i].M, like every other field in this loader, instead of
+                // nlohmann's type_error escaping to the caller with no position in it (engine#1330 review).
+                des.role = typed<std::string>(d, "role", where, path);
                 if (des.role.empty()) throw PlanError("plan: " + path + " " + where + ".role is empty");
                 // Named with the index, not just the field: a plan can carry a dozen of these and
                 // "M must be positive" without a position is a hunt.
-                des.M = d.value("M", 0);
+                des.M = int_field(d, "M", where, path);
                 if (des.M <= 0) throw PlanError("plan: " + path + " " + where + ".M must be positive");
-                des.K = d.value("K", 0);
+                des.K = int_field(d, "K", where, path);
                 if (des.K <= 0) throw PlanError("plan: " + path + " " + where + ".K must be positive");
-                des.N = d.value("N", 0);
+                des.N = int_field(d, "N", where, path);
                 if (des.N <= 0) throw PlanError("plan: " + path + " " + where + ".N must be positive");
-                des.elf = d.value("elf", "");
+                des.elf = typed<std::string>(d, "elf", where, path);
                 if (des.elf.empty())
                     throw PlanError("plan: " + path + " " + where + ".elf is empty (the artifact the role runs)");
+                // An exact duplicate is a plan mistake, and saying which entry it repeats reads better than
+                // the geometry comparison's "elf a.elf, the container derives a.elf" (engine#1330 review).
+                for (size_t k = 0; k < p.designs.size(); k++) {
+                    const Design& prev = p.designs[k];
+                    if (prev.role == des.role && prev.M == des.M && prev.K == des.K && prev.N == des.N &&
+                        prev.elf == des.elf)
+                        throw PlanError("plan: " + path + " " + where + " repeats designs[" +
+                                        std::to_string(k) + "] (" + des.role + " " + std::to_string(des.M) +
+                                        "x" + std::to_string(des.K) + "x" + std::to_string(des.N) + " " +
+                                        des.elf + ")");
+                }
                 p.designs.push_back(des);
             }
         }
@@ -414,6 +428,29 @@ struct Plan {
     }
 
 private:
+    // A typed read that names the field: nlohmann's own type_error says nothing about which entry of
+    // which plan was wrong, and a plan can carry a dozen designs.
+    template <typename T>
+    static T typed(const nlohmann::json& j, const char* key, const std::string& where,
+                   const std::string& path) {
+        if (!j.contains(key)) return T{};
+        if (!j.at(key).is_string() && !j.at(key).is_number_integer() && !j.at(key).is_number_float() &&
+            !j.at(key).is_boolean())
+            throw PlanError("plan: " + path + " " + where + "." + key + " has the wrong type");
+        try {
+            return j.at(key).get<T>();
+        } catch (const std::exception&) {
+            throw PlanError("plan: " + path + " " + where + "." + key + " has the wrong type");
+        }
+    }
+    static int int_field(const nlohmann::json& j, const char* key, const std::string& where,
+                         const std::string& path) {
+        if (!j.contains(key)) return 0;
+        if (!j.at(key).is_number_integer())
+            throw PlanError("plan: " + path + " " + where + "." + key + " must be an integer");
+        return j.at(key).get<int>();
+    }
+
     static const nlohmann::json& obj(const nlohmann::json& j, const char* key, const std::string& path) {
         if (!j.contains(key) || !j.at(key).is_object())
             throw PlanError("plan: " + path + " has no \"" + key + "\" object");

@@ -139,7 +139,15 @@ def main():
     mode.add_argument("--fix", action="store_true")
     args = ap.parse_args()
 
-    files = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True).stdout.split("\n")
+    # Tracked AND untracked-but-not-ignored files. `git ls-files` alone cannot see a file that has
+    # not been staged yet -- which is exactly the state a new file is in when a lane runs this check
+    # before `git add`, so the check would report green on the file most likely to be missing its
+    # notice (this happened: onnx/tests/ort_run_generic.sh passed --check and failed CI on the same
+    # head). Ignored files stay out: a build artifact is not source.
+    def listing(*args):
+        return subprocess.run(["git", "ls-files", *args], capture_output=True, text=True,
+                              check=True).stdout.split("\n")
+    files = sorted(set(filter(None, listing())) | set(filter(None, listing("--others", "--exclude-standard"))))
     missing, unknown = [], []
     for path in filter(None, files):
         if exempt(path):

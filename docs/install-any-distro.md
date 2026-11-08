@@ -199,7 +199,7 @@ that stays on its distribution's kernel only needs the second and third:
 | package | what it is | needed for |
 |---|---|---|
 | `linux-image-<rel>` / `linux-headers-<rel>` (deb), `1bit-kernel` + `1bit-kernel-devel` (rpm), `linux-1bit` + `linux-1bit-headers` (Arch) | the kernel 1bit OS boots: Linux 7.4-rc1 with this fleet's config, signed with the 1bit MOK | only if you want OUR kernel; the drivers build against yours as well |
-| `amdxdna-1bit-dkms` | `amd/xdna-driver` at `526c6081` plus the engine's patch series (`third_party/patches/amdxdna/0001-0005`), as DKMS source | the NPU. Any 6.10+ kernel, signed with **your** MOK |
+| `amdxdna-1bit-dkms` | `amd/xdna-driver` at `526c6081` plus the engine's patch series (`third_party/patches/amdxdna/0001-0005`), as DKMS source | the NPU. **6.10+ kernels only** (measured, not inherited — see below), signed with **your** MOK |
 | `ec-su-axb35-dkms` | the AXB35-02 board's embedded-controller driver (fans, EC temperature, power mode), GPL-2.0, upstream `cmetz/ec-su_axb35-linux` at `f62c2c22`, plus a DMI gate so it attaches only on an AXB35 | the fans on a Bosgame AXB35; inert on any other board |
 | `1bit-npu-config` | `limits.d/99-amdnpu-memlock.conf` (unlimited memlock), `udev/rules.d/90-1bit-npu-power.rules` (NPU keep-awake), `modules-load.d/ec_su_axb35.conf`, and the public MOK certificate at `/usr/share/1bit/mok/MOK-Kernel.der` | the NPU runtime's locked command buffers, and engine#1051's suspend/resume hang |
 
@@ -227,6 +227,22 @@ sudo mkinitcpio -P                                                  # if you ins
 Every one of them needs the kernel's own module tree next to the headers (`linux-modules-<ver>` on
 Ubuntu, `kernel-core` on Fedora, `linux` on Arch) — dkms looks for
 `/lib/modules/<ver>/build`, which those packages provide and a headers-only container does not.
+
+**Why 6.10, measured.** The package declares `BUILD_EXCLUSIVE_KERNEL_MIN=6.10` (AMD's own floor, which
+the engine inherits rather than invents), and that is not caution: the driver's trace-event header calls
+the one-argument form of `__assign_str()`, which the kernel gained in 6.10 — before that the macro takes
+two arguments. On **Ubuntu 24.04 GA (6.8.0-149-generic)**:
+
+    $ dkms build -m amdxdna-1bit -v 0.18.0 -k 6.8.0-149-generic
+    Error! … includes a BUILD_EXCLUSIVE directive which does not match this kernel/arch/config.
+    This indicates that it should not be built.                                    (rc=77)
+
+and with the floor bypassed the compiler stops at
+`include/trace/events/amdxdna.h:32: error: macro "__assign_str" requires 2 arguments, but only 1 given`.
+So on 24.04 the package refuses cleanly instead of leaving you a failed build to debug. The options
+there are the distro kernel's own in-tree `amdxdna` (the warning above explains why ours exists) or a
+6.10+ kernel. `ec-su-axb35-dkms` has no such floor in practice: it builds and installs on the same 6.8
+headers (measured, `ec_su_axb35.ko` 380 440 B), consistent with its declared 6.1.
 
 **Secure Boot.** Our kernel and its modules are signed with the `1bit-MONSTER` kernel key, which no
 machine has enrolled. Enrol the public half once, from the config package:
@@ -257,6 +273,23 @@ Uninstall puts the in-tree driver back:
 ```bash
 sudo apt-get remove amdxdna-1bit-dkms ec-su-axb35-dkms 1bit-npu-config   # or dnf remove / pacman -R
 ```
+
+**One release, three families, one version.** `scripts/mk-kernel-packages.sh <out> <version>` takes the
+release tag as the *release* field of the three 1bit packages (the kernel keeps the version it was built
+with), and that tag carries into all three families — measured, because "the weekly calls it with a date"
+is exactly the case a package can silently refuse to upgrade:
+
+| family | package a weekly tag produces | the family's tool says | upgrade over the previous release |
+|---|---|---|---|
+| deb | `amdxdna-1bit-dkms_0.18.0-2026.45.0_all.deb` | `dpkg --compare-versions 0.18.0-1 lt 0.18.0-2026.45.0` true | `dpkg -i` rc=0, version after `0.18.0-2026.45.0`, one `/usr/src/amdxdna-1bit-0.18.0` left (no stale duplicate) |
+| rpm | `amdxdna-1bit-dkms-0.18.0-2026.45.0.x86_64.rpm` | `rpmdev-vercmp` → `0.18.0-1 < 0.18.0-2026.45.0` | `dnf install` rc=0, version after `0.18.0-2026.45.0` |
+| arch | `amdxdna-1bit-dkms-0.18.0-2026.45.0-x86_64.pkg.tar.zst` | `vercmp 0.18.0-1 0.18.0-2026.45.0` → `-1` | `pacman -U` rc=0, version after `0.18.0-2026.45.0` |
+
+One convention difference worth knowing rather than discovering: this set puts the tag in the **release**
+field, so the Arch package's `pkgrel` becomes `2026.45.0` instead of an integer. pacman accepts it and
+orders it correctly (above), but it is not Arch's usual shape; the engine packages (`scripts/pack-version.sh`)
+map the tag into the *version* instead (`2026.45c32`). Both work; neither is wrong; do not mix them in one
+comparison.
 
 **Source.** Each driver package ships the source it builds (`/usr/src/amdxdna-1bit-0.18.0/`,
 `/usr/src/ec-su-axb35-0.1/`) with its LICENSE; the amdxdna patch series is
@@ -350,6 +383,8 @@ registry model, since this Lemonade version has no local-file registration):
 | the tarball cannot hand a system directory to uid 1000 | clean `ubuntu:26.04`, the documented `sudo tar -C / --no-same-owner --no-overwrite-dir -xf …` | `/`, `/usr`, `/usr/bin`, `/opt` read `0:0 755` before and after; the payload lands `0:0`, `0` of 75 files not owned by root, and the shim runs (`version: 1 (32559003)`). Before the fix the same extraction as root left uid 1000 owning `/`, `/usr`, `/usr/bin` and `/opt` — a local root escalation on every "any other distribution" install (#1292 review) |
 | the glibc floor is enforced, not just documented | clean `ubuntu:24.04` container (glibc 2.39), `apt-get install ./1bit-engine_<version>_amd64.deb` | refused: `1bit-engine : Depends: libc6 (>= 2.43) but 2.39-0ubuntu8.9 is to be installed`. Before the floor was declared, the same deb installed, `ldd` was happy and the binary then failed to load |
 | **the package's payload serves on the GPU** | strixhalo, the Fedora `.rpm` unpacked with `rpm2cpio` (so exactly the files the package installs), `1bit serve -m Qwen3-0.6B-Q4_K_M.gguf --device hrx --no-strict-device`, two chats | `1bit serve: HRX: HSA runtime …/_rocm_sdk_core/lib/libhsa-runtime64.so.1 sha256 21a66824…` — the runtime the package ships, not the box's — then `Qwen3-0.6B-Q4_K_M on hrx`, health `200`, and `request /v1/chat/completions -> hrx status 200 in 202.5 ms | prompt 16 completion 16 79.0 tok/s`; a second chat with `max_tokens: 200` came back `content: "5"` (109 completion tokens, 69.1 tok/s). The first one's content was empty because Qwen3 spends the opening tokens on its thinking trace, so a 16-token budget never reaches the answer. Both this model and `Qwen3-4B-Q4_K_M` are refused first by strict placement (`"embd" is GET_ROWS f32 … 1 of 986 nodes off HRX`), which is why the runs pass `--no-strict-device` |
+| **the release proves its own packages** | `scripts/pack-proof.sh <out-dir> <version>`, wired into `scripts/weekly.sh`'s package stage, 2026-11-07, on the `rc-2026-11-06-c31` artifacts | 6/6 rows PASS: the `.deb` installed in `ubuntu:26.04`, the `.rpm` in both `fedora:latest` and `opensuse/tumbleweed`, the pacman package in `archlinux:latest` (each asked `1bit-engine --version` = `1bit 0.0.1`, made to run the shim = `version: 1 (32559003)`, then removed with nothing left), the tarball unpacked as root the way this page says, and the four compared as root (paths, modes, owner `0:0`, sizes, sha256). Handed the pre-fix tarball — uid 1000, a `./` member, the filesystem directories — the same harness fails **4/6**, naming the 151 members that are not root's and the payload difference, so the row is a check and not a claim |
+| **a candidate package installs over the previous release** | `scripts/pack-version.sh` + `tests/pack_version_test.sh` (ctest `pack_version`), measured with each family's own comparator, 2026-11-07 | a candidate tag has to map to a version that sorts *above* the previous release and *below* the release it precedes, or installing it is a downgrade that apt and rpm refuse. `rc-2026-11-07-c32` packs as `2026.45~c32` (deb, rpm, tarball) and `2026.45c32` (pacman): `2026.44 < 2026.45~c32 < 2026.45` with `dpkg --compare-versions` and with rpm's `labelCompare` in `fedora:latest`, and `2026.44 < 2026.45c32 < 2026.45` with pacman's `vercmp` in `archlinux:latest`. The mapping this replaced read the tag as `2026.11.07.c32`, which is *below* every release since week 11 (`dpkg: 2026.11.07.c32 < 2026.44`) — the bug the #1368 review found, kept as a row in the test |
 | a stock Lemonade takes a backend binary from `hrx_bin` / `LEMONADE_HRX_HRX_BIN` | extracted PPA deb `2026.44.1~26.04` on the dev box, isolated cache/config | `llamacpp-hrx` backend `installable` → `installed`, both forms, with no fork and no patch |
 | the same recipe, both packages side by side | clean `ubuntu:26.04` container: PPA `lemonade-server` + this `.deb` | `lemond 2026.44.1` starts, `1bit-engine --version` and the shim run; the recipe's backend state is hardware-gated there (`unsupported: Unsupported GPU`), so the end-to-end chat is the hardware row below |
 | the shim is the engine's own wrapper | `1bit/lemonade-hrx` from this repo's package (`scripts/package-linux.sh`) | it runs `1bit serve --print-backend-env` and then `exec`s the engine with serve's environment and defaults; `lemonade-bin/llama-server` is a symlink to it |
@@ -360,4 +395,6 @@ registry model, since this Lemonade version has no local-file registration):
 | the same on Arch | clean `archlinux:latest` container, `scripts/pkg-proof.sh arch` | all 22 rows PASS: the pacman dkms hook builds both modules at install time, `linux-1bit` + `linux-1bit-headers` install with the build tree at `/usr/lib/modules/7.4.0-rc1-1bit/build` and `/etc/mkinitcpio.d/1bit.preset` |
 | the dkms source reproduces the driver this box runs | `scripts/mk-kernel-packages.sh` payload built in a container against `7.0.0-43-generic` | `srcversion EE1F36A2B9BA294CE11AD80`, the srcversion of the `amdxdna.ko` installed at `/lib/modules/7.4.0-rc1-1bit/updates/` — the package's source *is* the fleet's series |
 | the kernel the packages ship is the kernel this box runs | `linux-image-7.4.0-rc1-1bit_7.4.0~rc1-1_amd64.deb` payload vs `/boot/vmlinuz-7.4.0-rc1-1bit` | `sha256 6f3c6764…` in both, and `sbverify --cert MOK-Kernel.der` reports `Signature verification OK` |
+| the amdxdna floor is really 6.10 | clean `ubuntu:24.04` container, headers `6.8.0-149-generic`, this page's packages | `dkms build` refuses with the declared exclusive rule (`rc=77`, "should not be built"), and with the floor bypassed the driver does not compile: `amdxdna.h:32: macro "__assign_str" requires 2 arguments, but only 1 given` — the 6.10 trace-event API. `ec-su-axb35-dkms` builds on the same headers (`380 440 B`), so only the NPU driver has the floor |
+| a weekly release tag works in all three families, and upgrades | `scripts/mk-kernel-packages.sh <out> 2026.45.0 --skip-kernel`, each family's own tool, in `fedora:latest` / `ubuntu:26.04` / `archlinux:latest` | deb `0.18.0-1 < 0.18.0-2026.45.0` (dpkg), rpm `0.18.0-1 < 0.18.0-2026.45.0` (rpmdev-vercmp), arch `vercmp` `-1`; each installs over the previous package (`rc=0`) and reports `0.18.0-2026.45.0` afterwards, with one `/usr/src/amdxdna-1bit-0.18.0` left on deb — no stale duplicate source tree |
 | the shipped driver answers a known answer on the NPU | this box, `npu-hold`, `1bit serve --device npu` on Qwen3-0.6B, `/v1/completions` greedy, twice | load 2.2 s, `The capital of France is` → **` Paris. The capital of Italy is Rome. The capital of Spain is Madrid.`** identically on both runs (56.9 and 50.7 tok/s), 0 `amdxdna` lines in the two windows, and the loaded module is `srcversion EE1F36A2B9BA294CE11AD80` — the build this package's source produces. No install, no `modprobe`, no udev reload |

@@ -112,6 +112,17 @@ The adapter path adds two `MUL_MAT`s and an `ADD` per hybrid layer and **all of 
 on both forms at prefill and decode. There is no throughput cost to report: pp512 441.98 → 440.57 and tg64
 22.87 → 22.60 on one binary with both forms (0.997 / 0.988).
 
-One caveat for anyone running `-ngl 99` today: the token-embedding `GET_ROWS` is currently **not** on HRX
-(`1 of 3024` nodes, `GET_ROWS x 1`, 2 graph splits) after the host-pointer weight import landed — that is
-base-level and affects **both** forms equally, tracked as engine **#1316**, not in this family's changes
+One caveat for anyone running `-ngl 99` today: the token-embedding `GET_ROWS` sits on the CPU **by default**, and
+that is #170's policy rather than this family's doing — the input layer stays on the CPU
+(`src/llama-model.cpp`: "very little benefit to offloading the input layer"). `LLAMA_INPUT_LAYER_ON_DEV=1` is the
+opt-in, and it works for a tied embedding since fork **#233** (in the pin): a tied embedding is gathered natively by
+`GET_ROWS` and contracted in a packed layout by the output `MUL_MAT`, which a command program cannot hold twice, so
+the dispatch now declines the packed match for a weight another node gathers — measured as **0 nodes off HRX** with
+the switch on, 3/3 runs, against a refusal in 3/3 with that gate disabled. It stays **off by default** because device
+input measured ~6 % slower than CPU input on a 0.6B while removing one node and one split per graph.
+
+So at default settings a census of `1 of 3024` nodes with `GET_ROWS x 1` and 2 graph splits is the floor for **every**
+model at `-ngl 99`, Zamba2 forms included, and it is not residue these changes added; `LLAMA_INPUT_LAYER_ON_DEV=1`
+is how you leave it. (Engine **#1316** is where both halves were measured, and it is not the #856 host-pointer import:
+while that import existed, `GGML_HRX_WEIGHT_HOST_PLACEMENT=0` reproduced the placement identically — and it has since
+been replaced outright, so at this pin the import is not in the tree at all. [hrx.md](hrx.md) records that removal.)

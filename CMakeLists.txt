@@ -216,6 +216,11 @@ set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
 # own CTS: GPU export -> NPU import -> NPU executes on the imported range), keyed on the module's
 # fingerprint against third_party/patches/amdxdna/README.md. It skips (77) without the array or without a
 # CTS build (ONEBIT_LIBAMDF_CTS_DIR), so public CI neither runs nor fails it.
+# 1bit-update's slot decisions (engine#1334 review): the second update targets the slot holding the machine's own
+# save layer and must keep it, a foreign layer is still refused. The script sourced as a library over fake /data
+# layouts: no root, no mounts, no device, no VM.
+add_test(NAME one_bit_update_slots
+         COMMAND sh ${CMAKE_SOURCE_DIR}/tests/one_bit_update_slots_test.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME npu_import_contract
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_import_contract.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(npu_import_contract PROPERTIES SKIP_RETURN_CODE 77)
@@ -237,6 +242,11 @@ add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-chec
 # dir, so no key, no device and no build: the four refusals are a set with no manifest, a file the
 # manifest does not list, a ciphertext byte flipped after signing, and a manifest signed by another key.
 add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
+# engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
+# it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
+# release, and the ordering a candidate needs: previous release < candidate < its release. The
+# ordering is the row dpkg, rpm and pacman had to agree on; no container, no build, dpkg only.
+add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.
@@ -562,6 +572,19 @@ add_test(NAME laya_encoder COMMAND laya_encoder_test)
 add_executable(laya_models_test tests/laya_models_test.cpp)
 target_link_libraries(laya_models_test PRIVATE onebit_laya)
 add_test(NAME laya_models COMMAND laya_models_test ${CMAKE_SOURCE_DIR}/config/laya-models-game.json)
+# The decision record itself (app/route_log.h): the classified state a decision keeps, so a
+# /v1/route/decisions log can become `--eval` cases and fine-tune data (engine#1313, docs/laya-models.md
+# "Measuring and fine-tuning the router").  Header only: no checkpoint, no device.
+add_executable(route_log_test tests/route_log_test.cpp)
+target_include_directories(route_log_test PRIVATE app)
+target_link_libraries(route_log_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME route_log COMMAND route_log_test)
+# `tools/copyright.py --check` must see a file that has not been staged yet (the check used `git
+# ls-files`, so a brand-new file was invisible to it -- PR #1406's test script passed --check locally
+# and failed CI's copyright step on the same head).  Runs the real tool in a scratch git repo.
+add_test(NAME copyright_check_untracked
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/copyright_check_untracked_test.py)
+add_dependencies(onebit route_log_test)
 # CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
 # keeps the laya_models ctest from reporting "Not Run" without a workflow change.
 add_dependencies(onebit laya_models_test)
@@ -839,6 +862,12 @@ add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_
 target_include_directories(npu_elf_args_test PRIVATE npu/forward/include)
 target_link_libraries(npu_elf_args_test PRIVATE m)
 add_test(NAME npu_elf_args COMMAND npu_elf_args_test)
+# Every op a plan may name must ship a host reference with known answers, and the test walks the table
+# (engine#799): an op without one is named by op_coverage() and asserted here, so the gap is a decision in
+# the test rather than an omission.  Host-only, no model, no device.
+add_executable(npu_plan_op_reference_test tests/npu_plan_op_reference.cpp npu/plan/op_registry.cpp)
+target_include_directories(npu_plan_op_reference_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
+add_test(NAME npu_plan_op_reference COMMAND npu_plan_op_reference_test)
 add_executable(npu_plan_test tests/npu_plan_test.cpp)
 target_include_directories(npu_plan_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
 target_link_libraries(npu_plan_test PRIVATE nlohmann_json::nlohmann_json)
@@ -1021,11 +1050,15 @@ add_test(NAME attn_math COMMAND attn_math_test)
 # workflow is next touched with that scope and add these to the list itself. `host_gemm_pad_test` is here for the
 # same reason: without it ctest reports the row as "Not Run" and the job fails after every other test passes.
 add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test attn_math_test npu_kv_int8_test
-                 host_gemm_pad_test npu_derive_designs_dump)
+                 host_gemm_pad_test npu_derive_designs_dump npu_plan_op_reference_test)
 # The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.
 add_test(NAME npu_window11_policy COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/npu-window11.sh --self-test)
+# The package's file modes (engine#1352): a release artifact's modes are the packer's decision, so every staged file is
+# 0755 (was executable) or 0644 (was not), no file or directory is group/other-writable, and the reporter that catches a
+# staging line added below the normalisation still fires on a tree nobody normalised.  Fixture tree: no build, no tar.
+add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.sh)
 # The GEMM designs are derived on the container's K grid and the kernel's N grid (engine#845); a
 # model already on both is unchanged.  Pure arithmetic + one assemble_B, so it runs without a model.
 # The engine's derived design set for a set of dims, as `ROLE M K N elf` lines.  The instrument the
@@ -1072,6 +1105,14 @@ add_test(NAME npu_rmsnorm_offset COMMAND npu_rmsnorm_offset_test)
 add_dependencies(npu_sampling_test npu_rmsnorm_offset_test)
 # layer_types -> per-layer kind, and the name the forward refuses an unimplemented kind by (q4nx_forward.cpp,
 # the engine#1087 shape).  Plain C, links the semantics TU directly, no model and no device.
+# Interleaved MRoPE is declarable in two spellings (rope_parameters for OGA/Qwen3.5 packs, rope_scaling for a
+# Hugging Face qwen3_vl config); the flag is what a route or a refusal can act on, so both are pinned here, with
+# the controls that keep a yarn/linear rope_scaling block from being read as mrope.  Plain C, no model, no device.
+add_executable(q4nx_mrope_test tests/q4nx_mrope_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_mrope_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_mrope_test PRIVATE m)
+add_test(NAME q4nx_mrope COMMAND q4nx_mrope_test)
+add_dependencies(npu_sampling_test q4nx_mrope_test)
 add_executable(q4nx_layer_kinds_test tests/q4nx_layer_kinds_test.c npu/forward/src/q4nx_semantics.c)
 target_include_directories(q4nx_layer_kinds_test PRIVATE npu/forward/include)
 target_link_libraries(q4nx_layer_kinds_test PRIVATE m)

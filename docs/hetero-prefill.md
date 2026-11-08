@@ -178,9 +178,10 @@ numbers of this document dated, and to re-run the ratio before anyone quotes a c
 > So the 1.441 ms and 1.055 ms per 256-row group below are the **regressed** kernel selection, the "3.4-4.6x slower than the
 > microbenchmark" is #782 seen through a stale install rather than a dispatch-side gap, and on a post-fix library the iGPU
 > side of the ratio is the microbenchmark's own 0.29-0.31 ms per group (27-30x from the NPU) unless a post-fix **capture**
-> says otherwise - which is unrun. What that restores is the page's original verdict: **on a fixed build the split does not
-> pay** (ceiling ~1.03x), and #754's bar stands. The genuinely new finding of the whole exercise is the deployment one: a
-> capture harness can silently measure a four-day-old runtime, and the wall clock (653 tok/s) looked plausible on both.
+> says otherwise - and the post-fix capture below now says it does not: **0.855 ms per 256-row group, a 10x asymmetry,
+> 1.085x per GEMM, 1.035x end to end**. What that restores is the page's original verdict: **on a fixed build the split does
+> not pay**, and #754's bar stands. The genuinely new finding of the whole exercise is the deployment one: a capture harness
+> can silently measure a four-day-old runtime, and the wall clock (653 tok/s) looked plausible on both.
 
 That is exactly what the paragraph above asked for. The 12.4 TFLOP-s boot was **engine#782**, attributed
 (2026-11-06 08:26Z) to the compiler that built the embedded device code — clang-23 objects in
@@ -225,9 +226,8 @@ Either reading puts **that build's** iGPU at **1.06-1.44 ms per 256-row group** 
 per tile: an asymmetry of **6-8x** - and it is **3.4-4.6x slower than the microbenchmark this page's first two
 measurements used** (0.313 ms per 256-row group, 40.7 TFLOP-s). Reading that as a "loop-to-engine gap" was my
 first conclusion and it was wrong: the capture ran on the pre-#782 library (second correction above), and the
-post-fix library does not contain those tiles at all. **A post-fix capture is unrun**, so what is known is the
-microbenchmark's rate on the post-fix build and nothing about the engine's own prefill on it - which is the one
-measurement this page still owes.
+post-fix library does not contain those tiles at all. That capture was the last thing this page owed, and it has
+now been taken (next subsection).
 
 **What that does to the bar**, stated for both builds so neither can be quoted alone. On the **pre-#782 library
 the capture ran**: iGPU 1.441 ms per 256 rows, NPU 8.61 ms per tile, 64 row-groups at M=16384, iGPU-only =
@@ -243,6 +243,49 @@ across the models the Supreme board compares (`~/lb/prefill-split/RANKED-FOR-SUP
 prefill on the box is `bonsai2-27b-ternary` at **144-152 tok/s**, and its device time is **93-96 %** in
 three **f32** wmma kernels — a 1-bit model doing f32 prefill math. That is ~7.8 TFLOP-s of effective
 work, from wall clock rather than the capture, so the unit correction does not touch it.
+
+### Fourth measurement, 2026-11-07 18:34 (`gpu-hold`, 217 s): the post-fix capture, and it is the last number this page owed
+
+Taken on the runtime the *pin* builds, not the one the earlier captures were pointed at: `llama-bench` built into
+`~/.cache/hw-gate/build-13a7fda57a` (2026-11-06, gpu-kernels `fd69590`, `strings … | grep -c m128_w8_f2_sb` = **0**), with
+`libhrx` from `~/wt/c6-control` (`b99203c2`, the pin + #895's event ring) so a 36 688-dispatch pp16384 session captures at
+all. `llama-bench -dev HRX0 -ngl 99`, no-SVM trio, pp2048 and pp16384, one profiled rep each:
+
+| pp16384 | device time | share of busy | dispatches | per dispatch |
+|---|---:|---:|---:|---:|
+| attention (`fa_prompt_f16_d128`, now `k_c8f927eca76a`) | 12 364.7 ms | **57.1 %** | 2 304 | 5.367 ms |
+| `ggml_mul_mat_q4_k_f16_wmma_prefill_wave32` | 4 069.9 ms | 18.8 % | 9 216 | 0.442 ms |
+| `ggml_mul_mat_swiglu_q4_k_f16_wmma_prefill_wave32` | 3 830.2 ms | 17.7 % | 2 240 | **1.710 ms** |
+| `ggml_mul_mat_q6_k_f16_wmma_prefill_wave32` | 1 443.8 ms | 6.7 % | 2 240 | 0.645 ms |
+
+**The engine's matmuls on the post-fix runtime**, three readings of the same capture: `swiglu_q4_k` at 1.710 ms per
+dispatch is **0.855 ms per 256-row group** (the page's conservative reading), the total weight-matmul time (9 343.9 ms for
+two prefills) against 131.8 TFLOP is **28.2 TFLOP-s**, which is 0.452 ms per group. So the in-engine rate is
+**0.43-0.86 ms per group** - and the microbenchmark on the same pin (0.313 ms) is only **1.4x** faster, not the 3.4-4.6x
+that the stale library implied. That is the "loop-to-engine gap" as it actually stands: real, modest, and no longer an
+explanation for anything.
+
+| | pre-fix library (Nov-2) | **post-fix runtime (this capture)** | microbenchmark on the pin |
+|---|---:|---:|---:|
+| iGPU per 256-row group | 1.441 ms | **0.855 ms** (0.43-0.45 by FLOPs) | 0.313 ms |
+| weight matmuls | 12.1 TFLOP-s | **28.2 TFLOP-s** | 40.7 TFLOP-s |
+| asymmetry vs the 8.61 ms NPU tile | 6x | **10x** | 27x |
+| per-GEMM ceiling, M=16384 | 1.164x | **1.085x** (1.049x on the faster reading) | 1.032x |
+| attention share of busy | 48.5 % | **57.1 %** | - |
+| end to end | 1.078x | **1.035x** (1.021x) | 1.017x |
+
+So the fourth measurement lands between the two earlier answers and closer to the page's original one: a perfect concurrent
+split is worth **2-3.5 % of prefill** on a post-fix engine, because as the matmuls got 2.3x faster the attention share grew
+from 48.5 % to 57.1 % and the split can only touch the other 42.9 %. The bar in #754 therefore still stands, and the M<=2048
+cell is now **closed as "no"** rather than left unresolved: at pp2048 the same capture gives 1.661 ms per `swiglu` dispatch,
+i.e. 0.83 ms per 256-row group, so the whole `up_gate` GEMM (8 row-groups) is **6.6 ms** of iGPU work - *less* than one
+8.61 ms NPU tile, which makes the split 1.00x there. The earlier "1.143x at M=2048" came from the pre-fix library's
+1.441 ms per group, i.e. from the same stale reading as the 1.164x row.
+
+**One caveat that is not about the kernels**: that hw-gate build's *wall clock* is far below the shipped runtime's
+(660 tok/s at pp2048 against 1564 on the Nov-2 runtime, with **79.9 %** of the pp2048 device span idle). Its per-kernel
+*busy-time* numbers are the usable part - shares and per-dispatch times - and this subsection uses only those. The build is a
+gate build, not a release build, and the idle says so.
 
 ### The scheduling half, which the ratio alone does not cover
 
@@ -302,6 +345,39 @@ and the library evidence is `strings <lib> | grep -c m128_w8_f2_sb` (24 on the c
   model, the pin and the die temperature.
 - **Copy the weights to give the NPU its own layout per layer.** Measured cost: 50 MiB of copies per
   layer for the 4B up_gate (~3.6 ms at 14 GB/s) against a 1.3 % best-case gain.
+
+## What the 2026 paper survey changes (2026-11-08)
+
+Three readings from the survey in `~/amd-oss/npu-re/` change the *plan* rather than the measurements above. They are the papers'
+claims, cited so a reader can check them, plus this page's own numbers where they meet.
+
+**1. The NPU prefill GEMM's target is published, and it is 6-8x above ours.** TileFuse (arXiv 2606.11357) reports XDNA2 W4A16 prefill
+at **~12 TOPS (Krackan) / ~9 TOPS (Strix Point)**, Llama3-8B at 2048 tokens in **4.13 s on the NPU against 8.25 s on the iGPU**, and
+**501.9 tok/s** at 1K context against FastFlowLM's 345.9. Our `gemm_q4_prefill` is **1.2-1.5 TFLOP/s** (the 8.61 ms per 256-row tile
+above). So the bar this page derives for a split - "an NPU prefill GEMM ~4x faster" - sits *inside* a published result on the same
+silicon class: the gap is a kernel project with a known technique (interleaved column-major pre-tiling past 8K, fused
+unpack+dequant+matmul, 128 B-padded tile payload), not a property of the part. Their decode is the counterpoint and it agrees with our
+route: **GEMV at 181-206 GOPS, slower than the iGPU**, which is why decode stays on HRX here.
+
+**2. Attention is a second splittable share, not untouchable overhead.** This page's ceilings assume a split can only touch the
+matmuls, because attention is **57.1 %** of the post-fix pp16384 device time on the 4B. FlashAttention-on-XDNA (arXiv 2609.21264)
+reports **3.62 TFLOP/s** for a fully fused XDNA2 attention at 32K - scores kept in compute-tile L1, reduced over the cascade - against
+1.81 for a streamed design and 0.455 layer-by-layer, at **5.3-7.2x the iGPU's energy efficiency from 2K tokens up** (ridge points:
+MemTile 33.7 FLOP/B, compute tile 25.2 FLOP/B, so QK^T belongs in L1 and not the MemTile). If a kernel of that shape lands here, the
+split's end-to-end factor has *two* shares to spend and must be re-derived; the 1.035x end-to-end above is the matmul-only answer.
+
+**3. Two house rules from the hybrid designs, and one architecture target.** The ANE prefill + GPU decode study (arXiv, AtomGradient
+2026) reaches **11.3x** by dispatching **32 tokens at a time** instead of one, because a sequential NPU dispatch costs a flat ~42 ms -
+so on this box **no NPU path should dispatch fewer than 32 rows**, which is also why the M=16 decode twins and a one-token handoff are
+the wrong shape for anything batched. Pipeline Shards (arXiv 2608.19147) is the shape the shared-buffer work wants: a static NPU graph
+with **KV as explicit graph I/O in a host-managed bounded ring**, which is exactly the object a dma-buf would be made of, and a better
+long-term shape than this route's per-request state file. HeteroInfer (SOSP'25, arXiv 2501.14794) supplies the split shape that matches
+what was measured here - the NPU takes the **static aligned part** and the GPU the **ragged tail** (our optimum was already 5-9 of 64
+row-groups), with a **~400 us** GPU-NPU sync treated as a first-class cost, i.e. the bar any per-layer handoff would have to clear.
+
+Licence note for the one paper with code (TileFuse): the `mlir-aie` fork's `LICENSE` is *Apache License v2.0 with LLVM Exceptions*
+(GitHub reports it as "Other", so the file is the authority). Reading it for understanding is fine; any port keeps the notice and lands
+in the private kernel repositories, not in this tree.
 
 ## The DRM buffer, measured
 

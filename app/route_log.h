@@ -37,6 +37,13 @@ struct RouteDecision {
     std::string cls;            // the class used (after the fallback); "pinned" when the request named a row
     std::string laya_class;     // what Laya answered ("" for pinned)
     float confidence = 0;
+    // The text Laya classified (the last user message), so a decision log can become `--eval` cases
+    // and fine-tune data instead of an untraceable list of verdicts (engine#1313, docs/laya-models.md).
+    // Held for classified requests only: a pinned request was never a decision.  Bounded, with the
+    // full length kept: a long prompt must not grow this 512-entry log without bound, and a reader
+    // has to be able to see that what it got is a prefix.
+    std::string state;
+    long state_len = -1;        // the state's full length in bytes; -1 when no state was recorded
     std::string model, device;  // the row that answered
     double router_ms = 0;       // the Laya decision (0 when pinned or cached)
     bool cached = false;
@@ -59,9 +66,25 @@ struct RouteDecision {
         if (completion_tokens >= 0) j["completion_tokens"] = completion_tokens;
         if (prompt_tok_s >= 0) j["prompt_tok_s"] = prompt_tok_s;
         if (decode_tok_s >= 0) j["decode_tok_s"] = decode_tok_s;
+        if (state_len >= 0) {          // >= 0: classified (an empty state is still a decision)
+            j["state"] = state;
+            j["state_len"] = state_len;   // > (long)state.size() means `state` is a prefix
+        }
         return j;
     }
 };
+
+// The most of a classified state a decision keeps: prose from an agent step, not a document.  The
+// demo's steps are a few hundred bytes; 4 KiB is ~8 of those, and 512 decisions of it is the log's
+// own ceiling (2 MiB).  The full length is recorded either way, so a truncated state is visible as
+// truncated rather than silently being "the state" (engine#1313).
+constexpr size_t kRouteStateMax = 4096;
+
+inline std::string bounded_state(const std::string& s, long& full_len) {
+    full_len = static_cast<long>(s.size());
+    if (s.size() <= kRouteStateMax) return s;
+    return s.substr(0, kRouteStateMax);
+}
 
 // Reads usage and timings from a non-streamed reply body (llama-server and the NPU routes both send them).
 inline void read_reply_stats(const std::string& body, RouteDecision& d) {

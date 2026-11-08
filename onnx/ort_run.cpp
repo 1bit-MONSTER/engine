@@ -19,7 +19,13 @@
 //   ort-run --model qwen3-0.6b.onnx [--ep ./libonebit_ep.so] --ids "15 23 40" -n 8
 //           [--dump-logits DIR] [--threads N]
 //
-// The graph's interface is fixed to what onnx/export_qwen3.py emits: `input_ids` int64 [1,S],
+// Two kinds of graph:
+//   * with --input, ANY graph: each input is a named raw tensor from a file, each output is written
+//     where you ask (`--output NAME=FILE`) or into a directory (`--dump-all`), and nothing about
+//     names, shapes or roles is assumed -- a vision model, an audio model, a one-op toy;
+//   * without it, the Qwen3 LLM interface below (kept because the benchmarks are built on it).
+//
+// The LLM graph's interface is fixed to what onnx/export_qwen3.py emits: `input_ids` int64 [1,S],
 // `attention_mask` int64 [1,S] (omit it with --no-mask) and a `logits` float32 [1,S,V] output. A
 // decoding step is a full re-run over the growing sequence, because the exported graph carries no
 // KV cache: the tokens/s printed here is that graph's rate, not the forward route's, and the two are
@@ -115,10 +121,21 @@ OrtStatus* make_session(OrtEnv* env, const char* model_path, const std::vector<c
     return st;
 }
 
+// One named input for a non-LLM graph: the tensor is read from a raw little-endian file, because
+// that is what every preprocessing step in the world can write without a dependency (engine#1313's
+// sibling problem, TGPNPU): a vision model's bytes are the caller's, not ours to guess.
+struct InSpec {
+    std::string name, file, dtype;
+    std::vector<int64_t> shape;
+};
+
 struct Args {
     const char* model = nullptr;
     std::vector<const char*> eps;  // plugin EP libraries, in registration order
     std::vector<int64_t> ids;
+    std::vector<InSpec> inputs;                        // --input name=file:dtype:1x3x640x640
+    std::vector<std::pair<std::string, std::string>> outputs;  // --output name=file
+    const char* dump_all = nullptr;                    // --dump-all DIR: every output + a sidecar
     int steps = 8;
     const char* dump = nullptr;
     bool mask = true;
@@ -194,6 +211,46 @@ bool parse_args(int argc, char** argv, Args* a) {
         else if (arg == "--gen" && more) a->gen = std::atoi(argv[++i]);
         else if (arg == "--warmup" && more) a->warmup = std::atoi(argv[++i]);
         else if (arg == "--repeat" && more) a->repeat = std::atoi(argv[++i]);
+        else if (arg == "--input" && more) {
+            // name=file:dtype:SHAPE, SHAPE with x separators. The dtype and the shape are the
+            // caller's declaration and are checked against the file's byte count before ORT sees
+            // them: a silently short buffer is a wrong answer, not an error.
+            const std::string spec = argv[++i];
+            const size_t eq = spec.find('=');
+            const size_t c1 = eq == std::string::npos ? std::string::npos : spec.find(':', eq + 1);
+            const size_t c2 = c1 == std::string::npos ? std::string::npos : spec.rfind(':');
+            if (c1 == std::string::npos || c2 == c1) {
+                std::fprintf(stderr, "onebit-ort-run: --input wants NAME=FILE:DTYPE:SHAPE (%s)\n", spec.c_str());
+                return false;
+            }
+            InSpec in;
+            in.name = spec.substr(0, eq);
+            in.file = spec.substr(eq + 1, c1 - eq - 1);
+            in.dtype = spec.substr(c1 + 1, c2 - c1 - 1);
+            std::string dims = spec.substr(c2 + 1);
+            for (size_t at = 0; at <= dims.size();) {
+                const size_t x = dims.find('x', at);
+                const std::string tok = dims.substr(at, x == std::string::npos ? std::string::npos : x - at);
+                if (tok.empty()) {
+                    std::fprintf(stderr, "onebit-ort-run: --input %s: empty dimension (%s)\n", in.name.c_str(), spec.c_str());
+                    return false;
+                }
+                in.shape.push_back(std::atoll(tok.c_str()));
+                if (x == std::string::npos) break;
+                at = x + 1;
+            }
+            a->inputs.push_back(std::move(in));
+        }
+        else if (arg == "--output" && more) {
+            const std::string spec = argv[++i];
+            const size_t eq = spec.find('=');
+            if (eq == std::string::npos || eq == 0 || eq + 1 >= spec.size()) {
+                std::fprintf(stderr, "onebit-ort-run: --output wants NAME=FILE (%s)\n", spec.c_str());
+                return false;
+            }
+            a->outputs.emplace_back(spec.substr(0, eq), spec.substr(eq + 1));
+        }
+        else if (arg == "--dump-all" && more) a->dump_all = argv[++i];
         else if (arg == "--ids" && more) {
             const char* p = argv[++i];
             while (*p) {
@@ -210,7 +267,7 @@ bool parse_args(int argc, char** argv, Args* a) {
         }
     }
     if (a->lens.empty()) a->lens = {2048, 1024, 512, 256, 128};  // AMD's default sweep
-    if (!a->model || (a->ids.empty() && !a->bench)) {
+    if (!a->model || (a->ids.empty() && a->inputs.empty() && !a->bench)) {
         std::fprintf(stderr,
                      "usage: ort-run --model <file.onnx> [--ep <lib.so>]... --ids \"<id> <id>\"\n"
                      "               [-n N] [--dump-logits DIR] [--no-mask] [--threads N] [--cached]\n"
@@ -221,7 +278,13 @@ bool parse_args(int argc, char** argv, Args* a) {
                      "       --bench prints AMD's model_benchmark.exe block (avg/p50/stddev per stage) so\n"
                      "       the numbers sit next to their Ryzen AI runs; it needs a --cached graph.\n"
                      "       --ep may be repeated: the EPs are registered in the order given and the\n"
-                     "       CPU EP is always appended last (docs/onnx.md, \"Two engines\").\n");
+                     "       CPU EP is always appended last (docs/onnx.md, \"Two engines\").\n"
+                     "       ort-run --model <any.onnx> [--ep <lib.so>] --input NAME=FILE:DTYPE:SHAPE ...\n"
+                     "               [--output NAME=FILE]... [--dump-all DIR]\n"
+                     "       Any graph: each --input is a raw little-endian tensor (float32, float16,\n"
+                     "       uint8, int8, int32, int64), the declared shape must match the file's size\n"
+                     "       or the run is refused by name, and outputs go where --output says them or\n"
+                     "       into --dump-all with an outputs.txt sidecar (docs/onnx.md, \"Any graph\").\n");
         return false;
     }
     return true;
@@ -461,6 +524,224 @@ long peak_rss_bytes() {
     return kb * 1024L;
 }
 
+// Element type of a declared dtype, or -1 for one this runner does not carry. Kept deliberately
+// small: the tensors vision models take are float32 and uint8, and a dtype we cannot name is
+// refused by name rather than coerced.
+int elem_type(const std::string& d) {
+    if (d == "float32" || d == "f32") return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+    if (d == "float16" || d == "f16") return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+    if (d == "uint8" || d == "u8") return ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+    if (d == "int8" || d == "i8") return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
+    if (d == "int32" || d == "i32") return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
+    if (d == "int64" || d == "i64") return ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+    return -1;
+}
+
+size_t elem_size(int t) {
+    switch (t) {
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: return 4;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return 2;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8: return 1;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return 4;
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return 8;
+        default: return 0;
+    }
+}
+
+const char* type_name(int t) {
+    switch (t) {
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: return "float32";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16: return "float16";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8: return "uint8";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8: return "int8";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32: return "int32";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: return "int64";
+        default: return "other";
+    }
+}
+
+// A filename that cannot escape the output directory: ONNX names carry `::`, `/` and `:`.
+std::string safe_name(const std::string& n) {
+    std::string out;
+    for (char c : n) out += (std::isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_') ? c : '_';
+    return out.empty() ? std::string("tensor") : out;
+}
+
+// One run of an arbitrary graph: every declared input from a file, one Run(), every output either
+// to the path named for it or into --dump-all's directory with a sidecar that says what it is. This
+// is the whole of "the runner speaks any graph's interface" -- no inference about names, shapes or
+// roles, so a vision model, an audio model and a matmul toy all take the same path.
+int run_generic(OrtSession* session, OrtMemoryInfo* mi, const Args& a) {
+    std::vector<std::vector<uint8_t>> storage;   // outlives every tensor made from it
+    std::vector<OrtValue*> values;
+    std::vector<const char*> names;
+    storage.resize(a.inputs.size());
+    int rc = 0;
+    for (size_t i = 0; i < a.inputs.size() && !rc; ++i) {
+        const InSpec& in = a.inputs[i];
+        const int et = elem_type(in.dtype);
+        if (et < 0) {
+            std::fprintf(stderr, "onebit-ort-run: --input %s: dtype %s is not one this runner carries\n",
+                         in.name.c_str(), in.dtype.c_str());
+            rc = 2;
+            break;
+        }
+        size_t elems = 1;
+        for (int64_t d : in.shape) {
+            if (d <= 0) {
+                std::fprintf(stderr, "onebit-ort-run: --input %s: dimension %lld is not positive (a static shape is required)\n",
+                             in.name.c_str(), (long long)d);
+                rc = 2;
+                break;
+            }
+            elems *= (size_t)d;
+        }
+        if (rc) break;
+        const size_t want = elems * elem_size(et);
+        FILE* f = std::fopen(in.file.c_str(), "rb");
+        if (!f) {
+            std::fprintf(stderr, "onebit-ort-run: --input %s: cannot read %s\n", in.name.c_str(), in.file.c_str());
+            rc = 2;
+            break;
+        }
+        std::fseek(f, 0, SEEK_END);
+        const long have = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        if (have != (long)want) {
+            std::fprintf(stderr,
+                         "onebit-ort-run: --input %s: %s holds %ld B, %s of %lld elements needs %zu B\n",
+                         in.name.c_str(), in.file.c_str(), have, in.dtype.c_str(), (long long)elems, want);
+            std::fclose(f);
+            rc = 2;
+            break;
+        }
+        storage[i].assign(want, 0);
+        if (want && std::fread(storage[i].data(), 1, want, f) != want) {
+            std::fprintf(stderr, "onebit-ort-run: --input %s: short read from %s\n", in.name.c_str(), in.file.c_str());
+            std::fclose(f);
+            rc = 2;
+            break;
+        }
+        std::fclose(f);
+        OrtValue* v = nullptr;
+        if (OrtStatus* st = api->CreateTensorWithDataAsOrtValue(mi, storage[i].data(), want, in.shape.data(),
+                                                              in.shape.size(), (ONNXTensorElementDataType)et, &v)) {
+            rc = fail("input tensor", st);
+            break;
+        }
+        values.push_back(v);
+        names.push_back(in.name.c_str());
+        std::printf("  in      : %s %s %zu B", in.name.c_str(), in.dtype.c_str(), want);
+        for (int64_t d : in.shape) std::printf("x%lld", (long long)d);
+        std::printf("  <- %s\n", in.file.c_str());
+    }
+    if (rc) {
+        for (OrtValue* v : values) api->ReleaseValue(v);
+        return rc;
+    }
+
+    // Every output, named. Passing a null name array here is not "all outputs" in this API -- it
+    // aborted inside ORT (a terminate with no active exception, and the buffered log went with it).
+    std::vector<std::string> out_owned;
+    std::vector<const char*> out_names;
+    std::vector<OrtValue*> outs;
+    {
+        OrtAllocator* alloc = nullptr;
+        api->GetAllocatorWithDefaultOptions(&alloc);
+        size_t n_out = 0;
+        if (OrtStatus* st = api->SessionGetOutputCount(session, &n_out)) {
+            rc = fail("output count", st);
+        } else {
+            for (size_t i = 0; i < n_out && !rc; ++i) {
+                char* nm = nullptr;
+                if (OrtStatus* st = api->SessionGetOutputName(session, i, alloc, &nm)) {
+                    rc = fail("output name", st);
+                } else {
+                    out_owned.emplace_back(nm);
+                    alloc->Free(alloc, nm);
+                }
+            }
+        }
+        if (!rc && n_out) {
+            for (const auto& nm : out_owned) out_names.push_back(nm.c_str());
+            outs.assign(n_out, nullptr);
+            const auto t0 = std::chrono::steady_clock::now();
+            if (OrtStatus* st = api->Run(session, nullptr, names.data(), values.data(), values.size(),
+                                         out_names.data(), out_names.size(), outs.data()))
+                rc = fail("Run", st);
+            else
+                std::printf("  run     : %.2f ms, %zu output(s)\n",
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                            outs.size());
+        }
+    }
+    for (OrtValue* v : values) api->ReleaseValue(v);
+    if (rc) {
+        for (OrtValue* v : outs) if (v) api->ReleaseValue(v);
+        return rc;
+    }
+
+    if (a.dump_all) ::mkdir(a.dump_all, 0700);   // EEXIST is the normal case
+    FILE* side = a.dump_all ? std::fopen((std::string(a.dump_all) + "/outputs.txt").c_str(), "a") : nullptr;
+    for (size_t i = 0; i < outs.size(); ++i) {
+        OrtAllocator* alloc = nullptr;
+        char* gname = nullptr;
+        api->GetAllocatorWithDefaultOptions(&alloc);
+        if (OrtStatus* st = api->SessionGetOutputName(session, i, alloc, &gname)) {
+            rc = fail("output name", st);
+            break;
+        }
+        OrtTensorTypeAndShapeInfo* info = nullptr;
+        size_t rank = 0;
+        std::vector<int64_t> dims;
+        ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+        if (OrtStatus* st = api->GetTensorTypeAndShape(outs[i], &info)) {
+            rc = fail("output type", st);
+            break;
+        }
+        api->GetDimensionsCount(info, &rank);
+        dims.assign(rank, 0);
+        api->GetDimensions(info, dims.data(), rank);
+        api->GetTensorElementType(info, &et);
+        api->ReleaseTensorTypeAndShapeInfo(info);
+
+        // The write path: an explicit --output, else a file in --dump-all's directory.
+        std::string path;
+        for (const auto& o : a.outputs) if (o.first == gname) path = o.second;
+        if (path.empty() && !a.dump_all) continue;
+        if (path.empty()) path = std::string(a.dump_all) + "/" + safe_name(gname) + ".bin";
+        const void* data = nullptr;
+        if (OrtStatus* st = api->GetTensorData(outs[i], &data)) {
+            rc = fail("output data", st);
+            break;
+        }
+        size_t elems = 1;
+        for (int64_t d : dims) elems *= (size_t)(d > 0 ? d : 1);
+        const size_t bytes = elems * elem_size(et);
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) {
+            std::fprintf(stderr, "onebit-ort-run: cannot write %s\n", path.c_str());
+            rc = 2;
+            break;
+        }
+        if (bytes) std::fwrite(data, 1, bytes, f);
+        std::fclose(f);
+        std::printf("  out     : %s %s %zu B", gname, type_name(et), bytes);
+        for (int64_t d : dims) std::printf("x%lld", (long long)d);
+        std::printf("  -> %s\n", path.c_str());
+        if (side) {
+            std::fprintf(side, "%s %s", gname, type_name(et));
+            for (int64_t d : dims) std::fprintf(side, "x%lld", (long long)d);
+            std::fprintf(side, " %zu %s\n", bytes, path.c_str());
+        }
+        if (alloc && gname) alloc->Free(alloc, gname);
+    }
+    if (side) std::fclose(side);
+    for (OrtValue* v : outs) if (v) api->ReleaseValue(v);
+    return rc;
+}
+
 // AMD's model_benchmark.exe block: same stages, same statistics, same defaults (-l/-g/-w/-r), so the
 // two outputs are read side by side without translation. Each repeat restarts from a zero-length
 // cache, which is their repeat loop resetting the OGA generator.
@@ -515,6 +796,7 @@ int bench_amd(OrtSession* session, OrtMemoryInfo* mi, const Args& a) {
 }
 
 int onebit_ort_run_main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);  // an abort must not swallow the trace that explains it
     Args a;
     if (!parse_args(argc, argv, &a)) return 2;
 
@@ -549,6 +831,16 @@ int onebit_ort_run_main(int argc, char** argv) {
     for (size_t i = 0; i < a.eps.size(); ++i)
         std::printf("  ep%-6zu: %s\n", i + 1, a.eps[i]);
     if (a.eps.empty()) std::printf("  ep      : (CPU only)\n");
+
+    // Any graph with declared inputs takes the generic path: nothing below this line assumes the
+    // Qwen3 interface, and nothing above it assumed the caller had one.
+    if (!a.inputs.empty()) {
+        const int rc = run_generic(session, mi, a);
+        api->ReleaseSession(session);
+        api->ReleaseMemoryInfo(mi);
+        api->ReleaseEnv(env);
+        return rc;
+    }
 
     if (a.bench) {
         if (!a.cached) {

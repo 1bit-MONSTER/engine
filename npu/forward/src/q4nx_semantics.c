@@ -229,6 +229,18 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
      * picking one of the two. */
     double d = 0;
     double prf_rope = 0;   /* partial_rotary_factor found inside rope_parameters */
+    /* Interleaved MRoPE is declarable in two spellings and only one was read here.  FastFlowLM/OGA packs and
+     * Qwen3.5 nest the rotary block under `rope_parameters` (the block below); a Hugging Face `qwen3_vl` config
+     * (Qwen3-VL, engine #1311/TQVL) declares the same thing under `rope_scaling`.  Reading only the first meant
+     * such a container loaded as mrope=0 -- plain RoPE, silently: exact for a text-only prompt (with
+     * pos_t = pos_h = pos_w the two are bit-identical, measured), wrong by ~0.29 rad on the rotary block once
+     * image tokens are in it.  tests/q4nx_mrope_test.c pins both spellings and the controls (a yarn/linear
+     * rope_scaling block must NOT be read as mrope). */
+    {
+        const char* rs = value_for_top(json, "rope_scaling");
+        double mr = 0;
+        if (rs && *rs == '{' && get_num(rs, "mrope_interleaved", &mr) && mr != 0) s->mrope = 1;
+    }
     const char* rope_blk = value_for_top(json, "rope_parameters");
     if (rope_blk && *rope_blk == '{') {
         const char* end = match_brace(rope_blk);

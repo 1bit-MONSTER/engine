@@ -1680,7 +1680,9 @@ if [ ! -d "$PDIR" ]; then
     skip payload-modes "no $PDIR on this system: the payload is not unpacked where an appliance keeps it, so its modes cannot be read"
 else
     _pm_n=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
-    _pm_s=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 | tr '\n' ' ')
+    # the sample is relative to the payload, like the modes below it: an absolute path per file makes a long line on a console
+    # nobody can scroll, and the prefix is identical for every one of them
+    _pm_s=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 | sed "s|^$PDIR/||" | tr '\n' ' ')
     PM=$(payload_modes_verdict "${_pm_n:-}" "${_pm_s:-}")
     _pm_bits=
     for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do

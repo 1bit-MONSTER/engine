@@ -1117,6 +1117,14 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         setup.plan = plan_.loaded() ? &plan_ : nullptr;
         xd_->configure(setup);
         std::string why;
+        // Import-time completeness (engine#799 rule (c)): a plan that names an op whose kernel is not here
+        // is refused HERE, naming the design and the artifact, instead of at the first launch or -- worse --
+        // by quietly running that role on the host loop.  The target's own probe stays as the second line:
+        // this one runs before anything is opened at all.
+        if (!host_gemm_ && plan_.loaded() && !plan_.check_artifacts({dir}, why)) {
+            err_ = std::move(why);
+            return false;
+        }
         if (!xd_->open_prefill(designs_, ndesigns_, why)) {
             err_ = std::move(why);
             return false;

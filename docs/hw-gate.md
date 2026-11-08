@@ -50,6 +50,14 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   `third_party/hrx-system` gitlink, `CMakeLists.txt`, `cmake/hrx.cmake`, `config/hrx-toolchain.config`,
   `config/hrx-system-hold.config`, `app/serve.cpp` (the HRX wiring) or the workflow itself. It also runs by hand
   (Actions -> hrx-build -> Run workflow). It needs no label.
+- **Configure only, for a test registration.** A PR whose only change among those inputs is a ctest registration
+  added to `CMakeLists.txt` (`add_test(...)`, `set_tests_properties(...)`, `set_property(TEST ...)`, with comments and
+  blank lines) still configures with `-DONEBIT_HRX=ON` but skips the compile. Such a line creates no target and sets no
+  flag. It is still evaluated at configure time, including inside `if(ONEBIT_HRX)` blocks that `ci.yml` never
+  configures, which is why the configure stays. Files outside the inputs above (the new test's own script, docs) do not
+  count: on their own they do not run this job. `tools/ci/hrx_build_scope.py` decides, and it builds whenever it is
+  unsure: a line that is not a registration, a registration inside `foreach`/`function`/`macro`, a pure removal, a
+  `CMakeLists.txt` entry with no changed lines (a mode change or rename), or a crash.
 - **Where.** On the box's bench runner (`strixhalo-bench`, `[self-hosted, strixhalo, bench]`), with TheRock at
   `/opt/rocm-therock`, under `~/lb/thermal-run.sh`. That is not the gate's pr-agent runner, which a cold build would hold
   while every PR-Agent review queued behind it. It takes no GPU token and no NPU lock. Fork PRs never run it. It costs

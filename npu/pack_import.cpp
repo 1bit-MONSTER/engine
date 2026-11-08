@@ -1159,6 +1159,21 @@ Plan plan(const std::string& pack_dir) {
             if (!ec) p.graph_external_bytes = int64_t(sz);
         }
     }
+    // The Token .fconst, found once (see find_token_fconst) and used by the attention block below. Empty means this
+    // pack keeps no weights there -- which for the rai_1.3/1.6/1.7.1 line is the normal case, not a fault.
+    std::string tok_why;
+    std::string tok_path = find_token_fconst(pack_dir, &tok_why);
+    const bool no_fconst = tok_path.empty();
+    const bool graph_weights = p.graph_real_weights > 0 && no_fconst;
+    // The projections the graph carries as real initializers, by their own names (`.MatMulNBits.` marks one).
+    std::set<std::string> graph_projs;
+    if (graph_weights) {
+        for (const auto& t : onnx.tensors) {
+            const size_t pos = t.name.find(".MatMulNBits.");
+            if (pos == std::string::npos || t.dims.empty()) continue;   // 0-dim placeholders sit beside them
+            graph_projs.insert(t.name.substr(0, pos));
+        }
+    }
     const OnnxTensor* embed = nullptr;
     for (const auto& t : onnx.tensors)
         if (t.name == "model.embed_tokens.weight") embed = &t;
@@ -1187,12 +1202,24 @@ Plan plan(const std::string& pack_dir) {
     // refusal here is empty and import_pack reports what the anchors actually found.
     const std::string norm_source = "fconst:Llm_Token_Token";
     const std::string norm_refusal;
+    // Genre A: the norms are ordinary F16 initializers named after themselves, with real offsets -- not the
+    // .fconst tail envelope -- so the refusal names the initializer and where it sits.
+    auto graph_norm_refusal = [&](const std::string& name) -> std::string {
+        if (!graph_weights) return norm_refusal;
+        const auto ti = onnx.index.find(name);
+        if (ti == onnx.index.end()) return "the graph carries no initializer named " + name;
+        const OnnxTensor& t = onnx.tensors[ti->second];
+        if (t.dims.empty()) return "the graph carries " + name + " as a 0-dim placeholder, not a weight";
+        return "weights are in " + (t.location.empty() ? std::string("the graph") : t.location) + " + " +
+               std::to_string((unsigned long long)t.offset) + " B -- the graph-initializer reader is not "
+               "implemented yet (this pack is not a .fconst pack)";
+    };
     for (int L = 0; L < d.layers; ++L) {
         auto a = make("model.layers." + std::to_string(L) + ".input_layernorm.weight", norm_source, "BF16", {H});
         auto b = make("model.layers." + std::to_string(L) + ".post_attention_layernorm.weight", norm_source,
                       "BF16", {H});
-        a.refusal = norm_refusal;
-        b.refusal = norm_refusal;
+        a.refusal = graph_norm_refusal("model.layers." + std::to_string(L) + ".input_layernorm.weight");
+        b.refusal = graph_norm_refusal("model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");
         p.tensors.push_back(std::move(a));
         p.tensors.push_back(std::move(b));
     }
@@ -1213,8 +1240,7 @@ Plan plan(const std::string& pack_dir) {
     // 64-row tiles (or whose q/k/v/o row split does not add up to them) is refused rather than guessed at.
     const int q_out = d.heads * d.head_dim, kv_out = d.kv_heads * d.head_dim;
     {
-        std::string tok_why;
-        const std::string tok = find_token_fconst(pack_dir, &tok_why);
+        const std::string& tok = tok_path;
         const int64_t tile_bytes = attn_tile_bytes(H);
         if (tok.empty()) {
             p.attn_note = tok_why;
@@ -1345,12 +1371,47 @@ Plan plan(const std::string& pack_dir) {
                                      std::to_string(bits.begin()->first) +
                                      "), and the 4-bit two-codes-per-byte packing is what this importer decodes");
     }
+    // Genre A: those projections are not in a .fconst at all -- they are the graph's own initializers, so the
+    // refusal says that and names the one it found rather than repeating a .fconst message that is untrue for
+    // this pack. The reader that consumes them is the next item; nothing here claims they are importable.
+    auto graph_weight_refusal = [&](const std::string& proj) -> std::string {
+        if (!graph_weights) return std::string();
+        const auto it = graph_projs.find(proj);
+        if (it == graph_projs.end())
+            return "the graph carries no " + proj + ".MatMulNBits.qweight";
+        const std::string qw = proj + ".MatMulNBits.qweight";
+        const auto ti = onnx.index.find(qw);
+        std::string where = "the graph's own initializer";
+        if (ti != onnx.index.end()) {
+            const OnnxTensor& t = onnx.tensors[ti->second];
+            if (!t.location.empty())
+                where = t.location + " + " + std::to_string((unsigned long long)t.offset) + " B";
+            if (t.dims.size() == 3)   // [N, K/block, block/2]: 64 B = 128 four-bit codes
+                where += " [N=" + std::to_string(t.dims[0]) + " K=" + std::to_string(t.dims[1] * 128) + "]";
+        }
+        return "weights are in " + where + " -- the graph-initializer reader is not implemented yet (this pack is "
+               "not a .fconst pack)";
+    };
     for (int L = 0; L < d.layers; ++L)
         for (const auto& pr : projs) {
             const std::string name = "model.layers." + std::to_string(L) + "." + pr.suffix + ".weight";
             auto x = make(name, "fconst:Llm_Token_Token", "q4_1", {pr.rows, pr.cols});
             const bool attention = std::string(pr.suffix).compare(0, 9, "self_attn") == 0;
-            if (!attention) x.refusal = p.mlp_note;
+            // The pack names the attention projections `layers.N.attn.*` (not `self_attn`), o_proj carries its own
+            // initializer, and q/k/v have none because they are the FUSED qkv_proj MatMulNBits -- so a q/k/v
+            // refusal has to name that node (and the split by head geometry that is still to come) rather than
+            // hunt for an initializer that was never written.
+            std::string ga_proj;
+            if (attention) {
+                const std::string leaf = std::string(pr.suffix).substr(10);   // q_proj / k_proj / v_proj / o_proj
+                ga_proj = "model.layers." + std::to_string(L) + ".attn." +
+                          (leaf == "o_proj" ? leaf : std::string("qkv_proj"));
+            } else {
+                ga_proj = "model.layers." + std::to_string(L) + "." + std::string(pr.suffix);
+            }
+            const std::string ga = graph_weight_refusal(ga_proj);
+            if (graph_weights) x.refusal = ga;
+            else if (!attention) x.refusal = p.mlp_note;
             else if (!p.attn_note.empty()) x.refusal = p.attn_note;
             const std::string key = "model.layers." + std::to_string(L) + "." + pr.suffix;
             if (const auto it = declared.find(key); it != declared.end()) {

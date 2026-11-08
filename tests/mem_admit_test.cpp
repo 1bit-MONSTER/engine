@@ -47,6 +47,12 @@ struct Gguf {
         ++n_kv;
         return *this;
     }
+    Gguf& bools(const std::string& k, const std::vector<bool>& v) {  // GGUF type 7: how llama.cpp writes a pattern
+        str(k); raw<uint32_t>(9); raw<uint32_t>(7); raw<uint64_t>(v.size());
+        for (bool x : v) { const uint8_t b = x ? 1 : 0; raw(b); }
+        ++n_kv;
+        return *this;
+    }
     Gguf& vocab(size_t n) {  // a tokenizer-sized string array the reader must get through
         str("tokenizer.ggml.tokens"); raw<uint32_t>(9); raw<uint32_t>(8); raw<uint64_t>(n);
         for (size_t i = 0; i < n; ++i) str("tok" + std::to_string(i));
@@ -144,6 +150,36 @@ int main() {
         .u32("gpt-oss.attention.sliding_window", 128).write(d + "/oss.gguf");
     expect_mib("gpt-oss: 12 full layers at 131072 + 12 windowed at 128 + 512", admit::model_need(oss, 131072, 1).kv,
                (12.0 * 131072 + 12.0 * 640) * 8 * 128 * 2 / (1 << 20));
+
+    // engine#1425: flint's sliding-window pattern is a *bool array in the file* (llama.cpp's flint loader
+    // reads LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, conversion/flint.py writes layer_types as bools), not a
+    // "one full layer in N" constant - and the reader used to drop bool arrays on the floor, so every layer
+    // was priced windowed and the estimate never grew with the context. 49 layers, 35 windowed / 14 full.
+    std::vector<bool> flint_pattern(49, true);
+    for (int i = 0; i < 49; i += 7) flint_pattern[size_t(i)] = false;   // 7 full layers (49/7 = 7 of them)
+    const auto flint = Gguf().s("general.architecture", "flint").u32("flint.block_count", 49)
+        .u32("flint.embedding_length", 2048).u32("flint.attention.head_count", 16)
+        .u32("flint.attention.head_count_kv", 4).u32("flint.attention.key_length", 128)
+        .u32("flint.attention.value_length", 128).u32("flint.attention.sliding_window", 4096)
+        .bools("flint.attention.sliding_window_pattern", flint_pattern).write(d + "/flint.gguf");
+    // 49 layers x 4 kv heads x 128 + 128 bytes:
+    const double flint_layer_kvb = 4.0 * 256 * 2;
+    const double flint_full = 7.0 * 262144;                  // the 7 full layers attend over the whole context
+    const double flint_windowed = 42.0 * (4096 + 512);       // the rest see one window per sequence + a ubatch
+    expect_mib("flint: the bool pattern prices its full layers at 262144", admit::model_need(flint, 262144, 1).kv,
+               (flint_full + flint_windowed) * flint_layer_kvb / (1 << 20));
+    // the same header without the pattern is the documented lower bound (every layer windowed); the two
+    // numbers below differ by ~19x, which is the size of the error the fix removes at this context
+    const auto flint_nopat = Gguf().s("general.architecture", "flint").u32("flint.block_count", 49)
+        .u32("flint.embedding_length", 2048).u32("flint.attention.head_count", 16)
+        .u32("flint.attention.head_count_kv", 4).u32("flint.attention.key_length", 128)
+        .u32("flint.attention.value_length", 128).u32("flint.attention.sliding_window", 4096)
+        .write(d + "/flint-nopat.gguf");
+    expect_mib("flint without a pattern: still the lower bound (every layer windowed)",
+               admit::model_need(flint_nopat, 262144, 1).kv, 49.0 * (4096 + 512) * flint_layer_kvb / (1 << 20));
+    // and it must not be flat in context: the whole point of the pattern is that 7 layers scale
+    expect("flint: the estimate grows with the context", admit::model_need(flint, 262144, 1).kv >
+                                                              2.0 * admit::model_need(flint, 8192, 1).kv);
 
     // a split model counts every shard
     Gguf().s("general.architecture", "qwen3").write(d + "/big-00001-of-00002.gguf", 3ull << 30);

@@ -102,7 +102,13 @@ inline GgufHeader read_gguf_header(const std::string& path) {
     };
     static const int size[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
     auto scalar = [](uint32_t t) { return t < 13 ? size[t] : -1; };
-    auto is_int = [](uint32_t t) { return t <= 5 || t == 10 || t == 11; };
+    // bool counts as an integer here: llama.cpp writes `attention.sliding_window_pattern` as an array
+    // of Python bool (gguf_writer.add_sliding_window_pattern -> add_array([...])), i.e. GGUF type 7.
+    // Without it that array was skipped silently for *every* architecture that ships one (flint, qwen,
+    // zaya, mellum, olmo...), so `model_need()` fell back to the per-arch "one full layer in N" list and,
+    // for an arch not on it, priced every layer as windowed - a lower-bound KV estimate on an admission
+    // gate, which is the unsafe direction (engine#1425, the #680 overrun class).
+    auto is_int = [](uint32_t t) { return t <= 5 || t == 7 || t == 10 || t == 11; };
     auto as_int = [](uint32_t t, const unsigned char* b) {
         long long v = 0;
         const int n = size[t];

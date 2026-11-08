@@ -102,6 +102,17 @@ class bo : public npu_rt_api::bo {
 public:
     bo() = default;
     bo(const device& d, size_t size);
+    // A buffer whose memory already exists outside this process (engine#753): `dma_buf_fd` is imported
+    // (DRM PRIME), pinned and mapped so the NPU addresses those pages directly -- nothing is copied.
+    // `host` is the caller's own mapping of the same dma-buf (the exporter's, e.g. amdgpu's or HRX's):
+    // it is the address handed to the device, and nullptr asks for the driver's own mapping, which the
+    // driver then marks invalid (npu_rt.cpp, import_bo).
+    //
+    // The implementation lives with the private runtime (npu_rt_api.cpp in the RT tree), so this
+    // declaration is inert for every build that does not compile that file -- which is why it can land
+    // here ahead of it, and why the RT tree does not build without it: its npu_rt_api.cpp defines this
+    // constructor and no header declared it.
+    bo(const device& d, int dma_buf_fd, size_t size, void* host = nullptr);
 };
 }  // namespace ext
 

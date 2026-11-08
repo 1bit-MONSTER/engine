@@ -165,6 +165,39 @@ int main() {
     expect("flint: the estimate grows with the context",
            admit::model_need(flint, 262144, 1).kv > admit::model_need(flint, 8192, 1).kv);
 
+    // engine#1425: a header with a sliding window and no pattern this reader can use is priced as a lower bound,
+    // and the check must SAY so -- admitting on a floor is the #680 overrun class, and the comment in the code is
+    // not something a planner reads. A pattern array of either type, or a per-arch entry, clears the flag.
+    const auto flint_nopattern = Gguf().s("general.architecture", "flint").u32("flint.block_count", 49)
+        .u32("flint.embedding_length", 4096).u32("flint.attention.head_count", 32)
+        .u32("flint.attention.head_count_kv", 8).u32("flint.attention.key_length", 128)
+        .u32("flint.attention.value_length", 128).u32("flint.attention.sliding_window", 4096)
+        .write(d + "/flint-nopattern.gguf");
+    expect("no pattern array, unlisted arch: the need is flagged a lower bound",
+           admit::model_need(flint_nopattern, 262144, 1).kv_lower_bound);
+    expect("a bool pattern array clears the flag", !admit::model_need(flint, 262144, 1).kv_lower_bound);
+    expect("the per-arch list clears the flag", !admit::model_need(oss, 131072, 1).kv_lower_bound);
+    {   // the int32 form too: gguf-py writes an int for the single-interval pattern
+        std::vector<int32_t> i32(flint_pat.begin(), flint_pat.end());
+        const auto flint_int = Gguf().s("general.architecture", "flint").u32("flint.block_count", 49)
+            .u32("flint.embedding_length", 4096).u32("flint.attention.head_count", 32)
+            .u32("flint.attention.head_count_kv", 4).u32("flint.attention.key_length", 128)
+            .u32("flint.attention.value_length", 128).u32("flint.attention.sliding_window", 4096)
+            .i32s("flint.attention.sliding_window_pattern", i32).write(d + "/flint-i32.gguf");
+        expect("an int32 pattern prices the same as the bool one",
+               admit::model_need(flint_int, 262144, 1).kv == admit::model_need(flint, 262144, 1).kv);
+        expect("an int32 pattern clears the flag too", !admit::model_need(flint_int, 262144, 1).kv_lower_bound);
+    }
+    {
+        admit::Need lb;
+        admit::add_llama_server(lb, {"llama-server", "-m", flint_nopattern, "-c", "262144"});
+        std::string joined;
+        for (const auto& p : lb.parts) joined += p + " | ";
+        expect("the message names it a lower bound and whose pattern is missing",
+               joined.find("LOWER BOUND") != std::string::npos &&
+                   joined.find("flint's sliding-window pattern") != std::string::npos);
+    }
+
     // a split model counts every shard
     Gguf().s("general.architecture", "qwen3").write(d + "/big-00001-of-00002.gguf", 3ull << 30);
     Gguf().write(d + "/big-00002-of-00002.gguf", 2ull << 30);

@@ -198,6 +198,11 @@ struct ModelNeed {
     long long n_ctx = 0;       // the context the estimate is for
     bool ctx_from_model = false;
     uint64_t weights = 0, kv = 0, state = 0;
+    // The model has a sliding window this code cannot price: no pattern array this reader can use and the
+    // architecture is not in the per-architecture list, so every layer is counted as windowed and kv is a LOWER
+    // BOUND (engine#1425). The comment below has said so for a while; a planner cannot see a comment, and
+    // admitting on a floor is the #680 overrun class -- so the check's message says it too.
+    bool kv_lower_bound = false;
 };
 
 // One model's weights, KV and recurrent state for a context of n_ctx tokens (0: the model's own,
@@ -235,10 +240,12 @@ inline ModelNeed model_need(const std::string& path, long long n_ctx, int n_seq,
         else if (h.arch == "gemma3n") every = 5;
         else if (h.arch == "gemma3") every = 6;
         full_share = every > 0 ? 1.0 / double(every) : 0.0;
+        m.kv_lower_bound = every == 0;
         if (const auto* pat = h.array("attention.sliding_window_pattern"); pat && !pat->empty()) {
             long long windowed = 0;
             for (long long x : *pat) windowed += x != 0;
             full_share = 1.0 - double(windowed) / double(pat->size());
+            m.kv_lower_bound = false;   // the file said which layers are full
         }
     }
     const double tokens = full_share * double(n_ctx) + (1 - full_share) * double(swa_tokens);
@@ -311,7 +318,10 @@ inline void add_llama_server(Need& need, const std::vector<std::string>& argv, u
     if (need.n_ctx == 0) { need.n_ctx = m.n_ctx; need.ctx_from_model = m.ctx_from_model && n_ctx <= 0; }
     auto gib = [](uint64_t b) { char s[32]; std::snprintf(s, sizeof s, "%.2f", double(b) / double(kGiB)); return std::string(s); };
     const std::string name = std::filesystem::path(model).filename().string();
-    need.parts.push_back(name + ": weights " + gib(m.weights) + " + KV/state " + gib(m.kv + m.state) + " + compute " + gib(compute));
+    need.parts.push_back(name + ": weights " + gib(m.weights) + " + KV/state " + gib(m.kv + m.state) + " + compute " + gib(compute) +
+                         (m.kv_lower_bound ? " (KV/state is a LOWER BOUND: " + m.arch +
+                                                 "'s sliding-window pattern is unknown, so full-attention layers are priced as windowed)"
+                                           : std::string()));
     need.total += m.weights + m.kv + m.state + compute;
     const std::string draft = arg({"-md", "--model-draft"});
     if (!draft.empty()) {

@@ -121,8 +121,12 @@ change a pick.
   columns are unaffected**, and that is measured rather than argued: the rebuilt BF16 run against the **old** base logits gives
   **mean KLD 0.000000 / same-top-p 100.000 %** over 8192 tokens with the recorded PPLs reproduced (8.502790 and 16.793681), so the
   two layouts are the same model. Curve-arm sizes that were not re-quantized are still the pre-dedup figures and are marked as such.
-  `gate_up`/`ffn_up` stays per layer because it is 13 distinct values on the 7B and 9 on the 2.7B (a per-layer adapter baked into the
-  matrix) — that residual is cause 2 of #1036 and is a graph change, not a converter fix.
+  `gate_up`/`ffn_up` used to stay per layer because it is 13 distinct values on the 7B and 9 on the 2.7B (a per-layer adapter baked into
+  the matrix). **That residual has since been fixed as well**: fork **#218** (`21c814079`, engine #1036 cause 2) stores the shared base once and
+  each layer's low-rank pair separately, applied as `base + B*(A*x)` in the graph, and it **has landed**. So both halves of #1036 are resolved:
+  the layout in the paragraph above (cause 1, fork #203) and the per-layer adapter (cause 2, fork #218). The consequence for a reader is not
+  cosmetic — the adapter form is slightly smaller and not bit-identical, which is why the Zamba2 rows on this page are re-measured in that form and
+  why the 7B's `Q5_K_M` pick was retired; see each model's section.
 - **One measurable side effect of the dedupe, which is not a weight change: `Q5_K_M`'s KLD moved 0.019890 → 0.019361 and its PPL
   7.759 → 7.727.** `llama-quantize` upgrades a `Q5_K_M` tensor to `q6_K` by *position* (`use_more_bits(i_attention_wv, n_attention_wv)`),
   so the shared `attn_v` tensor's type depends on how many copies of it the file contains: with 13 copies, 6 of them got `q6_K`; with the

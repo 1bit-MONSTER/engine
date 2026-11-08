@@ -221,6 +221,8 @@ set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
 # layouts: no root, no mounts, no device, no VM.
 add_test(NAME one_bit_update_slots
          COMMAND sh ${CMAKE_SOURCE_DIR}/tests/one_bit_update_slots_test.sh ${CMAKE_SOURCE_DIR})
+add_test(NAME one_bit_network_conf
+         COMMAND sh ${CMAKE_SOURCE_DIR}/tests/one_bit_network_conf_test.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME npu_import_contract
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_import_contract.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(npu_import_contract PROPERTIES SKIP_RETURN_CODE 77)

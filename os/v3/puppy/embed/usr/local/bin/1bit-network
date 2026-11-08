@@ -1,0 +1,216 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-network show                 what the machine's address is now, and what /data/net.conf asks for
+# 1bit-network set-static <addr/prefix> [gateway] [dns...]
+#                                   persist a static address on this install and apply it now
+# 1bit-network reset                forget it: back to DHCP (the recovery command for a wrong address)
+# 1bit-network --check              parse /data/net.conf and say what would be applied, changing nothing
+#
+# The appliance takes its address from connman (DHCP). A server also wants the *option* of a fixed address, and the
+# console's own "set a static address" is deliberately session-only - a wrong address on a headless box is a walk to
+# the machine. So the fixed address lives in ONE file on the data partition, `/data/net.conf`, which survives an
+# appliance update because it is not on the OS set, and `reset` - or deleting that file - is the whole recovery, from
+# tty1, the serial console or the console menu.
+#
+# connman owns the interface on this base, so the address is set with connman's own CLI (`connmanctl config <service>
+# --ipv4 manual ...`): poking `ip addr add` behind connman's back gets undone the next time connman touches the link.
+# `ip` is the fallback for a boot where connman has no service for that interface yet.
+#
+# Exit: 0 done, 1 usage, 2 refused (bad or unsafe input, nothing written), 3 failed while applying.
+set -u
+
+DATA=/data
+CONF=$DATA/net.conf
+LOG=/var/log/1bit-network.log
+say() { printf '%s\n' "$*" | tee -a "$LOG"; }
+die() { say "1bit-network: REFUSED: $*" >&2; exit 2; }
+fail() { say "1bit-network: FAILED: $*" >&2; exit 3; }
+usage() { sed -n '/^# 1bit-network show/,/^# Exit:/p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ── the file: one `key=value` per line, nothing else. Pure functions, so tests/one_bit_network_conf_test.sh can run
+# them without root, an interface or a VM (ONEBIT_NETWORK_LIB=1 stops before anything is applied).
+valid_addr() {   # $1 addr/prefix -> 0 when it is IPv4 with a prefix 1..32
+    case $1 in
+        *[!0-9./]*|"") return 1 ;;
+    esac
+    case $1 in
+        */*) ;;
+        *) return 1 ;;
+    esac
+    ip=${1%/*}; pfx=${1#*/}
+    case $pfx in
+        ""|*[!0-9]*) return 1 ;;
+    esac
+    [ "$pfx" -ge 1 ] && [ "$pfx" -le 32 ] || return 1
+    oldifs=$IFS; IFS=.
+    set -- $ip
+    IFS=$oldifs
+    [ $# -eq 4 ] || return 1
+    for o in "$@"; do
+        case $o in
+            ""|*[!0-9]*) return 1 ;;
+        esac
+        [ "$o" -le 255 ] || return 1
+    done
+    return 0
+}
+valid_ip() {     # $1 plain IPv4
+    valid_addr "$1/32" 2> /dev/null
+}
+valid_iface() {  # $1 interface name that the kernel knows
+    [ -n "$1" ] || return 1
+    case $1 in
+        *[!a-zA-Z0-9_.:-]*) return 1 ;;
+    esac
+    [ -e "/sys/class/net/$1" ]
+}
+# read_conf FILE: sets iface/static/gateway/dns from the file, refusing anything that is not one of the four keys
+read_conf() {
+    iface=''; static=''; gateway=''; dns=''
+    [ -f "$1" ] || return 0
+    while IFS= read -r line; do
+        case $line in
+            ''|'#'*) continue ;;
+        esac
+        key=${line%%=*}
+        val=${line#*=}
+        case $key in
+            iface) iface=$val ;;
+            static) static=$val ;;
+            gateway) gateway=$val ;;
+            dns) dns=$val ;;
+            *) echo "1bit-network: ignoring unknown key '$key' in $1" >&2 ;;
+        esac
+    done < "$1"
+    return 0
+}
+conf_ok() {      # the loaded values have to be usable, or the boot must not touch the network at all
+    valid_iface "${iface:-}" || { echo "iface '${iface:-}' is not an interface on this machine"; return 1; }
+    valid_addr "${static:-}" || { echo "static '${static:-}' is not IPv4 addr/prefix"; return 1; }
+    [ -z "${gateway:-}" ] || valid_ip "$gateway" || { echo "gateway '${gateway:-}' is not an IPv4 address"; return 1; }
+    for d in ${dns:-}; do
+        valid_ip "$d" || { echo "dns '$d' is not an IPv4 address"; return 1; }
+    done
+    return 0
+}
+# on this boot: the interface that carries the default route, else the first one that is not loopback and is up
+default_iface() {
+    dev=$(ip route show default 2> /dev/null | awk '/^default/ { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+    [ -n "$dev" ] && { echo "$dev"; return 0; }
+    for d in /sys/class/net/*; do
+        n=$(basename "$d")
+        [ "$n" = lo ] && continue
+        [ "$(cat "$d/operstate" 2> /dev/null)" = up ] && { echo "$n"; return 0; }
+    done
+    return 1
+}
+
+# sourced by tests with ONEBIT_NETWORK_LIB=1: the functions above, nothing below
+if [ "${ONEBIT_NETWORK_LIB:-}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
+
+mkdir -p /tmp 2> /dev/null
+: >> "$LOG" 2> /dev/null || LOG=/dev/null
+
+mode=show
+case "${1:-show}" in
+    -h|--help|help) usage; exit 0 ;;
+    show|--status) mode=show ;;
+    --check) mode=check ;;
+    set-static) mode=set-static ;;
+    reset|--reset) mode=reset ;;
+    *) usage >&2; exit 1 ;;
+esac
+
+if [ "$mode" = show ]; then
+    say "1bit-network: $(hostname 2> /dev/null), interface $(default_iface 2> /dev/null || echo '<none>')"
+    ip -4 -o addr show 2> /dev/null | awk '{ print "  " $2 " " $4 }' | tee -a "$LOG"
+    ip route show default 2> /dev/null | sed 's/^/  default: /' | tee -a "$LOG"
+    if [ -f "$CONF" ]; then
+        read_conf "$CONF"
+        say "  $CONF: iface=$iface static=$static gateway=${gateway:--} dns=${dns:--}"
+    else
+        say "  $CONF: absent (DHCP)"
+    fi
+    exit 0
+fi
+
+if [ "$mode" = check ]; then
+    [ -f "$CONF" ] || { say "1bit-network: no $CONF: DHCP"; exit 0; }
+    read_conf "$CONF"
+    if why=$(conf_ok 2>&1); then
+        say "1bit-network: $CONF parses: iface=$iface static=$static gateway=${gateway:--} dns=${dns:--}"
+        exit 0
+    fi
+    say "1bit-network: $CONF is not usable: $why (the boot would leave the network alone)" >&2
+    exit 2
+fi
+
+if [ "$mode" = reset ]; then
+    read_conf "$CONF"
+    rm -f "$CONF" || fail "cannot remove $CONF"
+    # give the interface back to DHCP through connman, so a wrong address really is gone and not just forgotten
+    if [ -n "${iface:-}" ] && command -v connmanctl > /dev/null 2>&1; then
+        svc=$(connmanctl services 2> /dev/null | awk -v i="$iface" '
+            /^\*/ { name = $2; mac = $3 }
+            NF == 1 && name { print name; exit }
+            { }' | head -1)
+        [ -n "$svc" ] && connmanctl config "$svc" --ipv4 dhcp >> "$LOG" 2>&1 && \
+            say "1bit-network: $svc back to DHCP"
+    fi
+    say "1bit-network: reset - $CONF removed, the next boot and this one use DHCP"
+    say "  (if the link still carries the old address, restart the network:  /etc/init.d/connman restart)"
+    exit 0
+fi
+
+# ── set-static
+[ "$(id -u)" = 0 ] || die "run as root (it writes $CONF and reconfigures the interface)"
+[ $# -ge 2 ] || die "usage: 1bit-network set-static <addr/prefix> [gateway] [dns...]"
+[ -d "$DATA" ] && grep -q " $DATA " /proc/mounts 2> /dev/null || \
+    die "no $DATA: a static address only persists on an installed machine (a stick forgets by design)"
+addr=$2; gw=${3:-}; shift 2; [ $# -gt 0 ] && shift; dnsv="$*"
+valid_addr "$addr" || die "'$addr' is not IPv4 with a prefix (e.g. 192.168.50.20/24)"
+[ -z "$gw" ] || valid_ip "$gw" || die "gateway '$gw' is not an IPv4 address"
+for d in $dnsv; do valid_ip "$d" || die "dns '$d' is not an IPv4 address"; done
+[ -n "$gw" ] || say "1bit-network: no gateway given: the machine will keep its current default route"
+dev=$(default_iface) || die "no interface is up, so there is nothing to give an address to (plug the cable in first)"
+valid_iface "$dev" || die "'$dev' is not an interface"
+
+# a static address without the machine's own subnet gateway is the classic way to lock yourself out: say it once
+case " $addr " in
+    *"/32 "*) say "1bit-network: WARNING: a /32 has no on-link neighbours: only the gateway will be reachable" ;;
+esac
+
+tmp=$CONF.tmp
+{
+    echo "# written by 1bit-network on $(date -u +%FT%TZ); applied at boot by /etc/init.d/14onboard-net"
+    echo "# recovery: 1bit-network reset   (from tty1, the serial console or the console menu)"
+    echo "iface=$dev"
+    echo "static=$addr"
+    [ -n "$gw" ] && echo "gateway=$gw"
+    [ -n "$dnsv" ] && echo "dns=$dnsv"
+} > "$tmp" || fail "cannot write $tmp"
+mv -f "$tmp" "$CONF" || fail "cannot install $CONF"
+sync
+say "1bit-network: persisted to $CONF (iface=$dev static=$addr gateway=${gw:--} dns=${dnsv:--})"
+
+/etc/init.d/14onboard-net start || fail "applied the file but the interface did not take the address (see $LOG)"
+if ip -4 -o addr show dev "$dev" 2> /dev/null | grep -q " ${addr%/*}/"; then
+    say "1bit-network: $dev carries ${addr} now, and will again at the next boot"
+    [ -z "$gw" ] || say "  gateway $gw"
+    exit 0
+fi
+fail "$dev does not carry ${addr%/*} after applying $CONF (see $LOG)"

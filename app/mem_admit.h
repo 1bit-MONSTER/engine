@@ -68,7 +68,8 @@ inline uint64_t gtt_reserve_bytes() {
     return kGttReserveDefaultMiB * kMiB;
 }
 
-// The metadata a size estimate needs: integer scalars, integer arrays and general.architecture.
+// The metadata a size estimate needs: integer scalars, integer and bool arrays (a bool reads as 0/1:
+// converters write attention.sliding_window_pattern as bools, engine #1425) and general.architecture.
 struct GgufHeader {
     bool ok = false;
     std::string arch;
@@ -102,7 +103,7 @@ inline GgufHeader read_gguf_header(const std::string& path) {
     };
     static const int size[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
     auto scalar = [](uint32_t t) { return t < 13 ? size[t] : -1; };
-    auto is_int = [](uint32_t t) { return t <= 5 || t == 10 || t == 11; };
+    auto is_int = [](uint32_t t) { return t <= 5 || t == 7 || t == 10 || t == 11; };  // 7: bool, one byte
     auto as_int = [](uint32_t t, const unsigned char* b) {
         long long v = 0;
         const int n = size[t];

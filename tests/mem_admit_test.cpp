@@ -47,6 +47,12 @@ struct Gguf {
         ++n_kv;
         return *this;
     }
+    Gguf& bools(const std::string& k, const std::vector<bool>& v) {  // GGUF type 7, one byte each
+        str(k); raw<uint32_t>(9); raw<uint32_t>(7); raw<uint64_t>(v.size());
+        for (bool x : v) raw<uint8_t>(x ? 1 : 0);
+        ++n_kv;
+        return *this;
+    }
     Gguf& vocab(size_t n) {  // a tokenizer-sized string array the reader must get through
         str("tokenizer.ggml.tokens"); raw<uint32_t>(9); raw<uint32_t>(8); raw<uint64_t>(n);
         for (size_t i = 0; i < n; ++i) str("tok" + std::to_string(i));
@@ -144,6 +150,19 @@ int main() {
         .u32("gpt-oss.attention.sliding_window", 128).write(d + "/oss.gguf");
     expect_mib("gpt-oss: 12 full layers at 131072 + 12 windowed at 128 + 512", admit::model_need(oss, 131072, 1).kv,
                (12.0 * 131072 + 12.0 * 640) * 8 * 128 * 2 / (1 << 20));
+
+    // flint (engine #1425): no per-arch rule; the converter writes the pattern as a bool array
+    // (true = sliding), here 35 windowed and 14 full layers. The 14 must be priced at n_ctx.
+    std::vector<bool> pat;
+    for (int i = 0; i < 49; i++) pat.push_back(i % 7 != 3 && i % 7 != 6);
+    const auto flint = Gguf().s("general.architecture", "flint").u32("flint.block_count", 49)
+        .u32("flint.embedding_length", 2048).u32("flint.attention.head_count", 16).u32("flint.attention.head_count_kv", 4)
+        .u32("flint.attention.key_length", 128).u32("flint.attention.value_length", 128)
+        .u32("flint.attention.sliding_window", 4096).bools("flint.attention.sliding_window_pattern", pat)
+        .write(d + "/flint.gguf");
+    expect_mib("flint: 14 full layers at 262144 + 35 windowed at 4096 + 512", admit::model_need(flint, 262144, 1).kv,
+               (14.0 * 262144 + 35.0 * 4608) * 4 * 256 * 2 / (1 << 20));
+    expect("flint: the KV grows with the context", admit::model_need(flint, 262144, 1).kv > 4 * admit::model_need(flint, 8192, 1).kv);
 
     // a split model counts every shard
     Gguf().s("general.architecture", "qwen3").write(d + "/big-00001-of-00002.gguf", 3ull << 30);

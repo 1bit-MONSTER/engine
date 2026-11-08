@@ -104,7 +104,9 @@ The estimate (`app/mem_admit.h`) reads only the GGUF header, the way `tools/mem-
   rope dimensions once. Qwen3.5 / 3.8 / Next attend in one layer of `full_attention_interval`.
   Per-layer `head_count_kv` arrays count only the layers with heads. Sliding-window layers count
   the window per sequence plus a ubatch, with llama.cpp's per-architecture pattern for which
-  layers are windowed (gpt-oss and Gemma 2: every other layer; Gemma 3: 5 of 6).
+  layers are windowed (gpt-oss and Gemma 2: every other layer; Gemma 3: 5 of 6). A
+  `sliding_window_pattern` array in the file wins over that list, so a model that carries one
+  (flint: 14 full layers of 49) is priced from its own layout.
 - **state:** the gated delta-net recurrent state, per sequence;
 - **compute:** 512 MiB (HRX measured 20-505 MiB);
 - **extras:** a draft or MTP head (`-md`, with its KV), `--mmproj`.

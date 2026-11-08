@@ -534,6 +534,14 @@ integer datapath exists; what does not exist is a narrower one that multiplies *
 
 #### What the stream is worth at the model level (measured)
 
+**Reading a `[ph]`/`[bs]` row: the first field after the identifiers is `host_gemm`.** A row with
+`host_gemm=1` is a pass that never asked the device — `npu_gemm_rows()` returns to the host GEMM on that
+flag *before* `max_batch_rows()` or the blocked-launch path is consulted, and the flag is set only by
+`init_host()` or `NPU_INFER_HOST_GEMM` — so `n=0` on such a row is a host pass by construction, not a
+device launch that went uncounted (engine#1582, where a prefill row with `n=0` and a decode row with a
+device number were read as a contradiction in one process). `[bs]` also prints `rows_max=`, the widest
+launch the target's kernels take, because a batch wider than it is walked in blocks rather than skipped.
+
 The phase numbers above are the kernel's. The number a user feels is a decode step, and it is the one that
 decided P3: same container file and same engine binary, two weight paths, adjacent windows on one quiet box
 (2026-11-02, three `npu-hold` tickets on `:18099`, `amdxdna` counter 0 in each, seven steady-state tokens per

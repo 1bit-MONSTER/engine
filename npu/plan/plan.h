@@ -194,6 +194,17 @@ struct Plan {
     // need is exactly the silent divergence this layer exists to remove.
     bool designs_agree(const std::vector<Design>& derived, std::string& err) const;
 
+    // Import-time completeness (engine#799, rule (c)): every op the plan names must have its kernel on
+    // disk, in one of `dirs` (the same list the forward would search, first hit wins).  A plan is a
+    // description, so it can be complete as JSON and unservable in fact -- that gap is what this closes,
+    // and it closes it BEFORE anything is opened, naming the design and the artifact it wanted.
+    //
+    // It cannot check the tensors: whether a weight carries its quantization is the container's question
+    // (npu/q4nx.h refuses a tensor it cannot decode), and this layer only sees the plan.  A plan with no
+    // `designs` section passes here -- there is nothing named to be missing, and that is what every plan
+    // written before the section means.
+    bool check_artifacts(const std::vector<std::string>& dirs, std::string& err) const;
+
     bool loaded() const { return !format.empty(); }
 
     // Load and validate.  Throws PlanError naming the field for anything this build cannot run --
@@ -541,6 +552,30 @@ inline bool Plan::designs_agree(const std::vector<Design>& derived, std::string&
                   ") but the plan does not name it";
             return false;
         }
+    }
+    return true;
+}
+
+inline bool Plan::check_artifacts(const std::vector<std::string>& dirs, std::string& err) const {
+    if (designs.empty()) return true;   // nothing named, nothing to be missing
+    if (dirs.empty()) {
+        err = "plan designs: there is no kernel directory to look the artifacts up in";
+        return false;
+    }
+    for (size_t i = 0; i < designs.size(); i++) {
+        const Design& d = designs[i];
+        bool found = false;
+        for (const std::string& root : dirs) {
+            if (root.empty()) continue;
+            std::ifstream f(root + "/" + d.elf, std::ios::binary);
+            if (!f) continue;
+            f.seekg(0, std::ios::end);
+            if (f.tellg() >= 1) { found = true; break; }   // present and non-empty, like the forward's probe
+        }
+        if (found) continue;
+        err = "plan designs[" + std::to_string(i) + "] (" + d.role + "): the artifact \"" + d.elf +
+              "\" is in none of " + std::to_string(dirs.size()) + " kernel dir(s) -- this op has no kernel here";
+        return false;
     }
     return true;
 }

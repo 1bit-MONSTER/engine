@@ -486,12 +486,83 @@ void test_designs() {
     }
 }
 
+// ---- import-time completeness: every named op has its kernel on disk (engine#799 rule (c)) ----
+//
+// The plan can be complete as JSON and unservable in fact. These cases pin that the load-time check says
+// so, naming the design and the artifact, before anything is opened.
+void test_artifacts() {
+    auto with_designs = [] {
+        auto p = base_plan();
+        p["designs"] = nlohmann::json::array();
+        p["designs"].push_back({{"role", "QKV"}, {"M", 128}, {"K", 1024}, {"N", 4096},
+                                {"elf", "full_i8_QKV_K1024_N4096.elf"}});
+        p["designs"].push_back({{"role", "O"}, {"M", 128}, {"K", 2048}, {"N", 1024},
+                                {"elf", "full_i8_O_K2048_N1024.elf"}});
+        return p;
+    };
+    const Plan p = Plan::load(write_plan("artifacts", with_designs()));
+    const fs::path root = fs::temp_directory_path() / "npu_plan_test_artifacts";
+    const fs::path kdir = root / "kernels";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(kdir, ec);
+    auto make_file = [](const std::string& path, size_t bytes) {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        for (size_t i = 0; i < bytes; i++) f.put(' ');
+    };
+
+    // A plan with no designs has nothing named, so nothing can be missing.
+    {
+        const Plan plain = Plan::load(write_plan("artifacts_plain", base_plan()));
+        std::string why;
+        check(plain.check_artifacts({kdir.string()}, why), "a plan with no designs section is complete");
+    }
+    // Both artifacts present -> complete.
+    {
+        for (const char* n : {"full_i8_QKV_K1024_N4096.elf", "full_i8_O_K2048_N1024.elf"})
+            make_file((kdir / n).string(), 8);
+        std::string why;
+        check(p.check_artifacts({kdir.string()}, why), "both artifacts on disk is complete: " + why);
+    }
+    // One missing -> refused, naming the design and the artifact.
+    {
+        fs::remove(kdir / "full_i8_O_K2048_N1024.elf", ec);
+        std::string why;
+        check(!p.check_artifacts({kdir.string()}, why), "a missing artifact is refused");
+        check(has(why, "designs[1]") && has(why, "O") && has(why, "full_i8_O_K2048_N1024.elf"),
+              "the refusal names the design and the artifact: " + why);
+    }
+    // A second directory is searched too (the forward's own first-hit order).
+    const fs::path k2 = root / "kernels-m16";
+    {
+        fs::create_directories(k2, ec);
+        make_file((k2 / "full_i8_O_K2048_N1024.elf").string(), 8);
+        std::string why;
+        check(p.check_artifacts({kdir.string(), k2.string()}, why),
+              "the second directory is searched as well: " + why);
+    }
+    // An empty file is not a kernel -- same >= 1 byte rule the forward's probe uses.
+    {
+        std::ofstream((k2 / "full_i8_O_K2048_N1024.elf").string(), std::ios::binary | std::ios::trunc);
+        fs::remove(kdir / "full_i8_O_K2048_N1024.elf", ec);
+        std::string why;
+        check(!p.check_artifacts({kdir.string(), k2.string()}, why), "a zero-byte artifact is refused");
+    }
+    // No directory at all is a refusal that says so, not a crash.
+    {
+        std::string why;
+        check(!p.check_artifacts({}, why), "no kernel directory is refused");
+        check(has(why, "no kernel directory"), "the refusal says there was nowhere to look: " + why);
+    }
+}
+
 int main() {
     test_valid();
     test_kv();
     test_tile_order();
     test_refusals();
     test_designs();
+    test_artifacts();
     std::printf("%s\n", failures ? "FAILED" : "npu_plan: ok");
     return failures ? 1 : 0;
 }

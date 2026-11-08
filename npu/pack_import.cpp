@@ -2347,6 +2347,26 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             }
         }
         c["rms_norm_eps"] = p.dims.rms_norm_eps;
+        // The kernel family this container was imported for, so a serve that derives a different one refuses instead of
+        // answering garbage (the forward compares this exact string). Shape per role, in the order the importer plans
+        // them: QKV is the fused q|k|v width, GU the fused gate|up width, both on the padded K grid.
+        {
+            // The forward's own grids (npu/forward/include/q4nx_pack.h): K pads to the 256-column grid, N to the
+            // 512-column one. Spelled out here because the importer is a different build target from that helper;
+            // the forward compares this exact string, so a drift between the two shows up as a refusal (loud)
+            // rather than as wrong text (silent). Verified against both packs' `derived 4 designs` lines:
+            // SmolLM2 QKV 768x1024 / O 768x1024 / GU 768x3072 / D 1536x1024; Qwen2.5-0.5B 1024x1536 / 1024x1024 /
+            // 1024x9728 / 4864x1024.
+            auto pad_k = [](int k) { return (k + 255) / 256 * 256; };
+            auto pad_n = [](int n) { return (n + 511) / 512 * 512; };
+            const int kpad = pad_k(p.dims.hidden);
+            const int q_out = p.dims.heads * p.dims.head_dim, kv_out = p.dims.kv_heads * p.dims.head_dim;
+            c["q4nx_designs"] = "QKV:" + std::to_string(kpad) + "x" + std::to_string(pad_n(q_out + 2 * kv_out)) +
+                                ",O:" + std::to_string(kpad) + "x" + std::to_string(pad_n(p.dims.hidden)) +
+                                ",GU:" + std::to_string(kpad) + "x" + std::to_string(pad_n(2 * p.dims.intermediate)) +
+                                ",D:" + std::to_string(pad_k(p.dims.intermediate)) + "x" +
+                                std::to_string(pad_n(p.dims.hidden));
+        }
         // The stop tokens: `load_geometry` already copied eos/bos/pad and `architectures` out of the pack's
         // genai_config.json (these packs ship NO generation_config.json -- I had assumed they did), and read_dims
         // parsed eos into p.dims. This line is the belt: whatever the plan resolved wins over the raw metadata.

@@ -656,6 +656,27 @@ memlock_verdict() {
         "$_p" "$_v" "${_f:+ (highest-numbered memlock file: $_f)}"
 }
 
+# ── the payload NAME the identity file states (engine#1557) ────────────────────────────────────
+# `engine_sha256` is computed from a file: it cannot be inherited stale, and the row above compares it with the shipped
+# bytes. `payload=` is not: os/v3/puppy/container-build.sh:349 writes `payload=${PAYLOAD_NAME:-unknown}`, an ENVIRONMENT
+# input, and os/mini/mkimage.sh writes the payload directory the cut was given. One wrong (or unset) PA YLOAD_NAME
+# therefore produces a HALF-TRUE identity - a correct engine sha beside a wrong name - which is the shape engine#1481
+# survived two cycles with.
+#
+# What the image alone can settle is the "not stated" case, and that is what this row checks: a name that is empty or
+# literally `unknown` is a cut that did not tell the file which payload it shipped. It cannot check "stated wrongly":
+# the image carries no authority for the name (measured - the payload tree has no name-bearing file, and the tarball stem
+# lives in the bundle, not in the image), so comparing against a typed string would be the same defect one level up.
+# Pure, so --self-test drives it: <the payload= value, or empty>
+payload_name_verdict() {
+    _n=${1:-}
+    case "$_n" in
+        '')      printf 'FAIL the identity file states no payload= at all, so nothing in the image says which payload it carries' ;;
+        unknown) printf 'FAIL the identity file states payload=unknown - the cut did not pass PAYLOAD_NAME (os/v3/puppy/container-build.sh:349 writes %%s), so the name is unset while the engine_sha256 beside it is computed and correct: a half-true identity' '${PAYLOAD_NAME:-unknown}' ;;
+        *)       printf 'PASS the identity file names the payload it carries (%s); that name is DECLARED by the cut, not checked against the bytes - this row catches "not stated", and "stated wrongly" needs an authority the image does not carry (engine#1557)' "$_n" ;;
+    esac
+}
+
 payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
     _f=${1:-} _d=${2:-} _sample=${3:-}
     case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
@@ -762,6 +783,12 @@ if [ "${1:-}" = --self-test ]; then
     check SKIP "$(memlock_verdict '' '')"                                                       # nothing running: say so, do not pass
     check FAIL "$(memlock_verdict '' lemond)"                                                   # running but unreadable: unknown is not a pass
     check FAIL "$(memlock_verdict 'lots' lemond)"                                               # nonsense is a fail, not a skip
+    check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33)"
+    check FAIL "$(payload_name_verdict unknown)"          # the PAYLOAD_NAME-unset shape: half-true identity
+    check FAIL "$(payload_name_verdict '')"               # nothing stated
+    if printf '%s' "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33)" | grep -q 'DECLARED'; then
+        printf 'ok   the PASS line says the name is declared, not checked\n'
+    else printf 'FAIL the PASS line should say the name is declared\n'; rc=1; fi
     check PASS "$(payload_modes_verdict 0 0)"
     check FAIL "$(payload_modes_verdict 134 49)"        # c31/c32's real shape: 134 files AND 49 directories
     check FAIL "$(payload_modes_verdict 0 1)"           # the c33 first cut: no files, the payload ROOT writable
@@ -1997,6 +2024,20 @@ case "$ML" in
     PASS*) pass memlock "${ML#PASS }" ;;
     SKIP*) skip memlock "${ML#SKIP }" ;;
     *)     fail memlock "${ML#FAIL }" ;;
+esac
+
+
+# ── the payload name the identity file declares (engine#1557) ────────────────────────────────────
+if [ -f "$ID" ]; then
+    _pn=$(sed -n 's/^payload=//p' "$ID" 2>/dev/null | head -1)
+    _pnv=$(payload_name_verdict "${_pn:-}")
+else
+    _pnv='SKIP no identity file in this image build, so there is no payload name to read'
+fi
+case "$_pnv" in
+    PASS*) pass payload-name "${_pnv#PASS }" ;;
+    SKIP*) skip payload-name "${_pnv#SKIP }" ;;
+    *)     fail payload-name "${_pnv#FAIL }" ;;
 esac
 
 say ""

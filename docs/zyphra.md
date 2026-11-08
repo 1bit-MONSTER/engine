@@ -244,9 +244,17 @@ have been measured in three windows and answered differently every time.
   float path only needs `% 4` — with no error and a large prefill cost. That mechanism is documented, with the measured numbers and the
   `--tensor-type ffn_gate_up_adapter=f16` remedy, in [`zyphra-models.md`](zyphra-models.md); it is the most likely explanation for the unexplained
   prefill drop noted below, and it is why a throughput row here is inseparable from *which quantizer built it*. **Measured here on 2026-11-08**: two arms
-  that differ *only* in the adapter tensors' type, benched back to back in one ticket — F16 pairs `114.19` tok/s against Q6_K/Q8_0 pairs `14.03` at
-  `-p 8`, i.e. **8.1× for a 50 MiB file difference**. That is a launch-dominated shape, so it is not the ~1.3× that the same trap costs at `pp512`; it is the
-  honest number for "how bad can this get", and the reason a card must name the quantizer, not just the arm.
+  that differ *only* in the adapter tensors' type (F16 ×26 vs Q6_K ×13 + Q8_0 ×13), benched back to back in one ticket and one window —
+
+  | shape | F16 pairs | block-quantized pairs | cost |
+  |---|---|---|---|
+  | `pp8` | 114.19 tok/s | 14.03 tok/s | **8.1×** |
+  | `pp512` | 145.09 tok/s (sd 79.2) | 26.63 tok/s (sd 8.5) | **5.4×** |
+  | `tg128` | 16.50 tok/s | 10.24 tok/s (sd 7.3) | 0.6× — not a stable reading |
+
+  **5.4× at the shape that matters**, for a **50 MiB** difference in a 5.8 GiB file, and the arms differ in nothing else. The independent report from the
+  lane that found the trap measures ~1.3× on its own build and model, so the *size* of the penalty is file- and shape-dependent — but its direction and its
+  cause are not, and no card may quote a `tok/s` for a Zamba2 file without saying which quantizer produced it.
   **And when reporting which file suffered it, quote the types read out of the produced GGUF, never the ones you asked for** — the quantizer substitutes
   per tensor: asking for `ffn_gate_up_adapter=q6_K` yields `_a` = Q6_K but `_b` = **Q8_0**, because the `[128, 28672]` pair's contraction has
   `input_size = 128` and HRX's block-format admission needs `>= 256` while the float predicate needs only `>= 4`. So the pair leaves the device for *any*

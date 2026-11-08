@@ -29,6 +29,8 @@ set -uo pipefail
 
 bin=${1:?usage: metrics_serve.sh path/to/1bit}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound instead of guessing one (engine #1485)
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
 pids=()
@@ -41,27 +43,22 @@ cleanup() {
 trap cleanup EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
-newport() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 export FAKE_BACKEND_EVENTS="$scratch/events"
 # a model id of its own: the start counts live in ~/.local/state/1bit/serve/, removed at exit
 alias=metrics-test-$$-$RANDOM
 statefile() { grep -l "\"model\":\"$alias\"" "$(getent passwd "$(id -u)" | cut -d: -f6)"/.local/state/1bit/serve/*.json 2>/dev/null; }
 
 start() {  # <log> [serve args]
-    port=$(newport)
-    "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port" --alias "$alias" \
+    # --port 0: the kernel picks and serve reports it, so nothing here picks a port and releases it before serve binds
+    # (engine #1444/#1485). A bind failure can no longer be this test colliding with itself.
+    "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port 0 --alias "$alias" \
         --llama-server "$here/fake_backend.py" "${@:2}" >"$1" 2>&1 &
     pid=$!
     pids+=("$pid")
+    port=$(serve_port_wait "$1" "$pid") || { echo "FAIL serve never reported a port"; cat "$1"; exit 1; }
     api="http://127.0.0.1:$port"
     local code=000
     for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.1; done
-    # A server that never came up because it could not bind is a port collision, not a defect in
-    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
-    if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$1"; then
-        echo "FAIL: metrics_serve: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$1" | head -1))"
-        exit 1
-    fi
 }
 metric() {  # <text file> <series with labels>: its value, or "absent"
     python3 - "$1" "$2" <<'PY'

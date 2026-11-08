@@ -88,18 +88,13 @@ chmod +x "$scratch/backend.py"
 
 run() {  # <model> <record> [serve args]: serve with --device ${SERVE_DEVICE:-auto} until the backend has recorded its start
     local port
-    port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    # --port 0: the kernel picks and serve reports it; this test reads the backend's record file, so no readiness
+    # parse is needed, and nothing is picked and released before serve binds (engine #1485)
     env -u GGML_Q4_0_HADAMARD -u GGML_W4A4_TENSORS -u ONEBIT_RECIPE_TEST -u GGML_HRX_GRAPH_PROGRAM_CACHE \
         RECORD="$2" "$bin" serve -m "$1" --device "${SERVE_DEVICE:-auto}" \
-        --port "$port" --llama-server "$scratch/backend.py" "${@:3}" >"$2.log" 2>&1 &
+        --port 0 --llama-server "$scratch/backend.py" "${@:3}" >"$2.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do [ -s "$2" ] && break; sleep 0.1; done
-    # A server that never came up because it could not bind is a port collision, not a defect in
-    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
-    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$2.log"; then
-        echo "FAIL: recipes_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$2.log" | head -1))"
-        exit 1
-    fi
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 field() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$1" "$2"; }
@@ -156,13 +151,12 @@ check "file order: the narrower gguf_keys recipe wins (2, once) on a file that c
 run "$scratch/plainq35.gguf" "$scratch/gk-order-plain.json" --recipes "$scratch/gkorder.json"
 check "  and the broader one still applies without the key" '[ "$(after "$scratch/gk-order-plain.json" --spec-draft-n-max)" = 3 ] && grep -q "recipe gkg" "$scratch/gk-order-plain.json.log"'
 
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-bad=$(timeout 20 "$bin" serve -m "$scratch/plain.gguf" --device auto --port "$port" --llama-server "$scratch/backend.py" \
+# serve exits on the malformed recipe before it binds anything, so no port is needed here
+bad=$(timeout 20 "$bin" serve -m "$scratch/plain.gguf" --device auto --port 0 --llama-server "$scratch/backend.py" \
       --recipes "$scratch/bad.json" 2>&1)
 check "a malformed recipe file stops serve with the reason" '[[ "$bad" == *"unknown match key \"archtecture\""* ]]'
 
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-badk=$(timeout 20 "$bin" serve -m "$scratch/plain.gguf" --device auto --port "$port" --llama-server "$scratch/backend.py" \
+badk=$(timeout 20 "$bin" serve -m "$scratch/plain.gguf" --device auto --port 0 --llama-server "$scratch/backend.py" \
        --recipes "$scratch/gkbad.json" 2>&1)
 check "a non-list gguf_keys stops serve with the reason" '[[ "$badk" == *"match.gguf_keys is not a list"* ]]'
 

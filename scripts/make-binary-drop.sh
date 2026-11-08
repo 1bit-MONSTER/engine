@@ -211,6 +211,17 @@ echo "  MANIFEST: $(grep -cE '^[0-9a-f]{64}  ' "$stage/MANIFEST") files, pins en
 [ -f "$stage/MANIFEST" ] || fail "MANIFEST was not written"
 [ $bad = 0 ] && echo "  checks: ok" || die "checks failed, nothing written"
 
+# ── the modes, then the tarball and its SHA256SUMS ──────────────────────────────────────────────
+# A file mode in the drop is THIS script's decision, not its inputs' (engine#1352).  That matters more here than in
+# the two sites already fixed: --build stages straight out of a build tree, and measured on a real one
+# (rlk-build/hrx/llama/bin) all 13 files are 0775, so a drop built that way ships 0775 binaries; --from-package
+# inherits whatever an already-published tarball had, including one packed before #1361/#1360.  Measured, not assumed:
+# the same class shipped 134 of 195 files writable in c31 and c32.
+pack_normalise_modes "$stage"
+modes_bad=$(pack_writable_files "$stage")
+[ -z "$modes_bad" ] || die "files still group/ or other-writable after normalising:
+$modes_bad"
+
 # ── the tarball and its SHA256SUMS ──────────────────────────────────────────────────────────────
 name=binary-drop-$version
 # Rebuild cleanly: the target is this script's own output, and zstd refuses an existing one.

@@ -359,7 +359,7 @@ if [ -n "${PAYLOAD:-}" ]; then
     chmod 0755 "$skeleton/usr/local/bin/1bit-tty1"
     chmod 0755 "$skeleton"/etc/init.d/03onboard-efivars "$skeleton"/etc/init.d/05onboard-data \
         "$skeleton"/etc/init.d/06onboard-logs "$skeleton"/etc/init.d/07onboard-user \
-        "$skeleton"/etc/init.d/08onboard-presets "$skeleton"/etc/init.d/14onboard-net \
+        "$skeleton"/etc/init.d/08onboard-presets "$skeleton"/etc/init.d/zz-onboard-net \
         "$skeleton"/etc/init.d/10lemonade \
         "$skeleton"/etc/init.d/18onboard-mdns \
         "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console \
@@ -650,7 +650,7 @@ if [ -n "${PAYLOAD:-}" ]; then
              usr/local/bin/1bit-record usr/local/bin/1bit-lemonade-webapp \
              usr/local/bin/1bit-webapp-proxy usr/local/bin/1bit-desktop usr/local/bin/1bit-logs \
              etc/init.d/06onboard-logs etc/init.d/07onboard-user etc/init.d/08onboard-presets \
-             etc/init.d/14onboard-net usr/local/bin/1bit-network \
+             etc/init.d/zz-onboard-net usr/local/bin/1bit-network \
              root/Startup/1bit-lemonade-webapp \
              etc/personal_settings_popup_disabled etc/1bit/palemoon-prefs.js \
              etc/init.d/24onboard-webapp opt/1bit/webapp/index.html \

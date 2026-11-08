@@ -30,6 +30,8 @@ set -uo pipefail
 bin=${1:?usage: laya_route_e2e.sh path/to/1bit path/to/laya-model-dir}
 laya_model=${2:?usage: laya_route_e2e.sh path/to/1bit path/to/laya-model-dir}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound instead of guessing one (engine #1485)
 policy="$here/route-policy-e2e.json"
 # The devices serve offers Laya for a .gguf in this build (gguf_devices() in app/serve.cpp): HRX
 # and the CPU in a build with HRX; the CPU only in one without (CI).
@@ -39,8 +41,9 @@ if grep -q "^ONEBIT_HRX:BOOL=ON" "$cache" 2>/dev/null; then devices=hrx,cpu; fi
 echo "candidates: $devices"
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-api="http://127.0.0.1:$port"
+# --port 0: the refusal case below never binds, and the live serve reads its port back from serve's own ready line
+# (engine #1444/#1485); nothing picks a port and releases it before serve binds.
+api=
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 
@@ -48,14 +51,16 @@ npu_only=$("$bin" route --laya-model "$laya_model" --devices npu --state "anythi
 check "--devices npu routes to npu ($npu_only)" '[ "$npu_only" = npu ]'
 
 missing=$(HOME="$scratch" XDG_DATA_HOME= ONEBIT_LAYA_MODEL= "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya \
-    --port "$port" --llama-server "$here/fake_backend_route.py" 2>&1)
+    --port 0 --llama-server "$here/fake_backend_route.py" 2>&1)
 check "--laya without a checkpoint says how to install one" '[[ "$missing" == *fetch-laya.sh* ]]'
 
 ONEBIT_LAYA_MODEL="$laya_model" "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya --route-policy "$policy" \
-    --port "$port" --alias route-test \
+    --port 0 --alias route-test \
     --llama-server "$here/fake_backend_route.py" \
     >"$scratch/serve.log" 2>&1 &
 pid=$!
+port=$(serve_port_wait "$scratch/serve.log" "$pid" 1200) || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
+api="http://127.0.0.1:$port"
 cleanup() { kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$scratch"; }
 trap cleanup EXIT
 for _ in $(seq 1 1200); do curl -s -o /dev/null "$api/health" && break; sleep 0.1; done

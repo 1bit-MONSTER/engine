@@ -27,6 +27,8 @@ set -uo pipefail
 bin=${1:?usage: laya_models_e2e.sh path/to/1bit path/to/laya-model-dir}
 laya_model=${2:?usage: laya_models_e2e.sh path/to/1bit path/to/laya-model-dir}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound instead of guessing one (engine #1485)
 scratch=$(mktemp -d)
 touch "$scratch/small.gguf" "$scratch/big.gguf"
 fake="$here/fake_backend_route.py"
@@ -39,21 +41,24 @@ cat >"$scratch/table.json" <<EOF
  "classes": {"reflex": {"model": "small.gguf", "device": "cpu", "alias": "small-npu", "args": ["--llama-server", "$fake"]},
              "plan": {"model": "$scratch/big.gguf", "device": "cpu", "alias": "big-hrx", "args": ["--llama-server", "$fake"]}}}
 EOF
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-api="http://127.0.0.1:$port"
+# --port 0 everywhere below: the three refusal cases never bind, and the live one reads the port back from serve's own
+# ready line, so nothing picks a port and releases it before serve binds (engine #1444/#1485).
+api=
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 
-out=$("$bin" serve --laya-models "$scratch/table.json" --port "$port" 2>&1)
+out=$("$bin" serve --laya-models "$scratch/table.json" --port 0 2>&1)
 check "--laya-models without --laya says so" '[[ "$out" == *"needs --laya"* ]]'
-out=$("$bin" serve --laya-models "$scratch/table.json" --laya-model "$laya_model" -m "$scratch/big.gguf" --port "$port" 2>&1)
+out=$("$bin" serve --laya-models "$scratch/table.json" --laya-model "$laya_model" -m "$scratch/big.gguf" --port 0 2>&1)
 check "--laya-models with -m is refused" '[[ "$out" == *"drop -m"* ]]'
 echo '{"question":{"instructions":"x","classes":{"a":"d","b":"e"}},"classes":{"a":{"model":"m","device":"hrx"}}}' >"$scratch/bad.json"
-out=$("$bin" serve --laya-models "$scratch/bad.json" --laya-model "$laya_model" --port "$port" 2>&1)
+out=$("$bin" serve --laya-models "$scratch/bad.json" --laya-model "$laya_model" --port 0 2>&1)
 check "a table with a class and no row is refused by name" '[[ "$out" == *"\"b\" has no row"* ]]'
 
-"$bin" serve --laya-models "$scratch/table.json" --laya-model "$laya_model" --port "$port" >"$scratch/serve.log" 2>&1 &
+"$bin" serve --laya-models "$scratch/table.json" --laya-model "$laya_model" --port 0 >"$scratch/serve.log" 2>&1 &
 pid=$!
+port=$(serve_port_wait "$scratch/serve.log" "$pid" 1200) || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
+api="http://127.0.0.1:$port"
 cleanup() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$scratch"; }
 trap cleanup EXIT
 for _ in $(seq 1 1200); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$api/health")" = 200 ] && break; sleep 0.1; done

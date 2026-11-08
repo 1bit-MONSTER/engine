@@ -35,6 +35,10 @@
 # (cmake/hrx.cmake's default without a fetched SDK). The runner runs one job at a time, and the tree
 # is its own (~/.cache/hrx-build/bench), so no two runs share a tree.
 # The build runs under ~/lb/thermal-run.sh (4 cores, paused at 78 C) like every build on the box.
+# A PR whose only trigger change is test registration in CMakeLists.txt (add_test/set_tests_properties lines,
+# comments, blanks) configures with ONEBIT_HRX=ON and skips the compile: such a line creates no target and sets
+# no flag, but it is still evaluated at configure time, including inside if(ONEBIT_HRX) blocks ci.yml never
+# configures. tools/ci/hrx_build_scope.py decides; anything it does not recognise builds.
 # Fork PRs never reach the box: the `if:` requires the head repository to be this one.
 name: hrx-build
 
@@ -71,6 +75,21 @@ jobs:
         with:
           persist-credentials: false
           submodules: false
+          # the PR's merge commit and its first parent (the base), for the scope step
+          fetch-depth: 2
+
+      - name: Scope (compile, or configure only)
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          verdict=full
+          if [ "$EVENT" = pull_request ]; then
+            # prints full or configure-only (exit 0 for configure-only, 10 for full); a crash prints neither
+            verdict=$(python3 tools/ci/hrx_build_scope.py --base HEAD^1 --head HEAD) || true
+          fi
+          if [ "$verdict" = configure-only ]; then echo "build=false"; else echo "build=true"; fi >> "$GITHUB_OUTPUT"
 
       - name: Check out the HRX pair (llama.cpp + hrx-system)
         run: |
@@ -88,7 +107,12 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DONEBIT_HRX=ON
 
+      - name: Configure only (test registration, no compile)
+        if: steps.scope.outputs.build != 'true'
+        run: echo "only test registration changed in CMakeLists.txt; the ONEBIT_HRX=ON configure above passed, the compile is skipped" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Build llama_hrx and onebit
+        if: steps.scope.outputs.build == 'true'
         env:
           CCACHE_BASEDIR: ${{ github.workspace }}
         run: |

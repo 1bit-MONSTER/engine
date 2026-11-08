@@ -26,7 +26,12 @@ skipping is the one that catches a broken HRX pin, so a wrong `configure-only` c
 
 Rules -- `configure-only` (alias `ctest-only`) requires ALL of:
 
-1. every changed path is `CMakeLists.txt` (one or more of them); any other file at all is `full`;
+1. every changed path *that triggers the workflow* is `CMakeLists.txt`; any other trigger path is `full`. The
+   triggers are read from `hrx-build.yml`'s `paths:` at run time, so the two cannot drift. A path outside them (the
+   new test's own script, docs) is not an input of the HRX build: on its own it does not run this job at all, so it
+   must not force a compile here either. Without it, no real registration PR would ever skip: replayed over main, the
+   four registration-only commits and #1491 each carried their test file and were all `full` (engine#1500). If the
+   workflow's list cannot be read, every changed path counts, as before;
 2. every added and removed line in those files matches `add_test(`, `set_tests_properties(` or `set_property(TEST ... `,
    or is blank/comment -- a balance check then requires the removed and added lines to agree in kind, so a registration
    cannot be swapped for a `target_link_libraries`;
@@ -39,9 +44,29 @@ usage:
   tools/ci/hrx_build_scope.py --self-test
 """
 import argparse
+import os
 import re
 import subprocess
 import sys
+
+WORKFLOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".github", "workflows", "hrx-build.yml")
+
+
+def workflow_triggers(path=WORKFLOW):
+    """hrx-build.yml's pull_request `paths:` list, or None when it cannot be read (then every path counts)."""
+    try:
+        text = open(path).read()
+    except OSError:
+        return None
+    m = re.search(r"^\s*paths:\s*\n((?:\s*-\s*\S+\s*\n)+)", text, re.M)
+    if not m:
+        return None
+    listed = re.findall(r"^\s*-\s*(\S+)\s*$", m.group(1), re.M)
+    return listed or None
+
+
+def is_trigger(path, triggers):
+    return triggers is None or any(path == t or path.startswith(t.rstrip("/") + "/") for t in triggers)
 
 REGISTRATION = re.compile(r"^\s*(add_test\s*\(|set_tests_properties\s*\(|set_property\s*\(\s*TEST\b)")
 BENIGN = re.compile(r"^\s*(#|$)")
@@ -57,14 +82,17 @@ def classify_line(line):
     return "other"
 
 
-def decide(changed_paths, cmake_diff):
+def decide(changed_paths, cmake_diff, triggers=None):
     """(verdict, reason) for one PR.
 
-    `changed_paths` is every path the PR touches; `cmake_diff` is the unified diff text for the CMakeLists.txt files.
+    `changed_paths` is every path the PR touches; `cmake_diff` is the unified diff text for the CMakeLists.txt files;
+    `triggers` is the workflow's paths filter (None: every path counts).
     """
-    paths = sorted({p for p in changed_paths if p})
-    if not paths:
+    if not [p for p in changed_paths if p]:
         return "full", "no changed paths were given"
+    paths = sorted({p for p in changed_paths if p and is_trigger(p, triggers)})
+    if not paths:
+        return "full", "no changed path is one of the workflow's triggers (a manual run): not provable"
     other = [p for p in paths if p != "CMakeLists.txt"]
     if other:
         return "full", f"{len(other)} changed path(s) outside CMakeLists.txt ({', '.join(other[:3])})"
@@ -94,7 +122,7 @@ def decide(changed_paths, cmake_diff):
 def from_git(base, head):
     names = subprocess.run(["git", "diff", "--name-only", base, head], capture_output=True, text=True, check=True)
     diff = subprocess.run(["git", "diff", base, head, "--", "CMakeLists.txt"], capture_output=True, text=True, check=True)
-    return decide(names.stdout.splitlines(), diff.stdout)
+    return decide(names.stdout.splitlines(), diff.stdout, workflow_triggers())
 
 
 def self_test():
@@ -131,7 +159,26 @@ def self_test():
         ("no paths at all (a shallow checkout that failed to diff)",
          [], "+++ b/CMakeLists.txt\n+add_test(NAME a COMMAND a)\n", "full"),
     ]
+    trig = ["third_party/llama.cpp", "CMakeLists.txt", "cmake/hrx.cmake", "app/serve.cpp"]
+    one_reg = "+++ b/CMakeLists.txt\n@@ -1,1 +1,2 @@\n+add_test(NAME t COMMAND t)\n"
+    tcases = [
+        ("the #1491 shape: a registration plus its test file and script (not build inputs)",
+         ["CMakeLists.txt", "tests/t_test.sh", "os/v3/puppy/patch-sfs.sh"], one_reg, "configure-only"),
+        ("a registration plus a trigger path (app/serve.cpp)", ["CMakeLists.txt", "app/serve.cpp"], one_reg, "full"),
+        ("a registration plus a gitlink bump", ["CMakeLists.txt", "third_party/llama.cpp"], one_reg, "full"),
+        ("a file under a trigger directory", ["CMakeLists.txt", "cmake/hrx.cmake/x"], one_reg, "full"),
+        ("no trigger path at all (a manual run)", ["docs/x.md"], "", "full"),
+    ]
     bad = 0
+    for name, paths, diff, want in tcases:
+        got, why = decide(paths, diff, trig)
+        ok = got == want
+        print(("ok   " if ok else "FAIL ") + f"{name} -> {got}" + ("" if ok else f" (wanted {want}: {why})"))
+        bad += 0 if ok else 1
+    real = workflow_triggers()
+    ok = bool(real) and "CMakeLists.txt" in real and "cmake/hrx.cmake" in real
+    print(("ok   " if ok else "FAIL ") + f"hrx-build.yml's paths filter reads as {len(real or [])} trigger(s)")
+    bad += 0 if ok else 1
     for name, paths, diff, want in cases:
         got, why = decide(paths, diff)
         ok = got == want

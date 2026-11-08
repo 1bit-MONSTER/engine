@@ -21,7 +21,7 @@ This page is the route decision for both, with the numbers this repo has measure
 empty (Gumiho's is a licence header), and because the two families need different *verifiers* — which is the fact that
 decides whether they can run here at all.
 
-## PARD / PARD-2 — token-level draft models: **they run, and they pay on the device**
+## PARD / PARD-2 — token-level draft models: **they run, and on the device they are break-even**
 
 15 repos in the AMD catalogue (`amd/PARD-*`, `amd/PARD2-*`). They are **ordinary causal LMs** of standard architectures —
 `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `LlamaForCausalLM` (verified from each `config.json` **and** the safetensors tensor

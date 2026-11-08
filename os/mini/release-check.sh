@@ -591,6 +591,30 @@ identity_launcher_path() {
     else printf '%s\n' "${PAYLOAD_DIR:-/opt/1bit-package}/1bit/1bit"; fi
 }
 
+# The payload's own identity (engine#1557). `payload=` in release-identity is a LABEL - the tarball stem, which the console
+# shows and which no fact inside the image can equal (the payload directory is /opt/1bit-package, and nothing in the payload
+# records the stem) - so it is printed and NOT asserted. What IS checkable is the version string the payload's own launcher
+# reports; the writer reads it from the payload's bytes at build time and stores it as `payload_lemond=`, and this row
+# compares the claim with what the payload on this machine says about itself. Two different claims, never mixed: the label is
+# presented as a label, and the version is a real check. Pure, so --self-test drives it: <claimed> <actual>
+payload_identity_verdict() {   # <payload_lemond claimed> <what the launcher reports>
+    _pc=${1:-} _pa=${2:-}
+    if [ -z "$_pc" ]; then
+        printf 'SKIP this image'"'"'s identity carries no payload_lemond=, so the payload it names cannot be checked (engine#1557: only images built after this row have it)'
+        return 0
+    fi
+    if [ -z "$_pa" ]; then
+        printf 'FAIL the payload'"'"'s launcher reported no version, so the identity'"'"'s claim (%s) cannot be checked against it' "$_pc"
+        return 0
+    fi
+    if [ "$_pc" = "$_pa" ]; then
+        printf 'PASS the payload on this machine is the one the identity names: its own launcher reports %s, and the identity claims the same' "$_pa"
+    else
+        printf 'FAIL the identity claims payload_lemond=%s but the payload here reports %s - the name is stale or the payload is not the one that was packed (engine#1557)' \
+            "$_pc" "$_pa"
+    fi
+}
+
 identity_verdict() {
     _ce=${1:-} _ae=${2:-} _ch=${3:-} _ah=${4:-}
     case "$_ce" in ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s engine_sha256 is not a hex digest (%s) - malformed, not merely old' "${_ce:-empty}"; return 0 ;; esac
@@ -790,6 +814,12 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_modes_verdict '' 0)"
     check FAIL "$(payload_modes_verdict 0 '')"
     check FAIL "$(payload_modes_verdict x 0)"
+    # engine#1557: the payload's own identity - a claim that matches is a PASS, a stale one is a FAIL, and an image without
+    # the field is a SKIP that says why rather than a pass by absence
+    check PASS "$(payload_identity_verdict '2026.47.0~8.f44ff953' '2026.47.0~8.f44ff953')"
+    check FAIL "$(payload_identity_verdict '2026.47.0~8.f44ff953' '2026.48.0~1.aaaaaaaa')"
+    check SKIP "$(payload_identity_verdict '' '2026.47.0~8.f44ff953')"
+    check FAIL "$(payload_identity_verdict '2026.47.0~8.f44ff953' '')"
     # engine #1474: the base layer's row - clean only when the count is 0 AND a keep-list was read
     check PASS "$(base_modes_verdict 0 11)"   # 11: the entry count in os/v3/puppy/base-modes-keep today
     check FAIL "$(base_modes_verdict 2166 10 'drwxrwxr-x usr/share')"   # c33's base layer, the shape this closes
@@ -1868,6 +1898,19 @@ if [ -f "$ID" ]; then
             *)     fail identity "${_idv#FAIL } (${_idinfo})" ;;
         esac
     fi
+    # engine#1557: the label is printed, the payload's own version is CHECKED. `payload=` stays the human label (the tarball
+    # stem, which no in-image fact equals) and payload_lemond= is the claim the launcher on this machine can settle.
+    _pl_claim=$(sed -n 's/^payload_lemond=//p' "$ID" 2>/dev/null | head -1)
+    _pl_actual=
+    if [ -x "${PAYLOAD_DIR:-/opt/1bit-package}/lemond-onebit" ]; then
+        _pl_actual=$("${PAYLOAD_DIR:-/opt/1bit-package}/lemond-onebit" --version 2> /dev/null | sed -n 's/^lemond version //p' | head -1)
+    fi
+    PLV=$(payload_identity_verdict "$_pl_claim" "$_pl_actual")
+    case "$PLV" in
+        PASS*) pass payload-identity "${PLV#PASS } (label: ${_id_name:-?})" ;;
+        SKIP*) skip payload-identity "${PLV#SKIP }" ;;
+        *)     fail payload-identity "${PLV#FAIL } (label: ${_id_name:-?})" ;;
+    esac
     if [ -f /data/SHA256SUMS ]; then
         if (cd /data && sha256sum -c SHA256SUMS >/dev/null 2>&1); then pass sha256sums "/data/SHA256SUMS verifies"
         else fail sha256sums "/data/SHA256SUMS does not verify (cd /data && sha256sum -c SHA256SUMS)"; fi

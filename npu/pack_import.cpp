@@ -271,11 +271,20 @@ const uint8_t* at(const Fconst& f, int64_t off, int64_t len) {
 // pack's own const sizes -- so each rule below was measured against the 1.8 pack of the SAME model by
 // whole-file diff. A 1.9 pack whose geometry is not in this table is refused rather than decoded on a guess.
 struct Fconst19Rule {
-    int hidden, heads, layers, n_tiles, tile, rot;
+    int hidden, heads, layers;
+    int64_t prefix;   // bytes before the q/k/v bundle: the norms, and on Qwen3 the per-head QK gains too
+    int n_tiles, rot;
+    int64_t tile;
 };
+// Every entry was measured by diffing the 1.9 pack against the 1.8 pack of the SAME model: the bundle's tile shape and
+// its rotation are not derivable from the pack, and neither is `prefix` (Qwen3 puts its per-head QK norm gains inside
+// the block before the bundle, so `64 + 2*hidden` is not the rule there).
 constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen2.5-0.5B-Instruct: normalises to its 1.8 twin byte for byte, whole file, all 24 blocks.
-    {896, 14, 24, 16, 34816, 2},
+    {896, 14, 24, 1856, 16, 2, 34816},
+    // Qwen3-1.7B: same rule at hidden 2048 / 16 heads / 28 layers; 535 code bytes of the two builds differ, all in
+    // layer 24, which is content rather than layout (every block still lines up).
+    {2048, 16, 28, 8512, 3, 1, 1183744},
 };
 
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes
@@ -344,7 +353,7 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     }
     const int64_t hdr_len = int64_t(heads) * 4;
     const int64_t stride8 = stride9 - hdr_len;
-    const int64_t prefix = attn_payload_off(hidden);
+    const int64_t prefix = rule->prefix;
     const int64_t bundle = int64_t(rule->n_tiles) * rule->tile;
     if (rule->n_tiles < 2 || rule->tile <= 0 || prefix + bundle > hdr_off ||
         hdr_off + hdr_len > stride9 || stride8 <= 0) {
@@ -2171,19 +2180,23 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 const int64_t tail_off = int64_t(p.dims.layers) * g.stride;
                 const int64_t tile = attn_tile_bytes(H);
                 const int64_t rows = V / kTileRows;
-                const int64_t want = kTailNorm + rows * tile;
+                // The envelope is the same `64 + 2*hidden` the layer blocks open with (eps, padding, the norm), not a
+                // constant: 1,856 is only its qwen2.5-0.5B value. Qwen3-1.7B's tail is 4,160 + 2,374 x 73,984 to the
+                // byte, which the constant would have missed by 2,304.
+                const int64_t env = attn_payload_off(H);
+                const int64_t want = env + rows * tile;
                 const int64_t have = int64_t(fc.size) - tail_off;
                 if (V % kTileRows != 0 || want != have) {
                     late.push_back("lm_head.weight: the .fconst tail is " + std::to_string(have) + " B, not the " +
                                    std::to_string(want) + " B its envelope and head tiles would take (" +
-                                   std::to_string(kTailNorm) + " + " + std::to_string(rows) + " x " +
+                                   std::to_string(env) + " + " + std::to_string(rows) + " x " +
                                    std::to_string(tile) + " B), so the head's offsets are not established");
                 } else {
                     std::vector<TileW> tiles;
                     tiles.reserve(size_t(rows));
                     bool exact = true;
                     for (int64_t i = 0; i < rows; ++i) {
-                        const uint8_t* src = at(fc, tail_off + kTailNorm + i * tile, tile);
+                        const uint8_t* src = at(fc, tail_off + env + i * tile, tile);
                         tiles.push_back(decode_tile(src, int(H)));
                         const std::vector<uint8_t> back = encode_tile(tiles.back());
                         if (std::memcmp(back.data(), src, size_t(tile)) != 0) exact = false;

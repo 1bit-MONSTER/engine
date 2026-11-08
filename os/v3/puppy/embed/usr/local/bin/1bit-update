@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 # 1bit-update <release-dir> | <image.img>   install the next appliance into the OTHER slot and boot it next
+# 1bit-update --no-verify <release>         the same, for a release that carries no SHA256SUMS
 # 1bit-update --rollback                    boot the other slot next (both sets stay on the disk)
 # 1bit-update --status                      which slot is active, what each slot holds, which one GRUB boots
 #
@@ -90,7 +91,12 @@ prepare_target_layer() {
     for s in "$1/$2"/*save*; do
         [ -e "$s" ] || [ -L "$s" ] || continue
         if [ -d "$s" ] && [ ! -L "$s" ]; then
-            [ "$2" = "$save_slot" ] && [ "$(basename "$s")" = "$savename" ] && continue
+            # THE SAME FILE, stated directly: `-ef` is device+inode, so "this is the layer the running slot reaches"
+            # is one test and not two (slot name and directory name). It is a clarification, not a hole being closed:
+            # the name form also refused a same-named stranger, because it required the slot to match as well and a
+            # foreign layer is by definition in another slot (pi-os3 raised the case, the #1385 review measured that
+            # the old form already refused it - the test arm below is the regression guard either way).
+            [ "$s" -ef "$1/$save_slot/$savename" ] && continue
             echo "/$2 already holds a save layer ($(basename "$s")): two layers cannot be merged by an update - pick the slot by hand if that is really what you want"
             return 1
         fi
@@ -110,13 +116,18 @@ if [ "${ONEBIT_UPDATE_LIB:-}" = 1 ]; then return 0 2> /dev/null || exit 0; fi
 
 src=''
 mode=install
-case "${1:---help}" in
-    -h|--help) usage; exit 0 ;;
-    --status) mode=status ;;
-    --rollback) mode=rollback ;;
-    /*) src=$1 ;;
-    *) usage >&2; exit 1 ;;
-esac
+novfy=
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h|--help) usage; exit 0 ;;
+        --status) mode=status ;;
+        --rollback) mode=rollback ;;
+        --no-verify) novfy=1 ;;
+        /*) src=$1 ;;
+        *) usage >&2; exit 1 ;;
+    esac
+    shift
+done
 [ -n "$src" ] || [ "$mode" != install ] || { usage >&2; exit 1; }
 mkdir -p /tmp/1bit-update 2> /dev/null
 : >> "$LOG" 2> /dev/null || LOG=/dev/null
@@ -239,16 +250,28 @@ trap 'cleanup' EXIT INT TERM
 
 # a release image is what a user actually has: use the frugal set on its own data partition
 if [ ! -d "$src" ]; then
-    srcloop=$(losetup -f --show -r "$src" 2> /dev/null) || die "cannot loop-mount $src"
-    dataoff=$(sfdisk -d "$src" 2> /dev/null | awk '/name="1BIT-DATA"/ { for (i = 1; i <= NF; i++) if ($i ~ /^start=/) { sub(/start=/, "", $i); sub(/,/, "", $i); print $i; exit } }')
-    [ -n "$dataoff" ] || { losetup -d "$srcloop"; die "$src has no 1BIT-DATA partition (not a 1bit OS image)"; }
-    srcloop=$(losetup -d "$srcloop" > /dev/null 2>&1; losetup -f --show -r -o $((dataoff * 512)) "$src" 2> /dev/null) \
-        || die "cannot loop-mount $src's data partition"
+    # ONE loop device, taken at the partition's offset, and `sfdisk` reads the FILE directly: the first version attached
+    # the whole image, detached it, and immediately attached it again at an offset - and the second attach raced the
+    # detach, so the mount that followed failed ("cannot mount the data partition in ...", measured in the gate).
+    # `sfdisk -d` needs no loop at all.
+    #
+    # It also prints `start=` and the sector number as TWO fields, so the first version's "strip the prefix from $i and
+    # print it" produced an empty offset and every image was refused as "not a 1bit OS image" while the partition was
+    # right there. Read the number, wherever it is.
+    dataoff=$(sfdisk -d "$src" 2> /dev/null | awk '/name="1BIT-DATA"/ {
+        for (i = 1; i <= NF; i++) if ($i ~ /^start=/) {
+            v = $i; sub(/start=/, "", v); gsub(/,/, "", v)
+            if (v == "") { v = $(i + 1); gsub(/,/, "", v) }
+            print v + 0; exit } }')
+    [ -n "$dataoff" ] || die "$src has no 1BIT-DATA partition (not a 1bit OS image)"
+    srcloop=$(losetup -f --show -r -o $((dataoff * 512)) "$src" 2> /dev/null) \
+        || die "cannot loop-mount $src's data partition (offset ${dataoff} sectors)"
     srcimg=/tmp/1bit-update/src
     mkdir -p "$srcimg"
-    mount -t ext4 -o ro "$srcloop" "$srcimg" >> "$LOG" 2>&1 || die "cannot mount the data partition in $src"
+    mount -t ext4 -o ro "$srcloop" "$srcimg" >> "$LOG" 2>&1 || {
+        logtail; die "cannot mount the data partition in $src"; }
     src=$srcimg/1bit
-    [ -d "$src" ] || die "$src has no /1bit on its data partition"
+    [ -d "$src" ] || die "$src has no /1bit on its data partition (the data partition mounted, /1bit is not on it)"
 fi
 
 for f in $need; do
@@ -258,27 +281,40 @@ if [ -s "$src/SHA256SUMS" ]; then
     sums=/tmp/1bit-update/sums
     : > "$sums"
     for f in $need; do
-        awk -v b="$f" '$2 == b || $2 == "*" b { print }' "$src/SHA256SUMS" >> "$sums"
+        # strip a leading "./": `sha256sum ./*.sfs` writes "./name", and a membership test on the bare name then
+        # matched only the two files that were listed without the prefix (measured: "2 file(s) of the set verified"
+        # for a set of six - the SFS were copied but not hash-checked)
+        awk -v b="$f" '{ n = $2; sub(/^\.\//, "", n); if (n == b) print }' "$src/SHA256SUMS" >> "$sums"
     done
     if [ -s "$sums" ]; then
         ( cd "$src" && sha256sum -c --quiet "$sums" ) >> "$LOG" 2>&1 \
             || die "SHA256SUMS does not verify for the set's own files - the release is damaged"
         say "hashes: $(grep -c . "$sums") file(s) of the set verified against $src/SHA256SUMS"
     else
-        say "hashes: $src/SHA256SUMS has no line for any file of this set; sizes are checked, the bytes are not"
+        [ -n "$novfy" ] || die "$src/SHA256SUMS has no line for any file of this set: nothing proves the bytes are the release's own (this path replaces the appliance the machine boots; use --no-verify only if you trust the copy)"
     fi
 else
-    say "hashes: $src has no SHA256SUMS; sizes are checked, the bytes are not"
+    [ -n "$novfy" ] || die "$src carries no SHA256SUMS: nothing proves the bytes are the release's own. Every 1bit OS image writes one beside the set (engine#1385: mkimage does), so this is a hand-made release directory - pass --no-verify only if you trust the copy"
 fi
 
 # space: the new set, with room for the checksums and the GRUB rewrite
 szk=$(du -sk "$src" | cut -f 1)
 freek=$(df -Pk "$DATA" | awk 'NR == 2 { print $4 }')
 [ "$freek" -gt $((szk + 262144)) ] || die "only ${freek} KiB free on $DATA, the set needs ${szk} KiB plus 256 MiB of slack"
+# and the ESP, where the two GRUB entries go: it is the one place a half-write is not recoverable without a rescue
+# stick, so it is checked up front rather than after the copy has already run (the #1385 review: a full ESP used to be
+# refused after ~1.5 GB had been written into the other slot)
+mount_esp || fail "cannot mount the ESP $esp"
+espfree=$(df -Pk "$esp_mount" | awk 'NR == 2 { print $4 }')
+[ "${espfree:-0}" -gt 1024 ] || { unmount_esp; die "only ${espfree:-0} KiB free on the ESP $esp: refusing to write there"; }
+unmount_esp
 
 # a slot that already owns a save layer is another machine's state, not something to overwrite - unless it is the
 # slot holding THIS machine's shared layer, which is every second update (engine#1334 review)
 why=$(prepare_target_layer "$DATA" "$target") || die "$why"
+# the operator-facing half of the same decision: when the target is the slot holding the layer, say so (the function
+# itself stays silent on success, so its stdout remains "the reason" for the tests that call it)
+[ "$target" = "$save_slot" ] && say "   /$target holds this machine's save layer ($savename): left in place, no link needed"
 
 # ── write the other slot ─────────────────────────────────────────────────────────────────────────────────────
 say "== install $src into /$target (the running set is /$active and is not touched)"
@@ -297,6 +333,7 @@ say "   $(ls "$DATA/$target"/*.sfs | wc -l) SFS, kernel and initrd in /$target; 
 # ── GRUB: the other slot needs its entries, and they become the default ─────────────────────────────────────
 mount_esp || fail "cannot mount the ESP $esp"
 [ -f "$cfg" ] || { unmount_esp; fail "no EFI/BOOT/grub.cfg on $esp"; }
+# (the ESP's free space is checked before the copy, next to the data partition's own check)
 cp -p "$cfg" "$cfg.pre-1bit-update" 2> /dev/null || { unmount_esp; fail "cannot back up $cfg"; }
 tmpl=$(awk -v slot="$active" '$1 == "linux" && $0 ~ ("psubdir=" slot "([[:space:]]|$)") && $0 !~ /1bit\.serial=1/ {
                                   sub(/^[[:space:]]*linux[[:space:]]+[^[:space:]]+[[:space:]]+/, ""); print; exit }' "$cfg")

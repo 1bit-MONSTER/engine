@@ -198,6 +198,12 @@ d=$work/data; mkdir -p "$d/1bit" "$d/models" "$d/ssh" "$d/lemonade/cache" "$d/le
     "$d/npu/kernels" "$d/cache/hrx-jit"
 cp -L "$work/vmlinuz" "$work/initrd.gz" "$d/1bit/"
 for f in puppy zdrv fdrv bdrv; do cp -L "$src"/${f}_*.sfs "$d/1bit/"; done
+# The set's own hashes, ON the set (engine#1385 review): `1bit-update <image.img>` installs from the /1bit of the
+# image's data partition and verifies exactly these files, so an image that carries no SHA256SUMS could only ever be
+# updated with --no-verify - every weekly image would have needed it. Written here, out of the bytes just copied, so
+# it cannot disagree with them.
+( cd "$d/1bit" && sha256sum vmlinuz initrd.gz ./*.sfs > SHA256SUMS ) || {
+    echo "$prog: REFUSED: could not write $d/1bit/SHA256SUMS" >&2; exit 1; }
 if [ -n "${MODELS:-}" ]; then
     [ -d "$MODELS" ] || { echo "$prog: MODELS=$MODELS is not a directory" >&2; exit 1; }
     n=0

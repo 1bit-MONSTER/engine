@@ -114,13 +114,26 @@ if read_until(b"Press enter to boot the selected OS", 180) is None:
     print("FAIL boot           no grub menu on the serial line (no serial-shell entry?)"); sys.exit(2)
 print("INFO boot           grub menu after %.1fs" % (time.time() - t0), flush=True)
 time.sleep(1.0)
-s.sendall(b"\x1b[B" * 3 + b"\r")
+# The menu selection needs the same protection a reboot gets (below): arrows CANCEL GRUB's countdown, so an Enter lost
+# while the menu is still drawing leaves the machine at the menu (measured), and on a loaded box the boot to userspace
+# has been measured at 155 s and past 300 s - so press again if nothing arrives, and give each attempt a budget the
+# boot can actually fit in (120 s was inside the boot's own range on 2026-11-07/08, and reported "no shell" for a
+# machine that was booting normally).
 t0 = time.time()
 ok = False
-for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
-    if read_until(token, 120) is not None:
-        ok = True
+for attempt in (1, 2, 3):
+    s.sendall(b"\x1b[B" * 3)
+    time.sleep(0.5)
+    s.sendall(b"\r")
+    time.sleep(0.5)
+    s.sendall(b"\r")
+    for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
+        if read_until(token, 90 if attempt == 1 else 300) is not None:
+            ok = True
+            break
+    if ok:
         break
+    print("INFO boot           nothing booted after attempt %d; pressing Enter again at the menu" % attempt, flush=True)
 if not ok:
     print("FAIL boot           no serial root shell; last transcript lines:")
     for l in (buf.decode("utf-8", "replace").splitlines()[-12:]):
@@ -368,7 +381,7 @@ if assert_pupsfs:
                     print("FAIL installed    the second VM never opened its serial socket"); break
                 time.sleep(0.2)
         t.settimeout(0.5)
-        end = time.time() + 240
+        end = time.time() + 420
         while time.time() < end:
             try:
                 d = t.recv(65536)
@@ -515,13 +528,26 @@ if assert_pupsfs:
             if self.until(b"Press enter to boot the selected OS", 240) is None:
                 return False
             time.sleep(1.0)
-            self.s.sendall(b"\x1b[B" * 3 + b"\r")
-            for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
-                if self.until(token, 150) is not None:
-                    self.buf = b""
-                    self.s.sendall(b"\n")
-                    time.sleep(1)
-                    return True
+            # an arrow key CANCELS GRUB's countdown, so an Enter lost while the menu is still drawing leaves the
+            # machine waiting at it for ever (measured in update-gate.sh, and again here): pause, press it twice, and
+            # give it one more try before reporting a machine that "did not come back"
+            for attempt in (1, 2):
+                self.s.sendall(b"\x1b[B" * 3)
+                time.sleep(0.5)
+                self.s.sendall(b"\r")
+                time.sleep(0.5)
+                self.s.sendall(b"\r")
+                # generous: a loaded box has been measured at 138 s to a shell and 6 min for a whole boot, and a
+                # harness that loses that race reports "did not come back" for a machine that did
+                for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
+                    if self.until(token, 120 if attempt == 1 else 300) is not None:
+                        self.buf = b""
+                        self.s.sendall(b"\n")
+                        time.sleep(1)
+                        return True
+                if attempt == 1:
+                    print("INFO reboot         nothing booted after the first Enter; pressing it again at the menu",
+                          flush=True)
             return False
 
         def close(self):

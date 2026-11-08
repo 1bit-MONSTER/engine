@@ -570,14 +570,20 @@ hrx_placement_verdict() {
 # files 0755 if executable else 0644) and assert it, so THIS row is the board-side proof that it did: a payload packed after that
 # commit has no writable file, and a payload packed before it has 134. Pure, so --self-test drives it:
 #   <group/other-writable file count> [<first few paths>]
-payload_modes_verdict() {
-    _n=${1:-} _sample=${2:-}
-    case "$_n" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s modes could not be counted (%s)' "${_n:-empty}"; return 0 ;; esac
-    if [ "$_n" = 0 ]; then
-        printf 'PASS no file in the payload is group- or other-writable (engine #1352: the packer normalises, this is the proof)'
+payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
+    _f=${1:-} _d=${2:-} _sample=${3:-}
+    case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
+    case "$_d" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s directory modes could not be counted (%s)' "${_d:-empty}"; return 0 ;; esac
+    if [ "$_f" = 0 ] && [ "$_d" = 0 ]; then
+        printf 'PASS no path in the payload is group- or other-writable - neither a file nor a directory (engine #1352: the packer normalises, this is the proof)'
     else
-        printf 'FAIL %s file(s) in the payload are group- or other-writable%s - the packer that stages with cp -a is shipping inherited modes again (engine #1352: the fix is in scripts/package-linux.sh / pack-elf.sh, not in this row)' \
-            "$_n" "${_sample:+: $_sample}"
+        # FILES AND DIRECTORIES BOTH COUNT. The first version of this row counted files only, which was the same "too narrow" shape as
+        # the /home/-only and 1bit-only checks: measured 8 Nov, c32's shipped payload had **134 writable files AND 49 writable
+        # directories** (183 paths, not 134), so a files-only row would pass a payload that had re-grown writable directories - and
+        # the c33 cut's first image did exactly that (0 files, 1 directory: the payload root at 0775, because `tar -x` creates the
+        # top directory with the caller's umask while every entry below it carries the archive's stored modes).
+        printf 'FAIL %s file(s) and %s dir(s) in the payload are group- or other-writable%s - a packing site is not normalising (engine #1352: the fix is in scripts/package-linux.sh / pack-elf.sh, and for an unpacked payload the extraction root is the usual one)' \
+            "$_f" "$_d" "${_sample:+: $_sample}"
     fi
 }
 
@@ -643,11 +649,13 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_runpath_verdict 1)"
     check FAIL "$(payload_runpath_verdict '')"
     # engine #1352: the payload's modes. c31/c32 shipped 134 writable files; a payload packed after #1361 has none.
-    check PASS "$(payload_modes_verdict 0)"
-    check FAIL "$(payload_modes_verdict 134)"
-    check FAIL "$(payload_modes_verdict 1 '/opt/1bit-package/1bit/1bit')"
-    check FAIL "$(payload_modes_verdict '')"
-    check FAIL "$(payload_modes_verdict 'x')"
+    check PASS "$(payload_modes_verdict 0 0)"
+    check FAIL "$(payload_modes_verdict 134 49)"        # c31/c32's real shape: 134 files AND 49 directories
+    check FAIL "$(payload_modes_verdict 0 1)"           # the c33 first cut: no files, the payload ROOT writable
+    check FAIL "$(payload_modes_verdict 1 0 '/opt/1bit-package/1bit/1bit')"
+    check FAIL "$(payload_modes_verdict '' 0)"
+    check FAIL "$(payload_modes_verdict 0 '')"
+    check FAIL "$(payload_modes_verdict x 0)"
     # c32: the HRX weight placement. The measured arms from #1339 are the first two; the failure shapes are a default
     # that already imported (2), an unreadable arm, and a zero.
     check PASS "$(hrx_placement_verdict 5692 3010)"        # 4B perplexity, #1339
@@ -1701,11 +1709,14 @@ PDIR=${PAYLOAD_DIR:-/opt/1bit-package}
 if [ ! -d "$PDIR" ]; then
     skip payload-modes "no $PDIR on this system: the payload is not unpacked where an appliance keeps it, so its modes cannot be read"
 else
-    _pm_n=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
+    _pm_f=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
+    _pm_d=$(find "$PDIR" -mindepth 0 -type d \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
     # the sample is relative to the payload, like the modes below it: an absolute path per file makes a long line on a console
     # nobody can scroll, and the prefix is identical for every one of them
-    _pm_s=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 | sed "s|^$PDIR/||" | tr '\n' ' ')
-    PM=$(payload_modes_verdict "${_pm_n:-}" "${_pm_s:-}")
+    # the sample prints the mode too, because "writable" is not actionable and `drwxrwxr-x opt/1bit-package` is
+    _pm_s=$(find "$PDIR" -mindepth 0 \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 |
+        while IFS= read -r _p; do _r=${_p#"$PDIR"}; _r=${_r#/}; printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "${_r:-.}"; done)
+    PM=$(payload_modes_verdict "${_pm_f:-}" "${_pm_d:-}" "${_pm_s:-}")
     _pm_bits=
     for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
         [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"

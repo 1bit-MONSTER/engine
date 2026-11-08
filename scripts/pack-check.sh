@@ -21,6 +21,9 @@
 #   build_path_strings    <unpacked tree>  no packed ELF names a build-machine path          (engine #1461)
 #   runtime_selfcontained <unpacked tree>  nothing resolves outside the payload, and the HSA runtime set
 #                                          that libhsa opens at run time ships beside it     (engine #1411)
+#   layout_build_paths    <unpacked tree>  no path in the LAYOUT (a directory name, or a symlink's target)
+#                                          names a build machine - the fourth class, which the two rows
+#                                          above cannot see because they read file contents   (engine #1543)
 
 # What the engine tarball must and must not hold (docs/releases.md, "Private components"):
 # It is packed by scripts/package-linux.sh and folded into the Lemonade + onebit package as 1bit/;

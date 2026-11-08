@@ -125,6 +125,10 @@ SELF_TEST = [
     ("in-engine capture, 1.441 ms/256 rows, today's tile (92.22 ms, 8.61 ms/tile)", 92.224, 8.61, 16384, 1.164, 0.004),
     ("in-engine at #754's 4x bar (2.15 ms/tile)", 92.224, 2.15, 16384, 1.650, 0.01),
     ("in-engine, slower per-dispatch reading 2.883 ms/256 rows", 184.512, 8.61, 16384, 1.333, 0.004),
+    # The post-fix runtime's own capture (2026-11-07 18:34, ~/.cache/hw-gate/build-13a7fda57a, gpu-kernels fd69590,
+    # 0 references to the spilling tiles). This is the row that describes the engine the pin builds: matmuls 2.3x
+    # faster than the pre-fix library, attention grown to 57.1 % of busy, so the split's end-to-end worth shrinks.
+    ("post-fix runtime, in-engine 0.855 ms/256 rows", 54.72, 8.61, 16384, 1.085, 0.004),
 ]
 
 

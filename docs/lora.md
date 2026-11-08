@@ -55,7 +55,8 @@ There is now an in-place path in `include/llama.h` (engine#973):
 The factors are copied into the tensors the graph already points at, so there is no parse, no allocation, no
 adapter-set change and no graph rebuild.
 
-**Measured** (engine#973, Qwen3-0.6B Q4_K_M, rank 2 over 196 projections, batch 16, per update, HRX0,
+**Measured** (engine#973, on a build of llama.cpp `32559003a` — the pin main carried then, so these are that
+pin's numbers and not the current pin's; Qwen3-0.6B Q4_K_M, rank 2 over 196 projections, batch 16, per update, HRX0,
 min of two passes, `write` = the factor update, `apply` = reload + adapter-set change):
 
 | path | bank RT 2 | bank RT 26 |
@@ -85,12 +86,29 @@ does not, deterministically: adding the factor pair to the graph changes the mat
 |---|---|---|---|
 | `a5271d9` (c20) | 2.265140 | 2.272791 | **+0.34 %** above base |
 | `4a375bf2d` (engine #1120) | 2.267098 | 2.265357 | **−0.08 %** below base |
-| Vulkan, either pin | 2.219879 | 2.219879 | bit-identical |
+| `ed43da0b4` (current) | 2.265140 | 2.272791 | **+0.34 %** above base — same as `a5271d9` |
+| Vulkan, any of the three | 2.219879 | 2.219879 | bit-identical |
 
 Same four fixed prompts, same model, same seeds, each row reproduced bit-identically across runs. So: an
 adapter-on vs adapter-off loss comparison on HRX carries an offset of about 0.3 %, **it changes sign between pins**,
 and it must be read against the zero-factor row of the *same build*, never against a number remembered from another
 one. A difference-based method (two adapter-on evaluations) is unaffected.
+
+The third row also shows the drift is **transient rather than monotonic**: `4a375bf2d` moved the HRX base loss to
+2.267098 and flattened the probe's ±ε ordering, and `ed43da0b4` puts all four metrics back to `a5271d9`'s exact
+values. So a loss measured one pin ago is not a lower or upper bound on today's — it is simply another pin's number.
+The practical rule is the same one: re-measure the row, do not interpolate between rows.
+
+That third row is the most measured of the three: reference pair (`a5271d9`) and this pin alternating, **two runs
+each inside one GPU ticket**, and all six numbers equal in all four runs — so the identity is measured, not inferred:
+
+| | base | zero-adapter | after drop | ±ε probe | ×10 probe | Vulkan base |
+|---|---|---|---|---|---|---|
+| `a5271d9`, reference pair (runs 1, 2) | 2.265140 | 2.272791 | 2.265140 | 2.086712 / 2.256433 | 13.670712 / 13.830040 | 2.219879 |
+| `ed43da0b4`, this row (runs 1, 2) | 2.265140 | 2.272791 | 2.265140 | 2.086712 / 2.256433 | 13.670712 / 13.830040 | 2.219879 |
+
+Two runs per pair is what separates "the numbers are deterministic and this pin equals that one" from "the numbers
+looked like this once". A single run that differs is worth nothing until it repeats.
 
 ## Trap 2: the adapter's tensors are the model's buffer type, so "repack to CPU" is not what happens
 
@@ -112,6 +130,13 @@ moving the HRX base loss by +0.086 %:
 - a per-build table is the useful artefact: the rows above came from a four-prompt probe that runs in a few seconds
   of GPU, and the whole mechanism is ~30 lines against `libllama` (engine#973's feasibility study kept the harness
   and the reference rows).
+
+**Attribute the build before you record a row — the commit is not enough.** Two trees at the same llama.cpp sha are
+not the same build: one can be the pin with a clean working tree, the other that same sha plus someone's four
+modified sources. Both produce a `libggml-hrx.so` for the same commit, and only one of them is the pin. So a row
+records four things: the pin sha, whether the source tree was **clean** (`git status --porcelain` empty), the frozen
+copy of the libraries actually loaded (with `sha256sum`), and the log line that names the device. Skipping the
+cleanliness check is how a table gets a row labelled with a pin it was never built from.
 
 ## What is deliberately not here
 

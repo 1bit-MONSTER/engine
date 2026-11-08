@@ -759,12 +759,15 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_modes_verdict 0 '')"
     check FAIL "$(payload_modes_verdict x 0)"
     # engine #1474: the base layer's row - clean only when the count is 0 AND a keep-list was read
-    check PASS "$(base_modes_verdict 0 10)"
+    check PASS "$(base_modes_verdict 0 11)"   # 11: the entry count in os/v3/puppy/base-modes-keep today
     check FAIL "$(base_modes_verdict 2166 10 'drwxrwxr-x usr/share')"   # c33's base layer, the shape this closes
     check FAIL "$(base_modes_verdict 1 10 'drwxrwxr-x usr')"
     check FAIL "$(base_modes_verdict '' 10)"                            # unreadable count
     check FAIL "$(base_modes_verdict 0 '')"                             # no keep-list to judge against
-    check FAIL "$(base_modes_verdict 0 x)"
+    check FAIL "$(base_modes_verdict 0 x)"                              # a non-numeric keep count
+    # a ZERO keep count is not a verdict failure: the row SKIPs when the keep-list file is absent, and a present-but-empty
+    # one is a repository error rather than a machine state, so it is covered at the call site (documented here so the
+    # split is not mistaken for a gap)
     # c32: the HRX weight placement. The measured arms from #1339 are the first two; the failure shapes are a default
     # that already imported (2), an unreadable arm, and a zero.
     check PASS "$(hrx_placement_verdict 5692 3010)"        # 4B perplexity, #1339
@@ -1860,30 +1863,40 @@ else
 fi
 
 # ── the BASE layer's modes (engine#1474) ────────────────────────────────────────────────────────────────────────
-# The scan is the root filesystem only: /data carries the models (7.9 GB on the board) and is not the OS, and the
-# mounts below are either kept writable by the keep-list or are not on the image at all. Everything else is counted, with
-# the keep-list applied from the machine's own copy so the row prints the list that decided it.
+# The scan is the root filesystem only, and the keep-list is the ONE source of truth for what may stay writable: the prune
+# list is BUILT from it rather than copied beside it (the first version hardcoded the same eleven entries by hand, so the
+# next cycle to edit the keep-list - the file whose whole purpose is to be edited - would have had no prune for its new
+# entry, and the row would have failed on a path the keep-list explicitly allows). The four paths pruned for a DIFFERENT
+# reason are named separately, because "not part of the OS image" is not "allowed to be writable".
+#
+# The scan root is overridable for the same reason PAYLOAD_DIR is above: a row that can only be judged by booting an image
+# cannot be tested. `BASE_SCAN_ROOT=<tree>` points it at any tree of the same shape.
 BKEEP=${BASE_KEEP:-/etc/1bit/base-modes-keep}
 if [ ! -f "$BKEEP" ]; then
     skip base-modes "no $BKEEP on this system: this image predates the base-layer row (engine #1474), so there is no keep-list to judge against"
 else
-    _bm_n=$(awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if ($0 != "") print }' "$BKEEP" | wc -l)
     _bm_keep=$(awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if ($0 != "") print }' "$BKEEP")
-    # The scan root is overridable for the same reason PAYLOAD_DIR is above: a row that can only be judged by booting an
-    # image cannot be tested, and the first version of this one could not be run at all off a board. `BASE_SCAN_ROOT=<tree>`
-    # points it at any tree of the same shape, which is how it was checked both ways: the un-normalised base SFS tree gives
-    # "40+ writable path(s)" (head-capped, so FAIL) and the normalised one gives "0 writable path(s)" (PASS).
+    _bm_n=$(printf '%s\n' "$_bm_keep" | grep -c . || true)
     BROOT=${BASE_SCAN_ROOT:-/}
     BROOT=${BROOT%/}
-    # -prune the trees that are not the OS image; count the rest
+    # the rows that are not the OS image at all (a mounted data partition, the initramfs, removable media)
+    _bm_excl='data initrd mnt media'
     _bm_prune=
-    for _p in proc sys dev run tmp data initrd mnt media var/tmp var/run var/lock var/spool var/log opt/1bit-package; do
+    for _p in $_bm_excl; do
         _bm_prune="$_bm_prune -path $BROOT/$_p -prune -o"
     done
+    # and everything the keep-list names, from the keep-list itself
+    for _p in $_bm_keep; do
+        _bm_prune="$_bm_prune -path $BROOT/${_p%/} -prune -o"
+    done
+    # COUNT the whole set, then sample from it: `find … | head -40` before the count capped the number at 40, so the one
+    # sentence a reader uses to judge severity said "40 path(s)" for a base layer with 2,176 of them (review on #1544)
+    _bm_list=${TMPDIR:-/tmp}/.1bit-base-modes.$$
     # shellcheck disable=SC2086  # the prune expression is built as separate words on purpose
-    _bm_b=$(find "${BROOT:-/}" $_bm_prune \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null | head -40)
-    _bm_n_paths=$(printf '%s' "$_bm_b" | grep -c . || true)
-    _bm_s=$(printf '%s\n' "$_bm_b" | head -3 | while IFS= read -r _p; do [ -n "$_p" ] && printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "$_p"; done)
+    find "${BROOT:-/}" $_bm_prune \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) -print 2> /dev/null > "$_bm_list" || true
+    _bm_n_paths=$(wc -l < "$_bm_list" | tr -d ' ')
+    _bm_s=$(head -3 "$_bm_list" | while IFS= read -r _p; do [ -n "$_p" ] && printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "$_p"; done)
+    rm -f "$_bm_list"
     BM=$(base_modes_verdict "$_bm_n_paths" "$_bm_n" "$_bm_s")
     case "$BM" in
         PASS*) pass base-modes "${BM#PASS } (keep-list: $(printf '%s' "$_bm_keep" | tr '\n' ' '))" ;;

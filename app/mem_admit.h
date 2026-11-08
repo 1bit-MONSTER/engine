@@ -102,7 +102,8 @@ inline GgufHeader read_gguf_header(const std::string& path) {
     };
     static const int size[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
     auto scalar = [](uint32_t t) { return t < 13 ? size[t] : -1; };
-    auto is_int = [](uint32_t t) { return t <= 5 || t == 10 || t == 11; };
+    // bool (7) counts as 0/1: gguf-py writes a list of Python bools, e.g. a sliding_window_pattern, as a bool array
+    auto is_int = [](uint32_t t) { return t <= 5 || t == 7 || t == 10 || t == 11; };
     auto as_int = [](uint32_t t, const unsigned char* b) {
         long long v = 0;
         const int n = size[t];
@@ -222,7 +223,8 @@ inline ModelNeed model_need(const std::string& path, long long n_ctx, int n_seq,
     const long long swa_tokens = swa > 0 ? std::min(n_ctx, swa * n_seq + 512) : n_ctx;  // a window per sequence + a ubatch
     // the share of layers that attend over the full context: llama.cpp sets the sliding-window
     // pattern per architecture (one full layer in N); a pattern array in the file wins; an
-    // architecture not listed counts every layer as windowed (the estimate stays a lower bound)
+    // architecture not listed counts every layer as windowed (the estimate stays a lower bound);
+    // flint's loader requires the array, so flint always takes the file's pattern
     double full_share = 1;
     if (swa > 0) {
         long long every = 0;

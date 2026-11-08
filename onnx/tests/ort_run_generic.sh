@@ -87,5 +87,47 @@ check "and nothing was written" '[ ! -e "$scratch/no.bin" ]'
 "$bin" --model "$scratch/m.onnx" --input "x=$scratch/x.bin:bfloat16:1x4x4" >"$scratch/run4.log" 2>&1
 check "an unsupported dtype is refused by name" 'grep -q "not one this runner carries" "$scratch/run4.log"'
 
+# 6. ONNX's own integer ops (engine #1436): the pinned runtime has ConvInteger for uint8 x uint8 only, and
+#    DynamicQuantizeLinear always feeds uint8, so an int8-weight export cannot create a session. The refusal
+#    must say it is the runtime's coverage and point at the other exports; the uint8 x uint8 graph still runs.
+mkdir -p "$scratch/int8"
+cp "$scratch/m.onnx" "$scratch/int8/model.onnx"
+"$py" - "$scratch" <<'PY'
+import sys, numpy as np, onnx
+from onnx import TensorProto as T, helper
+d = sys.argv[1]
+w = (np.arange(9).reshape(1, 1, 3, 3) % 4)
+for wt, wn, name in ((T.INT8, np.int8, "model_int8.onnx"), (T.UINT8, np.uint8, "conv_u8u8.onnx")):
+    g = helper.make_graph([helper.make_node("ConvInteger", ["x", "W"], ["y"])], "conv_integer",
+                          [helper.make_tensor_value_info("x", T.UINT8, [1, 1, 4, 4])],
+                          [helper.make_tensor_value_info("y", T.INT32, [1, 1, 2, 2])],
+                          [helper.make_tensor("W", wt, [1, 1, 3, 3], w.astype(wn).ravel().tolist())])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    m.ir_version = 10
+    onnx.save(m, f"{d}/int8/{name}")
+np.save(f"{d}/int8/w.npy", w)
+np.arange(16, dtype=np.uint8).tofile(f"{d}/int8/x.bin")
+PY
+"$bin" --model "$scratch/int8/model_int8.onnx" --input "x=$scratch/int8/x.bin:uint8:1x1x4x4" >"$scratch/run5.log" 2>&1
+rc=$?
+check "a uint8 x int8 ConvInteger graph cannot create a session (non-zero rc $rc)" '[ $rc -ne 0 ]'
+check "the refusal says it is the runtime's kernel coverage" \
+  'grep -q "has no CPU kernel for ConvInteger at this graph.s input types: a runtime coverage gap" "$scratch/run5.log"'
+check "and what the pin does carry" 'grep -q "ConvInteger runs only uint8 x uint8" "$scratch/run5.log"'
+check "and the other exports next to it" 'grep -q "other exports in .*: conv_u8u8.onnx, model.onnx" "$scratch/run5.log"'
+"$bin" --model "$scratch/int8/conv_u8u8.onnx" --input "x=$scratch/int8/x.bin:uint8:1x1x4x4" \
+  --output "y=$scratch/int8/y.bin" >"$scratch/run6.log" 2>&1
+check "the uint8 x uint8 ConvInteger graph runs (rc 0)" '[ $? -eq 0 ]'
+"$py" - "$scratch" <<'PY'
+import sys, numpy as np
+d = sys.argv[1] + "/int8"
+x = np.fromfile(f"{d}/x.bin", dtype=np.uint8).reshape(4, 4).astype(np.int64)
+w = np.load(f"{d}/w.npy").reshape(3, 3)
+want = np.array([[(x[i:i + 3, j:j + 3] * w).sum() for j in range(2)] for i in range(2)])
+got = np.fromfile(f"{d}/y.bin", dtype="<i4").reshape(2, 2)
+sys.exit(0 if (got == want).all() else 1)
+PY
+check "and equals a numpy convolution" '[ $? -eq 0 ]'
+
 echo "ort_run_generic: $fail failure(s)"
 exit $fail

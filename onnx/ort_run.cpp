@@ -31,6 +31,7 @@
 // KV cache: the tokens/s printed here is that graph's rate, not the forward route's, and the two are
 // compared only where both do the same work (see docs/onnx.md, "Qwen3-0.6B").
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,6 +56,44 @@ int fail(const char* what, const OrtStatus* st) {
     std::fprintf(stderr, "onebit-ort-run: FAIL %s: %s\n", what, st ? api->GetErrorMessage(st) : "-");
     if (st) api->ReleaseStatus(const_cast<OrtStatus*>(st));
     return 1;
+}
+
+// "Could not find an implementation for ConvInteger(10) node ..." means the runtime has no kernel for
+// the op at these input types; it says nothing about the model or an EP. Say that, say what the pin
+// does carry for ONNX's integer ops (measured, docs/onnx.md "Integer-op exports"), and list the other
+// exports next to the model so the reader knows what to try instead (engine #1436).
+void explain_missing_kernel(const char* msg, const char* model_path) {
+    static const char kNeedle[] = "Could not find an implementation for ";
+    const char* at = msg ? std::strstr(msg, kNeedle) : nullptr;
+    if (!at) return;
+    std::string op(at + sizeof kNeedle - 1);
+    op = op.substr(0, op.find('('));
+    std::fprintf(stderr, "onebit-ort-run: the pinned ONNX Runtime has no CPU kernel for %s at this graph's input types: "
+                         "a runtime coverage gap, not a model or EP failure\n", op.c_str());
+    if (op == "ConvInteger")
+        std::fprintf(stderr, "onebit-ort-run:   ConvInteger runs only uint8 x uint8; DynamicQuantizeLinear feeds uint8, "
+                             "so an int8-weight export cannot load\n");
+    else if (op == "MatMulInteger")
+        std::fprintf(stderr, "onebit-ort-run:   MatMulInteger runs uint8 x uint8, uint8 x int8 and int8 x int8, not int8 x uint8\n");
+    std::string dir(model_path), self(model_path);
+    const size_t slash = dir.rfind('/');
+    dir = slash == std::string::npos ? "." : dir.substr(0, slash);
+    self = slash == std::string::npos ? self : self.substr(slash + 1);
+    std::vector<std::string> other;
+    if (DIR* d = opendir(dir.c_str())) {
+        while (const dirent* e = readdir(d)) {
+            const std::string n = e->d_name;
+            if (n != self && n.size() > 5 && n.compare(n.size() - 5, 5, ".onnx") == 0) other.push_back(n);
+        }
+        closedir(d);
+    }
+    std::sort(other.begin(), other.end());
+    if (!other.empty()) {
+        std::string list;
+        for (const auto& n : other) list += (list.empty() ? "" : ", ") + n;
+        std::fprintf(stderr, "onebit-ort-run:   other exports in %s: %s (a float or QDQ export uses no integer ops)\n",
+                     dir.c_str(), list.c_str());
+    }
 }
 
 // One registration pass: every --ep library in the order given, then the CPU device last, because
@@ -820,7 +859,9 @@ int onebit_ort_run_main(int argc, char** argv) {
 
     OrtSession* session = nullptr;
     if (OrtStatus* st = make_session(env, a.model, a.eps, a.threads, a.basic, a.profile, &session)) {
+        const std::string why = api->GetErrorMessage(st);
         int rc = fail("create session", st);
+        explain_missing_kernel(why.c_str(), a.model);
         api->ReleaseMemoryInfo(mi);
         api->ReleaseEnv(env);
         return rc;

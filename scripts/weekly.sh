@@ -556,6 +556,14 @@ stage_package() {
     LIBHSA=$(ls -d "$HRX_TOOLCHAIN"/lib/python3*/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 2>/dev/null | head -1) \
         "$SRC/scripts/mk-plugin-package.sh" "$W/lemonade/1bit" "$OUT" "$tag" > "$LOGS/distro-packages.log" 2>&1 ||
         { cat "$LOGS/distro-packages.log"; return 1; }
+    say "package $tag: proof, one clean container per family"
+    # Nothing is published that nobody installed: every family is installed in a throwaway container of
+    # its distribution, the engine is asked for its version and the shim is run, the removal is checked,
+    # the tarball is unpacked as root the way the guide says, and the four are compared as root so a
+    # package that carries a different payload fails here rather than on a user's machine
+    # (scripts/pack-proof.sh). docker is already required to build the .rpm and the Arch package.
+    "$SRC/scripts/pack-proof.sh" "$OUT" "$tag" > "$LOGS/pack-proof.log" 2>&1 ||
+        { cat "$LOGS/pack-proof.log"; return 1; }
     install -m 755 "$SRC/scripts/lemond-onebit.sh" "$W/lemonade/lemond-onebit"
     # links out of the tree (the web app's KaTeX fonts -> the build machine's fonts-katex) become
     # copies of their targets; the links inside it stay links

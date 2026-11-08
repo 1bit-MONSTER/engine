@@ -268,8 +268,11 @@ def quantize(fp32_dir: str, out_dir: str, calib: int, stream: bool = False, clip
     bucket, so the row is reproducible; a real deployment would calibrate on its own data.
     """
     if stream:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # tools/vision_qdq.py sits beside this file
         import vision_qdq
 
+        # same contract as the ORT path below: 1 when the quantised graph misses the cosine bar, so a failing graph can
+        # never exit 0
         return vision_qdq.quantise(os.path.join(fp32_dir, "vision_fp32.onnx"), os.path.join(out_dir, "vision_qdq.onnx"),
                                    calib=calib, clip_percentile=clip_percentile)
 
@@ -367,8 +370,7 @@ def main():
         export(a.hf_dir, a.out_dir, a.opset)
         return 0
     if a.cmd == "quantize":
-        quantize(a.fp32_dir, a.out_dir, a.calib, a.stream, a.clip_percentile)
-        return 0
+        return quantize(a.fp32_dir, a.out_dir, a.calib, a.stream, a.clip_percentile)
     if a.cmd == "bench":
         return bench(a.out_dir, a.images, a.providers)
     return check(a.hf_dir, a.out_dir, a.images, a.onnx)

@@ -384,12 +384,9 @@ private:
     const float* deepstack_ = nullptr;
     int deepstack_rows_ = 0;
     int deepstack_lo_ = -1, deepstack_hi_ = -1;
-    // Which plane a rotary frequency belongs to under interleaved MRoPE (semantics' mrope_section, contiguous).
-    int mrope_plane(int freq) const {
-        if (sem_.n_mrope_section < 3) return 0;
-        const int a = sem_.mrope_section[0], b = sem_.mrope_section[0] + sem_.mrope_section[1];
-        return freq < a ? 0 : (freq < b ? 1 : 2);
-    }
+    // Which plane a rotary frequency belongs to under interleaved MRoPE.  The rule lives in q4nx_semantics.h as
+    // q4nx_mrope_axis() so the C unit test can pin it without building a forward pass.
+    int mrope_plane(int freq) const { return q4nx_mrope_axis(freq, sem_.n_mrope_section, sem_.mrope_section); }
     // Some models store the embedding QUANTIZED (Gemma4-E2B/E4B: dtype I8), and
     // reading it as bf16 yields ~zero - which invalidated the whole forward and
     // the tied LM head (all-zero logits).  When the dtype is not BF16 the

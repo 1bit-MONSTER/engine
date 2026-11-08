@@ -13,8 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
 """Streaming QDQ A8W8 for the vision graph: one weight tensor in memory at a time.
 
 Used by `export_qwen3vl_vision.py quantize --stream`.
@@ -23,11 +21,13 @@ ORT's quantize_static needs ~64 GiB peak for this 1.6 GB graph (measured: the sy
 the OOM killer), which a shared box cannot spare. This does the same job by editing the graph directly:
 
   * weights: per-output-channel symmetric int8, emitted as QuantizeLinear -> DequantizeLinear pairs;
-  * activations: per-tensor symmetric int8 before each MatMul, with the scale calibrated from a few images (the fp32
-    graph is run once with every MatMul input exposed as an output, so no intermediate probing library is needed);
+  * activations: per-tensor symmetric int8 in front of every `Gemm` (the projections; attention's activation-times-
+    activation `MatMul`s are left float, see `matmul_weights`), with the scale calibrated from a few images -- the fp32
+    graph is run once with every `Gemm` input exposed as an output, so no intermediate probing library is needed;
   * everything else (Conv, norms, softmax, split) stays float.
 
-    qdq_stream.py <fp32 onnx> <out onnx> [--calib N]
+    vision_qdq.py <fp32 onnx> <out onnx> [--calib N]        (normally reached as `export_qwen3vl_vision.py
+                                                             quantize --stream`)
 """
 import argparse
 import json
@@ -37,8 +37,6 @@ import sys
 import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
-
-sys.path.insert(0, "/tmp/qvl")
 
 
 def matmul_weights(model):
@@ -75,32 +73,30 @@ def expose_outputs(model, names):
         model.graph.output.append(helper.make_tensor_value_info(nm, TensorProto.FLOAT, None))
 
 
-def run_calibration(path, names, images, bucket, patch, temporal, real_image="", calib_pv="", clip_pct=99.9):
+def make_image(rng, gh, gw, patch, temporal):
+    """A deterministic image at the exported bucket: two gradients plus a chequerboard, in [0, 1] before normalising."""
+    H, W = gh * patch, gw * patch
+    yy, xx = np.mgrid[0:H, 0:W]
+    img = np.zeros((3, H, W), dtype=np.float32)
+    img[0] = (yy / max(H - 1, 1)) * 0.8 + 0.1
+    img[1] = (xx / max(W - 1, 1)) * 0.8 + 0.1
+    img[2] = ((yy // 32 + xx // 32) % 2) * 0.7 + 0.1
+    img += rng.normal(0, 0.02, img.shape).astype(np.float32)
+    img = np.clip(img, 0, 1)
+    blocks = img.reshape(3, gh, patch, gw, patch).transpose(1, 3, 0, 2, 4)
+    if temporal != 1:
+        blocks = np.repeat(blocks[:, :, None], temporal, axis=2)
+    return blocks.reshape(gh * gw, 3 * temporal * patch * patch).astype(np.float32)
+
+
+def run_calibration(path, names, images, bucket, patch, temporal, calib_pv="", clip_pct=99.9):
     import onnxruntime as ort
-    # the same deterministic image generator the tool's check rows use, copied here so the streaming quantiser does not
-    # depend on the harness script
-    from hybrid_input import image_rows  # noqa: F401  (the real image path is exercised by the check rows)
-    def make_image(rng, gh, gw, patch, temporal):
-        H, W = gh * patch, gw * patch
-        yy, xx = np.mgrid[0:H, 0:W]
-        img = np.zeros((3, H, W), dtype=np.float32)
-        img[0] = (yy / max(H - 1, 1)) * 0.8 + 0.1
-        img[1] = (xx / max(W - 1, 1)) * 0.8 + 0.1
-        img[2] = ((yy // 32 + xx // 32) % 2) * 0.7 + 0.1
-        img += rng.normal(0, 0.02, img.shape).astype(np.float32)
-        img = np.clip(img, 0, 1)
-        blocks = img.reshape(3, gh, patch, gw, patch).transpose(1, 3, 0, 2, 4)
-        if temporal != 1:
-            blocks = np.repeat(blocks[:, :, None], temporal, axis=2)
-        return blocks.reshape(gh * gw, 3 * temporal * patch * patch).astype(np.float32)
 
     sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
     got = {nm: 0.0 for nm in names}   # the max over images of each image's p99.9 |x| (see --clip-percentile)
     feeds = []
     if calib_pv:                                # the real picture first: synthetic gradients do not bound a photo
         feeds.append(np.load(calib_pv).astype(np.float32))
-    elif real_image:
-        feeds.append(image_rows(real_image))
     rng = np.random.default_rng(3)
     for _ in range(images):
         feeds.append(make_image(rng, bucket, bucket, patch, temporal))
@@ -116,10 +112,11 @@ def run_calibration(path, names, images, bucket, patch, temporal, real_image="",
     return got
 
 
-def quantise(src, dst, calib=6, clip_percentile=99.9, calib_pv="", bucket=28, patch=16, temporal=2):
+def quantise(src, dst, calib=6, clip_percentile=99.9, calib_pv="", bucket=28, patch=16, temporal=2,
+             bar=0.999):
     """Quantise `src` into `dst` (+ `dst`.data). Returns the number of quantised weights."""
     a = argparse.Namespace(src=src, dst=dst, calib=calib, bucket=bucket, patch=patch, temporal=temporal,
-                           no_act_qdq=False, real_image="", calib_pv=calib_pv, clip_percentile=clip_percentile)
+                           no_act_qdq=False, calib_pv=calib_pv, clip_percentile=clip_percentile, bar=bar)
     return _run(a)
 
 
@@ -132,8 +129,8 @@ def main():
     ap.add_argument("--bucket", type=int, default=28)
     ap.add_argument("--patch", type=int, default=16)
     ap.add_argument("--temporal", type=int, default=2)
-    ap.add_argument("--real-image", default="", help="calibrate on this image too (needs PIL)")
     ap.add_argument("--calib-pv", default="", help="calibrate on these pixels (a .npy), so no PIL is needed here")
+    ap.add_argument("--bar", type=float, default=0.999, help="self-check cosine bar against the fp32 graph")
     ap.add_argument("--clip-percentile", type=float, default=99.9,
                     help="per-tensor |x| percentile used as the activation range (100 = plain max, which loses a tensor "
                          "to one outlier: measured 103/104 tensors diverge)")
@@ -141,6 +138,7 @@ def main():
 
 
 def _run(a):
+    os.makedirs(os.path.dirname(os.path.abspath(a.dst)), exist_ok=True)
     model = onnx.load(a.src)                      # ~2 GB in memory; the weights are not copied per tensor
     pairs, inits = matmul_weights(model)
     print(f"{len(pairs)} MatMul weights to quantise")
@@ -152,8 +150,7 @@ def _run(a):
     cpath = a.dst + ".calib.onnx"
     onnx.save(calib_model, cpath)
     del calib_model
-    act_absmax = run_calibration(cpath, names, a.calib, a.bucket, a.patch, a.temporal, a.real_image, a.calib_pv,
-                                 a.clip_percentile)
+    act_absmax = run_calibration(cpath, names, a.calib, a.bucket, a.patch, a.temporal, a.calib_pv, a.clip_percentile)
     os.unlink(cpath)
     vals = sorted(act_absmax.values())
     tiny = [nm for nm, v in act_absmax.items() if v < 1e-3]
@@ -229,7 +226,31 @@ def _run(a):
                     location=os.path.basename(a.dst) + ".data", size_threshold=1024)
     print(f"wrote {a.dst} ({os.path.getsize(a.dst) / 1e6:.1f} MB) + .data "
           f"({os.path.getsize(a.dst + '.data') / 1e6:.1f} MB); {len(replaced)} weights, {len(act_emitted)} activations")
-    return len(replaced)
+    return self_check(a.src, a.dst, images=3, bar=a.bar)
+
+
+def self_check(fp32_path, qdq_path, images=3, bar=0.999):
+    """Cosine of every output against the fp32 graph on the same images; 1 if it clears `bar`, 0 if it does not.
+
+    The ORT path in export_qwen3vl_vision.py gates itself the same way, and the point is that a graph below the bar must
+    not exit 0: the A8W8 output measures 0.61-0.91, so this path has to be able to fail.
+    """
+    import onnxruntime as ort
+
+    a = ort.InferenceSession(fp32_path, providers=["CPUExecutionProvider"])
+    b = ort.InferenceSession(qdq_path, providers=["CPUExecutionProvider"])
+    rng = np.random.default_rng(11)
+    worst = 1.0
+    for _ in range(images):
+        pv = make_image(rng, 28, 28, 16, 2)
+        feed = {"pixel_values": pv, "image_grid_thw": np.array([[1, 28, 28]], dtype=np.int64)}
+        for x, y in zip(a.run(None, feed), b.run(None, feed)):
+            x, y = x.reshape(-1).astype(np.float64), y.reshape(-1).astype(np.float64)
+            worst = min(worst, float(np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12)))
+    ok = worst >= bar
+    print(f"self-check: worst cosine {worst:.6f} against the fp32 graph on {images} images "
+          f"({'PASS' if ok else 'FAIL'}; the bar is {bar})")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

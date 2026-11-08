@@ -97,6 +97,32 @@ int main(void) {
     q4nx_semantics_from_config(cfg, dir, &s);
     check(s.mrope == 0, "mrope_interleaved:false stays plain");
 
+    /* 5. The interleaved axis rule (engine #1498).  The sections are stride-3 windows, not contiguous runs: at
+     *    [24, 20, 20] there must be 24 t, 20 h and 20 w frequencies out of 64, and the h/w windows must sit on
+     *    i % 3 == 1 / 2 and stop at 3 * section[dim].  A contiguous split puts 40 of the 64 on the wrong axis. */
+    {
+        int sec[3] = {24, 20, 20};
+        int count[3] = {0, 0, 0};
+        for (int i = 0; i < 64; i++) count[q4nx_mrope_axis(i, 3, sec)]++;
+        check(count[0] == 24 && count[1] == 20 && count[2] == 20, "interleaved [24,20,20] -> 24 t / 20 h / 20 w");
+        check(q4nx_mrope_axis(1, 3, sec) == 1 && q4nx_mrope_axis(4, 3, sec) == 1, "i%3==1 is the h window");
+        check(q4nx_mrope_axis(2, 3, sec) == 2 && q4nx_mrope_axis(5, 3, sec) == 2, "i%3==2 is the w window");
+        check(q4nx_mrope_axis(0, 3, sec) == 0 && q4nx_mrope_axis(3, 3, sec) == 0, "i%3==0 stays t");
+        check(q4nx_mrope_axis(60, 3, sec) == 0, "past 3 * section[1] the h window closes (i=60 is t)");
+        check(q4nx_mrope_axis(61, 3, sec) == 0 && q4nx_mrope_axis(62, 3, sec) == 0,
+              "past 3 * section[2] the w window closes too");
+        /* the contiguous mapping this replaces, for the record: 43 of 64 differ (measured, and the number the
+         * reviewer gave for engine #1498) */
+        int diff = 0;
+        for (int i = 0; i < 64; i++) {
+            int old = i < 24 ? 0 : (i < 44 ? 1 : 2);
+            if (old != q4nx_mrope_axis(i, 3, sec)) diff++;
+        }
+        check(diff == 43, "the contiguous reading differs on 43 of 64 frequencies");
+        /* and with no sections nothing rotates off the t plane */
+        check(q4nx_mrope_axis(1, 0, sec) == 0, "no mrope_section -> plain (t) axis");
+    }
+
     if (failures) { printf("q4nx_mrope: %d failure(s)\n", failures); return 1; }
     printf("q4nx_mrope: ok\n");
     return 0;

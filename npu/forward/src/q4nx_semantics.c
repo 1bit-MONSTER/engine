@@ -232,13 +232,19 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
     /* Deepstack layers: the vision tower emits extra feature sets that the decoder adds at these layer indexes. */
     {
         const char* vc = value_for_top(json, "vision_config");
-        const char* at = vc ? strstr(vc, "deepstack_visual_indexes") : nullptr;
+        const char* at = vc ? strstr(vc, "deepstack_visual_indexes") : NULL;
         if (at) at = strchr(at, '[');
         if (at) {
             int got = 0;
             const char* p3 = at + 1;
-            for (; p3 && *p3 && *p3 != ']' && got < 8; p3++) {
-                if (*p3 >= '0' && *p3 <= '9') s->deepstack_layers[got++] = (int)strtol(p3, (char**)&p3, 10);
+            while (*p3 && *p3 != ']' && got < 8) {
+                if (*p3 >= '0' && *p3 <= '9') {
+                    char* end = NULL;
+                    s->deepstack_layers[got++] = (int)strtol(p3, &end, 10);
+                    p3 = end;   /* strtol already stopped on the separator; a for-clause p3++ would skip the ']' */
+                } else {
+                    p3++;
+                }
             }
             s->n_deepstack = got;
         }
@@ -257,9 +263,13 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
             if (!at) continue;
             int got = 0;
             const char* p2 = at + 1;
-            for (; p2 && *p2 && *p2 != ']' && got < 3; p2++) {
+            while (*p2 && *p2 != ']' && got < 3) {
                 if (*p2 >= '0' && *p2 <= '9') {
-                    s->mrope_section[got++] = (int)strtol(p2, (char**)&p2, 10);
+                    char* end = NULL;
+                    s->mrope_section[got++] = (int)strtol(p2, &end, 10);
+                    p2 = end;   /* as above: let strtol move the cursor, not the loop */
+                } else {
+                    p2++;
                 }
             }
             s->n_mrope_section = got;

@@ -3236,23 +3236,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
 
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
-        cur_layer_ = l;
-        // Deepstack (Qwen3-VL's vision tower emits three extra sets, added at these layers): the reference adds set
-        // s to the hidden state before the layer runs. With no sets (text-only, or the control arm) this is skipped
-        // and the pass is byte-identical to before.
-        if (deepstack_ && sem_.n_deepstack > 0) {
-            for (int s2 = 0; s2 < sem_.n_deepstack; s2++) {
-                if (sem_.deepstack_layers[s2] != l) continue;
-                // Only the image rows: a set has rows_img rows, and the reference adds it at the image-token
-                // positions, not across the prompt.
-                const float* add = deepstack_ + size_t(s2) * size_t(deepstack_rows_) * size_t(H);
-                const int lo = std::max(0, deepstack_lo_), hi = std::min((int)M, deepstack_hi_);
-                for (int r = lo; r < hi; r++)
-                    for (size_t k = 0; k < (size_t)H; k++)
-                        X[size_t(r) * (size_t)H + k] += add[size_t(r - lo) * (size_t)H + k];
-                break;
-            }
-        }
+        cur_layer_ = l;   // (removed with the old pre-layer deepstack block by accident; every layer read the last one)
         const bool cached = weight_cached(0);
         const int lt0 = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
         // A GDN layer's host parameters (conv window, alpha/beta, ssm_a/dt, gated
@@ -3552,6 +3536,21 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 }
                 fprintf(stderr, "  [LB] m=%d l=%d %.6f %.4f\n", m, l, ms / H, mmx);
             }
+        }
+        // Deepstack, in the reference's place: set `l` is added to the hidden state AFTER text decoder layer `l`
+        // runs, for l < number of sets (transformers Qwen3VLTextModel.forward: "add visual features to the hidden
+        // states of first several layers", `hidden_states = _deepstack_process(hidden_states, mask, sets[layer_idx])`
+        // inside the loop, after the call). The pack's `deepstack_visual_indexes` are the VISION tower's layers the
+        // sets are tapped from (5/11/17 for this model) and are not text layer indexes -- using them here put the
+        // three sets at text layers 8/16/24, before the layer, which is why the image prompts answered "A\n".
+        if (deepstack_ && l < sem_.n_deepstack) {
+            // Only the image rows: a set has rows_img rows, and the reference adds it at the image-token positions,
+            // not across the prompt.
+            const float* add = deepstack_ + size_t(l) * size_t(deepstack_rows_) * size_t(H);
+            const int lo = std::max(0, deepstack_lo_), hi = std::min((int)M, deepstack_hi_);
+            for (int r = lo; r < hi; r++)
+                for (size_t k = 0; k < (size_t)H; k++)
+                    X[size_t(r) * (size_t)H + k] += add[size_t(r - lo) * (size_t)H + k];
         }
     }
 

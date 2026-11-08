@@ -1922,6 +1922,7 @@ int serve_models(const Options& o) {
             d.cls = "pinned";
         } else {
             const std::string state = last_user_text(body);
+            d.state = bounded_state(state, d.state_len);   // the log carries what was classified (#1313)
             onebit::laya::RequestClass cls;
             {
                 std::lock_guard<std::mutex> lock(cache_mu);

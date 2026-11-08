@@ -887,6 +887,28 @@ another box means linking that box's set the same way. Leaving `--kernels` out i
 (the container has no `npu/`, and `1bit forward-serve -m <model.q4nx> --kernels <dir>` still takes the set
 on the command line).
 
+### Rebuilding the prefill GEMM at another T, and gating it
+
+`tools/npu_prefill_tgate.sh` builds the prefill GEMM kernel at one or more T values and runs the design's own
+numeric gate on each build (`make_test.py`'s fp64 reference from the same q4_1 pool bytes → `run_kernel` →
+`compare.py`'s per-token cosine). It exists because the three things it needs were each rediscovered by hand:
+the toolchain that actually builds our designs, the fixture generator, and the device gate.
+
+    npu-hold -l <label> -t 10 -- T_LIST="256 512 1024" tools/npu_prefill_tgate.sh
+
+The **toolchain pin is load-bearing** and is printed by every run: `aiecc` **20a9c2fb2dc** with Peano
+**22.0.0 (llvm-aie 773413fb18d0)**, both inside `~/amd-oss/iron-venv` (the Peano install is in that venv's
+`site-packages/llvm-aie`, which is why a plain `find` for `clang++` does not turn it up). The other venv on
+this box, `~/amd-oss/iron-upstream-venv` (aiecc `d53582d3e0f`), does **not** build these designs — it rejects
+`--alloc-scheme=basic-sequential` — so a build that fails with that message is a wrong venv, not a wrong design.
+
+What the gate showed on 2026-11-08 for shape `qkv` (N=2560, K=2560), three runs per build: T=256 **2.415 ms**,
+T=512 **4.766 ms**, T=1024 **9.832 ms**, all three numerically PASS (per-token cosine min 0.9999947-0.9999949).
+Per-run time scales **linearly with T**, which is the design's documented weight refetch: the weight column is
+re-streamed once per T-tile, so a bigger T buys no weight reuse. That is also why the flat per-tile time in
+`docs/hetero-prefill.md` is not evidence of a kernel that keeps weights resident — it is evidence of the
+opposite, and a reuse restructure is the measured follow-up (engine#1421).
+
 ### The `.fconst` attention payload
 
 A layer block's attention payload sits between its two epsilon headers and is a whole number of

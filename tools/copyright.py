@@ -10,6 +10,7 @@ EXEMPT and skipped.
 """
 import argparse
 import fnmatch
+import re
 import subprocess
 import sys
 
@@ -126,6 +127,21 @@ def exempt(path):
 
 NOTICE_WINDOW = 20      # the lines has_notice() looks at; duplicated_notice() uses the same window
 
+BUILD_DIR = re.compile(r"(^|/)(build[^/]*|cmake-build[^/]*)/")
+
+
+def under_build_dir(path):
+    """True when a path sits in a build tree, tracked or not.
+
+    A build tree holds generated sources (`build*/generated/recipes_default.h` and friends) that carry no
+    notice by design, and it is never repo content until someone commits it. Before this, an untracked
+    generated `.h` was not skipped the way an unknown-style file is -- `.h` IS a known style, so it went
+    straight to missing[] -- and a developer clone with a build dir read 36 "missing copyright notice"
+    lines while `main` was clean. Only the untracked case is skipped: a TRACKED file in a build tree is
+    still an error, because then it is repo content (engine#1564's argument, applied to a known style).
+    """
+    return BUILD_DIR.search(path) is not None
+
 
 def has_notice(text):
     head = "\n".join(text.splitlines()[:NOTICE_WINDOW])
@@ -174,6 +190,8 @@ def main():
     missing, unknown, duplicated = [], [], []
     for path in filter(None, files):
         if exempt(path):
+            continue
+        if path in untracked and under_build_dir(path):
             continue
         block = notice_block(path)
         if block is None:

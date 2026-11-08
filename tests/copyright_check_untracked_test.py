@@ -147,5 +147,23 @@ with tempfile.TemporaryDirectory() as repo:
     check("no comment style known" in (rc.stdout + rc.stderr), "and it is named as an unknown style",
           rc.stdout + rc.stderr)
 
+    # A build tree's generated sources carry no notice by design, and `.h` IS a known style, so before this
+    # an untracked `build*/generated/*.h` went straight to missing[] -- 36 of them in a developer clone with a
+    # build dir, while `main` was clean. Untracked + under a build dir is skipped; TRACKED is still an error.
+    git(repo, "rm", "-q", "--cached", "probe-dump.jsonl")
+    git(repo, "commit", "-q", "-m", "drop the tracked jsonl")
+    os.makedirs(os.path.join(repo, "build-1336", "generated"))
+    with open(os.path.join(repo, "build-1336", "generated", "recipes_default.h"), "w") as f:
+        f.write("static const int k = 1;\n")
+    rc = run(repo, "--check")
+    check(rc.returncode == 0,
+          "an UNTRACKED generated source in a build tree is skipped, not failed",
+          rc.stdout + rc.stderr)
+    git(repo, "add", "-f", "build-1336/generated/recipes_default.h")
+    git(repo, "commit", "-q", "-m", "track a generated header")
+    rc = run(repo, "--check")
+    check(rc.returncode != 0, "the same generated source TRACKED is still an error: it is repo content now",
+          rc.stdout + rc.stderr)
+
 print(f"copyright_check_untracked_test: {len(FAIL)} failure(s)")
 sys.exit(1 if FAIL else 0)

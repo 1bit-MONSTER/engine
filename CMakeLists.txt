@@ -1269,6 +1269,12 @@ if(ONEBIT_NPU)
     # model's own table must give byte-identical logits to the token-id path, on the host and on the array.
     # The three-plane (MRoPE) position input: equal planes must be byte-identical to plain RoPE, different planes
     # must move the logits (npu/forward/mrope_planes_probe.cpp).
+    # The wiring a vision-conditioned prompt needs on the engine side: vision rows + 3-plane positions + deepstack
+    # sets through step_batch_embeds(), then a greedy decode (npu/forward/hybrid_prompt_probe.cpp).
+    add_executable(hybrid_prompt_probe npu/forward/hybrid_prompt_probe.cpp)
+    target_include_directories(hybrid_prompt_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
+        ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)
+    target_link_libraries(hybrid_prompt_probe PRIVATE onebit_npu_forward onebit_npu_rt)
     add_executable(mrope_planes_probe npu/forward/mrope_planes_probe.cpp)
     target_include_directories(mrope_planes_probe PRIVATE ${CMAKE_SOURCE_DIR}/npu
         ${CMAKE_SOURCE_DIR}/npu/forward/include ${CMAKE_SOURCE_DIR}/npu/forward/engine-src)

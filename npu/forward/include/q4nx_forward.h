@@ -161,6 +161,11 @@ public:
         const std::vector<int>* position_ids = nullptr;
         const float* deepstack = nullptr;
         int deepstack_sets = 0;
+        // The rows the deepstack sets belong to: the image span. They are added THERE, not everywhere -- a set has
+        // rows_img rows, so adding it to every row of the prompt would both be the wrong function and read past the
+        // buffer (the first version of this did exactly that and produced garbage tokens).
+        int image_lo = -1;
+        int image_hi = -1;
     };
     const int* deepstack_layers() const { return sem_.deepstack_layers; }
     int n_deepstack_layers() const { return sem_.n_deepstack; }
@@ -378,6 +383,7 @@ private:
     // Set only while a step_batch_embeds() call carries deepstack sets: sets x rows x H.
     const float* deepstack_ = nullptr;
     int deepstack_rows_ = 0;
+    int deepstack_lo_ = -1, deepstack_hi_ = -1;
     // Which plane a rotary frequency belongs to under interleaved MRoPE (semantics' mrope_section, contiguous).
     int mrope_plane(int freq) const {
         if (sem_.n_mrope_section < 3) return 0;

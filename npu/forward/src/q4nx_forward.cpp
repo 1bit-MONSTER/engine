@@ -3062,6 +3062,11 @@ bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int sta
             return false;
         }
         if (!in.deepstack) { err_ = "step_batch_embeds: deepstack_sets without a buffer"; return false; }
+        if (in.image_lo < 0 || in.image_hi <= in.image_lo || in.image_hi > rows) {
+            err_ = "step_batch_embeds: deepstack sets need the image row span (image_lo/image_hi inside 0.." +
+                   std::to_string(rows) + ")";
+            return false;
+        }
     }
     const std::vector<int> placeholder(size_t(rows), 0);
     struct Restore {
@@ -3070,13 +3075,17 @@ bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int sta
         int& n;
         const float*& d;
         int& dn;
-        ~Restore() { p = nullptr; q = nullptr; n = 0; d = nullptr; dn = 0; }
-    } restore{inject_embeds_, pos3_, pos3_rows_, deepstack_, deepstack_rows_};
+        int& lo;
+        int& hi;
+        ~Restore() { p = nullptr; q = nullptr; n = 0; d = nullptr; dn = 0; lo = -1; hi = -1; }
+    } restore{inject_embeds_, pos3_, pos3_rows_, deepstack_, deepstack_rows_, deepstack_lo_, deepstack_hi_};
     inject_embeds_ = embeds.data();
     pos3_ = position_ids.empty() ? nullptr : position_ids.data();
     pos3_rows_ = rows;
     deepstack_ = in.deepstack;
-    deepstack_rows_ = rows;
+    deepstack_rows_ = in.image_hi - in.image_lo;
+    deepstack_lo_ = in.image_lo;
+    deepstack_hi_ = in.image_hi;
     return step_batch(placeholder, start_pos, logits);
 }
 
@@ -3234,8 +3243,13 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         if (deepstack_ && sem_.n_deepstack > 0) {
             for (int s2 = 0; s2 < sem_.n_deepstack; s2++) {
                 if (sem_.deepstack_layers[s2] != l) continue;
+                // Only the image rows: a set has rows_img rows, and the reference adds it at the image-token
+                // positions, not across the prompt.
                 const float* add = deepstack_ + size_t(s2) * size_t(deepstack_rows_) * size_t(H);
-                for (size_t i = 0; i < X.size(); i++) X[i] += add[i];
+                const int lo = std::max(0, deepstack_lo_), hi = std::min((int)M, deepstack_hi_);
+                for (int r = lo; r < hi; r++)
+                    for (size_t k = 0; k < (size_t)H; k++)
+                        X[size_t(r) * (size_t)H + k] += add[size_t(r - lo) * (size_t)H + k];
                 break;
             }
         }

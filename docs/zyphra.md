@@ -171,8 +171,10 @@ described bytes that no longer exist. **The code column moved less than the wiki
 is the expected shape: the form's own perturbation (~1e-4 KLD) is an order of magnitude below a quantised arm's error (1e-3 to 4e-2), so a corpus
 comparison is the wrong instrument for seeing it. Two 2.7B arms that were in the old table are gone from this one: `Q5_K_M` (never rebuilt in the
 adapter form) and `Zamba2-7B-Instruct`'s `Q5_K_M`, which is **withdrawn** — it misses the top-1 bar in this layout. The two *pending* code cells are a
-paused job, not a missing measurement: the CPU pass whose other three arms are in this table was stopped to stop starving the GPU queue
-(see the state file, 2026-11-07 22:2x), and it resumes from those two arms.
+paused job, not a missing measurement: the CPU pass whose other three arms are in this table was stopped to stop starving the GPU queue, and each
+attempt since has been refused by a different precondition rather than by the code — a 4-core job that measured **0.19 of one core** while three
+`thermal-run` scopes shared the same pinned cores, and then less than 6 GiB of free RAM against the ~7 GiB a 7B perplexity needs to load. It resumes
+from those two arms when the box has both, and until then the cells stay marked rather than being filled from a neighbouring window.
 
 † the wikitext row is the **pre-#1036 file**; that arm was never re-measured on wikitext after the dedupe (its KLD is layout-invariant —
 proven by the 0.000000 identity check — but a 4-bit arm's type mix can shift with the copy count, see `Q5_K_M` above). The pass ran in two

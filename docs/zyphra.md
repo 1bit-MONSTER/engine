@@ -214,14 +214,16 @@ than the quality row next to it. Tctl is read at the end of the run; all rows ar
 | Zamba2-2.7B-instruct | **Q4_K_M-imx** | 610.27 | 25.57 | 22.04 | 68 C |
 | Zamba2-2.7B-instruct | **Q6_K** | 343.42 | 25.10 | 17.83 | 69 C |
 | Zamba2-2.7B-instruct | Q8_0 | 363.24 | 25.79 | 32.87 | 66 C |
-| Zamba2-7B-Instruct | **Q5_K_M** | 235.70 | 11.54 | 10.52 | 69 C |
+| Zamba2-7B-Instruct | Q5_K_M *(merged-form pick, retired)* | 235.70 | 11.54 | 10.52 | 69 C |
 | Zamba2-7B-Instruct | Q8_0 | 140.64 | 10.22 | 13.08 | 66 C |
 | Zamba-7B-v1 | **Q6_K** | 108.07 | 92.28 | 12.20 | 64 C |
 | Zamba-7B-v1 | Q8_0 | 100.54 | 89.14 | 11.40 | 63 C |
 | BlackMamba-2.8B | **Q8_0** | 4985.27 | 5082.12 | 164.81 | 70 C |
 | BlackMamba-2.8B | IQ4_XS-imx | 5065.11 | 5167.39 | 139.64 | 62 C |
 
-(`tok/s`, three repeats; bold = the model's sweet-spot pick. ZR1-1.5B has no row from this harness — its arms are measured by the
+(`tok/s`, three repeats; bold = the model's sweet-spot pick. **`Zamba2-7B-Instruct`'s bold row is its retired merged-form pick** — the
+adapter form's sweet spot is `Q6_K`, which had no row here until the re-bench below; there is no ranking to be read from a bold cell in that column.
+ZR1-1.5B has no row from this harness — its arms are measured by the
 1BP lane on the same KLD harness, not benched here.) **Which rows share a window matters more than which number is bigger**: the three
 Zamba2-2.7B rows are one ticket (20:43-21:16) that failed its own control, and the four `Zamba-7B-v1`/`BlackMamba` rows are **one ticket
 (2026-11-06 04:59-05:08) that passed it** — GTT in use 35.7-38.7 GiB across all four arms, the same two idle `llama-server`s at both ends,
@@ -250,9 +252,11 @@ have been measured in three windows and answered differently every time.
   |---|---|---|---|
   | `pp8` | 114.19 tok/s | 14.03 tok/s | **8.1×** |
   | `pp512` | 145.09 tok/s (sd 79.2) | 26.63 tok/s (sd 8.5) | **5.4×** |
-  | `tg128` | 16.50 tok/s | 10.24 tok/s (sd 7.3) | 0.6× — not a stable reading |
+  | `tg128` | 16.50 tok/s (sd 0.3) | 10.24 tok/s (sd 7.3) | **1.61×** — direction only, the block arm's sd is 71 % |
 
-  **5.4× at the shape that matters**, for a **50 MiB** difference in a 5.8 GiB file, and the arms differ in nothing else. The independent report from the
+  **5.4× at `pp512` — direction stable, magnitude not**, for a **50 MiB** difference in a 5.8 GiB file, and the arms differ in nothing else.
+  The F16 arm's own sd is **79.2 on 145.09 (CV 55 %)** and the block arm's is 32 %, so the ratio is an order of magnitude, not a measured multiple:
+  read it as "several times slower", and treat `pp8`'s 8.1× the same way. The independent report from the
   lane that found the trap measures ~1.3× on its own build and model, so the *size* of the penalty is file- and shape-dependent — but its direction and its
   cause are not, and no card may quote a `tok/s` for a Zamba2 file without saying which quantizer produced it.
   **And when reporting which file suffered it, quote the types read out of the produced GGUF, never the ones you asked for** — the quantizer substitutes

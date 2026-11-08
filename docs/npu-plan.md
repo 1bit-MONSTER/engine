@@ -65,7 +65,8 @@ tools/npu_plan.py <model dir> [--kernels DIR] [--out PATH] [--check] [--print]
 | `kv.key`, `kv.value` | what the KV cache is stored as, per side: `f16` (the meaning of an absent `kv` block, and of every plan written before P7) or `int8`. `int8` is int8 with **one fp32 scale per (head, token)**, taken *after* a per-head Hadamard rotation — the rotation is what makes one scale affordable, because it collapses the per-channel magnitude spread the scale would otherwise have to cover. `key` is the side that costs no un-rotation (`(QH)(KH)ᵀ = QKᵀ`), so storing K rotated and rotating Q needs no inverse transform; `value` is a separate choice because an int8 V needs one on the output, which is why K-only is the cheap variant to prove the path with. This is a description until a target opens it: a target without the capability refuses `int8` **by name**, never serves f16 in its place. That check is `check_kv_caps` in `npu/target/target.h`, called from every target's `open()`, and it is gated device-free (`ctest -R npu_target_caps`) |
 | `kv.hadamard.block`, `kv.hadamard.signs` | the rotation itself: `block` is `0` (no rotation) or a power of two in `[2, 65536]` — the head width the rotation runs over — and `signs` is an optional **bare file name** (no directory part, under the model dir) for per-channel signs. A `signs` file with `block: 0` is refused rather than ignored |
 | `moe.batched_expert_gu` | `{enabled, K, N}`; when enabled, K and N must be named |
-| `layers[]` | one entry per layer, in order: `index`, `role` (`attn`/`gdn`/`moe`/`mla`), and projections `qkv {K, N, fused}`, `attn_gate {K, N}`, `gate_up {K, N}`, `down {K, N}`. The count must equal `model.layers`. The projection shapes are recorded for P4’s `NpuModel`; the current forward reads only the count (for its [plan] log line) and derives designs from the container |
+| `designs[]` | **optional**: the per-role kernel set — `role` (`QKV`, `QKVLIN`, `O`, `GU`, `G`, `U`, `D`, the MoE `GB`/`UB`, the Gemma4 second attention type, the MLA and GDN roles), `M`, `K`, `N` and the artifact `elf` (a **bare file name**). When present, `Plan::designs_agree()` requires it to be exactly the set the container derives — same roles, same geometry, same artifact, **both directions** — and refuses by naming the role and both sides; a plan without the section keeps the engine's own derivation, which is what every plan written before the field means. Written by `tools/npu_plan.py` only for the families it can state completely (a partial section would be refused at load, so MLA, GDN mixes and Gemma4's second attention type / per-layer embeddings / double-wide MLP get none). `Plan::check_artifacts()` then refuses at load, before any context is opened, when a named artifact is not present and non-empty in the kernel directory — and `npu_plan.py --check` asks the same question with the same rule at import time |
+| `layers[]` | one entry per layer, in order: `index`, `role` (`attn`/`gdn`/`moe`/`mla`), and projections `qkv {K, N, fused}`, `attn_gate {K, N}`, `gate_up {K, N}`, `down {K, N}`. The count must equal `model.layers`. The projection shapes are recorded for P4’s `NpuModel`; the forward reads the count (for its [plan] log line), and takes the design set from `designs[]` when the plan names it, deriving it from the container otherwise |
 
 Unknown layer keys are ignored by the loader (the current generator also writes `ssm_out`; the forward does
 not read it from the plan).
@@ -176,11 +177,14 @@ layers[0]     {"index": 0, "role": "gdn", "qkv": {"K": 5120, "N": 10240, "fused"
 ## Not yet
 
 - **P4** (#803): **A1 landed** in #808 (`0a2cbb9`) — the `NpuTarget` interface (`npu/target/target.h`), the XDNA
-  target behind it, and `open()` consuming the plan instead of duplicating the derivation. **A2 is in progress and is
-  tracked on its own page of record**, [npu-p4-target-split.md](npu-p4-target-split.md) §3 (steps A1/A2/A3), so this
-  list does not try to snapshot it — as of #1380 (`A2b, part 1`) the M=128 ELF set is adopted in
-  `XdnaTarget::open_prefill()` instead of in the forward. What is still true from *this* page: `XdnaTarget::load_block`
-  remains a named no-op that says why, so weights still fill lazily per projection.
+  target behind it, and `open()` consuming the plan instead of duplicating the derivation. The step-by-step record is
+  [npu-p4-target-split.md](npu-p4-target-split.md) §3, so this list does not snapshot it, but the two ends that touch
+  *this* page's fields are worth naming: the plan can now **name the design set** (#1330, #1333 — `designs[]` above),
+  and the setup side is **the target's** — the M=128 ELF set in `XdnaTarget::open_prefill()` (#1380) and the lm-head
+  context in `XdnaTarget::open_head()` (#1458, #1478), so `q4nx_forward.cpp` creates no `I8Ctx` at all. What is still
+  true from *this* page: `XdnaTarget::load_block` remains a named no-op, so weight residency and decoding stay as they
+  were — the cache fills lazily inside `gemv`, and `load_block()` turning that into an explicit block step is the one
+  A2 item left, an optimisation whose evidence is a tokens/s row (see §3's A2c).
 - **P5** (#804): Hexagon target (t2 gemv on HVX/HMX, QEMU v73 oracle) has no engine rows yet.
 - **P6** (#805): the shared drafter protocol is on main; tau=0.6 and Hexagon acceptance rows are still missing.
 - **P7** (#806): the `kv` contract above is in the plan and its arithmetic is gated in CI (`ctest -R npu_kv_int8`,

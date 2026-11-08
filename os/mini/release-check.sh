@@ -1740,18 +1740,28 @@ ID=${RELEASE_IDENTITY:-/etc/1bit/release-identity}
 if [ -f "$ID" ]; then
     _id_name=$(sed -n 's/^payload=//p' "$ID" 2>/dev/null | head -1)
     _id_built=$(sed -n 's/^built=//p' "$ID" 2>/dev/null | head -1)
-    _id_engine=$(sed -n 's/^engine_sha256=//p' "$ID" 2>/dev/null | head -1)
+    _id_engine=$(sed -n 's/^engine_sha256 *= *//p' "$ID" 2>/dev/null | head -1)
+    # Two schemas write this file and only one of them is checkable against a payload (engine#1481): os/v3/puppy/
+    # container-build.sh writes `engine_sha256=<sha256 of the launcher>` (key=value), while os/mini/mkimage.sh writes
+    # `engine: <git short sha>` (key: value). Without this branch the mini schema reaches identity_verdict with an empty
+    # claim and reds as "malformed, not merely old" - a false red on every mini image. A git short sha is not a file
+    # hash, so the honest answer there is a SKIP that says why, not a FAIL and not a pass by absence.
+    _id_gitsha=$(sed -n 's/^engine: *//p' "$ID" 2>/dev/null | head -1)
     _id_hsasha=$(sed -n 's/^libhsa_sha256=//p' "$ID" 2>/dev/null | head -1)
     _id_launcher="${PAYLOAD_DIR:-/opt/1bit-package}/1bit/1bit"
     _id_act_engine=; [ -f "$_id_launcher" ] && _id_act_engine=$(sha256sum "$_id_launcher" 2>/dev/null | cut -d' ' -f1)
     _id_hsadir=$(sed -n 's/^\(export \)\{0,1\}LD_LIBRARY_PATH=//p' "${LIBHSA_ENV:-/etc/1bit/libhsa.env}" 2>/dev/null | sed 's/\$.*//' | cut -d: -f1)
     _id_act_hsasha=; [ -n "$_id_hsadir" ] && [ -f "${_id_hsadir%/}/libhsa-runtime64.so.1" ] && _id_act_hsasha=$(sha256sum "${_id_hsadir%/}/libhsa-runtime64.so.1" 2>/dev/null | cut -d' ' -f1)
-    _idv=$(identity_verdict "$_id_engine" "$_id_act_engine" "$_id_hsasha" "$_id_act_hsasha")
     _idinfo="payload=${_id_name:-?} built=${_id_built:-?}"
-    case "$_idv" in
-        PASS*) pass identity "${_idv#PASS } (${_idinfo})" ;;
-        *)     fail identity "${_idv#FAIL } (${_idinfo})" ;;
-    esac
+    if [ -z "$_id_engine" ] && [ -n "$_id_gitsha" ]; then
+        skip identity "this image's identity is the mini schema: it records engine: $_id_gitsha, a git short sha rather than the launcher's sha256, so the payload it carries cannot be checked from it (engine#1481)"
+    else
+        _idv=$(identity_verdict "$_id_engine" "$_id_act_engine" "$_id_hsasha" "$_id_act_hsasha")
+        case "$_idv" in
+            PASS*) pass identity "${_idv#PASS } (${_idinfo})" ;;
+            *)     fail identity "${_idv#FAIL } (${_idinfo})" ;;
+        esac
+    fi
     if [ -f /data/SHA256SUMS ]; then
         if (cd /data && sha256sum -c SHA256SUMS >/dev/null 2>&1); then pass sha256sums "/data/SHA256SUMS verifies"
         else fail sha256sums "/data/SHA256SUMS does not verify (cd /data && sha256sum -c SHA256SUMS)"; fi

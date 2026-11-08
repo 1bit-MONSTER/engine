@@ -114,13 +114,26 @@ if read_until(b"Press enter to boot the selected OS", 180) is None:
     print("FAIL boot           no grub menu on the serial line (no serial-shell entry?)"); sys.exit(2)
 print("INFO boot           grub menu after %.1fs" % (time.time() - t0), flush=True)
 time.sleep(1.0)
-s.sendall(b"\x1b[B" * 3 + b"\r")
+# The menu selection needs the same protection a reboot gets (below): arrows CANCEL GRUB's countdown, so an Enter lost
+# while the menu is still drawing leaves the machine at the menu (measured), and on a loaded box the boot to userspace
+# has been measured at 155 s and past 300 s - so press again if nothing arrives, and give each attempt a budget the
+# boot can actually fit in (120 s was inside the boot's own range on 2026-11-07/08, and reported "no shell" for a
+# machine that was booting normally).
 t0 = time.time()
 ok = False
-for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
-    if read_until(token, 120) is not None:
-        ok = True
+for attempt in (1, 2, 3):
+    s.sendall(b"\x1b[B" * 3)
+    time.sleep(0.5)
+    s.sendall(b"\r")
+    time.sleep(0.5)
+    s.sendall(b"\r")
+    for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
+        if read_until(token, 90 if attempt == 1 else 300) is not None:
+            ok = True
+            break
+    if ok:
         break
+    print("INFO boot           nothing booted after attempt %d; pressing Enter again at the menu" % attempt, flush=True)
 if not ok:
     print("FAIL boot           no serial root shell; last transcript lines:")
     for l in (buf.decode("utf-8", "replace").splitlines()[-12:]):

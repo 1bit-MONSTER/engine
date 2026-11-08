@@ -55,6 +55,7 @@ fam=${1:?usage: pkg-proof.sh <deb|rpm|arch> <package-dir>}
 pkgdir=${2:?usage: pkg-proof.sh <deb|rpm|arch> <package-dir>}
 pkgdir=$(cd "$pkgdir" && pwd)
 fail=0
+krel=      # set by the kernel-package block; empty on the distribution-kernel path (no kernel packages)
 row() {   # <PASS|FAIL> <what> <detail>
     printf '%-4s %-46s %s\n' "$1" "$2" "$3"
     [ "$1" = PASS ] || fail=1
@@ -69,6 +70,18 @@ case $fam in
     *) echo "unknown family: $fam" >&2; exit 2 ;;
 esac
 [ -n "$kv" ] || { echo "pkg-proof: no kernel headers in this container; install them first (see the header)" >&2; exit 2; }
+# Does this package dir carry the kernel packages? `mk-kernel-packages.sh --skip-kernel` does not, and that
+# is the most common user path — a machine that stays on its distribution's kernel takes only the drivers
+# and the config. Those rows are then skipped instead of failing; the rest of the proof runs unchanged.
+case $fam in
+    deb)  have_kernel=$(ls "$pkgdir"/linux-image-*.deb 2>/dev/null | wc -l) ;;
+    rpm)  have_kernel=$(ls "$pkgdir"/1bit-kernel-[0-9]*.rpm 2>/dev/null | wc -l) ;;
+    arch) have_kernel=$(ls "$pkgdir"/linux-1bit-[0-9]*.pkg.tar.zst 2>/dev/null | wc -l) ;;
+    *)    have_kernel=1 ;;
+esac
+if [ "$have_kernel" = 0 ] && [ "$fam" != coexist ]; then
+    printf 'INFO %-46s %s\n' "no kernel packages in this dir" "distribution-kernel path: kernel rows skipped"
+fi
 echo "== $fam in $(grep -h '^PRETTY_NAME' /etc/os-release | cut -d= -f2- | tr -d '\"') | headers $kv | running $(uname -r)"
 
 # the in-tree module this must displace; without the kernel's own module tree there is nothing to
@@ -180,6 +193,7 @@ else
 fi
 
 # ---- the kernel package ---------------------------------------------------------------------
+if [ "$have_kernel" = 1 ]; then
 case $fam in
     deb)
         dpkg -i "$pkgdir"/linux-image-*.deb "$pkgdir"/linux-headers-*.deb >/tmp/k.log 2>&1 \
@@ -221,6 +235,7 @@ if [ -r "$img" ]; then
 else
     row FAIL "vmlinuz in the package" "$img missing"
 fi
+fi   # have_kernel
 
 # ---- uninstall ------------------------------------------------------------------------------
 case $fam in
@@ -264,7 +279,7 @@ fi
 # ---- removing the kernel package again -------------------------------------------------------
 # The kernel rows above install it; nothing removed it, so "and uninstall cleanly" had no evidence for
 # the kernel half. It also has to leave the filesystem as it found it: no /boot entry, no module tree.
-if [ -n "$krel" ] && [ "$fam" != coexist ]; then
+if [ -n "$krel" ] && [ "$fam" != coexist ] && [ "$have_kernel" = 1 ]; then
     case $fam in
         deb)  dpkg -P "linux-image-$krel" "linux-headers-$krel" >/tmp/kr.log 2>&1 ;;
         rpm)  rpm -e 1bit-kernel-devel 1bit-kernel >/tmp/kr.log 2>&1 ;;

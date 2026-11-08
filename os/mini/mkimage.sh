@@ -316,12 +316,66 @@ fw "amdgpu/gc_11_5_1_*" "amdgpu/sdma_6_1_1*" "amdgpu/psp_14_0_1*" "amdgpu/smu_14
 echo "== the engine"
 bin=$build/onebit; [ -x "$bin" ] || bin=$build/1bit
 [ -x "$bin" ] || { echo "no engine binary in $build (build with -DONEBIT_NPU=ON -DONEBIT_HRX=ON)"; exit 1; }
-copy_elf "$bin"
-ln -s "$bin" "$root/bin/1bit"
-# The sealed NPU kernel sets travel BESIDE the engine binary (docs/releases.md, "The NPU engine"):
-# in a package that is <pkg>/npu/kernels next to <pkg>/1bit, and here the binary keeps its build
-# path, so the sets go to the same place relative to it. Without them the image ships the NPU
-# route and nothing it can load - the route then refuses rather than falling back.
+
+# engine #1543: the engine used to be installed AT ITS BUILD PATH, with /bin/1bit a symlink into the
+# builder's home and the whole /home/<user>/... tree carried in the image (a 4.7 MB binary included), so
+# every mini image disclosed the builder's username, work directory and build-directory name. That is a
+# fourth leak class - a path delivered as the filesystem LAYOUT, not as a string inside a file - and the
+# content rows (scripts/pack-check.sh: build_path_strings) cannot see it.
+#
+# The engine finds its backends BESIDE ITSELF when the build tree is gone (app/built_path.h: the compiled
+# path made relative to ONEBIT_BUILD_DIR, resolved against /proc/self/exe's directory), which is the layout
+# scripts/package-linux.sh ships. So it is installed that way here: /opt/1bit (the path 1bit-release-check
+# already probes) carrying the engine, its libraries and every backend beside it, $ORIGIN only, and
+# /bin/1bit a symlink to that image path - never to a build path.
+command -v patchelf >/dev/null || { echo "patchelf is needed to install the engine at \$ORIGIN instead of at its build path: apt install patchelf"; exit 1; }
+# shellcheck source=scripts/pack-elf.sh
+. "$here/../../scripts/pack-elf.sh"   # pack_is_elf, used below and by the Lemonade section
+eng=$root/opt/1bit
+install_origin() {   # install_origin <source elf> <destination dir>: the file, $ORIGIN, and its libs beside
+    local src=$1 dir=$2 f missing
+    [ -e "$src" ] || { echo "missing: $src"; exit 1; }
+    mkdir -p "$dir"; cp -L "$src" "$dir/"
+    patchelf --set-rpath '$ORIGIN' "$dir/$(basename "$src")"
+    # ONLY what the image does not already carry. The image has libc, libstdc++, libgcc_s and the loader;
+    # copying those beside the engine and then pointing RUNPATH at $ORIGIN makes the copy SHADOW the image's
+    # own libc for every ELF in that directory - a set that works on the builder and fails at boot. A library
+    # on the standard loader path is the loader's business, on the image as on any machine.
+    for f in $(ldd "$src" 2>/dev/null | awk '/=> \// {print $3}'); do
+        case "$f" in /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*) continue ;; esac
+        [ -e "$dir/$(basename "$f")" ] || cp -L "$f" "$dir/"
+    done
+    # EVERY copy, not just the program: a library from the build tree carries the build tree in its own
+    # RUNPATH, so patching only the program leaves libggml/libhrx/libloomc looking for each other in the
+    # builder's tree at boot. They are all in $dir now, so $ORIGIN is the whole answer for each of them.
+    for f in "$dir"/*; do
+        pack_is_elf "$f" && patchelf --set-rpath '$ORIGIN' "$f"
+    done
+    missing=$(LD_LIBRARY_PATH=$dir ldd "$dir/$(basename "$src")" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')
+    [ -z "${missing// /}" ] || { echo "$(basename "$src") still needs $missing beside it after relocation (engine #1543)"; exit 1; }
+}
+install_origin "$bin" "$eng"
+# install_origin refuses to put a SYSTEM library beside the engine ($ORIGIN would make it shadow the image's
+# own), but the image still has to carry them: copy_elf used to stage the engine's whole NEEDED set at its
+# system paths through copy_libs, and replacing it dropped that. libgomp and libpcre2-8 in particular have no
+# other ELF in the image pulling them in (engine #1543 review, fix 3's hole).
+copy_libs "$bin"
+ln -sfn ../opt/1bit/1bit "$root/bin/1bit"
+# NO backend goes into the initramfs. init.sh points ONEBIT_{,HRX_}LLAMA_SERVER at /opt/1bit-llama, which it
+# links from the stick's data partition at boot, and default_llama_server() (app/serve.cpp:292) returns those
+# first - so an HRX llama-server and its ~40 MB runtime set inside the image were never executed, while the
+# initramfs is already 97.9 MB compressed against the 103 MB that grub failed to load on real hardware. One
+# copy, and it is the one on the stick (mkimage.sh puts it there below, engine #1543's review item 2).
+for back in vulkan hrx; do
+    if [ -e "$build/$back/llama/bin/llama-server" ]; then
+        echo "   $back backend: left to the data partition ($(du -sm "$build/$back/llama/bin" 2>/dev/null | cut -f1) MB not in the initramfs)"
+    fi
+done
+# The sealed NPU kernel sets travel BESIDE the engine binary (docs/releases.md, "The NPU engine"): in a
+# package that is <pkg>/npu/kernels next to <pkg>/1bit. Here they live on the stick's data partition (they
+# are ~124 MB and grub would not load an initrd that size) and init.sh links them to /opt/1bit/npu/kernels
+# at boot. Without them the image ships the NPU route and nothing it can load - the route then refuses
+# rather than falling back.
 
 
 echo "== Lemonade (lemond, the lemonade CLI, the web app)"
@@ -696,6 +750,18 @@ root_elfs_load() {   # <root>: name every ELF in the image root that cannot reso
             echo "   ELF does not load: ${f#"$root"}"
             printf '%s\n' "$res" | grep -E "undefined symbol|not found" | sed 's/^/      /'
         fi
+        # ... and a library ldd resolved from the BUILD HOST is not one the image has: ldd falls back to this
+        # machine's loader cache, so a NEEDED entry the image is missing still resolves here and "loads".
+        # Every path it reports has to be inside the image; the vdso and the interpreter are the exceptions,
+        # and neither appears as "=> /path" (engine #1543 review).
+        outside=$(printf '%s\n' "$res" | awk '/=> \// {print $3}' | while IFS= read -r p; do
+                      case "$p" in "$root"/*) ;; *) printf '%s\n' "$p" ;; esac
+                  done | head -3)
+        if [ -n "$outside" ]; then
+            bad=$((bad + 1))
+            echo "   ELF would resolve outside the image: ${f#"$root"}"
+            printf '%s\n' "$outside" | sed 's/^/      /'
+        fi
     done < <(find "$root" -type f -print0 2>/dev/null)
     echo "   load check: $n ELF files in the image root, $bad that cannot resolve their symbols"
     if [ "$bad" != 0 ]; then
@@ -706,6 +772,13 @@ root_elfs_load() {   # <root>: name every ELF in the image root that cannot reso
 
 echo "== load check: every ELF in the image root, against the image's own libraries"
 root_elfs_load "$root"
+
+# engine #1543: the layout row. A build-machine path can arrive as a directory name or as a symlink target,
+# where the content rows cannot see it (they read packed ELFs), so the tree itself is checked before it is
+# packed. It runs here rather than in the release gate because this is where the layout is still ours to fix.
+# shellcheck source=scripts/pack-check.sh
+. "$src/scripts/pack-check.sh"
+layout_bad=$(layout_build_paths "$root") || { printf '%s\n' "$layout_bad"; echo "the image layout names a build machine: refusing to pack it (engine #1543)"; exit 1; }
 
 echo "== initramfs"
 # the builder's umask must not reach the image: nothing group- or world-writable, /root private

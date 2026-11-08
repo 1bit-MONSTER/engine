@@ -135,16 +135,20 @@ struct I8Ctx {
     // Bucketed by row count: the first version printed the LAST call's M with a CUMULATIVE average,
     // which is how a prefill window came back reading "M=1" while prefill was demonstrably batched.
     struct PackBucket { long n = 0; double q = 0, sy = 0, cn = 0, lc = 0; };
-    std::map<long, PackBucket> pack_buckets_;
+    // Keyed by the pair, not by am*100000+ak: that packing collides for ak >= 100000, and a diagnostic
+    // that silently merges two shapes is worse than no diagnostic. (pi-prs, #1431.)
+    std::map<std::pair<long, long>, PackBucket> pack_buckets_;
     inline void pack_split_add(double q, double sy, double cn, double lc, int am, int ak) {
-        PackBucket& b = pack_buckets_[(long)am * 100000 + ak];
+        PackBucket& b = pack_buckets_[{(long)am, (long)ak}];
         b.n++; b.q += q; b.sy += sy; b.cn += cn; b.lc += lc;
         pack_split_n_++;
-        if (pack_split_n_ % 100 == 0) {
+        // First launch prints too: a short run that never reaches 100 launches used to be silent, which is
+        // the worst possible behaviour for an instrument on a path that may only run a few times (#1431).
+        if (pack_split_n_ == 1 || pack_split_n_ % 100 == 0) {
             fprintf(stderr, "[ps] total=%ld launches, by rows:", pack_split_n_);
             for (const auto& kv : pack_buckets_)
                 fprintf(stderr, " | M=%ld K=%ld n=%ld quant=%.3f sync=%.3f canary=%.3f launch=%.3f ms",
-                        kv.first / 100000, kv.first % 100000, kv.second.n, kv.second.q / kv.second.n,
+                        kv.first.first, kv.first.second, kv.second.n, kv.second.q / kv.second.n,
                         kv.second.sy / kv.second.n, kv.second.cn / kv.second.n,
                         kv.second.lc / kv.second.n);
             fprintf(stderr, "\n");
@@ -575,17 +579,13 @@ struct I8Ctx {
         const auto t4 = pack_clock::now();
         {
             using namespace std::chrono;
-            const double q  = duration<double, std::milli>(t1 - t0).count();
-            const double sy = duration<double, std::milli>(t2 - t1).count();
-            const double cn = duration<double, std::milli>(t3 - t2).count();
-            const double lc = duration<double, std::milli>(t4 - t3).count();
-            pack_split_q_ += q; pack_split_sync_ += sy; pack_split_canary_ += cn;
-            pack_split_launch_ += lc; pack_split_n_++;
-            if (pack_split_n_ % 100 == 0)
-                fprintf(stderr, "[ps] n=%ld M=%d K=%d per-launch: quant=%.3f sync=%.3f "
-                                "canary=%.3f launch=%.3f ms\n", pack_split_n_, am, ak,
-                        pack_split_q_ / pack_split_n_, pack_split_sync_ / pack_split_n_,
-                        pack_split_canary_ / pack_split_n_, pack_split_launch_ / pack_split_n_);
+            // The shared bucketed reporter, not a second print site: this function was the one the
+            // ambiguous M=1 lines came from, and a private fprintf here is how the split stayed
+            // unreadable on the path prefill actually uses.
+            pack_split_add(duration<double, std::milli>(t1 - t0).count(),
+                           duration<double, std::milli>(t2 - t1).count(),
+                           duration<double, std::milli>(t3 - t2).count(),
+                           duration<double, std::milli>(t4 - t3).count(), am, ak);
         }
         return r;
     }

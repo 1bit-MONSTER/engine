@@ -1525,8 +1525,11 @@ Exiting is deliberate: after such a failure the context's own state is dead, and
 fails the same way — measured on the c22 board, where the same backend answered 614 to every subsequent request while a
 fresh process answered normally on the same device. The supervisor (Lemonade's backend watchdog, a systemd unit, the OS
 menu's launcher) is the only one that can build a new context, so the engine hands it the problem instead of answering
-with something that looks like a result. A client sees **one failed request**, and the next one lands on a working
-backend.
+with something that looks like a result. What the client sees next depends on the supervisor: Lemonade reloads the backend
+and **replays a non-streamed request once** on the new context, so that turn still gets an answer (fork #42: 200 in
+2.2-5.4 s where the same request used to be a 500, measured with a stand-in engine on strixhalo 2026-11-06); a **streamed**
+request keeps the error frame, because bytes may already have reached the client, and the next request lands on the working
+backend. Under any other supervisor (a systemd unit, the OS menu's launcher) a client sees one failed request and retries.
 
 If a *fresh* backend also fails, the device is the thing to look at rather than the engine: the driver refuses new
 hardware contexts until `amdxdna` is reloaded, and says so in its own kernel message — restarting backends cannot fix it.
@@ -1619,7 +1622,14 @@ usable beside another NPU engine, and what its limits are:
   overlap, in either order, on one file.
 - **Who may take what.** Anything that honours the file interlocks with us: `forward-serve`
   (`--npu-streams` decides which mode), the in-process route (`LOCK_EX`, always -- `app/unified.cpp`),
-  the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
+  the ELF runner (`LOCK_EX`, always). **A run that never opens the device takes no lock**: with
+  `NPU_INFER_HOST_GEMM=1` the forward runs the model with host GEMMs and makes no `xrt::device`, so it
+  holds nothing the lock protects (`npu_lock_taken()`, engine#1353). That matters because the lock is
+  exclusive for the process's life: a host-GEMM serve that took it would block every lane that *does*
+  use the array -- measured on this box, one orphaned host-GEMM serve held it **4 h 52 m** with zero
+  `/dev/accel*` handles and no CPU, and during that window a second lane's serve and two device tickets
+  waited on it. `NPU_NO_DEVICE_LOCK=1` remains the operator's escape hatch for the runs that do open
+  the device. A foreign NPU runtime --
   Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
   keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
   file is not slowed, not blocked and not detected.
@@ -1810,11 +1820,18 @@ against (the kernel's own copy also works); nothing from the pin is built into o
 the release. `.github/workflows/bump-xdna.yml` moves the pin when run by hand, because a driver
 move means rebuilding the module on Strix Halo and checking the NPU there first.
 
-That pin is **pre-fix**, and the fixes are not upstream. The two patches every build of ours runs — the
-`bo_invalid_list` use-after-free at close (#971) and the array recovery after a TDR (#1005) — are carried in
-[`third_party/patches/amdxdna/`](../third_party/patches/amdxdna/README.md) with the build, sign, install and
-initramfs recipe, the `srcversion` each build must produce, and what a pin bump invalidates. A module built from the
-pin alone has neither defect fixed: it panics on that close path and it cannot bring the array back after a TDR.
+That pin is **pre-fix**, and the fixes are not upstream. They are carried as a series in
+[`third_party/patches/amdxdna/`](../third_party/patches/amdxdna/README.md) — with the build, sign, install and
+initramfs recipe, the `srcversion` each build must produce, and what a pin bump invalidates. The series is nine patches
+and **every build of ours applies seven of them**, in this order: `0001` (the `bo_invalid_list` use-after-free at close,
+#971), `0002` (array recovery after a TDR, #1005), `0004` + `0005` (two recovery outcomes that are not failures, and the
+throttle check before any context is touched), `0003` (never share an array partition between two clients), and `0008` +
+`0009` (#1051: a dying context must not fail the device resume, and no runtime suspend while a context exists — the
+`code 614` hang). `0006` and `0007` (the imported-dma-buf execution pair, #812) are carried and **deliberately not
+installed**: loading them is the owner's call and the README says so per patch.
+
+A module built from the pin alone has none of it: it panics on that close path, it cannot bring the array back after a
+TDR, two clients can be handed the same columns, and a request that follows a runtime suspend wedges the array.
 
 ### The MTP head (FastFlowLM's container -> ours)
 
@@ -1922,7 +1939,9 @@ The gate does exactly what it was asked to do — **the drafts it keeps are far 
 rate, and depth 1 is identical to the offline protocol at the same positions, +0.00 pp) — and it does it by **almost
 never chaining**: 292 drafts over 277 chains, i.e. ~1.05 per chain against 4.0, so the chain collapses from 2.87 to
 **1.83 tokens/pass**. That is below the measured 3.2-4.1 break-even, so at the default the draft route is a
-**slowdown**: 0.81× on the prompt-0 pair ticket (plain 0.849 s/token, draft 1.049 s/token). The conditional
+**slowdown**: **0.48×** re-measured at main `4480a6df` on the prompt-0 pair ticket (plain 0.482 s/token, draft
+1.008 s/token; the same pair read 0.81× on 2026-11-06 — plain decode has since become ~1.8× faster while the loop's
+two-passes-per-iteration cost has not moved, so the default's penalty doubled). The conditional
 per-depth comparison at this `tau` reads +27 and +47 pp at depths 2-3, on 13 and 2 live chains — sampling noise, which
 is why the table above is the all-chains view and why depth 1 is the only cell here worth comparing.
 
@@ -1942,6 +1961,22 @@ a silently broken loop rather than a slow one.
 **What would change the answer**: a cheaper verify batch (the array wait is ~60 % of a batched pass — a kernel
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).
+
+**One such lever has since landed, and it does not reach this target.** engine#1348 made a batched verify pass launch
+the **int8 packed** lm head once per vocabulary tile instead of once per row (3.4× the pass, 18.7× the head on its own
+bench). Its entry path is gated on `!head_pb16i_` (`npu/forward/src/q4nx_forward.cpp:4755`), and this target's head **is**
+pb16i — `head_pb16i_` is set from the pack's own head images — which already had a row-batched path
+(`rows_supported`, `:4822`). Re-measured here after it merged: the pair ticket is **0.80× at `tau = 0`** (plain 0.870,
+draft 1.089 s/token) and **0.48× at `tau = 0.6`**, i.e. unchanged for the loop and *worse* as a ratio because plain
+decode improved. So the lever is real, it is just aimed at the other head format: a pb16i-head target gets nothing from
+it, and the recommendation below stands.
+
+**Re-confirmed at main `4480a6df` after ~1.4k lines of forward refactoring** (`#808` NpuTarget, `#1330` plan kernel sets,
+`#1310`, `#1348`): the acceptance numbers are **digit for digit** what the windows published — prompt 0 gives `44/80`
+accepted with depths `18/20, 13/20, 7/20, 6/20` at `tau = 0`, and `31/35` with `28/32, 2/2, 1/1, 0/0` at `tau = 0.6`,
+`TEXT IDENTICAL`, `stream 72 rows`, `0 mismatch` in both. The loop's contracts survived the refactor with it:
+`last_hidden_rows_ = norm_all` and `last_hidden_ = fnorm` (`q4nx_forward.cpp:3558`, `:3569`) and
+`commit_verify_rows` truncating to the accepted prefix (`:2348`).
 
 **Leaf fill is resolved, and the answer is that this verifier cannot use it.** The plan's last protocol item (#805) asks
 for "spare verify rows filled with the drafts' 2nd/3rd candidates". The acceptance rule here is

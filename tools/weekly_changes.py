@@ -25,6 +25,7 @@ import argparse
 import base64
 import datetime as dt
 import json
+import os
 import re
 import subprocess
 import urllib.request
@@ -188,6 +189,46 @@ def models(src: str, old: str, new: str, after: dt.datetime) -> dict:
     return out
 
 
+# What each package in a release is, for the notes. Anything not named here is still listed: the
+# table comes from the output directory, so a new artifact is never silently missing from the notes
+# (engine#1279 item 5). The engine's four are one payload in four wrappings (scripts/pack-distro.sh).
+PACKAGE_WHAT = (
+    (re.compile(r"^lemonade-onebit-.*\.tar\.zst$"),
+     "Lemonade (lemond + CLI) with the onebit recipe and the engine in `1bit/`; start it with `lemond-onebit`"),
+    (re.compile(r"^1bit-engine_.*_amd64\.deb$"),
+     "the engine as a Debian package (`apt-get install ./…deb`): `1bit`, the HRX llama.cpp build, the "
+     "sealed NPU kernel sets, the HSA runtime it dlopens and the shim a stock Lemonade starts"),
+    (re.compile(r"^1bit-engine-.*\.x86_64\.rpm$"),
+     "the same payload as an RPM (`dnf`/`zypper install ./…rpm`): Fedora, openSUSE Tumbleweed"),
+    (re.compile(r"^1bit-engine-.*\.pkg\.tar\.zst$"),
+     "the same payload as an Arch package (`pacman -U ./…pkg.tar.zst`)"),
+    (re.compile(r"^1bit-engine-.*-linux-x86_64\.tar\.zst$"),
+     "the same payload as a tarball, for any other distribution (`tar -C / --zstd --no-same-owner "
+     "--no-overwrite-dir -xf`)"),
+    (re.compile(r"^1bit-os-.*\.(img\.zst|efi)$"),
+     "1bit OS: Lemonade with the engine, booted from a USB stick"),
+)
+# written by the release itself, after (SHA256SUMS) or by this tool (changes.json): not packages
+NOT_A_PACKAGE = {"SHA256SUMS", "changes.json"}
+
+
+def human(n: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GiB"
+
+
+def release_files(out_dir: str | None) -> list[tuple[str, int]]:
+    """The files the release will publish, as (name, size). Empty when no directory was given."""
+    if not out_dir or not os.path.isdir(out_dir):
+        return []
+    return sorted((f, os.path.getsize(os.path.join(out_dir, f)))
+                  for f in os.listdir(out_dir)
+                  if f not in NOT_A_PACKAGE and os.path.isfile(os.path.join(out_dir, f)))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", required=True)
@@ -198,6 +239,8 @@ def main() -> None:
     ap.add_argument("--bumps", help="bumps.json from scripts/weekly.sh")
     ap.add_argument("--json", required=True)
     ap.add_argument("--md", required=True)
+    ap.add_argument("--out-dir", dest="out_dir",
+                    help="the directory the release will publish: every file in it is listed as a package")
     a = ap.parse_args()
 
     old_date, new_date = commit_date(a.src, a.old), dt.datetime.now(dt.timezone.utc)
@@ -237,7 +280,11 @@ def main() -> None:
                        "pr": int(m.group(1)) if m else None, "bump": title.startswith("Bump ")})
     bumps = json.load(open(a.bumps)) if a.bumps else []
 
+    packages = [{"file": name, "size": size,
+                 "what": next((w for rx, w in PACKAGE_WHAT if rx.match(name)), "a release asset")}
+                for name, size in release_files(a.out_dir)]
     data = {"tag": a.tag, "previous": a.previous or None, "date": new_date.date().isoformat(),
+            "packages": packages,
             "engine_from": a.old, "engine_to": run("git", "-C", a.src, "rev-parse", a.new).strip(),
             "upstreams": ups, "engine": engine, "bumps": bumps, "pins": pins(a.src, a.new, mods),
             "models": models(a.src, a.old, a.new, old_date)}
@@ -277,13 +324,21 @@ def main() -> None:
     own = [e for e in engine if not e["bump"]]
     if own:
         md += ["## Engine", ""] + [f"- {e['title']}" + (f" (#{e['pr']})" if e["pr"] else "") for e in own] + [""]
-    md += ["## Packages", "",
-           "| file | what |", "|---|---|",
-           f"| `lemonade-onebit-{a.tag}-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe and the engine in `1bit/`: 1bit and its backends (HRX, the NPU lane); start it with `lemond-onebit` |",
-           f"| `1bit-os-{a.tag}.img.zst`, `.efi` | 1bit OS: Lemonade with the engine, booted from a USB stick |",
-           "| `SHA256SUMS`, `changes.json` | checksums; this list as data |", "",
-           "Licenses: the engine is Apache-2.0 (LICENSE, NOTICE in each package); each backend keeps its own "
-           "license. 1bit OS also carries GPL programs (the Linux kernel, BusyBox) as built on the release "
+    md += ["## Packages", ""]
+    if packages:
+        # engine#1279 item 5: the notes list every package the release carries, read off the output
+        # directory rather than written out here, so a package that is added (or missing) shows up
+        md += ["| file | size | what |", "|---|---|---|"]
+        md += [f"| `{p['file']}` | {human(p['size'])} | {p['what']} |" for p in packages]
+        md += ["", "`SHA256SUMS` covers every file above. Download a package, then "
+               "`sha256sum -c SHA256SUMS --ignore-missing` in the same directory checks it.", ""]
+    else:
+        md += [f"`lemonade-onebit-{a.tag}-linux-x86_64.tar.zst`, the four `1bit-engine` packages (deb, "
+               "rpm, Arch, tarball), the 1bit OS image, `SHA256SUMS` and `changes.json`.", ""]
+    md += ["Licenses: the engine is Apache-2.0 (LICENSE, NOTICE in each package); the compiled HIP and "
+           "NPU binaries in the same packages travel under the 1bit Binary License (LICENSE-BINARY, "
+           "NOTICE-BINARY). Each backend keeps its own license. "
+           "1bit OS also carries GPL programs (the Linux kernel, BusyBox) as built on the release "
            "machine; their complete source is available on request for three years from this release: open "
            "an issue at https://github.com/1bit-MONSTER/engine/issues.", ""]
     open(a.md, "w").write("\n".join(md))

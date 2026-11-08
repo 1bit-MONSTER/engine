@@ -39,10 +39,11 @@ and `mokutil` are in the image - and the appliance **boots on the Max+ 395 with 
 (2026-11-03) came back **33 `puppy-check` rows, 0 failed, 1 skipped** (the skip is `u2-desktop`, correct on
 a headless entry); cycle 20 (2026-11-04) booted and served three chats on the NPU at 88.06 / 80.91 /
 87.43 tok/s (TTFT 0.37 / 0.26 / 0.18 s), and its two red rows were traced to a defect in the acceptance
-script rather than the image (engine#945, fixed in #951). The newest board, cycle 23 (2026-11-04), came back
-**41 rows, 40 PASS, 1 FAIL, 2 SKIP** with the image's own release check at **PASS (22 checks, 0 failures)** -
+script rather than the image (engine#945, fixed in #951). Cycle 23 (2026-11-04) came back
+**41 rows, 1 FAIL and 2 SKIP** with the image's own release check at **PASS (22 checks, 0 failures)** -
 the single red is a bug in the check's own `u7-mdns` row, not in the image - serving the NPU at 93.65 / 94.03
-tok/s and HRX at 305.09 tok/s, with 0 TDRs up a 400/600/1000-token ladder. Since cycle 20 the appliance
+tok/s and HRX at 305.09 tok/s, with 0 TDRs up a 400/600/1000-token ladder. Later board rows, c27's and c28's, are in
+[releases.md](releases.md). Since cycle 20 the appliance
 ships with **no API key** - `10lemonade` leaves `LEMONADE_API_KEY` unset and binds `0.0.0.0:13305` anyway,
 and console item 1 turns a key on (`os/v3/puppy/embed/etc/init.d/10lemonade:43-62`). **Nothing is
 published**: the next release carries it.
@@ -116,6 +117,13 @@ running entry's own boot line, and flips `set default` to the new headless entry
 counts entries before it reports success. The running set is never touched, so the previous appliance stays bootable:
 that is the rollback. `1bit-update --rollback` flips `set default` back; `1bit-update --status` says which slot is
 running, what each holds, and which entry GRUB boots.
+
+**Updates repeat.** The layer the machine uses is the one the **running** slot holds or links to, so after the first
+update (running `/1bit-alt`, whose link points at `/1bit`) the second one targets `/1bit` — the slot that *holds* the
+layer. That directory is this machine's own state: it is kept as it is and not re-linked. Only a real layer that is
+**not** the running one (another machine's, in the target slot) is refused, because two layers cannot be merged by
+an update. The decision is a set of functions in `1bit-update` that `tests/one_bit_update_slots_test.sh` runs over fake
+data partitions on every CI run (update 1, 2 and 3; a foreign layer; a stale link), without root or a VM.
 
 Which is not the same as package updates: `apt` (and the appliance's own payload) update **inside** the running set and
 land in the save layer. An OS change — kernel, initrd, SFS — is this, and it is the only thing that writes a slot.

@@ -91,6 +91,7 @@ The release goes out when every item on the release checklist is done ([docs/rel
 - [docs/architecture.md](docs/architecture.md): how the engine is built, what runs where, the hardware gate, the kernel, the direction.
 - [docs/serve.md](docs/serve.md): `1bit serve` and its options.
 - [docs/zero-copy.md](docs/zero-copy.md): the copies left on the serving paths, what each one costs per token, and why it stays.
+- [docs/lora.md](docs/lora.md): adapters (LoRA), changing a live adapter's factors in place, and the two traps around them.
 - [Measured results](https://github.com/1bit-MONSTER/engine/wiki): every number with how it was taken.
 - [Site repository](https://github.com/1bit-MONSTER/site): builds 1bit.gg from this repository.
 

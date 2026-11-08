@@ -355,6 +355,11 @@ install_origin() {   # install_origin <source elf> <destination dir>: the file, 
     [ -z "${missing// /}" ] || { echo "$(basename "$src") still needs $missing beside it after relocation (engine #1543)"; exit 1; }
 }
 install_origin "$bin" "$eng"
+# install_origin refuses to put a SYSTEM library beside the engine ($ORIGIN would make it shadow the image's
+# own), but the image still has to carry them: copy_elf used to stage the engine's whole NEEDED set at its
+# system paths through copy_libs, and replacing it dropped that. libgomp and libpcre2-8 in particular have no
+# other ELF in the image pulling them in (engine #1543 review, fix 3's hole).
+copy_libs "$bin"
 ln -sfn ../opt/1bit/1bit "$root/bin/1bit"
 # NO backend goes into the initramfs. init.sh points ONEBIT_{,HRX_}LLAMA_SERVER at /opt/1bit-llama, which it
 # links from the stick's data partition at boot, and default_llama_server() (app/serve.cpp:292) returns those
@@ -744,6 +749,18 @@ root_elfs_load() {   # <root>: name every ELF in the image root that cannot reso
             bad=$((bad + 1))
             echo "   ELF does not load: ${f#"$root"}"
             printf '%s\n' "$res" | grep -E "undefined symbol|not found" | sed 's/^/      /'
+        fi
+        # ... and a library ldd resolved from the BUILD HOST is not one the image has: ldd falls back to this
+        # machine's loader cache, so a NEEDED entry the image is missing still resolves here and "loads".
+        # Every path it reports has to be inside the image; the vdso and the interpreter are the exceptions,
+        # and neither appears as "=> /path" (engine #1543 review).
+        outside=$(printf '%s\n' "$res" | awk '/=> \// {print $3}' | while IFS= read -r p; do
+                      case "$p" in "$root"/*) ;; *) printf '%s\n' "$p" ;; esac
+                  done | head -3)
+        if [ -n "$outside" ]; then
+            bad=$((bad + 1))
+            echo "   ELF would resolve outside the image: ${f#"$root"}"
+            printf '%s\n' "$outside" | sed 's/^/      /'
         fi
     done < <(find "$root" -type f -print0 2>/dev/null)
     echo "   load check: $n ELF files in the image root, $bad that cannot resolve their symbols"

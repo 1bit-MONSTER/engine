@@ -86,7 +86,7 @@ does not, deterministically: adding the factor pair to the graph changes the mat
 |---|---|---|---|
 | `a5271d9` (c20) | 2.265140 | 2.272791 | **+0.34 %** above base |
 | `4a375bf2d` (engine #1120) | 2.267098 | 2.265357 | **−0.08 %** below base |
-| `ed43da0b4` (current) | 2.265140 | 2.272791 | **+0.34 %** above base — same as `a5271d9` |
+| `ed43da0b4` (engine main on 2026-11-07; superseded 2026-11-08) | 2.265140 | 2.272791 | **+0.34 %** above base — same as `a5271d9` |
 | Vulkan, any of the three | 2.219879 | 2.219879 | bit-identical |
 
 Same four fixed prompts, same model, same seeds, each row reproduced bit-identically across runs. So: an

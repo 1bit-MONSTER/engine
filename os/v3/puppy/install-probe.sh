@@ -717,18 +717,23 @@ if assert_pupsfs:
                                    "sleep 5; n=$((n+1)); done; echo waited" % (dev, static_addr), timeout=180)
                     per = val("PERSIST", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
                     f = val("CONF", "grep -c '^static=' /data/net.conf 2>/dev/null")
-                    cm = val("CONNMAN", "connmanctl services --properties 2>/dev/null | grep -c 'Method=manual'")
-                    print("INFO net          after the reboot: %s | net.conf static lines=%s | connman Method=manual=%s" % (per or "<none>", f, cm))
+                    # `connmanctl services --properties` does not print the IPv4 configuration on this build (measured), so
+                    # the proof is the applier's own log line from THIS boot plus an address DHCP would never hand out:
+                    # an address cannot survive a reboot, so .250 on the interface means something applied it after boot.
+                    bootline = val("BOOTLOG", "grep -c 'zz-onboard-net: .*carries 10.0.2.250' /var/log/1bit-network.log 2>/dev/null")
+                    print("INFO net          after the reboot: %s | net.conf static lines=%s | applier log lines for it=%s"
+                          % (per or "<none>", f, bootline or "0"))
                     if static_addr not in per:
                         print("FAIL net          after the reboot the interface does not carry the static %s (%s)" % (static_addr, per or "<none>")); ok = False
                     elif f != "1":
                         print("FAIL net          /data/net.conf lost its static line across the reboot (%s)" % (f or "0")); ok = False
-                    elif not cm.isdigit() or int(cm) < 1:
-                        print("FAIL net          connman does not report Method=manual after the reboot: the address may be"
-                              " left over from before, not applied (%s)" % (cm or "<none>")); ok = False
+                    elif not bootline.isdigit() or int(bootline) < 1:
+                        print("FAIL net          the applier did not log that it applied the file after the reboot (%s lines),"
+                              " so the address has no explanation on this boot" % (bootline or "<none>")); ok = False
                     else:
-                        print("PASS net          after a reboot %s carries %s and connman reports Method=manual: the address"
-                              " is applied from /data/net.conf, not inherited" % (dev, static_addr))
+                        print("PASS net          after a reboot %s carries %s (which DHCP never hands out) and"
+                              " /var/log/1bit-network.log has this boot's application from /data/net.conf"
+                              % (dev, static_addr))
                     val("RESETNET", "1bit-network reset 2>&1 | tr '\\n' '; '", timeout=180)
                     left = val("LEFT", "ls /data/net.conf 2>&1 | head -1")
                     # and DHCP has to come back on its own: a reset that leaves the box on the static address is a

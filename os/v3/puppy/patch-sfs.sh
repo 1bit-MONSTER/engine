@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# patch-sfs.sh <src.sfs> <path-in-sfs> <replacement> <out.sfs>
-# patch-sfs.sh --manifest <manifest> <src.sfs> <out.sfs>
+# patch-sfs.sh [--replace] <src.sfs> <path-in-sfs> <replacement> <out.sfs>
+# patch-sfs.sh [--replace] --manifest <manifest> <src.sfs> <out.sfs>
 #
 # The manifest form is the same tool for a cycle that changes SEVERAL paths (c29: six - the console menu and TUI, the
 # release check, the installer, the selftest the image never shipped, the lemonade service's models dir, and the whole
@@ -53,6 +53,11 @@
 set -euo pipefail
 prog=$(basename "$0")
 usage() { sed -n "/^# $prog /,/^# Run as root/p" "$0" | sed 's/^# \{0,1\}//'; }
+replace=''
+# --replace, before the positional arguments: the output is packed to <out>.partial and renamed once every check has passed,
+# so a reader never sees half an artifact and a REFUSED run no longer destroys the previous good one. Handing over an existing
+# name is therefore a deliberate act: without the flag the old refusal stands.
+if [ "${1:-}" = --replace ]; then replace=1; shift; fi
 [ $# -eq 4 ] || { usage >&2; exit 1; }
 manifest=''
 if [ "${1:-}" = --manifest ]; then manifest=$2; src=$3; out=$4; target=''; repl=''; else src=$1 target=$2 repl=$3 out=$4; fi
@@ -73,7 +78,7 @@ fi
 for f in "$src" "${repls[@]}"; do [ -f "$f" ] || [ -d "$f" ] || { echo "$prog: no $f" >&2; exit 1; }; done
 [ "$(id -u)" = 0 ] || { echo "$prog: run as root (uid/gid and setuid bits are part of the artifact)" >&2; exit 1; }
 case $out in /*) ;; *) echo "$prog: <out.sfs> must be an absolute path" >&2; exit 1;; esac
-[ -e "$out" ] && { echo "$prog: $out exists; refusing to overwrite a packed SFS" >&2; exit 1; }
+[ -e "$out" ] && [ -z "$replace" ] && { echo "$prog: $out exists; refusing to overwrite a packed SFS (pass --replace to hand the name over only once the new one is verified)" >&2; exit 1; }
 for t in unsquashfs mksquashfs diff sha256sum; do command -v "$t" >/dev/null || { echo "$prog: no $t" >&2; exit 1; }; done
 
 work=$(mktemp -d "${SFS_WORK:-$HOME/wt/sfs-patch}/run.XXXXXX" 2>/dev/null || true)
@@ -125,7 +130,48 @@ done
 
 # A line counts as declared if it names a target, or names both the target's directory and its own name: `diff -rq`
 # writes an addition or a removal as `Only in <dir>: <name>`, where the whole path never appears.
-matches_target() { case $1 in *"$2"*) return 0;; esac; case $1 in *"$(dirname "$2")"*"$(basename "$2")"*) return 0;; esac; return 1; }
+# `diff -rq` says `Only in <tree>/new: NEWDIR` for a file added under a new directory: the DIRECTORY alone, no file name. That
+# line belongs to the declared set when the directory it names is an ancestor of a declared target (or is the target's parent),
+# and it is the only evidence that target produced, so both directions have to read it the same way.
+#   only_in_path <line> -> tree-relative "a/b/NEWDIR", or empty when the line is not an "Only in" record
+only_in_path() {
+    case $1 in
+        "Only in "*": "*)
+            local pre dir name
+            pre=${1#Only in }
+            dir=${pre%: *}
+            name=${pre##*: }
+            [ "$dir" = "$2" ] && { printf '%s\n' "$name"; return 0; }
+            return 1 ;;
+    esac
+    return 1
+}
+# Three record shapes reach this matcher and each names a path differently:
+#   `Files <a>/x and <b>/x differ`                 - two absolute paths, the target is in both
+#   `Only in <tree>/new: NEWDIR`                   - a DIRECTORY, tree-relative, when a declared file brings a new one
+#   `755 root root d - ./NEWDIR`                    - the metadata pass, path in the LAST field, tree-relative
+# The old substring test only understood the first, which is why a manifest adding a file under a new directory was refused
+# in both later directions (pi-release reproduced it on 2026-11-08: 'Only in ...: NEWDIR' -> "outside the declared set", and
+# accepting that line then failed 'mode/owner/type/size differ outside the declared set: ./NEWDIR').
+target_path_of() {   # <record> -> the tree-relative path it names, when the shape is one of the local ones
+    case $1 in
+        "Only in "*": "*) only_in_path "$1" "$work/new" ;;
+        [0-7][0-7][0-7]*" "*) local f=${1##* }; printf '%s\n' "${f#./}" ;;
+        *) return 1 ;;
+    esac
+}
+matches_target() {
+    case $1 in *"$2"*) return 0;; esac
+    case $1 in *"$(dirname "$2")"*"$(basename "$2")"*) return 0;; esac
+    local p; p=$(target_path_of "$1") || true
+    [ -n "${p:-}" ] || return 1
+    [ "$p" = "$2" ] && return 0
+    # a directory that is an ancestor of the declared target is part of it: the only record that a new file's directory
+    # produces IS that directory, so refusing it would refuse every declared addition that brings its own directory
+    case "$2" in "$p"/*) return 0;; esac
+    case "$p" in *" "*) return 1;; esac
+    return 1
+}
 declared() { local t; for t in "${targets[@]}"; do matches_target "$1" "$t" && return 0; done; return 1; }
 declared_in() { local l; while IFS= read -r l; do [ -n "$l" ] || continue; declared "$l" || printf '%s\n' "$l"; done; }
 
@@ -136,7 +182,7 @@ printf '%s\n' "$changed" | sed -n '1,5p'
 undeclared=$(printf '%s\n' "$changed" | declared_in || true)
 [ -z "$undeclared" ] || {
     echo "$prog: REFUSED: $n path(s) differ and these are outside the declared set:" >&2
-    printf '%s\n' "$undeclared" | sed -n '1,10p' >&2; rm -f "$out"; exit 1; }
+    printf '%s\n' "$undeclared" | sed -n '1,10p' >&2; exit 1; }   # nothing written yet: $out is still the PREVIOUS artifact
 if [ -z "$manifest" ]; then
     [ "$n" = 1 ] || { echo "$prog: REFUSED: $n paths differ between the source tree and the patched tree, not 1" >&2; exit 1; }
     case $changed in *"$target"*) ;; *) echo "$prog: REFUSED: the one difference is not $target" >&2; exit 1;; esac
@@ -146,12 +192,19 @@ else
     for i in "${!targets[@]}"; do
         t=${targets[$i]}
         hit=$(printf '%s\n' "$changed" | while IFS= read -r l; do [ -n "$l" ] && matches_target "$l" "$t" && { echo y; break; }; done)
-        [ -n "$hit" ] || { echo "$prog: REFUSED: $t is declared but the patched tree does not differ there" >&2; rm -f "$out"; exit 1; }
+        [ -n "$hit" ] || { echo "$prog: REFUSED: $t is declared but the patched tree does not differ there" >&2; exit 1; }   # same: pre-pack
     done
     echo "$prog: $n path line(s) differ from the source; all of them inside the declared set (${#targets[@]} targets)"
 fi
 
 echo "$prog: packing with woof-CE's options (-comp zstd -Xcompression-level 19 -b 256K -no-exports -no-xattrs)"
+# Packed to a TEMPORARY name and renamed only once every check has passed, for two reasons measured on 2026-11-08:
+#   * a concurrent reader saw this file growing (127 MB of 490 MB) and misread it - another lane was measuring the
+#     artifact while a cut was rewriting it in place, which no check on this side can prevent;
+#   * every REFUSED path below used to `rm -f "$out"` a file that mksquashfs had already overwritten, i.e. a failed
+#     cut destroyed the previous good artifact as well as failing. Now a refusal removes only the temp.
+final=$out; out=$out.partial
+rm -f "$out"
 mksquashfs "$work/new" "$out" -comp zstd -Xcompression-level 19 -b 256K -no-exports -no-xattrs -noappend \
     -processors "${SFS_JOBS:-$(nproc)}" > "$work/mksquashfs.log" 2>&1 ||
     { echo "$prog: mksquashfs failed:" >&2; tail -5 "$work/mksquashfs.log" >&2; rm -f "$out"; exit 1; }
@@ -204,6 +257,8 @@ vmeta=$(diff "$work/meta-new" "$work/meta-verify" || true)
     printf '%s\n' "$vmeta" | sed -n '1,8p' >&2; rm -f "$out"; exit 1; }
 echo "$prog: metadata: $dn line(s) differ from the source, all inside the declared set; repack matches it exactly"
 
+# Every check above ran against the temporary name; only now does the artifact take the name callers read.
+mv -f "$out" "$final"; out=$final
 echo "$prog: OK  $out  ($(stat -c%s "$out") B, sha256 $(sha256sum "$out" | cut -c1-16)..., $(find "$work/new" | wc -l) paths)"
 if [ -z "$manifest" ]; then
     echo "$prog: source was $(stat -c%s "$src") B; one file differs: $target"

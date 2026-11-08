@@ -606,6 +606,13 @@ add_test(NAME route_log COMMAND route_log_test)
 # `tools/copyright.py --check` must see a file that has not been staged yet (the check used `git
 # ls-files`, so a brand-new file was invisible to it -- PR #1406's test script passed --check locally
 # and failed CI's copyright step on the same head).  Runs the real tool in a scratch git repo.
+# The HRX build's scope decision (engine#1499, .github/workflows/hrx-build.yml): a PR whose only
+# CMakeLists.txt change is a ctest registration skips the compile but still configures.  Each self-test
+# case is an artefact someone would actually push, and the conservative direction -- "full" -- is the
+# one every uncertain case must land on, because the build being skipped is the one that catches a
+# broken HRX pin.  Stdlib only: no git needed for the decision itself.
+add_test(NAME hrx_build_scope
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/hrx_build_scope.py --self-test)
 add_test(NAME copyright_check_untracked
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/copyright_check_untracked_test.py)
 add_dependencies(onebit route_log_test)

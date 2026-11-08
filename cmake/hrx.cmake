@@ -68,13 +68,18 @@ if(NOT ONEBIT_HRX_TOOLCHAIN)
 endif()
 message(STATUS "ONEBIT_HRX: toolchain ${ONEBIT_HRX_TOOLCHAIN}")
 
-# The HRX binaries carry strings from this tree and, with -DONEBIT_GPU_PRIVATE, from the add-on
-# checkout; both are rewritten so the shipped libraries name no build-machine path.
+# The HRX binaries carry strings from this tree, from the add-on checkout (-DONEBIT_GPU_PRIVATE), and from
+# the BUILD tree: ggml-hrx builds its deps as a nested ExternalProject that fetches Loom into
+# <build>/hrx/llama/ggml/src/ggml-hrx/hrx/src/ggml-hrx-deps-build/loom, which is where libloomc.so.0's
+# __FILE__ strings come from (engine #1461: 7 of the payload's 146 build-machine paths, and mapping only
+# the source tree left every one of them absolute). All three are rewritten so the shipped libraries name
+# no build-machine path. -ffile-prefix-map covers debug info as well, which the Release -g needs.
 set(ONEBIT_HRX_PATH_MAP_FLAGS "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
     CACHE STRING "Path mapping for the HRX llama.cpp build")
 if(ONEBIT_GPU_PRIVATE)
     string(APPEND ONEBIT_HRX_PATH_MAP_FLAGS " -ffile-prefix-map=${ONEBIT_GPU_PRIVATE}=addon")
 endif()
+string(APPEND ONEBIT_HRX_PATH_MAP_FLAGS " -ffile-prefix-map=${CMAKE_BINARY_DIR}=build")
 # Flags the HRX llama.cpp build needs from this toolchain, kept apart from the path maps above.
 set(ONEBIT_HRX_EXTRA_FLAGS "")
 

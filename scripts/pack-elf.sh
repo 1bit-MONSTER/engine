@@ -27,6 +27,11 @@
 #                                   and its RUNPATH becomes $ORIGIN plus the entries outside the
 #                                   build tree and $HOME (TheRock in /opt, which HRX needs anyway)
 #   pack_strip <dir>                strips symbol tables and debug info from every ELF under <dir>
+#   pack_normalise_base_modes <tree> <keeplist>
+#                                   the BASE layer's modes: dirs 0755, executables 0755, other files 0644, keeping the
+#                                   paths in <keeplist> (engine#1474). Prints what it changed, by class
+#   pack_writable_base_files <tree> <keeplist>
+#                                   the reporter for the same thing: group/other-writable paths outside the keep-list
 #   pack_build_rpaths <dir> <build> prints each ELF under <dir> whose RPATH/RUNPATH still points
 #                                   into <build> or $HOME
 #   pack_missing_libs <dir>         prints "<file>: <lib> ..." for each ELF under <dir> whose
@@ -245,6 +250,103 @@ pack_normalise_modes() {
     find "$stage" -type d -exec chmod 0755 {} + 2>/dev/null || true
     find "$stage" -type f -perm -u+x -exec chmod 0755 {} + 2>/dev/null || true
     find "$stage" -type f ! -perm -u+x -exec chmod 0644 {} + 2>/dev/null || true
+}
+
+# ── the BASE layer's modes (engine#1474) ─────────────────────────────────────────────────────────────────────────────
+# The payload's modes are settled (pack_normalise_modes above): c33 ships 0 group/other-writable files under
+# opt/1bit-package. The layer UNDER it had 2,176 such paths measured on the c33 base SFS, 1,814 of them regular files --
+# every one of them inherited from woof-CE's build with the builder's umask, carried faithfully by `cp -a`, and none of
+# them relied on by anything: the appliance runs as root, and root does not need group-write. Eight classes of path DO
+# need it, and they are the ones in os/v3/puppy/base-modes-keep.
+#
+# These two functions are the fix and its reporter, in the same split as pack_normalise_modes/pack_writable_files: a
+# function that normalises and then checks its own work can never fail.
+
+# _pack_keep_list <keeplist file>: the keep-list as a newline-joined string, comments and whitespace gone.
+# Read ONCE per run: the first version of the matcher re-read the file for every path in the tree, which is 60,000 file
+# reads on a real base layer and took longer than the rest of the cycle put together.
+_pack_keep_list() {
+    sed -e 's/#.*//' -e 's/[[:space:]]//g' "$1" 2> /dev/null | grep -v '^$' || true
+}
+
+# _pack_keep_match <relative path> <keep-list string>: 0 when the path is a keep-list entry or below one.
+# An entry covers the path ITSELF as well as everything under it -- `tmp/` keeps /tmp's mode 1777, not just `tmp/...` --
+# and matching is per COMPONENT (`var/log` does not keep `var/logrotate`).
+_pack_keep_match() {
+    local rel=$1 pfx
+    while IFS= read -r pfx; do
+        [ -n "$pfx" ] || continue
+        pfx=${pfx%/}
+        case $rel in "$pfx"|"$pfx"/*) return 0 ;; esac
+    done <<< "$2"
+    return 1
+}
+
+# _pack_chmod_batch <mode> <paths...>: chmod in chunks, because a tree this size overruns the argument list.
+_pack_chmod_batch() {
+    local mode=$1 batch=() n=0 p
+    shift
+    for p in "$@"; do
+        batch+=("$p")
+        n=$((n + 1))
+        if [ $n -ge 400 ]; then chmod "$mode" "${batch[@]}" 2> /dev/null; batch=(); n=0; fi
+    done
+    [ $n -gt 0 ] && chmod "$mode" "${batch[@]}" 2> /dev/null
+    return 0
+}
+
+# pack_normalise_base_modes <tree> <keeplist>: drop the GROUP AND OTHER WRITE BITS on every path in <tree> outside the
+# keep-list, and change nothing else.
+#
+# The first version set "dirs 0755, executables 0755, other files 0644" the way the payload's normaliser does, and that
+# was wrong for a whole operating system: it TAKES BITS AWAY FROM NOBODY but GRANTS them -- /etc/shadow and /etc/gshadow
+# (0640) become 0644, every 0600 private key becomes readable, and a 0700 directory becomes traversable. The payload has no
+# secrets, which is why the blunt rule is fine there; the base layer has all of them. `go-w` is the property engine#1474
+# is actually about (2,176 group/other-writable paths), it can only narrow, and the reporter below checks exactly it.
+#
+# Symlinks are skipped: their mode is not used by the kernel, and chmod would follow the link.
+pack_normalise_base_modes() {
+    local tree=$1 list=$2 keep m rel
+    [ -d "$tree" ] || { echo "pack_normalise_base_modes: no tree $tree" >&2; return 2; }
+    [ -f "$list" ] || { echo "pack_normalise_base_modes: no keep-list $list" >&2; return 2; }
+    keep=$(_pack_keep_list "$list")
+    local -a dirs_=() execs_=() files_=()
+    local kept=0
+    # three passes, each one find + a printf: nothing is stat'ed or forked per path
+    while IFS=$'\t' read -r rel; do
+        [ -n "$rel" ] || continue
+        if _pack_keep_match "$rel" "$keep"; then kept=$((kept + 1)); continue; fi
+        dirs_+=("$tree/$rel")
+    done < <(find "$tree" -type d \( -perm -0020 -o -perm -0002 \) -printf '%P\n')
+    while IFS=$'\t' read -r rel; do
+        [ -n "$rel" ] || continue
+        if _pack_keep_match "$rel" "$keep"; then kept=$((kept + 1)); continue; fi
+        execs_+=("$tree/$rel")
+    done < <(find "$tree" -type f -perm -u+x \( -perm -0020 -o -perm -0002 \) -printf '%P\n')
+    while IFS=$'\t' read -r rel; do
+        [ -n "$rel" ] || continue
+        if _pack_keep_match "$rel" "$keep"; then kept=$((kept + 1)); continue; fi
+        files_+=("$tree/$rel")
+    done < <(find "$tree" -type f ! -perm -u+x \( -perm -0020 -o -perm -0002 \) -printf '%P\n')
+    # go-w on the three classes -- BOTH group and other write: `g-w` alone left a 757 (o+w) behind, which the reporter
+    # then caught (measured). The counts are what the cycle log shows.
+    [ ${#dirs_[@]} -gt 0 ] && _pack_chmod_batch go-w "${dirs_[@]}"
+    [ ${#execs_[@]} -gt 0 ] && _pack_chmod_batch go-w "${execs_[@]}"
+    [ ${#files_[@]} -gt 0 ] && _pack_chmod_batch go-w "${files_[@]}"
+    printf 'base modes: go-w on %s directories, %s executables, %s other files (%s path(s) kept by the keep-list); no other bit changed\n' \
+        "${#dirs_[@]}" "${#execs_[@]}" "${#files_[@]}" "$kept"
+}
+
+# pack_writable_base_files <tree> <keeplist>: the reporter the release row uses -- group/other-writable paths in the base
+# layer OUTSIDE the keep-list, which is what has to be zero. Prints "<path> <mode>" and nothing when clean.
+pack_writable_base_files() {
+    local tree=$1 list=$2 keep m rel
+    keep=$(_pack_keep_list "$list")
+    while IFS=$'\t' read -r m rel; do
+        [ -n "$rel" ] || continue
+        _pack_keep_match "$rel" "$keep" && continue
+        printf '%s %s\n' "$rel" "$m"
+    done < <(find "$tree" \( -type f -o -type d \) \( -perm -0020 -o -perm -0002 \) -printf '%m\t%P\n')
 }
 
 pack_build_rpaths() {

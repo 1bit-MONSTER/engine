@@ -15,8 +15,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 <!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
 -->
 # AMD Ryzen AI ONNX packs — image + Whisper sweep
 

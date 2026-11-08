@@ -130,9 +130,25 @@ bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string&
             // The same wording the forward used for this case, because a diagnostic that changes shape
             // when code moves is a diagnostic someone has to re-learn.
             const char* role = q4nx_design_log_tag(g->role);
-            err = plan_path.empty() ? ("missing full ELF " + elf)
-                                    : ("plan " + plan_path + ": this model's plan needs the " + role +
-                                       " kernel \"" + g->elf_name + "\" in " + dir + " (missing)");
+            // engine#1503: when the asked-for name is the plain one and the directory holds only the _b8 family, the missing
+            // thing is the container's LAYOUT, not the artifact. Measured on a Ryzen AI 1.9 pack: the same container ran
+            // correctly once it was re-imported with `--weight-layout b8`. Say that here, or the reader goes looking for a
+            // kernel that was never supposed to exist.
+            std::string hint;
+            {
+                const std::string nm(g->elf_name);
+                if (nm.size() > 4 && nm.compare(nm.size() - 4, 4, ".elf") == 0) {
+                    const std::string b8 = nm.substr(0, nm.size() - 4) + "_b8.elf";
+                    if (elf_present(dir + "/" + b8))
+                        hint = " - but the b8 variant \"" + b8 + "\" is there: this container's weight layout is "
+                               "row-major (q4nx_weight_layout absent), and a row-major container asks for row-major "
+                               "kernels. Re-import the pack with `npu-pack import --weight-layout b8`, or supply a "
+                               "row-major ELF family (engine#1503).";
+                }
+            }
+            err = (plan_path.empty() ? ("missing full ELF " + elf)
+                                     : ("plan " + plan_path + ": this model's plan needs the " + role +
+                                        " kernel \"" + g->elf_name + "\" in " + dir + " (missing)")) + hint;
             return false;
         }
         if (!dev_) {

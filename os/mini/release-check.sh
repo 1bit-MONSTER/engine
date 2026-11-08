@@ -578,6 +578,43 @@ hrx_placement_verdict() {
 # os/v3/puppy/mkimage.sh - what a payload roll like c33 runs - writes neither, so a cut reusing a base SFS inherits whatever the
 # SFS was born with. This row used to `pass identity "$(tr '\n' ' ' < $ID)"`: it printed the lie and called it a PASS. It now
 # compares the claims with the shipped bytes. Pure, so --self-test drives it: <claimed engine> <actual launcher> <claimed libhsa> <actual libhsa>
+# Which file's bytes does an `engine_sha256` claim have to match? Two schemas, two layouts (engine#1481/#1541):
+#   * v3 (`container-build.sh`): the payload launcher at /opt/1bit-package/1bit/1bit;
+#   * mini (`os/mini/mkimage.sh`): the engine the image RUNS, /bin/1bit - a symlink to the image's own copy. Inside the
+#     booted image that symlink resolves to the image copy, which is why reading it here is right; on the build host the
+#     same expression escapes to the build tree, so the WRITER hashes $root$bin instead of hashing the symlink.
+# An empty first argument means "no checkable claim"; then the git short sha (if any) decides whether the row SKIPs.
+# Pure, so --self-test drives it: <claimed engine_sha256|""> <git sha|"">
+identity_launcher_path() {
+    [ -n "${1:-}" ] || return 0
+    if [ -n "${2:-}" ]; then printf '%s\n' "${MINI_LAUNCHER:-/bin/1bit}"
+    else printf '%s\n' "${PAYLOAD_DIR:-/opt/1bit-package}/1bit/1bit"; fi
+}
+
+# The payload's own identity (engine#1557). `payload=` in release-identity is a LABEL - the tarball stem, which the console
+# shows and which no fact inside the image can equal (the payload directory is /opt/1bit-package, and nothing in the payload
+# records the stem) - so it is printed and NOT asserted. What IS checkable is the version string the payload's own launcher
+# reports; the writer reads it from the payload's bytes at build time and stores it as `payload_lemond=`, and this row
+# compares the claim with what the payload on this machine says about itself. Two different claims, never mixed: the label is
+# presented as a label, and the version is a real check. Pure, so --self-test drives it: <claimed> <actual>
+payload_identity_verdict() {   # <payload_lemond claimed> <what the launcher reports>
+    _pc=${1:-} _pa=${2:-}
+    if [ -z "$_pc" ]; then
+        printf 'SKIP this image'"'"'s identity carries no payload_lemond=, so the payload it names cannot be checked (engine#1557: only images built after this row have it)'
+        return 0
+    fi
+    if [ -z "$_pa" ]; then
+        printf 'FAIL the payload'"'"'s launcher reported no version, so the identity'"'"'s claim (%s) cannot be checked against it' "$_pc"
+        return 0
+    fi
+    if [ "$_pc" = "$_pa" ]; then
+        printf 'PASS the payload on this machine is the one the identity names: its own launcher reports %s, and the identity claims the same' "$_pa"
+    else
+        printf 'FAIL the identity claims payload_lemond=%s but the payload here reports %s - the name is stale or the payload is not the one that was packed (engine#1557)' \
+            "$_pc" "$_pa"
+    fi
+}
+
 identity_verdict() {
     _ce=${1:-} _ae=${2:-} _ch=${3:-} _ah=${4:-}
     case "$_ce" in ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s engine_sha256 is not a hex digest (%s) - malformed, not merely old' "${_ce:-empty}"; return 0 ;; esac
@@ -586,17 +623,6 @@ identity_verdict() {
     # absence: it is true only if nothing /etc/1bit/libhsa.env names on the loader path is actually there. A cut that writes `none`
     # while libhsa.env still names a runtime has written a false statement, and the board's u5-hrxenv row pins its comparison to this
     # same field, so a `none` there fails that row too - with a message that blames the runtime instead of the file.
-    case "$_ch" in
-        none)
-            if [ -n "$_ah" ]; then
-                printf 'FAIL the identity file says libhsa_sha256=none but the image loads a runtime libhsa.env names, sha256 %.16s - either write that sha or say why the two disagree' "$_ah"
-            else
-                printf 'PASS consistent: engine_sha256=%.16s is the shipped launcher and libhsa_sha256=none is true (libhsa.env names no runtime that exists here)' "$_ce"
-            fi
-            return 0 ;;
-        ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s libhsa_sha256 is neither a hex digest nor none (%s) - malformed, not merely old' "${_ch:-empty}"; return 0 ;;
-    esac
-    [ "${#_ch}" = 64 ] || { printf 'FAIL the identity file'"'"'s libhsa_sha256 is %s characters, not 64 - malformed, not merely old' "${_ch}"; return 0; }
     if [ -z "$_ae" ]; then
         printf 'FAIL the identity file claims engine_sha256=%.16s but there is no payload launcher to compare it with - an uncheckable claim is not evidence' "$_ce"
         return 0
@@ -609,6 +635,22 @@ identity_verdict() {
         printf 'FAIL the identity file says libhsa_sha256=%.16s but the shipped runtime is %.16s - the image would name a runtime it does not carry' "$_ch" "$_ah"
         return 0
     fi
+    case "$_ch" in
+        not-stated)   # the mini schema writes tag/lemonade/engine/engine_sha256/built and no libhsa_sha256 at all, so there is
+                      # nothing to check in that field. "Not stated" is not "none" (which claims the image ships no runtime) and
+                      # it is not malformed - but it is only acceptable when the engine half IS checkable, or the row would PASS
+                      # on a file with nothing in it.
+            printf 'PASS consistent: engine_sha256=%.16s is the shipped engine; this schema states no libhsa_sha256, so that half is not claimed' "$_ce"
+            return 0 ;;
+        none)
+            if [ -n "$_ah" ]; then
+                printf 'FAIL the identity file says libhsa_sha256=none but the image loads a runtime libhsa.env names, sha256 %.16s - either write that sha or say why the two disagree' "$_ah"
+            else
+                printf 'PASS consistent: engine_sha256=%.16s is the shipped launcher and libhsa_sha256=none is true (libhsa.env names no runtime that exists here)' "$_ce"
+            fi
+            return 0 ;;
+        ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s libhsa_sha256 is neither a hex digest nor none (%s) - malformed, not merely old' "${_ch:-empty}"; return 0 ;;
+    esac
     printf 'PASS consistent: engine_sha256=%.16s and libhsa_sha256=%.16s are the shipped bytes, read off the payload rather than out of the file' "$_ce" "$_ch"
 }
 
@@ -652,6 +694,27 @@ payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
         # top directory with the caller's umask while every entry below it carries the archive's stored modes).
         printf 'FAIL %s file(s) and %s dir(s) in the payload are group- or other-writable%s - a packing site is not normalising (engine #1352: the fix is in scripts/package-linux.sh / pack-elf.sh, and for an unpacked payload the extraction root is the usual one)' \
             "$_f" "$_d" "${_sample:+: $_sample}"
+    fi
+}
+
+# The BASE layer's modes (engine#1474). The payload row above closes the same class for opt/1bit-package; this one is one
+# layer down, where woof-CE's build left 2,176 group/other-writable paths (1,814 of them files) inherited from the
+# builder's umask. The appliance runs as root, so none of them was reachable by anything that should not have it - the
+# defect is the same one: a mode in a release artifact that nobody decided.
+#
+# The keep-list is the point of the row as much as the count: eight classes of path DO need to stay writable (tmp,
+# var/tmp, var/run, var/lock, var/spool, var/log, run, dev, proc, sys), and a cycle that silently changes that list is
+# exactly what a row should make visible. So the row PRINTS it, and the verdict takes its size.
+# Pure, so --self-test drives it: <writable count> <keep-list entries> [<sample>]
+base_modes_verdict() {   # <writable> <keeplist entries> [<sample>]
+    _b=${1:-} _k=${2:-} _bs=${3:-}
+    case "$_b" in ''|*[!0-9]*) printf 'FAIL the base layer'"'"'s modes could not be counted (%s)' "${_b:-empty}"; return 0 ;; esac
+    case "$_k" in ''|*[!0-9]*) printf 'FAIL the base keep-list could not be read (%s)' "${_k:-empty}"; return 0 ;; esac
+    if [ "$_b" = 0 ]; then
+        printf 'PASS no path in the BASE layer is group- or other-writable outside the %s keep-list entr(y/ies) - the packer normalises them and this is the proof (engine #1474)' "$_k"
+    else
+        printf 'FAIL %s path(s) in the BASE layer are group- or other-writable outside the keep-list%s - a packing site is not normalising (engine #1474: scripts/base-modes.sh / pack-elf.sh)' \
+            "$_b" "${_bs:+: $_bs}"
     fi
 }
 
@@ -724,6 +787,20 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"          # nothing to check the claim against
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none '')"           # `none` and nothing on the loader path: consistent
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"        # `none` while the image loads a runtime: false statement
+    # `check` matches by PREFIX, so a path helper is asserted by giving the expected path as <want>
+    # 64 'a's generated POSIX-ly: `{1..60}` is a BASH brace expansion, and this file is #!/bin/sh - under dash it does not
+    # expand, printf formats the literal, the claim arrives 5 characters long and this PASS case fails as "malformed". That is
+    # what CI saw while a `bash release-check.sh --self-test` here passed: the self-test was run with a different shell than the
+    # one ctest uses, so the run was not evidence about the artifact.
+    a64=$(printf '%064s' '' | tr ' ' a)
+    check PASS "$(identity_verdict "$a64" "$a64" not-stated '')"   # mini: no libhsa claim
+    check FAIL "$(identity_verdict '' '' not-stated '')"                                                          # nothing checkable: still a FAIL
+    check /opt/1bit-package/1bit/1bit "$(PAYLOAD_DIR= identity_launcher_path aaaa '')"      # v3: no git sha -> the payload launcher
+    check /bin/1bit "$(MINI_LAUNCHER= identity_launcher_path aaaa bbbb)"                   # mini: both keys -> /bin/1bit
+    check /x/1bit "$(MINI_LAUNCHER=/x/1bit identity_launcher_path aa bb)"                  # the seam is honoured
+    check /y/1bit/1bit "$(PAYLOAD_DIR=/y identity_launcher_path aa '')"                    # PAYLOAD_DIR is honoured
+    if [ -z "$(identity_launcher_path '' bbbb)" ]; then printf 'ok   no claim yields no path (the row SKIPs)\n'
+    else printf 'FAIL no claim should yield no path\n'; rc=1; fi
     check PASS "$(memlock_verdict unlimited lemond)"
     check FAIL "$(memlock_verdict 65536 lemond /etc/security/limits.d/99-amdnpu-memlock.conf)"   # a user's 99- winning over our 90-
     check FAIL "$(memlock_verdict 4294967296 1bit)"                                             # finite is not what the driver asks for
@@ -737,6 +814,22 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_modes_verdict '' 0)"
     check FAIL "$(payload_modes_verdict 0 '')"
     check FAIL "$(payload_modes_verdict x 0)"
+    # engine#1557: the payload's own identity - a claim that matches is a PASS, a stale one is a FAIL, and an image without
+    # the field is a SKIP that says why rather than a pass by absence
+    check PASS "$(payload_identity_verdict '2026.47.0~8.f44ff953' '2026.47.0~8.f44ff953')"
+    check FAIL "$(payload_identity_verdict '2026.47.0~8.f44ff953' '2026.48.0~1.aaaaaaaa')"
+    check SKIP "$(payload_identity_verdict '' '2026.47.0~8.f44ff953')"
+    check FAIL "$(payload_identity_verdict '2026.47.0~8.f44ff953' '')"
+    # engine #1474: the base layer's row - clean only when the count is 0 AND a keep-list was read
+    check PASS "$(base_modes_verdict 0 11)"   # 11: the entry count in os/v3/puppy/base-modes-keep today
+    check FAIL "$(base_modes_verdict 2166 10 'drwxrwxr-x usr/share')"   # c33's base layer, the shape this closes
+    check FAIL "$(base_modes_verdict 1 10 'drwxrwxr-x usr')"
+    check FAIL "$(base_modes_verdict '' 10)"                            # unreadable count
+    check FAIL "$(base_modes_verdict 0 '')"                             # no keep-list to judge against
+    check FAIL "$(base_modes_verdict 0 x)"                              # a non-numeric keep count
+    # a ZERO keep count is not a verdict failure: the row SKIPs when the keep-list file is absent, and a present-but-empty
+    # one is a repository error rather than a machine state, so it is covered at the call site (documented here so the
+    # split is not mistaken for a gap)
     # c32: the HRX weight placement. The measured arms from #1339 are the first two; the failure shapes are a default
     # that already imported (2), an unreadable arm, and a zero.
     check PASS "$(hrx_placement_verdict 5692 3010)"        # 4B perplexity, #1339
@@ -1772,19 +1865,30 @@ ID=${RELEASE_IDENTITY:-/etc/1bit/release-identity}
 if [ -f "$ID" ]; then
     _id_name=$(sed -n 's/^payload=//p' "$ID" 2>/dev/null | head -1)
     _id_built=$(sed -n 's/^built=//p' "$ID" 2>/dev/null | head -1)
-    _id_engine=$(sed -n 's/^engine_sha256 *= *//p' "$ID" 2>/dev/null | head -1)
+    # BOTH separators: os/v3/puppy/container-build.sh writes `engine_sha256=<sha>` (key=value) and os/mini/mkimage.sh
+    # writes `engine_sha256: <sha>` (key: value) beside its `engine:` git sha (engine#1541). Reading only `=` made a mini
+    # image's claim arrive empty, which sent it down the SKIP branch for ever - found by a fixture built the way the
+    # writer writes it, not the way the reader expected it.
+    _id_engine=$(sed -n 's/^engine_sha256 *[=:] *//p' "$ID" 2>/dev/null | head -1 | tr -d '[:space:]')
     # Two schemas write this file and only one of them is checkable against a payload (engine#1481): os/v3/puppy/
     # container-build.sh writes `engine_sha256=<sha256 of the launcher>` (key=value), while os/mini/mkimage.sh writes
     # `engine: <git short sha>` (key: value). Without this branch the mini schema reaches identity_verdict with an empty
     # claim and reds as "malformed, not merely old" - a false red on every mini image. A git short sha is not a file
     # hash, so the honest answer there is a SKIP that says why, not a FAIL and not a pass by absence.
     _id_gitsha=$(sed -n 's/^engine: *//p' "$ID" 2>/dev/null | head -1)
-    _id_hsasha=$(sed -n 's/^libhsa_sha256=//p' "$ID" 2>/dev/null | head -1)
-    _id_launcher="${PAYLOAD_DIR:-/opt/1bit-package}/1bit/1bit"
-    _id_act_engine=; [ -f "$_id_launcher" ] && _id_act_engine=$(sha256sum "$_id_launcher" 2>/dev/null | cut -d' ' -f1)
+    _id_hsasha=$(sed -n 's/^libhsa_sha256 *[=:] *//p' "$ID" 2>/dev/null | head -1 | tr -d '[:space:]')
+    # the mini schema has no libhsa field: say "not stated" rather than letting the strict verdict call it malformed
+    [ -z "$_id_hsasha" ] && [ -n "${_id_gitsha:-}" ] && _id_hsasha=not-stated
+    _id_launcher=$(identity_launcher_path "${_id_engine:-}" "${_id_gitsha:-}")
+    _id_act_engine=
+    # sha256sum follows the symlink, so a mini image's /bin/1bit is hashed as the image copy it points at - which is the
+    # file the writer hashed ($root$bin). The resolved path goes into the message, because "/bin/1bit" and the file it
+    # names are different facts on a build host.
+    [ -n "$_id_launcher" ] && [ -f "$_id_launcher" ] && _id_act_engine=$(sha256sum "$_id_launcher" 2>/dev/null | cut -d' ' -f1)
+    _id_where=${_id_launcher:+$(readlink -f "$_id_launcher" 2>/dev/null || printf '%s' "$_id_launcher")}
     _id_hsadir=$(sed -n 's/^\(export \)\{0,1\}LD_LIBRARY_PATH=//p' "${LIBHSA_ENV:-/etc/1bit/libhsa.env}" 2>/dev/null | sed 's/\$.*//' | cut -d: -f1)
     _id_act_hsasha=; [ -n "$_id_hsadir" ] && [ -f "${_id_hsadir%/}/libhsa-runtime64.so.1" ] && _id_act_hsasha=$(sha256sum "${_id_hsadir%/}/libhsa-runtime64.so.1" 2>/dev/null | cut -d' ' -f1)
-    _idinfo="payload=${_id_name:-?} built=${_id_built:-?}"
+    _idinfo="payload=${_id_name:-?} built=${_id_built:-?}${_id_where:+ launcher=${_id_where}}"
     if [ -z "$_id_engine" ] && [ -n "$_id_gitsha" ]; then
         skip identity "this image's identity is the mini schema: it records engine: $_id_gitsha, a git short sha rather than the launcher's sha256, so the payload it carries cannot be checked from it (engine#1481)"
     else
@@ -1794,6 +1898,19 @@ if [ -f "$ID" ]; then
             *)     fail identity "${_idv#FAIL } (${_idinfo})" ;;
         esac
     fi
+    # engine#1557: the label is printed, the payload's own version is CHECKED. `payload=` stays the human label (the tarball
+    # stem, which no in-image fact equals) and payload_lemond= is the claim the launcher on this machine can settle.
+    _pl_claim=$(sed -n 's/^payload_lemond=//p' "$ID" 2>/dev/null | head -1)
+    _pl_actual=
+    if [ -x "${PAYLOAD_DIR:-/opt/1bit-package}/lemond-onebit" ]; then
+        _pl_actual=$("${PAYLOAD_DIR:-/opt/1bit-package}/lemond-onebit" --version 2> /dev/null | sed -n 's/^lemond version //p' | head -1)
+    fi
+    PLV=$(payload_identity_verdict "$_pl_claim" "$_pl_actual")
+    case "$PLV" in
+        PASS*) pass payload-identity "${PLV#PASS } (label: ${_id_name:-?})" ;;
+        SKIP*) skip payload-identity "${PLV#SKIP }" ;;
+        *)     fail payload-identity "${PLV#FAIL } (label: ${_id_name:-?})" ;;
+    esac
     if [ -f /data/SHA256SUMS ]; then
         if (cd /data && sha256sum -c SHA256SUMS >/dev/null 2>&1); then pass sha256sums "/data/SHA256SUMS verifies"
         else fail sha256sums "/data/SHA256SUMS does not verify (cd /data && sha256sum -c SHA256SUMS)"; fi
@@ -1828,6 +1945,48 @@ else
     case "$PM" in
         PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
         *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+    esac
+fi
+
+# ── the BASE layer's modes (engine#1474) ────────────────────────────────────────────────────────────────────────
+# The scan is the root filesystem only, and the keep-list is the ONE source of truth for what may stay writable: the prune
+# list is BUILT from it rather than copied beside it (the first version hardcoded the same eleven entries by hand, so the
+# next cycle to edit the keep-list - the file whose whole purpose is to be edited - would have had no prune for its new
+# entry, and the row would have failed on a path the keep-list explicitly allows). The four paths pruned for a DIFFERENT
+# reason are named separately, because "not part of the OS image" is not "allowed to be writable".
+#
+# The scan root is overridable for the same reason PAYLOAD_DIR is above: a row that can only be judged by booting an image
+# cannot be tested. `BASE_SCAN_ROOT=<tree>` points it at any tree of the same shape.
+BKEEP=${BASE_KEEP:-/etc/1bit/base-modes-keep}
+if [ ! -f "$BKEEP" ]; then
+    skip base-modes "no $BKEEP on this system: this image predates the base-layer row (engine #1474), so there is no keep-list to judge against"
+else
+    _bm_keep=$(awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if ($0 != "") print }' "$BKEEP")
+    _bm_n=$(printf '%s\n' "$_bm_keep" | grep -c . || true)
+    BROOT=${BASE_SCAN_ROOT:-/}
+    BROOT=${BROOT%/}
+    # the rows that are not the OS image at all (a mounted data partition, the initramfs, removable media)
+    _bm_excl='data initrd mnt media'
+    _bm_prune=
+    for _p in $_bm_excl; do
+        _bm_prune="$_bm_prune -path $BROOT/$_p -prune -o"
+    done
+    # and everything the keep-list names, from the keep-list itself
+    for _p in $_bm_keep; do
+        _bm_prune="$_bm_prune -path $BROOT/${_p%/} -prune -o"
+    done
+    # COUNT the whole set, then sample from it: `find … | head -40` before the count capped the number at 40, so the one
+    # sentence a reader uses to judge severity said "40 path(s)" for a base layer with 2,176 of them (review on #1544)
+    _bm_list=${TMPDIR:-/tmp}/.1bit-base-modes.$$
+    # shellcheck disable=SC2086  # the prune expression is built as separate words on purpose
+    find "${BROOT:-/}" $_bm_prune \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) -print 2> /dev/null > "$_bm_list" || true
+    _bm_n_paths=$(wc -l < "$_bm_list" | tr -d ' ')
+    _bm_s=$(head -3 "$_bm_list" | while IFS= read -r _p; do [ -n "$_p" ] && printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "$_p"; done)
+    rm -f "$_bm_list"
+    BM=$(base_modes_verdict "$_bm_n_paths" "$_bm_n" "$_bm_s")
+    case "$BM" in
+        PASS*) pass base-modes "${BM#PASS } (keep-list: $(printf '%s' "$_bm_keep" | tr '\n' ' '))" ;;
+        *)     fail base-modes "${BM#FAIL }" ;;
     esac
 fi
 

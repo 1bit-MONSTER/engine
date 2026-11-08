@@ -25,6 +25,8 @@
 set -uo pipefail
 
 bin=${1:?usage: serve_e2e.sh path/to/1bit <model> <device> [args]}
+# shellcheck source=tests/serve_port.sh
+. "$(dirname "$0")/serve_port.sh"   # serve_port_wait: read back the port serve bound (engine #1485)
 model=${2:?}
 device=${3:?}
 shift 3
@@ -35,10 +37,12 @@ if [ "$device" = hrx ]; then
     for t in $want; do case " $have" in *" $t "*) found=1 ;; esac; done
     [ $found = 1 ] || { echo "skip: no $want GPU for HRX on this machine (GPUs: ${have:-none})"; exit 77; }
 fi
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 log=$(mktemp)
-"$bin" serve -m "$model" --device "$device" --port "$port" --alias e2e-model "$@" >"$log" 2>&1 &
+# --port 0: the kernel picks and serve reports the port it bound, so nothing here picks a port and releases it before
+# serve binds (engine #1444/#1485). The budget is generous because this test loads a real model before it is ready.
+"$bin" serve -m "$model" --device "$device" --port 0 --alias e2e-model "$@" >"$log" 2>&1 &
 pid=$!
+port=$(serve_port_wait "$log" "$pid" 12000) || { echo "FAIL serve never reported a port"; cat "$log"; exit 1; }
 cleanup() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$log"; }
 trap cleanup EXIT
 fail=0

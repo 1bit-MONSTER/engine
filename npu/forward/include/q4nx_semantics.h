@@ -95,6 +95,17 @@ typedef struct {
     /* Interleaved/multimodal RoPE variant that this forward does not implement.
      * Source: rope_parameters.mrope_interleaved (or rope_type != "default"). */
     int mrope;
+    /* MVROPE sections: how many of the rotary frequencies belong to each of the (t, h, w) axes.  Read from
+     * rope_scaling.mrope_section (Hugging Face) or rope_parameters.mrope_section (OGA/Qwen3.5); zeros and
+     * n_mrope_section == 0 mean "declared mrope without sections", which a consumer must refuse rather than
+     * guess a layout for. */
+    int mrope_section[3];
+    int n_mrope_section;
+    /* DEEPSTACK: which decoder layers take one of the vision tower's extra feature sets.  Read from
+     * vision_config.deepstack_visual_indexes (Qwen3-VL: [5, 11, 17]); the consumer adds set s to the hidden state at
+     * layer deepstack_layers[s].  Empty means the pack has none. */
+    int deepstack_layers[8];
+    int n_deepstack;
     /* RoPE is configured PER LAYER TYPE (Gemma4 nests rope_parameters.
      * full_attention and .sliding_attention with different thetas and types).
      * Source: presence of rope_parameters.{full,sliding}_attention sub-blocks. */
@@ -192,6 +203,29 @@ void q4nx_semantics_default(Q4nxSemantics* s);
  * default value, so a missing field degrades to the neutral convention. */
 int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
                                Q4nxSemantics* s);
+
+/* Which axis a rotary frequency belongs to under INTERLEAVED MRoPE.
+ *
+ * The three `mrope_section` values are not contiguous runs of frequencies.  The reference builds cos/sin for all three
+ * planes and recomposes them: start from the t plane and, for each of h and w, overwrite every third frequency with that
+ * plane's value over a stride-3 window of length `section[dim] * 3` (transformers
+ * `Qwen3VLTextRotaryEmbedding.recomposition_frequencies`: `idx = slice(offset, mrope_section[dim] * 3, 3)`).
+ *
+ *   axis(i) = 1 if i % 3 == 1 && i < 3 * section[1]
+ *           = 2 if i % 3 == 2 && i < 3 * section[2]
+ *           = 0 otherwise
+ *
+ * For [24, 20, 20] that is 24 t / 20 h / 20 w frequencies, and 43 of the 64 sit where a contiguous split would not put
+ * them -- which is why treating the sections as contiguous runs left every image prompt's answer bad while all
+ * equal-plane (text-only) prompts stayed exact.  Frequency index is the index within head_dim/2.
+ */
+static inline int q4nx_mrope_axis(int freq, int n_section, const int* section) {
+    if (n_section < 3 || !section) return 0;
+    const int m = freq % 3;
+    if (m == 1 && freq < 3 * section[1]) return 1;
+    if (m == 2 && freq < 3 * section[2]) return 2;
+    return 0;
+}
 
 /* Human-readable one-line dump of every flag with its source field. */
 void q4nx_semantics_dump(const Q4nxSemantics* s);

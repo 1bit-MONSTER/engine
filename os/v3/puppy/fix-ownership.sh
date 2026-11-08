@@ -48,4 +48,27 @@ if [ "$after" != "$before" ]; then
     echo "fix-ownership: $tree had $before setuid/setgid entries, now $after - refusing to pack it" >&2
     exit 1
 fi
+# ── the BASE layer's modes (engine#1474) ─────────────────────────────────────────────────────────────────────────────
+# This hook runs immediately before mksquashfs, which is the last moment the tree exists and the right place to take the
+# group/other-write bits off: woof-CE's build leaves ~2,176 such paths (the builder's umask, carried by `cp -a`), nothing
+# needs them because the appliance runs as root, and the keep-list keeps the eight classes that do. The normaliser only
+# NARROWS (go-w), so it cannot expose a secret the way "other files 0644" would, and the reporter is checked here rather
+# than trusted: a tree that is still writable outside the keep-list is refused, exactly like a moved setuid count.
+here=$(cd "$(dirname "$0")" && pwd)
+keep=${BASE_KEEP:-$here/base-modes-keep}
+# the normaliser is in the repository's scripts/: /repo in the build container (the repo is mounted there), and three
+# levels up from this hook on a host. Both are tried, because this file runs in both places.
+normaliser=''
+for _c in /repo/scripts/base-modes.sh "$here/../../../scripts/base-modes.sh"; do
+    [ -x "$_c" ] && { normaliser=$_c; break; }
+done
+if [ ! -f "$keep" ]; then
+    echo "fix-ownership: no keep-list at $keep: the base layer's modes were NOT normalised (engine#1474)" >&2
+elif [ -z "$normaliser" ]; then
+    echo "fix-ownership: no scripts/base-modes.sh found (looked in /repo and beside this hook): the base layer's modes were NOT normalised (engine#1474)" >&2
+else
+    bash "$normaliser" "$tree" --keep "$keep" || {
+        echo "fix-ownership: the base layer's modes could not be normalised (engine#1474)" >&2; exit 1; }
+fi
+
 echo "fix-ownership: $tree is root:root with $after setuid/setgid entries restored"

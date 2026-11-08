@@ -19,6 +19,8 @@
 set -uo pipefail
 
 bin=${1:?usage: anchor_rerun.sh <1bit> <outdir> <device> <alias>:<gguf> ...}
+# shellcheck source=tests/serve_port.sh
+. "$(dirname "$0")/serve_port.sh"   # serve_port_wait: read back the port serve bound (engine #1485)
 outdir=${2:?}
 device=${3:?}
 shift 3
@@ -31,11 +33,16 @@ for spec in "$@"; do
         echo "SKIP $alias: gguf missing: $gguf"
         continue
     fi
-    port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
     log=$(mktemp /tmp/serve-rerun-${alias}.XXXX.log)
     t0=$(date +%s)
-    "$bin" serve -m "$gguf" --device "$device" --port "$port" --alias "$alias" >"$log" 2>&1 &
+    # --port 0: the kernel picks and serve reports the port it bound (engine #1485), so nothing is picked and released
+    # here. The budget matches this script's own 30-minute health window: these are real models.
+    "$bin" serve -m "$gguf" --device "$device" --port 0 --alias "$alias" >"$log" 2>&1 &
     pid=$!
+    port=$(serve_port_wait "$log" "$pid" 18000) || {
+        echo "FAIL $alias: serve never reported a port; log=$log"; tail -25 "$log"
+        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; continue
+    }
     code=000
     for _ in $(seq 1 3600); do
         code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health" 2>/dev/null)

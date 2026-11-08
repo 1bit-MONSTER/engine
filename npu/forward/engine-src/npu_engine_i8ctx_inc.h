@@ -132,6 +132,17 @@ struct I8Ctx {
     int last_am_ = 1;
     // engine#1416: [ps] pack-split accumulators (NPU_PACK_SPLIT=1)
     using pack_clock = std::chrono::steady_clock;
+    static void pack_split_line(long n, double q, double sy, double cn, double lc, int am, int ak) {
+        fprintf(stderr, "[ps] n=%ld M=%d K=%d per-launch: quant=%.3f sync=%.3f canary=%.3f "
+                        "launch=%.3f ms\n", n, am, ak, q / n, sy / n, cn / n, lc / n);
+    }
+    inline void pack_split_add(double q, double sy, double cn, double lc, int am, int ak) {
+        pack_split_q_ += q; pack_split_sync_ += sy; pack_split_canary_ += cn;
+        pack_split_launch_ += lc; pack_split_n_++;
+        if (pack_split_n_ % 100 == 0)
+            pack_split_line(pack_split_n_, pack_split_q_, pack_split_sync_, pack_split_canary_,
+                            pack_split_launch_, am, ak);
+    }
     long pack_split_n_ = 0;
     double pack_split_q_ = 0, pack_split_sync_ = 0, pack_split_canary_ = 0, pack_split_launch_ = 0;
     // A client that writes A itself instead of going through the quantisers has to say how many rows it
@@ -1079,8 +1090,22 @@ struct I8Ctx {
 
     inline xrt::run launch_async(int l, const float* A, int am, int ak,
                                  float ascale) {
+        // engine#1416: prefill's M=128 layer launches come through here, not through the
+        // with_bo_rows variant, which is why the first [ps] window only ever saw M=1.
+        static const bool split = std::getenv("NPU_PACK_SPLIT") != nullptr;
+        if (!split) {
+            quantize_async(A, am, ak, ascale);
+            return sync_and_launch(l);
+        }
+        const auto t0 = pack_clock::now();
         quantize_async(A, am, ak, ascale);
-        return sync_and_launch(l);
+        const auto t1 = pack_clock::now();
+        xrt::run r = sync_and_launch(l);
+        const auto t2 = pack_clock::now();
+        using namespace std::chrono;
+        pack_split_add(duration<double, std::milli>(t1 - t0).count(), 0.0, 0.0,
+                       duration<double, std::milli>(t2 - t1).count(), am, ak);
+        return r;
     }
 
     // Async launch with per-row activation scales (batched prefill fix,
@@ -1091,8 +1116,20 @@ struct I8Ctx {
     // quantized to all-zero int8 and the D GEMM emitted zeros).
     inline xrt::run launch_async_rows(int l, const float* A, int am, int ak,
                                       const float* ascales_q) {
+        static const bool split = std::getenv("NPU_PACK_SPLIT") != nullptr;
+        if (!split) {
+            quantize_async_rows(A, am, ak, ascales_q);
+            return sync_and_launch(l);
+        }
+        const auto t0 = pack_clock::now();
         quantize_async_rows(A, am, ak, ascales_q);
-        return sync_and_launch(l);
+        const auto t1 = pack_clock::now();
+        xrt::run r = sync_and_launch(l);
+        const auto t2 = pack_clock::now();
+        using namespace std::chrono;
+        pack_split_add(duration<double, std::milli>(t1 - t0).count(), 0.0, 0.0,
+                       duration<double, std::milli>(t2 - t1).count(), am, ak);
+        return r;
     }
 
     inline void finish_async_rows(xrt::run& r, float* C, int am, int an,

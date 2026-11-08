@@ -1212,6 +1212,18 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 const bool geo_ok = t2s_ ? q4nx_t2s::fits(designs16_[i].K, designs16_[i].N)
                                          : q4nx_pb16i::fits(designs16_[i].K, designs16_[i].N);
                 if (designs16_[i].M <= 0 || !geo_ok) {
+                    // Say WHY, once per role.  A geometry the ternary tile cannot hold is not a
+                    // missing artifact and not an error: the role keeps its M=128 kernel and the
+                    // model is correct, only slower -- so the only symptom is a decode step that
+                    // costs what a prefill step costs, with nothing in the log.  That is the same
+                    // "nothing logs the decline" gap the HRX prefill N%16 note names for a
+                    // different dispatcher, and it is cheap to close here.
+                    if (designs16_[i].M > 0 && !geo_ok)
+                        fprintf(stderr,
+                                "  [forward] dec %-3s: no %s twin (K=%d N=%d does not fit the tile), "
+                                "staying on M=128\n",
+                                role_tag(designs16_[i].role), t2s_ ? "t2s" : "pb16i",
+                                designs16_[i].K, designs16_[i].N);
                     designs16_[i].M = 0;
                     continue;
                 }

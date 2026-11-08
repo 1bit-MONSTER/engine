@@ -121,9 +121,27 @@ def exempt(path):
     return _match(path, EXEMPT) or _match(path.rsplit("/", 1)[-1], EXEMPT)
 
 
+NOTICE_WINDOW = 20      # the lines has_notice() looks at; duplicated_notice() uses the same window
+
+
 def has_notice(text):
-    head = "\n".join(text.splitlines()[:20])
+    head = "\n".join(text.splitlines()[:NOTICE_WINDOW])
     return NOTICE[0] in head and NOTICE[1] in head and "Licensed under the Apache License, Version 2.0" in head
+
+
+def duplicated_notice(text):
+    """True when the Copyright + SPDX pair appears twice inside the header window.
+
+    Present-in-the-head was all this gate ever asked, so a file whose header block was pasted twice passed —
+    which is how #1535 and #1544 shipped one, and why #1547 lists 20 files. The window is deliberate: the
+    three legitimate second occurrences in the tree (a heredoc emitting a licence header in
+    scripts/mk-kernel-packages.sh, the NOTICE string a test asserts on in
+    tests/copyright_check_untracked_test.py, and the NOTICE template in tools/npu_leaderboard.py) all sit
+    past line 20, because they are *data*, not the file's own header. A duplicate inside the window is the
+    accidental shape; anything further down is somebody's deliberate string.
+    """
+    head = "\n".join(text.splitlines()[:NOTICE_WINDOW])
+    return head.count(NOTICE[0]) > 1 and head.count(NOTICE[1]) > 1
 
 
 def add_notice(text, block):
@@ -148,7 +166,7 @@ def main():
         return subprocess.run(["git", "ls-files", *args], capture_output=True, text=True,
                               check=True).stdout.split("\n")
     files = sorted(set(filter(None, listing())) | set(filter(None, listing("--others", "--exclude-standard"))))
-    missing, unknown = [], []
+    missing, unknown, duplicated = [], [], []
     for path in filter(None, files):
         if exempt(path):
             continue
@@ -158,6 +176,9 @@ def main():
             continue
         with open(path, encoding="utf-8") as f:
             text = f.read()
+        if duplicated_notice(text):
+            duplicated.append(path)
+            continue
         if has_notice(text):
             continue
         if args.fix:
@@ -167,11 +188,13 @@ def main():
         else:
             missing.append(path)
 
+    for path in duplicated:
+        print("copyright notice duplicated inside the header window (delete the second copy):", path)
     for path in unknown:
         print("no comment style known (add one to LINE_STYLES/BLOCK_STYLES or EXEMPT):", path)
     for path in missing:
         print("missing copyright notice:", path)
-    if missing or unknown:
+    if missing or unknown or duplicated:
         print("run: python3 tools/copyright.py --fix", file=sys.stderr)
         return 1
     return 0

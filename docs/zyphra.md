@@ -221,8 +221,24 @@ than the quality row next to it. Tctl is read at the end of the run; all rows ar
 | BlackMamba-2.8B | **Q8_0** | 4985.27 | 5082.12 | 164.81 | 70 C |
 | BlackMamba-2.8B | IQ4_XS-imx | 5065.11 | 5167.39 | 139.64 | 62 C |
 
-(`tok/s`, three repeats; bold = the model's sweet-spot pick. **`Zamba2-7B-Instruct`'s bold row is its retired merged-form pick** — the
-adapter form's sweet spot is `Q6_K`, which had no row here until the re-bench below; there is no ranking to be read from a bold cell in that column.
+
+**Why the adapter-form `Zamba2-7B-Instruct` `Q6_K` row is missing rather than filled** (2026-11-08, and it is not a gap in the measurement): the six-arm
+survey that would have supplied it ran in one controlled window (its own logs: GTT 37.5-39.9 GiB) on the **current** HRX build (`a3e8d42c9`), while every
+number in this table came from a build that has since been deleted (`9ad387fb9`). The two are not comparable, and two of its three figures say so out loud:
+
+| arm | pp512 | pp4096 | tg128 | note |
+|---|---|---|---|---|
+| `Zamba2-7B-Instruct` `Q6_K` | **5.09** | 12.54 | 18.55 | pp512 below pp4096 — physically implausible, i.e. the first test carries a one-off cost (kernel compile/warmup) |
+| `Zamba2-2.7B-instruct` `Q6_K` | 535.93 | **97.03** | 45.07 | pp4096 **3.9× faster** than the 25.10 this table carries from the old build |
+| `Zamba2-2.7B-instruct` `Q8_0` | 686.74 | **91.57** | 21.16 | same |
+
+So a row from that window would read as a verdict on the file when it is a verdict on the build. The honest statement is the one above the table: **this page's
+throughput column is a record of one deleted build**, the adapter form's current numbers exist (in `bench-*-adapter.json` beside each arm's row) and are not
+comparable to it, and a like-for-like column needs either that build rebuilt or the whole column re-measured in one window on the current one. The 2.7B's
+pp4096 going 25 → 97 between builds is the size of the error a quiet mix would have introduced.
+(`tok/s`, three repeats; bold = the model's sweet-spot pick. **`Zamba2-7B-Instruct`'s bold row is its retired merged-form pick** — the adapter
+form's sweet spot is `Q6_K`, and **it has no row in this table on purpose**: every number here comes from one build, and the one re-bench I ran for it used a
+different one (details in the footnote below). No ranking is to be read from a bold cell in that column.
 ZR1-1.5B has no row from this harness — its arms are measured by the
 1BP lane on the same KLD harness, not benched here.) **Which rows share a window matters more than which number is bigger**: the three
 Zamba2-2.7B rows are one ticket (20:43-21:16) that failed its own control, and the four `Zamba-7B-v1`/`BlackMamba` rows are **one ticket

@@ -563,6 +563,41 @@ hrx_placement_verdict() {
     fi
 }
 
+# The payload's modes (engine #1352, fixed by #1361). Until that fix `package-linux.sh` staged with `cp -a`, so every mode was
+# inherited from the build tree: 134 of the 195 files under the payload were group- or other-writable (1bit and the HRX libs at
+# 0775, LICENSE/NOTICE at 0664). All root:root, so nothing non-root could reach those bits, and no appliance user is in group
+# root - the defect is that a mode in a release artifact was nobody's decision. #1361 makes the packer normalise (dirs 0755,
+# files 0755 if executable else 0644) and assert it, so THIS row is the board-side proof that it did: a payload packed after that
+# commit has no writable file, and a payload packed before it has 134. Pure, so --self-test drives it:
+#   <group/other-writable file count> [<first few paths>]
+payload_modes_verdict() {
+    _n=${1:-} _sample=${2:-}
+    case "$_n" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s modes could not be counted (%s)' "${_n:-empty}"; return 0 ;; esac
+    if [ "$_n" = 0 ]; then
+        printf 'PASS no file in the payload is group- or other-writable (engine #1352: the packer normalises, this is the proof)'
+    else
+        printf 'FAIL %s file(s) in the payload are group- or other-writable%s - the packer that stages with cp -a is shipping inherited modes again (engine #1352: the fix is in scripts/package-linux.sh / pack-elf.sh, not in this row)' \
+            "$_n" "${_sample:+: $_sample}"
+    fi
+}
+
+# The payload's RUNPATH (the orchestrator's rule of 2026-11-08, after an installed engine's RUNPATH into a build tree made a
+# rebuild swap the libraries under two running services: coder-llm on :8090 crash-looped 154 times and 1bit-canonical on :8095
+# 755 times). An installed package must carry `$ORIGIN` ONLY: it finds its own libraries beside itself, and a path into a build
+# tree is a live wire to whatever the next build there leaves behind. This is the shipped half of that rule - the appliance has no
+# readelf/objdump, so the row reads DT_RUNPATH/DT_RPATH out of the dynamic section itself (python3, which the image does ship) and
+# falls back to readelf on a host. Pure, so --self-test drives it: <offending count> [<sample>]
+payload_runpath_verdict() {
+    _n=${1:-} _sample=${2:-}
+    case "$_n" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s RUNPATHs could not be read (%s)' "${_n:-empty}"; return 0 ;; esac
+    if [ "$_n" = 0 ]; then
+        printf 'PASS every RUNPATH in the payload is $ORIGIN: the package finds its libraries beside itself and points at no build tree'
+    else
+        printf 'FAIL %s payload ELF(s) carry a RUNPATH or RPATH that is not $ORIGIN%s - an installed package must not point into a build tree (a rebuild there swaps the libraries under a running service)' \
+            "$_n" "${_sample:+: $_sample}"
+    fi
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -602,6 +637,17 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(followup_verdict '{"error":{"message":"no answer"}}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 0)"
     check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT"}}]}' 0 0)"
     check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' '' '')"
+    # the RUNPATH rule (2026-11-08 incident): $ORIGIN only, and RPATH is always a fail.
+    check PASS "$(payload_runpath_verdict 0)"
+    check FAIL "$(payload_runpath_verdict 3 '/opt/1bit-package/1bit/1bit runs /home/x/wt/release-rc/work/build')"
+    check FAIL "$(payload_runpath_verdict 1)"
+    check FAIL "$(payload_runpath_verdict '')"
+    # engine #1352: the payload's modes. c31/c32 shipped 134 writable files; a payload packed after #1361 has none.
+    check PASS "$(payload_modes_verdict 0)"
+    check FAIL "$(payload_modes_verdict 134)"
+    check FAIL "$(payload_modes_verdict 1 '/opt/1bit-package/1bit/1bit')"
+    check FAIL "$(payload_modes_verdict '')"
+    check FAIL "$(payload_modes_verdict 'x')"
     # c32: the HRX weight placement. The measured arms from #1339 are the first two; the failure shapes are a default
     # that already imported (2), an unreadable arm, and a zero.
     check PASS "$(hrx_placement_verdict 5692 3010)"        # 4B perplexity, #1339
@@ -1644,6 +1690,119 @@ if [ -f "$ID" ]; then
     fi
 else
     skip identity "no /etc/1bit/release-identity in this image build; the tag and the image sha256 are in the release table beside the .img.zst"
+fi
+
+# ── the payload's modes (engine #1352) ─────────────────────────────────────────────────────────────
+# The board-side half of #1361: the packer now normalises and asserts at pack time, and this proves it on the shipped tree. It
+# also prints the two binaries' modes, so the identity of a boot says 0755 for `1bit` and `bin/lemond` rather than leaving a reader
+# to trust that a mode fix happened. A SKIP (not a failure) when the payload is not where an appliance keeps it, so the row can be
+# run off a stick.
+PDIR=${PAYLOAD_DIR:-/opt/1bit-package}
+if [ ! -d "$PDIR" ]; then
+    skip payload-modes "no $PDIR on this system: the payload is not unpacked where an appliance keeps it, so its modes cannot be read"
+else
+    _pm_n=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
+    # the sample is relative to the payload, like the modes below it: an absolute path per file makes a long line on a console
+    # nobody can scroll, and the prefix is identical for every one of them
+    _pm_s=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 | sed "s|^$PDIR/||" | tr '\n' ' ')
+    PM=$(payload_modes_verdict "${_pm_n:-}" "${_pm_s:-}")
+    _pm_bits=
+    for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
+        [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
+    done
+    case "$PM" in
+        PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+        *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+    esac
+fi
+
+# ── the payload's RUNPATH (orchestrator's rule, 2026-11-08) ─────────────────────────────────────────────────────
+# An installed package must carry `$ORIGIN` ONLY. The incident: an installed engine whose RUNPATH pointed into
+# ~/wt/release-rc/work/build had its libraries swapped by a rebuild there, and two running services crash-looped
+# (coder-llm on :8090 154x, 1bit-canonical on :8095 755x). The appliance ships no readelf/objdump, so the dynamic section is read
+# directly: python3 is in the image, with readelf as the host fallback. DT_RPATH is a fail on its own - it is deprecated and cannot
+# be overridden by LD_LIBRARY_PATH, which is exactly the property that makes a stale path stick.
+payload_runpath_bad() {   # <payload dir> -> "relpath|TAG|value" per offending entry
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$1" <<'PYSCAN' 2>/dev/null
+import os, struct, sys
+root = sys.argv[1]
+def dyn(path):
+    try:
+        with open(path, 'rb') as f:
+            d = f.read()
+    except OSError:
+        return None
+    if len(d) < 64 or d[:4] != b'\x7fELF':
+        return None
+    is64 = d[4] == 2
+    try:
+        if is64:
+            shoff, = struct.unpack_from('<Q', d, 0x28)
+            shent, = struct.unpack_from('<H', d, 0x3A)
+            shnum, = struct.unpack_from('<H', d, 0x3C)
+        else:
+            shoff, = struct.unpack_from('<I', d, 0x20)
+            shent, = struct.unpack_from('<H', d, 0x2E)
+            shnum, = struct.unpack_from('<H', d, 0x30)
+        secs = []
+        for i in range(shnum):
+            o = shoff + i * shent
+            if is64:
+                nm, typ, fl, addr, off, size, link, info, al, ent = struct.unpack_from('<IIQQQQIIQQ', d, o)
+            else:
+                nm, typ, fl, addr, off, size, link, info, al, ent = struct.unpack_from('<IIIIIIIIII', d, o)
+            secs.append((typ, off, size, link))
+    except struct.error:
+        return None
+    out = []
+    for (typ, off, size, link) in secs:
+        if typ != 6 or link >= len(secs):
+            continue
+        stroff = secs[link][1]
+        step = 16 if is64 else 8
+        fmt = '<qQ' if is64 else '<iI'
+        for j in range(0, size - step + 1, step):
+            tag, val = struct.unpack_from(fmt, d, off + j)
+            if tag == 0:
+                break
+            if tag in (15, 29):
+                end = d.find(b'\0', stroff + val)
+                out.append((tag, d[stroff + val:end].decode('utf-8', 'replace')))
+    return out
+for dirpath, _, files in os.walk(root):
+    for name in files:
+        p = os.path.join(dirpath, name)
+        for (tag, value) in dyn(p) or []:
+            if tag == 15:
+                print('%s|RPATH|%s' % (os.path.relpath(p, root), value))
+            elif value not in ('$ORIGIN', '$ORIGIN/'):
+                print('%s|RUNPATH|%s' % (os.path.relpath(p, root), value))
+PYSCAN
+    elif command -v readelf >/dev/null 2>&1; then
+        find "$1" -type f -perm /111 2>/dev/null | while IFS= read -r _f; do
+            readelf -d "$_f" 2>/dev/null | sed -n "s|.*(\(RUNPATH\|RPATH\)).*\[\(.*\)\]|${_f#$1/}|\1|\2|p"
+        done | awk -F'|' '($2 == "RPATH") || ($3 != "$ORIGIN" && $3 != "$ORIGIN/")'
+    else
+        return 2
+    fi
+}
+RUNDIR=${PAYLOAD_DIR:-/opt/1bit-package}
+if [ ! -d "$RUNDIR" ]; then
+    skip payload-runpath "no $RUNDIR on this system: the payload is not unpacked where an appliance keeps it, so its RUNPATHs cannot be read"
+else
+    _rp_bad=$(payload_runpath_bad "$RUNDIR"); _rp_rc=$?
+    if [ "$_rp_rc" = 2 ]; then
+        skip payload-runpath "neither python3 nor readelf is here, so the payload's RUNPATHs cannot be read - that is not evidence"
+    else
+        _rp_n=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | wc -l)
+        _rp_s=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | head -3 | tr '\n' ' ')
+        RP=$(payload_runpath_verdict "${_rp_n:-0}" "${_rp_s:-}")
+        case "$RP" in
+            PASS*) pass payload-runpath "${RP#PASS }" ;;
+            *)     fail payload-runpath "${RP#FAIL }" ;;
+        esac
+    fi
 fi
 
 say ""

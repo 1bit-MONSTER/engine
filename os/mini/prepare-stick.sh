@@ -46,6 +46,16 @@
 # Space: an IMAGE file's data partition is the image's 2 GiB until it is written to a device and grown (#706), so a
 # 0.6B GGUF (396 MB) and an NPU model directory (664 MB) do not both fit in one image prep. On a stick they do.
 #
+# Space is CHECKED BEFORE the staging writes anything (#1374): the bytes the models need (only the GROWTH over a file
+# that cp -f would truncate, so a re-run is not refused for space it already occupies) are compared with `df`'s available
+# bytes on the mounted data partition, and a shortfall is a refusal that names both numbers. Before this, the loop
+# learned about a full filesystem from cp's failure, and a cp that fails half way leaves a TRUNCATED model on the medium
+# - c32 staged 6.6 of 7.9 GB that way (partition grown to 58.1 GiB, filesystem still 7.8 GiB) and needed a hand-written
+# `e2fsck -f` + `resize2fs` + clear + restage. A failed grow is still silent and still leaves a working 2 GiB stick, as
+# #706 wants; the staging check is what notices. The same reasoning made the 'grown' line read its numbers from the
+# filesystem (`dumpe2fs -h`) and the 'data' line say "of partition", and made a refused `resize2fs` retried once after
+# `e2fsck -f -y` instead of being handed to a person at 2am.
+#
 # --npu-model: the engine's NPU format is a DIRECTORY (model.q4nx + tokenizer + config), and init.sh
 # registers every /data/models/*/model.q4nx as `<directory name>-1bit` with onebit_backend npu. So the
 # directory name is the model's name: `--npu-model ~/models/npu/Qwen3-0.6B` becomes the entry
@@ -140,7 +150,10 @@ START=$(printf '%s\n' "$chosen" | sed -n 's/.*start=[[:space:]]*\([0-9]\+\).*/\1
 SIZE=$(printf '%s\n' "$chosen" | sed -n 's/.*size=[[:space:]]*\([0-9]\+\).*/\1/p' | head -n 1)
 [ -n "$START" ] && [ -n "$SIZE" ] || die "could not read the partition's start/size out of: $chosen"
 printf 'target   %s\n' "$TARGET"
-printf 'data     Linux filesystem partition at sector %s, %s sectors (%.1f GiB)\n' \
+# "of partition", deliberately: this number is the partition table's, and c32 read it as the space the
+# filesystem had - the two differ by 50 GiB exactly when a grow did not take, which is the failure that
+# truncated a model (#1374). The filesystem's own size is printed by 'grown' below and by df at the end.
+printf 'data     Linux filesystem partition at sector %s, %s sectors (%.1f GiB of partition)\n' \
     "$START" "$SIZE" "$(awk -v s="$SIZE" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')"
 
 # the partition's device node: a real stick publishes it, an image file needs a loop device first
@@ -175,7 +188,6 @@ grow_data() {
     [ -n "$pn" ] || return 0
     end=$(( (START + SIZE) * 512 ))
     [ $(( dev_bytes - end )) -gt 1048576 ] || return 0   # no room worth growing into
-    SIZE0=$SIZE
     printf 'grow     data partition ends at %.1f GiB of %.1f GiB: growing it to the end of the device\n' \
         "$(awk -v b="$end" 'BEGIN { print b / 1073741824 }')" \
         "$(awk -v b="$dev_bytes" 'BEGIN { print b / 1073741824 }')"
@@ -227,10 +239,27 @@ printf 'node     %s\n' "$PART"
 # ext4 grows in place; the filesystem is not mounted yet, so this is an offline resize - the quick path.
 if [ "$GREW" = 1 ]; then
     command -v resize2fs >/dev/null 2>&1 || die "resize2fs is missing; the data partition grew but its filesystem did not"
-    resize2fs "$PART" >/dev/null 2>&1 || die "resize2fs failed on $PART; the partition grew but the filesystem did not"
-    printf 'grown    %s now holds %.1f GiB of ext4 (was %.1f GiB)\n' "$PART" \
-        "$(awk -v s="$SIZE" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')" \
-        "$(awk -v s="$SIZE0" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')"
+    # the filesystem's OWN size, from the filesystem: the partition table said 58.1 GiB while the fs was
+    # still 7.8 GiB, and quoting the partition is what made c32's failure read as a success (#1374)
+    fs_gib() {   # <partition-node> -> that ext4's size in GiB, or "-" when it cannot be read
+        dumpe2fs -h "$1" 2> /dev/null | awk -F: '
+            /^Block count/ { gsub(/ /, "", $2); c = $2 }
+            /^Block size/  { gsub(/ /, "", $2); s = $2 }
+            END { if (c != "" && s != "") printf "%.1f", c * s / 1073741824; else printf "-" }'
+    }
+    was=$(fs_gib "$PART")
+    if ! resize2fs "$PART" >/dev/null 2>&1; then
+        # an ext4 that needs journal recovery makes resize2fs refuse - the board's workaround was
+        # "e2fsck -f first", so do that here and retry once instead of handing it to a person at 2am
+        command -v e2fsck >/dev/null 2>&1 ||
+            die "resize2fs failed on $PART and e2fsck is missing; the partition grew but the filesystem did not"
+        printf 'grown    resize2fs refused (a filesystem needing journal recovery does that): e2fsck -f -y, then one retry\n'
+        e2fsck -f -y "$PART" >/dev/null 2>&1
+        resize2fs "$PART" >/dev/null 2>&1 ||
+            die "resize2fs failed on $PART twice, once after e2fsck -f -y: the partition grew but the filesystem did not, and staging into it would truncate the first model that does not fit (engine#1374)"
+    fi
+    printf 'grown    %s now holds %s GiB of ext4 (was %s GiB; both read from the filesystem, not the partition)\n' \
+        "$PART" "$(fs_gib "$PART")" "$was"
 fi
 
 # ---- mount ---------------------------------------------------------------------------------------
@@ -247,6 +276,48 @@ mount -o "$MOUNT_OPTS" "$PART" "$MNT" 2>/dev/null ||
 CONF=$MNT/lemonade/lemond.conf
 AUTH=$MNT/ssh/authorized_keys
 printf 'mounted  %s (%s)\n' "$MNT" "$MOUNT_OPTS"
+
+# ---- the staging has to fit BEFORE it starts (#1374) ----------------------------------------------
+# The model loops below copy one file at a time and only learn that the filesystem is full from cp's own
+# failure - and a cp that fails half way leaves a TRUNCATED model behind. That is how c32 staged 6.6 of
+# 7.9 GB (partition grown to 58.1 GiB, filesystem still 7.8 GiB) and needed a hand-written restage:
+# e2fsck, resize2fs, clear the partial tree, stage again. A refusal with both numbers is the whole
+# difference: nothing is written, so there is nothing to prove and nothing to clean up.
+if [ "$CHECK" = 0 ]; then
+    need=0
+    for m in $MODELS; do
+        [ -s "$m" ] || continue
+        new=$(stat -Lc %s "$m" 2> /dev/null || echo 0); new=${new:-0}
+        # cp -f truncates a file that is already there, so only the GROWTH has to be allocated: a re-run,
+        # or the recovery path after a failed stage, must not be refused for space it already occupies
+        old=$(stat -Lc %s "$MNT/models/$(basename "$m")" 2> /dev/null || echo 0)
+        [ "$new" -gt "${old:-0}" ] && need=$((need + new - old))
+    done
+    for d in $NPUMODELS; do
+        # -B1 (blocks, in bytes) on both sides, not -sb (apparent): df counts what is ALLOCATED, and a directory of many
+        # small files allocates more than its sizes add up to - the 696 MB NPU pack is hundreds of them, which is where an
+        # apparent-bytes estimate and df disagree. Comparing like with like is the whole point of a preflight.
+        new=$(du -sB1 "$d" 2> /dev/null | cut -f1); new=${new:-0}
+        # the directory is rm -rf'd before the copy, so its old bytes come back to the filesystem
+        old=$(du -sB1 "$MNT/models/$(basename "${d%/}")" 2> /dev/null | cut -f1); old=${old:-0}
+        [ "$new" -gt "$old" ] && need=$((need + new - old))
+    done
+    need=$((need + 1048576))     # 1 MiB of headroom for the new directory entries and the conf/key writes
+    avail=$(df -B1 --output=avail "$MNT" 2> /dev/null | tail -n 1 | tr -d ' ')
+    # a df that cannot answer (an old busybox has no --output) leaves this empty: skip rather than guess
+    if [ -n "${avail:-}" ] && [ "$need" -gt 1048576 ] && [ "$avail" -lt "$need" ]; then
+        # what is already on the medium is part of the answer: on c32 the partition held the image's own /data at ~1.3 GiB, and
+        # finding that took the operator twenty minutes. Name the biggest occupants, excluding what this run is about to write.
+        occupants=$(du -sB1 "$MNT"/* 2> /dev/null | sort -rn | head -4 |
+            while read -r bytes path; do
+                [ "${path##*/}" = models ] && continue
+                printf '  %s %.1f MiB\n' "${path#"$MNT"/}" "$(awk -v b="$bytes" 'BEGIN { print b / 1048576 }')"
+            done)
+        die "refusing to stage: the data filesystem has $avail bytes free and the models need $need. The partition's grow or its resize2fs did not happen - read the 'grow'/'grown' lines above, then compare 'sfdisk -d $TARGET' (the partition) with 'df -h $MNT' (the filesystem). Already on it:
+${occupants:-  (nothing measurable)}
+Staging anyway leaves a TRUNCATED model on the medium instead of an error (engine#1374)."
+    fi
+fi
 
 # ---- the writes ----------------------------------------------------------------------------------
 write_key() {   # <key>: put LEMONADE_API_KEY=<key> on a line of its own in lemond.conf
@@ -316,7 +387,13 @@ if [ "$CHECK" = 0 ]; then
         [ -d "$MNT/models" ] || mkdir -p "$MNT/models"
         cp -f "$m" "$MNT/models/$(basename "$m")" || die "could not copy $m into $MNT/models"
         chown 0:0 "$MNT/models" "$MNT/models/$(basename "$m")" 2>/dev/null
-        printf 'model    models/%s (%s bytes)\n' "$(basename "$m")" "$(stat -Lc %s "$m")"
+        # engine#1374: prove the staged bytes, do not assume them. `cp` returning 0 is not evidence that what is on the medium
+        # is what was asked for - the c32 failure was a truncated model that only a byte comparison found, and this tool wrote
+        # it, so this tool is where the check belongs. cmp is byte-exact and costs one read of each side, which the copy has
+        # already paid for in page cache.
+        cmp -s "$m" "$MNT/models/$(basename "$m")" ||
+            die "the staged models/$(basename "$m") is not byte-identical to $m (a short write, a truncated copy, or the source changed while staging) - the medium was NOT left half-staged on purpose: re-run after checking space (engine#1374)"
+        printf 'model    models/%s (%s bytes, byte-identical to the source)\n' "$(basename "$m")" "$(stat -Lc %s "$m")"
     done
     for d in $NPUMODELS; do
         name=${d%/}; name=${name##*/}
@@ -325,6 +402,10 @@ if [ "$CHECK" = 0 ]; then
         mkdir -p "$MNT/models/$name" || die "could not create $MNT/models/$name"
         # -L: on a build box the model directory is symlinks into the FLM install; the stick needs the bytes
         cp -fRL "$d"/. "$MNT/models/$name"/ || die "could not copy the NPU model $d into $MNT/models/$name"
+        # the same proof for a directory of files: every staged file byte-identical to its source, and a missing or extra file
+        # is a difference too (diff -r reports both)
+        diff -r -q "$d" "$MNT/models/$name" > /dev/null 2>&1 ||
+            die "the staged models/$name is not byte-identical to $d (run: diff -r $d $MNT/models/$name) - engine#1374"
         chown -R 0:0 "$MNT/models/$name" 2>/dev/null
         printf 'npu      models/%s (%s files, %s bytes)\n' "$name" \
             "$(find "$MNT/models/$name" -type f | wc -l)" "$(du -sb "$MNT/models/$name" | cut -f1)"
@@ -423,6 +504,12 @@ for m in $MODELS; do
     [ -f "$f" ] && [ "$(stat -c %s "$f")" = "$(stat -Lc %s "$m")" ] &&
         ok "models/$(basename "$m") is there, same size as the source" ||
         bad "models/$(basename "$m") is missing or a different size"
+    # the same size is not the same bytes: the staging run now proves each copy with cmp, and this proves a
+    # medium that was staged earlier - or by an older tool - including under --check, where nothing is written
+    if [ -f "$f" ]; then
+        cmp -s "$f" "$m" && ok "models/$(basename "$m") is byte-identical to the source (cmp)" ||
+            bad "models/$(basename "$m") is the same size but NOT the same bytes as the source (cmp)"
+    fi
 done
 
 # An NPU model directory is only usable if init.sh will find model.q4nx in it and the engine can read every
@@ -443,6 +530,12 @@ for d in $NPUMODELS; do
         bad "models/$name holds symlinks that point nowhere on the stick: $broken"
     [ "$(find "$f" -type l | wc -l)" = 0 ] && ok "models/$name is real files, no symlinks (init.sh + the engine read it as is)" ||
         bad "models/$name still holds symlinks; copy it with -L (or re-run --npu-model)"
+    # and the bytes, not just the names: `diff -r` reports a missing file, an extra one, and a changed one
+    if [ -d "$d" ] && [ -d "$f" ]; then
+        diff -r -q "$d" "$f" > /dev/null 2>&1 &&
+            ok "models/$name is byte-identical to the source tree (diff -r)" ||
+            bad "models/$name differs from the source tree: $(diff -r -q "$d" "$f" 2>&1 | head -3 | tr '\n' ' ')"
+    fi
     ok "models/$name registers as the entry '$name-1bit' (onebit_backend npu, by init.sh) and 1bit-release-check asks the NPU through it"
 done
 

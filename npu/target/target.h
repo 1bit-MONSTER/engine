@@ -118,6 +118,28 @@ public:
     virtual bool gemv(const GemvArgs& a, std::vector<float>& out, std::string& err) = 0;
 
     // Optional ops.  A target that leaves one alone returns false and `supports()` stays false for it.
+    //
+    // CONTRACT, and why it is written out (engine#799 rule (b)): an op that a plan may name must be able to
+    // ship a host reference, and a reference can only exist if the signature carries its operands.  These
+    // three spell out what each one is, so the reference has something to be checked against:
+    //
+    //   gdn_step(layer, M, x, y)   the GDN delta-rule step for ONE layer over M rows.  `x` is [M][H] float
+    //                              row-major input to the layer; `y` is [M][H] the layer's output.  The
+    //                              layer's parameters (conv kernel, wa/wb, ssm_a, dt bias, norm) and its
+    //                              recurrence state come from the layer that `load_block()` made resident,
+    //                              NOT from the arguments: a target that holds them on the device runs the
+    //                              step there, and a host reference for it must take the same parameters
+    //                              explicitly.  Not idempotent -- the step advances the layer's state.
+    //   attn_step(layer, M, q, o)  the attention step for ONE layer over M rows: `q` is [M][NH*HD] float
+    //                              row-major, `o` is [M][NH*HD].  Keys/values come from the layer's own
+    //                              cache state (built by the forward, resident per load_block()), never from
+    //                              the arguments -- which is the same reason a reference needs them passed.
+    //   lm_head(h, logits)         one hidden row [H] to the vocabulary vector [V]; the weights are the
+    //                              model's, resident, and this one IS idempotent (no state).
+    //
+    // The first two are the reason rule (b) is two slices: a reference cannot be written against an
+    // argument list that omits the state and parameters the op consumes.  Specifying them here is the
+    // first step; `npu/plan/op_registry.cpp` registers them once their references and known answers exist.
     virtual bool gdn_step(int /*layer*/, int /*M*/, const float* /*x*/, float* /*y*/) { return false; }
     virtual bool attn_step(int /*layer*/, int /*M*/, const float* /*q*/, float* /*o*/) { return false; }
     virtual bool lm_head(const float* /*h*/, float* /*logits*/) { return false; }

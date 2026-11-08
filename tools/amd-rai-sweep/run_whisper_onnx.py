@@ -75,9 +75,17 @@ def main():
     so0 = ort.SessionOptions()
     so0.log_severity_level = 3
     enc = ort.InferenceSession(a.encoder, so0, providers=["CPUExecutionProvider"])
-    bins = enc.get_inputs()[0].shape[1]
+    enc_shape = enc.get_inputs()[0].shape          # expected [batch, 80|128, frames]
+    bins = enc_shape[1] if len(enc_shape) == 3 else None
+    # REFUSE an unfamiliar width instead of falling back: the whole point of trap 4 is that a wrong-width
+    # extractor is rejected by the graph and reads as "no output". A symbolic dim (a str), a frame-major export
+    # ([batch, frames, n_mels] -> 3000 here) and a 64/96-bin export all used to land silently on the 80-bin path.
+    if not isinstance(bins, int) or bins not in (80, 128):
+        raise SystemExit(f"whisper encoder declares shape {enc_shape}: cannot tell the mel-bin count "
+                         f"(expected [batch, 80|128, frames]); pass --tokenizer to choose the reference explicitly")
+    # the extractor follows the tokenizer reference, so the two cannot drift once a third width is added
     ref = a.tokenizer or ("openai/whisper-large-v3" if bins == 128 else "openai/whisper-tiny")
-    fe = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3" if bins == 128 else "openai/whisper-tiny")
+    fe = WhisperFeatureExtractor.from_pretrained(ref)
     tok = WhisperTokenizer.from_pretrained(ref)
     vocab = tok.get_vocab()
 
@@ -108,13 +116,21 @@ def main():
     enc_s = time.time() - t0
 
     prompt = [t for t in (SOT, EN, TR, NT) if t is not None]
-    width = dec.get_inputs()[0].shape[1]        # static decoder window (448 in AMD's exports)
+    d_in = dec.get_inputs()
+    if len(d_in) < 2:
+        raise SystemExit(f"whisper decoder expects {len(d_in)} input(s), not the token+encoder-state pair: "
+                         f"{[i.name for i in d_in]}")
+    tok_name, xa_name = d_in[0].name, d_in[1].name
+    t_shape = d_in[0].shape                     # [batch, 448] in AMD's exports
+    if len(t_shape) != 2 or not isinstance(t_shape[1], int):
+        raise SystemExit(f"whisper decoder declares {t_shape}: the token window must be a static [batch, N]")
+    width = t_shape[1]
     ids = np.zeros((1, width), dtype=np.int64)
     ids[0, :len(prompt)] = prompt
     t0 = time.time()
     out, steps = [], 0
     while len(prompt) < width:
-        logits = dec.run(None, {"x": ids, "xa": xa})[0]
+        logits = dec.run(None, {tok_name: ids, xa_name: xa})[0]
         nxt = int(np.argmax(logits[0, len(prompt) - 1]))
         steps += 1
         if nxt == EOT or len(out) >= 200:

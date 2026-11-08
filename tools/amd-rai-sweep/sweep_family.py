@@ -75,7 +75,11 @@ def workdir():
     and the driver reported it as a task error rather than "the box has no room where you put it". Cache dirs live
     under $HOME for exactly this reason; honour TMPDIR when it is set to something else.
     """
-    base = os.environ.get("AMD_RAI_SWEEP_TMP") or os.path.join(os.path.expanduser("~"), ".cache", "amd-rai-sweep")
+    base = os.path.join(os.path.expanduser("~"), ".cache", "amd-rai-sweep")
+    for cand in (os.environ.get("AMD_RAI_SWEEP_TMP"), os.environ.get("TMPDIR")):
+        if cand and os.path.realpath(cand).rstrip("/") != "/tmp":    # honour TMPDIR unless it is the tmpfs we avoid
+            base = cand
+            break
     os.makedirs(base, exist_ok=True)
     return tempfile.mkdtemp(prefix="pull-", dir=base)
 

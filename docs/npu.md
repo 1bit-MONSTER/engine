@@ -887,7 +887,19 @@ another box means linking that box's set the same way. Leaving `--kernels` out i
 (the container has no `npu/`, and `1bit forward-serve -m <model.q4nx> --kernels <dir>` still takes the set
 on the command line).
 
-### The `.fconst` attention payload
+### Prefill beyond T=256
+
+The prefill GEMM's kernel builds at T values above the 256 rows the shipped sets use, and each build passes the
+kernel tree's own numeric gate (fp64 reference from the same quantised pool bytes, per-token cosine ≥ 0.99999) —
+so `T > 256` is a capability, not a hazard. What it does **not** buy is throughput: per-row time is flat in T,
+because the weight stream is re-read once per T-tile, and the kernel's own tiling is what bounds a run at this
+size. The gate tool, the toolchain pins it needs, and the per-T rows live in the private kernel repository
+(`1bit-MONSTER/npu-kernels`, `tools/npu_prefill_tgate.sh`, `docs/npu-prefill-tgate.md`), as does the design.
+
+For this engine, the consequence is the one recorded in [engine#1421](https://github.com/1bit-MONSTER/engine/issues/1421):
+a faster NPU prefill is an inner-loop and layout question in the kernels, not a parameter this page can set.
+
+### The `.fconst` attention payload### The `.fconst` attention payload
 
 A layer block's attention payload sits between its two epsilon headers and is a whole number of
 **64-row tiles**: one tile is `2*(K/128) + 2` subvolumes of 2,176 B, a pair per (column half, K

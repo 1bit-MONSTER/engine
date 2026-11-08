@@ -24,6 +24,7 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "q4nx_row_chunks.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
 #include <algorithm>
 #include <fcntl.h>
@@ -4898,21 +4899,44 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
         scales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
     }
     I8Ctx& lctx = *xd_->head_ctx();
-    std::vector<float> got((size_t)M * (size_t)T);
-    for (int t = 0; t < ntiles; t++) {
-        const int n0 = t * T, n1 = std::min(NV, n0 + T);
-        xrt::run run = lctx.launch_async_with_bo_rows(*lm_head_packed_[(size_t)t].bo, hr.data(), M, H,
-                                                      scales.data());
-        lctx.wait_kernel(run);
-        lctx.readback();
-        std::fill(got.begin(), got.end(), 0.0f);
-        lctx.dequant_pb16i(got.data(), M, T, scales.data(), lm_head_packed_[(size_t)t].eref,
-                           xd_->head_ctx()->pb16i_planes);
+    // engine#1386: the head context is built with MD = Q4NX_DESIGN_M_DECODE (16) rows, and this path used
+    // to launch ALL M rows into it.  quantize_async_rows() refuses a wider batch and returns the rows
+    // unquantised, and `launch_async_with_bo_rows` then ran anyway -- a read and a write past the end of
+    // the activation BO, which is #1372's failure on the head.  Chunk at the context's own capacity, the
+    // way #1364 did for the int8 head: the weights are resident, so a chunk is one launch, and each row's
+    // rotation and scale are its own, so chunking cannot move a value.  NPU_HEAD_NO_CHUNK=1 is the
+    // pre-chunking arm (one row per chunk) that makes an A/B possible on the same artifacts.
+    static const bool chunk_on = std::getenv("NPU_HEAD_NO_CHUNK") == nullptr;
+    const std::vector<onebit::npu::RowChunk> chunks = onebit::npu::row_chunks(M, lctx.MD, chunk_on);
+    if (chunks.empty() && M > 0) {
+        // No capacity to launch into: the per-row path below is the correct answer, not a blind launch.
         for (int m = 0; m < M; m++) {
-            for (int n = n0; n < n1; n++) {
-                float v = got[(size_t)m * T + (n - n0)];
-                if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
-                logits_all[(size_t)m * (size_t)NV + (size_t)n] = v;
+            std::vector<float> one(h_rows.begin() + (size_t)m * H, h_rows.begin() + (size_t)(m + 1) * H);
+            std::vector<float> lg;
+            if (!run_lm_head(one, lg)) return false;
+            std::copy(lg.begin(), lg.end(), logits_all.begin() + (size_t)m * (size_t)NV);
+        }
+        return true;
+    }
+    for (const onebit::npu::RowChunk& c : chunks) {
+        const int r0 = c.offset, rows = c.rows;
+        std::vector<float> got((size_t)rows * (size_t)T);
+        for (int t = 0; t < ntiles; t++) {
+            const int n0 = t * T, n1 = std::min(NV, n0 + T);
+            xrt::run run = lctx.launch_async_with_bo_rows(
+                *lm_head_packed_[(size_t)t].bo, hr.data() + (size_t)r0 * (size_t)H, rows, H,
+                scales.data() + r0);
+            lctx.wait_kernel(run);
+            lctx.readback();
+            std::fill(got.begin(), got.end(), 0.0f);
+            lctx.dequant_pb16i(got.data(), rows, T, scales.data() + r0, lm_head_packed_[(size_t)t].eref,
+                               xd_->head_ctx()->pb16i_planes);
+            for (int m = 0; m < rows; m++) {
+                for (int n = n0; n < n1; n++) {
+                    float v = got[(size_t)m * T + (n - n0)];
+                    if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                    logits_all[(size_t)(r0 + m) * (size_t)NV + (size_t)n] = v;
+                }
             }
         }
     }

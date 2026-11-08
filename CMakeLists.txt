@@ -857,6 +857,12 @@ add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_
 target_include_directories(npu_elf_args_test PRIVATE npu/forward/include)
 target_link_libraries(npu_elf_args_test PRIVATE m)
 add_test(NAME npu_elf_args COMMAND npu_elf_args_test)
+# The batched verify pass's chunk arithmetic (engine#1386/#1364): no launch wider than the context's row
+# capacity, contiguous coverage of every row, and no chunks at all when the capacity is unknown.  Arithmetic
+# only, so it runs everywhere, including CI without a device.
+add_executable(npu_row_chunks_test tests/npu_row_chunks_test.cpp)
+target_include_directories(npu_row_chunks_test PRIVATE ${CMAKE_SOURCE_DIR}/npu/forward/include)
+add_test(NAME npu_row_chunks COMMAND npu_row_chunks_test)
 add_executable(npu_plan_test tests/npu_plan_test.cpp)
 target_include_directories(npu_plan_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
 target_link_libraries(npu_plan_test PRIVATE nlohmann_json::nlohmann_json)

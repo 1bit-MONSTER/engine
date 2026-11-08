@@ -863,6 +863,11 @@ add_test(NAME npu_elf_args COMMAND npu_elf_args_test)
 add_executable(npu_row_chunks_test tests/npu_row_chunks_test.cpp)
 target_include_directories(npu_row_chunks_test PRIVATE ${CMAKE_SOURCE_DIR}/npu/forward/include)
 add_test(NAME npu_row_chunks COMMAND npu_row_chunks_test)
+# ci.yml builds a named list of targets (its own comment: "keep this list in step with add_test()"), and the
+# PR token cannot edit a workflow file, so the test binary is built by way of a target that IS in that list -
+# the same arrangement npu_plan_test already has below. Without this, `ctest` reports the test "Not Run":
+# it only runs binaries that exist.
+add_dependencies(npu_elf_args_test npu_row_chunks_test)
 add_executable(npu_plan_test tests/npu_plan_test.cpp)
 target_include_directories(npu_plan_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
 target_link_libraries(npu_plan_test PRIVATE nlohmann_json::nlohmann_json)

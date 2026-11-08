@@ -161,8 +161,17 @@ fi
 # into this script, and re-created as a directory on every boot. The engine is installed at /opt/1bit with its
 # backends beside it (mkimage.sh), so the sets are linked beside the engine there and no /home path exists.
 if [ -d /data/npu/kernels ] && [ -d /opt/1bit ]; then
-    ln -sfn /data/npu/kernels /opt/1bit/npu/kernels 2>/dev/null
-    say "[kernels] $(ls /data/npu/kernels | wc -l) sealed NPU sets linked beside the engine"
+    # the parent has to exist before the link, or ln fails and the message below lies about it (engine #1543
+    # review item 1): the engine looks for <its own directory>/npu/kernels, and its directory is the real one
+    # /proc/self/exe resolves to - /opt/1bit - not /bin, which is only the symlink on PATH
+    mkdir -p /opt/1bit/npu
+    if ln -sfn /data/npu/kernels /opt/1bit/npu/kernels 2>/dev/null && [ -d /opt/1bit/npu/kernels ]; then
+        say "[kernels] $(ls /data/npu/kernels | wc -l) sealed NPU sets linked beside the engine"
+    else
+        say "[kernels] FAILED to link /data/npu/kernels beside the engine: the NPU route will register no device"
+    fi
+elif [ -d /data/npu/kernels ]; then
+    say "[kernels] /data/npu/kernels is there but the engine is not at /opt/1bit: nothing to link beside"
 fi
 
 n=0

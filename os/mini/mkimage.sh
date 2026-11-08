@@ -337,7 +337,12 @@ install_origin() {   # install_origin <source elf> <destination dir>: the file, 
     [ -e "$src" ] || { echo "missing: $src"; exit 1; }
     mkdir -p "$dir"; cp -L "$src" "$dir/"
     patchelf --set-rpath '$ORIGIN' "$dir/$(basename "$src")"
-    ldd "$src" 2>/dev/null | grep -o '/[^ ]*' | while read -r f; do
+    # ONLY what the image does not already carry. The image has libc, libstdc++, libgcc_s and the loader;
+    # copying those beside the engine and then pointing RUNPATH at $ORIGIN makes the copy SHADOW the image's
+    # own libc for every ELF in that directory - a set that works on the builder and fails at boot. A library
+    # on the standard loader path is the loader's business, on the image as on any machine.
+    for f in $(ldd "$src" 2>/dev/null | awk '/=> \// {print $3}'); do
+        case "$f" in /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*) continue ;; esac
         [ -e "$dir/$(basename "$f")" ] || cp -L "$f" "$dir/"
     done
     # EVERY copy, not just the program: a library from the build tree carries the build tree in its own
@@ -351,24 +356,16 @@ install_origin() {   # install_origin <source elf> <destination dir>: the file, 
 }
 install_origin "$bin" "$eng"
 ln -sfn ../opt/1bit/1bit "$root/bin/1bit"
-# the backends, at the relative paths built_path() looks them up, each with its own libraries beside it
+# NO backend goes into the initramfs. init.sh points ONEBIT_{,HRX_}LLAMA_SERVER at /opt/1bit-llama, which it
+# links from the stick's data partition at boot, and default_llama_server() (app/serve.cpp:292) returns those
+# first - so an HRX llama-server and its ~40 MB runtime set inside the image were never executed, while the
+# initramfs is already 97.9 MB compressed against the 103 MB that grub failed to load on real hardware. One
+# copy, and it is the one on the stick (mkimage.sh puts it there below, engine #1543's review item 2).
 for back in vulkan hrx; do
-    [ -x "$build/$back/llama/bin/llama-server" ] && install_origin "$build/$back/llama/bin/llama-server" "$eng/$back/llama/bin"
-done
-# the HRX backend's runtime set, which libhsa opens by name at run time (engine #1411): ldd cannot see it,
-# so it travels beside llama-server rather than being resolved from whatever the machine offers
-if [ -d "$eng/hrx/llama/bin" ]; then
-    tc=$(sed -n 's/^ONEBIT_HRX_TOOLCHAIN[^=]*=//p' "$build/CMakeCache.txt" 2>/dev/null | head -1)
-    core=$(ls -d "$tc"/lib/python3*/site-packages/_rocm_sdk_core/lib 2>/dev/null | head -1)
-    if [ -n "$core" ]; then
-        for n in libhsa-runtime64.so.1 libhsa-amd-aqlprofile64.so.1 librocprofiler-register.so.0; do
-            [ -e "$eng/hrx/llama/bin/$n" ] || cp -L "$core/$n" "$eng/hrx/llama/bin/" || exit 1
-        done
-        for f in "$core"/rocm_sysdeps/lib/librocm_sysdeps_*.so*; do
-            [ -e "$eng/hrx/llama/bin/$(basename "$f")" ] || cp -L "$f" "$eng/hrx/llama/bin/"
-        done
+    if [ -e "$build/$back/llama/bin/llama-server" ]; then
+        echo "   $back backend: left to the data partition ($(du -sm "$build/$back/llama/bin" 2>/dev/null | cut -f1) MB not in the initramfs)"
     fi
-fi
+done
 # The sealed NPU kernel sets travel BESIDE the engine binary (docs/releases.md, "The NPU engine"): in a
 # package that is <pkg>/npu/kernels next to <pkg>/1bit. Here they live on the stick's data partition (they
 # are ~124 MB and grub would not load an initrd that size) and init.sh links them to /opt/1bit/npu/kernels

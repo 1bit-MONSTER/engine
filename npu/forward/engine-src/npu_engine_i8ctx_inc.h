@@ -130,6 +130,10 @@ struct I8Ctx {
     // quantiser wrote. Both C syncs (the canary's writeback and readback()'s invalidate) cover
     // exactly these rows instead of the whole BO -- see c_host_bytes().
     int last_am_ = 1;
+    // engine#1416: [ps] pack-split accumulators (NPU_PACK_SPLIT=1)
+    using pack_clock = std::chrono::steady_clock;
+    long pack_split_n_ = 0;
+    double pack_split_q_ = 0, pack_split_sync_ = 0, pack_split_canary_ = 0, pack_split_launch_ = 0;
     // A client that writes A itself instead of going through the quantisers has to say how many rows it
     // wrote, or the narrow invalidation would be sized for one row: onnx/ort/onebit_npu_gemm.cpp memcpys the
     // graph's int8 rows straight into Am, so it calls this with the rows of the launch it is about to make.
@@ -529,13 +533,43 @@ struct I8Ctx {
     // PER-ROW scales, so each row of a prompt keeps its own dynamic range (a
     // single shared scale zeroes low-magnitude rows when one token's activations
     // dwarf the rest -- issue #1699). Dequantize with the same per-row scales.
+    // engine#1416 [ps]: the prefill `pack` column was 24 ms/launch on a build whose profiler is now
+    // gone, and a device-free bench of the row quantiser alone says 0.203 ms for 128x4864 -- so ~99 %
+    // of that figure sits in one of the other three terms below. This splits them, no behaviour change.
     inline xrt::run launch_async_with_bo_rows(xrt::bo& wbo, const float* A,
                                               int am, int ak,
                                               const float* ascales) {
+        static const bool split = std::getenv("NPU_PACK_SPLIT") != nullptr;
+        if (!split) {
+            quantize_async_rows(A, am, ak, ascales);
+            sync_a_to_device();
+            poison_canary(ND, am);
+            return (*kext)(*bA, wbo, *bC);
+        }
+        const auto t0 = pack_clock::now();
         quantize_async_rows(A, am, ak, ascales);
+        const auto t1 = pack_clock::now();
         sync_a_to_device();
+        const auto t2 = pack_clock::now();
         poison_canary(ND, am);
-        return (*kext)(*bA, wbo, *bC);
+        const auto t3 = pack_clock::now();
+        xrt::run r = (*kext)(*bA, wbo, *bC);
+        const auto t4 = pack_clock::now();
+        {
+            using namespace std::chrono;
+            const double q  = duration<double, std::milli>(t1 - t0).count();
+            const double sy = duration<double, std::milli>(t2 - t1).count();
+            const double cn = duration<double, std::milli>(t3 - t2).count();
+            const double lc = duration<double, std::milli>(t4 - t3).count();
+            pack_split_q_ += q; pack_split_sync_ += sy; pack_split_canary_ += cn;
+            pack_split_launch_ += lc; pack_split_n_++;
+            if (pack_split_n_ % 100 == 0)
+                fprintf(stderr, "[ps] n=%ld M=%d K=%d per-launch: quant=%.3f sync=%.3f "
+                                "canary=%.3f launch=%.3f ms\n", pack_split_n_, am, ak,
+                        pack_split_q_ / pack_split_n_, pack_split_sync_ / pack_split_n_,
+                        pack_split_canary_ / pack_split_n_, pack_split_launch_ / pack_split_n_);
+        }
+        return r;
     }
 
     // ── Pack weights for layer l into contiguous BO ──

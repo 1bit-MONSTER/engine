@@ -29,10 +29,11 @@
 # libhsa-runtime64.so.1 plus every sibling it needs at load time (the TheRock `librocm_sysdeps_*` set and
 # librocprofiler-register.so.0). Cycle 13's board boot measured why the set and not one file (engine#715 +
 # the 2 Nov hardware run):
-#   * `ONEBIT_HRX_LIBHSA` is a CMake compile definition, not a variable - nothing in the engine reads it at
-#     run time (CMakeLists.txt:279, cmake/hrx.cmake). app/serve.cpp:201 resolves in the order --hrx-libhsa,
-#     the BAKED build-machine path if it exists, then a recursive scan of /opt/rocm-therock. On the appliance
-#     the baked path is a release-build directory that does not exist, so the scan is the only route left;
+#   * nothing bakes an HSA path into `1bit` by default (engine#1459 / #1460): `ONEBIT_HRX_LIBHSA` is a CMake
+#     cache value the build fills by globbing ONEBIT_HRX_TOOLCHAIN, kept as build metadata because mkimage reads
+#     it to decide which runtime to SHIP; `-DONEBIT_HRX_LIBHSA_BAKE=<path>` is the explicit opt-in that compiles
+#     one in. app/serve.cpp:201 resolves in the order --hrx-libhsa, a baked path if one was asked for, then a
+#     recursive scan of /opt/rocm-therock - so on the appliance the scan is the route;
 #   * the pinned libhsa carries `RUNPATH=$ORIGIN` and NEEDED librocm_sysdeps_{elf,drm,drm_amdgpu,numa} +
 #     librocprofiler-register, so a lone file cannot load even when handed to the loader: measured `ldd` = 4
 #     `not found`. With the release kit's own directory on the path: 0 not found.

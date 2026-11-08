@@ -143,7 +143,24 @@ SFS with one added file): the update reports `UPDATED`, the machine comes back o
 the new set's marker file present and the marker written before the update still there; `--rollback` brings it back to
 `psubdir=1bit` with the previous appliance intact and the state unchanged.
 
-### The server-shaped rest, present or named
+#### What `/etc/1bit/release-identity` says, and which of it is checked
+
+The file is written by the builder, printed by the console's header and read by `1bit-release-check`'s identity rows. Its
+fields are not the same kind of thing, and the rows say so:
+
+| field | what it is | checked how |
+|---|---|---|
+| `engine_sha256` | the sha256 of the payload's launcher, **computed from the bytes** at build time | compared against the launcher present in the image |
+| `payload_lemond` | the version string the payload's own `lemond-onebit --version` prints, computed from the payload at build time | compared against what that launcher says **on the machine** (`payload-identity` row) |
+| `libhsa_sha256` | the sha256 of the shipped HSA runtime | compared against the runtime the image actually loads |
+| `payload` | a **label**: the release tarball's stem | printed, **not** asserted — no fact inside an image can equal a tarball's name, and a check that pretended otherwise would red a correct image |
+| `built` | the build timestamp | informational |
+
+The `payload=` label is what the console shows because a person wants the date in it; the verified field is
+`payload_lemond=`, which is a fact about the payload's bytes. An image built before engine#1557 has no `payload_lemond=` and
+the row **SKIPs with that reason** rather than passing by absence.
+
+## The server-shaped rest, present or named
 
 An installed 1bit OS is a headless server, so the things a server is expected to have are either there and measured, or
 named here as what they are:

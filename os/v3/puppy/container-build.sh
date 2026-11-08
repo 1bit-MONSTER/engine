@@ -350,7 +350,16 @@ if [ -n "${PAYLOAD:-}" ]; then
         "$skeleton/etc/1bit/onebit-models.txt" || {
         echo "build: REFUSED: could not write /etc/1bit/onebit-models.txt from the payload catalogue" >&2
         exit 1; }
+    # engine#1557: `payload=` is a LABEL (the tarball stem, which the console shows and no in-image fact can equal), so the
+    # identity also carries one fact about the payload that a machine CAN check: the version string the payload's own
+    # launcher reports. It is read from the bytes here, not from the environment, and the build refuses if it cannot be read -
+    # a payload that cannot say what it is has no business claiming a name.
+    payload_lemond=$("$PAYLOAD/lemond-onebit" --version 2> /dev/null | sed -n 's/^lemond version //p' | head -1)
+    [ -n "$payload_lemond" ] || {
+        echo "build: REFUSED: $PAYLOAD/lemond-onebit --version printed no version, so the identity cannot state which payload this is (engine#1557)" >&2
+        exit 1; }
     { echo "payload=${PAYLOAD_NAME:-unknown}"
+      echo "payload_lemond=$payload_lemond"
       echo "engine_sha256=$(sha256sum /payload/1bit/1bit | cut -c1-64)"
       if [ -n "${LIBHSA_DIR:-}" ]; then
           echo "libhsa_sha256=$(sha256sum /libhsa-runtime/libhsa-runtime64.so.1 | cut -c1-64)"

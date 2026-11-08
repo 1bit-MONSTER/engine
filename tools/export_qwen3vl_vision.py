@@ -130,6 +130,10 @@ def export(hf_dir: str, out_dir: str, opset: int):
             # a fixed bucket: the patch count is baked in (see dynamo=False below)
 
             opset_version=opset, do_constant_folding=True,
+            # External data: the tower is 1.6 GB of fp32 weights, and a single inline protobuf of that size is where
+            # ONNX tooling starts failing ("Wire format was corrupt" from the quantiser's pre-processing). Written as
+            # `<graph>.onnx` + `<graph>.data`, which is also the shape AMD's own vision packs ship.
+            external_data=True,
             # The legacy (TorchScript) exporter, not torch.export: the tower's positional interpolation loops over
             # the *values* of image_grid_thw (`torch.linspace(0, num_grid_per_side-1, h)` per image), which
             # torch.export cannot symbolic-shape.  This makes the exported graph a FIXED BUCKET: the grid is baked
@@ -137,6 +141,20 @@ def export(hf_dir: str, out_dir: str, opset: int):
             # noted in docs/npu.md.  The owner's order allows fixed buckets, so this is the shipped shape.
             dynamo=False,
         )
+    # Split the weights out by hand when the exporter kept them inline: the legacy exporter ignores
+    # external_data=, and a 1.6 GB inline protobuf is where the quantiser's pre-processing fails to parse.
+    try:
+        import onnx
+        big = os.path.getsize(path) > 512 * 1024 * 1024
+        if big and not os.path.exists(path + ".data"):
+            m = onnx.load(path)
+            onnx.save_model(m, path, save_as_external_data=True, all_tensors_to_one_file=True,
+                            location=os.path.basename(path) + ".data", size_threshold=1024)
+            del m
+            print(f"split weights to {os.path.basename(path)}.data "
+                  f"({os.path.getsize(path) / 1e6:.1f} MB graph + {os.path.getsize(path + '.data') / 1e6:.1f} MB)")
+    except ImportError:
+        pass
     meta = {"source": os.path.abspath(hf_dir), "opset": opset, "hidden": int(vc.hidden_size),
             "out_hidden": int(vc.out_hidden_size), "patch": patch, "temporal_patch": int(vc.temporal_patch_size),
             "merge": merge, "depth": depth, "heads": int(vc.num_heads),
@@ -210,15 +228,57 @@ def hf_dir_of(fp32_dir: str) -> str:
     return meta.get("source", "")
 
 
-def quantize(fp32_dir: str, out_dir: str, calib: int):
+def bench(out_dir: str, images: int, providers: str):
+    """Seconds per image through the graph, on the providers named (e.g. "CPUExecutionProvider").
+
+    This is gate 3's other half: the CPU projector in llama.cpp measures 16.97 s/image on this box, and a row here is
+    what our graph costs on the same machine. Not an accuracy row -- `check` is.
+    """
+    import onnxruntime as ort
+    import time
+
+    meta = json.load(open(os.path.join(out_dir, "vision_fp32.json")))
+    bucket, patch, temporal = int(meta["bucket_patches"]), int(meta["patch"]), int(meta["temporal_patch"])
+    provs = [p.strip() for p in providers.split(",") if p.strip()]
+    sess = ort.InferenceSession(os.path.join(out_dir, "vision_fp32.onnx"), providers=provs)
+    rng = np.random.default_rng(11)
+    pv = make_image(rng, bucket, bucket, patch, temporal)
+    grid = np.array([[1, bucket, bucket]], dtype=np.int64)
+    t0 = time.time()
+    sess.run(None, {"pixel_values": pv, "image_grid_thw": grid})          # warm-up (graph + arena)
+    warm = time.time() - t0
+    times = []
+    for _ in range(images):
+        pv = make_image(rng, bucket, bucket, patch, temporal)
+        t0 = time.time()
+        sess.run(None, {"pixel_values": pv, "image_grid_thw": grid})
+        times.append(time.time() - t0)
+    best, med = min(times), sorted(times)[len(times) // 2]
+    print(f"providers={sess.get_providers()} images={images} warm-up {warm:.2f}s | "
+          f"per image best {best:.2f}s median {med:.2f}s | {1.0 / best:.3f} images/s")
+    print(f"cpu bar to beat (llama.cpp CPU projector, measured): 16.97 s/image")
+    return 0
+
+
+def quantize(fp32_dir: str, out_dir: str, calib: int, stream: bool = False, clip_percentile: float = 99.9):
     """QDQ int8, A8W8 per-channel -- the shape our ORT EP runs (Quark-style A8W8).
 
     Activations are quantised per tensor (QDQ), weights per output channel, both int8, and `image_grid_thw` is left
     alone (it is an integer input, not an activation). The calibration set is deterministic images at the exported
     bucket, so the row is reproducible; a real deployment would calibrate on its own data.
     """
+    if stream:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # tools/vision_qdq.py sits beside this file
+        import vision_qdq
+
+        # same contract as the ORT path below: 1 when the quantised graph misses the cosine bar, so a failing graph can
+        # never exit 0
+        return vision_qdq.quantise(os.path.join(fp32_dir, "vision_fp32.onnx"), os.path.join(out_dir, "vision_qdq.onnx"),
+                                   calib=calib, clip_percentile=clip_percentile)
+
     import onnxruntime as ort
-    from onnxruntime.quantization import CalibrationDataReader, QuantFormat, QuantType, quantize_static
+    from onnxruntime.quantization import CalibrationDataReader, CalibrationMethod, QuantFormat, QuantType, quantize_static
+    from onnxruntime.quantization.shape_inference import quant_pre_process  # kept for the record above
 
     meta = json.load(open(os.path.join(fp32_dir, "vision_fp32.json")))
     bucket, patch = int(meta["bucket_patches"]), int(meta["patch"])
@@ -247,13 +307,23 @@ def quantize(fp32_dir: str, out_dir: str, calib: int):
 
     os.makedirs(out_dir, exist_ok=True)
     dst = os.path.join(out_dir, "vision_qdq.onnx")
+    # Pre-processing first: symbolic shape inference + the standard fusions. Without it ORT quantises a graph whose
+    # tensors have no inferred ranges at several nodes and the calibration never reaches them — measured as a
+    # systematic, not a precision, error (cosine 0.22 with it missing).
+    # No quant_pre_process() here on purpose: with the weights in an external `.data` file it copies the model to a
+    # temp dir and leaves the data behind ("Data of TensorProto … should be stored in /tmp/pre.quant.*/
+    # vision_fp32.onnx.data, but it is not regular file"), and with the weights inline it fails earlier on
+    # symbolic shape inference. The graph is a fixed bucket with concrete shapes, so the quantiser's own
+    # pre-processing is not needed; this is recorded rather than worked around with a fragile temp-file dance.
+    _ = quant_pre_process
     quantize_static(src, dst, Reader(), quant_format=QuantFormat.QDQ, per_channel=True,
+                    calibrate_method=CalibrationMethod.Percentile,
                     activation_type=QuantType.QInt8, weight_type=QuantType.QInt8,
                     # Only the big projections. Quantising Conv (the patch embed), Add (residuals) and the
                     # norm/softmax paths as well was measured at cosine 0.22 against fp32 -- the graph is a ViT
                     # with per-token dynamic ranges and no QDQ pre-processing, so the sensitive ops stay float.
                     op_types_to_quantize=["MatMul"],
-                    extra_options={"ActivationSymmetric": True, "WeightSymmetric": True})
+                    extra_options={"ActivationSymmetric": True, "WeightSymmetric": True, "CalibPercentile": 99.9})
     out_meta = dict(meta)
     out_meta.update({"quant": "qdq-a8w8-perchannel-int8", "calib_images": calib})
     json.dump(out_meta, open(os.path.join(out_dir, "vision_qdq.json"), "w"), indent=1)
@@ -279,7 +349,17 @@ def main():
     q = sub.add_parser("quantize")
     q.add_argument("fp32_dir")
     q.add_argument("out_dir")
-    q.add_argument("--calib", type=int, default=16)
+    q.add_argument("--calib", type=int, default=32)
+    q.add_argument("--stream", action="store_true",
+                   help="streaming per-tensor QDQ instead of ORT's quantize_static (which needs ~64 GiB peak for this "
+                        "graph: measured by a systemd scope at 64.1 G before the OOM killer; the streaming path peaks "
+                        "at 6.4 G)")
+    q.add_argument("--clip-percentile", type=float, default=99.9,
+                   help="with --stream: per-tensor |x| percentile used as the activation range")
+    b = sub.add_parser("bench")
+    b.add_argument("out_dir")
+    b.add_argument("--images", type=int, default=3)
+    b.add_argument("--providers", default="CPUExecutionProvider")
     c = sub.add_parser("check")
     c.add_argument("hf_dir")
     c.add_argument("out_dir")
@@ -290,7 +370,9 @@ def main():
         export(a.hf_dir, a.out_dir, a.opset)
         return 0
     if a.cmd == "quantize":
-        return quantize(a.fp32_dir, a.out_dir, a.calib)
+        return quantize(a.fp32_dir, a.out_dir, a.calib, a.stream, a.clip_percentile)
+    if a.cmd == "bench":
+        return bench(a.out_dir, a.images, a.providers)
     return check(a.hf_dir, a.out_dir, a.images, a.onnx)
 
 

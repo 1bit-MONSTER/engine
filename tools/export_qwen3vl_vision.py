@@ -260,13 +260,19 @@ def bench(out_dir: str, images: int, providers: str):
     return 0
 
 
-def quantize(fp32_dir: str, out_dir: str, calib: int):
+def quantize(fp32_dir: str, out_dir: str, calib: int, stream: bool = False, clip_percentile: float = 99.9):
     """QDQ int8, A8W8 per-channel -- the shape our ORT EP runs (Quark-style A8W8).
 
     Activations are quantised per tensor (QDQ), weights per output channel, both int8, and `image_grid_thw` is left
     alone (it is an integer input, not an activation). The calibration set is deterministic images at the exported
     bucket, so the row is reproducible; a real deployment would calibrate on its own data.
     """
+    if stream:
+        import vision_qdq
+
+        return vision_qdq.quantise(os.path.join(fp32_dir, "vision_fp32.onnx"), os.path.join(out_dir, "vision_qdq.onnx"),
+                                   calib=calib, clip_percentile=clip_percentile)
+
     import onnxruntime as ort
     from onnxruntime.quantization import CalibrationDataReader, CalibrationMethod, QuantFormat, QuantType, quantize_static
     from onnxruntime.quantization.shape_inference import quant_pre_process  # kept for the record above
@@ -341,6 +347,12 @@ def main():
     q.add_argument("fp32_dir")
     q.add_argument("out_dir")
     q.add_argument("--calib", type=int, default=32)
+    q.add_argument("--stream", action="store_true",
+                   help="streaming per-tensor QDQ instead of ORT's quantize_static (which needs ~64 GiB peak for this "
+                        "graph: measured by a systemd scope at 64.1 G before the OOM killer; the streaming path peaks "
+                        "at 6.4 G)")
+    q.add_argument("--clip-percentile", type=float, default=99.9,
+                   help="with --stream: per-tensor |x| percentile used as the activation range")
     b = sub.add_parser("bench")
     b.add_argument("out_dir")
     b.add_argument("--images", type=int, default=3)
@@ -355,7 +367,8 @@ def main():
         export(a.hf_dir, a.out_dir, a.opset)
         return 0
     if a.cmd == "quantize":
-        return quantize(a.fp32_dir, a.out_dir, a.calib)
+        quantize(a.fp32_dir, a.out_dir, a.calib, a.stream, a.clip_percentile)
+        return 0
     if a.cmd == "bench":
         return bench(a.out_dir, a.images, a.providers)
     return check(a.hf_dir, a.out_dir, a.images, a.onnx)

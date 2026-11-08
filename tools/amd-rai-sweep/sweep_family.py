@@ -88,9 +88,15 @@ def sweep_whisper(repo, rows, cache_path, rows_path, wav, expect):
     try:
         pe = fetch_with_data(repo, enc, tmp, names)
         pd = fetch_with_data(repo, dec, tmp, names)
-        tokenizer = "openai/whisper-small.en" if "-en-" in repo else "openai/whisper-tiny"
-        out = subprocess.run([PY, f"{HERE}/run_whisper_onnx.py", pe, pd, wav, f"--tokenizer={tokenizer}"],
-                             capture_output=True, text=True).stdout.strip().splitlines()[-1]
+        # Only the English-only packs need an explicit tokenizer (their vocabularies shift every style id by one).
+        # Everything else must let the runner pick the reference from the encoder's mel-bin count: large-v3/turbo are
+        # 128 bins and tiny's tokenizer is a different vocabulary (51865 vs 51866), so forcing it here is wrong even
+        # when the transcript happens to come out right.
+        args = [PY, f"{HERE}/run_whisper_onnx.py", pe, pd, wav]
+        tokenizer = "by mel bins"
+        if "-en-" in repo:
+            tokenizer = "openai/whisper-small.en"
+            args.append(f"--tokenizer={tokenizer}")
         # the known answer is clip-specific: pass --expect for anything but the bundled jfk sample
         ok = "transcript=" in out and expect.lower() in out.lower()
         rows[f"result:{repo}"] = {"status": "OOB" if ok else "loads-wrong-output",

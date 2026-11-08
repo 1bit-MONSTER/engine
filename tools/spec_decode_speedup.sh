@@ -51,6 +51,14 @@ WAITMAX=${WAITMAX:-150}
 PORT_A=${PORT_A:-18120}
 PORT_B=${PORT_B:-18121}
 
+CUR_PID=""
+cleanup() {   # a server must never outlive the arm that started it -- an orphaned 14 h llama-server took 51 GiB GTT on
+              # 2026-11-08 and knocked the PR-agent LLM off the iGPU. Both a normal exit and an interrupt land here.
+    [ -n "$CUR_PID" ] && kill -9 "$CUR_PID" 2>/dev/null
+    CUR_PID=""
+}
+trap cleanup EXIT INT TERM HUP
+
 waitup() {
     local port=$1 label=$2 t0=$(date +%s)
     while :; do
@@ -79,7 +87,8 @@ arm() {  # arm <label> <port> <server args...>
     # shellcheck disable=SC2086
     $BIN -m "$TARGET" --port "$port" $SRV_ARGS -c 2048 --no-warmup "$@" > "/tmp/specdec-$label.log" 2>&1 &
     local pid=$!
-    waitup "$port" "$label" || { kill -9 $pid 2>/dev/null; return 1; }
+    CUR_PID=$pid
+    waitup "$port" "$label" || { kill -9 $pid 2>/dev/null; CUR_PID=""; return 1; }
     local i
     for i in $(seq 1 $(( REQS + 1 ))); do
         read -r tps acc gen < <(ask "$port")
@@ -87,7 +96,7 @@ arm() {  # arm <label> <port> <server args...>
         echo "  $label: ${tps} tok/s   accepted ${acc:-0}/${gen:-0}"
         echo "$tps" >> "/tmp/specdec-$label.acc"
     done
-    kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null
+    kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; CUR_PID=""
 }
 
 echo "== bin $BIN   srv args: $SRV_ARGS   tokens=$N k=$K"

@@ -3233,7 +3233,10 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // device state -- localises a batched-vs-sequential divergence immediately.
     static const bool batch_check = getenv("NPU_BATCH_CHECK") != nullptr;
     int seq_argmax = -1;
-    if (batch_check) {
+    // Not with injected rows: the oracle's own sequential pass runs step(tokens[m]) on the placeholder ids this
+    // entry point supplies, so it would compare against a zero-token pass and report a divergence that is not
+    // there. A debug tool that lies is worse than one that says "not applicable".
+    if (batch_check && !inject_embeds_) {
         std::vector<float> seq;
         for (int m = 0; m < M; m++)
             if (!step(tokens[m], start_pos + m, seq)) return false;

@@ -142,8 +142,8 @@ public:
     //
     // `embeds` is rows x H row-major, each row the model's own embedding for that position **before**
     // `embed_scale` (the forward applies its own scale, as it does on the token path), so a caller that builds
-    // rows with embed_row() gets byte-identical logits to step_batch(ids) -- tests/npu_embeds_equiv_probe checks
-    // exactly that. This exists so a hybrid can put image-feature rows where the image tokens are, without the
+    // rows with embed_row() gets byte-identical logits to step_batch(ids) -- npu/forward/embeds_equiv_probe.cpp
+    // (target `embeds_equiv_probe`, run under npu-hold or with NPU_INFER_HOST_GEMM=1) checks exactly that. This exists so a hybrid can put image-feature rows where the image tokens are, without the
     // decoder needing to know what a vision encoder is; it is NOT a way to skip the embedding table for text.
     // The per-token fallback path (MLA/MoE/GDN/... models) needs ids and is refused by name.
     bool step_batch_embeds(const std::vector<float>& embeds, int start_pos,

@@ -57,7 +57,7 @@ and `1bit/zamba` (PR #184, stacked on #178) add the three graphs, each CPU-prove
 Zamba2 0.0030, BlackMamba 0.0035, Zamba v1 0.0022). **All of it is at the engine pin, so ask the pin rather than this page.** The pin is whatever the engine's submodule
 gitlink says — `git ls-tree origin/main third_party/llama.cpp` — and a literal sha here would be stale before the next review round: this page carried
 `c16424f56` and `6e42864a6` while the pin was already `b970d85ba`. Verified at `b970d85ba` on 2026-11-08: `conversion/zamba.py`, `zamba2.py`,
-`zamba2vl.py`, `src/models/zamba.cpp`, `src/models/zamba2.cpp` are present and `src/llama-arch.cpp` carries **4** `LLM_ARCH_ZAMBA*` registrations, so the
+`zamba2vl.py`, `src/models/zamba.cpp`, `src/models/zamba2.cpp` are present and `src/llama-arch.cpp` carries **4 occurrences of 2 `LLM_ARCH_ZAMBA*` arches** (`LLM_ARCH_ZAMBA`, `LLM_ARCH_ZAMBA2`), so the
 converters and graphs that used to need a fork head are in the pin. The **KLD/top-1 rows below are CPU measurements** (`GGML_HRX=OFF`, Release) while the **throughput rows are HRX** (pp512 / pp4096 / tg128,
 3 repeats, from a fork-head build at `work/zarch/i1036@9ad387fb9`, `-ngl 99`, Tctl noted per row — see *Throughput on Strix Halo* below). That CPU/HRX split is legitimate here:
 the same arm measured on both backends on ZAYA1 gives KLD `0.429220` (HRX) against `0.425474` (CPU), a 0.9 % spread. Rows that could not

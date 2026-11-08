@@ -102,7 +102,9 @@ inline GgufHeader read_gguf_header(const std::string& path) {
     };
     static const int size[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
     auto scalar = [](uint32_t t) { return t < 13 ? size[t] : -1; };
-    // bool (7) counts as 0/1: gguf-py writes a list of Python bools, e.g. a sliding_window_pattern, as a bool array
+    // bool (7) counts as 0/1: gguf-py writes a list of Python bools, e.g. a sliding_window_pattern, as a bool array.
+    // Without it the pattern was skipped and an unlisted arch priced every layer as windowed: a lower bound on an
+    // admission gate, which is the unsafe direction (engine #1425, the #680 overrun class)
     auto is_int = [](uint32_t t) { return t <= 5 || t == 7 || t == 10 || t == 11; };
     auto as_int = [](uint32_t t, const unsigned char* b) {
         long long v = 0;

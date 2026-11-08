@@ -129,9 +129,26 @@ proved by the byte-exact gate rather than assumed. It is listed in §5.
 - **still in the forward, and therefore still owed**: the M=16 decode family and the lm-head context.
   Moving them needs only the setup state that `configure(Setup)` already carries (dirs, family, plan,
   layout flags), which is why that struct exists.
-- `load_block(first_layer, n_layers, err)` takes over the weight residency role of `load_layer()`'s
-  packing half (`wcache_` fill + pb16i image load), so a target that maps weights zero-copy can do it.
-  **Not started.**
+- `load_block(first_layer, n_layers, err)` — **not started, and its premise is now measured, which changes
+  what it is for.** It was described here as taking over "`load_layer()`'s packing half (`wcache_` fill +
+  pb16i image load)"; at this tree that half is **already the target's**: `wcache_` lives in
+  `npu/target/xdna/xdna_target.h` and fills **lazily inside `gemv`**, keyed on the weight's identity, and
+  `load_layer()` is the dequantisation path (host float vectors), not the packing one. So `load_block()`
+  would not move a cost, it would move *when* a cost is paid — and the measurement says that cost is already
+  amortised. `NPU_PROFILE=1` separates it (`LH_PACK_UPLOAD` = "weight BO create + pack + upload (`wcache_`
+  miss only)"); on the 27B t2s2 container, one ticket, two runs:
+
+  | window | `pack` per role (ms) | share of the window |
+  |---|---|---|
+  | first touch (fills the cache) | 86.7 / 149.4 / 170.4 / 209.2 / 117.4 / 82.4 / 102.4 / 60.1 (O/G/U/D/QKV/Z/QKVFAQ/QKVFAKV) | **≈978 ms total, 99 % of each role's first window** |
+  | next window, same process (≥15 launches each) | 0.11 / 0.15 / 0.12 / 0.29 / 0.10 / 0.09 | **0.86 ms total** |
+
+  So the residue is **one ~1 s residency per process**, and a pass after the first pays none of it. What
+  `load_block()` would buy is **time to first token** (pay it up front, per block, instead of interleaving it
+  with the first pass's launches) — *not* throughput, which is what "residency" reads like. That reprices the
+  step: worth doing when someone wants first-token latency on a resident model, needing a quiet-box
+  measurement to state the gain, and **not required** for this page's acceptance. The numbers above were taken
+  at load 41.6 → 23.1 on a shared box, so the *share* is the result and the absolute ms are not.
 - the filename probes are gone for everything the plan names, and **`adopt_geometry`/`make_ctx` are still
   on the target's surface** because the decode family and the lm head use them; they become private with
   the move above.

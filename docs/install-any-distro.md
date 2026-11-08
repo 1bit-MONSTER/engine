@@ -205,7 +205,9 @@ that stays on its distribution's kernel only needs the second and third:
 
 The three driver/config packages are the same set in all three families. They install to
 `/lib/modules/<ver>/updates/` (Debian, Arch) or `/extra/` (Fedora) through dkms, which is in front of
-the in-tree `amdxdna`, and uninstalling the package puts the in-tree driver back.
+the in-tree `amdxdna`, and uninstalling the package puts the in-tree driver back — measured, not assumed:
+dkms archives the distribution's own module to `/var/lib/dkms/<pkg>/original_module/` when ours goes in,
+and on removal the `kernel/` file and what `modprobe` resolves to are both back.
 
 ```bash
 # Debian / Ubuntu: the kernel comes from 1bit OS's own build, the drivers build against your headers.
@@ -397,4 +399,5 @@ registry model, since this Lemonade version has no local-file registration):
 | the kernel the packages ship is the kernel this box runs | `linux-image-7.4.0-rc1-1bit_7.4.0~rc1-1_amd64.deb` payload vs `/boot/vmlinuz-7.4.0-rc1-1bit` | `sha256 6f3c6764…` in both, and `sbverify --cert MOK-Kernel.der` reports `Signature verification OK` |
 | the amdxdna floor is really 6.10 | clean `ubuntu:24.04` container, headers `6.8.0-149-generic`, this page's packages | `dkms build` refuses with the declared exclusive rule (`rc=77`, "should not be built"), and with the floor bypassed the driver does not compile: `amdxdna.h:32: macro "__assign_str" requires 2 arguments, but only 1 given` — the 6.10 trace-event API. `ec-su-axb35-dkms` builds on the same headers (`380 440 B`), so only the NPU driver has the floor |
 | a weekly release tag works in all three families, and upgrades | `scripts/mk-kernel-packages.sh <out> 2026.45.0 --skip-kernel`, each family's own tool, in `fedora:latest` / `ubuntu:26.04` / `archlinux:latest` | deb `0.18.0-1 < 0.18.0-2026.45.0` (dpkg), rpm `0.18.0-1 < 0.18.0-2026.45.0` (rpmdev-vercmp), arch `vercmp` `-1`; each installs over the previous package (`rc=0`) and reports `0.18.0-2026.45.0` afterwards, with one `/usr/src/amdxdna-1bit-0.18.0` left on deb — no stale duplicate source tree |
+| uninstalling really restores the in-tree driver, in all three families | `scripts/pkg-proof.sh`, each family in its container, after the purge | the in-tree module is gone from the tree while ours is installed (dkms archives it to `/var/lib/dkms/<pkg>/original_module/`), and after removal both `modprobe --show-depends amdxdna` and the file are back on the `kernel/` path: `amdxdna.ko.zst` on Ubuntu and Arch, `amdxdna.ko.xz` on Fedora. Same three containers as the install rows, `PROOF-RC=0` |
 | the shipped driver answers a known answer on the NPU | this box, `npu-hold`, `1bit serve --device npu` on Qwen3-0.6B, `/v1/completions` greedy, twice | load 2.2 s, `The capital of France is` → **` Paris. The capital of Italy is Rome. The capital of Spain is Madrid.`** identically on both runs (56.9 and 50.7 tok/s), 0 `amdxdna` lines in the two windows, and the loaded module is `srcversion EE1F36A2B9BA294CE11AD80` — the build this package's source produces. No install, no `modprobe`, no udev reload |

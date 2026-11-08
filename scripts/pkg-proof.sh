@@ -206,6 +206,27 @@ case $leftstate in *amdxdna-1bit*|*ec-su-axb35*) row FAIL "dkms forgot the modul
     *) row PASS "dkms forgot the module" "dkms status clean" ;; esac
 check "the config files are gone" "/etc rules removed" \
     bash -c "! test -e /etc/udev/rules.d/90-1bit-npu-power.rules"
+if [ "$fam" != coexist ]; then
+    # The other half of "uninstalling puts the in-tree driver back": dkms archives the in-tree module
+    # when it installs ours (into /var/lib/dkms/<pkg>/original_module/), so removal has to restore it —
+    # both the file and what a modprobe resolves to, because a restored file that nothing resolves to is
+    # not a restore. Verified by hand first: before our package the resolution is
+    # /lib/modules/<kv>/kernel/drivers/accel/amdxdna/amdxdna.ko.zst, with it .../updates/dkms/amdxdna.ko.zst,
+    # and after the purge back to the kernel/ path.
+    depmod -a "$kv" 2>/dev/null || :
+    back=$(modprobe -S "$kv" --show-depends amdxdna 2>/dev/null | sed -n 's/^insmod //p' | tail -1)
+    case $back in
+        */kernel/drivers/accel/amdxdna/*)
+            row PASS "the in-tree amdxdna resolves again" "$(basename "$back")" ;;
+        *)  row FAIL "the in-tree amdxdna resolves again" "${back:-nothing resolves amdxdna}" ;;
+    esac
+    intree_file=$(find -L /lib/modules/"$kv"/kernel -name 'amdxdna.ko*' 2>/dev/null | head -1)
+    if [ -n "$intree_file" ]; then
+        row PASS "the in-tree module file is restored" "$(basename "$intree_file")"
+    else
+        row FAIL "the in-tree module file is restored" "not under /lib/modules/$kv/kernel"
+    fi
+fi
 
 echo
 if [ "$fail" = 0 ]; then echo "== $fam: ALL ROWS PASS"; else echo "== $fam: FAILURES ABOVE"; fi

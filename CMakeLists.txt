@@ -579,6 +579,11 @@ add_executable(route_log_test tests/route_log_test.cpp)
 target_include_directories(route_log_test PRIVATE app)
 target_link_libraries(route_log_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME route_log COMMAND route_log_test)
+# `tools/copyright.py --check` must see a file that has not been staged yet (the check used `git
+# ls-files`, so a brand-new file was invisible to it -- PR #1406's test script passed --check locally
+# and failed CI's copyright step on the same head).  Runs the real tool in a scratch git repo.
+add_test(NAME copyright_check_untracked
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/copyright_check_untracked_test.py)
 add_dependencies(onebit route_log_test)
 # CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
 # keeps the laya_models ctest from reporting "Not Run" without a workflow change.

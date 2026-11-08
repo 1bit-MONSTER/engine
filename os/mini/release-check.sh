@@ -570,6 +570,48 @@ hrx_placement_verdict() {
 # files 0755 if executable else 0644) and assert it, so THIS row is the board-side proof that it did: a payload packed after that
 # commit has no writable file, and a payload packed before it has 134. Pure, so --self-test drives it:
 #   <group/other-writable file count> [<first few paths>]
+# ── the identity file must be TRUE, not merely present ─────────────────────────────────────────
+# /etc/1bit/release-identity states which payload and which engine the image carries. Nothing checked that the statement was true,
+# and on 8 Nov it was not: c32 and c33 both shipped `payload=lemonade-onebit-rc-2026-11-05-c26c` with `engine_sha256=89a6c386…`
+# (cycle 26's launcher) while the payloads carried `80aceca1…` and `7ba21108…`. The cause is per-path writers: os/v3/puppy/
+# container-build.sh writes the file when it builds a base SFS, os/mini/mkimage.sh writes a different schema, and
+# os/v3/puppy/mkimage.sh - what a payload roll like c33 runs - writes neither, so a cut reusing a base SFS inherits whatever the
+# SFS was born with. This row used to `pass identity "$(tr '\n' ' ' < $ID)"`: it printed the lie and called it a PASS. It now
+# compares the claims with the shipped bytes. Pure, so --self-test drives it: <claimed engine> <actual launcher> <claimed libhsa> <actual libhsa>
+identity_verdict() {
+    _ce=${1:-} _ae=${2:-} _ch=${3:-} _ah=${4:-}
+    case "$_ce" in ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s engine_sha256 is not a hex digest (%s) - malformed, not merely old' "${_ce:-empty}"; return 0 ;; esac
+    [ "${#_ce}" = 64 ] || { printf 'FAIL the identity file'"'"'s engine_sha256 is %s characters, not 64 - malformed, not merely old' "${#_ce}"; return 0; }
+    # `libhsa_sha256=none` is a legitimate claim - "this image ships no runtime of its own" - and it is checkable, not a pass by
+    # absence: it is true only if nothing /etc/1bit/libhsa.env names on the loader path is actually there. A cut that writes `none`
+    # while libhsa.env still names a runtime has written a false statement, and the board's u5-hrxenv row pins its comparison to this
+    # same field, so a `none` there fails that row too - with a message that blames the runtime instead of the file.
+    case "$_ch" in
+        none)
+            if [ -n "$_ah" ]; then
+                printf 'FAIL the identity file says libhsa_sha256=none but the image loads a runtime libhsa.env names, sha256 %.16s - either write that sha or say why the two disagree' "$_ah"
+            else
+                printf 'PASS consistent: engine_sha256=%.16s is the shipped launcher and libhsa_sha256=none is true (libhsa.env names no runtime that exists here)' "$_ce"
+            fi
+            return 0 ;;
+        ''|*[!0-9a-f]*) printf 'FAIL the identity file'"'"'s libhsa_sha256 is neither a hex digest nor none (%s) - malformed, not merely old' "${_ch:-empty}"; return 0 ;;
+    esac
+    [ "${#_ch}" = 64 ] || { printf 'FAIL the identity file'"'"'s libhsa_sha256 is %s characters, not 64 - malformed, not merely old' "${_ch}"; return 0; }
+    if [ -z "$_ae" ]; then
+        printf 'FAIL the identity file claims engine_sha256=%.16s but there is no payload launcher to compare it with - an uncheckable claim is not evidence' "$_ce"
+        return 0
+    fi
+    if [ "$_ce" != "$_ae" ]; then
+        printf 'FAIL the identity file says engine_sha256=%.16s but the payload'"'"'s launcher is %.16s - this cut does not write the file (os/v3/puppy/mkimage.sh writes it not at all), so it is an inherited base-SFS value naming an older engine' "$_ce" "$_ae"
+        return 0
+    fi
+    if [ -n "$_ah" ] && [ "$_ch" != "$_ah" ]; then
+        printf 'FAIL the identity file says libhsa_sha256=%.16s but the shipped runtime is %.16s - the image would name a runtime it does not carry' "$_ch" "$_ah"
+        return 0
+    fi
+    printf 'PASS consistent: engine_sha256=%.16s and libhsa_sha256=%.16s are the shipped bytes, read off the payload rather than out of the file' "$_ce" "$_ch"
+}
+
 payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
     _f=${1:-} _d=${2:-} _sample=${3:-}
     case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
@@ -649,6 +691,13 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_runpath_verdict 1)"
     check FAIL "$(payload_runpath_verdict '')"
     # engine #1352: the payload's modes. c31/c32 shipped 134 writable files; a payload packed after #1361 has none.
+    check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"
+    check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 7ba2110811111111111111111111111111111111111111111111111111111111 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"       # the c26-in-a-c32-image shape: engine claim vs shipped launcher
+    check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"       # libhsa claim vs the runtime the image carries
+    check FAIL "$(identity_verdict 89a6c386 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"    # malformed claim is FAIL, not unknown
+    check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"          # nothing to check the claim against
+    check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none '')"           # `none` and nothing on the loader path: consistent
+    check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"        # `none` while the image loads a runtime: false statement
     check PASS "$(payload_modes_verdict 0 0)"
     check FAIL "$(payload_modes_verdict 134 49)"        # c31/c32's real shape: 134 files AND 49 directories
     check FAIL "$(payload_modes_verdict 0 1)"           # the c33 first cut: no files, the payload ROOT writable
@@ -1687,9 +1736,22 @@ elif [ -n "$LIC" ]; then fail licences "$LIC present but no NOTICE-BINARY beside
 elif [ -n "$LIC" ]; then fail licences "$LIC present but no NOTICE-BINARY beside it"
 else fail licences "no LICENSE-BINARY/NOTICE-BINARY in the image (looked in:$LOOKED)"; fi
 
-ID=/etc/1bit/release-identity
+ID=${RELEASE_IDENTITY:-/etc/1bit/release-identity}
 if [ -f "$ID" ]; then
-    pass identity "$(tr '\n' ' ' < "$ID")"
+    _id_name=$(sed -n 's/^payload=//p' "$ID" 2>/dev/null | head -1)
+    _id_built=$(sed -n 's/^built=//p' "$ID" 2>/dev/null | head -1)
+    _id_engine=$(sed -n 's/^engine_sha256=//p' "$ID" 2>/dev/null | head -1)
+    _id_hsasha=$(sed -n 's/^libhsa_sha256=//p' "$ID" 2>/dev/null | head -1)
+    _id_launcher="${PAYLOAD_DIR:-/opt/1bit-package}/1bit/1bit"
+    _id_act_engine=; [ -f "$_id_launcher" ] && _id_act_engine=$(sha256sum "$_id_launcher" 2>/dev/null | cut -d' ' -f1)
+    _id_hsadir=$(sed -n 's/^\(export \)\{0,1\}LD_LIBRARY_PATH=//p' "${LIBHSA_ENV:-/etc/1bit/libhsa.env}" 2>/dev/null | sed 's/\$.*//' | cut -d: -f1)
+    _id_act_hsasha=; [ -n "$_id_hsadir" ] && [ -f "${_id_hsadir%/}/libhsa-runtime64.so.1" ] && _id_act_hsasha=$(sha256sum "${_id_hsadir%/}/libhsa-runtime64.so.1" 2>/dev/null | cut -d' ' -f1)
+    _idv=$(identity_verdict "$_id_engine" "$_id_act_engine" "$_id_hsasha" "$_id_act_hsasha")
+    _idinfo="payload=${_id_name:-?} built=${_id_built:-?}"
+    case "$_idv" in
+        PASS*) pass identity "${_idv#PASS } (${_idinfo})" ;;
+        *)     fail identity "${_idv#FAIL } (${_idinfo})" ;;
+    esac
     if [ -f /data/SHA256SUMS ]; then
         if (cd /data && sha256sum -c SHA256SUMS >/dev/null 2>&1); then pass sha256sums "/data/SHA256SUMS verifies"
         else fail sha256sums "/data/SHA256SUMS does not verify (cd /data && sha256sum -c SHA256SUMS)"; fi

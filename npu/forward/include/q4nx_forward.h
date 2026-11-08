@@ -334,9 +334,6 @@ private:
     bool noncausal_attn_ = false;
     // The refusal for a kernel a design needs but the directory does not have.  With a plan it names
     // the plan file and the role, so "which description asked for this" needs no log reading.
-    // The lm-head context: pb16i ternary images, the int8 ladder, or the q4_1 gemv head.  Extracted from
-    // init_impl() with its body unchanged (engine#803 A2b), so moving it behind XdnaTarget is a copy.
-    bool open_lm_head_context(xrt::device* dev, const std::string& model_dir, const std::string& kernels_dir);
     std::string missing_kernel(const std::string& dir, const char* elf_name, Q4nxDesign role) const;
     // Index of the design playing a role, or -1 when the model has no such
     // kernel (e.g. GU is absent on split models, G/U absent on fused ones).

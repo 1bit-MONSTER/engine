@@ -77,8 +77,84 @@ static const char* role_tag(Q4nxDesign r) {
 
 }  // namespace
 
-XdnaTarget::XdnaTarget() = default;
+// The forward's own probe, kept identical (exists and non-empty): an ELF that is present but zero bytes
+// is the failure this catches, and a target that decided differently from its caller would be a second
+// definition of "the kernel is there".
+static bool elf_present(const std::string& p) {
+    FILE* f = std::fopen(p.c_str(), "rb");
+    if (!f) return false;
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fclose(f);
+    return sz >= 1;
+}
+
+XdnaTarget::XdnaTarget(xrt::device* dev) : dev_(dev) {}
 XdnaTarget::~XdnaTarget() = default;
+
+// The M=128 ELF set, moved out of Q4nxNpuForward::init_impl() unchanged (engine#803 A2b): the same
+// probe, the same two refusals, the same per-role log line, and the same adopt-then-open order.  What
+// changed is who owns it -- a missing or unloadable artifact is now refused by the target that would
+// launch it, instead of by a caller that then hands it a context.
+bool XdnaTarget::open_prefill(const Q4nxDesignGeom* designs, int n, std::string& err) {
+    const std::string& dir = setup_.kernels_dir;
+    const bool b8 = setup_.b8;
+    const bool host_gemm = setup_.host_gemm;
+    const std::string& plan_path = setup_.plan_path;
+    if (!designs || n <= 0 || n > Q4NX_MAX_DESIGNS) {
+        err = "open_prefill: no design set (" + std::to_string(n) + " designs)";
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        const Q4nxDesignGeom* g = &designs[i];
+        // The two full-attention-QKV-split designs exist only as pb16i kernels (the role has no int8
+        // launch that fits), so they get no M=128 context and no int8 ELF on disk: their decode context
+        // is built from the _pb16i ELF by the caller's twin pass.
+        adopt_geometry(i, *g);
+        if (role_is_pb16i_split(i)) continue;
+        const std::string elf = dir + "/" + g->elf_name;
+        if (host_gemm) {
+            // Offline mode: host GEMMs are plain float matmuls over the decoded weights, so no ELF is
+            // opened and none is required.  A model whose kernel set is not built yet can still be
+            // loaded and prompted, which is what makes it a numeric reference for a new geometry
+            // (engine#796).
+            if (elf_present(elf))
+                std::fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s (host-GEMM)\n",
+                             q4nx_design_log_tag(g->role), g->M, g->K, g->N, elf.c_str());
+            else
+                std::fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  (host-GEMM, no ELF: %s)\n",
+                             q4nx_design_log_tag(g->role), g->M, g->K, g->N, g->elf_name);
+            continue;
+        }
+        if (!elf_present(elf)) {
+            // The same wording the forward used for this case, because a diagnostic that changes shape
+            // when code moves is a diagnostic someone has to re-learn.
+            const char* role = q4nx_design_log_tag(g->role);
+            err = plan_path.empty() ? ("missing full ELF " + elf)
+                                    : ("plan " + plan_path + ": this model's plan needs the " + role +
+                                       " kernel \"" + g->elf_name + "\" in " + dir + " (missing)");
+            return false;
+        }
+        if (!dev_) {
+            err = "open_prefill: no device for the ELF set";
+            return false;
+        }
+        I8Ctx* ctx = make_ctx(i);
+        if (!ctx) {
+            err = "cannot create a context for role " + std::to_string(i);
+            return false;
+        }
+        ctx->MD = g->M; ctx->KD = g->K; ctx->ND = g->N;
+        ctx->blocked_b = b8;
+        if (!ctx->init_elf(*dev_, elf.c_str(), g->M, g->K, g->N, 1)) {
+            err = "I8Ctx init_elf failed for " + elf;
+            return false;
+        }
+        std::fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s\n", q4nx_design_log_tag(g->role),
+                     g->M, g->K, g->N, elf.c_str());
+    }
+    return true;
+}
 
 // --------------------------------------------------------------------------
 // NpuTarget

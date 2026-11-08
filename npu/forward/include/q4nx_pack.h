@@ -246,6 +246,15 @@ int q4nx_derive_decode_designs(const Q4nxDesignGeom* designs, int count,
  * is a key (engine#803 A2), so it uses these; the log keeps the short tag. */
 const char* q4nx_design_role_name(Q4nxDesign role);
 
+/* The LOG tag for a design role -- deliberately NOT the unique name above, and deliberately the
+ * historical mapping (QKVLIN prints as "QKV", every role the old table did not name prints as "D").
+ *
+ * It exists so a diagnostic a reader has already learned does not change when code moves: the setup
+ * side moved into the target (engine#803 A2b) and the log lines had to stay byte-identical, which the
+ * #1380 review caught them not doing.  The mapping is arguably misleading for the MLA and MoE roles --
+ * that is a change worth making on purpose, in a PR that says so, not as a side effect of a move. */
+const char* q4nx_design_log_tag(Q4nxDesign role);
+
 /* Look up the entry for a role in a derived set; NULL if absent. */
 const Q4nxDesignGeom* q4nx_find_design(const Q4nxDesignGeom* designs, int count,
                                        Q4nxDesign role);

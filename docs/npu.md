@@ -1962,21 +1962,31 @@ a silently broken loop rather than a slow one.
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).
 
-**One such lever has since landed, and it does not reach this target.** engine#1348 made a batched verify pass launch
-the **int8 packed** lm head once per vocabulary tile instead of once per row (3.4× the pass, 18.7× the head on its own
-bench). Its entry path is gated on `!head_pb16i_` (`npu/forward/src/q4nx_forward.cpp:4755`), and this target's head **is**
-pb16i — `head_pb16i_` is set from the pack's own head images — which already had a row-batched path
-(`rows_supported`, `:4822`). Re-measured here after it merged: the pair ticket is **0.80× at `tau = 0`** (plain 0.870,
-draft 1.089 s/token) and **0.48× at `tau = 0.6`**, i.e. unchanged for the loop and *worse* as a ratio because plain
-decode improved. So the lever is real, it is just aimed at the other head format: a pb16i-head target gets nothing from
-it, and the recommendation below stands.
+**Two bars, and which one this loop has to clear.** engine#1371 measured a verify loop on the OGA 0.5B pack and derived
+a break-even of `181/154 = **1.17 tokens per round**` — right for that loop, which runs **one** batched verify pass per
+round. `mtp::run()` runs **two** base passes per round: a verify batch *and* the step that consumes the committed token so
+the drafter's head sees the hidden it drafts past (measured, not assumed: `passes/token 0.625` is 40 passes over 20
+rounds). The bar is therefore the round's cost in single-token units, and it is not one number — it depends on how many
+drafts the gate lets a round carry. Measured in one process (`MTP_PHASE_SPLIT=1`, prompt 0, 64 tokens, `k = 4`):
 
-**Re-confirmed at main `4480a6df` after ~1.4k lines of forward refactoring** (`#808` NpuTarget, `#1330` plan kernel sets,
-`#1310`, `#1348`): the acceptance numbers are **digit for digit** what the windows published — prompt 0 gives `44/80`
-accepted with depths `18/20, 13/20, 7/20, 6/20` at `tau = 0`, and `31/35` with `28/32, 2/2, 1/1, 0/0` at `tau = 0.6`,
-`TEXT IDENTICAL`, `stream 72 rows`, `0 mismatch` in both. The loop's contracts survived the refactor with it:
-`last_hidden_rows_ = norm_all` and `last_hidden_ = fnorm` (`q4nx_forward.cpp:3558`, `:3569`) and
-`commit_verify_rows` truncating to the accepted prefix (`:2348`).
+| gate | round | plain token | **bar** | accepted | speedup | `step / batch / head / commit` |
+|---|---|---|---|---|---|---|
+| `tau = 0` | 2533 ms | 602 ms | **4.2 tokens/round** | 3.20 | **0.76×** | 29.9 / 38.9 / 17.5 / 13.7 % |
+| `tau = 0.6` | 1559 ms | 619 ms | **2.5 tokens/round** | 1.97 | **0.79×** | 38.5 / 43.3 / 10.3 / 7.9 % |
+
+Two things fall out of the split, and both matter more than the headline number:
+
+* **the base passes are the round** — 69 % at `tau = 0` and 82 % at `tau = 0.6`; the drafter's own head work is 17.5 % and
+  10.3 %. So the second pass (and the verify batch's own cost) is what a would-be optimiser has to attack, not the
+  drafter: the hypothesis that the per-draft full-vocabulary call dominates is **refuted** by this measurement.
+* **the deferred commit is not free**: 13.7 % at `tau = 0` (6.9 s of 50.7 s), i.e. ~0.35 s per round for the GDN replay,
+  after the 16× cheaper replay of engine#1022.
+
+Cross-checked with the two methods this page already used (3.2-4.1 by dividing the wall clock by the pass count, and by
+the 8-prompt split): three readings of the same cost, all far above the 0.5B loop's 1.17, because two of the three passes
+in a round are the loop's. Acceptance alone does not clear either bar: at `tau = 0` the drafter accepts **2.20 drafts per
+round** (3.20 tokens), ~1.9x the 0.5B loop's bar, and still measures 0.76x. Quote a bar with its loop and its gate, or it
+is 2-4x too optimistic for this one.
 
 **Leaf fill is resolved, and the answer is that this verifier cannot use it.** The plan's last protocol item (#805) asks
 for "spare verify rows filled with the drafts' 2nd/3rd candidates". The acceptance rule here is

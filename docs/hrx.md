@@ -121,8 +121,12 @@ fails a pin that leaves a gate model's node off HRX.
   `loom/binding/c/include`, and moves llama.cpp only. The hand move of 2026-10-18 (#441) was validated
   the same way at the pinned pair: `onebit`, `llama_hrx`, `test-backend-ops`, `llama-server`,
   `llama-bench`, `llama-perplexity`, `libamdhip64` and `libhip_intercept` all build and
-  `generate_stubs.py --check` passes against the built `libamdhip64.so`. `hrx-backend-test` still
-  fails to build on either pin (#422), so that check is not covered yet.
+  `generate_stubs.py --check` passes against the built `libamdhip64.so`. `hrx-backend-test` builds at
+  the pinned pair again since f2099e9b deleted the stale `dispatch-symmetric-i4.h` include that broke it
+  (#422, closed 2026-10-18), but **nothing runs it yet**: it carries no ctest label (the fork's
+  `build-*.yml` workflows run `ctest -L main`) and `hw-gate.sh`'s target list is `llama-server test-backend-ops
+  llama-perplexity`, so its cases only execute when someone builds and runs the binary by hand. Until one
+  of those two lists carries it, a case added there is correct and dark.
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.

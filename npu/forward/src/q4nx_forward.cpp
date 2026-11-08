@@ -3023,6 +3023,16 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
 
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
 // then the f32 signs those offsets index (the GGUF's prism.hadamard.sign_widths/sign_values).
+// The plain-text overload. It is declared in q4nx_forward.h and used by npu/forward/embeds_equiv_probe.cpp, but only the
+// HybridInputs-taking definition existed, so every full build stopped at `undefined reference to
+// Q4nxNpuForward::step_batch_embeds(std::vector<float>, int, std::vector<float>&)` — the onebit target links because it
+// does not pull the probe in, which is why the breakage survived a release-ish build. Defaulting `in` is exactly the
+// documented meaning of the three-argument form: no position planes, no deepstack sets, nothing vision-conditioned.
+bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int start_pos,
+                                      std::vector<float>& logits) {
+    return step_batch_embeds(embeds, start_pos, logits, HybridInputs{});
+}
+
 bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int start_pos,
                                       std::vector<float>& logits, const HybridInputs& in) {
     if (!ready_) { err_ = "not initialised"; return false; }

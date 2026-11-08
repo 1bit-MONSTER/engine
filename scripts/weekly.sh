@@ -560,6 +560,14 @@ stage_package() {
     # links out of the tree (the web app's KaTeX fonts -> the build machine's fonts-katex) become
     # copies of their targets; the links inside it stay links
     pack_localize_links "$W/lemonade/bin"
+    # engine#1352, the second packing site: package-linux.sh normalises the ENGINE tarball (#1361), but this payload is packed
+    # here and carries its own modes - measured in the shipped c32 image, opt/1bit-package/bin/lemond was 0775 and bin/ itself
+    # a 0775 directory, straight from the build's umask. Same rule and the same helpers as the engine tarball, so the two
+    # tarballs cannot drift: pack_normalise_modes fixes, pack_writable_files reports, and the fold refuses rather than shipping.
+    # It runs after pack_localize_links because that is the last step that writes into the staging tree.
+    pack_normalise_modes "$W/lemonade"
+    fold_bad=$(pack_writable_files "$W/lemonade")
+    [ -z "$fold_bad" ] || { printf 'REFUSED: group/other-writable path(s) in the lemonade staging:\n%s\n' "$fold_bad" >&2; return 1; }
     # the S flag: member names only; GNU tar otherwise rewrites symlink targets too, and every
     # libggml*.so.0 -> libggml*.so.0.18.0 link in 1bit/hrx/llama/bin pointed into a directory that is not there
     tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/,S" -cf - bin 1bit lemond-onebit | zstd -q -T4 -19 \

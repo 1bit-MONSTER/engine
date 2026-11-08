@@ -423,8 +423,17 @@ if(ONEBIT_HRX)
         add_dependencies(onebit llama_hrx)
     endif()
     onebit_build_relative(ONEBIT_HRX_SERVER _onebit_hrx_server)
-    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${_onebit_hrx_server}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}"
+    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${_onebit_hrx_server}"
                                ONEBIT_HRX_ALLOW_NO_SVM=${ONEBIT_HRX_ALLOW_NO_SVM})
+    # The HSA runtime path is NOT compiled in (engine#1459): the glob below finds it under the builder's toolchain, so
+    # baking it puts that build directory into a public artifact (c33's roll failed its own gate with one
+    # `/home/<builder>/wt/.../libhsa-runtime64.so.1` string), it makes the tarball bytes depend on where the build ran, and
+    # serve can only use it when the path exists on the target -- which it does not, so it falls through to its own scan
+    # either way. ONEBIT_HRX_LIBHSA stays a cache value because os/mini/mkimage.sh reads it to decide what to ship;
+    # ONEBIT_HRX_LIBHSA_BAKE is the explicit opt-in for a builder whose layout *is* the target's.
+    if(ONEBIT_HRX_LIBHSA_BAKE)
+        target_compile_definitions(onebit PRIVATE ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA_BAKE}")
+    endif()
     if(ONEBIT_SERVE_TEST_GGUF)
         foreach(_dev hrx cpu)
             add_test(NAME serve_e2e_${_dev}

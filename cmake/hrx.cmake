@@ -103,9 +103,16 @@ if(ONEBIT_BINARY_DROP_HRX_BIN AND EXISTS "${ONEBIT_BINARY_DROP_HRX_BIN}/llama-se
                 "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH)" FORCE)
             message(STATUS "ONEBIT_HRX: no libhsa-runtime64.so.1 under ${ONEBIT_HRX_TOOLCHAIN}; the build "
                            "proceeds, but HRX needs TheRock's on the machine that runs it (pass "
-                           "-DONEBIT_HRX_LIBHSA=<path> to bake it in)")
+                           "-DONEBIT_HRX_LIBHSA=<path> to tell mkimage what to ship, or "
+                           "-DONEBIT_HRX_LIBHSA_BAKE=<path> to compile it into '1bit' as well)")
         endif()
     endif()
+    set(ONEBIT_HRX_LIBHSA_BAKE "" CACHE FILEPATH
+        "Compile this HSA runtime path into '1bit'. Empty by default: ONEBIT_HRX_LIBHSA is the toolchain path the build "
+        "FOUND and stays build metadata because os/mini/mkimage.sh reads it to decide what to ship, but a path compiled "
+        "into the binary is the builder's own tree in a public artifact and is dead on the appliance, where serve falls "
+        "through to its /opt/rocm-therock scan anyway (engine#1459). Set this only when the build directory's layout is "
+        "the target's.")
     set(ONEBIT_HRX_SERVER "${ONEBIT_BINARY_DROP_HRX_BIN}/llama-server" CACHE FILEPATH
         "HRX llama-server 1bit runs" FORCE)
     set(ONEBIT_HRX_ALLOW_NO_SVM 1)

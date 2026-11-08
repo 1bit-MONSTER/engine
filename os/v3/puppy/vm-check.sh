@@ -343,8 +343,9 @@ rows = [
                      "[ \"$n\" = 3 ] && grep -q 'trap .one_rescue' /initrd/init && echo init-guard-3-paths",
                      "init-guard-3-paths"),
     # Cycle 14, item 1 - the GPU blocker the board found: HRX registered no device because nothing ever opened
-    # libhsa-runtime64.so.1. `ONEBIT_HRX_LIBHSA` is a CMake compile definition, not a variable (measured in
-    # CMakeLists.txt:279 and app/serve.cpp:201), so the only runtime route on an appliance is the engine"'"'s
+    # libhsa-runtime64.so.1. Nothing bakes an HSA path into `1bit` by default (engine#1459: the build's own
+    # toolchain path is build metadata for mkimage, and -DONEBIT_HRX_LIBHSA_BAKE is the opt-in), so the runtime
+    # route on an appliance is the engine"'"'s
     # scan of /opt/rocm-therock - and even handed the file, the pinned libhsa cannot load without its
     # $ORIGIN siblings. This row asserts all three halves on the artifact: the set at the path the scan walks,
     # no unresolved dependency, and a dlopen by BARE soname inside the guest (what libggml-hrx does when the

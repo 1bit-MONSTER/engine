@@ -450,8 +450,17 @@ package_checks() {  # package_checks <linux tarball>
                   done | grep -E '\.(c|cc|cpp|cxx|h|hpp|py)$' | xargs -r -n1 basename | LC_ALL=C sort -u)
         n=0; [ -z "$privsrc" ] || n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$privsrc") || true)
         [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a private source file ($n strings)"; b1=1; }
-        n=$(strings -a "$f" | grep -c '/home/' || true)
-        [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a build-machine home ($n strings)"; b1=1; }
+        # Red on THIS machine's tree, not on one prefix that happens to be common (engine#1459): the row used to test
+        # for `/home/`, so c32 shipped a builder path under `/opt` and passed. Test the build's own roots instead -- and
+        # deliberately not `/opt/rocm-therock/...`, which is also the appliance's deployed runtime path, so baking that
+        # one is legitimate.
+        n=0
+        for _root in "$SRC" "$W"; do
+            [ -n "$_root" ] || continue
+            _c=$(strings -a "$f" | grep -c -F "$_root" || true)
+            n=$((n + ${_c:-0}))
+        done
+        [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a build-machine tree ($n strings under \$SRC/\$W: $SRC, $W)"; b1=1; }
         if [ $b1 = 0 ]; then echo "ok   the packed 1bit: no symbol table, no private source names, no build-machine paths"; else bad=1; fi
     fi
     for f in LICENSE NOTICE LICENSE-BINARY NOTICE-BINARY; do

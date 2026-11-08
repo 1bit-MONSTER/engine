@@ -75,7 +75,7 @@ release in the same week gets `.1`.
 >   then the install test, then publish.
 >
 > The newest full row set *measured on the board* is c28's 52 rows above (2026-11-05 19:42); before it, c27's 51, and
-> before that cycle 24's `puppy-check` **42 rows: 40 PASS, 1 FAIL — the checker's own `u7-mdns` row — 2 SKIP**.
+> before that cycle 24's `puppy-check` **42 rows, 1 FAIL — the checker's own `u7-mdns` row — and 2 SKIP**.
 
 **Not published.** Candidate **c19** (`rc-2026-11-01a`, engine `bcb28cc8f573`) passed every software gate below and
 was written to a 64 GB stick — and that is where it stopped: it was **never booted on hardware and never installed on

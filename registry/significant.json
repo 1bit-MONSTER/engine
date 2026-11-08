@@ -152,6 +152,11 @@
    "model_type": "grt",
    "family": "GRT rotational/coupling decoder (MatterWaveAI grt-30m-code, 8 models in registry/census.json). Not an alias of anything mapped: the config reads model_type grt with a rotational coupling mixer (n_qkv_rotations 11, n_mixer_rotations 1, mor_router_mode rotational, mor_delta_scale 0.5, coupling_init_mode diagonal, angle_init_scale 0.1), learnable_rope with rope_placement stream, residual_gate_mode bounded_depth, no residual norm, and it declares transformers_version 5.23.0.dev0 - a research decoder, not a llama/qwen shape with extra keys. Nothing at the pin registers the class or a 'grt' gguf architecture (conversion/ has no grt module, src/llama-arch.cpp has no grt arch), so mapping it would claim a graph the engine cannot run. Declined with this reason on 2026-11-07 under engine #1328; the census reports it as . REVIEWED instead of !! UNCOVERED. Remove this entry and watch: report if a backend ever ports it.",
    "watch": "report"
+  },
+  "RMSN": {
+   "model_type": "rmsn",
+   "family": "RMSN, Resonant Metriplectic Sheaf Network (DuoNeural physical-informed research decoder: model_type rmsn with dim/depth/slots/seq_len and a Lyapunov diagnostic in the config, card tags port-hamiltonian/metriplectic/lyapunov/sheaf, its own GitHub runtime - a continuous-time dynamical system, not a Transformer with attention/FFN tensors). Not an alias of anything mapped: config.json declares architectures [RMSN] with vocab_size 49152 on the HuggingFaceTB/cosmo2-tokenizer, dim 1024, depth 16, slots 64, seq_len 512, 243.7 M parameters and no attention/FFN keys, and nothing at the pin registers the class or an 'rmsn' gguf architecture (conversion/ has no module for it, src/llama-arch.cpp has no arch), so mapping it would claim a graph the engine cannot run. Declined with this reason on 2026-11-08 under engine #1451; the census reports it as . REVIEWED instead of !! UNCOVERED. Remove this entry and watch: report if a backend ever ports it.",
+   "watch": "report"
   }
  }
 }

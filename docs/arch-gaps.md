@@ -993,3 +993,24 @@ in `registry/significant.json`.
   project's own pipeline, and nothing at the pin registers the class. The V4.6 text tower is supported, so this
   is a converter-and-proof job rather than an architecture gap, but it is not one registration: the head and the
   vision side would both have to be verified.
+
+## Census run 2026-11-08 (`engine #1451`)
+
+* `RMSN` (`DuoNeural/RMSN-193M-Soliton-Reasoning-SFT`) — **declined, added to `registry/significant.json` with
+  `"watch": "report"`** so the census prints `. REVIEWED` instead of `!! UNCOVERED`. Read from the model's own
+  `config.json` and card, not inferred from the class name: `architectures: ["RMSN"]`, `model_type: rmsn`,
+  `dim 1024`, `depth 16`, `slots 64`, `seq_len 512`, `vocab_size 49152` on `HuggingFaceTB/cosmo2-tokenizer`,
+  243.7 M parameters — and **no attention or FFN keys at all**. The card names it *Resonant Metriplectic Sheaf
+  Network*, tagged port-Hamiltonian / metriplectic / Lyapunov / sheaf, with its own GitHub runtime, and the config
+  carries a Lyapunov diagnostic (`val_lyap`) next to perplexity. That is a continuous-time dynamical system, not a
+  Transformer with a few extra keys, and nothing at the pin registers the class or an `rmsn` gguf architecture
+  (`conversion/` has no module for it, `src/llama-arch.cpp` has no arch), so a registry entry would claim a graph
+  the engine cannot run.
+* The two `. REMOTE-CODE` classes in the same run (`Lfm3V9ForCausalLM` from `LTM-Lab/LFM3-1.7B-v9`,
+  `PhobosScratchLM` from `marsnext/Phobos-1`) are **deliberately not** added, per the policy recorded above: each
+  was seen from a single uploader, and the `. REMOTE-CODE` line plus the `REMOTE_CODE_SPREAD` alert is the review
+  trigger — silencing it now would remove the prompt. Both would need their config read the same way before anyone
+  maps them.
+* The 14 `UNVERIFIABLE` rows are **not** a registry problem and get no entries: they are gated repos with no
+  readable `config.json`, so the watcher retries them. Adding "unknown" dispositions would create rows that can
+  never resolve and would hide the day one of them becomes readable.

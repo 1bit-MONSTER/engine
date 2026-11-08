@@ -709,20 +709,31 @@ if assert_pupsfs:
                     print("FAIL net          the machine did not come back after the static-address reboot"); ok = False
                     v.close()
                 else:
+                    # zz-onboard-net runs AFTER connman (which sorts under "c"), so it lands later than the shell: wait for
+                    # it rather than sampling the instant the shell appears (measured: "<none>" at the shell, the address
+                    # minutes later from connman's own stored config - which is what "applied" must never look like)
+                    val("WAITNET", "n=0; while [ $n -lt 18 ]; do "
+                                   "ip -4 -o addr show dev %s 2>/dev/null | grep -q '%s' && break; "
+                                   "sleep 5; n=$((n+1)); done; echo waited" % (dev, static_addr), timeout=180)
                     per = val("PERSIST", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
                     f = val("CONF", "grep -c '^static=' /data/net.conf 2>/dev/null")
-                    cm = val("CONNMAN", "connmanctl services --properties 2>/dev/null | grep -c 'Method=manual'")
-                    print("INFO net          after the reboot: %s | net.conf static lines=%s | connman Method=manual=%s" % (per or "<none>", f, cm))
+                    # `connmanctl services --properties` does not print the IPv4 configuration on this build (measured), so
+                    # the proof is the applier's own log line from THIS boot plus an address DHCP would never hand out:
+                    # an address cannot survive a reboot, so .250 on the interface means something applied it after boot.
+                    bootline = val("BOOTLOG", "grep -c 'zz-onboard-net: .*carries 10.0.2.250' /var/log/1bit-network.log 2>/dev/null")
+                    print("INFO net          after the reboot: %s | net.conf static lines=%s | applier log lines for it=%s"
+                          % (per or "<none>", f, bootline or "0"))
                     if static_addr not in per:
                         print("FAIL net          after the reboot the interface does not carry the static %s (%s)" % (static_addr, per or "<none>")); ok = False
                     elif f != "1":
                         print("FAIL net          /data/net.conf lost its static line across the reboot (%s)" % (f or "0")); ok = False
-                    elif not cm.isdigit() or int(cm) < 1:
-                        print("FAIL net          connman does not report Method=manual after the reboot: the address may be"
-                              " left over from before, not applied (%s)" % (cm or "<none>")); ok = False
+                    elif not bootline.isdigit() or int(bootline) < 1:
+                        print("FAIL net          the applier did not log that it applied the file after the reboot (%s lines),"
+                              " so the address has no explanation on this boot" % (bootline or "<none>")); ok = False
                     else:
-                        print("PASS net          after a reboot %s carries %s and connman reports Method=manual: the address"
-                              " is applied from /data/net.conf, not inherited" % (dev, static_addr))
+                        print("PASS net          after a reboot %s carries %s (which DHCP never hands out) and"
+                              " /var/log/1bit-network.log has this boot's application from /data/net.conf"
+                              % (dev, static_addr))
                     val("RESETNET", "1bit-network reset 2>&1 | tr '\\n' '; '", timeout=180)
                     left = val("LEFT", "ls /data/net.conf 2>&1 | head -1")
                     # and DHCP has to come back on its own: a reset that leaves the box on the static address is a
@@ -739,6 +750,31 @@ if assert_pupsfs:
                     else:
                         print("PASS net          reset removed /data/net.conf and the link is back on DHCP (%s)"
                               % dhcp_addr.split("/")[0])
+                        # ---- and the OTHER documented recovery: delete /data/net.conf by hand (a rescue shell), reboot.
+                        # connman keeps a manual configuration in its own state, so without the marker the box would stay
+                        # on the static address for ever while the doc says "deleting it is the same thing" (review on
+                        # #1527). Re-apply, then delete the file instead of using reset.
+                        val("SETAGAIN", "1bit-network set-static %s %s >/dev/null 2>&1;" % (static_addr, gw or "") +
+                                        " rm -f /data/net.conf; ls /data/.net-manual >/dev/null 2>&1 && echo marker", timeout=240)
+                        if not v.reboot():
+                            print("FAIL net          the machine did not come back after the hand-deleted net.conf"); ok = False
+                            v.close()
+                        else:
+                            val("WAITDHCP", "n=0; while [ $n -lt 24 ]; do "
+                                            "ip -4 -o addr show dev %s 2>/dev/null | grep -q '%s' && break; "
+                                            "sleep 5; n=$((n+1)); done; echo waited" % (dev, dhcp_addr.split('/')[0]), timeout=180)
+                            back = val("DHCPBACK", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
+                            mk = val("MARK", "ls /data/.net-manual 2>&1 | head -1")
+                            print("INFO net          after deleting net.conf by hand and rebooting: %s | marker: %s"
+                                  % (back or "<none>", mk[-40:]))
+                            if dhcp_addr.split("/")[0] not in (back or ""):
+                                print("FAIL net          with net.conf deleted by hand the link did not return to DHCP (%s):"
+                                      " the documented hand-recovery does not recover" % (back or "<none>")); ok = False
+                            elif "No such file" not in mk:
+                                print("FAIL net          the marker survived: the box keeps undoing DHCP every boot (%s)" % mk[-40:]); ok = False
+                            else:
+                                print("PASS net          deleting /data/net.conf by hand is a real recovery: the next boot"
+                                      " hands the link back to DHCP (%s) and clears the marker" % dhcp_addr.split("/")[0])
             else:
                 print("INFO net          no global IPv4 address on this boot (%s): the static-address rows are a SKIP" % (cur or "<none>"))
             wrote = val("WROTE", "sh -c 'echo 712 > /root/712-persist; sync; cat /root/712-persist'")

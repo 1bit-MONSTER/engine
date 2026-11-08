@@ -156,10 +156,14 @@ named here as what they are:
 | logging | `06onboard-logs` keeps the boot's logs on `/data/logs` — the partition, not the filesystem that the next appliance replaces | `/data/logs` non-empty on the installed boot |
 | packages and services | `apt` works and its packages land in the save layer; the appliance's own services are `/etc/init.d` scripts, which is what `rc.services` runs (there is no systemd here, and nothing pretends there is) | — |
 
-| an optional static address | `1bit-network set-static <addr/prefix> [gateway] [dns…]` writes **`/data/net.conf`** — on the data partition, so it outlives an appliance update — and `/etc/init.d/14onboard-net` applies it at boot through **connman's own CLI** (`connmanctl config <service> --ipv4 manual …`), with `ip` only as the fallback for a link connman has no service for yet. The console's static action stays session-only, because a wrong address on a headless box is a walk to the machine; this one is persistent **and reversible in one command**: `1bit-network reset` deletes the file and hands the interface back to DHCP. An unparsable or unusable file is not applied at all — the boot leaves the link on DHCP and says so in `/var/log/1bit-network.log` | `tests/one_bit_network_conf_test.sh` (the address and file validation, 26 arms, no root or interface needed) and the installed boot's `1bit-network` rows |
+| an optional static address | `1bit-network set-static <addr/prefix> [gateway] [dns…]` writes **`/data/net.conf`** — on the data partition, so it outlives an appliance update — and `/etc/init.d/zz-onboard-net` applies it at boot through **connman's own CLI** (`connmanctl config <service> --ipv4 manual …`), with `ip` only as the fallback for a link connman has no service for yet. The console's static action stays session-only, because a wrong address on a headless box is a walk to the machine; this one is persistent **and reversible in one command**: `1bit-network reset` deletes the file and hands the interface back to DHCP. An unparsable or unusable file is not applied at all — the boot leaves the link on DHCP and says so in `/var/log/1bit-network.log` | `tests/one_bit_network_conf_test.sh` (the address and file validation, the `prefix_to_mask` table and the CIDR split — 43 assertions, no root or interface needed) and the installed boot's `1bit-network` rows |
 
 **Recovery, stated where someone under pressure will look:** `1bit-network reset` on tty1, the serial console, or the
-console menu's bash item. The file is `/data/net.conf`; deleting it is the same thing.
+console menu's bash item — and deleting `/data/net.conf` really is the same thing: the boot undoes a manual configuration
+*this box* wrote (it records that in `/data/.net-manual`) and leaves a connection it never touched alone. A file that no
+longer parses is treated the same way: the address is handed back rather than left applied invisibly.
+*A machine configured while #1513 was merged has a manual connman config and no marker, so run `1bit-network reset` once
+after updating it.*
 
 ## The Ubuntu plan (history, not a target)
 

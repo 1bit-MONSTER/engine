@@ -35,6 +35,9 @@ set -u
 
 DATA=/data
 CONF=$DATA/net.conf
+# what WE put on connman's own state (it persists a manual config across reboots, independent of net.conf): the boot uses
+# it to hand the link back to DHCP when the file is gone, and never touches a configuration it did not write
+MARK=$DATA/.net-manual
 LOG=/var/log/1bit-network.log
 say() { printf '%s\n' "$*" | tee -a "$LOG"; }
 die() { say "1bit-network: REFUSED: $*" >&2; exit 2; }
@@ -135,6 +138,18 @@ conf_ok() {      # the loaded values have to be usable, or the boot must not tou
     done
     return 0
 }
+# connman_service_for_iface IFACE: connman names a service after the link's MAC (`ethernet_<mac>_cable`), so the match is
+# by MAC out of /sys/class/net. Matching on "the first connected service" reconfigures whichever link happened to connect
+# first - silently the wrong one on a machine with two interfaces (review finding on #1513).
+connman_service_for_iface() {
+    [ -n "${1:-}" ] || return 1
+    command -v connmanctl > /dev/null 2>&1 || return 1
+    _csfi_mac=$(cat "/sys/class/net/$1/address" 2> /dev/null | tr -d ':')
+    [ -n "$_csfi_mac" ] || return 1
+    connmanctl services 2> /dev/null | awk -v m="$_csfi_mac" '
+        index($0, m) { for (i = 1; i <= NF; i++) if ($i ~ /^(ethernet|wifi|bluetooth)_/) { print $i; exit } }'
+}
+
 # on this boot: the interface that carries the default route, else the first one that is not loopback and is up
 default_iface() {
     dev=$(ip route show default 2> /dev/null | awk '/^default/ { for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
@@ -190,14 +205,24 @@ fi
 if [ "$mode" = reset ]; then
     read_conf "$CONF"
     rm -f "$CONF" || fail "cannot remove $CONF"
-    # give the interface back to DHCP through connman, so a wrong address really is gone and not just forgotten
+    # the marker goes only after connman has been handed back below; if that fails it stays, and the next boot retries
+    # give the interface back to DHCP through connman, so a wrong address really is gone and not just forgotten.
+    # The lookup is by MAC (the old one took the first connected service on any link, which on a two-interface machine
+    # is the wrong one), and the result is reported rather than assumed.
     if [ -n "${iface:-}" ] && command -v connmanctl > /dev/null 2>&1; then
-        svc=$(connmanctl services 2> /dev/null | awk -v i="$iface" '
-            /^\*/ { name = $2; mac = $3 }
-            NF == 1 && name { print name; exit }
-            { }' | head -1)
-        [ -n "$svc" ] && connmanctl config "$svc" --ipv4 dhcp >> "$LOG" 2>&1 && \
-            say "1bit-network: $svc back to DHCP"
+        svc=$(connman_service_for_iface "$iface")
+        if [ -n "$svc" ]; then
+            if connmanctl config "$svc" --ipv4 dhcp >> "$LOG" 2>&1; then
+                say "1bit-network: $svc back to DHCP"
+                # ONLY here: with the file already gone, a failed hand-back that also dropped the marker would leave no
+                # file, no marker and connman still applying the old address for ever - the hole this marker exists for
+                rm -f "$MARK" 2> /dev/null
+            else
+                say "1bit-network: connman refused to put $svc back on DHCP (see $LOG); the marker stays and the next boot retries"
+            fi
+        else
+            say "1bit-network: connman has no service for $iface; the marker stays and the next boot retries"
+        fi
     fi
     say "1bit-network: reset - $CONF removed, the next boot and this one use DHCP"
     say "  (if the link still carries the old address, restart the network:  /etc/init.d/connman restart)"
@@ -224,7 +249,7 @@ esac
 
 tmp=$CONF.tmp
 {
-    echo "# written by 1bit-network on $(date -u +%FT%TZ); applied at boot by /etc/init.d/14onboard-net"
+    echo "# written by 1bit-network on $(date -u +%FT%TZ); applied at boot by /etc/init.d/zz-onboard-net"
     echo "# recovery: 1bit-network reset   (from tty1, the serial console or the console menu)"
     echo "iface=$dev"
     echo "static=$addr"
@@ -236,10 +261,11 @@ tmp=$CONF.tmp
     true
 } > "$tmp" || fail "cannot write $tmp"
 mv -f "$tmp" "$CONF" || fail "cannot install $CONF"
+printf '%s\n' "$dev" > "$MARK" 2> /dev/null   # so a boot without the file can undo what this command did
 sync
 say "1bit-network: persisted to $CONF (iface=$dev static=$addr gateway=${gw:--} dns=${dnsv:--})"
 
-/etc/init.d/14onboard-net start || fail "applied the file but the interface did not take the address (see $LOG)"
+/etc/init.d/zz-onboard-net start || fail "applied the file but the interface did not take the address (see $LOG)"
 if ip -4 -o addr show dev "$dev" 2> /dev/null | grep -q " ${addr%/*}/"; then
     say "1bit-network: $dev carries ${addr} now, and will again at the next boot"
     [ -z "$gw" ] || say "  gateway $gw"

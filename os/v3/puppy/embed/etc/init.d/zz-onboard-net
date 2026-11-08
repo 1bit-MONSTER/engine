@@ -1,0 +1,190 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/zz-onboard-net - apply the persistent network identity, if an install has one (engine#712).
+#
+# `/data/net.conf` is written by `1bit-network set-static` and lives on the DATA partition, so it survives an appliance
+# update (nothing the OS set carries is touched).
+#
+# WHY THE NAME STARTS WITH zz-: connman ships as `/etc/init.d/connman`, which sorts under "c" - i.e. AFTER every numeric
+# script - so a `14onboard-net` ran BEFORE the daemon that owns the link existed: `connmanctl` had no service, the `ip`
+# fallback put the address on, and connman then took the link over and flushed it, so the machine came up with no address
+# at all for a while (measured: the row saw "<none>" right after the reboot and the static address only minutes later,
+# applied by connman from its own stored config). Running after it means the config is given to connman itself.
+#
+# With NO file - or a file that does not validate - it does nothing to the interface, except undo a manual configuration
+# this box set earlier (`/data/.net-manual`): deleting `/data/net.conf` from a rescue shell is the recovery the docs
+# promise, and connman would otherwise keep applying the old address at every boot. Doing nothing to a link it did not
+# configure is deliberate - a machine that cannot reach the LAN is worse than one on DHCP, and the repair path has to
+# stay obvious:
+#
+#   recovery:  1bit-network reset        (tty1, the serial console, or the console menu's bash item)
+#
+# It never writes the file, never guesses an address, and never leaves the interface without one: connman is asked for
+# the manual configuration first (it owns the link on this base), and `ip` is only the fallback for a boot where connman
+# has no service for that interface yet.
+set -u
+
+# shellcheck disable=SC2154  # iface/static/gateway/dns are set by read_conf, sourced from 1bit-network below
+iface=''; static=''; gateway=''; dns=''   # set by read_conf; defined here for `set -u`
+DATA=/data
+CONF=$DATA/net.conf
+LOG=/var/log/1bit-network.log
+log() { printf '%s\n' "$*" | tee -a "$LOG"; }
+
+[ "${1:-start}" = "stop" ] && exit 0
+mkdir -p /tmp 2> /dev/null
+: >> "$LOG" 2> /dev/null || LOG=/dev/null
+
+MARK=$DATA/.net-manual
+
+# load the library first: it defines the format parse AND the service lookup, and the hand-back below needs both
+NETWORK=/usr/local/bin/1bit-network
+if [ -r "$NETWORK" ]; then
+    # shellcheck disable=SC1090  # the image's own path; one definition of the format and of the service lookup
+    ONEBIT_NETWORK_LIB=1 . "$NETWORK"
+fi
+
+# hand_back REASON: give the interface this box configured back to DHCP. connman keeps a manual configuration in its OWN
+# state, so removing /data/net.conf is not enough - without this the old address comes back at every boot and the recovery
+# the docs promise does not recover (measured, and the review found the two paths that skipped it).
+# The marker is removed ONLY when connman actually took the change: a failed hand-back has to stay visible to the next boot.
+hand_back() {
+    miface=$(head -1 "$MARK" 2> /dev/null)
+    [ -n "$miface" ] || { log "zz-onboard-net: $1: $MARK is empty, so there is nothing to hand back"; return 1; }
+    # connman starts late (it sorts under "c"), so wait for it to publish a service for that interface before asking -
+    # the first version looked it up immediately and logged "will retry next boot" at every boot on a slow box
+    i=0
+    while [ $i -lt 30 ]; do
+        [ -n "$(connman_service_for_iface "$miface" 2> /dev/null)" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+    svc=$(connman_service_for_iface "$miface" 2> /dev/null)
+    if [ -n "$svc" ] && connmanctl config "$svc" --ipv4 dhcp >> "$LOG" 2>&1; then
+        rm -f "$MARK"
+        log "zz-onboard-net: $1: $svc handed back to DHCP (that manual config was this box's)"
+        return 0
+    fi
+    log "zz-onboard-net: $1: $miface could not be handed back to DHCP (see $LOG); the marker stays, the next boot retries"
+    return 1
+}
+
+# No file: nothing to apply - except undoing a manual configuration this box set earlier, which is the recovery the docs
+# promise for `rm /data/net.conf`. A service this box never touched is left alone.
+if [ ! -f "$CONF" ]; then
+    if [ -f "$MARK" ]; then
+        hand_back "no $CONF"
+        exit 0
+    fi
+    log "zz-onboard-net: no $CONF: the interface stays on DHCP (connman)"
+    exit 0
+fi
+
+# the same parse and validation as 1bit-network, sourced rather than copied: one definition of "a usable net.conf"
+NETWORK=/usr/local/bin/1bit-network
+if [ -r "$NETWORK" ]; then
+    # shellcheck disable=SC1090  # the path is the image's own, and this is the point: one definition of the format
+    ONEBIT_NETWORK_LIB=1 . "$NETWORK"
+fi
+if ! command -v read_conf > /dev/null 2>&1 || ! command -v conf_ok > /dev/null 2>&1; then
+    log "zz-onboard-net: cannot load the parser from $NETWORK: leaving the network alone (recovery: 1bit-network reset)"
+    exit 0
+fi
+
+read_conf "$CONF"
+if ! why=$(conf_ok 2>&1); then
+    # A broken file must not leave connman applying an address nobody can see: undo our own manual config, and say which
+    # case this is (the header promised exactly this, and it did not do it - review finding on #1527)
+    if [ -f "$MARK" ]; then
+        hand_back "$CONF is not usable ($why)"
+    else
+        log "zz-onboard-net: $CONF is not usable ($why): leaving the network on DHCP. Recovery: 1bit-network reset"
+    fi
+    exit 0
+fi
+
+# wait for the interface to exist: on a cold boot the driver may still be binding when rc.services starts
+i=0
+while [ ! -e "/sys/class/net/$iface" ] && [ $i -lt 20 ]; do sleep 1; i=$((i + 1)); done
+if [ ! -e "/sys/class/net/$iface" ]; then
+    log "zz-onboard-net: $iface did not appear in 20 s: leaving the network alone"
+    exit 0
+fi
+
+applied=no
+# connman starts LATE (`/etc/init.d/connman` sorts under "c", after every numeric script), and this script is meant to
+# run after it: give it up to 30 s to publish a service for this link rather than racing it
+i=0
+while [ $i -lt 30 ]; do
+    connmanctl services 2> /dev/null | grep -q "$(cat "/sys/class/net/$iface/address" 2> /dev/null | tr -d ':')" && break
+    sleep 1
+    i=$((i + 1))
+done
+
+if command -v connmanctl > /dev/null 2>&1; then
+    # WHICH service? connman's own name carries the interface's MAC (`ethernet_<mac>_cable`), so the match is by MAC
+    # from /sys/class/net: `awk '/^\*/ { print $2; exit }'` (the first version) reconfigured whichever link happened to
+    # be connected first - on a box with two interfaces that is the wrong one, silently.
+    svc=$(connman_service_for_iface "$iface")
+    if [ -n "$svc" ]; then
+        # connman's manual IPv4 configuration takes ADDRESS and NETMASK as two fields (never a CIDR), the gateway third,
+        # and DNS through --nameservers: `--ipv4 manual "$static" "$gateway"` sent "10.0.2.50/24" as the address and the
+        # gateway as the netmask (measured by review on #1513).
+        addr=${static%/*}
+        mask=$(prefix_to_mask "${static#*/}")
+        if [ -n "$gateway" ]; then
+            connmanctl config "$svc" --ipv4 manual "$addr" "$mask" "$gateway" >> "$LOG" 2>&1
+        else
+            connmanctl config "$svc" --ipv4 manual "$addr" "$mask" >> "$LOG" 2>&1
+        fi
+        rc=$?
+        if [ $rc -eq 0 ] && [ -n "$dns" ]; then
+            connmanctl config "$svc" --nameservers $dns >> "$LOG" 2>&1
+        fi
+        # and believe connman, not its exit code: read the configuration back
+        i=0
+        while [ $i -lt 10 ]; do
+            if connmanctl services --properties "$svc" 2> /dev/null | grep -q "Method=manual"; then
+                applied=yes
+                break
+            fi
+            sleep 1
+            i=$((i + 1))
+        done
+        [ "$applied" = yes ] || log "zz-onboard-net: connman accepted the config but does not report Method=manual" \
+                                    "for $svc (rc=$rc, see $LOG); falling back to ip"
+    else
+        log "zz-onboard-net: connman has no service for $iface (mac ${mac:-unknown}): falling back to ip"
+    fi
+fi
+
+if [ "$applied" = no ]; then
+    # no connman service for this link yet, or connman did not take the manual config: put it on with ip, which connman
+    # leaves alone for as long as it has no service of its own here
+    if ip addr add "$static" dev "$iface" >> "$LOG" 2>&1; then
+        [ -n "$gateway" ] && ip route replace default via "$gateway" dev "$iface" >> "$LOG" 2>&1
+        applied=yes
+    fi
+fi
+
+if [ "$applied" = yes ]; then
+    log "zz-onboard-net: $iface carries $static${gateway:+ via $gateway} from $CONF"
+    exit 0
+fi
+log "zz-onboard-net: could not apply $static to $iface (see $LOG); the link keeps whatever DHCP gave it." \
+    "Recovery: 1bit-network reset"
+exit 0

@@ -132,16 +132,23 @@ struct I8Ctx {
     int last_am_ = 1;
     // engine#1416: [ps] pack-split accumulators (NPU_PACK_SPLIT=1)
     using pack_clock = std::chrono::steady_clock;
-    static void pack_split_line(long n, double q, double sy, double cn, double lc, int am, int ak) {
-        fprintf(stderr, "[ps] n=%ld M=%d K=%d per-launch: quant=%.3f sync=%.3f canary=%.3f "
-                        "launch=%.3f ms\n", n, am, ak, q / n, sy / n, cn / n, lc / n);
-    }
+    // Bucketed by row count: the first version printed the LAST call's M with a CUMULATIVE average,
+    // which is how a prefill window came back reading "M=1" while prefill was demonstrably batched.
+    struct PackBucket { long n = 0; double q = 0, sy = 0, cn = 0, lc = 0; };
+    std::map<long, PackBucket> pack_buckets_;
     inline void pack_split_add(double q, double sy, double cn, double lc, int am, int ak) {
-        pack_split_q_ += q; pack_split_sync_ += sy; pack_split_canary_ += cn;
-        pack_split_launch_ += lc; pack_split_n_++;
-        if (pack_split_n_ % 100 == 0)
-            pack_split_line(pack_split_n_, pack_split_q_, pack_split_sync_, pack_split_canary_,
-                            pack_split_launch_, am, ak);
+        PackBucket& b = pack_buckets_[(long)am * 100000 + ak];
+        b.n++; b.q += q; b.sy += sy; b.cn += cn; b.lc += lc;
+        pack_split_n_++;
+        if (pack_split_n_ % 100 == 0) {
+            fprintf(stderr, "[ps] total=%ld launches, by rows:", pack_split_n_);
+            for (const auto& kv : pack_buckets_)
+                fprintf(stderr, " | M=%ld K=%ld n=%ld quant=%.3f sync=%.3f canary=%.3f launch=%.3f ms",
+                        kv.first / 100000, kv.first % 100000, kv.second.n, kv.second.q / kv.second.n,
+                        kv.second.sy / kv.second.n, kv.second.cn / kv.second.n,
+                        kv.second.lc / kv.second.n);
+            fprintf(stderr, "\n");
+        }
     }
     long pack_split_n_ = 0;
     double pack_split_q_ = 0, pack_split_sync_ = 0, pack_split_canary_ = 0, pack_split_launch_ = 0;

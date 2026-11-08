@@ -45,9 +45,19 @@ row because the two arms were taken on different days with different settled sta
 | **HRX0** (iGPU, `-dev HRX0 -ngl 99 -fa on -devd HRX0`) | 4 (2) | 75.785 tok/s | 76.656 tok/s | **1.012×** |
 | **CPU** (`-ngl 0 -t 4`) | 3 (1) | 20.53 tok/s | — | **0.508× / 0.609×** |
 
-Acceptance (llama.cpp's own accounting, **CPU** runs): **0.759 / 0.804 / 0.980** of drafted tokens. On HRX it is **not
-measured** — that build does not echo `draft_n_accepted` in the JSON and does not write the `draft acceptance rate` line by
-default, which is why the ratio above stands alone. Reproduce the HRX row exactly (the default is now `SKIP_FIRST=2` because one warm-up produced the bad number below):
+Acceptance is measured on both backends, by two different routes because the runtimes report differently:
+
+* **CPU** (llama.cpp's own speculative path): **0.759 / 0.804 / 0.980** of drafted tokens, behind its `--draft-p-min` gate.
+* **HRX**, where that build echoes neither `draft_n_accepted` nor the acceptance-rate line, so it is taken with two servers on
+  the device and `tools/spec_decode_acceptance.py` (token-exact, the target's own greedy continuation as the verifier):
+  24 tokens in **7 rounds**, **19 accepted of 28 offered** → **2.714 accepted drafts/round**, **3.429 tokens/round**,
+  per-round `[4,0,4,4,1,2,4]`. Driver: `/tmp/hrx-acceptance.sh`-shaped — both servers started inside one `gpu-hold` ticket and
+  killed through an `EXIT INT TERM HUP` trap.
+
+**That pair of numbers is the useful one**: on the device this draft is *accepted well* (2.7 accepted drafts every round) and the
+measured speedup is still only **1.012×** — so a round's draft-plus-verify work is costing ≈3.4 target-token-equivalents for the
+3.4 tokens it returns. High acceptance does not by itself pay here; the per-round cost does, and on this iGPU it is the draft's own
+decodes that make it a wash. Reproduce the HRX row exactly (the default is now `SKIP_FIRST=2` because one warm-up produced the bad number below):
 
 ```sh
 BIN=~/wt/i1251/pincur/llama-server \

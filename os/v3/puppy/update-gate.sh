@@ -184,22 +184,9 @@ try:
         say("INFO", "release", "%s: %d files + SHA256SUMS, puppy SFS carrying etc/1bit/%s" % (up, len(setfiles) + 1, name))
         return up
 
-    if os.environ.get("MODE") == "image":
-        # the image's set: the base set's files + the third patched SFS, in one directory the guest copies into the image
-        imgdir = os.path.join(data, "imgsrc")
-        sdo("mkdir", "-p", imgdir)
-        for f in setfiles:
-            sdo("cp", "-f", os.path.join(src, f), os.path.join(imgdir, f))
-        sdo("cp", "-f", os.path.join(data, "set-alt3.sfs"), os.path.join(imgdir, sfsname))
-        sdo("bash", "-c", "cd '%s' && sha256sum vmlinuz initrd.gz ./*.sfs > SHA256SUMS" % imgdir)
-        say("INFO", "release", "%s: the set the image will carry (set-alt3 as %s)" % (imgdir, sfsname))
-        src1 = src2 = imgdir
-    else:
-        src1 = build_release("set-alt", "this file exists only in the first updated appliance set\n")
-    src2 = build_release("set-alt2", "this file exists only in the second updated appliance set\n")
     # a THIRD set, as one file on /data: the guest builds an .img around it for the image-form update (the #1385 review:
     # "add one gate row that updates from an .img the way a user would" - and the image form is where the hashes come
-    # from the image's own SHA256SUMS, which is the fix that review asked for)
+    # from the image's own SHA256SUMS, which is the fix that review asked for). Built FIRST, because image mode needs it.
     marker3 = os.path.join(work, "set-alt3.marker")
     open(marker3, "w").write("this file exists only in the image-updated appliance set\n")
     patched3 = os.path.join(work, "set-alt3.sfs")
@@ -209,6 +196,20 @@ try:
         sdo("bash", os.path.join(tree, "os/v3/puppy/patch-sfs.sh"), "--manifest", man3, base, patched3)
     sdo("cp", "-f", patched3, os.path.join(data, "set-alt3.sfs"))
     say("INFO", "release", "%s/set-alt3.sfs: the set the third (image-form) update will carry" % data)
+
+    if os.environ.get("MODE") == "image":
+        # the image's set: the base set's files + the third patched SFS, in one directory the guest copies into the image
+        imgdir = os.path.join(data, "imgsrc")
+        sdo("mkdir", "-p", imgdir)
+        for f in setfiles:
+            sdo("cp", "-f", os.path.join(src, f), os.path.join(imgdir, f))
+        sdo("cp", "-f", patched3, os.path.join(imgdir, sfsname))
+        sdo("bash", "-c", "cd '%s' && sha256sum vmlinuz initrd.gz ./*.sfs > SHA256SUMS" % imgdir)
+        say("INFO", "release", "%s: the set the image will carry (set-alt3 as %s)" % (imgdir, sfsname))
+        src1 = src2 = imgdir
+    else:
+        src1 = build_release("set-alt", "this file exists only in the first updated appliance set\n")
+        src2 = build_release("set-alt2", "this file exists only in the second updated appliance set\n")
 finally:
     subprocess.run(["sudo", "-n", "umount", mnt + "/data"], capture_output=True)
     for dev in loops:

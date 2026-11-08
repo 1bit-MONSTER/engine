@@ -200,8 +200,12 @@ tmp=$CONF.tmp
     echo "# recovery: 1bit-network reset   (from tty1, the serial console or the console menu)"
     echo "iface=$dev"
     echo "static=$addr"
-    [ -n "$gw" ] && echo "gateway=$gw"
-    [ -n "$dnsv" ] && echo "dns=$dnsv"
+    if [ -n "$gw" ]; then echo "gateway=$gw"; fi
+    if [ -n "$dnsv" ]; then echo "dns=$dnsv"; fi
+    # the group's exit status is its LAST command's: `[ -n "$dnsv" ] && echo ...` as the last line made a set-static
+    # WITHOUT a DNS argument fail with "cannot write /data/net.conf.tmp" after the file had been written correctly
+    # (measured in the install gate). Every branch has to end 0.
+    true
 } > "$tmp" || fail "cannot write $tmp"
 mv -f "$tmp" "$CONF" || fail "cannot install $CONF"
 sync

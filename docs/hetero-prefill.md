@@ -346,6 +346,39 @@ and the library evidence is `strings <lib> | grep -c m128_w8_f2_sb` (24 on the c
 - **Copy the weights to give the NPU its own layout per layer.** Measured cost: 50 MiB of copies per
   layer for the 4B up_gate (~3.6 ms at 14 GB/s) against a 1.3 % best-case gain.
 
+## What the 2026 paper survey changes (2026-11-08)
+
+Three readings from the survey in `~/amd-oss/npu-re/` change the *plan* rather than the measurements above. They are the papers'
+claims, cited so a reader can check them, plus this page's own numbers where they meet.
+
+**1. The NPU prefill GEMM's target is published, and it is 6-8x above ours.** TileFuse (arXiv 2606.11357) reports XDNA2 W4A16 prefill
+at **~12 TOPS (Krackan) / ~9 TOPS (Strix Point)**, Llama3-8B at 2048 tokens in **4.13 s on the NPU against 8.25 s on the iGPU**, and
+**501.9 tok/s** at 1K context against FastFlowLM's 345.9. Our `gemm_q4_prefill` is **1.2-1.5 TFLOP/s** (the 8.61 ms per 256-row tile
+above). So the bar this page derives for a split - "an NPU prefill GEMM ~4x faster" - sits *inside* a published result on the same
+silicon class: the gap is a kernel project with a known technique (interleaved column-major pre-tiling past 8K, fused
+unpack+dequant+matmul, 128 B-padded tile payload), not a property of the part. Their decode is the counterpoint and it agrees with our
+route: **GEMV at 181-206 GOPS, slower than the iGPU**, which is why decode stays on HRX here.
+
+**2. Attention is a second splittable share, not untouchable overhead.** This page's ceilings assume a split can only touch the
+matmuls, because attention is **57.1 %** of the post-fix pp16384 device time on the 4B. FlashAttention-on-XDNA (arXiv 2609.21264)
+reports **3.62 TFLOP/s** for a fully fused XDNA2 attention at 32K - scores kept in compute-tile L1, reduced over the cascade - against
+1.81 for a streamed design and 0.455 layer-by-layer, at **5.3-7.2x the iGPU's energy efficiency from 2K tokens up** (ridge points:
+MemTile 33.7 FLOP/B, compute tile 25.2 FLOP/B, so QK^T belongs in L1 and not the MemTile). If a kernel of that shape lands here, the
+split's end-to-end factor has *two* shares to spend and must be re-derived; the 1.035x end-to-end above is the matmul-only answer.
+
+**3. Two house rules from the hybrid designs, and one architecture target.** The ANE prefill + GPU decode study (arXiv, AtomGradient
+2026) reaches **11.3x** by dispatching **32 tokens at a time** instead of one, because a sequential NPU dispatch costs a flat ~42 ms -
+so on this box **no NPU path should dispatch fewer than 32 rows**, which is also why the M=16 decode twins and a one-token handoff are
+the wrong shape for anything batched. Pipeline Shards (arXiv 2608.19147) is the shape the shared-buffer work wants: a static NPU graph
+with **KV as explicit graph I/O in a host-managed bounded ring**, which is exactly the object a dma-buf would be made of, and a better
+long-term shape than this route's per-request state file. HeteroInfer (SOSP'25, arXiv 2501.14794) supplies the split shape that matches
+what was measured here - the NPU takes the **static aligned part** and the GPU the **ragged tail** (our optimum was already 5-9 of 64
+row-groups), with a **~400 us** GPU-NPU sync treated as a first-class cost, i.e. the bar any per-layer handoff would have to clear.
+
+Licence note for the one paper with code (TileFuse): the `mlir-aie` fork's `LICENSE` is *Apache License v2.0 with LLVM Exceptions*
+(GitHub reports it as "Other", so the file is the authority). Reading it for understanding is fine; any port keeps the notice and lands
+in the private kernel repositories, not in this tree.
+
 ## The DRM buffer, measured
 
 `~/mosaic-bench/dmabuf_test.cpp`, 64 MiB, under `npu-hold` + `gpu-hold`:

@@ -68,22 +68,50 @@ fi
 
 applied=no
 if command -v connmanctl > /dev/null 2>&1; then
-    # the service connman has for this interface: "<type>_<mac>_<name>", looked up by the service list rather than
-    # guessed, and only the connected one (`*` marker) is reconfigured
-    svc=$(connmanctl services 2> /dev/null | awk -v i="$iface" '/^\*/ { print $2; exit }')
+    # WHICH service? connman's own name carries the interface's MAC (`ethernet_<mac>_cable`), so the match is by MAC
+    # from /sys/class/net: `awk '/^\*/ { print $2; exit }'` (the first version) reconfigured whichever link happened to
+    # be connected first - on a box with two interfaces that is the wrong one, silently.
+    mac=$(cat "/sys/class/net/$iface/address" 2> /dev/null | tr -d ':')
+    svc=''
+    if [ -n "$mac" ]; then
+        svc=$(connmanctl services 2> /dev/null | awk -v m="$mac" '
+            index($0, m) { for (i = 1; i <= NF; i++) if ($i ~ /^(ethernet|wifi|bluetooth)_/) { print $i; exit } }')
+    fi
     if [ -n "$svc" ]; then
+        # connman's manual IPv4 configuration takes ADDRESS and NETMASK as two fields (never a CIDR), the gateway third,
+        # and DNS through --nameservers: `--ipv4 manual "$static" "$gateway"` sent "10.0.2.50/24" as the address and the
+        # gateway as the netmask (measured by review on #1513).
+        addr=${static%/*}
+        mask=$(prefix_to_mask "${static#*/}")
         if [ -n "$gateway" ]; then
-            connmanctl config "$svc" --ipv4 manual "$static" "$gateway" $dns >> "$LOG" 2>&1
+            connmanctl config "$svc" --ipv4 manual "$addr" "$mask" "$gateway" >> "$LOG" 2>&1
         else
-            connmanctl config "$svc" --ipv4 manual "$static" >> "$LOG" 2>&1
+            connmanctl config "$svc" --ipv4 manual "$addr" "$mask" >> "$LOG" 2>&1
         fi
-        [ $? -eq 0 ] && applied=yes
+        rc=$?
+        if [ $rc -eq 0 ] && [ -n "$dns" ]; then
+            connmanctl config "$svc" --nameservers $dns >> "$LOG" 2>&1
+        fi
+        # and believe connman, not its exit code: read the configuration back
+        i=0
+        while [ $i -lt 10 ]; do
+            if connmanctl services --properties "$svc" 2> /dev/null | grep -q "Method=manual"; then
+                applied=yes
+                break
+            fi
+            sleep 1
+            i=$((i + 1))
+        done
+        [ "$applied" = yes ] || log "14onboard-net: connman accepted the config but does not report Method=manual" \
+                                    "for $svc (rc=$rc, see $LOG); falling back to ip"
+    else
+        log "14onboard-net: connman has no service for $iface (mac ${mac:-unknown}): falling back to ip"
     fi
 fi
 
 if [ "$applied" = no ]; then
-    # connman has no service for it (a boot before connman settled, or a bare interface): put it on with ip, which
-    # connman leaves alone for as long as it has no service of its own for that link
+    # no connman service for this link yet, or connman did not take the manual config: put it on with ip, which connman
+    # leaves alone for as long as it has no service of its own here
     if ip addr add "$static" dev "$iface" >> "$LOG" 2>&1; then
         [ -n "$gateway" ] && ip route replace default via "$gateway" dev "$iface" >> "$LOG" 2>&1
         applied=yes

@@ -358,6 +358,7 @@ if assert_pupsfs:
         try: os.unlink(f)
         except OSError: pass
     q = ["qemu-system-x86_64", "-m", "4096", "-smp", "4",
+         "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0",
          "-drive", "file=" + os.path.join(work, "target.img") + ",format=raw,if=none,id=d0",
          "-device", "qemu-xhci", "-device", "usb-storage,drive=d0",
          "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
@@ -436,6 +437,7 @@ if assert_pupsfs:
                 try: os.unlink(f)
                 except OSError: pass
             q = ["qemu-system-x86_64", "-m", "4096", "-smp", "4",
+                 "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0",
                  "-drive", "file=" + os.path.join(work, "target.img") + ",format=raw,if=none,id=d0",
                  "-device", "qemu-xhci", "-device", "usb-storage,drive=d0",
                  "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
@@ -682,45 +684,63 @@ if assert_pupsfs:
                       "Lemonade tcp/13305, mDNS udp/5353) the only ACCEPT rules, loopback+established exempted; a time "
                       "source (%s), hostname %s, /data/logs %s file(s)"
                       % (wait_s, ntp.strip(), hn, logs))
-            # ---- engine#712 the persistent network identity: the address the machine has now becomes a static one in
-            # /data/net.conf, the machine reboots, and it must come up carrying it - then `1bit-network reset` must take
-            # it away. The value is the machine's OWN current address, so nothing later in this run loses the network.
+            # ---- engine#712 the persistent network identity, and this row has to DISCRIMINATE (review on #1513): the
+            # address it persists is one DHCP will never hand out (slirp leases from 10.0.2.15), so "the interface
+            # carries it after a reboot" cannot be true by accident - and connman's own view of the service has to say
+            # Method=manual, because `connmanctl config` exiting 0 proves nothing about what connman did with it.
             cur = val("CUR", "ip -4 -o addr show scope global 2>/dev/null | awk '{ print $2 \" \" $4; exit }'")
             parts = cur.split()
             if len(parts) == 2 and "/" in parts[1]:
-                dev, addr = parts[0], parts[1]
+                dev, dhcp_addr = parts[0], parts[1]
                 gw = val("GW", "ip route show default 2>/dev/null | awk '/^default/ { for (i=1;i<=NF;i++) if ($i==\"via\") { print $(i+1); exit } }'")
-                setr = val("SETSTATIC", "1bit-network set-static %s %s 2>&1 | tr '\\n' '; '" % (addr, gw or ""), timeout=240)
-                say("INFO net          set-static %s %s -> %s" % (addr, gw or "-", setr[:300]))
+                # an address in the same /24 that no DHCP server here will lease
+                prefix = dhcp_addr.split("/")[1]
+                static_addr = ".".join(dhcp_addr.split("/")[0].split(".")[:3] + ["250"]) + "/" + prefix
+                setr = val("SETSTATIC", "1bit-network set-static %s %s 2>&1 | tr '\\n' '; '" % (static_addr, gw or ""), timeout=240)
+                print("INFO net          set-static %s %s -> %s" % (static_addr, gw or "-", setr[:300]))
                 if "persisted to /data/net.conf" not in setr:
-                    say("FAIL net          set-static did not persist the address: %s" % (setr[-200:] or "<no output>")); ok = False
+                    print("FAIL net          set-static did not persist the address: %s" % (setr[-200:] or "<no output>")); ok = False
                 else:
-                    say("PASS net          a static address persisted on the data partition and applied now")
-                    net_after = val("NETNOW", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
-                    if addr not in net_after:
-                        say("FAIL net          the interface does not carry %s right after set-static (%s)" % (addr, net_after or "<none>")); ok = False
+                    print("PASS net          %s (not the DHCP lease %s) persisted to /data/net.conf and applied now" % (static_addr, dhcp_addr))
+                    now = val("NETNOW", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
+                    if static_addr not in now:
+                        print("FAIL net          the interface does not carry %s right after set-static (%s)" % (static_addr, now or "<none>")); ok = False
                 if not v.reboot():
-                    say("FAIL net          the machine did not come back after the static-address reboot"); ok = False
+                    print("FAIL net          the machine did not come back after the static-address reboot"); ok = False
                     v.close()
                 else:
                     per = val("PERSIST", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
                     f = val("CONF", "grep -c '^static=' /data/net.conf 2>/dev/null")
-                    if addr not in per:
-                        say("FAIL net          after the reboot the interface does not carry %s (%s): the file was not applied" % (addr, per or "<none>")); ok = False
+                    cm = val("CONNMAN", "connmanctl services --properties 2>/dev/null | grep -c 'Method=manual'")
+                    print("INFO net          after the reboot: %s | net.conf static lines=%s | connman Method=manual=%s" % (per or "<none>", f, cm))
+                    if static_addr not in per:
+                        print("FAIL net          after the reboot the interface does not carry the static %s (%s)" % (static_addr, per or "<none>")); ok = False
                     elif f != "1":
-                        say("FAIL net          /data/net.conf is gone after the reboot (static= lines: %s)" % (f or "0")); ok = False
+                        print("FAIL net          /data/net.conf lost its static line across the reboot (%s)" % (f or "0")); ok = False
+                    elif not cm.isdigit() or int(cm) < 1:
+                        print("FAIL net          connman does not report Method=manual after the reboot: the address may be"
+                              " left over from before, not applied (%s)" % (cm or "<none>")); ok = False
                     else:
-                        say("PASS net          %s carries %s across a reboot, read from /data/net.conf on the data partition" % (dev, addr))
-                    reset = val("RESETNET", "1bit-network reset 2>&1 | tr '\\n' '; '", timeout=180)
+                        print("PASS net          after a reboot %s carries %s and connman reports Method=manual: the address"
+                              " is applied from /data/net.conf, not inherited" % (dev, static_addr))
+                    val("RESETNET", "1bit-network reset 2>&1 | tr '\\n' '; '", timeout=180)
                     left = val("LEFT", "ls /data/net.conf 2>&1 | head -1")
-                    if "reset" not in reset:
-                        say("FAIL net          1bit-network reset did not report: %s" % (reset[-200:] or "<no output>")); ok = False
-                    elif "No such file" not in left:
-                        say("FAIL net          /data/net.conf is still there after reset (%s)" % left); ok = False
+                    # and DHCP has to come back on its own: a reset that leaves the box on the static address is a
+                    # half-recovery, so the row waits for the lease rather than just for the file to disappear
+                    dhcp_back = val("BACK", "n=0; while [ $n -lt 24 ]; do "
+                                            "ip -4 -o addr show dev %s 2>/dev/null | grep -q '%s' && break; "
+                                            "sleep 5; n=$((n+1)); done; "
+                                            "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'"
+                                            % (dev, dhcp_addr.split('/')[0], dev), timeout=180)
+                    if "No such file" not in left:
+                        print("FAIL net          /data/net.conf is still there after reset (%s)" % left); ok = False
+                    elif dhcp_addr.split("/")[0] not in (dhcp_back or ""):
+                        print("FAIL net          after reset the link did not get its DHCP address back (%s)" % (dhcp_back or "<none>")); ok = False
                     else:
-                        say("PASS net          reset removed /data/net.conf and handed the link back to DHCP")
+                        print("PASS net          reset removed /data/net.conf and the link is back on DHCP (%s)"
+                              % dhcp_addr.split("/")[0])
             else:
-                say("INFO net          no global IPv4 address on this boot (%s): the static-address rows are a SKIP" % (cur or "<none>"))
+                print("INFO net          no global IPv4 address on this boot (%s): the static-address rows are a SKIP" % (cur or "<none>"))
             wrote = val("WROTE", "sh -c 'echo 712 > /root/712-persist; sync; cat /root/712-persist'")
             if wrote != "712":
                 print("FAIL persist      could not write to the installed root (/root/712-persist: %s)" % (wrote or "<no answer>")); ok = False

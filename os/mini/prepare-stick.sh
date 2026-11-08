@@ -294,16 +294,28 @@ if [ "$CHECK" = 0 ]; then
         [ "$new" -gt "${old:-0}" ] && need=$((need + new - old))
     done
     for d in $NPUMODELS; do
-        new=$(du -sb "$d" 2> /dev/null | cut -f1); new=${new:-0}
+        # -B1 (blocks, in bytes) on both sides, not -sb (apparent): df counts what is ALLOCATED, and a directory of many
+        # small files allocates more than its sizes add up to - the 696 MB NPU pack is hundreds of them, which is where an
+        # apparent-bytes estimate and df disagree. Comparing like with like is the whole point of a preflight.
+        new=$(du -sB1 "$d" 2> /dev/null | cut -f1); new=${new:-0}
         # the directory is rm -rf'd before the copy, so its old bytes come back to the filesystem
-        old=$(du -sb "$MNT/models/$(basename "${d%/}")" 2> /dev/null | cut -f1); old=${old:-0}
+        old=$(du -sB1 "$MNT/models/$(basename "${d%/}")" 2> /dev/null | cut -f1); old=${old:-0}
         [ "$new" -gt "$old" ] && need=$((need + new - old))
     done
     need=$((need + 1048576))     # 1 MiB of headroom for the new directory entries and the conf/key writes
     avail=$(df -B1 --output=avail "$MNT" 2> /dev/null | tail -n 1 | tr -d ' ')
     # a df that cannot answer (an old busybox has no --output) leaves this empty: skip rather than guess
     if [ -n "${avail:-}" ] && [ "$need" -gt 1048576 ] && [ "$avail" -lt "$need" ]; then
-        die "refusing to stage: the data filesystem has $avail bytes free and the models need $need. The partition's grow or its resize2fs did not happen - read the 'grow'/'grown' lines above, then compare 'sfdisk -d $TARGET' (the partition) with 'df -h $MNT' (the filesystem). Staging anyway leaves a TRUNCATED model on the medium instead of an error (engine#1374)."
+        # what is already on the medium is part of the answer: on c32 the partition held the image's own /data at ~1.3 GiB, and
+        # finding that took the operator twenty minutes. Name the biggest occupants, excluding what this run is about to write.
+        occupants=$(du -sB1 "$MNT"/* 2> /dev/null | sort -rn | head -4 |
+            while read -r bytes path; do
+                [ "${path##*/}" = models ] && continue
+                printf '  %s %.1f MiB\n' "${path#"$MNT"/}" "$(awk -v b="$bytes" 'BEGIN { print b / 1048576 }')"
+            done)
+        die "refusing to stage: the data filesystem has $avail bytes free and the models need $need. The partition's grow or its resize2fs did not happen - read the 'grow'/'grown' lines above, then compare 'sfdisk -d $TARGET' (the partition) with 'df -h $MNT' (the filesystem). Already on it:
+${occupants:-  (nothing measurable)}
+Staging anyway leaves a TRUNCATED model on the medium instead of an error (engine#1374)."
     fi
 fi
 
@@ -375,7 +387,13 @@ if [ "$CHECK" = 0 ]; then
         [ -d "$MNT/models" ] || mkdir -p "$MNT/models"
         cp -f "$m" "$MNT/models/$(basename "$m")" || die "could not copy $m into $MNT/models"
         chown 0:0 "$MNT/models" "$MNT/models/$(basename "$m")" 2>/dev/null
-        printf 'model    models/%s (%s bytes)\n' "$(basename "$m")" "$(stat -Lc %s "$m")"
+        # engine#1374: prove the staged bytes, do not assume them. `cp` returning 0 is not evidence that what is on the medium
+        # is what was asked for - the c32 failure was a truncated model that only a byte comparison found, and this tool wrote
+        # it, so this tool is where the check belongs. cmp is byte-exact and costs one read of each side, which the copy has
+        # already paid for in page cache.
+        cmp -s "$m" "$MNT/models/$(basename "$m")" ||
+            die "the staged models/$(basename "$m") is not byte-identical to $m (a short write, a truncated copy, or the source changed while staging) - the medium was NOT left half-staged on purpose: re-run after checking space (engine#1374)"
+        printf 'model    models/%s (%s bytes, byte-identical to the source)\n' "$(basename "$m")" "$(stat -Lc %s "$m")"
     done
     for d in $NPUMODELS; do
         name=${d%/}; name=${name##*/}
@@ -384,6 +402,10 @@ if [ "$CHECK" = 0 ]; then
         mkdir -p "$MNT/models/$name" || die "could not create $MNT/models/$name"
         # -L: on a build box the model directory is symlinks into the FLM install; the stick needs the bytes
         cp -fRL "$d"/. "$MNT/models/$name"/ || die "could not copy the NPU model $d into $MNT/models/$name"
+        # the same proof for a directory of files: every staged file byte-identical to its source, and a missing or extra file
+        # is a difference too (diff -r reports both)
+        diff -r -q "$d" "$MNT/models/$name" > /dev/null 2>&1 ||
+            die "the staged models/$name is not byte-identical to $d (run: diff -r $d $MNT/models/$name) - engine#1374"
         chown -R 0:0 "$MNT/models/$name" 2>/dev/null
         printf 'npu      models/%s (%s files, %s bytes)\n' "$name" \
             "$(find "$MNT/models/$name" -type f | wc -l)" "$(du -sb "$MNT/models/$name" | cut -f1)"

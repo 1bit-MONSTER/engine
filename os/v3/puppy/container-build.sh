@@ -315,6 +315,10 @@ if [ -n "${PAYLOAD:-}" ]; then
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-update "$skeleton/usr/local/bin/1bit-update"
     # engine#712: the persistent network identity (a static address on /data, applied at boot, one command to forget)
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-network "$skeleton/usr/local/bin/1bit-network"
+    # engine#1474: the BASE layer's keep-list ships so the board row can print what decided it. The normalisation itself
+    # runs in fix-ownership.sh, which 3builddistro calls immediately before mksquashfs - the last moment the tree exists,
+    # and the same hook that already refuses to pack when the setuid count moved.
+    install -D -m 644 /recipe/base-modes-keep "$skeleton/etc/1bit/base-modes-keep"
     install -D -m 755 /recipe/embed/etc/init.d/06onboard-logs "$skeleton/etc/init.d/06onboard-logs"
     install -D -m 755 /recipe/embed/etc/init.d/08onboard-presets "$skeleton/etc/init.d/08onboard-presets"
     install -D -m 755 /recipe/embed/root/Startup/1bit-lemonade-webapp \

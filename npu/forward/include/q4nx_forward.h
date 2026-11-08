@@ -127,7 +127,12 @@ public:
     bool extend_context(int n_tokens);
 
     // Run one token at absolute position pos; fills logits (size NV).
-    bool step(int token, int pos, std::vector<float>& logits);
+    // `pos` is the ROTARY position; `cache_pos` is the slot the new K/V lands in, which is the only thing that
+    // decides how many cached rows attention reads.  They are the same number only while positions equal indices:
+    // after an image they are not (an image's rows walk a small h/w grid, so the MRoPE position is far below the
+    // cache length), and using the rotary position as the window dropped the prompt's tail -- the question -- and
+    // every token after the first never saw what it had generated.  -1 keeps the old behaviour for text prompts.
+    bool step(int token, int pos, std::vector<float>& logits, int cache_pos = -1);
 
     // Batched prefill: run the whole prompt in one pass so each projection's
     // weight stream is read once per batch instead of once per token. The kernels
@@ -148,6 +153,29 @@ public:
     // The per-token fallback path (MLA/MoE/GDN/... models) needs ids and is refused by name.
     bool step_batch_embeds(const std::vector<float>& embeds, int start_pos,
                            std::vector<float>& logits);
+    // What a vision-conditioned prompt adds on top of the embeddings (engine#1311/TQVL; plan P4's `rope.planes`
+    // and a per-layer feature injection):
+    //   position_ids 3 x rows, plane-major (t, h, w) — the layout the reference's `get_rope_index` produces and
+    //                AMD's `text.onnx` takes. Text rows have all three equal, which is bit-identical to plain RoPE
+    //                (measured: 0 difference over positions 0..262143; image rows differ per axis and that is the
+    //                whole point). A pack that declares mrope without sections is refused by name.
+    //   deepstack   sets x rows x H, one set per `vision_config.deepstack_visual_indexes` entry (Qwen3-VL: 5/11/17);
+    //                set s is added to the hidden state when the layer loop reaches deepstack_layers[s]. This is how
+    //                the reference injects the vision tower's extra features, and an answer cannot match it without.
+    struct HybridInputs {
+        const std::vector<int>* position_ids = nullptr;
+        const float* deepstack = nullptr;
+        int deepstack_sets = 0;
+        // The rows the deepstack sets belong to: the image span. They are added THERE, not everywhere -- a set has
+        // rows_img rows, so adding it to every row of the prompt would both be the wrong function and read past the
+        // buffer (the first version of this did exactly that and produced garbage tokens).
+        int image_lo = -1;
+        int image_hi = -1;
+    };
+    const int* deepstack_layers() const { return sem_.deepstack_layers; }
+    int n_deepstack_layers() const { return sem_.n_deepstack; }
+    bool step_batch_embeds(const std::vector<float>& embeds, int start_pos, std::vector<float>& logits,
+                           const HybridInputs& in);
 
     // The same batched pass, but returning the logits of EVERY row (M x NV, row-major) instead of only
     // the last one.  Speculative decoding needs them: a draft token is accepted only if the model's own
@@ -231,7 +259,7 @@ private:
     // The default for the above when NPU_FFN_CACHE says nothing: on for a GDN
     // model on the NPU route, with a size guard.  See the definition.
     bool ffn_cache_default() const;
-    bool attention(const std::vector<float>& qkv, int pos, std::vector<float>& ctx,
+    bool attention(const std::vector<float>& qkv, int pos, const int* pos3, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
                    bool proportional, int window, int kv_layer, bool append_kv,
                    int kv_len = 0);
@@ -354,6 +382,16 @@ private:
     std::vector<uint16_t> embed_;                 // [NV*H] bf16
     // Set only while step_batch_embeds() runs: the row source for the batched body's embedding fill.
     const float* inject_embeds_ = nullptr;
+    // Set only while step_batch_embeds(..., position_ids, ...) runs: 3 x rows, plane-major, or null.
+    const int* pos3_ = nullptr;
+    int pos3_rows_ = 0;
+    // Set only while a step_batch_embeds() call carries deepstack sets: sets x rows x H.
+    const float* deepstack_ = nullptr;
+    int deepstack_rows_ = 0;
+    int deepstack_lo_ = -1, deepstack_hi_ = -1;
+    // Which plane a rotary frequency belongs to under interleaved MRoPE.  The rule lives in q4nx_semantics.h as
+    // q4nx_mrope_axis() so the C unit test can pin it without building a forward pass.
+    int mrope_plane(int freq) const { return q4nx_mrope_axis(freq, sem_.n_mrope_section, sem_.mrope_section); }
     // Some models store the embedding QUANTIZED (Gemma4-E2B/E4B: dtype I8), and
     // reading it as bf16 yields ~zero - which invalidated the whole forward and
     // the tied LM head (all-zero logits).  When the dtype is not BF16 the

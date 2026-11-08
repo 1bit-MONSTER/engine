@@ -12,8 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
 #
 # lib/env.sh -- sourced by every arena build/run.  Resolves the toolchain from the
 # environment (or from a local TOOLCHAIN.lock, which is deliberately NOT in the

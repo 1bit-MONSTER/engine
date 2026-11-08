@@ -30,6 +30,8 @@ import json
 import sys
 from pathlib import Path
 
+# Data, not this file's header: NOTICE is the HTML block written into a generated leaderboard, which is
+# why the second Copyright+SPDX pair here is legitimate (engine#1547).
 NOTICE = """<!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0

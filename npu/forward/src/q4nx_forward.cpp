@@ -3024,7 +3024,7 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
 // then the f32 signs those offsets index (the GGUF's prism.hadamard.sign_widths/sign_values).
 bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int start_pos,
-                                      std::vector<float>& logits) {
+                                      std::vector<float>& logits, const HybridInputs& in) {
     if (!ready_) { err_ = "not initialised"; return false; }
     const size_t H = (size_t)c_.H;
     if (H == 0 || embeds.empty() || embeds.size() % H != 0) {
@@ -3035,15 +3035,57 @@ bool Q4nxNpuForward::step_batch_embeds(const std::vector<float>& embeds, int sta
     for (float v : embeds)
         if (!std::isfinite(v)) { err_ = "step_batch_embeds: a row holds a non-finite value"; return false; }
     const int rows = int(embeds.size() / H);
+    const std::vector<int>& position_ids = in.position_ids ? *in.position_ids : std::vector<int>();
+    if (!position_ids.empty()) {
+        if (!sem_.mrope) {
+            err_ = "step_batch_embeds: position_ids given but this pack does not declare interleaved MRoPE";
+            return false;
+        }
+        if (sem_.n_mrope_section < 3) {
+            err_ = "step_batch_embeds: the pack declares MRoPE but no mrope_section, so the axis layout is "
+                   "unknown; refusing rather than guessing which frequencies are (t, h, w)";
+            return false;
+        }
+        if (position_ids.size() != size_t(3) * size_t(rows)) {
+            err_ = "step_batch_embeds: position_ids is " + std::to_string(position_ids.size()) + " values, expected 3 x " +
+                   std::to_string(rows);
+            return false;
+        }
+    }
     // The body indexes tokens[m] only when nothing is injected, but it still needs the row count and the guards
     // above it read tokens; a zero vector of the right length keeps every check honest (0 is a valid id) while
     // the fill itself takes the injected rows.
+    if (in.deepstack_sets > 0) {
+        if (in.deepstack_sets != sem_.n_deepstack) {
+            err_ = "step_batch_embeds: " + std::to_string(in.deepstack_sets) + " deepstack set(s) given but the pack "
+                   "declares " + std::to_string(sem_.n_deepstack) + " deepstack layer(s)";
+            return false;
+        }
+        if (!in.deepstack) { err_ = "step_batch_embeds: deepstack_sets without a buffer"; return false; }
+        if (in.image_lo < 0 || in.image_hi <= in.image_lo || in.image_hi > rows) {
+            err_ = "step_batch_embeds: deepstack sets need the image row span (image_lo/image_hi inside 0.." +
+                   std::to_string(rows) + ")";
+            return false;
+        }
+    }
     const std::vector<int> placeholder(size_t(rows), 0);
     struct Restore {
         const float*& p;
-        ~Restore() { p = nullptr; }
-    } restore{inject_embeds_};
+        const int*& q;
+        int& n;
+        const float*& d;
+        int& dn;
+        int& lo;
+        int& hi;
+        ~Restore() { p = nullptr; q = nullptr; n = 0; d = nullptr; dn = 0; lo = -1; hi = -1; }
+    } restore{inject_embeds_, pos3_, pos3_rows_, deepstack_, deepstack_rows_, deepstack_lo_, deepstack_hi_};
     inject_embeds_ = embeds.data();
+    pos3_ = position_ids.empty() ? nullptr : position_ids.data();
+    pos3_rows_ = rows;
+    deepstack_ = in.deepstack;
+    deepstack_rows_ = in.image_hi - in.image_lo;
+    deepstack_lo_ = in.image_lo;
+    deepstack_hi_ = in.image_hi;
     return step_batch(placeholder, start_pos, logits);
 }
 
@@ -3192,9 +3234,22 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                                    embed_scale_;
     if (phb) { g_ph.embed = ph_ms(tp_bs); tp_lap = std::chrono::steady_clock::now(); }
 
+    // Deepstack, in the reference's place (transformers Qwen3VLTextModel.forward: `_deepstack_process` is called
+    // after `decoder_layer(...)`, for layer_idx < len(sets)). Set `l` of `deepstack_` goes to the image rows of the
+    // residual stream after text layer `l` runs. It is a lambda because a MoE layer ends in `continue`, which used to
+    // skip the add entirely -- latent for this dense pack, wrong for the Qwen3-VL-*-A3B MoE models.
+    auto deepstack_add = [&](int l) {
+        if (!deepstack_ || l < 0 || l >= sem_.n_deepstack) return;
+        const float* add = deepstack_ + size_t(l) * size_t(deepstack_rows_) * size_t(H);
+        const int lo = std::max(0, deepstack_lo_), hi = std::min((int)M, deepstack_hi_);
+        for (int r = lo; r < hi; r++)
+            for (size_t k = 0; k < (size_t)H; k++)
+                X[size_t(r) * (size_t)H + k] += add[size_t(r - lo) * (size_t)H + k];
+    };
+
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
-        cur_layer_ = l;
+        cur_layer_ = l;   // the layer index the per-layer helpers read
         const bool cached = weight_cached(0);
         const int lt0 = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
         // A GDN layer's host parameters (conv window, alpha/beta, ssm_a/dt, gated
@@ -3328,7 +3383,16 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                     in = &qkv_use;
                 }
                 LhScope _t_attn(LH_ATTN);
-                if (!attention(*in, start_pos + m, dst ? ctx_row : ctx_scratch, l_hd, l_nkv, l_theta,
+                // pos3_ is plane-major (3 x rows): row m's three positions are three strided reads, not a pointer
+                // offset, so they are gathered here into the trio attention() expects.
+                int trio[3] = {0, 0, 0};
+                if (pos3_) {
+                    trio[0] = pos3_[m];
+                    trio[1] = pos3_[pos3_rows_ + m];
+                    trio[2] = pos3_[2 * pos3_rows_ + m];
+                }
+                if (!attention(*in, start_pos + m, pos3_ ? trio : nullptr, dst ? ctx_row : ctx_scratch,
+                               l_hd, l_nkv, l_theta,
                                l_rot, l_prop, l_win, l, append, kvlen)) {
                     err_ = "attention failed"; return false;
                 }
@@ -3397,6 +3461,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 for (int k = 0; k < H; k++)
                     X[(size_t)m * H + k] += d_row[(size_t)k] * residual_scale_;
             }
+            deepstack_add(l);   // a MoE layer's tail still owes the layer its set
             continue;
         }
         // ACT is read below at the *fused* design's N, so both branches have to hand it rows at that
@@ -3486,6 +3551,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 fprintf(stderr, "  [LB] m=%d l=%d %.6f %.4f\n", m, l, ms / H, mmx);
             }
         }
+        deepstack_add(l);
     }
 
     if (phb) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
@@ -3572,6 +3638,22 @@ std::string Q4nxNpuForward::missing_kernel(const std::string& dir, const char* e
     if (plan_.loaded())
         return "plan " + plan_path_ + ": this model's plan needs the " + role_tag(role) + " kernel \"" +
                elf_name + "\" in " + dir + " (missing)";
+    // engine#1503: a container imported without `--weight-layout b8` is row-major, so it asks for plain kernel names while
+    // the only kernels on the box carry the _b8 suffix. Naming the layout instead of only the missing file is the
+    // difference between "re-fetch the artifact" and "re-import the pack with a flag" - measured on a Ryzen AI 1.9 pack,
+    // where the same container ran correctly with the b8 set and the flag.
+    {
+        const std::string name(elf_name);
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".elf") == 0) {
+            const std::string b8 = name.substr(0, name.size() - 4) + "_b8.elf";
+            if (file_exists(dir + "/" + b8))
+                return "missing full ELF " + dir + "/" + elf_name +
+                       " - but the b8 variant \"" + b8 + "\" is there: this container's weight layout is row-major " +
+                       "(q4nx_weight_layout absent), so it asks for row-major kernels and the directory holds the b8 " +
+                       "family. Re-import the pack with `npu-pack import --weight-layout b8`, or supply row-major ELFs " +
+                       "(engine#1503).";
+        }
+    }
     return "missing full ELF " + dir + "/" + elf_name;
 }
 
@@ -4011,7 +4093,7 @@ bool Q4nxNpuForward::dense_mlp(int l, const std::vector<float>& xn, std::vector<
     return true;
 }
 
-bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
+bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int* pos3,
                                std::vector<float>& ctx, int head_dim,
                                int n_kv_heads, float theta, int rotary_dim,
                                bool proportional, int window,
@@ -4088,7 +4170,10 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
                 // nothing per token.  No-op unless the config declares rope_type "llama3".
                 inv = q4nx_rope_llama3_inv_freq(inv, &rope_llama3_);
             }
-            const double ang = (double)pos * inv;
+            // Interleaved MRoPE: each rotary frequency rotates by its own axis's position (t, h or w). With the
+            // three planes equal this is exactly `pos * inv`, which is why text-only prompts are bit-identical
+            // to plain RoPE (measured: 0 angle difference over positions 0..262143, engine#1311/TQVL).
+            const double ang = (double)(pos3 ? pos3[mrope_plane(i)] : pos) * inv;
             cos_[i] = (float)std::cos(ang);
             sin_[i] = (float)std::sin(ang);
         }
@@ -4188,7 +4273,7 @@ bool Q4nxNpuForward::mlp(const float* gu, float* h, int im) {
 // --------------------------------------------------------------------------
 // step
 // --------------------------------------------------------------------------
-bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
+bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // Generation is causal by construction (one position at a time, keys only in the past), so a pack
     // whose full-attention layers read the whole prompt cannot be run this way.  Refused by name
@@ -4413,8 +4498,13 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             }
             {
             LhScope _tlh(LH_ATTN);
-            if (!attention(qkv_use, pos, ctx, l_hd, l_nkv_heads, l_theta, l_rot, l_prop,
-                           l_win, kv_layer, !kv_shared)) {
+            // The rotary position rotates q; the cache slot decides the window.  Passing the rotary position as the
+            // window is what broke every image prompt: an image's rows walk a small h/w grid, so the position after the
+            // image is far below the cache length, and attention then read only the first `pos + 1` rows -- dropping
+            // the prompt's tail (the question) and never seeing the tokens it had just generated.
+            const int kv_window = cache_pos >= 0 ? cache_pos + 1 : 0;
+            if (!attention(qkv_use, pos, nullptr, ctx, l_hd, l_nkv_heads, l_theta, l_rot, l_prop,
+                           l_win, kv_layer, !kv_shared, kv_window)) {
                 err_ = "attention failed";
                 return false;
             }

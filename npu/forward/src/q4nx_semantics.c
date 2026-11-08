@@ -229,6 +229,52 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
      * picking one of the two. */
     double d = 0;
     double prf_rope = 0;   /* partial_rotary_factor found inside rope_parameters */
+    /* Deepstack layers: the vision tower emits extra feature sets that the decoder adds at these layer indexes. */
+    {
+        const char* vc = value_for_top(json, "vision_config");
+        const char* at = vc ? strstr(vc, "deepstack_visual_indexes") : NULL;
+        if (at) at = strchr(at, '[');
+        if (at) {
+            int got = 0;
+            const char* p3 = at + 1;
+            while (*p3 && *p3 != ']' && got < 8) {
+                if (*p3 >= '0' && *p3 <= '9') {
+                    char* end = NULL;
+                    s->deepstack_layers[got++] = (int)strtol(p3, &end, 10);
+                    p3 = end;   /* strtol already stopped on the separator; a for-clause p3++ would skip the ']' */
+                } else {
+                    p3++;
+                }
+            }
+            s->n_deepstack = got;
+        }
+    }
+    /* The sections say WHICH rotary frequencies belong to the (t, h, w) axes; without them an interleaved-MRoPE
+     * consumer has nothing but a guess, so they are read next to the flag (both spellings) and a model that
+     * declares mrope without them is refused by the consumer rather than assumed. */
+    {
+        const char* blocks[2] = {value_for_top(json, "rope_scaling"), value_for_top(json, "rope_parameters")};
+        for (int b = 0; b < 2 && s->n_mrope_section == 0; b++) {
+            const char* blk = blocks[b];
+            if (!blk || *blk != '{') continue;
+            const char* at = strstr(blk, "mrope_section");
+            if (!at) continue;
+            at = strchr(at, '[');
+            if (!at) continue;
+            int got = 0;
+            const char* p2 = at + 1;
+            while (*p2 && *p2 != ']' && got < 3) {
+                if (*p2 >= '0' && *p2 <= '9') {
+                    char* end = NULL;
+                    s->mrope_section[got++] = (int)strtol(p2, &end, 10);
+                    p2 = end;   /* as above: let strtol move the cursor, not the loop */
+                } else {
+                    p2++;
+                }
+            }
+            s->n_mrope_section = got;
+        }
+    }
     /* Interleaved MRoPE is declarable in two spellings and only one was read here.  FastFlowLM/OGA packs and
      * Qwen3.5 nest the rotary block under `rope_parameters` (the block below); a Hugging Face `qwen3_vl` config
      * (Qwen3-VL, engine #1311/TQVL) declares the same thing under `rope_scaling`.  Reading only the first meant

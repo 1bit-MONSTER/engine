@@ -130,6 +130,10 @@ def export(hf_dir: str, out_dir: str, opset: int):
             # a fixed bucket: the patch count is baked in (see dynamo=False below)
 
             opset_version=opset, do_constant_folding=True,
+            # External data: the tower is 1.6 GB of fp32 weights, and a single inline protobuf of that size is where
+            # ONNX tooling starts failing ("Wire format was corrupt" from the quantiser's pre-processing). Written as
+            # `<graph>.onnx` + `<graph>.data`, which is also the shape AMD's own vision packs ship.
+            external_data=True,
             # The legacy (TorchScript) exporter, not torch.export: the tower's positional interpolation loops over
             # the *values* of image_grid_thw (`torch.linspace(0, num_grid_per_side-1, h)` per image), which
             # torch.export cannot symbolic-shape.  This makes the exported graph a FIXED BUCKET: the grid is baked
@@ -137,6 +141,20 @@ def export(hf_dir: str, out_dir: str, opset: int):
             # noted in docs/npu.md.  The owner's order allows fixed buckets, so this is the shipped shape.
             dynamo=False,
         )
+    # Split the weights out by hand when the exporter kept them inline: the legacy exporter ignores
+    # external_data=, and a 1.6 GB inline protobuf is where the quantiser's pre-processing fails to parse.
+    try:
+        import onnx
+        big = os.path.getsize(path) > 512 * 1024 * 1024
+        if big and not os.path.exists(path + ".data"):
+            m = onnx.load(path)
+            onnx.save_model(m, path, save_as_external_data=True, all_tensors_to_one_file=True,
+                            location=os.path.basename(path) + ".data", size_threshold=1024)
+            del m
+            print(f"split weights to {os.path.basename(path)}.data "
+                  f"({os.path.getsize(path) / 1e6:.1f} MB graph + {os.path.getsize(path + '.data') / 1e6:.1f} MB)")
+    except ImportError:
+        pass
     meta = {"source": os.path.abspath(hf_dir), "opset": opset, "hidden": int(vc.hidden_size),
             "out_hidden": int(vc.out_hidden_size), "patch": patch, "temporal_patch": int(vc.temporal_patch_size),
             "merge": merge, "depth": depth, "heads": int(vc.num_heads),
@@ -218,7 +236,8 @@ def quantize(fp32_dir: str, out_dir: str, calib: int):
     bucket, so the row is reproducible; a real deployment would calibrate on its own data.
     """
     import onnxruntime as ort
-    from onnxruntime.quantization import CalibrationDataReader, QuantFormat, QuantType, quantize_static
+    from onnxruntime.quantization import CalibrationDataReader, CalibrationMethod, QuantFormat, QuantType, quantize_static
+    from onnxruntime.quantization.shape_inference import quant_pre_process  # kept for the record above
 
     meta = json.load(open(os.path.join(fp32_dir, "vision_fp32.json")))
     bucket, patch = int(meta["bucket_patches"]), int(meta["patch"])
@@ -247,13 +266,23 @@ def quantize(fp32_dir: str, out_dir: str, calib: int):
 
     os.makedirs(out_dir, exist_ok=True)
     dst = os.path.join(out_dir, "vision_qdq.onnx")
+    # Pre-processing first: symbolic shape inference + the standard fusions. Without it ORT quantises a graph whose
+    # tensors have no inferred ranges at several nodes and the calibration never reaches them — measured as a
+    # systematic, not a precision, error (cosine 0.22 with it missing).
+    # No quant_pre_process() here on purpose: with the weights in an external `.data` file it copies the model to a
+    # temp dir and leaves the data behind ("Data of TensorProto … should be stored in /tmp/pre.quant.*/
+    # vision_fp32.onnx.data, but it is not regular file"), and with the weights inline it fails earlier on
+    # symbolic shape inference. The graph is a fixed bucket with concrete shapes, so the quantiser's own
+    # pre-processing is not needed; this is recorded rather than worked around with a fragile temp-file dance.
+    _ = quant_pre_process
     quantize_static(src, dst, Reader(), quant_format=QuantFormat.QDQ, per_channel=True,
+                    calibrate_method=CalibrationMethod.Percentile,
                     activation_type=QuantType.QInt8, weight_type=QuantType.QInt8,
                     # Only the big projections. Quantising Conv (the patch embed), Add (residuals) and the
                     # norm/softmax paths as well was measured at cosine 0.22 against fp32 -- the graph is a ViT
                     # with per-token dynamic ranges and no QDQ pre-processing, so the sensitive ops stay float.
                     op_types_to_quantize=["MatMul"],
-                    extra_options={"ActivationSymmetric": True, "WeightSymmetric": True})
+                    extra_options={"ActivationSymmetric": True, "WeightSymmetric": True, "CalibPercentile": 99.9})
     out_meta = dict(meta)
     out_meta.update({"quant": "qdq-a8w8-perchannel-int8", "calib_images": calib})
     json.dump(out_meta, open(os.path.join(out_dir, "vision_qdq.json"), "w"), indent=1)
@@ -279,7 +308,7 @@ def main():
     q = sub.add_parser("quantize")
     q.add_argument("fp32_dir")
     q.add_argument("out_dir")
-    q.add_argument("--calib", type=int, default=16)
+    q.add_argument("--calib", type=int, default=32)
     c = sub.add_parser("check")
     c.add_argument("hf_dir")
     c.add_argument("out_dir")

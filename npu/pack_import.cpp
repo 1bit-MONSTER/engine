@@ -240,7 +240,9 @@ struct Fconst {
 };
 
 Fconst open_fconst(const std::string& path) {
-    if (path.empty()) throw std::runtime_error("no dd_metastate_Llm_Token_Token_*.fconst in the pack");
+    if (path.empty())
+        throw std::runtime_error("no dd_metastate_Llm_Token_*.fconst in the pack (1.8 spelled it Llm_Token_Token_, "
+                                 "Ryzen AI 1.9 tags it with the aie2 program name)");
     Fconst f;
     f.path = path;
     std::string why;
@@ -266,6 +268,48 @@ std::string find_one(const std::string& dir, const std::string& prefix, const st
         if (n.size() >= prefix.size() + suffix.size() && n.compare(0, prefix.size(), prefix) == 0 &&
             n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0)
             return e.path().string();
+    }
+    return {};
+}
+
+// The pack's **Token program** .fconst — the file that carries the layer blocks and the head tiles.
+//
+// Ryzen AI 1.8 names it `dd_metastate_Llm_Token_Token_<pipeline>.fconst`. Ryzen AI 1.9 names the same artifact
+// after the aie2 compiler's own per-node tag: `dd_metastate_Llm_Token_aie2_token_modellayers.0input_layernorm
+// MLADFRMSNORM.fconst`. A fixed `Llm_Token_Token_` prefix therefore matches **no** 1.9 pack, which is exactly how
+// `amd/Qwen3-8B_rai_1.9.0_npu` failed: `npu-pack info` read the dims and the tokenizer, then reported all 360 layer
+// tensors as "no dd_metastate_Llm_Token_Token_*.fconst in the pack".
+//
+// The stem that is stable across both releases is **Llm_Token_**. The prefill program is a different stem
+// (`Llm_Prefill_`, found separately), so it cannot be picked up here.
+//
+// Resolution order, and it never guesses: the 1.8 spelling first, so nothing that imports today changes; then a
+// *single* `Llm_Token_*` file. Two or more unmatched candidates is a pack shape we have not seen, and choosing the
+// alphabetically first would be a coin flip over the model's weights, so it is refused by name with the list.
+std::string find_token_fconst(const std::string& dir, std::string* why = nullptr) {
+    const std::string exact = find_one(dir, "dd_metastate_Llm_Token_Token_", ".fconst");
+    if (!exact.empty()) return exact;
+    const std::string pre = "dd_metastate_Llm_Token_", suf = ".fconst";
+    std::vector<std::string> cands;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        const std::string n = e.path().filename().string();
+        if (n.size() <= pre.size() + suf.size()) continue;
+        if (n.compare(0, pre.size(), pre) != 0) continue;
+        if (n.compare(n.size() - suf.size(), suf.size(), suf) != 0) continue;
+        cands.push_back(e.path().string());
+    }
+    std::sort(cands.begin(), cands.end());
+    if (cands.size() == 1) return cands[0];
+    if (why) {
+        if (cands.empty()) {
+            *why = "no dd_metastate_Llm_Token_*.fconst in the pack (neither the 1.8 spelling "
+                   "Llm_Token_Token_ nor a single Llm_Token_<program> file)";
+        } else {
+            *why = "the pack carries " + std::to_string(cands.size()) +
+                   " dd_metastate_Llm_Token_*.fconst files and none is named Llm_Token_Token_, so which one holds "
+                   "the layer weights cannot be decided here:";
+            for (const auto& c : cands) *why += " " + fs::path(c).filename().string();
+        }
     }
     return {};
 }
@@ -427,14 +471,92 @@ DeclaredMap read_declared(const std::string& pack_dir) {
     return out;
 }
 
-Dims read_dims(const json& c) {
+// ── the pack's geometry, from wherever this generation put it ────────────────
+// Ryzen AI 1.6 ships `config.json = {}` and 1.7/1.7.1 ship **no config.json at all**; all of them carry
+// genai_config.json with the decoder block. So the geometry comes from config.json when it is usable and from
+// genai_config.json otherwise. Every refusal names the key it needed and the file it looked in, because a
+// nlohmann exception out of a loader ("key hidden_size not found", "type must be string, but is null") is a bug
+// report, not a diagnosis -- pi-inferzo's item 3.
+json load_geometry(const std::string& pack_dir, std::string* source) {
+    auto readable_object = [](const std::string& path, json& out) {
+        std::ifstream f(path);
+        if (!f) return false;
+        try { out = json::parse(f); } catch (...) { return false; }
+        return out.is_object() && !out.empty();
+    };
+    json cfg;
+    if (readable_object(pack_dir + "/config.json", cfg)) {
+        if (source) *source = "config.json";
+        // genai_config.json still carries rope values some 1.6 packs omit from config.json
+        json g;
+        if (readable_object(pack_dir + "/genai_config.json", g)) {
+            for (const char* k : {"rope_theta", "rms_norm_eps", "intermediate_size"})
+                if (!cfg.contains(k) && g.contains(k)) cfg[k] = g[k];
+        }
+        return cfg;
+    }
+    json g;
+    if (readable_object(pack_dir + "/genai_config.json", g) && g.contains("model") &&
+        g["model"].is_object() && g["model"].contains("decoder") && g["model"]["decoder"].is_object()) {
+        const json& m = g["model"];
+        const json& dec = m["decoder"];
+        cfg = json::object();
+        if (dec.contains("hidden_size")) cfg["hidden_size"] = dec["hidden_size"];
+        if (dec.contains("num_hidden_layers")) cfg["num_hidden_layers"] = dec["num_hidden_layers"];
+        if (dec.contains("num_attention_heads")) cfg["num_attention_heads"] = dec["num_attention_heads"];
+        if (dec.contains("num_key_value_heads")) cfg["num_key_value_heads"] = dec["num_key_value_heads"];
+        if (dec.contains("head_size")) cfg["head_dim"] = dec["head_size"];
+        if (m.contains("vocab_size")) cfg["vocab_size"] = m["vocab_size"];
+        if (m.contains("context_length")) cfg["max_position_embeddings"] = m["context_length"];
+        if (m.contains("type") && m["type"].is_string()) cfg["model_type"] = m["type"];
+        if (source) *source = "genai_config.json (decoder block)";
+        return cfg;
+    }
+    if (source) *source = "neither config.json nor genai_config.json";
+    return json::object();
+}
+
+// The graph's own name: 1.9 and the hybrid lines ship `model_jit.onnx` / `<Model>_jit.onnx` / `<Model>.onnx` and say
+// which in `genai_config.json`'s `model.decoder.filename` (pi-inferzo's item 2). A pack that names no file keeps the
+// 1.8 default.
+std::string graph_filename(const std::string& pack_dir) {
+    std::ifstream f(pack_dir + "/genai_config.json");
+    if (f) {
+        try {
+            const auto g = json::parse(f);
+            if (g.contains("model") && g["model"].is_object() && g["model"].contains("decoder") &&
+                g["model"]["decoder"].is_object()) {
+                const json& dec = g["model"]["decoder"];
+                if (dec.contains("filename") && dec["filename"].is_string()) {
+                    const std::string n = dec["filename"].get<std::string>();
+                    if (!n.empty() && n.find('/') == std::string::npos) return n;
+                }
+            }
+        } catch (...) {
+            // an unreadable genai_config is reported by load_geometry; here it only costs the default name
+        }
+    }
+    return "model.onnx";
+}
+
+// One key of the geometry, refused by name (and by source) instead of as a json exception.
+int dims_required(const json& c, const char* key, const std::string& source) {
+    if (!c.contains(key) || c[key].is_null())
+        throw std::runtime_error("the pack's geometry has no " + std::string(key) + " (read from " + source +
+                                 "): the pack must carry it in config.json or genai_config.json");
+    if (!c[key].is_number_integer())
+        throw std::runtime_error(std::string("the pack's ") + key + " is not an integer (read from " + source + ")");
+    return c[key].get<int>();
+}
+
+Dims read_dims(const json& c, const std::string& source = "config.json") {
     Dims d;
-    d.hidden = c.at("hidden_size").get<int>();
-    d.layers = c.at("num_hidden_layers").get<int>();
-    d.heads = c.at("num_attention_heads").get<int>();
+    d.hidden = dims_required(c, "hidden_size", source);
+    d.layers = dims_required(c, "num_hidden_layers", source);
+    d.heads = dims_required(c, "num_attention_heads", source);
     d.kv_heads = c.value("num_key_value_heads", d.heads);
     d.head_dim = c.value("head_dim", d.hidden / d.heads);
-    d.intermediate = c.at("intermediate_size").get<int>();
+    d.intermediate = dims_required(c, "intermediate_size", source);
     d.vocab = c.value("vocab_size", 0);
     d.rope_theta = c.value("rope_theta", 10000.0f);
     d.model_type = c.value("model_type", "");
@@ -469,24 +591,35 @@ FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits) {
     // The header positions repeat with one period per layer block. Take the most common
     // pos[i+P] - pos[i] for each small P and require it to dominate: a header missed at a read-chunk
     // boundary must not defeat the measurement (it did on the 4B pack, where the strict test failed).
-    for (int P = 1; P <= 8; ++P) {
-        if (int(pos.size()) <= P + 2) break;
-        std::map<int64_t, int> votes;
-        int pairs = 0;
-        for (size_t i = 0; i + P < pos.size(); ++i) {
-            const int64_t d = pos[i + P] - pos[i];
-            if (d < 1000000) continue;
-            ++votes[d];
-            ++pairs;
-        }
-        for (const auto& [d, n] : votes) {
-            if (pairs < 4 || n * 10 < pairs * 8) continue;  // needs >= 80 % of the pairs
-            if (!g.stride || d > g.stride) {                 // prefer the largest consistent period
-                g.stride = d;
-                g.period = P;
+    // Two passes over the same vote. The first keeps the original 80 % dominance rule, so every pack that
+    // locates today locates identically. The second (2/3) exists for Ryzen AI 1.9: its 8B Token .fconst has a
+    // constant 104,350,656-byte layer block -- 36 blocks plus an 8,256-byte tail, measured -- but the four
+    // epsilon headers inside a block sit at offsets that VARY per layer (14 distinct residues across 36
+    // layers), so the stride is the right answer in only 117 of 151 lag-4 pairs (77.5 %): correct, and just
+    // under the old bar. A weaker bar risks a wrong stride, which is why the geometry it produces is still
+    // checked the way it always was -- locate_fconst only proposes; the import re-encodes every tile it reads
+    // and refuses when the bytes do not come back identical.
+    for (int pass = 0; pass < 2 && !g.stride; ++pass) {
+        const int need_num = pass == 0 ? 8 : 2, need_den = pass == 0 ? 10 : 3;
+        for (int P = 1; P <= 8; ++P) {
+            if (int(pos.size()) <= P + 2) break;
+            std::map<int64_t, int> votes;
+            int pairs = 0;
+            for (size_t i = 0; i + P < pos.size(); ++i) {
+                const int64_t d = pos[i + P] - pos[i];
+                if (d < 1000000) continue;
+                ++votes[d];
+                ++pairs;
             }
+            for (const auto& [d, n] : votes) {
+                if (pairs < 4 || n * need_den < pairs * need_num) continue;
+                if (!g.stride || d > g.stride) {                 // prefer the largest consistent period
+                    g.stride = d;
+                    g.period = P;
+                }
+            }
+            if (g.stride) break;
         }
-        if (g.stride) break;
     }
     if (!g.stride) {
         g.why = "the epsilon headers do not repeat with a single period";
@@ -923,12 +1056,55 @@ Plan plan(const std::string& pack_dir) {
     p.dir = pack_dir;
     p.pack = fs::path(pack_dir).lexically_normal().filename().string();
 
-    std::ifstream cf(pack_dir + "/config.json");
-    if (!cf) throw std::runtime_error("cannot read " + pack_dir + "/config.json");
-    p.dims = read_dims(json::parse(cf));
+    std::string geom_src;
+    json geom = load_geometry(pack_dir, &geom_src);
+    // `intermediate_size` is the one key no 1.6/1.7 pack states: genai_config.json has no such field, and on the
+    // hybrid line the FFN projections are not in the main graph either (measured: 25 of 121 qweights present). So
+    // it is taken from the graph when the graph carries an MLP projection, and otherwise refused with that reason
+    // -- never guessed from the other dimensions.
+    const std::string graph = graph_filename(pack_dir);
+    auto im_from_graph = [&](const std::string& gname) -> int {
+        std::error_code ec;
+        if (!fs::exists(pack_dir + "/" + gname, ec)) return 0;
+        const OnnxModel gm = parse_onnx(pack_dir + "/" + gname);
+        int best = 0;
+        for (const auto& t : gm.tensors) {
+            const bool weight = t.name.find("qweight") != std::string::npos ||
+                               t.name.find("MatMulNBits") != std::string::npos;
+            if (!weight || t.dims.size() != 3) continue;          // [N, K/128, 64]
+            const std::string& n = t.name;
+            if (n.find("lm_head") != std::string::npos) continue;
+            if (n.find("mlp") == std::string::npos && n.find("gate") == std::string::npos &&
+                n.find("up_proj") == std::string::npos && n.find("down_proj") == std::string::npos)
+                continue;
+            const int64_t w = t.dims.at(0);                        // N of the projection
+            if (n.find("gate_up") != std::string::npos) { if (w / 2 > best) best = int(w / 2); }
+            else if (w > best) best = int(w);
+        }
+        return best;
+    };
+    if (!geom.contains("intermediate_size") || geom["intermediate_size"].is_null()) {
+        const int im = im_from_graph(graph);
+        if (im > 0) {
+            geom["intermediate_size"] = im;
+            geom_src += ", intermediate_size from the graph's MLP projection width";
+        } else {
+            throw std::runtime_error(
+                "the pack states no intermediate_size: " + geom_src +
+                " has none, and the FFN projections are not initializers of " + graph +
+                " (on the hybrid line only the attention/head qweights are in the main graph), so the FFN width "
+                "has to come from the subgraph or from model.pb.bin -- refusing rather than guessing it from the "
+                "other dimensions");
+        }
+    }
+    p.dims = read_dims(geom, geom_src);
     const Dims& d = p.dims;
 
-    const OnnxModel onnx = parse_onnx(pack_dir + "/model.onnx");
+    std::error_code ec_graph;
+    if (!fs::exists(pack_dir + "/" + graph, ec_graph))
+        throw std::runtime_error("the pack's graph file " + graph + " is not in " + pack_dir +
+                                 " (named by genai_config.json's model.decoder.filename)");
+    const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph);
     const OnnxTensor* embed = nullptr;
     for (const auto& t : onnx.tensors)
         if (t.name == "model.embed_tokens.weight") embed = &t;
@@ -983,10 +1159,11 @@ Plan plan(const std::string& pack_dir) {
     // 64-row tiles (or whose q/k/v/o row split does not add up to them) is refused rather than guessed at.
     const int q_out = d.heads * d.head_dim, kv_out = d.kv_heads * d.head_dim;
     {
-        const std::string tok = find_one(pack_dir, "dd_metastate_Llm_Token_Token_", ".fconst");
+        std::string tok_why;
+        const std::string tok = find_token_fconst(pack_dir, &tok_why);
         const int64_t tile_bytes = attn_tile_bytes(H);
         if (tok.empty()) {
-            p.attn_note = "no dd_metastate_Llm_Token_Token_*.fconst in the pack";
+            p.attn_note = tok_why;
             p.mlp_note = p.attn_note;
         } else if (tile_bytes == 0) {
             p.attn_note = "hidden " + std::to_string(H) + " is not a multiple of 128, so the attention "
@@ -1444,7 +1621,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     }
 
     {
-        const std::string path = find_one(pack_dir, "dd_metastate_Llm_Token_Token_", ".fconst");
+        std::string path_why;
+        const std::string path = find_token_fconst(pack_dir, &path_why);
         const FconstGeom g = locate_fconst(path, p.dims.eps_bits);
         // refusals decided while reading the payload (a tile that does not survive its own round trip,
         // or an o_proj bias the container has nowhere to put); they land before anything is written

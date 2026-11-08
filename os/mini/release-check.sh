@@ -612,6 +612,32 @@ identity_verdict() {
     printf 'PASS consistent: engine_sha256=%.16s and libhsa_sha256=%.16s are the shipped bytes, read off the payload rather than out of the file' "$_ce" "$_ch"
 }
 
+# ── the NPU's locked memory, read from the process that locks it ─────────────────────────────────
+# Two mechanisms set this limit and either can silently override the other: /etc/security/limits.d/*.conf (pam_limits, files
+# applied in LEXICAL order, the last assignment for an item wins) covers anything PAM starts, and
+# /etc/profile.d/90onboard-limits sets it for a console session. A row that reads one of them passes on a machine where the
+# other is overridden - measured 2026-11-08: this fleet's own box carries a hand-written
+# /etc/security/limits.d/99-amdnpu-memlock.conf, and a higher-numbered user file wins over the 90- one our package ships
+# (scripts/mk-kernel-packages.sh), so the value we intend is not necessarily the value in force.
+# So this row reads neither file: it reads the effective soft limit of the process that actually locks command buffers
+# (/proc/<pid>/limits, "Max locked memory") and, when it is not unlimited, names the highest-numbered limits file that sets
+# memlock - the file whose value won, whether or not we shipped it.
+# Pure, so --self-test drives it: <effective soft limit> <process name> [<winning file>]
+memlock_verdict() {
+    _v=${1:-} _p=${2:-} _f=${3:-}
+    if [ -z "$_p" ]; then
+        printf 'SKIP no lemond/1bit process is running, so the locked-memory limit in force cannot be read (this row measures the process that locks, not the files that configure it)'
+        return 0
+    fi
+    case "$_v" in
+        '') printf 'FAIL %s is running but its /proc limits could not be read, so the locked-memory limit in force is unknown' "$_p"; return 0 ;;
+        unlimited) printf 'PASS %s may lock unlimited memory (soft limit read from /proc/.../limits, the value in force, not the value a file asks for)' "$_p"; return 0 ;;
+        *[!0-9]*) printf 'FAIL %s'"'"'s locked-memory soft limit reads %s, which is neither a byte count nor unlimited' "$_p" "$_v"; return 0 ;;
+    esac
+    printf 'FAIL %s'"'"'s locked-memory soft limit is %s bytes, not unlimited, so a large NPU buffer allocation fails with "Lock limit exceeded"%s - that is the limit IN FORCE in the process; the files that ask for one are the highest-numbered limits.d files and /etc/profile.d, and a process can also fail to inherit an unlimited file (measured 2026-11-08: a lemond started outside the appliance'\''s sessions had 8388608 while this box'\''s own 99- file says unlimited)' \
+        "$_p" "$_v" "${_f:+ (highest-numbered memlock file: $_f)}"
+}
+
 payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
     _f=${1:-} _d=${2:-} _sample=${3:-}
     case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
@@ -698,6 +724,12 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"          # nothing to check the claim against
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none '')"           # `none` and nothing on the loader path: consistent
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"        # `none` while the image loads a runtime: false statement
+    check PASS "$(memlock_verdict unlimited lemond)"
+    check FAIL "$(memlock_verdict 65536 lemond /etc/security/limits.d/99-amdnpu-memlock.conf)"   # a user's 99- winning over our 90-
+    check FAIL "$(memlock_verdict 4294967296 1bit)"                                             # finite is not what the driver asks for
+    check SKIP "$(memlock_verdict '' '')"                                                       # nothing running: say so, do not pass
+    check FAIL "$(memlock_verdict '' lemond)"                                                   # running but unreadable: unknown is not a pass
+    check FAIL "$(memlock_verdict 'lots' lemond)"                                               # nonsense is a fail, not a skip
     check PASS "$(payload_modes_verdict 0 0)"
     check FAIL "$(payload_modes_verdict 134 49)"        # c31/c32's real shape: 134 files AND 49 directories
     check FAIL "$(payload_modes_verdict 0 1)"           # the c33 first cut: no files, the payload ROOT writable
@@ -1887,6 +1919,42 @@ else
         esac
     fi
 fi
+
+
+# ── the NPU's locked memory in force (the driver asks for unlimited; this fleet's own 99- file can override ours) ──
+MEMLOCK_PID=${MEMLOCK_PID:-}
+MEMLOCK_NAME=${MEMLOCK_NAME:-}
+if [ -z "$MEMLOCK_PID" ]; then
+    for _n in lemond 1bit; do
+        _p=$(pgrep -x "$_n" 2>/dev/null | head -1)
+        [ -n "$_p" ] && { MEMLOCK_PID=$_p; MEMLOCK_NAME=$_n; break; }
+    done
+fi
+MEMLOCK_LIMITS=${MEMLOCK_LIMITS:-/proc/${MEMLOCK_PID:-0}/limits}
+MLV=
+if [ -n "$MEMLOCK_PID" ] && [ -r "$MEMLOCK_LIMITS" ]; then
+    # the last field is the UNIT ("bytes"), the value is the field before it - $NF here reads "bytes" and looks like a
+    # value that is not a number, which is the same $NF confusion as reading a path off a symlink line
+    MLV=$(awk '/^Max locked memory/ {print $(NF-1)}' "$MEMLOCK_LIMITS" 2>/dev/null | head -1)
+    MLV=${MLV:-}
+fi
+# the file whose value won: the LAST limits.d file in lexical order that mentions memlock at all
+MLF=
+for _c in $(ls "${LIMITS_D:-/etc/security/limits.d}"/*.conf 2>/dev/null | sort); do
+    grep -qs 'memlock' "$_c" && MLF=$_c
+done
+if [ "$MLV" != unlimited ]; then
+    _pf=${PROFILE_D:-/etc/profile.d}/90onboard-limits
+    if [ -f "$_pf" ] && grep -qs 'ulimit -l unlimited' "$_pf"; then
+        MLF="${MLF}${MLF:+, }$_pf (console sessions only)"
+    fi
+fi
+ML=$(memlock_verdict "${MLV:-}" "${MEMLOCK_NAME:-}" "${MLF:-}")
+case "$ML" in
+    PASS*) pass memlock "${ML#PASS }" ;;
+    SKIP*) skip memlock "${ML#SKIP }" ;;
+    *)     fail memlock "${ML#FAIL }" ;;
+esac
 
 say ""
 # The back-off leaves a trace: a run that only passed because the partition freed in time must say so, or the next

@@ -329,6 +329,8 @@ bin=$build/onebit; [ -x "$bin" ] || bin=$build/1bit
 # already probes) carrying the engine, its libraries and every backend beside it, $ORIGIN only, and
 # /bin/1bit a symlink to that image path - never to a build path.
 command -v patchelf >/dev/null || { echo "patchelf is needed to install the engine at \$ORIGIN instead of at its build path: apt install patchelf"; exit 1; }
+# shellcheck source=scripts/pack-elf.sh
+. "$here/../../scripts/pack-elf.sh"   # pack_is_elf, used below and by the Lemonade section
 eng=$root/opt/1bit
 install_origin() {   # install_origin <source elf> <destination dir>: the file, $ORIGIN, and its libs beside
     local src=$1 dir=$2 f missing
@@ -337,6 +339,12 @@ install_origin() {   # install_origin <source elf> <destination dir>: the file, 
     patchelf --set-rpath '$ORIGIN' "$dir/$(basename "$src")"
     ldd "$src" 2>/dev/null | grep -o '/[^ ]*' | while read -r f; do
         [ -e "$dir/$(basename "$f")" ] || cp -L "$f" "$dir/"
+    done
+    # EVERY copy, not just the program: a library from the build tree carries the build tree in its own
+    # RUNPATH, so patching only the program leaves libggml/libhrx/libloomc looking for each other in the
+    # builder's tree at boot. They are all in $dir now, so $ORIGIN is the whole answer for each of them.
+    for f in "$dir"/*; do
+        pack_is_elf "$f" && patchelf --set-rpath '$ORIGIN' "$f"
     done
     missing=$(LD_LIBRARY_PATH=$dir ldd "$dir/$(basename "$src")" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')
     [ -z "${missing// /}" ] || { echo "$(basename "$src") still needs $missing beside it after relocation (engine #1543)"; exit 1; }

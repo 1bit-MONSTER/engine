@@ -228,6 +228,28 @@ if [ "$fam" != coexist ]; then
     fi
 fi
 
+# ---- removing the kernel package again -------------------------------------------------------
+# The kernel rows above install it; nothing removed it, so "and uninstall cleanly" had no evidence for
+# the kernel half. It also has to leave the filesystem as it found it: no /boot entry, no module tree.
+if [ -n "$krel" ] && [ "$fam" != coexist ]; then
+    case $fam in
+        deb)  dpkg -P "linux-image-$krel" "linux-headers-$krel" >/tmp/kr.log 2>&1 ;;
+        rpm)  rpm -e 1bit-kernel-devel 1bit-kernel >/tmp/kr.log 2>&1 ;;
+        arch) pacman -R --noconfirm linux-1bit-headers linux-1bit >/tmp/kr.log 2>&1 ;;
+    esac
+    if [ $? -eq 0 ]; then row PASS "the kernel package removes" "rc=0"
+    else row FAIL "the kernel package removes" "$(tail -2 /tmp/kr.log)"; fi
+    case $fam in
+        deb|rpm) leftover=/boot/vmlinuz-$krel ;;
+        arch)    leftover=/boot/vmlinuz-1bit ;;
+    esac
+    [ -e "$leftover" ] && row FAIL "the kernel image is gone" "$leftover still there" \
+        || row PASS "the kernel image is gone" "$leftover removed"
+    mods_left=$(find /lib/modules/"$krel" /usr/lib/modules/"$krel" -type f 2>/dev/null | wc -l)
+    [ "$mods_left" = 0 ] && row PASS "the module tree is gone" "0 files under modules/$krel" \
+        || row FAIL "the module tree is gone" "$mods_left files left"
+fi
+
 echo
 if [ "$fail" = 0 ]; then echo "== $fam: ALL ROWS PASS"; else echo "== $fam: FAILURES ABOVE"; fi
 exit "$fail"

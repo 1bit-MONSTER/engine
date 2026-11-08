@@ -1437,8 +1437,10 @@ set(_onebit_route_tests
     laya_gguf_route mem_admit_route hrx_cwsr_route hrx_runtime_route hybrid_route
     hybrid_kvshare_route)
 # Tests that only exist for some configurations (a model was passed, a device is built in).
-list(APPEND _onebit_route_tests hybrid_e2e laya_route_e2e laya_models_e2e pm_laya_route serve_e2e_cpu serve_e2e_hrx
-     hrx_cpu_weight_parity)
+# serve_e2e_<dev> left this list with engine #1485: it runs `serve --port 0` now, so it picks nothing and there is no
+# window for the lock to close. hrx_cpu_weight_parity stays - it starts `llama-server` itself, whose port is not ours to
+# choose (that is also why it is not in the `1bit serve` migration).
+list(APPEND _onebit_route_tests hybrid_e2e laya_route_e2e laya_models_e2e pm_laya_route hrx_cpu_weight_parity)
 foreach(_onebit_route_test IN LISTS _onebit_route_tests)
     if(TEST ${_onebit_route_test})
         set_tests_properties(${_onebit_route_test} PROPERTIES RESOURCE_LOCK route_ports)

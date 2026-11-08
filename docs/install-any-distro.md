@@ -272,6 +272,24 @@ dkms packages are the other way round: dkms signs with *your* key (`/var/lib/shi
 Debian/Ubuntu, `/etc/dkms/` elsewhere), so a module built on your machine chains to the MOK you
 enrolled for it — on Fedora and Arch, dkms generates that key pair on first use.
 
+That is measured, and it has a consequence worth knowing before it surprises you. Same package, same
+kernel, only the machine differing (`ubuntu:26.04`, headers `7.0.0-43-generic`):
+
+| machine | what dkms did | what the module says |
+|---|---|---|
+| a MOK at `/var/lib/shim-signed/mok/{MOK.priv,MOK.der}` | `scripts/sign-file`, sha512 | `signer: <that certificate's CN>`, a `sig_key` fingerprint |
+| no MOK on the machine | `Binary update-secureboot-policy not found, modules won't be signed` | `signer:` empty, `sig_key:` empty |
+
+So **with Secure Boot on and no MOK of your own, the driver installs, builds, and then will not load** —
+`modprobe` refuses an unsigned module, and nothing in the package can help, because a key it shipped
+would not be trusted. Create and enrol a key first: `sudo update-secureboot-policy --new-key` writes
+`/var/lib/shim-signed/mok/{MOK.priv,MOK.der}` — the pair the table above signs with — then
+`sudo update-secureboot-policy --enroll-key` (or `sudo mokutil --import /var/lib/shim-signed/mok/MOK.der`)
+queues it, and you confirm it in MokManager on the next boot. Then `sudo dkms autoinstall` rebuilds and
+re-signs. On a distribution without `update-secureboot-policy`, generate a pair with
+`openssl req -new -x509 …` and enrol it with `mokutil --import`. With Secure Boot off, the unsigned module
+loads and none of this matters.
+
 Verify (no model needed):
 
 ```bash
@@ -418,4 +436,5 @@ registry model, since this Lemonade version has no local-file registration):
 | the distribution-kernel path, on its own | clean `ubuntu:26.04` container, packages built with `--skip-kernel`, `scripts/pkg-proof.sh deb` | 22 rows PASS and one `INFO no kernel packages in this dir` (the kernel rows skip themselves instead of failing): install, config, memlock reaching a login session, dkms building both modules against `7.0.0-43-generic`, `amdxdna` resolving to `updates/dkms`, uninstall, and the distribution's in-tree `amdxdna` back in place. This is the path a user on their own kernel takes |
 | the engine package and this set install on the same machine | clean `ubuntu:26.04` container, `scripts/pkg-proof.sh coexist`, engine `1bit-engine_2026.11.02-1_amd64.deb` | all 26 rows PASS: the engine installs alone, this set installs **over it** with `dpkg` reporting no file conflict, `/usr/share/1bit` holds both (`lemonade-config-fragment.json` from the engine, `mok/MOK-Kernel.der` from `1bit-npu-config`) with each file attributed to its own package, the engine still runs (`1bit 0.0.1`), both dkms modules build, purging this set leaves the engine's files intact, and the engine purges last. Neither `scripts/pack-proof.sh` (the engine) nor the rows above (this set) install both, so this is the combination nobody had tried |
 | the same `.rpm` installs on openSUSE Tumbleweed | clean `opensuse/tumbleweed` container, `scripts/pkg-proof.sh rpm` | **all 29 rows PASS**, `rc=0` — the same file Fedora takes, installed by `rpm`/zypper with no per-distro package: dkms builds both modules against `7.3.1-1-default`, `amdxdna` resolves to the dkms build ahead of the in-tree one, the kernel rpm installs and removes cleanly, the distribution's own module is restored. Two container facts, not package facts: openSUSE keeps headers in `/usr/src/linux-<ver>-obj/<flavour>` (so the harness finds the version through `/lib/modules/<ver>/build/Makefile`, never a vendor path), and the container needs `kernel-default` + `udev` for the in-tree-module and `udevadm` rows to have anything to look at |
+| the dkms package signs with the machine's own MOK, and what happens without one | clean `ubuntu:26.04` container, headers `7.0.0-43-generic`, `amdxdna-1bit-dkms` 0.18.0-1, paired with and without a MOK at `/var/lib/shim-signed/mok` | with one: `scripts/sign-file`, sha512, `modinfo -F signer` = that certificate's CN and a `sig_key`; without: `modules won't be signed`, `signer` and `sig_key` empty. So the package chains to the user's key — and on a Secure Boot machine with no MOK of its own the module installs, builds, and refuses to load |
 | the shipped driver answers a known answer on the NPU | this box, `npu-hold`, `1bit serve --device npu` on Qwen3-0.6B, `/v1/completions` greedy, twice | load 2.2 s, `The capital of France is` → **` Paris. The capital of Italy is Rome. The capital of Spain is Madrid.`** identically on both runs (56.9 and 50.7 tok/s), 0 `amdxdna` lines in the two windows, and the loaded module is `srcversion EE1F36A2B9BA294CE11AD80` — the build this package's source produces. No install, no `modprobe`, no udev reload |

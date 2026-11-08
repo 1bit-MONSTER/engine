@@ -86,6 +86,11 @@ grep -q "removing stale toolchain" "$root/scripts/fetch-rocm-sdk.sh" && ok "the 
 # environment and takes the compiler from /opt (the gap pi-prs found in review)
 grep -q "GGML_HRX_HIP_FLAGS" "$root/cmake/hrx.cmake" && ok "the HIP kernel flags are passed (GGML_HRX_HIP_FLAGS)" ||
     bad "cmake/hrx.cmake does not pass GGML_HRX_HIP_FLAGS: the HIP kernel compile needs the device library in the environment"
+# the device library must not reach the host C/C++ flags: the hrx-system deps build compiles with -Werror,
+# and on a host object clang rejects the flag as unused, so every cold HRX build failed on it
+grep -Eq 'APPEND ONEBIT_HRX_EXTRA_FLAGS[^)]*rocm-device-lib-path' "$root/cmake/hrx.cmake" &&
+    bad "cmake/hrx.cmake puts --rocm-device-lib-path into the host C/C++ flags (-Werror fails host objects on it)" ||
+    ok "the device library goes to the HIP kernel compile only, not the host C/C++ flags"
 grep -q "GGML_HRX_HIP_COMPILER" "$root/cmake/hrx.cmake" && ok "the HIP kernel compiler comes from the toolchain" ||
     bad "cmake/hrx.cmake does not set GGML_HRX_HIP_COMPILER: ggml-hrx-hip.cmake would find /opt/rocm-therock first"
 grep -q "config/hrx-toolchain.config" "$root/cmake/hrx.cmake" "$root/scripts/fetch-rocm-sdk.sh" "$root/scripts/weekly.sh" &&

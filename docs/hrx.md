@@ -1044,7 +1044,9 @@ cmake --build build --target onebit
   a fresh box needs only this repository. `-DONEBIT_HRX_TOOLCHAIN` / `ROCM_PATH` still override it,
   and an existing `/opt/rocm-therock` is used when the tree copy is absent. The device library
   (the `amdgcn` bitcode) is read from the toolchain itself, so no `HIP_DEVICE_LIB_PATH`,
-  `ROCM_PATH` or `HIP_PATH` is needed in the environment.
+  `ROCM_PATH` or `HIP_PATH` is needed in the environment. It is passed to the HIP kernel compile only
+  (`GGML_HRX_HIP_FLAGS`), not to the host C/C++ flags: the hrx-system build uses `-Werror`, and
+  clang rejects the flag as unused on a host object.
 
 - **One external project.** llama.cpp's ggml-hrx builds hrx-system itself
   (`HRX_SOURCE_DIR`) with TheRock's `amdclang`.

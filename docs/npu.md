@@ -486,6 +486,52 @@ carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's ow
 a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
 `plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
 
+#### The t2s family is M=16 today, and that is what caps prefill (#1416)
+
+Measured, not inferred: a t2s container's kernel set contains **only `*_t2s2_m16.elf`** for 8 of the nine decode roles, and the engine reports the
+same at load — `decode family: 8 role(s) at M=16, 1 on M=128`. The M=128 names in the same directory (`full_i8_G_K5120_N17408.elf`, `…O…`, `…D…`,
+`…QKV…`, `…Z…`, `…U…`) are the **int8/pb16i** family: they read pb16i images, not 2-bit streams, so they cannot serve a t2s container's prefill
+however many rows they accept.
+
+Consequences a reader will otherwise trip over:
+
+- `max_rows()` returns **16** for a t2s/pb16i container (`npu/target/xdna/xdna_target.cpp`, `c.max_rows = m16_ ? M_DECODE : M_PREFILL`), and that
+  value is the **chunk width** the blocked walk in `npu_gemm_rows()` uses. So a prompt is walked in 16-row chunks: measured on a 393-token prompt,
+  **24 chunks of 16 + one of 9 = 25 chunks × 64 layers = 1600 launches**, against the 4 × 64 = 256 the M=128 design intends.
+- nothing is corrupt by that: `ctx_for()` routes a ≤16-row chunk to the decode twin whose activation BO is 16 rows, and a launch wider than its BO is
+  **refused by name** (`quantize_async_rows: am=128 exceeds bA capacity MD=16`) rather than poisoning memory — the engine#1372 guard.
+- the cost does *not* grow with the stream: at M=16 the weight cache holds — `[wm]` prints **nothing**, where a miss would print
+  `[wm] n=20 cache-miss repacks, avg packB_into=29.224 ms` — whereas the M=128 **pb16i** geometry does pay that **≈30 ms `packB_into` per miss**
+  (measured 29.2-30.5 ms over 140 misses). The negative and its falsifier are the same line. Two container formats with different kernel families therefore have different
+  prefill cost structures, and numbers from one do not explain the other.
+
+An **M≥256 t2s family** is what removes the 8x launch overhead; it is private-repo kernel work (`npu-kernels`) with the same byte-exact gate the M=16
+family passes, and the acceptance row is: both Llama3-8B prefill shapes (`K=4096 N=14336`, `K=14336 N=4096`) at M = 256 / 1024 / 16384, ≥ 4 TFLOP/s,
+byte-exact logits against the current path on a fixed prompt set, `amdxdna` counter 0.
+
+#### Per-tile arithmetic ceiling, and where our GEMMs sit against it (AM027)
+
+AM027 (*Versal Adaptive SoC AIE-ML v2 Architecture Manual*, v1.1) **Appendix A, Table 14** gives 512 INT8×INT8 multipliers per compute tile and 256
+bf16/fp16; **Chapter 1, Table 1** gives the 1 GHz array clock. Per tile that is **1.024 TOPS int8** and **0.512 TOPS bf16**, so an N-tile launch has
+ceiling `N × 1.024`. Strix Halo's NPU is aie2p rather than AIE-ML v2, so these are *architecture* figures used as a scale, while the tile count that
+actually applied comes from this box's driver and from the measurement itself.
+
+| measurement | GEMM datatype | tiles | ceiling at **that** datatype | measured | % of that ceiling |
+|---|---|---:|---:|---:|---:|
+| gate, M=16, K=5120 N=17408 (2.852 GFLOP in 0.589 ms) | int8 | 8 | 8.19 TOPS | 4.84 TOPS | **59 %** |
+| prefill, M=128, 18.64 tok/s | bf16 | 32 | 16.4 TOPS | 1.01 TFLOPS | **6.1 %** |
+| published W4A16 reference, 8.06 TFLOP/s | int8 | 8 | 8.19 TOPS | 8.06 TFLOPS | **98 %** — i.e. an int8-MAC-bound result |
+
+The ceiling column is *per datatype* — 1.024 TOPS/tile for int8 and 0.512 for bf16 — so the rows are not comparable to each other by tile count; each % is
+against its own datatype's ceiling.
+
+Two readings that follow, and that a whole-array denominator would hide: our **decode** GEMM is at **59 %** of the tiles it occupies, so the remaining
+headroom there is the stream (40.2 GB/s measured) and not the MACs; our **prefill** is at **6.1 %**, which is the launch geometry above, not arithmetic.
+And the reference result being ~98 % of an 8-tile int8 ceiling is why 4-bit designs on this architecture are int8 MACs with an on-core expansion:
+Table 14 lists **no INT4 multiplier** row, and the array's 4-bit mode — *"Vector unit supporting MAC operations for multiple precisions (for example,
+512x 8-bit × 8-bit and 512x 4-bit × 4-bit)"*, Chapter 4's Vector Multiplication Unit — runs at the **same 512-per-tile rate as int8**. So a narrower
+integer datapath exists; what does not exist is a narrower one that multiplies *faster*, which is the fact that decides the design.
+
 #### What the stream is worth at the model level (measured)
 
 The phase numbers above are the kernel's. The number a user feels is a decode step, and it is the one that

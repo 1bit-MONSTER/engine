@@ -23,8 +23,9 @@
 #   build    main at the merged pins, with every backend this machine builds
 #   test     ctest, including the serve end-to-end tests on a small GGUF
 #   package  the engine, folded into the Lemonade + onebit package, and 1bit OS
-#   release  what moved upstream since the last release (tools/weekly_changes.py), published
-#            as the GitHub release v<ISO year>.<ISO week> with the packages
+#   release  what moved upstream since the last release (tools/weekly_changes.py); WEEKLY_PUBLISH=1 publishes it
+#            as the GitHub release v<ISO year>.<ISO week> with the packages, and without that variable it does
+#            the notes and checksums and then refuses to publish
 # No stage: all of them, in that order. WEEKLY_DRY_RUN=1 merges and publishes nothing.
 # WEEKLY_REF (default main) is what build checks out; bumps always works on main.
 # WEEKLY_JOBS (default 4, what ~/lb/thermal-run.sh allows on Strix Halo) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
@@ -639,6 +640,14 @@ stage_release() {
     # the checksums cover changes.json too (package wrote them before it existed)
     (cd "$OUT" && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS)
     if [ "$DRY" = 1 ]; then say "dry run: not publishing"; return; fi
+    # Publishing is OPT-IN, not the default. A bare `weekly.sh` runs every stage including this one, and DRY defaults to 0, so one
+    # mistyped invocation with no stage - or a stage list that someone extends - was enough to publish a release. Nothing about
+    # typing `release` says "and put it on the internet", so the switch is separate from the dry-run flag and refusing is the
+    # default (owner order 2026-11-08: nothing published). The message names the way forward rather than just failing.
+    if [ "${WEEKLY_PUBLISH:-0}" != 1 ]; then
+        say "release $tag: NOT publishing - notes and SHA256SUMS are in $OUT; set WEEKLY_PUBLISH=1 to publish this tag"
+        return 1
+    fi
     gh release create "$tag" -R "$REPO" --target "$(git -C "$SRC" rev-parse HEAD)" \
         --title "1bit engine $tag" -F "$W/notes.md" "$OUT"/*
     say "released $tag"

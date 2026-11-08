@@ -531,10 +531,14 @@ for is the HSA runtime: `stage_package` resolves the pinned toolchain itself wit
    upgrade (the property `tests/pack_version_test.sh` pins).
 4. **release**: `tools/weekly_changes.py` lists, for every pin that moved since the last release,
    the upstream commits (authors, PRs) and releases in between; that becomes the release notes and
-   `changes.json`, and `gh release create` publishes it all.
+   `changes.json`, and `gh release create` publishes it all — **only with `WEEKLY_PUBLISH=1`**: naming the
+   `release` stage writes the notes and `SHA256SUMS` and then refuses, because a bare `weekly.sh` runs every
+   stage and nothing about typing `release` says "and put it on the internet".
 
 `WEEKLY_DRY_RUN=1` merges and publishes nothing; stages can be run one at a time
-(`scripts/weekly.sh ~/.cache/1bit-weekly build test`).
+(`scripts/weekly.sh ~/.cache/1bit-weekly build test`). Publishing takes both: `WEEKLY_PUBLISH=1`. The two
+switches are separate on purpose — `DRY` defaults to 0, so before this it was the *lack* of a variable that
+published, and the safe habit (name your stages) was the only thing standing between a typo and a release.
 
 Before the first stage runs, `weekly.sh` checks what the machine must have (the 2026-10-19
 rehearsal found these only after the build) and stops with a message naming what is missing:

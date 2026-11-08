@@ -30,6 +30,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, os.pardir, "tools", "copyright.py")
+# Data, not this file's header: NOTICE is the string the cases below assert the tool against, which is why
+# the second Copyright+SPDX pair here is legitimate (engine#1547).
 NOTICE = ("# Copyright 2026 bong-water-water-bong\n"
           "# SPDX-License-Identifier: Apache-2.0\n"
           "#\n"
@@ -104,6 +106,29 @@ with tempfile.TemporaryDirectory() as repo:
         f.write("no notice here\n")
     rc = run(repo, "--check")
     check(rc.returncode == 0, "an ignored file is left out", rc.stdout + rc.stderr)
+
+    # A notice pasted twice in the header. This shape shipped in #1535 and #1544 because has_notice() only
+    # asked whether the notice was PRESENT; #1547 lists the 20 files it left behind.
+    with open(os.path.join(repo, "twice.py"), "w") as f:
+        f.write(NOTICE + "\n# Copyright 2026 bong-water-water-bong\n# SPDX-License-Identifier: Apache-2.0\nprint(2)\n")
+    rc = run(repo, "--check")
+    check(rc.returncode != 0, "a notice duplicated inside the header window FAILS the check",
+          f"rc {rc.returncode}: {rc.stdout.strip()}")
+    check("twice.py" in (rc.stdout + rc.stderr), "and the failure names the file", rc.stdout + rc.stderr)
+
+    # resolve it the way the tool's message says (delete the second copy) so the next case starts clean
+    with open(os.path.join(repo, "twice.py"), "w") as f:
+        f.write(NOTICE + "print(2)\n")
+
+    # ... but a second occurrence that is DATA, further down, is legitimate: a heredoc or template that emits
+    # the notice into a generated file. Three files in the tree are exactly this, and they must stay green.
+    with open(os.path.join(repo, "emits.sh"), "w") as f:
+        f.write(NOTICE + "".join(f"# line {i}\n" for i in range(20))
+                + "cat > out.h <<'EOF'\n# Copyright 2026 bong-water-water-bong\n"
+                  "# SPDX-License-Identifier: Apache-2.0\nEOF\n")
+    rc = run(repo, "--check")
+    check(rc.returncode == 0, "a second occurrence past the window (emitted notice) stays green",
+          rc.stdout + rc.stderr)
 
 print(f"copyright_check_untracked_test: {len(FAIL)} failure(s)")
 sys.exit(1 if FAIL else 0)

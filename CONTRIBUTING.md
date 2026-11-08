@@ -32,10 +32,14 @@ This repository exists to be reviewable. Five rules keep it that way.
    xclbins and the repository vendors none.
    A private add-on (docs/npu.md, "Private routes") builds its kernels from
    source in its own repository.
-5. **Every file carries the copyright and Apache-2.0 notice.** Run
+5. **Every file carries the copyright and Apache-2.0 notice, once.** Run
    `python3 tools/copyright.py --fix` before committing; CI runs `--check`.
    Files that cannot hold a comment (binaries, JSON, test data) are exempt,
-   listed in the tool.
+   listed in the tool. `--check` also fails a notice **duplicated inside the
+   first 20 lines** — the accidental shape that shipped 20 times before
+   engine#1547. A second occurrence further down is data (a heredoc or a
+   template that emits the notice into a generated file) and is left alone;
+   the three such files say so in a comment.
 
 ## RFCs: design before code
 

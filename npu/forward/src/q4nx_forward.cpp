@@ -1011,6 +1011,28 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     fprintf(stderr, "  [forward] derived %d designs (fused_gu=%d, H=%d NH=%d NKV=%d HD=%d IM=%d)\n",
             ndesigns_, dims.fused_gu, dims.H, dims.NH, dims.NKV, dims.HD, dims.IM);
 
+    // The container states which design family it was imported for, and a serve that derives a different one refuses
+    // rather than answering garbage. Two containers with the same hidden size can differ in IM, head count or head dim
+    // (so in every K/N the kernels are looked up by), and pointing one at the other's ELF set used to be a silent
+    // wrong answer. The field is written by `1bit npu-pack import` as "ROLE:KxN,ROLE:KxN,..."; a container without it
+    // (everything imported before this) is unaffected.
+    {
+        const std::string want = read_config_string(cfg_path, "\"q4nx_designs\"", "");
+        if (!want.empty()) {
+            std::string have;
+            for (int i = 0; i < ndesigns_; i++) {
+                have += (have.empty() ? "" : ",") + std::string(role_tag(designs_[i].role)) + ":" +
+                        std::to_string(designs_[i].K) + "x" + std::to_string(designs_[i].N);
+            }
+            if (have != want) {
+                err_ = "this container declares its kernel family as \"" + want + "\", but this model derives \"" +
+                       have + "\": the ELFs it was imported for are not the ones this geometry needs, so it would "
+                       "answer wrong text rather than fail (re-import, or serve the container that matches)";
+                return false;
+            }
+        }
+    }
+
     // pb16i has no kernel for a wide fused full-attention QKV: its q half needs the
     // int64 accumulator, and 14336/32 = 448 int64 columns per core do not fit L1.  The
     // role therefore runs as the two q halves (N = NH*HD each, i.e. q and the output

@@ -250,23 +250,28 @@ trap 'cleanup' EXIT INT TERM
 
 # a release image is what a user actually has: use the frugal set on its own data partition
 if [ ! -d "$src" ]; then
-    srcloop=$(losetup -f --show -r "$src" 2> /dev/null) || die "cannot loop-mount $src"
-    # `sfdisk -d` prints `start=` and the sector number as TWO fields, so stripping the prefix from `$i` leaves nothing
-    # and the offset came back empty - the image form refused every image with "has no 1BIT-DATA partition" while the
-    # partition was right there (measured: the new image-form gate row found it). Read the number, wherever it is.
+    # ONE loop device, taken at the partition's offset, and `sfdisk` reads the FILE directly: the first version attached
+    # the whole image, detached it, and immediately attached it again at an offset - and the second attach raced the
+    # detach, so the mount that followed failed ("cannot mount the data partition in ...", measured in the gate).
+    # `sfdisk -d` needs no loop at all.
+    #
+    # It also prints `start=` and the sector number as TWO fields, so the first version's "strip the prefix from $i and
+    # print it" produced an empty offset and every image was refused as "not a 1bit OS image" while the partition was
+    # right there. Read the number, wherever it is.
     dataoff=$(sfdisk -d "$src" 2> /dev/null | awk '/name="1BIT-DATA"/ {
         for (i = 1; i <= NF; i++) if ($i ~ /^start=/) {
             v = $i; sub(/start=/, "", v); gsub(/,/, "", v)
             if (v == "") { v = $(i + 1); gsub(/,/, "", v) }
             print v + 0; exit } }')
-    [ -n "$dataoff" ] || { losetup -d "$srcloop"; die "$src has no 1BIT-DATA partition (not a 1bit OS image)"; }
-    srcloop=$(losetup -d "$srcloop" > /dev/null 2>&1; losetup -f --show -r -o $((dataoff * 512)) "$src" 2> /dev/null) \
-        || die "cannot loop-mount $src's data partition"
+    [ -n "$dataoff" ] || die "$src has no 1BIT-DATA partition (not a 1bit OS image)"
+    srcloop=$(losetup -f --show -r -o $((dataoff * 512)) "$src" 2> /dev/null) \
+        || die "cannot loop-mount $src's data partition (offset ${dataoff} sectors)"
     srcimg=/tmp/1bit-update/src
     mkdir -p "$srcimg"
-    mount -t ext4 -o ro "$srcloop" "$srcimg" >> "$LOG" 2>&1 || die "cannot mount the data partition in $src"
+    mount -t ext4 -o ro "$srcloop" "$srcimg" >> "$LOG" 2>&1 || {
+        logtail; die "cannot mount the data partition in $src"; }
     src=$srcimg/1bit
-    [ -d "$src" ] || die "$src has no /1bit on its data partition"
+    [ -d "$src" ] || die "$src has no /1bit on its data partition (the data partition mounted, /1bit is not on it)"
 fi
 
 for f in $need; do

@@ -519,6 +519,23 @@ def flm_repo(record, archs):
     }
 
 
+_REVIEWED_CACHE = {}
+
+
+def reviewed_report_classes():
+    """Classes the registry has reviewed and recorded as NOT an alias (`watch: report`).
+
+    The FLM half of the census ignored `registry/significant.json`, so a pack whose family this engine has
+    explicitly declined (`Lfm3ForCausalLM`, `DFlash2DraftModel`) printed `!! NEW FLM ... registry: none` and
+    kept the daily issue open forever, while the same class in the model census printed `. REVIEWED`. Same
+    rule now applies to both halves: a reviewed class is listed, not alerted (engine#1451).
+    """
+    if "v" not in _REVIEWED_CACHE:
+        sig = json.load(open(os.path.join(REG, "significant.json")))["classes"]
+        _REVIEWED_CACHE["v"] = frozenset(c for c, e in sig.items() if e.get("watch") == "report")
+    return _REVIEWED_CACHE["v"]
+
+
 def class_unmapped(repo):
     """True when `registry/architectures.json` does not map the repo's architecture class."""
     return not repo["derivative"] and not repo["mapped"]
@@ -635,8 +652,12 @@ def gib(size):
     return f"{size / float(1024 ** 3):.2f} GiB"
 
 
-def flm_line(repo):
-    """One repo, one line: files, license, base model, architecture, both mapping answers."""
+def flm_line(repo, reviewed=None):
+    """One repo, one line: files, license, base model, architecture, both mapping answers.
+
+    `reviewed` is `reviewed_report_classes()`: a class recorded there as not-an-alias is printed as
+    `. FLM ... registry: none (reviewed, not an alias)` instead of `!! NEW FLM`, so an answered question
+    stops being asked (engine#1451)."""
     parts = []
     size = sum(item["size"] for item in repo["q4nx"])
     if repo["q4nx"]:
@@ -654,10 +675,15 @@ def flm_line(repo):
         parts.append(f"registry {repo['registry_class']} -> {repo['registry_gguf']}")
         parts.append(f"npu route: {repo['npu_model_type']}" if repo["npu"] else "npu route: no")
     else:
-        parts.append("registry: none")
+        seen = (reviewed if reviewed is not None else reviewed_report_classes())
+        parts.append("registry: none (reviewed, not an alias - registry/significant.json)"
+                     if repo["architecture"] in seen else "registry: none")
     if repo["derivative"]:
         parts.append("derivative drop (no config by design)")
-    marker = "!! NPU FLM" if npu_gap(repo) else ("!! NEW FLM" if unmapped(repo) else "+ FLM")
+    seen = (reviewed if reviewed is not None else reviewed_report_classes())
+    decl = class_unmapped(repo) and repo["architecture"] in seen
+    marker = ("!! NPU FLM" if npu_gap(repo)
+              else (". FLM" if decl else ("!! NEW FLM" if unmapped(repo) else "+ FLM")))
     return f"{marker} {repo['id']}  ({repo['lastModified'][:10]})  " + "  ".join(parts)
 
 
@@ -672,7 +698,9 @@ def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
     """Print the FastFlowLM delta and return its exit code (1 on an unserved family)."""
     shown_repos = repos if full else fresh_repos
     shown_releases = releases if full else fresh_releases
-    unmapped_repos = [repo["id"] for repo in shown_repos if class_unmapped(repo)]
+    reviewed = reviewed_report_classes()
+    unmapped_repos = [repo["id"] for repo in shown_repos
+                      if class_unmapped(repo) and repo["architecture"] not in reviewed]
     # Split the two reasons in the summary: "map the class" and "give the NPU route this
     # family" are different pieces of work, and a Q4NX pack named for an HRX-only family
     # is the second one.
@@ -686,7 +714,7 @@ def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
           f"{len(releases)} release(s) checked; {len(fresh_repos)} new/changed repo(s), "
           f"{len(fresh_releases)} new release(s)" + ("; full listing" if full else ""))
     for repo in shown_repos:
-        print("  " + flm_line(repo))
+        print("  " + flm_line(repo, reviewed))
     for release in shown_releases:
         print("  " + release_line(release))
     if not shown_repos and not shown_releases:

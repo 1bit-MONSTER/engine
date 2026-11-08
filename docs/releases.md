@@ -65,8 +65,8 @@ release in the same week gets `.1`.
 >   the death was green — chat 94.26 tok/s on the NPU, the 400/600/1000 ladder answered, `TDRs 0 → 0 → 0 → 0` on
 >   the follow-up — and the five `u9-*` SKIPs were the checker's own log-path bug, fixed the same night.
 > - **c28** (`rc-2026-11-05-c28`) is c27's bytes with that one fix, and **c29** composes c28 with the console and
->   installer fixes. **c28 booted the board on 2026-11-05 at 19:42**: `puppy-check` **52 rows: 49 PASS, 3 FAIL,
->   2 SKIP**, boot to Lemonade serving in **50 s**, NPU 94.9–98.0 tok/s, HRX 85.4–87.1 tok/s. None of the three reds
+>   installer fixes. **c28 booted the board on 2026-11-05 at 19:42**: `puppy-check` **52 rows: 47 PASS, 3 FAIL,
+>   2 SKIP**, boot to Lemonade serving in **51.5 s**, NPU 94.9–98.0 tok/s, HRX 85.4–87.1 tok/s. None of the three reds
 >   is the `PPID=$!` death: one is the appliance's release check reporting a non-streamed NPU chat that got no HTTP
 >   status at all, the second is that check's own follow-up run wedged on the same request (`code 102`, one TDR), and
 >   the third is `u9-degraded` firing for the first time, on a failed backend load. **c29** was written to a stick and
@@ -75,7 +75,7 @@ release in the same week gets `.1`.
 >   then the install test, then publish.
 >
 > The newest full row set *measured on the board* is c28's 52 rows above (2026-11-05 19:42); before it, c27's 51, and
-> before that cycle 24's `puppy-check` **42 rows: 40 PASS, 1 FAIL — the checker's own `u7-mdns` row — 2 SKIP**.
+> before that cycle 24's `puppy-check` **42 rows, 1 FAIL — the checker's own `u7-mdns` row — and 2 SKIP**.
 
 **Not published.** Candidate **c19** (`rc-2026-11-01a`, engine `bcb28cc8f573`) passed every software gate below and
 was written to a 64 GB stick — and that is where it stopped: it was **never booted on hardware and never installed on

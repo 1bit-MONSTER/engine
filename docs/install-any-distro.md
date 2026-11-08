@@ -199,7 +199,7 @@ that stays on its distribution's kernel only needs the second and third:
 | package | what it is | needed for |
 |---|---|---|
 | `linux-image-<rel>` / `linux-headers-<rel>` (deb), `1bit-kernel` + `1bit-kernel-devel` (rpm), `linux-1bit` + `linux-1bit-headers` (Arch) | the kernel 1bit OS boots: Linux 7.4-rc1 with this fleet's config, signed with the 1bit MOK | only if you want OUR kernel; the drivers build against yours as well |
-| `amdxdna-1bit-dkms` | `amd/xdna-driver` at `526c6081` plus the engine's patch series (`third_party/patches/amdxdna/0001-0005`), as DKMS source | the NPU. Any 6.10+ kernel, signed with **your** MOK |
+| `amdxdna-1bit-dkms` | `amd/xdna-driver` at `526c6081` plus the engine's patch series (`third_party/patches/amdxdna/0001-0005`), as DKMS source | the NPU. **6.10+ kernels only** (measured, not inherited — see below), signed with **your** MOK |
 | `ec-su-axb35-dkms` | the AXB35-02 board's embedded-controller driver (fans, EC temperature, power mode), GPL-2.0, upstream `cmetz/ec-su_axb35-linux` at `f62c2c22`, plus a DMI gate so it attaches only on an AXB35 | the fans on a Bosgame AXB35; inert on any other board |
 | `1bit-npu-config` | `limits.d/99-amdnpu-memlock.conf` (unlimited memlock), `udev/rules.d/90-1bit-npu-power.rules` (NPU keep-awake), `modules-load.d/ec_su_axb35.conf`, and the public MOK certificate at `/usr/share/1bit/mok/MOK-Kernel.der` | the NPU runtime's locked command buffers, and engine#1051's suspend/resume hang |
 
@@ -227,6 +227,22 @@ sudo mkinitcpio -P                                                  # if you ins
 Every one of them needs the kernel's own module tree next to the headers (`linux-modules-<ver>` on
 Ubuntu, `kernel-core` on Fedora, `linux` on Arch) — dkms looks for
 `/lib/modules/<ver>/build`, which those packages provide and a headers-only container does not.
+
+**Why 6.10, measured.** The package declares `BUILD_EXCLUSIVE_KERNEL_MIN=6.10` (AMD's own floor, which
+the engine inherits rather than invents), and that is not caution: the driver's trace-event header calls
+the one-argument form of `__assign_str()`, which the kernel gained in 6.10 — before that the macro takes
+two arguments. On **Ubuntu 24.04 GA (6.8.0-149-generic)**:
+
+    $ dkms build -m amdxdna-1bit -v 0.18.0 -k 6.8.0-149-generic
+    Error! … includes a BUILD_EXCLUSIVE directive which does not match this kernel/arch/config.
+    This indicates that it should not be built.                                    (rc=77)
+
+and with the floor bypassed the compiler stops at
+`include/trace/events/amdxdna.h:32: error: macro "__assign_str" requires 2 arguments, but only 1 given`.
+So on 24.04 the package refuses cleanly instead of leaving you a failed build to debug. The options
+there are the distro kernel's own in-tree `amdxdna` (the warning above explains why ours exists) or a
+6.10+ kernel. `ec-su-axb35-dkms` has no such floor in practice: it builds and installs on the same 6.8
+headers (measured, `ec_su_axb35.ko` 380 440 B), consistent with its declared 6.1.
 
 **Secure Boot.** Our kernel and its modules are signed with the `1bit-MONSTER` kernel key, which no
 machine has enrolled. Enrol the public half once, from the config package:
@@ -362,4 +378,5 @@ registry model, since this Lemonade version has no local-file registration):
 | the same on Arch | clean `archlinux:latest` container, `scripts/pkg-proof.sh arch` | all 22 rows PASS: the pacman dkms hook builds both modules at install time, `linux-1bit` + `linux-1bit-headers` install with the build tree at `/usr/lib/modules/7.4.0-rc1-1bit/build` and `/etc/mkinitcpio.d/1bit.preset` |
 | the dkms source reproduces the driver this box runs | `scripts/mk-kernel-packages.sh` payload built in a container against `7.0.0-43-generic` | `srcversion EE1F36A2B9BA294CE11AD80`, the srcversion of the `amdxdna.ko` installed at `/lib/modules/7.4.0-rc1-1bit/updates/` — the package's source *is* the fleet's series |
 | the kernel the packages ship is the kernel this box runs | `linux-image-7.4.0-rc1-1bit_7.4.0~rc1-1_amd64.deb` payload vs `/boot/vmlinuz-7.4.0-rc1-1bit` | `sha256 6f3c6764…` in both, and `sbverify --cert MOK-Kernel.der` reports `Signature verification OK` |
+| the amdxdna floor is really 6.10 | clean `ubuntu:24.04` container, headers `6.8.0-149-generic`, this page's packages | `dkms build` refuses with the declared exclusive rule (`rc=77`, "should not be built"), and with the floor bypassed the driver does not compile: `amdxdna.h:32: macro "__assign_str" requires 2 arguments, but only 1 given` — the 6.10 trace-event API. `ec-su-axb35-dkms` builds on the same headers (`380 440 B`), so only the NPU driver has the floor |
 | the shipped driver answers a known answer on the NPU | this box, `npu-hold`, `1bit serve --device npu` on Qwen3-0.6B, `/v1/completions` greedy, twice | load 2.2 s, `The capital of France is` → **` Paris. The capital of Italy is Rome. The capital of Spain is Madrid.`** identically on both runs (56.9 and 50.7 tok/s), 0 `amdxdna` lines in the two windows, and the loaded module is `srcversion EE1F36A2B9BA294CE11AD80` — the build this package's source produces. No install, no `modprobe`, no udev reload |

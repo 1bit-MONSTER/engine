@@ -125,7 +125,12 @@ depmod -a "$kv" 2>/dev/null || :
 # are asserted here rather than assumed.
 if [ "$fam" != coexist ]; then
     hand=/etc/security/limits.d/99-amdnpu-memlock.conf
+    # Arch has no /etc/security/limits.d until some package creates it, so the directory has to be made
+    # first — without this the write silently failed there and the two rows below measured nothing
+    # ("hand-written file survives our removal: deleted" was true of a file that never existed).
+    mkdir -p "$(dirname "$hand")"
     printf '*    soft    memlock    65536\n*    hard    memlock    65536\n# hand-written before this package\n' > "$hand"
+    [ -s "$hand" ] || { row FAIL "a hand-written limits file does not block the install" "could not write $hand"; fail=1; }
     case $fam in
         deb)  dpkg -i "$pkgdir"/1bit-npu-config_*.deb >/tmp/re.log 2>&1 ;;
         rpm)  rpm -i --nosignature "$pkgdir"/1bit-npu-config-[0-9]*.rpm >/tmp/re.log 2>&1 ;;

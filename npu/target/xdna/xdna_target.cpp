@@ -920,14 +920,28 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             PackedWeight pw;
             pw.bo = kctx.make_weight_bo(*dev_);
             float sout = 1.0f;
+            const auto w0 = std::chrono::steady_clock::now();       // engine#1416: the 22 ms candidate
             kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            const auto w1 = std::chrono::steady_clock::now();
+            wmiss_n_++;
+            wmiss_ms_ += std::chrono::duration<double, std::milli>(w1 - w0).count();
+            if (std::getenv("NPU_PACK_SPLIT") && wmiss_n_ % 20 == 0)
+                fprintf(stderr, "[wm] n=%ld cache-miss repacks, avg packB_into=%.3f ms\n",
+                        wmiss_n_, wmiss_ms_ / wmiss_n_);
             it = m.emplace(wkey, std::move(pw)).first;
         }
         slot = &it->second;
         gs = &slot->scales;
     } else {
         float sout = 1.0f;
+        const auto w0 = std::chrono::steady_clock::now();           // engine#1416: uncached branch
         kctx.packB(0, Bmat, K, N, sout);
+        const auto w1 = std::chrono::steady_clock::now();
+        wunc_n_++;
+        wunc_ms_ += std::chrono::duration<double, std::milli>(w1 - w0).count();
+        if (std::getenv("NPU_PACK_SPLIT") && wunc_n_ % 20 == 0)
+            fprintf(stderr, "[wm] n=%ld uncached packs, avg packB=%.3f ms\n",
+                    wunc_n_, wunc_ms_ / wunc_n_);
         gs = &kctx.group_scales[0];
     }
     const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

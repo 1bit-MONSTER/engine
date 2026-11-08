@@ -214,6 +214,9 @@ private:
     std::unordered_map<int, std::vector<float>> had_signs_;   // input width -> signs
     int64_t m16_worst_ = 0;
     long    m16_bad_ = 0, m16_checked_ = 0;
+    // engine#1416 [wm]: weight-side cost in the same tp->tl window as the activation pack
+    long    wmiss_n_ = 0, wunc_n_ = 0;
+    double  wmiss_ms_ = 0, wunc_ms_ = 0;
     std::vector<int32_t> m16_ref_;
     bool   prof_ = false;
     ProfAcc prof_dec_[Q4NX_MAX_DESIGNS], prof_pre_[Q4NX_MAX_DESIGNS];

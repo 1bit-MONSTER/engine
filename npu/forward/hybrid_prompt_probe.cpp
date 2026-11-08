@@ -82,7 +82,8 @@ int main(int argc, char** argv) {
         std::ifstream m(dir + "/meta.txt");
         if (m) m >> meta[0] >> meta[1];   // image_lo image_hi (one line each is fine)
     }
-    if (meta[0] < 0 || meta[1] <= meta[0]) { std::fprintf(stderr, "bad meta (image_lo image_hi)\n"); return 2; }
+    // image_lo == image_hi is the text-only control: no image rows, nothing to inject.
+    if (meta[0] < 0 || meta[1] < meta[0]) { std::fprintf(stderr, "bad meta (image_lo image_hi)\n"); return 2; }
     const int rows = (int)ids.size();
     std::vector<float> one;
     f.embed_row(11, one);
@@ -113,10 +114,13 @@ int main(int argc, char** argv) {
     }
     Q4nxNpuForward::HybridInputs in;
     in.position_ids = &positions;
-    in.deepstack = n_ds > 0 ? deepstack.data() : nullptr;
-    in.deepstack_sets = n_ds;
-    in.image_lo = meta[0];
-    in.image_hi = meta[1];
+    // A text-only prompt (the control) has no image rows, so there is no span to add deepstack sets at.
+    if (n_ds > 0 && rows_img > 0) {
+        in.deepstack = deepstack.data();
+        in.deepstack_sets = n_ds;
+        in.image_lo = meta[0];
+        in.image_hi = meta[1];
+    }
 
     std::vector<float> logits;
     f.reset();

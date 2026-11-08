@@ -61,6 +61,11 @@ if(Python3_Interpreter_FOUND)
   if(_onebit_onnx_missing EQUAL 0)
     add_test(NAME ort_run_generic
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/ort_run_generic.sh $<TARGET_FILE:ort_run> ${Python3_EXECUTABLE})
+    # What the runtime does with `ConvInteger` by type combination (engine#1436): `uint8 x uint8` is the
+    # workaround for the public int8 exports and is asserted; the two unsupported combinations are
+    # reported, so a runtime that gains them makes this test say so instead of going red.
+    add_test(NAME onnx_conv_integer_types
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/onnx_conv_integer_types_test.py $<TARGET_FILE:ort_run>)
   else()
     message(STATUS "ort_run_generic: not registered (python 'onnx' is not installed)")
   endif()

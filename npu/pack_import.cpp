@@ -388,6 +388,12 @@ Planned make(const std::string& name, const std::string& source, const std::stri
 struct Declared {
     int64_t n = 0, k = 0;      // from op attrs, per projection
     int64_t bytes = 0;         // the preformat const tensor's size
+    // MatMulNBits' block size along K, as the compiler declares it per op. Every rai_1.8 pack says 128 and so does
+    // Qwen3-8B rai_1.9, but **SmolLM2-135M rai_1.9 declares 32 on all 151 ops** (measured from cache/*_meta.json,
+    // 2026-11-08) -- and the tile geometry here is written for 128: a group is 2*(K/block)+2 subvolumes, so at block
+    // 32 every offset moves. Reading the declaration is what turns that from a wrong parse into a refusal.
+    int64_t block = 0;
+    int64_t bits = 0;
 };
 using DeclaredMap = std::map<std::string, Declared>;
 
@@ -454,6 +460,8 @@ DeclaredMap read_declared(const std::string& pack_dir) {
                 };
                 dec.n = val("N");
                 dec.k = val("K");
+                dec.block = val("block_size");
+                dec.bits = val("bits");
             }
             const std::string proj = op_to_projection(op["name"].get<std::string>());
             if (op.contains("const_args") && d.contains("tensor_map")) {
@@ -1265,6 +1273,32 @@ Plan plan(const std::string& pack_dir) {
                           {"mlp.up_proj", d.intermediate, d.hidden},
                           {"mlp.down_proj", d.hidden, d.intermediate}};
     const DeclaredMap declared = read_declared(pack_dir);
+    // Block size gate (engine#1410 §3 of FACTS-fconst-layout): the compiler states `block_size` per MatMulNBits, and
+    // this importer's tile geometry is the block-128 one -- a group is 2*(K/block)+2 subvolumes, so a block-32 pack
+    // has every offset in a different place. Refusing by number beats parsing it at the 1.8 geometry, which is what
+    // the 1.9 8B case showed (a confident parse of wrong offsets). Bits is checked the same way: every pack measured
+    // is 4-bit, and a wider code changes the byte packing.
+    {
+        std::map<int64_t, int> blocks, bits;
+        for (const auto& [proj, dec] : declared) {
+            if (dec.block) blocks[dec.block]++;
+            if (dec.bits) bits[dec.bits]++;
+        }
+        if (!blocks.empty() && !(blocks.size() == 1 && blocks.begin()->first == kKBlock))
+            throw std::runtime_error(
+                "this pack's MatMulNBits block size along K is " + [&] {
+                    std::string t;
+                    for (const auto& [b, n] : blocks)
+                        t += (t.empty() ? "" : ", ") + std::to_string(b) + " (" + std::to_string(n) + " ops)";
+                    return t;
+                }() + ", and this importer decodes the block-" + std::to_string(kKBlock) +
+                " tile layout only: at a different block every subvolume offset in the .fconst moves, so the "
+                "weights would be read from the wrong place, not merely mis-scaled");
+        if (!bits.empty() && !(bits.size() == 1 && bits.begin()->first == 4))
+            throw std::runtime_error("this pack's MatMulNBits bits is not 4 (declared: " +
+                                     std::to_string(bits.begin()->first) +
+                                     "), and the 4-bit two-codes-per-byte packing is what this importer decodes");
+    }
     for (int L = 0; L < d.layers; ++L)
         for (const auto& pr : projs) {
             const std::string name = "model.layers." + std::to_string(L) + "." + pr.suffix + ".weight";

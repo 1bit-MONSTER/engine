@@ -100,10 +100,15 @@ values. So a loss measured one pin ago is not a lower or upper bound on today's 
 The practical rule is the same one: re-measure the row, do not interpolate between rows.
 
 That third row is the most measured of the three: reference pair (`a5271d9`) and this pin alternating, **two runs
-each inside one GPU ticket**, four identical fingerprints — base 2.265140, zero 2.272791, drop 2.265140, ±ε
-2.086712/2.256433, ×10 13.670712/13.830040, and Vulkan 2.219879 on both pairs. Two runs per pair is what separates
-"the numbers are deterministic and this pin equals that one" from "the numbers looked like this once". A single run
-that differs is worth nothing until it repeats.
+each inside one GPU ticket**, and all six numbers equal in all four runs — so the identity is measured, not inferred:
+
+| | base | zero-adapter | after drop | ±ε probe | ×10 probe | Vulkan base |
+|---|---|---|---|---|---|---|
+| `a5271d9`, reference pair (runs 1, 2) | 2.265140 | 2.272791 | 2.265140 | 2.086712 / 2.256433 | 13.670712 / 13.830040 | 2.219879 |
+| `ed43da0b4`, this row (runs 1, 2) | 2.265140 | 2.272791 | 2.265140 | 2.086712 / 2.256433 | 13.670712 / 13.830040 | 2.219879 |
+
+Two runs per pair is what separates "the numbers are deterministic and this pin equals that one" from "the numbers
+looked like this once". A single run that differs is worth nothing until it repeats.
 
 ## Trap 2: the adapter's tensors are the model's buffer type, so "repack to CPU" is not what happens
 

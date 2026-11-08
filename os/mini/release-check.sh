@@ -607,11 +607,19 @@ payload_identity_verdict() {   # <payload_lemond claimed> <what the launcher rep
         printf 'FAIL the payload'"'"'s launcher reported no version, so the identity'"'"'s claim (%s) cannot be checked against it' "$_pc"
         return 0
     fi
-    if [ "$_pc" = "$_pa" ]; then
-        printf 'PASS the payload on this machine is the one the identity names: its own launcher reports %s, and the identity claims the same' "$_pa"
+    # COMPARE THE PIN, NOT THE WHOLE STRING. `lemond --version` is `2026.47.0~1.52a2a6b3`, and the `~N` is the commit count of
+    # the CHECKOUT IT WAS BUILT IN (docs/releases.md: a depth-1 clone reports ~1, a full clone ~1752 for the same commit; c18
+    # printed ~5). So the whole string is not a fact about the payload: an image built from a depth-1 clone and a machine payload
+    # built from a full clone carry the same code and print different strings, and comparing them would red on a CORRECT pair.
+    # What is a fact about the payload is the week pin and the trailing sha - `2026.47.0` and `52a2a6b3` - so the count is dropped
+    # on both sides before comparing, and the verdict says so.
+    _pc_pin=$(printf '%s' "$_pc" | sed 's/~[0-9]*\././')
+    _pa_pin=$(printf '%s' "$_pa" | sed 's/~[0-9]*\././')
+    if [ -n "$_pc_pin" ] && [ "$_pc_pin" = "$_pa_pin" ]; then
+        printf 'PASS the identity claims payload_lemond=%s and the payload'"'"'s own launcher reports the same pin (%s, clone count ignored: the ~N is commits in the checkout that built it)' "$_pc" "$_pa_pin"
     else
-        printf 'FAIL the identity claims payload_lemond=%s but the payload here reports %s - the name is stale or the payload is not the one that was packed (engine#1557)' \
-            "$_pc" "$_pa"
+        printf 'FAIL the identity claims payload_lemond=%s (pin %s) but the payload here reports %s (pin %s) - the name is stale, or the payload is not the one that was packed (engine#1557)' \
+            "$_pc" "${_pc_pin:-?}" "$_pa" "${_pa_pin:-?}"
     fi
 }
 
@@ -801,6 +809,11 @@ if [ "${1:-}" = --self-test ]; then
     check /y/1bit/1bit "$(PAYLOAD_DIR=/y identity_launcher_path aa '')"                    # PAYLOAD_DIR is honoured
     if [ -z "$(identity_launcher_path '' bbbb)" ]; then printf 'ok   no claim yields no path (the row SKIPs)\n'
     else printf 'FAIL no claim should yield no path\n'; rc=1; fi
+    check PASS "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 2026.47.0~1.52a2a6b3)"
+    check PASS "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 2026.47.0~1752.52a2a6b3)"   # the clone-count case: must NOT red
+    check FAIL "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 2026.47.0~1.abcdef01)"      # a different sha IS a different pin
+    check SKIP "$(payload_identity_verdict '' 2026.47.0~1.52a2a6b3)"
+    check FAIL "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 '')"
     check PASS "$(memlock_verdict unlimited lemond)"
     check FAIL "$(memlock_verdict 65536 lemond /etc/security/limits.d/99-amdnpu-memlock.conf)"   # a user's 99- winning over our 90-
     check FAIL "$(memlock_verdict 4294967296 1bit)"                                             # finite is not what the driver asks for

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# pkg-proof.sh <deb|rpm|arch> <package-dir>
+# pkg-proof.sh <deb|rpm|arch|coexist> <package-dir>
 #
 # The proof for one package family (engine#1280 item 7), run INSIDE a clean container of that
 # family. It installs the three 1bit packages, builds both DKMS modules against the CONTAINER's own
@@ -44,6 +44,20 @@
 #
 # docs/install-any-distro.md carries the same three lines with the version and the measured output.
 #
+# `coexist` is not a package format: it installs the engine package (1bit-engine_*.deb, which the
+# release publishes from scripts/pack-distro.sh) NEXT TO this set and checks the two do not fight. The
+# two harnesses that exist each install one set — this one and scripts/pack-proof.sh — so the
+# combination had never been installed anywhere, and the sets do share a path (/usr/share/1bit: the
+# engine's config fragment, our MOK certificate). Rows: the engine installs alone, this set installs
+# over it with dpkg reporting no file conflict, /usr/share/1bit holds both and each file is attributed
+# to its own package, the engine still runs, both dkms modules still build, this set purges while the
+# engine stays installed (its files survive), and the engine purges.
+#
+#   coexist  docker run --rm -v <dir>:/pkg:ro ubuntu:26.04 bash -c \
+#              'apt-get update -qq && apt-get install -y -qq dkms udev kmod linux-headers-generic \
+#                 && apt-get install -y linux-modules-$(ls /lib/modules | sort -V | tail -1) \
+#                 && bash /pkg/pkg-proof.sh coexist /pkg'      # needs 1bit-engine_*.deb in <dir>
+#
 # Two facts about running this in a container, so a failure here is not read as a package defect:
 #   * the container shares the HOST kernel, so `uname -r` is the host's, not the headers it has. Every
 #     dkms call therefore names the kernel explicitly (-k) instead of letting dkms default to uname.
@@ -64,7 +78,7 @@ check() { local what=$1 detail=$2; shift 2; if "$@" >/dev/null 2>&1; then row PA
 
 # the kernel whose headers this container has (never the running kernel's)
 case $fam in
-    deb)  kv=$(ls /lib/modules | sort -V | tail -1) ;;
+    deb|coexist) kv=$(ls /lib/modules | sort -V | tail -1) ;;
     rpm)  kv=$(ls /usr/src/kernels | head -1) ;;
     arch) for d in /usr/lib/modules/*; do case ${d##*/} in 7.4.0-rc1-1bit) continue ;; *) kv=${d##*/}; break ;; esac; done ;;
     *) echo "unknown family: $fam" >&2; exit 2 ;;
@@ -77,6 +91,7 @@ case $fam in
     deb)  have_kernel=$(ls "$pkgdir"/linux-image-*.deb 2>/dev/null | wc -l) ;;
     rpm)  have_kernel=$(ls "$pkgdir"/1bit-kernel-[0-9]*.rpm 2>/dev/null | wc -l) ;;
     arch) have_kernel=$(ls "$pkgdir"/linux-1bit-[0-9]*.pkg.tar.zst 2>/dev/null | wc -l) ;;
+    coexist) have_kernel=0 ;;   # this mode installs the engine package beside this set, never a kernel
     *)    have_kernel=1 ;;
 esac
 if [ "$have_kernel" = 0 ] && [ "$fam" != coexist ]; then
@@ -93,6 +108,12 @@ depmod -a "$kv" 2>/dev/null || :
 
 # ---- install the three packages --------------------------------------------------------------
 case $fam in
+    coexist)
+        eng=$(ls "$pkgdir"/1bit-engine_*.deb | head -1)
+        dpkg -i "$eng" >/tmp/engine.log 2>&1 && row PASS "the engine package installs alone" "$(basename "$eng")" \
+            || row FAIL "the engine package installs alone" "$(tail -2 /tmp/engine.log)"
+        dpkg -i "$pkgdir"/1bit-npu-config_*.deb "$pkgdir"/amdxdna-1bit-dkms_*.deb \
+                "$pkgdir"/ec-su-axb35-dkms_*.deb >/tmp/install.log 2>&1 ;;
     deb)  dpkg -i "$pkgdir"/1bit-npu-config_*.deb "$pkgdir"/amdxdna-1bit-dkms_*.deb \
                   "$pkgdir"/ec-su-axb35-dkms_*.deb >/tmp/install.log 2>&1 ;;
     rpm)  rpm -i --nosignature "$pkgdir"/1bit-npu-config-*.rpm "$pkgdir"/amdxdna-1bit-dkms-*.rpm \
@@ -101,6 +122,20 @@ case $fam in
                   "$pkgdir"/ec-su-axb35-dkms-*.pkg.tar.zst >/tmp/install.log 2>&1 ;;
 esac
 if [ $? -eq 0 ]; then row PASS "install the three 1bit packages" "rc=0"; else row FAIL "install the three 1bit packages" "$(tail -3 /tmp/install.log)"; fi
+if [ "$fam" = coexist ]; then
+    # the one path the two sets share, and who owns each file under it
+    both=$(ls /usr/share/1bit 2>/dev/null | tr '\n' ' ')
+    case $both in *mok*lemonade-config-fragment.json*|*lemonade-config-fragment.json*mok*)
+        row PASS "/usr/share/1bit carries both sets" "$both" ;;
+        *) row FAIL "/usr/share/1bit carries both sets" "${both:-empty}" ;; esac
+    who=$(dpkg -S /usr/share/1bit/mok/MOK-Kernel.der /usr/share/1bit/lemonade-config-fragment.json 2>&1 | tr '\n' ' ')
+    case $who in *1bit-npu-config*1bit-engine*|*1bit-engine*1bit-npu-config*)
+        row PASS "each file belongs to its own package" "$who" ;;
+        *) row FAIL "each file belongs to its own package" "$who" ;; esac
+    if /opt/1bit/engine/1bit --version >/tmp/engv.log 2>&1; then
+        row PASS "the engine still runs with this set installed" "$(cat /tmp/engv.log)"
+    else row FAIL "the engine still runs with this set installed" "$(tail -1 /tmp/engv.log)"; fi
+fi
 
 # ---- 1bit-npu-config ------------------------------------------------------------------------
 check "memlock limits.d" "2 lines, unlimited" \
@@ -195,6 +230,7 @@ fi
 # ---- the kernel package ---------------------------------------------------------------------
 if [ "$have_kernel" = 1 ]; then
 case $fam in
+    coexist) ;;   # this mode is about the engine set, not about the kernel package
     deb)
         dpkg -i "$pkgdir"/linux-image-*.deb "$pkgdir"/linux-headers-*.deb >/tmp/k.log 2>&1 \
             && row PASS "install the kernel debs" "linux-image + linux-headers" \
@@ -222,6 +258,8 @@ case $fam in
         ;;
 esac
 krel=7.4.0-rc1-1bit
+[ "$fam" = coexist ] && krel=          # this mode installed no kernel package; the rows below are the deb/rpm/arch ones
+if [ -n "$krel" ]; then
 mods=$(find /usr/lib/modules/$krel/kernel /lib/modules/$krel/kernel -name '*.ko*' 2>/dev/null | wc -l)
 check "the kernel package carries its modules" "$mods modules" test "$mods" -gt 3000
 build=$(readlink -f /usr/lib/modules/$krel/build /lib/modules/$krel/build 2>/dev/null | head -1)
@@ -235,11 +273,12 @@ if [ -r "$img" ]; then
 else
     row FAIL "vmlinuz in the package" "$img missing"
 fi
+fi          # [ -n "$krel" ]
 fi   # have_kernel
 
 # ---- uninstall ------------------------------------------------------------------------------
 case $fam in
-    deb)  dpkg -P ec-su-axb35-dkms amdxdna-1bit-dkms 1bit-npu-config >/tmp/r.log 2>&1 ;;
+    coexist|deb) dpkg -P ec-su-axb35-dkms amdxdna-1bit-dkms 1bit-npu-config >/tmp/r.log 2>&1 ;;
     rpm)  rpm -e ec-su-axb35-dkms amdxdna-1bit-dkms 1bit-npu-config >/tmp/r.log 2>&1 ;;
     arch) pacman -R --noconfirm ec-su-axb35-dkms amdxdna-1bit-dkms 1bit-npu-config >/tmp/r.log 2>&1 ;;
 esac
@@ -296,6 +335,16 @@ if [ -n "$krel" ] && [ "$fam" != coexist ] && [ "$have_kernel" = 1 ]; then
     mods_left=$(find /lib/modules/"$krel" /usr/lib/modules/"$krel" -type f 2>/dev/null | wc -l)
     [ "$mods_left" = 0 ] && row PASS "the module tree is gone" "0 files under modules/$krel" \
         || row FAIL "the module tree is gone" "$mods_left files left"
+fi
+if [ "$fam" = coexist ]; then
+    # the engine was there first and must be intact after our purge
+    if [ -e /usr/share/1bit/lemonade-config-fragment.json ] && [ ! -e /usr/share/1bit/mok ]; then
+        row PASS "the engine's files survive our purge" "fragment kept, mok/ gone"
+    else
+        row FAIL "the engine's files survive our purge" "$(ls /usr/share/1bit 2>/dev/null | tr '\n' ' ')"
+    fi
+    dpkg -P 1bit-engine >/tmp/re.log 2>&1 && row PASS "the engine purges last" "dpkg rc=0" \
+        || row FAIL "the engine purges last" "$(tail -2 /tmp/re.log)"
 fi
 
 echo

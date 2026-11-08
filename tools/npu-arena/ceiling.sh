@@ -13,8 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
 #
 # ceiling.sh -- phase 1 of the 2026-10-30 14:58 addendum: measure the attainable
 # weight-stream bandwidth for EACH phase's tap/tile geometry with the matrix unit

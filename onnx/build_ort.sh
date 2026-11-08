@@ -13,8 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
 #
 # Build ONNX Runtime from source and install it to a prefix we own, so onnx/ links against our
 # libonnxruntime instead of the distro's. ORT is MIT: patching it and shipping the result closed

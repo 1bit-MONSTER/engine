@@ -447,7 +447,14 @@ int64_t XdnaTarget::m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float* A,
 
 void XdnaTarget::prof_add(ProfAcc* acc, int design, double pack, double quant,
                               double wait, double rb) {
-    if (q4nx_lh::phprof_on() && acc == prof_dec_ && !q4nx_lh::g_in_head) {
+    // Both accumulators feed the step's phase line. `acc == prof_dec_` here was wrong for the batch half:
+    // every launch with M > 1 is accounted to prof_pre_ (see the M == 1 branch at each launch site), so a
+    // batched pass reported n=0 launches and, because the [bs] line derives host as "layer time minus the
+    // device slices", 100 % of a device prefill as HOST work (engine#1582: 219 rows, n=0, host=93113 of
+    // wall=97588, while the very next decode step reported npu_gemm 656 ms on the same target). Measurement
+    // only - g_ph is a per-step snapshot nothing reads back - so this changes what the line *says*, not what
+    // the engine does. A step is either batched or per-token, so counting both cannot double-count one launch.
+    if (q4nx_lh::phprof_on() && !q4nx_lh::g_in_head) {
         q4nx_lh::g_ph.g_pack += pack; q4nx_lh::g_ph.g_ql += quant;
         q4nx_lh::g_ph.g_wait += wait; q4nx_lh::g_ph.g_rb += rb;
         q4nx_lh::g_ph.launches++;

@@ -688,6 +688,40 @@ memlock_verdict() {
         "$_p" "$_v" "${_f:+ (highest-numbered memlock file: $_f)}"
 }
 
+# ── the payload= label against the payload the image ships (engine#1557, containment) ───────────────
+# `payload=` is a LABEL (the tarball stem, which no in-image fact equals) and the row above checks the payload's own version. Neither
+# settles the incident: an image carrying payload=…c26c with a correctly computed payload_lemond passes both. The one in-image fact that
+# DOES name the cycle is the payload's own README - `opt/1bit-package/1bit/README.txt` line 1 states `1bit engine rc-YYYY-MM-DD-cNN` - and
+# `payload=` CONTAINS that token (it never equals it: the label carries the stem). So the comparison is containment, on the first line only.
+payload_name_verdict() {
+    _pn=${1:-} _pt=${2:-}
+    case "$_pn" in
+        '')
+            printf 'FAIL the identity file states no payload at all (payload= is empty), so nothing says which payload this image carries' ;;
+        unknown)
+            printf 'FAIL the identity file states payload=unknown - the value is an environment input (container-build.sh: PAYLOAD_NAME), so "unknown" means the build never named what it shipped' ;;
+        *)
+            if [ -z "$_pt" ]; then
+                printf 'SKIP the payload ships no release tag in its README, so payload=%s cannot be checked in the image (the tarball name lives beside the bundle, not in the image)' "$_pn"
+            else
+                case "$_pn" in
+                    *"$_pt"*) printf 'PASS consistent: the identity says payload=%s and the payload ships %s' "$_pn" "$_pt" ;;
+                    *) printf 'FAIL the identity says payload=%s but the payload ships %s - payload= is a declared environment input, so this image names a release it does not carry (c32 and c33 shipped exactly this)' "$_pn" "$_pt" ;;
+                esac
+            fi ;;
+    esac
+}
+
+payload_name_from_image() {  # <identity file> <payload dir>
+    _pi=${1:-} _pd=${2:-}
+    _pval=$(sed -n 's/^payload=//p' "$_pi" 2>/dev/null | head -1)
+    _ptag=
+    if [ -n "$_pd" ] && [ -f "$_pd/1bit/README.txt" ]; then
+        _ptag=$(sed -n '1s/.*\(rc-[0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*-c[0-9][0-9]*\).*/\1/p' "$_pd/1bit/README.txt" 2>/dev/null)
+    fi
+    payload_name_verdict "$_pval" "$_ptag"
+}
+
 payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
     _f=${1:-} _d=${2:-} _sample=${3:-}
     case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
@@ -809,6 +843,11 @@ if [ "${1:-}" = --self-test ]; then
     check /y/1bit/1bit "$(PAYLOAD_DIR=/y identity_launcher_path aa '')"                    # PAYLOAD_DIR is honoured
     if [ -z "$(identity_launcher_path '' bbbb)" ]; then printf 'ok   no claim yields no path (the row SKIPs)\n'
     else printf 'FAIL no claim should yield no path\n'; rc=1; fi
+    check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 rc-2026-11-08-c33)"        # the label CONTAINS the token
+    check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26c rc-2026-11-08-c33)"        # the c26 incident: must red
+    check SKIP "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 '')"                        # no README tag: not a pass by absence
+    check FAIL "$(payload_name_verdict unknown rc-2026-11-08-c33)"                                   # PAYLOAD_NAME unset
+    check FAIL "$(payload_name_verdict '' rc-2026-11-08-c33)"                                        # nothing stated
     check PASS "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 2026.47.0~1.52a2a6b3)"
     check PASS "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 2026.47.0~1752.52a2a6b3)"   # the clone-count case: must NOT red
     check FAIL "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 2026.47.0~1.abcdef01)"      # a different sha IS a different pin
@@ -2126,6 +2165,15 @@ case "$ML" in
     PASS*) pass memlock "${ML#PASS }" ;;
     SKIP*) skip memlock "${ML#SKIP }" ;;
     *)     fail memlock "${ML#FAIL }" ;;
+esac
+
+
+# ── the payload= label is consistent with the payload the image ships (engine#1557) ──────────────
+PNV=$(payload_name_from_image "$ID" "${PAYLOAD_DIR:-/opt/1bit-package}")
+case "$PNV" in
+    PASS*) pass payload-name "${PNV#PASS }" ;;
+    SKIP*) skip payload-name "${PNV#SKIP }" ;;
+    *)     fail payload-name "${PNV#FAIL }" ;;
 esac
 
 say ""

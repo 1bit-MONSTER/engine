@@ -34,3 +34,10 @@ third_party/toolchain/
 # the model-pin sweep writes these where it runs (tools/pin_watch.py --check --json)
 pin-report.md
 pin-report.json
+
+# HRX probe run output: the .hrx123 probe tools write JSONL logs here. Run output is not source and carries no
+# licence notice, but tools/copyright.py deliberately also checks untracked-but-not-ignored files (so a new file
+# is caught before `git add`), so leaving these unignored reds the gate on every developer clone that has run a
+# probe - a red that is the tree's, not the repository's (engine#1564). Ignoring them also stops run output being
+# committed by accident.
+.hrx123/logs/

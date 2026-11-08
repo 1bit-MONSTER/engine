@@ -144,13 +144,21 @@ is 0 since engine#1460), every one of them naming the rolling machine's home dir
 the same commit produced different payload hashes**, and a sha you are given could not be reproduced from the source
 alone.
 
-The three mechanisms are fixed (engine#1461), and the payload is now **checked** rather than described:
-`scripts/build-lemonade.sh` maps its source tree and its build directory (engine#1464); `cmake/hrx.cmake` also maps
-the build tree, which is where Loom's sources are fetched; llama.cpp passes the same flags into its nested
-`GGML_HRX_CMAKE_ARGS` (llama.cpp#243), which is where the 7 Loom strings came from; and `scripts/weekly.sh`
-(`build_path_strings`) walks **every** packed ELF of both packages — not just the engine binary — counting occurrences
-rather than lines, so a roll that leaks one fails instead of shipping. What stays irreproducible from the tree is the
-Lemonade dev version's `~N` above, which is a count of commits in the checkout that built it.
+**One of the two mechanisms is fixed, one is not, and the payload is now checked rather than described.**
+`scripts/build-lemonade.sh` maps its source tree and its build directory (engine#1464) and the result is measured: a
+`lemond` rebuilt from the merged script carries **0** `/home/` occurrences against the **126** shipped in c32 and c33.
+The Loom strings are **not** fixed: `cmake/hrx.cmake` maps the build tree, but the flags do not reach the compilation
+that produces them, because `third_party/llama.cpp`'s `ggml/src/ggml-hrx/CMakeLists.txt` builds the nested
+`ggml-hrx-deps-build` with an explicit `GGML_HRX_CMAKE_ARGS` list that forwards `CMAKE_BUILD_TYPE`, the two compilers
+and the IREE driver switches - and **not** `CMAKE_C_FLAGS`/`CMAKE_CXX_FLAGS`. Measured on the pin itself
+(`0ce01dafcf35`): zero occurrences of either flag in that list. So `libloomc.so.0` still names the rolling machine in 7
+places (engine#1496), and a payload rolled from the tree is still not byte-reproducible.
+
+What IS fixed is the checking: `scripts/weekly.sh` (`build_path_strings`) walks **every** packed ELF of both packages -
+not just the engine binary - counting occurrences rather than lines, so a roll that leaks one fails instead of shipping.
+Until the Loom half lands, that row is expected to **fail the roll**, which is the honest state: the check is right and
+the leak is real. What stays irreproducible even then is the Lemonade dev version's `~N` above, which is a count of
+commits in the checkout that built it.
 
 Artifacts of the gated c19 candidate — sizes and sha256 exactly as its own `SHA256SUMS` records them:
 

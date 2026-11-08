@@ -743,7 +743,12 @@ if [ "${1:-}" = --self-test ]; then
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none '')"           # `none` and nothing on the loader path: consistent
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa none bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"        # `none` while the image loads a runtime: false statement
     # `check` matches by PREFIX, so a path helper is asserted by giving the expected path as <want>
-    check PASS "$(identity_verdict aaaa$(printf 'a%.0s' {1..60}) aaaa$(printf 'a%.0s' {1..60}) not-stated '')"   # mini: no libhsa claim
+    # 64 'a's generated POSIX-ly: `{1..60}` is a BASH brace expansion, and this file is #!/bin/sh - under dash it does not
+    # expand, printf formats the literal, the claim arrives 5 characters long and this PASS case fails as "malformed". That is
+    # what CI saw while a `bash release-check.sh --self-test` here passed: the self-test was run with a different shell than the
+    # one ctest uses, so the run was not evidence about the artifact.
+    a64=$(printf '%064s' '' | tr ' ' a)
+    check PASS "$(identity_verdict "$a64" "$a64" not-stated '')"   # mini: no libhsa claim
     check FAIL "$(identity_verdict '' '' not-stated '')"                                                          # nothing checkable: still a FAIL
     check /opt/1bit-package/1bit/1bit "$(PAYLOAD_DIR= identity_launcher_path aaaa '')"      # v3: no git sha -> the payload launcher
     check /bin/1bit "$(MINI_LAUNCHER= identity_launcher_path aaaa bbbb)"                   # mini: both keys -> /bin/1bit

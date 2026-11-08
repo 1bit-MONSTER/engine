@@ -46,7 +46,7 @@ ARCHS = {
     "EmptyForCausalLM": {"gguf": "empty", "backends": []},
 }
 SIG = {"Qwen3_5MVLAAbsorbedForCausalLM": {"model_type": "qwen3_5_text", "family": "Qwen3.5 MVLA"}}
-FLM_LINE_PREFIXES = ("  + FLM FastFlowLM/", "  !! NEW FLM ", "  !! NPU FLM ")
+FLM_LINE_PREFIXES = ("  + FLM FastFlowLM/", "  !! NEW FLM ", "  !! NPU FLM ", "  . FLM ")
 
 failures = []
 
@@ -373,6 +373,15 @@ def flm_state():
 # measured there, bench/npu-leaderboard/27b-*.json), so the example moved to a family that is
 # still HRX-only - gemma3, which FLM also publishes Q4NX packs for. Reading the live registry is
 # the point: if gemma3 is ever registered for the NPU this check fails and the example moves again.
+LFM3_REPO = {
+    "id": "FastFlowLM/LFM3-1.7B-NPU2",
+    "lastModified": "2026-10-28T00:00:00.000Z",
+    "tags": ["base_model:LiquidAI/LFM3-1.7B", "license:other"],
+    # reviewed, not an alias: registry/significant.json, watch: report -> the pack is listed, not alerted
+    "config": {"architectures": ["Lfm3ForCausalLM"], "model_type": "lfm3"},
+    "siblings": [{"rfilename": "config.json"}, {"rfilename": "model.q4nx"}],
+}
+
 HRX_ONLY_REPO = {
     "id": "FastFlowLM/Gemma3-12B-NPU2",
     "lastModified": "2026-10-20T00:00:00.000Z",
@@ -444,6 +453,16 @@ with contextlib.redirect_stderr(io.StringIO()):
 check("flm sizes: a failed detail fetch keeps the repo (size 0, no crash)",
       [f["size"] for f in kept["q4nx"]] == [0])
 
+# engine#1451: `Lfm3ForCausalLM` and `DFlash2DraftModel` are recorded in registry/significant.json as
+# reviewed-not-an-alias. The class census already printed them `. REVIEWED`; the FLM half printed
+# `!! NEW FLM ... registry: none` forever, which is what kept a daily issue open on an answered question.
+_declined_rows = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json") + [LFM3_REPO])
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    cw.report_flm(_declined_rows, cw.sweep_releases(fetch=flm_fetch),
+                  [r for r in _declined_rows if r["id"] == "FastFlowLM/LFM3-1.7B-NPU2"], [])
+_declined_listing = _buf.getvalue()
+
 # 18. One line per repo, `!! NEW FLM` only for a family we cannot serve, and the exit code
 #     is the OR of both watches (an unmapped class is not turned green by a quiet day).
 state = flm_state()
@@ -458,6 +477,13 @@ check("flm report: one line per repo",
            if ln.startswith(FLM_LINE_PREFIXES)]) == 5)
 check("flm report: the unknown family is marked !! NEW FLM",
       "  !! NEW FLM FastFlowLM/MiniCPM-V-4.7-1B-NPU2" in first)
+check("flm report: a reviewed-and-declined class is listed, not alerted (engine#1451)",
+      "  . FLM FastFlowLM/LFM3-1.7B-NPU2" in _declined_listing
+      and "!! NEW FLM FastFlowLM/LFM3-1.7B-NPU2" not in _declined_listing
+      and "registry: none (reviewed, not an alias" in _declined_listing)
+check("flm report: a reviewed-and-declined class is not counted as an unmapped family",
+      "LFM3-1.7B-NPU2" not in _declined_listing.split("publish a family this engine does not serve")[-1]
+      if "publish a family this engine does not serve" in _declined_listing else True)
 check("flm report: a mapped family is not marked",
       "  + FLM FastFlowLM/Qwen3-8B-NPU2" in first and "!! NEW FLM FastFlowLM/Qwen3-8B-NPU2" not in first)
 check("flm report: the derivative drop does not alert",

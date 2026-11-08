@@ -1014,3 +1014,31 @@ in `registry/significant.json`.
 * The 14 `UNVERIFIABLE` rows are **not** a registry problem and get no entries: they are gated repos with no
   readable `config.json`, so the watcher retries them. Adding "unknown" dispositions would create rows that can
   never resolve and would hide the day one of them becomes readable.
+
+* **The converter bump is not a formality for this route.** `d1d5232` → `93b8398` fixes the Qwen3.5 family converters:
+  full-attention layers are now detected from `attn_q.weight` instead of "every Nth layer" (the commit names full
+  attention at **2, 5, 8, 9, 10, 11** for `d3:edge` — the same irregularity our own `safetensors_to_q4nx.py` takes from
+  `layer_types`), an MTP block (`nextn_predict_layers > 0`, counted in `block_count`) no longer leaks out as a bogus
+  decoder layer, and the Qwen35 value-head reorder is decided from the v/qk head ratio. Stock Qwen3.5 0.8B/2B/4B
+  (Q4_K, Q4_1) are tested 124/124 in that PR and the output is byte-identical for GGUFs without an MTP block, so
+  `scripts/repack_gguf.py`'s declared-scale guard is unaffected.
+* **The router bump is 152 commits and none of them is the contract**: `d3_format.py`, `d3_server.py` and
+  `d3_runtime.py` do not appear in the diff at all, and the only System One files touched are dashboard frontend pages.
+  What moved is router-side decision config (`vela{2,3}-labels-spans.yaml`, a `decision-balance` recipe) and a
+  `canonical_decision_model` CRD — upstream's own newer packs, not something `/v1/systemone` must mirror.
+* **`d3-ultra-INT4` (17.6 GB), `-FP8` (31.9 GB), `-NVFP4` (51.6 GB)** are quantization variants of `d3-ultra`, each
+  carrying its own `config.json` **and** `decision_config.json`, so they are d3 packs the pack-list should know about
+  rather than a new family.
+
+### One tool fix in the same pass: a reviewed class is listed, not alerted, in the FLM half too
+
+The model census already printed a reviewed-not-an-alias class as `. REVIEWED`, but the **FLM** half ignored
+`registry/significant.json` and printed `!! NEW FLM ... registry: none` for the same class — so `Lfm3ForCausalLM` and
+`DFlash2DraftModel`, both declined in 2026-11-07, kept the daily issue open on an answered question. `flm_line()` now
+takes the reviewed set: such a pack prints `. FLM ... registry: none (reviewed, not an alias)` and is not counted in the
+"publish a family this engine does not serve" total. `tests/census_watch_test.py` pins both halves of that.
+
+Still open, and alerting on purpose: `MiniCPMV4_7ForConditionalGeneration` (needs one converter registration, not an
+architecture), `MiniCPMOcrForConditionalGeneration` (own `minicpm-ocr` library), `smolvla-NPU2` (no config at all), and
+the `!! NPU FLM` families whose registry mapping is HRX-only (`hy_v3`, `dflash`, `gemma4`, `hunyuan-dense`, `gemma3`) —
+that last group is engine #588 (the family must be served on the NPU route), not a registry edit.

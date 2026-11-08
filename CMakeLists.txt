@@ -671,6 +671,8 @@ if(Python3_Interpreter_FOUND)
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.
     add_test(NAME q4nx_dir_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_q4nx_dir.py --self-test)
+    # engine#1443: "carries HIP code objects" is an ELF e_machine, not a bundle-header string
+    add_test(NAME code_objects COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/code_objects_test.py)
     add_test(NAME trit_embed_pack COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/trit_embed_pack_test.py)
     # the FFN row/block sparsity measurements (docs/npu.md, "FFN row sparsity"): a synthetic GGUF and
     # a synthetic capture, so the byte budget and the capture arithmetic are gated without a model

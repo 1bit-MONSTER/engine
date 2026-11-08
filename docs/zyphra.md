@@ -119,10 +119,9 @@ change a pick.
   96.642 %. It held, and it is the smallest arm that clears either half of the bar. The two arms also re-quantized to
   **bit-identical sha256** in the second run (both files were released and rebuilt), so the rows describe the bytes. After the
   dedupe below the same pick re-measures at **0.019361 / 95.025 %** — still across both halves.
-- **Engine #1036 has landed (fork #203, `6e42864a6`) and the sizes are re-measured, not estimated.** Our BF16 of
-  `Zamba2-7B-Instruct` used to hold **10.977 B params (20.45 GiB)** where the checkpoint holds **7.357 B (14.82 GB)**, because the port
-  wrote the shared attention/FFN block **13 times** (once per hybrid layer, of which only 2 distinct values exist). With the fix the refs
-  are **`Zamba2-7B-Instruct` 16094 MiB (15.71 GiB, 771 tensors)** and **`Zamba2-2.7B-instruct` 5732 MiB (5.60 GiB, 520 tensors)**, and
+- **Engine #1036 has landed and the sizes are re-measured, not estimated** — what the refs weigh and why the shared block is no longer copied
+  13 times is [`zyphra-models.md`](zyphra-models.md)'s subject (it has the byte-level table), so this page states only what a *measurement* needs: with
+  cause 1 (fork #203, `6e42864a6`) the refs were rebuilt and
   the picks were re-quantized and re-measured against them: **Q5_K_M 5577 MiB** (was 7336), **Q8_0 8558 MiB** (was 11135) on the 7B;
   **Q6_K 2356 MiB** (was 3002), **Q8_0 3049 MiB** (was 3886), **Q4_K_M-imx 1658 MiB** (was 2159) on the 2.7B. The **KLD and same-top-1
   columns are unaffected**, and that is measured rather than argued: the rebuilt BF16 run against the **old** base logits gives
@@ -235,6 +234,11 @@ have been measured in three windows and answered differently every time.
   not been validated against a known-answer. (2) The bench build these rows cite (`work/zarch/i1036@9ad387fb9/build-hrx`) **has been removed from
   the box**, so the rows are not re-derivable without rebuilding that tree; the tree itself is still at `9ad387fb9`. A future re-bench should
   take the dispatch histogram first (`GGML_HRX_LOG_DISPATCH=1`, count registrations by name) and run the MUL_MAT gate before quoting a ratio.
+  (3) **And the quantizer that produced the file decides whether these numbers mean anything at all**: a `llama-quantize` older than the F16 default
+  quantizes the rank-128 adapter pair, whose `B` matmul then leaves HRX on every hybrid layer — the block formats want `input_size >= 256` while the
+  float path only needs `% 4` — with no error and a large prefill cost. That mechanism is documented, with the measured numbers and the
+  `--tensor-type ffn_gate_up_adapter=f16` remedy, in [`zyphra-models.md`](zyphra-models.md); it is the most likely explanation for the unexplained
+  prefill drop noted below, and it is why a throughput row here is inseparable from *which quantizer built it*.
 - **A control on 2026-11-08 shows how far a single reading can be off, and it retire the A/B this page would need.** One file whose form cause 2
   did **not** touch (`Zamba-7B-v1` `Q6_K`) was re-benched on a current build: `pp512 211.16 (sd 170.84)`, `pp4096 47.14 (sd 12.73)`, `tg128 4.26
   (sd 3.04)` against its own published `108.07 / 92.28 / 12.20`. **The same bytes, 2-2.9× apart, with 71 % sd on decode.** So the rows in this

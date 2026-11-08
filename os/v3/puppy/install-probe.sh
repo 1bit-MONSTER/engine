@@ -358,6 +358,7 @@ if assert_pupsfs:
         try: os.unlink(f)
         except OSError: pass
     q = ["qemu-system-x86_64", "-m", "4096", "-smp", "4",
+         "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0",
          "-drive", "file=" + os.path.join(work, "target.img") + ",format=raw,if=none,id=d0",
          "-device", "qemu-xhci", "-device", "usb-storage,drive=d0",
          "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
@@ -436,6 +437,7 @@ if assert_pupsfs:
                 try: os.unlink(f)
                 except OSError: pass
             q = ["qemu-system-x86_64", "-m", "4096", "-smp", "4",
+                 "-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0",
                  "-drive", "file=" + os.path.join(work, "target.img") + ",format=raw,if=none,id=d0",
                  "-device", "qemu-xhci", "-device", "usb-storage,drive=d0",
                  "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
@@ -691,36 +693,36 @@ if assert_pupsfs:
                 dev, addr = parts[0], parts[1]
                 gw = val("GW", "ip route show default 2>/dev/null | awk '/^default/ { for (i=1;i<=NF;i++) if ($i==\"via\") { print $(i+1); exit } }'")
                 setr = val("SETSTATIC", "1bit-network set-static %s %s 2>&1 | tr '\\n' '; '" % (addr, gw or ""), timeout=240)
-                say("INFO net          set-static %s %s -> %s" % (addr, gw or "-", setr[:300]))
+                print("INFO net          set-static %s %s -> %s" % (addr, gw or "-", setr[:300]))
                 if "persisted to /data/net.conf" not in setr:
-                    say("FAIL net          set-static did not persist the address: %s" % (setr[-200:] or "<no output>")); ok = False
+                    print("FAIL net          set-static did not persist the address: %s" % (setr[-200:] or "<no output>")); ok = False
                 else:
-                    say("PASS net          a static address persisted on the data partition and applied now")
+                    print("PASS net          a static address persisted on the data partition and applied now")
                     net_after = val("NETNOW", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
                     if addr not in net_after:
-                        say("FAIL net          the interface does not carry %s right after set-static (%s)" % (addr, net_after or "<none>")); ok = False
+                        print("FAIL net          the interface does not carry %s right after set-static (%s)" % (addr, net_after or "<none>")); ok = False
                 if not v.reboot():
-                    say("FAIL net          the machine did not come back after the static-address reboot"); ok = False
+                    print("FAIL net          the machine did not come back after the static-address reboot"); ok = False
                     v.close()
                 else:
                     per = val("PERSIST", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
                     f = val("CONF", "grep -c '^static=' /data/net.conf 2>/dev/null")
                     if addr not in per:
-                        say("FAIL net          after the reboot the interface does not carry %s (%s): the file was not applied" % (addr, per or "<none>")); ok = False
+                        print("FAIL net          after the reboot the interface does not carry %s (%s): the file was not applied" % (addr, per or "<none>")); ok = False
                     elif f != "1":
-                        say("FAIL net          /data/net.conf is gone after the reboot (static= lines: %s)" % (f or "0")); ok = False
+                        print("FAIL net          /data/net.conf is gone after the reboot (static= lines: %s)" % (f or "0")); ok = False
                     else:
-                        say("PASS net          %s carries %s across a reboot, read from /data/net.conf on the data partition" % (dev, addr))
+                        print("PASS net          %s carries %s across a reboot, read from /data/net.conf on the data partition" % (dev, addr))
                     reset = val("RESETNET", "1bit-network reset 2>&1 | tr '\\n' '; '", timeout=180)
                     left = val("LEFT", "ls /data/net.conf 2>&1 | head -1")
                     if "reset" not in reset:
-                        say("FAIL net          1bit-network reset did not report: %s" % (reset[-200:] or "<no output>")); ok = False
+                        print("FAIL net          1bit-network reset did not report: %s" % (reset[-200:] or "<no output>")); ok = False
                     elif "No such file" not in left:
-                        say("FAIL net          /data/net.conf is still there after reset (%s)" % left); ok = False
+                        print("FAIL net          /data/net.conf is still there after reset (%s)" % left); ok = False
                     else:
-                        say("PASS net          reset removed /data/net.conf and handed the link back to DHCP")
+                        print("PASS net          reset removed /data/net.conf and handed the link back to DHCP")
             else:
-                say("INFO net          no global IPv4 address on this boot (%s): the static-address rows are a SKIP" % (cur or "<none>"))
+                print("INFO net          no global IPv4 address on this boot (%s): the static-address rows are a SKIP" % (cur or "<none>"))
             wrote = val("WROTE", "sh -c 'echo 712 > /root/712-persist; sync; cat /root/712-persist'")
             if wrote != "712":
                 print("FAIL persist      could not write to the installed root (/root/712-persist: %s)" % (wrote or "<no answer>")); ok = False

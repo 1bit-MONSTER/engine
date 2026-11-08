@@ -518,6 +518,17 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
         if (m.contains("vocab_size")) cfg["vocab_size"] = m["vocab_size"];
         if (m.contains("context_length")) cfg["max_position_embeddings"] = m["context_length"];
         if (m.contains("type") && m["type"].is_string()) cfg["model_type"] = m["type"];
+        // The stop/start tokens live HERE on this line -- these packs ship no generation_config.json at all, which I
+        // had assumed they did. A container that does not state its eos cannot stop on it.
+        for (const char* k : {"eos_token_id", "bos_token_id", "pad_token_id"})
+            if (m.contains(k) && !m[k].is_null()) cfg[k] = m[k];
+        if (m.contains("type") && m["type"].is_string()) {
+            // genai_config states the family in lower case ("qwen2", "llama"); the Hugging Face spelling that other
+            // routes match is capitalised, so it is normalised rather than concatenated as-is.
+            std::string fam = m["type"].get<std::string>();
+            if (!fam.empty()) fam[0] = char(std::toupper((unsigned char)fam[0]));
+            cfg["architectures"] = std::vector<std::string>{fam + "ForCausalLM"};
+        }
         if (source) *source = "genai_config.json (decoder block)";
         return cfg;
     }
@@ -2336,6 +2347,10 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             }
         }
         c["rms_norm_eps"] = p.dims.rms_norm_eps;
+        // The stop tokens: `load_geometry` already copied eos/bos/pad and `architectures` out of the pack's
+        // genai_config.json (these packs ship NO generation_config.json -- I had assumed they did), and read_dims
+        // parsed eos into p.dims. This line is the belt: whatever the plan resolved wins over the raw metadata.
+        if (!p.dims.eos.empty()) c["eos_token_id"] = p.dims.eos;
         // ── the RoPE base, verified against the pack's own cache ──
         // These packs ship precomputed cos_cache/sin_cache, and their genai_config.json is not a trustworthy source
         // for theta (pi-inferzo measured 10000 declared where the model needs 1e6). Our forward COMPUTES RoPE from

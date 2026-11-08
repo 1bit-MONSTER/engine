@@ -37,15 +37,33 @@ llama-quantize /tmp/pard-qwen3-0.6b-f16.gguf /tmp/pard-qwen3-0.6b-Q4_K_M.gguf Q4
 that accelerates any Qwen3 target (pairing is by tokenizer/vocabulary, here 151936). A row that pairs it with
 "Qwen3-0.6B" would be exactly backwards.
 
-Measured here (`Qwen3-4B-Q4_K_M` target ← `PARD-Qwen3-0.6B` Q4_K_M draft, greedy, the first request of each arm discarded):
+Measured here (`Qwen3-4B-Q4_K_M` target ← `PARD-Qwen3-0.6B` Q4_K_M draft, greedy). The warm-up and sample count differ per
+row because the two arms were taken on different days with different settled states, so each row states its own:
 
-| backend | target alone | target + draft | ratio |
-|---|---|---|---|
-| **HRX0** (iGPU, `-dev HRX0 -ngl 99 -fa on -devd HRX0`) | 46.849 tok/s (median of 3) | 70.259 tok/s | **1.50×** |
-| **CPU** (`-ngl 0 -t 4`) | 20.53 tok/s | — | **0.508× / 0.609×** |
+| backend | samples per arm (warm-ups discarded) | target alone | target + draft | ratio |
+|---|---|---|---|---|
+| **HRX0** (iGPU, `-dev HRX0 -ngl 99 -fa on -devd HRX0`) | 4 (2) | 75.785 tok/s | 76.656 tok/s | **1.012×** |
+| **CPU** (`-ngl 0 -t 4`) | 3 (1) | 20.53 tok/s | — | **0.508× / 0.609×** |
 
-Acceptance (llama.cpp's own accounting, CPU runs): **0.759 / 0.804 / 0.980** of drafted tokens. Reproduce with
-`tools/spec_decode_speedup.sh` and `tools/spec_decode_acceptance.py`.
+Acceptance (llama.cpp's own accounting, **CPU** runs): **0.759 / 0.804 / 0.980** of drafted tokens. On HRX it is **not
+measured** — that build does not echo `draft_n_accepted` in the JSON and does not write the `draft acceptance rate` line by
+default, which is why the ratio above stands alone. Reproduce the HRX row exactly (the default is now `SKIP_FIRST=2` because one warm-up produced the bad number below):
+
+```sh
+BIN=~/wt/i1251/pincur/llama-server \
+SRV_ARGS='-dev HRX0 -ngl 99 -fa on -devd HRX0' \
+DRAFT_MAX_FLAG=--spec-draft-n-max DRAFT_MIN_FLAG=--spec-draft-n-min SKIP_FIRST=2 REQS=4 \
+  tools/spec_decode_speedup.sh ~/models/Qwen3-4B-Q4_K_M.gguf /tmp/pard-qwen3-0.6b-Q4_K_M.gguf 64 4
+```
+
+and the acceptance runs with `tools/spec_decode_acceptance.py`.
+
+**A 1.50× was published here first and it was wrong.** The first HRX run discarded a single warm-up request, and its baseline was
+**unsettled** across all three measured samples (40.646 → 51.942 → 46.849 tok/s — it rose and then fell, so not a ramp but not a
+plateau either) while the draft arm was measured after it. The claimed gain was +0.50 of ratio and the settled gain is +0.012, so
+**~98 % of the published "speedup" was that unsteady baseline** — "50 points of ratio", not "50 % of the gain". Two later runs with two discarded warm-ups and four measured samples each put the
+baseline on its plateau (~75 tok/s) and give **1.03×** and **1.012×** — i.e. the draft is roughly break-even on the device for this
+pair, not a large win. That is why the harness now takes `SKIP_FIRST` and why the tool prints both arms' every sample.
 
 **CPU can never win, and that is arithmetic rather than a bug.** A round is one batched verify over `M = 1 + drafted` tokens
 plus `drafted` draft decodes; on a CPU backend a decode is bandwidth-bound per token, so the verify costs ≈ `M`
@@ -54,6 +72,16 @@ which is impossible. Measured by counting work rather than timing it (load-indep
 10 rounds ⇒ **exactly one target decode per round** (the verify *is* batched) and zero rollback replays, and the observed
 0.68-0.79× matches `tokens/round ÷ (drafted·r + M)` with the measured per-token costs. engine#1423 carries that analysis, and
 its only open item is a policy question (warn or refuse when speculation is requested on a CPU-only backend).
+
+### What the corrected number means
+
+At ~75 tok/s the 4 B target is fast enough on this iGPU that a 0.6 B draft — issuing **up to 4 (k = 4) draft decodes per round**,
+the upper bound since acceptance is unmeasured on HRX — buys back about what it costs: **1.01×, not 1.50×**. So the device verdict is "break-even for this pair", not "a win" — and PARD's own headline numbers come from its
+tuned runtime (parallel mask, batching), not from driving its weights through our server in AR mode: the model card for
+`amd/PARD-Qwen3-0.6B` claims "an average inference speedup of 1.78×" over pure-AR drafts and "up to a 4.08× speedup" in
+"Transformers+ PARD" — different drafters and a different runtime from the pair measured above, which is why they are quoted as
+the vendor's claim and not as our result.
+A row that quotes a speedup for these drafts must say which of the two it measured.
 
 ## Gumiho — a vendor hybrid head: **it needs a tree verifier we do not have**
 

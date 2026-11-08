@@ -34,3 +34,9 @@ third_party/toolchain/
 # the model-pin sweep writes these where it runs (tools/pin_watch.py --check --json)
 pin-report.md
 pin-report.json
+
+# engine#1564: run output, not source. tools/copyright.py walks tracked AND untracked-but-not-ignored files (it
+# checks a file before it is ever `git add`ed), so a log a probe drops here reds the licence gate in a developer
+# clone while main is clean - the shape that teaches people to skip the gate. Ignoring the directory fixes it for
+# this gate without an EXEMPT entry that would also hide a real source file dropped there by mistake.
+.hrx123/logs/

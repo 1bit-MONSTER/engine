@@ -46,6 +46,15 @@ Same version, our own build: `onnx/build_ort.sh` clones tag `v1.23.2`, patches t
 `pkg-config` finds it by `PKG_CONFIG_PATH` alone — nothing in `onnx/` changes. The MIT notice covers
 that build too (see `NOTICE`).
 
+**The distro package is not always usable, and that is worth knowing before blaming a model.** On
+Ubuntu 26.04's `libonnxruntime1.23` (the pin above) a session cannot be created at all: the package's
+`libonnxruntime.so.1.23` links `libonnx.so.1`, both register the same ONNX schemas, and the process
+prints **629 `Schema error: … already registered`** lines and then hangs or dies with
+`terminate called without an active exception`. It reproduces on a plain ONNX language model, so it
+is the package and not the graph. A build against the pinned/vendored ORT (`scripts/build-onnx.sh`
+output, which has no `libonnx` dependency — point `PKG_CONFIG_PATH` at it) runs the same model. The
+`ldd` check is one line: `libonnx` in the link is the fault.
+
 ## Building it
 
 ```bash
@@ -451,6 +460,45 @@ The two backends are held to different tolerances, because they compute differen
 path is float32 and must match the CPU EP to `1e-5` relative; the device path is int8 by int8 into
 int32, and is held to `2e-2` of the result's magnitude. The proof prints which backend it got, so a
 silent fall back cannot be mistaken for a device pass.
+
+## Any graph: `ort-run --input`
+
+`ort-run` speaks two interfaces. With `--ids` it is the Qwen3 language model of
+[Qwen3-0.6B](#qwen3-06b) below. With `--input` it is **any** ONNX graph: nothing about the graph's
+names, shapes or roles is assumed, so a vision model, an audio model and a one-op toy all take the
+same path.
+
+```sh
+# one declared input, raw little-endian float32, NHWC 1x640x640x3
+build/ort_run --model yolov8m.onnx \
+  --input DetectionModel::input_0=x.bin:float32:1x640x640x3 \
+  --dump-all out/
+# the same, writing only what you name, and with our plugin EP asked first
+build/ort_run --model m.onnx --ep build/ep/libonebit_ep.so \
+  --input x=x.bin:float32:1x4x4 --output y=y.bin
+```
+
+| flag | meaning |
+|---|---|
+| `--input NAME=FILE:DTYPE:SHAPE` | repeatable. `FILE` holds the tensor raw, little-endian; `DTYPE` is `float32`, `float16`, `uint8`, `int8`, `int32` or `int64`; `SHAPE` is `1x640x640x3`. The file's size is checked against the declared shape **before** ORT sees it and a mismatch is refused by name: a short buffer is a wrong answer, not an error |
+| `--output NAME=FILE` | repeatable; write that output to that path |
+| `--dump-all DIR` | write every output as `DIR/<name>.bin` plus `DIR/outputs.txt`, one line per tensor with its dtype, shape, byte count and path |
+
+Both kinds of graph keep the same EP ordering story: `--ep` libraries are registered in the order
+given and the CPU EP is always appended last, so our EP is asked first and whatever it refuses falls
+through. A graph the EP cannot help is still served — and the EP's `ONEBIT_EP_TRACE=1` log says how
+many nodes it was offered and how many it claimed, which is the difference between "the plugin was
+loaded" and "the plugin did work".
+
+Two model-file traps are worth knowing before blaming the runner: a graph exported by python `onnx`
+1.23 defaults to **IR version 14** and ONNX Runtime 1.23.2 refuses anything above **11**
+(`Unsupported model IR version: 14, max supported IR version: 11`), and a graph with any `MatMul`
+whose `K`/`N` no NPU ELF covers simply falls through to the CPU EP — which is the designed behaviour,
+not an error.
+
+`onnx/tests/ort_run_generic.sh` (ctest `ort_run_generic`, registered when python `onnx` is present)
+writes a two-node `MatMul`+`Relu` model, runs this path on it, compares the tensor it writes with
+numpy, and checks that a file whose size disagrees with the declared shape is refused.
 
 ## Qwen3-0.6B
 

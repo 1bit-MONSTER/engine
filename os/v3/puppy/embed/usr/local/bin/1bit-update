@@ -251,7 +251,14 @@ trap 'cleanup' EXIT INT TERM
 # a release image is what a user actually has: use the frugal set on its own data partition
 if [ ! -d "$src" ]; then
     srcloop=$(losetup -f --show -r "$src" 2> /dev/null) || die "cannot loop-mount $src"
-    dataoff=$(sfdisk -d "$src" 2> /dev/null | awk '/name="1BIT-DATA"/ { for (i = 1; i <= NF; i++) if ($i ~ /^start=/) { sub(/start=/, "", $i); sub(/,/, "", $i); print $i; exit } }')
+    # `sfdisk -d` prints `start=` and the sector number as TWO fields, so stripping the prefix from `$i` leaves nothing
+    # and the offset came back empty - the image form refused every image with "has no 1BIT-DATA partition" while the
+    # partition was right there (measured: the new image-form gate row found it). Read the number, wherever it is.
+    dataoff=$(sfdisk -d "$src" 2> /dev/null | awk '/name="1BIT-DATA"/ {
+        for (i = 1; i <= NF; i++) if ($i ~ /^start=/) {
+            v = $i; sub(/start=/, "", v); gsub(/,/, "", v)
+            if (v == "") { v = $(i + 1); gsub(/,/, "", v) }
+            print v + 0; exit } }')
     [ -n "$dataoff" ] || { losetup -d "$srcloop"; die "$src has no 1BIT-DATA partition (not a 1bit OS image)"; }
     srcloop=$(losetup -d "$srcloop" > /dev/null 2>&1; losetup -f --show -r -o $((dataoff * 512)) "$src" 2> /dev/null) \
         || die "cannot loop-mount $src's data partition"

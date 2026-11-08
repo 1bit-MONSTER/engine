@@ -58,6 +58,11 @@ replace=''
 # so a reader never sees half an artifact and a REFUSED run no longer destroys the previous good one. Handing over an existing
 # name is therefore a deliberate act: without the flag the old refusal stands.
 if [ "${1:-}" = --replace ]; then replace=1; shift; fi
+# --keep-modes <keeplist>: normalise the BASE layer's group/other-write bits (engine#1474) BEFORE the metadata pass, on
+# BOTH sides, so the declared-set proof still means "the patch changed nothing outside its targets" and the artifact is
+# the normalised tree. Opt-in: a cut that does not pass it ships the base layer's modes exactly as its source had them.
+keepmodes=''
+if [ "${1:-}" = --keep-modes ]; then keepmodes=${2:?--keep-modes needs a keep-list}; shift 2; fi
 [ $# -eq 4 ] || { usage >&2; exit 1; }
 manifest=''
 if [ "${1:-}" = --manifest ]; then manifest=$2; src=$3; out=$4; target=''; repl=''; else src=$1 target=$2 repl=$3 out=$4; fi
@@ -198,6 +203,23 @@ else
 fi
 
 echo "$prog: packing with woof-CE's options (-comp zstd -Xcompression-level 19 -b 256K -no-exports -no-xattrs)"
+# engine#1474: with a keep-list, the BASE layer's group/other-write bits come off here - before the metadata pass and on
+# BOTH trees, which is what keeps the declared-set proof honest: after the same transformation on each side, a mode line
+# that differs is still a difference the patch made. The normaliser only narrows (go-w), so nothing can gain a bit; the
+# reporter is checked on the packed tree at the end, so a tree that is still writable outside the keep-list is refused.
+if [ -n "$keepmodes" ]; then
+    norm=''
+    for c in /repo/scripts/base-modes.sh "$(cd "$(dirname "$0")/../../.." && pwd)/scripts/base-modes.sh"; do
+        [ -x "$c" ] && { norm=$c; break; }
+    done
+    [ -n "$norm" ] || { echo "$prog: --keep-modes: no scripts/base-modes.sh found (looked in /repo and in the repository)" >&2; exit 1; }
+    [ -f "$keepmodes" ] || { echo "$prog: --keep-modes: no keep-list at $keepmodes" >&2; exit 1; }
+    echo "$prog: normalising the base layer's modes in the source tree:"
+    bash "$norm" "$work/src" --keep "$keepmodes" 2>&1 | sed 's/^/   /'
+    echo "$prog: and in the patched tree:"
+    bash "$norm" "$work/new" --keep "$keepmodes" 2>&1 | sed 's/^/   /'
+fi
+
 # Packed to a TEMPORARY name and renamed only once every check has passed, for two reasons measured on 2026-11-08:
 #   * a concurrent reader saw this file growing (127 MB of 490 MB) and misread it - another lane was measuring the
 #     artifact while a cut was rewriting it in place, which no check on this side can prevent;
@@ -256,6 +278,15 @@ vmeta=$(diff "$work/meta-new" "$work/meta-verify" || true)
     echo "$prog: REFUSED: the repack's modes/owners/types/sizes are not the packed tree's:" >&2
     printf '%s\n' "$vmeta" | sed -n '1,8p' >&2; rm -f "$out"; exit 1; }
 echo "$prog: metadata: $dn line(s) differ from the source, all inside the declared set; repack matches it exactly"
+if [ -n "$keepmodes" ]; then
+    if dirty=$(bash "$norm" "$work/verify" --keep "$keepmodes" --report-only 2>&1); then
+        echo "$prog: base modes: the packed SFS is clean outside $(basename "$keepmodes")"
+    else
+        printf '%s\n' "$dirty" | sed -n '1,10p' >&2
+        echo "$prog: REFUSED: the packed SFS is still group/other-writable outside the keep-list (engine#1474)" >&2
+        rm -f "$out"; exit 1
+    fi
+fi
 
 # Every check above ran against the temporary name; only now does the artifact take the name callers read.
 mv -f "$out" "$final"; out=$final

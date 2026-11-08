@@ -175,10 +175,12 @@ layers[0]     {"index": 0, "role": "gdn", "qkv": {"K": 5120, "N": 10240, "fused"
 
 ## Not yet
 
-- **P4** (#803): **landed** in #808 (`0a2cbb9`) as **A1** — the `NpuTarget` interface (`npu/target/target.h`),
-  the XDNA target behind it, and `open()` consuming the plan instead of duplicating the derivation. **A2** is what
-  remains: the design derivation moves out of the forward and into the target, so `open()` becomes the source rather
-  than the check (and `load_block`, which is a named no-op today).
+- **P4** (#803): **A1 landed** in #808 (`0a2cbb9`) — the `NpuTarget` interface (`npu/target/target.h`), the XDNA
+  target behind it, and `open()` consuming the plan instead of duplicating the derivation. **A2 is in progress and is
+  tracked on its own page of record**, [npu-p4-target-split.md](npu-p4-target-split.md) §3 (steps A1/A2/A3), so this
+  list does not try to snapshot it — as of #1380 (`A2b, part 1`) the M=128 ELF set is adopted in
+  `XdnaTarget::open_prefill()` instead of in the forward. What is still true from *this* page: `XdnaTarget::load_block`
+  remains a named no-op that says why, so weights still fill lazily per projection.
 - **P5** (#804): Hexagon target (t2 gemv on HVX/HMX, QEMU v73 oracle) has no engine rows yet.
 - **P6** (#805): the shared drafter protocol is on main; tau=0.6 and Hexagon acceptance rows are still missing.
 - **P7** (#806): the `kv` contract above is in the plan and its arithmetic is gated in CI (`ctest -R npu_kv_int8`,

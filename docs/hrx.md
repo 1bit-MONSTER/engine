@@ -668,6 +668,47 @@ It registered the file mapping as a KFD userptr, which the kernel always write-f
 its mtime, and never finished on large models while writeback kept invalidating it (engine#1339). HRX's repacked copy of the
 dense weights still sits next to the device buffer in GTT.
 
+### Measuring on `HRX0`: what makes a number citable
+
+Numbers measured on this device swing far more between *runs* than between *files*, so the harness matters as much as the arm. Everything below is
+either a guardrail the engine prints or an effect measured on this box on 2026-11-07/08; where another lane measured it first, they are named.
+
+**1. The GTT pool is finite and it is shared.** Every launch prints the guardrail line:
+
+```
+ggml_hrx: HRX0 guardrail: GTT total 120.0 GiB, in use 40.7 GiB, ceiling 104.0 GiB (reserve 16.0 GiB),
+          pool budget 63.3 GiB - a launch that needs more is refused here rather than faulting the device (engine #680)
+```
+
+`pool budget = ceiling - in use`, and a launch needing more than that is **refused**, not faulted. So the first thing a measurement needs is the budget,
+not the file: two lanes independently arrived at the same rule from opposite sides — the Zyphra lane refuses below a 12 GiB budget for a 5.8 GiB model, and
+the architecture lane refuses below `3.0 x weights + 2 GiB` (an 8B row was refused at budgets of 13.6 / 13.5 / 10.8 GiB). Over eight hours of this box's
+evening the budget sat at **14-17 GiB** while long-lived services held the rest, which is why runs "that worked yesterday" crawl today.
+
+**2. Budget the ticket for the *load*, not for the arms.** Loading is single-core-bound when other jobs share the four pinned cores: a 24 GiB GGUF spent
+**35 minutes at 88 % of one core with GTT unmoved** — it was still loading, having measured nothing. A `gpu-hold -t 40` therefore expires before the first
+arm, which happened four times in one night. Either take a long ticket on a quiet box, or reduce the **number of loads** (one process per arm means one
+load per arm).
+
+**3. A fallback is invisible in the dispatch histogram.** `GGML_HRX_LOG_DISPATCH=1` lists the registrations that **ran**; an op that never dispatched on
+the device leaves **no line at all**. Measured: two arms differing only in one tensor type's format had a **near-identical** registration set (one extra
+line, none missing) while `pp512` differed **5.4x** and `pp8` **8.1x**. So the histogram answers *"which kernel won"*, never *"did something fall back"* —
+that shows up in the **timing**, against a known-answer test (`test-backend-ops -o <OP> -b HRX0`).
+
+**4. Two windows are not a comparison.** The same unchanged file measured `211.16 / 47.14 / 4.26 tok/s` (pp512 / pp4096 / tg128) in one hour and
+`108.07 / 92.28 / 12.20` in another — **2-2.9x apart, with sd 71 % on decode**. Rows may only be compared inside **one ticket**, with the guardrail's GTT
+figure recorded at **each arm** and an unchanged-file control in the same window; otherwise the report is of the window, not of the file.
+
+**5. A hot die starves the queue, and the thresholds do not line up.** `~/lb/thermal-run.sh` freezes a CPU job at **78 C** and thaws at 68 C, while
+`gpu-hold` only starts below **75 C**. A CPU job under thermal-run can therefore park the die in the 75-78 C band indefinitely — too hot for the GPU
+queue to start, too cool to be paused — and a queue of 22 tickets waited an hour behind exactly that. CPU-heavy measurement belongs under thermal-run
+*and* out of a window with a deep device queue.
+
+**6. State the binary, the pool budget and the tensor types with every row.** The build a row came from may be deleted before the row is read (it
+happened: a 12-row table outlived its build by a day), and a file's *name* is not its format — a GGUF called `UD-Q4_K_XL` measured here was Q8_0 x279 /
+F32 x246 / Q5_K x129 / IQ4_XS x69 / BF16 x47 / Q4_K x6, i.e. six tensors of the type its name advertises. Read the types out of the produced file, and
+quote them, before quoting a number.
+
 ### Known issues on `HRX0`
 
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an

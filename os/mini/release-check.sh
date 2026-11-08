@@ -563,6 +563,24 @@ hrx_placement_verdict() {
     fi
 }
 
+# The payload's modes (engine #1352, fixed by #1361). Until that fix `package-linux.sh` staged with `cp -a`, so every mode was
+# inherited from the build tree: 134 of the 195 files under the payload were group- or other-writable (1bit and the HRX libs at
+# 0775, LICENSE/NOTICE at 0664). All root:root, so nothing non-root could reach those bits, and no appliance user is in group
+# root - the defect is that a mode in a release artifact was nobody's decision. #1361 makes the packer normalise (dirs 0755,
+# files 0755 if executable else 0644) and assert it, so THIS row is the board-side proof that it did: a payload packed after that
+# commit has no writable file, and a payload packed before it has 134. Pure, so --self-test drives it:
+#   <group/other-writable file count> [<first few paths>]
+payload_modes_verdict() {
+    _n=${1:-} _sample=${2:-}
+    case "$_n" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s modes could not be counted (%s)' "${_n:-empty}"; return 0 ;; esac
+    if [ "$_n" = 0 ]; then
+        printf 'PASS no file in the payload is group- or other-writable (engine #1352: the packer normalises, this is the proof)'
+    else
+        printf 'FAIL %s file(s) in the payload are group- or other-writable%s - the packer that stages with cp -a is shipping inherited modes again (engine #1352: the fix is in scripts/package-linux.sh / pack-elf.sh, not in this row)' \
+            "$_n" "${_sample:+: $_sample}"
+    fi
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -602,6 +620,12 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(followup_verdict '{"error":{"message":"no answer"}}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 0)"
     check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT"}}]}' 0 0)"
     check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' '' '')"
+    # engine #1352: the payload's modes. c31/c32 shipped 134 writable files; a payload packed after #1361 has none.
+    check PASS "$(payload_modes_verdict 0)"
+    check FAIL "$(payload_modes_verdict 134)"
+    check FAIL "$(payload_modes_verdict 1 '/opt/1bit-package/1bit/1bit')"
+    check FAIL "$(payload_modes_verdict '')"
+    check FAIL "$(payload_modes_verdict 'x')"
     # c32: the HRX weight placement. The measured arms from #1339 are the first two; the failure shapes are a default
     # that already imported (2), an unreadable arm, and a zero.
     check PASS "$(hrx_placement_verdict 5692 3010)"        # 4B perplexity, #1339
@@ -1644,6 +1668,28 @@ if [ -f "$ID" ]; then
     fi
 else
     skip identity "no /etc/1bit/release-identity in this image build; the tag and the image sha256 are in the release table beside the .img.zst"
+fi
+
+# ── the payload's modes (engine #1352) ─────────────────────────────────────────────────────────────
+# The board-side half of #1361: the packer now normalises and asserts at pack time, and this proves it on the shipped tree. It
+# also prints the two binaries' modes, so the identity of a boot says 0755 for `1bit` and `bin/lemond` rather than leaving a reader
+# to trust that a mode fix happened. A SKIP (not a failure) when the payload is not where an appliance keeps it, so the row can be
+# run off a stick.
+PDIR=${PAYLOAD_DIR:-/opt/1bit-package}
+if [ ! -d "$PDIR" ]; then
+    skip payload-modes "no $PDIR on this system: the payload is not unpacked where an appliance keeps it, so its modes cannot be read"
+else
+    _pm_n=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
+    _pm_s=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 | tr '\n' ' ')
+    PM=$(payload_modes_verdict "${_pm_n:-}" "${_pm_s:-}")
+    _pm_bits=
+    for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
+        [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
+    done
+    case "$PM" in
+        PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+        *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+    esac
 fi
 
 say ""

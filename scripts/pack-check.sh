@@ -72,6 +72,7 @@ gen_text() {
 }
 build_path_strings() {  # build_path_strings <unpacked tree>  -> one FAIL line per offending file, rc 1
     local t=$1 f n pats rc=0 elfs=0 text=0
+    [ -d "$t" ] || { printf 'FAIL no such tree: %s\n' "${t:-<empty>}"; return 1; }
     pats=$(printf '%s\n' /home/ "${SRC:-/nonexistent-build-src}" "${W:-/nonexistent-build-w}" \
                          "${BUILD:-/nonexistent-build-build}")
     while IFS= read -r -d '' f; do
@@ -109,6 +110,7 @@ build_path_strings() {  # build_path_strings <unpacked tree>  -> one FAIL line p
 # paths (readelf) and what the loader actually does (ldd), plus the runtime set the dlopen needs present.
 runtime_selfcontained() {  # runtime_selfcontained <unpacked tree>  -> FAIL lines, rc 1
     local t=$1 tcanon f n abs rc=0
+    [ -d "$t" ] || { printf 'FAIL no such tree: %s\n' "${t:-<empty>}"; return 1; }
     tcanon=$(readlink -f "$t" 2>/dev/null || printf '%s' "$t")
     while IFS= read -r -d '' f; do
         pack_is_elf "$f" || continue
@@ -152,6 +154,7 @@ runtime_selfcontained() {  # runtime_selfcontained <unpacked tree>  -> FAIL line
 # /bin/1bit -> /home/<user>/.../build/1bit and a whole /home/<user> tree carrying a 4.7 MB binary.
 layout_build_paths() {  # layout_build_paths <tree> [pattern ...]   (default pattern: /home/)
     local t=$1 rc=0 f p l pat
+    [ -d "$t" ] || { printf 'FAIL no such tree: %s\n' "${t:-<empty>}"; return 1; }
     shift
     [ $# -gt 0 ] || set -- /home/
     while IFS= read -r -d '' f; do

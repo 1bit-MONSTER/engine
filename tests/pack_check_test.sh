@@ -128,6 +128,12 @@ arm_layout() {  # arm_layout <want> <phrase> <tree>
 arm_layout "#1543: a directory named after the builder fails" "is a path naming a build machine" "$w/layout"
 arm_layout "#1543: a symlink into the builder's home fails" "the target names a build machine" "$w/layout"
 arm_layout pass "" "$w/clean"
+# a row given a tree that does not exist must refuse: an empty path once made runtime_selfcontained print
+# "ok" over nothing, which is the one failure mode a green row cannot be allowed to have
+out=$( { build_path_strings ""; runtime_selfcontained ""; layout_build_paths "$w/nonexistent"; } 2>&1 ) || true
+n=$(printf '%s\n' "$out" | grep -c 'FAIL no such tree')
+if [ "$n" = 3 ]; then echo "PASS  a missing tree is refused by all three rows"
+else echo "FAIL  a missing tree: expected 3 refusals, got $n"; printf '%s\n' "$out" | head -4 | sed 's/^/      /'; fail=$((fail+1)); fi
 
 if [ "$fail" = 0 ]; then echo "pack_check: all rows PASS"; else echo "pack_check: $fail row(s) FAILED"; fi
 [ "$fail" = 0 ]

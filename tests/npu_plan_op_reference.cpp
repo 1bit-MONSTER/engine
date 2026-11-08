@@ -81,7 +81,32 @@ int main() {
         for (size_t c = 0; c < e.n_cases; c++) check_case(e, e.cases[c]);
     }
 
-    // 2. find_op() answers by id and by name, and nullptr for what is missing -- that nullptr is what the
+    // 2. EVERY op in the vocabulary, not just the ones with entries: an OpId added tomorrow with no entry
+    //    must show up here rather than leave the test green (the reviewer of this PR named that hole).
+    {
+        const std::string documented_gap = "gdn_step,attn_step";
+        std::string unregistered;
+        int seen = 0;
+        for (int i = 0; i < (int)OpId::count; i++) {
+            const OpId op = (OpId)i;
+            const OpEntry* e = find_op(op);
+            const std::string name = op_name(op);
+            check(name != "?", name + " has a name (the vocabulary is walked, not listed)");
+            if (e) {
+                check(e->ref != nullptr, name + " has a reference");
+                check(e->n_cases > 0, name + " has known-answer cases");
+            } else {
+                if (!unregistered.empty()) unregistered += ",";
+                unregistered += name;
+            }
+            ++seen;
+        }
+        check(seen == 4, "the vocabulary has the four ops this build knows about");
+        check(unregistered == documented_gap,
+              "the ops with no entry are exactly the documented gap (got \"" + unregistered + "\")");
+    }
+
+    // 3. find_op() answers by id and by name, and nullptr for what is missing -- that nullptr is what the
     //    loader's rule will key on.
     check(find_op(OpId::gemv) != nullptr, "find_op(gemv)");
     check(find_op(OpId::lm_head) != nullptr, "find_op(lm_head)");

@@ -24,6 +24,7 @@ const char* op_name(OpId op) {
         case OpId::gdn_step: return "gdn_step";
         case OpId::attn_step: return "attn_step";
         case OpId::lm_head: return "lm_head";
+        case OpId::count: break;
     }
     return "?";
 }
@@ -118,12 +119,12 @@ const OpEntry* find_op(const char* name) {
 }
 
 std::string op_coverage() {
-    // The ops a plan's layers can require.  `gemv` is every layer's projection; `gdn_step` is a `gdn`
-    // layer's recurrence; `attn_step` the attention step; `lm_head` the output projection.  The two that
-    // are still missing are named here and the test asserts this exact string, so the gap cannot grow
-    // silently and cannot be closed without editing the test.
+    // Every op in the vocabulary is walked, including one added tomorrow: the sentinel is what makes that
+    // automatic.  `gemv` is every layer's projection, `gdn_step` a `gdn` layer's recurrence, `attn_step`
+    // the attention step, `lm_head` the output projection.
     std::string missing;
-    for (OpId op : {OpId::gemv, OpId::gdn_step, OpId::attn_step, OpId::lm_head}) {
+    for (int i = 0; i < (int)OpId::count; i++) {
+        const OpId op = (OpId)i;
         if (find_op(op)) continue;
         if (!missing.empty()) missing += ",";
         missing += op_name(op);

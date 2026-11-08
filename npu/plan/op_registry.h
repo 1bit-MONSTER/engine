@@ -43,7 +43,10 @@ namespace onebit::npu::plan {
 
 // The ops a plan may name.  These are the names `npu/target/target.h`'s `Op` uses, so a plan, a target and
 // a registry entry cannot spell the same op three ways.
-enum class OpId { gemv = 0, gdn_step, attn_step, lm_head };
+// `count` is a sentinel, not an op: it exists so the registry and the test can iterate the WHOLE vocabulary.
+// Without it a fifth OpId added tomorrow with no entry leaves both green -- the reviewer of this PR named
+// exactly that hole, and it is the hole the rule exists to close.
+enum class OpId { gemv = 0, gdn_step, attn_step, lm_head, count };
 
 const char* op_name(OpId op);
 
@@ -76,8 +79,9 @@ const OpEntry* find_op(const char* name);
 size_t op_entry_count();
 const OpEntry& op_entry(size_t i);
 
-// The ops a plan's layers can require but which have no entry yet, comma separated ("" when none).  The
-// test asserts the exact string, so removing an op from it requires removing a case from the test.
+// The ops in the vocabulary that have no entry yet, comma separated ("" when none).  It iterates every
+// OpId up to the `count` sentinel, so an op added to the enum is included automatically -- the test asserts
+// the exact string, so the gap is a decision rather than an omission.
 std::string op_coverage();
 
 // The two references this build implements.  `gemv_ref` is C[m][n] = A[m][k] x B[k][n]; `lm_head_ref` is

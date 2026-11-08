@@ -27,6 +27,40 @@ NPU add-on npu-lax (from the private npu-kernels repository, addons/npu-lax)
   (http://www.apache.org/licenses/LICENSE-2.0).
 
 -------------------------------------------------------------------------------------
+AMD HSA runtime set (libhsa-runtime64.so.1, libhsa-amd-aqlprofile64.so.1,
+librocprofiler-register.so.0 and the rocm_sysdeps libraries, packed beside the HRX llama.cpp libraries in
+hrx/llama/bin)
+
+HRX reaches the GPU through this set. The engine's backend opens the runtime BY NAME at run time
+(ggml-hrx-dmabuf.cpp:29, dlopen("libhsa-runtime64.so.1")), and the runtime in turn opens the aqlprofile
+agent by name, so ldd never sees either: the whole set ships in the payload, beside the backend, and the
+payload's RUNPATH is $ORIGIN - nothing resolves out of the install (engine #1411). Shipped unmodified, as
+built by TheRock; the release refuses a payload that carries the set incompletely.
+
+- libhsa-runtime64.so.1 (ROCr). Upstream https://github.com/ROCm/rocr-runtime, built by TheRock
+  (https://github.com/ROCm/TheRock). Copyright (c) 2014-2025 Advanced Micro Devices, Inc.
+  University of Illinois/NCSA Open Source License (NCSA).
+
+- libhsa-amd-aqlprofile64.so.1, the profiling agent the runtime opens by name. Upstream
+  https://github.com/ROCm/aqlprofile. Copyright (c) Advanced Micro Devices, Inc. MIT License.
+
+- librocprofiler-register.so.0, the profiling registration shim. Upstream
+  https://github.com/ROCm/rocprofiler-register. Copyright (c) Advanced Micro Devices, Inc. MIT License.
+
+- librocm_sysdeps_*.so* - TheRock's rocm_sysdeps build of the system libraries the runtime links, so the
+  payload does not depend on which version a distribution ships. Each is unmodified from TheRock and keeps
+  its upstream licence:
+
+    librocm_sysdeps_bz2.so          libbzip2   https://sourceware.org/bzip2/                bzip2-1.0.6
+    librocm_sysdeps_drm.so.2        libdrm     https://gitlab.freedesktop.org/mesa/drm     MIT
+    librocm_sysdeps_drm_amdgpu.so.1 libdrm     https://gitlab.freedesktop.org/mesa/drm     MIT
+    librocm_sysdeps_elf.so.1        libelf     https://sourceware.org/elfutils/            GPL-3.0-or-later OR LGPL-3.0-or-later
+    librocm_sysdeps_liblzma.so.5    liblzma    https://tukaani.org/xz/                     public domain (0BSD)
+    librocm_sysdeps_numa.so.1       libnuma    https://github.com/numactl/numactl          LGPL-2.1
+    librocm_sysdeps_z.so.1          zlib       https://zlib.net/                           Zlib
+    librocm_sysdeps_zstd.so.1       zstd       https://github.com/facebook/zstd            BSD-3-Clause OR GPL-2.0
+
+-------------------------------------------------------------------------------------
 LLVM OpenMP runtime (libomp.so, packed beside the HRX llama.cpp libraries in hrx/llama/bin)
 
 - libomp.so from TheRock's LLVM (ROCm's llvm-project, https://github.com/ROCm/llvm-project,

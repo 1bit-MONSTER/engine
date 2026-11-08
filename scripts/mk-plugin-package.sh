@@ -95,6 +95,17 @@ for so in $(LD_LIBRARY_PATH=$libdirs ldd "$libhsa" | awk '/=> \// {print $3}' | 
     install -m 0644 "$so" "$hsa_dir/$(basename "$so")"
     copied=$((copied + 1))
 done
+# The ldd closure above is not the whole set: libhsa OPENS the aqlprofile agent by name at run time
+# (libhsa-amd-aqlprofile64.so.1, the profiling interface), so ldd cannot see it and a payload built from
+# ldd alone ships a runtime that reaches for it wherever the machine happens to offer it - which is how
+# engine #1411's c22 install ended up mapping 64 files out of a builder's toolchain. It ships beside the
+# runtime with the rest, and the build refuses if it is not where the runtime was found.
+for pat in libhsa-amd-aqlprofile64.so*; do
+    aq=$(ls "$srcdir"/$pat 2>/dev/null | head -1)
+    [ -n "$aq" ] || { echo "no $pat beside $libhsa: the HSA runtime opens the aqlprofile agent by name at run time, so a payload without it resolves it from wherever the machine has one (engine #1411)" >&2; exit 1; }
+    install -m 0644 "$aq" "$hsa_dir/$(basename "$aq")"
+    copied=$((copied + 1))
+done
 missing=$(LD_LIBRARY_PATH=$hsa_dir ldd "$hsa_dir/libhsa-runtime64.so.1" | awk '/not found/ {print $1}' | tr '\n' ' ')
 [ -z "${missing// /}" ] || {
     echo "libhsa needs $missing and this build could not stage it beside the runtime;

@@ -63,6 +63,21 @@ c=$(curl -s -m 30 -o /tmp/embed_serve_er2 -w '%{http_code}' -H 'Content-Type: ap
 check "missing input: status" "$c" 400
 grep -q "input is required" /tmp/embed_serve_er2 && echo "  PASS missing input: named refusal" || { echo "  FAIL missing input not named"; fails=$((fails+1)); }
 
+# concurrency: the route answers from a worker pool, so N simultaneous requests must all be 200 and identical
+# (the NPU path's shared weight cache is the reason this row exists; cpu is the device-free half of it)
+rm -f /tmp/embed_serve_p[0-9]*.json
+pids=""
+for i in 1 2 3 4 5 6 7 8; do
+    curl -s -m 30 -o "/tmp/embed_serve_p$i.json" -H 'Content-Type: application/json' \
+        -d '{"input":"hello world"}' "http://127.0.0.1:$PORT/v1/embeddings" &
+    pids="$pids $!"
+done
+# wait for the CURLS only: a bare `wait` would also wait for the serve process and hang until it is killed
+for p in $pids; do wait "$p"; done
+check "concurrency: 8 identical replies" "$(md5sum /tmp/embed_serve_p*.json | awk '{print $1}' | sort -u | wc -l)" 1
+check "concurrency: 8 replies, none empty" "$(grep -l '"embedding"' /tmp/embed_serve_p*.json | wc -l)" 8
+rm -f /tmp/embed_serve_p[0-9]*.json
+
 # the model list names the role and the device
 body=$(curl -s -m 10 "http://127.0.0.1:$PORT/v1/models")
 echo "$body" | grep -q '"role":"embedding"' && echo "$body" | grep -q '"device":"cpu"' && echo "  PASS /v1/models: role and device" || { echo "  FAIL /v1/models"; fails=$((fails+1)); }

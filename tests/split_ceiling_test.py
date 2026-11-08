@@ -57,7 +57,8 @@ for label, gpu_ms, want, tol in (
 #     actually run beside -- the microbenchmark is 3-4x faster than the engine -- so a regression here is the
 #     difference between "the split cannot pay" and "it pays".
 for label, gpu_ms, tile_ms, want, want_tiles in (
-    ("in-engine 1.441 ms/256 rows, today's tile", 92.224, 8.61, 1.164, 9),
+    ("post-fix runtime 0.855 ms/256 rows", 54.72, 8.61, 1.085, 5),
+    ("in-engine 1.441 ms/256 rows, pre-#782 library", 92.224, 8.61, 1.164, 9),
     ("in-engine at the 4x bar (2.15 ms/tile)", 92.224, 2.15, 1.650, 26),
     ("in-engine, slower per-dispatch reading 2.883 ms/256 rows", 184.512, 8.61, 1.333, 16),
 ):
@@ -71,6 +72,14 @@ for label, gpu_ms, tile_ms, want, want_tiles in (
 #    critical path.  A rounding implementation would report 60.27 ms there instead of 59.55.
 reg = sc.ceiling(65.71, 8.61, 16384)
 check("integer-tile optimum is 6, not the rounded 7", reg["optimum_npu_tiles"] == 6, str(reg["optimum_npu_tiles"]))
+
+# 2b. M<=2048 on the post-fix runtime: the whole up_gate GEMM is 8 row-groups x 0.855 ms = 6.84 ms, less than one
+#     8.61 ms NPU tile, so the optimum is *zero* tiles and the split is 1.00x. A version that always puts a tile on
+#     the NPU "because there are rows" would report >1 here and would be wrong on the engine the pin builds.
+small = sc.ceiling(6.84, 8.61, 2048)
+check(f"M=2048 post-fix: {small['ceiling']:.3f}x at {small['optimum_npu_tiles']} tiles",
+      small["optimum_npu_tiles"] == 0 and abs(small["ceiling"] - 1.0) < 1e-9,
+      f"got {small['optimum_npu_tiles']} tiles / {small['ceiling']:.3f}x")
 
 # 3. The end-to-end factor: attention is 47.7 % of Qwen3-4B's pp16384 device time (the recorded split), so a
 #    split can only touch 52.3 % of it.  With the fast iGPU that turns 1.032x per GEMM into 1.017x e2e -- the

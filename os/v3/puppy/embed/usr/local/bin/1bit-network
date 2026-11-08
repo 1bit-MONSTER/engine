@@ -224,7 +224,7 @@ esac
 
 tmp=$CONF.tmp
 {
-    echo "# written by 1bit-network on $(date -u +%FT%TZ); applied at boot by /etc/init.d/14onboard-net"
+    echo "# written by 1bit-network on $(date -u +%FT%TZ); applied at boot by /etc/init.d/zz-onboard-net"
     echo "# recovery: 1bit-network reset   (from tty1, the serial console or the console menu)"
     echo "iface=$dev"
     echo "static=$addr"
@@ -239,7 +239,7 @@ mv -f "$tmp" "$CONF" || fail "cannot install $CONF"
 sync
 say "1bit-network: persisted to $CONF (iface=$dev static=$addr gateway=${gw:--} dns=${dnsv:--})"
 
-/etc/init.d/14onboard-net start || fail "applied the file but the interface did not take the address (see $LOG)"
+/etc/init.d/zz-onboard-net start || fail "applied the file but the interface did not take the address (see $LOG)"
 if ip -4 -o addr show dev "$dev" 2> /dev/null | grep -q " ${addr%/*}/"; then
     say "1bit-network: $dev carries ${addr} now, and will again at the next boot"
     [ -z "$gw" ] || say "  gateway $gw"

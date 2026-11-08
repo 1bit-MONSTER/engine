@@ -709,6 +709,12 @@ if assert_pupsfs:
                     print("FAIL net          the machine did not come back after the static-address reboot"); ok = False
                     v.close()
                 else:
+                    # zz-onboard-net runs AFTER connman (which sorts under "c"), so it lands later than the shell: wait for
+                    # it rather than sampling the instant the shell appears (measured: "<none>" at the shell, the address
+                    # minutes later from connman's own stored config - which is what "applied" must never look like)
+                    val("WAITNET", "n=0; while [ $n -lt 18 ]; do "
+                                   "ip -4 -o addr show dev %s 2>/dev/null | grep -q '%s' && break; "
+                                   "sleep 5; n=$((n+1)); done; echo waited" % (dev, static_addr), timeout=180)
                     per = val("PERSIST", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
                     f = val("CONF", "grep -c '^static=' /data/net.conf 2>/dev/null")
                     cm = val("CONNMAN", "connmanctl services --properties 2>/dev/null | grep -c 'Method=manual'")

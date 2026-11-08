@@ -123,5 +123,6 @@ input measured ~6 % slower than CPU input on a 0.6B while removing one node and 
 
 So at default settings a census of `1 of 3024` nodes with `GET_ROWS x 1` and 2 graph splits is the floor for **every**
 model at `-ngl 99`, Zamba2 forms included, and it is not residue these changes added; `LLAMA_INPUT_LAYER_ON_DEV=1`
-is how you leave it. (Engine **#1316** is where both halves were measured — it is not the #856 host-pointer import,
-which `GGML_HRX_WEIGHT_HOST_PLACEMENT=0` shows changes nothing here.)
+is how you leave it. (Engine **#1316** is where both halves were measured, and it is not the #856 host-pointer import:
+while that import existed, `GGML_HRX_WEIGHT_HOST_PLACEMENT=0` reproduced the placement identically — and it has since
+been replaced outright, so at this pin the import is not in the tree at all. [hrx.md](hrx.md) records that removal.)

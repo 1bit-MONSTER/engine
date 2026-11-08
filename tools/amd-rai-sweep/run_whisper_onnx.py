@@ -65,12 +65,20 @@ def main():
     ap.add_argument("encoder")
     ap.add_argument("decoder")
     ap.add_argument("wav", help="16 kHz mono s16 PCM")
-    ap.add_argument("--tokenizer", default="openai/whisper-tiny",
-                    help="reference tokenizer; use openai/whisper-small.en for the -en packs")
+    ap.add_argument("--tokenizer", default=None,
+                    help="reference tokenizer (default: by the encoder's mel-bin count - 128 -> whisper-large-v3, "
+                         "80 -> whisper-tiny); use openai/whisper-small.en for the -en packs")
     a = ap.parse_args()
 
-    fe = WhisperFeatureExtractor.from_pretrained(a.tokenizer)
-    tok = WhisperTokenizer.from_pretrained(a.tokenizer)
+    # The export decides the mel-bin count: whisper large-v3/turbo take 128 bins, tiny/base/small/medium take 80. A
+    # feature extractor of the wrong width is rejected by the graph (and, in a driver, reads as "no output").
+    so0 = ort.SessionOptions()
+    so0.log_severity_level = 3
+    enc = ort.InferenceSession(a.encoder, so0, providers=["CPUExecutionProvider"])
+    bins = enc.get_inputs()[0].shape[1]
+    ref = a.tokenizer or ("openai/whisper-large-v3" if bins == 128 else "openai/whisper-tiny")
+    fe = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3" if bins == 128 else "openai/whisper-tiny")
+    tok = WhisperTokenizer.from_pretrained(ref)
     vocab = tok.get_vocab()
 
     def tid(token, default):
@@ -93,7 +101,6 @@ def main():
     so = ort.SessionOptions()
     so.log_severity_level = 3
     t0 = time.time()
-    enc = ort.InferenceSession(a.encoder, so, providers=["CPUExecutionProvider"])
     dec = ort.InferenceSession(a.decoder, so, providers=["CPUExecutionProvider"])
     t_load = time.time() - t0
     t0 = time.time()

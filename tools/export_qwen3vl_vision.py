@@ -228,6 +228,38 @@ def hf_dir_of(fp32_dir: str) -> str:
     return meta.get("source", "")
 
 
+def bench(out_dir: str, images: int, providers: str):
+    """Seconds per image through the graph, on the providers named (e.g. "CPUExecutionProvider").
+
+    This is gate 3's other half: the CPU projector in llama.cpp measures 16.97 s/image on this box, and a row here is
+    what our graph costs on the same machine. Not an accuracy row -- `check` is.
+    """
+    import onnxruntime as ort
+    import time
+
+    meta = json.load(open(os.path.join(out_dir, "vision_fp32.json")))
+    bucket, patch, temporal = int(meta["bucket_patches"]), int(meta["patch"]), int(meta["temporal_patch"])
+    provs = [p.strip() for p in providers.split(",") if p.strip()]
+    sess = ort.InferenceSession(os.path.join(out_dir, "vision_fp32.onnx"), providers=provs)
+    rng = np.random.default_rng(11)
+    pv = make_image(rng, bucket, bucket, patch, temporal)
+    grid = np.array([[1, bucket, bucket]], dtype=np.int64)
+    t0 = time.time()
+    sess.run(None, {"pixel_values": pv, "image_grid_thw": grid})          # warm-up (graph + arena)
+    warm = time.time() - t0
+    times = []
+    for _ in range(images):
+        pv = make_image(rng, bucket, bucket, patch, temporal)
+        t0 = time.time()
+        sess.run(None, {"pixel_values": pv, "image_grid_thw": grid})
+        times.append(time.time() - t0)
+    best, med = min(times), sorted(times)[len(times) // 2]
+    print(f"providers={sess.get_providers()} images={images} warm-up {warm:.2f}s | "
+          f"per image best {best:.2f}s median {med:.2f}s | {1.0 / best:.3f} images/s")
+    print(f"cpu bar to beat (llama.cpp CPU projector, measured): 16.97 s/image")
+    return 0
+
+
 def quantize(fp32_dir: str, out_dir: str, calib: int):
     """QDQ int8, A8W8 per-channel -- the shape our ORT EP runs (Quark-style A8W8).
 
@@ -309,6 +341,10 @@ def main():
     q.add_argument("fp32_dir")
     q.add_argument("out_dir")
     q.add_argument("--calib", type=int, default=32)
+    b = sub.add_parser("bench")
+    b.add_argument("out_dir")
+    b.add_argument("--images", type=int, default=3)
+    b.add_argument("--providers", default="CPUExecutionProvider")
     c = sub.add_parser("check")
     c.add_argument("hf_dir")
     c.add_argument("out_dir")
@@ -320,6 +356,8 @@ def main():
         return 0
     if a.cmd == "quantize":
         return quantize(a.fp32_dir, a.out_dir, a.calib)
+    if a.cmd == "bench":
+        return bench(a.out_dir, a.images, a.providers)
     return check(a.hf_dir, a.out_dir, a.images, a.onnx)
 
 

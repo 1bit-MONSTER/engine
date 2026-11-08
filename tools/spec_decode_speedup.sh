@@ -21,8 +21,10 @@
 #   A: the target alone            (baseline)
 #   B: the target + the draft       (the runtime's own speculative decoding: -md / --draft-max or --spec-draft-n-max)
 #
-# Both arms run the same greedy requests back to back, the first request of each being discarded as warmup -- on a loaded
-# box that request can be 10-14x slower than the next one, which is how a first sweep of this measurement came out void.
+# Both arms run the same greedy requests back to back. The first SKIP_FIRST requests of each arm are discarded as warmup:
+# two by default, because ONE is not enough on this box -- an HRX baseline that read 40.6 -> 51.9 -> 46.8 tok/s across three
+# samples (unsettled, not monotonic) made a 1.01x result look like 1.50x, and 98 % of that claimed gain was artefact. Every
+# kept sample is printed for both arms so an unsteady baseline is visible rather than hidden inside a median.
 # Judge it by: the two medians, the ratio, and the runtime's own acceptance accounting from the server log.
 #
 # THREE THINGS THIS HARNESS LEARNED THE HARD WAY (each cost a gpu-hold ticket):
@@ -47,9 +49,10 @@ SRV_ARGS=${SRV_ARGS:--ngl 0 -t 4}
 DRAFT_MAX_FLAG=${DRAFT_MAX_FLAG:---draft-max}
 DRAFT_MIN_FLAG=${DRAFT_MIN_FLAG:---draft-min}
 REQS=${REQS:-3}
-SKIP_FIRST=${SKIP_FIRST:-1}   # warm-up requests discarded per arm. One is not always enough on this box: an HRX baseline
-                              # climbing 40.6 -> 51.9 -> 46.8 across three samples produced a 1.50x "speedup" that was
-                              # really 1.03x once the baseline had settled (2026-11-08).
+SKIP_FIRST=${SKIP_FIRST:-2}   # warm-up requests discarded per arm; TWO, because one is what produced the bad number below.
+                              # An HRX baseline reading 40.6 -> 51.9 -> 46.8 across three samples (unsettled, not monotonic)
+                              # made a 1.012x result look like 1.50x; 98 % of that claimed gain was artefact (2026-11-08).
+                              # SKIP_FIRST=0 degrades cleanly to REQS samples (the -le test is never true).
 WAITMAX=${WAITMAX:-150}
 PORT_A=${PORT_A:-18120}
 PORT_B=${PORT_B:-18121}

@@ -623,6 +623,65 @@ if assert_pupsfs:
             else:
                 print("PASS account      %s, sudo -> root, keys 600 onebit, %s key line(s) from %s"
                       % (acct, nkey, same[len("same-from-"):]))
+            # ---- engine#712 item 3 (the server-shaped rest), measured where it matters: on the installed machine.
+            # The claim is "present or named", so each row is a fact a server has: a firewall default that DROPS and
+            # opens only what we serve, the v6 stack too, a time source, the machine's name, and logs that survive on
+            # the data partition. What is NOT measured here (and stays named in the issue) is a *persisted* static
+            # address: the console's static action is session-only on purpose, and the persistent form needs a connman
+            # service config - a product decision, not a row to add.
+            #
+            # WAIT for the firewall first: /etc/rc.d/rc.sysinit starts rc.services in the BACKGROUND, and this shell is
+            # itself one of those scripts ("21serial-console"), so it exists before the last script - the one that opens
+            # the ports - has run. Measured: the policies are ACCEPT and there are no port rules at the moment the shell
+            # appears, and 10 s later they are DROP with 7 port rules. A row that fires immediately would "find" a
+            # missing firewall that is not missing (and did, once: the first version of this row).
+            wait_s = val("WAIT", "n=0; while [ $n -lt 24 ]; do iptables -S INPUT 2>/dev/null | grep -q 'dport 13305' && "
+                                 "iptables -S INPUT 2>/dev/null | grep -q 'dport 22' && break; sleep 5; n=$((n+1)); done; "
+                                 "echo $((n*5))", timeout=180)
+            fw4 = val("FW4", "iptables -S 2>/dev/null | awk '/^-P/ { printf \"%s \", $0 }'")
+            # each service port counted on its own: `dport (22|13305)` was satisfied by two rules for the same port,
+            # and the row's claim is that BOTH services are reachable (review nit on #1402)
+            fw22 = val("FW22", "iptables -S INPUT 2>/dev/null | grep -cE '\\-p tcp (\\-m tcp )?--dport 22 .*-j ACCEPT'")
+            fw13 = val("FW13", "iptables -S INPUT 2>/dev/null | grep -cE '\\-p tcp (\\-m tcp )?--dport 13305 .*-j ACCEPT'")
+            fw6 = val("FW6", "ip6tables -S 2>/dev/null | awk '/^-P/ { printf \"%s \", $0 }'")
+            # the exempts, matched separately and order-insensitively: rc.firewall writes
+            # `-m conntrack --ctstate RELATED,ESTABLISHED`, and a pattern demanding ESTABLISHED,RELATED in that order
+            # counted 1 instead of 2 and failed a firewall that was correct (measured)
+            fwbase = val("FWBASE", """sh -c 'l=$(iptables -S INPUT 2>/dev/null | grep -c -- "-i lo -j ACCEPT"); e=$(iptables -S INPUT 2>/dev/null | grep -cE "[-][-]ctstate [A-Z,]*ESTABLISHED"); echo $((l+e))'""")
+            fwrules = val("FWRULES", "iptables -S INPUT 2>/dev/null | head -12 | tr '\n' ';'")
+            stray = val("STRAY", "iptables -S INPUT 2>/dev/null | grep -c 'dport 9999'")
+            ntp = val("NTP", "grep -h '^FallbackTimeservers' /etc/connman/main.conf 2>/dev/null")
+            hn = val("HN", "hostname 2>/dev/null")
+            logs = val("LOGS", "ls /data/logs 2>/dev/null | wc -l")
+            print("INFO server       in place %s s after the shell: %s | %s | %s"
+                  % (wait_s, fw4.strip(), fw6.strip(), ntp.strip()))
+            print("INFO server       hostname=%s, /data/logs %s file(s), ACCEPT rules: tcp/22=%s tcp/13305=%s"
+                  % (hn, logs, fw22, fw13))
+            print("INFO server       INPUT rules: %s" % fwrules[:400])
+            if "INPUT DROP" not in fw4:
+                print("FAIL server       the IPv4 firewall has no default DROP on INPUT: %s" % (fw4 or "<no iptables>")); ok = False
+            elif "INPUT DROP" not in fw6:
+                print("FAIL server       the IPv6 firewall has no default DROP on INPUT: %s" % (fw6 or "<no ip6tables>")); ok = False
+            elif not fw22.isdigit() or int(fw22) < 1:
+                print("FAIL server       ssh tcp/22 is not allowed inbound (rules: %s)" % (fw22 or "<none>")); ok = False
+            elif not fw13.isdigit() or int(fw13) < 1:
+                print("FAIL server       Lemonade tcp/13305 is not allowed inbound (rules: %s)" % (fw13 or "<none>")); ok = False
+            elif not fwbase.isdigit() or int(fwbase) < 2:
+                print("FAIL server       the DROP policy has no loopback and established/related exempts (found %s)"
+                      % (fwbase or "<none>")); ok = False
+            elif stray != "0":
+                print("FAIL server       a port nothing serves (9999) is in the INPUT rules: %s" % (stray or "<unread>")); ok = False
+            elif "FallbackTimeservers" not in ntp:
+                print("FAIL server       no time source configured (connman FallbackTimeservers: %s)" % (ntp or "<absent>")); ok = False
+            elif not hn or hn == "(none)":
+                print("FAIL server       the machine has no hostname (%s)" % (hn or "<empty>")); ok = False
+            elif not logs.isdigit() or int(logs) < 1:
+                print("FAIL server       nothing on /data/logs: the boot's logs do not survive (count: %s)" % (logs or "<none>")); ok = False
+            else:
+                print("PASS server       after %s s: firewall DROP v4+v6, the inbound services it serves (ssh tcp/22, "
+                      "Lemonade tcp/13305, mDNS udp/5353) the only ACCEPT rules, loopback+established exempted; a time "
+                      "source (%s), hostname %s, /data/logs %s file(s)"
+                      % (wait_s, ntp.strip(), hn, logs))
             wrote = val("WROTE", "sh -c 'echo 712 > /root/712-persist; sync; cat /root/712-persist'")
             if wrote != "712":
                 print("FAIL persist      could not write to the installed root (/root/712-persist: %s)" % (wrote or "<no answer>")); ok = False

@@ -281,8 +281,10 @@ struct Fconst19Rule {
     int64_t tile;
 };
 // Every entry was measured by diffing the 1.9 pack against the 1.8 pack of the SAME model: the bundle's tile shape and
-// its rotation are not derivable from the pack, and neither is `prefix` (Qwen3 puts its per-head QK norm gains inside
-// the block before the bundle, so `64 + 2*hidden` is not the rule there).
+// its rotation are not derivable from the pack, and neither is `prefix`. It was tempting to read the extra bytes as
+// Qwen3's per-head QK norm gains, but Llama-3.2-1B -- which has no QK norms at all -- carries the same +4,352 at hidden
+// 2,048, so the extra is a property of the geometry, not of the architecture. Measured anyway, because a plausible
+// explanation that survives one model is how this table would get a wrong row.
 constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen2.5-0.5B-Instruct: normalises to its 1.8 twin byte for byte, whole file, all 24 blocks.
     {896, 14, 24, 1856, 16, 2, 34816},
@@ -293,6 +295,10 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen3 offset seen at 1.7B -- 64 + 2*hidden + 4,352, so 8,512 at hidden 2,048 and 9,536 at 2,560 -- and the tile
     // count differs from 1.7B's 3, which is why this is measured per pack and never derived.
     {2560, 32, 36, 9536, 5, 1, 1462272},
+    // Llama-3.2-1B-Instruct: hidden 2,048 with 32/16 heads and no QK norms -- the first non-Qwen family here. Same
+    // prefix as Qwen3-1.7B at this hidden size (8,512), a different bundle (5 tiles of 591,872, not 3 of 1,183,744),
+    // and 1,857 of 686,518,336 bytes differ (2.7e-6). This row is the one that disproved the QK-norm explanation above.
+    {2048, 32, 16, 8512, 5, 1, 591872},
 };
 
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes

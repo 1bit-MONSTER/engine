@@ -750,6 +750,31 @@ if assert_pupsfs:
                     else:
                         print("PASS net          reset removed /data/net.conf and the link is back on DHCP (%s)"
                               % dhcp_addr.split("/")[0])
+                        # ---- and the OTHER documented recovery: delete /data/net.conf by hand (a rescue shell), reboot.
+                        # connman keeps a manual configuration in its own state, so without the marker the box would stay
+                        # on the static address for ever while the doc says "deleting it is the same thing" (review on
+                        # #1527). Re-apply, then delete the file instead of using reset.
+                        val("SETAGAIN", "1bit-network set-static %s %s >/dev/null 2>&1;" % (static_addr, gw or "") +
+                                        " rm -f /data/net.conf; ls /data/.net-manual >/dev/null 2>&1 && echo marker", timeout=240)
+                        if not v.reboot():
+                            print("FAIL net          the machine did not come back after the hand-deleted net.conf"); ok = False
+                            v.close()
+                        else:
+                            val("WAITDHCP", "n=0; while [ $n -lt 24 ]; do "
+                                            "ip -4 -o addr show dev %s 2>/dev/null | grep -q '%s' && break; "
+                                            "sleep 5; n=$((n+1)); done; echo waited" % (dev, dhcp_addr.split('/')[0]), timeout=180)
+                            back = val("DHCPBACK", "ip -4 -o addr show dev %s 2>/dev/null | awk '{ print $4 }'" % dev)
+                            mk = val("MARK", "ls /data/.net-manual 2>&1 | head -1")
+                            print("INFO net          after deleting net.conf by hand and rebooting: %s | marker: %s"
+                                  % (back or "<none>", mk[-40:]))
+                            if dhcp_addr.split("/")[0] not in (back or ""):
+                                print("FAIL net          with net.conf deleted by hand the link did not return to DHCP (%s):"
+                                      " the documented hand-recovery does not recover" % (back or "<none>")); ok = False
+                            elif "No such file" not in mk:
+                                print("FAIL net          the marker survived: the box keeps undoing DHCP every boot (%s)" % mk[-40:]); ok = False
+                            else:
+                                print("PASS net          deleting /data/net.conf by hand is a real recovery: the next boot"
+                                      " hands the link back to DHCP (%s) and clears the marker" % dhcp_addr.split("/")[0])
             else:
                 print("INFO net          no global IPv4 address on this boot (%s): the static-address rows are a SKIP" % (cur or "<none>"))
             wrote = val("WROTE", "sh -c 'echo 712 > /root/712-persist; sync; cat /root/712-persist'")

@@ -35,6 +35,9 @@ set -u
 
 DATA=/data
 CONF=$DATA/net.conf
+# what WE put on connman's own state (it persists a manual config across reboots, independent of net.conf): the boot uses
+# it to hand the link back to DHCP when the file is gone, and never touches a configuration it did not write
+MARK=$DATA/.net-manual
 LOG=/var/log/1bit-network.log
 say() { printf '%s\n' "$*" | tee -a "$LOG"; }
 die() { say "1bit-network: REFUSED: $*" >&2; exit 2; }
@@ -141,9 +144,9 @@ conf_ok() {      # the loaded values have to be usable, or the boot must not tou
 connman_service_for_iface() {
     [ -n "${1:-}" ] || return 1
     command -v connmanctl > /dev/null 2>&1 || return 1
-    mac=$(cat "/sys/class/net/$1/address" 2> /dev/null | tr -d ':')
-    [ -n "$mac" ] || return 1
-    connmanctl services 2> /dev/null | awk -v m="$mac" '
+    _csfi_mac=$(cat "/sys/class/net/$1/address" 2> /dev/null | tr -d ':')
+    [ -n "$_csfi_mac" ] || return 1
+    connmanctl services 2> /dev/null | awk -v m="$_csfi_mac" '
         index($0, m) { for (i = 1; i <= NF; i++) if ($i ~ /^(ethernet|wifi|bluetooth)_/) { print $i; exit } }'
 }
 
@@ -202,6 +205,7 @@ fi
 if [ "$mode" = reset ]; then
     read_conf "$CONF"
     rm -f "$CONF" || fail "cannot remove $CONF"
+    # the marker goes only after connman has been handed back below; if that fails it stays, and the next boot retries
     # give the interface back to DHCP through connman, so a wrong address really is gone and not just forgotten.
     # The lookup is by MAC (the old one took the first connected service on any link, which on a two-interface machine
     # is the wrong one), and the result is reported rather than assumed.
@@ -217,6 +221,7 @@ if [ "$mode" = reset ]; then
             say "1bit-network: connman has no service for $iface; the link keeps its address until reconnect"
         fi
     fi
+    rm -f "$MARK" 2> /dev/null
     say "1bit-network: reset - $CONF removed, the next boot and this one use DHCP"
     say "  (if the link still carries the old address, restart the network:  /etc/init.d/connman restart)"
     exit 0
@@ -254,6 +259,7 @@ tmp=$CONF.tmp
     true
 } > "$tmp" || fail "cannot write $tmp"
 mv -f "$tmp" "$CONF" || fail "cannot install $CONF"
+printf '%s\n' "$dev" > "$MARK" 2> /dev/null   # so a boot without the file can undo what this command did
 sync
 say "1bit-network: persisted to $CONF (iface=$dev static=$addr gateway=${gw:--} dns=${dnsv:--})"
 

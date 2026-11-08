@@ -23,8 +23,13 @@
 # script - so a `14onboard-net` ran BEFORE the daemon that owns the link existed: `connmanctl` had no service, the `ip`
 # fallback put the address on, and connman then took the link over and flushed it, so the machine came up with no address
 # at all for a while (measured: the row saw "<none>" right after the reboot and the static address only minutes later,
-# applied by connman from its own stored config). Running after it means the config is given to connman itself. with no file, or a file that does not validate, it does NOTHING and says so - a
-# machine that cannot reach the LAN is worse than one on DHCP, and the repair path has to stay obvious:
+# applied by connman from its own stored config). Running after it means the config is given to connman itself.
+#
+# With NO file - or a file that does not validate - it does nothing to the interface, except undo a manual configuration
+# this box set earlier (`/data/.net-manual`): deleting `/data/net.conf` from a rescue shell is the recovery the docs
+# promise, and connman would otherwise keep applying the old address at every boot. Doing nothing to a link it did not
+# configure is deliberate - a machine that cannot reach the LAN is worse than one on DHCP, and the repair path has to
+# stay obvious:
 #
 #   recovery:  1bit-network reset        (tty1, the serial console, or the console menu's bash item)
 #
@@ -44,7 +49,31 @@ log() { printf '%s\n' "$*" | tee -a "$LOG"; }
 mkdir -p /tmp 2> /dev/null
 : >> "$LOG" 2> /dev/null || LOG=/dev/null
 
-[ -f "$CONF" ] || { log "zz-onboard-net: no $CONF: the interface stays on DHCP (connman)"; exit 0; }
+MARK=$DATA/.net-manual
+
+# No file: nothing to apply. But connman keeps a manual configuration in its OWN state, so if this machine ever set one
+# and the file is now gone (someone deleted /data/net.conf by hand - the recovery the docs promise), hand the link back
+# to DHCP here. Only configurations this box wrote are undone: the marker says so, and a service we never touched is left
+# alone.
+if [ ! -f "$CONF" ]; then
+    if [ -f "$MARK" ]; then
+        miface=$(head -1 "$MARK" 2> /dev/null)
+        [ -n "$miface" ] || { log "zz-onboard-net: $MARK is empty; nothing to hand back"; exit 0; }
+        NETWORK=/usr/local/bin/1bit-network
+        # shellcheck disable=SC1090  # the image's own path; one definition of the format and the service lookup
+        [ -r "$NETWORK" ] && ONEBIT_NETWORK_LIB=1 . "$NETWORK"
+        svc=$(connman_service_for_iface "$miface" 2> /dev/null)
+        if [ -n "$svc" ] && connmanctl config "$svc" --ipv4 dhcp >> "$LOG" 2>&1; then
+            rm -f "$MARK"
+            log "zz-onboard-net: no $CONF and a manual config was ours: $svc handed back to DHCP"
+        else
+            log "zz-onboard-net: no $CONF, and $miface could not be handed back to DHCP (see $LOG); will retry next boot"
+        fi
+        exit 0
+    fi
+    log "zz-onboard-net: no $CONF: the interface stays on DHCP (connman)"
+    exit 0
+fi
 
 # the same parse and validation as 1bit-network, sourced rather than copied: one definition of "a usable net.conf"
 NETWORK=/usr/local/bin/1bit-network

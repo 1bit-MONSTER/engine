@@ -180,11 +180,19 @@ layers[0]     {"index": 0, "role": "gdn", "qkv": {"K": 5120, "N": 10240, "fused"
   target behind it, and `open()` consuming the plan instead of duplicating the derivation. The step-by-step record is
   [npu-p4-target-split.md](npu-p4-target-split.md) §3, so this list does not snapshot it, but the two ends that touch
   *this* page's fields are worth naming: the plan can now **name the design set** (#1330, #1333 — `designs[]` above),
-  and the setup side is **the target's** — the M=128 ELF set in `XdnaTarget::open_prefill()` (#1380) and the lm-head
-  context in `XdnaTarget::open_head()` (#1458, #1478), so `q4nx_forward.cpp` creates no `I8Ctx` at all. What is still
-  true from *this* page: `XdnaTarget::load_block` remains a named no-op, so weight residency and decoding stay as they
-  were — the cache fills lazily inside `gemv`, and `load_block()` turning that into an explicit block step is the one
-  A2 item left, an optimisation whose evidence is a tokens/s row (see §3's A2c).
+  and two of the three context sets are now **the target's**: the M=128 prefill ELF set in
+  `XdnaTarget::open_prefill()` (#1380) and the lm-head context in `XdnaTarget::open_head()` (#1458, #1478) — the
+  forward calls `open_head()` (`q4nx_forward.cpp:1357`) and then asks the target for the context
+  (`head_ctx()`), rather than building it. **The M=16 decode family is still the forward's**, and that is the
+  correction to an earlier version of this paragraph: the target allocates the memory
+  (`XdnaTarget::make_ctx16()`), but the forward still decides which decode contexts exist and configures each one
+  field by field — `MD`, `KD`, `ND`, `blocked_b`, `pb16i`, `t2s`, the plane count
+  (`q4nx_forward.cpp:1306-1330`) — and `docs/npu-p4-target-split.md` §3 says the same in as many words ("still
+  in the forward, and therefore still owed: the M=16 decode family"). What is left on A2 is therefore two things,
+  not one: **A2c** moves that decode-family setup behind the target (it needs nothing the setup state does not
+  already carry), and `XdnaTarget::load_block` remains a named no-op, so weight residency and decoding stay as
+  they were — the cache fills lazily inside `gemv`, and turning that into an explicit block step is an optimisation
+  whose evidence is a tokens/s row, not a structural move.
 - **P5** (#804): Hexagon target (t2 gemv on HVX/HMX, QEMU v73 oracle) has no engine rows yet.
 - **P6** (#805): the shared drafter protocol is on main; tau=0.6 and Hexagon acceptance rows are still missing.
 - **P7** (#806): the `kv` contract above is in the plan and its arithmetic is gated in CI (`ctest -R npu_kv_int8`,

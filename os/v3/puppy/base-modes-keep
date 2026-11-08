@@ -12,9 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
-#
 # Paths in the BASE Puppy layer that must stay group/other-writable (engine#1474). One prefix per line, relative to the
 # root of the layered tree; `#` and blank lines are ignored. Everything not listed here has `go-w` applied by
 # `pack_normalise_base_modes` -- the group and other WRITE bits only, never any other bit: setting "other files 0644" the

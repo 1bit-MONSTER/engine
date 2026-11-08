@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 namespace onebit::npu::pack_import {
@@ -1047,6 +1048,22 @@ std::string Plan::manifest() const {
                              {"o_proj_k", o_k},
                              {"qk_norm", knorm_off != 0},
                              {"note", attn_note}};
+    // What the *graph* carries, in the graph's own terms. A pack's genre is the first question every sweep row asks,
+    // and until now it could only be answered by an external tool: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights
+    // as ordinary ONNX initializers (pi-inferzo: 25/25 real qweights, UINT8 [1152,7,64], location model_jit.onnx.data)
+    // while 1.8 and R1-Distill ship placeholders and put the weights in model.bin. Reported here so `npu-pack info`
+    // answers it with no download beyond the metadata and no third-party parser.
+    if (graph_matmuls >= 0) {
+        json g;
+        g["matmulnbits_ops"] = graph_matmuls;
+        g["real_weight_initializers"] = graph_real_weights;
+        g["external_tensors"] = graph_external;
+        if (graph_blocks.size() == 1) g["block_size"] = graph_blocks.begin()->first;
+        else if (!graph_blocks.empty()) g["block_size_per_op"] = graph_blocks;
+        if (!graph_weight_dims.empty()) g["weight_dims_sample"] = graph_weight_dims;
+        g["external_data_present"] = graph_external_bytes;  // bytes of the named .data file found on disk
+        j["graph_weights"] = g;
+    }
     j["mlp_section"] = {{"gate_up_units_measured", mlp_gu_units},
                         {"down_groups_measured", mlp_down_groups},
                         {"note", mlp_note}};
@@ -1107,12 +1124,41 @@ Plan plan(const std::string& pack_dir) {
     }
     p.dims = read_dims(geom, geom_src);
     const Dims& d = p.dims;
+    // (graph census is filled below, once the graph is parsed)
 
     std::error_code ec_graph;
     if (!fs::exists(pack_dir + "/" + graph, ec_graph))
         throw std::runtime_error("the pack's graph file " + graph + " is not in " + pack_dir +
                                  " (named by genai_config.json's model.decoder.filename)");
     const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph);
+    // Census the graph's own weight carrier (see plan_import.h's note): this is what tells a 1.3/1.6/1.7.1 pack
+    // (real ONNX initializers) from a 1.8/R1-Distill pack (placeholders, weights in model.bin) without parsing
+    // anything outside the pack.
+    {
+        p.graph_matmuls = int64_t(onnx.matmuls.size());
+        std::set<std::vector<int64_t>> dims_seen;
+        std::string ext_file;
+        for (const auto& mm : onnx.matmuls) {
+            if (mm.block) p.graph_blocks[mm.block]++;
+            if (mm.weight.empty()) continue;
+            const auto wi = onnx.index.find(mm.weight);
+            if (wi == onnx.index.end()) continue;
+            const OnnxTensor& w = onnx.tensors[wi->second];
+            if (!w.dims.empty()) {
+                p.graph_real_weights++;
+                if (dims_seen.size() < 4 && dims_seen.insert(w.dims).second)
+                    p.graph_weight_dims.push_back(w.dims);
+            }
+            if (!w.location.empty() && ext_file.empty()) ext_file = w.location;
+        }
+        for (const auto& t : onnx.tensors)
+            if (!t.location.empty()) p.graph_external++;
+        if (!ext_file.empty()) {
+            std::error_code ec;
+            const auto sz = fs::file_size(pack_dir + "/" + ext_file, ec);
+            if (!ec) p.graph_external_bytes = int64_t(sz);
+        }
+    }
     const OnnxTensor* embed = nullptr;
     for (const auto& t : onnx.tensors)
         if (t.name == "model.embed_tokens.weight") embed = &t;

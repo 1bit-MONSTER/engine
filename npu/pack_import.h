@@ -35,6 +35,7 @@
 
 #include <cstdint>
 #include <string>
+#include <map>
 #include <vector>
 
 namespace onebit::npu::pack_import {
@@ -106,6 +107,16 @@ struct Plan {
     // values differ on either pack, and the swap differs on 127-128 of 128).
     int64_t knorm_off = 0, qnorm_off = 0;
     int64_t mlp_off = 0;  // the MLP section starts just past the block's post-attention norm
+    // What the pack's *graph* carries, reported so `npu-pack info` can answer a pack's genre without a
+    // third-party parser: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights as ordinary ONNX initializers, while
+    // 1.8 and R1-Distill ship placeholders and keep the weights in model.bin (pi-inferzo, 2026-11-08).
+    // graph_matmuls < 0 means "no graph was read", which is why it is not just a count.
+    int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
+    int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
+    int64_t graph_external = 0;      // initializers that declare external data (location + offset)
+    int64_t graph_external_bytes = 0;// size on disk of the external file they name, 0 when it is not in the pack
+    std::map<int64_t, int64_t> graph_blocks;                 // block size -> how many ops declare it
+    std::vector<std::vector<int64_t>> graph_weight_dims;     // up to 4 distinct [N, K/block, bytes] shapes
     // The MLP section's geometry, likewise measured: gate and up share one fused 4,288-byte-subvolume
     // tensor of `mlp_gu_units` x 128 columns, then a 64-byte parameter subvolume, then down_proj in
     // 2,176-byte subvolumes. All of it has to add up to the block stride exactly, which is the check

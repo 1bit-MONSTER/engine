@@ -72,6 +72,37 @@ So the Gumiho row is *"fails as published, because our verifier is the wrong sha
 quality (its published numbers are the best in its class: 2.97× mean over Eagle-2's 2.74× on vicuna-7B). Running it would
 mean implementing a tree verifier first, which is its own project.
 
+## PARD-2's repos are weights-only — borrow the target's tokenizer
+
+`amd/PARD2-*` ship **`README.md`, `config.json`, `model.safetensors`, `warp_model.bin`** and nothing else: **no tokenizer
+files at all**. A converter pointed at such a repo dies with `FileNotFoundError: …/tokenizer.model` and then
+`NotImplementedError: BPE pre-tokenizer was not recognized`, which reads exactly like a broken converter and is not.
+
+The draft must **borrow its target's tokenizer**, and the identity check that makes that safe is cheap:
+`config.json: vocab_size 151936` — the Qwen3 family's — so any Qwen3 tokenizer pairs with it. With the repo's own weights
+untouched and a Qwen3 tokenizer dropped beside them, the stock converter succeeds first try:
+
+```sh
+mkdir /tmp/pard2-in && cp <repo>/{config.json,model.safetensors,warp_model.bin} /tmp/pard2-in/
+cp ~/models/npu/Qwen3-0.6B/{tokenizer.json,tokenizer_config.json} /tmp/pard2-in/     # same vocab: 151936
+python3 convert_hf_to_gguf.py /tmp/pard2-in --outfile /tmp/pard2-f16.gguf --outtype f16
+```
+
+Two further facts from the same measurement: **`warp_model.bin` (34-70 MB) is not in the GGUF** — it is PARD-2's extra
+module, so a converted artifact gives AR-mode drafting only, and a parallel-mode implementation needs that file; and the same
+1024-hidden / 28-layer draft serves both the 8B and 14B targets, which is what "target-aligned but target-independent" looks
+like in practice. Measured with it: `PARD2-Qwen3-8B` → `Qwen3-4B` gives **2.18 tokens/round** (1.36 accepted drafts/round,
+per-round `[0,2,1,3,0,2,3,0,0,0,4]`) — *below* PARD's 2.67 on its own family, correctly, because PARD-2 is aligned to 8B
+acceptance and a 4B target is off its pair.
+
+## A server must never outlive the arm that started it
+
+`tools/spec_decode_speedup.sh` starts a `llama-server` per arm and kills it at the end — but an interrupt (Ctrl-C, a ticket
+timeout, a `timeout` wrapper firing) used to leave the server running. **On 2026-11-08 an orphaned 14 h `llama-server` held
+51 GiB of GTT and knocked the PR-agent LLM off the iGPU**, which is a fleet incident, not a leak. The script now traps
+`EXIT INT TERM HUP` and kills the child, so the arm's server dies with the arm; if you drive a measurement any other way, put
+the server inside the same `gpu-hold`/`npu-hold` ticket as the measurement and let the ticket end it.
+
 ## Traps, each of which cost a measurement on this box
 
 * **`llama-cli -p … -n N -no-cnv` still enters its interactive loop** and spins `>` prompts forever; two unattended runs died

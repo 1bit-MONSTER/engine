@@ -155,14 +155,14 @@ missing=$(pack_missing_libs "$stage")
 # the private HIP kernels really are compiled into the HRX ggml library
 n=$(nm -D --defined-only "$stage/hrx/llama/bin/libggml-hrx.so" | grep -c ggml_hrx_hip_addon_register || true)
 [ "$n" != 0 ] || fail "libggml-hrx.so does not export ggml_hrx_hip_addon_register"
-# Count the embedded ELF images, not a string: the fatbin's spelling of "amdgcn-amd-amdhsa" depends on how the
-# bundle was assembled -- the shipped c31 library carries 56 code objects and zero occurrences of that string,
-# while a 3-object build carries two (engine#1443) -- so the string cannot stand in for "the kernels are
-# compiled in". The library's own header is one ELF image and every embedded code object adds one, so a library
-# with the kernels compiled in always has more than one; the count is in the message so a future refusal is
-# diagnosable from the log alone.
-elf_images=$(LC_ALL=C grep -ao $'\x7fELF' "$stage/hrx/llama/bin/libggml-hrx.so" | wc -l)
-[ "$elf_images" -gt 1 ] || fail "libggml-hrx.so carries no embedded code objects (${elf_images} ELF image(s): only the library's own header, so no fatbin entries)"
+# The property is "carries HIP code objects", not a proxy for it (engine#1443). Two proxies were tried and both
+# are one step short: `strings | grep amdgcn-amd-amdhsa` tests a clang offload-bundle header that a normally-built
+# HIP fat binary does not contain (the shipped c31 library: 51 code objects, 0 such strings), and "more than one
+# ELF image" counts *any* embedded ELF, so a library that embeds an x86-64 object or a JIT blob while carrying no
+# AMDGPU code object would pass. tools/code_objects.py reads the property: an embedded ELF header whose e_machine
+# is EM_AMDGPU (224). Its own test (tests/code_objects_test.py, ctest `code_objects`) pins both refusals.
+python3 "$src/tools/code_objects.py" "$stage/hrx/llama/bin/libggml-hrx.so" --quiet || \
+    fail "libggml-hrx.so carries no HIP code objects (no embedded ELF with e_machine EM_AMDGPU; see tools/code_objects.py)"
 
 # the NPU library exposes the public API and nothing that names the private sources
 n=$(nm -g --defined-only "$stage/npu/libnpu_rt_api.a" 2>/dev/null | grep -c ' T ' || true)

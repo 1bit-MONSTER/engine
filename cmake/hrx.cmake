@@ -158,8 +158,11 @@ if(NOT ONEBIT_HRX_DEVICE_LIB)
         endif()
     endif()
 endif()
+# It goes to the HIP kernel compile only (ONEBIT_HRX_HIP_FLAGS below), never into CMAKE_C/CXX_FLAGS:
+# those reach every host object of the hrx-system deps build, which compiles with -Werror, and a host C
+# file has no device code to link, so clang rejects the flag as unused (-Wunused-command-line-argument).
+# A cold HRX build failed on it here, and so did hrx-build whenever the deps rebuilt (runs 42524820160, 42526921955).
 if(ONEBIT_HRX_DEVICE_LIB)
-    string(APPEND ONEBIT_HRX_EXTRA_FLAGS " --rocm-device-lib-path=${ONEBIT_HRX_DEVICE_LIB}")
     message(STATUS "ONEBIT_HRX: device library ${ONEBIT_HRX_DEVICE_LIB}")
 else()
     message(STATUS "ONEBIT_HRX: no device library under ${ONEBIT_HRX_TOOLCHAIN}; hipcc's default is used")

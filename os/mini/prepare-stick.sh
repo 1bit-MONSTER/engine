@@ -46,6 +46,16 @@
 # Space: an IMAGE file's data partition is the image's 2 GiB until it is written to a device and grown (#706), so a
 # 0.6B GGUF (396 MB) and an NPU model directory (664 MB) do not both fit in one image prep. On a stick they do.
 #
+# Space is CHECKED BEFORE the staging writes anything (#1374): the bytes the models need (only the GROWTH over a file
+# that cp -f would truncate, so a re-run is not refused for space it already occupies) are compared with `df`'s available
+# bytes on the mounted data partition, and a shortfall is a refusal that names both numbers. Before this, the loop
+# learned about a full filesystem from cp's failure, and a cp that fails half way leaves a TRUNCATED model on the medium
+# - c32 staged 6.6 of 7.9 GB that way (partition grown to 58.1 GiB, filesystem still 7.8 GiB) and needed a hand-written
+# `e2fsck -f` + `resize2fs` + clear + restage. A failed grow is still silent and still leaves a working 2 GiB stick, as
+# #706 wants; the staging check is what notices. The same reasoning made the 'grown' line read its numbers from the
+# filesystem (`dumpe2fs -h`) and the 'data' line say "of partition", and made a refused `resize2fs` retried once after
+# `e2fsck -f -y` instead of being handed to a person at 2am.
+#
 # --npu-model: the engine's NPU format is a DIRECTORY (model.q4nx + tokenizer + config), and init.sh
 # registers every /data/models/*/model.q4nx as `<directory name>-1bit` with onebit_backend npu. So the
 # directory name is the model's name: `--npu-model ~/models/npu/Qwen3-0.6B` becomes the entry
@@ -140,7 +150,10 @@ START=$(printf '%s\n' "$chosen" | sed -n 's/.*start=[[:space:]]*\([0-9]\+\).*/\1
 SIZE=$(printf '%s\n' "$chosen" | sed -n 's/.*size=[[:space:]]*\([0-9]\+\).*/\1/p' | head -n 1)
 [ -n "$START" ] && [ -n "$SIZE" ] || die "could not read the partition's start/size out of: $chosen"
 printf 'target   %s\n' "$TARGET"
-printf 'data     Linux filesystem partition at sector %s, %s sectors (%.1f GiB)\n' \
+# "of partition", deliberately: this number is the partition table's, and c32 read it as the space the
+# filesystem had - the two differ by 50 GiB exactly when a grow did not take, which is the failure that
+# truncated a model (#1374). The filesystem's own size is printed by 'grown' below and by df at the end.
+printf 'data     Linux filesystem partition at sector %s, %s sectors (%.1f GiB of partition)\n' \
     "$START" "$SIZE" "$(awk -v s="$SIZE" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')"
 
 # the partition's device node: a real stick publishes it, an image file needs a loop device first
@@ -175,7 +188,6 @@ grow_data() {
     [ -n "$pn" ] || return 0
     end=$(( (START + SIZE) * 512 ))
     [ $(( dev_bytes - end )) -gt 1048576 ] || return 0   # no room worth growing into
-    SIZE0=$SIZE
     printf 'grow     data partition ends at %.1f GiB of %.1f GiB: growing it to the end of the device\n' \
         "$(awk -v b="$end" 'BEGIN { print b / 1073741824 }')" \
         "$(awk -v b="$dev_bytes" 'BEGIN { print b / 1073741824 }')"
@@ -227,10 +239,27 @@ printf 'node     %s\n' "$PART"
 # ext4 grows in place; the filesystem is not mounted yet, so this is an offline resize - the quick path.
 if [ "$GREW" = 1 ]; then
     command -v resize2fs >/dev/null 2>&1 || die "resize2fs is missing; the data partition grew but its filesystem did not"
-    resize2fs "$PART" >/dev/null 2>&1 || die "resize2fs failed on $PART; the partition grew but the filesystem did not"
-    printf 'grown    %s now holds %.1f GiB of ext4 (was %.1f GiB)\n' "$PART" \
-        "$(awk -v s="$SIZE" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')" \
-        "$(awk -v s="$SIZE0" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')"
+    # the filesystem's OWN size, from the filesystem: the partition table said 58.1 GiB while the fs was
+    # still 7.8 GiB, and quoting the partition is what made c32's failure read as a success (#1374)
+    fs_gib() {   # <partition-node> -> that ext4's size in GiB, or "-" when it cannot be read
+        dumpe2fs -h "$1" 2> /dev/null | awk -F: '
+            /^Block count/ { gsub(/ /, "", $2); c = $2 }
+            /^Block size/  { gsub(/ /, "", $2); s = $2 }
+            END { if (c != "" && s != "") printf "%.1f", c * s / 1073741824; else printf "-" }'
+    }
+    was=$(fs_gib "$PART")
+    if ! resize2fs "$PART" >/dev/null 2>&1; then
+        # an ext4 that needs journal recovery makes resize2fs refuse - the board's workaround was
+        # "e2fsck -f first", so do that here and retry once instead of handing it to a person at 2am
+        command -v e2fsck >/dev/null 2>&1 ||
+            die "resize2fs failed on $PART and e2fsck is missing; the partition grew but the filesystem did not"
+        printf 'grown    resize2fs refused (a filesystem needing journal recovery does that): e2fsck -f -y, then one retry\n'
+        e2fsck -f -y "$PART" >/dev/null 2>&1
+        resize2fs "$PART" >/dev/null 2>&1 ||
+            die "resize2fs failed on $PART twice, once after e2fsck -f -y: the partition grew but the filesystem did not, and staging into it would truncate the first model that does not fit (engine#1374)"
+    fi
+    printf 'grown    %s now holds %s GiB of ext4 (was %s GiB; both read from the filesystem, not the partition)\n' \
+        "$PART" "$(fs_gib "$PART")" "$was"
 fi
 
 # ---- mount ---------------------------------------------------------------------------------------
@@ -247,6 +276,36 @@ mount -o "$MOUNT_OPTS" "$PART" "$MNT" 2>/dev/null ||
 CONF=$MNT/lemonade/lemond.conf
 AUTH=$MNT/ssh/authorized_keys
 printf 'mounted  %s (%s)\n' "$MNT" "$MOUNT_OPTS"
+
+# ---- the staging has to fit BEFORE it starts (#1374) ----------------------------------------------
+# The model loops below copy one file at a time and only learn that the filesystem is full from cp's own
+# failure - and a cp that fails half way leaves a TRUNCATED model behind. That is how c32 staged 6.6 of
+# 7.9 GB (partition grown to 58.1 GiB, filesystem still 7.8 GiB) and needed a hand-written restage:
+# e2fsck, resize2fs, clear the partial tree, stage again. A refusal with both numbers is the whole
+# difference: nothing is written, so there is nothing to prove and nothing to clean up.
+if [ "$CHECK" = 0 ]; then
+    need=0
+    for m in $MODELS; do
+        [ -s "$m" ] || continue
+        new=$(stat -Lc %s "$m")
+        # cp -f truncates a file that is already there, so only the GROWTH has to be allocated: a re-run,
+        # or the recovery path after a failed stage, must not be refused for space it already occupies
+        old=$(stat -Lc %s "$MNT/models/$(basename "$m")" 2> /dev/null || echo 0)
+        [ "$new" -gt "${old:-0}" ] && need=$((need + new - old))
+    done
+    for d in $NPUMODELS; do
+        new=$(du -sb "$d" 2> /dev/null | cut -f1); new=${new:-0}
+        # the directory is rm -rf'd before the copy, so its old bytes come back to the filesystem
+        old=$(du -sb "$MNT/models/$(basename "${d%/}")" 2> /dev/null | cut -f1); old=${old:-0}
+        [ "$new" -gt "$old" ] && need=$((need + new - old))
+    done
+    need=$((need + 1048576))     # 1 MiB of headroom for the new directory entries and the conf/key writes
+    avail=$(df -B1 --output=avail "$MNT" 2> /dev/null | tail -n 1 | tr -d ' ')
+    # a df that cannot answer (an old busybox has no --output) leaves this empty: skip rather than guess
+    if [ -n "${avail:-}" ] && [ "$need" -gt 1048576 ] && [ "$avail" -lt "$need" ]; then
+        die "refusing to stage: the data filesystem has $avail bytes free and the models need $need. The partition's grow or its resize2fs did not happen - read the 'grow'/'grown' lines above, then compare 'sfdisk -d $TARGET' (the partition) with 'df -h $MNT' (the filesystem). Staging anyway leaves a TRUNCATED model on the medium instead of an error (engine#1374)."
+    fi
+fi
 
 # ---- the writes ----------------------------------------------------------------------------------
 write_key() {   # <key>: put LEMONADE_API_KEY=<key> on a line of its own in lemond.conf

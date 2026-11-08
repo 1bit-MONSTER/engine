@@ -81,12 +81,13 @@ refused=$("$bin" serve -m "$scratch/bonsai-q4_0.gguf" --device vulkan --port 1 -
 check "--device vulkan is refused as removed" '[[ "$refused" == *"--device vulkan was removed"* ]]'
 
 run() {  # <model> <record>: serve with --device auto until the backend has recorded its start
-    local port
     # --port 0: the kernel picks and serve reports it; this test reads its result from the backend's record file, so
     # it needs no readiness parse - and nothing is picked and released before serve binds (engine #1485)
     RECORD="$2" "$bin" serve -m "$1" --device auto --port 0 --llama-server "$scratch/backend.py" >"$2.log" 2>&1 &
     pid=$!
-    for _ in $(seq 1 100); do [ -s "$2" ] && break; sleep 0.1; done
+    # the liveness half of serve_port_wait, which these two need without the parse: a serve that dies at once must fail
+    # in a tenth of a second with its log, not ten seconds later as a parse error from the record file
+    for _ in $(seq 1 100); do [ -s "$2" ] && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 field() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$1" "$2"; }

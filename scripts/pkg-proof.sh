@@ -118,6 +118,39 @@ if [ -n "$intree" ]; then row PASS "the in-tree amdxdna is present" "$intree"
 else row FAIL "the in-tree amdxdna is present" "install the kernel's module tree (linux-modules-<ver> / kernel-core / linux)"; fi
 depmod -a "$kv" 2>/dev/null || :
 
+# A machine may already carry its own memlock file — this fleet's own box wrote
+# /etc/security/limits.d/99-amdnpu-memlock.conf by hand on 2026-10-12, before this package existed. With
+# our file at that exact path the install FAILED (dpkg rc=1, conffile conflict) and a purge then deleted
+# the hand-written file. So: the hand-written file stays, ours is a namespaced neighbour, and both facts
+# are asserted here rather than assumed.
+if [ "$fam" != coexist ]; then
+    hand=/etc/security/limits.d/99-amdnpu-memlock.conf
+    printf '*    soft    memlock    65536\n*    hard    memlock    65536\n# hand-written before this package\n' > "$hand"
+    case $fam in
+        deb)  dpkg -i "$pkgdir"/1bit-npu-config_*.deb >/tmp/re.log 2>&1 ;;
+        rpm)  rpm -i --nosignature "$pkgdir"/1bit-npu-config-[0-9]*.rpm >/tmp/re.log 2>&1 ;;
+        arch) pacman -U --noconfirm "$pkgdir"/1bit-npu-config-[0-9]*.pkg.tar.zst >/tmp/re.log 2>&1 ;;
+    esac
+    if [ $? -eq 0 ] && grep -q 65536 "$hand" && [ -f /etc/security/limits.d/90-1bit-npu-memlock.conf ]; then
+        row PASS "a hand-written limits file does not block the install" "ours at 90-…, ours-and-yours both present"
+    else
+        row FAIL "a hand-written limits file does not block the install" "$(tail -2 /tmp/re.log)"
+    fi
+    case $fam in
+        deb)  dpkg -P 1bit-npu-config >/tmp/rr.log 2>&1 ;;
+        rpm)  rpm -e 1bit-npu-config >/tmp/rr.log 2>&1 ;;
+        arch) pacman -R --noconfirm 1bit-npu-config >/tmp/rr.log 2>&1 ;;
+    esac
+    if [ $? -eq 0 ] && grep -q 65536 "$hand"; then
+        row PASS "the hand-written file survives our removal" "still 65536"
+    else
+        row FAIL "the hand-written file survives our removal" "$( [ -e "$hand" ] && echo 'content changed' || echo 'deleted')"
+    fi
+    # clean up after the scenario: a 99- file sorts after our 90- and would legitimately win (later file
+    # wins in limits.d), which would make the memlock rows below measure the user's limit, not ours
+    rm -f "$hand"
+fi
+
 # ---- install the three packages --------------------------------------------------------------
 case $fam in
     coexist)
@@ -151,7 +184,7 @@ fi
 
 # ---- 1bit-npu-config ------------------------------------------------------------------------
 check "memlock limits.d" "2 lines, unlimited" \
-    grep -q 'memlock    unlimited' /etc/security/limits.d/99-amdnpu-memlock.conf
+    grep -q 'memlock    unlimited' /etc/security/limits.d/90-1bit-npu-memlock.conf
 check "NPU keep-awake udev rule syntax" "udevadm verify" \
     udevadm verify /etc/udev/rules.d/90-1bit-npu-power.rules
 check "modules-load.d entry" "ec_su_axb35" \
@@ -160,14 +193,14 @@ check "public MOK certificate (kernel key)" \
     "$(openssl x509 -inform DER -in /usr/share/1bit/mok/MOK-Kernel.der -noout -subject 2>/dev/null | sed 's/subject=//')" \
     test -s /usr/share/1bit/mok/MOK-Kernel.der
 check "config files are 0644" "not group-writable" \
-    bash -c '! find /etc/security/limits.d/99-amdnpu-memlock.conf /etc/udev/rules.d/90-1bit-npu-power.rules -perm /022 | grep -q .'
+    bash -c '! find /etc/security/limits.d/90-1bit-npu-memlock.conf /etc/udev/rules.d/90-1bit-npu-power.rules -perm /022 | grep -q .'
 
 # Is the memlock file actually READ by the login path, or only present? The NPU runtime locks command
 # buffers and fails without it, so a right-looking file at a path pam_limits does not read would be a
 # confusing user-facing failure. Proof: write a distinctive finite limit into the installed file, log in
 # as a fresh user, and see that value come back; then restore the shipped content and read it again.
 if id kpkgprobe >/dev/null 2>&1 || useradd -m -s /bin/bash kpkgprobe >/dev/null 2>&1; then
-    lim=/etc/security/limits.d/99-amdnpu-memlock.conf
+    lim=/etc/security/limits.d/90-1bit-npu-memlock.conf
     keep=$(mktemp); cp "$lim" "$keep"
     # 4096, not 8192: LOWERING a limit is always permitted, so the value can only come from the file.
     # (The first version of this row wrote 8192, which happened to equal the container's inherited

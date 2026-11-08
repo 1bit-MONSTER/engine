@@ -123,7 +123,7 @@ mkdir -p "$cfg/etc/security/limits.d" "$cfg/etc/udev/rules.d" "$cfg/etc/modules-
          "$cfg/usr/share/1bit/mok" "$cfg/usr/share/doc/1bit-npu-config" "$cfg/usr/share/licenses/1bit-npu-config"
 # The NPU runtime is compiled into 1bit and locks command buffers; without unlimited memlock a loaded
 # model's allocations fail. The same two lines the box runs.
-cat > "$cfg/etc/security/limits.d/99-amdnpu-memlock.conf" <<'EOF'
+cat > "$cfg/etc/security/limits.d/90-1bit-npu-memlock.conf" <<'EOF'
 *    soft    memlock    unlimited
 *    hard    memlock    unlimited
 EOF
@@ -152,7 +152,7 @@ The runtime configuration the 1bit NPU packages need. Configuration only: no bin
 
 | file | why |
 |---|---|
-| `/etc/security/limits.d/99-amdnpu-memlock.conf` | the NPU runtime is compiled into `1bit` and locks command buffers; without unlimited memlock a loaded model's allocations fail |
+| `/etc/security/limits.d/90-1bit-npu-memlock.conf` | the NPU runtime is compiled into `1bit` and locks command buffers; without unlimited memlock a loaded model's allocations fail |
 | `/etc/udev/rules.d/90-1bit-npu-power.rules` | keeps the XDNA2 NPU (`1022:17f0`) out of runtime autosuspend, whose resume path loses the firmware context (engine#1051) |
 | `/etc/modules-load.d/ec_su_axb35.conf` | loads the AXB35 board's EC driver (fans, EC temperature, EC power mode); the driver attaches only on an AXB35, so it is inert on other boards |
 | `/usr/share/1bit/mok/MOK-Kernel.der` | the **public** certificate the 1bit kernel and its modules are signed with, for Secure Boot |

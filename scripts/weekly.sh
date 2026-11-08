@@ -56,6 +56,8 @@ mkdir -p "$LOGS"
 # pack_missing_libs (package_checks); this script's own copy, so it works before build checks out $SRC
 # shellcheck source=scripts/pack-elf.sh
 . "$(cd "$(dirname "$0")" && pwd)/pack-elf.sh"
+# shellcheck source=scripts/pack-check.sh
+. "$(cd "$(dirname "$0")" && pwd)/pack-check.sh"   # build_path_strings, runtime_selfcontained
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
 # Heavy steps wait for room, and stop before the box runs out of memory (unified memory: GPU
@@ -306,47 +308,7 @@ PY
 stage_build() { checkout "${WEEKLY_REF:-main}"; build; }
 stage_test() { run_tests; }
 
-# What the engine tarball must and must not hold (docs/releases.md, "Private components"):
-# It is packed by scripts/package-linux.sh and folded into the Lemonade + onebit package as 1bit/;
-#   runtime-deps  no program or library needs or names an external accelerator-runtime library
-#             (EXT_RUNTIME_LIBS below: readelf NEEDED, ldd, strings), and no such library is packed;
-#             the NPU runtime is compiled into 1bit
-#   kernels   the HRX ggml library carries the private HIP kernels (it exports the add-on's
-#             ggml_hrx_hip_addon_register), compiled in as code objects
-#   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .cmake) and no file named
-#             like one of the private checkouts' files -- except the three GGUF-on-NPU helper scripts
-#             (scripts/repack_gguf.py, scripts/check_repack_config.py, tools/gguf_to_q4nx.py), which
-#             are the engine's own Apache-2.0 source, published in this repository, and without
-#             which a packed install cannot serve a GGUF on the NPU
-#   licensed  the closed binaries' LICENSE-BINARY and NOTICE-BINARY are packed beside LICENSE and NOTICE
-#   npu       (with WEEKLY_NPU_KERNELS) every file under npu/kernels but layout.json is sealed, never a
-#             plaintext ELF; every ELF in the tarball is for the host (x86-64); the packed 1bit has no
-#             symbol table and its strings name no private source file and no build-machine home
-# Checks the build's 1bit and every file in the tarball.
-# engine #1461: no packed ELF may name a build-machine path. One row, used for BOTH packages - the engine
-# tarball and the Lemonade package that carries it - over every ELF rather than the packed `1bit` alone: that
-# narrow scope is why 146 build paths shipped in c32's payload (lemond 126, lemonade 13, libloomc.so.0 7)
-# while the row printed "no build-machine paths", exactly as #1460's `/home/`-only predicate had been too
-# narrow a pattern. OCCURRENCES are counted, not lines: a strings run glues paths to their neighbours, so one
-# of lemonade's 13 does not begin a line and `grep -c` reports 12 for a file carrying 13 (measured
-# 2026-11-08 on c32's own bytes). /home/ covers any builder's home; the source tree, the workdir and the
-# build tree cover a build that ran elsewhere on this machine.
-build_path_strings() {  # build_path_strings <unpacked tree>  -> one FAIL line per offending file, rc 1
-    local t=$1 f n pats rc=0
-    pats=$(printf '%s\n' /home/ "${SRC:-/nonexistent-build-src}" "${W:-/nonexistent-build-w}" \
-                         "${BUILD:-/nonexistent-build-build}")
-    while IFS= read -r -d '' f; do
-        pack_is_elf "$f" || continue
-        n=$(strings -a "$f" | grep -o -F -f <(printf '%s\n' "$pats") | wc -l || true)
-        [ "$n" = 0 ] || {
-            printf 'FAIL %s names a build-machine path (%s occurrences): %s\n' "$(basename "$f")" "$n" \
-                "$(strings -a "$f" | grep -o -F -f <(printf '%s\n' "$pats") | head -2 | tr '\n' ' ')"
-            rc=1
-        }
-    done < <(find "$t" -type f -print0)
-    [ "$rc" = 0 ] && echo "ok   no packed ELF names a build-machine path (/home/, the source tree, the workdir, the build tree)"
-    return $rc
-}
+
 
 package_checks() {  # package_checks <linux tarball>
     # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
@@ -465,6 +427,7 @@ package_checks() {  # package_checks <linux tarball>
     done < <(find "$t" -type f -print0)
     [ "$nk" = 0 ] && echo "ok   every ELF in $(basename "$1") is a host (x86-64) program or library" || bad=1
     build_path_strings "$t" || bad=1
+    runtime_selfcontained "$t" || bad=1
     f=$(find "$t" -maxdepth 2 -type f -name 1bit)
     f=${f%%$'\n'*}
     if [ -n "$f" ]; then
@@ -514,6 +477,7 @@ lemonade_package_checks() {  # lemonade_package_checks <tarball>
     if [ "$n" != 0 ]; then echo "ok   Lemonade's web app: bin/resources/web-app/index.html and $(find "$t" -path '*/bin/resources/web-app/*' -type f | wc -l) files in $(basename "$1")"
     else echo "FAIL no Lemonade web app (bin/resources/web-app/index.html) in $(basename "$1")"; rc=1; fi
     build_path_strings "$t" || rc=1              # engine#1461: lemond 126 and lemonade 13 shipped from here
+    runtime_selfcontained "$t" || rc=1           # engine#1411: nothing resolves outside the payload
     # the engine's own binaries are checked in package_checks; this is the other half of the same payload
     n=$(find "$t" -maxdepth 2 -name lemond-onebit -type f -exec grep -c '^export ONEBIT_KCRYPT_REQUIRE_SEALED=1$' {} + 2>/dev/null)
     n=${n%%$'\n'*}

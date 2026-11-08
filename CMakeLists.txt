@@ -249,6 +249,11 @@ add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
 # ordering is the row dpkg, rpm and pacman had to agree on; no container, no build, dpkg only.
 add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.sh)
+# engine #1461/#1411: the two release rows that read a PACKED tree (scripts/pack-check.sh). Synthetic trees
+# built with the C compiler: a build-machine path in an ELF, an absolute RUNPATH, a relative rpath that
+# resolves outside the payload, and a runtime set shipped without the aqlprofile agent libhsa opens. Each
+# arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
+add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.

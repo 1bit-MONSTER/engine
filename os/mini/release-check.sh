@@ -1869,13 +1869,19 @@ if [ ! -f "$BKEEP" ]; then
 else
     _bm_n=$(awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if ($0 != "") print }' "$BKEEP" | wc -l)
     _bm_keep=$(awk '{ sub(/#.*/, ""); gsub(/[[:space:]]/, ""); if ($0 != "") print }' "$BKEEP")
-    # -prune the trees that are not the OS image, and the keep-list entries; count the rest
+    # The scan root is overridable for the same reason PAYLOAD_DIR is above: a row that can only be judged by booting an
+    # image cannot be tested, and the first version of this one could not be run at all off a board. `BASE_SCAN_ROOT=<tree>`
+    # points it at any tree of the same shape, which is how it was checked both ways: the un-normalised base SFS tree gives
+    # "40+ writable path(s)" (head-capped, so FAIL) and the normalised one gives "0 writable path(s)" (PASS).
+    BROOT=${BASE_SCAN_ROOT:-/}
+    BROOT=${BROOT%/}
+    # -prune the trees that are not the OS image; count the rest
     _bm_prune=
-    for _p in /proc /sys /dev /run /tmp /data /initrd /mnt /media /var/tmp /var/run /var/lock /var/spool /var/log /opt/1bit-package; do
-        _bm_prune="$_bm_prune -path $_p -prune -o"
+    for _p in proc sys dev run tmp data initrd mnt media var/tmp var/run var/lock var/spool var/log opt/1bit-package; do
+        _bm_prune="$_bm_prune -path $BROOT/$_p -prune -o"
     done
     # shellcheck disable=SC2086  # the prune expression is built as separate words on purpose
-    _bm_b=$(find / $_bm_prune \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null | head -40)
+    _bm_b=$(find "${BROOT:-/}" $_bm_prune \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) -print 2>/dev/null | head -40)
     _bm_n_paths=$(printf '%s' "$_bm_b" | grep -c . || true)
     _bm_s=$(printf '%s\n' "$_bm_b" | head -3 | while IFS= read -r _p; do [ -n "$_p" ] && printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "$_p"; done)
     BM=$(base_modes_verdict "$_bm_n_paths" "$_bm_n" "$_bm_s")

@@ -23,15 +23,20 @@
 # then uninstalls everything and checks nothing is left behind. Prints one PASS/FAIL row per check and
 # exits non-zero if any row fails.
 #
-#   deb   docker run --rm -v <pkgs>:/pkg:ro ubuntu:26.04 bash -c \
+#   deb   docker run --rm --cap-add=sys_resource -v <pkgs>:/pkg:ro ubuntu:26.04 bash -c \
 #           'apt-get update -qq && apt-get install -y -qq dkms udev kmod sbsigntool linux-headers-generic \
 #              && apt-get install -y -qq linux-modules-$(ls /lib/modules | sort -V | tail -1) \
 #              && bash /pkg/pkg-proof.sh deb /pkg'
-#   rpm   docker run --rm -v <pkgs>:/pkg:ro fedora:latest bash -c \
+#   rpm   docker run --rm --cap-add=sys_resource -v <pkgs>:/pkg:ro fedora:latest bash -c \
 #           'dnf -y install dkms kernel-devel kernel-core kmod binutils xz; bash /pkg/pkg-proof.sh rpm /pkg'
-#   arch  docker run --rm -v <pkgs>:/pkg:ro archlinux:latest bash -c \
+#   arch  docker run --rm --cap-add=sys_resource -v <pkgs>:/pkg:ro archlinux:latest bash -c \
 #           'pacman -Sy --noconfirm && pacman -S --noconfirm dkms linux linux-headers kmod binutils zstd; \
 #            bash /pkg/pkg-proof.sh arch /pkg'
+#
+# `--cap-add=sys_resource` is for the two memlock rows: a container's default capability set excludes
+# CAP_SYS_RESOURCE, so raising the hard memlock limit to `unlimited` fails there and the login session
+# keeps the container's inherited 8192 KB. A real machine's root has the capability; the flag makes the
+# container behave like one.
 #
 # `linux-modules-<ver>` / `kernel-core` / `linux` are the container's way of having the kernel's own
 # module tree, which a real machine always has. Without it there is no in-tree amdxdna for the DKMS
@@ -50,6 +55,7 @@ fam=${1:?usage: pkg-proof.sh <deb|rpm|arch> <package-dir>}
 pkgdir=${2:?usage: pkg-proof.sh <deb|rpm|arch> <package-dir>}
 pkgdir=$(cd "$pkgdir" && pwd)
 fail=0
+krel=      # set by the kernel-package block; empty on the distribution-kernel path (no kernel packages)
 row() {   # <PASS|FAIL> <what> <detail>
     printf '%-4s %-46s %s\n' "$1" "$2" "$3"
     [ "$1" = PASS ] || fail=1
@@ -64,6 +70,18 @@ case $fam in
     *) echo "unknown family: $fam" >&2; exit 2 ;;
 esac
 [ -n "$kv" ] || { echo "pkg-proof: no kernel headers in this container; install them first (see the header)" >&2; exit 2; }
+# Does this package dir carry the kernel packages? `mk-kernel-packages.sh --skip-kernel` does not, and that
+# is the most common user path — a machine that stays on its distribution's kernel takes only the drivers
+# and the config. Those rows are then skipped instead of failing; the rest of the proof runs unchanged.
+case $fam in
+    deb)  have_kernel=$(ls "$pkgdir"/linux-image-*.deb 2>/dev/null | wc -l) ;;
+    rpm)  have_kernel=$(ls "$pkgdir"/1bit-kernel-[0-9]*.rpm 2>/dev/null | wc -l) ;;
+    arch) have_kernel=$(ls "$pkgdir"/linux-1bit-[0-9]*.pkg.tar.zst 2>/dev/null | wc -l) ;;
+    *)    have_kernel=1 ;;
+esac
+if [ "$have_kernel" = 0 ] && [ "$fam" != coexist ]; then
+    printf 'INFO %-46s %s\n' "no kernel packages in this dir" "distribution-kernel path: kernel rows skipped"
+fi
 echo "== $fam in $(grep -h '^PRETTY_NAME' /etc/os-release | cut -d= -f2- | tr -d '\"') | headers $kv | running $(uname -r)"
 
 # the in-tree module this must displace; without the kernel's own module tree there is nothing to
@@ -96,6 +114,34 @@ check "public MOK certificate (kernel key)" \
     test -s /usr/share/1bit/mok/MOK-Kernel.der
 check "config files are 0644" "not group-writable" \
     bash -c '! find /etc/security/limits.d/99-amdnpu-memlock.conf /etc/udev/rules.d/90-1bit-npu-power.rules -perm /022 | grep -q .'
+
+# Is the memlock file actually READ by the login path, or only present? The NPU runtime locks command
+# buffers and fails without it, so a right-looking file at a path pam_limits does not read would be a
+# confusing user-facing failure. Proof: write a distinctive finite limit into the installed file, log in
+# as a fresh user, and see that value come back; then restore the shipped content and read it again.
+if id kpkgprobe >/dev/null 2>&1 || useradd -m -s /bin/bash kpkgprobe >/dev/null 2>&1; then
+    lim=/etc/security/limits.d/99-amdnpu-memlock.conf
+    keep=$(mktemp); cp "$lim" "$keep"
+    # 4096, not 8192: LOWERING a limit is always permitted, so the value can only come from the file.
+    # (The first version of this row wrote 8192, which happened to equal the container's inherited
+    # memlock and so passed without proving anything.)
+    printf '*    soft    memlock    4096\n*    hard    memlock    4096\n' > "$lim"
+    probe=$(su - kpkgprobe -c 'ulimit -l' 2>/dev/null | tr -d ' ')
+    if [ "$probe" = 4096 ]; then
+        row PASS "the memlock file is what pam_limits reads" "a probe login came back with 4096 KB"
+    else
+        row FAIL "the memlock file is what pam_limits reads" "probe login reports '${probe:-nothing}'"
+    fi
+    cp "$keep" "$lim"; rm -f "$keep"
+    shipped=$(su - kpkgprobe -c 'ulimit -l' 2>/dev/null | tr -d ' ')
+    case $shipped in
+        unlimited) row PASS "the shipped limit reaches a login session" "ulimit -l: unlimited" ;;
+        *) row FAIL "the shipped limit reaches a login session" \
+               "ulimit -l: '${shipped:-nothing}' — raising a hard limit needs CAP_SYS_RESOURCE: run the container with --cap-add=sys_resource (a real machine's root has it)" ;;
+    esac
+else
+    row FAIL "the memlock file is what pam_limits reads" "could not create a probe user"
+fi
 
 # ---- the DKMS modules -----------------------------------------------------------------------
 dkmsstate=$(dkms status 2>/dev/null || :)
@@ -147,6 +193,7 @@ else
 fi
 
 # ---- the kernel package ---------------------------------------------------------------------
+if [ "$have_kernel" = 1 ]; then
 case $fam in
     deb)
         dpkg -i "$pkgdir"/linux-image-*.deb "$pkgdir"/linux-headers-*.deb >/tmp/k.log 2>&1 \
@@ -188,6 +235,7 @@ if [ -r "$img" ]; then
 else
     row FAIL "vmlinuz in the package" "$img missing"
 fi
+fi   # have_kernel
 
 # ---- uninstall ------------------------------------------------------------------------------
 case $fam in
@@ -206,6 +254,49 @@ case $leftstate in *amdxdna-1bit*|*ec-su-axb35*) row FAIL "dkms forgot the modul
     *) row PASS "dkms forgot the module" "dkms status clean" ;; esac
 check "the config files are gone" "/etc rules removed" \
     bash -c "! test -e /etc/udev/rules.d/90-1bit-npu-power.rules"
+if [ "$fam" != coexist ]; then
+    # The other half of "uninstalling puts the in-tree driver back": dkms archives the in-tree module
+    # when it installs ours (into /var/lib/dkms/<pkg>/original_module/), so removal has to restore it —
+    # both the file and what a modprobe resolves to, because a restored file that nothing resolves to is
+    # not a restore. Verified by hand first: before our package the resolution is
+    # /lib/modules/<kv>/kernel/drivers/accel/amdxdna/amdxdna.ko.zst, with it .../updates/dkms/amdxdna.ko.zst,
+    # and after the purge back to the kernel/ path.
+    depmod -a "$kv" 2>/dev/null || :
+    back=$(modprobe -S "$kv" --show-depends amdxdna 2>/dev/null | sed -n 's/^insmod //p' | tail -1)
+    case $back in
+        */kernel/drivers/accel/amdxdna/*)
+            row PASS "the in-tree amdxdna resolves again" "$(basename "$back")" ;;
+        *)  row FAIL "the in-tree amdxdna resolves again" "${back:-nothing resolves amdxdna}" ;;
+    esac
+    intree_file=$(find -L /lib/modules/"$kv"/kernel -name 'amdxdna.ko*' 2>/dev/null | head -1)
+    if [ -n "$intree_file" ]; then
+        row PASS "the in-tree module file is restored" "$(basename "$intree_file")"
+    else
+        row FAIL "the in-tree module file is restored" "not under /lib/modules/$kv/kernel"
+    fi
+fi
+
+# ---- removing the kernel package again -------------------------------------------------------
+# The kernel rows above install it; nothing removed it, so "and uninstall cleanly" had no evidence for
+# the kernel half. It also has to leave the filesystem as it found it: no /boot entry, no module tree.
+if [ -n "$krel" ] && [ "$fam" != coexist ] && [ "$have_kernel" = 1 ]; then
+    case $fam in
+        deb)  dpkg -P "linux-image-$krel" "linux-headers-$krel" >/tmp/kr.log 2>&1 ;;
+        rpm)  rpm -e 1bit-kernel-devel 1bit-kernel >/tmp/kr.log 2>&1 ;;
+        arch) pacman -R --noconfirm linux-1bit-headers linux-1bit >/tmp/kr.log 2>&1 ;;
+    esac
+    if [ $? -eq 0 ]; then row PASS "the kernel package removes" "rc=0"
+    else row FAIL "the kernel package removes" "$(tail -2 /tmp/kr.log)"; fi
+    case $fam in
+        deb|rpm) leftover=/boot/vmlinuz-$krel ;;
+        arch)    leftover=/boot/vmlinuz-1bit ;;
+    esac
+    [ -e "$leftover" ] && row FAIL "the kernel image is gone" "$leftover still there" \
+        || row PASS "the kernel image is gone" "$leftover removed"
+    mods_left=$(find /lib/modules/"$krel" /usr/lib/modules/"$krel" -type f 2>/dev/null | wc -l)
+    [ "$mods_left" = 0 ] && row PASS "the module tree is gone" "0 files under modules/$krel" \
+        || row FAIL "the module tree is gone" "$mods_left files left"
+fi
 
 echo
 if [ "$fail" = 0 ]; then echo "== $fam: ALL ROWS PASS"; else echo "== $fam: FAILURES ABOVE"; fi

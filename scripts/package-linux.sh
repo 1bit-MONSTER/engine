@@ -164,5 +164,13 @@ Keep the directory layout: 1bit finds its backends beside itself.
 HRX needs TheRock in /opt/rocm-therock; the NPU needs the amdxdna
 kernel driver. Docs: https://1bit.gg/  Code: https://github.com/1bit-MONSTER/engine
 EOF
+# A file mode in a release artifact is the packer's decision (engine#1352).  This runs LAST, after every staging line
+# above, because the licence/notice files and the Lemonade drop-in are staged just before it -- normalising earlier
+# would leave the check green while the next copy slipped an 0664 back in.  Asserted rather than assumed: a file that
+# is still group- or other-writable here fails the package instead of shipping.
+pack_normalise_modes "$stage"
+modes_bad=$(pack_writable_files "$stage")
+[ -z "$modes_bad" ] || { echo "files still group/ or other-writable after normalising:"; echo "$modes_bad"; exit 1; }
+
 tar -C "$(dirname "$stage")" -cf - "$name" | zstd -q -T4 -19 -o "$out/$name.tar.zst"
 ls -la "$out/$name.tar.zst"

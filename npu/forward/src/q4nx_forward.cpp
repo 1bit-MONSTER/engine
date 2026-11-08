@@ -3629,10 +3629,15 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         const double gsum = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
         const double hsum = g_ph.h_memcpy + g_ph.h_pack + g_ph.h_ql + g_ph.h_wait + g_ph.h_rb;
         fprintf(stderr,
-                "[bs] M=%2d start=%4d wall=%7.1f | embed=%5.1f | layers=%7.1f (gemm pack=%6.1f "
+                // host_gemm and rows_max are here because a [bs] line with n=0 is ambiguous without them:
+                // npu_gemm_rows() returns to the host GEMM on host_gemm_ BEFORE max_batch_rows() or the
+                // blocked path is consulted (q4nx_forward.cpp:2979), and the flag is set only by
+                // init_host() (:407) and NPU_INFER_HOST_GEMM (:413). So a row that says host_gemm=1 is a
+                // host prefill by construction, not a device launch that went uncounted (engine#1582).
+                "[bs] M=%2d start=%4d wall=%7.1f | host_gemm=%d rows_max=%d | embed=%5.1f | layers=%7.1f (gemm pack=%6.1f "
                 "ql=%6.2f wait=%7.1f rb=%6.1f sum=%7.1f host=%7.1f n=%ld) | epilogue=%6.1f "
                 "(head=%6.1f sum=%6.1f host=%5.1f) | tail=%5.1f\n",
-                M, start_pos, total, g_ph.embed, g_ph.layer, g_ph.g_pack, g_ph.g_ql, g_ph.g_wait,
+                M, start_pos, total, (int)host_gemm_, max_batch_rows(), g_ph.embed, g_ph.layer, g_ph.g_pack, g_ph.g_ql, g_ph.g_wait,
                 g_ph.g_rb, gsum, g_ph.layer - gsum, g_ph.launches, epi, g_ph.h_total, hsum,
                 g_ph.h_total - hsum, total - g_ph.embed - g_ph.layer - epi);
         char what[48];
@@ -4720,11 +4725,11 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
         const double gsum = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
         const double hsum = g_ph.h_memcpy + g_ph.h_pack + g_ph.h_ql + g_ph.h_wait + g_ph.h_rb;
         fprintf(stderr,
-                "[ph] tok %d pos %d wall=%.1f | embed=%.1f | layers=%.1f (gemm pack=%.1f "
+                "[ph] tok %d pos %d wall=%.1f | host_gemm=%d | embed=%.1f | layers=%.1f (gemm pack=%.1f "
                 "ql=%.1f wait=%.1f rb=%.1f sum=%.1f host=%.1f n=%ld) | ffnorm=%.1f | "
                 "head=%.1f (memcpy=%.1f pack=%.1f ql=%.1f wait=%.1f rb=%.1f sum=%.1f "
                 "host=%.1f) | tail=%.1f\n",
-                token, pos, total, g_ph.embed, g_ph.layer, g_ph.g_pack, g_ph.g_ql, g_ph.g_wait,
+                token, pos, total, (int)host_gemm_, g_ph.embed, g_ph.layer, g_ph.g_pack, g_ph.g_ql, g_ph.g_wait,
                 g_ph.g_rb, gsum, g_ph.layer - gsum, g_ph.launches, g_ph.ffnorm, g_ph.head,
                 g_ph.h_memcpy, g_ph.h_pack, g_ph.h_ql, g_ph.h_wait, g_ph.h_rb, hsum,
                 g_ph.head - hsum, tail);

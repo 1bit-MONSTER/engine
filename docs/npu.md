@@ -1820,11 +1820,18 @@ against (the kernel's own copy also works); nothing from the pin is built into o
 the release. `.github/workflows/bump-xdna.yml` moves the pin when run by hand, because a driver
 move means rebuilding the module on Strix Halo and checking the NPU there first.
 
-That pin is **pre-fix**, and the fixes are not upstream. The two patches every build of ours runs — the
-`bo_invalid_list` use-after-free at close (#971) and the array recovery after a TDR (#1005) — are carried in
-[`third_party/patches/amdxdna/`](../third_party/patches/amdxdna/README.md) with the build, sign, install and
-initramfs recipe, the `srcversion` each build must produce, and what a pin bump invalidates. A module built from the
-pin alone has neither defect fixed: it panics on that close path and it cannot bring the array back after a TDR.
+That pin is **pre-fix**, and the fixes are not upstream. They are carried as a series in
+[`third_party/patches/amdxdna/`](../third_party/patches/amdxdna/README.md) — with the build, sign, install and
+initramfs recipe, the `srcversion` each build must produce, and what a pin bump invalidates. The series is nine patches
+and **every build of ours applies seven of them**, in this order: `0001` (the `bo_invalid_list` use-after-free at close,
+#971), `0002` (array recovery after a TDR, #1005), `0004` + `0005` (two recovery outcomes that are not failures, and the
+throttle check before any context is touched), `0003` (never share an array partition between two clients), and `0008` +
+`0009` (#1051: a dying context must not fail the device resume, and no runtime suspend while a context exists — the
+`code 614` hang). `0006` and `0007` (the imported-dma-buf execution pair, #812) are carried and **deliberately not
+installed**: loading them is the owner's call and the README says so per patch.
+
+A module built from the pin alone has none of it: it panics on that close path, it cannot bring the array back after a
+TDR, two clients can be handed the same columns, and a request that follows a runtime suspend wedges the array.
 
 ### The MTP head (FastFlowLM's container -> ours)
 

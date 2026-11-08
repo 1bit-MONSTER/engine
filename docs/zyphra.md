@@ -157,8 +157,8 @@ what makes the conclusion safe is that the sign is the same on all thirteen of t
 | Zamba2-2.7B-instruct *(adapter form)* | **Q6_K** (sweet spot) | 0.007244 / 95.71 % (32 ch) | **0.003908 / 97.89 %** | clears both halves on both corpora |
 | | Q8_0 (max quality) | 0.001242 / 98.24 % | **0.000550 / 99.22 %** | " |
 | | Q4_K_M-imx (smallest usable) | 0.043205 / 90.86 % | **0.010407 / 97.50 %** | misses on wikitext, **clears on code** |
-| Zamba2-7B-Instruct *(adapter form)* | **Q6_K** (sweet spot) | 0.010430 / 96.59 % | *pending* | `Q5_K_M` fell off the bar under this form — see that model's section |
-| | Q8_0 (max quality) | 0.001669 / 98.60 % | *pending* | " |
+| Zamba2-7B-Instruct *(adapter form)* | **Q6_K** (sweet spot) | 0.010430 / 96.59 % | **0.003939 / 98.19 %** | clears both halves on both corpora — `Q5_K_M` did not survive this form, see that model's section |
+| | Q8_0 (max quality) | 0.001669 / 98.60 % | **0.000488 / 98.97 %** | " |
 | BlackMamba-2.8B | Q8_0 (sweet spot + max quality) | 0.001312 / 97.99 % | **0.000862 / 99.56 %** | " |
 | | IQ4_XS-imx (smallest usable) | 0.026519 / 91.01 % | **0.013286 / 97.01 %** | misses top-1 on wikitext, **clears on code** |
 | | IQ4_XS | 0.032975 / 90.27 % | 0.020463 / 96.86 % | misses both halves on wikitext, **clears on code** |
@@ -170,11 +170,11 @@ what makes the conclusion safe is that the sign is the same on all thirteen of t
 described bytes that no longer exist. **The code column moved less than the wikitext column did** — KLD within 1.3 %, top-1 within 0.25 points — which
 is the expected shape: the form's own perturbation (~1e-4 KLD) is an order of magnitude below a quantised arm's error (1e-3 to 4e-2), so a corpus
 comparison is the wrong instrument for seeing it. Two 2.7B arms that were in the old table are gone from this one: `Q5_K_M` (never rebuilt in the
-adapter form) and `Zamba2-7B-Instruct`'s `Q5_K_M`, which is **withdrawn** — it misses the top-1 bar in this layout. The two *pending* code cells are a
-paused job, not a missing measurement: the CPU pass whose other three arms are in this table was stopped to stop starving the GPU queue, and each
-attempt since has been refused by a different precondition rather than by the code — a 4-core job that measured **0.19 of one core** while three
-`thermal-run` scopes shared the same pinned cores, and then less than 6 GiB of free RAM against the ~7 GiB a 7B perplexity needs to load. It resumes
-from those two arms when the box has both, and until then the cells stay marked rather than being filled from a neighbouring window.
+adapter form) and `Zamba2-7B-Instruct`'s `Q5_K_M`, which is **withdrawn** — it misses the top-1 bar in this layout. The two `Zamba2-7B-Instruct` code cells were the last to be
+measured, and the reason is worth one sentence because it is a property of the box rather than of the files: four attempts were refused by a different
+precondition each time — a 4-core job that measured **0.19 of one core** while three `thermal-run` scopes shared the same pinned cores, then under 6 GiB
+of free RAM against the ~7 GiB a 7B perplexity needs to load. The cells stayed marked while that was true rather than being filled from a neighbouring
+window, and they are measured now.
 
 † the wikitext row is the **pre-#1036 file**; that arm was never re-measured on wikitext after the dedupe (its KLD is layout-invariant —
 proven by the 0.000000 identity check — but a 4-bit arm's type mix can shift with the copy count, see `Q5_K_M` above). The pass ran in two

@@ -42,10 +42,10 @@ the numbers below are anchored to.
 | ZAYA1-8B | `zaya` | yes, `conversion/zaya.py` | yes, `zaya` graph |
 | ZAYA1-VL-8B | `zaya1_vl` | yes, same converter | text graph yes; VL needs an `mmproj` |
 | ZR1-1.5B | `qwen2` | yes, stock converter | yes, standard Qwen2 |
-| Zamba2-2.7B-instruct | `zamba2` | **not from the pin**; yes at fork head `6e42864a6` (#178 merged) | **no** from the pin; yes at the fork head |
-| Zamba2-7B-Instruct | `zamba2` | **not from the pin**; yes at fork head `6e42864a6` (#178 merged) | **no** from the pin; yes at the fork head |
-| Zamba-7B-v1 | `zamba` | **no** from the pin; yes at fork head `6e42864a6` (#184 merged) | **no** from the pin; yes at the fork head |
-| BlackMamba-2.8B | custom (no `architectures`, Mamba-1 + MoE blocks) | **no** from the pin; yes at fork head `6e42864a6` (#183 merged; ships `pytorch_model.bin`) | **no** from the pin; yes at the fork head |
+| Zamba2-2.7B-instruct | `zamba2` | **from the pin** | yes, the pinned graph |
+| Zamba2-7B-Instruct | `zamba2` | **from the pin** | yes, the pinned graph |
+| Zamba-7B-v1 | `zamba` | **from the pin** | yes, the pinned graph |
+| BlackMamba-2.8B | custom (no `architectures`, Mamba-1 + MoE blocks) | **from the pin** (ships `pytorch_model.bin`) | yes, the pinned graph |
 
 So the SSM half of the family is not servable from this pin today: the gap is a converter
 *and* a graph per arch, not a quantization problem. Zamba2 ships its own engine in the
@@ -54,11 +54,11 @@ monorepo (`Makefile.zamba2`, `tools/convert_zamba2_safetensors_to_gguf.py`, arch
 Three of those gaps were closed **on branches and are all merged now**: `1bit/zamba2` (PR #178), `1bit/blackmamba` (PR #183)
 and `1bit/zamba` (PR #184, stacked on #178) add the three graphs, each CPU-proven
 (`test-llama-archs` round-trip OK, plus a KLD of the BF16 against the transformers reference:
-Zamba2 0.0030, BlackMamba 0.0035, Zamba v1 0.0022). **`1bit/hrx-vulkan-patched` head is `6e42864a6`**, which contains
-`428937ae6` (#178) → `5670d8e4d` (#183) → `e9870b37a` (#184) → `6e42864a6` (#203, the converter/loader fix that stopped the Zamba2 refs
-from carrying the shared block once per hybrid layer). So every model in the family can be converted and run at the **fork head**, just
-not from the engine pin (`c16424f56`) this page's KLD rows were measured with. The HRX build pin has not moved either, so the
-**KLD/top-1 rows below are CPU measurements** (`GGML_HRX=OFF`, Release) while the **throughput rows are HRX** (pp512 / pp4096 / tg128,
+Zamba2 0.0030, BlackMamba 0.0035, Zamba v1 0.0022). **All of it is at the engine pin, so ask the pin rather than this page.** The pin is whatever the engine's submodule
+gitlink says — `git ls-tree origin/main third_party/llama.cpp` — and a literal sha here would be stale before the next review round: this page carried
+`c16424f56` and `6e42864a6` while the pin was already `b970d85ba`. Verified at `b970d85ba` on 2026-11-08: `conversion/zamba.py`, `zamba2.py`,
+`zamba2vl.py`, `src/models/zamba.cpp`, `src/models/zamba2.cpp` are present and `src/llama-arch.cpp` carries **4** `LLM_ARCH_ZAMBA*` registrations, so the
+converters and graphs that used to need a fork head are in the pin. The **KLD/top-1 rows below are CPU measurements** (`GGML_HRX=OFF`, Release) while the **throughput rows are HRX** (pp512 / pp4096 / tg128,
 3 repeats, from a fork-head build at `work/zarch/i1036@9ad387fb9`, `-ngl 99`, Tctl noted per row — see *Throughput on Strix Halo* below). That CPU/HRX split is legitimate here:
 the same arm measured on both backends on ZAYA1 gives KLD `0.429220` (HRX) against `0.425474` (CPU), a 0.9 % spread. Rows that could not
 be measured at all are marked blocked rather than dropped.

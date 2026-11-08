@@ -140,6 +140,9 @@ def main():
     ap.add_argument("--pack-1-8", required=True, help="the 1.8 pack of the same model")
     ap.add_argument("--pack-1-9", required=True, help="the 1.9 pack to measure")
     ap.add_argument("--json", action="store_true", help="print the result as JSON instead of the table line")
+    ap.add_argument("--probe-wrong", action="store_true",
+                    help="having found the rule, perturb it one field at a time and print each residual, so the "
+                         "tolerance has a measurement behind it instead of an argument")
     args = ap.parse_args()
 
     hidden, heads, layers = geometry(args.pack_1_9)
@@ -147,20 +150,61 @@ def main():
     b = open(token_fconst(args.pack_1_9), "rb").read()
     hdr_len = heads * 4
 
+    # The structural fit is what identifies the rule; byte equality is the strong form of the same evidence and
+    # not always available. Two builds of one model can differ in a few hundred weight codes -- Qwen3-1.7B's 1.8
+    # and 1.9 fconsts differ in 535 bytes, all in layer 24 -- and those pairs are exactly what a catalog has to
+    # measure, so a candidate that fits every block structurally is accepted with its residual REPORTED rather
+    # than refused for not being byte-exact. A wrong rule does not produce a 0.0001 % residual: it produces a
+    # candidate that fails the per-block fit, or a residual spread across the whole file.
+    # The tolerance, MEASURED at both ends rather than argued (reviewer ask). Legitimate pairs, all on disk:
+    #   Qwen2.5-0.5B 0 B of 291,653,952 (0)        Qwen3-1.7B  535 B of 957,722,944 (5.6e-7)
+    #   Qwen3-4B     2,933 B of 2,208,061,248 (1.3e-6)   Llama-3.2-1B 1,857 B of 686,518,336 (2.7e-6)
+    # Wrong rules, measured with --probe-wrong against the accepted rule on the 0.5B pair (as a fraction of the
+    # file): rot+1 3.85e-2, tile/2 3.85e-2, n+1 9.7e-3, prefix+64 1.5e-3.
+    # So 1e-5 sits 3.7x above the worst LEGITIMATE residual and 148x below the mildest WRONG rule -- it cannot
+    # admit a misaligned rule, and it does admit the few-hundred-stray-codes case a fine-tune's twin produces.
+    TOL = 1e-5
     for p in candidates(a, b, heads, layers):
         got = normalise(b, layers, p, hdr_len)
-        if got == a:
+        if len(got) != len(a):
+            print(f"# candidate prefix={p[0]} n={p[1]} tile={p[2]} rot={p[3]}: length {len(got)} != {len(a)}",
+                  file=sys.stderr)
+            continue
+        # The exact case is the common one, so it takes the C-level compare: this loop is Python-level, one
+        # iteration per byte, and on a 957 MB pair it costs ~24 s against ~0.13 s for `bytes ==` (reviewer's
+        # measurement, same expression). The loop only runs when there is something to report.
+        differ = 0 if got == a else sum(1 for x, y in zip(got, a) if x != y)
+        if differ <= max(0, int(len(a) * TOL)):
             prefix, n, tile, rot, header_off, stride9 = p
+            note = "byte for byte" if differ == 0 else f"{differ} of {len(a)} bytes differ ({100.0 * differ / len(a):.2e} %)"
             if args.json:
                 print(json.dumps({"hidden": hidden, "heads": heads, "layers": layers, "prefix": prefix,
                                   "n_tiles": n, "tile": tile, "rot": rot, "header_off": header_off,
-                                  "stride_1_9": stride9, "verified": "whole file, byte for byte"}))
+                                  "stride_1_9": stride9, "verified": note}))
             else:
-                print(f"// verified: the whole file, byte for byte ({len(a)} B)")
+                print(f"// verified: {note} ({len(a)} B)")
                 print(f"{{{hidden}, {heads}, {layers}, {prefix}, {n}, {rot}, {tile}}},")
+            if args.probe_wrong:
+                # What a WRONG rule costs, in the same units as the tolerance: perturb one field of the accepted
+                # rule at a time, normalise again, and report the residual. A tolerance is only defensible when the
+                # wrong answers are orders of magnitude above it.
+                for label, wrong in (("rot+1", (prefix, n, tile, (rot + 1) % n if n > 1 else rot, header_off, stride9)),
+                                     ("tile/2", (prefix, n, max(4096, tile // 2), rot, header_off, stride9)),
+                                     ("prefix+64", (prefix + 64, n, tile, rot, header_off, stride9)),
+                                     ("n+1", (prefix, n + 1, tile, rot, header_off, stride9))):
+                    try:
+                        w = normalise(b, layers, wrong, hdr_len)
+                    except Exception as exc:                      # a perturbation that cannot even be built
+                        print(f"# wrong rule {label}: cannot normalise ({exc})", file=sys.stderr)
+                        continue
+                    if len(w) != len(a):
+                        print(f"# wrong rule {label}: length {len(w)} != {len(a)}", file=sys.stderr)
+                        continue
+                    wd = sum(1 for x, y in zip(w, a) if x != y)
+                    print(f"# wrong rule {label}: {wd} bytes differ ({100.0 * wd / len(a):.3e} % of the file; "
+                          f"tolerance is {TOL:.0e} = {int(len(a) * TOL)} B)", file=sys.stderr)
             return 0
-        differ = sum(1 for x, y in zip(got, a) if x != y)
-        print(f"# candidate prefix={prefix} n={n} tile={tile} rot={rot}: {differ} bytes differ, trying next",
+        print(f"# candidate prefix={p[0]} n={p[1]} tile={p[2]} rot={p[3]}: {differ} bytes differ, trying next",
               file=sys.stderr)
     raise SystemExit("no candidate reproduced the 1.8 file: this pack is not the 1.9 form, or the pair is not the "
                      "same model (a fine-tune's codes differ, which shows up here as a byte residual)")

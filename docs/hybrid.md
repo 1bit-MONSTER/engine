@@ -138,11 +138,16 @@ not ours: per layer, `cache_k_l<L>` and `cache_v_l<L>` are separate tensors, pos
 `[token][n_embd_k_gqa]`, and the region carries each of them at a 4 KiB boundary in tensor order
 (`src/llama-kv-share.cpp`, `share_layout`). A token's K|V row is contiguous in a prefill's output and is *not*
 contiguous in the cache, so the write has two destinations per layer at two different offsets and the row stride
-inside a tensor is `n_embd_k_gqa`. The provider addresses its **own mapping** of the dma-buf it was handed
-(a driver-made mapping of the imported buffer is the route that poisons the submission, engine#812), and the
-bytes it writes are the bytes the decoder reads: the handoff is `llama_kv_cells_adopt`, so nothing re-checks
-them. Engine#753 is that writer; the engine side of this contract (`?action=share`, `?action=adopt`,
-`llama_kv_cells_adopt`) needs no change for it.
+inside a tensor is `n_embd_k_gqa`. The provider writes through **a mapping it made itself** of the dma-buf it was
+handed — `mmap` of the fd it received is enough, and it aliases the decoder's pages (engine#753 measured both) —
+and never through a mapping the *driver* makes of the imported buffer, which is the route that poisons the
+submission (engine#812). One trap that costs a silent wrong answer: that mapping is lazy, so **fault the whole
+region in before the device writes it** — one byte per page is enough (`for (p = buf; p < buf + len; p += 4096)
+*p = *p;`), or `mmap` it with `MAP_POPULATE`, or `madvise(MADV_WILLNEED)`. A device DMA into pages the process has
+not faulted is dropped with no error and no fault, and the write looks like it never happened — touching a single
+byte of the region is *not* enough, and looks identical to having done the right thing. The bytes the provider writes are the bytes the
+decoder reads — the handoff is `llama_kv_cells_adopt`, so nothing re-checks them. Engine#753 is that writer; the
+engine side of this contract (`?action=share`, `?action=adopt`, `llama_kv_cells_adopt`) needs no change for it.
 
 Limits, so nobody reads more into the flag than it does: the region is the model's shared memory — the
 attention cache, plus the recurrent state for a hybrid model (fork 1bit-MONSTER/llama.cpp#181), so a

@@ -82,8 +82,12 @@ Two facts from that work belong here because they bound what a device provider c
 - the region is the decoder's cache, so a provider writes **two destinations per layer, not one**: `cache_k_l<L>`
   and `cache_v_l<L>` are separate tensors and a token's K|V row is contiguous in the compute but not in the
   cache (row stride `n_embd_k_gqa`, K and V at different tensor offsets);
-- it must write through **its own mapping** of the dma-buf. Asking the driver for a mapping of the import is the
-  route that makes every later submission fail (engine#812); the pages are the same either way.
+- it must write through **a mapping it makes itself** of the dma-buf. Asking the driver for a mapping of the
+  import is the route that makes every later submission fail (engine#812); the pages are the same either way. A
+  second process can `mmap` the fd it is handed and gets the decoder's pages, but that mapping is lazy: pages it
+  has not faulted in are not there, and a device write into them is dropped silently, so every page of the region
+  has to be faulted first — one byte per page, or `MAP_POPULATE` / `MADV_WILLNEED`; touching one byte of the region
+  is not enough (both measured, engine#753).
 
 ### The arm a device provider replaces, and the model to run it on
 

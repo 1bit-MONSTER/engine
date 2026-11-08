@@ -143,8 +143,24 @@ SFS with one added file): the update reports `UPDATED`, the machine comes back o
 the new set's marker file present and the marker written before the update still there; `--rollback` brings it back to
 `psubdir=1bit` with the previous appliance intact and the state unchanged.
 
-Still open on #712: the **server-shaped rest** (a firewall default, NTP, hostname and an optional static address in the
-installer's answers, logging that survives without systemd).
+### The server-shaped rest, present or named
+
+An installed 1bit OS is a headless server, so the things a server is expected to have are either there and measured, or
+named here as what they are:
+
+| | what the machine has | measured |
+|---|---|---|
+| firewall default | Puppy's `/etc/init.d/rc.firewall` sets `-P INPUT/-P FORWARD DROP` on the v4 **and** the v6 stack, and `zz-onboard-ports` — last in name order, which is the mechanism: `rc.services` runs `/etc/init.d/*` in order and `rc.firewall` sorts under "r" — inserts the two inbound rules the appliance serves, tcp/**22** (ssh, the owner's key) and tcp/**13305** (Lemonade), plus mDNS, each with `-C` so a re-run is a no-op. **When** it is in place is part of the property: `rc.sysinit` starts `rc.services` in the background, so for the first seconds of a boot the policy is still ACCEPT and no port rule exists yet — the serial shell appears *before* the last script has run, because that shell is itself one of them | `install-probe.sh` on the installed boot, **after waiting** (bounded, and the wait is printed): `INPUT DROP` in both stacks, both ACCEPT rules, loopback and established/related exempted, and a port nothing serves (9999) in no rule. Measured on an installed disk 2026-11-07: in place **10 s** after the shell (and the row that did not wait reported "no firewall" — a measurement artifact, recorded so nobody trusts the earlier claim) |
+| time | `connman` owns the network and syncs from `FallbackTimeservers = pool.ntp.org` (`/etc/connman/main.conf`); `ntpd`, `ntpdate` and `adjtimex` are in the image for a machine that wants a daemon | the installed boot's own connman config |
+| the machine's name | `/etc/hostname` is `1bit-os`, and the console's network item sets it — on an installed machine that write lands in the save layer, so it **persists** (on a stick it is RAM) | the installed boot's `hostname` |
+| logging | `06onboard-logs` keeps the boot's logs on `/data/logs` — the partition, not the filesystem that the next appliance replaces | `/data/logs` non-empty on the installed boot |
+| packages and services | `apt` works and its packages land in the save layer; the appliance's own services are `/etc/init.d` scripts, which is what `rc.services` runs (there is no systemd here, and nothing pretends there is) | — |
+
+**Not present, and named:** a **persisted static address**. The console's "set a static address" is *session only* on
+purpose — a wrong one on a headless box is a walk to the machine — and the persistent form is not a one-line change: on
+this base connman owns the interface, so it has to be a connman service config, with the console (or the install
+screen, #710) as its recovery path. That is the remaining piece of engine#712's third item, and it is a product decision
+rather than a row to add to a gate.
 
 ## The Ubuntu plan (history, not a target)
 

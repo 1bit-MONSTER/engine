@@ -72,26 +72,6 @@
 #     Arch /updates); the check is "modprobe -n resolves OUR file", not a fixed path.
 set -uo pipefail
 
-# --self-test exercises the row/summary accounting on stubs and exits: the counter this run prints is only worth
-# something if it has been seen to count, in both directions, without four containers. Same rule as the guard audits -
-# a number nobody has watched move is a claim.
-if [ "${1:-}" = --self-test ]; then
-    rows=0; fail=0
-    row() { printf '%-4s %-26s %s\n' "$1" "$2" "$3"; rows=$((rows + 1)); [ "$1" = PASS ] || fail=1; }
-    row PASS "a passing row counts" "1"
-    row PASS "a second passing row counts" "2"
-    [ "$rows" = 2 ] && [ "$fail" = 0 ] || { echo "self-test: FAIL - two passes should be 2 rows and no failure (rows=$rows fail=$fail)"; exit 1; }
-    row FAIL "a failing row counts too" "3"
-    [ "$rows" = 3 ] && [ "$fail" = 1 ] || { echo "self-test: FAIL - a failure should be the 3rd row and set fail (rows=$rows fail=$fail)"; exit 1; }
-    s=$(if [ "$fail" = 0 ]; then echo "ALL ROWS PASS ($rows rows)"; else echo "FAILURES ABOVE ($rows rows)"; fi)
-    [ "$s" = "FAILURES ABOVE (3 rows)" ] || { echo "self-test: FAIL - summary reads '$s'"; exit 1; }
-    echo "pkg-proof self-test: ok (3 rows, summary 'FAILURES ABOVE (3 rows)')"
-    exit 0
-fi
-
-fam=${1:?usage: pkg-proof.sh <deb|rpm|arch> <package-dir>}
-pkgdir=${2:?usage: pkg-proof.sh <deb|rpm|arch> <package-dir>}
-pkgdir=$(cd "$pkgdir" && pwd)
 fail=0
 krel=      # set by the kernel-package block; empty on the distribution-kernel path (no kernel packages)
 rows=0    # how many rows this run printed, so the summary states a number instead of an adjective
@@ -101,6 +81,30 @@ row() {   # <PASS|FAIL> <what> <detail>
     [ "$1" = PASS ] || fail=1
 }
 check() { local what=$1 detail=$2; shift 2; if "$@" >/dev/null 2>&1; then row PASS "$what" "$detail"; else row FAIL "$what" "$detail"; fi; }
+
+# --self-test exercises the row/summary accounting on stubs and exits: the counter this run prints is only worth
+# something if it has been seen to count, in both directions, without four containers. Same rule as the guard audits -
+# a number nobody has watched move is a claim.
+if [ "${1:-}" = --self-test ]; then
+    # This branch calls the SHIPPED row() and check(), not copies: the first version of the test defined its own row(), so
+    # dropping the increment from the real one would have left the test green - a check that cannot fail, in exactly the
+    # direction this PR exists to fix (pi-release's review of #1538). The definitions sit ABOVE this branch for that reason.
+    row PASS "a passing row counts" "1"
+    row PASS "a second passing row counts" "2"
+    [ "$rows" = 2 ] && [ "$fail" = 0 ] || { echo "self-test: FAIL - two passes should be 2 rows and no failure (rows=$rows fail=$fail)"; exit 1; }
+    row FAIL "a failing row counts too" "3"
+    [ "$rows" = 3 ] && [ "$fail" = 1 ] || { echo "self-test: FAIL - a failure should be the 3rd row and set fail (rows=$rows fail=$fail)"; exit 1; }
+    check "check() routes through row()" "stub" true
+    [ "$rows" = 4 ] || { echo "self-test: FAIL - check() should have counted a 4th row (rows=$rows)"; exit 1; }
+    s=$(if [ "$fail" = 0 ]; then echo "ALL ROWS PASS ($rows rows)"; else echo "FAILURES ABOVE ($rows rows)"; fi)
+    [ "$s" = "FAILURES ABOVE (4 rows)" ] || { echo "self-test: FAIL - summary reads '$s'"; exit 1; }
+    echo "pkg-proof self-test: ok (4 rows through the shipped row()/check(); summary 'FAILURES ABOVE (4 rows)')"
+    exit 0
+fi
+
+fam=${1:?usage: pkg-proof.sh <deb|rpm|arch> <package-dir>}
+pkgdir=${2:?usage: pkg-proof.sh <deb|rpm|arch> <package-dir>}
+pkgdir=$(cd "$pkgdir" && pwd)
 
 # the kernel whose headers this container has (never the running kernel's)
 case $fam in

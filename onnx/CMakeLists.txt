@@ -51,6 +51,21 @@ add_executable(ort_run ort_run_main.cpp)
 target_link_libraries(ort_run PRIVATE onebit_ort_run)
 target_compile_options(ort_run PRIVATE -O2 -Wall -std=c++17)
 
+# `ort-run --input/--output/--dump-all` on a graph it has never seen (docs/onnx.md, "Any graph").
+# The fixture is a two-node MatMul+Relu written by the test itself, so it needs python `onnx` and
+# nothing else; where that package is absent the test is not registered rather than registered red.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -c "import onnx" RESULT_VARIABLE _onebit_onnx_missing
+                  OUTPUT_QUIET ERROR_QUIET)
+  if(_onebit_onnx_missing EQUAL 0)
+    add_test(NAME ort_run_generic
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/ort_run_generic.sh $<TARGET_FILE:ort_run> ${Python3_EXECUTABLE})
+  else()
+    message(STATUS "ort_run_generic: not registered (python 'onnx' is not installed)")
+  endif()
+endif()
+
 # Standalone mode owns the test registry; in-tree, the root CMakeLists already
 # called enable_testing() before this subdirectory is added.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

@@ -41,11 +41,19 @@ Measured here (`Qwen3-4B-Q4_K_M` target ← `PARD-Qwen3-0.6B` Q4_K_M draft, gree
 
 | backend | target alone | target + draft | ratio |
 |---|---|---|---|
-| **HRX0** (iGPU, `-dev HRX0 -ngl 99 -fa on -devd HRX0`) | 46.849 tok/s (median of 3) | 70.259 tok/s | **1.50×** |
+| **HRX0** (iGPU, `-dev HRX0 -ngl 99 -fa on -devd HRX0`) | 75.785 tok/s (median of 4, two warm-ups discarded) | 76.656 tok/s | **1.012×** |
 | **CPU** (`-ngl 0 -t 4`) | 20.53 tok/s | — | **0.508× / 0.609×** |
 
-Acceptance (llama.cpp's own accounting, CPU runs): **0.759 / 0.804 / 0.980** of drafted tokens. Reproduce with
-`tools/spec_decode_speedup.sh` and `tools/spec_decode_acceptance.py`.
+Acceptance (llama.cpp's own accounting, **CPU** runs): **0.759 / 0.804 / 0.980** of drafted tokens. On HRX it is **not
+measured** — that build does not echo `draft_n_accepted` in the JSON and does not write the `draft acceptance rate` line by
+default, which is why the ratio above stands alone. Reproduce with `tools/spec_decode_speedup.sh` and
+`tools/spec_decode_acceptance.py`.
+
+**A 1.50× was published here first and it was wrong.** The first HRX run discarded a single warm-up request, and the baseline
+was still climbing through all three measured samples (40.646 → 51.942 → 46.849 tok/s) while the draft arm was measured after it:
+50 % of "speedup" was an unsteady baseline. Two later runs with two discarded warm-ups and four measured samples each put the
+baseline on its plateau (~75 tok/s) and give **1.03×** and **1.012×** — i.e. the draft is roughly break-even on the device for this
+pair, not a large win. That is why the harness now takes `SKIP_FIRST` and why the tool prints both arms' every sample.
 
 **CPU can never win, and that is arithmetic rather than a bug.** A round is one batched verify over `M = 1 + drafted` tokens
 plus `drafted` draft decodes; on a CPU backend a decode is bandwidth-bound per token, so the verify costs ≈ `M`
@@ -54,6 +62,13 @@ which is impossible. Measured by counting work rather than timing it (load-indep
 10 rounds ⇒ **exactly one target decode per round** (the verify *is* batched) and zero rollback replays, and the observed
 0.68-0.79× matches `tokens/round ÷ (drafted·r + M)` with the measured per-token costs. engine#1423 carries that analysis, and
 its only open item is a policy question (warn or refuse when speculation is requested on a CPU-only backend).
+
+### What the corrected number means
+
+At ~75 tok/s the 4 B target is fast enough on this iGPU that a 0.6 B draft spending ~4 decodes per round buys back about what it
+costs: **1.01×, not 1.50×**. So the device verdict is "break-even for this pair", not "a win" — and PARD's published 1.78×/4.08×
+numbers come from its own tuned runtime (parallel mask, batching), not from driving its weights through our server in AR mode.
+A row that quotes a speedup for these drafts must say which of the two it measured.
 
 ## Gumiho — a vendor hybrid head: **it needs a tree verifier we do not have**
 

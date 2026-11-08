@@ -47,6 +47,9 @@ SRV_ARGS=${SRV_ARGS:--ngl 0 -t 4}
 DRAFT_MAX_FLAG=${DRAFT_MAX_FLAG:---draft-max}
 DRAFT_MIN_FLAG=${DRAFT_MIN_FLAG:---draft-min}
 REQS=${REQS:-3}
+SKIP_FIRST=${SKIP_FIRST:-1}   # warm-up requests discarded per arm. One is not always enough on this box: an HRX baseline
+                              # climbing 40.6 -> 51.9 -> 46.8 across three samples produced a 1.50x "speedup" that was
+                              # really 1.03x once the baseline had settled (2026-11-08).
 WAITMAX=${WAITMAX:-150}
 PORT_A=${PORT_A:-18120}
 PORT_B=${PORT_B:-18121}
@@ -95,9 +98,9 @@ arm() {  # arm <label> <port> <server args...>
     CUR_PID=$pid
     waitup "$port" "$label" || { kill -9 $pid 2>/dev/null; CUR_PID=""; return 1; }
     local i
-    for i in $(seq 1 $(( REQS + 1 ))); do
+    for i in $(seq 1 $(( REQS + SKIP_FIRST ))); do
         read -r tps acc gen < <(ask "$port")
-        if [ "$i" = 1 ]; then echo "  $label warmup: ${tps} tok/s (discarded)"; continue; fi
+        if [ "$i" -le "$SKIP_FIRST" ]; then echo "  $label warmup $i: ${tps} tok/s (discarded)"; continue; fi
         echo "  $label: ${tps} tok/s   accepted ${acc:-0}/${gen:-0}"
         echo "$tps" >> "/tmp/specdec-$label.acc"
     done

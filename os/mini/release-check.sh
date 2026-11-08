@@ -630,6 +630,43 @@ identity_verdict() {
     printf 'PASS consistent: engine_sha256=%.16s and libhsa_sha256=%.16s are the shipped bytes, read off the payload rather than out of the file' "$_ce" "$_ch"
 }
 
+# ── the payload's NAME in the identity file (engine #1481's other half, #1557) ──────────────────
+# `payload=` is written from an ENVIRONMENT input, not from a fact about the payload:
+#   os/v3/puppy/container-build.sh  payload=${PAYLOAD_NAME:-unknown}
+#   build.sh                        PAYLOAD_NAME="$(basename "$payload")"
+# so c32 and c33 shipped `payload=lemonade-onebit-rc-2026-11-05-c26c` while carrying later payloads, and nothing reded. The
+# engine half of that lie is closed (engine_sha256 is compared with the launcher present, identity_verdict above). The NAME has
+# no image-side authority at all: the payload tree is unpacked at a fixed path (/opt/1bit-package) and carries no file naming
+# the tarball it came from, so a comparison "against the payload directory present" would only compare two different kinds of
+# name - the issue's own warning (#1557).
+#
+# What an image CAN check, and what this row therefore claims, is narrower and said out loud: the name is present, it is the
+# shape a bundle can match, and it does not postdate the image that carries it. The name's authority is the release bundle
+# (tarball stem + SHA256SUMS), which an image cannot see - so the release body must cite the tarball, never this file.
+# Pure, so --self-test drives it: <payload name> <built stamp> <payload dir present: yes|no>
+payload_name_verdict() {
+    _pn=${1:-} _pb=${2:-} _have=${3:-no}
+    if [ "$_have" != yes ]; then
+        printf 'SKIP no payload directory on this system, so the identity names nothing for this row to judge'
+        return 0
+    fi
+    case "$_pn" in
+        '') printf 'FAIL the identity names no payload (payload= is empty) while the image carries one - PAYLOAD_NAME was unset at build time, and an empty name matches no bundle'; return 0 ;;
+        unknown) printf 'FAIL the identity says payload=unknown while the image carries a payload - the build input PAYLOAD_NAME was unset (os/v3/puppy/container-build.sh), which is how a stale name ships without anyone noticing'; return 0 ;;
+    esac
+    case "$_pn" in
+        *[!A-Za-z0-9._-]*) printf 'FAIL payload=%s has characters no bundle name can carry (found %s) - malformed, not merely stale' "$_pn" "$(printf '%s' "$_pn" | tr -d 'A-Za-z0-9._-' | cut -c1-12)"; return 0 ;;
+    esac
+    # a payload cannot be built after the image that carries it: the date in the name must not postdate `built=`
+    _pnd=$(printf '%s' "$_pn" | sed -n 's/.*\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\).*/\1/p')
+    _pbd=$(printf '%s' "$_pb" | cut -c1-10)
+    if [ -n "$_pnd" ] && printf '%s' "$_pbd" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' && [ "$_pnd" \> "$_pbd" ]; then
+        printf 'FAIL payload=%s names %s, later than built=%s - a payload cannot postdate the image that carries it, so at least one of the two fields is not this cut'"'"'s' "$_pn" "$_pnd" "$_pbd"
+        return 0
+    fi
+    printf 'PASS payload=%s is a name a bundle can match and does not postdate built=%s (its authority is the release bundle - tarball stem and SHA256SUMS - which an image cannot see, so a release body cites the tarball, never this file)' "$_pn" "${_pbd:-?}"
+}
+
 # ── the NPU's locked memory, read from the process that locks it ─────────────────────────────────
 # Two mechanisms set this limit and either can silently override the other: /etc/security/limits.d/*.conf (pam_limits, files
 # applied in LEXICAL order, the last assignment for an item wins) covers anything PAM starts, and
@@ -756,6 +793,14 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_runpath_verdict 1)"
     check FAIL "$(payload_runpath_verdict '')"
     # engine #1352: the payload's modes. c31/c32 shipped 134 writable files; a payload packed after #1361 has none.
+    # engine #1557: the payload NAME. c32/c33 shipped a stale name and the row printed it as PASS.
+    check PASS   "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 2026-11-08T16:47:32Z yes)"
+    check FAIL   "$(payload_name_verdict unknown 2026-11-08T16:47:32Z yes)"                                   # PAYLOAD_NAME unset: what c32/c33 shipped
+    check FAIL   "$(payload_name_verdict '' 2026-11-08T16:47:32Z yes)"                                        # empty claim
+    check FAIL   "$(payload_name_verdict 'lem/onebit rc' 2026-11-08T16:47:32Z yes)"                           # no bundle can match it
+    check FAIL   "$(payload_name_verdict lemonade-onebit-rc-2026-12-01-c40 2026-11-08T16:47:32Z yes)"         # postdates built=: impossible
+    check SKIP   "$(payload_name_verdict unknown 2026-11-08T16:47:32Z no)"                                    # no payload: nothing claimed
+    check PASS   "$(payload_name_verdict binary-drop-2026.45.0 2026-11-08T16:47:32Z yes)"                     # a payload with no date in its name
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 7ba2110811111111111111111111111111111111111111111111111111111111 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"       # the c26-in-a-c32-image shape: engine claim vs shipped launcher
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"       # libhsa claim vs the runtime the image carries
@@ -1868,6 +1913,13 @@ if [ -f "$ID" ]; then
             *)     fail identity "${_idv#FAIL } (${_idinfo})" ;;
         esac
     fi
+    _pn_have=no; [ -d "${PAYLOAD_DIR:-/opt/1bit-package}" ] && _pn_have=yes
+    _pnv=$(payload_name_verdict "${_id_name:-}" "${_id_built:-}" "$_pn_have")
+    case "$_pnv" in
+        PASS*) pass payload-name "${_pnv#PASS }" ;;
+        SKIP*) skip payload-name "${_pnv#SKIP }" ;;
+        *)     fail payload-name "${_pnv#FAIL }" ;;
+    esac
     if [ -f /data/SHA256SUMS ]; then
         if (cd /data && sha256sum -c SHA256SUMS >/dev/null 2>&1); then pass sha256sums "/data/SHA256SUMS verifies"
         else fail sha256sums "/data/SHA256SUMS does not verify (cd /data && sha256sum -c SHA256SUMS)"; fi

@@ -270,6 +270,10 @@ const uint8_t* at(const Fconst& f, int64_t off, int64_t len) {
 // reads at -4*NH. The tile shape cannot be derived from the pack itself -- it is not a subset sum of the
 // pack's own const sizes -- so each rule below was measured against the 1.8 pack of the SAME model by
 // whole-file diff. A 1.9 pack whose geometry is not in this table is refused rather than decoded on a guess.
+// The correlation above which an imported head is taken to BE the embedding (tied). Named because the container's
+// field, the readout and the note all have to agree on it: three copies of 0.99 is how they drifted apart before.
+constexpr double kTieCorr = 0.99;
+
 struct Fconst19Rule {
     int hidden, heads, layers;
     int64_t prefix;   // bytes before the q/k/v bundle: the norms, and on Qwen3 the per-head QK gains too
@@ -2123,7 +2127,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // The diagnostic follows the NUMBER, not the pack's declaration: a genre-A pack ships no config.json, so
             // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
             // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
-            r.selfcheck_tied = r.lmhead_corr > 0.99;
+            r.selfcheck_tied = r.lmhead_corr > kTieCorr;
             const Q4 swap = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K),
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
@@ -2247,7 +2251,30 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             r.lmhead_rel = sum_abs / sum_ref;
                             r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
                             r.selfcheck_reference = true;
-                            r.selfcheck_tied = r.lmhead_corr > 0.99;
+                            r.selfcheck_tied = r.lmhead_corr > kTieCorr;
+                            // The control this path can actually run: the same tiles and the same decoder, with each
+                            // head row matched against the NEXT embedding row. If a misaligned head still correlated,
+                            // the number above would be measuring the vocabulary's mean brightness rather than the
+                            // head. (The host path's controls mis-decode its MatMulNBits bytes instead; there are no
+                            // such bytes here, and printing its numbers from struct defaults -- which is what this
+                            // path did until review -- is worse than printing none.)
+                            {
+                                double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
+                                const int n = std::min(2048, q.N - 1);
+                                for (int rr = 0; rr < n; ++rr)
+                                    for (int k = 0; k < q.K; ++k) {
+                                        const size_t g = size_t(rr) * (q.K / 32) + size_t(k) / 32;
+                                        const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[g] + q.zero[g];
+                                        uint16_t hb;
+                                        std::memcpy(&hb, embed_bytes + ((size_t(rr) + 1) * H + k) * 2, 2);
+                                        const double y = f16_to_f32(hb);
+                                        sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
+                                    }
+                                const double m = double(n) * q.K;
+                                const double cx = sxx - sx * sx / m, cy = syy - sy * sy / m;
+                                if (m > 0 && cx > 1e-12 && cy > 1e-12)
+                                    r.ctrl_corr_rowshift = (sxy - sx * sy / m) / std::sqrt(cx * cy);
+                            }
                         }
                         const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
                         r.tiles += head_tiles;
@@ -2683,10 +2710,10 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         if (tie_declared) {
             c["tie_word_embeddings"] = tied;
         } else if (head_written) {
-            c["tie_word_embeddings"] = r.lmhead_corr > 0.99;
+            c["tie_word_embeddings"] = r.lmhead_corr > kTieCorr;
             c["q4nx_tie_note"] = "this pack states no tie_word_embeddings, so it is taken from the data: the " +
-                                 std::string(r.lmhead_corr > 0.99 ? "imported head reproduces the embedding"
-                                                                  : "imported head is a separate matrix") +
+                                 std::string(r.lmhead_corr > kTieCorr ? "imported head reproduces the embedding"
+                                                                      : "imported head is a separate matrix") +
                                  " (correlation " + std::to_string(r.lmhead_corr) + ")";
         }
         c["q4nx_source"] = {{"converter", "1bit npu-pack import"},
@@ -2805,8 +2832,11 @@ int run(int argc, char** argv) {
         std::printf("  self-check: the head reproduces the pack's fp16 embedding  corr %.6f  rel_err %.6f\n"
                     "              (tied: this correlation is the check, and it passed)\n",
                     r.lmhead_corr, r.lmhead_rel);
-        std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
-                    r.ctrl_corr_nibble, r.ctrl_corr_nozp);
+        if (r.ctrl_corr_rowshift >= 0)
+            std::printf("  controls:   row-shifted corr %.4f (must fail)\n", r.ctrl_corr_rowshift);
+        else
+            std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
+                        r.ctrl_corr_nibble, r.ctrl_corr_nozp);
     } else if (r.selfcheck_reference) {
         // An untied pack: lm_head and model.embed_tokens are separate matrices, so correlating them is not a test of
         // anything. Say so, with the number, so the line cannot be read as a decoding failure.
@@ -2814,8 +2844,11 @@ int run(int argc, char** argv) {
                     "              matrices), so their correlation %.6f and rel_err %.6f are what an untied pack\n"
                     "              looks like, not a decode failure; the controls still run\n",
                     r.lmhead_corr, r.lmhead_rel);
-        std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
-                    r.ctrl_corr_nibble, r.ctrl_corr_nozp);
+        if (r.ctrl_corr_rowshift >= 0)
+            std::printf("  controls:   row-shifted corr %.4f (must fail)\n", r.ctrl_corr_rowshift);
+        else
+            std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
+                        r.ctrl_corr_nibble, r.ctrl_corr_nozp);
     } else {
         std::printf("  self-check: skipped -- the head is not tied to the embedding, so the pack\n"
                     "              carries no independent reference to test the decode against\n");

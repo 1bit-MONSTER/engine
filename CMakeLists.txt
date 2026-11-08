@@ -1445,11 +1445,12 @@ endif()
 # run is still named when it bites.
 # engine #1485: a script that runs `serve --port 0` no longer picks a port and releases it, so there is no window to
 # collide in and nothing for the lock to prevent - those are gone from this list (watchdog_serve, metrics_serve,
-# parallel_args, recipes_route, greedy_shortcut, prism_route, hrx_runtime_route), and the list now names exactly the
+# parallel_args, recipes_route, greedy_shortcut, prism_route, hrx_runtime_route, laya_gguf_route, mem_admit_route,
+# serve_e2e_<dev>), and the list now names exactly the
 # tests that still choose their port up front. bench_selftest stays: tools/bench.py picks its own free_port under it.
 set(_onebit_route_tests
     smoke_serve print_backend lemonade_hrx template_pin device_route npu_repack_path pm_route bench_selftest
-    laya_gguf_route mem_admit_route hrx_cwsr_route hybrid_route hybrid_kvshare_route)
+    hrx_cwsr_route hybrid_route hybrid_kvshare_route)
 # Tests that only exist for some configurations (a model was passed, a device is built in).
 # serve_e2e_<dev> left this list with engine #1485: it runs `serve --port 0` now, so it picks nothing and there is no
 # window for the lock to close. hrx_cpu_weight_parity stays - it starts `llama-server` itself, whose port is not ours to

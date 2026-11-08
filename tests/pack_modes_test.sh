@@ -91,6 +91,45 @@ chmod 0755 "$pristine"
 check "a file staged below the normalisation is caught" "$(pack_writable_files "$stage" | cut -d' ' -f1)" "staged-after.json"
 check "and reports the mode a user would see" "$(pack_writable_files "$stage" | cut -d' ' -f2)" "664"
 
+# The rule has to hold at EVERY packing site, not at the one being fixed. This is the check whose absence let the gap
+# reopen: #1361 fixed package-linux.sh, #1360 fixed weekly.sh's lemonade fold, and make-binary-drop.sh -- a third
+# script that sources this same library and writes a PUBLISHED tarball -- was missed by both until it was looked for.
+# Enumerated from the tree rather than listed here, so a fourth site cannot be forgotten either.
+#
+# Two tiers, because the sites are not the same job:
+#   * every site that stages files must call pack_normalise_modes -- no exceptions, it cannot change behaviour;
+#   * the sites that pack a FLAT payload must also assert with pack_writable_files.
+# pack-distro.sh is the one exemption and it is documented in that script (lines 63-74): it stages on the
+# formatter's own copy, so the chmod cannot fail there, and it decided the reporter would be "decoration". This test
+# records that decision instead of silently widening the rule; if a second site wants the exemption, someone has to
+# edit the list below, which is the point.
+flat="package-linux.sh weekly.sh make-binary-drop.sh"
+echo "packing sites:"
+for f in "$here"/../scripts/*.sh; do
+    grep -q 'pack-elf.sh' "$f" || continue      # only scripts that stage files with this library
+    grep -qE '\btar -C' "$f" || continue        # and actually write an archive
+    b=$(basename "$f")
+    printf '  %-28s ' "$b"
+    # A real invocation, not a mention: the first version of this check matched a COMMENTED-OUT call and passed on a
+    # site with the guard disabled -- the same "a check that cannot fail" defect the fixture half already caught once.
+    if ! grep -qE '^[[:space:]]*pack_normalise_modes' "$f"; then
+        echo "MISSING pack_normalise_modes"; fails=$((fails+1)); continue
+    fi
+    case " $flat " in
+        *" $b "*)
+            if grep -qE '^[[:space:]]*[a-z_]+=\$\(pack_writable_files' "$f"; then
+                echo "normalises and asserts"
+            else
+                echo "MISSING pack_writable_files (a flat payload must assert)"; fails=$((fails+1))
+            fi ;;
+        *)  echo "normalises (flat-payload assertion not required: see its own comment)" ;;
+    esac
+done
+# A floor, not an exact count: a fifth packing site that does carry the guard is a good change, and failing on it
+# would teach the next person to edit the test instead of the packer. The per-site loop above is the real assertion.
+sites=$(for f in "$here"/../scripts/*.sh; do grep -q 'pack-elf.sh' "$f" && grep -qE '\btar -C' "$f" && echo x; done | wc -l)
+check "the enumeration found every known packing site (>= 3)" "$([ "$sites" -ge 3 ] && echo yes || echo no)" "yes"
+
 rm -rf "$(dirname "$stage")"
 if [ "$fails" -ne 0 ]; then printf '%d check(s) failed\n' "$fails"; exit 1; fi
 echo "pack_modes: ok"

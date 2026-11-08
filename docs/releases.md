@@ -421,6 +421,13 @@ checks the release package runs: the NPU runtime compiled in, the kernels really
 nothing named like the private sources, both binary licenses present, every library found. It publishes nothing; the
 orchestrator publishes the tarball and adds its line to `config/binary-drop.config`.
 
+Its file modes are its **own** decision, not its inputs': the drop stages with `cp -a`, so built with `--build` it would
+carry that build tree's `0775` (measured: 13 of 13 files in a real `hrx/llama/bin` are `-rwxrwxr-x`), and built
+`--from-package` from an older tarball it would carry whatever that one had. It therefore runs the same
+`pack_normalise_modes` / `pack_writable_files` pair as the engine package before writing its archive, and
+`tests/pack_modes_test.sh` asserts that **every** script which stages with `scripts/pack-elf.sh` and writes an archive
+does the same.
+
 To build against a drop, point CMake at it — a directory or the tarball's URL:
 
 ```

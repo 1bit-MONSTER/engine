@@ -1719,7 +1719,19 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             add_norm_init(base + ".input_layernorm.weight", base + ".input_layernorm.weight");
             add_norm_init(base + ".post_attention_layernorm.weight", base + ".post_attention_layernorm.weight");
         }
-        add_norm_init("model.norm.weight", "model.norm.weight");
+        // The final norm is NOT `model.norm.weight` on this line: measured, both packs name it after a virtual
+        // (layers)-th block — `model.layers.30.final_norm_layernorm.weight` on SmolLM2-135M (30 layers) and
+        // `model.layers.24.final_norm_layernorm.weight` on Qwen2.5-0.5B (24 layers). Missing it left the container
+        // without a final norm, and every logit came back 0.0 -- which is what the head then reported.
+        const std::string suffix_norm = std::to_string(p.dims.layers) + ".final_norm_layernorm.weight";
+        bool got_final = add_norm_init("model.norm.weight", "model.norm.weight");
+        if (!got_final) got_final = add_norm_init("model.layers." + suffix_norm, "model.norm.weight");
+        if (!got_final) got_final = add_norm_init("model.final_layernorm.weight", "model.norm.weight");
+        if (!got_final)
+            std::fprintf(stderr,
+                         "WARNING: no final RMSNorm found (tried model.norm.weight, model.layers.%s, "
+                         "model.final_layernorm.weight); the container will have none and the head will read "
+                         "garbage\n", suffix_norm.c_str());
         // the fused qkv bias, split by the same row ranges the fused qweight uses
         for (int L = 0; L < p.dims.layers; ++L) {
             const std::string base = "model.layers." + std::to_string(L);
@@ -1837,7 +1849,17 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
 
     for (const auto& mm : onnx.matmuls) {
         const auto wi = onnx.index.find(mm.weight), si = onnx.index.find(mm.scales);
+        if (getenv("NPU_PACK_DEBUG"))
+            std::fprintf(stderr, "[pack-dbg2] weight=%s found=%d scales=%s found=%d (tensors=%zu index=%zu)\n",
+                         mm.weight.c_str(), (int)(wi != onnx.index.end()), mm.scales.c_str(),
+                         (int)(si != onnx.index.end()), onnx.tensors.size(), onnx.index.size());
         if (wi == onnx.index.end() || si == onnx.index.end()) continue;
+        // This loop visits EVERY MatMulNBits node -- on the genre-A packs that is 24-31 fused qkv nodes plus the head
+        // -- and it ends in a `break` (it was written when a pack had exactly one). So the first node was taken as
+        // the head and the loop exited: a *qkv* matrix went into lm_head.weight and the real head was never read,
+        // which is why the imported container answered "!!!!!!!!". Only the node whose geometry IS the head is
+        // taken here; the projections are imported from the graph's initializers by the block below.
+        if (!(mm.N == int(V) && mm.K == int(H))) continue;
         if (mm.bits != 4) throw std::runtime_error("lm_head: MatMulNBits is not 4-bit");
         const auto& wt = onnx.tensors[wi->second];
         const auto& st = onnx.tensors[si->second];

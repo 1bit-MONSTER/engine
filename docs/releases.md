@@ -280,11 +280,16 @@ the Ubuntu 26.04 PPA's `lemond` runs our HRX server unchanged (`#483`). Synced t
 onebit backend, catalog and FLM context clamp into upstream's rebuilt server, so the suite evidence for
 this pin is a run against the **ported** `lemond`, not against a package built before it.
 
-The catalog has **23 HRX entries**, each with a proven row on the box (strict placement, one request in
-role, `lemonade bench ... chat-short`): fork `#23`'s 22 plus flint from `#24`. It also has **4 NPU
-entries** — `Qwen3-0.6B`, `Qwen3-1.7B` and `Qwen3-4B` (fork `#19`, `#20`, `#23`) and
-`Qwen3.6-35B-A3B` (`#8`). Chat-short spans 43.4 (Qwen3-8B) to 330.7 tok/s (Qwen3-0.6B), 0 faults in 16
-holds.
+The catalog has **23 HRX entries**: **22 with a proven row on the box** (strict placement, one request in
+role, `lemonade bench ... chat-short`, fork `#23`) and `flint-40b-a2.5b` from fork `#24`, which is
+**added and not proven yet** — its proof run on 2026-11-08 never reached the model, because the engine's
+own planner refused the load on a full box (`need 24.07 GiB … free 6.03 GiB`, four foreign HRX clients
+resident), so flint needs an idle box rather than a different build — and a re-run at
+`--ctx-size 8192`, because that 24.07 GiB is the planner's lower bound for an arch it prices as
+fully windowed (lemonade `#45` carries the refusal and that condition on the fork's catalog page).
+It also has **4 NPU entries** — `Qwen3-0.6B`, `Qwen3-1.7B` and
+`Qwen3-4B` (fork `#19`, `#20`, `#23`) and `Qwen3.6-35B-A3B` (`#8`). Chat-short spans 43.4 (Qwen3-8B) to
+330.7 tok/s (Qwen3-0.6B) over the 22 proven rows, 0 faults in 16 holds.
 
 Two behaviours are new on this pin, both from the fleet's NPU-exclusivity decision (2026-11-05): **an
 NPU model switch evicts the previous NPU model before the new one starts**, because the array runs one

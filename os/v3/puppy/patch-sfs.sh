@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# patch-sfs.sh <src.sfs> <path-in-sfs> <replacement> <out.sfs>
-# patch-sfs.sh --manifest <manifest> <src.sfs> <out.sfs>
+# patch-sfs.sh [--replace] <src.sfs> <path-in-sfs> <replacement> <out.sfs>
+# patch-sfs.sh [--replace] --manifest <manifest> <src.sfs> <out.sfs>
 #
 # The manifest form is the same tool for a cycle that changes SEVERAL paths (c29: six - the console menu and TUI, the
 # release check, the installer, the selftest the image never shipped, the lemonade service's models dir, and the whole
@@ -53,6 +53,11 @@
 set -euo pipefail
 prog=$(basename "$0")
 usage() { sed -n "/^# $prog /,/^# Run as root/p" "$0" | sed 's/^# \{0,1\}//'; }
+replace=''
+# --replace, before the positional arguments: the output is packed to <out>.partial and renamed once every check has passed,
+# so a reader never sees half an artifact and a REFUSED run no longer destroys the previous good one. Handing over an existing
+# name is therefore a deliberate act: without the flag the old refusal stands.
+if [ "${1:-}" = --replace ]; then replace=1; shift; fi
 [ $# -eq 4 ] || { usage >&2; exit 1; }
 manifest=''
 if [ "${1:-}" = --manifest ]; then manifest=$2; src=$3; out=$4; target=''; repl=''; else src=$1 target=$2 repl=$3 out=$4; fi
@@ -73,7 +78,7 @@ fi
 for f in "$src" "${repls[@]}"; do [ -f "$f" ] || [ -d "$f" ] || { echo "$prog: no $f" >&2; exit 1; }; done
 [ "$(id -u)" = 0 ] || { echo "$prog: run as root (uid/gid and setuid bits are part of the artifact)" >&2; exit 1; }
 case $out in /*) ;; *) echo "$prog: <out.sfs> must be an absolute path" >&2; exit 1;; esac
-[ -e "$out" ] && { echo "$prog: $out exists; refusing to overwrite a packed SFS" >&2; exit 1; }
+[ -e "$out" ] && [ -z "$replace" ] && { echo "$prog: $out exists; refusing to overwrite a packed SFS (pass --replace to hand the name over only once the new one is verified)" >&2; exit 1; }
 for t in unsquashfs mksquashfs diff sha256sum; do command -v "$t" >/dev/null || { echo "$prog: no $t" >&2; exit 1; }; done
 
 work=$(mktemp -d "${SFS_WORK:-$HOME/wt/sfs-patch}/run.XXXXXX" 2>/dev/null || true)
@@ -152,6 +157,13 @@ else
 fi
 
 echo "$prog: packing with woof-CE's options (-comp zstd -Xcompression-level 19 -b 256K -no-exports -no-xattrs)"
+# Packed to a TEMPORARY name and renamed only once every check has passed, for two reasons measured on 2026-11-08:
+#   * a concurrent reader saw this file growing (127 MB of 490 MB) and misread it - another lane was measuring the
+#     artifact while a cut was rewriting it in place, which no check on this side can prevent;
+#   * every REFUSED path below used to `rm -f "$out"` a file that mksquashfs had already overwritten, i.e. a failed
+#     cut destroyed the previous good artifact as well as failing. Now a refusal removes only the temp.
+final=$out; out=$out.partial
+rm -f "$out"
 mksquashfs "$work/new" "$out" -comp zstd -Xcompression-level 19 -b 256K -no-exports -no-xattrs -noappend \
     -processors "${SFS_JOBS:-$(nproc)}" > "$work/mksquashfs.log" 2>&1 ||
     { echo "$prog: mksquashfs failed:" >&2; tail -5 "$work/mksquashfs.log" >&2; rm -f "$out"; exit 1; }
@@ -204,6 +216,8 @@ vmeta=$(diff "$work/meta-new" "$work/meta-verify" || true)
     printf '%s\n' "$vmeta" | sed -n '1,8p' >&2; rm -f "$out"; exit 1; }
 echo "$prog: metadata: $dn line(s) differ from the source, all inside the declared set; repack matches it exactly"
 
+# Every check above ran against the temporary name; only now does the artifact take the name callers read.
+mv -f "$out" "$final"; out=$final
 echo "$prog: OK  $out  ($(stat -c%s "$out") B, sha256 $(sha256sum "$out" | cut -c1-16)..., $(find "$work/new" | wc -l) paths)"
 if [ -z "$manifest" ]; then
     echo "$prog: source was $(stat -c%s "$src") B; one file differs: $target"

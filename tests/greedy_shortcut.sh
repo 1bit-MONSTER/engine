@@ -49,7 +49,9 @@ PY
 pid=$!
 port=
 for _ in $(seq 1 300); do
-    port=$(sed -n 's/^1bit serve: ready on http:\/\/[^:]*:\([0-9][0-9]*\).*/\1/p' "$scratch/serve.log" | head -1)
+    # `.*` rather than `[^:]*` for the host: greedy to the LAST colon, so an IPv6 --host (::1) still parses (reviewer's
+    # note on #1490). Everything before the port is throwaway, the port is the digits after the last colon.
+    port=$(sed -n 's/^1bit serve: ready on http:\/\/.*:\([0-9][0-9]*\)$/\1/p' "$scratch/serve.log" | head -1)
     [ -n "$port" ] && break
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1

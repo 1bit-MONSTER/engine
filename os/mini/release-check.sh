@@ -656,6 +656,24 @@ memlock_verdict() {
         "$_p" "$_v" "${_f:+ (highest-numbered memlock file: $_f)}"
 }
 
+# The image must not carry a builder's home directory (engine#1543). The mini (initramfs) image used to
+# ship its engine at the BUILDER's build path and symlink /bin/1bit at it, so the initrd disclosed the
+# builder's username, working directory and build-directory name - and carried a second copy of the
+# binary there. That is the fourth leak class: a path delivered as the filesystem LAYOUT rather than as
+# bytes in a file, which build_path_strings cannot see (it reads the contents of packed ELFs and
+# generated text). A mini image ships no users at all, so any /home/* path in its root is a builder's.
+# Pure, so --self-test drives it: <count of /home/* paths> [<sample>]
+builder_paths_verdict() {
+    _n=${1:-} _sample=${2:-}
+    case "$_n" in ''|*[!0-9]*) printf 'FAIL the image'"'"'s /home paths could not be counted (%s)' "${_n:-empty}"; return 0 ;; esac
+    if [ "$_n" = 0 ]; then
+        printf 'PASS the image carries no /home path: its engine is at /bin/1bit as a real file, so no builder directory travels with it'
+    else
+        printf 'FAIL %s /home path(s) in the image%s - a mini image ships no users, so this is the builder'"'"'s home (engine#1543: the engine belongs at /bin/1bit as a real file, not at its build path behind a symlink)' \
+            "$_n" "${_sample:+: $_sample}"
+    fi
+}
+
 payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
     _f=${1:-} _d=${2:-} _sample=${3:-}
     case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
@@ -784,6 +802,11 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(memlock_verdict '' lemond)"                                                   # running but unreadable: unknown is not a pass
     check FAIL "$(memlock_verdict 'lots' lemond)"                                               # nonsense is a fail, not a skip
     check PASS "$(payload_modes_verdict 0 0)"
+    # engine#1543: the fourth leak class - a path delivered as the layout, not as bytes
+    check PASS "$(builder_paths_verdict 0)"
+    check FAIL "$(builder_paths_verdict 4 'home/bcloud home/bcloud/wt home/bcloud/wt/build home/bcloud/wt/build/1bit')"
+    check FAIL "$(builder_paths_verdict 1)"
+    check FAIL "$(builder_paths_verdict '')"
     check FAIL "$(payload_modes_verdict 134 49)"        # c31/c32's real shape: 134 files AND 49 directories
     check FAIL "$(payload_modes_verdict 0 1)"           # the c33 first cut: no files, the payload ROOT writable
     check FAIL "$(payload_modes_verdict 1 0 '/opt/1bit-package/1bit/1bit')"
@@ -1876,6 +1899,22 @@ if [ -f "$ID" ]; then
     fi
 else
     skip identity "no /etc/1bit/release-identity in this image build; the tag and the image sha256 are in the release table beside the .img.zst"
+fi
+
+# ── the image's own LAYOUT must not name its builder (engine#1543) ───────────────────────────────────
+# A mini image's root IS the image, so a builder's home is visible right here; a stick's base layer has real
+# users and /home is its own, so this row is mini-only. `engine: <short sha>` in the identity file is the
+# mini schema (os/mini/mkimage.sh) - the same marker the identity row keys on above.
+if [ -n "$(sed -n 's/^engine: *//p' "${ID:-/etc/1bit/release-identity}" 2>/dev/null | head -1)" ]; then
+    _bp_paths=$(find / -xdev -maxdepth 6 -path '/home/*' 2>/dev/null | sed 's|^/||' | head -20)
+    _bp_n=$(printf '%s\n' "${_bp_paths:-}" | sed '/^$/d' | wc -l)
+    BP=$(builder_paths_verdict "${_bp_n:-0}" "$(printf '%s' "$_bp_paths" | sed '/^$/d' | head -3 | tr '\n' ' ')")
+    case "$BP" in
+        PASS*) pass image-builder-paths "${BP#PASS }" ;;
+        *)     fail image-builder-paths "${BP#FAIL }" ;;
+    esac
+else
+    skip image-builder-paths "not a mini image (no mini identity file), so /home here is not a builder path to check"
 fi
 
 # ── the payload's modes (engine #1352) ─────────────────────────────────────────────────────────────

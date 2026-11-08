@@ -66,7 +66,7 @@ set -euo pipefail
 export PATH="$PATH:/usr/sbin:/sbin"
 out=${1:?usage: mkimage.sh <out> [engine build dir]}
 build=${2:-$HOME/.cache/1bit-os/src/build}
-build=$(cd "$build" && pwd)   # absolute: binaries keep their build paths inside the image
+build=$(cd "$build" && pwd)   # absolute, so copy_libs resolves NEEDED against it; the image no longer keeps it
 kver=${KVER:-$(uname -r)}
 # the kernel image: /boot/vmlinuz-<kver>, or VMLINUZ= (e.g. unpacked from its .deb where /boot is root-only);
 # the engine builds no kernel: the Strix Halo kernel packages come from our separate kernel build
@@ -316,12 +316,18 @@ fw "amdgpu/gc_11_5_1_*" "amdgpu/sdma_6_1_1*" "amdgpu/psp_14_0_1*" "amdgpu/smu_14
 echo "== the engine"
 bin=$build/onebit; [ -x "$bin" ] || bin=$build/1bit
 [ -x "$bin" ] || { echo "no engine binary in $build (build with -DONEBIT_NPU=ON -DONEBIT_HRX=ON)"; exit 1; }
-copy_elf "$bin"
-ln -s "$bin" "$root/bin/1bit"
-# The sealed NPU kernel sets travel BESIDE the engine binary (docs/releases.md, "The NPU engine"):
-# in a package that is <pkg>/npu/kernels next to <pkg>/1bit, and here the binary keeps its build
-# path, so the sets go to the same place relative to it. Without them the image ships the NPU
-# route and nothing it can load - the route then refuses rather than falling back.
+# The engine goes to /bin/1bit as a REAL FILE: copying it to its build path and symlinking /bin/1bit at it
+# shipped the builder's username, working directory and build-directory name in the initrd, plus a second
+# copy of the binary at that path (engine#1543 — the fourth leak class: a path delivered as the filesystem
+# layout itself, which no content scan can see). Nothing in the image needs the build path: the binary
+# carries no RUNPATH (it resolves its NEEDED libraries from the standard loader paths, which copy_libs
+# stages), and no NPU kernel set is staged beside it. Keep copy_libs: it walks NEEDED, not the path.
+mkdir -p "$root/bin"
+cp -L "$bin" "$root/bin/1bit"
+chmod 0755 "$root/bin/1bit"
+copy_libs "$bin"
+# No NPU kernel set is staged into the mini image (the route refuses rather than falling back); if one
+# ever is, it goes beside /bin/1bit, which is now where the engine lives.
 
 
 echo "== Lemonade (lemond, the lemonade CLI, the web app)"

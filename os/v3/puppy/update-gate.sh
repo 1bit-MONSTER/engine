@@ -36,6 +36,10 @@
 #
 #   RESET=1 update-gate.sh target.img work     # after a failed or a successful run
 #
+# MODE=image runs ONLY the image form - two boots instead of five - because that row is what the #1385 review asked for and
+# a five-boot run needs ~40 quiet minutes, which a shared box does not always give: build the .img in the guest, update
+# from it, reboot, and check the set it carried is running on the machine's own save layer.
+#
 # Exit: 0 the update and the rollback both measured, 1 a check failed, 2 the harness could not run.
 set -uo pipefail
 prog=$(basename "$0")
@@ -180,7 +184,18 @@ try:
         say("INFO", "release", "%s: %d files + SHA256SUMS, puppy SFS carrying etc/1bit/%s" % (up, len(setfiles) + 1, name))
         return up
 
-    src1 = build_release("set-alt", "this file exists only in the first updated appliance set\n")
+    if os.environ.get("MODE") == "image":
+        # the image's set: the base set's files + the third patched SFS, in one directory the guest copies into the image
+        imgdir = os.path.join(data, "imgsrc")
+        sdo("mkdir", "-p", imgdir)
+        for f in setfiles:
+            sdo("cp", "-f", os.path.join(src, f), os.path.join(imgdir, f))
+        sdo("cp", "-f", os.path.join(data, "set-alt3.sfs"), os.path.join(imgdir, sfsname))
+        sdo("bash", "-c", "cd '%s' && sha256sum vmlinuz initrd.gz ./*.sfs > SHA256SUMS" % imgdir)
+        say("INFO", "release", "%s: the set the image will carry (set-alt3 as %s)" % (imgdir, sfsname))
+        src1 = src2 = imgdir
+    else:
+        src1 = build_release("set-alt", "this file exists only in the first updated appliance set\n")
     src2 = build_release("set-alt2", "this file exists only in the second updated appliance set\n")
     # a THIRD set, as one file on /data: the guest builds an .img around it for the image-form update (the #1385 review:
     # "add one gate row that updates from an .img the way a user would" - and the image form is where the hashes come
@@ -323,6 +338,66 @@ class Vm:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try: self.proc.wait(timeout=10)
         except Exception: pass
+
+# ---- MODE=image: just the image form, two boots (the row the #1385 review asked for)
+if os.environ.get("MODE") == "image":
+    v = Vm("img1", downs=3)
+    try:
+        if v.s is None:
+            ok = False
+        else:
+            pre = v.val("PRE", "sh -c 'echo 712-pre-update > /root/pre-update-marker; sync; cat /root/pre-update-marker'")
+            if pre != "712-pre-update":
+                say("FAIL", "pre-marker", "cannot write into the save layer (%s)" % (pre or "<nothing>")); ok = False
+            mk = ("rm -rf /data/imgstage /data/update.img; mkdir -p /data/imgstage/1bit; "
+                  "cp -f /data/imgsrc/vmlinuz /data/imgsrc/initrd.gz /data/imgsrc/SHA256SUMS /data/imgstage/1bit/; "
+                  "cp -f /data/imgsrc/*.sfs /data/imgstage/1bit/; "
+                  "truncate -s 1700M /data/update.img; "
+                  "printf 'label: gpt\\nstart=2048, type=L, name=\"1BIT-DATA\"\\n' | sfdisk -q /data/update.img; "
+                  "truncate -s 1664M /data/data.part; "
+                  "mkfs.ext4 -q -F -L 1BIT-DATA -d /data/imgstage /data/data.part; "
+                  "dd if=/data/data.part of=/data/update.img bs=1M seek=1 conv=notrunc status=none; "
+                  "rm -rf /data/imgstage /data/data.part; echo image-ok $(stat -c%s /data/update.img)")
+            img = v.val("MKIMG", mk, timeout=1800)
+            say("INFO", "mkimg", (img or "<no answer>")[-80:])
+            chk = v.val("CHKIMG", "sfdisk -d /data/update.img 2>&1 | grep -c 'name=\"1BIT-DATA\"'")
+            if "image-ok" not in (img or "") or chk.strip() != "1":
+                say("FAIL", "mkimg", "the test image is not a 1bit OS image (partition table names 1BIT-DATA: %s)"
+                    % (chk or "<none>")); ok = False
+            else:
+                say("PASS", "mkimg", "a GPT image with a 1BIT-DATA partition holding the set and its SHA256SUMS")
+            upi = v.val("UPDATE", "1bit-update /data/update.img 2>&1 | tr '\\n' '; '", timeout=2400)
+            say("INFO", "update", upi[:900])
+            if "UPDATED" not in upi:
+                say("FAIL", "update", "the image-form update failed: %s" % (upi[-300:] or "<no output>")); ok = False
+            elif "1bit/SHA256SUMS" not in upi:
+                say("FAIL", "update", "it did not verify against the image's own SHA256SUMS: %s" % upi[-400:]); ok = False
+            else:
+                say("PASS", "update", "an .img updated the machine, verified against the image's own SHA256SUMS")
+            if not v.reboot(downs=5):
+                say("FAIL", "boot-img", "the machine did not come back on the updated slot"); ok = False
+                v.close()
+            else:
+                sub = v.val("SUB", "tr ' ' '\\n' < /proc/cmdline | sed -n 's/^psubdir=//p'")
+                pm = v.val("PM", "sed -n 's/^PUPMODE=//p' /etc/rc.d/PUPSTATE | head -1")
+                m3 = v.val("MARK", "cat /etc/1bit/set-alt3 2>&1 | head -1")
+                pre2 = v.val("PRE", "cat /root/pre-update-marker 2>&1 | head -1")
+                say("INFO", "boot-img", "psubdir=%s PUPMODE=%s | set-alt3: %s | marker: %s"
+                    % (sub, pm, m3[:44], pre2[:40]))
+                if sub != "1bit-alt" or pm != "12":
+                    say("FAIL", "boot-img", "after the image-form update the machine is psubdir=%s PUPMODE=%s"
+                        % (sub or "<none>", pm or "<unread>")); ok = False
+                elif "only in the image-updated" not in m3:
+                    say("FAIL", "boot-img", "the image's set is not running (set-alt3: %s)" % (m3[:60] or "<none>")); ok = False
+                elif pre2 != "712-pre-update":
+                    say("FAIL", "boot-img", "the boot-1 marker is gone after the image-form update"); ok = False
+                else:
+                    say("PASS", "boot-img", "the image's set booted: psubdir=1bit-alt, PUPMODE=12, its marker present, "
+                                            "the machine's state intact")
+    finally:
+        v.close()
+    print("== %s" % ("PASS" if ok else "FAIL"))
+    sys.exit(0 if ok else 1)
 
 # ---- boot 1 (/1bit): the installed machine updates itself into the other slot
 v = Vm("b1-update", downs=3)

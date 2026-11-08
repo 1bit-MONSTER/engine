@@ -1955,6 +1955,23 @@ a silently broken loop rather than a slow one.
 lever) or a head that reliably produces a chain above 3.9 (widening `k` is not it: `k = 6` bought +0.05, and depth
 6 measured 0 %).
 
+**Two bars, and which one this loop has to clear.** engine#1371 measured a verify loop on the OGA 0.5B pack and derived
+a break-even of `181/154 = **1.17 tokens per round**` — correct for that loop, which runs **one** batched verify pass per
+round. `mtp::run()` runs **two** base passes per round: a verify batch *and* the step that consumes the committed token so
+the drafter's head sees the hidden it drafts past (measured, not assumed: `passes/token 0.625` is 40 passes over 20
+rounds). Dividing measured wall clock by measured rounds prices both:
+
+```
+tau = 0    draft 1.089 s/token x 64 tokens / 20 rounds = 3.48 s/round  ÷ 0.870 s/token = 4.0 tokens/round
+tau = 0.6  draft 1.008 s/token x 64 tokens / 32 rounds = 2.02 s/round  ÷ 0.482 s/token = 4.2 tokens/round
+```
+
+So this loop's bar is **~4 tokens per round**, and it agrees with the two methods above (3.2-4.1 by dividing the wall
+clock by the pass count, and by the prompt split) — three readings of the same cost, all above the 0.5B loop's 1.17
+because two of the three passes are the loop's, not the round's. Acceptance alone does not reach it: at `tau = 0` the
+drafter accepts **2.20 drafts per round** (3.20 tokens), ~1.9x the 0.5B loop's bar, and still measures 0.80x. Quote the
+bar with its loop, or it is 3.5x too optimistic for this one.
+
 **One such lever has since landed, and it does not reach this target.** engine#1348 made a batched verify pass launch
 the **int8 packed** lm head once per vocabulary tile instead of once per row (3.4× the pass, 18.7× the head on its own
 bench). Its entry path is gated on `!head_pb16i_` (`npu/forward/src/q4nx_forward.cpp:4755`), and this target's head **is**

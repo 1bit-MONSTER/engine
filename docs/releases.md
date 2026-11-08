@@ -135,6 +135,16 @@ The Lemonade pin is the sha (`ef0f3b49` at c19), not the string around it: `tool
 full clone reports `~1752` (both measured on 2026-11-02; c18 printed `~5`, i.e. built from a deeper clone). The `~N` is
 reproducible from the build tree, not from the release: it can differ between two candidates carrying the same code.
 
+The same is true of 146 strings in the Lemonade payload, and this one is not by design — measured 2026-11-08 on the
+shipped c32 payload: `bin/lemond` carries 126, `bin/lemonade` 13, `1bit/hrx/llama/bin/libloomc.so.0` 7 (`1bit` itself
+is 0 since engine#1460), every one of them naming the rolling machine's home directory, e.g.
+`…/wt/release-rc/work/src/third_party/lemonade/src/cpp/server/server.cpp`. They are `__FILE__` values: the engine's
+`-ffile-prefix-map` (`cmake/hrx.cmake`) rewrites its own objects but does not reach the nested
+`ggml-hrx-deps-build` that compiles Loom, and `scripts/build-lemonade.sh` sets no prefix map at all. So **two rolls of
+the same commit produce different payload hashes**, and a sha you are given cannot be reproduced from the source
+alone — rebuild, compare behaviour, and compare the engine's own files. engine#1461 carries the mechanism and the fix;
+when it lands this paragraph becomes the claim it should have been: the payload is reproducible from the tree.
+
 Artifacts of the gated c19 candidate — sizes and sha256 exactly as its own `SHA256SUMS` records them:
 
 | file | size | sha256 |

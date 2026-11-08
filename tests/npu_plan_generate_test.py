@@ -172,4 +172,47 @@ with tempfile.TemporaryDirectory() as root:
           "attn_output_gate doubles the q rows in the attn QKV (q4nx_pack.c:150)")
 
 print("npu_plan_generate: ok" if not failures else "npu_plan_generate: FAILED")
+# ---- rule (c) at import time: --check refuses a plan that names an artifact no kernel here provides ----
+#
+# The plan can be complete as JSON and unservable in fact.  The loader refuses it (Plan::check_artifacts,
+# engine#799), and generation has to refuse it too -- otherwise the plan is written happily and the failure
+# surfaces at load, on the box, instead of where the model dir and the kernel dir are both in hand.
+with tempfile.TemporaryDirectory() as root:
+    d = os.path.join(root, "dense")
+    kdir = os.path.join(d, "kernels")
+    os.makedirs(kdir, exist_ok=True)
+    # A DENSE config on purpose (model_dir()'s default carries GDN dimensions, which this tool refuses
+    # without layer_types): hidden 1024 / IM 3072 / 16 heads / 8 KV / head_dim 128.
+    with open(os.path.join(d, "config.json"), "w") as f:
+        json.dump({"model_type": "qwen3", "hidden_size": 1024, "num_hidden_layers": 2,
+                   "intermediate_size": 3072, "num_attention_heads": 16,
+                   "num_key_value_heads": 8, "head_dim": 128, "q4nx_weight_layout": "rm"}, f)
+    with open(os.path.join(d, "model.q4nx"), "wb") as f:
+        f.write(b"\0" * 16)
+
+    ok = run(d, "--kernels", kdir, "--print")
+    check(ok.returncode == 0, "a dense model generates a plan: " + ok.stderr.strip()[:160])
+    plan = json.loads(ok.stdout) if ok.returncode == 0 else {}
+    designs = plan.get("designs") or []
+    check(len(designs) > 0, "the generated plan carries a designs section")
+
+    plan_path = os.path.join(d, "plan.json")
+    # Written by the tool itself, so the comparison later is about the artifacts and not about formatting.
+    wrote = run(d, "--kernels", kdir)
+    check(wrote.returncode == 0, "the tool writes the plan: " + wrote.stderr.strip()[:160])
+
+    # Nothing on disk: --check refuses, names the design, and leaves the plan alone.
+    refused = run(d, "--kernels", kdir, "--check")
+    check(refused.returncode == 1, "--check refuses a plan whose artifacts are absent")
+    check("designs[0]" in refused.stderr, "the refusal names the design index: " + refused.stderr.strip()[:120])
+    with open(plan_path) as f:
+        check(json.load(f) == plan, "--check does not rewrite the plan it refused")
+
+    # Every artifact present: --check is green again (the fixtures are the names the plan asked for).
+    for des in designs:
+        touch(os.path.join(kdir, des["elf"]))
+    accepted = run(d, "--kernels", kdir, "--check")
+    check(accepted.returncode == 0, "--check accepts the plan once every named artifact is present: "
+          + accepted.stderr.strip()[:160])
+
 sys.exit(1 if failures else 0)

@@ -630,6 +630,49 @@ identity_verdict() {
     printf 'PASS consistent: engine_sha256=%.16s and libhsa_sha256=%.16s are the shipped bytes, read off the payload rather than out of the file' "$_ce" "$_ch"
 }
 
+# ── the payload= claim (engine #1557) ────────────────────────────────────────────────────────────
+# The identity's payload= is an ENVIRONMENT input - os/v3/puppy/container-build.sh takes PAYLOAD_NAME and writes
+# "unknown" when it is unset - and until now the row only printed it. c32 and c33 both shipped
+# payload=lemonade-onebit-rc-2026-11-05-c26c while carrying later payloads, so a stale name passed a gate whose other
+# half (engine_sha256) is COMPUTED from the file it names.
+#
+# The in-image authority is the payload's own README, whose first line states the release tag it was built from
+# ("1bit engine rc-2026-11-05-c26c for Linux x86_64 (Strix Halo / Ryzen AI): https://1bit.gg/"). The identity's value is
+# the tarball's stem and the stem must contain that tag. This is a directory/README comparison, NOT a tarball-name
+# comparison: the tarball lives beside the bundle, not in the image, so a bundle-side check is a different row and
+# mixing the two is how a row reds a correct image.
+# Pure, so --self-test drives it: <identity payload value> <tag the payload's README states, empty when it states none>
+payload_name_verdict() {
+    _pn=${1:-} _pt=${2:-}
+    case "$_pn" in
+        '')
+            printf 'FAIL the identity file states no payload at all (payload= is empty), so nothing says which payload this image carries' ;;
+        unknown)
+            printf 'FAIL the identity file states payload=unknown - the value is an environment input (container-build.sh: PAYLOAD_NAME), so "unknown" means the build never named what it shipped' ;;
+        *)
+            if [ -z "$_pt" ]; then
+                printf 'SKIP the payload ships no release tag in its README, so payload=%s cannot be checked in the image (the tarball name lives beside the bundle, not in the image)' "$_pn"
+            else
+                case "$_pn" in
+                    *"$_pt"*) printf 'PASS consistent: the identity says payload=%s and the payload ships %s' "$_pn" "$_pt" ;;
+                    *) printf 'FAIL the identity says payload=%s but the payload ships %s - payload= is a declared environment input, so this image names a release it does not carry (c32 and c33 shipped exactly this)' "$_pn" "$_pt" ;;
+                esac
+            fi ;;
+    esac
+}
+
+# The row's own reading, kept as a function so --self-test drives the seds rather than only the verdict: a fixture whose
+# identity and README disagree must FAIL, and the tag has to be found in the README's first line, not anywhere in it.
+payload_name_from_image() {  # <identity file> <payload dir>
+    _pi=${1:-} _pd=${2:-}
+    _pval=$(sed -n 's/^payload=//p' "$_pi" 2>/dev/null | head -1)
+    _ptag=
+    if [ -n "$_pd" ] && [ -f "$_pd/1bit/README.txt" ]; then
+        _ptag=$(sed -n '1s/.*\(rc-[0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*-c[0-9][0-9]*\).*/\1/p' "$_pd/1bit/README.txt" 2>/dev/null)
+    fi
+    payload_name_verdict "$_pval" "$_ptag"
+}
+
 # ── the NPU's locked memory, read from the process that locks it ─────────────────────────────────
 # Two mechanisms set this limit and either can silently override the other: /etc/security/limits.d/*.conf (pam_limits, files
 # applied in LEXICAL order, the last assignment for an item wins) covers anything PAM starts, and
@@ -758,6 +801,27 @@ if [ "${1:-}" = --self-test ]; then
     # engine #1352: the payload's modes. c31/c32 shipped 134 writable files; a payload packed after #1361 has none.
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 7ba2110811111111111111111111111111111111111111111111111111111111 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"       # the c26-in-a-c32-image shape: engine claim vs shipped launcher
+    # engine #1557: the payload= claim. The second arm is c32/c33's own shape - the stem names c26c while the
+    # payload ships c33 - and the unknown arm is the unset PAYLOAD_NAME default.
+    check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 rc-2026-11-08-c33)"
+    check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26c rc-2026-11-08-c33)"
+    check FAIL "$(payload_name_verdict unknown rc-2026-11-08-c33)"
+    check FAIL "$(payload_name_verdict '' rc-2026-11-08-c33)"
+    check SKIP "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 '')"
+    # engine #1557, the reading half: drive the two seds against fixtures, because a verdict that is right about a
+    # string it was handed says nothing about whether the row found that string in the file.
+    _pnfix=$(mktemp -d) || _pnfix=
+    if [ -n "$_pnfix" ]; then
+        mkdir -p "$_pnfix/payload/1bit"
+        printf 'payload=lemonade-onebit-rc-2026-11-08-c33\nengine_sha256=%s\n' "$(printf 'a%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)" > "$_pnfix/id"
+        printf '1bit engine rc-2026-11-08-c33 for Linux x86_64 (Strix Halo / Ryzen AI): https://1bit.gg/\n' > "$_pnfix/payload/1bit/README.txt"
+        check PASS "$(payload_name_from_image "$_pnfix/id" "$_pnfix/payload")"          # the cut's own shape
+        printf '1bit engine rc-2026-11-09-c34 for Linux x86_64 (Strix Halo / Ryzen AI): https://1bit.gg/\n' > "$_pnfix/payload/1bit/README.txt"
+        check FAIL "$(payload_name_from_image "$_pnfix/id" "$_pnfix/payload")"          # c32/c33's shape: stale name, later payload
+        rm -f "$_pnfix/payload/1bit/README.txt"
+        check SKIP "$(payload_name_from_image "$_pnfix/id" "$_pnfix/payload")"          # no authority in the image
+        rm -rf "$_pnfix"
+    fi
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)"       # libhsa claim vs the runtime the image carries
     check FAIL "$(identity_verdict 89a6c386 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"    # malformed claim is FAIL, not unknown
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"          # nothing to check the claim against
@@ -1868,6 +1932,14 @@ if [ -f "$ID" ]; then
             *)     fail identity "${_idv#FAIL } (${_idinfo})" ;;
         esac
     fi
+    # engine #1557: payload= is a declared claim (PAYLOAD_NAME at build time) and it was only printed, never compared.
+    # The authority is the payload's own README tag; the comparison and its reasons live in payload_name_verdict().
+    _idpv=$(payload_name_from_image "$ID" "${PAYLOAD_DIR:-/opt/1bit-package}")
+    case "$_idpv" in
+        PASS*) pass payload-name "${_idpv#PASS }" ;;
+        SKIP*) skip payload-name "${_idpv#SKIP }" ;;
+        *)     fail payload-name "${_idpv#FAIL }" ;;
+    esac
     if [ -f /data/SHA256SUMS ]; then
         if (cd /data && sha256sum -c SHA256SUMS >/dev/null 2>&1); then pass sha256sums "/data/SHA256SUMS verifies"
         else fail sha256sums "/data/SHA256SUMS does not verify (cd /data && sha256sum -c SHA256SUMS)"; fi

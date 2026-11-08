@@ -317,6 +317,36 @@ def generate(model_dir: str, kernels: str) -> dict:
     return plan
 
 
+def missing_artifacts(plan: dict, dirs: list[str]) -> list[str]:
+    """The designs whose artifact is in none of `dirs`, as "designs[i] (ROLE): elf" strings.
+
+    This is rule (c) at import time (engine#799): a plan can be complete as JSON and unservable in fact, and
+    the question "is this op's kernel here" belongs at generation, where the model and kernel directories are
+    both in hand.  `Plan::check_artifacts()` in npu/plan/plan.h asks the same question at load with the same
+    rule -- present and non-empty, first directory that has it wins -- so the two cannot disagree about what
+    "here" means.
+    """
+    missing = []
+    for i, d in enumerate(plan.get("designs") or []):
+        elf = d.get("elf", "")
+        if not elf:
+            continue
+        found = False
+        for root in dirs:
+            if not root:
+                continue
+            path = os.path.join(root, elf)
+            try:
+                if os.path.getsize(path) >= 1:
+                    found = True
+                    break
+            except OSError:
+                continue
+        if not found:
+            missing.append(f"designs[{i}] ({d.get('role', '?')}): {elf}")
+    return missing
+
+
 def designs_from_config(cfg: dict, prefill_tag: str, fused_gu: bool) -> list[dict] | None:
     """The engine's per-role kernel set for this config, or None when this tool cannot state it fully.
 
@@ -437,6 +467,16 @@ def main(argv=None) -> int:
         return 0
 
     if args.check:
+        # Rule (c), import-time half: a plan that names an op with no kernel in this directory is refused
+        # before it is compared or written, naming the design -- the same refusal the loader makes, asked at
+        # the point where the model dir and the kernel dir are both in hand.
+        missing = missing_artifacts(plan, [kernels])
+        if missing:
+            for m in missing:
+                print(f"{model_dir}: {m} is in no kernel in {kernels}", file=sys.stderr)
+            print(f"{model_dir}: the plan would name {len(missing)} op(s) with no kernel here -- refusing",
+                  file=sys.stderr)
+            return 1
         try:
             with open(out, "r", encoding="utf-8") as f:
                 on_disk = f.read()

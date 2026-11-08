@@ -323,6 +323,31 @@ stage_test() { run_tests; }
 #             plaintext ELF; every ELF in the tarball is for the host (x86-64); the packed 1bit has no
 #             symbol table and its strings name no private source file and no build-machine home
 # Checks the build's 1bit and every file in the tarball.
+# engine #1461: no packed ELF may name a build-machine path. One row, used for BOTH packages - the engine
+# tarball and the Lemonade package that carries it - over every ELF rather than the packed `1bit` alone: that
+# narrow scope is why 146 build paths shipped in c32's payload (lemond 126, lemonade 13, libloomc.so.0 7)
+# while the row printed "no build-machine paths", exactly as #1460's `/home/`-only predicate had been too
+# narrow a pattern. OCCURRENCES are counted, not lines: a strings run glues paths to their neighbours, so one
+# of lemonade's 13 does not begin a line and `grep -c` reports 12 for a file carrying 13 (measured
+# 2026-11-08 on c32's own bytes). /home/ covers any builder's home; the source tree, the workdir and the
+# build tree cover a build that ran elsewhere on this machine.
+build_path_strings() {  # build_path_strings <unpacked tree>  -> one FAIL line per offending file, rc 1
+    local t=$1 f n pats rc=0
+    pats=$(printf '%s\n' /home/ "${SRC:-/nonexistent-build-src}" "${W:-/nonexistent-build-w}" \
+                         "${BUILD:-/nonexistent-build-build}")
+    while IFS= read -r -d '' f; do
+        pack_is_elf "$f" || continue
+        n=$(strings -a "$f" | grep -o -F -f <(printf '%s\n' "$pats") | wc -l || true)
+        [ "$n" = 0 ] || {
+            printf 'FAIL %s names a build-machine path (%s occurrences): %s\n' "$(basename "$f")" "$n" \
+                "$(strings -a "$f" | grep -o -F -f <(printf '%s\n' "$pats") | head -2 | tr '\n' ' ')"
+            rc=1
+        }
+    done < <(find "$t" -type f -print0)
+    [ "$rc" = 0 ] && echo "ok   no packed ELF names a build-machine path (/home/, the source tree, the workdir, the build tree)"
+    return $rc
+}
+
 package_checks() {  # package_checks <linux tarball>
     # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
     # (lists go to stderr through `tee >(cat >&2)`, not `tee /dev/stderr`: reopening the log by
@@ -439,6 +464,7 @@ package_checks() {  # package_checks <linux tarball>
         [ "$m" = 62 ] || { echo "FAIL $f is an ELF for machine $m, not the host (x86-64)"; nk=$((nk + 1)); }
     done < <(find "$t" -type f -print0)
     [ "$nk" = 0 ] && echo "ok   every ELF in $(basename "$1") is a host (x86-64) program or library" || bad=1
+    build_path_strings "$t" || bad=1
     f=$(find "$t" -maxdepth 2 -type f -name 1bit)
     f=${f%%$'\n'*}
     if [ -n "$f" ]; then
@@ -451,17 +477,7 @@ package_checks() {  # package_checks <linux tarball>
                   done | grep -E '\.(c|cc|cpp|cxx|h|hpp|py)$' | xargs -r -n1 basename | LC_ALL=C sort -u)
         n=0; [ -z "$privsrc" ] || n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$privsrc") || true)
         [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a private source file ($n strings)"; b1=1; }
-        # Any path that names THIS machine's tree, not just /home/: a build under /build or /opt/ci leaks the builder
-        # the same way, and a /home/-only row let c32 ship a builder path under /opt. Measured 2026-11-08: the c32 and
-        # c33 tarballs baked /opt/rocm-therock/... and /home/<builder>/wt/.../libhsa-runtime64.so.1 respectively, and
-        # only the second tripped this row - the row was right about the leak and too narrow about where it lives.
-        _badpats=$(printf '%s\n' /home/ "${SRC:-/nonexistent-build-src}" "${W:-/nonexistent-build-w}")
-        n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$_badpats") || true)
-        [ "$n" = 0 ] || {
-            echo "FAIL the packed 1bit names a build-machine path ($n strings): $(strings -a "$f" | grep -F -f <(printf '%s\n' "$_badpats") | head -2 | tr '\n' ' ')"
-            b1=1
-        }
-        if [ $b1 = 0 ]; then echo "ok   the packed 1bit: no symbol table, no private source names, no build-machine paths"; else bad=1; fi
+        if [ $b1 = 0 ]; then echo "ok   the packed 1bit: no symbol table, no private source names"; else bad=1; fi
     fi
     for f in LICENSE NOTICE LICENSE-BINARY NOTICE-BINARY; do
         n=$(find "$t" -maxdepth 2 -type f -name "$f" | wc -l)
@@ -497,6 +513,8 @@ lemonade_package_checks() {  # lemonade_package_checks <tarball>
     n=$(find "$t" -path '*/bin/resources/web-app/index.html' -type f | wc -l)
     if [ "$n" != 0 ]; then echo "ok   Lemonade's web app: bin/resources/web-app/index.html and $(find "$t" -path '*/bin/resources/web-app/*' -type f | wc -l) files in $(basename "$1")"
     else echo "FAIL no Lemonade web app (bin/resources/web-app/index.html) in $(basename "$1")"; rc=1; fi
+    build_path_strings "$t" || rc=1              # engine#1461: lemond 126 and lemonade 13 shipped from here
+    # the engine's own binaries are checked in package_checks; this is the other half of the same payload
     n=$(find "$t" -maxdepth 2 -name lemond-onebit -type f -exec grep -c '^export ONEBIT_KCRYPT_REQUIRE_SEALED=1$' {} + 2>/dev/null)
     n=${n%%$'\n'*}
     if [ "${n:-0}" != 0 ]; then echo "ok   lemond-onebit loads sealed NPU kernels only (ONEBIT_KCRYPT_REQUIRE_SEALED=1)"

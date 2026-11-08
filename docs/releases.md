@@ -140,10 +140,17 @@ shipped c32 payload: `bin/lemond` carries 126, `bin/lemonade` 13, `1bit/hrx/llam
 is 0 since engine#1460), every one of them naming the rolling machine's home directory, e.g.
 `…/wt/release-rc/work/src/third_party/lemonade/src/cpp/server/server.cpp`. They are `__FILE__` values: the engine's
 `-ffile-prefix-map` (`cmake/hrx.cmake`) rewrites its own objects but does not reach the nested
-`ggml-hrx-deps-build` that compiles Loom, and `scripts/build-lemonade.sh` sets no prefix map at all. So **two rolls of
-the same commit produce different payload hashes**, and a sha you are given cannot be reproduced from the source
-alone — rebuild, compare behaviour, and compare the engine's own files. engine#1461 carries the mechanism and the fix;
-when it lands this paragraph becomes the claim it should have been: the payload is reproducible from the tree.
+`ggml-hrx-deps-build` that compiles Loom, and `scripts/build-lemonade.sh` set no prefix map at all — so **two rolls of
+the same commit produced different payload hashes**, and a sha you are given could not be reproduced from the source
+alone.
+
+The three mechanisms are fixed (engine#1461), and the payload is now **checked** rather than described:
+`scripts/build-lemonade.sh` maps its source tree and its build directory (engine#1464); `cmake/hrx.cmake` also maps
+the build tree, which is where Loom's sources are fetched; llama.cpp passes the same flags into its nested
+`GGML_HRX_CMAKE_ARGS` (llama.cpp#243), which is where the 7 Loom strings came from; and `scripts/weekly.sh`
+(`build_path_strings`) walks **every** packed ELF of both packages — not just the engine binary — counting occurrences
+rather than lines, so a roll that leaks one fails instead of shipping. What stays irreproducible from the tree is the
+Lemonade dev version's `~N` above, which is a count of commits in the checkout that built it.
 
 Artifacts of the gated c19 candidate — sizes and sha256 exactly as its own `SHA256SUMS` records them:
 

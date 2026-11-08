@@ -1826,6 +1826,16 @@ cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_NPU_RT_LIB=<path>/libnpu_rt_api
 - The release builds the runtime from a pinned commit named in `config/npu-runtime.config`
   ([releases.md](releases.md#private-components)).
 
+**A full build links every executable; public CI links one.** `.github/workflows/ci.yml` builds `--target onebit` only, because
+that is the target that needs no runtime. The gap that leaves is narrow but real: a member declared in
+`npu/forward/include/q4nx_forward.h` and never defined in a `.cpp` compiles, passes `-fsyntax-only` (a missing definition is a
+link-time fact, not a syntax one), keeps every check green — and fails `cmake --build` for anyone who does have a runtime. That
+is how `main` went red for full builds while CI stayed green on the 3-argument `step_batch_embeds` (engine#1573). ctest
+`npu_decl_check` (`tools/ci/npu_decl_check.py`) closes it: it pairs the header's direct members against every
+`Q4nxNpuForward::<name>(` in the tree by **name and arity**, so a missing overload is refused by name instead of surfacing as a
+92 %-through link error, and it needs no runtime, no device and no build. `npu_decl_check_self` drives the gate's own fixtures
+(a missing overload, a definition in a second translation unit, a comma inside `<>`).
+
 The NPU needs the `amdxdna` kernel driver. `third_party/xdna-driver` pins upstream
 [amd/xdna-driver](https://github.com/amd/xdna-driver) as the driver version the engine is checked
 against (the kernel's own copy also works); nothing from the pin is built into or shipped with

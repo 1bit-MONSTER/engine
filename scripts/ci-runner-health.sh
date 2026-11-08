@@ -33,6 +33,12 @@ runner_verdict() {
         printf 'PASS active/running, last result %s, %s restart(s) - the runner is accepting jobs' "${_res:-?}" "${_nr:-0}"
         return 0
     fi
+    # `activating (auto-restart)` is the transient where a FLAPPING runner looks busy: it is not accepting jobs, but a naive
+    # check sees a unit that systemd is already dealing with. Say which it is, and say what a repeat means (pi-os3's addition).
+    if [ "$_st" = activating ] || [ "${_sub:-}" = auto-restart ]; then
+        printf 'FAIL %s/%s - the runner is in its RESTART WINDOW and not accepting jobs (%s restarts so far); one line is transient, a log full of them is a flapping runner' "$_st" "${_sub:-?}" "${_nr:-0}"
+        return 0
+    fi
     case "$_res" in
         oom-kill) printf 'FAIL %s/%s after an OOM kill (%s restarts) - the kernel killed it and nothing restarted it; jobs read as pending, not as failed' "$_st" "$_sub" "${_nr:-0}" ;;
         *)        printf 'FAIL %s/%s with last result %s (%s restarts) - the runner is not accepting jobs' "$_st" "${_sub:-?}" "${_res:-?}" "${_nr:-0}" ;;
@@ -50,9 +56,14 @@ self_test() {
     chk FAIL "$(runner_verdict failed failed oom-kill 0)"
     chk FAIL "$(runner_verdict inactive dead success 0)"
     chk FAIL "$(runner_verdict '' '' '' '')"                   # nothing readable is not a pass
+    chk FAIL "$(runner_verdict activating auto-restart success 4)"    # the window where a flapping runner looks busy
+    chk FAIL "$(runner_verdict activating auto-restart oom-kill 2)"   # same window, last result a kill
+    if printf '%s' "$(runner_verdict activating auto-restart success 4)" | grep -q 'RESTART WINDOW'; then
+        printf 'ok   the restart window is named, not just failed\n'
+    else printf 'FAIL the restart window should be named in the message\n'; rc=1; fi
     # a restart policy that works shows NRestarts>0 and result success - which is a PASS with the count visible
     chk PASS "$(runner_verdict active running success 3)"
-    [ "$rc" = 0 ] && echo "ci-runner-health self-test: ok (6 cases)" || echo "ci-runner-health self-test: FAIL"
+    [ "$rc" = 0 ] && echo "ci-runner-health self-test: ok (9 cases)" || echo "ci-runner-health self-test: FAIL"
     return $rc
 }
 

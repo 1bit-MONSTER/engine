@@ -45,43 +45,31 @@ row because the two arms were taken on different days with different settled sta
 | **HRX0** (iGPU, `-dev HRX0 -ngl 99 -fa on -devd HRX0`) | 4 (2) | 75.785 tok/s | 76.656 tok/s | **1.012×** |
 | **CPU** (`-ngl 0 -t 4`) | 3 (1) | 20.53 tok/s | — | **0.508× / 0.609×** |
 
-Acceptance (llama.cpp's own accounting, **CPU** runs): **0.759 / 0.804 / 0.980** of drafted tokens. On HRX it is **not
-measured** — that build does not echo `draft_n_accepted` in the JSON and does not write the `draft acceptance rate` line by
-default, which is why the ratio above stands alone. Reproduce the HRX row exactly (the default is now `SKIP_FIRST=2` because one warm-up produced the bad number below):
+Acceptance is measured on both backends, by two different routes because the runtimes report differently. Both runs use the
+**same prompt** (`Q: Explain in plain words why the sky appears blue during the day. A:`), so the ratio above and the acceptance
+below describe one setup, not two:
 
-```sh
-BIN=~/wt/i1251/pincur/llama-server \
-SRV_ARGS='-dev HRX0 -ngl 99 -fa on -devd HRX0' \
-DRAFT_MAX_FLAG=--spec-draft-n-max DRAFT_MIN_FLAG=--spec-draft-n-min SKIP_FIRST=2 REQS=4 \
-  tools/spec_decode_speedup.sh ~/models/Qwen3-4B-Q4_K_M.gguf /tmp/pard-qwen3-0.6b-Q4_K_M.gguf 64 4
+* **CPU** — llama.cpp's own speculative path, 64-token budget: **0.759 / 0.804 / 0.980** of drafted tokens.
+* **HRX** — that build echoes neither `draft_n_accepted` nor an acceptance-rate line, so it is measured with two servers on
+  HRX0 and `tools/spec_decode_acceptance_hrx.sh` (which drives `tools/spec_decode_acceptance.py`: token-exact, the target's own
+  greedy continuation as the verifier), **64 tokens in 21 rounds**:
+
+```
+offered 84 drafts (4.00 per round), accepted 44  -> 0.524 per offered draft
+accepted drafts/round 2.095
+tokens/round 3.095 untruncated = (44 + 21)/21   (3.048 if you divide the 64-token budget by 21)
+per round: [4,0,4,4,1,2,4,4,4,0,0,0,4,0,0,4,0,4,0,1,4]   -- 8 of 21 rounds accepted nothing, the rest usually 4/4
 ```
 
-and the acceptance runs with `tools/spec_decode_acceptance.py`.
+**The two acceptance figures are not comparable and that clause matters**: the CPU numbers are llama.cpp's accepted/drafted
+*behind `--draft-p-min`*, which stops drafting early, while the device run always offered a full k = 4. 0.524 against 0.759-0.980
+does **not** mean the device accepts worse; it means the device probed four tokens every round and the CPU probed as few as its
+gate allowed.
 
-**A 1.50× was published here first and it was wrong.** The first HRX run discarded a single warm-up request, and its baseline was
-**unsettled** across all three measured samples (40.646 → 51.942 → 46.849 tok/s — it rose and then fell, so not a ramp but not a
-plateau either) while the draft arm was measured after it. The claimed gain was +0.50 of ratio and the settled gain is +0.012, so
-**~98 % of the published "speedup" was that unsteady baseline** — "50 points of ratio", not "50 % of the gain". Two later runs with two discarded warm-ups and four measured samples each put the
-baseline on its plateau (~75 tok/s) and give **1.03×** and **1.012×** — i.e. the draft is roughly break-even on the device for this
-pair, not a large win. That is why the harness now takes `SKIP_FIRST` and why the tool prints both arms' every sample.
-
-**CPU can never win, and that is arithmetic rather than a bug.** A round is one batched verify over `M = 1 + drafted` tokens
-plus `drafted` draft decodes; on a CPU backend a decode is bandwidth-bound per token, so the verify costs ≈ `M`
-token-equivalents, while the round can only return `1 + accepted ≤ 1 + drafted = M`. Break-even needs `accepted > drafted`,
-which is impossible. Measured by counting work rather than timing it (load-independent): `llamacpp:n_decode_total` = 11 for
-10 rounds ⇒ **exactly one target decode per round** (the verify *is* batched) and zero rollback replays, and the observed
-0.68-0.79× matches `tokens/round ÷ (drafted·r + M)` with the measured per-token costs. engine#1423 carries that analysis, and
-its only open item is a policy question (warn or refuse when speculation is requested on a CPU-only backend).
-
-### What the corrected number means
-
-At ~75 tok/s the 4 B target is fast enough on this iGPU that a 0.6 B draft — issuing **up to 4 (k = 4) draft decodes per round**,
-the upper bound since acceptance is unmeasured on HRX — buys back about what it costs: **1.01×, not 1.50×**. So the device verdict is "break-even for this pair", not "a win" — and PARD's own headline numbers come from its
-tuned runtime (parallel mask, batching), not from driving its weights through our server in AR mode: the model card for
-`amd/PARD-Qwen3-0.6B` claims "an average inference speedup of 1.78×" over pure-AR drafts and "up to a 4.08× speedup" in
-"Transformers+ PARD" — different drafters and a different runtime from the pair measured above, which is why they are quoted as
-the vendor's claim and not as our result.
-A row that quotes a speedup for these drafts must say which of the two it measured.
+**And the cost sentence is a measurement now, not an inference.** The 1.012× ratio was taken in exactly this regime — 64 tokens,
+same prompt — and the acceptance run gives **3.095 tokens returned per round**, so a round costs ≈3.06 target-token-equivalents
+(3.095 / 1.012). That is the shape of the result: on this iGPU a 0.6 B draft over a 4 B target is a **wash**, and its acceptance is
+bimodal (whole chain or nothing) rather than smoothly partial.
 
 ## Gumiho — a vendor hybrid head: **it needs a tree verifier we do not have**
 

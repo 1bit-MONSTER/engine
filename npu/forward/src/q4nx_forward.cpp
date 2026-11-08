@@ -3173,23 +3173,6 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     for (int t : tokens)
         if (t < 0 || t >= c_.NV) { err_ = "token out of range"; return false; }
 
-    // The device's activation buffer holds exactly max_batch_rows() rows (the M=128 prefill design). A
-    // larger batch is not quantized at all -- I8Ctx::quantize_async_rows refuses and hands the plain
-    // buffer back -- and the launch then reads and poisons past the BO: measured on the d3 pack at its
-    // real question length, 4/4 SIGSEGVs at a fixed offset plus one run that answered from rows the
-    // layers never processed (engine#1372). Refuse here instead of corrupting: a causal caller chunks,
-    // which forward_serve's chat path already does at max_batch_rows(); a noncausal pack cannot chunk --
-    // it encodes the whole prompt in one pass by contract -- so it is told that is the limit.
-    if (!host_gemm_ && M > max_batch_rows()) {
-        err_ = "a batch of " + std::to_string(M) + " rows exceeds this geometry's M=" +
-               std::to_string(max_batch_rows()) + " activation block";
-        err_ += noncausal_attn_
-                    ? ", and attention.mode noncausal_full_attention encodes the whole prompt in one pass, so it "
-                      "cannot be chunked: this pack cannot be answered at this prompt length on the NPU (blocked "
-                      "noncausal prefill is missing, engine#1372). NPU_INFER_HOST_GEMM=1 answers it"
-                    : " -- chunk the prefill at max_batch_rows() (forward_serve's chat path does)";
-        return false;
-    }
 
     // A new request starts at position 0: clear the KV cache.  The cache is
     // append-only (kcache_[l].insert(end, ...)) but the attention indexes it by

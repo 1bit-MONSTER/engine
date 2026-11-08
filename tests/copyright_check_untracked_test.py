@@ -130,5 +130,22 @@ with tempfile.TemporaryDirectory() as repo:
     check(rc.returncode == 0, "a second occurrence past the window (emitted notice) stays green",
           rc.stdout + rc.stderr)
 
+    # engine#1564: an untracked file whose comment style the tool does not know is debris, not repo content —
+    # run output a probe dropped (`.hrx123/logs/*.jsonl`), a scratch file. Skipping it is what stops the gate
+    # from reding a developer clone while `main` is clean; a TRACKED file of the same name is still an error.
+    with open(os.path.join(repo, "probe-dump.jsonl"), "w") as f:
+        f.write('{"x": 1}\n')
+    rc = run(repo, "--check")
+    check(rc.returncode == 0,
+          "an UNTRACKED file with no known comment style is skipped, not failed (engine#1564)",
+          rc.stdout + rc.stderr)
+    git(repo, "add", "probe-dump.jsonl")
+    git(repo, "commit", "-q", "-m", "track a jsonl")
+    rc = run(repo, "--check")
+    check(rc.returncode != 0, "the same file TRACKED is still an error: it would ship without a notice",
+          rc.stdout + rc.stderr)
+    check("no comment style known" in (rc.stdout + rc.stderr), "and it is named as an unknown style",
+          rc.stdout + rc.stderr)
+
 print(f"copyright_check_untracked_test: {len(FAIL)} failure(s)")
 sys.exit(1 if FAIL else 0)

@@ -168,14 +168,23 @@ def main():
     def listing(*args):
         return subprocess.run(["git", "ls-files", *args], capture_output=True, text=True,
                               check=True).stdout.split("\n")
-    files = sorted(set(filter(None, listing())) | set(filter(None, listing("--others", "--exclude-standard"))))
+    tracked = set(filter(None, listing()))
+    untracked = set(filter(None, listing("--others", "--exclude-standard")))
+    files = sorted(tracked | untracked)
     missing, unknown, duplicated = [], [], []
     for path in filter(None, files):
         if exempt(path):
             continue
         block = notice_block(path)
         if block is None:
-            unknown.append(path)
+            # A file this tool cannot attach a notice to. If it is IN the repository that is a real gap -- a source
+            # file whose style nobody taught the tool, which would ship without a licence header. If it is merely
+            # untracked, it is not repo content yet: run output, a probe's dump, a scratch file. Failing on that is
+            # the shape that teaches people to skip the gate (engine#1564: `.hrx123/logs/*.jsonl` reddened a
+            # developer clone while `main` was clean), so an untracked unknown-style file is skipped and a tracked
+            # one is still an error.
+            if path not in untracked:
+                unknown.append(path)
             continue
         with open(path, encoding="utf-8") as f:
             text = f.read()

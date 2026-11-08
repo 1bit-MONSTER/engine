@@ -4915,7 +4915,16 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
                                                          scales.data() + r0);
             lctx.wait_kernel(run);
             lctx.readback();
-            std::fill(got.begin(), got.end(), 0.0f);
+            // Mirror the int8 head's guard: this is the change that makes it worth having, because a chunk
+            // that comes back short would otherwise feed dequant_pb16i rows nobody wrote -- poison_canary()
+            // and a zeroed buffer make a plausible-looking row, so the logits go quietly wrong. Named here.
+            if (lctx.canary_short()) {
+                fprintf(stderr, "[canary] SHORT RESULT (head rows, pb16i): tile=%d M=%d rows=%d short=%d\n", t,
+                        M, rows, lctx.short_row_);
+                err_ = "LM head rows: a pb16i chunk came back short (" + std::to_string(rows) +
+                       " rows asked, row " + std::to_string(lctx.short_row_) + " short)";
+                return false;
+            }
             lctx.dequant_pb16i(got.data(), rows, T, scales.data() + r0, lm_head_packed_[(size_t)t].eref,
                                xd_->head_ctx()->pb16i_planes);
             for (int m = 0; m < rows; m++) {

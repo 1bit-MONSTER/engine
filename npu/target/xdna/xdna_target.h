@@ -59,7 +59,10 @@ struct ProfAcc {
 
 class XdnaTarget final : public NpuTarget {
 public:
-    XdnaTarget();
+    // The device is the XDNA target's business, not the interface's: passing it here is what keeps
+    // NpuTarget::open(plan, kernels_dir, family, err) exactly as documented for a second target
+    // (engine#803 A2b).  Null is legal and means "host GEMMs only" (init_host()).
+    explicit XdnaTarget(xrt::device* dev = nullptr);
     ~XdnaTarget() override;
     XdnaTarget(const XdnaTarget&) = delete;
     XdnaTarget& operator=(const XdnaTarget&) = delete;
@@ -110,6 +113,42 @@ public:
     int  max_rows() const;               // widest launch this target will accept (decode twins included)
     int  rows_for(int role, int want) const;   // rows the phase-selected kernel for `role` can take
 
+    // Everything the setup side reads, set once before open_*().  It exists because the remaining two
+    // blocks (the M=16 decode family and the lm-head context) read a dozen of the forward's fields --
+    // the plan, its path, the two given directories, the layout family, the sealed ELF, the t2s flag --
+    // and a twelve-argument call would be a signature nobody can review.  Once these live here, moving
+    // those blocks changes no call site (engine#803 A2b).
+    struct Setup {
+        std::string model_dir;      // the -m directory
+        std::string kernels_dir;    // the --kernels directory
+        std::string family;         // "", "_b8", "_pb16i", "_t2s", "_t2s2"
+        std::string plan_path;      // the plan this set came from, when one did ("" = derived)
+        bool b8 = false;            // blocked 8x8 tile layout
+        bool pb16i = false;         // integer-exact ternary, sidecar images
+        bool t2s = false;           // 2-bit ternary stream
+        bool t2s_v2 = false;
+        bool host_gemm = false;     // offline: open no ELF at all
+        const onebit::npu::plan::Plan* plan = nullptr;   // copied into plan_ by configure(); null = none
+    };
+    // Setup carries a pointer to the forward's Plan; this copies it, so from here on the target's own
+    // plan_ is THE copy the setup side reads (open() no longer has to be the one that filled it).  Two
+    // live copies of the plan is the drift the plan layer exists to prevent, so there is one.
+    void configure(const Setup& s) {
+        setup_ = s;
+        if (s.plan) plan_ = *s.plan;
+    }
+    const Setup& setup() const { return setup_; }
+
+    // The M=128 ELF set: for each design, adopt its geometry, probe its artifact and open it, refusing by
+    // name when an artifact is missing or will not load (engine#803 A2b).  This is the block that used to
+    // live at the top of Q4nxNpuForward::init_impl(); it is here because it is ELF loading and its
+    // refusals, which is what a target owns.  `host_gemm` opens nothing (the offline path needs no ELF)
+    // and only names the artifacts it would have used.  `b8` is the container's blocked-tile layout.
+    // `plan_path` is the plan the set came from, when one did: the missing-artifact refusal quotes it, so
+    // the message a user sees is the same one the forward produced before this moved (an empty string
+    // means no plan, i.e. a purely derived set).
+    bool open_prefill(const Q4nxDesignGeom* designs, int n, std::string& err);
+
     // Context construction: the caller configures and initialises the I8Ctx, then it stays here.
     I8Ctx* make_ctx(int role);
     I8Ctx* ctx(int role) const;
@@ -150,6 +189,7 @@ private:
     std::string pb16i_stem(int layer, const char* tag) const;
 
     xrt::device* dev_ = nullptr;
+    Setup setup_;   // see configure(): what the setup side reads, in one place
     int          n_layers_ = 0;
     std::string  kernels_dir_;
     onebit::npu::plan::Plan plan_;   // when loaded: what open() checked this target against

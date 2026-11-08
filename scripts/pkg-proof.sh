@@ -29,9 +29,16 @@
 #              && bash /pkg/pkg-proof.sh deb /pkg'
 #   rpm   docker run --rm --cap-add=sys_resource -v <pkgs>:/pkg:ro fedora:latest bash -c \
 #           'dnf -y install dkms kernel-devel kernel-core kmod binutils xz; bash /pkg/pkg-proof.sh rpm /pkg'
+#   suse  docker run --rm --cap-add=sys_resource -v <pkgs>:/pkg:ro opensuse/tumbleweed bash -c \
+#           'zypper -n install dkms kernel-default kernel-default-devel udev kmod binutils xz; \
+#            bash /pkg/pkg-proof.sh rpm /pkg'      # the same .rpm as Fedora, that family's own tool
 #   arch  docker run --rm --cap-add=sys_resource -v <pkgs>:/pkg:ro archlinux:latest bash -c \
 #           'pacman -Sy --noconfirm && pacman -S --noconfirm dkms linux linux-headers kmod binutils zstd; \
 #            bash /pkg/pkg-proof.sh arch /pkg'
+#
+# `rpm` covers both Fedora and openSUSE, and the headers live in different directories there
+# (/usr/src/kernels/<ver> vs /usr/src/linux-<ver>-obj/<flavour>), so the kernel version is found through
+# /lib/modules/<ver>/build/Makefile rather than by guessing the vendor's path — measured on both.
 #
 # `--cap-add=sys_resource` is for the two memlock rows: a container's default capability set excludes
 # CAP_SYS_RESOURCE, so raising the hard memlock limit to `unlimited` fails there and the login session
@@ -79,7 +86,12 @@ check() { local what=$1 detail=$2; shift 2; if "$@" >/dev/null 2>&1; then row PA
 # the kernel whose headers this container has (never the running kernel's)
 case $fam in
     deb|coexist) kv=$(ls /lib/modules | sort -V | tail -1) ;;
-    rpm)  kv=$(ls /usr/src/kernels | head -1) ;;
+    # vendor-agnostic on purpose: Fedora keeps headers in /usr/src/kernels/<ver>, openSUSE in
+    # /usr/src/linux-<ver>-obj/<flavour>, Debian in /usr/src/linux-headers-<ver>. What every family
+    # does provide is the build symlink, so ask that instead of guessing the directory name.
+    rpm)  kv=''; for d in /lib/modules/*/build; do [ -f "$d/Makefile" ] || continue; v=${d%/build}; v=${v##*/}
+              [ -z "$kv" ] && kv=$v; case $(printf '%s\n%s\n' "$kv" "$v" | sort -V | head -1) in "$v") kv=$v ;; esac
+          done ;;
     arch) for d in /usr/lib/modules/*; do case ${d##*/} in 7.4.0-rc1-1bit) continue ;; *) kv=${d##*/}; break ;; esac; done ;;
     *) echo "unknown family: $fam" >&2; exit 2 ;;
 esac

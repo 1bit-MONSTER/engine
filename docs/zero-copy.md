@@ -254,12 +254,15 @@ paths needs that direction today.
 
 ## How to re-measure
 
-- Handoff: the cross-process harness is `t1_handoff_lengths.sh` + `t1_asan_import.py` in the zero-copy probe set (it
-  exports, shares over `SCM_RIGHTS`, runs an ASan provider and adopts). `ONEBIT_KV_SHARE=1 ONEBIT_PREFILL_DEVICE=<dev>
-  1bit serve` logs one line per handoff in the engine's own route —
-  `shared KV handoff: N cells, X ms, 0 bytes copied`. The file route's price is `POST /slots/<id>?action=save`
-  then `?action=restore`, timed; the sizes in the table above come from fitting the state file's size against
-  prompt length.
+- Handoff: the cross-process gate is **in the tree**, `tests/hybrid_kvshare_e2e.sh` (ctest `hybrid_kvshare_e2e`,
+  with `tests/kvshare_fd_handoff.py`): it exports, shares over `SCM_RIGHTS`, runs a provider process against the
+  region and adopts, and asserts `n_read 0`, `prompt_n 1` and zero sanitizer reports. It needs the fork's reference
+  provider, which this build does not produce — pass it as `-DONEBIT_KVSHARE_PREFILL=<path to llama-kvshare-prefill>`
+  or the third argument, and it skips (77) without it, without a gfx1151 or without a model. An ASan build of that
+  provider works too and is what checks the imported region. `ONEBIT_KV_SHARE=1 ONEBIT_PREFILL_DEVICE=<dev> 1bit
+  serve` logs one line per handoff in the engine's own route — `shared KV handoff: N cells, X ms, 0 bytes copied`.
+  The file route's price is `POST /slots/<id>?action=save` then `?action=restore`, timed; the sizes in the table
+  above come from fitting the state file's size against prompt length.
 - NPU runtime: `NPU_PHASE_PROF=1` and `NPU_PROFILE_TOKEN=1` print the `[ph]` and `[prof]` rows quoted above.
 - Devices are shared: GPU work through `~/.local/bin/gpu-hold`, NPU work through `npu-hold`, CPU-heavy builds
   through `thermal-run.sh`. Kernel internals stay in the private trees; nothing in this page depends on them.

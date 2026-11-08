@@ -67,6 +67,23 @@ def merge_rows(rows, cache_path, rows_path):
     return False
 
 
+def workdir():
+    """A temp dir on the REAL disk, not on the system temp.
+
+    /tmp on this fleet is a 62 GB tmpfs that other lanes fill with build artifacts (56 GB used / 5 GB free on
+    2026-11-08), and an AMD Whisper pack is up to 7 GB: a download into tempfile.mkdtemp() died with ENOSPC at ~5 GB
+    and the driver reported it as a task error rather than "the box has no room where you put it". Cache dirs live
+    under $HOME for exactly this reason; honour TMPDIR when it is set to something else.
+    """
+    base = os.path.join(os.path.expanduser("~"), ".cache", "amd-rai-sweep")
+    for cand in (os.environ.get("AMD_RAI_SWEEP_TMP"), os.environ.get("TMPDIR")):
+        if cand and os.path.realpath(cand).rstrip("/") != "/tmp":    # honour TMPDIR unless it is the tmpfs we avoid
+            base = cand
+            break
+    os.makedirs(base, exist_ok=True)
+    return tempfile.mkdtemp(prefix="pull-", dir=base)
+
+
 def fetch_with_data(repo, name, tmp, names):
     """Download an .onnx AND its .onnx.data sidecar if the repo has one (see the module docstring)."""
     path = hf_hub_download(repo, name, local_dir=tmp)
@@ -84,13 +101,25 @@ def sweep_whisper(repo, rows, cache_path, rows_path, wav, expect):
         rows[f"result:{repo}"] = {"status": "fails", "numbers": "",
                                   "note": f"no ONNX encoder/decoder pair (graphs: {graphs}) - nothing runs outside AMD's .rai path"}
         return merge_rows(rows, cache_path, rows_path)
-    tmp = tempfile.mkdtemp(prefix="amd-rai-whisper-")
+    tmp = workdir()
     try:
         pe = fetch_with_data(repo, enc, tmp, names)
         pd = fetch_with_data(repo, dec, tmp, names)
-        tokenizer = "openai/whisper-small.en" if "-en-" in repo else "openai/whisper-tiny"
-        out = subprocess.run([PY, f"{HERE}/run_whisper_onnx.py", pe, pd, wav, f"--tokenizer={tokenizer}"],
-                             capture_output=True, text=True).stdout.strip().splitlines()[-1]
+        # Only the English-only packs need an explicit tokenizer (their vocabularies shift every style id by one).
+        # Everything else must let the runner pick the reference from the encoder's mel-bin count: large-v3/turbo are
+        # 128 bins and tiny's tokenizer is a different vocabulary (51865 vs 51866), so forcing it here is wrong even
+        # when the transcript happens to come out right.
+        args = [PY, f"{HERE}/run_whisper_onnx.py", pe, pd, wav]
+        tokenizer = "by mel bins"
+        if "-en-" in repo:
+            tokenizer = "openai/whisper-small.en"
+            args.append(f"--tokenizer={tokenizer}")
+        res = subprocess.run(args, capture_output=True, text=True)
+        if res.returncode != 0 or not res.stdout.strip():
+            # the runner's own stderr is the only thing that names a shape mismatch, a missing sidecar or a crash
+            err = (res.stderr or "").strip().splitlines()
+            raise RuntimeError(f"runner failed rc={res.returncode}: " + (err[-1] if err else "no output"))
+        out = res.stdout.strip().splitlines()[-1]
         # the known answer is clip-specific: pass --expect for anything but the bundled jfk sample
         ok = "transcript=" in out and expect.lower() in out.lower()
         rows[f"result:{repo}"] = {"status": "OOB" if ok else "loads-wrong-output",
@@ -112,7 +141,7 @@ def sweep_image(repo, rows, cache_path, rows_path, src):
         return merge_rows(rows, cache_path, rows_path)
     pick = cand[0]
     pre = next((v for k, v in IMG_PRE.items() if k in repo.lower()), "no255")
-    tmp = tempfile.mkdtemp(prefix="amd-rai-image-")
+    tmp = workdir()
     try:
         path = fetch_with_data(repo, pick, tmp, names)
         out = subprocess.run([PY, f"{HERE}/run_onnx_image.py", path, src, os.path.join(tmp, "out.png"),

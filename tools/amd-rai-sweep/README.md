@@ -56,7 +56,11 @@ exact transcripts on whisper.cpp's `jfk.wav` (dec 0.16 / 0.16 / 0.28 / 0.37 s pe
 3. **A missing `.onnx.data` sidecar is a silent wrong answer.** `whisper-small.en`'s graphs are ~5 MB and
    ~3 MB stubs whose weights live in `<name>.onnx.data`; ORT opens the stub with zero weights and the decoder
    emits `endoftext` at step 1. `sweep_family.py` fetches the sidecar whenever the repo has one.
-4. **The tokenizer is not shipped, and `.en` vocabularies shift every style id by one**
+4. **The mel-bin count differs by export.** `whisper-large-v3`/`large-turbo` are exported with **128** mel bins,
+   tiny/base/small/medium with **80**. A `whisper-tiny` feature extractor against a large-v3 graph is rejected by the
+   graph — and in a sweep driver that surfaces as "no output line", not as a shape error. The runner reads the bin
+   count from the encoder's declared input and picks the matching reference model.
+5. **The tokenizer is not shipped, and `.en` vocabularies shift every style id by one**
    (`<|startoftranscript|>` 50257 vs 50258, `<|transcribe|>` 50358 vs 50359, `<|notimestamps|>` 50362 vs
    50363). Ids are derived from the chosen tokenizer's own vocab, never hard-coded.
 

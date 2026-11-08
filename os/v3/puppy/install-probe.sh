@@ -368,7 +368,7 @@ if assert_pupsfs:
                     print("FAIL installed    the second VM never opened its serial socket"); break
                 time.sleep(0.2)
         t.settimeout(0.5)
-        end = time.time() + 240
+        end = time.time() + 420
         while time.time() < end:
             try:
                 d = t.recv(65536)
@@ -524,8 +524,10 @@ if assert_pupsfs:
                 self.s.sendall(b"\r")
                 time.sleep(0.5)
                 self.s.sendall(b"\r")
+                # generous: a loaded box has been measured at 138 s to a shell and 6 min for a whole boot, and a
+                # harness that loses that race reports "did not come back" for a machine that did
                 for token in (b"21serial-console: root shell", b"root@1bit-os", b"bash-5.3#"):
-                    if self.until(token, 60 if attempt == 1 else 150) is not None:
+                    if self.until(token, 120 if attempt == 1 else 300) is not None:
                         self.buf = b""
                         self.s.sendall(b"\n")
                         time.sleep(1)

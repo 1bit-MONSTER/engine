@@ -388,6 +388,10 @@ try:
                   "cp -f /data/set-alt3.sfs /data/imgstage/1bit/" + sfsname + "; "
                   "( cd /data/imgstage/1bit && sha256sum vmlinuz initrd.gz ./*.sfs > SHA256SUMS ); "
                   "truncate -s 1700M /data/update.img; "
+                  # ONE level of escaping: python \n is the two characters printf needs to write a newline. The first
+                  # version had \\n, printf wrote a literal backslash-n, sfdisk saw one mangled line, the "image" had no
+                  # partition table - and the updater refused it CORRECTLY ("not a 1bit OS image") while the gate called
+                  # the product broken (measured on the guest: "does not contain a recognized partition table")
                   "printf 'label: gpt\\nstart=2048, type=L, name=\"1BIT-DATA\"\\n' | sfdisk -q /data/update.img; "
                   "mkfs.ext4 -q -F -L 1BIT-DATA -d /data/imgstage /data/update.img 1664M; "
                   "rm -rf /data/imgstage; echo image-ok $(stat -c%s /data/update.img)")
@@ -395,6 +399,13 @@ try:
             say("INFO", "mkimg", (img or "<no answer>")[-120:])
             if "image-ok" not in (img or ""):
                 say("FAIL", "mkimg", "could not build the test image: %s" % ((img or "")[-200:] or "<no output>")); ok = False
+            else:
+                # the fixture itself must be a 1bit OS image before the next boot is allowed to judge the updater
+                chk = v.val("CHKIMG", "sfdisk -d /data/update.img 2>&1 | grep -c 'name=\"1BIT-DATA\"'")
+                say("INFO", "mkimg", "the image's partition table names 1BIT-DATA: %s" % (chk or "<no answer>"))
+                if chk.strip() != "1":
+                    say("FAIL", "mkimg", "the test image has no 1BIT-DATA partition, so the next boot would test the "
+                          "fixture, not the updater (sfdisk: %s)" % (chk or "<none>")); ok = False
             v.val("RM2", "rm -rf /data/update-set-alt2 /data/set-alt3.sfs; echo gone")
 
             # ---- boot 3 (/1bit again): the SECOND update's set, the boot-1 marker still there, and no link nested

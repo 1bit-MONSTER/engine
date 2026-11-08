@@ -97,6 +97,12 @@ def sweep_whisper(repo, rows, cache_path, rows_path, wav, expect):
         if "-en-" in repo:
             tokenizer = "openai/whisper-small.en"
             args.append(f"--tokenizer={tokenizer}")
+        res = subprocess.run(args, capture_output=True, text=True)
+        if res.returncode != 0 or not res.stdout.strip():
+            # the runner's own stderr is the only thing that names a shape mismatch, a missing sidecar or a crash
+            err = (res.stderr or "").strip().splitlines()
+            raise RuntimeError(f"runner failed rc={res.returncode}: " + (err[-1] if err else "no output"))
+        out = res.stdout.strip().splitlines()[-1]
         # the known answer is clip-specific: pass --expect for anything but the bundled jfk sample
         ok = "transcript=" in out and expect.lower() in out.lower()
         rows[f"result:{repo}"] = {"status": "OOB" if ok else "loads-wrong-output",

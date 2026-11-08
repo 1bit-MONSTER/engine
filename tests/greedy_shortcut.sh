@@ -41,10 +41,20 @@ def gguf(path, arch="llama"):
 gguf(sys.argv[1] + "/m.gguf")
 PY
 
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-"$bin" serve -m "$scratch/m.gguf" --device auto --port "$port" \
+# --port 0: the kernel picks the port and serve reports the one it bound, so nothing here picks a port and releases
+# it before serve binds - the release-then-bind race that made a port collision look like a routing failure
+# (engine #1444, #1485). The port is read from serve's own ready line, never guessed.
+"$bin" serve -m "$scratch/m.gguf" --device auto --port 0 \
     --llama-server "$(dirname "$0")/fake_backend.py" >"$scratch/serve.log" 2>&1 &
 pid=$!
+port=
+for _ in $(seq 1 300); do
+    port=$(sed -n 's/^1bit serve: ready on http:\/\/[^:]*:\([0-9][0-9]*\).*/\1/p' "$scratch/serve.log" | head -1)
+    [ -n "$port" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+done
+[ -n "$port" ] || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
 for _ in $(seq 1 100); do curl -sf "localhost:$port/health" >/dev/null 2>&1 && break; sleep 0.2; done
 
 ask() {  # ask <path> <json> -> reply body

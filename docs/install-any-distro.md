@@ -274,6 +274,23 @@ Uninstall puts the in-tree driver back:
 sudo apt-get remove amdxdna-1bit-dkms ec-su-axb35-dkms 1bit-npu-config   # or dnf remove / pacman -R
 ```
 
+**One release, three families, one version.** `scripts/mk-kernel-packages.sh <out> <version>` takes the
+release tag as the *release* field of the three 1bit packages (the kernel keeps the version it was built
+with), and that tag carries into all three families — measured, because "the weekly calls it with a date"
+is exactly the case a package can silently refuse to upgrade:
+
+| family | package a weekly tag produces | the family's tool says | upgrade over the previous release |
+|---|---|---|---|
+| deb | `amdxdna-1bit-dkms_0.18.0-2026.45.0_all.deb` | `dpkg --compare-versions 0.18.0-1 lt 0.18.0-2026.45.0` true | `dpkg -i` rc=0, version after `0.18.0-2026.45.0`, one `/usr/src/amdxdna-1bit-0.18.0` left (no stale duplicate) |
+| rpm | `amdxdna-1bit-dkms-0.18.0-2026.45.0.x86_64.rpm` | `rpmdev-vercmp` → `0.18.0-1 < 0.18.0-2026.45.0` | `dnf install` rc=0, version after `0.18.0-2026.45.0` |
+| arch | `amdxdna-1bit-dkms-0.18.0-2026.45.0-x86_64.pkg.tar.zst` | `vercmp 0.18.0-1 0.18.0-2026.45.0` → `-1` | `pacman -U` rc=0, version after `0.18.0-2026.45.0` |
+
+One convention difference worth knowing rather than discovering: this set puts the tag in the **release**
+field, so the Arch package's `pkgrel` becomes `2026.45.0` instead of an integer. pacman accepts it and
+orders it correctly (above), but it is not Arch's usual shape; the engine packages (`scripts/pack-version.sh`)
+map the tag into the *version* instead (`2026.45c32`). Both work; neither is wrong; do not mix them in one
+comparison.
+
 **Source.** Each driver package ships the source it builds (`/usr/src/amdxdna-1bit-0.18.0/`,
 `/usr/src/ec-su-axb35-0.1/`) with its LICENSE; the amdxdna patch series is
 `third_party/patches/amdxdna/` in the engine repository, and 0006/0007 are carried there but **not
@@ -379,4 +396,5 @@ registry model, since this Lemonade version has no local-file registration):
 | the dkms source reproduces the driver this box runs | `scripts/mk-kernel-packages.sh` payload built in a container against `7.0.0-43-generic` | `srcversion EE1F36A2B9BA294CE11AD80`, the srcversion of the `amdxdna.ko` installed at `/lib/modules/7.4.0-rc1-1bit/updates/` — the package's source *is* the fleet's series |
 | the kernel the packages ship is the kernel this box runs | `linux-image-7.4.0-rc1-1bit_7.4.0~rc1-1_amd64.deb` payload vs `/boot/vmlinuz-7.4.0-rc1-1bit` | `sha256 6f3c6764…` in both, and `sbverify --cert MOK-Kernel.der` reports `Signature verification OK` |
 | the amdxdna floor is really 6.10 | clean `ubuntu:24.04` container, headers `6.8.0-149-generic`, this page's packages | `dkms build` refuses with the declared exclusive rule (`rc=77`, "should not be built"), and with the floor bypassed the driver does not compile: `amdxdna.h:32: macro "__assign_str" requires 2 arguments, but only 1 given` — the 6.10 trace-event API. `ec-su-axb35-dkms` builds on the same headers (`380 440 B`), so only the NPU driver has the floor |
+| a weekly release tag works in all three families, and upgrades | `scripts/mk-kernel-packages.sh <out> 2026.45.0 --skip-kernel`, each family's own tool, in `fedora:latest` / `ubuntu:26.04` / `archlinux:latest` | deb `0.18.0-1 < 0.18.0-2026.45.0` (dpkg), rpm `0.18.0-1 < 0.18.0-2026.45.0` (rpmdev-vercmp), arch `vercmp` `-1`; each installs over the previous package (`rc=0`) and reports `0.18.0-2026.45.0` afterwards, with one `/usr/src/amdxdna-1bit-0.18.0` left on deb — no stale duplicate source tree |
 | the shipped driver answers a known answer on the NPU | this box, `npu-hold`, `1bit serve --device npu` on Qwen3-0.6B, `/v1/completions` greedy, twice | load 2.2 s, `The capital of France is` → **` Paris. The capital of Italy is Rome. The capital of Spain is Madrid.`** identically on both runs (56.9 and 50.7 tok/s), 0 `amdxdna` lines in the two windows, and the loaded module is `srcversion EE1F36A2B9BA294CE11AD80` — the build this package's source produces. No install, no `modprobe`, no udev reload |

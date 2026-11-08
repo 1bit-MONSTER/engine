@@ -85,6 +85,46 @@ Two facts from that work belong here because they bound what a device provider c
 - it must write through **its own mapping** of the dma-buf. Asking the driver for a mapping of the import is the
   route that makes every later submission fail (engine#812); the pages are the same either way.
 
+### The arm a device provider replaces, and the model to run it on
+
+The gate needs a model that exists **both** as a GGUF (the HRX decoder, which is the exporting side) and as a
+Q4NX pack (what a device provider prefills from). Pairing every GGUF staged under `~/models` (two levels deep)
+against the packs in `~/models/npu` by architecture, layer count and hidden size gives **four** pairs, and the
+first arm should be the cheapest of them rather than the one with the weights already staged:
+
+| pair | GGUF | pack | why it is or is not the first arm |
+|---|---|---|---|
+| **Qwen3-0.6B** | `~/models/Qwen3-0.6B-Q4_K_M.gguf` (396 MB, 28 layers, hidden 1024) | `~/models/npu/Qwen3-0.6B`: 28 `attn` | **first arm**: one small region, ~5 s of device time, and no recurrent half to get right |
+| ZR1-1.5B | `~/models/zyphra-zr1/ZR1-1.5B-bf16.gguf` (3.56 GB, 28 layers, hidden 1536) | `~/models/npu/ZR1-1.5B-npu-q4km`: 28 `attn` | a good second arm: still all attention, 9x the weights |
+| Qwen3-Coder-30B-A3B | `~/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` (18.6 GB, `qwen3moe`, 48 layers, hidden 2048, 128 experts) | `~/models/npu/qwen3-coder-30b-a3b-moe`: 48 `attn` | third: all attention like ZR1 and no recurrent half, but 47x the 0.6B's weights and a MoE plan, so a device arm here measures the MoE path before the handoff is even interesting |
+| Bonsai-2-27B | `~/models/bonsai2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf` (5.9 GB, `qwen35`, 64 layers, hidden 5120; the unrot q4_0 in the same directory is the same model) | `~/models/npu/bonsai2-27b-NPU`: 64 layers, **48 GDN + 16 attention** | last: the region is also the GDN recurrent state (fork#181), so the writer has 48 recurrent layers to get right as well as the attention cache |
+
+The other staged GGUFs have no pack and are not candidates for this gate: Qwen3-4B (both quants), Qwen3.5-4B,
+Qwen3.6-35B-A3B, zaya1-8b and bge-micro-v2.
+
+Qwen3-0.6B's geometry was read off both sides rather than assumed: the GGUF has 28 layers, hidden 1024, 16 query
+heads and **8 KV heads** of head_dim 128, i.e. `n_embd_k_gqa` **1024**, and the pack's `plan.json` has the same
+28 layers with a fused qkv of `N=4096` = 2048 q + **1024 k + 1024 v**. A device writer emitting rows at stride
+1024 f16 therefore lands in the decoder's own `cache_k_l*` / `cache_v_l*`.
+
+Measured on that pair (CPU ASan provider, `gpu-hold` ticket, 5 s of device time; logs in the lane's probe dir):
+
+| prompt tokens | regions | provider import | decoder adopt | `n_read` | `prompt_n` | greedy text | ASan |
+|---|---|---|---|---|---|---|---|
+| 307 | 1 | 1.276 ms | **0.109 ms** | 0 | 1 | `The tide comes in twice a day,` | 0 |
+| 1 027 | 1 | 1.103 ms | **0.227 ms** | 0 | 1 | identical | 0 |
+
+`n_read 0` is no prompt bytes moved; `prompt_n 1` is the decoder decoding from the adopted cells rather than
+re-processing the prompt. These are the numbers a device provider has to reproduce, and the import leg is 30x
+cheaper than on the 4B above (1.1-1.3 ms against 40-157 ms) because the region is one small cache -- which is
+the measurable reason this pair is the first arm, and why the two other pairs in the table above are second and
+last rather than first.
+
+One requirement makes the difference between a gate and a demo: the layout header's `params` (`n_ctx`, `n_batch`,
+`n_ubatch`, `n_seq_max`, `flash_attn`, `type_k`, `type_v`) are the **decoder's**, and a provider has to prefill in
+the ubatch the cells are adopted at. A provider that prefills in a different ubatch writes the right rows of the
+wrong stratification.
+
 ## Target 2 — the NPU runtime's copies, measured
 
 Per launch the runtime quantises one row into the activation BO, flushes it, waits, invalidates the result BO

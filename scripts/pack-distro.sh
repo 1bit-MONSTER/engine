@@ -39,9 +39,9 @@
 #   PKG_NAME, PKG_SUMMARY, PKG_DESC, PKG_MAINTAINER                (required)
 #   PKG_DEB_DEPENDS, PKG_DEB_RECOMMENDS                            (optional, comma separated)
 #
-# The version is normalized to what every family accepts: a leading "v" goes, and anything outside
-# [A-Za-z0-9._] becomes "." (rpm and pacman refuse "-" in a version, and the weekly's rehearsal tags
-# start with "rc-").
+# The version is normalized to what every family accepts, because the tag a cut carries is not one
+# (scripts/pack-version.sh: rc-2026-11-07-c32 packs as 2026.11.07.c32, and a tag with no digit at all as
+# 0.<tag>). It is the same function scripts/pack-proof.sh uses to find the packages again.
 #
 # deb and tarball are built here. rpm and arch are built in containers (fedora:latest,
 # archlinux:latest): rpmbuild and makepkg are the only correct builders for those two formats and the
@@ -53,16 +53,33 @@ set -euo pipefail
 [ $# -eq 3 ] || { sed -n '16,52p' "$0"; exit 2; }
 fmt=$1 root=$2 out=$3
 repo=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=scripts/pack-version.sh
+. "$(dirname "$0")/pack-version.sh"
+# shellcheck source=scripts/pack-elf.sh
+. "$(dirname "$0")/pack-elf.sh"      # pack_normalise_modes, pack_writable_files
+
+# The payload is a system tree, so its modes are the ones a distribution expects, and that rule is the
+# fleet's (#1352), not this script's: pack_normalise_modes in scripts/pack-elf.sh, the same helper
+# package-linux.sh and the lemonade fold use, so the three packing sites cannot drift. A tree staged under
+# a 002 umask is group-writable and rpm refuses it outright - /usr/bin at 0775 conflicts with the
+# filesystem package's 0755, which is how this was found: `dnf install` on fedora:latest failed on a
+# payload that had installed cleanly as a .deb and a pacman package. It runs on the formatter's own copy,
+# never on the caller's tree (the kernel packages share this script, #1280).
+#
+# No assertion follows it: the copy is ours, so the chmod cannot fail, and a check that cannot fire is
+# decoration. `pack_writable_files` (the reporter the fold refuses with) was tried here and dropped for
+# that reason - a root-owned 0664 file handed in as the payload comes out 0644, because cp makes it ours
+# first. The mode is checked where it can actually be wrong: on the finished archives, by
+# scripts/pack-proof.sh.
 
 need() { [ -n "${!1:-}" ] || { echo "pack-distro.sh: $1 is not set ($2)" >&2; exit 2; }; }
 need PKG_VERSION "the release version"
 [ -d "$root" ] || { echo "pack-distro.sh: no payload tree at $root" >&2; exit 2; }
 [ -n "$(ls -A "$root")" ] || { echo "pack-distro.sh: the payload tree at $root is empty" >&2; exit 2; }
 
-ver=$(printf '%s' "${PKG_VERSION#v}" | sed -e 's/[^A-Za-z0-9._]\+/./g' -e 's/^\.*//' -e 's/\.*$//')
-[[ $ver =~ ^[0-9] ]] || {
-    echo "pack-distro.sh: version '$PKG_VERSION' does not start with a digit even normalized ('$ver'); pass the release's version" >&2
-    exit 2; }
+# the version and how a tag becomes one lives in one place, shared with the proof that looks the
+# packages up by name (scripts/pack-version.sh); it is per family, because a candidate's version has to
+# sort below its release and only pacman needs a different spelling to do that
 rel=${PKG_RELEASE:-1}
 
 # The distribution's own filesystem skeleton: its filesystem package owns these paths, so no package
@@ -74,18 +91,6 @@ skeleton='^(usr|usr/bin|usr/sbin|usr/lib|usr/lib64|usr/libexec|usr/include|usr/s
 # without the "./" member tar writes for the top directory itself.
 payload_members() {  # payload_members <tree>
     (cd "$1" && find . -mindepth 1 | sed -e 's,^\./,,' | LC_ALL=C sort | { grep -Ev "$skeleton" || true; })
-}
-
-# The payload is a system tree, so its modes are the ones a distribution expects: 0755 directories,
-# 0755 programs, 0644 data. A tree staged under a 002 umask is group-writable, and rpm refuses that
-# outright - /usr/bin at 0775 conflicts with the filesystem package that already owns it (/usr/bin
-# 0755), which is how this was found: `dnf install` on fedora:latest failed on a payload that had
-# installed cleanly as a .deb and a pacman package. Each formatter runs this on its own copy, never on
-# the caller's tree: the kernel and driver packages share this script (engine #1280).
-normalize_modes() {  # normalize_modes <tree>
-    find "$1" -type d -exec chmod 0755 {} +
-    find "$1" -type f -perm -u+x -exec chmod 0755 {} +
-    find "$1" -type f ! -perm -u+x -exec chmod 0644 {} +
 }
 
 mkdir -p "$out"
@@ -103,10 +108,11 @@ deb)
     need PKG_DESC "the description"
     need PKG_MAINTAINER "the maintainer, \"Name <mail>\""
     [ ! -e "$root/DEBIAN" ] || { echo "pack-distro.sh: $root already has a DEBIAN directory" >&2; exit 2; }
+    ver=$(pack_version "$PKG_VERSION" deb) || exit 2
     # a real copy, not hardlinks: the modes are normalised inside it, and the caller's tree is left as
     # it was
     cp -a "$root" "$work/root"
-    normalize_modes "$work/root"
+    pack_normalise_modes "$work/root"
     size=$(du -sk "$work/root" | cut -f1)
     mkdir -p "$work/root/DEBIAN"
     {
@@ -128,9 +134,10 @@ deb)
     ;;
 tarball)
     # the name keeps the name the guide has always used for this route
+    ver=$(pack_version "$PKG_VERSION" tarball) || exit 2
     f="$out/${PKG_NAME:-1bit}-${ver}-linux-x86_64.tar.zst"
     cp -a "$root" "$work/root"
-    normalize_modes "$work/root"
+    pack_normalise_modes "$work/root"
     payload_members "$work/root" > "$work/members"
     # --owner/--group/--numeric-owner: every member is root's, so extracting as root cannot hand a
     # payload path to the builder's uid. Before this, `tar -C / -xf` as root left uid 1000 owning /,
@@ -148,10 +155,11 @@ rpm)
     need PKG_NAME "the package name"
     spec=${PKG_RPM_SPEC:-$repo/packaging/rpm/$PKG_NAME.spec}
     [ -f "$spec" ] || { echo "pack-distro.sh: no spec at $spec" >&2; exit 2; }
+    ver=$(pack_version "$PKG_VERSION" rpm) || exit 2
     p="$PKG_NAME-$ver"
     mkdir -p "$work/$p"
     cp -a "$root/." "$work/$p/"
-    normalize_modes "$work/$p"
+    pack_normalise_modes "$work/$p"
     tar -C "$work" -czf "$work/$p.tar.gz" "$p"
     # %files -f: every path, directories included (rpm does not read a listed directory as its
     # contents), built from the payload so it can never list a file the payload does not have - except
@@ -187,9 +195,10 @@ SH
 arch)
     pkgbuild=${PKG_ARCH_PKGBUILD:-$repo/packaging/arch/PKGBUILD}
     [ -f "$pkgbuild" ] || { echo "pack-distro.sh: no PKGBUILD at $pkgbuild" >&2; exit 2; }
+    ver=$(pack_version "$PKG_VERSION" arch) || exit 2
     mkdir -p "$work/payload"
     cp -a "$root/." "$work/payload/"
-    normalize_modes "$work/payload"
+    pack_normalise_modes "$work/payload"
     cp "$pkgbuild" "$work/PKGBUILD"
     command -v docker >/dev/null ||
         { echo "pack-distro.sh: the Arch package is built with makepkg in an archlinux container: no docker on PATH" >&2; exit 3; }

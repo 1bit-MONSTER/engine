@@ -216,6 +216,11 @@ set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
 # own CTS: GPU export -> NPU import -> NPU executes on the imported range), keyed on the module's
 # fingerprint against third_party/patches/amdxdna/README.md. It skips (77) without the array or without a
 # CTS build (ONEBIT_LIBAMDF_CTS_DIR), so public CI neither runs nor fails it.
+# 1bit-update's slot decisions (engine#1334 review): the second update targets the slot holding the machine's own
+# save layer and must keep it, a foreign layer is still refused. The script sourced as a library over fake /data
+# layouts: no root, no mounts, no device, no VM.
+add_test(NAME one_bit_update_slots
+         COMMAND sh ${CMAKE_SOURCE_DIR}/tests/one_bit_update_slots_test.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME npu_import_contract
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_import_contract.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(npu_import_contract PROPERTIES SKIP_RETURN_CODE 77)
@@ -237,6 +242,11 @@ add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-chec
 # dir, so no key, no device and no build: the four refusals are a set with no manifest, a file the
 # manifest does not list, a ciphertext byte flipped after signing, and a manifest signed by another key.
 add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
+# engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
+# it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
+# release, and the ordering a candidate needs: previous release < candidate < its release. The
+# ordering is the row dpkg, rpm and pacman had to agree on; no container, no build, dpkg only.
+add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.

@@ -61,6 +61,13 @@ bool Backend::load(const std::string& dir, const std::string& device, std::strin
     id_ = fs::path(dir).filename().string();
 #ifdef ONEBIT_NPU
     if (device == "npu") {
+        // Pack every weight block before the first request: the server answers from a worker pool, and a
+        // lazily filled cache shared by those threads is a data race (npu/embed/embed_npu.h says why).
+        std::string nwhy;
+        if (!impl_->npu.prepare(impl_->model, nwhy)) {
+            why = nwhy;
+            return false;
+        }
         impl_->model.set_gemm(impl_->npu.hook());
         impl_->npu_installed = true;
     }

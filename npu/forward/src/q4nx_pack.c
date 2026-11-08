@@ -158,6 +158,27 @@ void q4nx_host_gemm_f32_padded(const float* A, int a_k, int M, int K, int N, con
     free(pad);
 }
 
+const char* q4nx_design_log_tag(Q4nxDesign role) {
+    switch (role) {
+        case Q4NX_DESIGN_QKV: return "QKV";
+        case Q4NX_DESIGN_QKV2: return "QKV2";
+        case Q4NX_DESIGN_O:   return "O";
+        case Q4NX_DESIGN_O2:  return "O2";
+        case Q4NX_DESIGN_GU:  return "GU";
+        case Q4NX_DESIGN_G:   return "G";
+        case Q4NX_DESIGN_U:   return "U";
+        case Q4NX_DESIGN_PLEGATE: return "PLEGATE";
+        case Q4NX_DESIGN_PLEPROJ: return "PLEPROJ";
+        case Q4NX_DESIGN_GU2: return "GU2";
+        case Q4NX_DESIGN_D2:  return "D2";
+        case Q4NX_DESIGN_QKVLIN: return "QKV";
+        case Q4NX_DESIGN_Z:   return "Z";
+        case Q4NX_DESIGN_QKVFA_Q:  return "QKVFAQ";
+        case Q4NX_DESIGN_QKVFA_KV: return "QKVFAKV";
+        default:              return "D";
+    }
+}
+
 const char* q4nx_design_role_name(Q4nxDesign role) {
     switch (role) {
         case Q4NX_DESIGN_QKV: return "QKV";

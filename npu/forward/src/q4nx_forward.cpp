@@ -391,26 +391,9 @@ int Q4nxNpuForward::idx_of(Q4nxDesign role) const {
     return -1;
 }
 
-static const char* role_tag(Q4nxDesign r) {
-    switch (r) {
-        case Q4NX_DESIGN_QKV: return "QKV";
-        case Q4NX_DESIGN_QKV2: return "QKV2";
-        case Q4NX_DESIGN_O:   return "O";
-        case Q4NX_DESIGN_O2:  return "O2";
-        case Q4NX_DESIGN_GU:  return "GU";
-        case Q4NX_DESIGN_G:   return "G";
-        case Q4NX_DESIGN_U:   return "U";
-        case Q4NX_DESIGN_PLEGATE: return "PLEGATE";
-        case Q4NX_DESIGN_PLEPROJ: return "PLEPROJ";
-        case Q4NX_DESIGN_GU2: return "GU2";
-        case Q4NX_DESIGN_D2:  return "D2";
-        case Q4NX_DESIGN_QKVLIN: return "QKV";
-        case Q4NX_DESIGN_Z:   return "Z";
-        case Q4NX_DESIGN_QKVFA_Q:  return "QKVFAQ";
-        case Q4NX_DESIGN_QKVFA_KV: return "QKVFAKV";
-        default:              return "D";
-    }
-}
+// The log tag lives with the geometry it describes (q4nx_pack.c) so the target's own setup messages and
+// this file's can never drift apart; it is the historical mapping, not the unique plan name.
+static const char* role_tag(Q4nxDesign r) { return q4nx_design_log_tag(r); }
 
 // --------------------------------------------------------------------------
 // init
@@ -431,7 +414,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // The launch layer.  A1: everything below that touches a device talks to this, and the settings the
     // container declares (weight layout, pb16i image dir, Hadamard fold) are pushed into it as they are
     // parsed.  A2 turns this into NpuTarget::open(plan, kernels_dir).
-    xd_ = std::make_unique<npu::target::xdna::XdnaTarget>();
+    xd_ = std::make_unique<npu::target::xdna::XdnaTarget>(dev);
     int  had_block = 1024;
     bool weight_cache = true;
     if (getenv("NPU_NO_WCACHE")) weight_cache = false;   // A/B: disable the packed-weight cache
@@ -1116,46 +1099,27 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
     }
 
-    for (int i = 0; i < ndesigns_; i++) {
-        const Q4nxDesignGeom* g = &designs_[i];
-        // The two full-attention-QKV-split designs exist only as pb16i kernels (the
-        // role has no int8 launch that fits), so they get no M=128 context and no
-        // int8 ELF on disk: their decode context is built below from the _pb16i ELF.
-        xd_->adopt_geometry(i, *g);                  // the target owns the geometry it launches on
-        if (xd_->role_is_pb16i_split(i)) continue;   // no int8 launch for these two roles
-
-        if (host_gemm_) {
-            // Offline mode: host GEMMs are plain float matmuls over the decoded weights, so
-            // no ELF is opened and none is required.  A model whose kernel set has not been
-            // built yet can be loaded and prompted, which is what makes it a usable
-            // numeric reference for a new geometry (engine #796: the d3-lite backbone
-            // answers on the host while its six designs do not exist).  The artifact is
-            // named when it is there; the ELF set itself is checked by
-            // tests/verify_design_elfs + tests/verify_full_elfs.sh, not by this path.
-            std::string elf = dir + "/" + g->elf_name;
-            if (file_exists(elf)) {
-                fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s (host-GEMM)\n",
-                        role_tag(g->role), g->M, g->K, g->N, elf.c_str());
-            } else {
-                fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  (host-GEMM, no ELF: %s)\n",
-                        role_tag(g->role), g->M, g->K, g->N, g->elf_name);
-            }
-        } else {
-            std::string elf = dir + "/" + g->elf_name;
-            if (!file_exists(elf)) {
-                err_ = missing_kernel(dir, g->elf_name, g->role);
-                return false;
-            }
-            I8Ctx* ctx = xd_->make_ctx(i);   // adopted: the target owns the context from here
-            if (!ctx) { err_ = "cannot create a context for role " + std::to_string(i); return false; }
-            ctx->MD = g->M; ctx->KD = g->K; ctx->ND = g->N;
-            ctx->blocked_b = weight_layout_b8_;
-            if (!ctx->init_elf(*dev, elf.c_str(), g->M, g->K, g->N, 1)) {
-                err_ = "I8Ctx init_elf failed for " + elf;
-                return false;
-            }
-            fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s\n", role_tag(g->role),
-                    g->M, g->K, g->N, elf.c_str());
+    // The M=128 ELF set is the target's to open (engine#803 A2b): it adopts the geometry, probes the
+    // artifact and refuses by name, and the forward no longer touches an I8Ctx to do it.
+    {
+        // What the setup side reads, set once: the remaining two blocks (decode family, lm-head) read
+        // the same fields, so moving them later needs no new plumbing (engine#803 A2b).
+        npu::target::xdna::XdnaTarget::Setup setup;
+        setup.model_dir = mdir;
+        setup.kernels_dir = dir;
+        setup.family = family_tag();
+        setup.plan_path = plan_.loaded() ? plan_path_ : std::string();
+        setup.b8 = weight_layout_b8_;
+        setup.pb16i = pb16i_;
+        setup.t2s = t2s_;
+        setup.t2s_v2 = t2s_v2_;
+        setup.host_gemm = host_gemm_;
+        setup.plan = plan_.loaded() ? &plan_ : nullptr;
+        xd_->configure(setup);
+        std::string why;
+        if (!xd_->open_prefill(designs_, ndesigns_, why)) {
+            err_ = std::move(why);
+            return false;
         }
     }
 
@@ -1212,6 +1176,18 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 const bool geo_ok = t2s_ ? q4nx_t2s::fits(designs16_[i].K, designs16_[i].N)
                                          : q4nx_pb16i::fits(designs16_[i].K, designs16_[i].N);
                 if (designs16_[i].M <= 0 || !geo_ok) {
+                    // Say WHY, once per role.  A geometry the ternary tile cannot hold is not a
+                    // missing artifact and not an error: the role keeps its M=128 kernel and the
+                    // model is correct, only slower -- so the only symptom is a decode step that
+                    // costs what a prefill step costs, with nothing in the log.  That is the same
+                    // "nothing logs the decline" gap the HRX prefill N%16 note names for a
+                    // different dispatcher, and it is cheap to close here.
+                    if (designs16_[i].M > 0 && !geo_ok)
+                        fprintf(stderr,
+                                "  [forward] dec %-3s: no %s twin (K=%d N=%d does not fit the tile), "
+                                "staying on M=128\n",
+                                role_tag(designs16_[i].role), t2s_ ? "t2s" : "pb16i",
+                                designs16_[i].K, designs16_[i].N);
                     designs16_[i].M = 0;
                     continue;
                 }
@@ -3099,6 +3075,29 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
         return;
     }
+    // The device's activation BO holds exactly max_batch_rows() rows (the M=128 prefill design), and a wider
+    // launch is not quantized at all -- the kernel then reads and poisons past the BO, which is memory
+    // corruption, not a slow path (engine#1372: 4 of 4 segfaults on the d3 pack's real questions, and one run
+    // that answered from rows the layers never processed). So a wider GEMM is walked in blocks here, at the one
+    // choke point every batched projection goes through: the same launches in the same order, each within the
+    // BO. Each row's result is independent of the others -- the row loops downstream (`row_attn`, the GDN
+    // recurrence) never needed the whole prompt in one launch, only the GEMMs did.
+    const int blk = max_batch_rows();
+    if (blk > 0 && M > blk) {
+        out.assign((size_t)M * N, 0.0f);
+        for (int b0 = 0; b0 < M && err_.empty(); b0 += blk) {
+            const int rows = std::min(blk, M - b0);
+            std::vector<float> part;
+            // A's row stride is the caller's a_k, not the padded K (the same stride trap the host path documents).
+            npu_gemm_rows(role, A + (size_t)b0 * a_k, rows, K, N, Bmat, part, wkey, sc, a_k, decode_twin);
+            if (part.size() < (size_t)rows * N) {
+                if (err_.empty()) err_ = std::string("npu_gemm_rows: a blocked ") + sc + " launch returned short";
+                return;
+            }
+            std::copy(part.begin(), part.begin() + (size_t)rows * N, out.begin() + (size_t)b0 * N);
+        }
+        return;
+    }
     npu::target::GemvArgs a;
     a.role = role; a.layer = cur_layer_; a.M = M; a.K = K; a.N = N;
     a.x = A; a.Bmat = Bmat; a.wkey = wkey; a.tag = sc;
@@ -3149,6 +3148,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     if (M <= 0) { err_ = "empty batch"; return false; }
     for (int t : tokens)
         if (t < 0 || t >= c_.NV) { err_ = "token out of range"; return false; }
+
 
     // A new request starts at position 0: clear the KV cache.  The cache is
     // append-only (kcache_[l].insert(end, ...)) but the attention indexes it by
@@ -4874,21 +4874,41 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
         scales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
     }
     I8Ctx& lctx = *xd_->head_ctx();
-    std::vector<float> got((size_t)M * (size_t)T);
-    for (int t = 0; t < ntiles; t++) {
-        const int n0 = t * T, n1 = std::min(NV, n0 + T);
-        xrt::run run = lctx.launch_async_with_bo_rows(*lm_head_packed_[(size_t)t].bo, hr.data(), M, H,
-                                                      scales.data());
-        lctx.wait_kernel(run);
-        lctx.readback();
-        std::fill(got.begin(), got.end(), 0.0f);
-        lctx.dequant_pb16i(got.data(), M, T, scales.data(), lm_head_packed_[(size_t)t].eref,
-                           xd_->head_ctx()->pb16i_planes);
-        for (int m = 0; m < M; m++) {
-            for (int n = n0; n < n1; n++) {
-                float v = got[(size_t)m * T + (n - n0)];
-                if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
-                logits_all[(size_t)m * (size_t)NV + (size_t)n] = v;
+    // A verify batch can be wider than this head context's row capacity -- the tri-ternary head context is
+    // built on the decode design (MD = 16 rows) -- and the launcher's quantiser refuses am > MD while the
+    // launch still runs, so rows MD..M-1 were read and written past the activation BO (engine#1386, the
+    // same failure as #1372 on the head instead of the layers). Chunk at MD exactly as the int8 head does
+    // (engine#1364): the weights are already resident, so a chunk is one launch, and a row keeps its own
+    // activation scale either way, so the chunking cannot move a value.
+    const int chunk = lctx.MD > 0 ? lctx.MD : M;
+    std::vector<float> got((size_t)std::min(chunk, M) * (size_t)T);
+    for (int r0 = 0; r0 < M; r0 += chunk) {
+        const int rows = std::min(chunk, M - r0);
+        for (int t = 0; t < ntiles; t++) {
+            const int n0 = t * T, n1 = std::min(NV, n0 + T);
+            xrt::run run = lctx.launch_async_with_bo_rows(*lm_head_packed_[(size_t)t].bo,
+                                                         hr.data() + (size_t)r0 * (size_t)H, rows, H,
+                                                         scales.data() + r0);
+            lctx.wait_kernel(run);
+            lctx.readback();
+            // Mirror the int8 head's guard: this is the change that makes it worth having, because a chunk
+            // that comes back short would otherwise feed dequant_pb16i rows nobody wrote -- poison_canary()
+            // and a zeroed buffer make a plausible-looking row, so the logits go quietly wrong. Named here.
+            if (lctx.canary_short()) {
+                fprintf(stderr, "[canary] SHORT RESULT (head rows, pb16i): tile=%d M=%d rows=%d short=%d\n", t,
+                        M, rows, lctx.short_row_);
+                err_ = "LM head rows: a pb16i chunk came back short (" + std::to_string(rows) +
+                       " rows asked, row " + std::to_string(lctx.short_row_) + " short)";
+                return false;
+            }
+            lctx.dequant_pb16i(got.data(), rows, T, scales.data() + r0, lm_head_packed_[(size_t)t].eref,
+                               xd_->head_ctx()->pb16i_planes);
+            for (int m = 0; m < rows; m++) {
+                for (int n = n0; n < n1; n++) {
+                    float v = got[(size_t)m * T + (n - n0)];
+                    if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                    logits_all[(size_t)(r0 + m) * (size_t)NV + (size_t)n] = v;
+                }
             }
         }
     }

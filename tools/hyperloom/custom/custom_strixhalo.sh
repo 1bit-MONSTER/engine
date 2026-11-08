@@ -88,7 +88,14 @@ export HRX_ALLOW_NO_SVM=${HRX_ALLOW_NO_SVM:-1}
 # broken workload and is really a claim taken for work that could not fit. So the entrypoint waits for
 # room *before* claiming and re-checks the moment the claim is ours, because the box moves while queued
 # (the window harness learned the same lesson the same week: a pre-claim check alone is a race).
-GTT_NEED=${HL_GTT_NEED_GIB:-24}     # 27B at 20480 ctx needs 20.21 GiB by its own load line, plus margin
+# 21 GiB, not 24: the workload states its own requirement. `1bit serve` prints it at load --
+#   need 20.21 GiB (weights 16.35 + KV/state 1.40 + compute 0.50; draft 1.96)
+# -- and a round 24 refused two windows that fitted. Measured 2026-11-08 08:18: GTT 74 GiB in use,
+# 74 + 20.21 = 94.21 GiB, inside the 95 GiB rule and with 30 GiB of the engine's 104 GiB ceiling free;
+# the gate refused at 98 GiB because the constant said 24. The other refusal that session (06:26, GTT 75)
+# was correct at any value >= 20.21, so the constant was costing claims for nothing. Keep it a hair above
+# the measured figure rather than a round number nobody measured.
+GTT_NEED=${HL_GTT_NEED_GIB:-21}
 GTT_RULE=${HL_GTT_RULE_GIB:-95}     # this box's GTT rule; the engine's own ceiling is 104 with a 16 GiB reserve
 GTT_WAIT=${HL_GTT_ROOM_WAIT:-1800}
 export HL_GTT_NEED_GIB="$GTT_NEED" HL_GTT_RULE_GIB="$GTT_RULE"

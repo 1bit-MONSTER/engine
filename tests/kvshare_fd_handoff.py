@@ -47,6 +47,22 @@ PROMPT_TOKENS = int(os.environ.get("PROMPT_TOKENS", "0"))   # 0 = the fixed 145-
 CTX = os.environ.get("CTX", "4096")
 
 
+def die_with_parent():
+    """Have the kernel kill the server if this process dies, however it dies.
+
+    The `finally` below reaps the server on a clean exit, a Ctrl-C and a SIGTERM, but not on SIGKILL (an OOM kill,
+    a CI timeout, `kill -9` by an operator): the child is in its own session, so it would survive and keep its HRX
+    context -- and on this box an orphaned llama-server held 51 GiB of GTT for 14 h and knocked out another
+    service. PR_SET_PDEATHSIG closes that case: the kernel signals the child when the parent dies, whatever the
+    reason. Linux only, which is where the HRX route runs; elsewhere the flag is simply not set.
+    """
+    try:
+        import ctypes, signal
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -133,7 +149,8 @@ def main():
         srv = subprocess.Popen([SRV, "-m", MODEL, "--host", "127.0.0.1", "--port", str(port), "--device", "HRX0",
                                 "-ngl", "99", "--jinja", "-c", CTX, "-np", "1", "-fa", "on", "--no-warmup",
                                 "--slot-save-path", slotdir],
-                               env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+                               env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True,
+                               preexec_fn=die_with_parent)
     try:
         up, secs = wait_health(api, srv, out)
         say(f"server pid {srv.pid} on :{port}, health up={up} after {secs:.1f}s")

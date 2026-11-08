@@ -156,11 +156,15 @@ else
 fi
 
 # The sealed NPU kernels live on the stick (they used to be inside the RAM image, which made it too big
-# to load): link them to the path the engine looks for, beside itself.
-if [ -d /data/npu/kernels ] && [ -d /home ]; then
-    mkdir -p /home/bcloud/wt/npupkg-build/npu 2>/dev/null
-    ln -sfn /data/npu/kernels /home/bcloud/wt/npupkg-build/npu/kernels 2>/dev/null
-    say "[kernels] $(ls /data/npu/kernels | wc -l) sealed NPU sets linked beside the engine"
+# to load): link them to the path the engine looks for, BESIDE ITSELF. The engine is at /bin/1bit as a real
+# file (engine#1543 — it used to live at its builder's build path, and this link hardcoded that path, which
+# was the same disclosure a script instead of a layout), so "beside itself" is /bin/npu/kernels. A link
+# left at the old path is not a cosmetic miss: the engine would find no set, register no NPU device, and the
+# boot would otherwise look green.
+if [ -d /data/npu/kernels ]; then
+    mkdir -p /bin/npu 2>/dev/null
+    ln -sfn /data/npu/kernels /bin/npu/kernels 2>/dev/null
+    say "[kernels] $(ls /data/npu/kernels | wc -l) sealed NPU sets linked beside the engine (/bin/npu/kernels)"
 fi
 
 n=0

@@ -1913,6 +1913,15 @@ if [ -n "$(sed -n 's/^engine: *//p' "${ID:-/etc/1bit/release-identity}" 2>/dev/n
         PASS*) pass image-builder-paths "${BP#PASS }" ;;
         *)     fail image-builder-paths "${BP#FAIL }" ;;
     esac
+    # And the coupling that makes the move safe (engine#1543): the engine looks for its sealed NPU sets BESIDE
+    # ITSELF, and they live on the stick, so init.sh links /data/npu/kernels beside /bin/1bit. A link left at
+    # the engine's old build path registers no device on an otherwise green boot - so it is checked here.
+    if [ -d /data/npu/kernels ]; then
+        if [ -e /bin/npu/kernels ]; then pass npu-kernels-beside-engine "/bin/npu/kernels -> $(readlink /bin/npu/kernels 2>/dev/null || echo '(a directory)')"
+        else fail npu-kernels-beside-engine "/data/npu/kernels exists but /bin/npu/kernels does not: the engine finds its sealed sets beside itself, so no NPU device would register on this boot"; fi
+    else
+        skip npu-kernels-beside-engine "no /data/npu/kernels on this boot, so there is no set to link beside the engine"
+    fi
 else
     skip image-builder-paths "not a mini image (no mini identity file), so /home here is not a builder path to check"
 fi

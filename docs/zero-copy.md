@@ -159,6 +159,14 @@ Two facts from measuring the readback, which are why the sweeps were narrowed ra
 skip them (`NPU_NO_A_FLUSH=1`, `NPU_NO_C_INVAL=1`) **emit garbage**, so the answer to "when does the cache model
 need a sync" is "on every launch, over the rows the host touches" — measured, not assumed.
 
+That requirement has no architecture-manual citation behind it, and it is worth saying why rather than leaving the
+gap to be filled with a wrong one. The Versal AIE-ML v2 manual (AM027, a local copy with a text extract beside it)
+describes the array's own memory as on-die SRAM — "local, distributed memory · no cache misses" (§2, "AIE-ML v2
+Tile Architecture") — which is not what these syncs are about. Strix Halo is `aie2p`, and its NPU buffer objects are
+**cacheable host memory mapped through the IOMMU**, so the host and the array share a cache hierarchy that the
+Versal document does not describe. The sweeps are that difference, and the measurement above is the only evidence
+for them: a reader who finds an AIE-ML v2 section about array memory should not read it as covering this.
+
 Nothing here needs the file: this is all in-BO traffic.
 
 ## Target 3 — the ONNX execution provider's boundary

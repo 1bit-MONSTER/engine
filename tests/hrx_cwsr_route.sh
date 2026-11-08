@@ -63,19 +63,26 @@ PY
 chmod +x "$scratch/backend.py"
 
 run() {  # <record> [serve args]: the backend's three variables, as JSON, in <record>; serve's log in <record>.log
-    local port
-    port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    RECORD="$1" "$bin" serve -m "$scratch/plain.gguf" --port "$port" --llama-server "$scratch/backend.py" \
-        --no-mem-check "${@:2}" >"$1.log" 2>&1 &
-    pid=$!
-    for _ in $(seq 1 100); do [ -s "$1" ] && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-    # A server that never came up because it could not bind is a port collision, not a defect in
-    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
+    local attempt port
+    for attempt in 1 2 3; do
+        port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+        RECORD="$1" "$bin" serve -m "$scratch/plain.gguf" --port "$port" --llama-server "$scratch/backend.py" \
+            --no-mem-check "${@:2}" >"$1.log" 2>&1 &
+        pid=$!
+        for _ in $(seq 1 100); do [ -s "$1" ] && break; kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+        kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+        if ! grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$1.log"; then break; fi
+        if [ "$attempt" -ge 3 ]; then break; fi
+            # A server that never came up because it could not bind is a port collision, not a defect in what
+            # this test checks: serve picks the port, releases it, and launches its backends before it binds, so on
+            # a -j runner another serve can take it inside that window. Re-pick a bounded number of times; the FAIL
+            # message below stays for a collision that will not go away (engine #1444).
+        echo "     note: port $port was taken before serve bound it; retrying with a fresh port (attempt $((attempt + 1))/3)"
+    done
     if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$1.log"; then
         echo "FAIL: hrx_cwsr_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$1.log" | head -1))"
         exit 1
     fi
-    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 env_is() { [ "$(cat "$1" 2>/dev/null)" = "$2" ]; }
 all='{"HSA_USE_SVM": "0", "HSA_USERPTR_FOR_PAGED_MEM": "0", "HRX_ALLOW_NO_SVM": "1"}'

@@ -47,18 +47,29 @@ trap cleanup EXIT
 
 start() {   # start <device> <log> [env...]
     local device=$1 log=$2; shift 2
-    port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    env "$@" "$bin" serve -m "$model" --device "$device" --port "$port" --alias e2e-model --ctx-size 2048 \
-        --no-mem-check "${server_arg[@]}" >"$log" 2>&1 &
-    pid=$!
-    api="http://127.0.0.1:$port"
-    local code=000
-    for _ in $(seq 1 1200); do
-        code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break
-        kill -0 "$pid" 2>/dev/null || break; sleep 0.5
+    local attempt port code
+    for attempt in 1 2 3; do
+        port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+        env "$@" "$bin" serve -m "$model" --device "$device" --port "$port" --alias e2e-model --ctx-size 2048 \
+            --no-mem-check "${server_arg[@]}" >"$log" 2>&1 &
+        pid=$!
+        api="http://127.0.0.1:$port"
+        code=000
+        for _ in $(seq 1 1200); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break
+            kill -0 "$pid" 2>/dev/null || break; sleep 0.5
+        done
+        if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log" && [ "$attempt" -lt 3 ]; then
+            # A server that never came up because it could not bind is a port collision, not a defect in what
+            # this test checks: serve picks the port, releases it, and launches its backends before it binds, so on
+            # a -j runner another serve can take it inside that window. Re-pick a bounded number of times; the FAIL
+            # message below stays for a collision that will not go away (engine #1444).
+            echo "     note: port $port was taken before serve bound it; retrying with a fresh port (attempt $((attempt + 1))/3)"
+            stop
+            continue
+        fi
+        break
     done
-    # A server that never came up because it could not bind is a port collision, not a defect in
-    # what this test checks: name the port and stop, before an empty body turns into a JSON error.
     if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
         echo "FAIL: hybrid_e2e: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
         exit 1

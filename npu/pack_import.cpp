@@ -299,6 +299,13 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // prefix as Qwen3-1.7B at this hidden size (8,512), a different bundle (5 tiles of 591,872, not 3 of 1,183,744),
     // and 1,857 of 686,518,336 bytes differ (2.7e-6). This row is the one that disproved the QK-norm explanation above.
     {2048, 32, 16, 8512, 5, 1, 591872},
+    // Mistral-7B-Instruct-v0.2 at hidden 4,096 / 32 heads / 32 layers: measured with tools/fconst19_measure.py against
+    // amd/Mistral-7B-Instruct-v0.2_rai_1.8.0_npu_4K, 1,954 of 3,843,419,200 bytes differ (5.08e-05) -- content, not
+    // layout. The prefix follows the Qwen3 line (64 + 2*hidden + 4,352 = 12,608), the bundle is 5 tiles of 2,297,856
+    // (11,489,280 B, which is NOT header_off minus the prefix: the header sits after the prefix and the bundle follows
+    // it, so this row is one the arithmetic would have got wrong), and the header stride 117,862,720 is uniform over
+    // all 32 blocks. This is the largest family on #1503 (31 packs).
+    {4096, 32, 32, 12608, 5, 1, 2297856},
 };
 
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes

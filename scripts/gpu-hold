@@ -62,7 +62,15 @@ TCTL_START=${GPU_HOLD_TCTL_START:-75}
 TCTL_ABORT=${GPU_HOLD_TCTL_ABORT:-93}
 # End the hold when MemAvailable falls below this many GB (0 keeps the old behaviour). Set by the caller, not
 # defaulted: a box with a large model legitimately sits low, and the floor that matters is the fleet's, not this'. 
-MEM_ABORT_GB=${GPU_HOLD_MEM_ABORT_GB:-0}
+# GiB, whole number. A value that is not one is refused HERE rather than reaching `[ "$x" -gt 0 ]`, where bash
+# prints "integer expression expected", the test is treated as false and the floor is silently disabled.
+MEM_ABORT_GB=${GPU_HOLD_MEM_ABORT_GIB:-${GPU_HOLD_MEM_ABORT_GB:-0}}
+case $MEM_ABORT_GB in
+    '' | *[!0-9]*)
+        echo "gpu-hold: GPU_HOLD_MEM_ABORT_GB=$MEM_ABORT_GB is not a whole number of GiB - refusing to run with a floor that cannot be enforced" >&2
+        exit 2
+        ;;
+esac
 POLL=${GPU_HOLD_POLL:-2}
 LOG=${GPU_HOLD_LOG:-}
 THERMAL_FLAG=${GPU_HOLD_THERMAL_FLAG:-$HOME/THERMAL-HOLD}
@@ -278,7 +286,8 @@ kill_tree() {
 
 # MemAvailable, in GB, as the kernel reports it. 0 disables the abort (the old behaviour).
 mem_available_gb() {
-    awk '/^MemAvailable:/ { printf "%d", $2 / 1048576 }' "${GPU_HOLD_MEMINFO:-/proc/meminfo}" 2> /dev/null
+    # first match only: a fixture that adds a second MemAvailable line would otherwise concatenate both numbers
+    awk '/^MemAvailable:/ { printf "%d", $2 / 1048576; exit }' "${GPU_HOLD_MEMINFO:-/proc/meminfo}" 2> /dev/null
 }
 
 watch() {

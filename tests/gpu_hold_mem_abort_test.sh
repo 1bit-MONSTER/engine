@@ -33,7 +33,7 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 q=$scratch/queue; mkdir -p "$q"
 
-awk '{print} /^MemAvailable:/{print "MemAvailable:   900000000 kB"}' /proc/meminfo > "$scratch/mem-high"
+awk '{if ($1=="MemAvailable:") print "MemAvailable:   900000000 kB"; else print}' /proc/meminfo > "$scratch/mem-high"
 awk '{if ($1=="MemAvailable:") print "MemAvailable:      1048576 kB"; else print}' /proc/meminfo > "$scratch/mem-low"
 
 cat > "$scratch/wrapper.sh" <<'WRAP'
@@ -44,11 +44,12 @@ sleep 600
 WRAP
 chmod +x "$scratch/wrapper.sh"
 
+[ "$(grep -c '^MemAvailable:' "$scratch/mem-high")" = 1 ] || { echo "FAIL the high fixture has $(grep -c '^MemAvailable:' "$scratch/mem-high") MemAvailable lines, not 1"; exit 1; }
 cp "$scratch/mem-high" "$scratch/meminfo"
 ( sleep 5; cp "$scratch/mem-low" "$scratch/meminfo" ) &
 
 t0=$(date +%s)
-GPU_HOLD_MEMINFO="$scratch/meminfo" GPU_HOLD_MEM_ABORT_GB=10 \
+GPU_HOLD_MEMINFO="$scratch/meminfo" GPU_HOLD_MEM_ABORT_GIB=10 \
 GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TOKEN" GPU_HOLD_LOG="$scratch/log" \
 GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
 GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/tctl" GPU_HOLD_THERMAL_FLAG="$scratch/x" \
@@ -76,4 +77,29 @@ if [ -n "$deep" ] && kill -0 "$deep" 2> /dev/null; then
     exit 1
 fi
 echo "ok   the hold ended on the memory floor after ${elapsed}s (rc=$rc) and the child is gone"
+
+# engine#1652 review: pin the OPT-IN property, which is the one a future edit is most likely to break by giving the
+# variable a default. Same starved meminfo, same payload, floor unset -- the hold must run to its own max hold, with
+# no abort in the log and the payload alive until then.
+cp "$scratch/mem-high" "$scratch/meminfo"
+( sleep 5; cp "$scratch/mem-low" "$scratch/meminfo" ) &
+t0=$(date +%s)
+GPU_HOLD_MEMINFO="$scratch/meminfo" \
+GPU_QUEUE_DIR="$q" GPU_TOKEN_FILE="$scratch/TOKEN2" GPU_HOLD_LOG="$scratch/log2" \
+GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
+GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE="$scratch/tctl2" GPU_HOLD_THERMAL_FLAG="$scratch/x2" \
+    timeout 120 "$hold" -t 0.1 -l off -- "$scratch/wrapper.sh" "$scratch" >/dev/null 2>&1
+rc=$?
+elapsed=$(( $(date +%s) - t0 ))
+deep=$(cat "$scratch/deep.pid" 2> /dev/null)
+[ -n "$deep" ] && kill -9 "$deep" 2> /dev/null
+if [ "$rc" != 124 ]; then
+    echo "FAIL the floor is not opt-in: the hold ended at ${elapsed}s (rc=$rc) with GPU_HOLD_MEM_ABORT_GIB unset"
+    exit 1
+fi
+if grep -q "ending the hold" "$scratch/log2" 2> /dev/null; then
+    echo "FAIL the floor is not opt-in: an abort was logged with GPU_HOLD_MEM_ABORT_GIB unset"
+    exit 1
+fi
+echo "ok   the floor is opt-in: with it unset the hold ran to its own max hold (${elapsed}s) and nothing aborted"
 echo "gpu_hold_mem_abort: ok"

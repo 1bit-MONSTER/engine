@@ -36,7 +36,7 @@ import os
 import re
 import sys
 
-DEVICE = re.compile(r"^/dev/(kfd|dri/renderD[0-9]+)$")
+DEVICE = re.compile(r"^/dev/(kfd|dri/renderD[0-9]+|accel/accel[0-9]+)$")
 TOKEN = re.compile(r"\bpid\s+([0-9]+)\b")
 
 
@@ -175,6 +175,12 @@ def self_test():
     case("a NON-exempt service is still flagged",
          {7: ("other", ["/dev/dri/renderD128"])}, [], lambda p: [7, 1], lambda p: "/app.slice/other.service", 1)
     case("the holder being the token pid itself counts", {9: ("x", ["/dev/kfd"])}, [9], lambda p: [9], lambda p: "", 0)
+    # /dev/accel/accel0 is the XDNA NPU device, and it is the one the 05:0xZ orphan held. The first
+    # version's pattern matched only /dev/kfd and /dev/dri/renderD*, so an NPU-only holder was invisible to
+    # the device scan and was caught (when it was caught) only through the token test.
+    case("an NPU-only holder (/dev/accel) is seen too",
+         {587217: ("1bit forward-serve", ["/dev/accel/accel0"])}, [], lambda p: [587217, 1],
+         lambda p: "/app.slice/thermal-run-1.scope", 1)
     print(f"device_holders --self-test: {fails} failure(s)")
     return 1 if fails else 0
 

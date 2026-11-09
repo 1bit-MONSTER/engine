@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 
@@ -3583,8 +3584,26 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             char path[4096];
             std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
-            if (FILE* fp = std::fopen(path, "wb")) {
-                std::fwrite(X.data(), sizeof(float), (size_t)M * (size_t)H, fp);
+            // A dump that cannot be written must say so once: a missing layer_<l>.f32 otherwise reads as "that
+            // layer never ran", which is the misleading-instrument class #1605/#1619 exist to remove (engine #1726).
+            // One report per run -- a missing directory fails on the first layer and would otherwise print per layer.
+            static bool write_trouble = false;
+            FILE* fp = std::fopen(path, "wb");
+            if (fp == nullptr) {
+                if (!write_trouble) {
+                    write_trouble = true;
+                    std::fprintf(stderr, "  [dump] cannot write %s: %s -- no residual files are being written for this run\n",
+                                 path, std::strerror(errno));
+                }
+            } else {
+                const size_t want = (size_t)M * (size_t)H;
+                const size_t got  = std::fwrite(X.data(), sizeof(float), want, fp);
+                // A full disk is the case that matters most, and fwrite is the only thing that can report it.
+                if (got != want && !write_trouble) {
+                    write_trouble = true;
+                    std::fprintf(stderr, "  [dump] short write on %s (%zu of %zu floats): %s -- the dump is incomplete\n",
+                                 path, got, want, std::strerror(errno));
+                }
                 std::fclose(fp);
             }
         }

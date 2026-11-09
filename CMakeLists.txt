@@ -738,6 +738,10 @@ if(Python3_Interpreter_FOUND)
     # only real pair verified on the first candidate, so the line never ran) and the residual tolerance it
     # accepts and refuses at. Fixtures are ~200 KB each and built from the rule, so they can be wrong on purpose.
     add_test(NAME fconst19_measure COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/fconst19_measure_test.py)
+    # The 1.9 tail-head tool (engine#1693/#1740): its geometry, its decoder against the vendor golden tile, and the
+    # three refusals a real pack needed -- a block-32 head refused by name, an untied head given no false oracle, the
+    # trailing zeros counted. It was never registered, so nothing ran it after #1710.
+    add_test(NAME q4nx_tail_head COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_tail_head_test.py)
     # A member declared in npu/forward/include/q4nx_forward.h and never defined keeps `main` green while a full
     # `cmake --build` fails at link time (engine#1573: the 3-argument step_batch_embeds).  CI cannot catch it --
     # .github/workflows/ci.yml builds `--target onebit` only, because a full build wants the private NPU runtime --

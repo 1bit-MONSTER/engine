@@ -1649,13 +1649,24 @@ int serve_only(const std::string& why) {
     return kServeOnly;
 }
 
-// The warm-up requests (warm_backend, below): HRX only, and ONEBIT_NO_WARMUP=1 turns them off. serve sends
+// The warm-up requests (warm_backend, below): HRX only, and ONEBIT_NO_WARMUP=1 (or ONEBIT_WARMUP=none)
+// turns them off; ONEBIT_WARMUP picks which of the two, which is how engine#1539's bisect runs. serve sends
 // them itself; --print-backend hands the same requests to Lemonade as the plan's "warmups" ([{path, body}],
 // in order; "warmup" is the first one, for a lemond that reads only that), and Lemonade's onebit recipe
 // sends them once the backend is ready, before it marks the model loaded.
+// ONEBIT_WARMUP selects which warm-up requests are sent (engine#1539's bisect): "" or "both" = the shipped pair,
+// "long" = only the sampling chat request, "short" = only the 16-token /completion prompt, "none" = neither (the
+// spelling ONEBIT_NO_WARMUP already had). The two requests are not interchangeable -- the first samples and the
+// second does not -- so which one a model cannot survive is a question one load can answer instead of a rebuild.
+static std::string warmup_selection() {
+    const char* which = getenv("ONEBIT_WARMUP");
+    return which ? std::string(which) : std::string();
+}
+
 static bool warmup_wanted(const std::string& device) {
     const std::string dev = device.substr(0, device.find(' '));
-    return getenv("ONEBIT_NO_WARMUP") == nullptr && (dev == "hrx" || dev == "hybrid");
+    return getenv("ONEBIT_NO_WARMUP") == nullptr && warmup_selection() != "none" &&
+           (dev == "hrx" || dev == "hybrid");
 }
 
 static const char* const kWarmupPath = "/v1/chat/completions";
@@ -1689,8 +1700,16 @@ static json warmup_short_body() {
 }
 
 static json warmup_requests() {
-    return json::array({ json{ { "path", kWarmupPath }, { "body", warmup_body() } },
-                         json{ { "path", "/completion" }, { "body", warmup_short_body() } } });
+    // An unrecognised value is the shipped pair, not "none": a typo must not quietly disable a warm-up that moves a
+    // measured 2 s off the client's first request. Normalised here so a caller cannot see the two states differently.
+    std::string sel = warmup_selection();
+    if (sel != "long" && sel != "short" && sel != "none") sel = "both";
+    const bool want_chat  = sel == "both" || sel == "long";
+    const bool want_short = sel == "both" || sel == "short";
+    json out = json::array();
+    if (want_chat)  out.push_back(json{ { "path", kWarmupPath },    { "body", warmup_body() } });
+    if (want_short) out.push_back(json{ { "path", "/completion" },  { "body", warmup_short_body() } });
+    return out;
 }
 
 // --print-backend: the llama-server serve would start for this model, as one JSON line on stdout,
@@ -1732,7 +1751,7 @@ int print_backend(const Options& o, const Launch& l) {
     // a chat backend on HRX: the request Lemonade sends before it marks the model loaded (warmup_wanted)
     if (o.role.empty() && warmup_wanted(l.device)) {
         out["warmups"] = warmup_requests();
-        out["warmup"]  = out["warmups"][0];
+        if (!out["warmups"].empty()) out["warmup"] = out["warmups"][0];
     }
     std::printf("%s\n", out.dump().c_str());
     return 0;

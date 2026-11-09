@@ -47,6 +47,7 @@
 // and the weight residency (engine#799 P4).  A future non-XDNA NPU is a different implementation of the same
 // interface (npu/target/target.h) and nothing else in this file changes.
 #include "target/xdna/xdna_target.h"  // npu-relative: CI's syntax-only target has no tree root on its path
+#include "model/npu_model.h"   // NpuModel owns the target (engine#803 A3)
 #include <memory>
 #include <unordered_map>
 
@@ -345,7 +346,11 @@ private:
     // Hadamard fold of the activation, the M=16 bit-equality gate and the NPU_PROFILE accumulators.
     // A1 keeps the design table and the container parsing here; A2 (docs/npu-p4-target-split.md) hands the
     // target a plan instead.  `pb16i_dir_` above stays because the lm head's own images are named from it.
-    std::unique_ptr<npu::target::xdna::XdnaTarget> xd_;
+    // The model (engine#803 A3) owns the target; `xd_` below is a reference to it, so the ~94 `xd_->…` call sites and
+    // every expression in this class stay exactly as they were. Declared before `xd_`: a reference member must be
+    // initialised from something that already exists.
+    npu::NpuModel model_;
+    std::unique_ptr<npu::target::xdna::XdnaTarget> & xd_ = model_.xd;
     // plan.json (engine #799 P1), when the model directory carries one.  It states the three things
     // this class used to decide by looking at which files exist in --kernels: fused gate/up, the
     // artifact family (""/_b8/_pb16i), and where the M=16 decode twins live.  Absent = the legacy

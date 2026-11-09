@@ -38,6 +38,9 @@ LINE_STYLES = [
       # engine#1474: the BASE layer's keep-list is a '#'-comment data file read by scripts/base-modes.sh, listed by name
       # like packages-extra above because it has no extension
       "base-modes-keep",
+      # engine#1595: the direction-B ratchet's baseline is a '#'-comment data file too, and `.txt` has no style of
+      # its own (a blanket "*.txt" would demand a notice in files that are data, not code).
+      "add_test_gaps.txt",
       "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
       # cycle 17: Puppy's switch that skips its first-run Quick Setup is an empty marker file whose only content
       # is this notice - Puppy tests for its existence, so a comment is free

@@ -3604,7 +3604,15 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                     std::fprintf(stderr, "  [dump] short write on %s (%zu of %zu floats): %s -- the dump is incomplete\n",
                                  path, got, want, std::strerror(errno));
                 }
-                std::fclose(fp);
+                // fclose is a separate check, not a tidiness call: a write smaller than the stdio buffer is held
+                // and flushed here, so a full disk reports ENOSPC from fclose and NOTHING from fwrite (measured:
+                // <4096 B -> fwrite returns the full count with no errno and fclose returns -1; >=4096 B -> the
+                // reverse). Both checks are needed; either alone leaves a silent case.
+                if (std::fclose(fp) != 0 && !write_trouble) {
+                    write_trouble = true;
+                    std::fprintf(stderr, "  [dump] close/flush failed on %s: %s -- the dump is incomplete\n",
+                                 path, std::strerror(errno));
+                }
             }
         }
     }

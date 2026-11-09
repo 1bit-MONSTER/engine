@@ -230,9 +230,15 @@ void test_external_tile_decode() {
         std::memcpy(&u, &v, 4);
         return uint16_t((u + 0x8000u + ((u >> 16) & 1u)) >> 16);   // round to nearest even, as the importer does
     };
-    const float scale_v = 0.0078125f;                  // exactly representable in bf16
-    const uint16_t scale16 = bf16_bits(scale_v);
     for (const bool row_major : {false, true}) {
+    // DISTINCT scale and zero points per (tile, half, kk, r): a fixture that writes one value everywhere lets a decoder
+    // that reads row 0's scale for all 32 rows pass, which is exactly the addressing this test exists to pin.
+    const auto scale_for = [&](int64_t tile, int half, int64_t kk, int r) {
+        return 0.001953125f * float(1 + int(tile) * 7 + half * 5 + int(kk) * 3 + (r % 4));   // bf16-exact multiples of 2^-9
+    };
+    const auto zero_for = [&](int64_t tile, int half, int64_t kk, int r, int g) {
+        return uint8_t((int(tile) * 3 + half * 5 + int(kk) * 7 + r + g) % 16);
+    };
     std::vector<uint8_t> blob(size_t(bytes), 0);
     for (int64_t tile = 0; tile < tiles; ++tile)
         for (int half = 0; half < 2; ++half)
@@ -240,11 +246,11 @@ void test_external_tile_decode() {
                 uint8_t* subv = blob.data() + (tile * per_tile + kk * 2 + half) * 2176;
                 for (int r = 0; r < 32; ++r) {
                     const int64_t row = tile * 64 + half * 32 + r;
-                    subv[2112 + r * 2] = uint8_t(scale16 & 0xFF);
-                    subv[2113 + r * 2] = uint8_t(scale16 >> 8);
-                    const uint8_t zp[4] = {5, 6, 7, 8};
-                    subv[2048 + r * 2] = uint8_t(zp[0] | (zp[1] << 4));
-                    subv[2049 + r * 2] = uint8_t(zp[2] | (zp[3] << 4));
+                    const uint16_t sc = bf16_bits(scale_for(tile, half, kk, r));
+                    subv[2112 + r * 2] = uint8_t(sc & 0xFF);
+                    subv[2113 + r * 2] = uint8_t(sc >> 8);
+                    subv[2048 + r * 2] = uint8_t(zero_for(tile, half, kk, r, 0) | (zero_for(tile, half, kk, r, 1) << 4));
+                    subv[2049 + r * 2] = uint8_t(zero_for(tile, half, kk, r, 2) | (zero_for(tile, half, kk, r, 3) << 4));
                     for (int c = 0; c < 128; ++c) {
                         const uint8_t nib = codes[size_t(row) * K + (kk - 1) * 128 + c];
                         if (row_major) {
@@ -266,15 +272,22 @@ void test_external_tile_decode() {
     bool codes_ok = q.codes.size() == codes.size(), scale_ok = true, zero_ok = true;
     for (size_t i = 0; codes_ok && i < codes.size(); ++i)
         if (q.codes[i] != codes[i]) codes_ok = false;
-    for (size_t r = 0; r < size_t(N); ++r)
-        for (int g = 0; g < int(K / 32); ++g) {
-            if (q.scale[r * (K / 32) + g] != scale_v) scale_ok = false;
-            const uint8_t want = uint8_t(5 + g % 4);
-            if (q.zero[r * (K / 32) + g] != float(want)) zero_ok = false;
-        }
+    // Every row's own scale and all four of its zero points, so the addressing (row r*2 in the param regions, the
+    // group index (kk-1)*4+g, the half and tile choice) is pinned rather than the value of one row repeated.
+    for (int64_t tile = 0; tile < tiles; ++tile)
+        for (int half = 0; half < 2; ++half)
+            for (int64_t kk = 1; kk <= K / 128; ++kk)
+                for (int r = 0; r < 32; ++r) {
+                    const int64_t row = tile * 64 + half * 32 + r;
+                    for (int g = 0; g < 4; ++g) {
+                        const size_t at = size_t(row) * (K / 32) + (kk - 1) * 4 + g;
+                        if (q.scale[at] != scale_for(tile, half, kk, r)) scale_ok = false;
+                        if (q.zero[at] != float(zero_for(tile, half, kk, r, g))) zero_ok = false;
+                    }
+                }
     check(codes_ok, std::string("external tile: every 4-bit code comes back exactly, ") + (row_major ? "row-major" : "w8 interleave"));
-    check(scale_ok, "external tile: the per-row bf16 scale is repeated over the four 32-column groups");
-    check(zero_ok, "external tile: each group keeps its own int4 zero point");
+    check(scale_ok, "external tile: every row keeps its own bf16 scale, repeated over its four groups");
+    check(zero_ok, "external tile: every (row, group) keeps its own int4 zero point");
     std::string err2;
     (void)pi::decode_external_tile(blob.data(), blob.size() - 2176, N, K, err2);
     check(!err2.empty() && err2.find("is not") != std::string::npos,
@@ -512,10 +525,12 @@ void test_external_packed_genre(const std::string& root) {
             why = e.what();
         }
         std::printf("  external-packed import refusal: %s\n", why.c_str());
-        check(threw, "external-packed: import still refuses the genre (the census widening did not become a writer)");
-        check(why.find("qweight.packed") != std::string::npos && why.find("no writer") != std::string::npos,
-              "external-packed: and it refuses by NAME with the layout stated (no writer for N x (K/128+1) x 68), "
-              "not by tripping over a symbol (" + why + ")");
+        check(threw, "external-packed: import refuses a pack whose geometry no split can satisfy");
+        // The genre HAS a writer now (engine#1503), so the property is no longer "refused because nothing can
+        // write it": it is that a geometry the container split cannot satisfy is REFUSED with the numbers, not
+        // written wrong. This fixture's qkv is N 768 against a 40-head x 128 geometry, which is exactly that case.
+        check(why.find("container range") != std::string::npos || why.find("does not fit") != std::string::npos,
+              "external-packed: a geometry the split cannot satisfy is refused with the numbers (" + why + ")");
         check(!fs::exists(dir / "out" / "model.q4nx"),
               "external-packed: nothing is written for a genre this importer cannot yet walk");
     }

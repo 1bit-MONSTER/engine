@@ -275,6 +275,12 @@ const uint8_t* at(const Fconst& f, int64_t off, int64_t len) {
 constexpr double kTieCorr = 0.99;
 
 struct Fconst19Rule {
+    // The pack this row was MEASURED on, by model name. Geometry alone is not a key: Qwen3-1.7B and Llama-3.2-1B are
+    // both hidden 2,048 / 32 heads and cut the same payload into different bundles (3 x 1,183,744 against 5 x 591,872),
+    // and the bundle rotation is the one field a wrong row gets silently WRONG rather than loudly: the prefix and the
+    // header positions are untouched by it, so the epsilon anchors still line up and the import would rotate weights
+    // into the wrong projections and answer quiet nonsense. So a row applies only to the pack it was measured on.
+    const char* model;
     int hidden, heads, layers;
     int64_t prefix;   // bytes before the q/k/v bundle: the norms, and on Qwen3 the per-head QK gains too
     int n_tiles, rot;
@@ -287,10 +293,10 @@ struct Fconst19Rule {
 // explanation that survives one model is how this table would get a wrong row.
 constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen2.5-0.5B-Instruct: normalises to its 1.8 twin byte for byte, whole file, all 24 blocks.
-    {896, 14, 24, 1856, 16, 2, 34816},
+    {"Qwen2.5-0.5B-Instruct", 896, 14, 24, 1856, 16, 2, 34816},
     // Qwen3-1.7B: same rule at hidden 2048 / 16 heads / 28 layers; 535 code bytes of the two builds differ, all in
     // layer 24, which is content rather than layout (every block still lines up).
-    {2048, 16, 28, 8512, 3, 1, 1183744},
+    {"Qwen3-1.7B", 2048, 16, 28, 8512, 3, 1, 1183744},
     // SmolLM2-135M-Instruct: hidden 576 / 9 heads / 30 layers, headers of 36 B (4 x 9) at a 2,360,292 B stride.
     // Measured by diffing this pack against its 1.8 twin: prefix 3,776 B, then FOUR tiles of 76,800 rotated by 1, then
     // verbatim to the header. 29 of the 30 blocks normalise byte-identically; the 112 differing bytes are all in layer 3
@@ -298,20 +304,20 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // quantised at block 32 (151 ops), which is a tile rhythm this importer cannot walk -- so the import reaches the
     // block gate and refuses there by number (engine#1503). The row is what makes that refusal the FIRST thing wrong
     // with the pack rather than the 1.9 header layout.
-    {576, 9, 30, 3776, 4, 1, 76800},
+    {"SmolLM2-135M", 576, 9, 30, 3776, 4, 1, 76800},
     // Qwen2.5-Coder-1.5B-Instruct: hidden 1,536 / 12 heads / 28 layers, 748 of 733,564,160 layer-block bytes differ
     // (1.0e-6). Its TAIL is 262,147,136 B against the 1.8 pack's 134,314,560 -- this pack quantises its head at block 32
     // while its 140 layer ops are block 128 (engine#1503), so the tail is where the difference lives and the layers are
     // what this row describes.
-    {1536, 12, 28, 3136, 7, 1, 226304},
+    {"Qwen2.5-Coder-1.5B", 1536, 12, 28, 3136, 7, 1, 226304},
     // Qwen3-4B: 2,933 of 2,208,061,248 bytes differ (1.3e-6), again content not layout. The prefix corroborates the
     // Qwen3 offset seen at 1.7B -- 64 + 2*hidden + 4,352, so 8,512 at hidden 2,048 and 9,536 at 2,560 -- and the tile
     // count differs from 1.7B's 3, which is why this is measured per pack and never derived.
-    {2560, 32, 36, 9536, 5, 1, 1462272},
+    {"Qwen3-4B", 2560, 32, 36, 9536, 5, 1, 1462272},
     // Llama-3.2-1B-Instruct: hidden 2,048 with 32/16 heads and no QK norms -- the first non-Qwen family here. Same
     // prefix as Qwen3-1.7B at this hidden size (8,512), a different bundle (5 tiles of 591,872, not 3 of 1,183,744),
     // and 1,857 of 686,518,336 bytes differ (2.7e-6). This row is the one that disproved the QK-norm explanation above.
-    {2048, 32, 16, 8512, 5, 1, 591872},
+    {"Llama-3.2-1B", 2048, 32, 16, 8512, 5, 1, 591872},
 };
 
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes
@@ -367,8 +373,31 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
         return path;
     }
     const Fconst19Rule* rule = nullptr;
-    for (const auto& r : kFconst19Rules)
-        if (r.hidden == hidden && r.heads == heads && r.layers == layers) rule = &r;
+    // The pack's own directory name carries the model; a row is used only for the pack it was measured on.
+    const std::string pack_name = fs::path(path).parent_path().filename().string();
+    bool geometry_seen = false;
+    std::string measured_on;
+    for (const auto& r : kFconst19Rules) {
+        if (r.hidden != hidden || r.heads != heads || r.layers != layers) continue;
+        geometry_seen = true;
+        if (pack_name.find(r.model) == std::string::npos) {
+            measured_on = measured_on.empty() ? r.model : measured_on + ", " + r.model;
+            continue;
+        }
+        rule = &r;
+        break;
+    }
+    if (!rule && geometry_seen) {
+        unmap_file(fc.map, fc.size);
+        throw std::runtime_error(
+            path + ": this is a Ryzen AI 1.9 Token .fconst with hidden " + std::to_string(hidden) + ", " +
+            std::to_string(heads) + " heads and " + std::to_string(layers) +
+            " layers, and that geometry has been measured on " + measured_on +
+            " only. Sharing a geometry is not sharing a bundle: two models with the same hidden size can cut the payload"
+            " into different tiles and rotate them differently, and a wrong rotation leaves the header and the epsilon"
+            " anchors exactly where they should be, so it would be read as a correct parse and answer quiet nonsense."
+            " Measure this pack against its own 1.8 twin (tools/fconst19_measure) and add the row.");
+    }
     if (!rule) {
         unmap_file(fc.map, fc.size);
         throw std::runtime_error(

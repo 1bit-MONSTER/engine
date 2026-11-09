@@ -258,6 +258,33 @@ void test_external_packed_genre(const std::string& root) {
     check(g["external_row_stride"]["matched"] == 1 && g["external_row_stride"]["of"] == 1,
           "external-packed: the bytes fit length == N x (K/128 + 1) x 68, reported as a count");
 
+    // engine#1671: when the `*.packed` sibling is ALSO a placeholder (dims [0], no data), this graph carries no
+    // weight for that matmul at all -- and the node must be DROPPED rather than left naming the `.empty`
+    // placeholder. Left naming it, the reader calls bytes_of() on a byte-less tensor and throws
+    // "model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty: no data", which broke `npu-pack import` for every
+    // Ryzen AI 1.9 fconst pack: those declare all of their graph initializers this way (363 `.empty` and 363
+    // `.packed`, every one dims [0]) because the weights live in the Token .fconst.
+    write_data(0);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", 0);
+    {
+        // Both empty AND no .fconst: the weights are genuinely absent from this pack, so it is refused by name
+        // (#1687's rule) rather than reporting a capacity or tile-layout fault. The SAME graph imports fine from a
+        // Token .fconst -- that is the 1.9 shape, where every initializer is spelled this way and the weights live in
+        // the .fconst -- which `npu_pack_import_test <golden> <1.9 pack>` covers end to end with a real pack.
+        bool refused = false;
+        std::string what;
+        try {
+            (void)pi::plan(dir.string());
+        } catch (const std::exception& e) {
+            refused = true;
+            what = e.what();
+        }
+        check(refused, "placeholder pair: with no .fconst the pack is refused rather than read from a byte-less tensor");
+        check(what.find("qweight.empty") != std::string::npos && what.find("qweight.packed") != std::string::npos &&
+                  what.find("genuinely absent") != std::string::npos,
+              "placeholder pair: the refusal names the placeholder, its sibling and the reason (" + what + ")");
+    }
+
     // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
     write_data(stride * N - 68);
     write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N - 68);

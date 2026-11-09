@@ -270,6 +270,10 @@ add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_ho
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
 add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.sh)
+# engine#1639: the half of the survivor bound that a CPU-only box can drive. The bound itself fires only for a payload root
+# wedged in uninterruptible sleep, which user space cannot create, so this covers the other half: a holder that released with
+# a survivor must leave a record, and the NEXT holder must warn about it and clear it.
+add_test(NAME gpu_hold_survivors COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_survivors_test.sh)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
@@ -1518,11 +1522,11 @@ endif()
 # engine #1485: a script that runs `serve --port 0` no longer picks a port and releases it, so there is no window to
 # collide in and nothing for the lock to prevent - those are gone from this list (watchdog_serve, metrics_serve,
 # parallel_args, recipes_route, greedy_shortcut, prism_route, hrx_runtime_route, laya_gguf_route, mem_admit_route,
-# npu_repack_path, serve_e2e_<dev>, laya_route_e2e, laya_models_e2e), and the list now names exactly the
+# npu_repack_path, serve_e2e_<dev>, laya_route_e2e, laya_models_e2e, device_route, hrx_cwsr_route, hybrid_route,
+# hybrid_kvshare_route), and the list now names exactly the
 # tests that still choose their port up front. bench_selftest stays: tools/bench.py picks its own free_port under it.
 set(_onebit_route_tests
-    smoke_serve print_backend lemonade_hrx template_pin device_route pm_route bench_selftest
-    hrx_cwsr_route hybrid_route hybrid_kvshare_route)
+    smoke_serve print_backend lemonade_hrx template_pin pm_route bench_selftest)
 # Tests that only exist for some configurations (a model was passed, a device is built in).
 # serve_e2e_<dev>, laya_route_e2e and laya_models_e2e left this list with engine #1485: they run `serve --port 0`
 # now, so they pick nothing and there is no window for the lock to close. hrx_cpu_weight_parity stays - it starts `llama-server` itself, whose port is not ours to
@@ -1530,7 +1534,8 @@ set(_onebit_route_tests
 # engine #1485: hybrid_kvshare_e2e chooses its port in its own driver (tests/kvshare_fd_handoff.py calls free_port(),
 # binds :0, closes, and hands the number to the server it starts), so the census - which reads the .sh text - sees no
 # bind to require the lock for. Same shape as bench_selftest, so it is named here for the same reason.
-list(APPEND _onebit_route_tests hybrid_e2e pm_laya_route hrx_cpu_weight_parity hybrid_kvshare_e2e)
+# hybrid_e2e is no longer here: it takes `serve --port 0` and reads the port back (this PR).
+list(APPEND _onebit_route_tests pm_laya_route hrx_cpu_weight_parity hybrid_kvshare_e2e)
 foreach(_onebit_route_test IN LISTS _onebit_route_tests)
     if(TEST ${_onebit_route_test})
         set_tests_properties(${_onebit_route_test} PROPERTIES RESOURCE_LOCK route_ports)

@@ -33,6 +33,8 @@
 // visible to whatever loads it next.
 #pragma once
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <string>
 
@@ -142,6 +144,12 @@ struct Plan {
     std::vector<std::string> refused() const;
     std::string manifest() const;  // JSON: format, layout version, source, geometry, tensors
 };
+
+// The multi-component (gemma-4 1.9, `type: compositemodel`) packs keep the text tower's geometry in
+// model_config.json -> config.model_attributes.text_config, while config.json is `{}` and genai_config.json's
+// decoder block stops at head_size. Fills ONLY the keys `cfg` lacks and returns how many it added, so the caller
+// can name the source; exposed for a unit test that needs no ONNX graph.
+int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg);
 
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.

@@ -256,6 +256,24 @@ def test_q4_0_source_reader():
         except SystemExit as e:
             check("blk.0.norm.weight" in str(e) and "cannot size" in str(e),
                   "strict refuses an unsized type by name", K, N)
+        # engine#1605 follow-up: one tensor by name. `strict=True` refuses the whole file at the first unsized
+        # tensor, so a caller that wants a single q4_0 tensor out of a real model has no way to ask for it; these
+        # three arms pin the two answers it must keep apart -- absent, and present-but-unsized.
+        t_dims, t_tt, t_raw = Q.tensor(g, "blk.0.ffn_gate.weight")
+        check(t_dims == (K, N) and t_tt == Q.Q4_0 and t_raw == raw,
+              "tensor(name) returns the one tensor asked for, bytes intact", K, N)
+        try:
+            Q.tensor(g, "blk.0.norm.weight")
+            check(False, "tensor() refuses an unsized type by name", K, N)
+        except SystemExit as e:
+            check("blk.0.norm.weight" in str(e) and "cannot size" in str(e),
+                  "tensor() refuses an unsized type by name", K, N)
+        try:
+            Q.tensor(g, "blk.0.nope.weight")
+            check(False, "tensor() refuses an absent tensor by name", K, N)
+        except SystemExit as e:
+            check("no tensor named blk.0.nope.weight" in str(e),
+                  "tensor() refuses an absent tensor by name", K, N)
         vals, dgot = Q.read_q4_0(raw, K, N)
         check(vals.shape == (K, N) and dgot.shape == (K // 32, N), "q4_0 decode shapes", K, N)
         want = np.empty((N, K // 32, 32), np.float32)

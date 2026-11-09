@@ -1051,6 +1051,12 @@ int run_forward_serve(int argc, char** argv) {
     // request returning nothing in 150 s (engine #1605), and a "ready" line that is a lie about the next minute.
     // Paid here it is startup time, which is what startup time is for. NPU_SERVE_NO_WARMUP=1 keeps the old behaviour.
     if (!getenv("NPU_SERVE_NO_WARMUP")) {
+        // Announce the warm-up BEFORE it runs, so a caller polling for "ready" can tell "warming, give it a minute" from
+        // "hung". Measured cost is 44.5 s on a folded 27B pack, and `tests/serve_port.sh`'s helper defaults to a 30 s
+        // budget -- a caller that only knows about `ready` would time out and report "serve never reported a port",
+        // which is the misleading shape #1531/#1545 spent effort removing.
+        std::fprintf(stderr, "1bit forward-serve: warming (weight cache; first request would otherwise pay it)\n");
+        std::fflush(stderr);
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<float> wlogits;
         std::vector<int> wids = {131, 131, 131, 131};   // four tokens of one id: the cheapest pass that touches every weight

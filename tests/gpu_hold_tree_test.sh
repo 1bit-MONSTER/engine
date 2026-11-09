@@ -103,4 +103,43 @@ if kill -0 "$stubborn" 2> /dev/null; then
 fi
 echo "ok   the TERM-ignoring grandchild was killed too"
 
+
+# A SIGNAL to the hold itself. Until now TERM ran only `exit 143`: EXIT then released the token and removed the ticket
+# while the payload kept the device, so the next lane was admitted on top of it — the 11-08 orphan through a different
+# door (`timeout`, an operator kill, an orchestrator stopping a lane). This arm TERMs the hold mid-hold and asserts both
+# halves that matter: the payload's TREE is gone, and the token is released. It is the same shape as the two arms above
+# (a grandchild two levels down) so that a fix which only TERMs the wrapper still fails here.
+rm -f "$scratch/deep.pid" "$scratch/TOKEN"
+mkdir -p "$scratch/sig"
+GPU_QUEUE_DIR=$q GPU_TOKEN_FILE=$scratch/TOKEN GPU_HOLD_LOG=$scratch/log \
+GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=2 \
+GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE=$scratch/tctl GPU_HOLD_THERMAL_FLAG=$scratch/x \
+    "$hold" -t 5 -l selftest-signal -- "$scratch/mid.sh" "$scratch" >/dev/null 2>&1 &
+holdpid=$!
+for i in $(seq 1 200); do
+    [ -s "$scratch/deep.pid" ] && [ -f "$scratch/TOKEN" ] && break
+    kill -0 "$holdpid" 2> /dev/null || break
+    sleep 0.1
+done
+sigdeep=$(cat "$scratch/deep.pid" 2>/dev/null)
+if [ -z "$sigdeep" ] || [ ! -f "$scratch/TOKEN" ]; then
+    echo "FAIL the signal arm never got to a held state (deep=${sigdeep:-none} token=$([ -f "$scratch/TOKEN" ] && echo held || echo absent))"
+    kill -9 "$holdpid" 2> /dev/null
+    exit 1
+fi
+kill -TERM "$holdpid" 2> /dev/null
+wait "$holdpid"
+rc=$?
+if kill -0 "$sigdeep" 2> /dev/null; then
+    echo "FAIL a signal to the hold released the token but left the payload running ($sigdeep) - the #1640 door"
+    kill -9 "$sigdeep" 2> /dev/null
+    exit 1
+fi
+echo "ok   a signal to the hold ended the payload's tree (hold rc=$rc)"
+if [ -f "$scratch/TOKEN" ]; then
+    echo "FAIL the token outlived the hold after a signal"
+    exit 1
+fi
+echo "ok   and released the token"
+
 echo "gpu_hold_tree: ok"

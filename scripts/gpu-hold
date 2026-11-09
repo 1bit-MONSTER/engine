@@ -141,7 +141,13 @@ release() {
     state=done
 }
 trap release EXIT
-trap 'exit 143' TERM INT HUP
+# TERM/INT/HUP must END THE PAYLOAD before the token comes back. `exit 143` alone ran only the EXIT trap: the token was
+# released and the ticket removed while the payload kept the device, so the next lane was admitted on top of it (the
+# 11-08 orphan, reached through a different door: `timeout`, an operator kill, an orchestrator stopping a lane). Its
+# tree is ended with the same kill_tree the watchdog uses, so a process two levels down cannot survive the signal
+# either. `child` is empty while queued, so a signal in the queue still just leaves the queue; `declare -F` covers the
+# one window where the payload has started but the function is not defined yet.
+trap '[ -n "${child:-}" ] && declare -F kill_tree > /dev/null && kill_tree "$child"; exit 143' TERM INT HUP
 
 pid_of() { sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$1" 2> /dev/null | head -n 1; }
 

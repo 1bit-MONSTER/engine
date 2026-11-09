@@ -133,13 +133,60 @@ def decide(changed_paths, cmake_diff, triggers=None):
     if not [k for k in kinds_add if k == "registration"]:
         return "full", "no ctest registration line is being ADDED (a pure removal cannot be told from a rewrite)"
     return "configure-only", (f"{len([k for k in kinds_add if k == 'registration'])} ctest registration line(s), "
-                              f"CMakeLists.txt only")
+                              f"registration files only")
 
 
-def from_git(base, head):
-    names = subprocess.run(["git", "diff", "--name-only", base, head], capture_output=True, text=True, check=True)
-    diff = subprocess.run(["git", "diff", base, head, "--", "CMakeLists.txt"], capture_output=True, text=True, check=True)
+# The diff decide() classifies must cover EVERY registration file, not only CMakeLists.txt. With only CMakeLists.txt
+# here, a family file's own lines were never read: an add_test in CMakeLists.txt next to a target_link_libraries in
+# cmake/tests-gpu-hold.cmake came out configure-only, skipping the compile that exists to catch exactly that (found
+# probing main at bc21ba3 after #1699). The pathspec mirrors REGISTRATION_FILE.
+REGISTRATION_PATHSPEC = ["CMakeLists.txt", ":(glob)cmake/tests-*.cmake"]
+
+
+def from_git(base, head, cwd=None):
+    names = subprocess.run(["git", "diff", "--name-only", base, head], capture_output=True, text=True, check=True, cwd=cwd)
+    diff = subprocess.run(["git", "diff", base, head, "--", *REGISTRATION_PATHSPEC], capture_output=True, text=True,
+                          check=True, cwd=cwd)
     return decide(names.stdout.splitlines(), diff.stdout, workflow_triggers())
+
+
+def git_arm():
+    """from_git() on a real repo: the layer the diff-text cases above cannot reach. None when git is unavailable."""
+    import shutil
+    import tempfile
+    if not shutil.which("git"):
+        return None
+    bad = 0
+    with tempfile.TemporaryDirectory() as d:
+        def git(*a):
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=d, check=True,
+                           capture_output=True)
+        git("init", "-q")
+        os.makedirs(os.path.join(d, "cmake"))
+        for f, text in (("CMakeLists.txt", "add_test(NAME a COMMAND a)\n"),
+                        ("cmake/tests-gpu-hold.cmake", "add_test(NAME b COMMAND b)\n")):
+            open(os.path.join(d, f), "w").write(text)
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d, capture_output=True, text=True, check=True).stdout.strip()
+        arms = [
+            ("git: an add_test in CMakeLists.txt next to a target line in the family file",
+             {"CMakeLists.txt": "add_test(NAME c COMMAND c)\n",
+              "cmake/tests-gpu-hold.cmake": "target_link_libraries(onebit PRIVATE x)\n"}, "full"),
+            ("git: registrations added to both files",
+             {"CMakeLists.txt": "add_test(NAME d COMMAND d)\n",
+              "cmake/tests-gpu-hold.cmake": "add_test(NAME e COMMAND e)\n"}, "configure-only"),
+        ]
+        for name, appends, want in arms:
+            git("checkout", "-q", "-B", "arm", base)
+            for f, text in appends.items():
+                open(os.path.join(d, f), "a").write(text)
+            git("commit", "-q", "-am", name)
+            got, why = from_git("HEAD^1", "HEAD", cwd=d)
+            ok = got == want
+            print(("ok   " if ok else "FAIL ") + f"{name} -> {got}" + ("" if ok else f" (wanted {want}: {why})"))
+            bad += 0 if ok else 1
+    return bad
 
 
 def self_test():
@@ -216,6 +263,11 @@ def self_test():
         ok = got == want
         print(("ok   " if ok else "FAIL ") + f"{name} -> {got}" + ("" if ok else f" (wanted {want}: {why})"))
         bad += 0 if ok else 1
+    g = git_arm()
+    if g is None:
+        print("skip git: no git on PATH, from_git() not exercised")
+    else:
+        bad += g
     print(f"hrx_build_scope --self-test: {bad} failure(s)")
     return 1 if bad else 0
 

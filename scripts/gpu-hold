@@ -358,8 +358,25 @@ watch() {
 watch "$child" &
 watchdog=$!
 
-wait "$child"
-rc=$?
+# A payload ROOT that survives the KILL pass holds this token for ever: a process wedged in uninterruptible
+# sleep cannot be killed by SIGKILL, and every other lane then sits in the FIFO behind a job that cannot die.
+# Bound the wait and release anyway - a wedged job costs one lane's measurement, not the queue (engine #1639;
+# the deployed copy on strixhalo has had this bound since 2026-11-06, and this is it brought back to the repo).
+# GPU_HOLD_KILL_GRACE is the TERM->KILL window; GPU_HOLD_SURVIVE_WAIT is the settle time after it.
+survive_by=$(( ${GPU_HOLD_KILL_GRACE:-10} + ${GPU_HOLD_SURVIVE_WAIT:-60} ))
+while kill -0 "$child" 2> /dev/null; do
+    sleep 1
+    base=$deadline
+    [ -n "${STOP_STAMP:-}" ] && [ -f "$STOP_STAMP" ] && base=$(cat "$STOP_STAMP" 2> /dev/null || printf '%s' "$deadline")
+    [ "$(date +%s)" -ge $(( base + survive_by )) ] && break
+done
+if kill -0 "$child" 2> /dev/null; then
+    log "::error::child $child survived KILL: releasing the token anyway (a wedged job costs one lane's measurement, not the queue)"
+    rc=124
+else
+    wait "$child"
+    rc=$?
+fi
 # wait reports 143 for SIGTERM; say 124 for a max hold, as timeout does
 if [ "$rc" = 143 ] && [ "$(date +%s)" -ge "$deadline" ]; then rc=124; fi
 held=$(( $(date +%s) - started ))

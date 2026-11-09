@@ -547,9 +547,39 @@ std::string find_one(const std::string& dir, const std::string& prefix, const st
 // Resolution order, and it never guesses: the 1.8 spelling first, so nothing that imports today changes; then a
 // *single* `Llm_Token_*` file. Two or more unmatched candidates is a pack shape we have not seen, and choosing the
 // alphabetically first would be a coin flip over the model's weights, so it is refused by name with the list.
+// defined with the hybrid line's graph resolution below; the fconst lookup uses it to find a component pack's decoder.
+std::string graph_filename(const std::string& pack_dir);
+
 std::string find_token_fconst(const std::string& dir, std::string* why = nullptr) {
     const std::string exact = find_one(dir, "dd_metastate_Llm_Token_Token_", ".fconst");
     if (!exact.empty()) return exact;
+    // A multi-component pack (`type: compositemodel`) keeps its LLM graph AND its Token .fconst in the component
+    // `genai_config.json` names (`decoder/`), while the config files that state the geometry stay at the pack root.
+    // #1644 taught `graph_filename()` to follow that relative path; the fconst lookup was still scanning only the root,
+    // so pointing npu-pack at the pack root reported "the pack carries no Token .fconst either" for a pack that has one
+    // two directories down. Same pack, same rule: look where the pack says its decoder is.
+    {
+        const std::string graph = graph_filename(dir);
+        const size_t slash = graph.rfind('/');
+        if (slash != std::string::npos) {
+            const std::string component = dir + "/" + graph.substr(0, slash);
+            std::error_code cec;
+            if (fs::is_directory(component, cec)) {
+                const std::string in_component = find_one(component, "dd_metastate_Llm_Token_Token_", ".fconst");
+                if (!in_component.empty()) return in_component;
+                const std::string pre2 = "dd_metastate_Llm_Token_", suf2 = ".fconst";
+                std::vector<std::string> c2;
+                for (const auto& e : fs::directory_iterator(component)) {
+                    const std::string n = e.path().filename().string();
+                    if (n.size() <= pre2.size() + suf2.size()) continue;
+                    if (n.compare(0, pre2.size(), pre2) != 0) continue;
+                    if (n.compare(n.size() - suf2.size(), suf2.size(), suf2) != 0) continue;
+                    c2.push_back(e.path().string());
+                }
+                if (c2.size() == 1) return c2.front();
+            }
+        }
+    }
     const std::string pre = "dd_metastate_Llm_Token_", suf = ".fconst";
     std::vector<std::string> cands;
     for (const auto& e : fs::directory_iterator(dir)) {
@@ -829,7 +859,29 @@ DeclaredMap read_declared(const std::string& pack_dir) {
 // walk_graph() reads the graph with its external-data declarations, decode_matmulnbits() is block-parameterised, and
 // the scale-per-32-column-group layout is the container's own.
 std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why) {
-    const std::string gpath = pack_dir + "/embedding.onnx";
+    // A multi-component pack (`type: compositemodel`) names its embedding component in genai_config.json
+    // (`model.embedding.filename = "embedding/model.onnx"`), exactly as it names its decoder; a single-graph pack keeps
+    // the flat `embedding.onnx` this reader was written for. Follow the pack's own declaration first — the same rule the
+    // graph and the Token .fconst now follow (#1644, #1657) — and fall back to the flat name.
+    std::string gpath = pack_dir + "/embedding.onnx";
+    {
+        std::ifstream gf(pack_dir + "/genai_config.json");
+        if (gf) {
+            json g;
+            try { g = json::parse(gf); } catch (...) { g = json::object(); }
+            if (g.is_object() && g.contains("model") && g["model"].is_object() && g["model"].contains("embedding") &&
+                g["model"]["embedding"].is_object()) {
+                const json& emb = g["model"]["embedding"];
+                if (emb.contains("filename") && emb["filename"].is_string()) {
+                    const std::string rel = emb["filename"].get<std::string>();
+                    if (!rel.empty() && rel.front() != '/' && rel.find("..") == std::string::npos) {
+                        std::error_code nec;
+                        if (fs::is_regular_file(pack_dir + "/" + rel, nec)) gpath = pack_dir + "/" + rel;
+                    }
+                }
+            }
+        }
+    }
     std::error_code ec;
     if (!fs::is_regular_file(gpath, ec)) { if (why) *why = "no embedding.onnx"; return {}; }
     // parse_onnx() unwraps the ModelProto's graph field and walks it; walk_graph() alone expects the GRAPH protobuf,
@@ -850,6 +902,58 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         else if (t.name.size() > 3 && t.name.compare(t.name.size() - 3, 3, "_Q4") == 0) table = &t;
         else if (!table && t.dims.size() == 2) table = &t;   // an unquantised [V, H] table
     }
+    // engine#1725: the gemma-4 components are f32 and UNQUANTISED -- an `embed_tokens` table with no `*scales*` beside
+    // it -- while the shape above is the 4-bit packed one another family ships. Reading the f32 table is worth doing
+    // (the container wants BF16 and the conversion is exact); claiming the pack is not, because its decoder also carries
+    // `per_layer_inputs`, fed by `embed_tokens_per_layer.weight` (262144x8960 on the e2b pack, i.e. layers x head_dim)
+    // and a 256-wide projection norm, and no reader here implements that mechanism yet. So: read the token table, refuse
+    // by NAME when the per-layer table is present, instead of reporting the shape mismatch as a missing table.
+    if (table && !scales) {
+        const bool per_layer = [&] {
+            for (const auto& t2 : em.tensors)
+                if (t2.name.find("embed_tokens_per_layer") != std::string::npos) return true;
+            return false;
+        }();
+        if (per_layer) {
+            if (why)
+                *why = "the component carries embedding.embed_tokens_per_layer.weight, i.e. a PER-LAYER embedding table "
+                       "(262144x8960 on gemma-4-e2b = layers x head_dim) that feeds the decoder's per_layer_inputs, and "
+                       "the per-layer embedding mechanism is not implemented here yet (engine#1725): refusing rather "
+                       "than importing a decoder without that input";
+            return {};
+        }
+        if (table->type != kF32) {
+            if (why) *why = "embed_tokens is unquantised with dtype " + std::to_string(table->type) +
+                            ", and only f32 is read here (engine#1725)";
+            return {};
+        }
+        if (table->dims.size() != 2 || table->dims.at(0) <= 0 || table->dims.at(1) <= 0) {
+            if (why) *why = "an f32 embed_tokens table must be 2-D and positive";
+            return {};
+        }
+        const int64_t Vf = table->dims.at(0), Hf = table->dims.at(1);
+        std::map<std::string, const uint8_t*> fext;
+        const uint8_t* raw = nullptr;
+        if (!table->location.empty()) {
+            size_t sz = 0;
+            std::string w3;
+            const uint8_t* m = map_file(fs::path(gpath).parent_path().string() + "/" + table->location, sz, &w3);
+            if (!m) { if (why) *why = w3; return {}; }
+            fext[table->location] = m;
+            const uint64_t need = uint64_t(Vf) * uint64_t(Hf) * 4ull;
+            if (table->offset + need > sz) {
+                if (why) *why = "embed_tokens (f32) declares more bytes than its external data carries";
+                return {};
+            }
+            raw = m + table->offset;
+        } else if (table->raw != nullptr) {
+            raw = table->raw;
+        }
+        if (raw == nullptr) { if (why) *why = "an f32 embed_tokens table with no data"; return {}; }
+        std::vector<float> out(size_t(Vf) * size_t(Hf));
+        std::memcpy(out.data(), raw, out.size() * sizeof(float));
+        return out;
+    }
     if (!table || !scales) { if (why) *why = "embedding.onnx has no embed_tokens table + scales"; return {}; }
     if (table->dims.size() != 2 || scales->dims.size() != 2) { if (why) *why = "embed_tokens dims are not 2-D"; return {}; }
     const int64_t V = table->dims.at(0), packed = table->dims.at(1), groups = scales->dims.at(1);
@@ -863,7 +967,9 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         if (t->location.empty() || ext.count(t->location)) continue;
         size_t sz = 0;
         std::string w2;
-        const uint8_t* m = map_file(pack_dir + "/" + t->location, sz, &w2);
+        // external data is named relative to the GRAPH, which for a component pack is a subdirectory: the real pack's
+        // embedding graph declares `embedding.onnx.data`, which lives beside it in `embedding/`, not at the pack root.
+        const uint8_t* m = map_file(fs::path(gpath).parent_path().string() + "/" + t->location, sz, &w2);
         if (!m) { if (why) *why = w2; return {}; }
         ext[t->location] = m;
         ext_size[t->location] = sz;
@@ -1085,6 +1191,63 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+// The 1.9 external-data genre states no FFN width anywhere a file shows it: the weights are MatMulNBitsBf nodes
+// whose initializers carry dims `[0]` (bytes live in a *.qweight.packed sibling), so the initializer-dimension
+// heuristic in plan() sees nothing. The NODE carries K and N as attributes, and walk_graph already descends into
+// the `If` branches every OGA pack keeps its decoder in. The FFN is then a pair that agrees with itself: the down
+// projection's K is the gate/up projection's N, and the gate/up projection's K is the hidden size.
+//   amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu (hidden 2560): 42 activations each feed two (N=10240,K=2560)
+//   gate/up projections, and 42 down projections are (N=2560,K=10240) -> 10240. Its per-token "mobius" paths
+//   (N=512/2048, K=2560) have no matching down projection, so they cannot be mistaken for the FFN. Measured
+//   2026-11-09 on the pack itself (onnx 1.23.2, node attributes only; its initializers' dims are all [0]).
+// Returns 0 when there is no such pair, or when two widths both pair up: a derivation that can be wrong in two
+// ways is refused rather than picked from.
+int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) {
+    if (hidden <= 0) return 0;
+    const OnnxModel m = parse_onnx(model_path);
+    // Attention forms the same (N == others' K, K == hidden) shape as the FFN: q_proj is (N = heads*head_dim, K = hidden)
+    // and o_proj is (N = hidden, K = heads*head_dim), so a bare "pair that agrees" returns the ATTENTION width as
+    // intermediate_size on any model whose attention is wider than its hidden size (review of #1657: fused gate_up +
+    // q_dim 4096 against a true 9728 gave 4096 -- a silently wrong number from a function whose contract is to refuse).
+    // Two things keep it out, and neither is a guess:
+    //   1. the role names this genre really carries (`...attn.qkv_proj.MatMulNBits.qweight`, `...mlp.down_proj...`), and
+    //   2. a structural witness the FFN has and attention does not: gate AND up read the SAME activation tensor, so two
+    //      nodes share one input and one N. A lone q_proj never does, and o_proj has no partner.
+    // A fused gate_up (N = 2*w over the hidden width) is paired explicitly with the down projection's K = 2*w.
+    const auto excluded = [](const std::string& weight) {
+        for (const char* role : {"attn", "q_proj", "k_proj", "v_proj", "o_proj", "qkv", "lm_head"})
+            if (weight.find(role) != std::string::npos) return true;
+        return false;
+    };
+    std::map<std::string, std::map<int64_t, int>> shared;  // activation tensor -> N -> how many nodes read it
+    std::set<int64_t> down_k, gate_n;                     // down: N == hidden, K > hidden;  gate/up: K == hidden, N > hidden
+    for (const auto& mm : m.matmuls) {
+        if (mm.K <= 0 || mm.N <= 0 || excluded(mm.weight)) continue;
+        if (mm.K == hidden && mm.N > hidden) {
+            shared[mm.data][mm.N]++;
+            gate_n.insert(mm.N);
+        }
+        if (mm.N == hidden && mm.K > hidden) down_k.insert(mm.K);
+    }
+    // separate gate/up first: it is the witness attention cannot produce
+    std::set<int64_t> separate;
+    for (const int64_t dk : down_k)
+        for (const auto& [activation, by_n] : shared) {
+            const auto it = by_n.find(dk);
+            if (it != by_n.end() && it->second >= 2) separate.insert(dk);
+        }
+    if (separate.size() == 1) return int(*separate.begin());
+    if (separate.size() > 1) return 0;
+    // else a fused gate_up: ONE node covers gate and up, so its N is 2*w and the down projection's K is the same 2*w --
+    // the agreeing value is 2*w and the FFN width is half of it
+    std::set<int64_t> fused;
+    for (const int64_t dk : down_k)
+        if (dk % 2 == 0 && gate_n.count(dk)) fused.insert(dk / 2);
+    if (fused.size() != 1) return 0;
+    return int(*fused.begin());
+}
+std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }
+
 // engine#1638: the geometry READ (not just its dims), so a test can assert where each number came from -- the
 // text_config lift and the top-level-wins rule are both properties of load_geometry(), not of read_dims().
 json load_geometry_exported(const std::string& pack_dir, std::string* source) { return load_geometry(pack_dir, source); }
@@ -1802,6 +1965,8 @@ Plan plan(const std::string& pack_dir) {
                 if (w > best) best = int(w);
             }
         }
+        if (best == 0 && geom.contains("hidden_size") && geom["hidden_size"].is_number())
+            best = intermediate_size_from_graph(pack_dir + "/" + gname, geom["hidden_size"].get<int64_t>());
         return best;
     };
     if (!geom.contains("intermediate_size") || geom["intermediate_size"].is_null()) {
@@ -1811,11 +1976,11 @@ Plan plan(const std::string& pack_dir) {
             geom_src += ", intermediate_size from the graph's MLP projection width";
         } else {
             throw std::runtime_error(
-                "the pack states no intermediate_size: " + geom_src +
-                " has none, and the FFN projections are not initializers of " + graph +
-                " (on the hybrid line only the attention/head qweights are in the main graph), so the FFN width "
-                "has to come from the subgraph or from model.pb.bin -- refusing rather than guessing it from the "
-                "other dimensions");
+                "the pack states no intermediate_size: " + geom_src + " has none, and neither the initializers nor "
+                "the MatMulNBits/MatMulNBitsBf node attributes of " + graph + " (including its If branches) hold a "
+                "down/gate_up pair whose K and N agree -- on the hybrid line only the attention/head qweights are in "
+                "the main graph, and the 1.9 external-data genre keeps the FFN in the branch with dims [0] on every "
+                "initializer -- refusing rather than guessing it from the other dimensions");
         }
     }
     p.dims = read_dims(geom, geom_src);

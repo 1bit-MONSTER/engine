@@ -160,7 +160,24 @@ std::string matmulnbits(const std::string& name, const std::vector<std::string>&
     }
     return n;
 }
-std::string model(const std::vector<std::string>& tensors, const std::vector<std::string>& nodes) {
+std::string if_node(const std::string& name, const std::string& in, const std::string& out,
+                     const std::string& branch, const std::string& graph) {
+    std::string n;
+    str(n, 1, in);
+    str(n, 2, out);
+    str(n, 4, "If");
+    std::string a;
+    str(a, 1, branch);
+    tag(a, 6, 2);                                      // AttributeProto.graph = the branch GraphProto
+    varint(a, graph.size());
+    a += graph;
+    tag(n, 5, 2);
+    varint(n, a.size());
+    n += a;
+    return n;
+}
+// A bare GraphProto -- what an `If` branch attribute carries (ModelProto wraps one, a branch is one).
+std::string graph(const std::vector<std::string>& tensors, const std::vector<std::string>& nodes) {
     std::string g;
     for (const auto& n : nodes) {
         tag(g, 1, 2);
@@ -173,6 +190,10 @@ std::string model(const std::vector<std::string>& tensors, const std::vector<std
         varint(g, t.size());
         g += t;
     }
+    return g;
+}
+std::string model(const std::vector<std::string>& tensors, const std::vector<std::string>& nodes) {
+    const std::string g = graph(tensors, nodes);
     std::string m;
     ints(m, 1, 8);                                     // ir_version
     tag(m, 7, 2);                                      // graph
@@ -2642,6 +2663,189 @@ void test_model_config_geometry(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// The 1.9 external-data packs state the FFN width in no file and in no initializer dim (dims are `[0]`, the bytes
+// live in a *.qweight.packed sibling), so plan()'s initializer heuristic sees nothing. The NODE carries K and N,
+// and the decoder sits in an `If` branch. Measured on amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu: hidden 2560,
+// 42 activations each feeding two (N=10240,K=2560) gate/up projections and 42 down projections (N=2560,K=10240).
+void test_im_from_node_attrs(const std::string& root) {
+    const fs::path dir = fs::path(root) / "imattrs";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto mm_named = [](const std::string& weight, const std::string& in, int64_t K, int64_t N) {
+        return pb::matmulnbits(weight, {in, weight, weight + ".scales", weight + ".zeros"}, K, N, 4, 32);
+    };
+    auto mm = [&](const std::string& n, int64_t K, int64_t N) { return mm_named(n, "x", K, N); };
+    const std::string mlp = "model.layers.0.mlp.";
+    // the branch: gate and up (K = hidden, N = IM) reading ONE activation, down (K = IM, N = hidden), a "mobius" width,
+    // and lm_head -- the e4b shape, with the role names the genre carries
+    const std::string branch = pb::graph(
+        {}, {mm_named(mlp + "gate_proj.MatMulNBits.qweight", "h", 2560, 10240),
+             mm_named(mlp + "up_proj.MatMulNBits.qweight", "h", 2560, 10240),
+             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 10240, 2560),
+             mm_named("model.layers.0.mobius.MatMulNBits.qweight", "m", 2560, 2048),
+             mm_named("lm_head.MatMulNBits.qweight", "l", 2560, 262144)});
+    put_file((dir / "model.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", branch)}));
+    const int im = pi::intermediate_size_from_graph((dir / "model.onnx").string(), 2560);
+    std::printf("im-from-node-attrs: derived %d from the If branch's gate/up and down pair (hidden 2560)\n", im);
+    check(im == 10240, "im-from-node-attrs: the FFN pair inside the If branch gives 10240 (" + std::to_string(im) + ")");
+
+    // The review's case (#1657): attention forms the same (N == other's K, K == hidden) shape. With q_dim 4096 > hidden
+    // 2560, a bare "pair that agrees" returns 4096 as the FFN width while the true value is 9728 (fused gate_up N=19456,
+    // down K=19456). Attention must not be able to answer, and the fused pair must.
+    const std::string attn = "model.layers.0.attn.";
+    const std::string wider = pb::graph(
+        {}, {mm_named(attn + "q_proj.MatMulNBits.qweight", "h", 2560, 4096),
+             mm_named(attn + "o_proj.MatMulNBits.qweight", "q", 4096, 2560),
+             mm_named(attn + "k_proj.MatMulNBits.qweight", "h", 2560, 2048),
+             mm_named(attn + "v_proj.MatMulNBits.qweight", "h", 2560, 2048),
+             mm_named(mlp + "gate_up_proj.MatMulNBits.qweight", "h", 2560, 19456),
+             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 19456, 2560)});
+    put_file((dir / "model2.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", wider)}));
+    const int im2 = pi::intermediate_size_from_graph((dir / "model2.onnx").string(), 2560);
+    std::printf("im-from-node-attrs: q_dim 4096 > hidden 2560, fused gate_up -> %d (must not be 4096)\n", im2);
+    check(im2 == 9728, "im-from-node-attrs: wider attention does not become the FFN width; the fused pair gives 9728 (" +
+                           std::to_string(im2) + ")");
+
+    // Attention only, wider than hidden, no FFN at all: 0, never q_dim.
+    const std::string attnonly = pb::graph(
+        {}, {mm_named(attn + "q_proj.MatMulNBits.qweight", "h", 2560, 4096),
+             mm_named(attn + "o_proj.MatMulNBits.qweight", "q", 4096, 2560)});
+    put_file((dir / "model3.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", attnonly)}));
+    check(pi::intermediate_size_from_graph((dir / "model3.onnx").string(), 2560) == 0,
+          "im-from-node-attrs: an attention-only graph wider than hidden yields 0, not the attention width");
+
+    // Two widths that both pair up is a derivation that can be wrong in two ways: refused, not picked from.
+    const std::string ambiguous = pb::graph(
+        {}, {mm_named(mlp + "gate_proj.MatMulNBits.qweight", "h", 2560, 10240),
+             mm_named(mlp + "up_proj.MatMulNBits.qweight", "h", 2560, 10240),
+             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 10240, 2560),
+             mm_named("model.layers.1.mlp.gate_proj.MatMulNBits.qweight", "h2", 2560, 4096),
+             mm_named("model.layers.1.mlp.up_proj.MatMulNBits.qweight", "h2", 2560, 4096),
+             mm_named("model.layers.1.mlp.down_proj.MatMulNBits.qweight", "a2", 4096, 2560)});
+    put_file((dir / "model4.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", ambiguous)}));
+    check(pi::intermediate_size_from_graph((dir / "model4.onnx").string(), 2560) == 0,
+          "im-from-node-attrs: two agreeing widths are refused rather than picked from");
+
+    // An FFN with no down projection at all (attention-only graphs, the hybrid line's main graph) is 0, not a guess.
+    const std::string noffn = pb::graph({}, {mm_named(attn + "q_proj.MatMulNBits.qweight", "h", 2560, 256),
+                                             mm_named(attn + "o_proj.MatMulNBits.qweight", "q", 256, 2560)});
+    put_file((dir / "model5.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", noffn)}));
+    check(pi::intermediate_size_from_graph((dir / "model5.onnx").string(), 2560) == 0,
+          "im-from-node-attrs: a graph with no FFN pair yields 0 (the caller keeps refusing)");
+    fs::remove_all(dir);
+}
+
+
+// A multi-component pack (`type: compositemodel`) keeps its decoder graph AND its Token .fconst in the component
+// `genai_config.json` names, while the files that state the geometry stay at the pack root. Pointing npu-pack at the
+// root used to report "the pack carries no Token .fconst either" for a pack that has one two directories down (#1657).
+// Measured on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: root has config/model_config/genai_config.json,
+// decoder/ has model.onnx, model.bin, model.onnx.data and dd_metastate_Llm_Token_….fconst (1.34 GiB).
+void test_fconst_in_component(const std::string& root) {
+    const fs::path dir = fs::path(root) / "compfconst";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "decoder");
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"type":"gemma4","decoder":{"filename":"decoder/model.onnx","hidden_size":1536}}})");
+    put_file((dir / "decoder" / "model.onnx").string(), pb::model({}, {}));
+    put_file((dir / "decoder" / "dd_metastate_Llm_Token_aie2_token_decoder.fconst").string(), std::string(64, '\x11'));
+    const std::string found = pi::find_token_fconst_exported(dir.string());
+    std::printf("component fconst: found %s\n", found.empty() ? "(nothing)" : found.c_str());
+    check(!found.empty() && found.find("decoder") != std::string::npos,
+          "component fconst: the Token .fconst is found where genai_config.json says the decoder is (" + found + ")");
+    // a flat pack is unchanged: the same filename at the root still wins
+    const fs::path flat = fs::path(root) / "flatfconst";
+    fs::remove_all(flat);
+    fs::create_directories(flat);
+    put_file((flat / "dd_metastate_Llm_Token_Token_layer0.fconst").string(), std::string(64, '\x22'));
+    const std::string flat_found = pi::find_token_fconst_exported(flat.string());
+    check(!flat_found.empty() && flat_found.find("Token_Token_") != std::string::npos,
+          "component fconst: a flat pack's root fconst is still found first (" + flat_found + ")");
+    fs::remove_all(dir);
+    fs::remove_all(flat);
+}
+
+
+// A multi-component pack names its embedding component in genai_config.json (`model.embedding.filename =
+// "embedding/model.onnx"`) and keeps the external data beside it, while a single-graph pack uses the flat
+// `embedding.onnx` this reader was written for. Measured on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: the component
+// is `embedding/model.onnx` + `embedding/model.onnx.data` (10.26 GiB), and the reader reported "no embedding.onnx".
+void test_embedding_in_component(const std::string& root) {
+    const fs::path dir = fs::path(root) / "embedcomp2";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "embedding");
+    const int64_t V = 8, H = 256, groups = H / 128;
+    std::vector<uint8_t> table(size_t(V) * size_t(H / 2), 0);
+    std::vector<float> scales(size_t(V) * size_t(groups), 0.5f);
+    for (size_t i = 0; i < table.size(); ++i) table[i] = uint8_t(i * 13 % 256);
+    std::string data;
+    data.append(reinterpret_cast<const char*>(table.data()), table.size());
+    const size_t table_bytes = table.size();
+    data.append(reinterpret_cast<const char*>(scales.data()), scales.size() * sizeof(float));
+    put_file((dir / "embedding" / "model.onnx.data").string(), data);
+    // the location is BARE -- relative to the graph, not to the pack root
+    const auto t = pb::tensor("language_model.embed_tokens.weight_Q4", {V, H / 2}, "model.onnx.data", 0, table_bytes, 2);
+    const auto sc = pb::tensor("language_model.embed_tokens.weight_scales", {V, groups}, "model.onnx.data",
+                               table_bytes, scales.size() * sizeof(float), 1);
+    put_file((dir / "embedding" / "model.onnx").string(), pb::model({t, sc}, {}));
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"type":"gemma4","embedding":{"filename":"embedding/model.onnx"},)"
+             R"("decoder":{"filename":"decoder/model.onnx"}}})");
+    std::string why;
+    const std::vector<float> got = pi::read_embedding_component(dir.string(), &why);
+    std::printf("embedding component (declared): %zu values (why: %s)\n", got.size(), why.c_str());
+    check(got.size() == size_t(V) * size_t(H),
+          "embedding component: the graph genai_config.json names is read, with its data beside it ("
+              + std::to_string(got.size()) + ")");
+    fs::remove_all(dir);
+}
+
+
+// engine#1725: the gemma-4 component is f32 and unquantised -- an `embed_tokens` table with no scales beside it -- and its
+// decoder also needs a PER-LAYER table. Two arms: the f32 token table alone is read, and a per-layer table is refused by
+// name rather than reported as a missing table. Measured sizes on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu:
+// embed_tokens.weight (262144,1536) f32 and embed_tokens_per_layer.weight (262144,8960) f32.
+void test_embedding_f32_component(const std::string& root) {
+    auto build = [&](const fs::path& dir, bool with_per_layer) {
+        fs::remove_all(dir);
+        fs::create_directories(dir / "embedding");
+        const int64_t V = 8, H = 256;
+        std::vector<float> tok(size_t(V) * size_t(H));
+        for (size_t i = 0; i < tok.size(); ++i) tok[i] = float(int(i % 97) - 48) * 0.25f;
+        std::string data(reinterpret_cast<const char*>(tok.data()), tok.size() * sizeof(float));
+        const size_t tok_bytes = data.size();
+        std::vector<std::string> inits{pb::tensor("embedding.embed_tokens.weight", {V, H}, "model.onnx.data", 0,
+                                                  tok_bytes, 1)};
+        if (with_per_layer) {
+            std::vector<float> per(size_t(V) * size_t(320));
+            for (size_t i = 0; i < per.size(); ++i) per[i] = 0.5f;
+            data.append(reinterpret_cast<const char*>(per.data()), per.size() * sizeof(float));
+            inits.push_back(pb::tensor("embedding.embed_tokens_per_layer.weight", {V, 320}, "model.onnx.data", tok_bytes,
+                                       per.size() * sizeof(float), 1));
+        }
+        put_file((dir / "embedding" / "model.onnx.data").string(), data);
+        put_file((dir / "embedding" / "model.onnx").string(), pb::model(inits, {}));
+        put_file((dir / "genai_config.json").string(),
+                 R"({"model":{"type":"gemma4","embedding":{"filename":"embedding/model.onnx"}}})");
+    };
+    const fs::path a = fs::path(root) / "f32emb";
+    build(a, false);
+    std::string why;
+    const std::vector<float> got = pi::read_embedding_component(a.string(), &why);
+    std::printf("f32 embedding: %zu values (why: %s)\n", got.size(), why.c_str());
+    check(got.size() == 8u * 256u, "f32 embedding: an unquantised f32 table is read (" + std::to_string(got.size()) + ")");
+
+    const fs::path b = fs::path(root) / "f32emb_perlayer";
+    build(b, true);
+    std::string why2;
+    const std::vector<float> none = pi::read_embedding_component(b.string(), &why2);
+    std::printf("f32 embedding (per-layer): %zu values, why: %s\n", none.size(), why2.c_str());
+    check(none.empty() && why2.find("per_layer") != std::string::npos,
+          "f32 embedding: a per-layer table is refused by NAME, not reported as a missing table (" + why2 + ")");
+    fs::remove_all(a);
+    fs::remove_all(b);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2678,6 +2882,10 @@ int main(int argc, char** argv) {
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
+        test_im_from_node_attrs(golden_dir.empty() ? "." : golden_dir);
+        test_fconst_in_component(golden_dir.empty() ? "." : golden_dir);
+        test_embedding_in_component(golden_dir.empty() ? "." : golden_dir);
+        test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

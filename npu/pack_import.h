@@ -152,6 +152,17 @@ struct Plan {
 // can name the source; exposed for a unit test that needs no ONNX graph.
 int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg);
 
+// The same value derived from the graph's own node attributes (MatMulNBits/MatMulNBitsBf K and N) when the
+// initializers carry no dims -- the 1.9 external-data genre. Returns 0 when no FFN pair agrees, or when two
+// widths do, so the caller refuses instead of guessing. Exported for the unit test, which needs no pack.
+// Takes a PATH because it parses the graph: it is cheap only because plan() calls it once. If it ever moves into a
+// per-tensor or per-layer path, that parse is paid per call -- keep it to one call per plan.
+int intermediate_size_from_graph(const std::string& model_path, int64_t hidden);
+
+// Where a pack keeps its Token .fconst: the root for a flat pack, the decoder component `genai_config.json` names for a
+// multi-component one (`type: compositemodel`), whose geometry files stay at the root. Exported for the unit test.
+std::string find_token_fconst_exported(const std::string& pack_dir);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);

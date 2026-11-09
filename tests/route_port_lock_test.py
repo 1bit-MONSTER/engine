@@ -95,11 +95,12 @@ class RoutePortLockTest(unittest.TestCase):
         # their port before launching.
         for name in ("pm_route", "print_backend", "smoke_serve"):
             self.assertIn(name, found, f"{name} starts a server; the census must find it")
-        # 9 in a build with no model passed; a model-enabled build configures more (hybrid_e2e,
+        # 5 in a build with no model passed; a model-enabled build configures more (hybrid_e2e,
         # laya_route_e2e, laya_models_e2e, pm_laya_route, hrx_cpu_weight_parity and serve_e2e_<dev>), so the floor is
         # the number the CI build has, not the number a developer's build may have. It counted 15 before engine #1485
-        # moved ten scripts to `serve --port 0`.
-        self.assertGreaterEqual(len(found), 9,
+        # moved fifteen scripts to `serve --port 0`; the rest of the old
+        # list was `bench_selftest` (binds through tools/bench.py, pinned by its own case below).
+        self.assertGreaterEqual(len(found), 5,
                                 "fewer route tests found than the suite has: " + ", ".join(sorted(found)))
 
     def test_indirect_server_tests_hold_the_lock_too(self):

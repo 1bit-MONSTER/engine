@@ -678,6 +678,39 @@ preflight() {
                     { echo "preflight: cannot read the kernel image $vmlinuz (os/mini/mkimage.sh): set VMLINUZ to a readable copy"; bad=1; } ;;
         esac
     done
+    # engine#1504: a self-hosted runner that is dead makes every check that needs this box read as PENDING, never
+    # red (2026-11-08: both dead 3h45m behind 24 jobs), so the state that damages a release most is the one nothing
+    # reports. scripts/check-ci-runners.sh asks the API the release lanes already use; it exits 0 when no runners
+    # are registered, so a fresh box or a fork is unaffected. WEEKLY_SKIP_RUNNER_CHECK=1 releases during an outage.
+    if [ "${WEEKLY_SKIP_RUNNER_CHECK:-0}" != 1 ]; then
+        if runner_out=$("$(cd "$(dirname "$0")" && pwd)/check-ci-runners.sh" \
+                --require strixhalo-engine strixhalo-bench 2>&1); then
+            say "preflight: $runner_out"
+        else
+            printf '%s\n' "$runner_out" | sed 's/^/preflight: /'
+            echo "preflight: a self-hosted runner is not online, so the checks after this release would queue for ever (WEEKLY_SKIP_RUNNER_CHECK=1 to release anyway)"
+            bad=1
+        fi
+    fi
+    # The same fact from the other side: scripts/ci-runner-health.sh reads systemd's view (#1546, merged) and says WHY
+    # a runner is down -- Result=oom-kill, a restart window -- which the API above cannot see, and it fires the moment
+    # a unit dies instead of after the heartbeat timeout. Neither was ever invoked from anywhere until this row, so
+    # running both here is what makes the two halves one check at release time. Its exit 2 means "no such units on this
+    # host", which is a fresh box, not a failure.
+    if [ -x "$(cd "$(dirname "$0")" && pwd)/ci-runner-health.sh" ]; then
+        if health_out=$("$(cd "$(dirname "$0")" && pwd)/ci-runner-health.sh" 2>&1); then
+            printf '%s\n' "$health_out" | grep -c '^PASS' | xargs -r -I{} echo "preflight: runner units: {} PASS in systemd's view"
+        else
+            health_rc=$?
+            if [ "$health_rc" = 2 ]; then
+                say "preflight: no actions.runner.* units on this host: systemd has nothing to inspect"
+            else
+                printf '%s\n' "$health_out" | sed 's/^/preflight: /'
+                echo "preflight: a runner unit is not accepting jobs (scripts/ci-runner-health.sh): $health_rc"
+                bad=1
+            fi
+        fi
+    fi
     return $bad
 }
 preflight || { say "preflight failed: nothing was run"; exit 1; }

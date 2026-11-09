@@ -967,7 +967,11 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     // ~2.3 ms at K=12288 (host bench, `pack_bench`), sitting inside the span the profile column calls `pack`.
     // engine #1416 reads that column as the row quantiser's cost; the quantiser is 0.16-0.79 ms per launch, and this
     // sweep plus the fold below are what the column is actually timing.
-    if (!hadamard_) {
+    // Skipped only where the block below is certain to overwrite it: that requires BOTH the fold and the pb16i
+    // layout. `load_hadamard()` is called from the pb16i branch of the container parser, so in practice the fold
+    // implies the layout -- but the condition names both, because leaving `ascales` at its value-initialised zeros
+    // (a `std::vector<float>(M)` is all zeros) on any other path would change numerics silently rather than fail.
+    if (!(hadamard_ && pb16i_)) {
         for (int m = 0; m < M; m++) {
             const float* row = A + (size_t)m * K;
             float amax = 0.0f;

@@ -32,6 +32,17 @@ instead. It tracks the CMake `if()`/`endif()` nesting around each
 fails a target whose guard CI does not satisfy -- naming the option, which is
 the sentence the ninja error does not give.
 
+**Direction B (engine#1595) is the reverse gap.** `need` is the set of `add_executable` targets that
+some `add_test`'s COMMAND names -- a test whose target CI never builds reports "Not Run" and is a test
+in name only. `have` is the `--target` list above. The difference is a ratchet rather than a wall, because
+35 of them are already there: `tools/ci/add_test_gaps.txt` records today's names, and the check **fails
+when the difference grows**, printing only the new names. A shrinking baseline is progress, not a failure,
+so a rename does not have to be argued with -- a count would pass it.
+
+A script test names its interpreter (`add_test(… COMMAND bash script.sh)`), and `bash` is not an
+`add_executable`, so a self-test runner costs nothing here: that is why the release check's suite can live
+in an `add_test` (engine#1596) without raising the drift it measures.
+
     tools/ci/ci_targets_check.py --check [--root .]
     tools/ci/ci_targets_check.py --self-test
 """
@@ -100,6 +111,73 @@ def ci_targets(ci_text):
             if w in ("-j",) or w.startswith("-") or not w:
                 continue
             names.append(w)
+    return names
+
+
+# `add_executable(name …)` and `add_test(NAME n COMMAND …)`, for direction B (engine#1595).
+ADD_EXE = re.compile(r"^\s*add_executable\s*\(\s*([A-Za-z0-9_.+-]+)", re.IGNORECASE)
+ADD_TEST = re.compile(r"^\s*add_test\s*\(\s*NAME\s+([A-Za-z0-9_.+-]+)\s+COMMAND\s+(.*)$", re.IGNORECASE)
+BASELINE = "tools/ci/add_test_gaps.txt"
+
+
+def add_test_blocks(cmake_text):
+    """Every `add_test( … )` directive, paren-joined across lines: (line number, text).
+
+    The real tree writes 39 of them across lines, so a line-at-a-time scan misses them - and a missed
+    add_test is a missed gap, which for a ratchet means silence rather than a wrong red.
+    """
+    blocks, buf, start = [], "", None
+    for i, raw in enumerate(cmake_text.splitlines(), 1):
+        line = raw.strip()
+        if buf:
+            buf += " " + line
+            if buf.count("(") <= buf.count(")"):
+                blocks.append((start, buf))
+                buf, start = "", None
+            continue
+        if re.match(r"^add_test\s*\(", line, re.IGNORECASE):
+            if line.count("(") > line.count(")"):
+                buf, start = line, i
+            else:
+                blocks.append((i, line))
+    return blocks
+
+
+def add_test_need(cmake_text):
+    """{target: [test names]} for every add_executable that some add_test's COMMAND names.
+
+    Direction B, engine#1595. A target is named two ways in this tree - bare, as `COMMAND plain_test`,
+    and through a generator expression, as `$<TARGET_FILE:plain_test>` - so both count. A script test
+    names its interpreter (`COMMAND bash script.sh`), which is not an add_executable, and that is why a
+    self-test runner costs nothing here (engine#1596).
+    """
+    exes = set()
+    for line in cmake_text.splitlines():
+        m = ADD_EXE.match(line)
+        if m:
+            exes.add(m.group(1))
+    need = {}
+    for lineno, block in add_test_blocks(cmake_text):
+        m = re.search(r"\bNAME\s+([A-Za-z0-9_.+-]+)", block)
+        test_name = m.group(1) if m else f"line {lineno}"
+        named = set(re.findall(r"\$<TARGET_FILE:([A-Za-z0-9_.+-]+)>", block))
+        for tok in re.split(r"[\s()]+", block):
+            if tok in exes:
+                named.add(tok)
+        for target in sorted(named & exes):
+            need.setdefault(target, []).append(test_name)
+    return need
+
+
+def read_baseline(path):
+    """The names already known to drift, or None when there is no baseline file (which fails closed)."""
+    if not os.path.isfile(path):
+        return None
+    names = set()
+    for line in open(path, encoding="utf-8"):
+        name = line.split("#", 1)[0].strip()
+        if name:
+            names.add(name)
     return names
 
 
@@ -246,6 +324,31 @@ def check(root):
     if bad:
         return 1
     print(f"ci_targets_check: all {len(names)} target(s) ci.yml builds exist in the configuration it creates")
+
+    # ── direction B (engine#1595): a test whose target CI never builds reports "Not Run" ──────────────
+    need = add_test_need(cmake_text)
+    drift = set(need) - set(names)
+    baseline = read_baseline(os.path.join(root, BASELINE))
+    if baseline is None:
+        # No baseline is not "nothing known": treating it as empty would let the first run of a run
+        # without the file fail on 35 names a reader could not tell from regressions. Fail closed at 35.
+        print(f"ci_targets_check: no {BASELINE}, so the {len(drift)} target(s) whose tests CI never builds "
+              f"cannot be told apart from new ones", file=sys.stderr)
+        return 1
+    new = sorted(drift - baseline)
+    for name in new:
+        print(f"ci_targets_check: add_test names '{name}', and ci.yml never builds it -- that test reports "
+              f"'Not Run' ({', '.join(sorted(set(need[name])))}); build it or drop the test")
+    if new:
+        return 1
+    # A baseline entry that no longer drifts is progress; say so rather than staying silent, so the
+    # file can be shrunk by whoever reads the line.
+    fixed = sorted(baseline - drift)
+    if fixed:
+        print(f"ci_targets_check: {len(fixed)} baseline entr(y/ies) no longer drift ({', '.join(fixed[:6])}"
+              f"{', …' if len(fixed) > 6 else ''}) - drop them from {BASELINE} to keep it honest")
+    print(f"ci_targets_check: {len(drift)} target(s) with a test ci.yml never builds "
+          f"(baseline {len(baseline)}), and none new")
     return 0
 
 
@@ -273,12 +376,21 @@ def self_test():
     import tempfile
     fails = 0
 
-    def case(what, ci, cmake, want):
+    def case(what, ci, cmake, want, baseline="auto"):
         nonlocal fails
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, ".github", "workflows"))
             open(os.path.join(d, CI), "w", encoding="utf-8").write(ci)
             open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(cmake)
+            if baseline == "auto":
+                # The direction-A fixtures below are not about direction B, so the baseline records
+                # whatever they drift - a direction-B case must then say what its baseline is.
+                drift = sorted(set(add_test_need(cmake)) - set(ci_targets(ci)))
+                baseline = "".join(n + "\n" for n in drift)
+            if baseline is not None:
+                bpath = os.path.join(d, BASELINE)
+                os.makedirs(os.path.dirname(bpath), exist_ok=True)
+                open(bpath, "w", encoding="utf-8").write(baseline)
             got = check(d)
         ok = got == want
         print(f"  {'ok  ' if ok else 'FAIL'}  {what}  (rc {got}, wanted {want})")
@@ -313,6 +425,28 @@ def self_test():
     # Unrelated guards must not fail a tree.
     case("a target under a non-option guard is left alone",
          SELF_CI, SELF_CMAKE.replace("if(ONEBIT_NPU)", "if(NOT WIN32)"), 0)
+    # ── direction B (engine#1595): a test whose target CI never builds ─────────────────────────────────
+    # hidden_test is direction A's subject, so these fixtures drop it; `unbuilt_test` is direction B's.
+    # The case that says the fixture really drifts is the second one - the same tree with an empty
+    # baseline must fail - otherwise "passes when the baseline records it" could be passing on nothing.
+    B_CI = SELF_CI.replace("hidden_test ", "")
+    B_CMAKE = SELF_CMAKE + """
+add_executable(unbuilt_test unbuilt.cpp)
+add_test(NAME unbuilt_suite COMMAND unbuilt_test)
+"""
+    case("a test whose target ci.yml never builds passes when the baseline records it",
+         B_CI, B_CMAKE, 0, baseline="unbuilt_test\n")
+    case("the same tree with an empty baseline fails, naming the target it never builds",
+         B_CI, B_CMAKE, 1, baseline="")
+    case("a missing baseline fails closed rather than passing vacuously",
+         B_CI, B_CMAKE, 1, baseline=None)
+    case("a baseline entry that no longer drifts is progress, not a failure",
+         B_CI.replace("--target onebit", "--target onebit unbuilt_test"), B_CMAKE, 0,
+         baseline="unbuilt_test\n")
+    # engine#1596's shape: a script test names `bash`, which is not an add_executable, so it adds nothing.
+    case("a script test (COMMAND bash …) adds nothing to the drift",
+         B_CI, SELF_CMAKE + "add_test(NAME script_suite COMMAND bash ${CMAKE_SOURCE_DIR}/x.sh --self-test)\n",
+         0, baseline="")
     # And the clean case.
     case("a plain target list passes",
          SELF_CI.replace("hidden_test ", ""), SELF_CMAKE, 0)

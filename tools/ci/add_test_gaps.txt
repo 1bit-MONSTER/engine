@@ -1,0 +1,53 @@
+# Targets whose add_test() names them and which ci.yml's --target list never builds (engine#1595).
+#
+# These tests report "Not Run" in CI today: ci.yml's own comment says a test whose binary is missing is
+# reported that way, and the job stays green. That is the defect this file ratchets rather than gates.
+#
+# The check FAILS when this set GROWS - a new name here is a change that broke something, and it is
+# named in the output. A name that DISAPPEARS is progress and is reported as such, so this file can be
+# deleted a line at a time. It is a SET, not a count, because a count passes a rename (#1595).
+#
+# How a target counts as named, which is where the number comes from: a bare token in the COMMAND
+# (`COMMAND plain_test`) OR a generator expression (`$<TARGET_FILE:plain_test>`). Both mean the test
+# cannot run unless CI builds the target. By the bare-token rule alone the numbers are need=62, drift=35
+# (the figure in #1595); adding the generator expressions gives need=64, drift=36, the two extra being
+# npu_derive_designs_dump (a real gap the bare rule missed) and onebit (which ci.yml does build).
+#
+# Script tests (COMMAND sh/bash/python3 ...) are not here on purpose: they need no build, so they are not
+# in `need` at all. That is also why a self-test runner can live in an add_test for free (engine#1596).
+attn_math_test
+decision_test
+embed_model_test
+embed_wordpiece_test
+gdn_batch_order_test
+hadamard_rotate_test
+hf_tokenizer_test
+host_gemm_pad_test
+laya_classify_eval
+laya_eval_test
+laya_gate
+laya_models_test
+mtp_batch_all_test
+mtp_draft_test
+npu_dequant_bf16_test
+npu_derive_designs_dump
+npu_kv_int8_test
+npu_load_retry_test
+npu_moe_test
+npu_plan_op_reference_test
+npu_plan_test
+npu_prompt_ids_test
+npu_queue_test
+npu_rmsnorm_offset_test
+npu_rope_llama3_test
+npu_rt_shim_test
+npu_stop_tokens_test
+npu_target_caps_test
+q4nx_layer_kinds_test
+q4nx_mrope_test
+q4nx_state_planes_test
+quant_i8_row_test
+route_log_test
+serve_watchdog_test
+systemone_route_test
+systemone_test

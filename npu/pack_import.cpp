@@ -144,6 +144,11 @@ struct OnnxModel {
     // Node inputs that name a `*.qweight.empty` placeholder whose `*.qweight.packed` sibling carries the bytes
     // (resolved below). Counted so `info` can say "the weights are here, behind a placeholder" instead of "none".
     int64_t packed_siblings = 0;
+    // Matmuls whose `*.empty` placeholder AND its `*.packed` sibling both carry no bytes (engine#1671). Whether that is
+    // a fault depends on the pack: a 1.9 fconst pack spells every graph initializer this way and its weights are in the
+    // .fconst, so plan() drops them; with no .fconst there is no other source and plan() refuses by name (#1687).
+    int64_t weightless_matmuls = 0;
+    std::string weightless_example;   // the first one, for the refusal's text
 };
 
 void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
@@ -256,35 +261,52 @@ OnnxModel parse_onnx(const std::string& path) {
             if (d != 0) return false;
         return true;
     };
+    // A matmul whose placeholder and whose `*.packed` sibling BOTH carry no bytes has no weight in this graph at all,
+    // and it is DROPPED rather than left pointing at the placeholder. Leaving it was engine#1671: a 1.9 fconst pack
+    // declares 592 `[0]`-dim initializers (its 363 `.empty` AND their 363 `.packed` siblings are placeholders; the
+    // weights are in the Token .fconst), so the node kept naming `...qweight.empty`, the reader called bytes_of() on it
+    // and threw `model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty: no data` -- which broke `npu-pack import` for
+    // every 1.9 pack. Dropping them is also what tells the rest of the importer the truth about this pack: with no
+    // readable graph head, `matmuls` is empty and the head is read from the .fconst tail, which is where it is.
+    std::vector<OnnxMatMul> kept;
+    kept.reserve(m.matmuls.size());
     for (auto& mm : m.matmuls) {
-        if (mm.weight.empty()) continue;
+        if (mm.weight.empty()) { kept.push_back(mm); continue; }
         const OnnxTensor* w = find_init(mm.weight);
         if (w && !no_bytes(*w)) {
             mm.weight = w->name;   // the initializer's own spelling, so every later lookup is exact
+            kept.push_back(mm);
             continue;
         }
-        if (!w) continue;          // names nothing this graph declares: not this genre's business
+        if (!w) { kept.push_back(mm); continue; }   // names nothing this graph declares: not this genre's business
         std::string packed = w->name;
         if (packed.size() >= 6 && packed.compare(packed.size() - 6, 6, ".empty") == 0)
             packed.replace(packed.size() - 6, 6, ".packed");
-        else
-            continue;
+        else { kept.push_back(mm); continue; }
         const OnnxTensor* pw = find_init(packed);
-        if (!pw) continue;         // no sibling at all: not this genre's pack, leave it to the reader below
+        // No sibling at all: not this genre's pack. Keep the node exactly as it was -- it still names its `*.empty`
+        // initializer and the reader below decides what that means. Dropping it here would be a decision made by an
+        // absence: `onnx.matmuls.empty()` is what tells plan() "this is a 1.9 fconst pack, take the head from the tail"
+        // (:1685), so a truncated pack with real graph matmuls and no `.packed` siblings would silently get a head
+        // from the tail instead of the refusal #1687 asks for (engine#1690 review).
+        if (!pw) { kept.push_back(mm); continue; }
         if (no_bytes(*pw)) {
-            // engine#1671: the sibling exists and is ITSELF a zero-length placeholder (measured on
-            // Qwen2.5-0.5B-Instruct rai_1.9.0 -- dims [0], no external-data location, offset 0, length 0, for all 241
-            // of its MatMulNBits). So the weights are genuinely absent from the pack's external data, and the honest
-            // answer is a refusal that says that. Deferring it produced `...qweight.empty: no data` from a lookup much
-            // later, which names the placeholder rather than the problem and reads as a tile-layout fault.
-            throw std::runtime_error(
-                "the pack names " + w->name + ", and its " + packed + " sibling exists but carries no data either "
-                "(no external-data location, dims all zero): these weights are genuinely absent from the pack's "
-                "external data, so this pack cannot be imported -- not a tile-layout or block-size problem");
+            // The sibling exists and is ITSELF a zero-length placeholder. Whether that is a fault depends on something
+            // this walker cannot see: on a Ryzen AI 1.9 fconst pack EVERY graph initializer is spelled this way (363
+            // `.empty` and 363 `.packed`, all dims [0]) because the weights are in the Token .fconst, so dropping the
+            // node is right and the import succeeds from the fconst. On a pack with no .fconst there is nothing to fall
+            // back to, and refusing by name (#1687's rule) is the honest answer. So the walker records it and plan(),
+            // which knows whether an .fconst is there, decides. Deferring it silently produced
+            // `...qweight.empty: no data` from a lookup much later, naming the placeholder rather than the problem.
+            ++m.weightless_matmuls;
+            m.weightless_example = w->name + " (its " + packed + " sibling carries no data either)";
+            continue;
         }
         mm.weight = pw->name;
         ++m.packed_siblings;
+        kept.push_back(mm);
     }
+    m.matmuls = std::move(kept);
     return m;
 }
 
@@ -1528,6 +1550,10 @@ std::string Plan::manifest() const {
         // following the node inputs alone reports zero real weights for a 9.7 GB pack (measured: phi-4, engine#1503).
         g["ryzenai_matmuls_ops"] = graph_ryzenai_matmuls;
         g["packed_weight_siblings"] = graph_packed_siblings;
+        // Matmuls dropped because neither their `*.empty` placeholder nor its `*.packed` sibling carried any bytes
+        // (engine#1671). Reported so a test can pin the drop without needing a 1.9 pack, and so `info` says how many
+        // graph weights this pack does not keep in its graph.
+        g["weightless_matmuls"] = graph_weightless_matmuls;
         if (graph_stride_of > 0)
             g["external_row_stride"] = {{"matched", graph_stride_ok}, {"of", graph_stride_of},
                                         {"rule", "length == N * (K/128 + 1) * 68"}};
@@ -1649,6 +1675,7 @@ Plan plan(const std::string& pack_dir) {
         }
         p.graph_ryzenai_matmuls = onnx.ryzenai_matmuls;
         p.graph_packed_siblings = onnx.packed_siblings;
+        p.graph_weightless_matmuls = onnx.weightless_matmuls;
         for (const auto& t : onnx.tensors)
             if (!t.location.empty()) p.graph_external++;
         if (!ext_file.empty()) {
@@ -1661,6 +1688,16 @@ Plan plan(const std::string& pack_dir) {
     // pack keeps no weights there -- which for the rai_1.3/1.6/1.7.1 line is the normal case, not a fault.
     std::string tok_why;
     std::string tok_path = materialise_token_fconst(pack_dir, p.dims);
+    // engine#1671 / #1687: a pack whose graph names `*.qweight.empty` placeholders whose `*.packed` siblings carry no
+    // data has no weight for those ops IN THE GRAPH. With a Token .fconst that is the normal shape of a 1.9 pack -- its
+    // graph is all placeholders and the weights are in the .fconst -- so the walker drops them and the import proceeds.
+    // With no .fconst there is nothing to fall back to, and the honest answer is #1687's refusal, by name.
+    if (tok_path.empty() && onnx.weightless_matmuls > 0)
+        throw std::runtime_error(
+            pack_dir + ": " + onnx.weightless_example +
+            ", and the pack carries no Token .fconst either (no dd_metastate_Llm_Token_*.fconst): these weights are "
+            "genuinely absent from the pack's external data, so this pack cannot be imported -- not a tile-layout or "
+            "block-size problem");
     const bool no_fconst = tok_path.empty();
     // The 1.9 external-data genre (phi-4: 201 `MatMulNBitsBf` ops whose bytes are `*.qweight.packed` siblings in
     // `eager-mm.onnx.data`) must NOT ride the graph-weights path below, which was written for the 1.3/1.6/1.7.1 line's

@@ -83,6 +83,53 @@ case "$ourticket" in
     *) echo "FAIL sanity: read ticket '$ourticket'"; fails=$((fails + 1)) ;;
 esac
 
-[ "$fails" = 0 ] && { echo "PASS gpu-hold: a removed ticket exits 75 in ${elapsed}s, naming $ourticket"; exit 0; }
+# Second arm (engine #1635 point 2): a REAL reaper, not a hand deletion. Our ticket is rewritten to carry a dead pid,
+# the way a wrapper's pid can outlive its usefulness; another gpu-hold then drops it as stale. The victim must (a) exit
+# fast as before and (b) quote the note the reaper left, so the log says WHY the position vanished.
+queue2=$work/queue2
+token2=$work/token2
+mkdir -p "$queue2"
+# sorts AFTER the victim ticket: oldest_ticket() returns at the first NON-stale ticket, so a live ticket
+# ahead of the victim would hide it from the reaper (found the hard way - the first draft hung here).
+printf 'pid=%s\nlabel=other\n' $$ > "$queue2/99999999999999999999.other"
+printf 'gpu-hold other pid %s now\n' $$ > "$token2"
+: > "$work/log2"
+GPU_HOLD_POLL=1 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_COOLDOWN=0 GPU_HOLD_TCTL_START=0 \
+GPU_HOLD_IGNORE_THERMAL_HOLD=1 GPU_TOKEN_FILE=$token2 \
+    "$hold" -q "$queue2" -w 300 -t 0.05 -l victim true >> "$work/log2" 2>&1 &
+vpid=$!
+for _ in $(seq 1 50); do
+    grep -q "queued 'victim'" "$work/log2" 2> /dev/null && break
+    sleep 0.2
+done
+vticket=$(ls "$queue2" | grep '\.victim$' | head -n 1)
+if [ -z "$vticket" ]; then
+    echo "skip: victim never queued"; kill "$vpid" 2> /dev/null; exit 77
+fi
+# a pid that cannot be alive: 4194304 is above the default pid_max range in practice, and kill -0 must fail
+printf 'pid=4194304\nlabel=victim\n' > "$queue2/$vticket"
+start2=$(date +%s)
+GPU_HOLD_POLL=1 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_COOLDOWN=0 GPU_HOLD_TCTL_START=0 \
+GPU_HOLD_IGNORE_THERMAL_HOLD=1 GPU_TOKEN_FILE=$token2 \
+    "$hold" -q "$queue2" -w 20 -t 0.05 -l reaper true >> "$work/log2" 2>&1 &
+rpid=$!
+for _ in $(seq 1 100); do
+    kill -0 "$vpid" 2> /dev/null || break
+    sleep 0.1
+done
+elapsed2=$(( $(date +%s) - start2 ))
+kill "$rpid" 2> /dev/null
+wait "$vpid" 2> /dev/null
+rc2=$?
+[ -f "$queue2/.reaped" ] || { echo "FAIL the reaper left no .reaped note"; fails=$((fails + 1)); }
+case $(cat "$work/log2") in
+    *"[$vticket:"*"dropped by pid"*) ;;
+    *"$vticket: owner pid"*) ;;
+    *) echo "FAIL the victim does not quote the reaper's note:"; sed 's/^/    /' "$work/log2"; fails=$((fails + 1)) ;;
+esac
+[ "$elapsed2" -le 15 ] || { echo "FAIL the reaped arm took ${elapsed2}s"; fails=$((fails + 1)); }
+[ "$rc2" = 75 ] || { echo "FAIL the reaped arm exited $rc2, expected 75"; fails=$((fails + 1)); }
+
+[ "$fails" = 0 ] && { echo "PASS gpu-hold: a removed ticket exits 75 in ${elapsed}s naming $ourticket; a reaped one exits 75 in ${elapsed2}s quoting the reaper"; exit 0; }
 echo "FAIL gpu-hold ticket-loss: $fails case(s)"
 exit 1

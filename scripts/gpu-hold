@@ -158,6 +158,12 @@ oldest_ticket() {
     for f in $(ls -1 "$QUEUE" 2> /dev/null | grep -v '^\.' | sort); do
         [ -f "$QUEUE/$f" ] || continue
         if stale "$QUEUE/$f"; then
+            # engine #1635: the owner of this ticket is still polling, so dropping it silently left it waiting for a
+            # queue position that no longer existed. Leave a note in the queue directory (dotfiles are never treated
+            # as tickets) so the victim can say WHY its ticket vanished, not only that it did.
+            pid=$(pid_of "$QUEUE/$f")
+            printf '%s dropped %s: owner pid %s is gone (dropped by pid %s)\n' \
+                "$(date -Is)" "$f" "${pid:-unknown}" "$$" >> "$QUEUE/.reaped" 2> /dev/null
             rm -f "$QUEUE/$f"
             log "dropped stale ticket $f (owner pid gone)"
             continue
@@ -193,7 +199,8 @@ while [ "$state" = queued ]; do
         # can then never come true, and the wait would run to -w (5400 s by default) looking exactly like "queued
         # behind a busy box". Fail in this poll instead, and name what went missing. state=done first so the
         # release() trap does not touch a token this process never took.
-        log "::error::my ticket $TICKET_NAME is gone from $QUEUE after ${waited}s (token: $(cat "$TOKEN" 2> /dev/null || echo free)) - it was reaped or removed, so this queue position no longer exists; not waiting ${WAIT}s for it"
+        why=$(grep -F " $TICKET_NAME:" "$QUEUE/.reaped" 2> /dev/null | tail -n 1)
+        log "::error::my ticket $TICKET_NAME is gone from $QUEUE after ${waited}s (token: $(cat "$TOKEN" 2> /dev/null || echo free)) - it was reaped or removed, so this queue position no longer exists; not waiting ${WAIT}s for it${why:+ [$why]}"
         state=done
         exit 75
     fi

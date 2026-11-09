@@ -706,6 +706,22 @@ Use the right instrument for each question — three are needed and the histogra
 
 And when a fallback is suspected but all three say nothing, the cost still shows up in the **timing** — against a control arm in the same window.
 
+**3b. When the run *aborts*, the instruments have to be on before it does.** The sampler guard ends the process
+(`GGML_ABORT("HRX: NaN logits")`, `common/sampling.cpp`), so the log's last lines are the only evidence there will be — a rep
+run without the switches answers nothing and costs the same ticket. Two things worth having on for any long-context or
+suspected-numerics run:
+
+- `GGML_HRX_LOG_DISPATCH=1` in the *failing* arm, not a separate clean one: the registration list is per process.
+- `GGML_HRX_DISABLE_DISPATCH` as a **bisect**, which the examples above use but never state as a method: it takes a
+  comma-separated list of **substrings** of registration names (`dispatch-registry.cpp`), so `fused` skips every fused
+  registration and `qsa` every QSA one. Disable one family, re-run the same rep, and if the symptom goes the family is
+  implicated — that is the cheapest narrowing available without a device debugger, and it needs the *same* rep each time
+  (see 4 below: two windows are not a comparison).
+
+So the rule is: a failure report without the histogram and without one disable bisect says *that* something is wrong, not
+*where* — and the second question is the one the next run has to be built to answer.
+
+
 **4. Two windows are not a comparison.** The same unchanged file measured `211.16 / 47.14 / 4.26 tok/s` (pp512 / pp4096 / tg128) in one hour and
 `108.07 / 92.28 / 12.20` in another — **2-2.9x apart, with sd 71 % on decode**. Rows may only be compared inside **one ticket**, with the guardrail's GTT
 figure recorded at **each arm** and an unchanged-file control in the same window; otherwise the report is of the window, not of the file.

@@ -30,7 +30,10 @@ set(ONEBIT_EP_NPU_COMMON_SRC
     # I8Ctx::args_fit_elf() (#869) calls q4nx_elf_arg_sizes(), implemented here; the declaration is in
     # npu/forward/include, the definition is not. Without this line the leg links with an undefined
     # symbol, which is how #874's second half stayed green in CI.
-    ${CMAKE_CURRENT_LIST_DIR}/../../npu/forward/src/q4nx_pack.c)
+    ${CMAKE_CURRENT_LIST_DIR}/../../npu/forward/src/q4nx_pack.c
+    # q4nx_pack.c's fused q4_1 tile->int8 packer (engine #1416) decodes each tile with
+    # q4nx_dequant_tensor_chunked(), defined here: without it the leg links with an undefined symbol.
+    ${CMAKE_CURRENT_LIST_DIR}/../../npu/forward/src/q4nx_dequant.c)
 
 # Include dirs and defines that both configurations share. ONEBIT_NPU_RUNTIME_OWN is what npu/rt.h
 # requires before it will alias npu_rt_api as xrt::.

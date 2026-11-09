@@ -590,6 +590,57 @@ void test_crafted_refusals(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// engine#1671, device-free arm for the plan() head gate: a graph whose FIRST MatMulNBits is a projection and whose head comes
+// later must report `lm_head.weight` as the head's shape, not the projection's. Revert the gate and this fails.
+void test_1671_plan_head_arm(const std::string& root) {
+    const fs::path base = fs::path(root) / "plan-head-1671";
+    const auto pack = [&](const std::string& tag) {
+        const fs::path dir = base / tag;
+        fs::remove_all(dir);
+        fs::create_directories(dir / "cache");
+        put_file((dir / "config.json").string(),
+                 R"({"model_type":"qwen2","hidden_size":16,"intermediate_size":32,"num_hidden_layers":1,)"
+                 R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":64,)"
+                 R"("rope_theta":10000.0,"tie_word_embeddings":false})");
+        put_file((dir / "model.onnx.data").string(), std::string(4096, '\x11'));
+        return dir;
+    };
+    // 2. The FIRST MatMulNBits is a projection and the head comes later. plan() took the first node as the head, so it
+    // reported the projection's geometry as lm_head.weight; the head is the node whose N == vocab and K == hidden.
+    {
+        const fs::path dir = pack("head-not-first");
+        put_file((dir / "model.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {64, 16}, "model.onnx.data", 0, 4096),
+                            pb::tensor("proj_qweight", {}, "model.onnx.data", 3840, 16),
+                            pb::tensor("proj_scales", {}, "model.onnx.data", 3856, 16),
+                            pb::tensor("proj_zeros", {}, "model.onnx.data", 3872, 8),
+                            pb::tensor("head_qweight", {}, "model.onnx.data", 3880, 32),
+                            pb::tensor("head_scales", {}, "model.onnx.data", 3912, 16),
+                            pb::tensor("head_zeros", {}, "model.onnx.data", 3928, 8)},
+                           {pb::matmulnbits("proj", {"x", "proj_qweight", "proj_scales", "proj_zeros"}, 16, 32, 4, 8),
+                            pb::matmulnbits("head", {"x", "head_qweight", "head_scales", "head_zeros"}, 16, 64, 4, 8)}));
+        const pi::Plan p = pi::plan(dir.string());
+        std::vector<int64_t> head;
+        int heads = 0;
+        for (const auto& t : p.tensors)
+            if (t.name == "lm_head.weight") {
+                head = t.shape;
+                ++heads;
+            }
+        // exactly one, not merely the right shape: a future bug that pushes two heads (the shape of a bad merge between the two
+        // code paths this change unifies) would be tolerated by "take the last match", and the property worth pinning is ONE head
+        // chosen by geometry (review of #1732).
+        check(heads == 1, "gate: plan() pushes exactly one lm_head.weight (" + std::to_string(heads) + ")");
+        check(head.size() == 2 && head.at(0) == 64 && head.at(1) == 16,
+              "gate: plan() takes the node whose N x K IS the head, not the first MatMulNBits (lm_head " +
+                  (head.size() == 2 ? std::to_string(head.at(0)) + " x " + std::to_string(head.at(1))
+                                    : std::string("absent")) +
+                  ", and the projection is 32 x 16)");
+    }
+    fs::remove_all(base);
+    fs::remove_all(base);
+}
+
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────
 void test_matmulnbits() {
     const int N = 64, K = 256, B = 128;
@@ -1858,6 +1909,39 @@ void test_attn_payload_off() {
 // GatherBlockQuantized. Shape measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: weight_Q4 [V, H/2] UINT8 and
 // weight_scales [V, groups] FLOAT with group 128. Driving the reader against known codes and scales pins the
 // dequantisation without a 3 GB pack.
+
+// A hybrid pack keeps its text tower under `text_config` INSIDE config.json, with model_config.json carrying
+// model_attributes: null (measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu), so the geometry has to come from the
+// inline block. The text tower is the decoder this importer builds, so its keys fill gaps and never override.
+void test_text_config_geometry(const std::string& root) {
+    const fs::path dir = fs::path(root) / "textcfg";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    put_file((dir / "config.json").string(),
+             R"({"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl",)"
+             R"("image_token_id":151655,"tie_word_embeddings":true,)"
+             R"("text_config":{"model_type":"qwen3_vl_text","hidden_size":2560,"num_hidden_layers":36,)"
+             R"("num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"intermediate_size":9728,)"
+             R"("vocab_size":151936,"rope_theta":5000000.0,"rms_norm_eps":1e-06},)"
+             R"("vision_config":{"hidden_size":1024,"depth":24,"in_channels":3}})");
+    std::string src;
+    const nlohmann::json g = pi::load_geometry_exported(dir.string(), &src);
+    const pi::Dims d = pi::read_dims_exported(g, src);
+    check(d.hidden == 2560 && d.layers == 36 && d.heads == 32 && d.intermediate == 9728 && d.vocab == 151936,
+          "text_config: the text tower's geometry is read from one level down (hidden " + std::to_string(d.hidden) + ")");
+    check(d.head_dim == 128 && d.kv_heads == 8, "text_config: head_dim and num_key_value_heads come with it");
+    check(src.find("text_config") != std::string::npos, "text_config: the source names where the geometry came from (" + src + ")");
+    check(!g.contains("vision_config") || g["vision_config"]["hidden_size"] == 1024, "text_config: vision_config untouched");
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen3_vl","hidden_size":4096,"text_config":{"hidden_size":2560,)"
+             R"("num_hidden_layers":36,"num_attention_heads":32,"intermediate_size":9728,"vocab_size":151936}})");
+    const nlohmann::json g2 = pi::load_geometry_exported(dir.string(), &src);
+    check(pi::read_dims_exported(g2, src).hidden == 4096, "text_config: a top-level hidden_size is NOT overridden");
+    std::printf("  text_config: hidden %d, %dL, %d heads, intermediate %d, vocab %d\n", d.hidden, d.layers, d.heads,
+                d.intermediate, d.vocab);
+    fs::remove_all(dir);
+}
+
 void test_embedding_component(const std::string& root) {
     const fs::path dir = fs::path(root) / "embedcomp";
     fs::remove_all(dir);
@@ -1940,6 +2024,31 @@ void test_selfcheck_reads_bf16() {
                             std::to_string(good) + ")");
     check(wrong < 0.99, "selfcheck-bf16: and reading the same values at the wrong width does not (corr " +
                             std::to_string(wrong) + ") -- the arm that would have caught #1661");
+
+    // engine#1721: the width now travels with the pointer, so the accident #1661 made -- repointing the bytes under
+    // four readers that all decoded F16 -- cannot recur silently: a reader that wants F16 has to say Fmt::F16, and the
+    // default is the format the importer actually holds.
+    {
+        uint32_t f32bits = 0;
+        const float v = 1.5f;
+        std::memcpy(&f32bits, &v, 4);
+        const uint16_t bits = uint16_t(f32bits >> 16);   // bf16 1.5 = 0x3FC0; the same bits read as f16 are 1.75
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(&bits);
+        const pi::EmbedTable as_bf16{raw, pi::EmbedTable::Fmt::BF16, 1};
+        const pi::EmbedTable as_f16{raw, pi::EmbedTable::Fmt::F16, 1};
+        std::printf("embed-table: same bytes, bf16 %.3f, f16 %.3f, default %s\n", pi::embed_at(as_bf16, 0, 0),
+                    pi::embed_at(as_f16, 0, 0),
+                    pi::EmbedTable{}.fmt == pi::EmbedTable::Fmt::BF16 ? "BF16" : "F16");
+        check(std::fabs(pi::embed_at(as_bf16, 0, 0) - 1.5) < 1e-6,
+              "embed-table: Fmt::BF16 decodes the bytes as bf16");
+        // 0x3FC0 read as f16 is 1.9375 (exp 15 -> 2^0, mantissa 0x3C0/1024), not the 1.75 I first wrote here: the
+        // point of the arm is that the two formats DISAGREE, and getting the disagreement's value wrong is the same
+        // mistake in the test rather than the code.
+        check(std::fabs(pi::embed_at(as_f16, 0, 0) - 1.9375) < 1e-6,
+              "embed-table: Fmt::F16 on the SAME bytes gives a different number, so the width cannot be forgotten");
+        check(pi::EmbedTable{}.fmt == pi::EmbedTable::Fmt::BF16,
+              "embed-table: the default format is what the importer holds, so an unset width is the right one");
+    }
 }
 
 void test_qwen3_attn_sections() {
@@ -2522,6 +2631,7 @@ int main(int argc, char** argv) {
         test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
+        test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);
         test_q4_1f();
@@ -2529,6 +2639,7 @@ int main(int argc, char** argv) {
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
+        test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);

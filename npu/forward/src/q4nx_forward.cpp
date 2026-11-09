@@ -25,6 +25,7 @@
 // element-wise.
 #include "q4nx_forward.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
+#include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>   // mkstemp/close: the pb16i activation probe's dump
@@ -32,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -3582,9 +3584,18 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             char path[4096];
             std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
-            if (FILE* fp = std::fopen(path, "wb")) {
-                std::fwrite(X.data(), sizeof(float), (size_t)M * (size_t)H, fp);
-                std::fclose(fp);
+            // engine#1726: every one of the three calls can fail, and all three used to fail silently -- a missing
+            // directory, an unwritable one, or a full disk left the run printing that it was dumping with no files and
+            // no error, and a missing layer_<l>.f32 then reads as "that layer never ran" to whoever analyses the dump.
+            // Reported once per failure mode, not per layer: a full disk fails every layer, and 40 identical lines is how
+            // the first one gets scrolled past. Still non-fatal -- a diagnostic must not fail a valid run.
+            std::string dump_err;
+            if (!onebit::npu::write_residual_dump(path, X.data(), (size_t) M * (size_t) H, &dump_err)) {
+                static bool told_fail = false;
+                if (!told_fail) {
+                    told_fail = true;
+                    std::fprintf(stderr, "  [dump] %s (no residual dump for this run)\n", dump_err.c_str());
+                }
             }
         }
     }
@@ -4995,6 +5006,18 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
 
 bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>& logits) {
     const int H = c_.H, NV = c_.NV;
+    // The target first, and only if it both claims and succeeds (npu/model/op_dispatch.h): `lm_head` is the one
+    // optional op whose contract needs no residency -- one hidden row [H] to [V], idempotent, weights the model's
+    // -- so a target that owns a head context can run it here instead of the launch path below. No target on this
+    // box claims it yet (XdnaTarget's supports() is gemv-only), so today this falls through and the numerics are
+    // unchanged by construction; a target that claims it and fails still falls through, which is the case the
+    // dispatch is written for.
+    // `supports()` first and separately: the target's output buffer is [V] floats (1 MB at 248k vocab), and asking
+    // for it on every token when no target claims the op would be a per-token allocation for nothing.
+    if (xd_ && !host_gemm_ && (int)h.size() == H && xd_->supports(npu::target::Op::lm_head)) {
+        std::vector<float> via_target((size_t)NV, 0.0f);
+        if (npu::model::run_lm_head(*xd_, h.data(), via_target.data())) { logits = std::move(via_target); return true; }
+    }
     if (!host_gemm_ && xd_ && xd_->head_ctx() && xd_->head_ctx()->gemv) return run_lm_head_gemv(h, logits);
     if (host_gemm_) {
         // Offline mode: plain float matvec against the (possibly dequantized)

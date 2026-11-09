@@ -680,10 +680,40 @@ It registered the file mapping as a KFD userptr, which the kernel always write-f
 its mtime, and never finished on large models while writeback kept invalidating it (engine#1339). HRX's repacked copy of the
 dense weights still sits next to the device buffer in GTT.
 
+**What was tried to remove that duplicate, and why it does not work (2026-11-09).** The obvious route is to stop placing the
+native range on the device at all and let HRX repack on demand: `-ot '<pattern>=CPU'` does *not* put a weight in a plain CPU
+buffer — the loader resolves it through `select_weight_buft()` over `make_cpu_buft_list()`, which contains the first device's
+**host** buffer type (`HRX0_HOST` here), so the weight becomes host-resident *with* `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` and the
+repack path is allowed (`binding.weight` is that flag, engine#969). Measured, three arms in one ticket, Qwen3-4B-Q4_K_M,
+`-p 512 -n 32`, own peak `drm-total-gtt` from `bo_trace`:
+
+| arm | BO bytes | own peak GTT | prefill |
+|---|---:|---:|---:|
+| everything on the device | 5,867.8 MiB | 5,495 MiB | 3,241 tok/s |
+| host-placed `ffn_down` + repack | 7,743.8 MiB | 6,459 MiB | 3,879 tok/s |
+
+The native range really does shrink — the whole-model buffer drops **2,376.0 → 1,786.0 MiB (−590)** — but the repacked and parked
+copies cost more than the range they displace: a new **896.0 MiB** class (`HostWeightCache`'s reserved-plus-parked slots), **37 ×
+20 MiB = 740.0 MiB** of per-weight buffers, and two extra 306.4 MiB tensors. Isolated by holding the load mode fixed, placement
+alone is **+360 MiB of GTT and +972 MiB of BO bytes for 0.1 % speed**. So the duplicate is not removable by moving weights to the
+host while their packed copies are device-resident; it would need the packed side to live somewhere it does not today. The
+repacked-prefill kernel ([llama.cpp #250](https://github.com/1bit-MONSTER/llama.cpp/pull/250),
+`GGML_HRX_Q6K_PACKED_PREFILL`) stays **opt-in** for the same reason: it is numerically free and speed-neutral, so it buys nothing
+on its own.
+
 ### Measuring on `HRX0`: what makes a number citable
 
 Numbers measured on this device swing far more between *runs* than between *files*, so the harness matters as much as the arm. Everything below is
 either a guardrail the engine prints or an effect measured on this box on 2026-11-07/08; where another lane measured it first, they are named.
+
+**Before any of the numbered items below: pin the load mode across the arms, or the comparison is measuring `-lm`.** `llama-bench -lm none` (read the weights, no
+mmap) is **1.1745x** the prefill of the default `-lm mmap` on the same file and shape (3,181.97 → 3,737.19 tok/s pp512,
+Qwen3-4B-Q4_K_M, ABBA order A C C A with `REPS=3` so each arm gets one cold and one warm slot; per-pair ratios 1.199 and 1.150,
+decode 0.9835x as the control, per-pair spread 1.001x). It is not free: **+604 MiB of own peak GTT** and +903.9 MiB of BO bytes,
+because three more tensors become device-resident, and it costs the mmap load (`-lm none` reads the whole file). `-lm` is a
+`llama-bench` flag, not an engine one. Why it is faster is **not established** (first-touch faults, or one contiguous extent
+instead of file-backed pages, are both consistent with what was measured) — so treat it as a variable to hold fixed, not a
+setting to ship (engine#1668).
 
 **1. The GTT pool is finite and it is shared.** Every launch prints the guardrail line:
 

@@ -17,6 +17,7 @@
 // dims; nothing here is keyed on a model name or tag, and no geometry literal
 // for any specific model exists in this file.
 #include "q4nx_pack.h"
+#include "q4nx_dequant.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -508,29 +509,130 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
 
 float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
                        float* col_scales) {
+    // ROW-major traversal, both passes. The obvious spelling of this (for j, for i) walks a row-major K x N matrix with
+    // stride N, i.e. one cache line touched per element once N is wider than a line: measured at 27B shapes
+    // (K=5120, N=17408) that is **424 MB/s**, six times slower than the scatter pass that produces B (5.2 GB/s), and
+    // it made this the dominant host cost of the non-folded weight path (engine #1416, pass_bench in the issue).
+    //
+    // The arithmetic is unchanged and the result is byte-identical: amax is a max (order-independent), and each code is
+    // still round(v * 127/amax_j) clamped to +-127 with the same amax floor. Only the visit order moves, so the fixture
+    // that pins this composition (tests/npu_design_grid_test.c) is the proof rather than an argument.
+    float* amax = NULL;
+    float* tis = NULL;
+    float small[256];
+    if (N <= (int)(sizeof small / sizeof small[0])) {
+        amax = small;
+    } else {
+        amax = (float*)malloc((size_t)N * sizeof(float));
+        if (!amax) return 0.0f;                 // no scale array, no quantisation: the caller's error path
+    }
+    for (int j = 0; j < N; j++) amax[j] = 0.0f;
+    for (int i = 0; i < K; i++) {
+        const float* row = B + (size_t)i * N;
+        for (int j = 0; j < N; j++) {
+            const float a = fabsf(row[j]);
+            if (isfinite(a) && a > amax[j]) amax[j] = a;
+        }
+    }
     double ssum = 0.0;
     for (int j = 0; j < N; j++) {
-        // Per-output-column scale: amax_j / 127 (I8Ctx::packB_into).
-        float amax = 0.0f;
-        for (int i = 0; i < K; i++) {
-            float a = fabsf(B[(size_t)i * N + j]);
-            if (isfinite(a) && a > amax) amax = a;
-        }
-        if (amax < 1e-12f) amax = 1.0f;
-        const float ts = amax / 127.0f;
-        const float tis = 127.0f / amax;
-        for (int i = 0; i < K; i++) {
-            float v = B[(size_t)i * N + j];
-            if (!isfinite(v)) v = 0.0f;
-            int x = (int)roundf(v * tis);
-            if (x > 127) x = 127;
-            else if (x < -127) x = -127;
-            out[(size_t)i * ld + j] = (int8_t)x;
-        }
+        if (amax[j] < 1e-12f) amax[j] = 1.0f;   // an all-zero column still gets a usable scale
+        const float ts = amax[j] / 127.0f;
         if (col_scales) col_scales[j] = ts;
         ssum += (double)ts;
     }
+    // 127/amax per column, in the same array (the scale value has already been recorded above).
+    tis = amax;
+    for (int j = 0; j < N; j++) tis[j] = 127.0f / amax[j];
+    for (int i = 0; i < K; i++) {
+        const float* row = B + (size_t)i * N;
+        int8_t* dst = out + (size_t)i * ld;
+        for (int j = 0; j < N; j++) {
+            float v = row[j];
+            if (!isfinite(v)) v = 0.0f;
+            int x = (int)roundf(v * tis[j]);
+            if (x > 127) x = 127;
+            else if (x < -127) x = -127;
+            dst[j] = (int8_t)x;
+        }
+    }
+    if (amax != small) free(amax);
     return (float)(ssum / (double)N);
+}
+
+/* ── chunks → int8, without materialising the float matrix (engine #1416) ────────────────────────
+ *
+ * The non-folded weight path runs three passes over every projection: dequantise the container's chunks into a
+ * K x N float buffer (`deq` in load_layer), scatter that into B (q4nx_assemble_B), then quantise it
+ * (q4nx_pack_B_int8). At 27B shapes the float buffer is 356 MB per projection, and the whole first pass moves ~90 GB.
+ *
+ * This emits the int8 image STRAIGHT FROM THE TILES: one 32x256 tile is dequantised into a 32 KB scratch, folded into
+ * the per-column amax, then a second pass dequantises the same tiles again and writes the codes. Same dequantiser
+ * (q4nx_dequant_tile), same arithmetic, same amax floor -- so the result is byte-identical to the two-step path, which
+ * is what the fixture in tests/npu_design_grid_test.c asserts by running both.
+ *
+ * Only the q4_1 tile kind (5120 B, 32x256) has a one-tile decoder; any other chunk kind returns -2 so the caller keeps
+ * the existing path rather than being handed a guess.
+ */
+int q4nx_pack_q4_1_tiles_to_int8(const uint8_t* tiles, size_t nbytes, int K, int N, int8_t* out, int ld,
+                                 float* col_scales) {
+    if (!tiles || !out || K <= 0 || N <= 0) return -1;
+    if (K % Q4NX_TILE_ROWS || N % Q4NX_TILE_COLS) return -1;
+    const size_t ntr = (size_t)(K / Q4NX_TILE_ROWS), ntc = (size_t)(N / Q4NX_TILE_COLS);
+    if (nbytes != ntr * ntc * (size_t)Q4NX_TILE_BYTES) return -2;   // not the q4_1 tile kind: a caller keeps its path
+    float* amax = (float*)calloc((size_t)N, sizeof(float));
+    if (!amax) return -1;
+    float tilef[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
+    // pass 1: per-column amax, one tile at a time
+    for (size_t r = 0; r < ntr; r++) {
+        for (size_t c = 0; c < ntc; c++) {
+            // the SAME decoder the two-step reference path uses, applied to one tile: q4nx_dequant_tile() is a
+            // different function, and on the fixture it disagreed with the tensor path on 316 of 32768 codes -- rounding
+            // detail at the .5 boundary rather than layout (the scales matched exactly). Byte-exactness needs one
+            // decoder, not two that agree to 99%.
+            q4nx_dequant_tensor_chunked(tiles + (r * ntc + c) * (size_t)Q4NX_TILE_BYTES, Q4NX_TILE_BYTES,
+                                        Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_BYTES, tilef);
+            for (int i = 0; i < Q4NX_TILE_ROWS; i++) {
+                const float* row = tilef + (size_t)i * Q4NX_TILE_COLS;
+                float* am = amax + c * Q4NX_TILE_COLS;
+                for (int j = 0; j < Q4NX_TILE_COLS; j++) {
+                    const float a = fabsf(row[j]);
+                    if (isfinite(a) && a > am[j]) am[j] = a;
+                }
+            }
+        }
+    }
+    // the scale floor is the composition's own: an all-zero column takes amax 1.0, not 0
+    double ssum = 0.0;
+    for (int j = 0; j < N; j++) {
+        if (amax[j] < 1e-12f) amax[j] = 1.0f;
+        const float ts = amax[j] / 127.0f;
+        if (col_scales) col_scales[j] = ts;
+        ssum += (double)ts;
+    }
+    for (int j = 0; j < N; j++) amax[j] = 127.0f / amax[j];   // now 127/amax, the multiplier
+    // pass 2: codes, same tile order
+    for (size_t r = 0; r < ntr; r++) {
+        for (size_t c = 0; c < ntc; c++) {
+            q4nx_dequant_tensor_chunked(tiles + (r * ntc + c) * (size_t)Q4NX_TILE_BYTES, Q4NX_TILE_BYTES,
+                                        Q4NX_TILE_ROWS, Q4NX_TILE_COLS, Q4NX_TILE_BYTES, tilef);
+            const float* tis = amax + c * Q4NX_TILE_COLS;
+            for (int i = 0; i < Q4NX_TILE_ROWS; i++) {
+                const float* row = tilef + (size_t)i * Q4NX_TILE_COLS;
+                int8_t* dst = out + ((r * Q4NX_TILE_ROWS + (size_t)i) * (size_t)ld) + c * Q4NX_TILE_COLS;
+                for (int j = 0; j < Q4NX_TILE_COLS; j++) {
+                    float v = row[j];
+                    if (!isfinite(v)) v = 0.0f;
+                    int x = (int)roundf(v * tis[j]);
+                    if (x > 127) x = 127;
+                    else if (x < -127) x = -127;
+                    dst[j] = (int8_t)x;
+                }
+            }
+        }
+    }
+    free(amax);
+    return 0;
 }
 
 /* ── The launch contract: the argument widths a full ELF declares ───────────────────────────────

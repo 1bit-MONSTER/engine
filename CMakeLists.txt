@@ -254,21 +254,12 @@ add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test
 # engine#1564: which files the copyright gate looks at -- a staged file is seen, an untracked one is seen (that is why
 # running it before `git add` is useful), an ignored one is not. A throwaway repo in a temp dir: no build, no device.
 add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_test.sh)
-# engine#1621: a hold that ends must end everything it started. Three orphans in two days were all GRANDCHILDREN
-# of a ticket (ticket → shell → runner → server): `pkill -P` reaches one level, so the process holding the memory
-# outlived the ticket. Drives scripts/gpu-hold with a wrapper → mid → work chain and asserts the deepest one dies.
-add_test(NAME gpu_hold_tree COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_tree_test.sh)
-# engine#1650: a hold ends itself when the box runs out of memory, before the kernel picks a victim — the 11-08/09
-# failure where an unbudgeted GPU run took the box to 0.7 GiB and the OOM killer chose the PR-agent LLM.
-add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_mem_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
-# engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
-# queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
-# Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a
-# second real gpu-hold reaps it and leaves the note the victim quotes. No device, no build; skips (77) without the script.
-add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_ticket_lost_test.sh)
 # engine#1701: the NPU hold's queue/token follow ONEBIT_HOLD_DIR, and its queue settings never reach the payload.
 # Shell only (a stub gpu-hold plus the tree's own), no device, ~1 s.
 add_test(NAME npu_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_hold_test.sh)
+# engine#1696: the gpu_hold_* registrations live in their own file, so adding one does not conflict with every
+# other test-adding PR through the one contiguous add_test block this used to be part of (see that file's header).
+include(cmake/tests-gpu-hold.cmake)
 # engine#1485: the two port read-backs the route tests use (tests/serve_port.sh). Script-based, no device, no model --
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
@@ -290,6 +281,10 @@ add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
 # check; the two permanent services are exempt by name. --self-test drives the decision, no device needed.
 add_test(NAME device_holders COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
+# engine #1668: the bench preflight must pin the load mode, because `-lm none` is +17.5 % prefill at -1.6 % decode for +604 MiB of
+# GTT. The script existed with a test that nothing ran; a test nobody runs is a comment, so the loader/flag assertions are registered
+# here (the test fakes the box, so it needs no device and no ticket).
+add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-preflight.sh)
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
@@ -304,11 +299,6 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # resolves outside the payload, and a runtime set shipped without the aqlprofile agent libhsa opens. Each
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
-# engine #1504: the GPU hold queue is the FLEET's when the shared state is installed, with no environment to say
-# so - the failure it guards against is silent (a caller under another account taking its own token). Two arms:
-# fleet state present -> the claim uses the fleet's queue and token; absent -> the old ~/GPU-* paths, so a box
-# that has not been set up is unchanged. No GPU: the claim holds the token for three seconds and runs `true`.
-add_test(NAME gpu_hold_queue COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_test.sh)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
@@ -366,6 +356,16 @@ target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 add_executable(npu_load_retry_test tests/npu_load_retry_test.cpp)
 target_include_directories(npu_load_retry_test PRIVATE app)
 add_test(NAME npu_load_retry COMMAND npu_load_retry_test)
+
+# The optional-op fallback seam (npu/model/op_dispatch.h, engine#803 A3): every op but `gemv` is optional, and the
+# model runs its own implementation when the target does not take it -- including when the target claims it and
+# fails. Header only, stub targets, no device and no runtime library, so it runs in CI.
+add_executable(npu_op_dispatch_test tests/npu_op_dispatch_test.cpp)
+target_include_directories(npu_op_dispatch_test PRIVATE npu)
+add_test(NAME npu_op_dispatch COMMAND npu_op_dispatch_test)
+# ci.yml builds a named list of targets, so a test target that is not in it reports "Not Run" (#635); this lane's
+# token cannot edit the workflow. Hooking onto one that IS in the list gets it built there too.
+add_dependencies(npu_sampling_test npu_op_dispatch_test)
 
 add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose target is
@@ -994,7 +994,7 @@ add_dependencies(npu_sampling_test npu_stop_tokens_test)
 
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
-add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c)
+add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
 target_include_directories(npu_elf_args_test PRIVATE npu/forward/include)
 target_link_libraries(npu_elf_args_test PRIVATE m)
 add_test(NAME npu_elf_args COMMAND npu_elf_args_test)
@@ -1062,6 +1062,12 @@ add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4
 add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp)
 target_link_libraries(npu_pack_import_test PRIVATE onebit_npu)
 add_test(NAME npu_pack_import COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden)
+# engine#1726: NPU_INFER_DUMP_DIR's residual write must SAY when it cannot write -- a missing or unwritable directory, or a
+# full disk, used to leave a run that printed it was dumping with no files and no error. Pure stdio, no device, no NPU
+# headers: the arm a version that only checks fopen would pass is the short write, which /dev/full produces for real.
+add_executable(npu_residual_dump_test tests/npu_residual_dump_test.cpp)
+target_include_directories(npu_residual_dump_test PRIVATE npu/forward/include)
+add_test(NAME npu_residual_dump COMMAND npu_residual_dump_test)
 # The OGA pack importer against a real pack (1bit npu-pack), when one is on the box
 set(ONEBIT_OGA_PACK "" CACHE PATH "A Ryzen AI OGA NPU model pack directory")
 if(ONEBIT_OGA_PACK)
@@ -1216,10 +1222,12 @@ add_test(NAME pack_check_generated_text COMMAND bash ${CMAKE_SOURCE_DIR}/tests/p
 # The engine's derived design set for a set of dims, as `ROLE M K N elf` lines.  The instrument the
 # parity test above needs: the plan generator must state the same kernels q4nx_derive_designs() does, and
 # comparing the two is the only way that can be checked rather than assumed (engine#803 A2a).
-add_executable(npu_derive_designs_dump tests/npu_derive_designs_dump.c npu/forward/src/q4nx_pack.c)
+add_executable(npu_derive_designs_dump tests/npu_derive_designs_dump.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
 target_include_directories(npu_derive_designs_dump PRIVATE npu/forward/include)
 target_link_libraries(npu_derive_designs_dump PRIVATE m)
-add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c)
+# q4nx_dequant.c joins this target: the fused chunks->int8 path (engine #1416) dequantises one tile at a time and
+# the test compares it against the two-step dequant+pack, so both live here.
+add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
@@ -1233,7 +1241,7 @@ add_test(NAME npu_plan_designs_parity
 # (engine#808 review: the split moved the engine#845 pad into the target and left the host branch on the
 # raw A). The test's activation buffer carries a NaN guard tail, so an implementation that reads past the
 # buffer fails even when its numbers look plausible. Host-only, no model, no device.
-add_executable(host_gemm_pad_test tests/host_gemm_pad_test.c npu/forward/src/q4nx_pack.c)
+add_executable(host_gemm_pad_test tests/host_gemm_pad_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
 target_include_directories(host_gemm_pad_test PRIVATE npu/forward/include)
 target_link_libraries(host_gemm_pad_test PRIVATE m)
 add_test(NAME host_gemm_pad COMMAND host_gemm_pad_test)

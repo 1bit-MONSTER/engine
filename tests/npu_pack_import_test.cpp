@@ -569,6 +569,49 @@ void test_crafted_refusals(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// engine#1671, device-free arm for the plan() head gate: a graph whose FIRST MatMulNBits is a projection and whose head comes
+// later must report `lm_head.weight` as the head's shape, not the projection's. Revert the gate and this fails.
+void test_1671_plan_head_arm(const std::string& root) {
+    const fs::path base = fs::path(root) / "plan-head-1671";
+    const auto pack = [&](const std::string& tag) {
+        const fs::path dir = base / tag;
+        fs::remove_all(dir);
+        fs::create_directories(dir / "cache");
+        put_file((dir / "config.json").string(),
+                 R"({"model_type":"qwen2","hidden_size":16,"intermediate_size":32,"num_hidden_layers":1,)"
+                 R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":64,)"
+                 R"("rope_theta":10000.0,"tie_word_embeddings":false})");
+        put_file((dir / "model.onnx.data").string(), std::string(4096, '\x11'));
+        return dir;
+    };
+    // 2. The FIRST MatMulNBits is a projection and the head comes later. plan() took the first node as the head, so it
+    // reported the projection's geometry as lm_head.weight; the head is the node whose N == vocab and K == hidden.
+    {
+        const fs::path dir = pack("head-not-first");
+        put_file((dir / "model.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {64, 16}, "model.onnx.data", 0, 4096),
+                            pb::tensor("proj_qweight", {}, "model.onnx.data", 3840, 16),
+                            pb::tensor("proj_scales", {}, "model.onnx.data", 3856, 16),
+                            pb::tensor("proj_zeros", {}, "model.onnx.data", 3872, 8),
+                            pb::tensor("head_qweight", {}, "model.onnx.data", 3880, 32),
+                            pb::tensor("head_scales", {}, "model.onnx.data", 3912, 16),
+                            pb::tensor("head_zeros", {}, "model.onnx.data", 3928, 8)},
+                           {pb::matmulnbits("proj", {"x", "proj_qweight", "proj_scales", "proj_zeros"}, 16, 32, 4, 8),
+                            pb::matmulnbits("head", {"x", "head_qweight", "head_scales", "head_zeros"}, 16, 64, 4, 8)}));
+        const pi::Plan p = pi::plan(dir.string());
+        std::vector<int64_t> head;
+        for (const auto& t : p.tensors)
+            if (t.name == "lm_head.weight") head = t.shape;
+        check(head.size() == 2 && head.at(0) == 64 && head.at(1) == 16,
+              "gate: plan() takes the node whose N x K IS the head, not the first MatMulNBits (lm_head " +
+                  (head.size() == 2 ? std::to_string(head.at(0)) + " x " + std::to_string(head.at(1))
+                                    : std::string("absent")) +
+                  ", and the projection is 32 x 16)");
+    }
+    fs::remove_all(base);
+    fs::remove_all(base);
+}
+
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────
 void test_matmulnbits() {
     const int N = 64, K = 256, B = 128;
@@ -2343,6 +2386,7 @@ int main(int argc, char** argv) {
         test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
+        test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);
         test_q4_1f();

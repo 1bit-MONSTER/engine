@@ -188,6 +188,15 @@ log "queued '$LABEL' as $TICKET_NAME"
 
 waited=0
 while [ "$state" = queued ]; do
+    if [ ! -e "$TICKET" ]; then
+        # engine #1635: something (a reaper, another lane) removed a queued ticket. The head-of-queue test below
+        # can then never come true, and the wait would run to -w (5400 s by default) looking exactly like "queued
+        # behind a busy box". Fail in this poll instead, and name what went missing. state=done first so the
+        # release() trap does not touch a token this process never took.
+        log "::error::my ticket $TICKET_NAME is gone from $QUEUE after ${waited}s (token: $(cat "$TOKEN" 2> /dev/null || echo free)) - it was reaped or removed, so this queue position no longer exists; not waiting ${WAIT}s for it"
+        state=done
+        exit 75
+    fi
     reap_token
     cool=$(cool_left)
     head_ticket=$(oldest_ticket)

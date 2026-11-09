@@ -711,6 +711,10 @@ preflight() {
                 fi
             fi
         fi
+    else
+        # a skip that says nothing is the failure mode these rows exist for: a release log where the runner checks
+        # silently did not run reads exactly like one where they passed.
+        say "preflight: runner checks SKIPPED (WEEKLY_SKIP_RUNNER_CHECK=1) - a dead runner will read as a pending check, never red"
     fi
     return $bad
 }

@@ -326,7 +326,9 @@ scripts/ci-runner-health.sh --self-test    # the verdict logic, systemctl stubbe
 ```
 
 `WEEKLY_SKIP_RUNNER_CHECK=1` releases during an outage, and it skips **both** rows: they fail for the same dead
-runner, so a flag that skipped only one of them could not do the job it documents. Their exit 2 means "nothing to
+runner, so a flag that skipped only one of them could not do the job it documents. It also says so in the log --
+`preflight: runner checks SKIPPED (WEEKLY_SKIP_RUNNER_CHECK=1)` -- because a release log where the checks quietly did
+not run reads exactly like one where they passed. Their exit 2 means "nothing to
 inspect on this host" — a fresh box or a fork — which is a note, not a failure; a check that cannot see has to say so
 rather than report green.
 

@@ -241,20 +241,42 @@ child=$!
 # The watchdog is a function so it can be given the command's pid: a subshell inherits a copy of the shell's
 # variables, so a watchdog started before the command (the first version did) holds an empty pid and neither
 # the abort nor the max hold stops anything.
+# End the hold's whole DESCENDANT TREE: TERM first so a runner can clean up after itself (thermal-run's
+# scope, a benchmark's teardown), then KILL after a grace period for anything that ignored it. Walking
+# `ps --ppid` is depth-agnostic; `pkill -P` reached only the first level, which is why three orphans
+# survived their tickets on 2026-11-08/09 — in each one the process holding the memory was two or three
+# levels down (ticket → shell → runner → server). A process group would express this too, but `setsid`
+# forks when it is already a group leader (which it is inside `systemd-run --scope`), so `$!` stops
+# naming the group; recursion has no such trap.
+descendants() {   # <pid> -> its descendants and then itself, deepest last
+    local k
+    for k in $(ps -o pid= --ppid "$1" 2> /dev/null); do
+        descendants "$k"
+    done
+    printf '%s\n' "$1"
+}
+kill_tree() {
+    local root=$1 grace=${2:-10} i=0 p
+    for p in $(descendants "$root"); do kill -TERM "$p" 2> /dev/null; done
+    while kill -0 "$root" 2> /dev/null && [ "$i" -lt "$grace" ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+    for p in $(descendants "$root"); do kill -KILL "$p" 2> /dev/null; done
+}
+
 watch() {
     local target=$1
     while sleep 2; do
         t=$(tctl)
         if [ "$t" -ge "$TCTL_ABORT" ]; then
             log "ABORT die at ${t}C (limit ${TCTL_ABORT}C)"
-            pkill -TERM -P "$target" 2> /dev/null
-            kill -TERM "$target" 2> /dev/null
+            kill_tree "$target"
             return
         fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
             log "max hold of ${MINUTES} min reached"
-            pkill -TERM -P "$target" 2> /dev/null
-            kill -TERM "$target" 2> /dev/null
+            kill_tree "$target"
             return
         fi
     done

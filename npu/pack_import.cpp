@@ -1666,11 +1666,11 @@ Plan plan(const std::string& pack_dir) {
             geom_src += ", intermediate_size from the graph's MLP projection width";
         } else {
             throw std::runtime_error(
-                "the pack states no intermediate_size: " + geom_src +
-                " has none, and the FFN projections are not initializers of " + graph +
-                " (on the hybrid line only the attention/head qweights are in the main graph), so the FFN width "
-                "has to come from the subgraph or from model.pb.bin -- refusing rather than guessing it from the "
-                "other dimensions");
+                "the pack states no intermediate_size: " + geom_src + " has none, and neither the initializers nor "
+                "the MatMulNBits/MatMulNBitsBf node attributes of " + graph + " (including its If branches) hold a "
+                "down/gate_up pair whose K and N agree -- on the hybrid line only the attention/head qweights are in "
+                "the main graph, and the 1.9 external-data genre keeps the FFN in the branch with dims [0] on every "
+                "initializer -- refusing rather than guessing it from the other dimensions");
         }
     }
     p.dims = read_dims(geom, geom_src);

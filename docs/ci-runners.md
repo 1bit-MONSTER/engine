@@ -217,8 +217,21 @@ sudo rm -f /root/runner-token
 . /etc/profile.d/1bit-fleet.sh
 ```
 
-On a box that already has hold state in the owner's home, add `--migrate-hold-state --owner-user <name>` to the
-first install — with the queue drained, which the installer enforces.
+**Order matters, and the installer enforces it.** The default that keeps the queue un-forked lives in
+`scripts/gpu-hold`; what *runs* on the box is `~/.local/bin/gpu-hold`, which every lane and the runner reach
+through their own home. So the installer puts the repository's copy in place (keeping a dated `.bak-*`, as this
+box does for every other tool) before anything else, and `--migrate-hold-state` **refuses** to run against a copy
+that still defaults to `~/GPU-TOKEN` — otherwise the migration moves the token and the first lane without
+`GPU_TOKEN_FILE` recreates the old path, which is two queues again.
+
+On a box that already has hold state in the owner's home, the first install takes
+`--migrate-hold-state --owner-user <name>`, with the queue drained — the installer refuses a non-empty queue.
+
+**NPU is not shared yet, and the installer says so at install time.** `npu-hold` is not in this repository, and it
+pins the queue with `exec env GPU_QUEUE_DIR="$HOME/NPU-QUEUE" GPU_TOKEN_FILE="$HOME/NPU-TOKEN" …`
+(`~/.local/bin/npu-hold:31`), which resolves to a private NPU queue for any other account whatever `gpu-hold`'s
+default is. The unit sets `HW_GATE_LOCK` to the fleet's lock, so the *lock* is shared; the *queue* is not. Until
+`npu-hold` honours the two variables, a runner under another account must not take NPU work.
 
 `--dry-run` prints the unit and runs `systemd-analyze verify` on it without changing anything; `--verify` prints
 the installed unit's `Result`/`NRestarts`/`OOMPolicy` and exits. The script is idempotent: an existing `ghrunner`

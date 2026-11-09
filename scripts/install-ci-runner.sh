@@ -93,8 +93,9 @@ unit=actions.runner.1bit-MONSTER-engine.$name.service
 unit_path=/etc/systemd/system/$unit
 dir=/var/lib/$user/actions-runner-$name
 # MemoryHigh is 90% of MemoryMax IN ITS OWN UNIT: awk's numeric coercion reads "512M" as 512 and "2T" as 2,
-# so the old one-liner turned 512M into 460G and 2T into 1G. Anything without a K/M/G/T suffix is passed through
-# unconverted and MemoryHigh is left at systemd's default rather than guessed.
+# so the old one-liner turned 512M into 460G and 2T into 1G. A size with no K/M/G/T suffix is passed through
+# unconverted, which makes MemoryHigh equal to MemoryMax: a hard limit with no throttle band above it, which is a
+# fine choice for a runner (the job dies at the ceiling) and is what the code does.
 share_home=$(getent passwd "$owner_user" 2>/dev/null | cut -d: -f6) || share_home=''
 memory_high=$(awk -v m="$memory_max" 'BEGIN{
     if (m !~ /^[0-9.]+[KMGT]$/) { exit }        # no suffix: leave MemoryHigh alone
@@ -266,7 +267,26 @@ if [ "$no_hold" = 0 ]; then
         [ -e "$hold_state/$f" ] || continue
         chgrp "$hold_group" "$hold_state/$f"; chmod 0660 "$hold_state/$f"
     done
+    # The default that keeps the queue un-forked lives in scripts/gpu-hold, and what RUNS is the copy on the
+    # box: ~/.local/bin/gpu-hold, which every lane and this runner reach through its own home. If that copy is
+    # older it still defaults to ~/GPU-TOKEN, so a migration would move the token and the first lane without
+    # GPU_TOKEN_FILE would recreate it - two queues again. So the installer puts the repository's copy in place
+    # (keeping a dated backup, the way this box keeps every other tool), and the migration refuses to run
+    # against a copy that cannot resolve the fleet default.
+    tool_dir=$share_home/.local/bin
+    if [ -d "$tool_dir" ] && [ -f "$(dirname "$0")/gpu-hold" ] && ! cmp -s "$(dirname "$0")/gpu-hold" "$tool_dir/gpu-hold"; then
+        install -m 0755 "$(dirname "$0")/gpu-hold" "$tool_dir/gpu-hold.new" &&
+            { [ -f "$tool_dir/gpu-hold" ] && cp -a "$tool_dir/gpu-hold" "$tool_dir/gpu-hold.bak-$(date +%Y%m%d-%H%M%S)"; }
+        mv -f "$tool_dir/gpu-hold.new" "$tool_dir/gpu-hold"
+        echo "installed scripts/gpu-hold over $tool_dir/gpu-hold (previous copy kept as a .bak-*), so every lane's default is the fleet's"
+    fi
     if [ "$migrate" = 1 ]; then
+        # never migrate against a gpu-hold that would still default to ~/GPU-TOKEN
+        if [ -f "$tool_dir/gpu-hold" ] && ! grep -q 'ONEBIT_HOLD_DIR\|1bit-fleet' "$tool_dir/gpu-hold"; then
+            echo "install-ci-runner.sh: refusing --migrate-hold-state: $tool_dir/gpu-hold does not resolve the fleet default" >&2
+            echo "  (it still defaults to \$HOME/GPU-TOKEN, so the first lane without GPU_TOKEN_FILE would recreate the old path)" >&2
+            exit 1
+        fi
         owner_home=$(getent passwd "$owner_user" | cut -d: -f6)
         [ -n "$owner_home" ] || { echo "install-ci-runner.sh: --migrate-hold-state needs --owner-user that exists" >&2; exit 2; }
         # a live queue is not a thing to move under the lanes: refuse unless it is empty
@@ -295,6 +315,11 @@ PROFILE
     # thermal-run.sh runs its jobs under `systemctl --user`; without a user manager for this account it falls
     # back to a process-group SIGSTOP, which is the weaker mode the file itself warns about
     loginctl enable-linger "$user" 2>/dev/null || echo "warning: could not enable-linger $user; thermal-run.sh will use its process-group fallback"
+    if [ -f "$share_home/.local/bin/npu-hold" ] && grep -q 'GPU_TOKEN_FILE="\$HOME/NPU-TOKEN"' "$share_home/.local/bin/npu-hold" 2>/dev/null; then
+        echo "warning: npu-hold pins ~/NPU-QUEUE and ~/NPU-TOKEN, so NPU work from $user uses a PRIVATE NPU queue." >&2
+        echo "  The unit sets HW_GATE_LOCK to the fleet's lock, so the lock is shared; the queue is not until npu-hold" >&2
+        echo "  honours GPU_QUEUE_DIR/GPU_TOKEN_FILE (docs/ci-runners.md). Until then do not let this runner take NPU work." >&2
+    fi
     echo "hold state: $hold_state (group $hold_group, 0770, queues setgid); $user joined $hold_group"
     echo "the owner's shells pick up GPU_TOKEN_FILE/GPU_QUEUE_DIR from /etc/profile.d/1bit-fleet.sh;"
     echo "a long-running owner service needs them in its own unit or environment (docs/ci-runners.md)"

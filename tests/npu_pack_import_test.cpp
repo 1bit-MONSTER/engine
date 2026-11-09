@@ -119,6 +119,17 @@ std::string kv(const std::string& k, const std::string& v) {
     str(o, 2, v);
     return o;
 }
+// A `*.qweight.empty` placeholder as a REAL pack spells it: `dims [0]`, a 1-D tensor of no elements, not a dimensionless
+// scalar. Two readers have to agree about that shape (engine#1671): the `.packed`-sibling resolution and the lm_head
+// geometry gate, which tested `dims.empty()` and therefore called this a weight of length 0 and threw `no data`.
+std::string zero_dims_placeholder(const std::string& name) {
+    std::string t;
+    ints(t, 2, 1);      // data_type FLOAT
+    str(t, 8, name);
+    ints(t, 1, 0);      // dims = [0]
+    return t;
+}
+
 // a tensor whose values live in an external file, optionally with dims that overstate it
 std::string tensor(const std::string& name, const std::vector<int64_t>& dims, const std::string& location,
                    uint64_t offset, uint64_t length, int64_t type = 1) {
@@ -459,6 +470,83 @@ void test_crafted_refusals(const std::string& root) {
     check(!fs::exists(dir / "out3" / "model.qnx") && !fs::exists(dir / "out3" / "model.q4nx"),
           "crafted: nothing written for the empty .packed sibling");
     fs::remove_all(dir);
+}
+
+// engine#1671, device-free arms for the two gate fixes. Both are "a graph spelling that is legal and that the old code
+// read as something else", so they pin the fix rather than the pack: revert either gate and one of these fails.
+void test_1671_gate_arms(const std::string& root) {
+    const fs::path base = fs::path(root) / "gate-1671";
+    pi::Options allow;
+    allow.allow_incomplete = true;   // the plan's own refusals must not short-circuit before the readers
+    const auto pack = [&](const std::string& tag) {
+        const fs::path dir = base / tag;
+        fs::remove_all(dir);
+        fs::create_directories(dir / "cache");
+        put_file((dir / "config.json").string(),
+                 R"({"model_type":"qwen2","hidden_size":16,"intermediate_size":32,"num_hidden_layers":1,)"
+                 R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":64,)"
+                 R"("rope_theta":10000.0,"tie_word_embeddings":false})");
+        put_file((dir / "model.onnx.data").string(), std::string(4096, '\x11'));
+        return dir;
+    };
+
+    // 1. A `dims [0]` placeholder qweight with no data, NEXT TO a real weight. Before the fix the geometry gate fell
+    // through it (`dims.empty()` is false for `[0]`) into bytes_of(), which threw `model…qweight.empty: no data` out of
+    // the walk; the arm asserts the throw's spelling, not just that something else failed.
+    {
+        const fs::path dir = pack("zero-dims");
+        put_file((dir / "model.onnx").string(),
+                 pb::model({// the geometry has to agree with config.json, or an earlier refusal fires and the arm would
+                            // pass for the wrong reason: 64 x 16 floats is exactly the 4 KiB data file
+                            pb::tensor("model.embed_tokens.weight", {64, 16}, "model.onnx.data", 0, 4096),
+                            // NOT named `*.qweight.empty`: a name in that pattern sends the reader down the
+                            // external-packed genre, and the arm would then pass without ever reaching the gate it is
+                            // for. The gate's claim is about the SHAPE, so the arm uses a shape and a plain name.
+                            pb::zero_dims_placeholder("qkv_qweight_zero_dims"),
+                            // plain names for scales/zeros too: a node input spelled in the slash graph form that no
+                            // initializer carries is SKIPPED before the gate (`si == end -> continue`), and then the arm
+                            // would pass without exercising anything
+                            pb::tensor("qkv_scales", {}, "model.onnx.data", 0, 64),
+                            pb::tensor("qkv_zeros", {}, "model.onnx.data", 0, 16)},
+                           {pb::matmulnbits("qkv", {"x", "qkv_qweight_zero_dims", "qkv_scales", "qkv_zeros", "y"},
+                                           256, 32, 4, 128)}));
+        std::string what;
+        try {
+            (void)pi::import_pack(dir.string(), (dir / "out").string(), allow);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        std::printf("  gate arm1 (zero-dims placeholder) throw: %s\n", what.empty() ? "none" : what.c_str());
+        check(what.find("no data") == std::string::npos,
+              "gate: a `[0]`-dims placeholder is not read as a weight of length 0 (throw: " +
+                  (what.empty() ? std::string("none") : what) + ")");
+    }
+
+    // 2. The FIRST MatMulNBits is a projection and the head comes later. plan() took the first node as the head, so it
+    // reported the projection's geometry as lm_head.weight; the head is the node whose N == vocab and K == hidden.
+    {
+        const fs::path dir = pack("head-not-first");
+        put_file((dir / "model.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {64, 16}, "model.onnx.data", 0, 4096),
+                            pb::tensor("proj_qweight", {}, "model.onnx.data", 3840, 16),
+                            pb::tensor("proj_scales", {}, "model.onnx.data", 3856, 16),
+                            pb::tensor("proj_zeros", {}, "model.onnx.data", 3872, 8),
+                            pb::tensor("head_qweight", {}, "model.onnx.data", 3880, 32),
+                            pb::tensor("head_scales", {}, "model.onnx.data", 3912, 16),
+                            pb::tensor("head_zeros", {}, "model.onnx.data", 3928, 8)},
+                           {pb::matmulnbits("proj", {"x", "proj_qweight", "proj_scales", "proj_zeros"}, 16, 32, 4, 8),
+                            pb::matmulnbits("head", {"x", "head_qweight", "head_scales", "head_zeros"}, 16, 64, 4, 8)}));
+        const pi::Plan p = pi::plan(dir.string());
+        std::vector<int64_t> head;
+        for (const auto& t : p.tensors)
+            if (t.name == "lm_head.weight") head = t.shape;
+        check(head.size() == 2 && head.at(0) == 64 && head.at(1) == 16,
+              "gate: plan() takes the node whose N x K IS the head, not the first MatMulNBits (lm_head " +
+                  (head.size() == 2 ? std::to_string(head.at(0)) + " x " + std::to_string(head.at(1))
+                                    : std::string("absent")) +
+                  ", and the projection is 32 x 16)");
+    }
+    fs::remove_all(base);
 }
 
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────
@@ -2217,6 +2305,7 @@ int main(int argc, char** argv) {
         test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
+        test_1671_gate_arms(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);
         test_q4_1f();

@@ -336,6 +336,16 @@ add_executable(npu_load_retry_test tests/npu_load_retry_test.cpp)
 target_include_directories(npu_load_retry_test PRIVATE app)
 add_test(NAME npu_load_retry COMMAND npu_load_retry_test)
 
+# The optional-op fallback seam (npu/model/op_dispatch.h, engine#803 A3): every op but `gemv` is optional, and the
+# model runs its own implementation when the target does not take it -- including when the target claims it and
+# fails. Header only, stub targets, no device and no runtime library, so it runs in CI.
+add_executable(npu_op_dispatch_test tests/npu_op_dispatch_test.cpp)
+target_include_directories(npu_op_dispatch_test PRIVATE npu)
+add_test(NAME npu_op_dispatch COMMAND npu_op_dispatch_test)
+# ci.yml builds a named list of targets, so a test target that is not in it reports "Not Run" (#635); this lane's
+# token cannot edit the workflow. Hooking onto one that IS in the list gets it built there too.
+add_dependencies(npu_sampling_test npu_op_dispatch_test)
+
 add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose target is
 # not built reports "Not Run" (#635). This lane's token cannot edit the workflow.

@@ -384,7 +384,10 @@ watchdog=$!
 survive_by=$(( ${GPU_HOLD_KILL_GRACE:-10} + ${GPU_HOLD_SURVIVE_WAIT:-60} ))
 stopped=0
 while kill -0 "$child" 2> /dev/null; do
-    sleep 1
+    # 0.2 s, not 1 s: the poll is on the way to `wait`, so a coarse sleep makes every hold pay up to a second and
+    # the ticket log's "after Ns" steps up by one for fast payloads (a review finding). The bound itself is in
+    # whole seconds, so the granularity only costs response time.
+    sleep 0.2
     base=$deadline
     if [ -n "${STOP_STAMP:-}" ] && [ -f "$STOP_STAMP" ]; then
         base=$(cat "$STOP_STAMP" 2> /dev/null || printf '%s' "$deadline")

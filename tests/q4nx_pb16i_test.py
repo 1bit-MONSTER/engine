@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import q4nx_pb16i as Q  # noqa: E402
 
 FAIL = []
+SKIPPED = []   # checks that could not run here; a pass line must name them
 
 
 def check(ok, what, K=0, N=0):
@@ -145,13 +146,36 @@ def test_ptq1_0():
     plain base-3 number (ggml stores them in staged 32/16/8 chunks, five trits per byte),
     so a hand-built block would test my own inverse, not ggml's layout.  Instead: pack a
     real tensor and compare the image BYTE FOR BYTE against a set whose device output was
-    already gated bit-exact (the frozen pb16i sidecar set).  Skipped when the model is not
-    on this machine, so CI stays green."""
+    already gated bit-exact (a set this packer wrote).  Skipped when the model or that set is
+    not named on this machine -- and the skip is then reported IN THE PASS LINE, because this is
+    the file's only check of the reader and a bare "ok" would read as if it had run."""
     gguf = os.environ.get("Q4NX_PB16I_GGUF",
                           "/home/bcloud/models/bonsai2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf")
-    ref = os.environ.get("Q4NX_PB16I_REF", "/home/bcloud/models/npu/bonsai2-pb16i-sidecars")
-    if not os.path.exists(gguf) or not os.path.isdir(ref):
-        print("  (reader test skipped: no ternary GGUF or reference image set on this machine)")
+    # No default reference set on purpose.  The set this test used to name
+    # (`bonsai2-pb16[I]-sidecars`, and the name was misspelled so the test skipped on every run anyway) was built
+    # 2026-10-31 21:40, before this packer existed (`tools/q4nx_pb16i.py` was created in 88715dea, 2026-11-01 04:51,
+    # together with this test), and it comes from the container's own converter (`config.json` ->
+    # `q4nx_source.converter = qwen35_to_q4nx.py`).  Measured 2026-11-08 on bonsai2-27b: `pack` differs from all 8
+    # images of layer 3 byte for byte at identical sizes, and `verify` reports MISMATCH on 14/14 tensors of layers
+    # 6-7 -- i.e. that set is NOT this packer's output, so comparing against it asserted nothing.  Byte equality is
+    # only meaningful against a set THIS packer wrote, so it must be named explicitly (and can then be regenerated
+    # and device-gated on purpose) rather than inherited from a directory name that happens to exist.
+    ref = os.environ.get("Q4NX_PB16I_REF", "")
+    if not os.path.exists(gguf) or not ref or not os.path.isdir(ref):
+        # This is the ONLY test in the file that reads the reader, and it used to report its absence as part of the
+        # suite's "ok" line.  A CI run on a machine without the model then read as "the reader was checked", which is
+        # how the byte-for-byte claim below went unverified (measured 2026-11-08: `q4nx_pb16i_test: ok` while `pack`
+        # differed from every image in the reference set).  Say SKIPPED in the pass line, and let
+        # Q4NX_PB16I_REQUIRE=1 turn the absence into a failure for a machine that is supposed to have the model.
+        why = []
+        if not os.path.exists(gguf):
+            why.append(f"the ternary GGUF ({gguf})")
+        if not ref or not os.path.isdir(ref):
+            why.append("Q4NX_PB16I_REF, a reference set THIS packer wrote (none by default, see above)")
+        SKIPPED.append("reader test needs " + " and ".join(why))
+        print("  (reader test SKIPPED: needs " + " and ".join(why) + ")")
+        if os.environ.get("Q4NX_PB16I_REQUIRE"):
+            check(False, "Q4NX_PB16I_REQUIRE is set, so the reader test may not skip", 0, 0)
         return
     want = {}
     for name, dims, tt, raw in Q.gguf_tensors(gguf):
@@ -184,6 +208,11 @@ def main():
             print("FAIL", f)
         print(f"q4nx_pb16i_test: {len(FAIL)} failure(s)")
         return 1
+    # A green line must say what was NOT checked: this suite's only reader test needs a model that CI does not carry,
+    # and the rest of the file drives synthetic data against the header's rule.
+    if SKIPPED:
+        print(f"q4nx_pb16i_test: ok ({len(SKIPPED)} SKIPPED - {SKIPPED[0]})")
+        return 0
     print("q4nx_pb16i_test: ok")
     return 0
 

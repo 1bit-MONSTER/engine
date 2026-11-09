@@ -1545,12 +1545,37 @@ Plan plan(const std::string& pack_dir) {
                     // The gap is checked to be a norms-sized region rather than accepted loosely: if the remainder
                     // were tiles' worth of bytes it would be a layout this importer has not measured, and reading it
                     // would put weights in the wrong place.
+                    // Same composite, but for a pack whose q_out EQUALS hidden: every section is at K=hidden, so the
+                    // only trace of the norms is a sub-tile remainder. Measured class: Hy-MT2-1.8B (h2048, 16 heads x
+                    // head_dim 128) has payload 5,919,360 = 80 tiles x 73,984 + 640, exactly the 64 q/k/v tiles, the
+                    // 16 o_proj tiles and the same 640 B of per-head norms.
+                    bool handled = false;
+                    {
+                        const int64_t tiles_all = payload / tile_bytes;
+                        const int64_t rem = payload - tiles_all * tile_bytes;
+                        if (payload > 0 && tiles_all == int64_t(n_kv * 2 + n_q + H / kTileRows) && rem > 0 &&
+                            rem <= int64_t(2) * int64_t(d.head_dim) * 2 + 256) {
+                            p.attn_tiles = n_kv * 2 + n_q;
+                            p.o_off = attn_off + p.attn_tiles * tile_bytes + rem;
+                            p.o_k = int(H);
+                            static bool said2 = false;
+                            if (!said2) {
+                                said2 = true;
+                                std::fprintf(stderr,
+                                             "note: attention section is %lld tiles at K=%lld plus %lld B of per-head "
+                                             "QK norms before o_proj\n", (long long)p.attn_tiles, (long long)H,
+                                             (long long)rem);
+                            }
+                            handled = true;
+                        }
+                    }
                     const int64_t o_tiles_h = H / kTileRows;
                     const int64_t qkv_bytes_c = int64_t(n_kv * 2 + n_q) * tile_bytes;
                     const int64_t o_bytes_c = o_tiles_h * tile_o;
                     const int64_t gap_c = payload - qkv_bytes_c - o_bytes_c;
                     const int64_t norm_ceiling = int64_t(2) * int64_t(d.head_dim) * 2 + 256;
-                    if (payload > 0 && q_out != H && o_tiles_h > 0 && gap_c >= 0 && gap_c <= norm_ceiling) {
+                    if (!handled && payload > 0 && q_out != H && o_tiles_h > 0 && gap_c >= 0 && gap_c <= norm_ceiling) {
+                        handled = true;
                         p.attn_tiles = n_kv * 2 + n_q;
                         p.o_off = attn_off + qkv_bytes_c + gap_c;
                         p.o_k = int(q_out);
@@ -1566,10 +1591,10 @@ Plan plan(const std::string& pack_dir) {
                                          (long long)H, (long long)p.attn_tiles, (long long)gap_c,
                                          (long long)q_out, (long long)o_tiles_h);
                         }
-                    } else if (payload <= 0 || payload % tile_bytes)
+                    } else if (handled) { /* composite section above already assigned it */ }
+                    else if (payload <= 0 || payload % tile_bytes)
                         refuse("attention payload is " + std::to_string(payload) + " B, not a whole number of " +
                                std::to_string(tile_bytes) + "-byte tiles");
-                    else if (p.o_k != 0) { /* the composite layout above already assigned the sections */ }
                     else if (q_out != H)
                         refuse("the attention payload holds q/k/v/o as one uniform tile run, which needs "
                                "q_proj's width to be hidden; this pack's q_proj is " + std::to_string(q_out) +
@@ -1583,6 +1608,7 @@ Plan plan(const std::string& pack_dir) {
                         p.o_off = attn_off + (n_kv + n_q + n_kv) * tile_bytes;
                         p.o_k = int(H);
                     }
+
                 } else if (g.hdr.size() == 3) {
                     // engine#979: the Qwen3 families split the attention section in four. Measured on
                     // both shipped packs: [k,q,v tiles][header + per-head k_norm][header + per-head q_norm

@@ -27,6 +27,7 @@
 # usage: kvshare_fd_handoff.py <llama-server> <provider> <model.gguf> <outdir> [max_tokens]
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -80,19 +81,41 @@ def die_with_parent():
     _DEATHSIG()
 
 
-def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
-
-
 def post(api, path, body, timeout=1800):
     req = urllib.request.Request(api + path, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+
+def wait_bound_port(log_path, proc, deadline_s=180):
+    """The port the server bound, read back from the server's own ready line.
+
+    The driver used to pick a port with bind(0)-and-release and hope the server won it; `--port 0` makes llama-server
+    choose (`server-http.cpp` binds with `bind_to_any_port` and prints `listening on http://host:port`), so there is no
+    window to lose -- engine#1485's shape 2, which the other serve tests migrated to (#1525, #1545).
+
+    Returns None if the server died or never printed the line; the caller treats that as "did not come up", with the
+    log tail, rather than guessing a port.
+    """
+    # greedy up to the LAST ":" and anchored at end-of-line: `http://[::1]:44444` otherwise matches the `1` of
+    # `[::1]` (measured -- the non-greedy form captured 1), and a unix:// ready line matches nothing, which is
+    # the right answer for a socket the caller cannot curl.
+    pat = re.compile(r"listening on \S*:(\d+)\s*$")
+    t0 = time.time()
+    while time.time() - t0 < deadline_s:
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = pat.search(line)
+                    if m:
+                        return int(m.group(1))
+        except FileNotFoundError:
+            pass
+        if proc.poll() is not None:
+            return None
+        time.sleep(0.2)
+    return None
 
 
 def wait_health(api, proc, out, deadline_s=900):
@@ -126,8 +149,8 @@ def main():
     ids_path = os.path.join(out, "ids.txt")
     if os.path.exists(api_sock):
         os.unlink(api_sock)
-    port = free_port()
-    api = f"http://127.0.0.1:{port}"
+    port = None   # read back from the server's own ready line; nothing is picked and released
+    api = None
 
     def say(msg):
         line = f"{time.strftime('%Y-%m-%dT%H:%M%z')} {msg}"
@@ -163,14 +186,20 @@ def main():
         # attempt of this script. The engine's serve_hybrid.h sets it for the same reason.
         slotdir = os.path.join(out, "slots")
         os.makedirs(slotdir, exist_ok=True)
-        srv = subprocess.Popen([SRV, "-m", MODEL, "--host", "127.0.0.1", "--port", str(port), "--device", "HRX0",
+        srv = subprocess.Popen([SRV, "-m", MODEL, "--host", "127.0.0.1", "--port", "0", "--device", "HRX0",
                                 "-ngl", "99", "--jinja", "-c", CTX, "-np", "1", "-fa", "on", "--no-warmup",
                                 "--slot-save-path", slotdir],
                                env=env, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True,
                                preexec_fn=die_with_parent)
     try:
+        port = wait_bound_port(log_path, srv)
+        if not port:
+            say("server never reported a port it bound: " + open(log_path).read()[-400:].replace("\n", " "))
+            return 3
+        api = f"http://127.0.0.1:{port}"
+        say(f"server pid {srv.pid} bound :{port} (asked for 0: the server chooses, so no port is picked and released)")
         up, secs = wait_health(api, srv, out)
-        say(f"server pid {srv.pid} on :{port}, health up={up} after {secs:.1f}s")
+        say(f"health up={up} after {secs:.1f}s")
         if not up:
             say("server did not come up: " + open(log_path).read()[-400:].replace("\n", " "))
             return 3

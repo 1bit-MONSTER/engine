@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>     // errno/strerror for the residual dump's failure paths (engine#1726)
 #include <cstring>
 #include <fstream>
 
@@ -3583,9 +3584,21 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             char path[4096];
             std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
-            if (FILE* fp = std::fopen(path, "wb")) {
-                std::fwrite(X.data(), sizeof(float), (size_t)M * (size_t)H, fp);
-                std::fclose(fp);
+            // Both failures are reported, because a silent dump leaves no file and a missing file reads as "that layer
+            // never ran" -- the misleading-instrument class #1605/#1619 were fixing (engine#1726). Said per layer, not
+            // once: which layer could not be written is the useful part, and this path only runs when someone asked.
+            FILE* fp = std::fopen(path, "wb");
+            if (!fp) {
+                const int e = errno;
+                std::fprintf(stderr, "  [dump] cannot write %s: %s\n", path, std::strerror(e));
+            } else {
+                const size_t want = (size_t)M * (size_t)H, wrote = std::fwrite(X.data(), sizeof(float), want, fp);
+                // A short write is a full disk (or a filesystem limit), not a successful dump: say how far it got.
+                if (wrote != want)
+                    std::fprintf(stderr, "  [dump] short write %s: %zu of %zu floats: %s\n", path, wrote, want,
+                                 wrote ? "disk full or quota" : std::strerror(errno));
+                if (std::fclose(fp) != 0)
+                    std::fprintf(stderr, "  [dump] close failed %s: %s\n", path, std::strerror(errno));
             }
         }
     }

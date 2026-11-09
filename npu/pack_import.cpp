@@ -455,10 +455,16 @@ std::string find_token_fconst(const std::string& dir, std::string* why = nullptr
     return {};
 }
 
-// The Token .fconst as the rest of this file reads it. A Ryzen AI 1.9 pack comes back normalised to its 1.8
-// form (see canonical_token_fconst); a 1.8 pack comes back as itself, at no cost. `plan` and `import_pack`
-// both resolve through here so the two cannot disagree about which bytes they are reading.
-std::string resolve_token_fconst(const std::string& pack_dir, const Dims& dims) {
+// The Token .fconst as the rest of this file reads it. A Ryzen AI 1.9 pack comes back normalised to its 1.8 form (see
+// canonical_token_fconst); a 1.8 pack comes back as itself, at no cost.
+//
+// THIS WRITES. For a 1.9 pack it materialises the canonical copy -- 291 MB on Qwen2.5-0.5B, about 1 GB on a 1.5B -- into the
+// temporary directory, and it does NOT cache, so every call rewrites it. It is named `materialise_` for that reason: it was
+// `resolve_token_fconst` until a review of engine#1655 caught a call site using it as a cheap "does this pack have an
+// .fconst?" predicate, which cost a second full rewrite per `npu-pack` command (measured: two O_TRUNC opens of the same
+// 291 MB file for one `npu-pack info`). Call it ONCE per plan/import and pass the path around. "Is there an .fconst?" is
+// find_token_fconst(), which touches nothing.
+std::string materialise_token_fconst(const std::string& pack_dir, const Dims& dims) {
     const std::string found = find_token_fconst(pack_dir);
     if (found.empty()) return found;
     // Named by pack and geometry, so a rerun overwrites its own copy instead of filling the temp dir.
@@ -1365,7 +1371,7 @@ Plan plan(const std::string& pack_dir) {
     // The Token .fconst, found once (see find_token_fconst) and used by the attention block below. Empty means this
     // pack keeps no weights there -- which for the rai_1.3/1.6/1.7.1 line is the normal case, not a fault.
     std::string tok_why;
-    std::string tok_path = resolve_token_fconst(pack_dir, p.dims);
+    std::string tok_path = materialise_token_fconst(pack_dir, p.dims);
     const bool no_fconst = tok_path.empty();
     const bool graph_weights = p.graph_real_weights > 0 && no_fconst;
     // The projections the graph carries as real initializers, by their own names (`.MatMulNBits.` marks one).
@@ -2288,7 +2294,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
 
     {
         std::string path_why;
-        const std::string path = resolve_token_fconst(pack_dir, p.dims);
+        const std::string path = materialise_token_fconst(pack_dir, p.dims);
         const FconstGeom g = locate_fconst(path, p.dims.eps_bits);
         // refusals decided while reading the payload (a tile that does not survive its own round trip,
         // or an o_proj bias the container has nowhere to put); they land before anything is written

@@ -137,6 +137,13 @@ struct OnnxModel {
     std::vector<OnnxTensor> tensors;
     std::vector<OnnxMatMul> matmuls;
     std::map<std::string, size_t> index;
+    // `com.ryzenai:MatMulNBitsBf` is the same quantised matmul as `com.microsoft:MatMulNBits`, and on the 1.9
+    // blob/external-data packs it is the ONLY one: phi-4's 201 weights are all `MatMulNBitsBf`, so a walker that
+    // matches the Microsoft name alone reports a weightless graph for a 9.7 GB pack (engine#1503).
+    int64_t ryzenai_matmuls = 0;
+    // Node inputs that name a `*.qweight.empty` placeholder whose `*.qweight.packed` sibling carries the bytes
+    // (resolved below). Counted so `info` can say "the weights are here, behind a placeholder" instead of "none".
+    int64_t packed_siblings = 0;
 };
 
 void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
@@ -180,7 +187,8 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
             for (const auto* sg : fields(at, 6)) walk_graph(sg->p, sg->n, m);
             for (const auto* sg : fields(at, 11)) walk_graph(sg->p, sg->n, m);
         }
-        if (op == "MatMulNBits") {
+        if (op == "MatMulNBits" || op == "MatMulNBitsBf") {
+            if (op == "MatMulNBitsBf") ++m.ryzenai_matmuls;
             OnnxMatMul mm;
             if (ins.size() >= 4) {
                 mm.data = ins[0];
@@ -213,6 +221,54 @@ OnnxModel parse_onnx(const std::string& path) {
         throw;
     }
     unmap_file(map, size);
+    // A 1.9 external-data pack names its weights through placeholders: the node's input is
+    // `model.layers.0.attn.o_proj.MatMulNBits.qweight.empty`, an initializer with NO dims, while the bytes sit in
+    // `...qweight.packed` -- an initializer the node never references (measured on phi-4: 201 of 201 matmuls, and
+    // the packed lengths match N x (K/128+1) x 68 exactly, the same 68-byte per-row-per-128-block stride the
+    // .fconst attention tile carries). Following node inputs only makes a 9.7 GB pack look weightless, so the
+    // reader resolves the sibling here and every consumer downstream sees a real weight (engine#1503).
+    // Same tensor, two spellings: a node names `/model/layers.0/attn/...` while the initializer is
+    // `model.layers.0.attn...` (measured on phi-4, 201 of 201). Resolving by exact name alone finds the node's input
+    // in no pack that spells them this way.
+    const auto find_init = [&m](const std::string& name) -> const OnnxTensor* {
+        auto it = m.index.find(name);
+        if (it != m.index.end()) return &m.tensors[it->second];
+        if (!name.empty() && name[0] == '/') {
+            std::string dots = name.substr(1);
+            for (auto& c : dots)
+                if (c == '/') c = '.';
+            const auto it2 = m.index.find(dots);
+            if (it2 != m.index.end()) return &m.tensors[it2->second];
+        }
+        return nullptr;
+    };
+    // A placeholder states its length as zero rather than stating nothing: the real pack's
+    // `...qweight.empty` is dims [0] (a 1-D tensor of no elements), not a dimensionless scalar. Both spellings mean
+    // "no bytes here", and a reader that only checks `dims.empty()` calls that a real weight of length 0.
+    const auto no_bytes = [](const OnnxTensor& t) {
+        if (t.dims.empty()) return true;
+        for (auto d : t.dims)
+            if (d != 0) return false;
+        return true;
+    };
+    for (auto& mm : m.matmuls) {
+        if (mm.weight.empty()) continue;
+        const OnnxTensor* w = find_init(mm.weight);
+        if (w && !no_bytes(*w)) {
+            mm.weight = w->name;   // the initializer's own spelling, so every later lookup is exact
+            continue;
+        }
+        if (!w) continue;          // names nothing this graph declares: not this genre's business
+        std::string packed = w->name;
+        if (packed.size() >= 6 && packed.compare(packed.size() - 6, 6, ".empty") == 0)
+            packed.replace(packed.size() - 6, 6, ".packed");
+        else
+            continue;
+        const OnnxTensor* pw = find_init(packed);
+        if (!pw || no_bytes(*pw)) continue;
+        mm.weight = pw->name;
+        ++m.packed_siblings;
+    }
     return m;
 }
 
@@ -1265,6 +1321,14 @@ std::string Plan::manifest() const {
         else if (!graph_blocks.empty()) g["block_size_per_op"] = graph_blocks;
         if (!graph_weight_dims.empty()) g["weight_dims_sample"] = graph_weight_dims;
         g["external_data_present"] = graph_external_bytes;  // bytes of the named .data file found on disk
+        // Which quantised-matmul op the graph speaks, and whether the weights are behind placeholders. A pack whose
+        // node inputs are `*.qweight.empty` and whose bytes are in a `*.qweight.packed` sibling is NOT weightless:
+        // following the node inputs alone reports zero real weights for a 9.7 GB pack (measured: phi-4, engine#1503).
+        g["ryzenai_matmuls_ops"] = graph_ryzenai_matmuls;
+        g["packed_weight_siblings"] = graph_packed_siblings;
+        if (graph_stride_of > 0)
+            g["external_row_stride"] = {{"matched", graph_stride_ok}, {"of", graph_stride_of},
+                                        {"rule", "length == N * (K/128 + 1) * 68"}};
         j["graph_weights"] = g;
     }
     j["mlp_section"] = {{"gate_up_units_measured", mlp_gu_units},
@@ -1308,6 +1372,25 @@ Plan plan(const std::string& pack_dir) {
             const int64_t w = t.dims.at(0);                        // N of the projection
             if (n.find("gate_up") != std::string::npos) { if (w / 2 > best) best = int(w / 2); }
             else if (w > best) best = int(w);
+        }
+        // The external-data genre states its weight as a 1-D byte blob, so the shape is not in the tensor at all --
+        // it is in the NODE's N/K attributes, which are the pack's own declaration (phi-4: gate_proj N 17920,
+        // down_proj K 17920). Reading them is not guessing from other dimensions: it is reading what the graph says
+        // about this very projection (engine#1503).
+        if (best == 0) {
+            for (const auto& mm : gm.matmuls) {
+                if (mm.N <= 0 || mm.K <= 0) continue;
+                const std::string& n = mm.weight;
+                if (n.find("lm_head") != std::string::npos) continue;
+                const bool mlp = n.find("mlp") != std::string::npos || n.find("gate") != std::string::npos ||
+                                 n.find("up_proj") != std::string::npos || n.find("down_proj") != std::string::npos;
+                if (!mlp) continue;
+                int64_t w = 0;
+                if (n.find("down_proj") != std::string::npos) w = mm.K;      // down: K is the FFN width
+                else w = mm.N;                                                // gate/up: N is the FFN width
+                if (n.find("gate_up") != std::string::npos) w /= 2;
+                if (w > best) best = int(w);
+            }
         }
         return best;
     };
@@ -1353,7 +1436,17 @@ Plan plan(const std::string& pack_dir) {
                     p.graph_weight_dims.push_back(w.dims);
             }
             if (!w.location.empty() && ext_file.empty()) ext_file = w.location;
+            // The external-data packs state one row per output row and one extra 128-K block at the end of each:
+            // length == N x (K/128 + 1) x 68, where 64 B is the 4-bit codes and the 4 B trailer is the block's
+            // scale pair. Verified on all 201 of phi-4's matmuls; counted here so `info` reports a measurement
+            // rather than an assumption, and a pack that does not fit it says so with numbers.
+            if (!w.location.empty() && mm.block == 128 && mm.bits == 4 && mm.K > 0 && mm.N > 0) {
+                p.graph_stride_of++;
+                if (int64_t(w.length) == mm.N * (mm.K / 128 + 1) * 68) p.graph_stride_ok++;
+            }
         }
+        p.graph_ryzenai_matmuls = onnx.ryzenai_matmuls;
+        p.graph_packed_siblings = onnx.packed_siblings;
         for (const auto& t : onnx.tensors)
             if (!t.location.empty()) p.graph_external++;
         if (!ext_file.empty()) {

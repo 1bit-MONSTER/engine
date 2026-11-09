@@ -136,11 +136,19 @@ std::string tensor(const std::string& name, const std::vector<int64_t>& dims, co
     ints(t, 14, 1);                                    // data_location = EXTERNAL
     return t;
 }
+// An initializer with a name and nothing else: the `*.qweight.empty` placeholders a 1.9 external-data pack puts in
+// the node's input slot while the bytes live in a `*.qweight.packed` sibling (engine#1503).
+std::string placeholder(const std::string& name) {
+    std::string t;
+    ints(t, 2, 1);      // data_type FLOAT
+    str(t, 8, name);
+    return t;
+}
 std::string matmulnbits(const std::string& name, const std::vector<std::string>& ins, int64_t K, int64_t N,
-                        int64_t bits, int64_t block) {
+                        int64_t bits, int64_t block, const std::string& op = "MatMulNBits") {
     std::string n;
     for (const auto& i : ins) str(n, 1, i);
-    str(n, 4, "MatMulNBits");
+    str(n, 4, op);
     for (const auto& [k, v] : {std::pair<std::string, int64_t>{"K", K}, {"N", N}, {"bits", bits},
                                {"block_size", block}}) {
         std::string a;
@@ -200,6 +208,91 @@ int q4_1f_tensors(const json& table) {
         if (!shape.empty() && shape.back() == int64_t(onebit::npu::kTileBytesF32)) ++n;
     }
     return n;
+}
+
+// The 1.9 external-data genre (engine#1503, measured on phi-4): every node's qweight slot holds a
+// `*.qweight.empty` placeholder with no dims, and the bytes are in a `*.qweight.packed` sibling the node never
+// references. A reader that follows node inputs only reports a weightless graph for a 9.7 GB pack; one that sees the
+// sibling must also say whether the bytes fit the stride the .fconst tile already carries --
+// length == N x (K/128 + 1) x 68 -- as a count, not an assumption.
+void test_external_packed_genre(const std::string& root) {
+    const fs::path dir = fs::path(root) / "external-packed";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"phi3","hidden_size":5120,"intermediate_size":17920,"num_hidden_layers":1,)"
+             R"("num_attention_heads":40,"num_key_value_heads":10,"head_dim":128,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":false})");
+    // The graph's name comes from genai_config.json, as in the real pack (phi-4's is eager-mm.onnx).
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"decoder":{"filename":"eager-mm.onnx","hidden_size":5120,"num_hidden_layers":1,)"
+             R"("num_attention_heads":40,"num_key_value_heads":10,"head_size":128}}})");
+    // K 5120 -> 41 blocks of 68 B = 2,788 B per row; N 768, so a fitting tensor is 2,141,184 B.
+    const int64_t K = 5120, N = 768, stride = (K / 128 + 1) * 68;
+    const int64_t embed_bytes = 64 * 5120 * 2;          // vocab 64 x hidden 5120, f16
+    const auto write_data = [&](int64_t packed_bytes) {
+        put_file((dir / "eager-mm.onnx.data").string(), std::string(size_t(embed_bytes + packed_bytes), '\x22'));
+    };
+    const auto write_graph = [&](const std::string& packed, int64_t packed_bytes) {
+        put_file((dir / "eager-mm.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
+                                       uint64_t(embed_bytes)),
+                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
+                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty"),
+                            pb::tensor(packed, {packed_bytes}, "eager-mm.onnx.data", uint64_t(embed_bytes),
+                                       uint64_t(packed_bytes))},
+                           {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
+                                                    "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
+                                            K, N, 4, 128, "MatMulNBitsBf")}));
+    };
+
+    write_data(stride * N);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N);
+    const json m = json::parse(pi::plan(dir.string()).manifest());
+    const json& g = m["graph_weights"];
+    check(g["ryzenai_matmuls_ops"] == 1, "external-packed: MatMulNBitsBf is counted as a quantised matmul");
+    check(g["matmulnbits_ops"] == 1, "external-packed: and it enters the matmul list (the reader follows it)");
+    check(g["packed_weight_siblings"] == 1,
+          "external-packed: the *.empty placeholder resolves to its *.packed sibling (the weights are here, "
+          "behind a placeholder)");
+    check(g["external_row_stride"]["matched"] == 1 && g["external_row_stride"]["of"] == 1,
+          "external-packed: the bytes fit length == N x (K/128 + 1) x 68, reported as a count");
+
+    // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
+    write_data(stride * N - 68);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N - 68);
+    const json m2 = json::parse(pi::plan(dir.string()).manifest());
+    std::printf("external-packed: %s, %s\n",
+                m["graph_weights"]["packed_weight_siblings"] == 1 ? "placeholder resolved to .packed" : "NOT resolved",
+                "stride rule measured");
+    check(m2["graph_weights"]["external_row_stride"]["matched"] == 0 &&
+              m2["graph_weights"]["external_row_stride"]["of"] == 1,
+          "external-packed: a length that does not fit the stride is reported as 0 of 1, with the rule named");
+    fs::remove_all(dir);
+
+    // The FFN width in the external-data genre is the NODE's declaration, because the weight is a 1-D byte blob with
+    // no shape: a pack whose config states no intermediate_size must still be readable from gate/up (N) or down (K).
+    const fs::path dir2 = fs::path(root) / "external-packed-im";
+    fs::remove_all(dir2);
+    fs::create_directories(dir2 / "cache");
+    put_file((dir2 / "config.json").string(),
+             R"({"model_type":"phi3","hidden_size":5120,"num_hidden_layers":1,"num_attention_heads":40,)"
+             R"("num_key_value_heads":10,"head_dim":128,"vocab_size":64,"rope_theta":10000.0})");
+    put_file((dir2 / "genai_config.json").string(),
+             R"({"model":{"decoder":{"filename":"model.onnx","hidden_size":5120,"num_hidden_layers":1,)"
+             R"("num_attention_heads":40,"num_key_value_heads":10,"head_size":128}}})");
+    const int64_t im = 17920;
+    put_file((dir2 / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {64, 5120}, "model.onnx.data", 0, uint64_t(embed_bytes))},
+                       {pb::matmulnbits("gate", {"x", "/model/layers.0/mlp/gate_proj/MatMulNBits.qweight.empty",
+                                                 "/s", "y"}, K, im, 4, 128, "MatMulNBitsBf"),
+                        pb::matmulnbits("down", {"x", "/model/layers.0/mlp/down_proj/MatMulNBits.qweight.empty",
+                                                 "/s", "y"}, im, 5120, 4, 128, "MatMulNBitsBf")}));
+    put_file((dir2 / "model.onnx.data").string(), std::string(size_t(embed_bytes + 4096), '\x33'));
+    const json mi = json::parse(pi::plan(dir2.string()).manifest());
+    check(mi["dims"]["intermediate_size"] == im,
+          "external-packed: intermediate_size comes from the node's N/K when the config states none");
+    fs::remove_all(dir2);
 }
 
 // The two overstatements the readers must catch: declared dims larger than the external file, and a
@@ -1783,6 +1876,7 @@ int main(int argc, char** argv) {
                     "these packs and not an OGA NPU pack this importer reads\n", pack.c_str());
     try {
         test_bounds();
+        test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);

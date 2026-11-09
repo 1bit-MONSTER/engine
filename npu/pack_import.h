@@ -115,6 +115,14 @@ struct Plan {
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)
     int64_t graph_external_bytes = 0;// size on disk of the external file they name, 0 when it is not in the pack
+    // `com.ryzenai:MatMulNBitsBf` ops, and node inputs that resolved to a `*.qweight.packed` sibling behind a
+    // `*.qweight.empty` placeholder. Both exist because a walker that matches only the Microsoft op name, or only
+    // the node's own initializer, reports a weightless graph for the 1.9 external-data packs (engine#1503).
+    int64_t graph_ryzenai_matmuls = 0;
+    int64_t graph_packed_siblings = 0;
+    // How many of the graph's 4-bit block-128 weights satisfy length == N x (K/128 + 1) x 68 (the per-row stride the
+    // .fconst tile also carries): a measurement, so `info` can say "201 of 201" or "3 of 7" instead of guessing.
+    int64_t graph_stride_ok = 0, graph_stride_of = 0;
     std::map<int64_t, int64_t> graph_blocks;                 // block size -> how many ops declare it
     std::vector<std::vector<int64_t>> graph_weight_dims;     // up to 4 distinct [N, K/block, bytes] shapes
     // The MLP section's geometry, likewise measured: gate and up share one fused 4,288-byte-subvolume

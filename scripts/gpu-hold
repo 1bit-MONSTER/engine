@@ -46,6 +46,7 @@
 #   GPU_HOLD_RELEASE_WAIT  seconds a label must wait after releasing, default 180
 #   GPU_HOLD_TCTL_START    start gate in C, default 75 - a hot box is not taken
 #   GPU_HOLD_TCTL_ABORT    abort in C, default 93
+#   GPU_HOLD_MEM_ABORT_GB  end the hold when MemAvailable falls below this (GB); 0 = off, the default
 #   GPU_HOLD_TCTL_FILE     temperature file in millidegrees, default the k10temp hwmon
 #   GPU_HOLD_POLL          queue poll interval in seconds, default 2
 #   GPU_HOLD_LOG           also append the protocol log to this file
@@ -67,6 +68,17 @@ TOKEN=${GPU_TOKEN_FILE:-$([ -d "$HOLD" ] && printf '%s' "$HOLD/gpu-token" || pri
 RELEASE_WAIT=${GPU_HOLD_RELEASE_WAIT:-180}
 TCTL_START=${GPU_HOLD_TCTL_START:-75}
 TCTL_ABORT=${GPU_HOLD_TCTL_ABORT:-93}
+# End the hold when MemAvailable falls below this many GB (0 keeps the old behaviour). Set by the caller, not
+# defaulted: a box with a large model legitimately sits low, and the floor that matters is the fleet's, not this'. 
+# GiB, whole number. A value that is not one is refused HERE rather than reaching `[ "$x" -gt 0 ]`, where bash
+# prints "integer expression expected", the test is treated as false and the floor is silently disabled.
+MEM_ABORT_GB=${GPU_HOLD_MEM_ABORT_GIB:-${GPU_HOLD_MEM_ABORT_GB:-0}}
+case $MEM_ABORT_GB in
+    '' | *[!0-9]*)
+        echo "gpu-hold: GPU_HOLD_MEM_ABORT_GB=$MEM_ABORT_GB is not a whole number of GiB - refusing to run with a floor that cannot be enforced" >&2
+        exit 2
+        ;;
+esac
 POLL=${GPU_HOLD_POLL:-2}
 LOG=${GPU_HOLD_LOG:-}
 THERMAL_FLAG=${GPU_HOLD_THERMAL_FLAG:-$HOME/THERMAL-HOLD}
@@ -305,9 +317,27 @@ kill_tree() {
     for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
 
+# MemAvailable, in GB, as the kernel reports it. 0 disables the abort (the old behaviour).
+mem_available_gb() {
+    # first match only: a fixture that adds a second MemAvailable line would otherwise concatenate both numbers
+    awk '/^MemAvailable:/ { printf "%d", $2 / 1048576; exit }' "${GPU_HOLD_MEMINFO:-/proc/meminfo}" 2> /dev/null
+}
+
 watch() {
     local target=$1
     while sleep 2; do
+        # The OOM kill this prevents is not the run's own: on 2026-11-08/09 a GPU run took the box to 0.7 GiB
+        # available and the kernel chose the PR-agent LLM as the victim, which took the fleet's own brains down.
+        # The temperature gate has the same shape — one sampled number, one threshold, end the hold — so the
+        # memory floor rides the same watchdog rather than adding a second one.
+        if [ "${MEM_ABORT_GB:-0}" -gt 0 ]; then
+            avail=$(mem_available_gb)
+            if [ -n "$avail" ] && [ "$avail" -lt "$MEM_ABORT_GB" ]; then
+                log "ABORT ${avail} GiB MemAvailable (floor ${MEM_ABORT_GB} GiB) - ending the hold before the kernel picks a victim"
+                kill_tree "$target" "${GPU_HOLD_KILL_GRACE:-10}"
+                return
+            fi
+        fi
         t=$(tctl)
         if [ "$t" -ge "$TCTL_ABORT" ]; then
             log "ABORT die at ${t}C (limit ${TCTL_ABORT}C)"

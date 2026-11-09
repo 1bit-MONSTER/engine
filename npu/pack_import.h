@@ -33,6 +33,8 @@
 // visible to whatever loads it next.
 #pragma once
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <string>
 #include <map>
@@ -68,6 +70,12 @@ struct Dims {
     std::string model_type;
     std::vector<int> eos;
 };
+
+// The geometry as a JSON object, and the Dims read out of it. Exposed for the unit tests: a hybrid pack keeps its text
+// tower under `text_config`, and the only way to prove that lift works (and that a top-level key still wins) is to hand
+// both functions a config.json and read the numbers back.
+nlohmann::json load_geometry(const std::string& pack_dir, std::string* source);
+Dims read_dims(const nlohmann::json& c, const std::string& source);
 
 // One tensor the pack describes, and where its values would come from.
 struct Planned {

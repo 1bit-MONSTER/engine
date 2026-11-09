@@ -672,6 +672,8 @@ DeclaredMap read_declared(const std::string& pack_dir) {
     return out;
 }
 
+}  // namespace: load_geometry/read_dims are declared in pack_import.h so a test can drive them
+
 // ── the pack's geometry, from wherever this generation put it ────────────────
 // Ryzen AI 1.6 ships `config.json = {}` and 1.7/1.7.1 ship **no config.json at all**; all of them carry
 // genai_config.json with the decoder block. So the geometry comes from config.json when it is usable and from
@@ -693,6 +695,22 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
         if (readable_object(pack_dir + "/genai_config.json", g)) {
             for (const char* k : {"rope_theta", "rms_norm_eps", "intermediate_size"})
                 if (!cfg.contains(k) && g.contains(k)) cfg[k] = g[k];
+        }
+        // A hybrid pack keeps its TEXT tower under `text_config` and states no top-level geometry at all. Measured on
+        // amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: config.json's top level is {architectures, image_token_id, model_type,
+        // text_config, tie_word_embeddings, video_token_id, vision_config, …} with hidden_size/num_hidden_layers/
+        // num_attention_heads/intermediate_size all inside text_config (2560 / 36 / 32 / 9728). The importer then
+        // refused with "the pack states no intermediate_size: config.json has none, and the FFN projections are not
+        // initializers of text.onnx" -- true, because this pack also keeps its weights in text.onnx.data, so the
+        // refusal named a second cause while the first was simply a missing lookup one level down.
+        //
+        // The text tower IS the decoder this importer builds, so lift its keys -- only where the top level lacks them,
+        // never overriding -- and leave `vision_config` alone. Same nested-config rule tools/npu_plan.py already
+        // applies to rope_scaling/mrope_section for VL packs.
+        if (cfg.contains("text_config") && cfg["text_config"].is_object()) {
+            for (auto it = cfg["text_config"].begin(); it != cfg["text_config"].end(); ++it)
+                if (!cfg.contains(it.key())) cfg[it.key()] = it.value();
+            if (source) *source = "config.json:text_config";
         }
         return cfg;
     }
@@ -781,8 +799,6 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
     }
     return d;
 }
-
-}  // namespace
 
 // engine#734: exported so the epsilon anchor itself can be tested against a crafted .fconst, without a pack.
 // The two bytes a bf16 epsilon is stored as (little-endian): round the f32 to nearest-even bf16.

@@ -743,7 +743,10 @@ if(Python3_Interpreter_FOUND)
     # engine#1070: every configured test that starts a server holds RESOURCE_LOCK route_ports, so
     # the list at the end of this file cannot drift away from the tests it protects. Reads the
     # configured test list (ctest -N --show-only=json-v1); no device, no model, no build products.
-    add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
+    # Ending a serve must end the process that holds the memory: `1bit serve` is a wrapper and the model lives in the
+# `llama-server` child (engine #1653 review). Device-free: it drives the helper against a synthetic wrapper.
+add_test(NAME serve_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_kill_tree_test.sh)
+add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.

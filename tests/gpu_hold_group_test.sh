@@ -84,4 +84,24 @@ if [ "$src" = 7 ]; then
 else
     echo "FAIL a payload that exits 7 reported $src through gpu-hold (set -m must not change the status)"; exit 1
 fi
+# The payload must not read the CALLER's stdin: `set -m` makes a background job keep the shell's stdin, and the fleet's own
+# sweep shape is `while read m; do gpu-hold -- bench "$m"; done < list` - without the payload's `< /dev/null` the first job
+# swallows the rest of the list and the sweep silently runs once (measured, bash 5.3.9).
+cat > "$scratch/eat.sh" <<'EAT'
+#!/bin/bash
+cat > /dev/null
+EAT
+chmod +x "$scratch/eat.sh"
+consumed=$(printf 'a\nb\nc\n' | { n=0; while read -r m; do
+    n=$((n + 1))
+    GPU_QUEUE_DIR=$scratch/q GPU_TOKEN_FILE=$scratch/token GPU_HOLD_LOG=$scratch/log3 \
+    GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=1 GPU_HOLD_KILL_GRACE=2 \
+    GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE=$scratch/tctl GPU_HOLD_THERMAL_FLAG=$scratch/none \
+        bash "$hold" -t 30 -l "$marker-eat-$n" -- "$scratch/eat.sh" > /dev/null 2>&1
+done; printf '%s' "$n"; })
+if [ "$consumed" = 3 ]; then
+    echo "ok   the payload cannot swallow the caller's stdin (a 3-entry sweep runs 3 times)"
+else
+    echo "FAIL a sweep over 3 entries ran $consumed time(s): the payload is reading the caller's stdin"; exit 1
+fi
 echo "gpu_hold_group: ok"

@@ -14,7 +14,9 @@
 // limitations under the License.
 #include "plan/op_registry.h"
 
+#include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace onebit::npu::plan {
 
@@ -125,11 +127,143 @@ std::string op_coverage() {
     std::string missing;
     for (int i = 0; i < (int)OpId::count; i++) {
         const OpId op = (OpId)i;
-        if (find_op(op)) continue;
+        // A reference of EITHER shape counts: `attn_step`'s operands are not a matrix pair, so it is
+        // registered in the call table (engine#799 rule (b) slice 2) and is no longer a gap.
+        if (find_op(op) || find_op_call(op)) continue;
         if (!missing.empty()) missing += ",";
         missing += op_name(op);
     }
     return missing;
 }
+
+// ── op-shaped calls: attn_step (engine#799 rule (b), slice 2) ───────────────────────────────────────
+namespace {
+// One position's attention: out[d] = sum_i softmax(q . k_i / sqrt(hd))[i] * v_i[d].
+constexpr float kAttnQ[] = {1.0f, 0.0f};
+constexpr float kAttnK[] = {1.0f, 0.0f, 0.0f, 1.0f};   // two cached positions: (1,0), (0,1)
+constexpr float kAttnV[] = {1.0f, 2.0f, 3.0f, 4.0f};   // (1,2), (3,4)
+// By hand: scores = (q.k0, q.k1)/sqrt(2) = (0.7071, 0); softmax = (0.66976, 0.33024);
+// out = 0.66976*(1,2) + 0.33024*(3,4) = (1.66048, 2.66048).
+constexpr float kAttnWantTwo[] = {1.6604769013466862f, 2.6604769013466862f};
+// With one cached position the softmax is 1 by definition, so the output is v0 exactly -- a case the
+// reference cannot pass by accident, because it pins that the normaliser is the sum and not a bare exp.
+constexpr float kAttnWantOne[] = {1.0f, 2.0f};
+
+const OpCallCase kAttnCases[] = {
+    {"two cached positions, hd 2",
+     "by hand: scores (1/sqrt2, 0) -> softmax (0.66976, 0.33024) -> 0.66976*(1,2)+0.33024*(3,4)",
+     {OpId::attn_step, kAttnQ, kAttnK, kAttnV, 2, 2, nullptr},
+     kAttnWantTwo, 2},
+    {"one cached position",
+     "softmax over a single score is 1, so the output is v0 (an implementation that skipped the normaliser "
+     "would pass the two-position case by luck but not this one)",
+     {OpId::attn_step, kAttnQ, kAttnK, kAttnV, 1, 2, nullptr},
+     kAttnWantOne, 2},
+};
+}  // namespace
+
+bool attn_step_ref(const OpCall& call) {
+    if (!call.q || !call.kcache || !call.vcache || !call.out || call.pos <= 0 || call.hd <= 0) return false;
+    const double scale = 1.0 / std::sqrt(double(call.hd));
+    std::vector<double> scores(static_cast<size_t>(call.pos));
+    double best = -1e300;
+    for (int i = 0; i < call.pos; ++i) {
+        double s = 0.0;
+        for (int d = 0; d < call.hd; ++d) s += double(call.q[d]) * double(call.kcache[i * call.hd + d]);
+        scores[size_t(i)] = s * scale;
+        if (scores[size_t(i)] > best) best = scores[size_t(i)];
+    }
+    double z = 0.0;
+    for (auto& s : scores) {
+        s = std::exp(s - best);
+        z += s;
+    }
+    for (int d = 0; d < call.hd; ++d) {
+        double acc = 0.0;
+        for (int i = 0; i < call.pos; ++i) acc += scores[size_t(i)] / z * double(call.vcache[i * call.hd + d]);
+        call.out[d] = float(acc);
+    }
+    return true;
+}
+
+namespace {
+// ── gdn_step: the delta-rule core ──────────────────────────────────────────────────────────────────
+namespace {
+constexpr float kGdnK[] = {2.0f};
+constexpr float kGdnV[] = {3.0f};
+constexpr float kGdnQ[] = {1.0f};
+constexpr float kGdnWantNoDecay[] = {3.0f};    // S = 1 + 2*1
+constexpr float kGdnWantDecay[] = {4.5f};      // S = 0.5 + 2*2
+constexpr float kGdnWantNoWrite[] = {0.5f};    // S = 0.5, the gate writes nothing
+// Each case owns its state buffer (the reference advances it in place); the test resets it to the case's
+// documented initial S = 1 before running, so the table stays re-runnable.
+float kGdnS0[] = {1.0f}, kGdnS1[] = {1.0f}, kGdnS2[] = {1.0f};
+
+const OpCallCase kGdnCases[] = {
+    {"dk = dv = 1, no decay, gate open",
+     "by hand: S 1, k 2, v 3, g 0, beta 1 -> err = 3 - 1*2 = 1, S = 1 + 2*1 = 3, out = S*q = 3",
+     {OpId::gdn_step, kGdnQ, nullptr, nullptr, 0, 0, nullptr, kGdnS0, kGdnK, kGdnV, 1, 1, 1.0f, 0.0f},
+     kGdnWantNoDecay, 1},
+    {"dk = dv = 1, half decay, gate open",
+     "by hand: S 1*exp(ln 0.5) = 0.5, err = 3 - 0.5*2 = 2, S = 0.5 + 2*2 = 4.5, out = 4.5",
+     {OpId::gdn_step, kGdnQ, nullptr, nullptr, 0, 0, nullptr, kGdnS1, kGdnK, kGdnV, 1, 1, 1.0f, -0.6931471805599453f},
+     kGdnWantDecay, 1},
+    {"dk = dv = 1, half decay, gate closed",
+     "by hand: S = 0.5 and beta = 0 writes nothing, so out = 0.5 -- pins that the gate multiplies the write "
+     "rather than being added to it",
+     {OpId::gdn_step, kGdnQ, nullptr, nullptr, 0, 0, nullptr, kGdnS2, kGdnK, kGdnV, 1, 1, 0.0f, -0.6931471805599453f},
+     kGdnWantNoWrite, 1},
+};
+}  // namespace
+
+bool gdn_delta_ref(const OpCall& call) {
+    if (!call.state || !call.k || !call.v || !call.q || !call.out || call.dk <= 0 || call.dv <= 0) return false;
+    const int dk = call.dk, dv = call.dv;
+    std::vector<double> S(static_cast<size_t>(dk) * dv), err(static_cast<size_t>(dv));
+    for (size_t i = 0; i < S.size(); ++i) S[i] = double(call.state[i]);
+    const double decay = std::exp(double(call.g));
+    for (auto& s : S) s *= decay;                       // 1. decay the state
+    for (int j = 0; j < dv; ++j) {                      // 2. err = v - S^T k  (S is [dk][dv])
+        double acc = 0.0;
+        for (int i = 0; i < dk; ++i) acc += S[size_t(i) * dv + j] * double(call.k[i]);
+        err[size_t(j)] = double(call.v[j]) - acc;
+    }
+    for (int i = 0; i < dk; ++i)                        // 3. rank-1 write: S += beta * k (x) err
+        for (int j = 0; j < dv; ++j) S[size_t(i) * dv + j] += double(call.beta) * double(call.k[i]) * err[size_t(j)];
+    for (int j = 0; j < dv; ++j) {                      // 4. readout: out = S^T q
+        double acc = 0.0;
+        for (int i = 0; i < dk; ++i) acc += S[size_t(i) * dv + j] * double(call.q[i]);
+        call.out[j] = float(acc);
+    }
+    for (size_t i = 0; i < S.size(); ++i) call.state[i] = float(S[i]);
+    return true;
+}
+
+const OpCallEntry kCallEntries[] = {
+    {OpId::attn_step, &attn_step_ref, kAttnCases, sizeof(kAttnCases) / sizeof(kAttnCases[0]), nullptr},
+    {OpId::gdn_step, &gdn_delta_ref, kGdnCases, sizeof(kGdnCases) / sizeof(kGdnCases[0]),
+     "the delta-rule core (state update + readout); the layer's conv, q/k/v/a/b projections, per-head norms and "
+     "gates are gemv-shaped and covered by the first table, and their parameters are what load_block() makes "
+     "resident"},
+};
+}  // namespace
+
+const OpCallEntry* find_op_call(OpId op) {
+    for (const auto& e : kCallEntries)
+        if (e.op == op) return &e;
+    return nullptr;
+}
+size_t op_call_entry_count() { return sizeof(kCallEntries) / sizeof(kCallEntries[0]); }
+
+std::string op_partial_coverage() {
+    std::string partial;
+    for (const auto& e : kCallEntries) {
+        if (!e.scope || !*e.scope) continue;
+        if (!partial.empty()) partial += ",";
+        partial += op_name(e.op);
+    }
+    return partial;
+}
+const OpCallEntry& op_call_entry(size_t i) { return kCallEntries[i]; }
 
 }  // namespace onebit::npu::plan

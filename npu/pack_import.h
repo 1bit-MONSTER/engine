@@ -33,6 +33,8 @@
 // visible to whatever loads it next.
 #pragma once
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <string>
 
@@ -144,9 +146,21 @@ struct Plan {
     std::string manifest() const;  // JSON: format, layout version, source, geometry, tensors
 };
 
+// The multi-component (gemma-4 1.9, `type: compositemodel`) packs keep the text tower's geometry in
+// model_config.json -> config.model_attributes.text_config, while config.json is `{}` and genai_config.json's
+// decoder block stops at head_size. Fills ONLY the keys `cfg` lacks and returns how many it added, so the caller
+// can name the source; exposed for a unit test that needs no ONNX graph.
+int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);
+
+// Whether the canonical Token .fconst already on the scratch path holds exactly the bytes this run would write,
+// given the length the canonical form must have (engine#1662). True means the ~291 MB rewrite can be skipped. Split
+// out of canonical_token_fconst() so the decision has a test that needs no 1.9 pack: a truncated copy, a missing file
+// and a directory on the scratch path must all come back false.
+bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
 
 // The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
 // actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos

@@ -1045,6 +1045,38 @@ int run_forward_serve(int argc, char** argv) {
         ~Stop() { s.stop(); if (t.joinable()) t.join(); }
     } stop{srv, listener};
 
+    // Warm the weight cache before saying "ready". A first request has to touch every (layer, role) weight once, and on
+    // the non-folded int8 route that means materialising the weight matrix in float32 and packing it -- ~112
+    // projections, which on a 27B pack is tens of seconds. Left in the request, that looks like a hang: a 8-token
+    // request returning nothing in 150 s (engine #1605), and a "ready" line that is a lie about the next minute.
+    // Paid here it is startup time, which is what startup time is for. NPU_SERVE_NO_WARMUP=1 keeps the old behaviour.
+    if (!getenv("NPU_SERVE_NO_WARMUP")) {
+        // Announce the warm-up BEFORE it runs, so a caller polling for "ready" can tell "warming, give it a minute" from
+        // "hung". Measured cost is 44.5 s on a folded 27B pack, and `tests/serve_port.sh`'s helper defaults to a 30 s
+        // budget -- a caller that only knows about `ready` would time out and report "serve never reported a port",
+        // which is the misleading shape #1531/#1545 spent effort removing.
+        std::fprintf(stderr, "1bit forward-serve: warming (weight cache; first request would otherwise pay it)\n");
+        std::fflush(stderr);
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<float> wlogits;
+        std::vector<int> wids = {131, 131, 131, 131};   // four tokens of one id: the cheapest pass that touches every weight
+        e.fwd->reset();
+        const bool ok = e.fwd->step_batch(wids, 0, wlogits);
+        e.fwd->reset();
+        const double wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!ok) {
+            std::fprintf(stderr, "1bit forward-serve: warm-up pass failed (%s); serving anyway -- the first request "
+                                 "will pay it\n", e.fwd->last_error());
+        } else {
+            // The caveat is in the log line, not only the PR: the warm-up covers the TOKEN-INVARIANT weights (wkey >=
+            // 0, "packed once and reused" -- xdna_target.cpp). Routed-expert weights are wkey < 0 and are deliberately
+            // never cached ("whose weights change per token"), so on a MoE pack the warm-up is NOT the whole first-touch
+            // cost and a reader must not expect the same 44.5 s to disappear.
+            std::fprintf(stderr, "1bit forward-serve: warm-up pass %.1f ms (token-invariant weights only -- routed MoE "
+                                 "experts are never cached, so a MoE pack still pays per-expert packing; "
+                                 "NPU_SERVE_NO_WARMUP=1 to skip)\n", wms);
+        }
+    }
     ready = true;
     std::fprintf(stderr, "1bit forward-serve: %s ready on http://%s:%d (%s)", e.id.c_str(), host.c_str(), port,
                  e.fwd->backend().c_str());

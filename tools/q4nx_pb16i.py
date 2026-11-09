@@ -301,7 +301,12 @@ def main():
             manifest[stem] = {'K': K, 'N': N, 'tiles': int(w_bytes(K, N) // TILE)}
             n_done += 1
             print(f"  {stem} K={K} N={N} {'ok' if not bad else f'{bad} MISMATCH'}", flush=True)
-    json.dump(manifest, open(os.path.join(outdir, 'manifest.json'), 'w'), indent=1)
+    # Only `pack` owns the directory's manifest: it is the resume state for a pack.  `verify` reads a set it did not
+    # write -- including, in the test's case, a frozen reference set -- so writing here silently modified the artifact
+    # under inspection (measured 2026-11-08: `verify --layers 6,7` left a manifest.json in
+    # models/npu/bonsai2-pb16-sidecars, a directory whose whole purpose is to stay byte-identical).
+    if cmd == 'pack':
+        json.dump(manifest, open(os.path.join(outdir, 'manifest.json'), 'w'), indent=1)
     print(f"{cmd}: {n_done} image(s) in {outdir}")
 
 

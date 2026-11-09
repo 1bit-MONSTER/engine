@@ -81,15 +81,17 @@ void test_op_call_table() {
         check(e.n_cases > 0, label + " entry has known-answer cases");
         for (size_t c = 0; c < e.n_cases; c++) {
             const auto& kase = e.cases[c];
-            check(kase.what && kase.how && *kase.how, label + " case states how its answer was derived");
+            const std::string what = std::string(label) + " case \"" + (kase.what ? kase.what : "?") + "\"";
+            check(kase.what && kase.how && *kase.how, what + " states how its answer was derived");
             std::vector<float> out(size_t(kase.want_len > 0 ? kase.want_len : kase.call.hd), 0.0f);
             auto call = kase.call;
             call.out = out.data();
-            check(e.ref(call), label + " case "" + kase.what + "" reference returns true");
+            if (call.state && call.dk > 0 && call.dv > 0)
+                for (int i2 = 0; i2 < call.dk * call.dv; ++i2) call.state[i2] = 1.0f;
+            check(e.ref(call), what + " reference returns true");
             float worst = 0.0f;
             for (int d = 0; d < kase.want_len; ++d) worst = std::max(worst, std::fabs(out[size_t(d)] - kase.want[d]));
-            check(worst <= 1e-5f, label + " case "" + kase.what + "" matches the hand-derived answer (worst " +
-                                      std::to_string(worst) + ")");
+            check(worst <= 1e-5f, what + " matches the hand-derived answer (worst " + std::to_string(worst) + ")");
         }
     }
     // The vacuum check: a malformed call must be refused rather than dereferenced.
@@ -147,11 +149,15 @@ int main() {
     check(find_op(OpId::attn_step) == nullptr, "attn_step has no entry yet");
     check(find_op("not_an_op") == nullptr, "an unknown name finds nothing");
 
-    // 3. The coverage gap is a decision in this test, not an omission: with `attn_step` registered in the
-    //    op-shaped table (rule (b) slice 2) exactly ONE op is still missing, and it is named here.
+    // 3. Coverage is now two questions, and this test is where both are decisions rather than omissions:
+    //    nothing is MISSING any more (attn_step and gdn_step are both in the op-shaped table), and the one
+    //    PARTIAL entry is named -- gdn_step's reference covers the delta-rule core, not the whole layer, and a
+    //    partial oracle presented as a whole one is the failure this registry exists to prevent.
     const std::string missing = op_coverage();
-    check(missing == "gdn_step",
-          "op_coverage() names exactly the unregistered ops (got \"" + missing + "\")");
+    check(missing.empty(), "op_coverage() names no unregistered op (got \"" + missing + "\")");
+    const std::string partial = onebit::npu::plan::op_partial_coverage();
+    check(partial == "gdn_step",
+          "op_partial_coverage() names exactly the partially covered op (got \"" + partial + "\")");
 
     // 4. A reference that is handed bad dimensions refuses rather than computing garbage.
     float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};

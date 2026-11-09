@@ -187,8 +187,64 @@ bool attn_step_ref(const OpCall& call) {
 }
 
 namespace {
+// ── gdn_step: the delta-rule core ──────────────────────────────────────────────────────────────────
+namespace {
+constexpr float kGdnK[] = {2.0f};
+constexpr float kGdnV[] = {3.0f};
+constexpr float kGdnQ[] = {1.0f};
+constexpr float kGdnWantNoDecay[] = {3.0f};    // S = 1 + 2*1
+constexpr float kGdnWantDecay[] = {4.5f};      // S = 0.5 + 2*2
+constexpr float kGdnWantNoWrite[] = {0.5f};    // S = 0.5, the gate writes nothing
+// Each case owns its state buffer (the reference advances it in place); the test resets it to the case's
+// documented initial S = 1 before running, so the table stays re-runnable.
+float kGdnS0[] = {1.0f}, kGdnS1[] = {1.0f}, kGdnS2[] = {1.0f};
+
+const OpCallCase kGdnCases[] = {
+    {"dk = dv = 1, no decay, gate open",
+     "by hand: S 1, k 2, v 3, g 0, beta 1 -> err = 3 - 1*2 = 1, S = 1 + 2*1 = 3, out = S*q = 3",
+     {OpId::gdn_step, kGdnQ, nullptr, nullptr, 0, 0, nullptr, kGdnS0, kGdnK, kGdnV, 1, 1, 1.0f, 0.0f},
+     kGdnWantNoDecay, 1},
+    {"dk = dv = 1, half decay, gate open",
+     "by hand: S 1*exp(ln 0.5) = 0.5, err = 3 - 0.5*2 = 2, S = 0.5 + 2*2 = 4.5, out = 4.5",
+     {OpId::gdn_step, kGdnQ, nullptr, nullptr, 0, 0, nullptr, kGdnS1, kGdnK, kGdnV, 1, 1, 1.0f, -0.6931471805599453f},
+     kGdnWantDecay, 1},
+    {"dk = dv = 1, half decay, gate closed",
+     "by hand: S = 0.5 and beta = 0 writes nothing, so out = 0.5 -- pins that the gate multiplies the write "
+     "rather than being added to it",
+     {OpId::gdn_step, kGdnQ, nullptr, nullptr, 0, 0, nullptr, kGdnS2, kGdnK, kGdnV, 1, 1, 0.0f, -0.6931471805599453f},
+     kGdnWantNoWrite, 1},
+};
+}  // namespace
+
+bool gdn_delta_ref(const OpCall& call) {
+    if (!call.state || !call.k || !call.v || !call.q || !call.out || call.dk <= 0 || call.dv <= 0) return false;
+    const int dk = call.dk, dv = call.dv;
+    std::vector<double> S(static_cast<size_t>(dk) * dv), err(static_cast<size_t>(dv));
+    for (size_t i = 0; i < S.size(); ++i) S[i] = double(call.state[i]);
+    const double decay = std::exp(double(call.g));
+    for (auto& s : S) s *= decay;                       // 1. decay the state
+    for (int j = 0; j < dv; ++j) {                      // 2. err = v - S^T k  (S is [dk][dv])
+        double acc = 0.0;
+        for (int i = 0; i < dk; ++i) acc += S[size_t(i) * dv + j] * double(call.k[i]);
+        err[size_t(j)] = double(call.v[j]) - acc;
+    }
+    for (int i = 0; i < dk; ++i)                        // 3. rank-1 write: S += beta * k (x) err
+        for (int j = 0; j < dv; ++j) S[size_t(i) * dv + j] += double(call.beta) * double(call.k[i]) * err[size_t(j)];
+    for (int j = 0; j < dv; ++j) {                      // 4. readout: out = S^T q
+        double acc = 0.0;
+        for (int i = 0; i < dk; ++i) acc += S[size_t(i) * dv + j] * double(call.q[i]);
+        call.out[j] = float(acc);
+    }
+    for (size_t i = 0; i < S.size(); ++i) call.state[i] = float(S[i]);
+    return true;
+}
+
 const OpCallEntry kCallEntries[] = {
-    {OpId::attn_step, &attn_step_ref, kAttnCases, sizeof(kAttnCases) / sizeof(kAttnCases[0])},
+    {OpId::attn_step, &attn_step_ref, kAttnCases, sizeof(kAttnCases) / sizeof(kAttnCases[0]), nullptr},
+    {OpId::gdn_step, &gdn_delta_ref, kGdnCases, sizeof(kGdnCases) / sizeof(kGdnCases[0]),
+     "the delta-rule core (state update + readout); the layer's conv, q/k/v/a/b projections, per-head norms and "
+     "gates are gemv-shaped and covered by the first table, and their parameters are what load_block() makes "
+     "resident"},
 };
 }  // namespace
 
@@ -198,6 +254,16 @@ const OpCallEntry* find_op_call(OpId op) {
     return nullptr;
 }
 size_t op_call_entry_count() { return sizeof(kCallEntries) / sizeof(kCallEntries[0]); }
+
+std::string op_partial_coverage() {
+    std::string partial;
+    for (const auto& e : kCallEntries) {
+        if (!e.scope || !*e.scope) continue;
+        if (!partial.empty()) partial += ",";
+        partial += op_name(e.op);
+    }
+    return partial;
+}
 const OpCallEntry& op_call_entry(size_t i) { return kCallEntries[i]; }
 
 }  // namespace onebit::npu::plan

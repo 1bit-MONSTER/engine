@@ -101,6 +101,20 @@ struct OpCall {
     const float* vcache = nullptr;
     int pos = 0, hd = 0;
     float* out = nullptr;
+    // gdn_step: the delta-rule CORE of one layer step -- the stateful, order-sensitive half.
+    //   state [dk][dv] in and out (the recurrence, advanced in place)
+    //   k     [dk], v [dv], q [dk]   the layer's projected vectors for this position
+    //   beta  the write gate, g the log decay (g = 0 means no decay; exp(g) is applied to the state)
+    // The projections and norms around the core are gemv/elementwise ops covered by the first table, and
+    // `npu/target/target.h`'s CONTRACT says the layer takes them from what `load_block()` made resident --
+    // so a reference for the whole layer would have to be a reimplementation of it, which is not what this
+    // entry claims. Scope is stated here and in every case's `how`, because a partial oracle presented as a
+    // whole one is exactly the failure this registry exists to prevent.
+    float* state = nullptr;
+    const float* k = nullptr;
+    const float* v = nullptr;
+    int dk = 0, dv = 0;
+    float beta = 0.0f, g = 0.0f;
 };
 using OpCallRefFn = bool (*)(const OpCall&);
 
@@ -119,9 +133,20 @@ struct OpCallEntry {
     OpCallRefFn ref;
     const OpCallCase* cases;
     size_t n_cases;
+    // Empty when the reference covers the WHOLE op as a plan names it. Non-empty says which part it covers,
+    // because a partial oracle presented as a whole one is the failure this registry exists to prevent:
+    // `gdn_step` as a plan names it is a whole layer (conv, four projections, per-head norms and gates, then the
+    // delta rule), and only the delta rule is hand-derivable -- the rest comes from what `load_block()` made
+    // resident. `op_partial_coverage()` is what keeps that a stated gap instead of an implied coverage.
+    const char* scope;
 };
 
 const OpCallEntry* find_op_call(OpId op);
+
+// The ops whose entry states a PARTIAL scope, comma separated ("" when every entry is whole). The companion
+// question to op_coverage(): that one says "nothing registered", this one says "registered, and here is what it
+// does not cover" -- so a plan naming such an op is known to be less guarded than one naming a whole entry.
+std::string op_partial_coverage();
 size_t op_call_entry_count();
 const OpCallEntry& op_call_entry(size_t i);
 
@@ -129,6 +154,15 @@ const OpCallEntry& op_call_entry(size_t i);
 // cases: with hd = 2 and q = (1, 0), the first score is 1/sqrt(2) and the second 0, so the softmax is
 // (0.6698, 0.3302) and the output (1.6605, 2.6605); with pos = 1 the softmax is 1 and the output IS v0.
 bool attn_step_ref(const OpCall& call);
+
+// `gdn_step`'s delta-rule core: S <- exp(g) * S; err = v - S^T k; S <- S + beta * k (x) err; out = S^T q.
+// Hand-derived cases (dk = dv = 1, so each one is one line of arithmetic a reader can redo):
+//   S 1, k 2, v 3, g 0,  beta 1, q 1  ->  S stays 1, err = 3 - 1*2 = 1, S = 1 + 2*1 = 3, out = 3
+//   same but g = ln(0.5)              ->  S = 0.5, err = 3 - 0.5*2 = 2, S = 0.5 + 2*2 = 4.5, out = 4.5
+//   same but beta 0                   ->  S = 0.5 only (no write), out = 0.5
+// The g = 0 case and the beta = 0 case together pin the ORDER (decay, then write) and that a zero gate
+// really writes nothing; an implementation that added before decaying passes neither.
+bool gdn_delta_ref(const OpCall& call);
 
 // The two references this build implements.  `gemv_ref` is C[m][n] = A[m][k] x B[k][n]; `lm_head_ref` is
 // the same product with m == 1 (the plan layer's lm-head contract), kept separate so its own cases name the

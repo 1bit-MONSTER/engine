@@ -257,12 +257,19 @@ descendants() {   # <pid> -> its descendants and then itself, deepest last
 }
 kill_tree() {
     local root=$1 grace=${2:-10} i=0 p
-    for p in $(descendants "$root"); do kill -TERM "$p" 2> /dev/null; done
-    while kill -0 "$root" 2> /dev/null && [ "$i" -lt "$grace" ]; do
+    # Snapshot ONCE, before any signal. Re-walking after TERM loses exactly the processes this pass exists for: a
+    # process that ignores TERM is the one still alive when the second walk runs, and if its own parent exited during
+    # the grace period it has been reparented (to init or a subreaper), so `ps --ppid "$root"` no longer links it to the
+    # ticket. The KILL pass then cannot see it and the orphan survives the hold -- which is the failure this function was
+    # written to end. A snapshot also fixes the grace period: `kill -0` with a pid list is true while ANY of them lives,
+    # so a wrapper that exits promptly no longer denies its children the grace they were promised.
+    local tree; tree=$(descendants "$root")
+    for p in $tree; do kill -TERM "$p" 2> /dev/null; done
+    while kill -0 $tree 2> /dev/null && [ "$i" -lt "$grace" ]; do
         sleep 1
         i=$((i + 1))
     done
-    for p in $(descendants "$root"); do kill -KILL "$p" 2> /dev/null; done
+    for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
 
 watch() {
@@ -271,14 +278,18 @@ watch() {
         t=$(tctl)
         if [ "$t" -ge "$TCTL_ABORT" ]; then
             log "ABORT die at ${t}C (limit ${TCTL_ABORT}C)"
-            kill_tree "$target"
+            kill_tree "$target" "${GPU_HOLD_KILL_GRACE:-10}"
             return
         fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
             log "max hold of ${MINUTES} min reached"
-            kill_tree "$target"
+            kill_tree "$target" "${GPU_HOLD_KILL_GRACE:-10}"
             return
         fi
+        # the command is gone: nothing left to guard. This is also what lets the caller simply WAIT for this
+        # shell instead of killing it — a kill here would land inside kill_tree's grace period and cancel the
+        # KILL pass, which is how a TERM-ignoring descendant survived its ticket.
+        kill -0 "$target" 2> /dev/null || return
     done
 }
 watch "$child" &
@@ -290,8 +301,23 @@ rc=$?
 if [ "$rc" = 143 ] && [ "$(date +%s)" -ge "$deadline" ]; then rc=124; fi
 held=$(( $(date +%s) - started ))
 
+# Reap the watchdog BEFORE killing anything it may be in the middle of: it is the process that runs
+# kill_tree, and its TERM pass is what makes `wait "$child"` return. Killing it here (which is what this
+# did) ends it inside its own grace period, so the KILL half of kill_tree never runs and a descendant that
+# ignores TERM survives its ticket — exactly the orphans this was written to stop.
+# Wait for the watchdog to finish rather than killing it: it is the process that runs kill_tree, its TERM
+# pass is what made `wait "$child"` return, and a kill here lands inside its grace period and cancels the
+# KILL pass — which is exactly how a descendant that ignores TERM outlived its ticket. It returns on its
+# own as soon as the command is gone (see watch()), so a normal hold pays nothing for this.
+i=0
+while kill -0 "$watchdog" 2> /dev/null && [ "$i" -lt "${GPU_HOLD_WATCHDOG_WAIT:-$(( ${GPU_HOLD_KILL_GRACE:-10} + 5 ))}" ]; do
+    sleep 1
+    i=$((i + 1))
+done
 kill "$watchdog" 2> /dev/null
 wait "$watchdog" 2> /dev/null
+# And end whatever is left from here too, so the promise does not depend on a helper having outlived its parent.
+kill_tree "$child"
 log "command exited $rc after ${held}s"
 release
 exit "$rc"

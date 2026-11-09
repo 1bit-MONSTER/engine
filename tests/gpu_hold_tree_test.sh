@@ -66,4 +66,41 @@ if kill -0 "$deep" 2> /dev/null; then
     exit 1
 fi
 echo "ok   the grandchild was killed with the hold (hold rc=$rc)"
+
+# The case above is the one `pkill -P` failed, and a `sleep` dies on TERM, so it only ever exercises the TERM pass. The
+# processes that became 14-hour orphans are the ones that IGNORE TERM, and the trap is that their parent exits on TERM:
+# once reparented they are no longer reachable from the ticket, so a KILL pass that re-walks the tree cannot find them.
+# This arm is that shape - a TERM-ignoring grandchild whose mid-level parent exits during the grace period.
+cat > "$scratch/mid_stubborn.sh" <<'MID'
+#!/bin/bash
+trap '' TERM                       # the wrapper ignores TERM, like a server that installs its own handler
+( trap '' TERM; exec -a gpu-hold-survivor sleep 300 ) &
+echo $! > "$1/stubborn.pid"
+sleep 300
+MID
+cat > "$scratch/wrapper_quitter.sh" <<'WRAP'
+#!/bin/bash
+bash "$1/mid_stubborn.sh" "$1" &
+echo $! > "$1/mid.pid"
+sleep 300
+WRAP
+chmod +x "$scratch/mid_stubborn.sh" "$scratch/wrapper_quitter.sh"
+rm -f "$scratch/stubborn.pid"
+
+GPU_QUEUE_DIR=$q GPU_TOKEN_FILE=$scratch/TOKEN GPU_HOLD_LOG=$scratch/log \
+GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
+GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE=$scratch/tctl GPU_HOLD_THERMAL_FLAG=$scratch/x \
+    "$hold" -t 0.05 -l selftest-tree-stubborn -- "$scratch/wrapper_quitter.sh" "$scratch" >/dev/null 2>&1
+
+stubborn=$(cat "$scratch/stubborn.pid" 2>/dev/null)
+if [ -z "$stubborn" ]; then
+    echo "FAIL the stubborn wrapper never wrote stubborn.pid"; exit 1
+fi
+if kill -0 "$stubborn" 2> /dev/null; then
+    echo "FAIL the TERM-ignoring grandchild ($stubborn) survived the hold - this is the 14-hour-orphan shape"
+    kill -9 "$stubborn" 2> /dev/null
+    exit 1
+fi
+echo "ok   the TERM-ignoring grandchild was killed too"
+
 echo "gpu_hold_tree: ok"

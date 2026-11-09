@@ -2138,6 +2138,27 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // learned to read fail at the first byte, with "cannot open <pack>/model.onnx".
     const bool tok_present = !find_token_fconst(pack_dir).empty();
     const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph_filename(pack_dir));
+    // A graph whose quantised matmuls name a `*.qweight.empty` placeholder *and* whose packed siblings carry no bytes
+    // has no weights in the graph at all. On this line that means model.bin: 1.8/R1-Distill ship their 4-bit weights
+    // there and keep `[0]`-dims placeholders in the graph, and this importer has no model.bin reader. Refusing here
+    // names the file and the count; without it the walk reaches bytes_of()'s `ext.find("")` and reports
+    // "<tensor>.qweight.empty: no data", which says the bytes are missing rather than that they are somewhere this
+    // importer does not read (engine#1671). Narrow on purpose: it can only fire when NO matmul resolved to bytes, so a
+    // pack that imports today cannot start failing because of it.
+    {
+        size_t unresolved = 0;
+        for (const auto& mm : onnx.matmuls)
+            if (!mm.weight.empty() && mm.weight.find(".empty") != std::string::npos) ++unresolved;
+        std::error_code bin_ec;
+        const auto bin_size = fs::file_size(fs::path(pack_dir) / "model.bin", bin_ec);
+        if (unresolved > 0 && unresolved == onnx.matmuls.size() && !bin_ec)
+            throw std::runtime_error(
+                std::to_string(unresolved) + " MatMulNBits weight(s) in this graph are `*.qweight.empty` placeholders and "
+                "none of their `*.qweight.packed` siblings carries bytes; the pack carries model.bin (" +
+                std::to_string(static_cast<unsigned long long>(bin_size)) + " B), which is the 1.8/hybrid genre: the "
+                "4-bit weights live there and this importer has no model.bin reader, it reads ONNX initializers only. "
+                "Refusing rather than reading zero-length placeholders as weights (engine#1671)");
+    }
     std::map<std::string, const uint8_t*> ext;
     std::map<std::string, size_t> ext_size;
     for (const auto& t : onnx.tensors) {

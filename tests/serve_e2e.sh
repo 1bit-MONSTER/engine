@@ -42,9 +42,13 @@ log=$(mktemp)
 # serve binds (engine #1444/#1485). The budget is generous because this test loads a real model before it is ready.
 "$bin" serve -m "$model" --device "$device" --port 0 --alias e2e-model "$@" >"$log" 2>&1 &
 pid=$!
-port=$(serve_port_wait "$log" "$pid" 12000) || { echo "FAIL serve never reported a port"; cat "$log"; exit 1; }
+# Registered BEFORE the wait, not after it (engine #1545 review): this branch fires when serve never became ready --
+# i.e. while it is still loading a model and holding that model's GTT -- and an `exit 1` above the trap registration
+# leaves that process running with nothing to reap it. That is the 51 GiB orphan shape from 11-08, produced by a test
+# whose own failure path was the leak.
 cleanup() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$log"; }
 trap cleanup EXIT
+port=$(serve_port_wait "$log" "$pid" 12000) || { echo "FAIL serve never reported a port"; cat "$log"; exit 1; }
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 api="http://127.0.0.1:$port"

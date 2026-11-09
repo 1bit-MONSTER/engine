@@ -2329,27 +2329,66 @@ void test_im_from_node_attrs(const std::string& root) {
     const fs::path dir = fs::path(root) / "imattrs";
     fs::remove_all(dir);
     fs::create_directories(dir);
-    auto mm = [](const std::string& n, int64_t K, int64_t N) {
-        return pb::matmulnbits(n, {"x", n + ".qweight", n + ".scales", n + ".zeros"}, K, N, 4, 32);
+    auto mm_named = [](const std::string& weight, const std::string& in, int64_t K, int64_t N) {
+        return pb::matmulnbits(weight, {in, weight, weight + ".scales", weight + ".zeros"}, K, N, 4, 32);
     };
-    // the branch: gate and up (K = hidden, N = IM), down (K = IM, N = hidden), a "mobius" width, and lm_head
+    auto mm = [&](const std::string& n, int64_t K, int64_t N) { return mm_named(n, "x", K, N); };
+    const std::string mlp = "model.layers.0.mlp.";
+    // the branch: gate and up (K = hidden, N = IM) reading ONE activation, down (K = IM, N = hidden), a "mobius" width,
+    // and lm_head -- the e4b shape, with the role names the genre carries
     const std::string branch = pb::graph(
-        {}, {mm("gate", 2560, 10240), mm("up", 2560, 10240), mm("down", 10240, 2560), mm("mobius", 2560, 2048),
-             mm("lm_head", 2560, 262144)});
+        {}, {mm_named(mlp + "gate_proj.MatMulNBits.qweight", "h", 2560, 10240),
+             mm_named(mlp + "up_proj.MatMulNBits.qweight", "h", 2560, 10240),
+             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 10240, 2560),
+             mm_named("model.layers.0.mobius.MatMulNBits.qweight", "m", 2560, 2048),
+             mm_named("lm_head.MatMulNBits.qweight", "l", 2560, 262144)});
     put_file((dir / "model.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", branch)}));
     const int im = pi::intermediate_size_from_graph((dir / "model.onnx").string(), 2560);
     std::printf("im-from-node-attrs: derived %d from the If branch's gate/up and down pair (hidden 2560)\n", im);
     check(im == 10240, "im-from-node-attrs: the FFN pair inside the If branch gives 10240 (" + std::to_string(im) + ")");
+
+    // The review's case (#1657): attention forms the same (N == other's K, K == hidden) shape. With q_dim 4096 > hidden
+    // 2560, a bare "pair that agrees" returns 4096 as the FFN width while the true value is 9728 (fused gate_up N=19456,
+    // down K=19456). Attention must not be able to answer, and the fused pair must.
+    const std::string attn = "model.layers.0.attn.";
+    const std::string wider = pb::graph(
+        {}, {mm_named(attn + "q_proj.MatMulNBits.qweight", "h", 2560, 4096),
+             mm_named(attn + "o_proj.MatMulNBits.qweight", "q", 4096, 2560),
+             mm_named(attn + "k_proj.MatMulNBits.qweight", "h", 2560, 2048),
+             mm_named(attn + "v_proj.MatMulNBits.qweight", "h", 2560, 2048),
+             mm_named(mlp + "gate_up_proj.MatMulNBits.qweight", "h", 2560, 19456),
+             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 19456, 2560)});
+    put_file((dir / "model2.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", wider)}));
+    const int im2 = pi::intermediate_size_from_graph((dir / "model2.onnx").string(), 2560);
+    std::printf("im-from-node-attrs: q_dim 4096 > hidden 2560, fused gate_up -> %d (must not be 4096)\n", im2);
+    check(im2 == 9728, "im-from-node-attrs: wider attention does not become the FFN width; the fused pair gives 9728 (" +
+                           std::to_string(im2) + ")");
+
+    // Attention only, wider than hidden, no FFN at all: 0, never q_dim.
+    const std::string attnonly = pb::graph(
+        {}, {mm_named(attn + "q_proj.MatMulNBits.qweight", "h", 2560, 4096),
+             mm_named(attn + "o_proj.MatMulNBits.qweight", "q", 4096, 2560)});
+    put_file((dir / "model3.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", attnonly)}));
+    check(pi::intermediate_size_from_graph((dir / "model3.onnx").string(), 2560) == 0,
+          "im-from-node-attrs: an attention-only graph wider than hidden yields 0, not the attention width");
+
     // Two widths that both pair up is a derivation that can be wrong in two ways: refused, not picked from.
     const std::string ambiguous = pb::graph(
-        {}, {mm("gate", 2560, 10240), mm("down", 10240, 2560), mm("gate2", 2560, 4096), mm("down2", 4096, 2560)});
-    put_file((dir / "model2.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", ambiguous)}));
-    check(pi::intermediate_size_from_graph((dir / "model2.onnx").string(), 2560) == 0,
+        {}, {mm_named(mlp + "gate_proj.MatMulNBits.qweight", "h", 2560, 10240),
+             mm_named(mlp + "up_proj.MatMulNBits.qweight", "h", 2560, 10240),
+             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 10240, 2560),
+             mm_named("model.layers.1.mlp.gate_proj.MatMulNBits.qweight", "h2", 2560, 4096),
+             mm_named("model.layers.1.mlp.up_proj.MatMulNBits.qweight", "h2", 2560, 4096),
+             mm_named("model.layers.1.mlp.down_proj.MatMulNBits.qweight", "a2", 4096, 2560)});
+    put_file((dir / "model4.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", ambiguous)}));
+    check(pi::intermediate_size_from_graph((dir / "model4.onnx").string(), 2560) == 0,
           "im-from-node-attrs: two agreeing widths are refused rather than picked from");
-    // No down projection at all (attention-only graphs, which is the hybrid line's main graph) is 0, not a guess.
-    const std::string noffn = pb::graph({}, {mm("q_proj", 2560, 256), mm("o_proj", 256, 2560)});
-    put_file((dir / "model3.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", noffn)}));
-    check(pi::intermediate_size_from_graph((dir / "model3.onnx").string(), 2560) == 0,
+
+    // An FFN with no down projection at all (attention-only graphs, the hybrid line's main graph) is 0, not a guess.
+    const std::string noffn = pb::graph({}, {mm_named(attn + "q_proj.MatMulNBits.qweight", "h", 2560, 256),
+                                             mm_named(attn + "o_proj.MatMulNBits.qweight", "q", 256, 2560)});
+    put_file((dir / "model5.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", noffn)}));
+    check(pi::intermediate_size_from_graph((dir / "model5.onnx").string(), 2560) == 0,
           "im-from-node-attrs: a graph with no FFN pair yields 0 (the caller keeps refusing)");
     fs::remove_all(dir);
 }

@@ -1074,18 +1074,47 @@ Dims read_dims_exported(const json& c, const std::string& source) { return read_
 int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) {
     if (hidden <= 0) return 0;
     const OnnxModel m = parse_onnx(model_path);
-    std::set<int64_t> down_k, gate_n;
+    // Attention forms the same (N == others' K, K == hidden) shape as the FFN: q_proj is (N = heads*head_dim, K = hidden)
+    // and o_proj is (N = hidden, K = heads*head_dim), so a bare "pair that agrees" returns the ATTENTION width as
+    // intermediate_size on any model whose attention is wider than its hidden size (review of #1657: fused gate_up +
+    // q_dim 4096 against a true 9728 gave 4096 -- a silently wrong number from a function whose contract is to refuse).
+    // Two things keep it out, and neither is a guess:
+    //   1. the role names this genre really carries (`...attn.qkv_proj.MatMulNBits.qweight`, `...mlp.down_proj...`), and
+    //   2. a structural witness the FFN has and attention does not: gate AND up read the SAME activation tensor, so two
+    //      nodes share one input and one N. A lone q_proj never does, and o_proj has no partner.
+    // A fused gate_up (N = 2*w over the hidden width) is paired explicitly with the down projection's K = 2*w.
+    const auto excluded = [](const std::string& weight) {
+        for (const char* role : {"attn", "q_proj", "k_proj", "v_proj", "o_proj", "qkv", "lm_head"})
+            if (weight.find(role) != std::string::npos) return true;
+        return false;
+    };
+    std::map<std::string, std::map<int64_t, int>> shared;  // activation tensor -> N -> how many nodes read it
+    std::set<int64_t> down_k, gate_n;                     // down: N == hidden, K > hidden;  gate/up: K == hidden, N > hidden
     for (const auto& mm : m.matmuls) {
+        if (mm.K <= 0 || mm.N <= 0 || excluded(mm.weight)) continue;
+        if (mm.K == hidden && mm.N > hidden) {
+            shared[mm.data][mm.N]++;
+            gate_n.insert(mm.N);
+        }
         if (mm.N == hidden && mm.K > hidden) down_k.insert(mm.K);
-        if (mm.K == hidden && mm.N > hidden) gate_n.insert(mm.N);
     }
-    std::set<int64_t> agree;
-    for (const int64_t k : down_k)
-        if (gate_n.count(k)) agree.insert(k);
-    if (agree.size() != 1) return 0;
-    return int(*agree.begin());
+    // separate gate/up first: it is the witness attention cannot produce
+    std::set<int64_t> separate;
+    for (const int64_t dk : down_k)
+        for (const auto& [activation, by_n] : shared) {
+            const auto it = by_n.find(dk);
+            if (it != by_n.end() && it->second >= 2) separate.insert(dk);
+        }
+    if (separate.size() == 1) return int(*separate.begin());
+    if (separate.size() > 1) return 0;
+    // else a fused gate_up: ONE node covers gate and up, so its N is 2*w and the down projection's K is the same 2*w --
+    // the agreeing value is 2*w and the FFN width is half of it
+    std::set<int64_t> fused;
+    for (const int64_t dk : down_k)
+        if (dk % 2 == 0 && gate_n.count(dk)) fused.insert(dk / 2);
+    if (fused.size() != 1) return 0;
+    return int(*fused.begin());
 }
-
 int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg) {
     return fill_from_model_config_impl(pack_dir, cfg);
 }

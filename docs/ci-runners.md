@@ -96,8 +96,41 @@ WantedBy=multi-user.target
 ## The dedicated user
 
 The jobs used to run as the owner (`User=bcloud`). They now run as `ghrunner`: no shell, home
-`/var/lib/ghrunner`, and the runner's `_work` tree under it. That account holds no ssh keys, no `~/models` and no
-fleet remotes — anything a job writes into `$HOME` lands there, not in the owner's tree.
+`/var/lib/ghrunner`, and the runner's `_work` tree under it. Anything a job writes into `$HOME` lands there, not
+in the owner's tree, and the account holds no ssh keys and no fleet git remotes of its own.
+
+**It is not read-isolation of the owner's files, though** — `/home/bcloud` is `drwxrwxr-x` on this box, so a job
+as `ghrunner` can read whatever in the owner's home is world-readable. The isolation is per-process and
+per-account (a job cannot use the owner's keys to push, and its `$HOME` writes are its own); if read-isolation is
+wanted too, that is `chmod o-rx /home/bcloud` — the owner's call, because it changes the box for every other lane
+as well.
+
+### The fleet's shared state, which the jobs assume is in `$HOME`
+
+The workflows and the scripts they call reach the box's shared state through `$HOME`, so a runner with an empty
+home does not merely lose the tools — **it takes a different GPU token**:
+
+| the jobs use | via |
+|---|---|
+| `~/lb/thermal-run.sh` (`hrx-build.yml:111,132`, `hw-gate.yml:33-34`) | the thermal governor every build runs under |
+| `gpu-hold`, `npu-hold` | `command -v`, i.e. `~/.local/bin` on `PATH` (`hw-gate.sh:53-88`) |
+| `~/GPU-TOKEN`, `~/GPU-QUEUE`, `~/NPU-TOKEN`, `~/NPU-QUEUE` | the token files the whole fleet queues on |
+
+Run as `ghrunner` with an empty home, `command -v gpu-hold` finds nothing (or the repo copy beside the script),
+`~` resolves to `/var/lib/ghrunner`, and the hardware gate then queues on **its own** token file while every
+other lane holds the real one — GPU work running concurrently with a holder, which is exactly what the "devices
+only via gpu-hold" rule exists to prevent.
+
+So the installer links those six paths from the runner's home into the account that already has them
+(`--share-with`, default `bcloud`), puts the runner's account in that account's group, makes the queue
+directories and token files group-writable (removing world access), sets `PATH` in the unit so `command -v`
+resolves the shared `gpu-hold`, and enables lingering for the runner's user so `thermal-run.sh`'s
+`systemctl --user` has a user manager to talk to. `--no-share` skips all of that, for a box with no fleet.
+
+What that deliberately does **not** share is `~/.cache`, which is `0700` on the owner's account: the persistent
+build trees (`~/.cache/hrx-build/bench`, `~/.cache/hw-gate`) and the `pr-agent-venv-*` environments therefore
+move, and the first runs on a fresh install are cold — `hrx-build`'s "rebuild only what changed" starts from
+zero once.
 
 What it still needs, and the honest price of each:
 
@@ -105,7 +138,7 @@ What it still needs, and the honest price of each:
 |---|---|---|
 | `docker` group | the bench jobs run containers (podman/docker images for the distro proofs) | **docker group is root-equivalent** — a job that runs `docker run -v /:/h …` can read the box. It is narrower than the owner's account but not a sandbox |
 | `render` (or `video`) group | `/dev/kfd` and `/dev/dri/renderD*` at `0660` for the GPU jobs | device access only |
-| read on the models directory | `pr-agent` starts the local LLM through `1bit serve` | the same models any job could already load |
+| the fleet group (the owner's primary group) | the shared `~/lb`, `~/.local/bin` and the queue/token files above | jobs write the real queue, so a runner is a full member of the fleet, not a bystander — which is the point |
 
 If that trade is not wanted, the next step is rootless podman (or a docker socket proxy that only allows the
 images the workflows name) and dropping the `docker` group — that is a change to the workflows, not to this

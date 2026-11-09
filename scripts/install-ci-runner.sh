@@ -42,13 +42,19 @@
 #   --user USER            dedicated user (default: ghrunner)
 #   --groups LIST          extra groups for that user (default: docker; use "" for none)
 #   --memory-max SIZE      MemoryMax for the unit (default: 48G); MemoryHigh is 90% of it
+#   --share-with USER      the existing user whose fleet state the jobs must keep using (default: the owner
+#                          account, bcloud). Its ~/lb, ~/.local/bin, ~/GPU-TOKEN, ~/GPU-QUEUE, ~/NPU-TOKEN
+#                          and ~/NPU-QUEUE are linked into the runner's home, and the runner's account joins
+#                          that user's group so it can write the queue. Without this a job would take ITS OWN
+#                          GPU token and run GPU work concurrently with every lane holding the real one
+#   --no-share             skip that (only for a box with no fleet to share with)
 #   --env-file FILE        optional EnvironmentFile= for the unit
 #   --dry-run              print the unit and verify it, change nothing
 #   --verify               only report the installed unit's state
 set -euo pipefail
 
 name=strixhalo-engine labels=pr-agent user=ghrunner groups=docker memory_max=48G
-token_file='' runner_dir='' runner_version='' env_file='' dry=0 verify=0
+token_file='' runner_dir='' runner_version='' env_file='' share_with=bcloud no_share=0 dry=0 verify=0
 usage() { sed -n '16,48p' "$0"; }
 
 while [ $# -gt 0 ]; do
@@ -62,6 +68,8 @@ while [ $# -gt 0 ]; do
         --groups) groups=$2; shift 2 ;;
         --memory-max) memory_max=$2; shift 2 ;;
         --env-file) env_file=$2; shift 2 ;;
+        --share-with) share_with=$2; shift 2 ;;
+        --no-share) no_share=1; shift ;;
         --dry-run) dry=1; shift ;;
         --verify) verify=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -91,6 +99,8 @@ Type=simple
 User=$user
 WorkingDirectory=$dir
 ExecStart=$dir/runsvc.sh
+# hw-gate.sh resolves gpu-hold with `command -v`, and the runner's PATH is what decides which token it takes
+Environment=PATH=/var/lib/$user/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 $( [ -n "$env_file" ] && echo "EnvironmentFile=$env_file" )
 # runsvc.sh exits 0 after an OOM kill ("no retry needed"), so on-failure would leave the runner dead.
 Restart=always
@@ -190,6 +200,45 @@ if [ ! -f "$dir/.runner" ]; then
     echo "registered runner $name with labels self-hosted,Linux,X64,$labels"
 fi
 chown -R "$user:" "$dir"
+
+# --- the fleet's state, at the paths the jobs already assume ---------------------------------------------
+# The workflows and scripts reach the box's shared state through $HOME: ~/lb/thermal-run.sh (the thermal
+# governor every build runs under), ~/.local/bin/gpu-hold (found with `command -v`), and the queue/token files
+# ~/GPU-TOKEN, ~/GPU-QUEUE, ~/NPU-TOKEN, ~/NPU-QUEUE. A runner whose home is empty therefore does not just lose
+# the tools - it takes a DIFFERENT GPU token and queues beside nobody, which is the one thing the fleet's hold
+# rule exists to prevent (engine #1504 review). So the runner's home carries the same absolute paths, linked
+# into the account that already holds them, and the runner joins that account's group to write the queue.
+if [ "$no_share" = 0 ]; then
+    id "$share_with" >/dev/null 2>&1 || { echo "install-ci-runner.sh: --share-with user '$share_with' does not exist (use --no-share on a box with no fleet)" >&2; exit 2; }
+    share_home=$(getent passwd "$share_with" | cut -d: -f6)
+    share_group=$(id -gn "$share_with")
+    id -nG "$user" | tr ' ' '\n' | grep -qx "$share_group" || usermod -aG "$share_group" "$user"
+    # the tools and the hold state, by name, only when they exist: an install on a box that has not set them
+    # up yet is not an error, it is a missing feature the docs name
+    for rel in lb .local/bin GPU-TOKEN GPU-QUEUE NPU-TOKEN NPU-QUEUE; do
+        src="$share_home/$rel" dst="/var/lib/$user/$rel"
+        if [ -e "$src" ]; then
+            mkdir -p "$(dirname "$dst")"
+            [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ] && continue
+            if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+                echo "warning: /var/lib/$user/$rel exists as a real path; leaving it (move it aside to share $src)" >&2
+                continue
+            fi
+            ln -sfn "$src" "$dst"
+            echo "shared: ~/$rel -> $src"
+        fi
+    done
+    # the queue and the token files must be writable by the runner's new group; the modes are the owner's, so
+    # they are tightened here rather than left to chance (0775 dir / 0664 file: group read+write, no world)
+    [ -d "$share_home/GPU-QUEUE" ] && chgrp -R "$share_group" "$share_home/GPU-QUEUE" && chmod -R g+rwX,o-rwx "$share_home/GPU-QUEUE"
+    [ -d "$share_home/NPU-QUEUE" ] && chgrp -R "$share_group" "$share_home/NPU-QUEUE" && chmod -R g+rwX,o-rwx "$share_home/NPU-QUEUE"
+    for f in GPU-TOKEN NPU-TOKEN; do
+        if [ -f "$share_home/$f" ]; then chgrp "$share_group" "$share_home/$f"; chmod g+rw,o-rw "$share_home/$f"; fi
+    done
+    # thermal-run.sh runs under `systemctl --user`, so the account needs a user manager of its own
+    loginctl enable-linger "$user" 2>/dev/null || echo "warning: could not enable-linger $user; thermal-run.sh will use its process-group fallback"
+    echo "shared state: $share_with's group ($share_group), queue and token files group-writable"
+fi
 
 unit_text > "$unit_path"
 chmod 0644 "$unit_path"

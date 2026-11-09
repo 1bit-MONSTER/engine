@@ -281,8 +281,14 @@ def measure(pack, tiles_wanted, ref_path=None, ref_dtype="bf16"):
     tile = attn_tile_bytes(hidden)
     env = attn_payload_off(hidden)
     ntiles = vocab // K_TILE_ROWS
-    if tile == 0 or vocab % K_TILE_ROWS:
-        return None, 2, "H %d is not a multiple of %d" % (hidden, K_KBLOCK)
+    # Two conditions, two sentences. They used to share one message, which blamed H when V was the problem:
+    # `Hunyuan-0.5B-Instruct_rai_1.9.0_npu` has V 120818, not a multiple of the 64-row tile, and was refused with
+    # "H 1024 is not a multiple of 128" -- H is; V is not, and V % 64 is a property of these packs, not a defect.
+    if tile == 0:
+        return None, 2, "H %d is not a multiple of %d, so one tile has no rows to divide" % (hidden, K_KBLOCK)
+    if vocab % K_TILE_ROWS:
+        return None, 2, ("V %d is not a multiple of the %d-row tile, so the head is not a whole number of tiles "
+                         "(this is the pack's vocabulary, not its H)" % (vocab, K_TILE_ROWS))
     # WHERE the head is: the LAST `ntiles * tile` bytes. `env` on its own is only the tail's envelope -- the importer
     # reaches the head as `layers*stride + env`, which equals this subtraction whenever its size check passes
     # (engine#1693: at `env` the decode correlates at chance, at the real offset 1.0000).

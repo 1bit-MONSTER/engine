@@ -547,9 +547,39 @@ std::string find_one(const std::string& dir, const std::string& prefix, const st
 // Resolution order, and it never guesses: the 1.8 spelling first, so nothing that imports today changes; then a
 // *single* `Llm_Token_*` file. Two or more unmatched candidates is a pack shape we have not seen, and choosing the
 // alphabetically first would be a coin flip over the model's weights, so it is refused by name with the list.
+// defined with the hybrid line's graph resolution below; the fconst lookup uses it to find a component pack's decoder.
+std::string graph_filename(const std::string& pack_dir);
+
 std::string find_token_fconst(const std::string& dir, std::string* why = nullptr) {
     const std::string exact = find_one(dir, "dd_metastate_Llm_Token_Token_", ".fconst");
     if (!exact.empty()) return exact;
+    // A multi-component pack (`type: compositemodel`) keeps its LLM graph AND its Token .fconst in the component
+    // `genai_config.json` names (`decoder/`), while the config files that state the geometry stay at the pack root.
+    // #1644 taught `graph_filename()` to follow that relative path; the fconst lookup was still scanning only the root,
+    // so pointing npu-pack at the pack root reported "the pack carries no Token .fconst either" for a pack that has one
+    // two directories down. Same pack, same rule: look where the pack says its decoder is.
+    {
+        const std::string graph = graph_filename(dir);
+        const size_t slash = graph.rfind('/');
+        if (slash != std::string::npos) {
+            const std::string component = dir + "/" + graph.substr(0, slash);
+            std::error_code cec;
+            if (fs::is_directory(component, cec)) {
+                const std::string in_component = find_one(component, "dd_metastate_Llm_Token_Token_", ".fconst");
+                if (!in_component.empty()) return in_component;
+                const std::string pre2 = "dd_metastate_Llm_Token_", suf2 = ".fconst";
+                std::vector<std::string> c2;
+                for (const auto& e : fs::directory_iterator(component)) {
+                    const std::string n = e.path().filename().string();
+                    if (n.size() <= pre2.size() + suf2.size()) continue;
+                    if (n.compare(0, pre2.size(), pre2) != 0) continue;
+                    if (n.compare(n.size() - suf2.size(), suf2.size(), suf2) != 0) continue;
+                    c2.push_back(e.path().string());
+                }
+                if (c2.size() == 1) return c2.front();
+            }
+        }
+    }
     const std::string pre = "dd_metastate_Llm_Token_", suf = ".fconst";
     std::vector<std::string> cands;
     for (const auto& e : fs::directory_iterator(dir)) {
@@ -829,7 +859,29 @@ DeclaredMap read_declared(const std::string& pack_dir) {
 // walk_graph() reads the graph with its external-data declarations, decode_matmulnbits() is block-parameterised, and
 // the scale-per-32-column-group layout is the container's own.
 std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why) {
-    const std::string gpath = pack_dir + "/embedding.onnx";
+    // A multi-component pack (`type: compositemodel`) names its embedding component in genai_config.json
+    // (`model.embedding.filename = "embedding/model.onnx"`), exactly as it names its decoder; a single-graph pack keeps
+    // the flat `embedding.onnx` this reader was written for. Follow the pack's own declaration first — the same rule the
+    // graph and the Token .fconst now follow (#1644, #1657) — and fall back to the flat name.
+    std::string gpath = pack_dir + "/embedding.onnx";
+    {
+        std::ifstream gf(pack_dir + "/genai_config.json");
+        if (gf) {
+            json g;
+            try { g = json::parse(gf); } catch (...) { g = json::object(); }
+            if (g.is_object() && g.contains("model") && g["model"].is_object() && g["model"].contains("embedding") &&
+                g["model"]["embedding"].is_object()) {
+                const json& emb = g["model"]["embedding"];
+                if (emb.contains("filename") && emb["filename"].is_string()) {
+                    const std::string rel = emb["filename"].get<std::string>();
+                    if (!rel.empty() && rel.front() != '/' && rel.find("..") == std::string::npos) {
+                        std::error_code nec;
+                        if (fs::is_regular_file(pack_dir + "/" + rel, nec)) gpath = pack_dir + "/" + rel;
+                    }
+                }
+            }
+        }
+    }
     std::error_code ec;
     if (!fs::is_regular_file(gpath, ec)) { if (why) *why = "no embedding.onnx"; return {}; }
     // parse_onnx() unwraps the ModelProto's graph field and walks it; walk_graph() alone expects the GRAPH protobuf,
@@ -850,6 +902,58 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         else if (t.name.size() > 3 && t.name.compare(t.name.size() - 3, 3, "_Q4") == 0) table = &t;
         else if (!table && t.dims.size() == 2) table = &t;   // an unquantised [V, H] table
     }
+    // engine#1725: the gemma-4 components are f32 and UNQUANTISED -- an `embed_tokens` table with no `*scales*` beside
+    // it -- while the shape above is the 4-bit packed one another family ships. Reading the f32 table is worth doing
+    // (the container wants BF16 and the conversion is exact); claiming the pack is not, because its decoder also carries
+    // `per_layer_inputs`, fed by `embed_tokens_per_layer.weight` (262144x8960 on the e2b pack, i.e. layers x head_dim)
+    // and a 256-wide projection norm, and no reader here implements that mechanism yet. So: read the token table, refuse
+    // by NAME when the per-layer table is present, instead of reporting the shape mismatch as a missing table.
+    if (table && !scales) {
+        const bool per_layer = [&] {
+            for (const auto& t2 : em.tensors)
+                if (t2.name.find("embed_tokens_per_layer") != std::string::npos) return true;
+            return false;
+        }();
+        if (per_layer) {
+            if (why)
+                *why = "the component carries embedding.embed_tokens_per_layer.weight, i.e. a PER-LAYER embedding table "
+                       "(262144x8960 on gemma-4-e2b = layers x head_dim) that feeds the decoder's per_layer_inputs, and "
+                       "the per-layer embedding mechanism is not implemented here yet (engine#1725): refusing rather "
+                       "than importing a decoder without that input";
+            return {};
+        }
+        if (table->type != kF32) {
+            if (why) *why = "embed_tokens is unquantised with dtype " + std::to_string(table->type) +
+                            ", and only f32 is read here (engine#1725)";
+            return {};
+        }
+        if (table->dims.size() != 2 || table->dims.at(0) <= 0 || table->dims.at(1) <= 0) {
+            if (why) *why = "an f32 embed_tokens table must be 2-D and positive";
+            return {};
+        }
+        const int64_t Vf = table->dims.at(0), Hf = table->dims.at(1);
+        std::map<std::string, const uint8_t*> fext;
+        const uint8_t* raw = nullptr;
+        if (!table->location.empty()) {
+            size_t sz = 0;
+            std::string w3;
+            const uint8_t* m = map_file(fs::path(gpath).parent_path().string() + "/" + table->location, sz, &w3);
+            if (!m) { if (why) *why = w3; return {}; }
+            fext[table->location] = m;
+            const uint64_t need = uint64_t(Vf) * uint64_t(Hf) * 4ull;
+            if (table->offset + need > sz) {
+                if (why) *why = "embed_tokens (f32) declares more bytes than its external data carries";
+                return {};
+            }
+            raw = m + table->offset;
+        } else if (table->raw != nullptr) {
+            raw = table->raw;
+        }
+        if (raw == nullptr) { if (why) *why = "an f32 embed_tokens table with no data"; return {}; }
+        std::vector<float> out(size_t(Vf) * size_t(Hf));
+        std::memcpy(out.data(), raw, out.size() * sizeof(float));
+        return out;
+    }
     if (!table || !scales) { if (why) *why = "embedding.onnx has no embed_tokens table + scales"; return {}; }
     if (table->dims.size() != 2 || scales->dims.size() != 2) { if (why) *why = "embed_tokens dims are not 2-D"; return {}; }
     const int64_t V = table->dims.at(0), packed = table->dims.at(1), groups = scales->dims.at(1);
@@ -863,7 +967,9 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         if (t->location.empty() || ext.count(t->location)) continue;
         size_t sz = 0;
         std::string w2;
-        const uint8_t* m = map_file(pack_dir + "/" + t->location, sz, &w2);
+        // external data is named relative to the GRAPH, which for a component pack is a subdirectory: the real pack's
+        // embedding graph declares `embedding.onnx.data`, which lives beside it in `embedding/`, not at the pack root.
+        const uint8_t* m = map_file(fs::path(gpath).parent_path().string() + "/" + t->location, sz, &w2);
         if (!m) { if (why) *why = w2; return {}; }
         ext[t->location] = m;
         ext_size[t->location] = sz;
@@ -1085,6 +1191,63 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+// The 1.9 external-data genre states no FFN width anywhere a file shows it: the weights are MatMulNBitsBf nodes
+// whose initializers carry dims `[0]` (bytes live in a *.qweight.packed sibling), so the initializer-dimension
+// heuristic in plan() sees nothing. The NODE carries K and N as attributes, and walk_graph already descends into
+// the `If` branches every OGA pack keeps its decoder in. The FFN is then a pair that agrees with itself: the down
+// projection's K is the gate/up projection's N, and the gate/up projection's K is the hidden size.
+//   amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu (hidden 2560): 42 activations each feed two (N=10240,K=2560)
+//   gate/up projections, and 42 down projections are (N=2560,K=10240) -> 10240. Its per-token "mobius" paths
+//   (N=512/2048, K=2560) have no matching down projection, so they cannot be mistaken for the FFN. Measured
+//   2026-11-09 on the pack itself (onnx 1.23.2, node attributes only; its initializers' dims are all [0]).
+// Returns 0 when there is no such pair, or when two widths both pair up: a derivation that can be wrong in two
+// ways is refused rather than picked from.
+int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) {
+    if (hidden <= 0) return 0;
+    const OnnxModel m = parse_onnx(model_path);
+    // Attention forms the same (N == others' K, K == hidden) shape as the FFN: q_proj is (N = heads*head_dim, K = hidden)
+    // and o_proj is (N = hidden, K = heads*head_dim), so a bare "pair that agrees" returns the ATTENTION width as
+    // intermediate_size on any model whose attention is wider than its hidden size (review of #1657: fused gate_up +
+    // q_dim 4096 against a true 9728 gave 4096 -- a silently wrong number from a function whose contract is to refuse).
+    // Two things keep it out, and neither is a guess:
+    //   1. the role names this genre really carries (`...attn.qkv_proj.MatMulNBits.qweight`, `...mlp.down_proj...`), and
+    //   2. a structural witness the FFN has and attention does not: gate AND up read the SAME activation tensor, so two
+    //      nodes share one input and one N. A lone q_proj never does, and o_proj has no partner.
+    // A fused gate_up (N = 2*w over the hidden width) is paired explicitly with the down projection's K = 2*w.
+    const auto excluded = [](const std::string& weight) {
+        for (const char* role : {"attn", "q_proj", "k_proj", "v_proj", "o_proj", "qkv", "lm_head"})
+            if (weight.find(role) != std::string::npos) return true;
+        return false;
+    };
+    std::map<std::string, std::map<int64_t, int>> shared;  // activation tensor -> N -> how many nodes read it
+    std::set<int64_t> down_k, gate_n;                     // down: N == hidden, K > hidden;  gate/up: K == hidden, N > hidden
+    for (const auto& mm : m.matmuls) {
+        if (mm.K <= 0 || mm.N <= 0 || excluded(mm.weight)) continue;
+        if (mm.K == hidden && mm.N > hidden) {
+            shared[mm.data][mm.N]++;
+            gate_n.insert(mm.N);
+        }
+        if (mm.N == hidden && mm.K > hidden) down_k.insert(mm.K);
+    }
+    // separate gate/up first: it is the witness attention cannot produce
+    std::set<int64_t> separate;
+    for (const int64_t dk : down_k)
+        for (const auto& [activation, by_n] : shared) {
+            const auto it = by_n.find(dk);
+            if (it != by_n.end() && it->second >= 2) separate.insert(dk);
+        }
+    if (separate.size() == 1) return int(*separate.begin());
+    if (separate.size() > 1) return 0;
+    // else a fused gate_up: ONE node covers gate and up, so its N is 2*w and the down projection's K is the same 2*w --
+    // the agreeing value is 2*w and the FFN width is half of it
+    std::set<int64_t> fused;
+    for (const int64_t dk : down_k)
+        if (dk % 2 == 0 && gate_n.count(dk)) fused.insert(dk / 2);
+    if (fused.size() != 1) return 0;
+    return int(*fused.begin());
+}
+std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }
+
 // engine#1638: the geometry READ (not just its dims), so a test can assert where each number came from -- the
 // text_config lift and the top-level-wins rule are both properties of load_geometry(), not of read_dims().
 json load_geometry_exported(const std::string& pack_dir, std::string* source) { return load_geometry(pack_dir, source); }
@@ -1313,6 +1476,144 @@ constexpr int kTileRows = 64, kSubvRows = 32, kKBlock = 128;
 // §7.16.6 and §7.17.
 constexpr int64_t kMlpSubvBytes = 4288;
 constexpr int kMlpRows = 128;
+
+// ── the 1.9 external-data tile (engine#1503) ─────────────────────────────────
+// The `.fconst` tile's subvolume, written densely per tensor instead of inside the fconst envelope. Measured field by
+// field on `amd/phi-4_rai_1.9.0_npu`: the blob length is exactly `N x (K/128 + 1) x 68` on all 201 matmuls, the
+// all-zero subvolume pair sits at `index % (2*(K/128+1)) == 0,1` (the writer's bias pair, zero here), the scales read
+// as bf16 in 5.7e-3 .. 8.5e-3 while reading as ~1.0 the same bytes as f16, and the zero points are int4 nibbles
+// (`0x5555`, `0x6666`, `0xAAAA` appear as such).
+//
+// What the host side could NOT settle is which way the 128 code bytes of one row lie inside the 2,048-byte quants
+// region: the subvolume's own doc formula (`(cp%4) + kk*4 + (cp/4)*512`, known-answer verified for the .fconst tile)
+// against a plain row-major reading. Three statistics were tried and they disagreed with each other, which discredits
+// all three (they all assumed a row's codes centre on its zero-point, and the measured zero points span 0..11). So the
+// default is the verified prior and the alternative is one constant, to be settled by the known-answer run.
+const char* external_role_of(const std::string& tensor_name) {
+    struct Role {
+        const char* needle;
+        const char* role;
+    };
+    // Longest-needle-first where one name could contain another: `qkv_proj` before nothing else matters, and
+    // `gate_proj`/`up_proj`/`down_proj` do not overlap, but keeping the table explicit is cheaper than a rule.
+    static const Role kRoles[] = {
+        {"qkv_proj", "QKV"}, {"o_proj", "O"}, {"gate_proj", "G"},
+        {"up_proj", "U"},    {"down_proj", "D"}, {"lm_head", "HEAD"},
+    };
+    // A COMPONENT match, not a substring one: the needle must sit at a name boundary and be followed by a `.` or
+    // the end. `model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed` matches; `...qkv_proj_matmul` does not,
+    // and would otherwise be mapped to a role it is not -- the "guess by resemblance" failure this table exists to
+    // avoid, caught by the test below rather than by a container full of mislabelled weights.
+    for (const auto& r : kRoles) {
+        const std::string needle = r.needle;
+        for (size_t at = tensor_name.find(needle); at != std::string::npos;
+             at = tensor_name.find(needle, at + 1)) {
+            const bool left_ok = at == 0 || tensor_name[at - 1] == '.' || tensor_name[at - 1] == '/';
+            const size_t end = at + needle.size();
+            const bool right_ok = end == tensor_name.size() || tensor_name[end] == '.';
+            if (left_ok && right_ok) return r.role;
+        }
+    }
+    return nullptr;
+}
+
+bool external_container_tensors(const std::string& role, int nh, int nkv, int hd, std::vector<ContainerTensor>& out,
+                                std::string& err) {
+    out.clear();
+    if (role == "QKV") {
+        if (nh <= 0 || nkv <= 0 || hd <= 0) {
+            err = "QKV split: the geometry states no head count (nh " + std::to_string(nh) + ", nkv " +
+                  std::to_string(nkv) + ", hd " + std::to_string(hd) + ")";
+            return false;
+        }
+        const int q = nh * hd, kv = nkv * hd;
+        out.push_back({"self_attn.q_proj.weight", 0, q});
+        out.push_back({"self_attn.k_proj.weight", q, q + kv});
+        out.push_back({"self_attn.v_proj.weight", q + kv, q + 2 * kv});
+        return true;
+    }
+    if (role == "O") { out.push_back({"self_attn.o_proj.weight", 0, 0}); return true; }
+    if (role == "G") { out.push_back({"mlp.gate_proj.weight", 0, 0}); return true; }
+    if (role == "U") { out.push_back({"mlp.up_proj.weight", 0, 0}); return true; }
+    if (role == "D") { out.push_back({"mlp.down_proj.weight", 0, 0}); return true; }
+    if (role == "HEAD") { out.push_back({"lm_head.weight", 0, 0}); return true; }
+    err = "external role \"" + role + "\" has no container tensor in this forward (a weight with nowhere to go is a "
+          "refusal, not a silent drop)";
+    return false;
+}
+
+Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
+    Q4 q = pack;   // same codes, same geometry
+    long long inexact = 0;
+    for (size_t i = 0; i < q.zero.size(); ++i) {
+        // pack: w = (code - zp) * scale  ->  container: w = code * scale + m, so m = -zp * scale.
+        const float m = -q.zero[i] * q.scale[i];
+        if (bf16_to_f32(bf16_bits_of(m)) != m) ++inexact;
+        q.zero[i] = m;
+    }
+    if (m_inexact) *m_inexact = inexact;
+    return q;
+}
+
+Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err, bool row_major) {
+    Q4 q;
+    if (N <= 0 || K <= 0 || N % kExtTileRows != 0 || K % 128 != 0) {
+        err = "external tile: N must be a multiple of 64 and K a multiple of 128 (got " + std::to_string(N) + " x " +
+              std::to_string(K) + ")";
+        return q;
+    }
+    const int64_t blocks = K / 128, tiles = N / kExtTileRows, per_tile = 2 * (blocks + 1);
+    const int64_t want = tiles * per_tile * kExtSubvBytes;
+    if (int64_t(bytes) != want) {
+        err = "external tile: " + std::to_string(bytes) + " B is not " + std::to_string(want) + " B = " +
+              std::to_string(tiles) + " tiles x " + std::to_string(per_tile) + " subvolumes of " +
+              std::to_string(kExtSubvBytes) + " (N " + std::to_string(N) + " x K " + std::to_string(K) + ")";
+        return q;
+    }
+    q.N = N;
+    q.K = K;
+    q.block = 32;
+    q.codes.assign(size_t(N) * K, 0);
+    q.scale.assign(size_t(N) * (K / 32), 0.0f);
+    q.zero.assign(size_t(N) * (K / 32), 0.0f);
+    for (int64_t tile = 0; tile < tiles; ++tile) {
+        for (int half = 0; half < 2; ++half) {
+            for (int64_t kk = 1; kk <= blocks; ++kk) {   // kk == 0 is the tile's bias pair, all zero here
+                const uint8_t* subv = data + (tile * per_tile + kk * 2 + half) * kExtSubvBytes;
+                const uint8_t* quants = subv;
+                const uint8_t* zeros = subv + 2048;
+                const uint8_t* scales = subv + 2112;
+                for (int r = 0; r < kExtSubvRows; ++r) {
+                    const int64_t row = tile * kExtTileRows + half * kExtSubvRows + r;
+                    const float s = bf16_to_f32(uint16_t(scales[r * 2] | (scales[r * 2 + 1] << 8)));
+                    // four int4 zero points per row, one per 32-column group of the 128-column block
+                    const uint8_t z0 = zeros[r * 2], z1 = zeros[r * 2 + 1];
+                    const uint8_t zp[4] = {uint8_t(z0 & 0xF), uint8_t(z0 >> 4), uint8_t(z1 & 0xF), uint8_t(z1 >> 4)};
+                    for (int g = 0; g < 4; ++g) {
+                        q.scale[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = s;
+                        q.zero[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = float(zp[g]);
+                    }
+                    for (int c = 0; c < 128; ++c) {
+                        // Row-major: a row's 128 codes are 64 contiguous bytes, even column in the low nibble.
+                        // The .fconst formula: one byte per COLUMN holds the row PAIR 2cp (low) / 2cp+1 (high), so a
+                        // row's codes are strided by 4 through a 512-byte block -- no column pairing at all.
+                        uint8_t nib;
+                        if (row_major) {
+                            const uint8_t b = quants[r * 64 + c / 2];
+                            nib = (c % 2 == 0) ? uint8_t(b & 0xF) : uint8_t(b >> 4);
+                        } else {
+                            const int cp = r / 2;
+                            const uint8_t b = quants[(cp % 4) + c * 4 + (cp / 4) * 512];
+                            nib = (r % 2 == 0) ? uint8_t(b & 0xF) : uint8_t(b >> 4);
+                        }
+                        q.codes[size_t(row) * K + (kk - 1) * 128 + c] = nib;
+                    }
+                }
+            }
+        }
+    }
+    return q;
+}
 
 // One subvolume's size at a given group width: 64*(rows/2) quants + 64 zero-point bytes + rows bf16
 // scales. rows/2 is the subvolume's column count (32 -> 2,176 B, 64 -> 4,288 B).
@@ -1664,6 +1965,8 @@ Plan plan(const std::string& pack_dir) {
                 if (w > best) best = int(w);
             }
         }
+        if (best == 0 && geom.contains("hidden_size") && geom["hidden_size"].is_number())
+            best = intermediate_size_from_graph(pack_dir + "/" + gname, geom["hidden_size"].get<int64_t>());
         return best;
     };
     if (!geom.contains("intermediate_size") || geom["intermediate_size"].is_null()) {
@@ -1673,11 +1976,11 @@ Plan plan(const std::string& pack_dir) {
             geom_src += ", intermediate_size from the graph's MLP projection width";
         } else {
             throw std::runtime_error(
-                "the pack states no intermediate_size: " + geom_src +
-                " has none, and the FFN projections are not initializers of " + graph +
-                " (on the hybrid line only the attention/head qweights are in the main graph), so the FFN width "
-                "has to come from the subgraph or from model.pb.bin -- refusing rather than guessing it from the "
-                "other dimensions");
+                "the pack states no intermediate_size: " + geom_src + " has none, and neither the initializers nor "
+                "the MatMulNBits/MatMulNBitsBf node attributes of " + graph + " (including its If branches) hold a "
+                "down/gate_up pair whose K and N agree -- on the hybrid line only the attention/head qweights are in "
+                "the main graph, and the 1.9 external-data genre keeps the FFN in the branch with dims [0] on every "
+                "initializer -- refusing rather than guessing it from the other dimensions");
         }
     }
     p.dims = read_dims(geom, geom_src);
@@ -2268,12 +2571,169 @@ std::string kernel_set_refusal(const std::vector<std::string>& file_names, const
     return "";
 }
 
+// The 1.9 external-data genre's importer (engine#1503): the pack stores each projection as one 4-bit blob and the
+// container stores per-role tensors, so this walks the graph's matmuls, decodes each blob, splits the fused qkv by
+// the geometry the pack states, and writes the same I8 tile chunks the .fconst route writes.
+//
+// Deliberately its own function rather than a fourth branch inside import_pack: that one is built around the
+// .fconst envelope (attention payload, MLP sections, tail) and the graph-weights path, and threading a third shape
+// through it is how the two existing paths got their special cases. What it shares is the parts that are genuinely
+// shared -- the plan, the geometry, the tile writer, the container metadata.
+Report import_external(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
+    const Plan p = plan(pack_dir);
+    const std::string graph = graph_filename(pack_dir);
+    const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph);
+    std::error_code ec;
+    fs::create_directories(out_dir, ec);
+    if (ec) throw std::runtime_error("cannot create " + out_dir + ": " + ec.message());
+    Writer w;
+    w.dir = out_dir;
+    Report r;
+    r.out_dir = out_dir;
+    // The genre's bytes live in the external file, so map it once and slice per tensor (the same check import_pack
+    // makes: `need` must fit what the tensor declares, because a 4-bit blob deliberately does not satisfy
+    // product(dims) == length).
+    std::map<std::string, std::pair<const uint8_t*, size_t>> ext;
+    auto bytes_of = [&](const OnnxTensor& t, uint64_t need) -> const uint8_t* {
+        if (t.raw) {
+            if (need > t.raw_len)
+                throw std::runtime_error(t.name + ": needs " + std::to_string(need) + " B, carries " +
+                                         std::to_string(t.raw_len));
+            return t.raw;
+        }
+        auto it = ext.find(t.location);
+        if (it == ext.end()) {
+            size_t size = 0;
+            std::string why;
+            const uint8_t* m = map_file(pack_dir + "/" + t.location, size, &why);
+            if (!m) throw std::runtime_error(t.name + ": " + why);
+            it = ext.emplace(t.location, std::make_pair(m, size)).first;
+        }
+        if (need > t.length) throw std::runtime_error(t.name + ": needs " + std::to_string(need) + " B, declares " +
+                                                      std::to_string(t.length) + " in " + t.location);
+        if (uint64_t(t.offset) + need > it->second.second)
+            throw std::runtime_error(t.name + ": external data past the end of " + t.location);
+        return it->second.first + t.offset;
+    };
+    const int64_t L = p.dims.layers;
+    const int GH = int(p.dims.heads), GKV = int(p.dims.kv_heads), GHD = int(p.dims.head_dim);
+    for (const auto& mm : onnx.matmuls) {
+        const char* role = external_role_of(mm.weight);
+        if (!role) {
+            r.refused.push_back(mm.weight + ": no container role for this projection (the graph names something this "
+                                             "importer has not measured)");
+            continue;
+        }
+        const auto wi = onnx.index.find(mm.weight);
+        if (wi == onnx.index.end() || mm.N <= 0 || mm.K <= 0) {
+            r.refused.push_back(mm.weight + ": the graph names it but carries no bytes for it");
+            continue;
+        }
+        const OnnxTensor& wt = onnx.tensors[wi->second];
+        uint64_t need = 0;
+        if (!mul_ok(uint64_t(wt.length ? wt.length : wt.raw_len), 1, need) || need == 0)
+            throw std::runtime_error(mm.weight + ": no external length recorded");
+        std::string derr;
+        const Q4 pack = decode_external_tile(bytes_of(wt, need), size_t(need), int(mm.N), int(mm.K), derr);
+        if (!derr.empty()) throw std::runtime_error(mm.weight + ": " + derr);
+        const Q4 conv = container_from_external_q4(pack);
+        std::vector<ContainerTensor> outs;
+        std::string nerr;
+        if (!external_container_tensors(role, GH, GKV, GHD, outs, nerr)) {
+            r.refused.push_back(mm.weight + ": " + nerr);
+            continue;
+        }
+        // `model.layers.N.` from the graph's own name, so the container is keyed the way the forward looks it up.
+        std::string prefix;
+        if (const size_t at = mm.weight.find("layers."); at != std::string::npos) {
+            const size_t end = mm.weight.find('.', at + 7);
+            prefix = "model.layers." + mm.weight.substr(at + 7, end - at - 7) + ".";
+        }
+        for (const auto& one : outs) {
+            const int lo = one.row_lo, hi = one.row_hi > 0 ? one.row_hi : conv.N;
+            if (lo < 0 || hi > conv.N || hi <= lo)
+                throw std::runtime_error(mm.weight + ": container range [" + std::to_string(lo) + ", " +
+                                         std::to_string(hi) + ") does not fit N " + std::to_string(conv.N));
+            Q4 part;
+            part.N = hi - lo;
+            part.K = conv.K;
+            part.block = 32;
+            const int kg = conv.K / 32;
+            part.codes.assign(size_t(part.N) * part.K, 0);
+            part.scale.assign(size_t(part.N) * kg, 0.0f);
+            part.zero.assign(size_t(part.N) * kg, 0.0f);
+            for (int row = 0; row < part.N; ++row) {
+                std::memcpy(&part.codes[size_t(row) * part.K], &conv.codes[size_t(lo + row) * part.K], part.K);
+                std::memcpy(&part.scale[size_t(row) * kg], &conv.scale[size_t(lo + row) * kg], kg * sizeof(float));
+                std::memcpy(&part.zero[size_t(row) * kg], &conv.zero[size_t(lo + row) * kg], kg * sizeof(float));
+            }
+            std::vector<uint8_t> tiled;
+            long long pinexact = 0;
+            tile_q4_1_f32(part, tiled, &pinexact);
+            const int64_t nt = int64_t(tiled.size() / kImportTileBytes);
+            r.tiles += nt;
+            r.tensors++;
+            w.add(prefix + one.suffix, "I8", {nt, kImportTileBytes}, std::move(tiled));
+        }
+    }
+    if (!r.refused.empty()) {
+        if (!opt.allow_incomplete) throw std::runtime_error("external-data import refused: " + r.refused.front());
+        return r;
+    }
+    // The exact tensors the container also needs: the embedding and the norms, copied as BF16 (the container's form).
+    int64_t aux = 0;
+    for (const auto& t : onnx.tensors) {
+        const bool norm = t.name.find("layernorm.weight") != std::string::npos ||
+                          t.name == "model.norm.weight";
+        if (t.name != "model.embed_tokens.weight" && !norm) continue;
+        if (t.dims.empty()) continue;
+        uint64_t n = 1;
+        for (auto d : t.dims) n *= uint64_t(d);
+        if (n == 0) continue;
+        std::vector<int64_t> shape(t.dims.begin(), t.dims.end());
+        w.add(t.name, "BF16", shape, as_bf16(bytes_of(t, n * (t.type == kF32 ? 4 : 2)), t.type, size_t(n)));
+        ++r.tensors;
+        ++aux;
+    }
+    json c;
+    c["model_type"] = p.dims.model_type;
+    c["hidden_size"] = p.dims.hidden;
+    c["intermediate_size"] = p.dims.intermediate;
+    c["num_hidden_layers"] = p.dims.layers;
+    c["num_attention_heads"] = p.dims.heads;
+    c["num_key_value_heads"] = p.dims.kv_heads;
+    c["head_dim"] = p.dims.head_dim;
+    c["vocab_size"] = p.dims.vocab;
+    c["rope_theta"] = p.dims.rope_theta;
+    c["q4nx_parameters"] = "fp32 scale/zero per 32-column group";
+    c["q4nx_source"] = {{"kind", "oga-npu-pack external data"}, {"pack", p.pack},
+                        {"importer", "1bit npu-pack import"}, {"graph", graph},
+                        {"note", "weights decoded from *.qweight.packed via decode_external_tile; the code ordering is "
+                                 "kExtQuantsRowMajor's compile-time choice (engine#1503)"}};
+    json manifest;
+    manifest["format"] = "q4nx";
+    manifest["layout"] = "q4nx-2";
+    manifest["dims"] = {{"hidden_size", p.dims.hidden}, {"num_hidden_layers", p.dims.layers}};
+    w.finish(manifest);
+    std::ofstream cf(out_dir + "/config.json", std::ios::binary | std::ios::trunc);
+    if (!cf) throw std::runtime_error("cannot write " + out_dir + "/config.json");
+    cf << c.dump(2) << "\n";
+    std::fprintf(stderr, "npu-pack: external-data genre: %d tensors (%lld tiles, %lld exact)\n", r.tensors,
+                 (long long)r.tiles, (long long)aux);
+    return r;
+}
+
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
     const Plan p = plan(pack_dir);
     // Census yes, writer no (see the note where graph_weights is decided): this genre's weights are 1-D external-data
     // blocks, and until the repacker exists an import would write a container nothing can read. Refused here rather
     // than in plan(), because `info` must keep reporting the genre it can now see.
-    if (p.graph_packed_siblings > 0)
+    if (p.graph_packed_siblings > 0) {
+        // The genre has a writer now (engine#1503): decode -> convert -> split by role -> the same I8 tile chunks,
+        // with its own function because import_pack is built around the .fconst envelope.
+        return import_external(pack_dir, out_dir, opt);
+    }
+    if (false)
         throw std::runtime_error(
             "this pack keeps its 4-bit weights as external-data blocks (" + std::to_string(p.graph_packed_siblings) +
             " `*.qweight.packed` tensors behind `*.qweight.empty` placeholders, " + std::to_string(p.graph_stride_ok) +

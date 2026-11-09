@@ -264,12 +264,6 @@ include(cmake/tests-gpu-hold.cmake)
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
 add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.sh)
-# engine#1639: the half of the survivor bound that a CPU-only box can drive. The bound itself fires only for a payload root
-# wedged in uninterruptible sleep, which user space cannot create, so this covers the other half: a holder that released with
-# a survivor must leave a record, and the NEXT holder must warn about it and clear it.
-add_test(NAME gpu_hold_survivors COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_survivors_test.sh)
-add_test(NAME gpu_hold_group
-         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_group_test.sh)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
@@ -737,6 +731,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_gaps_test.py)
     # a pin bump that did not regenerate the registry (only the gitlinks: no checkouts)
     add_test(NAME registry_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-pins)
+    # the same check where a lane actually runs it: with the bump staged and HEAD still behind, where a HEAD-only
+    # read of the gitlink passed a registry recording the pin being replaced (engine#1738's post-commit failure)
+    add_test(NAME registry_pins_staged COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_pin_staged_test.py)
     # the 1.9 measurement tool's own paths, on synthetic packs: the "trying next" line it shipped broken (its
     # only real pair verified on the first candidate, so the line never ran) and the residual tolerance it
     # accepts and refuses at. Fixtures are ~200 KB each and built from the rule, so they can be wrong on purpose.
@@ -773,9 +770,6 @@ if(Python3_Interpreter_FOUND)
     # engine#1070: every configured test that starts a server holds RESOURCE_LOCK route_ports, so
     # the list at the end of this file cannot drift away from the tests it protects. Reads the
     # configured test list (ctest -N --show-only=json-v1); no device, no model, no build products.
-    # Ending a serve must end the process that holds the memory: `1bit serve` is a wrapper and the model lives in the
-# `llama-server` child (engine #1653 review). Device-free: it drives the helper against a synthetic wrapper.
-add_test(NAME serve_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_kill_tree_test.sh)
 add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
@@ -1312,6 +1306,14 @@ target_link_libraries(onebit PRIVATE onebit_npu)
 target_compile_definitions(onebit PRIVATE ONEBIT_NPU_HOST)
 endif()  # ONEBIT_NPU_HOST
 
+# Device-free: `tests/serve_kill_tree_test.sh` drives the helper against a synthetic wrapper, so this needs neither
+# the NPU host lane nor Python -- registered unconditionally. It sat inside ONEBIT_NPU_HOST /
+# Python3_Interpreter_FOUND by accident (appended next to route_port_lock in engine #1653), which silently
+# unregistered it in any build with -DONEBIT_NPU_HOST=OFF.
+# Ending a serve must end the process that holds the memory: `1bit serve` is a wrapper and the model lives in the
+# `llama-server` child (engine #1653 review). Device-free: it drives the helper against a synthetic wrapper.
+add_test(NAME serve_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_kill_tree_test.sh)
+
 # The lane itself: needs the NPU runtime and an XDNA NPU to run.
 option(ONEBIT_NPU "Build the NPU lane (needs the private NPU runtime: ONEBIT_NPU_RT_LIB or ONEBIT_NPU_RT_DIR)" OFF)
 # The NPU code compiles against one runtime (npu/rt.h, docs/npu.md "The runtime"): our own runtime,
@@ -1437,6 +1439,8 @@ endif()
         npu/forward/src/model.c
         npu/forward/src/q4nx_dequant.c
         npu/forward/src/q4nx_pack.c
+        # The production weight packer, extracted from I8Ctx so it can be tested without the device runtime (#1416).
+        npu/forward/src/q4nx_pack_blocked.cpp
         npu/forward/src/q4nx_semantics.c
         npu/forward/src/q4nx_forward.cpp
         # The NPU target interface and this box's target (engine#799 P4): the model keeps the maths, the

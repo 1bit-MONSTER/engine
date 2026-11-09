@@ -32,10 +32,12 @@
 //   4. geometries that are not a whole number of 64x128 tiles are refused,
 //   5. the row-major layout is unchanged (it must keep serving every container
 //      built before the blocked one).
+#include "q4nx_pack.h"
 #include "q4nx_weight_layout.h"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -174,6 +176,38 @@ void test_pack_geometries() {
 
 }  // namespace
 
+
+// ── the production packer, now that it is reachable (engine #1416) ────────────────────────────────────────────────
+// q4nx_pack_B_int8_blocked is the body I8Ctx::packB_blocked runs on every weight. Two things are asserted here, neither of
+// which any test could check while it lived inside a header that pulls XRT: that its scales and codes equal the row-major
+// reference's (q4nx_pack_B_int8), and that its blocked output is exactly the row-major output permuted by bpos -- which is
+// the layout contract the microkernel indexes through.
+void test_production_packer() {
+    const int K = 64, N = 256, KD = 64, ND = 256;
+    std::vector<float> w((size_t)K * N);
+    for (size_t i = 0; i < w.size(); ++i) w[i] = float((i * 2654435761u) % 2000) * 1e-3f - 1.0f;
+    w[(size_t)3 * N + 7] = 0.0f / 0.0f;                  // a NaN, which both paths must zero
+    for (int j = 100; j < 164; ++j) w[(size_t)5 * N + (size_t)j] = 0.0f;   // an all-zero column block: the amax floor
+
+    std::vector<int8_t> rowmaj((size_t)K * N), blocked((size_t)K * N);
+    std::vector<float> sc_ref((size_t)N), sc_blk((size_t)N);
+    const float mean_ref = q4nx_pack_B_int8(w.data(), K, N, rowmaj.data(), N, sc_ref.data());
+    double ssum = 0;
+    const int rc = q4nx_pack_B_int8_blocked(blocked.data(), w.data(), K, N, KD, ND, /*blocked=*/1, sc_blk.data(), &ssum);
+    check(rc == 0, "production packer: runs");
+    check(sc_blk == sc_ref, "production packer: every column scale equals the row-major reference");
+    check(std::fabs(float(ssum) - mean_ref * N) < 1e-3f, "production packer: the scale sum is the reference's mean x N");
+
+    size_t mismatched = 0;
+    for (int i = 0; i < K; ++i)
+        for (int j = 0; j < N; ++j) {
+            const size_t dst = q4nx_layout::blocked_index((size_t)i, (size_t)j, KD, ND);
+            if (blocked[dst] != rowmaj[(size_t)i * N + (size_t)j]) mismatched++;
+        }
+    check(mismatched == 0, "production packer: the blocked image is the row-major image permuted by bpos");
+    std::printf("  production packer: %zu codes, %d scales, blocked == bpos(rowmajor)\n", (size_t)K * N, N);
+}
+
 int main() {
     for (Geom g : kGeoms) {
         test_bijection(g);
@@ -181,6 +215,7 @@ int main() {
         test_microkernel_order(g);
     }
     test_refusals();
+    test_production_packer();
     test_row_major_unchanged();
     test_pack_geometries();
     if (failures) {

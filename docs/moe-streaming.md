@@ -691,8 +691,16 @@ middle row is why this is per layer and not one permutation for the model.
 
 ```
 tools/moe_trace … trace.tsv                    # the per-step, per-layer expert ids
-tools/moe_placement.py trace.tsv -g 2 -o placement.json
+tools/moe_placement.py trace.tsv -g 2 -e 256 -o placement.json
 ```
+
+**`-e` is the model's expert count, and it matters.** A decode sample does not fire every expert in every layer, and the
+default derives the layer's size from the highest id the trace happens to visit — so without `-e` the table is a placement
+of the *sample*. With `-e` the table covers `0..N-1`, every expert appears exactly once, and each layer records `unseen`:
+the experts with no co-activation evidence, which are placed by balance alone (round-robin onto the smallest group, ties to
+the earlier group) rather than left out. A layer where `unseen` is most of the plan is a layer whose ordering is a default,
+and it should read that way. If the trace visits an id the model does not have, the tool refuses and names both numbers —
+the trace and the model disagreeing is not a placement to publish.
 
 **Decode rows only.** Placement adds 5.4-6.9 % on batched prefill while deduplication gives 90-94 % (engine#1702 §3), so a
 prefill run is refused by name rather than quietly scored: placement is a decode lever, and a tool that counted prefill
@@ -703,7 +711,8 @@ splitter or the streamer may consume, and an unused table changes nothing. Its s
 
 ```json
 { "schema": "1bit/moe-placement/1", "groups": 2,
-  "layers": { "0": { "decode_steps": 720, "experts_seen": 256, "groups": [[…ids…], […ids…]] } } }
+  "layers": { "0": { "decode_steps": 720, "experts": 256, "experts_seen": 243, "unseen": 13,
+                     "groups": [[…ids…], […ids…]] } } }
 ```
 
 keyed by (layer, global expert id) — the same key `tools/build_expert_placement.py` uses upstream of us, which is why the
@@ -712,5 +721,6 @@ schema carries its own name: a consumer can check `schema` rather than assume th
 `--self-test` pins the property that matters on synthetic traces with a known answer: two **interleaved** clusters (ids
 `0,2,4,6` / `1,3,5,7`, so a contiguous split cannot be right by accident) must reach a 100 % one-device share under `-g 2`
 while the contiguous control reaches 0 %, four clusters must do it under `-g 4`, a token spanning every group must never
-count as one device, and `G=1` / `G=n_experts` must be exact. It runs in CI (`ctest moe_placement`), needs no model and no
+count as one device, `G=1` / `G=n_experts` must be exact, and a **partial** sample must still place every expert in range
+exactly once with the evidence-less ones counted and balanced. It runs in CI (`ctest moe_placement`), needs no model and no
 device.

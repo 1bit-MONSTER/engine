@@ -152,6 +152,17 @@ struct Plan {
 // can name the source; exposed for a unit test that needs no ONNX graph.
 int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg);
 
+// The same value derived from the graph's own node attributes (MatMulNBits/MatMulNBitsBf K and N) when the
+// initializers carry no dims -- the 1.9 external-data genre. Returns 0 when no FFN pair agrees, or when two
+// widths do, so the caller refuses instead of guessing. Exported for the unit test, which needs no pack.
+// Takes a PATH because it parses the graph: it is cheap only because plan() calls it once. If it ever moves into a
+// per-tensor or per-layer path, that parse is paid per call -- keep it to one call per plan.
+int intermediate_size_from_graph(const std::string& model_path, int64_t hidden);
+
+// Where a pack keeps its Token .fconst: the root for a flat pack, the decoder component `genai_config.json` names for a
+// multi-component one (`type: compositemodel`), whose geometry files stay at the root. Exported for the unit test.
+std::string find_token_fconst_exported(const std::string& pack_dir);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);
@@ -271,6 +282,55 @@ struct Q4 {
     std::vector<float> scale;    // [N, K/32]
     std::vector<float> zero;     // [N, K/32]
 };
+// The 1.9 external-data tile (engine#1503): the `.fconst` tile's subvolume written densely per tensor.
+//
+// Measured on `amd/phi-4_rai_1.9.0_npu` (`eager-mm.onnx.data`, 9.74 GB): every `MatMulNBitsBf` weight is a 1-D byte
+// blob whose length is `N x (K/128 + 1) x 68` -- i.e. `N/64` tiles of `2*(K/128 + 1)` subvolumes of 2,176 B. Inside a
+// subvolume: 2,048 B of 4-bit codes, 64 B of int4 zero points (four per row, one per 32-column group), 64 B of bf16
+// scales (one per row). The `k = 0` subvolume pair of every tile is the writer's bias pair, zero on a pack whose
+// matmuls carry no bias. `decode_external_tile` returns the whole matrix as a `Q4` (block 32: the 128-column scale is
+// repeated over its four groups and each group keeps its own zero point, which is what the pack states).
+constexpr int kExtSubvBytes = 2176;   // one subvolume: 2,048 B quants + 64 B int4 zero points + 64 B bf16 scales
+constexpr int kExtSubvRows = 32;
+constexpr int kExtTileRows = 64;      // two subvolumes per tile per K block
+// Which way one row's 128 code bytes lie inside the 2,048-byte quants region. The default is the .fconst tile's
+// verified formula; the alternative is here so the known-answer run can settle it without touching addressing.
+constexpr bool kExtQuantsRowMajor = false;
+
+// `row_major` defaults to kExtQuantsRowMajor (the shipped choice); it is a parameter only so the test can hold BOTH
+// orderings to their own spec -- a flip of the constant must not quietly change what the other branch means.
+// Turn a decoded external-data tile into the container's q4_1 parts. The two conventions differ in what zero
+// means: the container dequantises `w = code*d + m` (m is the group's MIN, npu/q4nx.h), while the pack's is
+// `w = (code - zp)*scale` (zp is an int4 CODE offset). So the mapping is `d = scale`, `m = -zp*scale`, codes
+// unchanged -- and the obvious alternative, dequantise then re-quantise with the container's own quantiser, is
+// measurably NOT the same weights: on a real phi-4 tile it reproduced the pack's codes on only 2,826 of 8,192
+// entries and moved weights by 2.5 % of the tensor's range (engine#1503). `m_inexact` reports how many group
+// offsets were not bf16-exact (86.3 % are, measured), because that rounding is the only loss this path has.
+Q4 container_from_external_q4(const Q4& pack, long long* m_inexact = nullptr);
+
+// The container role a matmul plays, read off the graph's own tensor name: `...qkv_proj...` -> "QKV",
+// `o_proj` -> "O", `gate_proj` -> "G", `up_proj` -> "U", `down_proj` -> "D", `lm_head` -> "HEAD". These are the
+// roles the design/tile writer already speaks, so the external-data genre's writer is a mapping and not a second
+// vocabulary. nullptr when the name is one this importer has not measured: reported BY NAME rather than skipped,
+// because a projection nothing maps is a weight that would silently not be written (engine#1503).
+const char* external_role_of(const std::string& tensor_name);
+
+// Where a pack projection's rows go in the container: the container stores `self_attn.q_proj.weight` and its
+// siblings separately (only a GDN layer has a fused `linear_attn.qkv_proj.weight`), while the pack stores q/k/v as
+// ONE matmul -- phi-4's is N 7680 with 40 heads x 128 (q 5120) and 10 kv heads x 128 (k 1280, v 1280). So a role
+// is one container tensor except "QKV", which is three with row ranges taken from the geometry the pack states.
+// Names are the forward's own (`self_attn.{q,k,v,o}_proj.weight`, `mlp.{gate,up,down}_proj.weight`,
+// `lm_head.weight`), read from npu/forward/src/q4nx_forward.cpp rather than invented.
+struct ContainerTensor {
+    std::string suffix;   // relative to `model.layers.<L>.`, or a model-level name for HEAD
+    int row_lo = 0, row_hi = 0;   // rows of the pack's matmul this tensor takes (its own N when split is 1)
+};
+// False + `err` for a role with no container home (the caller must then refuse rather than drop the weights).
+bool external_container_tensors(const std::string& role, int nh, int nkv, int hd, std::vector<ContainerTensor>& out,
+                                std::string& err);
+
+Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err,
+                        bool row_major = kExtQuantsRowMajor);
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles = false, bool drop_zero = false);
 

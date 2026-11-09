@@ -2029,6 +2029,45 @@ static void dump_real_component(const std::string& dir) {
     }
 }
 
+// engine#1662: the canonical Token .fconst copy is reused when -- and only when -- it is still the copy of THIS source.
+// Two arms matter and a size test alone passes neither: a truncated copy from an interrupted run, and a same-size copy of a
+// REPLACED source (the scratch name carries a hash of the pack path and geometry, not of the file).
+void test_canonical_copy_reuse() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-fconst19-reuse-" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const std::string work = (dir / "copy.fconst").string();
+    const int64_t n = 4096;
+    {
+        std::ofstream os(work, std::ios::binary | std::ios::trunc);
+        os << std::string(size_t(n), 'x');
+    }
+    check(!pi::canonical_copy_reusable(work, n, "ident-1"), "reuse: a copy with no sidecar is not reused");
+    {
+        std::ofstream id(work + ".ident", std::ios::binary | std::ios::trunc);
+        id << "ident-1";
+    }
+    check(pi::canonical_copy_reusable(work, n, "ident-1"), "reuse: matching sidecar + size is reused");
+    check(!pi::canonical_copy_reusable(work, n, "ident-2"), "reuse: a REPLACED source (different identity) is not reused");
+    check(!pi::canonical_copy_reusable(work, n + 1, "ident-1"), "reuse: a size that is not the canonical one is not reused");
+    {
+        // an interrupted run leaves a short copy: the size test is what catches it, the sidecar would still match
+        std::ofstream os(work, std::ios::binary | std::ios::trunc);
+        os << std::string(size_t(n / 2), 'x');
+    }
+    check(!pi::canonical_copy_reusable(work, n, "ident-1"), "reuse: a TRUNCATED copy is not reused");
+    check(!pi::canonical_copy_reusable((dir / "absent.fconst").string(), n, "ident-1"), "reuse: a missing copy is not reused");
+    // the identity of a real file depends on its bytes: same size, different content, must differ
+    const std::string a = (dir / "a.bin").string(), b = (dir / "b.bin").string();
+    {
+        std::ofstream os(a, std::ios::binary); os << std::string(2048, 'a');
+        std::ofstream os2(b, std::ios::binary); os2 << std::string(2047, 'a') << 'b';
+    }
+    check(!pi::source_identity(a).empty(), "identity: a real file has one");
+    check(pi::source_identity(a) != pi::source_identity(b), "identity: same-size files with different content differ");
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2062,6 +2101,7 @@ int main(int argc, char** argv) {
         test_kernel_set_refusal();
         test_weight_layout();
         test_null_optional_dims();
+        test_canonical_copy_reuse();
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

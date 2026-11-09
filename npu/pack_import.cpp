@@ -413,6 +413,28 @@ bool fconst19_detect(const Fconst& fc, int heads, int layers, int64_t* hdr_off, 
 // copy is written -- the caller removes it.
 //
 // The q/k/v bundle is normalised here, which is what makes the tiles line up: 1.9 stores q first and k last.
+// Identity of a .fconst for the canonical-copy reuse test (engine#1662): size, mtime, and an FNV-1a hash of the first and
+// last 64 KiB. The copy's own name carries only a hash of the pack PATH and the geometry, so a repacked pack at the same
+// path with the same geometry and the same size would otherwise be served from a stale copy -- silently, since the bytes
+// would still parse.
+namespace {
+std::string ident_of(const uint8_t* p, int64_t size, int64_t mtime) {
+    auto fnv = [](const uint8_t* b, int64_t n, uint64_t h) {
+        for (int64_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+        return h;
+    };
+    const int64_t head = size < 65536 ? size : 65536;
+    uint64_t h = 1469598103934665603ULL;
+    if (p && size > 0) {
+        h = fnv(p, head, h);
+        h = fnv(p + (size - head), head, h);   // first and last 64 KiB: the layer-block head and the tail's head tiles
+    }
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "%lld:%lld:%016llx", (long long)size, (long long)mtime, (unsigned long long)h);
+    return std::string(buf);
+}
+}  // namespace
+
 std::string canonical_token_fconst(const std::string& path, int hidden, int heads, int layers, const std::string& work) {
     if (path.empty()) return path;
     Fconst fc = open_fconst(path);
@@ -448,6 +470,18 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
         throw std::runtime_error(path + ": fewer bytes than " + std::to_string(layers) + " blocks of " +
                                  std::to_string(stride9) + " B");
     }
+    // REUSE (engine#1662): the canonical body is a deterministic function of the source, so a copy whose sidecar records
+    // this source's identity and whose length is the canonical one IS these bytes. Rebuilding it costs a write of the whole
+    // file (~291 MB on the 0.5B pack, ~1 GB on a 1.5B one) plus a re-read, and a sweep over N packs pays that N times.
+    const std::string ident = ident_of(fc.map, fc.size, /*mtime*/ [&] {
+        std::error_code e2;
+        const auto mt = fs::last_write_time(path, e2);
+        return e2 ? int64_t(0) : int64_t(mt.time_since_epoch().count());
+    }());
+    if (canonical_copy_reusable(work, int64_t(fc.size) - int64_t(layers) * hdr_len, ident)) {
+        unmap_file(fc.map, fc.size);
+        return work;
+    }
     std::vector<uint8_t> out;
     out.reserve(size_t(fc.size - int64_t(layers) * hdr_len));
     for (int L = 0; L < layers; ++L) {
@@ -467,6 +501,14 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
         if (!os) throw std::runtime_error(work + ": cannot write the canonical copy of the 1.9 .fconst");
         os.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
         if (!os) throw std::runtime_error(work + ": short write of the canonical copy of the 1.9 .fconst");
+    }
+    {
+        // the sidecar is what makes the reuse test safe: without it the size-only test would trust a same-size copy of a
+        // different source. Written after the copy, so an interrupted write leaves a copy with no identity and is redone.
+        // A future cleanup that deletes the copy must delete this file with it, or the next run finds an identity with no
+        // copy -- which canonical_copy_reusable already refuses (it needs both), so the failure is a rewrite, not a wrong read.
+        std::ofstream id(work + ".ident", std::ios::binary | std::ios::trunc);
+        if (id) id << ident;
     }
     return work;
 }
@@ -960,6 +1002,32 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+std::string source_identity(const std::string& path) {
+    Fconst fc = open_fconst(path);
+    std::error_code ec;
+    // file_clock has no to_time_t in C++20/26; the raw tick count is enough here -- it only has to CHANGE when the file
+    // does, and it is compared against the same value written into the sidecar.
+    const auto mt = fs::last_write_time(path, ec);
+    const int64_t mtime = ec ? 0 : int64_t(mt.time_since_epoch().count());
+    const std::string out = ident_of(fc.map, fc.size, mtime);
+    unmap_file(fc.map, fc.size);
+    return out;
+}
+
+bool canonical_copy_reusable(const std::string& work, int64_t expect_size, const std::string& ident) {
+    if (work.empty() || ident.empty() || expect_size <= 0) return false;
+    std::error_code ec;
+    // both tests matter: the size catches a copy truncated by an interrupted run, the sidecar catches a replaced source
+    if (!fs::is_regular_file(work, ec) || ec) return false;
+    const auto sz = fs::file_size(work, ec);
+    if (ec || int64_t(sz) != expect_size) return false;
+    std::ifstream in(work + ".ident", std::ios::binary);
+    if (!in) return false;
+    std::string got;
+    std::getline(in, got);
+    return got == ident;
+}
+
 
 // engine#734: exported so the epsilon anchor itself can be tested against a crafted .fconst, without a pack.
 // The two bytes a bf16 epsilon is stored as (little-endian): round the f32 to nearest-even bf16.

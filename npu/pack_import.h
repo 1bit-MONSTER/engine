@@ -325,6 +325,15 @@ TileW decode_tile(const uint8_t* tile, int k, int rows = 64);
 // The exact inverse. Used only as the importer's self-check: a tile that does not survive
 // encode(decode(t)) == t is a tile whose fields we do not understand, and it is refused by name.
 std::vector<uint8_t> encode_tile(const TileW& t);
+// The identity of a .fconst, cheap enough to compute on every call: its size, its mtime, and an FNV-1a hash of its first
+// and last 64 KiB. Used to decide whether a canonical copy on the scratch path is still the copy of THIS file -- a size
+// test alone is not enough, because a repacked pack at the same path with the same geometry can have the same size
+// (engine#1662).
+std::string source_identity(const std::string& path);
+// Whether `work` may be reused instead of rewritten: it must hold exactly `expect_size` bytes, and its sidecar
+// `<work>.ident` must record `ident`. A truncated copy (size mismatch) and a replaced source (identity mismatch) both
+// fail here, which is the point of checking both.
+bool canonical_copy_reusable(const std::string& work, int64_t expect_size, const std::string& ident);
 // A projection assembled from consecutive tiles, in the form the container's writer takes.
 Q4 q_from_tiles(const std::vector<TileW>& tiles);
 // gate and up are ONE tensor in the .fconst, interleaved in 32-column chunks, so a 128-column group holds

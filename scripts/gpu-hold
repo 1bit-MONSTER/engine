@@ -99,7 +99,8 @@ log() {
 }
 
 mkdir -p "$QUEUE" || { echo "gpu-hold: cannot create $QUEUE" >&2; exit 2; }
-COOLDOWN_STAMP="$QUEUE/.cooldown"      # "<epoch> <C>" of the last hold that ended hot; shared by every label
+COOLDOWN_STAMP="$QUEUE/.cooldown"
+ABORTED="$QUEUE/.kill-tree.$$"      # the watchdog is ending the tree; main must let it finish (#1624)      # "<epoch> <C>" of the last hold that ended hot; shared by every label
 [ -n "$LABEL" ] || LABEL="$(basename -- "$1")-$$"
 SAFE=$(printf '%s' "$LABEL" | tr -c 'A-Za-z0-9_.-' '_')
 TICKET="$QUEUE/$(printf '%020d' "$(date +%s%N)").$SAFE"
@@ -256,13 +257,24 @@ descendants() {   # <pid> -> its descendants and then itself, deepest last
     printf '%s\n' "$1"
 }
 kill_tree() {
-    local root=$1 grace=${2:-10} i=0 p
-    for p in $(descendants "$root"); do kill -TERM "$p" 2> /dev/null; done
-    while kill -0 "$root" 2> /dev/null && [ "$i" -lt "$grace" ]; do
+    local root=$1 grace=${2:-10} i=0 p tree alive
+    # Snapshot the tree BEFORE signalling. Once the root dies its children are reparented to init, so walking
+    # `ps --ppid` again afterwards finds nothing but the dead root and the KILL pass hits a corpse: the first
+    # version re-walked here and a TERM-ignoring grandchild outlived its ticket on 2026-11-09 (engine#1624).
+    tree=$(descendants "$root")
+    for p in $tree; do kill -TERM "$p" 2> /dev/null; done
+    # Wait on ANY survivor, not on the root: the root usually dies on the first TERM, and ending the grace
+    # period there gives everything below it no time at all.
+    while [ "$i" -lt "$grace" ]; do
+        alive=0
+        for p in $tree; do
+            if kill -0 "$p" 2> /dev/null; then alive=1; break; fi
+        done
+        [ "$alive" = 1 ] || break
         sleep 1
         i=$((i + 1))
     done
-    for p in $(descendants "$root"); do kill -KILL "$p" 2> /dev/null; done
+    for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
 
 watch() {
@@ -271,11 +283,13 @@ watch() {
         t=$(tctl)
         if [ "$t" -ge "$TCTL_ABORT" ]; then
             log "ABORT die at ${t}C (limit ${TCTL_ABORT}C)"
+            : > "$ABORTED"
             kill_tree "$target"
             return
         fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
             log "max hold of ${MINUTES} min reached"
+            : > "$ABORTED"
             kill_tree "$target"
             return
         fi
@@ -290,8 +304,20 @@ rc=$?
 if [ "$rc" = 143 ] && [ "$(date +%s)" -ge "$deadline" ]; then rc=124; fi
 held=$(( $(date +%s) - started ))
 
-kill "$watchdog" 2> /dev/null
+# Ending the hold must not end the tree-kill itself: the watchdog is inside kill_tree when the payload's
+# root dies, and `kill "$watchdog"` here was what left a TERM-ignoring grandchild alive (#1624). Wait for it
+# to finish, bounded so a wedged watchdog cannot hold the token.
+if [ -e "$ABORTED" ]; then
+    i=0
+    while kill -0 "$watchdog" 2> /dev/null && [ "$i" -lt 20 ]; do
+        sleep 1
+        i=$((i + 1))
+    done
+else
+    kill "$watchdog" 2> /dev/null
+fi
 wait "$watchdog" 2> /dev/null
+rm -f "$ABORTED"
 log "command exited $rc after ${held}s"
 release
 exit "$rc"

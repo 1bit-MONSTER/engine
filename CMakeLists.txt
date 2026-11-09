@@ -733,7 +733,10 @@ if(Python3_Interpreter_FOUND)
     # engine#1070: every configured test that starts a server holds RESOURCE_LOCK route_ports, so
     # the list at the end of this file cannot drift away from the tests it protects. Reads the
     # configured test list (ctest -N --show-only=json-v1); no device, no model, no build products.
-    add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
+    # A hold that ends must end everything it started: the payload below is a root that dies on TERM with a
+# child that ignores it, which is the shape of every orphan this fleet has produced (engine#1624).
+add_test(NAME gpu_hold_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_kill_tree_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.

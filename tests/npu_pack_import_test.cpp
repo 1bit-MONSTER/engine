@@ -663,6 +663,122 @@ void test_1671_tail_arm(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// engine#1671's refusal branch, which the review asked to pin: a pack that DECLARES tying, a tail whose length is exactly right,
+// and head tiles that cannot be the pack's head. Only the oracle can catch that, and it must refuse by name rather than write it.
+// 64 is the importer's kTileRows, which pack_import.h does not export.
+void test_1671_tied_tail_arm(const std::string& root) {
+    const fs::path dir = fs::path(root) / "tail-1671-tied";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    const int H = 896, L = 3, heads = 14, kv_heads = 2, hd = 64, inter = 256, V = 64, block = 128;
+    const int n_kv = (kv_heads * hd) / 64, n_q = (heads * hd) / 64;
+    const int64_t tile = pi::attn_tile_bytes(H), attn_off = pi::attn_payload_off(H);
+    const int64_t second = attn_off + int64_t(2 * n_kv + 2 * n_q) * tile;
+    const int64_t gu_unit = pi::group_bytes(H, 128), down_group = pi::group_bytes(inter, 64);
+    const int64_t gu_units = inter / 64, down_units = H / 64;
+    const int64_t mlp_off = second + 64 + 2 * H;
+    const int64_t stride = mlp_off + gu_units * gu_unit + 64 + down_units * down_group;
+    auto make_tile = [](int rows, int k, int seed) {
+        pi::TileW t;
+        t.k = k;
+        t.rows = rows;
+        t.code.assign(size_t(rows) * size_t(k), 0);
+        t.scale.assign(size_t(rows) * size_t(k / 128), 0.0f);
+        t.zp.assign(size_t(rows) * size_t(k / 128), 0);
+        t.bias.assign(rows, 0);
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < k; ++c) t.code[size_t(r) * k + c] = uint8_t((r * 3 + c * 5 + seed) % 8);
+            for (int b = 0; b < k / 128; ++b) {
+                t.scale[size_t(r) * (k / 128) + b] = 0.1f * float(1 + ((r + b + seed) & 7));
+                t.zp[size_t(r) * (k / 128) + b] = uint8_t((r + b + seed) % 8);
+            }
+        }
+        return pi::encode_tile(t);
+    };
+    const int64_t head_tiles_n = V / 64;   // the head of V rows, as the importer's tail arithmetic expects it
+    std::string fc(size_t(int64_t(L) * stride + 64 + H * 2 + head_tiles_n * pi::attn_tile_bytes(H)), '\0');   // tail: eps + norm, NO head tiles
+    auto put16 = [&](int64_t off, uint16_t v) {
+        fc[size_t(off)] = char(v & 0xFF);
+        fc[size_t(off) + 1] = char(v >> 8);
+    };
+    for (int l = 0; l < L; ++l) {
+        const int64_t base = int64_t(l) * stride;
+        put16(base, 0x3586);
+        put16(base + second, 0x3586);
+        for (int i = 0; i < H; ++i) {
+            put16(base + 64 + 2 * i, pi::bf16_bits_of(float(i + 1)));
+            put16(base + second + 64 + 2 * i, pi::bf16_bits_of(float(i + 1)));
+        }
+        for (int i = 0; i < 2 * n_kv + 2 * n_q; ++i) {
+            const std::vector<uint8_t> b = make_tile(64, H, 40 + i);
+            std::memcpy(&fc[size_t(base + attn_off + int64_t(i) * tile)], b.data(), b.size());
+        }
+        for (int u = 0; u < int(gu_units); ++u) {
+            const std::vector<uint8_t> b = make_tile(128, H, 200 + u);
+            std::memcpy(&fc[size_t(base + mlp_off + int64_t(u) * gu_unit)], b.data(), b.size());
+        }
+        for (int u = 0; u < int(down_units); ++u) {
+            const std::vector<uint8_t> b = make_tile(64, inter, 300 + u);
+            std::memcpy(&fc[size_t(base + mlp_off + gu_units * gu_unit + 64 + int64_t(u) * down_group)], b.data(),
+                        b.size());
+        }
+    }
+    put16(int64_t(L) * stride, 0x3586);
+    for (int i = 0; i < H; ++i) put16(int64_t(L) * stride + 64 + 2 * i, pi::bf16_bits_of(float(i + 1)));
+    for (int64_t i = 0; i < head_tiles_n; ++i) {
+        // head tiles that cannot be this pack's head: codes from a seed nothing else uses, so the oracle must reject them
+        const std::vector<uint8_t> b = make_tile(64, H, 900 + int(i));
+        std::memcpy(&fc[size_t(int64_t(L) * stride + pi::attn_payload_off(H) + i * pi::attn_tile_bytes(H))], b.data(),
+                    b.size());
+    }
+    put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+
+    // The graph: the embedding and ONE projection (N = 32, so no node can be the head), and no head node at all.
+    const size_t kblocks = size_t(H / block);
+    std::vector<uint8_t> qw(size_t(32) * kblocks * size_t(block / 2), 0x11);
+    std::vector<float> sc(size_t(32) * kblocks, 0.02f);
+    std::vector<uint8_t> qz(size_t(32) * ((kblocks + 1) / 2), 0x22);
+    std::string data;
+    auto append = [&](const void* q, size_t n) {
+        data.append(static_cast<const char*>(q), n);
+        return uint64_t(data.size() - n);
+    };
+    std::vector<float> embed(size_t(V) * size_t(H), 0.5f);
+    const uint64_t embed_off = append(embed.data(), embed.size() * sizeof(float));
+    const uint64_t qw_off = append(qw.data(), qw.size());
+    const uint64_t sc_off = append(sc.data(), sc.size() * sizeof(float));
+    const uint64_t qz_off = append(qz.data(), qz.size());
+    put_file((dir / "model.onnx.data").string(), data);
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":896,"intermediate_size":256,"num_hidden_layers":3,)"
+             R"("num_attention_heads":14,"num_key_value_heads":2,"head_dim":64,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06})");
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", embed_off,
+                                   uint64_t(V) * H * 4),
+                        pb::tensor("proj_qweight", {}, "model.onnx.data", qw_off, uint64_t(qw.size())),
+                        pb::tensor("proj_scales", {}, "model.onnx.data", sc_off, uint64_t(sc.size()) * 4),
+                        pb::tensor("proj_zeros", {}, "model.onnx.data", qz_off, uint64_t(qz.size()))},
+                       {pb::matmulnbits("proj", {"x", "proj_qweight", "proj_scales", "proj_zeros"}, H, 32, 4, block)}));
+
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    std::string said;
+    std::vector<std::string> refused;
+    try {
+        const pi::Report r = pi::import_pack(dir.string(), (dir / "out").string(), allow);
+        refused = r.refused;
+    } catch (const std::exception& e) {
+        said = e.what();
+    }
+    bool names_head = !said.empty() && said.rfind("lm_head.weight", 0) == 0;
+    for (const auto& why : refused)
+        if (why.rfind("lm_head.weight", 0) == 0) names_head = true;
+    check(names_head, "tied tail arm: a declared-tied pack whose tail head still gets the .fconst tail TRIED, and the head it cannot "
+                      "build is refused by name rather than dropped in silence" +
+                          (refused.empty() ? std::string(" -- no refusal at all here (head lost silently)") : ""));
+    fs::remove_all(dir);
+}
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────
 void test_matmulnbits() {
     const int N = 64, K = 256, B = 128;
@@ -2421,6 +2537,7 @@ int main(int argc, char** argv) {
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_gate_arms(golden_dir.empty() ? "." : golden_dir);
         test_1671_tail_arm(golden_dir.empty() ? "." : golden_dir);
+        test_1671_tied_tail_arm(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);
         test_q4_1f();

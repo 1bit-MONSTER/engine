@@ -47,20 +47,37 @@ PROMPT_TOKENS = int(os.environ.get("PROMPT_TOKENS", "0"))   # 0 = the fixed 145-
 CTX = os.environ.get("CTX", "4096")
 
 
-def die_with_parent():
-    """Have the kernel kill the server if this process dies, however it dies.
+def _pdeathsig_setter():
+    """Build the prctl call ONCE, at import: the setter runs in a forked child (preexec_fn).
 
-    The `finally` below reaps the server on a clean exit, a Ctrl-C and a SIGTERM, but not on SIGKILL (an OOM kill,
-    a CI timeout, `kill -9` by an operator): the child is in its own session, so it would survive and keep its HRX
-    context -- and on this box an orphaned llama-server held 51 GiB of GTT for 14 h and knocked out another
-    service. PR_SET_PDEATHSIG closes that case: the kernel signals the child when the parent dies, whatever the
-    reason. Linux only, which is where the HRX route runs; elsewhere the flag is simply not set.
+    Why it matters here and not in a single-threaded program: this driver runs a socket-listener thread, so the fork
+    that spawns a child happens in a multi-threaded process, and anything the child does before `exec` that allocates
+    or imports can deadlock on a lock another thread held at fork time. Resolving libc and the constant at import time
+    leaves the child with one C call that allocates nothing. Linux only (the HRX route); elsewhere the setter is a
+    no-op and the `finally` remains the reaper.
     """
     try:
         import ctypes, signal
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        sig = int(signal.SIGTERM)
+        return lambda: libc.prctl(1, sig)   # PR_SET_PDEATHSIG
     except Exception:
-        pass
+        return lambda: None
+
+
+_DEATHSIG = _pdeathsig_setter()
+
+
+def die_with_parent():
+    """Have the kernel kill the child if this process dies, however it dies.
+
+    The `finally` below reaps both children on a clean exit, a Ctrl-C and a SIGTERM, but not on SIGKILL (an OOM kill,
+    a CI timeout, `kill -9` by an operator): the server is in its own session and the provider runs for up to 1800 s,
+    so either would survive and keep its HRX context or its region -- and on this box an orphaned llama-server held
+    51 GiB of GTT for 14 h and knocked out another service. PR_SET_PDEATHSIG closes that case: the kernel signals the
+    child when the parent dies, whatever the reason.
+    """
+    _DEATHSIG()
 
 
 def free_port():
@@ -258,10 +275,28 @@ def main():
         # even when the caller called set_inheritable() on it, so the first attempt handed the provider a dead
         # fd 3 -- mmap returned EBADF and the run blamed the dma-buf instead of the harness (measured 2026-11-04
         # 09:55, and reproduced in isolation with a memfd: "child: fd/3 MISSING" without this, mmap OK with it).
+        # Popen, not run(): the provider can run for the whole timeout (1800 s on a 16k prompt), so it needs the
+        # same two properties as the server -- its own session, so the deadline can reap the whole group, and
+        # PR_SET_PDEATHSIG, so a driver killed by SIGKILL does not leave it behind (the shape of the 2026-11-08
+        # incident and the rule engine#1624 is about). `run()` would give neither: it blocks, and its child is in
+        # the driver's process group, which the teardown below does not signal.
         with open(prov_log, "w") as pf:
-            prow = subprocess.run([PROV, "--model", MODEL, "--tokens", ids_path, "--layout", layout_path,
-                                   "--fds", fds_arg], env=penv, stdout=pf, stderr=subprocess.STDOUT, timeout=1800,
-                                  pass_fds=tuple(3 + i for i in range(len(fds))))
+            prov = subprocess.Popen([PROV, "--model", MODEL, "--tokens", ids_path, "--layout", layout_path,
+                                     "--fds", fds_arg], env=penv, stdout=pf, stderr=subprocess.STDOUT,
+                                    pass_fds=tuple(3 + i for i in range(len(fds))),
+                                    start_new_session=True, preexec_fn=die_with_parent)
+            try:
+                rc = prov.wait(timeout=1800)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(prov.pid), 9)
+                except ProcessLookupError:
+                    pass
+                rc = -9
+
+        class _R:   # the rest of the block reads like the run() it replaced
+            returncode = rc
+        prow = _R()
         say(f"provider exit={prow.returncode} wall={time.time() - t0:.1f}s log={prov_log}")
         prov_text = open(prov_log).read()
         asan = prov_text.count("ERROR: AddressSanitizer") + prov_text.count("SUMMARY: AddressSanitizer")

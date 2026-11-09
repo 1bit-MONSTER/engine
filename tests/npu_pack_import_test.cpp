@@ -2690,8 +2690,9 @@ void test_im_from_node_attrs(const std::string& root) {
     check(im == 10240, "im-from-node-attrs: the FFN pair inside the If branch gives 10240 (" + std::to_string(im) + ")");
 
     // The review's case (#1657): attention forms the same (N == other's K, K == hidden) shape. With q_dim 4096 > hidden
-    // 2560, a bare "pair that agrees" returns 4096 as the FFN width while the true value is 9728 (fused gate_up N=19456,
-    // down K=19456). Attention must not be able to answer, and the fused pair must.
+    // 2560, a bare "pair that agrees" returns 4096 as the FFN width while the true value is 9728 (fused gate_up N=19456 =
+    // 2w, down K=9728 = w: down_proj reads the gated product, engine#1756). Attention must not be able to answer, and the
+    // fused pair must.
     const std::string attn = "model.layers.0.attn.";
     const std::string wider = pb::graph(
         {}, {mm_named(attn + "q_proj.MatMulNBits.qweight", "h", 2560, 4096),
@@ -2699,12 +2700,23 @@ void test_im_from_node_attrs(const std::string& root) {
              mm_named(attn + "k_proj.MatMulNBits.qweight", "h", 2560, 2048),
              mm_named(attn + "v_proj.MatMulNBits.qweight", "h", 2560, 2048),
              mm_named(mlp + "gate_up_proj.MatMulNBits.qweight", "h", 2560, 19456),
-             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 19456, 2560)});
+             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 9728, 2560)});
     put_file((dir / "model2.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", wider)}));
     const int im2 = pi::intermediate_size_from_graph((dir / "model2.onnx").string(), 2560);
     std::printf("im-from-node-attrs: q_dim 4096 > hidden 2560, fused gate_up -> %d (must not be 4096)\n", im2);
     check(im2 == 9728, "im-from-node-attrs: wider attention does not become the FFN width; the fused pair gives 9728 (" +
                            std::to_string(im2) + ")");
+
+    // engine#1756: the same shapes with OPAQUE tensor names, so the role filter cannot help. o_proj's K and q_proj's N are both
+    // q_dim (4096); the old fused rule (gate_n.count(dk), halved) matched that pair and returned 2048 -- a wrong width, not a
+    // refusal. The rule that pairs a down K with a gate N of twice it cannot be met by attention, so this must be 9728.
+    const std::string opaque = pb::graph(
+        {}, {mm_named("n0", "h", 2560, 4096), mm_named("n1", "q", 4096, 2560), mm_named("n2", "h", 2560, 2048),
+             mm_named("n3", "h", 2560, 2048), mm_named("n4", "h", 2560, 19456), mm_named("n5", "a", 9728, 2560)});
+    put_file((dir / "model2o.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", opaque)}));
+    const int im2o = pi::intermediate_size_from_graph((dir / "model2o.onnx").string(), 2560);
+    check(im2o == 9728, "im-from-node-attrs: with opaque names the fused pair still gives 9728, never q_dim/2 (" +
+                            std::to_string(im2o) + ")");
 
     // Attention only, wider than hidden, no FFN at all: 0, never q_dim.
     const std::string attnonly = pb::graph(

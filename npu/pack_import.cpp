@@ -1194,6 +1194,78 @@ constexpr int kTileRows = 64, kSubvRows = 32, kKBlock = 128;
 constexpr int64_t kMlpSubvBytes = 4288;
 constexpr int kMlpRows = 128;
 
+// ── the 1.9 external-data tile (engine#1503) ─────────────────────────────────
+// The `.fconst` tile's subvolume, written densely per tensor instead of inside the fconst envelope. Measured field by
+// field on `amd/phi-4_rai_1.9.0_npu`: the blob length is exactly `N x (K/128 + 1) x 68` on all 201 matmuls, the
+// all-zero subvolume pair sits at `index % (2*(K/128+1)) == 0,1` (the writer's bias pair, zero here), the scales read
+// as bf16 in 5.7e-3 .. 8.5e-3 while reading as ~1.0 the same bytes as f16, and the zero points are int4 nibbles
+// (`0x5555`, `0x6666`, `0xAAAA` appear as such).
+//
+// What the host side could NOT settle is which way the 128 code bytes of one row lie inside the 2,048-byte quants
+// region: the subvolume's own doc formula (`(cp%4) + kk*4 + (cp/4)*512`, known-answer verified for the .fconst tile)
+// against a plain row-major reading. Three statistics were tried and they disagreed with each other, which discredits
+// all three (they all assumed a row's codes centre on its zero-point, and the measured zero points span 0..11). So the
+// default is the verified prior and the alternative is one constant, to be settled by the known-answer run.
+Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err, bool row_major) {
+    Q4 q;
+    if (N <= 0 || K <= 0 || N % kExtTileRows != 0 || K % 128 != 0) {
+        err = "external tile: N must be a multiple of 64 and K a multiple of 128 (got " + std::to_string(N) + " x " +
+              std::to_string(K) + ")";
+        return q;
+    }
+    const int64_t blocks = K / 128, tiles = N / kExtTileRows, per_tile = 2 * (blocks + 1);
+    const int64_t want = tiles * per_tile * kExtSubvBytes;
+    if (int64_t(bytes) != want) {
+        err = "external tile: " + std::to_string(bytes) + " B is not " + std::to_string(want) + " B = " +
+              std::to_string(tiles) + " tiles x " + std::to_string(per_tile) + " subvolumes of " +
+              std::to_string(kExtSubvBytes) + " (N " + std::to_string(N) + " x K " + std::to_string(K) + ")";
+        return q;
+    }
+    q.N = N;
+    q.K = K;
+    q.block = 32;
+    q.codes.assign(size_t(N) * K, 0);
+    q.scale.assign(size_t(N) * (K / 32), 0.0f);
+    q.zero.assign(size_t(N) * (K / 32), 0.0f);
+    for (int64_t tile = 0; tile < tiles; ++tile) {
+        for (int half = 0; half < 2; ++half) {
+            for (int64_t kk = 1; kk <= blocks; ++kk) {   // kk == 0 is the tile's bias pair, all zero here
+                const uint8_t* subv = data + (tile * per_tile + kk * 2 + half) * kExtSubvBytes;
+                const uint8_t* quants = subv;
+                const uint8_t* zeros = subv + 2048;
+                const uint8_t* scales = subv + 2112;
+                for (int r = 0; r < kExtSubvRows; ++r) {
+                    const int64_t row = tile * kExtTileRows + half * kExtSubvRows + r;
+                    const float s = bf16_to_f32(uint16_t(scales[r * 2] | (scales[r * 2 + 1] << 8)));
+                    // four int4 zero points per row, one per 32-column group of the 128-column block
+                    const uint8_t z0 = zeros[r * 2], z1 = zeros[r * 2 + 1];
+                    const uint8_t zp[4] = {uint8_t(z0 & 0xF), uint8_t(z0 >> 4), uint8_t(z1 & 0xF), uint8_t(z1 >> 4)};
+                    for (int g = 0; g < 4; ++g) {
+                        q.scale[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = s;
+                        q.zero[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = float(zp[g]);
+                    }
+                    for (int c = 0; c < 128; ++c) {
+                        // Row-major: a row's 128 codes are 64 contiguous bytes, even column in the low nibble.
+                        // The .fconst formula: one byte per COLUMN holds the row PAIR 2cp (low) / 2cp+1 (high), so a
+                        // row's codes are strided by 4 through a 512-byte block -- no column pairing at all.
+                        uint8_t nib;
+                        if (row_major) {
+                            const uint8_t b = quants[r * 64 + c / 2];
+                            nib = (c % 2 == 0) ? uint8_t(b & 0xF) : uint8_t(b >> 4);
+                        } else {
+                            const int cp = r / 2;
+                            const uint8_t b = quants[(cp % 4) + c * 4 + (cp / 4) * 512];
+                            nib = (r % 2 == 0) ? uint8_t(b & 0xF) : uint8_t(b >> 4);
+                        }
+                        q.codes[size_t(row) * K + (kk - 1) * 128 + c] = nib;
+                    }
+                }
+            }
+        }
+    }
+    return q;
+}
+
 // One subvolume's size at a given group width: 64*(rows/2) quants + 64 zero-point bytes + rows bf16
 // scales. rows/2 is the subvolume's column count (32 -> 2,176 B, 64 -> 4,288 B).
 int64_t subv_bytes(int rows) {

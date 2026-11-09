@@ -296,6 +296,7 @@ add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
 # fleet state present -> the claim uses the fleet's queue and token; absent -> the old ~/GPU-* paths, so a box
 # that has not been set up is unchanged. No GPU: the claim holds the token for three seconds and runs `true`.
 add_test(NAME gpu_hold_queue COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_test.sh)
+add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.

@@ -272,6 +272,26 @@ together with the rest of #1504's acceptance.
 ## What a restart policy cannot do
 
 It cannot notice that a runner is *not* coming back (a version mismatch, a revoked token, a full disk under
-`/var/lib/ghrunner`). That is [engine #1504](https://github.com/1bit-MONSTER/engine/issues/1504)'s item 3 and
-still open: a cheap row that asserts both self-hosted runners are `online=busy=false` through the API the release
-lanes already use, so a runner that is gone turns a check red instead of leaving it pending for ever.
+`/var/lib/ghrunner`). That is [engine #1504](https://github.com/1bit-MONSTER/engine/issues/1504)'s item 3, and it is
+`scripts/check-ci-runners.sh`:
+
+```sh
+scripts/check-ci-runners.sh --list                                      # what the API says, and the verdict
+scripts/check-ci-runners.sh --require strixhalo-engine strixhalo-bench  # the fleet, named
+```
+
+It exits 0 when both named runners are `online`, 1 with a `::error::` line per offender, and 2 when the list cannot
+be read at all — an unchecked runner is exactly the state the row exists to end. `--require` is not decoration: a
+runner that has been *deleted* satisfies "every registered runner is online", so the two names have to be asked for
+explicitly. A repository with no self-hosted runners registered is not an outage, so a fresh box and a fork both
+exit 0.
+
+`scripts/weekly.sh` runs it in the preflight, as a fatal row: a release whose post-release checks queue for ever is
+worse than a release that waits an hour, and `WEEKLY_SKIP_RUNNER_CHECK=1` is the deliberate way to publish during an
+outage. `tests/check_ci_runners_test.sh` (ctest `check_ci_runners`) covers the arms with a fake `gh`: both online,
+one offline, an unrequired dead runner, a required runner that is not registered, nothing registered, an API failure,
+and `--list`.
+
+It cannot be a ctest itself — it needs the network and a token, which the GitHub-hosted job does not have. A
+*scheduled* red (a cron workflow that fails once an hour while a runner is down) is the complete answer and is not
+here: a new workflow changes what the repository's token may do, which is an RFC under CONTRIBUTING.md.

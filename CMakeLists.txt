@@ -254,21 +254,12 @@ add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test
 # engine#1564: which files the copyright gate looks at -- a staged file is seen, an untracked one is seen (that is why
 # running it before `git add` is useful), an ignored one is not. A throwaway repo in a temp dir: no build, no device.
 add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_test.sh)
-# engine#1621: a hold that ends must end everything it started. Three orphans in two days were all GRANDCHILDREN
-# of a ticket (ticket → shell → runner → server): `pkill -P` reaches one level, so the process holding the memory
-# outlived the ticket. Drives scripts/gpu-hold with a wrapper → mid → work chain and asserts the deepest one dies.
-add_test(NAME gpu_hold_tree COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_tree_test.sh)
-# engine#1650: a hold ends itself when the box runs out of memory, before the kernel picks a victim — the 11-08/09
-# failure where an unbudgeted GPU run took the box to 0.7 GiB and the OOM killer chose the PR-agent LLM.
-add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_mem_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
-# engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
-# queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
-# Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a
-# second real gpu-hold reaps it and leaves the note the victim quotes. No device, no build; skips (77) without the script.
-add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_ticket_lost_test.sh)
 # engine#1701: the NPU hold's queue/token follow ONEBIT_HOLD_DIR, and its queue settings never reach the payload.
 # Shell only (a stub gpu-hold plus the tree's own), no device, ~1 s.
 add_test(NAME npu_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_hold_test.sh)
+# engine#1696: the gpu_hold_* registrations live in their own file, so adding one does not conflict with every
+# other test-adding PR through the one contiguous add_test block this used to be part of (see that file's header).
+include(cmake/tests-gpu-hold.cmake)
 # engine#1485: the two port read-backs the route tests use (tests/serve_port.sh). Script-based, no device, no model --
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
@@ -304,11 +295,6 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # resolves outside the payload, and a runtime set shipped without the aqlprofile agent libhsa opens. Each
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
-# engine #1504: the GPU hold queue is the FLEET's when the shared state is installed, with no environment to say
-# so - the failure it guards against is silent (a caller under another account taking its own token). Two arms:
-# fleet state present -> the claim uses the fleet's queue and token; absent -> the old ~/GPU-* paths, so a box
-# that has not been set up is unchanged. No GPU: the claim holds the token for three seconds and runs `true`.
-add_test(NAME gpu_hold_queue COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_test.sh)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and

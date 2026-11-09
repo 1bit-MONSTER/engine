@@ -328,6 +328,8 @@ unsigned short bf16_bits_of(float v);
 // the default rather than throw. Exported so tests/npu_pack_import_test.cpp can pin it without a
 // pack; `source` names where the geometry came from, for the refusal messages.
 Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
+// engine#1638: the geometry as read, so a test can check WHICH source a number came from.
+nlohmann::json load_geometry_exported(const std::string& pack_dir, std::string* source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);

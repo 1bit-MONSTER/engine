@@ -281,18 +281,10 @@ done
 
 deadline=$(( $(date +%s) + $(awk -v m="$MINUTES" 'BEGIN { printf "%d", m * 60 }') ))
 started=$(date +%s)
-"$@" &
-child=$!
-# The watchdog is a function so it can be given the command's pid: a subshell inherits a copy of the shell's
-# variables, so a watchdog started before the command (the first version did) holds an empty pid and neither
-# the abort nor the max hold stops anything.
-# End the hold's whole DESCENDANT TREE: TERM first so a runner can clean up after itself (thermal-run's
-# scope, a benchmark's teardown), then KILL after a grace period for anything that ignored it. Walking
-# `ps --ppid` is depth-agnostic; `pkill -P` reached only the first level, which is why three orphans
-# survived their tickets on 2026-11-08/09 — in each one the process holding the memory was two or three
-# levels down (ticket → shell → runner → server). A process group would express this too, but `setsid`
-# forks when it is already a group leader (which it is inside `systemd-run --scope`), so `$!` stops
-# naming the group; recursion has no such trap.
+# Defined BEFORE the payload starts, on purpose: the signal trap calls kill_tree, and a TERM landing between
+# `child=$!` and the definition runs the trap with the payload started and the helper undefined -- `declare -F`
+# then skips the kill, so the token is released and the payload survives, which is the leak this order removes
+# (engine#1640; #1642 landed the guard, this is the ordering that makes it always true).
 descendants() {   # <pid> -> its descendants and then itself, deepest last
     local k
     for k in $(ps -o pid= --ppid "$1" 2> /dev/null); do
@@ -316,6 +308,19 @@ kill_tree() {
     done
     for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
+"$@" &
+child=$!
+# The watchdog is a function so it can be given the command's pid: a subshell inherits a copy of the shell's
+# variables, so a watchdog started before the command (the first version did) holds an empty pid and neither
+# the abort nor the max hold stops anything.
+# End the hold's whole DESCENDANT TREE: TERM first so a runner can clean up after itself (thermal-run's
+# scope, a benchmark's teardown), then KILL after a grace period for anything that ignored it. Walking
+# `ps --ppid` is depth-agnostic; `pkill -P` reached only the first level, which is why three orphans
+# survived their tickets on 2026-11-08/09 — in each one the process holding the memory was two or three
+# levels down (ticket → shell → runner → server). A process group would express this too, but `setsid`
+# forks when it is already a group leader (which it is inside `systemd-run --scope`), so `$!` stops
+# naming the group; recursion has no such trap.
+
 
 # MemAvailable, in GB, as the kernel reports it. 0 disables the abort (the old behaviour).
 mem_available_gb() {

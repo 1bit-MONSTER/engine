@@ -31,6 +31,7 @@
 #include <unistd.h>   // mkstemp/close: the pb16i activation probe's dump
 
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -3583,9 +3584,26 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             char path[4096];
             std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
+            // A dump that cannot be written has to say so: a missing layer_<l>.f32 reads as "that layer never ran", which is
+            // the misleading-instrument class #1605/#1619 were fixing (engine#1726). Once, because the ordinary cause is a
+            // directory that is missing or unwritable, which fails for every layer and needs one line, not one per layer.
+            static bool warned = false;
             if (FILE* fp = std::fopen(path, "wb")) {
-                std::fwrite(X.data(), sizeof(float), (size_t)M * (size_t)H, fp);
-                std::fclose(fp);
+                const size_t want = (size_t)M * (size_t)H;
+                const size_t got  = std::fwrite(X.data(), sizeof(float), want, fp);
+                const int    shut = std::fclose(fp);
+                // Buffered stdio can defer the failure to fclose - a full disk reports ENOSPC there, not from fwrite - so
+                // both are checked rather than trusting the write's return alone.
+                if (!warned && (got != want || shut != 0)) {
+                    warned = true;
+                    std::fprintf(stderr,
+                                 "  [dump] cannot write %s (%zu of %zu floats%s): %s - the dump is INCOMPLETE\n", path, got,
+                                 want, shut == 0 ? "" : ", close failed", std::strerror(errno));
+                }
+            } else if (!warned) {
+                warned = true;
+                std::fprintf(stderr, "  [dump] cannot open %s for writing: %s - no residual dump was made\n", path,
+                             std::strerror(errno));
             }
         }
     }

@@ -233,17 +233,20 @@ void test_external_packed_genre(const std::string& root) {
     const auto write_data = [&](int64_t packed_bytes) {
         put_file((dir / "eager-mm.onnx.data").string(), std::string(size_t(embed_bytes + packed_bytes), '\x22'));
     };
-    const auto write_graph = [&](const std::string& packed, int64_t packed_bytes) {
+    // `with_sibling = false` writes the placeholder with NO `*.qweight.packed` initializer at all -- the truncated-pack
+    // shape engine#1690's review is about, which is a different case from the byte-less sibling.
+    const auto write_graph = [&](const std::string& packed, int64_t packed_bytes, bool with_sibling = true) {
+        std::vector<std::string> inits{pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
+                                                  uint64_t(embed_bytes)),
+                                       pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
+                                       pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty")};
+        if (with_sibling)
+            inits.push_back(pb::tensor(packed, {packed_bytes}, "eager-mm.onnx.data", uint64_t(embed_bytes),
+                                       uint64_t(packed_bytes)));
         put_file((dir / "eager-mm.onnx").string(),
-                 pb::model({pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
-                                       uint64_t(embed_bytes)),
-                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
-                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty"),
-                            pb::tensor(packed, {packed_bytes}, "eager-mm.onnx.data", uint64_t(embed_bytes),
-                                       uint64_t(packed_bytes))},
-                           {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
-                                                    "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
-                                            K, N, 4, 128, "MatMulNBitsBf")}));
+                 pb::model(inits, {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
+                                                           "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
+                                                   K, N, 4, 128, "MatMulNBitsBf")}));
     };
 
     write_data(stride * N);
@@ -300,6 +303,30 @@ void test_external_packed_genre(const std::string& root) {
               "(engine#1671: this is the path a 1.9 pack takes, where the weights are in the .fconst)");
     }
     fs::remove(dir / "dd_metastate_Llm_Token_Token_crafted.fconst");
+
+    // engine#1690 review: a `*.empty` placeholder with NO `*.packed` sibling at all must KEEP its matmul. Dropping it
+    // empties onnx.matmuls, and an empty matmul list is what tells plan() "this is a 1.9 fconst pack, take the head
+    // from the tail" (:1685) -- so a truncated pack would silently get a tail head instead of #1687's refusal. The
+    // point of the arm is the count, not the refusal: with the drop the node is gone and `matmulnbits_ops` reads 0.
+    write_data(0);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", 0, /*with_sibling=*/false);
+    {
+        bool refused = false;
+        std::string what;
+        json g4;
+        try {
+            g4 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
+        } catch (const std::exception& e) {
+            refused = true;
+            what = e.what();
+        }
+        if (refused)
+            check(what.find("fconst") == std::string::npos,
+                  "placeholder with no sibling: any refusal is not the \"read the head from the tail\" path (" + what + ")");
+        else
+            check(g4["matmulnbits_ops"] == 1 && g4["weightless_matmuls"] == 0,
+                  "placeholder with no sibling: the matmul is KEPT, so the pack is not mistaken for a tail-head pack");
+    }
 
     // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
     write_data(stride * N - 68);

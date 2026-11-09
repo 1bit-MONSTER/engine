@@ -284,7 +284,12 @@ OnnxModel parse_onnx(const std::string& path) {
             packed.replace(packed.size() - 6, 6, ".packed");
         else { kept.push_back(mm); continue; }
         const OnnxTensor* pw = find_init(packed);
-        if (!pw) continue;         // no sibling at all: not this genre's pack, leave it to the reader below
+        // No sibling at all: not this genre's pack. Keep the node exactly as it was -- it still names its `*.empty`
+        // initializer and the reader below decides what that means. Dropping it here would be a decision made by an
+        // absence: `onnx.matmuls.empty()` is what tells plan() "this is a 1.9 fconst pack, take the head from the tail"
+        // (:1685), so a truncated pack with real graph matmuls and no `.packed` siblings would silently get a head
+        // from the tail instead of the refusal #1687 asks for (engine#1690 review).
+        if (!pw) { kept.push_back(mm); continue; }
         if (no_bytes(*pw)) {
             // The sibling exists and is ITSELF a zero-length placeholder. Whether that is a fault depends on something
             // this walker cannot see: on a Ryzen AI 1.9 fconst pack EVERY graph initializer is spelled this way (363

@@ -25,6 +25,7 @@
 // built -- and timed on the array -- at full_i8_{QKV,O,GU,D}_K1024_N{1536,1024,9728,1024}_m16.
 // Before this, the forward derived K=896/N=1152, probed names no kernel has, and dequantised a
 // 1024-column tensor at 896 columns (which the chunk decoder refuses outright).
+#include "q4nx_dequant.h"
 #include "q4nx_pack.h"
 
 #include <math.h>
@@ -209,6 +210,59 @@ static void oga_geometry(void) {
         free(B);
         free(out);
         free(scales);
+    }
+
+    /* THE FUSED PATH (engine #1416): chunks -> int8 without the K x N float buffer. It has to be byte-identical to
+     * `q4nx_dequant_tensor() -> q4nx_pack_B_int8()`, so this runs BOTH on the same synthetic tiles and compares the codes,
+     * the scales and the returned mean. A synthetic 32x256 q4_1 tile is 5120 B of (16 B scale/zero header + 128 nibble
+     * pairs) x 8 groups; the encoder here is only required to be a *valid* q4_1 tile, not a meaningful weight. */
+    {
+        const int K = 64, N = 512;                     /* 2 x 2 tiles */
+        const size_t ntr = (size_t)(K / 32), ntc = (size_t)(N / 256);
+        uint8_t* tiles = malloc(ntr * ntc * 5120);
+        float* B = malloc((size_t)K * N * sizeof(float));
+        int8_t* ref = malloc((size_t)K * N);
+        int8_t* fused = malloc((size_t)K * N);
+        float* sc_ref = malloc((size_t)N * sizeof(float));
+        float* sc_fused = malloc((size_t)N * sizeof(float));
+        check(tiles && B && ref && fused && sc_ref && sc_fused, "fused fixture allocates");
+        if (tiles && B && ref && fused && sc_ref && sc_fused) {
+            for (size_t t = 0; t < ntr * ntc; t++)
+                for (size_t i = 0; i < 5120; i++)
+                    tiles[t * 5120 + i] = (uint8_t)((i * 37 + t * 91) & 0xFF);
+            /* The reference is `dequant_any`'s own call for this chunk kind: q4nx_dequant_tensor_chunked with
+             * chunk_bytes = 5120. Plain q4nx_dequant_tensor() dispatches differently (it sniffs the byte count for a
+             * packed grid) and left part of B unwritten, which the first version of this test read as a mismatch in the
+             * fused path -- it was the reference that was wrong for these tiles. */
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), 0,
+                      "fused: the reference path dequantises the synthetic tiles");
+            const int ld = N;   // q4nx_pack_B_int8 writes out[i * ld + j] with i < K, j < N, so ld must be >= N
+            const float m_ref = q4nx_pack_B_int8(B, K, N, ref, ld, sc_ref);
+            const int rc = q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused);
+            check_int(rc, 0, "fused: q4nx_pack_q4_1_tiles_to_int8 accepts the same tiles");
+            int bad_code = 0, bad_scale = 0;
+            for (int i = 0; i < K * N; i++)
+                if (fused[i] != ref[i]) {
+                    if (bad_code < 6)
+                        printf("    mismatch at row %d col %d: fused %d ref %d\n", i / N, i % N, (int)fused[i],
+                               (int)ref[i]);
+                    bad_code++;
+                }
+            for (int j = 0; j < N; j++) if (sc_fused[j] != sc_ref[j]) bad_scale++;
+            check_int(bad_code, 0, "fused: every code is byte-identical to dequant -> pack");
+            check_int(bad_scale, 0, "fused: every column scale is byte-identical as well");
+            /* the mean the two-step path returns is the mean of the same scales, so it agrees by construction */
+            double ssum = 0.0;
+            for (int j = 0; j < N; j++) ssum += (double)sc_fused[j];
+            check(fabsf((float)(ssum / N) - m_ref) < 1e-6f,
+                  "fused: the mean column scale matches the two-step return value");
+            /* a wrong chunk kind is refused by name rather than quantised from garbage */
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120 - 1, K, N, fused, ld, sc_fused), -2,
+                      "fused: a non-q4_1 byte count returns -2 so the caller keeps the two-step path");
+            printf("  fused chunks->int8: K=%d N=%d  %d codes and %d scales byte-identical to dequant->pack\n",
+                   K, N, K * N, N);
+        }
+        free(tiles); free(B); free(ref); free(fused); free(sc_ref); free(sc_fused);
     }
 
     /* QKV: the three projections are stacked along N at their real row counts and the tail of the

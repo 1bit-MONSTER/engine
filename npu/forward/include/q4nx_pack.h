@@ -274,6 +274,14 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
 /* Per-column int8 quantization of B[K][N] into out with leading dimension ld,
  * plus per-column scales.  Identical numerics to I8Ctx::packB_into().
  * Returns the mean column scale (I8Ctx's `sout`). */
+/* Chunks -> int8 without materialising the float matrix (engine #1416): the q4_1 tile kind only.
+ * Dequantises one 32x256 tile into scratch, folds it into the per-column amax, then writes the codes on a second pass.
+ * Byte-identical to `q4nx_dequant_tensor() -> q4nx_pack_B_int8()` (same tile decoder, same arithmetic, same amax floor),
+ * which tests/npu_design_grid_test.c asserts by running both. Returns 0, -1 on a bad geometry, -2 when the container is
+ * not the q4_1 tile kind (caller keeps the two-step path). */
+int q4nx_pack_q4_1_tiles_to_int8(const uint8_t* tiles, size_t nbytes, int K, int N, int8_t* out, int ld,
+                                 float* col_scales);
+
 float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
                        float* col_scales);
 

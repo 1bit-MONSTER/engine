@@ -1,0 +1,60 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Targets whose add_test() names them and which CI never builds (engine#1595).
+#
+# These tests never reach ctest in the configuration ci.yml creates, and there are two ways that happens: the
+# add_test is inside a guard CI's configure makes false, so ctest never registers it at all, or it is
+# registered and its binary is never built (ci.yml's own comment says the missing binary is reported "Not Run"
+# and the job stays green). Main's last green `build` job reports 148/148 with 0 Not Run, so the first is the
+# common case -- the earlier wording here ("these tests report Not Run in CI") was wrong for every line in the
+# file (engine#1595 review). The defect this file ratchets is that a test can be declared and still never run,
+# not the reporting label ctest attaches when it does not.
+#
+# The check FAILS when this set GROWS -- a new name here is a change that broke something, and it is deleted a
+# line at a time. It is a SET, not a count, because a count passes a rename.
+#
+# `have` is ci.yml's `--target` list PLUS everything reachable from it through `add_dependencies`, which is the
+# tree's other documented way to get a target built (`add_dependencies(onebit onebit_npu_forward_syntax)` and
+# ~30 `add_dependencies(npu_sampling_test …)`) . Reading only the --target list made 32 of the 36 entries below
+# look unbuilt when they are built as dependencies of `onebit`/`npu_sampling_test` (engine#1595 review).
+# The set below is MEASURED, not guessed (engine#1595 review). Every name was produced by running this check
+# against the guard-evaluated model: a test whose add_executable/add_test is registered under a guard ci.yml's
+# configure satisfies, and which nowhere gets built -- an `add_dependencies` edge inside `if(ONEBIT_NPU)` is not a
+# build route when CI turns ONEBIT_NPU off.
+#
+# The previous four entries were all wrong in the same way, and in both directions at once:
+#   hf_tokenizer_test, laya_classify_eval, laya_gate, npu_rt_shim_test  -- each is guarded by an option CI turns
+#   off, so CI never registers it BY DESIGN; the tool told their authors to "build it or drop the test", which was a
+#   false positive, and the file recorded them as defects that were not defects.
+# while these seven were invisible, cleared by dead-guard `add_dependencies` edges -- the false negative the same
+# review demonstrated. A dead edge is not a build route, and a guard CI turns off is not drift; both are now
+# modelled, and this list is what survived.
+#
+# What each line means: `add_test` names the target, ci.yml's configuration registers the test, and nothing in
+# that configuration ever builds the binary -- so the test either reports "Not Run" (if ctest registers it) or
+# never appears at all. Either way a declared test does not run in CI, which is the defect this file ratchets.
+#
+# The check FAILS when this set GROWS -- a new name here is a change that broke something, and it is deleted a
+# line at a time. It is a SET, not a count, because a count passes a rename.
+attn_math_test
+hadamard_rotate_test
+host_gemm_pad_test
+npu_derive_designs_dump
+npu_kv_int8_test
+npu_plan_op_reference_test
+quant_i8_row_test
+laya_classify_eval
+laya_gate

@@ -725,6 +725,60 @@ payload_name_from_image() {  # <identity file> <payload dir>
     payload_name_verdict "$_pval" "$_ptag"
 }
 
+# ── the shipped kernel carries the ip_options UAF fix (CVE-2026-98432) ─────────────────────────
+# CVE-2026-98432: a remote, unauthenticated use-after-free in IPv4 `ip_options` (the request-socket path). The fix is to free
+# `ireq_opt` with `kfree_rcu` in `tcp_v4_reqsk_destructor`; upstream fixed it in 5.10.272, 5.15.223, 6.1.190, 6.6.159, 6.12.113,
+# 6.18.56, 7.2.10, 7.3 - and 7.4-rc1 carries it.
+#
+# Two kinds of evidence, and the STRONGER one decides where it exists:
+#   * a kernel source tree on the image (`net/ipv4/tcp_ipv4.c`): the function must free with `kfree_rcu`, which is the fix itself
+#     and outranks a version number - a backport can carry the fix below the floor (this box's 7.3-rc4 perfopt tree does), and a
+#     vendor tree can lack it above the floor;
+#   * otherwise the VERSION FLOOR for the shipped kernel's own line, which is what an appliance with no sources can offer.
+# Pure, so --self-test drives it: <kernel release> <source verdict: yes|no|absent>
+kernel_cve_verdict() {
+    _v=${1:-} _src=${2:-absent}
+    case "$_src" in
+        yes) printf 'PASS %s'"'"'s tcp_v4_reqsk_destructor frees ireq_opt with kfree_rcu (read from its own net/ipv4/tcp_ipv4.c, which outranks the version floor)' "$_v"; return 0 ;;
+        no)  printf 'FAIL %s'"'"'s tcp_v4_reqsk_destructor frees ireq_opt WITHOUT kfree_rcu - the CVE-2026-98432 use-after-free, whatever the version says' "$_v"; return 0 ;;
+    esac
+    # version floor per line, from the advisory: a patch equal to the floor is the fix; a PRE-release at that patch is not.
+    # The advisory writes "7.4-rc1" and "5.10.272"; `uname -r` writes "7.4.0-rc1-1bit". Both must parse, so the
+    # numeric part is taken from the text BEFORE the first '-': without this, `_min` kept the suffix ("4-rc1") and
+    # every `X.Y-rcN` release - the advisory's own 7.4-rc1 included - fell through to "cannot be parsed".
+    _vbase=${_v%%-*}
+    _maj=${_vbase%%.*}; _rest=${_vbase#*.}
+    _min=${_rest%%.*}; _rest2=${_rest#*.}
+    if [ "$_rest2" = "$_rest" ]; then _pat=0; else _pat=${_rest2%%[!0-9]*}; fi   # "7.3" is 7.3.0, not 7.3.3
+    _rc=$(printf '%s' "$_v" | sed -n 's/.*-rc\([0-9][0-9]*\).*/\1/p')
+    case "$_maj$_min" in ''|*[!0-9]*) printf 'FAIL the kernel release (%s) cannot be parsed, so whether it carries the CVE-2026-98432 fix is unknown' "${_v:-empty}"; return 0 ;; esac
+    case "$_pat" in ''|*[!0-9]*) printf 'FAIL the kernel release (%s) has no patch number, so it is a pre-release of %s.%s and cannot be compared with the fix floor' "$_v" "$_maj" "$_min"; return 0 ;; esac
+    if [ "$_maj" -gt 7 ] || { [ "$_maj" = 7 ] && [ "$_min" -ge 4 ]; }; then
+        # the 7.4 line: 7.4-rc1 is the advisory's own "carries it"; earlier rc of 7.4 is unknown, and 7.4 release is fixed
+        if [ -z "$_rc" ] || [ "$_rc" -ge 1 ]; then
+            printf 'PASS %s is at or after 7.4%s, the advisory'"'"'s own floor for this fix (no kernel source on the image to read the function from)' "$_v" "$([ -n "$_rc" ] && echo "-rc1")"
+        else
+            printf 'FAIL %s predates 7.4-rc1, the advisory'"'"'s floor for this fix' "$_v"
+        fi
+        return 0
+    fi
+    case "$_maj.$_min" in
+        5.10) _floor=272 ;; 5.15) _floor=223 ;; 6.1) _floor=190 ;; 6.6) _floor=159 ;;
+        6.12) _floor=113 ;; 6.18) _floor=56 ;; 7.2) _floor=10 ;;
+        7.3)  _floor=0 ;;
+        *) printf 'FAIL no fix floor is known for the %s.%s line (the advisory lists 5.10/5.15/6.1/6.6/6.12/6.18/7.2/7.3/7.4), so this kernel cannot be confirmed either way' "$_maj" "$_min"; return 0 ;;
+    esac
+    if [ "$_pat" -gt "$_floor" ]; then
+        printf 'PASS %s is after %s.%s.%s, the advisory'"'"'s floor for its line (no kernel source on the image to read the function from)' "$_v" "$_maj" "$_min" "$_floor"
+    elif [ "$_pat" -eq "$_floor" ] && [ -z "$_rc" ]; then
+        printf 'PASS %s is the advisory'"'"'s floor for its line (no kernel source on the image to read the function from)' "$_v"
+    elif [ "$_pat" -eq "$_floor" ] && [ -n "$_rc" ]; then
+        printf 'FAIL %s is a pre-release AT the floor patch %s.%s.%s - the fix landed in the release, not the rc' "$_v" "$_maj" "$_min" "$_floor"
+    else
+        printf 'FAIL %s is before %s.%s.%s, the advisory'"'"'s floor for its line' "$_v" "$_maj" "$_min" "$_floor"
+    fi
+}
+
 payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
     _f=${1:-} _d=${2:-} _sample=${3:-}
     case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
@@ -788,6 +842,27 @@ payload_runpath_verdict() {
 # target RESOLVES TO A FILE under home|Users|root (0 in c33, 1 in the leaking image). Targets that are a directory or
 # absent are named but not failed - `root/spot -> /home/spot` is legitimate, and a payload scanned on a build host
 # cannot tell an image directory from a missing one.
+# The sealed NPU sets live on the stick and the engine looks for them BESIDE ITSELF, so `init.sh` links
+# /data/npu/kernels to <engine dir>/npu/kernels at boot. engine#1543 moved the engine from its builder's path to
+# /opt/1bit and had to move this link with it; a link left behind (or a guard that skips because the engine dir is
+# absent) is not cosmetic: the engine finds no set, registers no device, and the boot is otherwise green.
+# Pure, so --self-test drives it: <sets present 0|1> <link target or empty>
+npu_link_verdict() {
+    _sets=${1:-} _link=${2:-}
+    case "$_sets" in
+        0) printf 'PASS no sealed NPU set on this boot, so there is no link to check beside the engine'; return 0 ;;
+        1) ;;
+        *) printf 'FAIL whether the sealed NPU sets are present could not be read (%s)' "${_sets:-empty}"; return 0 ;;
+    esac
+    if [ -z "$_link" ]; then
+        printf 'FAIL the boot carries sealed NPU sets but nothing is linked beside the engine: the engine loads them from <engine dir>/npu/kernels, so it would register NO device on an otherwise green boot (engine#1543)'
+    elif [ "$_link" = "${NPU_SETS_DIR:-/data/npu/kernels}" ]; then
+        printf 'PASS the sealed NPU sets are linked beside the engine (%s -> %s)' "$_link" "${ENGINE_DIR:-/opt/1bit}/npu/kernels"
+    else
+        printf 'FAIL %s/npu/kernels points at %s, not at the set directory of this boot (%s): the engine would load the wrong sets or none (engine#1543)' "${ENGINE_DIR:-/opt/1bit}" "$_link" "${NPU_SETS_DIR:-/data/npu/kernels}"
+    fi
+}
+
 payload_home_layout_bad() {   # <payload dir> -> "relpath|TARGET|file|dir|dangling" per absolute home-targeting link
     python3 - "$1" 2>/dev/null <<'PYSCAN'
 import os, sys
@@ -825,6 +900,14 @@ payload_home_layout_verdict() {   # <links at a FILE or at NOTHING> <links at a 
     else
         printf "PASS no absolute symlink in the payload points into a home directory: the payload's layout carries no builder path"
     fi
+}
+
+xhci_capture_verdict() {   # <1 when /bin/1bit-xhci-capture is present and executable, 0 when not>
+    case "${1:-}" in
+        1) printf 'PASS /bin/1bit-xhci-capture is installed and executable: a boot can capture the xHCI state for engine#823, which is the only place a plug can be observed' ;;
+        0) printf 'FAIL /bin/1bit-xhci-capture is not installed: engine#823 asks whether a rear USB-A or Type-C port sees a device, and nothing on this medium can read that' ;;
+        *) printf 'FAIL whether the xHCI capture is installed could not be read (%s)' "${1:-empty}" ;;
+    esac
 }
 
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
@@ -878,10 +961,21 @@ if [ "${1:-}" = --self-test ]; then
     ln -s /home/nonexistent-xyz "$_hl_st/opt/home"                 # a home directory target: named, not failed
     check "bin/leak|/home/nonexistent-xyz/wt/build/1bit|dangling" "$(payload_home_layout_bad "$_hl_st" | grep '^bin/leak|')"
     rm -rf "$_hl_st"
+    check PASS "$(xhci_capture_verdict 1)"
+    check FAIL "$(xhci_capture_verdict 0)"
+    check FAIL "$(xhci_capture_verdict '')"
     check PASS "$(payload_runpath_verdict 0)"
     check FAIL "$(payload_runpath_verdict 3 '/opt/1bit-package/1bit/1bit runs /home/x/wt/release-rc/work/build')"
     check FAIL "$(payload_runpath_verdict 1)"
     check FAIL "$(payload_runpath_verdict '')"
+    # engine#1543's other half: the sets are linked BESIDE the engine, so moving the engine without the link
+    # registers no device on a green boot
+    check PASS "$(npu_link_verdict 0 '')"
+    check PASS "$(npu_link_verdict 1 /data/npu/kernels)"
+    check FAIL "$(npu_link_verdict 1 '')"
+    check FAIL "$(npu_link_verdict 1 /home/builder/wt/npupkg-build/npu/kernels)"
+    check FAIL "$(npu_link_verdict '')"
+
     # engine #1352: the payload's modes. c31/c32 shipped 134 writable files; a payload packed after #1361 has none.
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 7ba2110811111111111111111111111111111111111111111111111111111111 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"       # the c26-in-a-c32-image shape: engine claim vs shipped launcher
@@ -1068,6 +1162,27 @@ next')
     check PASS "$(laya_verdict '{"choices":[{"message":{"content":"Here you go"}}],"x_lemonade_route":{"route_to":"m","matched_rule":"laya-prose","default_used":false,"trace":[{"condition":"classifier:laya","score":0.77}]}}' prose m)"
 
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
+    # ── kernel_cve_verdict: the CVE-2026-98432 fix standing of a kernel release ──────────────────────────
+    # The advisory's own spelling, `X.Y-rcN` and `X.Y` with no patch component, is driven first: the first
+    # version of the parse rejected those as unparsable while the code had a 7.4 branch waiting for them.
+    check PASS "$(kernel_cve_verdict 7.4-rc1 absent)"          # the advisory's floor for this fix
+    check PASS "$(kernel_cve_verdict 7.4.0-rc1-1bit absent)"   # the same kernel as `uname -r` writes it
+    check PASS "$(kernel_cve_verdict 7.4 absent)"              # the release
+    check FAIL "$(kernel_cve_verdict 7.4-rc0 absent)"          # before the advisory's rc1
+    check PASS "$(kernel_cve_verdict 7.3 absent)"              # a release with no patch component
+    check FAIL "$(kernel_cve_verdict 7.3-rc4 absent)"          # a pre-release AT the floor patch
+    check FAIL "$(kernel_cve_verdict 7.3.0-rc4-1bit absent)"   # the same, in `uname -r` form
+    check PASS "$(kernel_cve_verdict 7.3-rc4 yes)"             # source evidence outranks the floor
+    check FAIL "$(kernel_cve_verdict 7.4-rc1 no)"              # ... and can convict above it
+    check FAIL "$(kernel_cve_verdict 5.10.272-rc1 absent)"     # pre-release at a patch floor
+    check PASS "$(kernel_cve_verdict 5.10.272 absent)"
+    check FAIL "$(kernel_cve_verdict 6.6.158 absent)"
+    check PASS "$(kernel_cve_verdict 6.6.159 absent)"
+    check FAIL "$(kernel_cve_verdict 7.2.9 absent)"
+    check PASS "$(kernel_cve_verdict 7.2.10 absent)"
+    check FAIL "$(kernel_cve_verdict 4.19.0 absent)"           # a line the advisory does not list
+    check FAIL "$(kernel_cve_verdict '' absent)"               # nothing may read as safe
+    check FAIL "$(kernel_cve_verdict 7.x.0 absent)"
     # A self-test is not a check run: without this the EXIT trap above appended "RESULT: FAIL (this check died
     # before its footer)" to every green self-test, which reads exactly like the death the trap exists to report.
     RC_FOOTER=1
@@ -2045,25 +2160,37 @@ fi
 # to trust that a mode fix happened. A SKIP (not a failure) when the payload is not where an appliance keeps it, so the row can be
 # run off a stick.
 PDIR=${PAYLOAD_DIR:-/opt/1bit-package}
+# A clean mode count over an EMPTY payload proves nothing - and a directory that exists but holds nothing is exactly what an
+# interrupted extraction leaves behind (measured 2026-11-08: an `unsquashfs -d` with the wrong path argument produced 0 entries
+# and this row printed PASS over it). So the row checks its subject before it checks the modes: a real payload carries hundreds
+# of entries (c33: 263).
+# Absence first, then vacuity: the SKIP below is the row's documented behaviour on a machine where the payload is not
+# unpacked (a stick, a dev box), and the floor must not pre-empt it. A missing payload is a claim about THIS system; a
+# payload that exists and holds nothing is a claim about the ARTIFACT - and only the second is a FAIL.
 if [ ! -d "$PDIR" ]; then
     skip payload-modes "no $PDIR on this system: the payload is not unpacked where an appliance keeps it, so its modes cannot be read"
 else
-    _pm_f=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
-    _pm_d=$(find "$PDIR" -mindepth 0 -type d \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
-    # the sample is relative to the payload, like the modes below it: an absolute path per file makes a long line on a console
-    # nobody can scroll, and the prefix is identical for every one of them
-    # the sample prints the mode too, because "writable" is not actionable and `drwxrwxr-x opt/1bit-package` is
-    _pm_s=$(find "$PDIR" -mindepth 0 \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 |
-        while IFS= read -r _p; do _r=${_p#"$PDIR"}; _r=${_r#/}; printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "${_r:-.}"; done)
-    PM=$(payload_modes_verdict "${_pm_f:-}" "${_pm_d:-}" "${_pm_s:-}")
-    _pm_bits=
-    for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
-        [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
-    done
-    case "$PM" in
-        PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
-        *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
-    esac
+    _pm_entries=$(find "$PDIR" -mindepth 1 2>/dev/null | wc -l)
+    if [ "${_pm_entries:-0}" -lt 100 ] 2>/dev/null; then
+        fail payload-modes "the payload at $PDIR holds only ${_pm_entries:-0} entries - a payload has hundreds (c33: 263), so this is an interrupted extraction, not a clean payload"
+    else
+        _pm_f=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
+        _pm_d=$(find "$PDIR" -mindepth 0 -type d \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
+        # the sample is relative to the payload: an absolute path per file makes a line nobody can scroll, and the
+        # prefix is identical for every one of them. It prints the mode too, because "writable" is not actionable
+        # and `drwxrwxr-x opt/1bit-package` is.
+        _pm_s=$(find "$PDIR" -mindepth 0 \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 |
+            while IFS= read -r _p; do _r=${_p#"$PDIR"}; _r=${_r#/}; printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "${_r:-.}"; done)
+        PM=$(payload_modes_verdict "${_pm_f:-}" "${_pm_d:-}" "${_pm_s:-}")
+        _pm_bits=
+        for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
+            [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
+        done
+        case "$PM" in
+            PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+            *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+        esac
+    fi
 fi
 
 # ── the BASE layer's modes (engine#1474) ────────────────────────────────────────────────────────────────────────
@@ -2180,26 +2307,51 @@ PYSCAN
     fi
 }
 RUNDIR=${PAYLOAD_DIR:-/opt/1bit-package}
+# A payload with no ELF in it is an empty or interrupted unpack, not a clean RUNPATH set: the row would print
+# "ELF=0 non-$ORIGIN=0" and read as a pass over nothing. Same floor as payload-modes, for the same reason.
+# Same order as payload-modes, and one chain rather than two `if`s: with the floor checked first, a missing payload
+# took the FAIL branch and its own SKIP was unreachable - and in this row both ran, recording a FAIL and a SKIP for the
+# same path, which also double-counted in the summary.
 if [ ! -d "$RUNDIR" ]; then
     skip payload-runpath "no $RUNDIR on this system: the payload is not unpacked where an appliance keeps it, so its RUNPATHs cannot be read"
 else
-    _rp_bad=$(payload_runpath_bad "$RUNDIR"); _rp_rc=$?
-    if [ "$_rp_rc" = 2 ]; then
-        skip payload-runpath "neither python3 nor readelf is here, so the payload's RUNPATHs cannot be read - that is not evidence"
+    # Count ELFs by magic rather than by name, and judge only after: a RUNPATH scan over a tree holding no ELF prints
+    # the same PASS whether it read a payload or an empty directory.
+    _rp_elfs=$(find "$RUNDIR" -type f -size +1k 2>/dev/null | head -400 | while IFS= read -r _f; do
+        head -c4 "$_f" 2>/dev/null | od -An -tx1 | tr -d ' \n' | grep -q '^7f454c46' && echo x; done | wc -l)
+    if [ "${_rp_elfs:-0}" -lt 5 ] 2>/dev/null; then
+        fail payload-runpath "the payload at $RUNDIR holds ${_rp_elfs:-0} ELF(s) - a payload carries dozens (c33: 19 real ELFs), so this is an interrupted extraction, not a clean payload"
     else
-        _rp_n=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | wc -l)
-        _rp_s=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | head -3 | tr '\n' ' ')
-        RP=$(payload_runpath_verdict "${_rp_n:-0}" "${_rp_s:-}")
-        case "$RP" in
-            PASS*) pass payload-runpath "${RP#PASS }" ;;
-            *)     fail payload-runpath "${RP#FAIL }" ;;
-        esac
+        _rp_bad=$(payload_runpath_bad "$RUNDIR"); _rp_rc=$?
+        if [ "$_rp_rc" = 2 ]; then
+            skip payload-runpath "neither python3 nor readelf is here, so the payload's RUNPATHs cannot be read - that is no verdict either way"
+        else
+            _rp_n=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | wc -l)
+            _rp_s=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | head -3 | tr '\n' ' ')
+            RP=$(payload_runpath_verdict "${_rp_n:-0}" "${_rp_s:-}")
+            case "$RP" in
+                PASS*) pass payload-runpath "${RP#PASS }" ;;
+                *)     fail payload-runpath "${RP#FAIL }" ;;
+            esac
+        fi
     fi
 fi
 
 # The layout row gets the same subject check as the other payload rows (engine#1599 measured why): existence first,
 # so a host that simply has no payload SKIPs, then the subject, so an empty or interrupted unpack FAILs rather than
 # passing over nothing, and only then the row itself - once, in the else, so a subject failure never falls through.
+# ── the NPU sets are linked BESIDE the engine (engine#1543's coupling) ──────────────────────────────
+# init.sh links the stick's /data/npu/kernels to <engine dir>/npu/kernels at boot, because that is where the
+# engine looks. The failure this row exists for is silent: the boot is green and no NPU device registers.
+_npu_sets=0; [ -d "${NPU_SETS_DIR:-/data/npu/kernels}" ] && _npu_sets=1
+_npu_link=$(readlink "${ENGINE_DIR:-/opt/1bit}/npu/kernels" 2>/dev/null || true)
+if [ "$_npu_sets" = 1 ]; then
+    _nv=$(npu_link_verdict 1 "${_npu_link:-}")
+    case "$_nv" in PASS*) pass npu-kernels-beside-engine "${_nv#PASS }" ;; *) fail npu-kernels-beside-engine "${_nv#FAIL }" ;; esac
+else
+    skip npu-kernels-beside-engine "no ${NPU_SETS_DIR:-/data/npu/kernels} on this boot, so there is no set to link beside the engine"
+fi
+
 _HL_DIR=${PAYLOAD_DIR:-/opt/1bit-package}
 if [ ! -d "$_HL_DIR" ]; then
     skip payload-home-layout "no $_HL_DIR on this system: the payload is not unpacked where an appliance keeps it, so its symlinks cannot be judged here - that is not evidence"
@@ -2220,6 +2372,17 @@ else
     esac
 fi
 
+
+# engine#823: the instrument the plug test needs must be on the medium (see os/mini/mkimage.sh).
+if [ -x /bin/1bit-xhci-capture ]; then
+    XC=$(xhci_capture_verdict 1)
+else
+    XC=$(xhci_capture_verdict 0)
+fi
+case "$XC" in
+    PASS*) pass xhci-capture "${XC#PASS }" ;;
+    *)     fail xhci-capture "${XC#FAIL }" ;;
+esac
 
 # ── the NPU's locked memory in force (the driver asks for unlimited; this fleet's own 99- file can override ours) ──
 MEMLOCK_PID=${MEMLOCK_PID:-}
@@ -2273,6 +2436,33 @@ else
     esac
 fi
 
+# ── the shipped kernel carries the CVE-2026-98432 ip_options use-after-free fix ──────────────────────────
+# Remote, unauthenticated UAF in the IPv4 request-socket path; the fix frees ireq_opt with kfree_rcu in
+# tcp_v4_reqsk_destructor. An appliance is exactly the thing this CVE is aimed at: a listening socket someone
+# else can reach - so the released kernel's standing on it is a release fact, not a distro footnote.
+_kver=$(uname -r 2>/dev/null)
+# Kernel-headers packages do NOT carry net/ipv4/*.c, so on a normal appliance this is absent and the version
+# floor decides. When a source tree IS here it outranks the floor: a backport can carry the fix below the floor
+# and a vendor tree can lack it above it.
+_ksrc=""
+for _d in "/usr/src/linux-headers-$_kver" "/usr/src/linux-source-$_kver" "/usr/src/linux-$_kver" /usr/src/linux "/lib/modules/$_kver/build"; do
+    if [ -f "$_d/net/ipv4/tcp_ipv4.c" ]; then _ksrc="$_d/net/ipv4/tcp_ipv4.c"; break; fi
+done
+if [ -n "$_ksrc" ]; then
+    _kfn=$(sed -n '/^static void tcp_v4_reqsk_destructor/,/^}/p' "$_ksrc" 2>/dev/null)
+    case "$_kfn" in
+        *kfree_rcu*) _ksrckind=yes ;;
+        '')          _ksrckind=absent ;;   # the function is not in that file: not a v4-TCP kernel, so no claim from it
+        *)           _ksrckind=no ;;
+    esac
+else
+    _ksrckind=absent
+fi
+KC=$(kernel_cve_verdict "$_kver" "$_ksrckind")
+case "$KC" in
+    PASS*) pass kernel-cve-2026-98432 "${KC#PASS }" ;;
+    *)     fail kernel-cve-2026-98432 "${KC#FAIL }" ;;
+esac
 say ""
 # The back-off leaves a trace: a run that only passed because the partition freed in time must say so, or the next
 # person reads a clean transcript and believes nothing was ever refused.

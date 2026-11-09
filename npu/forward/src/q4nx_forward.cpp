@@ -3570,6 +3570,24 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
         }
         deepstack_add(l);
+        // NPU_INFER_DUMP_DIR=<dir> writes this layer's residual stream (M x H floats, row-major) as layer_<l>.f32, so a
+        // per-layer cosine against a reference trace is possible at all: NPU_INFER_DUMP_LAYERS only prints mean/absmax,
+        // which cannot localise a divergence to an op. TorchLens (Apache-2.0, reference side only) supplies the other
+        // half; nothing from it ships here. Off unless the variable is set, and written with plain fopen/fwrite because
+        // this runs in the forward's hot loop only when someone asked for it.
+        if (const char* dd = getenv("NPU_INFER_DUMP_DIR")) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                std::fprintf(stderr, "  [dump] residual stream per layer -> %s (M=%d H=%d)\n", dd, M, H);
+            }
+            char path[4096];
+            std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
+            if (FILE* fp = std::fopen(path, "wb")) {
+                std::fwrite(X.data(), sizeof(float), (size_t)M * (size_t)H, fp);
+                std::fclose(fp);
+            }
+        }
     }
 
     if (phb) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }

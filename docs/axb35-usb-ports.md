@@ -76,3 +76,52 @@ One device into a rear USB-A or a Type-C port **on a 1bit-OS boot**, checked wit
 dead the next diagnostic is the one no one has run: compare `_DSM` on the xHCI/USB4 ACPI nodes against what Windows sends. Until
 that plug, the honest row is *"fix merged and its mechanism verified on the board; functional confirmation pending"* — which is what
 the release notes should say rather than leaving users to discover it.
+
+## What a capture on BIOS 1.10 shows (measured 2026-11-08, after the owner's reflash)
+
+The owner's 1.10 (11/04/2026) does not change the software-side picture, and one thing about it is worth
+recording because it settles a hypothesis in engine#823:
+
+```
+bios-version:            1.10
+bios-release-date:       11/04/2026
+baseboard-product-name:  AXB35-02
+
+0000:c5:00.4  control=auto  power_state=D3cold  runtime_status=suspended
+0000:c7:00.0  control=auto  power_state=D0      runtime_status=active
+0000:c7:00.3  control=auto  power_state=D3cold  runtime_status=suspended
+0000:c7:00.4  control=auto  power_state=D3cold  runtime_status=suspended
+```
+
+**Three of four controllers still autosuspend to D3cold on 1.10** - the same shape engine#823 reported on
+1.09. What is new is that the state is **software-controllable**, which the issue's hypothesis doubted:
+
+```
+$ for d in c5:00.4 c7:00.3 c7:00.4; do echo on > /sys/bus/pci/devices/0000:$d/power/control; done
+   c5:00.4  D3cold -> D0      c7:00.3  D3cold -> D0      c7:00.4  D3cold -> D0
+$ for d in c5:00.4 c7:00.3 c7:00.4; do echo auto > /sys/bus/pci/devices/0000:$d/power/control; done
+   all three back to D3cold   (so the transition is reversible in both directions)
+```
+
+So the controller power gating is **not** behind a Windows-only driver or an EC/PD path that Linux cannot
+reach: writing the same value the image's `91-1bit-xhci-keepawake.rules` writes moves the controllers to
+D0. What that does **not** prove is that a device plugged into a woken controller enumerates - that is the
+part only a plug can answer, and it is why the capture below reports per-port `connect` state rather than
+controller power alone.
+
+## `tools/xhci_boot_capture.sh` - one bundle from a boot, for the owner's next stick run
+
+    tools/xhci_boot_capture.sh [outdir]      # root; writes /data/xhci-capture-<stamp> when /data is writable
+
+It records the firmware next to the claim it supports (BIOS version/date, board), then per controller
+`power/control`, `power_state` and `runtime_status`, then **per port `connect` or not** from `lsusb -v` on
+each root hub - the distinction that matters, because "nothing is plugged in" and "plugged in and not
+enumerated" are indistinguishable in every other view. It also keeps the udev rule's presence, the
+interrupt counts, `lspci -vv`, the full and filtered `dmesg`, and the repo's own
+`xhci_keepawake_check.sh` verdict when the stick carries it, then prints a one-screen `VERDICT.txt`.
+
+Deliberate limits: it needs root (per-port status and PCI config space), it does **not** assume
+`/sys/kernel/debug/usb` (this kernel does not expose `xhci/*/ports/*/portsc`), and it lists which of
+`dmidecode`/`lsusb`/`lspci`/`dmesg`/`tar` the stick actually had - an empty section then means "no tool"
+rather than "no problem". When it escalates through `sudo` it hands the bundle back to the invoking user,
+because a capture that needs `sudo` to read is a capture that does not get sent.

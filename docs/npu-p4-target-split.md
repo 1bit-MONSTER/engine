@@ -205,6 +205,23 @@ A3 is the step with the large diff and no numerical content; it goes after the g
    `--npu-target hexagon: this build has no such target (compiled: xdna)` and exits, and the same message comes
    out of `serve --device npu --npu-target hexagon` because it reaches the forward unchanged.
 
+   **Measured (2026-11-09, `ONEBIT_NPU=ON` against the shipping runtime, no ticket and no device — the refusal is
+   before both):**
+
+   | form | what it prints |
+   |---|---|
+   | `forward-serve … --npu-target hexagon` | `--npu-target hexagon: this build has no such target (compiled: xdna)` |
+   | `forward-serve …` (default) | proceeds to its own checks — `xdna` is the default |
+   | `serve --device npu --npu-target hexagon` | the same by-name message, carried through the child |
+
+   **One caveat the `serve` row earned:** it only reaches the child after `serve`'s own kernel resolution succeeds.
+   With a pack whose full ELFs resolve nothing, `serve` refuses first with *its* message (`… no NPU kernel (full ELF)
+   directory resolves for it: set ONEBIT_NPU_KERNELS …`) and the target refusal is never printed — measured on
+   `Qwen3-0.6B` and on `bonsai2-27b-t2s2-serve`, whose `kernels-m16/` does not satisfy that check. That is not a
+   defect to fix in code: the route cannot run without kernels either, and duplicating the compiled-target list into
+   `serve` to reorder the two refusals would break the rule that keeps the list in one place. It is a reason to set
+   the kernels up before testing this row, which is what the table's third line did.
+
 Runs go through `npu-hold` tickets; a new ELF is not involved (no kernel changes), so tickets are the normal
 kind. The reference binary is the `c20`-era build with the same model dir, so a difference can only be the
 split.

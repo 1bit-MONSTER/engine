@@ -961,14 +961,26 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     // scale zeroed low-magnitude rows when one token's activations dwarfed the
     // rest).
     std::vector<float> ascales((size_t)M);
-    for (int m = 0; m < M; m++) {
-        const float* row = A + (size_t)m * K;
-        float amax = 0.0f;
-        for (int k = 0; k < K; k++) {
-            const float a = std::fabs(row[k]);
-            if (a > amax) amax = a;
+    // A Hadamard-folded container takes its per-row scale from the ROTATED row, in the block below, which overwrites
+    // every entry this loop writes. So on that path this sweep over the unrotated activations is dead work -- and it
+    // is not free: it is a scalar pass over M x K floats, measured at ~3.2 ms per 128-row launch at K=4864 and
+    // ~2.3 ms at K=12288 (host bench, `pack_bench`), sitting inside the span the profile column calls `pack`.
+    // engine #1416 reads that column as the row quantiser's cost; the quantiser is 0.16-0.79 ms per launch, and this
+    // sweep plus the fold below are what the column is actually timing.
+    // Skipped only where the block below is certain to overwrite it: that requires BOTH the fold and the pb16i
+    // layout. `load_hadamard()` is called from the pb16i branch of the container parser, so in practice the fold
+    // implies the layout -- but the condition names both, because leaving `ascales` at its value-initialised zeros
+    // (a `std::vector<float>(M)` is all zeros) on any other path would change numerics silently rather than fail.
+    if (!(hadamard_ && pb16i_)) {
+        for (int m = 0; m < M; m++) {
+            const float* row = A + (size_t)m * K;
+            float amax = 0.0f;
+            for (int k = 0; k < K; k++) {
+                const float a = std::fabs(row[k]);
+                if (a > amax) amax = a;
+            }
+            ascales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
         }
-        ascales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
     }
     // Rows > 1 is prefill and keeps the M=128 kernel (one launch per chunk); a
     // single row here is a decode step and gets the M=16 twin, exactly like
@@ -1072,7 +1084,12 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
                 prof_add(prof_pre_, di, dpk, dql, dwt, drb);
                 prof_pre_n_++;
             }
-            if (prof_dec_n_ && (prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();
+            // Dump on either family's count. The `prof_dec_n_ &&` guard meant a PREFILL-ONLY process never dumped at
+            // all: no decode launch had happened, so the condition was false no matter how many prefill launches ran.
+            // That is exactly the case that matters when a request stalls -- the run that never returns is a prefill,
+            // so the profiler stayed silent and "no rows" could not be read as "no launches" (engine #1605: an 8-token
+            // request on the pb16i arm returned nothing in 420 s and printed no profiler rows).
+            if ((prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();
         }
         return;
     }
@@ -1155,7 +1172,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             prof_add(prof_pre_, di, dpk, dql, dwt, drb);
             prof_pre_n_++;
         }
-        if (prof_dec_n_ && (prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();
+        if ((prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();   // same reason as above: prefill-only runs
     }
 }
 

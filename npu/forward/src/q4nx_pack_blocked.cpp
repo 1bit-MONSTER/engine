@@ -31,37 +31,42 @@ extern "C" int q4nx_pack_B_int8_blocked(int8_t* Bm, const float* w, int K, int N
                                         float* col_scales, double* ssum_out) {
     if (!Bm || !w || K <= 0 || N <= 0 || KD <= 0 || ND <= 0) return -1;
     if (!col_scales || !ssum_out) return -1;
-    const int CB = 64;
-    double ssum = 0;
-#pragma omp parallel for reduction(+ : ssum) schedule(static)
-    for (int jb = 0; jb < N; jb += CB) {
-        const int jn = (N - jb < CB) ? (N - jb) : CB;
-        float amax[64], tis[64];
-        for (int b = 0; b < jn; b++) amax[b] = 0.0f;
-        for (int i = 0; i < K; i++) {
-            const float* row = w + (size_t)i * (size_t)N + (size_t)jb;
-            for (int b = 0; b < jn; b++) {
-                const float a = std::fabs(row[b]);
-                if (std::isfinite(a) && a > amax[b]) amax[b] = a;
-            }
+    // ROW-major traversal (engine #1416). The CB=64 stripes this replaced touched 256 B of a row, then jumped 69 KB to the
+    // next at 27B shapes, so every row opened fresh cache lines: measured 928 ms serial against 299 ms for the row-major
+    // reference (q4nx_pack_B_int8), 384 vs 1194 MB/s. Both phases now stream whole rows, and the blocked write lands in
+    // 128-column runs inside a tile, which is contiguous (`q4nx_layout::blocked_index`), so neither side of the pass is
+    // strided.
+    //
+    // The scale sum is accumulated in a serial loop over j rather than inside a `reduction(+:ssum)` parallel loop. That is
+    // deliberate: the mean column scale becomes order-independent, where the parallel reduction left its last bits to the
+    // schedule. Codes and scales are unchanged (the amax of a column is a max over rows, and the rounding is per element).
+    std::vector<float> amax((size_t)N, 0.0f);
+    std::vector<float> tis((size_t)N, 0.0f);
+    for (int i = 0; i < K; i++) {
+        const float* row = w + (size_t)i * (size_t)N;
+        for (int j = 0; j < N; j++) {
+            const float a = std::fabs(row[j]);
+            if (std::isfinite(a) && a > amax[(size_t)j]) amax[(size_t)j] = a;
         }
-        for (int b = 0; b < jn; b++) {
-            float am = amax[b];
-            if (am < 1e-12f) am = 1.0f;
-            col_scales[jb + b] = am / 127.0f;
-            tis[b] = 127.0f / am;
-            ssum += (double)(am / 127.0f);
-        }
-        for (int i = 0; i < K; i++) {
-            const float* row = w + (size_t)i * (size_t)N + (size_t)jb;
-            for (int b = 0; b < jn; b++) {
-                float v = row[b];
-                if (!std::isfinite(v)) v = 0.0f;
-                int x = (int)std::roundf(v * tis[b]);
-                if (x > 127) x = 127;
-                else if (x < -127) x = -127;
-                Bm[bpos((size_t)i, (size_t)(jb + b), KD, ND, blocked)] = (int8_t)x;
-            }
+    }
+    double ssum = 0.0;
+    for (int j = 0; j < N; j++) {
+        float am = amax[(size_t)j];
+        if (am < 1e-12f) am = 1.0f;
+        col_scales[j] = am / 127.0f;
+        tis[(size_t)j] = 127.0f / am;
+        ssum += (double)(am / 127.0f);
+    }
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < K; i++) {
+        const float* row = w + (size_t)i * (size_t)N;
+        for (int j = 0; j < N; j++) {
+            float v = row[j];
+            if (!std::isfinite(v)) v = 0.0f;
+            int x = (int)std::roundf(v * tis[(size_t)j]);
+            if (x > 127) x = 127;
+            else if (x < -127) x = -127;
+            Bm[bpos((size_t)i, (size_t)j, KD, ND, blocked)] = (int8_t)x;
         }
     }
     *ssum_out = ssum;

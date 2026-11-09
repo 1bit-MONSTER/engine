@@ -313,16 +313,40 @@ kill_tree() {
     # ticket. The KILL pass then cannot see it and the orphan survives the hold -- which is the failure this function was
     # written to end. A snapshot also fixes the grace period: `kill -0` with a pid list is true while ANY of them lives,
     # so a wrapper that exits promptly no longer denies its children the grace they were promised.
+    # The group first: it is named by the payload's own pid and stays valid while ANY member lives, so this reaches
+    # descendants the walk cannot see (the root already gone, or a child that reparented before the snapshot). The
+    # walk stays as the fallback for a payload that moved itself into another group.
+    kill -TERM -- "-$root" 2> /dev/null
     local tree; tree=$(descendants "$root")
     for p in $tree; do kill -TERM "$p" 2> /dev/null; done
     while kill -0 $tree 2> /dev/null && [ "$i" -lt "$grace" ]; do
         sleep 1
         i=$((i + 1))
     done
+    kill -KILL -- "-$root" 2> /dev/null
     for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
-"$@" &
+# The payload gets its PROCESS GROUP of its own (`set -m` makes every background job a group leader), because a
+# process group is the one thing a descendant cannot escape: reparenting to init does not change it, and a group
+# outlives its leader, so `kill -- -$child` still reaches the children AFTER the payload's root has gone. Without it
+# the whole tree-kill is anchored on the root: a lane that starts a server and returns (`gpu-hold -- bash -c 'server &'`)
+# leaves the root dead before the teardown runs, `descendants "$root"` is empty before it is even snapshotted, and the
+# server outlives its ticket (engine#1649: measured, payload root exits by itself, `trap '' TERM` grandchild survives
+# on main). `-m` also makes `$!` the payload's own pid, so `wait` still reports the payload's status.
+set -m
+# `< /dev/null` is NOT decoration: job control makes a background job keep the shell's stdin, so without it the payload
+# would read whatever the CALLER is reading. Measured (bash 5.3.9), the fleet's own sweep shape
+# `while read m; do gpu-hold -- bench "$m"; done < list`: without `set -m` the loop runs every entry, with `set -m` the
+# first payload's `cat` swallows the rest and the sweep silently runs once. Background jobs on `main` already got
+# /dev/null (a non-interactive shell's rule), so this keeps that semantic and takes only the process group.
+"$@" < /dev/null &
 child=$!
+set +m   # job control is needed only to place THIS job in its own group; leaving it on would make every later
+         # background job in this shell a background *group*, which is a semantic this script does not want to
+         # inherit. Measured: the payload keeps its own group after `set +m`, so the group kill still reaches it.
+# shortcut: a payload that READS the controlling terminal is now a background group and would be stopped by SIGTTIN
+# (job control's own rule). `gpu-hold` is for benchmarks and servers, which do not; an interactive payload on a tty is
+# not a use this script supports, and the max-hold bound ends it (rc=124) rather than leaving the token held.
 # The watchdog is a function so it can be given the command's pid: a subshell inherits a copy of the shell's
 # variables, so a watchdog started before the command (the first version did) holds an empty pid and neither
 # the abort nor the max hold stops anything.

@@ -743,9 +743,15 @@ kernel_cve_verdict() {
         no)  printf 'FAIL %s'"'"'s tcp_v4_reqsk_destructor frees ireq_opt WITHOUT kfree_rcu - the CVE-2026-98432 use-after-free, whatever the version says' "$_v"; return 0 ;;
     esac
     # version floor per line, from the advisory: a patch equal to the floor is the fix; a PRE-release at that patch is not.
-    _maj=${_v%%.*}; _rest=${_v#*.}; _min=${_rest%%.*}; _rest2=${_rest#*.}; _pat=${_rest2%%[!0-9]*}
+    # The advisory writes "7.4-rc1" and "5.10.272"; `uname -r` writes "7.4.0-rc1-1bit". Both must parse, so the
+    # numeric part is taken from the text BEFORE the first '-': without this, `_min` kept the suffix ("4-rc1") and
+    # every `X.Y-rcN` release - the advisory's own 7.4-rc1 included - fell through to "cannot be parsed".
+    _vbase=${_v%%-*}
+    _maj=${_vbase%%.*}; _rest=${_vbase#*.}
+    _min=${_rest%%.*}; _rest2=${_rest#*.}
+    if [ "$_rest2" = "$_rest" ]; then _pat=0; else _pat=${_rest2%%[!0-9]*}; fi   # "7.3" is 7.3.0, not 7.3.3
     _rc=$(printf '%s' "$_v" | sed -n 's/.*-rc\([0-9][0-9]*\).*/\1/p')
-    case "$_maj.$_min" in ''|*[!0-9.]*) printf 'FAIL the kernel release (%s) cannot be parsed, so whether it carries the CVE-2026-98432 fix is unknown' "${_v:-empty}"; return 0 ;; esac
+    case "$_maj$_min" in ''|*[!0-9]*) printf 'FAIL the kernel release (%s) cannot be parsed, so whether it carries the CVE-2026-98432 fix is unknown' "${_v:-empty}"; return 0 ;; esac
     case "$_pat" in ''|*[!0-9]*) printf 'FAIL the kernel release (%s) has no patch number, so it is a pre-release of %s.%s and cannot be compared with the fix floor' "$_v" "$_maj" "$_min"; return 0 ;; esac
     if [ "$_maj" -gt 7 ] || { [ "$_maj" = 7 ] && [ "$_min" -ge 4 ]; }; then
         # the 7.4 line: 7.4-rc1 is the advisory's own "carries it"; earlier rc of 7.4 is unknown, and 7.4 release is fixed
@@ -1059,21 +1065,26 @@ next')
 
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
     # ── kernel_cve_verdict: the CVE-2026-98432 fix standing of a kernel release ──────────────────────────
-    case "$(kernel_cve_verdict 7.4.0-rc1-1bit absent)" in PASS*) : ;; *) fail "7.4.0-rc1 is the advisory's own floor and must PASS, got: $(kernel_cve_verdict 7.4.0-rc1-1bit absent)" ;; esac
-    case "$(kernel_cve_verdict 7.4.0-rc0-1bit absent)" in FAIL*) : ;; *) fail "7.4-rc0 predates 7.4-rc1 and must FAIL, got: $(kernel_cve_verdict 7.4.0-rc0-1bit absent)" ;; esac
-    case "$(kernel_cve_verdict 7.4.0-1bit absent)" in PASS*) : ;; *) fail "a 7.4 release must PASS" ;; esac
-    case "$(kernel_cve_verdict 7.3.0-1bit absent)" in PASS*) : ;; *) fail "7.3 release is the floor and must PASS, got: $(kernel_cve_verdict 7.3.0-1bit absent)" ;; esac
-    case "$(kernel_cve_verdict 7.3.0-rc4-1bit absent)" in FAIL*) : ;; *) fail "7.3-rc4 is a PRE-release at the floor patch and must FAIL, got: $(kernel_cve_verdict 7.3.0-rc4-1bit absent)" ;; esac
-    case "$(kernel_cve_verdict 7.3.0-rc4-1bit yes)" in PASS*) : ;; *) fail "source evidence must outrank the version floor (a backport below/at an rc) and PASS" ;; esac
-    case "$(kernel_cve_verdict 7.4.0-rc1-1bit no)" in FAIL*) : ;; *) fail "source evidence WITHOUT kfree_rcu must FAIL even above the floor - that is the whole point of reading the function" ;; esac
-    case "$(kernel_cve_verdict 6.6.158-1bit absent)" in FAIL*) : ;; *) fail "6.6.158 is one patch before the floor and must FAIL" ;; esac
-    case "$(kernel_cve_verdict 6.6.159-1bit absent)" in PASS*) : ;; *) fail "6.6.159 is the floor and must PASS" ;; esac
-    case "$(kernel_cve_verdict 7.2.9-1bit absent)" in FAIL*) : ;; *) fail "7.2.9 must FAIL, got: $(kernel_cve_verdict 7.2.9-1bit absent)" ;; esac
-    case "$(kernel_cve_verdict 7.2.10-1bit absent)" in PASS*) : ;; *) fail "7.2.10 is the floor and must PASS" ;; esac
-    case "$(kernel_cve_verdict 5.10.272-1bit absent)" in PASS*) : ;; *) fail "5.10.272 is the floor and must PASS" ;; esac
-    case "$(kernel_cve_verdict 4.19.0-1bit absent)" in FAIL*) : ;; *) fail "a line the advisory does not list must FAIL (cannot be confirmed), got: $(kernel_cve_verdict 4.19.0-1bit absent)" ;; esac
-    case "$(kernel_cve_verdict '' absent)" in FAIL*) : ;; *) fail "an empty release must FAIL, not PASS" ;; esac
-    case "$(kernel_cve_verdict 7.x.0 absent)" in FAIL*) : ;; *) fail "an unparsable release must FAIL" ;; esac
+    # The advisory's own spelling, `X.Y-rcN` and `X.Y` with no patch component, is driven first: the first
+    # version of the parse rejected those as unparsable while the code had a 7.4 branch waiting for them.
+    check PASS "$(kernel_cve_verdict 7.4-rc1 absent)"          # the advisory's floor for this fix
+    check PASS "$(kernel_cve_verdict 7.4.0-rc1-1bit absent)"   # the same kernel as `uname -r` writes it
+    check PASS "$(kernel_cve_verdict 7.4 absent)"              # the release
+    check FAIL "$(kernel_cve_verdict 7.4-rc0 absent)"          # before the advisory's rc1
+    check PASS "$(kernel_cve_verdict 7.3 absent)"              # a release with no patch component
+    check FAIL "$(kernel_cve_verdict 7.3-rc4 absent)"          # a pre-release AT the floor patch
+    check FAIL "$(kernel_cve_verdict 7.3.0-rc4-1bit absent)"   # the same, in `uname -r` form
+    check PASS "$(kernel_cve_verdict 7.3-rc4 yes)"             # source evidence outranks the floor
+    check FAIL "$(kernel_cve_verdict 7.4-rc1 no)"              # ... and can convict above it
+    check FAIL "$(kernel_cve_verdict 5.10.272-rc1 absent)"     # pre-release at a patch floor
+    check PASS "$(kernel_cve_verdict 5.10.272 absent)"
+    check FAIL "$(kernel_cve_verdict 6.6.158 absent)"
+    check PASS "$(kernel_cve_verdict 6.6.159 absent)"
+    check FAIL "$(kernel_cve_verdict 7.2.9 absent)"
+    check PASS "$(kernel_cve_verdict 7.2.10 absent)"
+    check FAIL "$(kernel_cve_verdict 4.19.0 absent)"           # a line the advisory does not list
+    check FAIL "$(kernel_cve_verdict '' absent)"               # nothing may read as safe
+    check FAIL "$(kernel_cve_verdict 7.x.0 absent)"
     # A self-test is not a check run: without this the EXIT trap above appended "RESULT: FAIL (this check died
     # before its footer)" to every green self-test, which reads exactly like the death the trap exists to report.
     RC_FOOTER=1

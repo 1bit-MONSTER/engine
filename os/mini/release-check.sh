@@ -902,6 +902,14 @@ payload_home_layout_verdict() {   # <links at a FILE or at NOTHING> <links at a 
     fi
 }
 
+xhci_capture_verdict() {   # <1 when /bin/1bit-xhci-capture is present and executable, 0 when not>
+    case "${1:-}" in
+        1) printf 'PASS /bin/1bit-xhci-capture is installed and executable: a boot can capture the xHCI state for engine#823, which is the only place a plug can be observed' ;;
+        0) printf 'FAIL /bin/1bit-xhci-capture is not installed: engine#823 asks whether a rear USB-A or Type-C port sees a device, and nothing on this medium can read that' ;;
+        *) printf 'FAIL whether the xHCI capture is installed could not be read (%s)' "${1:-empty}" ;;
+    esac
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -953,6 +961,9 @@ if [ "${1:-}" = --self-test ]; then
     ln -s /home/nonexistent-xyz "$_hl_st/opt/home"                 # a home directory target: named, not failed
     check "bin/leak|/home/nonexistent-xyz/wt/build/1bit|dangling" "$(payload_home_layout_bad "$_hl_st" | grep '^bin/leak|')"
     rm -rf "$_hl_st"
+    check PASS "$(xhci_capture_verdict 1)"
+    check FAIL "$(xhci_capture_verdict 0)"
+    check FAIL "$(xhci_capture_verdict '')"
     check PASS "$(payload_runpath_verdict 0)"
     check FAIL "$(payload_runpath_verdict 3 '/opt/1bit-package/1bit/1bit runs /home/x/wt/release-rc/work/build')"
     check FAIL "$(payload_runpath_verdict 1)"
@@ -2361,6 +2372,17 @@ else
     esac
 fi
 
+
+# engine#823: the instrument the plug test needs must be on the medium (see os/mini/mkimage.sh).
+if [ -x /bin/1bit-xhci-capture ]; then
+    XC=$(xhci_capture_verdict 1)
+else
+    XC=$(xhci_capture_verdict 0)
+fi
+case "$XC" in
+    PASS*) pass xhci-capture "${XC#PASS }" ;;
+    *)     fail xhci-capture "${XC#FAIL }" ;;
+esac
 
 # ── the NPU's locked memory in force (the driver asks for unlimited; this fleet's own 99- file can override ours) ──
 MEMLOCK_PID=${MEMLOCK_PID:-}

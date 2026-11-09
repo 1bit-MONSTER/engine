@@ -1,0 +1,175 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# Self-hosted CI runners on the Strix Halo box
+
+Two runners serve this repository, both on Strix Halo, both installed by
+`scripts/install-ci-runner.sh`:
+
+| runner | labels | takes |
+|---|---|---|
+| `strixhalo-engine` | `self-hosted,Linux,X64,pr-agent,strixhalo` | `pr-agent`, `issue-agent` |
+| `strixhalo-bench` | `self-hosted,Linux,X64,strixhalo,bench` | `hrx-build` and the bench/gate jobs |
+
+Everything the GitHub-hosted jobs need comes from `ubuntu-*` runners; these two exist because those jobs need
+*this box* — its GPU, its NPU and the local LLM at `127.0.0.1:8090`.
+
+## Why this page exists (engine #1504)
+
+On 2026-11-08 both runners were OOM-killed at 08:37 and **stayed dead until 12:23**:
+
+```
+$ systemctl show actions.runner.1bit-MONSTER-engine.strixhalo-bench.service -p Result -p NRestarts
+Result=oom-kill
+NRestarts=0
+```
+
+`NRestarts=0` is the whole bug. The units shipped with no restart policy, and `runsvc.sh` exits **0** after the
+listener stops ("Runner listener exit with 0 return code, stop the service, no retry needed"), so even
+`Restart=on-failure` would never have fired. While they were down, 9 `hrx-build` and 15 `pr-agent` jobs queued,
+and every check that needs the box read as *pending* — never green, never red, which looks exactly like "queued
+behind a busy runner". It had happened before (2026-11-06, 41 `pr-agent` runs queued behind the same unit).
+
+A check whose runner is gone is the same silent-absence class as [engine #1077](https://github.com/1bit-MONSTER/engine/issues/1077);
+a restart policy is what turns a four-hour outage into a thirty-second one.
+
+## The unit, and why each line is there
+
+`scripts/install-ci-runner.sh` writes this (values shown for the defaults):
+
+```ini
+[Unit]
+Description=GitHub Actions runner strixhalo-engine (dedicated user ghrunner)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ghrunner
+WorkingDirectory=/var/lib/ghrunner/actions-runner-strixhalo-engine
+ExecStart=/var/lib/ghrunner/actions-runner-strixhalo-engine/runsvc.sh
+Restart=always
+RestartSec=30
+OOMPolicy=continue
+MemoryHigh=43G
+MemoryMax=48G
+TasksMax=8192
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- **`Restart=always`, not `on-failure`** — because `runsvc.sh` reports success when it is killed. `always` is the
+  only value that brings a runner back from that exit code. `RestartSec=30` keeps a crash-looping runner from
+  hammering the box and the GitHub API.
+- **`StartLimitIntervalSec=0`** — a runner must never be rate-limited out of existence. The 30-second spacing is
+  the rate limit; systemd giving up after five starts in ten seconds (the default) is how "stays dead" happens
+  again.
+- **`OOMPolicy=continue`** — this is the line the old units lacked. With the default (`stop`), a process in the
+  cgroup being OOM-killed stops the *unit* with `Result=oom-kill`. With `continue`, the kernel's victim is the
+  one that dies — the job — and the runner keeps running, so the job fails with a reason instead of the runner
+  vanishing.
+- **`MemoryHigh`/`MemoryMax`** — the cgroup hits its own ceiling before the box's OOM killer has to choose
+  between "the largest allocation on the machine" and everything else. The default 48G matches the bench rule
+  (`systemd-run --user --scope -p MemoryMax=48G`), so a heavy job is killed by *its* limit, not by the box's.
+- **`KillMode=process`** with the 5-minute stop timeout — the behaviour the shipped units already had: stop the
+  listener, let the job's own timeout end its children.
+
+## The dedicated user
+
+The jobs used to run as the owner (`User=bcloud`). They now run as `ghrunner`: no shell, home
+`/var/lib/ghrunner`, and the runner's `_work` tree under it. That account holds no ssh keys, no `~/models` and no
+fleet remotes — anything a job writes into `$HOME` lands there, not in the owner's tree.
+
+What it still needs, and the honest price of each:
+
+| grant | why | price |
+|---|---|---|
+| `docker` group | the bench jobs run containers (podman/docker images for the distro proofs) | **docker group is root-equivalent** — a job that runs `docker run -v /:/h …` can read the box. It is narrower than the owner's account but not a sandbox |
+| `render` (or `video`) group | `/dev/kfd` and `/dev/dri/renderD*` at `0660` for the GPU jobs | device access only |
+| read on the models directory | `pr-agent` starts the local LLM through `1bit serve` | the same models any job could already load |
+
+If that trade is not wanted, the next step is rootless podman (or a docker socket proxy that only allows the
+images the workflows name) and dropping the `docker` group — that is a change to the workflows, not to this
+recipe, and it is not in #1504's scope.
+
+## A fresh install, start to finish
+
+```bash
+# 1. the runner, unpacked and verified. Pin the version; the script checks the release's SHA256SUMS and
+#    refuses an unverified tarball.
+curl -fsSLO https://github.com/actions/runner/releases/download/v2.329.0/actions-runner-linux-x64-2.329.0.tar.gz
+mkdir -p /srv/actions-runner-2.329.0 && tar -C /srv/actions-runner-2.329.0 -xzf actions-runner-linux-x64-2.329.0.tar.gz
+
+# 2. a registration token: repo Settings -> Actions -> Runners -> New self-hosted runner, or
+#    gh api -X POST repos/1bit-MONSTER/engine/actions/runners/registration-token --jq .token > /root/runner-token
+#    It is a one-hour secret: write it to a root-only file and delete it after the install.
+
+# 3. install both runners
+sudo scripts/install-ci-runner.sh --name strixhalo-engine --labels pr-agent \
+     --token-file /root/runner-token --runner-dir /srv/actions-runner-2.329.0
+sudo scripts/install-ci-runner.sh --name strixhalo-bench --labels bench \
+     --token-file /root/runner-token --runner-dir /srv/actions-runner-2.329.0
+sudo rm -f /root/runner-token
+```
+
+`--dry-run` prints the unit and runs `systemd-analyze verify` on it without changing anything; `--verify` prints
+the installed unit's `Result`/`NRestarts`/`OOMPolicy` and exits. The script is idempotent: an existing `ghrunner`
+user, an already-configured runner directory and an existing unit are reused or rewritten, not re-created.
+
+## Verifying an install
+
+```bash
+# the unit is up and has not been restarting
+systemctl show actions.runner.1bit-MONSTER-engine.strixhalo-engine.service \
+    -p ActiveState -p Result -p NRestarts -p OOMPolicy -p MemoryMax
+#   ActiveState=active  Result=success  NRestarts=0  OOMPolicy=continue  MemoryMax=51539607552
+
+# GitHub agrees it is online and idle
+gh api repos/1bit-MONSTER/engine/actions/runners --jq '.runners[] | "\(.name) \(.status) busy=\(.busy)"'
+#   strixhalo-bench   online busy=false
+#   strixhalo-engine  online busy=false
+```
+
+And the OOM behaviour itself, which is what #1504 is about: with `OOMPolicy=continue`, a process killed inside the
+unit's cgroup does not stop the unit (`systemd.service(5)`: "the service manager will not take any action"), so
+the job fails and the runner keeps listening; with the default `stop` it ends up exactly as it did on 11-08 —
+`Result=oom-kill`, `NRestarts=0`.
+
+```bash
+# the state to read after a heavy job has been killed, on a freshly installed runner:
+systemctl show actions.runner.1bit-MONSTER-engine.strixhalo-bench.service -p Result -p NRestarts
+#   Result=success     <- the job died, the runner did not
+#   NRestarts=0        <- nothing had to restart it
+```
+
+**Not yet demonstrated end to end here.** A throwaway `systemd-run --user` pair with and without
+`OOMPolicy=continue` (128M cap, a child allocating 256M) both came back `Result=success` on this box — the child's
+allocation failed as an exception rather than as an OOM kill, so that experiment says nothing either way. The
+directive is the documented mechanism and it is what the fresh install's single end-to-end run should confirm,
+together with the rest of #1504's acceptance.
+
+## What a restart policy cannot do
+
+It cannot notice that a runner is *not* coming back (a version mismatch, a revoked token, a full disk under
+`/var/lib/ghrunner`). That is [engine #1504](https://github.com/1bit-MONSTER/engine/issues/1504)'s item 3 and
+still open: a cheap row that asserts both self-hosted runners are `online=busy=false` through the API the release
+lanes already use, so a runner that is gone turns a check red instead of leaving it pending for ever.

@@ -81,7 +81,7 @@ def pair_ratios(runs):
     return ratios
 
 
-def summarise(ratios, tolerance):
+def summarise(ratios, tolerance, requested=None):
     """-> (verdict, text lines). Verdict is 'accepted', 'void' or 'insufficient'.
 
     A single pair is never accepted: with one pair there is no way to tell a ratio from a fluctuation, which is the
@@ -100,6 +100,14 @@ def summarise(ratios, tolerance):
         f"range {min(values):.3f}-{max(values):.3f}x (n={len(values)})"
     )
     lines.append(f"implied saving at the median: {(1.0 - 1.0 / median) * 100.0:.1f}% of the -fa 0 time")
+    # A run that dropped rows is short, and a short run that agrees with itself is still a short run: the operator asked
+    # for `requested` pairs, and a row that printed no rate is a statement about the harness before it is a ratio.
+    if requested is not None and len(values) < requested:
+        lines.append(
+            f"CONSISTENCY: {requested} pair(s) requested, {len(values)} usable "
+            f"({requested - len(values)} run(s) printed no rate row -- a harness problem before it is a ratio) -> VOID"
+        )
+        return "void", lines
     if len(values) < 3:
         lines.append(f"CONSISTENCY: only {len(values)} pair(s); three are the minimum for a stable median -> VOID")
         return "void", lines
@@ -112,7 +120,7 @@ def summarise(ratios, tolerance):
     return "accepted", lines
 
 
-def preflight_problems(load, gpu_busy_percent, resident_servers, max_load, max_gpu_busy):
+def preflight_problems(load, gpu_busy_percent, resident, max_load, max_gpu_busy):
     """-> list of reasons not to start. Pure, so the self-test covers the policy and not a copy of it.
 
     A ratio measured next to another HRX server, or on a GPU that is already busy, is a ratio of the contention: three resident
@@ -123,8 +131,8 @@ def preflight_problems(load, gpu_busy_percent, resident_servers, max_load, max_g
         problems.append(f"load {load:.2f} > {max_load:.2f}")
     if gpu_busy_percent is not None and gpu_busy_percent > max_gpu_busy:
         problems.append(f"gpu_busy_percent {gpu_busy_percent} > {max_gpu_busy}")
-    if resident_servers:
-        problems.append(f"{resident_servers} llama-server process(es) resident on this box")
+    for pid, gtt in resident or []:
+        problems.append(f"llama-server pid {pid} holds {gtt} MiB of GTT")
     return problems
 
 
@@ -136,17 +144,40 @@ def read_gpu_busy_percent(path="/sys/class/drm/card0/device/gpu_busy_percent"):
         return None
 
 
-def count_resident_servers(proc="/proc"):
-    """> count of live processes running llama-server, excluding this tool's own tree.
+def held_gtt_mib(pid, proc="/proc"):
+    """-> GTT a process holds, in MiB, from its own fdinfo; 0 when it holds none or cannot be read.
 
-    The engine's servers and any lane's bench both count: what matters is that something else is using the GPU while the pair
-    runs, not who owns it.
+    This is the discriminator that matters: a `llama-server` that is up but holds no device memory is not the contention this
+    gate exists to catch, and on the reference box two permanent embed servers (serving :8090/:8095) would otherwise make the
+    gate refuse every run and turn --skip-preflight into the normal path.
     """
-    count = 0
+    total_kib = 0
+    fdinfo = os.path.join(proc, str(pid), "fdinfo")
+    try:
+        fds = os.listdir(fdinfo)
+    except OSError:
+        return 0
+    for fd in fds:
+        try:
+            with open(os.path.join(fdinfo, fd), encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if line.startswith("drm-total-gtt:"):
+                        total_kib += int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    return total_kib // 1024
+
+
+def resident_servers(max_gtt_mib=256, proc="/proc"):
+    """-> [(pid, held GTT MiB)] for llama-server processes holding device memory above max_gtt_mib.
+
+    Counted by what they hold, not by whether they exist: a resident server with no GTT is not using the pool the arms share.
+    """
+    found = []
     try:
         entries = os.listdir(proc)
     except OSError:
-        return 0
+        return found
     for entry in entries:
         if not entry.isdigit():
             continue
@@ -155,9 +186,12 @@ def count_resident_servers(proc="/proc"):
                 cmdline = handle.read().replace(b"\x00", b" ").decode("utf-8", "replace")
         except OSError:
             continue
-        if "llama-server" in cmdline and "fa_ratio.py" not in cmdline:
-            count += 1
-    return count
+        if "llama-server" not in cmdline or "fa_ratio.py" in cmdline:
+            continue
+        gtt = held_gtt_mib(entry, proc)
+        if gtt > max_gtt_mib:
+            found.append((int(entry), gtt))
+    return found
 
 
 def bench_arms(llama_bench, model, n_prompt, reps, pairs, extra):
@@ -201,10 +235,16 @@ def self_test():
 
     agreeing = pair_ratios([("fa1", 1774.0), ("fa0", 1388.0), ("fa0", 1388.0), ("fa1", 1774.0),
                             ("fa1", 1790.0), ("fa0", 1406.0), ("fa0", 1406.0), ("fa1", 1790.0)])
-    verdict, lines = summarise(agreeing, 1.25)
+    verdict, lines = summarise(agreeing, 1.25, requested=4)
     check("agreement is accepted", verdict == "accepted", "\n".join(lines))
     median = statistics.median([r for _, _, _, r in agreeing])
     check("median ratio", abs(median - 1774.0 / 1388.0) < 0.01, f"{median}")
+
+    # A run that silently lost rows agreed with itself but is short: 4 requested, 2 usable must not be ACCEPTED.
+    short = pair_ratios([("fa1", 1700.0), ("fa0", 1350.0), ("fa0", 1350.0), ("fa1", 1700.0)])
+    verdict, lines = summarise(short, 1.25, requested=4)
+    check("short run is void", verdict == "void", "\n".join(lines))
+    check("short run says so", any("requested, 2 usable" in l for l in lines), str(lines))
 
     # The shape a loaded box produces: one arm spanning 161-1773 t/s, ratios 0.16x-1.53x.
     wild = pair_ratios([("fa1", 200.36), ("fa0", 1218.58), ("fa0", 1338.99), ("fa1", 833.85),
@@ -225,11 +265,12 @@ def self_test():
     check("non-row parse", parse_rate("build: d8bd0ff (1)") is None)
 
     # Preflight policy: each condition alone must refuse, and a clean box must pass.
-    check("clean box passes", preflight_problems(1.0, 0, 0, 60.0, 5) == [])
-    check("hot load refuses", preflight_problems(75.0, 0, 0, 60.0, 5) == ["load 75.00 > 60.00"])
-    check("busy gpu refuses", preflight_problems(1.0, 40, 0, 60.0, 5) == ["gpu_busy_percent 40 > 5"])
-    check("resident server refuses", len(preflight_problems(1.0, 0, 3, 60.0, 5)) == 1)
-    check("unreadable gpu counter is not a refusal", preflight_problems(1.0, None, 0, 60.0, 5) == [])
+    check("clean box passes", preflight_problems(1.0, 0, [], 60.0, 5) == [])
+    check("hot load refuses", preflight_problems(75.0, 0, [], 60.0, 5) == ["load 75.00 > 60.00"])
+    check("busy gpu refuses", preflight_problems(1.0, 40, [], 60.0, 5) == ["gpu_busy_percent 40 > 5"])
+    check("server holding pool refuses", len(preflight_problems(1.0, 0, [(4242, 36000)], 60.0, 5)) == 1)
+    check("up-but-idle server does not refuse", preflight_problems(1.0, 0, [], 60.0, 5) == [])
+    check("unreadable gpu counter is not a refusal", preflight_problems(1.0, None, [], 60.0, 5) == [])
 
     if failures:
         print("fa_ratio self-test FAILED:")
@@ -252,6 +293,9 @@ def main(argv):
     parser.add_argument("--max-load", type=float, default=60.0, help="refuse to start above this 1-min load average")
     parser.add_argument("--max-gpu-busy", type=int, default=5,
                         help="refuse to start when /sys/class/drm/card0/device/gpu_busy_percent is above this")
+    parser.add_argument("--max-resident-gtt-mib", type=int, default=256,
+                        help="a llama-server holding more GTT than this blocks the run; one that holds less does not, so the"
+                             " permanent embed servers do not make --skip-preflight the normal path")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="measure anyway: for a deliberately contended run, never for a number you intend to quote")
     parser.add_argument("--extra", default="", help="extra llama-bench flags, quoted")
@@ -271,7 +315,8 @@ def main(argv):
     if arguments.skip_preflight:
         problems = []
     else:
-        problems = preflight_problems(load, read_gpu_busy_percent(), count_resident_servers(),
+        problems = preflight_problems(load, read_gpu_busy_percent(),
+                                      resident_servers(arguments.max_resident_gtt_mib),
                                       arguments.max_load, arguments.max_gpu_busy)
     if problems:
         print("refusing to measure: " + "; ".join(problems)
@@ -284,7 +329,7 @@ def main(argv):
 
     runs = bench_arms(arguments.llama_bench, arguments.model, arguments.n_prompt, arguments.reps,
                       arguments.pairs, arguments.extra.split())
-    verdict, lines = summarise(pair_ratios(runs), arguments.tolerance)
+    verdict, lines = summarise(pair_ratios(runs), arguments.tolerance, requested=arguments.pairs)
     print("\n".join(lines))
     return {"accepted": EXIT_ACCEPTED, "void": EXIT_VOID}.get(verdict, EXIT_VOID)
 

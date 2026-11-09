@@ -89,10 +89,17 @@ pp2048:
 | busy box (load 73, 20 GiB of foreign models resident) | 3 | — | 9.29× | VOID — the same arms spanned 161 to 1 773 tok/s |
 
 Before it starts, the tool refuses a box that cannot produce a quotable run: a 1-minute load average above `--max-load`
-(default 60), `/sys/class/drm/card0/device/gpu_busy_percent` above `--max-gpu-busy` (default 5), or **any other `llama-server`
-resident on the box** — three resident servers inflated an earlier measurement by up to 15 %, and refusing beats averaging.
-`--skip-preflight` exists for a deliberately contended run, never for a number anyone intends to quote. On the box this was
-written on the gate refuses right now, with three servers up.
+(default 60), `/sys/class/drm/card0/device/gpu_busy_percent` above `--max-gpu-busy` (default 5), or another `llama-server`
+**holding** more than `--max-resident-gtt-mib` of GTT (default 256) — three resident servers inflated an earlier measurement by up
+to 15 %, and refusing beats averaging. The last test is by *held device memory*, not by existence, because the reference box runs
+two permanent embed servers (`:8090`/`:8095`) that no lane may stop: measured there, six `llama-server` processes were up and only
+three held GTT (5 492 MiB, 32 240 MiB, 298 MiB), so a server that exists but holds nothing does not block a run and
+`--skip-preflight` stays the exception rather than the normal path. `--skip-preflight` exists for a deliberately contended run,
+never for a number anyone intends to quote.
+
+The verdict refuses a run that came out **short** as well as one that disagrees: if fewer pairs are usable than `--pairs` asked
+for, it prints how many runs produced no rate row and returns VOID, because a silently short run is the same class of error as a
+silently shifted pair.
 
 `-fa 0` is usable only below roughly 5.4k context on this route (it segfaults above that), which is why the default shape
 is pp2048. The self-test (`ctest fa_ratio_estimator`) exercises the estimator without a GPU: it accepts agreement, refuses

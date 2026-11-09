@@ -761,18 +761,30 @@ int dims_required(const json& c, const char* key, const std::string& source) {
     return c[key].get<int>();
 }
 
+// An optional field, read the way a pack means it. nlohmann's value() throws when the key is
+// present AND null (`type must be number, but is null`), which is not absence: AMD's 1.9
+// Mistral-7B-Instruct-v0.2 pack writes `"head_dim": null` (and `"sliding_window": null`) to mean
+// "unset, use the default", and the throw turned an 8 GB pack into "info failed" with no geometry
+// at all (engine#1650). A wrong TYPE still throws inside get<T>(): that is a real disagreement,
+// not a default.
+template <typename T>
+T opt_field(const json& c, const char* key, T fallback) {
+    const auto it = c.find(key);
+    return (it == c.end() || it->is_null()) ? fallback : it->get<T>();
+}
+
 Dims read_dims(const json& c, const std::string& source = "config.json") {
     Dims d;
     d.hidden = dims_required(c, "hidden_size", source);
     d.layers = dims_required(c, "num_hidden_layers", source);
     d.heads = dims_required(c, "num_attention_heads", source);
-    d.kv_heads = c.value("num_key_value_heads", d.heads);
-    d.head_dim = c.value("head_dim", d.hidden / d.heads);
+    d.kv_heads = opt_field<int>(c, "num_key_value_heads", d.heads);
+    d.head_dim = opt_field<int>(c, "head_dim", d.hidden / d.heads);
     d.intermediate = dims_required(c, "intermediate_size", source);
-    d.vocab = c.value("vocab_size", 0);
-    d.rope_theta = c.value("rope_theta", 10000.0f);
-    d.model_type = c.value("model_type", "");
-    d.rms_norm_eps = c.value("rms_norm_eps", 1e-6f);
+    d.vocab = opt_field<int>(c, "vocab_size", 0);
+    d.rope_theta = opt_field<float>(c, "rope_theta", 10000.0f);
+    d.model_type = opt_field<std::string>(c, "model_type", "");
+    d.rms_norm_eps = opt_field<float>(c, "rms_norm_eps", 1e-6f);
     d.eps_bits = bf16_bits_of(d.rms_norm_eps);
     if (c.contains("eos_token_id")) {
         const auto& e = c["eos_token_id"];
@@ -783,6 +795,10 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 }
 
 }  // namespace
+
+// engine#1650: exported so the config reader can be tested on a pack that declares an optional
+// field as null, without a pack and without the vendor stack.
+Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
 
 // engine#734: exported so the epsilon anchor itself can be tested against a crafted .fconst, without a pack.
 // The two bytes a bf16 epsilon is stored as (little-endian): round the f32 to nearest-even bf16.
@@ -1858,7 +1874,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         if (cf) {
             const auto c = json::parse(cf);
             tie_declared = c.contains("tie_word_embeddings");
-            tied = c.value("tie_word_embeddings", false);
+            tied = opt_field<bool>(c, "tie_word_embeddings", false);
         }
     }
     bool head_written = false;

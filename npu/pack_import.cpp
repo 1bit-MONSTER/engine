@@ -144,6 +144,11 @@ struct OnnxModel {
     // Node inputs that name a `*.qweight.empty` placeholder whose `*.qweight.packed` sibling carries the bytes
     // (resolved below). Counted so `info` can say "the weights are here, behind a placeholder" instead of "none".
     int64_t packed_siblings = 0;
+    // Matmuls whose `*.empty` placeholder AND its `*.packed` sibling both carry no bytes (engine#1671). Whether that is
+    // a fault depends on the pack: a 1.9 fconst pack spells every graph initializer this way and its weights are in the
+    // .fconst, so plan() drops them; with no .fconst there is no other source and plan() refuses by name (#1687).
+    int64_t weightless_matmuls = 0;
+    std::string weightless_example;   // the first one, for the refusal's text
 };
 
 void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
@@ -256,35 +261,52 @@ OnnxModel parse_onnx(const std::string& path) {
             if (d != 0) return false;
         return true;
     };
+    // A matmul whose placeholder and whose `*.packed` sibling BOTH carry no bytes has no weight in this graph at all,
+    // and it is DROPPED rather than left pointing at the placeholder. Leaving it was engine#1671: a 1.9 fconst pack
+    // declares 592 `[0]`-dim initializers (its 363 `.empty` AND their 363 `.packed` siblings are placeholders; the
+    // weights are in the Token .fconst), so the node kept naming `...qweight.empty`, the reader called bytes_of() on it
+    // and threw `model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty: no data` -- which broke `npu-pack import` for
+    // every 1.9 pack. Dropping them is also what tells the rest of the importer the truth about this pack: with no
+    // readable graph head, `matmuls` is empty and the head is read from the .fconst tail, which is where it is.
+    std::vector<OnnxMatMul> kept;
+    kept.reserve(m.matmuls.size());
     for (auto& mm : m.matmuls) {
-        if (mm.weight.empty()) continue;
+        if (mm.weight.empty()) { kept.push_back(mm); continue; }
         const OnnxTensor* w = find_init(mm.weight);
         if (w && !no_bytes(*w)) {
             mm.weight = w->name;   // the initializer's own spelling, so every later lookup is exact
+            kept.push_back(mm);
             continue;
         }
-        if (!w) continue;          // names nothing this graph declares: not this genre's business
+        if (!w) { kept.push_back(mm); continue; }   // names nothing this graph declares: not this genre's business
         std::string packed = w->name;
         if (packed.size() >= 6 && packed.compare(packed.size() - 6, 6, ".empty") == 0)
             packed.replace(packed.size() - 6, 6, ".packed");
-        else
-            continue;
+        else { kept.push_back(mm); continue; }
         const OnnxTensor* pw = find_init(packed);
-        if (!pw) continue;         // no sibling at all: not this genre's pack, leave it to the reader below
+        // No sibling at all: not this genre's pack. Keep the node exactly as it was -- it still names its `*.empty`
+        // initializer and the reader below decides what that means. Dropping it here would be a decision made by an
+        // absence: `onnx.matmuls.empty()` is what tells plan() "this is a 1.9 fconst pack, take the head from the tail"
+        // (:1685), so a truncated pack with real graph matmuls and no `.packed` siblings would silently get a head
+        // from the tail instead of the refusal #1687 asks for (engine#1690 review).
+        if (!pw) { kept.push_back(mm); continue; }
         if (no_bytes(*pw)) {
-            // engine#1671: the sibling exists and is ITSELF a zero-length placeholder (measured on
-            // Qwen2.5-0.5B-Instruct rai_1.9.0 -- dims [0], no external-data location, offset 0, length 0, for all 241
-            // of its MatMulNBits). So the weights are genuinely absent from the pack's external data, and the honest
-            // answer is a refusal that says that. Deferring it produced `...qweight.empty: no data` from a lookup much
-            // later, which names the placeholder rather than the problem and reads as a tile-layout fault.
-            throw std::runtime_error(
-                "the pack names " + w->name + ", and its " + packed + " sibling exists but carries no data either "
-                "(no external-data location, dims all zero): these weights are genuinely absent from the pack's "
-                "external data, so this pack cannot be imported -- not a tile-layout or block-size problem");
+            // The sibling exists and is ITSELF a zero-length placeholder. Whether that is a fault depends on something
+            // this walker cannot see: on a Ryzen AI 1.9 fconst pack EVERY graph initializer is spelled this way (363
+            // `.empty` and 363 `.packed`, all dims [0]) because the weights are in the Token .fconst, so dropping the
+            // node is right and the import succeeds from the fconst. On a pack with no .fconst there is nothing to fall
+            // back to, and refusing by name (#1687's rule) is the honest answer. So the walker records it and plan(),
+            // which knows whether an .fconst is there, decides. Deferring it silently produced
+            // `...qweight.empty: no data` from a lookup much later, naming the placeholder rather than the problem.
+            ++m.weightless_matmuls;
+            m.weightless_example = w->name + " (its " + packed + " sibling carries no data either)";
+            continue;
         }
         mm.weight = pw->name;
         ++m.packed_siblings;
+        kept.push_back(mm);
     }
+    m.matmuls = std::move(kept);
     return m;
 }
 
@@ -459,6 +481,15 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
         throw std::runtime_error(path + ": fewer bytes than " + std::to_string(layers) + " blocks of " +
                                  std::to_string(stride9) + " B");
     }
+    // The canonical body is a function of this file alone, so its length is known before it is built: reuse the copy
+    // when it already has that length, instead of writing ~291 MB (1.5B: ~1 GB) again on every call (engine#1662). The
+    // name already carries the source's size and mtime, so a reached-here path cannot be a stale copy of another pack --
+    // and a TRUNCATED copy from an interrupted run is caught by the length test rather than trusted.
+    const int64_t expected = int64_t(fc.size) - int64_t(layers) * hdr_len;
+    if (canonical_copy_reusable(work, expected)) {
+        unmap_file(fc.map, fc.size);
+        return work;
+    }
     std::vector<uint8_t> out;
     out.reserve(size_t(fc.size - int64_t(layers) * hdr_len));
     for (int L = 0; L < layers; ++L) {
@@ -549,8 +580,25 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // Named by pack and geometry, so a rerun overwrites its own copy instead of filling the temp dir.
     const std::string tag =
         std::to_string(std::hash<std::string>{}(fs::path(pack_dir).lexically_normal().string()) % 100000000);
-    const std::string name = "1bit-fconst19-" + tag + "-" + std::to_string(dims.hidden) + "-" +
-                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst";
+    // The name carries the SOURCE file's identity as well as the pack path and geometry (engine#1662): the copy is
+    // reused when it already exists at the right size, and a repacked pack at the same path with the same geometry would
+    // otherwise be served a stale copy of the same length. Size alone is not identity; the mtime completes it cheaply.
+    std::error_code src_ec;
+    const std::uintmax_t src_size = fs::file_size(found, src_ec);
+    const auto src_stamp = [&] {
+        std::error_code e;
+        const auto t = fs::last_write_time(found, e);
+        return e ? int64_t(0) : int64_t(t.time_since_epoch().count());
+    }();
+    // The scratch copy is only reusable while the RULES that produced it are the ones in this binary: a change to the
+    // canonical form (a new kFconst19Rules entry, a different tile order) leaves the source file untouched, so source
+    // identity alone would keep serving a copy of the old form. Bump this when the canonical form changes.
+    constexpr int kCanonicalFormVersion = 1;
+    const std::string name = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
+                             std::to_string(dims.hidden) + "-" +
+                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + "-" +
+                             std::to_string(src_ec ? std::uintmax_t(0) : src_size) + "-" +
+                             std::to_string(static_cast<std::uint64_t>(src_stamp)) + ".fconst";
     // `temp_directory_path()` THROWS when TMPDIR names a directory that no longer exists, which is the ordinary state of
     // a shell after a reboot has cleared /tmp -- and it threw before any work was attempted, so `npu-pack info` on a
     // 1.9 pack failed with `filesystem error: temp_directory_path: No such file or directory [/tmp/x]` and no hint that
@@ -850,6 +898,41 @@ namespace {
 // genai_config.json otherwise. Every refusal names the key it needed and the file it looked in, because a
 // nlohmann exception out of a loader ("key hidden_size not found", "type must be string, but is null") is a bug
 // report, not a diagnosis -- pi-inferzo's item 3.
+// ── the multi-component packs: geometry under model_config.json ─────────────────────────────────
+// The gemma-4 1.9 packs ship `config.json = {}` and a genai_config decoder block that stops at
+// num_key_value_heads/head_size, so the third value read_dims() needs -- intermediate_size -- is stated nowhere
+// those two files are read from, and the importer refused with "the pack states no intermediate_size". It is one
+// file over: model_config.json keeps the text tower under config.model_attributes.text_config.
+//   amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: 1536 hidden, 35L, 8 heads, 1 kv, head_dim 256, IM 6144, vocab 262144
+//   amd/gemma-4-12B-it_rai_1.9.0_npu:            3840 hidden, 48L, 16 heads, 8 kv, head_dim 256, IM 15360, vocab 262144
+// (measured 2026-11-09 on both packs' own JSON). `type: compositemodel` says what the file is; the text tower is
+// the decoder this importer builds, so its keys fill gaps and never override a value already resolved -- the same
+// rule the hybrid text_config lift uses. Returns how many keys it added, so the caller can name the source.
+static int fill_from_model_config_impl(const std::string& pack_dir, json& cfg) {
+    std::ifstream f(pack_dir + "/model_config.json");
+    if (!f) return 0;
+    json mc;
+    try { mc = json::parse(f); } catch (...) { return 0; }
+    if (!mc.is_object()) return 0;
+    const json* attrs = nullptr;
+    if (mc.contains("config") && mc["config"].is_object() && mc["config"].contains("model_attributes") &&
+        mc["config"]["model_attributes"].is_object()) {
+        attrs = &mc["config"]["model_attributes"];
+    } else if (mc.contains("model_attributes") && mc["model_attributes"].is_object()) {
+        attrs = &mc["model_attributes"];
+    }
+    if (!attrs) return 0;
+    const json* tower = attrs;
+    if (attrs->contains("text_config") && (*attrs)["text_config"].is_object()) tower = &(*attrs)["text_config"];
+    int added = 0;
+    for (auto it = tower->begin(); it != tower->end(); ++it) {
+        if (cfg.contains(it.key()) || it.value().is_null()) continue;
+        cfg[it.key()] = it.value();
+        ++added;
+    }
+    return added;
+}
+
 json load_geometry(const std::string& pack_dir, std::string* source) {
     auto readable_object = [](const std::string& path, json& out) {
         std::ifstream f(path);
@@ -866,6 +949,7 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
             for (const char* k : {"rope_theta", "rms_norm_eps", "intermediate_size"})
                 if (!cfg.contains(k) && g.contains(k)) cfg[k] = g[k];
         }
+        if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
     }
     json g;
@@ -894,6 +978,7 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
             cfg["architectures"] = std::vector<std::string>{fam + "ForCausalLM"};
         }
         if (source) *source = "genai_config.json (decoder block)";
+        if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
     }
     if (source) *source = "neither config.json nor genai_config.json";
@@ -913,7 +998,11 @@ std::string graph_filename(const std::string& pack_dir) {
                 const json& dec = g["model"]["decoder"];
                 if (dec.contains("filename") && dec["filename"].is_string()) {
                     const std::string n = dec["filename"].get<std::string>();
-                    if (!n.empty() && n.find('/') == std::string::npos) return n;
+                    // A multi-component pack (gemma-4 1.9, `type: compositemodel`) keeps its LLM graph in a
+                    // subdirectory -- genai_config.json says `decoder/model.onnx` -- so a relative path is accepted.
+                    // Absolute paths and `..` are still refused: the name comes from the pack, and a pack must not be
+                    // able to aim the reader outside itself.
+                    if (!n.empty() && n.front() != '/' && n.find("..") == std::string::npos) return n;
                 }
             }
         } catch (...) {
@@ -971,6 +1060,9 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg) {
+    return fill_from_model_config_impl(pack_dir, cfg);
+}
 
 // engine#734: exported so the epsilon anchor itself can be tested against a crafted .fconst, without a pack.
 // The two bytes a bf16 epsilon is stored as (little-endian): round the f32 to nearest-even bf16.
@@ -1208,6 +1300,15 @@ int64_t group_bytes(int64_t k, int rows) {
     if (sv == 0) return 0;
     return (2 * (k / kKBlock) + 2) * sv;
 }
+
+// Exported for the unit test (engine#1690). The head's self-check compares a quantised head against the embedding
+// buffer the importer actually holds -- which is the container's bf16 copy, not the pack's original F16 bytes. Reading
+// that buffer at the wrong width produced a plausible-looking number (0.885220 on a tied pack whose container scores
+// 0.999999) for every pack from #1661 until this existed, so the width is pinned directly rather than only end to end.
+namespace {
+double corr(const Q4& q, const uint8_t* embed, int H, int rows);   // defined below, internal to this file
+}
+double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows) { return corr(q, embed_bf16, H, rows); }
 
 int64_t attn_tile_bytes(int64_t k) { return group_bytes(k, kTileRows); }
 int64_t attn_payload_off(int64_t hidden) { return kNormOff + hidden * 2; }
@@ -1458,6 +1559,10 @@ std::string Plan::manifest() const {
         // following the node inputs alone reports zero real weights for a 9.7 GB pack (measured: phi-4, engine#1503).
         g["ryzenai_matmuls_ops"] = graph_ryzenai_matmuls;
         g["packed_weight_siblings"] = graph_packed_siblings;
+        // Matmuls dropped because neither their `*.empty` placeholder nor its `*.packed` sibling carried any bytes
+        // (engine#1671). Reported so a test can pin the drop without needing a 1.9 pack, and so `info` says how many
+        // graph weights this pack does not keep in its graph.
+        g["weightless_matmuls"] = graph_weightless_matmuls;
         if (graph_stride_of > 0)
             g["external_row_stride"] = {{"matched", graph_stride_ok}, {"of", graph_stride_of},
                                         {"rule", "length == N * (K/128 + 1) * 68"}};
@@ -1579,6 +1684,7 @@ Plan plan(const std::string& pack_dir) {
         }
         p.graph_ryzenai_matmuls = onnx.ryzenai_matmuls;
         p.graph_packed_siblings = onnx.packed_siblings;
+        p.graph_weightless_matmuls = onnx.weightless_matmuls;
         for (const auto& t : onnx.tensors)
             if (!t.location.empty()) p.graph_external++;
         if (!ext_file.empty()) {
@@ -1591,6 +1697,16 @@ Plan plan(const std::string& pack_dir) {
     // pack keeps no weights there -- which for the rai_1.3/1.6/1.7.1 line is the normal case, not a fault.
     std::string tok_why;
     std::string tok_path = materialise_token_fconst(pack_dir, p.dims);
+    // engine#1671 / #1687: a pack whose graph names `*.qweight.empty` placeholders whose `*.packed` siblings carry no
+    // data has no weight for those ops IN THE GRAPH. With a Token .fconst that is the normal shape of a 1.9 pack -- its
+    // graph is all placeholders and the weights are in the .fconst -- so the walker drops them and the import proceeds.
+    // With no .fconst there is nothing to fall back to, and the honest answer is #1687's refusal, by name.
+    if (tok_path.empty() && onnx.weightless_matmuls > 0)
+        throw std::runtime_error(
+            pack_dir + ": " + onnx.weightless_example +
+            ", and the pack carries no Token .fconst either (no dd_metastate_Llm_Token_*.fconst): these weights are "
+            "genuinely absent from the pack's external data, so this pack cannot be imported -- not a tile-layout or "
+            "block-size problem");
     const bool no_fconst = tok_path.empty();
     // The 1.9 external-data genre (phi-4: 201 `MatMulNBitsBf` ops whose bytes are `*.qweight.packed` siblings in
     // `eager-mm.onnx.data`) must NOT ride the graph-weights path below, which was written for the 1.3/1.6/1.7.1 line's
@@ -2027,6 +2143,11 @@ std::vector<uint8_t> as_bf16(const uint8_t* src, int type, size_t count) {
     return out;
 }
 
+// `embed` is BF16 rows: the importer converts the pack's table once (`embed_bf16`) and every consumer reads that
+// buffer. It used to be the pack's own F16 bytes, and this decoded them as F16 -- which engine#1661 changed underneath
+// without changing this, so from then on the self-check compared the head against mis-decoded values: Qwen2.5-0.5B 1.9
+// reported corr 0.885220 (and "untied", for a pack declaring tie_word_embeddings) where the same container's weights
+// score 0.999999. The container was always right; the number about it was not.
 double corr(const Q4& q, const uint8_t* embed, int H, int rows) {
     double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
     const int n = std::min(rows, q.N);
@@ -2034,9 +2155,7 @@ double corr(const Q4& q, const uint8_t* embed, int H, int rows) {
         for (int k = 0; k < q.K; ++k) {
             const size_t g = size_t(r) * (q.K / 32) + size_t(k) / 32;
             const double x = double(q.codes[size_t(r) * q.K + k]) * q.scale[g] + q.zero[g];
-            uint16_t h;
-            std::memcpy(&h, embed + (size_t(r) * H + k) * 2, 2);
-            const double y = f16_to_f32(h);
+            const double y = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed)[size_t(r) * H + k]);
             sxy += x * y;
             sx += x;
             sy += y;
@@ -2138,6 +2257,27 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // learned to read fail at the first byte, with "cannot open <pack>/model.onnx".
     const bool tok_present = !find_token_fconst(pack_dir).empty();
     const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph_filename(pack_dir));
+    // A graph whose quantised matmuls name a `*.qweight.empty` placeholder *and* whose packed siblings carry no bytes
+    // has no weights in the graph at all. On this line that means model.bin: 1.8/R1-Distill ship their 4-bit weights
+    // there and keep `[0]`-dims placeholders in the graph, and this importer has no model.bin reader. Refusing here
+    // names the file and the count; without it the walk reaches bytes_of()'s `ext.find("")` and reports
+    // "<tensor>.qweight.empty: no data", which says the bytes are missing rather than that they are somewhere this
+    // importer does not read (engine#1671). Narrow on purpose: it can only fire when NO matmul resolved to bytes, so a
+    // pack that imports today cannot start failing because of it.
+    {
+        size_t unresolved = 0;
+        for (const auto& mm : onnx.matmuls)
+            if (!mm.weight.empty() && mm.weight.find(".empty") != std::string::npos) ++unresolved;
+        std::error_code bin_ec;
+        const auto bin_size = fs::file_size(fs::path(pack_dir) / "model.bin", bin_ec);
+        if (unresolved > 0 && unresolved == onnx.matmuls.size() && !bin_ec)
+            throw std::runtime_error(
+                std::to_string(unresolved) + " MatMulNBits weight(s) in this graph are `*.qweight.empty` placeholders and "
+                "none of their `*.qweight.packed` siblings carries bytes; the pack carries model.bin (" +
+                std::to_string(static_cast<unsigned long long>(bin_size)) + " B), which is the 1.8/hybrid genre: the "
+                "4-bit weights live there and this importer has no model.bin reader, it reads ONNX initializers only. "
+                "Refusing rather than reading zero-length placeholders as weights (engine#1671)");
+    }
     std::map<std::string, const uint8_t*> ext;
     std::map<std::string, size_t> ext_size;
     for (const auto& t : onnx.tensors) {
@@ -2516,13 +2656,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
                     const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
                     double e;
-                    if (embed->type == kF16) {
-                        uint16_t h;
-                        std::memcpy(&h, embed_bytes + (size_t(n) * H + k) * 2, 2);
-                        e = f16_to_f32(h);
-                    } else {
-                        e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
-                    }
+                    e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
                     sum_abs += std::fabs(x - e);
                     sum_ref += std::fabs(e);
                 }
@@ -2641,14 +2775,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                 for (int k = 0; k < q.K; ++k) {
                                     const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
                                     const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
-                                    double e;
-                                    if (embed->type == kF16) {
-                                        uint16_t h;
-                                        std::memcpy(&h, embed_bytes + (size_t(n) * H + k) * 2, 2);
-                                        e = f16_to_f32(h);
-                                    } else {
-                                        e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
-                                    }
+                                    const double e =
+                                        bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
                                     sum_abs += std::fabs(x - e);
                                     sum_ref += std::fabs(e);
                                 }
@@ -2669,9 +2797,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                     for (int k = 0; k < q.K; ++k) {
                                         const size_t g = size_t(rr) * (q.K / 32) + size_t(k) / 32;
                                         const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[g] + q.zero[g];
-                                        uint16_t hb;
-                                        std::memcpy(&hb, embed_bytes + ((size_t(rr) + 1) * H + k) * 2, 2);
-                                        const double y = f16_to_f32(hb);
+                                        const double y =
+                                            bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[(size_t(rr) + 1) * H + k]);
                                         sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
                                     }
                                 const double m = double(n) * q.K;
@@ -3238,7 +3365,7 @@ int run(int argc, char** argv) {
     }
     std::printf("imported %d tensors, %lld q4_1 tiles into %s\n", r.tensors, r.tiles, out.c_str());
     if (r.selfcheck_reference && r.selfcheck_tied) {
-        std::printf("  self-check: the head reproduces the pack's fp16 embedding  corr %.6f  rel_err %.6f\n"
+        std::printf("  self-check: the head reproduces the pack's own embedding (as imported, bf16)  corr %.6f  rel_err %.6f\n"
                     "              (tied: this correlation is the check, and it passed)\n",
                     r.lmhead_corr, r.lmhead_rel);
         if (r.ctrl_corr_rowshift >= 0)
@@ -3349,6 +3476,17 @@ int run(int argc, char** argv) {
                      dir.c_str(), out.c_str());
     }
     return 0;
+}
+
+
+// Public (engine#1662): see the declaration in pack_import.h. Lives outside the anonymous namespace because the test
+// calls it directly with crafted files, so the decision that guards a ~291 MB rewrite is pinned without a 1.9 pack.
+bool canonical_copy_reusable(const std::string& work, int64_t expected_len) {
+    if (expected_len <= 0) return false;
+    std::error_code ec;
+    // file_size() fails on a missing file and on a directory, which is exactly the set that must be rewritten.
+    const std::uintmax_t have = fs::file_size(work, ec);
+    return !ec && have == static_cast<std::uintmax_t>(expected_len);
 }
 
 }  // namespace onebit::npu::pack_import

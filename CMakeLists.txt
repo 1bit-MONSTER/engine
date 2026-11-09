@@ -266,6 +266,19 @@ add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a
 # second real gpu-hold reaps it and leaves the note the victim quotes. No device, no build; skips (77) without the script.
 add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_ticket_lost_test.sh)
+# engine#1701: the NPU hold's queue/token follow ONEBIT_HOLD_DIR, and its queue settings never reach the payload.
+# Shell only (a stub gpu-hold plus the tree's own), no device, ~1 s.
+add_test(NAME npu_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_hold_test.sh)
+# engine#1485: the two port read-backs the route tests use (tests/serve_port.sh). Script-based, no device, no model --
+# it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
+# empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
+add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.sh)
+# engine#1639: the half of the survivor bound that a CPU-only box can drive. The bound itself fires only for a payload root
+# wedged in uninterruptible sleep, which user space cannot create, so this covers the other half: a holder that released with
+# a survivor must leave a record, and the NEXT holder must warn about it and clear it.
+add_test(NAME gpu_hold_survivors COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_survivors_test.sh)
+add_test(NAME gpu_hold_group
+         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_group_test.sh)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
@@ -277,6 +290,10 @@ add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
 # check; the two permanent services are exempt by name. --self-test drives the decision, no device needed.
 add_test(NAME device_holders COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
+# engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
+# placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
+# traces with a known answer; no model, no device.
+add_test(NAME moe_placement COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
@@ -292,6 +309,7 @@ add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
 # fleet state present -> the claim uses the fleet's queue and token; absent -> the old ~/GPU-* paths, so a box
 # that has not been set up is unchanged. No GPU: the claim holds the token for three seconds and runs `true`.
 add_test(NAME gpu_hold_queue COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_test.sh)
+add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.
@@ -348,6 +366,16 @@ target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 add_executable(npu_load_retry_test tests/npu_load_retry_test.cpp)
 target_include_directories(npu_load_retry_test PRIVATE app)
 add_test(NAME npu_load_retry COMMAND npu_load_retry_test)
+
+# The optional-op fallback seam (npu/model/op_dispatch.h, engine#803 A3): every op but `gemv` is optional, and the
+# model runs its own implementation when the target does not take it -- including when the target claims it and
+# fails. Header only, stub targets, no device and no runtime library, so it runs in CI.
+add_executable(npu_op_dispatch_test tests/npu_op_dispatch_test.cpp)
+target_include_directories(npu_op_dispatch_test PRIVATE npu)
+add_test(NAME npu_op_dispatch COMMAND npu_op_dispatch_test)
+# ci.yml builds a named list of targets, so a test target that is not in it reports "Not Run" (#635); this lane's
+# token cannot edit the workflow. Hooking onto one that IS in the list gets it built there too.
+add_dependencies(npu_sampling_test npu_op_dispatch_test)
 
 add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose target is
@@ -1182,6 +1210,14 @@ add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.
 # patch-sfs needs uid/gid and setuid bits - this is the only test here that does, hence the property.
 add_test(NAME patch_sfs_atomic COMMAND ${CMAKE_SOURCE_DIR}/tests/patch_sfs_atomic_test.sh)
 set_tests_properties(patch_sfs_atomic PROPERTIES SKIP_RETURN_CODE 77)
+# build-static.sh must never print a quotable artifact hash for a tree that is not a commit (engine#1326, from
+# engine#1323's mis-quoted hash). The toolchain is stubbed inside the test - it is the provenance line under test,
+# not the compile - so this costs milliseconds and needs no rustup, no musl target and no network.
+add_test(NAME build_static_provenance COMMAND ${CMAKE_SOURCE_DIR}/tests/build_static_provenance_test.sh)
+# embed/usr/local/bin/1bit-console owns tty1 and its whole job is that there is no path from this screen to a bare
+# prompt; nothing tested it. Same shape as the test above - the script is copied and its absolute paths rewritten into
+# a temp tree, so every branch (installer, desktop, TUI-then-menu, no-TUI) is reachable without root or a build.
+add_test(NAME console_chain COMMAND ${CMAKE_SOURCE_DIR}/tests/console_chain_test.sh)
 # build_path_strings must see compiler output, not only ELFs: a shipped devicetable-offsets.s with 449 build-tree paths
 # passed the row that exists to stop that (engine#1487). No root, no fixture beyond two text files.
 add_test(NAME pack_check_generated_text COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_check_generated_text_test.sh)
@@ -1514,11 +1550,11 @@ endif()
 # engine #1485: a script that runs `serve --port 0` no longer picks a port and releases it, so there is no window to
 # collide in and nothing for the lock to prevent - those are gone from this list (watchdog_serve, metrics_serve,
 # parallel_args, recipes_route, greedy_shortcut, prism_route, hrx_runtime_route, laya_gguf_route, mem_admit_route,
-# npu_repack_path, serve_e2e_<dev>, laya_route_e2e, laya_models_e2e), and the list now names exactly the
+# npu_repack_path, serve_e2e_<dev>, laya_route_e2e, laya_models_e2e, device_route, hrx_cwsr_route, hybrid_route,
+# hybrid_kvshare_route), and the list now names exactly the
 # tests that still choose their port up front. bench_selftest stays: tools/bench.py picks its own free_port under it.
 set(_onebit_route_tests
-    smoke_serve print_backend lemonade_hrx template_pin device_route pm_route bench_selftest
-    hrx_cwsr_route hybrid_route hybrid_kvshare_route)
+    smoke_serve print_backend lemonade_hrx template_pin pm_route bench_selftest)
 # Tests that only exist for some configurations (a model was passed, a device is built in).
 # serve_e2e_<dev>, laya_route_e2e and laya_models_e2e left this list with engine #1485: they run `serve --port 0`
 # now, so they pick nothing and there is no window for the lock to close. hrx_cpu_weight_parity stays - it starts `llama-server` itself, whose port is not ours to
@@ -1526,7 +1562,8 @@ set(_onebit_route_tests
 # engine #1485: hybrid_kvshare_e2e chooses its port in its own driver (tests/kvshare_fd_handoff.py calls free_port(),
 # binds :0, closes, and hands the number to the server it starts), so the census - which reads the .sh text - sees no
 # bind to require the lock for. Same shape as bench_selftest, so it is named here for the same reason.
-list(APPEND _onebit_route_tests hybrid_e2e pm_laya_route hrx_cpu_weight_parity hybrid_kvshare_e2e)
+# hybrid_e2e is no longer here: it takes `serve --port 0` and reads the port back (this PR).
+list(APPEND _onebit_route_tests pm_laya_route hrx_cpu_weight_parity hybrid_kvshare_e2e)
 foreach(_onebit_route_test IN LISTS _onebit_route_tests)
     if(TEST ${_onebit_route_test})
         set_tests_properties(${_onebit_route_test} PROPERTIES RESOURCE_LOCK route_ports)

@@ -301,6 +301,35 @@ void test_matmulnbits() {
     const size_t nz = size_t(1) * (K / 32);  // row 1 has zero-point 1, so its zero is not 0
     check(nozp.zero[nz] == 0.0f && q.zero[nz] != 0.0f,
           "control: dropping the zero point really changes it");
+
+    // Block 32: the decoder is parameterised by the block, and the container's Q4 chunks are per-32-column groups, so
+    // a block-32 table is one scale per group rather than two. Pinned because the block-size GATE upstream refuses 32
+    // for fconst packs, and the reason it gives ("every subvolume offset in the .fconst moves") cannot apply to a pack
+    // whose weights are the graph's own initializers -- amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu declares 253
+    // MatMulNBits ops at block 32 and carries no .fconst at all (engine#1503).
+    {
+        const int B32 = 32;
+        std::vector<uint8_t> qw32(size_t(N) * (K / B32) * (B32 / 2));
+        std::vector<float> sc32(size_t(N) * (K / B32));
+        for (int n = 0; n < N; ++n)
+            for (int b = 0; b < K / B32; ++b) {
+                sc32[size_t(n) * (K / B32) + b] = 0.02f * float(b + 1);
+                for (int i = 0; i < B32 / 2; ++i) {
+                    const int k = b * B32 + 2 * i;
+                    qw32[(size_t(n) * (K / B32) + b) * (B32 / 2) + i] =
+                        uint8_t(want(n, k) | (want(n, k + 1) << 4));
+                }
+            }
+        const pi::Q4 q32 = pi::decode_matmulnbits(qw32.data(), sc32.data(), nullptr, N, K, B32, false, true);
+        bool ok32 = true;
+        for (int n = 0; n < N && ok32; ++n)
+            for (int k = 0; k < K; ++k) {
+                if (q32.codes[size_t(n) * K + k] != want(n, k)) { ok32 = false; break; }
+                const size_t g = size_t(n) * (K / 32) + size_t(k) / 32;
+                if (q32.scale[g] != sc32[size_t(n) * (K / B32) + size_t(k) / B32]) { ok32 = false; break; }
+            }
+        check(ok32, "MatMulNBits: block-32 decodes too, one scale per 32-column group");
+    }
 }
 
 // ── 2. tiling against the committed golden ──────────────────────────────────

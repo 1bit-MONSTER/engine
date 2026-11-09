@@ -68,10 +68,7 @@ struct I8Ctx;
 // per-token [lh] table ranks, the rest are request-level rows.
 #include "q4nx_lh.h"   // the phase accounting both the forward and a target write
 
-struct Q4nxForwardConfig {
-    int H = 1024, NH = 16, NKV = 8, HD = 128, IM = 3072, NL = 28, NV = 151936;
-    float eps = 1e-6f, theta = 1e6f;
-};
+// Q4nxForwardConfig now lives with the model that owns it: npu/model/npu_model.h (engine#803 A3).
 
 class Q4nxNpuForward {
 public:
@@ -289,7 +286,7 @@ private:
                              std::string& err);
     bool run_lm_head_gemv(const std::vector<float>& h, std::vector<float>& logits);
 
-    Q4nxForwardConfig c_;
+    Q4nxForwardConfig & c_ = model_.c;   // the model owns its config (A3)
     ModelWeights* mw_ = nullptr;
     xrt::device* dev_ = nullptr;
 

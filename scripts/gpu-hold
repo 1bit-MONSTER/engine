@@ -65,8 +65,14 @@ MINUTES=${GPU_HOLD_MINUTES:-14}
 LABEL=""
 WAIT=${GPU_HOLD_WAIT:-5400}
 HOLD=${ONEBIT_HOLD_DIR:-/var/lib/1bit-fleet}
-# the fleet's state wins when it is installed, and ~ is the fallback for a box that has not been set up that way
-QUEUE=${GPU_QUEUE_DIR:-$([ -d "$HOLD/gpu-queue" ] && printf '%s' "$HOLD/gpu-queue" || printf '%s' "$HOME/GPU-QUEUE")}
+# The fleet's state wins when it is installed, and ~ is the fallback for a box that has not been set up that way.
+# BOTH lines must test the SAME thing. They used to differ -- the queue tested $HOLD/gpu-queue and the token tested
+# $HOLD -- so on a box where /var/lib/1bit-fleet existed before gpu-queue did (a partially-run install, a mkdir for the
+# NPU lock, anything that creates the directory first) the queue resolved to ~/GPU-QUEUE while the token resolved to
+# $HOLD/gpu-token: two callers in that window hold DIFFERENT token files and both run GPU work, which is the silent
+# double-hold the fleet directory exists to prevent. The directory being installed is the condition; the paths under it
+# are then fixed, and $QUEUE is created by the mkdir below if the installer has not made it yet.
+QUEUE=${GPU_QUEUE_DIR:-$([ -d "$HOLD" ] && printf '%s' "$HOLD/gpu-queue" || printf '%s' "$HOME/GPU-QUEUE")}
 TOKEN=${GPU_TOKEN_FILE:-$([ -d "$HOLD" ] && printf '%s' "$HOLD/gpu-token" || printf '%s' "$HOME/GPU-TOKEN")}
 RELEASE_WAIT=${GPU_HOLD_RELEASE_WAIT:-180}
 TCTL_START=${GPU_HOLD_TCTL_START:-75}

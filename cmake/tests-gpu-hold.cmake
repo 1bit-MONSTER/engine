@@ -51,3 +51,9 @@ add_test(NAME gpu_hold_queue COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_te
 add_test(NAME gpu_hold_survivors COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_survivors_test.sh)
 add_test(NAME gpu_hold_group
          COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_group_test.sh)
+# engine#1609 follow-up: the resolution has THREE directory states and `gpu_hold_queue` above covers two of them
+# (fleet state fully installed, and absent). The third -- the hold directory exists but gpu-queue does not, which is
+# what a partially-run install or any `mkdir` of /var/lib/1bit-fleet leaves -- is where the queue and the token used to
+# resolve under DIFFERENT bases, so two callers could each hold a token and both run GPU work. Asserts the two
+# resolve under one base in all three states, plus that the script's two predicates are textually identical.
+add_test(NAME gpu_hold_hold_dir COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_hold_dir_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)

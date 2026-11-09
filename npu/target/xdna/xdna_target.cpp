@@ -1084,7 +1084,12 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
                 prof_add(prof_pre_, di, dpk, dql, dwt, drb);
                 prof_pre_n_++;
             }
-            if (prof_dec_n_ && (prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();
+            // Dump on either family's count. The `prof_dec_n_ &&` guard meant a PREFILL-ONLY process never dumped at
+            // all: no decode launch had happened, so the condition was false no matter how many prefill launches ran.
+            // That is exactly the case that matters when a request stalls -- the run that never returns is a prefill,
+            // so the profiler stayed silent and "no rows" could not be read as "no launches" (engine #1605: an 8-token
+            // request on the pb16i arm returned nothing in 420 s and printed no profiler rows).
+            if ((prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();
         }
         return;
     }
@@ -1167,7 +1172,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             prof_add(prof_pre_, di, dpk, dql, dwt, drb);
             prof_pre_n_++;
         }
-        if (prof_dec_n_ && (prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();
+        if ((prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();   // same reason as above: prefill-only runs
     }
 }
 

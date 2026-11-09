@@ -321,6 +321,68 @@ void test_external_packed_genre(const std::string& root) {
 
 // The two overstatements the readers must catch: declared dims larger than the external file, and a
 // MatMulNBits node whose N/K/block_size demand more qweight than the tensor declares.
+// engine#1671: a pack whose graph is all `[0]`-dims placeholders and whose bytes are in model.bin (the 1.8/hybrid
+// genre). The importer has no model.bin reader, so the honest outcome is a refusal that NAMES the file — not
+// "<tensor>.qweight.empty: no data", which reports a placeholder as though the bytes were absent rather than elsewhere.
+// Crafted, so this needs no 1.9 pack: a graph with one resolvable tensor, one MatMulNBits whose qweight input is a
+// `.empty` placeholder with no sibling, and a model.bin next to it.
+void test_modelbin_genre_refusal(const std::string& root) {
+    const fs::path dir = fs::path(root) / "crafted-modelbin";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    fs::create_directories(dir / "cache");
+    put_file((dir / "model.onnx.data").string(), std::string(4096, '\x11'));
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":16,"intermediate_size":32,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":true})");
+    put_file((dir / "model.bin").string(), std::string(8192, '\x22'));   // the file the refusal must name
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {8, 8}, "model.onnx.data", 0, 256)},
+                       {pb::matmulnbits("lm_head", {"x", "lm_head.MatMulNBits.qweight.empty",
+                                                    "lm_head.MatMulNBits.scales.empty",
+                                                    "lm_head.MatMulNBits.qzeros.empty"}, 512, 64, 4, 128)}));
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    const fs::path out = dir / "out";
+    try {
+        const auto r = pi::import_pack(dir.string(), out.string(), allow);
+        check(false, "modelbin genre: a placeholder-only graph next to model.bin was refused");
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        std::printf("  modelbin genre refusal: %s\n", what.c_str());
+        check(what.find("model.bin") != std::string::npos,
+              "modelbin genre: the refusal names model.bin, not a placeholder tensor (" + what + ")");
+        check(what.find("no data") == std::string::npos,
+              "modelbin genre: it does not say \"no data\" (the bytes are elsewhere, not absent)");
+        check(what.find("engine#1671") != std::string::npos, "modelbin genre: the refusal cites the issue");
+    }
+    check(!fs::exists(out / "model.q4nx"), "modelbin genre: nothing written");
+
+    // the control: the SAME graph with the placeholder's bytes present must NOT hit this refusal, or the guard would
+    // be masking a pack that can be read.
+    fs::remove_all(dir / "model.bin");
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {8, 8}, "model.onnx.data", 0, 256),
+                        pb::tensor("lm_head.MatMulNBits.qweight.empty", {}, "model.onnx.data", 256, 4096),
+                        pb::tensor("lm_head.MatMulNBits.scales.empty", {}, "model.onnx.data", 4352, 1024),
+                        pb::tensor("lm_head.MatMulNBits.qzeros.empty", {}, "model.onnx.data", 5376, 160)},
+                       {pb::matmulnbits("lm_head", {"x", "lm_head.MatMulNBits.qweight.empty",
+                                                    "lm_head.MatMulNBits.scales.empty",
+                                                    "lm_head.MatMulNBits.qzeros.empty"}, 512, 64, 4, 128)}));
+    std::string control;
+    try {
+        const auto r = pi::import_pack(dir.string(), (dir / "out2").string(), allow);
+        control = "ok";
+    } catch (const std::exception& e) {
+        control = e.what();
+    }
+    check(control.find("model.bin reader") == std::string::npos,
+          "modelbin genre: control — the same graph WITH the bytes present is not refused by this guard (" +
+              control.substr(0, 90) + ")");
+    fs::remove_all(dir);   // leave the tree as we found it, like the crafted leg above
+}
+
 void test_crafted_refusals(const std::string& root) {
     const fs::path dir = fs::path(root) / "crafted";
     fs::remove_all(dir);
@@ -2055,6 +2117,43 @@ static void dump_real_component(const std::string& dir) {
     }
 }
 
+// A multi-component pack (gemma-4 1.9, `type: compositemodel`) states its geometry in model_config.json's
+// config.model_attributes.text_config -- not in config.json (which is `{}`) nor in genai_config.json's decoder block
+// (which stops at head_size). Measured on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: hidden 1536, 35L, 8 heads,
+// 1 kv, head_dim 256, intermediate_size 6144, vocab 262144. Without this source the pack refuses with "the pack
+// states no intermediate_size", which is exactly what it did on the real pack.
+void test_model_config_geometry(const std::string& root) {
+    const fs::path dir = fs::path(root) / "modelcfg";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    // what the genai_config decoder block resolves on such a pack: everything but intermediate_size
+    nlohmann::json cfg = {{"hidden_size", 1536},        {"num_hidden_layers", 35}, {"num_attention_heads", 8},
+                          {"num_key_value_heads", 1},   {"head_dim", 256},         {"model_type", "gemma4"}};
+    put_file((dir / "model_config.json").string(),
+             R"({"type":"compositemodel","config":{"model_attributes":{"text_config":{)"
+             R"("hidden_size":1536,"num_hidden_layers":48,"num_attention_heads":16,"num_key_value_heads":8,)"
+             R"("head_dim":256,"intermediate_size":6144,"vocab_size":262144,)"
+             R"("max_position_embeddings":131072,"model_type":"gemma4_text"}}}})");
+    const int added = pi::fill_from_model_config(dir.string(), cfg);
+    check(added > 0, "model_config: the text tower's geometry is read from model_config.json (" + std::to_string(added) +
+                         " key(s) added)");
+    check(cfg.value("intermediate_size", 0) == 6144,
+          "model_config: intermediate_size comes from the text tower (6144)");
+    check(cfg.value("vocab_size", 0) == 262144 && cfg.value("max_position_embeddings", 0) == 131072,
+          "model_config: vocab and context come with it");
+    std::printf("model_config: added %d key(s), intermediate %d, vocab %d, layers %d (genai's value kept)\n", added,
+                cfg.value("intermediate_size", 0), cfg.value("vocab_size", 0), cfg.value("num_hidden_layers", 0));
+    check(cfg.value("hidden_size", 0) == 1536 && cfg.value("num_hidden_layers", 0) == 35 &&
+              cfg.value("num_attention_heads", 0) == 8,
+          "model_config: a value already resolved (genai's 1536/35/8) is NOT overridden by the tower's 1536/48/16");
+    // A pack without the file contributes nothing and reports nothing added.
+    fs::remove(dir / "model_config.json");
+    nlohmann::json cfg2 = {{"hidden_size", 1536}};
+    check(pi::fill_from_model_config(dir.string(), cfg2) == 0 && !cfg2.contains("intermediate_size"),
+          "model_config: no model_config.json adds nothing (the 1.6/gemma-3 shape is unchanged)");
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2071,6 +2170,7 @@ int main(int argc, char** argv) {
         test_bounds();
         test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
+        test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);
         test_q4_1f();
@@ -2080,6 +2180,7 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
+        test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
@@ -2088,8 +2189,19 @@ int main(int argc, char** argv) {
         test_kernel_set_refusal();
         test_weight_layout();
         test_null_optional_dims();
-        if (pack_ran) test_pack(pack, golden_dir);
-        else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
+        // The pack leg gets its OWN catch, so one unreadable pack is a counted failed check rather than the end of the
+        // run. Before this, a throw here reached the handler below and printed "FAIL exception:", skipping the summary
+        // that says which legs ran -- which is how pack-leg breakage stayed invisible behind a green line (engine#842,
+        // engine#1671: the 0.5B-Instruct 1.9 pack's placeholders threw "no data" and nothing after it ran).
+        if (pack_ran) {
+            try {
+                test_pack(pack, golden_dir);
+            } catch (const std::exception& e) {
+                check(false, std::string("pack leg: ") + e.what());
+            }
+        } else {
+            std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL exception: %s\n", e.what());
         return 1;

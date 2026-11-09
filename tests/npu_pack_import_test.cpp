@@ -2423,6 +2423,41 @@ void test_fconst_in_component(const std::string& root) {
     fs::remove_all(flat);
 }
 
+
+// A multi-component pack names its embedding component in genai_config.json (`model.embedding.filename =
+// "embedding/model.onnx"`) and keeps the external data beside it, while a single-graph pack uses the flat
+// `embedding.onnx` this reader was written for. Measured on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: the component
+// is `embedding/model.onnx` + `embedding/model.onnx.data` (10.26 GiB), and the reader reported "no embedding.onnx".
+void test_embedding_in_component(const std::string& root) {
+    const fs::path dir = fs::path(root) / "embedcomp2";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "embedding");
+    const int64_t V = 8, H = 256, groups = H / 128;
+    std::vector<uint8_t> table(size_t(V) * size_t(H / 2), 0);
+    std::vector<float> scales(size_t(V) * size_t(groups), 0.5f);
+    for (size_t i = 0; i < table.size(); ++i) table[i] = uint8_t(i * 13 % 256);
+    std::string data;
+    data.append(reinterpret_cast<const char*>(table.data()), table.size());
+    const size_t table_bytes = table.size();
+    data.append(reinterpret_cast<const char*>(scales.data()), scales.size() * sizeof(float));
+    put_file((dir / "embedding" / "model.onnx.data").string(), data);
+    // the location is BARE -- relative to the graph, not to the pack root
+    const auto t = pb::tensor("language_model.embed_tokens.weight_Q4", {V, H / 2}, "model.onnx.data", 0, table_bytes, 2);
+    const auto sc = pb::tensor("language_model.embed_tokens.weight_scales", {V, groups}, "model.onnx.data",
+                               table_bytes, scales.size() * sizeof(float), 1);
+    put_file((dir / "embedding" / "model.onnx").string(), pb::model({t, sc}, {}));
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"type":"gemma4","embedding":{"filename":"embedding/model.onnx"},)"
+             R"("decoder":{"filename":"decoder/model.onnx"}}})");
+    std::string why;
+    const std::vector<float> got = pi::read_embedding_component(dir.string(), &why);
+    std::printf("embedding component (declared): %zu values (why: %s)\n", got.size(), why.c_str());
+    check(got.size() == size_t(V) * size_t(H),
+          "embedding component: the graph genai_config.json names is read, with its data beside it ("
+              + std::to_string(got.size()) + ")");
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2454,6 +2489,7 @@ int main(int argc, char** argv) {
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_im_from_node_attrs(golden_dir.empty() ? "." : golden_dir);
         test_fconst_in_component(golden_dir.empty() ? "." : golden_dir);
+        test_embedding_in_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

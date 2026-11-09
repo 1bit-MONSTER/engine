@@ -849,7 +849,29 @@ DeclaredMap read_declared(const std::string& pack_dir) {
 // walk_graph() reads the graph with its external-data declarations, decode_matmulnbits() is block-parameterised, and
 // the scale-per-32-column-group layout is the container's own.
 std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why) {
-    const std::string gpath = pack_dir + "/embedding.onnx";
+    // A multi-component pack (`type: compositemodel`) names its embedding component in genai_config.json
+    // (`model.embedding.filename = "embedding/model.onnx"`), exactly as it names its decoder; a single-graph pack keeps
+    // the flat `embedding.onnx` this reader was written for. Follow the pack's own declaration first — the same rule the
+    // graph and the Token .fconst now follow (#1644, #1657) — and fall back to the flat name.
+    std::string gpath = pack_dir + "/embedding.onnx";
+    {
+        std::ifstream gf(pack_dir + "/genai_config.json");
+        if (gf) {
+            json g;
+            try { g = json::parse(gf); } catch (...) { g = json::object(); }
+            if (g.is_object() && g.contains("model") && g["model"].is_object() && g["model"].contains("embedding") &&
+                g["model"]["embedding"].is_object()) {
+                const json& emb = g["model"]["embedding"];
+                if (emb.contains("filename") && emb["filename"].is_string()) {
+                    const std::string rel = emb["filename"].get<std::string>();
+                    if (!rel.empty() && rel.front() != '/' && rel.find("..") == std::string::npos) {
+                        std::error_code nec;
+                        if (fs::is_regular_file(pack_dir + "/" + rel, nec)) gpath = pack_dir + "/" + rel;
+                    }
+                }
+            }
+        }
+    }
     std::error_code ec;
     if (!fs::is_regular_file(gpath, ec)) { if (why) *why = "no embedding.onnx"; return {}; }
     // parse_onnx() unwraps the ModelProto's graph field and walks it; walk_graph() alone expects the GRAPH protobuf,
@@ -883,7 +905,9 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         if (t->location.empty() || ext.count(t->location)) continue;
         size_t sz = 0;
         std::string w2;
-        const uint8_t* m = map_file(pack_dir + "/" + t->location, sz, &w2);
+        // external data is named relative to the GRAPH, which for a component pack is a subdirectory: the real pack's
+        // embedding graph declares `embedding.onnx.data`, which lives beside it in `embedding/`, not at the pack root.
+        const uint8_t* m = map_file(fs::path(gpath).parent_path().string() + "/" + t->location, sz, &w2);
         if (!m) { if (why) *why = w2; return {}; }
         ext[t->location] = m;
         ext_size[t->location] = sz;

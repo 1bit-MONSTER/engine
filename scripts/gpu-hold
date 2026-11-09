@@ -29,7 +29,10 @@
 #      the critical temperature;
 #   4. always releases the token and removes its ticket, however it exits (trap on EXIT/INT/TERM/HUP);
 #   5. drops tickets, and tokens, whose owner process is gone, so a killed agent cannot block the queue;
-#   6. makes a label that has just released wait RELEASE_WAIT seconds (default 180) before it holds again.
+#   6. makes a label that has just released wait RELEASE_WAIT seconds (default 180) before it holds again;
+#   7. releases the token even when the payload's ROOT survives the KILL pass (a process in uninterruptible sleep
+#      cannot be killed), recording the pid, its start time and its command beside the ticket so the next holder
+#      is told rather than left to measure on a device that may still hold that process's memory.
 #
 # Options and environment (all optional):
 #   -t MINUTES     max hold, default $GPU_HOLD_MINUTES or 14        (0.05 = 3 seconds)
@@ -124,6 +127,11 @@ COOLDOWN_STAMP="$QUEUE/.cooldown"      # "<epoch> <C>" of the last hold that end
 SAFE=$(printf '%s' "$LABEL" | tr -c 'A-Za-z0-9_.-' '_')
 TICKET="$QUEUE/$(printf '%020d' "$(date +%s%N)").$SAFE"
 RELEASED_AT="$QUEUE/.released-at.$SAFE"
+# a root that survived KILL is recorded here, beside the ticket, so the NEXT holder is told: the log line alone
+# scrolls away with the ticket, and the next lane then measures on a device that may still hold the wedged
+# process's GTT - which is the 2026-11-08 incident (a 14 h llama-server holding 51 GiB that nobody knew about
+# until the PR agent died). engine #1639.
+SURVIVORS="$QUEUE/.gpu-hold-survivors"
 TICKET_NAME=$(basename "$TICKET")
 
 state=queued
@@ -265,6 +273,11 @@ while [ "$state" = queued ]; do
             if ( set -o noclobber; printf '%s\n' "$mine" > "$TOKEN" ) 2> /dev/null; then
                 state=holding
                 log "took $TOKEN after ${waited}s (die $(tctl)C)"
+                # the previous holder left a process the kernel would not kill: say so before this lane measures
+                if [ -s "$SURVIVORS" ]; then
+                    log "::warning::previous holder left $(tr '\n' ';' < "$SURVIVORS") - that device may still hold its memory (engine #1639)"
+                    : > "$SURVIVORS"
+                fi
                 break
             fi
         fi
@@ -363,16 +376,34 @@ watchdog=$!
 # Bound the wait and release anyway - a wedged job costs one lane's measurement, not the queue (engine #1639;
 # the deployed copy on strixhalo has had this bound since 2026-11-06, and this is it brought back to the repo).
 # GPU_HOLD_KILL_GRACE is the TERM->KILL window; GPU_HOLD_SURVIVE_WAIT is the settle time after it.
+#
+# This bound is COMPLEMENTARY to the bounded wait for the watchdog that #1626 landed further down: with a
+# survived root the watchdog keeps polling `kill -0 "$target"` and will not exit on its own, so before #1626 this
+# script would have hung in that wait instead. A future reader rebasing one of the two should see that the other
+# is what makes the token actually reach `release`.
 survive_by=$(( ${GPU_HOLD_KILL_GRACE:-10} + ${GPU_HOLD_SURVIVE_WAIT:-60} ))
+stopped=0
 while kill -0 "$child" 2> /dev/null; do
     sleep 1
     base=$deadline
-    [ -n "${STOP_STAMP:-}" ] && [ -f "$STOP_STAMP" ] && base=$(cat "$STOP_STAMP" 2> /dev/null || printf '%s' "$deadline")
+    if [ -n "${STOP_STAMP:-}" ] && [ -f "$STOP_STAMP" ]; then
+        base=$(cat "$STOP_STAMP" 2> /dev/null || printf '%s' "$deadline")
+        stopped=1
+    fi
     [ "$(date +%s)" -ge $(( base + survive_by )) ] && break
 done
 if kill -0 "$child" 2> /dev/null; then
     log "::error::child $child survived KILL: releasing the token anyway (a wedged job costs one lane's measurement, not the queue)"
-    rc=124
+    # durable, not just in a log that scrolls away: the next acquire prints this
+    {
+        printf 'pid=%s start=%s cmd=%s\n' "$child" \
+            "$(ps -o lstart= -p "$child" 2> /dev/null | sed 's/^ *//' || printf unknown)" \
+            "$(tr '\0' ' ' < "/proc/$child/cmdline" 2> /dev/null | cut -c1-120 || printf unknown)"
+    } >> "$SURVIVORS" 2> /dev/null || true
+    # a deadline is a timeout (124, as timeout(1) says); a stop is not - the job was asked to end and refused to
+    # die, which is 130 in the shell convention, and a caller that tells the two apart must not read a stop as a
+    # job that hit its own limit
+    if [ "$stopped" = 1 ]; then rc=130; else rc=124; fi
 else
     wait "$child"
     rc=$?

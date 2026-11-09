@@ -26,6 +26,8 @@ set -uo pipefail
 
 bin=${1:?usage: hybrid_route.sh path/to/1bit}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound (engine #1485)
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
 fail=0
@@ -34,41 +36,27 @@ pid=
 cleanup() { [ -n "$pid" ] && { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; }; rm -rf "$scratch"; }
 trap cleanup EXIT
 
-start() {   # start <log> [env...]: serve on a free port with the fake backend, env applied to serve
+start() {   # start <log> [env...]: serve on the port it reports, with the fake backend and env applied
     local log=$1; shift
-    local attempt port code deadline
-    for attempt in 1 2 3; do
-        port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-        env FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port "$port" --alias hybrid-model \
-            --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
-        pid=$!
-        api="http://127.0.0.1:$port"
-        # A deadline in seconds, not a try count: the old 100-try loop took 6.7 s on a quiet box and 15.2 s on the
-        # same commit on a loaded CI runner, so a slow runner exhausted it and four checks failed as if routing had
-        # broken (engine #850).
-        code=000 deadline=$((SECONDS + ${HYBRID_ROUTE_START_S:-60}))
-        while :; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health")
-            [ "$code" = 200 ] && break
-            [ $SECONDS -lt $deadline ] || break
-            sleep 0.1
-        done
-        if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log" && [ "$attempt" -lt 3 ]; then
-            # A server that never came up because it could not bind is a port collision, not a defect in what
-            # this test checks: serve picks the port, releases it, and launches its backends before it binds, so on
-            # a -j runner another serve can take it inside that window. Re-pick a bounded number of times; the FAIL
-            # message below stays for a collision that will not go away (engine #1444).
-            echo "     note: port $port was taken before serve bound it; retrying with a fresh port (attempt $((attempt + 1))/3)"
-            stop
-            continue
-        fi
-        break
+    local port code deadline
+    # --port 0: the kernel picks and serve reports it, so nothing here picks a port and releases it before serve binds -
+    # the release-then-bind race this test used to retry around is gone rather than mitigated (engine #1444/#1485).
+    env FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port 0 --alias hybrid-model \
+        --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
+    pid=$!
+    port=$(serve_port_wait "$log" "$pid" 900) || { echo "FAIL serve never reported a port; log=$log"; tail -5 "$log" 2>/dev/null; return 1; }
+    api="http://127.0.0.1:$port"
+    # A deadline in seconds, not a try count: the old 100-try loop took 6.7 s on a quiet box and 15.2 s on the
+    # same commit on a loaded CI runner, so a slow runner exhausted it and four checks failed as if routing had
+    # broken (engine #850).
+    code=000 deadline=$((SECONDS + ${HYBRID_ROUTE_START_S:-60}))
+    while :; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health")
+        [ "$code" = 200 ] && break
+        [ $SECONDS -lt $deadline ] || break
+        sleep 0.1
     done
     if [ "$code" != 200 ]; then
-        if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
-            echo "FAIL: hybrid_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
-            exit 1
-        fi
         echo "FAIL serve did not answer $api/health within $((SECONDS - deadline + ${HYBRID_ROUTE_START_S:-60}))s: last code $code, pid $pid $(kill -0 "$pid" 2>/dev/null && echo alive || echo gone)"
         tail -5 "$log" 2>/dev/null
     fi

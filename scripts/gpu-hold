@@ -141,7 +141,19 @@ release() {
     state=done
 }
 trap release EXIT
-trap 'exit 143' TERM INT HUP
+# A SIGNAL MUST END THE PAYLOAD'S TREE, not only the token. `exit 143` alone ran release() (token removed, ticket removed) and left
+# the payload running with the device: the next lane is admitted while the old work still holds it — the 2026-11-08 51 GiB orphan
+# reached through the second door, and any `timeout`, operator `kill` or orchestrator stop takes it (engine#1640). `kill_tree` is
+# defined further down, so the handler checks for it with `declare -F`; before it exists `child` is still empty, so there is nothing
+# to end. The watchdog is stopped here too, or it would outlive this shell for one poll interval.
+on_signal() {
+    if declare -F kill_tree > /dev/null 2>&1 && [ -n "${child:-}" ]; then
+        kill_tree "$child" "${GPU_HOLD_KILL_GRACE:-10}"
+    fi
+    kill "$watchdog" 2> /dev/null
+    exit 143
+}
+trap on_signal TERM INT HUP
 
 pid_of() { sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$1" 2> /dev/null | head -n 1; }
 

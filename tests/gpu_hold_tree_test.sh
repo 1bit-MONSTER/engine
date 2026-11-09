@@ -103,4 +103,57 @@ if kill -0 "$stubborn" 2> /dev/null; then
 fi
 echo "ok   the TERM-ignoring grandchild was killed too"
 
+# A THIRD shape, and it is the one nobody's ticket timeout goes through: a signal to `gpu-hold` ITSELF. The trap was
+# `trap 'exit 143' TERM INT HUP`, so TERM ran release() - token and ticket removed - and left the payload holding the device:
+# the next lane is admitted while the old work still has it. Measured on main 2026-11-09 by pi-verify as
+# "hold alive=no, payload alive=yes, token=released", and by this lane the same way before the fix in engine#1640.
+# This arm is that measurement: TERM the hold, then assert the payload is gone AND the token was released.
+rm -f "$scratch/sig.pid" "$scratch/TOKEN"
+cat > "$scratch/sig_payload.sh" <<'SIG'
+#!/bin/bash
+echo $$ > "$1/sig.pid"
+exec -a gpu-hold-signal-payload sleep 300
+SIG
+chmod +x "$scratch/sig_payload.sh"
+GPU_QUEUE_DIR=$q GPU_TOKEN_FILE=$scratch/TOKEN GPU_HOLD_LOG=$scratch/log \
+GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=3 \
+GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE=$scratch/tctl GPU_HOLD_THERMAL_FLAG=$scratch/x \
+    "$hold" -t 1 -l selftest-signal -- "$scratch/sig_payload.sh" "$scratch" >/dev/null 2>&1 &
+sig_hold=$!
+# wait for it to HOLD (the token names its pid) rather than for a sleep: a queued hold has no payload yet
+for _ in $(seq 1 30); do
+    grep -q "pid $sig_hold" "$scratch/TOKEN" 2> /dev/null && break
+    sleep 0.5
+done
+sig_payload=$(cat "$scratch/sig.pid" 2> /dev/null)
+if [ -z "$sig_payload" ]; then
+    kill -9 "$sig_hold" 2> /dev/null
+    echo "FAIL the payload never started for the signal arm"; exit 1
+fi
+kill -TERM "$sig_hold" 2> /dev/null
+for _ in $(seq 1 40); do
+    kill -0 "$sig_payload" 2> /dev/null || break
+    sleep 0.5
+done
+sig_rc=0
+if kill -0 "$sig_payload" 2> /dev/null; then
+    echo "FAIL the payload ($sig_payload) survived a TERM to gpu-hold - the token is free and the device is not (engine#1640)"
+    kill -9 "$sig_payload" 2> /dev/null
+    sig_rc=1
+else
+    echo "ok   a TERM to gpu-hold ends the payload too"
+fi
+# The order inside the hold is tree FIRST, token second: releasing the token while the payload still holds the device is the
+# defect, so this arm waits for the release instead of assuming it lands in the same instant the payload dies.
+for _ in $(seq 1 40); do
+    [ -e "$scratch/TOKEN" ] || break
+    sleep 0.25
+done
+if [ -e "$scratch/TOKEN" ]; then
+    echo "FAIL the token was not released within 10 s of the signal"; sig_rc=1
+else
+    echo "ok   ... and the token is released (tree first, token second)"
+fi
+[ "$sig_rc" = 0 ] || exit 1
+
 echo "gpu_hold_tree: ok"

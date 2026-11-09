@@ -160,6 +160,34 @@ def attention_mode(model_dir: str) -> str:
     return mode
 
 
+def rope_block(cfg: dict) -> dict:
+    """The rotary the model declares: `plain` one index, or the vision-conditioned `mrope` planes.
+
+    Qwen3-VL states `rope_scaling: {mrope_interleaved: true, mrope_section: [24, 20, 20]}` -- on the text
+    tower, so a VL pack's copy sits under `text_config`.  The split is written into the plan because a
+    caller that builds the position block has to know how the rotary width divides over (t, h, w); without
+    it the three planes have no declared width and a caller would guess.  Everything else (including a
+    `rope_scaling` that carries no `mrope_section`, e.g. a plain linear/YaRN scaling) means one index, which
+    is what every plan meant before this field existed.
+    """
+    def sections_of(block) -> object:
+        if not isinstance(block, dict):
+            return None
+        scaling = block.get("rope_scaling")
+        return scaling.get("mrope_section") if isinstance(scaling, dict) else None
+
+    sections = sections_of(cfg)
+    if sections is None:
+        sections = sections_of(cfg.get("text_config"))
+    if sections is None:
+        return {"kind": "plain", "planes": 1}
+    if not isinstance(sections, list) or not sections or not all(
+            isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in sections):
+        raise SystemExit(f"rope_scaling.mrope_section {sections!r} is not a list of positive integers "
+                         "(one width per plane)")
+    return {"kind": "mrope", "planes": len(sections), "sections": list(sections)}
+
+
 def artifact(model_dir: str, kernels: str, name: str) -> bool:
     for d in (kernels, model_dir):
         if os.path.isfile(os.path.join(d, name)):
@@ -299,6 +327,10 @@ def generate(model_dir: str, kernels: str) -> dict:
         },
         "kernels": {"tag": tag},
         "attention": {"mode": attention_mode(model_dir)},
+        # The rotary, from the pack's own declaration (engine#799): `plain` one index, or `mrope` with the
+        # planes' split.  Stated rather than left to a key's absence, like kv below -- a plan should read as
+        # what its positions are.
+        "rope": rope_block(cfg),
         # P7 (#806) part A: the KV contract.  f16 with no rotation is what every container shipped so
         # far means; the generator states it rather than leaving it to a key's absence, so a plan reads
         # as what its cache is.  Turning int8 on is a per-target decision (its rotation and scale

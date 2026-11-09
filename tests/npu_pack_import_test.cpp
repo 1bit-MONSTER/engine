@@ -2458,6 +2458,52 @@ void test_embedding_in_component(const std::string& root) {
     fs::remove_all(dir);
 }
 
+
+// engine#1725: the gemma-4 component is f32 and unquantised -- an `embed_tokens` table with no scales beside it -- and its
+// decoder also needs a PER-LAYER table. Two arms: the f32 token table alone is read, and a per-layer table is refused by
+// name rather than reported as a missing table. Measured sizes on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu:
+// embed_tokens.weight (262144,1536) f32 and embed_tokens_per_layer.weight (262144,8960) f32.
+void test_embedding_f32_component(const std::string& root) {
+    auto build = [&](const fs::path& dir, bool with_per_layer) {
+        fs::remove_all(dir);
+        fs::create_directories(dir / "embedding");
+        const int64_t V = 8, H = 256;
+        std::vector<float> tok(size_t(V) * size_t(H));
+        for (size_t i = 0; i < tok.size(); ++i) tok[i] = float(int(i % 97) - 48) * 0.25f;
+        std::string data(reinterpret_cast<const char*>(tok.data()), tok.size() * sizeof(float));
+        const size_t tok_bytes = data.size();
+        std::vector<std::string> inits{pb::tensor("embedding.embed_tokens.weight", {V, H}, "model.onnx.data", 0,
+                                                  tok_bytes, 1)};
+        if (with_per_layer) {
+            std::vector<float> per(size_t(V) * size_t(320));
+            for (size_t i = 0; i < per.size(); ++i) per[i] = 0.5f;
+            data.append(reinterpret_cast<const char*>(per.data()), per.size() * sizeof(float));
+            inits.push_back(pb::tensor("embedding.embed_tokens_per_layer.weight", {V, 320}, "model.onnx.data", tok_bytes,
+                                       per.size() * sizeof(float), 1));
+        }
+        put_file((dir / "embedding" / "model.onnx.data").string(), data);
+        put_file((dir / "embedding" / "model.onnx").string(), pb::model(inits, {}));
+        put_file((dir / "genai_config.json").string(),
+                 R"({"model":{"type":"gemma4","embedding":{"filename":"embedding/model.onnx"}}})");
+    };
+    const fs::path a = fs::path(root) / "f32emb";
+    build(a, false);
+    std::string why;
+    const std::vector<float> got = pi::read_embedding_component(a.string(), &why);
+    std::printf("f32 embedding: %zu values (why: %s)\n", got.size(), why.c_str());
+    check(got.size() == 8u * 256u, "f32 embedding: an unquantised f32 table is read (" + std::to_string(got.size()) + ")");
+
+    const fs::path b = fs::path(root) / "f32emb_perlayer";
+    build(b, true);
+    std::string why2;
+    const std::vector<float> none = pi::read_embedding_component(b.string(), &why2);
+    std::printf("f32 embedding (per-layer): %zu values, why: %s\n", none.size(), why2.c_str());
+    check(none.empty() && why2.find("per_layer") != std::string::npos,
+          "f32 embedding: a per-layer table is refused by NAME, not reported as a missing table (" + why2 + ")");
+    fs::remove_all(a);
+    fs::remove_all(b);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2490,6 +2536,7 @@ int main(int argc, char** argv) {
         test_im_from_node_attrs(golden_dir.empty() ? "." : golden_dir);
         test_fconst_in_component(golden_dir.empty() ? "." : golden_dir);
         test_embedding_in_component(golden_dir.empty() ? "." : golden_dir);
+        test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

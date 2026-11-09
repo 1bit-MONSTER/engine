@@ -892,6 +892,58 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         else if (t.name.size() > 3 && t.name.compare(t.name.size() - 3, 3, "_Q4") == 0) table = &t;
         else if (!table && t.dims.size() == 2) table = &t;   // an unquantised [V, H] table
     }
+    // engine#1725: the gemma-4 components are f32 and UNQUANTISED -- an `embed_tokens` table with no `*scales*` beside
+    // it -- while the shape above is the 4-bit packed one another family ships. Reading the f32 table is worth doing
+    // (the container wants BF16 and the conversion is exact); claiming the pack is not, because its decoder also carries
+    // `per_layer_inputs`, fed by `embed_tokens_per_layer.weight` (262144x8960 on the e2b pack, i.e. layers x head_dim)
+    // and a 256-wide projection norm, and no reader here implements that mechanism yet. So: read the token table, refuse
+    // by NAME when the per-layer table is present, instead of reporting the shape mismatch as a missing table.
+    if (table && !scales) {
+        const bool per_layer = [&] {
+            for (const auto& t2 : em.tensors)
+                if (t2.name.find("embed_tokens_per_layer") != std::string::npos) return true;
+            return false;
+        }();
+        if (per_layer) {
+            if (why)
+                *why = "the component carries embedding.embed_tokens_per_layer.weight, i.e. a PER-LAYER embedding table "
+                       "(262144x8960 on gemma-4-e2b = layers x head_dim) that feeds the decoder's per_layer_inputs, and "
+                       "the per-layer embedding mechanism is not implemented here yet (engine#1725): refusing rather "
+                       "than importing a decoder without that input";
+            return {};
+        }
+        if (table->type != kF32) {
+            if (why) *why = "embed_tokens is unquantised with dtype " + std::to_string(table->type) +
+                            ", and only f32 is read here (engine#1725)";
+            return {};
+        }
+        if (table->dims.size() != 2 || table->dims.at(0) <= 0 || table->dims.at(1) <= 0) {
+            if (why) *why = "an f32 embed_tokens table must be 2-D and positive";
+            return {};
+        }
+        const int64_t Vf = table->dims.at(0), Hf = table->dims.at(1);
+        std::map<std::string, const uint8_t*> fext;
+        const uint8_t* raw = nullptr;
+        if (!table->location.empty()) {
+            size_t sz = 0;
+            std::string w3;
+            const uint8_t* m = map_file(fs::path(gpath).parent_path().string() + "/" + table->location, sz, &w3);
+            if (!m) { if (why) *why = w3; return {}; }
+            fext[table->location] = m;
+            const uint64_t need = uint64_t(Vf) * uint64_t(Hf) * 4ull;
+            if (table->offset + need > sz) {
+                if (why) *why = "embed_tokens (f32) declares more bytes than its external data carries";
+                return {};
+            }
+            raw = m + table->offset;
+        } else if (table->raw != nullptr) {
+            raw = table->raw;
+        }
+        if (raw == nullptr) { if (why) *why = "an f32 embed_tokens table with no data"; return {}; }
+        std::vector<float> out(size_t(Vf) * size_t(Hf));
+        std::memcpy(out.data(), raw, out.size() * sizeof(float));
+        return out;
+    }
     if (!table || !scales) { if (why) *why = "embedding.onnx has no embed_tokens table + scales"; return {}; }
     if (table->dims.size() != 2 || scales->dims.size() != 2) { if (why) *why = "embed_tokens dims are not 2-D"; return {}; }
     const int64_t V = table->dims.at(0), packed = table->dims.at(1), groups = scales->dims.at(1);

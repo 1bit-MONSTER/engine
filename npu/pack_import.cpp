@@ -1784,17 +1784,26 @@ Plan plan(const std::string& pack_dir) {
                                  {embed->dims.at(0), embed->dims.at(1)}));
     }
 
+    // Only the node whose geometry IS the head (N = V, K = H) is the head. This loop used to take the FIRST MatMulNBits and
+    // `break`, so on a pack whose first matmul is a projection the plan reported that projection's shape as
+    // `lm_head.weight` -- [1152, 896], a fused qkv, instead of [151936, 896] on Qwen2.5-0.5B-Instruct 1.9 (engine#1671).
+    // import_pack() already gates this way; the plan's copy of the loop did not.
+    bool head_from_graph = false;
     for (const auto& mm : onnx.matmuls) {
+        if (!(mm.N == d.vocab && mm.K == d.hidden)) continue;
         const auto it = onnx.index.find(mm.weight);
         if (it == onnx.index.end()) continue;
         auto x = make("lm_head.weight", onnx.tensors[it->second].location, "q4_1", {mm.N, mm.K});
         if (mm.bits != 4) x.refusal = "MatMulNBits is " + std::to_string(mm.bits) + "-bit, not 4-bit";
         p.tensors.push_back(std::move(x));
+        head_from_graph = true;
         break;
     }
-    if (onnx.matmuls.empty()) {
+    if (!head_from_graph) {
         // The head is in the .fconst tail (the Ryzen AI 1.9 lines). The importer reads it, and refuses by name
-        // there if the tail's arithmetic does not come out, so the plan does not refuse it here.
+        // there if the tail's arithmetic does not come out, so the plan does not refuse it here. Keyed on "did a graph
+        // head get written", not "is the graph free of matmuls": a graph of projections only is not a pack without a head
+        // (engine#1671).
         p.tensors.push_back(make("lm_head.weight", "fconst:tail", "q4_1", {d.vocab, d.hidden}));
     }
 

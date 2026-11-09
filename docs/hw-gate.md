@@ -77,6 +77,14 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   add-on (the gate builds that) and does not dispatch anything. Green means the pinned pair builds into the engine. It
   does not replace the `hw-gate` label on a pin bump.
 
+> **Since 2026-11-09 this job is red on every branch, so a red badge is not a signal** (engine #1733). Three errors sit in
+> `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as `bool`, and two declarations
+> that differ only in return type — i.e. the fork's source no longer compiles against the fork's own headers, and the pin-bump
+> PR #1681 does not change it (its own `hrx_build` fails at 9m15s while `build` is green). Measured on five unrelated branches
+> and on the last eight runs of this workflow, all failures. Until the fork is fixed, read `hrx_build` as **unavailable**, not as
+> failing: a red run says nothing about the change under it, and there is no green run left to compare against. It is the same
+> shape as #1595 in the opposite direction — a red job nobody can act on stops being a check.
+
 ## What it checks
 
 `scripts/hw-gate.sh` builds this checkout's HRX pair (`third_party/llama.cpp` and

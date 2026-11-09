@@ -258,6 +258,9 @@ add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_te
 # of a ticket (ticket → shell → runner → server): `pkill -P` reaches one level, so the process holding the memory
 # outlived the ticket. Drives scripts/gpu-hold with a wrapper → mid → work chain and asserts the deepest one dies.
 add_test(NAME gpu_hold_tree COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_tree_test.sh)
+# engine#1650: a hold ends itself when the box runs out of memory, before the kernel picks a victim — the 11-08/09
+# failure where an unbudgeted GPU run took the box to 0.7 GiB and the OOM killer chose the PR-agent LLM.
+add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_mem_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
 # engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
 # queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a

@@ -1,0 +1,54 @@
+From 8e534a83cf6aabce8a6ab154630ff3fa3bd25c7c Mon Sep 17 00:00:00 2001
+From: pi-rlk <rlk@1bit.gg>
+Date: Mon, 9 Nov 2026 19:01:39 -0400
+Subject: [PATCH] accel/amdxdna: a context that failed to restart stays paused
+
+---
+ drivers/accel/amdxdna/aie2_ctx.c | 15 +++++++++++++--
+ drivers/accel/amdxdna/aie2_tdr.c |  4 +++-
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index 6b8653a..75bc573 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -204,8 +204,19 @@ int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx)
+ 	}
+ 
+ out:
+-	XDNA_DBG(xdna, "%s restarted, ret %d", hwctx->name, ret);
+-	aie2_hwctx_job_unpause(hwctx);
++	/*
++	 * Only a context that actually came back may take work.  Unpausing on the
++	 * failure path submitted jobs to a context firmware no longer has, and the
++	 * only visible symptom was an NPU that had "restarted" and then silently
++	 * stopped answering (engine#1750).  A context that failed stays paused, so
++	 * its jobs get a clean, attributable failure instead of a wedge.
++	 */
++	if (!ret) {
++		XDNA_DBG(xdna, "%s restarted", hwctx->name);
++		aie2_hwctx_job_unpause(hwctx);
++	} else {
++		XDNA_DBG(xdna, "%s restart failed, left paused, ret %d", hwctx->name, ret);
++	}
+ 	return ret;
+ }
+ 
+diff --git a/drivers/accel/amdxdna/aie2_tdr.c b/drivers/accel/amdxdna/aie2_tdr.c
+index fdf85de..fbe9a86 100644
+--- a/drivers/accel/amdxdna/aie2_tdr.c
++++ b/drivers/accel/amdxdna/aie2_tdr.c
+@@ -135,7 +135,9 @@ static int aie2_tdr_resume_hwctx(struct amdxdna_hwctx *hwctx, void *arg)
+ 		 */
+ 		rarg->skipped++;
+ 	} else if (ret) {
+-		XDNA_ERR(rarg->xdna, "%s restart failed, ret %d", hwctx->name, ret);
++		/* aie2_hwctx_restart() left it paused when it failed: it is counted as
++		 * failed here, and must not be unpaused by a retry either. */
++		XDNA_ERR(rarg->xdna, "%s restart failed, left paused, ret %d", hwctx->name, ret);
+ 		rarg->failed = true;
+ 	}
+ 
+-- 
+2.53.0
+

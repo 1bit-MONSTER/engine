@@ -746,6 +746,93 @@ DeclaredMap read_declared(const std::string& pack_dir) {
     return out;
 }
 
+
+}  // namespace: read_embedding_component is declared in pack_import.h so a test can drive it
+
+// ── the embedding component ───────────────────────────────────────────────────
+// A hybrid pack keeps its embedding table in its OWN graph: `embedding.onnx` (+ `embedding.onnx.data`) holds
+// `language_model.embed_tokens.weight_Q4` [V, H/2] UINT8 and `..._weight_scales` [V, groups] FLOAT, gathered by
+// `GatherBlockQuantized`. The main graph then has no `model.embed_tokens.weight` at all, which is what the importer
+// used to refuse on (measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: 151936 x 1280 UINT8 + 151936 x 20 FLOAT,
+// i.e. 4-bit, group 128, hidden 2560; engine #1503).
+//
+// Returns [V, H] f32 (row-major), empty when the pack has no such component. Everything it needs already existed:
+// walk_graph() reads the graph with its external-data declarations, decode_matmulnbits() is block-parameterised, and
+// the scale-per-32-column-group layout is the container's own.
+std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why) {
+    const std::string gpath = pack_dir + "/embedding.onnx";
+    std::error_code ec;
+    if (!fs::is_regular_file(gpath, ec)) { if (why) *why = "no embedding.onnx"; return {}; }
+    // parse_onnx() unwraps the ModelProto's graph field and walks it; walk_graph() alone expects the GRAPH protobuf,
+    // which is why handing it the whole file yields zero tensors.
+    OnnxModel em;
+    try {
+        em = parse_onnx(gpath);
+    } catch (const std::exception& e) {
+        if (why) *why = e.what();
+        return {};
+    }
+    const OnnxTensor* table = nullptr;
+    const OnnxTensor* scales = nullptr;
+    for (const auto& t : em.tensors) {
+        const bool emb = t.name.find("embed_tokens") != std::string::npos;
+        if (!emb) continue;
+        if (t.name.find("scale") != std::string::npos) scales = &t;
+        else if (t.name.size() > 3 && t.name.compare(t.name.size() - 3, 3, "_Q4") == 0) table = &t;
+        else if (!table && t.dims.size() == 2) table = &t;   // an unquantised [V, H] table
+    }
+    if (!table || !scales) { if (why) *why = "embedding.onnx has no embed_tokens table + scales"; return {}; }
+    if (table->dims.size() != 2 || scales->dims.size() != 2) { if (why) *why = "embed_tokens dims are not 2-D"; return {}; }
+    const int64_t V = table->dims.at(0), packed = table->dims.at(1), groups = scales->dims.at(1);
+    if (V <= 0 || packed <= 0 || groups <= 0) { if (why) *why = "embed_tokens dims are not positive"; return {}; }
+    const int64_t H = packed * 2;                       // 4-bit: two codes per byte
+    if (H % groups || (H / groups) % 32) { if (why) *why = "embed_tokens group " + std::to_string(H / groups) + " is not a multiple of 32"; return {}; }
+    // the component's own external data, bounds-checked the same way the main graph's is
+    std::map<std::string, const uint8_t*> ext;
+    std::map<std::string, size_t> ext_size;
+    for (const OnnxTensor* t : {table, scales}) {
+        if (t->location.empty() || ext.count(t->location)) continue;
+        size_t sz = 0;
+        std::string w2;
+        const uint8_t* m = map_file(pack_dir + "/" + t->location, sz, &w2);
+        if (!m) { if (why) *why = w2; return {}; }
+        ext[t->location] = m;
+        ext_size[t->location] = sz;
+    }
+    auto get = [&](const OnnxTensor& t, uint64_t need) -> const uint8_t* {
+        const auto it = ext.find(t.location);
+        if (it == ext.end()) throw std::runtime_error(t.name + ": no data");
+        if (!ext_range_ok(ext_size[t.location], t.offset, t.length))
+            throw std::runtime_error(t.name + ": external data past the end of " + t.location);
+        if (need > t.length)
+            throw std::runtime_error(t.name + ": needs " + std::to_string(need) + " B, declares " +
+                                     std::to_string(t.length));
+        return it->second + t.offset;
+    };
+    const uint64_t n_scales = uint64_t(V) * uint64_t(groups);
+    if (scales->type != kF32) { if (why) *why = "embed_tokens scales are not f32"; return {}; }
+    const uint8_t* sc = get(*scales, n_scales * 4);
+    const uint8_t* qw = get(*table, uint64_t(V) * uint64_t(packed));
+    const int block = int(H / groups);
+    // Two conventions, both settled against ONNX Runtime running this pack's own embedding.onnx rather than assumed:
+    // the first element of a pair is the LOW nibble (`swap_nibbles = false`), and the codes are **asymmetric int4 with
+    // zero point 8**, i.e. value = (code - 8) * scale. Measured on token 1 of
+    // amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: low-first + zp 8 reproduces ORT's row with cosine 1.000000 and max|d| 0,
+    // while low-first + zp 0 gives cosine 0.317 and either high-first variant gives ~-0.05.
+    const int zp = 8;                     // 2^(bits-1) for GatherBlockQuantized's unsigned 4-bit codes
+    const Q4 q = decode_matmulnbits(qw, reinterpret_cast<const float*>(sc), nullptr, int(V), int(H), block, false, true);
+    std::vector<float> out(size_t(V) * size_t(H));
+    for (int64_t v = 0; v < V; ++v)
+        for (int64_t k = 0; k < H; ++k) {
+            const size_t gi = size_t(v) * size_t(H / 32) + size_t(k) / 32;
+            out[size_t(v) * size_t(H) + size_t(k)] =
+                float(int(q.codes[size_t(v) * size_t(H) + size_t(k)]) - zp) * q.scale[gi];
+        }
+    return out;
+}
+
+namespace {
+
 // ── the pack's geometry, from wherever this generation put it ────────────────
 // Ryzen AI 1.6 ships `config.json = {}` and 1.7/1.7.1 ship **no config.json at all**; all of them carry
 // genai_config.json with the decoder block. So the geometry comes from config.json when it is usable and from
@@ -1514,11 +1601,26 @@ Plan plan(const std::string& pack_dir) {
     const OnnxTensor* embed = nullptr;
     for (const auto& t : onnx.tensors)
         if (t.name == "model.embed_tokens.weight") embed = &t;
-    if (!embed) throw std::runtime_error("the pack has no model.embed_tokens.weight");
-    if (d.vocab == 0) p.dims.vocab = int(embed->dims.at(0));
-    const int64_t H = embed->dims.at(1);
-    p.tensors.push_back(make("model.embed_tokens.weight", embed->location, "BF16",
-                             {embed->dims.at(0), H}));
+    if (!embed) {
+        // A hybrid pack keeps the table in its own graph; if that component is there, this pack HAS an embedding and the
+        // refusal below would be wrong about it.
+        std::string emb_why;
+        const std::vector<float> comp = read_embedding_component(pack_dir, &emb_why);
+        if (comp.empty())
+            throw std::runtime_error("the pack has no model.embed_tokens.weight, and " + emb_why);
+        const int64_t Vc2 = d.vocab > 0 ? d.vocab : 0, Hc2 = d.hidden > 0 ? d.hidden : 0;
+        if (d.vocab == 0 || d.hidden == 0)
+            throw std::runtime_error("the pack's embedding comes from embedding.onnx but the geometry does not give V/H");
+        if (comp.size() != size_t(Vc2) * size_t(Hc2))
+            throw std::runtime_error("embedding.onnx carries " + std::to_string(comp.size()) + " values, not V*H = " +
+                                     std::to_string(int64_t(Vc2) * Hc2));
+        p.tensors.push_back(make("model.embed_tokens.weight", "embedding.onnx", "BF16", {Vc2, Hc2}));
+    }
+    if (embed) {
+        if (d.vocab == 0) p.dims.vocab = int(embed->dims.at(0));
+        p.tensors.push_back(make("model.embed_tokens.weight", embed->location, "BF16",
+                                 {embed->dims.at(0), embed->dims.at(1)}));
+    }
 
     for (const auto& mm : onnx.matmuls) {
         const auto it = onnx.index.find(mm.weight);
@@ -1539,6 +1641,7 @@ Plan plan(const std::string& pack_dir) {
     // refusal here is empty and import_pack reports what the anchors actually found.
     const std::string norm_source = "fconst:Llm_Token_Token";
     const std::string norm_refusal;
+    const int64_t H = d.hidden;   // the geometry's hidden; the embedding, when the main graph has none, must match it
     // Genre A: the norms are ordinary F16 initializers named after themselves, with real offsets -- not the
     // .fconst tail envelope -- so the refusal names the initializer and where it sits.
     auto graph_norm_refusal = [&](const std::string& name) -> std::string {
@@ -2060,19 +2163,38 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     const OnnxTensor* embed = nullptr;
     for (const auto& t : onnx.tensors)
         if (t.name == "model.embed_tokens.weight") embed = &t;
-    if (!embed) throw std::runtime_error("no model.embed_tokens.weight");
-    if (embed->dims.size() != 2) throw std::runtime_error("model.embed_tokens.weight is not 2-D");
-    const int64_t V = embed->dims.at(0), H = embed->dims.at(1);
-    const uint64_t Vc = dim_count("model.embed_tokens.weight", V), Hc = dim_count("model.embed_tokens.weight", H);
-    uint64_t elems = 0;
-    if (!mul_ok(Vc, Hc, elems)) throw std::runtime_error("model.embed_tokens.weight: V*H overflows");
-    const uint64_t src_width = embed->type == kF32 ? 4 : 2;
-    uint64_t embed_need = 0;
-    if (!mul_ok(elems, src_width, embed_need))
-        throw std::runtime_error("model.embed_tokens.weight: V*H*width overflows");
-    const uint8_t* embed_bytes = bytes_of(*embed, embed_need);
-    w.add("model.embed_tokens.weight", "BF16", {V, H}, as_bf16(embed_bytes, embed->type, size_t(elems)));
-    ++r.tensors;
+    if (embed && embed->dims.size() != 2) throw std::runtime_error("model.embed_tokens.weight is not 2-D");
+    // V/H are read further down for the tied-head and vocab checks, so they exist whether the table came from the main
+    // graph or from the embedding component (where the geometry states them instead).
+    const int64_t V = embed ? embed->dims.at(0) : int64_t(p.dims.vocab);
+    const int64_t H = embed ? embed->dims.at(1) : int64_t(p.dims.hidden);
+    // The container takes BF16, and the tied-head self-check reads these same bytes, so convert once into a buffer that
+    // outlives both. For the component path the source is f32 that the reader already dequantised.
+    std::vector<uint8_t> embed_bf16;
+    const uint8_t* embed_bytes = nullptr;
+    {
+        const uint64_t Vc = dim_count("model.embed_tokens.weight", V), Hc = dim_count("model.embed_tokens.weight", H);
+        uint64_t elems = 0;
+        if (!mul_ok(Vc, Hc, elems)) throw std::runtime_error("model.embed_tokens.weight: V*H overflows");
+        if (embed) {
+            const uint64_t src_width = embed->type == kF32 ? 4 : 2;
+            uint64_t embed_need = 0;
+            if (!mul_ok(elems, src_width, embed_need))
+                throw std::runtime_error("model.embed_tokens.weight: V*H*width overflows");
+            embed_bf16 = as_bf16(bytes_of(*embed, embed_need), embed->type, size_t(elems));
+        } else {
+            std::string emb_why;
+            const std::vector<float> comp = read_embedding_component(pack_dir, &emb_why);
+            if (comp.empty()) throw std::runtime_error("no model.embed_tokens.weight, and " + emb_why);
+            if (comp.size() != size_t(elems))
+                throw std::runtime_error("embedding.onnx carries " + std::to_string(comp.size()) + " values, not V*H = " +
+                                         std::to_string(elems));
+            embed_bf16 = as_bf16(reinterpret_cast<const uint8_t*>(comp.data()), kF32, size_t(elems));
+        }
+        embed_bytes = embed_bf16.data();
+        w.add("model.embed_tokens.weight", "BF16", {V, H}, embed_bf16);
+        ++r.tensors;
+    }
 
     // genre A = the graph carries real weights and there is no .fconst to read (the same test plan() uses)
     auto has_real_graph_weight = [&]() {

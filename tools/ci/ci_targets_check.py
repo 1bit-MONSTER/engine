@@ -118,6 +118,31 @@ def ci_targets(ci_text):
 ADD_EXE = re.compile(r"^\s*add_executable\s*\(\s*([A-Za-z0-9_.+-]+)", re.IGNORECASE)
 ADD_TEST = re.compile(r"^\s*add_test\s*\(\s*NAME\s+([A-Za-z0-9_.+-]+)\s+COMMAND\s+(.*)$", re.IGNORECASE)
 BASELINE = "tools/ci/add_test_gaps.txt"
+# `add_dependencies(<target> <dep>…)`: the second way a target gets built (engine#1595 review).
+ADD_DEPS = re.compile(r"add_dependencies\s*\(\s*([A-Za-z0-9_.+-]+)([^)]*)\)", re.IGNORECASE)
+
+
+def build_closure(cmake_text, listed):
+    """`listed`, plus every target reachable from it through `add_dependencies`.
+
+    `ci.yml`'s `--target` list is not the only way a target gets built: this tree documents
+    `add_dependencies(onebit onebit_npu_forward_syntax)` precisely so a gate target is compiled without being
+    named on the command line, and the comment there says why ("a check that depends on the order of another
+    step's target list is the kind that goes quiet when that list is edited"). A `have` that reads only the
+    list calls every such test "never built", so the first PR to use the documented hook reds direction B.
+    """
+    deps = {}
+    for m in ADD_DEPS.finditer(cmake_text):
+        for d in m.group(2).split():
+            if re.fullmatch(r"[A-Za-z0-9_.+-]+", d):
+                deps.setdefault(m.group(1), set()).add(d)
+    built, frontier = set(listed), list(listed)
+    while frontier:
+        for d in deps.get(frontier.pop(), ()):
+            if d not in built:
+                built.add(d)
+                frontier.append(d)
+    return built
 
 
 def add_test_blocks(cmake_text):
@@ -327,7 +352,8 @@ def check(root):
 
     # ── direction B (engine#1595): a test whose target CI never builds reports "Not Run" ──────────────
     need = add_test_need(cmake_text)
-    drift = set(need) - set(names)
+    # `built`, not `names`: add_dependencies is the tree's documented second route (see build_closure).
+    drift = set(need) - build_closure(cmake_text, names)
     baseline = read_baseline(os.path.join(root, BASELINE))
     if baseline is None:
         # No baseline is not "nothing known": treating it as empty would let the first run of a run
@@ -447,6 +473,19 @@ add_test(NAME unbuilt_suite COMMAND unbuilt_test)
     case("a script test (COMMAND bash …) adds nothing to the drift",
          B_CI, SELF_CMAKE + "add_test(NAME script_suite COMMAND bash ${CMAKE_SOURCE_DIR}/x.sh --self-test)\n",
          0, baseline="")
+    # engine#1595 review: a target CI builds only through `add_dependencies` is built, so its test does not drift.
+    D_CMAKE = B_CMAKE + """
+add_executable(hoisted_test hoisted.cpp)
+add_test(NAME hoisted_suite COMMAND hoisted_test)
+add_dependencies(onebit hoisted_test)
+"""
+    case("a target built through add_dependencies is not drift, so its test passes",
+         B_CI, D_CMAKE, 0, baseline="unbuilt_test\n")
+    case("the same tree without the add_dependencies line drifts that test, naming it",
+         B_CI, B_CMAKE + """
+add_executable(hoisted_test hoisted.cpp)
+add_test(NAME hoisted_suite COMMAND hoisted_test)
+""", 1, baseline="unbuilt_test\n")
     # And the clean case.
     case("a plain target list passes",
          SELF_CI.replace("hidden_test ", ""), SELF_CMAKE, 0)

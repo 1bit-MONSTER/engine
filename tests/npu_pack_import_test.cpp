@@ -326,6 +326,44 @@ void test_external_packed_genre(const std::string& root) {
 // "<tensor>.qweight.empty: no data", which reports a placeholder as though the bytes were absent rather than elsewhere.
 // Crafted, so this needs no 1.9 pack: a graph with one resolvable tensor, one MatMulNBits whose qweight input is a
 // `.empty` placeholder with no sibling, and a model.bin next to it.
+// engine#1662: the ~291 MB canonical Token .fconst rewrite is skipped when the copy on the scratch path already holds
+// exactly the bytes this run would write. The decision is a length test against a length that is a function of the source
+// alone, so what can go wrong is the test being too willing -- a truncated copy from an interrupted run, a leftover
+// directory, a copy from a bigger pack. Those are the arms.
+void test_canonical_copy_reusable() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-reuse-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    auto write = [&](const fs::path& f, size_t n) {
+        std::ofstream o(f, std::ios::binary | std::ios::trunc);
+        const std::string blob(n, 'x');
+        o.write(blob.data(), std::streamsize(blob.size()));
+    };
+    const int64_t want = 4096;
+
+    write(dir / "complete.fconst", size_t(want));
+    check(pi::canonical_copy_reusable((dir / "complete.fconst").string(), want),
+          "reuse: a copy of exactly the expected length is reused");
+    write(dir / "short.fconst", size_t(want) - 1);
+    check(!pi::canonical_copy_reusable((dir / "short.fconst").string(), want),
+          "reuse: a truncated copy is rewritten, not trusted (interrupted run)");
+    write(dir / "long.fconst", size_t(want) + 1);
+    check(!pi::canonical_copy_reusable((dir / "long.fconst").string(), want),
+          "reuse: a longer copy (another pack) is not reused");
+    check(!pi::canonical_copy_reusable((dir / "absent.fconst").string(), want), "reuse: a missing copy is not reused");
+    fs::create_directories(dir / "a-directory");
+    check(!pi::canonical_copy_reusable((dir / "a-directory").string(), want),
+          "reuse: a directory on the scratch path is not reused");
+    check(!pi::canonical_copy_reusable((dir / "complete.fconst").string(), 0),
+          "reuse: a non-positive expected length never reuses");
+    write(dir / "empty.fconst", 0);
+    check(!pi::canonical_copy_reusable((dir / "empty.fconst").string(), 1),
+          "reuse: an empty copy is not the canonical form of a non-empty body");
+    fs::remove_all(dir, ec);
+    std::printf("  canonical copy reuse: 7 arms (complete/truncated/long/absent/directory/zero-length/empty)\n");
+}
+
 void test_modelbin_genre_refusal(const std::string& root) {
     const fs::path dir = fs::path(root) / "crafted-modelbin";
     fs::remove_all(dir);
@@ -2168,6 +2206,7 @@ int main(int argc, char** argv) {
                     "these packs and not an OGA NPU pack this importer reads\n", pack.c_str());
     try {
         test_bounds();
+        test_canonical_copy_reusable();
         test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);

@@ -67,6 +67,16 @@ def attn_payload_off(hidden):
     return K_NORM_OFF + hidden * 2
 
 
+def head_offset(fconst_bytes, ntiles, tile):
+    """Where the tied head's grid starts: the LAST `ntiles * tile` bytes. Not `attn_payload_off(H)`.
+
+    engine#1693 read it from `attn_payload_off(H)` and got corr 0.885; the `.fconst` carries the per-layer payload
+    first and ends with the head, and at this offset the same decode correlates 1.0000 with the pack's own fp16
+    embedding with a magnitude ratio of 1.000 (rel_err 0.0007 over four tiles on `Qwen2.5-0.5B-Instruct_rai_1.9.0_npu`).
+    """
+    return fconst_bytes - ntiles * tile
+
+
 def bf16_to_f32(codes):
     """bf16_to_f32: the 16-bit pattern is the f32 word's high half."""
     return np.frombuffer((np.asarray(codes, np.uint16).astype(np.uint32) << 16).tobytes(), np.float32)
@@ -160,11 +170,16 @@ def measure(pack, tiles_wanted):
     if tile == 0 or vocab % K_TILE_ROWS:
         return None, 2, "H %d is not a multiple of %d" % (hidden, K_KBLOCK)
     need = env + ntiles * tile
+    # WHERE the head is: the LAST `ntiles * tile` bytes, not the region after `env`. The `.fconst` carries the
+    # per-layer payload first and ends with the tied head's grid, so `env` addresses the wrong bytes by the whole
+    # payload (engine#1693: at `env` the decode correlates at chance; at `size - ntiles*tile` it correlates 1.0000
+    # with the pack's own fp16 embedding and its magnitude ratio is 1.000).
+    base = head_offset(size, ntiles, tile)
     rows = []
-    status = 0 if need <= size else 3
+    status = 0 if base >= 0 else 3
     with open(path, "rb") as f:
         for t in range(min(tiles_wanted, ntiles)):
-            f.seek(env + t * tile)
+            f.seek(base + t * tile)
             buf = f.read(tile)
             if len(buf) != tile:
                 break
@@ -178,11 +193,11 @@ def measure(pack, tiles_wanted):
     out = {
         "pack": os.path.basename(os.path.abspath(pack)),
         "vocab": vocab, "hidden": hidden,
-        "geometry": {"env": env, "tile_bytes": tile, "tiles": ntiles, "tail_bytes": need,
+        "geometry": {"env": env, "head_off": base, "tile_bytes": tile, "tiles": ntiles, "tail_bytes": need,
                      "fconst_bytes": size,
                      "int4_ratio": (ntiles * tile) / (vocab * hidden / 2.0) if vocab * hidden else 0.0,
                      "tile_ratio": tile / (K_TILE_ROWS * hidden / 2.0) if hidden else 0.0,
-                     "tail_fits": need <= size},
+                     "tail_fits": base >= 0},
         "tiles_measured": rows,
     }
     return out, status, None
@@ -203,15 +218,15 @@ def main(argv):
         print(json.dumps(out, indent=2))
         return status
     print("%s: V %d H %d" % (out["pack"], out["vocab"], out["hidden"]))
-    print("  tail: env %d + %d tiles x %d B = %d B of %d B (fits: %s)"
-          % (g["env"], g["tiles"], g["tile_bytes"], g["tail_bytes"], g["fconst_bytes"], g["tail_fits"]))
+    print("  head: the last %d tiles x %d B of %d B, so at %d (env-only base %d is the pre-head payload)"
+          % (g["tiles"], g["tile_bytes"], g["fconst_bytes"], g["head_off"], g["env"]))
     print("  int4 ratio %.4f, per-tile ratio %.4f (equal means the surplus is the envelope, not extra tensors)"
           % (g["int4_ratio"], g["tile_ratio"]))
     for r in out["tiles_measured"]:
         print("  tile %4d  corr %+0.4f  rel_err %0.4f  |w|/|ref| %0.4f"
               % (r["tile"], r["corr"], r["rel_err"], r["abs_ratio"]))
     if status == 3:
-        print("  the tail does not fit the .fconst: the numbers above describe other bytes", file=sys.stderr)
+        print("  the head grid is larger than the .fconst: the numbers above describe other bytes", file=sys.stderr)
     return status
 
 

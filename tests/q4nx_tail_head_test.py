@@ -67,6 +67,12 @@ def main():
     per_tile = T.attn_tile_bytes(H) / (T.K_TILE_ROWS * H / 2.0)
     check(abs(whole - per_tile) < 1e-12, "whole-tail int4 ratio %.6f == per-tile ratio %.6f" % (whole, per_tile))
 
+    # ── the head's offset rule: the last grid, not the region after env (engine#1693's 0.885 was an env-based read)
+    check(T.head_offset(291655296, 2374, 34816) == 209002112, "head_offset is fconst_bytes - ntiles*tile")
+    check(T.head_offset(291655296, 2374, 34816) + 2374 * 34816 == 291655296, "the head grid ends exactly at EOF")
+    check(T.head_offset(291655296, 2374, 34816) != T.attn_payload_off(896),
+          "the head's offset is not attn_payload_off(H) -- the mistake engine#1693 records")
+
     # ── the envelope decoder, against the vendor tile ──
     with open(GOLDEN + ".json") as f:
         meta = json.load(f)

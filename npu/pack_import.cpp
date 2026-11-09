@@ -146,6 +146,19 @@ struct OnnxModel {
     int64_t packed_siblings = 0;
 };
 
+// A placeholder states its length as zero rather than stating nothing: a real pack's `...qweight.empty` is dims [0]
+// (a 1-D tensor of no elements), not a dimensionless scalar. Both spellings mean "no bytes here", and a reader that
+// only checks `dims.empty()` calls that a real weight of length 0. File scope because two readers need the same rule
+// (engine#1671: the lm_head geometry gate had drifted to `dims.empty()` and threw `no data` out of the walk).
+bool no_bytes(const OnnxTensor& t) {
+    if (!t.dims.empty()) {
+        for (auto d : t.dims)
+            if (d != 0) return false;
+        return true;
+    }
+    return true;
+}
+
 void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
     const auto g = pb(p, n);
     for (const auto* f : fields(g, 5)) {
@@ -247,15 +260,7 @@ OnnxModel parse_onnx(const std::string& path) {
         }
         return nullptr;
     };
-    // A placeholder states its length as zero rather than stating nothing: the real pack's
-    // `...qweight.empty` is dims [0] (a 1-D tensor of no elements), not a dimensionless scalar. Both spellings mean
-    // "no bytes here", and a reader that only checks `dims.empty()` calls that a real weight of length 0.
-    const auto no_bytes = [](const OnnxTensor& t) {
-        if (t.dims.empty()) return true;
-        for (auto d : t.dims)
-            if (d != 0) return false;
-        return true;
-    };
+    using ::onebit::npu::pack_import::no_bytes;   // the same rule walk_graph used inline
     for (auto& mm : m.matmuls) {
         if (mm.weight.empty()) continue;
         const OnnxTensor* w = find_init(mm.weight);
@@ -2501,8 +2506,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // A 0-dim tensor is either a genre-A *placeholder* (nothing beside it: no location, no length -- the
             // packs ship one next to every real weight) or an OVERSTATED qweight that declares bytes it does not
             // carry. Only the second is a refusal; the first is simply not this node's weight.
-            if (wt.dims.empty() && wt.location.empty() && wt.length == 0 && wt.raw == nullptr)
-                continue;   // a genre-A placeholder: nothing beside it, so it is not this node's weight
+            if (no_bytes(wt) && wt.location.empty() && wt.length == 0 && wt.raw == nullptr)
+                continue;   // a genre-A placeholder, `[0]` dims or a dimensionless scalar: not this node's weight
             // else: fall through -- a 0-dim tensor that DOES declare data is legitimate when the byte count
             // matches the geometry (the crafted tests carry both shapes), and bytes_of() below is what decides.
             if (mm.bits != 4)

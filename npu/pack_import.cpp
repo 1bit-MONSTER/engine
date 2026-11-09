@@ -1698,7 +1698,14 @@ Plan plan(const std::string& pack_dir) {
             if (dec.block) blocks[dec.block]++;
             if (dec.bits) bits[dec.bits]++;
         }
-        if (!blocks.empty() && !(blocks.size() == 1 && blocks.begin()->first == kKBlock))
+        // ...but only where the weights really come from the .fconst. A no-fconst pack keeps them as the graph's own
+        // initializers (external data), and there the block size is a property of the quantised TABLE, which
+        // decode_matmulnbits() already parameterises (`gpb = block/32`, `bpb = block/2`, one scale per block) and the
+        // container's Q4 chunks are per-32-column groups. Measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: 253
+        // MatMulNBits ops, all block_size 32, no fconst at all -- refused by this gate for a reason ("every subvolume
+        // offset in the .fconst moves") that cannot apply to a pack with no .fconst. engine#1503.
+        const bool fconst_weights = !resolve_token_fconst(pack_dir, d).empty();
+        if (fconst_weights && !blocks.empty() && !(blocks.size() == 1 && blocks.begin()->first == kKBlock))
             throw std::runtime_error(
                 "this pack's MatMulNBits block size along K is " + [&] {
                     std::string t;

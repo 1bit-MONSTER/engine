@@ -1234,6 +1234,31 @@ const char* external_role_of(const std::string& tensor_name) {
     return nullptr;
 }
 
+bool external_container_tensors(const std::string& role, int nh, int nkv, int hd, std::vector<ContainerTensor>& out,
+                                std::string& err) {
+    out.clear();
+    if (role == "QKV") {
+        if (nh <= 0 || nkv <= 0 || hd <= 0) {
+            err = "QKV split: the geometry states no head count (nh " + std::to_string(nh) + ", nkv " +
+                  std::to_string(nkv) + ", hd " + std::to_string(hd) + ")";
+            return false;
+        }
+        const int q = nh * hd, kv = nkv * hd;
+        out.push_back({"self_attn.q_proj.weight", 0, q});
+        out.push_back({"self_attn.k_proj.weight", q, q + kv});
+        out.push_back({"self_attn.v_proj.weight", q + kv, q + 2 * kv});
+        return true;
+    }
+    if (role == "O") { out.push_back({"self_attn.o_proj.weight", 0, 0}); return true; }
+    if (role == "G") { out.push_back({"mlp.gate_proj.weight", 0, 0}); return true; }
+    if (role == "U") { out.push_back({"mlp.up_proj.weight", 0, 0}); return true; }
+    if (role == "D") { out.push_back({"mlp.down_proj.weight", 0, 0}); return true; }
+    if (role == "HEAD") { out.push_back({"lm_head.weight", 0, 0}); return true; }
+    err = "external role \"" + role + "\" has no container tensor in this forward (a weight with nowhere to go is a "
+          "refusal, not a silent drop)";
+    return false;
+}
+
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
     Q4 q = pack;   // same codes, same geometry
     long long inexact = 0;

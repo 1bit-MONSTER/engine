@@ -289,6 +289,20 @@ Q4 container_from_external_q4(const Q4& pack, long long* m_inexact = nullptr);
 // because a projection nothing maps is a weight that would silently not be written (engine#1503).
 const char* external_role_of(const std::string& tensor_name);
 
+// Where a pack projection's rows go in the container: the container stores `self_attn.q_proj.weight` and its
+// siblings separately (only a GDN layer has a fused `linear_attn.qkv_proj.weight`), while the pack stores q/k/v as
+// ONE matmul -- phi-4's is N 7680 with 40 heads x 128 (q 5120) and 10 kv heads x 128 (k 1280, v 1280). So a role
+// is one container tensor except "QKV", which is three with row ranges taken from the geometry the pack states.
+// Names are the forward's own (`self_attn.{q,k,v,o}_proj.weight`, `mlp.{gate,up,down}_proj.weight`,
+// `lm_head.weight`), read from npu/forward/src/q4nx_forward.cpp rather than invented.
+struct ContainerTensor {
+    std::string suffix;   // relative to `model.layers.<L>.`, or a model-level name for HEAD
+    int row_lo = 0, row_hi = 0;   // rows of the pack's matmul this tensor takes (its own N when split is 1)
+};
+// False + `err` for a role with no container home (the caller must then refuse rather than drop the weights).
+bool external_container_tensors(const std::string& role, int nh, int nkv, int hd, std::vector<ContainerTensor>& out,
+                                std::string& err);
+
 Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err,
                         bool row_major = kExtQuantsRowMajor);
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,

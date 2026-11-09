@@ -344,6 +344,34 @@ void test_external_roles() {
           "external role: an unknown suffix is not guessed");
 }
 
+// The assembly's naming half (engine#1503): the container stores q/k/v separately while the pack stores them as one
+// matmul, so the split is geometry, not a guess. phi-4's qkv is N 7680 = 40 heads x 128 (q) + 2 x 10 kv heads x 128.
+void test_external_container_names() {
+    std::vector<pi::ContainerTensor> t;
+    std::string err;
+    check(pi::external_container_tensors("QKV", 40, 10, 128, t, err) && t.size() == 3,
+          "container names: QKV splits into three tensors");
+    check(t.size() == 3 && t[0].suffix == "self_attn.q_proj.weight" && t[0].row_lo == 0 && t[0].row_hi == 5120,
+          "container names: q takes rows [0, nh*hd)");
+    check(t.size() == 3 && t[1].suffix == "self_attn.k_proj.weight" && t[1].row_lo == 5120 && t[1].row_hi == 6400,
+          "container names: k follows q, nkv*hd rows");
+    check(t.size() == 3 && t[2].suffix == "self_attn.v_proj.weight" && t[2].row_lo == 6400 && t[2].row_hi == 7680,
+          "container names: v closes the range, which must equal the pack's N exactly");
+    for (const char* role : {"O", "G", "U", "D", "HEAD"}) {
+        std::vector<pi::ContainerTensor> one;
+        std::string e2;
+        check(pi::external_container_tensors(role, 40, 10, 128, one, e2) && one.size() == 1,
+              std::string("container names: ") + role + " is one tensor");
+    }
+    std::vector<pi::ContainerTensor> bad;
+    std::string e3;
+    check(!pi::external_container_tensors("MOE_EXPERT", 40, 10, 128, bad, e3) && !e3.empty(),
+          "container names: a role with no container tensor is refused, naming it (" + e3 + ")");
+    std::string e4;
+    check(!pi::external_container_tensors("QKV", 0, 0, 0, bad, e4) && e4.find("geometry") != std::string::npos,
+          "container names: a QKV split with no geometry is refused by name");
+}
+
 void test_external_packed_genre(const std::string& root) {
     const fs::path dir = fs::path(root) / "external-packed";
     fs::remove_all(dir);
@@ -2263,6 +2291,7 @@ int main(int argc, char** argv) {
         test_external_tile_decode();
     test_external_to_container();
     test_external_roles();
+    test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);

@@ -850,6 +850,41 @@ namespace {
 // genai_config.json otherwise. Every refusal names the key it needed and the file it looked in, because a
 // nlohmann exception out of a loader ("key hidden_size not found", "type must be string, but is null") is a bug
 // report, not a diagnosis -- pi-inferzo's item 3.
+// ── the multi-component packs: geometry under model_config.json ─────────────────────────────────
+// The gemma-4 1.9 packs ship `config.json = {}` and a genai_config decoder block that stops at
+// num_key_value_heads/head_size, so the third value read_dims() needs -- intermediate_size -- is stated nowhere
+// those two files are read from, and the importer refused with "the pack states no intermediate_size". It is one
+// file over: model_config.json keeps the text tower under config.model_attributes.text_config.
+//   amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: 1536 hidden, 35L, 8 heads, 1 kv, head_dim 256, IM 6144, vocab 262144
+//   amd/gemma-4-12B-it_rai_1.9.0_npu:            3840 hidden, 48L, 16 heads, 8 kv, head_dim 256, IM 15360, vocab 262144
+// (measured 2026-11-09 on both packs' own JSON). `type: compositemodel` says what the file is; the text tower is
+// the decoder this importer builds, so its keys fill gaps and never override a value already resolved -- the same
+// rule the hybrid text_config lift uses. Returns how many keys it added, so the caller can name the source.
+static int fill_from_model_config_impl(const std::string& pack_dir, json& cfg) {
+    std::ifstream f(pack_dir + "/model_config.json");
+    if (!f) return 0;
+    json mc;
+    try { mc = json::parse(f); } catch (...) { return 0; }
+    if (!mc.is_object()) return 0;
+    const json* attrs = nullptr;
+    if (mc.contains("config") && mc["config"].is_object() && mc["config"].contains("model_attributes") &&
+        mc["config"]["model_attributes"].is_object()) {
+        attrs = &mc["config"]["model_attributes"];
+    } else if (mc.contains("model_attributes") && mc["model_attributes"].is_object()) {
+        attrs = &mc["model_attributes"];
+    }
+    if (!attrs) return 0;
+    const json* tower = attrs;
+    if (attrs->contains("text_config") && (*attrs)["text_config"].is_object()) tower = &(*attrs)["text_config"];
+    int added = 0;
+    for (auto it = tower->begin(); it != tower->end(); ++it) {
+        if (cfg.contains(it.key()) || it.value().is_null()) continue;
+        cfg[it.key()] = it.value();
+        ++added;
+    }
+    return added;
+}
+
 json load_geometry(const std::string& pack_dir, std::string* source) {
     auto readable_object = [](const std::string& path, json& out) {
         std::ifstream f(path);
@@ -866,6 +901,7 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
             for (const char* k : {"rope_theta", "rms_norm_eps", "intermediate_size"})
                 if (!cfg.contains(k) && g.contains(k)) cfg[k] = g[k];
         }
+        if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
     }
     json g;
@@ -894,6 +930,7 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
             cfg["architectures"] = std::vector<std::string>{fam + "ForCausalLM"};
         }
         if (source) *source = "genai_config.json (decoder block)";
+        if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
     }
     if (source) *source = "neither config.json nor genai_config.json";
@@ -913,7 +950,11 @@ std::string graph_filename(const std::string& pack_dir) {
                 const json& dec = g["model"]["decoder"];
                 if (dec.contains("filename") && dec["filename"].is_string()) {
                     const std::string n = dec["filename"].get<std::string>();
-                    if (!n.empty() && n.find('/') == std::string::npos) return n;
+                    // A multi-component pack (gemma-4 1.9, `type: compositemodel`) keeps its LLM graph in a
+                    // subdirectory -- genai_config.json says `decoder/model.onnx` -- so a relative path is accepted.
+                    // Absolute paths and `..` are still refused: the name comes from the pack, and a pack must not be
+                    // able to aim the reader outside itself.
+                    if (!n.empty() && n.front() != '/' && n.find("..") == std::string::npos) return n;
                 }
             }
         } catch (...) {
@@ -971,6 +1012,9 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg) {
+    return fill_from_model_config_impl(pack_dir, cfg);
+}
 
 // engine#734: exported so the epsilon anchor itself can be tested against a crafted .fconst, without a pack.
 // The two bytes a bf16 epsilon is stored as (little-endian): round the f32 to nearest-even bf16.

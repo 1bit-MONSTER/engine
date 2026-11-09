@@ -157,7 +157,16 @@ model=${PREFLIGHT_MODEL:-$HOME/models/Qwen3-4B-Q4_K_M.gguf}
 
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
-GGML_HRX_LOG_DISPATCH=1 "$bench" -m "$model" -p "$tokens" -n 0 -ngl 99 --device HRX0 -r 3 \
+# The LOAD MODE is part of the measurement (engine #1668): `-lm none` is +17.5 % prefill at -1.6 % decode for +604 MiB of GTT on this
+# box, so a dispatch tally taken with the mode unstated is a tally of two variables. It is pinned here, printed in the header below,
+# and overridable only through PREFLIGHT_LM so a comparison sets both arms deliberately instead of inheriting a default. The value
+# set is llama-bench's own (`-lm, --load-mode <none|mmap|mlock|mmap+mlock|dio>`, tools/llama-bench/llama-bench.cpp at the pin).
+lm=${PREFLIGHT_LM:-mmap}
+case "$lm" in
+    none|mmap|mlock|mmap+mlock|dio) ;;
+    *) fatal "PREFLIGHT_LM='$lm' is not a llama-bench load mode (none|mmap|mlock|mmap+mlock|dio); the mode is part of the measurement, so it is not guessed (engine #1668)" ;;
+esac
+GGML_HRX_LOG_DISPATCH=1 "$bench" -m "$model" -p "$tokens" -n 0 -ngl 99 --device HRX0 -r 3 -lm "$lm" \
     >/dev/null 2>"$log"
 
 lines=$(grep -c 'ggml_hrx dispatch:' "$log" || true)
@@ -165,7 +174,7 @@ lines=$(grep -c 'ggml_hrx dispatch:' "$log" || true)
 # and would be read as a clean bill of health.
 [ "$lines" -eq 0 ] &&
     fatal "GGML_HRX_LOG_DISPATCH=1 produced no 'ggml_hrx dispatch:' lines; an empty tally would be a fiction"
-printf '\n  matcher decisions at pp%s (one run, -r 3):\n' "$tokens"
+printf '\n  matcher decisions at pp%s (one run, -r 3, -lm %s):\n' "$tokens" "$lm"
 grep 'ggml_hrx dispatch:' "$log" |
     sed -E 's/^.*ggml_hrx dispatch: //; s/ declined.*/ [declined]/' |
     sort | uniq -c | sort -rn | sed 's/^/    /' | head -40

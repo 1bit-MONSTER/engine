@@ -119,18 +119,46 @@ def group_of_plan(order, groups):
     return [order[i * per :(i + 1) * per] for i in range(groups) if order[i * per :(i + 1) * per]]
 
 
-def build(trace, groups, min_pairs=1):
+def fill_unseen(group_lists, total, groups):
+    """Place the experts with no co-activation evidence, so the table covers the model and not just the sample.
+
+    A decode sample does not fire every expert in every layer (on a 256- or 512-expert layer it is usually far from it),
+    so a table built only from `seen` leaves the rest of the layer unplaced and says nothing -- a consumer would either
+    skip them or index past the end. There is no affinity evidence for these, so the only defensible default is balance:
+    round-robin onto the currently smallest group, with ties going to the earlier group so the output is deterministic.
+    The count is reported per layer as `unseen`, so a layer where most of the plan is a default is visible rather than
+    mistaken for a measurement.
+    """
+    placed = {e for g in group_lists for e in g}
+    out = [list(g) for g in group_lists] + [[] for _ in range(groups - len(group_lists))]
+    for e in range(total):
+        if e not in placed:
+            min(out, key=len).append(e)
+    return [g for g in out if g]
+
+
+def build(trace, groups, min_pairs=1, experts=None):
     layers = {}
     for layer, steps in sorted(trace.items()):
         pairs = sum(len(r) * (len(r) - 1) for r in steps)
         if pairs < min_pairs:
             continue
-        n_experts = max(max(r) for r in steps) + 1
-        order = plan_layer(steps, n_experts, groups)
+        seen_max = max(max(r) for r in steps) + 1
+        if experts is not None:
+            if min(min(r) for r in steps) < 0 or seen_max > experts:
+                raise ValueError(
+                    f"layer {layer} visits expert {max(max(r) for r in steps)}, but the model has {experts} "
+                    f"(0..{experts - 1}): the trace and the model disagree, so a placement built from it would "
+                    f"put an expert id the model does not have into a group")
+            total = experts
+        else:
+            total = seen_max
+        order = plan_layer(steps, total, groups)
         if not order:
             continue
-        layers[str(layer)] = {"groups": group_of_plan(order, groups), "decode_steps": len(steps),
-                              "experts_seen": len(order)}
+        group_lists = fill_unseen(group_of_plan(order, groups), total, groups)
+        layers[str(layer)] = {"groups": group_lists, "decode_steps": len(steps), "experts": total,
+                              "experts_seen": len(order), "unseen": total - len(order)}
     return layers
 
 
@@ -188,6 +216,26 @@ def self_test():
     total = sum(len(g) for g in build(two, 16)["0"]["groups"])
     check(total == 8, f"G=16 over 8 seen experts keeps all 8 ({total})")
 
+    # A decode sample misses experts, and a table that placed only the seen ones would leave the rest of the layer
+    # unplaced while saying nothing -- so every expert in range must appear EXACTLY once, and the ones with no evidence
+    # must be counted rather than hidden.
+    partial = {0: [[0, 1, 6, 7]] * 40}          # 2..5 never fire
+    one = build(partial, 2)["0"]
+    flat = [e for g in one["groups"] for e in g]
+    check(sorted(flat) == list(range(8)) and one["unseen"] == 4,
+          f"a partial sample still covers every expert in range once ({sorted(flat)} unseen {one['unseen']})")
+    wider = build(partial, 2, experts=16)["0"]
+    flat16 = [e for g in wider["groups"] for e in g]
+    check(sorted(flat16) == list(range(16)) and wider["unseen"] == 12,
+          f"--experts 16 covers 0..15 with 12 counted unseen ({len(flat16)} placed)")
+    sizes = [len(g) for g in wider["groups"]]
+    check(max(sizes) - min(sizes) <= 1, f"evidence-less experts are balanced across groups ({sizes})")
+    try:
+        build({0: [[0, 1, 7]] * 40}, 2, experts=4)
+        check(False, "a trace that visits expert 7 of a 4-expert model is refused")
+    except ValueError as e:
+        check("expert 7" in str(e) and "4" in str(e), f"... refused by naming the id and the count ({str(e)[:40]}...)")
+
     # Prefill rows must be ignored: the report says placement is not a prefill lever, so a tool that counted them would
     # inflate its own case.
     import tempfile, os
@@ -210,6 +258,9 @@ def main():
     ap.add_argument("-g", "--groups", type=int, default=2, help="device groups (default 2: HRX + NPU)")
     ap.add_argument("-o", "--out", help="write the JSON table here (default: stdout)")
     ap.add_argument("--min-pairs", type=int, default=1, help="skip a layer with fewer than N co-activating pairs")
+    ap.add_argument("-e", "--experts", type=int,
+                    help="the model's expert count per layer: the table then covers 0..N-1 and `unseen` says how many "
+                         "were placed by balance alone. Default: the highest expert id the trace visits (a partial table)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
@@ -223,7 +274,14 @@ def main():
         print("moe_placement: no decode rows in the trace (a 'P'-only trace is a prefill run, which placement does not "
               "help -- see engine#1702 §3)", file=sys.stderr)
         return 2
-    table = {"schema": "1bit/moe-placement/1", "groups": a.groups, "layers": build(trace, a.groups, a.min_pairs)}
+    if a.experts is not None and a.experts < 1:
+        ap.error("--experts must be >= 1")
+    try:
+        layers = build(trace, a.groups, a.min_pairs, a.experts)
+    except ValueError as e:
+        print(f"moe_placement: {e}", file=sys.stderr)
+        return 2
+    table = {"schema": "1bit/moe-placement/1", "groups": a.groups, "layers": layers}
     text = json.dumps(table, indent=1, sort_keys=True)
     if a.out:
         with open(a.out, "w", encoding="utf-8") as f:

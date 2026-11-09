@@ -33,8 +33,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "residual-dump.h"
 #include <cstdlib>
-#include <cerrno>
 #include <filesystem>
 #include <cstring>
 #include <fstream>
@@ -3578,7 +3578,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         // half; nothing from it ships here. Off unless the variable is set, and written with plain fopen/fwrite because
         // this runs in the forward's hot loop only when someone asked for it.
         if (const char* dd = getenv("NPU_INFER_DUMP_DIR")) {
-            static bool told = false, failed = false;   // `failed` is separate: one report, then quiet
+            static bool told = false;
             if (!told) {
                 told = true;
                 // Create it if missing. The dump is opt-in and named by the caller, so making it is what they asked for
@@ -3592,22 +3592,17 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             char path[4096];
             std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
-            FILE* fp = std::fopen(path, "wb");
-            if (!fp) {
-                if (!failed) {
-                    failed = true;
-                    std::fprintf(stderr, "  [dump] cannot write %s: %s -- the dump is INCOMPLETE, do not read a missing "
-                                         "layer as one that did not run\n", path, std::strerror(errno));
-                }
-            } else {
-                const size_t want = (size_t)M * (size_t)H;
-                const size_t got = std::fwrite(X.data(), sizeof(float), want, fp);
-                if (std::fclose(fp) != 0 || got != want) {
-                    if (!failed) {
-                        failed = true;
-                        std::fprintf(stderr, "  [dump] short write on %s: %zu of %zu floats -- the dump is INCOMPLETE, do "
-                                             "not read a missing layer as one that did not run\n", path, got, want);
-                    }
+            // engine#1726: every one of the three calls can fail, and all three used to fail silently -- a missing
+            // directory, an unwritable one, or a full disk left the run printing that it was dumping with no files and
+            // no error, and a missing layer_<l>.f32 then reads as "that layer never ran" to whoever analyses the dump.
+            // Reported once per failure mode, not per layer: a full disk fails every layer, and 40 identical lines is how
+            // the first one gets scrolled past. Still non-fatal -- a diagnostic must not fail a valid run.
+            std::string dump_err;
+            if (!onebit::npu::write_residual_dump(path, X.data(), (size_t) M * (size_t) H, &dump_err)) {
+                static bool told_fail = false;
+                if (!told_fail) {
+                    told_fail = true;
+                    std::fprintf(stderr, "  [dump] %s (no residual dump for this run)\n", dump_err.c_str());
                 }
             }
         }

@@ -302,3 +302,36 @@ and `--list`.
 It cannot be a ctest itself — it needs the network and a token, which the GitHub-hosted job does not have. A
 *scheduled* red (a cron workflow that fails once an hour while a runner is down) is the complete answer and is not
 here: a new workflow changes what the repository's token may do, which is an RFC under CONTRIBUTING.md.
+
+## Two rows, one question: are the runners healthy?
+
+Since #1682 and #1546 both landed there are two checks, and neither alone is enough — each is blind to what the
+other sees. Both run in `scripts/weekly.sh`'s preflight, so a release refuses to start on a runner it cannot trust.
+
+| | `scripts/check-ci-runners.sh` | `scripts/ci-runner-health.sh` |
+|---|---|---|
+| reads | the GitHub API (`…/actions/runners`) | systemd (`systemctl show`) |
+| says | is it **registered** and `online` | is the unit **active**, `Result=`, `NRestarts` |
+| notices | a registration that was revoked, expired or never made | `Result=oom-kill`, a restart window, a unit that stopped |
+| cannot see | *why* it died — no `oom-kill`, no restart count | a unit that is running fine while its registration is gone |
+| speed | after the heartbeat times out | the moment the unit dies |
+| exit | 0 online · 1 an offender, named · **2 cannot tell** (unreadable or truncated list) | 0 all accepting · 1 one is not · 2 no such units on this host |
+
+Run either by hand — both are read-only and neither restarts anything:
+
+```sh
+scripts/check-ci-runners.sh --require strixhalo-engine strixhalo-bench --list
+scripts/ci-runner-health.sh                # every actions.runner.* unit
+scripts/ci-runner-health.sh --self-test    # the verdict logic, systemctl stubbed
+```
+
+`WEEKLY_SKIP_RUNNER_CHECK=1` releases during an outage, and it skips **both** rows: they fail for the same dead
+runner, so a flag that skipped only one of them could not do the job it documents. It also says so in the log --
+`preflight: runner checks SKIPPED (WEEKLY_SKIP_RUNNER_CHECK=1)` -- because a release log where the checks quietly did
+not run reads exactly like one where they passed. Their exit 2 means "nothing to
+inspect on this host" — a fresh box or a fork — which is a note, not a failure; a check that cannot see has to say so
+rather than report green.
+
+One case neither row covers: a runner that is `online` in the API *and* active locally, but wedged so it takes no
+jobs. That is a hung process, not a registration or unit state; the practical signal for it is a queue that stops
+moving while both rows stay green.

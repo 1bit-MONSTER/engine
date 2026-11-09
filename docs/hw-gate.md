@@ -56,13 +56,14 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   `config/hrx-system-hold.config`, `app/serve.cpp` (the HRX wiring) or the workflow itself. It also runs by hand
   (Actions -> hrx-build -> Run workflow). It needs no label.
 - **Configure only, for a test registration.** A PR whose only change among those inputs is a ctest registration
-  added to `CMakeLists.txt` (`add_test(...)`, `set_tests_properties(...)`, `set_property(TEST ...)`, with comments and
-  blank lines) still configures with `-DONEBIT_HRX=ON` but skips the compile. Such a line creates no target and sets no
+  added to `CMakeLists.txt` or to a `cmake/tests-*.cmake` family file it includes (`add_test(...)`,
+  `set_tests_properties(...)`, `set_property(TEST ...)`, with comments and blank lines) still configures with `-DONEBIT_HRX=ON` but skips the compile. Such a line creates no target and sets no
   flag. It is still evaluated at configure time, including inside `if(ONEBIT_HRX)` blocks that `ci.yml` never
   configures, which is why the configure stays. Files outside the inputs above (the new test's own script, docs) do not
   count: on their own they do not run this job. `tools/ci/hrx_build_scope.py` decides, and it builds whenever it is
   unsure: a line that is not a registration, a registration inside `foreach`/`function`/`macro`, a pure removal, a
-  `CMakeLists.txt` entry with no changed lines (a mode change or rename), or a crash.
+  `CMakeLists.txt` entry with no changed lines (a mode change or rename), or a crash. Every changed line in **every**
+  registration file is read, so a target change in a family file next to an `add_test` in `CMakeLists.txt` builds.
 - **Where.** On the box's bench runner (`strixhalo-bench`, `[self-hosted, strixhalo, bench]`), with TheRock at
   `/opt/rocm-therock`, under `~/lb/thermal-run.sh`. That is not the gate's pr-agent runner, which a cold build would hold
   while every PR-Agent review queued behind it. It takes no GPU token and no NPU lock. Fork PRs never run it. It costs
@@ -76,6 +77,14 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
 - **What it is not.** It is a compile and link check of the public plumbing only. It does not build the private HIP
   add-on (the gate builds that) and does not dispatch anything. Green means the pinned pair builds into the engine. It
   does not replace the `hw-gate` label on a pin bump.
+
+> **Since 2026-11-09 this job is red on every branch, so a red badge is not a signal** (engine #1733). Three errors sit in
+> `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as `bool`, and two declarations
+> that differ only in return type — i.e. the fork's source no longer compiles against the fork's own headers, and the pin-bump
+> PR #1681 does not change it (its own `hrx_build` fails at 9m15s while `build` is green). Measured on five unrelated branches
+> and on the last eight runs of this workflow, all failures. Until the fork is fixed, read `hrx_build` as **unavailable**, not as
+> failing: a red run says nothing about the change under it, and there is no green run left to compare against. It is the same
+> shape as #1595 in the opposite direction — a red job nobody can act on stops being a check.
 
 ## What it checks
 

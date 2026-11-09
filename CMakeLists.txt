@@ -258,6 +258,11 @@ add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_te
 # of a ticket (ticket → shell → runner → server): `pkill -P` reaches one level, so the process holding the memory
 # outlived the ticket. Drives scripts/gpu-hold with a wrapper → mid → work chain and asserts the deepest one dies.
 add_test(NAME gpu_hold_tree COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_tree_test.sh)
+# engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
+# queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
+# Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a
+# second real gpu-hold reaps it and leaves the note the victim quotes. No device, no build; skips (77) without the script.
+add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_ticket_lost_test.sh)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the

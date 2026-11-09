@@ -291,6 +291,14 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen3-1.7B: same rule at hidden 2048 / 16 heads / 28 layers; 535 code bytes of the two builds differ, all in
     // layer 24, which is content rather than layout (every block still lines up).
     {2048, 16, 28, 8512, 3, 1, 1183744},
+    // SmolLM2-135M-Instruct: hidden 576 / 9 heads / 30 layers, headers of 36 B (4 x 9) at a 2,360,292 B stride.
+    // Measured by diffing this pack against its 1.8 twin: prefix 3,776 B, then FOUR tiles of 76,800 rotated by 1, then
+    // verbatim to the header. 29 of the 30 blocks normalise byte-identically; the 112 differing bytes are all in layer 3
+    // (content: this pair is a fine-tune on both sides). Note what this row does NOT buy: the pack's weights are
+    // quantised at block 32 (151 ops), which is a tile rhythm this importer cannot walk -- so the import reaches the
+    // block gate and refuses there by number (engine#1503). The row is what makes that refusal the FIRST thing wrong
+    // with the pack rather than the 1.9 header layout.
+    {576, 9, 30, 3776, 4, 1, 76800},
     // Qwen2.5-Coder-1.5B-Instruct: hidden 1,536 / 12 heads / 28 layers, 748 of 733,564,160 layer-block bytes differ
     // (1.0e-6). Its TAIL is 262,147,136 B against the 1.8 pack's 134,314,560 -- this pack quantises its head at block 32
     // while its 140 layer ops are block 128 (engine#1503), so the tail is where the difference lives and the layers are
@@ -1594,8 +1602,11 @@ Plan plan(const std::string& pack_dir) {
             if (only_the_head) {
                 p.head_block = declared.at(off_block[0].substr(0, off_block[0].find(" @ "))).block;
             } else {
+                // Name a few and count the rest: SmolLM2-135M has 151 off-block ops, and listing every one of them made
+                // the refusal a wall of text that hid the sentence explaining it.
                 std::string list;
-                for (const auto& o : off_block) list += (list.empty() ? "" : ", ") + o;
+                for (size_t i = 0; i < off_block.size() && i < 4; ++i) list += (list.empty() ? "" : ", ") + off_block[i];
+                if (off_block.size() > 4) list += " and " + std::to_string(off_block.size() - 4) + " more";
                 throw std::runtime_error(
                     "this pack's MatMulNBits block size along K is " + [&] {
                         std::string t;

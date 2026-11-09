@@ -961,14 +961,22 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     // scale zeroed low-magnitude rows when one token's activations dwarfed the
     // rest).
     std::vector<float> ascales((size_t)M);
-    for (int m = 0; m < M; m++) {
-        const float* row = A + (size_t)m * K;
-        float amax = 0.0f;
-        for (int k = 0; k < K; k++) {
-            const float a = std::fabs(row[k]);
-            if (a > amax) amax = a;
+    // A Hadamard-folded container takes its per-row scale from the ROTATED row, in the block below, which overwrites
+    // every entry this loop writes. So on that path this sweep over the unrotated activations is dead work -- and it
+    // is not free: it is a scalar pass over M x K floats, measured at ~3.2 ms per 128-row launch at K=4864 and
+    // ~2.3 ms at K=12288 (host bench, `pack_bench`), sitting inside the span the profile column calls `pack`.
+    // engine #1416 reads that column as the row quantiser's cost; the quantiser is 0.16-0.79 ms per launch, and this
+    // sweep plus the fold below are what the column is actually timing.
+    if (!hadamard_) {
+        for (int m = 0; m < M; m++) {
+            const float* row = A + (size_t)m * K;
+            float amax = 0.0f;
+            for (int k = 0; k < K; k++) {
+                const float a = std::fabs(row[k]);
+                if (a > amax) amax = a;
+            }
+            ascales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
         }
-        ascales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
     }
     // Rows > 1 is prefill and keeps the M=128 kernel (one launch per chunk); a
     // single row here is a decode step and gets the M=16 twin, exactly like

@@ -29,6 +29,7 @@
 #define ONEBIT_NPU_MODEL_NPU_MODEL_H
 
 #include <memory>
+#include <vector>
 
 #include "forward/include/q4nx_semantics.h"   // Q4nxSemantics: the architecture flags derived from config.json
 #include "target/xdna/xdna_target.h"          // npu-relative: the CI syntax target has no tree root on its path
@@ -48,6 +49,11 @@ class NpuModel {
     // The target this model runs on. Null until `Q4nxNpuForward::init()` creates it with the device, exactly as the
     // forward's own member was: every use site already null-checks it (`if (xd_ && …)`).
     std::unique_ptr<npu::target::xdna::XdnaTarget> xd;
+
+    // Per-layer norm scratch: [NL][H] for the two norms and [NL][max_hd] for q/k norm. They are the model's working
+    // set, not the target's: the launch reads them as ordinary host memory, so moving them here changes nothing a
+    // launch can see (checked on the device: identical text, same rows -- the gate in #1697's last comment).
+    std::vector<std::vector<float>> in_norm, post_norm, q_norm, k_norm;
 
     // The model's geometry, as derived from its own model_path — configuration, like `sem` below, and assigned as a
     // whole exactly once in setup (`c_ = ...`), which a reference passes through to this member.

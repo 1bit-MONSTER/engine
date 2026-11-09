@@ -326,6 +326,44 @@ void test_external_packed_genre(const std::string& root) {
 // "<tensor>.qweight.empty: no data", which reports a placeholder as though the bytes were absent rather than elsewhere.
 // Crafted, so this needs no 1.9 pack: a graph with one resolvable tensor, one MatMulNBits whose qweight input is a
 // `.empty` placeholder with no sibling, and a model.bin next to it.
+// engine#1662: the ~291 MB canonical Token .fconst rewrite is skipped when the copy on the scratch path already holds
+// exactly the bytes this run would write. The decision is a length test against a length that is a function of the source
+// alone, so what can go wrong is the test being too willing -- a truncated copy from an interrupted run, a leftover
+// directory, a copy from a bigger pack. Those are the arms.
+void test_canonical_copy_reusable() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-reuse-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    auto write = [&](const fs::path& f, size_t n) {
+        std::ofstream o(f, std::ios::binary | std::ios::trunc);
+        const std::string blob(n, 'x');
+        o.write(blob.data(), std::streamsize(blob.size()));
+    };
+    const int64_t want = 4096;
+
+    write(dir / "complete.fconst", size_t(want));
+    check(pi::canonical_copy_reusable((dir / "complete.fconst").string(), want),
+          "reuse: a copy of exactly the expected length is reused");
+    write(dir / "short.fconst", size_t(want) - 1);
+    check(!pi::canonical_copy_reusable((dir / "short.fconst").string(), want),
+          "reuse: a truncated copy is rewritten, not trusted (interrupted run)");
+    write(dir / "long.fconst", size_t(want) + 1);
+    check(!pi::canonical_copy_reusable((dir / "long.fconst").string(), want),
+          "reuse: a longer copy (another pack) is not reused");
+    check(!pi::canonical_copy_reusable((dir / "absent.fconst").string(), want), "reuse: a missing copy is not reused");
+    fs::create_directories(dir / "a-directory");
+    check(!pi::canonical_copy_reusable((dir / "a-directory").string(), want),
+          "reuse: a directory on the scratch path is not reused");
+    check(!pi::canonical_copy_reusable((dir / "complete.fconst").string(), 0),
+          "reuse: a non-positive expected length never reuses");
+    write(dir / "empty.fconst", 0);
+    check(!pi::canonical_copy_reusable((dir / "empty.fconst").string(), 1),
+          "reuse: an empty copy is not the canonical form of a non-empty body");
+    fs::remove_all(dir, ec);
+    std::printf("  canonical copy reuse: 7 arms (complete/truncated/long/absent/directory/zero-length/empty)\n");
+}
+
 void test_modelbin_genre_refusal(const std::string& root) {
     const fs::path dir = fs::path(root) / "crafted-modelbin";
     fs::remove_all(dir);
@@ -2117,6 +2155,43 @@ static void dump_real_component(const std::string& dir) {
     }
 }
 
+// A multi-component pack (gemma-4 1.9, `type: compositemodel`) states its geometry in model_config.json's
+// config.model_attributes.text_config -- not in config.json (which is `{}`) nor in genai_config.json's decoder block
+// (which stops at head_size). Measured on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: hidden 1536, 35L, 8 heads,
+// 1 kv, head_dim 256, intermediate_size 6144, vocab 262144. Without this source the pack refuses with "the pack
+// states no intermediate_size", which is exactly what it did on the real pack.
+void test_model_config_geometry(const std::string& root) {
+    const fs::path dir = fs::path(root) / "modelcfg";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    // what the genai_config decoder block resolves on such a pack: everything but intermediate_size
+    nlohmann::json cfg = {{"hidden_size", 1536},        {"num_hidden_layers", 35}, {"num_attention_heads", 8},
+                          {"num_key_value_heads", 1},   {"head_dim", 256},         {"model_type", "gemma4"}};
+    put_file((dir / "model_config.json").string(),
+             R"({"type":"compositemodel","config":{"model_attributes":{"text_config":{)"
+             R"("hidden_size":1536,"num_hidden_layers":48,"num_attention_heads":16,"num_key_value_heads":8,)"
+             R"("head_dim":256,"intermediate_size":6144,"vocab_size":262144,)"
+             R"("max_position_embeddings":131072,"model_type":"gemma4_text"}}}})");
+    const int added = pi::fill_from_model_config(dir.string(), cfg);
+    check(added > 0, "model_config: the text tower's geometry is read from model_config.json (" + std::to_string(added) +
+                         " key(s) added)");
+    check(cfg.value("intermediate_size", 0) == 6144,
+          "model_config: intermediate_size comes from the text tower (6144)");
+    check(cfg.value("vocab_size", 0) == 262144 && cfg.value("max_position_embeddings", 0) == 131072,
+          "model_config: vocab and context come with it");
+    std::printf("model_config: added %d key(s), intermediate %d, vocab %d, layers %d (genai's value kept)\n", added,
+                cfg.value("intermediate_size", 0), cfg.value("vocab_size", 0), cfg.value("num_hidden_layers", 0));
+    check(cfg.value("hidden_size", 0) == 1536 && cfg.value("num_hidden_layers", 0) == 35 &&
+              cfg.value("num_attention_heads", 0) == 8,
+          "model_config: a value already resolved (genai's 1536/35/8) is NOT overridden by the tower's 1536/48/16");
+    // A pack without the file contributes nothing and reports nothing added.
+    fs::remove(dir / "model_config.json");
+    nlohmann::json cfg2 = {{"hidden_size", 1536}};
+    check(pi::fill_from_model_config(dir.string(), cfg2) == 0 && !cfg2.contains("intermediate_size"),
+          "model_config: no model_config.json adds nothing (the 1.6/gemma-3 shape is unchanged)");
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2131,6 +2206,7 @@ int main(int argc, char** argv) {
                     "these packs and not an OGA NPU pack this importer reads\n", pack.c_str());
     try {
         test_bounds();
+        test_canonical_copy_reusable();
         test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
@@ -2143,6 +2219,7 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
+        test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

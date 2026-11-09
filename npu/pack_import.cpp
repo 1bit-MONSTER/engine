@@ -459,6 +459,15 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
         throw std::runtime_error(path + ": fewer bytes than " + std::to_string(layers) + " blocks of " +
                                  std::to_string(stride9) + " B");
     }
+    // The canonical body is a function of this file alone, so its length is known before it is built: reuse the copy
+    // when it already has that length, instead of writing ~291 MB (1.5B: ~1 GB) again on every call (engine#1662). The
+    // name already carries the source's size and mtime, so a reached-here path cannot be a stale copy of another pack --
+    // and a TRUNCATED copy from an interrupted run is caught by the length test rather than trusted.
+    const int64_t expected = int64_t(fc.size) - int64_t(layers) * hdr_len;
+    if (canonical_copy_reusable(work, expected)) {
+        unmap_file(fc.map, fc.size);
+        return work;
+    }
     std::vector<uint8_t> out;
     out.reserve(size_t(fc.size - int64_t(layers) * hdr_len));
     for (int L = 0; L < layers; ++L) {
@@ -549,8 +558,25 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // Named by pack and geometry, so a rerun overwrites its own copy instead of filling the temp dir.
     const std::string tag =
         std::to_string(std::hash<std::string>{}(fs::path(pack_dir).lexically_normal().string()) % 100000000);
-    const std::string name = "1bit-fconst19-" + tag + "-" + std::to_string(dims.hidden) + "-" +
-                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst";
+    // The name carries the SOURCE file's identity as well as the pack path and geometry (engine#1662): the copy is
+    // reused when it already exists at the right size, and a repacked pack at the same path with the same geometry would
+    // otherwise be served a stale copy of the same length. Size alone is not identity; the mtime completes it cheaply.
+    std::error_code src_ec;
+    const std::uintmax_t src_size = fs::file_size(found, src_ec);
+    const auto src_stamp = [&] {
+        std::error_code e;
+        const auto t = fs::last_write_time(found, e);
+        return e ? int64_t(0) : int64_t(t.time_since_epoch().count());
+    }();
+    // The scratch copy is only reusable while the RULES that produced it are the ones in this binary: a change to the
+    // canonical form (a new kFconst19Rules entry, a different tile order) leaves the source file untouched, so source
+    // identity alone would keep serving a copy of the old form. Bump this when the canonical form changes.
+    constexpr int kCanonicalFormVersion = 1;
+    const std::string name = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
+                             std::to_string(dims.hidden) + "-" +
+                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + "-" +
+                             std::to_string(src_ec ? std::uintmax_t(0) : src_size) + "-" +
+                             std::to_string(static_cast<std::uint64_t>(src_stamp)) + ".fconst";
     // `temp_directory_path()` THROWS when TMPDIR names a directory that no longer exists, which is the ordinary state of
     // a shell after a reboot has cleared /tmp -- and it threw before any work was attempted, so `npu-pack info` on a
     // 1.9 pack failed with `filesystem error: temp_directory_path: No such file or directory [/tmp/x]` and no hint that
@@ -850,6 +876,41 @@ namespace {
 // genai_config.json otherwise. Every refusal names the key it needed and the file it looked in, because a
 // nlohmann exception out of a loader ("key hidden_size not found", "type must be string, but is null") is a bug
 // report, not a diagnosis -- pi-inferzo's item 3.
+// ── the multi-component packs: geometry under model_config.json ─────────────────────────────────
+// The gemma-4 1.9 packs ship `config.json = {}` and a genai_config decoder block that stops at
+// num_key_value_heads/head_size, so the third value read_dims() needs -- intermediate_size -- is stated nowhere
+// those two files are read from, and the importer refused with "the pack states no intermediate_size". It is one
+// file over: model_config.json keeps the text tower under config.model_attributes.text_config.
+//   amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: 1536 hidden, 35L, 8 heads, 1 kv, head_dim 256, IM 6144, vocab 262144
+//   amd/gemma-4-12B-it_rai_1.9.0_npu:            3840 hidden, 48L, 16 heads, 8 kv, head_dim 256, IM 15360, vocab 262144
+// (measured 2026-11-09 on both packs' own JSON). `type: compositemodel` says what the file is; the text tower is
+// the decoder this importer builds, so its keys fill gaps and never override a value already resolved -- the same
+// rule the hybrid text_config lift uses. Returns how many keys it added, so the caller can name the source.
+static int fill_from_model_config_impl(const std::string& pack_dir, json& cfg) {
+    std::ifstream f(pack_dir + "/model_config.json");
+    if (!f) return 0;
+    json mc;
+    try { mc = json::parse(f); } catch (...) { return 0; }
+    if (!mc.is_object()) return 0;
+    const json* attrs = nullptr;
+    if (mc.contains("config") && mc["config"].is_object() && mc["config"].contains("model_attributes") &&
+        mc["config"]["model_attributes"].is_object()) {
+        attrs = &mc["config"]["model_attributes"];
+    } else if (mc.contains("model_attributes") && mc["model_attributes"].is_object()) {
+        attrs = &mc["model_attributes"];
+    }
+    if (!attrs) return 0;
+    const json* tower = attrs;
+    if (attrs->contains("text_config") && (*attrs)["text_config"].is_object()) tower = &(*attrs)["text_config"];
+    int added = 0;
+    for (auto it = tower->begin(); it != tower->end(); ++it) {
+        if (cfg.contains(it.key()) || it.value().is_null()) continue;
+        cfg[it.key()] = it.value();
+        ++added;
+    }
+    return added;
+}
+
 json load_geometry(const std::string& pack_dir, std::string* source) {
     auto readable_object = [](const std::string& path, json& out) {
         std::ifstream f(path);
@@ -866,6 +927,7 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
             for (const char* k : {"rope_theta", "rms_norm_eps", "intermediate_size"})
                 if (!cfg.contains(k) && g.contains(k)) cfg[k] = g[k];
         }
+        if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
     }
     json g;
@@ -894,6 +956,7 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
             cfg["architectures"] = std::vector<std::string>{fam + "ForCausalLM"};
         }
         if (source) *source = "genai_config.json (decoder block)";
+        if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
     }
     if (source) *source = "neither config.json nor genai_config.json";
@@ -913,7 +976,11 @@ std::string graph_filename(const std::string& pack_dir) {
                 const json& dec = g["model"]["decoder"];
                 if (dec.contains("filename") && dec["filename"].is_string()) {
                     const std::string n = dec["filename"].get<std::string>();
-                    if (!n.empty() && n.find('/') == std::string::npos) return n;
+                    // A multi-component pack (gemma-4 1.9, `type: compositemodel`) keeps its LLM graph in a
+                    // subdirectory -- genai_config.json says `decoder/model.onnx` -- so a relative path is accepted.
+                    // Absolute paths and `..` are still refused: the name comes from the pack, and a pack must not be
+                    // able to aim the reader outside itself.
+                    if (!n.empty() && n.front() != '/' && n.find("..") == std::string::npos) return n;
                 }
             }
         } catch (...) {
@@ -971,6 +1038,9 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg) {
+    return fill_from_model_config_impl(pack_dir, cfg);
+}
 
 // engine#734: exported so the epsilon anchor itself can be tested against a crafted .fconst, without a pack.
 // The two bytes a bf16 epsilon is stored as (little-endian): round the f32 to nearest-even bf16.
@@ -3370,6 +3440,17 @@ int run(int argc, char** argv) {
                      dir.c_str(), out.c_str());
     }
     return 0;
+}
+
+
+// Public (engine#1662): see the declaration in pack_import.h. Lives outside the anonymous namespace because the test
+// calls it directly with crafted files, so the decision that guards a ~291 MB rewrite is pinned without a 1.9 pack.
+bool canonical_copy_reusable(const std::string& work, int64_t expected_len) {
+    if (expected_len <= 0) return false;
+    std::error_code ec;
+    // file_size() fails on a missing file and on a directory, which is exactly the set that must be rewritten.
+    const std::uintmax_t have = fs::file_size(work, ec);
+    return !ec && have == static_cast<std::uintmax_t>(expected_len);
 }
 
 }  // namespace onebit::npu::pack_import

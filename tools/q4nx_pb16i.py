@@ -256,6 +256,23 @@ def gguf_tensors(path, strict=False):
     return out
 
 
+def tensor(path, name):
+    """The bytes of ONE tensor by name -> (dims, ggml type, raw).
+
+    `gguf_tensors(strict=True)` refuses the whole file at the first tensor it cannot size, so a caller who wants
+    one known tensor out of a real model cannot use it: every pack has BF16 norms this reader does not size
+    (measured on bonsai2-27b: `output_norm.weight`, ggml type 0, refuses before reaching the tensor it wanted).
+    This walks the file and answers for that one name -- refusing by name when the tensor is absent, and naming the
+    type when it is present but not one this reader can size, which are different answers (engine#1605)."""
+    for n, dims, tt, raw in gguf_tensors(path):
+        if n == name:
+            if tt not in SIZED:
+                raise SystemExit(f"{path}: tensor {name} has ggml type {tt}, which this reader cannot size "
+                                 f"(known: {sorted(SIZED)})")
+            return dims, tt, raw
+    raise SystemExit(f"{path}: no tensor named {name}")
+
+
 def jobs(name, dims, tt):
     """(stem, K, N, column slice) the tensor produces."""
     if tt != PTQ1_0 or len(dims) != 2:

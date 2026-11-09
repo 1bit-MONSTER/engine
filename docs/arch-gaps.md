@@ -1042,3 +1042,36 @@ Still open, and alerting on purpose: `MiniCPMV4_7ForConditionalGeneration` (need
 architecture), `MiniCPMOcrForConditionalGeneration` (own `minicpm-ocr` library), `smolvla-NPU2` (no config at all), and
 the `!! NPU FLM` families whose registry mapping is HRX-only (`hy_v3`, `dflash`, `gemma4`, `hunyuan-dense`, `gemma3`) —
 that last group is engine #588 (the family must be served on the NPU route), not a registry edit.
+
+## Census run 2026-11-09 (`engine #1667`)
+
+Checked with `tools/census_watch.py --full` on the day, not only from the issue text. The live run has the same two
+`!! UNCOVERED` classes, plus one moved pin that the issue does not list.
+
+* `IndonesianChatLM` (`fadhilahkhairogi/Liwet-400M-A188M-id-chat`, 3 models from one uploader) is **declined**, with
+  `"watch": "report"`. The repo has no modeling code and no `auto_map`, which is why the watcher printed it as
+  UNCOVERED and not REMOTE-CODE. The tensors were read from the `model.safetensors` header, not guessed from the
+  class name: q/k/v/o attention (16Q/4KV, `head_dim` 64, no q/k norm), a fused `gate_up_proj [8, 1024, 720]` and
+  `down_proj [8, 360, 1024]` over 8 experts with top-2 routing, a `router.weight`, and two buffers no supported
+  family has (`expert_bias [8]`, `load_ema [8]`). The config's `router_bias_update_speed` / `router_load_decay` /
+  `moe_capacity_factor` describe a balancing rule that is published nowhere. So the routing function (softmax or
+  sigmoid, and whether the bias reaches the weights or only the selection) cannot be read from anything the engine
+  has. `intermediate_size: 2880` has no tensor behind it. The card describes it as university coursework. Mapping it
+  to a Mixtral/Qwen-MoE family would claim a router the uploader never specified.
+* `GPT` (`learner-subodh/Delivery-Rider-Assistant-SLM`, `model_type: nanogpt-custom`) is **declined**, with
+  `"watch": "report"`. `GPT` is the class nanoGPT's `model.py` exports, so the entry covers nanoGPT state-dict
+  uploads in general. It is not GPT-2 under another name: the config uses nanoGPT's keys (`n_embd`, `block_size`,
+  `bias`, `dropout`), the repo ships only a pickled `pytorch_model.bin` and no tokenizer, and nanoGPT's `nn.Linear`
+  weights are the transpose of GPT-2's `Conv1D`, so the gpt2 converter would read every projection the wrong way round.
+* `vllm-project/semantic-router` moved `b7adcfa` → `a921924` (9 commits). The **pin is bumped** and the d3 contract is
+  unchanged (reasons in `registry/support_pins.json`). No `d3_*` file is in the delta. The one System One file is the
+  router's own client, which now refuses a `trusted_gateway` backend before dispatch, and the protocol string is still
+  `vllm-sr/systemone@1`.
+
+Left as they are, on purpose, under the policy above: the six `. REMOTE-CODE` classes, each from a single uploader
+(`HajeriOperatorForCausalLM`, `MM200ForCausalLM`, `K2HorizonForCausalLM`, `KLMForCausalLM`,
+`KimiK31SuperExpertForCausalLM`, `ThalamusReasoningQwen3_5ForConditionalGeneration`); the `? UNVERIFIABLE` gated repos,
+which are retried on every run; and the `!! FLM` lines. Those keep the 2026-11-08 reasons: `MiniCPMV4_7`, `MiniCPMOcr`
+and `smolvla` as above, and `!! NPU FLM` is engine #588. This run's issue window also includes the `gpt-oss`
+(`GPT-OSS-20B`, `GPT-OSS-Safeguard-20b`) and `lfm2` (`LFM2-1.2B`, `LFM2-2.6B`) Q4NX packs. Their mapping is HRX-only
+too, so they belong to #588, not to a registry edit.

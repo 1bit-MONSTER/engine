@@ -692,6 +692,25 @@ preflight() {
             bad=1
         fi
     fi
+    # The same fact from the other side: scripts/ci-runner-health.sh reads systemd's view (#1546, merged) and says WHY
+    # a runner is down -- Result=oom-kill, a restart window -- which the API above cannot see, and it fires the moment
+    # a unit dies instead of after the heartbeat timeout. Neither was ever invoked from anywhere until this row, so
+    # running both here is what makes the two halves one check at release time. Its exit 2 means "no such units on this
+    # host", which is a fresh box, not a failure.
+    if [ -x "$(cd "$(dirname "$0")" && pwd)/ci-runner-health.sh" ]; then
+        if health_out=$("$(cd "$(dirname "$0")" && pwd)/ci-runner-health.sh" 2>&1); then
+            printf '%s\n' "$health_out" | grep -c '^PASS' | xargs -r -I{} echo "preflight: runner units: {} PASS in systemd's view"
+        else
+            health_rc=$?
+            if [ "$health_rc" = 2 ]; then
+                say "preflight: no actions.runner.* units on this host: systemd has nothing to inspect"
+            else
+                printf '%s\n' "$health_out" | sed 's/^/preflight: /'
+                echo "preflight: a runner unit is not accepting jobs (scripts/ci-runner-health.sh): $health_rc"
+                bad=1
+            fi
+        fi
+    fi
     return $bad
 }
 preflight || { say "preflight failed: nothing was run"; exit 1; }

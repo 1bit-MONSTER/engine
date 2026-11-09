@@ -317,6 +317,33 @@ void test_external_to_container() {
               std::to_string(worst_rel) + " of the group's 15-step range)");
 }
 
+// The writer's role mapping (engine#1503): the graph's own names, mapped onto the roles the tile writer already
+// speaks, with an unknown name reported rather than skipped -- a projection nothing maps is a weight that would
+// silently not be written.
+void test_external_roles() {
+    struct Case { const char* name; const char* role; };
+    const Case cases[] = {
+        {"model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", "QKV"},
+        {"model.layers.39.attn.o_proj.MatMulNBits.qweight.packed", "O"},
+        {"model.layers.7.mlp.gate_proj.MatMulNBits.qweight.packed", "G"},
+        {"model.layers.7.mlp.up_proj.MatMulNBits.qweight.packed", "U"},
+        {"model.layers.7.mlp.down_proj.MatMulNBits.qweight.packed", "D"},
+        {"lm_head.MatMulNBits.qweight.packed", "HEAD"},
+    };
+    for (const auto& c : cases) {
+        const char* got = pi::external_role_of(c.name);
+        check(got && std::string(got) == c.role,
+              std::string("external role: ") + c.name + " -> " + c.role + " (got " + (got ? got : "null") + ")");
+    }
+    // The three that must NOT be mistaken for a projection: a norm, the embedding, and a name from another genre.
+    check(pi::external_role_of("model.layers.0.input_layernorm.weight") == nullptr,
+          "external role: a norm is not a projection");
+    check(pi::external_role_of("model.embed_tokens.weight") == nullptr,
+          "external role: the embedding is not a projection");
+    check(pi::external_role_of("model.layers.0.attn.qkv_proj_matmul") == nullptr,
+          "external role: an unknown suffix is not guessed");
+}
+
 void test_external_packed_genre(const std::string& root) {
     const fs::path dir = fs::path(root) / "external-packed";
     fs::remove_all(dir);
@@ -2235,6 +2262,7 @@ int main(int argc, char** argv) {
         test_bounds();
         test_external_tile_decode();
     test_external_to_container();
+    test_external_roles();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);

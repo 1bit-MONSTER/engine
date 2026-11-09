@@ -282,6 +282,13 @@ constexpr bool kExtQuantsRowMajor = false;
 // offsets were not bf16-exact (86.3 % are, measured), because that rounding is the only loss this path has.
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact = nullptr);
 
+// The container role a matmul plays, read off the graph's own tensor name: `...qkv_proj...` -> "QKV",
+// `o_proj` -> "O", `gate_proj` -> "G", `up_proj` -> "U", `down_proj` -> "D", `lm_head` -> "HEAD". These are the
+// roles the design/tile writer already speaks, so the external-data genre's writer is a mapping and not a second
+// vocabulary. nullptr when the name is one this importer has not measured: reported BY NAME rather than skipped,
+// because a projection nothing maps is a weight that would silently not be written (engine#1503).
+const char* external_role_of(const std::string& tensor_name);
+
 Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err,
                         bool row_major = kExtQuantsRowMajor);
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,

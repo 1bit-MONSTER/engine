@@ -1206,6 +1206,34 @@ constexpr int kMlpRows = 128;
 // against a plain row-major reading. Three statistics were tried and they disagreed with each other, which discredits
 // all three (they all assumed a row's codes centre on its zero-point, and the measured zero points span 0..11). So the
 // default is the verified prior and the alternative is one constant, to be settled by the known-answer run.
+const char* external_role_of(const std::string& tensor_name) {
+    struct Role {
+        const char* needle;
+        const char* role;
+    };
+    // Longest-needle-first where one name could contain another: `qkv_proj` before nothing else matters, and
+    // `gate_proj`/`up_proj`/`down_proj` do not overlap, but keeping the table explicit is cheaper than a rule.
+    static const Role kRoles[] = {
+        {"qkv_proj", "QKV"}, {"o_proj", "O"}, {"gate_proj", "G"},
+        {"up_proj", "U"},    {"down_proj", "D"}, {"lm_head", "HEAD"},
+    };
+    // A COMPONENT match, not a substring one: the needle must sit at a name boundary and be followed by a `.` or
+    // the end. `model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed` matches; `...qkv_proj_matmul` does not,
+    // and would otherwise be mapped to a role it is not -- the "guess by resemblance" failure this table exists to
+    // avoid, caught by the test below rather than by a container full of mislabelled weights.
+    for (const auto& r : kRoles) {
+        const std::string needle = r.needle;
+        for (size_t at = tensor_name.find(needle); at != std::string::npos;
+             at = tensor_name.find(needle, at + 1)) {
+            const bool left_ok = at == 0 || tensor_name[at - 1] == '.' || tensor_name[at - 1] == '/';
+            const size_t end = at + needle.size();
+            const bool right_ok = end == tensor_name.size() || tensor_name[end] == '.';
+            if (left_ok && right_ok) return r.role;
+        }
+    }
+    return nullptr;
+}
+
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
     Q4 q = pack;   // same codes, same geometry
     long long inexact = 0;

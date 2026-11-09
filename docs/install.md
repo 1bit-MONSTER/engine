@@ -268,11 +268,16 @@ mokutil --list-enrolled | grep -i "1bit\|strixhalo"
 
 ## 7. The Bosgame BeyondMax has one usable USB port
 
-On the Bosgame BeyondMax (`AXB35-02`, BIOS 1.09) **only the front USB-A port works under Linux**: a drive
-plugged into the front or rear Type-C, or a rear USB-A port, produces no kernel event at all — the xHCI
-port registers stay in RxDetect, and three of the four controllers have taken no interrupt. The same
-ports work in Windows on the same box, so it is a firmware/EC gap, not a driver in this image
+On the Bosgame BeyondMax (`AXB35-02`) **only the front USB-A port works under Linux**: a drive plugged into
+the front or rear Type-C, or a rear USB-A port, produces no kernel event at all — the xHCI port registers
+stay in RxDetect, and three of the four controllers have taken no interrupt. The same ports work in Windows
+on the same box, so it is a firmware/EC gap, not a driver in this image
 ([#823](https://github.com/1bit-MONSTER/engine/issues/823)). Boot from the front USB-A port.
+
+That is measured on **BIOS 1.09 and, since the owner's reflash, on 1.10** (11/04/2026): the newer firmware
+does not change the picture — three of the four controllers still autosuspend to `D3cold` — so the front
+port is still the one to use. The capture, the per-controller states and the keepawake rule that follows
+from them are in [axb35-usb-ports.md](axb35-usb-ports.md).
 
 ## What was verified for this page
 

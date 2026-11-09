@@ -1433,6 +1433,8 @@ endif()
         npu/forward/src/model.c
         npu/forward/src/q4nx_dequant.c
         npu/forward/src/q4nx_pack.c
+        # The production weight packer, extracted from I8Ctx so it can be tested without the device runtime (#1416).
+        npu/forward/src/q4nx_pack_blocked.cpp
         npu/forward/src/q4nx_semantics.c
         npu/forward/src/q4nx_forward.cpp
         # The NPU target interface and this box's target (engine#799 P4): the model keeps the maths, the

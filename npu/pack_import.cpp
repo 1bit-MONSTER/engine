@@ -291,6 +291,11 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen3-1.7B: same rule at hidden 2048 / 16 heads / 28 layers; 535 code bytes of the two builds differ, all in
     // layer 24, which is content rather than layout (every block still lines up).
     {2048, 16, 28, 8512, 3, 1, 1183744},
+    // Qwen2.5-Coder-1.5B-Instruct: hidden 1,536 / 12 heads / 28 layers, 748 of 733,564,160 layer-block bytes differ
+    // (1.0e-6). Its TAIL is 262,147,136 B against the 1.8 pack's 134,314,560 -- this pack quantises its head at block 32
+    // while its 140 layer ops are block 128 (engine#1503), so the tail is where the difference lives and the layers are
+    // what this row describes.
+    {1536, 12, 28, 3136, 7, 1, 226304},
     // Qwen3-4B: 2,933 of 2,208,061,248 bytes differ (1.3e-6), again content not layout. The prefix corroborates the
     // Qwen3 offset seen at 1.7B -- 64 + 2*hidden + 4,352, so 8,512 at hidden 2,048 and 9,536 at 2,560 -- and the tile
     // count differs from 1.7B's 3, which is why this is measured per pack and never derived.
@@ -1570,16 +1575,39 @@ Plan plan(const std::string& pack_dir) {
             if (dec.block) blocks[dec.block]++;
             if (dec.bits) bits[dec.bits]++;
         }
-        if (!blocks.empty() && !(blocks.size() == 1 && blocks.begin()->first == kKBlock))
-            throw std::runtime_error(
-                "this pack's MatMulNBits block size along K is " + [&] {
-                    std::string t;
-                    for (const auto& [b, n] : blocks)
-                        t += (t.empty() ? "" : ", ") + std::to_string(b) + " (" + std::to_string(n) + " ops)";
-                    return t;
-                }() + ", and this importer decodes the block-" + std::to_string(kKBlock) +
-                " tile layout only: at a different block every subvolume offset in the .fconst moves, so the "
-                "weights would be read from the wrong place, not merely mis-scaled");
+        // Where the non-128 blocks are decides whether the pack is readable at all. The .fconst tile geometry is the
+        // block-128 one, so a LAYER with another block makes the payload unwalkable and the pack is refused. The LM
+        // HEAD is the one exception that can be survived: it lives in the tail, after every layer, so the layers can
+        // still be read -- and on a tied pack the head need not be read at all, because it IS the embedding
+        // (engine#1503: the three Qwen-1.5B 1.9 packs are 140 ops at 128 and exactly one at 32, and that one is
+        // `/lm_head/MatMul_Q4`). Counting the census per projection is what makes that distinction possible.
+        std::vector<std::string> off_block;
+        for (const auto& [proj, dec] : declared)
+            if (dec.block && dec.block != kKBlock) off_block.push_back(proj + " @ " + std::to_string(dec.block));
+        bool only_the_head = !off_block.empty();
+        for (const auto& o : off_block) {
+            const auto it = declared.find(o.substr(0, o.find(" @ ")));
+            const bool head = it != declared.end() && it->first.rfind("lm_head", 0) == 0;
+            if (!head) only_the_head = false;
+        }
+        if (!blocks.empty() && !(blocks.size() == 1 && blocks.begin()->first == kKBlock)) {
+            if (only_the_head) {
+                p.head_block = declared.at(off_block[0].substr(0, off_block[0].find(" @ "))).block;
+            } else {
+                std::string list;
+                for (const auto& o : off_block) list += (list.empty() ? "" : ", ") + o;
+                throw std::runtime_error(
+                    "this pack's MatMulNBits block size along K is " + [&] {
+                        std::string t;
+                        for (const auto& [b, n] : blocks)
+                            t += (t.empty() ? "" : ", ") + std::to_string(b) + " (" + std::to_string(n) + " ops)";
+                        return t;
+                    }() + ", and this importer decodes the block-" + std::to_string(kKBlock) +
+                    " tile layout only: at a different block every subvolume offset in the .fconst moves, so the "
+                    "weights would be read from the wrong place, not merely mis-scaled. The off-block tensor(s) are " +
+                    list + "; only the LM head could be tolerated, because the layers come before it in the tail.");
+            }
+        }
         if (!bits.empty() && !(bits.size() == 1 && bits.begin()->first == 4))
             throw std::runtime_error("this pack's MatMulNBits bits is not 4 (declared: " +
                                      std::to_string(bits.begin()->first) +
@@ -2306,7 +2334,97 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // with, then the head's own 64-row tiles at K = hidden -- so `1,856 + (vocab/64) x tile(hidden)` has
             // to equal the tail length exactly. When that arithmetic does not hold the head is refused by name,
             // because reading the wrong offsets with confidence is worse than not reading them.
-            if (onnx.matmuls.empty()) {
+            if (onnx.matmuls.empty() && p.head_block != 0 && p.head_block != kKBlock) {
+                // engine#1503: the pack quantises its HEAD at a block this importer cannot walk, but every LAYER is at
+                // kKBlock (the plan proved that before allowing this path), so the tail's head tiles are the only
+                // thing out of reach. On a pack that DECLARES tied embeddings the head IS the embedding, so it is
+                // synthesised here -- 4-bit, one scale and zero-point per 32 columns, the same form tile_q4_1_f32
+                // writes -- and the self-check then measures the synthesis against the embedding rather than being
+                // skipped. An untied pack is refused by name: its head is a matrix nothing else in the pack can
+                // stand in for.
+                if (!(tie_declared && tied)) {
+                    late.push_back("lm_head.weight: this pack quantises its head at block " +
+                                   std::to_string(p.head_block) + " along K, which this importer's tile geometry cannot "
+                                   "walk, and the pack does not declare tied embeddings, so the embedding cannot stand "
+                                   "in for it");
+                } else {
+                    const size_t rows_v = size_t(V), kk = size_t(H);
+                    Q4 q;
+                    q.N = int(V); q.K = int(H); q.block = 32;
+                    q.codes.assign(rows_v * kk, 0);
+                    q.scale.assign(rows_v * (kk / 32), 0.0f);
+                    q.zero.assign(rows_v * (kk / 32), 0.0f);
+                    for (size_t v = 0; v < rows_v; ++v) {
+                        for (size_t gk = 0; gk < kk / 32; ++gk) {
+                            float lo = 1e30f, hi = -1e30f;
+                            for (size_t k = 0; k < 32; ++k) {
+                                const size_t idx = v * kk + gk * 32 + k;
+                                float x;
+                                if (embed->type == kF16) {
+                                    uint16_t hb; std::memcpy(&hb, embed_bytes + idx * 2, 2); x = f16_to_f32(hb);
+                                } else {
+                                    x = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[idx]);
+                                }
+                                lo = std::min(lo, x); hi = std::max(hi, x);
+                            }
+                            const float sc = (hi - lo) / 15.0f;
+                            q.scale[v * (kk / 32) + gk] = sc > 0 ? sc : 1.0f;
+                            q.zero[v * (kk / 32) + gk] = lo;
+                            for (size_t k = 0; k < 32; ++k) {
+                                const size_t idx = v * kk + gk * 32 + k;
+                                float x;
+                                if (embed->type == kF16) {
+                                    uint16_t hb; std::memcpy(&hb, embed_bytes + idx * 2, 2); x = f16_to_f32(hb);
+                                } else {
+                                    x = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[idx]);
+                                }
+                                const int code = sc > 0 ? int(std::lround((x - lo) / sc)) : 0;
+                                q.codes[idx] = uint8_t(std::min(15, std::max(0, code)));
+                            }
+                        }
+                    }
+                    // The self-check still means something here, and it is worth saying what: this head was DERIVED
+                    // from the embedding, so the correlation measures the 4-bit quantisation (and the row-shifted
+                    // control still shows what a misaligned read would score). It does not vouch for the pack -- the
+                    // pack's own head tiles were never read, which q4nx_head_note states.
+                    {
+                        r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+                        r.selfcheck_reference = true;
+                        r.selfcheck_tied = r.lmhead_corr > kTieCorr;
+                        double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
+                        const int nsh = std::min(2048, q.N - 1);
+                        for (int rr = 0; rr < nsh; ++rr)
+                            for (int k = 0; k < q.K; ++k) {
+                                const size_t g = size_t(rr) * (q.K / 32) + size_t(k) / 32;
+                                const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[g] + q.zero[g];
+                                uint16_t hb;
+                                std::memcpy(&hb, embed_bytes + ((size_t(rr) + 1) * H + k) * 2, 2);
+                                const double y = f16_to_f32(hb);
+                                sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
+                            }
+                        const double m = double(nsh) * q.K;
+                        const double cx = sxx - sx * sx / m, cy = syy - sy * sy / m;
+                        if (m > 0 && cx > 1e-12 && cy > 1e-12)
+                            r.ctrl_corr_rowshift = (sxy - sx * sy / m) / std::sqrt(cx * cy);
+                    }
+                    std::vector<uint8_t> tiled;
+                    long long pinexact = 0;
+                    tile_q4_1_f32(q, tiled, &pinexact);
+                    const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
+                    r.tiles += head_tiles;
+                    w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
+                    ++r.tensors;
+                    head_written = true;
+                    r.head_synthesized_note =
+                        "the pack quantises its head at block " + std::to_string(p.head_block) +
+                        " along K, so the tail's head tiles are not read; the pack declares tied embeddings, so "
+                        "lm_head is the 4-bit quantisation of model.embed_tokens";
+                    std::fprintf(stderr,
+                                 "note: this pack's head is block %lld along K, which this importer cannot walk; the "
+                                 "pack is tied, so the head was taken from the embedding (engine#1503)\n",
+                                 (long long)p.head_block);
+                }
+            } else if (onnx.matmuls.empty()) {
                 const int64_t tail_off = int64_t(p.dims.layers) * g.stride;
                 const int64_t tile = attn_tile_bytes(H);
                 const int64_t rows = V / kTileRows;
@@ -2820,6 +2938,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         const TextArtifacts ta = scan_text_artifacts(pack_dir);
         c["vocab_size"] = V;
         c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries
+        if (!r.head_synthesized_note.empty()) c["q4nx_head_note"] = r.head_synthesized_note;
         // The forward picks between "logits from the token embedding" and "logits from a separate head tensor" on this
         // key, and defaults to TIED when it is absent (npu/forward/src/q4nx_semantics.c). An untied pack that ships no
         // config.json -- every genre-A hybrid, e.g. Phi-3-mini -- therefore used to look tied, and the forward decoded

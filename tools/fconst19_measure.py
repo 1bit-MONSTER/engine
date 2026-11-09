@@ -90,8 +90,14 @@ def candidates(a, b, heads, layers):
     hdr_len = heads * 4
     header_off, stride9 = find_headers(b, heads, layers)
     stride8 = stride9 - hdr_len
-    if len(a) - layers * stride8 != len(b) - layers * stride9:
-        raise SystemExit("the two files' tails differ in length")
+    # The TAILS may differ, and on a mixed-block pack they do: the head is quantised at its own block, so the 1.9 tail
+    # is larger (Qwen2.5-Coder-1.5B: 262,147,136 B against 134,314,560 B). The layer blocks are what this tool measures,
+    # so a differing tail is reported rather than fatal -- and it is a useful signal, because it is how a differently
+    # quantised head shows up before anyone tries to read one.
+    tail8, tail9 = len(a) - layers * stride8, len(b) - layers * stride9
+    if tail8 != tail9:
+        print(f"# note: the tails differ ({tail8:,} B in the 1.8 pack, {tail9:,} B in the 1.9), which is what a head "
+              f"quantised at a different block looks like; only the layer blocks are measured here", file=sys.stderr)
     a0, b0 = a[:stride8], b[:stride9]
     if a0[header_off:] != b0[header_off + hdr_len:]:
         raise SystemExit("block 0's tail does not match at -4*NH")
@@ -164,23 +170,31 @@ def main():
     TOL = 1e-5
     for p in candidates(a, b, heads, layers):
         got = normalise(b, layers, p, hdr_len)
-        if len(got) != len(a):
-            print(f"# candidate prefix={p[0]} n={p[1]} tile={p[2]} rot={p[3]}: length {len(got)} != {len(a)}",
+        # With differing tails the tail cannot be compared -- the 1.9 one is genuinely different data -- so the
+        # comparison is the layer blocks, which is the region these parameters describe.
+        stride8_here = p[5] - hdr_len
+        tail8 = len(a) - layers * stride8_here
+        tail9 = len(b) - layers * p[5]
+        cmp_len = layers * stride8_here if tail8 != tail9 else len(a)
+        if len(got) < cmp_len:
+            print(f"# candidate prefix={p[0]} n={p[1]} tile={p[2]} rot={p[3]}: {len(got)} B short of {cmp_len}",
                   file=sys.stderr)
             continue
         # The exact case is the common one, so it takes the C-level compare: this loop is Python-level, one
         # iteration per byte, and on a 957 MB pair it costs ~24 s against ~0.13 s for `bytes ==` (reviewer's
         # measurement, same expression). The loop only runs when there is something to report.
-        differ = 0 if got == a else sum(1 for x, y in zip(got, a) if x != y)
-        if differ <= max(0, int(len(a) * TOL)):
+        differ = 0 if got[:cmp_len] == a[:cmp_len] else sum(1 for x, y in zip(got[:cmp_len], a[:cmp_len]) if x != y)
+        if differ <= max(0, int(cmp_len * TOL)):
             prefix, n, tile, rot, header_off, stride9 = p
-            note = "byte for byte" if differ == 0 else f"{differ} of {len(a)} bytes differ ({100.0 * differ / len(a):.2e} %)"
+            scope = "the whole file" if cmp_len == len(a) else f"all {layers} layer blocks (the tails differ)"
+            note = (f"byte for byte over {scope}" if differ == 0 else
+                    f"{differ} of {cmp_len} bytes differ over {scope} ({100.0 * differ / cmp_len:.2e} %)")
             if args.json:
                 print(json.dumps({"hidden": hidden, "heads": heads, "layers": layers, "prefix": prefix,
                                   "n_tiles": n, "tile": tile, "rot": rot, "header_off": header_off,
                                   "stride_1_9": stride9, "verified": note}))
             else:
-                print(f"// verified: {note} ({len(a)} B)")
+                print(f"// verified: {note} ({cmp_len} B)")
                 print(f"{{{hidden}, {heads}, {layers}, {prefix}, {n}, {rot}, {tile}}},")
             if args.probe_wrong:
                 # What a WRONG rule costs, in the same units as the tolerance: perturb one field of the accepted

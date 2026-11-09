@@ -86,6 +86,10 @@ struct Planned {
 
 struct Plan {
     std::string dir;
+    // The MatMulNBits block size along K the pack declares for its LM HEAD, when that is not the 128 this importer's
+    // .fconst tile geometry assumes. Non-zero means the tail's head tiles cannot be walked (engine#1503): a tied pack
+    // takes the head from its embedding instead, an untied one is refused by name.
+    int64_t head_block = 0;
     std::string pack;  // *_rai_1.8.0_npu_4K, from the directory name
     Dims dims;
     std::vector<Planned> tensors;
@@ -211,6 +215,10 @@ struct Report {
     // false means "no agreeing duplicate", which also covers "no duplicate to compare" and "the norm was
     // refused", and those are different things to say about an import.
     bool final_norm_imported = false;      // model.norm.weight was written into the container
+    // Why lm_head was synthesised rather than read (engine#1503: the pack's head is at a block this importer cannot
+    // walk and the pack is tied). Empty means it was read, as usual. Carried on the Report because the config JSON is
+    // built after the .fconst block that discovers this.
+    std::string head_synthesized_note;
     bool prefill_tail_seen = false;        // a second copy was readable in the prefill .fconst
     bool final_norm_crosscheck = false;    // ... and it is byte-identical to the Token_Token copy
 

@@ -28,6 +28,11 @@ INC=${2:?}
 SRC=${3:?}
 work=$(mktemp -d "${TMPDIR:-/tmp}/npu-blocked-layout.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-"$CXX" -std=c++17 -O1 -Wall -Wextra -I "$INC" "$SRC" -o "$work/t" || {
+# Two packers join the link (engine #1416): the row-major reference (q4nx_pack.c) and the extracted production packer
+# (q4nx_pack_blocked.cpp). The test asserts that the production image is the reference image permuted by bpos, so the
+# layout contract and the packer that feeds the microkernel are checked against each other rather than in isolation.
+LIB=${LIB_DIR:-$(cd "$(dirname "$SRC")/../npu/forward/src" 2>/dev/null && pwd)}
+"$CXX" -std=c++17 -O1 -Wall -Wextra -I "$INC" "$SRC" "$LIB/q4nx_pack.c" "$LIB/q4nx_pack_blocked.cpp" \
+    -fopenmp -lm -o "$work/t" || {
     echo "npu_blocked_layout_test: compile failed"; exit 1; }
 "$work/t"

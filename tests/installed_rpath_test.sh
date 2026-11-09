@@ -18,7 +18,8 @@
 # The installed-RUNPATH audit (engine#1411) on fixtures it must pass and must fail.
 #   $ORIGIN only                    -> PASS, rc 0
 #   a build tree in the RUNPATH     -> FAIL, rc 1, the path named
-#   $ORIGIN plus a toolchain dir    -> FAIL, rc 1   (the c22 shape: dead weight, still not $ORIGIN only)
+#   $ORIGIN plus a toolchain dir    -> FAIL, rc 1   (the c22 shape) and reported as *dead* when it holds
+#                                     nothing the ELF needs, *LIVE* when it supplies one (engine #1615)
 #   RPATH instead of RUNPATH        -> FAIL, rc 1
 #   a missing root                  -> rc 2, not a silent PASS
 set -euo pipefail
@@ -56,6 +57,21 @@ case $out in *release-rc/work/build*) ;; *) echo "FAIL build-tree run did not na
 mk mixed '$ORIGIN:/work-c22/hrx-toolchain/lib/llvm/lib/clang/24/lib/x86_64-unknown-linux-gnu'
 out=$("$tool" "$work/mixed" 2>&1) && rc=0 || rc=$?
 check "origin plus a toolchain dir fails" 1 "$rc"
+case $out in *dead*) ;; *) echo "FAIL a directory that holds nothing needed is not called dead: $out"; fails=$((fails + 1)) ;; esac
+# "dead" must not read as "safe to drop": $LIB/$PLATFORM are not expanded, so the report says so.
+case $out in *"not a promise that the entry can be dropped"*) ;; *) echo "FAIL dead is not qualified as sweep-scoped: $out"; fails=$((fails + 1)) ;; esac
+
+# engine #1615: the same entry can be harmless one day and load-bearing the next, so the tool has to
+# say which. `onebit` (a copy of /bin/true) needs libc.so.6, so a directory holding it is LIVE.
+mkdir -p "$work/livesrc" && cp /bin/true "$work/live/bin/onebit" 2>/dev/null || mkdir -p "$work/live/bin"
+cp /bin/true "$work/live/bin/onebit"
+mkdir -p "$work/live/sdk/lib" && cp /bin/true "$work/live/sdk/lib/libc.so.6"
+patchelf --set-rpath "\$ORIGIN:$work/live/sdk/lib" "$work/live/bin/onebit"
+out=$("$tool" "$work/live" 2>&1) && rc=0 || rc=$?
+check "a load-bearing entry still fails" 1 "$rc"
+case $out in *"LIVE libc.so.6"*) ;; *) echo "FAIL the load-bearing entry is not named LIVE with its library: $out"; fails=$((fails + 1)) ;; esac
+case $out in *"1 LIVE, 0 dead"*) ;; *) echo "FAIL the live/dead split is not in the summary: $out"; fails=$((fails + 1)) ;; esac
+case $out in *"cannot start if that directory is rebuilt"*) ;; *) echo "FAIL the FAIL line does not say what the hazard is: $out"; fails=$((fails + 1)) ;; esac
 
 mk rpath '$ORIGIN' --force-rpath
 out=$("$tool" "$work/rpath" 2>&1) && rc=0 || rc=$?

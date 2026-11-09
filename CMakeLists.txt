@@ -1076,6 +1076,12 @@ add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4
 add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp)
 target_link_libraries(npu_pack_import_test PRIVATE onebit_npu)
 add_test(NAME npu_pack_import COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden)
+# engine#1726: NPU_INFER_DUMP_DIR's residual write must SAY when it cannot write -- a missing or unwritable directory, or a
+# full disk, used to leave a run that printed it was dumping with no files and no error. Pure stdio, no device, no NPU
+# headers: the arm a version that only checks fopen would pass is the short write, which /dev/full produces for real.
+add_executable(npu_residual_dump_test tests/npu_residual_dump_test.cpp)
+target_include_directories(npu_residual_dump_test PRIVATE npu/forward/include)
+add_test(NAME npu_residual_dump COMMAND npu_residual_dump_test)
 # The OGA pack importer against a real pack (1bit npu-pack), when one is on the box
 set(ONEBIT_OGA_PACK "" CACHE PATH "A Ryzen AI OGA NPU model pack directory")
 if(ONEBIT_OGA_PACK)

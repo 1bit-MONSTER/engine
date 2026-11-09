@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -3583,9 +3584,18 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             char path[4096];
             std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
-            if (FILE* fp = std::fopen(path, "wb")) {
-                std::fwrite(X.data(), sizeof(float), (size_t)M * (size_t)H, fp);
-                std::fclose(fp);
+            // engine#1726: every one of the three calls can fail, and all three used to fail silently -- a missing
+            // directory, an unwritable one, or a full disk left the run printing that it was dumping with no files and
+            // no error, and a missing layer_<l>.f32 then reads as "that layer never ran" to whoever analyses the dump.
+            // Reported once per failure mode, not per layer: a full disk fails every layer, and 40 identical lines is how
+            // the first one gets scrolled past. Still non-fatal -- a diagnostic must not fail a valid run.
+            std::string dump_err;
+            if (!onebit::npu::write_residual_dump(path, X.data(), (size_t) M * (size_t) H, &dump_err)) {
+                static bool told_fail = false;
+                if (!told_fail) {
+                    told_fail = true;
+                    std::fprintf(stderr, "  [dump] %s (no residual dump for this run)\n", dump_err.c_str());
+                }
             }
         }
     }

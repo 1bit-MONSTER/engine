@@ -1837,6 +1837,39 @@ void test_attn_payload_off() {
 // GatherBlockQuantized. Shape measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: weight_Q4 [V, H/2] UINT8 and
 // weight_scales [V, groups] FLOAT with group 128. Driving the reader against known codes and scales pins the
 // dequantisation without a 3 GB pack.
+
+// A hybrid pack keeps its text tower under `text_config` INSIDE config.json, with model_config.json carrying
+// model_attributes: null (measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu), so the geometry has to come from the
+// inline block. The text tower is the decoder this importer builds, so its keys fill gaps and never override.
+void test_text_config_geometry(const std::string& root) {
+    const fs::path dir = fs::path(root) / "textcfg";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    put_file((dir / "config.json").string(),
+             R"({"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl",)"
+             R"("image_token_id":151655,"tie_word_embeddings":true,)"
+             R"("text_config":{"model_type":"qwen3_vl_text","hidden_size":2560,"num_hidden_layers":36,)"
+             R"("num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"intermediate_size":9728,)"
+             R"("vocab_size":151936,"rope_theta":5000000.0,"rms_norm_eps":1e-06},)"
+             R"("vision_config":{"hidden_size":1024,"depth":24,"in_channels":3}})");
+    std::string src;
+    const nlohmann::json g = pi::load_geometry_exported(dir.string(), &src);
+    const pi::Dims d = pi::read_dims_exported(g, src);
+    check(d.hidden == 2560 && d.layers == 36 && d.heads == 32 && d.intermediate == 9728 && d.vocab == 151936,
+          "text_config: the text tower's geometry is read from one level down (hidden " + std::to_string(d.hidden) + ")");
+    check(d.head_dim == 128 && d.kv_heads == 8, "text_config: head_dim and num_key_value_heads come with it");
+    check(src.find("text_config") != std::string::npos, "text_config: the source names where the geometry came from (" + src + ")");
+    check(!g.contains("vision_config") || g["vision_config"]["hidden_size"] == 1024, "text_config: vision_config untouched");
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen3_vl","hidden_size":4096,"text_config":{"hidden_size":2560,)"
+             R"("num_hidden_layers":36,"num_attention_heads":32,"intermediate_size":9728,"vocab_size":151936}})");
+    const nlohmann::json g2 = pi::load_geometry_exported(dir.string(), &src);
+    check(pi::read_dims_exported(g2, src).hidden == 4096, "text_config: a top-level hidden_size is NOT overridden");
+    std::printf("  text_config: hidden %d, %dL, %d heads, intermediate %d, vocab %d\n", d.hidden, d.layers, d.heads,
+                d.intermediate, d.vocab);
+    fs::remove_all(dir);
+}
+
 void test_embedding_component(const std::string& root) {
     const fs::path dir = fs::path(root) / "embedcomp";
     fs::remove_all(dir);
@@ -2350,6 +2383,7 @@ int main(int argc, char** argv) {
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
+        test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);

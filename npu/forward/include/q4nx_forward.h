@@ -416,8 +416,11 @@ private:
     bool weight_layout_b8_ = false;    std::vector<float> lm_head_tiles_;
     int                lm_head_tiles_T_ = 0;
     float lm_at(int n, int k) const;
-    std::vector<std::vector<float>> in_norm_, post_norm_;   // [NL][H]
-    std::vector<std::vector<float>> q_norm_, k_norm_;       // [NL][HD]
+    // The model owns these (A3); the references keep every use site unchanged, `assign` included.
+    std::vector<std::vector<float>> & in_norm_ = model_.in_norm;
+    std::vector<std::vector<float>> & post_norm_ = model_.post_norm;
+    std::vector<std::vector<float>> & q_norm_ = model_.q_norm;   // [NL][HD], owned by the model (A3)
+    std::vector<std::vector<float>> & k_norm_ = model_.k_norm;
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
     Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else

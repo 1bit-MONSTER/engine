@@ -310,6 +310,10 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // while its 140 layer ops are block 128 (engine#1503), so the tail is where the difference lives and the layers are
     // what this row describes.
     {"Qwen2.5-Coder-1.5B", 1536, 12, 28, 3136, 7, 1, 226304},
+    // Qwen-2.5_1.5B_Instruct: same hidden / heads / layers and, measured, the SAME bundle and rotation -- byte for byte
+    // over all 28 layer blocks. Listed separately rather than folded into one row: the name is the key, and two packs
+    // that happen to match today are still two measurements (this is the pair that would have looked safest to merge).
+    {"Qwen-2.5_1.5B_Instruct", 1536, 12, 28, 3136, 7, 1, 226304},
     // Qwen3-4B: 2,933 of 2,208,061,248 bytes differ (1.3e-6), again content not layout. The prefix corroborates the
     // Qwen3 offset seen at 1.7B -- 64 + 2*hidden + 4,352, so 8,512 at hidden 2,048 and 9,536 at 2,560 -- and the tile
     // count differs from 1.7B's 3, which is why this is measured per pack and never derived.

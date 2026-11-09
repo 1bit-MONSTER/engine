@@ -85,6 +85,32 @@ jobs:
           g++-16 -std=c++26 -fsyntax-only -DONEBIT_NPU_RUNTIME_OWN \
             -Inpu -Inpu/forward/include -Ibuild/_deps/json-src/include \
             tools/mtp_acceptance.cpp
+      - name: The forward defines every step_batch_embeds overload the header declares
+        # `embeds_equiv_probe` cannot be built in this job: it lives under `if(ONEBIT_NPU)` (CMakeLists.txt),
+        # and this workflow configures without it because the NPU runtime is private. Adding an unknown target
+        # to `cmake --build --target ...` is a hard ninja error, so that is not the way to guard it. What this
+        # job DOES build is `onebit_npu_forward_syntax`, an OBJECT library that compiles q4nx_forward.cpp and
+        # links nothing -- so the object is here, and the invariant that broke on 2026-11-08 (the three-argument
+        # `step_batch_embeds` was declared in the header and never defined, so `embeds_equiv_probe` failed to
+        # link while every CI job stayed green) is checkable against it without the NPU configuration.
+        run: |
+          OBJ=$(find build -name 'q4nx_forward.cpp.o' -path '*onebit_npu_forward_syntax*' | head -1)
+          test -n "$OBJ" || { echo "the forward syntax object was not built"; exit 1; }
+          decl=$(grep -c 'bool step_batch_embeds(' npu/forward/include/q4nx_forward.h)
+          def=$(nm -C "$OBJ" | grep -c ' T Q4nxNpuForward::step_batch_embeds')
+          echo "$OBJ: $def definition(s) of Q4nxNpuForward::step_batch_embeds, $decl declared"
+          if [ "$def" -lt "$decl" ]; then
+            echo "a declared overload has no definition: anything that calls it fails to link, and this job's"
+            echo "own targets never do (that is how a red main survived). Counted above."
+            exit 1
+          fi
+      - name: The embedding probe still compiles against the in-tree headers
+        # The probe itself cannot be built here (see above), but it must keep compiling: this catches the probe
+        # drifting from the forward's interface, which the symbol check above would not.
+        run: |
+          g++-16 -std=c++26 -fsyntax-only -DONEBIT_NPU_RUNTIME_OWN \
+            -Inpu -Inpu/forward/include -Ibuild/_deps/json-src/include \
+            npu/forward/embeds_equiv_probe.cpp
       - name: Build
         # Every target a ctest test invokes must be listed here: `ctest` runs whatever
         # binaries exist, so a test whose target is missing reports "Not Run" and never
@@ -98,8 +124,7 @@ jobs:
             npu_model_bounds_test npu_forward_loader_test npu_design_grid_test npu_sampling_test \
             npu_flm_head_import_test npu_elf_args_test \
             npu_template_test npu_chatml_test \
-            tokenizer_linear_test hrx_placement_test hrx_cwsr_test hrx_runtime_test npu_device_lock_test \
-            embeds_equiv_probe -j
+            tokenizer_linear_test hrx_placement_test hrx_cwsr_test hrx_runtime_test npu_device_lock_test -j
       - name: Test
         # One hung test must not hold the job for hours: each test gets 10 minutes.
         run: ctest --test-dir build --output-on-failure --timeout 600

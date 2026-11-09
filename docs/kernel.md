@@ -44,7 +44,10 @@ list, with the facts that go stale marked as facts and the commands that do not.
   Both are also packaged as dkms packages (`amdxdna-1bit-dkms`, `ec-su-axb35-dkms`) which do that
   rebuild on any machine that installs them — `scripts/mk-kernel-packages.sh` builds the set for deb,
   rpm and Arch, and [install-any-distro.md](install-any-distro.md), "Kernel and NPU driver packages",
-  is the install.
+  is the install. The board's other firmware-side quirk is not a module at all: three of its four xHCI
+  controllers park in `D3cold`, so the rear USB-A and both Type-C ports never enumerate, and the fix
+  that ships for it is a udev rule — written up, with the ACPI evidence and the one-command check, in
+  [axb35-usb-ports.md](axb35-usb-ports.md).
 
 ## 7.4 on the box: what changed, and what to watch
 

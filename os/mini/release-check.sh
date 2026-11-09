@@ -725,6 +725,60 @@ payload_name_from_image() {  # <identity file> <payload dir>
     payload_name_verdict "$_pval" "$_ptag"
 }
 
+# ── the shipped kernel carries the ip_options UAF fix (CVE-2026-98432) ─────────────────────────
+# CVE-2026-98432: a remote, unauthenticated use-after-free in IPv4 `ip_options` (the request-socket path). The fix is to free
+# `ireq_opt` with `kfree_rcu` in `tcp_v4_reqsk_destructor`; upstream fixed it in 5.10.272, 5.15.223, 6.1.190, 6.6.159, 6.12.113,
+# 6.18.56, 7.2.10, 7.3 - and 7.4-rc1 carries it.
+#
+# Two kinds of evidence, and the STRONGER one decides where it exists:
+#   * a kernel source tree on the image (`net/ipv4/tcp_ipv4.c`): the function must free with `kfree_rcu`, which is the fix itself
+#     and outranks a version number - a backport can carry the fix below the floor (this box's 7.3-rc4 perfopt tree does), and a
+#     vendor tree can lack it above the floor;
+#   * otherwise the VERSION FLOOR for the shipped kernel's own line, which is what an appliance with no sources can offer.
+# Pure, so --self-test drives it: <kernel release> <source verdict: yes|no|absent>
+kernel_cve_verdict() {
+    _v=${1:-} _src=${2:-absent}
+    case "$_src" in
+        yes) printf 'PASS %s'"'"'s tcp_v4_reqsk_destructor frees ireq_opt with kfree_rcu (read from its own net/ipv4/tcp_ipv4.c, which outranks the version floor)' "$_v"; return 0 ;;
+        no)  printf 'FAIL %s'"'"'s tcp_v4_reqsk_destructor frees ireq_opt WITHOUT kfree_rcu - the CVE-2026-98432 use-after-free, whatever the version says' "$_v"; return 0 ;;
+    esac
+    # version floor per line, from the advisory: a patch equal to the floor is the fix; a PRE-release at that patch is not.
+    # The advisory writes "7.4-rc1" and "5.10.272"; `uname -r` writes "7.4.0-rc1-1bit". Both must parse, so the
+    # numeric part is taken from the text BEFORE the first '-': without this, `_min` kept the suffix ("4-rc1") and
+    # every `X.Y-rcN` release - the advisory's own 7.4-rc1 included - fell through to "cannot be parsed".
+    _vbase=${_v%%-*}
+    _maj=${_vbase%%.*}; _rest=${_vbase#*.}
+    _min=${_rest%%.*}; _rest2=${_rest#*.}
+    if [ "$_rest2" = "$_rest" ]; then _pat=0; else _pat=${_rest2%%[!0-9]*}; fi   # "7.3" is 7.3.0, not 7.3.3
+    _rc=$(printf '%s' "$_v" | sed -n 's/.*-rc\([0-9][0-9]*\).*/\1/p')
+    case "$_maj$_min" in ''|*[!0-9]*) printf 'FAIL the kernel release (%s) cannot be parsed, so whether it carries the CVE-2026-98432 fix is unknown' "${_v:-empty}"; return 0 ;; esac
+    case "$_pat" in ''|*[!0-9]*) printf 'FAIL the kernel release (%s) has no patch number, so it is a pre-release of %s.%s and cannot be compared with the fix floor' "$_v" "$_maj" "$_min"; return 0 ;; esac
+    if [ "$_maj" -gt 7 ] || { [ "$_maj" = 7 ] && [ "$_min" -ge 4 ]; }; then
+        # the 7.4 line: 7.4-rc1 is the advisory's own "carries it"; earlier rc of 7.4 is unknown, and 7.4 release is fixed
+        if [ -z "$_rc" ] || [ "$_rc" -ge 1 ]; then
+            printf 'PASS %s is at or after 7.4%s, the advisory'"'"'s own floor for this fix (no kernel source on the image to read the function from)' "$_v" "$([ -n "$_rc" ] && echo "-rc1")"
+        else
+            printf 'FAIL %s predates 7.4-rc1, the advisory'"'"'s floor for this fix' "$_v"
+        fi
+        return 0
+    fi
+    case "$_maj.$_min" in
+        5.10) _floor=272 ;; 5.15) _floor=223 ;; 6.1) _floor=190 ;; 6.6) _floor=159 ;;
+        6.12) _floor=113 ;; 6.18) _floor=56 ;; 7.2) _floor=10 ;;
+        7.3)  _floor=0 ;;
+        *) printf 'FAIL no fix floor is known for the %s.%s line (the advisory lists 5.10/5.15/6.1/6.6/6.12/6.18/7.2/7.3/7.4), so this kernel cannot be confirmed either way' "$_maj" "$_min"; return 0 ;;
+    esac
+    if [ "$_pat" -gt "$_floor" ]; then
+        printf 'PASS %s is after %s.%s.%s, the advisory'"'"'s floor for its line (no kernel source on the image to read the function from)' "$_v" "$_maj" "$_min" "$_floor"
+    elif [ "$_pat" -eq "$_floor" ] && [ -z "$_rc" ]; then
+        printf 'PASS %s is the advisory'"'"'s floor for its line (no kernel source on the image to read the function from)' "$_v"
+    elif [ "$_pat" -eq "$_floor" ] && [ -n "$_rc" ]; then
+        printf 'FAIL %s is a pre-release AT the floor patch %s.%s.%s - the fix landed in the release, not the rc' "$_v" "$_maj" "$_min" "$_floor"
+    else
+        printf 'FAIL %s is before %s.%s.%s, the advisory'"'"'s floor for its line' "$_v" "$_maj" "$_min" "$_floor"
+    fi
+}
+
 payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
     _f=${1:-} _d=${2:-} _sample=${3:-}
     case "$_f" in ''|*[!0-9]*) printf 'FAIL the payload'"'"'s file modes could not be counted (%s)' "${_f:-empty}"; return 0 ;; esac
@@ -848,6 +902,14 @@ payload_home_layout_verdict() {   # <links at a FILE or at NOTHING> <links at a 
     fi
 }
 
+xhci_capture_verdict() {   # <1 when /bin/1bit-xhci-capture is present and executable, 0 when not>
+    case "${1:-}" in
+        1) printf 'PASS /bin/1bit-xhci-capture is installed and executable: a boot can capture the xHCI state for engine#823, which is the only place a plug can be observed' ;;
+        0) printf 'FAIL /bin/1bit-xhci-capture is not installed: engine#823 asks whether a rear USB-A or Type-C port sees a device, and nothing on this medium can read that' ;;
+        *) printf 'FAIL whether the xHCI capture is installed could not be read (%s)' "${1:-empty}" ;;
+    esac
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -899,6 +961,9 @@ if [ "${1:-}" = --self-test ]; then
     ln -s /home/nonexistent-xyz "$_hl_st/opt/home"                 # a home directory target: named, not failed
     check "bin/leak|/home/nonexistent-xyz/wt/build/1bit|dangling" "$(payload_home_layout_bad "$_hl_st" | grep '^bin/leak|')"
     rm -rf "$_hl_st"
+    check PASS "$(xhci_capture_verdict 1)"
+    check FAIL "$(xhci_capture_verdict 0)"
+    check FAIL "$(xhci_capture_verdict '')"
     check PASS "$(payload_runpath_verdict 0)"
     check FAIL "$(payload_runpath_verdict 3 '/opt/1bit-package/1bit/1bit runs /home/x/wt/release-rc/work/build')"
     check FAIL "$(payload_runpath_verdict 1)"
@@ -1097,6 +1162,27 @@ next')
     check PASS "$(laya_verdict '{"choices":[{"message":{"content":"Here you go"}}],"x_lemonade_route":{"route_to":"m","matched_rule":"laya-prose","default_used":false,"trace":[{"condition":"classifier:laya","score":0.77}]}}' prose m)"
 
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
+    # ── kernel_cve_verdict: the CVE-2026-98432 fix standing of a kernel release ──────────────────────────
+    # The advisory's own spelling, `X.Y-rcN` and `X.Y` with no patch component, is driven first: the first
+    # version of the parse rejected those as unparsable while the code had a 7.4 branch waiting for them.
+    check PASS "$(kernel_cve_verdict 7.4-rc1 absent)"          # the advisory's floor for this fix
+    check PASS "$(kernel_cve_verdict 7.4.0-rc1-1bit absent)"   # the same kernel as `uname -r` writes it
+    check PASS "$(kernel_cve_verdict 7.4 absent)"              # the release
+    check FAIL "$(kernel_cve_verdict 7.4-rc0 absent)"          # before the advisory's rc1
+    check PASS "$(kernel_cve_verdict 7.3 absent)"              # a release with no patch component
+    check FAIL "$(kernel_cve_verdict 7.3-rc4 absent)"          # a pre-release AT the floor patch
+    check FAIL "$(kernel_cve_verdict 7.3.0-rc4-1bit absent)"   # the same, in `uname -r` form
+    check PASS "$(kernel_cve_verdict 7.3-rc4 yes)"             # source evidence outranks the floor
+    check FAIL "$(kernel_cve_verdict 7.4-rc1 no)"              # ... and can convict above it
+    check FAIL "$(kernel_cve_verdict 5.10.272-rc1 absent)"     # pre-release at a patch floor
+    check PASS "$(kernel_cve_verdict 5.10.272 absent)"
+    check FAIL "$(kernel_cve_verdict 6.6.158 absent)"
+    check PASS "$(kernel_cve_verdict 6.6.159 absent)"
+    check FAIL "$(kernel_cve_verdict 7.2.9 absent)"
+    check PASS "$(kernel_cve_verdict 7.2.10 absent)"
+    check FAIL "$(kernel_cve_verdict 4.19.0 absent)"           # a line the advisory does not list
+    check FAIL "$(kernel_cve_verdict '' absent)"               # nothing may read as safe
+    check FAIL "$(kernel_cve_verdict 7.x.0 absent)"
     # A self-test is not a check run: without this the EXIT trap above appended "RESULT: FAIL (this check died
     # before its footer)" to every green self-test, which reads exactly like the death the trap exists to report.
     RC_FOOTER=1
@@ -2287,6 +2373,17 @@ else
 fi
 
 
+# engine#823: the instrument the plug test needs must be on the medium (see os/mini/mkimage.sh).
+if [ -x /bin/1bit-xhci-capture ]; then
+    XC=$(xhci_capture_verdict 1)
+else
+    XC=$(xhci_capture_verdict 0)
+fi
+case "$XC" in
+    PASS*) pass xhci-capture "${XC#PASS }" ;;
+    *)     fail xhci-capture "${XC#FAIL }" ;;
+esac
+
 # ── the NPU's locked memory in force (the driver asks for unlimited; this fleet's own 99- file can override ours) ──
 MEMLOCK_PID=${MEMLOCK_PID:-}
 MEMLOCK_NAME=${MEMLOCK_NAME:-}
@@ -2339,6 +2436,33 @@ else
     esac
 fi
 
+# ── the shipped kernel carries the CVE-2026-98432 ip_options use-after-free fix ──────────────────────────
+# Remote, unauthenticated UAF in the IPv4 request-socket path; the fix frees ireq_opt with kfree_rcu in
+# tcp_v4_reqsk_destructor. An appliance is exactly the thing this CVE is aimed at: a listening socket someone
+# else can reach - so the released kernel's standing on it is a release fact, not a distro footnote.
+_kver=$(uname -r 2>/dev/null)
+# Kernel-headers packages do NOT carry net/ipv4/*.c, so on a normal appliance this is absent and the version
+# floor decides. When a source tree IS here it outranks the floor: a backport can carry the fix below the floor
+# and a vendor tree can lack it above it.
+_ksrc=""
+for _d in "/usr/src/linux-headers-$_kver" "/usr/src/linux-source-$_kver" "/usr/src/linux-$_kver" /usr/src/linux "/lib/modules/$_kver/build"; do
+    if [ -f "$_d/net/ipv4/tcp_ipv4.c" ]; then _ksrc="$_d/net/ipv4/tcp_ipv4.c"; break; fi
+done
+if [ -n "$_ksrc" ]; then
+    _kfn=$(sed -n '/^static void tcp_v4_reqsk_destructor/,/^}/p' "$_ksrc" 2>/dev/null)
+    case "$_kfn" in
+        *kfree_rcu*) _ksrckind=yes ;;
+        '')          _ksrckind=absent ;;   # the function is not in that file: not a v4-TCP kernel, so no claim from it
+        *)           _ksrckind=no ;;
+    esac
+else
+    _ksrckind=absent
+fi
+KC=$(kernel_cve_verdict "$_kver" "$_ksrckind")
+case "$KC" in
+    PASS*) pass kernel-cve-2026-98432 "${KC#PASS }" ;;
+    *)     fail kernel-cve-2026-98432 "${KC#FAIL }" ;;
+esac
 say ""
 # The back-off leaves a trace: a run that only passed because the partition freed in time must say so, or the next
 # person reads a clean transcript and believes nothing was ever refused.

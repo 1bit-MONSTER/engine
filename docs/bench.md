@@ -41,6 +41,34 @@ tools/bench.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf \
 - **Best and median.** Each cell is the best and the median over all runs. The median is what
   the change is computed on.
 
+## The load mode is part of the measurement: `-lm mmap` versus `-lm none`
+
+A prefill comparison whose arms differ in load mode is partly measuring the loader, not the kernel. Measured on one
+`gpu-hold` ticket, ABBA order `A C C A` (A = `-lm mmap`, C = `-lm none`), `REPS=3` per slot, Qwen3-4B-Q4_K_M at
+`-dev HRX0 -ngl 99 -fa 1 -p 512 -n 32` (engine#1668):
+
+| arm | prefill pp512 | decode tg32 | own peak GTT |
+|---|---:|---:|---:|
+| `-lm mmap` (default) | 3 181.97 t/s | 77.98 t/s | 5 495 MiB |
+| `-lm none` | **3 737.19 t/s** (1.1745×) | 76.69 t/s (0.9835×) | 6 099 MiB (+604) |
+
+**Why, from the code rather than from the ratio.** llama.cpp's loader refuses to put a weight in the *device's host buffer
+type* while mmap is on: `src/llama-model-loader.cpp:1277` redirects such a tensor to the plain CPU buffer type. HRX exposes
+`HRX0_HOST` as exactly that host type (`ggml/src/ggml-hrx/ggml-hrx.cpp:885`, registered as the device's host buffer type at
+`:1423`). So the two modes differ in *where three of the model's weights live and therefore where their matmuls run*:
+
+- `-lm none`: those tensors keep `HRX0_HOST`, the backend materialises them into device buffers on first use, and their
+  matmuls dispatch on HRX against device-resident weights — the +604 MiB of GTT and the faster prefill (prefill touches
+  every weight, so it sees the difference; decode touches a few per token, which is why it moves only −1.6 %).
+- `-lm mmap` (default): the same tensors are pushed to plain CPU buffers, so their matmuls execute on the CPU.
+
+That also explains why the effect is invisible in the byte-for-byte identical decode rate and why the extra memory is BO
+bytes rather than slack: three more ~306 MiB tensors become device-resident (3 → 6).
+
+**The rule that follows:** record `-lm` in the row, hold it constant across the configurations of a comparison, and never
+quote a prefill delta measured across it. `-lm none` is not a lever to ship on the strength of one measurement — it costs
+GTT on a box where GTT is the scarce resource, and the honest statement is the mechanism above, not the percentage.
+
 ## What is measured
 
 - **Prompt:** one long prompt (default: the first 8,000 characters of `docs/*.md`, about 1,800

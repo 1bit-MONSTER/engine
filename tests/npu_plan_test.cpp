@@ -639,9 +639,63 @@ void test_rope_and_inputs() {
     }
 }
 
+// engine#799 §1: the two sections the spec names and the loader could not express -- `drafter {head, k, tau,
+// verify_rows, tree}` and `state {gdn_commit}`.  Both are absent-by-default (no drafter, immediate commit), and a
+// half-stated contract is refused by name, because a speculator with different numbers answers different text for the
+// same prompt and raises nothing.
+void test_drafter_and_state() {
+    {
+        const Plan p = Plan::load(write_plan("drafter_absent", base_plan()));
+        check(!p.has_drafter() && !p.gdn_deferred(), "no drafter and immediate GDN commit are the defaults");
+    }
+    {
+        auto j = base_plan();
+        j["drafter"] = {{"head", "draft_head.q4nx"}, {"k", 4}, {"tau", 0.6}, {"verify_rows", 4}, {"tree", "leaf"}};
+        j["state"] = {{"gdn_commit", "deferred"}};
+        const Plan p = Plan::load(write_plan("drafter_full", j));
+        check(p.has_drafter() && p.drafter_head == "draft_head.q4nx" && p.drafter_k == 4 &&
+                  p.drafter_verify_rows == 4 && p.drafter_tau == 0.6 && p.drafter_tree == "leaf",
+              "a fully stated drafter loads as written");
+        check(p.gdn_deferred(), "and a deferred GDN commit is reported");
+    }
+    {
+        auto j = base_plan();
+        j["drafter"] = {{"head", "draft.q4nx"}, {"k", 2}, {"tau", 1.0}, {"verify_rows", 2}};
+        const Plan p = Plan::load(write_plan("drafter_edge_tau", j));
+        check(p.drafter_tau == 1.0 && p.drafter_tree == "none", "tau 1.0 is allowed and tree defaults to none");
+    }
+    {
+        auto j = base_plan();
+        j["drafter"] = {{"head", "draft.q4nx"}, {"k", 2}, {"tau", 1.5}, {"verify_rows", 2}};
+        const std::string why = refusal(write_plan("drafter_tau", j));
+        check(has(why, "drafter.tau") && has(why, "(0, 1]"), "a tau outside (0,1] is refused, naming the range: " + why);
+    }
+    {
+        auto j = base_plan();
+        j["drafter"] = {{"head", "sub/draft.q4nx"}, {"k", 2}, {"tau", 0.5}, {"verify_rows", 2}};
+        const std::string why = refusal(write_plan("drafter_path", j));
+        check(has(why, "drafter.head") && has(why, "bare file name"),
+              "a drafter head with a directory part is refused (a plan cannot aim the loader): " + why);
+    }
+    {
+        auto j = base_plan();
+        j["drafter"] = {{"head", "draft.q4nx"}, {"k", 2}, {"verify_rows", 2}};
+        const std::string why = refusal(write_plan("drafter_half", j));
+        check(has(why, "drafter.head") && has(why, "tau"),
+              "a drafter with no tau is refused as a half-stated contract: " + why);
+    }
+    {
+        auto j = base_plan();
+        j["state"] = {{"gdn_commit", "promptly"}};
+        const std::string why = refusal(write_plan("state_bad", j));
+        check(has(why, "state.gdn_commit"), "an unknown gdn_commit is refused by name: " + why);
+    }
+}
+
 int main() {
     test_valid();
     test_rope_and_inputs();
+    test_drafter_and_state();
     test_kv();
     test_tile_order();
     test_refusals();

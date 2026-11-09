@@ -35,6 +35,8 @@
 
 #include <cstdint>
 #include <string>
+
+#include <nlohmann/json.hpp>
 #include <map>
 #include <vector>
 
@@ -300,6 +302,12 @@ struct FconstGeom {
     std::string why;      // non-empty when the geometry could not be established
 };
 unsigned short bf16_bits_of(float v);
+
+// engine#1650: config.json may declare an OPTIONAL field as JSON null (AMD's 1.9
+// Mistral-7B-Instruct-v0.2 pack writes `"head_dim": null`), which must read as "absent" and take
+// the default rather than throw. Exported so tests/npu_pack_import_test.cpp can pin it without a
+// pack; `source` names where the geometry came from, for the refusal messages.
+Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);

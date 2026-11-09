@@ -1838,6 +1838,40 @@ void test_weight_layout() {
     std::printf("weight layout: b8 allowed, pb16i/t2s/unknown refused\n");
 }
 
+// engine#1650: a config.json that declares an OPTIONAL field as JSON null means "unset", not
+// "broken". AMD's 1.9 Mistral-7B-Instruct-v0.2 pack ships `"head_dim": null` and
+// `"sliding_window": null`, and nlohmann's value() throws on a present-but-null key, so the reader
+// reported `type must be number, but is null` and no geometry at all: an 8 GB pack named "info
+// failed" with nothing said about what it contains. head_dim's default is the one every
+// Llama-family config implies (hidden / heads); a WRONG TYPE must still be refused.
+void test_null_optional_dims() {
+    using nlohmann::json;
+    const json base = {{"hidden_size", 4096}, {"num_hidden_layers", 32},
+                       {"num_attention_heads", 32}, {"intermediate_size", 14336}};
+    json c = base;
+    for (const char* k : {"head_dim", "sliding_window", "num_key_value_heads", "rope_theta",
+                          "vocab_size", "rms_norm_eps", "model_type"})
+        c[k] = nullptr;                       // the measured pack, field for field
+    const pi::Dims d = pi::read_dims_exported(c, "config.json");
+    check(d.head_dim == 128, "null head_dim defaults to hidden/heads (4096/32 = 128)");
+    check(d.kv_heads == d.heads, "null num_key_value_heads defaults to the head count");
+    check(d.rope_theta == 10000.0f, "null rope_theta defaults to 10000");
+    check(d.vocab == 0, "null vocab_size reads as 0 (unset)");
+    check(std::abs(d.rms_norm_eps - 1e-6f) < 1e-12f, "null rms_norm_eps defaults to 1e-6");
+    check(d.model_type.empty(), "null model_type reads as empty, not as a crash");
+
+    json good = base;
+    good["head_dim"] = 128;                   // an explicit value still wins over the default
+    check(pi::read_dims_exported(good, "config.json").head_dim == 128, "an explicit head_dim wins");
+
+    json bad = base;
+    bad["head_dim"] = "128";                  // null is absence; a string is a disagreement
+    bool threw = false;
+    try { (void)pi::read_dims_exported(bad, "config.json"); } catch (const std::exception&) { threw = true; }
+    check(threw, "a non-numeric head_dim is still refused");
+    std::printf("null optional dims: head_dim falls back to hidden/heads, a wrong type still throws\n");
+}
+
 void test_fconst_eps(const std::string& root) {    const fs::path dir = fs::path(root) / "fconst-eps";
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -1916,6 +1950,7 @@ int main(int argc, char** argv) {
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);
         test_kernel_set_refusal();
         test_weight_layout();
+        test_null_optional_dims();
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

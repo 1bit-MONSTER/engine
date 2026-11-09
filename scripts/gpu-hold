@@ -65,6 +65,146 @@ THERMAL_FLAG=${GPU_HOLD_THERMAL_FLAG:-$HOME/THERMAL-HOLD}
 COOLDOWN=${GPU_HOLD_COOLDOWN:-180}
 COOLDOWN_TCTL=${GPU_HOLD_COOLDOWN_TCTL:-85}
 
+case "${1:-}" in
+    --self-test) SELF_TEST=1; shift ;;
+esac
+descendants() {   # <pid> -> its descendants and then itself, deepest last
+    local k
+    for k in $(ps -o pid= --ppid "$1" 2> /dev/null); do
+        descendants "$k"
+    done
+    printf '%s\n' "$1"
+}
+# End the hold's whole tree.  Two mechanisms, because each covers what the other misses (engine#1624):
+#
+#   * the payload is started under job control, so it leads its OWN process group and `$child` is the
+#     group id.  Every descendant inherits that group and reparenting does not change it, so one group
+#     signal reaches a TERM-ignoring grandchild that the old two-pass `ps --ppid` walk lost: when the
+#     root died on TERM its children were reparented, the second walk found only the corpse, and the
+#     KILL pass killed nothing (#1624 reproduced it: the trap-'' child outlived its own ticket).
+#   * the snapshot below is taken ONCE, before anything is signalled, and is still used -- for a payload
+#     that turns out not to lead its own group, and for a descendant that leaves the group with its own
+#     setsid.  #1620 rejected `setsid` for this reason (it forks when already a group leader, so `$!`
+#     stops naming the group); job control has no such trap, but it silently does nothing in some
+#     contexts, which is why ownership of the group is VERIFIED before it is signalled.  A group kill
+#     aimed at a pgroup that is really the caller's own would kill gpu-hold, the ticket, and whatever
+#     else shares it -- measured while writing this: `set -m` off gives child pgid = the shell's.
+tree_alive() {   # <pgid> -> true while any process in that group exists
+    kill -0 -- "-$1" 2> /dev/null
+}
+# End the hold's whole tree.  Two mechanisms, because each covers what the other misses (engine#1624):
+#
+#   * the payload is started under job control, so it leads its OWN process group and `$child` is the
+#     group id.  Every descendant inherits that group and reparenting does not change it, so one group
+#     signal reaches a TERM-ignoring grandchild that the old two-pass `ps --ppid` walk lost: when the
+#     root died on TERM its children were reparented, the second walk found only the corpse, and the
+#     KILL pass killed nothing (#1624's reproduction: the trap-'' child outlived its own ticket).
+#   * the snapshot below is taken ONCE, before anything is signalled, and is still used -- for a payload
+#     that turns out not to lead its own group, and for a descendant that leaves the group with its own
+#     setsid.  #1620 rejected `setsid` for this (it forks when already a group leader, so `$!` stops
+#     naming the group); job control has no such trap, but it can silently fail to take effect, which is
+#     why ownership of the group is VERIFIED before it is signalled: a group kill aimed at a pgroup that
+#     is really the caller's own would kill gpu-hold, the ticket and whatever shares it -- measured while
+#     writing this, with `set -m` off the child's pgid IS the shell's.
+tree_alive() {   # <pgid> -> true while any process in that group exists
+    kill -0 -- "-$1" 2> /dev/null
+}
+kill_tree() {
+    local root=$1 grace=${2:-10} i=0 p tree alive pgid=${PAYLOAD_PGID:-}
+    tree=$(descendants "$root")
+    if [ -n "$pgid" ]; then kill -TERM -- "-$pgid" 2> /dev/null; fi
+    for p in $tree; do kill -TERM "$p" 2> /dev/null; done
+    # the grace period ends when nothing of this tree is left, not when the root alone is gone
+    while [ "$i" -lt "$grace" ]; do
+        alive=
+        if [ -n "$pgid" ] && tree_alive "$pgid"; then alive=1; fi
+        for p in $tree; do
+            if [ -z "$alive" ] && kill -0 "$p" 2> /dev/null; then alive=1; fi
+        done
+        [ -z "$alive" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+    if [ -n "$pgid" ]; then kill -KILL -- "-$pgid" 2> /dev/null; fi
+    for p in $tree; do kill -KILL "$p" 2> /dev/null; done
+}
+self_test() {
+    local bad=0
+    SELF_TEST_TMP=$(mktemp -d)
+    local tmp=$SELF_TEST_TMP
+    # The case #1624 reproduces: a root that DIES on TERM (it traps nothing) with a child under it that
+    # IGNORES TERM.  An earlier fixture trapped TERM in the root too, so the root survived, the old
+    # two-pass walk still saw a live tree, and the control passed with the bug reintroduced.
+    printf '%s\n' '#!/usr/bin/env bash' 'trap "" TERM' 'sleep 137 & wait' > "$tmp/child.sh"
+    chmod +x "$tmp/child.sh"
+    cat > "$tmp/payload.sh" <<EOF
+#!/usr/bin/env bash
+# root: no trap, so it dies on TERM and orphans the child (which ignores it)
+"$tmp/child.sh" &
+wait
+EOF
+    chmod +x "$tmp/payload.sh"
+    # Only pids this test started are ever signalled or checked: a `pgrep -f 'sleep 137'` survivor sweep
+    # would also match anything else on the box whose command line says that, which is how the first
+    # version of this test killed a wrapper shell that was merely running it.
+    alive() { kill -0 "$1" 2> /dev/null; }
+
+    # case A: started the way the hold starts it (job control) -> one group signal ends the tree
+    set -m
+    "$tmp/payload.sh" &
+    child=$!
+    set +m
+    sleep 0.4
+    PAYLOAD_PGID=""
+    if [ "$(ps -o pgid= -p "$child" 2> /dev/null | tr -d ' ')" = "$child" ]; then PAYLOAD_PGID=$child; fi
+    if [ -z "$PAYLOAD_PGID" ]; then
+        echo "FAIL the payload did not lead its own process group (job control did not take effect)"
+        bad=$((bad + 1))
+    else
+        echo "ok   the payload leads its own process group ($PAYLOAD_PGID)"
+    fi
+    kill_tree "$child" 3
+    sleep 0.3
+    if [ -n "$PAYLOAD_PGID" ] && tree_alive "$PAYLOAD_PGID"; then
+        echo "FAIL something in the payload's group outlived kill_tree: $(ps -o pid=,args= -g "$PAYLOAD_PGID" 2> /dev/null | head -3)"
+        bad=$((bad + 1))
+    elif [ -z "$PAYLOAD_PGID" ] && alive "$child"; then
+        echo "FAIL the payload outlived kill_tree"
+        bad=$((bad + 1))
+    else
+        echo "ok   a TERM-ignoring descendant does not outlive its ticket"
+    fi
+    if alive $$; then echo "ok   the caller is still alive (the group signalled was not ours)"; else
+        echo "FAIL the caller was signalled"; bad=1
+    fi
+
+    # case B: a payload that is NOT a group leader (no job control) -> the snapshot path must still end
+    # its tree, and must still not signal the caller's group
+    PAYLOAD_PGID=""
+    "$tmp/payload.sh" &
+    child=$!
+    sleep 0.4
+    local victims; victims=$(descendants "$child")
+    kill_tree "$child" 3
+    sleep 0.3
+    local left=
+    for p in $victims; do if alive "$p"; then left="$left $p"; fi; done
+    if [ -n "$left" ]; then
+        echo "FAIL without a group the snapshot left:$left"
+        bad=$((bad + 1))
+    else
+        echo "ok   without a group of its own, the snapshot still ends the tree"
+    fi
+    if alive $$; then echo "ok   and the caller is still alive"; else
+        echo "FAIL the caller was signalled on the fallback path"; bad=1
+    fi
+    rm -rf "$SELF_TEST_TMP"
+    echo "gpu-hold self-test: $bad failure(s)"
+    echo "   (the 'Killed' lines above are the test killing its own TERM-ignoring payload: expected)"
+    return "$bad"
+}
+if [ "${SELF_TEST:-}" = 1 ]; then self_test; exit $?; fi
+
 while getopts ":t:l:w:q:h" opt; do
     case $opt in
         t) MINUTES=$OPTARG ;;
@@ -236,8 +376,19 @@ done
 
 deadline=$(( $(date +%s) + $(awk -v m="$MINUTES" 'BEGIN { printf "%d", m * 60 }') ))
 started=$(date +%s)
+# Job control puts the payload in its own process group so kill_tree can name the whole tree with one
+# signal; the id is only trusted after checking that the child really leads it (see kill_tree).
+set -m
+# Job control puts the payload in its own process group so kill_tree can name the whole tree with one
+# signal; the id is only trusted after checking that the child really leads it (see kill_tree).
+set -m
 "$@" &
 child=$!
+set +m
+PAYLOAD_PGID=""
+if [ "$(ps -o pgid= -p "$child" 2> /dev/null | tr -d ' ')" = "$child" ]; then PAYLOAD_PGID=$child; fi
+set +m
+PAYLOAD_PGID=""
 # The watchdog is a function so it can be given the command's pid: a subshell inherits a copy of the shell's
 # variables, so a watchdog started before the command (the first version did) holds an empty pid and neither
 # the abort nor the max hold stops anything.
@@ -248,23 +399,6 @@ child=$!
 # levels down (ticket → shell → runner → server). A process group would express this too, but `setsid`
 # forks when it is already a group leader (which it is inside `systemd-run --scope`), so `$!` stops
 # naming the group; recursion has no such trap.
-descendants() {   # <pid> -> its descendants and then itself, deepest last
-    local k
-    for k in $(ps -o pid= --ppid "$1" 2> /dev/null); do
-        descendants "$k"
-    done
-    printf '%s\n' "$1"
-}
-kill_tree() {
-    local root=$1 grace=${2:-10} i=0 p
-    for p in $(descendants "$root"); do kill -TERM "$p" 2> /dev/null; done
-    while kill -0 "$root" 2> /dev/null && [ "$i" -lt "$grace" ]; do
-        sleep 1
-        i=$((i + 1))
-    done
-    for p in $(descendants "$root"); do kill -KILL "$p" 2> /dev/null; done
-}
-
 watch() {
     local target=$1
     while sleep 2; do

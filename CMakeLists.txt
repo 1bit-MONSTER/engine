@@ -641,6 +641,12 @@ add_test(NAME route_log COMMAND route_log_test)
 # case is an artefact someone would actually push, and the conservative direction -- "full" -- is the
 # one every uncertain case must land on, because the build being skipped is the one that catches a
 # broken HRX pin.  Stdlib only: no git needed for the decision itself.
+# gpu-hold's kill at the end of a ticket (engine#1624): a root that dies on TERM orphans a child that
+# ignores TERM, and the two-pass `ps --ppid` walk then killed nothing.  The self-test starts that exact
+# tree, kills it, and asserts nothing survives AND that the caller's own process group was never
+# signalled.  Shell only: no queue, no ticket, no device, ~5 s.
+add_test(NAME gpu_hold_kill_tree
+         COMMAND ${CMAKE_SOURCE_DIR}/scripts/gpu-hold --self-test)
 add_test(NAME hrx_build_scope
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/hrx_build_scope.py --self-test)
 add_test(NAME copyright_check_untracked

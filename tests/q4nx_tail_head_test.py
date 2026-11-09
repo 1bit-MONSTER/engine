@@ -145,21 +145,26 @@ def synthetic():
             # CI installs numpy, not onnx: the graph cannot be written, so the block gate is checked where onnx is
             print("skip the block-32 refusal: onnx is not installed (the other synthetic checks still run)")
 
-        # engine#1747 review: a pack that does not declare tie_word_embeddings is not an untied pack. It must still be
-        # correlated against its own embedding, labelled provisional, and NOT exit 5 with "untied".
-        p_undecl = os.path.join(work, "undeclared")
-        make_pack(p_undecl, tied=True, head_block=T.K_KBLOCK, declare=False, embed=True)
-        r_undecl = T.measure(p_undecl, 2)
-        check(r_undecl[1] == 0, "an undeclared tie_word_embeddings measures (rc %s, not 5): %s" % (r_undecl[1], r_undecl[0] or r_undecl[2]))
-        rep = r_undecl[0] or {}
-        check("does not declare tie_word_embeddings" in (rep.get("oracle") or ""),
-              "and it says the oracle is provisional rather than calling the pack untied (%s)" % (rep.get("oracle"),))
-        check([t["finite"] for t in rep.get("tiles_measured", [])] == [1.0, 1.0],
-              "and the decode is reported as finite on both tiles")
-        # The synthetic embedding is a constant, so the correlation is nan by construction: the tool must not invent a
-        # number there. That is the point of the label, not a gap in the arm.
-        check(all(t["corr"] != t["corr"] for t in rep.get("tiles_measured", [])),
-              "and a constant oracle yields no correlation rather than a plausible one")
+        # The undeclared arm reads its embedding through onnx (T.embedding loads model.onnx), so like the block-32 arm
+        # it runs only where onnx is installed -- in CI it skips (ci.yml installs numpy and gguf; see #1747).
+        if HAVE_ONNX:
+            # engine#1747 review: a pack that does not declare tie_word_embeddings is not an untied pack. It must still be
+            # correlated against its own embedding, labelled provisional, and NOT exit 5 with "untied".
+            p_undecl = os.path.join(work, "undeclared")
+            make_pack(p_undecl, tied=True, head_block=T.K_KBLOCK, declare=False, embed=True)
+            r_undecl = T.measure(p_undecl, 2)
+            check(r_undecl[1] == 0, "an undeclared tie_word_embeddings measures (rc %s, not 5): %s" % (r_undecl[1], r_undecl[0] or r_undecl[2]))
+            rep = r_undecl[0] or {}
+            check("does not declare tie_word_embeddings" in (rep.get("oracle") or ""),
+                  "and it says the oracle is provisional rather than calling the pack untied (%s)" % (rep.get("oracle"),))
+            check([t["finite"] for t in rep.get("tiles_measured", [])] == [1.0, 1.0],
+                  "and the decode is reported as finite on both tiles")
+            # The synthetic embedding is a constant, so the correlation is nan by construction: the tool must not invent a
+            # number there. That is the point of the label, not a gap in the arm.
+            check(all(t["corr"] != t["corr"] for t in rep.get("tiles_measured", [])),
+                  "and a constant oracle yields no correlation rather than a plausible one")
+        else:
+            print("skip the undeclared-tie arm: onnx is not installed (it reads model.onnx's embedding)")
         # ...whereas a pack that DECLARES untied and gets no --ref still has no oracle, and says so.
         p_untied = os.path.join(work, "declared_untied")
         make_pack(p_untied, tied=False, head_block=T.K_KBLOCK, declare=True)

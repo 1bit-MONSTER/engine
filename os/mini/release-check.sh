@@ -2045,25 +2045,37 @@ fi
 # to trust that a mode fix happened. A SKIP (not a failure) when the payload is not where an appliance keeps it, so the row can be
 # run off a stick.
 PDIR=${PAYLOAD_DIR:-/opt/1bit-package}
+# A clean mode count over an EMPTY payload proves nothing - and a directory that exists but holds nothing is exactly what an
+# interrupted extraction leaves behind (measured 2026-11-08: an `unsquashfs -d` with the wrong path argument produced 0 entries
+# and this row printed PASS over it). So the row checks its subject before it checks the modes: a real payload carries hundreds
+# of entries (c33: 263).
+# Absence first, then vacuity: the SKIP below is the row's documented behaviour on a machine where the payload is not
+# unpacked (a stick, a dev box), and the floor must not pre-empt it. A missing payload is a claim about THIS system; a
+# payload that exists and holds nothing is a claim about the ARTIFACT - and only the second is a FAIL.
 if [ ! -d "$PDIR" ]; then
     skip payload-modes "no $PDIR on this system: the payload is not unpacked where an appliance keeps it, so its modes cannot be read"
 else
-    _pm_f=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
-    _pm_d=$(find "$PDIR" -mindepth 0 -type d \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
-    # the sample is relative to the payload, like the modes below it: an absolute path per file makes a long line on a console
-    # nobody can scroll, and the prefix is identical for every one of them
-    # the sample prints the mode too, because "writable" is not actionable and `drwxrwxr-x opt/1bit-package` is
-    _pm_s=$(find "$PDIR" -mindepth 0 \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 |
-        while IFS= read -r _p; do _r=${_p#"$PDIR"}; _r=${_r#/}; printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "${_r:-.}"; done)
-    PM=$(payload_modes_verdict "${_pm_f:-}" "${_pm_d:-}" "${_pm_s:-}")
-    _pm_bits=
-    for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
-        [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
-    done
-    case "$PM" in
-        PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
-        *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
-    esac
+    _pm_entries=$(find "$PDIR" -mindepth 1 2>/dev/null | wc -l)
+    if [ "${_pm_entries:-0}" -lt 100 ] 2>/dev/null; then
+        fail payload-modes "the payload at $PDIR holds only ${_pm_entries:-0} entries - a payload has hundreds (c33: 263), so this is an interrupted extraction, not a clean payload"
+    else
+        _pm_f=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
+        _pm_d=$(find "$PDIR" -mindepth 0 -type d \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
+        # the sample is relative to the payload: an absolute path per file makes a line nobody can scroll, and the
+        # prefix is identical for every one of them. It prints the mode too, because "writable" is not actionable
+        # and `drwxrwxr-x opt/1bit-package` is.
+        _pm_s=$(find "$PDIR" -mindepth 0 \( -type f -o -type d \) \( -perm -g+w -o -perm -o+w \) 2>/dev/null | head -3 |
+            while IFS= read -r _p; do _r=${_p#"$PDIR"}; _r=${_r#/}; printf '%s %s ' "$(stat -c %A "$_p" 2>/dev/null)" "${_r:-.}"; done)
+        PM=$(payload_modes_verdict "${_pm_f:-}" "${_pm_d:-}" "${_pm_s:-}")
+        _pm_bits=
+        for _b in "$PDIR/1bit/1bit" "$PDIR/bin/lemond" "$PDIR/lemond-onebit"; do
+            [ -f "$_b" ] && _pm_bits="$_pm_bits $(stat -c '%a %n' "$_b" 2>/dev/null | sed "s|$PDIR/||")"
+        done
+        case "$PM" in
+            PASS*) pass payload-modes "${PM#PASS }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+            *)     fail payload-modes "${PM#FAIL }${_pm_bits:+ (modes:$_pm_bits)}" ;;
+        esac
+    fi
 fi
 
 # ── the BASE layer's modes (engine#1474) ────────────────────────────────────────────────────────────────────────
@@ -2180,20 +2192,33 @@ PYSCAN
     fi
 }
 RUNDIR=${PAYLOAD_DIR:-/opt/1bit-package}
+# A payload with no ELF in it is an empty or interrupted unpack, not a clean RUNPATH set: the row would print
+# "ELF=0 non-$ORIGIN=0" and read as a pass over nothing. Same floor as payload-modes, for the same reason.
+# Same order as payload-modes, and one chain rather than two `if`s: with the floor checked first, a missing payload
+# took the FAIL branch and its own SKIP was unreachable - and in this row both ran, recording a FAIL and a SKIP for the
+# same path, which also double-counted in the summary.
 if [ ! -d "$RUNDIR" ]; then
     skip payload-runpath "no $RUNDIR on this system: the payload is not unpacked where an appliance keeps it, so its RUNPATHs cannot be read"
 else
-    _rp_bad=$(payload_runpath_bad "$RUNDIR"); _rp_rc=$?
-    if [ "$_rp_rc" = 2 ]; then
-        skip payload-runpath "neither python3 nor readelf is here, so the payload's RUNPATHs cannot be read - that is not evidence"
+    # Count ELFs by magic rather than by name, and judge only after: a RUNPATH scan over a tree holding no ELF prints
+    # the same PASS whether it read a payload or an empty directory.
+    _rp_elfs=$(find "$RUNDIR" -type f -size +1k 2>/dev/null | head -400 | while IFS= read -r _f; do
+        head -c4 "$_f" 2>/dev/null | od -An -tx1 | tr -d ' \n' | grep -q '^7f454c46' && echo x; done | wc -l)
+    if [ "${_rp_elfs:-0}" -lt 5 ] 2>/dev/null; then
+        fail payload-runpath "the payload at $RUNDIR holds ${_rp_elfs:-0} ELF(s) - a payload carries dozens (c33: 19 real ELFs), so this is an interrupted extraction, not a clean payload"
     else
-        _rp_n=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | wc -l)
-        _rp_s=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | head -3 | tr '\n' ' ')
-        RP=$(payload_runpath_verdict "${_rp_n:-0}" "${_rp_s:-}")
-        case "$RP" in
-            PASS*) pass payload-runpath "${RP#PASS }" ;;
-            *)     fail payload-runpath "${RP#FAIL }" ;;
-        esac
+        _rp_bad=$(payload_runpath_bad "$RUNDIR"); _rp_rc=$?
+        if [ "$_rp_rc" = 2 ]; then
+            skip payload-runpath "neither python3 nor readelf is here, so the payload's RUNPATHs cannot be read - that is no verdict either way"
+        else
+            _rp_n=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | wc -l)
+            _rp_s=$(printf '%s\n' "${_rp_bad:-}" | sed '/^$/d' | head -3 | tr '\n' ' ')
+            RP=$(payload_runpath_verdict "${_rp_n:-0}" "${_rp_s:-}")
+            case "$RP" in
+                PASS*) pass payload-runpath "${RP#PASS }" ;;
+                *)     fail payload-runpath "${RP#FAIL }" ;;
+            esac
+        fi
     fi
 fi
 

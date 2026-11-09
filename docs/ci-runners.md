@@ -280,8 +280,15 @@ scripts/check-ci-runners.sh --list                                      # what t
 scripts/check-ci-runners.sh --require strixhalo-engine strixhalo-bench  # the fleet, named
 ```
 
-It exits 0 when both named runners are `online`, 1 with a `::error::` line per offender, and 2 when the list cannot
-be read at all — an unchecked runner is exactly the state the row exists to end. `--require` is not decoration: a
+The sentence to keep in mind while reading any check list: **every check that needs this box reads as pending,
+never red**. That is why the 2026-11-08 outage lasted 3h45m instead of being visible in a minute — a job whose
+runner does not exist never runs, so GitHub never fails it, and a pending check looks exactly like a busy queue.
+That is the person this row is for: whoever is staring at a green-looking list.
+
+It exits 0 when both named runners are `online`, 1 with a `::error::` line per offender, and **2 when the list
+cannot be read at all** — an unchecked runner is exactly the state the row exists to end. It is also 2 when the list
+is **truncated** (one page is 100 runners): past that, a runner that exists on page two would be reported missing,
+which is a false outage, and a monitor that cannot tell has to say so rather than answer wrongly. `--require` is not decoration: a
 runner that has been *deleted* satisfies "every registered runner is online", so the two names have to be asked for
 explicitly. A repository with no self-hosted runners registered is not an outage, so a fresh box and a fork both
 exit 0.

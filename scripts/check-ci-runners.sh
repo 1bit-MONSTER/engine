@@ -52,13 +52,28 @@ json=$(gh api "repos/$repo/actions/runners?per_page=100" 2>/dev/null) || {
     echo "::error::check-ci-runners: cannot read the runner list of $repo (gh api failed): an unchecked runner is the state this row exists to end" >&2
     exit 2; }
 
-# name<TAB>status<TAB>busy, one per registered runner
+# name<TAB>status<TAB>busy, one per registered runner -- or the word "truncated", which is not a verdict at all.
+# The list is one page of 100: if the repository ever has more, a runner that EXISTS beyond page one is reported
+# missing, which is a false outage and a page at 3 a.m. for a pager that cannot see page two. A monitor that
+# cannot tell has to say so (exit 2), same rule as an unreadable list.
 rows=$(printf '%s' "$json" | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
-for r in d.get("runners",[]):
+rs=d.get("runners",[])
+total=d.get("total_count",len(rs))
+if total>len(rs) or len(rs)>=100:
+    print("truncated\t%s\t%s" % (len(rs), total))
+    raise SystemExit(0)
+for r in rs:
     print("%s\t%s\t%s" % (r.get("name","?"), r.get("status","?"), str(r.get("busy")).lower()))
 ') || { echo "check-ci-runners.sh: cannot parse the runner list" >&2; exit 2; }
+
+case ${rows:-} in
+    truncated*)
+        have=$(printf '%s' "$rows" | cut -f2); total=$(printf '%s' "$rows" | cut -f3)
+        echo "::error::check-ci-runners: the runner list is truncated ($have of $total registered, one page is 100), so a runner on the next page would read as missing: this row cannot answer" >&2
+        exit 2 ;;
+esac
 
 if [ -z "$rows" ]; then
     echo "ok   no self-hosted runners registered for $repo: nothing for this row to watch"

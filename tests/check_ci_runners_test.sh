@@ -94,6 +94,13 @@ out=$(run "$none" "${req[@]}"); check 0 $? "$out" "no self-hosted runners regist
 out=$(FAKE_API_FAIL=1 FAKE_RUNNERS=$none PATH=$tmp/bin:$PATH bash "$script" "${req[@]}" 2>&1)
 check 2 $? "$out" "cannot read the runner list" "API failure -> 2, explicitly"
 
+# 5b. more runners than one page: the list cannot be trusted, so 2 -- NOT a "missing" verdict for a required name
+long=$(python3 -c 'import json; print(json.dumps({"total_count":150,"runners":[{"name":"r%d"%i,"status":"online","busy":False} for i in range(100)]}))')
+out=$(run "$long" "${req[@]}"); check 2 $? "$out" "runner list is truncated" "a truncated list -> 2, not 'strixhalo-engine is not registered'"
+printf '%s' "$out" | grep -q 'is not registered' && { echo "FAIL a truncated list blamed a required name"; fail=$((fail + 1)); }
+full=$(python3 -c 'import json; print(json.dumps({"total_count":100,"runners":[{"name":"r%d"%i,"status":"online","busy":False} for i in range(100)]}))')
+out=$(run "$full"); check 2 $? "$out" "truncated" "exactly one page -> 2 (may be truncated), never a vacuous ok"
+
 # 6. --list prints the table without changing the verdict
 out=$(run "$two_online" --list); check 0 $? "$out" "strixhalo-engine" "--list prints runners and still exits 0"
 

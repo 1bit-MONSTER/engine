@@ -704,8 +704,11 @@ payload_name_verdict() {
             if [ -z "$_pt" ]; then
                 printf 'SKIP the payload ships no release tag in its README, so payload=%s cannot be checked in the image (the tarball name lives beside the bundle, not in the image)' "$_pn"
             else
+                # the label must CONTAIN the token with a BOUNDARY after it: `c33x` must not match `c33`, `c3` must not match `c33`.
+                # Unanchored containment passed `…-c26b` against a `c26c` payload, and those letter-suffixed names are exactly the
+                # incident's (this box carries payload-c17b, -c26b and -c26c).
                 case "$_pn" in
-                    *"$_pt"*) printf 'PASS consistent: the identity says payload=%s and the payload ships %s' "$_pn" "$_pt" ;;
+                    *"$_pt"|*"$_pt"[!0-9a-z]*) printf 'PASS consistent: the identity says payload=%s and the payload ships %s' "$_pn" "$_pt" ;;
                     *) printf 'FAIL the identity says payload=%s but the payload ships %s - payload= is a declared environment input, so this image names a release it does not carry (c32 and c33 shipped exactly this)' "$_pn" "$_pt" ;;
                 esac
             fi ;;
@@ -717,7 +720,7 @@ payload_name_from_image() {  # <identity file> <payload dir>
     _pval=$(sed -n 's/^payload=//p' "$_pi" 2>/dev/null | head -1)
     _ptag=
     if [ -n "$_pd" ] && [ -f "$_pd/1bit/README.txt" ]; then
-        _ptag=$(sed -n '1s/.*\(rc-[0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*-c[0-9][0-9]*\).*/\1/p' "$_pd/1bit/README.txt" 2>/dev/null)
+        _ptag=$(sed -n '1s/.*\(rc-[0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*-c[0-9][0-9]*[a-z]*\).*/\1/p' "$_pd/1bit/README.txt" 2>/dev/null)
     fi
     payload_name_verdict "$_pval" "$_ptag"
 }
@@ -843,6 +846,11 @@ if [ "${1:-}" = --self-test ]; then
     check /y/1bit/1bit "$(PAYLOAD_DIR=/y identity_launcher_path aa '')"                    # PAYLOAD_DIR is honoured
     if [ -z "$(identity_launcher_path '' bbbb)" ]; then printf 'ok   no claim yields no path (the row SKIPs)\n'
     else printf 'FAIL no claim should yield no path\n'; rc=1; fi
+    check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26 rc-2026-11-05-c26c)"       # c26 must NOT match c26c
+    check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26b rc-2026-11-05-c26c)"      # nor c26b
+    check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33x rc-2026-11-08-c33)"        # the token must END there, not continue
+    check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33.tar rc-2026-11-08-c33)"    # a non-alphanumeric after it is fine
+    check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26c rc-2026-11-05-c26c)"      # the real c26c pair still passes
     check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 rc-2026-11-08-c33)"        # the label CONTAINS the token
     check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26c rc-2026-11-08-c33)"        # the c26 incident: must red
     check SKIP "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 '')"                        # no README tag: not a pass by absence
@@ -2169,12 +2177,20 @@ esac
 
 
 # ── the payload= label is consistent with the payload the image ships (engine#1557) ──────────────
-PNV=$(payload_name_from_image "$ID" "${PAYLOAD_DIR:-/opt/1bit-package}")
-case "$PNV" in
-    PASS*) pass payload-name "${PNV#PASS }" ;;
-    SKIP*) skip payload-name "${PNV#SKIP }" ;;
-    *)     fail payload-name "${PNV#FAIL }" ;;
-esac
+if [ ! -f "$ID" ]; then
+    skip payload-name "no $ID in this image build, so there is no payload label to read (an image older than the identity file is not wrong, it is silent)"
+elif [ -n "${_id_gitsha:-}" ]; then
+    skip payload-name "this image's identity is the mini schema (tag/engine/engine_sha256/built), which carries no payload= label and no ${PAYLOAD_DIR:-/opt/1bit-package}: there is nothing here to check"
+elif [ ! -d "${PAYLOAD_DIR:-/opt/1bit-package}" ]; then
+    skip payload-name "no ${PAYLOAD_DIR:-/opt/1bit-package} in this image, so the payload's own README cannot be read"
+else
+    PNV=$(payload_name_from_image "$ID" "${PAYLOAD_DIR:-/opt/1bit-package}")
+    case "$PNV" in
+        PASS*) pass payload-name "${PNV#PASS }" ;;
+        SKIP*) skip payload-name "${PNV#SKIP }" ;;
+        *)     fail payload-name "${PNV#FAIL }" ;;
+    esac
+fi
 
 say ""
 # The back-off leaves a trace: a run that only passed because the partition freed in time must say so, or the next

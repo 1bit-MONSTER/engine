@@ -138,6 +138,30 @@ struct Plan {
     std::string tile_order = "engine-1";
     std::string attention_mode = "causal";
     bool noncausal() const { return attention_mode == "noncausal_full_attention"; }
+    // The rotary the decoder applies (engine#799, the hybrid half).  `plain` is one position index, and is
+    // what every plan written before this field existed means.  `mrope` is the vision-conditioned form: a
+    // 3 x N block of position ids whose planes (t, h, w) advance differently across an image, so a text row
+    // with all three planes equal is bit-identical to plain RoPE while an image row is not.  `sections` is
+    // the pack's own split of the rotary width over the planes (Qwen3-VL: [24, 20, 20]), carried so the block
+    // a caller builds can be checked against the pack instead of guessed.
+    //
+    // A description, like `kv`: a caller that cannot build the planes must refuse `mrope` by name rather than
+    // fall back to one index.  The fallback is not a small error -- text after a 448x448 image resumes at
+    // position 19, where a token-count advance would give 201 (engine#799), and both predict fluently.
+    std::string rope_kind = "plain";   // "plain" | "mrope"
+    std::vector<int> rope_sections;    // mrope only: one positive width per plane
+    int rope_planes = 1;               // 1 for plain, sections.size() for mrope
+    bool mrope() const { return rope_kind == "mrope"; }
+    // What the decoder is fed (engine#799).  `tokens` is an id per row, which the decoder looks up itself, and
+    // is what every plan meant before this field.  `embeds` is rows x hidden of precomputed embeddings, already
+    // merged with any vision features -- AMD's reference splits a VL pack into embedding.onnx + text.onnx for
+    // exactly this.  `vision.merge` says who merged: "external" (a companion graph or the caller, with
+    // `feature_dim`-wide features) or "none".  Descriptive only, as above: a plan that says `embeds` and a
+    // caller that feeds ids is the caller's refusal to make, not a default to interpolate here.
+    std::string inputs_kind = "tokens";   // "tokens" | "embeds"
+    std::string vision_merge = "none";    // "external" | "none"
+    int vision_feature_dim = 0;
+    bool takes_embeds() const { return inputs_kind == "embeds"; }
     // P7 (#806) part A: what the KV cache is stored as.  `f16` is every plan written before this field
     // existed, and stays the default for that reason.  `int8` stores that side as int8 with one fp32
     // scale per (head, token), taken AFTER a per-head Hadamard rotation -- the rotation is what makes one
@@ -270,6 +294,108 @@ struct Plan {
                 throw PlanError("plan: " + path + " attention.mode \"" + p.attention_mode +
                                 "\" is not causal or noncausal_full_attention");
         }
+        // Rotary and the decoder's input kind (engine#799, the hybrid half).  Both are optional and defaulted
+        // on purpose: `plain` + `tokens` is what every plan written before these fields means, so this is not a
+        // format bump.  What is NOT defaulted is a half-stated section -- `mrope` without the planes' split, or
+        // `embeds` with no feature width, states a contract nothing can check later.
+        if (j.contains("rope")) {
+            const auto& r = obj(j, "rope", path);
+            if (r.contains("kind")) {
+                p.rope_kind = typed<std::string>(r, "kind", "rope", path);
+                if (p.rope_kind != "plain" && p.rope_kind != "mrope")
+                    throw PlanError("plan: " + path + " rope.kind \"" + p.rope_kind +
+                                    "\" is not plain or mrope");
+            }
+            if (r.contains("planes")) {
+                p.rope_planes = int_field(r, "planes", "rope", path);
+                if (p.rope_planes < 1)
+                    throw PlanError("plan: " + path + " rope.planes " + std::to_string(p.rope_planes) +
+                                    " must be at least 1");
+            }
+            if (r.contains("sections")) {
+                if (!r.at("sections").is_array())
+                    throw PlanError("plan: " + path + " rope.sections must be an array");
+                for (const auto& one : r.at("sections")) {
+                    if (!one.is_number_integer() || one.get<int>() < 1)
+                        throw PlanError("plan: " + path +
+                                        " rope.sections holds a value that is not a positive integer (each is a "
+                                        "plane's share of the rotary width)");
+                    p.rope_sections.push_back(one.get<int>());
+                }
+            }
+            if (p.rope_kind == "mrope") {
+                // The split is not optional here: without it the planes have no declared width, and a caller
+                // building them from a guess would rotate a different model than the pack was trained as.
+                if (p.rope_sections.empty())
+                    throw PlanError("plan: " + path +
+                                    " rope.kind is mrope but rope.sections is empty (one positive width per "
+                                    "plane is what makes the position block checkable against the pack)");
+                // The split is the authority on how many planes there are: `planes` is only there to be able
+                // to disagree with it out loud.
+                if (!r.contains("planes")) p.rope_planes = (int)p.rope_sections.size();
+                if (p.rope_planes < 2)
+                    throw PlanError("plan: " + path + " rope.kind is mrope but rope.planes is " +
+                                    std::to_string(p.rope_planes) + " (mrope has a plane per axis: t, h, w)");
+                if ((int)p.rope_sections.size() != p.rope_planes)
+                    throw PlanError("plan: " + path + " rope.sections has " +
+                                    std::to_string(p.rope_sections.size()) + " widths but rope.planes is " +
+                                    std::to_string(p.rope_planes) + " (one width per plane)");
+            } else {
+                // A plain rope states nothing about planes: a section here would be a contract with no reader
+                // and would read as if the planes existed.
+                if (!p.rope_sections.empty())
+                    throw PlanError("plan: " + path +
+                                    " rope.sections is set but rope.kind is plain (sections describe the mrope "
+                                    "split; a plain rope has one index)");
+                if (p.rope_planes != 1)
+                    throw PlanError("plan: " + path + " rope.planes is " + std::to_string(p.rope_planes) +
+                                    " but rope.kind is plain (a plain rope has one plane)");
+            }
+        }
+        if (j.contains("inputs")) {
+            const auto& in = obj(j, "inputs", path);
+            if (in.contains("kind")) {
+                p.inputs_kind = typed<std::string>(in, "kind", "inputs", path);
+                if (p.inputs_kind != "tokens" && p.inputs_kind != "embeds")
+                    throw PlanError("plan: " + path + " inputs.kind \"" + p.inputs_kind +
+                                    "\" is not tokens or embeds");
+            }
+            if (in.contains("vision")) {
+                // Vision features arrive inside the embeddings, so a plan that feeds ids has nowhere to put
+                // them: refused rather than ignored, because ignoring it would serve the text half of a vision
+                // model and answer confidently about an image it never saw.
+                if (p.inputs_kind != "embeds")
+                    throw PlanError("plan: " + path +
+                                    " inputs.vision is set but inputs.kind is tokens (vision features are merged "
+                                    "into embeddings, so inputs.kind must be embeds)");
+                const auto& v = obj(in, "vision", path);
+                p.vision_merge = typed<std::string>(v, "merge", "inputs.vision", path);
+                p.vision_feature_dim = int_field(v, "feature_dim", "inputs.vision", path);
+                if (p.vision_merge != "external" && p.vision_merge != "none")
+                    throw PlanError("plan: " + path + " inputs.vision.merge \"" + p.vision_merge +
+                                    "\" is not external or none");
+                if (p.vision_feature_dim < 0)
+                    throw PlanError("plan: " + path + " inputs.vision.feature_dim must not be negative");
+                if (p.vision_merge == "external" && p.vision_feature_dim == 0)
+                    throw PlanError("plan: " + path +
+                                    " inputs.vision.merge is external but feature_dim is 0 (an external merge "
+                                    "has to say how wide the features it merged are)");
+                if (p.vision_merge == "none" && p.vision_feature_dim != 0)
+                    throw PlanError("plan: " + path + " inputs.vision.feature_dim is " +
+                                    std::to_string(p.vision_feature_dim) +
+                                    " but inputs.vision.merge is none (no merge, no features)");
+            }
+        }
+        // A second graph (a vision encoder, a projector) is deliberately NOT a plan field: one plan is one
+        // decoder stream over one token sequence.  A hybrid is two model directories and a merge above them,
+        // which is the serving layer's business -- a companion list would put two graphs and their scheduling in
+        // a file whose only consumer cannot open or order them.  Refused by name rather than ignored, so a pack
+        // that tries says so at load (engine#799).
+        if (j.contains("companion"))
+            throw PlanError("plan: " + path +
+                            " companion is not part of the decoder plan: a plan describes ONE decoder stream, "
+                            "and a second graph (vision, projector) is its own model directory that the "
+                            "serving layer merges into inputs.embeds (engine#799)");
         // Optional and defaulted on purpose, for the same reason as attention.mode: a plan written
         // before P7 existed describes f16 KV, which is what every plan meant then.
         if (j.contains("kv")) {

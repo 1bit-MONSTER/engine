@@ -806,17 +806,22 @@ for dp, dns, fns in os.walk(root):
 PYSCAN
 }
 
-payload_home_layout_verdict() {   # <links resolving to a FILE> <links at a directory or absent> [<sample>]
-    _bad=${1:-} _other=${2:-} _s=${3:-}
-    case "${_bad}:${_other}" in
-        *[!0-9:]*) printf 'FAIL the home-path links in the payload could not be counted (%s:%s)' "${_bad:-empty}" "${_other:-empty}"; return 0 ;;
+payload_home_layout_verdict() {   # <links at a FILE or at NOTHING> <links at a DIRECTORY> [<sample>]
+    _bad=${1:-} _dir=${2:-} _s=${3:-}
+    case "${_bad}:${_dir}" in
+        *[!0-9:]*) printf 'FAIL the home-path links in the payload could not be counted (%s:%s)' "${_bad:-empty}" "${_dir:-empty}"; return 0 ;;
     esac
+    # FAIL on a FILE target AND on a target that is NOT THERE. A dangling `bin/1bit -> /home/<builder>/wt/build/onebit`
+    # is the leak twice over: the disclosure IS the path (the image still ships the builder's username and workdir as its
+    # layout), and it is the worse failure to stand up - nothing to load, so the engine registers no device on an
+    # otherwise fine boot. Only a DIRECTORY target is a different, legitimate thing (`root/spot -> /home/spot`, a home
+    # on /data): measured on the shipped c33 image, the whole rootfs has exactly one of those and the payload has none.
     if [ "$_bad" != 0 ]; then
-        printf 'FAIL %s absolute symlink(s) in the payload point into a home directory at a FILE%s - the image ships the build tree as its layout and no content check can see it' \
+        printf 'FAIL %s absolute symlink(s) in the payload point into a home directory at a file or at nothing%s - the image ships the builder path as its layout and no content check can see it' \
             "$_bad" "${_s:+: $_s}"
-    elif [ "$_other" != 0 ]; then
-        printf 'PASS no payload symlink resolves to a builder FILE (0); %s name a home directory or an absent target%s - not this class, named so the count travels' \
-            "$_other" "${_s:+: $_s}"
+    elif [ "$_dir" != 0 ]; then
+        printf 'PASS no payload symlink points at a builder file or at nothing (0); %s name a home DIRECTORY%s, which is a home on /data and not this class' \
+            "$_dir" "${_s:+: $_s}"
     else
         printf "PASS no absolute symlink in the payload points into a home directory: the payload's layout carries no builder path"
     fi
@@ -864,7 +869,8 @@ if [ "${1:-}" = --self-test ]; then
     # the RUNPATH rule (2026-11-08 incident): $ORIGIN only, and RPATH is always a fail.
     check PASS "$(payload_home_layout_verdict 0 0 '')"
     check FAIL "$(payload_home_layout_verdict 1 0 'bin/1bit|/home/x/wt/issue-709-build/1bit|file')"
-    check PASS "$(payload_home_layout_verdict 0 1 'root/spot|/home/spot|dangling')"
+    check FAIL "$(payload_home_layout_verdict 1 0 'bin/1bit|/home/x/wt/build/onebit|dangling')"
+    check PASS "$(payload_home_layout_verdict 0 1 'root/spot|/home/spot|dir')"
     _hl_st=$(mktemp -d)
     mkdir -p "$_hl_st/bin" "$_hl_st/opt"
     ln -s /home/nonexistent-xyz/wt/build/1bit "$_hl_st/bin/leak"   # the class: absolute, target absent
@@ -2193,10 +2199,11 @@ else
         if [ "$_hl_rc" = 2 ]; then
             skip payload-home-layout "the payload's symlinks could not be read here - that is not evidence"
         else
-            _hl_nf=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 == "file"' | wc -l)
-            _hl_no=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 != "file"' | wc -l)
-            _hl_s=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | head -3 | tr '\n' ' ')
-            HL=$(payload_home_layout_verdict "${_hl_nf:-0}" "${_hl_no:-0}" "${_hl_s:-}")
+            _hl_nf=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 != "dir"' | wc -l)
+            _hl_nd=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 == "dir"' | wc -l)
+            _hl_s=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 != "dir"' | head -3 | tr '\n' ' ')
+            [ "$_hl_nf" = 0 ] && [ -n "$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d')" ] && _hl_s=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | head -2 | tr '\n' ' ')
+HL=$(payload_home_layout_verdict "${_hl_nf:-0}" "${_hl_no:-0}" "${_hl_s:-}")
             case "$HL" in
                 PASS*) pass payload-home-layout "${HL#PASS }" ;;
                 *)     fail payload-home-layout "${HL#FAIL }" ;;

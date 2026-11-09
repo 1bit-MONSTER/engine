@@ -151,7 +151,10 @@ def held_gtt_mib(pid, proc="/proc"):
     gate exists to catch, and on the reference box two permanent embed servers (serving :8090/:8095) would otherwise make the
     gate refuse every run and turn --skip-preflight into the normal path.
     """
-    total_kib = 0
+    # `drm-total-gtt` is the CLIENT's total: the same number is printed in the fdinfo of every DRM fd that client holds, so a
+    # process with two of them would be double-counted by a sum. Take the maximum instead -- one fd is the common case, and this
+    # stays right when it is not.
+    highest_kib = 0
     fdinfo = os.path.join(proc, str(pid), "fdinfo")
     try:
         fds = os.listdir(fdinfo)
@@ -162,10 +165,10 @@ def held_gtt_mib(pid, proc="/proc"):
             with open(os.path.join(fdinfo, fd), encoding="utf-8", errors="replace") as handle:
                 for line in handle:
                     if line.startswith("drm-total-gtt:"):
-                        total_kib += int(line.split()[1])
+                        highest_kib = max(highest_kib, int(line.split()[1]))
         except (OSError, ValueError, IndexError):
             continue
-    return total_kib // 1024
+    return highest_kib // 1024
 
 
 def resident_servers(max_gtt_mib=256, proc="/proc"):
@@ -194,8 +197,29 @@ def resident_servers(max_gtt_mib=256, proc="/proc"):
     return found
 
 
-def bench_arms(llama_bench, model, n_prompt, reps, pairs, extra):
-    """Run the alternating arms and return the rates in run order (None where a row failed to parse)."""
+def environment(max_gtt_mib=256):
+    """-> (load1, gpu_busy_percent, largest resident llama-server GTT in MiB); None where unreadable.
+
+    Recorded per pair rather than only checked once: the ratio is protected against a slowdown that hits both arms, but a VOID
+    should say whether the box moved underneath it. Not used to gate mid-run -- a refusal halfway through is worse than a
+    documented contamination.
+    """
+    load = None
+    try:
+        with open("/proc/loadavg", encoding="utf-8") as handle:
+            load = float(handle.read().split()[0])
+    except OSError:
+        pass
+    resident = resident_servers(max_gtt_mib)
+    largest = max((gtt for _pid, gtt in resident), default=0)
+    return load, read_gpu_busy_percent(), largest
+
+
+def bench_arms(llama_bench, model, n_prompt, reps, pairs, extra, trace=None):
+    """Run the alternating arms and return the rates in run order (None where a row failed to parse).
+
+    `trace`, when given, receives one (pair index, load1, gpu_busy_percent, largest resident GTT) per completed pair.
+    """
     runs = []
     for index in range(pairs):
         on_first = index % 2 == 0
@@ -216,6 +240,8 @@ def bench_arms(llama_bench, model, n_prompt, reps, pairs, extra):
                     rate = parsed
             runs.append(("fa1" if arm == "-fa 1" else "fa0", rate))
             print(f"  -> {rate if rate is not None else 'no rate row'}", file=sys.stderr)
+        if trace is not None:
+            trace.append((index + 1,) + environment())
     return runs
 
 
@@ -259,6 +285,20 @@ def self_test():
     check("zero rate skipped", pair_ratios([("fa1", 0.0), ("fa0", 1350.0)]) == [])
     verdict, _ = summarise([], 1.25)
     check("no pairs reported", verdict == "insufficient", verdict)
+
+    # drm-total-gtt is client-wide: two DRM fds carrying the same total must not double it.
+    import tempfile
+    with tempfile.TemporaryDirectory() as fake:
+        pid_dir = os.path.join(fake, "4242", "fdinfo")
+        os.makedirs(pid_dir)
+        for fd_name in ("3", "5"):
+            with open(os.path.join(pid_dir, fd_name), "w", encoding="utf-8") as handle:
+                handle.write("pos:\t0\ndrm-total-gtt:\t5623808 kB\n")
+        check("two fds are not double counted", held_gtt_mib(4242, fake) == 5492, str(held_gtt_mib(4242, fake)))
+        with open(os.path.join(pid_dir, "7"), "w", encoding="utf-8") as handle:
+            handle.write("drm-total-gtt:\t11247616 kB\n")
+        check("the largest fd wins", held_gtt_mib(4242, fake) == 10984, str(held_gtt_mib(4242, fake)))
+        check("a pid with no fdinfo is zero", held_gtt_mib(9999, fake) == 0)
 
     row = "| qwen3 0.6B Q4_K - Medium       | 372.65 MiB |   596.05 M | HRX        |  99 |   1 |          pp2048 |       1718.51 ± 0.00 |"
     check("row parse", parse_rate(row) == 1718.51, str(parse_rate(row)))
@@ -327,10 +367,17 @@ def main(argv):
         if not shutil.os.path.exists(tool):
             parser.error(f"not found: {tool}")
 
+    trace = []
     runs = bench_arms(arguments.llama_bench, arguments.model, arguments.n_prompt, arguments.reps,
-                      arguments.pairs, arguments.extra.split())
+                      arguments.pairs, arguments.extra.split(), trace)
     verdict, lines = summarise(pair_ratios(runs), arguments.tolerance, requested=arguments.pairs)
     print("\n".join(lines))
+    if trace:
+        # Only when the box moved: a run that was stable end to end needs no extra noise in its output.
+        loads = [row[1] for row in trace if row[1] is not None]
+        largest = max((row[3] for row in trace), default=0)
+        if loads and (max(loads) - min(loads) > 5.0 or largest > 0):
+            print(f"environment per pair (load1, gpu_busy%, largest resident GTT MiB): {trace}")
     return {"accepted": EXIT_ACCEPTED, "void": EXIT_VOID}.get(verdict, EXIT_VOID)
 
 

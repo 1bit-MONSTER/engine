@@ -15,10 +15,13 @@
 # limitations under the License.
 """Measure a 1.9 pack's tied head against the pack's own fp16 embedding.
 
-engine#1693 was found with a scratch script: on `Qwen2.5-0.5B-Instruct_rai_1.9.0_npu` the head read from the `.fconst`
-tail correlates 0.885 with the pack's own embedding although `tie_word_embeddings` is true.  A number that cannot be
-re-run is a finding nobody can check (and a decode that agrees with itself proves nothing), so this is that measurement
-as a command: geometry from the numbers `npu/pack_import.cpp` uses, decode of the tail's tile grid, and three statistics
+engine#1693 was found with a scratch script: on `Qwen2.5-0.5B-Instruct_rai_1.9.0_npu` the head's self-check reported
+`corr 0.885220`, `rel_err 0.987007` against the pack's own embedding although `tie_word_embeddings` is true.  Those two
+figures are **not** a property of the tail: they are the #1661 self-check bug, which decoded the container's bf16 copy at
+F16 (`embed_bytes` was repointed at `embed_bf16` and the readers kept `f16_to_f32`).  engine#1690 fixes only that decode
+and changes no offset, and the importer's figure on this pack becomes `corr 0.999999`, `rel_err 0.0007`.  A number that
+cannot be re-run is a finding nobody can check (and a decode that agrees with itself proves nothing), so this is that
+measurement as a command: geometry from the numbers `npu/pack_import.cpp` uses, decode of the tail's tile grid, and three statistics
 against the fp16 `model.embed_tokens.weight` that the pack already carries.
 
 What this tool is NOT: a fix.  On the pack above it reports the geometry as *exact* (the region is `V/64` tiles of
@@ -77,8 +80,11 @@ def head_offset(fconst_bytes, ntiles, tile):
     correlation that is not 1 rather than as a silently wrong offset.
 
     Reading from `attn_payload_off(H)` alone (without the `layers * stride` term) addresses the wrong bytes by the whole
-    payload; that is the mistake engine#1693 records, and at the correct offset the decode correlates 1.0000 with the
-    pack's own fp16 embedding, magnitude ratio 1.000, rel_err 0.0007 over four tiles on
+    payload. That is a mistake made *while chasing* engine#1693 and it is worth naming, but it is not what #1693
+    measured: at that offset this tool reads chance (tile corr -0.0098 / -0.0098 / +0.0197), never 0.885, and the
+    importer never reads the head there at all -- `import_pack()` takes it at `tail_off = layers * stride`. What #1693
+    recorded (0.885220 / 0.987007) is #1661's bf16-read-as-F16 decode, fixed by #1690. At the correct offset the decode
+    correlates 1.0000 with the pack's own fp16 embedding, magnitude ratio 1.000, rel_err 0.0007 over four tiles on
     `Qwen2.5-0.5B-Instruct_rai_1.9.0_npu`.
     """
     return fconst_bytes - ntiles * tile

@@ -530,7 +530,10 @@ lemver=$("$lem/bin/lemond" --version 2>/dev/null | sed -n 's/^lemond version \([
     # the IMAGE's copy, not the build tree's and not the payload's: hashing "$root$bin" is post-`cp -L`, and nothing rewrites it
     # afterwards (the only `relocate`/patchelf calls are on the data-partition llama set). Hashing the build file would name
     # bytes the image may not carry, and hashing `$root/bin/1bit` would follow the symlink out to the host's build tree.
-    launcher=${bin:+$root$bin}
+    # engine#1543 follow-up: the engine is installed by `install_origin "$bin" "$eng"` into $root/opt/1bit, and
+    # /bin/1bit is a SYMLINK to it - nothing writes "$root$bin" any more, so hashing that path found no file and every
+    # mini image built from this tree wrote `engine_sha256: none` while carrying the engine. Hash the image's copy.
+    launcher=${bin:+"$eng/$(basename "$bin")"}
     if [ -n "${launcher:-}" ] && [ -f "$launcher" ]; then
         echo "engine_sha256: $(sha256sum "$launcher" | cut -c1-64)"
     else

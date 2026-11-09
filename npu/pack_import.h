@@ -129,6 +129,7 @@ struct Plan {
     // the node's own initializer, reports a weightless graph for the 1.9 external-data packs (engine#1503).
     int64_t graph_ryzenai_matmuls = 0;
     int64_t graph_packed_siblings = 0;
+    int64_t graph_weightless_matmuls = 0;   // dropped: placeholder + packed sibling both byte-less (engine#1671)
     // How many of the graph's 4-bit block-128 weights satisfy length == N x (K/128 + 1) x 68 (the per-row stride the
     // .fconst tile also carries): a measurement, so `info` can say "201 of 201" or "3 of 7" instead of guessing.
     int64_t graph_stride_ok = 0, graph_stride_of = 0;
@@ -330,6 +331,25 @@ Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);
+// Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,
+// exported so a test can pin the buffer width it decodes).
+/* The embedding table the self-check compares a head against, with its WIDTH in the value (engine#1721).
+ *
+ * `embed_bytes` was a bare `const uint8_t*` that meant the pack's own f16 bytes and then -- from #1661, silently --
+ * the container's bf16 copy, and four readers went on decoding F16. Nothing objected at compile time, and the
+ * result was not a crash but a plausible number: corr 0.885220 / rel_err 0.987 on a tied pack whose container
+ * scores 0.999999. So the format travels with the pointer, the default is what the importer actually holds
+ * (bf16), and a reader that wants F16 has to say so. */
+struct EmbedTable {
+    const uint8_t* p = nullptr;
+    enum class Fmt { F16, BF16 } fmt = Fmt::BF16;
+    int H = 0;                       // row stride in ELEMENTS, both formats are 2 bytes
+    bool ok() const { return p != nullptr && H > 0; }
+};
+// The only decode: bf16 or f16 per t.fmt. out-of-range rows still read (callers clamp), as before.
+double embed_at(const EmbedTable& t, int row, int k);
+
+double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows);
 // Where a layer block's attention payload starts: the block's 64-byte header, then its
 // input_layernorm weight as bf16 [hidden]. So it is `64 + 2 x hidden`, not a constant. It reads 1,856 on
 // the 0.5B pack (hidden 896) and 4,160 on Llama-3.2-1B (hidden 2,048); reading it as the constant is what

@@ -266,6 +266,9 @@ add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a
 # second real gpu-hold reaps it and leaves the note the victim quotes. No device, no build; skips (77) without the script.
 add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_ticket_lost_test.sh)
+# engine#1701: the NPU hold's queue/token follow ONEBIT_HOLD_DIR, and its queue settings never reach the payload.
+# Shell only (a stub gpu-hold plus the tree's own), no device, ~1 s.
+add_test(NAME npu_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_hold_test.sh)
 # engine#1485: the two port read-backs the route tests use (tests/serve_port.sh). Script-based, no device, no model --
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
@@ -274,6 +277,8 @@ add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.
 # wedged in uninterruptible sleep, which user space cannot create, so this covers the other half: a holder that released with
 # a survivor must leave a record, and the NEXT holder must warn about it and clear it.
 add_test(NAME gpu_hold_survivors COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_survivors_test.sh)
+add_test(NAME gpu_hold_group
+         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_group_test.sh)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
@@ -285,6 +290,14 @@ add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
 # check; the two permanent services are exempt by name. --self-test drives the decision, no device needed.
 add_test(NAME device_holders COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
+# engine #1668: the bench preflight must pin the load mode, because `-lm none` is +17.5 % prefill at -1.6 % decode for +604 MiB of
+# GTT. The script existed with a test that nothing ran; a test nobody runs is a comment, so the loader/flag assertions are registered
+# here (the test fakes the box, so it needs no device and no ticket).
+add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-preflight.sh)
+# engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
+# placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
+# traces with a known answer; no model, no device.
+add_test(NAME moe_placement COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
@@ -357,6 +370,16 @@ target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 add_executable(npu_load_retry_test tests/npu_load_retry_test.cpp)
 target_include_directories(npu_load_retry_test PRIVATE app)
 add_test(NAME npu_load_retry COMMAND npu_load_retry_test)
+
+# The optional-op fallback seam (npu/model/op_dispatch.h, engine#803 A3): every op but `gemv` is optional, and the
+# model runs its own implementation when the target does not take it -- including when the target claims it and
+# fails. Header only, stub targets, no device and no runtime library, so it runs in CI.
+add_executable(npu_op_dispatch_test tests/npu_op_dispatch_test.cpp)
+target_include_directories(npu_op_dispatch_test PRIVATE npu)
+add_test(NAME npu_op_dispatch COMMAND npu_op_dispatch_test)
+# ci.yml builds a named list of targets, so a test target that is not in it reports "Not Run" (#635); this lane's
+# token cannot edit the workflow. Hooking onto one that IS in the list gets it built there too.
+add_dependencies(npu_sampling_test npu_op_dispatch_test)
 
 add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose target is
@@ -1191,6 +1214,14 @@ add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.
 # patch-sfs needs uid/gid and setuid bits - this is the only test here that does, hence the property.
 add_test(NAME patch_sfs_atomic COMMAND ${CMAKE_SOURCE_DIR}/tests/patch_sfs_atomic_test.sh)
 set_tests_properties(patch_sfs_atomic PROPERTIES SKIP_RETURN_CODE 77)
+# build-static.sh must never print a quotable artifact hash for a tree that is not a commit (engine#1326, from
+# engine#1323's mis-quoted hash). The toolchain is stubbed inside the test - it is the provenance line under test,
+# not the compile - so this costs milliseconds and needs no rustup, no musl target and no network.
+add_test(NAME build_static_provenance COMMAND ${CMAKE_SOURCE_DIR}/tests/build_static_provenance_test.sh)
+# embed/usr/local/bin/1bit-console owns tty1 and its whole job is that there is no path from this screen to a bare
+# prompt; nothing tested it. Same shape as the test above - the script is copied and its absolute paths rewritten into
+# a temp tree, so every branch (installer, desktop, TUI-then-menu, no-TUI) is reachable without root or a build.
+add_test(NAME console_chain COMMAND ${CMAKE_SOURCE_DIR}/tests/console_chain_test.sh)
 # build_path_strings must see compiler output, not only ELFs: a shipped devicetable-offsets.s with 449 build-tree paths
 # passed the row that exists to stop that (engine#1487). No root, no fixture beyond two text files.
 add_test(NAME pack_check_generated_text COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_check_generated_text_test.sh)

@@ -692,7 +692,11 @@ ggml_hrx: HRX0 guardrail: GTT total 120.0 GiB, in use 40.7 GiB, ceiling 104.0 Gi
           pool budget 63.3 GiB - a launch that needs more is refused here rather than faulting the device (engine #680)
 ```
 
-`pool budget = ceiling - in use`, and a launch needing more than that is **refused**, not faulted. So the first thing a measurement needs is the budget,
+`pool budget = ceiling - in use`, and a **buffer allocation** needing more than that is refused at the allocator, not faulted. What the guardrail
+charges is the ggml tensor buffers — the runtime's transient arena (the per-launch scratch a large case actually grows into), its host-visible
+staging and its command-program buffers allocate **uncharged**, so this line is a rule about tensor-buffer allocations and not a promise that a launch
+cannot exhaust the pool (engine #1711, measured 2026-11-09; that is also why the #1417 crash is neither prevented by the guardrail nor cheap to
+reproduce). So the first thing a measurement needs is the budget,
 not the file: two lanes independently arrived at the same rule from opposite sides — the Zyphra lane refuses below a 12 GiB budget for a 5.8 GiB model, and
 the architecture lane refuses below `3.0 x weights + 2 GiB` (an 8B row was refused at budgets of 13.6 / 13.5 / 10.8 GiB). Over eight hours of this box's
 evening the budget sat at **14-17 GiB** while long-lived services held the rest, which is why runs "that worked yesterday" crawl today. Two `llama-server`

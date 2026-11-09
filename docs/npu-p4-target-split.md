@@ -162,6 +162,35 @@ proved by the byte-exact gate rather than assumed. It is listed in §5.
 - Optional ops get their host fallbacks here: `gdn_step`, `attn_step`, `lm_head` return false from a target
   that does not implement them, and the model runs its own implementation (today's code, unchanged).
 
+### A3a — the fallback seam, and what it can honestly wire today
+
+The interface's promise ("the model falls back to its own host implementation when `supports(op)` is false") had
+**no caller anywhere in the tree**: `git grep 'supports(Op::'` found nothing in `npu/` or `app/`, so the contract was
+declared and unimplemented. `npu/model/op_dispatch.h` is that missing side, and it is the part of A3 with logic in it
+— the rest of A3 is a move.
+
+One function per optional op, each returning "the target did it, do not run yours" or "it did not, run yours". The
+answer is `supports(op) && <op>(...)`, never `supports(op)` on its own: a target that **claims** an op and then fails
+it (its state is not resident, say) must not swallow the op, or the layer silently produces whatever the
+half-executed op left behind. `tests/npu_op_dispatch_test.cpp` (ctest `npu_op_dispatch`, stub targets, no device, no
+runtime library) pins both failure modes plus the claiming-and-running case, and runs in CI by hooking onto
+`npu_sampling_test`'s target — `ci.yml` builds a named list, so an unhooked test target reports "Not Run" (#635).
+
+**Wired today: `lm_head` only.** Its contract is complete without residency — one hidden row `[H]` to `[V]`, the
+weights are the model's, and it is idempotent — so `Q4nxNpuForward::run_lm_head` asks the target first, behind a
+`supports()` check so that no per-token `[V]` buffer is allocated while no target claims it. No target on this box
+claims it (XdnaTarget's `supports()` is `gemv`-only), so the numerics are unchanged by construction.
+
+**Not wired, and why:** `gdn_step` and `attn_step` require the layer's parameters and state to be **resident**
+(`load_block()`), and `XdnaTarget::load_block()` is still the documented no-op ("weights still fill lazily per
+projection"). Wiring the dispatch before that residency exists would hand a target an op it cannot honour and hide
+the reason inside a fallback that always fires. The helpers exist and are tested; they are the seam those two ops
+land on when A2c/`load_block()` arrives.
+
+What remains of A3 proper: the state move (`c_`, `sem_`, `embed_*`, KV, GDN state, `mla_*`, `moe_*`) into
+`npu/model/npu_model.{h,cpp}`, and its gate — window11 text identity, logits KLD 0 on 8 prompts, a profile table
+within 2 % — which needs device windows and a quiet box.
+
 A3 is the step with the large diff and no numerical content; it goes after the gate proves A1+A2.
 
 ## 4. Gate (unchanged from #803)
@@ -175,6 +204,23 @@ A3 is the step with the large diff and no numerical content; it goes after the g
    device is opened**, which is what makes the row measurable without a ticket: `--npu-target hexagon` prints
    `--npu-target hexagon: this build has no such target (compiled: xdna)` and exits, and the same message comes
    out of `serve --device npu --npu-target hexagon` because it reaches the forward unchanged.
+
+   **Measured (2026-11-09, `ONEBIT_NPU=ON` against the shipping runtime, no ticket and no device — the refusal is
+   before both):**
+
+   | form | what it prints |
+   |---|---|
+   | `forward-serve … --npu-target hexagon` | `--npu-target hexagon: this build has no such target (compiled: xdna)` |
+   | `forward-serve …` (default) | proceeds to its own checks — `xdna` is the default |
+   | `serve --device npu --npu-target hexagon` | the same by-name message, carried through the child |
+
+   **One caveat the `serve` row earned:** it only reaches the child after `serve`'s own kernel resolution succeeds.
+   With a pack whose full ELFs resolve nothing, `serve` refuses first with *its* message (`… no NPU kernel (full ELF)
+   directory resolves for it: set ONEBIT_NPU_KERNELS …`) and the target refusal is never printed — measured on
+   `Qwen3-0.6B` and on `bonsai2-27b-t2s2-serve`, whose `kernels-m16/` does not satisfy that check. That is not a
+   defect to fix in code: the route cannot run without kernels either, and duplicating the compiled-target list into
+   `serve` to reorder the two refusals would break the rule that keeps the list in one place. It is a reason to set
+   the kernels up before testing this row, which is what the table's third line did.
 
 Runs go through `npu-hold` tickets; a new ELF is not involved (no kernel changes), so tickets are the normal
 kind. The reference binary is the `c20`-era build with the same model dir, so a difference can only be the

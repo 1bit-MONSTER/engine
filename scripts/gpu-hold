@@ -102,9 +102,12 @@ mkdir -p "$QUEUE" || { echo "gpu-hold: cannot create $QUEUE" >&2; exit 2; }
 COOLDOWN_STAMP="$QUEUE/.cooldown"      # "<epoch> <C>" of the last hold that ended hot; shared by every label
 [ -n "$LABEL" ] || LABEL="$(basename -- "$1")-$$"
 SAFE=$(printf '%s' "$LABEL" | tr -c 'A-Za-z0-9_.-' '_')
+ABORT_STAMP=""                       # touched by the watchdog when a tree-kill starts (see kill_tree_started)
 TICKET="$QUEUE/$(printf '%020d' "$(date +%s%N)").$SAFE"
 RELEASED_AT="$QUEUE/.released-at.$SAFE"
 TICKET_NAME=$(basename "$TICKET")
+ABORT_STAMP="$QUEUE/.kill-tree.$$"
+DONE_STAMP="$QUEUE/.hold-done.$$"    # payload gone; the watchdog may end
 
 state=queued
 mine=""
@@ -256,26 +259,53 @@ descendants() {   # <pid> -> its descendants and then itself, deepest last
     printf '%s\n' "$1"
 }
 kill_tree() {
-    local root=$1 grace=${2:-10} i=0 p
-    for p in $(descendants "$root"); do kill -TERM "$p" 2> /dev/null; done
-    while kill -0 "$root" 2> /dev/null && [ "$i" -lt "$grace" ]; do
+    local root=$1 grace=${2:-10} i=0 p alive tree
+    # Snapshot BEFORE signalling. After the TERM the root is usually gone and its children are reparented
+    # to init, so a second `ps --ppid` walk finds only a corpse: the re-walk this replaced left a
+    # TERM-ignoring grandchild alive (measured 2026-11-09, reproduced by tests/gpu_hold_tree_test.sh's
+    # stubborn case). One snapshot, TERM over it, KILL over the same list.
+    tree=$(descendants "$root")
+    for p in $tree; do kill -TERM "$p" 2> /dev/null; done
+    # Wait on ANY survivor, not on the root: the root dies on the first TERM, and ending the grace period
+    # there gives everything below it no time at all.
+    while [ "$i" -lt "$grace" ]; do
+        alive=0
+        for p in $tree; do
+            if kill -0 "$p" 2> /dev/null; then
+                alive=1
+                break
+            fi
+        done
+        [ "$alive" = 1 ] || break
         sleep 1
         i=$((i + 1))
     done
-    for p in $(descendants "$root"); do kill -KILL "$p" 2> /dev/null; done
+    for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
+
+# Has the watchdog started a tree-kill? `wait "$child"` returns as soon as the payload's root exits, which
+# can be before the watchdog has finished its grace period — killing the watchdog there ends the hold's own
+# tree-kill and leaves the grandchildren alive (engine#1624, found independently in #1629). The marker is
+# written by the watchdog before it signals, and main waits for the watchdog instead of killing it.
+kill_tree_started() { [ -e "$ABORT_STAMP" ]; }
 
 watch() {
     local target=$1
     while sleep 2; do
+        # The payload is gone and main has finished with it: nothing left to watch. Any kill_tree this loop
+        # started has already returned (it is synchronous inside this function), so breaking here cannot cut
+        # a tree-kill short.
+        [ -e "$DONE_STAMP" ] && return
         t=$(tctl)
         if [ "$t" -ge "$TCTL_ABORT" ]; then
             log "ABORT die at ${t}C (limit ${TCTL_ABORT}C)"
+            : > "$ABORT_STAMP"
             kill_tree "$target"
             return
         fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
             log "max hold of ${MINUTES} min reached"
+            : > "$ABORT_STAMP"
             kill_tree "$target"
             return
         fi
@@ -290,8 +320,19 @@ rc=$?
 if [ "$rc" = 143 ] && [ "$(date +%s)" -ge "$deadline" ]; then rc=124; fi
 held=$(( $(date +%s) - started ))
 
+# Ending the hold must not end a tree-kill that is in flight. The watchdog is synchronous — it either has
+# finished kill_tree or is sleeping between polls — so main marks the hold done and lets the loop end at its
+# next tick instead of killing it. Killing it was what left a TERM-ignoring grandchild alive once the
+# payload's root had already exited (engine#1624). Bounded, so a wedged watchdog cannot hold the token.
+: > "$DONE_STAMP"
+i=0
+while kill -0 "$watchdog" 2> /dev/null && [ "$i" -lt 20 ]; do
+    sleep 1
+    i=$((i + 1))
+done
 kill "$watchdog" 2> /dev/null
 wait "$watchdog" 2> /dev/null
+rm -f "$ABORT_STAMP" "$DONE_STAMP"
 log "command exited $rc after ${held}s"
 release
 exit "$rc"

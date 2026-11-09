@@ -66,4 +66,36 @@ if kill -0 "$deep" 2> /dev/null; then
     exit 1
 fi
 echo "ok   the grandchild was killed with the hold (hold rc=$rc)"
+
+# Case 2: the case the FIRST version of this fix missed. The root dies on TERM (normal), but a descendant
+# IGNORES it — and once the root is gone its children are reparented to init, so a KILL pass that re-walks
+# `ps --ppid` from the root finds only a corpse. The tree must be snapshotted before signalling, and main
+# must not kill the watchdog while a tree-kill is in flight.
+cat > "$scratch/mid2.sh" <<'MID'
+#!/bin/bash
+( trap '' TERM; exec -a gpu-hold-stubborn sleep 300 ) &
+echo $! > "$1/stubborn.pid"
+sleep 300
+MID
+cat > "$scratch/wrapper2.sh" <<'WRAP'
+#!/bin/bash
+bash "$1/mid2.sh" "$1" &
+wait
+WRAP
+chmod +x "$scratch/mid2.sh" "$scratch/wrapper2.sh"
+: > "$scratch/out2"
+GPU_QUEUE_DIR=$q GPU_TOKEN_FILE=$scratch/TOKEN2 GPU_HOLD_LOG=$scratch/log2 \
+GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=2 \
+GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE=$scratch/tctl2 GPU_HOLD_THERMAL_FLAG=$scratch/x \
+    "$hold" -t 0.05 -l selftest-stubborn -- "$scratch/wrapper2.sh" "$scratch" >>"$scratch/out2" 2>&1
+stubborn=$(cat "$scratch/stubborn.pid" 2>/dev/null)
+if [ -z "$stubborn" ]; then
+    echo "FAIL the stubborness case never started (see $scratch/out2)"; sed 's/^/     /' "$scratch/out2"; exit 1
+fi
+if kill -0 "$stubborn" 2> /dev/null; then
+    echo "FAIL a TERM-ignoring grandchild ($stubborn) outlived the hold after its root died — the snapshot/KILL-pass bug"
+    kill -9 "$stubborn" 2> /dev/null
+    exit 1
+fi
+echo "ok   a TERM-ignoring grandchild dies even when the root exits first"
 echo "gpu_hold_tree: ok"

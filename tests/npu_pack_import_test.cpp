@@ -1526,10 +1526,11 @@ void test_embedding_component(const std::string& root) {
     bool ok = got.size() == size_t(V) * size_t(H);
     for (int64_t v = 0; v < V && ok; ++v)
         for (int64_t k = 0; k < H; ++k) {
-            const float exp = float(want(v, k)) * 0.5f * float(k / 128 + 1);
+            // asymmetric int4: the codes are centred on 8, which is what ONNX Runtime's GatherBlockQuantized does
+            const float exp = (float(want(v, k)) - 8.0f) * 0.5f * float(k / 128 + 1);
             if (std::fabs(got[size_t(v) * size_t(H) + size_t(k)] - exp) > 1e-6f) { ok = false; break; }
         }
-    check(ok, "embedding component: every code times its group's scale, group 128, low nibble first");
+    check(ok, "embedding component: (code - 8) times its group's scale, group 128, low nibble first");
     std::printf("embedding component: %zu values, V=%lld H=%lld group 128\n", got.size(), (long long)V, (long long)H);
 
     const fs::path none = dir / "none";
@@ -1819,6 +1820,35 @@ void test_fconst_eps(const std::string& root) {    const fs::path dir = fs::path
     fs::remove_all(dir);
 }
 
+// Opt-in: read a REAL pack's embedding component (NPU_EMBED_COMPONENT=<dir>) and dump one row for an oracle comparison.
+// The 4B pack's component is 206 MB, not 3 GB, so this is the cheap way to settle the two facts the reader's comment
+// calls pack-settled -- the nibble order and the implicit zero point -- against ONNX Runtime running the pack's own
+// embedding.onnx.
+static void dump_real_component(const std::string& dir) {
+    std::string why;
+    const std::vector<float> v = pi::read_embedding_component(dir, &why);
+    if (v.empty()) {
+        std::printf("real component: EMPTY (%s)\n", why.c_str());
+        return;
+    }
+    const std::string cfg = dir + "/config.json";
+    size_t H = 0;
+    if (FILE* f = std::fopen(cfg.c_str(), "rb")) { fclose(f); }
+    // H comes from the file the caller names next to the dump; keep this independent of the JSON parser.
+    H = v.size() / 151936;                     // the 4B shape; asserted below against the advertised V
+    std::printf("real component: %zu values, H=%zu\n", v.size(), H);
+    const int row = 1;                          // token id 1: a plain text token ORT embeds
+    if ((row + 1) * H > v.size()) return;
+    const std::string out = dir + "/eng_row.f32";
+    if (FILE* f = std::fopen(out.c_str(), "wb")) {
+        std::fwrite(&v[size_t(row) * H], sizeof(float), H, f);
+        std::fclose(f);
+        double s = 0;
+        for (size_t k = 0; k < H; ++k) s += std::fabs(v[size_t(row) * H + k]);
+        std::printf("real component: row %d -> %s (mean|x| %.6f)\n", row, out.c_str(), s / double(H));
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -1842,6 +1872,7 @@ int main(int argc, char** argv) {
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
+        if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

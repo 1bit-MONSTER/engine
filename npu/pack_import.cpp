@@ -740,15 +740,19 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
     const uint8_t* sc = get(*scales, n_scales * 4);
     const uint8_t* qw = get(*table, uint64_t(V) * uint64_t(packed));
     const int block = int(H / groups);
-    // Nibble order is a property of the packing: MatMulNBits packs differ between packs, which is why the decoder takes
-    // `swap_nibbles`. GatherBlockQuantized stores the first element of a pair in the LOW nibble, which is the decoder's
-    // `swap_nibbles = false`.
+    // Two conventions, both settled against ONNX Runtime running this pack's own embedding.onnx rather than assumed:
+    // the first element of a pair is the LOW nibble (`swap_nibbles = false`), and the codes are **asymmetric int4 with
+    // zero point 8**, i.e. value = (code - 8) * scale. Measured on token 1 of
+    // amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: low-first + zp 8 reproduces ORT's row with cosine 1.000000 and max|d| 0,
+    // while low-first + zp 0 gives cosine 0.317 and either high-first variant gives ~-0.05.
+    const int zp = 8;                     // 2^(bits-1) for GatherBlockQuantized's unsigned 4-bit codes
     const Q4 q = decode_matmulnbits(qw, reinterpret_cast<const float*>(sc), nullptr, int(V), int(H), block, false, true);
     std::vector<float> out(size_t(V) * size_t(H));
     for (int64_t v = 0; v < V; ++v)
         for (int64_t k = 0; k < H; ++k) {
             const size_t gi = size_t(v) * size_t(H / 32) + size_t(k) / 32;
-            out[size_t(v) * size_t(H) + size_t(k)] = float(q.codes[size_t(v) * size_t(H) + size_t(k)]) * q.scale[gi];
+            out[size_t(v) * size_t(H) + size_t(k)] =
+                float(int(q.codes[size_t(v) * size_t(H) + size_t(k)]) - zp) * q.scale[gi];
         }
     return out;
 }

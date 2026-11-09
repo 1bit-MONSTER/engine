@@ -840,7 +840,23 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         else if (t.name.size() > 3 && t.name.compare(t.name.size() - 3, 3, "_Q4") == 0) table = &t;
         else if (!table && t.dims.size() == 2) table = &t;   // an unquantised [V, H] table
     }
-    if (!table || !scales) { if (why) *why = "embedding.onnx has no embed_tokens table + scales"; return {}; }
+    // Name what was FOUND rather than what is missing (engine#1725). A component with an f32 table and no scales is the
+    // gemma-4 shape -- `embedding.embed_tokens.weight (262144, 1536) f32, external` next to a `per_layer` table of
+    // (262144, 8960) -- and the old message ("no embed_tokens table + scales") described a component the reader had just
+    // located as though it were absent, which is the misleading-instrument class this session has spent its time on.
+    if (!table) { if (why) *why = "embedding.onnx declares no tensor whose name matches embed_tokens"; return {}; }
+    if (!scales) {
+        if (why) {
+            const OnnxType ty = OnnxType(table->type);
+            const char* fmt = ty == kF32 ? "f32" : ty == kF16 ? "f16" : ty == kBF16 ? "bf16" : "a non-float type";
+            *why = "embedding.onnx's " + table->name + " is " +
+                   (table->dims.size() == 2 ? std::to_string(table->dims.at(0)) + " x " +
+                                                  std::to_string(table->dims.at(1)) : std::string("not 2-D")) +
+                   " " + fmt + " with no *scales* tensor: that is the UNQUANTISED shape (gemma-4's), which this reader "
+                   "does not implement yet (engine#1725), not a component that is missing";
+        }
+        return {};
+    }
     if (table->dims.size() != 2 || scales->dims.size() != 2) { if (why) *why = "embed_tokens dims are not 2-D"; return {}; }
     const int64_t V = table->dims.at(0), packed = table->dims.at(1), groups = scales->dims.at(1);
     if (V <= 0 || packed <= 0 || groups <= 0) { if (why) *why = "embed_tokens dims are not positive"; return {}; }

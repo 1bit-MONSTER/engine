@@ -1837,6 +1837,30 @@ void test_attn_payload_off() {
 // GatherBlockQuantized. Shape measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: weight_Q4 [V, H/2] UINT8 and
 // weight_scales [V, groups] FLOAT with group 128. Driving the reader against known codes and scales pins the
 // dequantisation without a 3 GB pack.
+// engine#1725: a component whose table is f32 and has no scales is the gemma-4 shape, and the reader must SAY that rather
+// than report a component it has just found as missing. The message is the whole deliverable of this arm.
+void test_unquantised_embedding_refusal(const std::string& root) {
+    const fs::path dir = fs::path(root) / "embed-f32-1725";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const int64_t V = 8, H = 16;
+    std::vector<float> tbl(size_t(V) * size_t(H), 0.25f);
+    std::string data(reinterpret_cast<const char*>(tbl.data()), tbl.size() * sizeof(float));
+    put_file((dir / "embedding.onnx.data").string(), data);
+    const auto t = pb::tensor("embedding.embed_tokens.weight", {V, H}, "embedding.onnx.data", 0,
+                              tbl.size() * sizeof(float), 1);
+    put_file((dir / "embedding.onnx").string(), pb::model({t}, {}));
+    std::string why;
+    const std::vector<float> got = pi::read_embedding_component(dir.string(), &why);
+    check(got.empty(), "f32 embedding: the unquantised shape is refused, not decoded as if it had scales");
+    check(why.find("embed_tokens.weight") != std::string::npos, "f32 embedding: the message names the tensor it FOUND");
+    check(why.find("8 x 16") != std::string::npos && why.find("f32") != std::string::npos &&
+              why.find("engine#1725") != std::string::npos,
+          "f32 embedding: and states its shape, its type and which issue owns the missing reader");
+    std::printf("  f32 embedding refusal: %s\n", why.c_str());
+    fs::remove_all(dir);
+}
+
 void test_embedding_component(const std::string& root) {
     const fs::path dir = fs::path(root) / "embedcomp";
     fs::remove_all(dir);
@@ -2325,6 +2349,7 @@ int main(int argc, char** argv) {
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
+        test_unquantised_embedding_refusal(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);

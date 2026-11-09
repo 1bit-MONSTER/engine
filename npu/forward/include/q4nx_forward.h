@@ -455,7 +455,10 @@ private:
     std::vector<float> mla_qan_, mla_kvan_;             // q_a / kv_a layernorms
     std::vector<float> w_kb_, w_vb_;                    // [NH][N][K], N padded for k_b
     int kb_rows_ = 0;                                   // k_b's padded row count (256)
-    std::vector<std::vector<float>> mla_kn_, mla_kr_, mla_v_;  // per-layer MLA caches
+    // The model owns the state the launch path writes (A3); references keep every use site unchanged.
+    std::vector<std::vector<float>> & mla_kn_ = model_.mla_kn;
+    std::vector<std::vector<float>> & mla_kr_ = model_.mla_kr;
+    std::vector<std::vector<float>> & mla_v_ = model_.mla_v;
     std::vector<float> moe_router_, moe_router_b_, share_g_, share_u_, share_d_, share_router_;
     std::vector<float> dense_g_, dense_u_, dense_d_;    // leading dense layer only
     // Routed experts stay packed until selected: per layer the Q4NX pools them as
@@ -475,7 +478,8 @@ private:
     std::vector<float> wq_, wk_, wv_, wo_, wg_, wu_, wd_;
 
     // KV cache: [layer] -> pos-major [max_pos][NKV][HD]
-    std::vector<std::vector<float>> kcache_, vcache_;
+    std::vector<std::vector<float>> & kcache_ = model_.kcache;   // per-layer attention K/V, owned by the model (A3)
+    std::vector<std::vector<float>> & vcache_ = model_.vcache;
 
     std::vector<float> B_;        // packed weight scratch  (max K*N floats)
     // Packed-int8 weight cache, one weight BO per (layer, wkey), packed on first
@@ -524,7 +528,7 @@ private:
     std::vector<float> ple_norm_;       // per_layer_proj_norm  [ple_dim]
     std::vector<float> ple_model_proj_; // per_layer_model_proj [NL*ple_dim][H]
     std::vector<float> ple_input_;      // this token's per-layer inputs [NL][ple_dim]
-    std::vector<int>    kv_owner_;      // per layer: layer whose K/V it reuses (itself)
+    std::vector<int> & kv_owner_ = model_.kv_owner;   // per layer: layer whose K/V it reuses (itself)
     // per-layer Gemma4 tensors
     std::vector<std::vector<float>> pre_ff_norm_, post_ff_norm_, post_ln_;  // [H]
     std::vector<float> layer_scale_;                                        // [NL]
@@ -565,7 +569,8 @@ private:
     };
     std::vector<GdnSmall> gdn_small_;     // [layer]
     bool gdn_cache_ = true;               // NPU_GDN_CACHE=0 disables
-    std::vector<std::vector<float>> conv_state_, rec_state_;  // [CD][CK-1], [nvh][khd][vhd]
+    std::vector<std::vector<float>> & conv_state_ = model_.conv_state;   // [CD][CK-1]
+    std::vector<std::vector<float>> & rec_state_ = model_.rec_state;     // [nvh][khd][vhd]
     // One GDN token step: xn is the normed input; out gets the out_proj result.
     bool gdn_layer(int l, const std::vector<float>& xn, std::vector<float>& out);
     // ---- deferred GDN commit (speculative verify) ------------------------------------------------

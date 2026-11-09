@@ -1883,6 +1883,44 @@ void test_embedding_component(const std::string& root) {
     if (!getenv("KEEP_EMBEDCOMP")) fs::remove_all(dir);
 }
 
+
+// engine#1690: the head's self-check must decode the embedding at the width the importer holds. `embed_bytes` is the
+// container's bf16 copy on every path (#1661 made that true and left four readers decoding F16), so a tied
+// Qwen2.5-0.5B 1.9 pack reported corr 0.885220 -- and "untied" -- for a container whose own numbers are 0.999999.
+// This pins the statistic against a known matrix at both widths: the bf16 buffer must correlate ~1.0, and the same
+// values encoded as F16 must not, which is the arm that would have caught #1661 when it landed.
+void test_selfcheck_reads_bf16() {
+    const int V = 64, H = 64;
+    auto code_of = [&](int n, int k) { return (n * 7 + k) % 8; };
+    pi::Q4 q;
+    q.N = V;
+    q.K = H;
+    q.block = 32;
+    q.codes.resize(size_t(V) * H);
+    q.scale.assign(size_t(V) * (H / 32), 0.5f);
+    q.zero.assign(size_t(V) * (H / 32), 0.0f);
+    for (int n = 0; n < V; ++n)
+        for (int k = 0; k < H; ++k) q.codes[size_t(n) * H + k] = uint8_t(code_of(n, k));
+    // the same values, once as bf16 (what the importer holds) and once as f16 (what it used to assume)
+    std::vector<uint8_t> bf(size_t(V) * H * 2), f16(size_t(V) * H * 2);
+    for (int n = 0; n < V; ++n)
+        for (int k = 0; k < H; ++k) {
+            const float v = float(code_of(n, k)) * 0.5f;   // 0.0 .. 3.5, exact in both formats
+            const uint16_t b = pi::bf16_bits_of(v);
+            const uint16_t h = uint16_t(v == 0.0f ? 0x0000 : (0x3800 | (uint16_t(std::lround(v * 2.0f) - 2) << 10)));
+            const size_t i = (size_t(n) * H + k) * 2;
+            bf[i] = uint8_t(b & 0xFF); bf[i + 1] = uint8_t(b >> 8);
+            f16[i] = uint8_t(h & 0xFF); f16[i + 1] = uint8_t(h >> 8);
+        }
+    const double good = pi::corr_bf16(q, bf.data(), H, V);
+    const double wrong = pi::corr_bf16(q, f16.data(), H, V);
+    std::printf("selfcheck-bf16: corr(bf16 buffer) %.6f, corr(f16 buffer) %.6f\n", good, wrong);
+    check(good > 0.999, "selfcheck-bf16: the statistic reads the bf16 buffer the importer holds (corr " +
+                            std::to_string(good) + ")");
+    check(wrong < 0.99, "selfcheck-bf16: and reading the same values at the wrong width does not (corr " +
+                            std::to_string(wrong) + ") -- the arm that would have caught #1661");
+}
+
 void test_qwen3_attn_sections() {
     struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
     const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
@@ -2288,6 +2326,7 @@ int main(int argc, char** argv) {
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
+        test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();

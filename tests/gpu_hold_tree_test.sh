@@ -142,4 +142,60 @@ if [ -f "$scratch/TOKEN" ]; then
 fi
 echo "ok   and released the token"
 
+# The two arms #1642 does not have (engine#1640): a signal while the hold is still QUEUED, and the ordering the guard
+# depends on. The queued arm is the other side of `[ -n "$child" ]`; the ordering arm exists because #1642's `declare -F
+# kill_tree` guard silently skips the kill in the window between `child=$!` and the helper's definition.
+cat > "$scratch/mid_signal2.sh" <<'MID'
+#!/bin/bash
+( exec -a gpu-hold-signal2-child sleep 300 ) &
+echo $! > "$1/signal2.pid"
+sleep 300
+MID
+chmod +x "$scratch/mid_signal2.sh"
+rm -f "$scratch/signal2.pid" "$scratch/TOKEN"
+
+GPU_QUEUE_DIR=$q GPU_TOKEN_FILE=$scratch/TOKEN GPU_HOLD_LOG=$scratch/log \
+GPU_HOLD_POLL=1 GPU_HOLD_WAIT=5 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=2 \
+GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE=$scratch/tctl GPU_HOLD_THERMAL_FLAG=$scratch/x \
+    "$hold" -t 5 -l selftest-signal2 -- "$scratch/mid_signal2.sh" "$scratch" >/dev/null 2>&1 &
+hold2=$!
+for _ in $(seq 100); do [ -s "$scratch/signal2.pid" ] && break; sleep 0.1; done
+sig2=$(cat "$scratch/signal2.pid" 2>/dev/null)
+if [ -z "$sig2" ]; then echo "FAIL the second signalling payload never started"; kill -9 "$hold2" 2>/dev/null; exit 1; fi
+kill -TERM "$hold2" 2> /dev/null
+wait "$hold2" 2> /dev/null
+if kill -0 "$sig2" 2> /dev/null; then
+    echo "FAIL the payload ($sig2) survived a TERM to the hold - it holds the device with the token free"
+    kill -9 "$sig2" 2> /dev/null; exit 1
+fi
+if [ -f "$scratch/TOKEN" ]; then echo "FAIL the token outlived a TERM to the hold"; rm -f "$scratch/TOKEN"; exit 1; fi
+echo "ok   a TERM to the hold ends the payload and frees the token"
+
+# queued: no payload exists, so the queue entry must go and the token it never held must be left alone
+printf 'someone-else %s\n' "$$" > "$scratch/TOKEN"
+GPU_QUEUE_DIR=$q GPU_TOKEN_FILE=$scratch/TOKEN GPU_HOLD_LOG=$scratch/log \
+GPU_HOLD_POLL=1 GPU_HOLD_WAIT=30 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_KILL_GRACE=2 \
+GPU_HOLD_TCTL_START=100 GPU_HOLD_TCTL_FILE=$scratch/tctl GPU_HOLD_THERMAL_FLAG=$scratch/x \
+    "$hold" -t 5 -l selftest-queued -- sleep 300 >/dev/null 2>&1 &
+queued=$!
+for _ in $(seq 100); do [ -n "$(ls "$q" 2>/dev/null | grep -v '^\.' || true)" ] && break; sleep 0.1; done
+kill -TERM "$queued" 2> /dev/null
+wait "$queued" 2> /dev/null
+left=$(ls "$q" 2>/dev/null | grep -v '^\.' || true)
+if [ -n "$left" ]; then echo "FAIL a queued hold left its ticket behind after a TERM: $left"; rm -f "$q"/*; exit 1; fi
+if [ ! -f "$scratch/TOKEN" ]; then echo "FAIL a queued hold removed someone else's token"; exit 1; fi
+rm -f "$scratch/TOKEN"
+echo "ok   a TERM to a queued hold leaves the queue, not the token"
+
+# ordering: the guard only works if the helper exists by the time the trap can run
+ktl=$(grep -n '^kill_tree()' "$hold" | head -1 | cut -d: -f1)
+lnch=$(grep -n '^child=\$!' "$hold" | head -1 | cut -d: -f1)
+if [ -z "$ktl" ] || [ -z "$lnch" ]; then echo "FAIL cannot find kill_tree() or child=! in $hold"; exit 1; fi
+if [ "$ktl" -gt "$lnch" ]; then
+    echo "FAIL kill_tree is defined at line $ktl, after the payload launch at $lnch - a TERM in that window releases the"
+    echo "     token and leaves the payload running, which is what #1642's declare -F guard then skips"
+    exit 1
+fi
+echo "ok   kill_tree is defined before the payload starts ($ktl < $lnch)"
+
 echo "gpu_hold_tree: ok"

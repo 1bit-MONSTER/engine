@@ -32,12 +32,24 @@ instead. It tracks the CMake `if()`/`endif()` nesting around each
 fails a target whose guard CI does not satisfy -- naming the option, which is
 the sentence the ninja error does not give.
 
+**Direction B (engine#1595) is the reverse gap.** `need` is the set of `add_executable` targets that
+some `add_test`'s COMMAND names -- a test whose target CI never builds reports "Not Run" and is a test
+in name only. `have` is the `--target` list above. The difference is a ratchet rather than a wall, because
+35 of them are already there: `tools/ci/add_test_gaps.txt` records today's names, and the check **fails
+when the difference grows**, printing only the new names. A shrinking baseline is progress, not a failure,
+so a rename does not have to be argued with -- a count would pass it.
+
+A script test names its interpreter (`add_test(… COMMAND bash script.sh)`), and `bash` is not an
+`add_executable`, so a self-test runner costs nothing here: that is why the release check's suite can live
+in an `add_test` (engine#1596) without raising the drift it measures.
+
     tools/ci/ci_targets_check.py --check [--root .]
     tools/ci/ci_targets_check.py --self-test
 """
 import argparse
 import os
 import re
+import shutil
 import sys
 
 CI = ".github/workflows/ci.yml"
@@ -47,6 +59,7 @@ CMAKE = "CMakeLists.txt"
 ADD = re.compile(r"^\s*add_(?:executable|library)\s*\(\s*([A-Za-z0-9_.+-]+)", re.IGNORECASE)
 IF = re.compile(r"^\s*if\s*\(\s*([^)]*)\)", re.IGNORECASE)
 ENDIF = re.compile(r"^\s*endif\s*\(", re.IGNORECASE)
+INCLUDE = re.compile(r'^\s*include\(\s*"?([^\s")]+\.cmake)"?\s*\)', re.M)
 DEFINE = re.compile(r"-D([A-Za-z0-9_]+)=([^\s\"]*)")
 
 
@@ -103,6 +116,105 @@ def ci_targets(ci_text):
     return names
 
 
+# `add_executable(name …)` and `add_test(NAME n COMMAND …)`, for direction B (engine#1595).
+ADD_EXE = re.compile(r"^\s*add_executable\s*\(\s*([A-Za-z0-9_.+-]+)", re.IGNORECASE)
+ADD_TEST = re.compile(r"^\s*add_test\s*\(\s*NAME\s+([A-Za-z0-9_.+-]+)\s+COMMAND\s+(.*)$", re.IGNORECASE)
+BASELINE = "tools/ci/add_test_gaps.txt"
+# `add_dependencies(<target> <dep>…)`: the second way a target gets built (engine#1595 review).
+ADD_DEPS = re.compile(r"add_dependencies\s*\(\s*([A-Za-z0-9_.+-]+)([^)]*)\)", re.IGNORECASE)
+
+
+def build_closure(cmake_text, listed, defines=None, defaults=None):
+    """`listed`, plus every target reachable from it through `add_dependencies`.
+
+    `ci.yml`'s `--target` list is not the only way a target gets built: this tree documents
+    `add_dependencies(onebit onebit_npu_forward_syntax)` precisely so a gate target is compiled without being
+    named on the command line, and the comment there says why ("a check that depends on the order of another
+    step's target list is the kind that goes quiet when that list is edited"). A `have` that reads only the
+    list calls every such test "never built", so the first PR to use the documented hook reds direction B.
+    """
+    deps = {}
+    for _n, line, guards, unknown in scan_guards(cmake_text):
+        m = ADD_DEPS.search(line)
+        if not m:
+            continue
+        # engine#1595 review: an `add_dependencies` inside `if(ONEBIT_NPU)` does not exist in the configuration
+        # CI creates, so counting it lets one dead-guard line clear a test that still never reaches ctest.
+        if defines is not None and not unknown and any(not satisfied(g, defines, defaults or {})[0] for g in guards):
+            continue
+        for d in m.group(2).split():
+            if re.fullmatch(r"[A-Za-z0-9_.+-]+", d):
+                deps.setdefault(m.group(1), set()).add(d)
+    built, frontier = set(listed), list(listed)
+    while frontier:
+        for d in deps.get(frontier.pop(), ()):
+            if d not in built:
+                built.add(d)
+                frontier.append(d)
+    return built
+
+
+def add_test_blocks(cmake_text):
+    """Every `add_test( … )` directive, paren-joined across lines: (line number, text).
+
+    The real tree writes 39 of them across lines, so a line-at-a-time scan misses them - and a missed
+    add_test is a missed gap, which for a ratchet means silence rather than a wrong red.
+    """
+    blocks, buf, start = [], "", None
+    for i, raw in enumerate(cmake_text.splitlines(), 1):
+        line = raw.strip()
+        if buf:
+            buf += " " + line
+            if buf.count("(") <= buf.count(")"):
+                blocks.append((start, buf))
+                buf, start = "", None
+            continue
+        if re.match(r"^add_test\s*\(", line, re.IGNORECASE):
+            if line.count("(") > line.count(")"):
+                buf, start = line, i
+            else:
+                blocks.append((i, line))
+    return blocks
+
+
+def add_test_need(cmake_text):
+    """{target: [test names]} for every add_executable that some add_test's COMMAND names.
+
+    Direction B, engine#1595. A target is named two ways in this tree - bare, as `COMMAND plain_test`,
+    and through a generator expression, as `$<TARGET_FILE:plain_test>` - so both count. A script test
+    names its interpreter (`COMMAND bash script.sh`), which is not an add_executable, and that is why a
+    self-test runner costs nothing here (engine#1596).
+    """
+    exes = set()
+    for line in cmake_text.splitlines():
+        m = ADD_EXE.match(line)
+        if m:
+            exes.add(m.group(1))
+    need = {}
+    for lineno, block in add_test_blocks(cmake_text):
+        m = re.search(r"\bNAME\s+([A-Za-z0-9_.+-]+)", block)
+        test_name = m.group(1) if m else f"line {lineno}"
+        named = set(re.findall(r"\$<TARGET_FILE:([A-Za-z0-9_.+-]+)>", block))
+        for tok in re.split(r"[\s()]+", block):
+            if tok in exes:
+                named.add(tok)
+        for target in sorted(named & exes):
+            need.setdefault(target, []).append(test_name)
+    return need
+
+
+def read_baseline(path):
+    """The names already known to drift, or None when there is no baseline file (which fails closed)."""
+    if not os.path.isfile(path):
+        return None
+    names = set()
+    for line in open(path, encoding="utf-8"):
+        name = line.split("#", 1)[0].strip()
+        if name:
+            names.add(name)
+    return names
+
+
 def ci_defines(ci_text):
     """The -D flags ci.yml configures with, as {NAME: VALUE}."""
     out = {}
@@ -113,20 +225,21 @@ def ci_defines(ci_text):
     return out
 
 
-def cmake_targets(cmake_text):
-    """{target: [guard conditions enclosing it]} for every add_executable/add_library.
+def scan_guards(cmake_text):
+    """(lineno, line, guards, unknown) for every line that is not itself an if()/elseif()/else()/endif().
 
-    A paren-aware scan, because the real tree has both shapes this has to survive:
-    a condition spanning lines (`if(ONEBIT_X AND\n    ONEBIT_Y)`) and `else()` /
-    `elseif()` inside a block. `else()` marks the entry unknown rather than
-    negating it: a target in an else-branch is guarded by the negation, and this
-    check would rather leave that to a human than guess (the message prints the
-    guard it saw, so a false positive costs one line to read).
+    A paren-aware scan, because the real tree has both shapes this has to survive: a condition spanning
+    lines (`if(ONEBIT_X AND\n    ONEBIT_Y)`) and `else()` / `elseif()` inside a block. `else()` marks the
+    enclosing scope unknown rather than negating it: a target in an else-branch is guarded by the negation,
+    and this check would rather leave that to a human than guess.
+
+    Shared since engine#1595's review: `add_test` drift and `add_dependencies` edges need the same guards
+    `add_executable` gets, and a second walker would be a second place for the paren handling to drift.
     """
-    targets = {}
-    stack = []            # each entry: {"cond": str|None, "buf": str|None}
+    stack = []            # each entry: {"cond": str|None}
     pending = None        # accumulating a multi-line if()/elseif()
-    for raw in cmake_text.splitlines():
+    lines = cmake_text.splitlines()
+    for i, raw in enumerate(lines):
         line = raw.strip()
         if pending is not None:
             pending[1] += " " + line
@@ -149,10 +262,19 @@ def cmake_targets(cmake_text):
                 if stack:
                     stack.pop()
             continue
+        while line.endswith("\\") and i + 1 < len(lines):
+            i += 1
+            line = line[:-1].strip() + " " + lines[i].strip()
+        if line:
+            yield i + 1, line, [e["cond"] for e in stack if e["cond"]], any(e["cond"] is None for e in stack)
+
+
+def cmake_targets(cmake_text):
+    """{target: {"guards", "unknown"}} for every add_executable/add_library."""
+    targets = {}
+    for _n, line, guards, unknown in scan_guards(cmake_text):
         m = ADD.match(line)
         if m:
-            guards = [e["cond"] for e in stack if e["cond"]]
-            unknown = any(e["cond"] is None for e in stack)
             targets.setdefault(m.group(1), {"guards": guards, "unknown": unknown})
     return targets
 
@@ -212,6 +334,24 @@ def satisfied(guard, defines, defaults):
     return ok, guard
 
 
+def family_text(root, cmake_text):
+    """The text of every cmake file CMakeLists.txt actually include()s, in include order.
+
+    engine#1595 review: a glob over `cmake/tests-*.cmake` reads a file nothing includes, so a family file
+    that was moved out of the build is still counted (and its tests still ratcheted), while a family file
+    pulled in under a guard is counted as if it were unconditional. Following include() is the only reading
+    that matches what CMake configures; the guard on the include is left to cmake_targets(), which already
+    tracks a guard stack across the text this returns.
+    """
+    out = []
+    for m in INCLUDE.finditer(cmake_text):
+        rel = m.group(1).replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
+        path = os.path.join(root, rel)
+        if os.path.isfile(path):
+            out.append(open(path, encoding="utf-8").read())
+    return "\n".join(out)
+
+
 def check(root):
     ci_path = os.path.join(root, CI)
     cmake_path = os.path.join(root, CMAKE)
@@ -221,7 +361,12 @@ def check(root):
             return 2
     names = ci_targets(open(ci_path, encoding="utf-8").read())
     defines = ci_defines(open(ci_path, encoding="utf-8").read())
+    # CMakeLists.txt plus any included family file. A `add_test`/`add_executable` pair moved into
+    # `cmake/tests-*.cmake` (engine#1696: one family out of the contiguous add_test block, so two test-adding
+    # PRs stop conflicting by construction) is still a test this ratchet must see: a family file it does not
+    # read is a family whose gaps are silently unratcheted, which looks exactly like "no new gaps".
     cmake_text = open(cmake_path, encoding="utf-8").read()
+    cmake_text += "\n" + family_text(root, cmake_text)
     targets = cmake_targets(cmake_text)
     defaults = option_defaults(cmake_text)
     if not names:
@@ -246,6 +391,66 @@ def check(root):
     if bad:
         return 1
     print(f"ci_targets_check: all {len(names)} target(s) ci.yml builds exist in the configuration it creates")
+
+    # ── direction B (engine#1595): a test whose target CI never builds never reaches ctest ───────────
+    need = add_test_need(cmake_text)
+    # `built`, not `names`: add_dependencies is the tree's documented second route (see build_closure).
+    drift = set(need) - build_closure(cmake_text, names, defines, defaults)
+    # engine#1595 review: a test declared inside a guard CI's configure makes false is not drift. CI is *supposed*
+    # to skip it -- an NPU-only test under `if(ONEBIT_NPU)` with ONEBIT_NPU=OFF -- and telling its author to
+    # "build it or drop the test" was a false positive. Only a test CI would register and build, and does not, is
+    # the defect this ratchets.
+    line_guard = {n: (g, u) for n, _l, g, u in scan_guards(cmake_text)}
+    by_design = set()
+    for name in sorted(drift):
+        # Both sites count: the add_test block that registers the test, and the add_executable it names. The tree
+        # writes NPU tests as `if(ONEBIT_NPU) add_executable(..) add_test(..) endif()`, so either side alone would
+        # miss the half that matters on some pack.
+        # `need` is {target: [test names]}, so the blocks to look at are the ones naming this target's TESTS -- an
+        # add_test's NAME is the test, not the executable, and matching the target there silently finds nothing.
+        guards, unknown = [], False
+        blocks = add_test_blocks(cmake_text)
+        for test_name in need[name]:
+            for lineno, block in blocks:
+                if re.search(r"\bNAME\s+" + re.escape(test_name) + r"\b", block):
+                    g, u = line_guard.get(lineno, ([], False))
+                    guards += g
+                    unknown = unknown or u
+        for t in need[name]:
+            info = targets.get(t, {})
+            guards += info.get("guards", [])
+            unknown = unknown or info.get("unknown", False)
+        if not unknown and any(not satisfied(g, defines, defaults)[0] for g in guards):
+            by_design.add(name)
+    drift -= by_design
+    if by_design:
+        print(f"ci_targets_check: {len(by_design)} test(s) are declared only under guards ci.yml's configure turns "
+              f"off, so CI never registers them by design ({', '.join(sorted(by_design)[:6])}"
+              f"{', …' if len(by_design) > 6 else ''}) - not drift")
+    baseline = read_baseline(os.path.join(root, BASELINE))
+    if baseline is None:
+        # No baseline is not "nothing known": treating it as empty would let the first run of a run
+        # without the file fail on 35 names a reader could not tell from regressions. Fail closed at 35.
+        print(f"ci_targets_check: no {BASELINE}, so the {len(drift)} target(s) whose tests CI never builds "
+              f"cannot be told apart from new ones", file=sys.stderr)
+        return 1
+    new = sorted(drift - baseline)
+    for name in new:
+        guards = sorted({g for t in need[name] for g in targets.get(t, {}).get("guards", [])})
+        where = f" under if({' AND '.join(guards)})" if guards else ""
+        print(f"ci_targets_check: add_test names '{name}'{where}, and ci.yml never builds "
+              f"{'/'.join(sorted(set(need[name])))} -- that test never reaches ctest in the configuration CI "
+              f"creates (it is not registered, or registered and not built); build it or drop the test")
+    if new:
+        return 1
+    # A baseline entry that no longer drifts is progress; say so rather than staying silent, so the
+    # file can be shrunk by whoever reads the line.
+    fixed = sorted(baseline - drift)
+    if fixed:
+        print(f"ci_targets_check: {len(fixed)} baseline entr(y/ies) no longer drift ({', '.join(fixed[:6])}"
+              f"{', …' if len(fixed) > 6 else ''}) - drop them from {BASELINE} to keep it honest")
+    print(f"ci_targets_check: {len(drift)} target(s) whose test never reaches ctest under ci.yml "
+          f"(baseline {len(baseline)}), and none new")
     return 0
 
 
@@ -273,12 +478,21 @@ def self_test():
     import tempfile
     fails = 0
 
-    def case(what, ci, cmake, want):
+    def case(what, ci, cmake, want, baseline="auto"):
         nonlocal fails
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, ".github", "workflows"))
             open(os.path.join(d, CI), "w", encoding="utf-8").write(ci)
             open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(cmake)
+            if baseline == "auto":
+                # The direction-A fixtures below are not about direction B, so the baseline records
+                # whatever they drift - a direction-B case must then say what its baseline is.
+                drift = sorted(set(add_test_need(cmake)) - set(ci_targets(ci)))
+                baseline = "".join(n + "\n" for n in drift)
+            if baseline is not None:
+                bpath = os.path.join(d, BASELINE)
+                os.makedirs(os.path.dirname(bpath), exist_ok=True)
+                open(bpath, "w", encoding="utf-8").write(baseline)
             got = check(d)
         ok = got == want
         print(f"  {'ok  ' if ok else 'FAIL'}  {what}  (rc {got}, wanted {want})")
@@ -313,6 +527,105 @@ def self_test():
     # Unrelated guards must not fail a tree.
     case("a target under a non-option guard is left alone",
          SELF_CI, SELF_CMAKE.replace("if(ONEBIT_NPU)", "if(NOT WIN32)"), 0)
+    # ── direction B (engine#1595): a test whose target CI never builds ─────────────────────────────────
+    # hidden_test is direction A's subject, so these fixtures drop it; `unbuilt_test` is direction B's.
+    # The case that says the fixture really drifts is the second one - the same tree with an empty
+    # baseline must fail - otherwise "passes when the baseline records it" could be passing on nothing.
+    B_CI = SELF_CI.replace("hidden_test ", "")
+    B_CMAKE = SELF_CMAKE + """
+add_executable(unbuilt_test unbuilt.cpp)
+add_test(NAME unbuilt_suite COMMAND unbuilt_test)
+"""
+    case("a test whose target ci.yml never builds passes when the baseline records it",
+         B_CI, B_CMAKE, 0, baseline="unbuilt_test\n")
+    case("the same tree with an empty baseline fails, naming the target it never builds",
+         B_CI, B_CMAKE, 1, baseline="")
+    case("a missing baseline fails closed rather than passing vacuously",
+         B_CI, B_CMAKE, 1, baseline=None)
+    case("a baseline entry that no longer drifts is progress, not a failure",
+         B_CI.replace("--target onebit", "--target onebit unbuilt_test"), B_CMAKE, 0,
+         baseline="unbuilt_test\n")
+    # engine#1596's shape: a script test names `bash`, which is not an add_executable, so it adds nothing.
+    case("a script test (COMMAND bash …) adds nothing to the drift",
+         B_CI, SELF_CMAKE + "add_test(NAME script_suite COMMAND bash ${CMAKE_SOURCE_DIR}/x.sh --self-test)\n",
+         0, baseline="")
+    # engine#1595 review: a target CI builds only through `add_dependencies` is built, so its test does not drift.
+    D_CMAKE = B_CMAKE + """
+add_executable(hoisted_test hoisted.cpp)
+add_test(NAME hoisted_suite COMMAND hoisted_test)
+add_dependencies(onebit hoisted_test)
+"""
+    case("a target built through add_dependencies is not drift, so its test passes",
+         B_CI, D_CMAKE, 0, baseline="unbuilt_test\n")
+    case("the same tree without the add_dependencies line drifts that test, naming it",
+         B_CI, B_CMAKE + """
+add_executable(hoisted_test hoisted.cpp)
+add_test(NAME hoisted_suite COMMAND hoisted_test)
+""", 1, baseline="unbuilt_test\n")
+    # engine#1595 review, both halves of the false-positive/false-negative pair, end to end.
+    # B_CI, not SELF_CI: SELF_CI's --target list names hidden_test, which lives behind the same dead guard, so
+    # direction A would fail this arm for the other reason and the arm would pass or fail on the wrong check.
+    case("a test declared inside a guard ci.yml turns off is not drift (CI is meant to skip it)",
+         B_CI, SELF_CMAKE + """
+if(ONEBIT_NPU)
+    add_executable(npu_only_test npu.cpp)
+    add_test(NAME npu_only COMMAND npu_only_test)
+endif()
+""", 0, baseline="")
+    case("an add_dependencies inside a dead guard does not clear a live test",
+         B_CI, B_CMAKE + """
+add_executable(live_test live.cpp)
+add_test(NAME live_suite COMMAND live_test)
+if(ONEBIT_NPU)
+    add_dependencies(onebit live_test)
+endif()
+""", 1, baseline="unbuilt_test\n")
+    case("...but the same edge outside the guard does clear it",
+         B_CI, B_CMAKE + """
+add_executable(live_test live.cpp)
+add_test(NAME live_suite COMMAND live_test)
+add_dependencies(onebit live_test)
+""", 0, baseline="unbuilt_test\n")
+    # engine#1696: a test that lives in an included family file is still ratcheted. `case` writes only
+    # .github/workflows/CI and CMakeLists.txt, so this arm builds its tree by hand.
+    def family_tree(included):
+        """A tree whose family file holds one drifting test, included or merely present.
+
+        engine#1595 review: the arm used to be a bare glob, so a file nothing includes was still read. The
+        fixture now says which of the two it is building, because include() is the whole point.
+        """
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, ".github", "workflows"))
+        os.makedirs(os.path.join(d, "cmake"))
+        open(os.path.join(d, CI), "w", encoding="utf-8").write(B_CI)
+        inc = "include(cmake/tests-family.cmake)\n" if included else ""
+        open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(B_CMAKE + inc)
+        open(os.path.join(d, "cmake", "tests-family.cmake"), "w", encoding="utf-8").write("""
+add_executable(family_test family.cpp)
+add_test(NAME family_suite COMMAND family_test)
+""")
+        bpath = os.path.join(d, BASELINE)
+        os.makedirs(os.path.dirname(bpath), exist_ok=True)
+        open(bpath, "w", encoding="utf-8").write("unbuilt_test\n")
+        return d
+
+    d = family_tree(included=True)
+    got = check(d)
+    shutil.rmtree(d, ignore_errors=True)
+    ok = got == 1
+    print(f"  {'ok  ' if ok else 'FAIL'}  a test moved into an include()d family file is still ratcheted  "
+          f"(rc {got}, wanted 1)")
+    if not ok:
+        fails += 1
+    # ...and a family file that nothing include()s is not part of the tree CMake configures, so it adds nothing.
+    d = family_tree(included=False)
+    got = check(d)
+    shutil.rmtree(d, ignore_errors=True)
+    ok = got == 0
+    print(f"  {'ok  ' if ok else 'FAIL'}  a family file nothing include()s is not read  (rc {got}, wanted 0)")
+    if not ok:
+        fails += 1
+
     # And the clean case.
     case("a plain target list passes",
          SELF_CI.replace("hidden_test ", ""), SELF_CMAKE, 0)

@@ -172,7 +172,11 @@ static void oga_geometry(void) {
             memset(&p, 0, sizeof p);
             p.o = src;
             check_int(q4nx_assemble_B(o, &p, B), 0, "fixture: assemble_B accepts the crafted O design");
-            const float sout = q4nx_pack_B_int8(B, K, N, out, K, scales);
+            /* ld is the ROW stride of the code image: q4nx_pack_B_int8 writes out[i * ld + j] with j < N, so it must
+             * be >= N. It happens that K == N in this fixture; passing K would be the same bug #1713 hit as a silent
+             * self-overwrite on a non-square grid. */
+            const int ld = N;
+            const float sout = q4nx_pack_B_int8(B, K, N, out, ld, scales);
             /* expectation, computed here rather than read back from the implementation */
             int bad_code = 0, bad_scale = 0;
             float sum_scale = 0.0f;
@@ -200,8 +204,15 @@ static void oga_geometry(void) {
             check_int(bad_code, 0, "pack_B -> every code is round(B / column scale), clamped to +-127");
             check(fabsf(sout - sum_scale / (float)N) < 1e-6f,
                   "pack_B -> the returned scale is the mean of the column scales");
-            /* The literal golden: a fused packer must land on these exact numbers. */
-            check_int(out[0], (int)out[0], "fixture: code[0] is readable");   /* keeps the value in the log */
+            /* The literal golden, ASSERTED rather than printed. This is the one check that does not derive from what
+             * q4nx_assemble_B happened to produce, so it is what a fused packer -- which never goes through assemble -- is
+             * measured against; a `check(x, x)` here would pass whatever the composition did. */
+            /* column 0, rows 0..3 (the codes are stored row-major at stride ld), not "codes[0..3]" as the label used to say */
+            check(out[0] == -106 && out[ld] == 32 && out[2 * ld] == -74 && out[3 * ld] == 64,
+                  "fixture: column 0 rows 0..3 are the pinned golden (-106 32 -74 64)");
+            check(fabsf(scales[0] - 0.004724f) < 5e-7f && fabsf(scales[1] - 0.004724f) < 5e-7f,
+                  "fixture: scales[0..1] are the pinned golden (0.004724)");
+            check(fabsf(sout - 0.005118f) < 5e-7f, "fixture: the mean column scale is the pinned golden (0.005118)");
             printf("  assemble->pack fixture: K=%d N=%d  codes[0..3]=%d %d %d %d  scales[0..1]=%.6f %.6f  mean=%.6f\n",
                    K, N, (int)out[0], (int)out[K], (int)out[2 * K], (int)out[3 * K], (double)scales[0],
                    (double)scales[1], (double)sout);

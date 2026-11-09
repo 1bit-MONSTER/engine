@@ -1813,7 +1813,10 @@ Plan plan(const std::string& pack_dir) {
         // container's Q4 chunks are per-32-column groups. Measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: 253
         // MatMulNBits ops, all block_size 32, no fconst at all -- refused by this gate for a reason ("every subvolume
         // offset in the .fconst moves") that cannot apply to a pack with no .fconst. engine#1503.
-        const bool fconst_weights = !resolve_token_fconst(pack_dir, d).empty();
+        // find_token_fconst(), not the writer: this question is "does a Token .fconst exist", and answering it with
+        // materialise_token_fconst() rewrote a 291 MB copy (a second time) just to find out. engine#1660 renamed the
+        // writer for exactly this reason and left this call site behind, so main did not compile.
+        const bool fconst_weights = !find_token_fconst(pack_dir).empty();
         if (fconst_weights && !blocks.empty() && !(blocks.size() == 1 && blocks.begin()->first == kKBlock))
             throw std::runtime_error(
                 "this pack's MatMulNBits block size along K is " + [&] {

@@ -179,6 +179,20 @@ def _holder(line):
 
 _CANON_HOLDER = _holder(NOTICE[0])
 
+# How much of a holder two copyright lines must share, normalised, to be treated as the same claim misspelled
+# instead of a different attribution. This is a DECISION, not a value that arrived:
+#
+#   too small  -> a real second attribution gets deleted, which is silent data loss in a file someone can read;
+#   too large  -> a misspelling survives as a second notice, which is what engine#1606 shipped.
+#
+# Six is chosen so that `bongwaterbong` (this repo, misspelled) matches `bongwaterwaterbong` (canonical) - the
+# shape that actually occurred - while a distinct holder like `the1bitmonsterauthors` (which the tree carries
+# beside the notice in tests/installed_rpath_test.sh and tools/check-installed-rpath.py) shares nothing and is
+# left alone. The residual cost of being wrong is one visible line removed from a file a human can inspect,
+# which is why the failure mode is chosen in that direction; the dual-attribution case is pinned by a test so a
+# future change to this number cannot quietly start deleting `The 1bit-MONSTER Authors.`.
+HOLDER_NEAR_MISS_PREFIX = 6
+
 
 def near_miss_holder(line):
     """True when a copyright line names a holder that is a TYPO of this repo's, not a different attribution.
@@ -196,7 +210,29 @@ def near_miss_holder(line):
     n = 0
     while n < len(h) and n < len(_CANON_HOLDER) and h[n] == _CANON_HOLDER[n]:
         n += 1
-    return n >= 6
+    return n >= HOLDER_NEAR_MISS_PREFIX
+
+
+def repair_notice(text, block):
+    """The file already HAS the canonical notice, plus a near-miss of our holder: delete the misspelling.
+
+    This is the state engine#1606 shipped - canonical block present, hand-written `bong-water-bong` beside it -
+    and it needed its own path because it is neither "notice missing" (has_notice() is true, so --fix skipped
+    the file) nor "duplicate canonical pair" (duplicated_notice() only reported it, even under --fix). Dropping
+    the copyright line and the SPDX line directly beneath it keeps a near-miss pair from leaving an orphan.
+    """
+    out, drop_next_spdx = [], False
+    for line in text.splitlines(keepends=True):
+        if near_miss_holder(line):
+            drop_next_spdx = True
+            continue
+        if drop_next_spdx and re.match(r"^\W*SPDX-License-Identifier\s*:", line, re.IGNORECASE):
+            drop_next_spdx = False
+            continue
+        drop_next_spdx = False
+        out.append(line)
+    repaired = "".join(out)
+    return repaired if has_notice(repaired) else add_notice(repaired, block)
 
 
 def add_notice(text, block):
@@ -256,7 +292,12 @@ def main():
         except FileNotFoundError:
             continue
         if duplicated_notice(text):
-            duplicated.append(path)
+            if args.fix:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(repair_notice(text, block))
+                print("repaired:", path)
+            else:
+                duplicated.append(path)
             continue
         if has_notice(text):
             continue

@@ -121,5 +121,21 @@ printf '%s\n' 'z = 5' > "$gone"; git -C "$tmp" add gone.py; rm -f "$gone"
 check "a staged-then-deleted path does not crash the gate" "! gate 2>&1 | grep -q Traceback" "$(gate 2>&1 | tail -2)"
 git -C "$tmp" update-index --force-remove gone.py 2>/dev/null
 
+# 8. The state that actually shipped on #1606, one step past case 6: a near-miss holder AND a legitimate second
+#    attribution in the same file. `--fix` used to insert the canonical block and remove neither, so `main` turned
+#    this into THREE notices with a green `--check` (measured: main 3, this tree 2). The right answer is two: the
+#    canonical notice plus the attribution that is not a misspelling of it.
+both=$tmp/both.py
+{ sed -n '2,16p' "$root/tests/copyright_gate_test.sh"
+  echo '# Copyright 2026 The 1bit-MONSTER Authors.'
+  echo '# Copyright 2026 bong-water-bong'
+  echo 'z = 6'; } > "$both"
+git -C "$tmp" add both.py
+fix
+check "near-miss beside an existing notice leaves exactly two copyright lines" \
+      "[ $(grep -c '^# Copyright' "$both") -eq 2 ]" "$(grep -c '^# Copyright' "$both") line(s)"
+check "and the near-miss spelling is the one that went" "[ $(grep -c 'bong-water-bong$' "$both") -eq 0 ]" "$(grep 'Copyright' "$both")"
+rm -f "$both"; git -C "$tmp" update-index --force-remove both.py 2>/dev/null
+
 echo "$([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 exit $((fail))

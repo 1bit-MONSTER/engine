@@ -249,6 +249,12 @@ add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test
 # engine#1564: which files the copyright gate looks at -- a staged file is seen, an untracked one is seen (that is why
 # running it before `git add` is useful), an ignored one is not. A throwaway repo in a temp dir: no build, no device.
 add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_test.sh)
+# engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
+# creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
+# rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
+# two files, no build and no submodules; --self-test drives it.
+add_test(NAME ci_targets COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The

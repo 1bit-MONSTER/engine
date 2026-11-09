@@ -124,7 +124,7 @@ BASELINE = "tools/ci/add_test_gaps.txt"
 ADD_DEPS = re.compile(r"add_dependencies\s*\(\s*([A-Za-z0-9_.+-]+)([^)]*)\)", re.IGNORECASE)
 
 
-def build_closure(cmake_text, listed):
+def build_closure(cmake_text, listed, defines=None, defaults=None):
     """`listed`, plus every target reachable from it through `add_dependencies`.
 
     `ci.yml`'s `--target` list is not the only way a target gets built: this tree documents
@@ -134,7 +134,14 @@ def build_closure(cmake_text, listed):
     list calls every such test "never built", so the first PR to use the documented hook reds direction B.
     """
     deps = {}
-    for m in ADD_DEPS.finditer(cmake_text):
+    for _n, line, guards, unknown in scan_guards(cmake_text):
+        m = ADD_DEPS.search(line)
+        if not m:
+            continue
+        # engine#1595 review: an `add_dependencies` inside `if(ONEBIT_NPU)` does not exist in the configuration
+        # CI creates, so counting it lets one dead-guard line clear a test that still never reaches ctest.
+        if defines is not None and not unknown and any(not satisfied(g, defines, defaults or {})[0] for g in guards):
+            continue
         for d in m.group(2).split():
             if re.fullmatch(r"[A-Za-z0-9_.+-]+", d):
                 deps.setdefault(m.group(1), set()).add(d)
@@ -218,20 +225,21 @@ def ci_defines(ci_text):
     return out
 
 
-def cmake_targets(cmake_text):
-    """{target: [guard conditions enclosing it]} for every add_executable/add_library.
+def scan_guards(cmake_text):
+    """(lineno, line, guards, unknown) for every line that is not itself an if()/elseif()/else()/endif().
 
-    A paren-aware scan, because the real tree has both shapes this has to survive:
-    a condition spanning lines (`if(ONEBIT_X AND\n    ONEBIT_Y)`) and `else()` /
-    `elseif()` inside a block. `else()` marks the entry unknown rather than
-    negating it: a target in an else-branch is guarded by the negation, and this
-    check would rather leave that to a human than guess (the message prints the
-    guard it saw, so a false positive costs one line to read).
+    A paren-aware scan, because the real tree has both shapes this has to survive: a condition spanning
+    lines (`if(ONEBIT_X AND\n    ONEBIT_Y)`) and `else()` / `elseif()` inside a block. `else()` marks the
+    enclosing scope unknown rather than negating it: a target in an else-branch is guarded by the negation,
+    and this check would rather leave that to a human than guess.
+
+    Shared since engine#1595's review: `add_test` drift and `add_dependencies` edges need the same guards
+    `add_executable` gets, and a second walker would be a second place for the paren handling to drift.
     """
-    targets = {}
-    stack = []            # each entry: {"cond": str|None, "buf": str|None}
+    stack = []            # each entry: {"cond": str|None}
     pending = None        # accumulating a multi-line if()/elseif()
-    for raw in cmake_text.splitlines():
+    lines = cmake_text.splitlines()
+    for i, raw in enumerate(lines):
         line = raw.strip()
         if pending is not None:
             pending[1] += " " + line
@@ -254,10 +262,19 @@ def cmake_targets(cmake_text):
                 if stack:
                     stack.pop()
             continue
+        while line.endswith("\\") and i + 1 < len(lines):
+            i += 1
+            line = line[:-1].strip() + " " + lines[i].strip()
+        if line:
+            yield i + 1, line, [e["cond"] for e in stack if e["cond"]], any(e["cond"] is None for e in stack)
+
+
+def cmake_targets(cmake_text):
+    """{target: {"guards", "unknown"}} for every add_executable/add_library."""
+    targets = {}
+    for _n, line, guards, unknown in scan_guards(cmake_text):
         m = ADD.match(line)
         if m:
-            guards = [e["cond"] for e in stack if e["cond"]]
-            unknown = any(e["cond"] is None for e in stack)
             targets.setdefault(m.group(1), {"guards": guards, "unknown": unknown})
     return targets
 
@@ -378,7 +395,38 @@ def check(root):
     # ── direction B (engine#1595): a test whose target CI never builds never reaches ctest ───────────
     need = add_test_need(cmake_text)
     # `built`, not `names`: add_dependencies is the tree's documented second route (see build_closure).
-    drift = set(need) - build_closure(cmake_text, names)
+    drift = set(need) - build_closure(cmake_text, names, defines, defaults)
+    # engine#1595 review: a test declared inside a guard CI's configure makes false is not drift. CI is *supposed*
+    # to skip it -- an NPU-only test under `if(ONEBIT_NPU)` with ONEBIT_NPU=OFF -- and telling its author to
+    # "build it or drop the test" was a false positive. Only a test CI would register and build, and does not, is
+    # the defect this ratchets.
+    line_guard = {n: (g, u) for n, _l, g, u in scan_guards(cmake_text)}
+    by_design = set()
+    for name in sorted(drift):
+        # Both sites count: the add_test block that registers the test, and the add_executable it names. The tree
+        # writes NPU tests as `if(ONEBIT_NPU) add_executable(..) add_test(..) endif()`, so either side alone would
+        # miss the half that matters on some pack.
+        # `need` is {target: [test names]}, so the blocks to look at are the ones naming this target's TESTS -- an
+        # add_test's NAME is the test, not the executable, and matching the target there silently finds nothing.
+        guards, unknown = [], False
+        blocks = add_test_blocks(cmake_text)
+        for test_name in need[name]:
+            for lineno, block in blocks:
+                if re.search(r"\bNAME\s+" + re.escape(test_name) + r"\b", block):
+                    g, u = line_guard.get(lineno, ([], False))
+                    guards += g
+                    unknown = unknown or u
+        for t in need[name]:
+            info = targets.get(t, {})
+            guards += info.get("guards", [])
+            unknown = unknown or info.get("unknown", False)
+        if not unknown and any(not satisfied(g, defines, defaults)[0] for g in guards):
+            by_design.add(name)
+    drift -= by_design
+    if by_design:
+        print(f"ci_targets_check: {len(by_design)} test(s) are declared only under guards ci.yml's configure turns "
+              f"off, so CI never registers them by design ({', '.join(sorted(by_design)[:6])}"
+              f"{', …' if len(by_design) > 6 else ''}) - not drift")
     baseline = read_baseline(os.path.join(root, BASELINE))
     if baseline is None:
         # No baseline is not "nothing known": treating it as empty would let the first run of a run
@@ -514,6 +562,30 @@ add_dependencies(onebit hoisted_test)
 add_executable(hoisted_test hoisted.cpp)
 add_test(NAME hoisted_suite COMMAND hoisted_test)
 """, 1, baseline="unbuilt_test\n")
+    # engine#1595 review, both halves of the false-positive/false-negative pair, end to end.
+    # B_CI, not SELF_CI: SELF_CI's --target list names hidden_test, which lives behind the same dead guard, so
+    # direction A would fail this arm for the other reason and the arm would pass or fail on the wrong check.
+    case("a test declared inside a guard ci.yml turns off is not drift (CI is meant to skip it)",
+         B_CI, SELF_CMAKE + """
+if(ONEBIT_NPU)
+    add_executable(npu_only_test npu.cpp)
+    add_test(NAME npu_only COMMAND npu_only_test)
+endif()
+""", 0, baseline="")
+    case("an add_dependencies inside a dead guard does not clear a live test",
+         B_CI, B_CMAKE + """
+add_executable(live_test live.cpp)
+add_test(NAME live_suite COMMAND live_test)
+if(ONEBIT_NPU)
+    add_dependencies(onebit live_test)
+endif()
+""", 1, baseline="unbuilt_test\n")
+    case("...but the same edge outside the guard does clear it",
+         B_CI, B_CMAKE + """
+add_executable(live_test live.cpp)
+add_test(NAME live_suite COMMAND live_test)
+add_dependencies(onebit live_test)
+""", 0, baseline="unbuilt_test\n")
     # engine#1696: a test that lives in an included family file is still ratcheted. `case` writes only
     # .github/workflows/CI and CMakeLists.txt, so this arm builds its tree by hand.
     def family_tree(included):

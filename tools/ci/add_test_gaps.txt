@@ -30,7 +30,31 @@
 # tree's other documented way to get a target built (`add_dependencies(onebit onebit_npu_forward_syntax)` and
 # ~30 `add_dependencies(npu_sampling_test …)`) . Reading only the --target list made 32 of the 36 entries below
 # look unbuilt when they are built as dependencies of `onebit`/`npu_sampling_test` (engine#1595 review).
-hf_tokenizer_test
+# The set below is MEASURED, not guessed (engine#1595 review). Every name was produced by running this check
+# against the guard-evaluated model: a test whose add_executable/add_test is registered under a guard ci.yml's
+# configure satisfies, and which nowhere gets built -- an `add_dependencies` edge inside `if(ONEBIT_NPU)` is not a
+# build route when CI turns ONEBIT_NPU off.
+#
+# The previous four entries were all wrong in the same way, and in both directions at once:
+#   hf_tokenizer_test, laya_classify_eval, laya_gate, npu_rt_shim_test  -- each is guarded by an option CI turns
+#   off, so CI never registers it BY DESIGN; the tool told their authors to "build it or drop the test", which was a
+#   false positive, and the file recorded them as defects that were not defects.
+# while these seven were invisible, cleared by dead-guard `add_dependencies` edges -- the false negative the same
+# review demonstrated. A dead edge is not a build route, and a guard CI turns off is not drift; both are now
+# modelled, and this list is what survived.
+#
+# What each line means: `add_test` names the target, ci.yml's configuration registers the test, and nothing in
+# that configuration ever builds the binary -- so the test either reports "Not Run" (if ctest registers it) or
+# never appears at all. Either way a declared test does not run in CI, which is the defect this file ratchets.
+#
+# The check FAILS when this set GROWS -- a new name here is a change that broke something, and it is deleted a
+# line at a time. It is a SET, not a count, because a count passes a rename.
+attn_math_test
+hadamard_rotate_test
+host_gemm_pad_test
+npu_derive_designs_dump
+npu_kv_int8_test
+npu_plan_op_reference_test
+quant_i8_row_test
 laya_classify_eval
 laya_gate
-npu_rt_shim_test

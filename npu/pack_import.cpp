@@ -393,6 +393,16 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // prefix as Qwen3-1.7B at this hidden size (8,512), a different bundle (5 tiles of 591,872, not 3 of 1,183,744),
     // and 1,857 of 686,518,336 bytes differ (2.7e-6). This row is the one that disproved the QK-norm explanation above.
     {2048, 32, 16, 8512, 5, 1, 591872},
+    // Phi-3.5-mini-instruct at hidden 3,072 / 32 heads / 32 layers (and Phi-3-mini-128k, the same phi3 geometry; the
+    // table is keyed by shape, and the Llama row above is what established that the prefix is a property of the shape).
+    // Measured against Phi-3.5-mini's own 1.8 build (`_rai_1.8.0_npu_4K`) by whole-file normalisation: 28 of the 32
+    // blocks come out byte-identical and the four that differ hold all 26,145 differing bytes of 2,036,067,648
+    // (1.28e-5), i.e. content in four layers, not layout. The separation that makes this a rule rather than a fit is
+    // the wrong-rotation end: any rotation other than this one differs in 307,097,372 bytes (15 %) across all 32
+    // blocks, a factor of 10,000. The two halves of the bundle are swapped relative to 1.8 -- the same q/k/v order
+    // change the transform above notes -- so n=2/rot=1 is the minimal spelling of it (n=4/rot=2 and n=8/rot=4 are the
+    // identical permutation, which is why the measurement tool prints the same residual for each).
+    {3072, 32, 32, 10560, 2, 1, 5222400},
     // Mistral-7B-Instruct-v0.2 at hidden 4,096 / 32 heads / 32 layers: measured with tools/fconst19_measure.py against
     // amd/Mistral-7B-Instruct-v0.2_rai_1.8.0_npu_4K, 1,954 of 3,843,419,200 bytes differ (5.08e-05) -- content, not
     // layout. The prefix follows the Qwen3 line (64 + 2*hidden + 4,352 = 12,608), the bundle is 5 tiles of 2,297,856
@@ -949,6 +959,21 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
             for (const char* k : {"rope_theta", "rms_norm_eps", "intermediate_size"})
                 if (!cfg.contains(k) && g.contains(k)) cfg[k] = g[k];
         }
+        // A hybrid pack can keep its TEXT tower under `text_config` INSIDE config.json, with no separate model_config.json
+        // to read: amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu states hidden_size/num_hidden_layers/num_attention_heads/
+        // intermediate_size (2560/36/32/9728) there and none at the top level, and its model_config.json has
+        // model_attributes: null, so fill_from_model_config_impl() adds nothing. The importer then refused with "the pack
+        // states no intermediate_size". The text tower IS the decoder this importer builds, so its keys fill gaps -- the
+        // same rule fill_from_model_config_impl() and tools/npu_plan.py already use for VL packs, never overriding.
+        int from_text_config = 0;
+        if (cfg.contains("text_config") && cfg["text_config"].is_object()) {
+            for (auto it = cfg["text_config"].begin(); it != cfg["text_config"].end(); ++it) {
+                if (cfg.contains(it.key()) || it.value().is_null()) continue;
+                cfg[it.key()] = it.value();
+                ++from_text_config;
+            }
+        }
+        if (from_text_config > 0 && source) *source += " + config.json text_config";
         if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
     }
@@ -1060,6 +1085,9 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+// engine#1638: the geometry READ (not just its dims), so a test can assert where each number came from -- the
+// text_config lift and the top-level-wins rule are both properties of load_geometry(), not of read_dims().
+json load_geometry_exported(const std::string& pack_dir, std::string* source) { return load_geometry(pack_dir, source); }
 int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg) {
     return fill_from_model_config_impl(pack_dir, cfg);
 }

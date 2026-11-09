@@ -737,6 +737,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_gaps_test.py)
     # a pin bump that did not regenerate the registry (only the gitlinks: no checkouts)
     add_test(NAME registry_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-pins)
+    # the same check where a lane actually runs it: with the bump staged and HEAD still behind, where a HEAD-only
+    # read of the gitlink passed a registry recording the pin being replaced (engine#1738's post-commit failure)
+    add_test(NAME registry_pins_staged COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_pin_staged_test.py)
     # the 1.9 measurement tool's own paths, on synthetic packs: the "trying next" line it shipped broken (its
     # only real pair verified on the first candidate, so the line never ran) and the residual tolerance it
     # accepts and refuses at. Fixtures are ~200 KB each and built from the rule, so they can be wrong on purpose.
@@ -1438,6 +1441,8 @@ endif()
         npu/forward/src/model.c
         npu/forward/src/q4nx_dequant.c
         npu/forward/src/q4nx_pack.c
+        # The production weight packer, extracted from I8Ctx so it can be tested without the device runtime (#1416).
+        npu/forward/src/q4nx_pack_blocked.cpp
         npu/forward/src/q4nx_semantics.c
         npu/forward/src/q4nx_forward.cpp
         # The NPU target interface and this box's target (engine#799 P4): the model keeps the maths, the

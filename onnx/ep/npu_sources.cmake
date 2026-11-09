@@ -31,6 +31,9 @@ set(ONEBIT_EP_NPU_COMMON_SRC
     # npu/forward/include, the definition is not. Without this line the leg links with an undefined
     # symbol, which is how #874's second half stayed green in CI.
     ${CMAKE_CURRENT_LIST_DIR}/../../npu/forward/src/q4nx_pack.c
+    # I8Ctx::packB_blocked() calls q4nx_pack_B_int8_blocked() (#1416 moved its body out of npu_engine_i8ctx_inc.h
+    # so it can be tested); the definition lives here, so the leg must link it -- the same shape as the line above.
+    ${CMAKE_CURRENT_LIST_DIR}/../../npu/forward/src/q4nx_pack_blocked.cpp
     # q4nx_pack.c's fused q4_1 tile->int8 packer (engine #1416) decodes each tile with
     # q4nx_dequant_tensor_chunked(), defined here: without it the leg links with an undefined symbol.
     ${CMAKE_CURRENT_LIST_DIR}/../../npu/forward/src/q4nx_dequant.c)

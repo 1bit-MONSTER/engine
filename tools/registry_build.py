@@ -35,8 +35,9 @@ Every entry is read from a pinned source, never typed in by hand:
 architecture was run and checked here is recorded separately, in registry/checked.json.
 
 --check exits 1 when the file on disk differs from what the pinned sources give.
---check-pins only compares the pins the file records with the committed gitlinks, so it needs no
-checkouts (CI and ctest `registry_pins` run it): a pin bump must regenerate the registry.
+--check-pins only compares the pins the file records with the gitlinks, so it needs no checkouts (CI and
+ctest `registry_pins` run it): a pin bump must regenerate the registry. "The gitlinks" means the index where it
+has one, so a bump that is staged but not yet committed is checked too, which is when a lane actually runs it.
 """
 import argparse
 import ast
@@ -74,7 +75,15 @@ NPU_ARCHS = {
 
 
 def pin(path):
-    out = subprocess.run(["git", "-C", ROOT, "ls-tree", "HEAD", path], capture_output=True, text=True)
+    # The index first, HEAD only as a fallback: a pin bump is *staged* before it is committed, and every check here
+    # runs before that commit. Reading only HEAD reported the pin being replaced, so `--check` said the registry
+    # matched while the bump sat in the index, and the stale `sources` pin surfaced only in ctest `registry_pins`
+    # after the commit -- ten minutes of CI to learn what the same command could have said locally (engine#1738).
+    staged = subprocess.run(["git", "-C", ROOT, "ls-files", "-s", "--", path], capture_output=True, text=True)
+    parts = staged.stdout.split()
+    if len(parts) >= 2 and parts[0] == "160000":  # <mode> <sha> <stage>\t<path>: the gitlink as staged
+        return parts[1]
+    out = subprocess.run(["git", "-C", ROOT, "ls-tree", "HEAD", "--", path], capture_output=True, text=True)
     parts = out.stdout.split()
     return parts[2] if len(parts) >= 3 else ""
 
@@ -242,6 +251,15 @@ def main():
     text = json.dumps(build(), indent=1, sort_keys=False) + "\n"
     report_gaps(json.loads(text))
     if a.check:
+        # The registry's content comes from the checked-out sources, so those must BE the pinned ones: with the pin
+        # read from the index (above) a bump staged against a submodule left at the old commit would record the new
+        # pin beside the old architecture list and pass.
+        head = subprocess.run(["git", "-C", os.path.join(ROOT, HRX), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        if head and head != pin(HRX):
+            print(f"{HRX} is checked out at {head[:9]}, the pin is {pin(HRX)[:9] or 'unset'}: "
+                  "run git submodule update --init before regenerating")
+            return 1
         old = open(a.out).read() if os.path.exists(a.out) else ""
         if old != text:
             print(f"{a.out} is stale: run tools/registry_build.py")

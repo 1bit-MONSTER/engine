@@ -25,6 +25,8 @@
 set -uo pipefail
 
 bin=${1:?usage: greedy_shortcut.sh path/to/1bit}
+# shellcheck source=tests/serve_port.sh
+. "$(dirname "$0")/serve_port.sh"   # serve_port_wait: read back the port serve bound (engine #1485)
 scratch=$(mktemp -d)
 trap 'kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf "$scratch"' EXIT
 pid=
@@ -47,16 +49,10 @@ PY
 "$bin" serve -m "$scratch/m.gguf" --device auto --port 0 \
     --llama-server "$(dirname "$0")/fake_backend.py" >"$scratch/serve.log" 2>&1 &
 pid=$!
-port=
-for _ in $(seq 1 300); do
-    # `.*` rather than `[^:]*` for the host: greedy to the LAST colon, so an IPv6 --host (::1) still parses (reviewer's
-    # note on #1490). Everything before the port is throwaway, the port is the digits after the last colon.
-    port=$(sed -n 's/^1bit serve: ready on http:\/\/.*:\([0-9][0-9]*\)$/\1/p' "$scratch/serve.log" | head -1)
-    [ -n "$port" ] && break
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.1
-done
-[ -n "$port" ] || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
+# The shared read-back (tests/serve_port.sh), not a local sed: this loop used to anchor its pattern on `$`, which matches
+# only serve's plain ready line -- the laya and laya-models shapes carry a suffix after the port and would have returned
+# empty and failed as "serve never reported a port" (the #1523/#1525 finding, pinned by tests/serve_port_test.sh).
+port=$(serve_port_wait "$scratch/serve.log" "$pid") || { echo "FAIL serve never reported a port"; cat "$scratch/serve.log"; exit 1; }
 for _ in $(seq 1 100); do curl -sf "localhost:$port/health" >/dev/null 2>&1 && break; sleep 0.2; done
 
 ask() {  # ask <path> <json> -> reply body

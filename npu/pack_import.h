@@ -37,6 +37,8 @@
 
 #include <cstdint>
 #include <string>
+
+#include <nlohmann/json.hpp>
 #include <map>
 #include <vector>
 
@@ -76,6 +78,11 @@ struct Dims {
 // both functions a config.json and read the numbers back.
 nlohmann::json load_geometry(const std::string& pack_dir, std::string* source);
 Dims read_dims(const nlohmann::json& c, const std::string& source);
+
+// A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
+// GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
+// reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
+std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why);
 
 // One tensor the pack describes, and where its values would come from.
 struct Planned {
@@ -123,6 +130,15 @@ struct Plan {
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)
     int64_t graph_external_bytes = 0;// size on disk of the external file they name, 0 when it is not in the pack
+    // `com.ryzenai:MatMulNBitsBf` ops, and node inputs that resolved to a `*.qweight.packed` sibling behind a
+    // `*.qweight.empty` placeholder. Both exist because a walker that matches only the Microsoft op name, or only
+    // the node's own initializer, reports a weightless graph for the 1.9 external-data packs (engine#1503).
+    int64_t graph_ryzenai_matmuls = 0;
+    int64_t graph_packed_siblings = 0;
+    int64_t graph_weightless_matmuls = 0;   // dropped: placeholder + packed sibling both byte-less (engine#1671)
+    // How many of the graph's 4-bit block-128 weights satisfy length == N x (K/128 + 1) x 68 (the per-row stride the
+    // .fconst tile also carries): a measurement, so `info` can say "201 of 201" or "3 of 7" instead of guessing.
+    int64_t graph_stride_ok = 0, graph_stride_of = 0;
     std::map<int64_t, int64_t> graph_blocks;                 // block size -> how many ops declare it
     std::vector<std::vector<int64_t>> graph_weight_dims;     // up to 4 distinct [N, K/block, bytes] shapes
     // The MLP section's geometry, likewise measured: gate and up share one fused 4,288-byte-subvolume
@@ -136,9 +152,21 @@ struct Plan {
     std::string manifest() const;  // JSON: format, layout version, source, geometry, tensors
 };
 
+// The multi-component (gemma-4 1.9, `type: compositemodel`) packs keep the text tower's geometry in
+// model_config.json -> config.model_attributes.text_config, while config.json is `{}` and genai_config.json's
+// decoder block stops at head_size. Fills ONLY the keys `cfg` lacks and returns how many it added, so the caller
+// can name the source; exposed for a unit test that needs no ONNX graph.
+int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);
+
+// Whether the canonical Token .fconst already on the scratch path holds exactly the bytes this run would write,
+// given the length the canonical form must have (engine#1662). True means the ~291 MB rewrite can be skipped. Split
+// out of canonical_token_fconst() so the decision has a test that needs no 1.9 pack: a truncated copy, a missing file
+// and a directory on the scratch path must all come back false.
+bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
 
 // The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
 // actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos
@@ -300,9 +328,18 @@ struct FconstGeom {
     std::string why;      // non-empty when the geometry could not be established
 };
 unsigned short bf16_bits_of(float v);
+
+// engine#1650: config.json may declare an OPTIONAL field as JSON null (AMD's 1.9
+// Mistral-7B-Instruct-v0.2 pack writes `"head_dim": null`), which must read as "absent" and take
+// the default rather than throw. Exported so tests/npu_pack_import_test.cpp can pin it without a
+// pack; `source` names where the geometry came from, for the refusal messages.
+Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);
+// Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,
+// exported so a test can pin the buffer width it decodes).
+double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows);
 // Where a layer block's attention payload starts: the block's 64-byte header, then its
 // input_layernorm weight as bf16 [hidden]. So it is `64 + 2 x hidden`, not a constant. It reads 1,856 on
 // the 0.5B pack (hidden 896) and 4,160 on Llama-3.2-1B (hidden 2,048); reading it as the constant is what

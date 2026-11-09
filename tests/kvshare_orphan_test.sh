@@ -48,6 +48,13 @@ gone=0
 for _ in $(seq 1 40); do kill -0 "$child" 2>/dev/null || { gone=1; break; }; sleep 0.05; done
 check "SIGKILL of the driver takes the child with it (PR_SET_PDEATHSIG)" '[ "$gone" = 1 ]'
 
+# and the driver must pass the hook to BOTH of its spawns (the server and the provider, both Popen): a future edit
+# that drops one is the same orphan with a different name, and this source assertion is the only device-free way to
+# see it -- the functional path needs an HRX server and a model
+drv=$here/kvshare_fd_handoff.py
+hooked=$(grep -c "preexec_fn=die_with_parent" "$drv")
+check "the driver applies die_with_parent to both spawns (found $hooked)" '[ "$hooked" = 2 ]'
+
 # and the negative control: a child spawned *without* it survives, which is what the flag is protecting against
 python3 - "$here" > "$scratch/leak.pid" <<'PY' &
 import subprocess, sys, time

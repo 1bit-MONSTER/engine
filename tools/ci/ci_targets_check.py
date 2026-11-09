@@ -50,17 +50,35 @@ ENDIF = re.compile(r"^\s*endif\s*\(", re.IGNORECASE)
 DEFINE = re.compile(r"-D([A-Za-z0-9_]+)=([^\s\"]*)")
 
 
+COMMENT = re.compile(r"(^|\s)#.*$")
+
+
 def continued_lines(text):
-    """The lines of a YAML `run:` block, with backslash continuations joined."""
+    r"""The lines of a YAML `run:` block, comment-stripped, with backslash continuations joined.
+
+    Two things have to happen in this order, and getting it wrong is how this gate invented two
+    target names in one day:
+
+      * strip the comment **per physical line, before joining** -- a `#` that follows a
+        continuation is no longer at the start of the logical line once the lines are joined, so a
+        full-line check cannot see it (engine#1601's review: a `# notatarget trailingprose` inside
+        a `\`-continued list produced `ci_targets_check: ci.yml builds 'trailingprose'`);
+      * decide the **continuation from the original line**, not the stripped one -- a line that is
+        only a comment *and* ends in `\` still continues the command, so stripping it first would
+        end the logical line early and silently drop every target after it.
+
+    The `(^|\s)` in COMMENT keeps a `#` inside a quoted string (``"a#b"``) from being eaten.
+    """
     out, buf = [], ""
     for line in text.splitlines():
-        stripped = line.rstrip()
-        if stripped.endswith("\\"):
-            buf += stripped[:-1] + " "
+        cont = line.rstrip().endswith("\\")
+        core = COMMENT.sub("", line).rstrip()
+        if cont:
+            buf += (core[:-1] if core.endswith("\\") else core) + " "
             continue
-        out.append(buf + stripped)
+        out.append(buf + core)
         buf = ""
-    if buf:
+    if buf.strip():
         out.append(buf)
     return out
 
@@ -69,6 +87,12 @@ def ci_targets(ci_text):
     """The target names in ci.yml's `cmake --build … --target …` command."""
     names = []
     for line in continued_lines(ci_text):
+        # A YAML `run:` block can carry `#` comments, and they talk about the very command this scans
+        # ("adding an unknown target to `cmake --build --target ...` is a hard ninja error"), so a comment
+        # naming the phrase would otherwise contribute its prose as target names. engine#1583's second
+        # attempt did exactly that: the scan reported targets called 'What' and 'this'.
+        if line.lstrip().startswith("#"):
+            continue
         if "cmake --build" not in line or "--target" not in line:
             continue
         words = line.split("--target", 1)[1].split()
@@ -273,6 +297,19 @@ def self_test():
     # An option that defaults ON needs no -D: ONEBIT_NPU_HOST is that shape in the real tree.
     case("a target under an option that defaults ON passes without a -D",
          SELF_CI, SELF_CMAKE.replace("if(ONEBIT_NPU)", "if(ONEBIT_HOST)") + "option(ONEBIT_HOST \"x\" ON)\n", 0)
+    # A comment inside the run block that names the command must not be parsed as targets (engine#1583's
+    # second attempt did: the scan reported targets 'What' and 'this' from the prose).
+    case("a # comment mentioning cmake --build --target contributes no target names",
+         SELF_CI.replace("hidden_test ", "").replace("      - name: Build",
+                         "      # NB: adding an unknown target to `cmake --build --target ...` is a hard ninja error\n"
+                         "      - name: Build"), SELF_CMAKE, 0)
+    # … and a comment AFTER a continuation is the same prose, one hop in: the continuations are
+    # joined first, so it is no longer at the start of the logical line (found in #1601's review).
+    case("a # comment after a continuation contributes no target names",
+         SELF_CI.replace("hidden_test ", "").replace(
+             "            plain_test \\\n",
+             "            # notatarget trailingprose \\\n            plain_test \\\n"),
+         SELF_CMAKE, 0)
     # Unrelated guards must not fail a tree.
     case("a target under a non-option guard is left alone",
          SELF_CI, SELF_CMAKE.replace("if(ONEBIT_NPU)", "if(NOT WIN32)"), 0)

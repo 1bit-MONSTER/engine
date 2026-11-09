@@ -290,6 +290,10 @@ add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
 # check; the two permanent services are exempt by name. --self-test drives the decision, no device needed.
 add_test(NAME device_holders COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
+# engine #1668: the bench preflight must pin the load mode, because `-lm none` is +17.5 % prefill at -1.6 % decode for +604 MiB of
+# GTT. The script existed with a test that nothing ran; a test nobody runs is a comment, so the loader/flag assertions are registered
+# here (the test fakes the box, so it needs no device and no ticket).
+add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-preflight.sh)
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
@@ -366,6 +370,16 @@ target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 add_executable(npu_load_retry_test tests/npu_load_retry_test.cpp)
 target_include_directories(npu_load_retry_test PRIVATE app)
 add_test(NAME npu_load_retry COMMAND npu_load_retry_test)
+
+# The optional-op fallback seam (npu/model/op_dispatch.h, engine#803 A3): every op but `gemv` is optional, and the
+# model runs its own implementation when the target does not take it -- including when the target claims it and
+# fails. Header only, stub targets, no device and no runtime library, so it runs in CI.
+add_executable(npu_op_dispatch_test tests/npu_op_dispatch_test.cpp)
+target_include_directories(npu_op_dispatch_test PRIVATE npu)
+add_test(NAME npu_op_dispatch COMMAND npu_op_dispatch_test)
+# ci.yml builds a named list of targets, so a test target that is not in it reports "Not Run" (#635); this lane's
+# token cannot edit the workflow. Hooking onto one that IS in the list gets it built there too.
+add_dependencies(npu_sampling_test npu_op_dispatch_test)
 
 add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose target is

@@ -193,6 +193,38 @@ within 2 % — which needs device windows and a quiet box.
 
 A3 is the step with the large diff and no numerical content; it goes after the gate proves A1+A2.
 
+### A3 as landed — five slices, each with a device arm
+
+`npu/model/npu_model.h` owns what the line above calls "the maths + its state", and `Q4nxNpuForward` is the adapter this
+page describes: it keeps every member name as a **reference** into `NpuModel`, so no expression in the class changes and
+each slice is reviewable as the ownership change it is.
+
+| slice | what moved | uses left alone |
+|---|---|---|
+| target | `std::unique_ptr<XdnaTarget>` | ~94 `xd_->…` |
+| semantics | `Q4nxSemantics` | 82 `sem_.…` |
+| geometry | `Q4nxForwardConfig` (the type moved with it) | 112 `c_.…` |
+| norm scratch | `in_norm_`, `post_norm_`, `q_norm_`, `k_norm_` | 16 |
+| KV / MLA / recurrent | `kcache_`, `vcache_`, `mla_*`, `conv_state_`, `rec_state_`, `kv_owner_` | 54 |
+
+Why the last one is safe to move and the aliasing question that had to be answered first: nothing outside the model
+aliases those buffers — the model's KV sharing is *between its own layers* (`kv_owner_`), and the dma-buf shared region
+lives in the fork's llama.cpp side, a different process. The hazard a reference cannot survive is a vector *re-seated*
+(moved out and replaced) rather than grown in place; every mutation here is `insert`/`reserve`/`assign`/`resize` on the
+same object.
+
+**The gate as it is actually evaluable, and why "within 2 %" died.** This box moves a row by **up to 7.7 %** when the
+*same binary* is run twice (engine#834), and in the 2026-11-09 arms the same-binary control pair's worst row moved
+**22 %**. A constant 2 % assertion was therefore never evaluable here. What the arms did instead, via
+`scripts/npu-window11.sh`: run the pre-move binary twice (**control pair**) for that window's noise floor, then pre-move
+vs post-move, scored on the paired statistic with the tolerance taken from the control. Every slice came back with
+**3/3 byte-identical transcripts**, **13/13 identical rows** (same phase/role/M set and launch counts) and no row
+outside the control's own spread; the KV/recurrent arm's ratios were **−1.3 % … +2.3 %**. The same five slices against
+the shipped **c25 reference** binary also passed (`window11: PASS`, 3/3 texts, 13/13 rows).
+
+What is still not wired, and stated as such: `gdn_step`/`attn_step` dispatch needs `load_block()` residency, and
+`XdnaTarget::load_block()` remains the documented no-op; `lm_head` is wired behind `supports()` in `run_lm_head`.
+
 ## 4. Gate (unchanged from #803)
 
 1. `window11`: 3 greedy prompts, text identical to the current binary.

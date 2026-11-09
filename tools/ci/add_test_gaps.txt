@@ -15,8 +15,13 @@
 #
 # Targets whose add_test() names them and which CI never builds (engine#1595).
 #
-# These tests report "Not Run" in CI: ci.yml's own comment says a test whose binary is missing is reported that
-# way and the job stays green. That is the defect this file ratchets rather than gates.
+# These tests never reach ctest in the configuration ci.yml creates, and there are two ways that happens: the
+# add_test is inside a guard CI's configure makes false, so ctest never registers it at all, or it is
+# registered and its binary is never built (ci.yml's own comment says the missing binary is reported "Not Run"
+# and the job stays green). Main's last green `build` job reports 148/148 with 0 Not Run, so the first is the
+# common case -- the earlier wording here ("these tests report Not Run in CI") was wrong for every line in the
+# file (engine#1595 review). The defect this file ratchets is that a test can be declared and still never run,
+# not the reporting label ctest attaches when it does not.
 #
 # The check FAILS when this set GROWS -- a new name here is a change that broke something, and it is deleted a
 # line at a time. It is a SET, not a count, because a count passes a rename.

@@ -47,9 +47,9 @@ in an `add_test` (engine#1596) without raising the drift it measures.
     tools/ci/ci_targets_check.py --self-test
 """
 import argparse
-import glob
 import os
 import re
+import shutil
 import sys
 
 CI = ".github/workflows/ci.yml"
@@ -59,6 +59,7 @@ CMAKE = "CMakeLists.txt"
 ADD = re.compile(r"^\s*add_(?:executable|library)\s*\(\s*([A-Za-z0-9_.+-]+)", re.IGNORECASE)
 IF = re.compile(r"^\s*if\s*\(\s*([^)]*)\)", re.IGNORECASE)
 ENDIF = re.compile(r"^\s*endif\s*\(", re.IGNORECASE)
+INCLUDE = re.compile(r'^\s*include\(\s*"?([^\s")]+\.cmake)"?\s*\)', re.M)
 DEFINE = re.compile(r"-D([A-Za-z0-9_]+)=([^\s\"]*)")
 
 
@@ -316,6 +317,24 @@ def satisfied(guard, defines, defaults):
     return ok, guard
 
 
+def family_text(root, cmake_text):
+    """The text of every cmake file CMakeLists.txt actually include()s, in include order.
+
+    engine#1595 review: a glob over `cmake/tests-*.cmake` reads a file nothing includes, so a family file
+    that was moved out of the build is still counted (and its tests still ratcheted), while a family file
+    pulled in under a guard is counted as if it were unconditional. Following include() is the only reading
+    that matches what CMake configures; the guard on the include is left to cmake_targets(), which already
+    tracks a guard stack across the text this returns.
+    """
+    out = []
+    for m in INCLUDE.finditer(cmake_text):
+        rel = m.group(1).replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
+        path = os.path.join(root, rel)
+        if os.path.isfile(path):
+            out.append(open(path, encoding="utf-8").read())
+    return "\n".join(out)
+
+
 def check(root):
     ci_path = os.path.join(root, CI)
     cmake_path = os.path.join(root, CMAKE)
@@ -330,8 +349,7 @@ def check(root):
     # PRs stop conflicting by construction) is still a test this ratchet must see: a family file it does not
     # read is a family whose gaps are silently unratcheted, which looks exactly like "no new gaps".
     cmake_text = open(cmake_path, encoding="utf-8").read()
-    for fam in sorted(glob.glob(os.path.join(root, "cmake", "tests-*.cmake"))):
-        cmake_text += "\n" + open(fam, encoding="utf-8").read()
+    cmake_text += "\n" + family_text(root, cmake_text)
     targets = cmake_targets(cmake_text)
     defaults = option_defaults(cmake_text)
     if not names:
@@ -357,7 +375,7 @@ def check(root):
         return 1
     print(f"ci_targets_check: all {len(names)} target(s) ci.yml builds exist in the configuration it creates")
 
-    # ── direction B (engine#1595): a test whose target CI never builds reports "Not Run" ──────────────
+    # ── direction B (engine#1595): a test whose target CI never builds never reaches ctest ───────────
     need = add_test_need(cmake_text)
     # `built`, not `names`: add_dependencies is the tree's documented second route (see build_closure).
     drift = set(need) - build_closure(cmake_text, names)
@@ -370,8 +388,11 @@ def check(root):
         return 1
     new = sorted(drift - baseline)
     for name in new:
-        print(f"ci_targets_check: add_test names '{name}', and ci.yml never builds it -- that test reports "
-              f"'Not Run' ({', '.join(sorted(set(need[name])))}); build it or drop the test")
+        guards = sorted({g for t in need[name] for g in targets.get(t, {}).get("guards", [])})
+        where = f" under if({' AND '.join(guards)})" if guards else ""
+        print(f"ci_targets_check: add_test names '{name}'{where}, and ci.yml never builds "
+              f"{'/'.join(sorted(set(need[name])))} -- that test never reaches ctest in the configuration CI "
+              f"creates (it is not registered, or registered and not built); build it or drop the test")
     if new:
         return 1
     # A baseline entry that no longer drifts is progress; say so rather than staying silent, so the
@@ -380,7 +401,7 @@ def check(root):
     if fixed:
         print(f"ci_targets_check: {len(fixed)} baseline entr(y/ies) no longer drift ({', '.join(fixed[:6])}"
               f"{', …' if len(fixed) > 6 else ''}) - drop them from {BASELINE} to keep it honest")
-    print(f"ci_targets_check: {len(drift)} target(s) with a test ci.yml never builds "
+    print(f"ci_targets_check: {len(drift)} target(s) whose test never reaches ctest under ci.yml "
           f"(baseline {len(baseline)}), and none new")
     return 0
 
@@ -495,12 +516,18 @@ add_test(NAME hoisted_suite COMMAND hoisted_test)
 """, 1, baseline="unbuilt_test\n")
     # engine#1696: a test that lives in an included family file is still ratcheted. `case` writes only
     # .github/workflows/CI and CMakeLists.txt, so this arm builds its tree by hand.
-    nonlocal_fails = None  # (kept simple: the arm is written out below rather than through `case`)
-    with tempfile.TemporaryDirectory() as d:
+    def family_tree(included):
+        """A tree whose family file holds one drifting test, included or merely present.
+
+        engine#1595 review: the arm used to be a bare glob, so a file nothing includes was still read. The
+        fixture now says which of the two it is building, because include() is the whole point.
+        """
+        d = tempfile.mkdtemp()
         os.makedirs(os.path.join(d, ".github", "workflows"))
         os.makedirs(os.path.join(d, "cmake"))
         open(os.path.join(d, CI), "w", encoding="utf-8").write(B_CI)
-        open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(B_CMAKE)
+        inc = "include(cmake/tests-family.cmake)\n" if included else ""
+        open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(B_CMAKE + inc)
         open(os.path.join(d, "cmake", "tests-family.cmake"), "w", encoding="utf-8").write("""
 add_executable(family_test family.cpp)
 add_test(NAME family_suite COMMAND family_test)
@@ -508,9 +535,22 @@ add_test(NAME family_suite COMMAND family_test)
         bpath = os.path.join(d, BASELINE)
         os.makedirs(os.path.dirname(bpath), exist_ok=True)
         open(bpath, "w", encoding="utf-8").write("unbuilt_test\n")
-        got = check(d)
+        return d
+
+    d = family_tree(included=True)
+    got = check(d)
+    shutil.rmtree(d, ignore_errors=True)
     ok = got == 1
-    print(f"  {'ok  ' if ok else 'FAIL'}  a test moved into cmake/tests-*.cmake is still ratcheted  (rc {got}, wanted 1)")
+    print(f"  {'ok  ' if ok else 'FAIL'}  a test moved into an include()d family file is still ratcheted  "
+          f"(rc {got}, wanted 1)")
+    if not ok:
+        fails += 1
+    # ...and a family file that nothing include()s is not part of the tree CMake configures, so it adds nothing.
+    d = family_tree(included=False)
+    got = check(d)
+    shutil.rmtree(d, ignore_errors=True)
+    ok = got == 0
+    print(f"  {'ok  ' if ok else 'FAIL'}  a family file nothing include()s is not read  (rc {got}, wanted 0)")
     if not ok:
         fails += 1
 

@@ -34,6 +34,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
+#include <filesystem>
 #include <cstring>
 #include <fstream>
 
@@ -3576,16 +3578,37 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         // half; nothing from it ships here. Off unless the variable is set, and written with plain fopen/fwrite because
         // this runs in the forward's hot loop only when someone asked for it.
         if (const char* dd = getenv("NPU_INFER_DUMP_DIR")) {
-            static bool told = false;
+            static bool told = false, failed = false;   // `failed` is separate: one report, then quiet
             if (!told) {
                 told = true;
-                std::fprintf(stderr, "  [dump] residual stream per layer -> %s (M=%d H=%d)\n", dd, M, H);
+                // Create it if missing. The dump is opt-in and named by the caller, so making it is what they asked for
+                // -- and it removes the most common way this failed silently (engine#1726: a missing directory left the
+                // run printing that it was dumping, with no files and no error, and a missing file then reads as "that
+                // layer never ran").
+                std::error_code ec;
+                if (dd[0] != '\0') std::filesystem::create_directories(dd, ec);
+                std::fprintf(stderr, "  [dump] residual stream per layer -> %s (M=%d H=%d)%s%s\n", dd, M, H,
+                             ec ? " -- cannot create: " : "", ec ? ec.message().c_str() : "");
             }
             char path[4096];
             std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
-            if (FILE* fp = std::fopen(path, "wb")) {
-                std::fwrite(X.data(), sizeof(float), (size_t)M * (size_t)H, fp);
-                std::fclose(fp);
+            FILE* fp = std::fopen(path, "wb");
+            if (!fp) {
+                if (!failed) {
+                    failed = true;
+                    std::fprintf(stderr, "  [dump] cannot write %s: %s -- the dump is INCOMPLETE, do not read a missing "
+                                         "layer as one that did not run\n", path, std::strerror(errno));
+                }
+            } else {
+                const size_t want = (size_t)M * (size_t)H;
+                const size_t got = std::fwrite(X.data(), sizeof(float), want, fp);
+                if (std::fclose(fp) != 0 || got != want) {
+                    if (!failed) {
+                        failed = true;
+                        std::fprintf(stderr, "  [dump] short write on %s: %zu of %zu floats -- the dump is INCOMPLETE, do "
+                                             "not read a missing layer as one that did not run\n", path, got, want);
+                    }
+                }
             }
         }
     }

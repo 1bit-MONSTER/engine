@@ -1191,6 +1191,14 @@ add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.
 # patch-sfs needs uid/gid and setuid bits - this is the only test here that does, hence the property.
 add_test(NAME patch_sfs_atomic COMMAND ${CMAKE_SOURCE_DIR}/tests/patch_sfs_atomic_test.sh)
 set_tests_properties(patch_sfs_atomic PROPERTIES SKIP_RETURN_CODE 77)
+# build-static.sh must never print a quotable artifact hash for a tree that is not a commit (engine#1326, from
+# engine#1323's mis-quoted hash). The toolchain is stubbed inside the test - it is the provenance line under test,
+# not the compile - so this costs milliseconds and needs no rustup, no musl target and no network.
+add_test(NAME build_static_provenance COMMAND ${CMAKE_SOURCE_DIR}/tests/build_static_provenance_test.sh)
+# embed/usr/local/bin/1bit-console owns tty1 and its whole job is that there is no path from this screen to a bare
+# prompt; nothing tested it. Same shape as the test above - the script is copied and its absolute paths rewritten into
+# a temp tree, so every branch (installer, desktop, TUI-then-menu, no-TUI) is reachable without root or a build.
+add_test(NAME console_chain COMMAND ${CMAKE_SOURCE_DIR}/tests/console_chain_test.sh)
 # build_path_strings must see compiler output, not only ELFs: a shipped devicetable-offsets.s with 449 build-tree paths
 # passed the row that exists to stop that (engine#1487). No root, no fixture beyond two text files.
 add_test(NAME pack_check_generated_text COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_check_generated_text_test.sh)

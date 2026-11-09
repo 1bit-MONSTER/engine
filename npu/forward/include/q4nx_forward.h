@@ -68,10 +68,7 @@ struct I8Ctx;
 // per-token [lh] table ranks, the rest are request-level rows.
 #include "q4nx_lh.h"   // the phase accounting both the forward and a target write
 
-struct Q4nxForwardConfig {
-    int H = 1024, NH = 16, NKV = 8, HD = 128, IM = 3072, NL = 28, NV = 151936;
-    float eps = 1e-6f, theta = 1e6f;
-};
+// Q4nxForwardConfig now lives with the model that owns it: npu/model/npu_model.h (engine#803 A3).
 
 class Q4nxNpuForward {
 public:
@@ -289,15 +286,20 @@ private:
                              std::string& err);
     bool run_lm_head_gemv(const std::vector<float>& h, std::vector<float>& logits);
 
-    Q4nxForwardConfig c_;
+    Q4nxForwardConfig & c_ = model_.c;   // the model owns its config (A3)
     ModelWeights* mw_ = nullptr;
     xrt::device* dev_ = nullptr;
+
+    // The model (engine#803 A3) owns its state; the members below that it owns are references into it, so every use
+    // site is unchanged. Declared FIRST among the owned state: a reference member is initialised from something that
+    // already exists.
+    npu::NpuModel model_;
 
     // Architecture semantics derived from the model's own config.json.  Models
     // whose config asks for layer types this forward does not implement (hybrid
     // linear/sliding attention, per-layer-type RoPE, mRoPE) are REFUSED in
     // init() rather than silently run with the wrong math.
-    Q4nxSemantics sem_;
+    Q4nxSemantics & sem_ = model_.sem;
 
     // Design set DERIVED from c_ (no model-specific geometry constant): four
     // kernels for fused gate/up, five when gate and up are split.
@@ -346,10 +348,8 @@ private:
     // Hadamard fold of the activation, the M=16 bit-equality gate and the NPU_PROFILE accumulators.
     // A1 keeps the design table and the container parsing here; A2 (docs/npu-p4-target-split.md) hands the
     // target a plan instead.  `pb16i_dir_` above stays because the lm head's own images are named from it.
-    // The model (engine#803 A3) owns the target; `xd_` below is a reference to it, so the ~94 `xd_->…` call sites and
-    // every expression in this class stay exactly as they were. Declared before `xd_`: a reference member must be
-    // initialised from something that already exists.
-    npu::NpuModel model_;
+    // The model (engine#803 A3) owns the target; this is a reference to it, so the ~94 `xd_->…` call sites and every
+    // expression in this class stay exactly as they were.
     std::unique_ptr<npu::target::xdna::XdnaTarget> & xd_ = model_.xd;
     // plan.json (engine #799 P1), when the model directory carries one.  It states the three things
     // this class used to decide by looking at which files exist in --kernels: fused gate/up, the
@@ -416,8 +416,11 @@ private:
     bool weight_layout_b8_ = false;    std::vector<float> lm_head_tiles_;
     int                lm_head_tiles_T_ = 0;
     float lm_at(int n, int k) const;
-    std::vector<std::vector<float>> in_norm_, post_norm_;   // [NL][H]
-    std::vector<std::vector<float>> q_norm_, k_norm_;       // [NL][HD]
+    // The model owns these (A3); the references keep every use site unchanged, `assign` included.
+    std::vector<std::vector<float>> & in_norm_ = model_.in_norm;
+    std::vector<std::vector<float>> & post_norm_ = model_.post_norm;
+    std::vector<std::vector<float>> & q_norm_ = model_.q_norm;   // [NL][HD], owned by the model (A3)
+    std::vector<std::vector<float>> & k_norm_ = model_.k_norm;
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
     Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else
@@ -452,7 +455,10 @@ private:
     std::vector<float> mla_qan_, mla_kvan_;             // q_a / kv_a layernorms
     std::vector<float> w_kb_, w_vb_;                    // [NH][N][K], N padded for k_b
     int kb_rows_ = 0;                                   // k_b's padded row count (256)
-    std::vector<std::vector<float>> mla_kn_, mla_kr_, mla_v_;  // per-layer MLA caches
+    // The model owns the state the launch path writes (A3); references keep every use site unchanged.
+    std::vector<std::vector<float>> & mla_kn_ = model_.mla_kn;
+    std::vector<std::vector<float>> & mla_kr_ = model_.mla_kr;
+    std::vector<std::vector<float>> & mla_v_ = model_.mla_v;
     std::vector<float> moe_router_, moe_router_b_, share_g_, share_u_, share_d_, share_router_;
     std::vector<float> dense_g_, dense_u_, dense_d_;    // leading dense layer only
     // Routed experts stay packed until selected: per layer the Q4NX pools them as
@@ -472,7 +478,8 @@ private:
     std::vector<float> wq_, wk_, wv_, wo_, wg_, wu_, wd_;
 
     // KV cache: [layer] -> pos-major [max_pos][NKV][HD]
-    std::vector<std::vector<float>> kcache_, vcache_;
+    std::vector<std::vector<float>> & kcache_ = model_.kcache;   // per-layer attention K/V, owned by the model (A3)
+    std::vector<std::vector<float>> & vcache_ = model_.vcache;
 
     std::vector<float> B_;        // packed weight scratch  (max K*N floats)
     // Packed-int8 weight cache, one weight BO per (layer, wkey), packed on first
@@ -521,7 +528,7 @@ private:
     std::vector<float> ple_norm_;       // per_layer_proj_norm  [ple_dim]
     std::vector<float> ple_model_proj_; // per_layer_model_proj [NL*ple_dim][H]
     std::vector<float> ple_input_;      // this token's per-layer inputs [NL][ple_dim]
-    std::vector<int>    kv_owner_;      // per layer: layer whose K/V it reuses (itself)
+    std::vector<int> & kv_owner_ = model_.kv_owner;   // per layer: layer whose K/V it reuses (itself)
     // per-layer Gemma4 tensors
     std::vector<std::vector<float>> pre_ff_norm_, post_ff_norm_, post_ln_;  // [H]
     std::vector<float> layer_scale_;                                        // [NL]
@@ -562,7 +569,8 @@ private:
     };
     std::vector<GdnSmall> gdn_small_;     // [layer]
     bool gdn_cache_ = true;               // NPU_GDN_CACHE=0 disables
-    std::vector<std::vector<float>> conv_state_, rec_state_;  // [CD][CK-1], [nvh][khd][vhd]
+    std::vector<std::vector<float>> & conv_state_ = model_.conv_state;   // [CD][CK-1]
+    std::vector<std::vector<float>> & rec_state_ = model_.rec_state;     // [nvh][khd][vhd]
     // One GDN token step: xn is the normed input; out gets the out_proj result.
     bool gdn_layer(int l, const std::vector<float>& xn, std::vector<float>& out);
     // ---- deferred GDN commit (speculative verify) ------------------------------------------------

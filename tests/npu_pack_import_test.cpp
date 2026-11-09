@@ -380,6 +380,7 @@ void test_modelbin_genre_refusal(const std::string& root) {
     check(control.find("model.bin reader") == std::string::npos,
           "modelbin genre: control — the same graph WITH the bytes present is not refused by this guard (" +
               control.substr(0, 90) + ")");
+    fs::remove_all(dir);   // leave the tree as we found it, like the crafted leg above
 }
 
 void test_crafted_refusals(const std::string& root) {

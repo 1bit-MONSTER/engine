@@ -90,8 +90,14 @@ def candidates(a, b, heads, layers):
     hdr_len = heads * 4
     header_off, stride9 = find_headers(b, heads, layers)
     stride8 = stride9 - hdr_len
-    if len(a) - layers * stride8 != len(b) - layers * stride9:
-        raise SystemExit("the two files' tails differ in length")
+    # engine#1740: a 1.9 pack's tail can carry MORE than its 1.8 twin's -- the 1.5B's 1.9 tail is 262,147,136 B against the 1.8's
+    # 134,314,560 B, and that 1.8 figure is exactly `attn_payload_off(1536) + 2374 x attn_tile_bytes(1536)`, i.e. the twin's tail IS
+    # the head and the 1.9 tail is the head plus more. The rule describes the LAYER BLOCKS, so a surplus is not a layout disagreement:
+    # it is reported and not compared. A 1.9 tail SHORTER than its twin's still means the two files disagree.
+    tail8 = len(a) - layers * stride8
+    tail9 = len(b) - layers * stride9
+    if tail9 < tail8:
+        raise SystemExit(f"the 1.9 tail is shorter than its 1.8 twin's ({tail9} B < {tail8} B): the files disagree")
     a0, b0 = a[:stride8], b[:stride9]
     if a0[header_off:] != b0[header_off + hdr_len:]:
         raise SystemExit("block 0's tail does not match at -4*NH")
@@ -162,8 +168,11 @@ def main():
     # So 1e-5 sits 3.7x above the worst LEGITIMATE residual and 148x below the mildest WRONG rule -- it cannot
     # admit a misaligned rule, and it does admit the few-hundred-stray-codes case a fine-tune's twin produces.
     TOL = 1e-5
+    _ho, _s9 = find_headers(b, heads, layers)
+    surplus = max(0, (len(b) - layers * _s9) - (len(a) - layers * (_s9 - hdr_len)))
+    b_cmp = b[:len(b) - surplus] if surplus else b
     for p in candidates(a, b, heads, layers):
-        got = normalise(b, layers, p, hdr_len)
+        got = normalise(b_cmp, layers, p, hdr_len)
         if len(got) != len(a):
             print(f"# candidate prefix={p[0]} n={p[1]} tile={p[2]} rot={p[3]}: length {len(got)} != {len(a)}",
                   file=sys.stderr)
@@ -175,6 +184,8 @@ def main():
         if differ <= max(0, int(len(a) * TOL)):
             prefix, n, tile, rot, header_off, stride9 = p
             note = "byte for byte" if differ == 0 else f"{differ} of {len(a)} bytes differ ({100.0 * differ / len(a):.2e} %)"
+            if surplus:
+                note += f"; the 1.9 tail carries {surplus} B past its 1.8 twin's, not compared (engine#1740)"
             if args.json:
                 print(json.dumps({"hidden": hidden, "heads": heads, "layers": layers, "prefix": prefix,
                                   "n_tiles": n, "tile": tile, "rot": rot, "header_off": header_off,

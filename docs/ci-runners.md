@@ -140,6 +140,37 @@ So the hold state lives in its own directory, owned by its own group:
 - `npu-hold` wraps `gpu-hold` with `exec env GPU_QUEUE_DIR=~/NPU-QUEUE GPU_TOKEN_FILE=~/NPU-TOKEN …`, so it
   overrides whatever the environment says: **NPU sharing needs that wrapper changed** to honour the two
   variables. Until then the NPU queue is per-account, and that is a named follow-up rather than a claim.
+### The tools are reached by a home-relative path
+
+`hrx-build.yml:111,132` and `hw-gate.yml` call `~/lb/thermal-run.sh`, and `hw-gate.sh` resolves `gpu-hold` with
+`command -v` — a **home-relative path**, not a permission. So the installer links `~/lb` and `~/.local/bin` from the
+runner's home into the account that owns them and puts `.local/bin` first on the unit's `PATH`. The runner reaches
+both through `other` (`r-x`), so it can **run** the tools and cannot rewrite them — which is the difference between
+this and the owner's group, and the reason the links are back after the review's first round.
+
+`thermal-run.sh` runs its jobs under `systemctl --user`, so the installer also does
+`loginctl enable-linger <user>`; without a user manager for that account it falls back to a process-group
+`SIGSTOP`, which is the weaker thermal brake the script itself warns about.
+
+`hw-gate.sh` has two more `$HOME` defaults (`:98-99`), and both resolve into an empty home for a runner under
+another account:
+
+| variable | default | the installer sets it to |
+|---|---|---|
+| `HW_GATE_MODELS` | `$HOME/models` | `--owner-user`'s `models/` when it exists — read-only |
+| `HW_GATE_LOCK` | `$HOME/npu.lock` | `<hold-state>/npu.lock` — the **fleet's** lock, so a runner cannot take NPU work on a lock of its own (the NPU version of the GPU-token bypass) |
+
+The same reasoning is applied at the other end: `scripts/hw-gate.sh` now prefers `<hold-state>/npu.lock` when that
+directory exists, and `scripts/gpu-hold` prefers `<hold-state>/{gpu-token,gpu-queue}`, so **the default is what
+moved, not an environment variable**. That matters because the lanes are long-lived tmux/`pi` sessions and
+`systemd --user` services, none of them login shells: `/etc/profile.d` reaches none of them, and a caller without
+the variables would otherwise fall back to `~/GPU-TOKEN` and silently fork the queue. `ONEBIT_HOLD_DIR` overrides
+the directory if it ever lives elsewhere.
+
+One consequence worth writing down, found by `tests/gpu_hold_queue_test.sh`: `gpu-hold` treats the token file
+**existing** as "held" — the holder creates it with `noclobber` — so the installer must not pre-create an empty
+`gpu-token`. It creates the directory and the queues, and lets the first claim create the token.
+
 - `--no-hold-state` exists for a runner that runs no hardware jobs — the `pr-agent` runner does not (it talks to
   the local LLM over HTTP on `127.0.0.1:8090`), so it needs none of this.
 - `--migrate-hold-state` moves an existing `~/GPU-{TOKEN,QUEUE}`, `~/NPU-{TOKEN,QUEUE}` into `/var/lib/1bit-fleet`,

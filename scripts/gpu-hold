@@ -35,8 +35,14 @@
 #   -t MINUTES     max hold, default $GPU_HOLD_MINUTES or 14        (0.05 = 3 seconds)
 #   -l LABEL       label written into the token, default "<command name>-$$"
 #   -w SECONDS     how long to queue before giving up, default $GPU_HOLD_WAIT or 5400; exit 75 on timeout
-#   -q DIR         queue directory, default $GPU_QUEUE_DIR or ~/GPU-QUEUE
-#   GPU_TOKEN_FILE         the token file, default ~/GPU-TOKEN
+#   -q DIR         queue directory, default $GPU_QUEUE_DIR, else the fleet's queue when it exists
+#                  ($ONEBIT_HOLD_DIR/gpu-queue, /var/lib/1bit-fleet by default), else ~/GPU-QUEUE
+#   GPU_TOKEN_FILE         the token file, same order of preference, else ~/GPU-TOKEN
+#   ONEBIT_HOLD_DIR        where the fleet's hold state lives (engine #1504); when that directory exists it IS
+#                  the queue for every caller, whoever runs: a runner under another account, a tmux lane, a
+#                  systemd --user service. Without it a second account silently takes its own token and runs
+#                  GPU work beside the fleet, and with it a lane that never sourced a profile file still
+#                  agrees, because the default - not an environment variable - is what moved.
 #   GPU_HOLD_RELEASE_WAIT  seconds a label must wait after releasing, default 180
 #   GPU_HOLD_TCTL_START    start gate in C, default 75 - a hot box is not taken
 #   GPU_HOLD_TCTL_ABORT    abort in C, default 93
@@ -54,8 +60,10 @@ set -u
 MINUTES=${GPU_HOLD_MINUTES:-14}
 LABEL=""
 WAIT=${GPU_HOLD_WAIT:-5400}
-QUEUE=${GPU_QUEUE_DIR:-$HOME/GPU-QUEUE}
-TOKEN=${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}
+HOLD=${ONEBIT_HOLD_DIR:-/var/lib/1bit-fleet}
+# the fleet's state wins when it is installed, and ~ is the fallback for a box that has not been set up that way
+QUEUE=${GPU_QUEUE_DIR:-$([ -d "$HOLD/gpu-queue" ] && printf '%s' "$HOLD/gpu-queue" || printf '%s' "$HOME/GPU-QUEUE")}
+TOKEN=${GPU_TOKEN_FILE:-$([ -d "$HOLD" ] && printf '%s' "$HOLD/gpu-token" || printf '%s' "$HOME/GPU-TOKEN")}
 RELEASE_WAIT=${GPU_HOLD_RELEASE_WAIT:-180}
 TCTL_START=${GPU_HOLD_TCTL_START:-75}
 TCTL_ABORT=${GPU_HOLD_TCTL_ABORT:-93}

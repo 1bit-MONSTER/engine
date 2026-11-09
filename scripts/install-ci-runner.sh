@@ -92,7 +92,16 @@ done
 unit=actions.runner.1bit-MONSTER-engine.$name.service
 unit_path=/etc/systemd/system/$unit
 dir=/var/lib/$user/actions-runner-$name
-memory_high=$(awk -v m="$memory_max" 'BEGIN{ sub(/G$/,"",m); printf "%dG", int(m * 0.9) }')
+# MemoryHigh is 90% of MemoryMax IN ITS OWN UNIT: awk's numeric coercion reads "512M" as 512 and "2T" as 2,
+# so the old one-liner turned 512M into 460G and 2T into 1G. Anything without a K/M/G/T suffix is passed through
+# unconverted and MemoryHigh is left at systemd's default rather than guessed.
+share_home=$(getent passwd "$owner_user" 2>/dev/null | cut -d: -f6) || share_home=''
+memory_high=$(awk -v m="$memory_max" 'BEGIN{
+    if (m !~ /^[0-9.]+[KMGT]$/) { exit }        # no suffix: leave MemoryHigh alone
+    v = substr(m, 1, length(m) - 1) + 0; u = substr(m, length(m))
+    printf "%.1f%s", v * 0.9, u
+}')
+[ -n "$memory_high" ] || memory_high=$memory_max
 
 # <-- the unit this recipe installs
 unit_text() {
@@ -111,7 +120,9 @@ Type=simple
 User=$user
 WorkingDirectory=$dir
 ExecStart=$dir/runsvc.sh
-$( [ "$no_hold" = 0 ] && printf 'Environment=GPU_TOKEN_FILE=%s/gpu-token GPU_QUEUE_DIR=%s/gpu-queue\n' "$hold_state" "$hold_state" )
+Environment=PATH=/var/lib/$user/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+$( [ "$no_hold" = 0 ] && printf 'Environment=GPU_TOKEN_FILE=%s/gpu-token GPU_QUEUE_DIR=%s/gpu-queue HW_GATE_LOCK=%s/npu.lock\n' "$hold_state" "$hold_state" "$hold_state" )
+$( [ -n "${share_home:-}" ] && [ -d "$share_home/models" ] && printf 'Environment=HW_GATE_MODELS=%s/models\n' "$share_home" )
 $( [ -n "$env_file" ] && echo "EnvironmentFile=$env_file" )
 # runsvc.sh exits 0 after an OOM kill ("no retry needed"), so on-failure would leave the runner dead.
 Restart=always
@@ -225,13 +236,34 @@ chown -R "$user:" "$dir"
 #                                                            created by either account inherit the group
 # The runner's account joins THAT group and nothing else; the shared tools (~/lb, ~/.local/bin) are already
 # world-readable and executable, so no group is needed to run them.
+# the workflows reach the shared tools by a HOME-RELATIVE path (~/lb/thermal-run.sh, and `command -v gpu-hold`
+# for ~/.local/bin), so the runner's home needs those two entries. They are symlinks into the account that owns
+# them and the runner reaches them through "other" (r-x), NOT through a group: it can run the tools and cannot
+# rewrite them - which is the escalation the first version of this recipe created.
+if [ -n "$share_home" ]; then
+    for rel in lb .local/bin; do
+        src="$share_home/$rel"; dst="/var/lib/$user/$rel"
+        [ -d "$src" ] || continue
+        mkdir -p "$(dirname "$dst")"
+        if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+            echo "warning: /var/lib/$user/$rel exists as a real path; leaving it (move it aside to share $src)" >&2
+            continue
+        fi
+        ln -sfn "$src" "$dst"
+        echo "tools: ~/$rel -> $src (read-only through \"other\", no group)"
+    done
+fi
+
 if [ "$no_hold" = 0 ]; then
     getent group "$hold_group" >/dev/null 2>&1 || groupadd --system "$hold_group"
     id -nG "$user" | tr ' ' '\n' | grep -qx "$hold_group" || usermod -aG "$hold_group" "$user"
     install -d -m 0770 -g "$hold_group" "$hold_state" "$hold_state/gpu-queue" "$hold_state/npu-queue"
     chmod g+s "$hold_state/gpu-queue" "$hold_state/npu-queue"
+    # NOT the token files: `gpu-hold` treats the token's EXISTENCE as "held" (the holder creates it with
+    # noclobber), so pre-creating an empty one makes every claim wait for ever - found by tests/gpu_hold_queue_test.sh.
+    # The directory is group-writable so any fleet member can create the token; an existing one is handed over.
     for f in gpu-token npu-token; do
-        [ -e "$hold_state/$f" ] || install -m 0660 -g "$hold_group" /dev/null "$hold_state/$f"
+        [ -e "$hold_state/$f" ] || continue
         chgrp "$hold_group" "$hold_state/$f"; chmod 0660 "$hold_state/$f"
     done
     if [ "$migrate" = 1 ]; then
@@ -242,7 +274,8 @@ if [ "$no_hold" = 0 ]; then
             echo "install-ci-runner.sh: $owner_home/GPU-QUEUE is not empty: let the queue drain before migrating (or migrate by hand)" >&2; exit 1; }
         for pair in "GPU-TOKEN:gpu-token" "NPU-TOKEN:npu-token"; do
             src="$owner_home/${pair%%:*}"; dst="$hold_state/${pair##*:}"
-            [ -s "$src" ] && cp -a "$src" "$dst" && chgrp "$hold_group" "$dst" && chmod 0660 "$dst" && rm -f "$src"
+            if [ -s "$src" ]; then cp -a "$src" "$dst" && chgrp "$hold_group" "$dst" && chmod 0660 "$dst"; fi
+            rm -f "$src"   # empty or moved: either way no file stays behind to read as a held token
         done
         for pair in "GPU-QUEUE:gpu-queue" "NPU-QUEUE:npu-queue"; do
             src="$owner_home/${pair%%:*}"; dst="$hold_state/${pair##*:}"
@@ -259,6 +292,9 @@ if [ "$no_hold" = 0 ]; then
 export GPU_TOKEN_FILE=$hold_state/gpu-token
 export GPU_QUEUE_DIR=$hold_state/gpu-queue
 PROFILE
+    # thermal-run.sh runs its jobs under `systemctl --user`; without a user manager for this account it falls
+    # back to a process-group SIGSTOP, which is the weaker mode the file itself warns about
+    loginctl enable-linger "$user" 2>/dev/null || echo "warning: could not enable-linger $user; thermal-run.sh will use its process-group fallback"
     echo "hold state: $hold_state (group $hold_group, 0770, queues setgid); $user joined $hold_group"
     echo "the owner's shells pick up GPU_TOKEN_FILE/GPU_QUEUE_DIR from /etc/profile.d/1bit-fleet.sh;"
     echo "a long-running owner service needs them in its own unit or environment (docs/ci-runners.md)"

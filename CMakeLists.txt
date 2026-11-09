@@ -265,6 +265,11 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # resolves outside the payload, and a runtime set shipped without the aqlprofile agent libhsa opens. Each
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
+# engine #1504: the GPU hold queue is the FLEET's when the shared state is installed, with no environment to say
+# so - the failure it guards against is silent (a caller under another account taking its own token). Two arms:
+# fleet state present -> the claim uses the fleet's queue and token; absent -> the old ~/GPU-* paths, so a box
+# that has not been set up is unchanged. No GPU: the claim holds the token for three seconds and runs `true`.
+add_test(NAME gpu_hold_queue COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.

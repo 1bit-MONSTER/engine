@@ -1813,7 +1813,13 @@ Plan plan(const std::string& pack_dir) {
         // container's Q4 chunks are per-32-column groups. Measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: 253
         // MatMulNBits ops, all block_size 32, no fconst at all -- refused by this gate for a reason ("every subvolume
         // offset in the .fconst moves") that cannot apply to a pack with no .fconst. engine#1503.
-        const bool fconst_weights = !resolve_token_fconst(pack_dir, d).empty();
+        // engine#1660 renamed the materialising function to `materialise_token_fconst` and updated every call
+        // site except this one, which left `main` not compiling (`resolve_token_fconst` no longer exists). The
+        // right replacement here is NOT the materialising one: this is a predicate ("does the pack carry its
+        // weights in a .fconst?"), and the rename's own comment says the predicate is `find_token_fconst()`,
+        // which touches nothing -- calling the writer here cost a second 278 MiB rewrite per `npu-pack`/import
+        // (measured: two O_TRUNC opens of the same 291 MB file for one `npu-pack info`).
+        const bool fconst_weights = !find_token_fconst(pack_dir).empty();
         if (fconst_weights && !blocks.empty() && !(blocks.size() == 1 && blocks.begin()->first == kKBlock))
             throw std::runtime_error(
                 "this pack's MatMulNBits block size along K is " + [&] {

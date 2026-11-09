@@ -91,6 +91,8 @@ for t in $want; do case " $have " in *" $t "*) found=1 ;; esac; done
 # The recipe every lane uses for a tool the engine does not launch itself (engine#715 trio, engine#315/#674 runtime).
 # shellcheck source=../scripts/hrx-env.sh
 . "$root/scripts/hrx-env.sh"
+# shellcheck source=tests/serve_port.sh
+. "$root/tests/serve_port.sh"   # llama_port_wait: read back the port llama-server bound (engine #1485)
 
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
@@ -104,8 +106,6 @@ if [[ "$devices" != *HRX0* ]]; then
     exit 1
 fi
 
-free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
-
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -113,10 +113,19 @@ trap 'rm -rf "$work"' EXIT
 arm() { # $1 tag, rest = llama-server args
     local tag=$1; shift
     local port log pid body
-    port=$(free_port)
     log=$(mktemp)
-    "$server" -m "$model" --host 127.0.0.1 --port "$port" --alias parity "$@" >"$log" 2>&1 &
+    # --port 0: the kernel picks and llama-server reports the address it bound (engine #1485), so nothing is picked and
+    # released here. The old free_port() released its socket before the server bound it, and on a `ctest -j` runner
+    # another serve could take the port inside that window -- the arm then reported "did not come up", which reads as a
+    # placement bug in whatever this row checks.
+    "$server" -m "$model" --host 127.0.0.1 --port 0 --alias parity "$@" >"$log" 2>&1 &
     pid=$!
+    port=$(llama_port_wait "$log" "$pid" 2400) || {
+        echo "     $tag: llama-server never reported a port (engine #1485 read-back)" >&2
+        tail -5 "$log" >&2
+        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$log"
+        return 4
+    }
     local up=0
     for _ in $(seq 1 240); do
         if curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1; then up=1; break; fi

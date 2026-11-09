@@ -83,3 +83,24 @@ serve_kill_tree() {  # <pid> [grace-seconds, default 10] -> TERM the whole tree,
     done
     for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
+
+# `llama-server` -- the vendored llama.cpp, which the offload-parity scripts drive directly rather than through
+# `1bit serve` -- prints the same fact in its own words (engine #1485). llama.cpp binds an ephemeral port when
+# --port is 0 (`bind_to_any_port`, tools/server/server-http.cpp:444) and logs the address it ended up on:
+#   srv  http_bind: listening on http://127.0.0.1:41235
+# so the port is the field after the URL token's last colon, and the same IPv6 reasoning applies.
+llama_port_from_log() {  # <log> -> the port, empty while llama-server has not said
+    awk '/listening on http:\/\//{ for (i = 1; i <= NF; i++) if ($i ~ /^http:\/\//) { n = split($i, a, ":"); if (a[n] ~ /^[0-9]+$/) { print a[n]; exit } } }' "$1" 2>/dev/null
+}
+
+llama_port_wait() {  # <log> <pid> [tenths-of-a-second, default 300 = 30 s] -> the port, non-zero if it never came
+    local log=$1 pid=$2 tries=${3:-300} port=
+    for _ in $(seq 1 "$tries"); do
+        port=$(llama_port_from_log "$log")
+        if [ -n "$port" ]; then printf '%s\n' "$port"; return 0; fi
+        # the server died: no listening line is ever coming, so stop rather than sleeping out the budget
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    return 1
+}

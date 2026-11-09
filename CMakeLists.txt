@@ -266,6 +266,10 @@ add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold
 # Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a
 # second real gpu-hold reaps it and leaves the note the victim quotes. No device, no build; skips (77) without the script.
 add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_ticket_lost_test.sh)
+# engine#1485: the two port read-backs the route tests use (tests/serve_port.sh). Script-based, no device, no model --
+# it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
+# empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
+add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.sh)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the

@@ -254,12 +254,46 @@ add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test
 # engine#1564: which files the copyright gate looks at -- a staged file is seen, an untracked one is seen (that is why
 # running it before `git add` is useful), an ignored one is not. A throwaway repo in a temp dir: no build, no device.
 add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_test.sh)
+# engine#1621: a hold that ends must end everything it started. Three orphans in two days were all GRANDCHILDREN
+# of a ticket (ticket → shell → runner → server): `pkill -P` reaches one level, so the process holding the memory
+# outlived the ticket. Drives scripts/gpu-hold with a wrapper → mid → work chain and asserts the deepest one dies.
+add_test(NAME gpu_hold_tree COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_tree_test.sh)
+# engine#1650: a hold ends itself when the box runs out of memory, before the kernel picks a victim — the 11-08/09
+# failure where an unbudgeted GPU run took the box to 0.7 GiB and the OOM killer chose the PR-agent LLM.
+add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_mem_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+# engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
+# queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
+# Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a
+# second real gpu-hold reaps it and leaves the note the victim quotes. No device, no build; skips (77) without the script.
+add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_ticket_lost_test.sh)
+# engine#1701: the NPU hold's queue/token follow ONEBIT_HOLD_DIR, and its queue settings never reach the payload.
+# Shell only (a stub gpu-hold plus the tree's own), no device, ~1 s.
+add_test(NAME npu_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_hold_test.sh)
+# engine#1485: the two port read-backs the route tests use (tests/serve_port.sh). Script-based, no device, no model --
+# it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
+# empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
+add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.sh)
+# engine#1639: the half of the survivor bound that a CPU-only box can drive. The bound itself fires only for a payload root
+# wedged in uninterruptible sleep, which user space cannot create, so this covers the other half: a holder that released with
+# a survivor must leave a record, and the NEXT holder must warn about it and clear it.
+add_test(NAME gpu_hold_survivors COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_survivors_test.sh)
+add_test(NAME gpu_hold_group
+         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_group_test.sh)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
 # two files, no build and no submodules; --self-test drives it.
 add_test(NAME ci_targets COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
+# orphans of that shape landed in two days (51 GiB of GTT for 14 h; an NPU server 70 min past a 6-min ticket;
+# then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
+# check; the two permanent services are exempt by name. --self-test drives the decision, no device needed.
+add_test(NAME device_holders COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
+# engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
+# placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
+# traces with a known answer; no model, no device.
+add_test(NAME moe_placement COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
@@ -270,6 +304,12 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # resolves outside the payload, and a runtime set shipped without the aqlprofile agent libhsa opens. Each
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
+# engine #1504: the GPU hold queue is the FLEET's when the shared state is installed, with no environment to say
+# so - the failure it guards against is silent (a caller under another account taking its own token). Two arms:
+# fleet state present -> the claim uses the fleet's queue and token; absent -> the old ~/GPU-* paths, so a box
+# that has not been set up is unchanged. No GPU: the claim holds the token for three seconds and runs `true`.
+add_test(NAME gpu_hold_queue COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_test.sh)
+add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.
@@ -636,6 +676,11 @@ add_test(NAME hrx_build_scope
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/hrx_build_scope.py --self-test)
 add_test(NAME copyright_check_untracked
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/copyright_check_untracked_test.py)
+# engine#1517: the prefill flash-attention ratio is measured in adjacent pairs and only quoted when the pairs agree, so a
+# loaded box yields VOID instead of a number.  The self-test is the estimator's own gate and needs no GPU: it accepts
+# agreement, refuses disagreement, and proves a dropped run cannot shift an arm.
+add_test(NAME fa_ratio_estimator
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fa_ratio.py --self-test)
 add_dependencies(onebit route_log_test)
 # CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
 # keeps the laya_models ctest from reporting "Not Run" without a workflow change.
@@ -724,7 +769,10 @@ if(Python3_Interpreter_FOUND)
     # engine#1070: every configured test that starts a server holds RESOURCE_LOCK route_ports, so
     # the list at the end of this file cannot drift away from the tests it protects. Reads the
     # configured test list (ctest -N --show-only=json-v1); no device, no model, no build products.
-    add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
+    # Ending a serve must end the process that holds the memory: `1bit serve` is a wrapper and the model lives in the
+# `llama-server` child (engine #1653 review). Device-free: it drives the helper against a synthetic wrapper.
+add_test(NAME serve_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_kill_tree_test.sh)
+add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.
@@ -1152,6 +1200,14 @@ add_test(NAME pack_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_modes_test.
 # patch-sfs needs uid/gid and setuid bits - this is the only test here that does, hence the property.
 add_test(NAME patch_sfs_atomic COMMAND ${CMAKE_SOURCE_DIR}/tests/patch_sfs_atomic_test.sh)
 set_tests_properties(patch_sfs_atomic PROPERTIES SKIP_RETURN_CODE 77)
+# build-static.sh must never print a quotable artifact hash for a tree that is not a commit (engine#1326, from
+# engine#1323's mis-quoted hash). The toolchain is stubbed inside the test - it is the provenance line under test,
+# not the compile - so this costs milliseconds and needs no rustup, no musl target and no network.
+add_test(NAME build_static_provenance COMMAND ${CMAKE_SOURCE_DIR}/tests/build_static_provenance_test.sh)
+# embed/usr/local/bin/1bit-console owns tty1 and its whole job is that there is no path from this screen to a bare
+# prompt; nothing tested it. Same shape as the test above - the script is copied and its absolute paths rewritten into
+# a temp tree, so every branch (installer, desktop, TUI-then-menu, no-TUI) is reachable without root or a build.
+add_test(NAME console_chain COMMAND ${CMAKE_SOURCE_DIR}/tests/console_chain_test.sh)
 # build_path_strings must see compiler output, not only ELFs: a shipped devicetable-offsets.s with 449 build-tree paths
 # passed the row that exists to stop that (engine#1487). No root, no fixture beyond two text files.
 add_test(NAME pack_check_generated_text COMMAND bash ${CMAKE_SOURCE_DIR}/tests/pack_check_generated_text_test.sh)
@@ -1484,16 +1540,20 @@ endif()
 # engine #1485: a script that runs `serve --port 0` no longer picks a port and releases it, so there is no window to
 # collide in and nothing for the lock to prevent - those are gone from this list (watchdog_serve, metrics_serve,
 # parallel_args, recipes_route, greedy_shortcut, prism_route, hrx_runtime_route, laya_gguf_route, mem_admit_route,
-# npu_repack_path, serve_e2e_<dev>, laya_route_e2e, laya_models_e2e), and the list now names exactly the
+# npu_repack_path, serve_e2e_<dev>, laya_route_e2e, laya_models_e2e, device_route, hrx_cwsr_route, hybrid_route,
+# hybrid_kvshare_route), and the list now names exactly the
 # tests that still choose their port up front. bench_selftest stays: tools/bench.py picks its own free_port under it.
 set(_onebit_route_tests
-    smoke_serve print_backend lemonade_hrx template_pin device_route pm_route bench_selftest
-    hrx_cwsr_route hybrid_route hybrid_kvshare_route)
+    smoke_serve print_backend lemonade_hrx template_pin pm_route bench_selftest)
 # Tests that only exist for some configurations (a model was passed, a device is built in).
 # serve_e2e_<dev>, laya_route_e2e and laya_models_e2e left this list with engine #1485: they run `serve --port 0`
 # now, so they pick nothing and there is no window for the lock to close. hrx_cpu_weight_parity stays - it starts `llama-server` itself, whose port is not ours to
 # choose (that is also why it is not in the `1bit serve` migration).
-list(APPEND _onebit_route_tests hybrid_e2e pm_laya_route hrx_cpu_weight_parity)
+# engine #1485: hybrid_kvshare_e2e chooses its port in its own driver (tests/kvshare_fd_handoff.py calls free_port(),
+# binds :0, closes, and hands the number to the server it starts), so the census - which reads the .sh text - sees no
+# bind to require the lock for. Same shape as bench_selftest, so it is named here for the same reason.
+# hybrid_e2e is no longer here: it takes `serve --port 0` and reads the port back (this PR).
+list(APPEND _onebit_route_tests pm_laya_route hrx_cpu_weight_parity hybrid_kvshare_e2e)
 foreach(_onebit_route_test IN LISTS _onebit_route_tests)
     if(TEST ${_onebit_route_test})
         set_tests_properties(${_onebit_route_test} PROPERTIES RESOURCE_LOCK route_ports)

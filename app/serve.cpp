@@ -1700,9 +1700,12 @@ static json warmup_short_body() {
 }
 
 static json warmup_requests() {
-    const std::string sel = warmup_selection();
-    const bool want_chat  = sel.empty() || sel == "both" || sel == "long";
-    const bool want_short = sel.empty() || sel == "both" || sel == "short";
+    // An unrecognised value is the shipped pair, not "none": a typo must not quietly disable a warm-up that moves a
+    // measured 2 s off the client's first request. Normalised here so a caller cannot see the two states differently.
+    std::string sel = warmup_selection();
+    if (sel != "long" && sel != "short" && sel != "none") sel = "both";
+    const bool want_chat  = sel == "both" || sel == "long";
+    const bool want_short = sel == "both" || sel == "short";
     json out = json::array();
     if (want_chat)  out.push_back(json{ { "path", kWarmupPath },    { "body", warmup_body() } });
     if (want_short) out.push_back(json{ { "path", "/completion" },  { "body", warmup_short_body() } });
@@ -1748,7 +1751,7 @@ int print_backend(const Options& o, const Launch& l) {
     // a chat backend on HRX: the request Lemonade sends before it marks the model loaded (warmup_wanted)
     if (o.role.empty() && warmup_wanted(l.device)) {
         out["warmups"] = warmup_requests();
-        out["warmup"]  = out["warmups"][0];
+        if (!out["warmups"].empty()) out["warmup"] = out["warmups"][0];
     }
     std::printf("%s\n", out.dump().c_str());
     return 0;

@@ -188,8 +188,12 @@ for _sel in long short; do
     out=$(ONEBIT_WARMUP=$_sel "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" \
           --no-mem-check --port 43133 --print-backend 2>"$scratch/err"); rc=$?
     if [ "$_sel" = long ]; then _want=/v1/chat/completions; else _want=/completion; fi
+    # A join, not print(list): python renders a one-element list as ['/completion'], quotes included, and comparing
+    # against a bare [$_want] is a test that fails on a correct plan (found by running it).
+    _got=$(get "' '.join(w[\"path\"] for w in d[\"warmups\"])")
+    _mirrors=$(get "d[\"warmup\"] == d[\"warmups\"][0]")
     check "hrx plan: ONEBIT_WARMUP=$_sel sends only $_want (exit $rc)" \
-        '[ "$rc" = 0 ] && [ "$(get "[w[\"path\"] for w in d[\"warmups\"]]")" = "[$_want]" ] && [ "$(get "d[\"warmup\"] == d[\"warmups\"][0]")" = True ]'
+        '[ "$rc" = 0 ] && [ "$_got" = "$_want" ] && [ "$_mirrors" = True ]'
 done
 out=$(ONEBIT_WARMUP=none "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" \
       --no-mem-check --port 43134 --print-backend 2>"$scratch/err"); rc=$?

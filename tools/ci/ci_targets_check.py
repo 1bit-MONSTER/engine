@@ -47,6 +47,7 @@ in an `add_test` (engine#1596) without raising the drift it measures.
     tools/ci/ci_targets_check.py --self-test
 """
 import argparse
+import glob
 import os
 import re
 import shutil
@@ -60,6 +61,13 @@ ADD = re.compile(r"^\s*add_(?:executable|library)\s*\(\s*([A-Za-z0-9_.+-]+)", re
 IF = re.compile(r"^\s*if\s*\(\s*([^)]*)\)", re.IGNORECASE)
 ENDIF = re.compile(r"^\s*endif\s*\(", re.IGNORECASE)
 INCLUDE = re.compile(r'^\s*include\(\s*"?([^\s")]+\.cmake)"?\s*\)', re.M)
+# `file(GLOB VAR … <dir>/*.cmake)` … `foreach(… IN LISTS VAR)` … `include(${…})`: the one-file-per-test
+# shape engine#1696 landed. The include argument is a VARIABLE, so INCLUDE above cannot match it, and a
+# reader that only followed literal includes would stop seeing every registration at once - the count
+# would fall to zero and read as "the gap closed".
+GLOB = re.compile(r'file\s*\(\s*GLOB\s+(\w+)[^)]*?([^\s")]+/\*\.cmake)', re.IGNORECASE)
+INCLUDE_VAR = re.compile(r'include\(\s*\$\{(\w+)\}\s*\)')
+FOREACH_LISTS = re.compile(r'foreach\s*\(\s*(\w+)\s+IN\s+LISTS\s+(\w+)', re.IGNORECASE)
 DEFINE = re.compile(r"-D([A-Za-z0-9_]+)=([^\s\"]*)")
 
 
@@ -344,6 +352,16 @@ def family_text(root, cmake_text):
     tracks a guard stack across the text this returns.
     """
     out = []
+    # a glob the include loop iterates: every file matching it is configured, so every one is read
+    for gvar, pattern in GLOB.findall(cmake_text):
+        # the loop variable differs from the glob variable: `foreach(v IN LISTS GLOBVAR) include(${v})`
+        loop_vars = [v for v, g in FOREACH_LISTS.findall(cmake_text) if g == gvar]
+        if not loop_vars or loop_vars[0] not in INCLUDE_VAR.findall(cmake_text):
+            continue
+        pat = pattern.replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
+        for path in sorted(glob.glob(os.path.join(root, pat))):
+            if os.path.isfile(path):
+                out.append(open(path, encoding="utf-8").read())
     for m in INCLUDE.finditer(cmake_text):
         rel = m.group(1).replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
         path = os.path.join(root, rel)
@@ -445,10 +463,22 @@ def check(root):
         return 1
     # A baseline entry that no longer drifts is progress; say so rather than staying silent, so the
     # file can be shrunk by whoever reads the line.
-    fixed = sorted(baseline - drift)
-    if fixed:
-        print(f"ci_targets_check: {len(fixed)} baseline entr(y/ies) no longer drift ({', '.join(fixed[:6])}"
-              f"{', …' if len(fixed) > 6 else ''}) - drop them from {BASELINE} to keep it honest")
+    # A baseline entry can leave `drift` for two reasons, and only one of them is good news:
+    #   * the target IS still named by an add_test and ci.yml now builds it / a dependency builds it - progress;
+    #   * nothing names it any more - the test was deleted (fine, but then its line goes too) OR the reader
+    #     stopped seeing it (engine#1696's one-file-per-test move did exactly this to this tool: 179 files
+    #     went unread and the gap "closed"). A number may only fall while its subject is still visible.
+    vanished = sorted(baseline - set(need))
+    built = sorted((baseline & set(need)) - drift)
+    if built:
+        print(f"ci_targets_check: {len(built)} baseline entr(y/ies) no longer drift ({', '.join(built[:6])}"
+              f"{', …' if len(built) > 6 else ''}) - drop them from {BASELINE} to keep it honest")
+    if vanished:
+        for name in vanished:
+            print(f"ci_targets_check: '{name}' is in {BASELINE} but no add_test names it any more - if the "
+                  f"test was deleted, remove its line in this change; if it was not, the reader has stopped "
+                  f"seeing it and every count below is about less than it claims")
+        return 1
     print(f"ci_targets_check: {len(drift)} target(s) whose test never reaches ctest under ci.yml "
           f"(baseline {len(baseline)}), and none new")
     return 0
@@ -478,12 +508,16 @@ def self_test():
     import tempfile
     fails = 0
 
-    def case(what, ci, cmake, want, baseline="auto"):
+    def case(what, ci, cmake, want, baseline="auto", family=None):
         nonlocal fails
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, ".github", "workflows"))
             open(os.path.join(d, CI), "w", encoding="utf-8").write(ci)
             open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(cmake)
+            if family is not None:
+                fam_dir = os.path.join(d, "cmake", "tests")
+                os.makedirs(fam_dir, exist_ok=True)
+                open(os.path.join(fam_dir, "zz_family.cmake"), "w", encoding="utf-8").write(family)
             if baseline == "auto":
                 # The direction-A fixtures below are not about direction B, so the baseline records
                 # whatever they drift - a direction-B case must then say what its baseline is.
@@ -546,6 +580,22 @@ add_test(NAME unbuilt_suite COMMAND unbuilt_test)
          B_CI.replace("--target onebit", "--target onebit unbuilt_test"), B_CMAKE, 0,
          baseline="unbuilt_test\n")
     # engine#1596's shape: a script test names `bash`, which is not an add_executable, so it adds nothing.
+    # engine#1696's one-file-per-test shape: `file(GLOB V … cmake/tests/*.cmake)` + `foreach(v IN LISTS V)`
+    # + `include(${v})`. The include argument is a VARIABLE, so a reader that only follows literal
+    # includes stops seeing every registration at once - the count falls to 0 and reads as "closed".
+    GLOB_CMAKE = SELF_CMAKE + """
+file(GLOB ONEBIT_TEST_REGISTRATIONS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tests/*.cmake)
+foreach(_onebit_reg IN LISTS ONEBIT_TEST_REGISTRATIONS)
+    include(${_onebit_reg})
+endforeach()
+"""
+    case("an add_test in a glob-included family file is still read",
+         B_CI, GLOB_CMAKE, 1, baseline="",
+         family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n")
+    # ... and a baseline name nothing names any more is a FAILURE, not "progress": the two reasons a
+    # count can fall are "now built" (good) and "no longer seen" (the reader narrowed).
+    case("a baseline name no add_test names any more fails instead of reading as progress",
+         B_CI, SELF_CMAKE, 1, baseline="vanished_test\n")
     case("a script test (COMMAND bash …) adds nothing to the drift",
          B_CI, SELF_CMAKE + "add_test(NAME script_suite COMMAND bash ${CMAKE_SOURCE_DIR}/x.sh --self-test)\n",
          0, baseline="")

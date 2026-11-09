@@ -273,7 +273,27 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
 
 /* Per-column int8 quantization of B[K][N] into out with leading dimension ld,
  * plus per-column scales.  Identical numerics to I8Ctx::packB_into().
- * Returns the mean column scale (I8Ctx's `sout`). */
+ * Returns the mean column scale (I8Ctx's `sout`), and **0.0 with nothing written** when the per-column scale array cannot
+ * be allocated (the row-major traversal added in engine #1416 needs N floats; the old j-outer loop did not allocate). The
+ * only caller today is a test, but a 0 return must not be read as "quantised to nothing". */
+/* Chunks -> int8 without materialising the float matrix (engine #1416): the q4_1 tile kind only.
+ * Dequantises one 32x256 tile into scratch, folds it into the per-column amax, then writes the codes on a second pass.
+ * Byte-identical to `q4nx_dequant_tensor() -> q4nx_pack_B_int8()` (same tile decoder, same arithmetic, same amax floor),
+ * which tests/npu_design_grid_test.c asserts by running both. Returns 0, -1 on a bad geometry, -2 when the container is
+ * not the q4_1 tile kind (caller keeps the two-step path). */
+/* Fold a q4_1 tile grid straight into the int8 image q4nx_pack_B_int8 produces, with no K x N float buffer:
+ * dequantise one 32x256 tile into 32 KB of scratch, fold it into the per-column amax, then a second pass over the
+ * same tiles emits the codes. Returns 0 on success, -2 when `nbytes` is not a q4_1 tile grid (the check a caller
+ * uses to keep its existing path), -1 on a bad argument or allocation failure.
+ *
+ * NOT CALLED YET (engine#1416 / #1713): nothing in the forward path invokes it. `load_layer` still runs
+ * deq() into the K x N float buffer and `I8Ctx::packB_into` -> packB_blocked(). The next slice is to call this
+ * from load_layer's q4_1 branch (fused when rc == 0, deq + pack when rc == -2), and gate that on a byte-identity
+ * comparison against packB_blocked's image on the production quantiser -- until then the traffic and timing
+ * numbers measure this primitive, not the path it will replace. */
+int q4nx_pack_q4_1_tiles_to_int8(const uint8_t* tiles, size_t nbytes, int K, int N, int8_t* out, int ld,
+                                 float* col_scales);
+
 float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
                        float* col_scales);
 

@@ -393,6 +393,16 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // prefix as Qwen3-1.7B at this hidden size (8,512), a different bundle (5 tiles of 591,872, not 3 of 1,183,744),
     // and 1,857 of 686,518,336 bytes differ (2.7e-6). This row is the one that disproved the QK-norm explanation above.
     {2048, 32, 16, 8512, 5, 1, 591872},
+    // Phi-3.5-mini-instruct at hidden 3,072 / 32 heads / 32 layers (and Phi-3-mini-128k, the same phi3 geometry; the
+    // table is keyed by shape, and the Llama row above is what established that the prefix is a property of the shape).
+    // Measured against Phi-3.5-mini's own 1.8 build (`_rai_1.8.0_npu_4K`) by whole-file normalisation: 28 of the 32
+    // blocks come out byte-identical and the four that differ hold all 26,145 differing bytes of 2,036,067,648
+    // (1.28e-5), i.e. content in four layers, not layout. The separation that makes this a rule rather than a fit is
+    // the wrong-rotation end: any rotation other than this one differs in 307,097,372 bytes (15 %) across all 32
+    // blocks, a factor of 10,000. The two halves of the bundle are swapped relative to 1.8 -- the same q/k/v order
+    // change the transform above notes -- so n=2/rot=1 is the minimal spelling of it (n=4/rot=2 and n=8/rot=4 are the
+    // identical permutation, which is why the measurement tool prints the same residual for each).
+    {3072, 32, 32, 10560, 2, 1, 5222400},
     // Mistral-7B-Instruct-v0.2 at hidden 4,096 / 32 heads / 32 layers: measured with tools/fconst19_measure.py against
     // amd/Mistral-7B-Instruct-v0.2_rai_1.8.0_npu_4K, 1,954 of 3,843,419,200 bytes differ (5.08e-05) -- content, not
     // layout. The prefix follows the Qwen3 line (64 + 2*hidden + 4,352 = 12,608), the bundle is 5 tiles of 2,297,856
@@ -1324,9 +1334,16 @@ int64_t group_bytes(int64_t k, int rows) {
 // that buffer at the wrong width produced a plausible-looking number (0.885220 on a tied pack whose container scores
 // 0.999999) for every pack from #1661 until this existed, so the width is pinned directly rather than only end to end.
 namespace {
-double corr(const Q4& q, const uint8_t* embed, int H, int rows);   // defined below, internal to this file
+static double corr(const Q4& q, const EmbedTable& embed, int rows);   // defined below, internal to this file
 }
-double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows) { return corr(q, embed_bf16, H, rows); }
+double embed_at(const EmbedTable& t, int row, int k) {
+    const uint16_t v = reinterpret_cast<const uint16_t*>(t.p)[size_t(row) * size_t(t.H) + size_t(k)];
+    return t.fmt == EmbedTable::Fmt::BF16 ? bf16_to_f32(v) : f16_to_f32(v);
+}
+
+double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows) {
+    return corr(q, EmbedTable{embed_bf16, EmbedTable::Fmt::BF16, H}, rows);
+}
 
 int64_t attn_tile_bytes(int64_t k) { return group_bytes(k, kTileRows); }
 int64_t attn_payload_off(int64_t hidden) { return kNormOff + hidden * 2; }
@@ -1767,17 +1784,26 @@ Plan plan(const std::string& pack_dir) {
                                  {embed->dims.at(0), embed->dims.at(1)}));
     }
 
+    // Only the node whose geometry IS the head (N = V, K = H) is the head. This loop used to take the FIRST MatMulNBits and
+    // `break`, so on a pack whose first matmul is a projection the plan reported that projection's shape as
+    // `lm_head.weight` -- [1152, 896], a fused qkv, instead of [151936, 896] on Qwen2.5-0.5B-Instruct 1.9 (engine#1671).
+    // import_pack() already gates this way; the plan's copy of the loop did not.
+    bool head_from_graph = false;
     for (const auto& mm : onnx.matmuls) {
+        if (!(mm.N == d.vocab && mm.K == d.hidden)) continue;
         const auto it = onnx.index.find(mm.weight);
         if (it == onnx.index.end()) continue;
         auto x = make("lm_head.weight", onnx.tensors[it->second].location, "q4_1", {mm.N, mm.K});
         if (mm.bits != 4) x.refusal = "MatMulNBits is " + std::to_string(mm.bits) + "-bit, not 4-bit";
         p.tensors.push_back(std::move(x));
+        head_from_graph = true;
         break;
     }
-    if (onnx.matmuls.empty()) {
+    if (!head_from_graph) {
         // The head is in the .fconst tail (the Ryzen AI 1.9 lines). The importer reads it, and refuses by name
-        // there if the tail's arithmetic does not come out, so the plan does not refuse it here.
+        // there if the tail's arithmetic does not come out, so the plan does not refuse it here. Keyed on "did a graph
+        // head get written", not "is the graph free of matmuls": a graph of projections only is not a pack without a head
+        // (engine#1671).
         p.tensors.push_back(make("lm_head.weight", "fconst:tail", "q4_1", {d.vocab, d.hidden}));
     }
 
@@ -2166,14 +2192,14 @@ std::vector<uint8_t> as_bf16(const uint8_t* src, int type, size_t count) {
 // without changing this, so from then on the self-check compared the head against mis-decoded values: Qwen2.5-0.5B 1.9
 // reported corr 0.885220 (and "untied", for a pack declaring tie_word_embeddings) where the same container's weights
 // score 0.999999. The container was always right; the number about it was not.
-double corr(const Q4& q, const uint8_t* embed, int H, int rows) {
+static double corr(const Q4& q, const EmbedTable& embed, int rows) {
     double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
     const int n = std::min(rows, q.N);
     for (int r = 0; r < n; ++r)
         for (int k = 0; k < q.K; ++k) {
             const size_t g = size_t(r) * (q.K / 32) + size_t(k) / 32;
             const double x = double(q.codes[size_t(r) * q.K + k]) * q.scale[g] + q.zero[g];
-            const double y = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed)[size_t(r) * H + k]);
+            const double y = embed_at(embed, r, k);
             sxy += x * y;
             sx += x;
             sy += y;
@@ -2346,7 +2372,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // The container takes BF16, and the tied-head self-check reads these same bytes, so convert once into a buffer that
     // outlives both. For the component path the source is f32 that the reader already dequantised.
     std::vector<uint8_t> embed_bf16;
-    const uint8_t* embed_bytes = nullptr;
+    EmbedTable embed_tbl;   // engine#1721: the table and its width travel together
     {
         const uint64_t Vc = dim_count("model.embed_tokens.weight", V), Hc = dim_count("model.embed_tokens.weight", H);
         uint64_t elems = 0;
@@ -2366,7 +2392,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                          std::to_string(elems));
             embed_bf16 = as_bf16(reinterpret_cast<const uint8_t*>(comp.data()), kF32, size_t(elems));
         }
-        embed_bytes = embed_bf16.data();
+        embed_tbl = EmbedTable{embed_bf16.data(), EmbedTable::Fmt::BF16, int(H)};
         w.add("model.embed_tokens.weight", "BF16", {V, H}, embed_bf16);
         ++r.tensors;
     }
@@ -2674,12 +2700,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
                     const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
                     double e;
-                    e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
+                    e = embed_at(embed_tbl, int(n), k);
                     sum_abs += std::fabs(x - e);
                     sum_ref += std::fabs(e);
                 }
             r.lmhead_rel = sum_abs / sum_ref;
-            r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+            r.lmhead_corr = corr(q, embed_tbl, q.N);
             // The diagnostic follows the NUMBER, not the pack's declaration: a genre-A pack ships no config.json, so
             // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
             // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
@@ -2688,8 +2714,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
                                                mm.block, false, /*drop_zero*/ true);
-            r.ctrl_corr_nibble = corr(swap, embed_bytes, int(H), 2048);
-            r.ctrl_corr_nozp = corr(nozp, embed_bytes, int(H), 2048);
+            r.ctrl_corr_nibble = corr(swap, embed_tbl, 2048);
+            r.ctrl_corr_nozp = corr(nozp, embed_tbl, 2048);
         }
 
         // self-check 2: the tiles as written, read back through the engine's own decoder.
@@ -2794,12 +2820,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                     const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
                                     const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
                                     const double e =
-                                        bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
+                                        embed_at(embed_tbl, int(n), k);
                                     sum_abs += std::fabs(x - e);
                                     sum_ref += std::fabs(e);
                                 }
                             r.lmhead_rel = sum_abs / sum_ref;
-                            r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+                            r.lmhead_corr = corr(q, embed_tbl, q.N);
                             r.selfcheck_reference = true;
                             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
                             // The control this path can actually run: the same tiles and the same decoder, with each
@@ -2816,7 +2842,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                         const size_t g = size_t(rr) * (q.K / 32) + size_t(k) / 32;
                                         const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[g] + q.zero[g];
                                         const double y =
-                                            bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[(size_t(rr) + 1) * H + k]);
+                                            embed_at(embed_tbl, int(rr) + 1, k);
                                         sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
                                     }
                                 const double m = double(n) * q.K;

@@ -600,8 +600,16 @@ void test_1671_plan_head_arm(const std::string& root) {
                             pb::matmulnbits("head", {"x", "head_qweight", "head_scales", "head_zeros"}, 16, 64, 4, 8)}));
         const pi::Plan p = pi::plan(dir.string());
         std::vector<int64_t> head;
+        int heads = 0;
         for (const auto& t : p.tensors)
-            if (t.name == "lm_head.weight") head = t.shape;
+            if (t.name == "lm_head.weight") {
+                head = t.shape;
+                ++heads;
+            }
+        // exactly one, not merely the right shape: a future bug that pushes two heads (the shape of a bad merge between the two
+        // code paths this change unifies) would be tolerated by "take the last match", and the property worth pinning is ONE head
+        // chosen by geometry (review of #1732).
+        check(heads == 1, "gate: plan() pushes exactly one lm_head.weight (" + std::to_string(heads) + ")");
         check(head.size() == 2 && head.at(0) == 64 && head.at(1) == 16,
               "gate: plan() takes the node whose N x K IS the head, not the first MatMulNBits (lm_head " +
                   (head.size() == 2 ? std::to_string(head.at(0)) + " x " + std::to_string(head.at(1))

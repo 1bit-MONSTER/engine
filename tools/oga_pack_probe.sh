@@ -38,33 +38,42 @@
 set -u
 PACK=${1:?usage: oga_pack_probe.sh <pack dir> [port]}
 PORT=${2:-18160}
-BIN=${BIN:-${ONEBIT_BIN:-}}
+BIN=${BIN:-${ONEBIT_BIN:-$(command -v 1bit 2>/dev/null || command -v onebit 2>/dev/null)}}
 # Scratch goes to a DISK-backed dir, never /tmp: an imported container is hundreds of MB to several GB, and this box's tmpfs hit
 # 0 MB free on 2026-11-08 and broke every lane's tool output. KEEP=1 leaves it behind, otherwise it is removed on exit.
 SCRATCH=${SCRATCH:-${XDG_CACHE_HOME:-$HOME/.cache}/oga-probe}
-OUT=${OUT:-$SCRATCH/$(basename "$PACK")}
+pack_base=$(basename "$PACK")
+# `rm -rf "$OUT"` runs before gate 1, and OUT defaults to $SCRATCH/<basename of the pack>: a pack given as "." or ".." would make
+# that the scratch root itself and wipe every other probe's container. Refuse rather than tidy up after it.
+case "$pack_base" in ''|.|..|/) echo "oga_pack_probe: refusing a pack path whose basename is '${pack_base}' -- set OUT= explicitly" >&2; exit 2;; esac
+OUT=${OUT:-$SCRATCH/$pack_base}
 KEEP=${KEEP:-0}
 LOG=$OUT/serve.log
 
 [ -d "$PACK" ] || { echo "oga_pack_probe: no such pack dir: $PACK" >&2; exit 2; }
 
-# Gate 2 touches the NPU, so this script is only correct inside a device ticket. Walk the ancestors and refuse otherwise -- a
-# probe that ran unticketed is the shape of every collision this fleet has had. ALLOW_UNTICKETED=1 is the documented escape for a
-# gate-1-only run on a box where no ticket is available.
+# Gate 2 touches the NPU, so this script is only correct inside a device ticket. The check is "is an ancestor of mine the pid
+# the token file names?", which is what npu-kernels#32 settled on after the GPU_TOKEN_FILE idea failed: the helpers are bash
+# scripts, so a running npu-hold's argv[0] is the INTERPRETER and its script path is argv[1] -- matching argv[0] (the first
+# version of this guard) can never match, and matching the whole command line let a shell whose text merely mentioned
+# npu-hold pass the guard on its own grep. The token file is the holder's own statement:
+#   gpu-hold <label> pid <PID> <date>
+TOKEN_FILES=${TOKEN_FILES:-${NPU_TOKEN_FILE:-$HOME/NPU-TOKEN}:${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}}
+token_pids() {
+    local f
+    IFS=':' read -r -a _files <<< "$TOKEN_FILES"
+    for f in "${_files[@]}"; do
+        [ -r "$f" ] || continue
+        sed -n 's/.* pid \([0-9][0-9]*\).*/\1/p' "$f" | head -1
+    done
+}
 ticketed() {
-    # PPid comes from /proc/<pid>/status, not from field 4 of /proc/<pid>/stat: a comm containing a space or a parenthesis
-    # shifts stat's fields and silently walks the wrong chain. Depth-capped so a malformed chain cannot loop.
-    local pid=$$ argv0 ppid depth=0
+    local pids mine pid ppid depth=0
+    pids=$(token_pids | tr '\n' ' ')
+    [ -z "${pids// /}" ] && return 1
+    pid=$$
     while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$depth" -lt 20 ]; do
-        # argv[0] only, never the whole command line: a shell whose command *text* mentions npu-hold (a patch script, an editor,
-        # a grep) made the first version of this walk match its own search string and wave an unticketed run through.
-        argv0=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1)
-        [ "${DEBUG_TICKET:-0}" = 1 ] && echo "   ticket-walk: pid=$pid argv0=$argv0" >&2
-        case "$argv0" in
-            npu-hold|gpu-hold|*/npu-hold|*/gpu-hold)
-                [ "${DEBUG_TICKET:-0}" = 1 ] && echo "   ticket-walk MATCH pid=$pid: $argv0" >&2
-                return 0;;
-        esac
+        for mine in $pids; do [ "$pid" = "$mine" ] && return 0; done
         ppid=$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)
         case "$ppid" in ''|*[!0-9]*) return 1;; esac
         pid=$ppid
@@ -75,15 +84,11 @@ ticketed() {
 if ticketed; then TICKETED=1; else TICKETED=0; fi
 GATE1_ONLY=$(( 1 - TICKETED ))
 if [ "$TICKETED" = 0 ]; then
-    # Known limitation, stated rather than papered over: this fleet's harness (`npu-hold`) EXECs the command it is given, so the
-    # hold process is not in an ancestor's argv[0] by the time this script runs and the walk above cannot see it. A first version
-    # matched the whole command line instead, which made a shell whose *text* mentioned npu-hold (a patch script, an editor, a
-    # grep) wave an unticketed run through -- a guard that passes on its own search string. So the default is a loud warning plus
-    # the exact command, and REQUIRE_TICKET=1 turns it into a refusal for a provisioning script that knows better.
-    echo "oga_pack_probe: WARNING: no npu-hold/gpu-hold ticket detected in this process tree, so GATE 2 WILL NOT RUN." >&2
-    echo "                the invocation that runs both gates: npu-hold -t 4 -l \"oga probe\" -- $0 $PACK $PORT" >&2
-    echo "                (REQUIRE_TICKET=1 refuses outright instead of running gate 1 only)" >&2
+    echo "oga_pack_probe: WARNING: no device ticket detected (no ancestor of this process is the pid in $TOKEN_FILES)," >&2
+    echo "                so GATE 2 WILL NOT RUN. The invocation that runs both gates is:" >&2
+    echo "                  npu-hold -t 4 -l \"oga probe\" -- $0 $PACK $PORT" >&2
     if [ "${REQUIRE_TICKET:-0}" = 1 ]; then
+        echo "                REQUIRE_TICKET=1, so this is a refusal." >&2
         exit 2
     fi
 fi

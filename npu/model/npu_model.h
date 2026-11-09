@@ -30,7 +30,8 @@
 
 #include <memory>
 
-#include "target/xdna/xdna_target.h"   // npu-relative: the CI syntax target has no tree root on its path
+#include "forward/include/q4nx_semantics.h"   // Q4nxSemantics: the architecture flags derived from config.json
+#include "target/xdna/xdna_target.h"          // npu-relative: the CI syntax target has no tree root on its path
 
 namespace npu {
 
@@ -39,6 +40,12 @@ class NpuModel {
     // The target this model runs on. Null until `Q4nxNpuForward::init()` creates it with the device, exactly as the
     // forward's own member was: every use site already null-checks it (`if (xd_ && …)`).
     std::unique_ptr<npu::target::xdna::XdnaTarget> xd;
+
+    // Architecture semantics derived from the model's own config.json — the first piece of *state* to move, because it
+    // is pure configuration: only field-wise assignments happen (`sem_.x = …`, never a wholesale copy, checked with
+    // `grep 'sem_ *='`), so the forward can hold a reference and all 82 `sem_.…` uses stay unchanged. Models whose
+    // config asks for math this forward does not implement are still REFUSED in `init()`, where that check lives.
+    Q4nxSemantics sem;
 };
 
 }  // namespace npu

@@ -293,11 +293,16 @@ private:
     ModelWeights* mw_ = nullptr;
     xrt::device* dev_ = nullptr;
 
+    // The model (engine#803 A3) owns its state; the members below that it owns are references into it, so every use
+    // site is unchanged. Declared FIRST among the owned state: a reference member is initialised from something that
+    // already exists.
+    npu::NpuModel model_;
+
     // Architecture semantics derived from the model's own config.json.  Models
     // whose config asks for layer types this forward does not implement (hybrid
     // linear/sliding attention, per-layer-type RoPE, mRoPE) are REFUSED in
     // init() rather than silently run with the wrong math.
-    Q4nxSemantics sem_;
+    Q4nxSemantics & sem_ = model_.sem;
 
     // Design set DERIVED from c_ (no model-specific geometry constant): four
     // kernels for fused gate/up, five when gate and up are split.
@@ -346,10 +351,8 @@ private:
     // Hadamard fold of the activation, the M=16 bit-equality gate and the NPU_PROFILE accumulators.
     // A1 keeps the design table and the container parsing here; A2 (docs/npu-p4-target-split.md) hands the
     // target a plan instead.  `pb16i_dir_` above stays because the lm head's own images are named from it.
-    // The model (engine#803 A3) owns the target; `xd_` below is a reference to it, so the ~94 `xd_->…` call sites and
-    // every expression in this class stay exactly as they were. Declared before `xd_`: a reference member must be
-    // initialised from something that already exists.
-    npu::NpuModel model_;
+    // The model (engine#803 A3) owns the target; this is a reference to it, so the ~94 `xd_->…` call sites and every
+    // expression in this class stay exactly as they were.
     std::unique_ptr<npu::target::xdna::XdnaTarget> & xd_ = model_.xd;
     // plan.json (engine #799 P1), when the model directory carries one.  It states the three things
     // this class used to decide by looking at which files exist in --kernels: fused gate/up, the

@@ -152,6 +152,11 @@ struct Plan {
 // can name the source; exposed for a unit test that needs no ONNX graph.
 int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg);
 
+// The same value derived from the graph's own node attributes (MatMulNBits/MatMulNBitsBf K and N) when the
+// initializers carry no dims -- the 1.9 external-data genre. Returns 0 when no FFN pair agrees, or when two
+// widths do, so the caller refuses instead of guessing. Exported for the unit test, which needs no pack.
+int intermediate_size_from_graph(const std::string& model_path, int64_t hidden);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);

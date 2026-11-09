@@ -1060,6 +1060,32 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+// The 1.9 external-data genre states no FFN width anywhere a file shows it: the weights are MatMulNBitsBf nodes
+// whose initializers carry dims `[0]` (bytes live in a *.qweight.packed sibling), so the initializer-dimension
+// heuristic in plan() sees nothing. The NODE carries K and N as attributes, and walk_graph already descends into
+// the `If` branches every OGA pack keeps its decoder in. The FFN is then a pair that agrees with itself: the down
+// projection's K is the gate/up projection's N, and the gate/up projection's K is the hidden size.
+//   amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu (hidden 2560): 42 activations each feed two (N=10240,K=2560)
+//   gate/up projections, and 42 down projections are (N=2560,K=10240) -> 10240. Its per-token "mobius" paths
+//   (N=512/2048, K=2560) have no matching down projection, so they cannot be mistaken for the FFN. Measured
+//   2026-11-09 on the pack itself (onnx 1.23.2, node attributes only; its initializers' dims are all [0]).
+// Returns 0 when there is no such pair, or when two widths both pair up: a derivation that can be wrong in two
+// ways is refused rather than picked from.
+int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) {
+    if (hidden <= 0) return 0;
+    const OnnxModel m = parse_onnx(model_path);
+    std::set<int64_t> down_k, gate_n;
+    for (const auto& mm : m.matmuls) {
+        if (mm.N == hidden && mm.K > hidden) down_k.insert(mm.K);
+        if (mm.K == hidden && mm.N > hidden) gate_n.insert(mm.N);
+    }
+    std::set<int64_t> agree;
+    for (const int64_t k : down_k)
+        if (gate_n.count(k)) agree.insert(k);
+    if (agree.size() != 1) return 0;
+    return int(*agree.begin());
+}
+
 int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg) {
     return fill_from_model_config_impl(pack_dir, cfg);
 }
@@ -1629,6 +1655,8 @@ Plan plan(const std::string& pack_dir) {
                 if (w > best) best = int(w);
             }
         }
+        if (best == 0 && geom.contains("hidden_size") && geom["hidden_size"].is_number())
+            best = intermediate_size_from_graph(pack_dir + "/" + gname, geom["hidden_size"].get<int64_t>());
         return best;
     };
     if (!geom.contains("intermediate_size") || geom["intermediate_size"].is_null()) {

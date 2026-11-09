@@ -160,7 +160,24 @@ std::string matmulnbits(const std::string& name, const std::vector<std::string>&
     }
     return n;
 }
-std::string model(const std::vector<std::string>& tensors, const std::vector<std::string>& nodes) {
+std::string if_node(const std::string& name, const std::string& in, const std::string& out,
+                     const std::string& branch, const std::string& graph) {
+    std::string n;
+    str(n, 1, in);
+    str(n, 2, out);
+    str(n, 4, "If");
+    std::string a;
+    str(a, 1, branch);
+    tag(a, 6, 2);                                      // AttributeProto.graph = the branch GraphProto
+    varint(a, graph.size());
+    a += graph;
+    tag(n, 5, 2);
+    varint(n, a.size());
+    n += a;
+    return n;
+}
+// A bare GraphProto -- what an `If` branch attribute carries (ModelProto wraps one, a branch is one).
+std::string graph(const std::vector<std::string>& tensors, const std::vector<std::string>& nodes) {
     std::string g;
     for (const auto& n : nodes) {
         tag(g, 1, 2);
@@ -173,6 +190,10 @@ std::string model(const std::vector<std::string>& tensors, const std::vector<std
         varint(g, t.size());
         g += t;
     }
+    return g;
+}
+std::string model(const std::vector<std::string>& tensors, const std::vector<std::string>& nodes) {
+    const std::string g = graph(tensors, nodes);
     std::string m;
     ints(m, 1, 8);                                     // ir_version
     tag(m, 7, 2);                                      // graph
@@ -2300,6 +2321,39 @@ void test_model_config_geometry(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// The 1.9 external-data packs state the FFN width in no file and in no initializer dim (dims are `[0]`, the bytes
+// live in a *.qweight.packed sibling), so plan()'s initializer heuristic sees nothing. The NODE carries K and N,
+// and the decoder sits in an `If` branch. Measured on amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu: hidden 2560,
+// 42 activations each feeding two (N=10240,K=2560) gate/up projections and 42 down projections (N=2560,K=10240).
+void test_im_from_node_attrs(const std::string& root) {
+    const fs::path dir = fs::path(root) / "imattrs";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto mm = [](const std::string& n, int64_t K, int64_t N) {
+        return pb::matmulnbits(n, {"x", n + ".qweight", n + ".scales", n + ".zeros"}, K, N, 4, 32);
+    };
+    // the branch: gate and up (K = hidden, N = IM), down (K = IM, N = hidden), a "mobius" width, and lm_head
+    const std::string branch = pb::graph(
+        {}, {mm("gate", 2560, 10240), mm("up", 2560, 10240), mm("down", 10240, 2560), mm("mobius", 2560, 2048),
+             mm("lm_head", 2560, 262144)});
+    put_file((dir / "model.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", branch)}));
+    const int im = pi::intermediate_size_from_graph((dir / "model.onnx").string(), 2560);
+    std::printf("im-from-node-attrs: derived %d from the If branch's gate/up and down pair (hidden 2560)\n", im);
+    check(im == 10240, "im-from-node-attrs: the FFN pair inside the If branch gives 10240 (" + std::to_string(im) + ")");
+    // Two widths that both pair up is a derivation that can be wrong in two ways: refused, not picked from.
+    const std::string ambiguous = pb::graph(
+        {}, {mm("gate", 2560, 10240), mm("down", 10240, 2560), mm("gate2", 2560, 4096), mm("down2", 4096, 2560)});
+    put_file((dir / "model2.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", ambiguous)}));
+    check(pi::intermediate_size_from_graph((dir / "model2.onnx").string(), 2560) == 0,
+          "im-from-node-attrs: two agreeing widths are refused rather than picked from");
+    // No down projection at all (attention-only graphs, which is the hybrid line's main graph) is 0, not a guess.
+    const std::string noffn = pb::graph({}, {mm("q_proj", 2560, 256), mm("o_proj", 256, 2560)});
+    put_file((dir / "model3.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", noffn)}));
+    check(pi::intermediate_size_from_graph((dir / "model3.onnx").string(), 2560) == 0,
+          "im-from-node-attrs: a graph with no FFN pair yields 0 (the caller keeps refusing)");
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2329,6 +2383,7 @@ int main(int argc, char** argv) {
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
+        test_im_from_node_attrs(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

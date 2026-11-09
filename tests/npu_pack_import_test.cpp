@@ -215,6 +215,176 @@ int q4_1f_tensors(const json& table) {
 // references. A reader that follows node inputs only reports a weightless graph for a 9.7 GB pack; one that sees the
 // sibling must also say whether the bytes fit the stride the .fconst tile already carries --
 // length == N x (K/128 + 1) x 68 -- as a count, not an assumption.
+// The external-data tile's own decode (engine#1503): a synthetic blob laid out the way the pack lays it out must come
+// back exactly, under BOTH code orderings -- the decoder's constant picks one, and the test holds each to the spec it
+// claims, so flipping the constant cannot silently change what the other branch means.
+void test_external_tile_decode() {
+    const int N = 128, K = 256;                       // 2 tiles of 64 rows, 2 K-blocks -> 3 subvolume pairs
+    const int64_t tiles = N / 64, per_tile = 2 * (K / 128 + 1);
+    const int64_t bytes = tiles * per_tile * 2176;
+    // A code matrix and per-block scale/zero-points to encode, then to find again.
+    std::vector<uint8_t> codes(size_t(N) * K);
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = uint8_t((i * 7 + i / 13) % 16);
+    const auto bf16_bits = [](float v) {
+        unsigned int u;
+        std::memcpy(&u, &v, 4);
+        return uint16_t((u + 0x8000u + ((u >> 16) & 1u)) >> 16);   // round to nearest even, as the importer does
+    };
+    for (const bool row_major : {false, true}) {
+    // DISTINCT scale and zero points per (tile, half, kk, r): a fixture that writes one value everywhere lets a decoder
+    // that reads row 0's scale for all 32 rows pass, which is exactly the addressing this test exists to pin.
+    const auto scale_for = [&](int64_t tile, int half, int64_t kk, int r) {
+        return 0.001953125f * float(1 + int(tile) * 7 + half * 5 + int(kk) * 3 + (r % 4));   // bf16-exact multiples of 2^-9
+    };
+    const auto zero_for = [&](int64_t tile, int half, int64_t kk, int r, int g) {
+        return uint8_t((int(tile) * 3 + half * 5 + int(kk) * 7 + r + g) % 16);
+    };
+    std::vector<uint8_t> blob(size_t(bytes), 0);
+    for (int64_t tile = 0; tile < tiles; ++tile)
+        for (int half = 0; half < 2; ++half)
+            for (int64_t kk = 1; kk <= K / 128; ++kk) {
+                uint8_t* subv = blob.data() + (tile * per_tile + kk * 2 + half) * 2176;
+                for (int r = 0; r < 32; ++r) {
+                    const int64_t row = tile * 64 + half * 32 + r;
+                    const uint16_t sc = bf16_bits(scale_for(tile, half, kk, r));
+                    subv[2112 + r * 2] = uint8_t(sc & 0xFF);
+                    subv[2113 + r * 2] = uint8_t(sc >> 8);
+                    subv[2048 + r * 2] = uint8_t(zero_for(tile, half, kk, r, 0) | (zero_for(tile, half, kk, r, 1) << 4));
+                    subv[2049 + r * 2] = uint8_t(zero_for(tile, half, kk, r, 2) | (zero_for(tile, half, kk, r, 3) << 4));
+                    for (int c = 0; c < 128; ++c) {
+                        const uint8_t nib = codes[size_t(row) * K + (kk - 1) * 128 + c];
+                        if (row_major) {
+                            if (c % 2 == 0) subv[r * 64 + c / 2] = uint8_t((subv[r * 64 + c / 2] & 0xF0) | nib);
+                            else subv[r * 64 + c / 2] = uint8_t((subv[r * 64 + c / 2] & 0x0F) | (nib << 4));
+                        } else {
+                            const int cp = r / 2;      // one byte per column, holding the row pair 2cp / 2cp+1
+                            uint8_t& b = subv[(cp % 4) + c * 4 + (cp / 4) * 512];
+                            if (r % 2 == 0) b = uint8_t((b & 0xF0) | nib);
+                            else b = uint8_t((b & 0x0F) | (nib << 4));
+                        }
+                    }
+                }
+            }
+    std::string err;
+    const pi::Q4 q = pi::decode_external_tile(blob.data(), blob.size(), N, K, err, row_major);
+    check(err.empty() && q.N == N && q.K == K && q.block == 32,
+          "external tile: a blob of the measured size decodes (" + err + ")");
+    bool codes_ok = q.codes.size() == codes.size(), scale_ok = true, zero_ok = true;
+    for (size_t i = 0; codes_ok && i < codes.size(); ++i)
+        if (q.codes[i] != codes[i]) codes_ok = false;
+    // Every row's own scale and all four of its zero points, so the addressing (row r*2 in the param regions, the
+    // group index (kk-1)*4+g, the half and tile choice) is pinned rather than the value of one row repeated.
+    for (int64_t tile = 0; tile < tiles; ++tile)
+        for (int half = 0; half < 2; ++half)
+            for (int64_t kk = 1; kk <= K / 128; ++kk)
+                for (int r = 0; r < 32; ++r) {
+                    const int64_t row = tile * 64 + half * 32 + r;
+                    for (int g = 0; g < 4; ++g) {
+                        const size_t at = size_t(row) * (K / 32) + (kk - 1) * 4 + g;
+                        if (q.scale[at] != scale_for(tile, half, kk, r)) scale_ok = false;
+                        if (q.zero[at] != float(zero_for(tile, half, kk, r, g))) zero_ok = false;
+                    }
+                }
+    check(codes_ok, std::string("external tile: every 4-bit code comes back exactly, ") + (row_major ? "row-major" : "w8 interleave"));
+    check(scale_ok, "external tile: every row keeps its own bf16 scale, repeated over its four groups");
+    check(zero_ok, "external tile: every (row, group) keeps its own int4 zero point");
+    std::string err2;
+    (void)pi::decode_external_tile(blob.data(), blob.size() - 2176, N, K, err2);
+    check(!err2.empty() && err2.find("is not") != std::string::npos,
+          "external tile: a blob one subvolume short is refused with the arithmetic (" + err2 + ")");
+    }
+}
+
+// The conversion half of the writer (engine#1503): the pack's `(code - zp)*scale` and the container's
+// `code*d + m` are different conventions, and the mapping has to reproduce the pack's own numbers. The obvious
+// alternative -- dequantise and re-quantise with the container's quantiser -- was measured on a real phi-4 tile and
+// reproduced the pack's codes on only 2,826 of 8,192 entries, so the identity below is the thing to pin.
+void test_external_to_container() {
+    pi::Q4 pack;
+    pack.N = 4; pack.K = 128; pack.block = 32;
+    pack.codes.assign(size_t(pack.N) * pack.K, 0);
+    for (size_t i = 0; i < pack.codes.size(); ++i) pack.codes[i] = uint8_t((i * 5 + 1) % 16);
+    pack.scale.assign(size_t(pack.N) * (pack.K / 32), 0.0068359375f);   // exact in bf16
+    pack.zero.assign(pack.scale.size(), 0.0f);
+    for (int r = 0; r < pack.N; ++r)
+        for (int g = 0; g < pack.K / 32; ++g) pack.zero[size_t(r) * (pack.K / 32) + g] = float(3 + (g % 4));
+
+    long long m_inexact = -1;
+    const pi::Q4 q = pi::container_from_external_q4(pack, &m_inexact);
+    check(q.codes == pack.codes, "external->container: codes are carried unchanged (the pack's grid is the container's)");
+    check(q.scale == pack.scale, "external->container: d is the pack's scale");
+    check(m_inexact >= 0, "external->container: the bf16-exactness of m is reported, not assumed");
+
+    // The arithmetic identity: code*d + m must equal the pack's (code - zp)*scale, up to the bf16 rounding of m.
+    float worst_rel = 0.0f;
+    for (int r = 0; r < pack.N; ++r)
+        for (int k = 0; k < pack.K; ++k) {
+            const size_t g = size_t(r) * (pack.K / 32) + size_t(k) / 32;
+            const float want = (float(pack.codes[size_t(r) * pack.K + k]) - pack.zero[g]) * pack.scale[g];
+            const float got = float(q.codes[size_t(r) * pack.K + k]) * q.scale[g] + q.zero[g];
+            const float range = 15.0f * pack.scale[g];
+            worst_rel = std::max(worst_rel, std::fabs(got - want) / range);
+        }
+    check(worst_rel <= 1.0f / 256.0f,
+          "external->container: code*d + m reproduces (code - zp)*scale to within one bf16 ulp of m (worst " +
+              std::to_string(worst_rel) + " of the group's 15-step range)");
+}
+
+// The writer's role mapping (engine#1503): the graph's own names, mapped onto the roles the tile writer already
+// speaks, with an unknown name reported rather than skipped -- a projection nothing maps is a weight that would
+// silently not be written.
+void test_external_roles() {
+    struct Case { const char* name; const char* role; };
+    const Case cases[] = {
+        {"model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", "QKV"},
+        {"model.layers.39.attn.o_proj.MatMulNBits.qweight.packed", "O"},
+        {"model.layers.7.mlp.gate_proj.MatMulNBits.qweight.packed", "G"},
+        {"model.layers.7.mlp.up_proj.MatMulNBits.qweight.packed", "U"},
+        {"model.layers.7.mlp.down_proj.MatMulNBits.qweight.packed", "D"},
+        {"lm_head.MatMulNBits.qweight.packed", "HEAD"},
+    };
+    for (const auto& c : cases) {
+        const char* got = pi::external_role_of(c.name);
+        check(got && std::string(got) == c.role,
+              std::string("external role: ") + c.name + " -> " + c.role + " (got " + (got ? got : "null") + ")");
+    }
+    // The three that must NOT be mistaken for a projection: a norm, the embedding, and a name from another genre.
+    check(pi::external_role_of("model.layers.0.input_layernorm.weight") == nullptr,
+          "external role: a norm is not a projection");
+    check(pi::external_role_of("model.embed_tokens.weight") == nullptr,
+          "external role: the embedding is not a projection");
+    check(pi::external_role_of("model.layers.0.attn.qkv_proj_matmul") == nullptr,
+          "external role: an unknown suffix is not guessed");
+}
+
+// The assembly's naming half (engine#1503): the container stores q/k/v separately while the pack stores them as one
+// matmul, so the split is geometry, not a guess. phi-4's qkv is N 7680 = 40 heads x 128 (q) + 2 x 10 kv heads x 128.
+void test_external_container_names() {
+    std::vector<pi::ContainerTensor> t;
+    std::string err;
+    check(pi::external_container_tensors("QKV", 40, 10, 128, t, err) && t.size() == 3,
+          "container names: QKV splits into three tensors");
+    check(t.size() == 3 && t[0].suffix == "self_attn.q_proj.weight" && t[0].row_lo == 0 && t[0].row_hi == 5120,
+          "container names: q takes rows [0, nh*hd)");
+    check(t.size() == 3 && t[1].suffix == "self_attn.k_proj.weight" && t[1].row_lo == 5120 && t[1].row_hi == 6400,
+          "container names: k follows q, nkv*hd rows");
+    check(t.size() == 3 && t[2].suffix == "self_attn.v_proj.weight" && t[2].row_lo == 6400 && t[2].row_hi == 7680,
+          "container names: v closes the range, which must equal the pack's N exactly");
+    for (const char* role : {"O", "G", "U", "D", "HEAD"}) {
+        std::vector<pi::ContainerTensor> one;
+        std::string e2;
+        check(pi::external_container_tensors(role, 40, 10, 128, one, e2) && one.size() == 1,
+              std::string("container names: ") + role + " is one tensor");
+    }
+    std::vector<pi::ContainerTensor> bad;
+    std::string e3;
+    check(!pi::external_container_tensors("MOE_EXPERT", 40, 10, 128, bad, e3) && !e3.empty(),
+          "container names: a role with no container tensor is refused, naming it (" + e3 + ")");
+    std::string e4;
+    check(!pi::external_container_tensors("QKV", 0, 0, 0, bad, e4) && e4.find("geometry") != std::string::npos,
+          "container names: a QKV split with no geometry is refused by name");
+}
+
 void test_external_packed_genre(const std::string& root) {
     const fs::path dir = fs::path(root) / "external-packed";
     fs::remove_all(dir);
@@ -355,10 +525,12 @@ void test_external_packed_genre(const std::string& root) {
             why = e.what();
         }
         std::printf("  external-packed import refusal: %s\n", why.c_str());
-        check(threw, "external-packed: import still refuses the genre (the census widening did not become a writer)");
-        check(why.find("qweight.packed") != std::string::npos && why.find("no writer") != std::string::npos,
-              "external-packed: and it refuses by NAME with the layout stated (no writer for N x (K/128+1) x 68), "
-              "not by tripping over a symbol (" + why + ")");
+        check(threw, "external-packed: import refuses a pack whose geometry no split can satisfy");
+        // The genre HAS a writer now (engine#1503), so the property is no longer "refused because nothing can
+        // write it": it is that a geometry the container split cannot satisfy is REFUSED with the numbers, not
+        // written wrong. This fixture's qkv is N 768 against a 40-head x 128 geometry, which is exactly that case.
+        check(why.find("container range") != std::string::npos || why.find("does not fit") != std::string::npos,
+              "external-packed: a geometry the split cannot satisfy is refused with the numbers (" + why + ")");
         check(!fs::exists(dir / "out" / "model.q4nx"),
               "external-packed: nothing is written for a genre this importer cannot yet walk");
     }
@@ -2423,8 +2595,12 @@ int main(int argc, char** argv) {
                     "these packs and not an OGA NPU pack this importer reads\n", pack.c_str());
     try {
         test_bounds();
+        test_external_tile_decode();
+    test_external_to_container();
+    test_external_roles();
+    test_external_container_names();
+    test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_canonical_copy_reusable();
-        test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);

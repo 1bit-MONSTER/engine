@@ -299,6 +299,16 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // prefix as Qwen3-1.7B at this hidden size (8,512), a different bundle (5 tiles of 591,872, not 3 of 1,183,744),
     // and 1,857 of 686,518,336 bytes differ (2.7e-6). This row is the one that disproved the QK-norm explanation above.
     {2048, 32, 16, 8512, 5, 1, 591872},
+    // Phi-3.5-mini-instruct at hidden 3,072 / 32 heads / 32 layers (and Phi-3-mini-128k, the same phi3 geometry; the
+    // table is keyed by shape, and the Llama row above is what established that the prefix is a property of the shape).
+    // Measured against Phi-3.5-mini's own 1.8 build (`_rai_1.8.0_npu_4K`) by whole-file normalisation: 28 of the 32
+    // blocks come out byte-identical and the four that differ hold all 26,145 differing bytes of 2,036,067,648
+    // (1.28e-5), i.e. content in four layers, not layout. The separation that makes this a rule rather than a fit is
+    // the wrong-rotation end: any rotation other than this one differs in 307,097,372 bytes (15 %) across all 32
+    // blocks, a factor of 10,000. The two halves of the bundle are swapped relative to 1.8 -- the same q/k/v order
+    // change the transform above notes -- so n=2/rot=1 is the minimal spelling of it (n=4/rot=2 and n=8/rot=4 are the
+    // identical permutation, which is why the measurement tool prints the same residual for each).
+    {3072, 32, 32, 10560, 2, 1, 5222400},
 };
 
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes

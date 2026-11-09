@@ -37,6 +37,7 @@ Usage:
 """
 import argparse
 import math
+import os
 import re
 import shutil
 import statistics
@@ -111,6 +112,54 @@ def summarise(ratios, tolerance):
     return "accepted", lines
 
 
+def preflight_problems(load, gpu_busy_percent, resident_servers, max_load, max_gpu_busy):
+    """-> list of reasons not to start. Pure, so the self-test covers the policy and not a copy of it.
+
+    A ratio measured next to another HRX server, or on a GPU that is already busy, is a ratio of the contention: three resident
+    servers inflated an earlier measurement by up to 15 %, and the fix is to refuse rather than to average.
+    """
+    problems = []
+    if load is not None and load > max_load:
+        problems.append(f"load {load:.2f} > {max_load:.2f}")
+    if gpu_busy_percent is not None and gpu_busy_percent > max_gpu_busy:
+        problems.append(f"gpu_busy_percent {gpu_busy_percent} > {max_gpu_busy}")
+    if resident_servers:
+        problems.append(f"{resident_servers} llama-server process(es) resident on this box")
+    return problems
+
+
+def read_gpu_busy_percent(path="/sys/class/drm/card0/device/gpu_busy_percent"):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def count_resident_servers(proc="/proc"):
+    """> count of live processes running llama-server, excluding this tool's own tree.
+
+    The engine's servers and any lane's bench both count: what matters is that something else is using the GPU while the pair
+    runs, not who owns it.
+    """
+    count = 0
+    try:
+        entries = os.listdir(proc)
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, entry, "cmdline"), "rb") as handle:
+                cmdline = handle.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "llama-server" in cmdline and "fa_ratio.py" not in cmdline:
+            count += 1
+    return count
+
+
 def bench_arms(llama_bench, model, n_prompt, reps, pairs, extra):
     """Run the alternating arms and return the rates in run order (None where a row failed to parse)."""
     runs = []
@@ -175,12 +224,19 @@ def self_test():
     check("row parse", parse_rate(row) == 1718.51, str(parse_rate(row)))
     check("non-row parse", parse_rate("build: d8bd0ff (1)") is None)
 
+    # Preflight policy: each condition alone must refuse, and a clean box must pass.
+    check("clean box passes", preflight_problems(1.0, 0, 0, 60.0, 5) == [])
+    check("hot load refuses", preflight_problems(75.0, 0, 0, 60.0, 5) == ["load 75.00 > 60.00"])
+    check("busy gpu refuses", preflight_problems(1.0, 40, 0, 60.0, 5) == ["gpu_busy_percent 40 > 5"])
+    check("resident server refuses", len(preflight_problems(1.0, 0, 3, 60.0, 5)) == 1)
+    check("unreadable gpu counter is not a refusal", preflight_problems(1.0, None, 0, 60.0, 5) == [])
+
     if failures:
         print("fa_ratio self-test FAILED:")
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print("fa_ratio self-test: ok (estimator, alternating pairs, acceptance verdict, row parsing)")
+    print("fa_ratio self-test: ok (estimator, alternating pairs, acceptance verdict, row parsing, preflight policy)")
     return 0
 
 
@@ -194,6 +250,10 @@ def main(argv):
     parser.add_argument("--reps", type=int, default=2, help="llama-bench repetitions inside one arm")
     parser.add_argument("--tolerance", type=float, default=1.25, help="max/min of the pair ratios that still counts")
     parser.add_argument("--max-load", type=float, default=60.0, help="refuse to start above this 1-min load average")
+    parser.add_argument("--max-gpu-busy", type=int, default=5,
+                        help="refuse to start when /sys/class/drm/card0/device/gpu_busy_percent is above this")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="measure anyway: for a deliberately contended run, never for a number you intend to quote")
     parser.add_argument("--extra", default="", help="extra llama-bench flags, quoted")
     arguments = parser.parse_args(argv)
 
@@ -202,15 +262,21 @@ def main(argv):
     if not arguments.llama_bench or not arguments.model:
         parser.error("--llama-bench and --model are required (or --self-test)")
 
-    load = 0.0
+    load = None
     try:
         with open("/proc/loadavg", encoding="utf-8") as handle:
             load = float(handle.read().split()[0])
     except OSError:
         pass
-    if load > arguments.max_load:
-        print(f"refusing to measure at load {load:.2f} > {arguments.max_load:.2f}: a saturated box is what makes"
-              " the ratio unquotable", file=sys.stderr)
+    if arguments.skip_preflight:
+        problems = []
+    else:
+        problems = preflight_problems(load, read_gpu_busy_percent(), count_resident_servers(),
+                                      arguments.max_load, arguments.max_gpu_busy)
+    if problems:
+        print("refusing to measure: " + "; ".join(problems)
+              + " -- a ratio taken under contention is a ratio of the contention (--skip-preflight overrides)",
+              file=sys.stderr)
         return EXIT_VOID
     for tool in (arguments.llama_bench, arguments.model):
         if not shutil.os.path.exists(tool):

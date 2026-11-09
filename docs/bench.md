@@ -88,6 +88,12 @@ pp2048:
 | quiet box | 4 | **1.273×** (1 774.17 / 1 388.34 tok/s) | 1.08× | ACCEPTED — the FA path is worth ~21 % of the `-fa 0` time, 0.156 ms per 2048-token forward |
 | busy box (load 73, 20 GiB of foreign models resident) | 3 | — | 9.29× | VOID — the same arms spanned 161 to 1 773 tok/s |
 
+Before it starts, the tool refuses a box that cannot produce a quotable run: a 1-minute load average above `--max-load`
+(default 60), `/sys/class/drm/card0/device/gpu_busy_percent` above `--max-gpu-busy` (default 5), or **any other `llama-server`
+resident on the box** — three resident servers inflated an earlier measurement by up to 15 %, and refusing beats averaging.
+`--skip-preflight` exists for a deliberately contended run, never for a number anyone intends to quote. On the box this was
+written on the gate refuses right now, with three servers up.
+
 `-fa 0` is usable only below roughly 5.4k context on this route (it segfaults above that), which is why the default shape
 is pp2048. The self-test (`ctest fa_ratio_estimator`) exercises the estimator without a GPU: it accepts agreement, refuses
 disagreement, and checks that a run whose row failed to parse cannot shift the arms of the pair after it.

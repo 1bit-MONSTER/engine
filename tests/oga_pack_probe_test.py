@@ -32,12 +32,16 @@ Arms:
   2. REQUIRE_TICKET=1, no ticket     -> refusal, exit 2, and it never even imports
   3. token naming an ancestor's pid  -> ticket detected, no warning, gate 2 attempted (exit 4 with a stub binary, not 3)
   4. basename "."                    -> refused, exit 2, before any `rm -rf`
+  5. no binary on PATH, BIN unset    -> refused by name, exit 2 (was: rc 127 from the shell, reported as "the pack stops at gate 1")
+  6. a GPU ticket and no NPU token   -> NOT a ticket: gate 2 is NPU work and runs only on the NPU token
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 
+BASH = shutil.which("bash") or "/bin/bash"   # arm 5 empties PATH, so the interpreter has to be named absolutely
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "oga_pack_probe.sh")
 
@@ -111,6 +115,28 @@ r = subprocess.run(["bash", TOOL, TMP + "/.", "19957"], capture_output=True, tex
                    env={**os.environ, "BIN": "/bin/true", "SCRATCH": TMP + "/scratch", "TOKEN_FILES": TMP + "/no-such-token"})
 check(r.returncode == 2, f"a pack path whose basename is '.' is refused (rc={r.returncode})")
 check("refusing a pack path" in r.stderr, "with the reason, before any rm -rf")
+
+# 5. no binary anywhere: the verdict must name the missing binary, not the pack (the shell's rc 127 used to be read as gate 1)
+r = subprocess.run([BASH, TOOL, pack, "19956"], capture_output=True, text=True, timeout=120,
+                   env={**os.environ, "BIN": "", "ONEBIT_BIN": "", "PATH": TMP + "/empty-bin",
+                        "SCRATCH": TMP + "/scratch", "TOKEN_FILES": TMP + "/no-such-token"})
+check(r.returncode == 2, f"no 1bit binary -> exit 2 (rc={r.returncode})")
+check("no 1bit binary" in r.stderr, "and it says so by name")
+check("gate 1" not in r.stdout and "no container" not in r.stdout,
+      "and it never reaches gate 1, so the pack is not blamed for the tool")
+
+# 6. a GPU ticket is not an NPU ticket: gate 2 opens the NPU, so a GPU-only hold must not authorise it
+home = TMP + "/home-gpu-only"
+os.makedirs(home, exist_ok=True)
+gpu_tok = home + "/GPU-TOKEN"
+script = (
+    'printf "gpu-hold test-gpu pid %d 2026-11-09T00:00:00\\n" $$ > "$1"\n'
+    'HOME="$2" BIN="$5" SCRATCH="$3" bash "$4" "$6" 19955; echo "rc=$?"\n'
+)
+r = subprocess.run(["bash", "-c", script, "x", gpu_tok, home, TMP + "/scratch", TOOL, STUB, pack],
+                   capture_output=True, text=True, timeout=120)
+check("GATE 2 WILL NOT RUN" in r.stderr, "a GPU token alone is NOT a ticket for the NPU gate")
+check("rc=3" in r.stdout, "so only gate 1 runs (rc=3), and no NPU work happens under a GPU ticket")
 
 import shutil
 shutil.rmtree(TMP, ignore_errors=True)

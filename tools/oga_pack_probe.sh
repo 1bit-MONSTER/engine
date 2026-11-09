@@ -39,6 +39,12 @@ set -u
 PACK=${1:?usage: oga_pack_probe.sh <pack dir> [port]}
 PORT=${2:-18160}
 BIN=${BIN:-${ONEBIT_BIN:-$(command -v 1bit 2>/dev/null || command -v onebit 2>/dev/null)}}
+# A missing binary used to reach gate 1, fail with the shell's rc 127, and be reported as "this pack stops at gate 1" -- the pack
+# was blamed for the tool not being installed. Refuse here, before anything is touched, so the verdict can only be about the pack.
+[ -n "$BIN" ] && [ -x "$BIN" ] || {
+    echo "oga_pack_probe: no 1bit binary: BIN is '${BIN:-}', which is not an executable path (set BIN=, ONEBIT_BIN=, or put one on PATH)" >&2
+    exit 2
+}
 # Scratch goes to a DISK-backed dir, never /tmp: an imported container is hundreds of MB to several GB, and this box's tmpfs hit
 # 0 MB free on 2026-11-08 and broke every lane's tool output. KEEP=1 leaves it behind, otherwise it is removed on exit.
 SCRATCH=${SCRATCH:-${XDG_CACHE_HOME:-$HOME/.cache}/oga-probe}
@@ -58,7 +64,10 @@ LOG=$OUT/serve.log
 # version of this guard) can never match, and matching the whole command line let a shell whose text merely mentioned
 # npu-hold pass the guard on its own grep. The token file is the holder's own statement:
 #   gpu-hold <label> pid <PID> <date>
-TOKEN_FILES=${TOKEN_FILES:-${NPU_TOKEN_FILE:-$HOME/NPU-TOKEN}:${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}}
+# Gate 2 is `forward-serve` on the NPU, so the default is the NPU token ALONE: accepting a GPU ticket here would run NPU work
+# without the NPU token, alongside the lane that does hold it -- the collision this guard exists to prevent. A caller that ever
+# adds a GPU-only gate widens this explicitly via TOKEN_FILES=<file>[:<file>...].
+TOKEN_FILES=${TOKEN_FILES:-${NPU_TOKEN_FILE:-$HOME/NPU-TOKEN}}
 token_pids() {
     local f
     IFS=':' read -r -a _files <<< "$TOKEN_FILES"

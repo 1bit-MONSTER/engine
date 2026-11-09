@@ -144,6 +144,10 @@ struct OnnxModel {
     // Node inputs that name a `*.qweight.empty` placeholder whose `*.qweight.packed` sibling carries the bytes
     // (resolved below). Counted so `info` can say "the weights are here, behind a placeholder" instead of "none".
     int64_t packed_siblings = 0;
+    // The first placeholder whose `*.qweight.packed` sibling is ITSELF empty, if any: the graph carries no weights. That is a
+    // refusal only when the pack has no Token .fconst to carry them instead (engine#1717), and `walk_graph` parses a file,
+    // not a pack -- so it records the fact and the decision is made where `pack_dir` is known.
+    std::string empty_packed_sibling;
 };
 
 // A placeholder states its length as zero rather than stating nothing: a real pack's `...qweight.empty` is dims [0]
@@ -277,15 +281,12 @@ OnnxModel parse_onnx(const std::string& path) {
         const OnnxTensor* pw = find_init(packed);
         if (!pw) continue;         // no sibling at all: not this genre's pack, leave it to the reader below
         if (no_bytes(*pw)) {
-            // engine#1671: the sibling exists and is ITSELF a zero-length placeholder (measured on
-            // Qwen2.5-0.5B-Instruct rai_1.9.0 -- dims [0], no external-data location, offset 0, length 0, for all 241
-            // of its MatMulNBits). So the weights are genuinely absent from the pack's external data, and the honest
-            // answer is a refusal that says that. Deferring it produced `...qweight.empty: no data` from a lookup much
-            // later, which names the placeholder rather than the problem and reads as a tile-layout fault.
-            throw std::runtime_error(
-                "the pack names " + w->name + ", and its " + packed + " sibling exists but carries no data either "
-                "(no external-data location, dims all zero): these weights are genuinely absent from the pack's "
-                "external data, so this pack cannot be imported -- not a tile-layout or block-size problem");
+            // The sibling exists and is ITSELF a zero-length placeholder: the GRAPH carries no weights. On the 1.9 line that is
+            // normal -- the weights are in the Token .fconst -- so this is recorded, not thrown (engine#1717; #1686 threw here
+            // and refused the fleet's reference pack, whose .fconst reader then never ran).
+            if (m.empty_packed_sibling.empty())
+                m.empty_packed_sibling = w->name + " / " + packed;
+            continue;
         }
         mm.weight = pw->name;
         ++m.packed_siblings;
@@ -548,6 +549,20 @@ std::string find_token_fconst(const std::string& dir, std::string* why = nullptr
 // .fconst?" predicate, which cost a second full rewrite per `npu-pack` command (measured: two O_TRUNC opens of the same
 // 291 MB file for one `npu-pack info`). Call it ONCE per plan/import and pass the path around. "Is there an .fconst?" is
 // find_token_fconst(), which touches nothing.
+// engine#1717: the graph names `.qweight` placeholders whose `.packed` siblings are empty too, so the graph itself carries no
+// weights. That is a refusal ONLY when the pack has nothing else to carry them -- the 1.9 line puts every weight in the Token
+// `.fconst`, and the fleet's reference pack is exactly that shape. #1686 threw inside `walk_graph`, which cannot see the pack, so
+// the reference pack was refused before its `.fconst` was ever consulted.
+void refuse_if_no_weight_carrier(const OnnxModel& m, const std::string& pack_dir) {
+    if (m.empty_packed_sibling.empty()) return;
+    if (!find_token_fconst(pack_dir).empty()) return;   // the .fconst carries them; nothing to refuse
+    throw std::runtime_error(
+        "the pack's graph names " + m.empty_packed_sibling +
+        " and that placeholder's sibling carries no data either (no external-data location, dims all zero): these weights are "
+        "genuinely absent from the pack's external data, and this pack has no Token .fconst to carry them instead, so nothing in "
+        "the pack holds them -- not a tile-layout or block-size problem");
+}
+
 std::string materialise_token_fconst(const std::string& pack_dir, const Dims& dims) {
     const std::string found = find_token_fconst(pack_dir);
     if (found.empty()) return found;
@@ -1598,6 +1613,7 @@ Plan plan(const std::string& pack_dir) {
         throw std::runtime_error("the pack's graph file " + graph + " is not in " + pack_dir +
                                  " (named by genai_config.json's model.decoder.filename)");
     const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph);
+    refuse_if_no_weight_carrier(onnx, pack_dir);
     // Census the graph's own weight carrier (see plan_import.h's note): this is what tells a 1.3/1.6/1.7.1 pack
     // (real ONNX initializers) from a 1.8/R1-Distill pack (placeholders, weights in model.bin) without parsing
     // anything outside the pack.
@@ -2194,6 +2210,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // learned to read fail at the first byte, with "cannot open <pack>/model.onnx".
     const bool tok_present = !find_token_fconst(pack_dir).empty();
     const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph_filename(pack_dir));
+    refuse_if_no_weight_carrier(onnx, pack_dir);
     // A graph whose quantised matmuls name a `*.qweight.empty` placeholder *and* whose packed siblings carry no bytes
     // has no weights in the graph at all. On this line that means model.bin: 1.8/R1-Distill ship their 4-bit weights
     // there and keep `[0]`-dims placeholders in the graph, and this importer has no model.bin reader. Refusing here
@@ -2207,7 +2224,10 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             if (!mm.weight.empty() && mm.weight.find(".empty") != std::string::npos) ++unresolved;
         std::error_code bin_ec;
         const auto bin_size = fs::file_size(fs::path(pack_dir) / "model.bin", bin_ec);
-        if (unresolved > 0 && unresolved == onnx.matmuls.size() && !bin_ec)
+        // ...and not when the pack carries a Token .fconst, which is where the 1.9 line puts those very weights: without this,
+        // the fleet's reference pack (Qwen2.5-0.5B-Instruct 1.9, 25 unresolved matmuls and a model.bin) is refused before its
+        // .fconst reader runs at all (engine#1717, measured on current main).
+        if (unresolved > 0 && unresolved == onnx.matmuls.size() && !bin_ec && !tok_present)
             throw std::runtime_error(
                 std::to_string(unresolved) + " MatMulNBits weight(s) in this graph are `*.qweight.empty` placeholders and "
                 "none of their `*.qweight.packed` siblings carries bytes; the pack carries model.bin (" +

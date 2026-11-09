@@ -441,10 +441,46 @@ std::string resolve_token_fconst(const std::string& pack_dir, const Dims& dims) 
     // Named by pack and geometry, so a rerun overwrites its own copy instead of filling the temp dir.
     const std::string tag =
         std::to_string(std::hash<std::string>{}(fs::path(pack_dir).lexically_normal().string()) % 100000000);
-    const std::string work = (fs::temp_directory_path() /
-                              ("1bit-fconst19-" + tag + "-" + std::to_string(dims.hidden) + "-" +
-                               std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst"))
-                                 .string();
+    const std::string name = "1bit-fconst19-" + tag + "-" + std::to_string(dims.hidden) + "-" +
+                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst";
+    // `temp_directory_path()` THROWS when TMPDIR names a directory that no longer exists, which is the ordinary state of
+    // a shell after a reboot has cleared /tmp -- and it threw before any work was attempted, so `npu-pack info` on a
+    // 1.9 pack failed with `filesystem error: temp_directory_path: No such file or directory [/tmp/x]` and no hint that
+    // the pack was fine. Fall back rather than fail: /tmp, then the current directory. The copy is scratch, and a note
+    // says where it went so nobody wonders what that 291 MB file is.
+    std::vector<fs::path> dirs;
+    try {
+        dirs.push_back(fs::temp_directory_path());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "1bit npu-pack: note: the temporary directory is unusable (%s), so the 1.9 pack's canonical copy "
+                     "goes elsewhere\n", e.what());
+    }
+    dirs.push_back(fs::path("/tmp"));
+    dirs.push_back(fs::current_path());
+    std::string work;
+    for (const auto& d : dirs) {
+        std::error_code ec;
+        if (!fs::is_directory(d, ec) || ec) continue;
+        const fs::path cand = d / name;
+        // Writable in fact, not just in theory: the copy is written immediately after this.
+        std::ofstream probe(cand, std::ios::binary | std::ios::app);
+        if (!probe) continue;
+        probe.close();
+        work = cand.string();
+        // Say where it went whenever that is not the ordinary place: the copy is a few hundred MB and it is scratch.
+        std::error_code ec2;
+        const fs::path tmpdir = [&] { try { return fs::temp_directory_path(); } catch (...) { return fs::path(); } }();
+        if (tmpdir.empty() || fs::weakly_canonical(cand.parent_path(), ec2) != fs::weakly_canonical(tmpdir, ec2))
+            std::fprintf(stderr, "1bit npu-pack: note: the 1.9 pack's canonical copy is %s (remove it when done)\n",
+                         work.c_str());
+        break;
+    }
+    if (work.empty())
+        throw std::runtime_error(pack_dir + ": this is a Ryzen AI 1.9 pack, whose Token .fconst has to be rewritten into "
+                                            "its 1.8 form before it can be read, and no writable directory is available "
+                                            "for that copy (tried the temporary directory, /tmp and the current "
+                                            "directory)");
     return canonical_token_fconst(found, dims.hidden, dims.heads, dims.layers, work);
 }
 

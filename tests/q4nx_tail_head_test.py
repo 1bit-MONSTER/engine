@@ -71,7 +71,9 @@ def main():
     check(T.head_offset(291655296, 2374, 34816) == 209002112, "head_offset is fconst_bytes - ntiles*tile")
     check(T.head_offset(291655296, 2374, 34816) + 2374 * 34816 == 291655296, "the head grid ends exactly at EOF")
     check(T.head_offset(291655296, 2374, 34816) != T.attn_payload_off(896),
-          "the head's offset is not attn_payload_off(H) -- the mistake engine#1693 records")
+          "attn_payload_off(H) alone is not the head's offset -- the mistake engine#1693 records")
+    check(T.head_offset(291655296, 2374, 34816) == 209000256 + T.attn_payload_off(896),
+          "it equals the importer's layers*stride + env (209000256 is this pack's 24 layer blocks)")
 
     # ── the envelope decoder, against the vendor tile ──
     with open(GOLDEN + ".json") as f:

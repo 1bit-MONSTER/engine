@@ -68,11 +68,18 @@ def attn_payload_off(hidden):
 
 
 def head_offset(fconst_bytes, ntiles, tile):
-    """Where the tied head's grid starts: the LAST `ntiles * tile` bytes. Not `attn_payload_off(H)`.
+    """Where the tied head's grid starts: the last `ntiles * tile` bytes of the `.fconst`.
 
-    engine#1693 read it from `attn_payload_off(H)` and got corr 0.885; the `.fconst` carries the per-layer payload
-    first and ends with the head, and at this offset the same decode correlates 1.0000 with the pack's own fp16
-    embedding with a magnitude ratio of 1.000 (rel_err 0.0007 over four tiles on `Qwen2.5-0.5B-Instruct_rai_1.9.0_npu`).
+    The importer derives the same number as `layers * stride + attn_payload_off(H)` -- past the per-layer payload, then
+    the tail's own envelope -- and *verifies* it against the remaining file size (`want == have`, pack_import.cpp), so
+    the two agree whenever the tail is the thing the file ends with. Using the subtraction here is deliberate: it needs
+    neither the layer count nor the eps-anchor-derived `stride`, and a file whose end is something else shows up as a
+    correlation that is not 1 rather than as a silently wrong offset.
+
+    Reading from `attn_payload_off(H)` alone (without the `layers * stride` term) addresses the wrong bytes by the whole
+    payload; that is the mistake engine#1693 records, and at the correct offset the decode correlates 1.0000 with the
+    pack's own fp16 embedding, magnitude ratio 1.000, rel_err 0.0007 over four tiles on
+    `Qwen2.5-0.5B-Instruct_rai_1.9.0_npu`.
     """
     return fconst_bytes - ntiles * tile
 
@@ -170,10 +177,9 @@ def measure(pack, tiles_wanted):
     if tile == 0 or vocab % K_TILE_ROWS:
         return None, 2, "H %d is not a multiple of %d" % (hidden, K_KBLOCK)
     need = env + ntiles * tile
-    # WHERE the head is: the LAST `ntiles * tile` bytes, not the region after `env`. The `.fconst` carries the
-    # per-layer payload first and ends with the tied head's grid, so `env` addresses the wrong bytes by the whole
-    # payload (engine#1693: at `env` the decode correlates at chance; at `size - ntiles*tile` it correlates 1.0000
-    # with the pack's own fp16 embedding and its magnitude ratio is 1.000).
+    # WHERE the head is: the LAST `ntiles * tile` bytes. `env` on its own is only the tail's envelope -- the importer
+    # reaches the head as `layers*stride + env`, which equals this subtraction whenever its size check passes
+    # (engine#1693: at `env` the decode correlates at chance, at the real offset 1.0000).
     base = head_offset(size, ntiles, tile)
     rows = []
     status = 0 if base >= 0 else 3

@@ -1535,9 +1535,41 @@ Plan plan(const std::string& pack_dir) {
                     // o_proj's K is hidden and q_proj has to be hidden wide for the run to be uniform.
                     const int64_t payload = g.hdr[0] - attn_off;
                     const int64_t want = n_kv * 2 + n_q * 2;  // k, q, v, o = 2/14/2/14 on 0.5B
-                    if (payload <= 0 || payload % tile_bytes)
+                    // A pack whose attention section is [q,k,v at K=hidden][per-head QK norms][o_proj at K=q_out]
+                    // still has ONE header, so it lands here -- and the uniform test rejects it by a handful of
+                    // bytes. Measured on Hunyuan-0.5B-Instruct (h1024, 16 heads x head_dim 128, so q_out = 2,048):
+                    //   q,k,v           64 tiles x 39,168                    = 2,506,752
+                    //   per-head norms  2 x 128 x 2 B + 128 B pad             =       640
+                    //   o_proj          16 tiles x 73,984 (K = q_out)         = 1,183,744
+                    //                                                          3,691,136 = the payload to the byte
+                    // The gap is checked to be a norms-sized region rather than accepted loosely: if the remainder
+                    // were tiles' worth of bytes it would be a layout this importer has not measured, and reading it
+                    // would put weights in the wrong place.
+                    const int64_t o_tiles_h = H / kTileRows;
+                    const int64_t qkv_bytes_c = int64_t(n_kv * 2 + n_q) * tile_bytes;
+                    const int64_t o_bytes_c = o_tiles_h * tile_o;
+                    const int64_t gap_c = payload - qkv_bytes_c - o_bytes_c;
+                    const int64_t norm_ceiling = int64_t(2) * int64_t(d.head_dim) * 2 + 256;
+                    if (payload > 0 && q_out != H && o_tiles_h > 0 && gap_c >= 0 && gap_c <= norm_ceiling) {
+                        p.attn_tiles = n_kv * 2 + n_q;
+                        p.o_off = attn_off + qkv_bytes_c + gap_c;
+                        p.o_k = int(q_out);
+                        // NOT p.attn_note: that field is the refusal channel -- a non-empty value there refuses the
+                        // attention biases by name (it means "why this section could not be read"). This is the
+                        // opposite: the section WAS read this way. Reported on stderr once instead.
+                        static bool said = false;
+                        if (!said) {
+                            said = true;
+                            std::fprintf(stderr,
+                                         "note: attention section is q/k/v at K=%lld (%lld tiles), %lld B of per-head "
+                                         "QK norms, then o_proj at K=%lld (%lld tiles)\n",
+                                         (long long)H, (long long)p.attn_tiles, (long long)gap_c,
+                                         (long long)q_out, (long long)o_tiles_h);
+                        }
+                    } else if (payload <= 0 || payload % tile_bytes)
                         refuse("attention payload is " + std::to_string(payload) + " B, not a whole number of " +
                                std::to_string(tile_bytes) + "-byte tiles");
+                    else if (p.o_k != 0) { /* the composite layout above already assigned the sections */ }
                     else if (q_out != H)
                         refuse("the attention payload holds q/k/v/o as one uniform tile run, which needs "
                                "q_proj's width to be hidden; this pack's q_proj is " + std::to_string(q_out) +
@@ -2471,14 +2503,18 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             } else if (onnx.matmuls.empty()) {
                 const int64_t tail_off = int64_t(p.dims.layers) * g.stride;
                 const int64_t tile = attn_tile_bytes(H);
-                const int64_t rows = V / kTileRows;
+                // ceil, not floor: a vocab that is not a multiple of 64 is padded up to whole tiles in the pack
+                // (Hunyuan-0.5B: 120,818 rows = 1,887.8 tiles, so the tail holds 1,888 and the last one is partly
+                // padding). The rows past V are dropped before the tensor is written, so the container's head has
+                // exactly V rows.
+                const int64_t rows = (V + kTileRows - 1) / kTileRows;
                 // The envelope is the same `64 + 2*hidden` the layer blocks open with (eps, padding, the norm), not a
                 // constant: 1,856 is only its qwen2.5-0.5B value. Qwen3-1.7B's tail is 4,160 + 2,374 x 73,984 to the
                 // byte, which the constant would have missed by 2,304.
                 const int64_t env = attn_payload_off(H);
                 const int64_t want = env + rows * tile;
                 const int64_t have = int64_t(fc.size) - tail_off;
-                if (V % kTileRows != 0 || want != have) {
+                if (want != have) {
                     late.push_back("lm_head.weight: the .fconst tail is " + std::to_string(have) + " B, not the " +
                                    std::to_string(want) + " B its envelope and head tiles would take (" +
                                    std::to_string(env) + " + " + std::to_string(rows) + " x " +
@@ -2498,6 +2534,15 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                        "so their fields are not understood");
                     } else {
                         Q4 q = q_from_tiles(tiles);
+                        // The pack's own padding stays: q4_1 tiles need N % 32 == 0, and the padded row count
+                        // (ceil(V/64) x 64) satisfies it where V itself may not -- Hunyuan-0.5B has 120,818 rows, so
+                        // the head carries 120,832 and the 14 extra are padding the vocabulary never addresses (the
+                        // container still states vocab_size = 120,818).
+                        if (q.N != int(V))
+                            std::fprintf(stderr,
+                                         "note: the head is stored as %d rows for a vocabulary of %lld (the pack pads "
+                                         "to whole 64-row tiles); vocab_size stays %lld in the container\n",
+                                         q.N, (long long)V, (long long)V);
                         std::vector<uint8_t> tiled;
                         long long pinexact = 0;
                         tile_q4_1_f32(q, tiled, &pinexact);
@@ -2507,9 +2552,11 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         // model it must reproduce the 4-bit head, and on an untied one the number simply comes
                         // out low. Report it rather than skipping: it is evidence either way (same rule the host
                         // head path uses).
-                        if (q.N == int(V) && q.K == int(H)) {
+                        // q.N may exceed V by the pack's tile padding (Hunyuan-0.5B: 120,832 rows for 120,818),
+                        // so the reference is compared over the vocabulary's own rows.
+                        if (q.N >= int(V) && q.K == int(H)) {
                             double sum_abs = 0, sum_ref = 0;
-                            for (int n = 0; n < q.N; ++n)
+                            for (int n = 0; n < int(V); ++n)
                                 for (int k = 0; k < q.K; ++k) {
                                     const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
                                     const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
@@ -2525,7 +2572,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                     sum_ref += std::fabs(e);
                                 }
                             r.lmhead_rel = sum_abs / sum_ref;
-                            r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+                            r.lmhead_corr = corr(q, embed_bytes, int(H), int(V));
                             r.selfcheck_reference = true;
                             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
                             // The control this path can actually run: the same tiles and the same decoder, with each

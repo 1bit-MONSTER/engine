@@ -52,7 +52,8 @@ the reference is the pack's own `model.embed_tokens.weight`, and `--ref` overrid
 Exit status: 0 measured against an oracle; 2 the pack cannot be measured (no model.onnx.data / no embed_tokens / no
 .fconst); 3 measured with a geometry that does not match the tail (so the numbers describe the wrong bytes); 4 refused:
 the head's block size is not 128, so a block-128 decode would measure the wrong layout; 5 decoded, but no oracle (an
-untied pack without `--ref`), so no correlation is reported.
+pack that DECLARES `tie_word_embeddings: false` and is given no `--ref`), so no correlation is reported.  A pack that
+does not declare it is correlated against its embedding and labelled provisional, because "undeclared" is not "untied".
 """
 import argparse
 import glob
@@ -246,6 +247,11 @@ def measure(pack, tiles_wanted, ref_path=None, ref_dtype="bf16"):
     cfg = config(pack)
     vocab = int(cfg["vocab_size"])
     hidden = int(cfg["hidden_size"])
+    # "declared untied" and "did not declare" are different states (engine#1747 review; npu/pack_import.cpp:2201 keeps
+    # them apart the same way).  Absent key -- or no config.json at all, which is the genre-A case -- used to fall into
+    # the untied branch, skip the correlation and exit 5 saying "an untied pack without --ref": an assertion the pack
+    # never made, withholding a 1.0000 correlation its own embedding would have supplied.
+    tie_declared = "tie_word_embeddings" in cfg
     tied = bool(cfg.get("tie_word_embeddings", False))
     decl = head_decl(pack)
     # engine#1740: a head declared at another block size has every subvolume offset elsewhere, so decoding it with the
@@ -258,14 +264,15 @@ def measure(pack, tiles_wanted, ref_path=None, ref_dtype="bf16"):
     if ref_path:
         ref_all, why = reference(ref_path, ref_dtype, hidden)
         oracle = "--ref " + os.path.basename(ref_path)
-    elif tied:
+    elif tied or not tie_declared:
         ref_all, why = embedding(pack, vocab, hidden)
-        oracle = "model.embed_tokens.weight (tied)"
+        oracle = ("model.embed_tokens.weight (tied)" if tied else
+                  "model.embed_tokens.weight (the pack does not declare tie_word_embeddings; the correlation is provisional)")
     else:
-        ref_all, why, oracle = None, None, None     # untied, no --ref: decode, but do not correlate against nothing
+        ref_all, why, oracle = None, None, None     # DECLARED untied, no --ref: decode, but do not correlate against nothing
     if ref_path and ref_all is None:
         return None, 2, why
-    if tied and not ref_path and ref_all is None:
+    if (tied or not tie_declared) and not ref_path and ref_all is None:
         return None, 2, why
     path = fconst(pack)
     if not path:

@@ -69,14 +69,17 @@ def check(ok, what):
         print("ok   %s" % what)
 
 
-def make_pack(d, tied, head_block, zeros=0):
+def make_pack(d, tied, head_block, zeros=0, declare=True, embed=False):
     """A pack the tool can open: config, a graph whose head sits in an If subgraph, a .fconst of the right tail size."""
     V, H = 2 * T.K_TILE_ROWS, T.K_KBLOCK
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "config.json"), "w") as f:
-        json.dump({"vocab_size": V, "hidden_size": H, "tie_word_embeddings": tied}, f)
+        cfg = {"vocab_size": V, "hidden_size": H}
+        if declare:                     # engine#1747 review: "declared untied" and "did not declare" are different states
+            cfg["tie_word_embeddings"] = tied
+        json.dump(cfg, f)
     if HAVE_ONNX:
-        write_graph(d, V, H, head_block)
+        write_graph(d, V, H, head_block, embed=embed)
     tile = T.attn_tile_bytes(H)
     rng = np.random.default_rng(1740)
     blob = bytearray(rng.integers(0, 256, 1000 + 2 * tile, dtype=np.uint8).tobytes())
@@ -91,8 +94,13 @@ def make_pack(d, tied, head_block, zeros=0):
     return V, H
 
 
-def write_graph(d, V, H, head_block):
-    """The head inside an If subgraph under the vendor op name -- the shape of the real 1.9 graphs."""
+def write_graph(d, V, H, head_block, embed=False):
+    """The head inside an If subgraph under the vendor op name -- the shape of the real 1.9 graphs.
+
+    `embed=True` also writes `model.embed_tokens.weight` as external data, which is what the tied (and the undeclared)
+    oracle paths read: without it the tool correctly says "no embed_tokens initializer in the graph" and there is
+    nothing to correlate against.
+    """
     import onnx
     from onnx import helper, TensorProto
     head = helper.make_node("MatMulNBitsBf", ["x", "w"], ["y"], name="/lm_head/MatMul_Q4", domain="com.ryzenai",
@@ -100,9 +108,23 @@ def write_graph(d, V, H, head_block):
     layer = helper.make_node("MatMulNBitsBf", ["x", "w"], ["z"], name="/model/layers.0/attn/qkv_proj/MatMulNBits",
                              domain="com.ryzenai", K=H, N=3 * H, block_size=T.K_KBLOCK, bits=4)
     vi = lambda n: helper.make_tensor_value_info(n, TensorProto.FLOAT, None)
+    inits = []
+    if embed:
+        import numpy as np
+        from onnx import numpy_helper
+        emb = numpy_helper.from_array(np.full((V, H), 0.5, dtype="<f2"), name="model.embed_tokens.weight")
+        emb.ClearField("raw_data")                 # the bytes live in model.onnx.data, as they do in a real pack
+        emb.data_location = TensorProto.EXTERNAL
+        for k, v in (("location", "model.onnx.data"), ("offset", "0"), ("length", str(V * H * 2))):
+            e = emb.external_data.add()
+            e.key, e.value = k, v
+        with open(os.path.join(d, "model.onnx.data"), "wb") as f:
+            f.write(np.full((V, H), 0.5, dtype="<f2").tobytes())
+        inits.append(emb)
     branch = helper.make_graph([layer, head], "b", [], [vi("y")])
     cond = helper.make_node("If", ["c"], ["y"], then_branch=branch, else_branch=branch)
-    g = helper.make_graph([cond], "g", [helper.make_tensor_value_info("c", TensorProto.BOOL, [])], [vi("y")])
+    g = helper.make_graph([cond], "g", [helper.make_tensor_value_info("c", TensorProto.BOOL, [])], [vi("y")],
+                          initializer=inits)   # the embedding is a top-level initializer, as in a real pack
     onnx.save(helper.make_model(g), os.path.join(d, "model.onnx"))
 
 
@@ -122,6 +144,27 @@ def synthetic():
         else:
             # CI installs numpy, not onnx: the graph cannot be written, so the block gate is checked where onnx is
             print("skip the block-32 refusal: onnx is not installed (the other synthetic checks still run)")
+
+        # engine#1747 review: a pack that does not declare tie_word_embeddings is not an untied pack. It must still be
+        # correlated against its own embedding, labelled provisional, and NOT exit 5 with "untied".
+        p_undecl = os.path.join(work, "undeclared")
+        make_pack(p_undecl, tied=True, head_block=T.K_KBLOCK, declare=False, embed=True)
+        r_undecl = T.measure(p_undecl, 2)
+        check(r_undecl[1] == 0, "an undeclared tie_word_embeddings measures (rc %s, not 5): %s" % (r_undecl[1], r_undecl[0] or r_undecl[2]))
+        rep = r_undecl[0] or {}
+        check("does not declare tie_word_embeddings" in (rep.get("oracle") or ""),
+              "and it says the oracle is provisional rather than calling the pack untied (%s)" % (rep.get("oracle"),))
+        check([t["finite"] for t in rep.get("tiles_measured", [])] == [1.0, 1.0],
+              "and the decode is reported as finite on both tiles")
+        # The synthetic embedding is a constant, so the correlation is nan by construction: the tool must not invent a
+        # number there. That is the point of the label, not a gap in the arm.
+        check(all(t["corr"] != t["corr"] for t in rep.get("tiles_measured", [])),
+              "and a constant oracle yields no correlation rather than a plausible one")
+        # ...whereas a pack that DECLARES untied and gets no --ref still has no oracle, and says so.
+        p_untied = os.path.join(work, "declared_untied")
+        make_pack(p_untied, tied=False, head_block=T.K_KBLOCK, declare=True)
+        r_untied = T.measure(p_untied, 2)
+        check(r_untied[1] == 5, "a DECLARED untied pack without --ref still exits 5 (rc %s)" % (r_untied[1],))
 
         pu = os.path.join(work, "untied")
         V, H = make_pack(pu, tied=False, head_block=T.K_KBLOCK)

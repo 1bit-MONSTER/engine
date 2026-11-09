@@ -38,8 +38,12 @@ serve_port_from_log() {  # <log> -> the port, empty while serve has not said
     awk '/^1bit serve: ready on http:\/\//{ n = split($5, a, ":"); if (a[n] ~ /^[0-9]+$/) { print a[n]; exit } }' "$1" 2>/dev/null
 }
 
-serve_port_wait() {  # <log> <pid> [tenths-of-a-second, default 300 = 30 s] -> the port, non-zero if it never came
-    local log=$1 pid=$2 tries=${3:-300} port=
+# The default budget is 90 s, not 30: `forward-serve` warms its weight cache before printing `ready on` (engine#1621),
+# measured at 44.5 s on a folded 27B pack, and pays it on exactly the configurations these tests exercise. A caller that
+# wants the old bound can still pass it, and a log now says `warming` before the wait, so a short budget fails with a
+# readable line rather than with "serve never reported a port".
+serve_port_wait() {  # <log> <pid> [tenths-of-a-second, default 900 = 90 s] -> the port, non-zero if it never came
+    local log=$1 pid=$2 tries=${3:-900} port=
     for _ in $(seq 1 "$tries"); do
         port=$(serve_port_from_log "$log")
         if [ -n "$port" ]; then printf '%s\n' "$port"; return 0; fi

@@ -45,3 +45,9 @@ add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_ho
 # fleet state present -> the claim uses the fleet's queue and token; absent -> the old ~/GPU-* paths, so a box
 # that has not been set up is unchanged. No GPU: the claim holds the token for three seconds and runs `true`.
 add_test(NAME gpu_hold_queue COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_test.sh)
+# engine#1639: the half of the survivor bound that a CPU-only box can drive. The bound itself fires only for a payload root
+# wedged in uninterruptible sleep, which user space cannot create, so this covers the other half: a holder that released with
+# a survivor must leave a record, and the NEXT holder must warn about it and clear it.
+add_test(NAME gpu_hold_survivors COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_survivors_test.sh)
+add_test(NAME gpu_hold_group
+         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_group_test.sh)

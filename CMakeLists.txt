@@ -203,6 +203,11 @@ add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
+# os/mini/release-check.sh --self-test: the shipped release gate's own verdict rows, asserted (engine#1596). It needs no
+# build and no device - the subject is the row functions - so it is the one test here that takes no $<TARGET_FILE>, and
+# it is here because nothing else runs it: the rows had 128 assertions and no runner. It names no add_executable, so it
+# adds nothing to the set of test targets the CI --target list would have to build (the direction-B measurement, #1595).
+add_test(NAME release_check_selftest COMMAND bash ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh --self-test)
 add_test(NAME template_pin COMMAND ${CMAKE_SOURCE_DIR}/tests/template_pin.sh $<TARGET_FILE:onebit>)
 add_test(NAME greedy_shortcut COMMAND ${CMAKE_SOURCE_DIR}/tests/greedy_shortcut.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)

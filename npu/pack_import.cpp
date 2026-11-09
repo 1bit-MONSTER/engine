@@ -1306,9 +1306,39 @@ int64_t group_bytes(int64_t k, int rows) {
 // that buffer at the wrong width produced a plausible-looking number (0.885220 on a tied pack whose container scores
 // 0.999999) for every pack from #1661 until this existed, so the width is pinned directly rather than only end to end.
 namespace {
-double corr(const Q4& q, const uint8_t* embed, int H, int rows);   // defined below, internal to this file
+// engine#1721: `embed_bytes` used to be a bare `const uint8_t*`, and it has meant two different formats in three weeks -- the pack's
+// own f16 initializer bytes, then (after #1661) the bf16 copy the container stores -- with all four consumers still decoding F16. The
+// result was not a crash but a plausible number (corr 0.885 on a tied pack that scores 0.999999), which is the kind that gets a real
+// regression dismissed later. So the format is in the TYPE and the only reader is `at()`: a consumer cannot pick the wrong decoder,
+// because it has no pointer to decode. If a third format is ever needed, `at()` is the one place that changes.
+struct EmbedBuf {
+    static EmbedBuf from_bf16(std::vector<uint8_t> bytes) { return EmbedBuf(std::move(bytes), Fmt::Bf16); }
+    static EmbedBuf from_f16(std::vector<uint8_t> bytes) { return EmbedBuf(std::move(bytes), Fmt::F16); }
+    double at(size_t idx) const {
+        if (2 * idx + 1 >= bytes.size()) return 0.0;   // out of range is a caller bug, but never a read past the buffer
+        uint16_t h;
+        std::memcpy(&h, bytes.data() + 2 * idx, 2);
+        return fmt == Fmt::F16 ? f16_to_f32(h) : bf16_to_f32(h);
+    }
+    double at(int row, int col, int H) const { return at(size_t(row) * size_t(H) + size_t(col)); }
+    size_t count() const { return bytes.size() / 2; }
+    const std::vector<uint8_t>& bytes_ref() const { return bytes; }
+
+  private:
+    enum class Fmt { Bf16, F16 };
+    EmbedBuf(std::vector<uint8_t> b, Fmt f) : bytes(std::move(b)), fmt(f) {}
+    std::vector<uint8_t> bytes;
+    Fmt fmt;
+};
+
+double corr(const Q4& q, const EmbedBuf& embed, int H, int rows);   // defined below, internal to this file
 }
-double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows) { return corr(q, embed_bf16, H, rows); }
+// Test seam (engine#1690's device-free arm): it takes raw bf16 bytes and answers with the same reader every consumer uses, so the
+// arm and the importer cannot drift apart. The copy is deliberate -- the format is no longer a caller's choice (engine#1721).
+double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows) {
+    const size_t n = size_t(rows > 0 ? rows : 0) * size_t(H > 0 ? H : 0) * 2;
+    return corr(q, EmbedBuf::from_bf16(std::vector<uint8_t>(embed_bf16, embed_bf16 + n)), H, rows);
+}
 
 int64_t attn_tile_bytes(int64_t k) { return group_bytes(k, kTileRows); }
 int64_t attn_payload_off(int64_t hidden) { return kNormOff + hidden * 2; }
@@ -2148,14 +2178,14 @@ std::vector<uint8_t> as_bf16(const uint8_t* src, int type, size_t count) {
 // without changing this, so from then on the self-check compared the head against mis-decoded values: Qwen2.5-0.5B 1.9
 // reported corr 0.885220 (and "untied", for a pack declaring tie_word_embeddings) where the same container's weights
 // score 0.999999. The container was always right; the number about it was not.
-double corr(const Q4& q, const uint8_t* embed, int H, int rows) {
+double corr(const Q4& q, const EmbedBuf& embed, int H, int rows) {
     double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
     const int n = std::min(rows, q.N);
     for (int r = 0; r < n; ++r)
         for (int k = 0; k < q.K; ++k) {
             const size_t g = size_t(r) * (q.K / 32) + size_t(k) / 32;
             const double x = double(q.codes[size_t(r) * q.K + k]) * q.scale[g] + q.zero[g];
-            const double y = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed)[size_t(r) * H + k]);
+            const double y = embed.at(r, k, H);
             sxy += x * y;
             sx += x;
             sy += y;
@@ -2328,7 +2358,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // The container takes BF16, and the tied-head self-check reads these same bytes, so convert once into a buffer that
     // outlives both. For the component path the source is f32 that the reader already dequantised.
     std::vector<uint8_t> embed_bf16;
-    const uint8_t* embed_bytes = nullptr;
+    EmbedBuf embed_buf = EmbedBuf::from_bf16({});
     {
         const uint64_t Vc = dim_count("model.embed_tokens.weight", V), Hc = dim_count("model.embed_tokens.weight", H);
         uint64_t elems = 0;
@@ -2348,7 +2378,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                          std::to_string(elems));
             embed_bf16 = as_bf16(reinterpret_cast<const uint8_t*>(comp.data()), kF32, size_t(elems));
         }
-        embed_bytes = embed_bf16.data();
+        // the format travels with the bytes from here on (engine#1721); everything below reads through at()
+        embed_buf = EmbedBuf::from_bf16(embed_bf16);
         w.add("model.embed_tokens.weight", "BF16", {V, H}, embed_bf16);
         ++r.tensors;
     }
@@ -2656,12 +2687,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
                     const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
                     double e;
-                    e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
+                    e = embed_buf.at(n, k, int(H));
                     sum_abs += std::fabs(x - e);
                     sum_ref += std::fabs(e);
                 }
             r.lmhead_rel = sum_abs / sum_ref;
-            r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+            r.lmhead_corr = corr(q, embed_buf, int(H), q.N);
             // The diagnostic follows the NUMBER, not the pack's declaration: a genre-A pack ships no config.json, so
             // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
             // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
@@ -2670,8 +2701,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
                                                mm.block, false, /*drop_zero*/ true);
-            r.ctrl_corr_nibble = corr(swap, embed_bytes, int(H), 2048);
-            r.ctrl_corr_nozp = corr(nozp, embed_bytes, int(H), 2048);
+            r.ctrl_corr_nibble = corr(swap, embed_buf, int(H), 2048);
+            r.ctrl_corr_nozp = corr(nozp, embed_buf, int(H), 2048);
         }
 
         // self-check 2: the tiles as written, read back through the engine's own decoder.
@@ -2776,12 +2807,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                     const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
                                     const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
                                     const double e =
-                                        bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
+                                        embed_buf.at(n, k, int(H));
                                     sum_abs += std::fabs(x - e);
                                     sum_ref += std::fabs(e);
                                 }
                             r.lmhead_rel = sum_abs / sum_ref;
-                            r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
+                            r.lmhead_corr = corr(q, embed_buf, int(H), q.N);
                             r.selfcheck_reference = true;
                             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
                             // The control this path can actually run: the same tiles and the same decoder, with each
@@ -2798,7 +2829,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                         const size_t g = size_t(rr) * (q.K / 32) + size_t(k) / 32;
                                         const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[g] + q.zero[g];
                                         const double y =
-                                            bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[(size_t(rr) + 1) * H + k]);
+                                            embed_buf.at(int(rr) + 1, k, int(H));
                                         sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
                                     }
                                 const double m = double(n) * q.K;

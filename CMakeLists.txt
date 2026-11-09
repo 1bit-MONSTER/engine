@@ -282,6 +282,10 @@ add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.
+# gpu-hold must end the hold's whole descendant tree even when the ROOT is what dies first (engine#1624):
+# a `bash -c` payload exits on TERM, its children are reparented, and a tree recomputed after that finds only
+# the corpse - so a TERM-ignoring descendant outlived its ticket. CPU-only: nested `sleep`s, no GPU, ~5 s.
+add_test(NAME gpu_hold_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_kill_tree_test.sh)
 add_test(NAME hrx_toolchain_pin COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_toolchain_pin.sh)
 add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)

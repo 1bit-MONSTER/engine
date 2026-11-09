@@ -255,14 +255,25 @@ descendants() {   # <pid> -> its descendants and then itself, deepest last
     done
     printf '%s\n' "$1"
 }
+alive() {   # any of these pids still alive?
+    local p
+    for p in "$@"; do kill -0 "$p" 2> /dev/null && return 0; done
+    return 1
+}
 kill_tree() {
-    local root=$1 grace=${2:-10} i=0 p
-    for p in $(descendants "$root"); do kill -TERM "$p" 2> /dev/null; done
-    while kill -0 "$root" 2> /dev/null && [ "$i" -lt "$grace" ]; do
+    local root=$1 grace=${2:-10} i=0 p tree
+    # The tree is taken ONCE, before anything is signalled. Recomputing it after the root dies was the bug
+    # (engine#1624): a normal `bash -c` root exits on TERM, its children are reparented to init, and
+    # `descendants "$root"` then returns only the corpse - so a descendant that ignored TERM survived its
+    # own ticket, which is the exact orphan #1620 exists to prevent. The grace loop waits on ANY survivor
+    # for the same reason: `kill -0 "$root"` ends the moment the root goes, with the rest still running.
+    tree=$(descendants "$root")
+    for p in $tree; do kill -TERM "$p" 2> /dev/null; done
+    while [ "$i" -lt "$grace" ] && alive $tree; do
         sleep 1
         i=$((i + 1))
     done
-    for p in $(descendants "$root"); do kill -KILL "$p" 2> /dev/null; done
+    for p in $tree; do kill -KILL "$p" 2> /dev/null; done
 }
 
 watch() {

@@ -198,8 +198,27 @@ def synthetic():
         w0.astype("<f4").tofile(ref)
         out, status, _ = T.measure(pu, 4, ref, "f32")
         got = out["tiles_measured"]
-        check(status == 0 and len(got) == 1 and abs(got[0]["corr"] - 1.0) < 1e-9,
-              "--ref is the oracle, and only the tiles it covers are measured (%d)" % len(got))
+        # with onnx the synthetic graph declares a block-128 head, so the run is fully checked (0); without it the
+        # block size is unverified and the tool says so (6) instead of passing an unchecked layout off as 0
+        want = 0 if HAVE_ONNX else 6
+        check(status == want and len(got) == 1 and abs(got[0]["corr"] - 1.0) < 1e-9,
+              "--ref is the oracle, and only the tiles it covers are measured (%d, exit %s)" % (len(got), status))
+        g = out["geometry"]
+        check(g["ref_rows"] == T.K_TILE_ROWS and g["ref_tiles"] == 1 and g["tiles_wanted"] == 4,
+              "and the truncation is the reference's, stated: ref_rows %s, ref_tiles %s of %s wanted"
+              % (g["ref_rows"], g["ref_tiles"], g["tiles_wanted"]))
+
+        # engine#1747 review: a block size nobody checked is not block 128. Runs in both environments -- without onnx
+        # the reason is "onnx is not importable", with it this pack has no model.onnx to read.
+        pc = os.path.join(work, "unchecked")
+        make_pack(pc, tied=False, head_block=T.K_KBLOCK)
+        if os.path.exists(os.path.join(pc, "model.onnx")):
+            os.remove(os.path.join(pc, "model.onnx"))
+        out, status, _ = T.measure(pc, 1, ref, "f32")
+        why = out["block_unchecked_why"] if out else None
+        check(status == 6 and out["block_checked"] is False
+              and why == ("no model.onnx" if HAVE_ONNX else "onnx is not importable"),
+              "a correlation over an UNCHECKED block size exits 6, not 0, and says why (%s: %s)" % (status, why))
     finally:
         import shutil
         shutil.rmtree(work, ignore_errors=True)

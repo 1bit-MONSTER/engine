@@ -52,8 +52,15 @@ the reference is the pack's own `model.embed_tokens.weight`, and `--ref` overrid
 Exit status: 0 measured against an oracle; 2 the pack cannot be measured (no model.onnx.data / no embed_tokens / no
 .fconst); 3 measured with a geometry that does not match the tail (so the numbers describe the wrong bytes); 4 refused:
 the head's block size is not 128, so a block-128 decode would measure the wrong layout; 5 decoded, but no oracle (an
-pack that DECLARES `tie_word_embeddings: false` and is given no `--ref`), so no correlation is reported.  A pack that
-does not declare it is correlated against its embedding and labelled provisional, because "undeclared" is not "untied".
+pack that DECLARES `tie_word_embeddings: false` and is given no `--ref`), so no correlation is reported; 6 correlated,
+but the head's block size was NOT checked (onnx not importable, no model.onnx, or no lm_head MatMulNBits node), so the
+numbers are only as good as the assumption that the head is block 128 -- a block-32 head decodes to exactly the NaN /
+1e38 output engine#1740 was about.  Precedence: 3, then 4, then 5 (no correlation printed), then 6.  A pack that does not
+declare `tie_word_embeddings` is correlated against its embedding and labelled provisional, because "undeclared" is not
+"untied".
+
+**The block gate (exit 4) needs `onnx`**: it reads the head's declaration from `model.onnx`.  Without it the tool still
+measures, but says the block size is unchecked and exits 6 rather than 0.
 """
 import argparse
 import glob
@@ -145,6 +152,18 @@ def embedding(pack, vocab, hidden):
         return None, "embed_tokens declares %d B, V*H*2 is %d" % (length, vocab * hidden * 2)
     view = np.memmap(data, dtype=np.uint8, mode="r", offset=off, shape=(length,))
     return np.frombuffer(view, dtype=np.float16, count=vocab * hidden).reshape(vocab, hidden).astype(np.float32), None
+
+
+def head_block(pack):
+    """`(decl, unchecked)`: the head's declaration, or None with the reason its block size could not be checked."""
+    try:
+        import onnx  # noqa: F401
+    except ImportError:
+        return None, "onnx is not importable"
+    if not os.path.exists(os.path.join(pack, "model.onnx")):
+        return None, "no model.onnx"
+    decl = head_decl(pack)
+    return (decl, None) if decl else (None, "no lm_head MatMulNBits node in the graph")
 
 
 def head_decl(pack):
@@ -253,7 +272,7 @@ def measure(pack, tiles_wanted, ref_path=None, ref_dtype="bf16"):
     # never made, withholding a 1.0000 correlation its own embedding would have supplied.
     tie_declared = "tie_word_embeddings" in cfg
     tied = bool(cfg.get("tie_word_embeddings", False))
-    decl = head_decl(pack)
+    decl, unchecked = head_block(pack)
     # engine#1740: a head declared at another block size has every subvolume offset elsewhere, so decoding it with the
     # block-128 tile reads scales out of code bytes (NaN / 1e38 on the 1.5B pack) -- a number about this tool, not the
     # pack.  Refused by name, the way the importer's own block gate refuses (npu/pack_import.cpp, engine#1503).
@@ -298,6 +317,9 @@ def measure(pack, tiles_wanted, ref_path=None, ref_dtype="bf16"):
     status = 0 if base >= 0 else 3
     if base >= 0 and oracle is None:
         status = 5
+    elif base >= 0 and unchecked:
+        status = 6          # a correlation will be printed, and nothing verified the block-128 layout it assumes
+    ref_tiles = None if ref_all is None else ref_all.shape[0] // K_TILE_ROWS
     with open(path, "rb") as f:
         for t in range(min(tiles_wanted, ntiles)):
             if ref_all is not None and (t + 1) * K_TILE_ROWS > ref_all.shape[0]:
@@ -327,8 +349,11 @@ def measure(pack, tiles_wanted, ref_path=None, ref_dtype="bf16"):
     out = {
         "pack": os.path.basename(os.path.abspath(pack)),
         "vocab": vocab, "hidden": hidden, "tied": tied, "head": decl, "oracle": oracle,
+        "block_checked": decl is not None, "block_unchecked_why": unchecked,
         "geometry": {"env": env, "head_off": base, "tile_bytes": tile, "tiles": ntiles, "tail_bytes": env + ntiles * tile,
-                     "fconst_bytes": size, "trailing_zero_bytes": zeros, "tail_fits": base >= 0},
+                     "fconst_bytes": size, "trailing_zero_bytes": zeros, "tail_fits": base >= 0,
+                     "tiles_wanted": tiles_wanted,
+                     "ref_rows": None if ref_all is None else int(ref_all.shape[0]), "ref_tiles": ref_tiles},
         "tiles_measured": rows,
     }
     return out, status, None
@@ -355,13 +380,17 @@ def main(argv):
     h = out["head"]
     print("%s: V %d H %d, %s, head %s" % (out["pack"], out["vocab"], out["hidden"],
                                           "tied" if out["tied"] else "UNTIED",
-                                          "block %s" % h["block_size"] if h else "(not declared in the graph)"))
+                                          "block %s" % h["block_size"] if h else
+                                          "block UNCHECKED (%s; exit 6)" % out["block_unchecked_why"]))
     print("  head: the last %d tiles x %d B of %d B, so at %d (env-only base %d is the pre-head payload)"
           % (g["tiles"], g["tile_bytes"], g["fconst_bytes"], g["head_off"], g["env"]))
     if g["trailing_zero_bytes"]:
         print("  the .fconst ends in %d zero bytes: the end-anchored offset assumes the head is its last bytes"
               % g["trailing_zero_bytes"])
     print("  oracle: %s" % (out["oracle"] or "none -- an untied head is not its embedding; pass --ref (exit 5)"))
+    if g["ref_tiles"] is not None and g["ref_tiles"] < min(g["tiles_wanted"], g["tiles"]):
+        print("  the oracle covers %d rows = %d tile(s), so only %d of the %d tiles asked for are measured"
+              % (g["ref_rows"], g["ref_tiles"], g["ref_tiles"], g["tiles_wanted"]))
     for r in out["tiles_measured"]:
         line = "  tile %4d  finite %.4f  w_std %.4f" % (r["tile"], r["finite"], r["w_std"])
         if "corr" in r:

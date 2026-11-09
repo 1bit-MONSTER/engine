@@ -29,6 +29,7 @@
 #     --device cpu, --parallel 2, --embedding and a file without the key leave it out,
 #   - an hrx chat plan carries "warmups" (serve's warm-up requests, in order: the chat request, then a
 #     16-token /completion prompt (" a" x 16, n_predict 0)) and "warmup" (the first one, for an older lemond),
+#   - ONEBIT_WARMUP=long|short|none picks which warm-up request(s) the plan carries (engine#1539's bisect)
 #   - an hrx chat plan carries "warmup" (serve's warm-up request, for Lemonade to send before the
 #     model counts as loaded); ONEBIT_NO_WARMUP=1, cpu and role servers have none.
 #
@@ -180,6 +181,23 @@ check "hrx plan: warmups = [the chat request, a 16-token /completion], warmup = 
 out=$(ONEBIT_NO_WARMUP=1 "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" \
       --no-mem-check --port 43132 --print-backend 2>"$scratch/err"); rc=$?
 check "hrx plan: ONEBIT_NO_WARMUP=1, no warmup (exit $rc)" '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d or \"warmups\" in d")" = False ]'
+# engine#1539: the two warm-ups are not interchangeable (the first samples, the second does not), so which one a
+# model cannot survive is now a selector rather than a rebuild. ONEBIT_WARMUP picks them; "none" is the spelling
+# ONEBIT_NO_WARMUP already had, and an unknown value keeps the shipped pair rather than silently sending none.
+for _sel in long short; do
+    out=$(ONEBIT_WARMUP=$_sel "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" \
+          --no-mem-check --port 43133 --print-backend 2>"$scratch/err"); rc=$?
+    if [ "$_sel" = long ]; then _want=/v1/chat/completions; else _want=/completion; fi
+    check "hrx plan: ONEBIT_WARMUP=$_sel sends only $_want (exit $rc)" \
+        '[ "$rc" = 0 ] && [ "$(get "[w[\"path\"] for w in d[\"warmups\"]]")" = "[$_want]" ] && [ "$(get "d[\"warmup\"] == d[\"warmups\"][0]")" = True ]'
+done
+out=$(ONEBIT_WARMUP=none "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" \
+      --no-mem-check --port 43134 --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: ONEBIT_WARMUP=none, no warmup (exit $rc)" '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d or \"warmups\" in d")" = False ]'
+out=$(ONEBIT_WARMUP=bogus "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" \
+      --no-mem-check --port 43135 --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: an unknown ONEBIT_WARMUP keeps the shipped pair (exit $rc)" \
+    '[ "$rc" = 0 ] && [ "$(get "len(d[\"warmups\"])")" = 2 ]'
 out=$(mplan small cpu); rc=$?
 check "cpu plan: no warmup (exit $rc)" '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d")" = False ]'
 

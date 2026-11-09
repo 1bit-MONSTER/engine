@@ -69,6 +69,12 @@ def ci_targets(ci_text):
     """The target names in ci.yml's `cmake --build … --target …` command."""
     names = []
     for line in continued_lines(ci_text):
+        # A YAML `run:` block can carry `#` comments, and they talk about the very command this scans
+        # ("adding an unknown target to `cmake --build --target ...` is a hard ninja error"), so a comment
+        # naming the phrase would otherwise contribute its prose as target names. engine#1583's second
+        # attempt did exactly that: the scan reported targets called 'What' and 'this'.
+        if line.lstrip().startswith("#"):
+            continue
         if "cmake --build" not in line or "--target" not in line:
             continue
         words = line.split("--target", 1)[1].split()
@@ -273,6 +279,12 @@ def self_test():
     # An option that defaults ON needs no -D: ONEBIT_NPU_HOST is that shape in the real tree.
     case("a target under an option that defaults ON passes without a -D",
          SELF_CI, SELF_CMAKE.replace("if(ONEBIT_NPU)", "if(ONEBIT_HOST)") + "option(ONEBIT_HOST \"x\" ON)\n", 0)
+    # A comment inside the run block that names the command must not be parsed as targets (engine#1583's
+    # second attempt did: the scan reported targets 'What' and 'this' from the prose).
+    case("a # comment mentioning cmake --build --target contributes no target names",
+         SELF_CI.replace("hidden_test ", "").replace("      - name: Build",
+                         "      # NB: adding an unknown target to `cmake --build --target ...` is a hard ninja error\n"
+                         "      - name: Build"), SELF_CMAKE, 0)
     # Unrelated guards must not fail a tree.
     case("a target under a non-option guard is left alone",
          SELF_CI, SELF_CMAKE.replace("if(ONEBIT_NPU)", "if(NOT WIN32)"), 0)

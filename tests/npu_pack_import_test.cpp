@@ -1530,6 +1530,67 @@ void test_text_config_geometry(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// engine#1648: the import's PACK leg never ran anywhere, so the shape a hybrid pack actually has -- geometry under
+// `text_config`, none at the top level -- was exercised by no test end to end. `test_text_config_geometry` above checks
+// the reader; this runs import_pack() on a crafted pack of that shape and checks what lands in the container, which is
+// what a pack actually goes through. The crafted .fconst is the one the final-norm test uses (8 blocks, eps headers at
+// both boundaries), so the only thing that varies here is where the geometry is declared.
+void test_hybrid_pack_import(const std::string& root) {
+    const fs::path dir = fs::path(root) / "hybrid-import";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    const int H = 128, L = 8;
+    const int64_t stride = 1 << 20, second = 262144;
+    std::string fc(size_t(L * stride) + size_t(64) + size_t(H * 2), '\0');
+    auto put_eps = [&](int64_t off) {
+        fc[size_t(off)] = char(0x86);
+        fc[size_t(off) + 1] = char(0x35);
+    };
+    for (int l = 0; l < L; ++l) {
+        put_eps(int64_t(l) * stride);
+        put_eps(int64_t(l) * stride + second);
+    }
+    put_eps(int64_t(L) * stride);
+    for (int i = 0; i < H; ++i) {
+        const uint16_t bits = pi::bf16_bits_of(float(i + 1));
+        fc[size_t(int64_t(L) * stride + 64 + 2 * i)] = char(bits & 0xFF);
+        fc[size_t(int64_t(L) * stride + 64 + 2 * i) + 1] = char(bits >> 8);
+    }
+    put_file((dir / "config.json").string(),
+             R"({"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl",)"
+             R"("tie_word_embeddings":true,"text_config":{"model_type":"qwen3_vl_text",)"
+             R"("hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,"num_attention_heads":2,)"
+             R"("num_key_value_heads":1,"head_dim":64,"vocab_size":128,"rope_theta":10000.0,)"
+             R"("rms_norm_eps":1e-06},"vision_config":{"hidden_size":1024,"depth":24}})");
+    put_file((dir / "model.onnx.data").string(), std::string(size_t(H) * size_t(H) * 4, '\x11'));
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {H, H}, "model.onnx.data", 0,
+                                   int64_t(H) * H * 4)}, {}));
+    put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+
+    const std::string out = (fs::temp_directory_path() /
+                             ("oga_pack_import_hybrid." + std::to_string(::getpid()))).string();
+    fs::remove_all(out);
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    const pi::Report r = pi::import_pack(dir.string(), out, allow);
+    check(r.final_norm_imported,
+          "hybrid import: a pack whose geometry is only in text_config imports, tail envelope included");
+    bool hidden_ok = false;
+    std::ifstream cf(out + "/config.json");
+    if (cf) {
+        nlohmann::json c;
+        cf >> c;
+        hidden_ok = c.value("hidden_size", 0) == H;
+    }
+    check(hidden_ok, "hybrid import: out/config.json states the text tower's hidden_size, so a serve reads the same "
+                     "geometry the import used");
+    std::printf("hybrid import: geometry only in text_config -> imported%s, container hidden_size %s\n",
+                r.final_norm_imported ? " (tail envelope included)" : "", hidden_ok ? "from text_config" : "WRONG");
+    fs::remove_all(out);
+    fs::remove_all(dir);
+}
+
 void test_qwen3_attn_sections() {
     struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
     const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
@@ -1832,6 +1893,7 @@ int main(int argc, char** argv) {
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
+        test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

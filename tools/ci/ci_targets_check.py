@@ -47,6 +47,7 @@ in an `add_test` (engine#1596) without raising the drift it measures.
     tools/ci/ci_targets_check.py --self-test
 """
 import argparse
+import glob
 import os
 import re
 import sys
@@ -324,7 +325,13 @@ def check(root):
             return 2
     names = ci_targets(open(ci_path, encoding="utf-8").read())
     defines = ci_defines(open(ci_path, encoding="utf-8").read())
+    # CMakeLists.txt plus any included family file. A `add_test`/`add_executable` pair moved into
+    # `cmake/tests-*.cmake` (engine#1696: one family out of the contiguous add_test block, so two test-adding
+    # PRs stop conflicting by construction) is still a test this ratchet must see: a family file it does not
+    # read is a family whose gaps are silently unratcheted, which looks exactly like "no new gaps".
     cmake_text = open(cmake_path, encoding="utf-8").read()
+    for fam in sorted(glob.glob(os.path.join(root, "cmake", "tests-*.cmake"))):
+        cmake_text += "\n" + open(fam, encoding="utf-8").read()
     targets = cmake_targets(cmake_text)
     defaults = option_defaults(cmake_text)
     if not names:
@@ -486,6 +493,27 @@ add_dependencies(onebit hoisted_test)
 add_executable(hoisted_test hoisted.cpp)
 add_test(NAME hoisted_suite COMMAND hoisted_test)
 """, 1, baseline="unbuilt_test\n")
+    # engine#1696: a test that lives in an included family file is still ratcheted. `case` writes only
+    # .github/workflows/CI and CMakeLists.txt, so this arm builds its tree by hand.
+    nonlocal_fails = None  # (kept simple: the arm is written out below rather than through `case`)
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, ".github", "workflows"))
+        os.makedirs(os.path.join(d, "cmake"))
+        open(os.path.join(d, CI), "w", encoding="utf-8").write(B_CI)
+        open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(B_CMAKE)
+        open(os.path.join(d, "cmake", "tests-family.cmake"), "w", encoding="utf-8").write("""
+add_executable(family_test family.cpp)
+add_test(NAME family_suite COMMAND family_test)
+""")
+        bpath = os.path.join(d, BASELINE)
+        os.makedirs(os.path.dirname(bpath), exist_ok=True)
+        open(bpath, "w", encoding="utf-8").write("unbuilt_test\n")
+        got = check(d)
+    ok = got == 1
+    print(f"  {'ok  ' if ok else 'FAIL'}  a test moved into cmake/tests-*.cmake is still ratcheted  (rc {got}, wanted 1)")
+    if not ok:
+        fails += 1
+
     # And the clean case.
     case("a plain target list passes",
          SELF_CI.replace("hidden_test ", ""), SELF_CMAKE, 0)

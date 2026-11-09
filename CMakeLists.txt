@@ -645,6 +645,11 @@ add_test(NAME hrx_build_scope
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/hrx_build_scope.py --self-test)
 add_test(NAME copyright_check_untracked
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/copyright_check_untracked_test.py)
+# engine#1517: the prefill flash-attention ratio is measured in adjacent pairs and only quoted when the pairs agree, so a
+# loaded box yields VOID instead of a number.  The self-test is the estimator's own gate and needs no GPU: it accepts
+# agreement, refuses disagreement, and proves a dropped run cannot shift an arm.
+add_test(NAME fa_ratio_estimator
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fa_ratio.py --self-test)
 add_dependencies(onebit route_log_test)
 # CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
 # keeps the laya_models ctest from reporting "Not Run" without a workflow change.

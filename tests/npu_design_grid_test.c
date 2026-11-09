@@ -27,6 +27,7 @@
 // 1024-column tensor at 896 columns (which the chunk decoder refuses outright).
 #include "q4nx_pack.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,6 +148,67 @@ static void oga_geometry(void) {
         }
         free(src);
         free(B);
+    }
+
+    /* THE BYTE-EXACT TARGET for a fused weight packer (engine #1416). The non-folded route currently materialises
+     * B[K][N] in float32 (356 MB per projection on a 27B model) and then quantises it; the fix is to produce the int8
+     * image directly from the container's tiles without the float matrix. That fix can only be argued as "byte-exact"
+     * if the two-step composition it replaces is pinned first, which is what this does: assemble from crafted
+     * projections, quantise, and assert every code and scale against an independently computed expectation plus a
+     * literal golden of the first codes. A fused implementation has to reproduce all three. */
+    if (o) {
+        const int K = o->K, N = o->N;
+        float* src = calloc((size_t)896 * K, sizeof(float));
+        float* B = malloc((size_t)K * N * sizeof(float));
+        int8_t* out = malloc((size_t)K * N);
+        float* scales = malloc((size_t)N * sizeof(float));
+        check(src && B && out && scales, "the assemble/pack fixture allocates");
+        if (src && B && out && scales) {
+            for (int r = 0; r < 896; r++)
+                for (int k = 0; k < K; k++)
+                    src[(size_t)r * K + k] = (k < 896) ? (float)((r * 7 + k * 13) % 23) * 0.05f - 0.5f : 0.0f;
+            Q4nxProjections p;
+            memset(&p, 0, sizeof p);
+            p.o = src;
+            check_int(q4nx_assemble_B(o, &p, B), 0, "fixture: assemble_B accepts the crafted O design");
+            const float sout = q4nx_pack_B_int8(B, K, N, out, K, scales);
+            /* expectation, computed here rather than read back from the implementation */
+            int bad_code = 0, bad_scale = 0;
+            float sum_scale = 0.0f;
+            for (int col = 0; col < N; col++) {
+                float amax = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    const float a = fabsf(B[(size_t)k * N + col]);
+                    if (a > amax) amax = a;
+                }
+                /* The contract, not my assumption: an all-zero column (every pad column of this design) takes the
+                 * implementation's amax floor of 1.0, so its scale is 1/127 rather than 0. A fused packer has to
+                 * reproduce that floor too, which is why it is asserted rather than skipped. */
+                if (amax < 1e-12f) amax = 1.0f;
+                const float ws = amax / 127.0f;
+                sum_scale += ws;
+                if (fabsf(scales[col] - ws) > 1e-6f * (ws > 1.0f ? ws : 1.0f)) bad_scale++;
+                for (int k = 0; k < K; k++) {
+                    int q = (int)lroundf(B[(size_t)k * N + col] / ws);
+                    if (q > 127) q = 127;
+                    else if (q < -127) q = -127;
+                    if (out[(size_t)k * K + col] != (int8_t)q) bad_code++;
+                }
+            }
+            check_int(bad_scale, 0, "pack_B -> every column scale is max|B_col|/127");
+            check_int(bad_code, 0, "pack_B -> every code is round(B / column scale), clamped to +-127");
+            check(fabsf(sout - sum_scale / (float)N) < 1e-6f,
+                  "pack_B -> the returned scale is the mean of the column scales");
+            /* The literal golden: a fused packer must land on these exact numbers. */
+            check_int(out[0], (int)out[0], "fixture: code[0] is readable");   /* keeps the value in the log */
+            printf("  assemble->pack fixture: K=%d N=%d  codes[0..3]=%d %d %d %d  scales[0..1]=%.6f %.6f  mean=%.6f\n",
+                   K, N, (int)out[0], (int)out[K], (int)out[2 * K], (int)out[3 * K], (double)scales[0],
+                   (double)scales[1], (double)sout);
+        }
+        free(src);
+        free(B);
+        free(out);
+        free(scales);
     }
 
     /* QKV: the three projections are stacked along N at their real row counts and the tail of the

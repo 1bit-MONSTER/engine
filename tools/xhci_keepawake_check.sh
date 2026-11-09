@@ -23,19 +23,33 @@
 # and refuses to pretend on a machine the rule does not cover.
 #
 #   xhci_keepawake_check.sh                 # report: DMI match, per-controller state, verdict; exit 0
-#   xhci_keepawake_check.sh --require-awake # exit 1 if an applicable controller is NOT in D0 (plug test would be void)
+#   xhci_keepawake_check.sh --require-awake # exit 0 ONLY when every applicable controller is in D0; exit 1 for "some
+#                                            asleep", "not this board" and "the rule would bind nothing" - a precondition
+#                                            step must fail closed, because a green there reads as "the rule is in force" void)
 #   xhci_keepawake_check.sh --sysfs-root DIR # check a tree other than /sys (what the test uses)
 #
 # Read-only by default. `--apply` / `--revert` perform the rule's own single action (`power/control = on|auto`) on the
 # controllers the rule matches, which needs root; they exist so the mechanism can be verified without a reboot, and `--revert`
 # is the documented way back.
 #
-# Exit: 0 = checked (the verdict can be "not this board", "all awake", or "some asleep"), 1 = --require-awake not met,
+# Exit (report mode): 0 = checked (the verdict can be "not this board", "all awake", or "some asleep"), 1 = --require-awake not met,
 #       2 = usage/IO problem. Never 0 by accident: a machine where the rule does not apply says so.
 set -u
 
 SYSFS=${SYSFS:-/sys}
 MODE=report
+
+# A verdict that cannot CONFIRM the precondition is a FAILURE under --require-awake, and only there: report mode exists to
+# describe a machine ("not this board", "the rule would bind nothing") and must stay exit 0. engine#823's precondition step is
+# `--require-awake`, so a green there would let someone plug a port into a boot where the rule is not in force and read the
+# result as evidence about the rule.
+require_verdict() {   # <why this is not a "go ahead and plug" verdict>
+    if [ "$MODE" = require ]; then
+        echo "==           --require-awake: $1, so this is NOT a precondition met (exit 1)"
+        exit 1
+    fi
+    exit 0
+}
 while [ $# -gt 0 ]; do
     case "$1" in
         --require-awake) MODE=require; shift;;
@@ -62,7 +76,7 @@ echo "== machine: board_name='${dmi_board:-?}'  bios='${dmi_bios:-?}'  product='
 if [ "$dmi_board" != "$BOARD" ]; then
     echo "== verdict: NOT THIS BOARD -- the keepawake rule (board_name == '$BOARD') does not apply here, so nothing about it"
     echo "            can be concluded from this machine. engine#823's port finding is AXB35-02-specific."
-    exit 0
+    require_verdict "the board does not match the rule's DMI gate"
 fi
 echo "== board matches the rule's DMI gate ('$BOARD')"
 
@@ -103,7 +117,7 @@ done
 if [ "$applicable" -eq 0 ]; then
     echo "== verdict: the rule's DMI gate matches but no AMD xHCI function with the rule's device ids was found --"
     echo "            the rule would bind nothing here (BIOS changed the ids?). Reported, not guessed."
-    exit 0
+    require_verdict "the rule would bind nothing on this machine"
 fi
 
 if [ "$MODE" = apply ] || [ "$MODE" = revert ]; then

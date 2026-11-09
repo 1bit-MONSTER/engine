@@ -23,6 +23,12 @@ server outside the token while a third lane held it (i1536's `i1536-long-next.sh
 `mtp_decode.py`). Each one is invisible from the outside: the process looks like work, and only the
 token knows it is not.
 
+What a clean result means, and what it does not: this is a **ticket** check, not a health check. `0` says
+nobody is outside their ticket — it says nothing about whether the box has memory left. On 2026-11-09 a
+single ticketed `supreme max bench` had GTT at 102.7 of 120 GiB with `MemAvailable 2.8 GiB`, which is the
+state that got both self-hosted runners OOM-killed (engine#1504), and this check correctly printed "every
+one inside a ticket". Pair it with `MemAvailable` and the GTT counter; the floor is 20 GiB.
+
 The test is ancestry, not intention: a holder is fine when the pid recorded in `~/GPU-TOKEN` or
 `~/NPU-TOKEN` is itself or one of its ancestors. Systemd `.service` units are exempt by name, because
 the fleet's own resident services (`1bit-canonical`, `coder-llm`) are supposed to hold a device

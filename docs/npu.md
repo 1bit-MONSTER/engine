@@ -200,7 +200,10 @@ and NUL/0xFFFD dropped, whitespace to single spaces), one token per CJK characte
 split punctuation, then greedy longest-match WordPiece with `##` continuations, and `[UNK]` for a word whose
 *first* piece cannot be matched. `[CLS]`/`[SEP]` frame the ids and truncation counts both. Unicode work is
 table-driven (ASCII, Latin-1, Latin Extended-A, the common punctuation blocks, the CJK ranges); measured on the
-2,552 distinct STS-B test sentences the ids are **identical to the reference tokenizer's, 0 mismatches**.
+2,552 distinct STS-B test sentences the ids are **identical to the reference tokenizer's, 0 mismatches**. That is
+this route's own pipeline; the engine's other tokenizer path - a `tokenizer.json` read through Hugging Face
+tokenizers, the Rust library, behind a C ABI - is a separate implementation of the same contract, measured against
+its own reference ([tokenizers.md](tokenizers.md)).
 
 **Correctness, as measured** (`tests/trit_embed_pack_test.py` and the rows in engine#1311): the importer's
 ternary decode is *exactly* the reference's `codes * scale` (worst |Δw| 0, not a tolerance), and the encoder's

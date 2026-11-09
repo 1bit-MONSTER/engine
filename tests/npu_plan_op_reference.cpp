@@ -67,10 +67,42 @@ void check_case(const onebit::npu::plan::OpEntry& e, const onebit::npu::plan::Op
 
 }  // namespace
 
+// Rule (b) slice 2: the op-shaped table (engine#799). Same discipline as the GEMM table -- walk it, run every
+// case, compare against the hand-derived answer -- and the case text says HOW each expectation was derived.
+void test_op_call_table() {
+    using onebit::npu::plan::OpId;
+    using onebit::npu::plan::op_call_entry;
+    using onebit::npu::plan::op_call_entry_count;
+    check(op_call_entry_count() > 0, "the op-shaped registry has at least one entry");
+    for (size_t i = 0; i < op_call_entry_count(); i++) {
+        const auto& e = op_call_entry(i);
+        const std::string label = std::string("op-call ") + onebit::npu::plan::op_name(e.op);
+        check(e.ref != nullptr, label + " entry has a reference");
+        check(e.n_cases > 0, label + " entry has known-answer cases");
+        for (size_t c = 0; c < e.n_cases; c++) {
+            const auto& kase = e.cases[c];
+            check(kase.what && kase.how && *kase.how, label + " case states how its answer was derived");
+            std::vector<float> out(size_t(kase.want_len > 0 ? kase.want_len : kase.call.hd), 0.0f);
+            auto call = kase.call;
+            call.out = out.data();
+            check(e.ref(call), label + " case "" + kase.what + "" reference returns true");
+            float worst = 0.0f;
+            for (int d = 0; d < kase.want_len; ++d) worst = std::max(worst, std::fabs(out[size_t(d)] - kase.want[d]));
+            check(worst <= 1e-5f, label + " case "" + kase.what + "" matches the hand-derived answer (worst " +
+                                      std::to_string(worst) + ")");
+        }
+    }
+    // The vacuum check: a malformed call must be refused rather than dereferenced.
+    auto bad = onebit::npu::plan::OpCall{};
+    bad.op = OpId::attn_step;
+    check(!onebit::npu::plan::attn_step_ref(bad), "op-call attn_step refuses a call with no operands");
+}
+
 int main() {
     using namespace onebit::npu::plan;
 
     // 1. The table is walked, not named.
+    test_op_call_table();
     check(op_entry_count() > 0, "the registry has at least one entry");
     for (size_t i = 0; i < op_entry_count(); i++) {
         const OpEntry& e = op_entry(i);
@@ -115,9 +147,10 @@ int main() {
     check(find_op(OpId::attn_step) == nullptr, "attn_step has no entry yet");
     check(find_op("not_an_op") == nullptr, "an unknown name finds nothing");
 
-    // 3. The coverage gap is a decision in this test, not an omission: exactly these two ops are missing.
+    // 3. The coverage gap is a decision in this test, not an omission: with `attn_step` registered in the
+    //    op-shaped table (rule (b) slice 2) exactly ONE op is still missing, and it is named here.
     const std::string missing = op_coverage();
-    check(missing == "gdn_step,attn_step",
+    check(missing == "gdn_step",
           "op_coverage() names exactly the unregistered ops (got \"" + missing + "\")");
 
     // 4. A reference that is handed bad dimensions refuses rather than computing garbage.

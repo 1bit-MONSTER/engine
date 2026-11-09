@@ -14,7 +14,9 @@
 // limitations under the License.
 #include "plan/op_registry.h"
 
+#include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace onebit::npu::plan {
 
@@ -125,11 +127,77 @@ std::string op_coverage() {
     std::string missing;
     for (int i = 0; i < (int)OpId::count; i++) {
         const OpId op = (OpId)i;
-        if (find_op(op)) continue;
+        // A reference of EITHER shape counts: `attn_step`'s operands are not a matrix pair, so it is
+        // registered in the call table (engine#799 rule (b) slice 2) and is no longer a gap.
+        if (find_op(op) || find_op_call(op)) continue;
         if (!missing.empty()) missing += ",";
         missing += op_name(op);
     }
     return missing;
 }
+
+// ── op-shaped calls: attn_step (engine#799 rule (b), slice 2) ───────────────────────────────────────
+namespace {
+// One position's attention: out[d] = sum_i softmax(q . k_i / sqrt(hd))[i] * v_i[d].
+constexpr float kAttnQ[] = {1.0f, 0.0f};
+constexpr float kAttnK[] = {1.0f, 0.0f, 0.0f, 1.0f};   // two cached positions: (1,0), (0,1)
+constexpr float kAttnV[] = {1.0f, 2.0f, 3.0f, 4.0f};   // (1,2), (3,4)
+// By hand: scores = (q.k0, q.k1)/sqrt(2) = (0.7071, 0); softmax = (0.66976, 0.33024);
+// out = 0.66976*(1,2) + 0.33024*(3,4) = (1.66048, 2.66048).
+constexpr float kAttnWantTwo[] = {1.6604769013466862f, 2.6604769013466862f};
+// With one cached position the softmax is 1 by definition, so the output is v0 exactly -- a case the
+// reference cannot pass by accident, because it pins that the normaliser is the sum and not a bare exp.
+constexpr float kAttnWantOne[] = {1.0f, 2.0f};
+
+const OpCallCase kAttnCases[] = {
+    {"two cached positions, hd 2",
+     "by hand: scores (1/sqrt2, 0) -> softmax (0.66976, 0.33024) -> 0.66976*(1,2)+0.33024*(3,4)",
+     {OpId::attn_step, kAttnQ, kAttnK, kAttnV, 2, 2, nullptr},
+     kAttnWantTwo, 2},
+    {"one cached position",
+     "softmax over a single score is 1, so the output is v0 (an implementation that skipped the normaliser "
+     "would pass the two-position case by luck but not this one)",
+     {OpId::attn_step, kAttnQ, kAttnK, kAttnV, 1, 2, nullptr},
+     kAttnWantOne, 2},
+};
+}  // namespace
+
+bool attn_step_ref(const OpCall& call) {
+    if (!call.q || !call.kcache || !call.vcache || !call.out || call.pos <= 0 || call.hd <= 0) return false;
+    const double scale = 1.0 / std::sqrt(double(call.hd));
+    std::vector<double> scores(static_cast<size_t>(call.pos));
+    double best = -1e300;
+    for (int i = 0; i < call.pos; ++i) {
+        double s = 0.0;
+        for (int d = 0; d < call.hd; ++d) s += double(call.q[d]) * double(call.kcache[i * call.hd + d]);
+        scores[size_t(i)] = s * scale;
+        if (scores[size_t(i)] > best) best = scores[size_t(i)];
+    }
+    double z = 0.0;
+    for (auto& s : scores) {
+        s = std::exp(s - best);
+        z += s;
+    }
+    for (int d = 0; d < call.hd; ++d) {
+        double acc = 0.0;
+        for (int i = 0; i < call.pos; ++i) acc += scores[size_t(i)] / z * double(call.vcache[i * call.hd + d]);
+        call.out[d] = float(acc);
+    }
+    return true;
+}
+
+namespace {
+const OpCallEntry kCallEntries[] = {
+    {OpId::attn_step, &attn_step_ref, kAttnCases, sizeof(kAttnCases) / sizeof(kAttnCases[0])},
+};
+}  // namespace
+
+const OpCallEntry* find_op_call(OpId op) {
+    for (const auto& e : kCallEntries)
+        if (e.op == op) return &e;
+    return nullptr;
+}
+size_t op_call_entry_count() { return sizeof(kCallEntries) / sizeof(kCallEntries[0]); }
+const OpCallEntry& op_call_entry(size_t i) { return kCallEntries[i]; }
 
 }  // namespace onebit::npu::plan

@@ -84,6 +84,52 @@ const OpEntry& op_entry(size_t i);
 // the exact string, so the gap is a decision rather than an omission.
 std::string op_coverage();
 
+// ── op-shaped calls (engine#799 rule (b), slice 2) ──────────────────────────────────────────────────
+// `OpRefFn` above is GEMM-shaped (`a, m, k, n, b, out`), so the two ops whose operands are not a matrix
+// pair -- `attn_step` and `gdn_step` -- could not be registered at all, which is why `op_coverage()` named
+// them as gaps. `OpCall` is the operand set they need. The GEMM table stays as it is (its entries and
+// cases are the shipped contract); this is an additive second shape and `op_coverage()` now means "no
+// reference of EITHER shape", which is the honest question a plan asks.
+struct OpCall {
+    OpId op = OpId::gemv;
+    // attn_step: one query against `pos` cached keys/values of one head.
+    //   q      [hd]
+    //   kcache [pos][hd], vcache [pos][hd]   (row-major, one row per cached position)
+    //   out    [hd] = softmax(q . k_i / sqrt(hd)) over i, applied to v
+    const float* q = nullptr;
+    const float* kcache = nullptr;
+    const float* vcache = nullptr;
+    int pos = 0, hd = 0;
+    float* out = nullptr;
+};
+using OpCallRefFn = bool (*)(const OpCall&);
+
+// One known-answer case for an op-shaped call: the case owns its operands, so the test can run it without
+// knowing the op's shape. `want` is `hd` floats.
+struct OpCallCase {
+    const char* what;
+    const char* how;          // how the expectation was derived, same rule as OpCase::how
+    OpCall call;              // operands; `out` is filled by the reference
+    const float* want;
+    int want_len;
+};
+
+struct OpCallEntry {
+    OpId op;
+    OpCallRefFn ref;
+    const OpCallCase* cases;
+    size_t n_cases;
+};
+
+const OpCallEntry* find_op_call(OpId op);
+size_t op_call_entry_count();
+const OpCallEntry& op_call_entry(size_t i);
+
+// `attn_step`: one query, one head, causal-agnostic over the cached positions.  Hand-derived answers in the
+// cases: with hd = 2 and q = (1, 0), the first score is 1/sqrt(2) and the second 0, so the softmax is
+// (0.6698, 0.3302) and the output (1.6605, 2.6605); with pos = 1 the softmax is 1 and the output IS v0.
+bool attn_step_ref(const OpCall& call);
+
 // The two references this build implements.  `gemv_ref` is C[m][n] = A[m][k] x B[k][n]; `lm_head_ref` is
 // the same product with m == 1 (the plan layer's lm-head contract), kept separate so its own cases name the
 // shape it is used at.

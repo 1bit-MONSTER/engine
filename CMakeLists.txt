@@ -1502,7 +1502,10 @@ set(_onebit_route_tests
 # serve_e2e_<dev>, laya_route_e2e and laya_models_e2e left this list with engine #1485: they run `serve --port 0`
 # now, so they pick nothing and there is no window for the lock to close. hrx_cpu_weight_parity stays - it starts `llama-server` itself, whose port is not ours to
 # choose (that is also why it is not in the `1bit serve` migration).
-list(APPEND _onebit_route_tests hybrid_e2e pm_laya_route hrx_cpu_weight_parity)
+# engine #1485: hybrid_kvshare_e2e chooses its port in its own driver (tests/kvshare_fd_handoff.py calls free_port(),
+# binds :0, closes, and hands the number to the server it starts), so the census - which reads the .sh text - sees no
+# bind to require the lock for. Same shape as bench_selftest, so it is named here for the same reason.
+list(APPEND _onebit_route_tests hybrid_e2e pm_laya_route hrx_cpu_weight_parity hybrid_kvshare_e2e)
 foreach(_onebit_route_test IN LISTS _onebit_route_tests)
     if(TEST ${_onebit_route_test})
         set_tests_properties(${_onebit_route_test} PROPERTIES RESOURCE_LOCK route_ports)

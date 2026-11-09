@@ -282,6 +282,41 @@ void test_external_tile_decode() {
     }
 }
 
+// The conversion half of the writer (engine#1503): the pack's `(code - zp)*scale` and the container's
+// `code*d + m` are different conventions, and the mapping has to reproduce the pack's own numbers. The obvious
+// alternative -- dequantise and re-quantise with the container's quantiser -- was measured on a real phi-4 tile and
+// reproduced the pack's codes on only 2,826 of 8,192 entries, so the identity below is the thing to pin.
+void test_external_to_container() {
+    pi::Q4 pack;
+    pack.N = 4; pack.K = 128; pack.block = 32;
+    pack.codes.assign(size_t(pack.N) * pack.K, 0);
+    for (size_t i = 0; i < pack.codes.size(); ++i) pack.codes[i] = uint8_t((i * 5 + 1) % 16);
+    pack.scale.assign(size_t(pack.N) * (pack.K / 32), 0.0068359375f);   // exact in bf16
+    pack.zero.assign(pack.scale.size(), 0.0f);
+    for (int r = 0; r < pack.N; ++r)
+        for (int g = 0; g < pack.K / 32; ++g) pack.zero[size_t(r) * (pack.K / 32) + g] = float(3 + (g % 4));
+
+    long long m_inexact = -1;
+    const pi::Q4 q = pi::container_from_external_q4(pack, &m_inexact);
+    check(q.codes == pack.codes, "external->container: codes are carried unchanged (the pack's grid is the container's)");
+    check(q.scale == pack.scale, "external->container: d is the pack's scale");
+    check(m_inexact >= 0, "external->container: the bf16-exactness of m is reported, not assumed");
+
+    // The arithmetic identity: code*d + m must equal the pack's (code - zp)*scale, up to the bf16 rounding of m.
+    float worst_rel = 0.0f;
+    for (int r = 0; r < pack.N; ++r)
+        for (int k = 0; k < pack.K; ++k) {
+            const size_t g = size_t(r) * (pack.K / 32) + size_t(k) / 32;
+            const float want = (float(pack.codes[size_t(r) * pack.K + k]) - pack.zero[g]) * pack.scale[g];
+            const float got = float(q.codes[size_t(r) * pack.K + k]) * q.scale[g] + q.zero[g];
+            const float range = 15.0f * pack.scale[g];
+            worst_rel = std::max(worst_rel, std::fabs(got - want) / range);
+        }
+    check(worst_rel <= 1.0f / 256.0f,
+          "external->container: code*d + m reproduces (code - zp)*scale to within one bf16 ulp of m (worst " +
+              std::to_string(worst_rel) + " of the group's 15-step range)");
+}
+
 void test_external_packed_genre(const std::string& root) {
     const fs::path dir = fs::path(root) / "external-packed";
     fs::remove_all(dir);
@@ -2199,6 +2234,7 @@ int main(int argc, char** argv) {
     try {
         test_bounds();
         test_external_tile_decode();
+    test_external_to_container();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);

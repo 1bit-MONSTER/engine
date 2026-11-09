@@ -273,6 +273,15 @@ constexpr bool kExtQuantsRowMajor = false;
 
 // `row_major` defaults to kExtQuantsRowMajor (the shipped choice); it is a parameter only so the test can hold BOTH
 // orderings to their own spec -- a flip of the constant must not quietly change what the other branch means.
+// Turn a decoded external-data tile into the container's q4_1 parts. The two conventions differ in what zero
+// means: the container dequantises `w = code*d + m` (m is the group's MIN, npu/q4nx.h), while the pack's is
+// `w = (code - zp)*scale` (zp is an int4 CODE offset). So the mapping is `d = scale`, `m = -zp*scale`, codes
+// unchanged -- and the obvious alternative, dequantise then re-quantise with the container's own quantiser, is
+// measurably NOT the same weights: on a real phi-4 tile it reproduced the pack's codes on only 2,826 of 8,192
+// entries and moved weights by 2.5 % of the tensor's range (engine#1503). `m_inexact` reports how many group
+// offsets were not bf16-exact (86.3 % are, measured), because that rounding is the only loss this path has.
+Q4 container_from_external_q4(const Q4& pack, long long* m_inexact = nullptr);
+
 Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err,
                         bool row_major = kExtQuantsRowMajor);
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,

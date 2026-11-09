@@ -1206,6 +1206,19 @@ constexpr int kMlpRows = 128;
 // against a plain row-major reading. Three statistics were tried and they disagreed with each other, which discredits
 // all three (they all assumed a row's codes centre on its zero-point, and the measured zero points span 0..11). So the
 // default is the verified prior and the alternative is one constant, to be settled by the known-answer run.
+Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
+    Q4 q = pack;   // same codes, same geometry
+    long long inexact = 0;
+    for (size_t i = 0; i < q.zero.size(); ++i) {
+        // pack: w = (code - zp) * scale  ->  container: w = code * scale + m, so m = -zp * scale.
+        const float m = -q.zero[i] * q.scale[i];
+        if (bf16_to_f32(bf16_bits_of(m)) != m) ++inexact;
+        q.zero[i] = m;
+    }
+    if (m_inexact) *m_inexact = inexact;
+    return q;
+}
+
 Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err, bool row_major) {
     Q4 q;
     if (N <= 0 || K <= 0 || N % kExtTileRows != 0 || K % 128 != 0) {

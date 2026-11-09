@@ -121,10 +121,10 @@ std::string kv(const std::string& k, const std::string& v) {
 }
 // a tensor whose values live in an external file, optionally with dims that overstate it
 std::string tensor(const std::string& name, const std::vector<int64_t>& dims, const std::string& location,
-                   uint64_t offset, uint64_t length) {
+                   uint64_t offset, uint64_t length, int64_t type = 1) {
     std::string t;
     for (auto d : dims) ints(t, 1, d);                 // dims
-    ints(t, 2, 1);                                     // data_type (FLOAT; the importer only uses it for width)
+    ints(t, 2, type);   // data_type: FLOAT unless the caller says otherwise (a quantised table is UINT8)
     str(t, 8, name);
     for (const auto& [k, v] : {std::pair<std::string, std::string>{"location", location},
                                {"offset", std::to_string(offset)}, {"length", std::to_string(length)}}) {
@@ -1490,6 +1490,56 @@ void test_attn_payload_off() {
 // the Token program's op_list) and declares `o_proj N=2560 K=4096` on the 4B, i.e. o_proj's K is
 // q_proj's output width, not hidden. The two 256-byte gains match Qwen/Qwen3-1.7B's and -4B's public
 // q_norm/k_norm weights bit for bit at those offsets (128 of 128 values, and 127-128 of 128 on the swap).
+
+// The embedding component (engine #1503): a hybrid pack keeps its table in `embedding.onnx` (+ `.data`), gathered by
+// GatherBlockQuantized. Shape measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: weight_Q4 [V, H/2] UINT8 and
+// weight_scales [V, groups] FLOAT with group 128. Driving the reader against known codes and scales pins the
+// dequantisation without a 3 GB pack.
+void test_embedding_component(const std::string& root) {
+    const fs::path dir = fs::path(root) / "embedcomp";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const int64_t V = 8, H = 256, groups = H / 128;
+    auto want = [&](int64_t v, int64_t k) { return uint8_t((v * 7 + k * 5) % 16); };
+    std::vector<uint8_t> table(size_t(V) * size_t(H / 2), 0);
+    std::vector<float> scales(size_t(V) * size_t(groups), 0.0f);
+    for (int64_t v = 0; v < V; ++v) {
+        for (int64_t g = 0; g < groups; ++g) scales[size_t(v) * groups + size_t(g)] = 0.5f * float(g + 1);
+        for (int64_t k = 0; k < H; k += 2)
+            table[size_t(v) * size_t(H / 2) + size_t(k / 2)] = uint8_t(want(v, k) | (want(v, k + 1) << 4));
+    }
+    std::string data;
+    data.append(reinterpret_cast<const char*>(table.data()), table.size());
+    const size_t table_bytes = table.size();
+    data.append(reinterpret_cast<const char*>(scales.data()), scales.size() * sizeof(float));
+    put_file((dir / "embedding.onnx.data").string(), data);
+    const auto t = pb::tensor("language_model.embed_tokens.weight_Q4", {V, H / 2}, "embedding.onnx.data", 0,
+                              table_bytes, 2);
+    const auto sc = pb::tensor("language_model.embed_tokens.weight_scales", {V, groups}, "embedding.onnx.data",
+                               table_bytes, scales.size() * sizeof(float), 1);
+    put_file((dir / "embedding.onnx").string(), pb::model({t, sc}, {}));
+
+    std::string why;
+    const std::vector<float> got = pi::read_embedding_component(dir.string(), &why);
+    check(got.size() == size_t(V) * size_t(H),
+          "embedding component: reads V*H values (" + std::to_string(got.size()) + ", why: " + why + ")");
+    bool ok = got.size() == size_t(V) * size_t(H);
+    for (int64_t v = 0; v < V && ok; ++v)
+        for (int64_t k = 0; k < H; ++k) {
+            const float exp = float(want(v, k)) * 0.5f * float(k / 128 + 1);
+            if (std::fabs(got[size_t(v) * size_t(H) + size_t(k)] - exp) > 1e-6f) { ok = false; break; }
+        }
+    check(ok, "embedding component: every code times its group's scale, group 128, low nibble first");
+    std::printf("embedding component: %zu values, V=%lld H=%lld group 128\n", got.size(), (long long)V, (long long)H);
+
+    const fs::path none = dir / "none";
+    fs::create_directories(none);
+    std::string why2;
+    check(pi::read_embedding_component(none.string(), &why2).empty() && !why2.empty(),
+          "embedding component: absent -> empty with a reason (" + why2 + ")");
+    if (!getenv("KEEP_EMBEDCOMP")) fs::remove_all(dir);
+}
+
 void test_qwen3_attn_sections() {
     struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
     const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
@@ -1791,6 +1841,7 @@ int main(int argc, char** argv) {
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
+        test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

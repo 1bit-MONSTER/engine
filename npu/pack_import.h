@@ -69,6 +69,11 @@ struct Dims {
     std::vector<int> eos;
 };
 
+// A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
+// GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
+// reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
+std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why);
+
 // One tensor the pack describes, and where its values would come from.
 struct Planned {
     std::string name;     // Q4NX tensor name (model.layers.N.<...>.weight)

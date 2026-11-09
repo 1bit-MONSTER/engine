@@ -58,6 +58,8 @@ mk mixed '$ORIGIN:/work-c22/hrx-toolchain/lib/llvm/lib/clang/24/lib/x86_64-unkno
 out=$("$tool" "$work/mixed" 2>&1) && rc=0 || rc=$?
 check "origin plus a toolchain dir fails" 1 "$rc"
 case $out in *dead*) ;; *) echo "FAIL a directory that holds nothing needed is not called dead: $out"; fails=$((fails + 1)) ;; esac
+# "dead" must not read as "safe to drop": $LIB/$PLATFORM are not expanded, so the report says so.
+case $out in *"not a promise that the entry can be dropped"*) ;; *) echo "FAIL dead is not qualified as sweep-scoped: $out"; fails=$((fails + 1)) ;; esac
 
 # engine #1615: the same entry can be harmless one day and load-bearing the next, so the tool has to
 # say which. `onebit` (a copy of /bin/true) needs libc.so.6, so a directory holding it is LIVE.

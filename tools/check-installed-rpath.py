@@ -30,7 +30,9 @@ fall back on. A stable count therefore says nothing, so each offending entry is 
 
     LIVE  a library this ELF actually needs is found in that directory (the entry is load-bearing; the
           line names the library and the real path it resolves to, symlinks followed)
-    dead  nothing this ELF needs is there, so the entry only needs to be dropped
+    dead  nothing this ELF needs is there, so the entry only needs to be dropped - read as "nothing
+          this sweep can see is here", not as "certified safe": `$LIB`/`$PLATFORM` are not expanded
+          (see below), so a dead entry may still be live on a real loader
 
 Both are still failures - neither is something a package should carry - but only LIVE changes what the
 binary can start without. Exit codes are unchanged.
@@ -140,6 +142,9 @@ def main(argv):
                     print(f"  {os.path.relpath(path, root)}  {kind}={value}  (dead)")
             if len(bad) > MAX_SHOWN:
                 print(f"  ... and {len(bad) - MAX_SHOWN} more")
+            if len(bad) > len(live):
+                print(f"  (dead = nothing this sweep can see is needed here; $LIB/$PLATFORM are not "
+                      "expanded, so dead is not a promise that the entry can be dropped)")
             total_live += len(live)
         else:
             print(f"{root}: every RUNPATH is $ORIGIN")

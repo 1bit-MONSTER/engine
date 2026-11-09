@@ -290,6 +290,10 @@ add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
 # check; the two permanent services are exempt by name. --self-test drives the decision, no device needed.
 add_test(NAME device_holders COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
+# engine #1668: the bench preflight must pin the load mode, because `-lm none` is +17.5 % prefill at -1.6 % decode for +604 MiB of
+# GTT. The script existed with a test that nothing ran; a test nobody runs is a comment, so the loader/flag assertions are registered
+# here (the test fakes the box, so it needs no device and no ticket).
+add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-bench-preflight.sh)
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.

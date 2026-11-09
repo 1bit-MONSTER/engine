@@ -226,10 +226,10 @@ void test_external_packed_genre(const std::string& root) {
     // The graph's name comes from genai_config.json, as in the real pack (phi-4's is eager-mm.onnx).
     put_file((dir / "genai_config.json").string(),
              R"({"model":{"decoder":{"filename":"eager-mm.onnx","hidden_size":5120,"num_hidden_layers":1,)"
-             R"("num_attention_heads":40,"num_key_value_heads":10,"head_size":128}}})");
+             R"("num_attention_heads":40,"num_key_value_heads":10,"head_size":128,"intermediate_size":17920}}})");
     // K 5120 -> 41 blocks of 68 B = 2,788 B per row; N 768, so a fitting tensor is 2,141,184 B.
     const int64_t K = 5120, N = 768, stride = (K / 128 + 1) * 68;
-    const int64_t embed_bytes = 64 * 5120 * 2;          // vocab 64 x hidden 5120, f16
+    const int64_t embed_bytes = 64 * 5120 * 4;          // vocab 64 x hidden 5120, and pb::tensor declares FLOAT
     const auto write_data = [&](int64_t packed_bytes) {
         put_file((dir / "eager-mm.onnx.data").string(), std::string(size_t(embed_bytes + packed_bytes), '\x22'));
     };
@@ -268,6 +268,30 @@ void test_external_packed_genre(const std::string& root) {
     check(m2["graph_weights"]["external_row_stride"]["matched"] == 0 &&
               m2["graph_weights"]["external_row_stride"]["of"] == 1,
           "external-packed: a length that does not fit the stride is reported as 0 of 1, with the rule named");
+
+    // …and widening the CENSUS must not widen the IMPORT. This genre has no writer yet, so the import answer has to
+    // stay the refusal it was before this change: the check is on the answer, not on a sentence in the PR.
+    {
+        pi::Options allow;
+        allow.allow_incomplete = true;   // so the plan's own refusals do not short-circuit before the readers
+        bool threw = false;
+        std::string why;
+        write_data(stride * N);
+        write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N);
+        try {
+            (void)pi::import_pack(dir.string(), (dir / "out").string(), allow);
+        } catch (const std::exception& e) {
+            threw = true;
+            why = e.what();
+        }
+        std::printf("  external-packed import refusal: %s\n", why.c_str());
+        check(threw, "external-packed: import still refuses the genre (the census widening did not become a writer)");
+        check(why.find("qweight.packed") != std::string::npos && why.find("no writer") != std::string::npos,
+              "external-packed: and it refuses by NAME with the layout stated (no writer for N x (K/128+1) x 68), "
+              "not by tripping over a symbol (" + why + ")");
+        check(!fs::exists(dir / "out" / "model.q4nx"),
+              "external-packed: nothing is written for a genre this importer cannot yet walk");
+    }
     fs::remove_all(dir);
 
     // The FFN width in the external-data genre is the NODE's declaration, because the weight is a 1-D byte blob with

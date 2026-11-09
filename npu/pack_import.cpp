@@ -187,6 +187,11 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
             for (const auto* sg : fields(at, 6)) walk_graph(sg->p, sg->n, m);
             for (const auto* sg : fields(at, 11)) walk_graph(sg->p, sg->n, m);
         }
+        // The graph is the authority on how THIS reader should spell a quantised matmul: the same pack also states the
+        // op in `cache/*_meta.json` (which the block census reads) and in the `.onnx` alias table, and if those ever
+        // disagree the graph wins here, because the graph is what the nodes — and therefore the weights — actually are.
+        // A disagreement is a pack fault to report, not something to reconcile silently: `tools/npu_plan.py` walks the
+        // metadata sidecar for the fconst tile census, a different question, and the two must not be averaged.
         if (op == "MatMulNBits" || op == "MatMulNBitsBf") {
             if (op == "MatMulNBitsBf") ++m.ryzenai_matmuls;
             OnnxMatMul mm;
@@ -1460,6 +1465,13 @@ Plan plan(const std::string& pack_dir) {
     std::string tok_why;
     std::string tok_path = resolve_token_fconst(pack_dir, p.dims);
     const bool no_fconst = tok_path.empty();
+    // The 1.9 external-data genre (phi-4: 201 `MatMulNBitsBf` ops whose bytes are `*.qweight.packed` siblings in
+    // `eager-mm.onnx.data`) must NOT ride the graph-weights path below, which was written for the 1.3/1.6/1.7.1 line's
+    // ordinary initializers (`UINT8 [N, K/128, 64]`). There the weight is 3-D and the tile is the initializer; here it
+    // is a 1-D byte blob whose row stride is N x (K/128 + 1) x 68, and repacking it into this importer's per-role tile
+    // form is a writer this tree does not have yet (engine#1503). Recognising the genre in the census and then letting
+    // it fall through here would import a half-readable pack -- so it is refused by name, with the layout stated,
+    // until the writer lands.
     const bool graph_weights = p.graph_real_weights > 0 && no_fconst;
     // The projections the graph carries as real initializers, by their own names (`.MatMulNBits.` marks one).
     std::set<std::string> graph_projs;
@@ -1939,6 +1951,16 @@ std::string kernel_set_refusal(const std::vector<std::string>& file_names, const
 
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
     const Plan p = plan(pack_dir);
+    // Census yes, writer no (see the note where graph_weights is decided): this genre's weights are 1-D external-data
+    // blocks, and until the repacker exists an import would write a container nothing can read. Refused here rather
+    // than in plan(), because `info` must keep reporting the genre it can now see.
+    if (p.graph_packed_siblings > 0)
+        throw std::runtime_error(
+            "this pack keeps its 4-bit weights as external-data blocks (" + std::to_string(p.graph_packed_siblings) +
+            " `*.qweight.packed` tensors behind `*.qweight.empty` placeholders, " + std::to_string(p.graph_stride_ok) +
+            " of " + std::to_string(p.graph_stride_of) +
+            " fitting length == N x (K/128 + 1) x 68) and this importer has no writer for that layout yet; the .fconst "
+            "tile decoder does not apply (engine#1503)");
     Report r;
     r.out_dir = out_dir;
     r.refused = p.refused();

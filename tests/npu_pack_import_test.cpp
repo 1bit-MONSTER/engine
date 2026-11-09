@@ -233,17 +233,20 @@ void test_external_packed_genre(const std::string& root) {
     const auto write_data = [&](int64_t packed_bytes) {
         put_file((dir / "eager-mm.onnx.data").string(), std::string(size_t(embed_bytes + packed_bytes), '\x22'));
     };
-    const auto write_graph = [&](const std::string& packed, int64_t packed_bytes) {
+    // `with_sibling = false` writes the placeholder with NO `*.qweight.packed` initializer at all -- the truncated-pack
+    // shape engine#1690's review is about, which is a different case from the byte-less sibling.
+    const auto write_graph = [&](const std::string& packed, int64_t packed_bytes, bool with_sibling = true) {
+        std::vector<std::string> inits{pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
+                                                  uint64_t(embed_bytes)),
+                                       pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
+                                       pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty")};
+        if (with_sibling)
+            inits.push_back(pb::tensor(packed, {packed_bytes}, "eager-mm.onnx.data", uint64_t(embed_bytes),
+                                       uint64_t(packed_bytes)));
         put_file((dir / "eager-mm.onnx").string(),
-                 pb::model({pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
-                                       uint64_t(embed_bytes)),
-                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
-                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty"),
-                            pb::tensor(packed, {packed_bytes}, "eager-mm.onnx.data", uint64_t(embed_bytes),
-                                       uint64_t(packed_bytes))},
-                           {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
-                                                    "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
-                                            K, N, 4, 128, "MatMulNBitsBf")}));
+                 pb::model(inits, {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
+                                                           "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
+                                                   K, N, 4, 128, "MatMulNBitsBf")}));
     };
 
     write_data(stride * N);
@@ -257,6 +260,73 @@ void test_external_packed_genre(const std::string& root) {
           "behind a placeholder)");
     check(g["external_row_stride"]["matched"] == 1 && g["external_row_stride"]["of"] == 1,
           "external-packed: the bytes fit length == N x (K/128 + 1) x 68, reported as a count");
+
+    // engine#1671: when the `*.packed` sibling is ALSO a placeholder (dims [0], no data), this graph carries no
+    // weight for that matmul at all -- and the node must be DROPPED rather than left naming the `.empty`
+    // placeholder. Left naming it, the reader calls bytes_of() on a byte-less tensor and throws
+    // "model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty: no data", which broke `npu-pack import` for every
+    // Ryzen AI 1.9 fconst pack: those declare all of their graph initializers this way (363 `.empty` and 363
+    // `.packed`, every one dims [0]) because the weights live in the Token .fconst.
+    write_data(0);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", 0);
+    {
+        // Both empty AND no .fconst: the weights are genuinely absent from this pack, so it is refused by name
+        // (#1687's rule) rather than reporting a capacity or tile-layout fault. The SAME graph imports fine from a
+        // Token .fconst -- that is the 1.9 shape, where every initializer is spelled this way and the weights live in
+        // the .fconst -- which `npu_pack_import_test <golden> <1.9 pack>` covers end to end with a real pack.
+        bool refused = false;
+        std::string what;
+        try {
+            (void)pi::plan(dir.string());
+        } catch (const std::exception& e) {
+            refused = true;
+            what = e.what();
+        }
+        check(refused, "placeholder pair: with no .fconst the pack is refused rather than read from a byte-less tensor");
+        check(what.find("qweight.empty") != std::string::npos && what.find("qweight.packed") != std::string::npos &&
+                  what.find("genuinely absent") != std::string::npos,
+              "placeholder pair: the refusal names the placeholder, its sibling and the reason (" + what + ")");
+    }
+
+    // The SAME graph, but with a Token .fconst beside it: now the weights have a source, so the drop is what makes the
+    // pack readable -- and this is the arm that pins the drop. Reverting it (the weightless node pushed back into the
+    // matmul list) leaves matmulnbits_ops at 1 here, because the node names a tensor with no bytes.
+    put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), std::string(4096, '\0'));
+    {
+        const json p3 = json::parse(pi::plan(dir.string()).manifest());
+        const json& g3 = p3["graph_weights"];
+        check(g3["weightless_matmuls"] == 1,
+              "placeholder pair: with an .fconst the weightless matmul is COUNTED (" +
+                  std::to_string(g3["weightless_matmuls"].get<int64_t>()) + ")");
+        check(g3["matmulnbits_ops"] == 0 && g3["packed_weight_siblings"] == 0,
+              "placeholder pair: and dropped from the matmul list, so nothing downstream reads a byte-less tensor "
+              "(engine#1671: this is the path a 1.9 pack takes, where the weights are in the .fconst)");
+    }
+    fs::remove(dir / "dd_metastate_Llm_Token_Token_crafted.fconst");
+
+    // engine#1690 review: a `*.empty` placeholder with NO `*.packed` sibling at all must KEEP its matmul. Dropping it
+    // empties onnx.matmuls, and an empty matmul list is what tells plan() "this is a 1.9 fconst pack, take the head
+    // from the tail" (:1685) -- so a truncated pack would silently get a tail head instead of #1687's refusal. The
+    // point of the arm is the count, not the refusal: with the drop the node is gone and `matmulnbits_ops` reads 0.
+    write_data(0);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", 0, /*with_sibling=*/false);
+    {
+        bool refused = false;
+        std::string what;
+        json g4;
+        try {
+            g4 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
+        } catch (const std::exception& e) {
+            refused = true;
+            what = e.what();
+        }
+        if (refused)
+            check(what.find("fconst") == std::string::npos,
+                  "placeholder with no sibling: any refusal is not the \"read the head from the tail\" path (" + what + ")");
+        else
+            check(g4["matmulnbits_ops"] == 1 && g4["weightless_matmuls"] == 0,
+                  "placeholder with no sibling: the matmul is KEPT, so the pack is not mistaken for a tail-head pack");
+    }
 
     // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
     write_data(stride * N - 68);
@@ -1813,6 +1883,69 @@ void test_embedding_component(const std::string& root) {
     if (!getenv("KEEP_EMBEDCOMP")) fs::remove_all(dir);
 }
 
+
+// engine#1690: the head's self-check must decode the embedding at the width the importer holds. `embed_bytes` is the
+// container's bf16 copy on every path (#1661 made that true and left four readers decoding F16), so a tied
+// Qwen2.5-0.5B 1.9 pack reported corr 0.885220 -- and "untied" -- for a container whose own numbers are 0.999999.
+// This pins the statistic against a known matrix at both widths: the bf16 buffer must correlate ~1.0, and the same
+// values encoded as F16 must not, which is the arm that would have caught #1661 when it landed.
+void test_selfcheck_reads_bf16() {
+    const int V = 64, H = 64;
+    auto code_of = [&](int n, int k) { return (n * 7 + k) % 8; };
+    pi::Q4 q;
+    q.N = V;
+    q.K = H;
+    q.block = 32;
+    q.codes.resize(size_t(V) * H);
+    q.scale.assign(size_t(V) * (H / 32), 0.5f);
+    q.zero.assign(size_t(V) * (H / 32), 0.0f);
+    for (int n = 0; n < V; ++n)
+        for (int k = 0; k < H; ++k) q.codes[size_t(n) * H + k] = uint8_t(code_of(n, k));
+    // the same values, once as bf16 (what the importer holds) and once as f16 (what it used to assume)
+    std::vector<uint8_t> bf(size_t(V) * H * 2), f16(size_t(V) * H * 2);
+    for (int n = 0; n < V; ++n)
+        for (int k = 0; k < H; ++k) {
+            const float v = float(code_of(n, k)) * 0.5f;   // 0.0 .. 3.5, exact in both formats
+            const uint16_t b = pi::bf16_bits_of(v);
+            const uint16_t h = uint16_t(v == 0.0f ? 0x0000 : (0x3800 | (uint16_t(std::lround(v * 2.0f) - 2) << 10)));
+            const size_t i = (size_t(n) * H + k) * 2;
+            bf[i] = uint8_t(b & 0xFF); bf[i + 1] = uint8_t(b >> 8);
+            f16[i] = uint8_t(h & 0xFF); f16[i + 1] = uint8_t(h >> 8);
+        }
+    const double good = pi::corr_bf16(q, bf.data(), H, V);
+    const double wrong = pi::corr_bf16(q, f16.data(), H, V);
+    std::printf("selfcheck-bf16: corr(bf16 buffer) %.6f, corr(f16 buffer) %.6f\n", good, wrong);
+    check(good > 0.999, "selfcheck-bf16: the statistic reads the bf16 buffer the importer holds (corr " +
+                            std::to_string(good) + ")");
+    check(wrong < 0.99, "selfcheck-bf16: and reading the same values at the wrong width does not (corr " +
+                            std::to_string(wrong) + ") -- the arm that would have caught #1661");
+
+    // engine#1721: the width now travels with the pointer, so the accident #1661 made -- repointing the bytes under
+    // four readers that all decoded F16 -- cannot recur silently: a reader that wants F16 has to say Fmt::F16, and the
+    // default is the format the importer actually holds.
+    {
+        uint32_t f32bits = 0;
+        const float v = 1.5f;
+        std::memcpy(&f32bits, &v, 4);
+        const uint16_t bits = uint16_t(f32bits >> 16);   // bf16 1.5 = 0x3FC0; the same bits read as f16 are 1.75
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(&bits);
+        const pi::EmbedTable as_bf16{raw, pi::EmbedTable::Fmt::BF16, 1};
+        const pi::EmbedTable as_f16{raw, pi::EmbedTable::Fmt::F16, 1};
+        std::printf("embed-table: same bytes, bf16 %.3f, f16 %.3f, default %s\n", pi::embed_at(as_bf16, 0, 0),
+                    pi::embed_at(as_f16, 0, 0),
+                    pi::EmbedTable{}.fmt == pi::EmbedTable::Fmt::BF16 ? "BF16" : "F16");
+        check(std::fabs(pi::embed_at(as_bf16, 0, 0) - 1.5) < 1e-6,
+              "embed-table: Fmt::BF16 decodes the bytes as bf16");
+        // 0x3FC0 read as f16 is 1.9375 (exp 15 -> 2^0, mantissa 0x3C0/1024), not the 1.75 I first wrote here: the
+        // point of the arm is that the two formats DISAGREE, and getting the disagreement's value wrong is the same
+        // mistake in the test rather than the code.
+        check(std::fabs(pi::embed_at(as_f16, 0, 0) - 1.9375) < 1e-6,
+              "embed-table: Fmt::F16 on the SAME bytes gives a different number, so the width cannot be forgotten");
+        check(pi::EmbedTable{}.fmt == pi::EmbedTable::Fmt::BF16,
+              "embed-table: the default format is what the importer holds, so an unset width is the right one");
+    }
+}
+
 void test_qwen3_attn_sections() {
     struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
     const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
@@ -2218,6 +2351,7 @@ int main(int argc, char** argv) {
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
+        test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();

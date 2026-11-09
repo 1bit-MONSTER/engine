@@ -273,7 +273,9 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
 
 /* Per-column int8 quantization of B[K][N] into out with leading dimension ld,
  * plus per-column scales.  Identical numerics to I8Ctx::packB_into().
- * Returns the mean column scale (I8Ctx's `sout`). */
+ * Returns the mean column scale (I8Ctx's `sout`), and **0.0 with nothing written** when the per-column scale array cannot
+ * be allocated (the row-major traversal added in engine #1416 needs N floats; the old j-outer loop did not allocate). The
+ * only caller today is a test, but a 0 return must not be read as "quantised to nothing". */
 /* The PRODUCTION weight packer: I8Ctx::packB_blocked, extracted so it can be tested without the device runtime
  * (engine #1416). Writes Bm at the blocked (or row-major, `blocked == 0`) index for this geometry, per-column scales into
  * col_scales[N], and the sum of the scales into *ssum_out. `KD`/`ND` are the container's padded geometry the layout is

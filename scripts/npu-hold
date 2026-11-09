@@ -24,29 +24,61 @@
 #
 # Two things this file exists to fix (engine#1701), both of them drift rather than logic:
 #
-#   * the queue, the token and the log follow ONEBIT_HOLD_DIR when that directory exists, exactly as
-#     scripts/gpu-hold does (engine#1504), so a runner under its own account queues on the SAME token as the
-#     owner's lanes instead of serialising against itself and being invisible to npu-serve-keeper. Without it
-#     the paths stay $HOME/NPU-*, which keeps a box that has not been set up unchanged.
-#   * the hold is taken by an INSTALLED gpu-hold, resolved in this order: $ONEBIT_GPU_HOLD, the copy the
-#     installer manages (~/.local/bin/gpu-hold), then this tree's scripts/gpu-hold. The owner's private copy
-#     drifted for three days on the survivor bound alone (engine#1639 / #1646); NPU work inherited every fix
-#     only when someone remembered to copy the file by hand.
+#   * the queue, the token and the log follow the fleet directory exactly as scripts/gpu-hold does
+#     (engine#1504): HOLD is $ONEBIT_HOLD_DIR or /var/lib/1bit-fleet, and $HOLD/npu-queue IS the queue when that
+#     subdirectory exists - the same per-subdirectory test gpu-hold applies to $HOLD/gpu-queue, so the two holds
+#     can never disagree about where the fleet's state is. Without it the paths stay $HOME/NPU-*, which keeps a
+#     box that has not been set up unchanged.
+#     A shared queue is REFUSED (exit 2) while ~/.local/bin/npu-serve-keeper still reads $HOME/NPU-QUEUE: the
+#     keeper yields the array when a ticket appears in the queue IT reads, so a hold it cannot see would believe
+#     the device is free while the serve keeps it. Point the keeper at the same paths first, then set
+#     NPU_HOLD_SHARED=1 to confirm you have checked.
+#   * the hold is taken by THIS TREE's scripts/gpu-hold first ($ONEBIT_GPU_HOLD overrides), with the
+#     installer-managed ~/.local/bin copy as the fallback for a machine without a checkout, and a note printed
+#     when the two differ. The private copy drifted for three days on the survivor bound alone (engine#1639 /
+#     #1646); "fixed in the tree" has to mean fixed for NPU work too.
 #
 # The queue/token settings are given to gpu-hold ONLY, never to CMD: a gpu-hold inside CMD (the hw-gate's own
 # GPU claim, a bench wrapper) must queue on the GPU, not on the NPU queue its parent already holds (that
 # deadlocked the c18 gate on 2026-10-31). Everything after -- runs with those variables unset.
 set -u
-HOLD=${ONEBIT_HOLD_DIR:-$HOME}
-if [ -n "${ONEBIT_HOLD_DIR:-}" ] && [ -d "${ONEBIT_HOLD_DIR}" ]; then
-    QUEUE=$HOLD/npu-queue; TOKEN=$HOLD/npu-token; LOG=$HOLD/npu-queue/.log
+# Where the fleet's hold state lives. The discovery is deliberately IDENTICAL to scripts/gpu-hold's
+# (engine#1504), including the default: the two holds must never disagree about where the state is, or the
+# owner's "create /var/lib/1bit-fleet" step moves one of them and not the other.
+HOLD=${ONEBIT_HOLD_DIR:-/var/lib/1bit-fleet}
+if [ -d "$HOLD/npu-queue" ]; then
+    QUEUE=$HOLD/npu-queue; TOKEN=$HOLD/npu-token; LOG=$HOLD/npu-queue/.log; SHARED=1
 else
-    QUEUE=$HOME/NPU-QUEUE; TOKEN=$HOME/NPU-TOKEN; LOG=$HOME/NPU-QUEUE/.log
+    QUEUE=$HOME/NPU-QUEUE; TOKEN=$HOME/NPU-TOKEN; LOG=$HOME/NPU-QUEUE/.log; SHARED=0
 fi
+# A shared queue is only safe once npu-serve-keeper watches it too (engine#1701): the keeper yields the NPU
+# when a ticket appears in the queue IT reads, and hard-codes $HOME/NPU-QUEUE. A hold queued somewhere the
+# keeper cannot see would believe the device is free while the serve keeps it -- two owners on the array,
+# which is worse than the per-account drift this file fixes. So a shared queue is refused until the keeper's
+# own path follows it, unless the caller says it has checked (NPU_HOLD_SHARED=1).
+if [ "$SHARED" = 1 ] && [ "${NPU_HOLD_SHARED:-0}" != 1 ]; then
+    keeper=$HOME/.local/bin/npu-serve-keeper
+    if [ -f "$keeper" ] && grep -q 'NPU-QUEUE' "$keeper" 2> /dev/null; then
+        echo "npu-hold: REFUSED: $QUEUE is a shared NPU queue, but $(printf '%s' "$keeper") still reads \$HOME/NPU-QUEUE" >&2
+        echo "npu-hold: so the keeper would not see this ticket and could keep the array. Point the keeper at $QUEUE" >&2
+        echo "npu-hold: first, or set NPU_HOLD_SHARED=1 once you have checked that it does." >&2
+        exit 2
+    fi
+fi
+# The hold is taken by the tree's gpu-hold first, so "fixed in the tree" is fixed for NPU work as well; the
+# installer-managed copy under ~/.local/bin is the fallback for a machine without a checkout (engine#1701).
 here=$(cd "$(dirname "$0")" && pwd)
+priv=$HOME/.local/bin/gpu-hold
 if [ -n "${ONEBIT_GPU_HOLD:-}" ]; then GH=$ONEBIT_GPU_HOLD
-elif [ -x "$HOME/.local/bin/gpu-hold" ]; then GH=$HOME/.local/bin/gpu-hold
-else GH=$here/gpu-hold; fi
+elif [ -x "$here/gpu-hold" ]; then GH=$here/gpu-hold
+elif [ -x "$priv" ]; then GH=$priv
+else
+    echo "npu-hold: no gpu-hold found (looked at \$ONEBIT_GPU_HOLD, $here/gpu-hold, $priv)" >&2
+    exit 2
+fi
+if [ -x "$priv" ] && [ -x "$here/gpu-hold" ] && ! cmp -s "$priv" "$here/gpu-hold"; then
+    echo "npu-hold: note: $priv differs from the tree's $here/gpu-hold; using the tree's (ONEBIT_GPU_HOLD overrides)" >&2
+fi
 opts=(); while [ $# -gt 0 ] && [ "$1" != -- ]; do opts+=("$1"); shift; done
 [ "${1:-}" = -- ] && shift
 [ $# -gt 0 ] || { echo "npu-hold: usage: npu-hold [-t MIN] [-l LABEL] [-w SEC] -- CMD [ARGS...]" >&2; exit 2; }

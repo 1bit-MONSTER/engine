@@ -35,8 +35,9 @@ exec "$@"
 STUB
 chmod +x "$t/gpu-hold"
 
-# 1. ONEBIT_HOLD_DIR set and existing: the fleet layout wins
-mkdir -p "$t/fleet"
+# 1. the fleet queue directory exists: it wins -- the same per-subdirectory rule scripts/gpu-hold uses for
+#    $HOLD/gpu-queue, so the two holds cannot disagree about where the state is
+mkdir -p "$t/fleet/npu-queue"
 env ONEBIT_HOLD_DIR="$t/fleet" ONEBIT_GPU_HOLD="$t/gpu-hold" STUB_RECORD="$t/r1" HOME="$t/home" \
     "$root/scripts/npu-hold" -t 1 -l probe -- sh -c 'echo payload-ran' > "$t/out1" 2>&1
 ck "the payload ran" "$(cat "$t/out1")" "payload-ran"
@@ -60,9 +61,24 @@ cat > "$t/payload" <<'P'
 echo "${GPU_QUEUE_DIR:-unset}|${GPU_TOKEN_FILE:-unset}|${GPU_HOLD_LOG:-unset}" > "$PAYLOAD_RECORD"
 P
 chmod +x "$t/payload"
-env ONEBIT_HOLD_DIR="$t/fleet" ONEBIT_GPU_HOLD="$t/gpu-hold" STUB_RECORD="$t/r3" PAYLOAD_RECORD="$t/p3" \
-    "$root/scripts/npu-hold" -- "$t/payload" > /dev/null 2>&1
+#    NPU_HOLD_SHARED=1 because this box's real ~/.local/bin/npu-serve-keeper still hard-codes $HOME/NPU-QUEUE,
+#    which is exactly what the guard above refuses -- the arm is about the env the payload gets, not the queue path.
+env ONEBIT_HOLD_DIR="$t/fleet" NPU_HOLD_SHARED=1 ONEBIT_GPU_HOLD="$t/gpu-hold" STUB_RECORD="$t/r3" \
+    PAYLOAD_RECORD="$t/p3" "$root/scripts/npu-hold" -- "$t/payload" > /dev/null 2>&1
 ck "the payload sees no NPU queue settings" "$(cat "$t/p3")" "unset|unset|unset"
+
+# 3b. a shared queue is refused while npu-serve-keeper still reads $HOME/NPU-QUEUE (it would not see the ticket)
+mkdir -p "$t/home2/.local/bin"
+printf '#!/usr/bin/env bash\nQ=$HOME/NPU-QUEUE; T=$HOME/NPU-TOKEN\n' > "$t/home2/.local/bin/npu-serve-keeper"
+chmod +x "$t/home2/.local/bin/npu-serve-keeper"
+env ONEBIT_HOLD_DIR="$t/fleet" ONEBIT_GPU_HOLD="$t/gpu-hold" STUB_RECORD="$t/r4" HOME="$t/home2" \
+    "$root/scripts/npu-hold" -- sh -c ':' > "$t/out4b" 2>&1
+ck "a shared queue is refused while the keeper reads \$HOME/NPU-QUEUE" "$?" "2"
+ck "and the refusal says why" "$(grep -c 'still reads' "$t/out4b")" "1"
+#    ...and it is allowed once the caller confirms the keeper follows it
+env ONEBIT_HOLD_DIR="$t/fleet" NPU_HOLD_SHARED=1 ONEBIT_GPU_HOLD="$t/gpu-hold" STUB_RECORD="$t/r5" HOME="$t/home2" \
+    "$root/scripts/npu-hold" -- sh -c ':' > /dev/null 2>&1
+ck "NPU_HOLD_SHARED=1 allows it" "$([ -f "$t/r5" ] && echo recorded || echo missing)" "recorded"
 
 # 4. integration: the tree's own gpu-hold takes the NPU queue when it is the only one present, and releases it.
 #    No device is touched - gpu-hold only creates a ticket/token and runs the payload - so this is hermetic too.
@@ -72,6 +88,15 @@ env ONEBIT_HOLD_DIR="$t/fleet2" ONEBIT_GPU_HOLD="$root/scripts/gpu-hold" HOME="$
 ck "the tree gpu-hold ran the payload" "$(grep -c integrated "$t/out4")" "1"
 ck "and released the NPU token" "$([ -f "$t/fleet2/npu-token" ] && echo present || echo gone)" "gone"
 ck "with no ticket left behind" "$(ls -A "$t/fleet2/npu-queue" 2>/dev/null | grep -v '^\.' | wc -l)" "0"
+
+# 4b. the tree's gpu-hold wins over a differing ~/.local/bin copy, and the difference is reported
+mkdir -p "$t/home3/.local/bin"
+printf '#!/usr/bin/env bash\n# stale private copy\nexit 0\n' > "$t/home3/.local/bin/gpu-hold"
+chmod +x "$t/home3/.local/bin/gpu-hold"
+env ONEBIT_HOLD_DIR="$t/fleet" STUB_RECORD="$t/r6" HOME="$t/home3" \
+    "$root/scripts/npu-hold" -- sh -c 'echo from-tree' > "$t/out4c" 2>&1
+ck "the tree gpu-hold ran, not the stale private copy" "$(grep -c from-tree "$t/out4c")" "1"
+ck "and the stale copy was reported" "$(grep -c 'differs from the tree' "$t/out4c")" "1"
 
 # 5. a missing command is a usage error, not a silent success
 env ONEBIT_GPU_HOLD="$t/gpu-hold" "$root/scripts/npu-hold" -- > /dev/null 2>&1

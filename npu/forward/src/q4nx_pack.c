@@ -579,7 +579,7 @@ int q4nx_pack_q4_1_tiles_to_int8(const uint8_t* tiles, size_t nbytes, int K, int
     if (!tiles || !out || K <= 0 || N <= 0) return -1;
     if (K % Q4NX_TILE_ROWS || N % Q4NX_TILE_COLS) return -1;
     const size_t ntr = (size_t)(K / Q4NX_TILE_ROWS), ntc = (size_t)(N / Q4NX_TILE_COLS);
-    if (nbytes != ntr * ntc * (size_t)Q4NX_TILE_BYTES) return -2;   // not the q4_1 tile kind: caller keeps its path
+    if (nbytes != ntr * ntc * (size_t)Q4NX_TILE_BYTES) return -2;   // not the q4_1 tile kind: a caller keeps its path
     float* amax = (float*)calloc((size_t)N, sizeof(float));
     if (!amax) return -1;
     float tilef[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];

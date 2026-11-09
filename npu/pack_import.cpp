@@ -1301,6 +1301,15 @@ int64_t group_bytes(int64_t k, int rows) {
     return (2 * (k / kKBlock) + 2) * sv;
 }
 
+// Exported for the unit test (engine#1690). The head's self-check compares a quantised head against the embedding
+// buffer the importer actually holds -- which is the container's bf16 copy, not the pack's original F16 bytes. Reading
+// that buffer at the wrong width produced a plausible-looking number (0.885220 on a tied pack whose container scores
+// 0.999999) for every pack from #1661 until this existed, so the width is pinned directly rather than only end to end.
+namespace {
+double corr(const Q4& q, const uint8_t* embed, int H, int rows);   // defined below, internal to this file
+}
+double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows) { return corr(q, embed_bf16, H, rows); }
+
 int64_t attn_tile_bytes(int64_t k) { return group_bytes(k, kTileRows); }
 int64_t attn_payload_off(int64_t hidden) { return kNormOff + hidden * 2; }
 

@@ -331,6 +331,9 @@ Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);
+// Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,
+// exported so a test can pin the buffer width it decodes).
+double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows);
 // Where a layer block's attention payload starts: the block's 64-byte header, then its
 // input_layernorm weight as bf16 [hidden]. So it is `64 + 2 x hidden`, not a constant. It reads 1,856 on
 // the 0.5B pack (hidden 896) and 4,160 on Llama-3.2-1B (hidden 2,048); reading it as the constant is what

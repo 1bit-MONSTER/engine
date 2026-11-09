@@ -33,6 +33,14 @@
 #include "forward/include/q4nx_semantics.h"   // Q4nxSemantics: the architecture flags derived from config.json
 #include "target/xdna/xdna_target.h"          // npu-relative: the CI syntax target has no tree root on its path
 
+// The model's own geometry/config (engine#803 A3). Kept in the global namespace it had in the forward's header, so
+// every use site is byte-identical; the type is used nowhere else in the tree (`grep -rn Q4nxForwardConfig` → this
+// header, the forward's, and nothing more), which is what makes moving it a pure relocation.
+struct Q4nxForwardConfig {
+    int H = 1024, NH = 16, NKV = 8, HD = 128, IM = 3072, NL = 28, NV = 151936;
+    float eps = 1e-6f, theta = 1e6f;
+};
+
 namespace npu {
 
 class NpuModel {
@@ -40,6 +48,10 @@ class NpuModel {
     // The target this model runs on. Null until `Q4nxNpuForward::init()` creates it with the device, exactly as the
     // forward's own member was: every use site already null-checks it (`if (xd_ && …)`).
     std::unique_ptr<npu::target::xdna::XdnaTarget> xd;
+
+    // The model's geometry, as derived from its own model_path — configuration, like `sem` below, and assigned as a
+    // whole exactly once in setup (`c_ = ...`), which a reference passes through to this member.
+    Q4nxForwardConfig c;
 
     // Architecture semantics derived from the model's own config.json — the first piece of *state* to move, because it
     // is pure configuration: only field-wise assignments happen (`sem_.x = …`, never a wholesale copy, checked with

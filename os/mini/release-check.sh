@@ -788,6 +788,27 @@ payload_runpath_verdict() {
 # target RESOLVES TO A FILE under home|Users|root (0 in c33, 1 in the leaking image). Targets that are a directory or
 # absent are named but not failed - `root/spot -> /home/spot` is legitimate, and a payload scanned on a build host
 # cannot tell an image directory from a missing one.
+# The sealed NPU sets live on the stick and the engine looks for them BESIDE ITSELF, so `init.sh` links
+# /data/npu/kernels to <engine dir>/npu/kernels at boot. engine#1543 moved the engine from its builder's path to
+# /opt/1bit and had to move this link with it; a link left behind (or a guard that skips because the engine dir is
+# absent) is not cosmetic: the engine finds no set, registers no device, and the boot is otherwise green.
+# Pure, so --self-test drives it: <sets present 0|1> <link target or empty>
+npu_link_verdict() {
+    _sets=${1:-} _link=${2:-}
+    case "$_sets" in
+        0) printf 'PASS no sealed NPU set on this boot, so there is no link to check beside the engine'; return 0 ;;
+        1) ;;
+        *) printf 'FAIL whether the sealed NPU sets are present could not be read (%s)' "${_sets:-empty}"; return 0 ;;
+    esac
+    if [ -z "$_link" ]; then
+        printf 'FAIL the boot carries sealed NPU sets but nothing is linked beside the engine: the engine loads them from <engine dir>/npu/kernels, so it would register NO device on an otherwise green boot (engine#1543)'
+    elif [ "$_link" = "${NPU_SETS_DIR:-/data/npu/kernels}" ]; then
+        printf 'PASS the sealed NPU sets are linked beside the engine (%s -> %s)' "$_link" "${ENGINE_DIR:-/opt/1bit}/npu/kernels"
+    else
+        printf 'FAIL %s/npu/kernels points at %s, not at the set directory of this boot (%s): the engine would load the wrong sets or none (engine#1543)' "${ENGINE_DIR:-/opt/1bit}" "$_link" "${NPU_SETS_DIR:-/data/npu/kernels}"
+    fi
+}
+
 payload_home_layout_bad() {   # <payload dir> -> "relpath|TARGET|file|dir|dangling" per absolute home-targeting link
     python3 - "$1" 2>/dev/null <<'PYSCAN'
 import os, sys
@@ -882,6 +903,14 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(payload_runpath_verdict 3 '/opt/1bit-package/1bit/1bit runs /home/x/wt/release-rc/work/build')"
     check FAIL "$(payload_runpath_verdict 1)"
     check FAIL "$(payload_runpath_verdict '')"
+    # engine#1543's other half: the sets are linked BESIDE the engine, so moving the engine without the link
+    # registers no device on a green boot
+    check PASS "$(npu_link_verdict 0 '')"
+    check PASS "$(npu_link_verdict 1 /data/npu/kernels)"
+    check FAIL "$(npu_link_verdict 1 '')"
+    check FAIL "$(npu_link_verdict 1 /home/builder/wt/npupkg-build/npu/kernels)"
+    check FAIL "$(npu_link_verdict '')"
+
     # engine #1352: the payload's modes. c31/c32 shipped 134 writable files; a payload packed after #1361 has none.
     check PASS "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"
     check FAIL "$(identity_verdict aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 7ba2110811111111111111111111111111111111111111111111111111111111 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb)"       # the c26-in-a-c32-image shape: engine claim vs shipped launcher
@@ -2200,6 +2229,18 @@ fi
 # The layout row gets the same subject check as the other payload rows (engine#1599 measured why): existence first,
 # so a host that simply has no payload SKIPs, then the subject, so an empty or interrupted unpack FAILs rather than
 # passing over nothing, and only then the row itself - once, in the else, so a subject failure never falls through.
+# ── the NPU sets are linked BESIDE the engine (engine#1543's coupling) ──────────────────────────────
+# init.sh links the stick's /data/npu/kernels to <engine dir>/npu/kernels at boot, because that is where the
+# engine looks. The failure this row exists for is silent: the boot is green and no NPU device registers.
+_npu_sets=0; [ -d "${NPU_SETS_DIR:-/data/npu/kernels}" ] && _npu_sets=1
+_npu_link=$(readlink "${ENGINE_DIR:-/opt/1bit}/npu/kernels" 2>/dev/null || true)
+if [ "$_npu_sets" = 1 ]; then
+    _nv=$(npu_link_verdict 1 "${_npu_link:-}")
+    case "$_nv" in PASS*) pass npu-kernels-beside-engine "${_nv#PASS }" ;; *) fail npu-kernels-beside-engine "${_nv#FAIL }" ;; esac
+else
+    skip npu-kernels-beside-engine "no ${NPU_SETS_DIR:-/data/npu/kernels} on this boot, so there is no set to link beside the engine"
+fi
+
 _HL_DIR=${PAYLOAD_DIR:-/opt/1bit-package}
 if [ ! -d "$_HL_DIR" ]; then
     skip payload-home-layout "no $_HL_DIR on this system: the payload is not unpacked where an appliance keeps it, so its symlinks cannot be judged here - that is not evidence"

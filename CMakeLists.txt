@@ -994,7 +994,7 @@ add_dependencies(npu_sampling_test npu_stop_tokens_test)
 
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
-add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c)
+add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
 target_include_directories(npu_elf_args_test PRIVATE npu/forward/include)
 target_link_libraries(npu_elf_args_test PRIVATE m)
 add_test(NAME npu_elf_args COMMAND npu_elf_args_test)
@@ -1216,7 +1216,7 @@ add_test(NAME pack_check_generated_text COMMAND bash ${CMAKE_SOURCE_DIR}/tests/p
 # The engine's derived design set for a set of dims, as `ROLE M K N elf` lines.  The instrument the
 # parity test above needs: the plan generator must state the same kernels q4nx_derive_designs() does, and
 # comparing the two is the only way that can be checked rather than assumed (engine#803 A2a).
-add_executable(npu_derive_designs_dump tests/npu_derive_designs_dump.c npu/forward/src/q4nx_pack.c)
+add_executable(npu_derive_designs_dump tests/npu_derive_designs_dump.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
 target_include_directories(npu_derive_designs_dump PRIVATE npu/forward/include)
 target_link_libraries(npu_derive_designs_dump PRIVATE m)
 # q4nx_dequant.c joins this target: the fused chunks->int8 path (engine #1416) dequantises one tile at a time and
@@ -1235,7 +1235,7 @@ add_test(NAME npu_plan_designs_parity
 # (engine#808 review: the split moved the engine#845 pad into the target and left the host branch on the
 # raw A). The test's activation buffer carries a NaN guard tail, so an implementation that reads past the
 # buffer fails even when its numbers look plausible. Host-only, no model, no device.
-add_executable(host_gemm_pad_test tests/host_gemm_pad_test.c npu/forward/src/q4nx_pack.c)
+add_executable(host_gemm_pad_test tests/host_gemm_pad_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
 target_include_directories(host_gemm_pad_test PRIVATE npu/forward/include)
 target_link_libraries(host_gemm_pad_test PRIVATE m)
 add_test(NAME host_gemm_pad COMMAND host_gemm_pad_test)

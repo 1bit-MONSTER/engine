@@ -454,7 +454,14 @@ void XdnaTarget::prof_add(ProfAcc* acc, int design, double pack, double quant,
     // lane (engine #1582) looking for a fallback that does not exist. The batched body sets g_in_batch for
     // its whole duration, so accepting prof_pre_ there counts those launches and keeps a decode-only
     // measurement decode-only.
-    if (q4nx_lh::phprof_on() && (acc == prof_dec_ || q4nx_lh::g_in_batch) && !q4nx_lh::g_in_head) {
+    // The head is NEVER counted here, and that is the second half of this gate. `g_in_batch` stays set for the whole of
+    // step_batch, and the batched head (run_lm_head_rows -> note_head -> prof_add(&prof_head_, ...)) runs inside that
+    // window without setting g_in_head -- which only the single-row head does. So accepting "any accumulator while in a
+    // batch" put the head's device time into g_ph as well, where [bs] computes host = layers - gsum: the same time was
+    // then reported twice, once in gsum and once on the epilogue line's own h_* slices, and host was understated by it
+    // (it can go negative) on exactly the multi-row passes this line exists for. The head keeps its own accounting.
+    if (q4nx_lh::phprof_on() && acc != &prof_head_ &&
+        (acc == prof_dec_ || (q4nx_lh::g_in_batch && acc == prof_pre_)) && !q4nx_lh::g_in_head) {
         q4nx_lh::g_ph.g_pack += pack; q4nx_lh::g_ph.g_ql += quant;
         q4nx_lh::g_ph.g_wait += wait; q4nx_lh::g_ph.g_rb += rb;
         q4nx_lh::g_ph.launches++;

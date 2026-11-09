@@ -127,6 +127,7 @@ struct Plan {
     // the node's own initializer, reports a weightless graph for the 1.9 external-data packs (engine#1503).
     int64_t graph_ryzenai_matmuls = 0;
     int64_t graph_packed_siblings = 0;
+    int64_t graph_weightless_matmuls = 0;   // dropped: placeholder + packed sibling both byte-less (engine#1671)
     // How many of the graph's 4-bit block-128 weights satisfy length == N x (K/128 + 1) x 68 (the per-row stride the
     // .fconst tile also carries): a measurement, so `info` can say "201 of 201" or "3 of 7" instead of guessing.
     int64_t graph_stride_ok = 0, graph_stride_of = 0;

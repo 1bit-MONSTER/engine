@@ -1475,6 +1475,10 @@ std::string Plan::manifest() const {
         // following the node inputs alone reports zero real weights for a 9.7 GB pack (measured: phi-4, engine#1503).
         g["ryzenai_matmuls_ops"] = graph_ryzenai_matmuls;
         g["packed_weight_siblings"] = graph_packed_siblings;
+        // Matmuls dropped because neither their `*.empty` placeholder nor its `*.packed` sibling carried any bytes
+        // (engine#1671). Reported so a test can pin the drop without needing a 1.9 pack, and so `info` says how many
+        // graph weights this pack does not keep in its graph.
+        g["weightless_matmuls"] = graph_weightless_matmuls;
         if (graph_stride_of > 0)
             g["external_row_stride"] = {{"matched", graph_stride_ok}, {"of", graph_stride_of},
                                         {"rule", "length == N * (K/128 + 1) * 68"}};
@@ -1596,6 +1600,7 @@ Plan plan(const std::string& pack_dir) {
         }
         p.graph_ryzenai_matmuls = onnx.ryzenai_matmuls;
         p.graph_packed_siblings = onnx.packed_siblings;
+        p.graph_weightless_matmuls = onnx.weightless_matmuls;
         for (const auto& t : onnx.tensors)
             if (!t.location.empty()) p.graph_external++;
         if (!ext_file.empty()) {

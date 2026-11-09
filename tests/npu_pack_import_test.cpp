@@ -285,6 +285,22 @@ void test_external_packed_genre(const std::string& root) {
               "placeholder pair: the refusal names the placeholder, its sibling and the reason (" + what + ")");
     }
 
+    // The SAME graph, but with a Token .fconst beside it: now the weights have a source, so the drop is what makes the
+    // pack readable -- and this is the arm that pins the drop. Reverting it (the weightless node pushed back into the
+    // matmul list) leaves matmulnbits_ops at 1 here, because the node names a tensor with no bytes.
+    put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), std::string(4096, '\0'));
+    {
+        const json p3 = json::parse(pi::plan(dir.string()).manifest());
+        const json& g3 = p3["graph_weights"];
+        check(g3["weightless_matmuls"] == 1,
+              "placeholder pair: with an .fconst the weightless matmul is COUNTED (" +
+                  std::to_string(g3["weightless_matmuls"].get<int64_t>()) + ")");
+        check(g3["matmulnbits_ops"] == 0 && g3["packed_weight_siblings"] == 0,
+              "placeholder pair: and dropped from the matmul list, so nothing downstream reads a byte-less tensor "
+              "(engine#1671: this is the path a 1.9 pack takes, where the weights are in the .fconst)");
+    }
+    fs::remove(dir / "dd_metastate_Llm_Token_Token_crafted.fconst");
+
     // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
     write_data(stride * N - 68);
     write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N - 68);

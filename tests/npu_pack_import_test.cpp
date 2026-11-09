@@ -233,17 +233,20 @@ void test_external_packed_genre(const std::string& root) {
     const auto write_data = [&](int64_t packed_bytes) {
         put_file((dir / "eager-mm.onnx.data").string(), std::string(size_t(embed_bytes + packed_bytes), '\x22'));
     };
-    const auto write_graph = [&](const std::string& packed, int64_t packed_bytes) {
+    // `with_sibling = false` writes the placeholder with NO `*.qweight.packed` initializer at all -- the truncated-pack
+    // shape engine#1690's review is about, which is a different case from the byte-less sibling.
+    const auto write_graph = [&](const std::string& packed, int64_t packed_bytes, bool with_sibling = true) {
+        std::vector<std::string> inits{pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
+                                                  uint64_t(embed_bytes)),
+                                       pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
+                                       pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty")};
+        if (with_sibling)
+            inits.push_back(pb::tensor(packed, {packed_bytes}, "eager-mm.onnx.data", uint64_t(embed_bytes),
+                                       uint64_t(packed_bytes)));
         put_file((dir / "eager-mm.onnx").string(),
-                 pb::model({pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
-                                       uint64_t(embed_bytes)),
-                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
-                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty"),
-                            pb::tensor(packed, {packed_bytes}, "eager-mm.onnx.data", uint64_t(embed_bytes),
-                                       uint64_t(packed_bytes))},
-                           {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
-                                                    "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
-                                            K, N, 4, 128, "MatMulNBitsBf")}));
+                 pb::model(inits, {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
+                                                           "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
+                                                   K, N, 4, 128, "MatMulNBitsBf")}));
     };
 
     write_data(stride * N);
@@ -257,6 +260,73 @@ void test_external_packed_genre(const std::string& root) {
           "behind a placeholder)");
     check(g["external_row_stride"]["matched"] == 1 && g["external_row_stride"]["of"] == 1,
           "external-packed: the bytes fit length == N x (K/128 + 1) x 68, reported as a count");
+
+    // engine#1671: when the `*.packed` sibling is ALSO a placeholder (dims [0], no data), this graph carries no
+    // weight for that matmul at all -- and the node must be DROPPED rather than left naming the `.empty`
+    // placeholder. Left naming it, the reader calls bytes_of() on a byte-less tensor and throws
+    // "model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty: no data", which broke `npu-pack import` for every
+    // Ryzen AI 1.9 fconst pack: those declare all of their graph initializers this way (363 `.empty` and 363
+    // `.packed`, every one dims [0]) because the weights live in the Token .fconst.
+    write_data(0);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", 0);
+    {
+        // Both empty AND no .fconst: the weights are genuinely absent from this pack, so it is refused by name
+        // (#1687's rule) rather than reporting a capacity or tile-layout fault. The SAME graph imports fine from a
+        // Token .fconst -- that is the 1.9 shape, where every initializer is spelled this way and the weights live in
+        // the .fconst -- which `npu_pack_import_test <golden> <1.9 pack>` covers end to end with a real pack.
+        bool refused = false;
+        std::string what;
+        try {
+            (void)pi::plan(dir.string());
+        } catch (const std::exception& e) {
+            refused = true;
+            what = e.what();
+        }
+        check(refused, "placeholder pair: with no .fconst the pack is refused rather than read from a byte-less tensor");
+        check(what.find("qweight.empty") != std::string::npos && what.find("qweight.packed") != std::string::npos &&
+                  what.find("genuinely absent") != std::string::npos,
+              "placeholder pair: the refusal names the placeholder, its sibling and the reason (" + what + ")");
+    }
+
+    // The SAME graph, but with a Token .fconst beside it: now the weights have a source, so the drop is what makes the
+    // pack readable -- and this is the arm that pins the drop. Reverting it (the weightless node pushed back into the
+    // matmul list) leaves matmulnbits_ops at 1 here, because the node names a tensor with no bytes.
+    put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), std::string(4096, '\0'));
+    {
+        const json p3 = json::parse(pi::plan(dir.string()).manifest());
+        const json& g3 = p3["graph_weights"];
+        check(g3["weightless_matmuls"] == 1,
+              "placeholder pair: with an .fconst the weightless matmul is COUNTED (" +
+                  std::to_string(g3["weightless_matmuls"].get<int64_t>()) + ")");
+        check(g3["matmulnbits_ops"] == 0 && g3["packed_weight_siblings"] == 0,
+              "placeholder pair: and dropped from the matmul list, so nothing downstream reads a byte-less tensor "
+              "(engine#1671: this is the path a 1.9 pack takes, where the weights are in the .fconst)");
+    }
+    fs::remove(dir / "dd_metastate_Llm_Token_Token_crafted.fconst");
+
+    // engine#1690 review: a `*.empty` placeholder with NO `*.packed` sibling at all must KEEP its matmul. Dropping it
+    // empties onnx.matmuls, and an empty matmul list is what tells plan() "this is a 1.9 fconst pack, take the head
+    // from the tail" (:1685) -- so a truncated pack would silently get a tail head instead of #1687's refusal. The
+    // point of the arm is the count, not the refusal: with the drop the node is gone and `matmulnbits_ops` reads 0.
+    write_data(0);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", 0, /*with_sibling=*/false);
+    {
+        bool refused = false;
+        std::string what;
+        json g4;
+        try {
+            g4 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
+        } catch (const std::exception& e) {
+            refused = true;
+            what = e.what();
+        }
+        if (refused)
+            check(what.find("fconst") == std::string::npos,
+                  "placeholder with no sibling: any refusal is not the \"read the head from the tail\" path (" + what + ")");
+        else
+            check(g4["matmulnbits_ops"] == 1 && g4["weightless_matmuls"] == 0,
+                  "placeholder with no sibling: the matmul is KEPT, so the pack is not mistaken for a tail-head pack");
+    }
 
     // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
     write_data(stride * N - 68);
@@ -326,6 +396,44 @@ void test_external_packed_genre(const std::string& root) {
 // "<tensor>.qweight.empty: no data", which reports a placeholder as though the bytes were absent rather than elsewhere.
 // Crafted, so this needs no 1.9 pack: a graph with one resolvable tensor, one MatMulNBits whose qweight input is a
 // `.empty` placeholder with no sibling, and a model.bin next to it.
+// engine#1662: the ~291 MB canonical Token .fconst rewrite is skipped when the copy on the scratch path already holds
+// exactly the bytes this run would write. The decision is a length test against a length that is a function of the source
+// alone, so what can go wrong is the test being too willing -- a truncated copy from an interrupted run, a leftover
+// directory, a copy from a bigger pack. Those are the arms.
+void test_canonical_copy_reusable() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-reuse-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    auto write = [&](const fs::path& f, size_t n) {
+        std::ofstream o(f, std::ios::binary | std::ios::trunc);
+        const std::string blob(n, 'x');
+        o.write(blob.data(), std::streamsize(blob.size()));
+    };
+    const int64_t want = 4096;
+
+    write(dir / "complete.fconst", size_t(want));
+    check(pi::canonical_copy_reusable((dir / "complete.fconst").string(), want),
+          "reuse: a copy of exactly the expected length is reused");
+    write(dir / "short.fconst", size_t(want) - 1);
+    check(!pi::canonical_copy_reusable((dir / "short.fconst").string(), want),
+          "reuse: a truncated copy is rewritten, not trusted (interrupted run)");
+    write(dir / "long.fconst", size_t(want) + 1);
+    check(!pi::canonical_copy_reusable((dir / "long.fconst").string(), want),
+          "reuse: a longer copy (another pack) is not reused");
+    check(!pi::canonical_copy_reusable((dir / "absent.fconst").string(), want), "reuse: a missing copy is not reused");
+    fs::create_directories(dir / "a-directory");
+    check(!pi::canonical_copy_reusable((dir / "a-directory").string(), want),
+          "reuse: a directory on the scratch path is not reused");
+    check(!pi::canonical_copy_reusable((dir / "complete.fconst").string(), 0),
+          "reuse: a non-positive expected length never reuses");
+    write(dir / "empty.fconst", 0);
+    check(!pi::canonical_copy_reusable((dir / "empty.fconst").string(), 1),
+          "reuse: an empty copy is not the canonical form of a non-empty body");
+    fs::remove_all(dir, ec);
+    std::printf("  canonical copy reuse: 7 arms (complete/truncated/long/absent/directory/zero-length/empty)\n");
+}
+
 void test_modelbin_genre_refusal(const std::string& root) {
     const fs::path dir = fs::path(root) / "crafted-modelbin";
     fs::remove_all(dir);
@@ -2117,6 +2225,43 @@ static void dump_real_component(const std::string& dir) {
     }
 }
 
+// A multi-component pack (gemma-4 1.9, `type: compositemodel`) states its geometry in model_config.json's
+// config.model_attributes.text_config -- not in config.json (which is `{}`) nor in genai_config.json's decoder block
+// (which stops at head_size). Measured on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: hidden 1536, 35L, 8 heads,
+// 1 kv, head_dim 256, intermediate_size 6144, vocab 262144. Without this source the pack refuses with "the pack
+// states no intermediate_size", which is exactly what it did on the real pack.
+void test_model_config_geometry(const std::string& root) {
+    const fs::path dir = fs::path(root) / "modelcfg";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    // what the genai_config decoder block resolves on such a pack: everything but intermediate_size
+    nlohmann::json cfg = {{"hidden_size", 1536},        {"num_hidden_layers", 35}, {"num_attention_heads", 8},
+                          {"num_key_value_heads", 1},   {"head_dim", 256},         {"model_type", "gemma4"}};
+    put_file((dir / "model_config.json").string(),
+             R"({"type":"compositemodel","config":{"model_attributes":{"text_config":{)"
+             R"("hidden_size":1536,"num_hidden_layers":48,"num_attention_heads":16,"num_key_value_heads":8,)"
+             R"("head_dim":256,"intermediate_size":6144,"vocab_size":262144,)"
+             R"("max_position_embeddings":131072,"model_type":"gemma4_text"}}}})");
+    const int added = pi::fill_from_model_config(dir.string(), cfg);
+    check(added > 0, "model_config: the text tower's geometry is read from model_config.json (" + std::to_string(added) +
+                         " key(s) added)");
+    check(cfg.value("intermediate_size", 0) == 6144,
+          "model_config: intermediate_size comes from the text tower (6144)");
+    check(cfg.value("vocab_size", 0) == 262144 && cfg.value("max_position_embeddings", 0) == 131072,
+          "model_config: vocab and context come with it");
+    std::printf("model_config: added %d key(s), intermediate %d, vocab %d, layers %d (genai's value kept)\n", added,
+                cfg.value("intermediate_size", 0), cfg.value("vocab_size", 0), cfg.value("num_hidden_layers", 0));
+    check(cfg.value("hidden_size", 0) == 1536 && cfg.value("num_hidden_layers", 0) == 35 &&
+              cfg.value("num_attention_heads", 0) == 8,
+          "model_config: a value already resolved (genai's 1536/35/8) is NOT overridden by the tower's 1536/48/16");
+    // A pack without the file contributes nothing and reports nothing added.
+    fs::remove(dir / "model_config.json");
+    nlohmann::json cfg2 = {{"hidden_size", 1536}};
+    check(pi::fill_from_model_config(dir.string(), cfg2) == 0 && !cfg2.contains("intermediate_size"),
+          "model_config: no model_config.json adds nothing (the 1.6/gemma-3 shape is unchanged)");
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2131,6 +2276,7 @@ int main(int argc, char** argv) {
                     "these packs and not an OGA NPU pack this importer reads\n", pack.c_str());
     try {
         test_bounds();
+        test_canonical_copy_reusable();
         test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
@@ -2143,6 +2289,7 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
+        test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

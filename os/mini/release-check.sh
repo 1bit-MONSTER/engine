@@ -780,6 +780,48 @@ payload_runpath_verdict() {
     fi
 }
 
+# ── the payload's home-path LAYOUT (engine#1543, the fourth leak class) ─────────────────────────────────────────
+# The first three classes are about CONTENT - a path compiled into a map or a debug string, a build tree packaged as
+# bytes, a symbol table. The fourth is the path delivered as the FILESYSTEM LAYOUT: `bin/1bit` was an ABSOLUTE symlink
+# to /home/<builder>/wt/issue-709-build/1bit, so the image shipped the builder's home as a directory and every content
+# check passed. Discriminator measured on the shipped c33 SFS and on the leaking mini image: an absolute symlink whose
+# target RESOLVES TO A FILE under home|Users|root (0 in c33, 1 in the leaking image). Targets that are a directory or
+# absent are named but not failed - `root/spot -> /home/spot` is legitimate, and a payload scanned on a build host
+# cannot tell an image directory from a missing one.
+payload_home_layout_bad() {   # <payload dir> -> "relpath|TARGET|file|dir|dangling" per absolute home-targeting link
+    python3 - "$1" 2>/dev/null <<'PYSCAN'
+import os, sys
+root = sys.argv[1]
+HOMES = ('/home/', '/Users/', '/root/')
+for dp, dns, fns in os.walk(root):
+    for n in sorted(dns + fns):
+        p = os.path.join(dp, n)
+        if not os.path.islink(p):
+            continue
+        t = os.readlink(p)
+        if not t.startswith('/') or not t.startswith(HOMES):
+            continue
+        kind = 'file' if os.path.isfile(p) else ('dir' if os.path.isdir(p) else 'dangling')
+        print('%s|%s|%s' % (os.path.relpath(p, root), t, kind))
+PYSCAN
+}
+
+payload_home_layout_verdict() {   # <links resolving to a FILE> <links at a directory or absent> [<sample>]
+    _bad=${1:-} _other=${2:-} _s=${3:-}
+    case "${_bad}:${_other}" in
+        *[!0-9:]*) printf 'FAIL the home-path links in the payload could not be counted (%s:%s)' "${_bad:-empty}" "${_other:-empty}"; return 0 ;;
+    esac
+    if [ "$_bad" != 0 ]; then
+        printf 'FAIL %s absolute symlink(s) in the payload point into a home directory at a FILE%s - the image ships the build tree as its layout and no content check can see it' \
+            "$_bad" "${_s:+: $_s}"
+    elif [ "$_other" != 0 ]; then
+        printf 'PASS no payload symlink resolves to a builder FILE (0); %s name a home directory or an absent target%s - not this class, named so the count travels' \
+            "$_other" "${_s:+: $_s}"
+    else
+        printf "PASS no absolute symlink in the payload points into a home directory: the payload's layout carries no builder path"
+    fi
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -820,6 +862,16 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT"}}]}' 0 0)"
     check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' '' '')"
     # the RUNPATH rule (2026-11-08 incident): $ORIGIN only, and RPATH is always a fail.
+    check PASS "$(payload_home_layout_verdict 0 0 '')"
+    check FAIL "$(payload_home_layout_verdict 1 0 'bin/1bit|/home/x/wt/issue-709-build/1bit|file')"
+    check PASS "$(payload_home_layout_verdict 0 1 'root/spot|/home/spot|dangling')"
+    _hl_st=$(mktemp -d)
+    mkdir -p "$_hl_st/bin" "$_hl_st/opt"
+    ln -s /home/nonexistent-xyz/wt/build/1bit "$_hl_st/bin/leak"   # the class: absolute, target absent
+    ln -s ../opt/1bit/1bit "$_hl_st/bin/rel"                       # relative: not this class
+    ln -s /home/nonexistent-xyz "$_hl_st/opt/home"                 # a home directory target: named, not failed
+    check "bin/leak|/home/nonexistent-xyz/wt/build/1bit|dangling" "$(payload_home_layout_bad "$_hl_st" | grep '^bin/leak|')"
+    rm -rf "$_hl_st"
     check PASS "$(payload_runpath_verdict 0)"
     check FAIL "$(payload_runpath_verdict 3 '/opt/1bit-package/1bit/1bit runs /home/x/wt/release-rc/work/build')"
     check FAIL "$(payload_runpath_verdict 1)"
@@ -2136,6 +2188,20 @@ else
             PASS*) pass payload-runpath "${RP#PASS }" ;;
             *)     fail payload-runpath "${RP#FAIL }" ;;
         esac
+        # the layout class runs on the same unpacked payload, right after the content classes
+        _hl_bad=$(payload_home_layout_bad "$RUNDIR" 2>/dev/null); _hl_rc=$?
+        if [ "$_hl_rc" = 2 ]; then
+            skip payload-home-layout "the payload's symlinks could not be read here - that is not evidence"
+        else
+            _hl_nf=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 == "file"' | wc -l)
+            _hl_no=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 != "file"' | wc -l)
+            _hl_s=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | head -3 | tr '\n' ' ')
+            HL=$(payload_home_layout_verdict "${_hl_nf:-0}" "${_hl_no:-0}" "${_hl_s:-}")
+            case "$HL" in
+                PASS*) pass payload-home-layout "${HL#PASS }" ;;
+                *)     fail payload-home-layout "${HL#FAIL }" ;;
+            esac
+        fi
     fi
 fi
 

@@ -1987,7 +1987,15 @@ fi
 # to trust that a mode fix happened. A SKIP (not a failure) when the payload is not where an appliance keeps it, so the row can be
 # run off a stick.
 PDIR=${PAYLOAD_DIR:-/opt/1bit-package}
-if [ ! -d "$PDIR" ]; then
+# A clean mode count over an EMPTY payload proves nothing - and a directory that exists but holds nothing is exactly what an
+# interrupted extraction leaves behind (measured 2026-11-08: an `unsquashfs -d` with the wrong path argument produced 0 entries
+# and this row printed PASS over it). So the row checks its subject before it checks the modes: a real payload carries hundreds
+# of entries (c33: 263).
+_pm_entries=0
+[ -d "$PDIR" ] && _pm_entries=$(find "$PDIR" -mindepth 1 2>/dev/null | wc -l)
+if [ "$_pm_entries" -lt 100 ] 2>/dev/null; then
+    fail payload-modes "the payload at $PDIR holds only ${_pm_entries:-0} entries - a payload has hundreds (c33: 263), so this is an empty or interrupted unpack and a clean mode count over it would prove nothing"
+elif [ ! -d "$PDIR" ]; then
     skip payload-modes "no $PDIR on this system: the payload is not unpacked where an appliance keeps it, so its modes cannot be read"
 else
     _pm_f=$(find "$PDIR" -type f \( -perm -g+w -o -perm -o+w \) 2>/dev/null | wc -l)
@@ -2122,6 +2130,14 @@ PYSCAN
     fi
 }
 RUNDIR=${PAYLOAD_DIR:-/opt/1bit-package}
+# A payload with no ELF in it is an empty or interrupted unpack, not a clean RUNPATH set: the row would print
+# "ELF=0 non-$ORIGIN=0" and read as a pass over nothing. Same floor as payload-modes, for the same reason.
+_rp_elfs=0
+[ -d "$RUNDIR" ] && _rp_elfs=$(find "$RUNDIR" -type f -size +1k 2>/dev/null | head -400 | while IFS= read -r _f; do
+    head -c4 "$_f" 2>/dev/null | od -An -tx1 | tr -d ' \n' | grep -q '^7f454c46' && echo x; done | wc -l)
+if [ "${_rp_elfs:-0}" -lt 5 ] 2>/dev/null; then
+    fail payload-runpath "the payload at $RUNDIR holds ${_rp_elfs:-0} ELF(s) - a payload carries dozens (c33: 19 real ELFs plus 14 symlinks), so this is an empty or interrupted unpack and 'every RUNPATH is \$ORIGIN' would be true of nothing"
+fi
 if [ ! -d "$RUNDIR" ]; then
     skip payload-runpath "no $RUNDIR on this system: the payload is not unpacked where an appliance keeps it, so its RUNPATHs cannot be read"
 else

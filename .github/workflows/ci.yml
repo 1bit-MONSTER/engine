@@ -90,10 +90,15 @@ jobs:
         # and this workflow configures without it because the NPU runtime is private. Adding an unknown target
         # to `cmake --build --target ...` is a hard ninja error, so that is not the way to guard it. What this
         # job DOES build is `onebit_npu_forward_syntax`, an OBJECT library that compiles q4nx_forward.cpp and
-        # links nothing -- so the object is here, and the invariant that broke on 2026-11-08 (the three-argument
+        # links nothing -- so the object can be built here, and the invariant that broke on 2026-11-08 (the three-argument
         # `step_batch_embeds` was declared in the header and never defined, so `embeds_equiv_probe` failed to
         # link while every CI job stayed green) is checkable against it without the NPU configuration.
         run: |
+          # Built explicitly rather than relied on transitively: it IS built by the step above, because
+          # CMakeLists.txt:542 has `add_dependencies(onebit onebit_npu_forward_syntax)` -- but a check that
+          # depends on the order of another step's target list is the kind that goes quiet when that list is
+          # edited. One line here makes the object's existence this step's own precondition.
+          cmake --build build --target onebit_npu_forward_syntax
           OBJ=$(find build -name 'q4nx_forward.cpp.o' -path '*onebit_npu_forward_syntax*' | head -1)
           test -n "$OBJ" || { echo "the forward syntax object was not built"; exit 1; }
           decl=$(grep -c 'bool step_batch_embeds(' npu/forward/include/q4nx_forward.h)

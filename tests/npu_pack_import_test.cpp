@@ -1116,14 +1116,34 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     const std::string out = (fs::temp_directory_path() /
                              ("oga_pack_import_test." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
-    const pi::Report r0 = pi::import_pack(pack, out, pi::Options{});
+    // engine#1671: one unreadable tensor must report a FAILED CHECK, not end the run. `FAIL exception:` used to skip every
+    // check after it, so a pack leg that broke at the first refusal looked like a suite that had simply stopped talking --
+    // and the tensor that broke it was named in a message nobody could act on. The throw is still a failure, it is just
+    // attributed and survivable, so the rest of the pack's evidence is still collected.
+    auto import_or_fail = [&](pi::Options opt) {
+        try {
+            return pi::import_pack(pack, out, opt);
+        } catch (const std::exception& e) {
+            check(false, std::string("pack: the import must refuse by tensor name, not throw out of the pack leg: ") +
+                             e.what());
+            return pi::Report{};
+        }
+    };
+    const pi::Report r0 = import_or_fail(pi::Options{});
     check(refused.empty() ? (r0.refused.empty() && fs::exists(out + "/model.q4nx"))
                           : (!r0.refused.empty() && !fs::exists(out + "/model.q4nx")),
           "pack: without --allow-incomplete a container is written only when nothing is refused");
     fs::remove_all(out);
     if (golden_dir.empty()) { /* unreachable in practice */ }
 
-    const pi::Report r = pi::import_pack(pack, out, pi::Options{true});
+    const pi::Report r = import_or_fail(pi::Options{true});
+    // engine#1671: the head can legitimately be ABSENT. A 1.9 pack whose head is the `.fconst` tail is refused by name when the
+    // tail's arithmetic does not come out, and every check that asks for the head then has to say which case it is looking at --
+    // `m.tensor()` throwing skipped the rest of the pack leg, and the self-checks below silently reported 0 instead of saying
+    // they do not apply. One bool, from the report, so the container and the report are forced to agree.
+    const bool head_refused = std::any_of(r.refused.begin(), r.refused.end(), [](const std::string& why) {
+        return why.rfind("lm_head.weight", 0) == 0;
+    });
     // A container written with --allow-incomplete has to SAY what it is missing. The plan's manifest cannot
     // know what only the import discovers (a group that does not survive decode->encode, a nonempty bias
     // subvolume, a missing tail envelope), so the runtime refusals must be merged into it: attributed to the
@@ -1160,8 +1180,19 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
         }
         check(attributed, "pack: each runtime-refused tensor is marked imported=false in the manifest");
     }
-    check(r.lmhead_corr > 0.999, "pack: the decode reproduces the fp16 embedding (corr " +
-                                     std::to_string(r.lmhead_corr) + ")");
+    if (!head_refused) {
+        // The pack's own config.json says `tie_word_embeddings: true`, so a correlation below 1 is a DECODE problem, not
+        // an untied pack -- and the importer's heuristic (`selfcheck_tied = corr > threshold`) reports it as "this pack is
+        // untied", which is the misleading half of the same number. Both facts go in the message so the next reader does
+        // not have to rediscover the contradiction (engine#1671).
+        check(r.lmhead_corr > 0.999, "pack: the decode reproduces the fp16 embedding (corr " +
+                                         std::to_string(r.lmhead_corr) + "; the pack's config.json says " +
+                                         (qwen05b ? "tie_word_embeddings true, so this is the head decode, not an untied pack"
+                                                  : "nothing about tying here") +
+                                         (r.selfcheck_tied ? "" : ", and the importer reported it as untied"));
+    } else {
+        check(true, "pack: the head's embedding self-check does not apply -- the import refused lm_head.weight by name");
+    }
     check(r.ctrl_corr_nibble < 0.5 && r.ctrl_corr_nozp < 0.95,
           "pack: both wrong decoders are rejected as controls");
     // engine#1185: an imported container carries fp32 scale/zero (layout q4nx-2, npu/q4nx.h
@@ -1170,9 +1201,12 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     check(r.q4nx_rel == 0.0 && r.q4nx_max_abs == 0.0,
           "pack: container read back exactly, no bf16 parameter round trip (rel " +
               std::to_string(r.q4nx_rel) + ", max " + std::to_string(r.q4nx_max_abs) + ")");
-    check(r.zero_exact_pct == 100.0 && r.attn_zero_inexact_pct == 0.0 && r.mlp_zero_inexact_pct == 0.0,
-          "pack: every per-32-group scale/zero is the pack's own f32 value (" +
-              std::to_string(r.zero_exact_pct) + " %)");
+    if (!head_refused)
+        check(r.zero_exact_pct == 100.0 && r.attn_zero_inexact_pct == 0.0 && r.mlp_zero_inexact_pct == 0.0,
+              "pack: every per-32-group scale/zero is the pack's own f32 value (" +
+                  std::to_string(r.zero_exact_pct) + " %)");
+    else
+        check(true, "pack: the per-group scale/zero read-back does not apply either -- the head it compares was refused");
     // engine#734: the geometry is MEASURED from the anchors, so it holds for any hidden size
     check(r.stride > 0 && r.second_header > 0 && r.second_header < r.stride,
           "pack: the .fconst layer stride and second header were located (" +
@@ -1216,9 +1250,15 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
 
     // the container must open with the engine's own loader
     onebit::npu::Model m(out);
-    const auto& head = m.tensor("lm_head.weight");
-    check(head.shape.at(0) == int64_t((head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256)),
-          "pack: lm_head tile count matches the container");
+    // find(), not tensor(): `tensor()` throws "model has no tensor lm_head.weight", which ended the pack leg on a pack whose
+    // head the import had refused BY NAME -- the refusal is the evidence, and the exception hid it (engine#1671).
+    const onebit::npu::Tensor* head = m.find("lm_head.weight");
+    check((head != nullptr) != head_refused, head ? "pack: the container carries lm_head.weight and the import did not refuse it"
+                                                  : "pack: lm_head.weight is absent from the container only because the import "
+                                                    "refused it by name");
+    if (head)
+        check(head->shape.at(0) == int64_t((head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256)),
+              "pack: lm_head tile count matches the container");
     check(m.tensor("model.layers.0.input_layernorm.weight").shape.at(0) == p.dims.hidden,
           "pack: a layer norm is `hidden` bf16 values, whatever the hidden size");
     check(m.tensor("model.norm.weight").shape.at(0) == int64_t(p.dims.hidden),

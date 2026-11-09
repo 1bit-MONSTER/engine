@@ -2673,7 +2673,14 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // with, then the head's own 64-row tiles at K = hidden -- so `1,856 + (vocab/64) x tile(hidden)` has
             // to equal the tail length exactly. When that arithmetic does not hold the head is refused by name,
             // because reading the wrong offsets with confidence is worse than not reading them.
-            if (onnx.matmuls.empty()) {
+            //
+            // The question is "was a graph head WRITTEN", not "is the graph free of MatMulNBits nodes". On a pack whose
+            // graph carries 4-bit matmuls that are all projections, `onnx.matmuls.empty()` is false and no node matches
+            // N == V && K == H, so this whole path was skipped and the head was dropped with no refusal at all: the
+            // container came out without lm_head.weight and its manifest said `incomplete: []` (measured on
+            // amd/Qwen2.5-0.5B-Instruct_rai_1.9.0_npu, engine#1671). With head_written the tail is tried whenever the
+            // graph did not supply the head, and the else-branch refuses it by name instead of losing it.
+            if (!head_written) {
                 const int64_t tail_off = int64_t(p.dims.layers) * g.stride;
                 const int64_t tile = attn_tile_bytes(H);
                 const int64_t rows = V / kTileRows;

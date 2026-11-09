@@ -302,6 +302,11 @@ for cls, mid in (
     ("NanochronoForCausalLM", "tensin320/round14_5_114_fitleech_sn38-2023-01"),
     # issue #437 (2026-10-17): upstream-only architecture, after the pin.
     ("MuseSparkForConditionalGeneration", "Interchained/Muse-Spark-Open-816B-A42B-GGUF"),
+    # engine #1667 (2026-11-09): the two UNCOVERED classes the daily census raised that day, declined
+    # with their reasons in significant.json. report-only, because nothing a backend can read defines
+    # Liwet's router and nanoGPT's GPT is not GPT-2 under another name.
+    ("IndonesianChatLM", "fadhilahkhairogi/Liwet-400M-A188M-id-chat"),
+    ("GPT", "learner-subodh/Delivery-Rider-Assistant-SLM"),
     # DeepseekV41ForCausalLM used to be here (issue #522, reviewed report-only, "needs real
     # support: engram + candidate blocks"). Since pin 5e6388a5a it is *mapped* - the fork ships
     # the deepseek41 architecture - so it is asserted below as covered, not as report-only.

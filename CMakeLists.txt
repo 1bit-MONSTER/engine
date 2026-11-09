@@ -214,6 +214,15 @@ target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 add_executable(npu_load_retry_test tests/npu_load_retry_test.cpp)
 target_include_directories(npu_load_retry_test PRIVATE app)
 
+# The optional-op fallback seam (npu/model/op_dispatch.h, engine#803 A3): every op but `gemv` is optional, and the
+# model runs its own implementation when the target does not take it -- including when the target claims it and
+# fails. Header only, stub targets, no device and no runtime library, so it runs in CI.
+add_executable(npu_op_dispatch_test tests/npu_op_dispatch_test.cpp)
+target_include_directories(npu_op_dispatch_test PRIVATE npu)
+# ci.yml builds a named list of targets, so a test target that is not in it reports "Not Run" (#635); this lane's
+# token cannot edit the workflow. Hooking onto one that IS in the list gets it built there too.
+add_dependencies(npu_sampling_test npu_op_dispatch_test)
+
 # Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose target is
 # not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test serve_watchdog_test)
@@ -1029,8 +1038,8 @@ foreach(_onebit_reg IN LISTS ONEBIT_TEST_REGISTRATIONS)
     include(${_onebit_reg})
 endforeach()
 
-# RESOURCE_LOCK has to be applied after the registrations above: the loop is guarded by `if(TEST ...)`, so it
-# can only see tests that already exist -- which is what engine#1696 moved to the end of this file.
+# RESOURCE_LOCK has to be applied after the registrations above: the loop is guarded by `if(TEST ...)`, so it can
+# only see tests that already exist -- which is what engine#1696 moved to the end of this file.
 # ── Loopback ports: route tests run one at a time (engine#1070) ──────────────
 # Every test named below starts a server on 127.0.0.1. Most pick a port by binding :0, closing the
 # socket, then letting the child bind that number; three use fixed 43xxx literals. Under `ctest -j`

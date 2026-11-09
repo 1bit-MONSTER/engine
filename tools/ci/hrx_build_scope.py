@@ -116,7 +116,10 @@ def decide(changed_paths, cmake_diff, triggers=None):
     added = [l[1:] for l in cmake_diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
     removed = [l[1:] for l in cmake_diff.splitlines() if l.startswith("-") and not l.startswith("---")]
     if not added and not removed:
-        return "full", "CMakeLists.txt appears in the diff with no line changes (rename or mode change): not provable"
+        # The diff spans every registration file since #1744, so naming CMakeLists.txt here would misreport a mode
+        # change on cmake/tests-*.cmake -- and this tool's whole output is the reason string.
+        return "full", ("the registration file(s) appear in the diff with no line changes (rename or mode change): "
+                        "not provable")
     kinds_add = [classify_line(l) for l in added]
     kinds_del = [classify_line(l) for l in removed]
     for kind, lines in (("added", added), ("removed", removed)):

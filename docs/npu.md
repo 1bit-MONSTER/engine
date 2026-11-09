@@ -860,6 +860,18 @@ contract are the model; the reader is written from the pack-side facts in
 `amd-oss/npu-re/docs/FACTS-oga-pack-weight-layout.md`, and no vendor library, wheel or compiled
 program is called or shipped.
 
+**A pack can state its weights behind a placeholder.** The 1.9 generation's external-data packs (`phi-4`, and the
+`com.ryzenai:MatMulNBitsBf` family) name each weight through an initializer with no bytes —
+`model.layers.0.attn.o_proj.MatMulNBits.qweight.empty`, dims `[0]` — while the payload sits in a `…qweight.packed`
+sibling the node never references, inside the ordinary ONNX external data (`eager-mm.onnx.data`, 9.73 GB on `phi-4`). A
+reader that follows the node's inputs therefore sees zero-size tensors on a 9.7 GB pack, which is what made this genre look
+like a proprietary blob. `npu-pack info` resolves the sibling and reports it: `graph_weights.packed_weight_siblings`, the
+`ryzenai_matmuls_ops` count, and `graph_weights.external_row_stride: {matched, of, rule}` — the bytes fit
+`length == N × (K/128 + 1) × 68` on **201 of 201** of `phi-4`'s matmuls, and the 68-byte row-per-128-K-block is the same
+stride the `.fconst` attention tile already carries (2,176 B subvolume = 32 rows × 68 B). The FFN width for this genre comes
+from the node's own `N`/`K` (`gate_proj`/`up_proj` → N, `down_proj` → K), because the weight is a 1-D byte blob with no
+shape to read it from (engine#1503).
+
 **A pack can be the weights without the text.** AMD's `_rai_1.8.0_npu_4K` repos do publish the
 model's own `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, `merges.txt`,
 `chat_template.jinja`, `special_tokens_map.json`, `added_tokens.json` and `generation_config.json`,

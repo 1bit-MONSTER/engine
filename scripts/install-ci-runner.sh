@@ -275,8 +275,12 @@ if [ "$no_hold" = 0 ]; then
     # against a copy that cannot resolve the fleet default.
     tool_dir=$share_home/.local/bin
     if [ -d "$tool_dir" ] && [ -f "$(dirname "$0")/gpu-hold" ] && ! cmp -s "$(dirname "$0")/gpu-hold" "$tool_dir/gpu-hold"; then
-        install -m 0755 "$(dirname "$0")/gpu-hold" "$tool_dir/gpu-hold.new" &&
-            { [ -f "$tool_dir/gpu-hold" ] && cp -a "$tool_dir/gpu-hold" "$tool_dir/gpu-hold.bak-$(date +%Y%m%d-%H%M%S)"; }
+        # owned by the account whose tool it is, not by root: this script runs as root, and a root-owned file in
+        # ~/.local/bin can be replaced (the directory is theirs) but not edited in place by its owner
+        owner_group=$(id -gn "$owner_user")
+        install -m 0755 -o "$owner_user" -g "$owner_group" "$(dirname "$0")/gpu-hold" "$tool_dir/gpu-hold.new" &&
+            { [ -f "$tool_dir/gpu-hold" ] && cp -a "$tool_dir/gpu-hold" "$tool_dir/gpu-hold.bak-$(date +%Y%m%d-%H%M%S)" &&
+              chown "$owner_user:$owner_group" "$tool_dir"/gpu-hold.bak-*; }
         mv -f "$tool_dir/gpu-hold.new" "$tool_dir/gpu-hold"
         echo "installed scripts/gpu-hold over $tool_dir/gpu-hold (previous copy kept as a .bak-*), so every lane's default is the fleet's"
     fi

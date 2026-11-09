@@ -234,20 +234,30 @@ while [ "$state" = queued ]; do
     waited=$((waited + POLL))
 done
 
+KILLING="$QUEUE/.killing-$$"   # in the queue dir: TMPDIR can be stale on this box (engine#1604)
 deadline=$(( $(date +%s) + $(awk -v m="$MINUTES" 'BEGIN { printf "%d", m * 60 }') ))
 started=$(date +%s)
+# job control makes the payload its own process-group leader, so `$!` names a group that kill_tree can signal
+# as a whole (engine#1624). The job-control chatter ("[1]+ Terminated") is suppressed: it is not the tool's
+# output and the ticket log is read by people.
+set -m 2> /dev/null || log "warn: no job control, falling back to killing descendants only"
 "$@" &
 child=$!
 # The watchdog is a function so it can be given the command's pid: a subshell inherits a copy of the shell's
 # variables, so a watchdog started before the command (the first version did) holds an empty pid and neither
 # the abort nor the max hold stops anything.
 # End the hold's whole DESCENDANT TREE: TERM first so a runner can clean up after itself (thermal-run's
-# scope, a benchmark's teardown), then KILL after a grace period for anything that ignored it. Walking
-# `ps --ppid` is depth-agnostic; `pkill -P` reached only the first level, which is why three orphans
-# survived their tickets on 2026-11-08/09 — in each one the process holding the memory was two or three
-# levels down (ticket → shell → runner → server). A process group would express this too, but `setsid`
-# forks when it is already a group leader (which it is inside `systemd-run --scope`), so `$!` stops
-# naming the group; recursion has no such trap.
+# scope, a benchmark's teardown), then KILL after a grace period for anything that ignored it.
+#
+# Two mechanisms, because either one alone has a hole (engine#1624):
+#   * the process GROUP, because reparenting cannot move a process out of its group. The payload is started
+#     under job control (`set -m` below) so `$!` IS the group leader — `setsid` was rejected for this
+#     because it forks when the shell is already a group leader (which it is inside `systemd-run --scope`),
+#     so `$!` would stop naming the child;
+#   * a DESCENDANT SNAPSHOT taken once, before anything is signalled, because a child that calls `setsid`
+#     or double-forks leaves the group. The first version recomputed the tree for the KILL pass, and by then
+#     the root was dead: its children had been reparented, `descendants` returned the corpse only, and a
+#     TERM-ignoring grandchild survived its own ticket (reproduced in tests/gpu_hold_kill_tree.sh).
 descendants() {   # <pid> -> its descendants and then itself, deepest last
     local k
     for k in $(ps -o pid= --ppid "$1" 2> /dev/null); do
@@ -255,14 +265,34 @@ descendants() {   # <pid> -> its descendants and then itself, deepest last
     done
     printf '%s\n' "$1"
 }
+group_of() {   # <pid> -> the process group it is in, empty if the pid is gone
+    ps -o pgid= -p "$1" 2> /dev/null | tr -d ' '
+}
 kill_tree() {
-    local root=$1 grace=${2:-10} i=0 p
-    for p in $(descendants "$root"); do kill -TERM "$p" 2> /dev/null; done
-    while kill -0 "$root" 2> /dev/null && [ "$i" -lt "$grace" ]; do
+    local root=$1 grace=${2:-10} i=0 p tree alive pgid own
+    # snapshot BEFORE signalling: recomputing after the root dies finds nothing, because its children have
+    # been reparented by then (engine#1624)
+    tree=$(descendants "$root")
+    # the GROUP as well, but only when it is not ours: `-$pid` addresses the group the pid is in, and if the
+    # launch did not get its own group (no job control in this shell, a payload that changed group, ...) that
+    # is the queue shell's own group — signalling it would take the tool down with the ticket's leftovers.
+    # Measured 2026-11-09: without this guard the KILL pass killed the calling shell.
+    pgid=$(group_of "$root")
+    own=$(group_of $$)
+    [ -n "$pgid" ] && [ "$pgid" != "$own" ] || pgid=""
+    [ -n "$pgid" ] && kill -TERM -- "-$pgid" 2> /dev/null
+    for p in $tree; do kill -TERM "$p" 2> /dev/null; done   # the snapshot covers a child that left the group
+    # the grace is for ANY survivor, not for the root: the root dying is exactly when the interesting
+    # process is still alive
+    while [ "$i" -lt "$grace" ]; do
+        alive=""
+        for p in $tree; do kill -0 "$p" 2> /dev/null && alive="$alive $p"; done
+        [ -z "$alive" ] && break
         sleep 1
         i=$((i + 1))
     done
-    for p in $(descendants "$root"); do kill -KILL "$p" 2> /dev/null; done
+    [ -n "$pgid" ] && kill -KILL -- "-$pgid" 2> /dev/null
+    for p in $tree; do kill -KILL "$p" 2>/dev/null; done
 }
 
 watch() {
@@ -271,12 +301,16 @@ watch() {
         t=$(tctl)
         if [ "$t" -ge "$TCTL_ABORT" ]; then
             log "ABORT die at ${t}C (limit ${TCTL_ABORT}C)"
+            : > "$KILLING"          # in flight: the exit path must let this finish before it kills this process
             kill_tree "$target"
+            rm -f "$KILLING"
             return
         fi
         if [ "$(date +%s)" -ge "$deadline" ]; then
             log "max hold of ${MINUTES} min reached"
+            : > "$KILLING"
             kill_tree "$target"
+            rm -f "$KILLING"
             return
         fi
     done
@@ -290,8 +324,16 @@ rc=$?
 if [ "$rc" = 143 ] && [ "$(date +%s)" -ge "$deadline" ]; then rc=124; fi
 held=$(( $(date +%s) - started ))
 
-kill "$watchdog" 2> /dev/null
-wait "$watchdog" 2> /dev/null
+if [ -f "$KILLING" ]; then
+    # a kill_tree is in flight (abort / max hold): it TERMs, waits out its grace and then KILLs. Killing the
+    # watchdog here would cut the escalation short — measured: the payload dies on TERM, `wait` returns, and
+    # this line used to kill the watchdog before its KILL pass, which is why a TERM-ignoring child survived
+    wait "$watchdog" 2> /dev/null
+else
+    kill "$watchdog" 2> /dev/null
+    wait "$watchdog" 2> /dev/null
+fi
+rm -f "$KILLING"
 log "command exited $rc after ${held}s"
 release
 exit "$rc"

@@ -121,7 +121,12 @@ elapsed2=$(( $(date +%s) - start2 ))
 kill "$rpid" 2> /dev/null
 wait "$vpid" 2> /dev/null
 rc2=$?
-[ -f "$queue2/.reaped" ] || { echo "FAIL the reaper left no .reaped note"; fails=$((fails + 1)); }
+# the note is per ticket and the victim removes it after quoting it, so nothing accumulates in a shared queue dir
+[ -f "$queue2/.reaped.$vticket" ] && { echo "FAIL the victim did not remove its own .reaped note"; fails=$((fails + 1)); }
+case $(ls "$queue2" | grep -c '^\.reaped\.') in
+    0) ;;
+    *) echo "FAIL .reaped notes left behind in the queue"; fails=$((fails + 1)) ;;
+esac
 case $(cat "$work/log2") in
     *"[$vticket:"*"dropped by pid"*) ;;
     *"$vticket: owner pid"*) ;;

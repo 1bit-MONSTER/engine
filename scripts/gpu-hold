@@ -162,8 +162,10 @@ oldest_ticket() {
             # queue position that no longer existed. Leave a note in the queue directory (dotfiles are never treated
             # as tickets) so the victim can say WHY its ticket vanished, not only that it did.
             pid=$(pid_of "$QUEUE/$f")
+            # One file per ticket, not one shared log: the victim reads its own note and removes it, so the queue
+            # directory cannot accumulate notes for the life of the box (review note on PR #1636).
             printf '%s dropped %s: owner pid %s is gone (dropped by pid %s)\n' \
-                "$(date -Is)" "$f" "${pid:-unknown}" "$$" >> "$QUEUE/.reaped" 2> /dev/null
+                "$(date -Is)" "$f" "${pid:-unknown}" "$$" > "$QUEUE/.reaped.$f" 2> /dev/null
             rm -f "$QUEUE/$f"
             log "dropped stale ticket $f (owner pid gone)"
             continue
@@ -199,7 +201,8 @@ while [ "$state" = queued ]; do
         # can then never come true, and the wait would run to -w (5400 s by default) looking exactly like "queued
         # behind a busy box". Fail in this poll instead, and name what went missing. state=done first so the
         # release() trap does not touch a token this process never took.
-        why=$(grep -F " $TICKET_NAME:" "$QUEUE/.reaped" 2> /dev/null | tail -n 1)
+        why=$(cat "$QUEUE/.reaped.$TICKET_NAME" 2> /dev/null | tail -n 1)
+        rm -f "$QUEUE/.reaped.$TICKET_NAME" 2> /dev/null
         log "::error::my ticket $TICKET_NAME is gone from $QUEUE after ${waited}s (token: $(cat "$TOKEN" 2> /dev/null || echo free)) - it was reaped or removed, so this queue position no longer exists; not waiting ${WAIT}s for it${why:+ [$why]}"
         state=done
         exit 75

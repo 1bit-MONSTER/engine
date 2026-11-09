@@ -419,6 +419,7 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // it, so this row is one the arithmetic would have got wrong), and the header stride 117,862,720 is uniform over
     // all 32 blocks. This is the largest family on #1503 (31 packs). Measured by another lane on main, whose
     // table is keyed on geometry; merged here in the same form.
+    {4096, 32, 32, 12608, 5, 1, 2297856},
 };
 
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,

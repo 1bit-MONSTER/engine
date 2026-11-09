@@ -215,6 +215,73 @@ int q4_1f_tensors(const json& table) {
 // references. A reader that follows node inputs only reports a weightless graph for a 9.7 GB pack; one that sees the
 // sibling must also say whether the bytes fit the stride the .fconst tile already carries --
 // length == N x (K/128 + 1) x 68 -- as a count, not an assumption.
+// The external-data tile's own decode (engine#1503): a synthetic blob laid out the way the pack lays it out must come
+// back exactly, under BOTH code orderings -- the decoder's constant picks one, and the test holds each to the spec it
+// claims, so flipping the constant cannot silently change what the other branch means.
+void test_external_tile_decode() {
+    const int N = 128, K = 256;                       // 2 tiles of 64 rows, 2 K-blocks -> 3 subvolume pairs
+    const int64_t tiles = N / 64, per_tile = 2 * (K / 128 + 1);
+    const int64_t bytes = tiles * per_tile * 2176;
+    // A code matrix and per-block scale/zero-points to encode, then to find again.
+    std::vector<uint8_t> codes(size_t(N) * K);
+    for (size_t i = 0; i < codes.size(); ++i) codes[i] = uint8_t((i * 7 + i / 13) % 16);
+    const auto bf16_bits = [](float v) {
+        unsigned int u;
+        std::memcpy(&u, &v, 4);
+        return uint16_t((u + 0x8000u + ((u >> 16) & 1u)) >> 16);   // round to nearest even, as the importer does
+    };
+    const float scale_v = 0.0078125f;                  // exactly representable in bf16
+    const uint16_t scale16 = bf16_bits(scale_v);
+    for (const bool row_major : {false, true}) {
+    std::vector<uint8_t> blob(size_t(bytes), 0);
+    for (int64_t tile = 0; tile < tiles; ++tile)
+        for (int half = 0; half < 2; ++half)
+            for (int64_t kk = 1; kk <= K / 128; ++kk) {
+                uint8_t* subv = blob.data() + (tile * per_tile + kk * 2 + half) * 2176;
+                for (int r = 0; r < 32; ++r) {
+                    const int64_t row = tile * 64 + half * 32 + r;
+                    subv[2112 + r * 2] = uint8_t(scale16 & 0xFF);
+                    subv[2113 + r * 2] = uint8_t(scale16 >> 8);
+                    const uint8_t zp[4] = {5, 6, 7, 8};
+                    subv[2048 + r * 2] = uint8_t(zp[0] | (zp[1] << 4));
+                    subv[2049 + r * 2] = uint8_t(zp[2] | (zp[3] << 4));
+                    for (int c = 0; c < 128; ++c) {
+                        const uint8_t nib = codes[size_t(row) * K + (kk - 1) * 128 + c];
+                        if (row_major) {
+                            if (c % 2 == 0) subv[r * 64 + c / 2] = uint8_t((subv[r * 64 + c / 2] & 0xF0) | nib);
+                            else subv[r * 64 + c / 2] = uint8_t((subv[r * 64 + c / 2] & 0x0F) | (nib << 4));
+                        } else {
+                            const int cp = r / 2;      // one byte per column, holding the row pair 2cp / 2cp+1
+                            uint8_t& b = subv[(cp % 4) + c * 4 + (cp / 4) * 512];
+                            if (r % 2 == 0) b = uint8_t((b & 0xF0) | nib);
+                            else b = uint8_t((b & 0x0F) | (nib << 4));
+                        }
+                    }
+                }
+            }
+    std::string err;
+    const pi::Q4 q = pi::decode_external_tile(blob.data(), blob.size(), N, K, err, row_major);
+    check(err.empty() && q.N == N && q.K == K && q.block == 32,
+          "external tile: a blob of the measured size decodes (" + err + ")");
+    bool codes_ok = q.codes.size() == codes.size(), scale_ok = true, zero_ok = true;
+    for (size_t i = 0; codes_ok && i < codes.size(); ++i)
+        if (q.codes[i] != codes[i]) codes_ok = false;
+    for (size_t r = 0; r < size_t(N); ++r)
+        for (int g = 0; g < int(K / 32); ++g) {
+            if (q.scale[r * (K / 32) + g] != scale_v) scale_ok = false;
+            const uint8_t want = uint8_t(5 + g % 4);
+            if (q.zero[r * (K / 32) + g] != float(want)) zero_ok = false;
+        }
+    check(codes_ok, std::string("external tile: every 4-bit code comes back exactly, ") + (row_major ? "row-major" : "w8 interleave"));
+    check(scale_ok, "external tile: the per-row bf16 scale is repeated over the four 32-column groups");
+    check(zero_ok, "external tile: each group keeps its own int4 zero point");
+    std::string err2;
+    (void)pi::decode_external_tile(blob.data(), blob.size() - 2176, N, K, err2);
+    check(!err2.empty() && err2.find("is not") != std::string::npos,
+          "external tile: a blob one subvolume short is refused with the arithmetic (" + err2 + ")");
+    }
+}
+
 void test_external_packed_genre(const std::string& root) {
     const fs::path dir = fs::path(root) / "external-packed";
     fs::remove_all(dir);
@@ -1900,7 +1967,8 @@ int main(int argc, char** argv) {
                     "these packs and not an OGA NPU pack this importer reads\n", pack.c_str());
     try {
         test_bounds();
-        test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
+        test_external_tile_decode();
+    test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);

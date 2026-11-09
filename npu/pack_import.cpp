@@ -849,11 +849,21 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
         if (why) {
             const OnnxType ty = OnnxType(table->type);
             const char* fmt = ty == kF32 ? "f32" : ty == kF16 ? "f16" : ty == kBF16 ? "bf16" : "a non-float type";
-            *why = "embedding.onnx's " + table->name + " is " +
-                   (table->dims.size() == 2 ? std::to_string(table->dims.at(0)) + " x " +
-                                                  std::to_string(table->dims.at(1)) : std::string("not 2-D")) +
-                   " " + fmt + " with no *scales* tensor: that is the UNQUANTISED shape (gemma-4's), which this reader "
-                   "does not implement yet (engine#1725), not a component that is missing";
+            const bool wide = ty == kF32 || ty == kF16 || ty == kBF16;
+            const std::string shape = table->dims.size() == 2
+                                          ? std::to_string(table->dims.at(0)) + " x " + std::to_string(table->dims.at(1))
+                                          : std::string("not 2-D");
+            // Two different faults reached this branch once (engine#1743 review): a WIDE table with no scales is the
+            // gemma-4 unquantised shape, while a NARROW (1-byte) table with no scales is a quantised pair whose scales
+            // are missing -- saying "unquantised ... not a component that is missing" about the second sends the reader
+            // away from the actual fault, which is the same misleading-instrument class as reporting the first as absent.
+            *why = wide
+                       ? "embedding.onnx's " + table->name + " is " + shape + " " + fmt + " with no *scales* tensor: that "
+                             "is the UNQUANTISED shape (gemma-4's), which this reader does not implement yet "
+                             "(engine#1725), not a component that is missing"
+                       : "embedding.onnx's " + table->name + " is " + shape + " (" + fmt +
+                             ") and the component has no *scales* tensor: that is a QUANTISED table whose scale half is "
+                             "missing, which is a fault in the pack rather than the unquantised shape (engine#1725)";
         }
         return {};
     }

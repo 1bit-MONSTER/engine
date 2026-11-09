@@ -1858,6 +1858,29 @@ void test_unquantised_embedding_refusal(const std::string& root) {
               why.find("engine#1725") != std::string::npos,
           "f32 embedding: and states its shape, its type and which issue owns the missing reader");
     std::printf("  f32 embedding refusal: %s\n", why.c_str());
+
+    // engine#1743 review: the OTHER fault that reaches the same branch. A 1-byte table with no scales is a QUANTISED
+    // component whose scale half is missing -- a fault in the pack. Before this, both got the "UNQUANTISED shape
+    // (gemma-4's) ... not a component that is missing" message, which sends the reader away from the actual fault.
+    {
+        const fs::path q = fs::path(root) / "embed-q4-no-scales-1743";
+        fs::remove_all(q);
+        fs::create_directories(q);
+        const int64_t qV = 8, qH = 16;
+        std::string qdata(size_t(qV) * size_t(qH / 2), '\x12');
+        put_file((q / "embedding.onnx.data").string(), qdata);
+        const auto qt = pb::tensor("language_model.embed_tokens.weight_Q4", {qV, qH / 2}, "embedding.onnx.data", 0,
+                                   qdata.size(), 2);   // UINT8, exactly the quantised shape
+        put_file((q / "embedding.onnx").string(), pb::model({qt}, {}));
+        std::string qwhy;
+        const std::vector<float> qgot = pi::read_embedding_component(q.string(), &qwhy);
+        check(qgot.empty(), "q4 embedding with no scales: refused (" + std::to_string(qgot.size()) + " values)");
+        check(qwhy.find("QUANTISED table whose scale half is missing") != std::string::npos,
+              "q4 embedding with no scales: called a missing scale half, not the unquantised shape (" + qwhy + ")");
+        check(qwhy.find("UNQUANTISED") == std::string::npos,
+              "q4 embedding with no scales: and does NOT claim it is the unquantised gemma-4 shape");
+        std::printf("  q4-no-scales refusal: %s\n", qwhy.c_str());
+    }
     fs::remove_all(dir);
 }
 

@@ -159,6 +159,10 @@ int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg);
 // per-tensor or per-layer path, that parse is paid per call -- keep it to one call per plan.
 int intermediate_size_from_graph(const std::string& model_path, int64_t hidden);
 
+// Where a pack keeps its Token .fconst: the root for a flat pack, the decoder component `genai_config.json` names for a
+// multi-component one (`type: compositemodel`), whose geometry files stay at the root. Exported for the unit test.
+std::string find_token_fconst_exported(const std::string& pack_dir);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);

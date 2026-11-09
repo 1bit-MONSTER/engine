@@ -537,9 +537,39 @@ std::string find_one(const std::string& dir, const std::string& prefix, const st
 // Resolution order, and it never guesses: the 1.8 spelling first, so nothing that imports today changes; then a
 // *single* `Llm_Token_*` file. Two or more unmatched candidates is a pack shape we have not seen, and choosing the
 // alphabetically first would be a coin flip over the model's weights, so it is refused by name with the list.
+// defined with the hybrid line's graph resolution below; the fconst lookup uses it to find a component pack's decoder.
+std::string graph_filename(const std::string& pack_dir);
+
 std::string find_token_fconst(const std::string& dir, std::string* why = nullptr) {
     const std::string exact = find_one(dir, "dd_metastate_Llm_Token_Token_", ".fconst");
     if (!exact.empty()) return exact;
+    // A multi-component pack (`type: compositemodel`) keeps its LLM graph AND its Token .fconst in the component
+    // `genai_config.json` names (`decoder/`), while the config files that state the geometry stay at the pack root.
+    // #1644 taught `graph_filename()` to follow that relative path; the fconst lookup was still scanning only the root,
+    // so pointing npu-pack at the pack root reported "the pack carries no Token .fconst either" for a pack that has one
+    // two directories down. Same pack, same rule: look where the pack says its decoder is.
+    {
+        const std::string graph = graph_filename(dir);
+        const size_t slash = graph.rfind('/');
+        if (slash != std::string::npos) {
+            const std::string component = dir + "/" + graph.substr(0, slash);
+            std::error_code cec;
+            if (fs::is_directory(component, cec)) {
+                const std::string in_component = find_one(component, "dd_metastate_Llm_Token_Token_", ".fconst");
+                if (!in_component.empty()) return in_component;
+                const std::string pre2 = "dd_metastate_Llm_Token_", suf2 = ".fconst";
+                std::vector<std::string> c2;
+                for (const auto& e : fs::directory_iterator(component)) {
+                    const std::string n = e.path().filename().string();
+                    if (n.size() <= pre2.size() + suf2.size()) continue;
+                    if (n.compare(0, pre2.size(), pre2) != 0) continue;
+                    if (n.compare(n.size() - suf2.size(), suf2.size(), suf2) != 0) continue;
+                    c2.push_back(e.path().string());
+                }
+                if (c2.size() == 1) return c2.front();
+            }
+        }
+    }
     const std::string pre = "dd_metastate_Llm_Token_", suf = ".fconst";
     std::vector<std::string> cands;
     for (const auto& e : fs::directory_iterator(dir)) {
@@ -1115,6 +1145,8 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
     if (fused.size() != 1) return 0;
     return int(*fused.begin());
 }
+std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }
+
 int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg) {
     return fill_from_model_config_impl(pack_dir, cfg);
 }

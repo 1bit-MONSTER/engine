@@ -2393,6 +2393,36 @@ void test_im_from_node_attrs(const std::string& root) {
     fs::remove_all(dir);
 }
 
+
+// A multi-component pack (`type: compositemodel`) keeps its decoder graph AND its Token .fconst in the component
+// `genai_config.json` names, while the files that state the geometry stay at the pack root. Pointing npu-pack at the
+// root used to report "the pack carries no Token .fconst either" for a pack that has one two directories down (#1657).
+// Measured on amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: root has config/model_config/genai_config.json,
+// decoder/ has model.onnx, model.bin, model.onnx.data and dd_metastate_Llm_Token_….fconst (1.34 GiB).
+void test_fconst_in_component(const std::string& root) {
+    const fs::path dir = fs::path(root) / "compfconst";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "decoder");
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"type":"gemma4","decoder":{"filename":"decoder/model.onnx","hidden_size":1536}}})");
+    put_file((dir / "decoder" / "model.onnx").string(), pb::model({}, {}));
+    put_file((dir / "decoder" / "dd_metastate_Llm_Token_aie2_token_decoder.fconst").string(), std::string(64, '\x11'));
+    const std::string found = pi::find_token_fconst_exported(dir.string());
+    std::printf("component fconst: found %s\n", found.empty() ? "(nothing)" : found.c_str());
+    check(!found.empty() && found.find("decoder") != std::string::npos,
+          "component fconst: the Token .fconst is found where genai_config.json says the decoder is (" + found + ")");
+    // a flat pack is unchanged: the same filename at the root still wins
+    const fs::path flat = fs::path(root) / "flatfconst";
+    fs::remove_all(flat);
+    fs::create_directories(flat);
+    put_file((flat / "dd_metastate_Llm_Token_Token_layer0.fconst").string(), std::string(64, '\x22'));
+    const std::string flat_found = pi::find_token_fconst_exported(flat.string());
+    check(!flat_found.empty() && flat_found.find("Token_Token_") != std::string::npos,
+          "component fconst: a flat pack's root fconst is still found first (" + flat_found + ")");
+    fs::remove_all(dir);
+    fs::remove_all(flat);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2423,6 +2453,7 @@ int main(int argc, char** argv) {
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_im_from_node_attrs(golden_dir.empty() ? "." : golden_dir);
+        test_fconst_in_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);

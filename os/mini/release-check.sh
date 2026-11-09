@@ -2194,22 +2194,30 @@ else
             PASS*) pass payload-runpath "${RP#PASS }" ;;
             *)     fail payload-runpath "${RP#FAIL }" ;;
         esac
-        # the layout class runs on the same unpacked payload, right after the content classes
-        _hl_bad=$(payload_home_layout_bad "$RUNDIR" 2>/dev/null); _hl_rc=$?
-        if [ "$_hl_rc" = 2 ]; then
-            skip payload-home-layout "the payload's symlinks could not be read here - that is not evidence"
-        else
-            _hl_nf=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 != "dir"' | wc -l)
-            _hl_nd=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 == "dir"' | wc -l)
-            _hl_s=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 != "dir"' | head -3 | tr '\n' ' ')
-            [ "$_hl_nf" = 0 ] && [ -n "$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d')" ] && _hl_s=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | head -2 | tr '\n' ' ')
-HL=$(payload_home_layout_verdict "${_hl_nf:-0}" "${_hl_no:-0}" "${_hl_s:-}")
-            case "$HL" in
-                PASS*) pass payload-home-layout "${HL#PASS }" ;;
-                *)     fail payload-home-layout "${HL#FAIL }" ;;
-            esac
-        fi
     fi
+fi
+
+# The layout row gets the same subject check as the other payload rows (engine#1599 measured why): existence first,
+# so a host that simply has no payload SKIPs, then the subject, so an empty or interrupted unpack FAILs rather than
+# passing over nothing, and only then the row itself - once, in the else, so a subject failure never falls through.
+_HL_DIR=${PAYLOAD_DIR:-/opt/1bit-package}
+if [ ! -d "$_HL_DIR" ]; then
+    skip payload-home-layout "no $_HL_DIR on this system: the payload is not unpacked where an appliance keeps it, so its symlinks cannot be judged here - that is not evidence"
+elif [ "$(find "$_HL_DIR" -mindepth 1 2>/dev/null | wc -l)" -lt 100 ]; then
+    fail payload-home-layout "the payload at $_HL_DIR holds fewer than 100 entries - an empty or interrupted unpack has no layout to judge, and a green row here would be a pass over nothing (c33: 263 entries)"
+elif ! command -v python3 >/dev/null 2>&1; then
+    skip payload-home-layout "no python3 here, so the payload's symlinks cannot be read - that is not evidence"
+else
+    _hl_bad=$(payload_home_layout_bad "$_HL_DIR" 2>/dev/null)
+    _hl_nf=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 != "dir"' | wc -l)
+    _hl_nd=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 == "dir"' | wc -l)
+    _hl_s=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | awk -F'|' '$3 != "dir"' | head -3 | tr '\n' ' ')
+    [ "$_hl_nf" = 0 ] && [ -n "$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d')" ] && _hl_s=$(printf '%s\n' "${_hl_bad:-}" | sed '/^$/d' | head -2 | tr '\n' ' ')
+    HL=$(payload_home_layout_verdict "$_hl_nf" "$_hl_nd" "${_hl_s:-}")
+    case "$HL" in
+        PASS*) pass payload-home-layout "${HL#PASS }" ;;
+        *)     fail payload-home-layout "${HL#FAIL }" ;;
+    esac
 fi
 
 

@@ -405,6 +405,18 @@ quant, ctx 16384, `-fa on --cache-reuse 0`, 2026-11-05 16:06 and 17:11, `~/lb/su
 llamasrv-q31-prep/` and `...-ub512/`), so the cap was one of the limiters and not a detail. It is
 still not the whole gap.
 
+That 2.03x is a **Flash-Next result at ctx 16384 with this quant**, not a general rule about chunk
+size — and on a different model the direction reverses. On the dense prefill path `-ub 512` is
+already the optimum for pp4096: **2733-2765 tok/s** at 512 against **2442** at 256, **2182** at 1024,
+**1926** at 2048 and **1397** at 4096, and sclk is *higher* at 4096, so the fall-off is a
+memory-footprint cliff rather than a clock effect. Treat `-ub` as a per-model lever to be measured,
+never as "bigger is faster": on Flash-Next with 512 experts the MoE amortisation pays, on the dense
+path the footprint does not. Source for the dense rows:
+`~/okf/systems/1bit-monster/research/prefill-remainder-path-and-chunk-size.md` (commit `f8a4b9477`),
+which also closes the adjacent question — the hip-hrx dense-prefill add-on is on the serving path and
+is ~1.7x the generic fallback (forcing it off with `DENSE_TAKE_OFF=1` drops pp512 from 3462 to
+2002 tok/s), not a slow path to be avoided.
+
 Measured on Strix Halo, engine `0d0c846` + llama.cpp `8ee20a0`, `-ngl 99 -fa 1`, 2026-10-27T02:38Z,
 3 runs (`samples_ts` 287.384 / 286.933 / 285.578):
 

@@ -45,12 +45,14 @@ number about a model that never produced a logit.
 1bit forward-serve: forward init failed: embedding dtype q4_1 but dequant failed
 ```
 
-The dims are right (that is Qwen2.5-0.5B), so the container parses. What fails is the **quantized embedding**:
-`npu/forward/src/q4nx_forward.cpp:647` hands the tensor to `dequant_any()`, and `dequant_any` (`:181`) accepts exactly three chunk
-sizes — our 5120-byte q4_1 tile (`Q4NX_TILE_BYTES`), Q4_K, or Q8 — deriving the chunk size from `data_size / ntiles`. The OGA import
+The dims are right (that is Qwen2.5-0.5B), so the container parses. What fails is the **quantized embedding**: the embedding branch of
+`Q4nxNpuForward`'s init calls `dequant_any()` (`npu/forward/src/q4nx_forward.cpp`), and that function accepts exactly three chunk sizes
+— our 5120-byte q4_1 tile (`Q4NX_TILE_BYTES`), a Q4_K chunk, or a Q8 chunk — deriving the chunk size from `data_size / ntiles`; its
+caller raises `"embedding dtype … but dequant failed"` when the tensor is none of them. The OGA import
 writes the embedding as **q4_1 in the vendor's layout**, whose per-tile byte count is not one of the three, so the call falls through
 to the packed/tensor decoders and returns non-zero. That is a precise, repeatable diagnosis, not a guess: the same message appears
-with the same tensor on every attempt.
+with the same tensor on every attempt. (Line numbers are deliberately not quoted: this page has already been wrong once by naming a
+line that moved. The function names are stable, and `git log -S` finds them.)
 
 Two ways out, and they belong to different lanes: teach the import to write the embedding in a chunk our forward already reads (the
 import is where the vendor layout is known), or teach `dequant_any` the vendor's q4_1 embedding layout. Either unblocks gate 2; only

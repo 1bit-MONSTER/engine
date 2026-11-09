@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#
+# npu-hold [-t MINUTES] [-l LABEL] [-w WAIT_SECONDS] -- CMD [ARGS...]
+#
+# The NPU array's fair FIFO claim: gpu-hold's mechanism on the NPU's own queue/token. A lane that needs the array
+# runs its command under npu-hold and BLOCKS until its turn. The owner's Bonsai serve is managed by
+# npu-serve-keeper, which holds the token while the serve is up and stops it whenever a ticket is waiting.
+# Thermal gates are relaxed (the NPU does not heat the die the way the GPU does); max hold default 20 minutes.
+#
+# Two things this file exists to fix (engine#1701), both of them drift rather than logic:
+#
+#   * the queue, the token and the log follow ONEBIT_HOLD_DIR when that directory exists, exactly as
+#     scripts/gpu-hold does (engine#1504), so a runner under its own account queues on the SAME token as the
+#     owner's lanes instead of serialising against itself and being invisible to npu-serve-keeper. Without it
+#     the paths stay $HOME/NPU-*, which keeps a box that has not been set up unchanged.
+#   * the hold is taken by an INSTALLED gpu-hold, resolved in this order: $ONEBIT_GPU_HOLD, the copy the
+#     installer manages (~/.local/bin/gpu-hold), then this tree's scripts/gpu-hold. The owner's private copy
+#     drifted for three days on the survivor bound alone (engine#1639 / #1646); NPU work inherited every fix
+#     only when someone remembered to copy the file by hand.
+#
+# The queue/token settings are given to gpu-hold ONLY, never to CMD: a gpu-hold inside CMD (the hw-gate's own
+# GPU claim, a bench wrapper) must queue on the GPU, not on the NPU queue its parent already holds (that
+# deadlocked the c18 gate on 2026-10-31). Everything after -- runs with those variables unset.
+set -u
+HOLD=${ONEBIT_HOLD_DIR:-$HOME}
+if [ -n "${ONEBIT_HOLD_DIR:-}" ] && [ -d "${ONEBIT_HOLD_DIR}" ]; then
+    QUEUE=$HOLD/npu-queue; TOKEN=$HOLD/npu-token; LOG=$HOLD/npu-queue/.log
+else
+    QUEUE=$HOME/NPU-QUEUE; TOKEN=$HOME/NPU-TOKEN; LOG=$HOME/NPU-QUEUE/.log
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+if [ -n "${ONEBIT_GPU_HOLD:-}" ]; then GH=$ONEBIT_GPU_HOLD
+elif [ -x "$HOME/.local/bin/gpu-hold" ]; then GH=$HOME/.local/bin/gpu-hold
+else GH=$here/gpu-hold; fi
+opts=(); while [ $# -gt 0 ] && [ "$1" != -- ]; do opts+=("$1"); shift; done
+[ "${1:-}" = -- ] && shift
+[ $# -gt 0 ] || { echo "npu-hold: usage: npu-hold [-t MIN] [-l LABEL] [-w SEC] -- CMD [ARGS...]" >&2; exit 2; }
+exec env GPU_QUEUE_DIR="$QUEUE" GPU_TOKEN_FILE="$TOKEN" \
+    GPU_HOLD_MINUTES="${NPU_HOLD_MINUTES:-20}" GPU_HOLD_WAIT="${NPU_HOLD_WAIT:-7200}" \
+    GPU_HOLD_TCTL_START=90 GPU_HOLD_RELEASE_WAIT=0 GPU_HOLD_COOLDOWN=0 GPU_HOLD_IGNORE_THERMAL_HOLD=1 \
+    GPU_HOLD_LOG="$LOG" "$GH" "${opts[@]}" -- \
+    env -u GPU_QUEUE_DIR -u GPU_TOKEN_FILE -u GPU_HOLD_MINUTES -u GPU_HOLD_WAIT -u GPU_HOLD_TCTL_START \
+        -u GPU_HOLD_RELEASE_WAIT -u GPU_HOLD_COOLDOWN -u GPU_HOLD_IGNORE_THERMAL_HOLD -u GPU_HOLD_LOG "$@"

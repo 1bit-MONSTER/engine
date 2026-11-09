@@ -270,7 +270,18 @@ OnnxModel parse_onnx(const std::string& path) {
         else
             continue;
         const OnnxTensor* pw = find_init(packed);
-        if (!pw || no_bytes(*pw)) continue;
+        if (!pw) continue;         // no sibling at all: not this genre's pack, leave it to the reader below
+        if (no_bytes(*pw)) {
+            // engine#1671: the sibling exists and is ITSELF a zero-length placeholder (measured on
+            // Qwen2.5-0.5B-Instruct rai_1.9.0 -- dims [0], no external-data location, offset 0, length 0, for all 241
+            // of its MatMulNBits). So the weights are genuinely absent from the pack's external data, and the honest
+            // answer is a refusal that says that. Deferring it produced `...qweight.empty: no data` from a lookup much
+            // later, which names the placeholder rather than the problem and reads as a tile-layout fault.
+            throw std::runtime_error(
+                "the pack names " + w->name + ", and its " + packed + " sibling exists but carries no data either "
+                "(no external-data location, dims all zero): these weights are genuinely absent from the pack's "
+                "external data, so this pack cannot be imported -- not a tile-layout or block-size problem");
+        }
         mm.weight = pw->name;
         ++m.packed_siblings;
     }

@@ -2243,12 +2243,169 @@ std::string kernel_set_refusal(const std::vector<std::string>& file_names, const
     return "";
 }
 
+// The 1.9 external-data genre's importer (engine#1503): the pack stores each projection as one 4-bit blob and the
+// container stores per-role tensors, so this walks the graph's matmuls, decodes each blob, splits the fused qkv by
+// the geometry the pack states, and writes the same I8 tile chunks the .fconst route writes.
+//
+// Deliberately its own function rather than a fourth branch inside import_pack: that one is built around the
+// .fconst envelope (attention payload, MLP sections, tail) and the graph-weights path, and threading a third shape
+// through it is how the two existing paths got their special cases. What it shares is the parts that are genuinely
+// shared -- the plan, the geometry, the tile writer, the container metadata.
+Report import_external(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
+    const Plan p = plan(pack_dir);
+    const std::string graph = graph_filename(pack_dir);
+    const OnnxModel onnx = parse_onnx(pack_dir + "/" + graph);
+    std::error_code ec;
+    fs::create_directories(out_dir, ec);
+    if (ec) throw std::runtime_error("cannot create " + out_dir + ": " + ec.message());
+    Writer w;
+    w.dir = out_dir;
+    Report r;
+    r.out_dir = out_dir;
+    // The genre's bytes live in the external file, so map it once and slice per tensor (the same check import_pack
+    // makes: `need` must fit what the tensor declares, because a 4-bit blob deliberately does not satisfy
+    // product(dims) == length).
+    std::map<std::string, std::pair<const uint8_t*, size_t>> ext;
+    auto bytes_of = [&](const OnnxTensor& t, uint64_t need) -> const uint8_t* {
+        if (t.raw) {
+            if (need > t.raw_len)
+                throw std::runtime_error(t.name + ": needs " + std::to_string(need) + " B, carries " +
+                                         std::to_string(t.raw_len));
+            return t.raw;
+        }
+        auto it = ext.find(t.location);
+        if (it == ext.end()) {
+            size_t size = 0;
+            std::string why;
+            const uint8_t* m = map_file(pack_dir + "/" + t.location, size, &why);
+            if (!m) throw std::runtime_error(t.name + ": " + why);
+            it = ext.emplace(t.location, std::make_pair(m, size)).first;
+        }
+        if (need > t.length) throw std::runtime_error(t.name + ": needs " + std::to_string(need) + " B, declares " +
+                                                      std::to_string(t.length) + " in " + t.location);
+        if (uint64_t(t.offset) + need > it->second.second)
+            throw std::runtime_error(t.name + ": external data past the end of " + t.location);
+        return it->second.first + t.offset;
+    };
+    const int64_t L = p.dims.layers;
+    const int GH = int(p.dims.heads), GKV = int(p.dims.kv_heads), GHD = int(p.dims.head_dim);
+    for (const auto& mm : onnx.matmuls) {
+        const char* role = external_role_of(mm.weight);
+        if (!role) {
+            r.refused.push_back(mm.weight + ": no container role for this projection (the graph names something this "
+                                             "importer has not measured)");
+            continue;
+        }
+        const auto wi = onnx.index.find(mm.weight);
+        if (wi == onnx.index.end() || mm.N <= 0 || mm.K <= 0) {
+            r.refused.push_back(mm.weight + ": the graph names it but carries no bytes for it");
+            continue;
+        }
+        const OnnxTensor& wt = onnx.tensors[wi->second];
+        uint64_t need = 0;
+        if (!mul_ok(uint64_t(wt.length ? wt.length : wt.raw_len), 1, need) || need == 0)
+            throw std::runtime_error(mm.weight + ": no external length recorded");
+        std::string derr;
+        const Q4 pack = decode_external_tile(bytes_of(wt, need), size_t(need), int(mm.N), int(mm.K), derr);
+        if (!derr.empty()) throw std::runtime_error(mm.weight + ": " + derr);
+        const Q4 conv = container_from_external_q4(pack);
+        std::vector<ContainerTensor> outs;
+        std::string nerr;
+        if (!external_container_tensors(role, GH, GKV, GHD, outs, nerr)) {
+            r.refused.push_back(mm.weight + ": " + nerr);
+            continue;
+        }
+        // `model.layers.N.` from the graph's own name, so the container is keyed the way the forward looks it up.
+        std::string prefix;
+        if (const size_t at = mm.weight.find("layers."); at != std::string::npos) {
+            const size_t end = mm.weight.find('.', at + 7);
+            prefix = "model.layers." + mm.weight.substr(at + 7, end - at - 7) + ".";
+        }
+        for (const auto& one : outs) {
+            const int lo = one.row_lo, hi = one.row_hi > 0 ? one.row_hi : conv.N;
+            if (lo < 0 || hi > conv.N || hi <= lo)
+                throw std::runtime_error(mm.weight + ": container range [" + std::to_string(lo) + ", " +
+                                         std::to_string(hi) + ") does not fit N " + std::to_string(conv.N));
+            Q4 part;
+            part.N = hi - lo;
+            part.K = conv.K;
+            part.block = 32;
+            const int kg = conv.K / 32;
+            part.codes.assign(size_t(part.N) * part.K, 0);
+            part.scale.assign(size_t(part.N) * kg, 0.0f);
+            part.zero.assign(size_t(part.N) * kg, 0.0f);
+            for (int row = 0; row < part.N; ++row) {
+                std::memcpy(&part.codes[size_t(row) * part.K], &conv.codes[size_t(lo + row) * part.K], part.K);
+                std::memcpy(&part.scale[size_t(row) * kg], &conv.scale[size_t(lo + row) * kg], kg * sizeof(float));
+                std::memcpy(&part.zero[size_t(row) * kg], &conv.zero[size_t(lo + row) * kg], kg * sizeof(float));
+            }
+            std::vector<uint8_t> tiled;
+            long long pinexact = 0;
+            tile_q4_1_f32(part, tiled, &pinexact);
+            const int64_t nt = int64_t(tiled.size() / kImportTileBytes);
+            r.tiles += nt;
+            r.tensors++;
+            w.add(prefix + one.suffix, "I8", {nt, kImportTileBytes}, std::move(tiled));
+        }
+    }
+    if (!r.refused.empty()) {
+        if (!opt.allow_incomplete) throw std::runtime_error("external-data import refused: " + r.refused.front());
+        return r;
+    }
+    // The exact tensors the container also needs: the embedding and the norms, copied as BF16 (the container's form).
+    int64_t aux = 0;
+    for (const auto& t : onnx.tensors) {
+        const bool norm = t.name.find("layernorm.weight") != std::string::npos ||
+                          t.name == "model.norm.weight";
+        if (t.name != "model.embed_tokens.weight" && !norm) continue;
+        if (t.dims.empty()) continue;
+        uint64_t n = 1;
+        for (auto d : t.dims) n *= uint64_t(d);
+        if (n == 0) continue;
+        std::vector<int64_t> shape(t.dims.begin(), t.dims.end());
+        w.add(t.name, "BF16", shape, as_bf16(bytes_of(t, n * (t.type == kF32 ? 4 : 2)), t.type, size_t(n)));
+        ++r.tensors;
+        ++aux;
+    }
+    json c;
+    c["model_type"] = p.dims.model_type;
+    c["hidden_size"] = p.dims.hidden;
+    c["intermediate_size"] = p.dims.intermediate;
+    c["num_hidden_layers"] = p.dims.layers;
+    c["num_attention_heads"] = p.dims.heads;
+    c["num_key_value_heads"] = p.dims.kv_heads;
+    c["head_dim"] = p.dims.head_dim;
+    c["vocab_size"] = p.dims.vocab;
+    c["rope_theta"] = p.dims.rope_theta;
+    c["q4nx_parameters"] = "fp32 scale/zero per 32-column group";
+    c["q4nx_source"] = {{"kind", "oga-npu-pack external data"}, {"pack", p.pack},
+                        {"importer", "1bit npu-pack import"}, {"graph", graph},
+                        {"note", "weights decoded from *.qweight.packed via decode_external_tile; the code ordering is "
+                                 "kExtQuantsRowMajor's compile-time choice (engine#1503)"}};
+    json manifest;
+    manifest["format"] = "q4nx";
+    manifest["layout"] = "q4nx-2";
+    manifest["dims"] = {{"hidden_size", p.dims.hidden}, {"num_hidden_layers", p.dims.layers}};
+    w.finish(manifest);
+    std::ofstream cf(out_dir + "/config.json", std::ios::binary | std::ios::trunc);
+    if (!cf) throw std::runtime_error("cannot write " + out_dir + "/config.json");
+    cf << c.dump(2) << "\n";
+    std::fprintf(stderr, "npu-pack: external-data genre: %d tensors (%lld tiles, %lld exact)\n", r.tensors,
+                 (long long)r.tiles, (long long)aux);
+    return r;
+}
+
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
     const Plan p = plan(pack_dir);
     // Census yes, writer no (see the note where graph_weights is decided): this genre's weights are 1-D external-data
     // blocks, and until the repacker exists an import would write a container nothing can read. Refused here rather
     // than in plan(), because `info` must keep reporting the genre it can now see.
-    if (p.graph_packed_siblings > 0)
+    if (p.graph_packed_siblings > 0) {
+        // The genre has a writer now (engine#1503): decode -> convert -> split by role -> the same I8 tile chunks,
+        // with its own function because import_pack is built around the .fconst envelope.
+        return import_external(pack_dir, out_dir, opt);
+    }
+    if (false)
         throw std::runtime_error(
             "this pack keeps its 4-bit weights as external-data blocks (" + std::to_string(p.graph_packed_siblings) +
             " `*.qweight.packed` tensors behind `*.qweight.empty` placeholders, " + std::to_string(p.graph_stride_ok) +

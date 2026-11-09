@@ -42,19 +42,28 @@
 #   --user USER            dedicated user (default: ghrunner)
 #   --groups LIST          extra groups for that user (default: docker; use "" for none)
 #   --memory-max SIZE      MemoryMax for the unit (default: 48G); MemoryHigh is 90% of it
-#   --share-with USER      the existing user whose fleet state the jobs must keep using (default: the owner
-#                          account, bcloud). Its ~/lb, ~/.local/bin, ~/GPU-TOKEN, ~/GPU-QUEUE, ~/NPU-TOKEN
-#                          and ~/NPU-QUEUE are linked into the runner's home, and the runner's account joins
-#                          that user's group so it can write the queue. Without this a job would take ITS OWN
-#                          GPU token and run GPU work concurrently with every lane holding the real one
-#   --no-share             skip that (only for a box with no fleet to share with)
+#   --hold-state DIR       where the fleet's GPU/NPU token and queue files live (default /var/lib/1bit-fleet).
+#                          The installer creates it group-owned by --hold-group, mode 0770 with the setgid bit so
+#                          tickets inherit the group, and puts the runner's account in that group - NOT in the
+#                          owner's group. The unit is given GPU_TOKEN_FILE/GPU_QUEUE_DIR so the job queues with
+#                          the fleet instead of beside it, and the owner's own environment must name the same
+#                          two variables (docs/ci-runners.md, "One queue, two accounts"). A file inside the
+#                          owner's home cannot be shared this way: gpu-hold RELEASES with `rm -f "$TOKEN"`,
+#                          which needs write on the DIRECTORY, i.e. on the owner's home itself.
+#   --hold-group GROUP     the group that owns the hold state (default fleethold)
+#   --no-hold-state        leave the runner without hold state, for a runner that runs no hardware jobs (the
+#                          pr-agent runner does not: it talks to the local LLM over HTTP). A runner without it
+#                          must not run hw-gate/hrx-build, which is why the default is to set it up
+#   --migrate-hold-state   move an existing ~/GPU-TOKEN, ~/GPU-QUEUE, ~/NPU-TOKEN, ~/NPU-QUEUE of
+#                          --owner-user into --hold-state. Requires a quiet queue: it is the one step that
+#                          changes the paths under every running lane
 #   --env-file FILE        optional EnvironmentFile= for the unit
 #   --dry-run              print the unit and verify it, change nothing
 #   --verify               only report the installed unit's state
 set -euo pipefail
 
 name=strixhalo-engine labels=pr-agent user=ghrunner groups=docker memory_max=48G
-token_file='' runner_dir='' runner_version='' env_file='' share_with=bcloud no_share=0 dry=0 verify=0
+token_file='' runner_dir='' runner_version='' env_file='' hold_state=/var/lib/1bit-fleet hold_group=fleethold owner_user=bcloud no_hold=0 migrate=0 dry=0 verify=0
 usage() { sed -n '16,48p' "$0"; }
 
 while [ $# -gt 0 ]; do
@@ -68,8 +77,11 @@ while [ $# -gt 0 ]; do
         --groups) groups=$2; shift 2 ;;
         --memory-max) memory_max=$2; shift 2 ;;
         --env-file) env_file=$2; shift 2 ;;
-        --share-with) share_with=$2; shift 2 ;;
-        --no-share) no_share=1; shift ;;
+        --hold-state) hold_state=$2; shift 2 ;;
+        --hold-group) hold_group=$2; shift 2 ;;
+        --owner-user) owner_user=$2; shift 2 ;;
+        --no-hold-state) no_hold=1; shift ;;
+        --migrate-hold-state) migrate=1; shift ;;
         --dry-run) dry=1; shift ;;
         --verify) verify=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -99,8 +111,7 @@ Type=simple
 User=$user
 WorkingDirectory=$dir
 ExecStart=$dir/runsvc.sh
-# hw-gate.sh resolves gpu-hold with `command -v`, and the runner's PATH is what decides which token it takes
-Environment=PATH=/var/lib/$user/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+$( [ "$no_hold" = 0 ] && printf 'Environment=GPU_TOKEN_FILE=%s/gpu-token GPU_QUEUE_DIR=%s/gpu-queue\n' "$hold_state" "$hold_state" )
 $( [ -n "$env_file" ] && echo "EnvironmentFile=$env_file" )
 # runsvc.sh exits 0 after an OOM kill ("no retry needed"), so on-failure would leave the runner dead.
 Restart=always
@@ -201,43 +212,56 @@ if [ ! -f "$dir/.runner" ]; then
 fi
 chown -R "$user:" "$dir"
 
-# --- the fleet's state, at the paths the jobs already assume ---------------------------------------------
-# The workflows and scripts reach the box's shared state through $HOME: ~/lb/thermal-run.sh (the thermal
-# governor every build runs under), ~/.local/bin/gpu-hold (found with `command -v`), and the queue/token files
-# ~/GPU-TOKEN, ~/GPU-QUEUE, ~/NPU-TOKEN, ~/NPU-QUEUE. A runner whose home is empty therefore does not just lose
-# the tools - it takes a DIFFERENT GPU token and queues beside nobody, which is the one thing the fleet's hold
-# rule exists to prevent (engine #1504 review). So the runner's home carries the same absolute paths, linked
-# into the account that already holds them, and the runner joins that account's group to write the queue.
-if [ "$no_share" = 0 ]; then
-    id "$share_with" >/dev/null 2>&1 || { echo "install-ci-runner.sh: --share-with user '$share_with' does not exist (use --no-share on a box with no fleet)" >&2; exit 2; }
-    share_home=$(getent passwd "$share_with" | cut -d: -f6)
-    share_group=$(id -gn "$share_with")
-    id -nG "$user" | tr ' ' '\n' | grep -qx "$share_group" || usermod -aG "$share_group" "$user"
-    # the tools and the hold state, by name, only when they exist: an install on a box that has not set them
-    # up yet is not an error, it is a missing feature the docs name
-    for rel in lb .local/bin GPU-TOKEN GPU-QUEUE NPU-TOKEN NPU-QUEUE; do
-        src="$share_home/$rel" dst="/var/lib/$user/$rel"
-        if [ -e "$src" ]; then
-            mkdir -p "$(dirname "$dst")"
-            [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ] && continue
-            if [ -e "$dst" ] && [ ! -L "$dst" ]; then
-                echo "warning: /var/lib/$user/$rel exists as a real path; leaving it (move it aside to share $src)" >&2
-                continue
-            fi
-            ln -sfn "$src" "$dst"
-            echo "shared: ~/$rel -> $src"
-        fi
+# --- the fleet's hold state, in a directory the fleet group owns -----------------------------------------
+# The workflows reach the hold through $HOME (~/GPU-TOKEN, ~/GPU-QUEUE, and npu-hold's hard-coded
+# ~/NPU-TOKEN, ~/NPU-QUEUE), and gpu-hold RELEASES a token with `rm -f "$TOKEN"` - a write to the DIRECTORY,
+# not to the file. So a hold file that stays inside the owner's home cannot be shared with another account by
+# chgrp'ing the file: either the runner is in the owner's group, which is group-write on the owner's whole home
+# (/home/bcloud is 0775 here, so a job could replace ~/.bashrc or move ~/.ssh aside - an owner-level escalation
+# created by a recipe whose point is that jobs no longer run as the owner), or the file is not shareable at all.
+#
+# So the hold state moves to a directory the FLEET group owns, and both sides name it:
+#   <hold-state>/{gpu-token,gpu-queue,npu-token,npu-queue}   group-owned, 0770, queues setgid so tickets
+#                                                            created by either account inherit the group
+# The runner's account joins THAT group and nothing else; the shared tools (~/lb, ~/.local/bin) are already
+# world-readable and executable, so no group is needed to run them.
+if [ "$no_hold" = 0 ]; then
+    getent group "$hold_group" >/dev/null 2>&1 || groupadd --system "$hold_group"
+    id -nG "$user" | tr ' ' '\n' | grep -qx "$hold_group" || usermod -aG "$hold_group" "$user"
+    install -d -m 0770 -g "$hold_group" "$hold_state" "$hold_state/gpu-queue" "$hold_state/npu-queue"
+    chmod g+s "$hold_state/gpu-queue" "$hold_state/npu-queue"
+    for f in gpu-token npu-token; do
+        [ -e "$hold_state/$f" ] || install -m 0660 -g "$hold_group" /dev/null "$hold_state/$f"
+        chgrp "$hold_group" "$hold_state/$f"; chmod 0660 "$hold_state/$f"
     done
-    # the queue and the token files must be writable by the runner's new group; the modes are the owner's, so
-    # they are tightened here rather than left to chance (0775 dir / 0664 file: group read+write, no world)
-    [ -d "$share_home/GPU-QUEUE" ] && chgrp -R "$share_group" "$share_home/GPU-QUEUE" && chmod -R g+rwX,o-rwx "$share_home/GPU-QUEUE"
-    [ -d "$share_home/NPU-QUEUE" ] && chgrp -R "$share_group" "$share_home/NPU-QUEUE" && chmod -R g+rwX,o-rwx "$share_home/NPU-QUEUE"
-    for f in GPU-TOKEN NPU-TOKEN; do
-        if [ -f "$share_home/$f" ]; then chgrp "$share_group" "$share_home/$f"; chmod g+rw,o-rw "$share_home/$f"; fi
-    done
-    # thermal-run.sh runs under `systemctl --user`, so the account needs a user manager of its own
-    loginctl enable-linger "$user" 2>/dev/null || echo "warning: could not enable-linger $user; thermal-run.sh will use its process-group fallback"
-    echo "shared state: $share_with's group ($share_group), queue and token files group-writable"
+    if [ "$migrate" = 1 ]; then
+        owner_home=$(getent passwd "$owner_user" | cut -d: -f6)
+        [ -n "$owner_home" ] || { echo "install-ci-runner.sh: --migrate-hold-state needs --owner-user that exists" >&2; exit 2; }
+        # a live queue is not a thing to move under the lanes: refuse unless it is empty
+        [ -z "$(ls -A "$owner_home/GPU-QUEUE" 2>/dev/null)" ] || {
+            echo "install-ci-runner.sh: $owner_home/GPU-QUEUE is not empty: let the queue drain before migrating (or migrate by hand)" >&2; exit 1; }
+        for pair in "GPU-TOKEN:gpu-token" "NPU-TOKEN:npu-token"; do
+            src="$owner_home/${pair%%:*}"; dst="$hold_state/${pair##*:}"
+            [ -s "$src" ] && cp -a "$src" "$dst" && chgrp "$hold_group" "$dst" && chmod 0660 "$dst" && rm -f "$src"
+        done
+        for pair in "GPU-QUEUE:gpu-queue" "NPU-QUEUE:npu-queue"; do
+            src="$owner_home/${pair%%:*}"; dst="$hold_state/${pair##*:}"
+            [ -d "$src" ] && { cp -a "$src/." "$dst/" 2>/dev/null || true; rm -rf "$src"; }
+        done
+        chgrp -R "$hold_group" "$hold_state"; chmod -R g+rwX,o-rwx "$hold_state"
+        echo "migrated the hold state from $owner_home into $hold_state"
+    fi
+    # the owner's side has to name the same two paths, or the runner queues with the fleet's files and the
+    # owner's lanes with their own - which is the bug this whole block exists to prevent
+    cat > /etc/profile.d/1bit-fleet.sh <<PROFILE
+# engine #1504: one hold queue for the fleet. gpu-hold reads both variables; npu-hold wraps gpu-hold and
+# hard-codes \$HOME/NPU-*, so NPU sharing needs that wrapper changed (docs/ci-runners.md).
+export GPU_TOKEN_FILE=$hold_state/gpu-token
+export GPU_QUEUE_DIR=$hold_state/gpu-queue
+PROFILE
+    echo "hold state: $hold_state (group $hold_group, 0770, queues setgid); $user joined $hold_group"
+    echo "the owner's shells pick up GPU_TOKEN_FILE/GPU_QUEUE_DIR from /etc/profile.d/1bit-fleet.sh;"
+    echo "a long-running owner service needs them in its own unit or environment (docs/ci-runners.md)"
 fi
 
 unit_text > "$unit_path"

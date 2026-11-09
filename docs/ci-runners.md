@@ -105,32 +105,50 @@ per-account (a job cannot use the owner's keys to push, and its `$HOME` writes a
 wanted too, that is `chmod o-rx /home/bcloud` — the owner's call, because it changes the box for every other lane
 as well.
 
-### The fleet's shared state, which the jobs assume is in `$HOME`
+### One queue, two accounts
 
-The workflows and the scripts they call reach the box's shared state through `$HOME`, so a runner with an empty
-home does not merely lose the tools — **it takes a different GPU token**:
+The workflows reach the box's hold state through `$HOME`: `~/GPU-TOKEN`, `~/GPU-QUEUE` (and `npu-hold`, which
+hard-codes `~/NPU-TOKEN` and `~/NPU-QUEUE` around `gpu-hold`). A runner with a different home therefore does not
+merely lose `thermal-run.sh` — it takes **its own** GPU token, and the hardware gate then runs GPU work
+concurrently with whatever lane holds the real one, which is the one thing the hold rule exists to prevent.
 
-| the jobs use | via |
-|---|---|
-| `~/lb/thermal-run.sh` (`hrx-build.yml:111,132`, `hw-gate.yml:33-34`) | the thermal governor every build runs under |
-| `gpu-hold`, `npu-hold` | `command -v`, i.e. `~/.local/bin` on `PATH` (`hw-gate.sh:53-88`) |
-| `~/GPU-TOKEN`, `~/GPU-QUEUE`, `~/NPU-TOKEN`, `~/NPU-QUEUE` | the token files the whole fleet queues on |
+The obvious repair — put the runner's account in the owner's group — is wrong, and the review of this PR measured
+why: `/home/bcloud` is `0775`, so group write on the **directory** lets a job rename or replace any entry in it.
+A job could rewrite `~/.local/bin/gpu-hold` (which every lane then executes), replace `~/.bashrc`, or move
+`~/.ssh` aside and put its own directory in its place. That is an owner-level code path created by a recipe whose
+whole point is that jobs no longer run as the owner.
 
-Run as `ghrunner` with an empty home, `command -v gpu-hold` finds nothing (or the repo copy beside the script),
-`~` resolves to `/var/lib/ghrunner`, and the hardware gate then queues on **its own** token file while every
-other lane holds the real one — GPU work running concurrently with a holder, which is exactly what the "devices
-only via gpu-hold" rule exists to prevent.
+So the hold state lives in its own directory, owned by its own group:
 
-So the installer links those six paths from the runner's home into the account that already has them
-(`--share-with`, default `bcloud`), puts the runner's account in that account's group, makes the queue
-directories and token files group-writable (removing world access), sets `PATH` in the unit so `command -v`
-resolves the shared `gpu-hold`, and enables lingering for the runner's user so `thermal-run.sh`'s
-`systemctl --user` has a user manager to talk to. `--no-share` skips all of that, for a box with no fleet.
+```
+/var/lib/1bit-fleet/          0770 fleethold, setgid
+  gpu-token                   0660 fleethold     <- what gpu-hold writes, and rm -f's on release
+  gpu-queue/                  0770 fleethold, setgid   <- tickets inherit the group
+  npu-token, npu-queue/
+```
 
-What that deliberately does **not** share is `~/.cache`, which is `0700` on the owner's account: the persistent
-build trees (`~/.cache/hrx-build/bench`, `~/.cache/hw-gate`) and the `pr-agent-venv-*` environments therefore
-move, and the first runs on a fresh install are cold — `hrx-build`'s "rebuild only what changed" starts from
-zero once.
+- `ghrunner` joins **`fleethold` and nothing else**. The shared tools (`~/lb`, `~/.local/bin`) are already
+  world-readable and executable, so no group is needed to *run* them — only the hold files need the group.
+- The unit gets `Environment=GPU_TOKEN_FILE=/var/lib/1bit-fleet/gpu-token GPU_QUEUE_DIR=/var/lib/1bit-fleet/gpu-queue`,
+  which `gpu-hold` honours, so a job queues with the fleet.
+- **The owner's side has to name the same two paths**, or the split simply reappears in the other direction. The
+  installer writes `/etc/profile.d/1bit-fleet.sh` exporting them for the owner's shells; a long-running owner
+  service needs them in its own unit or environment.
+- **Why a shared *file* inside the owner's home cannot work at all:** `gpu-hold` releases with
+  `rm -f "$TOKEN"`, a write to the containing **directory**. `chgrp` on the file is not enough, and a symlink is
+  worse — `rm` removes the link and leaves the real token held for ever.
+- `npu-hold` wraps `gpu-hold` with `exec env GPU_QUEUE_DIR=~/NPU-QUEUE GPU_TOKEN_FILE=~/NPU-TOKEN …`, so it
+  overrides whatever the environment says: **NPU sharing needs that wrapper changed** to honour the two
+  variables. Until then the NPU queue is per-account, and that is a named follow-up rather than a claim.
+- `--no-hold-state` exists for a runner that runs no hardware jobs — the `pr-agent` runner does not (it talks to
+  the local LLM over HTTP on `127.0.0.1:8090`), so it needs none of this.
+- `--migrate-hold-state` moves an existing `~/GPU-{TOKEN,QUEUE}`, `~/NPU-{TOKEN,QUEUE}` into `/var/lib/1bit-fleet`,
+  and **refuses when the queue is not empty**: moving a live queue out from under the lanes is not a step to
+  take blind.
+
+What is deliberately **not** shared is `~/.cache`, which is `0700` on the owner's account: the persistent build
+trees (`~/.cache/hrx-build/bench`, `~/.cache/hw-gate`) and the `pr-agent-venv-*` environments move, so the first
+runs on a fresh install are cold — `hrx-build`'s "rebuild only what changed" starts from zero once.
 
 What it still needs, and the honest price of each:
 
@@ -138,7 +156,7 @@ What it still needs, and the honest price of each:
 |---|---|---|
 | `docker` group | the bench jobs run containers (podman/docker images for the distro proofs) | **docker group is root-equivalent** — a job that runs `docker run -v /:/h …` can read the box. It is narrower than the owner's account but not a sandbox |
 | `render` (or `video`) group | `/dev/kfd` and `/dev/dri/renderD*` at `0660` for the GPU jobs | device access only |
-| the fleet group (the owner's primary group) | the shared `~/lb`, `~/.local/bin` and the queue/token files above | jobs write the real queue, so a runner is a full member of the fleet, not a bystander — which is the point |
+| `fleethold` (its own group) | write the hold state in `/var/lib/1bit-fleet` | the runner can write the queue and the token files **and nothing else** — not the owner's home, not the tools it runs |
 
 If that trade is not wanted, the next step is rootless podman (or a docker socket proxy that only allows the
 images the workflows name) and dropping the `docker` group — that is a change to the workflows, not to this
@@ -162,7 +180,14 @@ sudo scripts/install-ci-runner.sh --name strixhalo-engine --labels pr-agent \
 sudo scripts/install-ci-runner.sh --name strixhalo-bench --labels bench \
      --token-file /root/runner-token --runner-dir /srv/actions-runner-2.329.0
 sudo rm -f /root/runner-token
+
+# 4. the owner's own lanes must name the same hold state (the installer writes this file); a long-running
+#    owner service needs the two variables in its own unit instead
+. /etc/profile.d/1bit-fleet.sh
 ```
+
+On a box that already has hold state in the owner's home, add `--migrate-hold-state --owner-user <name>` to the
+first install — with the queue drained, which the installer enforces.
 
 `--dry-run` prints the unit and runs `systemd-analyze verify` on it without changing anything; `--verify` prints
 the installed unit's `Result`/`NRestarts`/`OOMPolicy` and exits. The script is idempotent: an existing `ghrunner`

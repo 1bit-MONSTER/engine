@@ -432,6 +432,32 @@ void test_crafted_refusals(const std::string& root) {
               "crafted: the refusal names the qweight tensor (" + what + ")");
     }
     check(!fs::exists(dir / "out2" / "model.q4nx"), "crafted: nothing written for the overstated MatMulNBits");
+
+    // 3. engine#1671: a node names a `.qweight.empty` placeholder and its `.qweight.packed` sibling exists but is
+    // ITSELF empty (dims [0], no external-data location). The weights are genuinely absent, so the refusal must say
+    // so and name the tensor -- not defer to a `no data` lookup much later, which named the placeholder and read as
+    // a tile-layout fault. Measured on Qwen2.5-0.5B-Instruct rai_1.9.0, whose 241 MatMulNBits are all this shape.
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {8, 8}, "model.onnx.data", 0, 256),
+                        pb::tensor("gguf_qweight.empty", {0}, "", 0, 0),
+                        pb::tensor("gguf_qweight.packed", {0}, "", 0, 0),
+                        pb::tensor("gguf_scales", {}, "model.onnx.data", 256, 1024),
+                        pb::tensor("gguf_zeros", {}, "model.onnx.data", 1280, 160)},
+                       {pb::matmulnbits("mm", {"x", "gguf_qweight.empty", "gguf_scales", "gguf_zeros"},
+                                        64, 512, 4, 128)}));
+    try {
+        const auto r = pi::import_pack(dir.string(), (dir / "out3").string(), allow);
+        check(false, "crafted: an empty .packed sibling was refused");
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        std::printf("  crafted packed-empty refusal: %s\n", what.c_str());
+        check(what.find("gguf_qweight.empty") != std::string::npos && what.find("gguf_qweight.packed") != std::string::npos,
+              "crafted: the refusal names the placeholder and its sibling (" + what + ")");
+        check(what.find("genuinely absent") != std::string::npos,
+              "crafted: and says the bytes are absent rather than reporting a tile/lookup fault (" + what + ")");
+    }
+    check(!fs::exists(dir / "out3" / "model.qnx") && !fs::exists(dir / "out3" / "model.q4nx"),
+          "crafted: nothing written for the empty .packed sibling");
     fs::remove_all(dir);
 }
 

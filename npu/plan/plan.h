@@ -162,6 +162,30 @@ struct Plan {
     std::string vision_merge = "none";    // "external" | "none"
     int vision_feature_dim = 0;
     bool takes_embeds() const { return inputs_kind == "embeds"; }
+    // The drafter the plan may name (engine#799 §1 `drafter {head path, k, tau, verify_rows, tree}`).  Absent means
+    // no drafter, which is what every plan written before this field means.  Descriptive, like `rope` and `kv`: the
+    // speculator (P6) reads it, and a plan that names a drafter this engine cannot drive is refused at the point that
+    // tries to drive it -- never silently served as plain decode, because a speculator with the wrong tau or k answers
+    // with different text for the same prompt and no error at all.
+    //
+    //   head        the draft head artifact, a BARE FILE NAME under the model dir (the same rule kv.hadamard.signs
+    //               follows: a plan must not be able to aim the loader at a file the command line did not name)
+    //   k           draft tokens per pass, >= 1
+    //   tau         the acceptance gate, 0 < tau <= 1
+    //   verify_rows rows the verifier checks per pass, >= 1 (4 in P6's design: one draft plus a leaf fill)
+    //   tree        "leaf" (P6's tree) or "none" (a plain chain)
+    std::string drafter_head;
+    int drafter_k = 0, drafter_verify_rows = 0;
+    double drafter_tau = 0.0;
+    std::string drafter_tree = "none";   // "leaf" | "none"
+    bool has_drafter() const { return !drafter_head.empty(); }
+    // When a GDN layer's recurrent state is committed (engine#799 §1 `state {gdn commit}`): "immediate" is every plan
+    // written before this field and is what the step path does today; "deferred" is the speculator's contract, where a
+    // rejected draft row must not leave its recurrence behind.  A target that cannot defer must refuse it by name:
+    // committing early and reporting the accepted tokens gives the right-looking text with a state that no future token
+    // agrees with.
+    std::string gdn_commit = "immediate";   // "immediate" | "deferred"
+    bool gdn_deferred() const { return gdn_commit == "deferred"; }
     // P7 (#806) part A: what the KV cache is stored as.  `f16` is every plan written before this field
     // existed, and stays the default for that reason.  `int8` stores that side as int8 with one fp32
     // scale per (head, token), taken AFTER a per-head Hadamard rotation -- the rotation is what makes one
@@ -384,6 +408,58 @@ struct Plan {
                     throw PlanError("plan: " + path + " inputs.vision.feature_dim is " +
                                     std::to_string(p.vision_feature_dim) +
                                     " but inputs.vision.merge is none (no merge, no features)");
+            }
+        }
+        // The drafter (engine#799 §1).  Absent means no drafter; every stated field is checked, because a speculator
+        // with a plausible-but-wrong k/tau/rows answers different text for the same prompt with no error at all.
+        if (j.contains("drafter")) {
+            const auto& dr = obj(j, "drafter", path);
+            p.drafter_head = typed<std::string>(dr, "head", "drafter", path);
+            if (!p.drafter_head.empty() &&
+                (p.drafter_head.find('/') != std::string::npos || p.drafter_head.find("..") != std::string::npos))
+                throw PlanError("plan: " + path + " drafter.head \"" + p.drafter_head +
+                                "\" must be a bare file name (no directory part)");
+            if (dr.contains("k")) {
+                p.drafter_k = int_field(dr, "k", "drafter", path);
+                if (p.drafter_k < 1)
+                    throw PlanError("plan: " + path + " drafter.k " + std::to_string(p.drafter_k) +
+                                    " must be at least 1");
+            }
+            if (dr.contains("verify_rows")) {
+                p.drafter_verify_rows = int_field(dr, "verify_rows", "drafter", path);
+                if (p.drafter_verify_rows < 1)
+                    throw PlanError("plan: " + path + " drafter.verify_rows " +
+                                    std::to_string(p.drafter_verify_rows) + " must be at least 1");
+            }
+            if (dr.contains("tau")) {
+                if (!dr.at("tau").is_number())
+                    throw PlanError("plan: " + path + " drafter.tau must be a number");
+                p.drafter_tau = dr.at("tau").get<double>();
+                if (!(p.drafter_tau > 0.0 && p.drafter_tau <= 1.0))
+                    throw PlanError("plan: " + path + " drafter.tau " + std::to_string(p.drafter_tau) +
+                                    " is not in (0, 1] (it is an acceptance gate, not a temperature)");
+            }
+            if (dr.contains("tree")) {
+                p.drafter_tree = typed<std::string>(dr, "tree", "drafter", path);
+                if (p.drafter_tree != "leaf" && p.drafter_tree != "none")
+                    throw PlanError("plan: " + path + " drafter.tree \"" + p.drafter_tree +
+                                    "\" is not leaf or none");
+            }
+            // A named drafter with no k/tau/rows is a half-stated contract: the values exist to be checked against what
+            // the speculator actually does, so a plan that omits them cannot be honoured either.
+            if (p.has_drafter() && (p.drafter_k == 0 || p.drafter_verify_rows == 0 || p.drafter_tau == 0.0))
+                throw PlanError("plan: " + path +
+                                " names drafter.head but not k, verify_rows and tau (a drafter's numbers are part of "
+                                "its contract: the same prompt answers different text at a different tau)");
+        }
+        // When GDN state is committed (engine#799 §1).  Absent means immediate, which is what the step path does today.
+        if (j.contains("state")) {
+            const auto& st = obj(j, "state", path);
+            if (st.contains("gdn_commit")) {
+                p.gdn_commit = typed<std::string>(st, "gdn_commit", "state", path);
+                if (p.gdn_commit != "immediate" && p.gdn_commit != "deferred")
+                    throw PlanError("plan: " + path + " state.gdn_commit \"" + p.gdn_commit +
+                                    "\" is not immediate or deferred");
             }
         }
         // A second graph (a vision encoder, a projector) is deliberately NOT a plan field: one plan is one

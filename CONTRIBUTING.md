@@ -70,6 +70,10 @@ an RFC or issue.
 
 - **PR-Agent** reviews every pull request with a local model (Qwen3-Coder-30B-A3B) on the Strix Halo box
   (`.github/workflows/pr-agent.yml`); comment `/review`, `/describe`, `/improve` or `/ask` for more.
+- **The box's runners.** `pr-agent` and `hrx-build` run on Strix Halo's own self-hosted runners, because those
+  jobs need the GPU, the NPU and the local LLM. How they are installed — the dedicated user, the restart policy
+  and the OOM guard that engine [#1504](https://github.com/1bit-MONSTER/engine/issues/1504) asked for — is
+  [docs/ci-runners.md](docs/ci-runners.md).
 - **Issue agent** (`tools/issue_agent.py`) takes a first pass on issues opened by people outside the
   project: one label, a request for the bug-report fields when a bug skipped the form, a registry
   lookup for linked Hugging Face models, and a pointer to Q&A for questions. The model only picks

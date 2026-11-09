@@ -25,6 +25,7 @@
 // element-wise.
 #include "q4nx_forward.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
+#include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>   // mkstemp/close: the pb16i activation probe's dump
@@ -3569,6 +3570,24 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
         }
         deepstack_add(l);
+        // NPU_INFER_DUMP_DIR=<dir> writes this layer's residual stream (M x H floats, row-major) as layer_<l>.f32, so a
+        // per-layer cosine against a reference trace is possible at all: NPU_INFER_DUMP_LAYERS only prints mean/absmax,
+        // which cannot localise a divergence to an op. TorchLens (Apache-2.0, reference side only) supplies the other
+        // half; nothing from it ships here. Off unless the variable is set, and written with plain fopen/fwrite because
+        // this runs in the forward's hot loop only when someone asked for it.
+        if (const char* dd = getenv("NPU_INFER_DUMP_DIR")) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                std::fprintf(stderr, "  [dump] residual stream per layer -> %s (M=%d H=%d)\n", dd, M, H);
+            }
+            char path[4096];
+            std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
+            if (FILE* fp = std::fopen(path, "wb")) {
+                std::fwrite(X.data(), sizeof(float), (size_t)M * (size_t)H, fp);
+                std::fclose(fp);
+            }
+        }
     }
 
     if (phb) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
@@ -4977,6 +4996,18 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
 
 bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>& logits) {
     const int H = c_.H, NV = c_.NV;
+    // The target first, and only if it both claims and succeeds (npu/model/op_dispatch.h): `lm_head` is the one
+    // optional op whose contract needs no residency -- one hidden row [H] to [V], idempotent, weights the model's
+    // -- so a target that owns a head context can run it here instead of the launch path below. No target on this
+    // box claims it yet (XdnaTarget's supports() is gemv-only), so today this falls through and the numerics are
+    // unchanged by construction; a target that claims it and fails still falls through, which is the case the
+    // dispatch is written for.
+    // `supports()` first and separately: the target's output buffer is [V] floats (1 MB at 248k vocab), and asking
+    // for it on every token when no target claims the op would be a per-token allocation for nothing.
+    if (xd_ && !host_gemm_ && (int)h.size() == H && xd_->supports(npu::target::Op::lm_head)) {
+        std::vector<float> via_target((size_t)NV, 0.0f);
+        if (npu::model::run_lm_head(*xd_, h.data(), via_target.data())) { logits = std::move(via_target); return true; }
+    }
     if (!host_gemm_ && xd_ && xd_->head_ctx() && xd_->head_ctx()->gemv) return run_lm_head_gemv(h, logits);
     if (host_gemm_) {
         // Offline mode: plain float matvec against the (possibly dequantized)

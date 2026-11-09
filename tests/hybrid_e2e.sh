@@ -30,6 +30,8 @@ bin=${1:?usage: hybrid_e2e.sh path/to/1bit <model.gguf> [llama-server]}
 model=${2:-}
 server=${3:-}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound (engine #1485)
 [ -n "$model" ] && [ -f "$model" ] || { echo "skip: no model"; exit 77; }
 if [ -z "$server" ]; then
     "$bin" serve -m "$model" --device cpu --print-backend --no-mem-check >/dev/null 2>&1 || { echo "skip: no llama-server in this build"; exit 77; }
@@ -47,33 +49,19 @@ trap cleanup EXIT
 
 start() {   # start <device> <log> [env...]
     local device=$1 log=$2; shift 2
-    local attempt port code
-    for attempt in 1 2 3; do
-        port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-        env "$@" "$bin" serve -m "$model" --device "$device" --port "$port" --alias e2e-model --ctx-size 2048 \
-            --no-mem-check "${server_arg[@]}" >"$log" 2>&1 &
-        pid=$!
-        api="http://127.0.0.1:$port"
-        code=000
-        for _ in $(seq 1 1200); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break
-            kill -0 "$pid" 2>/dev/null || break; sleep 0.5
-        done
-        if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log" && [ "$attempt" -lt 3 ]; then
-            # A server that never came up because it could not bind is a port collision, not a defect in what
-            # this test checks: serve picks the port, releases it, and launches its backends before it binds, so on
-            # a -j runner another serve can take it inside that window. Re-pick a bounded number of times; the FAIL
-            # message below stays for a collision that will not go away (engine #1444).
-            echo "     note: port $port was taken before serve bound it; retrying with a fresh port (attempt $((attempt + 1))/3)"
-            stop
-            continue
-        fi
-        break
+    local port code
+    # --port 0: the kernel picks and serve reports it - no pick-and-release window for another serve to take (engine
+    # #1444/#1485). The budget is generous: this script's own health window is 1200 x 0.5 s and it loads a model.
+    env "$@" "$bin" serve -m "$model" --device "$device" --port 0 --alias e2e-model --ctx-size 2048 \
+        --no-mem-check "${server_arg[@]}" >"$log" 2>&1 &
+    pid=$!
+    port=$(serve_port_wait "$log" "$pid" 6000) || { echo "FAIL serve never reported a port; log=$log"; tail -5 "$log" 2>/dev/null; return 1; }
+    api="http://127.0.0.1:$port"
+    code=000
+    for _ in $(seq 1 1200); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break
+        kill -0 "$pid" 2>/dev/null || break; sleep 0.5
     done
-    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
-        echo "FAIL: hybrid_e2e: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
-        exit 1
-    fi
     [ "$code" = 200 ]
 }
 stop() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=; }

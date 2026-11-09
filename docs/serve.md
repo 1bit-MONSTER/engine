@@ -333,7 +333,12 @@ What serve did on the request path is the backend's own on this route:
   `"warmups": [{"path", "body"}, ...]` (and `"warmup"`, the first one, for an older lemond), on `hrx`
   chat plans only; Lemonade's onebit recipe sends them in order after `/health` answers and before it
   marks the model loaded. `ONEBIT_NO_WARMUP=1` in lemond's environment leaves them out of the plan, as
-  it turns serve's own warm-up off.
+  it turns serve's own warm-up off. `ONEBIT_WARMUP=long|short|none` selects *which* of the two, in
+  serve's own environment and in the plan alike (`long` = the chat request, `short` = the 16-token
+  completion, `none` = neither; unset or `both` is the shipped pair, and an unrecognised value keeps
+  it). The two are not interchangeable — the first samples, the second does not — so when a model
+  cannot survive one of them, this is the difference between one load per hypothesis and a rebuild
+  (engine#1539).
 
   **Why the 16-token request.** The first batch of 13 to 20 tokens after a load takes ggml-hrx's
   small-batch matmul kernels, which read the weights in a layout ggml-hrx builds on the host the first

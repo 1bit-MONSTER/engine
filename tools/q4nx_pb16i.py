@@ -50,6 +50,16 @@ import numpy as np
 # llama-fmt/ggml/src/ggml-prism.h block_ptq1_0 + dequantize_row_ptq1_0.
 PTQ1_0 = 143
 BLOCK_BYTES, QK, POW3 = 28, 128, (1, 3, 9, 27, 81, 243)
+Q4_0 = 2
+Q4_0_BLOCK, Q4_0_QK = 18, 32   # fp16 d + 16 nibble bytes, 32 values a block
+
+# Which ggml types this reader can size, as (block bytes, values per block). A type that is not here is
+# yielded as b'' -- which is right for a caller walking a whole model (a BF16 norm is not this tool's
+# business) and wrong for a caller asking "does this pack's declared source match its sidecar", because
+# there an empty tensor and an unreadable one are different answers. `strict=True` turns the second into a
+# refusal that names the tensor and the type, and Q4_0 is here because it is exactly that declared source
+# for the pb16i sidecars (engine#1605).
+SIZED = {PTQ1_0: (BLOCK_BYTES, QK), Q4_0: (Q4_0_BLOCK, Q4_0_QK)}
 QS_N, QH_N, D_OFF = 24, 2, 26      # qs[24] @0, qh[2] @24, fp16 d @26
 
 # The image geometry (q4nx_pb16i.h): 32 cores = 8 columns x 4 rows, 256-K x 32-N tiles.
@@ -168,8 +178,29 @@ def read_ptq1_0(raw, K, N):
     return codes.reshape(N, K).T.copy(), bits
 
 
-def gguf_tensors(path):
-    """Yield (name, dims, type, raw bytes) for every tensor of a GGUF file."""
+def read_q4_0(raw, K, N):
+    """The tensor's bytes -> (values float32 [K][N], d bits uint16 [K/32][N]).
+
+    ggml q4_0 stores an 18-byte block along K: one fp16 `d`, then 16 bytes carrying 32 codes, where the
+    low nibbles are k = 0..15 of the block and the high nibbles k = 16..31, and the value is `d * (code - 8)`.
+    The scale granularity is the same as PTQ1_0's (one per 32 K rows per output column), which is what makes
+    a sidecar built from a q4_0 source comparable to that source element for element -- the check engine#1605
+    needed and could not run, because this reader used to hand back b"" for every type but PTQ1_0."""
+    nb = K // Q4_0_QK
+    blk = np.frombuffer(raw, dtype=np.uint8).reshape(N, nb, Q4_0_BLOCK)
+    d = blk[:, :, :2].copy().view("<f2").astype(np.float32).reshape(N, nb)
+    qs = blk[:, :, 2:]
+    v = np.empty((N, nb, Q4_0_QK), dtype=np.float32)
+    v[:, :, 0:16] = ((qs & 0x0F).astype(np.float32) - 8.0) * d[:, :, None]
+    v[:, :, 16:32] = ((qs >> 4).astype(np.float32) - 8.0) * d[:, :, None]
+    return v.reshape(N, K).T.copy(), d.T.copy()
+
+
+def gguf_tensors(path, strict=False):
+    """Yield (name, dims, type, raw bytes) for every tensor of a GGUF file.
+
+    A tensor whose ggml type is not in SIZED is yielded with b"" unless strict, in which case it is
+    refused by name: a reader that silently returns nothing cannot be used to check a pack."""
     f = open(path, 'rb')
     magic, ver, n_tensors, n_kv = struct.unpack('<IIQQ', f.read(24))
     if magic != 0x46554747:
@@ -211,11 +242,35 @@ def gguf_tensors(path):
     out = []
     for name, dims, tt, off in meta:
         n = int(np.prod(dims))
-        nb = n // QK * BLOCK_BYTES if tt == PTQ1_0 else 0
+        if tt in SIZED:
+            blk, qk = SIZED[tt]
+            nb = n // qk * blk
+        else:
+            if strict:
+                raise SystemExit(f"{path}: tensor {name} has ggml type {tt}, which this reader cannot size "
+                                 f"(known: {sorted(SIZED)}); pass strict=False to skip it")
+            nb = 0
         f.seek(base + off)
         out.append((name, dims, tt, f.read(nb) if nb else b''))
     f.close()
     return out
+
+
+def tensor(path, name):
+    """The bytes of ONE tensor by name -> (dims, ggml type, raw).
+
+    `gguf_tensors(strict=True)` refuses the whole file at the first tensor it cannot size, so a caller who wants
+    one known tensor out of a real model cannot use it: every pack has BF16 norms this reader does not size
+    (measured on bonsai2-27b: `output_norm.weight`, ggml type 0, refuses before reaching the tensor it wanted).
+    This walks the file and answers for that one name -- refusing by name when the tensor is absent, and naming the
+    type when it is present but not one this reader can size, which are different answers (engine#1605)."""
+    for n, dims, tt, raw in gguf_tensors(path):
+        if n == name:
+            if tt not in SIZED:
+                raise SystemExit(f"{path}: tensor {name} has ggml type {tt}, which this reader cannot size "
+                                 f"(known: {sorted(SIZED)})")
+            return dims, tt, raw
+    raise SystemExit(f"{path}: no tensor named {name}")
 
 
 def jobs(name, dims, tt):

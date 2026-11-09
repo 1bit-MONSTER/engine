@@ -46,7 +46,10 @@ pid=$!
 # i.e. while it is still loading a model and holding that model's GTT -- and an `exit 1` above the trap registration
 # leaves that process running with nothing to reap it. That is the 51 GiB orphan shape from 11-08, produced by a test
 # whose own failure path was the leak.
-cleanup() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$log"; }
+# And it ends the whole TREE, not the process the shell started: `1bit serve` is a wrapper and the model — with the
+# GTT it holds — lives in the `llama-server` child it spawns (seen live: `1bit serve` 4642 -> `llama-server` 4644), so
+# `kill "$pid"` would reap the wrapper and leave the only process that matters (engine #1653 review).
+cleanup() { serve_kill_tree "$pid"; wait "$pid" 2>/dev/null; rm -f "$log"; }
 trap cleanup EXIT
 port=$(serve_port_wait "$log" "$pid" 12000) || { echo "FAIL serve never reported a port"; cat "$log"; exit 1; }
 fail=0

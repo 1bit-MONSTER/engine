@@ -49,3 +49,37 @@ serve_port_wait() {  # <log> <pid> [tenths-of-a-second, default 300 = 30 s] -> t
     done
     return 1
 }
+
+# Ending a serve is not the same as killing the process the shell started: `1bit serve` is a WRAPPER, and the model —
+# with the GTT it holds — lives in the `llama-server` it spawns as a child. Seen live on this box:
+#
+#   4642  ppid 2510  1bit serve -m … --device hrx
+#   4644  ppid 4642  …/hrx/llama/bin/llama-server -m … --device HRX0 -ngl 99
+#
+# so `kill "$pid"; wait "$pid"` signals the wrapper, reaps the wrapper, and leaves the process that actually holds the
+# memory — the orphan shape from 11-08, one level down, produced by a test's own teardown (engine #1653 review). This is
+# the same conclusion `scripts/gpu-hold` reached in kill_tree (engine #1624): walk the tree, and snapshot it BEFORE
+# signalling, because once the root dies its children are reparented and a `ps --ppid` walk finds only the corpse.
+serve_descendants() {  # <pid> -> its descendants and then itself, deepest last
+    local k
+    for k in $(ps -o pid= --ppid "$1" 2> /dev/null); do
+        serve_descendants "$k"
+    done
+    printf '%s\n' "$1"
+}
+
+serve_kill_tree() {  # <pid> [grace-seconds, default 10] -> TERM the whole tree, KILL whatever ignored it
+    local root=$1 grace=${2:-10} i=0 p tree alive
+    tree=$(serve_descendants "$root")
+    for p in $tree; do kill -TERM "$p" 2> /dev/null; done
+    while [ "$i" -lt "$grace" ]; do
+        alive=0
+        for p in $tree; do
+            if kill -0 "$p" 2> /dev/null; then alive=1; break; fi
+        done
+        [ "$alive" = 1 ] || break
+        sleep 1
+        i=$((i + 1))
+    done
+    for p in $tree; do kill -KILL "$p" 2> /dev/null; done
+}

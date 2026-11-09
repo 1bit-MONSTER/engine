@@ -50,6 +50,16 @@ class NpuModel {
     // forward's own member was: every use site already null-checks it (`if (xd_ && …)`).
     std::unique_ptr<npu::target::xdna::XdnaTarget> xd;
 
+    // Per-layer KV caches (attention) and the MLA ones, the GDN convolution and recurrent state, and the per-layer KV
+    // sharing map. This is the state the launch path writes per token, as opposed to the configuration above: nothing
+    // outside the model aliases these buffers (the model's KV sharing is *between its own layers*, `kv_owner`; the
+    // dma-buf shared region of the fork's llama.cpp side is a different process entirely), so who owns the vector
+    // objects is invisible to every writer.
+    std::vector<std::vector<float>> kcache, vcache;
+    std::vector<std::vector<float>> mla_kn, mla_kr, mla_v;
+    std::vector<std::vector<float>> conv_state, rec_state;
+    std::vector<int> kv_owner;
+
     // Per-layer norm scratch: [NL][H] for the two norms and [NL][max_hd] for q/k norm. They are the model's working
     // set, not the target's: the launch reads them as ordinary host memory, so moving them here changes nothing a
     // launch can see (checked on the device: identical text, same rows -- the gate in #1697's last comment).

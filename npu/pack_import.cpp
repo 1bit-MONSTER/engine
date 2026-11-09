@@ -459,6 +459,15 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
         throw std::runtime_error(path + ": fewer bytes than " + std::to_string(layers) + " blocks of " +
                                  std::to_string(stride9) + " B");
     }
+    // The canonical body is a function of this file alone, so its length is known before it is built: reuse the copy
+    // when it already has that length, instead of writing ~291 MB (1.5B: ~1 GB) again on every call (engine#1662). The
+    // name already carries the source's size and mtime, so a reached-here path cannot be a stale copy of another pack --
+    // and a TRUNCATED copy from an interrupted run is caught by the length test rather than trusted.
+    const int64_t expected = int64_t(fc.size) - int64_t(layers) * hdr_len;
+    if (canonical_copy_reusable(work, expected)) {
+        unmap_file(fc.map, fc.size);
+        return work;
+    }
     std::vector<uint8_t> out;
     out.reserve(size_t(fc.size - int64_t(layers) * hdr_len));
     for (int L = 0; L < layers; ++L) {
@@ -549,8 +558,25 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // Named by pack and geometry, so a rerun overwrites its own copy instead of filling the temp dir.
     const std::string tag =
         std::to_string(std::hash<std::string>{}(fs::path(pack_dir).lexically_normal().string()) % 100000000);
-    const std::string name = "1bit-fconst19-" + tag + "-" + std::to_string(dims.hidden) + "-" +
-                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst";
+    // The name carries the SOURCE file's identity as well as the pack path and geometry (engine#1662): the copy is
+    // reused when it already exists at the right size, and a repacked pack at the same path with the same geometry would
+    // otherwise be served a stale copy of the same length. Size alone is not identity; the mtime completes it cheaply.
+    std::error_code src_ec;
+    const std::uintmax_t src_size = fs::file_size(found, src_ec);
+    const auto src_stamp = [&] {
+        std::error_code e;
+        const auto t = fs::last_write_time(found, e);
+        return e ? int64_t(0) : int64_t(t.time_since_epoch().count());
+    }();
+    // The scratch copy is only reusable while the RULES that produced it are the ones in this binary: a change to the
+    // canonical form (a new kFconst19Rules entry, a different tile order) leaves the source file untouched, so source
+    // identity alone would keep serving a copy of the old form. Bump this when the canonical form changes.
+    constexpr int kCanonicalFormVersion = 1;
+    const std::string name = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
+                             std::to_string(dims.hidden) + "-" +
+                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + "-" +
+                             std::to_string(src_ec ? std::uintmax_t(0) : src_size) + "-" +
+                             std::to_string(static_cast<std::uint64_t>(src_stamp)) + ".fconst";
     // `temp_directory_path()` THROWS when TMPDIR names a directory that no longer exists, which is the ordinary state of
     // a shell after a reboot has cleared /tmp -- and it threw before any work was attempted, so `npu-pack info` on a
     // 1.9 pack failed with `filesystem error: temp_directory_path: No such file or directory [/tmp/x]` and no hint that
@@ -3370,6 +3396,17 @@ int run(int argc, char** argv) {
                      dir.c_str(), out.c_str());
     }
     return 0;
+}
+
+
+// Public (engine#1662): see the declaration in pack_import.h. Lives outside the anonymous namespace because the test
+// calls it directly with crafted files, so the decision that guards a ~291 MB rewrite is pinned without a 1.9 pack.
+bool canonical_copy_reusable(const std::string& work, int64_t expected_len) {
+    if (expected_len <= 0) return false;
+    std::error_code ec;
+    // file_size() fails on a missing file and on a directory, which is exactly the set that must be rewritten.
+    const std::uintmax_t have = fs::file_size(work, ec);
+    return !ec && have == static_cast<std::uintmax_t>(expected_len);
 }
 
 }  // namespace onebit::npu::pack_import

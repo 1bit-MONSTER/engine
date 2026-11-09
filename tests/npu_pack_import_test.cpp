@@ -1919,6 +1919,31 @@ void test_selfcheck_reads_bf16() {
                             std::to_string(good) + ")");
     check(wrong < 0.99, "selfcheck-bf16: and reading the same values at the wrong width does not (corr " +
                             std::to_string(wrong) + ") -- the arm that would have caught #1661");
+
+    // engine#1721: the width now travels with the pointer, so the accident #1661 made -- repointing the bytes under
+    // four readers that all decoded F16 -- cannot recur silently: a reader that wants F16 has to say Fmt::F16, and the
+    // default is the format the importer actually holds.
+    {
+        uint32_t f32bits = 0;
+        const float v = 1.5f;
+        std::memcpy(&f32bits, &v, 4);
+        const uint16_t bits = uint16_t(f32bits >> 16);   // bf16 1.5 = 0x3FC0; the same bits read as f16 are 1.75
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(&bits);
+        const pi::EmbedTable as_bf16{raw, pi::EmbedTable::Fmt::BF16, 1};
+        const pi::EmbedTable as_f16{raw, pi::EmbedTable::Fmt::F16, 1};
+        std::printf("embed-table: same bytes, bf16 %.3f, f16 %.3f, default %s\n", pi::embed_at(as_bf16, 0, 0),
+                    pi::embed_at(as_f16, 0, 0),
+                    pi::EmbedTable{}.fmt == pi::EmbedTable::Fmt::BF16 ? "BF16" : "F16");
+        check(std::fabs(pi::embed_at(as_bf16, 0, 0) - 1.5) < 1e-6,
+              "embed-table: Fmt::BF16 decodes the bytes as bf16");
+        // 0x3FC0 read as f16 is 1.9375 (exp 15 -> 2^0, mantissa 0x3C0/1024), not the 1.75 I first wrote here: the
+        // point of the arm is that the two formats DISAGREE, and getting the disagreement's value wrong is the same
+        // mistake in the test rather than the code.
+        check(std::fabs(pi::embed_at(as_f16, 0, 0) - 1.9375) < 1e-6,
+              "embed-table: Fmt::F16 on the SAME bytes gives a different number, so the width cannot be forgotten");
+        check(pi::EmbedTable{}.fmt == pi::EmbedTable::Fmt::BF16,
+              "embed-table: the default format is what the importer holds, so an unset width is the right one");
+    }
 }
 
 void test_qwen3_attn_sections() {

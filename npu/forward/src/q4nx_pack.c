@@ -508,28 +508,54 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
 
 float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
                        float* col_scales) {
+    // ROW-major traversal, both passes. The obvious spelling of this (for j, for i) walks a row-major K x N matrix with
+    // stride N, i.e. one cache line touched per element once N is wider than a line: measured at 27B shapes
+    // (K=5120, N=17408) that is **424 MB/s**, six times slower than the scatter pass that produces B (5.2 GB/s), and
+    // it made this the dominant host cost of the non-folded weight path (engine #1416, pass_bench in the issue).
+    //
+    // The arithmetic is unchanged and the result is byte-identical: amax is a max (order-independent), and each code is
+    // still round(v * 127/amax_j) clamped to +-127 with the same amax floor. Only the visit order moves, so the fixture
+    // that pins this composition (tests/npu_design_grid_test.c) is the proof rather than an argument.
+    float* amax = NULL;
+    float* tis = NULL;
+    float small[256];
+    if (N <= (int)(sizeof small / sizeof small[0])) {
+        amax = small;
+    } else {
+        amax = (float*)malloc((size_t)N * sizeof(float));
+        if (!amax) return 0.0f;                 // no scale array, no quantisation: the caller's error path
+    }
+    for (int j = 0; j < N; j++) amax[j] = 0.0f;
+    for (int i = 0; i < K; i++) {
+        const float* row = B + (size_t)i * N;
+        for (int j = 0; j < N; j++) {
+            const float a = fabsf(row[j]);
+            if (isfinite(a) && a > amax[j]) amax[j] = a;
+        }
+    }
     double ssum = 0.0;
     for (int j = 0; j < N; j++) {
-        // Per-output-column scale: amax_j / 127 (I8Ctx::packB_into).
-        float amax = 0.0f;
-        for (int i = 0; i < K; i++) {
-            float a = fabsf(B[(size_t)i * N + j]);
-            if (isfinite(a) && a > amax) amax = a;
-        }
-        if (amax < 1e-12f) amax = 1.0f;
-        const float ts = amax / 127.0f;
-        const float tis = 127.0f / amax;
-        for (int i = 0; i < K; i++) {
-            float v = B[(size_t)i * N + j];
-            if (!isfinite(v)) v = 0.0f;
-            int x = (int)roundf(v * tis);
-            if (x > 127) x = 127;
-            else if (x < -127) x = -127;
-            out[(size_t)i * ld + j] = (int8_t)x;
-        }
+        if (amax[j] < 1e-12f) amax[j] = 1.0f;   // an all-zero column still gets a usable scale
+        const float ts = amax[j] / 127.0f;
         if (col_scales) col_scales[j] = ts;
         ssum += (double)ts;
     }
+    // 127/amax per column, in the same array (the scale value has already been recorded above).
+    tis = amax;
+    for (int j = 0; j < N; j++) tis[j] = 127.0f / amax[j];
+    for (int i = 0; i < K; i++) {
+        const float* row = B + (size_t)i * N;
+        int8_t* dst = out + (size_t)i * ld;
+        for (int j = 0; j < N; j++) {
+            float v = row[j];
+            if (!isfinite(v)) v = 0.0f;
+            int x = (int)roundf(v * tis[j]);
+            if (x > 127) x = 127;
+            else if (x < -127) x = -127;
+            dst[j] = (int8_t)x;
+        }
+    }
+    if (amax != small) free(amax);
     return (float)(ssum / (double)N);
 }
 

@@ -123,5 +123,49 @@ mkdir -p "$tmp/models"; : > "$tmp/models/Qwen3-4B-Q4_K_M.gguf"
 PREFLIGHT_MODEL=$tmp/models/Qwen3-4B-Q4_K_M.gguf expect no "--dispatch with silent bench" \
     "$(fake 3600 0 60)" --dispatch "$tmp/fakebench" 512
 
+# --dispatch must PIN the load mode (engine #1668): `-lm none` is +17.5 % prefill at -1.6 % decode for +604 MiB of GTT, so a tally
+# taken with the mode unstated is a tally of two variables. The bench below answers like a live one and records its own argv, so the
+# assertions are about what was EXECUTED rather than about what the script printed.
+cat > "$tmp/argbench" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$ARGV_FILE"
+echo "ggml_hrx dispatch: common.mul_mat.q4_k_q8_1_x4_prefill" >&2
+echo "| qwen3-4b | 2.30 GiB | 4B | HRX | 99 | 1 | pp512 | 3181.97 t/s |" >&2
+exit 0
+SH
+chmod +x "$tmp/argbench"
+
+argv_case() {  # argv_case <name> <want-needle> [PREFLIGHT_LM]
+    local name=$1 needle=$2 lm=${3:-} root
+    root=$(fake 3600 0 60)                      # the same clean box for every case; patched() rewrites run.sh in place
+    : > "$tmp/argv"
+    out=$(ARGV_FILE=$tmp/argv PREFLIGHT_LM=$lm PREFLIGHT_MODEL=$tmp/models/Qwen3-4B-Q4_K_M.gguf \
+          patched "$root" --dispatch "$tmp/argbench" 512 2>&1)
+    if grep -q -- "$needle" "$tmp/argv"; then
+        printf 'ok   %-38s bench argv has %s\n' "$name" "$needle"; pass=$((pass+1))
+    else
+        printf 'FAIL %-38s bench argv lacks %s (argv: %s)\n%s\n' "$name" "$needle" "$(cat "$tmp/argv")" "$out"; fail=$((fail+1))
+    fi
+    printf '%s' "$out" > "$tmp/lastout"
+}
+
+argv_case "load mode is pinned to the default" "-lm mmap"
+argv_case "PREFLIGHT_LM=none reaches the bench" "-lm none" none
+# A mode nobody pinned must be refused, not forwarded: a typo would silently mean something else.
+root=$(fake 3600 0 60); : > "$tmp/argv"
+out=$(ARGV_FILE=$tmp/argv PREFLIGHT_LM=bogus PREFLIGHT_MODEL=$tmp/models/Qwen3-4B-Q4_K_M.gguf \
+      patched "$root" --dispatch "$tmp/argbench" 512 2>&1)
+if [ -s "$tmp/argv" ] || ! printf '%s' "$out" | grep -q 'is not a llama-bench load mode'; then
+    printf 'FAIL %-38s a bogus PREFLIGHT_LM was not refused before the bench ran\n%s\n' "bogus load mode is refused" "$out"; fail=$((fail+1))
+else
+    printf 'ok   %-38s refused before the bench ran\n' "bogus load mode is refused"; pass=$((pass+1))
+fi
+# The header must name the mode, so a capture says which one it was.
+if grep -q -- "-lm none" "$tmp/lastout"; then   # the last argv_case ran with PREFLIGHT_LM=none
+    printf 'ok   %-38s header names the load mode\n' "tally header states -lm"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s header does not name the load mode\n%s\n' "tally header states -lm" "$(cat "$tmp/lastout")"; fail=$((fail+1))
+fi
+
 printf '\nbench-preflight test: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

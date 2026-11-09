@@ -2134,6 +2134,11 @@ std::vector<uint8_t> as_bf16(const uint8_t* src, int type, size_t count) {
     return out;
 }
 
+// `embed` is BF16 rows: the importer converts the pack's table once (`embed_bf16`) and every consumer reads that
+// buffer. It used to be the pack's own F16 bytes, and this decoded them as F16 -- which engine#1661 changed underneath
+// without changing this, so from then on the self-check compared the head against mis-decoded values: Qwen2.5-0.5B 1.9
+// reported corr 0.885220 (and "untied", for a pack declaring tie_word_embeddings) where the same container's weights
+// score 0.999999. The container was always right; the number about it was not.
 double corr(const Q4& q, const uint8_t* embed, int H, int rows) {
     double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
     const int n = std::min(rows, q.N);
@@ -2141,9 +2146,7 @@ double corr(const Q4& q, const uint8_t* embed, int H, int rows) {
         for (int k = 0; k < q.K; ++k) {
             const size_t g = size_t(r) * (q.K / 32) + size_t(k) / 32;
             const double x = double(q.codes[size_t(r) * q.K + k]) * q.scale[g] + q.zero[g];
-            uint16_t h;
-            std::memcpy(&h, embed + (size_t(r) * H + k) * 2, 2);
-            const double y = f16_to_f32(h);
+            const double y = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed)[size_t(r) * H + k]);
             sxy += x * y;
             sx += x;
             sy += y;
@@ -2644,13 +2647,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
                     const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
                     double e;
-                    if (embed->type == kF16) {
-                        uint16_t h;
-                        std::memcpy(&h, embed_bytes + (size_t(n) * H + k) * 2, 2);
-                        e = f16_to_f32(h);
-                    } else {
-                        e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
-                    }
+                    e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
                     sum_abs += std::fabs(x - e);
                     sum_ref += std::fabs(e);
                 }
@@ -2769,14 +2766,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                 for (int k = 0; k < q.K; ++k) {
                                     const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
                                     const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
-                                    double e;
-                                    if (embed->type == kF16) {
-                                        uint16_t h;
-                                        std::memcpy(&h, embed_bytes + (size_t(n) * H + k) * 2, 2);
-                                        e = f16_to_f32(h);
-                                    } else {
-                                        e = bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
-                                    }
+                                    const double e =
+                                        bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[size_t(n) * H + k]);
                                     sum_abs += std::fabs(x - e);
                                     sum_ref += std::fabs(e);
                                 }
@@ -2797,9 +2788,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                     for (int k = 0; k < q.K; ++k) {
                                         const size_t g = size_t(rr) * (q.K / 32) + size_t(k) / 32;
                                         const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[g] + q.zero[g];
-                                        uint16_t hb;
-                                        std::memcpy(&hb, embed_bytes + ((size_t(rr) + 1) * H + k) * 2, 2);
-                                        const double y = f16_to_f32(hb);
+                                        const double y =
+                                            bf16_to_f32(reinterpret_cast<const uint16_t*>(embed_bytes)[(size_t(rr) + 1) * H + k]);
                                         sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
                                     }
                                 const double m = double(n) * q.K;
@@ -3366,7 +3356,7 @@ int run(int argc, char** argv) {
     }
     std::printf("imported %d tensors, %lld q4_1 tiles into %s\n", r.tensors, r.tiles, out.c_str());
     if (r.selfcheck_reference && r.selfcheck_tied) {
-        std::printf("  self-check: the head reproduces the pack's fp16 embedding  corr %.6f  rel_err %.6f\n"
+        std::printf("  self-check: the head reproduces the pack's own embedding (as imported, bf16)  corr %.6f  rel_err %.6f\n"
                     "              (tied: this correlation is the check, and it passed)\n",
                     r.lmhead_corr, r.lmhead_rel);
         if (r.ctrl_corr_rowshift >= 0)

@@ -1045,6 +1045,27 @@ int run_forward_serve(int argc, char** argv) {
         ~Stop() { s.stop(); if (t.joinable()) t.join(); }
     } stop{srv, listener};
 
+    // Warm the weight cache before saying "ready". A first request has to touch every (layer, role) weight once, and on
+    // the non-folded int8 route that means materialising the weight matrix in float32 and packing it -- ~112
+    // projections, which on a 27B pack is tens of seconds. Left in the request, that looks like a hang: a 8-token
+    // request returning nothing in 150 s (engine #1605), and a "ready" line that is a lie about the next minute.
+    // Paid here it is startup time, which is what startup time is for. NPU_SERVE_NO_WARMUP=1 keeps the old behaviour.
+    if (!getenv("NPU_SERVE_NO_WARMUP")) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<float> wlogits;
+        std::vector<int> wids = {131, 131, 131, 131};   // four tokens of one id: the cheapest pass that touches every weight
+        e.fwd->reset();
+        const bool ok = e.fwd->step_batch(wids, 0, wlogits);
+        e.fwd->reset();
+        const double wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!ok) {
+            std::fprintf(stderr, "1bit forward-serve: warm-up pass failed (%s); serving anyway -- the first request "
+                                 "will pay it\n", e.fwd->last_error());
+        } else {
+            std::fprintf(stderr, "1bit forward-serve: warm-up pass %.1f ms (weight cache warm; "
+                                 "NPU_SERVE_NO_WARMUP=1 to skip)\n", wms);
+        }
+    }
     ready = true;
     std::fprintf(stderr, "1bit forward-serve: %s ready on http://%s:%d (%s)", e.id.c_str(), host.c_str(), port,
                  e.fwd->backend().c_str());

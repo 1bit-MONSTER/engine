@@ -806,7 +806,7 @@ DeclaredMap read_declared(const std::string& pack_dir) {
 }
 
 
-}  // namespace: read_embedding_component, load_geometry and read_dims are declared in pack_import.h so a test can drive them
+}  // namespace: read_embedding_component is declared in pack_import.h so a test can drive it
 
 // ── the embedding component ───────────────────────────────────────────────────
 // A hybrid pack keeps its embedding table in its OWN graph: `embedding.onnx` (+ `embedding.onnx.data`) holds
@@ -890,6 +890,8 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
     return out;
 }
 
+namespace {
+
 // ── the pack's geometry, from wherever this generation put it ────────────────
 // Ryzen AI 1.6 ships `config.json = {}` and 1.7/1.7.1 ship **no config.json at all**; all of them carry
 // genai_config.json with the decoder block. So the geometry comes from config.json when it is usable and from
@@ -947,22 +949,21 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
             for (const char* k : {"rope_theta", "rms_norm_eps", "intermediate_size"})
                 if (!cfg.contains(k) && g.contains(k)) cfg[k] = g[k];
         }
-        // A hybrid pack keeps its TEXT tower under `text_config` and states no top-level geometry at all. Measured on
-        // amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: config.json's top level is {architectures, image_token_id, model_type,
-        // text_config, tie_word_embeddings, video_token_id, vision_config, …} with hidden_size/num_hidden_layers/
-        // num_attention_heads/intermediate_size all inside text_config (2560 / 36 / 32 / 9728). The importer then
-        // refused with "the pack states no intermediate_size: config.json has none, and the FFN projections are not
-        // initializers of text.onnx" -- true, because this pack also keeps its weights in text.onnx.data, so the
-        // refusal named a second cause while the first was simply a missing lookup one level down.
-        //
-        // The text tower IS the decoder this importer builds, so lift its keys -- only where the top level lacks them,
-        // never overriding -- and leave `vision_config` alone. Same nested-config rule tools/npu_plan.py already
-        // applies to rope_scaling/mrope_section for VL packs.
+        // A hybrid pack can keep its TEXT tower under `text_config` INSIDE config.json, with no separate model_config.json
+        // to read: amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu states hidden_size/num_hidden_layers/num_attention_heads/
+        // intermediate_size (2560/36/32/9728) there and none at the top level, and its model_config.json has
+        // model_attributes: null, so fill_from_model_config_impl() adds nothing. The importer then refused with "the pack
+        // states no intermediate_size". The text tower IS the decoder this importer builds, so its keys fill gaps -- the
+        // same rule fill_from_model_config_impl() and tools/npu_plan.py already use for VL packs, never overriding.
+        int from_text_config = 0;
         if (cfg.contains("text_config") && cfg["text_config"].is_object()) {
-            for (auto it = cfg["text_config"].begin(); it != cfg["text_config"].end(); ++it)
-                if (!cfg.contains(it.key())) cfg[it.key()] = it.value();
-            if (source) *source = "config.json:text_config";
+            for (auto it = cfg["text_config"].begin(); it != cfg["text_config"].end(); ++it) {
+                if (cfg.contains(it.key()) || it.value().is_null()) continue;
+                cfg[it.key()] = it.value();
+                ++from_text_config;
+            }
         }
+        if (from_text_config > 0 && source) *source += " + config.json text_config";
         if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
     }
@@ -1069,9 +1070,14 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
     return d;
 }
 
+}  // namespace
+
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+// engine#1638: the geometry READ (not just its dims), so a test can assert where each number came from -- the
+// text_config lift and the top-level-wins rule are both properties of load_geometry(), not of read_dims().
+json load_geometry_exported(const std::string& pack_dir, std::string* source) { return load_geometry(pack_dir, source); }
 int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg) {
     return fill_from_model_config_impl(pack_dir, cfg);
 }

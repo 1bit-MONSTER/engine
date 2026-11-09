@@ -73,12 +73,6 @@ struct Dims {
     std::vector<int> eos;
 };
 
-// The geometry as a JSON object, and the Dims read out of it. Exposed for the unit tests: a hybrid pack keeps its text
-// tower under `text_config`, and the only way to prove that lift works (and that a top-level key still wins) is to hand
-// both functions a config.json and read the numbers back.
-nlohmann::json load_geometry(const std::string& pack_dir, std::string* source);
-Dims read_dims(const nlohmann::json& c, const std::string& source);
-
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
 // GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
 // reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
@@ -334,6 +328,8 @@ unsigned short bf16_bits_of(float v);
 // the default rather than throw. Exported so tests/npu_pack_import_test.cpp can pin it without a
 // pack; `source` names where the geometry came from, for the refusal messages.
 Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
+// engine#1638: the geometry as read, so a test can check WHICH source a number came from.
+nlohmann::json load_geometry_exported(const std::string& pack_dir, std::string* source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);

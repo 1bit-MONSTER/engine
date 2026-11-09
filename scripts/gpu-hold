@@ -35,8 +35,14 @@
 #   -t MINUTES     max hold, default $GPU_HOLD_MINUTES or 14        (0.05 = 3 seconds)
 #   -l LABEL       label written into the token, default "<command name>-$$"
 #   -w SECONDS     how long to queue before giving up, default $GPU_HOLD_WAIT or 5400; exit 75 on timeout
-#   -q DIR         queue directory, default $GPU_QUEUE_DIR or ~/GPU-QUEUE
-#   GPU_TOKEN_FILE         the token file, default ~/GPU-TOKEN
+#   -q DIR         queue directory, default $GPU_QUEUE_DIR, else the fleet's queue when it exists
+#                  ($ONEBIT_HOLD_DIR/gpu-queue, /var/lib/1bit-fleet by default), else ~/GPU-QUEUE
+#   GPU_TOKEN_FILE         the token file, same order of preference, else ~/GPU-TOKEN
+#   ONEBIT_HOLD_DIR        where the fleet's hold state lives (engine #1504); when that directory exists it IS
+#                  the queue for every caller, whoever runs: a runner under another account, a tmux lane, a
+#                  systemd --user service. Without it a second account silently takes its own token and runs
+#                  GPU work beside the fleet, and with it a lane that never sourced a profile file still
+#                  agrees, because the default - not an environment variable - is what moved.
 #   GPU_HOLD_RELEASE_WAIT  seconds a label must wait after releasing, default 180
 #   GPU_HOLD_TCTL_START    start gate in C, default 75 - a hot box is not taken
 #   GPU_HOLD_TCTL_ABORT    abort in C, default 93
@@ -55,8 +61,10 @@ set -u
 MINUTES=${GPU_HOLD_MINUTES:-14}
 LABEL=""
 WAIT=${GPU_HOLD_WAIT:-5400}
-QUEUE=${GPU_QUEUE_DIR:-$HOME/GPU-QUEUE}
-TOKEN=${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}
+HOLD=${ONEBIT_HOLD_DIR:-/var/lib/1bit-fleet}
+# the fleet's state wins when it is installed, and ~ is the fallback for a box that has not been set up that way
+QUEUE=${GPU_QUEUE_DIR:-$([ -d "$HOLD/gpu-queue" ] && printf '%s' "$HOLD/gpu-queue" || printf '%s' "$HOME/GPU-QUEUE")}
+TOKEN=${GPU_TOKEN_FILE:-$([ -d "$HOLD" ] && printf '%s' "$HOLD/gpu-token" || printf '%s' "$HOME/GPU-TOKEN")}
 RELEASE_WAIT=${GPU_HOLD_RELEASE_WAIT:-180}
 TCTL_START=${GPU_HOLD_TCTL_START:-75}
 TCTL_ABORT=${GPU_HOLD_TCTL_ABORT:-93}
@@ -153,7 +161,13 @@ release() {
     state=done
 }
 trap release EXIT
-trap 'exit 143' TERM INT HUP
+# TERM/INT/HUP must END THE PAYLOAD before the token comes back. `exit 143` alone ran only the EXIT trap: the token was
+# released and the ticket removed while the payload kept the device, so the next lane was admitted on top of it (the
+# 11-08 orphan, reached through a different door: `timeout`, an operator kill, an orchestrator stopping a lane). Its
+# tree is ended with the same kill_tree the watchdog uses, so a process two levels down cannot survive the signal
+# either. `child` is empty while queued, so a signal in the queue still just leaves the queue; `declare -F` covers the
+# one window where the payload has started but the function is not defined yet.
+trap '[ -n "${child:-}" ] && declare -F kill_tree > /dev/null && kill_tree "$child"; exit 143' TERM INT HUP
 
 pid_of() { sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$1" 2> /dev/null | head -n 1; }
 
@@ -170,6 +184,14 @@ oldest_ticket() {
     for f in $(ls -1 "$QUEUE" 2> /dev/null | grep -v '^\.' | sort); do
         [ -f "$QUEUE/$f" ] || continue
         if stale "$QUEUE/$f"; then
+            # engine #1635: the owner of this ticket is still polling, so dropping it silently left it waiting for a
+            # queue position that no longer existed. Leave a note in the queue directory (dotfiles are never treated
+            # as tickets) so the victim can say WHY its ticket vanished, not only that it did.
+            pid=$(pid_of "$QUEUE/$f")
+            # One file per ticket, not one shared log: the victim reads its own note and removes it, so the queue
+            # directory cannot accumulate notes for the life of the box (review note on PR #1636).
+            printf '%s dropped %s: owner pid %s is gone (dropped by pid %s)\n' \
+                "$(date -Is)" "$f" "${pid:-unknown}" "$$" > "$QUEUE/.reaped.$f" 2> /dev/null
             rm -f "$QUEUE/$f"
             log "dropped stale ticket $f (owner pid gone)"
             continue
@@ -200,6 +222,17 @@ log "queued '$LABEL' as $TICKET_NAME"
 
 waited=0
 while [ "$state" = queued ]; do
+    if [ ! -e "$TICKET" ]; then
+        # engine #1635: something (a reaper, another lane) removed a queued ticket. The head-of-queue test below
+        # can then never come true, and the wait would run to -w (5400 s by default) looking exactly like "queued
+        # behind a busy box". Fail in this poll instead, and name what went missing. state=done first so the
+        # release() trap does not touch a token this process never took.
+        why=$(cat "$QUEUE/.reaped.$TICKET_NAME" 2> /dev/null | tail -n 1)
+        rm -f "$QUEUE/.reaped.$TICKET_NAME" 2> /dev/null
+        log "::error::my ticket $TICKET_NAME is gone from $QUEUE after ${waited}s (token: $(cat "$TOKEN" 2> /dev/null || echo free)) - it was reaped or removed, so this queue position no longer exists; not waiting ${WAIT}s for it${why:+ [$why]}"
+        state=done
+        exit 75
+    fi
     reap_token
     cool=$(cool_left)
     head_ticket=$(oldest_ticket)

@@ -261,6 +261,11 @@ add_test(NAME gpu_hold_tree COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_tree
 # engine#1650: a hold ends itself when the box runs out of memory, before the kernel picks a victim — the 11-08/09
 # failure where an unbudgeted GPU run took the box to 0.7 GiB and the OOM killer chose the PR-agent LLM.
 add_test(NAME gpu_hold_mem_abort COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_mem_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+# engine#1635: a queued ticket that is removed (reaped, or deleted by another lane) used to leave its owner waiting for a
+# queue position that no longer existed -- the full -w, 5400 s by default, looking exactly like "queued behind a busy box".
+# Drives scripts/gpu-hold on a private queue: the ticket is deleted mid-wait, and separately rewritten to a dead pid so a
+# second real gpu-hold reaps it and leaves the note the victim quotes. No device, no build; skips (77) without the script.
+add_test(NAME gpu_hold_ticket_lost COMMAND bash ${CMAKE_SOURCE_DIR}/tests/gpu_hold_ticket_lost_test.sh)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
@@ -282,6 +287,11 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # resolves outside the payload, and a runtime set shipped without the aqlprofile agent libhsa opens. Each
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
+# engine #1504: the GPU hold queue is the FLEET's when the shared state is installed, with no environment to say
+# so - the failure it guards against is silent (a caller under another account taking its own token). Two arms:
+# fleet state present -> the claim uses the fleet's queue and token; absent -> the old ~/GPU-* paths, so a box
+# that has not been set up is unchanged. No GPU: the claim holds the token for three seconds and runs `true`.
+add_test(NAME gpu_hold_queue COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_queue_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.
@@ -741,7 +751,10 @@ if(Python3_Interpreter_FOUND)
     # engine#1070: every configured test that starts a server holds RESOURCE_LOCK route_ports, so
     # the list at the end of this file cannot drift away from the tests it protects. Reads the
     # configured test list (ctest -N --show-only=json-v1); no device, no model, no build products.
-    add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
+    # Ending a serve must end the process that holds the memory: `1bit serve` is a wrapper and the model lives in the
+# `llama-server` child (engine #1653 review). Device-free: it drives the helper against a synthetic wrapper.
+add_test(NAME serve_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_kill_tree_test.sh)
+add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.

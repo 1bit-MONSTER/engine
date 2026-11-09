@@ -160,12 +160,90 @@ def duplicated_notice(text):
     accidental shape; anything further down is somebody's deliberate string.
     """
     head = "\n".join(text.splitlines()[:NOTICE_WINDOW])
-    return head.count(NOTICE[0]) > 1 and head.count(NOTICE[1]) > 1
+    if head.count(NOTICE[0]) > 1 and head.count(NOTICE[1]) > 1:
+        return True
+    # The same defect in a different spelling: the canonical notice plus a near-miss of our own holder.
+    if NOTICE[0] in head and any(near_miss_holder(l) for l in head.splitlines()):
+        return True
+    return False
+
+
+_COPY_LINE = re.compile(r"^\W*Copyright\s+(?:\(c\)\s*)?\d{4}\s+(.+?)\s*$", re.IGNORECASE)
+
+
+def _holder(line):
+    """The holder a copyright line names, normalised: 'bong-water-bong' -> 'bongwaterbong'."""
+    m = _COPY_LINE.match(line)
+    return re.sub(r"[^a-z0-9]", "", m.group(1).lower()) if m else ""
+
+
+_CANON_HOLDER = _holder(NOTICE[0])
+
+# How much of a holder two copyright lines must share, normalised, to be treated as the same claim misspelled
+# instead of a different attribution. This is a DECISION, not a value that arrived:
+#
+#   too small  -> a real second attribution gets deleted, which is silent data loss in a file someone can read;
+#   too large  -> a misspelling survives as a second notice, which is what engine#1606 shipped.
+#
+# Six is chosen so that `bongwaterbong` (this repo, misspelled) matches `bongwaterwaterbong` (canonical) - the
+# shape that actually occurred - while a distinct holder like `the1bitmonsterauthors` (which the tree carries
+# beside the notice in tests/installed_rpath_test.sh and tools/check-installed-rpath.py) shares nothing and is
+# left alone. The residual cost of being wrong is one visible line removed from a file a human can inspect,
+# which is why the failure mode is chosen in that direction; the dual-attribution case is pinned by a test so a
+# future change to this number cannot quietly start deleting `The 1bit-MONSTER Authors.`.
+HOLDER_NEAR_MISS_PREFIX = 6
+
+
+def near_miss_holder(line):
+    """True when a copyright line names a holder that is a TYPO of this repo's, not a different attribution.
+
+    engine#1606's build failed on exactly this: a hand-written `Copyright 2026 bong-water-bong` beside the
+    canonical block, and `--fix` inserted a second notice rather than replacing it. It cannot be "any second
+    copyright line" - the tree legitimately carries dual attribution (`Copyright 2026 The 1bit-MONSTER
+    Authors.` for derived work) inside the same header window - so the test is the holder: normalised
+    holders that share a long prefix and differ are the same claim misspelled; holders that share nothing
+    are a different claim and are left alone.
+    """
+    h = _holder(line)
+    if not h or h == _CANON_HOLDER:
+        return False
+    n = 0
+    while n < len(h) and n < len(_CANON_HOLDER) and h[n] == _CANON_HOLDER[n]:
+        n += 1
+    return n >= HOLDER_NEAR_MISS_PREFIX
+
+
+def repair_notice(text, block):
+    """The file already HAS the canonical notice, plus a near-miss of our holder: delete the misspelling.
+
+    This is the state engine#1606 shipped - canonical block present, hand-written `bong-water-bong` beside it -
+    and it needed its own path because it is neither "notice missing" (has_notice() is true, so --fix skipped
+    the file) nor "duplicate canonical pair" (duplicated_notice() only reported it, even under --fix). Dropping
+    the copyright line and the SPDX line directly beneath it keeps a near-miss pair from leaving an orphan.
+    """
+    out, drop_next_spdx = [], False
+    for line in text.splitlines(keepends=True):
+        if near_miss_holder(line):
+            drop_next_spdx = True
+            continue
+        if drop_next_spdx and re.match(r"^\W*SPDX-License-Identifier\s*:", line, re.IGNORECASE):
+            drop_next_spdx = False
+            continue
+        drop_next_spdx = False
+        out.append(line)
+    repaired = "".join(out)
+    return repaired if has_notice(repaired) else add_notice(repaired, block)
 
 
 def add_notice(text, block):
     lines = text.splitlines(keepends=True)
     insert_at = 1 if lines and lines[0].startswith("#!") else 0
+    # A near-miss of this repo's holder is REPLACED, not stacked beside: `--fix` used to insert the canonical
+    # block and leave the hand-written one in place, which is how a file ended up with two notices and a green
+    # `--check` (engine#1606). Dual attribution with a different holder is untouched - only the window is read.
+    head = lines[:NOTICE_WINDOW]
+    kept = [l for l in head if not near_miss_holder(l)]
+    lines = kept + lines[NOTICE_WINDOW:]
     return "".join(lines[:insert_at]) + block + "".join(lines[insert_at:])
 
 
@@ -204,10 +282,22 @@ def main():
             if path not in untracked:
                 unknown.append(path)
             continue
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+        # git ls-files lists a path that was staged and then deleted before it is committed; opening it used
+        # to raise FileNotFoundError and take the whole gate down with a traceback (found while testing the
+        # near-miss fix below). A missing path is skipped: it is not repo content, and `git status` is where a
+        # half-deleted file belongs, not a licence gate.
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except FileNotFoundError:
+            continue
         if duplicated_notice(text):
-            duplicated.append(path)
+            if args.fix:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(repair_notice(text, block))
+                print("repaired:", path)
+            else:
+                duplicated.append(path)
             continue
         if has_notice(text):
             continue

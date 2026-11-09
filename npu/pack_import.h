@@ -35,6 +35,8 @@
 
 #include <cstdint>
 #include <string>
+
+#include <nlohmann/json.hpp>
 #include <map>
 #include <vector>
 
@@ -68,6 +70,11 @@ struct Dims {
     std::string model_type;
     std::vector<int> eos;
 };
+
+// A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
+// GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
+// reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
+std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why);
 
 // One tensor the pack describes, and where its values would come from.
 struct Planned {
@@ -115,6 +122,14 @@ struct Plan {
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)
     int64_t graph_external_bytes = 0;// size on disk of the external file they name, 0 when it is not in the pack
+    // `com.ryzenai:MatMulNBitsBf` ops, and node inputs that resolved to a `*.qweight.packed` sibling behind a
+    // `*.qweight.empty` placeholder. Both exist because a walker that matches only the Microsoft op name, or only
+    // the node's own initializer, reports a weightless graph for the 1.9 external-data packs (engine#1503).
+    int64_t graph_ryzenai_matmuls = 0;
+    int64_t graph_packed_siblings = 0;
+    // How many of the graph's 4-bit block-128 weights satisfy length == N x (K/128 + 1) x 68 (the per-row stride the
+    // .fconst tile also carries): a measurement, so `info` can say "201 of 201" or "3 of 7" instead of guessing.
+    int64_t graph_stride_ok = 0, graph_stride_of = 0;
     std::map<int64_t, int64_t> graph_blocks;                 // block size -> how many ops declare it
     std::vector<std::vector<int64_t>> graph_weight_dims;     // up to 4 distinct [N, K/block, bytes] shapes
     // The MLP section's geometry, likewise measured: gate and up share one fused 4,288-byte-subvolume
@@ -292,6 +307,12 @@ struct FconstGeom {
     std::string why;      // non-empty when the geometry could not be established
 };
 unsigned short bf16_bits_of(float v);
+
+// engine#1650: config.json may declare an OPTIONAL field as JSON null (AMD's 1.9
+// Mistral-7B-Instruct-v0.2 pack writes `"head_dim": null`), which must read as "absent" and take
+// the default rather than throw. Exported so tests/npu_pack_import_test.cpp can pin it without a
+// pack; `source` names where the geometry came from, for the refusal messages.
+Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);

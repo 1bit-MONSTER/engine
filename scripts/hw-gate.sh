@@ -96,7 +96,10 @@ fi
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 STORE=${HW_GATE_STORE:-$HOME/.cache/hw-gate}
 MODELS=${HW_GATE_MODELS:-$HOME/models}
-LOCK=${HW_GATE_LOCK:-$HOME/npu.lock}
+# engine #1504: the NPU lock is fleet state, like the GPU token - when the shared hold directory exists it is
+# THE lock, so a process running under another account cannot take NPU work on a lock of its own
+_HOLD=${ONEBIT_HOLD_DIR:-/var/lib/1bit-fleet}
+LOCK=${HW_GATE_LOCK:-$([ -d "$_HOLD" ] && printf '%s' "$_HOLD/npu.lock" || printf '%s' "$HOME/npu.lock")}
 LOCK_WAIT=${HW_GATE_LOCK_WAIT:-5400}
 # The NPU array's fair claim, the one the rest of the box uses: npu-hold puts the command on ~/NPU-QUEUE and
 # ~/NPU-TOKEN, and npu-serve-keeper stops the owner's serve while a ticket waits. ~/npu.lock is a *private*

@@ -519,14 +519,21 @@ actually applied comes from this box's driver and from the measurement itself.
 | measurement | GEMM datatype | tiles | ceiling at **that** datatype | measured | % of that ceiling |
 |---|---|---:|---:|---:|---:|
 | gate, M=16, K=5120 N=17408 (2.852 GFLOP in 0.589 ms) | int8 | 8 | 8.19 TOPS | 4.84 TOPS | **59 %** |
-| prefill, M=128, 18.64 tok/s | bf16 | 32 | 16.4 TOPS | 1.01 TFLOPS | **6.1 %** |
+| prefill, M=128, ~~18.64 tok/s~~ — **RETRACTED, see below** | bf16 | 32 | 16.4 TOPS | — | — |
+| prefill, M=128, 16.81 tok/s (TTFT, 2048-token prompt) | bf16 | 32 | 16.4 TOPS | 0.91 TFLOPS | **5.5 %** |
 | published W4A16 reference, 8.06 TFLOP/s | int8 | 8 | 8.19 TOPS | 8.06 TFLOPS | **98 %** — i.e. an int8-MAC-bound result |
+
+**Retraction notice — 18.64 tok/s is retracted.** It was quoted against *request-wall* figures in later comparisons where the ticket's load window was not
+sustained; the replacement is the TTFT-based 16.81 above (`prompt_tokens / TTFT`, distinct prompts, no shared prefix, measured in the first half of the
+ticket — so also an upper-band figure). Any page still carrying 18.64 must mark it retracted rather than repeat it. The ceiling arithmetic is unaffected:
+the tile count and the per-tile rate are properties of the architecture, and what changes is 2·params ÷ tok/s — 0.91 TFLOPS, i.e. 5.5 % of the 32-tile bf16
+ceiling.
 
 The ceiling column is *per datatype* — 1.024 TOPS/tile for int8 and 0.512 for bf16 — so the rows are not comparable to each other by tile count; each % is
 against its own datatype's ceiling.
 
 Two readings that follow, and that a whole-array denominator would hide: our **decode** GEMM is at **59 %** of the tiles it occupies, so the remaining
-headroom there is the stream (40.2 GB/s measured) and not the MACs; our **prefill** is at **6.1 %**, which is the launch geometry above, not arithmetic.
+headroom there is the stream (40.2 GB/s measured) and not the MACs; our **prefill** is at **5.5 %**, which is the launch geometry above, not arithmetic.
 And the reference result being ~98 % of an 8-tile int8 ceiling is why 4-bit designs on this architecture are int8 MACs with an on-core expansion:
 Table 14 lists **no INT4 multiplier** row, and the array's 4-bit mode — *"Vector unit supporting MAC operations for multiple precisions (for example,
 512x 8-bit × 8-bit and 512x 4-bit × 4-bit)"*, Chapter 4's Vector Multiplication Unit — runs at the **same 512-per-tile rate as int8**. So a narrower
@@ -859,6 +866,18 @@ prints what the pack states as JSON and writes nothing. The pack's weights and i
 contract are the model; the reader is written from the pack-side facts in
 `amd-oss/npu-re/docs/FACTS-oga-pack-weight-layout.md`, and no vendor library, wheel or compiled
 program is called or shipped.
+
+**A pack can state its weights behind a placeholder.** The 1.9 generation's external-data packs (`phi-4`, and the
+`com.ryzenai:MatMulNBitsBf` family) name each weight through an initializer with no bytes —
+`model.layers.0.attn.o_proj.MatMulNBits.qweight.empty`, dims `[0]` — while the payload sits in a `…qweight.packed`
+sibling the node never references, inside the ordinary ONNX external data (`eager-mm.onnx.data`, 9.73 GB on `phi-4`). A
+reader that follows the node's inputs therefore sees zero-size tensors on a 9.7 GB pack, which is what made this genre look
+like a proprietary blob. `npu-pack info` resolves the sibling and reports it: `graph_weights.packed_weight_siblings`, the
+`ryzenai_matmuls_ops` count, and `graph_weights.external_row_stride: {matched, of, rule}` — the bytes fit
+`length == N × (K/128 + 1) × 68` on **201 of 201** of `phi-4`'s matmuls, and the 68-byte row-per-128-K-block is the same
+stride the `.fconst` attention tile already carries (2,176 B subvolume = 32 rows × 68 B). The FFN width for this genre comes
+from the node's own `N`/`K` (`gate_proj`/`up_proj` → N, `down_proj` → K), because the weight is a 1-D byte blob with no
+shape to read it from (engine#1503).
 
 **A pack can be the weights without the text.** AMD's `_rai_1.8.0_npu_4K` repos do publish the
 model's own `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, `merges.txt`,

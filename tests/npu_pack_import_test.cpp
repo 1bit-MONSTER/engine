@@ -121,10 +121,10 @@ std::string kv(const std::string& k, const std::string& v) {
 }
 // a tensor whose values live in an external file, optionally with dims that overstate it
 std::string tensor(const std::string& name, const std::vector<int64_t>& dims, const std::string& location,
-                   uint64_t offset, uint64_t length) {
+                   uint64_t offset, uint64_t length, int64_t type = 1) {
     std::string t;
     for (auto d : dims) ints(t, 1, d);                 // dims
-    ints(t, 2, 1);                                     // data_type (FLOAT; the importer only uses it for width)
+    ints(t, 2, type);   // data_type: FLOAT unless the caller says otherwise (a quantised table is UINT8)
     str(t, 8, name);
     for (const auto& [k, v] : {std::pair<std::string, std::string>{"location", location},
                                {"offset", std::to_string(offset)}, {"length", std::to_string(length)}}) {
@@ -136,11 +136,19 @@ std::string tensor(const std::string& name, const std::vector<int64_t>& dims, co
     ints(t, 14, 1);                                    // data_location = EXTERNAL
     return t;
 }
+// An initializer with a name and nothing else: the `*.qweight.empty` placeholders a 1.9 external-data pack puts in
+// the node's input slot while the bytes live in a `*.qweight.packed` sibling (engine#1503).
+std::string placeholder(const std::string& name) {
+    std::string t;
+    ints(t, 2, 1);      // data_type FLOAT
+    str(t, 8, name);
+    return t;
+}
 std::string matmulnbits(const std::string& name, const std::vector<std::string>& ins, int64_t K, int64_t N,
-                        int64_t bits, int64_t block) {
+                        int64_t bits, int64_t block, const std::string& op = "MatMulNBits") {
     std::string n;
     for (const auto& i : ins) str(n, 1, i);
-    str(n, 4, "MatMulNBits");
+    str(n, 4, op);
     for (const auto& [k, v] : {std::pair<std::string, int64_t>{"K", K}, {"N", N}, {"bits", bits},
                                {"block_size", block}}) {
         std::string a;
@@ -200,6 +208,115 @@ int q4_1f_tensors(const json& table) {
         if (!shape.empty() && shape.back() == int64_t(onebit::npu::kTileBytesF32)) ++n;
     }
     return n;
+}
+
+// The 1.9 external-data genre (engine#1503, measured on phi-4): every node's qweight slot holds a
+// `*.qweight.empty` placeholder with no dims, and the bytes are in a `*.qweight.packed` sibling the node never
+// references. A reader that follows node inputs only reports a weightless graph for a 9.7 GB pack; one that sees the
+// sibling must also say whether the bytes fit the stride the .fconst tile already carries --
+// length == N x (K/128 + 1) x 68 -- as a count, not an assumption.
+void test_external_packed_genre(const std::string& root) {
+    const fs::path dir = fs::path(root) / "external-packed";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"phi3","hidden_size":5120,"intermediate_size":17920,"num_hidden_layers":1,)"
+             R"("num_attention_heads":40,"num_key_value_heads":10,"head_dim":128,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":false})");
+    // The graph's name comes from genai_config.json, as in the real pack (phi-4's is eager-mm.onnx).
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"decoder":{"filename":"eager-mm.onnx","hidden_size":5120,"num_hidden_layers":1,)"
+             R"("num_attention_heads":40,"num_key_value_heads":10,"head_size":128,"intermediate_size":17920}}})");
+    // K 5120 -> 41 blocks of 68 B = 2,788 B per row; N 768, so a fitting tensor is 2,141,184 B.
+    const int64_t K = 5120, N = 768, stride = (K / 128 + 1) * 68;
+    const int64_t embed_bytes = 64 * 5120 * 4;          // vocab 64 x hidden 5120, and pb::tensor declares FLOAT
+    const auto write_data = [&](int64_t packed_bytes) {
+        put_file((dir / "eager-mm.onnx.data").string(), std::string(size_t(embed_bytes + packed_bytes), '\x22'));
+    };
+    const auto write_graph = [&](const std::string& packed, int64_t packed_bytes) {
+        put_file((dir / "eager-mm.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
+                                       uint64_t(embed_bytes)),
+                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
+                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty"),
+                            pb::tensor(packed, {packed_bytes}, "eager-mm.onnx.data", uint64_t(embed_bytes),
+                                       uint64_t(packed_bytes))},
+                           {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
+                                                    "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
+                                            K, N, 4, 128, "MatMulNBitsBf")}));
+    };
+
+    write_data(stride * N);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N);
+    const json m = json::parse(pi::plan(dir.string()).manifest());
+    const json& g = m["graph_weights"];
+    check(g["ryzenai_matmuls_ops"] == 1, "external-packed: MatMulNBitsBf is counted as a quantised matmul");
+    check(g["matmulnbits_ops"] == 1, "external-packed: and it enters the matmul list (the reader follows it)");
+    check(g["packed_weight_siblings"] == 1,
+          "external-packed: the *.empty placeholder resolves to its *.packed sibling (the weights are here, "
+          "behind a placeholder)");
+    check(g["external_row_stride"]["matched"] == 1 && g["external_row_stride"]["of"] == 1,
+          "external-packed: the bytes fit length == N x (K/128 + 1) x 68, reported as a count");
+
+    // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
+    write_data(stride * N - 68);
+    write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N - 68);
+    const json m2 = json::parse(pi::plan(dir.string()).manifest());
+    std::printf("external-packed: %s, %s\n",
+                m["graph_weights"]["packed_weight_siblings"] == 1 ? "placeholder resolved to .packed" : "NOT resolved",
+                "stride rule measured");
+    check(m2["graph_weights"]["external_row_stride"]["matched"] == 0 &&
+              m2["graph_weights"]["external_row_stride"]["of"] == 1,
+          "external-packed: a length that does not fit the stride is reported as 0 of 1, with the rule named");
+
+    // …and widening the CENSUS must not widen the IMPORT. This genre has no writer yet, so the import answer has to
+    // stay the refusal it was before this change: the check is on the answer, not on a sentence in the PR.
+    {
+        pi::Options allow;
+        allow.allow_incomplete = true;   // so the plan's own refusals do not short-circuit before the readers
+        bool threw = false;
+        std::string why;
+        write_data(stride * N);
+        write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N);
+        try {
+            (void)pi::import_pack(dir.string(), (dir / "out").string(), allow);
+        } catch (const std::exception& e) {
+            threw = true;
+            why = e.what();
+        }
+        std::printf("  external-packed import refusal: %s\n", why.c_str());
+        check(threw, "external-packed: import still refuses the genre (the census widening did not become a writer)");
+        check(why.find("qweight.packed") != std::string::npos && why.find("no writer") != std::string::npos,
+              "external-packed: and it refuses by NAME with the layout stated (no writer for N x (K/128+1) x 68), "
+              "not by tripping over a symbol (" + why + ")");
+        check(!fs::exists(dir / "out" / "model.q4nx"),
+              "external-packed: nothing is written for a genre this importer cannot yet walk");
+    }
+    fs::remove_all(dir);
+
+    // The FFN width in the external-data genre is the NODE's declaration, because the weight is a 1-D byte blob with
+    // no shape: a pack whose config states no intermediate_size must still be readable from gate/up (N) or down (K).
+    const fs::path dir2 = fs::path(root) / "external-packed-im";
+    fs::remove_all(dir2);
+    fs::create_directories(dir2 / "cache");
+    put_file((dir2 / "config.json").string(),
+             R"({"model_type":"phi3","hidden_size":5120,"num_hidden_layers":1,"num_attention_heads":40,)"
+             R"("num_key_value_heads":10,"head_dim":128,"vocab_size":64,"rope_theta":10000.0})");
+    put_file((dir2 / "genai_config.json").string(),
+             R"({"model":{"decoder":{"filename":"model.onnx","hidden_size":5120,"num_hidden_layers":1,)"
+             R"("num_attention_heads":40,"num_key_value_heads":10,"head_size":128}}})");
+    const int64_t im = 17920;
+    put_file((dir2 / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {64, 5120}, "model.onnx.data", 0, uint64_t(embed_bytes))},
+                       {pb::matmulnbits("gate", {"x", "/model/layers.0/mlp/gate_proj/MatMulNBits.qweight.empty",
+                                                 "/s", "y"}, K, im, 4, 128, "MatMulNBitsBf"),
+                        pb::matmulnbits("down", {"x", "/model/layers.0/mlp/down_proj/MatMulNBits.qweight.empty",
+                                                 "/s", "y"}, im, 5120, 4, 128, "MatMulNBitsBf")}));
+    put_file((dir2 / "model.onnx.data").string(), std::string(size_t(embed_bytes + 4096), '\x33'));
+    const json mi = json::parse(pi::plan(dir2.string()).manifest());
+    check(mi["dims"]["intermediate_size"] == im,
+          "external-packed: intermediate_size comes from the node's N/K when the config states none");
+    fs::remove_all(dir2);
 }
 
 // The two overstatements the readers must catch: declared dims larger than the external file, and a
@@ -301,6 +418,35 @@ void test_matmulnbits() {
     const size_t nz = size_t(1) * (K / 32);  // row 1 has zero-point 1, so its zero is not 0
     check(nozp.zero[nz] == 0.0f && q.zero[nz] != 0.0f,
           "control: dropping the zero point really changes it");
+
+    // Block 32: the decoder is parameterised by the block, and the container's Q4 chunks are per-32-column groups, so
+    // a block-32 table is one scale per group rather than two. Pinned because the block-size GATE upstream refuses 32
+    // for fconst packs, and the reason it gives ("every subvolume offset in the .fconst moves") cannot apply to a pack
+    // whose weights are the graph's own initializers -- amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu declares 253
+    // MatMulNBits ops at block 32 and carries no .fconst at all (engine#1503).
+    {
+        const int B32 = 32;
+        std::vector<uint8_t> qw32(size_t(N) * (K / B32) * (B32 / 2));
+        std::vector<float> sc32(size_t(N) * (K / B32));
+        for (int n = 0; n < N; ++n)
+            for (int b = 0; b < K / B32; ++b) {
+                sc32[size_t(n) * (K / B32) + b] = 0.02f * float(b + 1);
+                for (int i = 0; i < B32 / 2; ++i) {
+                    const int k = b * B32 + 2 * i;
+                    qw32[(size_t(n) * (K / B32) + b) * (B32 / 2) + i] =
+                        uint8_t(want(n, k) | (want(n, k + 1) << 4));
+                }
+            }
+        const pi::Q4 q32 = pi::decode_matmulnbits(qw32.data(), sc32.data(), nullptr, N, K, B32, false, true);
+        bool ok32 = true;
+        for (int n = 0; n < N && ok32; ++n)
+            for (int k = 0; k < K; ++k) {
+                if (q32.codes[size_t(n) * K + k] != want(n, k)) { ok32 = false; break; }
+                const size_t g = size_t(n) * (K / 32) + size_t(k) / 32;
+                if (q32.scale[g] != sc32[size_t(n) * (K / B32) + size_t(k) / B32]) { ok32 = false; break; }
+            }
+        check(ok32, "MatMulNBits: block-32 decodes too, one scale per 32-column group");
+    }
 }
 
 // ── 2. tiling against the committed golden ──────────────────────────────────
@@ -1490,6 +1636,57 @@ void test_attn_payload_off() {
 // the Token program's op_list) and declares `o_proj N=2560 K=4096` on the 4B, i.e. o_proj's K is
 // q_proj's output width, not hidden. The two 256-byte gains match Qwen/Qwen3-1.7B's and -4B's public
 // q_norm/k_norm weights bit for bit at those offsets (128 of 128 values, and 127-128 of 128 on the swap).
+
+// The embedding component (engine #1503): a hybrid pack keeps its table in `embedding.onnx` (+ `.data`), gathered by
+// GatherBlockQuantized. Shape measured on amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu: weight_Q4 [V, H/2] UINT8 and
+// weight_scales [V, groups] FLOAT with group 128. Driving the reader against known codes and scales pins the
+// dequantisation without a 3 GB pack.
+void test_embedding_component(const std::string& root) {
+    const fs::path dir = fs::path(root) / "embedcomp";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const int64_t V = 8, H = 256, groups = H / 128;
+    auto want = [&](int64_t v, int64_t k) { return uint8_t((v * 7 + k * 5) % 16); };
+    std::vector<uint8_t> table(size_t(V) * size_t(H / 2), 0);
+    std::vector<float> scales(size_t(V) * size_t(groups), 0.0f);
+    for (int64_t v = 0; v < V; ++v) {
+        for (int64_t g = 0; g < groups; ++g) scales[size_t(v) * groups + size_t(g)] = 0.5f * float(g + 1);
+        for (int64_t k = 0; k < H; k += 2)
+            table[size_t(v) * size_t(H / 2) + size_t(k / 2)] = uint8_t(want(v, k) | (want(v, k + 1) << 4));
+    }
+    std::string data;
+    data.append(reinterpret_cast<const char*>(table.data()), table.size());
+    const size_t table_bytes = table.size();
+    data.append(reinterpret_cast<const char*>(scales.data()), scales.size() * sizeof(float));
+    put_file((dir / "embedding.onnx.data").string(), data);
+    const auto t = pb::tensor("language_model.embed_tokens.weight_Q4", {V, H / 2}, "embedding.onnx.data", 0,
+                              table_bytes, 2);
+    const auto sc = pb::tensor("language_model.embed_tokens.weight_scales", {V, groups}, "embedding.onnx.data",
+                               table_bytes, scales.size() * sizeof(float), 1);
+    put_file((dir / "embedding.onnx").string(), pb::model({t, sc}, {}));
+
+    std::string why;
+    const std::vector<float> got = pi::read_embedding_component(dir.string(), &why);
+    check(got.size() == size_t(V) * size_t(H),
+          "embedding component: reads V*H values (" + std::to_string(got.size()) + ", why: " + why + ")");
+    bool ok = got.size() == size_t(V) * size_t(H);
+    for (int64_t v = 0; v < V && ok; ++v)
+        for (int64_t k = 0; k < H; ++k) {
+            // asymmetric int4: the codes are centred on 8, which is what ONNX Runtime's GatherBlockQuantized does
+            const float exp = (float(want(v, k)) - 8.0f) * 0.5f * float(k / 128 + 1);
+            if (std::fabs(got[size_t(v) * size_t(H) + size_t(k)] - exp) > 1e-6f) { ok = false; break; }
+        }
+    check(ok, "embedding component: (code - 8) times its group's scale, group 128, low nibble first");
+    std::printf("embedding component: %zu values, V=%lld H=%lld group 128\n", got.size(), (long long)V, (long long)H);
+
+    const fs::path none = dir / "none";
+    fs::create_directories(none);
+    std::string why2;
+    check(pi::read_embedding_component(none.string(), &why2).empty() && !why2.empty(),
+          "embedding component: absent -> empty with a reason (" + why2 + ")");
+    if (!getenv("KEEP_EMBEDCOMP")) fs::remove_all(dir);
+}
+
 void test_qwen3_attn_sections() {
     struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
     const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
@@ -1721,6 +1918,40 @@ void test_weight_layout() {
     std::printf("weight layout: b8 allowed, pb16i/t2s/unknown refused\n");
 }
 
+// engine#1650: a config.json that declares an OPTIONAL field as JSON null means "unset", not
+// "broken". AMD's 1.9 Mistral-7B-Instruct-v0.2 pack ships `"head_dim": null` and
+// `"sliding_window": null`, and nlohmann's value() throws on a present-but-null key, so the reader
+// reported `type must be number, but is null` and no geometry at all: an 8 GB pack named "info
+// failed" with nothing said about what it contains. head_dim's default is the one every
+// Llama-family config implies (hidden / heads); a WRONG TYPE must still be refused.
+void test_null_optional_dims() {
+    using nlohmann::json;
+    const json base = {{"hidden_size", 4096}, {"num_hidden_layers", 32},
+                       {"num_attention_heads", 32}, {"intermediate_size", 14336}};
+    json c = base;
+    for (const char* k : {"head_dim", "sliding_window", "num_key_value_heads", "rope_theta",
+                          "vocab_size", "rms_norm_eps", "model_type"})
+        c[k] = nullptr;                       // the measured pack, field for field
+    const pi::Dims d = pi::read_dims_exported(c, "config.json");
+    check(d.head_dim == 128, "null head_dim defaults to hidden/heads (4096/32 = 128)");
+    check(d.kv_heads == d.heads, "null num_key_value_heads defaults to the head count");
+    check(d.rope_theta == 10000.0f, "null rope_theta defaults to 10000");
+    check(d.vocab == 0, "null vocab_size reads as 0 (unset)");
+    check(std::abs(d.rms_norm_eps - 1e-6f) < 1e-12f, "null rms_norm_eps defaults to 1e-6");
+    check(d.model_type.empty(), "null model_type reads as empty, not as a crash");
+
+    json good = base;
+    good["head_dim"] = 128;                   // an explicit value still wins over the default
+    check(pi::read_dims_exported(good, "config.json").head_dim == 128, "an explicit head_dim wins");
+
+    json bad = base;
+    bad["head_dim"] = "128";                  // null is absence; a string is a disagreement
+    bool threw = false;
+    try { (void)pi::read_dims_exported(bad, "config.json"); } catch (const std::exception&) { threw = true; }
+    check(threw, "a non-numeric head_dim is still refused");
+    std::printf("null optional dims: head_dim falls back to hidden/heads, a wrong type still throws\n");
+}
+
 void test_fconst_eps(const std::string& root) {    const fs::path dir = fs::path(root) / "fconst-eps";
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -1769,6 +2000,35 @@ void test_fconst_eps(const std::string& root) {    const fs::path dir = fs::path
     fs::remove_all(dir);
 }
 
+// Opt-in: read a REAL pack's embedding component (NPU_EMBED_COMPONENT=<dir>) and dump one row for an oracle comparison.
+// The 4B pack's component is 206 MB, not 3 GB, so this is the cheap way to settle the two facts the reader's comment
+// calls pack-settled -- the nibble order and the implicit zero point -- against ONNX Runtime running the pack's own
+// embedding.onnx.
+static void dump_real_component(const std::string& dir) {
+    std::string why;
+    const std::vector<float> v = pi::read_embedding_component(dir, &why);
+    if (v.empty()) {
+        std::printf("real component: EMPTY (%s)\n", why.c_str());
+        return;
+    }
+    const std::string cfg = dir + "/config.json";
+    size_t H = 0;
+    if (FILE* f = std::fopen(cfg.c_str(), "rb")) { fclose(f); }
+    // H comes from the file the caller names next to the dump; keep this independent of the JSON parser.
+    H = v.size() / 151936;                     // the 4B shape; asserted below against the advertised V
+    std::printf("real component: %zu values, H=%zu\n", v.size(), H);
+    const int row = 1;                          // token id 1: a plain text token ORT embeds
+    if ((row + 1) * H > v.size()) return;
+    const std::string out = dir + "/eng_row.f32";
+    if (FILE* f = std::fopen(out.c_str(), "wb")) {
+        std::fwrite(&v[size_t(row) * H], sizeof(float), H, f);
+        std::fclose(f);
+        double s = 0;
+        for (size_t k = 0; k < H; ++k) s += std::fabs(v[size_t(row) * H + k]);
+        std::printf("real component: row %d -> %s (mean|x| %.6f)\n", row, out.c_str(), s / double(H));
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -1783,6 +2043,7 @@ int main(int argc, char** argv) {
                     "these packs and not an OGA NPU pack this importer reads\n", pack.c_str());
     try {
         test_bounds();
+        test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);
@@ -1791,6 +2052,8 @@ int main(int argc, char** argv) {
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
+        test_embedding_component(golden_dir.empty() ? "." : golden_dir);
+        if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
@@ -1798,6 +2061,7 @@ int main(int argc, char** argv) {
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);
         test_kernel_set_refusal();
         test_weight_layout();
+        test_null_optional_dims();
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

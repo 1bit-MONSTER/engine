@@ -90,7 +90,19 @@ try:
     check(r.returncode == 0, f"a non-AXB35 board exits 0 (rc={r.returncode})")
     check("NOT THIS BOARD" in r.stdout, "and says NOT THIS BOARD rather than reporting a verdict")
     r2 = run(t, "--require-awake")
-    check(r2.returncode == 0, "… and --require-awake on a non-board machine is not a failure either")
+    check(r2.returncode == 1, "--require-awake FAILS on a non-board machine: the precondition cannot be confirmed here")
+    check("NOT a precondition met" in r2.stdout, "and says so rather than exiting quietly")
+
+    # 1b. the board's DMI gate matches but NO function carries the rule's device ids: nothing would be kept awake, so a
+    #     plug test would prove nothing - --require-awake must fail closed here too (the class this fix is about).
+    t = os.path.join(tmp, "bind-nothing")
+    make_tree(t, "AXB35-02", [("0000:c5:00.4", "0x9999", "xhci_hcd", "D0", "on")])   # a device id the rule does not name
+    r = run(t)
+    check(r.returncode == 0, f"report mode still exits 0 when the rule would bind nothing (rc={r.returncode})")
+    check("would bind nothing" in r.stdout, "and says the rule would bind nothing")
+    r2 = run(t, "--require-awake")
+    check(r2.returncode == 1, "--require-awake FAILS when the rule would bind nothing (nothing is being kept awake)")
+    check("NOT a precondition met" in r2.stdout, "and says so")
 
     # 2. the board, three asleep (what a stock Ubuntu boot looks like): report passes, --require-awake must not
     t = os.path.join(tmp, "asleep")

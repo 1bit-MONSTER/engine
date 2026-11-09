@@ -368,12 +368,6 @@ const uint8_t* at(const Fconst& f, int64_t off, int64_t len) {
 // field, the readout and the note all have to agree on it: three copies of 0.99 is how they drifted apart before.
 constexpr double kTieCorr = 0.99;
 
-struct Fconst19Rule {
-    int hidden, heads, layers;
-    int64_t prefix;   // bytes before the q/k/v bundle: the norms, and on Qwen3 the per-head QK gains too
-    int n_tiles, rot;
-    int64_t tile;
-};
 // Every entry was measured by diffing the 1.9 pack against the 1.8 pack of the SAME model: the bundle's tile shape and
 // its rotation are not derivable from the pack, and neither is `prefix`. It was tempting to read the extra bytes as
 // Qwen3's per-head QK norm gains, but Llama-3.2-1B -- which has no QK norms at all -- carries the same +4,352 at hidden
@@ -420,6 +414,37 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // all 32 blocks. This is the largest family on #1503 (31 packs). Measured by another lane on main, whose
     // table is keyed on geometry; merged here in the same form.
 };
+
+const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
+                                   std::string* why) {
+    const Fconst19Rule* found = nullptr;
+    std::string ambiguity;
+    for (int i = 0; i < count; ++i) {
+        const Fconst19Rule& r = rules[i];
+        if (r.hidden != hidden || r.heads != heads || r.layers != layers) continue;
+        if (!found) { found = &r; continue; }
+        if (r.prefix != found->prefix || r.n_tiles != found->n_tiles || r.rot != found->rot || r.tile != found->tile)
+            ambiguity += (ambiguity.empty() ? "" : " and ") + std::string("prefix ") + std::to_string(found->prefix) +
+                         "/" + std::to_string(r.prefix) + " B, " + std::to_string(found->n_tiles) + "/" +
+                         std::to_string(r.n_tiles) + " tiles of " + std::to_string(found->tile) + "/" +
+                         std::to_string(r.tile) + " B, rot " + std::to_string(found->rot) + "/" + std::to_string(r.rot);
+    }
+    if (!ambiguity.empty()) {
+        if (why)
+            *why = "hidden " + std::to_string(hidden) + ", " + std::to_string(heads) + " heads, " +
+                   std::to_string(layers) + " layers has been measured with two DIFFERENT block shapes (" + ambiguity +
+                   "). Which one a pack needs cannot be decided from its geometry, and choosing either would rotate its"
+                   " weights into the wrong projections and answer quietly wrong text, so this refuses: measure this"
+                   " pack against its own 1.8 twin with tools/fconst19_measure.py and keep one row per geometry";
+        return nullptr;
+    }
+    if (!found && why)
+        *why = "its block shape has not been measured for hidden " + std::to_string(hidden) + ", " +
+               std::to_string(heads) + " heads, " + std::to_string(layers) +
+               " layers. The tile shape cannot be derived from the pack, so decoding it would be a guess: the 1.8 pack"
+               " of the same model is what establishes it.";
+    return found;
+}
 
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes
 // it a test rather than a magic number. 0x00007fff is the big-endian reading of those four bytes; the bytes
@@ -473,17 +498,13 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
         unmap_file(fc.map, fc.size);
         return path;
     }
-    const Fconst19Rule* rule = nullptr;
-    for (const auto& r : kFconst19Rules)
-        if (r.hidden == hidden && r.heads == heads && r.layers == layers) rule = &r;
+    std::string rule_why;
+    const Fconst19Rule* rule = select_fconst19_rule(hidden, heads, layers, &rule_why);
     if (!rule) {
         unmap_file(fc.map, fc.size);
-        throw std::runtime_error(
-            path + ": this is a Ryzen AI 1.9 Token .fconst (it carries " + std::to_string(layers) +
-            " headers of " + std::to_string(heads * 4) + " B, one per layer, 00 00 7f ff per head), and its block "
-            "shape has not been measured for hidden " + std::to_string(hidden) + ", " + std::to_string(heads) +
-            " heads, " + std::to_string(layers) + " layers. The tile shape cannot be derived from the pack, so "
-            "decoding it would be a guess: the 1.8 pack of the same model is what establishes it.");
+        throw std::runtime_error(path + ": this is a Ryzen AI 1.9 Token .fconst (it carries " +
+                                 std::to_string(layers) + " headers of " + std::to_string(heads * 4) +
+                                 " B, one per layer, 00 00 7f ff per head), and " + rule_why);
     }
     const int64_t hdr_len = int64_t(heads) * 4;
     const int64_t stride8 = stride9 - hdr_len;
@@ -1327,6 +1348,20 @@ int64_t group_bytes(int64_t k, int rows) {
 namespace {
 double corr(const Q4& q, const uint8_t* embed, int H, int rows);   // defined below, internal to this file
 }
+namespace {
+const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
+                                   std::string* why);   // defined with the table, internal to this file
+}
+const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std::string* why) {
+    return select_rule_in(kFconst19Rules, int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0])), hidden, heads, layers,
+                          why);
+}
+
+const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
+                                              std::string* why) {
+    return select_rule_in(rules, count, hidden, heads, layers, why);
+}
+
 double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows) { return corr(q, embed_bf16, H, rows); }
 
 int64_t attn_tile_bytes(int64_t k) { return group_bytes(k, kTileRows); }

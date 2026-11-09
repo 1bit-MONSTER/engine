@@ -338,6 +338,27 @@ unsigned short bf16_bits_of(float v);
 Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
+// One measured Ryzen AI 1.9 Token .fconst block shape (engine#1503). Every field is measured against the 1.8 pack of
+// the same model by tools/fconst19_measure.py; none of it is derivable from the pack, which is why a pack whose shape
+// is not in the table is refused rather than decoded.
+struct Fconst19Rule {
+    int hidden, heads, layers;
+    int64_t prefix;   // bytes before the q/k/v bundle
+    int n_tiles, rot;
+    int64_t tile;
+};
+
+// The row for a geometry, or nullptr with `why` explaining which of the two reasons applies: the geometry has never
+// been measured, or it has been measured MORE THAN ONCE with different shapes (two models can share hidden/heads/layers
+// and still cut the payload differently -- Qwen3-1.7B and Llama-3.2-1B are both 2,048/32 heads and use 3 x 1,183,744
+// against 5 x 591,872). A wrong row gets the ROTATION wrong, which leaves the prefix and the epsilon anchors untouched,
+// so it reads as a correct parse and answers quiet nonsense; that is why an ambiguous table refuses instead of picking.
+const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std::string* why);
+// The same decision over an explicit table, so a test can hand it the one shape that decides correctness and that the
+// real table must never contain: two rows for one geometry with different shapes.
+const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
+                                              std::string* why);
+
 int64_t attn_tile_bytes(int64_t k);
 // Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,
 // exported so a test can pin the buffer width it decodes).

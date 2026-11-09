@@ -607,11 +607,19 @@ payload_identity_verdict() {   # <payload_lemond claimed> <what the launcher rep
         printf 'FAIL the payload'"'"'s launcher reported no version, so the identity'"'"'s claim (%s) cannot be checked against it' "$_pc"
         return 0
     fi
-    if [ "$_pc" = "$_pa" ]; then
-        printf 'PASS the payload on this machine is the one the identity names: its own launcher reports %s, and the identity claims the same' "$_pa"
+    # COMPARE THE PIN, NOT THE WHOLE STRING. `lemond --version` is `2026.47.0~1.52a2a6b3`, and the `~N` is the commit count of
+    # the CHECKOUT IT WAS BUILT IN (docs/releases.md: a depth-1 clone reports ~1, a full clone ~1752 for the same commit; c18
+    # printed ~5). So the whole string is not a fact about the payload: an image built from a depth-1 clone and a machine payload
+    # built from a full clone carry the same code and print different strings, and comparing them would red on a CORRECT pair.
+    # What is a fact about the payload is the week pin and the trailing sha - `2026.47.0` and `52a2a6b3` - so the count is dropped
+    # on both sides before comparing, and the verdict says so.
+    _pc_pin=$(printf '%s' "$_pc" | sed 's/~[0-9]*\././')
+    _pa_pin=$(printf '%s' "$_pa" | sed 's/~[0-9]*\././')
+    if [ -n "$_pc_pin" ] && [ "$_pc_pin" = "$_pa_pin" ]; then
+        printf 'PASS the identity claims payload_lemond=%s and the payload'"'"'s own launcher reports the same pin (%s, clone count ignored: the ~N is commits in the checkout that built it)' "$_pc" "$_pa_pin"
     else
-        printf 'FAIL the identity claims payload_lemond=%s but the payload here reports %s - the name is stale or the payload is not the one that was packed (engine#1557)' \
-            "$_pc" "$_pa"
+        printf 'FAIL the identity claims payload_lemond=%s (pin %s) but the payload here reports %s (pin %s) - the name is stale, or the payload is not the one that was packed (engine#1557)' \
+            "$_pc" "${_pc_pin:-?}" "$_pa" "${_pa_pin:-?}"
     fi
 }
 
@@ -678,6 +686,43 @@ memlock_verdict() {
     esac
     printf 'FAIL %s'"'"'s locked-memory soft limit is %s bytes, not unlimited, so a large NPU buffer allocation fails with "Lock limit exceeded"%s - that is the limit IN FORCE in the process; the files that ask for one are the highest-numbered limits.d files and /etc/profile.d, and a process can also fail to inherit an unlimited file (measured 2026-11-08: a lemond started outside the appliance'\''s sessions had 8388608 while this box'\''s own 99- file says unlimited)' \
         "$_p" "$_v" "${_f:+ (highest-numbered memlock file: $_f)}"
+}
+
+# ── the payload= label against the payload the image ships (engine#1557, containment) ───────────────
+# `payload=` is a LABEL (the tarball stem, which no in-image fact equals) and the row above checks the payload's own version. Neither
+# settles the incident: an image carrying payload=…c26c with a correctly computed payload_lemond passes both. The one in-image fact that
+# DOES name the cycle is the payload's own README - `opt/1bit-package/1bit/README.txt` line 1 states `1bit engine rc-YYYY-MM-DD-cNN` - and
+# `payload=` CONTAINS that token (it never equals it: the label carries the stem). So the comparison is containment, on the first line only.
+payload_name_verdict() {
+    _pn=${1:-} _pt=${2:-}
+    case "$_pn" in
+        '')
+            printf 'FAIL the identity file states no payload at all (payload= is empty), so nothing says which payload this image carries' ;;
+        unknown)
+            printf 'FAIL the identity file states payload=unknown - the value is an environment input (container-build.sh: PAYLOAD_NAME), so "unknown" means the build never named what it shipped' ;;
+        *)
+            if [ -z "$_pt" ]; then
+                printf 'SKIP the payload ships no release tag in its README, so payload=%s cannot be checked in the image (the tarball name lives beside the bundle, not in the image)' "$_pn"
+            else
+                # the label must CONTAIN the token with a BOUNDARY after it: `c33x` must not match `c33`, `c3` must not match `c33`.
+                # Unanchored containment passed `…-c26b` against a `c26c` payload, and those letter-suffixed names are exactly the
+                # incident's (this box carries payload-c17b, -c26b and -c26c).
+                case "$_pn" in
+                    *"$_pt"|*"$_pt"[!0-9a-z]*) printf 'PASS consistent: the identity says payload=%s and the payload ships %s' "$_pn" "$_pt" ;;
+                    *) printf 'FAIL the identity says payload=%s but the payload ships %s - payload= is a declared environment input, so this image names a release it does not carry (c32 and c33 shipped exactly this)' "$_pn" "$_pt" ;;
+                esac
+            fi ;;
+    esac
+}
+
+payload_name_from_image() {  # <identity file> <payload dir>
+    _pi=${1:-} _pd=${2:-}
+    _pval=$(sed -n 's/^payload=//p' "$_pi" 2>/dev/null | head -1)
+    _ptag=
+    if [ -n "$_pd" ] && [ -f "$_pd/1bit/README.txt" ]; then
+        _ptag=$(sed -n '1s/.*\(rc-[0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*-c[0-9][0-9]*[a-z]*\).*/\1/p' "$_pd/1bit/README.txt" 2>/dev/null)
+    fi
+    payload_name_verdict "$_pval" "$_ptag"
 }
 
 payload_modes_verdict() {   # <writable files> <writable directories> [<sample>]
@@ -801,6 +846,21 @@ if [ "${1:-}" = --self-test ]; then
     check /y/1bit/1bit "$(PAYLOAD_DIR=/y identity_launcher_path aa '')"                    # PAYLOAD_DIR is honoured
     if [ -z "$(identity_launcher_path '' bbbb)" ]; then printf 'ok   no claim yields no path (the row SKIPs)\n'
     else printf 'FAIL no claim should yield no path\n'; rc=1; fi
+    check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26 rc-2026-11-05-c26c)"       # c26 must NOT match c26c
+    check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26b rc-2026-11-05-c26c)"      # nor c26b
+    check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33x rc-2026-11-08-c33)"        # the token must END there, not continue
+    check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33.tar rc-2026-11-08-c33)"    # a non-alphanumeric after it is fine
+    check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26c rc-2026-11-05-c26c)"      # the real c26c pair still passes
+    check PASS "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 rc-2026-11-08-c33)"        # the label CONTAINS the token
+    check FAIL "$(payload_name_verdict lemonade-onebit-rc-2026-11-05-c26c rc-2026-11-08-c33)"        # the c26 incident: must red
+    check SKIP "$(payload_name_verdict lemonade-onebit-rc-2026-11-08-c33 '')"                        # no README tag: not a pass by absence
+    check FAIL "$(payload_name_verdict unknown rc-2026-11-08-c33)"                                   # PAYLOAD_NAME unset
+    check FAIL "$(payload_name_verdict '' rc-2026-11-08-c33)"                                        # nothing stated
+    check PASS "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 2026.47.0~1.52a2a6b3)"
+    check PASS "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 2026.47.0~1752.52a2a6b3)"   # the clone-count case: must NOT red
+    check FAIL "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 2026.47.0~1.abcdef01)"      # a different sha IS a different pin
+    check SKIP "$(payload_identity_verdict '' 2026.47.0~1.52a2a6b3)"
+    check FAIL "$(payload_identity_verdict 2026.47.0~1.52a2a6b3 '')"
     check PASS "$(memlock_verdict unlimited lemond)"
     check FAIL "$(memlock_verdict 65536 lemond /etc/security/limits.d/99-amdnpu-memlock.conf)"   # a user's 99- winning over our 90-
     check FAIL "$(memlock_verdict 4294967296 1bit)"                                             # finite is not what the driver asks for
@@ -2114,6 +2174,23 @@ case "$ML" in
     SKIP*) skip memlock "${ML#SKIP }" ;;
     *)     fail memlock "${ML#FAIL }" ;;
 esac
+
+
+# ── the payload= label is consistent with the payload the image ships (engine#1557) ──────────────
+if [ ! -f "$ID" ]; then
+    skip payload-name "no $ID in this image build, so there is no payload label to read (an image older than the identity file is not wrong, it is silent)"
+elif [ -n "${_id_gitsha:-}" ]; then
+    skip payload-name "this image's identity is the mini schema (tag/engine/engine_sha256/built), which carries no payload= label and no ${PAYLOAD_DIR:-/opt/1bit-package}: there is nothing here to check"
+elif [ ! -d "${PAYLOAD_DIR:-/opt/1bit-package}" ]; then
+    skip payload-name "no ${PAYLOAD_DIR:-/opt/1bit-package} in this image, so the payload's own README cannot be read"
+else
+    PNV=$(payload_name_from_image "$ID" "${PAYLOAD_DIR:-/opt/1bit-package}")
+    case "$PNV" in
+        PASS*) pass payload-name "${PNV#PASS }" ;;
+        SKIP*) skip payload-name "${PNV#SKIP }" ;;
+        *)     fail payload-name "${PNV#FAIL }" ;;
+    esac
+fi
 
 say ""
 # The back-off leaves a trace: a run that only passed because the partition freed in time must say so, or the next

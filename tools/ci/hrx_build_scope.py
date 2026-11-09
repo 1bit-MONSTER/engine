@@ -66,20 +66,56 @@ def workflow_triggers(path=WORKFLOW):
 
 
 def is_trigger(path, triggers):
-    return triggers is None or any(path == t or path.startswith(t.rstrip("/") + "/") for t in triggers)
+    # A trailing `/**` (GitHub's "everything under") is the directory prefix; any other entry is a path or a directory.
+    def under(t):
+        t = t[:-3] if t.endswith("/**") else t
+        return path == t or path.startswith(t.rstrip("/") + "/")
+    return triggers is None or any(under(t) for t in triggers)
+
+
+# engine#1696: every registration lives in its own file under cmake/tests/, included by CMakeLists.txt. Such a file is
+# a registration file like CMakeLists.txt, with one more kind of line: the single `if(<condition>)` / `else()` /
+# `endif()` guard each file wraps its registration in. That guard is evaluated at configure time only, which is what
+# configure-only still runs, and it creates no target.
+REGISTRATION_DIR = "cmake/tests/"
+
+
+def is_registration_file(path):
+    return path == "CMakeLists.txt" or (path.startswith(REGISTRATION_DIR) and path.endswith(".cmake")
+                                        and "/" not in path[len(REGISTRATION_DIR):])
 
 REGISTRATION = re.compile(r"^\s*(add_test\s*\(|set_tests_properties\s*\(|set_property\s*\(\s*TEST\b)")
 BENIGN = re.compile(r"^\s*(#|$)")
 BLOCK_OPEN = re.compile(r"^\s*(foreach|function|macro)\s*\(", re.IGNORECASE)
+GUARD = re.compile(r"^\s*(if\s*\([^()]*\)|else\s*\(\s*\)|endif\s*\([^()]*\))\s*(#.*)?$", re.IGNORECASE)
 
 
-def classify_line(line):
-    """What a changed CMake line is, for the balance check."""
+def classify_line(line, guards=False):
+    """What a changed CMake line is, for the balance check. `guards`: the line is in a cmake/tests/ file."""
     if BENIGN.match(line):
         return "benign"
     if REGISTRATION.match(line):
         return "registration"
+    if guards and GUARD.match(line):
+        return "benign"
     return "other"
+
+
+def split_diff(cmake_diff):
+    """{path: (added lines, removed lines)} from a unified diff over the registration files."""
+    out, cur = {}, None
+    for l in cmake_diff.splitlines():
+        if l.startswith("+++ "):
+            cur = l[4:].strip()
+            cur = cur[2:] if cur.startswith("b/") else cur
+            out.setdefault(cur, ([], []))
+        elif l.startswith("--- "):
+            continue
+        elif cur is not None and l.startswith("+"):
+            out[cur][0].append(l[1:])
+        elif cur is not None and l.startswith("-"):
+            out[cur][1].append(l[1:])
+    return out
 
 
 def decide(changed_paths, cmake_diff, triggers=None):
@@ -93,19 +129,23 @@ def decide(changed_paths, cmake_diff, triggers=None):
     paths = sorted({p for p in changed_paths if p and is_trigger(p, triggers)})
     if not paths:
         return "full", "no changed path is one of the workflow's triggers (a manual run): not provable"
-    other = [p for p in paths if p != "CMakeLists.txt"]
+    other = [p for p in paths if not is_registration_file(p)]
     if other:
-        return "full", f"{len(other)} changed path(s) outside CMakeLists.txt ({', '.join(other[:3])})"
-    added = [l[1:] for l in cmake_diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
-    removed = [l[1:] for l in cmake_diff.splitlines() if l.startswith("-") and not l.startswith("---")]
-    if not added and not removed:
-        return "full", "CMakeLists.txt appears in the diff with no line changes (rename or mode change): not provable"
-    kinds_add = [classify_line(l) for l in added]
-    kinds_del = [classify_line(l) for l in removed]
-    for kind, lines in (("added", added), ("removed", removed)):
-        for line, kind_of_line in zip(lines, [classify_line(l) for l in lines]):
-            if kind_of_line == "other":
-                return "full", f"{kind} line is not a ctest registration: {line.strip()[:80]!r}"
+        return "full", f"{len(other)} changed path(s) outside the registration files ({', '.join(other[:3])})"
+    per_file = split_diff(cmake_diff)
+    added, removed, kinds_add = [], [], []
+    for p in paths:
+        a, r = per_file.get(p, ([], []))
+        if not a and not r:
+            return "full", f"{p} appears in the diff with no line changes (rename, mode change or deletion): not provable"
+        guards = p != "CMakeLists.txt"
+        for kind, lines in (("added", a), ("removed", r)):
+            for line in lines:
+                if classify_line(line, guards) == "other":
+                    return "full", f"{kind} line in {p} is not a ctest registration: {line.strip()[:80]!r}"
+        added += a
+        removed += r
+        kinds_add += [classify_line(l, guards) for l in a]
     # No equality requirement: a PR that only *adds* registrations is exactly the case this exists for, and a
     # registration swapped for anything else was already caught above by the per-line kind check (a
     # `target_link_libraries` + line is "other", not "registration").
@@ -116,12 +156,13 @@ def decide(changed_paths, cmake_diff, triggers=None):
     if not [k for k in kinds_add if k == "registration"]:
         return "full", "no ctest registration line is being ADDED (a pure removal cannot be told from a rewrite)"
     return "configure-only", (f"{len([k for k in kinds_add if k == 'registration'])} ctest registration line(s), "
-                              f"CMakeLists.txt only")
+                              f"in {', '.join(paths)}")
 
 
 def from_git(base, head):
     names = subprocess.run(["git", "diff", "--name-only", base, head], capture_output=True, text=True, check=True)
-    diff = subprocess.run(["git", "diff", base, head, "--", "CMakeLists.txt"], capture_output=True, text=True, check=True)
+    diff = subprocess.run(["git", "diff", base, head, "--", "CMakeLists.txt", REGISTRATION_DIR],
+                          capture_output=True, text=True, check=True)
     return decide(names.stdout.splitlines(), diff.stdout, workflow_triggers())
 
 
@@ -167,17 +208,37 @@ def self_test():
         ("a registration plus a trigger path (app/serve.cpp)", ["CMakeLists.txt", "app/serve.cpp"], one_reg, "full"),
         ("a registration plus a gitlink bump", ["CMakeLists.txt", "third_party/llama.cpp"], one_reg, "full"),
         ("a file under a trigger directory", ["CMakeLists.txt", "cmake/hrx.cmake/x"], one_reg, "full"),
+    ]
+    # engine#1696: a test is added as its own cmake/tests/NNN_<name>.cmake, so that directory is a trigger and its
+    # files are registration files. The license header and the one if()/endif() guard are what such a file adds.
+    trig16 = trig + ["cmake/tests/**"]
+    new_file = ("+++ b/cmake/tests/180_t.cmake\n@@ -0,0 +1,5 @@\n+# Copyright 2026 x\n+if(ONEBIT_HRX)\n"
+                "+add_test(NAME t COMMAND t)\n+set_tests_properties(t PROPERTIES RESOURCE_LOCK gpu)\n+endif()\n")
+    tcases += [
+        ("#1696: a new cmake/tests/ file with its guard, plus its test script",
+         ["cmake/tests/180_t.cmake", "tests/t_test.sh"], new_file, "configure-only"),
+        ("#1696: a cmake/tests/ file that also adds an executable (a target: must build)",
+         ["cmake/tests/180_t.cmake"], new_file + "+add_executable(t tests/t.cpp)\n", "full"),
+        ("#1696: a cmake/tests/ file with a loop",
+         ["cmake/tests/180_t.cmake"], new_file + "+foreach(x IN LISTS y)\n", "full"),
+        ("#1696: a guard with a nested call is not a bare guard",
+         ["cmake/tests/180_t.cmake"], new_file.replace("if(ONEBIT_HRX)", "if(EXISTS $(foo))"), "full"),
+        ("#1696: a deleted cmake/tests/ file (no added registration)",
+         ["cmake/tests/180_t.cmake"], "+++ /dev/null\n", "full"),
+        ("#1696: a file in a subdirectory of cmake/tests/ is not a registration file",
+         ["cmake/tests/sub/x.cmake"], "+++ b/cmake/tests/sub/x.cmake\n+add_test(NAME t COMMAND t)\n", "full"),
         ("no trigger path at all (a manual run)", ["docs/x.md"], "", "full"),
     ]
     bad = 0
     for name, paths, diff, want in tcases:
-        got, why = decide(paths, diff, trig)
+        got, why = decide(paths, diff, trig16 if name.startswith("#1696") else trig)
         ok = got == want
         print(("ok   " if ok else "FAIL ") + f"{name} -> {got}" + ("" if ok else f" (wanted {want}: {why})"))
         bad += 0 if ok else 1
     real = workflow_triggers()
     ok = bool(real) and "CMakeLists.txt" in real and "cmake/hrx.cmake" in real
-    print(("ok   " if ok else "FAIL ") + f"hrx-build.yml's paths filter reads as {len(real or [])} trigger(s)")
+    print(("ok   " if ok else "FAIL ") + f"hrx-build.yml's paths filter reads as {len(real or [])} trigger(s)"
+          + ("" if "cmake/tests/**" in (real or []) else " (cmake/tests/** not yet among them: engine#1696)"))
     bad += 0 if ok else 1
     for name, paths, diff, want in cases:
         got, why = decide(paths, diff)

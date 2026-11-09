@@ -769,9 +769,6 @@ if(Python3_Interpreter_FOUND)
     # engine#1070: every configured test that starts a server holds RESOURCE_LOCK route_ports, so
     # the list at the end of this file cannot drift away from the tests it protects. Reads the
     # configured test list (ctest -N --show-only=json-v1); no device, no model, no build products.
-    # Ending a serve must end the process that holds the memory: `1bit serve` is a wrapper and the model lives in the
-# `llama-server` child (engine #1653 review). Device-free: it drives the helper against a synthetic wrapper.
-add_test(NAME serve_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_kill_tree_test.sh)
 add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/route_port_lock_test.py ${CMAKE_CTEST_COMMAND} ${CMAKE_BINARY_DIR})
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
@@ -1307,6 +1304,14 @@ add_test(NAME npu_private_route COMMAND npu_private_route_test)
 target_link_libraries(onebit PRIVATE onebit_npu)
 target_compile_definitions(onebit PRIVATE ONEBIT_NPU_HOST)
 endif()  # ONEBIT_NPU_HOST
+
+# Device-free: `tests/serve_kill_tree_test.sh` drives the helper against a synthetic wrapper, so this needs neither
+# the NPU host lane nor Python -- registered unconditionally. It sat inside ONEBIT_NPU_HOST /
+# Python3_Interpreter_FOUND by accident (appended next to route_port_lock in engine #1653), which silently
+# unregistered it in any build with -DONEBIT_NPU_HOST=OFF.
+# Ending a serve must end the process that holds the memory: `1bit serve` is a wrapper and the model lives in the
+# `llama-server` child (engine #1653 review). Device-free: it drives the helper against a synthetic wrapper.
+add_test(NAME serve_kill_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_kill_tree_test.sh)
 
 # The lane itself: needs the NPU runtime and an XDNA NPU to run.
 option(ONEBIT_NPU "Build the NPU lane (needs the private NPU runtime: ONEBIT_NPU_RT_LIB or ONEBIT_NPU_RT_DIR)" OFF)

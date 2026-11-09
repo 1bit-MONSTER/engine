@@ -61,3 +61,33 @@ for each configuration goes to `--log-dir` (default `bench-logs/`), including th
 
 `tests/bench_selftest.sh` (ctest `bench_selftest`) runs the tool against `1bit serve` with
 `tests/fake_backend.py` behind it, without a GPU.
+
+## The prefill flash-attention ratio: `tools/fa_ratio.py`
+
+Whether the HRX flash-attention path is worth anything for prefill is an end-to-end question here, because the two
+instruments that would answer it per dispatch are closed on this hardware:
+
+- `rocprofv3` records **nothing** for HRX — the runtime `dlopen`s its own ROCr and writes its own AQL packets, so a
+  profiler that intercepts the system ROCr never attaches;
+- the runtime's own HAL profiler (`HRX_PROFILE_MODE=dispatch` with `HRX_PROFILE_FILE`) produces **no file** on a shipped
+  payload, and adding `HRX_GPU_DEBUG=1` — the only way its sink and begin paths report failure — prints nothing either,
+  which means the sink-owning path is not executed there.
+
+What is left is the comparison a user can make with the shipped binary: the same model and shape with `-fa 1` and with
+`-fa 0`. `tools/fa_ratio.py` runs that comparison in **adjacent pairs** (one `-fa 1` and one `-fa 0` back to back, with
+the pair order alternating so slow drift cancels) and reports the **median of the per-pair ratios**, not the level of any
+arm — because on a shared box the levels move by an order of magnitude inside one ticket while a pair taken seconds
+apart moves far less.
+
+A run is only quoted when its own pairs agree: with fewer than three pairs, or with `max/min` of the ratios above
+`--tolerance` (default 1.25), the tool prints `VOID` and exits 3. Measured on a Strix Halo box with a 0.6B model at
+pp2048:
+
+| run | pairs | median ratio | spread | verdict |
+|---|---|---|---|---|
+| quiet box | 4 | **1.273×** (1 774.17 / 1 388.34 tok/s) | 1.08× | ACCEPTED — the FA path is worth ~21 % of the `-fa 0` time, 0.156 ms per 2048-token forward |
+| busy box (load 73, 20 GiB of foreign models resident) | 3 | — | 9.29× | VOID — the same arms spanned 161 to 1 773 tok/s |
+
+`-fa 0` is usable only below roughly 5.4k context on this route (it segfaults above that), which is why the default shape
+is pp2048. The self-test (`ctest fa_ratio_estimator`) exercises the estimator without a GPU: it accepts agreement, refuses
+disagreement, and checks that a run whose row failed to parse cannot shift the arms of the pair after it.

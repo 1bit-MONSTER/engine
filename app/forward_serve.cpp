@@ -1062,7 +1062,12 @@ int run_forward_serve(int argc, char** argv) {
             std::fprintf(stderr, "1bit forward-serve: warm-up pass failed (%s); serving anyway -- the first request "
                                  "will pay it\n", e.fwd->last_error());
         } else {
-            std::fprintf(stderr, "1bit forward-serve: warm-up pass %.1f ms (weight cache warm; "
+            // The caveat is in the log line, not only the PR: the warm-up covers the TOKEN-INVARIANT weights (wkey >=
+            // 0, "packed once and reused" -- xdna_target.cpp). Routed-expert weights are wkey < 0 and are deliberately
+            // never cached ("whose weights change per token"), so on a MoE pack the warm-up is NOT the whole first-touch
+            // cost and a reader must not expect the same 44.5 s to disappear.
+            std::fprintf(stderr, "1bit forward-serve: warm-up pass %.1f ms (token-invariant weights only -- routed MoE "
+                                 "experts are never cached, so a MoE pack still pays per-expert packing; "
                                  "NPU_SERVE_NO_WARMUP=1 to skip)\n", wms);
         }
     }

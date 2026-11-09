@@ -2764,11 +2764,27 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                     r.ctrl_corr_rowshift = (sxy - sx * sy / m) / std::sqrt(cx * cy);
                             }
                         }
-                        const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
-                        r.tiles += head_tiles;
-                        w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
-                        ++r.tensors;
-                        head_written = true;
+                        // A pack that DECLARES tie_word_embeddings has its own fp16 embedding as an oracle for this decode: on
+                        // such a pack the tail head has to reproduce it, so a low correlation is a decode that failed its own
+                        // reference, not evidence that the pack is untied. `selfcheck_tied = corr > threshold` reads it the other
+                        // way round and turns a wrong head into a property of the pack. Measured on
+                        // amd/Qwen2.5-0.5B-Instruct_rai_1.9.0_npu (config says tied): corr 0.885, rel_err 0.987, row-shifted
+                        // control 0.065 -- i.e. the rows line up and the VALUES do not, so the head's offsets or scale handling
+                        // inside the tail are not established yet (engine#1671). Refusing it here is what the issue asks for:
+                        // name the absent bytes instead of writing a head that disagrees with the pack's own reference.
+                        if (tie_declared && tied && r.selfcheck_reference && r.lmhead_corr <= kTieCorr) {
+                            late.push_back("lm_head.weight: the pack declares tie_word_embeddings and its .fconst tail does not "
+                                           "reproduce the pack's own fp16 embedding (corr " +
+                                           std::to_string(r.lmhead_corr) + ", rel_err " + std::to_string(r.lmhead_rel) +
+                                           "), so the tail head's offsets are not established; not writing a head that "
+                                           "disagrees with its own reference");
+                        } else {
+                            const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
+                            r.tiles += head_tiles;
+                            w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
+                            ++r.tensors;
+                            head_written = true;
+                        }
                     }
                 }
             }

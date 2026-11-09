@@ -1130,9 +1130,15 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
         }
     };
     const pi::Report r0 = import_or_fail(pi::Options{});
-    check(refused.empty() ? (r0.refused.empty() && fs::exists(out + "/model.q4nx"))
-                          : (!r0.refused.empty() && !fs::exists(out + "/model.q4nx")),
-          "pack: without --allow-incomplete a container is written only when nothing is refused");
+    // The property is "written XOR refused", not "the plan's refusal list agrees with the import's": the plan cannot know what
+    // only the import discovers (a tail head whose decode fails its own oracle, a group that does not survive decode->encode), so
+    // a plan-clean pack may still be refused by name here -- measured on Qwen2.5-0.5B-Instruct 1.9, engine#1671. What must never
+    // happen is a container written WITH refusals, or nothing written and nothing said.
+    const bool strict_wrote = fs::exists(out + "/model.q4nx");
+    check(strict_wrote == r0.refused.empty(),
+          strict_wrote ? "pack: without --allow-incomplete the container is written and nothing is refused"
+                       : "pack: without --allow-incomplete nothing is written and the refusal is named (" +
+                             (r0.refused.empty() ? std::string("NO REFUSAL -- a silent refusal") : r0.refused.front()) + ")");
     fs::remove_all(out);
     if (golden_dir.empty()) { /* unreachable in practice */ }
 

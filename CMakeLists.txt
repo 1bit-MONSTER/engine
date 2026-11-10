@@ -1076,6 +1076,10 @@ if(ONEBIT_OGA_PACK)
              COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden ${ONEBIT_OGA_PACK})
 endif()
 add_executable(npu_pack_test tests/npu_pack_test.cpp)
+# The Whisper encoder front-end's four f32 host kernels: no container, no device, so it runs wherever this file is built
+# (the same reason #1830/#1863 put their arms in a binary CI already compiles). Values come from the encoder reference.
+add_executable(audio_ops_test tests/audio_ops_test.cpp)
+target_include_directories(audio_ops_test PRIVATE npu/forward/include)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1299,6 +1303,7 @@ endif()
 if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_BO_DUMP)
     add_test(NAME npu_pack_model COMMAND npu_pack_test ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_BO_DUMP})
 endif()
+add_test(NAME audio_ops COMMAND audio_ops_test)
 # The private NPU route registry (npu/private_route.h), without an add-on.
 add_executable(npu_private_route_test tests/npu_private_route_test.cpp)
 target_link_libraries(npu_private_route_test PRIVATE onebit_npu)

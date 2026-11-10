@@ -3062,6 +3062,12 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         it = host_i8_cache_.emplace(key, std::move(t)).first;
     }
     const HostI8Tensor& t = it->second;
+    // One-GEMM A/B (engine#1830): with NPU_DBG_I8_AB set, compare this arm's output against the f32 GEMM for the
+    // SAME activation and the SAME tensor. cos ~0.99 means the layout and scales are right and a remaining
+    // degeneracy is an integration issue; cos ~0 means the operands are still wrong. Host only, first few calls.
+    const bool ab = getenv("NPU_DBG_I8_AB") != nullptr && dbg_i8_ab_ < 4;
+    std::vector<float> ab_ref;
+    if (ab) { ab_ref.assign((size_t)M * (size_t)N, 0.0f); q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, ab_ref.data()); }
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
         const float* a = A + (size_t)m * (size_t)a_k;
@@ -3085,6 +3091,18 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
                 acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] * (int)a8[(size_t)k]);
             dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
         }
+    }
+    if (ab) {
+        double dot = 0, na = 0, nb = 0, md = 0;
+        for (size_t i = 0; i < ab_ref.size(); i++) {
+            const double a = ab_ref[i], b = out[i];
+            dot += a * b; na += a * a; nb += b * b;
+            md = std::max(md, std::fabs(a - b));
+        }
+        const double cos = dot / (std::sqrt(na * nb) + 1e-30);
+        std::fprintf(stderr, "[i8ab] wkey=%d K=%d N=%d cos(i8,f32)=%.6f max|d|=%.6g ref[0]=%g i8[0]=%g\n",
+                     wkey, K, N, cos, md, (double)ab_ref.empty() ? 0.0 : (double)ab_ref[0], (double)out[0]);
+        dbg_i8_ab_++;
     }
 }
 

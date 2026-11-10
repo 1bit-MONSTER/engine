@@ -97,7 +97,7 @@ def attn_payload_off(hidden):
     return K_NORM_OFF + hidden * 2
 
 
-def head_offset(fconst_bytes, ntiles, tile):
+def head_offset(fconst_bytes, ntiles, tile, zeros=0):
     """Where the tied head's grid starts: the last `ntiles * tile` bytes of the `.fconst`.
 
     The importer derives the same number as `layers * stride + attn_payload_off(H)` -- past the per-layer payload, then
@@ -114,7 +114,13 @@ def head_offset(fconst_bytes, ntiles, tile):
     correlates 1.0000 with the pack's own fp16 embedding, magnitude ratio 1.000, rel_err 0.0007 over four tiles on
     `Qwen2.5-0.5B-Instruct_rai_1.9.0_npu`.
     """
-    return fconst_bytes - ntiles * tile
+    # engine#1740: the tail is [envelope][rows x tile][PADDING], and 12+ of the 42 1.9 packs end in a multi-hundred-MB
+    # all-zero run (110,208,000 B on the hidden-1536 family). Subtracting only the grid lands *inside that padding* and
+    # reports corr ~ 0 with a zero variance -- the symptom engine#1693 started from, on a pack where nothing is wrong.
+    # So the grid ends where the zero run begins; `zeros` is measured, not assumed. This is the zero-run-implied candidate
+    # and not a proof of placement (the head need not end exactly there): the printed correlation is what decides, and the
+    # importer's `plan_tail_head()` walks the neighbouring tile-aligned candidates for the cases where it does not.
+    return fconst_bytes - zeros - ntiles * tile
 
 
 def bf16_to_f32(codes):
@@ -311,8 +317,8 @@ def measure(pack, tiles_wanted, ref_path=None, ref_dtype="bf16"):
     # WHERE the head is: the LAST `ntiles * tile` bytes. `env` on its own is only the tail's envelope -- the importer
     # reaches the head as `layers*stride + env`, which equals this subtraction whenever its size check passes
     # (engine#1693: at `env` the decode correlates at chance, at the real offset 1.0000).
-    base = head_offset(size, ntiles, tile)
     zeros = trailing_zeros(path)
+    base = head_offset(size, ntiles, tile, zeros)
     rows = []
     status = 0 if base >= 0 else 3
     if base >= 0 and oracle is None:

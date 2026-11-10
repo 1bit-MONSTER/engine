@@ -2275,6 +2275,11 @@ can fail a run.
 variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
 looking for a code path that skips the dump.
 
+The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS_DUMP`'s weight-scale pairs) are
+created owner-only (0600) and never through a symlink at the final path component, whatever the umask; the head-image
+cache's files are 0644. Both go through `npu/forward/include/file_create.h`, so no write site uses `fopen(…, "w")`,
+which creates with 0666 under the umask and follows a planted link (CodeQL `cpp/world-writable-file-creation`).
+
 ```
   [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935
   [op] L00 ffn_gate_up  rows=1 |x| mean 0.0258482 absmax 1.25728

@@ -21,6 +21,7 @@
 // docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
 #include "target/xdna/xdna_target.h"
 #include "batch_width.h"
+#include "file_create.h"   // dumps are created 0600, never through a symlink
 
 #include <algorithm>
 #include <chrono>
@@ -1187,7 +1188,7 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         static int n = 0;
         char path[4096];
         std::snprintf(path, sizeof path, "%s/dev_L%d_N%d_K%d_%03d.bin", gdir, ar.layer, N, K, n++);
-        if (std::FILE* f = std::fopen(path, "wb")) {
+        if (std::FILE* f = onebit_fopen_private_wb(path)) {
             if (gs && !gs->empty()) std::fwrite(gs->data(), sizeof(float), (size_t)N, f);
             std::fclose(f);
         }

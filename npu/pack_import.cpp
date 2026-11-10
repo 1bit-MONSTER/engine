@@ -2929,6 +2929,12 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         ++r.tensors;
         ++aux;
     }
+    // The device weight layout, when the caller declared one (`--weight-layout b8`): without this key the container
+    // asks the forward for the UNTAGGED family while the caller built `_b8` ELFs, and the failure reads as "missing
+    // full ELF" for a set that exists. Found by importing phi-4 with the flag, seeing the report print "declares
+    // q4nx_weight_layout b8", and then finding the key absent from config.json (engine#1503).
+    if (const std::string why = weight_layout_refusal(opt.weight_layout); !why.empty())
+        throw std::runtime_error("--weight-layout: " + why);
     json c;
     c["model_type"] = p.dims.model_type;
     c["hidden_size"] = p.dims.hidden;
@@ -2940,10 +2946,12 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     c["vocab_size"] = p.dims.vocab;
     c["rope_theta"] = p.dims.rope_theta;
     c["q4nx_parameters"] = "fp32 scale/zero per 32-column group";
+    if (!opt.weight_layout.empty() && opt.weight_layout != "rm") c["q4nx_weight_layout"] = opt.weight_layout;
     c["q4nx_source"] = {{"kind", "oga-npu-pack external data"}, {"pack", p.pack},
                         {"importer", "1bit npu-pack import"}, {"graph", graph},
                         {"note", "weights decoded from *.qweight.packed via decode_external_tile; the code ordering is "
-                                 "kExtQuantsRowMajor's compile-time choice (engine#1503)"}};
+                                 "kExtQuantsRowMajor's compile-time choice (engine#1503)"},
+                        {"weight_layout", opt.weight_layout.empty() ? "rm" : opt.weight_layout}};
     json manifest;
     manifest["format"] = "q4nx";
     manifest["layout"] = "q4nx-2";

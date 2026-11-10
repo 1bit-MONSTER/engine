@@ -183,7 +183,10 @@ def main():
         differ = 0 if got == a else sum(1 for x, y in zip(got, a) if x != y)
         if differ <= max(0, int(len(a) * TOL)):
             prefix, n, tile, rot, header_off, stride9 = p
-            note = "byte for byte" if differ == 0 else f"{differ} of {len(a)} bytes differ ({100.0 * differ / len(a):.2e} %)"
+            # Both spellings, because the percent is what this line prints and the fraction is what a row's comment needs: a
+            # row copied "6.20e-05 %" as "(6.20e-05)" once already and read as a 100x layout difference (engine#1767).
+            note = ("byte for byte" if differ == 0 else
+                    f"{differ} of {len(a)} bytes differ ({100.0 * differ / len(a):.2e} % = {differ / len(a):.2e} of the file)")
             if surplus:
                 note += f"; the 1.9 tail carries {surplus} B past its 1.8 twin's, not compared (engine#1740)"
             if args.json:

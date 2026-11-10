@@ -115,7 +115,8 @@ code2=$(curl -s -m 300 -o "$log.over.body" -w '%{http_code}' -H 'Content-Type: a
 echo "over-limit turn:    HTTP $code2 $(head -c 160 "$log.over.body" 2> /dev/null | tr '\n' ' ')"
 
 # Classify the over-limit answer: refusal (non-2xx with a body), clean text, empty-with-length, or degenerate.
-verdict=$(python3 - "$code2" "$log.over.body" <<'PY'
+classify() {  # <http-code> <body-file> -> refusal | refusal-empty | clean | clean-empty | degenerate
+    python3 - "$1" "$2" <<'PY'
 import json, sys, re
 code, path = sys.argv[1], sys.argv[2]
 try:
@@ -133,16 +134,39 @@ try:
 except Exception:
     text, finish = body.strip(), None
 core = text.strip()
-if re.fullmatch(r"(.)\1{7,}", core, re.S):
+# Degenerate = one character repeated, which is the reported symptom shape. The first version matched
+# r"(.)\1{7,}" - EIGHT or more - while the symptom in the issue is "//////", six: a server answering exactly
+# the reported string would have passed. Whitespace is removed first so "////// //////" or a line of
+# "//////\n//////" is caught too. Six is the threshold rather than four or five because a real completion can
+# legitimately be a short repeated token, and no real answer is six identical characters.
+packed = re.sub(r"\s+", "", core)
+if len(packed) >= 6 and len(set(packed)) == 1:
     print("degenerate")
-elif core == "" and finish in ("length", None):
-    print("clean-empty")
 elif core == "":
     print("clean-empty")
 else:
     print("clean")
 PY
-)
+}
+
+# Self-check, because a detector that cannot fire is the defect it exists to catch: the classifier MUST call the
+# reported symptom shape degenerate. Without this arm the eight-vs-six bug below was invisible - the test would have
+# passed a server that answered exactly "//////".
+printf '%s' '{"choices":[{"message":{"content":"//////"},"finish_reason":"length"}]}' > "$log.degen.body"
+selfcheck=$(classify 200 "$log.degen.body")
+if [ "$selfcheck" != "degenerate" ]; then
+    echo "FAIL serve_context_limit: the classifier does not call the reported symptom (//////) degenerate - it said '$selfcheck'"
+    exit 1
+fi
+printf '%s' '{"choices":[{"message":{"content":"Paris."},"finish_reason":"stop"}]}' > "$log.clean.body"
+selfclean=$(classify 200 "$log.clean.body")
+if [ "$selfclean" != "clean" ]; then
+    echo "FAIL serve_context_limit: the classifier calls an ordinary answer '$selfclean' (self-check)"
+    exit 1
+fi
+echo "self-check:          ////// -> degenerate, 'Paris.' -> clean"
+
+verdict=$(classify "$code2" "$log.over.body")
 echo "verdict:            $verdict"
 
 case "$verdict" in

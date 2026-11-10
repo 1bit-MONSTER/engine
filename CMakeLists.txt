@@ -269,6 +269,13 @@ include(cmake/tests-gpu-hold.cmake)
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
 add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.sh)
+# `find_package(Python3)` has to come BEFORE the first test that interpolates ${Python3_EXECUTABLE} (engine#1864). It used
+# to sit next to the registry tests further down, so the nine rows below it -- ci_targets, ci_targets_self,
+# tests_referenced, tests_referenced_self, device_holders, moe_placement, hrx_build_scope, copyright_check_untracked,
+# fa_ratio -- were written with an EMPTY command word, and ctest then executed the .py directly, working only because the
+# file is 100755. One mode change (a plumbing-built commit rewrote hrx_build_scope.py 100755 -> 100644) turned such a row
+# into "Not Run (BAD_COMMAND)" with no content change. Finding it here makes the row independent of the exec bit.
+find_package(Python3 COMPONENTS Interpreter)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
@@ -752,7 +759,7 @@ endif()
 
 # The registry against the reviewed not-an-alias list (docs/arch-gaps.md) and the committed pins:
 # no checkouts or network.
-find_package(Python3 COMPONENTS Interpreter)
+# (find_package(Python3) moved above the first test that uses ${Python3_EXECUTABLE}: engine#1864)
 if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-gaps)
     # pin the guard's firing behavior: the committed registry always passes --check-gaps, so

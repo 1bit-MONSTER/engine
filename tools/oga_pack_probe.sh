@@ -37,7 +37,12 @@
 #       4 = forward init failed inside a ticket, 5 = no health, 2 = usage / REQUIRE_TICKET refusal.
 set -u
 PACK=${1:?usage: oga_pack_probe.sh <pack dir> [port]}
-PORT=${2:-18160}
+# A FIXED default port cannot be trusted as evidence: a foreign listener on 18160 answers /health 200, the loop below believes it, and the probe
+# reports "the pack serves" for a pack that never bound it (engine#1611 review, three heads running). Ask the kernel for a free port instead, so a
+# 200 can only come from something that started after this script asked, and -- for the case where the caller does name one -- require evidence that
+# OUR process is still alive before believing the answer (both checks below).
+PORT=${2:-$(python3 -c 'import socket
+s = socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')}
 BIN=${BIN:-${ONEBIT_BIN:-$(command -v 1bit 2>/dev/null || command -v onebit 2>/dev/null)}}
 # A missing binary used to reach gate 1, fail with the shell's rc 127, and be reported as "this pack stops at gate 1" -- the pack
 # was blamed for the tool not being installed. Refuse here, before anything is touched, so the verdict can only be about the pack.
@@ -132,8 +137,9 @@ trap 'cleanup; exit 130' INT TERM HUP
 trap cleanup EXIT
 for _ in $(seq 1 30); do
     code=$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" 2>/dev/null)
-    [ "$code" = 200 ] && break
-    kill -0 $pid 2>/dev/null || break
+    # a 200 is only evidence about THIS pack if the process that should be serving it is alive: otherwise a foreign listener on the port produced it
+    if [ "$code" = 200 ] && kill -0 "$pid" 2>/dev/null; then break; fi
+    kill -0 "$pid" 2>/dev/null || break
     sleep 2
 done
 if [ "${code:-}" != 200 ]; then
@@ -150,7 +156,13 @@ if [ "${code:-}" != 200 ]; then
     exit 4
 fi
 
-echo "== verdict: HEALTH 200 -- the pack serves; gate 3 (a drafter measurement) is worth doing"
+# the same evidence question as the loop: a 200 alone is not proof, because the port may belong to someone else
+kill -0 "$pid" 2>/dev/null || {
+    echo "== verdict: /health answered 200 but the server this probe started is gone -- the answer came from another listener on port $PORT"
+    echo "            (re-run without a port argument to let the kernel pick one this probe owns)"
+    exit 5
+}
+echo "== verdict: HEALTH 200 from this probe's own server (pid $pid) -- the pack serves; gate 3 (a drafter measurement) is worth doing"
 curl -s -m 120 -X POST "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
     -d '{"prompt":"Q: Explain in plain words why the sky appears blue. A:","max_tokens":12,"temperature":0}' | head -c 300
 echo

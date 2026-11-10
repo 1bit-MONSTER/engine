@@ -577,6 +577,40 @@ A request wall moves less than the block does and scatters more: the same four a
 21.6-23.1 after by TTFT, with one outlier in each direction (18.3 and 15.8) from other lanes' load. Quote the block
 medians for the effect and the TTFT range for what a caller sees.
 
+#### The attention rows of a block share one thread team (#1990)
+
+The next host term after the one above, same pack, same instruments. A batched pass called `attention()` once per row,
+and each call opened its own thread team over the heads: 16 rows on each of this model's 16 full-attention layers is
+256 teams per block. The rows of a layer now go through `q4nx_attn::rows_context()` (`npu/forward/include/attn_math.h`):
+every row's position-local half runs first (its q, and its k/v appended to the cache), then all (row, head) pairs are
+one statically scheduled loop in one team. A causal row reads only positions up to its own, so the later rows already
+being in the cache changes nothing it reads.
+
+Measured on `bonsai2-27b-t2s2` (2026-11-10, one `npu-hold` ticket, one binary, `NPU_ATTN_ROWS=0` against the default,
+arms A B B A, 103 blocks per arm, `amdxdna` error count unchanged):
+
+| 16-row block | per-row teams | one team |
+|---|---:|---:|
+| attention, mean / p90 / max | 31.2 / 43.3 / 53.9 ms | **14.3 / 20.5 / 30.1 ms** |
+| block wall, median | 675.7 ms | **658.4 ms** |
+| rows/s from the block median | 23.68 | **24.30** |
+| TTFT, three 510-536-token prompts | 23.0-23.4 tok/s | 23.8-23.9 tok/s |
+
+That is the first A and the first B, which ran on a quiet box. Another lane's load arrived during the second pair, and
+it is reported separately because it is a different condition, not a repeat: the one-team arm held 13.6 ms median
+attention with no block over 100 ms, while the per-row arm that followed measured 56.2 ms median with 36 of 103 blocks
+over 100 ms. So the effect on a quiet box is about 17 ms of a 676 ms block (2.6 %), and the per-row form is the one
+that degrades under load.
+
+Nothing rounds differently: a (row, head) pair runs the same statements in the same order as before
+(`q4nx_attn::head_context()`, which `attention()` now calls too) and writes only its own floats. Greedy text is identical
+in every arm. `NPU_ATTN_CHECK=1` recomputes each row the per-row way and compares bit patterns, failing the pass on a
+difference (160 of 160 layer passes identical on the device); `tests/attn_math_test` holds `rows_context()` to the
+per-row form bit for bit on 1, 2, 5 and 12 threads, for causal, whole-prompt and sliding-window reads.
+
+The schedule is static on purpose. A first version used a dynamic schedule and measured a lower median (15-25 ms) but a
+worse mean than the per-row form, with 6 and 14 of 103 blocks over 100 ms in its two arms: the tail was the whole cost.
+
 #### Per-tile arithmetic ceiling, and where our GEMMs sit against it (AM027)
 
 AM027 (*Versal Adaptive SoC AIE-ML v2 Architecture Manual*, v1.1) **Appendix A, Table 14** gives 512 INT8×INT8 multipliers per compute tile and 256

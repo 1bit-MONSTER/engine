@@ -1149,6 +1149,18 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     }
     const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     out.resize((size_t)M * N);
+    // engine#1808: the device's per-column weight scales, KEYED by (layer, N, K) so it can be paired with the host
+    // arm's dump exactly. Index pairing was tried first and is meaningless -- the two sides reach the GEMM a
+    // different number of times (384 device dumps against 1024 arm dumps on the same request).
+    if (const char* gdir = getenv("NPU_I8_GS_DUMP")) {
+        static int n = 0;
+        char path[4096];
+        std::snprintf(path, sizeof path, "%s/dev_L%d_N%d_K%d_%03d.bin", gdir, ar.layer, N, K, n++);
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            if (gs && !gs->empty()) std::fwrite(gs->data(), sizeof(float), (size_t)N, f);
+            std::fclose(f);
+        }
+    }
     for (int m = 0; m < M; m++) {
         const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
         const float asc = ascales[(size_t)m];

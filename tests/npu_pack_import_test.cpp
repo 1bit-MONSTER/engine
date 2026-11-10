@@ -537,18 +537,24 @@ void test_external_packed_genre(const std::string& root) {
             pb::tag(named, 5, 2);
             pb::varint(named, a.size());
             named += a;
+            // A pack this fixture can actually plan: it needs its own embedding tensor in the graph, exactly as the
+            // write_graph lambda above gives it.
+            const std::string emb = pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
+                                               uint64_t(embed_bytes));
             const std::string head = pb::matmulnbits("lm_head", {"x", "w", "w.scales", "w.zeros"}, K, N, 4, 128);
-            const std::string prefill = pb::graph({}, {head});
-            const std::string decode = pb::graph({}, {head});
+            const std::string prefill = pb::graph({emb}, {head});
+            const std::string decode = pb::graph({emb}, {head});
             return pb::model({}, {named, pb::if_node("c", "input_ids", "logits", head_branch, decode),
                                   pb::if_node("c2", "input_ids", "logits",
                                               head_branch == "then_branch" ? "else_branch" : "then_branch", prefill)});
         };
-        put_file((dir / "model.onnx").string(), graph_with_cond(/*one_token_when_true=*/true, "then_branch"));
+        // The graph this pack imports is the one genai_config.json names (eager-mm.onnx); a crafted model.onnx beside
+        // it is not read at all, which is why the first version of this arm measured the fixture's own graph.
+        put_file((dir / "eager-mm.onnx").string(), graph_with_cond(/*one_token_when_true=*/true, "then_branch"));
         const json d1 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
         check(d1.contains("decode_branch") && d1["decode_branch"].get<std::string>() == "then_branch",
               "decode branch: a condition comparing the shape with 1 makes then_branch the decode path");
-        put_file((dir / "model.onnx").string(), graph_with_cond(/*one_token_when_true=*/false, "else_branch"));
+        put_file((dir / "eager-mm.onnx").string(), graph_with_cond(/*one_token_when_true=*/false, "else_branch"));
         const json d2 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
         check(d2["decode_branch"].get<std::string>() == "else_branch",
               "decode branch: an inverted condition moves the decode path to else_branch");

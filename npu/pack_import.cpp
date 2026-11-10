@@ -265,9 +265,10 @@ OnnxModel parse_onnx(const std::string& path) {
         // `then_branch` keeps the rule honest for a pack that inverts it; when the graph is not that shape, the ONNX
         // convention (`then_branch`) stands and `branch_note` says the rule was assumed rather than read.
         {
-            const auto gpb = pb(g->p, g->n);
+            // g IS the GraphProto (field 7 of ModelProto), so its nodes are at field 1 of g directly -- re-wrapping
+            // g's bytes in another pb() would read the graph as if it were a node list and find no Constant at all.
             bool one_token_when_true = true, read = false;
-            for (const auto* f : fields(gpb, 1)) {   // GraphProto.node = 1
+            for (const auto* f : fields(pb(g->p, g->n), 1)) {   // GraphProto.node = 1
                 const auto node = pb(f->p, f->n);
                 const auto* opf = field1(node, 4);
                 if (!opf || pb_str(*opf) != "Constant") continue;
@@ -279,9 +280,42 @@ OnnxModel parse_onnx(const std::string& path) {
                     if (iv) { one_token_when_true = (iv->v == 1); read = true; }
                 }
             }
-            m.decode_branch = one_token_when_true ? "then_branch" : "else_branch";
-            m.branch_note = read ? "the If condition compares the input shape with 1, so " + m.decode_branch +
-                                       " is the one-token (decode) path"
+            // The branch whose graph actually declares a MatMulNBits. `value_int == 1` is the pack's convention, but the
+            // arithmetic is what must hold: the Token .fconst carries the graph's own quantised matmuls, so the branch
+            // that HAS them is the decode path whatever the constant says. A pack that inverts the condition without
+            // moving its weights stays readable; a pack whose weights sit in two branches is ambiguous, so the condition
+            // decides and the note says it did.
+            const auto branch_has_matmul = [&](const std::string& want) {
+                int n = 0;
+                for (const auto* f : fields(pb(g->p, g->n), 1)) {
+                    const auto node = pb(f->p, f->n);
+                    for (const auto* a : fields(node, 5)) {
+                        const auto at = pb(a->p, a->n);
+                        const auto* nm = field1(at, 1);
+                        if (!nm || (pb_str(*nm) != "then_branch" && pb_str(*nm) != "else_branch")) continue;
+                        if (pb_str(*nm) != want) continue;
+                        for (const auto* sg : fields(at, 6)) {
+                            for (const auto* nf : fields(pb(sg->p, sg->n), 1)) {
+                                const auto sub = pb(nf->p, nf->n);
+                                const auto* op = field1(sub, 4);
+                                if (op && (pb_str(*op) == "MatMulNBits" || pb_str(*op) == "MatMulNBitsBf")) ++n;
+                            }
+                        }
+                    }
+                }
+                return n;
+            };
+            const std::string by_condition = one_token_when_true ? "then_branch" : "else_branch";
+            const int then_mm = branch_has_matmul("then_branch"), else_mm = branch_has_matmul("else_branch");
+            if (then_mm > 0 && else_mm == 0) m.decode_branch = "then_branch";
+            else if (else_mm > 0 && then_mm == 0) m.decode_branch = "else_branch";
+            else m.decode_branch = by_condition;
+            m.branch_note = read ? "the If condition compares the input shape with 1, so " + by_condition +
+                                       " is the one-token (decode) path" +
+                                       ((m.decode_branch == by_condition) ? "" :
+                                        "; its weights are in " + m.decode_branch + " (then " +
+                                            std::to_string(then_mm) + ", else " + std::to_string(else_mm) +
+                                            " quantised matmuls), which is where the Token .fconst's weights are read")
                                  : "no recognisable If condition, so then_branch is taken as decode by the ONNX convention";
         }
     } catch (...) {

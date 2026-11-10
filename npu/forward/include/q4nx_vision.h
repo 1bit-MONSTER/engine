@@ -73,6 +73,38 @@ void pos_embed(const float* table, int gh, int gw, int C, float* out);
 // positions in merge-block order (see block_position).
 void rope_axial(float* x, int tokens, int n_heads, int head_dim, const float* inv_freq, const int* pos_h, const int* pos_w);
 
+// One vision transformer block, host float32, in the order the graph computes it:
+//   h = x + proj(attn(rope(qkv(LN1(x)))))          -- qkv split into three contiguous hidden-wide chunks
+//   y = h + fc2(gelu_tanh(fc1(LN2(h))))
+// Constants that are easy to get wrong and are therefore here rather than at a call site: LayerNorm eps 1e-6, the gelu is the
+// TANH approximation (config `gelu_pytorch_tanh`), the attention scale is 1/sqrt(head_dim) (the graph's 0.125 at head_dim 64)
+// and it is FULL attention -- the pack's 24 Loop nodes are per-image bookkeeping, `pad` measured [0, num_patches].
+// Established against the graph block by block: block 0 norm1 corr 1.000000, qkv all 3072 columns > 0.999, attention
+// corr 0.999994, and the whole tower matches the fp32 oracle at corr 1.000000 (mean|d| 4.1e-5).
+struct VisionBlockWeights {
+    const float* ln1_w;
+    const float* ln1_b;
+    const float* qkv_w;   // (3*hidden, hidden)
+    const float* qkv_b;   // (3*hidden)
+    const float* proj_w;  // (hidden, hidden)
+    const float* proj_b;  // (hidden)
+    const float* ln2_w;
+    const float* ln2_b;
+    const float* fc1_w;   // (intermediate, hidden)
+    const float* fc1_b;
+    const float* fc2_w;   // (hidden, intermediate)
+    const float* fc2_b;
+};
+
+// `x` is (tokens, hidden) in place; `pos_h`/`pos_w` are those tokens' positions in merge-block order.
+void block_forward(float* x, int tokens, int hidden, int heads, int head_dim, int intermediate,
+                   const VisionBlockWeights& w, const float* inv_freq, const int* pos_h, const int* pos_w);
+
+// The merger: LayerNorm per token, then view (tokens/4, 4*hidden), fc1 -> gelu -> fc2 to `out_hidden` (2560 for this pack).
+// `out` is (tokens/4, out_hidden).
+void merger_forward(const float* x, int tokens, int hidden, int out_hidden, const float* ln_w, const float* ln_b,
+                    const float* fc1_w, const float* fc1_b, const float* fc2_w, const float* fc2_b, float* out);
+
 }  // namespace q4nx_vision
 
 #endif  // ONEBIT_NPU_VISION_H

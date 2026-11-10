@@ -1110,6 +1110,9 @@ add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4
 # Listed explicitly like npu_pack_test above so the test needs no NPU library to build.
 add_executable(q4nx_vision_pos_test tests/q4nx_vision_pos_test.cpp npu/forward/src/q4nx_vision_pos.cpp)
 add_executable(q4nx_vision_rope_test tests/q4nx_vision_rope_test.cpp npu/forward/src/q4nx_vision_rope.cpp)
+add_executable(q4nx_vision_block_test tests/q4nx_vision_block_test.cpp npu/forward/src/q4nx_vision_block.cpp npu/forward/src/q4nx_vision_rope.cpp)
+target_include_directories(q4nx_vision_block_test PRIVATE npu/forward/include)
+add_test(NAME q4nx_vision_block COMMAND q4nx_vision_block_test)
 target_include_directories(q4nx_vision_rope_test PRIVATE npu/forward/include)
 add_test(NAME q4nx_vision_rope COMMAND q4nx_vision_rope_test)
 target_include_directories(q4nx_vision_pos_test PRIVATE npu/forward/include)

@@ -1201,6 +1201,14 @@ target_link_libraries(npu_pack_test PRIVATE onebit_npu)
 # golden fixture that pins them.
 target_include_directories(npu_pack_test PRIVATE npu/forward/include ${CMAKE_SOURCE_DIR}/tests)
 
+# NPU_INFER_DUMP_OPS (npu/forward/include/ops-dump.h, engine#1503): the on/off rule, the mean|x|/absmax arithmetic and
+# the line's text. Header-only, no device. `add_dependencies(onebit ...)` is what gets it built in CI, whose target
+# list is explicit (tools/ci/ci_targets_check.py).
+add_executable(ops_dump_test tests/ops_dump_test.cpp)
+target_include_directories(ops_dump_test PRIVATE npu/forward/include)
+add_test(NAME ops_dump COMMAND ops_dump_test)
+add_dependencies(onebit ops_dump_test)
+
 # The device weight layout contract (q4nx_weight_layout): pure index math, no device
 # and no runtime.  CI builds an explicit target list, so the check compiles itself with
 # the build's compiler at test time (tests/npu_blocked_layout_test.sh) rather than being

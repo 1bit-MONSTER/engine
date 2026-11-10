@@ -208,6 +208,11 @@ add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $
 # it is here because nothing else runs it: the rows had 128 assertions and no runner. It names no add_executable, so it
 # adds nothing to the set of test targets the CI --target list would have to build (the direction-B measurement, #1595).
 add_test(NAME release_check_selftest COMMAND bash ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh --self-test)
+# engine#1800: the 1bit OS base layer's mode normaliser and reporter (scripts/pack-elf.sh, engine#1474), run over a
+# crafted tree. Same shape as the row above: no build, no device, no target, so it adds nothing to the CI --target list.
+# It was in tests/ with nothing referencing it, so the property it pins (the normaliser only NARROWS modes: a 0600
+# secret stays 0600 and /tmp keeps 1777) had no runner at all.
+add_test(NAME base_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/base_modes_test.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME template_pin COMMAND ${CMAKE_SOURCE_DIR}/tests/template_pin.sh $<TARGET_FILE:onebit>)
 add_test(NAME greedy_shortcut COMMAND ${CMAKE_SOURCE_DIR}/tests/greedy_shortcut.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)

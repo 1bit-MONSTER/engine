@@ -1282,6 +1282,9 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
     d.rope_theta = opt_field<float>(c, "rope_theta", 10000.0f);
     d.model_type = opt_field<std::string>(c, "model_type", "");
     d.rms_norm_eps = opt_field<float>(c, "rms_norm_eps", 1e-6f);
+    // engine#1889: the pack's own statement about per-head q/k gains. `opt_field<bool>` because the key is absent on
+    // every pack that has no such norm, and absent must mean false rather than a parse error.
+    d.use_qk_norm = opt_field<bool>(c, "use_qk_norm", false);
     d.eps_bits = bf16_bits_of(d.rms_norm_eps);
     if (c.contains("eos_token_id")) {
         const auto& e = c["eos_token_id"];
@@ -1407,32 +1410,49 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
     // vote failing must not leave it at 0: with the stride known, the anchors' offsets *within* a block repeat, and the mode
     // of `pos mod stride` (excluding 0, the block start) is the second header. This is the same pool of anchors the vote
     // could not win on, used for a question that does not need a dominance test -- 28 blocks each contribute their residue.
+    // engine#1831: only when the vote did NOT record the block's headers. When it did, its list is the measurement
+    // (`plan()` reads 2-header vs 4-header from `hdr.size()`, and `post_attn_hdr()` is `hdr.back()`), and rewriting it
+    // to one entry turned every Qwen3 4-header 1.9 block into a 2-header one whose "post-attention" header was k_norm's.
+    if (!g.hdr.empty()) return g;
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
-    if (!pos.empty()) {
-        std::map<int64_t, int> off;
-        for (const int64_t q : pos) {
-            const int64_t r = q % stride8;
-            if (r > 0 && r < stride8) ++off[r];
-        }
-        int best = 0;
-        int64_t best_off = 0;
-        for (const auto& [o, n] : off)
-            if (n > best) { best = n; best_off = o; }
-        if (best_off > 0) {
-            // Populate the same fields `locate_fconst` would have: `hdr` is the in-block header list and the reader
-            // classifies a pack as a 2-header (one inner anchor) or 4-header (three) block from its SIZE. Setting only
-            // h1 left `hdr` empty, so a pack whose anchors could not win the vote was classified as "1 epsilon header"
-            // and every attention projection refused while the MLP imported byte-exact -- measured on Qwen2-7B 1.9.
-            // The scan window is the first GiB (about 8 blocks of this geometry), so the right residue repeats ~8 times
-            // against 1-2 for a payload coincidence. Requiring `layers/2` was too strict and silently dropped the real one.
-            if (best >= 3) {                             // the residue repeats across blocks: a real section boundary
-                g.h1 = best_off;
-                g.hdr.assign(1, best_off);               // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
-                g.period = 2;
-            }
-        }
+    // The scan window is the first GiB (about 8 blocks at h3584), so a real section boundary repeats ~8 times against
+    // 1-2 for a payload coincidence; 3 separates them (requiring `layers/2` was too strict and dropped the real one).
+    const std::vector<int64_t> inner = fconst_block_headers(pos, stride8, 3);
+    if (!fconst_set_block_headers(g, inner)) {
+        g.why = "the 1.9 header gives stride " + std::to_string(stride8) + ", but the epsilon anchors repeat at " +
+                std::to_string(inner.size()) + " in-block offset(s), and a layer block has 1 (2-header) or 3 (4-header); "
+                "refusing rather than guessing the layout";
+        g.stride = 0;
     }
     return g;
+}
+
+// engine#1831: every in-block header offset the anchors support, sorted. A header at offset `r` of a block of `stride`
+// bytes lands at `r` modulo `stride` in every block, so the offsets that recur `min_repeat` or more times are the block's
+// section boundaries; offset 0 is the block start, not an inner header. ALL of them are kept rather than the most common
+// one: a Qwen3 block has three equally frequent inner headers, and keeping only the first maximum picked k_norm's.
+std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64_t stride, int min_repeat) {
+    std::vector<int64_t> out;
+    if (stride <= 0) return out;
+    std::map<int64_t, int> count;
+    for (const int64_t q : pos) {
+        const int64_t r = q % stride;
+        if (r > 0) ++count[r];
+    }
+    for (const auto& [r, n] : count)
+        if (n >= min_repeat) out.push_back(r);   // std::map iterates in order, so `out` is sorted
+    return out;
+}
+
+// engine#1831: the fields `locate_fconst()` sets from the same list -- `hdr` (whose SIZE is the block layout), `h1` (its
+// first entry) and `period` (headers per block, counting the block's own). One inner header is a 2-header block
+// (Qwen2.5/Llama), three is a 4-header block (Qwen3); anything else is not a layout this reader knows, so nothing is set.
+bool fconst_set_block_headers(FconstGeom& g, const std::vector<int64_t>& inner) {
+    if (inner.size() != 1 && inner.size() != 3) return false;
+    g.hdr = inner;
+    g.h1 = inner.front();
+    g.period = int(inner.size()) + 1;
+    return true;
 }
 
 std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }
@@ -2487,6 +2507,14 @@ std::string Plan::manifest() const {
     return j.dump(2);
 }
 
+std::string qk_norm_refusal(bool declared, bool found) {
+    if (declared && !found)
+        return "this pack declares use_qk_norm and its per-head q/k gains are not where the block layout says "
+               "(engine#1889): importing without them would normalise no q/k, which answers plausibly-wrong text "
+               "instead of refusing. The section location for this family is not measured yet";
+    return std::string();
+}
+
 Plan plan(const std::string& pack_dir) {
     Plan p;
     p.dir = pack_dir;
@@ -3068,6 +3096,13 @@ Plan plan(const std::string& pack_dir) {
     // source from the .fconst's two per-head sections but the same tensor in the container.
     const bool graph_qk_norm = graph_weights && !onnx.index.empty() &&
                                onnx.index.count("model.layers.0.attn.q_norm.layernorm.weight");
+    /* engine#1889: a pack that DECLARES per-head q/k gains and whose gains this importer did not locate must not
+     * import -- the forward would run without normalising q/k, which answers deterministic gibberish instead of
+     * refusing (Hunyuan-7B: `Trease/ft//////////` three of three, at a geometry four other packs answer correctly on).
+     * The section location for that family is not measured yet, so the honest outcome is a named refusal; the
+     * layout arithmetic and the graph check stay the two ways the gains ARE found. */
+    if (const std::string qk_why = qk_norm_refusal(d.use_qk_norm, p.knorm_off != 0 || graph_qk_norm); !qk_why.empty())
+        throw std::runtime_error(pack_dir + ": " + qk_why);
     if (p.knorm_off || graph_qk_norm)
         for (int L = 0; L < d.layers; ++L)
             for (const char* nm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
@@ -3185,6 +3220,11 @@ static const char* const kTextFiles[] = {"tokenizer.json",
                                          "generation_config.json"};
 
 // The same list every path copies (see kTextFiles): a container without tokenizer.json is not an NPU model directory.
+// engine#1751 follow-up: the ONE copier. Both import paths call it (the .fconst path used to keep its own loop, which
+// threw a bare filesystem_error, while this one counted successes and swallowed failures), and a file the pack HAS that
+// fails to copy is refused by name -- a counter nobody compared let an import "succeed" without tokenizer.json, and serve
+// then refused the directory for a missing tokenizer, the exact misleading report #1751 existed to remove. A file the pack
+// does not ship stays a skip: a pack without a chat template is legitimate.
 static int copy_text_artifacts(const std::string& pack_dir, const std::string& out_dir) {
     int copied = 0;
     for (const char* f : kTextFiles) {
@@ -3192,9 +3232,15 @@ static int copy_text_artifacts(const std::string& pack_dir, const std::string& o
         std::error_code cec;
         if (!fs::exists(src, cec)) continue;
         fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing, cec);
-        if (!cec) ++copied;
+        if (cec)
+            throw std::runtime_error("cannot copy the pack's " + std::string(f) + " into " + out_dir + " (" + cec.message() +
+                                     "); without it the output is not a servable model directory");
+        ++copied;
     }
     return copied;
+}
+int copy_text_artifacts_exported(const std::string& pack_dir, const std::string& out_dir) {
+    return copy_text_artifacts(pack_dir, out_dir);
 }
 
 TextArtifacts scan_text_artifacts(const std::string& pack_dir) {
@@ -4614,10 +4660,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         std::ofstream out(out_dir + "/config.json");
         out << c.dump(2) << "\n";
     }
-    for (const char* f : kTextFiles) {
-        const std::string src = pack_dir + "/" + f;
-        if (fs::exists(src)) fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing);
-    }
+    // engine#1751 follow-up: the same copier the external-data path uses, so the two genres cannot drift apart again.
+    copy_text_artifacts(pack_dir, out_dir);
     for (const auto& [name, m] : ext) unmap_file(m, ext_size[name]);
     return r;
 }

@@ -80,9 +80,16 @@ def pin(path):
     # matched while the bump sat in the index, and the stale `sources` pin surfaced only in ctest `registry_pins`
     # after the commit -- ten minutes of CI to learn what the same command could have said locally (engine#1738).
     staged = subprocess.run(["git", "-C", ROOT, "ls-files", "-s", "--", path], capture_output=True, text=True)
-    parts = staged.stdout.split()
-    if len(parts) >= 2 and parts[0] == "160000":  # <mode> <sha> <stage>\t<path>: the gitlink as staged
-        return parts[1]
+    # `ls-files -s` prints "<mode> <sha> <stage>\t<path>", one line per STAGE. Stages 1/2/3 mean an unmerged index --
+    # a submodule conflict -- and the first line is then the merge BASE, so matching on the mode alone would return a
+    # third pin that nobody chose: silent, and the very staleness this function exists to stop (engine#1745 review).
+    rows = [l.split() for l in staged.stdout.splitlines() if l.split()]
+    if any(len(r) >= 3 and r[2] != "0" for r in rows):
+        raise SystemExit("registry_build: the index has an unmerged entry for %s (stages %s) -- resolving that conflict "
+                         "is what decides the pin, so this cannot check it" %
+                         (path, ", ".join(sorted({r[2] for r in rows if len(r) >= 3}))))
+    if rows and len(rows[0]) >= 3 and rows[0][0] == "160000":  # the gitlink as staged
+        return rows[0][1]
     out = subprocess.run(["git", "-C", ROOT, "ls-tree", "HEAD", "--", path], capture_output=True, text=True)
     parts = out.stdout.split()
     return parts[2] if len(parts) >= 3 else ""

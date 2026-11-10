@@ -26,7 +26,10 @@ skipping is the one that catches a broken HRX pin, so a wrong `configure-only` c
 
 Rules -- `configure-only` (alias `ctest-only`) requires ALL of:
 
-1. every changed path *that triggers the workflow* is `CMakeLists.txt`; any other trigger path is `full`. The
+1. every changed path *that triggers the workflow* is a **registration file** -- `CMakeLists.txt` or a
+   `cmake/tests-*.cmake` family file included from it (engine#1696 moved the `gpu_hold_*` registrations into one, because
+   every test-adding PR edited the same contiguous block there and any two of them conflicted by construction); any other
+   trigger path is `full`. The
    triggers are read from `hrx-build.yml`'s `paths:` at run time, so the two cannot drift. A path outside them (the
    new test's own script, docs) is not an input of the HRX build: on its own it does not run this job at all, so it
    must not force a compile here either. Without it, no real registration PR would ever skip: replayed over main, the
@@ -58,7 +61,11 @@ def workflow_triggers(path=WORKFLOW):
         text = open(path).read()
     except OSError:
         return None
-    m = re.search(r"^\s*paths:\s*\n((?:\s*-\s*\S+\s*\n)+)", text, re.M)
+    # A YAML comment inside the list is legal and must be skipped: the first version stopped at the first line that was
+    # not a `- entry`, so one comment truncated the trigger set silently and every entry after it became "not a trigger".
+    # Found while adding a `cmake/tests-*.cmake` entry for engine#1696 (that entry needs `workflow` scope on a token this
+    # box does not have, so it is a follow-up; the skip is still the right behaviour for anyone who adds a comment).
+    m = re.search(r"^\s*paths:\s*\n((?:\s*(?:#[^\n]*|-\s*\S+)\s*\n)+)", text, re.M)
     if not m:
         return None
     listed = re.findall(r"^\s*-\s*(\S+)\s*$", m.group(1), re.M)
@@ -82,6 +89,16 @@ def classify_line(line):
     return "other"
 
 
+# engine#1696: a family of registrations may live in cmake/tests-<family>.cmake and be included by CMakeLists.txt. Such a
+# file is a registration file in exactly the sense the rule below means: it creates no target and sets no flag, so a PR
+# whose only change is a registration there must still classify `configure-only`.
+REGISTRATION_FILE = re.compile(r"^(?:CMakeLists\.txt|cmake/tests-[A-Za-z0-9._-]+\.cmake)$")
+
+
+def is_registration_file(path):
+    return bool(REGISTRATION_FILE.match(path))
+
+
 def decide(changed_paths, cmake_diff, triggers=None):
     """(verdict, reason) for one PR.
 
@@ -93,13 +110,16 @@ def decide(changed_paths, cmake_diff, triggers=None):
     paths = sorted({p for p in changed_paths if p and is_trigger(p, triggers)})
     if not paths:
         return "full", "no changed path is one of the workflow's triggers (a manual run): not provable"
-    other = [p for p in paths if p != "CMakeLists.txt"]
+    other = [p for p in paths if not is_registration_file(p)]
     if other:
-        return "full", f"{len(other)} changed path(s) outside CMakeLists.txt ({', '.join(other[:3])})"
+        return "full", f"{len(other)} changed path(s) outside the registration files ({', '.join(other[:3])})"
     added = [l[1:] for l in cmake_diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
     removed = [l[1:] for l in cmake_diff.splitlines() if l.startswith("-") and not l.startswith("---")]
     if not added and not removed:
-        return "full", "CMakeLists.txt appears in the diff with no line changes (rename or mode change): not provable"
+        # The diff spans every registration file since #1744, so naming CMakeLists.txt here would misreport a mode
+        # change on cmake/tests-*.cmake -- and this tool's whole output is the reason string.
+        return "full", ("the registration file(s) appear in the diff with no line changes (rename or mode change): "
+                        "not provable")
     kinds_add = [classify_line(l) for l in added]
     kinds_del = [classify_line(l) for l in removed]
     for kind, lines in (("added", added), ("removed", removed)):
@@ -116,19 +136,81 @@ def decide(changed_paths, cmake_diff, triggers=None):
     if not [k for k in kinds_add if k == "registration"]:
         return "full", "no ctest registration line is being ADDED (a pure removal cannot be told from a rewrite)"
     return "configure-only", (f"{len([k for k in kinds_add if k == 'registration'])} ctest registration line(s), "
-                              f"CMakeLists.txt only")
+                              f"registration files only")
 
 
-def from_git(base, head):
-    names = subprocess.run(["git", "diff", "--name-only", base, head], capture_output=True, text=True, check=True)
-    diff = subprocess.run(["git", "diff", base, head, "--", "CMakeLists.txt"], capture_output=True, text=True, check=True)
+# The diff decide() classifies must cover EVERY registration file, not only CMakeLists.txt. With only CMakeLists.txt
+# here, a family file's own lines were never read: an add_test in CMakeLists.txt next to a target_link_libraries in
+# cmake/tests-gpu-hold.cmake came out configure-only, skipping the compile that exists to catch exactly that (found
+# probing main at bc21ba3 after #1699). The pathspec mirrors REGISTRATION_FILE.
+REGISTRATION_PATHSPEC = ["CMakeLists.txt", ":(glob)cmake/tests-*.cmake"]
+
+
+def from_git(base, head, cwd=None):
+    names = subprocess.run(["git", "diff", "--name-only", base, head], capture_output=True, text=True, check=True, cwd=cwd)
+    diff = subprocess.run(["git", "diff", base, head, "--", *REGISTRATION_PATHSPEC], capture_output=True, text=True,
+                          check=True, cwd=cwd)
     return decide(names.stdout.splitlines(), diff.stdout, workflow_triggers())
+
+
+def git_arm():
+    """from_git() on a real repo: the layer the diff-text cases above cannot reach. None when git is unavailable."""
+    import shutil
+    import tempfile
+    if not shutil.which("git"):
+        return None
+    bad = 0
+    with tempfile.TemporaryDirectory() as d:
+        def git(*a):
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=d, check=True,
+                           capture_output=True)
+        git("init", "-q")
+        os.makedirs(os.path.join(d, "cmake"))
+        for f, text in (("CMakeLists.txt", "add_test(NAME a COMMAND a)\n"),
+                        ("cmake/tests-gpu-hold.cmake", "add_test(NAME b COMMAND b)\n")):
+            open(os.path.join(d, f), "w").write(text)
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=d, capture_output=True, text=True, check=True).stdout.strip()
+        arms = [
+            ("git: an add_test in CMakeLists.txt next to a target line in the family file",
+             {"CMakeLists.txt": "add_test(NAME c COMMAND c)\n",
+              "cmake/tests-gpu-hold.cmake": "target_link_libraries(onebit PRIVATE x)\n"}, "full"),
+            ("git: registrations added to both files",
+             {"CMakeLists.txt": "add_test(NAME d COMMAND d)\n",
+              "cmake/tests-gpu-hold.cmake": "add_test(NAME e COMMAND e)\n"}, "configure-only"),
+        ]
+        for name, appends, want in arms:
+            git("checkout", "-q", "-B", "arm", base)
+            for f, text in appends.items():
+                open(os.path.join(d, f), "a").write(text)
+            git("commit", "-q", "-am", name)
+            got, why = from_git("HEAD^1", "HEAD", cwd=d)
+            ok = got == want
+            print(("ok   " if ok else "FAIL ") + f"{name} -> {got}" + ("" if ok else f" (wanted {want}: {why})"))
+            bad += 0 if ok else 1
+    return bad
 
 
 def self_test():
     """The cases that make the rule trustworthy: each one an artefact someone would actually push."""
     cases = [
         # name, paths, diff, expected verdict
+        # engine#1696: a registration added to an included family file is still a registration -- this is the shape every
+        # later gpu_hold_* test PR has, and it must not pay the ONEBIT_HRX compile
+        ("a registration added to an included cmake/tests-*.cmake family file",
+         ["CMakeLists.txt", "cmake/tests-gpu-hold.cmake"],   # the script it runs is not a build input, see the #1491 arm
+         "+++ b/cmake/tests-gpu-hold.cmake\n+add_test(NAME gpu_hold_new COMMAND bash x.sh)\n",
+         "configure-only"),
+        # the first move itself edits CMakeLists.txt with an include(), which is not a registration: full, and that is
+        # correct -- the rule must not learn to wave through arbitrary lines in that file
+        ("the first move, which adds include() to CMakeLists.txt",
+         ["CMakeLists.txt", "cmake/tests-gpu-hold.cmake"],
+         "+++ b/CMakeLists.txt\n+include(cmake/tests-gpu-hold.cmake)\n", "full"),
+        # ... and a change there that is not a registration still pays the compile
+        ("a non-registration line in cmake/tests-*.cmake",
+         ["cmake/tests-gpu-hold.cmake"],
+         "+++ b/cmake/tests-gpu-hold.cmake\n+target_link_libraries(x y)\n", "full"),
         ("a lone add_test with its if/endif context",
          ["CMakeLists.txt"],
          "+++ b/CMakeLists.txt\n@@ -1,3 +1,6 @@\n add_executable(t tests/t.cpp)\n+# a new check\n+add_test(NAME t COMMAND t)\n+\n", "configure-only"),
@@ -184,6 +266,11 @@ def self_test():
         ok = got == want
         print(("ok   " if ok else "FAIL ") + f"{name} -> {got}" + ("" if ok else f" (wanted {want}: {why})"))
         bad += 0 if ok else 1
+    g = git_arm()
+    if g is None:
+        print("skip git: no git on PATH, from_git() not exercised")
+    else:
+        bad += g
     print(f"hrx_build_scope --self-test: {bad} failure(s)")
     return 1 if bad else 0
 

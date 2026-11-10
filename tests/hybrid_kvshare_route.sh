@@ -30,6 +30,8 @@ set -uo pipefail
 
 bin=${1:?usage: hybrid_kvshare_route.sh path/to/1bit}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound (engine #1485)
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
 fail=0
@@ -40,30 +42,16 @@ trap cleanup EXIT
 
 start() {   # start <log> [env...]
     local log=$1; shift
-    local attempt port code
-    for attempt in 1 2 3; do
-        port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-        env FAKE_KVSHARE_MARKER="$scratch/provider.json" FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port "$port" --alias hybrid-model \
-            --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
-        pid=$!
-        api="http://127.0.0.1:$port"
-        code=000
-        for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.1; done
-        if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log" && [ "$attempt" -lt 3 ]; then
-            # A server that never came up because it could not bind is a port collision, not a defect in what
-            # this test checks: serve picks the port, releases it, and launches its backends before it binds, so on
-            # a -j runner another serve can take it inside that window. Re-pick a bounded number of times; the FAIL
-            # message below stays for a collision that will not go away (engine #1444).
-            echo "     note: port $port was taken before serve bound it; retrying with a fresh port (attempt $((attempt + 1))/3)"
-            stop
-            continue
-        fi
-        break
-    done
-    if grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$log"; then
-        echo "FAIL: hybrid_kvshare_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$log" | head -1))"
-        exit 1
-    fi
+    local port code
+    # --port 0: the kernel picks and serve reports it, so nothing here picks a port and releases it before serve binds -
+    # the release-then-bind race this test used to retry around is gone rather than mitigated (engine #1444/#1485).
+    env FAKE_KVSHARE_MARKER="$scratch/provider.json" FAKE_SLOT_MARKER="$scratch/slot.json" "$@" "$bin" serve -m "$scratch/tiny.gguf" --device hybrid --port 0 --alias hybrid-model \
+        --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
+    pid=$!
+    port=$(serve_port_wait "$log" "$pid" 900) || { echo "FAIL serve never reported a port; log=$log"; tail -5 "$log" 2>/dev/null; return 1; }
+    api="http://127.0.0.1:$port"
+    code=000
+    for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.1; done
     # this serve's OWN slot directory, from its child's argv: /tmp/1bit-hybrid-* is shared with every other serve
     # on the box, so globbing it reports another test's in-flight socket as this route leaking one (see the same
     # fix and the measurement in tests/hybrid_route.sh)

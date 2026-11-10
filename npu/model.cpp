@@ -74,7 +74,24 @@ Model::Model(const std::string& dir) {
     dims_.kv_heads = c.value("num_key_value_heads", dims_.heads);
     dims_.head_dim = c.value("head_dim", dims_.hidden / dims_.heads);
     dims_.intermediate = c.at("intermediate_size");
-    dims_.vocab = int(tensor("model.embed_tokens.weight").shape.at(0));
+    // engine#1782: the vocabulary comes from config.json first. Two things went wrong when it came from the
+    // tensor: (1) a pack that declares `tie_word_embeddings` may ship the table ONLY as `lm_head.weight` (the
+    // 1.9/1.0.12 Decision packs do), so `tensor("model.embed_tokens.weight")` threw "model has no tensor …";
+    // (2) a tiled entry's shape is [tile_rows, tile_cols, tile_bytes], so `shape[0]` is a TILE count -- a 248320-row
+    // table is [7760, 4, 8704] and was reported as vocab 7760, hidden 4.
+    if (c.contains("vocab_size")) {
+        dims_.vocab = c.at("vocab_size");
+    } else {
+        const Tensor* emb = find("model.embed_tokens.weight");
+        if (!emb && c.value("tie_word_embeddings", false)) emb = find("lm_head.weight");
+        if (!emb)
+            throw std::runtime_error(dir + "/config.json states no vocab_size and the container has no embedding "
+                                             "table (`model.embed_tokens.weight`, or `lm_head.weight` for a model "
+                                             "that declares tie_word_embeddings)");
+        // 3-D is one tile grid (npu/q4nx.h: 32 rows x 256 columns per tile); 2-D is the plain row shape.
+        static constexpr int kTileRows = 32;
+        dims_.vocab = emb->shape.size() >= 3 ? int(emb->shape[0] * kTileRows) : int(emb->shape.at(0));
+    }
     dims_.rope_theta = c.value("rope_theta", 10000.0f);
     dims_.model_type = c.value("model_type", "");
     if (c.contains("eos_token_id")) {

@@ -111,10 +111,16 @@ struct ForwardEngine {
     std::unique_ptr<npu::DecisionHead> head;
     std::string head_error;  // why there is no head, for the 503 the decision route answers
     // --dump-logits <dir>: write each generated position's raw logits (float32, vocabulary-wide)
-    // as step_<n>.bin.  The OpenAI API cannot express this -- it caps top_logprobs at 100 -- so a
+    // as step_<response>_<n>.bin (`<response>` is 1-based per serve, so two prompts in one run cannot overwrite each
+    // other's steps -- engine#803; a single-prompt run is step_1_*).  The OpenAI API cannot express this -- it caps
+    // top_logprobs at 100 -- so a
     // KL-divergence comparison against another stack (engine#671 gate b) needs the distribution
     // itself.  Empty means off, which is the default: nothing is written unless asked.
     std::string dump_logits;
+    // The dump's response index. `step_<n>.bin` used the decode index alone, so a second request overwrote the first
+    // request's steps: a multi-prompt comparison (the KLD row, engine#803) then silently compared only the LAST prompt's
+    // dumps and looked complete. Numbering the response too makes the set of files say how many responses it holds.
+    std::atomic<int> dump_seq{0};
     std::mutex mu;
 };
 
@@ -171,6 +177,8 @@ int json_int(const std::string& path, const char* key, int def) {
 }
 
 void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Response& res, bool chat) {
+    // One id per response, taken before any step: the dumps of two prompts in one serve must not share names.
+    const int dump_req = e.dump_logits.empty() ? 0 : ++e.dump_seq;
     json body;
     try {
         body = json::parse(req.body);
@@ -262,7 +270,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
     // a stop sequence or a grammar that allows nothing more, "length" when the token
     // budget ran out.
-    auto run = [&e, &req, prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats](
+    auto run = [&e, &req, prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats, dump_req](
                    const std::function<bool(const std::string&, const std::vector<Emitted>&)>& on_text) {
         std::string finish = "stop";
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.  A caller
@@ -434,7 +442,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             // reference and the copy below happens before it runs, so what lands on disk is what
             // the model produced, not what the sampler chose.
             if (!e.dump_logits.empty()) {
-                const std::string path = e.dump_logits + "/step_" + std::to_string(n) + ".bin";
+                const std::string path = e.dump_logits + "/step_" + std::to_string(dump_req) + "_" +
+                                          std::to_string(n) + ".bin";
                 if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
                     std::fwrite(logits.data(), sizeof(float), logits.size(), f);
                     std::fclose(f);
@@ -1045,6 +1054,38 @@ int run_forward_serve(int argc, char** argv) {
         ~Stop() { s.stop(); if (t.joinable()) t.join(); }
     } stop{srv, listener};
 
+    // Warm the weight cache before saying "ready". A first request has to touch every (layer, role) weight once, and on
+    // the non-folded int8 route that means materialising the weight matrix in float32 and packing it -- ~112
+    // projections, which on a 27B pack is tens of seconds. Left in the request, that looks like a hang: a 8-token
+    // request returning nothing in 150 s (engine #1605), and a "ready" line that is a lie about the next minute.
+    // Paid here it is startup time, which is what startup time is for. NPU_SERVE_NO_WARMUP=1 keeps the old behaviour.
+    if (!getenv("NPU_SERVE_NO_WARMUP")) {
+        // Announce the warm-up BEFORE it runs, so a caller polling for "ready" can tell "warming, give it a minute" from
+        // "hung". Measured cost is 44.5 s on a folded 27B pack, and `tests/serve_port.sh`'s helper defaults to a 30 s
+        // budget -- a caller that only knows about `ready` would time out and report "serve never reported a port",
+        // which is the misleading shape #1531/#1545 spent effort removing.
+        std::fprintf(stderr, "1bit forward-serve: warming (weight cache; first request would otherwise pay it)\n");
+        std::fflush(stderr);
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<float> wlogits;
+        std::vector<int> wids = {131, 131, 131, 131};   // four tokens of one id: the cheapest pass that touches every weight
+        e.fwd->reset();
+        const bool ok = e.fwd->step_batch(wids, 0, wlogits);
+        e.fwd->reset();
+        const double wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!ok) {
+            std::fprintf(stderr, "1bit forward-serve: warm-up pass failed (%s); serving anyway -- the first request "
+                                 "will pay it\n", e.fwd->last_error());
+        } else {
+            // The caveat is in the log line, not only the PR: the warm-up covers the TOKEN-INVARIANT weights (wkey >=
+            // 0, "packed once and reused" -- xdna_target.cpp). Routed-expert weights are wkey < 0 and are deliberately
+            // never cached ("whose weights change per token"), so on a MoE pack the warm-up is NOT the whole first-touch
+            // cost and a reader must not expect the same 44.5 s to disappear.
+            std::fprintf(stderr, "1bit forward-serve: warm-up pass %.1f ms (token-invariant weights only -- routed MoE "
+                                 "experts are never cached, so a MoE pack still pays per-expert packing; "
+                                 "NPU_SERVE_NO_WARMUP=1 to skip)\n", wms);
+        }
+    }
     ready = true;
     std::fprintf(stderr, "1bit forward-serve: %s ready on http://%s:%d (%s)", e.id.c_str(), host.c_str(), port,
                  e.fwd->backend().c_str());

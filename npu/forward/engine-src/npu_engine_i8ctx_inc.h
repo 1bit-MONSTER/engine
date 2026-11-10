@@ -492,40 +492,13 @@ struct I8Ctx {
                          : q4nx_layout::rowmajor_index(i, j, KD, ND);
     }
 
+    // The body moved to q4nx_pack.c's C twin (q4nx_pack_B_int8_blocked, engine #1416) so it can be tested without the
+    // device runtime: this class included XRT, so nothing could check the packer against the layout contract or measure
+    // its traversal. Same code, `bpos()` passed in; the extraction is behaviour-preserving by construction.
     void packB_blocked(int8_t* Bm, const float* w, int K, int N,
                        std::vector<float>& col, double& ssum) {
-        const int CB = 64;
-        #pragma omp parallel for reduction(+:ssum) schedule(static)
-        for (int jb = 0; jb < N; jb += CB) {
-            const int jn = (N - jb < CB) ? (N - jb) : CB;
-            float amax[CB], tis[CB];
-            for (int b = 0; b < jn; b++) amax[b] = 0.0f;
-            for (int i = 0; i < K; i++) {
-                const float* row = w + (size_t)i * N + jb;
-                for (int b = 0; b < jn; b++) {
-                    float a = fabsf(row[b]);
-                    if (std::isfinite(a) && a > amax[b]) amax[b] = a;
-                }
-            }
-            for (int b = 0; b < jn; b++) {
-                float am = amax[b];
-                if (am < 1e-12f) am = 1.0f;
-                col[jb + b] = am / 127.0f;
-                tis[b] = 127.0f / am;
-                ssum += (double)(am / 127.0f);
-            }
-            for (int i = 0; i < K; i++) {
-                const float* row = w + (size_t)i * N + jb;
-                for (int b = 0; b < jn; b++) {
-                    float v = row[b];
-                    if (!std::isfinite(v)) v = 0.0f;
-                    int x = (int)roundf(v * tis[b]);
-                    if (x > 127) x = 127;
-                    else if (x < -127) x = -127;
-                    Bm[bpos((size_t)i, (size_t)jb + b)] = (int8_t)x;
-                }
-            }
-        }
+        col.resize((size_t)N);
+        q4nx_pack_B_int8_blocked(Bm, w, K, N, KD, ND, blocked_b ? 1 : 0, col.data(), &ssum);
     }
 
     // Pack weights into an arbitrary (already-allocated) weight BO.

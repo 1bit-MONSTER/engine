@@ -25,6 +25,7 @@
 // element-wise.
 #include "q4nx_forward.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
+#include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>   // mkstemp/close: the pb16i activation probe's dump
@@ -32,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -116,21 +118,10 @@ static const uint8_t* data_of(ModelWeights* mw, const TensorDesc* d, size_t byte
     return (const uint8_t*)model_tensor_data(mw, const_cast<TensorDesc*>(d));
 }
 
-// Which instance of the sealed ELF runs a role, or nullptr when the sealed ELF does not
-// cover it.  The names are the contract with the kernel lane (TROSS-GU-STATE.md 08:30).
-static const char* pb16i_instance(Q4nxDesign r) {
-    switch (r) {
-        case Q4NX_DESIGN_G:
-        case Q4NX_DESIGN_U:        return "main:gu";
-        case Q4NX_DESIGN_D:        return "main:d";
-        case Q4NX_DESIGN_QKVLIN:   return "main:qkv";
-        case Q4NX_DESIGN_O:        return "main:o";
-        case Q4NX_DESIGN_Z:        return "main:z";
-        case Q4NX_DESIGN_QKVFA_Q:  return "main:qh";
-        case Q4NX_DESIGN_QKVFA_KV: return "main:kv";
-        default:                   return nullptr;
-    }
-}
+// Which instance of the sealed ELF runs a role, or nullptr when the sealed ELF does not cover it.  The table
+// moved to q4nx_pack.c (q4nx_pb16i_instance) because the target opens the decode family (engine#803 A2b) and a
+// contract both sides must agree on cannot live on one side; this wrapper keeps the call sites unchanged.
+static const char* pb16i_instance(Q4nxDesign r) { return q4nx_pb16i_instance(r); }
 
 // Where an M=16 int8 twin is looked for, first hit wins: <model dir>/kernels-m16,
 // <kernels>/m16, then <kernels> itself.
@@ -202,6 +193,29 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
 // every other architecture builds exactly the table it built before.  Keys are searched with their
 // quotes, which is what keeps "factor" from matching inside "high_freq_factor".
+// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
+// 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
+// accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
+static Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
+    Q4nxRopeDynamic d{};
+    std::ifstream f(cfg_path);
+    if (!f) return d;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    char type[64];
+    q4nx_rope_declared_type(t.c_str(), type, (int)sizeof type);
+    if (std::strcmp(type, "dynamic") && std::strcmp(type, "dynamic_ntk")) return d;
+    auto number = [&](const char* key) {
+        const std::string k = std::string("\"") + key + "\":";
+        const size_t at = t.find(k);
+        if (at == std::string::npos) return 0.0;
+        return std::strtod(t.c_str() + at + k.size(), nullptr);
+    };
+    d.factor = number("factor");
+    d.original_max_position = number("max_position_embeddings");
+    d.on = (d.factor > 0.0 && d.original_max_position > 0.0) ? 1 : 0;
+    return d;
+}
+
 static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
     Q4nxRopeLlama3 s{};
     std::ifstream f(cfg_path);
@@ -595,6 +609,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    rope_dynamic_ = read_rope_dynamic(cfg_path);     // rope_type "dynamic" (NTK by base, engine#1740 W2)
     {
         // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
         // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
@@ -603,7 +618,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         char declared[64];
         q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
-        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1)) {
+        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
             if (!std::strcmp(declared, "llama3"))
                 err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
                        "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
@@ -682,7 +697,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         fprintf(stderr, "  [forward] container K grid: H %d -> %d, IM %d -> %d (pad columns are zero)\n",
                 c_.H, kpad_, c_.IM, impad_);
 
-    embed_.resize((size_t)NV * H);
+    /* engine#1784: `embed_` (the bf16 copy) is no longer filled: the table is read in place. It stays for nothing
+     * and is sized to zero, so a stale read would be a bounds error rather than a silent wrong answer. */
     {
         /* A tied model may store the table ONLY as `lm_head.weight` (Qwen3.5-4B's
          * container has no `model.embed_tokens.weight`); it doubles as both the
@@ -701,7 +717,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             /* A quantised table is stored on the container's K grid, so it dequantises to kpad_
              * wide rows (engine#845); the pad columns are zero, so the head's dot product over
              * c_.H columns is unchanged. */
-            embed_f_.resize((size_t)NV * (size_t)kpad_);
+            /* engine#1784: nothing is expanded until it is asked for. The plain int8 + per-32-column-scale table --
+             * the dtype the 27B and the gemma-class containers use -- is read element-wise straight from the mapping
+             * by embed_at(), so 0.74 GiB of container no longer becomes 2.96 GiB of anonymous memory. Only the chunked
+             * formats (which have no element-wise read yet) still decode into embed_f_. */
             lm_w_ = kpad_;
             const size_t esz = (size_t)etd->data_size;
             int rc;
@@ -713,24 +732,57 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 TensorDesc* sd = model_tensor_by_name(mw_, "model.embed_tokens.weight.scale");
                 const float* sc = sd ? (const float*)data_of(mw_, sd, en / 32 * sizeof(float)) : nullptr;
                 if (sd && !sc) { err_ = "model.embed_tokens.weight.scale is too small"; return false; }
-                rc = q4nx_dequant_plain_i8((const uint8_t*)e, sc, NV, H, embed_f_.data());
+                embed_i8_     = (const int8_t*)e;
+                embed_sc_     = sc;
+                embed_groups_ = H / Q4NX_GROUP_SIZE;
+                rc            = 0;
             } else {
-                rc = dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data());
+                /* engine#1784: the chunked formats are tiles of 5,120 B (the 27B's 0.625 B/element packed table is
+                 * 155,200 of them), so a row is read out of the `cols/256` tiles that cover it instead of the whole
+                 * table being decoded into f32 -- which for that pack is 0.74 GiB of container becoming 4.74 GiB.
+                 * Same tile grid and ordering as q4nx_dequant_tensor_chunked(), pinned by the row test. */
+                const int ntr = NV / 32, ntc = kpad_ / 256;
+                const size_t tiles = (size_t)ntr * (size_t)ntc;
+                if (tiles > 0 && esz % tiles == 0) {
+                    embed_tile_       = (const uint8_t*)e;
+                    embed_tile_bytes_ = esz;
+                    embed_tile_rows_  = NV;
+                    embed_tile_cols_  = kpad_;
+                    embed_tile_cb_    = int(esz / tiles);
+                    embed_row_buf_.assign((size_t)kpad_, 0.0f);
+                    embed_row_tok_    = -1;
+                }
+                rc = 0;   // the buffer below is the fallback, and it reports its own failure
             }
             if (rc != 0) {
                 err_ = std::string("embedding dtype ") + dt + " but dequant failed";
                 return false;
             }
+            if (!embed_tile_ && !embed_i8_) {   // no element-wise read: keep the whole-table buffer (unchanged path)
+                embed_f_.resize((size_t)NV * (size_t)kpad_);
+                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data()) != 0) {
+                    err_ = std::string("embedding dtype ") + dt + " but dequant failed";
+                    return false;
+                }
+            }
             embed_f32_ = true;
-            fprintf(stderr, "  [forward] embedding dtype %s -> dequantized (%zu floats, %.2f GiB)\n",
-                    dt, embed_f_.size(),
-                    (double)embed_f_.size() * sizeof(float) / (1024.0 * 1024.0 * 1024.0));
+            if (embed_i8_ || embed_tile_)
+                fprintf(stderr, "  [forward] embedding dtype %s -> read in place from the container, one row per token "
+                                "(engine#1784): %.2f GiB not materialised\n", dt,
+                        (double)NV * (double)kpad_ * 4.0 / (1024.0 * 1024.0 * 1024.0));
+            else
+                fprintf(stderr, "  [forward] embedding dtype %s -> dequantized (%zu floats, %.2f GiB)\n",
+                        dt, embed_f_.size(),
+                        (double)embed_f_.size() * sizeof(float) / (1024.0 * 1024.0 * 1024.0));
         } else {
             if (etd->data_size < (size_t)NV * H * 2) {
                 err_ = "embedding too small for NV*H bf16";
                 return false;
             }
-            memcpy(embed_.data(), e, (size_t)NV * H * sizeof(uint16_t));
+            /* engine#1784: read the table in place out of the container's read-only mapping, one row per token,
+             * instead of copying it. `e` points into `mw_`'s mapping, which outlives this forward, and embed_at()
+             * indexes it at the container's own row stride. */
+            embed_bf16_ = (const uint16_t*)e;
             lm_w_ = H;   // raw bf16: the table has no pad
         }
     }
@@ -1494,8 +1546,23 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
 
 float Q4nxNpuForward::embed_at(int token, int k) const {
     if (token < 0 || token >= c_.NV || k < 0 || k >= c_.H) return 0.0f;
+    // engine#1784: the two dtypes that can be read in place, without a table-sized buffer, are read in place. Pad
+    // columns (k >= c_.H) are already refused above and read as 0.0f, which is what the expanded table held there.
+    if (embed_i8_)
+        return q4nx_plain_i8_at((const uint8_t*)embed_i8_, embed_sc_, c_.NV, c_.H, token, k);
+    if (embed_tile_) {
+        // One row per token: the callers walk k innermost, so this gathers the row once and serves the H reads from it.
+        if (token != embed_row_tok_) {
+            if (q4nx_dequant_tile_row(embed_tile_, embed_tile_bytes_, embed_tile_rows_, embed_tile_cols_,
+                                      embed_tile_cb_, token, embed_row_buf_.data()) != 0)
+                return 0.0f;
+            embed_row_tok_ = token;
+        }
+        return embed_row_buf_[(size_t)k];
+    }
+    if (embed_bf16_) return bf16_to_f32(embed_bf16_[(size_t)token * (size_t)c_.H + (size_t)k]);
     if (embed_f32_) return embed_f_[(size_t)token * (size_t)lm_w_ + (size_t)k];
-    return bf16_to_f32(embed_[(size_t)token * (size_t)c_.H + (size_t)k]);
+    return 0.0f;
 }
 
 /* LM-head weight for output n, column k: the separate lm_head.weight when the
@@ -3603,9 +3670,18 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             char path[4096];
             std::snprintf(path, sizeof path, "%s/layer_%02d.f32", dd, l);
-            if (FILE* fp = std::fopen(path, "wb")) {
-                std::fwrite(X.data(), sizeof(float), (size_t)M * (size_t)H, fp);
-                std::fclose(fp);
+            // engine#1726: every one of the three calls can fail, and all three used to fail silently -- a missing
+            // directory, an unwritable one, or a full disk left the run printing that it was dumping with no files and
+            // no error, and a missing layer_<l>.f32 then reads as "that layer never ran" to whoever analyses the dump.
+            // Reported once per failure mode, not per layer: a full disk fails every layer, and 40 identical lines is how
+            // the first one gets scrolled past. Still non-fatal -- a diagnostic must not fail a valid run.
+            std::string dump_err;
+            if (!onebit::npu::write_residual_dump(path, X.data(), (size_t) M * (size_t) H, &dump_err)) {
+                static bool told_fail = false;
+                if (!told_fail) {
+                    told_fail = true;
+                    std::fprintf(stderr, "  [dump] %s (no residual dump for this run)\n", dump_err.c_str());
+                }
             }
         }
     }
@@ -4208,13 +4284,17 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     {
         const int half = proportional ? HD / 2 : rot / 2;
         std::vector<float> cos_(half), sin_(half);
+        // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
+        // Below the model's original window this returns theta unchanged, which is what makes a short prompt
+        // bit-identical to the same model served without the scaling.
+        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, (int)HD);
         for (int i = 0; i < half; i++) {
             double inv;
             if (proportional) {
-                inv = 1.0 / std::pow((double)theta, 2.0 * (double)i / (double)HD);
+                inv = 1.0 / std::pow(rope_theta, 2.0 * (double)i / (double)HD);
                 if (i >= rot / 2) inv = 0.0;
             } else {
-                inv = 1.0 / std::pow((double)theta, (double)i / (double)half);
+                inv = 1.0 / std::pow(rope_theta, (double)i / (double)half);
                 // LongRoPE (MiniCPM4): ggml's rope applies the factor as
                 // `rope_yarn(theta / ff, ...)` (ggml-cpu/ops.cpp
                 // ggml_rope_cache_init), i.e. the angle is DIVIDED by
@@ -5016,6 +5096,18 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
 
 bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>& logits) {
     const int H = c_.H, NV = c_.NV;
+    // The target first, and only if it both claims and succeeds (npu/model/op_dispatch.h): `lm_head` is the one
+    // optional op whose contract needs no residency -- one hidden row [H] to [V], idempotent, weights the model's
+    // -- so a target that owns a head context can run it here instead of the launch path below. No target on this
+    // box claims it yet (XdnaTarget's supports() is gemv-only), so today this falls through and the numerics are
+    // unchanged by construction; a target that claims it and fails still falls through, which is the case the
+    // dispatch is written for.
+    // `supports()` first and separately: the target's output buffer is [V] floats (1 MB at 248k vocab), and asking
+    // for it on every token when no target claims the op would be a per-token allocation for nothing.
+    if (xd_ && !host_gemm_ && (int)h.size() == H && xd_->supports(npu::target::Op::lm_head)) {
+        std::vector<float> via_target((size_t)NV, 0.0f);
+        if (npu::model::run_lm_head(*xd_, h.data(), via_target.data())) { logits = std::move(via_target); return true; }
+    }
     if (!host_gemm_ && xd_ && xd_->head_ctx() && xd_->head_ctx()->gemv) return run_lm_head_gemv(h, logits);
     if (host_gemm_) {
         // Offline mode: plain float matvec against the (possibly dequantized)

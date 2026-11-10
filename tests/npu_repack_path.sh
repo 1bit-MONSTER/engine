@@ -61,9 +61,12 @@ serve_npu() {
     # from a directory with no ../src beside it: a build tree's baked fallback is relative, and a
     # caller's working directory must not decide whether the script is found
     local cwd=$scratch/cwd; mkdir -p "$cwd"
+    # --port 0: nothing here calls the server, so no port is needed at all - it just must not be one that was
+    # picked and released before serve binds it (engine #1444/#1485).
+    # The comment must stay ABOVE this command: a `\` continuation followed by a comment line turns the command into
+    # `env VAR=... # ...`, which drops every assignment, so each arm below ran a bare `1bit` with none of its env
+    # (the markers were never written and this test failed on main from the day it landed).
     ( cd "$cwd" && env REPACK_MARKER="$marker" ONEBIT_Q4NX_CACHE="$scratch/cache" "$@" \
-        # --port 0: nothing here calls the server, so no port is needed at all - it just must not be one that was
-        # picked and released before serve binds it (engine #1444/#1485)
         timeout 60 "$dir/1bit" serve -m "$scratch/m.gguf" --device npu --port 0 > "$scratch/out.log" 2>&1 )
     echo $?
 }

@@ -678,6 +678,44 @@ preflight() {
                     { echo "preflight: cannot read the kernel image $vmlinuz (os/mini/mkimage.sh): set VMLINUZ to a readable copy"; bad=1; } ;;
         esac
     done
+    # engine#1504: a self-hosted runner that is dead makes every check that needs this box read as PENDING, never
+    # red (2026-11-08: both dead 3h45m behind 24 jobs), so the state that damages a release most is the one nothing
+    # reports. Two rows, because each is blind to what the other sees:
+    #   scripts/check-ci-runners.sh  - GitHub's view: is it REGISTERED and online. Cannot say why, and it only
+    #                                  notices after the heartbeat times out. Exit 0 when none are registered.
+    #   scripts/ci-runner-health.sh  - systemd's view (#1546): Result=oom-kill, a restart window, a unit that is not
+    #                                  active. Says WHY, and fires the moment a unit dies. Exit 2 = no such units on
+    #                                  this host, i.e. a fresh box, which is a note rather than a failure.
+    # WEEKLY_SKIP_RUNNER_CHECK=1 is the release-during-an-outage escape, and it skips BOTH: a flag that skipped only
+    # one of them would be useless in exactly the outage it exists for, because both fail for the same dead runner.
+    if [ "${WEEKLY_SKIP_RUNNER_CHECK:-0}" != 1 ]; then
+        if runner_out=$("$(cd "$(dirname "$0")" && pwd)/check-ci-runners.sh" \
+                --require strixhalo-engine strixhalo-bench 2>&1); then
+            say "preflight: $runner_out"
+        else
+            printf '%s\n' "$runner_out" | sed 's/^/preflight: /'
+            echo "preflight: a self-hosted runner is not online, so the checks after this release would queue for ever (WEEKLY_SKIP_RUNNER_CHECK=1 to release anyway)"
+            bad=1
+        fi
+        if [ -x "$(cd "$(dirname "$0")" && pwd)/ci-runner-health.sh" ]; then
+            if health_out=$("$(cd "$(dirname "$0")" && pwd)/ci-runner-health.sh" 2>&1); then
+                printf '%s\n' "$health_out" | grep -c '^PASS' | xargs -r -I{} echo "preflight: runner units: {} PASS in systemd's view"
+            else
+                health_rc=$?
+                if [ "$health_rc" = 2 ]; then
+                    say "preflight: no actions.runner.* units on this host: systemd has nothing to inspect"
+                else
+                    printf '%s\n' "$health_out" | sed 's/^/preflight: /'
+                    echo "preflight: a runner unit is not accepting jobs (scripts/ci-runner-health.sh): $health_rc"
+                    bad=1
+                fi
+            fi
+        fi
+    else
+        # a skip that says nothing is the failure mode these rows exist for: a release log where the runner checks
+        # silently did not run reads exactly like one where they passed.
+        say "preflight: runner checks SKIPPED (WEEKLY_SKIP_RUNNER_CHECK=1) - a dead runner will read as a pending check, never red"
+    fi
     return $bad
 }
 preflight || { say "preflight failed: nothing was run"; exit 1; }

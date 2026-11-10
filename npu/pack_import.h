@@ -33,6 +33,8 @@
 // visible to whatever loads it next.
 #pragma once
 
+#include <nlohmann/json.hpp>
+
 #include <cstdint>
 #include <string>
 
@@ -71,6 +73,11 @@ struct Dims {
     std::vector<int> eos;
 };
 
+// A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
+// GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
+// reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
+std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why);
+
 // One tensor the pack describes, and where its values would come from.
 struct Planned {
     std::string name;     // Q4NX tensor name (model.layers.N.<...>.weight)
@@ -88,6 +95,10 @@ struct Planned {
 
 struct Plan {
     std::string dir;
+    // The MatMulNBits block size along K the pack declares for its LM HEAD, when that is not the 128 this importer's
+    // .fconst tile geometry assumes. Non-zero means the tail's head tiles cannot be walked (engine#1503): a tied pack
+    // takes the head from its embedding instead, an untied one is refused by name.
+    int64_t head_block = 0;
     std::string pack;  // *_rai_1.8.0_npu_4K, from the directory name
     Dims dims;
     std::vector<Planned> tensors;
@@ -117,6 +128,15 @@ struct Plan {
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)
     int64_t graph_external_bytes = 0;// size on disk of the external file they name, 0 when it is not in the pack
+    // `com.ryzenai:MatMulNBitsBf` ops, and node inputs that resolved to a `*.qweight.packed` sibling behind a
+    // `*.qweight.empty` placeholder. Both exist because a walker that matches only the Microsoft op name, or only
+    // the node's own initializer, reports a weightless graph for the 1.9 external-data packs (engine#1503).
+    int64_t graph_ryzenai_matmuls = 0;
+    int64_t graph_packed_siblings = 0;
+    int64_t graph_weightless_matmuls = 0;   // dropped: placeholder + packed sibling both byte-less (engine#1671)
+    // How many of the graph's 4-bit block-128 weights satisfy length == N x (K/128 + 1) x 68 (the per-row stride the
+    // .fconst tile also carries): a measurement, so `info` can say "201 of 201" or "3 of 7" instead of guessing.
+    int64_t graph_stride_ok = 0, graph_stride_of = 0;
     std::map<int64_t, int64_t> graph_blocks;                 // block size -> how many ops declare it
     std::vector<std::vector<int64_t>> graph_weight_dims;     // up to 4 distinct [N, K/block, bytes] shapes
     // The MLP section's geometry, likewise measured: gate and up share one fused 4,288-byte-subvolume
@@ -130,9 +150,47 @@ struct Plan {
     std::string manifest() const;  // JSON: format, layout version, source, geometry, tensors
 };
 
+// The multi-component (gemma-4 1.9, `type: compositemodel`) packs keep the text tower's geometry in
+// model_config.json -> config.model_attributes.text_config, while config.json is `{}` and genai_config.json's
+// decoder block stops at head_size. Fills ONLY the keys `cfg` lacks and returns how many it added, so the caller
+// can name the source; exposed for a unit test that needs no ONNX graph.
+int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg);
+
+// The same value derived from the graph's own node attributes (MatMulNBits/MatMulNBitsBf K and N) when the
+// initializers carry no dims -- the 1.9 external-data genre. Returns 0 when no FFN pair agrees, or when two
+// widths do, so the caller refuses instead of guessing. Exported for the unit test, which needs no pack.
+// Takes a PATH because it parses the graph: it is cheap only because plan() calls it once. If it ever moves into a
+// per-tensor or per-layer path, that parse is paid per call -- keep it to one call per plan.
+int intermediate_size_from_graph(const std::string& model_path, int64_t hidden);
+
+// Where a pack keeps its Token .fconst: the root for a flat pack, the decoder component `genai_config.json` names for a
+// multi-component one (`type: compositemodel`), whose geometry files stay at the root. Exported for the unit test.
+std::string find_token_fconst_exported(const std::string& pack_dir);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);
+
+// Whether the canonical Token .fconst already on the scratch path holds exactly the bytes this run would write,
+// given the length the canonical form must have (engine#1662). True means the ~291 MB rewrite can be skipped. Split
+// out of canonical_token_fconst() so the decision has a test that needs no 1.9 pack: a truncated copy, a missing file
+// and a directory on the scratch path must all come back false.
+bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
+
+// Removes the canonical Token .fconst copies in `dir` that nothing will reuse (engine#1770). Reuse writes a new copy when the
+// source changes rather than overwriting, so without this the scratch directory grows one multi-hundred-MB file per change; on
+// this box 699 files / 8.7 GiB of tmpfs. Three rules:
+//   * share `prefix` (one pack path and geometry) but are not `keep_name` -- normal generations of a superseded source;
+//   * equal `legacy_name` -- the generation before the source identity was part of the name
+//     (`1bit-fconst19-<tag>-<h>-<heads>-<layers>.fconst`), which `prefix` cannot match because it was written without the version
+//     suffix, so those files were invisible to this sweep and stayed resident (three of them, 10.67 GiB, on 2026-11-10);
+//   * start with `1bit-fconst19` and are older than `max_age_seconds` (0 disables) -- a pack nobody imports again. A write-triggered
+//     sweep only reaches the geometry being written, so the abandoned tail needs an age rule.
+// Exposed for the same reason as canonical_copy_reusable(): the rule it applies is what can be wrong, and a test can prove it on a
+// directory of empty files with no pack at all.
+void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix,
+                                  const std::string& legacy_name  = std::string(),
+                                  int64_t            max_age_seconds = 0);
 
 // The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
 // actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos
@@ -144,6 +202,27 @@ struct TextArtifacts {
     bool tokenizer = false;                     // tokenizer.json present: what `1bit serve` opens
 };
 TextArtifacts scan_text_artifacts(const std::string& pack_dir);
+
+// engine#1740 (W1a): where the 1.9 Token .fconst keeps its output layer. The arithmetic is exposed because it is the
+// half that can be wrong silently -- a one-tile error reads a plausible region and only a correlation against the
+// embedding notices -- so it is pinned by a host test with no pack, no device and no fixture.
+struct TailHeadPlacement {
+    int64_t first = -1;   // earliest tile-aligned candidate (== tail_off + env)
+    int64_t last = -1;    // candidate the trailing zero run implies
+    int64_t rows = 0;
+    int64_t zeros = 0;
+    int64_t have = 0;
+    int64_t want = 0;
+    bool exact = false;   // have == want: the head ends the file
+    std::string why;      // non-empty when no candidate exists
+};
+TailHeadPlacement plan_tail_head(int64_t bytes, int64_t tail_off, int64_t env, int64_t rows, int64_t tile,
+                                 int64_t zeros);
+
+// The search half: a synthetic tied head (built through the tile encoder) is located, then displaced by one tile and
+// still located, then handed over as untied where padding must refuse and an exact tail must be taken unverified.
+// Returns false with *why set. No pack, no device, no fixture.
+bool tail_head_selftest(std::string* why);
 
 struct Options {
     bool allow_incomplete = false;  // write what is representable and name the rest
@@ -213,6 +292,10 @@ struct Report {
     // false means "no agreeing duplicate", which also covers "no duplicate to compare" and "the norm was
     // refused", and those are different things to say about an import.
     bool final_norm_imported = false;      // model.norm.weight was written into the container
+    // Why lm_head was synthesised rather than read (engine#1503: the pack's head is at a block this importer cannot
+    // walk and the pack is tied). Empty means it was read, as usual. Carried on the Report because the config JSON is
+    // built after the .fconst block that discovers this.
+    std::string head_synthesized_note;
     bool prefill_tail_seen = false;        // a second copy was readable in the prefill .fconst
     bool final_norm_crosscheck = false;    // ... and it is byte-identical to the Token_Token copy
 
@@ -243,6 +326,55 @@ struct Q4 {
     std::vector<float> scale;    // [N, K/32]
     std::vector<float> zero;     // [N, K/32]
 };
+// The 1.9 external-data tile (engine#1503): the `.fconst` tile's subvolume written densely per tensor.
+//
+// Measured on `amd/phi-4_rai_1.9.0_npu` (`eager-mm.onnx.data`, 9.74 GB): every `MatMulNBitsBf` weight is a 1-D byte
+// blob whose length is `N x (K/128 + 1) x 68` -- i.e. `N/64` tiles of `2*(K/128 + 1)` subvolumes of 2,176 B. Inside a
+// subvolume: 2,048 B of 4-bit codes, 64 B of int4 zero points (four per row, one per 32-column group), 64 B of bf16
+// scales (one per row). The `k = 0` subvolume pair of every tile is the writer's bias pair, zero on a pack whose
+// matmuls carry no bias. `decode_external_tile` returns the whole matrix as a `Q4` (block 32: the 128-column scale is
+// repeated over its four groups and each group keeps its own zero point, which is what the pack states).
+constexpr int kExtSubvBytes = 2176;   // one subvolume: 2,048 B quants + 64 B int4 zero points + 64 B bf16 scales
+constexpr int kExtSubvRows = 32;
+constexpr int kExtTileRows = 64;      // two subvolumes per tile per K block
+// Which way one row's 128 code bytes lie inside the 2,048-byte quants region. The default is the .fconst tile's
+// verified formula; the alternative is here so the known-answer run can settle it without touching addressing.
+constexpr bool kExtQuantsRowMajor = false;
+
+// `row_major` defaults to kExtQuantsRowMajor (the shipped choice); it is a parameter only so the test can hold BOTH
+// orderings to their own spec -- a flip of the constant must not quietly change what the other branch means.
+// Turn a decoded external-data tile into the container's q4_1 parts. The two conventions differ in what zero
+// means: the container dequantises `w = code*d + m` (m is the group's MIN, npu/q4nx.h), while the pack's is
+// `w = (code - zp)*scale` (zp is an int4 CODE offset). So the mapping is `d = scale`, `m = -zp*scale`, codes
+// unchanged -- and the obvious alternative, dequantise then re-quantise with the container's own quantiser, is
+// measurably NOT the same weights: on a real phi-4 tile it reproduced the pack's codes on only 2,826 of 8,192
+// entries and moved weights by 2.5 % of the tensor's range (engine#1503). `m_inexact` reports how many group
+// offsets were not bf16-exact (86.3 % are, measured), because that rounding is the only loss this path has.
+Q4 container_from_external_q4(const Q4& pack, long long* m_inexact = nullptr);
+
+// The container role a matmul plays, read off the graph's own tensor name: `...qkv_proj...` -> "QKV",
+// `o_proj` -> "O", `gate_proj` -> "G", `up_proj` -> "U", `down_proj` -> "D", `lm_head` -> "HEAD". These are the
+// roles the design/tile writer already speaks, so the external-data genre's writer is a mapping and not a second
+// vocabulary. nullptr when the name is one this importer has not measured: reported BY NAME rather than skipped,
+// because a projection nothing maps is a weight that would silently not be written (engine#1503).
+const char* external_role_of(const std::string& tensor_name);
+
+// Where a pack projection's rows go in the container: the container stores `self_attn.q_proj.weight` and its
+// siblings separately (only a GDN layer has a fused `linear_attn.qkv_proj.weight`), while the pack stores q/k/v as
+// ONE matmul -- phi-4's is N 7680 with 40 heads x 128 (q 5120) and 10 kv heads x 128 (k 1280, v 1280). So a role
+// is one container tensor except "QKV", which is three with row ranges taken from the geometry the pack states.
+// Names are the forward's own (`self_attn.{q,k,v,o}_proj.weight`, `mlp.{gate,up,down}_proj.weight`,
+// `lm_head.weight`), read from npu/forward/src/q4nx_forward.cpp rather than invented.
+struct ContainerTensor {
+    std::string suffix;   // relative to `model.layers.<L>.`, or a model-level name for HEAD
+    int row_lo = 0, row_hi = 0;   // rows of the pack's matmul this tensor takes (its own N when split is 1)
+};
+// False + `err` for a role with no container home (the caller must then refuse rather than drop the weights).
+bool external_container_tensors(const std::string& role, int nh, int nkv, int hd, std::vector<ContainerTensor>& out,
+                                std::string& err);
+
+Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err,
+                        bool row_major = kExtQuantsRowMajor);
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles = false, bool drop_zero = false);
 
@@ -300,9 +432,61 @@ unsigned short bf16_bits_of(float v);
 // the default rather than throw. Exported so tests/npu_pack_import_test.cpp can pin it without a
 // pack; `source` names where the geometry came from, for the refusal messages.
 Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
+// engine#1503: what the graph walker RECORDED, without exposing its model type. A three-input MatMulNBits (no qzeros,
+// weights spelled `<proj>.MatMul.weight_Q4`) used to be dropped entirely, which is why Qwen3-VL-4B imported one tensor.
+// Returns the matmul count; `without_zeros` counts those that carry no qzeros tensor (the implicit-zero-point case), and
+// the last three report the first matmul's own K/N/block attributes.
+int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without_zeros, int* K, int* N, int* block);
+// engine#1638: the geometry as read, so a test can check WHICH source a number came from.
+nlohmann::json load_geometry_exported(const std::string& pack_dir, std::string* source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
+// One measured Ryzen AI 1.9 Token .fconst block shape (engine#1503). Every field is measured against the 1.8 pack of
+// the same model by tools/fconst19_measure.py; none of it is derivable from the pack, which is why a pack whose shape
+// is not in the table is refused rather than decoded.
+struct Fconst19Rule {
+    int hidden, heads, layers;
+    int64_t prefix;   // bytes before the q/k/v bundle
+    int n_tiles, rot;
+    int64_t tile;
+};
+
+// The row for a geometry, or nullptr with `why` explaining which of the two reasons applies: the geometry has never
+// been measured, or it has been measured MORE THAN ONCE with different shapes (two models can share hidden/heads/layers
+// and still cut the payload differently -- Qwen3-1.7B and Llama-3.2-1B are both 2,048/32 heads and use 3 x 1,183,744
+// against 5 x 591,872). A wrong row gets the ROTATION wrong, which leaves the prefix and the epsilon anchors untouched,
+// so it reads as a correct parse and answers quiet nonsense; that is why an ambiguous table refuses instead of picking.
+const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std::string* why);
+// The measured 1.9 rule table itself, with its row count, so a test can pin every row against the numbers that were
+// measured. Two failure modes this exists for, both seen on this table: a wrong digit in a row (which rotates a pack's
+// weights into the wrong projections while every anchor still lines up), and a row that a merge silently drops (the
+// h4096 row was lost twice that way, which un-measured a whole model class with nothing failing).
+const Fconst19Rule* fconst19_rules(int* count);
+// The same decision over an explicit table, so a test can hand it the one shape that decides correctness and that the
+// real table must never contain: two rows for one geometry with different shapes.
+const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
+                                              std::string* why);
+
 int64_t attn_tile_bytes(int64_t k);
+// Pearson correlation between a quantised head and a bf16 embedding table (engine#1690; the self-check's own statistic,
+// exported so a test can pin the buffer width it decodes).
+/* The embedding table the self-check compares a head against, with its WIDTH in the value (engine#1721).
+ *
+ * `embed_bytes` was a bare `const uint8_t*` that meant the pack's own f16 bytes and then -- from #1661, silently --
+ * the container's bf16 copy, and four readers went on decoding F16. Nothing objected at compile time, and the
+ * result was not a crash but a plausible number: corr 0.885220 / rel_err 0.987 on a tied pack whose container
+ * scores 0.999999. So the format travels with the pointer, the default is what the importer actually holds
+ * (bf16), and a reader that wants F16 has to say so. */
+struct EmbedTable {
+    const uint8_t* p = nullptr;
+    enum class Fmt { F16, BF16 } fmt = Fmt::BF16;
+    int H = 0;                       // row stride in ELEMENTS, both formats are 2 bytes
+    bool ok() const { return p != nullptr && H > 0; }
+};
+// The only decode: bf16 or f16 per t.fmt. out-of-range rows still read (callers clamp), as before.
+double embed_at(const EmbedTable& t, int row, int k);
+
+double corr_bf16(const Q4& q, const uint8_t* embed_bf16, int H, int rows);
 // Where a layer block's attention payload starts: the block's 64-byte header, then its
 // input_layernorm weight as bf16 [hidden]. So it is `64 + 2 x hidden`, not a constant. It reads 1,856 on
 // the 0.5B pack (hidden 896) and 4,160 on Llama-3.2-1B (hidden 2,048); reading it as the constant is what

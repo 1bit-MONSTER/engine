@@ -119,6 +119,19 @@ bool env_int(const char* name, int* out) {
     return true;
 }
 
+// Whether the configured ELF is a `_b8` (device-blocked B) design. THIS WAS MISSING and it made every `_b8` design
+// unjudgeable through the probe path: `I8Ctx::blocked_b` defaults to false and only the forward and the xdna target ever set
+// it, so ONEBIT_EP_NPU_ELF loading a `_b8` kernel packed B row-major and returned a plausible wrong answer at every shape.
+// Measured 2026-11-10 with onebit_npu_gemm_probe on the device: a *device-proven* 4B family set (full_i8_O_K4096_N2560_b8_m16)
+// and a freshly built 3584 set both FAILed with max_abs 5.8-6.3e1 and max_rel ~4-5e4 -- i.e. the probe was measuring its own
+// packing, not the kernel. The suffix IS the family contract (the forward derives the same `_b8` from the container's
+// q4nx_weight_layout), and an explicit ONEBIT_EP_NPU_BLOCKED_B wins over the name so a mis-named file stays testable.
+bool elf_declares_b8(const std::string& elf) {
+    if (const char* v = env("ONEBIT_EP_NPU_BLOCKED_B")) return strtol(v, nullptr, 10) != 0;
+    const std::string stem = elf.substr(elf.find_last_of('/') == std::string::npos ? 0 : elf.find_last_of('/') + 1);
+    return stem.find("_b8") != std::string::npos;
+}
+
 bool fail(State& s, const std::string& why) {
     s.why = why;
     s.ok = false;
@@ -206,6 +219,7 @@ bool init(State& s) {
         kernel->n = n;
         kernel->elf = elf;
         kernel->ctx = std::make_unique<I8Ctx>();
+        kernel->ctx->blocked_b = elf_declares_b8(elf);
         if (!kernel->ctx->init_elf(*s.dev, elf.c_str(), m, k, n, 1)) {
             // One unloadable design must cost that design, not the device. This used to fail the whole State,
             // which meant a single bad entry in ONEBIT_EP_NPU_ELFS (an ELF from another kernel family, a
@@ -276,6 +290,7 @@ Q8Kernel* q8_kernel(State& s, int64_t k, int64_t n) {
         kern->n = nn;
         kern->elf = elf;
         kern->ctx = std::make_unique<I8Ctx>();
+        kern->ctx->blocked_b = elf_declares_b8(elf);
         if (!kern->ctx->init_elf(*s.dev, elf.c_str(), m, kk, nn, 1)) {
             s.q8_unavailable.push_back(
                 {k, n, "I8Ctx init_elf failed for " + elf + " (" + dims + ") -- check the design M"});

@@ -1417,6 +1417,14 @@ add_dependencies(onebit npu_answer_parser_test)
 add_executable(batch_check_compare_test tests/batch_check_compare_test.cpp)
 target_include_directories(batch_check_compare_test PRIVATE npu/forward/include)
 add_test(NAME batch_check_compare COMMAND batch_check_compare_test)
+
+# engine#1780: the DFlash draft block's acceptance arithmetic -- tokens = accepted + bonus, the break-even rule, and the
+# published OGA-route counts as known answers. Header-only and host-only: no container, no device, no NPU runtime, so it
+# runs wherever this file is built. Registered at top level with the same hook as the row above, for the same reason.
+add_executable(dflash_accept_test tests/dflash_accept_test.cpp)
+target_include_directories(dflash_accept_test PRIVATE npu/forward/include)
+add_test(NAME dflash_accept COMMAND dflash_accept_test)
+add_dependencies(onebit dflash_accept_test)
 # direction B (tools/ci/ci_targets_check.py): a target ci.yml's --target list does not name is "never built", and ci.yml
 # is a workflow file no lane can patch. The documented hook is the one onebit_npu_forward_syntax uses.
 add_dependencies(onebit batch_check_compare_test)

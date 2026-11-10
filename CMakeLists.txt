@@ -1080,6 +1080,10 @@ add_executable(npu_pack_test tests/npu_pack_test.cpp)
 # (the same reason #1830/#1863 put their arms in a binary CI already compiles). Values come from the encoder reference.
 add_executable(audio_ops_test tests/audio_ops_test.cpp)
 target_include_directories(audio_ops_test PRIVATE npu/forward/include)
+# The audio pack's graph, read through the engine: pins the topological-order assumption the executor needs and the op
+# census the host reference was written against. Skips (77) without a path.
+add_executable(onnx_graph_test tests/onnx_graph_test.cpp)
+target_link_libraries(onnx_graph_test PRIVATE onebit_npu)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1304,6 +1308,9 @@ if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_BO_DUMP)
     add_test(NAME npu_pack_model COMMAND npu_pack_test ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_BO_DUMP})
 endif()
 add_test(NAME audio_ops COMMAND audio_ops_test)
+set_tests_properties(audio_ops PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME onnx_graph COMMAND onnx_graph_test ${ONEBIT_AUDIO_ONNX})
+set_tests_properties(onnx_graph PROPERTIES SKIP_RETURN_CODE 77)
 # The private NPU route registry (npu/private_route.h), without an add-on.
 add_executable(npu_private_route_test tests/npu_private_route_test.cpp)
 target_link_libraries(npu_private_route_test PRIVATE onebit_npu)

@@ -2478,23 +2478,49 @@ void test_fconst19_rule_table() {
     check(pi::select_fconst19_rule_from(dup, 2, 1536, 12, 28, &why) != nullptr,
           "fconst19 rule: a geometry measured twice with the same shape is fine -- that is the h1536 pair, which is "
           "byte-identical over all 28 blocks");
-    // 4. engine#1774 / TNPU-ALL W2's third gate clause: EVERY row of the real table must select itself back, with its own
-    //    numbers. Written table-driven rather than one check per row for two reasons the table has already demonstrated:
-    //    a wrong digit is silent (the anchors still line up), and a merge dropped the h4096 row twice with nothing failing.
-    int rules_n = 0;
-    const pi::Fconst19Rule* rules = pi::fconst19_rules(&rules_n);
-    check(rules && rules_n >= 8,
-          "fconst19 rule: the table still has its rows (" + std::to_string(rules_n) + " >= 8; a merge dropping one is a "
-          "silent un-measure of a whole class)");
-    for (int i = 0; i < rules_n; i++) {
-        const pi::Fconst19Rule& row = rules[i];
-        std::string w;
-        const pi::Fconst19Rule* got = pi::select_fconst19_rule(row.hidden, row.heads, row.layers, &w);
-        check(got && got->prefix == row.prefix && got->n_tiles == row.n_tiles && got->rot == row.rot && got->tile == row.tile,
-              "fconst19 rule: row " + std::to_string(row.hidden) + "/" + std::to_string(row.heads) + "h/" +
-                  std::to_string(row.layers) + "L selects itself back with its measured numbers (" +
-                  std::to_string(got ? got->prefix : -1) + ", " + std::to_string(got ? got->n_tiles : -1) + ", " +
-                  std::to_string(got ? got->rot : -1) + ", " + std::to_string(got ? got->tile : -1) + ")");
+    // 4. engine#1774 / TNPU-ALL W2's third gate clause, made able to fail (engine#1854). The expected rows live HERE, as
+    //    literals copied from the measured table, not read back from it: an arm that selects each table row by its own key
+    //    and compares it with itself passes a wrong digit (h4096 prefix 12608 -> 12609) and a dropped row (10 >= 8), the
+    //    two failures this arm exists for. Adding or re-measuring a row is therefore a deliberate edit in BOTH places.
+    {
+        const pi::Fconst19Rule want[] = {
+            {896, 14, 24, 1856, 16, 2, 34816},       // Qwen2.5-0.5B-Instruct
+            {2048, 16, 28, 8512, 3, 1, 1183744},     // Qwen3-1.7B
+            {576, 9, 30, 3776, 4, 1, 76800},         // SmolLM2-135M-Instruct
+            {1536, 12, 28, 3136, 7, 1, 226304},      // Qwen2.5-Coder-1.5B-Instruct (and Qwen-2.5_1.5B_Instruct)
+            {2560, 32, 36, 9536, 5, 1, 1462272},     // Qwen3-4B
+            {2048, 32, 16, 8512, 5, 1, 591872},      // Llama-3.2-1B-Instruct
+            {3072, 32, 32, 10560, 2, 1, 5222400},    // Phi-3.5-mini-instruct (and Phi-3-mini-128k)
+            {3584, 28, 28, 7232, 8, 1, 1009664},     // the Qwen2.5-7B family, measured on two models
+            {2048, 16, 36, 4160, 9, 1, 295936},      // Qwen2.5_3B_Instruct
+            {4096, 32, 32, 12608, 5, 1, 2297856},    // Mistral-7B-Instruct-v0.2
+            {3072, 24, 28, 10560, 4, 1, 1740800},    // Llama-3.2-3B (and -Instruct)
+        };
+        const int want_n = (int)(sizeof(want) / sizeof(want[0]));
+        int rules_n = 0;
+        const pi::Fconst19Rule* rules = pi::fconst19_rules(&rules_n);
+        check(rules && rules_n == want_n,
+              "fconst19 rule: the table has exactly the " + std::to_string(want_n) + " measured rows (" +
+                  std::to_string(rules_n) + "); a dropped row is a silent un-measure of a whole class, an added one "
+                  "must be added here too");
+        for (const pi::Fconst19Rule& row : want) {
+            std::string w;
+            const pi::Fconst19Rule* got = pi::select_fconst19_rule(row.hidden, row.heads, row.layers, &w);
+            check(got && got->prefix == row.prefix && got->n_tiles == row.n_tiles && got->rot == row.rot &&
+                      got->tile == row.tile,
+                  "fconst19 rule: " + std::to_string(row.hidden) + "/" + std::to_string(row.heads) + "h/" +
+                      std::to_string(row.layers) + "L selects its measured numbers (" +
+                      std::to_string(got ? got->prefix : -1) + ", " + std::to_string(got ? got->n_tiles : -1) + ", " +
+                      std::to_string(got ? got->rot : -1) + ", " + std::to_string(got ? got->tile : -1) + ")");
+        }
+        // what the old self-select loop really tested: no two rows of the real table share a key with different
+        // shapes (select_rule_in refuses that as ambiguous, so every row must still select)
+        for (int i = 0; rules && i < rules_n; i++) {
+            std::string w;
+            check(pi::select_fconst19_rule(rules[i].hidden, rules[i].heads, rules[i].layers, &w) != nullptr,
+                  "fconst19 rule: no two rows share the key " + std::to_string(rules[i].hidden) + "/" +
+                      std::to_string(rules[i].heads) + "h/" + std::to_string(rules[i].layers) + "L with different shapes");
+        }
     }
 
     // 5. the case this row is: the SECOND geometry at hidden 2048 / 16 heads, told apart only by its layer count. If a

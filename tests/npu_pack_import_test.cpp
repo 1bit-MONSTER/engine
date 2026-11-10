@@ -37,6 +37,7 @@
 #include "pack.h"
 #include "pack_import.h"
 #include "q4nx.h"
+#include "forward/include/q4nx_dequant.h"
 #include "q4nx_device.h"
 
 #include <nlohmann/json.hpp>
@@ -452,6 +453,120 @@ void test_external_packed_genre(const std::string& root) {
           "behind a placeholder)");
     check(g["external_row_stride"]["matched"] == 1 && g["external_row_stride"]["of"] == 1,
           "external-packed: the bytes fit length == N x (K/128 + 1) x 68, reported as a count");
+
+    // engine#1849: the writer's SUCCESS path. Every other arm on this genre expects a refusal, so three merged changes
+    // to import_external (#1712, #1751, #1793) have only ever run against real packs on the box.
+    //
+    // Its own directory and its own geometry, because the container split has to FIT: the earlier fixture here is
+    // 768 wide, and a qkv split of 40 heads x 128 needs N 5120 for q alone ("container range [0, 5120) does not fit
+    // N 768"). With 40 heads and 40 kv heads the fused qkv is 3 x 5120 = 15360 wide, so every role's slice is 5120.
+    //
+    // The blob cannot be the all-0x22 the other fixtures write: a 68-byte stride is 64 B of codes then 4 B of zero
+    // point and bf16 scale, so all-0x22 makes every weight (2 - 2) x s = 0 -- and an all-zero decode is exactly what a
+    // broken writer produces too (engine#1871, engine#1875). These bytes decode to a value that pins all three parts:
+    //   codes 0xCC -> int4 -4 everywhere; zero point 0x11 -> four nibbles of 1; scale bf16 0x4000 = 2.0
+    //   w = (c - z) * s  (engine#1874's identity) = (-4 - 1) * 2 = -10.0
+    // Drop the codes and it reads -2.0, drop the zero point -8.0, drop the scale -5.0.
+    {
+        const fs::path sdir = fs::path(root) / "external-success";
+        fs::remove_all(sdir);
+        fs::create_directories(sdir / "cache");
+        const int64_t K = 5120, N = 15360, heads = 40, hd = 128;
+        put_file((sdir / "config.json").string(),
+                 R"({"model_type":"phi3","hidden_size":5120,"intermediate_size":17920,"num_hidden_layers":1,)"
+                 R"("num_attention_heads":40,"num_key_value_heads":40,"head_dim":128,"vocab_size":64,)"
+                 R"("rope_theta":10000.0,"tie_word_embeddings":false})");
+        put_file((sdir / "genai_config.json").string(),
+                 R"({"model":{"decoder":{"filename":"eager-mm.onnx","hidden_size":5120,"num_hidden_layers":1,)"
+                 R"("num_attention_heads":40,"num_key_value_heads":40,"head_size":128,"intermediate_size":17920}}})");
+        const int64_t embed_bytes = 64 * 5120 * 4;
+        const std::string qc(2048, '\xCC');
+        const std::string zs(64, '\x11');
+        std::string sc(64, '\0');
+        for (size_t i = 0; i + 1 < sc.size(); i += 2) sc[i + 1] = '\x40';   // bf16 2.0
+        std::string blob;
+        const int64_t blocks = K / 128, per_tile = 2 * (blocks + 1);
+        for (int64_t tile = 0; tile < N / 64; ++tile)
+            for (int64_t s2 = 0; s2 < per_tile; ++s2)
+                blob += (s2 / 2 == 0) ? std::string(2048 + 128, '\0') : (qc + zs + sc);   // kk 0 is the bias pair
+        put_file((sdir / "eager-mm.onnx.data").string(), std::string(size_t(embed_bytes), '\x22') + blob);
+        put_file((sdir / "eager-mm.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
+                                       uint64_t(embed_bytes)),
+                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
+                            pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty"),
+                            pb::tensor("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", {int64_t(blob.size())},
+                                       "eager-mm.onnx.data", uint64_t(embed_bytes), uint64_t(blob.size()))},
+                           {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
+                                                    "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
+                                            K, N, 4, 128, "MatMulNBitsBf")}));
+        const fs::path sout = sdir / "out";
+        pi::Options ok_opt;
+        bool imported = false;
+        std::string why_imp;
+        try {
+            (void)pi::import_pack(sdir.string(), sout.string(), ok_opt);
+            imported = true;
+        } catch (const std::exception& e) { why_imp = e.what(); }
+        check(imported, "external writer: a crafted pack with a satisfiable split imports" + (imported ? "" : " (" + why_imp + ")"));
+        if (imported) {
+            check(fs::exists(sout / "model.q4nx"), "external writer: and writes model.q4nx");
+            std::ifstream f(sout / "model.q4nx", std::ios::binary);
+            uint64_t hlen = 0;
+            f.read(reinterpret_cast<char*>(&hlen), 8);
+            std::string hdr(static_cast<size_t>(hlen), '\0');
+            f.read(&hdr[0], std::streamsize(hlen));
+            const json h = json::parse(hdr);
+            std::string qname;
+            uint64_t qoff = 0, qbytes = 0;
+            int64_t qrows = 0, qcols = 0;
+            // The container header is a FLAT map of tensor name -> {dtype, shape, data_offsets}: no "tensors" wrapper,
+            // and non-tensor keys (format, config) carry no data_offsets.
+            for (auto it = h.begin(); it != h.end(); ++it) {
+                if (!it.value().is_object() || !it.value().contains("data_offsets")) continue;
+                const std::string k2 = it.key();
+                if (k2.find("q_proj") != std::string::npos || k2.find("qkv") != std::string::npos) {
+                    qname = k2;
+                    qoff = it.value()["data_offsets"][0].get<uint64_t>();
+                    qbytes = it.value()["data_offsets"][1].get<uint64_t>() - qoff;
+                    if (it.value().contains("shape") && it.value()["shape"].size() >= 2) {
+                        qrows = it.value()["shape"][0].get<int64_t>();
+                        qcols = it.value()["shape"][1].get<int64_t>();
+                    }
+                }
+            }
+            check(!qname.empty(), "external writer: the container carries the q projection");
+            if (!qname.empty()) {
+                std::printf("  writer success: %s %llu B (header %llu B)\n", qname.c_str(),
+                            (unsigned long long)qbytes, (unsigned long long)hlen);
+                std::vector<uint8_t> tile_raw(static_cast<size_t>(qbytes));
+                f.seekg(std::streamoff(8 + hlen + qoff));
+                f.read(reinterpret_cast<char*>(tile_raw.data()), std::streamsize(tile_raw.size()));
+                std::printf("  writer success: shape %lld x %lld\n", (long long)qrows, (long long)qcols);
+                std::vector<float> row(static_cast<size_t>(qcols));
+                const int rc = q4nx_dequant_tile_row(tile_raw.data(), tile_raw.size(), int(qrows), int(qcols),
+                                                     Q4NX_TILE_BYTES, 0, row.data());
+                check(rc == 0, "external writer: the written tile decodes (got " + std::to_string(rc) + ")");
+                if (rc == 0) {
+                    for (int rr : {0, 32, 160, qrows > 0 ? int(qrows - 1) : 0}) {
+                        std::vector<float> r2(static_cast<size_t>(qcols));
+                        const int r2c = q4nx_dequant_tile_row(tile_raw.data(), tile_raw.size(), int(qrows), int(qcols),
+                                                              Q4NX_TILE_BYTES, rr, r2.data());
+                        if (r2c == 0) std::printf("  row %d: first %.4f  mid %.4f\n", rr, double(r2[0]), double(r2[size_t(qcols / 2)]));
+                    }
+                    size_t bad = 0;
+                    for (int64_t c = 0; c < qcols; ++c)
+                        if (std::fabs(row[size_t(c)] - (-10.0f)) > 1e-6f) ++bad;
+                    char msg[200];
+                    std::snprintf(msg, sizeof msg,
+                                  "external writer: every decoded weight is -10.0 (codes -4, zero 1, scale 2.0); %zu of %d differ, first %.4f",
+                                  bad, int(qcols), double(row[0]));
+                    check(bad == 0, msg);
+                }
+            }
+        }
+    }
+
 
     // engine#1671: when the `*.packed` sibling is ALSO a placeholder (dims [0], no data), this graph carries no
     // weight for that matmul at all -- and the node must be DROPPED rather than left naming the `.empty`

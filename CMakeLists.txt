@@ -1106,7 +1106,10 @@ add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
 add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4nx)
-add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp)
+# npu/forward/src/q4nx_dequant.c carries q4nx_dequant_tile_row, which the external-data writer's success-path arm
+# reads a written tile back with (engine#1849). Sources added to an existing target, so ci_targets sees no new test.
+add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(npu_pack_import_test PRIVATE npu/forward/include)
 target_link_libraries(npu_pack_import_test PRIVATE onebit_npu)
 add_test(NAME npu_pack_import COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden)
 # engine#1726: NPU_INFER_DUMP_DIR's residual write must SAY when it cannot write -- a missing or unwritable directory, or a

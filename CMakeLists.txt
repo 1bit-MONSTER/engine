@@ -1576,6 +1576,13 @@ if(ONEBIT_NPU)
     add_executable(npu_rt_shim_test tests/npu_rt_shim_test.cpp)
     target_link_libraries(npu_rt_shim_test PRIVATE onebit_npu_lane)
     add_test(NAME npu_rt_shim COMMAND npu_rt_shim_test)
+    # engine#753: does the engine EXECUTE on a dma-buf it did not allocate? This one does open the device (it imports a udmabuf and
+    # hands the exporter's mapping to the runtime), so it takes the kernel ELF as an argument and SKIPS (77) without one -- a box
+    # with no ELF registers a skip rather than a red row, the same rule as the other device-dependent rows.
+    add_executable(npu_dmabuf_import_test tests/npu_dmabuf_import_test.cpp)
+    target_link_libraries(npu_dmabuf_import_test PRIVATE onebit_npu_lane)
+    add_test(NAME npu_dmabuf_import COMMAND npu_dmabuf_import_test "")
+    set_tests_properties(npu_dmabuf_import PROPERTIES SKIP_RETURN_CODE 77)
 
     # The model-generic forward (npu/forward): the GGUF-on-NPU serve route
     # (docs/npu.md, "Open"). q4nx_forward.cpp + its Q4NX dequant/pack/semantics

@@ -729,8 +729,19 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // 1.9 pack failed with `filesystem error: temp_directory_path: No such file or directory [/tmp/x]` and no hint that
     // the pack was fine. Fall back rather than fail: /tmp, then the current directory. The copy is scratch, and a note
     // says where it went so nobody wonders what that 291 MB file is.
+    // Where the canonical copy lives. This is a CACHE (reused on size+mtime+rules version), not a leak, but its size is the
+    // pack's fconst -- 3.6 GB for an h4096 pack -- and on a box whose /tmp is a RAM disk that is RAM, per pack, held until
+    // reboot: three of them from one afternoon's imports were 11.4 GB of tmpfs (measured 2026-11-10). So the order is:
+    // an explicit override, then the on-disk cache directory, and only then the temp directory this used to prefer.
     std::vector<fs::path> dirs;
+    if (const char* scratch = std::getenv("ONEBIT_FCONST_SCRATCH"); scratch && *scratch)
+        dirs.emplace_back(scratch);
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+        dirs.emplace_back(fs::path(xdg) / "1bit/fconst19");
+    else if (const char* home = std::getenv("HOME"); home && *home)
+        dirs.emplace_back(fs::path(home) / ".cache/1bit/fconst19");
     try {
+        // Last resort only: on strixhalo /tmp is tmpfs, so this costs RAM equal to the pack's fconst.
         dirs.push_back(fs::temp_directory_path());
     } catch (const std::exception& e) {
         std::fprintf(stderr,
@@ -742,7 +753,13 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     std::string work;
     for (const auto& d : dirs) {
         std::error_code ec;
-        if (!fs::is_directory(d, ec) || ec) continue;
+        // The cache directory is ours to create: without this the new first choice never wins, because it does not exist on a
+        // fresh box and the loop walked straight past it to /tmp (caught by testing the default, not the override).
+        if (!fs::is_directory(d, ec) || ec) {
+            std::error_code made;
+            fs::create_directories(d, made);
+            if (made || !fs::is_directory(d)) continue;
+        }
         const fs::path cand = d / name;
         // Writable in fact, not just in theory: the copy is written immediately after this.
         std::ofstream probe(cand, std::ios::binary | std::ios::app);

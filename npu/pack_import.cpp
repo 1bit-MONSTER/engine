@@ -1040,6 +1040,65 @@ EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidd
     return out;
 }
 
+// engine#1725: stream the per-layer token table out in bands. The component states it as f32 (V x NL*P, 9.4 GiB on
+// gemma-4-e2b), so materialising it to convert would cost more RAM than the box has to spare for one import; the bands go
+// straight from the mapped external data into the container's BF16 layout.
+int64_t read_per_layer_table_band(const std::string& pack_dir, EmbedPerLayer* meta, int64_t first_row, int64_t rows,
+                                  uint8_t* out, std::string* why) {
+    if (meta == nullptr || out == nullptr || meta->V <= 0 || meta->width <= 0) {
+        if (why) *why = "no per-layer table metadata (call read_embedding_per_layer first)";
+        return -1;
+    }
+    if (first_row < 0 || rows <= 0 || first_row + rows > meta->V) {
+        if (why) *why = "band out of range";
+        return -1;
+    }
+    std::string gpath = pack_dir + "/embedding.onnx";
+    {
+        std::ifstream gf(pack_dir + "/genai_config.json");
+        if (gf) {
+            json g;
+            try { g = json::parse(gf); } catch (...) { g = json::object(); }
+            if (g.is_object() && g.contains("model") && g["model"].is_object() && g["model"].contains("embedding") &&
+                g["model"]["embedding"].is_object() && g["model"]["embedding"].contains("filename") &&
+                g["model"]["embedding"]["filename"].is_string()) {
+                const std::string rel = g["model"]["embedding"]["filename"].get<std::string>();
+                if (!rel.empty() && rel.front() != '/' && rel.find("..") == std::string::npos) {
+                    std::error_code nec;
+                    if (fs::is_regular_file(pack_dir + "/" + rel, nec)) gpath = pack_dir + "/" + rel;
+                }
+            }
+        }
+    }
+    OnnxModel em;
+    try { em = parse_onnx(gpath); } catch (const std::exception& e) { if (why) *why = e.what(); return -1; }
+    const OnnxTensor* table = nullptr;
+    for (const auto& t : em.tensors)
+        if (t.name.find("embed_tokens_per_layer") != std::string::npos) table = &t;
+    if (table == nullptr) { if (why) *why = "the component carries no embed_tokens_per_layer table"; return -1; }
+    if (table->location.empty()) { if (why) *why = "the per-layer table has no external data (banded reads need it)"; return -1; }
+    const std::string base = fs::path(gpath).parent_path().string() + "/" + table->location;
+    size_t sz = 0;
+    std::string w2;
+    const uint8_t* m = map_file(base, sz, &w2);
+    if (!m) { if (why) *why = w2; return -1; }
+    const uint64_t row_bytes = uint64_t(meta->width) * 4ull;
+    const uint64_t need_end = table->offset + uint64_t(first_row + rows) * row_bytes;
+    if (need_end > sz) { if (why) *why = "the per-layer table declares more bytes than its data carries"; return -1; }
+    const uint8_t* src = m + table->offset + uint64_t(first_row) * row_bytes;
+    uint16_t* dst = reinterpret_cast<uint16_t*>(out);
+    const size_t n = size_t(rows) * size_t(meta->width);
+    for (size_t i = 0; i < n; ++i) {
+        float f;
+        std::memcpy(&f, src + i * 4, 4);
+        uint32_t b;
+        std::memcpy(&b, &f, 4);
+        const uint32_t lsb = (b >> 16) & 1u;
+        dst[i] = uint16_t((b >> 16) + (lsb && ((b & 0xFFFFu) != 0 || (((b >> 16) & 1u) != 0)) ? 1u : 0u));
+    }
+    return rows;
+}
+
 std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why) {
     // A multi-component pack (`type: compositemodel`) names its embedding component in genai_config.json
     // (`model.embedding.filename = "embedding/model.onnx"`), exactly as it names its decoder; a single-graph pack keeps
@@ -3155,19 +3214,49 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         embed_tbl = EmbedTable{embed_bf16.data(), EmbedTable::Fmt::BF16, int(H)};
         w.add("model.embed_tokens.weight", "BF16", {V, H}, embed_bf16);
         ++r.tensors;
-        // engine#1725: a multi-component pack's embedding also carries the PER-LAYER table and its projection norm, which
-        // the decoder consumes as `per_layer_inputs`. Written as BF16 like every other table here (the component ships
-        // f32); the forward path does the gather. Absent for a single-graph pack, which is why this is conditional rather
-        // than a refusal.
+        // engine#1725: a multi-component pack's embedding also carries the PER-LAYER table, its projection norm and the
+        // context projection. Written under the names the FORWARD loads (q4nx_forward.cpp's build_ple_inputs/load_ple_block),
+        // because the arithmetic there is already this model's: context = rmsnorm((emb @ W_l) * H**-0.5, norm),
+        // identity = 16 * table[id], per_layer_input = (context + identity)/sqrt(2). Absent for a single-graph pack.
         {
             std::string pl_why;
-            const EmbedPerLayer pl = read_embedding_per_layer(pack_dir, H, &pl_why);
+            EmbedPerLayer pl = read_embedding_per_layer(pack_dir, H, &pl_why);
             if (pl.ok()) {
-                w.add("model.embed_tokens_per_layer.weight", "BF16", {pl.V, pl.width},
-                      as_bf16(reinterpret_cast<const uint8_t*>(pl.table.data()), kF32, pl.table.size()));
-                w.add("model.per_layer_projection_norm.weight", "BF16", {pl.width},
-                      as_bf16(reinterpret_cast<const uint8_t*>(pl.norm.data()), kF32, pl.norm.size()));
-                r.tensors += 2;
+                // The token table is streamed: V x (NL*P) f32 is 9.4 GiB on e2b, and a band is 32 rows.
+                std::vector<uint8_t> tbl_bf16(size_t(pl.V) * size_t(pl.width) * 2);
+                bool bands_ok = true;
+                for (int64_t row = 0; row < pl.V; row += 32) {
+                    const int64_t n = (pl.V - row < 32) ? (pl.V - row) : 32;
+                    if (read_per_layer_table_band(pack_dir, &pl, row, n,
+                                                  tbl_bf16.data() + size_t(row) * size_t(pl.width) * 2, &pl_why) != n) {
+                        bands_ok = false;
+                        break;
+                    }
+                }
+                if (bands_ok) {
+                    w.add("model.per_layer_token_embd.weight", "BF16", {pl.V, pl.width}, std::move(tbl_bf16));
+                    if (!pl.norm.empty())
+                        w.add("model.per_layer_proj_norm.weight", "BF16", {pl.P},
+                              as_bf16(reinterpret_cast<const uint8_t*>(pl.norm.data()), kF32, pl.norm.size()));
+                    r.tensors += 1 + (pl.norm.empty() ? 0 : 1);
+                    if (pl.complete()) {
+                        for (int64_t l = 0; l < pl.NL; ++l) {
+                            std::vector<uint8_t> one(size_t(pl.P) * size_t(pl.H) * 2);
+                            for (int64_t o = 0; o < pl.P; ++o)
+                                for (int64_t k = 0; k < pl.H; ++k) {
+                                    const float f = pl.model_proj[size_t(l * pl.P + o) * size_t(pl.H) + size_t(k)];
+                                    uint32_t b;
+                                    std::memcpy(&b, &f, 4);
+                                    const uint32_t lsb = (b >> 16) & 1u;
+                                    reinterpret_cast<uint16_t*>(one.data())[size_t(o) * size_t(pl.H) + size_t(k)] =
+                                        uint16_t((b >> 16) + (lsb && ((b & 0xFFFFu) != 0 || (((b >> 16) & 1u) != 0)) ? 1u : 0u));
+                                }
+                            w.add("model.per_layer_model_proj.weight_layer" + std::to_string(l), "BF16", {pl.P, pl.H},
+                                  std::move(one));
+                            ++r.tensors;
+                        }
+                    }
+                }
             }
         }
     }

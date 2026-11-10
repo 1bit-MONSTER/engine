@@ -106,6 +106,12 @@ struct EmbedPerLayer {
 // the component, which is why the caller passes it.
 EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidden, std::string* why);
 
+// The per-layer token table is `V x (NL*P)` f32 in the component -- 9.4 GiB for gemma-4-e2b -- so it is never
+// materialised: the importer streams it into the container in 32-row bands, converting to BF16 as it goes (engine#1725).
+// Returns the rows written, or -1 with `why` set. `out` must hold `rows * width * 2` bytes.
+int64_t read_per_layer_table_band(const std::string& pack_dir, EmbedPerLayer* meta, int64_t first_row, int64_t rows,
+                                  uint8_t* out, std::string* why);
+
 // One tensor the pack describes, and where its values would come from.
 struct Planned {
     std::string name;     // Q4NX tensor name (model.layers.N.<...>.weight)

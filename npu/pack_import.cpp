@@ -2924,6 +2924,17 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         ++aux;
     }
     json c;
+    // engine#1794 review: the container's OWN config is what the forward reads (`q4nx_semantics.c:121` value_for_top,
+    // depth 1 only), and this writer started from an empty json -- so a mRoPE declaration that lives only at
+    // `text_config.rope_parameters` was dropped, and the pack would be served as plain RoPE with the right theta and the
+    // wrong axis layout (engine#1311: exact for a text-only prompt, ~0.29 rad off once image tokens are in it). The
+    // import_pack() writer starts from load_geometry() and already carries it; this one has to copy it.
+    {
+        std::string geom_src;
+        const json geom = load_geometry(pack_dir, &geom_src);
+        if (geom.value("mrope_interleaved", false)) c["mrope_interleaved"] = true;
+        if (geom.contains("mrope_section")) c["mrope_section"] = geom["mrope_section"];
+    }
     c["model_type"] = p.dims.model_type;
     c["hidden_size"] = p.dims.hidden;
     c["intermediate_size"] = p.dims.intermediate;

@@ -293,7 +293,28 @@ static void oga_geometry(void) {
         check(bt && codes && scales, "head tile: the layout fixture allocates");
         if (bt && codes && scales) {
             for (int k = 0; k < kpad; k++)
-                for (int n = 0; n < T; n++) bt[(size_t)k * T + n] = (float)((k * 13 + n * 7) % 97) * 0.01f - 0.5f;
+                /* Per-column spread is load-bearing: the plain ramp reaches -0.5 in every column, so every column's
+                 * absmax is 0.5 and all T scales are equal (measured: 1 distinct scale of 64) -- an arm comparing two
+                 * packers on that fixture cannot see a per-column mistake. Scaling by (1 + 0.05n) gives T distinct
+                 * absmax values (measured: 64 of 64), and the check below keeps the fixture from going flat again. */
+                for (int n = 0; n < T; n++)
+                    bt[(size_t)k * T + n] = ((float)((k * 13 + n * 7) % 97) * 0.01f - 0.5f) * (1.0f + 0.05f * (float)n);
+            {
+                /* the fixture must exercise per-column arithmetic, or every arm below compares on a flat input */
+                float seen[64];
+                int distinct = 0;
+                for (int n = 0; n < T; n++) {
+                    float amax = 0.0f;
+                    for (int k = 0; k < kpad; k++) {
+                        const float a = fabsf(bt[(size_t)k * T + n]);
+                        if (a > amax) amax = a;
+                    }
+                    int dup = 0;
+                    for (int i = 0; i < distinct; i++) if (seen[i] == amax) dup = 1;
+                    if (!dup) seen[distinct++] = amax;
+                }
+                check_int(distinct, T, "head tile: the fixture has T distinct column absmax (not a flat input)");
+            }
             const float m = q4nx_pack_B_int8(bt, kpad, T, codes, T, scales);
             /* (a) one scale per column, and it is that column's absmax/127 (with the all-zero floor) */
             int bad_scale = 0;
@@ -311,10 +332,23 @@ static void oga_geometry(void) {
             for (int n = 0; n < T; n++) ssum += (double)scales[n];
             check(fabsf((float)(ssum / T) - m) < 1e-6f, "head tile: the returned mean is over the T columns");
             /* (b) codes are row-major over (k, n) and match the column's scale */
+            /* The reference has to use the packer's own arithmetic -- absmax with the 1e-12 floor, then
+             * roundf(v * (127/amax)) -- and not v/scales[n]: once the columns differ the two disagree on 26 of 6144
+             * codes, because 127/amax and 1/(amax/127) are different floats. */
+            float tis[64];
+            for (int n = 0; n < T; n++) {
+                float amax = 0.0f;
+                for (int k = 0; k < kpad; k++) {
+                    const float a = fabsf(bt[(size_t)k * T + n]);
+                    if (a > amax) amax = a;
+                }
+                if (amax < 1e-12f) amax = 1.0f;
+                tis[n] = 127.0f / amax;
+            }
             int bad_code = 0;
             for (int k = 0; k < kpad; k++)
                 for (int n = 0; n < T; n++) {
-                    int want = (int)lroundf(bt[(size_t)k * T + n] / scales[n]);
+                    int want = (int)roundf(bt[(size_t)k * T + n] * tis[n]);
                     if (want > 127) want = 127;
                     else if (want < -127) want = -127;
                     if (codes[(size_t)k * T + n] != (int8_t)want) bad_code++;

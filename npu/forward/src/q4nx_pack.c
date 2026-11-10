@@ -161,6 +161,7 @@ void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
  *
  * exactly the kernel's epilogue, with the inner sum in int32 and no float in it. `d` is the per-128-K-group
  * multiplier per column ([groups][N]), `ascale` the activation row's scale. */
+
 void q4nx_host_gemm_i8_grouped(const int8_t* a8, int K, const int8_t* codes, const float* d,
                                int groups, int N, float ascale, float* out) {
     const int G = 128;
@@ -194,14 +195,12 @@ void q4nx_host_gemm_i8_from_f32(const float* A, int a_k, int M, int K, int N, co
                     const float v = fabsf(Bmat[(size_t)k * (size_t)N + (size_t)n]);
                     if (v > amax && isfinite(v)) amax = v;
                 }
-                if (!(amax >= 1e-12f)) amax = 1.0f;
-                const float tis = 127.0f / amax;
+                /* engine#1839: the scale and the clamp describe the SAME range -- int4, [-8, 7] -- or the codes
+                 * saturate and the dequantised weight is ~18x too small. q4nx_quant_int4_*() own the pair. */
+                const float amax_eff = (amax >= 1e-12f) ? amax : 1.0f;
                 for (int k = k0; k < k1; k++) {
-                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
-                    if (!isfinite(v)) v = 0.0f;
-                    int q = (int)roundf(v * tis);
-                    if (q > 7) q = 7;
-                    else if (q < -8) q = -8;    /* int4 codes are [-8, 7] in this format */
+                    const float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
+                    const int q = q4nx_quant_int4_code(v, amax_eff);
                     int aq = (int)roundf(a[k] * 127.0f);
                     if (aq > 127) aq = 127;
                     else if (aq < -127) aq = -127;
@@ -210,6 +209,20 @@ void q4nx_host_gemm_i8_from_f32(const float* A, int a_k, int M, int K, int N, co
             }
         }
     }
+}
+
+float q4nx_quant_int4_scale(float amax) {
+    if (!(amax >= 1e-12f) || !isfinite(amax)) return 1.0f;   /* an all-zero group still needs a usable scale */
+    return amax / 7.0f;
+}
+
+int8_t q4nx_quant_int4_code(float v, float amax) {
+    if (!isfinite(v)) v = 0.0f;
+    const float s = q4nx_quant_int4_scale(amax);
+    int q = (int)roundf(v / s);
+    if (q > 7) q = 7;
+    else if (q < -8) q = -8;
+    return (int8_t)q;
 }
 
 void q4nx_host_gemm_i8(const int8_t* a8, int K, const int8_t* codes, int N, int32_t* out32) {

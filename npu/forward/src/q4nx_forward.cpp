@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "batch_check_compare.h"
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
@@ -741,14 +742,17 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                  * 155,200 of them), so a row is read out of the `cols/256` tiles that cover it instead of the whole
                  * table being decoded into f32 -- which for that pack is 0.74 GiB of container becoming 4.74 GiB.
                  * Same tile grid and ordering as q4nx_dequant_tensor_chunked(), pinned by the row test. */
-                const int ntr = NV / 32, ntc = kpad_ / 256;
-                const size_t tiles = (size_t)ntr * (size_t)ntc;
-                if (tiles > 0 && esz % tiles == 0) {
+                /* engine#1842: the grid is checked with the row reader's own rule, not `esz % tiles == 0`. That test let a
+                 * table with no supported chunk kind, or an NV / kpad_ off the 32 x 256 grid, take this path; the reader
+                 * then refused every row and embed_at() served 0.0f with no message. A table it would refuse stays on
+                 * the whole-table decode below, which reports its own failure. */
+                const int cb = q4nx_tile_row_kind(esz, NV, kpad_);
+                if (cb != 0) {
                     embed_tile_       = (const uint8_t*)e;
                     embed_tile_bytes_ = esz;
                     embed_tile_rows_  = NV;
                     embed_tile_cols_  = kpad_;
-                    embed_tile_cb_    = int(esz / tiles);
+                    embed_tile_cb_    = cb;
                     embed_row_buf_.assign((size_t)kpad_, 0.0f);
                     embed_row_tok_    = -1;
                 }
@@ -3040,36 +3044,60 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 //    the device is about accumulation and epilogue, not about a float both sides happen to share.
 void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                                   int wkey, float* out) {
-    const int G = 128, groups = (K + G - 1) / G;
-    auto it = host_i8_cache_.find(wkey);
-    if (it == host_i8_cache_.end()) {
+    // THE KEY MUST CARRY THE LAYER AND THE SHAPE (engine#1830 review). `wkey` is a per-ROLE slot -- 0 QKV, 1 O/gate,
+    // 2 GU, 3 up, 4 down -- so it is the same number in every layer, and `Bmat` is the one scratch buffer that
+    // `load_layer()` decodes each layer into, so neither identifies a layer. Keyed on `wkey` alone, every layer after 0
+    // ran on LAYER 0's weights: layer 0 scored cos 0.99923, layer 1 collapsed to 0.37, and 31 layers of wrong residual
+    // updates compounded into the "explosion, not drift" the per-layer dump shows. The device cache this arm mirrors
+    // says the rule in its own comment -- one weight BO per (layer, wkey) -- and carries `a.layer = cur_layer_`.
+    // `wkey < 0` is the routed-expert case: those weights vary per TOKEN, which is why the device path passes -1; caching
+    // them would serve every token's experts from the first token's, so that case packs a throwaway image instead.
+    const bool cacheable = wkey >= 0;
+    const auto key = std::make_tuple(cur_layer_, wkey, K, N);
+    HostI8Tensor scratch;
+    const HostI8Tensor* cached = nullptr;
+    auto it = cacheable ? host_i8_cache_.find(key) : host_i8_cache_.end();
+    if (!cacheable || it == host_i8_cache_.end()) {
         HostI8Tensor t;
-        t.groups = groups; t.N = N;
+        t.N = N;
         t.codes.assign((size_t)K * (size_t)N, 0);
-        t.d.assign((size_t)groups * (size_t)N, 0.0f);
-        for (int g = 0; g < groups; g++) {
-            const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
-            for (int n = 0; n < N; n++) {
-                float amax = 0.0f;
-                for (int k = k0; k < k1; k++) {
-                    const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
-                    if (std::isfinite(v) && v > amax) amax = v;
-                }
-                if (!(amax >= 1e-12f)) amax = 1.0f;
-                t.d[(size_t)g * (size_t)N + (size_t)n] = amax / 127.0f;
-                const float tis = 127.0f / amax;
-                for (int k = k0; k < k1; k++) {
-                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
-                    if (!std::isfinite(v)) v = 0.0f;
-                    int q = (int)std::round(v * tis);
-                    q = q > 7 ? 7 : (q < -8 ? -8 : q);
-                    t.codes[(size_t)k * (size_t)N + (size_t)n] = (int8_t)q;
-                }
-            }
+        // RESOLVED toward the int8 packer (this branch) rather than main's corrected int4 rule (engine#1839).
+        // Both are self-consistent; the question is what the DEVICE consumes. The device's body image comes from
+        // packB_blocked() -- one multiplier per column, int8 codes -- and this branch measured the consequence:
+        // device logits BIT-EXACT (max|d| = 0) over four steps, three repeats, plus an edge case. So the int8 packer
+        // is the rule the reference has to share with the device, and q4nx_quant_int4_*() stays for the paths that
+        // genuinely hold int4 codes.
+        t.d.assign((size_t)N, 0.0f);
+        // THE OPERANDS MUST BE THE ENGINE'S, NOT A PRIVATE RE-QUANTISATION (engine#1808/#1830). This arm exists to be
+        // the integer reference a kernel family is gated against, and the device's weight image comes from
+        // q4nx_pack_B_int8_blocked(): ONE multiplier per column (amax over the whole K), int8 codes in [-127, 127].
+        // Quantising here with a different rule -- per 128-K group, int4 [-8, 7] -- computes a different model: measured
+        // 2026-11-10, the arm answered "ikt" to "The capital of France is" and then locked onto one token, while the
+        // per-GEMM A/B read cos 0.9999 against f32 on the same tensors. Same packer, same bytes, same model.
+        double ssum = 0.0;
+        // blocked=1: the image is written in the blocked microtile order, which is the fast path AND the layout the
+        // device actually reads, so the MAC below walks it with q4nx_layout::blocked_index(). (blocked=0 was measured
+        // at 174.5 s of warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.)
+        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, /*blocked=*/1, t.d.data(), &ssum);
+        if (!cacheable) {
+            scratch = std::move(t);
+            cached = &scratch;
+        } else {
+            cached = &host_i8_cache_.emplace(key, std::move(t)).first->second;
         }
-        it = host_i8_cache_.emplace(wkey, std::move(t)).first;
+    } else {
+        cached = &it->second;
     }
-    const HostI8Tensor& t = it->second;
+    const HostI8Tensor& t = *cached;
+    if (const char* gdir = getenv("NPU_I8_GS_DUMP")) {
+        static int n = 0;
+        char path[4096];
+        std::snprintf(path, sizeof path, "%s/arm_L%d_N%d_K%d_%03d.bin", gdir, cur_layer_, N, K, n++);
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            std::fwrite(t.d.data(), sizeof(float), std::min<size_t>((size_t)N, t.d.size()), f);
+            std::fclose(f);
+        }
+    }
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
         const float* a = A + (size_t)m * (size_t)a_k;
@@ -3086,8 +3114,14 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
             int q = (int)std::round(v * tis);
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
         }
-        q4nx_host_gemm_i8_grouped(a8.data(), K, t.codes.data(), t.d.data(), t.groups, N, ascale,
-                                  out + (size_t)m * (size_t)N);
+        float* dst = out + (size_t)m * (size_t)N;
+        for (int n = 0; n < N; n++) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++)
+                acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] *
+                                 (int)a8[(size_t)k]);
+            dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
+        }
     }
 }
 
@@ -3338,16 +3372,46 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // device state -- localises a batched-vs-sequential divergence immediately.
     static const bool batch_check = getenv("NPU_BATCH_CHECK") != nullptr;
     int seq_argmax = -1;
+    // engine#1781: the old oracle compared ONE argmax at ONE position -- the last row's -- which is not the question a
+    // speculative decoder asks. Every drafted position's LOGITS matter (the accept rule consumes the target's
+    // probability at the drafted token), so the sequential rows are kept whole and compared row for row, bitwise.
+    // M x vocab floats: 4-7 MB on the models this runs, allocated only under the debug flag.
+    std::vector<float> seq_rows, bat_rows;
     // Not with injected rows: the oracle's own sequential pass runs step(tokens[m]) on the placeholder ids this
     // entry point supplies, so it would compare against a zero-token pass and report a divergence that is not
     // there. A debug tool that lies is worse than one that says "not applicable".
+    // engine#1905: the oracle's sequential replay must start from the SAME state the batched pass will, or the
+    // comparison is between different prefixes. It used to walk `start_pos .. start_pos+M-1` and then `reset()`, so for
+    // any chunk with `start_pos > 0` the batched pass ran from an empty cache and the replay from the real prefix: the
+    // oracle reported MISMATCH for every chunk but the first (measured on `bonsai2-27b-NPU-b8`, width 1, four ids:
+    // start=0 MATCH, start=1 seq=220 bat=653). That reads as a row-dependence bug in the kernels and sends the reader
+    // to fix the wrong thing. Snapshot the state the prefix established and restore it after the replay -- the same
+    // pair the prefix cache uses (`snapshot_state`/`restore_state`, and `q4nx_state_planes.h` is device-free).
+    StateSnapshot oracle_snap;
+    const bool oracle_snapped = batch_check && !inject_embeds_ && start_pos > 0 &&
+                                snapshot_state(start_pos, oracle_snap);
     if (batch_check && !inject_embeds_) {
         std::vector<float> seq;
-        for (int m = 0; m < M; m++)
+        if (c_.NV > 0) seq_rows.reserve((size_t)M * (size_t)c_.NV);
+        for (int m = 0; m < M; m++) {
             if (!step(tokens[m], start_pos + m, seq)) return false;
-        reset();
-        for (size_t i = 0; i < seq.size(); i++)
-            if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
+            seq_rows.insert(seq_rows.end(), seq.begin(), seq.end());   // every row, not only the last
+            if (m == M - 1)
+                for (size_t i = 0; i < seq.size(); i++)
+                    if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
+        }
+        // Restore instead of reset() when the replay ran over a real prefix: `reset()` would leave the batched pass
+        // starting from nothing while the replay started from `start_pos` rows, which is the false mismatch above. With
+        // `start_pos == 0` there is nothing to restore and `reset()` is exactly right.
+        if (oracle_snapped) {
+            if (!restore_state(oracle_snap, start_pos)) {
+                err_ = "batch check: the sequential replay's prefix could not be restored, so the batched pass would "
+                       "not be comparable with it";
+                return false;
+            }
+        } else {
+            reset();
+        }
     }
 
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
@@ -3759,6 +3823,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
         }
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
+        // engine#1781: keep the batched rows so the oracle can compare all of them, not just the last one's argmax.
+        if (batch_check) bat_rows.assign(batch_all_out_->begin(), batch_all_out_->end());
     } else {
         std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
         rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
@@ -3784,8 +3850,21 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         int ba = 0;
         for (size_t i = 1; i < logits.size(); i++)
             if (logits[i] > logits[(size_t)ba]) ba = (int)i;
-        std::fprintf(stderr, "[batchcheck] M=%d start=%d seq_argmax=%d batch_argmax=%d %s\n",
-                     M, start_pos, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+        // engine#1905: name the positions compared, not only the start. Before the snapshot fix this line said
+        // `start=1 MATCH`-looking numbers for a comparison that was really "position 1 from scratch" against "position
+        // 1 continuing a prefix", and the reader had to infer the range from `start` and `M`.
+        std::fprintf(stderr, "[batchcheck] M=%d positions=%d..%d seq_argmax=%d batch_argmax=%d %s\n",
+                     M, start_pos, start_pos + M - 1, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+        // engine#1781: and the comparison the gate actually asks for -- every row, bitwise.
+        if (!seq_rows.empty() && bat_rows.size() == seq_rows.size() && c_.NV > 0) {
+            onebit::npu::RowMismatch mm;
+            const int differing = onebit::npu::compare_rows_bitwise(seq_rows.data(), bat_rows.data(), M, c_.NV, &mm);
+            std::fprintf(stderr, "[batchcheck] rows M=%d identical=%d differing=%d", M, M - differing, differing);
+            if (differing > 0)
+                std::fprintf(stderr, " first row=%d index=%d seq=0x%08x bat=0x%08x%s", mm.row, mm.index,
+                             (unsigned)mm.seq_bits, (unsigned)mm.bat_bits, mm.nan_mismatch ? " (NaN)" : "");
+            std::fprintf(stderr, "\n");
+        }
     } else if (getenv("NPU_BATCH_DBG")) {
         std::fprintf(stderr, "[batch] M=%d start=%d batched (%d layers, two_widths=%d)\n",
                      M, start_pos, c_.NL, (int)two_widths);
@@ -5166,6 +5245,55 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         if (npu::model::run_lm_head(*xd_, h.data(), via_target.data())) { logits = std::move(via_target); return true; }
     }
     if (!host_gemm_ && xd_ && xd_->head_ctx() && xd_->head_ctx()->gemv) return run_lm_head_gemv(h, logits);
+    if (host_gemm_ && host_gemm_i8_) {
+        // engine#1808: the head's integer twin. Without this the arm's head is a plain f32 matvec ("No I8Ctx is
+        // touched" below) while the device's head reads a packed quantised table, which is exactly the 0.30 max|d|
+        // that was left once every body GEMM had been shown bit-exact. The device packs its head tiles with
+        // lctx.packB_into(...) -> packB_blocked, so the arm builds them with the same rule through
+        // q4nx_pack_B_int8_blocked(): one multiplier per column, int8 codes. Chunked by vocabulary block, because a
+        // whole head image is H x V bytes (622 MB at this vocabulary).
+        const float inv_es = (sem_.tie_embeddings && sem_.embed_scale > 0) ? 1.0f / sem_.embed_scale : 1.0f;
+        const int TB = 8192;   // vocabulary block; a tile's image is H x TB bytes
+        if ((int)lm_head_i8_.size() != (NV + TB - 1) / TB) lm_head_i8_.assign((NV + TB - 1) / TB, HostI8Tensor());
+        logits.assign((size_t)NV, 0.0f);
+        std::vector<float> a8v((size_t)H);
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) {
+            const float v = std::fabs(h[(size_t)k] * inv_es);
+            if (v > amax) amax = v;
+        }
+        const float ascale = amax > 0 ? amax / 127.0f : 1.0f;
+        for (int k = 0; k < H; k++) {
+            int q = (int)std::round(h[(size_t)k] * inv_es / ascale);
+            a8v[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        }
+        std::vector<float> bt((size_t)H * (size_t)TB);
+        std::vector<int8_t> a8i((size_t)H);
+        for (size_t i = 0; i < a8v.size(); i++) a8i[i] = a8v[i];
+        for (int t = 0; t < (int)lm_head_i8_.size(); t++) {
+            const int n0 = t * TB, n1 = std::min(NV, n0 + TB), Tn = n1 - n0;
+            HostI8Tensor& c = lm_head_i8_[(size_t)t];
+            if (c.codes.empty()) {
+                for (int n = n0; n < n1; n++)
+                    for (int k = 0; k < H; k++) bt[(size_t)k * Tn + (n - n0)] = lm_at(n, k);
+                c.N = Tn;
+                c.codes.assign((size_t)H * (size_t)Tn, 0);
+                c.d.assign((size_t)Tn, 0.0f);
+                double ssum = 0.0;
+                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, /*blocked=*/1, c.d.data(), &ssum);
+            }
+            for (int n = 0; n < Tn; n++) {
+                int32_t acc = 0;
+                for (int k = 0; k < H; k++)
+                    acc += (int32_t)((int)c.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, H, Tn)] *
+                                     (int)a8i[(size_t)k]);
+                float v = c.d[(size_t)n] * (ascale * (float)acc);
+                if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                logits[(size_t)(n0 + n)] = v;
+            }
+        }
+        return true;
+    }
     if (host_gemm_) {
         // Offline mode: plain float matvec against the (possibly dequantized)
         // tied table, matching the Python reference.  No I8Ctx is touched.

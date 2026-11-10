@@ -19,10 +19,15 @@
 // measured at 10-17 s quiet and minutes contended for the h4096 shapes. Nothing device-side enters that image, so it can be
 // produced on the host, written once at import and copied on later serves.
 //
-// What makes that safe is the identity, not the speed. The image is written with a format version, its geometry, and a hash
-// over the payload; `read` recomputes the hash and refuses rather than returning bytes it cannot vouch for. A packer change,
-// a geometry change or a truncated write are therefore a loud refusal and never a plausible-looking image -- the same rule the
-// .fconst canonical copy follows after engine#1662/#1669.
+// What makes that safe is INTEGRITY AND GEOMETRY, not provenance (engine#1802 audit). The image is written with a format
+// version, its geometry, and a hash over the payload; `read` recomputes the hash and refuses rather than returning bytes it
+// cannot vouch for. So a truncated write, a corrupted byte, or a geometry change is a loud refusal and never a
+// plausible-looking image -- the same rule the .fconst canonical copy follows after engine#1662/#1669.
+//
+// What the hash does NOT prove: that the image was built from THESE weights. An image from another pack with the same kd/nd
+// hashes faithfully to its own bytes and passes every check here, so a stale image left beside a different container of the
+// same head geometry would be accepted. Nothing calls this API yet; whoever first does must key the path on the container's
+// identity (or add a source hash beside the payload hash) before a stale file can be read as this pack's head.
 //
 // Absence is not an error: a container without an image simply packs as it did before.
 #ifndef Q4NX_HEAD_IMAGE_H
@@ -55,6 +60,32 @@ int q4nx_head_image_read(const char *path, int8_t *codes, int codes_n, float *sc
 
 // The hash the writer would compute, so a caller that built an image itself can compare against a file it read.
 uint64_t q4nx_head_image_hash(const int8_t *codes, const float *scales, int kd, int nd);
+
+// The cache KEY (engine#1716, from reading run_lm_head): a head image is only valid for one combination of the kernel-set
+// geometry and the container's head bytes, because the forward packs with
+//
+//     const int T = designs_[i_qkv].N;                 // the widest design with K == kpad_
+//     const size_t tile_elems = (size_t)kpad_ * (size_t)T;
+//     lctx.packB_into(bo, bt.data(), kpad_, T, ...);   // and the design's `blocked` flag changes the byte order
+//
+// so the SAME container packs to a DIFFERENT image under a different kernel set. A key that omitted `kpad`, `T` or
+// `blocked` would serve one set's image to another -- and the aggregate correlation would still look plausible, which is
+// the failure this whole contract exists to make impossible.
+//
+// The key is a 64-bit digest of exactly those four facts, one of which is a digest of the head bytes themselves.
+typedef struct {
+    uint32_t kpad;      // K padded to the kernel grid (the BO's row count)
+    uint32_t t;         // the design's N: columns per tile
+    uint32_t blocked;   // 1 when the design packs blocked (b8), 0 otherwise
+    uint64_t head_hash; // FNV-1a over the container's lm_head.weight bytes
+} Q4nxHeadImageKey;
+
+// Returns a digest over {version, key}, so a key can name a file without embedding four numbers and a hash in a filename.
+uint64_t q4nx_head_image_key_digest(const Q4nxHeadImageKey *key);
+
+// The suggested file name for a key: "headimg-<16 hex>.q4hi". `out` is written NUL-terminated; returns 1 on success.
+int q4nx_head_image_key_name(const Q4nxHeadImageKey *key, char *out, int out_n);
+
 
 #ifdef __cplusplus
 }

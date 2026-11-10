@@ -63,8 +63,8 @@ def workflow_triggers(path=WORKFLOW):
         return None
     # A YAML comment inside the list is legal and must be skipped: the first version stopped at the first line that was
     # not a `- entry`, so one comment truncated the trigger set silently and every entry after it became "not a trigger".
-    # Found while adding a `cmake/tests-*.cmake` entry for engine#1696 (that entry needs `workflow` scope on a token this
-    # box does not have, so it is a follow-up; the skip is still the right behaviour for anyone who adds a comment).
+    # Found while adding the `cmake/tests-*.cmake` entry for engine#1696 (the entry itself landed later, with the glob
+    # match in is_trigger() below; the skip is still the right behaviour for anyone who adds a comment).
     m = re.search(r"^\s*paths:\s*\n((?:\s*(?:#[^\n]*|-\s*\S+)\s*\n)+)", text, re.M)
     if not m:
         return None
@@ -72,8 +72,16 @@ def workflow_triggers(path=WORKFLOW):
     return listed or None
 
 
+def _glob_re(entry):
+    """A paths-filter entry as GitHub reads it: `*` stays inside one path segment, `**` crosses segments."""
+    return re.compile("^" + re.escape(entry).replace(r"\*\*", "\0").replace(r"\*", "[^/]*").replace("\0", ".*") + "$")
+
+
 def is_trigger(path, triggers):
-    return triggers is None or any(path == t or path.startswith(t.rstrip("/") + "/") for t in triggers)
+    # A glob entry (`cmake/tests-*.cmake`) must match as a glob. Read literally it matched nothing, so a PR touching
+    # only a family file came out "no trigger path" -> full, and the compile ran for a registration-only change.
+    return triggers is None or any(
+        _glob_re(t).match(path) if "*" in t else (path == t or path.startswith(t.rstrip("/") + "/")) for t in triggers)
 
 REGISTRATION = re.compile(r"^\s*(add_test\s*\(|set_tests_properties\s*\(|set_property\s*\(\s*TEST\b)")
 BENIGN = re.compile(r"^\s*(#|$)")
@@ -241,7 +249,7 @@ def self_test():
         ("no paths at all (a shallow checkout that failed to diff)",
          [], "+++ b/CMakeLists.txt\n+add_test(NAME a COMMAND a)\n", "full"),
     ]
-    trig = ["third_party/llama.cpp", "CMakeLists.txt", "cmake/hrx.cmake", "app/serve.cpp"]
+    trig = ["third_party/llama.cpp", "CMakeLists.txt", "cmake/tests-*.cmake", "cmake/hrx.cmake", "app/serve.cpp"]
     one_reg = "+++ b/CMakeLists.txt\n@@ -1,1 +1,2 @@\n+add_test(NAME t COMMAND t)\n"
     tcases = [
         ("the #1491 shape: a registration plus its test file and script (not build inputs)",
@@ -250,6 +258,12 @@ def self_test():
         ("a registration plus a gitlink bump", ["CMakeLists.txt", "third_party/llama.cpp"], one_reg, "full"),
         ("a file under a trigger directory", ["CMakeLists.txt", "cmake/hrx.cmake/x"], one_reg, "full"),
         ("no trigger path at all (a manual run)", ["docs/x.md"], "", "full"),
+        # The glob entry: a family file alone is a trigger and a registration file, so a registration there is
+        # configure-only. Read as a literal string the entry matched nothing and this came out full.
+        ("a registration in a family file only, with the glob trigger", ["cmake/tests-gpu-hold.cmake"],
+         "+++ b/cmake/tests-gpu-hold.cmake\n+add_test(NAME gpu_hold_new COMMAND bash x.sh)\n", "configure-only"),
+        # `*` stays in one segment, as in GitHub's filter: a file one directory down is not that entry's match.
+        ("a path one directory under the glob is not its match", ["cmake/tests-x/y.cmake"], one_reg, "full"),
     ]
     bad = 0
     for name, paths, diff, want in tcases:
@@ -258,7 +272,7 @@ def self_test():
         print(("ok   " if ok else "FAIL ") + f"{name} -> {got}" + ("" if ok else f" (wanted {want}: {why})"))
         bad += 0 if ok else 1
     real = workflow_triggers()
-    ok = bool(real) and "CMakeLists.txt" in real and "cmake/hrx.cmake" in real
+    ok = bool(real) and "CMakeLists.txt" in real and "cmake/hrx.cmake" in real and "cmake/tests-*.cmake" in real
     print(("ok   " if ok else "FAIL ") + f"hrx-build.yml's paths filter reads as {len(real or [])} trigger(s)")
     bad += 0 if ok else 1
     for name, paths, diff, want in cases:
@@ -266,6 +280,14 @@ def self_test():
         ok = got == want
         print(("ok   " if ok else "FAIL ") + f"{name} -> {got}" + ("" if ok else f" (wanted {want}: {why})"))
         bad += 0 if ok else 1
+    # The reason string is this tool's product, and the arms above compare the verdict only (engine#1753's review). The
+    # no-line-change branch is reached by a mode change on a family file too, since #1744 widened the diff, so it must
+    # name the registration files and not claim CMakeLists.txt: that wrong wording is what survived #1744 unseen.
+    got, why = decide(["cmake/tests-gpu-hold.cmake"], "+++ b/cmake/tests-gpu-hold.cmake\n")
+    ok = got == "full" and "registration file" in why and "CMakeLists.txt" not in why
+    print(("ok   " if ok else "FAIL ") + "a mode-only family file names the registration files, not CMakeLists.txt"
+          + ("" if ok else f" (got {got}: {why})"))
+    bad += 0 if ok else 1
     g = git_arm()
     if g is None:
         print("skip git: no git on PATH, from_git() not exercised")

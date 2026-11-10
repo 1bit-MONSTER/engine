@@ -253,6 +253,21 @@ def main():
     check(T.head_offset(291655296, 2374, 34816) == 209000256 + T.attn_payload_off(896),
           "it equals the importer's layers*stride + env (209000256 is this pack's 24 layer blocks)")
 
+    # ── placement when the tail is padded to whole tile slots (engine#1852) ──
+    ENV, TILE, N = T.attn_payload_off(896), T.attn_tile_bytes(896), 2374
+    unpadded = ENV + N * TILE
+    check(T.slot_candidates(unpadded, ENV, N, TILE) == [T.head_offset(unpadded, N, TILE)],
+          "an unpadded tail has exactly one placement, and it is head_offset's")
+    byte_padded = unpadded + 4096
+    check(T.slot_candidates(byte_padded, ENV, N, TILE, zeros=4096) == [ENV + 0 * TILE],
+          "bytes padded after the grid still give the envelope's end (engine#1789's case)")
+    slot_padded = ENV + (N + 1) * TILE          # Hunyuan-7B: 2004 slots for a 2003-tile head
+    c = T.slot_candidates(slot_padded, ENV, N, TILE)
+    check(len(c) == 2 and c[1] == ENV,
+          "a whole-slot pad gives two placements and the head is the SECOND one (env), which is the #1789 rule landing a tile early")
+    check(all(off >= ENV for off in T.slot_candidates(ENV + (N + 9) * TILE, ENV, N, TILE)),
+          "no candidate starts before the envelope, however much padding the file holds")
+
     # ── the envelope decoder, against the vendor tile ──
     with open(GOLDEN + ".json") as f:
         meta = json.load(f)
@@ -280,8 +295,17 @@ def main():
 
     synthetic()
 
-    print("all q4nx_tail_head checks passed" if not failures else "%d check(s) failed" % failures)
-    return 1 if failures else 0
+    if failures:
+        print("%d check(s) failed" % failures)
+        return 1
+    # engine#1747 review: the block-32 refusal and the undeclared-tie arm need onnx, and they are the reason this test is
+    # registered. Without onnx a pass would hide that they never ran, so report SKIPPED to ctest (SKIP_RETURN_CODE 77 in
+    # CMakeLists.txt) instead. A failing synthetic check still returns 1 above, in either environment.
+    if not HAVE_ONNX:
+        print("SKIPPED: the synthetic checks passed, but the two onnx arms (block-32 refusal, undeclared tie) did not run")
+        return 77
+    print("all q4nx_tail_head checks passed")
+    return 0
 
 
 if __name__ == "__main__":

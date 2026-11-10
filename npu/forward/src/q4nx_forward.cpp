@@ -1545,6 +1545,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
 
     backend_ = "full ELF";
     ready_ = true;
+    /* engine#1900: say the batch width once at load, the way the block note does, so a log can be told apart from a
+     * forward that never batched. #1904 gives the sealed route its plan's width; this line is what makes the difference
+     * visible either way. */
+    std::fprintf(stderr, "  [forward] batch width %d row(s) per launch\n", max_batch_rows());
     return true;
 }
 

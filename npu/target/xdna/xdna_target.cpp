@@ -20,6 +20,7 @@
 //
 // docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
 #include "target/xdna/xdna_target.h"
+#include "batch_width.h"
 
 #include <algorithm>
 #include <chrono>
@@ -281,8 +282,25 @@ bool XdnaTarget::weight_cached(int layer, int key) const {
 }
 
 int XdnaTarget::max_rows() const {
-    if (pb16i_) { for (int i = 0; i < ndesigns_; i++) if (ctx16_[i]) return ctx16_[i]->MD; }
-    for (int i = 0; i < ndesigns_; i++) if (ctx_[i]) return ctx_[i]->MD;
+    /* engine#1900/#1903: MIN over the loaded per-role widths, never the first populated one. This width IS the chunk
+     * width, and the activation BO holds exactly that many rows -- an over-wide launch reads and poisons past the BO,
+     * which is memory corruption rather than a slow path (engine#1372). Returning the FIRST entry meant a mixed set
+     * answered whichever role happened to be index 0, so a 16/16/128 set could answer 128: the dangerous direction.
+     * The pb16i_ case keeps main's fall-through (a pb16i set that adopted only its prefill kernels has no 16-row twin,
+     * and answering 1 there would walk single-row passes), and #1904's plan-derived width for the sealed route stays
+     * below exactly as merged. */
+    const int n = ndesigns_ < Q4NX_MAX_DESIGNS ? ndesigns_ : Q4NX_MAX_DESIGNS;
+    int widths16[Q4NX_MAX_DESIGNS] = {0};
+    bool any16 = false;
+    if (pb16i_)
+        for (int i = 0; i < n; i++)
+            if (ctx16_[i]) { widths16[i] = ctx16_[i]->MD; any16 = true; }
+    if (any16) return onebit::npu::batch_width_min(widths16, n, 1);
+    int widths[Q4NX_MAX_DESIGNS] = {0};
+    bool any_ctx = false;
+    for (int i = 0; i < n; i++)
+        if (ctx_[i]) { widths[i] = ctx_[i]->MD; any_ctx = true; }
+    if (any_ctx) return onebit::npu::batch_width_min(widths, n, 1);
     // engine#1900: the sealed/mono-ELF generation adopts its kernel set through a path that fills neither array, so both
     // loops above find nothing and this returned 1. This is the CHUNK WIDTH (q4nx_forward's `blk = max_batch_rows()`), so
     // those packs batched ONE ROW per launch however wide their design is -- `models/npu/bonsai2-27b-NPU-b8` states prefill

@@ -4103,6 +4103,31 @@ void test_tail_head_placement() {
         check(p.why.empty() && p.exact, "tail placement: a tail that ends with the head is exact");
         check(p.first == env && p.last == env, "tail placement: and the only candidate is the envelope's end");
     }
+    // (b2) engine#1773's review: the zero run is counted FROM EOF, so a head whose own last tiles are zero contributes
+    //      to it exactly like padding does, and `last` then computes as base - n*tile with only the `last < base` clamp
+    //      keeping it at the envelope's end. Measured by lifting `plan_tail_head` verbatim and running the hidden-896
+    //      geometry through it: all four cases below give first == last == 1,856. They are the cases where a clamp
+    //      mistake would hide, so they are pinned here rather than left to the pad-whole-tiles arm.
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes, 0, env, rows, tile, 2 * tile);
+        check(p.why.empty() && p.last == env && p.first == env,
+              "tail placement: a head whose own last two tiles are zero still lands on the envelope's end");
+    }
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes + 5 * tile, 0, env, rows, tile, 7 * tile);
+        check(p.why.empty() && p.last == env && p.first == env,
+              "tail placement: a zero run spanning the head's own tail tiles AND its padding is not counted twice");
+    }
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes + 512, 0, env, rows, tile, 512);
+        check(p.why.empty() && p.last == env && p.first == env,
+              "tail placement: padding smaller than one tile still lands on the envelope's end");
+    }
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes + rows * tile, 0, env, rows, tile, rows * tile);
+        check(p.why.empty() && p.last == env && p.first == env,
+              "tail placement: a zero run longer than the head is clamped to its start");
+    }
     // (b) n whole zero tiles after the head: the candidate walks back by exactly n tiles, never past the envelope
     for (int64_t n : {1, 3, 9}) {
         const int64_t bytes = exact_bytes + n * tile;

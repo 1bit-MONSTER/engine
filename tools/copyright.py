@@ -41,6 +41,9 @@ LINE_STYLES = [
       # engine#1595: the direction-B ratchet's baseline is a '#'-comment data file too, and `.txt` has no style of
       # its own (a blanket "*.txt" would demand a notice in files that are data, not code).
       "add_test_gaps.txt",
+      # engine#1820: the same shape one direction over - the direction-C allow-list, a '#'-comment data file read by
+      # tools/ci/ci_targets_check.py. Listed by name for the same reason: `.txt` is data elsewhere in this tree.
+      "unreferenced_tests.txt",
       "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
       # cycle 17: Puppy's switch that skips its first-run Quick Setup is an empty marker file whose only content
       # is this notice - Puppy tests for its existence, so a comment is free

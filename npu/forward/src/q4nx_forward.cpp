@@ -1444,7 +1444,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
              *
              * The extra rows decode to zero and are never sampled: the logits vector stays NV long. */
             int head_rows = NV;
-            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0 && ltd->shape[1] == kpad_) {
+            /* The head is stored as a TILE tensor (shape {tiles, bytes-per-tile}), not as {rows, cols}: the rows have to
+             * be recovered from the tile count and the grid, which is why comparing shape[1] against kpad_ was the wrong
+             * test and left this at NV. */
+            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0 && ltd->shape[0] > 0) {
                 const int64_t per_block = kpad_ / Q4NX_TILE_COLS;   // tiles per 32-row block
                 if (per_block > 0 && ltd->shape[0] % per_block == 0) {
                     const int64_t r = (ltd->shape[0] / per_block) * Q4NX_TILE_ROWS;
@@ -3129,15 +3132,21 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
         const float* a = A + (size_t)m * (size_t)a_k;
+        // engine#845's pad, on THIS leg too: a padded design has K > a_k (chatglm3-6b's IM is 13,696 and its D design
+        // is K = 13,824), so reading A[k] for k < K runs 128 floats past the caller's row -- into the next row, or past
+        // the buffer on the last. The f32 leg has always padded (q4nx_host_gemm_f32_padded "owns the pad-and-read pair
+        // so neither leg can be handed an unpadded A"); this leg was written later and did not. Measured on chatglm
+        // before the fix: cos 0.40 -> -0.003 against the device, while the f32 arm tracked it at 0.985-0.988.
+        const auto act = [a, a_k](int k) { return k < a_k ? a[(size_t)k] : 0.0f; };
         float amax = 0.0f;
         for (int k = 0; k < K; k++) {
-            const float v = std::fabs(a[k]);
+            const float v = std::fabs(act(k));
             if (std::isfinite(v) && v > amax) amax = v;
         }
         const float ascale = (amax >= 1e-12f) ? amax / 127.0f : 1.0f;
         const float tis = 1.0f / ascale;
         for (int k = 0; k < K; k++) {
-            float v = a[k];
+            float v = act(k);
             if (!std::isfinite(v)) v = 0.0f;
             int q = (int)std::round(v * tis);
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));

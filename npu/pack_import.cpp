@@ -1774,6 +1774,29 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
     return false;
 }
 
+// engine#1990: q4_1 tiles hold 32-row multiples, and a pack's vocabulary need not be one. CodeLlama's is 32,016, which
+// refused the whole import with "q4_1 tiles need N % 32 == 0" -- a head the grid cannot hold, not a head that is wrong.
+// Where the pack pads its own head (the .fconst tail carries ceil(V/64)*64 rows: Hunyuan-0.5B has 120,832 for 120,818)
+// nothing here fires; where it does not, pad with rows that decode to zero, and leave `vocab_size` at the vocabulary's
+// own number so the padding is never addressed. codes 0 with scale 0 decode to 0, for the same reason a padded column
+// does: the quantised value is code*scale + zero, and zero holds the group's `m`.
+void pad_rows_to_tile_quantum(Q4& q, int vocab) {
+    if (q.N <= 0 || q.K <= 0 || q.block <= 0 || q.K % q.block) return;
+    if (q.N % q4nx::kRows == 0) return;
+    const int padded = (q.N + q4nx::kRows - 1) / q4nx::kRows * q4nx::kRows;
+    const size_t gpr = size_t(q.K / q.block);   // groups per row
+    for (int r = q.N; r < padded; r++) {
+        q.codes.insert(q.codes.end(), size_t(q.K), 0);
+        q.scale.insert(q.scale.end(), gpr, 0.0f);
+        q.zero.insert(q.zero.end(), gpr, 0.0f);
+    }
+    std::fprintf(stderr,
+                 "note: the head is %d rows for a vocabulary of %d (padded from %lld to the 32-row tile quantum); "
+                 "vocab_size stays %d in the container\n",
+                 padded, vocab, (long long)q.N, vocab);
+    q.N = padded;
+}
+
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
     Q4 q = pack;   // same codes, same geometry
     long long inexact = 0;
@@ -3910,6 +3933,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         uint64_t qw_need = 0;   // N * K/block * block/2
         if (!mul_ok(groups_n, uint64_t(mm.block) / 2, qw_need)) throw std::runtime_error("lm_head: qweight length overflows");
         Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        pad_rows_to_tile_quantum(q, int(V));
         // no qzeros tensor -> the implicit zero point (engine#1503: Qwen3-VL-4B's spelling, three-input nodes)
         if (!have_zp) implicit_zp_zero(q, mm.bits);
 

@@ -918,6 +918,53 @@ void test_1671_plan_head_arm(const std::string& root) {
 }
 
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────
+// engine#1990: a head whose row count is not a multiple of the 32-row tile quantum (CodeLlama's vocabulary is 32,016) is
+// padded with rows that decode to zero, and the container's vocab_size is NOT changed -- the padding is invisible to the
+// vocabulary. Both halves are pinned here because widening N without staying invisible is the failure that would show up
+// as two plausible extra tokens at the end of every distribution.
+void test_head_row_padding() {
+    const auto make = [](int N) {
+        pi::Q4 q;
+        q.N = N;
+        q.K = 128;      // two 64-column tiles
+        q.block = 32;   // four groups per row
+        q.codes.assign(size_t(N) * size_t(q.K), 1);          // non-zero, so padding is distinguishable
+        q.scale.assign(size_t(N) * size_t(q.K / q.block), 0.5f);
+        q.zero.assign(size_t(N) * size_t(q.K / q.block), 0.25f);
+        return q;
+    };
+    {
+        pi::Q4 q = make(32016);
+        pi::pad_rows_to_tile_quantum(q, 32016);
+        check(q.N == 32032 && q.N % 32 == 0, "head padding: 32,016 rows become 32,032 (the 32-row quantum)");
+        check(q.codes.size() == size_t(32032) * 128 && q.scale.size() == size_t(32032) * 4,
+              "head padding: codes and scales grow with the rows, one group's worth each");
+        bool zeros = true;
+        for (int r = 32016; r < q.N; r++) {
+            for (int k = 0; k < q.K; k++) zeros = zeros && q.codes[size_t(r) * 128 + size_t(k)] == 0;
+            for (int g = 0; g < 4; g++)
+                zeros = zeros && q.scale[size_t(r) * 4 + size_t(g)] == 0.0f && q.zero[size_t(r) * 4 + size_t(g)] == 0.0f;
+        }
+        check(zeros, "head padding: every padded row is code 0, scale 0, zero 0 -- which decodes to 0.0, not to a weight");
+        bool kept = true;
+        for (int r = 0; r < 32016; r++)
+            for (int k = 0; k < 128; k++) kept = kept && q.codes[size_t(r) * 128 + size_t(k)] == 1;
+        check(kept, "head padding: the vocabulary's own rows are untouched");
+    }
+    {   // an aligned vocabulary is left exactly as it was: no note, no growth
+        pi::Q4 q = make(32000);
+        const size_t before = q.codes.size();
+        pi::pad_rows_to_tile_quantum(q, 32000);
+        check(q.N == 32000 && q.codes.size() == before, "head padding: a 32-aligned vocabulary (32,000) is not touched");
+    }
+    {   // 16 rows of slack and 1 row of slack both round up to one tile boundary, not two
+        pi::Q4 a = make(32017), b = make(32031);
+        pi::pad_rows_to_tile_quantum(a, 32017);
+        pi::pad_rows_to_tile_quantum(b, 32031);
+        check(a.N == 32032 && b.N == 32032, "head padding: 32,017 and 32,031 both round to 32,032");
+    }
+}
+
 void test_matmulnbits() {
     const int N = 64, K = 256, B = 128;
     std::vector<uint8_t> qw(size_t(N) * (K / B) * (B / 2));
@@ -3687,7 +3734,8 @@ int main(int argc, char** argv) {
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);
-        test_matmulnbits();
+        test_head_row_padding();
+    test_matmulnbits();
         test_tiles(golden_dir);
         test_q4_1f();
         test_attn_tile(golden_dir);

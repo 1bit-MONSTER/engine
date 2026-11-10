@@ -12,6 +12,7 @@
 // The pack on disk carries no tokenizer, so this stops at ids: `400 370 452 ...` is the sentence, and comparing ids is a
 // stricter check than comparing text (two ids can share a detokenisation, and neither can share an id).
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -105,11 +106,13 @@ int main(int argc, char** argv) {
     const size_t want = size_t(cfg.sample_rate) * size_t(cfg.frames) * size_t(cfg.hop) / size_t(cfg.frames);
     audio.resize(std::max(audio.size(), want), 0.0f);
 
+    const auto t_start = std::chrono::steady_clock::now();
     std::vector<float> mel;
     if (!onebit::audio::log_mel_spectrogram(audio.data(), audio.size(), cfg, &mel)) {
         std::fprintf(stderr, "mel: refused\n");
         return 1;
     }
+    const auto t_mel = std::chrono::steady_clock::now();
     OnnxGraphInfo enc, dec;
     try {
         enc = parse_onnx_graph(argv[1]);
@@ -123,6 +126,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "encoder: %s\n", why.c_str());
         return 1;
     }
+    const auto t_enc = std::chrono::steady_clock::now();
     std::printf("encoder: [");
     for (int64_t d : xa.dims) std::printf(" %lld", (long long)d);
     std::printf(" ]\n");
@@ -150,6 +154,13 @@ int main(int argc, char** argv) {
         ids.push_back(best);
         seq.push_back(best);
     }
+    const auto t_dec = std::chrono::steady_clock::now();
+    const auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+    std::printf("time: mel+load %.3f s, encoder %.3f s, decode %.3f s for %zu token(s) -> %.3f s/token, wall %.3f s\n",
+                secs(t_start, t_mel), secs(t_mel, t_enc), secs(t_enc, t_dec), ids.size(),
+                ids.empty() ? 0.0 : secs(t_enc, t_dec) / double(ids.size()), secs(t_start, t_dec));
     std::printf("ids:");
     for (int64_t v : ids) std::printf(" %lld", (long long)v);
     std::printf("\n");

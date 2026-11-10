@@ -385,6 +385,14 @@ private:
     // prompt-encoding forward (step_batch at start_pos 0) attends bidirectionally there and the GDN
     // layers keep their recurrence.  Off unless the plan says so, so a causal model is untouched.
     bool noncausal_attn_ = false;
+    // engine#1959: measured wall of one batched launch per design, narrow (the 16-row twin) and wide (the prefill
+    // design), for cached weights only. npu_gemm_rows() reads them to decide whether a 17..wide-row chunk runs as one
+    // wide launch or as several narrow ones (batch_split.h). 0 = not measured yet. `split_mode_` is NPU_PREFILL_SPLIT:
+    // -1 unset (decide from the measurements), 0 never split (the behaviour before), 1 split whenever a twin exists.
+    double split_narrow_ms_[Q4NX_MAX_DESIGNS] = {0};
+    double split_wide_ms_[Q4NX_MAX_DESIGNS] = {0};
+    int    split_mode_ = -2;      // -2 = environment not read yet
+    bool   split_said_ = false;
     // The refusal for a kernel a design needs but the directory does not have.  With a plan it names
     // the plan file and the role, so "which description asked for this" needs no log reading.
     std::string missing_kernel(const std::string& dir, const char* elf_name, Q4nxDesign role) const;

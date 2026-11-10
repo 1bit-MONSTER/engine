@@ -23,6 +23,7 @@
 #include "full_elf.h"
 #include "pack.h"
 #include "q4nx_pack.h"
+#include "batch_split.h"
 #include "batch_width.h"
 
 #include "golden/host_gemm_i8_fixture.h"
@@ -112,8 +113,36 @@ static void batch_width_arms() {
     std::printf("  batch width: 7 arms (min not first, empty slots, fallback)\n");
 }
 
+/* engine#1959: a 17-row chunk ran the 128-row design and paid for 128 rows (6992 ms against 1073 ms for 16 rows on an
+ * imported 7B pack). batch_split_rows() decides from the two MEASURED launch costs whether a chunk is walked at the
+ * twin's width. These arms pin the decision, including the direction that must not change anything: one family only,
+ * an unmeasured side, and a family where the wide launch is the cheaper one. */
+static void batch_split_arms() {
+    using onebit::npu::batch_split_rows;
+    const double n7b = 7.6, w7b = 56.3;   // per-launch device wait measured on the 7B b8 family (ms)
+    check(batch_split_rows(17, 16, 128, n7b, w7b) == 16, "batch split: 17 rows run as 2 narrow launches (15.2 ms against 56.3)");
+    check(batch_split_rows(96, 16, 128, n7b, w7b) == 16, "batch split: 96 rows run as 6 narrow launches (45.6 ms against 56.3)");
+    check(batch_split_rows(97, 16, 128, n7b, w7b) == 0,
+          "batch split: 97 rows stay one wide launch (7 x 7.6 = 53.2 is not a tenth below 56.3)");
+    check(batch_split_rows(128, 16, 128, n7b, w7b) == 0, "batch split: a full 128-row chunk stays one wide launch (60.8 > 56.3)");
+    check(batch_split_rows(16, 16, 128, n7b, w7b) == 0 && batch_split_rows(1, 16, 128, n7b, w7b) == 0,
+          "batch split: a chunk the twin already takes is not split");
+    check(batch_split_rows(129, 16, 128, n7b, w7b) == 0, "batch split: a chunk wider than the wide design is the block walk's, not this rule's");
+    check(batch_split_rows(17, 16, 128, 0.0, w7b) == 0 && batch_split_rows(17, 16, 128, n7b, 0.0) == 0,
+          "batch split: an unmeasured side keeps the wide launch (that launch is how it gets measured)");
+    check(batch_split_rows(17, 16, 16, n7b, w7b) == 0 && batch_split_rows(17, 128, 128, n7b, w7b) == 0 &&
+          batch_split_rows(17, 0, 128, n7b, w7b) == 0 && batch_split_rows(17, 1, 128, n7b, w7b) == 0,
+          "batch split: one family only (no twin, or twin == wide) never splits");
+    // a family whose wide launch costs twice a narrow one: the wide launch wins from 33 rows, and 17..32 is level
+    check(batch_split_rows(17, 16, 128, 0.59, 1.20) == 0, "batch split: 2 x 0.59 = 1.18 is not a tenth below 1.20, so 17 rows stay wide there");
+    check(batch_split_rows(40, 16, 128, 0.59, 1.20) == 0, "batch split: 40 rows stay wide on a family where wide = 2 x narrow");
+    check(batch_split_rows(17, 16, 128, 0.50, 1.20) == 16, "batch split: 2 x 0.50 = 1.00 is a tenth below 1.20, so it splits");
+    std::printf("  batch split: 11 arms (crossover, unmeasured, one family, a family where wide wins)\n");
+}
+
 int main(int argc, char** argv) {
     batch_width_arms();
+    batch_split_arms();
     quant_int4_arms();
     for (int G : {8, 9, 16}) {
         for (int n : {G, 3 * G}) {  // whole groups: a ragged tail is not a permutation

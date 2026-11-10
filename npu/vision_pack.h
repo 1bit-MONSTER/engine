@@ -21,18 +21,21 @@
 //
 // What this reader is for: the forward that will run the tower must never size a buffer from config.json. Both packs
 // on the catalogue state `MINICPM_V_VISION_MLP_INTERMEDIATE_SIZE 4304` and `MINICPM_V_VIT_MERGER_INTERMEDIATE_SIZE
-// 17216` while their tensors are 4608 and 17280 rows; a loader that trusted the config would read 304 rows into the
-// next tensor and return plausible numbers. So the geometry here is DERIVED from the tensors' own shapes, every
-// tensor in the file has to be one this reader can place (zero gaps), and the config is only consulted for what the
-// tensors cannot say (the head count, the image size) and for the two widths that tie the tower to something outside
-// it (the patch grid and the text model's hidden size).
+// 17216` while their tensors are 4608 and 17280 rows. The config is the MODEL's width (the source GGUF's ffn tensors
+// are 4304 and 17216 wide); the container stores each MLP padded with all-zero rows to a multiple of 128, measured
+// bit for bit against both packs' sources. A loader that sized a buffer from the config would read 304 rows short of
+// what the file holds and misplace everything after it. So the geometry here is DERIVED from the tensors' own shapes,
+// every tensor in the file has to be one this reader can place (zero gaps), and the config is only consulted for what
+// the tensors cannot say (the head count, the image size, the unpadded MLP widths) and for the widths that tie the
+// tower to something outside it (the patch grid and the text model's hidden size).
 //
 // Two kinds of disagreement with config.json, on purpose:
 //   refused  the head count does not divide the width, the patch grid is not the position table, the tower's output
-//            is not the text model's hidden size, or the width / block count differ: the files do not belong together
-//            or the container is cut short, and no forward can be right.
-//   noted    an MLP intermediate width differs. The tensors decide it completely and nothing outside the tower
-//            depends on it; the tensor wins and `notes()` says what the config claimed.
+//            is not the text model's hidden size, the width / block count differ, or an MLP is stated WIDER than its
+//            tensors: the files do not belong together or the container is cut short, and no forward can be right.
+//   noted    an MLP is stated narrower than its tensors. The tensor decides every size. The rows past the stated
+//            width are checked: all zero in every block means padding (the published packs), and `model_*` below
+//            carry the stated width; anything else means the config is simply wrong and `model_*` stay the tensors'.
 #pragma once
 
 #include <cstdint>
@@ -62,6 +65,10 @@ struct Geometry {
     int vit_merger_intermediate = 0;  // vit_merger.mlp.linear_fc1 rows
     int out_hidden = 0;               // merger.linear_fc2 rows: the text model's hidden size
     int heads = 0, head_dim = 0, image_size = 0;
+    // The MLP widths without the container's zero padding: config.json's value when it is smaller than the tensors'
+    // and every row past it is zero in every block, else the tensors' own. A forward may stop at these; it must
+    // still index the tensors at `intermediate` / `vit_merger_intermediate`.
+    int model_intermediate = 0, model_vit_merger_intermediate = 0;
 };
 
 class Pack {

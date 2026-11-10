@@ -19,8 +19,8 @@
 // tensor names and the same shape relations as FastFlowLM's MiniCPM-V 4.7 `vision_weight.q4nx`, so each arm is one
 // edit to a container that otherwise loads:
 //   - it loads, and the geometry is the one the tensors hold;
-//   - a config that is stale about an MLP width does not move a single size (the published packs are stale there:
-//     4304 stated, 4608 held) and is reported;
+//   - an MLP the container pads with zero rows (the published packs: the model is 4304 wide, 4608 are stored) is sized
+//     from the tensor, with the model's width carried beside it and the padding verified to be zero;
 //   - every way the file can disagree with itself, or with the config in a way no forward survives, is refused with
 //     the tensor or field named.
 // When ONEBIT_MINICPM_PACK names a published pack directory, its own numbers are checked too.
@@ -205,26 +205,81 @@ void test_loads() {
     }
 }
 
-// The published packs' situation: the config states smaller MLP widths than the tensors hold.
-void test_stale_config_widths() {
+// Zeroes the rows of an MLP past `from`: fc1 weight rows and bias entries, fc2 weight columns. This is what the
+// published packs hold past the model's width.
+void zero_mlp_tail(json& t, std::vector<uint8_t>& p, const std::string& stem, int from) {
+    const auto span = [&](const std::string& n, uint64_t* off, std::vector<int64_t>* shape) {
+        *off = t[n]["data_offsets"][0];
+        *shape = t[n]["shape"].get<std::vector<int64_t>>();
+    };
+    uint64_t off;
+    std::vector<int64_t> sh;
+    span(stem + ".linear_fc1.weight", &off, &sh);
+    for (int64_t i = int64_t(from) * sh[1]; i < sh[0] * sh[1]; ++i) p[off + 2 * i] = p[off + 2 * i + 1] = 0;
+    span(stem + ".linear_fc1.bias", &off, &sh);
+    for (int64_t i = from; i < sh[0]; ++i) p[off + 2 * i] = p[off + 2 * i + 1] = 0;
+    span(stem + ".linear_fc2.weight", &off, &sh);
+    for (int64_t r = 0; r < sh[0]; ++r)
+        for (int64_t c = from; c < sh[1]; ++c) p[off + 2 * (r * sh[1] + c)] = p[off + 2 * (r * sh[1] + c) + 1] = 0;
+}
+
+// The published packs' situation: the config states the model's MLP widths (4304, 17216) and the container stores them
+// padded with zero rows (4608, 17280). Every size is the tensor's; the model's width is carried beside it.
+void test_padded_mlp_widths() {
     const Small s;
-    write(kPath, s);
     json c = config_of(s);
     c["vision_config"]["MINICPM_V_VISION_MLP_INTERMEDIATE_SIZE"] = 30;
     c["vision_config"]["MINICPM_V_VIT_MERGER_INTERMEDIATE_SIZE"] = 60;
+    const auto pad_all = [&](json& t, std::vector<uint8_t>& p) {
+        zero_mlp_tail(t, p, "model.visual.blocks.0.mlp", 30);
+        zero_mlp_tail(t, p, "model.visual.blocks.1.mlp", 30);
+        zero_mlp_tail(t, p, "model.visual.vit_merger.mlp", 60);
+    };
+    write(kPath, s, pad_all);
     try {
         const vis::Pack p(kPath, c.dump());
-        check(p.geometry().intermediate == 32 && p.geometry().vit_merger_intermediate == 64,
-              "stale config: both widths are the tensors', not the config's");
-        check(p.notes().size() == 2, "stale config: one note per overruled field");
+        const vis::Geometry& g = p.geometry();
+        check(g.intermediate == 32 && g.vit_merger_intermediate == 64, "padded MLP: both stored widths are the tensors'");
+        check(g.model_intermediate == 30 && g.model_vit_merger_intermediate == 60,
+              "padded MLP: the model's widths are the config's, because every row past them is zero");
+        check(p.notes().size() == 2, "padded MLP: one note per padded width");
         const std::string all = p.notes().size() == 2 ? p.notes()[0] + p.notes()[1] : "";
-        check(all.find("VISION_MLP_INTERMEDIATE_SIZE 30") != std::string::npos && all.find("32 rows") != std::string::npos,
-              "stale config: the note states the config's value and the tensor's");
-        check(all.find("VIT_MERGER_INTERMEDIATE_SIZE 60") != std::string::npos && all.find("64 rows") != std::string::npos,
-              "stale config: and the same for the vit_merger");
+        check(all.find("VISION_MLP_INTERMEDIATE_SIZE 30") != std::string::npos && all.find("32 rows, the last 2 all zero") != std::string::npos,
+              "padded MLP: the note states the config's value, the tensor's, and that the difference is zero rows");
+        check(all.find("VIT_MERGER_INTERMEDIATE_SIZE 60") != std::string::npos && all.find("64 rows, the last 4 all zero") != std::string::npos,
+              "padded MLP: and the same for the vit_merger");
     } catch (const std::exception& e) {
-        check(false, std::string("a config stale about an MLP width still loads (threw: ") + e.what() + ")");
+        check(false, std::string("a container that pads its MLPs loads (threw: ") + e.what() + ")");
     }
+    // one nonzero value past the stated width, in ONE block's fc2: that is not padding, and it is said so
+    write(kPath, s, [&](json& t, std::vector<uint8_t>& p) {
+        pad_all(t, p);
+        const uint64_t off = t["model.visual.blocks.1.mlp.linear_fc2.weight"]["data_offsets"][0];
+        const uint64_t e = uint64_t(7) * 32 + 31;  // last row, last column
+        p[off + 2 * e + 1] = 0x3f;                  // bf16 high byte: a nonzero value
+    });
+    try {
+        const vis::Pack p(kPath, c.dump());
+        check(p.geometry().model_intermediate == 32, "not padding: one nonzero value past the stated width keeps the tensor's width");
+        check(p.geometry().model_vit_merger_intermediate == 60, "not padding: the vit_merger, still zero past 60, keeps the config's");
+        const std::string all = p.notes().size() == 2 ? p.notes()[0] + p.notes()[1] : "";
+        check(all.find("are not zero: this is not padding") != std::string::npos, "not padding: the note says so");
+    } catch (const std::exception& e) {
+        check(false, std::string("a config narrower than nonzero tensors still loads (threw: ") + e.what() + ")");
+    }
+    // without a config the model's widths are the stored ones
+    try {
+        const vis::Pack p(kPath, "");
+        check(p.geometry().model_intermediate == 32 && p.geometry().model_vit_merger_intermediate == 64,
+              "no config: the model's widths are the stored widths");
+    } catch (const std::exception& e) {
+        check(false, std::string("loads without a config (threw: ") + e.what() + ")");
+    }
+    // a config that states an MLP WIDER than its tensors cannot be padding
+    json wide = config_of(s);
+    wide["vision_config"]["MINICPM_V_VISION_MLP_INTERMEDIATE_SIZE"] = 40;
+    write(kPath, s);
+    refused("config: an MLP wider than its tensors", wide.dump(), {"VISION_MLP_INTERMEDIATE_SIZE 40", "only 32 rows"});
 }
 
 void test_refusals() {
@@ -366,9 +421,11 @@ void test_published_pack(const std::string& dir) {
         check(g.hidden == 1152 && g.heads == 16 && g.head_dim == 72 && g.layers == 27, "published pack: 27 blocks at 1152, 16 x 72");
         check(g.patch == 14 && g.channels == 3 && g.pos_rows == 4900 && g.grid == 70 && g.image_size == 980,
               "published pack: 14-pixel patches on a 70 x 70 grid (980)");
-        check(g.intermediate == 4608 && g.vit_merger_intermediate == 17280, "published pack: MLP 4608 and 17280, from the tensors");
+        check(g.intermediate == 4608 && g.vit_merger_intermediate == 17280, "published pack: MLPs stored 4608 and 17280 wide");
+        check(g.model_intermediate == 4304 && g.model_vit_merger_intermediate == 17216,
+              "published pack: the model's MLP widths are 4304 and 17216, the rest verified zero in all 27 blocks");
         check(g.merge_hidden == 4608, "published pack: mergers at 4 x 1152");
-        check(p.notes().size() == 2, "published pack: the two stale config widths are noted, not obeyed");
+        check(p.notes().size() == 2, "published pack: both padded widths are noted");
         // The 1B pack's container names its source; the 35B-A3B's carries no __metadata__ at all. Both are accepted,
         // and a source hash that is present has to look like one.
         const std::string sha = p.metadata("source_sha256");
@@ -387,7 +444,7 @@ void test_published_pack(const std::string& dir) {
 
 int main() {
     test_loads();
-    test_stale_config_widths();
+    test_padded_mlp_widths();
     test_refusals();
     test_pack_dir_name();
     std::remove(kPath);

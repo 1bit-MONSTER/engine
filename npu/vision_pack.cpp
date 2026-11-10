@@ -250,6 +250,8 @@ void Pack::open(const std::string& container_path, const std::string& config_jso
         if (!want.count(name)) fail("holds " + name + " " + shape_text(t.shape) + ", a tensor this reader has no place for");
 
     // ── config.json: what the tensors cannot say, and what ties the tower to something outside it ──
+    geom_.model_intermediate = geom_.intermediate;
+    geom_.model_vit_merger_intermediate = geom_.vit_merger_intermediate;
     if (config_json.empty()) return;
     const json c = json::parse(config_json, nullptr, false);
     if (c.is_discarded() || !c.is_object()) fail("the config beside it is not a JSON object");
@@ -297,14 +299,54 @@ void Pack::open(const std::string& container_path, const std::string& config_jso
         fail("config.json states the text model's hidden_size " + std::to_string(c["hidden_size"].get<int64_t>()) +
              " but the merger projects to " + std::to_string(geom_.out_hidden) + ": this tower is not this text model's");
 
-    const auto note = [&](const char* key, int held, const char* tensor) {
-        int stated = 0;
-        if (field(key, &stated) && stated != held)
-            notes_.push_back("config.json states MINICPM_V_" + std::string(key) + " " + std::to_string(stated) + "; " + tensor +
-                             " has " + std::to_string(held) + " rows, and the tensor is what is used");
+    // An MLP's stated width against its tensors. `stems` are the MLPs that share the width (every block, or the
+    // vit_merger alone): fc1 is [width, in] with a [width] bias, fc2 is [out, width].
+    const auto zero_from = [&](const std::string& name, int64_t rows, int64_t cols, int64_t from, bool by_row) {
+        const Tensor& t = tensors_.at(kPrefix + name);
+        const auto is_zero = [&](int64_t i) {
+            uint16_t h;
+            std::memcpy(&h, t.data + 2 * i, 2);
+            return (h & 0x7fff) == 0;
+        };
+        if (by_row) {
+            for (int64_t i = from * cols; i < rows * cols; ++i)
+                if (!is_zero(i)) return false;
+        } else {
+            for (int64_t r = 0; r < rows; ++r)
+                for (int64_t c = from; c < cols; ++c)
+                    if (!is_zero(r * cols + c)) return false;
+        }
+        return true;
     };
-    note("VISION_MLP_INTERMEDIATE_SIZE", geom_.intermediate, "model.visual.blocks.*.mlp.linear_fc1.weight");
-    note("VIT_MERGER_INTERMEDIATE_SIZE", geom_.vit_merger_intermediate, "model.visual.vit_merger.mlp.linear_fc1.weight");
+    const auto mlp_width = [&](const char* key, int held, const std::vector<std::string>& stems, int64_t in, int64_t out,
+                               const char* tensor, int* model) {
+        int stated = 0;
+        *model = held;
+        if (!field(key, &stated) || stated == held) return;
+        if (stated > held)
+            refuse(key, stated, std::string(tensor) + " has only " + std::to_string(held) + " rows");
+        bool pad = true;
+        for (const std::string& st : stems)
+            pad = pad && zero_from(st + ".linear_fc1.weight", held, in, stated, true) &&
+                  zero_from(st + ".linear_fc1.bias", held, 1, stated, true) &&
+                  zero_from(st + ".linear_fc2.weight", out, held, stated, false);
+        const std::string head = "config.json states MINICPM_V_" + std::string(key) + " " + std::to_string(stated) + "; " + tensor +
+                                 " has " + std::to_string(held) + " rows";
+        if (pad) {
+            *model = stated;
+            notes_.push_back(head + ", the last " + std::to_string(held - stated) +
+                             " all zero: the container pads the model's width, and sizes come from the tensor");
+        } else {
+            notes_.push_back(head + " and the rows past the stated width are not zero: this is not padding, the tensor's "
+                                    "width is the model's");
+        }
+    };
+    std::vector<std::string> block_mlps;
+    for (int i = 0; i < geom_.layers; ++i) block_mlps.push_back("blocks." + std::to_string(i) + ".mlp");
+    mlp_width("VISION_MLP_INTERMEDIATE_SIZE", geom_.intermediate, block_mlps, H, H,
+              "model.visual.blocks.*.mlp.linear_fc1.weight", &geom_.model_intermediate);
+    mlp_width("VIT_MERGER_INTERMEDIATE_SIZE", geom_.vit_merger_intermediate, {"vit_merger.mlp"}, M, H,
+              "model.visual.vit_merger.mlp.linear_fc1.weight", &geom_.model_vit_merger_intermediate);
 }
 
 const Tensor& Pack::tensor(const std::string& name) const {
@@ -338,8 +380,10 @@ int print_info(const std::string& pack_dir) {
                 (unsigned long long)p.payload_bytes(), (unsigned long long)p.unaccounted_bytes());
     std::printf("patch embed       %d x %d pixels x %d channels -> %d\n", g.patch, g.patch, g.channels, g.hidden);
     std::printf("positions         %d (a %d x %d grid; image %d)\n", g.pos_rows, g.grid, g.grid, g.grid * g.patch);
-    std::printf("blocks            %d at width %d, %d heads x %d, MLP %d\n", g.layers, g.hidden, g.heads, g.head_dim, g.intermediate);
-    std::printf("vit_merger        attention at %d, MLP %d -> %d -> %d\n", g.hidden, g.merge_hidden, g.vit_merger_intermediate, g.hidden);
+    std::printf("blocks            %d at width %d, %d heads x %d, MLP %d (%d stored)\n", g.layers, g.hidden, g.heads, g.head_dim,
+                g.model_intermediate, g.intermediate);
+    std::printf("vit_merger        attention at %d, MLP %d -> %d (%d stored) -> %d\n", g.hidden, g.merge_hidden,
+                g.model_vit_merger_intermediate, g.vit_merger_intermediate, g.hidden);
     std::printf("merger            %d -> %d -> %d (the text model's hidden size)\n", g.merge_hidden, g.merge_hidden, g.out_hidden);
     for (const char* k : {"source_file", "source_sha256", "source_dtype", "converter"})
         if (!p.metadata(k).empty()) std::printf("%-17s %s\n", k, p.metadata(k).c_str());

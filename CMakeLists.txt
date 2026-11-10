@@ -346,6 +346,12 @@ add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runner
 # resumed like a thermal stop, and the stopped compile (or GPU step) is really gone. A fake root with a stub
 # cmake, a stub thermal-run and a fake meminfo: no GPU, no compiler, runs in CI.
 add_test(NAME hw_gate_mem COMMAND bash ${CMAKE_SOURCE_DIR}/tests/hw_gate_mem_test.sh ${CMAKE_SOURCE_DIR})
+# engine #1750: the carried amdxdna series applies in order to the pinned driver, and the context-restart code it
+# produces fails a context's jobs (and logs it) when the restart fails, instead of leaving them parked or running
+# them at close on a half-built firmware context. The driver's own functions in a user-space harness: no NPU, no
+# kernel headers. Skips (77) where the driver source is not checked out (third_party/xdna-driver or ONEBIT_XDNA_SRC).
+add_test(NAME amdxdna_restart COMMAND bash ${CMAKE_SOURCE_DIR}/tests/amdxdna_restart_test.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(amdxdna_restart PROPERTIES SKIP_RETURN_CODE 77)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.

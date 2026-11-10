@@ -1418,16 +1418,14 @@ void test_final_norm_envelope(const std::string& root) {
     // key being absent. Without this pair, the regression #1793 fixed (a report printing `declares q4nx_weight_layout
     // "b8"` while the writer omitted the key) can return silently: nothing else asserts the writer's half.
     {
-        const auto header_of = [](const std::string& file) -> json {
+        // the key lives in the container's config.json (`c["q4nx_weight_layout"]`, pack_import.cpp:3385), NOT in the
+        // model.q4nx header -- reading the header is what my first version of this arm did, and CI caught it: the
+        // negative passed trivially and the positive found nothing.
+        const auto config_of = [](const std::string& file) -> json {
             std::ifstream cf(file, std::ios::binary);
-            uint64_t hlen = 0;
-            cf.read(reinterpret_cast<char*>(&hlen), 8);
-            std::string hdr(size_t(hlen), '\0');
-            cf.read(hdr.data(), std::streamsize(hlen));
-            while (!hdr.empty() && (hdr.back() == ' ' || hdr.back() == '\0')) hdr.pop_back();
-            return json::parse(hdr);
+            return json::parse(cf);
         };
-        const auto default_doc = header_of(out + "/model.q4nx");
+        const auto default_doc = config_of(out + "/config.json");
         check(!default_doc.contains("q4nx_weight_layout"),
               "weight layout: a default-layout container carries no q4nx_weight_layout (the key is only for a non-default one)");
         const std::string out_b8 = out + "_b8";
@@ -1444,7 +1442,7 @@ void test_final_norm_envelope(const std::string& root) {
         }
         check(!threw_b8, "weight layout: a b8 import completes on a pack the default layout imports");
         if (fs::exists(out_b8 + "/model.q4nx")) {
-            const auto b8_doc = header_of(out_b8 + "/model.q4nx");
+            const auto b8_doc = config_of(out_b8 + "/config.json");
             check(b8_doc.contains("q4nx_weight_layout") && b8_doc["q4nx_weight_layout"].is_string() &&
                       b8_doc["q4nx_weight_layout"].get<std::string>() == "b8",
                   "weight layout: --weight-layout b8 writes q4nx_weight_layout=\"b8\" into the container it builds");

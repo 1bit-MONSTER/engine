@@ -269,6 +269,11 @@ include(cmake/tests-gpu-hold.cmake)
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
 add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.sh)
+# engine#1864: the Python add_tests below run `${Python3_EXECUTABLE} <script>`, and before this line the interpreter was
+# first looked up ~480 lines further down -- so for the nine registered above that point the variable was empty, ctest
+# executed the script itself, and a test ran only while its file kept mode 100755 (#1845's hrx_build_scope went
+# "Not Run" over a mode change alone). Found here, once, for all of them; the later call is a no-op re-find.
+find_package(Python3 COMPONENTS Interpreter)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the

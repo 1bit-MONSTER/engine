@@ -1336,6 +1336,11 @@ add_test(NAME quant_i8_row COMMAND quant_i8_row_test)
 add_executable(attn_math_test tests/attn_math_test.cpp)
 target_include_directories(attn_math_test PRIVATE npu/forward/include)
 add_test(NAME attn_math COMMAND attn_math_test)
+# engine#1990: the test also holds rows_context() (M rows in one thread team) to the per-row form bit for bit,
+# and that comparison is only about threads when the test has them.
+if(TARGET OpenMP::OpenMP_CXX)
+    target_link_libraries(attn_math_test PRIVATE OpenMP::OpenMP_CXX)
+endif()
 # ci.yml's build step names its targets explicitly and needs the `workflow` scope to extend, so bind each new
 # test binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add these to the list itself. `host_gemm_pad_test` is here for the

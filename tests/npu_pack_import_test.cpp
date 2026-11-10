@@ -532,6 +532,47 @@ void test_external_packed_genre(const std::string& root) {
                   "placeholder with no sibling: the matmul is KEPT, so the pack is not mistaken for a tail-head pack");
     }
 
+    // Which `If` branch is decode (engine#1740). An OGA pack splits prefill from decode with
+    // `If (Equal(Shape(input_ids), Constant(value_int 1)))`, and the two branches do NOT hold the same tensors: measured
+    // on amd/Qwen3-8B_rai_1.9.0_npu, `then_branch` holds exactly one MatMulNBits -- lm_head [151936,32,64] with real
+    // bytes -- while `else_branch` holds 109 layer projections and an `lm_head.MatMulNBits.qweight.empty` placeholder
+    // with none. The Token .fconst is the decode path, so a walk that merges the branches counts the prefill
+    // placeholder as "this pack has no head", falls back to the tail, and refuses (these packs' tails are the 8,256-byte
+    // envelope alone). The arm pins the reading of the condition, both ways round.
+    {
+        const auto graph_with_cond = [&](bool one_token_when_true, const std::string& head_branch) {
+            std::string named;
+            pb::str(named, 4, "Constant");
+            std::string a;
+            pb::str(a, 1, "value_int");
+            pb::ints(a, 3, one_token_when_true ? 1 : 2);
+            pb::tag(named, 5, 2);
+            pb::varint(named, a.size());
+            named += a;
+            // A pack this fixture can actually plan: it needs its own embedding tensor in the graph, exactly as the
+            // write_graph lambda above gives it.
+            const std::string emb = pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
+                                               uint64_t(embed_bytes));
+            const std::string head = pb::matmulnbits("lm_head", {"x", "w", "w.scales", "w.zeros"}, K, N, 4, 128);
+            const std::string prefill = pb::graph({emb}, {head});
+            const std::string decode = pb::graph({emb}, {head});
+            return pb::model({}, {named, pb::if_node("c", "input_ids", "logits", head_branch, decode),
+                                  pb::if_node("c2", "input_ids", "logits",
+                                              head_branch == "then_branch" ? "else_branch" : "then_branch", prefill)});
+        };
+        // The graph this pack imports is the one genai_config.json names (eager-mm.onnx); a crafted model.onnx beside
+        // it is not read at all, which is why the first version of this arm measured the fixture's own graph.
+        put_file((dir / "eager-mm.onnx").string(), graph_with_cond(/*one_token_when_true=*/true, "then_branch"));
+        const json d1 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
+        check(d1.contains("decode_branch") && d1["decode_branch"].get<std::string>() == "then_branch",
+              "decode branch: a condition comparing the shape with 1 makes then_branch the decode path");
+        put_file((dir / "eager-mm.onnx").string(), graph_with_cond(/*one_token_when_true=*/false, "else_branch"));
+        const json d2 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
+        check(d2["decode_branch"].get<std::string>() == "else_branch",
+              "decode branch: an inverted condition moves the decode path to else_branch");
+        write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N);
+    }
+
     // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
     write_data(stride * N - 68);
     write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N - 68);
@@ -1960,7 +2001,25 @@ void test_block32_tail_head(const std::string& root) {
     check(std::fabs(ncorr(emb, other)) < 0.3,
           "block-32 tail: the fixture's two heads are unrelated (corr " + std::to_string(ncorr(emb, other)) + ")");
 
-    const auto build = [&](bool tied, const char* tag, const std::string& tail_after_env) {
+    // A Ryzen AI fused MLP node as the 1.9 graphs spell it: op SSMLP, the gate/up/down shapes as int attributes, and
+    // NO weight tensor (the weights are in the .fconst). Every 1.9 pack measured carries one per layer.
+    const auto ssmlp_node = [&]() {
+        std::string n;
+        pb::str(n, 1, "/model/layers.0/x");
+        pb::str(n, 4, "SSMLP");
+        const std::pair<const char*, int64_t> attrs[] = {{"gate_K", 128}, {"gate_N", 256}, {"up_K", 128},
+                                                         {"up_N", 256},   {"down_K", 256}, {"down_N", 128}};
+        for (const auto& [name, value] : attrs) {
+            std::string a;
+            pb::str(a, 1, name);
+            pb::ints(a, 3, value);
+            pb::tag(n, 5, 2);
+            pb::varint(n, a.size());
+            n += a;
+        }
+        return n;
+    };
+    const auto build = [&](bool tied, const char* tag, const std::string& tail_after_env, bool fused_mlp = false) {
         const fs::path dir = fs::path(root) / tag;
         fs::remove_all(dir);
         fs::create_directories(dir / "cache");
@@ -2005,7 +2064,7 @@ void test_block32_tail_head(const std::string& root) {
                             pb::placeholder("lm_head.weight.MatMulNBits.qweight"),
                             pb::placeholder("lm_head.weight.MatMulNBits.scales"),
                             pb::placeholder("lm_head.weight.MatMulNBits.zeros")},
-                           {}));
+                           fused_mlp ? std::vector<std::string>{ssmlp_node()} : std::vector<std::string>{}));
         return dir;
     };
     struct Run {
@@ -2083,6 +2142,22 @@ void test_block32_tail_head(const std::string& root) {
               "block-32 tail, tied: the container's head is the embedding (corr " +
                   std::to_string(x.head.empty() ? 0.0 : ncorr(x.head, emb)) + ")");
     }
+    {   // arm 2b: the same pack with a fused-MLP node in its graph, as every real 1.9 pack has. The node names no weight,
+        // so it must not make the graph look like it carries quantised matmuls: that is the switch for "the head is in
+        // the .fconst tail", and with it off the import wrote a container with no lm_head at all and exit 0
+        // (measured on Qwen-2.5 1.5B 1.9 with the SSMLP attributes counted as graph matmuls: 338 tensors, not 339).
+        const Run x = run(build(true, "b32-tied-ssmlp", encode_block32_units(emb, V, H), true), "ssmlp");
+        check(x.said.empty(), "block-32 tail, fused MLP in the graph: imports (" + x.said.substr(0, 160) + ")");
+        check(x.has_head && !x.head.empty() && ncorr(x.head, emb) > 0.99,
+              "block-32 tail, fused MLP in the graph: the container still carries the head read from the tail");
+        check(x.r.selfcheck_tied && x.r.head_read_note.find("reproduces") != std::string::npos,
+              "block-32 tail, fused MLP in the graph: the tied self-check still runs (" + x.r.head_read_note + ")");
+        const fs::path plan_dir = build(true, "b32-tied-ssmlp-plan", encode_block32_units(emb, V, H), true);
+        const json g = json::parse(pi::plan(plan_dir.string()).manifest());
+        fs::remove_all(plan_dir);
+        check(g.value("graph_weights", json::object()).value("matmulnbits_ops", int64_t(-1)) == 0,
+              "block-32 tail, fused MLP in the graph: SSMLP attributes are not counted as graph matmuls");
+    }
     {   // arm 3: TIED, but the tail's head is some other matrix -> the read is NOT taken, the synthesis stands, says why
         const Run x = run(build(true, "b32-tied-mismatch", encode_block32_units(other, V, H)), "mismatch");
         check(x.r.head_read_note.empty() && x.r.head_synthesized_note.find("correlates") != std::string::npos,
@@ -2153,6 +2228,508 @@ void test_block32_tail_head(const std::string& root) {
         check(!pi::read_block32_head(gap.data(), int64_t(gap.size()), 64, 64).ok,
               "block-32 reader: a non-zero byte between the zero points and the scales is refused");
         check(!pi::read_block32_head(u.data(), int64_t(u.size()), 64, 48).ok, "block-32 reader: K 48 is refused");
+    }
+}
+
+// ── engine#1503: a pack whose EVERY MatMulNBits is block 32 ────────────────────────────────────────────────────────
+// The gate/up unit, written from its description (pack_import.h, above read_block32_gate_up) and NOT through the
+// reader: 64-row units of 4,864 zero bytes + 2*(K/32) strips of 1,216 B; strip s is K block s/2 and holds 64 slots,
+// slots 0..31 = gate rows 32*(s%2)..+31, slots 32..63 = the same rows of up; code position
+// `(slot/8)*256 + c*8 + slot%8`, low nibble first; 32 B of zero-point nibbles (8) by slot; 32 zero bytes; 64 signed
+// bf16 scales by slot, `-m/8` as in encode_block32_units.
+static std::string encode_block32_gate_up(const std::vector<float>& G, const std::vector<float>& U, int rows, int K) {
+    const int kb = K / 32, units = rows / 64;
+    const size_t unit = size_t(4864 + 2 * kb * 1216);
+    std::string out(size_t(units) * unit, '\0');
+    for (int u = 0; u < units; ++u)
+        for (int s = 0; s < 2 * kb; ++s) {
+            char* sp = out.data() + size_t(u) * unit + 4864 + size_t(s) * 1216;
+            for (int slot = 0; slot < 64; ++slot) {
+                const std::vector<float>& M = slot < 32 ? G : U;
+                const float* w = M.data() + size_t(u * 64 + 32 * (s % 2) + slot % 32) * size_t(K) + size_t((s / 2) * 32);
+                float m = 0;
+                for (int c = 0; c < 32; ++c)
+                    if (std::fabs(w[c]) > std::fabs(m)) m = w[c];
+                const uint16_t bits = pi::bf16_bits_of(-m / 8.0f);
+                const uint32_t wide = uint32_t(bits) << 16;
+                float sc;
+                std::memcpy(&sc, &wide, 4);
+                sp[1088 + 2 * slot] = char(bits & 0xFF);
+                sp[1089 + 2 * slot] = char(bits >> 8);
+                sp[1024 + slot / 2] = char(uint8_t(sp[1024 + slot / 2]) | uint8_t(8 << (4 * (slot & 1))));
+                for (int c = 0; c < 32; ++c) {
+                    const int code = sc == 0 ? 8 : std::min(15, std::max(0, int(std::lround(w[c] / sc)) + 8));
+                    const int pos = (slot / 8) * 256 + c * 8 + slot % 8;
+                    sp[pos / 2] = char(uint8_t(sp[pos / 2]) | uint8_t(code << (4 * (pos & 1))));
+                }
+            }
+        }
+    return out;
+}
+
+void test_block32_layers(const std::string& root) {
+    const auto ncorr = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double num = 0, da = 0, db = 0, sa = 0, sb = 0;
+        const double n = double(a.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+            num += double(a[i]) * b[i], da += double(a[i]) * a[i], db += double(b[i]) * b[i];
+            sa += a[i], sb += b[i];
+        }
+        const double den = (n * da - sa * sa) * (n * db - sb * sb);
+        return den > 0 ? (n * num - sa * sb) / std::sqrt(den) : 0.0;
+    };
+    const auto value = [](const pi::Q4& q, int row, int col) {
+        const size_t g = size_t(row) * size_t(q.K / 32) + size_t(col / 32);
+        return double(q.codes[size_t(row) * size_t(q.K) + col]) * q.scale[g] + q.zero[g];
+    };
+    // a deterministic matrix per (seed): values in about [-2, 2], unrelated between seeds
+    const auto matrix = [](int rows, int cols, uint32_t seed) {
+        std::vector<float> m(size_t(rows) * size_t(cols));
+        uint32_t x = seed * 2654435761u + 12345u;
+        for (auto& v : m) {
+            x = x * 1664525u + 1013904223u;
+            v = float(int((x >> 8) & 0xFFFF) - 32768) / 16384.0f;
+        }
+        return m;
+    };
+
+    {   // arm 1: the unit reader with ROWS as a parameter, typed bytes (K 64: one unit is 5,120 B)
+        std::vector<uint8_t> u(2 * 5120, 0);
+        uint8_t* sp = u.data() + 5120 + 2560 + 2 * 640;   // unit 1, strip 2: K block 1, rows 0..31 of the unit
+        const uint16_t bits = pi::bf16_bits_of(-0.5f);
+        sp[576 + 2 * 20] = uint8_t(bits & 0xFF);          // row 20's scale
+        sp[577 + 2 * 20] = uint8_t(bits >> 8);
+        sp[512 + 10] = 0x05;                              // row 20's zero point: low nibble of byte 10
+        sp[(2 * 256 + 3 * 8 + 4) / 2] |= 0x09;            // row 20 (band 2, r%8 4), column 3: position 540, low nibble
+        pi::Block32Units r = pi::read_block32_units(u.data(), int64_t(u.size()), 128, 64, "q_proj", 7000);
+        check(r.ok && r.units == 2 && r.bytes == 10240 && r.q.N == 128 && r.q.K == 64 && r.q.block == 32,
+              "block-32 units: 128 rows of K 64 are two units (" + r.why + ")");
+        if (r.ok) {
+            check(value(r.q, 64 + 20, 32 + 3) == -2.0,
+                  "block-32 units: unit 1 row 20 col 35 = (9 - 5) x -0.5 (" + std::to_string(value(r.q, 84, 35)) + ")");
+            check(value(r.q, 84, 34) == 2.5, "block-32 units: its neighbour is code 0, (0 - 5) x -0.5");
+            check(r.q.scale[size_t(84) * 2 + 1] == 0.5f, "block-32 units: the stored scale is positive");
+            check(value(r.q, 20, 35) == 0.0 && value(r.q, 84, 3) == 0.0,
+                  "block-32 units: the same position in unit 0 and in K block 0 is untouched");
+        }
+        check(pi::read_block32_units(u.data(), int64_t(u.size()), 65, 64).units == 2,
+              "block-32 units: 65 rows round up to two units");
+        const pi::Block32Units one = pi::read_block32_units(u.data(), int64_t(u.size()), 64, 64);
+        check(one.ok && one.units == 1 && one.q.N == 64,
+              "block-32 units: 64 rows read one unit and nothing is required of the bytes after it");
+        const pi::Block32Units sh = pi::read_block32_units(u.data(), 10239, 128, 64, "q_proj", 7000);
+        check(!sh.ok && sh.why.find("q_proj") != std::string::npos && sh.why.find("7000") != std::string::npos,
+              "block-32 units: a buffer one byte short is refused, naming the tensor and the offset (" + sh.why + ")");
+        std::vector<uint8_t> hdr = u;
+        hdr[5120 + 9] = 1;
+        const pi::Block32Units hr = pi::read_block32_units(hdr.data(), int64_t(hdr.size()), 128, 64, "q_proj", 7000);
+        check(!hr.ok && hr.why.find("12120 B") != std::string::npos,
+              "block-32 units: a non-zero unit header is refused with the unit's offset, 7000 + 5120 (" + hr.why + ")");
+        std::vector<uint8_t> nan = u;
+        nan[2560 + 576] = 0xC0, nan[2560 + 577] = 0x7F;   // bf16 quiet NaN in unit 0, strip 0, row 0
+        check(!pi::read_block32_units(nan.data(), int64_t(nan.size()), 128, 64).ok,
+              "block-32 units: a scale that is not finite is refused");
+    }
+
+    {   // arm 2: the gate/up reader, typed bytes (K 32: one unit is 4,864 + 2 x 1,216 = 7,296 B)
+        check(pi::block32_mlp_unit_bytes(32) == 7296 && pi::block32_mlp_unit_bytes(576) == 48640,
+              "block-32 gate/up: the unit is 4,864 + 2*(K/32)*1,216 B (48,640 at K 576)");
+        std::vector<uint8_t> u(7296, 0);
+        uint8_t* sp = u.data() + 4864 + 1216;             // strip 1: K block 0, rows 32..63
+        const auto put_scale = [&](int slot, float v) {
+            const uint16_t bits = pi::bf16_bits_of(v);
+            sp[1088 + 2 * slot] = uint8_t(bits & 0xFF);
+            sp[1089 + 2 * slot] = uint8_t(bits >> 8);
+        };
+        put_scale(5, 0.5f);                               // slot 5: GATE row 32 + 5
+        put_scale(41, -0.25f);                            // slot 41: UP row 32 + 9
+        sp[1024 + 2] = 0x80;                              // slot 5's zero point (high nibble of byte 2) = 8
+        sp[1024 + 20] = 0x60;                             // slot 41's zero point (high nibble of byte 20) = 6
+        sp[(0 * 256 + 7 * 8 + 5) / 2] |= 0xB0;            // slot 5 (band 0, 5), column 7: position 61, high nibble
+        sp[(5 * 256 + 31 * 8 + 1) / 2] |= 0x30;           // slot 41 (band 5, 1), column 31: position 1529, high nibble
+        pi::Block32GateUp h = pi::read_block32_gate_up(u.data(), int64_t(u.size()), 64, 32, 900);
+        check(h.ok && h.units == 1 && h.bytes == 7296 && h.gate.N == 64 && h.up.N == 64 && h.gate.K == 32 &&
+                  h.up.block == 32,
+              "block-32 gate/up: one unit of K 32 reads (" + h.why + ")");
+        if (h.ok) {
+            check(value(h.gate, 37, 7) == 1.5,
+                  "block-32 gate/up: slot 5 is GATE row 37, (11 - 8) x 0.5 (" + std::to_string(value(h.gate, 37, 7)) + ")");
+            check(value(h.gate, 37, 6) == -4.0, "block-32 gate/up: its neighbour is code 0, (0 - 8) x 0.5");
+            check(value(h.up, 37, 7) == 0.0, "block-32 gate/up: and UP row 37 holds nothing");
+            check(value(h.up, 41, 31) == 0.75,
+                  "block-32 gate/up: slot 41 is UP row 41, a NEGATIVE scale, (3 - 6) x -0.25 (" +
+                      std::to_string(value(h.up, 41, 31)) + ")");
+            check(value(h.up, 41, 0) == 1.5, "block-32 gate/up: its code 0, (0 - 6) x -0.25");
+            check(h.up.scale[41] == 0.25f, "block-32 gate/up: the stored scale is positive");
+            check(value(h.gate, 41, 31) == 0.0 && value(h.gate, 5, 7) == 0.0,
+                  "block-32 gate/up: GATE row 41 and the other strip's row 5 hold nothing");
+        }
+        const pi::Block32GateUp sh = pi::read_block32_gate_up(u.data(), 7295, 64, 32, 900);
+        check(!sh.ok && sh.why.find("900") != std::string::npos,
+              "block-32 gate/up: a buffer one byte short is refused with the offset (" + sh.why + ")");
+        std::vector<uint8_t> hdr = u;
+        hdr[4863] = 1;
+        check(!pi::read_block32_gate_up(hdr.data(), int64_t(hdr.size()), 64, 32).ok,
+              "block-32 gate/up: a non-zero unit header is refused");
+        std::vector<uint8_t> gap = u;
+        gap[4864 + 1216 + 1056 + 31] = 1;
+        check(!pi::read_block32_gate_up(gap.data(), int64_t(gap.size()), 64, 32).ok,
+              "block-32 gate/up: a non-zero byte between the zero points and the scales is refused");
+        std::vector<uint8_t> inf = u;
+        inf[4864 + 1088 + 2 * 63] = 0x80, inf[4864 + 1089 + 2 * 63] = 0x7F;   // bf16 +inf in strip 0, slot 63
+        check(!pi::read_block32_gate_up(inf.data(), int64_t(inf.size()), 64, 32).ok,
+              "block-32 gate/up: a scale that is not finite is refused");
+        check(!pi::read_block32_gate_up(u.data(), int64_t(u.size()), 64, 48).ok, "block-32 gate/up: K 48 is refused");
+    }
+
+    {   // arm 3: the description's encoder against the reader, two unrelated matrices over two units and three K blocks
+        const int rows = 128, K = 96;
+        const std::vector<float> G = matrix(rows, K, 1), U = matrix(rows, K, 2);
+        const std::string enc = encode_block32_gate_up(G, U, rows, K);
+        const pi::Block32GateUp h =
+            pi::read_block32_gate_up(reinterpret_cast<const uint8_t*>(enc.data()), int64_t(enc.size()), rows, K);
+        check(h.ok, "block-32 gate/up: the encoded stream reads (" + h.why + ")");
+        if (h.ok) {
+            std::vector<float> g(G.size()), up(U.size());
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < K; ++c) {
+                    g[size_t(r) * K + c] = float(value(h.gate, r, c));
+                    up[size_t(r) * K + c] = float(value(h.up, r, c));
+                }
+            check(ncorr(g, G) > 0.99 && ncorr(up, U) > 0.99,
+                  "block-32 gate/up: gate and up come back (corr " + std::to_string(ncorr(g, G)) + " / " +
+                      std::to_string(ncorr(up, U)) + ")");
+            check(std::fabs(ncorr(g, U)) < 0.3 && std::fabs(ncorr(up, G)) < 0.3,
+                  "block-32 gate/up: and not swapped (corr " + std::to_string(ncorr(g, U)) + " / " +
+                      std::to_string(ncorr(up, G)) + ")");
+        }
+    }
+
+    {   // arm 4: the layer block's arithmetic at the one measured geometry (SmolLM2-135M-Instruct 1.9)
+        pi::Dims d;
+        d.hidden = 576, d.intermediate = 1536, d.layers = 30, d.heads = 9, d.kv_heads = 3, d.head_dim = 64;
+        d.vocab = 49152;
+        const pi::Block32Layout l = pi::block32_layout(d);
+        check(l.why.empty() && l.q_off == 1216 && l.k_off == 231616 && l.v_off == 308416 && l.sink_off == 385216 &&
+                  l.o_off == 385252 && l.post_off == 615652 && l.gu_off == 616868 && l.hdr_off == 1784228 &&
+                  l.down_off == 1784292 && l.stride == 2360292,
+              "block-32 layout: SmolLM2-135M's layer block, stride 2,360,292 (" + l.why + " " +
+                  std::to_string(l.stride) + ")");
+        check(l.head_off == 70809976 && l.head_units == 768 && l.min_size == 90470776,
+              "block-32 layout: its head at 70,809,976 and the file's 90,470,776 B (" + std::to_string(l.min_size) + ")");
+        d.intermediate = 1500;
+        check(pi::block32_layout(d).why.find("intermediate 1500") != std::string::npos,
+              "block-32 layout: a width that is not whole 64-row units is refused by name");
+    }
+
+    // arm 5: a crafted all-block-32 pack through import_pack(). hidden 128, intermediate 256, 2 heads x 64, 1 KV head,
+    // 2 layers, vocab 64, tied. Every matrix is its own pseudo-random one, so a tensor read from another's offset
+    // cannot correlate with what the container is compared against.
+    const int H = 128, IM = 256, LAYERS = 2, V = 64, NQ = 128, NKV = 64;
+    const int R = onebit::npu::q4nx::kRows;
+    enum { Q, K_, V_, O, G, U, D, NPROJ };
+    const char* const pname[NPROJ] = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+                                      "mlp.gate_proj",    "mlp.up_proj",      "mlp.down_proj"};
+    const int prow[NPROJ] = {NQ, NKV, NKV, H, IM, IM, H}, pcol[NPROJ] = {H, H, H, NQ, H, H, IM};
+    std::vector<std::vector<float>> mats;
+    for (int l = 0; l < LAYERS; ++l)
+        for (int i = 0; i < NPROJ; ++i) mats.push_back(matrix(prow[i], pcol[i], uint32_t(100 + l * NPROJ + i)));
+    const std::vector<float> emb = matrix(V, H, 7);
+    const auto norm_bytes = [&](int which) {   // bf16 [H], a different ramp per norm
+        std::string b(size_t(H) * 2, '\0');
+        for (int i = 0; i < H; ++i) {
+            const uint16_t bits = pi::bf16_bits_of(float(which) + float(i) / 256.0f);
+            b[2 * i] = char(bits & 0xFF), b[2 * i + 1] = char(bits >> 8);
+        }
+        return b;
+    };
+    const auto envelope = [&](int which) {
+        std::string e(64, '\0');
+        e[0] = char(0x86), e[1] = char(0x35);   // bf16 1e-06
+        return e + norm_bytes(which);
+    };
+    const auto fconst = [&] {
+        std::string fc;
+        for (int l = 0; l < LAYERS; ++l) {
+            const auto& m = [&](int i) -> const std::vector<float>& { return mats[size_t(l * NPROJ + i)]; };
+            fc += envelope(10 * l + 1);
+            fc += encode_block32_units(m(Q), NQ, H) + encode_block32_units(m(K_), NKV, H) +
+                  encode_block32_units(m(V_), NKV, H);
+            fc += std::string(4 * 2, '\x7f');   // 4 x heads bytes that are not a weight (their content is not read)
+            fc += encode_block32_units(m(O), H, NQ);
+            fc += envelope(10 * l + 2);
+            fc += encode_block32_gate_up(m(G), m(U), IM, H);
+            fc += std::string(1, '\x01') + std::string(63, '\0');
+            fc += encode_block32_units(m(D), H, IM);
+        }
+        fc += envelope(99);
+        fc += encode_block32_units(emb, V, H);
+        return fc;
+    };
+    const std::string good = fconst();
+    {
+        pi::Dims d;
+        d.hidden = H, d.intermediate = IM, d.layers = LAYERS, d.heads = 2, d.kv_heads = 1, d.head_dim = 64, d.vocab = V;
+        check(pi::block32_layout(d).min_size == int64_t(good.size()),
+              "all-block-32 fixture: the stream built from the description is the layout's size (" +
+                  std::to_string(good.size()) + ")");
+    }
+    // `layer_block` / `head_block` are what cache/ops_meta.json DECLARES; the .fconst bytes are the caller's.
+    const auto build = [&](const char* tag, const std::string& fc, bool layers_declared, int layer_block = 32,
+                           int head_block = 32) {
+        const fs::path dir = fs::path(root) / tag;
+        fs::remove_all(dir);
+        fs::create_directories(dir / "cache");
+        // the 1.9 spelling of the Token file: this path reads the raw file, and it must not be mistaken for a 1.8 one
+        put_file((dir / "dd_metastate_Llm_Token_aie2_token_crafted.fconst").string(), fc);
+        put_file((dir / "config.json").string(),
+                 R"({"model_type":"llama","hidden_size":128,"intermediate_size":256,"num_hidden_layers":2,)"
+                 R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,)"
+                 R"("rope_theta":10000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06})");
+        std::string data(size_t(V) * size_t(H) * 2, '\0');
+        for (size_t i = 0; i < emb.size(); ++i) {
+            const uint16_t bits = pi::bf16_bits_of(emb[i]);
+            data[2 * i] = char(bits & 0xFF);
+            data[2 * i + 1] = char(bits >> 8);
+        }
+        put_file((dir / "model.onnx.data").string(), data);
+        const auto op_at = [](const std::string& name, int n, int k, int block) {
+            return R"({"type":"MladfMatMul","name":")" + name + R"(.MatMulNBits","attrs":{"N":{"value":[)" +
+                   std::to_string(n) + R"(]},"K":{"value":[)" + std::to_string(k) + R"(]},"block_size":{"value":[)" +
+                   std::to_string(block) + R"(]},"bits":{"value":[4]}}})";
+        };
+        const auto op = [&](const std::string& name, int n, int k) { return op_at(name, n, k, layer_block); };
+        std::string ops = op_at("lm_head", V, H, head_block);
+        if (layers_declared)
+            for (int l = 0; l < LAYERS; ++l) {
+                const std::string a = "model.layers." + std::to_string(l) + ".attn.",
+                                  m = "model.layers." + std::to_string(l) + ".mlp.";
+                ops += "," + op(a + "q_proj", NQ, H) + "," + op(a + "k_proj", NKV, H) + "," + op(a + "v_proj", NKV, H) +
+                       "," + op(a + "o_proj", H, NQ) + "," + op(m + "down_proj", H, IM);
+            }
+        put_file((dir / "cache" / "ops_meta.json").string(), R"({"op_list":[)" + ops + R"(],"tensor_map":{}})");
+        put_file((dir / "model.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", 0,
+                                       uint64_t(V) * uint64_t(H) * 2, 16),
+                            pb::placeholder("lm_head.weight.MatMulNBits.qweight"),
+                            pb::placeholder("lm_head.weight.MatMulNBits.scales"),
+                            pb::placeholder("lm_head.weight.MatMulNBits.zeros")},
+                           {}));
+        return dir;
+    };
+    const auto out_of = [](const char* tag) {
+        return (fs::temp_directory_path() /
+                (std::string("oga_pack_import_b32layers_") + tag + "." + std::to_string(::getpid()))).string();
+    };
+    // the first `cols` columns of rows 0..R-1 of a container tensor, from its own bytes (tile 0)
+    const auto tile0 = [&](const json& tbl, const std::vector<uint8_t>& blob, const std::string& name, int cols) {
+        std::vector<float> w(size_t(R) * onebit::npu::q4nx::kCols, 0.f), out(size_t(R) * size_t(cols), 0.f);
+        if (!tbl.contains(name)) return std::vector<float>();
+        const auto offs = tbl[name]["data_offsets"].get<std::vector<uint64_t>>();
+        onebit::npu::q4nx::dequant_tile(onebit::npu::q4nx::Chunk::Q4_1F, blob.data() + offs[0], w.data(),
+                                        onebit::npu::q4nx::kCols);
+        for (int r = 0; r < R; ++r)
+            for (int c = 0; c < cols; ++c) out[size_t(r) * cols + c] = w[size_t(r) * onebit::npu::q4nx::kCols + c];
+        return out;
+    };
+    const auto head_of = [&](const std::vector<float>& m, int cols_total, int cols) {   // the same window of a source
+        std::vector<float> out(size_t(R) * size_t(cols));
+        for (int r = 0; r < R; ++r)
+            for (int c = 0; c < cols; ++c) out[size_t(r) * cols + c] = m[size_t(r) * cols_total + c];
+        return out;
+    };
+
+    {   // 5a: the pack imports, complete, and every container tensor is the matrix the description put at its offset
+        const fs::path dir = build("b32-layers", good, true);
+        const std::string out = out_of("good");
+        fs::remove_all(out);
+        pi::Report r;
+        std::string said;
+        try {
+            const pi::Plan p = pi::plan(dir.string());
+            check(p.block32_layers && p.block32_note.empty() && p.refused().empty(),
+                  "all-block-32: the plan takes the block-32 layout and refuses nothing (" + p.block32_note + ")");
+            r = pi::import_pack(dir.string(), out, pi::Options{});
+        } catch (const std::exception& e) {
+            said = e.what();
+        }
+        check(said.empty() && r.refused.empty(),
+              "all-block-32: a crafted pack imports with nothing refused (" + said +
+                  (r.refused.empty() ? "" : r.refused.front()) + ")");
+        check(r.attn_projections == 4 * LAYERS && r.mlp_projections == 3 * LAYERS && r.attn_bias_tensors == 0,
+              "all-block-32: 4 attention + 3 MLP projections per layer, no bias tensor");
+        check(r.stride == (int64_t(good.size()) - (64 + 2 * H) - pi::block32_unit_bytes(H)) / LAYERS,
+              "all-block-32: the report carries the stride (" + std::to_string(r.stride) + ")");
+        check(r.selfcheck_tied && r.lmhead_corr > 0.99 && r.head_read_note.find("block 32") != std::string::npos,
+              "all-block-32: the head is read and verified against the embedding (corr " +
+                  std::to_string(r.lmhead_corr) + ")");
+        if (fs::exists(out + "/model.q4nx")) {
+            const json tbl = container_table(out + "/model.q4nx");
+            const std::vector<uint8_t> blob = container_payload(out + "/model.q4nx");
+            for (int l = 0; l < LAYERS; ++l)
+                for (int i = 0; i < NPROJ; ++i) {
+                    const std::string name = "model.layers." + std::to_string(l) + "." + pname[i] + ".weight";
+                    const int cols = std::min(pcol[i], onebit::npu::q4nx::kCols);
+                    const std::vector<float> got = tile0(tbl, blob, name, cols);
+                    const double c = got.empty() ? 0.0 : ncorr(got, head_of(mats[size_t(l * NPROJ + i)], pcol[i], cols));
+                    check(c > 0.99, "all-block-32: container " + name + " is its own matrix (corr " +
+                                        std::to_string(c) + ")");
+                    // the control: the matrix one slot along (gate <-> up among them) must not match
+                    const int j = (i == G) ? U : (i == U) ? G : -1;
+                    if (j >= 0 && !got.empty()) {
+                        const double x = ncorr(got, head_of(mats[size_t(l * NPROJ + j)], pcol[j], cols));
+                        check(std::fabs(x) < 0.3, "all-block-32: container " + name + " is not the other MLP half "
+                                                  "(corr " + std::to_string(x) + ")");
+                    }
+                }
+            const std::vector<float> hd = tile0(tbl, blob, "lm_head.weight", H);
+            check(!hd.empty() && ncorr(hd, head_of(emb, H, H)) > 0.99, "all-block-32: container lm_head is the tail's head");
+            const auto norm_is = [&](const std::string& name, int which) {
+                if (!tbl.contains(name)) return false;
+                const auto offs = tbl[name]["data_offsets"].get<std::vector<uint64_t>>();
+                const std::string want = norm_bytes(which);
+                return offs[1] - offs[0] == want.size() && std::memcmp(blob.data() + offs[0], want.data(), want.size()) == 0;
+            };
+            check(norm_is("model.layers.0.input_layernorm.weight", 1) &&
+                      norm_is("model.layers.1.input_layernorm.weight", 11) &&
+                      norm_is("model.layers.0.post_attention_layernorm.weight", 2) &&
+                      norm_is("model.layers.1.post_attention_layernorm.weight", 12) && norm_is("model.norm.weight", 99),
+                  "all-block-32: the five norms are the envelopes' bytes");
+            check(!tbl.contains("model.layers.0.self_attn.q_proj.bias"), "all-block-32: no bias tensor is invented");
+        } else {
+            check(false, "all-block-32: the container was written");
+        }
+        fs::remove_all(out);
+        fs::remove_all(dir);
+    }
+    // what a refused import says, and that it wrote no container
+    const auto refused = [&](const char* tag, const std::string& fc) {
+        const fs::path dir = build(tag, fc, true);
+        const std::string out = out_of(tag);
+        fs::remove_all(out);
+        std::string said;
+        try {
+            const pi::Report r = pi::import_pack(dir.string(), out, pi::Options{});
+            for (const auto& w : r.refused) said += w + " | ";
+        } catch (const std::exception& e) {
+            said = e.what();
+        }
+        if (fs::exists(out + "/model.q4nx")) said = "WROTE A CONTAINER " + said;
+        fs::remove_all(out);
+        fs::remove_all(dir);
+        return said;
+    };
+    {   // 5b: a file one byte short of the layout is refused with the arithmetic
+        const std::string said = refused("b32-layers-short", good.substr(0, good.size() - 1));
+        check(said.find("WROTE") == std::string::npos && said.find("all-block-32 layout") != std::string::npos &&
+                  said.find(std::to_string(good.size())) != std::string::npos,
+              "all-block-32: a short file is refused with the size the layout needs (" + said.substr(0, 300) + ")");
+    }
+    {   // 5c: layer 1's post-attention envelope without its epsilon
+        pi::Dims d;
+        d.hidden = H, d.intermediate = IM, d.layers = LAYERS, d.heads = 2, d.kv_heads = 1, d.head_dim = 64, d.vocab = V;
+        const pi::Block32Layout l = pi::block32_layout(d);
+        std::string bad = good;
+        bad[size_t(l.stride + l.post_off)] = 0;
+        const std::string said = refused("b32-layers-eps", bad);
+        check(said.find("WROTE") == std::string::npos && said.find("no RMSNorm epsilon at " +
+                                                                   std::to_string(l.stride + l.post_off)) !=
+                                                             std::string::npos,
+              "all-block-32: a missing epsilon is refused with its offset (" + said.substr(0, 300) + ")");
+        // 5d: a non-zero byte in a gate/up unit header of layer 1 -> both halves refused by name
+        bad = good;
+        bad[size_t(l.stride + l.gu_off + pi::block32_mlp_unit_bytes(H) + 17)] = 1;
+        const std::string s2 = refused("b32-layers-gu", bad);
+        check(s2.find("WROTE") == std::string::npos &&
+                  s2.find("model.layers.1.mlp.gate_proj.weight: block-32 gate/up unit 1") != std::string::npos &&
+                  s2.find("model.layers.1.mlp.up_proj.weight") != std::string::npos &&
+                  s2.find("model.layers.0") == std::string::npos,
+              "all-block-32: a non-zero gate/up unit header refuses that layer's gate and up by name (" +
+                  s2.substr(0, 300) + ")");
+        // 5e: trailing junk after the head is the head's refusal
+        const std::string s3 = refused("b32-layers-junk", good + std::string(99, '\0') + "x");
+        check(s3.find("WROTE") == std::string::npos && s3.find("lm_head.weight") != std::string::npos &&
+                  s3.find("not zero after") != std::string::npos,
+              "all-block-32: a non-zero byte after the head refuses the head (" + s3.substr(0, 300) + ")");
+    }
+    {   // 5f: zero padding after the head is accepted (the measured mixed pack has 110 MB of it)
+        const fs::path dir = build("b32-layers-pad", good + std::string(5000, '\0'), true);
+        const std::string out = out_of("pad");
+        fs::remove_all(out);
+        std::string said;
+        try {
+            const pi::Report r = pi::import_pack(dir.string(), out, pi::Options{});
+            for (const auto& w : r.refused) said += w + " | ";
+        } catch (const std::exception& e) {
+            said = e.what();
+        }
+        check(said.empty() && fs::exists(out + "/model.q4nx"), "all-block-32: zero padding after the head imports (" +
+                                                                   said.substr(0, 200) + ")");
+        fs::remove_all(out);
+        fs::remove_all(dir);
+    }
+    {   // 5g: the same pack declaring ONLY its head at block 32 is not this class (it is the mixed pack's path)
+        const fs::path dir = build("b32-layers-headonly", good, false);
+        bool block32 = true;
+        try {
+            block32 = pi::plan(dir.string()).block32_layers;
+        } catch (const std::exception&) {
+            block32 = false;
+        }
+        check(!block32, "all-block-32: a pack that declares only lm_head at block 32 does not take the all-block-32 path");
+        fs::remove_all(dir);
+    }
+    // 5h..5k: the path is chosen by what the pack DECLARES, one arm per declaration. The bytes are the same good
+    // all-block-32 file every time, so the only thing that changes is cache/ops_meta.json -- and a declaration this
+    // importer has no layout for must be refused with its number, never read at 32 or at 128 by default.
+    const auto declared_as = [&](const char* tag, int layer_block, int head_block) {
+        const fs::path dir = build(tag, good, true, layer_block, head_block);
+        const std::string out = out_of(tag);
+        fs::remove_all(out);
+        std::string said;
+        bool block32 = false;
+        try {
+            block32 = pi::plan(dir.string()).block32_layers;
+            const pi::Report r = pi::import_pack(dir.string(), out, pi::Options{});
+            for (const auto& w : r.refused) said += w + " | ";
+        } catch (const std::exception& e) {
+            said = e.what();
+        }
+        if (block32) said = "TOOK THE ALL-BLOCK-32 PATH " + said;
+        if (fs::exists(out + "/model.q4nx")) said = "WROTE A CONTAINER " + said;
+        fs::remove_all(out);
+        fs::remove_all(dir);
+        return said;
+    };
+    for (const int b : {3, 64, 256}) {   // 5h: every op at a block nobody has measured
+        const std::string said = declared_as(("b32-layers-all" + std::to_string(b)).c_str(), b, b);
+        check(said.find("WROTE") == std::string::npos && said.find("TOOK") == std::string::npos &&
+                  said.find("block size along K is " + std::to_string(b) + " (11 ops)") != std::string::npos &&
+                  said.find("lm_head @ " + std::to_string(b)) != std::string::npos,
+              "block declaration: every op at " + std::to_string(b) + " is refused with that number (" +
+                  said.substr(0, 200) + ")");
+    }
+    {   // 5i: layers at 32 under a block-128 head is not the all-block-32 class, and is refused by tensor
+        const std::string said = declared_as("b32-layers-head128", 32, 128);
+        check(said.find("WROTE") == std::string::npos && said.find("TOOK") == std::string::npos &&
+                  said.find("128 (1 ops)") != std::string::npos && said.find("32 (10 ops)") != std::string::npos &&
+                  said.find("lm_head @") == std::string::npos,
+              "block declaration: layers at 32 with the head at 128 is refused, naming the layers (" +
+                  said.substr(0, 260) + ")");
+    }
+    {   // 5j: layers at 32 with the head at 64 -- one unmeasured op is enough to leave the class
+        const std::string said = declared_as("b32-layers-head64", 32, 64);
+        check(said.find("WROTE") == std::string::npos && said.find("TOOK") == std::string::npos &&
+                  said.find("64 (1 ops)") != std::string::npos,
+              "block declaration: layers at 32 with the head at 64 is refused (" + said.substr(0, 260) + ")");
+    }
+    {   // 5k: the same ops all declared at 128 stay on the block-128 walk (which then refuses THESE bytes, because
+        // they are a block-32 file: the point is that the declaration, not a default, picked the path)
+        const std::string said = declared_as("b32-layers-all128", 128, 128);
+        check(said.find("WROTE") == std::string::npos && said.find("TOOK") == std::string::npos &&
+                  said.find("block size along K") == std::string::npos && !said.empty(),
+              "block declaration: every op at 128 does not take the all-block-32 path or the block gate (" +
+                  said.substr(0, 260) + ")");
     }
 }
 
@@ -2402,8 +2979,16 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
         }
         check(attributed, "pack: each runtime-refused tensor is marked imported=false in the manifest");
     }
-    check(r.lmhead_corr > 0.999, "pack: the decode reproduces the fp16 embedding (corr " +
-                                     std::to_string(r.lmhead_corr) + ")");
+    // Only a TIED pack can be checked this way: there lm_head IS the embedding, so correlating them measures the decoder.
+    // An untied pack's lm_head is a separate matrix and the number is meaningless by construction (Qwen3-8B: 0.0043 on a
+    // head that decodes correctly -- std 0.026, plausible per-row scale, weakly correlated rows). Asserting 0.999
+    // unconditionally demanded every pack be tied, which no untied pack can satisfy.
+    if (r.selfcheck_tied)
+        check(r.lmhead_corr > 0.999, "pack: the decode reproduces the fp16 embedding, tied (corr " +
+                                         std::to_string(r.lmhead_corr) + ")");
+    else
+        check(true, "pack: untied, so the embedding correlation is not a decoder check (corr " +
+                        std::to_string(r.lmhead_corr) + ")");
     check(r.ctrl_corr_nibble < 0.5 && r.ctrl_corr_nozp < 0.95,
           "pack: both wrong decoders are rejected as controls");
     // engine#1185: an imported container carries fp32 scale/zero (layout q4nx-2, npu/q4nx.h
@@ -3393,6 +3978,7 @@ void test_fconst19_rule_table() {
             {3584, 28, 28, 7232, 8, 1, 1009664},     // the Qwen2.5-7B family, measured on two models
             {2048, 16, 36, 4160, 9, 1, 295936},      // Qwen2.5_3B_Instruct
             {4096, 32, 32, 12608, 5, 1, 2297856},    // Mistral-7B-Instruct-v0.2
+            {4096, 32, 36, 12608, 5, 1, 2297856},    // Qwen3-8B (measured against ..._rai_1.8.0_npu_16K)
             {3072, 24, 28, 10560, 4, 1, 1740800},    // Llama-3.2-3B (and -Instruct)
         };
         const int want_n = (int)(sizeof(want) / sizeof(want[0]));
@@ -4758,6 +5344,42 @@ void test_encode_tile_code_range() {
     std::printf("  encode tile: 6 arms (0 and 15 encode, 16 refuses by name)\n");
 }
 
+// engine#1921 follow-up: the container writer (tile_q4_1 / tile_q4_1_f32) packs with the same `& 0x0F` as
+// encode_tile(), and it is the writer engine#1918's wrap was measured on. Both tile forms refuse a code above 15 by
+// position, and the legal extremes still write: a guard that refused everything would pass a throw-only arm.
+void test_q4_writer_code_range() {
+    auto make = [](uint8_t code_at_last) {
+        pi::Q4 q;
+        q.N = 32; q.K = 256; q.block = 32;
+        q.codes.assign(size_t(q.N) * q.K, 0);
+        q.scale.assign(size_t(q.N) * (q.K / 32), 1.0f);
+        q.zero.assign(size_t(q.N) * (q.K / 32), 0.0f);
+        q.codes[0] = 15;                              // the top of the range, legal
+        q.codes[size_t(31) * q.K + 255] = code_at_last;
+        return q;
+    };
+    for (int f32 = 0; f32 < 2; ++f32) {
+        const char* form = f32 ? "q4_1f" : "q4_1";
+        auto run = [&](const pi::Q4& q, std::vector<uint8_t>& out) {
+            if (f32) pi::tile_q4_1_f32(q, out); else pi::tile_q4_1(q, out);
+        };
+        std::vector<uint8_t> out;
+        bool ok = false;
+        try { run(make(15), out); ok = !out.empty(); } catch (const std::exception&) {}
+        check(ok, std::string("q4 writer (") + form + "): codes 0 and 15 write a tile");
+        std::string why;
+        std::vector<uint8_t> out2;
+        try { run(make(16), out2); } catch (const std::exception& e) { why = e.what(); }
+        check(!why.empty(), std::string("q4 writer (") + form + "): code 16 is REFUSED, not wrapped to 0");
+        check(why.find("row 31, column 255") != std::string::npos,
+              std::string("q4 writer (") + form + "): the refusal names the row and column");
+        check(why.find("0..15") != std::string::npos && why.find("wrap") != std::string::npos,
+              std::string("q4 writer (") + form + "): and states the range and what would have happened");
+        check(out2.empty(), std::string("q4 writer (") + form + "): nothing is written before the refusal");
+    }
+    std::printf("  q4 writer: 10 arms (both tile forms: 15 writes, 16 refuses by row and column)\n");
+}
+
 // engine#1889: the arithmetic that claims the per-head QK gains out of the 640 B Hunyuan-7B carries between its last qkv
 // tile and o_proj. A wrong offset there reads tile bytes as bf16 and mis-rotates every pack of the family, so both the
 // right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
@@ -4821,6 +5443,7 @@ int main(int argc, char** argv) {
     } scratch_cleanup{run_scratch};
     test_header_witness_refusal();
     test_encode_tile_code_range();
+    test_q4_writer_code_range();
     test_qk_norm_refusal();
     test_qk_gain_offsets();
     test_tail_head_placement();
@@ -4880,6 +5503,7 @@ int main(int argc, char** argv) {
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_tied_block32_head(golden_dir.empty() ? "." : golden_dir);
         test_block32_tail_head(golden_dir.empty() ? "." : golden_dir);
+        test_block32_layers(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         test_import_fp32_params(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);

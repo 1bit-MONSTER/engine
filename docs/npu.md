@@ -586,21 +586,22 @@ every row's position-local half runs first (its q, and its k/v appended to the c
 one statically scheduled loop in one team. A causal row reads only positions up to its own, so the later rows already
 being in the cache changes nothing it reads.
 
-Measured on `bonsai2-27b-t2s2` (2026-11-10, one `npu-hold` ticket, one binary, `NPU_ATTN_ROWS=0` against the default,
-arms A B B A, 103 blocks per arm, `amdxdna` error count unchanged):
+Measured on `bonsai2-27b-t2s2` (2026-11-10, `npu-hold` tickets, one binary, `NPU_ATTN_ROWS=0` against the default,
+103 blocks per arm, `amdxdna` error count unchanged). **What it buys is the attention term and its behaviour under
+load, not a block-wall gain that can be resolved on a quiet box:**
 
-| 16-row block | per-row teams | one team |
-|---|---:|---:|
-| attention, mean / p90 / max | 31.2 / 43.3 / 53.9 ms | **14.3 / 20.5 / 30.1 ms** |
-| block wall, median | 675.7 ms | **658.4 ms** |
-| rows/s from the block median | 23.68 | **24.30** |
-| TTFT, three 510-536-token prompts | 23.0-23.4 tok/s | 23.8-23.9 tok/s |
+| ticket, arms in order | attention per block, mean (per-row -> one team) | block wall median |
+|---|---|---|
+| first: A B (quiet) | 31.2 -> **14.3 ms** | 675.7 -> 658.4 ms |
+| second: A B A B (quiet) | 24.5 -> **13.0**, 26.6 -> **13.1 ms** | 609.3 -> 613.1, 626.3 -> 601.9 ms |
+| first, later arms: B then A, another lane's load on the box | **16.0** vs 98.1 ms | 674.5 vs 834.4 ms |
 
-That is the first A and the first B, which ran on a quiet box. Another lane's load arrived during the second pair, and
-it is reported separately because it is a different condition, not a repeat: the one-team arm held 13.6 ms median
-attention with no block over 100 ms, while the per-row arm that followed measured 56.2 ms median with 36 of 103 blocks
-over 100 ms. So the effect on a quiet box is about 17 ms of a 676 ms block (2.6 %), and the per-row form is the one
-that degrades under load.
+The attention term halves in every pair. The block wall does not follow it reliably: the first pair moved by 17 ms,
+the two pairs of the second ticket by +4 and -24 ms, which is the arm-to-arm scatter of this box (about 15 ms on a
+600 ms block) and not a measured 2-3 %. The first version of this section quoted the first pair as a 2.6 % gain; the
+second ticket is why it no longer does. Under load the picture is different and is one observation, not a repeat: the
+per-row arm measured 56.2 ms median attention with 36 of 103 blocks over 100 ms, while the one-team arm before it held
+13.6 ms with none.
 
 Nothing rounds differently: a (row, head) pair runs the same statements in the same order as before
 (`q4nx_attn::head_context()`, which `attention()` now calls too) and writes only its own floats. Greedy text is identical

@@ -666,7 +666,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         fprintf(stderr, "  [forward] container K grid: H %d -> %d, IM %d -> %d (pad columns are zero)\n",
                 c_.H, kpad_, c_.IM, impad_);
 
-    embed_.resize((size_t)NV * H);
+    /* engine#1784: `embed_` (the bf16 copy) is no longer filled: the table is read in place. It stays for nothing
+     * and is sized to zero, so a stale read would be a bounds error rather than a silent wrong answer. */
     {
         /* A tied model may store the table ONLY as `lm_head.weight` (Qwen3.5-4B's
          * container has no `model.embed_tokens.weight`); it doubles as both the
@@ -685,7 +686,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             /* A quantised table is stored on the container's K grid, so it dequantises to kpad_
              * wide rows (engine#845); the pad columns are zero, so the head's dot product over
              * c_.H columns is unchanged. */
-            embed_f_.resize((size_t)NV * (size_t)kpad_);
+            /* engine#1784: nothing is expanded until it is asked for. The plain int8 + per-32-column-scale table --
+             * the dtype the 27B and the gemma-class containers use -- is read element-wise straight from the mapping
+             * by embed_at(), so 0.74 GiB of container no longer becomes 2.96 GiB of anonymous memory. Only the chunked
+             * formats (which have no element-wise read yet) still decode into embed_f_. */
             lm_w_ = kpad_;
             const size_t esz = (size_t)etd->data_size;
             int rc;
@@ -697,8 +701,12 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 TensorDesc* sd = model_tensor_by_name(mw_, "model.embed_tokens.weight.scale");
                 const float* sc = sd ? (const float*)data_of(mw_, sd, en / 32 * sizeof(float)) : nullptr;
                 if (sd && !sc) { err_ = "model.embed_tokens.weight.scale is too small"; return false; }
-                rc = q4nx_dequant_plain_i8((const uint8_t*)e, sc, NV, H, embed_f_.data());
+                embed_i8_     = (const int8_t*)e;
+                embed_sc_     = sc;
+                embed_groups_ = H / Q4NX_GROUP_SIZE;
+                rc            = 0;
             } else {
+                embed_f_.resize((size_t)NV * (size_t)kpad_);
                 rc = dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data());
             }
             if (rc != 0) {
@@ -706,15 +714,22 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 return false;
             }
             embed_f32_ = true;
-            fprintf(stderr, "  [forward] embedding dtype %s -> dequantized (%zu floats, %.2f GiB)\n",
-                    dt, embed_f_.size(),
-                    (double)embed_f_.size() * sizeof(float) / (1024.0 * 1024.0 * 1024.0));
+            if (!embed_i8_)
+                fprintf(stderr, "  [forward] embedding dtype %s -> dequantized (%zu floats, %.2f GiB)\n",
+                        dt, embed_f_.size(),
+                        (double)embed_f_.size() * sizeof(float) / (1024.0 * 1024.0 * 1024.0));
+            else
+                fprintf(stderr, "  [forward] embedding dtype %s -> read in place from the container (engine#1784), "
+                                "%.2f GiB not copied\n", dt, (double)NV * H * 4.0 / (1024.0 * 1024.0 * 1024.0));
         } else {
             if (etd->data_size < (size_t)NV * H * 2) {
                 err_ = "embedding too small for NV*H bf16";
                 return false;
             }
-            memcpy(embed_.data(), e, (size_t)NV * H * sizeof(uint16_t));
+            /* engine#1784: read the table in place out of the container's read-only mapping, one row per token,
+             * instead of copying it. `e` points into `mw_`'s mapping, which outlives this forward, and embed_at()
+             * indexes it at the container's own row stride. */
+            embed_bf16_ = (const uint16_t*)e;
             lm_w_ = H;   // raw bf16: the table has no pad
         }
     }
@@ -1478,8 +1493,13 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
 
 float Q4nxNpuForward::embed_at(int token, int k) const {
     if (token < 0 || token >= c_.NV || k < 0 || k >= c_.H) return 0.0f;
+    // engine#1784: the two dtypes that can be read in place, without a table-sized buffer, are read in place. Pad
+    // columns (k >= c_.H) are already refused above and read as 0.0f, which is what the expanded table held there.
+    if (embed_i8_)
+        return q4nx_plain_i8_at((const uint8_t*)embed_i8_, embed_sc_, c_.NV, c_.H, token, k);
+    if (embed_bf16_) return bf16_to_f32(embed_bf16_[(size_t)token * (size_t)c_.H + (size_t)k]);
     if (embed_f32_) return embed_f_[(size_t)token * (size_t)lm_w_ + (size_t)k];
-    return bf16_to_f32(embed_[(size_t)token * (size_t)c_.H + (size_t)k]);
+    return 0.0f;
 }
 
 /* LM-head weight for output n, column k: the separate lm_head.weight when the

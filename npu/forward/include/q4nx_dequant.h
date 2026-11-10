@@ -143,6 +143,13 @@ int q4nx_dequant_plain_bf16(const uint8_t* data, int rows, int cols, float* out)
 int q4nx_dequant_plain_i8(const uint8_t* data, const float* scale, int rows,
                           int cols, float* out);
 
+/* One element of the same table `q4nx_dequant_plain_i8()` decodes, without decoding the table: what a loader needs
+ * to read a row per token out of a read-only mapping instead of expanding the whole table into RAM (engine#1784).
+ * `row`/`col` out of range give 0.0f. `scale` may be NULL, which is the unscaled int8 table. The arithmetic is the
+ * one in the loop above -- `(float)q * scale[row * groups + col / group]` -- so a row read this way is bit-identical
+ * to the same element of the fully decoded table, which is what the test pins. */
+float q4nx_plain_i8_at(const uint8_t* data, const float* scale, int rows, int cols, int row, int col);
+
 #ifdef __cplusplus
 }
 #endif

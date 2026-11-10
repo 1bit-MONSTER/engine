@@ -96,6 +96,19 @@ struct QkGainOffsets {
 QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
+// Why a pack's two layout witnesses cannot be reconciled, or "" when they can (engine#1985).
+//
+// `vote_hdrs` is the number of in-block headers the epsilon-anchor vote recorded (0 when it could not win); `declared_qk`
+// is config.json's `use_qk_norm`. A pack that states per-head q/k gains keeps them in the two sections between q/k/v and
+// o_proj, which a 2-header block does not have -- so a ONE-header vote on such a pack is self-contradictory, and engine#1985
+// is what trusting it costs: `Qwen3-1.7B` read as a 2-header block, `qk_norm` flipped true -> false, and every attention
+// projection was refused (280 gaps) where yesterday's main imported the same pack with 0.
+//
+// Neither witness wins: the vote measured where anchors repeat, and the declaration states what the block must contain.
+// The reader refuses and names both, because picking either one silently is the defect. Exposed so the three cases can be
+// pinned without a 2.6 GB pack.
+std::string header_witness_refusal(int vote_hdrs, bool declared_qk);
+
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
 // GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
 // reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
@@ -170,6 +183,12 @@ struct Plan {
     // .fconst tile geometry assumes. Non-zero means the tail's head tiles cannot be walked (engine#1503): a tied pack
     // takes the head from its embedding instead, an untied one is refused by name.
     int64_t head_block = 0;
+    // engine#1503: every MatMulNBits the pack declares is block 32 and at least one of them is a layer projection, and
+    // the pack has a Token .fconst. Such a pack is read with the all-block-32 layout (Block32Layout below) from the
+    // raw .fconst; the block-128 walk and the canonical copy are not used. `block32_note` is why that file does not
+    // fit the layout (empty when it does), and is the refusal every .fconst tensor of the plan then carries.
+    bool block32_layers = false;
+    std::string block32_note;
     std::string pack;  // *_rai_1.8.0_npu_4K, from the directory name
     Dims dims;
     std::vector<Planned> tensors;
@@ -195,6 +214,14 @@ struct Plan {
     // third-party parser: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights as ordinary ONNX initializers, while
     // 1.8 and R1-Distill ship placeholders and keep the weights in model.bin (pi-inferzo, 2026-11-08).
     // graph_matmuls < 0 means "no graph was read", which is why it is not just a count.
+    // engine#1786 (item F1): a FastFlowLM NPU2 model source is a safetensors container (`model.q4nx`) with no graph,
+    // so the two census fields above stay -1. `container_tensors` is -1 for every pack that is not that genre; when it
+    // is not, it is the container's tensor count and the dtype map says what the reader found. Reported rather than
+    // refused at the first byte, because "cannot open model.onnx" says nothing about a pack that has no graph by design.
+    int64_t container_tensors = -1;
+    int64_t container_payload_bytes = 0;
+    std::map<std::string, int64_t> container_dtypes;
+    std::string container_note;   // what the container genre still needs, empty for a non-container pack
     int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)
@@ -205,6 +232,11 @@ struct Plan {
     int64_t graph_ryzenai_matmuls = 0;
     int64_t graph_packed_siblings = 0;
     int64_t graph_weightless_matmuls = 0;   // dropped: placeholder + packed sibling both byte-less (engine#1671)
+    // Of those, the ones outside the decode `If` branch: what plan() refuses on. The total above stays for `info`.
+    int64_t graph_weightless_matmuls_decode = 0;
+    // The `If` branch taken when input_ids has length 1, and how that was decided (read from the condition, or assumed).
+    std::string graph_decode_branch;
+    std::string graph_branch_note;
     // How many of the graph's 4-bit block-128 weights satisfy length == N x (K/128 + 1) x 68 (the per-row stride the
     // .fconst tile also carries): a measurement, so `info` can say "201 of 201" or "3 of 7" instead of guessing.
     int64_t graph_stride_ok = 0, graph_stride_of = 0;
@@ -238,6 +270,29 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden);
 // multi-component one (`type: compositemodel`), whose geometry files stay at the root. Exported for the unit test.
 std::string find_token_fconst_exported(const std::string& pack_dir);
 
+// A FastFlowLM NPU2 model source (engine#1786, item F1) is a safetensors container named `model.q4nx`: an 8-byte
+// little-endian header length, that many bytes of JSON mapping tensor name -> {dtype, shape, data_offsets}, then the
+// payload. There is no graph and no `model.onnx`, which is why the importer above refuses such a pack before reading a
+// byte of it. The tensor NAMES are the model's own HF names, so this reader is also the work list: what it reports is
+// what a container-genre plan has to map.
+//
+// Header only: no weights are read, no device is opened. Exported because it is the half that can be wrong silently
+// (an off-by-one header length reports an empty inventory and looks like "a pack with no tensors").
+struct Q4nxTensor {
+    std::string name;
+    std::string dtype;
+    std::vector<int64_t> shape;
+    int64_t begin = 0;      // data_offsets[0]
+    int64_t end = 0;        // data_offsets[1]
+};
+struct Q4nxContainer {
+    int64_t header_bytes = 0;
+    int64_t payload_bytes = 0;
+    std::vector<Q4nxTensor> tensors;   // in header order
+    std::string why;                        // non-empty when the container could not be read; tensors is then empty
+};
+Q4nxContainer read_q4nx_container(const std::string& path);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);
@@ -262,6 +317,14 @@ bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
 void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix,
                                   const std::string& legacy_name  = std::string(),
                                   int64_t            max_age_seconds = 0);
+
+// engine#1907: apply evict_stale_canonical_copies() to EVERY scratch candidate, not only the one being written. Since #1801 the
+// write lands in the on-disk cache, so a sweep of that directory alone never reached /tmp again, and the copies older binaries
+// had left in tmpfs (17.0 GiB of RAM, measured 2026-11-10) stayed until reboot. `written_dir` is swept even if it is not yet a
+// directory as seen here; every other entry is swept only when it already exists, and is never created.
+void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::string& written_dir,
+                               const std::string& keep_name, const std::string& prefix, const std::string& legacy_name,
+                               int64_t max_age_seconds);
 
 // The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
 // actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos
@@ -371,6 +434,8 @@ struct Report {
     // walk and the pack is tied). Empty means it was read, as usual. Carried on the Report because the config JSON is
     // built after the .fconst block that discovers this.
     std::string head_synthesized_note;
+    // engine#1740: set when a block-32 head was READ from the .fconst tail (never together with the note above)
+    std::string head_read_note;
     // engine#1725: the per-layer embedding block the container carries (0 = none): row width per layer, and rows
     int64_t per_layer_P = 0, per_layer_V = 0;
     bool prefill_tail_seen = false;        // a second copy was readable in the prefill .fconst
@@ -388,6 +453,10 @@ struct Report {
     long long mlp_groups_ok = 0, mlp_groups_total = 0;
     int mlp_projections = 0;
     double mlp_zero_inexact_pct = 0;
+
+    // engine#1503: the all-block-32 path. Units read (640-byte-strip units plus gate/up units, head included). There
+    // is no decode->encode round trip on this path, so the two counters above stay 0 for such a pack.
+    long long block32_units = 0;
 };
 
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options&);
@@ -403,6 +472,115 @@ struct Q4 {
     std::vector<float> scale;    // [N, K/32]
     std::vector<float> zero;     // [N, K/32]
 };
+// The 1.9 block-32 tail head (engine#1740). A pack whose `/lm_head/MatMul_Q4` is declared `block_size 32` keeps the
+// head in the Token .fconst tail, after the same `64 + 2*hidden` envelope every other 1.9 tail opens with, but NOT in
+// the block-128 tile: it is written in 64-row units of `2,560 + 2*(K/32)*640` bytes.
+//
+// Measured on `Qwen-2.5_1.5B_Instruct_rai_1.9.0_npu` (tied, V 151,936, K 1,536; unit 64,000 B, 2,374 units, then
+// 110,208,000 B of zeros to EOF) against the pack's own `model.embed_tokens`:
+//     unit   : 2,560 B of zeros, then 2*(K/32) strips of 640 B
+//     strip s: K block `s/2` (32 columns), rows `32*(s%2) .. +31` of the unit
+//       +0   512 B of 4-bit codes, low nibble first; code position p (0..1023) is row `(p/256)*8 + p%8`, column
+//            `(p/8)%32` -- four 8-row bands, each written column by column
+//       +512  16 B of zero points, one nibble per row (0x8 everywhere on the measured pack)
+//       +528  48 B of zeros
+//       +576  32 bf16 scales, one per row; SIGNED -- the measured writer stores `-m/8` where m is the block's
+//            largest-magnitude weight, so about half of them are negative
+//     w = (code - zero_point) * scale
+// Every one of the 3,072 scales of a unit equals `bf16(-m/8)` of its embedding block exactly, and the decoded rows
+// correlate 0.990 .. 0.997 with the embedding (4-bit), which is what fixed the field positions. The result is returned
+// with positive scales (a negative one is folded into its codes: `15 - code`, `15 - zp`), as a `Q4` at block 32, rows
+// padded to whole units the way the block-128 tail head is.
+//
+// What is checked, because a wrong region read with confidence is the failure this path exists to avoid: the unit
+// count is `ceil(V/64)` and has to fit; every unit's 2,560 B and every strip's 48 B are zero; every scale is finite;
+// and everything after the last unit is zero. Any of those failing is a refusal with the offset in it.
+constexpr int64_t kB32UnitRows = 64, kB32UnitHeader = 2560, kB32StripBytes = 640;
+inline int64_t block32_unit_bytes(int64_t K) { return kB32UnitHeader + 2 * (K / 32) * kB32StripBytes; }
+struct Block32Head {
+    bool ok = false;
+    Q4 q;                 // N = units x 64 (>= V), K, block 32; value = code*scale + zero, scale > 0
+    int64_t units = 0;
+    int64_t bytes = 0;    // units x block32_unit_bytes(K)
+    int64_t padding = 0;  // zero bytes after the last unit
+    std::string why;      // set when !ok
+};
+// `p` points at the first unit (tail_off + envelope), `avail` is the bytes from there to the end of the file, and
+// `file_off` is where `p` sits in the file (only used to put an offset in a refusal).
+Block32Head read_block32_head(const uint8_t* p, int64_t avail, int64_t V, int64_t K, int64_t file_off = 0);
+
+// The same units for any matrix (engine#1503): `ceil(rows/64)` units of `block32_unit_bytes(K)` starting at `p`. This
+// is the head reader without its tail rule (nothing is required of the bytes after the last unit), and it is what the
+// all-block-32 layer block's q/k/v/o/down are read with. `what` names the tensor in a refusal. Same checks: the bytes
+// fit, every unit header and strip gap is zero, every scale is finite; same normalisation (positive scales).
+struct Block32Units {
+    bool ok = false;
+    Q4 q;                 // N = units x 64 (>= rows), K, block 32
+    int64_t units = 0;
+    int64_t bytes = 0;    // units x block32_unit_bytes(K)
+    std::string why;      // set when !ok
+};
+Block32Units read_block32_units(const uint8_t* p, int64_t avail, int64_t rows, int64_t K, const char* what = "head",
+                                int64_t file_off = 0);
+
+// The gate/up unit of an all-block-32 pack (engine#1503): gate_proj and up_proj share one run of 64-row units, each
+// `4,864 + 2*(K/32)*1,216` bytes.
+//
+// Measured on `SmolLM2-135M-Instruct_rai_1.9.0_npu` (K 576, intermediate 1,536: 24 units of 48,640 B per layer)
+// against the public checkpoint's gate_proj / up_proj:
+//     unit   : 4,864 B of zeros, then 2*(K/32) strips of 1,216 B
+//     strip s: K block `s/2` (32 columns), 64 row SLOTS: slots 0..31 are GATE rows `32*(s%2) .. +31` of the unit,
+//              slots 32..63 are UP rows with the same numbers
+//       +0    1,024 B of 4-bit codes, low nibble first; code position p (0..2047) is slot `(p/256)*8 + p%8`, column
+//             `(p/8)%32` -- the head strip's order over eight 8-slot bands instead of four
+//       +1024 32 B of zero points, one nibble per slot
+//       +1056 32 B of zeros
+//       +1088 64 bf16 scales, one per slot, signed
+// The code order is the measured part (0.98 .. 0.996 per 32-code block against the reference). That zero point and
+// scale are indexed by slot is ASSUMED by analogy with the 640-byte strip; the import of the measured pack is what
+// tests it (a container gate/up that still correlates with the checkpoint after the zero points and scales are
+// applied). Returned as two `Q4`s with the same normalisation and the same refusals as the unit reader.
+constexpr int64_t kB32MlpUnitHeader = 4864, kB32MlpStripBytes = 1216;
+inline int64_t block32_mlp_unit_bytes(int64_t K) { return kB32MlpUnitHeader + 2 * (K / 32) * kB32MlpStripBytes; }
+struct Block32GateUp {
+    bool ok = false;
+    Q4 gate, up;          // each N = units x 64, K, block 32
+    int64_t units = 0;
+    int64_t bytes = 0;    // units x block32_mlp_unit_bytes(K)
+    std::string why;      // set when !ok
+};
+Block32GateUp read_block32_gate_up(const uint8_t* p, int64_t avail, int64_t rows, int64_t K, int64_t file_off = 0);
+
+// The layer block of a pack whose EVERY MatMulNBits is block 32 (engine#1503), as offsets from the block's start.
+// Read from the RAW 1.9 Token .fconst (not the canonical 1.8-form copy). With H = hidden, Nq = heads*head_dim,
+// Nkv = kv_heads*head_dim, IM = intermediate, unit = block32_unit_bytes, mlp_unit = block32_mlp_unit_bytes:
+//     +0        64 + 2*H   envelope: bf16 rms_norm_eps, zeros to 64, input_layernorm bf16[H]
+//     q_off     (Nq/64)  x unit(H)       q_proj [Nq][H]
+//     k_off     (Nkv/64) x unit(H)       k_proj [Nkv][H]
+//     v_off     (Nkv/64) x unit(H)       v_proj [Nkv][H]
+//     sink_off  4*heads bytes            not a weight; skipped (int32 0xFF7F0000 x heads on the measured pack)
+//     o_off     (H/64)   x unit(Nq)      o_proj [H][Nq]
+//     post_off  64 + 2*H   envelope: eps, zeros, post_attention_layernorm bf16[H]
+//     gu_off    (IM/64)  x mlp_unit(H)   gate_proj + up_proj, [IM][H] each
+//     hdr_off   64 bytes                 skipped, content not interpreted (01 then 63 zeros on the measured pack)
+//     down_off  (H/64)   x unit(IM)      down_proj [H][IM]
+//     stride
+// and the tail at `layers x stride`: the same envelope with the final norm, `ceil(V/64)` head units at K = H, zeros.
+// Measured on SmolLM2-135M-Instruct 1.9 only (stride 2,360,292; file 90,470,776 B), where Nq == H -- so o_proj's K
+// being Nq rather than H is the declared shape, not a measurement. There is no bias field in this layout.
+struct Block32Layout {
+    std::string why;      // non-empty: this geometry does not fit the layout (a width that is not whole units)
+    int64_t env = 0, q_off = 0, k_off = 0, v_off = 0, sink_off = 0, o_off = 0, post_off = 0, gu_off = 0, hdr_off = 0,
+            down_off = 0, stride = 0;
+    int64_t tail_off = 0, head_off = 0, head_units = 0;
+    int64_t min_size = 0; // head_off + head_units x unit(H); the file is this plus zero padding
+};
+Block32Layout block32_layout(const Dims& d);
+// Empty when a mapped file fits `lay`: it is at least `min_size` long, and every envelope (two per layer and the
+// tail's) opens with the pack's epsilon followed by zeros up to the norm. Otherwise the reason, with the offset. The
+// zero padding after the head is the head reader's check.
+std::string block32_file_refusal(const uint8_t* map, int64_t size, const Dims& d, const Block32Layout& lay);
+
 // The 1.9 external-data tile (engine#1503): the `.fconst` tile's subvolume written densely per tensor.
 //
 // Measured on `amd/phi-4_rai_1.9.0_npu` (`eager-mm.onnx.data`, 9.74 GB): every `MatMulNBitsBf` weight is a 1-D byte

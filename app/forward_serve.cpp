@@ -109,6 +109,10 @@ struct ForwardEngine {
     // slot's attention KV and GDN state.  Only ever touched under mu.
     std::unique_ptr<npu::PrefixCache> prefix;
     std::vector<Q4nxNpuForward::StateSnapshot> prefix_state;
+    // --prefix-pin (engine#1785): keep the state at the point where a request stops agreeing with the
+    // previous one, so single-turn requests under one system prompt resume from it (PrefixCache::pin_point).
+    bool prefix_pin = false;
+    std::vector<int> prev_ids;  // the previous request's prompt, what pin_point() compares against
     // The d3 decision head (#653), loaded when decision_config.json and decision.q4nx sit next to the
     // model: it is what turns this server into a decision endpoint as well as a chat one.
     std::unique_ptr<npu::DecisionHead> head;
@@ -332,11 +336,42 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             std::fprintf(stderr, "[prefix] slot=%d cached=%d of %zu reason=%s\n", stats.prefix.slot,
                          stats.prefix.cached_tokens, ids.size(), stats.prefix.reason.c_str());
         }
+        // (engine#1785) Where this request should leave a pinned snapshot, as a position: the state is saved
+        // one token short of the shared part for the same reason the whole-prompt snapshot below is saved one
+        // token short of the prompt. -1 = no pin for this request. pin_point() is 0 when a slot (the pin
+        // itself, on every request after the one that made it) already covers the shared part, and it is
+        // always less than the prompt's length, so this cut is never the last-token cut below.
+        int pin_cut = -1;
+        size_t pin_tokens = 0;
+        if (e.prefix_pin && e.prefix && e.prefix->enabled()) {
+            pin_tokens = e.prefix->pin_point(e.prev_ids, ids);
+            if (pin_tokens > 0 && int(pin_tokens) - 1 >= resume) pin_cut = int(pin_tokens) - 1;
+        }
         {
             const int chunk_max = std::max(1, e.fwd->max_batch_rows());
             const int n = int(ids.size());
             for (int off = resume; off < n;) {
-                const int take = std::min(chunk_max, n - off);
+                int take = std::min(chunk_max, n - off);
+                if (pin_cut >= 0 && off == pin_cut) {
+                    Q4nxNpuForward::StateSnapshot snap;
+                    if (e.fwd->snapshot_state(off, snap)) {
+                        std::string why;
+                        const std::vector<int> shared(ids.begin(), ids.begin() + long(pin_tokens));
+                        const int slot = e.prefix->pin(shared, snap.bytes(), &why);
+                        if (slot >= 0 && size_t(slot) < e.prefix_state.size()) e.prefix_state[size_t(slot)] = std::move(snap);
+                        std::fprintf(stderr, "[prefix] pin slot=%d tokens=%zu state_at=%d %s\n", slot, pin_tokens, off,
+                                     why.c_str());
+                    }
+                    pin_cut = -1;
+                } else if (pin_cut > off && off + take > pin_cut) {
+                    // Stop this chunk at the pin position; the next pass saves the state there. One more launch.
+                    take = pin_cut - off;
+                    const std::vector<int> head(ids.begin() + off, ids.begin() + off + take);
+                    if (!e.fwd->step_batch(head, off, logits))
+                        throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
+                    off += take;
+                    continue;
+                }
                 // The state the prefix cache keeps is taken one token short of the prompt, because the answer is
                 // drawn from the last position's logits and a snapshot holds state, not logits -- so the snapshot
                 // is saved just before the last token and that token is run again on a resume.  On a GDN model
@@ -368,6 +403,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 off += take;
             }
         }
+        if (e.prefix_pin) e.prev_ids = ids;
 
         // Prompt processing ends here: every prompt token has been through the model and the first
         // token's distribution is in `logits`.
@@ -520,7 +556,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     {"prompt_tokens_details", {{"cached_tokens", st.prefix.cached_tokens}}},
                     {"flm_prefix_cache", {{"slot", st.prefix.slot},
                                           {"cached_tokens", st.prefix.cached_tokens},
-                                          {"reason", st.prefix.reason}}}};
+                                          {"reason", st.prefix.reason},
+                                          {"pinned", st.prefix.pinned}}}};
     };
 
     // OpenAI's logprobs.content entry: the token's text, its log-probability, and the most likely
@@ -868,6 +905,7 @@ int run_forward_serve(int argc, char** argv) {
     // instead of being ignored and served by whatever target happened to be linked.
     std::string npu_target = ::npu::target::xdna::XdnaTarget::kName;
     npu::PrefixOptions prefix_opts;  // --prefix-slots / --prefix-cache-mb / --prefix-min-gain (#650)
+    bool prefix_pin = false;         // --prefix-pin (engine#1785)
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -882,6 +920,7 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--prefix-slots") prefix_opts.slots = std::stoi(next());
         else if (a == "--prefix-cache-mb") prefix_opts.cache_mb = std::stoul(next());
         else if (a == "--prefix-min-gain") prefix_opts.min_gain = std::stoi(next());
+        else if (a == "--prefix-pin") prefix_pin = true;
         else if (a == "--npu-streams") streams = std::stoi(next());
         else if (a == "--npu-target") npu_target = next();
         else if (a == "--dump-logits") dump_logits = next();
@@ -979,6 +1018,8 @@ int run_forward_serve(int argc, char** argv) {
         std::fprintf(stderr,
                      "1bit forward-serve: prefix cache on: %d slots, %zu MB, min gain %d tokens\n",
                      prefix_opts.slots, prefix_opts.cache_mb, prefix_opts.min_gain);
+        e.prefix_pin = prefix_pin;
+        if (prefix_pin) std::fprintf(stderr, "1bit forward-serve: prefix pin on: the part a request shares with the previous one keeps a slot\n");
     }
 
     e.fwd = std::make_unique<Q4nxNpuForward>();

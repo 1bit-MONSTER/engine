@@ -185,6 +185,7 @@ struct Options {
     int prefix_slots    = -1;   // --prefix-slots N (0 = off)
     int prefix_cache_mb = -1;   // --prefix-cache-mb N
     int prefix_min_gain = -1;   // --prefix-min-gain N: tokens a prompt must add to be worth keeping
+    bool prefix_pin = false;    // --prefix-pin: keep the part single-turn requests share (docs/npu.md)
     std::string npu_target;  // --npu-target NAME: which NPU target serves the per-op route (empty = the build's default)
     std::string prefill_provider;        // --prefill-provider PATH (or ONEBIT_HYBRID_PREFILL): --device hybrid's prefill (docs/hybrid.md)
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
@@ -2958,12 +2959,12 @@ std::string q4nx_cache_root() {
 // engine#1956: the cache is regenerable scratch, not user data, and nothing ever removed an old entry -- measured at 104 G in
 // 29 entries on one box, which closed two lanes' build gates the same day. The bound is a size, not an age, because a busy
 // day imports more packs than any age window expires; ONEBIT_Q4NX_CACHE_MAX_GIB=0 restores the old unbounded behaviour.
+// The order is least-recently-USED: a cache hit touches its entry (q4nx_cache_touch), here and in npu/q4nx_device.cpp.
 // The entry just written is never a candidate, and neither is one younger than the sweep's age window (a serve may be reading
 // it) -- see app/q4nx_cache.h for why that is a heuristic rather than a guarantee.
 static void q4nx_cache_sweep(const std::string& cache, const std::string& keep) {
-    const char* env = std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB");
-    long long gib = env && *env ? std::atoll(env) : 60;
-    q4nx_cache_evict(cache, keep, gib > 0 ? gib * (1LL << 30) : 0);
+    q4nx_cache_touch(keep);              // a reused entry counts as used now: the sweep is LRU by this, not by creation
+    q4nx_cache_evict(cache, keep, q4nx_cache_bound_bytes(std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB")));
 }
 
 std::string repack_gguf(const std::string& gguf) {
@@ -3041,9 +3042,13 @@ std::string repack_gguf(const std::string& gguf) {
                     "1bit serve: ============================================================\n\n",
                     checker.empty() ? "(unresolved)" : checker.c_str());
             }
+            q4nx_cache_touch(out);       // a hit is a use: without this the sweep's order is by creation
             return out;
         }
-        if (run_program({ python, checker, gguf, out }, true) == 0) return out;
+        if (run_program({ python, checker, gguf, out }, true) == 0) {
+            q4nx_cache_touch(out);
+            return out;
+        }
         std::fprintf(stderr, "1bit serve: cached Q4NX dir %s FAILED the declared-scale scan; "
                              "discarding and re-repacking\n", out.c_str());
         fs::remove_all(out);
@@ -3167,6 +3172,7 @@ void usage(FILE* out) {
                  "                  [--npu-streams N]   with --device npu: this serve is one of N sharing the NPU\n"
                  "                  [--prefix-slots N] [--prefix-cache-mb N] [--prefix-min-gain N]   the prompt prefix cache\n"
                  "                  (docs/npu.md; 0 slots turns it off). Unset keeps the forward's defaults: 8 / 4096 / 128\n"
+                 "                  [--prefix-pin]   keep the part a request shares with the previous one (one system prompt, many questions)\n"
                  "                  (default 1, the device exclusive; docs/npu.md)\n"
                  "                  [--load-queue-ms N]   a load refused because another client holds the NPU array\n"
                  "                  waits at most N ms for it to free before the driver is called dead\n"
@@ -3282,6 +3288,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--prefix-slots")    o.prefix_slots    = std::stoi(next());
         else if (a == "--prefix-cache-mb") o.prefix_cache_mb = std::stoi(next());
         else if (a == "--prefix-min-gain") o.prefix_min_gain = std::stoi(next());
+        else if (a == "--prefix-pin") o.prefix_pin = true;
         else if (a == "--npu-target") o.npu_target = next();
         else if (a == "--prefill-provider") o.prefill_provider = next();
         else if (a == "--laya-model") o.laya_model = next();
@@ -3417,6 +3424,21 @@ int run_serve(int argc, char** argv) {
                                        fs::exists(fs::path(o.model) / "config.json") &&
                                        fs::exists(fs::path(o.model) / "tokenizer.json");
             if (model_generic && !kernels.empty() && fs::is_directory(kernels)) {
+                // engine#1740 (W6): --npu-opt is for a PRIVATE route, and this branch is the per-op forward, which
+                // cannot consume one. #1868 made the option refuse when no add-on is linked; with an add-on linked the
+                // option was still accepted here and then bypassed by the CONTAINER TYPE, silently -- a W6 run asked for
+                // the fused route, got per-op, and produced *identical* numbers, which reads as "no gain" rather than
+                // "wrong route". Refusing is the only answer that cannot be misread.
+                if (!o.npu_opts.empty()) {
+                    std::string keys;
+                    for (const auto& kv : o.npu_opts) keys += (keys.empty() ? "" : ", ") + kv.substr(0, kv.find('='));
+                    std::fprintf(stderr,
+                                 "1bit serve: --npu-opt %s was given, but %s is a model-generic container, which serves "
+                                 "through the per-op forward: the option has no effect here (it applies to a private "
+                                 "route's own model directory). Drop it, or serve the model directory that route "
+                                 "expects.\n", keys.c_str(), o.model.c_str());
+                    return 2;
+                }
                 std::fprintf(stderr,
                              "1bit serve: %s is a model-generic container: serving it through the per-op forward "
                              "(kernels %s)\n", o.model.c_str(), kernels.c_str());
@@ -3433,6 +3455,7 @@ int run_serve(int argc, char** argv) {
                 if (o.prefix_slots    >= 0) { fargs.push_back("--prefix-slots");    fargs.push_back(std::to_string(o.prefix_slots)); }
                 if (o.prefix_cache_mb >= 0) { fargs.push_back("--prefix-cache-mb"); fargs.push_back(std::to_string(o.prefix_cache_mb)); }
                 if (o.prefix_min_gain >= 0) { fargs.push_back("--prefix-min-gain"); fargs.push_back(std::to_string(o.prefix_min_gain)); }
+                if (o.prefix_pin) fargs.push_back("--prefix-pin");
                 std::vector<char*> fav;
                 for (auto& a : fargs) fav.push_back(a.data());
                 return run_forward_serve(int(fav.size()), fav.data());

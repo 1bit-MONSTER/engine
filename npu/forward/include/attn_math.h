@@ -26,6 +26,10 @@
 // Contract: the forms differ by float ROUNDING ORDER only -- they are the same sum, not the same bits.
 // tests/attn_math_test.cpp is what holds that line (each form against a double-precision direct sum, on
 // every width the forward passes, including the awkward ones either body's tail loop would mishandle).
+#include <cmath>
+#include <cstddef>
+#include <vector>
+
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #define Q4NX_ATTN_X86 1
 #include <immintrin.h>
@@ -102,6 +106,61 @@ inline void saxpy(float p, const float* x, float* y, int n) {
     if (have_avx2_fma()) { saxpy_avx2(p, x, y, n); return; }
 #endif
     saxpy_scalar(p, x, y, n);
+}
+
+// One head of one row: softmax(q.K * scale) over cached positions [t0, T), then ctx = sum p_t * V_t.
+// `kc`/`vc` are the cache planes, position-major [t][NKV][HD]; `kh` is the KV head this query head reads;
+// `score` is T floats of scratch; `out` (HD floats) must be zero on entry. This is the body attention() ran
+// inline before it was shared -- the same statements in the same order, so the result is the same bits.
+inline void head_context(const float* qh, const float* kc, const float* vc, int NKV, int kh, int HD,
+                         int t0, int T, float scale, float* score, float* out) {
+    float mx = -1e30f;
+    for (int t = 0; t < T; t++) {
+        if (t < t0) { score[t] = -1e30f; continue; }
+        const float* kt = kc + ((size_t)t * NKV + kh) * HD;
+        score[t] = dot(qh, kt, HD) * scale;
+        if (score[t] > mx) mx = score[t];
+    }
+    float sum = 0.0f;
+    for (int t = 0; t < T; t++) {
+        if (t < t0) { score[t] = 0.0f; continue; }
+        score[t] = std::exp(score[t] - mx);
+        sum += score[t];
+    }
+    const float inv = sum > 0 ? 1.0f / sum : 0.0f;
+    for (int t = t0; t < T; t++) saxpy(score[t] * inv, vc + ((size_t)t * NKV + kh) * HD, out, HD);
+}
+
+// M rows of attention in ONE thread team (engine#1990). A batched pass used to call attention() once per row,
+// and each call opened its own team over the heads: 16 rows x 16 attention layers = 256 teams per prefill
+// block, and the team count is what a loaded box pays for. Here the (row, head) pairs are one work-shared
+// loop. Each pair is independent -- it reads its own q, the read-only cache, and writes its own HD floats of
+// ctx -- so the split across threads cannot change a value; tests/attn_math_test.cpp compares this against a
+// plain loop over head_context() bit for bit.
+//
+// `q` is [M][NH][HD] (already normed and rotated), `T[m]`/`t0[m]` are row m's read window, `ctx` is
+// [M][NH][HD] and is zeroed here. `nt` <= 1 runs it on the caller's thread.
+inline void rows_context(const float* q, const float* kc, const float* vc, int M, int NH, int NKV, int HD,
+                         const int* T, const int* t0, float scale, float* ctx, int nt) {
+    const int gqa = NH / NKV;
+    int tmax = 0;
+    for (int m = 0; m < M; m++) tmax = T[m] > tmax ? T[m] : tmax;
+    for (size_t i = 0, n = (size_t)M * NH * HD; i < n; i++) ctx[i] = 0.0f;
+    const long pairs = (long)M * NH;
+    (void)nt;
+#pragma omp parallel num_threads(nt > 1 ? nt : 1) if (nt > 1 && pairs > 1)
+    {
+        std::vector<float> score((size_t)(tmax > 0 ? tmax : 1));
+        // static, not dynamic: on a loaded box a dynamic schedule's tail was the whole cost (a host microbench at
+        // this geometry, 24 threads: p99 62 ms against 17 ms static per layer), and the rows of one block read
+        // windows within M positions of each other, so there is no imbalance for dynamic to fix.
+#pragma omp for schedule(static)
+        for (long i = 0; i < pairs; i++) {
+            const int m = (int)(i / NH), h = (int)(i % NH);
+            head_context(q + ((size_t)m * NH + h) * HD, kc, vc, NKV, h / gqa, HD, t0[m], T[m], scale,
+                         score.data(), ctx + ((size_t)m * NH + h) * HD);
+        }
+    }
 }
 
 }  // namespace q4nx_attn

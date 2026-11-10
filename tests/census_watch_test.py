@@ -141,6 +141,42 @@ check("a pytorch library with the transformers tag still alerts", rc == 1 and re
 rc, res = rc_of([model("z/nano", "Qwen3_5MVLAAbsorbedForCausalLM", library="mlx")])
 check("a reviewed class alerts even when not Transformers", rc == 1)
 
+# 4d. engine#1922: a repo with no library at all that ships its own modeling_*.py. The record is
+#     Climb-Ai/Climb-1-Toki's listing row of 2026-11-10 (the fields this watcher reads): class
+#     MicroLlamaForCausalLM, `model_type: llama`, no auto_map, and modeling_micro_llama.py where
+#     that class is a bare torch.nn.Module. It alerted as a new class; it is the same one-off.
+def own_code(mid, arch, files=("config.json", "model.safetensors", "modeling_micro_llama.py"), **kw):
+    m = model(mid, arch, **kw)
+    m["siblings"] = [{"rfilename": f} for f in files]
+    return m
+
+
+TOKI_TAGS = ["pytorch", "safetensors", "llama", "toki-pona", "micro-llama", "text-generation",
+             "conversational", "license:apache-2.0", "region:us"]
+rc, text = text_of([own_code("Climb-Ai/Climb-1-Toki", "MicroLlamaForCausalLM", tags=TOKI_TAGS)])
+check("own modeling_*.py, no library -> exit 0, reported",
+      rc == 0 and "REMOTE-CODE MicroLlamaForCausalLM" in text and "UNCOVERED" not in text)
+rc, res = rc_of([own_code(f"u{i}/toki", "MicroLlamaForCausalLM") for i in range(cw.REMOTE_CODE_SPREAD)])
+check("own-code class from REMOTE_CODE_SPREAD uploaders -> exit 1", rc == 1 and res["remote_code"] == [])
+# the rule must not quiet a class Transformers has: the Hub marks such a repo as a Transformers model
+rc, res = rc_of([own_code("o/new", "NimbusMindForCausalLM", tags=["transformers"])])
+check("own modeling_*.py with the transformers tag still alerts", rc == 1 and res["remote_code"] == [])
+rc, res = rc_of([own_code("o/new", "NimbusMindForCausalLM", library="transformers")])
+check("own modeling_*.py with library transformers still alerts", rc == 1 and res["remote_code"] == [])
+rc, res = rc_of([own_code("o/new", "NimbusMindForCausalLM", library="sentence-transformers")])
+check("own modeling_*.py under an unknown library still alerts", rc == 1 and res["remote_code"] == [])
+# only a top-level modeling_<name>.py counts: not a training script, not a file in a folder
+rc, res = rc_of([own_code("o/new", "NimbusMindForCausalLM", files=("config.json", "train.py", "model.py"))])
+check("other python files are not modeling code", rc == 1 and res["remote_code"] == [])
+rc, res = rc_of([own_code("o/new", "NimbusMindForCausalLM", files=("config.json", "src/modeling_x.py"))])
+check("a modeling file in a subfolder is not the repo's model class", rc == 1 and res["remote_code"] == [])
+rc, res = rc_of([own_code("o/a", "MixForCausalLM"), model("o/b", "MixForCausalLM")])
+check("a class with one model that ships no code alerts", rc == 1 and res["remote_code"] == [])
+rc, res = rc_of([own_code("o/a", "Qwen3_5MVLAAbsorbedForCausalLM")])
+check("a reviewed class alerts even with its own modeling file", rc == 1)
+rc, res = rc_of([own_code("o/a", "Qwen3ForCausalLM")])
+check("a mapped class stays covered whatever files it ships", rc == 0 and res[cw.COVERED] == ["o/a"])
+
 # 5. A derivative with no config is expected, not an alert.
 rc, res = rc_of([model("e/five", tags=["gguf", "text-generation"])])
 check("derivative -> no alert, not unverifiable",
@@ -230,6 +266,9 @@ check("sweep reaches the limit across two pages",
       len(out) == 120 and out[0]["id"] == "a/0" and out[119]["id"] == "b/19")
 check("sweep uses the cursor, never p=",
       len(urls) == 2 and "p=" not in urls[0] and "cursor=PAGE1" in urls[1])
+# engine#1922: the file names arrive only with full=true; without them 4d's rule sees nothing
+check("sweep asks the listing for file names (full=true) and the config",
+      "full=true" in urls[0] and "config=true" in urls[0])
 
 fetch, urls = pages([f"a/{i}" for i in range(100)])
 out = cw.sweep_newest(5, seen={f"a/{i}" for i in range(95)}, fetch=fetch)

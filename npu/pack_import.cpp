@@ -200,11 +200,16 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
         if (op == "MatMulNBits" || op == "MatMulNBitsBf") {
             if (op == "MatMulNBitsBf") ++m.ryzenai_matmuls;
             OnnxMatMul mm;
-            if (ins.size() >= 4) {
+            // THREE inputs is a real spelling, not a truncation: `amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu` names its
+            // projections `(activations, ...MatMul.weight_Q4, ...MatMul.weight_scales)` with `bits 4, block_size 32` and
+            // no qzeros tensor at all, and a `>= 4` test therefore recorded NO matmuls for it -- `info` printed
+            // matmulnbits_ops 0 and the importer wrote only the embedding (engine#1503). A missing qzeros means the
+            // implicit zero point, which `implicit_zp_zero()` below applies.
+            if (ins.size() >= 3) {
                 mm.data = ins[0];
                 mm.weight = ins[1];
                 mm.scales = ins[2];
-                mm.zeros = ins[3];
+                if (ins.size() >= 4) mm.zeros = ins[3];
             }
             if (attrs.count("K")) mm.K = attrs["K"];
             if (attrs.count("N")) mm.N = attrs["N"];
@@ -1245,6 +1250,21 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without_zeros, int* K, int* N, int* block) {
+    const OnnxModel m = parse_onnx(path);
+    if (matmuls) *matmuls = int(m.matmuls.size());
+    if (without_zeros) {
+        int n = 0;
+        for (const auto& mm : m.matmuls) if (mm.zeros.empty()) ++n;
+        *without_zeros = n;
+    }
+    if (!m.matmuls.empty()) {
+        if (K) *K = int(m.matmuls[0].K);
+        if (N) *N = int(m.matmuls[0].N);
+        if (block) *block = m.matmuls[0].block;
+    }
+    return int(m.matmuls.size());
+}
 // The 1.9 external-data genre states no FFN width anywhere a file shows it: the weights are MatMulNBitsBf nodes
 // whose initializers carry dims `[0]` (bytes live in a *.qweight.packed sibling), so the initializer-dimension
 // heuristic in plan() sees nothing. The NODE carries K and N as attributes, and walk_graph already descends into
@@ -1385,6 +1405,19 @@ FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits) {
     return g;
 }
 
+
+// ── The implicit zero point ───────────────────────────────────────────────────
+// A quantised matmul with no `qzeros` input takes an implicit zero point of 2^(bits-1) -- ONNX Runtime's own
+// MatMulNBits does exactly that when the tensor is absent, and it is corroborated in this collection: the *embedding*
+// component of the same family (GatherBlockQuantized, also no zeros) decodes to ONNX Runtime's output with cosine
+// 1.00000000 and max|d| 0 at zero point 8, against 0.317 at zero point 0 (measured on
+// amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu, engine#1725/#1661). `decode_matmulnbits` folds the zero into `q.zero`, so
+// this subtracts the implicit one the same way: zero term = -(2^(bits-1)) * scale.
+void implicit_zp_zero(Q4& q, int bits) {
+    if (bits <= 0 || q.scale.empty() || q.scale.size() != q.zero.size()) return;
+    const float zp = float(1 << (bits - 1));
+    for (size_t i = 0; i < q.zero.size(); ++i) q.zero[i] -= zp * q.scale[i];
+}
 
 // ── MatMulNBits → (codes, scale, zero) per 32-column group ───────────────────
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
@@ -2135,9 +2168,14 @@ Plan plan(const std::string& pack_dir) {
     std::set<std::string> graph_projs;
     if (graph_weights) {
         for (const auto& t : onnx.tensors) {
-            const size_t pos = t.name.find(".MatMulNBits.");
-            if (pos == std::string::npos || t.dims.empty()) continue;   // 0-dim placeholders sit beside them
-            graph_projs.insert(t.name.substr(0, pos));
+            if (t.dims.empty()) continue;                              // 0-dim placeholders sit beside them
+            // Two spellings of the same thing: `<proj>.MatMulNBits.qweight` (the 1.8/phi-4 form) and
+            // `<proj>.MatMul.weight_Q4` (Qwen3-VL-4B's, three-input nodes, engine#1503).
+            size_t pos = t.name.find(".MatMulNBits.");
+            if (pos != std::string::npos) { graph_projs.insert(t.name.substr(0, pos)); continue; }
+            const std::string q4 = ".MatMul.weight_Q4";
+            pos = t.name.find(q4);
+            if (pos != std::string::npos) graph_projs.insert(t.name.substr(0, pos));
         }
     }
     const OnnxTensor* embed = nullptr;
@@ -3160,8 +3198,15 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // Decode rows [row0, row0+rows) of a projection's MatMulNBits weight into q4_1 tiles.
         auto decode_rows = [&](const std::string& proj, int row0, int rows, const std::string& out_name,
                                int k_override) -> bool {
+            // The two spellings of a quantised projection (engine#1503): the 1.8/phi-4 form carries a qweight and a
+            // scales sibling; Qwen3-VL-4B names them `<proj>.MatMul.weight_Q4` / `<proj>.MatMul.weight_scales` on a
+            // three-input node with no qzeros (implicit zero point, applied below).
             const OnnxTensor* qw = init_of(proj + ".MatMulNBits.qweight");
             const OnnxTensor* sc = init_of(proj + ".MatMulNBits.scales");
+            if (!qw || !sc) {
+                qw = init_of(proj + "MatMul.weight_Q4");
+                sc = init_of(proj + "MatMul.weight_scales");
+            }
             if (!qw || !sc || qw->dims.size() != 3 || sc->dims.empty()) return false;
             const int N = int(qw->dims[0]);
             const int block = int(qw->dims[2]) * 2;            // 64 B holds 128 four-bit codes
@@ -3311,7 +3356,9 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         const uint8_t* zp = have_zp ? bytes_of(onnx.tensors[zi->second], zp_need) : nullptr;
         uint64_t qw_need = 0;   // N * K/block * block/2
         if (!mul_ok(groups_n, uint64_t(mm.block) / 2, qw_need)) throw std::runtime_error("lm_head: qweight length overflows");
-        const Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        // no qzeros tensor -> the implicit zero point (engine#1503: Qwen3-VL-4B's spelling, three-input nodes)
+        if (!have_zp) implicit_zp_zero(q, mm.bits);
 
         std::vector<uint8_t> tiled;
         long long pinexact = 0;

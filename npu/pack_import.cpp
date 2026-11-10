@@ -1797,6 +1797,17 @@ std::vector<std::string> fconst_scratch_dirs() {
         dirs.push_back(std::string(xdg) + "/1bit/fconst19");
     else if (const char* home = std::getenv("HOME"); home && *home)
         dirs.push_back(std::string(home) + "/.cache/1bit/fconst19");
+    // engine#1818 review: `$TMPDIR` belongs BETWEEN the cache and the literal /tmp. It was dropped in this extraction, and on a
+    // lane that points TMPDIR at disk (which is what people do here precisely because /tmp is RAM) a pack whose cache directory
+    // is unusable then landed in tmpfs -- the outcome engine#1801 exists to prevent. temp_directory_path() throws when TMPDIR
+    // names a missing directory, hence the try and the note; it also returns /tmp when TMPDIR is unset, so the literal below is
+    // still the final disc-resort and not a duplicate.
+    try {
+        const fs::path tmp = fs::temp_directory_path();
+        if (!tmp.empty() && tmp != fs::path("/tmp")) dirs.push_back(tmp.string());
+    } catch (...) {
+        // The temporary directory is unusable (TMPDIR names something that is not there): go elsewhere.
+    }
     // Last resorts only: on this box /tmp is tmpfs, so each of these costs RAM equal to the pack's .fconst.
     dirs.push_back("/tmp");
     dirs.push_back(".");

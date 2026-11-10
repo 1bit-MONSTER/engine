@@ -2515,6 +2515,34 @@ void test_fconst_scratch_order() {
     std::system(("rm -rf /tmp/1bit-scratch-test-" + std::to_string(::getpid())).c_str());
     // 5. and there is always somewhere to fall back to
     check(dirs.size() >= 2, "fconst scratch: more than one candidate, so a box with no HOME still has a fallback");
+    // 6. engine#1818 review: `$TMPDIR` sits BETWEEN the cache and the literal /tmp. It was dropped by the extraction, and a
+    //    lane that points TMPDIR at disk -- which is what lanes here do, because /tmp is RAM -- then landed its scratch copy
+    //    in tmpfs whenever the cache directory was unusable. That is the outcome #1801 exists to prevent, so it is pinned.
+    {
+        const std::string tdir = "/tmp/1bit-tmpdir-test-" + std::to_string(::getpid());
+        std::system(("mkdir -p " + tdir).c_str());
+        unsetenv("ONEBIT_FCONST_SCRATCH");
+        unsetenv("XDG_CACHE_HOME");
+        unsetenv("HOME");                       // no usable cache: the case the reviewer named
+        setenv("TMPDIR", tdir.c_str(), 1);
+        const auto with_tmpdir = pi::fconst_scratch_dirs();
+        size_t at_tmpdir = with_tmpdir.size(), at_slash_tmp = with_tmpdir.size();
+        for (size_t i = 0; i < with_tmpdir.size(); ++i) {
+            if (with_tmpdir[i] == tdir) at_tmpdir = i;
+            if (with_tmpdir[i] == "/tmp") at_slash_tmp = i;
+        }
+        check(at_tmpdir < with_tmpdir.size(),
+              "fconst scratch: a TMPDIR with no override and no cache is a candidate at all (it was dropped)");
+        check(at_tmpdir < at_slash_tmp,
+              "fconst scratch: and it comes BEFORE the literal /tmp, which is RAM on this box");
+        // control: with TMPDIR unset the resolver returns /tmp, so the literal must still be there and unused twice
+        unsetenv("TMPDIR");
+        const auto no_tmpdir = pi::fconst_scratch_dirs();
+        check(std::count(no_tmpdir.begin(), no_tmpdir.end(), std::string("/tmp")) == 1,
+              "fconst scratch: with TMPDIR unset, /tmp appears exactly once (no duplicate from the resolver)");
+        std::system(("rm -rf " + tdir).c_str());
+        setenv("HOME", "/home/x", 1);           // leave the environment as the arms above expect it
+    }
     std::printf("fconst scratch: order is override -> disk cache -> temp/cwd, pinned\n");
 }
 

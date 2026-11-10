@@ -2755,6 +2755,18 @@ void test_im_from_node_attrs(const std::string& root) {
     check(im2o == 9728, "im-from-node-attrs: with opaque names the fused pair still gives 9728, never q_dim/2 (" +
                             std::to_string(im2o) + ")");
 
+    // engine#1756 (review of #1757): a FUSED qkv at a 2:1 GQA ratio has N = q_dim + 2*kv_dim = 2*q_dim, so with opaque
+    // names it satisfies the fused rule against o_proj (K = q_dim) and offers q_dim as a candidate. Beside a fused gate_up
+    // that is two candidates, and the size() != 1 guard must refuse rather than answer q_dim. Never q_dim.
+    const std::string qkv21 = pb::graph(
+        {}, {mm_named("m0", "h", 2560, 8192), mm_named("m1", "q", 4096, 2560),      // qkv: N = 4096 + 2*2048; o: K 4096
+             mm_named("m2", "h", 2560, 19456), mm_named("m3", "a", 9728, 2560)});   // fused gate_up / down
+    put_file((dir / "model2q.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", qkv21)}));
+    const int im2q = pi::intermediate_size_from_graph((dir / "model2q.onnx").string(), 2560);
+    check(im2q != 4096, "im-from-node-attrs: a 2:1 fused qkv beside a fused gate_up never yields q_dim (" +
+                            std::to_string(im2q) + ")");
+    check(im2q == 0, "im-from-node-attrs: ... it yields a refusal (two candidates), not a guess (" + std::to_string(im2q) + ")");
+
     // Attention only, wider than hidden, no FFN at all: 0, never q_dim.
     const std::string attnonly = pb::graph(
         {}, {mm_named(attn + "q_proj.MatMulNBits.qweight", "h", 2560, 4096),

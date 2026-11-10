@@ -1279,8 +1279,13 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
     // product, which is w wide, so its K is w, not 2*w. So the width is a down K whose double is a gate N (engine#1756).
     // The previous rule paired dk with gate_n.count(dk) and halved it: on a real fused MLP (gate_up N = 2w, down K = w)
     // that never matched and returned 0, and with opaque tensor names it matched ATTENTION instead (o_proj's K and
-    // q_proj's N are both q_dim) and returned q_dim / 2 -- a wrong intermediate_size rather than a refusal. Attention
-    // cannot satisfy this rule: 2 * q_dim is not the N of any node that reads the hidden state.
+    // q_proj's N are both q_dim) and returned q_dim / 2 -- a wrong intermediate_size rather than a refusal.
+    //
+    // Attention CAN satisfy this rule, so the `size() != 1` guard below is load-bearing, not tidiness: a fused qkv_proj
+    // has N = q_dim + 2*kv_dim, which is exactly 2*q_dim at a 2:1 GQA ratio, and o_proj's K is q_dim, so with opaque
+    // names (no role filter) the pair matches and offers q_dim as a candidate. Beside any FFN that is a SECOND candidate
+    // and the guard refuses (0) instead of guessing; a separate gate/up returns above before reaching here. So a false
+    // match can only cost a derivation, never produce a wrong width -- keep the guard (engine#1756 review of #1757).
     std::set<int64_t> fused;
     for (const int64_t dk : down_k)
         if (gate_n.count(2 * dk)) fused.insert(dk);

@@ -28,6 +28,12 @@ execution provider, with weights pre-quantised into that provider's own layout. 
 opaque: the pack decides the quantisation, the kernel, the tiling and the schedule, and the operator
 that runs on the device is a black box the vendor compiles.
 
+This holds for every `*.onnx` in a pack, not only the transformer. A component whose inputs and outputs
+are plain tensors can still carry custom-domain nodes. For example, a 1.9 pack's `vision.onnx` holds
+`com.ryzenai:DynamicPad`, and its strategy file lists more rewrites of the same kind. Under the plain
+ONNX Runtime EPs it fails at session create, so "the pack ships it as ONNX" does not mean "`ort-run`
+can run it" (engine#2000).
+
 We do not execute those operators. Three concrete reasons, in the order they bind:
 
 1. **Licence and footprint.** The VitisAI EP arrives in the AMD wheel, which the contract forbids us

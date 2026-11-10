@@ -484,17 +484,38 @@ build/ort_run --model m.onnx --ep build/ep/libonebit_ep.so \
 | `--output NAME=FILE` | repeatable; write that output to that path |
 | `--dump-all DIR` | write every output as `DIR/<name>.bin` plus `DIR/outputs.txt`, one line per tensor with its dtype, shape, byte count and path |
 
+**Two entry points, one parser.** `1bit ort-run …` and the standalone `build/ort_run …` are the same
+function (`onebit_ort_run_main` in `onnx/ort_run.cpp`; `app/main.cpp` hands it the subcommand's
+arguments unchanged), so they accept the same flags, `--input`/`--output`/`--dump-all` included
+(since #1406). They differ only in how they are built:
+
+- `1bit ort-run` exists only in a build configured with `-DONEBIT_ORT=ON`. Without that, `1bit` says
+  `1bit: unknown command 'ort-run'`.
+- the standalone binary is its own target. `--target onebit` does not build it, so run
+  `ninja -C build ort_run`.
+
+If `1bit ort-run` answers `onebit-ort-run: unknown argument --input`, that `1bit` is older than #1406.
+Rebuild it with `--target onebit` (the target is `onebit`, while `1bit` is only its output file name:
+engine#1993) and check the binary's mtime against the checkout.
+
 Both kinds of graph keep the same EP ordering story: `--ep` libraries are registered in the order
 given and the CPU EP is always appended last, so our EP is asked first and whatever it refuses falls
 through. A graph the EP cannot help is still served — and the EP's `ONEBIT_EP_TRACE=1` log says how
 many nodes it was offered and how many it claimed, which is the difference between "the plugin was
 loaded" and "the plugin did work".
 
-Two model-file traps are worth knowing before blaming the runner: a graph exported by python `onnx`
-1.23 defaults to **IR version 14** and ONNX Runtime 1.23.2 refuses anything above **11**
-(`Unsupported model IR version: 14, max supported IR version: 11`), and a graph with any `MatMul`
-whose `K`/`N` no NPU ELF covers simply falls through to the CPU EP — which is the designed behaviour,
-not an error.
+Three model-file traps are worth knowing before blaming the runner:
+
+- A graph exported by python `onnx` 1.23 defaults to **IR version 14**, and ONNX Runtime 1.23.2
+  refuses anything above **11** (`Unsupported model IR version: 14, max supported IR version: 11`).
+- A graph with any `MatMul` whose `K`/`N` no NPU ELF covers simply falls through to the CPU EP. That
+  is the designed behaviour, not an error.
+- **A Ryzen AI pack's `*.onnx` component is not a plain graph, even when its interface is.** For
+  example, `vision.onnx` in `Qwen3.5_4B_rai_1.9.0_npu` (inputs `pixel_values` f32 and
+  `image_grid_thw` i64) fails at session create with
+  `com.ryzenai:DynamicPad(-1) is not a registered function/op`. Its strategy passes rewrite it into
+  the vendor's custom op domain ([onnx-pack.md](onnx-pack.md)). No plain EP loads it, so such a
+  component has no CPU-EP oracle here (engine#2000).
 
 `onnx/tests/ort_run_generic.sh` (ctest `ort_run_generic`, registered when python `onnx` is present)
 writes a two-node `MatMul`+`Relu` model, runs this path on it, compares the tensor it writes with

@@ -86,6 +86,10 @@ struct Dims {
 // REFUSAL (importing without the gains is the silent-garbage path), found-and-not-declared is allowed only with the
 // measurement behind it (Qwen3 packs ship the sections without the key), and neither is the ordinary case. Exposed
 // so the three can be pinned without a 4 GB pack.
+struct QkGainOffsets {
+    int64_t k_norm = 0, q_norm = 0;  // 0,0 = the gap is not the gains' shape
+};
+QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with

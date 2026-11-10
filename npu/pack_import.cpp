@@ -2508,6 +2508,19 @@ std::string Plan::manifest() const {
     return j.dump(2);
 }
 
+// engine#1889: where the per-head QK gains sit when the attention section carries them as the 640 B between the last
+// qkv tile and o_proj. Split out and exposed because this is the arithmetic a wrong answer silently mis-rotates every
+// Hunyuan pack with: a right offset reads a gain (~1.0-2.0), a wrong one reads tile bytes as bf16 and the gains come out
+// wild, and the test drives both shapes without a pack.
+QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes) {
+    const int64_t per_head = head_dim * 2;
+    if (gap_bytes != 2 * (kNormOff + per_head)) return QkGainOffsets{};
+    QkGainOffsets o;
+    o.k_norm = gap_start + kNormOff;                          // block 0 is k, as the separate-section family
+    o.q_norm = gap_start + (kNormOff + per_head) + kNormOff;  // block 1 is q
+    return o;
+}
+
 std::string qk_norm_refusal(bool declared, bool found) {
     if (declared && !found)
         return "this pack declares use_qk_norm and its per-head q/k gains are not where the block layout says "
@@ -2828,6 +2841,17 @@ Plan plan(const std::string& pack_dir) {
                             p.attn_tiles = n_kv * 2 + n_q;
                             p.o_off = attn_off + p.attn_tiles * tile_bytes + rem;
                             p.o_k = int(H);
+                            // engine#1889: that gap IS the per-head QK norms -- the note below has said so since it was
+                            // measured, and its shape is the separate-section family's, twice: [64 B header][bf16
+                            // [head_dim] gain], i.e. 2 * (kNormOff + head_dim*2) = 640 B at head_dim 128, which is
+                            // exactly the `rem` Hunyuan-7B reports. Naming it is what turns #1895's refusal ("declares
+                            // use_qk_norm, gains not located") into an import; the values are the check (a wrong offset
+                            // reads tile bytes as bf16 and the gains come out wild, a right one gives the 1.0-2.0 a norm
+                            // gain has).
+                            const QkGainOffsets qkg =
+                                qk_gain_offsets(attn_off + p.attn_tiles * tile_bytes, int64_t(d.head_dim), rem);
+                            p.knorm_off = qkg.k_norm;
+                            p.qnorm_off = qkg.q_norm;
                             static bool said2 = false;
                             if (!said2) {
                                 said2 = true;

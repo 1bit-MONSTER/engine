@@ -3856,8 +3856,27 @@ void test_qk_norm_refusal() {
     std::printf("  qk norm: 7 arms (declared+not-found refuses; found-only and neither are allowed)\n");
 }
 
+// engine#1889: the arithmetic that claims the per-head QK gains out of the 640 B Hunyuan-7B carries between its last qkv
+// tile and o_proj. A wrong offset there reads tile bytes as bf16 and mis-rotates every pack of the family, so both the
+// right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
+void test_qk_gain_offsets() {
+    const pi::QkGainOffsets o = pi::qk_gain_offsets(1000, 128, 640);
+    check(o.k_norm == 1064, "qk gains: block 0 starts one kNormOff (64 B) after the gap");
+    check(o.q_norm == 1384, "qk gains: block 1 starts after block 0 (64 B header + a 256 B bf16 [128] gain)");
+    check(o.q_norm - o.k_norm == 320, "qk gains: the two blocks are 320 B apart, the same stride as the separate family");
+    const pi::QkGainOffsets n1 = pi::qk_gain_offsets(1000, 128, 639);
+    const pi::QkGainOffsets n2 = pi::qk_gain_offsets(1000, 128, 641);
+    const pi::QkGainOffsets n3 = pi::qk_gain_offsets(1000, 128, 512);   // just the two gains, no headers
+    const pi::QkGainOffsets n4 = pi::qk_gain_offsets(1000, 256, 640);   // the right byte count at the wrong head_dim
+    check(n1.k_norm == 0 && n1.q_norm == 0, "qk gains: a gap one byte short is not the gains' shape");
+    check(n2.k_norm == 0 && n2.q_norm == 0, "qk gains: a gap one byte long is not either");
+    check(n3.k_norm == 0 && n3.q_norm == 0, "qk gains: two bare gains with no headers are not this shape");
+    check(n4.k_norm == 0 && n4.q_norm == 0, "qk gains: the byte count alone is not enough, head_dim has to agree");
+}
+
 int main(int argc, char** argv) {
     test_qk_norm_refusal();
+    test_qk_gain_offsets();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";

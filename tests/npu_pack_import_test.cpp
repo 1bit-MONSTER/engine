@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -664,6 +665,50 @@ void test_evict_stale_canonical_copies() {
     check(exists(other_form), "evict: another canonical form version is kept");
     check(exists(unrelated), "evict: unrelated files in the directory are kept");
 
+    // engine#1770 (second generation): the pre-version naming has no source identity, so a prefix match on the current form
+    // never sees it -- three such files sat in /tmp for a day at 3.6 GB each, i.e. 10.67 GiB of RAM.
+    const std::string legacy = "1bit-fconst19-12345-896-14-24.fconst";
+    const std::string legacy_other_geometry = "1bit-fconst19-12345-1536-12-28.fconst";
+    touch(legacy);
+    touch(legacy_other_geometry);
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix, legacy);
+    check(!exists(legacy), "evict: the pre-version name for THIS geometry goes (no identity to reuse)");
+    check(exists(legacy_other_geometry), "evict: ... but another geometry's pre-version name is kept");
+
+    // and the abandoned tail: a pack nobody imports again is only reachable by age, because the sweep runs when a pack is
+    // written. 0 must disable it, so the callers that pass nothing keep the old behaviour.
+    const std::string old_other = "1bit-fconst19v1-77777-1536-12-28-995712640-73345656.fconst";
+    const std::string fresh_other = "1bit-fconst19v1-88888-1536-12-28-995712640-73345656.fconst";
+    touch(old_other);
+    touch(fresh_other);
+    const auto seven_hours_ago = fs::file_time_type::clock::now() - std::chrono::hours(7);
+    fs::last_write_time(dir / old_other, seven_hours_ago, ec);
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix, legacy, 6 * 3600);
+    check(!exists(old_other), "evict: an abandoned geometry older than the age goes (the tail a write cannot reach)");
+    check(exists(fresh_other), "evict: a fresh copy of another geometry stays -- another run may be writing it");
+
+    // engine#1797 review: the age rule reads `last_write_time`, and reuse used to READ the copy without writing it -- so
+    // a file in continuous use aged past `max_age_seconds` and was swept, and the next run rewrote it. The repair is
+    // that reuse now touches the copy, which makes the timestamp mean "last use". This arm pins the rule that repair
+    // relies on: a copy with a FRESH mtime survives an age sweep, and one with an old mtime does not.
+    {
+        // DIFFERENT geometry (hidden 1536), so the name rule cannot reach them and only the age rule decides -- which is
+        // the rule this arm is about. Same geometry would test the name rule instead, and my first version of this arm
+        // made exactly that mistake and failed on it.
+        const std::string stem = "1bit-fconst19v1-";
+        const std::string aged = stem + "12345-1536-12-28-995712640-73345656.fconst";
+        const std::string fresh_name = stem + "12345-1536-12-28-500000000-11111111.fconst";
+        touch(aged);
+        touch(fresh_name);
+        std::error_code tec;
+        fs::last_write_time(dir / aged, fs::file_time_type::clock::now() - std::chrono::hours(10), tec);
+        check(!tec, "evict age: the fixture can age a copy");
+        // 6 h window: the 10 h copy goes, the one just written stays
+        pi::evict_stale_canonical_copies(dir.string(), keep, prefix, "", 6 * 3600);
+        check(!exists(aged), "evict age: a copy nobody has touched for 10 h is swept");
+        check(exists(fresh_name), "evict age: a copy with a fresh mtime survives -- what reuse's touch produces");
+        check(exists(keep), "evict age: and the copy being written is still kept");
+    }
     // The degenerate arguments must not turn into "delete the directory".
     for (const auto& f : {keep, stale}) touch(f);
     pi::evict_stale_canonical_copies(dir.string(), "", prefix);
@@ -673,7 +718,8 @@ void test_evict_stale_canonical_copies() {
     pi::evict_stale_canonical_copies((dir / "absent").string(), keep, prefix);
     check(exists(keep), "evict: an absent directory is not an error");
     fs::remove_all(dir, ec);
-    std::printf("  canonical copy eviction: 12 arms (name composition + keep/stale/geometry/pack/form/unrelated + 3 degenerate)\n");
+    std::printf("  canonical copy eviction: 16 arms (name composition + keep/stale/geometry/pack/form/unrelated + legacy name +"
+                " geometry/age rules + 3 degenerate)\n");
 }
 
 void test_modelbin_genre_refusal(const std::string& root) {

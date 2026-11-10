@@ -569,6 +569,12 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     // and a TRUNCATED copy from an interrupted run is caught by the length test rather than trusted.
     const int64_t expected = int64_t(fc.size) - int64_t(layers) * hdr_len;
     if (canonical_copy_reusable(work, expected)) {
+        // engine#1797 review: the eviction age is `last_write_time`, and a reuse used to READ the file without writing
+        // it -- so a copy in continuous use aged past `max_age_seconds` and was swept, and the next run rewrote a
+        // multi-hundred-MB file. Touching on reuse makes the timestamp mean what the rule assumes: last USE. Errors
+        // are ignored: failing to bump an mtime must not fail an import that already has a good copy.
+        std::error_code tec;
+        fs::last_write_time(fs::path(work), fs::file_time_type::clock::now(), tec);
         unmap_file(fc.map, fc.size);
         return work;
     }
@@ -706,6 +712,12 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // canonical form (a new kFconst19Rules entry, a different tile order) leaves the source file untouched, so source
     // identity alone would keep serving a copy of the old form. Bump this when the canonical form changes.
     constexpr int kCanonicalFormVersion = 1;
+    // Every generation of the scratch cache starts with this (engine#1770). Named because the sweep below has to match the
+    // generations that have no version suffix.
+    constexpr const char* kScratchStem = "1bit-fconst19";
+    // A scratch copy older than this is a pack no run is importing: no import holds one for hours, so an mtime this far back
+    // means the pack was abandoned, not that somebody is using it. Kept well above the longest import measured (~minutes).
+    constexpr int64_t kScratchMaxAgeSeconds = 6 * 3600;
     // Everything but the source identity: the group this run evicts its stale siblings from (engine#1770).
     const std::string ident_prefix = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
                                      std::to_string(dims.hidden) + "-" + std::to_string(dims.heads) + "-" +
@@ -739,7 +751,12 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
         work = cand.string();
         // This is the copy that will be written, so the copies of the same pack and geometry at other sizes/mtimes are
         // the ones nothing will reuse (engine#1770).
-        evict_stale_canonical_copies(d.string(), name, ident_prefix);
+        // The pre-version generation of the same pack and geometry: `1bit-fconst19-<tag>-<h>-<heads>-<layers>.fconst`,
+        // with no source identity in the name, so the prefix above cannot match it (engine#1770: three such files, 10.67
+        // GiB of tmpfs, had been resident all day).
+        const std::string legacy_name = std::string(kScratchStem) + "-" + tag + "-" + std::to_string(dims.hidden) + "-" +
+                                        std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst";
+        evict_stale_canonical_copies(d.string(), name, ident_prefix, legacy_name, kScratchMaxAgeSeconds);
         // Say where it went whenever that is not the ordinary place: the copy is a few hundred MB and it is scratch.
         std::error_code ec2;
         const fs::path tmpdir = [&] { try { return fs::temp_directory_path(); } catch (...) { return fs::path(); } }();
@@ -4351,15 +4368,38 @@ bool canonical_copy_reusable(const std::string& work, int64_t expected_len) {
 // a copy a reader is about to use: reuse requires the entire name to match, and the one name that can match is the one
 // being kept. A reader holding a removed file open is unaffected (the inode outlives the unlink); at worst a concurrent
 // lane rewrites a copy it would have reused, which costs a file write and no correctness.
-void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix) {
+void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix,
+                                  const std::string& legacy_name, int64_t max_age_seconds) {
     if (dir.empty() || keep_name.empty() || prefix.empty() || keep_name.size() <= prefix.size()) return;
-    std::error_code ec;
+    const std::string stem = "1bit-fconst19";
+    const auto        now  = fs::file_time_type::clock::now();
+    std::error_code   ec;
     for (fs::directory_iterator it(fs::path(dir), ec), end; !ec && it != end; it.increment(ec)) {
         const std::string base = it->path().filename().string();
-        if (base == keep_name || base.size() <= prefix.size()) continue;
-        if (base.compare(0, prefix.size(), prefix) != 0) continue;
-        std::error_code rm;
-        fs::remove(it->path(), rm);
+        if (base == keep_name) continue;
+        // same pack and geometry, different source identity: nothing reuses it
+        if (base.size() > prefix.size() && base.compare(0, prefix.size(), prefix) == 0) {
+            std::error_code rm;
+            fs::remove(it->path(), rm);
+            continue;
+        }
+        // the generation before the source identity was part of the name: at most one per pack+geometry, matched exactly
+        if (!legacy_name.empty() && base == legacy_name) {
+            std::error_code rm;
+            fs::remove(it->path(), rm);
+            continue;
+        }
+        // and any scratch copy at all that nobody has touched for max_age_seconds is an abandoned pack: a write-triggered
+        // sweep is enough for the geometry being written, but a pack that is never imported again would otherwise stay in
+        // tmpfs (i.e. in RAM) for the life of the box (engine#1770)
+        if (max_age_seconds > 0 && base.size() > stem.size() && base.compare(0, stem.size(), stem) == 0) {
+            std::error_code tec;
+            const auto      mtime = fs::last_write_time(it->path(), tec);
+            if (!tec && now - mtime > std::chrono::seconds(max_age_seconds)) {
+                std::error_code rm;
+                fs::remove(it->path(), rm);
+            }
+        }
     }
 }
 

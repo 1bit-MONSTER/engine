@@ -165,6 +165,26 @@ int main(void) {
             model_free(dm);
         }
     }
+    /* engine#1786 (item F1): three of the fifty-eight NPU2 model sources spell the per-layer prefix
+     * `model.layer.` (singular) where this forward addresses `model.layers.`. model_tensor_by_name() retries the lookup
+     * with the other spelling AFTER an exact match has failed, and this helper is the whole of that rewrite -- so it
+     * must swap the leading prefix and nothing else: a global replace would corrupt a tensor that carries the same text
+     * further along, and a near-miss prefix must be left alone rather than "helpfully" matched. */
+    {
+        char alt[512];
+        check(model_tensor_name_alt("model.layers.0.input_layernorm.weight", alt, sizeof alt) == 1 &&
+                  strcmp(alt, "model.layer.0.input_layernorm.weight") == 0,
+              "ALT: model.layers. -> model.layer., the rest untouched");
+        check(model_tensor_name_alt("model.layer.0.input_layernorm.weight", alt, sizeof alt) == 1 &&
+                  strcmp(alt, "model.layers.0.input_layernorm.weight") == 0,
+              "ALT: and back, model.layer. -> model.layers.");
+        check(model_tensor_name_alt("lm_head.weight", alt, sizeof alt) == 0,
+              "ALT: a model-level tensor has no per-layer spelling to try");
+        check(model_tensor_name_alt("model.layersX.0.proj.weight", alt, sizeof alt) == 0,
+              "ALT: a near-miss prefix is not matched helpfully");
+        check(model_tensor_name_alt("model.layers.0.a.weight", alt, 16) == 0,
+              "ALT: a too-small buffer reports no alternative rather than truncating");
+    }
     char cmd[96];
     snprintf(cmd, sizeof cmd, "rm -rf %s", dir);
     if (system(cmd) != 0) fprintf(stderr, "could not remove %s\n", dir);

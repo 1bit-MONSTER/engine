@@ -926,6 +926,157 @@ void test_evict_stale_canonical_copies() {
                 " geometry/age rules + 3 degenerate)\n");
 }
 
+// engine#1907: the sweep ran only in the directory being written. Since #1801 that is the on-disk cache, so /tmp was never swept
+// again, and 17.0 GiB of copies left there by older binaries stayed in tmpfs (RAM). Every candidate is swept now; one that does
+// not exist is not created.
+void test_sweep_fconst_scratch_dirs() {
+    const fs::path root = fs::temp_directory_path() / ("1bit-sweep-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    const fs::path written = root / "cache", other = root / "tmp", absent = root / "never-made";
+    fs::create_directories(written);
+    fs::create_directories(other);
+    auto touch = [&](const fs::path& d, const std::string& base) {
+        std::ofstream o(d / base, std::ios::binary | std::ios::trunc);
+        o << 'x';
+    };
+    const std::string prefix = "1bit-fconst19v1-12345-896-14-24-";
+    const std::string keep = prefix + "291653952-76263210.fconst";
+    const std::string stale = prefix + "291653952-99999.fconst";
+    const std::string legacy = "1bit-fconst19-12345-896-14-24.fconst";
+    const std::string old_other = "1bit-fconst19v1-77777-1536-12-28-995712640-73345656.fconst";
+    const std::string fresh_other = "1bit-fconst19v1-88888-1536-12-28-995712640-73345656.fconst";
+    for (const auto& f : {keep, stale, legacy, old_other, fresh_other}) touch(other, f);
+    touch(written, keep);
+    const auto seven_hours_ago = fs::file_time_type::clock::now() - std::chrono::hours(7);
+    fs::last_write_time(other / old_other, seven_hours_ago, ec);
+    pi::sweep_fconst_scratch_dirs({written.string(), other.string(), absent.string()}, written.string(), keep, prefix, legacy,
+                                  6 * 3600);
+    const auto in_other = [&](const std::string& b) { return fs::exists(other / b); };
+    check(!in_other(old_other), "sweep: an abandoned copy in a directory that was NOT written goes (the /tmp left behind by #1801)");
+    check(!in_other(stale) && !in_other(legacy),
+          "sweep: a stale identity and the legacy name of this pack go from the other directory too");
+    check(in_other(keep), "sweep: the exact name is kept in every directory (another environment may reuse it there)");
+    check(in_other(fresh_other), "sweep: a fresh copy of another pack stays -- another run may be writing it");
+    check(fs::exists(written / keep), "sweep: the copy being written is kept");
+    check(!fs::exists(absent), "sweep: a candidate that does not exist is not created");
+    // #1915 review, boundary arms. (a) A file that is not fconst19 scratch is kept however old it is. (b) The current
+    // directory is never swept unless it is the directory being written -- under every spelling of it.
+    {
+        const fs::path lane = root / "lane-cwd";
+        fs::create_directories(lane);
+        const std::string notes = "notes-about-1bit-fconst19.txt";
+        for (const auto& d : {other, lane}) {
+            touch(d, notes);
+            touch(d, old_other);
+            fs::last_write_time(d / notes, seven_hours_ago, ec);
+            fs::last_write_time(d / old_other, seven_hours_ago, ec);
+        }
+        const fs::path was = fs::current_path();
+        fs::current_path(lane);
+        pi::sweep_fconst_scratch_dirs({written.string(), other.string(), ".", lane.string(), (lane / ".." / "lane-cwd").string()},
+                                      written.string(), keep, prefix, legacy, 6 * 3600);
+        const bool cwd_kept = fs::exists(lane / old_other);
+        // and when the cwd IS the directory being written, the evict-on-write rule still applies to it
+        pi::sweep_fconst_scratch_dirs({lane.string(), other.string()}, lane.string(), keep, prefix, legacy, 6 * 3600);
+        const bool cwd_written_swept = !fs::exists(lane / old_other);
+        fs::current_path(was);
+        check(!in_other(old_other), "sweep: (control) the same old file in a directory that is not the cwd goes");
+        check(in_other(notes) && fs::exists(lane / notes), "sweep: a file that is not fconst19 scratch is kept however old");
+        check(cwd_kept, "sweep: the current directory is never swept, as '.', as its absolute path or through '..'");
+        check(cwd_written_swept, "sweep: unless it is the directory being written (evict-on-write, engine#1770)");
+    }
+    fs::remove_all(root, ec);
+    std::printf("  scratch sweep: every candidate directory, 10 arms\n");
+}
+
+// #1915 review: the arms above call the sweep; nothing ran the importer and looked. "Delete the call site and the suite
+// stays green" was true. This runs the production path once -- import_pack() on a crafted pack with a Token .fconst --
+// with a scratch directory that already holds an abandoned copy of ANOTHER pack, and asserts that copy is gone. With an
+// override set only that directory is swept, so the second directory's copy must still be there.
+void test_sweep_is_wired(const std::string& root) {
+    const fs::path dir = fs::path(root) / "sweep-wired";
+    const fs::path scratch = fs::temp_directory_path() / ("1bit-sweep-wired-" + std::to_string(::getpid()));
+    const fs::path cache_home = fs::temp_directory_path() / ("1bit-sweep-wired-xdg-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::remove_all(scratch, ec);
+    fs::remove_all(cache_home, ec);
+    fs::create_directories(dir / "cache");
+    fs::create_directories(scratch);
+    fs::create_directories(cache_home / "1bit" / "fconst19");
+    const int H = 128, L = 8, V = 64;
+    {
+        const int64_t stride = 1 << 20, second = 262144;
+        std::string fc(size_t(int64_t(L) * stride + 64 + size_t(H) * 2), '\0');
+        for (int l = 0; l <= L; ++l) {
+            fc[size_t(int64_t(l) * stride)] = char(0x86);
+            fc[size_t(int64_t(l) * stride) + 1] = char(0x35);
+            if (l < L) {
+                fc[size_t(int64_t(l) * stride + second)] = char(0x86);
+                fc[size_t(int64_t(l) * stride + second) + 1] = char(0x35);
+            }
+        }
+        put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+    }
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06})");
+    put_file((dir / "model.onnx.data").string(), std::string(size_t(V) * size_t(H) * 2, '\x11'));
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", 0, uint64_t(V) * uint64_t(H) * 2, 10)},
+                       {}));
+    const std::string foreign_old = "1bit-fconst19v1-77777-1536-12-28-995712640-73345656.fconst";
+    const std::string foreign_fresh = "1bit-fconst19v1-88888-1536-12-28-995712640-73345656.fconst";
+    const std::string unrelated = "keep-me.txt";
+    const auto seven_hours_ago = fs::file_time_type::clock::now() - std::chrono::hours(7);
+    for (const fs::path& d : {scratch, cache_home / "1bit" / "fconst19"})
+        for (const auto& f : {foreign_old, foreign_fresh, unrelated}) {
+            put_file((d / f).string(), "x");
+            if (f != foreign_fresh) fs::last_write_time(d / f, seven_hours_ago, ec);
+        }
+    struct Env {
+        std::string name, value;
+        bool had;
+    };
+    std::vector<Env> saved;
+    for (const char* n : {"ONEBIT_FCONST_SCRATCH", "XDG_CACHE_HOME"}) {
+        const char* v = std::getenv(n);
+        saved.push_back({n, v ? v : "", v != nullptr});
+    }
+    setenv("ONEBIT_FCONST_SCRATCH", scratch.c_str(), 1);
+    setenv("XDG_CACHE_HOME", cache_home.c_str(), 1);
+    const std::string out = (fs::temp_directory_path() / ("oga_pack_import_sweepwired." + std::to_string(::getpid()))).string();
+    fs::remove_all(out, ec);
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    try {
+        (void)pi::import_pack(dir.string(), out, allow);
+    } catch (const std::exception&) {
+        // the import's own outcome is not what is under test: the scratch copy is made, and swept around, before any
+        // refusal about this fixture's empty payload
+    }
+    for (const auto& e : saved) {
+        if (e.had) setenv(e.name.c_str(), e.value.c_str(), 1);
+        else unsetenv(e.name.c_str());
+    }
+    bool wrote_here = false;
+    for (const auto& e : fs::directory_iterator(scratch, ec))
+        if (e.path().filename().string().rfind("1bit-fconst19v", 0) == 0 && e.path().filename().string() != foreign_fresh)
+            wrote_here = true;
+    check(wrote_here, "sweep wiring: (premise) the import put its scratch copy in the override directory");
+    check(!fs::exists(scratch / foreign_old), "sweep wiring: an abandoned copy of another pack is GONE after a real import");
+    check(fs::exists(scratch / foreign_fresh), "sweep wiring: a fresh copy of another pack is still there");
+    check(fs::exists(scratch / unrelated), "sweep wiring: a file that is not fconst19 scratch is still there");
+    check(fs::exists(cache_home / "1bit" / "fconst19" / foreign_old),
+          "sweep wiring: with an override set, the cache directory is NOT swept (another lane's files stay)");
+    fs::remove_all(out, ec);
+    fs::remove_all(dir, ec);
+    fs::remove_all(scratch, ec);
+    fs::remove_all(cache_home, ec);
+}
+
 void test_modelbin_genre_refusal(const std::string& root) {
     const fs::path dir = fs::path(root) / "crafted-modelbin";
     fs::remove_all(dir);
@@ -3342,6 +3493,19 @@ void test_fconst_block_headers() {
 // cache whose size is the pack's own .fconst, and on this box /tmp is tmpfs, so where it lands is a RAM decision. The bug was a
 // cache directory that was never created -- every pack then fell through to /tmp and nothing noticed.
 void test_fconst_scratch_order() {
+    // engine#1907: this arm rewrites four variables, and it used to leave HOME=/home/x with TMPDIR and the override unset, so
+    // every crafted import after it fell through to the literal /tmp (179 of the 188 files found there were this suite's).
+    // Save and restore them, so the rest of the run keeps the per-run scratch directory main() set.
+    struct Saved { const char* name; bool had; std::string value; };
+    std::vector<Saved> saved;
+    for (const char* n : {"ONEBIT_FCONST_SCRATCH", "XDG_CACHE_HOME", "HOME", "TMPDIR"}) {
+        const char* v = std::getenv(n);
+        saved.push_back({n, v != nullptr, v ? v : ""});
+    }
+    struct Restore {
+        std::vector<Saved>& s;
+        ~Restore() { for (const auto& x : s) { if (x.had) setenv(x.name, x.value.c_str(), 1); else unsetenv(x.name); } }
+    } restore{saved};
     const auto first_with = [](const char* scratch, const char* xdg, const char* home) {
         if (scratch) setenv("ONEBIT_FCONST_SCRATCH", scratch, 1); else unsetenv("ONEBIT_FCONST_SCRATCH");
         if (xdg) setenv("XDG_CACHE_HOME", xdg, 1); else unsetenv("XDG_CACHE_HOME");
@@ -3396,7 +3560,6 @@ void test_fconst_scratch_order() {
         check(std::count(no_tmpdir.begin(), no_tmpdir.end(), std::string("/tmp")) == 1,
               "fconst scratch: with TMPDIR unset, /tmp appears exactly once (no duplicate from the resolver)");
         std::system(("rm -rf " + tdir).c_str());
-        setenv("HOME", "/home/x", 1);           // leave the environment as the arms above expect it
     }
     std::printf("fconst scratch: order is override -> disk cache -> temp/cwd, pinned\n");
 }
@@ -4015,6 +4178,107 @@ void test_embedding_f32_component(const std::string& root) {
     fs::remove_all(b);
 }
 
+// engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
+// a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
+// which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
+// the emptiness. No weights are read and no device is opened: the header is 26,496 B on the smallest real pack.
+void test_q4nx_container(const std::string& root) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(root) / "q4nx-container";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    const auto write_container = [&](const std::string& name, const std::string& header_json, int64_t payload,
+                                     bool truncate_header) {
+        const fs::path p = dir / name;
+        std::string out(8, '\0');
+        int64_t n = int64_t(header_json.size());
+        for (int i = 0; i < 8; ++i) out[size_t(i)] = char((n >> (8 * i)) & 0xFF);
+        out += truncate_header ? header_json.substr(0, header_json.size() / 2) : header_json;
+        out.append(size_t(payload), '\x22');
+        std::ofstream f(p, std::ios::binary);
+        f.write(out.data(), std::streamsize(out.size()));
+        return p.string();
+    };
+
+    // (a) the real shape: one BF16 vector and one packed I8 matrix, with the payload the offsets imply.
+    {
+        const std::string hdr =
+            R"({"model.layers.0.input_layernorm.weight":{"dtype":"BF16","shape":[640],"data_offsets":[0,1280]},)"
+            R"("model.layers.0.mlp.down_proj.weight":{"dtype":"I8","shape":[640,1280],"data_offsets":[1280,820480]}})";
+        const auto c = pi::read_q4nx_container(write_container("two.q4nx", hdr, 820480, false));
+        check(!c.tensors.empty(), "q4nx container: a two-tensor header reads (" + c.why + ")");
+        check(c.tensors.size() == 2, "q4nx container: both tensors are reported");
+        check(c.header_bytes == int64_t(hdr.size()), "q4nx container: the 8-byte length is the header's own");
+        check(c.payload_bytes == 820480, "q4nx container: the payload is the sum of the data_offsets spans (got " +
+                                             std::to_string(c.payload_bytes) + ")");
+        bool saw_bf16 = false, saw_i8 = false;
+        for (const auto& t : c.tensors) {
+            if (t.dtype == "BF16" && t.shape.size() == 1 && t.shape[0] == 640) saw_bf16 = true;
+            // The packed matrix: I8 with TWICE the logical element count of a 640-wide FFN is the NPU2 shape.
+            if (t.dtype == "I8" && t.shape.size() == 2 && t.shape[0] == 640 && t.shape[1] == 1280) saw_i8 = true;
+        }
+        check(saw_bf16 && saw_i8, "q4nx container: dtype and shape survive for a vector and a packed matrix");
+    }
+
+    // (b) `__metadata__` is a string map, not a tensor, and the vendor's converter does not always write one.
+    {
+        const std::string hdr =
+            R"({"__metadata__":{"group_size":"32"},"t":{"dtype":"I8","shape":[32,256],"data_offsets":[0,5120]}})";
+        const auto c = pi::read_q4nx_container(write_container("meta.q4nx", hdr, 5120, false));
+        check(c.tensors.size() == 1 && c.tensors[0].name == "t",
+              "q4nx container: __metadata__ is skipped, not counted as a tensor");
+    }
+
+    // (c) a truncated header is named, and reports no tensors rather than a partial inventory.
+    {
+        const std::string hdr = R"({"a":{"dtype":"I8","shape":[32,256],"data_offsets":[0,5120]}})";
+        const auto c = pi::read_q4nx_container(write_container("short.q4nx", hdr, 5120, true));
+        check(c.tensors.empty() && !c.why.empty(),
+              "q4nx container: a truncated header names the problem instead of reporting no tensors (" + c.why + ")");
+    }
+
+    // (e) engine#1786: a pack that IS a container and has NO graph is recognised and reported, not refused at the first
+    // byte. The alternative -- `npu-pack info` answering a 0.5 GB model source with "cannot open <pack>/model.onnx" --
+    // describes a missing file on a pack that has no graph by design, and says nothing about what it does contain.
+    {
+        const fs::path pdir = dir / "container-genre";
+        fs::create_directories(pdir, ec);
+        const std::string hdr =
+            R"({"model.embed_tokens.weight":{"dtype":"BF16","shape":[64,8],"data_offsets":[0,1024]},)"
+            R"("model.layers.0.mlp.down_proj.weight":{"dtype":"I8","shape":[8,16],"data_offsets":[1024,1152]}})";
+        write_container("container-genre/model.q4nx", hdr, 1152, false);
+        const pi::Plan p = pi::plan(pdir.string());
+        check(p.container_tensors == 2, "container genre: plan() reports the container's tensors (" +
+                                            std::to_string(p.container_tensors) + ")");
+        check(p.container_payload_bytes == 1152, "container genre: and the payload the offsets imply");
+        check(p.container_dtypes.count("BF16") == 1 && p.container_dtypes.count("I8") == 1,
+              "container genre: and both dtypes it found");
+        // The note must say it is NOT importable: a plan that listed these as importable would be worse than the
+        // refusal it replaces, because it would claim a compute mapping this importer does not have.
+        check(p.container_note.find("not importable") != std::string::npos,
+              "container genre: the note says the pack is recognised and not importable (" + p.container_note + ")");
+        const json m = json::parse(p.manifest());
+        check(m.contains("container") && m["container"]["tensors"] == 2,
+              "container genre: and manifest() reports it, so npu-pack info prints it");
+    }
+
+    // (d) an implausible length is refused by the number, so a mis-typed length cannot make the caller allocate it.
+    {
+        const fs::path p = dir / "huge.q4nx";
+        std::string out(8, '\0');
+        const int64_t n = int64_t(1) << 40;
+        for (int i = 0; i < 8; ++i) out[size_t(i)] = char((n >> (8 * i)) & 0xFF);
+        {
+            std::ofstream f(p, std::ios::binary);
+            f.write(out.data(), std::streamsize(out.size()));
+        }   // flushed and closed: the reader must see the bytes, not an empty file
+        const auto c = pi::read_q4nx_container(p.string());
+        check(c.tensors.empty() && c.why.find("implausible") != std::string::npos,
+              "q4nx container: an implausible header length is refused by the number (" + c.why + ")");
+    }
+}
+
 
 // engine#1725: a multi-component embedding carries a PER-LAYER table and its projection norm beside the token table, and
 // the importer writes both into the container so the forward path can gather them. Measured shapes on
@@ -4583,6 +4847,14 @@ void test_header_witness_refusal() {
 }
 
 int main(int argc, char** argv) {
+    // engine#1907: every crafted 1.9 import writes a canonical copy into the scratch cache. Without this the suite left 0-byte
+    // copies in the user's real ~/.cache/1bit/fconst19 and in /tmp on every run. Give the run its own directory, removed at exit.
+    const fs::path run_scratch = fs::temp_directory_path() / ("1bit-pack-test-scratch-" + std::to_string(::getpid()));
+    if (!std::getenv("ONEBIT_FCONST_SCRATCH")) setenv("ONEBIT_FCONST_SCRATCH", run_scratch.c_str(), 1);
+    struct ScratchCleanup {
+        fs::path p;
+        ~ScratchCleanup() { std::error_code ec; fs::remove_all(p, ec); }
+    } scratch_cleanup{run_scratch};
     test_header_witness_refusal();
     test_encode_tile_code_range();
     test_q4_writer_code_range();
@@ -4609,6 +4881,8 @@ int main(int argc, char** argv) {
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
     test_external_import_success(golden_dir.empty() ? "." : golden_dir);
         test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
+        test_sweep_fconst_scratch_dirs();
+        test_sweep_is_wired(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);
@@ -4621,6 +4895,7 @@ int main(int argc, char** argv) {
         test_fconst_variable_stride(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
+        test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);

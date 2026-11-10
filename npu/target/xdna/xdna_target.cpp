@@ -20,6 +20,7 @@
 //
 // docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
 #include "target/xdna/xdna_target.h"
+#include "batch_width.h"
 
 #include <algorithm>
 #include <chrono>
@@ -281,8 +282,33 @@ bool XdnaTarget::weight_cached(int layer, int key) const {
 }
 
 int XdnaTarget::max_rows() const {
-    if (pb16i_) { for (int i = 0; i < ndesigns_; i++) if (ctx16_[i]) return ctx16_[i]->MD; }
-    for (int i = 0; i < ndesigns_; i++) if (ctx_[i]) return ctx_[i]->MD;
+    /* engine#1900/#1903: MIN over the loaded per-role widths, never the first populated one. This width IS the chunk
+     * width, and the activation BO holds exactly that many rows -- an over-wide launch reads and poisons past the BO,
+     * which is memory corruption rather than a slow path (engine#1372). Returning the FIRST entry meant a mixed set
+     * answered whichever role happened to be index 0, so a 16/16/128 set could answer 128: the dangerous direction.
+     * The pb16i_ case keeps main's fall-through (a pb16i set that adopted only its prefill kernels has no 16-row twin,
+     * and answering 1 there would walk single-row passes), and #1904's plan-derived width for the sealed route stays
+     * below exactly as merged. */
+    const int n = ndesigns_ < Q4NX_MAX_DESIGNS ? ndesigns_ : Q4NX_MAX_DESIGNS;
+    int widths16[Q4NX_MAX_DESIGNS] = {0};
+    bool any16 = false;
+    if (pb16i_)
+        for (int i = 0; i < n; i++)
+            if (ctx16_[i]) { widths16[i] = ctx16_[i]->MD; any16 = true; }
+    if (any16) return onebit::npu::batch_width_min(widths16, n, 1);
+    int widths[Q4NX_MAX_DESIGNS] = {0};
+    bool any_ctx = false;
+    for (int i = 0; i < n; i++)
+        if (ctx_[i]) { widths[i] = ctx_[i]->MD; any_ctx = true; }
+    if (any_ctx) return onebit::npu::batch_width_min(widths, n, 1);
+    // engine#1900: the sealed/mono-ELF generation adopts its kernel set through a path that fills neither array, so both
+    // loops above find nothing and this returned 1. This is the CHUNK WIDTH (q4nx_forward's `blk = max_batch_rows()`), so
+    // those packs batched ONE ROW per launch however wide their design is -- `models/npu/bonsai2-27b-NPU-b8` states prefill
+    // M=128 and reported 1. Only reachable when no per-role context was adopted, so nothing that has one changes; and the
+    // plan is the pack's own statement of the width its kernels were built for (a plan whose M disagrees with adopted
+    // kernels is already refused above). Still 1 when the plan states nothing: guessing a width launches into a BO sized for
+    // fewer rows, which is the memory-corruption path engine#1372 records.
+    if (plan_.prefill_m > 0) return plan_.prefill_m;
     return 1;
 }
 
@@ -1054,8 +1080,13 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         kctx.readback();
         const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        out.assign((size_t)M * (size_t)N, 0.0f);
-        kctx.dequant_pb16i(out.data(), M, N, ascales.data(), slot->eref, kctx.pb16i_planes);
+        {
+            // `out` is already M x N (sized before the refusal paths above) and every element is written here, so it
+            // is not zero-filled a second time. Timed on its own: this runs after `tr`, so no launch phase column
+            // ever counted it, and the batched [lh] table had it under UNATTRIBUTED (engine#1990).
+            q4nx_lh::LhScope _t_deq(LH_DEQ_OUT);
+            kctx.dequant_pb16i(out.data(), M, N, ascales.data(), slot->eref, kctx.pb16i_planes);
+        }
         // The batched (prefill) twin of the trace above: a short prompt runs step_batch, so this
         // is the path a 1-token request actually takes.
         if (const char* tl = getenv("NPU_PB16I_TRACE")) {
@@ -1149,6 +1180,18 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     }
     const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     out.resize((size_t)M * N);
+    // engine#1808: the device's per-column weight scales, KEYED by (layer, N, K) so it can be paired with the host
+    // arm's dump exactly. Index pairing was tried first and is meaningless -- the two sides reach the GEMM a
+    // different number of times (384 device dumps against 1024 arm dumps on the same request).
+    if (const char* gdir = getenv("NPU_I8_GS_DUMP")) {
+        static int n = 0;
+        char path[4096];
+        std::snprintf(path, sizeof path, "%s/dev_L%d_N%d_K%d_%03d.bin", gdir, ar.layer, N, K, n++);
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            if (gs && !gs->empty()) std::fwrite(gs->data(), sizeof(float), (size_t)N, f);
+            std::fclose(f);
+        }
+    }
     for (int m = 0; m < M; m++) {
         const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
         const float asc = ascales[(size_t)m];

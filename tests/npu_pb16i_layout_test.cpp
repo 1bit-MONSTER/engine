@@ -206,6 +206,56 @@ int main() {
     for (const geom& g : bad)
         check(!q4nx_pb16i::fits(g.K, g.N), "a non-whole-tile geometry must be refused", g.K, g.N);
 
+    // 7: dequant_rows() (engine#1990) is scale_i64() per element, bit for bit -- one plane and two, the exponents a
+    // container uses, the edges of the table's range, and exponents outside it (which must take the per-element form
+    // and still agree). The sums include 0, +-1, the int32 extremes and two-plane values past 2^53, where
+    // (double)s itself rounds: both forms round it the same way first.
+    {
+        struct Case { int planes, M, N, e_lo, e_hi; const char* what; };
+        const Case cases[] = {
+            {1, 16, 1024, -40, -8, "one plane, container-like exponents"},
+            {2, 16, 1024, -40, -8, "two planes, container-like exponents"},
+            {1, 3, 257, q4nx_pb16i::kExpLo, q4nx_pb16i::kExpLo + 3, "one plane, lowest table exponents"},
+            {2, 3, 257, q4nx_pb16i::kExpHi - 3, q4nx_pb16i::kExpHi, "two planes, highest table exponents"},
+            {2, 2, 64, -1100, -1000, "exponents below the table range (per-element path)"},
+            {1, 2, 64, 950, 1100, "exponents above the table range (per-element path)"},
+            {1, 1, 1, 0, 0, "a single element"},
+        };
+        uint32_t x = 0x9e3779b9u;
+        auto next = [&]() { x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x; };
+        size_t compared = 0, nonzero = 0;
+        for (const Case& c : cases) {
+            const int ND = c.N + 5;                      // the kernel's row is wider than the columns read
+            const int row = c.planes > 1 ? 2 * ND : ND;
+            std::vector<int32_t> Cm((size_t)c.M * (size_t)row);
+            for (int32_t& v : Cm) v = (int32_t)next();
+            const int32_t edge[] = {0, 1, -1, INT32_MAX, INT32_MIN};
+            for (size_t i = 0; i < Cm.size() && i < 40; i++) Cm[i] = edge[i % 5];
+            std::vector<int16_t> eref((size_t)c.N);
+            for (int n = 0; n < c.N; n++) eref[(size_t)n] = (int16_t)(c.e_lo + (int)(next() % (uint32_t)(c.e_hi - c.e_lo + 1)));
+            std::vector<float> asc((size_t)c.M);
+            for (float& a : asc) a = 1e-4f * (float)(1 + next() % 5000);
+            std::vector<float> want((size_t)c.M * (size_t)c.N), got(want.size(), -7.0f);
+            for (int m = 0; m < c.M; m++) {
+                const int32_t* lo = Cm.data() + (size_t)m * (size_t)row;
+                for (int n = 0; n < c.N; n++)
+                    want[(size_t)m * (size_t)c.N + n] =
+                        q4nx_pb16i::scale_i64(q4nx_pb16i::sum_of(lo + n, lo + ND + n, c.planes > 1 ? 1 : 0),
+                                              eref[(size_t)n]) * asc[(size_t)m];
+            }
+            std::vector<double> scratch;
+            q4nx_pb16i::dequant_rows(got.data(), Cm.data(), ND, c.M, c.N, asc.data(), eref.data(), c.planes, scratch);
+            size_t diff = 0;
+            for (size_t i = 0; i < want.size(); i++) {
+                if (std::memcmp(&want[i], &got[i], sizeof(float)) != 0) diff++;
+                if (want[i] != 0.0f) nonzero++;
+            }
+            compared += want.size();
+            if (diff) { std::printf("FAIL dequant_rows != scale_i64 per element: %s (%zu of %zu differ)\n", c.what, diff, want.size()); failures++; }
+        }
+        if (nonzero < compared / 4) { std::printf("FAIL dequant_rows arm compares mostly zeros (%zu of %zu nonzero)\n", nonzero, compared); failures++; }
+    }
+
     if (failures) {
         std::printf("npu_pb16i_layout_test: %d failure(s)\n", failures);
         return 1;

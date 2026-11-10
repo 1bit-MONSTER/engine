@@ -1380,6 +1380,66 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
     if (fused.size() != 1) return 0;
     return int(*fused.begin());
 }
+// engine#1740: a 1.9 pack's stride is KNOWN before the eps vote -- canonical_token_fconst() derives it from the 112-byte
+// per-head header to build its copy -- but `locate_fconst`'s epsilon-anchor vote can still lose when the payload is dense in
+// eps-SHAPED bytes (bf16 1e-6 followed by ten zeros is not rare in 4-bit weights). Measured on Qwen2-7B 1.9: the right stride
+// won only 52.6 % of lag-2 pairs, under the 66 % bar, so a 3.8 GB pack structurally identical to two measured ones was refused
+// with "the epsilon headers do not repeat with a single period" while its own header reported the stride exactly.
+// So ask the header first on the SOURCE file (the canonical copy has the 1.9 header removed by construction), and keep the eps
+// vote as the fallback for packs with no 1.9 header -- the 1.8 / R1-Distill line, where it works today.
+FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
+    FconstGeom g = locate_fconst(tok, dims.eps_bits);
+    const std::string src = find_token_fconst(pack_dir);
+    if (src.empty()) return g;
+    Fconst fc = open_fconst(src);
+    int64_t hdr_off = 0, stride9 = 0;
+    const bool is19 = fconst19_detect(fc, dims.heads, dims.layers, &hdr_off, &stride9);
+    unmap_file(fc.map, fc.size);
+    if (!is19) return g;                                  // no 1.9 header: the eps vote is the only witness, keep it
+    const int64_t stride8 = stride9 - int64_t(dims.heads) * 4;
+    if (stride8 <= 0) return g;
+    if (g.stride != 0 && g.stride != stride8) {
+        // Two witnesses that disagree: say so rather than pick. They cannot both be right, and a wrong stride reads weights
+        // from the wrong place instead of failing cleanly.
+        g.why = "the 1.9 header gives stride " + std::to_string(stride8) + " and the epsilon anchors give " +
+                std::to_string(g.stride) + "; refusing rather than choosing";
+        g.stride = 0;
+        return g;
+    }
+    g.stride = stride8;
+    g.why.clear();
+    // The second header offset (`h1`) is what tells the payload reader whether a block holds 2 eps headers or 4, so the eps
+    // vote failing must not leave it at 0: with the stride known, the anchors' offsets *within* a block repeat, and the mode
+    // of `pos mod stride` (excluding 0, the block start) is the second header. This is the same pool of anchors the vote
+    // could not win on, used for a question that does not need a dominance test -- 28 blocks each contribute their residue.
+    const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
+    if (!pos.empty()) {
+        std::map<int64_t, int> off;
+        for (const int64_t q : pos) {
+            const int64_t r = q % stride8;
+            if (r > 0 && r < stride8) ++off[r];
+        }
+        int best = 0;
+        int64_t best_off = 0;
+        for (const auto& [o, n] : off)
+            if (n > best) { best = n; best_off = o; }
+        if (best_off > 0) {
+            // Populate the same fields `locate_fconst` would have: `hdr` is the in-block header list and the reader
+            // classifies a pack as a 2-header (one inner anchor) or 4-header (three) block from its SIZE. Setting only
+            // h1 left `hdr` empty, so a pack whose anchors could not win the vote was classified as "1 epsilon header"
+            // and every attention projection refused while the MLP imported byte-exact -- measured on Qwen2-7B 1.9.
+            // The scan window is the first GiB (about 8 blocks of this geometry), so the right residue repeats ~8 times
+            // against 1-2 for a payload coincidence. Requiring `layers/2` was too strict and silently dropped the real one.
+            if (best >= 3) {                             // the residue repeats across blocks: a real section boundary
+                g.h1 = best_off;
+                g.hdr.assign(1, best_off);               // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
+                g.period = 2;
+            }
+        }
+    }
+    return g;
+}
+
 std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }
 
 // engine#1638: the geometry READ (not just its dims), so a test can assert where each number came from -- the
@@ -2643,7 +2703,7 @@ Plan plan(const std::string& pack_dir) {
                                                                   "payload is not 64-row tiles of this shape";
             p.mlp_note = p.attn_note;
         } else {
-            const FconstGeom g = locate_fconst(tok, p.dims.eps_bits);
+            const FconstGeom g = locate_fconst_with_header(tok, pack_dir, p.dims);
             if (g.stride == 0) {
                 p.attn_note = "layer blocks not located: " + g.why;
                 p.mlp_note = p.attn_note;
@@ -3805,7 +3865,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     {
         std::string path_why;
         const std::string path = materialise_token_fconst(pack_dir, p.dims);
-        const FconstGeom g = locate_fconst(path, p.dims.eps_bits);
+        const FconstGeom g = locate_fconst_with_header(path, pack_dir, p.dims);
         // refusals decided while reading the payload (a tile that does not survive its own round trip,
         // or an o_proj bias the container has nowhere to put); they land before anything is written
         std::vector<std::string> late;

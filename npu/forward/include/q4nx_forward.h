@@ -286,7 +286,6 @@ private:
                              std::string& err);
     bool run_lm_head_gemv(const std::vector<float>& h, std::vector<float>& logits);
 
-    Q4nxForwardConfig & c_ = model_.c;   // the model owns its config (A3)
     ModelWeights* mw_ = nullptr;
     xrt::device* dev_ = nullptr;
 
@@ -300,6 +299,10 @@ private:
     // linear/sliding attention, per-layer-type RoPE, mRoPE) are REFUSED in
     // init() rather than silently run with the wrong math.
     Q4nxSemantics & sem_ = model_.sem;
+    // The model owns its config too; bound here rather than where the value member used to sit, because a reference
+    // member is initialised in DECLARATION order — above `model_` this bound a subobject of an object whose lifetime
+    // had not started (latent UB that only worked because the address is fixed).
+    Q4nxForwardConfig & c_ = model_.c;
 
     // Design set DERIVED from c_ (no model-specific geometry constant): four
     // kernels for fused gate/up, five when gate and up are split.

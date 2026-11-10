@@ -1168,6 +1168,22 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
                 ++from_text_config;
             }
         }
+        // `rope_theta` (and the rotary block's other keys) can be ONE LEVEL DEEPER still: Qwen3-VL-4B declares
+        // `text_config.rope_parameters = {mrope_interleaved: true, mrope_section: [24,20,20], rope_theta: 5000000,
+        // rope_type: default}` with no `rope_theta` anywhere else, so this reader fell back to its 10000 default and the
+        // importer warned that the pack's cos/sin caches "no plain theta explains (best 0.5918 at 3.2e+06, declared 10000)".
+        // Measured against the pack's own cos_cache (262144 x 64, external): **theta 5e6 reproduces row 1 to max|d|
+        // 0.000000**, 10000 is off by 0.088 and 3.2e6 by 0.005 -- so the caches are not unexplained at all, the theta was
+        // simply not read (engine#1503). Gaps only, never overriding, same rule as the lift above.
+        int from_rope_params = 0;
+        if (cfg.contains("rope_parameters") && cfg["rope_parameters"].is_object()) {
+            for (auto it = cfg["rope_parameters"].begin(); it != cfg["rope_parameters"].end(); ++it) {
+                if (cfg.contains(it.key()) || it.value().is_null()) continue;
+                cfg[it.key()] = it.value();
+                ++from_rope_params;
+            }
+        }
+        if (from_rope_params > 0 && source) *source += " + config.json rope_parameters";
         if (from_text_config > 0 && source) *source += " + config.json text_config";
         if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
@@ -3354,6 +3370,17 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     if (const std::string why = weight_layout_refusal(opt.weight_layout); !why.empty())
         throw std::runtime_error("--weight-layout: " + why);
     json c;
+    // engine#1794 review: the container's OWN config is what the forward reads (`q4nx_semantics.c:121` value_for_top,
+    // depth 1 only), and this writer started from an empty json -- so a mRoPE declaration that lives only at
+    // `text_config.rope_parameters` was dropped, and the pack would be served as plain RoPE with the right theta and the
+    // wrong axis layout (engine#1311: exact for a text-only prompt, ~0.29 rad off once image tokens are in it). The
+    // import_pack() writer starts from load_geometry() and already carries it; this one has to copy it.
+    {
+        std::string geom_src;
+        const json geom = load_geometry(pack_dir, &geom_src);
+        if (geom.value("mrope_interleaved", false)) c["mrope_interleaved"] = true;
+        if (geom.contains("mrope_section")) c["mrope_section"] = geom["mrope_section"];
+    }
     c["model_type"] = p.dims.model_type;
     c["hidden_size"] = p.dims.hidden;
     c["intermediate_size"] = p.dims.intermediate;
@@ -3649,12 +3676,20 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // The two spellings of a quantised projection (engine#1503): the 1.8/phi-4 form carries a qweight and a
             // scales sibling; Qwen3-VL-4B names them `<proj>.MatMul.weight_Q4` / `<proj>.MatMul.weight_scales` on a
             // three-input node with no qzeros (implicit zero point, applied below).
-            const OnnxTensor* qw = init_of(proj + ".MatMulNBits.qweight");
-            const OnnxTensor* sc = init_of(proj + ".MatMulNBits.scales");
+            // `proj` arrives from a plan source string (`graph:model.layers.N.attn.q_proj`, no trailing dot) as well as
+            // from a role name (`...q_proj.`, with one), so normalise before appending a suffix -- otherwise the
+            // three-input spelling is looked up as `...q_projMatMul.weight_Q4` and never found, which is how a pack could
+            // plan all 252 projections, write only its norms, and fail on the device with `MLP dequant : data_size 0`
+            // (engine#1503).
+            std::string pre = proj;
+            if (!pre.empty() && pre.back() != '.') pre += '.';
+            const OnnxTensor* qw = init_of(pre + "MatMulNBits.qweight");
+            const OnnxTensor* sc = init_of(pre + "MatMulNBits.scales");
             if (!qw || !sc) {
-                qw = init_of(proj + "MatMul.weight_Q4");
-                sc = init_of(proj + "MatMul.weight_scales");
+                qw = init_of(pre + "MatMul.weight_Q4");
+                sc = init_of(pre + "MatMul.weight_scales");
             }
+            if (!qw || !sc) return false;   // named, so the caller's refusal says which
             if (!qw || !sc || qw->dims.size() != 3 || sc->dims.empty()) return false;
             const int N = int(qw->dims[0]);
             const int block = int(qw->dims[2]) * 2;            // 64 B holds 128 four-bit codes
@@ -3684,7 +3719,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             const uint8_t* zp = zt ? bytes_of(*zt, z_need) : nullptr;
             uint64_t qw_need = 0;
             if (!mul_ok(groups_n, uint64_t(block) / 2, qw_need)) return false;
-            const Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
+            Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
+            // No qzeros tensor means the implicit zero point 2^(bits-1) -- the same rule the head path applies, and the
+            // one ONNX Runtime's MatMulNBits uses. Missing it here decoded every PROJECTION with zero point 0 while the
+            // head was decoded with 8, which is why the pack imported completely, served on the device, and answered
+            // gibberish on both the device and the host-GEMM path (engine#1503: "West什么呢ưởng中国联通nio…").
+            if (!zt) implicit_zp_zero(q, 4);
             // the row slice, re-tiled exactly as the whole tensor would be
             Q4 part;
             part.N = rows; part.K = K;

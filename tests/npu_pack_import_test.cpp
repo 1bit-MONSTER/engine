@@ -1850,7 +1850,25 @@ void test_block32_tail_head(const std::string& root) {
     check(std::fabs(ncorr(emb, other)) < 0.3,
           "block-32 tail: the fixture's two heads are unrelated (corr " + std::to_string(ncorr(emb, other)) + ")");
 
-    const auto build = [&](bool tied, const char* tag, const std::string& tail_after_env) {
+    // A Ryzen AI fused MLP node as the 1.9 graphs spell it: op SSMLP, the gate/up/down shapes as int attributes, and
+    // NO weight tensor (the weights are in the .fconst). Every 1.9 pack measured carries one per layer.
+    const auto ssmlp_node = [&]() {
+        std::string n;
+        pb::str(n, 1, "/model/layers.0/x");
+        pb::str(n, 4, "SSMLP");
+        const std::pair<const char*, int64_t> attrs[] = {{"gate_K", 128}, {"gate_N", 256}, {"up_K", 128},
+                                                         {"up_N", 256},   {"down_K", 256}, {"down_N", 128}};
+        for (const auto& [name, value] : attrs) {
+            std::string a;
+            pb::str(a, 1, name);
+            pb::ints(a, 3, value);
+            pb::tag(n, 5, 2);
+            pb::varint(n, a.size());
+            n += a;
+        }
+        return n;
+    };
+    const auto build = [&](bool tied, const char* tag, const std::string& tail_after_env, bool fused_mlp = false) {
         const fs::path dir = fs::path(root) / tag;
         fs::remove_all(dir);
         fs::create_directories(dir / "cache");
@@ -1895,7 +1913,7 @@ void test_block32_tail_head(const std::string& root) {
                             pb::placeholder("lm_head.weight.MatMulNBits.qweight"),
                             pb::placeholder("lm_head.weight.MatMulNBits.scales"),
                             pb::placeholder("lm_head.weight.MatMulNBits.zeros")},
-                           {}));
+                           fused_mlp ? std::vector<std::string>{ssmlp_node()} : std::vector<std::string>{}));
         return dir;
     };
     struct Run {
@@ -1972,6 +1990,21 @@ void test_block32_tail_head(const std::string& root) {
         check(!x.head.empty() && ncorr(x.head, emb) > 0.99,
               "block-32 tail, tied: the container's head is the embedding (corr " +
                   std::to_string(x.head.empty() ? 0.0 : ncorr(x.head, emb)) + ")");
+    }
+    {   // arm 2b: the same pack with a fused-MLP node in its graph, as every real 1.9 pack has. The node names no weight,
+        // so it must not make the graph look like it carries quantised matmuls: that is the switch for "the head is in
+        // the .fconst tail", and with it off the import wrote a container with no lm_head at all and exit 0
+        // (measured on Qwen-2.5 1.5B 1.9 with the SSMLP attributes counted as graph matmuls: 338 tensors, not 339).
+        const Run x = run(build(true, "b32-tied-ssmlp", encode_block32_units(emb, V, H), true), "ssmlp");
+        check(x.said.empty(), "block-32 tail, fused MLP in the graph: imports (" + x.said.substr(0, 160) + ")");
+        check(x.has_head && !x.head.empty() && ncorr(x.head, emb) > 0.99,
+              "block-32 tail, fused MLP in the graph: the container still carries the head read from the tail");
+        check(x.r.selfcheck_tied && x.r.head_read_note.find("reproduces") != std::string::npos,
+              "block-32 tail, fused MLP in the graph: the tied self-check still runs (" + x.r.head_read_note + ")");
+        const json g = json::parse(pi::plan(build(true, "b32-tied-ssmlp-plan", encode_block32_units(emb, V, H), true)
+                                                .string()).manifest());
+        check(g.value("graph_weights", json::object()).value("matmulnbits_ops", int64_t(-1)) == 0,
+              "block-32 tail, fused MLP in the graph: SSMLP attributes are not counted as graph matmuls");
     }
     {   // arm 3: TIED, but the tail's head is some other matrix -> the read is NOT taken, the synthesis stands, says why
         const Run x = run(build(true, "b32-tied-mismatch", encode_block32_units(other, V, H)), "mismatch");
@@ -3291,6 +3324,7 @@ void test_fconst19_rule_table() {
             {3584, 28, 28, 7232, 8, 1, 1009664},     // the Qwen2.5-7B family, measured on two models
             {2048, 16, 36, 4160, 9, 1, 295936},      // Qwen2.5_3B_Instruct
             {4096, 32, 32, 12608, 5, 1, 2297856},    // Mistral-7B-Instruct-v0.2
+            {4096, 32, 36, 12608, 5, 1, 2297856},    // Qwen3-8B (the Mistral row at 36 layers; the key includes layers)
             {3072, 24, 28, 10560, 4, 1, 1740800},    // Llama-3.2-3B (and -Instruct)
         };
         const int want_n = (int)(sizeof(want) / sizeof(want[0]));

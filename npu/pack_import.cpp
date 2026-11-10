@@ -144,6 +144,9 @@ struct OnnxMatMul {
 struct OnnxModel {
     std::vector<OnnxTensor> tensors;
     std::vector<OnnxMatMul> matmuls;
+    // The fused-MLP nodes' (SSMLP / GQO) gate/up/down shapes, from their attributes. Kept apart from `matmuls` because they
+    // name no weight tensor: `matmuls` answers "does the graph carry quantised weights", and these must not.
+    std::vector<OnnxMatMul> fused_mlp;
     std::map<std::string, size_t> index;
     // `com.ryzenai:MatMulNBitsBf` is the same quantised matmul as `com.microsoft:MatMulNBits`, and on the 1.9
     // blob/external-data packs it is the ONLY one: phi-4's 201 weights are all `MatMulNBitsBf`, so a walker that
@@ -268,7 +271,12 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& bra
                 mm.K = k->second;
                 mm.N = n->second;
                 mm.branch = branch;
-                m.matmuls.push_back(std::move(mm));
+                // NOT into `matmuls`: these carry no weight tensor, and `matmuls.empty()` is how the importer knows a
+                // 1.9 pack keeps its head in the .fconst tail. Counted as graph matmuls they turned that off for every
+                // pack with a fused MLP -- measured on Qwen-2.5 1.5B 1.9, which then imported 338 tensors with no
+                // lm_head, exit 0 and no refusal. They are geometry witnesses only, read by
+                // intermediate_size_from_graph().
+                m.fused_mlp.push_back(std::move(mm));
             }
         }
     }
@@ -1717,14 +1725,16 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
     };
     std::map<std::string, std::map<int64_t, int>> shared;  // activation tensor -> N -> how many nodes read it
     std::set<int64_t> down_k, gate_n;                     // down: N == hidden, K > hidden;  gate/up: K == hidden, N > hidden
-    for (const auto& mm : m.matmuls) {
-        if (mm.K <= 0 || mm.N <= 0 || excluded(mm.weight)) continue;
+    const auto witness = [&](const OnnxMatMul& mm) {
+        if (mm.K <= 0 || mm.N <= 0 || excluded(mm.weight)) return;
         if (mm.K == hidden && mm.N > hidden) {
             shared[mm.data][mm.N]++;
             gate_n.insert(mm.N);
         }
         if (mm.N == hidden && mm.K > hidden) down_k.insert(mm.K);
-    }
+    };
+    for (const auto& mm : m.matmuls) witness(mm);
+    for (const auto& mm : m.fused_mlp) witness(mm);   // SSMLP / GQO attributes: shapes without a weight tensor
     // separate gate/up first: it is the witness attention cannot produce
     std::set<int64_t> separate;
     for (const int64_t dk : down_k)

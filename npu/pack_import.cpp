@@ -734,32 +734,11 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // reboot: three of them from one afternoon's imports were 11.4 GB of tmpfs (measured 2026-11-10). So the order is:
     // an explicit override, then the on-disk cache directory, and only then the temp directory this used to prefer.
     std::vector<fs::path> dirs;
-    if (const char* scratch = std::getenv("ONEBIT_FCONST_SCRATCH"); scratch && *scratch)
-        dirs.emplace_back(scratch);
-    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
-        dirs.emplace_back(fs::path(xdg) / "1bit/fconst19");
-    else if (const char* home = std::getenv("HOME"); home && *home)
-        dirs.emplace_back(fs::path(home) / ".cache/1bit/fconst19");
-    try {
-        // Last resort only: on strixhalo /tmp is tmpfs, so this costs RAM equal to the pack's fconst.
-        dirs.push_back(fs::temp_directory_path());
-    } catch (const std::exception& e) {
-        std::fprintf(stderr,
-                     "1bit npu-pack: note: the temporary directory is unusable (%s), so the 1.9 pack's canonical copy "
-                     "goes elsewhere\n", e.what());
-    }
-    dirs.push_back(fs::path("/tmp"));
+    for (const auto& d : fconst_scratch_dirs()) dirs.emplace_back(d);
     dirs.push_back(fs::current_path());
     std::string work;
     for (const auto& d : dirs) {
-        std::error_code ec;
-        // The cache directory is ours to create: without this the new first choice never wins, because it does not exist on a
-        // fresh box and the loop walked straight past it to /tmp (caught by testing the default, not the override).
-        if (!fs::is_directory(d, ec) || ec) {
-            std::error_code made;
-            fs::create_directories(d, made);
-            if (made || !fs::is_directory(d)) continue;
-        }
+        if (!fconst_scratch_ready(d.string())) continue;
         const fs::path cand = d / name;
         // Writable in fact, not just in theory: the copy is written immediately after this.
         std::ofstream probe(cand, std::ios::binary | std::ios::app);
@@ -1796,6 +1775,34 @@ namespace {
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                    std::string* why);   // defined with the table, internal to this file
 }
+bool fconst_scratch_ready(const std::string& dir) {
+    // A candidate scratch directory is usable when it is (or can be made into) a directory. The cache directory is OURS to create:
+    // the version of engine#1801 that shipped first did not, so on a fresh box the loop walked straight past the new first choice
+    // and every pack fell through to tmpfs -- the bug this function exists to make testable.
+    std::error_code ec;
+    if (fs::is_directory(dir, ec) && !ec) return true;
+    std::error_code made;
+    fs::create_directories(dir, made);
+    return fs::is_directory(dir, ec) && !ec;
+}
+
+std::vector<std::string> fconst_scratch_dirs() {
+    // Where the canonical .fconst copy may live, in preference order. A function because the ORDER is the fix from engine#1801 and
+    // the reviewer's ask was a test that pins it: on strixhalo /tmp is tmpfs, so the first choice has to be disk, and a version of
+    // this that forgot to create the cache directory silently fell through to /tmp for every pack.
+    std::vector<std::string> dirs;
+    if (const char* scratch = std::getenv("ONEBIT_FCONST_SCRATCH"); scratch && *scratch)
+        dirs.push_back(scratch);
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+        dirs.push_back(std::string(xdg) + "/1bit/fconst19");
+    else if (const char* home = std::getenv("HOME"); home && *home)
+        dirs.push_back(std::string(home) + "/.cache/1bit/fconst19");
+    // Last resorts only: on this box /tmp is tmpfs, so each of these costs RAM equal to the pack's .fconst.
+    dirs.push_back("/tmp");
+    dirs.push_back(".");
+    return dirs;
+}
+
 const Fconst19Rule* fconst19_rules(int* count) {
     if (count) *count = int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0]));
     return kFconst19Rules;

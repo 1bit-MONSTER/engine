@@ -1745,15 +1745,14 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
 }
 
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
-    // A PASS-THROUGH since the signed-int4 fix: `decode_external_tile` now produces the container's own convention
-    // directly (code = c_signed + 8, zero = (-8 - z_signed) * scale), so converting again here applies the mapping
-    // TWICE. That double conversion is what made every weight a near-constant positive: zero became
-    // -((-8-z)*scale)*scale = +0.0002 instead of -0.04, leaving w = code*scale ~ 0.04 for every entry, and a down
-    // projection whose output is K*mean(act)*0.04 = ~110,000 instead of ~0.7 (engine#1503 measured 73,089).
-    Q4 q = pack;   // same codes, same geometry, same parameter convention
+    Q4 q = pack;   // same codes, same geometry
     long long inexact = 0;
-    for (size_t i = 0; i < q.zero.size(); ++i)
-        if (bf16_to_f32(bf16_bits_of(q.zero[i])) != q.zero[i]) ++inexact;
+    for (size_t i = 0; i < q.zero.size(); ++i) {
+        // pack: w = (code - zp) * scale  ->  container: w = code * scale + m, so m = -zp * scale.
+        const float m = -q.zero[i] * q.scale[i];
+        if (bf16_to_f32(bf16_bits_of(m)) != m) ++inexact;
+        q.zero[i] = m;
+    }
     if (m_inexact) *m_inexact = inexact;
     return q;
 }
@@ -3365,18 +3364,7 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         for (auto d : t.dims) n *= uint64_t(d);
         if (n == 0) continue;
         std::vector<int64_t> shape(t.dims.begin(), t.dims.end());
-        std::vector<uint8_t> bytes = as_bf16(bytes_of(t, n * (t.type == kF32 ? 4 : 2)), t.type, size_t(n));
-        // TEMPORARY experiment (engine#1503): phi-4's norm gains are ~1/sqrt(hidden) (0.01343 at h=5120, and 1/sqrt(5120)=0.01398),
-        // which leaves every layer operating at 1/77 of its trained activation scale and flattens the logits to ~-6.7 each.
-        if (norm && p.dims.hidden > 0) {
-            const float k = std::sqrt(float(p.dims.hidden));
-            auto* u = reinterpret_cast<uint16_t*>(bytes.data());
-            for (uint64_t i = 0; i < n; ++i) {
-                const float v = bf16_to_f32(u[i]) * k;
-                u[i] = bf16_bits_of(v);
-            }
-        }
-        w.add(t.name, "BF16", shape, std::move(bytes));
+        w.add(t.name, "BF16", shape, as_bf16(bytes_of(t, n * (t.type == kF32 ? 4 : 2)), t.type, size_t(n)));
         ++r.tensors;
         ++aux;
     }

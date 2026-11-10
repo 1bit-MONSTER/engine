@@ -410,7 +410,14 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
 
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
-    if (getenv("NPU_INFER_HOST_GEMM")) host_gemm_ = true;
+    if (const char* hg = getenv("NPU_INFER_HOST_GEMM")) {
+        host_gemm_ = true;
+        // engine#1808: "i8" selects the integer arm, whose int32 accumulation is the only thing a
+        // kernel family can be bit-exact against (an int8 device cannot match an f32 host by
+        // construction). Any other value keeps the f32 path, which is what every existing caller and
+        // every row measured so far used.
+        host_gemm_i8_ = (hg[0] == 'i' && hg[1] == '8');
+    }
     // The launch layer.  A1: everything below that touches a device talks to this, and the settings the
     // container declares (weight layout, pb16i image dir, Hadamard fold) are pushed into it as they are
     // parsed.  A2 turns this into NpuTarget::open(plan, kernels_dir).
@@ -2966,6 +2973,14 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
         // unpadded A. (In review of this PR the split moved the pad into the target and left this
         // branch reading past the caller's buffer at a padded design.)
         out.assign((size_t)N, 0.0f);
+        if (host_gemm_i8_) {
+            // int32 arm: quantise both sides here, accumulate exactly, then apply the same two factors the
+            // kernel's epilogue applies (the activation row scale and the per-128-K weight multiplier).
+            std::vector<int32_t> acc((size_t)N, 0);
+            q4nx_host_gemm_i8_from_f32(A, a_k, 1, K, N, Bmat, acc.data());
+            for (int n = 0; n < N; n++) out[(size_t)n] = (float)acc[(size_t)n];
+            return;
+        }
         q4nx_host_gemm_f32_padded(A, a_k, 1, K, N, Bmat, out.data());
         return;
     }
@@ -2985,6 +3000,12 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         // Same pad, and here it is also a stride: the rows form used to index A at `m * K` while the
         // caller's buffer is laid out at `m * a_k`, so every row past the first read the wrong row.
         out.assign((size_t)M * N, 0.0f);
+        if (host_gemm_i8_) {
+            std::vector<int32_t> acc((size_t)M * (size_t)N, 0);
+            q4nx_host_gemm_i8_from_f32(A, a_k, M, K, N, Bmat, acc.data());
+            for (size_t i = 0; i < acc.size(); i++) out[i] = (float)acc[i];
+            return;
+        }
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
         return;
     }

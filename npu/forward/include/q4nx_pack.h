@@ -177,6 +177,13 @@ void q4nx_host_gemm_f32_padded(const float* A, int a_k, int M, int K, int N, con
  * holding an int4 value in [-8, 7], exactly as the importer's packB lays it down. */
 void q4nx_host_gemm_i8(const int8_t* a8, int K, const int8_t* codes, int N, int32_t* out32);
 
+/* The whole GEMM in int8 x int4 for the gate's `i8` host arm, quantising both sides here with the engine's
+ * own rule. It cannot see a wrong weight LAYOUT (the f32 arm covers that); what it can see is a wrong int4
+ * quantisation, a wrong 128-K group boundary, an int8 intermediate or a saturated accumulator -- i.e. the
+ * kernel's arithmetic, exactly. int32 out, M*N, no scaling applied. */
+void q4nx_host_gemm_i8_from_f32(const float* A, int a_k, int M, int K, int N, const float* Bmat,
+                                int32_t* out32);
+
 
 /* Architecture dims a design set is derived from. */
 typedef struct {

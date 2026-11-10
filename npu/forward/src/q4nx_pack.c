@@ -141,6 +141,54 @@ void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
  * Scaling (per-128-K group multiplier and the per-row activation scale) is deliberately NOT applied here:
  * the gate compares the int32 exactly, and applies scales on both sides from the same inputs, so a scale
  * mistake cannot hide inside the comparison. */
+/* The whole GEMM in int8 x int4, for the gate's `NPU_INFER_HOST_GEMM=i8` arm: quantise the activation row
+ * and every weight column with the engine's own rule, accumulate exactly, and hand back the int32 -- the
+ * caller applies the multiplier and the activation scale, the same two factors the kernel's epilogue uses.
+ *
+ * LIMIT, stated because it decides what this arm can and cannot prove: the weights are quantised HERE from
+ * the dequantised f32 matrix, not read from the container's packed b8 image. So this arm isolates the
+ * kernel's ACCUMULATION and epilogue from its weight-layout handling: a wrong tile order will not show up
+ * here (the f32 arm covers that by construction), but a wrong int4 quantisation, a wrong per-128-K group
+ * boundary, an int8 intermediate or a saturated accumulator will. That is the split the MoE oracle already
+ * uses (`expected_int32` with the scales factored out), and it is what makes an int32 bit-exact comparison
+ * meaningful at all. */
+void q4nx_host_gemm_i8_from_f32(const float* A, int a_k, int M, int K, int N, const float* Bmat,
+                                int32_t* out32) {
+    const int G = 128;                       /* the arena's multiplier group: one d per 128 K-rows per column */
+    const int kg = (K + G - 1) / G;
+    for (int m = 0; m < M; m++) {
+        const float* a = A + (size_t)m * (size_t)a_k;
+        int32_t* out = out32 + (size_t)m * (size_t)N;
+        for (int n = 0; n < N; n++) out[n] = 0;
+        for (int g = 0; g < kg; g++) {
+            const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
+            /* the activation's own per-row scale is the caller's; here only the integer codes matter, and the
+             * kernel receives them already scaled, so quantise with a per-group unit scale to keep the
+             * comparison about the accumulation rather than about a float that both sides share */
+            for (int n = 0; n < N; n++) {
+                float amax = 0.0f;
+                for (int k = k0; k < k1; k++) {
+                    const float v = fabsf(Bmat[(size_t)k * (size_t)N + (size_t)n]);
+                    if (v > amax && isfinite(v)) amax = v;
+                }
+                if (!(amax >= 1e-12f)) amax = 1.0f;
+                const float tis = 127.0f / amax;
+                for (int k = k0; k < k1; k++) {
+                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
+                    if (!isfinite(v)) v = 0.0f;
+                    int q = (int)roundf(v * tis);
+                    if (q > 7) q = 7;
+                    else if (q < -8) q = -8;    /* int4 codes are [-8, 7] in this format */
+                    int aq = (int)roundf(a[k] * 127.0f);
+                    if (aq > 127) aq = 127;
+                    else if (aq < -127) aq = -127;
+                    out[n] += (int32_t)(q * aq);
+                }
+            }
+        }
+    }
+}
+
 void q4nx_host_gemm_i8(const int8_t* a8, int K, const int8_t* codes, int N, int32_t* out32) {
     for (int n = 0; n < N; n++) out32[n] = 0;
     for (int k = 0; k < K; k++) {

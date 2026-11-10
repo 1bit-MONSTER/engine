@@ -34,6 +34,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <vector>
+#include <cmath>
+#include <algorithm>
 
 #include "golden/host_gemm_i8_fixture.h"
 
@@ -75,6 +78,47 @@ int main() {
     // column 1:  7 * (-128) +  7 * 127 * 255 = -896 + 226695 = 225799
     check(edge[0] == -258056 && edge[1] == 225799,
           "a -128 activation accumulates exactly (no int8 intermediate, no int32 saturation)");
+
+    // 4. the whole-GEMM arm the gate switches on: quantise both sides here, accumulate exactly, and check
+    //    the two properties that make the comparison meaningful -- the per-128-K group boundary is honoured
+    //    (a K of 130 must not fold the last two rows into the first group's scale) and int4 codes stay in
+    //    [-8, 7] so an out-of-range code cannot silently wrap.
+    {
+        const int KK = 130, NN = 3, MM = 2;
+        std::vector<float> A((size_t)MM * KK), B((size_t)KK * NN);
+        for (int m = 0; m < MM; m++)
+            for (int k = 0; k < KK; k++) A[(size_t)m * KK + k] = (float)((k * 7 + m * 3) % 11) - 5.0f;
+        for (int k = 0; k < KK; k++)
+            for (int n = 0; n < NN; n++) B[(size_t)k * NN + n] = (float)((k * 5 + n * 13) % 17) / 3.0f;
+        std::vector<int32_t> out((size_t)MM * NN, 0);
+        q4nx_host_gemm_i8_from_f32(A.data(), KK, MM, KK, NN, B.data(), out.data());
+        // independent computation in long double, from the same quantisation rule
+        bool ok = true;
+        for (int m = 0; m < MM && ok; m++) {
+            for (int n = 0; n < NN && ok; n++) {
+                double want = 0;
+                for (int g = 0; g < 2; g++) {                       // 128 + 2 rows = two groups
+                    const int k0 = g * 128, k1 = (k0 + 128 < KK) ? k0 + 128 : KK;
+                    double amax = 0;
+                    for (int k = k0; k < k1; k++) amax = std::max(amax, std::fabs((double)B[(size_t)k * NN + n]));
+                    if (amax < 1e-12) amax = 1;
+                    const double tis = 127.0 / amax;
+                    for (int k = k0; k < k1; k++) {
+                        int q = (int)std::round((double)B[(size_t)k * NN + n] * tis);
+                        q = q > 7 ? 7 : (q < -8 ? -8 : q);
+                        int aq = (int)std::round((double)A[(size_t)m * KK + k] * 127.0);
+                        aq = aq > 127 ? 127 : (aq < -127 ? -127 : aq);
+                        want += (double)q * (double)aq;
+                    }
+                }
+                if ((double)out[(size_t)m * NN + n] != want) {
+                    std::printf("     m=%d n=%d: got %d, want %.0f\n", m, n, (int)out[(size_t)m * NN + n], want);
+                    ok = false;
+                }
+            }
+        }
+        check(ok, "whole-GEMM i8 arm: exact int32, 128-K group boundary respected at K=130");
+    }
 
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("all npu_host_gemm_i8 checks passed\n");

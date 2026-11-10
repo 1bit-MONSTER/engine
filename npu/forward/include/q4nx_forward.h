@@ -235,6 +235,11 @@ private:
     bool init_impl(xrt::device* dev, const char* model_path,
                    const std::string& artifact_dir);
     bool host_gemm_ = false;
+    // NPU_INFER_HOST_GEMM=i8 (engine#1808): the host arm accumulates int8 x int4 in EXACT int32, which is
+    // the only arm a kernel family can be bit-exact against -- f32 cannot match an int8 device by
+    // construction. It cannot see a wrong weight layout (the f32 arm covers that); it can see a wrong
+    // quantisation, a wrong 128-K group boundary, an int8 intermediate or a saturated accumulator.
+    bool host_gemm_i8_ = false;
     bool load_layer(int l);
     // `a_k` is the activation's REAL width per row (the design's real_k, i.e. the model's hidden or
     // intermediate size).  It is K whenever the model is already on the container's 256-column K

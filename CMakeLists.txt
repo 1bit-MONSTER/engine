@@ -379,6 +379,11 @@ add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
 add_test(NAME think_split COMMAND think_split_test)
 # Host / Origin checks every engine HTTP server applies (app/http_guard.h); header only, runs in CI.
+# engine#1779 (F10 fault 2): the degenerate-repetition predicate at the context limit. Header only, no device.
+add_executable(serve_degenerate_test tests/serve_degenerate_test.cpp)
+target_include_directories(serve_degenerate_test PRIVATE app)
+add_test(NAME serve_degenerate COMMAND serve_degenerate_test)
+
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)
 add_test(NAME http_guard COMMAND http_guard_test)

@@ -1447,7 +1447,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
              *
              * The extra rows decode to zero and are never sampled: the logits vector stays NV long. */
             int head_rows = NV;
-            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0 && ltd->shape[1] == kpad_) {
+            /* The head is a TILE tensor -- shape {tiles, bytes-per-tile} (CodeLlama: {16016, 5120}) -- not {rows, cols},
+             * so the rows come from the tile count and the grid. Comparing shape[1] against kpad_ was the wrong test and
+             * left this at NV, which is exactly the refusal this block exists to prevent. */
+            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0 && ltd->shape[0] > 0) {
                 const int64_t per_block = kpad_ / Q4NX_TILE_COLS;   // tiles per 32-row block
                 if (per_block > 0 && ltd->shape[0] % per_block == 0) {
                     const int64_t r = (ltd->shape[0] / per_block) * Q4NX_TILE_ROWS;

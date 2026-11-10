@@ -518,6 +518,23 @@ checks keep the contract honest without a device: `tests/npu_t2s_layout_test.cpp
 against the numbers the tool measured on a real image (gate/up: 50,135,040 B of pb16i → 23,674,880 B
 of stream), and `tests/q4nx_t2s_test.py` pins the code order byte for byte.
 
+**That single rounding costs one multiply per element, not one `ldexp()` (#1990).** A launch's result is
+`float32(S * 2^e_ref) * ascale` for every element, and `2^e_ref` depends only on the column. It was computed
+with a libm `ldexp()` call per element, after readback, where no launch phase column counted it: a 16-row
+prefill block on `bonsai2-27b-t2s2` is 416 launches of up to 16 x 17,408 elements, and that call was the
+block's largest host term. `q4nx_pb16i::dequant_rows()` computes the power once per column and multiplies.
+The value is the same, not close: a double times a normal power of two is exact while the product is a
+normal double, which holds for every exponent from -1022 to 960, and any column outside that range takes
+the per-element form as before. Measured in one `npu-hold` ticket, one binary, `NPU_DEQ_LDEXP=1` (the old
+form) against the default, 103 blocks per arm: the dequant term **137.4 -> 32.3 ms per block**, the block
+median **630.4 -> 515.0 ms** (25.4 -> 31.1 rows/s), and three 510-536-token prompts reached their first
+token at 24.4-25.1 tok/s before and **29.8-30.6 tok/s** after. That is the first pair of arms; the box
+slowed for both forms in the second pair (the old form measured 357 ms of dequant per block there), so the
+second pair is not quoted as a speedup. `NPU_DEQ_LDEXP=2` runs both forms and counts differing elements:
+0 of 568,483,840 on the device, and the greedy text is identical in all five arms.
+`tests/npu_pb16i_layout_test.cpp` holds the two forms to the same bits for one and two planes, the edges
+of the exponent range and exponents outside it. The `[bl]` line names the term as `deq`.
+
 **A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
 a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
 family shipped as eight per-role `_t2s2_m16` ELFs paid **+2.0-2.3 ms on every launch, in every role** — more
@@ -1029,6 +1046,26 @@ Two facts about what the container holds, both reported, not hidden:
   `lm_head` and q/k/v/o are stored as 4 column tiles with the last one zero-padded (codes 0,
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's
   manifest and in `config.json`, and nothing reads a padding column as a weight.
+
+### Where a 1.9 pack's rewritten `.fconst` goes
+
+A Ryzen AI 1.9 pack's Token `.fconst` is rewritten into its 1.8 form before it is read. The copy is as large as the source
+(3.6 GB for an h4096 pack), so where it lands matters: on strixhalo `/tmp` is tmpfs, which means RAM. The importer tries these
+directories in order:
+
+1. `$ONEBIT_FCONST_SCRATCH`, if set;
+2. `$XDG_CACHE_HOME/1bit/fconst19`, or `~/.cache/1bit/fconst19` (on disk);
+3. `$TMPDIR`, then `/tmp`, then the current directory.
+
+The copy is a cache: it is reused while the source's size and mtime and the rules version match. On each write the importer
+sweeps the scratch directories. It removes other identities of the same pack and geometry, the pre-version name, and any
+`1bit-fconst19*` copy nobody has written for 6 hours. Without an override, **every** candidate directory is swept, not only the
+one being written, so copies older binaries left in `/tmp` get reclaimed (engine#1907). With `ONEBIT_FCONST_SCRATCH` set, only
+that directory is swept, and a run with an override never removes another lane's files. The current directory is the
+one candidate that is never swept unless the copy is being written there: it is only the last write fallback, and a
+working directory's files are not the importer's to clean. The 6 hours are what keep a concurrent run's copy alive in a
+shared directory, so the number stays above the longest import; it is not the knob for disk or tmpfs pressure. The test suite sets one per run and
+removes it at exit.
 
 ### Linking the kernel set the container will be served with
 

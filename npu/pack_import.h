@@ -208,6 +208,14 @@ struct Plan {
     // third-party parser: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights as ordinary ONNX initializers, while
     // 1.8 and R1-Distill ship placeholders and keep the weights in model.bin (pi-inferzo, 2026-11-08).
     // graph_matmuls < 0 means "no graph was read", which is why it is not just a count.
+    // engine#1786 (item F1): a FastFlowLM NPU2 model source is a safetensors container (`model.q4nx`) with no graph,
+    // so the two census fields above stay -1. `container_tensors` is -1 for every pack that is not that genre; when it
+    // is not, it is the container's tensor count and the dtype map says what the reader found. Reported rather than
+    // refused at the first byte, because "cannot open model.onnx" says nothing about a pack that has no graph by design.
+    int64_t container_tensors = -1;
+    int64_t container_payload_bytes = 0;
+    std::map<std::string, int64_t> container_dtypes;
+    std::string container_note;   // what the container genre still needs, empty for a non-container pack
     int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)
@@ -256,6 +264,29 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden);
 // multi-component one (`type: compositemodel`), whose geometry files stay at the root. Exported for the unit test.
 std::string find_token_fconst_exported(const std::string& pack_dir);
 
+// A FastFlowLM NPU2 model source (engine#1786, item F1) is a safetensors container named `model.q4nx`: an 8-byte
+// little-endian header length, that many bytes of JSON mapping tensor name -> {dtype, shape, data_offsets}, then the
+// payload. There is no graph and no `model.onnx`, which is why the importer above refuses such a pack before reading a
+// byte of it. The tensor NAMES are the model's own HF names, so this reader is also the work list: what it reports is
+// what a container-genre plan has to map.
+//
+// Header only: no weights are read, no device is opened. Exported because it is the half that can be wrong silently
+// (an off-by-one header length reports an empty inventory and looks like "a pack with no tensors").
+struct Q4nxTensor {
+    std::string name;
+    std::string dtype;
+    std::vector<int64_t> shape;
+    int64_t begin = 0;      // data_offsets[0]
+    int64_t end = 0;        // data_offsets[1]
+};
+struct Q4nxContainer {
+    int64_t header_bytes = 0;
+    int64_t payload_bytes = 0;
+    std::vector<Q4nxTensor> tensors;   // in header order
+    std::string why;                        // non-empty when the container could not be read; tensors is then empty
+};
+Q4nxContainer read_q4nx_container(const std::string& path);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);
@@ -280,6 +311,14 @@ bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
 void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix,
                                   const std::string& legacy_name  = std::string(),
                                   int64_t            max_age_seconds = 0);
+
+// engine#1907: apply evict_stale_canonical_copies() to EVERY scratch candidate, not only the one being written. Since #1801 the
+// write lands in the on-disk cache, so a sweep of that directory alone never reached /tmp again, and the copies older binaries
+// had left in tmpfs (17.0 GiB of RAM, measured 2026-11-10) stayed until reboot. `written_dir` is swept even if it is not yet a
+// directory as seen here; every other entry is swept only when it already exists, and is never created.
+void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::string& written_dir,
+                               const std::string& keep_name, const std::string& prefix, const std::string& legacy_name,
+                               int64_t max_age_seconds);
 
 // The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
 // actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos

@@ -161,6 +161,23 @@ void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
  *
  * exactly the kernel's epilogue, with the inner sum in int32 and no float in it. `d` is the per-128-K-group
  * multiplier per column ([groups][N]), `ascale` the activation row's scale. */
+/* The form that matches OUR packing, not a q4_1 convention. `packB_blocked()` (engine-src) quantises a weight
+ * column with ONE multiplier over its whole K -- amax over the column, d = amax/127, codes in [-127, 127] as
+ * int8 -- so that is the arithmetic a bit-exactness gate has to reproduce. The earlier per-128-K int4 form
+ * re-quantised the container into a different numeric model (measured: the host arm answered 'ikt' and then
+ * locked onto one token), which is why it could not be a reference.
+ *
+ *   out[n] = d[n] * ascale * sum_k code[k][n] * a8[k],  inner sum exact int32, no float inside it. */
+void q4nx_host_gemm_i8_col(const int8_t* a8, int K, const int8_t* codes, const float* d, int N, float ascale,
+                           float* out) {
+    for (int n = 0; n < N; n++) {
+        int32_t acc = 0;
+        for (int k = 0; k < K; k++)
+            acc += (int32_t)((int)codes[(size_t)k * (size_t)N + (size_t)n] * (int)a8[k]);
+        out[n] = d[n] * (ascale * (float)acc);
+    }
+}
+
 void q4nx_host_gemm_i8_grouped(const int8_t* a8, int K, const int8_t* codes, const float* d,
                                int groups, int N, float ascale, float* out) {
     const int G = 128;

@@ -48,6 +48,8 @@
 #include "q4nx_semantics.h"
 #include "q4nx_pack.h"
 
+#include <tuple>
+
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
@@ -3041,33 +3043,35 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                                   int wkey, float* out) {
     const int G = 128, groups = (K + G - 1) / G;
-    auto it = host_i8_cache_.find(wkey);
+    const auto key = std::make_tuple(wkey, K, N);
+    auto it = host_i8_cache_.find(key);
     if (it == host_i8_cache_.end()) {
         HostI8Tensor t;
-        t.groups = groups; t.N = N;
+        t.groups = 0; t.N = N;
         t.codes.assign((size_t)K * (size_t)N, 0);
-        t.d.assign((size_t)groups * (size_t)N, 0.0f);
-        for (int g = 0; g < groups; g++) {
-            const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
-            for (int n = 0; n < N; n++) {
-                float amax = 0.0f;
-                for (int k = k0; k < k1; k++) {
-                    const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
-                    if (std::isfinite(v) && v > amax) amax = v;
-                }
-                if (!(amax >= 1e-12f)) amax = 1.0f;
-                t.d[(size_t)g * (size_t)N + (size_t)n] = amax / 127.0f;
-                const float tis = 127.0f / amax;
-                for (int k = k0; k < k1; k++) {
-                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
-                    if (!std::isfinite(v)) v = 0.0f;
-                    int q = (int)std::round(v * tis);
-                    q = q > 7 ? 7 : (q < -8 ? -8 : q);
-                    t.codes[(size_t)k * (size_t)N + (size_t)n] = (int8_t)q;
-                }
+        t.d.assign((size_t)N, 0.0f);
+        // The rule packB_blocked() applies to the weights the device streams: ONE multiplier per column, amax
+        // over the whole K, codes in [-127, 127]. Anything else is a different numeric model and cannot be
+        // compared bit for bit (measured 2026-11-10: a per-128-K int4 re-quantisation answered "ikt" and then
+        // locked onto a single token).
+        for (int n = 0; n < N; n++) {
+            float amax = 0.0f;
+            for (int k = 0; k < K; k++) {
+                const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
+                if (std::isfinite(v) && v > amax) amax = v;
+            }
+            if (!(amax >= 1e-12f)) amax = 1.0f;
+            t.d[(size_t)n] = amax / 127.0f;
+            const float tis = 127.0f / amax;
+            for (int k = 0; k < K; k++) {
+                float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
+                if (!std::isfinite(v)) v = 0.0f;
+                int q = (int)std::round(v * tis);
+                q = q > 127 ? 127 : (q < -127 ? -127 : q);
+                t.codes[(size_t)k * (size_t)N + (size_t)n] = (int8_t)q;
             }
         }
-        it = host_i8_cache_.emplace(wkey, std::move(t)).first;
+        it = host_i8_cache_.emplace(key, std::move(t)).first;
     }
     const HostI8Tensor& t = it->second;
     std::vector<int8_t> a8((size_t)K);
@@ -3086,8 +3090,8 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
             int q = (int)std::round(v * tis);
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
         }
-        q4nx_host_gemm_i8_grouped(a8.data(), K, t.codes.data(), t.d.data(), t.groups, N, ascale,
-                                  out + (size_t)m * (size_t)N);
+        q4nx_host_gemm_i8_col(a8.data(), K, t.codes.data(), t.d.data(), N, ascale,
+                              out + (size_t)m * (size_t)N);
     }
 }
 

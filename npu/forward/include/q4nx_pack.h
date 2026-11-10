@@ -191,6 +191,13 @@ void q4nx_host_gemm_i8_from_f32(const float* A, int a_k, int M, int K, int N, co
 void q4nx_host_gemm_i8_grouped(const int8_t* a8, int K, const int8_t* codes, const float* d,
                                int groups, int N, float ascale, float* out);
 
+/* The form that matches `packB_blocked()`: one multiplier per weight COLUMN (amax over the whole K, codes int8
+ * in [-127,127]), inner sum exact int32. This is the arm a bit-exactness gate can use, because the operands are
+ * the ones our own packing produces; the per-128-K int4 form above re-quantises into a different model and is
+ * kept only for the arithmetic tests. */
+void q4nx_host_gemm_i8_col(const int8_t* a8, int K, const int8_t* codes, const float* d, int N, float ascale,
+                           float* out);
+
 
 /* Architecture dims a design set is derived from. */
 typedef struct {

@@ -90,50 +90,42 @@ int main(int argc, char** argv) {
         q4nx_host_gemm_i8(a8, 256, codes2, 2, edge);
         check(edge[0] == -258056 && edge[1] == 225799,
               "a -128 activation accumulates exactly (no int8 intermediate, no int32 saturation)");
-        // the reusable grouped form: inner sum int32, per-128-K multipliers applied outside it, K=130 so the
-        // group boundary matters
-        const int KK = 130, NN = 2, groups = 2;
-        std::vector<float> A(KK), B((size_t)KK * NN);
-        std::vector<int8_t> codes((size_t)KK * NN, 0);
-        std::vector<float> d((size_t)groups * NN, 0.0f), want((size_t)NN, 0.0f);
-        for (int k = 0; k < KK; k++) A[k] = float(k % 13) - 6.0f;
-        for (int k = 0; k < KK; k++)
-            for (int n = 0; n < NN; n++) B[(size_t)k * NN + n] = float((k * 3 + n) % 7) - 3.0f;
-        float amax_all = 0.0f;
-        for (int k = 0; k < KK; k++) amax_all = std::max(amax_all, std::fabs(A[k]));
-        const float ascale = amax_all / 127.0f, tis = 1.0f / ascale;
-        std::vector<int8_t> a8q(KK);
-        for (int k = 0; k < KK; k++) {
-            int q = int(std::round(A[k] * tis));
-            a8q[k] = int8_t(q > 127 ? 127 : (q < -127 ? -127 : q));
+        // the column form that matches packB_blocked(): ONE multiplier per weight column, amax over the whole
+        // K, int8 codes, inner sum exact int32. Checked against an independent double computation.
+        const int KC = 130, NC = 3;
+        std::vector<float> A2(KC), B2((size_t)KC * NC), want2((size_t)NC, 0.0f);
+        std::vector<int8_t> codes3((size_t)KC * NC, 0);
+        std::vector<float> d2((size_t)NC, 0.0f);
+        for (int k = 0; k < KC; k++) A2[k] = float((k * 7) % 11) - 5.0f;
+        for (int k = 0; k < KC; k++)
+            for (int n = 0; n < NC; n++) B2[(size_t)k * NC + n] = float((k * 5 + n * 13) % 17) / 3.0f;
+        float amaxA = 0.0f;
+        for (int k = 0; k < KC; k++) amaxA = std::max(amaxA, std::fabs(A2[k]));
+        const float ascale2 = amaxA / 127.0f, tis2 = 1.0f / ascale2;
+        std::vector<int8_t> a8c(KC);
+        for (int k = 0; k < KC; k++) {
+            int q = int(std::round(A2[k] * tis2));
+            a8c[k] = int8_t(q > 127 ? 127 : (q < -127 ? -127 : q));
         }
-        for (int g = 0; g < groups; g++) {
-            const int k0 = g * 128, k1 = (k0 + 128 < KK) ? k0 + 128 : KK;
-            for (int n = 0; n < NN; n++) {
-                float amax = 0.0f;
-                for (int k = k0; k < k1; k++) amax = std::max(amax, std::fabs(B[(size_t)k * NN + n]));
-                if (amax < 1e-12f) amax = 1.0f;
-                d[(size_t)g * NN + n] = amax / 127.0f;
-                for (int k = k0; k < k1; k++) {
-                    int q = int(std::round(B[(size_t)k * NN + n] * (127.0f / amax)));
-                    codes[(size_t)k * NN + n] = int8_t(q > 7 ? 7 : (q < -8 ? -8 : q));
-                }
+        for (int n = 0; n < NC; n++) {
+            float amax = 0.0f;
+            for (int k = 0; k < KC; k++) amax = std::max(amax, std::fabs(B2[(size_t)k * NC + n]));
+            if (amax < 1e-12f) amax = 1.0f;
+            d2[(size_t)n] = amax / 127.0f;
+            for (int k = 0; k < KC; k++) {
+                int q = int(std::round(B2[(size_t)k * NC + n] * (127.0f / amax)));
+                codes3[(size_t)k * NC + n] = int8_t(q > 127 ? 127 : (q < -127 ? -127 : q));
             }
+            double acc = 0;
+            for (int k = 0; k < KC; k++) acc += double(codes3[(size_t)k * NC + n]) * double(a8c[k]);
+            want2[(size_t)n] = float(d2[(size_t)n] * double(ascale2 * float(acc)));
         }
-        for (int g = 0; g < groups; g++) {
-            const int k0 = g * 128, k1 = (k0 + 128 < KK) ? k0 + 128 : KK;
-            for (int n = 0; n < NN; n++) {
-                double acc = 0;
-                for (int k = k0; k < k1; k++) acc += double(codes[(size_t)k * NN + n]) * double(a8q[k]);
-                want[(size_t)n] += float(d[(size_t)g * NN + n] * double(ascale * float(acc)));
-            }
-        }
-        std::vector<float> outv((size_t)NN, 0.0f);
-        q4nx_host_gemm_i8_grouped(a8q.data(), KK, codes.data(), d.data(), groups, NN, ascale, outv.data());
-        bool ok = true;
-        for (int n = 0; n < NN; n++)
-            ok &= std::fabs(outv[(size_t)n] - want[(size_t)n]) <= 1e-5f * std::fabs(want[(size_t)n]) + 1e-6f;
-        check(ok, "grouped form: int32 inner sum + per-128-K multipliers match an independent computation");
+        std::vector<float> got2((size_t)NC, 0.0f);
+        q4nx_host_gemm_i8_col(a8c.data(), KC, codes3.data(), d2.data(), NC, ascale2, got2.data());
+        bool ok2 = true;
+        for (int n = 0; n < NC; n++)
+            ok2 &= std::fabs(got2[(size_t)n] - want2[(size_t)n]) <= 1e-5f * std::fabs(want2[(size_t)n]) + 1e-6f;
+        check(ok2, "column form (our packing rule): one multiplier per column, int32 inner sum, matches an independent computation");
     }
 
     if (argc == 1) {

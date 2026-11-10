@@ -1447,10 +1447,19 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
              *
              * The extra rows decode to zero and are never sampled: the logits vector stays NV long. */
             int head_rows = NV;
-            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0 && ltd->shape[1] == kpad_) {
+            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0) {
                 const int64_t per_block = kpad_ / Q4NX_TILE_COLS;   // tiles per 32-row block
-                if (per_block > 0 && ltd->shape[0] % per_block == 0) {
-                    const int64_t r = (ltd->shape[0] / per_block) * Q4NX_TILE_ROWS;
+                // engine#1990: the tile COUNT is shape[0] when the tensor is stored as [tiles, tile bytes] -- which is
+                // what this container does (CodeLlama-7b: I8 [16016, 6144] for a 32,032-row head at kpad_ 4,096) -- and
+                // it is shape[0] / per_block when it is stored as a row grid. Gating on `shape[1] == kpad_` saw only the
+                // second form, so a padded head in the first form kept head_rows = NV and dequant_any() refused it:
+                // "lm_head dequant failed" on a head that is exactly what the importer was asked to write.
+                // Both spellings count TILE-ROWS in shape[0] -- [rows, kpad_] and [tiles, tile bytes] -- so the number of
+                // 32-row blocks is shape[0] / per_block either way; only the row WIDTH in shape[1] differs.
+                int64_t blocks = 0;
+                if (per_block > 0 && ltd->shape[0] % per_block == 0) blocks = ltd->shape[0] / per_block;
+                if (blocks > 0) {
+                    const int64_t r = blocks * Q4NX_TILE_ROWS;
                     if (r >= NV && r % Q4NX_TILE_ROWS == 0) head_rows = int(r);
                 }
             }

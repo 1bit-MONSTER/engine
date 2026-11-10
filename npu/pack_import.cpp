@@ -2659,6 +2659,19 @@ static const char* const kTextFiles[] = {"tokenizer.json",
                                          "chat_template.jinja",
                                          "generation_config.json"};
 
+// The same list every path copies (see kTextFiles): a container without tokenizer.json is not an NPU model directory.
+static int copy_text_artifacts(const std::string& pack_dir, const std::string& out_dir) {
+    int copied = 0;
+    for (const char* f : kTextFiles) {
+        const std::string src = pack_dir + "/" + f;
+        std::error_code cec;
+        if (!fs::exists(src, cec)) continue;
+        fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing, cec);
+        if (!cec) ++copied;
+    }
+    return copied;
+}
+
 TextArtifacts scan_text_artifacts(const std::string& pack_dir) {
     TextArtifacts t;
     for (const char* f : kTextFiles) {
@@ -2711,6 +2724,9 @@ std::string kernel_set_refusal(const std::vector<std::string>& file_names, const
 // .fconst envelope (attention payload, MLP sections, tail) and the graph-weights path, and threading a third shape
 // through it is how the two existing paths got their special cases. What it shares is the parts that are genuinely
 // shared -- the plan, the geometry, the tile writer, the container metadata.
+// Copies the tokenizer/chat files the container needs beside model.q4nx; defined past kTextFiles' declaration.
+static int copy_text_artifacts(const std::string& pack_dir, const std::string& out_dir);
+
 Report import_external(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
     const Plan p = plan(pack_dir);
     const std::string graph = graph_filename(pack_dir);
@@ -2850,6 +2866,12 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     std::ofstream cf(out_dir + "/config.json", std::ios::binary | std::ios::trunc);
     if (!cf) throw std::runtime_error("cannot write " + out_dir + "/config.json");
     cf << c.dump(2) << "\n";
+    cf.close();
+    // The text artifacts, the same list the other paths copy: without tokenizer.json the directory is not an NPU model
+    // directory at all, and the first probe of this genre failed exactly there -- the container was complete and
+    // `serve` refused it for the missing tokenizer, which reads like a weights problem and is not one.
+    const int copied = copy_text_artifacts(pack_dir, out_dir);
+    std::fprintf(stderr, "npu-pack: external-data genre: %d text artifact(s) copied\n", copied);
     std::fprintf(stderr, "npu-pack: external-data genre: %d tensors (%lld tiles, %lld exact)\n", r.tensors,
                  (long long)r.tiles, (long long)aux);
     return r;

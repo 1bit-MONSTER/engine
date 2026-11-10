@@ -3368,6 +3368,16 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // Not with injected rows: the oracle's own sequential pass runs step(tokens[m]) on the placeholder ids this
     // entry point supplies, so it would compare against a zero-token pass and report a divergence that is not
     // there. A debug tool that lies is worse than one that says "not applicable".
+    // engine#1905: the oracle's sequential replay must start from the SAME state the batched pass will, or the
+    // comparison is between different prefixes. It used to walk `start_pos .. start_pos+M-1` and then `reset()`, so for
+    // any chunk with `start_pos > 0` the batched pass ran from an empty cache and the replay from the real prefix: the
+    // oracle reported MISMATCH for every chunk but the first (measured on `bonsai2-27b-NPU-b8`, width 1, four ids:
+    // start=0 MATCH, start=1 seq=220 bat=653). That reads as a row-dependence bug in the kernels and sends the reader
+    // to fix the wrong thing. Snapshot the state the prefix established and restore it after the replay -- the same
+    // pair the prefix cache uses (`snapshot_state`/`restore_state`, and `q4nx_state_planes.h` is device-free).
+    StateSnapshot oracle_snap;
+    const bool oracle_snapped = batch_check && !inject_embeds_ && start_pos > 0 &&
+                                snapshot_state(start_pos, oracle_snap);
     if (batch_check && !inject_embeds_) {
         std::vector<float> seq;
         if (c_.NV > 0) seq_rows.reserve((size_t)M * (size_t)c_.NV);
@@ -3378,7 +3388,18 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 for (size_t i = 0; i < seq.size(); i++)
                     if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
         }
-        reset();
+        // Restore instead of reset() when the replay ran over a real prefix: `reset()` would leave the batched pass
+        // starting from nothing while the replay started from `start_pos` rows, which is the false mismatch above. With
+        // `start_pos == 0` there is nothing to restore and `reset()` is exactly right.
+        if (oracle_snapped) {
+            if (!restore_state(oracle_snap, start_pos)) {
+                err_ = "batch check: the sequential replay's prefix could not be restored, so the batched pass would "
+                       "not be comparable with it";
+                return false;
+            }
+        } else {
+            reset();
+        }
     }
 
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
@@ -3817,8 +3838,11 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         int ba = 0;
         for (size_t i = 1; i < logits.size(); i++)
             if (logits[i] > logits[(size_t)ba]) ba = (int)i;
-        std::fprintf(stderr, "[batchcheck] M=%d start=%d seq_argmax=%d batch_argmax=%d %s\n",
-                     M, start_pos, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+        // engine#1905: name the positions compared, not only the start. Before the snapshot fix this line said
+        // `start=1 MATCH`-looking numbers for a comparison that was really "position 1 from scratch" against "position
+        // 1 continuing a prefix", and the reader had to infer the range from `start` and `M`.
+        std::fprintf(stderr, "[batchcheck] M=%d positions=%d..%d seq_argmax=%d batch_argmax=%d %s\n",
+                     M, start_pos, start_pos + M - 1, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
         // engine#1781: and the comparison the gate actually asks for -- every row, bitwise.
         if (!seq_rows.empty() && bat_rows.size() == seq_rows.size() && c_.NV > 0) {
             onebit::npu::RowMismatch mm;

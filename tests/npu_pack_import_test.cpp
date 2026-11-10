@@ -4772,7 +4772,14 @@ void test_q4nx_container(const std::string& root) {
     namespace fs = std::filesystem;
     const fs::path dir = fs::path(root) / "q4nx-container";
     std::error_code ec;
+    fs::remove_all(dir, ec);   // a directory left by a run that died is not this run's fixture
     fs::create_directories(dir, ec);
+    // `root` is the golden directory when CTest runs this, i.e. the source tree: without the removal every run left
+    // tests/golden/q4nx-container/ behind as untracked files. Removed on every way out of the function.
+    struct Cleanup {
+        fs::path p;
+        ~Cleanup() { std::error_code e; fs::remove_all(p, e); }
+    } cleanup{dir};
 
     const auto write_container = [&](const std::string& name, const std::string& header_json, int64_t payload,
                                      bool truncate_header) {

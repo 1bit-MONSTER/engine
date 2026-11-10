@@ -752,6 +752,113 @@ void test_json_schema_refusals() {
           "grammar and json_schema together are refused");
 }
 
+
+// Gemma 4's own markup (engine#1779, F10 fault 4), taken from the pack's tokenizer_config.json: the call body is
+// `call:NAME{key:value,...}` with string values wrapped in <|"|>, which is not JSON. Asserted on the normalised
+// JSON rather than on "a call was found", because the normalisation is the part that can be silently wrong.
+void test_gemma4_answer_parser() {
+    const auto G = AnswerFamily::gemma4;
+    {
+        const std::string reply =
+            "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3,metric:true}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1, "gemma4: a <|tool_call> body is a call when tools were sent");
+        check(a.calls[0].name == "get_weather", "gemma4: the name is what follows call:");
+        check(a.calls[0].arguments == R"({"city":"Paris","days":3,"metric":true})",
+              "gemma4: arguments are rewritten to JSON (escaped strings, numbers, booleans)");
+        check(a.content.empty() && a.content_null, "gemma4: a call-only reply has content: null");
+    }
+    {
+        // A comma inside an escaped string must not split the argument list -- the case a naive splitter gets wrong.
+        const std::string reply =
+            "<|tool_call>call:say{text:<|\"|>hello, world<|\"|>,n:2}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == R"({"text":"hello, world","n":2})",
+              "gemma4: a comma inside <|\"|>...<|\"|> stays inside the string");
+    }
+    {
+        const std::string reply = "<|tool_call>call:ping{}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == "{}", "gemma4: a call with no arguments is {}");
+        const auto without = parse_answer(reply, G, false);
+        check(without.calls.empty(), "gemma4: the same markup is not a call when no tools were sent");
+        check(without.content.find("<|tool_call>") != std::string::npos,
+              "gemma4: and it stays in content, marker included");
+    }
+    {
+        const auto a = parse_answer("<|channel>thought\nlet me think<channel|>Done.", G, false);
+        check(a.reasoning == "\nlet me think", "gemma4: the thought channel is reasoning");
+        check(a.content == "Done.", "gemma4: and the reply after it is content");
+    }
+    {
+        // A string whose closing <|"|> never arrives is malformed: no call, and the markup is back in content.
+        const std::string reply = "<|tool_call>call:say{text:<|\"|>hello}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.empty(), "gemma4: an unterminated <|\"|> string is not a call");
+        check(a.content == reply, "gemma4: and what the model wrote is back in content, whole");
+        const auto b = parse_answer("<|tool_call>call:f{a:1}tail}<tool_call|>", G, true);
+        check(b.calls.empty() && !b.content.empty(), "gemma4: text after the arguments object is not a call");
+        const auto c = parse_answer("<|tool_call>call:f{a:[1,2}<tool_call|>", G, true);
+        check(c.calls.empty() && !c.content.empty(), "gemma4: an array that never closes is not a call");
+    }
+    {
+        // Nested object and array, the same bare-key form one level down.
+        const auto a = parse_answer(
+            "<|tool_call>call:f{o:{k:<|\"|>v<|\"|>},l:[1,<|\"|>a,b<|\"|>],z:null}<tool_call|>", G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == R"({"o":{"k":"v"},"l":[1,"a,b"],"z":null})",
+              "gemma4: nested objects and arrays are rewritten too");
+    }
+}
+
+// The family comes from the container's chat template. The Gemma 4 lines are the two literals the pack's own
+// chat_template carries (amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu: `<|tool_call>` x1, `<|channel>thought`
+// x1, `<tool_call>` x0, `<think>` x0), not a guess at them.
+void test_answer_family_of_template() {
+    using onebit::npu::answer_family_of_template;
+    check(answer_family_of_template("") == AnswerFamily::qwen3, "no template is qwen3, as before");
+    check(answer_family_of_template("{%- if tools %}<tool_call>\n{\"name\": ...}</tool_call>{% endif %}<think>") ==
+              AnswerFamily::qwen3,
+          "a template with <tool_call> and <think> is qwen3");
+    check(answer_family_of_template("{{- '<|tool_call>call:' + function['name'] + '{' -}}") == AnswerFamily::gemma4,
+          "a template that writes <|tool_call>call: is gemma4");
+    check(answer_family_of_template("{{- '<|channel>thought\\n<channel|>' -}}") == AnswerFamily::gemma4,
+          "a template with the thought channel and no tools is gemma4 too");
+    check(answer_family_of_template("<|im_start|>user\n{{ content }}<|im_end|>") == AnswerFamily::qwen3,
+          "a template with neither marker is qwen3");
+}
+
+// Every tag every family declares must be recognised, whatever its length, whole and split across two chunks at
+// every byte. The scanner once read tags through a 16-byte window, so a 17-byte tag read as text (engine#1779);
+// this arm fails for any family whose tags the scanner cannot match, including one added later.
+void test_every_family_tag_is_matched() {
+    for (const AnswerFamily f : {AnswerFamily::qwen3, AnswerFamily::gemma4}) {
+        const auto t = onebit::npu::answer_detail::tags_of(f);
+        const std::string name = onebit::npu::answer_detail::family_name(f);
+        const std::string think = std::string(t.think_open) + "R" + t.think_close + "C";
+        const std::string call = std::string(t.call_open) + "not a call" + t.call_close;
+        for (size_t cut = 0; cut <= think.size(); cut++) {
+            AnswerStream s(f, false);
+            std::vector<std::pair<bool, std::string>> out;
+            s.feed(think.substr(0, cut), out);
+            s.feed(think.substr(cut), out);
+            s.finish(out);
+            check(s.reasoning() == "R" && s.content() == "C",
+                  (name + ": think tags are matched, split at byte " + std::to_string(cut)).c_str());
+        }
+        for (size_t cut = 0; cut <= call.size(); cut++) {
+            AnswerStream s(f, true);
+            std::vector<std::pair<bool, std::string>> out;
+            s.feed(call.substr(0, cut), out);
+            s.feed(call.substr(cut), out);
+            s.finish(out);
+            // Not a valid body, so it comes back as content: open tag, body and close tag, which proves both
+            // call tags were seen (an unseen close tag would leave the body unterminated and drop the tag).
+            check(s.calls().empty() && s.content() == call && s.reasoning().empty(),
+                  (name + ": call tags are matched, split at byte " + std::to_string(cut)).c_str());
+        }
+    }
+}
+
 void test_answer_parser() {
     const auto F = AnswerFamily::qwen3;
     {   // reasoning, then content: the Qwen3 shape this route sees on every answer
@@ -1079,6 +1186,9 @@ int main() {
     test_answer_parser();
     test_answer_stream();
     test_tool_grammar();
+    test_gemma4_answer_parser();
+    test_every_family_tag_is_matched();
+    test_answer_family_of_template();
     test_tool_request_parsing();
     test_content_mask();
     test_request_parsing();

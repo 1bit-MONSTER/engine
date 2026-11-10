@@ -196,6 +196,7 @@ add_test(NAME embed_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/embed_serve.sh $<TAR
 # serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
 add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
 # serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.
+add_test(NAME serve_hangup COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_hangup_test.sh $<TARGET_FILE:onebit>)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
 add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $<TARGET_FILE:onebit>)
@@ -384,6 +385,14 @@ add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
 add_test(NAME think_split COMMAND think_split_test)
 # Host / Origin checks every engine HTTP server applies (app/http_guard.h); header only, runs in CI.
+# engine#1779 (F10 fault 2): the degenerate-repetition predicate at the context limit. Header only, no device.
+add_executable(serve_degenerate_test tests/serve_degenerate_test.cpp)
+target_include_directories(serve_degenerate_test PRIVATE app)
+add_test(NAME serve_degenerate COMMAND serve_degenerate_test)
+# Built with `onebit`, which CI's --target list already names: a test target of its own would need a line in
+# .github/workflows/ci.yml, and a PR that edits a workflow cannot be merged by a token without the `workflow` scope.
+add_dependencies(onebit serve_degenerate_test)
+
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)
 add_test(NAME http_guard COMMAND http_guard_test)
@@ -1334,8 +1343,12 @@ target_link_libraries(npu_derive_designs_dump PRIVATE m)
 # actually calls against the reference; the test links both. It is C++, so CMake switches this target's linker to CXX.
 # q4nx_head_image.c is the image cache's file format (engine#1716's cache slice, this branch): the identity arm above pins
 # what the image must contain, this one pins that what is written and read back is byte-identical to it.
+# q4nx_head_tile_cache.cpp is what a serve calls per head tile (load the image a previous serve wrote, or pack and write
+# it): the arms here are the cache's behaviour -- a second pass does not pack, a changed key does, a damaged or stale image
+# is replaced rather than used -- with a counter on the gather, so "rebuilt on every serve" cannot come back unnoticed.
 add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c
-                                  npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c)
+                                  npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c
+                                  npu/forward/src/q4nx_head_tile_cache.cpp)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 # engine#1779 fault 4 ("Gemma 4 tool-call parsing"): the answer parser is header-only (app/npu_answer_parser.h), so
@@ -1575,6 +1588,9 @@ endif()
         npu/forward/src/q4nx_pack.c
         # The production weight packer, extracted from I8Ctx so it can be tested without the device runtime (#1416).
         npu/forward/src/q4nx_pack_blocked.cpp
+        # The lm-head image cache (engine#1716): the file format, and the load-or-pack a serve calls per head tile.
+        npu/forward/src/q4nx_head_image.c
+        npu/forward/src/q4nx_head_tile_cache.cpp
         npu/forward/src/q4nx_semantics.c
         npu/forward/src/q4nx_forward.cpp
         # The NPU target interface and this box's target (engine#799 P4): the model keeps the maths, the

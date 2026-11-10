@@ -35,6 +35,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstring>
+#include <memory>
 #include <cstdint>
 #include <string>
 
@@ -86,6 +88,8 @@ struct Dims {
 // REFUSAL (importing without the gains is the silent-garbage path), found-and-not-declared is allowed only with the
 // measurement behind it (Qwen3 packs ship the sections without the key), and neither is the ordinary case. Exposed
 // so the three can be pinned without a 4 GB pack.
+// The gap is `[64 B zeros][q_norm bf16 [head_dim]][64 B zeros][k_norm bf16 [head_dim]]`: q first (engine#1934, measured
+// against the q_norm/k_norm initializers in Hunyuan-7B's own model.onnx).
 struct QkGainOffsets {
     int64_t k_norm = 0, q_norm = 0;  // 0,0 = the gap is not the gains' shape
 };
@@ -96,6 +100,54 @@ std::string qk_norm_refusal(bool declared, bool found);
 // GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
 // reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
 std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why);
+
+// The per-layer half of a multi-component pack's embedding (engine#1725). gemma-4 components carry, beside the token
+// table, `embed_tokens_per_layer.weight` (262144 x 8960 on e2b = layers x head_dim) and a 256-wide projection norm;
+// the decoder consumes them as `per_layer_inputs`, so a container without them gives the decoder less than it asks for.
+// Read separately from the token table because they have different shapes and different consumers: the token table
+// becomes the head oracle, this becomes an input. Empty (with `why`) when the component has no per-layer table.
+struct EmbedPerLayer {
+    // [V][layers*P] f32, row-major (embed_tokens_per_layer.weight) -- NOT copied. It is 9.4 GiB on gemma-4-e2b, so the
+    // reader hands out a pointer into the component's mapped external data and the importer converts it a band at a
+    // time. `keep` owns whatever that pointer lives in (the mapping, or a copy of an inline initializer) and unmaps it
+    // when the last copy of this struct goes.
+    const uint8_t* table_f32 = nullptr;
+    std::shared_ptr<const void> keep;
+    std::vector<float> norm;    // [P]                       (per_layer_projection_norm.weight, shared by every layer)
+    // The CONTEXT projection: the component carries it quantised as
+    // `per_layer_model_projection.weight_t_Q4` [layers*P][H] plus scales and packed zero points. The loader wants it
+    // dequantised, one [P][H] matrix per layer (`model.per_layer_model_proj.weight_layer{l}`), so it is dequantised here
+    // -- without it the per-layer input is `16*table/sqrt(2)`, plausible and wrong at every layer (engine#1725).
+    std::vector<float> model_proj;   // [layers][P][H]
+    int64_t          V = 0, width = 0, P = 0, H = 0, NL = 0;
+    // `ok()` is what the reader guarantees: the table (bounds-checked against its data) and the projection norm.
+    // `complete()` additionally requires the context projection, which the PLE contract needs -- a component with
+    // `ok()` but not `complete()` imports the table and will be refused by the loader on
+    // `per_layer_model_proj.weight_layer0`, which is the honest place to refuse (the importer does not know whether the
+    // decoder declares per_layer_inputs).
+    bool ok() const {
+        return V > 0 && width > 0 && table_f32 != nullptr && (!norm.empty() ? norm.size() == size_t(P) : true);
+    }
+    bool complete() const { return ok() && P > 0 && H > 0 && NL > 0 && model_proj.size() == size_t(NL) * size_t(P) * size_t(H); }
+    // one value of the table, for tests and spot checks
+    float at(int64_t row, int64_t col) const {
+        float f;
+        std::memcpy(&f, table_f32 + (size_t(row) * size_t(width) + size_t(col)) * 4, 4);
+        return f;
+    }
+};
+// `hidden` is the decoder's hidden size (the context projection's K); it comes from the pack's geometry, not from
+// the component, which is why the caller passes it. Parses the component graph and maps its external data ONCE; the
+// table's bytes are not read.
+EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidden, std::string* why);
+
+// One band of the per-layer token table as BF16 (round to nearest even, the same `f32_to_bf16` every other tensor
+// gets), straight from the mapping `meta` holds: no graph parse, no file open, nothing allocated. The importer
+// streams the whole table through this in 32-row bands (573 KB at a time on gemma-4-e2b) while the container is
+// written, so the table is never held -- not as f32, not as BF16 (engine#1725).
+// Returns the rows written, or -1 with `why` set. `out` must hold `rows * width * 2` bytes.
+int64_t read_per_layer_table_band(const EmbedPerLayer& meta, int64_t first_row, int64_t rows, uint8_t* out,
+                                  std::string* why);
 
 // One tensor the pack describes, and where its values would come from.
 struct Planned {
@@ -327,6 +379,8 @@ struct Report {
     std::string head_synthesized_note;
     // engine#1740: set when a block-32 head was READ from the .fconst tail (never together with the note above)
     std::string head_read_note;
+    // engine#1725: the per-layer embedding block the container carries (0 = none): row width per layer, and rows
+    int64_t per_layer_P = 0, per_layer_V = 0;
     bool prefill_tail_seen = false;        // a second copy was readable in the prefill .fconst
     bool final_norm_crosscheck = false;    // ... and it is byte-identical to the Token_Token copy
 

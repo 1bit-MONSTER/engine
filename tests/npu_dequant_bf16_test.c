@@ -60,7 +60,60 @@ static void put_bf16(uint8_t* dst, size_t i, float v) {
 /* A value pattern with both signs, no zeros in the middle, exact in bf16 */
 static float value_at(size_t i) { return (float)((int)(i % 61) - 30); }
 
+/* engine#1784: the loader no longer expands the plain int8 embedding table into RAM (0.74 GiB of int8 became 2.96 GiB
+ * of floats on the 27B); it reads one row per token out of the container's mapping through q4nx_plain_i8_at(). The
+ * arithmetic that must not drift is the scale group: per 32-column GROUP within a row, indexed (row * groups + col/32).
+ * A row/column mix-up there produces plausible numbers, so this is pinned against the whole-table decode of the same
+ * buffer, bit for bit, on a table whose scale differs per row AND per group -- symmetry cannot make a wrong index pass.
+ * Host-only: no model, no device, no tile alignment (the element-wise read needs none).
+ *
+ * These arms live in this file rather than a target of their own because a new add_test() has to be built by
+ * .github/workflows/ci.yml (the `ci_targets` test enforces it) and an edit to that file needs a token with the
+ * `workflow` scope; this binary already links q4nx_dequant.c and already runs in CI, so the primitive is covered
+ * without the workflow change. */
+static void embed_row_arms(void) {
+    const int rows = 7, cols = 64;               /* not a tile grid on purpose */
+    const int groups = cols / Q4NX_GROUP_SIZE;
+    uint8_t* q = malloc((size_t)rows * cols);
+    float* sc = malloc((size_t)rows * groups * sizeof(float));
+    float* ref = malloc((size_t)rows * cols * sizeof(float));
+    if (!q || !sc || !ref) { check(0, "embed row: the arms allocate"); free(q); free(sc); free(ref); return; }
+    unsigned seed = 12345u;
+    for (int i = 0; i < rows * cols; i++) {
+        seed = seed * 1103515245u + 12345u;
+        q[i] = (uint8_t)((seed >> 16) & 0xff);   /* every bit pattern, including 0x80 (-128) and 0xff (-1) */
+    }
+    for (int r = 0; r < rows; r++)
+        for (int g = 0; g < groups; g++) sc[r * groups + g] = 0.0005f * (float)(1 + r * groups + g);
+
+    check(q4nx_dequant_plain_i8(q, sc, rows, cols, ref) == 0, "embed row: the reference decode succeeds");
+    int bad = 0;
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++) {
+            const float got = q4nx_plain_i8_at(q, sc, rows, cols, r, c);
+            if (memcmp(&got, &ref[(size_t)r * cols + c], sizeof(float)) != 0) bad++;
+        }
+    check(bad == 0, "embed row: every element reads identically to the whole-table decode (bit for bit)");
+
+    bad = 0;
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++)
+            if (q4nx_plain_i8_at(q, NULL, rows, cols, r, c) != (float)((const int8_t*)q)[(size_t)r * cols + c]) bad++;
+    check(bad == 0, "embed row: with no scale array the value is the raw int8 (the unscaled table)");
+
+    check(q4nx_plain_i8_at(q, sc, rows, cols, -1, 0) == 0.0f, "embed row: row -1 reads as 0.0f");
+    check(q4nx_plain_i8_at(q, sc, rows, cols, rows, 0) == 0.0f, "embed row: row == rows reads as 0.0f");
+    check(q4nx_plain_i8_at(q, sc, rows, cols, 0, -1) == 0.0f, "embed row: col -1 reads as 0.0f");
+    check(q4nx_plain_i8_at(q, sc, rows, cols, 0, cols) == 0.0f, "embed row: col == cols (a pad column) reads 0.0f");
+    check(q4nx_plain_i8_at(NULL, sc, rows, cols, 0, 0) == 0.0f, "embed row: a null table reads as 0.0f");
+    check(q4nx_plain_i8_at(q, sc, rows, cols - 1, 0, 0) == 0.0f,
+          "embed row: cols that is not a multiple of the group reads 0.0f, not off the end of the scale row");
+    free(q); free(sc); free(ref);
+    printf("  embed row: 9 arms (bit-exact row read, null scale, 4 out-of-range, null table, wrong cols)\n");
+}
+
 int main(void) {
+    embed_row_arms();
     const int rows = 64, cols = 512;
     const size_t n = (size_t)rows * cols;
 

@@ -387,7 +387,15 @@ private:
     // dequantised from a container tensor, c_.H when it is the raw BF16 embedding.
     int lm_w_ = 0;
     // BF16 host-side tensors
-    std::vector<uint16_t> embed_;                 // [NV*H] bf16
+    std::vector<uint16_t> embed_;                 // unused since engine#1784 (the table is read in place); always empty
+    /* engine#1784: the token embedding table, read in place from the container's read-only mapping, one row per token.
+     * These point INTO that mapping, which is owned by `model_` and outlives the forward -- they are views, never
+     * owners, and must not be freed or written. Empty/null means the dtype goes through embed_f_ (the chunked formats
+     * that have no element-wise read yet). */
+    const uint16_t* embed_bf16_   = nullptr;      // bf16 table, row stride c_.H
+    const int8_t*   embed_i8_     = nullptr;      // plain int8 table, row stride c_.H
+    const float*    embed_sc_     = nullptr;      // per-32-column scales, H/32 per row (may be null: unscaled)
+    int             embed_groups_ = 0;            // H / Q4NX_GROUP_SIZE
     // Set only while step_batch_embeds() runs: the row source for the batched body's embedding fill.
     const float* inject_embeds_ = nullptr;
     // Set only while step_batch_embeds(..., position_ids, ...) runs: 3 x rows, plane-major, or null.

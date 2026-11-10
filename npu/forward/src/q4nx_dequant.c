@@ -271,3 +271,15 @@ int q4nx_dequant_plain_i8(const uint8_t* data, const float* scale, int rows,
     }
     return 0;
 }
+
+/* engine#1784: the element-wise form of the loop above, for a loader that reads one row at a time out of the
+ * container's mapping instead of materialising the table. Kept beside the loop so the two cannot drift: the group
+ * index and the scale row are computed the same way, and out-of-range coordinates are 0.0f (the caller's pad
+ * columns read as zero, which is what the fully decoded table holds there). */
+float q4nx_plain_i8_at(const uint8_t* data, const float* scale, int rows, int cols, int row, int col) {
+    if (!data || rows <= 0 || cols <= 0 || (cols % Q4NX_GROUP_SIZE) != 0) return 0.0f;
+    if (row < 0 || row >= rows || col < 0 || col >= cols) return 0.0f;
+    const int groups = cols / Q4NX_GROUP_SIZE;
+    const float v = (float)((const int8_t*)data)[(size_t)row * (size_t)cols + (size_t)col];
+    return scale ? v * scale[(size_t)row * (size_t)groups + (size_t)col / Q4NX_GROUP_SIZE] : v;
+}

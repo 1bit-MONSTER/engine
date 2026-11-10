@@ -1650,7 +1650,17 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
     // engine#1831: only when the vote did NOT record the block's headers. When it did, its list is the measurement
     // (`plan()` reads 2-header vs 4-header from `hdr.size()`, and `post_attn_hdr()` is `hdr.back()`), and rewriting it
     // to one entry turned every Qwen3 4-header 1.9 block into a 2-header one whose "post-attention" header was k_norm's.
-    if (!g.hdr.empty()) return g;
+    if (!g.hdr.empty()) {
+        /* engine#1985: the vote's list is a measurement, but it is not the only witness. A pack that declares per-head q/k
+         * gains cannot have a 2-header block, so a one-header vote on such a pack is the #1831 defect coming back through
+         * the vote instead of through the residue step -- measured: Qwen3-1.7B read as 2-header, qk_norm true -> false, 280
+         * refused projections, where main imported it with 0 the day before. Refuse naming both rather than pick. */
+        if (const std::string why = header_witness_refusal(int(g.hdr.size()), dims.use_qk_norm); !why.empty()) {
+            g.why = why;
+            g.stride = 0;
+        }
+        return g;
+    }
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
     // The scan window is the first GiB (about 8 blocks at h3584), so a real section boundary repeats ~8 times against
     // 1-2 for a payload coincidence; 3 separates them (requiring `layers/2` was too strict and dropped the real one).
@@ -2463,6 +2473,88 @@ static TailHeadLocate locate_tail_head(const Fconst& fc, int64_t tail_off, int64
     return r;
 }
 
+// engine#1740: the block-32 tail head. Layout and its measurement are in pack_import.h.
+Block32Head read_block32_head(const uint8_t* p, int64_t avail, int64_t V, int64_t K) {
+    Block32Head h;
+    if (V <= 0 || K <= 0 || K % 32 != 0) {
+        h.why = "a block-32 head needs K to be a multiple of 32 (K " + std::to_string(K) + ")";
+        return h;
+    }
+    const int64_t kb = K / 32, strips = 2 * kb, unit = block32_unit_bytes(K);
+    h.units = (V + kB32UnitRows - 1) / kB32UnitRows;
+    h.bytes = h.units * unit;
+    if (avail < h.bytes) {
+        h.why = "the .fconst tail has " + std::to_string(avail) + " B after its envelope, and a block-32 head of " +
+                std::to_string(h.units) + " units x " + std::to_string(unit) + " B needs " + std::to_string(h.bytes);
+        return h;
+    }
+    for (int64_t i = h.bytes; i < avail; ++i)
+        if (p[i] != 0) {
+            h.why = "the .fconst tail is not zero after the block-32 head's " + std::to_string(h.units) +
+                    " units (first non-zero byte " + std::to_string(i - h.bytes) + " B past them), so the head is not "
+                    "where this layout puts it";
+            return h;
+        }
+    h.padding = avail - h.bytes;
+    const auto all_zero = [](const uint8_t* b, int64_t n) {
+        for (int64_t i = 0; i < n; ++i)
+            if (b[i] != 0) return false;
+        return true;
+    };
+    Q4& q = h.q;
+    q.N = int(h.units * kB32UnitRows);
+    q.K = int(K);
+    q.block = 32;
+    q.codes.assign(size_t(q.N) * size_t(K), 0);
+    q.scale.assign(size_t(q.N) * size_t(kb), 1.0f);
+    q.zero.assign(size_t(q.N) * size_t(kb), 0.0f);
+    for (int64_t u = 0; u < h.units; ++u) {
+        const uint8_t* up = p + u * unit;
+        if (!all_zero(up, kB32UnitHeader)) {
+            h.why = "block-32 head unit " + std::to_string(u) + " does not open with " +
+                    std::to_string(kB32UnitHeader) + " zero bytes, so this is not the layout measured";
+            return h;
+        }
+        for (int64_t s = 0; s < strips; ++s) {
+            const uint8_t* sp = up + kB32UnitHeader + s * kB32StripBytes;
+            if (!all_zero(sp + 528, 48)) {
+                h.why = "block-32 head unit " + std::to_string(u) + " strip " + std::to_string(s) +
+                        " has non-zero bytes between its zero points and its scales, so this is not the layout measured";
+                return h;
+            }
+            const int64_t col0 = (s / 2) * 32, row0 = u * kB32UnitRows + 32 * (s % 2);
+            for (int r = 0; r < 32; ++r) {
+                const uint16_t bits = uint16_t(sp[576 + 2 * r]) | uint16_t(uint16_t(sp[577 + 2 * r]) << 8);
+                const uint32_t wide = uint32_t(bits) << 16;
+                float sc;
+                std::memcpy(&sc, &wide, 4);
+                if (!std::isfinite(sc)) {
+                    h.why = "block-32 head unit " + std::to_string(u) + " strip " + std::to_string(s) + " row " +
+                            std::to_string(r) + " has a scale that is not finite";
+                    return h;
+                }
+                const int zp = (sp[512 + r / 2] >> (4 * (r & 1))) & 15;
+                const bool flip = sc < 0;
+                const size_t g = size_t(row0 + r) * size_t(kb) + size_t(s / 2);
+                if (sc == 0.0f) continue;   // an all-zero block: codes 0, scale 1, zero 0 decode to 0
+                const float mag = flip ? -sc : sc;
+                q.scale[g] = mag;
+                q.zero[g] = -float(flip ? 15 - zp : zp) * mag;
+                // position p = band*256 + col*8 + (r%8) holds row band*8 + r%8, column col
+                const int base = (r / 8) * 256 + (r % 8);
+                uint8_t* dst = q.codes.data() + size_t(row0 + r) * size_t(K) + size_t(col0);
+                for (int c = 0; c < 32; ++c) {
+                    const int pos = base + c * 8;
+                    const int code = (sp[pos / 2] >> (4 * (pos & 1))) & 15;
+                    dst[c] = uint8_t(flip ? 15 - code : code);
+                }
+            }
+        }
+    }
+    h.ok = true;
+    return h;
+}
+
 // engine#1740: a self-test for the SEARCH, not the arithmetic. `plan_tail_head` is pinned by the host test; this pins
 // the part that can go silently wrong -- the candidate loop, best/runner-up tracking, the kTieCorr cut, the ambiguity
 // refusal and the untied-with-padding refusal -- using a synthetic head built through encode_tile, so it needs no pack,
@@ -2789,6 +2881,13 @@ QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_b
     o.q_norm = gap_start + kNormOff;                          // block 0: [64 B zeros][q_norm bf16 [head_dim]]
     o.k_norm = gap_start + (kNormOff + per_head) + kNormOff;  // block 1: [64 B zeros][k_norm bf16 [head_dim]]
     return o;
+}
+
+std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
+    if (!declared_qk || vote_hdrs != 1) return std::string();
+    return "the epsilon-anchor vote recorded ONE in-block header, and this pack declares use_qk_norm, whose per-head q/k "
+           "gains live in the two sections a 2-header block does not have (engine#1985). The two witnesses disagree and "
+           "neither is being preferred";
 }
 
 std::string qk_norm_refusal(bool declared, bool found) {
@@ -4409,11 +4508,99 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 // writes -- and the self-check then measures the synthesis against the embedding rather than being
                 // skipped. An untied pack is refused by name: its head is a matrix nothing else in the pack can
                 // stand in for.
-                if (!(tie_declared && tied)) {
+                //
+                // engine#1740: a block-32 head is READ when the tail holds it in the measured layout (pack_import.h,
+                // read_block32_head). On a tied pack the read has to correlate with the embedding above kTieCorr to be
+                // taken -- otherwise the synthesis below stands, and says why the read did not. On an untied pack the
+                // structural checks are all there is (nothing in the pack can vouch for the values), which the note
+                // states; it is the same standing the block-128 tail head has on an untied pack.
+                bool head32_read = false;
+                std::string head32_why;
+                if (p.head_block == 32) {
+                    const int64_t tail_off = int64_t(p.dims.layers) * g.stride;
+                    const int64_t env = attn_payload_off(H);
+                    if (tail_off + env > int64_t(fc.size)) {
+                        head32_why = "the .fconst ends before the tail's envelope";
+                    } else {
+                        Block32Head h32 = read_block32_head(fc.map + tail_off + env, int64_t(fc.size) - tail_off - env,
+                                                            V, H);
+                        const bool is_tied = tie_declared && tied;
+                        double c32 = 0.0;
+                        if (h32.ok && embed_tbl.ok()) c32 = corr(h32.q, embed_tbl, int(V));
+                        if (!h32.ok) {
+                            head32_why = h32.why;
+                        } else if (is_tied && !(c32 > kTieCorr)) {
+                            char b[160];
+                            std::snprintf(b, sizeof b,
+                                          "the tail's block-32 head decodes but correlates %.6f with the embedding of "
+                                          "a pack that declares them tied", c32);
+                            head32_why = b;
+                        } else {
+                            Q4& q = h32.q;
+                            std::fprintf(stderr,
+                                         "  lm head: block 32, %lld unit(s) of %lld B at %lld B, %lld B of zeros after "
+                                         "them%s\n",
+                                         (long long)h32.units, (long long)block32_unit_bytes(H),
+                                         (long long)(tail_off + env), (long long)h32.padding,
+                                         is_tied ? " (tied: verified by correlation with the pack's embedding)"
+                                                 : " (untied: layout checked, values not verified)");
+                            if (embed_tbl.ok()) {
+                                r.lmhead_corr = c32;
+                                {
+                                    double sum_abs = 0, sum_ref = 0;
+                                    for (int n = 0; n < int(V); ++n)
+                                        for (int k = 0; k < q.K; ++k) {
+                                            const size_t gg = size_t(n) * (q.K / 32) + size_t(k) / 32;
+                                            const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[gg] + q.zero[gg];
+                                            const double e = embed_at(embed_tbl, n, k);
+                                            sum_abs += std::fabs(x - e);
+                                            sum_ref += std::fabs(e);
+                                        }
+                                    if (sum_ref > 0) r.lmhead_rel = sum_abs / sum_ref;
+                                }
+                                r.selfcheck_reference = true;
+                                r.selfcheck_tied = c32 > kTieCorr;
+                                double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
+                                const int nsh = std::min(2048, int(V) - 1);
+                                for (int rr = 0; rr < nsh; ++rr)
+                                    for (int k = 0; k < q.K; ++k) {
+                                        const size_t gg = size_t(rr) * (q.K / 32) + size_t(k) / 32;
+                                        const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[gg] + q.zero[gg];
+                                        const double y = embed_at(embed_tbl, rr + 1, k);
+                                        sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
+                                    }
+                                const double m = double(nsh) * q.K;
+                                const double cx = sxx - sx * sx / m, cy = syy - sy * sy / m;
+                                if (m > 0 && cx > 1e-12 && cy > 1e-12)
+                                    r.ctrl_corr_rowshift = (sxy - sx * sy / m) / std::sqrt(cx * cy);
+                            }
+                            std::vector<uint8_t> tiled;
+                            long long pinexact = 0;
+                            tile_q4_1_f32(q, tiled, &pinexact);
+                            r.codes_total = q.codes.size();
+                            r.zero_exact_pct = 100.0 * double(q.scale.size() - pinexact) / double(q.scale.size());
+                            const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
+                            r.tiles += head_tiles;
+                            w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
+                            ++r.tensors;
+                            head_written = true;
+                            head32_read = true;
+                            r.head_read_note =
+                                std::string("lm_head was read from the .fconst tail's block 32 head (") +
+                                std::to_string(h32.units) + " units of " + std::to_string(block32_unit_bytes(H)) +
+                                " B)" + (is_tied ? ", and it reproduces model.embed_tokens"
+                                                 : "; the pack is untied, so its values are not verified against "
+                                                   "anything in the pack");
+                        }
+                    }
+                }
+                if (head32_read) {
+                    // nothing more to do: the pack's own head is in the container
+                } else if (!(tie_declared && tied)) {
                     late.push_back("lm_head.weight: this pack quantises its head at block " +
                                    std::to_string(p.head_block) + " along K, which this importer's tile geometry cannot "
                                    "walk, and the pack does not declare tied embeddings, so the embedding cannot stand "
-                                   "in for it");
+                                   "in for it" + (head32_why.empty() ? "" : " (" + head32_why + ")"));
                 } else {
                     const size_t rows_v = size_t(V), kk = size_t(H);
                     Q4 q;
@@ -4473,7 +4660,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     r.head_synthesized_note =
                         "the pack quantises its head at block " + std::to_string(p.head_block) +
                         " along K, so the tail's head tiles are not read; the pack declares tied embeddings, so "
-                        "lm_head is the 4-bit quantisation of model.embed_tokens";
+                        "lm_head is the 4-bit quantisation of model.embed_tokens" +
+                        (head32_why.empty() ? "" : " (" + head32_why + ")");
                     std::fprintf(stderr,
                                  "note: this pack's head is block %lld along K, which this importer cannot walk; the "
                                  "pack is tied, so the head was taken from the embedding (engine#1503)\n",
@@ -5040,6 +5228,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         c["vocab_size"] = V;
         c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries
         if (!r.head_synthesized_note.empty()) c["q4nx_head_note"] = r.head_synthesized_note;
+        if (!r.head_read_note.empty()) c["q4nx_head_note"] = r.head_read_note;
         // The forward picks between "logits from the token embedding" and "logits from a separate head tensor" on this
         // key, and defaults to TIED when it is absent (npu/forward/src/q4nx_semantics.c). An untied pack that ships no
         // config.json -- every genre-A hybrid, e.g. Phi-3-mini -- therefore used to look tied, and the forward decoded

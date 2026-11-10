@@ -269,6 +269,12 @@ include(cmake/tests-gpu-hold.cmake)
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
 add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.sh)
+# engine#1844: the serve_context_limit row's classifier used to accept anything that was not 2xx, so a server that DIED
+# mid-request (curl 000) or answered 5xx passed as "a refusal". The classifier and its pass set are pure functions of
+# (http code, body), so their cases -- especially the ones that must reject -- run here with no model, no server and no
+# device. Deliberately OUTSIDE if(ONEBIT_SERVE_TEST_GGUF): that row is device-gated, and the whole point is that the
+# classification is checked in every configure, including the ones that never load a model.
+add_test(NAME serve_context_limit_classify COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh --self-test)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the

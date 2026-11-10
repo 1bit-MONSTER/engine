@@ -765,8 +765,121 @@ void test_sweep_fconst_scratch_dirs() {
     check(in_other(fresh_other), "sweep: a fresh copy of another pack stays -- another run may be writing it");
     check(fs::exists(written / keep), "sweep: the copy being written is kept");
     check(!fs::exists(absent), "sweep: a candidate that does not exist is not created");
+    // #1915 review, boundary arms. (a) A file that is not fconst19 scratch is kept however old it is. (b) The current
+    // directory is never swept unless it is the directory being written -- under every spelling of it.
+    {
+        const fs::path lane = root / "lane-cwd";
+        fs::create_directories(lane);
+        const std::string notes = "notes-about-1bit-fconst19.txt";
+        for (const auto& d : {other, lane}) {
+            touch(d, notes);
+            touch(d, old_other);
+            fs::last_write_time(d / notes, seven_hours_ago, ec);
+            fs::last_write_time(d / old_other, seven_hours_ago, ec);
+        }
+        const fs::path was = fs::current_path();
+        fs::current_path(lane);
+        pi::sweep_fconst_scratch_dirs({written.string(), other.string(), ".", lane.string(), (lane / ".." / "lane-cwd").string()},
+                                      written.string(), keep, prefix, legacy, 6 * 3600);
+        const bool cwd_kept = fs::exists(lane / old_other);
+        // and when the cwd IS the directory being written, the evict-on-write rule still applies to it
+        pi::sweep_fconst_scratch_dirs({lane.string(), other.string()}, lane.string(), keep, prefix, legacy, 6 * 3600);
+        const bool cwd_written_swept = !fs::exists(lane / old_other);
+        fs::current_path(was);
+        check(!in_other(old_other), "sweep: (control) the same old file in a directory that is not the cwd goes");
+        check(in_other(notes) && fs::exists(lane / notes), "sweep: a file that is not fconst19 scratch is kept however old");
+        check(cwd_kept, "sweep: the current directory is never swept, as '.', as its absolute path or through '..'");
+        check(cwd_written_swept, "sweep: unless it is the directory being written (evict-on-write, engine#1770)");
+    }
     fs::remove_all(root, ec);
-    std::printf("  scratch sweep: every candidate directory, 6 arms\n");
+    std::printf("  scratch sweep: every candidate directory, 10 arms\n");
+}
+
+// #1915 review: the arms above call the sweep; nothing ran the importer and looked. "Delete the call site and the suite
+// stays green" was true. This runs the production path once -- import_pack() on a crafted pack with a Token .fconst --
+// with a scratch directory that already holds an abandoned copy of ANOTHER pack, and asserts that copy is gone. With an
+// override set only that directory is swept, so the second directory's copy must still be there.
+void test_sweep_is_wired(const std::string& root) {
+    const fs::path dir = fs::path(root) / "sweep-wired";
+    const fs::path scratch = fs::temp_directory_path() / ("1bit-sweep-wired-" + std::to_string(::getpid()));
+    const fs::path cache_home = fs::temp_directory_path() / ("1bit-sweep-wired-xdg-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::remove_all(scratch, ec);
+    fs::remove_all(cache_home, ec);
+    fs::create_directories(dir / "cache");
+    fs::create_directories(scratch);
+    fs::create_directories(cache_home / "1bit" / "fconst19");
+    const int H = 128, L = 8, V = 64;
+    {
+        const int64_t stride = 1 << 20, second = 262144;
+        std::string fc(size_t(int64_t(L) * stride + 64 + size_t(H) * 2), '\0');
+        for (int l = 0; l <= L; ++l) {
+            fc[size_t(int64_t(l) * stride)] = char(0x86);
+            fc[size_t(int64_t(l) * stride) + 1] = char(0x35);
+            if (l < L) {
+                fc[size_t(int64_t(l) * stride + second)] = char(0x86);
+                fc[size_t(int64_t(l) * stride + second) + 1] = char(0x35);
+            }
+        }
+        put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+    }
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06})");
+    put_file((dir / "model.onnx.data").string(), std::string(size_t(V) * size_t(H) * 2, '\x11'));
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", 0, uint64_t(V) * uint64_t(H) * 2, 10)},
+                       {}));
+    const std::string foreign_old = "1bit-fconst19v1-77777-1536-12-28-995712640-73345656.fconst";
+    const std::string foreign_fresh = "1bit-fconst19v1-88888-1536-12-28-995712640-73345656.fconst";
+    const std::string unrelated = "keep-me.txt";
+    const auto seven_hours_ago = fs::file_time_type::clock::now() - std::chrono::hours(7);
+    for (const fs::path& d : {scratch, cache_home / "1bit" / "fconst19"})
+        for (const auto& f : {foreign_old, foreign_fresh, unrelated}) {
+            put_file((d / f).string(), "x");
+            if (f != foreign_fresh) fs::last_write_time(d / f, seven_hours_ago, ec);
+        }
+    struct Env {
+        std::string name, value;
+        bool had;
+    };
+    std::vector<Env> saved;
+    for (const char* n : {"ONEBIT_FCONST_SCRATCH", "XDG_CACHE_HOME"}) {
+        const char* v = std::getenv(n);
+        saved.push_back({n, v ? v : "", v != nullptr});
+    }
+    setenv("ONEBIT_FCONST_SCRATCH", scratch.c_str(), 1);
+    setenv("XDG_CACHE_HOME", cache_home.c_str(), 1);
+    const std::string out = (fs::temp_directory_path() / ("oga_pack_import_sweepwired." + std::to_string(::getpid()))).string();
+    fs::remove_all(out, ec);
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    try {
+        (void)pi::import_pack(dir.string(), out, allow);
+    } catch (const std::exception&) {
+        // the import's own outcome is not what is under test: the scratch copy is made, and swept around, before any
+        // refusal about this fixture's empty payload
+    }
+    for (const auto& e : saved) {
+        if (e.had) setenv(e.name.c_str(), e.value.c_str(), 1);
+        else unsetenv(e.name.c_str());
+    }
+    bool wrote_here = false;
+    for (const auto& e : fs::directory_iterator(scratch, ec))
+        if (e.path().filename().string().rfind("1bit-fconst19v", 0) == 0 && e.path().filename().string() != foreign_fresh)
+            wrote_here = true;
+    check(wrote_here, "sweep wiring: (premise) the import put its scratch copy in the override directory");
+    check(!fs::exists(scratch / foreign_old), "sweep wiring: an abandoned copy of another pack is GONE after a real import");
+    check(fs::exists(scratch / foreign_fresh), "sweep wiring: a fresh copy of another pack is still there");
+    check(fs::exists(scratch / unrelated), "sweep wiring: a file that is not fconst19 scratch is still there");
+    check(fs::exists(cache_home / "1bit" / "fconst19" / foreign_old),
+          "sweep wiring: with an override set, the cache directory is NOT swept (another lane's files stay)");
+    fs::remove_all(out, ec);
+    fs::remove_all(dir, ec);
+    fs::remove_all(scratch, ec);
+    fs::remove_all(cache_home, ec);
 }
 
 void test_modelbin_genre_refusal(const std::string& root) {
@@ -3742,6 +3855,7 @@ int main(int argc, char** argv) {
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
         test_sweep_fconst_scratch_dirs();
+        test_sweep_is_wired(golden_dir.empty() ? "." : golden_dir);
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);

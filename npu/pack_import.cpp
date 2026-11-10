@@ -717,6 +717,9 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     constexpr const char* kScratchStem = "1bit-fconst19";
     // A scratch copy older than this is a pack no run is importing: no import holds one for hours, so an mtime this far back
     // means the pack was abandoned, not that somebody is using it. Kept well above the longest import measured (~minutes).
+    // This number is what protects a CONCURRENT run's copy in a shared directory (the sweep reaches every candidate
+    // directory now, engine#1907), so it has to stay above the longest import: do not lower it to relieve disk or tmpfs
+    // pressure -- remove the files, or point ONEBIT_FCONST_SCRATCH at disk, instead.
     constexpr int64_t kScratchMaxAgeSeconds = 6 * 3600;
     // Everything but the source identity: the group this run evicts its stale siblings from (engine#1770).
     const std::string ident_prefix = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
@@ -4923,9 +4926,24 @@ void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::
                                int64_t max_age_seconds) {
     // engine#1907: every candidate is swept, not only the one being written. A directory that does not exist is skipped,
     // never created: only the written one is made ready, by its caller.
+    //
+    // The CURRENT DIRECTORY is the one candidate that is not this importer's to clean (#1915 review): it is in the list
+    // only as the last write fallback, and a lane that runs `npu-pack` from inside its own scratch would otherwise have
+    // that scratch's old `1bit-fconst19*` files removed. So it is swept only when it is the directory being written --
+    // which is what happened before #1907 and is the evict-on-write rule of engine#1770, unchanged. The comparison is
+    // on canonical paths: `.`, a relative spelling and the absolute path are the same directory. A directory listed
+    // twice is swept once.
+    std::error_code cwd_ec;
+    const fs::path cwd = fs::weakly_canonical(fs::current_path(cwd_ec), cwd_ec);
+    std::set<std::string> seen;
     for (const auto& dir : dirs) {
-        std::error_code ec;
-        if (dir == written_dir || fs::is_directory(dir, ec))
+        if (dir.empty()) continue;
+        std::error_code ec, cec;
+        const bool written = dir == written_dir;
+        const fs::path canon = fs::weakly_canonical(dir, cec);
+        if (!written && (cwd_ec || cec || canon == cwd)) continue;
+        if (!cec && !seen.insert(canon.string()).second) continue;
+        if (written || fs::is_directory(dir, ec))
             evict_stale_canonical_copies(dir, keep_name, prefix, legacy_name, max_age_seconds);
     }
 }

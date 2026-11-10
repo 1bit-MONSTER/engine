@@ -950,7 +950,10 @@ The copy is a cache: it is reused while the source's size and mtime and the rule
 sweeps the scratch directories. It removes other identities of the same pack and geometry, the pre-version name, and any
 `1bit-fconst19*` copy nobody has written for 6 hours. Without an override, **every** candidate directory is swept, not only the
 one being written, so copies older binaries left in `/tmp` get reclaimed (engine#1907). With `ONEBIT_FCONST_SCRATCH` set, only
-that directory is swept, and a run with an override never removes another lane's files. The test suite sets one per run and
+that directory is swept, and a run with an override never removes another lane's files. The current directory is the
+one candidate that is never swept unless the copy is being written there: it is only the last write fallback, and a
+working directory's files are not the importer's to clean. The 6 hours are what keep a concurrent run's copy alive in a
+shared directory, so the number stays above the longest import; it is not the knob for disk or tmpfs pressure. The test suite sets one per run and
 removes it at exit.
 
 ### Linking the kernel set the container will be served with

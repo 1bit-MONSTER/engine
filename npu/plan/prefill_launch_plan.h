@@ -8,6 +8,12 @@
 // **1073.4 ms** wall and a 128-row pass **6992.2 ms** -- 6.51x -- so `k = ceil(rows/16)` 16-row launches are cheaper than
 // one wide pass while `k <= 6`, i.e. rows <= 96. A 17-row chunk is the worst case: 6992 ms instead of 2147 ms, 3.26x.
 //
+// THESE CONSTANTS ARE THAT PACK'S, NOT A RULE (engine#1959, measured on the 4B b8 pack 2026-11-10 19:44Z, one npu-hold
+// ticket, 48-row prompt): the wide pass took **2416.3 ms** and three M=16 launches **2502.6 ms** -- the split is **3.6%
+// SLOWER** there, i.e. 50 vs 52 ms/row. So the 6.5x cliff belongs to the 7B kernel set, and whether splitting pays has to
+// be measured per pack before it is enabled for it: this function encodes one measurement, not a law. Make the two unit
+// costs parameters when a second pack's numbers land.
+//
 // Header-only and dependency-free on purpose: the decision is the part that can be wrong by arithmetic alone, so it is
 // pinned by tests/prefill_launch_plan_test.cpp without a device and without linking the XDNA runtime.
 //

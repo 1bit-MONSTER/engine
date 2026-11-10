@@ -66,6 +66,7 @@
 #include "built_path.h"
 
 #include "gguf_meta.h"
+#include "q4nx_cache.h"
 #include "hrx_archs.h"
 #include "hrx_cwsr.h"
 #include "hrx_runtime.h"
@@ -2954,6 +2955,17 @@ std::string q4nx_cache_root() {
 // (Python), cached by GGUF stem so a repeated serve reuses the conversion.
 // Override the tool paths with ONEBIT_Q4NX_PYTHON / ONEBIT_Q4NX_CONVERTER and
 // the cache root with ONEBIT_Q4NX_CACHE.
+// engine#1956: the cache is regenerable scratch, not user data, and nothing ever removed an old entry -- measured at 104 G in
+// 29 entries on one box, which closed two lanes' build gates the same day. The bound is a size, not an age, because a busy
+// day imports more packs than any age window expires; ONEBIT_Q4NX_CACHE_MAX_GIB=0 restores the old unbounded behaviour.
+// The entry just written is never a candidate, and neither is one younger than the sweep's age window (a serve may be reading
+// it) -- see app/q4nx_cache.h for why that is a heuristic rather than a guarantee.
+static void q4nx_cache_sweep(const std::string& cache, const std::string& keep) {
+    const char* env = std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB");
+    long long gib = env && *env ? std::atoll(env) : 60;
+    q4nx_cache_evict(cache, keep, gib > 0 ? gib * (1LL << 30) : 0);
+}
+
 std::string repack_gguf(const std::string& gguf) {
     const std::string stem = fs::path(gguf).stem().string();
     const std::string cache = q4nx_cache_root();
@@ -3048,6 +3060,7 @@ std::string repack_gguf(const std::string& gguf) {
     const int rc = run_program(repack, false);
     if (rc != 0 || !fs::exists(out + "/model.q4nx"))
         throw std::runtime_error("GGUF repack failed (rc=" + std::to_string(rc) + "): " + command_text(repack));
+    q4nx_cache_sweep(cache, out);        // engine#1956: after the new entry exists, and never evicting it
     return out;
 }
 
@@ -3117,6 +3130,7 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
             fs::copy_file(fs::path(tok) / "tokenizer_config.json", fs::path(out) / "tokenizer_config.json",
                           fs::copy_options::overwrite_existing);
     }
+    q4nx_cache_sweep(cache, out);        // engine#1956: the lane layout lands in the same cache, so it sweeps too
     return out;
 }
 

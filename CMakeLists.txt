@@ -95,7 +95,7 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
      "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
 add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp
-                     app/embed_serve.cpp app/embed_model.cpp)
+                     app/embed_serve.cpp app/embed_model.cpp app/q4nx_cache.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -1067,6 +1067,13 @@ add_dependencies(npu_sampling_test npu_queue_test)
 # sentences) needs the 17.9 MB container the importer writes (the source safetensors is 13.9 MB) and stays
 # a measured row in the PR.
 add_executable(embed_model_test tests/embed_model_test.cpp app/embed_model.cpp)
+# engine#1956: the Q4NX container cache's sweep, driven on a synthetic cache (bound, LRU order, the entry just written, the
+# age window, and the disabled case). Listed explicitly like the other app/ units so the test needs no `onebit`.
+add_executable(q4nx_cache_test tests/q4nx_cache_test.cpp app/q4nx_cache.cpp)
+target_include_directories(q4nx_cache_test PRIVATE app)
+add_test(NAME q4nx_cache COMMAND q4nx_cache_test)
+# engine#1956 review: an `add_test` whose target ci.yml never builds never runs in CI -- the documented route, no workflow edit.
+add_dependencies(onebit q4nx_cache_test)
 target_include_directories(embed_model_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
 target_link_libraries(embed_model_test PRIVATE nlohmann_json::nlohmann_json)
 target_compile_definitions(embed_model_test PRIVATE SRC_DIR="${CMAKE_SOURCE_DIR}")

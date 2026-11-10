@@ -74,6 +74,16 @@ namespace onebit {
 
 namespace {
 
+// A prompt that leaves no room for an answer inside the context (the model's, or --ctx-size).
+struct ContextOverflow : std::runtime_error {
+    size_t prompt_tokens;
+    int context;
+    ContextOverflow(size_t n, int ctx)
+        : std::runtime_error("request (" + std::to_string(n) + " tokens) exceeds the available context size (" +
+                             std::to_string(ctx) + " tokens)"),
+          prompt_tokens(n), context(ctx) {}
+};
+
 using json = nlohmann::json;
 
 struct ForwardEngine {
@@ -297,7 +307,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         // The KV cache grows with every position: the prompt and the answer together stay
         // inside the model's context.
         const int room = e.max_context - int(ids.size());
-        if (room < 1) throw std::runtime_error("prompt longer than the context");
+        if (room < 1) throw ContextOverflow(ids.size(), e.max_context);
         const int limit = std::clamp(max_tokens, 0, room);
         std::lock_guard<std::mutex> lock(e.mu);
 
@@ -488,7 +498,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     std::fclose(f);
                 }
             }
-            const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr);
+            const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr, e.tok->size());
             // -1: the grammar allows no token here, so the answer ends where it is.  An end token is
             // in the mask only where the grammar can stop (refresh_allowed), so a constrained reply
             // that completes reports "stop" instead of padding to the budget (engine#1182).
@@ -729,6 +739,13 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     return true;
                 });
         }
+    } catch (const ContextOverflow& ex) {
+        // The client's request, not a server fault: 400, with the type and the wording the GGUF route's
+        // backend uses for the same refusal, so one client-side check covers both routes.
+        res.status = 400;
+        res.set_content(json{{"error", {{"message", ex.what()}, {"type", "exceed_context_size_error"},
+                                        {"n_prompt_tokens", ex.prompt_tokens}, {"n_ctx", ex.context}}}}.dump(),
+                        "application/json");
     } catch (const std::exception& ex) {
         res.status = 500;
         res.set_content(json{{"error", {{"message", ex.what()}}}}.dump(), "application/json");
@@ -848,6 +865,10 @@ int run_forward_ids(const std::string& model_dir, const std::string& kernels, co
     if (ids.empty()) throw std::runtime_error("--ids: no token ids");
     const std::string model = model_dir + "/model.q4nx";
     if (!std::filesystem::exists(model)) throw std::runtime_error(model + " does not exist");
+    // The tokenizer's size bounds the printed ids (engine#2017); a container without tokenizer.json keeps the whole row.
+    int tok_vocab = 0;
+    if (const std::string tj = model_dir + "/tokenizer.json"; std::filesystem::exists(tj))
+        tok_vocab = npu::Tokenizer(tj).size();
     // Same device discipline as forward-serve: host-GEMM runs take no lock (engine#1353 -- a host-GEMM run that held it
     // for 4 h 52 m stopped two lanes' device work), a run that opens the device takes the exclusive one.
     int lock_fd = -1;
@@ -878,10 +899,8 @@ int run_forward_ids(const std::string& model_dir, const std::string& kernels, co
                                      " floats for " + std::to_string(m) + " rows)");
         const int nv = int(all.size() / size_t(m));
         for (int r = 0; r < m; ++r) {
-            const float* row = all.data() + size_t(r) * size_t(nv);
-            int best = 0;
-            for (int v = 1; v < nv; ++v)
-                if (row[v] > row[best]) best = v;
+            // Bounded by the tokenizer like the served route (engine#2017): an id past it is a padding position.
+            const int best = npu::argmax_token(all.data() + size_t(r) * size_t(nv), size_t(nv), tok_vocab);
             std::printf("%d\n", best);   // token ids out, in row order: the id the model chooses at that row
         }
         done += m;
@@ -906,6 +925,7 @@ int run_forward_serve(int argc, char** argv) {
     std::string npu_target = ::npu::target::xdna::XdnaTarget::kName;
     npu::PrefixOptions prefix_opts;  // --prefix-slots / --prefix-cache-mb / --prefix-min-gain (#650)
     bool prefix_pin = false;         // --prefix-pin (engine#1785)
+    int ctx_size = 0;                // --ctx-size N: prompt plus answer, at most the model's own (0 = the model's)
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -921,6 +941,7 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--prefix-cache-mb") prefix_opts.cache_mb = std::stoul(next());
         else if (a == "--prefix-min-gain") prefix_opts.min_gain = std::stoi(next());
         else if (a == "--prefix-pin") prefix_pin = true;
+        else if (a == "-c" || a == "--ctx-size") ctx_size = std::stoi(next());
         else if (a == "--npu-streams") streams = std::stoi(next());
         else if (a == "--npu-target") npu_target = next();
         else if (a == "--dump-logits") dump_logits = next();
@@ -963,6 +984,16 @@ int run_forward_serve(int argc, char** argv) {
     // q4nx_config_int finds the key at any depth (a text_config's too).
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
     if (e.max_context <= 0) e.max_context = 32768;
+    // --ctx-size lowers the limit and never raises it: the model's positions are what they are. The same
+    // guard that refuses a prompt longer than the model's context then refuses one longer than this.
+    if (ctx_size < 0) throw std::runtime_error("--ctx-size: must be zero or more");
+    if (ctx_size > 0) {
+        if (ctx_size > e.max_context)
+            std::fprintf(stderr, "1bit forward-serve: --ctx-size %d is above the model's context %d; using %d\n", ctx_size,
+                         e.max_context, e.max_context);
+        e.max_context = std::min(e.max_context, ctx_size);
+    }
+    std::fprintf(stderr, "1bit forward-serve: context %d tokens (prompt plus answer)\n", e.max_context);
 
     // #963: the chat route's prompt was ChatML for every container, and a tokenizer with no
     // <|im_start|>/<|im_end|> added token cannot represent it -- the marker becomes ordinary pieces and

@@ -93,6 +93,23 @@ def make_model(d, np):
         json.dump({"add_bos_token": False}, f)
 
 
+def tmp_root():
+    """tests/tmp_root.h's rule (engine#2029): scratch goes on disk, not in tmpfs. ONEBIT_TEST_TMP if set, else
+    ~/.cache/scratch-tests/tmp, else the system temp directory."""
+    e = os.environ.get("ONEBIT_TEST_TMP")
+    if e:
+        return e
+    h = os.environ.get("HOME")
+    if h:
+        p = os.path.join(h, ".cache", "scratch-tests", "tmp")
+        try:
+            os.makedirs(p, exist_ok=True)
+            return p
+        except OSError:
+            pass
+    return None
+
+
 def main():
     if len(sys.argv) != 2:
         print(__doc__.strip().splitlines()[2])
@@ -102,7 +119,7 @@ def main():
     except ImportError:
         print("SKIP: numpy is not installed")
         return 77
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(prefix="batch_check_state_ci.", dir=tmp_root()) as tmp:
         src, out = os.path.join(tmp, "hf"), os.path.join(tmp, "q4nx")
         make_model(src, np)
         r = subprocess.run([sys.executable, TOOL, "pack", src, out], capture_output=True, text=True)

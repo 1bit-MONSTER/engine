@@ -1610,10 +1610,28 @@ The slot table (`app/npu_prefix_cache.h`) has a slot kind for the part such requ
 
 It reads token ids only, so it does not depend on the template or on which message is the system prompt.
 
-**State of this, plainly:** the table and its tests are in; `forward-serve` does not call `pin_point()`/`pin()`
-yet, so no request is faster because of it today. The forward half is one more cut in the prefill loop (stop one
-token short of the pin point, `snapshot_state`, `pin`), and it needs a device run to be claimed.
+**`--prefix-pin`** (on `1bit serve --device npu` and on `forward-serve`; off by default) turns it on. The
+forward keeps the previous request's prompt ids, and when `pin_point()` is non-zero it stops the prefill one
+token short of that point, takes a snapshot and pins it, the same cut it already makes before the last token.
+The cost is one more launch on the request that makes the pin. Every decision is logged
+(`[prefix] pin slot=1 tokens=342 state_at=341 pinned`), and `usage.flm_prefix_cache.pinned` says when a hit
+came from the pinned slot.
 
+Measured 2026-11-10 on `bonsai2-t2s2-perrole876` with its `kernels-m16`, `--ctx-size 1024`, one `npu-hold`
+ticket, one server per arm, four requests: the same 14-rule system prompt, then three different questions and
+the second one again. 16 tokens generated, temperature 0.
+
+| request | cache off | default cache | `--prefix-pin` |
+|---|---|---|---|
+| 1 (question A) | cached 0, 58.6 s | cached 0 | cached 0, 59.5 s |
+| 2 (question B) | cached 0, 59.4 s | cached 0 | cached 0, 62.1 s (makes the pin: 342 tokens) |
+| 3 (question C) | cached 0, 61.5 s | cached 0 | **cached 341 of 355, pinned, 23.4 s** |
+| 4 (question B again) | cached 0, 60.0 s | not reached | cached 354 of 355 (the whole-prompt slot), 20.4 s |
+
+The generated text of all four requests is identical between the cache-off arm and the `--prefix-pin` arm.
+The default-cache arm's times are not in the table: the ticket ended during its third request, so only its
+three cache decisions (from the server log) are known. A request's time here is the whole HTTP call, prefill
+plus 16 generated tokens, not TTFT.
 
 ### Sampling and structured output
 

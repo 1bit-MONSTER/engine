@@ -18,13 +18,14 @@
 // The fix this pins is invisible without an arm: every call site only swapped fopen() for an opener, and a later
 // "simplification" back to fopen() would pass every other test. So, with umask 0 (the case where fopen gives 0666):
 //   [1] a new file from the private opener is 0600, and from the shared opener 0644;
-//   [2] a file that already exists at 0666 (what an older build left) is narrowed to 0600 / 0644 when rewritten, and
-//       its old contents are truncated;
+//   [2] a file that already exists wider than the stated mode -- 0664, what fopen() left under a 002 umask; the test
+//       does not make a world-writable file itself, which CodeQL would rightly flag -- is narrowed to 0600 / 0644 when
+//       rewritten, and its old contents are truncated;
 //   [3] a stricter umask still wins: under 077 the shared opener's new file is 0600, not widened to 0644;
 //   [4] a symlink at the path is refused with ELOOP, and the file it points at is untouched;
 //   [5] a failure leaves the open's errno (a missing directory reads ENOENT), so a caller's strerror still says why;
 //   [6] a device keeps its own mode: /dev/null opens, and is not chmod-ed;
-//   [7] the append opener creates 0600, keeps what is there, and narrows an existing 0666 log.
+//   [7] the append opener creates 0600, keeps what is there, and narrows an existing 0664 log.
 // Scratch goes under ONEBIT_TEST_TMP, else ~/.cache/scratch-tests/tmp (tests/tmp_root.h's rule), and is removed.
 #include "file_create.h"
 
@@ -87,11 +88,12 @@ int main(void) {
     check(write_one(onebit_fopen_private_wb(a), "x") && mode_of(a) == 0600, "[1] a new private file is 0600 under umask 0");
     check(write_one(onebit_fopen_shared_wb(b), "x") && mode_of(b) == 0644, "[1] a new shared file is 0644 under umask 0");
 
-    chmod(a, 0666);
-    chmod(b, 0666);
+    chmod(a, 0664);
+    chmod(b, 0664);
+    check(mode_of(a) == 0664 && mode_of(b) == 0664, "[2] the two files start wider than their openers allow (0664)");
     check(write_one(onebit_fopen_private_wb(a), "") && mode_of(a) == 0600 && size_of(a) == 0,
-          "[2] an existing 0666 file is narrowed to 0600 and truncated");
-    check(write_one(onebit_fopen_shared_wb(b), "") && mode_of(b) == 0644, "[2] an existing 0666 cache file is narrowed to 0644");
+          "[2] an existing 0664 file is narrowed to 0600 and truncated");
+    check(write_one(onebit_fopen_shared_wb(b), "") && mode_of(b) == 0644, "[2] an existing 0664 cache file is narrowed to 0644");
 
     umask(077);
     check(write_one(onebit_fopen_shared_wb(c), "x") && mode_of(c) == 0600,
@@ -99,9 +101,8 @@ int main(void) {
     umask(0);
 
     {
-        FILE* f = fopen(t, "w");  // file-create-ok: the test's own symlink target, created to be left untouched
+        FILE* f = onebit_fopen_private_wb(t);   // the symlink's target, created 0600 and expected to stay untouched
         if (f) { fputs("keep", f); fclose(f); }
-        chmod(t, 0600);
     }
     check(symlink(t, l) == 0, "a symlink to a target file");
     errno = 0;
@@ -131,9 +132,9 @@ int main(void) {
     char g[1200];
     snprintf(g, sizeof g, "%s/log", root);
     check(write_one(onebit_fopen_private_ab(g), "ab") && mode_of(g) == 0600, "[7] the append opener creates 0600");
-    chmod(g, 0666);
+    chmod(g, 0664);
     check(write_one(onebit_fopen_private_ab(g), "cd") && size_of(g) == 4 && mode_of(g) == 0600,
-          "[7] a second append keeps the first line and narrows a 0666 log to 0600");
+          "[7] a second append keeps the first line and narrows a 0664 log to 0600");
 
     unlink(a); unlink(b); unlink(c); unlink(l); unlink(t); unlink(g);
     rmdir(root);

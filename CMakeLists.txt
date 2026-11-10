@@ -266,9 +266,8 @@ add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_te
 # engine#1701: the NPU hold's queue/token follow ONEBIT_HOLD_DIR, and its queue settings never reach the payload.
 # Shell only (a stub gpu-hold plus the tree's own), no device, ~1 s.
 add_test(NAME npu_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_hold_test.sh)
-# engine#1696: the gpu_hold_* registrations live in their own file, so adding one does not conflict with every
-# other test-adding PR through the one contiguous add_test block this used to be part of (see that file's header).
-include(cmake/tests-gpu-hold.cmake)
+# engine#1696: the gpu_hold_* registrations live in cmake/tests-gpu-hold.cmake. It is no longer named here: every
+# cmake/tests-*.cmake is included by the glob near the end of this file (engine#1979).
 # engine#1485: the two port read-backs the route tests use (tests/serve_port.sh). Script-based, no device, no model --
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
@@ -320,6 +319,9 @@ add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_ag
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
 add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)
 add_python_test(tool_selftest_whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools/whisper_encoder_baseline.py --self-test)
+# engine#1780: the DFlash draft package's gate before a loader -- tile-grid sizes from the config, tile-header sanity and
+# the container's scalars against config.json, on a synthetic package with eight negative controls. Stdlib only.
+add_python_test(tool_selftest_dflash_draft_info ${CMAKE_SOURCE_DIR}/tools/dflash_draft_info.py --selftest)
 # engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
 add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
@@ -444,6 +446,13 @@ if(TARGET OpenMP::OpenMP_CXX)
     target_link_libraries(mtp_draft_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 add_test(NAME mtp_draft COMMAND mtp_draft_test)
+# engine#1781 gate 2: the distribution-following acceptance rule (accept with min(1, p/q), resample the residual at the
+# first rejection), with the temperature-0 identity and a deliberately wrong drafter whose output must still follow p.
+# Header-only and device-free; pulled into CI through npu_sampling_test for the same reason as mtp_draft_test below.
+add_executable(spec_accept_test tests/spec_accept_test.cpp)
+target_include_directories(spec_accept_test PRIVATE npu)
+add_test(NAME spec_accept COMMAND spec_accept_test)
+add_dependencies(npu_sampling_test spec_accept_test)
 # ci.yml's build step lists every ctest target explicitly, and this branch cannot edit that file (the push
 # token has no `workflow` scope), so the binary is pulled in as a dependency of a listed test target. When a
 # workflow-scoped push is available, add `mtp_draft_test` to ci.yml's build list and delete this line.
@@ -1712,6 +1721,42 @@ if(ONEBIT_NPU_PRIVATE)
         target_compile_definitions(onebit PRIVATE ONEBIT_NPU_DX_KERNELS_DEFAULT="${ONEBIT_NPU_DX_KERNELS}")
     endif()
 endif()
+
+# ── Test registrations that live in their own file (engine#1696, engine#1979) ─
+# Every cmake/tests-*.cmake is included here, in name order. A test added as a NEW file there touches no line any
+# other pull request touches, so it cannot conflict and its registration cannot go stale while the PR waits: 37 commits
+# changed this file in the 24 h before engine#1979 was filed, and three open PRs had a registration hunk that no longer
+# applied. The rows above stay where they are; nothing has to move.
+# Here, after every target and after find_package(Python3), so a file may use if(TARGET ...), add_python_test() and
+# ${Python3_EXECUTABLE}; and before the RESOURCE_LOCK loop below, which asks if(TEST ...).
+# CONFIGURE_DEPENDS re-runs the glob at build time, so a file added after the first configure is picked up.
+# Readers that follow this shape: tools/ci/ci_targets_check.py (the glob), tools/ci/hrx_build_scope.py and
+# .github/workflows/hrx-build.yml (the cmake/tests-*.cmake path), tools/ci/tests_referenced_check.py (all of cmake/).
+# The lines between the two markers are run as they stand by tests/registration_glob_test.sh, in a scratch project.
+# >>> registration glob
+file(GLOB ONEBIT_TEST_REGISTRATION_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tests-*.cmake)
+list(SORT ONEBIT_TEST_REGISTRATION_FILES)
+# A file this CMakeLists.txt already include()s by name is skipped: that include fixes the file's position (some rows
+# need one), and including it twice stops the configure with `add_test given test NAME ... which already exists`. So a
+# family file moved out with its own include() line and this glob can land in either order.
+# "By name" means a line CMake would execute -- include( at the start of a line, the same rule
+# tools/ci/ci_targets_check.py reads by -- and not the same text in a comment: a substring search took
+# `# was include(cmake/tests-gpu-hold.cmake)` for an include, and the seven gpu_hold_* tests left the configuration with
+# every gate green (review of engine#1983). An include this pattern does not recognise is the loud miss: both includes
+# run and the configure stops.
+file(READ ${CMAKE_CURRENT_LIST_FILE} _onebit_top_cmake_text)
+set(_onebit_include_prefix "(^|\n)[ \t]*include\\([ \t]*\"?(\\$\\{CMAKE_(CURRENT_)?SOURCE_DIR\\}/)?cmake/")
+foreach(_onebit_test_registration_file IN LISTS ONEBIT_TEST_REGISTRATION_FILES)
+    get_filename_component(_onebit_test_registration_name ${_onebit_test_registration_file} NAME)
+    string(REGEX REPLACE "([.+])" "\\\\\\1" _onebit_test_registration_re "${_onebit_test_registration_name}")
+    string(REGEX MATCH "${_onebit_include_prefix}${_onebit_test_registration_re}\"?[ \t]*\\)" _onebit_named
+           "${_onebit_top_cmake_text}")
+    if(_onebit_named STREQUAL "")
+        include(${_onebit_test_registration_file})
+    endif()
+endforeach()
+unset(_onebit_top_cmake_text)
+# <<< registration glob
 
 # ── Loopback ports: route tests run one at a time (engine#1070) ──────────────
 # Every test named below starts a server on 127.0.0.1. Most pick a port by binding :0, closing the

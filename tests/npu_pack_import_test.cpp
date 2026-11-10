@@ -1900,6 +1900,262 @@ void test_tied_block32_head(const std::string& root) {
     }
 }
 
+// ── engine#1740: the block-32 head READ from the .fconst tail ──────────────────────────────────────────────────────
+// The layout was measured on Qwen-2.5_1.5B_Instruct 1.9 (pack_import.h, above read_block32_head). This writes it from
+// that description -- NOT through the reader -- so a reader that disagrees with the description fails here: 64-row
+// units of 2,560 zero bytes + 2*(K/32) strips of 640 B; strip s is K block s/2, rows 32*(s%2)..+31; code position
+// `(r/8)*256 + c*8 + r%8`, low nibble first; 16 B of zero-point nibbles (8); 48 zero bytes; 32 signed bf16 scales,
+// `-m/8` with m the block's largest-magnitude weight.
+static std::string encode_block32_units(const std::vector<float>& W, int rows, int K) {
+    const int kb = K / 32, units = rows / 64;
+    const size_t unit = size_t(2560 + 2 * kb * 640);
+    std::string out(size_t(units) * unit, '\0');
+    for (int u = 0; u < units; ++u)
+        for (int s = 0; s < 2 * kb; ++s) {
+            char* sp = out.data() + size_t(u) * unit + 2560 + size_t(s) * 640;
+            for (int r = 0; r < 32; ++r) {
+                const float* w = W.data() + size_t(u * 64 + 32 * (s % 2) + r) * size_t(K) + size_t((s / 2) * 32);
+                float m = 0;
+                for (int c = 0; c < 32; ++c)
+                    if (std::fabs(w[c]) > std::fabs(m)) m = w[c];
+                const uint16_t bits = pi::bf16_bits_of(-m / 8.0f);
+                const uint32_t wide = uint32_t(bits) << 16;
+                float sc;
+                std::memcpy(&sc, &wide, 4);
+                sp[576 + 2 * r] = char(bits & 0xFF);
+                sp[577 + 2 * r] = char(bits >> 8);
+                sp[512 + r / 2] = char(uint8_t(sp[512 + r / 2]) | uint8_t(8 << (4 * (r & 1))));
+                for (int c = 0; c < 32; ++c) {
+                    const int code = sc == 0 ? 8 : std::min(15, std::max(0, int(std::lround(w[c] / sc)) + 8));
+                    const int pos = (r / 8) * 256 + c * 8 + r % 8;
+                    sp[pos / 2] = char(uint8_t(sp[pos / 2]) | uint8_t(code << (4 * (pos & 1))));
+                }
+            }
+        }
+    return out;
+}
+
+void test_block32_tail_head(const std::string& root) {
+    const int H = 128, L = 8, V = 64;
+    const int R = onebit::npu::q4nx::kRows;   // the rows of container tile 0, which is what the arms decode
+    std::vector<float> emb(size_t(V) * H), other(size_t(V) * H);
+    for (int r = 0; r < V; ++r)
+        for (int c = 0; c < H; ++c) {
+            emb[size_t(r) * H + c] = 0.05f * float((r * 7 + c * 13) % 97) - 2.4f;
+            other[size_t(r) * H + c] = 0.04f * float((r * 31 + c * 5 + (r * c) % 11) % 89) - 1.7f;   // an UNRELATED head
+        }
+    // Pearson over the first `a.size()` values of both
+    const auto ncorr = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double num = 0, da = 0, db = 0, sa = 0, sb = 0;
+        const double n = double(a.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+            num += double(a[i]) * b[i], da += double(a[i]) * a[i], db += double(b[i]) * b[i];
+            sa += a[i], sb += b[i];
+        }
+        const double den = (n * da - sa * sa) * (n * db - sb * sb);
+        return den > 0 ? (n * num - sa * sb) / std::sqrt(den) : 0.0;
+    };
+    // The fixture's own premise, asserted: the two matrices must not resemble each other, or "reads the tail" and
+    // "falls back to the embedding" could not be told apart by a correlation.
+    check(std::fabs(ncorr(emb, other)) < 0.3,
+          "block-32 tail: the fixture's two heads are unrelated (corr " + std::to_string(ncorr(emb, other)) + ")");
+
+    const auto build = [&](bool tied, const char* tag, const std::string& tail_after_env) {
+        const fs::path dir = fs::path(root) / tag;
+        fs::remove_all(dir);
+        fs::create_directories(dir / "cache");
+        const int64_t stride = 1 << 20, second = 262144;
+        std::string fc(size_t(int64_t(L) * stride + 64 + size_t(H) * 2), '\0');
+        auto put_eps = [&](int64_t off) {
+            fc[size_t(off)] = char(0x86);
+            fc[size_t(off) + 1] = char(0x35);
+        };
+        for (int l = 0; l < L; ++l) {
+            put_eps(int64_t(l) * stride);
+            put_eps(int64_t(l) * stride + second);
+        }
+        put_eps(int64_t(L) * stride);
+        for (int i = 0; i < H; ++i) {
+            const uint16_t bits = pi::bf16_bits_of(float(i + 1));
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i)] = char(bits & 0xFF);
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i) + 1] = char(bits >> 8);
+        }
+        fc += tail_after_env;
+        put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+        put_file((dir / "config.json").string(),
+                 std::string(R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+                             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,)"
+                             R"("rope_theta":10000.0,"tie_word_embeddings":)") +
+                     (tied ? "true" : "false") + R"(,"rms_norm_eps":1e-06})");
+        std::string data(size_t(V) * size_t(H) * 2, '\0');
+        for (size_t i = 0; i < emb.size(); ++i) {
+            const uint16_t bits = pi::bf16_bits_of(emb[i]);
+            data[2 * i] = char(bits & 0xFF);
+            data[2 * i + 1] = char(bits >> 8);
+        }
+        put_file((dir / "model.onnx.data").string(), data);
+        // the declaration that sets `p.head_block` (see test_tied_block32_head for why it lives in cache/)
+        put_file((dir / "cache" / "lm_head_meta.json").string(),
+                 R"({"op_list":[{"type":"MladfMatMul","name":"lm_head.MatMulNBits",)"
+                 R"("attrs":{"N":{"value":[64]},"K":{"value":[128]},"block_size":{"value":[32]},"bits":{"value":[4]}}}],)"
+                 R"("tensor_map":{}})");
+        put_file((dir / "model.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", 0,
+                                       uint64_t(V) * uint64_t(H) * 2, 16),   // 16 = BFLOAT16: the bytes ARE bf16
+                            pb::placeholder("lm_head.weight.MatMulNBits.qweight"),
+                            pb::placeholder("lm_head.weight.MatMulNBits.scales"),
+                            pb::placeholder("lm_head.weight.MatMulNBits.zeros")},
+                           {}));
+        return dir;
+    };
+    struct Run {
+        pi::Report r;
+        std::string said, note;
+        bool has_head = false;
+        std::vector<float> head;   // the container's lm_head tile 0, decoded from its own bytes: [kRows][H]
+    };
+    const auto run = [&](const fs::path& dir, const char* tag) {
+        Run x;
+        const std::string out =
+            (fs::temp_directory_path() /
+             (std::string("oga_pack_import_b32tail_") + tag + "." + std::to_string(::getpid()))).string();
+        fs::remove_all(out);
+        pi::Options allow;
+        allow.allow_incomplete = true;   // the fixture's layer payload is empty; the head gate is what is under test
+        try {
+            x.r = pi::import_pack(dir.string(), out, allow);
+        } catch (const std::exception& e) {
+            x.said = e.what();
+        }
+        for (const auto& w : x.r.refused)
+            if (w.rfind("lm_head.weight", 0) == 0) x.said += " | " + w;
+        if (fs::exists(out + "/model.q4nx")) {
+            const json tbl = container_table(out + "/model.q4nx");
+            x.has_head = tbl.contains("lm_head.weight");
+            if (x.has_head) {
+                const std::vector<uint8_t> blob = container_payload(out + "/model.q4nx");
+                const auto offs = tbl["lm_head.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+                std::vector<float> w(size_t(R) * onebit::npu::q4nx::kCols, 0.f);
+                onebit::npu::q4nx::dequant_tile(onebit::npu::q4nx::Chunk::Q4_1F, blob.data() + offs[0], w.data(),
+                                                onebit::npu::q4nx::kCols);
+                x.head.assign(size_t(R) * H, 0.f);
+                for (int r = 0; r < R; ++r)
+                    for (int c = 0; c < H; ++c) x.head[size_t(r) * H + c] = w[size_t(r) * onebit::npu::q4nx::kCols + c];
+            }
+            std::ifstream cf(out + "/config.json");
+            if (cf.good()) {
+                const json cfg = json::parse(cf);
+                if (cfg.contains("q4nx_head_note")) x.note = cfg["q4nx_head_note"].get<std::string>();
+            }
+        }
+        fs::remove_all(out);
+        fs::remove_all(dir);
+        return x;
+    };
+
+    {   // arm 1: UNTIED, the tail holds a head that is NOT the embedding, then padding that is not a whole unit
+        const Run x = run(build(false, "b32-untied-read", encode_block32_units(other, V, H) + std::string(10000, '\0')),
+                          "untied");
+        check(x.said.empty(),
+              "block-32 tail: an untied pack whose tail holds the head imports it (" + x.said.substr(0, 160) + ")");
+        check(x.has_head && !x.head.empty(), "block-32 tail: the container carries the head");
+        if (!x.head.empty()) {
+            const double c_tail = ncorr(x.head, other), c_emb = ncorr(x.head, emb);
+            check(c_tail > 0.99,
+                  "block-32 tail: the container's head is the matrix the TAIL holds (corr " + std::to_string(c_tail) + ")");
+            check(std::fabs(c_emb) < 0.3, "block-32 tail: and it is not the embedding (corr " + std::to_string(c_emb) + ")");
+        }
+        check(x.r.head_synthesized_note.empty() && x.r.head_read_note.find("block 32") != std::string::npos &&
+                  x.r.head_read_note.find("untied") != std::string::npos,
+              "block-32 tail: the report says the head was read, and that an untied one is not verified (" +
+                  x.r.head_read_note + ")");
+        check(x.note == x.r.head_read_note && !x.note.empty(), "block-32 tail: config.json carries the same note");
+    }
+    {   // arm 2: TIED, the tail holds the embedding's own quantisation -> read (not synthesised), verified
+        const Run x = run(build(true, "b32-tied-read", encode_block32_units(emb, V, H)), "tied");
+        check(x.said.empty(), "block-32 tail, tied: imports (" + x.said.substr(0, 160) + ")");
+        check(x.r.head_synthesized_note.empty() && x.r.head_read_note.find("reproduces") != std::string::npos,
+              "block-32 tail, tied: the head is READ and the note says it reproduces the embedding (" +
+                  x.r.head_read_note + ")");
+        check(x.r.selfcheck_tied && x.r.lmhead_corr > 0.99,
+              "block-32 tail, tied: the self-check measures the read head (corr " + std::to_string(x.r.lmhead_corr) + ")");
+        check(!x.head.empty() && ncorr(x.head, emb) > 0.99,
+              "block-32 tail, tied: the container's head is the embedding (corr " +
+                  std::to_string(x.head.empty() ? 0.0 : ncorr(x.head, emb)) + ")");
+    }
+    {   // arm 3: TIED, but the tail's head is some other matrix -> the read is NOT taken, the synthesis stands, says why
+        const Run x = run(build(true, "b32-tied-mismatch", encode_block32_units(other, V, H)), "mismatch");
+        check(x.r.head_read_note.empty() && x.r.head_synthesized_note.find("correlates") != std::string::npos,
+              "block-32 tail, tied mismatch: a tail head that is not the embedding is not taken (" +
+                  x.r.head_synthesized_note.substr(0, 260) + ")");
+        const double c_emb = x.head.empty() ? 0.0 : ncorr(x.head, emb), c_oth = x.head.empty() ? 1.0 : ncorr(x.head, other);
+        check(c_emb > 0.99 && std::fabs(c_oth) < 0.3,
+              "block-32 tail, tied mismatch: the container's head is the embedding's synthesis, not the tail's matrix "
+              "(corr " + std::to_string(c_emb) + " / " + std::to_string(c_oth) + ")");
+    }
+    {   // arm 4: UNTIED, a non-zero byte after the units -> refused by name with the reason, nothing written
+        std::string tail = encode_block32_units(other, V, H) + std::string(4096, '\0');
+        tail[tail.size() - 100] = 1;
+        const Run x = run(build(false, "b32-untied-junk", tail), "junk");
+        check(!x.has_head, "block-32 tail, junk after the head: no head is written");
+        check(x.said.find("block 32") != std::string::npos && x.said.find("does not declare tied") != std::string::npos &&
+                  x.said.find("not zero after") != std::string::npos,
+              "block-32 tail, junk after the head: the refusal names the block, the missing tie and the reason (" +
+                  x.said.substr(0, 300) + ")");
+    }
+    {   // arm 5: known answers on the reader itself, typed byte by byte (K 64: one unit is 2,560 + 4 x 640 = 5,120 B)
+        std::vector<uint8_t> u(5120, 0);
+        uint8_t* sp = u.data() + 2560 + 3 * 640;          // strip 3: K block 1, rows 32..63
+        const auto put_scale = [&](int r, float v) {
+            const uint16_t bits = pi::bf16_bits_of(v);
+            sp[576 + 2 * r] = uint8_t(bits & 0xFF);
+            sp[577 + 2 * r] = uint8_t(bits >> 8);
+        };
+        put_scale(9, 0.5f);
+        put_scale(10, -0.25f);
+        sp[512 + 4] = 0x80;                               // row 9's zero point (high nibble of byte 4) = 8
+        sp[512 + 5] = 0x06;                               // row 10's zero point (low nibble of byte 5) = 6
+        sp[(256 + 5 * 8 + 1) / 2] |= 0xB0;                // row 9 (band 1, r%8 1), column 5: position 297, high nibble
+        sp[(256 + 31 * 8 + 2) / 2] |= 0x03;               // row 10 (band 1, r%8 2), column 31: position 506, low nibble
+        pi::Block32Head h = pi::read_block32_head(u.data(), int64_t(u.size()), 64, 64);
+        check(h.ok && h.units == 1 && h.q.N == 64 && h.q.K == 64 && h.q.block == 32,
+              "block-32 reader: one unit of K 64 reads (" + h.why + ")");
+        if (h.ok) {
+            const auto val = [&](int row, int col) {
+                const size_t g = size_t(row) * 2 + size_t(col / 32);
+                return double(h.q.codes[size_t(row) * 64 + col]) * h.q.scale[g] + h.q.zero[g];
+            };
+            check(val(41, 37) == 1.5,
+                  "block-32 reader: (row 41, col 37) = (11 - 8) x 0.5 (" + std::to_string(val(41, 37)) + ")");
+            check(val(41, 36) == -4.0,
+                  "block-32 reader: its neighbour is code 0, (0 - 8) x 0.5 (" + std::to_string(val(41, 36)) + ")");
+            check(val(42, 63) == 0.75,
+                  "block-32 reader: a NEGATIVE scale, (3 - 6) x -0.25 (" + std::to_string(val(42, 63)) + ")");
+            check(val(42, 32) == 1.5,
+                  "block-32 reader: and its code 0, (0 - 6) x -0.25 (" + std::to_string(val(42, 32)) + ")");
+            check(h.q.scale[size_t(42) * 2 + 1] == 0.25f, "block-32 reader: the stored scale is positive");
+            check(val(41, 5) == 0.0 && val(0, 0) == 0.0, "block-32 reader: a block with a zero scale decodes to zero");
+        }
+        check(!pi::read_block32_head(u.data(), 5119, 64, 64).ok, "block-32 reader: a tail one byte short is refused");
+        std::vector<uint8_t> two = u;
+        two.resize(5120 + 300, 0);
+        check(pi::read_block32_head(two.data(), int64_t(two.size()), 64, 64).padding == 300,
+              "block-32 reader: zeros after the last unit are padding, and counted");
+        two.back() = 7;
+        check(!pi::read_block32_head(two.data(), int64_t(two.size()), 64, 64).ok,
+              "block-32 reader: a non-zero byte after the last unit is refused");
+        std::vector<uint8_t> hdr = u;
+        hdr[100] = 1;
+        check(!pi::read_block32_head(hdr.data(), int64_t(hdr.size()), 64, 64).ok,
+              "block-32 reader: a non-zero unit header is refused");
+        std::vector<uint8_t> gap = u;
+        gap[2560 + 640 + 540] = 1;
+        check(!pi::read_block32_head(gap.data(), int64_t(gap.size()), 64, 64).ok,
+              "block-32 reader: a non-zero byte between the zero points and the scales is refused");
+        check(!pi::read_block32_head(u.data(), int64_t(u.size()), 64, 48).ok, "block-32 reader: K 48 is refused");
+    }
+}
+
 // ── the final norm out of the tail envelope, on a crafted pack (engine#844) ──────────────────
 // The real-pack leg only covers this where a pack is supplied, and three of the four packs on the
 // box ship no prefill program, so the import's tail-envelope read had no coverage in the default
@@ -4430,6 +4686,29 @@ void test_qk_gain_offsets() {
     check(n4.k_norm == 0 && n4.q_norm == 0, "qk gains: the byte count alone is not enough, head_dim has to agree");
 }
 
+/* engine#1985: a REGRESSION, not a new bug -- `Qwen3-1.7B` imported with 0 gaps on yesterday's main and refused with 280
+ * on today's, because #1838's early return trusted an epsilon-anchor vote that had recorded ONE in-block header on a block
+ * that has three. The tell in the report is `qk_norm: true -> false`: a pack that declares per-head q/k gains keeps them in
+ * the two sections a 2-header block does not have, so the two witnesses disagree and neither may be preferred silently.
+ *
+ * The arms below pin the refusal and, just as importantly, the three cases it must NOT fire on: a vote that found three
+ * headers (a correct 4-header pack), a genuine 2-header pack that declares nothing, and no vote at all (0), which is the
+ * residue step's case and not a disagreement. */
+void test_header_witness_refusal() {
+    const std::string a = pi::header_witness_refusal(1, true);
+    check(!a.empty(), "header witness: a one-header vote on a pack declaring use_qk_norm is refused");
+    check(a.find("engine#1985") != std::string::npos, "header witness: the refusal carries its issue");
+    check(a.find("use_qk_norm") != std::string::npos, "header witness: it names the declaration it contradicts");
+    check(a.find("ONE in-block header") != std::string::npos, "header witness: and what the vote measured");
+    check(a.find("neither is being preferred") != std::string::npos,
+          "header witness: and that no witness is being chosen, which is the point");
+    check(pi::header_witness_refusal(3, true).empty(), "header witness: a three-header vote is consistent with the declaration");
+    check(pi::header_witness_refusal(1, false).empty(), "header witness: a 2-header pack that declares nothing is fine");
+    check(pi::header_witness_refusal(0, true).empty(),
+          "header witness: NO vote is not a disagreement (the residue step decides it)");
+    std::printf("  header witness: 8 arms (one-header vote vs declaration refuses; 3/1-without-declaration/0 allowed)\n");
+}
+
 int main(int argc, char** argv) {
     // engine#1907: every crafted 1.9 import writes a canonical copy into the scratch cache. Without this the suite left 0-byte
     // copies in the user's real ~/.cache/1bit/fconst19 and in /tmp on every run. Give the run its own directory, removed at exit.
@@ -4439,6 +4718,7 @@ int main(int argc, char** argv) {
         fs::path p;
         ~ScratchCleanup() { std::error_code ec; fs::remove_all(p, ec); }
     } scratch_cleanup{run_scratch};
+    test_header_witness_refusal();
     test_encode_tile_code_range();
     test_qk_norm_refusal();
     test_qk_gain_offsets();
@@ -4497,6 +4777,7 @@ int main(int argc, char** argv) {
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         test_tied_block32_head(golden_dir.empty() ? "." : golden_dir);
+        test_block32_tail_head(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         test_import_fp32_params(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);

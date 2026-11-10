@@ -88,6 +88,34 @@ So the Gumiho row is *"fails as published, because our verifier is the wrong sha
 quality (its published numbers are the best in its class: 2.97× mean over Eagle-2's 2.74× on vicuna-7B). Running it would
 mean implementing a tree verifier first, which is its own project.
 
+## DFlash draft packages on the NPU route: **the container is in forms we already read; the forward is what is missing** (engine#1780)
+
+FastFlowLM 1.0.12 ships speculative decode as two-package tags: a small DFlash draft beside the main model's package.
+A draft package is `config.json` (`model_type: dflash`) plus one Q4NX container. `tools/dflash_draft_info.py <dir>`
+checks such a package against its own config and prints what it declares; on
+`Nemotron-3.5-Bolt-E4B-DFlash-NPU2` (0.27 GB, sha256 matching the repo's `MANIFEST.sha256`) it passes 19 of 19
+checks in 3.4 s. What that settles, each with the evidence the tool prints:
+
+| question | answer | evidence |
+|---|---|---|
+| are the `I8 [tiles, 5120]` projections a new packing? | **No.** They are the ordinary Q4NX q4_1 tile grid (32 x 256 weights per 5120-byte tile), the form every main-model container uses. | all 35 projections have `bytes == (N/32)(K/256) x 5120` for the N x K the config gives the role; 10,240,000 groups with every scale finite and positive; minimum/scale median -7.59 .. -7.33 per tensor (a known-good main model reads -7.41 the same way) |
+| is `q_proj` 4096 x 2560 or a half-float 1280 x 2560? | **4096 x 2560**, so `head_dim` is 128 as the config says. | both readings are 6,553,600 bytes, but the half-float one has 25.7 % of its values above 100 in magnitude and 1.8 % non-finite, and 1280 x 2560 as a tile grid would be 400 tiles, not 1280 |
+| are the `BF16` labels wrong (really F16)? | **No, they are bf16.** | a norm gain read as half-float looks tight (1.6-2.4) and as bf16 looks wide (0.22-6.3), which reads like a mislabel. The same pattern appears in a main-model container our forward serves correctly with the bf16 reading (1.49-1.88 against 0.12-1.05): half-float folds bf16's exponent range into one octave, so "tight" proves nothing |
+| does the container agree with `config.json`? | **Yes.** | `dflash.block_size`, `target_layer_ids`, `sliding_window`, `rope_theta`, `rms_eps`, `embedding_scale` all equal |
+| is anything in it unexplained? | **No.** | 64 tensors: 35 projections, 22 norms, `model.fc.weight` (2560 x 12800, the fusion of five target layers' features) and six scalars |
+
+So importing a DFlash draft is a config-schema translation, not a format project. What our runtime does not have is the
+draft's **forward**: fuse the target's hidden states at `target_layer_ids` through `fc`, run five non-causal layers
+over a block of `block_size` positions filled with `mask_token_id`, and score the block with the target's own
+embedding table and head. `forward-serve` stops on such a package at the first key it expects
+(`key 'model' not found`), which is the schema, before any of that.
+
+The tool is the gate before a loader, and it fails closed: a projection that is a tile short, a `head_dim` that
+disagrees with the stored tiles, a NaN scale, a plain half-float matrix of the same size, a scalar that differs from
+the config, or a tensor it cannot explain (the second draft family, `DFlash2DraftModel`, has selector and
+convolution tensors this tool does not know) each fail by name. `--selftest` runs those controls on a synthetic
+package (ctest `tool_selftest_dflash_draft_info`).
+
 ## PARD-2's repos are weights-only — borrow the target's tokenizer
 
 `amd/PARD2-*` ship **`README.md`, `config.json`, `model.safetensors`, `warp_model.bin`** and nothing else: **no tokenizer

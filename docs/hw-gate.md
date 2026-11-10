@@ -212,11 +212,19 @@ Each of those steps:
   byte-exact, zero resets). The lock is what the **NPU phase** takes, below, because an NPU dispatch must
   not overlap another NPU dispatch.
 - **Heat.** It waits for Tctl to drop to 75 C, then runs under `~/lb/thermal-run.sh`, which freezes it at 78 C and kills it at 93 C.
-- **Memory.** It runs under `scripts/mem-guard.sh` (kills the step below 12 GB MemAvailable). Before a step starts, `tools/mem_budget.py` estimates it. A step that would take GTT to 95 GiB or more (the engine#315 fault zone), or past MemAvailable, is refused. The gate then waits for memory to free up and retries every minute, up to ten times.
+- **Memory.** It runs under `scripts/mem-guard.sh --term` (stops the step below 12 GB MemAvailable; `--term` because the guard's default SIGKILL ends `thermal-run` but leaves the step it started running, with its memory). Before a step starts, `tools/mem_budget.py` estimates it. A step that would take GTT to 95 GiB or more (the engine#315 fault zone), or past MemAvailable, is refused. The gate then waits for memory to free up and retries every minute, up to ten times.
 - **The PR-Agent model.** coder-llm (Vulkan, :8090) loses its device when long HRX dispatches starve it. The gate runs on `strixhalo-engine`, the runner that also runs the pr-agent jobs, and a runner takes one job at a time, so no review is generating during the gate. Before each step the gate also waits for coder-llm's slots to be idle. Afterwards it reports any new `ring ... timeout` in the kernel log.
 
 The build runs under thermal-run too, and resumes after a thermal kill. Build trees and ccache
 persist under `~/.cache/hw-gate`, so a PR that does not move the pins rebuilds in seconds.
+
+The build has its own memory check (engine#1504: on 2026-11-08 both self-hosted runners were OOM-killed 76 s
+after a restart handed them a compile). Before it compiles, the gate waits for 24 GB of `MemAvailable`
+(`scripts/mem-wait.sh`, polled once a minute for up to 10 minutes; `HW_GATE_BUILD_MEM_FLOOR`,
+`HW_GATE_BUILD_MEM_WAIT`). If memory does not free up, the build is not started and the gate exits 2 with the
+reading. The compile runs under `scripts/mem-guard.sh --term`, which stops the whole `thermal-run` scope
+below 12 GB (`HW_GATE_MEM_FLOOR`). A guard stop is exit 2 too and is not resumed: a re-run once memory frees
+is the fix. `tests/hw_gate_mem_test.sh` (ctest `hw_gate_mem`) checks all of it with a fake meminfo.
 
 ## Goldens: where they live
 

@@ -137,10 +137,12 @@ set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
 # engine#1993: `1bit` is the OUTPUT NAME, not a target -- the target is `onebit`. With the MAKEFILE generator (CMake's
 # default) the output file `1bit` in the build directory makes `--target 1bit` a satisfied FILE rule, so the command prints
 # nothing, exits 0 and builds nothing while a stale binary keeps its old timestamp: a typo that succeeds, which is the
-# failure this fleet pays for most. Ninja errors on that command already (`unknown target '1bit'`), because it has no file
-# rules -- so this refusal is added ONLY for the Makefile generator: a custom target with that name is a second rule for an
-# output `onebit` already produces, which ninja rejects outright ("multiple rules generate 1bit") and Makefile absorbs as a
-# phony. Deliberately not an alias: an alias that built `onebit` would keep the wrong name in everyone's fingers and logs.
+# failure this fleet pays for most. With Ninja the same command is not a trap: `1bit` there is the output-file rule of
+# `onebit`, so `--target 1bit` rebuilds and relinks the binary (measured, CMake 4.2.3: a touched source, rc 0, new mtime).
+# So this refusal is added ONLY for the Makefile generator, and it cannot be added for Ninja at all: a custom target with
+# that name is a second rule for an output `onebit` already produces, which ninja rejects outright ("multiple rules generate
+# 1bit") and Makefile absorbs as a phony. Deliberately not an alias: an alias that built `onebit` would keep the wrong name
+# in everyone's fingers and logs.
 if(CMAKE_GENERATOR MATCHES "Makefiles")
     add_custom_target(1bit
         COMMAND ${CMAKE_COMMAND} -E echo "error: the build target is onebit; 1bit is only its output file name. Nothing was built. Use: cmake --build <dir> --target onebit"

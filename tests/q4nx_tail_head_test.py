@@ -179,16 +179,17 @@ def synthetic():
         check(all(r["finite"] == 1.0 for r in out["tiles_measured"]) and len(out["tiles_measured"]) == 2,
               "and its decode is reported as finite on both tiles")
 
-        # the end-anchored offset on a file that ends in padding (the 1.5B pack's .fconst ends in 110 MB of zeros):
-        # the count is reported, and the shifted read shows up as a non-finite decode instead of a quiet number
+        # a file that ends in padding (the 1.5B packs' .fconst ends in 110 MB of zeros): the count is reported AND used
+        # to place the grid. It used to be reported only, so the read landed inside the padding and came out non-finite --
+        # the symptom engine#1693 started from, on a pack where nothing is wrong (engine#1740)
         pz = os.path.join(work, "padded")
         make_pack(pz, tied=False, head_block=T.K_KBLOCK, zeros=4096)
         out, status, _ = T.measure(pz, 2)
         check(out["geometry"]["trailing_zero_bytes"] == 4096,
               "trailing zero bytes are counted (%d)" % out["geometry"]["trailing_zero_bytes"])
-        check(min(r["finite"] for r in out["tiles_measured"]) < 1.0,
-              "and a read shifted by them is visible as a non-finite decode (min finite %.3f)"
-              % min(r["finite"] for r in out["tiles_measured"]))
+        check(min(r["finite"] for r in out["tiles_measured"]) == 1.0,
+              "and the grid is placed BEFORE them, so a padded pack decodes finitely instead of reading its own padding "
+              "(min finite %.3f)" % min(r["finite"] for r in out["tiles_measured"]))
 
         # --ref as the oracle: the decode itself, written as f32 rows, must correlate 1.0 with itself
         with open(T.fconst(pu), "rb") as f:
@@ -245,8 +246,27 @@ def main():
     check(T.head_offset(291655296, 2374, 34816) + 2374 * 34816 == 291655296, "the head grid ends exactly at EOF")
     check(T.head_offset(291655296, 2374, 34816) != T.attn_payload_off(896),
           "attn_payload_off(H) alone is not the head's offset -- the mistake engine#1693 records")
+    check(T.head_offset(291655296, 2374, 34816, 0) == T.head_offset(291655296, 2374, 34816),
+          "no padding leaves the offset unchanged (the case engine#1693 measured)")
+    check(T.head_offset(291655296, 2374, 34816, 110208000) == T.head_offset(291655296, 2374, 34816) - 110208000,
+          "a trailing zero run moves the grid back by exactly its length (engine#1740's padded packs)")
     check(T.head_offset(291655296, 2374, 34816) == 209000256 + T.attn_payload_off(896),
           "it equals the importer's layers*stride + env (209000256 is this pack's 24 layer blocks)")
+
+    # ── placement when the tail is padded to whole tile slots (engine#1852) ──
+    ENV, TILE, N = T.attn_payload_off(896), T.attn_tile_bytes(896), 2374
+    unpadded = ENV + N * TILE
+    check(T.slot_candidates(unpadded, ENV, N, TILE) == [T.head_offset(unpadded, N, TILE)],
+          "an unpadded tail has exactly one placement, and it is head_offset's")
+    byte_padded = unpadded + 4096
+    check(T.slot_candidates(byte_padded, ENV, N, TILE, zeros=4096) == [ENV + 0 * TILE],
+          "bytes padded after the grid still give the envelope's end (engine#1789's case)")
+    slot_padded = ENV + (N + 1) * TILE          # Hunyuan-7B: 2004 slots for a 2003-tile head
+    c = T.slot_candidates(slot_padded, ENV, N, TILE)
+    check(len(c) == 2 and c[1] == ENV,
+          "a whole-slot pad gives two placements and the head is the SECOND one (env), which is the #1789 rule landing a tile early")
+    check(all(off >= ENV for off in T.slot_candidates(ENV + (N + 9) * TILE, ENV, N, TILE)),
+          "no candidate starts before the envelope, however much padding the file holds")
 
     # ── the envelope decoder, against the vendor tile ──
     with open(GOLDEN + ".json") as f:
@@ -275,8 +295,17 @@ def main():
 
     synthetic()
 
-    print("all q4nx_tail_head checks passed" if not failures else "%d check(s) failed" % failures)
-    return 1 if failures else 0
+    if failures:
+        print("%d check(s) failed" % failures)
+        return 1
+    # engine#1747 review: the block-32 refusal and the undeclared-tie arm need onnx, and they are the reason this test is
+    # registered. Without onnx a pass would hide that they never ran, so report SKIPPED to ctest (SKIP_RETURN_CODE 77 in
+    # CMakeLists.txt) instead. A failing synthetic check still returns 1 above, in either environment.
+    if not HAVE_ONNX:
+        print("SKIPPED: the synthetic checks passed, but the two onnx arms (block-32 refusal, undeclared tie) did not run")
+        return 77
+    print("all q4nx_tail_head checks passed")
+    return 0
 
 
 if __name__ == "__main__":

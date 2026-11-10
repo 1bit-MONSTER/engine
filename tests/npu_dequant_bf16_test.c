@@ -60,7 +60,142 @@ static void put_bf16(uint8_t* dst, size_t i, float v) {
 /* A value pattern with both signs, no zeros in the middle, exact in bf16 */
 static float value_at(size_t i) { return (float)((int)(i % 61) - 30); }
 
+/* engine#1784: the loader no longer expands the plain int8 embedding table into RAM (0.74 GiB of int8 became 2.96 GiB
+ * of floats on the 27B); it reads one row per token out of the container's mapping through q4nx_plain_i8_at(). The
+ * arithmetic that must not drift is the scale group: per 32-column GROUP within a row, indexed (row * groups + col/32).
+ * A row/column mix-up there produces plausible numbers, so this is pinned against the whole-table decode of the same
+ * buffer, bit for bit, on a table whose scale differs per row AND per group -- symmetry cannot make a wrong index pass.
+ * Host-only: no model, no device, no tile alignment (the element-wise read needs none).
+ *
+ * These arms live in this file rather than a target of their own because a new add_test() has to be built by
+ * .github/workflows/ci.yml (the `ci_targets` test enforces it) and an edit to that file needs a token with the
+ * `workflow` scope; this binary already links q4nx_dequant.c and already runs in CI, so the primitive is covered
+ * without the workflow change. */
+static void embed_row_arms(void) {
+    const int rows = 7, cols = 64;               /* not a tile grid on purpose */
+    const int groups = cols / Q4NX_GROUP_SIZE;
+    uint8_t* q = malloc((size_t)rows * cols);
+    float* sc = malloc((size_t)rows * groups * sizeof(float));
+    float* ref = malloc((size_t)rows * cols * sizeof(float));
+    if (!q || !sc || !ref) { check(0, "embed row: the arms allocate"); free(q); free(sc); free(ref); return; }
+    unsigned seed = 12345u;
+    for (int i = 0; i < rows * cols; i++) {
+        seed = seed * 1103515245u + 12345u;
+        q[i] = (uint8_t)((seed >> 16) & 0xff);   /* every bit pattern, including 0x80 (-128) and 0xff (-1) */
+    }
+    for (int r = 0; r < rows; r++)
+        for (int g = 0; g < groups; g++) sc[r * groups + g] = 0.0005f * (float)(1 + r * groups + g);
+
+    check(q4nx_dequant_plain_i8(q, sc, rows, cols, ref) == 0, "embed row: the reference decode succeeds");
+    int bad = 0;
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++) {
+            const float got = q4nx_plain_i8_at(q, sc, rows, cols, r, c);
+            if (memcmp(&got, &ref[(size_t)r * cols + c], sizeof(float)) != 0) bad++;
+        }
+    check(bad == 0, "embed row: every element reads identically to the whole-table decode (bit for bit)");
+
+    bad = 0;
+    for (int r = 0; r < rows; r++)
+        for (int c = 0; c < cols; c++)
+            if (q4nx_plain_i8_at(q, NULL, rows, cols, r, c) != (float)((const int8_t*)q)[(size_t)r * cols + c]) bad++;
+    check(bad == 0, "embed row: with no scale array the value is the raw int8 (the unscaled table)");
+
+    check(q4nx_plain_i8_at(q, sc, rows, cols, -1, 0) == 0.0f, "embed row: row -1 reads as 0.0f");
+    check(q4nx_plain_i8_at(q, sc, rows, cols, rows, 0) == 0.0f, "embed row: row == rows reads as 0.0f");
+    check(q4nx_plain_i8_at(q, sc, rows, cols, 0, -1) == 0.0f, "embed row: col -1 reads as 0.0f");
+    check(q4nx_plain_i8_at(q, sc, rows, cols, 0, cols) == 0.0f, "embed row: col == cols (a pad column) reads 0.0f");
+    check(q4nx_plain_i8_at(NULL, sc, rows, cols, 0, 0) == 0.0f, "embed row: a null table reads as 0.0f");
+    check(q4nx_plain_i8_at(q, sc, rows, cols - 1, 0, 0) == 0.0f,
+          "embed row: cols that is not a multiple of the group reads 0.0f, not off the end of the scale row");
+    free(q); free(sc); free(ref);
+    printf("  embed row: 9 arms (bit-exact row read, null scale, 4 out-of-range, null table, wrong cols)\n");
+}
+
+/* engine#1784: one row of a CHUNKED (tiled) table, decoded without decoding the table. This is the path the 27B-class
+ * containers actually take: 155,200 tiles of 5,120 B (0.625 B/element, packed 4-bit) that decode to 1.27 G elements and
+ * materialise as 4.74 GiB of f32. The row gather must reproduce exactly what q4nx_dequant_tensor_chunked() puts in that
+ * row -- all three chunk kinds, every row including the last one of a tile-row and the last row of the tensor -- because
+ * the tiles are ordered (row-tile * ntiles_across + col-tile) and an off-by-one there reads a neighbouring tile and
+ * still produces plausible numbers. */
+static void chunked_row_arms(void) {
+    const int rows = 64, cols = 512;                  /* 2x2 tiles: several rows per tile, several tiles per row */
+    const int ntc = cols / Q4NX_TILE_COLS;
+    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
+    float* whole = malloc((size_t)rows * cols * sizeof(float));
+    float* row = malloc((size_t)cols * sizeof(float));
+    if (!whole || !row) { check(0, "chunked row: the arms allocate"); free(whole); free(row); return; }
+    for (int k = 0; k < 3; k++) {
+        const int cb = kinds[k];
+        const size_t nbytes = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)ntc * (size_t)cb;
+        uint8_t* q = malloc(nbytes);
+        if (!q) { check(0, "chunked row: the tile buffer allocates"); continue; }
+        unsigned seed = 987u + (unsigned)k;
+        for (size_t i = 0; i < nbytes; i++) { seed = seed * 1103515245u + 12345u; q[i] = (uint8_t)(seed >> 16); }
+        check(q4nx_dequant_tensor_chunked(q, nbytes, rows, cols, cb, whole) == 0,
+              "chunked row: the whole-table reference decodes");
+        int bad = 0;
+        for (int r = 0; r < rows; r++) {
+            if (q4nx_dequant_tile_row(q, nbytes, rows, cols, cb, r, row) != 0) { bad++; continue; }
+            if (memcmp(row, whole + (size_t)r * cols, (size_t)cols * sizeof(float)) != 0) bad++;
+        }
+        check(bad == 0, cb == Q4NX_TILE_BYTES   ? "chunked row: every row matches the whole-table decode (5,120 B tiles)"
+                     : cb == Q4NX_CHUNK_Q4K    ? "chunked row: every row matches the whole-table decode (Q4K chunks)"
+                                               : "chunked row: every row matches the whole-table decode (Q8 chunks)");
+        check(q4nx_dequant_tile_row(q, nbytes, rows, cols, cb, rows, row) == -1, "chunked row: row == rows is refused");
+        check(q4nx_dequant_tile_row(q, nbytes, rows, cols, cb, -1, row) == -1, "chunked row: row -1 is refused");
+        check(q4nx_dequant_tile_row(q, nbytes - 1, rows, cols, cb, 0, row) == -1,
+              "chunked row: one byte short is refused, not read past");
+        check(q4nx_dequant_tile_row(q, nbytes, rows - 1, cols, cb, 0, row) == -1,
+              "chunked row: a rows that is not a tile multiple is refused (a last partial row has no tile)");
+        check(q4nx_dequant_tile_row(NULL, nbytes, rows, cols, cb, 0, row) == -1, "chunked row: a null table is refused");
+        free(q);
+    }
+    free(whole); free(row);
+    printf("  chunked row: 3 kinds x 64 rows bit-exact + 5 refusal arms\n");
+}
+
+/* engine#1842: the forward picks the per-row path for a chunked embedding with q4nx_tile_row_kind(). It used to pick it
+ * on `esz % tiles == 0` alone (tiles = (NV/32)*(kpad/256), truncating), which three kinds of table pass while the reader
+ * refuses every row of them -- and embed_at() turns that refusal into 0.0f. Each arm below is one such table: the old
+ * rule accepts it, the reader refuses it, and the predicate must refuse it too, so the table stays on the whole-table
+ * decode, which reports its own failure. The valid kinds must still be accepted, with the kind the reader takes. */
+static int old_rule(size_t esz, int nv, int kpad) {
+    const size_t tiles = (size_t)(nv / 32) * (size_t)(kpad / 256);
+    return tiles > 0 && esz % tiles == 0;
+}
+static void tile_row_kind_arms(void) {
+    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
+    for (int k = 0; k < 3; k++)
+        check(q4nx_tile_row_kind((size_t)4 * (size_t)kinds[k], 64, 512) == kinds[k],
+              "tile-row kind: each supported chunk kind on a 2x2 grid is accepted as itself");
+    struct { size_t esz; int nv, kpad; const char* what; } bad[] = {
+        {(size_t)4 * 1000, 64, 512, "a chunk of 1,000 B (no such kind) on an exact 2x2 grid"},
+        {(size_t)8 * Q4NX_TILE_BYTES, 64, 512, "two tiles' worth per grid cell (esz / tiles = 10,240 B)"},
+        {(size_t)2 * Q4NX_TILE_BYTES, 48, 512, "NV 48: NV / 32 truncates to 1 tile-row and the grid misses rows 32..47"},
+        {(size_t)2 * Q4NX_TILE_BYTES, 64, 384, "kpad 384: kpad / 256 truncates to 1 tile-column"},
+    };
+    uint8_t* q = calloc(bad[1].esz, 1);
+    float* row = malloc(512 * sizeof(float));
+    if (!q || !row) { check(0, "tile-row kind: the arms allocate"); free(q); free(row); return; }
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        const int cb_old = (int)(bad[i].esz / ((size_t)(bad[i].nv / 32) * (size_t)(bad[i].kpad / 256)));
+        char msg[256];
+        snprintf(msg, sizeof msg, "tile-row kind: the old rule took %s", bad[i].what);
+        check(old_rule(bad[i].esz, bad[i].nv, bad[i].kpad), msg);
+        snprintf(msg, sizeof msg, "tile-row kind: the reader refuses %s", bad[i].what);
+        check(q4nx_dequant_tile_row(q, bad[i].esz, bad[i].nv, bad[i].kpad, cb_old, 0, row) == -1, msg);
+        snprintf(msg, sizeof msg, "tile-row kind: and so does the predicate the forward now asks (%s)", bad[i].what);
+        check(q4nx_tile_row_kind(bad[i].esz, bad[i].nv, bad[i].kpad) == 0, msg);
+    }
+    free(q); free(row);
+    printf("  tile-row kind: 3 kinds accepted, 4 tables the old rule took and the reader refuses are refused\n");
+}
+
 int main(void) {
+    tile_row_kind_arms();
+    chunked_row_arms();
+    embed_row_arms();
     const int rows = 64, cols = 512;
     const size_t n = (size_t)rows * cols;
 

@@ -179,3 +179,27 @@ and the Qwen3 reading of its reply. Stop tokens come from the container's `confi
 where the model says it does; the parsing of *tool calls* for a non-Qwen3 family is the next piece if a
 customer packs one. The route-level rows (200 with the container's prompt, 400 for a container with neither)
 need the device and are recorded in the PR rather than in CI.
+
+## The reply is split by the template's own markup (engine#1779)
+
+The template decides what the model was shown, so it also decides what the model writes back. `forward-serve`
+reads the answer markup from the template it renders and prints it at load:
+
+```
+1bit forward-serve: answer markup=gemma4
+```
+
+| the rendered template contains | markup | reasoning | a tool call |
+|---|---|---|---|
+| `<|tool_call>` or `<|channel>thought` | `gemma4` | `<|channel>thought … <channel|>` | `<|tool_call>call:NAME{key:value}<tool_call|>`, strings as `<|"|>…<|"|>` |
+| neither, or no template (ChatML) | `qwen3` | `<think> … </think>` | `<tool_call>{"name": …, "arguments": {…}}</tool_call>` |
+
+Both give the client the same OpenAI shape: `reasoning_content`, `content`, and `tool_calls` whose `arguments`
+is a JSON string. A Gemma call body that is not well formed (a string that never closes, a key with no value,
+an unclosed object or array, an empty value) is not a call: the markup is returned in `content` unchanged.
+
+One exception: `tool_choice: "required"` or a named function installs a grammar that constrains the reply to
+the `qwen3` call markup for every container (`app/npu_tool_grammar.h`), so that reply is split as `qwen3`.
+A grammar in Gemma's own call syntax is not written yet.
+
+Code: `answer_family_of_template()` in `app/npu_answer_parser.h`; tests in `tests/npu_sampling_test.cpp`.

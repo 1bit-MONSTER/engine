@@ -148,7 +148,7 @@ static void test_declared_type(void) {
         s.high_freq_factor = 4.0;
         s.low_freq_factor = 1.0;
         s.original_max_position = 8192.0;
-        const int got = q4nx_rope_type_supported(type, &s, cases[i].has_short);
+        const int got = q4nx_rope_type_supported(type, &s, cases[i].has_short, 0);
         char buf[192];
         snprintf(buf, sizeof buf, "declared type \"%s\" reads as \"%s\"", cases[i].type, type);
         check(!strcmp(type, cases[i].type), buf);
@@ -170,7 +170,7 @@ static void test_declared_type(void) {
         char type[64];
         q4nx_rope_declared_type(big, type, (int)sizeof type);
         check(!strcmp(type, "yarn"), "a type 1,000 bytes into the block is still read (fails closed)");
-        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0) == 0,
+        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0, 0) == 0,
               "... and is refused");
     }
     {
@@ -178,7 +178,7 @@ static void test_declared_type(void) {
         q4nx_rope_declared_type("{\"rope_scaling\": {\"factor\": 8.0}, "
                                 "\"quantization_config\": {\"type\": \"fp8\"}}", type, (int)sizeof type);
         check(type[0] == '\0', "a block with no type does not take a neighbour's type");
-        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0) == 1, "... and is not refused");
+        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0, 0) == 1, "... and is not refused");
         /* nested arrays/objects before the type, and a '}' inside a string, both keep the block open */
         q4nx_rope_declared_type("{\"rope_scaling\": {\"mrope_section\": [1, 2], \"rope_type\": \"yarn\"}}",
                                 type, (int)sizeof type);
@@ -194,7 +194,71 @@ static void test_declared_type(void) {
     char none[8];
     q4nx_rope_declared_type((const char*)0, none, (int)sizeof none);
     check(none[0] == '\0', "null config declares no type");
-    check(q4nx_rope_type_supported(none, (const Q4nxRopeLlama3*)0, 0) == 1, "no type is supported");
+    check(q4nx_rope_type_supported(none, (const Q4nxRopeLlama3*)0, 0, 0) == 1, "no type is supported");
+    /* engine#1740 W2: the declared-type extraction must SEE Hunyuan's block, because everything downstream (the
+     * reader, the predicate, the base rule) is gated on this string. A config that declares dynamic must report it,
+     * and one that declares nothing must report nothing -- the second half is what keeps every other model on plain
+     * rope. */
+    {
+        const char* hy = "{\"rope_scaling\": {\"type\": \"dynamic\", \"factor\": 1.0}, \"max_position_embeddings\": 262144}";
+        char t2[64] = {0};
+        q4nx_rope_declared_type(hy, t2, (int)sizeof t2);
+        check(!strcmp(t2, "dynamic"), "a config declaring rope_scaling dynamic is read as dynamic");
+        const char* none = "{\"max_position_embeddings\": 32768}";
+        char t3[64] = {1};
+        q4nx_rope_declared_type(none, t3, (int)sizeof t3);
+        check(t3[0] == 0, "and a config with no rope_scaling block reports nothing");
+    }
+
+    /* engine#1740 W2: dynamic NTK. The support predicate accepts it ONLY when the numbers were read, and the base
+     * rule is the plain theta until a position passes the model's own window -- which is the property that makes
+     * accepting Hunyuan's factor-1.0 block safe rather than a guess. */
+    check(q4nx_rope_type_supported("dynamic", (const Q4nxRopeLlama3*)0, 0, 0) == 0,
+          "dynamic NTK is refused when no numbers were read (a declared block must not be served as plain rope)");
+    check(q4nx_rope_type_supported("dynamic", (const Q4nxRopeLlama3*)0, 0, 1) == 1,
+          "... and accepted when they were");
+    check(q4nx_rope_type_supported("yarn", (const Q4nxRopeLlama3*)0, 0, 1) == 0,
+          "... which does not open the door to the other types");
+    {
+        Q4nxRopeDynamic d = {1, 1.0, 262144.0};            /* Hunyuan-0.5B's own numbers */
+        check(q4nx_rope_dynamic_base(1e6, &d, 0.0, 128) == 1e6, "below the window the base IS theta (position 0)");
+        check(q4nx_rope_dynamic_base(1e6, &d, 262143.0, 128) == 1e6, "... and still is one position short of it");
+        check(q4nx_rope_dynamic_base(1e6, &d, 262144.0, 128) >= 1e6, "... and does not fall below theta once past it");
+        /* factor 1 at exactly the window is the no-op case: scaled == 1, so base == theta */
+        check(q4nx_rope_dynamic_base(1e6, &d, 262144.0, 128) == 1e6, "factor 1 at the window is a no-op, bit for bit");
+        Q4nxRopeDynamic f4 = {1, 4.0, 8192.0};
+        const double at_2x = q4nx_rope_dynamic_base(1e4, &f4, 16384.0, 128);
+        /* factor 4 at 2x the window: scaled = 4*2 - 3 = 5, base = theta * 5^(dim/(dim-2)) */
+        check(fabs(at_2x - 1e4 * pow(5.0, 128.0 / 126.0)) < 1e-6, "the dynamic base follows the NTK formula exactly");
+        Q4nxRopeDynamic bad = {1, 0.0, 8192.0};
+        check(q4nx_rope_dynamic_base(1e4, &bad, 1e6, 128) == 1e4, "an unusable factor leaves the base alone");
+        Q4nxRopeDynamic bad2 = {1, 4.0, 0.0};
+        check(q4nx_rope_dynamic_base(1e4, &bad2, 1e6, 128) == 1e4, "an unusable window leaves the base alone");
+        Q4nxRopeDynamic off = {0, 4.0, 8192.0};
+        check(q4nx_rope_dynamic_base(1e4, &off, 1e6, 128) == 1e4, "and off is a no-op");
+        /* THE EXPONENT, against a KNOWN VALUE (review of #1792). Every arm above asserts a property -- "below the window
+         * the base is theta, past it not below theta" -- and every one of them is satisfied by ANY exponent, which is how
+         * a wrong rotary width (the caller passing head_dim instead of the rotary width) survived a green suite. With
+         * factor 1.0 the rule collapses to theta * (pos/original)^(dim/(dim-2)), so one printed constant pins it:
+         *   pos 524288, original 262144 -> ratio 2; dim 64 -> 1e6 * 2^(64/62) = 2.0435e6
+         * and dim 128 -> 1e6 * 2^(128/126) = 2.0219e6, i.e. the arm distinguishes the two widths the bug confused. */
+        {
+            Q4nxRopeDynamic k = {1, 1.0, 262144.0};
+            const double want64 = 1e6 * pow(2.0, 64.0 / 62.0);
+            const double want128 = 1e6 * pow(2.0, 128.0 / 126.0);
+            const double got64 = q4nx_rope_dynamic_base(1e6, &k, 524288.0, 64);
+            const double got128 = q4nx_rope_dynamic_base(1e6, &k, 524288.0, 128);
+            check(fabs(got64 - want64) < 1e-6 * want64,
+                  "the base at twice the window with dim 64 is theta * 2^(64/62), to 1e-6 relative");
+            check(fabs(got128 - want128) < 1e-6 * want128,
+                  "... and with dim 128 it is theta * 2^(128/62)");
+            /* the pair is the point: if the exponent were ignored, or the width were not passed through, these would be
+             * equal -- so this asserts the arms CAN tell the rotary width from the head dim. */
+            check(fabs(got64 - got128) > 1e3,
+                  "and the two widths differ by more than 1e3, so this arm cannot pass with the widths confused");
+        }
+    }
+
 }
 
 int main(void) {

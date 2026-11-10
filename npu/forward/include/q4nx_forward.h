@@ -70,6 +70,10 @@ struct I8Ctx;
 
 // Q4nxForwardConfig now lives with the model that owns it: npu/model/npu_model.h (engine#803 A3).
 
+// engine#1740 W2: the rope_type "dynamic" reader, exposed so a host test can pin it against the exact block the
+// Hunyuan 1.9 packs carry ({"type": "dynamic", "factor": 1.0} with max_position_embeddings 262144) without a device.
+Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path);
+
 class Q4nxNpuForward {
 public:
     Q4nxNpuForward();
@@ -233,6 +237,20 @@ private:
     bool init_impl(xrt::device* dev, const char* model_path,
                    const std::string& artifact_dir);
     bool host_gemm_ = false;
+    // NPU_INFER_HOST_GEMM=i8 (engine#1808): the host arm accumulates int8 x int4 in EXACT int32, which is
+    // the only arm a kernel family can be bit-exact against -- f32 cannot match an int8 device by
+    // construction. It cannot see a wrong weight layout (the f32 arm covers that); it can see a wrong
+    // quantisation, a wrong 128-K group boundary, an int8 intermediate or a saturated accumulator.
+    bool host_gemm_i8_ = false;
+    // Weight codes + per-128-K multipliers for the integer host arm, quantised once per tensor (engine#1809).
+    // `blocked` is the layout `codes` was packed in: blocked only when K x N is whole tiles (engine#1994).
+    struct HostI8Tensor { int groups = 0; int N = 0; bool blocked = true; std::vector<int8_t> codes; std::vector<float> d; };
+    // Keyed on (LAYER, wkey, K, N): `wkey` alone is a per-role slot that repeats in every layer and `Bmat` is the one
+    // scratch buffer each layer is decoded into, so keying on it served layer 0's weights to every later layer
+    // (engine#1830 review). Routed experts pass wkey < 0 and are never cached: their weights change per token.
+    std::map<std::tuple<int, int, int, int>, HostI8Tensor> host_i8_cache_;
+    std::vector<HostI8Tensor> lm_head_i8_;   // integer arm's head image, one per vocabulary block
+    void host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat, int wkey, float* out);
     bool load_layer(int l);
     // `a_k` is the activation's REAL width per row (the design's real_k, i.e. the model's hidden or
     // intermediate size).  It is K whenever the model is already on the container's 256-column K
@@ -260,12 +278,13 @@ private:
     bool attention(const std::vector<float>& qkv, int pos, const int* pos3, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
                    bool proportional, int window, int kv_layer, bool append_kv,
-                   int kv_len = 0);
+                   int kv_len = 0, std::vector<float>* q_out = nullptr);
     bool mlp(const std::vector<float>& gu, std::vector<float>& h, int im);
     // The same elementwise gate*up on caller memory, so a batched pass can read its ACT row and write its HH
     // row where they already are instead of staging both through a vector (a copy on each side).
     bool mlp(const float* gu, float* h, int im);
-    float rmsnorm(const float* x, const float* w, int n, float* out) const;
+    // `tag` is the NPU_INFER_DUMP_OPS label (ops-dump.h); the per-head q/k norms pass their own.
+    float rmsnorm(const float* x, const float* w, int n, float* out, const char* tag = "rmsnorm") const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;
     bool run_lm_head(const std::vector<float>& h, std::vector<float>& logits);
     // M rows of hidden state -> M x NV logits, row-major.  Same head, same packed tiles: the rows ride
@@ -387,7 +406,25 @@ private:
     // dequantised from a container tensor, c_.H when it is the raw BF16 embedding.
     int lm_w_ = 0;
     // BF16 host-side tensors
-    std::vector<uint16_t> embed_;                 // [NV*H] bf16
+    std::vector<uint16_t> embed_;                 // unused since engine#1784 (the table is read in place); always empty
+    /* engine#1784: the token embedding table, read in place from the container's read-only mapping, one row per token.
+     * These point INTO that mapping, which is owned by `model_` and outlives the forward -- they are views, never
+     * owners, and must not be freed or written. Empty/null means the dtype goes through embed_f_ (the chunked formats
+     * that have no element-wise read yet). */
+    const uint16_t* embed_bf16_   = nullptr;      // bf16 table, row stride c_.H
+    const int8_t*   embed_i8_     = nullptr;      // plain int8 table, row stride c_.H
+    const float*    embed_sc_     = nullptr;      // per-32-column scales, H/32 per row (may be null: unscaled)
+    int             embed_groups_ = 0;            // H / Q4NX_GROUP_SIZE
+    /* The chunked formats (tiled), read one row per token out of the same mapping: `embed_row_buf_` holds the row
+     * currently gathered and `embed_row_tok_` which token it is for (mutable: embed_at() is const and the callers walk
+     * k innermost, so a row is gathered once and served H times). engine#1784. */
+    const uint8_t*  embed_tile_        = nullptr;
+    size_t          embed_tile_bytes_  = 0;
+    int             embed_tile_rows_   = 0;
+    int             embed_tile_cols_   = 0;
+    int             embed_tile_cb_     = 0;
+    mutable std::vector<float>   embed_row_buf_;
+    mutable int                  embed_row_tok_ = -1;
     // Set only while step_batch_embeds() runs: the row source for the batched body's embedding fill.
     const float* inject_embeds_ = nullptr;
     // Set only while step_batch_embeds(..., position_ids, ...) runs: 3 x rows, plane-major, or null.
@@ -427,6 +464,7 @@ private:
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
     Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else
+    Q4nxRopeDynamic rope_dynamic_;   // rope_type "dynamic" (NTK base rule, engine#1740 W2); on == 0 elsewhere
     // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
     // every other architecture.  MiniCPM4 scales the embedding by 12 and each
     // residual branch by scale_depth/sqrt(NL) (0.2475 for 32 layers); skipping

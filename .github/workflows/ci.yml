@@ -35,10 +35,26 @@ jobs:
     steps:
       - name: Tools for checkout and the build
         run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git \
-            python3 python3-venv curl jq file procps make gcc-16 g++-16 cmake ninja-build libcurl4-openssl-dev libzstd-dev \
-            libssl-dev libdrm-dev libpcre2-dev
+          # engine#1814: `apt-get update` and the install must be retried TOGETHER, with a back-off. Twice on 2026-11-10 the
+          # install 404'd on .debs the fresh index had just listed (perl-base/perl-modules-5.40/libperl5.40, mirror IPs
+          # 91.189.92.22 and 91.189.91.82) and turned main red for every PR; `gh run rerun --failed` passed with no code
+          # change, so it is the mirror, not the tree. Retrying only the install would reuse the same stale index, so each
+          # attempt re-reads the index -- which is also what lets it reach a different mirror.
+          ok=0
+          for attempt in 1 2 3 4; do
+            if apt-get update &&
+               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git \
+                 python3 python3-venv curl jq file procps make gcc-16 g++-16 cmake ninja-build libcurl4-openssl-dev \
+                 libzstd-dev libssl-dev libdrm-dev libpcre2-dev; then
+              ok=1; break
+            fi
+            echo "apt attempt $attempt failed (mirror 404 is a known transient, engine#1814); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::apt-get update+install failed 4 times -- if the 404s name .debs the index lists, it is the mirror (engine#1814), not this tree; re-run the job"
+            exit 1
+          fi
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 -m venv /opt/ci-venv && echo /opt/ci-venv/bin >> "$GITHUB_PATH"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -65,7 +65,9 @@ INCLUDE = re.compile(r'^\s*include\(\s*"?([^\s")]+\.cmake)"?\s*\)', re.M)
 # shape engine#1696 landed. The include argument is a VARIABLE, so INCLUDE above cannot match it, and a
 # reader that only followed literal includes would stop seeing every registration at once - the count
 # would fall to zero and read as "the gap closed".
-GLOB = re.compile(r'file\s*\(\s*GLOB\s+(\w+)[^)]*?([^\s")]+/\*\.cmake)', re.IGNORECASE)
+# engine#1979: the pattern main uses is `cmake/tests-*.cmake` (a prefix before the star), not `<dir>/*.cmake`; a
+# reader that wanted the star right after the slash matched nothing there, and every such file went unread.
+GLOB = re.compile(r'file\s*\(\s*GLOB\s+(\w+)[^)]*?([^\s")]+/[^\s"/)]*\*[^\s"/)]*\.cmake)', re.IGNORECASE)
 INCLUDE_VAR = re.compile(r'include\(\s*\$\{(\w+)\}\s*\)')
 FOREACH_LISTS = re.compile(r'foreach\s*\(\s*(\w+)\s+IN\s+LISTS\s+(\w+)', re.IGNORECASE)
 DEFINE = re.compile(r"-D([A-Za-z0-9_]+)=([^\s\"]*)")
@@ -352,6 +354,7 @@ def family_text(root, cmake_text):
     tracks a guard stack across the text this returns.
     """
     out = []
+    seen = set()
     # a glob the include loop iterates: every file matching it is configured, so every one is read
     for gvar, pattern in GLOB.findall(cmake_text):
         # the loop variable differs from the glob variable: `foreach(v IN LISTS GLOBVAR) include(${v})`
@@ -360,12 +363,16 @@ def family_text(root, cmake_text):
             continue
         pat = pattern.replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
         for path in sorted(glob.glob(os.path.join(root, pat))):
-            if os.path.isfile(path):
+            if os.path.isfile(path) and os.path.realpath(path) not in seen:
+                seen.add(os.path.realpath(path))
                 out.append(open(path, encoding="utf-8").read())
     for m in INCLUDE.finditer(cmake_text):
         rel = m.group(1).replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
         path = os.path.join(root, rel)
-        if os.path.isfile(path):
+        # engine#1979: a file both named by a literal include() and matched by the glob is configured once
+        # (CMakeLists.txt skips it in the glob loop), so it is read once.
+        if os.path.isfile(path) and os.path.realpath(path) not in seen:
+            seen.add(os.path.realpath(path))
             out.append(open(path, encoding="utf-8").read())
     return "\n".join(out)
 
@@ -418,6 +425,10 @@ def check(root):
     # to skip it -- an NPU-only test under `if(ONEBIT_NPU)` with ONEBIT_NPU=OFF -- and telling its author to
     # "build it or drop the test" was a false positive. Only a test CI would register and build, and does not, is
     # the defect this ratchets.
+    # engine#1810 review: three PRs in one shift added a test `add_executable` and stopped here, because the message
+    # named only two routes and neither was available -- ci.yml's build list is a `.github/workflows/` file, which a lane
+    # identity cannot push (no `workflow` scope). Folding the cases into a target ci.yml already builds needs no scope
+    # at all, so the message names it.
     line_guard = {n: (g, u) for n, _l, g, u in scan_guards(cmake_text)}
     by_design = set()
     for name in sorted(drift):
@@ -458,7 +469,11 @@ def check(root):
         where = f" under if({' AND '.join(guards)})" if guards else ""
         print(f"ci_targets_check: add_test names '{name}'{where}, and ci.yml never builds "
               f"{'/'.join(sorted(set(need[name])))} -- that test never reaches ctest in the configuration CI "
-              f"creates (it is not registered, or registered and not built); build it or drop the test")
+              f"creates (it is not registered, or registered and not built). Routes, of which only the first needs a "
+              f"ci.yml edit: name the target in ci.yml's build list (a `.github/workflows/` edit, so it needs "
+              f"`workflow` scope); make it a build dependency of a target ci.yml builds "
+              f"(`add_dependencies(onebit <target>)`, which this checker already follows); fold these cases into such "
+              f"a target (the tests/npu_pack_import_test.cpp pattern); or drop the test")
     if new:
         return 1
     # A baseline entry that no longer drifts is progress; say so rather than staying silent, so the
@@ -508,16 +523,16 @@ def self_test():
     import tempfile
     fails = 0
 
-    def case(what, ci, cmake, want, baseline="auto", family=None):
+    def case(what, ci, cmake, want, baseline="auto", family=None, family_rel="cmake/tests/zz_family.cmake"):
         nonlocal fails
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, ".github", "workflows"))
             open(os.path.join(d, CI), "w", encoding="utf-8").write(ci)
             open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(cmake)
             if family is not None:
-                fam_dir = os.path.join(d, "cmake", "tests")
-                os.makedirs(fam_dir, exist_ok=True)
-                open(os.path.join(fam_dir, "zz_family.cmake"), "w", encoding="utf-8").write(family)
+                fam_path = os.path.join(d, family_rel)
+                os.makedirs(os.path.dirname(fam_path), exist_ok=True)
+                open(fam_path, "w", encoding="utf-8").write(family)
             if baseline == "auto":
                 # The direction-A fixtures below are not about direction B, so the baseline records
                 # whatever they drift - a direction-B case must then say what its baseline is.
@@ -592,6 +607,18 @@ endforeach()
     case("an add_test in a glob-included family file is still read",
          B_CI, GLOB_CMAKE, 1, baseline="",
          family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n")
+    # engine#1979: the shape main has, a prefix before the star (`cmake/tests-*.cmake`). With the GLOB pattern that
+    # wanted `<dir>/*.cmake` this arm returned 0: the file was configured by CMake and read by nobody here.
+    PREFIX_GLOB_CMAKE = GLOB_CMAKE.replace("cmake/tests/*.cmake", "cmake/tests-*.cmake")
+    case("an add_test in a file included by a cmake/tests-*.cmake glob is still read",
+         B_CI, PREFIX_GLOB_CMAKE, 1, baseline="",
+         family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n",
+         family_rel="cmake/tests-zz.cmake")
+    # ... and a file the glob does not match (one directory down) is not configured, so it is not read.
+    case("a file the cmake/tests-*.cmake glob does not match is not read",
+         B_CI, PREFIX_GLOB_CMAKE, 0, baseline="",
+         family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n",
+         family_rel="cmake/tests-zz/inner.cmake")
     # ... and a baseline name nothing names any more is a FAILURE, not "progress": the two reasons a
     # count can fall are "now built" (good) and "no longer seen" (the reader narrowed).
     case("a baseline name no add_test names any more fails instead of reading as progress",

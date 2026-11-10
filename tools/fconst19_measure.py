@@ -37,6 +37,7 @@ The geometry (hidden, heads, layers) is read from the 1.9 pack's own genai_confi
 """
 import argparse
 import json
+import re
 import os
 import sys
 
@@ -139,11 +140,45 @@ def normalise(blob, layers, p, hdr_len):
     return bytes(res)
 
 
+ROW_RE = re.compile(r"^\s*\{(\d+), (\d+), (\d+), (\d+), (\d+), (\d+), (\d+)\},", re.M)
+
+
+def table_rows(source_text):
+    """The `kFconst19Rules` rows in a pack_import.cpp, as tuples in the tool's own field order."""
+    out = {}
+    for m in ROW_RE.finditer(source_text):
+        hidden, heads, layers, prefix, n, rot, tile = (int(g) for g in m.groups())
+        out[(hidden, heads, layers)] = (prefix, n, rot, tile)
+    return out
+
+
+def check_row(source_text, measured):
+    """engine#2010: a row must BE the measurement. `prefix` is the first byte where the twins diverge, so a row
+    derived from `64 + 2*hidden + 4,352` (or from a neighbour's shape) is wrong in a way no geometry check sees --
+    and a 1.9 pack with no 1.8 twin cannot be given a row at all, because there is nothing to diff. Returns
+    (ok, message)."""
+    hidden, heads, layers, prefix, n, rot, tile = measured
+    rows = table_rows(source_text)
+    key = (hidden, heads, layers)
+    if key not in rows:
+        return False, f"no kFconst19Rules row for {hidden}/{heads}/{layers}: the table cannot describe this pack"
+    got = rows[key]
+    want = (prefix, n, rot, tile)   # the struct's field order
+    if got != want:
+        return False, (f"row {hidden}/{heads}/{layers} is {got} but this pair measures {want} "
+                       f"(prefix {got[0]} vs measured {prefix})")
+    return True, f"row {hidden}/{heads}/{layers} is exactly what this pair measures"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pack-1-8", required=True, help="the 1.8 pack of the same model")
     ap.add_argument("--pack-1-9", required=True, help="the 1.9 pack to measure")
     ap.add_argument("--json", action="store_true", help="print the result as JSON instead of the table line")
+    ap.add_argument("--check-row", metavar="PACK_IMPORT_CPP",
+                    help="after measuring, find this geometry's row in PACK_IMPORT_CPP and FAIL if any field differs "
+                         "from what this pair measures. The guard for a row derived from arithmetic (or from a "
+                         "neighbour's shape) instead of from the twin-diff this tool computes: engine#2010")
     ap.add_argument("--probe-wrong", action="store_true",
                     help="having found the rule, perturb it one field at a time and print each residual, so the "
                          "tolerance has a measurement behind it instead of an argument")
@@ -183,7 +218,10 @@ def main():
         differ = 0 if got == a else sum(1 for x, y in zip(got, a) if x != y)
         if differ <= max(0, int(len(a) * TOL)):
             prefix, n, tile, rot, header_off, stride9 = p
-            note = "byte for byte" if differ == 0 else f"{differ} of {len(a)} bytes differ ({100.0 * differ / len(a):.2e} %)"
+            # Both spellings, because the percent is what this line prints and the fraction is what a row's comment needs: a
+            # row copied "6.20e-05 %" as "(6.20e-05)" once already and read as a 100x layout difference (engine#1767).
+            note = ("byte for byte" if differ == 0 else
+                    f"{differ} of {len(a)} bytes differ ({100.0 * differ / len(a):.2e} % = {differ / len(a):.2e} of the file)")
             if surplus:
                 note += f"; the 1.9 tail carries {surplus} B past its 1.8 twin's, not compared (engine#1740)"
             if args.json:
@@ -193,6 +231,11 @@ def main():
             else:
                 print(f"// verified: {note} ({len(a)} B)")
                 print(f"{{{hidden}, {heads}, {layers}, {prefix}, {n}, {rot}, {tile}}},")
+            if args.check_row:
+                ok, why = check_row(open(args.check_row).read(), (hidden, heads, layers, prefix, n, rot, tile))
+                print(f"# {'ok' if ok else 'MISMATCH'}: {why}", file=sys.stderr if not ok else sys.stdout)
+                if not ok:
+                    return 1
             if args.probe_wrong:
                 # What a WRONG rule costs, in the same units as the tolerance: perturb one field of the accepted
                 # rule at a time, normalise again, and report the residual. A tolerance is only defensible when the

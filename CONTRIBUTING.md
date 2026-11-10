@@ -78,6 +78,26 @@ an RFC or issue.
   project: one label, a request for the bug-report fields when a bug skipped the form, a registry
   lookup for linked Hugging Face models, and a pointer to Q&A for questions. The model only picks
   the label; every comment is a template. Maintainers can run it on any issue from the Actions tab.
+- **A test runs only if a job builds it.** A ctest row is not enough. `ci.yml` builds a fixed `--target` list, so a
+  target that nothing builds never reaches ctest: hook it with `add_dependencies(onebit <target>)`, the way
+  `onebit_npu_forward_syntax` is, and `tools/ci/ci_targets_check.py --check` keeps the count from growing. A
+  `tests/*.sh` script has to be named by a row — or listed with a reason in `tools/ci/unreferenced_tests.txt` if it is
+  not a row (`anchor_rerun.sh`, an operator measurement that always exits 0) — and `tools/ci/tests_referenced_check.py
+  --check` fails on one that is referenced by nothing. A row that runs Python goes through `add_python_test()`, which
+  hands the script to the interpreter instead of relying on the file's exec bit; `tests/python_test_order_check.py
+  --check` enforces that it follows `find_package(Python3)`. Two rows may not share a name: CMake stops at configure with
+  `add_test given test NAME "…" which already exists in this directory`.
+- **A new test's registration goes in its own file.** Put the `add_test(...)` (or `add_python_test(...)`) row, its
+  comment, and its `set_tests_properties` in a new `cmake/tests-<name>.cmake` with the Apache notice, and do not touch
+  `CMakeLists.txt` for it: every `cmake/tests-*.cmake` is included by a glob near the end of `CMakeLists.txt`, after all
+  targets exist. A new file cannot conflict with another pull request, and a row appended to `CMakeLists.txt` does —
+  that file changed 37 times in one day and three open pull requests had a registration hunk that no longer applied
+  (engine [#1979](https://github.com/1bit-MONSTER/engine/issues/1979)). A row that belongs to an existing family goes in
+  that family's file (`cmake/tests-gpu-hold.cmake`). An `add_executable` for a test binary still goes in
+  `CMakeLists.txt` next to the sources it builds; only the registration moves. Existing rows stay where they are.
+  A registration file that needs a fixed position may still be `include()`d by name from `CMakeLists.txt`; the glob
+  then leaves it alone. `tests/registration_glob_test.sh` (itself registered from `cmake/tests-registration-glob.cmake`)
+  runs the glob block and holds both rules.
 - **Pins only move forward.** CI fails a pull request whose submodule pin is behind, or has
   diverged from, the pin on `main` (`tools/check_pins.py`), because that drops commits the engine
   already shipped. A rollback on purpose carries the `pin rollback` label.

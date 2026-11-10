@@ -1157,11 +1157,23 @@ void model_free(ModelWeights* mw) {
     free(mw);
 }
 
+// engine#1786 (item F1): the per-layer prefix, in the two spellings the NPU2 model sources use. `layers.` is this
+// forward's own spelling; `layer.` is what three of the fifty-eight containers carry (`model.layer.0.input_layernorm…`),
+// where every other tensor matches by name. Swapping one prefix is a spelling fallback, not a rename: it happens only
+// after an exact match has failed, so a container that carries both is unaffected.
+
 TensorDesc* model_tensor_by_name(ModelWeights* mw, const char* name) {
     if (!mw || !mw->all_tensors || !name) return NULL;
     for (int i = 0; i < mw->all_count; i++) {
         const char* n = mw->all_tensors[i].name;
         if (n[0] && strcmp(n, name) == 0) return &mw->all_tensors[i];
+    }
+    // Exact match failed: try the other per-layer spelling before reporting absence (engine#1786).
+    char alt[512];
+    if (!model_tensor_name_alt(name, alt, sizeof(alt))) return NULL;
+    for (int i = 0; i < mw->all_count; i++) {
+        const char* n = mw->all_tensors[i].name;
+        if (n[0] && strcmp(n, alt) == 0) return &mw->all_tensors[i];
     }
     return NULL;
 }

@@ -97,6 +97,9 @@ struct ForwardEngine {
     // The template the container declares, its sha256 and where it came from: rendered per request
     // when present (app/npu_template.h), else ChatML when the tokenizer has the anchors.
     npu::ChatTemplate tmpl;
+    // The markup this container's replies are split by (app/npu_answer_parser.h): the template's own when
+    // the template is what gets rendered, else qwen3, which is what the ChatML fallback prompts for.
+    npu::AnswerFamily answer_family = npu::AnswerFamily::qwen3;
     std::string bos_text;  // the bos/eos *strings* the template's {{ bos_token }} renders
     std::string eos_text;
     // decode() of every vocabulary id, built on the first constrained request: the GBNF
@@ -106,6 +109,10 @@ struct ForwardEngine {
     // slot's attention KV and GDN state.  Only ever touched under mu.
     std::unique_ptr<npu::PrefixCache> prefix;
     std::vector<Q4nxNpuForward::StateSnapshot> prefix_state;
+    // --prefix-pin (engine#1785): keep the state at the point where a request stops agreeing with the
+    // previous one, so single-turn requests under one system prompt resume from it (PrefixCache::pin_point).
+    bool prefix_pin = false;
+    std::vector<int> prev_ids;  // the previous request's prompt, what pin_point() compares against
     // The d3 decision head (#653), loaded when decision_config.json and decision.q4nx sit next to the
     // model: it is what turns this server into a decision endpoint as well as a chat one.
     std::unique_ptr<npu::DecisionHead> head;
@@ -329,11 +336,42 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             std::fprintf(stderr, "[prefix] slot=%d cached=%d of %zu reason=%s\n", stats.prefix.slot,
                          stats.prefix.cached_tokens, ids.size(), stats.prefix.reason.c_str());
         }
+        // (engine#1785) Where this request should leave a pinned snapshot, as a position: the state is saved
+        // one token short of the shared part for the same reason the whole-prompt snapshot below is saved one
+        // token short of the prompt. -1 = no pin for this request. pin_point() is 0 when a slot (the pin
+        // itself, on every request after the one that made it) already covers the shared part, and it is
+        // always less than the prompt's length, so this cut is never the last-token cut below.
+        int pin_cut = -1;
+        size_t pin_tokens = 0;
+        if (e.prefix_pin && e.prefix && e.prefix->enabled()) {
+            pin_tokens = e.prefix->pin_point(e.prev_ids, ids);
+            if (pin_tokens > 0 && int(pin_tokens) - 1 >= resume) pin_cut = int(pin_tokens) - 1;
+        }
         {
             const int chunk_max = std::max(1, e.fwd->max_batch_rows());
             const int n = int(ids.size());
             for (int off = resume; off < n;) {
-                const int take = std::min(chunk_max, n - off);
+                int take = std::min(chunk_max, n - off);
+                if (pin_cut >= 0 && off == pin_cut) {
+                    Q4nxNpuForward::StateSnapshot snap;
+                    if (e.fwd->snapshot_state(off, snap)) {
+                        std::string why;
+                        const std::vector<int> shared(ids.begin(), ids.begin() + long(pin_tokens));
+                        const int slot = e.prefix->pin(shared, snap.bytes(), &why);
+                        if (slot >= 0 && size_t(slot) < e.prefix_state.size()) e.prefix_state[size_t(slot)] = std::move(snap);
+                        std::fprintf(stderr, "[prefix] pin slot=%d tokens=%zu state_at=%d %s\n", slot, pin_tokens, off,
+                                     why.c_str());
+                    }
+                    pin_cut = -1;
+                } else if (pin_cut > off && off + take > pin_cut) {
+                    // Stop this chunk at the pin position; the next pass saves the state there. One more launch.
+                    take = pin_cut - off;
+                    const std::vector<int> head(ids.begin() + off, ids.begin() + off + take);
+                    if (!e.fwd->step_batch(head, off, logits))
+                        throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
+                    off += take;
+                    continue;
+                }
                 // The state the prefix cache keeps is taken one token short of the prompt, because the answer is
                 // drawn from the last position's logits and a snapshot holds state, not logits -- so the snapshot
                 // is saved just before the last token and that token is run again on a resume.  On a GDN model
@@ -365,6 +403,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 off += take;
             }
         }
+        if (e.prefix_pin) e.prev_ids = ids;
 
         // Prompt processing ends here: every prompt token has been through the model and the first
         // token's distribution is in `logits`.
@@ -517,7 +556,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     {"prompt_tokens_details", {{"cached_tokens", st.prefix.cached_tokens}}},
                     {"flm_prefix_cache", {{"slot", st.prefix.slot},
                                           {"cached_tokens", st.prefix.cached_tokens},
-                                          {"reason", st.prefix.reason}}}};
+                                          {"reason", st.prefix.reason},
+                                          {"pinned", st.prefix.pinned}}}};
     };
 
     // OpenAI's logprobs.content entry: the token's text, its log-probability, and the most likely
@@ -534,6 +574,10 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         return json{{"content", content}};
     };
 
+    // A tool grammar (tool_choice "required" or a named function) constrains the reply to the qwen3 call
+    // markup whatever the container is (app/npu_tool_grammar.h), so that reply is split as qwen3.  Every
+    // other reply is in the container's own markup.
+    const npu::AnswerFamily family = opts.tool_grammar ? npu::AnswerFamily::qwen3 : e.answer_family;
     auto wrap = [&](const std::string& content, const std::string& finish, const std::vector<Emitted>& lps) {
         json out;
         out["id"] = id;
@@ -544,7 +588,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             // (issue #652 item 3) one shared parser splits what the model wrote into OpenAI's three
             // parts; a reply that is only tool calls says content: null.
             const npu::ParsedAnswer ans =
-                npu::parse_answer(content, npu::AnswerFamily::qwen3, opts.tools_sent);
+                npu::parse_answer(content, family, opts.tools_sent);
             json message{{"role", "assistant"}};
             message["content"] = ans.content_null ? json(nullptr) : json(ans.content);
             if (!ans.reasoning.empty()) message["reasoning_content"] = ans.reasoning;
@@ -565,7 +609,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 std::vector<std::string> texts;
                 texts.reserve(lps.size());
                 for (const auto& x : lps) texts.push_back(x.text);
-                const std::vector<char> keep = npu::content_mask(texts, npu::AnswerFamily::qwen3, opts.tools_sent);
+                const std::vector<char> keep = npu::content_mask(texts, family, opts.tools_sent);
                 std::vector<Emitted> content_lps;
                 for (size_t i = 0; i < lps.size(); i++)
                     if (i < keep.size() && keep[i]) content_lps.push_back(lps[i]);
@@ -606,7 +650,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             auto chunks = std::make_shared<std::vector<std::string>>();
             // The same splitter as the non-streamed path, fed piece by piece, so a streamed reply
             // and a non-streamed one cannot disagree about what is reasoning and what is content.
-            npu::AnswerStream stream(npu::AnswerFamily::qwen3, opts.tools_sent);
+            npu::AnswerStream stream(family, opts.tools_sent);
             auto emit_pieces = [&](const std::string& t, const std::vector<Emitted>& lp) {
                 std::vector<std::pair<bool, std::string>> pieces;
                 stream.feed(t, pieces);
@@ -795,6 +839,64 @@ void handle_systemone(ForwardEngine& e, const httplib::Request& req, httplib::Re
 
 }  // namespace
 
+// engine#1862: the sealed-route one-shot id run. `npu-run` was written for the per-role lane kernel set
+// (layer_ctx{1,2,17}.elf + lmhead.elf), which no pack on disk ships any more: every pack since the sealed route carries
+// SEALED-*.elf / full_i8_* driven by this forward. So an id run on a current pack goes through the SAME forward, and
+// the pass it makes is the one the k-row identity check needs -- one launch, M rows, per-row logits.
+int run_forward_ids(const std::string& model_dir, const std::string& kernels, const std::vector<int>& ids,
+                    int max_tokens, float penalty, bool host_gemm) {
+    if (ids.empty()) throw std::runtime_error("--ids: no token ids");
+    const std::string model = model_dir + "/model.q4nx";
+    if (!std::filesystem::exists(model)) throw std::runtime_error(model + " does not exist");
+    // Same device discipline as forward-serve: host-GEMM runs take no lock (engine#1353 -- a host-GEMM run that held it
+    // for 4 h 52 m stopped two lanes' device work), a run that opens the device takes the exclusive one.
+    int lock_fd = -1;
+    if (npu_lock_taken(!host_gemm, std::getenv("NPU_NO_DEVICE_LOCK") != nullptr)) lock_fd = take_npu_device_lock(1);
+    std::unique_ptr<xrt::device> dev;
+    if (!host_gemm) dev = std::make_unique<xrt::device>(0);
+    Q4nxNpuForward fwd;
+    const bool ok = dev ? fwd.init(*dev, model.c_str(), kernels) : fwd.init_host(model.c_str(), kernels);
+    if (!ok) throw std::runtime_error("forward init failed: " + std::string(fwd.last_error()));
+    const int width = fwd.max_batch_rows();
+    if (int(ids.size()) > width)
+        std::fprintf(stderr, "1bit npu-run: %zu ids, so this runs in passes of %d rows (the kernel's width)\n", ids.size(),
+                     width);
+    int done = 0;
+    while (done < int(ids.size())) {
+        const int m = std::min(width, int(ids.size()) - done);
+        std::vector<int> chunk(ids.begin() + done, ids.begin() + done + m);
+        std::vector<float> all, one;
+        // begin_verify() is what makes the next pass norm EVERY row and write M x NV logits (the speculative verifier's
+        // call); plain step_batch() returns only the last row, which cannot answer a per-row question.
+        fwd.begin_verify(m, done);
+        if (!fwd.step_batch_all(chunk, done, all))
+            throw std::runtime_error("forward step failed: " + std::string(fwd.last_error()));
+        // NV from the block itself (the vocab width is whatever the head returns) rather than from a config accessor:
+        // the size has to divide by the row count either way, and a block that does not is the thing to report.
+        if (all.empty() || all.size() % size_t(m) != 0)
+            throw std::runtime_error("forward returned a logits block of the wrong size (" + std::to_string(all.size()) +
+                                     " floats for " + std::to_string(m) + " rows)");
+        const int nv = int(all.size() / size_t(m));
+        for (int r = 0; r < m; ++r) {
+            const float* row = all.data() + size_t(r) * size_t(nv);
+            int best = 0;
+            for (int v = 1; v < nv; ++v)
+                if (row[v] > row[best]) best = v;
+            std::printf("%d\n", best);   // token ids out, in row order: the id the model chooses at that row
+        }
+        done += m;
+    }
+    // -n only matters for a continuation, which this route does not do: say so rather than ignore the option.
+    if (max_tokens > 0)
+        std::fprintf(stderr,
+                     "1bit npu-run: sealed route returns the model's choice at EVERY row of one pass; -n %d is not "
+                     "used (a continuation is `1bit forward-serve`)\n",
+                     max_tokens);
+    (void)penalty;
+    if (lock_fd >= 0) ::close(lock_fd);
+    return 0;
+}
+
 int run_forward_serve(int argc, char** argv) {
     std::string model, kernels, host = "127.0.0.1", alias, dump_logits;
     int port = 8000, streams = 1;
@@ -803,6 +905,7 @@ int run_forward_serve(int argc, char** argv) {
     // instead of being ignored and served by whatever target happened to be linked.
     std::string npu_target = ::npu::target::xdna::XdnaTarget::kName;
     npu::PrefixOptions prefix_opts;  // --prefix-slots / --prefix-cache-mb / --prefix-min-gain (#650)
+    bool prefix_pin = false;         // --prefix-pin (engine#1785)
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -817,6 +920,7 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "--prefix-slots") prefix_opts.slots = std::stoi(next());
         else if (a == "--prefix-cache-mb") prefix_opts.cache_mb = std::stoul(next());
         else if (a == "--prefix-min-gain") prefix_opts.min_gain = std::stoi(next());
+        else if (a == "--prefix-pin") prefix_pin = true;
         else if (a == "--npu-streams") streams = std::stoi(next());
         else if (a == "--npu-target") npu_target = next();
         else if (a == "--dump-logits") dump_logits = next();
@@ -875,6 +979,9 @@ int run_forward_serve(int argc, char** argv) {
                  e.tmpl.present() ? e.tmpl.source.c_str() : "no template",
                  e.tmpl.present() ? "" : " -- the chat route uses ChatML with anchors, else refuses");
     const bool can_render = e.tmpl.present() && npu::renderer_built();
+    if (can_render) e.answer_family = npu::answer_family_of_template(e.tmpl.text);
+    std::fprintf(stderr, "1bit forward-serve: answer markup=%s\n",
+                 e.answer_family == npu::AnswerFamily::gemma4 ? "gemma4" : "qwen3");
     if (e.tmpl.present() && !npu::renderer_built())
         std::fprintf(stderr,
                      "1bit forward-serve: this build has no chat-template renderer (ONEBIT_JINJA=OFF), so the "
@@ -911,6 +1018,8 @@ int run_forward_serve(int argc, char** argv) {
         std::fprintf(stderr,
                      "1bit forward-serve: prefix cache on: %d slots, %zu MB, min gain %d tokens\n",
                      prefix_opts.slots, prefix_opts.cache_mb, prefix_opts.min_gain);
+        e.prefix_pin = prefix_pin;
+        if (prefix_pin) std::fprintf(stderr, "1bit forward-serve: prefix pin on: the part a request shares with the previous one keeps a slot\n");
     }
 
     e.fwd = std::make_unique<Q4nxNpuForward>();

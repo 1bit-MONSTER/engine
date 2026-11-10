@@ -462,17 +462,35 @@ struct I8Ctx {
     // row is dequantised with its own activation scale.
     void dequant_pb16i(float* out, int am, int an, const float* ascales,
                        const std::vector<int16_t>& eref, int planes) {
+        // engine#1990: one 2^e_ref per column instead of one ldexp() per element; same bits (q4nx_pb16i.h).
+        // NPU_DEQ_LDEXP=1 keeps the per-element form for an A/B; =2 runs both and counts differing elements.
+        static const int legacy = [] {
+            const char* e = getenv("NPU_DEQ_LDEXP");
+            return e ? atoi(e) : 0;
+        }();
+        if (legacy != 1)
+            q4nx_pb16i::dequant_rows(out, Cm, ND, am, an, ascales, eref.data(), planes, deq_pow2_);
+        if (legacy == 0) return;
         const int row = planes > 1 ? 2 * ND : ND;
+        static long calls = 0, elems = 0, differing = 0;
         for (int m = 0; m < am; m++) {
             const int32_t* lo = Cm + (size_t)m * (size_t)row;
             const float asc = ascales[m];
             for (int n = 0; n < an; n++) {
                 const int64_t s = q4nx_pb16i::sum_of(lo + n, lo + ND + n, planes > 1 ? 1 : 0);
-                out[(size_t)m * (size_t)an + n] =
-                    q4nx_pb16i::scale_i64(s, eref[(size_t)n]) * asc;
+                const float v = q4nx_pb16i::scale_i64(s, eref[(size_t)n]) * asc;
+                float& o = out[(size_t)m * (size_t)an + n];
+                if (legacy == 2 && memcmp(&o, &v, sizeof v) != 0) differing++;
+                o = v;
             }
         }
+        if (legacy == 2) {
+            elems += (long)am * an;
+            if (++calls % 2000 == 0)
+                fprintf(stderr, "[deqcheck] calls=%ld elements=%ld differing=%ld\n", calls, elems, differing);
+        }
     }
+    std::vector<double> deq_pow2_;   // dequant_pb16i's per-column scratch
 
     // Cache-friendly per-column int8 quantization into a [KD][ND] padded buffer.
     // The original column-at-a-time loop reads w[i*N + j] with a stride of N
@@ -512,6 +530,15 @@ struct I8Ctx {
         bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         col_out = std::move(col);
         sout = (float)(ssum / N);
+    }
+
+    // Fill an (already-allocated) weight BO through `fill(Bm)`, which writes the KD x ND image itself, then sync it.
+    // packB_into() above is this with the packer as `fill`; the head-image cache (engine#1716) is this with
+    // q4nx_head_tile_image(), which either reads the image a previous serve wrote or packs it the same way.
+    template <class F>
+    void fill_weight_bo(xrt::bo& bo, F&& fill) {
+        fill((int8_t*)bo.map());
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
 
     // Async launch with an arbitrary weight BO (resident-expert path).

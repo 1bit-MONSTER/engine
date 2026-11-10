@@ -4523,7 +4523,31 @@ void test_qk_gain_offsets() {
     check(n4.k_norm == 0 && n4.q_norm == 0, "qk gains: the byte count alone is not enough, head_dim has to agree");
 }
 
+/* engine#1985: a REGRESSION, not a new bug -- `Qwen3-1.7B` imported with 0 gaps on yesterday's main and refused with 280
+ * on today's, because #1838's early return trusted an epsilon-anchor vote that had recorded ONE in-block header on a block
+ * that has three. The tell in the report is `qk_norm: true -> false`: a pack that declares per-head q/k gains keeps them in
+ * the two sections a 2-header block does not have, so the two witnesses disagree and neither may be preferred silently.
+ *
+ * The arms below pin the refusal and, just as importantly, the three cases it must NOT fire on: a vote that found three
+ * headers (a correct 4-header pack), a genuine 2-header pack that declares nothing, and no vote at all (0), which is the
+ * residue step's case and not a disagreement. */
+void test_header_witness_refusal() {
+    const std::string a = pi::header_witness_refusal(1, true);
+    check(!a.empty(), "header witness: a one-header vote on a pack declaring use_qk_norm is refused");
+    check(a.find("engine#1985") != std::string::npos, "header witness: the refusal carries its issue");
+    check(a.find("use_qk_norm") != std::string::npos, "header witness: it names the declaration it contradicts");
+    check(a.find("ONE in-block header") != std::string::npos, "header witness: and what the vote measured");
+    check(a.find("neither is being preferred") != std::string::npos,
+          "header witness: and that no witness is being chosen, which is the point");
+    check(pi::header_witness_refusal(3, true).empty(), "header witness: a three-header vote is consistent with the declaration");
+    check(pi::header_witness_refusal(1, false).empty(), "header witness: a 2-header pack that declares nothing is fine");
+    check(pi::header_witness_refusal(0, true).empty(),
+          "header witness: NO vote is not a disagreement (the residue step decides it)");
+    std::printf("  header witness: 8 arms (one-header vote vs declaration refuses; 3/1-without-declaration/0 allowed)\n");
+}
+
 int main(int argc, char** argv) {
+    test_header_witness_refusal();
     test_encode_tile_code_range();
     test_qk_norm_refusal();
     test_qk_gain_offsets();

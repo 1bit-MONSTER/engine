@@ -2685,10 +2685,33 @@ bool Q4nxNpuForward::load_ple_block(int row) {
         (size_t)sem_.vocab_size_per_layer_input * (size_t)cols;
     // engine#1725: a RAW BF16 band. The multi-component packs state this table as f32 and the importer converts it to BF16
     // when it writes the container (a converting copy of the whole V x NL*P table would be 9.4 GiB), so the band here is
-    // 32 rows of BF16 -- exactly the shape the plain-int8 branch handles, with a 2-byte element instead of a code.
+    // 32 rows of BF16 -- the shape the plain-int8 branch handles, with a 2-byte element instead of a code.
+    //
+    // The branch is chosen by the container's DECLARED dtype, not by arithmetic on data_size (review of #1825): a size test
+    // needs `% bf16_bytes == 0 && != plain_bytes` to separate two layouts, and every multiple of the band satisfies it, so a
+    // plain table whose byte count happens to divide would be read as BF16 bands -- plausible and wrong. This tree already
+    // decides exactly this way elsewhere (`model.c`: `strcmp(dtype,"I8")`), and `q4nx_dequant.h`'s rule is that an
+    // ambiguous layout is refused rather than resolved by which test happens to pass.
     const size_t bf16_bytes = (size_t)Q4NX_TILE_ROWS * (size_t)cols * 2;
-    if ((size_t)td->data_size >= ((size_t)block + 1) * bf16_bytes &&
-        (size_t)td->data_size % bf16_bytes == 0 && (size_t)td->data_size != plain_bytes) {
+    const char* pl_dtype = td->dtype;
+    const bool declared_bf16 = pl_dtype[0] != '\0' && std::strcmp(pl_dtype, "BF16") == 0;
+    const bool declared_i8 = pl_dtype[0] != '\0' && (std::strcmp(pl_dtype, "I8") == 0 || std::strcmp(pl_dtype, "Q4") == 0);
+    if (!declared_bf16 && !declared_i8) {
+        // Some other declared format, or none at all: refuse rather than fall through to a layout guess. A container
+        // written by this importer always states one (`w.add()` writes dtype for every tensor), so an empty dtype means a
+        // foreign or truncated container, not a layout this loader can infer.
+        err_ = pl_dtype[0] != '\0'
+                   ? std::string("per_layer_token_embd has dtype ") + pl_dtype +
+                         ", which this loader does not read (BF16 or plain I8 only)"
+                   : std::string("per_layer_token_embd declares no dtype, so its layout cannot be decided");
+        return false;
+    }
+    if (declared_bf16) {
+        if ((size_t)td->data_size < ((size_t)block + 1) * bf16_bytes ||
+            (size_t)td->data_size % bf16_bytes != 0) {
+            err_ = "per_layer_token_embd is declared BF16 but its size is not whole 32-row bands";
+            return false;
+        }
         const uint16_t* band = reinterpret_cast<const uint16_t*>(raw + (size_t)block * bf16_bytes);
         for (size_t i = 0; i < (size_t)Q4NX_TILE_ROWS * (size_t)cols; ++i) ple_block_[i] = bf16_to_f32(band[i]);
     } else if ((size_t)td->data_size == plain_bytes) {

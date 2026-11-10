@@ -96,6 +96,19 @@ struct QkGainOffsets {
 QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
+// Why a pack's two layout witnesses cannot be reconciled, or "" when they can (engine#1985).
+//
+// `vote_hdrs` is the number of in-block headers the epsilon-anchor vote recorded (0 when it could not win); `declared_qk`
+// is config.json's `use_qk_norm`. A pack that states per-head q/k gains keeps them in the two sections between q/k/v and
+// o_proj, which a 2-header block does not have -- so a ONE-header vote on such a pack is self-contradictory, and engine#1985
+// is what trusting it costs: `Qwen3-1.7B` read as a 2-header block, `qk_norm` flipped true -> false, and every attention
+// projection was refused (280 gaps) where yesterday's main imported the same pack with 0.
+//
+// Neither witness wins: the vote measured where anchors repeat, and the declaration states what the block must contain.
+// The reader refuses and names both, because picking either one silently is the defect. Exposed so the three cases can be
+// pinned without a 2.6 GB pack.
+std::string header_witness_refusal(int vote_hdrs, bool declared_qk);
+
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
 // GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
 // reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.

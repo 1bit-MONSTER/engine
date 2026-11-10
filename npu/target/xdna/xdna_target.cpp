@@ -1061,7 +1061,10 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
             }
             const auto h0 = std::chrono::steady_clock::now();
             // engine#1990: the rows are rotated by one thread team (bit-identical to one after another; see
-            // q4nx_hadamard::rotate_rows). NPU_ROT_ROWS=0 keeps the serial form for an A/B.
+            // q4nx_hadamard::rotate_rows). NPU_ROT_ROWS=0 keeps the serial form for an A/B; it is read once, at the
+            // first batched launch, so the A/B is per process start, not switchable mid-serve.
+            // `resize` (not `assign`) is safe only because `A` is the caller's activation and never points into
+            // `had_buf_`: a growing resize would free the buffer `A` reads from. rotate_rows writes every element.
             static const int rot_threads = [] {
                 const char* e = getenv("NPU_ROT_ROWS");
                 if (e && e[0] == '0') return 1;

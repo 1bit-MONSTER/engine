@@ -1238,11 +1238,14 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
         }
     if (separate.size() == 1) return int(*separate.begin());
     if (separate.size() > 1) return 0;
-    // else a fused gate_up: ONE node covers gate and up, so its N is 2*w and the down projection's K is the same 2*w --
-    // the agreeing value is 2*w and the FFN width is half of it
+    // else a fused gate_up: ONE node covers gate and up, so its N is 2*w, and `down_proj` reads the GATED PRODUCT, which is
+    // w wide -- so its K is w, half of the gate_up N. This was written the other way round (`gate_n.count(dk)` on a K that
+    // was assumed to be 2*w), which returns 0 for a real fused pack and `q_dim/2` for one whose tensor names are opaque
+    // (engine#1756: hidden 2560, q_dim 4096, true FFN 9728 gave 2048). The pairing is therefore `2*dk` in gate_n, and the
+    // answer is `dk` itself.
     std::set<int64_t> fused;
     for (const int64_t dk : down_k)
-        if (dk % 2 == 0 && gate_n.count(dk)) fused.insert(dk / 2);
+        if (dk > 0 && dk < (int64_t(1) << 40) && gate_n.count(2 * dk)) fused.insert(dk);
     if (fused.size() != 1) return 0;
     return int(*fused.begin());
 }

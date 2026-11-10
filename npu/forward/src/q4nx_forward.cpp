@@ -3073,6 +3073,7 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     }
     const HostI8Tensor& t = it->second;
     std::vector<float> padded_a;
+    float order_gap_ = 0.0f;
     // One-GEMM A/B (engine#1830): with NPU_DBG_I8_AB set, compare this arm's output against the f32 GEMM for the
     // SAME activation and the SAME tensor. cos ~0.99 means the layout and scales are right and a remaining
     // degeneracy is an integration issue; cos ~0 means the operands are still wrong. Host only, first few calls.
@@ -3107,6 +3108,12 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
             for (int k = 0; k < K; k++)
                 acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] * (int)a8[(size_t)k]);
             dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
+            // How much can float ORDER alone move this value? The device multiplies ((cm * asc) * gs); this arm
+            // multiplies (gs * (asc * cm)). Track the gap so "the residue is just multiplication order" can be
+            // checked instead of asserted.
+            const float alt = ((float)acc * ascale) * t.d[(size_t)n];
+            const float gap = std::fabs(alt - dst[(size_t)n]);
+            if (gap > order_gap_) order_gap_ = gap;
         }
     }
     if (ab) {
@@ -3118,9 +3125,11 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         }
         const double cos = dot / (std::sqrt(na * nb) + 1e-30);
         if (cos < 0.999 || dbg_i8_ab_ < 4)
-            std::fprintf(stderr, "[i8ab] call=%d wkey=%d K=%d N=%d cos(i8,f32)=%.6f max|d|=%.6g ref[0]=%g i8[0]=%g\n",
-                         dbg_i8_ab_, wkey, K, N, cos, md,
+            std::fprintf(stderr, "[i8ab] call=%d wkey=%d K=%d N=%d cos(i8,f32)=%.6f max|d|=%.6g "
+                                 "epilogue_order_gap=%.3g ref[0]=%g i8[0]=%g\n",
+                         dbg_i8_ab_, wkey, K, N, cos, md, (double)order_gap_,
                          ab_ref.empty() ? 0.0 : (double)ab_ref[0], (double)out[0]);
+        order_gap_ = 0.0f;
         dbg_i8_ab_++;
     }
 }

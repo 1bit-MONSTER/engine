@@ -162,7 +162,74 @@ proved by the byte-exact gate rather than assumed. It is listed in §5.
 - Optional ops get their host fallbacks here: `gdn_step`, `attn_step`, `lm_head` return false from a target
   that does not implement them, and the model runs its own implementation (today's code, unchanged).
 
+### A3a — the fallback seam, and what it can honestly wire today
+
+The interface's promise ("the model falls back to its own host implementation when `supports(op)` is false") had
+**no caller anywhere in the tree**: `git grep 'supports(Op::'` found nothing in `npu/` or `app/`, so the contract was
+declared and unimplemented. `npu/model/op_dispatch.h` is that missing side, and it is the part of A3 with logic in it
+— the rest of A3 is a move.
+
+One function per optional op, each returning "the target did it, do not run yours" or "it did not, run yours". The
+answer is `supports(op) && <op>(...)`, never `supports(op)` on its own: a target that **claims** an op and then fails
+it (its state is not resident, say) must not swallow the op, or the layer silently produces whatever the
+half-executed op left behind. `tests/npu_op_dispatch_test.cpp` (ctest `npu_op_dispatch`, stub targets, no device, no
+runtime library) pins both failure modes plus the claiming-and-running case, and runs in CI by hooking onto
+`npu_sampling_test`'s target — `ci.yml` builds a named list, so an unhooked test target reports "Not Run" (#635).
+
+**Wired today: `lm_head` only.** Its contract is complete without residency — one hidden row `[H]` to `[V]`, the
+weights are the model's, and it is idempotent — so `Q4nxNpuForward::run_lm_head` asks the target first, behind a
+`supports()` check so that no per-token `[V]` buffer is allocated while no target claims it. No target on this box
+claims it (XdnaTarget's `supports()` is `gemv`-only), so the numerics are unchanged by construction.
+
+**Not wired, and why:** `gdn_step` and `attn_step` require the layer's parameters and state to be **resident**
+(`load_block()`), and `XdnaTarget::load_block()` is still the documented no-op ("weights still fill lazily per
+projection"). Wiring the dispatch before that residency exists would hand a target an op it cannot honour and hide
+the reason inside a fallback that always fires. The helpers exist and are tested; they are the seam those two ops
+land on when A2c/`load_block()` arrives.
+
+What remains of A3 proper: the state move (`c_`, `sem_`, `embed_*`, KV, GDN state, `mla_*`, `moe_*`) into
+`npu/model/npu_model.{h,cpp}`, and its gate — window11 text identity, logits KLD 0 on 8 prompts, a profile table
+within 2 % — which needs device windows and a quiet box.
+
 A3 is the step with the large diff and no numerical content; it goes after the gate proves A1+A2.
+
+### A3 as landed — five slices, each with a device arm
+
+`npu/model/npu_model.h` owns what the line above calls "the maths + its state", and `Q4nxNpuForward` is the adapter this
+page describes: it keeps every member name as a **reference** into `NpuModel`, so no expression in the class changes and
+each slice is reviewable as the ownership change it is.
+
+| slice | what moved | expressions unchanged |
+|---|---|---|
+| target | `std::unique_ptr<XdnaTarget>` | `xd_->…` |
+| semantics | `Q4nxSemantics` | `sem_.…` |
+| geometry | `Q4nxForwardConfig` (the type moved with it) | `c_.…` |
+| norm scratch | `in_norm_`, `post_norm_`, `q_norm_`, `k_norm_` | those four names |
+| KV / MLA / recurrent | `kcache_`, `vcache_`, `mla_*`, `conv_state_`, `rec_state_`, `kv_owner_` | those members |
+
+The column carried counts (94 / 82 / 112 / 16 / 54) until a reviewer tried to reproduce them. They were true on each slice's own base and
+**not** from the merged tree, where the file has grown: `grep -o` over `npu/forward/src/q4nx_forward.cpp` +
+`npu/forward/include/q4nx_forward.h` gives **104** for `xd_->`, **112** for `sem_.` and **169** for `c_.` at the merge. So the integers are
+gone rather than wrong — a table of five exact numbers nothing checks is the shape this repository has been bitten by, and the claim that
+matters ("every expression unchanged, because the member name is still a reference") does not need them.
+
+Why the last one is safe to move and the aliasing question that had to be answered first: nothing outside the model
+aliases those buffers — the model's KV sharing is *between its own layers* (`kv_owner_`), and the dma-buf shared region
+lives in the fork's llama.cpp side, a different process. The hazard a reference cannot survive is a vector *re-seated*
+(moved out and replaced) rather than grown in place; every mutation here is `insert`/`reserve`/`assign`/`resize` on the
+same object.
+
+**The gate as it is actually evaluable, and why "within 2 %" died.** This box moves a row by **up to 7.7 %** when the
+*same binary* is run twice (engine#834), and in the 2026-11-09 arms the same-binary control pair's worst row moved
+**22 %**. A constant 2 % assertion was therefore never evaluable here. What the arms did instead, via
+`scripts/npu-window11.sh`: run the pre-move binary twice (**control pair**) for that window's noise floor, then pre-move
+vs post-move, scored on the paired statistic with the tolerance taken from the control. Every slice came back with
+**3/3 byte-identical transcripts**, **13/13 identical rows** (same phase/role/M set and launch counts) and no row
+outside the control's own spread; the KV/recurrent arm's ratios were **−1.3 % … +2.3 %**. The same five slices against
+the shipped **c25 reference** binary also passed (`window11: PASS`, 3/3 texts, 13/13 rows).
+
+What is still not wired, and stated as such: `gdn_step`/`attn_step` dispatch needs `load_block()` residency, and
+`XdnaTarget::load_block()` remains the documented no-op; `lm_head` is wired behind `supports()` in `run_lm_head`.
 
 ## 4. Gate (unchanged from #803)
 
@@ -175,6 +242,23 @@ A3 is the step with the large diff and no numerical content; it goes after the g
    device is opened**, which is what makes the row measurable without a ticket: `--npu-target hexagon` prints
    `--npu-target hexagon: this build has no such target (compiled: xdna)` and exits, and the same message comes
    out of `serve --device npu --npu-target hexagon` because it reaches the forward unchanged.
+
+   **Measured (2026-11-09, `ONEBIT_NPU=ON` against the shipping runtime, no ticket and no device — the refusal is
+   before both):**
+
+   | form | what it prints |
+   |---|---|
+   | `forward-serve … --npu-target hexagon` | `--npu-target hexagon: this build has no such target (compiled: xdna)` |
+   | `forward-serve …` (default) | proceeds to its own checks — `xdna` is the default |
+   | `serve --device npu --npu-target hexagon` | the same by-name message, carried through the child |
+
+   **One caveat the `serve` row earned:** it only reaches the child after `serve`'s own kernel resolution succeeds.
+   With a pack whose full ELFs resolve nothing, `serve` refuses first with *its* message (`… no NPU kernel (full ELF)
+   directory resolves for it: set ONEBIT_NPU_KERNELS …`) and the target refusal is never printed — measured on
+   `Qwen3-0.6B` and on `bonsai2-27b-t2s2-serve`, whose `kernels-m16/` does not satisfy that check. That is not a
+   defect to fix in code: the route cannot run without kernels either, and duplicating the compiled-target list into
+   `serve` to reorder the two refusals would break the rule that keeps the list in one place. It is a reason to set
+   the kernels up before testing this row, which is what the table's third line did.
 
 Runs go through `npu-hold` tickets; a new ELF is not involved (no kernel changes), so tickets are the normal
 kind. The reference binary is the `c20`-era build with the same model dir, so a difference can only be the

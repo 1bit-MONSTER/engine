@@ -672,3 +672,55 @@ the change is within the noise (four rounds, 6.7 against 7.0 tok/s).
    rate it and the streamer to consume it.
 4. **The quants not on the box** (UD-Q2/Q3/Q4_K_XL): their decode speed, once there is room
    on the drive.
+
+## The placement table: `tools/moe_placement.py` (engine#1702)
+
+Co-activating experts cluster hard enough that a **per-layer** placement is worth real numbers on this box, measured on
+2026-11-09 (engine#1702, routes replayed, no model math changed):
+
+| placement | Qwen3.6 chat | Qwen3.6 code | Flash-Next |
+|---|---|---|---|
+| co-activation, **per layer** | **46.2 %** | **60.0 %** | **44.0 %** |
+| co-activation, one global plan | 4.2 % | 6.9 % | 2.7 % |
+| contiguous id split (control) | 0.6 % | 0.5 % | 0.2 % |
+
+(share of decoded tokens whose experts all land on ONE device, i.e. how often a token can skip the wire entirely). The
+middle row is why this is per layer and not one permutation for the model.
+
+`tools/moe_placement.py` builds that table from a `tools/moe_trace.cpp` trace:
+
+```
+tools/moe_trace … trace.tsv                    # the per-step, per-layer expert ids
+tools/moe_placement.py trace.tsv -g 2 -e 256 -o placement.json
+```
+
+**`-e` is the model's expert count, and it matters.** A decode sample does not fire every expert in every layer, and the
+default derives the layer's size from the highest id the trace happens to visit — so without `-e` the table is a placement
+of the *sample*. With `-e` the table covers `0..N-1`, every expert appears exactly once, and each layer records `unseen`:
+the experts with no co-activation evidence, which are placed by balance alone (round-robin onto the smallest group, ties to
+the earlier group) rather than left out. A layer where `unseen` is most of the plan is a layer whose ordering is a default,
+and it should read that way. If the trace visits an id the model does not have, the tool refuses and names both numbers —
+the trace and the model disagreeing is not a placement to publish.
+
+**Decode rows only.** Placement adds 5.4-6.9 % on batched prefill while deduplication gives 90-94 % (engine#1702 §3), so a
+prefill run is refused by name rather than quietly scored: placement is a decode lever, and a tool that counted prefill
+steps would inflate its own case.
+
+**The file is a proposal, not a placement.** Nothing in the graph changes and no tensor moves: the table is a JSON a
+splitter or the streamer may consume, and an unused table changes nothing. Its shape:
+
+```json
+{ "schema": "1bit/moe-placement/1", "groups": 2,
+  "layers": { "0": { "decode_steps": 720, "experts": 256, "experts_seen": 243, "unseen": 13,
+                     "groups": [[…ids…], […ids…]] } } }
+```
+
+keyed by (layer, global expert id) — the same key `tools/build_expert_placement.py` uses upstream of us, which is why the
+schema carries its own name: a consumer can check `schema` rather than assume this tool's version.
+
+`--self-test` pins the property that matters on synthetic traces with a known answer: two **interleaved** clusters (ids
+`0,2,4,6` / `1,3,5,7`, so a contiguous split cannot be right by accident) must reach a 100 % one-device share under `-g 2`
+while the contiguous control reaches 0 %, four clusters must do it under `-g 4`, a token spanning every group must never
+count as one device, `G=1` / `G=n_experts` must be exact, and a **partial** sample must still place every expert in range
+exactly once with the evidence-less ones counted and balanced. It runs in CI (`ctest moe_placement`), needs no model and no
+device.

@@ -85,6 +85,38 @@ jobs:
           g++-16 -std=c++26 -fsyntax-only -DONEBIT_NPU_RUNTIME_OWN \
             -Inpu -Inpu/forward/include -Ibuild/_deps/json-src/include \
             tools/mtp_acceptance.cpp
+      - name: The forward defines every step_batch_embeds overload the header declares
+        # `embeds_equiv_probe` cannot be built in this job: it lives under `if(ONEBIT_NPU)` (CMakeLists.txt), and
+        # this workflow configures without it because the NPU runtime is private. Naming a target the configuration
+        # does not define is a hard ninja error that stops the whole step (tools/ci/ci_targets_check.py guards that
+        # now), so the probe is guarded by its symbol instead. What this job DOES build is
+        # `onebit_npu_forward_syntax`, an OBJECT library that compiles q4nx_forward.cpp and links nothing -- so the
+        # object can be built here, and the invariant that broke on 2026-11-08 (the three-argument
+        # `step_batch_embeds` was declared in the header and never defined, so `embeds_equiv_probe` failed to link
+        # while every CI job stayed green) is checkable against it without the NPU configuration.
+        run: |
+          # Built explicitly rather than relied on transitively: it IS built by the step above, because
+          # CMakeLists.txt:542 has `add_dependencies(onebit onebit_npu_forward_syntax)` -- but a check that
+          # depends on the order of another step's target list is the kind that goes quiet when that list is
+          # edited. One line here makes the object's existence this step's own precondition.
+          cmake --build build --target onebit_npu_forward_syntax
+          OBJ=$(find build -name 'q4nx_forward.cpp.o' -path '*onebit_npu_forward_syntax*' | head -1)
+          test -n "$OBJ" || { echo "the forward syntax object was not built"; exit 1; }
+          decl=$(grep -c 'bool step_batch_embeds(' npu/forward/include/q4nx_forward.h)
+          def=$(nm -C "$OBJ" | grep -c ' T Q4nxNpuForward::step_batch_embeds')
+          echo "$OBJ: $def definition(s) of Q4nxNpuForward::step_batch_embeds, $decl declared"
+          if [ "$def" -lt "$decl" ]; then
+            echo "a declared overload has no definition: anything that calls it fails to link, and this job's"
+            echo "own targets never do (that is how a red main survived). Counted above."
+            exit 1
+          fi
+      - name: The embedding probe still compiles against the in-tree headers
+        # The probe itself cannot be built here (see above), but it must keep compiling: this catches the probe
+        # drifting from the forward's interface, which the symbol check above would not.
+        run: |
+          g++-16 -std=c++26 -fsyntax-only -DONEBIT_NPU_RUNTIME_OWN \
+            -Inpu -Inpu/forward/include -Ibuild/_deps/json-src/include \
+            npu/forward/embeds_equiv_probe.cpp
       - name: Build
         # Every target a ctest test invokes must be listed here: `ctest` runs whatever
         # binaries exist, so a test whose target is missing reports "Not Run" and never
@@ -92,7 +124,7 @@ jobs:
         run: |
           cmake --build build --target onebit \
             npu_full_elf_test npu_pack_test npu_q4nx_test npu_private_route_test \
-            npu_pack_import_test \
+            npu_pack_import_test npu_residual_dump_test \
             tokenizer_test think_split_test gguf_meta_test mem_admit_test pm_routes_test \
             laya_encoder_test http_guard_test moe_gguf_index_test laya_bounds_test \
             npu_model_bounds_test npu_forward_loader_test npu_design_grid_test npu_sampling_test \

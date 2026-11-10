@@ -31,6 +31,8 @@ set -uo pipefail
 bin=${1:?usage: pm_laya_route.sh path/to/1bit path/to/laya-checkpoint-dir}
 laya=${2:?usage: pm_laya_route.sh path/to/1bit path/to/laya-checkpoint-dir}
 here=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=tests/serve_port.sh
+. "$here/serve_port.sh"   # serve_port_wait: read back the port serve bound (engine #1485)
 scratch=$(mktemp -d)
 pids=()
 cleanup() { for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; done; rm -rf "$scratch"; }
@@ -54,21 +56,17 @@ JSON
 lem_port=$(freeport)
 python3 "$here/fake_lemonade.py" "$lem_port" "$scratch/lemonade.jsonl" &
 pids+=($!)
-port=$(freeport)
-PM_RECORD="$scratch/backend.jsonl" "$bin" serve -m "$scratch/zaya.gguf" --device cpu --port "$port" \
+# --port 0 for serve. freeport() above is still the fake lemonade's: that is a python process which cannot pick its own
+# port and report it back, so it keeps the old shape (engine #1485).
+PM_RECORD="$scratch/backend.jsonl" "$bin" serve -m "$scratch/zaya.gguf" --device cpu --port 0 \
     --alias ZAYA1-8B-PM --llama-server "$here/fake_pm_backend.py" --pm --pm-router laya \
     --laya-model "$laya" --pm-experts "$scratch/experts.json" \
     --lemonade-url "http://127.0.0.1:$lem_port" >"$scratch/pm.log" 2>&1 &
 pids+=($!)
+port=$(serve_port_wait "$scratch/pm.log" "${pids[-1]}" 1500) || { echo "FAIL serve never reported a port"; cat "$scratch/pm.log"; exit 1; }
 api="http://127.0.0.1:$port"
 code=000
 for _ in $(seq 1 300); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.2; done
-# A server that never came up because it could not bind is a port collision, not a defect in what this
-# test checks: name the port and stop, before an empty body turns into a JSON decode error (engine#1070).
-if [ "$code" != 200 ] && grep -qiE 'EADDRINUSE|address already in use|cannot listen on' "$scratch/pm.log"; then
-    echo "FAIL: pm_laya_route: could not bind a port $port ($(grep -m1 -oiE 'EADDRINUSE|address already in use|cannot listen on [^ ]*' "$scratch/pm.log" | head -1))"
-    exit 1
-fi
 check "serve --pm --pm-router laya comes up with the checkpoint" '[ "$(curl -s -o /dev/null -w "%{http_code}" "$api/health")" = 200 ]'
 check "  the log names the router and its table" 'grep -q "pm: router laya: .*code=coder" "$scratch/pm.log"'
 

@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import q4nx_pb16i as Q  # noqa: E402
 
 FAIL = []
+SKIPPED = []   # checks that could not run here; a pass line must name them
 
 
 def check(ok, what, K=0, N=0):
@@ -145,13 +146,36 @@ def test_ptq1_0():
     plain base-3 number (ggml stores them in staged 32/16/8 chunks, five trits per byte),
     so a hand-built block would test my own inverse, not ggml's layout.  Instead: pack a
     real tensor and compare the image BYTE FOR BYTE against a set whose device output was
-    already gated bit-exact (the frozen pb16i sidecar set).  Skipped when the model is not
-    on this machine, so CI stays green."""
+    already gated bit-exact (a set this packer wrote).  Skipped when the model or that set is
+    not named on this machine -- and the skip is then reported IN THE PASS LINE, because this is
+    the file's only check of the reader and a bare "ok" would read as if it had run."""
     gguf = os.environ.get("Q4NX_PB16I_GGUF",
                           "/home/bcloud/models/bonsai2-27b/Ternary-Bonsai-2-27B-PTQ1_0.gguf")
-    ref = os.environ.get("Q4NX_PB16I_REF", "/home/bcloud/models/npu/bonsai2-pb16i-sidecars")
-    if not os.path.exists(gguf) or not os.path.isdir(ref):
-        print("  (reader test skipped: no ternary GGUF or reference image set on this machine)")
+    # No default reference set on purpose.  The set this test used to name
+    # (`bonsai2-pb16[I]-sidecars`, and the name was misspelled so the test skipped on every run anyway) was built
+    # 2026-10-31 21:40, before this packer existed (`tools/q4nx_pb16i.py` was created in 88715dea, 2026-11-01 04:51,
+    # together with this test), and it comes from the container's own converter (`config.json` ->
+    # `q4nx_source.converter = qwen35_to_q4nx.py`).  Measured 2026-11-08 on bonsai2-27b: `pack` differs from all 8
+    # images of layer 3 byte for byte at identical sizes, and `verify` reports MISMATCH on 14/14 tensors of layers
+    # 6-7 -- i.e. that set is NOT this packer's output, so comparing against it asserted nothing.  Byte equality is
+    # only meaningful against a set THIS packer wrote, so it must be named explicitly (and can then be regenerated
+    # and device-gated on purpose) rather than inherited from a directory name that happens to exist.
+    ref = os.environ.get("Q4NX_PB16I_REF", "")
+    if not os.path.exists(gguf) or not ref or not os.path.isdir(ref):
+        # This is the ONLY test in the file that reads the reader, and it used to report its absence as part of the
+        # suite's "ok" line.  A CI run on a machine without the model then read as "the reader was checked", which is
+        # how the byte-for-byte claim below went unverified (measured 2026-11-08: `q4nx_pb16i_test: ok` while `pack`
+        # differed from every image in the reference set).  Say SKIPPED in the pass line, and let
+        # Q4NX_PB16I_REQUIRE=1 turn the absence into a failure for a machine that is supposed to have the model.
+        why = []
+        if not os.path.exists(gguf):
+            why.append(f"the ternary GGUF ({gguf})")
+        if not ref or not os.path.isdir(ref):
+            why.append("Q4NX_PB16I_REF, a reference set THIS packer wrote (none by default, see above)")
+        SKIPPED.append("reader test needs " + " and ".join(why))
+        print("  (reader test SKIPPED: needs " + " and ".join(why) + ")")
+        if os.environ.get("Q4NX_PB16I_REQUIRE"):
+            check(False, "Q4NX_PB16I_REQUIRE is set, so the reader test may not skip", 0, 0)
         return
     want = {}
     for name, dims, tt, raw in Q.gguf_tensors(gguf):
@@ -174,16 +198,106 @@ def test_ptq1_0():
                 check(got == f.read(), f"{stem}{suffix} != the gated reference image", K, N)
 
 
+def _tiny_gguf(path, tensors):
+    """Write a GGUF with `tensors` = [(name, dims, ggml_type, payload bytes)] and no metadata.
+
+    Hand-rolled because the fixture needs control of a QUANTIZED payload (a q4_0 block), which the repo's
+    GGUFWriter helper does not offer -- and because a test that pulls in the writer code it is testing is not
+    a test. Layout: header, tensor infos, then the data section aligned to 32 (ggml's default), which is the
+    same alignment the reader assumes."""
+    import struct
+    body = b""
+    infos = b""
+    for name, dims, tt, payload in tensors:
+        nb = name.encode()
+        infos += struct.pack("<Q", len(nb)) + nb
+        infos += struct.pack("<I", len(dims)) + b"".join(struct.pack("<Q", d) for d in dims)
+        infos += struct.pack("<I", tt) + struct.pack("<Q", len(body))
+        body += payload
+        body += b"\0" * (-len(body) % 32)
+    head = struct.pack("<IIQQ", 0x46554747, 3, len(tensors), 0) + infos
+    with open(path, "wb") as f:
+        f.write(head)
+        f.write(b"\0" * (-(len(head)) % 32))
+        f.write(body)
+
+
+def test_q4_0_source_reader():
+    """engine#1605: a sidecar can be checked against a q4_0 source only if the reader can read one.
+
+    `gguf_tensors` used to size every non-PTQ1_0 tensor as 0 bytes and yield b"", so a caller could not tell
+    "this tensor is empty" from "this reader cannot size it" -- the wall the pb16i sidecar check hit. The three
+    arms below are: a q4_0 tensor is sized and decodes to the values it was built from, an unknown type is still
+    skipped quietly by default, and strict=True refuses it by name instead.
+    """
+    import tempfile
+    K, N = 64, 4
+    rng = np.random.default_rng(7)
+    codes = rng.integers(0, 16, size=(N, K // 32, 32), dtype=np.uint8)
+    d = (rng.standard_normal((N, K // 32)) * 0.02).astype(np.float16)
+    payload = b""
+    for col in range(N):
+        for b in range(K // 32):
+            qs = codes[col, b]
+            packed = (qs[0:16] | (qs[16:32] << 4)).astype(np.uint8).tobytes()
+            payload += d[col, b].tobytes() + packed
+    with tempfile.TemporaryDirectory() as td:
+        g = os.path.join(td, "t.gguf")
+        _tiny_gguf(g, [("blk.0.ffn_gate.weight", (K, N), Q.Q4_0, payload),
+                       ("blk.0.norm.weight", (K,), 0, np.zeros(K, np.float32).tobytes())])
+        got = {n: (dims, tt, raw) for n, dims, tt, raw in Q.gguf_tensors(g)}
+        dims, tt, raw = got["blk.0.ffn_gate.weight"]
+        check(tt == Q.Q4_0 and len(raw) == N * (K // 32) * Q.Q4_0_BLOCK,
+              "a q4_0 tensor is sized from its dims, not skipped", K, N)
+        check(got["blk.0.norm.weight"][2] == b"", "an unsized type is still skipped by default (no behaviour change)", K, N)
+        try:
+            list(Q.gguf_tensors(g, strict=True))
+            check(False, "strict refuses an unsized type by name", K, N)
+        except SystemExit as e:
+            check("blk.0.norm.weight" in str(e) and "cannot size" in str(e),
+                  "strict refuses an unsized type by name", K, N)
+        # engine#1605 follow-up: one tensor by name. `strict=True` refuses the whole file at the first unsized
+        # tensor, so a caller that wants a single q4_0 tensor out of a real model has no way to ask for it; these
+        # three arms pin the two answers it must keep apart -- absent, and present-but-unsized.
+        t_dims, t_tt, t_raw = Q.tensor(g, "blk.0.ffn_gate.weight")
+        check(t_dims == (K, N) and t_tt == Q.Q4_0 and t_raw == raw,
+              "tensor(name) returns the one tensor asked for, bytes intact", K, N)
+        try:
+            Q.tensor(g, "blk.0.norm.weight")
+            check(False, "tensor() refuses an unsized type by name", K, N)
+        except SystemExit as e:
+            check("blk.0.norm.weight" in str(e) and "cannot size" in str(e),
+                  "tensor() refuses an unsized type by name", K, N)
+        try:
+            Q.tensor(g, "blk.0.nope.weight")
+            check(False, "tensor() refuses an absent tensor by name", K, N)
+        except SystemExit as e:
+            check("no tensor named blk.0.nope.weight" in str(e),
+                  "tensor() refuses an absent tensor by name", K, N)
+        vals, dgot = Q.read_q4_0(raw, K, N)
+        check(vals.shape == (K, N) and dgot.shape == (K // 32, N), "q4_0 decode shapes", K, N)
+        want = np.empty((N, K // 32, 32), np.float32)
+        want[:] = (codes.astype(np.float32) - 8.0) * d.astype(np.float32)[:, :, None]
+        err = float(np.abs(vals.T.reshape(N, K // 32, 32) - want).max())
+        check(err == 0.0, f"q4_0 decodes to the values it was built from (max|err| {err:.3e})", K, N)
+
+
 def main():
     test_geometry()
     test_bijection()
     test_roundtrip()
     test_ptq1_0()
+    test_q4_0_source_reader()
     if FAIL:
         for f in FAIL[:20]:
             print("FAIL", f)
         print(f"q4nx_pb16i_test: {len(FAIL)} failure(s)")
         return 1
+    # A green line must say what was NOT checked: this suite's only reader test needs a model that CI does not carry,
+    # and the rest of the file drives synthetic data against the header's rule.
+    if SKIPPED:
+        print(f"q4nx_pb16i_test: ok ({len(SKIPPED)} SKIPPED - {SKIPPED[0]})")
+        return 0
     print("q4nx_pb16i_test: ok")
     return 0
 

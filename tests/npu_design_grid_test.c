@@ -25,8 +25,10 @@
 // built -- and timed on the array -- at full_i8_{QKV,O,GU,D}_K1024_N{1536,1024,9728,1024}_m16.
 // Before this, the forward derived K=896/N=1152, probed names no kernel has, and dequantised a
 // 1024-column tensor at 896 columns (which the chunk decoder refuses outright).
+#include "q4nx_dequant.h"
 #include "q4nx_pack.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,6 +149,194 @@ static void oga_geometry(void) {
         }
         free(src);
         free(B);
+    }
+
+    /* THE BYTE-EXACT TARGET for a fused weight packer (engine #1416). The non-folded route currently materialises
+     * B[K][N] in float32 (356 MB per projection on a 27B model) and then quantises it; the fix is to produce the int8
+     * image directly from the container's tiles without the float matrix. That fix can only be argued as "byte-exact"
+     * if the two-step composition it replaces is pinned first, which is what this does: assemble from crafted
+     * projections, quantise, and assert every code and scale against an independently computed expectation plus a
+     * literal golden of the first codes. A fused implementation has to reproduce all three. */
+    if (o) {
+        const int K = o->K, N = o->N;
+        float* src = calloc((size_t)896 * K, sizeof(float));
+        float* B = malloc((size_t)K * N * sizeof(float));
+        int8_t* out = malloc((size_t)K * N);
+        float* scales = malloc((size_t)N * sizeof(float));
+        check(src && B && out && scales, "the assemble/pack fixture allocates");
+        if (src && B && out && scales) {
+            for (int r = 0; r < 896; r++)
+                for (int k = 0; k < K; k++)
+                    src[(size_t)r * K + k] = (k < 896) ? (float)((r * 7 + k * 13) % 23) * 0.05f - 0.5f : 0.0f;
+            Q4nxProjections p;
+            memset(&p, 0, sizeof p);
+            p.o = src;
+            check_int(q4nx_assemble_B(o, &p, B), 0, "fixture: assemble_B accepts the crafted O design");
+            /* ld is the ROW stride of the code image: q4nx_pack_B_int8 writes out[i * ld + j] with j < N, so it must
+             * be >= N. It happens that K == N in this fixture; passing K would be the same bug #1713 hit as a silent
+             * self-overwrite on a non-square grid. */
+            const int ld = N;
+            const float sout = q4nx_pack_B_int8(B, K, N, out, ld, scales);
+            /* expectation, computed here rather than read back from the implementation */
+            int bad_code = 0, bad_scale = 0;
+            float sum_scale = 0.0f;
+            for (int col = 0; col < N; col++) {
+                float amax = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    const float a = fabsf(B[(size_t)k * N + col]);
+                    if (a > amax) amax = a;
+                }
+                /* The contract, not my assumption: an all-zero column (every pad column of this design) takes the
+                 * implementation's amax floor of 1.0, so its scale is 1/127 rather than 0. A fused packer has to
+                 * reproduce that floor too, which is why it is asserted rather than skipped. */
+                if (amax < 1e-12f) amax = 1.0f;
+                const float ws = amax / 127.0f;
+                sum_scale += ws;
+                if (fabsf(scales[col] - ws) > 1e-6f * (ws > 1.0f ? ws : 1.0f)) bad_scale++;
+                for (int k = 0; k < K; k++) {
+                    int q = (int)lroundf(B[(size_t)k * N + col] / ws);
+                    if (q > 127) q = 127;
+                    else if (q < -127) q = -127;
+                    if (out[(size_t)k * K + col] != (int8_t)q) bad_code++;
+                }
+            }
+            check_int(bad_scale, 0, "pack_B -> every column scale is max|B_col|/127");
+            check_int(bad_code, 0, "pack_B -> every code is round(B / column scale), clamped to +-127");
+            check(fabsf(sout - sum_scale / (float)N) < 1e-6f,
+                  "pack_B -> the returned scale is the mean of the column scales");
+            /* The literal golden, ASSERTED rather than printed. This is the one check that does not derive from what
+             * q4nx_assemble_B happened to produce, so it is what a fused packer -- which never goes through assemble -- is
+             * measured against; a `check(x, x)` here would pass whatever the composition did. */
+            /* column 0, rows 0..3 (the codes are stored row-major at stride ld), not "codes[0..3]" as the label used to say */
+            check(out[0] == -106 && out[ld] == 32 && out[2 * ld] == -74 && out[3 * ld] == 64,
+                  "fixture: column 0 rows 0..3 are the pinned golden (-106 32 -74 64)");
+            check(fabsf(scales[0] - 0.004724f) < 5e-7f && fabsf(scales[1] - 0.004724f) < 5e-7f,
+                  "fixture: scales[0..1] are the pinned golden (0.004724)");
+            check(fabsf(sout - 0.005118f) < 5e-7f, "fixture: the mean column scale is the pinned golden (0.005118)");
+            printf("  assemble->pack fixture: K=%d N=%d  codes[0..3]=%d %d %d %d  scales[0..1]=%.6f %.6f  mean=%.6f\n",
+                   K, N, (int)out[0], (int)out[K], (int)out[2 * K], (int)out[3 * K], (double)scales[0],
+                   (double)scales[1], (double)sout);
+        }
+        free(src);
+        free(B);
+        free(out);
+        free(scales);
+    }
+
+    /* THE FUSED PATH (engine #1416): chunks -> int8 without the K x N float buffer. It has to be byte-identical to
+     * `q4nx_dequant_tensor() -> q4nx_pack_B_int8()`, so this runs BOTH on the same synthetic tiles and compares the codes,
+     * the scales and the returned mean. A synthetic 32x256 q4_1 tile is 5120 B of (16 B scale/zero header + 128 nibble
+     * pairs) x 8 groups; the encoder here is only required to be a *valid* q4_1 tile, not a meaningful weight. */
+    {
+        const int K = 64, N = 512;                     /* 2 x 2 tiles */
+        const size_t ntr = (size_t)(K / 32), ntc = (size_t)(N / 256);
+        uint8_t* tiles = malloc(ntr * ntc * 5120);
+        float* B = malloc((size_t)K * N * sizeof(float));
+        int8_t* ref = malloc((size_t)K * N);
+        int8_t* fused = malloc((size_t)K * N);
+        float* sc_ref = malloc((size_t)N * sizeof(float));
+        float* sc_fused = malloc((size_t)N * sizeof(float));
+        check(tiles && B && ref && fused && sc_ref && sc_fused, "fused fixture allocates");
+        if (tiles && B && ref && fused && sc_ref && sc_fused) {
+            for (size_t t = 0; t < ntr * ntc; t++)
+                for (size_t i = 0; i < 5120; i++)
+                    tiles[t * 5120 + i] = (uint8_t)((i * 37 + t * 91) & 0xFF);
+            /* The reference is `dequant_any`'s own call for this chunk kind: q4nx_dequant_tensor_chunked with
+             * chunk_bytes = 5120. Plain q4nx_dequant_tensor() dispatches differently (it sniffs the byte count for a
+             * packed grid) and left part of B unwritten, which the first version of this test read as a mismatch in the
+             * fused path -- it was the reference that was wrong for these tiles. */
+            check_int(q4nx_dequant_tensor_chunked(tiles, ntr * ntc * 5120, K, N, 5120, B), 0,
+                      "fused: the reference path dequantises the synthetic tiles");
+            const int ld = N;   // q4nx_pack_B_int8 writes out[i * ld + j] with i < K, j < N, so ld must be >= N
+            const float m_ref = q4nx_pack_B_int8(B, K, N, ref, ld, sc_ref);
+            const int rc = q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120, K, N, fused, ld, sc_fused);
+            check_int(rc, 0, "fused: q4nx_pack_q4_1_tiles_to_int8 accepts the same tiles");
+            int bad_code = 0, bad_scale = 0;
+            for (int i = 0; i < K * N; i++)
+                if (fused[i] != ref[i]) {
+                    if (bad_code < 6)
+                        printf("    mismatch at row %d col %d: fused %d ref %d\n", i / N, i % N, (int)fused[i],
+                               (int)ref[i]);
+                    bad_code++;
+                }
+            for (int j = 0; j < N; j++) if (sc_fused[j] != sc_ref[j]) bad_scale++;
+            check_int(bad_code, 0, "fused: every code is byte-identical to dequant -> pack");
+            check_int(bad_scale, 0, "fused: every column scale is byte-identical as well");
+            /* the mean the two-step path returns is the mean of the same scales, so it agrees by construction */
+            double ssum = 0.0;
+            for (int j = 0; j < N; j++) ssum += (double)sc_fused[j];
+            check(fabsf((float)(ssum / N) - m_ref) < 1e-6f,
+                  "fused: the mean column scale matches the two-step return value");
+            /* a wrong chunk kind is refused by name rather than quantised from garbage */
+            check_int(q4nx_pack_q4_1_tiles_to_int8(tiles, ntr * ntc * 5120 - 1, K, N, fused, ld, sc_fused), -2,
+                      "fused: a non-q4_1 byte count returns -2 so the caller keeps the two-step path");
+            printf("  fused chunks->int8: K=%d N=%d  %d codes and %d scales byte-identical to dequant->pack\n",
+                   K, N, K * N, N);
+        }
+        free(tiles); free(B); free(ref); free(fused); free(sc_ref); free(sc_fused);
+    }
+
+    /* THE HEAD TILE'S LAYOUT CONTRACT (engine #1716, spec before implementation). The forward packs the lm head one
+     * tile at a time from a scratch buffer it fills as
+     *
+     *     bt[k * T + (n - n0)] = lm_at(n, k)          // K = kpad rows, T columns per tile
+     *     packB_into(bo, bt.data(), kpad, T, ...)     -> packB_blocked -> q4nx_pack_B_int8(bt, kpad, T, ...)
+     *
+     * A head-image cache has to reproduce that byte for byte, so this pins the contract it must match: one scale per
+     * COLUMN of the tile (T of them), codes in row-major order, and the axis order load-bearing -- which is the property
+     * a transposed or row/column-swapped builder would get wrong while still producing plausible numbers. */
+    {
+        const int kpad = 96, T = 64;                 /* a head tile: kpad along K, T along N */
+        float* bt = malloc((size_t)kpad * T * sizeof(float));
+        int8_t* codes = malloc((size_t)kpad * T);
+        float* scales = malloc((size_t)T * sizeof(float));
+        check(bt && codes && scales, "head tile: the layout fixture allocates");
+        if (bt && codes && scales) {
+            for (int k = 0; k < kpad; k++)
+                for (int n = 0; n < T; n++) bt[(size_t)k * T + n] = (float)((k * 13 + n * 7) % 97) * 0.01f - 0.5f;
+            const float m = q4nx_pack_B_int8(bt, kpad, T, codes, T, scales);
+            /* (a) one scale per column, and it is that column's absmax/127 (with the all-zero floor) */
+            int bad_scale = 0;
+            for (int n = 0; n < T; n++) {
+                float amax = 0.0f;
+                for (int k = 0; k < kpad; k++) {
+                    const float a = fabsf(bt[(size_t)k * T + n]);
+                    if (a > amax) amax = a;
+                }
+                if (amax < 1e-12f) amax = 1.0f;
+                if (fabsf(scales[n] - amax / 127.0f) > 1e-7f) bad_scale++;
+            }
+            check_int(bad_scale, 0, "head tile: one scale per COLUMN of the tile (T of them), absmax/127");
+            double ssum = 0.0;
+            for (int n = 0; n < T; n++) ssum += (double)scales[n];
+            check(fabsf((float)(ssum / T) - m) < 1e-6f, "head tile: the returned mean is over the T columns");
+            /* (b) codes are row-major over (k, n) and match the column's scale */
+            int bad_code = 0;
+            for (int k = 0; k < kpad; k++)
+                for (int n = 0; n < T; n++) {
+                    int want = (int)lroundf(bt[(size_t)k * T + n] / scales[n]);
+                    if (want > 127) want = 127;
+                    else if (want < -127) want = -127;
+                    if (codes[(size_t)k * T + n] != (int8_t)want) bad_code++;
+                }
+            check_int(bad_code, 0, "head tile: codes are row-major over (k, n) with the column's scale");
+            /* (c) the axis order is load-bearing: a transposed scratch is a DIFFERENT image, so a builder that swaps
+             *     rows and columns cannot pass by producing plausible numbers. */
+            float* tr = malloc((size_t)kpad * T * sizeof(float));
+            int8_t* codes_t = malloc((size_t)kpad * T);
+            float* scales_t = malloc((size_t)kpad * sizeof(float));   /* K/N swap: the transposed image has kpad columns */
+            if (tr && codes_t && scales_t) {
+                for (int k = 0; k < kpad; k++)
+                    for (int n = 0; n < T; n++) tr[(size_t)n * kpad + k] = bt[(size_t)k * T + n];
+                q4nx_pack_B_int8(tr, T, kpad, codes_t, kpad, scales_t);
+                int differ = 0;
+                for (int i = 0; i < kpad * T; i++) if (codes_t[i] != codes[i]) differ++;
+                check(differ > kpad * T / 4, "head tile control: the transposed scratch is a different image");
+                free(tr); free(codes_t); free(scales_t);
+            }
+            printf("  head tile: kpad %d x T %d, %d codes, %d column scales, layout pinned\n", kpad, T, kpad * T, T);
+        }
+        free(bt); free(codes); free(scales);
     }
 
     /* QKV: the three projections are stacked along N at their real row counts and the tail of the

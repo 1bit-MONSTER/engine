@@ -405,6 +405,18 @@ quant, ctx 16384, `-fa on --cache-reuse 0`, 2026-11-05 16:06 and 17:11, `~/lb/su
 llamasrv-q31-prep/` and `...-ub512/`), so the cap was one of the limiters and not a detail. It is
 still not the whole gap.
 
+That 2.03x is a **Flash-Next result at ctx 16384 with this quant**, not a general rule about chunk
+size — and on a different model the direction reverses. On the dense prefill path `-ub 512` is
+already the optimum for pp4096: **2733-2765 tok/s** at 512 against **2442** at 256, **2182** at 1024,
+**1926** at 2048 and **1397** at 4096, and sclk is *higher* at 4096, so the fall-off is a
+memory-footprint cliff rather than a clock effect. Treat `-ub` as a per-model lever to be measured,
+never as "bigger is faster": on Flash-Next with 512 experts the MoE amortisation pays, on the dense
+path the footprint does not. Source for the dense rows:
+`~/okf/systems/1bit-monster/research/prefill-remainder-path-and-chunk-size.md` (commit `f8a4b9477`),
+which also closes the adjacent question — the hip-hrx dense-prefill add-on is on the serving path and
+is ~1.7x the generic fallback (forcing it off with `DENSE_TAKE_OFF=1` drops pp512 from 3462 to
+2002 tok/s), not a slow path to be avoided.
+
 Measured on Strix Halo, engine `0d0c846` + llama.cpp `8ee20a0`, `-ngl 99 -fa 1`, 2026-10-27T02:38Z,
 3 runs (`samples_ts` 287.384 / 286.933 / 285.578):
 
@@ -668,10 +680,40 @@ It registered the file mapping as a KFD userptr, which the kernel always write-f
 its mtime, and never finished on large models while writeback kept invalidating it (engine#1339). HRX's repacked copy of the
 dense weights still sits next to the device buffer in GTT.
 
+**What was tried to remove that duplicate, and why it does not work (2026-11-09).** The obvious route is to stop placing the
+native range on the device at all and let HRX repack on demand: `-ot '<pattern>=CPU'` does *not* put a weight in a plain CPU
+buffer — the loader resolves it through `select_weight_buft()` over `make_cpu_buft_list()`, which contains the first device's
+**host** buffer type (`HRX0_HOST` here), so the weight becomes host-resident *with* `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` and the
+repack path is allowed (`binding.weight` is that flag, engine#969). Measured, three arms in one ticket, Qwen3-4B-Q4_K_M,
+`-p 512 -n 32`, own peak `drm-total-gtt` from `bo_trace`:
+
+| arm | BO bytes | own peak GTT | prefill |
+|---|---:|---:|---:|
+| everything on the device | 5,867.8 MiB | 5,495 MiB | 3,241 tok/s |
+| host-placed `ffn_down` + repack | 7,743.8 MiB | 6,459 MiB | 3,879 tok/s |
+
+The native range really does shrink — the whole-model buffer drops **2,376.0 → 1,786.0 MiB (−590)** — but the repacked and parked
+copies cost more than the range they displace: a new **896.0 MiB** class (`HostWeightCache`'s reserved-plus-parked slots), **37 ×
+20 MiB = 740.0 MiB** of per-weight buffers, and two extra 306.4 MiB tensors. Isolated by holding the load mode fixed, placement
+alone is **+360 MiB of GTT and +972 MiB of BO bytes for 0.1 % speed**. So the duplicate is not removable by moving weights to the
+host while their packed copies are device-resident; it would need the packed side to live somewhere it does not today. The
+repacked-prefill kernel ([llama.cpp #250](https://github.com/1bit-MONSTER/llama.cpp/pull/250),
+`GGML_HRX_Q6K_PACKED_PREFILL`) stays **opt-in** for the same reason: it is numerically free and speed-neutral, so it buys nothing
+on its own.
+
 ### Measuring on `HRX0`: what makes a number citable
 
 Numbers measured on this device swing far more between *runs* than between *files*, so the harness matters as much as the arm. Everything below is
 either a guardrail the engine prints or an effect measured on this box on 2026-11-07/08; where another lane measured it first, they are named.
+
+**Before any of the numbered items below: pin the load mode across the arms, or the comparison is measuring `-lm`.** `llama-bench -lm none` (read the weights, no
+mmap) is **1.1745x** the prefill of the default `-lm mmap` on the same file and shape (3,181.97 → 3,737.19 tok/s pp512,
+Qwen3-4B-Q4_K_M, ABBA order A C C A with `REPS=3` so each arm gets one cold and one warm slot; per-pair ratios 1.199 and 1.150,
+decode 0.9835x as the control, per-pair spread 1.001x). It is not free: **+604 MiB of own peak GTT** and +903.9 MiB of BO bytes,
+because three more tensors become device-resident, and it costs the mmap load (`-lm none` reads the whole file). `-lm` is a
+`llama-bench` flag, not an engine one. Why it is faster is **not established** (first-touch faults, or one contiguous extent
+instead of file-backed pages, are both consistent with what was measured) — so treat it as a variable to hold fixed, not a
+setting to ship (engine#1668).
 
 **1. The GTT pool is finite and it is shared.** Every launch prints the guardrail line:
 
@@ -680,7 +722,11 @@ ggml_hrx: HRX0 guardrail: GTT total 120.0 GiB, in use 40.7 GiB, ceiling 104.0 Gi
           pool budget 63.3 GiB - a launch that needs more is refused here rather than faulting the device (engine #680)
 ```
 
-`pool budget = ceiling - in use`, and a launch needing more than that is **refused**, not faulted. So the first thing a measurement needs is the budget,
+`pool budget = ceiling - in use`, and a **buffer allocation** needing more than that is refused at the allocator, not faulted. What the guardrail
+charges is the ggml tensor buffers — the runtime's transient arena (the per-launch scratch a large case actually grows into), its host-visible
+staging and its command-program buffers allocate **uncharged**, so this line is a rule about tensor-buffer allocations and not a promise that a launch
+cannot exhaust the pool (engine #1711, measured 2026-11-09; that is also why the #1417 crash is neither prevented by the guardrail nor cheap to
+reproduce). So the first thing a measurement needs is the budget,
 not the file: two lanes independently arrived at the same rule from opposite sides — the Zyphra lane refuses below a 12 GiB budget for a 5.8 GiB model, and
 the architecture lane refuses below `3.0 x weights + 2 GiB` (an 8B row was refused at budgets of 13.6 / 13.5 / 10.8 GiB). Over eight hours of this box's
 evening the budget sat at **14-17 GiB** while long-lived services held the rest, which is why runs "that worked yesterday" crawl today. Two `llama-server`

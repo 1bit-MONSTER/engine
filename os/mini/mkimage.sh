@@ -501,6 +501,11 @@ cp /etc/mke2fs.conf "$root/etc/mke2fs.conf"
 # to the stick instead of booting the disk.
 copy_elf /usr/bin/efibootmgr
 cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/1bit-release-check"
+# engine#823: the plug test's instrument has to be ON the medium. The capture answers "did a device appear on
+# this port" from the booted system, which is the only place a plug can be observed - a tool that lives only in
+# the source tree cannot be run by the person holding the stick, so the issue would stay open for want of a
+# script rather than for want of hardware.
+install -m 0755 "$src/tools/xhci_boot_capture.sh" "$root/bin/1bit-xhci-capture"
 install -m 0755 "$here/board.sh" "$root/usr/sbin/1bit-board"
 mkdir -p "$root/etc/1bit"
 install -m 0644 "$here/power.conf.example" "$root/etc/1bit/power"

@@ -1110,7 +1110,10 @@ add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4
 # Listed explicitly like npu_pack_test above so the test needs no NPU library to build.
 add_executable(q4nx_vision_pos_test tests/q4nx_vision_pos_test.cpp npu/forward/src/q4nx_vision_pos.cpp)
 add_executable(q4nx_vision_rope_test tests/q4nx_vision_rope_test.cpp npu/forward/src/q4nx_vision_rope.cpp)
-add_executable(q4nx_vision_block_test tests/q4nx_vision_block_test.cpp npu/forward/src/q4nx_vision_block.cpp npu/forward/src/q4nx_vision_rope.cpp)
+# engine#1930: the block test calls `pos_embed` too (a block is rope AND position embedding), so it needs that source as
+# well -- without it the link fails with "undefined reference to q4nx_vision::pos_embed" and the build job dies before any
+# test runs.
+add_executable(q4nx_vision_block_test tests/q4nx_vision_block_test.cpp npu/forward/src/q4nx_vision_block.cpp npu/forward/src/q4nx_vision_pos.cpp npu/forward/src/q4nx_vision_rope.cpp)
 add_executable(q4nx_vision_tower_test tests/q4nx_vision_tower_test.cpp npu/forward/src/q4nx_vision_block.cpp npu/forward/src/q4nx_vision_pos.cpp npu/forward/src/q4nx_vision_rope.cpp)
 target_include_directories(q4nx_vision_tower_test PRIVATE npu/forward/include)
 add_test(NAME q4nx_vision_tower COMMAND q4nx_vision_tower_test)

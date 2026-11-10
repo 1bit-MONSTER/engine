@@ -1896,7 +1896,16 @@ static TailHeadLocate locate_tail_head(const Fconst& fc, int64_t tail_off, int64
     int64_t best_slack = -1, second_slack = -1;
     double best = -2.0, second = -2.0;
     int64_t tried = 0;
-    for (int64_t cand = (plan.first - base) / tile; cand <= k0; ++cand) {
+    // engine#1773 review: the search window is anchored on the zero run, so when the file ends in NON-zero junk after
+    // the head the window slides forward and can EXCLUDE the true start (`base`, the envelope's end) -- arm (c2) builds
+    // exactly that shape and blessed the span without noticing the one placement that matters was outside it. `base` is
+    // known independently of the zero run, so it is always a candidate; the slack window is kept for the rest.
+    std::vector<int64_t> cands;
+    cands.push_back(0);                                  // the head begins right after the envelope
+    for (int64_t cand = (plan.first - base) / tile; cand <= k0; ++cand)
+        if (cand != 0) cands.push_back(cand);
+    for (size_t ci = 0; ci < cands.size(); ++ci) {
+        const int64_t cand = cands[ci];
         const int64_t s = base + cand * tile;
         if (s < base || s + rows * tile > int64_t(fc.size)) continue;
         std::vector<TileW> tiles;
@@ -2059,6 +2068,22 @@ bool tail_head_selftest(std::string* why) {
         if (loc.slack != 1) return fail("it was located at slack " + std::to_string(loc.slack) + ", not 1");
         if (!loc.verified) return fail("and it was not verified");
         if (loc.runner >= kTieCorr) return fail("the runner-up also passed the threshold (" + std::to_string(loc.runner) + ")");
+    }
+    // (e) engine#1773 review: junk AFTER the head, then zeros. The zero run then sits 18 tiles past the envelope's end,
+    // so `plan_tail_head`'s window -- anchored on the zero run and walking backwards -- starts at `base + 10*tile` and
+    // the head's true placement at `base` is OUTSIDE it. Arm (b) cannot see this: one junk tile before the head leaves
+    // the window clamped to `base`. Only a candidate list that always contains the envelope's end finds the head here.
+    {
+        std::vector<uint8_t> buf = build(0, 0, nullptr);
+        buf.insert(buf.end(), size_t(tile) * 18, 0x11);   // junk after the head ...
+        buf.insert(buf.end(), size_t(tile) * 3, 0);       // ... then zeros: last = base + 18 tiles, first = base + 10
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, true);
+        if (loc.off < 0)
+            return fail("a head followed by junk and then zeros was not located: " + loc.why);
+        if (loc.off != base)
+            return fail("a head followed by junk and then zeros was located at " + std::to_string(loc.off) +
+                        " B, not the envelope's end " + std::to_string(base));
     }
     // (c) untied + padding: refused rather than taken
     {

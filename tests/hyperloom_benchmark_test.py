@@ -202,9 +202,30 @@ def main():
     # below stands in for a box that exposes nothing.
     box = bench.box_conditions()
     assert box["tctl_c"] is None or 20.0 < box["tctl_c"] < 120.0, box
-    assert box["gtt_used_gib"] is not None and box["gtt_total_gib"] is not None, box
-    assert 0.0 <= box["gtt_used_gib"] <= box["gtt_total_gib"], box
+    # The GTT counters exist only on a box with the amdgpu device. A CI container has none (engine#2023's first
+    # registered run: AssertionError on gtt_used_gib None), and there the rule under test is the other half of the
+    # sentence above: absent is a null. The numbers themselves are checked on a fake device below, so they are
+    # covered on every box and not only on this one.
+    if (bench.GPU_SYSFS / "mem_info_gtt_total").exists():
+        assert box["gtt_used_gib"] is not None and box["gtt_total_gib"] is not None, box
+        assert 0.0 <= box["gtt_used_gib"] <= box["gtt_total_gib"], box
+    else:
+        assert box["gtt_used_gib"] is None and box["gtt_total_gib"] is None, box
     assert box["mem_available_gib"] is not None and box["mem_available_gib"] > 0, box
+    real_gpu = bench.GPU_SYSFS
+    with tempfile.TemporaryDirectory() as tmp:
+        bench.GPU_SYSFS = pathlib.Path(tmp)
+        try:
+            none = bench.box_conditions()
+            assert none["gtt_used_gib"] is None and none["gtt_total_gib"] is None, none   # a device with no counters
+            (pathlib.Path(tmp) / "mem_info_gtt_used").write_text(f"{3 * 2 ** 30}\n", encoding="ascii")
+            (pathlib.Path(tmp) / "mem_info_gtt_total").write_text(f"{120 * 2 ** 30}\n", encoding="ascii")
+            fake = bench.box_conditions()
+            assert fake["gtt_used_gib"] == 3.0 and fake["gtt_total_gib"] == 120.0, fake  # bytes -> GiB
+            (pathlib.Path(tmp) / "mem_info_gtt_used").write_text("not a number\n", encoding="ascii")
+            assert bench.box_conditions()["gtt_used_gib"] is None                         # unreadable is null, not 0
+        finally:
+            bench.GPU_SYSFS = real_gpu
     # The hwmon channel is found by label, not by a hardcoded index: the k10temp Tctl has come back as
     # hwmon2 and as hwmon4 across six reboots in three days. A root with no Tctl label yields null.
     real_root = bench.HWMON_ROOT

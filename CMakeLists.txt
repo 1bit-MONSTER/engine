@@ -1250,8 +1250,10 @@ target_link_libraries(npu_derive_designs_dump PRIVATE m)
 # the test compares it against the two-step dequant+pack, so both live here.
 # q4nx_pack_blocked.cpp is here because the head-tile identity arm (engine#1716) compares the blocked packer the forward
 # actually calls against the reference; the test links both. It is C++, so CMake switches this target's linker to CXX.
+# q4nx_head_image.c is the image cache's file format (engine#1716's cache slice, this branch): the identity arm above pins
+# what the image must contain, this one pins that what is written and read back is byte-identical to it.
 add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c
-                                  npu/forward/src/q4nx_pack_blocked.cpp)
+                                  npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)

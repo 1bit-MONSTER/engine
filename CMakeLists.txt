@@ -555,21 +555,6 @@ if(ONEBIT_HRX)
             # hrx skips without a gfx1151 (ONEBIT_HRX_E2E_TARGETS)
             set_tests_properties(serve_e2e_${_dev} PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
-        # engine#1779 fault 1 (FLM 1.0.12: "a server that stopped accepting connections after clients hung up"): a
-        # client that disconnects mid-response, repeated, then a fresh client must still be served. The assertion is
-        # about the LISTENER, so an interrupted request is allowed to get nothing. `cpu` on purpose: the fault is
-        # server logic, and the issue's rule is that these four are tested without a device where possible.
-        add_test(NAME serve_client_hangup_cpu
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_client_hangup_test.sh $<TARGET_FILE:onebit>
-                         ${ONEBIT_SERVE_TEST_GGUF} cpu)
-        set_tests_properties(serve_client_hangup_cpu PROPERTIES SKIP_RETURN_CODE 77)
-        # engine#1779 fault 2 (FLM 1.0.12: "Qwen3.5 answering `//////` after hitting the context limit"): a prompt that
-        # fills the context is served, the next turn cannot fit, and the answer must be a refusal or a truncated-but-clean
-        # reply - never one character repeated. Also `cpu`: the fault is in the request path's clamp, not in a kernel.
-        add_test(NAME serve_context_limit_cpu
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh $<TARGET_FILE:onebit>
-                         ${ONEBIT_SERVE_TEST_GGUF} cpu)
-        set_tests_properties(serve_context_limit_cpu PROPERTIES SKIP_RETURN_CODE 77)
         # Placement must not change the answer (engine #674): the same greedy prompt through the CPU, through the device
         # with every layer assigned to the CPU, and fully offloaded, compared byte for byte.
         add_test(NAME hrx_cpu_weight_parity
@@ -585,7 +570,39 @@ if(ONEBIT_HRX)
                  COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_kvshare_e2e.sh "${ONEBIT_HRX_SERVER}" "${ONEBIT_SERVE_TEST_GGUF}" "${ONEBIT_KVSHARE_PREFILL}")
         set_tests_properties(hybrid_kvshare_e2e PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+
 endif()
+
+    # engine#1779: these two are registered OUTSIDE both `if(ONEBIT_SERVE_TEST_GGUF)` and `if(ONEBIT_HRX)` on purpose.
+    # Inside the GGUF guard they did not exist in CI at all (a configure-time cache path CI never sets: the build job
+    # runs 164 tests and none of the serve_* family is among them, so a gap in the family looked like coverage), and
+    # inside the HRX guard they would only exist for an HRX build while ci.yml configures without ONEBIT_HRX. They skip
+    # (77) when the model path is empty, which is a visible skip in the CI table, not an absent test. `onebit` is an
+    # unconditional target (CMakeLists.txt:97), so $<TARGET_FILE:onebit> resolves in any configuration.
+    # engine#1779 fault 1 (FLM 1.0.12: "a server that stopped accepting connections after clients hung up"): a
+    # client that disconnects mid-response, repeated, then a fresh client must still be served. The assertion is
+    # about the LISTENER, so an interrupted request is allowed to get nothing. `cpu` on purpose: the fault is
+    # server logic, and the issue's rule is that these four are tested without a device where possible.
+    add_test(NAME serve_client_hangup_cpu
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_client_hangup_test.sh $<TARGET_FILE:onebit>
+                     "${ONEBIT_SERVE_TEST_GGUF}" cpu)
+    set_tests_properties(serve_client_hangup_cpu PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
+    # engine#1779 fault 2 (FLM 1.0.12: "Qwen3.5 answering `//////` after hitting the context limit"): a prompt that
+    # fills the context is served, the next turn cannot fit, and the answer must be a refusal or a truncated-but-clean
+    # reply - never one character repeated. Also `cpu`: the fault is in the request path's clamp, not in a kernel.
+    add_test(NAME serve_context_limit_cpu
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh $<TARGET_FILE:onebit>
+                     "${ONEBIT_SERVE_TEST_GGUF}" cpu)
+    set_tests_properties(serve_context_limit_cpu PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
+# engine#1779 fault 3 ("wrong vectors from embed-gemma"): tested on the route where OUR code computes the vector -
+# `serve.cpp:2264 if (embed_serve::container(model))` serves a container directory in-process - not on the
+# `rag_launch()` proxy, where the numbers come from a delegated llama-server. Same registration rule as the two
+# above (outside both guards, skip 77 when unset); ONEBIT_EMBED_TEST_CONTAINER names a directory holding model.embed.
+set(ONEBIT_EMBED_TEST_CONTAINER "" CACHE PATH "1-bit encoder container (.embed dir) the embed-vector test loads")
+add_test(NAME serve_embed_vectors_cpu
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_embed_vectors_test.sh $<TARGET_FILE:onebit>
+                 "${ONEBIT_EMBED_TEST_CONTAINER}" cpu)
+set_tests_properties(serve_embed_vectors_cpu PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
 
 # ── DwarfStar is gone (owner 2026-11-01, removed 2026-11-02) ───────────────
 # `--device ds4` ran DwarfStar (third_party/ds4: antirez's CUDA kernels behind a HIP shim plus
@@ -1319,6 +1336,20 @@ add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src
                                   npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
+# engine#1779 fault 4 ("Gemma 4 tool-call parsing"): the answer parser is header-only (app/npu_answer_parser.h), so
+# this is a PURE unit test - no server, no model, no device - of the contract that header states: a template's own
+# <tool_call>{"name":...,"arguments":{...}}</tool_call> becomes a structured call with the arguments re-dumped as JSON
+# text; a call-only reply reports content_null; WITHOUT tools declared the marker stays text in content; and a
+# malformed call body is never dropped. The issue asked for name, arguments and a non-tool reply that must not be
+# parsed as one; the last two arms are the loss-proofing the header promises at :193 and :216-221.
+add_executable(npu_answer_parser_test tests/npu_answer_parser_test.cpp)
+target_include_directories(npu_answer_parser_test PRIVATE app)
+target_link_libraries(npu_answer_parser_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_answer_parser COMMAND npu_answer_parser_test)
+# direction B (tools/ci/ci_targets_check.py, engine#1595): a target no ci.yml line names is "never built", and its test
+# then reports "Not Run" instead of running. `ci.yml` is a workflow file no lane can patch, so the documented hook is the
+# one this tree already uses for onebit_npu_forward_syntax: add_dependencies(onebit <target>), which the checker follows.
+add_dependencies(onebit npu_answer_parser_test)
 # engine#1781's oracle (merged in #1813) arrived with its test file but no registration, so the comparator behind
 # NPU_BATCH_CHECK -- "every drafted position's logits, bitwise" instead of one argmax at the last row -- was neither
 # built nor run while every job stayed green. Header-only, so the test needs no link libraries; host-only, so it needs no

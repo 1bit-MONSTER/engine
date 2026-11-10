@@ -1275,11 +1275,13 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
         }
     if (separate.size() == 1) return int(*separate.begin());
     if (separate.size() > 1) return 0;
-    // else a fused gate_up: ONE node covers gate and up, so its N is 2*w and the down projection's K is the same 2*w --
-    // the agreeing value is 2*w and the FFN width is half of it
+    // else a fused gate_up: ONE node covers gate and up, so its N is 2*w while the down projection reads the *w*-wide
+    // gated product, i.e. its K is w. The witness is "the gate's N is twice the down projection's K", and the FFN
+    // width is that K (engine#1756: read the other way round, a named fused graph derived nothing at all and an
+    // opaque one returned q_dim/2 -- a silently wrong number from a function whose contract is to refuse).
     std::set<int64_t> fused;
     for (const int64_t dk : down_k)
-        if (dk % 2 == 0 && gate_n.count(dk)) fused.insert(dk / 2);
+        if (gate_n.count(2 * dk)) fused.insert(dk);
     if (fused.size() != 1) return 0;
     return int(*fused.begin());
 }

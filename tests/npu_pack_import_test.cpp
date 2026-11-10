@@ -2735,13 +2735,32 @@ void test_im_from_node_attrs(const std::string& root) {
              mm_named(attn + "o_proj.MatMulNBits.qweight", "q", 4096, 2560),
              mm_named(attn + "k_proj.MatMulNBits.qweight", "h", 2560, 2048),
              mm_named(attn + "v_proj.MatMulNBits.qweight", "h", 2560, 2048),
+             // down_proj reads the *gated product*: K = 9728 = w, while the fused gate_up's N = 19456 = 2w. The fixture
+             // used to give down_proj K = 19456 -- a shape no model has -- which is why the backwards rule (engine#1756)
+             // still returned the right number here and nothing caught it.
              mm_named(mlp + "gate_up_proj.MatMulNBits.qweight", "h", 2560, 19456),
-             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 19456, 2560)});
+             mm_named(mlp + "down_proj.MatMulNBits.qweight", "a", 9728, 2560)});
     put_file((dir / "model2.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", wider)}));
     const int im2 = pi::intermediate_size_from_graph((dir / "model2.onnx").string(), 2560);
     std::printf("im-from-node-attrs: q_dim 4096 > hidden 2560, fused gate_up -> %d (must not be 4096)\n", im2);
     check(im2 == 9728, "im-from-node-attrs: wider attention does not become the FFN width; the fused pair gives 9728 (" +
                            std::to_string(im2) + ")");
+
+    // The same shapes with OPAQUE names (n0..n5): no role name for excluded() to work from, so the derivation rests
+    // entirely on the structure. This is the arm that caught the backwards rule (engine#1756): it returned q_dim/2 =
+    // 2048 here -- a wrong intermediate_size, not a refusal -- because q_proj's N (4096) is also o_proj's K.
+    const std::string opaque = pb::graph(
+        {}, {mm_named("n0", "h", 2560, 4096),
+             mm_named("n1", "h", 2560, 2048),
+             mm_named("n2", "h", 2560, 2048),
+             mm_named("n3", "q", 4096, 2560),
+             mm_named("n4", "h", 2560, 19456),
+             mm_named("n5", "a", 9728, 2560)});
+    put_file((dir / "model4.onnx").string(), pb::model({}, {pb::if_node("cond", "inputs_embeds", "logits", "else_branch", opaque)}));
+    const int im4 = pi::intermediate_size_from_graph((dir / "model4.onnx").string(), 2560);
+    std::printf("im-from-node-attrs: opaque names, q_dim 4096, fused gate_up -> %d (must be 9728, not 2048)\n", im4);
+    check(im4 == 9728, "im-from-node-attrs: with opaque names the fused pair still gives 9728, not q_dim/2 (" +
+                           std::to_string(im4) + ")");
 
     // Attention only, wider than hidden, no FFN at all: 0, never q_dim.
     const std::string attnonly = pb::graph(

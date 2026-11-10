@@ -2514,6 +2514,69 @@ void test_fconst19_rule_table() {
     std::printf("fconst19 rule: measured row, unmeasured refusal, and the ambiguity guard all behave\n");
 }
 
+// engine#1801's reviewer asked for the test that would catch the case the fix itself found once: the canonical .fconst copy is a
+// cache whose size is the pack's own .fconst, and on this box /tmp is tmpfs, so where it lands is a RAM decision. The bug was a
+// cache directory that was never created -- every pack then fell through to /tmp and nothing noticed.
+void test_fconst_scratch_order() {
+    const auto first_with = [](const char* scratch, const char* xdg, const char* home) {
+        if (scratch) setenv("ONEBIT_FCONST_SCRATCH", scratch, 1); else unsetenv("ONEBIT_FCONST_SCRATCH");
+        if (xdg) setenv("XDG_CACHE_HOME", xdg, 1); else unsetenv("XDG_CACHE_HOME");
+        if (home) setenv("HOME", home, 1); else unsetenv("HOME");
+        const auto dirs = pi::fconst_scratch_dirs();
+        return dirs.empty() ? std::string() : dirs.front();
+    };
+    // 1. an explicit override wins, because a lane's own scratch dir is the only place it controls
+    check(first_with("/tmp/scratch-override", nullptr, "/home/x") == "/tmp/scratch-override",
+          "fconst scratch: ONEBIT_FCONST_SCRATCH is chosen first");
+    // 2. otherwise the on-disk cache directory, never the temp directory -- the whole point of engine#1801
+    check(first_with(nullptr, "/xdg-cache", "/home/x") == "/xdg-cache/1bit/fconst19",
+          "fconst scratch: XDG_CACHE_HOME/1bit/fconst19 is chosen when no override is set");
+    check(first_with(nullptr, nullptr, "/home/x") == "/home/x/.cache/1bit/fconst19",
+          "fconst scratch: HOME/.cache/1bit/fconst19 is the default -- disk, not tmpfs");
+    // 3. the temp directory must never come first: on this box that is RAM equal to the pack's .fconst
+    const auto dirs = pi::fconst_scratch_dirs();
+    check(!dirs.empty() && dirs.front().find("/tmp") != 0,
+          "fconst scratch: the first choice is not the temp directory (it was, before #1801)");
+    // 4. the bug the fix shipped once: a cache directory that does not exist must be CREATED, not skipped. Without this the loop
+    //    walked past the new first choice and every pack's 3.6 GB scratch copy landed in tmpfs anyway.
+    const std::string fresh = "/tmp/1bit-scratch-test-" + std::to_string(::getpid()) + "/nested";
+    std::system(("rm -rf /tmp/1bit-scratch-test-" + std::to_string(::getpid())).c_str());
+    check(!std::filesystem::exists(fresh) && pi::fconst_scratch_ready(fresh) && std::filesystem::is_directory(fresh),
+          "fconst scratch: a missing cache directory is created, not skipped (the #1801 first-version bug)");
+    std::system(("rm -rf /tmp/1bit-scratch-test-" + std::to_string(::getpid())).c_str());
+    // 5. and there is always somewhere to fall back to
+    check(dirs.size() >= 2, "fconst scratch: more than one candidate, so a box with no HOME still has a fallback");
+    // 6. engine#1818 review: `$TMPDIR` sits BETWEEN the cache and the literal /tmp. It was dropped by the extraction, and a
+    //    lane that points TMPDIR at disk -- which is what lanes here do, because /tmp is RAM -- then landed its scratch copy
+    //    in tmpfs whenever the cache directory was unusable. That is the outcome #1801 exists to prevent, so it is pinned.
+    {
+        const std::string tdir = "/tmp/1bit-tmpdir-test-" + std::to_string(::getpid());
+        std::system(("mkdir -p " + tdir).c_str());
+        unsetenv("ONEBIT_FCONST_SCRATCH");
+        unsetenv("XDG_CACHE_HOME");
+        unsetenv("HOME");                       // no usable cache: the case the reviewer named
+        setenv("TMPDIR", tdir.c_str(), 1);
+        const auto with_tmpdir = pi::fconst_scratch_dirs();
+        size_t at_tmpdir = with_tmpdir.size(), at_slash_tmp = with_tmpdir.size();
+        for (size_t i = 0; i < with_tmpdir.size(); ++i) {
+            if (with_tmpdir[i] == tdir) at_tmpdir = i;
+            if (with_tmpdir[i] == "/tmp") at_slash_tmp = i;
+        }
+        check(at_tmpdir < with_tmpdir.size(),
+              "fconst scratch: a TMPDIR with no override and no cache is a candidate at all (it was dropped)");
+        check(at_tmpdir < at_slash_tmp,
+              "fconst scratch: and it comes BEFORE the literal /tmp, which is RAM on this box");
+        // control: with TMPDIR unset the resolver returns /tmp, so the literal must still be there and unused twice
+        unsetenv("TMPDIR");
+        const auto no_tmpdir = pi::fconst_scratch_dirs();
+        check(std::count(no_tmpdir.begin(), no_tmpdir.end(), std::string("/tmp")) == 1,
+              "fconst scratch: with TMPDIR unset, /tmp appears exactly once (no duplicate from the resolver)");
+        std::system(("rm -rf " + tdir).c_str());
+        setenv("HOME", "/home/x", 1);           // leave the environment as the arms above expect it
+    }
+    std::printf("fconst scratch: order is override -> disk cache -> temp/cwd, pinned\n");
+}
+
 void test_qwen3_attn_sections() {
     struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
     const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
@@ -3213,6 +3276,7 @@ int main(int argc, char** argv) {
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();
+        test_fconst_scratch_order();
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);

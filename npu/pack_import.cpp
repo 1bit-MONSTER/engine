@@ -3260,7 +3260,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             const uint8_t* zp = zt ? bytes_of(*zt, z_need) : nullptr;
             uint64_t qw_need = 0;
             if (!mul_ok(groups_n, uint64_t(block) / 2, qw_need)) return false;
-            const Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
+            Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
+            // No qzeros tensor means the implicit zero point 2^(bits-1) -- the same rule the head path applies, and the
+            // one ONNX Runtime's MatMulNBits uses. Missing it here decoded every PROJECTION with zero point 0 while the
+            // head was decoded with 8, which is why the pack imported completely, served on the device, and answered
+            // gibberish on both the device and the host-GEMM path (engine#1503: "West什么呢ưởng中国联通nio…").
+            if (!zt) implicit_zp_zero(q, 4);
             // the row slice, re-tiled exactly as the whole tensor would be
             Q4 part;
             part.N = rows; part.K = K;

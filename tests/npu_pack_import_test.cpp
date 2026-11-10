@@ -1414,6 +1414,35 @@ void test_final_norm_envelope(const std::string& root) {
     fs::remove_all(out);
     const pi::Report r = pi::import_pack(dir.string(), out, allow);
     check(r.final_norm_imported, "final norm: the crafted tail envelope yields model.norm.weight");
+    /* engine#1840: the arm the CHANGES at #1793 asked for and never got. `import_external` now writes
+     * `q4nx_weight_layout` exactly as the `.fconst` path does, so a container built for the `_b8` family stops asking for
+     * untagged ELFs and reporting "missing full ELF" for files that are on disk. Nothing asserted it, so the regression
+     * could return silently while the report happily printed `declares q4nx_weight_layout "b8"`.
+     *
+     * Both directions, because the key's meaning depends on both: it is written ONLY for a non-default layout, and every
+     * container the importer wrote before that option existed has no such key. An arm that only checked the positive
+     * would leave the negative — every earlier container — free to acquire a key that changes which kernels are looked
+     * for. */
+    {
+        const auto layout_of = [](const std::string& dir) -> std::string {
+            std::ifstream f(dir + "/config.json");
+            if (!f) return "<no config.json>";
+            const nlohmann::json c = nlohmann::json::parse(f);
+            return c.contains("q4nx_weight_layout") ? c.at("q4nx_weight_layout").get<std::string>() : std::string();
+        };
+        check(layout_of(out).empty(),
+              "weight layout: a default import writes NO q4nx_weight_layout key (every earlier container depends on that)");
+        pi::Options b8 = allow;
+        b8.weight_layout = "b8";
+        const std::string out8 = out + "_b8";
+        fs::remove_all(out8);
+        const pi::Report r8 = pi::import_pack(dir.string(), out8, b8);
+        check(r8.final_norm_imported, "weight layout: the same pack imports with a declared b8 layout");
+        check(layout_of(out8) == "b8",
+              "weight layout: an import with --weight-layout b8 CARRIES the key in its container (was missing: engine#1793)");
+        std::printf("  weight layout: default import writes no key, b8 import writes \"b8\"\n");
+        fs::remove_all(out8);
+    }
     check(!r.prefill_tail_seen && !r.final_norm_crosscheck,
           "final norm: with no prefill program the cross-check is unavailable, not failed");
     if (r.final_norm_imported) {

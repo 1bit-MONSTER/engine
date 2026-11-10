@@ -1,10 +1,16 @@
-From 5d7b464a4f5b0e2ac1e9b4d3f1a2c7e8d9b0a1c2d3 Mon Sep 17 00:00:00 2001
-From: Eva Crystal <upstream@drm-misc>
-Date: Sat, 3 Oct 2026 00:00:00 +0000
+# Carried patch, NOT authored here and NOT a `git format-patch` artifact (engine#1811 review).
+#
+# Upstream change: drm-misc-next-2026-10-16 (tag 41cec5feed4687aea2a59378b271faf363c7d938),
+# commit 5d7b464a4f5b -- the 12-hex prefix is what was recorded; the full 40-hex id and the author were
+# not retained in this tree, so they are not stated. The paragraph below says the same thing.
+#
+# Applied by path (`git apply`), never by `git am`: nothing here reads these lines as authorship, and
+# an earlier version of this file DID invent them (a 41-character id, "upstream@drm-misc", midnight UTC),
+# which looks verifiable and is not. Provenance this file can actually support follows the subject.
 Subject: [PATCH] accel/amdxdna: document trusted mailbox ring geometry and drop the power-of-two check
 
 Carried from drm-misc-next-2026-10-16 (tag 41cec5feed4687aea2a59378b271faf363c7d938),
-upstream commit 5d7b464a4f5b. Unmodified upstream change: it applies to our pinned
+upstream commit 5d7b464a4f5b (12-hex prefix as recorded; full id not retained). Unmodified upstream change: it applies to our pinned
 xdna-driver (526c6081974e) both on the bare pin and on top of 0001-0010.
 Applied by: pi-kernel-74 (carried, not installed).
 ---

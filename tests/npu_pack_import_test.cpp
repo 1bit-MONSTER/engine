@@ -595,6 +595,198 @@ void test_external_packed_genre(const std::string& root) {
     fs::remove_all(dir2);
 }
 
+// engine#1849 (the CHANGES on #1712 that the merge went past): the external-data WRITER had no success-path arm. Every
+// import_pack() on the genre above expects a refusal, so the decode -> split -> tile chain, the BF16 copies and the header
+// keys #1751/#1793 added were exercised only on real packs. This builds a pack whose geometry the split CAN satisfy,
+// imports it to completion and reads the container back through q4nx's own decoders -- independent of the writer -- against
+// values the fixture computes itself. Every row has its own scale, and every (row, block, group) its own zero point, so a
+// row that lands in the wrong tensor or a q/k/v range that is off by one tile changes a weight and fails here.
+void test_external_import_success(const std::string& root) {
+    const fs::path dir = fs::path(root) / "external-success";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    // 2 heads + 1 kv head of 128: q 256 rows, k 128, v 128 -> one qkv matmul of N 512 at K = hidden 256.
+    const int H = 256, NH = 2, NKV = 1, HD = 128, V = 64;
+    const int N = (NH + 2 * NKV) * HD, K = H;
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"phi3","hidden_size":256,"intermediate_size":512,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":128,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":false})");
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"decoder":{"filename":"eager-mm.onnx","hidden_size":256,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_size":128,"intermediate_size":512}}})");
+    put_file((dir / "tokenizer.json").string(), R"({"model":{"type":"BPE"}})");
+
+    // The fixture's own weights: w(row, col) = (code - zp) * scale, chosen so every product is exact in f32 (scales are
+    // bf16-exact with 7 mantissa bits, |code - zp| <= 15), so the container's `code*scale + m` form must reproduce them
+    // bit for bit. Both nibbles are int4 TWO'S COMPLEMENT (the pack's writer asserts -8 <= x <= 7), so the reference
+    // sign-extends them: the generators walk all 16 nibble values, and for a code and zero of opposite sign an
+    // unsigned reading is off by 16 * scale (engine#1503, #1874).
+    auto scale_of = [](int row) { return (1.0f + float(row % 128) / 128.0f) * std::ldexp(1.0f, -(row / 128 + 2)); };
+    auto zp_of = [](int row, int kb, int g) { return uint8_t((row + 3 * kb + 5 * g) % 16); };
+    auto code_of = [](int row, int col) { return uint8_t((row * 7 + col * 3) % 16); };
+    auto w_of = [&](int row, int col) {
+        auto sx = [](uint8_t v) { return v >= 8 ? int(v) - 16 : int(v); };
+        return float(sx(code_of(row, col)) - sx(zp_of(row, col / 128, (col % 128) / 32))) * scale_of(row);
+    };
+    // Encode the blob as the pack lays it out -- the inverse of decode_external_tile() for the shipped ordering
+    // (pi::kExtQuantsRowMajor == false: byte (cp%4) + c*4 + (cp/4)*512 holds rows 2cp/2cp+1 of column c).
+    const int blocks = K / 128, tiles = N / 64, per_tile = 2 * (blocks + 1);
+    std::string blob(size_t(tiles) * per_tile * 2176, '\0');
+    for (int tile = 0; tile < tiles; ++tile)
+        for (int half = 0; half < 2; ++half)
+            for (int kk = 1; kk <= blocks; ++kk) {
+                char* subv = &blob[size_t(tile * per_tile + kk * 2 + half) * 2176];
+                for (int r = 0; r < 32; ++r) {
+                    // A 64-row block's FIRST 32 rows live in the pair's SECOND subvolume (measured on the pack, #1874).
+                    const int row = tile * 64 + (1 - half) * 32 + r;
+                    const uint16_t s = pi::bf16_bits_of(scale_of(row));
+                    subv[2112 + r * 2] = char(s & 0xFF);
+                    subv[2112 + r * 2 + 1] = char(s >> 8);
+                    subv[2048 + r * 2] = char(zp_of(row, kk - 1, 0) | (zp_of(row, kk - 1, 1) << 4));
+                    subv[2048 + r * 2 + 1] = char(zp_of(row, kk - 1, 2) | (zp_of(row, kk - 1, 3) << 4));
+                    for (int c = 0; c < 128; ++c) {
+                        const int cp = r / 2;
+                        uint8_t& b = reinterpret_cast<uint8_t&>(subv[(cp % 4) + c * 4 + (cp / 4) * 512]);
+                        const uint8_t nib = code_of(row, (kk - 1) * 128 + c);
+                        b = (r % 2 == 0) ? uint8_t((b & 0xF0) | nib) : uint8_t((b & 0x0F) | (nib << 4));
+                    }
+                }
+            }
+    check(int64_t(blob.size()) == int64_t(N) * (K / 128 + 1) * 68,
+          "external success: the crafted blob has the genre's length N x (K/128 + 1) x 68");
+    // The embedding, F32 in the pack, values exact in bf16.
+    std::string embed(size_t(V) * H * 4, '\0');
+    for (int i = 0; i < V * H; ++i) {
+        const float v = float((i % 61) - 30) * 0.5f;
+        std::memcpy(&embed[size_t(i) * 4], &v, 4);
+    }
+    put_file((dir / "eager-mm.onnx.data").string(), embed + blob);
+    put_file((dir / "eager-mm.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "eager-mm.onnx.data", 0, uint64_t(embed.size())),
+                        pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
+                        pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty"),
+                        pb::tensor("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", {int64_t(blob.size())},
+                                   "eager-mm.onnx.data", uint64_t(embed.size()), uint64_t(blob.size()))},
+                       {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
+                                                "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
+                                        K, N, 4, 128, "MatMulNBitsBf")}));
+
+    struct Container {
+        json table;
+        std::string data;
+    };
+    auto read_container = [](const fs::path& out) {
+        Container c;
+        std::ifstream f(out / "model.q4nx", std::ios::binary);
+        uint64_t hlen = 0;
+        f.read(reinterpret_cast<char*>(&hlen), 8);
+        std::string hdr(size_t(hlen), '\0');
+        f.read(hdr.data(), std::streamsize(hlen));
+        while (!hdr.empty() && (hdr.back() == ' ' || hdr.back() == '\0')) hdr.pop_back();
+        c.table = json::parse(hdr);
+        c.data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        return c;
+    };
+    auto json_of = [](const fs::path& p) {
+        std::ifstream f(p);
+        return json::parse(f);
+    };
+
+    for (const std::string layout : {"", "b8"}) {
+        const fs::path out = dir / (layout.empty() ? "out" : "out-b8");
+        fs::remove_all(out);
+        pi::Options opt;
+        opt.allow_incomplete = true;   // the plan's own refusals (no .fconst, no programs) must not stop the writer
+        opt.weight_layout = layout;
+        pi::Report r;
+        std::string why;
+        try {
+            r = pi::import_pack(dir.string(), out.string(), opt);
+        } catch (const std::exception& e) {
+            why = e.what();
+        }
+        const std::string tag = "external success" + std::string(layout.empty() ? "" : " (b8)") + ": ";
+        check(why.empty() && r.refused.empty() && fs::exists(out / "model.q4nx"),
+              tag + "a pack whose geometry the split satisfies imports to completion (" + why +
+                  (r.refused.empty() ? "" : r.refused.front()) + ")");
+        if (!fs::exists(out / "model.q4nx")) continue;
+
+        // config.json: the geometry, and q4nx_weight_layout ONLY for a non-default layout (engine#1840 / #1793).
+        const json cfg = json_of(out / "config.json");
+        check(cfg.value("num_attention_heads", 0) == NH && cfg.value("num_key_value_heads", 0) == NKV &&
+                  cfg.value("head_dim", 0) == HD && cfg.value("hidden_size", 0) == H,
+              tag + "config.json carries the pack's geometry");
+        if (layout.empty())
+            check(!cfg.contains("q4nx_weight_layout"),
+                  tag + "a default-layout container carries no q4nx_weight_layout key (every earlier container depends "
+                        "on that)");
+        else
+            check(cfg.value("q4nx_weight_layout", std::string()) == "b8",
+                  tag + "--weight-layout b8 writes q4nx_weight_layout \"b8\" into config.json");
+        // The text artifacts (engine#1751): without tokenizer.json the directory is not a model directory.
+        check(fs::exists(out / "tokenizer.json"), tag + "tokenizer.json is copied beside the container");
+        if (!layout.empty()) continue;   // the weights do not depend on the layout key; check them once
+
+        const Container c = read_container(out);
+        // q/k/v land as three tensors with the geometry's row ranges, and every weight is the fixture's.
+        struct Want {
+            const char* name;
+            int lo, rows;
+        };
+        for (const Want& want : {Want{"model.layers.0.self_attn.q_proj.weight", 0, NH * HD},
+                                 Want{"model.layers.0.self_attn.k_proj.weight", NH * HD, NKV * HD},
+                                 Want{"model.layers.0.self_attn.v_proj.weight", NH * HD + NKV * HD, NKV * HD}}) {
+            const std::string nm = want.name;
+            if (!c.table.contains(nm)) {
+                check(false, tag + nm + " is in the container");
+                continue;
+            }
+            const json& e = c.table.at(nm);
+            const int64_t lo = e.at("data_offsets").at(0), hi = e.at("data_offsets").at(1);
+            const int RT = want.rows / 32, KT = K / 256;
+            const size_t tb = size_t(onebit::npu::q4nx::Chunk::Q4_1F);
+            check(e.at("shape").at(1) == int64_t(tb) && (hi - lo) == int64_t(RT) * KT * int64_t(tb),
+                  tag + nm + " is " + std::to_string(RT * KT) + " q4_1f tiles");
+            if ((hi - lo) != int64_t(RT) * KT * int64_t(tb)) continue;
+            int bad = 0, first_r = -1, first_c = -1;
+            std::vector<float> w(32 * 256);
+            for (int rt = 0; rt < RT; ++rt)
+                for (int kt = 0; kt < KT; ++kt) {
+                    const auto* tile =
+                        reinterpret_cast<const uint8_t*>(c.data.data() + lo + (size_t(rt) * KT + kt) * tb);
+                    onebit::npu::q4nx::dequant_tile(onebit::npu::q4nx::Chunk::Q4_1F, tile, w.data(), 256);
+                    for (int r = 0; r < 32; ++r)
+                        for (int col = 0; col < 256; ++col) {
+                            const int row = rt * 32 + r, gcol = kt * 256 + col;
+                            if (w[size_t(r) * 256 + col] != w_of(want.lo + row, gcol)) {
+                                if (bad++ == 0) first_r = row, first_c = gcol;
+                            }
+                        }
+                }
+            check(bad == 0, tag + nm + ": every weight is the pack's row " + std::to_string(want.lo) + "+r, exactly (" +
+                                std::to_string(bad) + " differ, first at " + std::to_string(first_r) + "," +
+                                std::to_string(first_c) + ")");
+        }
+        // The embedding is copied as BF16 with its shape (exact here by construction).
+        bool embed_ok = c.table.contains("model.embed_tokens.weight");
+        if (embed_ok) {
+            const json& e = c.table.at("model.embed_tokens.weight");
+            const int64_t lo = e.at("data_offsets").at(0), hi = e.at("data_offsets").at(1);
+            embed_ok = e.at("dtype") == "BF16" && e.at("shape") == json::array({V, H}) && hi - lo == int64_t(V) * H * 2;
+            for (int i = 0; embed_ok && i < V * H; ++i) {
+                uint16_t b = 0;
+                std::memcpy(&b, c.data.data() + lo + size_t(i) * 2, 2);
+                embed_ok = onebit::npu::bf16_to_f32(b) == float((i % 61) - 30) * 0.5f;
+            }
+        }
+        check(embed_ok, tag + "the embedding is copied as BF16 [64, 256] with every value intact");
+    }
+    fs::remove_all(dir);
+    std::printf("external success: crafted external-data pack imported; q/k/v split, weights, embedding and keys hold\n");
+}
+
+
 // The two overstatements the readers must catch: declared dims larger than the external file, and a
 // MatMulNBits node whose N/K/block_size demand more qweight than the tensor declares.
 // engine#1671: a pack whose graph is all `[0]`-dims placeholders and whose bytes are in model.bin (the 1.8/hybrid
@@ -3685,6 +3877,7 @@ int main(int argc, char** argv) {
     test_external_roles();
     test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
+    test_external_import_success(golden_dir.empty() ? "." : golden_dir);
         test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);

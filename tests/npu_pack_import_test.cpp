@@ -267,7 +267,9 @@ void test_external_tile_decode() {
             for (int64_t kk = 1; kk <= K / 128; ++kk) {
                 uint8_t* subv = blob.data() + (tile * per_tile + kk * 2 + half) * 2176;
                 for (int r = 0; r < 32; ++r) {
-                    const int64_t row = tile * 64 + half * 32 + r;
+                    // The decoder reads the block's FIRST 32 rows from the pair's SECOND subvolume, so the fixture encodes
+                    // its rows in that order; without this the test pins a mapping the decoder does not use (engine#1503).
+                    const int64_t row = tile * 64 + (1 - half) * 32 + r;
                     const uint16_t sc = bf16_bits(scale_for(tile, half, kk, r));
                     subv[2112 + r * 2] = uint8_t(sc & 0xFF);
                     subv[2113 + r * 2] = uint8_t(sc >> 8);
@@ -305,7 +307,9 @@ void test_external_tile_decode() {
         for (int half = 0; half < 2; ++half)
             for (int64_t kk = 1; kk <= K / 128; ++kk)
                 for (int r = 0; r < 32; ++r) {
-                    const int64_t row = tile * 64 + half * 32 + r;
+                    // The decoder reads the block's FIRST 32 rows from the pair's SECOND subvolume, so the fixture encodes
+                    // its rows in that order; without this the test pins a mapping the decoder does not use (engine#1503).
+                    const int64_t row = tile * 64 + (1 - half) * 32 + r;
                     for (int g = 0; g < 4; ++g) {
                         const size_t at = size_t(row) * (K / 32) + (kk - 1) * 4 + g;
                         if (q.scale[at] != scale_for(tile, half, kk, r)) scale_ok = false;

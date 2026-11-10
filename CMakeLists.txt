@@ -269,6 +269,12 @@ include(cmake/tests-gpu-hold.cmake)
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
 add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.sh)
+# engine#1844: the serve_context_limit row's classifier used to accept anything that was not 2xx, so a server that DIED
+# mid-request (curl 000) or answered 5xx passed as "a refusal". The classifier and its pass set are pure functions of
+# (http code, body), so their cases -- especially the ones that must reject -- run here with no model, no server and no
+# device. Deliberately OUTSIDE if(ONEBIT_SERVE_TEST_GGUF): that row is device-gated, and the whole point is that the
+# classification is checked in every configure, including the ones that never load a model.
+add_test(NAME serve_context_limit_classify COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh --self-test)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
@@ -353,6 +359,8 @@ target_include_directories(serve_watchdog_test PRIVATE app)
 add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 # The NPU route's sampling controls and GBNF output constraint (app/npu_sampling.h,
 # app/npu_grammar.h, docs/npu.md "Sampling and structured output"); header only, no device.
+# engine#1781: the comparator behind NPU_BATCH_CHECK -- pure arithmetic over two float arrays, so it runs with no model,
+# no device and no runtime. It is a header, so the test includes it directly and needs no link libraries.
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
@@ -772,6 +780,8 @@ if(Python3_Interpreter_FOUND)
     # three refusals a real pack needed -- a block-32 head refused by name, an untied head given no false oracle, the
     # trailing zeros counted. It was never registered, so nothing ran it after #1710.
     add_test(NAME q4nx_tail_head COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_tail_head_test.py)
+    # Without onnx its two refusal arms cannot run: it exits 77, so ctest shows SKIPPED rather than a pass (#1747 review).
+    set_tests_properties(q4nx_tail_head PROPERTIES SKIP_RETURN_CODE 77)
     # A member declared in npu/forward/include/q4nx_forward.h and never defined keeps `main` green while a full
     # `cmake --build` fails at link time (engine#1573: the 3-argument step_batch_embeds).  CI cannot catch it --
     # .github/workflows/ci.yml builds `--target onebit` only, because a full build wants the private NPU runtime --
@@ -814,6 +824,8 @@ add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
     # the HRX hardware gate's judges (docs/hw-gate.md) against a fake server and synthetic logs;
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
+    # engine#1781: the comparator behind NPU_BATCH_CHECK, host-only (no model, no device, no runtime):
+    # the batched verify pass is compared row for row against the sequential one, bitwise.
     add_test(NAME q4nx_pb16i COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_pb16i_test.py)
     # The padded-grid read (engine#1097/#1110): tools/q4nx_diff.py decode reads a container whose weight sits on a
     # WIDER tile grid than the model's dimensions (the FastFlowLM repack pads intermediate_size to 512 columns, IM
@@ -1277,6 +1289,16 @@ add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src
                                   npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
+# engine#1781's oracle (merged in #1813) arrived with its test file but no registration, so the comparator behind
+# NPU_BATCH_CHECK -- "every drafted position's logits, bitwise" instead of one argmax at the last row -- was neither
+# built nor run while every job stayed green. Header-only, so the test needs no link libraries; host-only, so it needs no
+# model and no device.
+add_executable(batch_check_compare_test tests/batch_check_compare_test.cpp)
+target_include_directories(batch_check_compare_test PRIVATE npu/forward/include)
+add_test(NAME batch_check_compare COMMAND batch_check_compare_test)
+# direction B (tools/ci/ci_targets_check.py): a target ci.yml's --target list does not name is "never built", and ci.yml
+# is a workflow file no lane can patch. The documented hook is the one onebit_npu_forward_syntax uses.
+add_dependencies(onebit batch_check_compare_test)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
 # The plan's `designs` section against the engine's own derivation (engine#803 A2a): the generator and
 # q4nx_derive_designs() must state the same kernels, because a section that disagreed would be refused at

@@ -1168,6 +1168,22 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
                 ++from_text_config;
             }
         }
+        // `rope_theta` (and the rotary block's other keys) can be ONE LEVEL DEEPER still: Qwen3-VL-4B declares
+        // `text_config.rope_parameters = {mrope_interleaved: true, mrope_section: [24,20,20], rope_theta: 5000000,
+        // rope_type: default}` with no `rope_theta` anywhere else, so this reader fell back to its 10000 default and the
+        // importer warned that the pack's cos/sin caches "no plain theta explains (best 0.5918 at 3.2e+06, declared 10000)".
+        // Measured against the pack's own cos_cache (262144 x 64, external): **theta 5e6 reproduces row 1 to max|d|
+        // 0.000000**, 10000 is off by 0.088 and 3.2e6 by 0.005 -- so the caches are not unexplained at all, the theta was
+        // simply not read (engine#1503). Gaps only, never overriding, same rule as the lift above.
+        int from_rope_params = 0;
+        if (cfg.contains("rope_parameters") && cfg["rope_parameters"].is_object()) {
+            for (auto it = cfg["rope_parameters"].begin(); it != cfg["rope_parameters"].end(); ++it) {
+                if (cfg.contains(it.key()) || it.value().is_null()) continue;
+                cfg[it.key()] = it.value();
+                ++from_rope_params;
+            }
+        }
+        if (from_rope_params > 0 && source) *source += " + config.json rope_parameters";
         if (from_text_config > 0 && source) *source += " + config.json text_config";
         if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;
@@ -3172,6 +3188,11 @@ static const char* const kTextFiles[] = {"tokenizer.json",
                                          "generation_config.json"};
 
 // The same list every path copies (see kTextFiles): a container without tokenizer.json is not an NPU model directory.
+// engine#1751 follow-up: the ONE copier. Both import paths call it (the .fconst path used to keep its own loop, which
+// threw a bare filesystem_error, while this one counted successes and swallowed failures), and a file the pack HAS that
+// fails to copy is refused by name -- a counter nobody compared let an import "succeed" without tokenizer.json, and serve
+// then refused the directory for a missing tokenizer, the exact misleading report #1751 existed to remove. A file the pack
+// does not ship stays a skip: a pack without a chat template is legitimate.
 static int copy_text_artifacts(const std::string& pack_dir, const std::string& out_dir) {
     int copied = 0;
     for (const char* f : kTextFiles) {
@@ -3179,9 +3200,15 @@ static int copy_text_artifacts(const std::string& pack_dir, const std::string& o
         std::error_code cec;
         if (!fs::exists(src, cec)) continue;
         fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing, cec);
-        if (!cec) ++copied;
+        if (cec)
+            throw std::runtime_error("cannot copy the pack's " + std::string(f) + " into " + out_dir + " (" + cec.message() +
+                                     "); without it the output is not a servable model directory");
+        ++copied;
     }
     return copied;
+}
+int copy_text_artifacts_exported(const std::string& pack_dir, const std::string& out_dir) {
+    return copy_text_artifacts(pack_dir, out_dir);
 }
 
 TextArtifacts scan_text_artifacts(const std::string& pack_dir) {
@@ -3362,6 +3389,17 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     if (const std::string why = weight_layout_refusal(opt.weight_layout); !why.empty())
         throw std::runtime_error("--weight-layout: " + why);
     json c;
+    // engine#1794 review: the container's OWN config is what the forward reads (`q4nx_semantics.c:121` value_for_top,
+    // depth 1 only), and this writer started from an empty json -- so a mRoPE declaration that lives only at
+    // `text_config.rope_parameters` was dropped, and the pack would be served as plain RoPE with the right theta and the
+    // wrong axis layout (engine#1311: exact for a text-only prompt, ~0.29 rad off once image tokens are in it). The
+    // import_pack() writer starts from load_geometry() and already carries it; this one has to copy it.
+    {
+        std::string geom_src;
+        const json geom = load_geometry(pack_dir, &geom_src);
+        if (geom.value("mrope_interleaved", false)) c["mrope_interleaved"] = true;
+        if (geom.contains("mrope_section")) c["mrope_section"] = geom["mrope_section"];
+    }
     c["model_type"] = p.dims.model_type;
     c["hidden_size"] = p.dims.hidden;
     c["intermediate_size"] = p.dims.intermediate;
@@ -3647,6 +3685,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // this is a loop, not a second reader. The one projection that needs arithmetic is the fused qkv: one
     // [q|k|v] tensor that has to be split by head geometry, since only it is fused.
     if (graph_weights_a) {
+        std::vector<std::string> proj_gaps;
         auto init_of = [&](const std::string& n) -> const OnnxTensor* {
             const auto it = onnx.index.find(n);
             return it == onnx.index.end() ? nullptr : &onnx.tensors[it->second];
@@ -3657,13 +3696,31 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // The two spellings of a quantised projection (engine#1503): the 1.8/phi-4 form carries a qweight and a
             // scales sibling; Qwen3-VL-4B names them `<proj>.MatMul.weight_Q4` / `<proj>.MatMul.weight_scales` on a
             // three-input node with no qzeros (implicit zero point, applied below).
-            const OnnxTensor* qw = init_of(proj + ".MatMulNBits.qweight");
-            const OnnxTensor* sc = init_of(proj + ".MatMulNBits.scales");
+            // `proj` arrives from a plan source string (`graph:model.layers.N.attn.q_proj`, no trailing dot) as well as
+            // from a role name (`...q_proj.`, with one), so normalise before appending a suffix -- otherwise the
+            // three-input spelling is looked up as `...q_projMatMul.weight_Q4` and never found, which is how a pack could
+            // plan all 252 projections, write only its norms, and fail on the device with `MLP dequant : data_size 0`
+            // (engine#1503).
+            std::string pre = proj;
+            if (!pre.empty() && pre.back() != '.') pre += '.';
+            // Every way out of here that writes nothing is a named gap (engine#1841), never a quiet skip.
+            auto gap = [&](const std::string& why) {
+                proj_gaps.push_back(out_name + ": `" + pre + "` " + why);
+                return false;
+            };
+            const OnnxTensor* qw = init_of(pre + "MatMulNBits.qweight");
+            const OnnxTensor* sc = init_of(pre + "MatMulNBits.scales");
             if (!qw || !sc) {
-                qw = init_of(proj + "MatMul.weight_Q4");
-                sc = init_of(proj + "MatMul.weight_scales");
+                qw = init_of(pre + "MatMul.weight_Q4");
+                sc = init_of(pre + "MatMul.weight_scales");
             }
-            if (!qw || !sc || qw->dims.size() != 3 || sc->dims.empty()) return false;
+            // plan() counts a projection present on its codes alone, so a pack missing only the scales passed it; returning
+            // quietly here then let the container report itself complete without the projection.
+            if (!qw || !sc)
+                return gap("has no quantised projection the decoder can pair (tried MatMulNBits.qweight + .scales and "
+                           "MatMul.weight_Q4 + _scales)");
+            if (qw->dims.size() != 3 || sc->dims.empty())
+                return gap("qweight is not [N, K/block, block/2], or its scales have no shape");
             const int N = int(qw->dims[0]);
             const int block = int(qw->dims[2]) * 2;            // 64 B holds 128 four-bit codes
             const int K = k_override > 0 ? k_override : int(qw->dims[1]) * block;
@@ -3672,27 +3729,35 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // block the pack used, which is why a block-32 SmolLM-class pack tiles identically (pi-inferzo
             // verified the recipe on amd/SmolLM2-135M-Instruct_rai_1.7.1_hybrid, corr +0.9957 against the
             // pack's own tied embedding).
-            if (block <= 0 || N <= 0 || K <= 0 || K % block || row0 < 0 || row0 + rows > N) return false;
+            if (block <= 0 || N <= 0 || K <= 0 || K % block || row0 < 0 || row0 + rows > N)
+                return gap("has geometry N=" + std::to_string(N) + " K=" + std::to_string(K) + " block=" +
+                           std::to_string(block) + " that does not hold rows [" + std::to_string(row0) + ", " +
+                           std::to_string(row0 + rows) + ")");
             const uint64_t groups = uint64_t(K) / uint64_t(block), nrows = uint64_t(N);
             uint64_t groups_n = 0;
-            if (!mul_ok(nrows, groups, groups_n)) return false;
+            if (!mul_ok(nrows, groups, groups_n)) return gap("declares a size that overflows");
             std::vector<float> scales(static_cast<std::vector<float>::size_type>(groups_n));
             const uint64_t sw = sc->type == kF32 ? 4 : 2;
             uint64_t s_need = 0;
-            if (!mul_ok(groups_n, sw, s_need)) return false;
+            if (!mul_ok(groups_n, sw, s_need)) return gap("declares a size that overflows");
             if (sc->type == kF32) std::memcpy(scales.data(), bytes_of(*sc, s_need), scales.size() * 4);
             else {
                 const auto b = as_bf16(bytes_of(*sc, s_need), sc->type, scales.size());
                 const auto* d = reinterpret_cast<const uint16_t*>(b.data());
                 for (size_t i = 0; i < scales.size(); ++i) scales[i] = bf16_to_f32(d[i]);
             }
-            const OnnxTensor* zt = init_of(proj + ".MatMulNBits.qzeros");
+            const OnnxTensor* zt = init_of(pre + "MatMulNBits.qzeros");
             uint64_t z_need = 0;
-            if (!mul_ok(nrows, (groups + 1) / 2, z_need)) return false;
+            if (!mul_ok(nrows, (groups + 1) / 2, z_need)) return gap("declares a size that overflows");
             const uint8_t* zp = zt ? bytes_of(*zt, z_need) : nullptr;
             uint64_t qw_need = 0;
-            if (!mul_ok(groups_n, uint64_t(block) / 2, qw_need)) return false;
-            const Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
+            if (!mul_ok(groups_n, uint64_t(block) / 2, qw_need)) return gap("declares a size that overflows");
+            Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
+            // No qzeros tensor means the implicit zero point 2^(bits-1) -- the same rule the head path applies, and the
+            // one ONNX Runtime's MatMulNBits uses. Missing it here decoded every PROJECTION with zero point 0 while the
+            // head was decoded with 8, which is why the pack imported completely, served on the device, and answered
+            // gibberish on both the device and the host-GEMM path (engine#1503: "West什么呢ưởng中国联通nio…").
+            if (!zt) implicit_zp_zero(q, 4);
             // the row slice, re-tiled exactly as the whole tensor would be
             Q4 part;
             part.N = rows; part.K = K;
@@ -3742,6 +3807,10 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 decode_rows(a + "k_proj", 0, kv_rows, base + ".self_attn.k_proj.weight", 0);
                 decode_rows(a + "v_proj", 0, kv_rows, base + ".self_attn.v_proj.weight", 0);
             }
+        }
+        if (!proj_gaps.empty()) {
+            for (auto& s : proj_gaps) r.refused.push_back(std::move(s));
+            if (!opt.allow_incomplete) return r;   // refuse by name; the container is not written
         }
     }
 
@@ -4559,10 +4628,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         std::ofstream out(out_dir + "/config.json");
         out << c.dump(2) << "\n";
     }
-    for (const char* f : kTextFiles) {
-        const std::string src = pack_dir + "/" + f;
-        if (fs::exists(src)) fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing);
-    }
+    // engine#1751 follow-up: the same copier the external-data path uses, so the two genres cannot drift apart again.
+    copy_text_artifacts(pack_dir, out_dir);
     for (const auto& [name, m] : ext) unmap_file(m, ext_size[name]);
     return r;
 }

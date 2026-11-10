@@ -54,6 +54,7 @@ on:
       - third_party/llama.cpp
       - third_party/hrx-system
       - CMakeLists.txt
+      - cmake/tests-*.cmake
       - cmake/hrx.cmake
       - config/hrx-toolchain.config
       - config/hrx-system-hold.config

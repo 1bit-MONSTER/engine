@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "batch_check_compare.h"
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
@@ -741,14 +742,17 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                  * 155,200 of them), so a row is read out of the `cols/256` tiles that cover it instead of the whole
                  * table being decoded into f32 -- which for that pack is 0.74 GiB of container becoming 4.74 GiB.
                  * Same tile grid and ordering as q4nx_dequant_tensor_chunked(), pinned by the row test. */
-                const int ntr = NV / 32, ntc = kpad_ / 256;
-                const size_t tiles = (size_t)ntr * (size_t)ntc;
-                if (tiles > 0 && esz % tiles == 0) {
+                /* engine#1842: the grid is checked with the row reader's own rule, not `esz % tiles == 0`. That test let a
+                 * table with no supported chunk kind, or an NV / kpad_ off the 32 x 256 grid, take this path; the reader
+                 * then refused every row and embed_at() served 0.0f with no message. A table it would refuse stays on
+                 * the whole-table decode below, which reports its own failure. */
+                const int cb = q4nx_tile_row_kind(esz, NV, kpad_);
+                if (cb != 0) {
                     embed_tile_       = (const uint8_t*)e;
                     embed_tile_bytes_ = esz;
                     embed_tile_rows_  = NV;
                     embed_tile_cols_  = kpad_;
-                    embed_tile_cb_    = int(esz / tiles);
+                    embed_tile_cb_    = cb;
                     embed_row_buf_.assign((size_t)kpad_, 0.0f);
                     embed_row_tok_    = -1;
                 }
@@ -3041,8 +3045,20 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                                   int wkey, float* out) {
     const int G = 128, groups = (K + G - 1) / G;
-    auto it = host_i8_cache_.find(wkey);
-    if (it == host_i8_cache_.end()) {
+    // THE KEY MUST CARRY THE LAYER AND THE SHAPE (engine#1830 review). `wkey` is a per-ROLE slot -- 0 QKV, 1 O/gate,
+    // 2 GU, 3 up, 4 down -- so it is the same number in every layer, and `Bmat` is the one scratch buffer that
+    // `load_layer()` decodes each layer into, so neither identifies a layer. Keyed on `wkey` alone, every layer after 0
+    // ran on LAYER 0's weights: layer 0 scored cos 0.99923, layer 1 collapsed to 0.37, and 31 layers of wrong residual
+    // updates compounded into the "explosion, not drift" the per-layer dump shows. The device cache this arm mirrors
+    // says the rule in its own comment -- one weight BO per (layer, wkey) -- and carries `a.layer = cur_layer_`.
+    // `wkey < 0` is the routed-expert case: those weights vary per TOKEN, which is why the device path passes -1; caching
+    // them would serve every token's experts from the first token's, so that case packs a throwaway image instead.
+    const bool cacheable = wkey >= 0;
+    const auto key = std::make_tuple(cur_layer_, wkey, K, N);
+    HostI8Tensor scratch;
+    const HostI8Tensor* cached = nullptr;
+    auto it = cacheable ? host_i8_cache_.find(key) : host_i8_cache_.end();
+    if (!cacheable || it == host_i8_cache_.end()) {
         HostI8Tensor t;
         t.groups = groups; t.N = N;
         t.codes.assign((size_t)K * (size_t)N, 0);
@@ -3067,9 +3083,16 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
                 }
             }
         }
-        it = host_i8_cache_.emplace(wkey, std::move(t)).first;
+        if (!cacheable) {
+            scratch = std::move(t);
+            cached = &scratch;
+        } else {
+            cached = &host_i8_cache_.emplace(key, std::move(t)).first->second;
+        }
+    } else {
+        cached = &it->second;
     }
-    const HostI8Tensor& t = it->second;
+    const HostI8Tensor& t = *cached;
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
         const float* a = A + (size_t)m * (size_t)a_k;
@@ -3338,16 +3361,25 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // device state -- localises a batched-vs-sequential divergence immediately.
     static const bool batch_check = getenv("NPU_BATCH_CHECK") != nullptr;
     int seq_argmax = -1;
+    // engine#1781: the old oracle compared ONE argmax at ONE position -- the last row's -- which is not the question a
+    // speculative decoder asks. Every drafted position's LOGITS matter (the accept rule consumes the target's
+    // probability at the drafted token), so the sequential rows are kept whole and compared row for row, bitwise.
+    // M x vocab floats: 4-7 MB on the models this runs, allocated only under the debug flag.
+    std::vector<float> seq_rows, bat_rows;
     // Not with injected rows: the oracle's own sequential pass runs step(tokens[m]) on the placeholder ids this
     // entry point supplies, so it would compare against a zero-token pass and report a divergence that is not
     // there. A debug tool that lies is worse than one that says "not applicable".
     if (batch_check && !inject_embeds_) {
         std::vector<float> seq;
-        for (int m = 0; m < M; m++)
+        if (c_.NV > 0) seq_rows.reserve((size_t)M * (size_t)c_.NV);
+        for (int m = 0; m < M; m++) {
             if (!step(tokens[m], start_pos + m, seq)) return false;
+            seq_rows.insert(seq_rows.end(), seq.begin(), seq.end());   // every row, not only the last
+            if (m == M - 1)
+                for (size_t i = 0; i < seq.size(); i++)
+                    if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
+        }
         reset();
-        for (size_t i = 0; i < seq.size(); i++)
-            if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
     }
 
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
@@ -3759,6 +3791,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
         }
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
+        // engine#1781: keep the batched rows so the oracle can compare all of them, not just the last one's argmax.
+        if (batch_check) bat_rows.assign(batch_all_out_->begin(), batch_all_out_->end());
     } else {
         std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
         rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
@@ -3786,6 +3820,16 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (logits[i] > logits[(size_t)ba]) ba = (int)i;
         std::fprintf(stderr, "[batchcheck] M=%d start=%d seq_argmax=%d batch_argmax=%d %s\n",
                      M, start_pos, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+        // engine#1781: and the comparison the gate actually asks for -- every row, bitwise.
+        if (!seq_rows.empty() && bat_rows.size() == seq_rows.size() && c_.NV > 0) {
+            onebit::npu::RowMismatch mm;
+            const int differing = onebit::npu::compare_rows_bitwise(seq_rows.data(), bat_rows.data(), M, c_.NV, &mm);
+            std::fprintf(stderr, "[batchcheck] rows M=%d identical=%d differing=%d", M, M - differing, differing);
+            if (differing > 0)
+                std::fprintf(stderr, " first row=%d index=%d seq=0x%08x bat=0x%08x%s", mm.row, mm.index,
+                             (unsigned)mm.seq_bits, (unsigned)mm.bat_bits, mm.nan_mismatch ? " (NaN)" : "");
+            std::fprintf(stderr, "\n");
+        }
     } else if (getenv("NPU_BATCH_DBG")) {
         std::fprintf(stderr, "[batch] M=%d start=%d batched (%d layers, two_widths=%d)\n",
                      M, start_pos, c_.NL, (int)two_widths);

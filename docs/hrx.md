@@ -86,7 +86,13 @@ fails a pin that leaves a gate model's node off HRX.
   `DRY_RUN=1` and pushes nothing):
   - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin). When AMD
     rewrites its history, the old `1bit/hrx-vulkan` tip is tagged `hrx-vulkan-<sha>` first,
-    and the run fails if that branch held a commit that is on no AMD branch;
+    and the run fails if that branch held a commit that is on no AMD branch. The failure
+    says which of two things that commit is, because they need opposite actions:
+    **rebased** (AMD's pin holds a commit with the same author, author date and subject:
+    AMD rebased its line and dropped the old one, so the commit is AMD's and the pin is merged
+    by hand) or **foreign** (no such commit: it is not AMD's and moves to
+    `1bit/hrx-vulkan-patched`). `scripts/bump-hrx-sync.sh off-branch <repo> <mirror> <pin>`
+    prints the classification alone, from a commits-only clone;
   - merges AMD's pin into `1bit/hrx-vulkan-patched`, after tagging the previous tip
     `patched-<sha>` so every commit the engine has pinned stays reachable. Conflicts under
     `ggml/src/ggml-hrx` keep our side; a conflict anywhere else fails the run and names the files;
@@ -245,6 +251,23 @@ Measured on Strix Halo (Qwen3-Coder-30B-A3B-Instruct Q4_K_M, `-dev HRX0`,
 decode-path logits (`llama-perplexity -c 2049 -b 1 --save-all-logits`) are byte-identical
 to the previous pin, the buried code word is exact at 4700 tokens, and no GPU faults
 were observed.
+
+### Fixed: one-token decode at a head size that is not a power of two ([engine#1926](https://github.com/1bit-MONSTER/engine/issues/1926))
+
+A model whose attention head size is not a power of two (stories15M: 48; Sarashina2.2-3B: 160) and whose
+Q weights are not Q4_K or Q6_K loaded and prefilled on `HRX0`, then failed at the first decode step:
+`HRX Loom JIT Loom compilation failed`, `llama_decode: failed to decode, ret = -3`. The one-token Q
+projection kernel wrote each rotated pair at `channel rem head_size`, and the kernel compiler can only
+prove that two-wide store in bounds when the remainder is a mask. The kernel now indexes by rotation
+pair, which is in bounds at every head size (llama.cpp #282). Q4_K and Q6_K models took a different
+kernel at one token and were not affected.
+
+Measured at pin `a5dc597b8` on gfx1151 (2026-11-10, power mode `performance`):
+`test-hrx-attention-q-decode-head-size` compares the fused projection with the CPU backend at head
+sizes 48, 96 and 160 (controls 64 and 128) on BF16, F16 and Q8_0 weights: 9 of 15 cases failed before
+the fix, 0 of 15 after. `llama-bench -p 512 -n 128 -r 3`, two runs each: Sarashina2.2-3B bf16 decodes
+at 26.49 and 25.92 tok/s, stories15M Q8_0 at 317.77 and 338.54 tok/s (the box was shared; the same
+binary gave 545.39 tok/s on a quieter run).
 
 ### MoE decode and the kernel cache (llama.cpp #32, #33)
 

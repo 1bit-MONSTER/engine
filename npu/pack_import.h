@@ -371,6 +371,8 @@ struct Report {
     // walk and the pack is tied). Empty means it was read, as usual. Carried on the Report because the config JSON is
     // built after the .fconst block that discovers this.
     std::string head_synthesized_note;
+    // engine#1740: set when a block-32 head was READ from the .fconst tail (never together with the note above)
+    std::string head_read_note;
     // engine#1725: the per-layer embedding block the container carries (0 = none): row width per layer, and rows
     int64_t per_layer_P = 0, per_layer_V = 0;
     bool prefill_tail_seen = false;        // a second copy was readable in the prefill .fconst
@@ -403,6 +405,42 @@ struct Q4 {
     std::vector<float> scale;    // [N, K/32]
     std::vector<float> zero;     // [N, K/32]
 };
+// The 1.9 block-32 tail head (engine#1740). A pack whose `/lm_head/MatMul_Q4` is declared `block_size 32` keeps the
+// head in the Token .fconst tail, after the same `64 + 2*hidden` envelope every other 1.9 tail opens with, but NOT in
+// the block-128 tile: it is written in 64-row units of `2,560 + 2*(K/32)*640` bytes.
+//
+// Measured on `Qwen-2.5_1.5B_Instruct_rai_1.9.0_npu` (tied, V 151,936, K 1,536; unit 64,000 B, 2,374 units, then
+// 110,208,000 B of zeros to EOF) against the pack's own `model.embed_tokens`:
+//     unit   : 2,560 B of zeros, then 2*(K/32) strips of 640 B
+//     strip s: K block `s/2` (32 columns), rows `32*(s%2) .. +31` of the unit
+//       +0   512 B of 4-bit codes, low nibble first; code position p (0..1023) is row `(p/256)*8 + p%8`, column
+//            `(p/8)%32` -- four 8-row bands, each written column by column
+//       +512  16 B of zero points, one nibble per row (0x8 everywhere on the measured pack)
+//       +528  48 B of zeros
+//       +576  32 bf16 scales, one per row; SIGNED -- the measured writer stores `-m/8` where m is the block's
+//            largest-magnitude weight, so about half of them are negative
+//     w = (code - zero_point) * scale
+// Every one of the 3,072 scales of a unit equals `bf16(-m/8)` of its embedding block exactly, and the decoded rows
+// correlate 0.990 .. 0.997 with the embedding (4-bit), which is what fixed the field positions. The result is returned
+// with positive scales (a negative one is folded into its codes: `15 - code`, `15 - zp`), as a `Q4` at block 32, rows
+// padded to whole units the way the block-128 tail head is.
+//
+// What is checked, because a wrong region read with confidence is the failure this path exists to avoid: the unit
+// count is `ceil(V/64)` and has to fit; every unit's 2,560 B and every strip's 48 B are zero; every scale is finite;
+// and everything after the last unit is zero. Any of those failing is a refusal with the offset in it.
+constexpr int64_t kB32UnitRows = 64, kB32UnitHeader = 2560, kB32StripBytes = 640;
+inline int64_t block32_unit_bytes(int64_t K) { return kB32UnitHeader + 2 * (K / 32) * kB32StripBytes; }
+struct Block32Head {
+    bool ok = false;
+    Q4 q;                 // N = units x 64 (>= V), K, block 32; value = code*scale + zero, scale > 0
+    int64_t units = 0;
+    int64_t bytes = 0;    // units x block32_unit_bytes(K)
+    int64_t padding = 0;  // zero bytes after the last unit
+    std::string why;      // set when !ok
+};
+// `p` points at the first unit (tail_off + envelope), `avail` is the bytes from there to the end of the file.
+Block32Head read_block32_head(const uint8_t* p, int64_t avail, int64_t V, int64_t K);
+
 // The 1.9 external-data tile (engine#1503): the `.fconst` tile's subvolume written densely per tensor.
 //
 // Measured on `amd/phi-4_rai_1.9.0_npu` (`eager-mm.onnx.data`, 9.74 GB): every `MatMulNBitsBf` weight is a 1-D byte

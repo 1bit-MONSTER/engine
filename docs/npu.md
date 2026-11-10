@@ -1183,6 +1183,25 @@ stored bytes equal the upstream checkpoint's `model.norm.weight` exactly. (The e
 "the tail envelope is `[eps][pad][448 f32]`, so the final norm's position is unknown" — was the
 last 1,856 bytes of the *file*, which in the Token_Token program are tile padding.)
 
+**A head the pack declares at `block_size 32` is not in that tile stream** (engine#1740). The three
+Ryzen AI 1.9 Qwen-1.5B packs quantise every layer at block 128 and `/lm_head/MatMul_Q4` at block 32,
+and their tail after the envelope is 64-row *units* instead: 2,560 zero bytes, then `2 x (K/32)`
+strips of 640 B. Strip `s` holds K block `s/2` for rows `32 x (s%2) .. +31` of the unit: 512 B of
+4-bit codes (low nibble first; position `p` is row `(p/256) x 8 + p%8`, column `(p/8) % 32`), 16 B
+of zero-point nibbles, 48 zero bytes, and 32 **signed** bf16 scales, one per row;
+`w = (code - zero_point) x scale`. After the last unit the file is zero to its end (110,208,000 B on
+the measured pack, which is why the block-128 arithmetic never landed there). `npu-pack import`
+reads it (`read_block32_head`), folds a negative scale into its codes so the container's scales are
+positive, and writes the same q4_1f tiles as any other head. The layout checks are part of the read
+— unit count `ceil(vocab/64)`, the zero fields, finite scales, zeros to the end of the file — and
+each failure is a refusal that says which. On a pack that declares tied embeddings the read head
+also has to correlate above 0.99 with `model.embed_tokens`; if it does not, the head is made from
+the embedding as before and `q4nx_head_note` says why the read was not taken. On an untied pack the
+layout checks are all there is, and the note says the values are not verified. Measured on
+`Qwen-2.5_1.5B_Instruct_rai_1.9.0_npu` (tied, 151,936 x 1,536, 2,374 units of 64,000 B): every scale
+equals `bf16(-m/8)` of its 32-column embedding block, `m` being the block's largest-magnitude
+weight, and the read head correlates 0.996 with the embedding.
+
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
 opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as
 `npu_pack_import`, and as `npu_pack_import_oga` when `-DONEBIT_OGA_PACK=<dir>` is given) checks
@@ -2162,6 +2181,19 @@ short read, a mixed budget, a mixed window identity) and, since the tau=0.6 wind
 is worth more than the whole bar. Those depths keep their PASS/FAIL (the bar is the brief's criterion) but print
 `(thin: N live chain(s), one chain = X pp > the 2 pp bar)` and are counted out of the summary line, because a bare FAIL
 on 2 chains reads as a drafter regression when it is arithmetic.
+
+**Which drafts a sampler may keep** is a separate rule from how they are committed, and it lives in
+`npu/mtp/spec_accept.h` (engine#1781, gate 2). The loop above accepts a draft when it equals the base model's argmax,
+which is exact for greedy decode only. With a sampler the contract is that the output follows the **target's**
+distribution, and the rule that guarantees it is: accept a drafted token `x` (drawn from the drafter's distribution `q`)
+with probability `min(1, p(x)/q(x))`, and at the first rejection emit a token from `normalise(max(0, p - q))` and stop
+the chain. `p` and `q` are the final sampling distributions (after temperature, top-k, top-p), and an argmax drafter
+states a one-hot `q`. At temperature 0 both rows are one-hot and the rule reduces to the greedy contract, so that
+contract is its degenerate case. `tests/spec_accept_test.cpp` (ctest `spec_accept`) pins both: the temperature-0
+identity, and a deliberately wrong drafter (`p = [.45, .35, .20]`, `q = [.10, .80, .10]`) whose emitted tokens are
+within 0.0016 of `p` over 200,000 draws at an acceptance rate of 0.55, where the greedy rule on the same rows misses
+`p` by 0.55. The header is not called by a serve yet: wiring a speculative loop into `forward-serve` is the rest of
+#1781, and that loop must print its acceptance rate beside its tok/s.
 
 **The one thing that must be right**: the drafter attends over its own states, so its cache has to be the base
 model's *committed stream, row by row*. Feeding it only the current chain is silent — drafts get worse, the text

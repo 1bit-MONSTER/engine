@@ -2484,10 +2484,10 @@ struct BatchPhases {
         const double row = M > 0 ? (double)M : 1.0;
         std::fprintf(stderr,
                      "[bl] M=%2d gdn %7.1f ab %7.1f core %7.1f attn %6.1f mlp %6.1f rms %5.1f "
-                     "res %5.1f gemm %7.1f head %6.1f | per row: gdn %6.1f attn %5.1f "
+                     "res %5.1f gemm %7.1f head %6.1f deq %6.1f | per row: gdn %6.1f attn %5.1f "
                      "gemm %6.1f head %5.1f\n",
                      M, ms(LH_GDN), ms(LH_GDN_AB), ms(LH_GDN_CORE), ms(LH_ATTN), ms(LH_MLP),
-                     ms(LH_RMS), ms(LH_RES), gemm, ms(LH_HEAD_ROWS),
+                     ms(LH_RMS), ms(LH_RES), gemm, ms(LH_HEAD_ROWS), ms(LH_DEQ_OUT),
                      ms(LH_GDN) / row, ms(LH_ATTN) / row, gemm / row, ms(LH_HEAD_ROWS) / row);
     }
 };
@@ -3690,7 +3690,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             // One row of attention.  `append` is the K/V cache append, `kvlen` is how many cached
             // positions to read (0 = up to and including `pos`, i.e. causal), and `dst` receives the
             // context -- null when the pass only fills the cache (the noncausal first pass below).
-            auto row_attn = [&](int m, float* dst, bool append, int kvlen) -> bool {
+            auto row_attn = [&](int m, float* dst, bool append, int kvlen,
+                                std::vector<float>* q_keep = nullptr) -> bool {
                 {
                     CpScope _cp(CP_QKV);
                     qkv_row.assign(QKV.begin() + (size_t)m * g->N,
@@ -3725,9 +3726,10 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 }
                 if (!attention(*in, start_pos + m, pos3_ ? trio : nullptr, dst ? ctx_row : ctx_scratch,
                                l_hd, l_nkv, l_theta,
-                               l_rot, l_prop, l_win, l, append, kvlen)) {
+                               l_rot, l_prop, l_win, l, append, kvlen, q_keep)) {
                     err_ = "attention failed"; return false;
                 }
+                if (q_keep) return true;       // prepare only: q is in *q_keep, k/v are in the cache
                 if (!dst) return true;
                 if (gate_ptr)
                     for (int i = 0; i < nhd; i++)
@@ -3743,7 +3745,62 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             // hold all M rows before any of them attends -- a row's keys come from the same layer, and
             // the rows after it only exist once their projections ran.  The GDN layers keep their own
             // causal recurrence (the reference keeps it too), and a sliding layer stays causal.
-            if (noncausal_attn_ && l_full) {
+            // engine#1990: one thread team for the layer's M rows instead of one per row. Every row's
+            // position-local half runs first (q, and its k/v appended -- a causal row reads only positions up
+            // to its own, so the later rows already being in the cache changes nothing it reads), then all
+            // (row, head) pairs are one work-shared loop. NPU_ATTN_ROWS=0 keeps the per-row form for an A/B;
+            // NPU_ATTN_CHECK=1 recomputes every row that way and fails the pass on any differing bit.
+            static const bool attn_rows_on = [] {
+                const char* e = getenv("NPU_ATTN_ROWS");
+                return !(e && e[0] == '0');
+            }();
+            static const bool attn_check = [] {
+                const char* e = getenv("NPU_ATTN_CHECK");
+                return e && e[0] == '1';
+            }();
+            if (attn_rows_on && M > 1 && l_hd > 0 && c_.NH % l_nkv == 0) {
+                const bool whole = noncausal_attn_ && l_full;
+                const size_t qw = (size_t)nhd;
+                std::vector<float> qall((size_t)M * qw), qm;
+                std::vector<int> Tm((size_t)M), t0m((size_t)M);
+                for (int m = 0; m < M; m++) {
+                    if (!row_attn(m, nullptr, true, 0, &qm)) return false;
+                    if (qm.size() != qw) { err_ = "attention rows: q width"; return false; }
+                    memcpy(qall.data() + (size_t)m * qw, qm.data(), qw * sizeof(float));
+                    const int T = whole ? start_pos + M : start_pos + m + 1;
+                    Tm[(size_t)m] = T;
+                    t0m[(size_t)m] = (l_win > 0 && T > l_win) ? T - l_win : 0;
+                }
+                {
+                    LhScope _t_attn(LH_ATTN);
+                    const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)l_hd);
+                    const int nt = ((long)M * (start_pos + M) * l_hd >= 8192) ? omp_heads_threads() : 1;
+                    q4nx_attn::rows_context(qall.data(), kcache_[l].data(), vcache_[l].data(), M, c_.NH, l_nkv,
+                                            l_hd, Tm.data(), t0m.data(), scale, CTX.data(), nt);
+                    if (attn_gate_)
+                        for (int m = 0; m < M; m++) {
+                            const float* gate = QKV.data() + (size_t)m * g->N + nhd;
+                            float* c = CTX.data() + (size_t)m * ctx_w;
+                            for (int i = 0; i < nhd; i++) c[i] *= 1.0f / (1.0f + expf(-gate[i]));
+                        }
+                }
+                if (attn_check) {
+                    std::vector<float> ref((size_t)ctx_w);
+                    size_t differing = 0;
+                    for (int m = 0; m < M; m++) {
+                        if (!row_attn(m, ref.data(), false, Tm[(size_t)m])) return false;
+                        const float* c = CTX.data() + (size_t)m * ctx_w;
+                        for (int i = 0; i < ctx_w; i++)
+                            if (memcmp(&c[i], &ref[(size_t)i], sizeof(float)) != 0) differing++;
+                    }
+                    fprintf(stderr, "[attncheck] l=%d M=%d start=%d one-team vs per-row: %zu values %s\n", l, M,
+                            start_pos, (size_t)M * ctx_w, differing ? "MISMATCH" : "identical");
+                    if (differing) {
+                        err_ = "attention rows: the one-team form differs from the per-row form";
+                        return false;
+                    }
+                }
+            } else if (noncausal_attn_ && l_full) {
                 for (int m = 0; m < M; m++)
                     if (!row_attn(m, nullptr, true, 0)) return false;
                 for (int m = 0; m < M; m++)
@@ -4478,7 +4535,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
                                std::vector<float>& ctx, int head_dim,
                                int n_kv_heads, float theta, int rotary_dim,
                                bool proportional, int window,
-                               int kv_layer, bool append_kv, int kv_len) {
+                               int kv_layer, bool append_kv, int kv_len, std::vector<float>* q_out) {
     const int NH = c_.NH;
     const int HD = head_dim;      /* per layer type (Gemma4: 256 or 512) */
     const int NKV = n_kv_heads;
@@ -4585,6 +4642,13 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         vcache_[kv_layer].insert(vcache_[kv_layer].end(), v.begin(), v.end());
     }
 
+    // engine#1990: a batched pass asks for the position-local half only -- the q this row attends with, and its
+    // k/v in the cache -- and runs the read for all of its rows in one thread team (q4nx_attn::rows_context).
+    if (q_out) {
+        q_out->swap(q);
+        return true;
+    }
+
     // kv_len > 0 is a noncausal read: attend over that many cached positions instead of only the ones
     // up to `pos`.  Everything above (rope, qk-norm, the cache append) is position-local and unchanged.
     const int T = kv_len > 0 ? kv_len : pos + 1;
@@ -4606,30 +4670,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     {
         std::vector<float> score(T);
 #pragma omp for schedule(static)
-        for (int h = 0; h < NH; h++) {
-            const int kh = h / gqa;
-            const float* qh = &q[(size_t)h * HD];
-            float mx = -1e30f;
-            for (int t = 0; t < T; t++) {
-                if (t < t0) { score[t] = -1e30f; continue; }
-                const float* kt = &kcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-                score[t] = q4nx_attn::dot(qh, kt, HD) * scale;
-                if (score[t] > mx) mx = score[t];
-            }
-            float sum = 0.0f;
-            for (int t = 0; t < T; t++) {
-                if (t < t0) { score[t] = 0.0f; continue; }
-                score[t] = std::exp(score[t] - mx);
-                sum += score[t];
-            }
-            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
-            float* out = &ctx[(size_t)h * HD];
-            for (int t = t0; t < T; t++) {
-                const float p = score[t] * inv;
-                const float* vt = &vcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-                q4nx_attn::saxpy(p, vt, out, HD);
-            }
-        }
+        for (int h = 0; h < NH; h++)
+            q4nx_attn::head_context(&q[(size_t)h * HD], kcache_[kv_layer].data(), vcache_[kv_layer].data(), NKV,
+                                    h / gqa, HD, t0, T, scale, score.data(), &ctx[(size_t)h * HD]);
     }
     return true;
 }

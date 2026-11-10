@@ -278,7 +278,7 @@ private:
     bool attention(const std::vector<float>& qkv, int pos, const int* pos3, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
                    bool proportional, int window, int kv_layer, bool append_kv,
-                   int kv_len = 0);
+                   int kv_len = 0, std::vector<float>* q_out = nullptr);
     bool mlp(const std::vector<float>& gu, std::vector<float>& h, int im);
     // The same elementwise gate*up on caller memory, so a batched pass can read its ACT row and write its HH
     // row where they already are instead of staging both through a vector (a copy on each side).

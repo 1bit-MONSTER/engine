@@ -278,6 +278,9 @@ add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.
 # device. Deliberately OUTSIDE if(ONEBIT_SERVE_TEST_GGUF): that row is device-gated, and the whole point is that the
 # classification is checked in every configure, including the ones that never load a model.
 add_test(NAME serve_context_limit_classify COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh --self-test)
+# engine#1785: `serve --flash` names two settings (--ctx-size 1024, --prefix-pin on --device npu) and refuses what
+# contradicts them. Every case ends in the option check, so the row needs no model, no device and no port.
+add_test(NAME serve_flash_refusals COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_flash_test.sh $<TARGET_FILE:onebit>)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
@@ -322,6 +325,11 @@ add_python_test(tool_selftest_whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools
 # engine#1780: the DFlash draft package's gate before a loader -- tile-grid sizes from the config, tile-header sanity and
 # the container's scalars against config.json, on a synthetic package with eight negative controls. Stdlib only.
 add_python_test(tool_selftest_dflash_draft_info ${CMAKE_SOURCE_DIR}/tools/dflash_draft_info.py --selftest)
+# engine#2013: the qwen35 (gated linear attention) GGUF -> Q4NX converter. Its own selftest (tile round-trips, the
+# value-head permutation), and a pack + verify of a small qwen35 GGUF the test writes itself, with the three inputs it
+# has to refuse. numpy only: no gguf package, no model, no device.
+add_python_test(tool_selftest_qwen35_to_q4nx ${CMAKE_SOURCE_DIR}/tools/qwen35_to_q4nx.py selftest)
+add_python_test(qwen35_to_q4nx ${CMAKE_SOURCE_DIR}/tests/qwen35_to_q4nx_test.py)
 # engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
 add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
@@ -336,6 +344,11 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
+# engine#1934: reading ONE tensor out of a safetensors shard needs `data_offsets` measured from 8 + header_len, not
+# from byte 8. Getting that wrong returns a *different* tensor of the same size that still looks finite, and it cost
+# two false conclusions about a pack in one night. `--self-test` drives the rule on a synthetic shard (no network):
+# the same offset from the data section returns the tensor, from byte 8 it does not.
+add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-test)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
@@ -1326,6 +1339,11 @@ add_test(NAME quant_i8_row COMMAND quant_i8_row_test)
 add_executable(attn_math_test tests/attn_math_test.cpp)
 target_include_directories(attn_math_test PRIVATE npu/forward/include)
 add_test(NAME attn_math COMMAND attn_math_test)
+# engine#1990: the test also holds rows_context() (M rows in one thread team) to the per-row form bit for bit,
+# and that comparison is only about threads when the test has them.
+if(TARGET OpenMP::OpenMP_CXX)
+    target_link_libraries(attn_math_test PRIVATE OpenMP::OpenMP_CXX)
+endif()
 # ci.yml's build step names its targets explicitly and needs the `workflow` scope to extend, so bind each new
 # test binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add these to the list itself. `host_gemm_pad_test` is here for the

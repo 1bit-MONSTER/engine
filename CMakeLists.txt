@@ -687,7 +687,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp
                             npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
@@ -1200,6 +1200,11 @@ add_executable(npu_vision_pack_test tests/npu_vision_pack_test.cpp)
 target_link_libraries(npu_vision_pack_test PRIVATE onebit_npu)
 add_test(NAME npu_vision_pack COMMAND npu_vision_pack_test)
 add_dependencies(onebit npu_vision_pack_test)
+# The host float32 tower against goldens from the transformers implementation (see the test's header).
+add_executable(npu_vision_tower_test tests/npu_vision_tower_test.cpp)
+target_link_libraries(npu_vision_tower_test PRIVATE onebit_npu)
+add_test(NAME npu_vision_tower COMMAND npu_vision_tower_test)
+add_dependencies(onebit npu_vision_tower_test)
 add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)

@@ -37,6 +37,7 @@
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
@@ -48,6 +49,7 @@
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_semantics.h"
 #include "q4nx_pack.h"
+#include "q4nx_head_image.h"   // the lm-head tile cache (engine#1716)
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -2577,25 +2579,10 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
             for (int j = 0; j + 1 < CK - 1; j++) cs[j] = cs[j + 1];
             if (CK > 1) cs[CK - 2] = qkv[ch];
         }
-        // alpha/beta on the host (N = NVH, below the GEMM tile width)
-        const float* xm = xn.data() + (size_t)m * H;
-        {
-            LhScope _t_ab(LH_GDN_AB);
-            for (int hh = 0; hh < NVH; hh++) {
-                const float* ra = gdn_small_[(size_t)l].wa.data() + (size_t)hh * H;
-                const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)hh * H;
-                float sa = 0, sb = 0;
-                for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
-                AHS[(size_t)m * NVH + hh] = sa;
-                BHS[(size_t)m * NVH + hh] = sb;
-            }
-        }
-        if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l) {   // keep what a commit would need
-            auto& rec = row_in_[(size_t)l][(size_t)m];
-            rec.qkv.assign(qkv, qkv + CD);
-            rec.ah.assign(AHS.begin() + (size_t)m * NVH, AHS.begin() + (size_t)(m + 1) * NVH);
-            rec.bh.assign(BHS.begin() + (size_t)m * NVH, BHS.begin() + (size_t)(m + 1) * NVH);
-        }
+        // alpha/beta (N = NVH, below the GEMM tile width) no longer runs here: it depends on nothing this loop
+        // carries, so it is computed head-major inside the layer's one parallel region below (engine#1416).
+        if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l)   // keep what a commit would need;
+            row_in_[(size_t)l][(size_t)m].qkv.assign(qkv, qkv + CD);       // ah/bh are stored after the region
         // q/k L2-normalised with NVH/NKH head repetition; v per v-head
         float* qlm = &QLS[(size_t)m * NVH * KHD];
         float* klm = &KLS[(size_t)m * NVH * KHD];
@@ -2679,12 +2666,46 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     if (gdn_check) core_ref.assign(CORE.size(), 0.0f);
     std::vector<float> state_pre;   // NPU_GDN_CHECK only: the state the old nesting must start from
     if (gdn_check) state_pre = rec_state_[l];
+    // alpha/beta on the host: for every (row, head) one dot product of the row against that head's alpha row and
+    // one against its beta row.  It used to run inside the row loop above on ONE thread -- measured on the served
+    // 27B t2s pack, 76 ms of a 730 ms 16-row prefill block (0.099 ms per row and layer, 48 GDN layers), the largest
+    // single non-GEMM host term of a prefill pass once the pack column fell to 0.13 ms/launch (engine#1416).
+    // Each (row, head) pair is independent and writes its own two elements, and each dot product is the same
+    // sequential loop as before (strict IEEE: the build has no -ffast-math, so the summation order is the source
+    // order), so sharing the pairs out moves no bit.  It takes NO new parallel region: it is a second worksharing
+    // loop inside the one this layer already opens, because a region is what costs under contention (see above).
+    // Head-major like the recurrence, so a thread keeps one head's two weight rows (2 x H floats) in L1/L2 across
+    // the rows.  NPU_GDN_CHECK=1 recomputes it the old way, serially, and compares bit for bit.
+    const float* const wa_all = gdn_small_[(size_t)l].wa.data();
+    const float* const wb_all = gdn_small_[(size_t)l].wb.data();
+    auto alpha_beta = [&](int hh, int m, float* ah, float* bh) {
+        const float* xm = xn.data() + (size_t)m * H;
+        const float* ra = wa_all + (size_t)hh * H;
+        const float* rb = wb_all + (size_t)hh * H;
+        float sa = 0, sb = 0;
+        for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
+        ah[(size_t)m * NVH + hh] = sa;
+        bh[(size_t)m * NVH + hh] = sb;
+    };
     {
-        LhScope _t_core(LH_GDN_CORE);
+        // Timed on thread 0 at the two barriers, so `gdn alpha/beta` and `gdn recurrence` stay the two
+        // disjoint columns they were (an LhScope inside the region would be written by every thread).
+        const bool lh = q4nx_lh::lh_on();
+        std::chrono::steady_clock::time_point t0, t1;
+        if (lh) t0 = std::chrono::steady_clock::now();
 #pragma omp parallel num_threads(gdn_nt)
         {
             std::vector<float> scratch((size_t)2 * VHD);   // one allocation per thread, not per head
             float* sc = scratch.data();
+#pragma omp for schedule(static)
+            for (int hh = 0; hh < NVH; hh++)
+                for (int m = 0; m < M; m++) alpha_beta(hh, m, AHS.data(), BHS.data());
+            // implicit barrier: every AHS/BHS element is written before any head reads one
+#if defined(_OPENMP)
+            if (lh && omp_get_thread_num() == 0) t1 = std::chrono::steady_clock::now();
+#else
+            if (lh) t1 = std::chrono::steady_clock::now();
+#endif
 #pragma omp for schedule(static)
             for (int hh = 0; hh < NVH; hh++) {
                 float* sh = rs + (size_t)hh * KHD * VHD;
@@ -2692,8 +2713,34 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                     head_row(hh, m, sh, CORE.data() + (size_t)m * VD + (size_t)hh * VHD, sc);
             }
         }
+        if (lh) {
+            const auto t2 = std::chrono::steady_clock::now();
+            q4nx_lh::g_lh[LH_GDN_AB] += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            q4nx_lh::g_lh_n[LH_GDN_AB]++;
+            q4nx_lh::g_lh[LH_GDN_CORE] += std::chrono::duration<double, std::milli>(t2 - t1).count();
+            q4nx_lh::g_lh_n[LH_GDN_CORE]++;
+        }
     }
+    if (verify_open_ && (int)row_in_.size() > l)   // the rest of what a commit would need (qkv was stored above)
+        for (int m = 0; m < M && m < verify_rows_; m++) {
+            auto& rec = row_in_[(size_t)l][(size_t)m];
+            rec.ah.assign(AHS.begin() + (size_t)m * NVH, AHS.begin() + (size_t)(m + 1) * NVH);
+            rec.bh.assign(BHS.begin() + (size_t)m * NVH, BHS.begin() + (size_t)(m + 1) * NVH);
+        }
     if (gdn_check) {
+        // alpha/beta the old way: one thread, row-major, through the same body.  Compared as bit patterns, so a
+        // NaN that both produce is equal and a -0.0 against +0.0 is not.
+        std::vector<float> ah_ref(AHS.size()), bh_ref(BHS.size());
+        for (int m = 0; m < M; m++)
+            for (int hh = 0; hh < NVH; hh++) alpha_beta(hh, m, ah_ref.data(), bh_ref.data());
+        const bool ab_same = std::memcmp(ah_ref.data(), AHS.data(), AHS.size() * sizeof(float)) == 0 &&
+                             std::memcmp(bh_ref.data(), BHS.data(), BHS.size() * sizeof(float)) == 0;
+        fprintf(stderr, "[gdncheck] l=%d M=%d alpha/beta shared vs serial: %zu values %s\n", l, M,
+                2 * AHS.size(), ab_same ? "identical" : "MISMATCH");
+        if (!ab_same) {
+            err_ = "gdn check: the shared alpha/beta disagrees with the serial one at layer " + std::to_string(l);
+            return false;
+        }
         // The old nesting, through the same body: one region per row.  Bit-exactness is the whole claim of this
         // change, so it is asserted rather than argued -- the same form as NPU_REPLAY_CHECK in commit_verify_rows.
         std::copy(state_pre.begin(), state_pre.end(), rec_state_[l].begin());
@@ -5406,7 +5453,6 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     if (head_packed &&
         ((int)lm_head_packed_.size() != ntiles || lm_head_packed_T_ != T)) {
         lm_head_packed_.clear();
-        std::vector<float> bt(tile_elems);
         if (head_pb16i) {
             // The image is the file: no dequant, no pack, nothing to quantise on the host.  A
             // tile whose side table asks for the two-plane accumulator is refused, not guessed:
@@ -5433,20 +5479,76 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             fprintf(stderr, "  [forward] lm head: %d ternary image(s) resident (H=%d T=%d), "
                             "f32 head released\n", ntiles, H, T);
         } else {
+        // engine#1716: this loop used to gather and pack every tile on EVERY serve (10-17 s on a quiet box for the
+        // h4096 shapes, minutes on a contended one). The image is a pure function of the head's stored bytes and the
+        // kernel set's geometry, so a serve now asks q4nx_head_tile_image() for it: a previous serve's file is used
+        // when it reads back whole AND a sample of its columns re-packs to the same bytes from the weights held here;
+        // anything else packs exactly as before (same packer, same padded KD x ND image, same per-column scales as
+        // the per-token packB below) and leaves the file for the next serve. ONEBIT_HEAD_IMAGE_CACHE=0 turns it off.
+        const auto head_t0 = std::chrono::steady_clock::now();
+        std::string head_dir;
+        Q4nxHeadImageKey head_key = {(uint32_t)kpad_, (uint32_t)T, lctx.blocked_b ? 1u : 0u, 0};
+        {
+            const char* off = getenv("ONEBIT_HEAD_IMAGE_CACHE");
+            const bool cache_on = !(off && off[0] == '0' && off[1] == 0);
+            // The head's stored bytes: the separate lm_head.weight of an untied model, else the token table lm_at()
+            // falls back to (which a tied container may itself store as lm_head.weight).
+            TensorDesc* src = !lm_head_f_.empty() ? model_tensor_by_name(mw_, "lm_head.weight") : nullptr;
+            if (!src) {
+                src = &mw_->embed_tokens;
+                if (src->data_size == 0 || src->name[0] == '\0') src = model_tensor_by_name(mw_, "lm_head.weight");
+            }
+            const void* sp = (cache_on && src) ? model_tensor_data(mw_, src) : nullptr;
+            // An image the layout cannot hold as kd x nd bytes of T columns is not cached: it packs as before.
+            if (sp && src->data_size > 0 && (int)lctx.ND == T && (int)lctx.KD >= kpad_) {
+                // What changes the decoded head without changing its bytes: the vocabulary, the width it is read at,
+                // whether it is the tied table, and the dtype the decoder dispatches on.
+                uint32_t extra[8] = {(uint32_t)NV, (uint32_t)H, (uint32_t)lm_w_, lm_head_f_.empty() ? 1u : 0u, 0, 0, 0, 0};
+                std::memcpy(&extra[4], src->dtype, std::min(sizeof src->dtype, (size_t)16));
+                head_key.head_hash = q4nx_head_source_hash(sp, (size_t)src->data_size, extra, 8);
+                try {
+                    head_dir = onebit::npu::q4nx::cache_root() + "/head-images";
+                    std::error_code ec;
+                    std::filesystem::create_directories(head_dir, ec);
+                    if (ec) head_dir.clear();
+                } catch (const std::exception&) {
+                    head_dir.clear();   // no home and no ONEBIT_Q4NX_CACHE: pack, as before
+                }
+            }
+        }
+        struct HeadCol {
+            const Q4nxNpuForward* self;
+            int k;
+        } head_col = {this, kpad_};
+        const Q4nxHeadColFn head_col_fn = [](void* ctx, int n, float* out) {
+            const HeadCol* c = (const HeadCol*)ctx;
+            for (int k = 0; k < c->k; k++) out[k] = c->self->lm_at(n, k);
+        };
+        int head_hits = 0, head_wrote = 0;
         for (int t = 0; t < ntiles; t++) {
             const int n0 = t * T, n1 = std::min(NV, n0 + T);
-            std::fill(bt.begin(), bt.end(), 0.0f);   // padded columns must be zero
-            for (int n = n0; n < n1; n++)
-                for (int k = 0; k < kpad_; k++) bt[(size_t)k * T + (n - n0)] = lm_at(n, k);
             PackedWeight pw;
             pw.bo = lctx.make_weight_bo(*dev_);
-            float sout = 1.0f;
-            // Same packer, same padded KD x ND BO, same per-column scales as the
-            // per-token packB below, so the packed bytes are bit-identical.
-            lctx.packB_into(*pw.bo, bt.data(), kpad_, T, sout, pw.scales);
+            pw.scales.assign((size_t)lctx.ND > (size_t)T ? (size_t)lctx.ND : (size_t)T, 0.0f);
+            Q4nxHeadTileResult hres;
+            bool ok = false;
+            lctx.fill_weight_bo(*pw.bo, [&](int8_t* Bm) {
+                ok = q4nx_head_tile_image(head_dir.empty() ? nullptr : head_dir.c_str(), &head_key, t, n0, n1 - n0, kpad_,
+                                          T, lctx.KD, lctx.ND, head_col_fn, &head_col, Bm, pw.scales.data(), &hres) == 1;
+            });
+            if (!ok) {
+                err_ = std::string("lm head: ") + hres.why;
+                return false;
+            }
+            if (hres.refused)
+                fprintf(stderr, "  [forward] lm head: tile %d's cached image was NOT used and is replaced: %s\n", t, hres.why);
+            head_hits += hres.hit;
+            head_wrote += hres.wrote;
+            pw.scales.resize((size_t)T);
             lm_head_packed_.push_back(std::move(pw));
         }
         lm_head_packed_T_ = T;
+        const double head_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count();
         // Both f32 copies are now dead on this path: lm_head_tiles_ was only ever
         // read by the memcpy below, and lm_at() is reachable only from the
         // host_gemm_ branch (which returns above) and from the gather just done.
@@ -5455,8 +5557,9 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         lm_head_f_.clear();
         lm_head_f_.shrink_to_fit();
         fprintf(stderr, "  [forward] lm head: %d packed weight tile(s) resident "
-                        "(H=%d T=%d), f32 head + f32 tile gather released\n",
-                ntiles, H, T);
+                        "(H=%d T=%d), f32 head + f32 tile gather released; %d from the image cache, %d packed "
+                        "(%d written for the next serve) in %.2f s\n",
+                ntiles, H, T, head_hits, ntiles - head_hits, head_wrote, head_s);
         }
     }
     std::vector<float> Bt;

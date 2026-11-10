@@ -95,7 +95,7 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
      "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
 add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp
-                     app/embed_serve.cpp app/embed_model.cpp)
+                     app/embed_serve.cpp app/embed_model.cpp app/q4nx_cache.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -1070,6 +1070,13 @@ add_dependencies(npu_sampling_test npu_queue_test)
 # sentences) needs the 17.9 MB container the importer writes (the source safetensors is 13.9 MB) and stays
 # a measured row in the PR.
 add_executable(embed_model_test tests/embed_model_test.cpp app/embed_model.cpp)
+# engine#1956: the Q4NX container cache's sweep, driven on a synthetic cache (bound, LRU order, the entry just written, the
+# age window, and the disabled case). Listed explicitly like the other app/ units so the test needs no `onebit`.
+add_executable(q4nx_cache_test tests/q4nx_cache_test.cpp app/q4nx_cache.cpp)
+target_include_directories(q4nx_cache_test PRIVATE app)
+add_test(NAME q4nx_cache COMMAND q4nx_cache_test)
+# engine#1956 review: an `add_test` whose target ci.yml never builds never runs in CI -- the documented route, no workflow edit.
+add_dependencies(onebit q4nx_cache_test)
 target_include_directories(embed_model_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
 target_link_libraries(embed_model_test PRIVATE nlohmann_json::nlohmann_json)
 target_compile_definitions(embed_model_test PRIVATE SRC_DIR="${CMAKE_SOURCE_DIR}")
@@ -1346,8 +1353,12 @@ target_link_libraries(npu_derive_designs_dump PRIVATE m)
 # actually calls against the reference; the test links both. It is C++, so CMake switches this target's linker to CXX.
 # q4nx_head_image.c is the image cache's file format (engine#1716's cache slice, this branch): the identity arm above pins
 # what the image must contain, this one pins that what is written and read back is byte-identical to it.
+# q4nx_head_tile_cache.cpp is what a serve calls per head tile (load the image a previous serve wrote, or pack and write
+# it): the arms here are the cache's behaviour -- a second pass does not pack, a changed key does, a damaged or stale image
+# is replaced rather than used -- with a counter on the gather, so "rebuilt on every serve" cannot come back unnoticed.
 add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c
-                                  npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c)
+                                  npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c
+                                  npu/forward/src/q4nx_head_tile_cache.cpp)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 # engine#1779 fault 4 ("Gemma 4 tool-call parsing"): the answer parser is header-only (app/npu_answer_parser.h), so
@@ -1587,6 +1598,9 @@ endif()
         npu/forward/src/q4nx_pack.c
         # The production weight packer, extracted from I8Ctx so it can be tested without the device runtime (#1416).
         npu/forward/src/q4nx_pack_blocked.cpp
+        # The lm-head image cache (engine#1716): the file format, and the load-or-pack a serve calls per head tile.
+        npu/forward/src/q4nx_head_image.c
+        npu/forward/src/q4nx_head_tile_cache.cpp
         npu/forward/src/q4nx_semantics.c
         npu/forward/src/q4nx_forward.cpp
         # The NPU target interface and this box's target (engine#799 P4): the model keeps the maths, the

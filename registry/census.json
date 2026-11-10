@@ -1,6 +1,14 @@
 {
  "date": "2026-11-10",
  "coverage": {
+  "definitions": {
+   "mapped": "the pinned backend's code accepts this HF architecture class (registry/architectures.json names a backend for it); it is a property of the ARCHITECTURE, so every model of a mapped class counts as mapped whether or not that model was ever run",
+   "checked": "the architecture has a PASSING serve_e2e at the pin -- not that this model was run. It is the same per-architecture property, which is why the npu figure is essentially one architecture's model population rather than a count of models anyone exercised",
+   "declined": "a human reviewed the class and deliberately did not map it (registry/significant.json, watch: \"report\"). Counted separately and excluded from top_unmapped: it is a recorded decision, not work remaining. The denominator is unchanged -- declined models are still with_architecture",
+   "with_architecture": "models whose HF card names an architecture this census can look up; models with no architecture are excluded from every percentage above"
+  },
+  "declined_models": 687,
+  "declined_architectures": 21,
   "models": 435913,
   "with_architecture": 344207,
   "architectures_seen": 3037,
@@ -80,24 +88,12 @@
     "models": 139
    },
    {
-    "architecture": "Lfm3ForCausalLM",
-    "models": 126
-   },
-   {
     "architecture": "NanochatGPTForCausalLM",
     "models": 126
    },
    {
     "architecture": "OpensciForCausalLM",
     "models": 121
-   },
-   {
-    "architecture": "Glm5NextForConditionalGeneration",
-    "models": 115
-   },
-   {
-    "architecture": "MBartForConditionalGeneration",
-    "models": 112
    },
    {
     "architecture": "BartForCausalLM",

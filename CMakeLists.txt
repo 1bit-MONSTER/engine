@@ -1316,6 +1316,11 @@ add_dependencies(npu_sampling_test npu_rope_llama3_test)
 add_executable(hadamard_rotate_test tests/hadamard_rotate_test.cpp)
 target_include_directories(hadamard_rotate_test PRIVATE npu/forward/include)
 add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
+# engine#1990: rotate_rows() rotates a launch's rows in one thread team, and the test holds it to the serial loop bit
+# for bit; that comparison is only about threads when the test has them.
+if(TARGET OpenMP::OpenMP_CXX)
+    target_link_libraries(hadamard_rotate_test PRIVATE OpenMP::OpenMP_CXX)
+endif()
 # The arithmetic P7 (#806) part A rests on: (QH)(KH)^T = QK^T to f32 rounding, and what the rotation is
 # worth against an f16 KV cache (attention-weight KLD) with and without outlier channels.  Header only, no
 # device, no model: runs in CI.

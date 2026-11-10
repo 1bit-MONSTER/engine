@@ -146,4 +146,28 @@ inline void rotate(const float* signs, float* a, int n, int block) {
     rotate_scalar(signs, a, n, block);
 }
 
+// engine#1990: a batched launch's M rows -- each copied from `src` into `dst`, rotated, and given its int8 scale from
+// the rotated vector (amax / 127, or 1.0 for an all-zero row). XdnaTarget::npu_gemm_rows did this one row after
+// another on one thread, about 45-50 ms of a 16-row prefill block on bonsai2-27b-t2s2. The rows share nothing, so a
+// thread team over them runs exactly the per-row statements of the serial loop and the result is bit-identical for
+// any thread count (pinned by tests/hadamard_rotate_test.cpp). `threads` <= 1 is the serial loop.
+inline void rotate_rows(const float* signs, const float* src, float* dst, int M, int K, int block, float* ascales,
+                        int threads) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(threads > 1 ? threads : 1) if (threads > 1 && M > 1)
+#endif
+    for (int m = 0; m < M; m++) {
+        float* row = dst + (size_t)m * (size_t)K;
+        const float* in = src + (size_t)m * (size_t)K;
+        for (int k = 0; k < K; k++) row[k] = in[k];
+        rotate(signs, row, K, block);
+        float am = 0.0f;
+        for (int k = 0; k < K; k++) {
+            const float a = std::fabs(row[k]);
+            if (a > am) am = a;
+        }
+        ascales[m] = am > 0.0f ? am / 127.0f : 1.0f;
+    }
+}
+
 }  // namespace q4nx_hadamard

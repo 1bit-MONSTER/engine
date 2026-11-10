@@ -113,6 +113,52 @@ int main() {
             break;
         }
     }
+    // engine#1990: rotate_rows() is the batched launch's rows, rotated by one thread team. Each row must come out
+    // exactly as the serial loop it replaced makes it (copy, rotate, amax / 127 -- written out below as that loop),
+    // for every thread count, with the all-zero row's scale 1.0 and the input left untouched.
+    {
+        const int Ks[] = {5120, 17408};
+        const int threads[] = {1, 2, 5, 16};
+        size_t compared = 0;
+        for (int K : Ks) {
+            const int M = 16;
+            std::mt19937 rng(77u + (unsigned)K);
+            std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+            std::vector<float> signs((size_t)K), src((size_t)M * (size_t)K);
+            for (int i = 0; i < K; i++) signs[(size_t)i] = (i % 5 == 0) ? -1.0f : 1.0f;
+            for (float& v : src) v = dist(rng);
+            for (int k = 0; k < K; k++) src[(size_t)3 * (size_t)K + (size_t)k] = 0.0f;   // row 3: all zero
+            const std::vector<float> src_copy = src;
+            std::vector<float> want((size_t)M * (size_t)K), want_sc((size_t)M);
+            for (int m = 0; m < M; m++) {   // the serial loop XdnaTarget::npu_gemm_rows ran before
+                float* row = want.data() + (size_t)m * (size_t)K;
+                std::memcpy(row, src.data() + (size_t)m * (size_t)K, sizeof(float) * (size_t)K);
+                q4nx_hadamard::rotate(signs.data(), row, K, 1024);
+                float am = 0.0f;
+                for (int k = 0; k < K; k++) am = std::fabs(row[k]) > am ? std::fabs(row[k]) : am;
+                want_sc[(size_t)m] = am > 0.0f ? am / 127.0f : 1.0f;
+            }
+            for (int t : threads) {
+                std::vector<float> got((size_t)M * (size_t)K, -9.0f), sc((size_t)M, -9.0f);
+                q4nx_hadamard::rotate_rows(signs.data(), src.data(), got.data(), M, K, 1024, sc.data(), t);
+                char what[160];
+                std::snprintf(what, sizeof what, "rotate_rows K=%d threads=%d: rows differ from the serial loop", K, t);
+                check(std::memcmp(got.data(), want.data(), sizeof(float) * got.size()) == 0, what);
+                std::snprintf(what, sizeof what, "rotate_rows K=%d threads=%d: scales differ from the serial loop", K, t);
+                check(std::memcmp(sc.data(), want_sc.data(), sizeof(float) * sc.size()) == 0, what);
+                compared += got.size() + sc.size();
+            }
+            check(want_sc[3] == 1.0f, "rotate_rows: an all-zero row's scale is 1.0");
+            check(src == src_copy, "rotate_rows: the input rows are not modified");
+        }
+#if defined(_OPENMP)
+        std::printf("  rotate_rows: %zu values bit-identical to the serial loop (OpenMP build: threads 1, 2, 5, 16)\n",
+                    compared);
+#else
+        std::printf("  rotate_rows: %zu values bit-identical to the serial loop (no OpenMP: every count is serial)\n",
+                    compared);
+#endif
+    }
     if (failures) {
         std::printf("%d failure(s)\n", failures);
         return 1;

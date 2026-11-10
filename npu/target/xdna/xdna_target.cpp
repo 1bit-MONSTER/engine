@@ -31,6 +31,9 @@
 #include <fcntl.h>
 #include <fstream>
 #include <unistd.h>   // mkstemp/close: the pb16i activation probe's dump
+#if defined(_OPENMP)
+#include <omp.h>      // omp_get_max_threads: the batched rotation's thread team (engine#1990)
+#endif
 
 #include "hadamard.h"                // the activation rotation: one implementation, shared with the model
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx
@@ -1057,17 +1060,20 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
                 return;
             }
             const auto h0 = std::chrono::steady_clock::now();
-            had_buf_.assign(A, A + (size_t)M * (size_t)K);
-            for (int m = 0; m < M; m++) {
-                float* row = had_buf_.data() + (size_t)m * (size_t)K;
-                q4nx_hadamard::rotate(hs->second.data(), row, K, had_block_);
-                float am = 0.0f;
-                for (int k = 0; k < K; k++) {
-                    const float a = std::fabs(row[(size_t)k]);
-                    if (a > am) am = a;
-                }
-                ascales[(size_t)m] = am > 0.0f ? am / 127.0f : 1.0f;
-            }
+            // engine#1990: the rows are rotated by one thread team (bit-identical to one after another; see
+            // q4nx_hadamard::rotate_rows). NPU_ROT_ROWS=0 keeps the serial form for an A/B.
+            static const int rot_threads = [] {
+                const char* e = getenv("NPU_ROT_ROWS");
+                if (e && e[0] == '0') return 1;
+#if defined(_OPENMP)
+                return omp_get_max_threads();
+#else
+                return 1;
+#endif
+            }();
+            had_buf_.resize((size_t)M * (size_t)K);
+            q4nx_hadamard::rotate_rows(hs->second.data(), A, had_buf_.data(), M, K, had_block_, ascales.data(),
+                                       rot_threads);
             Ab = had_buf_.data();
             had_ms_ += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - h0).count();

@@ -179,16 +179,17 @@ def synthetic():
         check(all(r["finite"] == 1.0 for r in out["tiles_measured"]) and len(out["tiles_measured"]) == 2,
               "and its decode is reported as finite on both tiles")
 
-        # the end-anchored offset on a file that ends in padding (the 1.5B pack's .fconst ends in 110 MB of zeros):
-        # the count is reported, and the shifted read shows up as a non-finite decode instead of a quiet number
+        # a file that ends in padding (the 1.5B packs' .fconst ends in 110 MB of zeros): the count is reported AND used
+        # to place the grid. It used to be reported only, so the read landed inside the padding and came out non-finite --
+        # the symptom engine#1693 started from, on a pack where nothing is wrong (engine#1740)
         pz = os.path.join(work, "padded")
         make_pack(pz, tied=False, head_block=T.K_KBLOCK, zeros=4096)
         out, status, _ = T.measure(pz, 2)
         check(out["geometry"]["trailing_zero_bytes"] == 4096,
               "trailing zero bytes are counted (%d)" % out["geometry"]["trailing_zero_bytes"])
-        check(min(r["finite"] for r in out["tiles_measured"]) < 1.0,
-              "and a read shifted by them is visible as a non-finite decode (min finite %.3f)"
-              % min(r["finite"] for r in out["tiles_measured"]))
+        check(min(r["finite"] for r in out["tiles_measured"]) == 1.0,
+              "and the grid is placed BEFORE them, so a padded pack decodes finitely instead of reading its own padding "
+              "(min finite %.3f)" % min(r["finite"] for r in out["tiles_measured"]))
 
         # --ref as the oracle: the decode itself, written as f32 rows, must correlate 1.0 with itself
         with open(T.fconst(pu), "rb") as f:
@@ -245,6 +246,10 @@ def main():
     check(T.head_offset(291655296, 2374, 34816) + 2374 * 34816 == 291655296, "the head grid ends exactly at EOF")
     check(T.head_offset(291655296, 2374, 34816) != T.attn_payload_off(896),
           "attn_payload_off(H) alone is not the head's offset -- the mistake engine#1693 records")
+    check(T.head_offset(291655296, 2374, 34816, 0) == T.head_offset(291655296, 2374, 34816),
+          "no padding leaves the offset unchanged (the case engine#1693 measured)")
+    check(T.head_offset(291655296, 2374, 34816, 110208000) == T.head_offset(291655296, 2374, 34816) - 110208000,
+          "a trailing zero run moves the grid back by exactly its length (engine#1740's padded packs)")
     check(T.head_offset(291655296, 2374, 34816) == 209000256 + T.attn_payload_off(896),
           "it equals the importer's layers*stride + env (209000256 is this pack's 24 layer blocks)")
 

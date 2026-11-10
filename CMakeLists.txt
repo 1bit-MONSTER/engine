@@ -325,6 +325,9 @@ add_python_test(tool_selftest_whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools
 # engine#1780: the DFlash draft package's gate before a loader -- tile-grid sizes from the config, tile-header sanity and
 # the container's scalars against config.json, on a synthetic package with eight negative controls. Stdlib only.
 add_python_test(tool_selftest_dflash_draft_info ${CMAKE_SOURCE_DIR}/tools/dflash_draft_info.py --selftest)
+# engine#1750: what a TDR recovery did, counted from the kernel log (failed context restarts among them). The self-test
+# parses lines in the driver's own formats for three module generations. Stdlib only, no device.
+add_python_test(tool_selftest_amdxdna_tdr_report ${CMAKE_SOURCE_DIR}/tools/amdxdna_tdr_report.py --self-test)
 # engine#2013: the qwen35 (gated linear attention) GGUF -> Q4NX converter. Its own selftest (tile round-trips, the
 # value-head permutation), and a pack + verify of a small qwen35 GGUF the test writes itself, with the three inputs it
 # has to refuse. numpy only: no gguf package, no model, no device.
@@ -350,6 +353,8 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # the same offset from the data section returns the tensor, from byte 8 it does not.
 add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-test)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
+# engine#856: one HRX process's GTT split into the loader's copy and HRX's packed second copy, from its own -v log.
+add_python_test(hrx_gtt_split_self ${CMAKE_SOURCE_DIR}/tools/hrx_gtt_split.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
@@ -1130,6 +1135,14 @@ target_include_directories(npu_stop_tokens_test PRIVATE ${CMAKE_SOURCE_DIR}/app 
 target_link_libraries(npu_stop_tokens_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME npu_stop_tokens COMMAND npu_stop_tokens_test)
 add_dependencies(npu_sampling_test npu_stop_tokens_test)
+
+# The hand-off between the thread that generates a streamed reply and the one that writes it (app/stream_bridge.h,
+# engine#1785: the NPU route sent every frame after the generation ended). Two threads and a clock; no device.
+add_executable(stream_bridge_test tests/stream_bridge_test.cpp)
+target_include_directories(stream_bridge_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_link_libraries(stream_bridge_test PRIVATE Threads::Threads)
+add_test(NAME stream_bridge COMMAND stream_bridge_test)
+add_dependencies(npu_sampling_test stream_bridge_test)
 
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.

@@ -836,6 +836,34 @@ repacked-prefill kernel ([llama.cpp #250](https://github.com/1bit-MONSTER/llama.
 `GGML_HRX_Q6K_PACKED_PREFILL`) stays **opt-in** for the same reason: it is numerically free and speed-neutral, so it buys nothing
 on its own.
 
+**Measuring the duplicate on your own build.** `tools/hrx_gtt_split.py` splits one process's GTT into the loader's copy and HRX's
+packed second copy, using only lines llama.cpp and HRX already print plus the process's own fdinfo. It needs no root and no
+tracefs. Inside your ticket:
+
+```
+gpu-hold -l <lane> -t 5 -- tools/hrx_gtt_split.py run --out split-4b -- \
+    llama-cli -m Qwen3-4B-Q4_K_M.gguf -ngl 99 -fit off -c 256 -n 16 --temp 0 -no-cnv -p "The capital of France is"
+tools/hrx_gtt_split.py parse split-4b/split.log --samples split-4b/gtt.txt     # again, from the files it left
+```
+
+`run` adds `-v`, sets `GGML_HRX_HOST_WEIGHT_TRACE=1`, and samples `drm-total-gtt` with each DRM client counted once. On the
+#1351 pin (llama.cpp `40f58efe1`, the same command):
+
+| part | Qwen3-4B Q4_K_M | Qwen3.8-27B UD-Q4_K_XL |
+|---|---:|---:|
+| loader's model buffer (HRX) | 2,375.9 MiB | 15,718.5 MiB |
+| HRX's packed copies | **795.8 MiB** (38 weights) | **2,631.3 MiB** (66 weights) |
+| KV + recurrent state | 36.0 | 165.6 |
+| compute + output buffers | 43.2 | 72.1 |
+| not attributed | 674.1 | 1,909.5 |
+| process peak GTT | 3,925 | 20,497 |
+| share of the loader's copy resident twice | 33.5 % | 16.7 % |
+
+The packed copies are the duplicate. HRX builds one for each weight that a kernel reads in a re-laid-out form; prefill above
+a token threshold still reads the loader's copy. "Not attributed" is mostly runtime module memory and copy staging (the
+staging buffer is capped at 64 MiB since [llama.cpp #266](https://github.com/1bit-MONSTER/llama.cpp/pull/266)). It is not
+weights. This replaces the `bo_trace.py` reproduction in the issue body, which was never committed.
+
 ### Measuring on `HRX0`: what makes a number citable
 
 Numbers measured on this device swing far more between *runs* than between *files*, so the harness matters as much as the arm. Everything below is

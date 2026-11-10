@@ -1526,6 +1526,15 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
 
+**Streaming.** With `"stream": true` the route sends each piece of the answer as it is produced. The first frame
+leaves once the prompt has been processed and the first visible piece exists (a thinking model's opening markup is
+held until it can be classified, so that is a token or two after the prompt is done), and the rest follow about
+one per token. Before engine#1785 every frame was sent after the generation had ended, so a client's time to first
+token was the whole request. A request that fails before producing anything (a prompt over the context, a
+malformed field) still gets its own status code, not a 200 stream; one that fails later reports the error as a
+last `data:` frame. A client that disconnects stops the generation at the next token, which frees the device for
+the next request. The streamed reply and the non-streamed one are the same text.
+
 ### FastFlowLM's NPU2 drops: the families the route does not serve
 
 The daily census-watch (engine#588) prints one line per new or changed repo in FastFlowLM's HF

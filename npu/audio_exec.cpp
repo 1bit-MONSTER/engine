@@ -1,9 +1,22 @@
 // Copyright 2026 bong-water-water-bong
 // SPDX-License-Identifier: Apache-2.0
 //
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // audio_exec.cpp -- the host f32 executor for an audio pack's graph (see audio_exec.h for the contract).
 
 #include "audio_exec.h"
+#include "audio_parallel.h"
 
 #include <cmath>
 #include <cstring>
@@ -11,7 +24,6 @@
 #include <set>
 #include <cstdlib>
 #include <limits>
-#include <thread>
 #include <stdexcept>
 
 #include "forward/include/audio_ops.h"
@@ -80,33 +92,6 @@ size_t bcast_index(const std::vector<int64_t>& od, const std::vector<int64_t>& s
         stride *= size_t(d);
     }
     return off;
-}
-
-// Deterministic fork-join over independent units of work (output rows, batch indices). Each unit writes only its own slice, so
-// every element's arithmetic is unchanged by the thread count: the result is bit-identical to the serial loop, which is the
-// property a reference implementation has to keep. ONEBIT_AUDIO_THREADS=1 forces the serial path (the control for measuring it).
-template <typename Fn>
-void parallel_units(size_t units, Fn&& fn) {
-    size_t want = 1;
-    if (const char* env = std::getenv("ONEBIT_AUDIO_THREADS")) {
-        const long n = std::strtol(env, nullptr, 10);
-        want = n > 0 ? size_t(n) : 1;
-    } else {
-        const size_t hw = std::thread::hardware_concurrency();
-        want = hw == 0 ? 1 : (hw > 8 ? 8 : hw);
-    }
-    if (want > units) want = units;
-    if (want <= 1) {
-        for (size_t u = 0; u < units; ++u) fn(u);
-        return;
-    }
-    std::vector<std::thread> pool;
-    pool.reserve(want);
-    for (size_t t = 0; t < want; ++t)
-        pool.emplace_back([&, t]() {
-            for (size_t u = t; u < units; u += want) fn(u);
-        });
-    for (auto& th : pool) th.join();
 }
 
 void broadcast_binary(const Tensor& a, const Tensor& b, const std::string& op, Tensor* out) {

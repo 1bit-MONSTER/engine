@@ -1223,6 +1223,13 @@ add_executable(audio_mel_test tests/audio_mel_test.cpp)
 target_include_directories(audio_mel_test PRIVATE npu/forward/include)
 add_executable(audio_exec_test tests/audio_exec_test.cpp)
 target_link_libraries(audio_exec_test PRIVATE onebit_npu)
+# The executor's fork-join (npu/audio_parallel.h): MatMul bit-identical across ONEBIT_AUDIO_THREADS, and a throwing unit
+# is a caught exception rather than std::terminate. The graph is built in memory, so: no pack, no device.
+add_executable(audio_parallel_test tests/audio_parallel_test.cpp)
+target_link_libraries(audio_parallel_test PRIVATE onebit_npu Threads::Threads)
+# ci.yml's build list is not ours to edit without `workflow` scope, so these reach CI the way ops_dump_test does: as build
+# dependencies of a target it already builds (tools/ci/ci_targets_check.py follows this edge).
+add_dependencies(onebit audio_ops_test audio_mel_test onnx_graph_test audio_exec_test audio_parallel_test)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1500,6 +1507,7 @@ add_test(NAME audio_mel COMMAND audio_mel_test)
 set_tests_properties(audio_ops PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME onnx_graph COMMAND onnx_graph_test ${ONEBIT_AUDIO_ONNX})
 add_test(NAME audio_exec COMMAND audio_exec_test ${ONEBIT_AUDIO_ONNX})
+add_test(NAME audio_parallel COMMAND audio_parallel_test)
 set_tests_properties(audio_exec PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(onnx_graph PROPERTIES SKIP_RETURN_CODE 77)
 # The private NPU route registry (npu/private_route.h), without an add-on.

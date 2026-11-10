@@ -1,6 +1,18 @@
 // Copyright 2026 bong-water-water-bong
 // SPDX-License-Identifier: Apache-2.0
 //
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // whisper_transcribe.cpp -- the whole host pipeline: wav -> log-mel -> encoder -> greedy decode -> token ids.
 //
 //     ./whisper_transcribe <encoder.onnx> <decoder.onnx> <file.wav> [expected-ids-csv ...]
@@ -96,6 +108,10 @@ int main(int argc, char** argv) {
     using namespace onebit::npu::pack_import;
 
     std::string why;
+    // The spans the last line reports, each named for what it contains and nothing else: wav (reading the file), mel
+    // (the log-mel front-end), load (parsing both graphs), encoder, decode. `wall` is their sum, from before the file
+    // is opened.
+    const auto t_begin = std::chrono::steady_clock::now();
     std::vector<float> audio = read_wav_16k_mono(argv[3], &why);
     if (audio.empty()) {
         std::fprintf(stderr, "wav: %s\n", why.c_str());
@@ -121,6 +137,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "graph: %s\n", e.what());
         return 1;
     }
+    const auto t_load = std::chrono::steady_clock::now();
     AudioRunResult xa;
     if (!run_audio_graph(enc, mel.data(), cfg.bins, cfg.frames, "", &xa, &why)) {
         std::fprintf(stderr, "encoder: %s\n", why.c_str());
@@ -158,9 +175,10 @@ int main(int argc, char** argv) {
     const auto secs = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
         return std::chrono::duration<double>(b - a).count();
     };
-    std::printf("time: mel+load %.3f s, encoder %.3f s, decode %.3f s for %zu token(s) -> %.3f s/token, wall %.3f s\n",
-                secs(t_start, t_mel), secs(t_mel, t_enc), secs(t_enc, t_dec), ids.size(),
-                ids.empty() ? 0.0 : secs(t_enc, t_dec) / double(ids.size()), secs(t_start, t_dec));
+    std::printf("time: wav %.3f s, mel %.3f s, load %.3f s, encoder %.3f s, decode %.3f s for %zu token(s) -> %.3f s/token, "
+                "wall %.3f s\n",
+                secs(t_begin, t_start), secs(t_start, t_mel), secs(t_mel, t_load), secs(t_load, t_enc), secs(t_enc, t_dec),
+                ids.size(), ids.empty() ? 0.0 : secs(t_enc, t_dec) / double(ids.size()), secs(t_begin, t_dec));
     std::printf("ids:");
     for (int64_t v : ids) std::printf(" %lld", (long long)v);
     std::printf("\n");

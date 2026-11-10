@@ -823,6 +823,25 @@ forward route, which reads the block from `config.json`: `rope_type: "llama3"`
 declared-but-unusable `llama3` block, and every other declared type, at `1bit serve` /
 `forward-serve` load time rather than at request time.
 
+**Hunyuan (`hunyuan_v1_dense`) differs from the other q/k-norm families in four places: three in
+the forward, which reads them from the model rather than from a family list where it can, and one in
+the importer**
+([engine#1889](https://github.com/1bit-MONSTER/engine/issues/1889)). Each was measured against
+`Hunyuan-7B-Instruct`'s own pack:
+
+| what | rule | where it comes from |
+|---|---|---|
+| whether q and k are normalised | `use_qk_norm` in `config.json` decides when the config states it; the `qwen3*`/`gemma*` table answers only for configs that do not | the config key. The table has no Hunyuan row, so its gains were loaded and never applied |
+| the RoPE base | `rope_scaling: {type: "dynamic", alpha: A}` is a **fixed** base `theta * A^(dim/(dim-2))` at every position (11,158,840 for theta 10000, alpha 1000, dim 128). Without `alpha` the block is the position-dependent NTK rule | the graph's `cos_cache`/`sin_cache` in `model.onnx.data` match that base to 0.00024; plain theta 10000 is off by up to 1.99 |
+| the order of norm and RoPE | RoPE first, then the per-head RMSNorm (Qwen3 and Gemma normalise first) | the graph: `q_proj -> RotaryEmbedding -> q_norm -> GroupQueryAttention` in every layer |
+| the order of the attention tiles in the pack (importer) | q tiles first, then k, then v. Every other family's block is k, q, v. `1bit npu-pack import` picks the order with the block shape that carries the packed q/k gains | measured: with k, q, v the imported model predicts 26 of 77 next tokens of a fixed text, with q, k, v 59 (the two projections were being read as each other) |
+
+A model whose config says q and k are normalised and whose container has no
+`self_attn.q_norm.weight` is refused at load: the gain would read as zeros and zero every head's q.
+That is the shape of a Hunyuan container imported before the importer carried the gains, so the
+answer is to re-import it. A Hunyuan container imported before the tile order was right has
+the gains and still answers filler words; re-import that one too.
+
 | GGUF type | To q4_1 | Error |
 |---|---|---|
 | Q4_0 | scale `d`, zero `-8d`, codes unchanged | bf16 rounding of scale and zero |

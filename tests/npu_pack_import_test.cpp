@@ -5665,6 +5665,21 @@ void test_header_witness_refusal() {
     std::printf("  header witness: 8 arms (one-header vote vs declaration refuses; 3/1-without-declaration/0 allowed)\n");
 }
 
+// engine#1889: which tile each projection starts at inside the attention payload. Every family before Hunyuan is
+// k, q, v; the Hunyuan block is q, k, v, and reading it k, q, v handed the forward q_proj's first rows as k_proj
+// (byte-exact round trip, filler-word answers). Hunyuan-7B's own counts: 16 k/v tiles, 64 q tiles.
+void test_attn_first_tiles() {
+    const pi::AttnFirstTiles kqv = pi::attn_first_tiles(16, 64, false);
+    check(kqv.k == 0 && kqv.q == 16 && kqv.v == 80, "attn order: k,q,v puts k at tile 0, q at 16, v at 80");
+    const pi::AttnFirstTiles qkv = pi::attn_first_tiles(16, 64, true);
+    check(qkv.q == 0 && qkv.k == 64 && qkv.v == 80, "attn order: q,k,v puts q at tile 0, k at 64, v at 80 (engine#1889)");
+    check(qkv.k + 16 == qkv.v && kqv.q + 64 == kqv.v, "attn order: v follows the second run in both orders");
+    const pi::AttnFirstTiles small = pi::attn_first_tiles(2, 14, false);   // Qwen2.5-0.5B: k 2, q 14, v 2
+    check(small.k == 0 && small.q == 2 && small.v == 16, "attn order: the Qwen2.5-0.5B run (2/14/2) is unchanged");
+    pi::Plan p;
+    check(!p.attn_q_first, "attn order: a plan is k,q,v unless the block measured otherwise");
+}
+
 int main(int argc, char** argv) {
     // engine#1907: every crafted 1.9 import writes a canonical copy into the scratch cache. Without this the suite left 0-byte
     // copies in the user's real ~/.cache/1bit/fconst19 and in /tmp on every run. Give the run its own directory, removed at exit.
@@ -5677,6 +5692,7 @@ int main(int argc, char** argv) {
     test_header_witness_refusal();
     test_encode_tile_code_range();
     test_q4_writer_code_range();
+    test_attn_first_tiles();
     test_qk_norm_refusal();
     test_qk_gain_offsets();
     test_tail_head_placement();

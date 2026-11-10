@@ -1525,6 +1525,14 @@ target_include_directories(q4nx_mrope_test PRIVATE npu/forward/include)
 target_link_libraries(q4nx_mrope_test PRIVATE m)
 add_test(NAME q4nx_mrope COMMAND q4nx_mrope_test)
 add_dependencies(npu_sampling_test q4nx_mrope_test)
+# Which models get the per-head q/k RMSNorm: config.json's use_qk_norm when the config states it, else the
+# model_type table (engine#1889: Hunyuan declares it under a model_type the table has no row for, so its gains were
+# loaded and never applied).  Plain C, links the semantics TU directly, no model and no device.
+add_executable(q4nx_qk_norm_test tests/q4nx_qk_norm_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(q4nx_qk_norm_test PRIVATE npu/forward/include)
+target_link_libraries(q4nx_qk_norm_test PRIVATE m)
+add_test(NAME q4nx_qk_norm COMMAND q4nx_qk_norm_test)
+add_dependencies(npu_sampling_test q4nx_qk_norm_test)
 add_executable(q4nx_layer_kinds_test tests/q4nx_layer_kinds_test.c npu/forward/src/q4nx_semantics.c)
 target_include_directories(q4nx_layer_kinds_test PRIVATE npu/forward/include)
 target_link_libraries(q4nx_layer_kinds_test PRIVATE m)

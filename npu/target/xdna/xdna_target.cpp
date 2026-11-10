@@ -20,6 +20,7 @@
 //
 // docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
 #include "target/xdna/xdna_target.h"
+#include "batch_width.h"
 
 #include <algorithm>
 #include <chrono>
@@ -281,8 +282,28 @@ bool XdnaTarget::weight_cached(int layer, int key) const {
 }
 
 int XdnaTarget::max_rows() const {
-    if (pb16i_) { for (int i = 0; i < ndesigns_; i++) if (ctx16_[i]) return ctx16_[i]->MD; }
-    for (int i = 0; i < ndesigns_; i++) if (ctx_[i]) return ctx_[i]->MD;
+    // engine#1900: the SEALED route keeps its design in one ELF and populates no per-role ctx_, so both loops used to
+    // find nothing and every sealed pack reported width 1 -- the chunker then walked N single-row passes, which is
+    // the whole point of step_batch's chunking. The width is known: the sealed ELF is plan-derived and `caps()`
+    // already answers which design is loaded (the decode twin or the prefill one).
+    //
+    // MIN over the loaded widths, never the first populated one: this width is the chunk width, and an over-wide
+    // launch reads past the activation BO (engine#1372 -- memory corruption, not a slow path). A 16/16/128 set must
+    // therefore answer 16; answering 128 because that role happens to be index 0 is the dangerous direction.
+    const int n = ndesigns_;
+    int w = 0;
+    if (pb16i_) {
+        int widths[Q4NX_MAX_DESIGNS] = {0};
+        for (int i = 0; i < n && i < Q4NX_MAX_DESIGNS; i++) widths[i] = ctx16_[i] ? ctx16_[i]->MD : 0;
+        w = onebit::npu::batch_width_min(widths, n < Q4NX_MAX_DESIGNS ? n : Q4NX_MAX_DESIGNS, 1);
+        if (w <= 1 && !pb16i_sealed_.empty()) w = caps().max_rows;   // sealed: no ctx, the loaded design's own M
+        if (w > 1) return w;
+    } else {
+        int widths[Q4NX_MAX_DESIGNS] = {0};
+        for (int i = 0; i < n && i < Q4NX_MAX_DESIGNS; i++) widths[i] = ctx_[i] ? ctx_[i]->MD : 0;
+        w = onebit::npu::batch_width_min(widths, n < Q4NX_MAX_DESIGNS ? n : Q4NX_MAX_DESIGNS, 1);
+        if (w > 1) return w;
+    }
     return 1;
 }
 

@@ -1545,6 +1545,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
 
     backend_ = "full ELF";
     ready_ = true;
+    /* engine#1900: say the batch width once at load, the way the block note does, so a log can be told apart from a
+     * forward that never batched. Before this, a sealed pack reported 1 through the whole run and nothing said so --
+     * the only symptom was N single-row passes and #1781 gate 1 having no pack to measure on. */
+    std::fprintf(stderr, "  [forward] batch width %d row(s) per launch\n", max_batch_rows());
     return true;
 }
 

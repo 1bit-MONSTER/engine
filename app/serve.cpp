@@ -185,6 +185,7 @@ struct Options {
     int prefix_slots    = -1;   // --prefix-slots N (0 = off)
     int prefix_cache_mb = -1;   // --prefix-cache-mb N
     int prefix_min_gain = -1;   // --prefix-min-gain N: tokens a prompt must add to be worth keeping
+    bool prefix_pin = false;    // --prefix-pin: keep the part single-turn requests share (docs/npu.md)
     std::string npu_target;  // --npu-target NAME: which NPU target serves the per-op route (empty = the build's default)
     std::string prefill_provider;        // --prefill-provider PATH (or ONEBIT_HYBRID_PREFILL): --device hybrid's prefill (docs/hybrid.md)
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
@@ -3167,6 +3168,7 @@ void usage(FILE* out) {
                  "                  [--npu-streams N]   with --device npu: this serve is one of N sharing the NPU\n"
                  "                  [--prefix-slots N] [--prefix-cache-mb N] [--prefix-min-gain N]   the prompt prefix cache\n"
                  "                  (docs/npu.md; 0 slots turns it off). Unset keeps the forward's defaults: 8 / 4096 / 128\n"
+                 "                  [--prefix-pin]   keep the part a request shares with the previous one (one system prompt, many questions)\n"
                  "                  (default 1, the device exclusive; docs/npu.md)\n"
                  "                  [--load-queue-ms N]   a load refused because another client holds the NPU array\n"
                  "                  waits at most N ms for it to free before the driver is called dead\n"
@@ -3282,6 +3284,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--prefix-slots")    o.prefix_slots    = std::stoi(next());
         else if (a == "--prefix-cache-mb") o.prefix_cache_mb = std::stoi(next());
         else if (a == "--prefix-min-gain") o.prefix_min_gain = std::stoi(next());
+        else if (a == "--prefix-pin") o.prefix_pin = true;
         else if (a == "--npu-target") o.npu_target = next();
         else if (a == "--prefill-provider") o.prefill_provider = next();
         else if (a == "--laya-model") o.laya_model = next();
@@ -3433,6 +3436,7 @@ int run_serve(int argc, char** argv) {
                 if (o.prefix_slots    >= 0) { fargs.push_back("--prefix-slots");    fargs.push_back(std::to_string(o.prefix_slots)); }
                 if (o.prefix_cache_mb >= 0) { fargs.push_back("--prefix-cache-mb"); fargs.push_back(std::to_string(o.prefix_cache_mb)); }
                 if (o.prefix_min_gain >= 0) { fargs.push_back("--prefix-min-gain"); fargs.push_back(std::to_string(o.prefix_min_gain)); }
+                if (o.prefix_pin) fargs.push_back("--prefix-pin");
                 std::vector<char*> fav;
                 for (auto& a : fargs) fav.push_back(a.data());
                 return run_forward_serve(int(fav.size()), fav.data());

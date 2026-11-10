@@ -19,8 +19,18 @@
 // OpenAI endpoints as `1bit unified`.
 #pragma once
 
+#include <string>
+#include <vector>
+
 namespace onebit {
 
 int run_forward_serve(int argc, char** argv);
+
+// engine#1862: `1bit npu-run --ids` on a pack whose kernel directory holds the SEALED set (SEALED-*/full_i8_*), which is
+// every pack since that route shipped. Runs the ids through ONE multi-row pass of the same forward `forward-serve`
+// drives -- the pass the k-row identity check needs -- and prints each row's argmax. `host_gemm` (NPU_INFER_HOST_GEMM)
+// takes no device lock, exactly as forward-serve decides it. Returns the process exit code.
+int run_forward_ids(const std::string& model_dir, const std::string& kernels, const std::vector<int>& ids,
+                    int max_tokens, float penalty, bool host_gemm);
 
 }  // namespace onebit

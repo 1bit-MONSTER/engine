@@ -66,6 +66,14 @@ inline bool blocked_fits(int KD, int ND) {
     return KD > 0 && ND > 0 && KD % 64 == 0 && ND % 128 == 0;
 }
 
+// Element (i,j) in whichever layout an image was packed in. A caller that packs UNPADDED (KD == K, ND == N), like
+// the integer host arm, must pick `blocked = blocked_fits(K, N)`: blocked_index() addresses whole tiles, so on a
+// geometry that is not whole tiles it walks past a K*N buffer -- phi-3-mini's last vocabulary block (K 3072,
+// N 7488) by 196,608 B (engine#1994). The row-major image holds the same codes, so the int32 result is unchanged.
+inline size_t image_index(size_t i, size_t j, int KD, int ND, bool blocked) {
+    return blocked ? blocked_index(i, j, KD, ND) : rowmajor_index(i, j, KD, ND);
+}
+
 // Copy an int8 K x N weight (row-major, K rows of N bytes) into a KD x ND image
 // in the given layout; bytes outside the logical K x N matrix come out zero.
 //

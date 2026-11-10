@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -664,6 +665,50 @@ void test_evict_stale_canonical_copies() {
     check(exists(other_form), "evict: another canonical form version is kept");
     check(exists(unrelated), "evict: unrelated files in the directory are kept");
 
+    // engine#1770 (second generation): the pre-version naming has no source identity, so a prefix match on the current form
+    // never sees it -- three such files sat in /tmp for a day at 3.6 GB each, i.e. 10.67 GiB of RAM.
+    const std::string legacy = "1bit-fconst19-12345-896-14-24.fconst";
+    const std::string legacy_other_geometry = "1bit-fconst19-12345-1536-12-28.fconst";
+    touch(legacy);
+    touch(legacy_other_geometry);
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix, legacy);
+    check(!exists(legacy), "evict: the pre-version name for THIS geometry goes (no identity to reuse)");
+    check(exists(legacy_other_geometry), "evict: ... but another geometry's pre-version name is kept");
+
+    // and the abandoned tail: a pack nobody imports again is only reachable by age, because the sweep runs when a pack is
+    // written. 0 must disable it, so the callers that pass nothing keep the old behaviour.
+    const std::string old_other = "1bit-fconst19v1-77777-1536-12-28-995712640-73345656.fconst";
+    const std::string fresh_other = "1bit-fconst19v1-88888-1536-12-28-995712640-73345656.fconst";
+    touch(old_other);
+    touch(fresh_other);
+    const auto seven_hours_ago = fs::file_time_type::clock::now() - std::chrono::hours(7);
+    fs::last_write_time(dir / old_other, seven_hours_ago, ec);
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix, legacy, 6 * 3600);
+    check(!exists(old_other), "evict: an abandoned geometry older than the age goes (the tail a write cannot reach)");
+    check(exists(fresh_other), "evict: a fresh copy of another geometry stays -- another run may be writing it");
+
+    // engine#1797 review: the age rule reads `last_write_time`, and reuse used to READ the copy without writing it -- so
+    // a file in continuous use aged past `max_age_seconds` and was swept, and the next run rewrote it. The repair is
+    // that reuse now touches the copy, which makes the timestamp mean "last use". This arm pins the rule that repair
+    // relies on: a copy with a FRESH mtime survives an age sweep, and one with an old mtime does not.
+    {
+        // DIFFERENT geometry (hidden 1536), so the name rule cannot reach them and only the age rule decides -- which is
+        // the rule this arm is about. Same geometry would test the name rule instead, and my first version of this arm
+        // made exactly that mistake and failed on it.
+        const std::string stem = "1bit-fconst19v1-";
+        const std::string aged = stem + "12345-1536-12-28-995712640-73345656.fconst";
+        const std::string fresh_name = stem + "12345-1536-12-28-500000000-11111111.fconst";
+        touch(aged);
+        touch(fresh_name);
+        std::error_code tec;
+        fs::last_write_time(dir / aged, fs::file_time_type::clock::now() - std::chrono::hours(10), tec);
+        check(!tec, "evict age: the fixture can age a copy");
+        // 6 h window: the 10 h copy goes, the one just written stays
+        pi::evict_stale_canonical_copies(dir.string(), keep, prefix, "", 6 * 3600);
+        check(!exists(aged), "evict age: a copy nobody has touched for 10 h is swept");
+        check(exists(fresh_name), "evict age: a copy with a fresh mtime survives -- what reuse's touch produces");
+        check(exists(keep), "evict age: and the copy being written is still kept");
+    }
     // The degenerate arguments must not turn into "delete the directory".
     for (const auto& f : {keep, stale}) touch(f);
     pi::evict_stale_canonical_copies(dir.string(), "", prefix);
@@ -673,7 +718,8 @@ void test_evict_stale_canonical_copies() {
     pi::evict_stale_canonical_copies((dir / "absent").string(), keep, prefix);
     check(exists(keep), "evict: an absent directory is not an error");
     fs::remove_all(dir, ec);
-    std::printf("  canonical copy eviction: 12 arms (name composition + keep/stale/geometry/pack/form/unrelated + 3 degenerate)\n");
+    std::printf("  canonical copy eviction: 16 arms (name composition + keep/stale/geometry/pack/form/unrelated + legacy name +"
+                " geometry/age rules + 3 degenerate)\n");
 }
 
 void test_modelbin_genre_refusal(const std::string& root) {
@@ -2437,6 +2483,69 @@ void test_fconst19_rule_table() {
     std::printf("fconst19 rule: measured row, unmeasured refusal, and the ambiguity guard all behave\n");
 }
 
+// engine#1801's reviewer asked for the test that would catch the case the fix itself found once: the canonical .fconst copy is a
+// cache whose size is the pack's own .fconst, and on this box /tmp is tmpfs, so where it lands is a RAM decision. The bug was a
+// cache directory that was never created -- every pack then fell through to /tmp and nothing noticed.
+void test_fconst_scratch_order() {
+    const auto first_with = [](const char* scratch, const char* xdg, const char* home) {
+        if (scratch) setenv("ONEBIT_FCONST_SCRATCH", scratch, 1); else unsetenv("ONEBIT_FCONST_SCRATCH");
+        if (xdg) setenv("XDG_CACHE_HOME", xdg, 1); else unsetenv("XDG_CACHE_HOME");
+        if (home) setenv("HOME", home, 1); else unsetenv("HOME");
+        const auto dirs = pi::fconst_scratch_dirs();
+        return dirs.empty() ? std::string() : dirs.front();
+    };
+    // 1. an explicit override wins, because a lane's own scratch dir is the only place it controls
+    check(first_with("/tmp/scratch-override", nullptr, "/home/x") == "/tmp/scratch-override",
+          "fconst scratch: ONEBIT_FCONST_SCRATCH is chosen first");
+    // 2. otherwise the on-disk cache directory, never the temp directory -- the whole point of engine#1801
+    check(first_with(nullptr, "/xdg-cache", "/home/x") == "/xdg-cache/1bit/fconst19",
+          "fconst scratch: XDG_CACHE_HOME/1bit/fconst19 is chosen when no override is set");
+    check(first_with(nullptr, nullptr, "/home/x") == "/home/x/.cache/1bit/fconst19",
+          "fconst scratch: HOME/.cache/1bit/fconst19 is the default -- disk, not tmpfs");
+    // 3. the temp directory must never come first: on this box that is RAM equal to the pack's .fconst
+    const auto dirs = pi::fconst_scratch_dirs();
+    check(!dirs.empty() && dirs.front().find("/tmp") != 0,
+          "fconst scratch: the first choice is not the temp directory (it was, before #1801)");
+    // 4. the bug the fix shipped once: a cache directory that does not exist must be CREATED, not skipped. Without this the loop
+    //    walked past the new first choice and every pack's 3.6 GB scratch copy landed in tmpfs anyway.
+    const std::string fresh = "/tmp/1bit-scratch-test-" + std::to_string(::getpid()) + "/nested";
+    std::system(("rm -rf /tmp/1bit-scratch-test-" + std::to_string(::getpid())).c_str());
+    check(!std::filesystem::exists(fresh) && pi::fconst_scratch_ready(fresh) && std::filesystem::is_directory(fresh),
+          "fconst scratch: a missing cache directory is created, not skipped (the #1801 first-version bug)");
+    std::system(("rm -rf /tmp/1bit-scratch-test-" + std::to_string(::getpid())).c_str());
+    // 5. and there is always somewhere to fall back to
+    check(dirs.size() >= 2, "fconst scratch: more than one candidate, so a box with no HOME still has a fallback");
+    // 6. engine#1818 review: `$TMPDIR` sits BETWEEN the cache and the literal /tmp. It was dropped by the extraction, and a
+    //    lane that points TMPDIR at disk -- which is what lanes here do, because /tmp is RAM -- then landed its scratch copy
+    //    in tmpfs whenever the cache directory was unusable. That is the outcome #1801 exists to prevent, so it is pinned.
+    {
+        const std::string tdir = "/tmp/1bit-tmpdir-test-" + std::to_string(::getpid());
+        std::system(("mkdir -p " + tdir).c_str());
+        unsetenv("ONEBIT_FCONST_SCRATCH");
+        unsetenv("XDG_CACHE_HOME");
+        unsetenv("HOME");                       // no usable cache: the case the reviewer named
+        setenv("TMPDIR", tdir.c_str(), 1);
+        const auto with_tmpdir = pi::fconst_scratch_dirs();
+        size_t at_tmpdir = with_tmpdir.size(), at_slash_tmp = with_tmpdir.size();
+        for (size_t i = 0; i < with_tmpdir.size(); ++i) {
+            if (with_tmpdir[i] == tdir) at_tmpdir = i;
+            if (with_tmpdir[i] == "/tmp") at_slash_tmp = i;
+        }
+        check(at_tmpdir < with_tmpdir.size(),
+              "fconst scratch: a TMPDIR with no override and no cache is a candidate at all (it was dropped)");
+        check(at_tmpdir < at_slash_tmp,
+              "fconst scratch: and it comes BEFORE the literal /tmp, which is RAM on this box");
+        // control: with TMPDIR unset the resolver returns /tmp, so the literal must still be there and unused twice
+        unsetenv("TMPDIR");
+        const auto no_tmpdir = pi::fconst_scratch_dirs();
+        check(std::count(no_tmpdir.begin(), no_tmpdir.end(), std::string("/tmp")) == 1,
+              "fconst scratch: with TMPDIR unset, /tmp appears exactly once (no duplicate from the resolver)");
+        std::system(("rm -rf " + tdir).c_str());
+        setenv("HOME", "/home/x", 1);           // leave the environment as the arms above expect it
+    }
+    std::printf("fconst scratch: order is override -> disk cache -> temp/cwd, pinned\n");
+}
+
 void test_qwen3_attn_sections() {
     struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
     const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
@@ -3023,7 +3132,84 @@ void test_embedding_f32_component(const std::string& root) {
     fs::remove_all(b);
 }
 
+// engine#1740 (W1a): the tail-head placement arithmetic, pinned without a pack, a device or a fixture. The rows, the
+// tile size and the envelope are the hidden-896 pack's, so the numbers here are the real ones: 1,856 B envelope,
+// 2,374 tiles of 122,880 B, tail 1,856 + 2,374 x 122,880 = 291,653,952 B.
+void test_tail_head_placement() {
+    // The real hidden-896 geometry: group_bytes(896, 64) = 8 x 68 x 64 = 34,816 B per head tile, V/64 = 2,374 tiles,
+    // 1,856 B envelope, so the tail is 1,856 + 2,374 x 34,816 = 82,655,040 B -- which is the 0.5B pack's measured tail
+    // span (its tile 0 sits at 209,000,768 B in a 291,653,952 B file).
+    const int64_t env = 1856, rows = 2374, tile = 34816;
+    const int64_t head = rows * tile;
+    const int64_t exact_bytes = env + head;              // the file ends with the head
+    // (a) the head ends the file: exactly one candidate, no slack
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes, 0, env, rows, tile, 0);
+        check(p.why.empty() && p.exact, "tail placement: a tail that ends with the head is exact");
+        check(p.first == env && p.last == env, "tail placement: and the only candidate is the envelope's end");
+    }
+    // (b) n whole zero tiles after the head: the candidate walks back by exactly n tiles, never past the envelope
+    for (int64_t n : {1, 3, 9}) {
+        const int64_t bytes = exact_bytes + n * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, n * tile);
+        check(p.why.empty() && !p.exact, "tail placement: trailing padding is not the exact case");
+        check(p.last == env,
+              "tail placement: " + std::to_string(n) + " zero tile(s) at EOF still land the head at the envelope's end");
+        check(p.first == env, "tail placement: and the search never walks to before the envelope");
+    }
+    // (c) a clean zero run of ANY length puts the head at the envelope's end -- the padding's size is not a displacement
+    {
+        const int64_t bytes = exact_bytes + 20 * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, 20 * tile);
+        check(p.why.empty() && p.first == env && p.last == env,
+              "tail placement: trailing padding of 20 tiles still ends the head at the envelope's end");
+    }
+    // (c2) but when the file ends in NON-zero bytes after the head, the zero run is short and the candidates span the
+    // slack -- this is the shape the caller's correlation has to decide (the hidden-1536 case)
+    {
+        const int64_t bytes = exact_bytes + 20 * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, 3 * tile);
+        check(p.why.empty() && p.first > env && p.last > p.first,
+              "tail placement: a short zero run before non-zero junk leaves a span of candidates, not one guess");
+    }
+    // (d) refinements: a tail shorter than envelope + head is refused by name, with both numbers in it
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(env + head - 1, 0, env, rows, tile, 0);
+        check(!p.why.empty(), "tail placement: a short tail is refused, not read");
+        check(p.why.find(std::to_string(env + head)) != std::string::npos,
+              "tail placement: and the refusal carries the length it wanted (" + p.why + ")");
+    }
+    // (e) one byte short is refused for the length, and one byte more is a candidate rather than a refusal: the
+    // boundary is exact, which is what keeps a part-tile payload from being rounded up into a head
+    {
+        const pi::TailHeadPlacement short_by_one = pi::plan_tail_head(env + head - 1, 0, env, rows, tile, 0);
+        const pi::TailHeadPlacement one_more = pi::plan_tail_head(env + head + 1, 0, env, rows, tile, 0);
+        check(!short_by_one.why.empty() && one_more.why.empty(),
+              "tail placement: the length boundary is exact (short refused, one byte more is a candidate)");
+        check(one_more.last == env, "tail placement: and the extra byte does not move the head");
+    }
+    // (f) a tail_off that moves the window is honoured: the same arithmetic one layer block later
+    {
+        const int64_t tail_off = 5 * 8708288;   // the 0.5B pack's measured layer stride
+        const pi::TailHeadPlacement p = pi::plan_tail_head(tail_off + exact_bytes, tail_off, env, rows, tile, 0);
+        check(p.why.empty() && p.last == tail_off + env, "tail placement: the window is relative to tail_off");
+    }
+    // and the SEARCH itself (engine#1740 review): the candidate loop, best/runner-up tracking, the kTieCorr cut, the
+    // ambiguity case and the untied refusal. Synthetic head through encode_tile, so no pack and no device.
+    {
+        std::string why;
+        // called first, then checked: building the message inside the check() call read `why` before the call filled it,
+        // because argument evaluation order is unspecified -- the first run of this arm failed with an empty reason.
+        const bool ok = pi::tail_head_selftest(&why);
+        check(ok, "tail search: a synthetic tied head locates, survives a one-tile displacement, refuses "
+                  "untied-with-padding and takes an untied exact tail unverified"
+                  + (why.empty() ? std::string() : " (" + why + ")"));
+    }
+}
+
+
 int main(int argc, char** argv) {
+    test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
     // The pack leg is the only one that can regress a real pack, and ctest runs this binary with the
@@ -3058,6 +3244,7 @@ int main(int argc, char** argv) {
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();
+        test_fconst_scratch_order();
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);

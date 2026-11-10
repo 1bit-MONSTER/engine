@@ -418,6 +418,10 @@ def check(root):
     # to skip it -- an NPU-only test under `if(ONEBIT_NPU)` with ONEBIT_NPU=OFF -- and telling its author to
     # "build it or drop the test" was a false positive. Only a test CI would register and build, and does not, is
     # the defect this ratchets.
+    # engine#1810 review: three PRs in one shift added a test `add_executable` and stopped here, because the message
+    # named only two routes and neither was available -- ci.yml's build list is a `.github/workflows/` file, which a lane
+    # identity cannot push (no `workflow` scope). Folding the cases into a target ci.yml already builds needs no scope
+    # at all, so the message names it.
     line_guard = {n: (g, u) for n, _l, g, u in scan_guards(cmake_text)}
     by_design = set()
     for name in sorted(drift):
@@ -458,7 +462,10 @@ def check(root):
         where = f" under if({' AND '.join(guards)})" if guards else ""
         print(f"ci_targets_check: add_test names '{name}'{where}, and ci.yml never builds "
               f"{'/'.join(sorted(set(need[name])))} -- that test never reaches ctest in the configuration CI "
-              f"creates (it is not registered, or registered and not built); build it or drop the test")
+              f"creates (it is not registered, or registered and not built). Three routes, and only the middle one "
+              f"needs no ci.yml edit: name the target in ci.yml's build list (a `.github/workflows/` edit, so it "
+              f"needs `workflow` scope), fold these cases into a target ci.yml ALREADY builds (the "
+              f"tests/npu_pack_import_test.cpp pattern), or drop the test")
     if new:
         return 1
     # A baseline entry that no longer drifts is progress; say so rather than staying silent, so the

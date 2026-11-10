@@ -193,6 +193,29 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
 // every other architecture builds exactly the table it built before.  Keys are searched with their
 // quotes, which is what keeps "factor" from matching inside "high_freq_factor".
+// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
+// 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
+// accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
+Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
+    Q4nxRopeDynamic d{};
+    std::ifstream f(cfg_path);
+    if (!f) return d;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    char type[64];
+    q4nx_rope_declared_type(t.c_str(), type, (int)sizeof type);
+    if (std::strcmp(type, "dynamic") && std::strcmp(type, "dynamic_ntk")) return d;
+    auto number = [&](const char* key) {
+        const std::string k = std::string("\"") + key + "\":";
+        const size_t at = t.find(k);
+        if (at == std::string::npos) return 0.0;
+        return std::strtod(t.c_str() + at + k.size(), nullptr);
+    };
+    d.factor = number("factor");
+    d.original_max_position = number("max_position_embeddings");
+    d.on = (d.factor > 0.0 && d.original_max_position > 0.0) ? 1 : 0;
+    return d;
+}
+
 static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
     Q4nxRopeLlama3 s{};
     std::ifstream f(cfg_path);
@@ -401,7 +424,14 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
 
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
-    if (getenv("NPU_INFER_HOST_GEMM")) host_gemm_ = true;
+    if (const char* hg = getenv("NPU_INFER_HOST_GEMM")) {
+        host_gemm_ = true;
+        // engine#1808: "i8" selects the integer arm, whose int32 accumulation is the only thing a
+        // kernel family can be bit-exact against (an int8 device cannot match an f32 host by
+        // construction). Any other value keeps the f32 path, which is what every existing caller and
+        // every row measured so far used.
+        host_gemm_i8_ = (hg[0] == 'i' && hg[1] == '8');
+    }
     // The launch layer.  A1: everything below that touches a device talks to this, and the settings the
     // container declares (weight layout, pb16i image dir, Hadamard fold) are pushed into it as they are
     // parsed.  A2 turns this into NpuTarget::open(plan, kernels_dir).
@@ -579,6 +609,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    rope_dynamic_ = read_rope_dynamic(cfg_path);     // rope_type "dynamic" (NTK by base, engine#1740 W2)
     {
         // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
         // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
@@ -587,7 +618,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         char declared[64];
         q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
-        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1)) {
+        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
             if (!std::strcmp(declared, "llama3"))
                 err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
                        "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
@@ -706,21 +737,43 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 embed_groups_ = H / Q4NX_GROUP_SIZE;
                 rc            = 0;
             } else {
-                embed_f_.resize((size_t)NV * (size_t)kpad_);
-                rc = dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data());
+                /* engine#1784: the chunked formats are tiles of 5,120 B (the 27B's 0.625 B/element packed table is
+                 * 155,200 of them), so a row is read out of the `cols/256` tiles that cover it instead of the whole
+                 * table being decoded into f32 -- which for that pack is 0.74 GiB of container becoming 4.74 GiB.
+                 * Same tile grid and ordering as q4nx_dequant_tensor_chunked(), pinned by the row test. */
+                const int ntr = NV / 32, ntc = kpad_ / 256;
+                const size_t tiles = (size_t)ntr * (size_t)ntc;
+                if (tiles > 0 && esz % tiles == 0) {
+                    embed_tile_       = (const uint8_t*)e;
+                    embed_tile_bytes_ = esz;
+                    embed_tile_rows_  = NV;
+                    embed_tile_cols_  = kpad_;
+                    embed_tile_cb_    = int(esz / tiles);
+                    embed_row_buf_.assign((size_t)kpad_, 0.0f);
+                    embed_row_tok_    = -1;
+                }
+                rc = 0;   // the buffer below is the fallback, and it reports its own failure
             }
             if (rc != 0) {
                 err_ = std::string("embedding dtype ") + dt + " but dequant failed";
                 return false;
             }
+            if (!embed_tile_ && !embed_i8_) {   // no element-wise read: keep the whole-table buffer (unchanged path)
+                embed_f_.resize((size_t)NV * (size_t)kpad_);
+                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data()) != 0) {
+                    err_ = std::string("embedding dtype ") + dt + " but dequant failed";
+                    return false;
+                }
+            }
             embed_f32_ = true;
-            if (!embed_i8_)
+            if (embed_i8_ || embed_tile_)
+                fprintf(stderr, "  [forward] embedding dtype %s -> read in place from the container, one row per token "
+                                "(engine#1784): %.2f GiB not materialised\n", dt,
+                        (double)NV * (double)kpad_ * 4.0 / (1024.0 * 1024.0 * 1024.0));
+            else
                 fprintf(stderr, "  [forward] embedding dtype %s -> dequantized (%zu floats, %.2f GiB)\n",
                         dt, embed_f_.size(),
                         (double)embed_f_.size() * sizeof(float) / (1024.0 * 1024.0 * 1024.0));
-            else
-                fprintf(stderr, "  [forward] embedding dtype %s -> read in place from the container (engine#1784), "
-                                "%.2f GiB not copied\n", dt, (double)NV * H * 4.0 / (1024.0 * 1024.0 * 1024.0));
         } else {
             if (etd->data_size < (size_t)NV * H * 2) {
                 err_ = "embedding too small for NV*H bf16";
@@ -1497,6 +1550,16 @@ float Q4nxNpuForward::embed_at(int token, int k) const {
     // columns (k >= c_.H) are already refused above and read as 0.0f, which is what the expanded table held there.
     if (embed_i8_)
         return q4nx_plain_i8_at((const uint8_t*)embed_i8_, embed_sc_, c_.NV, c_.H, token, k);
+    if (embed_tile_) {
+        // One row per token: the callers walk k innermost, so this gathers the row once and serves the H reads from it.
+        if (token != embed_row_tok_) {
+            if (q4nx_dequant_tile_row(embed_tile_, embed_tile_bytes_, embed_tile_rows_, embed_tile_cols_,
+                                      embed_tile_cb_, token, embed_row_buf_.data()) != 0)
+                return 0.0f;
+            embed_row_tok_ = token;
+        }
+        return embed_row_buf_[(size_t)k];
+    }
     if (embed_bf16_) return bf16_to_f32(embed_bf16_[(size_t)token * (size_t)c_.H + (size_t)k]);
     if (embed_f32_) return embed_f_[(size_t)token * (size_t)lm_w_ + (size_t)k];
     return 0.0f;
@@ -2969,6 +3032,65 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 // packed-weight BO cache, pb16i images, Hadamard fold.  What stays here is the model's own fallback, the
 // plain float GEMM of init_host() -- that is a property of the model, not of any NPU.
 // --------------------------------------------------------------------------
+// The integer host arm (engine#1808/#1809). Two decisions here, both measured:
+//  * the weight codes and their per-128-K multipliers are quantised ONCE per tensor (`wkey`) and cached --
+//    doing it per call made a 7B token ~7.5 G scalar operations and the arm never finished a token inside a
+//    9-minute ticket;
+//  * the inner sum is exact int32 with no float in it (q4nx_host_gemm_i8_grouped), so the comparison against
+//    the device is about accumulation and epilogue, not about a float both sides happen to share.
+void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
+                                  int wkey, float* out) {
+    const int G = 128, groups = (K + G - 1) / G;
+    auto it = host_i8_cache_.find(wkey);
+    if (it == host_i8_cache_.end()) {
+        HostI8Tensor t;
+        t.groups = groups; t.N = N;
+        t.codes.assign((size_t)K * (size_t)N, 0);
+        t.d.assign((size_t)groups * (size_t)N, 0.0f);
+        for (int g = 0; g < groups; g++) {
+            const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
+            for (int n = 0; n < N; n++) {
+                float amax = 0.0f;
+                for (int k = k0; k < k1; k++) {
+                    const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
+                    if (std::isfinite(v) && v > amax) amax = v;
+                }
+                if (!(amax >= 1e-12f)) amax = 1.0f;
+                t.d[(size_t)g * (size_t)N + (size_t)n] = amax / 127.0f;
+                const float tis = 127.0f / amax;
+                for (int k = k0; k < k1; k++) {
+                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
+                    if (!std::isfinite(v)) v = 0.0f;
+                    int q = (int)std::round(v * tis);
+                    q = q > 7 ? 7 : (q < -8 ? -8 : q);
+                    t.codes[(size_t)k * (size_t)N + (size_t)n] = (int8_t)q;
+                }
+            }
+        }
+        it = host_i8_cache_.emplace(wkey, std::move(t)).first;
+    }
+    const HostI8Tensor& t = it->second;
+    std::vector<int8_t> a8((size_t)K);
+    for (int m = 0; m < M; m++) {
+        const float* a = A + (size_t)m * (size_t)a_k;
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            const float v = std::fabs(a[k]);
+            if (std::isfinite(v) && v > amax) amax = v;
+        }
+        const float ascale = (amax >= 1e-12f) ? amax / 127.0f : 1.0f;
+        const float tis = 1.0f / ascale;
+        for (int k = 0; k < K; k++) {
+            float v = a[k];
+            if (!std::isfinite(v)) v = 0.0f;
+            int q = (int)std::round(v * tis);
+            a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        }
+        q4nx_host_gemm_i8_grouped(a8.data(), K, t.codes.data(), t.d.data(), t.groups, N, ascale,
+                                  out + (size_t)m * (size_t)N);
+    }
+}
+
 void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
                               std::vector<float>& out, int wkey, const char* sc, int a_k) {
     if (host_gemm_) {
@@ -2977,6 +3099,10 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
         // unpadded A. (In review of this PR the split moved the pad into the target and left this
         // branch reading past the caller's buffer at a padded design.)
         out.assign((size_t)N, 0.0f);
+        if (host_gemm_i8_) {
+            host_gemm_i8(A, a_k, 1, K, N, Bmat, wkey, out.data());
+            return;
+        }
         q4nx_host_gemm_f32_padded(A, a_k, 1, K, N, Bmat, out.data());
         return;
     }
@@ -2996,6 +3122,10 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         // Same pad, and here it is also a stride: the rows form used to index A at `m * K` while the
         // caller's buffer is laid out at `m * a_k`, so every row past the first read the wrong row.
         out.assign((size_t)M * N, 0.0f);
+        if (host_gemm_i8_) {
+            host_gemm_i8(A, a_k, M, K, N, Bmat, wkey, out.data());
+            return;
+        }
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
         return;
     }
@@ -4207,13 +4337,21 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     {
         const int half = proportional ? HD / 2 : rot / 2;
         std::vector<float> cos_(half), sin_(half);
+        // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
+        // Below the model's original window this returns theta unchanged, which is what makes a short prompt
+        // bit-identical to the same model served without the scaling.
+        // engine#1792 review: the exponent is HF's `dim / (dim - 2)` over the ROTARY width (`dim = int(head_dim *
+        // partial_rotary_factor)`), which is `rot` here -- passing `HD` was wrong for any model that declares dynamic
+        // scaling together with partial_rotary_factor < 1. Unreachable in today's catalog, so this is a correctness
+        // constant rather than a behaviour change for any pack that exists.
+        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, rot);
         for (int i = 0; i < half; i++) {
             double inv;
             if (proportional) {
-                inv = 1.0 / std::pow((double)theta, 2.0 * (double)i / (double)HD);
+                inv = 1.0 / std::pow(rope_theta, 2.0 * (double)i / (double)HD);
                 if (i >= rot / 2) inv = 0.0;
             } else {
-                inv = 1.0 / std::pow((double)theta, (double)i / (double)half);
+                inv = 1.0 / std::pow(rope_theta, (double)i / (double)half);
                 // LongRoPE (MiniCPM4): ggml's rope applies the factor as
                 // `rope_yarn(theta / ff, ...)` (ggml-cpu/ops.cpp
                 // ggml_rope_cache_init), i.e. the angle is DIVIDED by

@@ -83,6 +83,31 @@ int q4nx_head_image_write(const char *path, const int8_t *codes, const float *sc
     return 1;
 }
 
+uint64_t q4nx_head_image_key_digest(const Q4nxHeadImageKey *key) {
+    if (!key) return 0;
+    struct {
+        uint32_t version;
+        uint32_t kpad;
+        uint32_t t;
+        uint32_t blocked;
+        uint64_t head_hash;
+    } fields;
+    fields.version = Q4NX_HEAD_IMAGE_VERSION;
+    fields.kpad = key->kpad;
+    fields.t = key->t;
+    fields.blocked = key->blocked;
+    fields.head_hash = key->head_hash;
+    uint64_t h = 1469598103934665603ull;
+    return fnv1a(h, &fields, sizeof fields);
+}
+
+int q4nx_head_image_key_name(const Q4nxHeadImageKey *key, char *out, int out_n) {
+    if (!key || !out || out_n < 8) return 0;
+    const uint64_t d = q4nx_head_image_key_digest(key);
+    const int n = snprintf(out, (size_t)out_n, "headimg-%016llx.q4hi", (unsigned long long)d);
+    return n > 0 && n < out_n;
+}
+
 int q4nx_head_image_read(const char *path, int8_t *codes, int codes_n, float *scales, int scales_n, Q4nxHeadImageInfo *info,
                          char *why, int why_n) {
     if (why && why_n > 0) why[0] = 0;

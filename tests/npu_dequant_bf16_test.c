@@ -155,7 +155,45 @@ static void chunked_row_arms(void) {
     printf("  chunked row: 3 kinds x 64 rows bit-exact + 5 refusal arms\n");
 }
 
+/* engine#1842: the forward picks the per-row path for a chunked embedding with q4nx_tile_row_kind(). It used to pick it
+ * on `esz % tiles == 0` alone (tiles = (NV/32)*(kpad/256), truncating), which three kinds of table pass while the reader
+ * refuses every row of them -- and embed_at() turns that refusal into 0.0f. Each arm below is one such table: the old
+ * rule accepts it, the reader refuses it, and the predicate must refuse it too, so the table stays on the whole-table
+ * decode, which reports its own failure. The valid kinds must still be accepted, with the kind the reader takes. */
+static int old_rule(size_t esz, int nv, int kpad) {
+    const size_t tiles = (size_t)(nv / 32) * (size_t)(kpad / 256);
+    return tiles > 0 && esz % tiles == 0;
+}
+static void tile_row_kind_arms(void) {
+    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
+    for (int k = 0; k < 3; k++)
+        check(q4nx_tile_row_kind((size_t)4 * (size_t)kinds[k], 64, 512) == kinds[k],
+              "tile-row kind: each supported chunk kind on a 2x2 grid is accepted as itself");
+    struct { size_t esz; int nv, kpad; const char* what; } bad[] = {
+        {(size_t)4 * 1000, 64, 512, "a chunk of 1,000 B (no such kind) on an exact 2x2 grid"},
+        {(size_t)8 * Q4NX_TILE_BYTES, 64, 512, "two tiles' worth per grid cell (esz / tiles = 10,240 B)"},
+        {(size_t)2 * Q4NX_TILE_BYTES, 48, 512, "NV 48: NV / 32 truncates to 1 tile-row and the grid misses rows 32..47"},
+        {(size_t)2 * Q4NX_TILE_BYTES, 64, 384, "kpad 384: kpad / 256 truncates to 1 tile-column"},
+    };
+    uint8_t* q = calloc(bad[1].esz, 1);
+    float* row = malloc(512 * sizeof(float));
+    if (!q || !row) { check(0, "tile-row kind: the arms allocate"); free(q); free(row); return; }
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        const int cb_old = (int)(bad[i].esz / ((size_t)(bad[i].nv / 32) * (size_t)(bad[i].kpad / 256)));
+        char msg[256];
+        snprintf(msg, sizeof msg, "tile-row kind: the old rule took %s", bad[i].what);
+        check(old_rule(bad[i].esz, bad[i].nv, bad[i].kpad), msg);
+        snprintf(msg, sizeof msg, "tile-row kind: the reader refuses %s", bad[i].what);
+        check(q4nx_dequant_tile_row(q, bad[i].esz, bad[i].nv, bad[i].kpad, cb_old, 0, row) == -1, msg);
+        snprintf(msg, sizeof msg, "tile-row kind: and so does the predicate the forward now asks (%s)", bad[i].what);
+        check(q4nx_tile_row_kind(bad[i].esz, bad[i].nv, bad[i].kpad) == 0, msg);
+    }
+    free(q); free(row);
+    printf("  tile-row kind: 3 kinds accepted, 4 tables the old rule took and the reader refuses are refused\n");
+}
+
 int main(void) {
+    tile_row_kind_arms();
     chunked_row_arms();
     embed_row_arms();
     const int rows = 64, cols = 512;

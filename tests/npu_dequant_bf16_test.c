@@ -112,7 +112,51 @@ static void embed_row_arms(void) {
     printf("  embed row: 9 arms (bit-exact row read, null scale, 4 out-of-range, null table, wrong cols)\n");
 }
 
+/* engine#1784: one row of a CHUNKED (tiled) table, decoded without decoding the table. This is the path the 27B-class
+ * containers actually take: 155,200 tiles of 5,120 B (0.625 B/element, packed 4-bit) that decode to 1.27 G elements and
+ * materialise as 4.74 GiB of f32. The row gather must reproduce exactly what q4nx_dequant_tensor_chunked() puts in that
+ * row -- all three chunk kinds, every row including the last one of a tile-row and the last row of the tensor -- because
+ * the tiles are ordered (row-tile * ntiles_across + col-tile) and an off-by-one there reads a neighbouring tile and
+ * still produces plausible numbers. */
+static void chunked_row_arms(void) {
+    const int rows = 64, cols = 512;                  /* 2x2 tiles: several rows per tile, several tiles per row */
+    const int ntc = cols / Q4NX_TILE_COLS;
+    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
+    float* whole = malloc((size_t)rows * cols * sizeof(float));
+    float* row = malloc((size_t)cols * sizeof(float));
+    if (!whole || !row) { check(0, "chunked row: the arms allocate"); free(whole); free(row); return; }
+    for (int k = 0; k < 3; k++) {
+        const int cb = kinds[k];
+        const size_t nbytes = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)ntc * (size_t)cb;
+        uint8_t* q = malloc(nbytes);
+        if (!q) { check(0, "chunked row: the tile buffer allocates"); continue; }
+        unsigned seed = 987u + (unsigned)k;
+        for (size_t i = 0; i < nbytes; i++) { seed = seed * 1103515245u + 12345u; q[i] = (uint8_t)(seed >> 16); }
+        check(q4nx_dequant_tensor_chunked(q, nbytes, rows, cols, cb, whole) == 0,
+              "chunked row: the whole-table reference decodes");
+        int bad = 0;
+        for (int r = 0; r < rows; r++) {
+            if (q4nx_dequant_tile_row(q, nbytes, rows, cols, cb, r, row) != 0) { bad++; continue; }
+            if (memcmp(row, whole + (size_t)r * cols, (size_t)cols * sizeof(float)) != 0) bad++;
+        }
+        check(bad == 0, cb == Q4NX_TILE_BYTES   ? "chunked row: every row matches the whole-table decode (5,120 B tiles)"
+                     : cb == Q4NX_CHUNK_Q4K    ? "chunked row: every row matches the whole-table decode (Q4K chunks)"
+                                               : "chunked row: every row matches the whole-table decode (Q8 chunks)");
+        check(q4nx_dequant_tile_row(q, nbytes, rows, cols, cb, rows, row) == -1, "chunked row: row == rows is refused");
+        check(q4nx_dequant_tile_row(q, nbytes, rows, cols, cb, -1, row) == -1, "chunked row: row -1 is refused");
+        check(q4nx_dequant_tile_row(q, nbytes - 1, rows, cols, cb, 0, row) == -1,
+              "chunked row: one byte short is refused, not read past");
+        check(q4nx_dequant_tile_row(q, nbytes, rows - 1, cols, cb, 0, row) == -1,
+              "chunked row: a rows that is not a tile multiple is refused (a last partial row has no tile)");
+        check(q4nx_dequant_tile_row(NULL, nbytes, rows, cols, cb, 0, row) == -1, "chunked row: a null table is refused");
+        free(q);
+    }
+    free(whole); free(row);
+    printf("  chunked row: 3 kinds x 64 rows bit-exact + 5 refusal arms\n");
+}
+
 int main(void) {
+    chunked_row_arms();
     embed_row_arms();
     const int rows = 64, cols = 512;
     const size_t n = (size_t)rows * cols;

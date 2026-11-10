@@ -706,21 +706,43 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 embed_groups_ = H / Q4NX_GROUP_SIZE;
                 rc            = 0;
             } else {
-                embed_f_.resize((size_t)NV * (size_t)kpad_);
-                rc = dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data());
+                /* engine#1784: the chunked formats are tiles of 5,120 B (the 27B's 0.625 B/element packed table is
+                 * 155,200 of them), so a row is read out of the `cols/256` tiles that cover it instead of the whole
+                 * table being decoded into f32 -- which for that pack is 0.74 GiB of container becoming 4.74 GiB.
+                 * Same tile grid and ordering as q4nx_dequant_tensor_chunked(), pinned by the row test. */
+                const int ntr = NV / 32, ntc = kpad_ / 256;
+                const size_t tiles = (size_t)ntr * (size_t)ntc;
+                if (tiles > 0 && esz % tiles == 0) {
+                    embed_tile_       = (const uint8_t*)e;
+                    embed_tile_bytes_ = esz;
+                    embed_tile_rows_  = NV;
+                    embed_tile_cols_  = kpad_;
+                    embed_tile_cb_    = int(esz / tiles);
+                    embed_row_buf_.assign((size_t)kpad_, 0.0f);
+                    embed_row_tok_    = -1;
+                }
+                rc = 0;   // the buffer below is the fallback, and it reports its own failure
             }
             if (rc != 0) {
                 err_ = std::string("embedding dtype ") + dt + " but dequant failed";
                 return false;
             }
+            if (!embed_tile_ && !embed_i8_) {   // no element-wise read: keep the whole-table buffer (unchanged path)
+                embed_f_.resize((size_t)NV * (size_t)kpad_);
+                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data()) != 0) {
+                    err_ = std::string("embedding dtype ") + dt + " but dequant failed";
+                    return false;
+                }
+            }
             embed_f32_ = true;
-            if (!embed_i8_)
+            if (embed_i8_ || embed_tile_)
+                fprintf(stderr, "  [forward] embedding dtype %s -> read in place from the container, one row per token "
+                                "(engine#1784): %.2f GiB not materialised\n", dt,
+                        (double)NV * (double)kpad_ * 4.0 / (1024.0 * 1024.0 * 1024.0));
+            else
                 fprintf(stderr, "  [forward] embedding dtype %s -> dequantized (%zu floats, %.2f GiB)\n",
                         dt, embed_f_.size(),
                         (double)embed_f_.size() * sizeof(float) / (1024.0 * 1024.0 * 1024.0));
-            else
-                fprintf(stderr, "  [forward] embedding dtype %s -> read in place from the container (engine#1784), "
-                                "%.2f GiB not copied\n", dt, (double)NV * H * 4.0 / (1024.0 * 1024.0 * 1024.0));
         } else {
             if (etd->data_size < (size_t)NV * H * 2) {
                 err_ = "embedding too small for NV*H bf16";
@@ -1497,6 +1519,16 @@ float Q4nxNpuForward::embed_at(int token, int k) const {
     // columns (k >= c_.H) are already refused above and read as 0.0f, which is what the expanded table held there.
     if (embed_i8_)
         return q4nx_plain_i8_at((const uint8_t*)embed_i8_, embed_sc_, c_.NV, c_.H, token, k);
+    if (embed_tile_) {
+        // One row per token: the callers walk k innermost, so this gathers the row once and serves the H reads from it.
+        if (token != embed_row_tok_) {
+            if (q4nx_dequant_tile_row(embed_tile_, embed_tile_bytes_, embed_tile_rows_, embed_tile_cols_,
+                                      embed_tile_cb_, token, embed_row_buf_.data()) != 0)
+                return 0.0f;
+            embed_row_tok_ = token;
+        }
+        return embed_row_buf_[(size_t)k];
+    }
     if (embed_bf16_) return bf16_to_f32(embed_bf16_[(size_t)token * (size_t)c_.H + (size_t)k]);
     if (embed_f32_) return embed_f_[(size_t)token * (size_t)lm_w_ + (size_t)k];
     return 0.0f;

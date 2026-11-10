@@ -95,6 +95,9 @@ an RFC or issue.
   (engine [#1979](https://github.com/1bit-MONSTER/engine/issues/1979)). A row that belongs to an existing family goes in
   that family's file (`cmake/tests-gpu-hold.cmake`). An `add_executable` for a test binary still goes in
   `CMakeLists.txt` next to the sources it builds; only the registration moves. Existing rows stay where they are.
+  A registration file that needs a fixed position may still be `include()`d by name from `CMakeLists.txt`; the glob
+  then leaves it alone. `tests/registration_glob_test.sh` (itself registered from `cmake/tests-registration-glob.cmake`)
+  runs the glob block and holds both rules.
 - **Pins only move forward.** CI fails a pull request whose submodule pin is behind, or has
   diverged from, the pin on `main` (`tools/check_pins.py`), because that drops commits the engine
   already shipped. A rollback on purpose carries the `pin rollback` label.

@@ -1719,21 +1719,31 @@ endif()
 # CONFIGURE_DEPENDS re-runs the glob at build time, so a file added after the first configure is picked up.
 # Readers that follow this shape: tools/ci/ci_targets_check.py (the glob), tools/ci/hrx_build_scope.py and
 # .github/workflows/hrx-build.yml (the cmake/tests-*.cmake path), tools/ci/tests_referenced_check.py (all of cmake/).
+# The lines between the two markers are run as they stand by tests/registration_glob_test.sh, in a scratch project.
+# >>> registration glob
 file(GLOB ONEBIT_TEST_REGISTRATION_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tests-*.cmake)
 list(SORT ONEBIT_TEST_REGISTRATION_FILES)
-# A file this CMakeLists.txt already names in a literal include(cmake/tests-<name>.cmake) is skipped: that include
-# fixes the file's position (some rows need one), and including it twice stops the configure with
-# `add_test given test NAME ... which already exists`. So a family file moved out with its own include() line and
-# this glob can land in either order.
+# A file this CMakeLists.txt already include()s by name is skipped: that include fixes the file's position (some rows
+# need one), and including it twice stops the configure with `add_test given test NAME ... which already exists`. So a
+# family file moved out with its own include() line and this glob can land in either order.
+# "By name" means a line CMake would execute -- include( at the start of a line, the same rule
+# tools/ci/ci_targets_check.py reads by -- and not the same text in a comment: a substring search took
+# `# was include(cmake/tests-gpu-hold.cmake)` for an include, and the seven gpu_hold_* tests left the configuration with
+# every gate green (review of engine#1983). An include this pattern does not recognise is the loud miss: both includes
+# run and the configure stops.
 file(READ ${CMAKE_CURRENT_LIST_FILE} _onebit_top_cmake_text)
+set(_onebit_include_prefix "(^|\n)[ \t]*include\\([ \t]*\"?(\\$\\{CMAKE_(CURRENT_)?SOURCE_DIR\\}/)?cmake/")
 foreach(_onebit_test_registration_file IN LISTS ONEBIT_TEST_REGISTRATION_FILES)
     get_filename_component(_onebit_test_registration_name ${_onebit_test_registration_file} NAME)
-    string(FIND "${_onebit_top_cmake_text}" "include(cmake/${_onebit_test_registration_name})" _onebit_named_at)
-    if(_onebit_named_at EQUAL -1)
+    string(REGEX REPLACE "([.+])" "\\\\\\1" _onebit_test_registration_re "${_onebit_test_registration_name}")
+    string(REGEX MATCH "${_onebit_include_prefix}${_onebit_test_registration_re}\"?[ \t]*\\)" _onebit_named
+           "${_onebit_top_cmake_text}")
+    if(_onebit_named STREQUAL "")
         include(${_onebit_test_registration_file})
     endif()
 endforeach()
 unset(_onebit_top_cmake_text)
+# <<< registration glob
 
 # ── Loopback ports: route tests run one at a time (engine#1070) ──────────────
 # Every test named below starts a server on 127.0.0.1. Most pick a port by binding :0, closing the

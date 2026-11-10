@@ -248,6 +248,7 @@ private:
     // scratch buffer each layer is decoded into, so keying on it served layer 0's weights to every later layer
     // (engine#1830 review). Routed experts pass wkey < 0 and are never cached: their weights change per token.
     std::map<std::tuple<int, int, int, int>, HostI8Tensor> host_i8_cache_;
+    std::vector<HostI8Tensor> lm_head_i8_;   // integer arm's head image, one per vocabulary block
     void host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat, int wkey, float* out);
     bool load_layer(int l);
     // `a_k` is the activation's REAL width per row (the design's real_k, i.e. the model's hidden or

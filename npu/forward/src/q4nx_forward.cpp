@@ -5215,6 +5215,55 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         if (npu::model::run_lm_head(*xd_, h.data(), via_target.data())) { logits = std::move(via_target); return true; }
     }
     if (!host_gemm_ && xd_ && xd_->head_ctx() && xd_->head_ctx()->gemv) return run_lm_head_gemv(h, logits);
+    if (host_gemm_ && host_gemm_i8_) {
+        // engine#1808: the head's integer twin. Without this the arm's head is a plain f32 matvec ("No I8Ctx is
+        // touched" below) while the device's head reads a packed quantised table, which is exactly the 0.30 max|d|
+        // that was left once every body GEMM had been shown bit-exact. The device packs its head tiles with
+        // lctx.packB_into(...) -> packB_blocked, so the arm builds them with the same rule through
+        // q4nx_pack_B_int8_blocked(): one multiplier per column, int8 codes. Chunked by vocabulary block, because a
+        // whole head image is H x V bytes (622 MB at this vocabulary).
+        const float inv_es = (sem_.tie_embeddings && sem_.embed_scale > 0) ? 1.0f / sem_.embed_scale : 1.0f;
+        const int TB = 8192;   // vocabulary block; a tile's image is H x TB bytes
+        if ((int)lm_head_i8_.size() != (NV + TB - 1) / TB) lm_head_i8_.assign((NV + TB - 1) / TB, HostI8Tensor());
+        logits.assign((size_t)NV, 0.0f);
+        std::vector<float> a8v((size_t)H);
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) {
+            const float v = std::fabs(h[(size_t)k] * inv_es);
+            if (v > amax) amax = v;
+        }
+        const float ascale = amax > 0 ? amax / 127.0f : 1.0f;
+        for (int k = 0; k < H; k++) {
+            int q = (int)std::round(h[(size_t)k] * inv_es / ascale);
+            a8v[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        }
+        std::vector<float> bt((size_t)H * (size_t)TB);
+        std::vector<int8_t> a8i((size_t)H);
+        for (size_t i = 0; i < a8v.size(); i++) a8i[i] = a8v[i];
+        for (int t = 0; t < (int)lm_head_i8_.size(); t++) {
+            const int n0 = t * TB, n1 = std::min(NV, n0 + TB), Tn = n1 - n0;
+            HostI8Tensor& c = lm_head_i8_[(size_t)t];
+            if (c.codes.empty()) {
+                for (int n = n0; n < n1; n++)
+                    for (int k = 0; k < H; k++) bt[(size_t)k * Tn + (n - n0)] = lm_at(n, k);
+                c.N = Tn;
+                c.codes.assign((size_t)H * (size_t)Tn, 0);
+                c.d.assign((size_t)Tn, 0.0f);
+                double ssum = 0.0;
+                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, /*blocked=*/1, c.d.data(), &ssum);
+            }
+            for (int n = 0; n < Tn; n++) {
+                int32_t acc = 0;
+                for (int k = 0; k < H; k++)
+                    acc += (int32_t)((int)c.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, H, Tn)] *
+                                     (int)a8i[(size_t)k]);
+                float v = c.d[(size_t)n] * (ascale * (float)acc);
+                if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                logits[(size_t)(n0 + n)] = v;
+            }
+        }
+        return true;
+    }
     if (host_gemm_) {
         // Offline mode: plain float matvec against the (possibly dequantized)
         // tied table, matching the Python reference.  No I8Ctx is touched.

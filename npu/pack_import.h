@@ -547,6 +547,9 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
 // the assumption `kk == 0` rests on; a non-empty string is the first slot that was not, with its tile and byte count.
 const std::string& bias_slot_witness();
 int64_t bias_slots_checked();
+// engine#1946 review: both are process-global, so a caller that decodes more than one pack in a process must reset them
+// between packs. `import_pack()` does it itself; a test or a batch tool that calls decode_external_tile() directly has to.
+void reset_bias_slot_witness();
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles = false, bool drop_zero = false);
 

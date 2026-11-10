@@ -2125,6 +2125,13 @@ static std::string g_bias_witness;
 static int64_t g_bias_tiles_checked = 0;
 const std::string& bias_slot_witness() { return g_bias_witness; }
 int64_t bias_slots_checked() { return g_bias_tiles_checked; }
+// engine#1946 review: the witness is process-global, so one import's finding would otherwise be written into the NEXT
+// import's container as its own ("pack-A.q_proj … holds 1 of 2176 non-zero bytes" in pack B's config.json), and B's
+// "all N slots were zero" count would include A's tiles. import_pack() calls this before it decodes anything.
+void reset_bias_slot_witness() {
+    g_bias_witness.clear();
+    g_bias_tiles_checked = 0;
+}
 
 static void note_bias_slot(const char* who, int64_t tile, int slot, const uint8_t* p, int64_t n) {
     if (!g_bias_witness.empty()) return;
@@ -4049,6 +4056,8 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
 }
 
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
+    reset_bias_slot_witness();   // engine#1946 review: a process-global witness must not leak between imports
+
     const Plan p = plan(pack_dir);
     // Census yes, writer no (see the note where graph_weights is decided): this genre's weights are 1-D external-data
     // blocks, and until the repacker exists an import would write a container nothing can read. Refused here rather

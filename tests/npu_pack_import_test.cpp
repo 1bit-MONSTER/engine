@@ -4811,6 +4811,19 @@ void test_bias_slot_witness() {
     check(pi::bias_slot_witness().find("1 of ") != std::string::npos,
           "bias slot: and counts the non-zero bytes rather than saying 'something'");
     check(pi::bias_slots_checked() >= 2, "bias slot: the tiles it looked at are counted");
+
+    // engine#1946 review: the witness and the count are process-global, so the NEXT import used to inherit the last
+    // one's finding -- pack B's container recorded pack A's tensor as its own non-zero bias, and B's "all N slots were
+    // zero" count included A's tiles. Both are reset between packs now, and this pins that a reset is a reset.
+    pi::reset_bias_slot_witness();
+    check(pi::bias_slot_witness().empty(), "bias slot: a reset clears the witness, so the next pack starts clean");
+    check(pi::bias_slots_checked() == 0, "bias slot: and the count, so the next pack's note does not add a stranger's tiles");
+    (void)pi::decode_external_tile(zero.data(), bytes, N, K, err, pi::kExtQuantsRowMajor, "clean-after-dirty");
+    check(pi::bias_slot_witness().empty(),
+          "bias slot: decoding a clean pack after a dirty one leaves the witness empty (" +
+              pi::bias_slot_witness() + ")");
+    check(pi::bias_slots_checked() == 1, "bias slot: and counts only this decode's tile");
+    pi::reset_bias_slot_witness();   // leave the process clean for the pack leg that follows
 }
 
 /* engine#1985: a REGRESSION, not a new bug -- `Qwen3-1.7B` imported with 0 gaps on yesterday's main and refused with 280

@@ -95,7 +95,7 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/laya_first_default.h
      "static const char kDefaultLayaFirstJson[] = R\"ONEBITLAYAFIRST(${ONEBIT_LAYA_FIRST_JSON})ONEBITLAYAFIRST\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/laya-first.json)
 add_executable(onebit app/main.cpp app/serve.cpp app/recipes.cpp app/pm.cpp app/route_serve.cpp app/route_eval.cpp app/laya_checkpoint.cpp app/laya_first.cpp
-                     app/embed_serve.cpp app/embed_model.cpp)
+                     app/embed_serve.cpp app/embed_model.cpp app/q4nx_cache.cpp)
 # config/recipes.json (tuned llama-server settings per model and route, docs/recipes.md) is
 # compiled in as serve's default recipes; --recipes replaces them at run time.
 file(READ ${CMAKE_SOURCE_DIR}/config/recipes.json ONEBIT_RECIPES_JSON)
@@ -197,6 +197,9 @@ add_test(NAME embed_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/embed_serve.sh $<TAR
 add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
 # serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.
 add_test(NAME serve_hangup COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_hangup_test.sh $<TARGET_FILE:onebit>)
+# engine#1945: scripts/bump-hrx-sync.sh tells AMD's own commit from a line AMD rebased apart from a commit that
+# is not AMD's. Local git repositories only: no network, no GPU.
+add_test(NAME bump_hrx_sync COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_sync_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-sync.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
 add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $<TARGET_FILE:onebit>)
@@ -317,6 +320,9 @@ add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_ag
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
 add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)
 add_python_test(tool_selftest_whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools/whisper_encoder_baseline.py --self-test)
+# engine#1780: the DFlash draft package's gate before a loader -- tile-grid sizes from the config, tile-header sanity and
+# the container's scalars against config.json, on a synthetic package with eight negative controls. Stdlib only.
+add_python_test(tool_selftest_dflash_draft_info ${CMAKE_SOURCE_DIR}/tools/dflash_draft_info.py --selftest)
 # engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
 add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
@@ -441,6 +447,13 @@ if(TARGET OpenMP::OpenMP_CXX)
     target_link_libraries(mtp_draft_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 add_test(NAME mtp_draft COMMAND mtp_draft_test)
+# engine#1781 gate 2: the distribution-following acceptance rule (accept with min(1, p/q), resample the residual at the
+# first rejection), with the temperature-0 identity and a deliberately wrong drafter whose output must still follow p.
+# Header-only and device-free; pulled into CI through npu_sampling_test for the same reason as mtp_draft_test below.
+add_executable(spec_accept_test tests/spec_accept_test.cpp)
+target_include_directories(spec_accept_test PRIVATE npu)
+add_test(NAME spec_accept COMMAND spec_accept_test)
+add_dependencies(npu_sampling_test spec_accept_test)
 # ci.yml's build step lists every ctest target explicitly, and this branch cannot edit that file (the push
 # token has no `workflow` scope), so the binary is pulled in as a dependency of a listed test target. When a
 # workflow-scoped push is available, add `mtp_draft_test` to ci.yml's build list and delete this line.
@@ -1067,6 +1080,13 @@ add_dependencies(npu_sampling_test npu_queue_test)
 # sentences) needs the 17.9 MB container the importer writes (the source safetensors is 13.9 MB) and stays
 # a measured row in the PR.
 add_executable(embed_model_test tests/embed_model_test.cpp app/embed_model.cpp)
+# engine#1956: the Q4NX container cache's sweep, driven on a synthetic cache (bound, LRU order, the entry just written, the
+# age window, and the disabled case). Listed explicitly like the other app/ units so the test needs no `onebit`.
+add_executable(q4nx_cache_test tests/q4nx_cache_test.cpp app/q4nx_cache.cpp)
+target_include_directories(q4nx_cache_test PRIVATE app)
+add_test(NAME q4nx_cache COMMAND q4nx_cache_test)
+# engine#1956 review: an `add_test` whose target ci.yml never builds never runs in CI -- the documented route, no workflow edit.
+add_dependencies(onebit q4nx_cache_test)
 target_include_directories(embed_model_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
 target_link_libraries(embed_model_test PRIVATE nlohmann_json::nlohmann_json)
 target_compile_definitions(embed_model_test PRIVATE SRC_DIR="${CMAKE_SOURCE_DIR}")

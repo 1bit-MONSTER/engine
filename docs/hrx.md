@@ -86,7 +86,13 @@ fails a pin that leaves a gate model's node off HRX.
   `DRY_RUN=1` and pushes nothing):
   - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin). When AMD
     rewrites its history, the old `1bit/hrx-vulkan` tip is tagged `hrx-vulkan-<sha>` first,
-    and the run fails if that branch held a commit that is on no AMD branch;
+    and the run fails if that branch held a commit that is on no AMD branch. The failure
+    says which of two things that commit is, because they need opposite actions:
+    **rebased** (AMD's pin holds a commit with the same author, author date and subject:
+    AMD rebased its line and dropped the old one, so the commit is AMD's and the pin is merged
+    by hand) or **foreign** (no such commit: it is not AMD's and moves to
+    `1bit/hrx-vulkan-patched`). `scripts/bump-hrx-sync.sh off-branch <repo> <mirror> <pin>`
+    prints the classification alone, from a commits-only clone;
   - merges AMD's pin into `1bit/hrx-vulkan-patched`, after tagging the previous tip
     `patched-<sha>` so every commit the engine has pinned stays reachable. Conflicts under
     `ggml/src/ggml-hrx` keep our side; a conflict anywhere else fails the run and names the files;
@@ -245,6 +251,23 @@ Measured on Strix Halo (Qwen3-Coder-30B-A3B-Instruct Q4_K_M, `-dev HRX0`,
 decode-path logits (`llama-perplexity -c 2049 -b 1 --save-all-logits`) are byte-identical
 to the previous pin, the buried code word is exact at 4700 tokens, and no GPU faults
 were observed.
+
+### Fixed: one-token decode at a head size that is not a power of two ([engine#1926](https://github.com/1bit-MONSTER/engine/issues/1926))
+
+A model whose attention head size is not a power of two (stories15M: 48; Sarashina2.2-3B: 160) and whose
+Q weights are not Q4_K or Q6_K loaded and prefilled on `HRX0`, then failed at the first decode step:
+`HRX Loom JIT Loom compilation failed`, `llama_decode: failed to decode, ret = -3`. The one-token Q
+projection kernel wrote each rotated pair at `channel rem head_size`, and the kernel compiler can only
+prove that two-wide store in bounds when the remainder is a mask. The kernel now indexes by rotation
+pair, which is in bounds at every head size (llama.cpp #282). Q4_K and Q6_K models took a different
+kernel at one token and were not affected.
+
+Measured at pin `a5dc597b8` on gfx1151 (2026-11-10, power mode `performance`):
+`test-hrx-attention-q-decode-head-size` compares the fused projection with the CPU backend at head
+sizes 48, 96 and 160 (controls 64 and 128) on BF16, F16 and Q8_0 weights: 9 of 15 cases failed before
+the fix, 0 of 15 after. `llama-bench -p 512 -n 128 -r 3`, two runs each: Sarashina2.2-3B bf16 decodes
+at 26.49 and 25.92 tok/s, stories15M Q8_0 at 317.77 and 338.54 tok/s (the box was shared; the same
+binary gave 545.39 tok/s on a quieter run).
 
 ### MoE decode and the kernel cache (llama.cpp #32, #33)
 
@@ -515,9 +538,21 @@ IQ3_XXS on 28 blocks and IQ4_XS on 17 — and on identical geometry the IQ3_XXS 
 IQ4_XS blocks cost (79.94 ms vs 33.34 ms per dispatch at a 10x639 grid, from the dispatch profiler). The IQ3_XXS grid
 decode was the reason: it selected a 12-bit grid code out of 256 inline constants, once per 4-value packet.
 
-`GGML_HRX_IQ3S_TABLE_DECODE=1` selects a second router-expert kernel that reads that grid from a small per-workgroup
-table instead. It is **off by default**; unset or `0` is the shipping path. Measured with it on, in one hold against a
-control arm on the same binary:
+A second router-expert kernel reads that grid from a small per-workgroup table instead. Which one runs depends on the
+fork pin:
+
+| fork pin | unset | `GGML_HRX_IQ3S_TABLE_DECODE=0` | `=1` |
+|---|---|---|---|
+| before `69ee6f50e` (llama.cpp#281) | select chain | select chain | table |
+| `69ee6f50e` and later | **table** | select chain | table |
+
+From `69ee6f50e` on, the table decode is the default for any routed gate/up pair where either weight is IQ3_XXS, and
+`=0` is the way back to the select chain. The first such dispatch logs which one was chosen
+(`ggml_hrx: IQ3_XXS routed gate/up decode: workgroup table`). A file with no IQ3_XXS expert tensors is unaffected:
+UD-IQ3_XXS stores its experts as IQ2_S, so of the two Flash-Next files only UD-IQ4_XS takes this path.
+
+Measured with the table on, in one hold against a control arm on the same binary, while it was still opt-in
+(engine#1347):
 
 | cell | control | `=1` | |
 |---|---:|---:|---|
@@ -530,10 +565,20 @@ The PPL row is the point: the value is unchanged to four decimals, measured in t
 decode is the same arithmetic. The absolute tok/s above are one box's state on one day — the same arm has read 182-318
 tok/s across windows for identical flags, which is why only the paired ratios are quoted.
 
-It stays opt-in because the two windows above ran on a fork commit that predates the SET_ROWS fix (#227), and a
-3,858-token prompt on that commit intermittently died in the CPU fallback (engine #1251). Before this becomes a default
-it needs the long-prompt cell plus `test-backend-ops -o MUL_MAT -b HRX0` on the current pin, neither of which this lane
-has run.
+It was opt-in at first because the two windows above ran on a fork commit that predates the SET_ROWS fix (#227), and
+a 3,858-token prompt on that commit intermittently died in the CPU fallback (engine #1251). What was run before the
+default changed (11-10, HRX0 against the CPU backend, both decodes in each row):
+
+    test-backend-ops -b HRX0 -o MUL_MAT_VEC_FUSION, fork cef5e2e20 (same kernel and matcher), unset and =1:
+        374 OK / 0 FAIL in each arm
+    the four routed cases below, fork 2d62cc7af plus the default change, unset and =0:
+        4/4 OK in each arm, NMSE 3.09e-5 .. 3.12e-5 against a 5e-3 limit
+
+The four are a routed gate/up SwiGLU, 640 -> 2560, 16 experts, top-10, with IQ3_XXS and IQ4_XS weights at 80 and 512
+tokens. They are in the fork's `tests/test-backend-ops.cpp` from `69ee6f50e`; before it, no case covered the routed
+IQ3_XXS shape. Not run for the default change: the paired pp4096 cell on the UD-IQ4_XS file at a pin that
+has it (the file needs about 60 GiB free and the box did not have it), and a bitwise compare of the two decodes. The
+ratios in the table are therefore still the opt-in ones.
 
 Still open on #572, stated so nobody reads this as closed: the 1,679 tok/s gap is not explained; the
 ubatch lever was measured up to 2048 and 4096 was tried and does not fit this 87 GiB file; no MTP

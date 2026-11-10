@@ -4359,6 +4359,31 @@ void test_tail_head_placement() {
         check(p.why.empty() && p.exact, "tail placement: a tail that ends with the head is exact");
         check(p.first == env && p.last == env, "tail placement: and the only candidate is the envelope's end");
     }
+    // (b2) engine#1773's review: the zero run is counted FROM EOF, so a head whose own last tiles are zero contributes
+    //      to it exactly like padding does, and `last` then computes as base - n*tile with only the `last < base` clamp
+    //      keeping it at the envelope's end. Measured by lifting `plan_tail_head` verbatim and running the hidden-896
+    //      geometry through it: all four cases below give first == last == 1,856. They are the cases where a clamp
+    //      mistake would hide, so they are pinned here rather than left to the pad-whole-tiles arm.
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes, 0, env, rows, tile, 2 * tile);
+        check(p.why.empty() && p.last == env && p.first == env,
+              "tail placement: a head whose own last two tiles are zero still lands on the envelope's end");
+    }
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes + 5 * tile, 0, env, rows, tile, 7 * tile);
+        check(p.why.empty() && p.last == env && p.first == env,
+              "tail placement: a zero run spanning the head's own tail tiles AND its padding is not counted twice");
+    }
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes + 512, 0, env, rows, tile, 512);
+        check(p.why.empty() && p.last == env && p.first == env,
+              "tail placement: padding smaller than one tile still lands on the envelope's end");
+    }
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes + rows * tile, 0, env, rows, tile, rows * tile);
+        check(p.why.empty() && p.last == env && p.first == env,
+              "tail placement: a zero run longer than the head is clamped to its start");
+    }
     // (b) n whole zero tiles after the head: the candidate walks back by exactly n tiles, never past the envelope
     for (int64_t n : {1, 3, 9}) {
         const int64_t bytes = exact_bytes + n * tile;
@@ -4440,6 +4465,35 @@ void test_qk_norm_refusal() {
     std::printf("  qk norm: 7 arms (declared+not-found refuses; found-only and neither are allowed)\n");
 }
 
+/* engine#1921: the nibble packer applies `& 0x0F`, so a code outside 0..15 WRAPS a full code range instead of
+ * saturating -- measured as `container == expected mod 4.0` over 32/32 columns of a group, i.e. a wrong weight that still
+ * looks plausible. The writer now refuses, and these arms pin the two ends of the legal range plus the refusal, because an
+ * arm that only checked the throw would pass on a writer that refused everything. */
+void test_encode_tile_code_range() {
+    const auto tile_with = [](int v) {
+        pi::TileW t;
+        t.k = 128;      // one 128-wide group, the minimum the layout allows
+        t.rows = 64;
+        t.code.assign(size_t(t.rows) * size_t(t.k), uint8_t(v));
+        t.scale.assign(size_t(t.rows), 1.0f);
+        t.zp.assign(size_t(t.rows), 0);
+        t.bias.assign(size_t(t.rows), 0);
+        return t;
+    };
+    bool ok0 = true, ok15 = true;
+    try { (void)pi::encode_tile(tile_with(0)); } catch (const std::exception&) { ok0 = false; }
+    try { (void)pi::encode_tile(tile_with(15)); } catch (const std::exception&) { ok15 = false; }
+    check(ok0, "encode tile: code 0 (the bottom of the legal range) encodes");
+    check(ok15, "encode tile: code 15 (the top of the legal range) encodes");
+    std::string why;
+    try { (void)pi::encode_tile(tile_with(16)); } catch (const std::exception& e) { why = e.what(); }
+    check(!why.empty(), "encode tile: code 16 is REFUSED, not wrapped to 0");
+    check(why.find("engine#1921") != std::string::npos, "encode tile: the refusal carries its issue");
+    check(why.find("0..15") != std::string::npos, "encode tile: and states the range it wants");
+    check(why.find("wrap") != std::string::npos, "encode tile: and says what would have happened instead");
+    std::printf("  encode tile: 6 arms (0 and 15 encode, 16 refuses by name)\n");
+}
+
 // engine#1889: the arithmetic that claims the per-head QK gains out of the 640 B Hunyuan-7B carries between its last qkv
 // tile and o_proj. A wrong offset there reads tile bytes as bf16 and mis-rotates every pack of the family, so both the
 // right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
@@ -4470,6 +4524,7 @@ void test_qk_gain_offsets() {
 }
 
 int main(int argc, char** argv) {
+    test_encode_tile_code_range();
     test_qk_norm_refusal();
     test_qk_gain_offsets();
     test_tail_head_placement();

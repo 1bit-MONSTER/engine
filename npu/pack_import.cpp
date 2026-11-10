@@ -2233,6 +2233,21 @@ TileW decode_tile(const uint8_t* tile, int k, int rows) {
 
 std::vector<uint8_t> encode_tile(const TileW& t) {
     if (t.k <= 0 || t.k % kKBlock) throw std::runtime_error("tile: K is not a positive multiple of 128");
+    /* A DEFENSIVE range check on this writer, not a fix for a measured defect -- the distinction matters, and an earlier
+     * version of this comment got it wrong: it cited #1918, whose mechanism (a pack's two's-complement int4 code landing in
+     * the container's unsigned field) was the EXTERNAL-TILE writer's, and whose cause was fixed on main by #1874. Nothing
+     * here ever produced an out-of-range code: the pack legs on two real 1.9 packs are unchanged with this guard in place.
+     *
+     * What it does buy: the nibble packer below applies `& 0x0F`, so IF a future caller ever hands this function a code
+     * outside 0..15, it would wrap a full code range rather than saturate -- a weight one range away that still looks
+     * plausible. Nobody documents whether that is the caller's job or the writer's, so the writer refuses, naming the
+     * position and the value, instead of silently packing a different number. A caller that means 15 says 15. */
+    for (size_t i = 0; i < t.code.size(); ++i)
+        if (t.code[i] > 0x0F)
+            throw std::runtime_error("tile: code " + std::to_string(int(t.code[i])) + " at k=" + std::to_string(t.k) +
+                                     " rows=" + std::to_string(t.rows) + ", element " + std::to_string(i) +
+                                     ": a 4-bit code is 0..15, and packing it would wrap a full code range "
+                                     "(engine#1921: clamp or re-quantise before encoding)");
     const int64_t sv = subv_bytes(t.rows);
     if (sv == 0) throw std::runtime_error("tile: rows is not a positive multiple of 64");
     const int nsubv = t.rows / 2, kbs = t.k / kKBlock;

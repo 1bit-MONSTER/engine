@@ -4214,7 +4214,11 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
         // Below the model's original window this returns theta unchanged, which is what makes a short prompt
         // bit-identical to the same model served without the scaling.
-        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, (int)HD);
+        // engine#1792 review: the exponent is HF's `dim / (dim - 2)` over the ROTARY width (`dim = int(head_dim *
+        // partial_rotary_factor)`), which is `rot` here -- passing `HD` was wrong for any model that declares dynamic
+        // scaling together with partial_rotary_factor < 1. Unreachable in today's catalog, so this is a correctness
+        // constant rather than a behaviour change for any pack that exists.
+        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, rot);
         for (int i = 0; i < half; i++) {
             double inv;
             if (proportional) {

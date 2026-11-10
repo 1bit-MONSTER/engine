@@ -85,7 +85,8 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
 >
 > | | `hrx-system` | `llama.cpp` | result |
 > |---|---|---|---|
-> | red window, 20:01–21:52 (ten runs, e.g. `fix/1696` 21:06) | `7f4236924` | **`8f124f906`** | failure |
+> | red window, 20:01–21:52 (`8f124f906`; 13 of the 15 failing runs) | `7f4236924` | **`8f124f906`** | failure |
+> | 21:00, 21:01 (`1bit/pack-blocked-*`) | `7f4236924` | `b970d85ba` | failure, **unexplained** (see below) |
 > | first green, 21:41 (`bump-hrx/60ae4c935`) | `7f4236924` | **`60ae4c935`** | success |
 > | green from 22:04 (`bump-hrx/831629fe` 00:21) | `7f4236924` | `831629fe9` | success |
 >
@@ -95,6 +96,12 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
 > fix (llama.cpp #260, `4e570337a`): it is green from 21:41Z, before `831629fe` existed. #1759's `831629fe` is a *later*
 > bump (green at 00:21) and did not end the window — an earlier version of this paragraph credited it, which the runs
 > contradict. The window closed because the pin moved, not because the failure was transient.
+>
+> **Two of the fifteen failing runs are not this failure**, and saying so is the point of a window: `21:00`
+> (`1bit/pack-blocked-extract`, run 42698418833) and `21:01` (`1bit/pack-blocked-rowmajor`) ran on the **older** pin
+> `b970d85ba` with the same `hrx-system` `7f4236924`, and I could not re-verify whether that pair built green earlier
+> (those commits are no longer fetchable), while `gh run view 42698418833 --log-failed` returns nothing. So: thirteen runs
+> on `8f124f906` are the redeclaration, two are unexplained, and neither is evidence for the other.
 >
 > One red run after the window is worth knowing about, because it is not this failure: `2026-11-10 02:23` on `1b02be9`
 > (pin already `5514ebea`) failed in **"Wait for memory (or refuse)" with exit 75** — `gh run view 42742403894

@@ -276,6 +276,69 @@ static void oga_geometry(void) {
         free(tiles); free(B); free(ref); free(fused); free(sc_ref); free(sc_fused);
     }
 
+    /* THE HEAD TILE'S LAYOUT CONTRACT (engine #1716, spec before implementation). The forward packs the lm head one
+     * tile at a time from a scratch buffer it fills as
+     *
+     *     bt[k * T + (n - n0)] = lm_at(n, k)          // K = kpad rows, T columns per tile
+     *     packB_into(bo, bt.data(), kpad, T, ...)     -> packB_blocked -> q4nx_pack_B_int8(bt, kpad, T, ...)
+     *
+     * A head-image cache has to reproduce that byte for byte, so this pins the contract it must match: one scale per
+     * COLUMN of the tile (T of them), codes in row-major order, and the axis order load-bearing -- which is the property
+     * a transposed or row/column-swapped builder would get wrong while still producing plausible numbers. */
+    {
+        const int kpad = 96, T = 64;                 /* a head tile: kpad along K, T along N */
+        float* bt = malloc((size_t)kpad * T * sizeof(float));
+        int8_t* codes = malloc((size_t)kpad * T);
+        float* scales = malloc((size_t)T * sizeof(float));
+        check(bt && codes && scales, "head tile: the layout fixture allocates");
+        if (bt && codes && scales) {
+            for (int k = 0; k < kpad; k++)
+                for (int n = 0; n < T; n++) bt[(size_t)k * T + n] = (float)((k * 13 + n * 7) % 97) * 0.01f - 0.5f;
+            const float m = q4nx_pack_B_int8(bt, kpad, T, codes, T, scales);
+            /* (a) one scale per column, and it is that column's absmax/127 (with the all-zero floor) */
+            int bad_scale = 0;
+            for (int n = 0; n < T; n++) {
+                float amax = 0.0f;
+                for (int k = 0; k < kpad; k++) {
+                    const float a = fabsf(bt[(size_t)k * T + n]);
+                    if (a > amax) amax = a;
+                }
+                if (amax < 1e-12f) amax = 1.0f;
+                if (fabsf(scales[n] - amax / 127.0f) > 1e-7f) bad_scale++;
+            }
+            check_int(bad_scale, 0, "head tile: one scale per COLUMN of the tile (T of them), absmax/127");
+            double ssum = 0.0;
+            for (int n = 0; n < T; n++) ssum += (double)scales[n];
+            check(fabsf((float)(ssum / T) - m) < 1e-6f, "head tile: the returned mean is over the T columns");
+            /* (b) codes are row-major over (k, n) and match the column's scale */
+            int bad_code = 0;
+            for (int k = 0; k < kpad; k++)
+                for (int n = 0; n < T; n++) {
+                    int want = (int)lroundf(bt[(size_t)k * T + n] / scales[n]);
+                    if (want > 127) want = 127;
+                    else if (want < -127) want = -127;
+                    if (codes[(size_t)k * T + n] != (int8_t)want) bad_code++;
+                }
+            check_int(bad_code, 0, "head tile: codes are row-major over (k, n) with the column's scale");
+            /* (c) the axis order is load-bearing: a transposed scratch is a DIFFERENT image, so a builder that swaps
+             *     rows and columns cannot pass by producing plausible numbers. */
+            float* tr = malloc((size_t)kpad * T * sizeof(float));
+            int8_t* codes_t = malloc((size_t)kpad * T);
+            float* scales_t = malloc((size_t)kpad * sizeof(float));   /* K/N swap: the transposed image has kpad columns */
+            if (tr && codes_t && scales_t) {
+                for (int k = 0; k < kpad; k++)
+                    for (int n = 0; n < T; n++) tr[(size_t)n * kpad + k] = bt[(size_t)k * T + n];
+                q4nx_pack_B_int8(tr, T, kpad, codes_t, kpad, scales_t);
+                int differ = 0;
+                for (int i = 0; i < kpad * T; i++) if (codes_t[i] != codes[i]) differ++;
+                check(differ > kpad * T / 4, "head tile control: the transposed scratch is a different image");
+                free(tr); free(codes_t); free(scales_t);
+            }
+            printf("  head tile: kpad %d x T %d, %d codes, %d column scales, layout pinned\n", kpad, T, kpad * T, T);
+        }
+        free(bt); free(codes); free(scales);
+    }
+
     /* QKV: the three projections are stacked along N at their real row counts and the tail of the
      * 1536-wide kernel is zero. */
     if (qkv) {

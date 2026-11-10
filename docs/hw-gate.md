@@ -52,8 +52,8 @@ compiled `ggml/src/ggml-hrx` at PR time, and every pin bump merged that week rea
 hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
 
 - **When.** On every same-repo PR that changes an input of that build: the `third_party/llama.cpp` or
-  `third_party/hrx-system` gitlink, `CMakeLists.txt`, `cmake/hrx.cmake`, `config/hrx-toolchain.config`,
-  `config/hrx-system-hold.config`, `app/serve.cpp` (the HRX wiring) or the workflow itself. It also runs by hand
+  `third_party/hrx-system` gitlink, `CMakeLists.txt`, a `cmake/tests-*.cmake` family file, `cmake/hrx.cmake`,
+  `config/hrx-toolchain.config`, `config/hrx-system-hold.config`, `app/serve.cpp` (the HRX wiring) or the workflow itself. It also runs by hand
   (Actions -> hrx-build -> Run workflow). It needs no label.
 - **Configure only, for a test registration.** A PR whose only change among those inputs is a ctest registration
   added to `CMakeLists.txt` or to a `cmake/tests-*.cmake` family file it includes (`add_test(...)`,

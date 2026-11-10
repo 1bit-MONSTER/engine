@@ -3066,21 +3066,14 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         for (int g = 0; g < groups; g++) {
             const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
             for (int n = 0; n < N; n++) {
-                float amax = 0.0f;
-                for (int k = k0; k < k1; k++) {
-                    const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
-                    if (std::isfinite(v) && v > amax) amax = v;
-                }
-                if (!(amax >= 1e-12f)) amax = 1.0f;
-                t.d[(size_t)g * (size_t)N + (size_t)n] = amax / 127.0f;
-                const float tis = 127.0f / amax;
-                for (int k = k0; k < k1; k++) {
-                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
-                    if (!std::isfinite(v)) v = 0.0f;
-                    int q = (int)std::round(v * tis);
-                    q = q > 7 ? 7 : (q < -8 ? -8 : q);
-                    t.codes[(size_t)k * (size_t)N + (size_t)n] = (int8_t)q;
-                }
+                // engine#1839: the rule lives in ONE place now. It was inline here, clamping to the int4 range (-8..7)
+                // while the storage and the scale were int8 -- so every |v| > 7/127 of amax was truncated before the
+                // first multiply. `q4nx_quantise_i8_group` is the extracted rule (one scale per group-column, int8 codes,
+                // int8 clamp) and `tests/npu_pack_test.cpp` pins a known vector to known codes, which this copy could
+                // not be held to while it was inline in a cache-filling loop.
+                q4nx_quantise_i8_group(Bmat + (size_t)k0 * (size_t)N + (size_t)n, k1 - k0, N,
+                                       &t.d[(size_t)g * (size_t)N + (size_t)n],
+                                       t.codes.data() + (size_t)k0 * (size_t)N + (size_t)n, N);
             }
         }
         if (!cacheable) {

@@ -307,6 +307,13 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
  * (engine #1416). Writes Bm at the blocked (or row-major, `blocked == 0`) index for this geometry, per-column scales into
  * col_scales[N], and the sum of the scales into *ssum_out. `KD`/`ND` are the container's padded geometry the layout is
  * defined on. Behaviour-preserving extraction: the body is the class's own, with `bpos()` passed in. */
+/* Quantise one 128-row group of a column to int8 (engine#1839): `amax` is the group's max |v| over rows [k0, k1) of
+ * column n, the scale is `amax / 127` and the codes are the int8 range -- NOT -8..7. The int4 code range belongs to the
+ * weights a device kernel packs two per byte; the activations this arm feeds the reference GEMM are one int8 per element,
+ * and clamping them to +-8 truncated every |v| > 7/127 of amax (i.e. most of a real tensor) before the first multiply.
+ * Exported because the rule is what can be wrong silently: `tests/npu_pack_test.cpp` pins a known vector to known codes. */
+void q4nx_quantise_i8_group(const float* v, int rows, int ld, float* scale_out, int8_t* codes, int code_ld);
+
 int q4nx_pack_B_int8_blocked(int8_t* Bm, const float* w, int K, int N, int KD, int ND, int blocked,
                              float* col_scales, double* ssum_out);
 

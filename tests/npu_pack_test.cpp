@@ -44,6 +44,24 @@ static void check(bool ok, const std::string& what) {
     }
 }
 
+    /* engine#1839: the quantiser's known answer. A vector whose amax is 127 must come back as int8 codes in the INT8
+     * range -- 127 stays 127 and -128 stays -128 -- because `codes` holds one int8 per element and the scale is amax/127.
+     * The bug this pins: the clamp was the int4 range (-8..7), so 127 -> 7 and -128 -> -8, an 18x error on the largest
+     * entries before the first multiply, in the arm the engine#1809 gate grades the device against. */
+    {
+        float   col[129];
+        int8_t  codes[129];
+        col[0] = 127.0f;  col[1] = -128.0f;  col[2] = 0.5f;  col[3] = -0.5f;
+        for (int k = 4; k < 129; k++) col[k] = float((k % 17) - 8);      /* small values, still inside int8 */
+        float d = 0.0f;
+        q4nx_quantise_i8_group(col, 129, 1, &d, codes, 1);
+        check(codes[0] == 127, "engine#1839: an amax element quantises to 127, not the int4 clamp 7");
+        check(codes[1] == -126, "engine#1839: a large negative element quantises to -126, not the int4 clamp -8");
+        check(codes[2] == 1, "engine#1839: 0.5 rounds half away to 1");
+        check(codes[3] == -1, "engine#1839: -0.5 rounds half away to -1");
+        check(fabsf(d - 1.0f) < 1e-6f, "engine#1839: the scale is amax/127 = 1.0 for an amax of 127");
+    }
+
 int main(int argc, char** argv) {
     for (int G : {8, 9, 16}) {
         for (int n : {G, 3 * G}) {  // whole groups: a ragged tail is not a permutation

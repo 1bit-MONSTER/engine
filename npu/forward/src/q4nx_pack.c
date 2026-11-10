@@ -610,6 +610,30 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
     return 0;
 }
 
+void q4nx_quantise_i8_group(const float* v, int rows, int ld, float* scale_out, int8_t* codes, int code_ld) {
+    /* engine#1839: one column of one 128-row group. The clamp is the INT8 range because `codes` holds one int8 per
+     * element and the scale is amax/127 -- `roundf(v * 127/amax)` is inside +-127 by construction, so the clamp is only
+     * a float-rounding guard and must not narrow the codes. It used to narrow them to the int4 range (-8..7), which is
+     * right for the weights a device kernel packs two per byte and wrong for these activations: every |v| > 7/127 of
+     * amax became +-8 before the first multiply. Pinned by a known vector -> known codes in tests/npu_pack_test.cpp. */
+    float amax = 0.0f;
+    for (int k = 0; k < rows; k++) {
+        const float x = v[(size_t)k * (size_t)ld];
+        const float a = x < 0 ? -x : x;
+        if (isfinite(a) && a > amax) amax = a;
+    }
+    if (!(amax >= 1e-12f)) amax = 1.0f;
+    *scale_out = amax / 127.0f;
+    const float tis = 127.0f / amax;
+    for (int k = 0; k < rows; k++) {
+        float x = v[(size_t)k * (size_t)ld];
+        if (!isfinite(x)) x = 0.0f;
+        int q = (int)roundf(x * tis);
+        q = q > 127 ? 127 : (q < -128 ? -128 : q);
+        codes[(size_t)k * (size_t)code_ld] = (int8_t)q;
+    }
+}
+
 float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
                        float* col_scales) {
     // ROW-major traversal, both passes. The obvious spelling of this (for j, for i) walks a row-major K x N matrix with

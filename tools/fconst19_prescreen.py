@@ -79,11 +79,19 @@ def geometry(repo):
 
 
 def main():
+    """Decide whether a twin-diff is plausible, by CONTENT past the 1.9 header -- not by counting the twin's headers.
+
+    Two corrections from review are baked in here:
+      1. a 1.8 Token .fconst never carries the per-head header (the 1.9 block is the 1.8 block PLUS it), so "the twin has no
+         markers" is the normal case, not a bad twin. The first version treated it as fatal and rejected every pair,
+         including amd/Qwen2.5_3B_Instruct's, which is already measured into the table as {2048, 16, 36, ...} (#1774);
+      2. the head count is not read from a config (that returned None and made the fallback mis-align everything) -- it is
+         found by asking which header length makes the two files agree past the header.
+    """
     if len(sys.argv) < 3:
         print(__doc__.strip().splitlines()[-1], file=sys.stderr)
         return 2
     r19, r18 = sys.argv[1], sys.argv[2]
-    h, nh, nl = geometry(r19)
     try:
         f19, f18 = token_fconst(r19), token_fconst(r18)
     except Exception as e:
@@ -92,36 +100,48 @@ def main():
     if not f19 or not f18:
         print(f"{r19}: missing Token .fconst ({f19}, {f18})")
         return 1
-    # The first header can sit past the first window (a bigger hidden size means a bigger prefix), so grow the window until a
-    # header appears on the 1.9 side or the cap is reached. Still tens of MB, not gigabytes.
-    win = WINDOW
-    while True:
+    win, at, b, a = WINDOW, -1, b"", b""
+    while win <= 48 * 1024 * 1024:
         try:
             b = head_bytes(r19, f19, win)
             a = head_bytes(r18, f18, win)
         except Exception as e:
-            print(f"  fetch failed at {win//1048576} MB: {e}")
+            print(f"  fetch failed at {win // 1048576} MB: {e}")
             return 1
-        n19, n18 = b.count(HDR), a.count(HDR)
-        if n19 or win >= 48 * 1024 * 1024:
+        at = b.find(HDR * 2) if at < 0 else at     # any run of at least two markers is a header
+        if at >= 0:
             break
         win *= 2
-    print(f"{r19.split('/')[-1][:44]:46s} h{h} nh{nh} L{nl}")
-    print(f"  1.9 {f19[:52]:54s} header markers in first {win//1048576} MB: {n19}")
-    print(f"  1.8 {f18[:52]:54s} header markers in first {win//1048576} MB: {n18}")
-    if n18 == 0 and n19 == 0:
-        print("  -> neither window contains a header; fetch more before judging")
+    if at < 0:
+        print(f"  the 1.9 window ({win // 1048576} MB) contains no header markers: fetch more before judging")
         return 0
-    if n18 == 0:
-        print("  -> the twin carries NO per-head header in this window: the twin-diff route needs the geometry-agnostic path "
-              "(engine#1740 W1a) or another 1.8 reference. Do not spend the download.")
+    n = min(1_000_000, len(a) - at, len(b) - at - 512)
+    if n <= 0:
+        print("  the windows are too small to compare past the first header")
         return 0
-    # first difference between the two windows, which is what the tool reports as the prefix
-    same = 0
-    while same < min(len(a), len(b)) and a[same] == b[same]:
-        same += 1
-    print(f"  -> both carry headers; windows agree for {same:,} B, then differ. A twin-diff measurement is plausible: run "
-          f"tools/fconst19_measure.py on the full packs.")
+    best = None
+    for heads in range(1, 129):
+        hdr_len = heads * 4
+        if at + hdr_len + n > len(b):
+            continue
+        step = max(1, n // 20000)
+        idx = range(0, n, step)
+        same = sum(1 for i in idx if a[at + i] == b[at + hdr_len + i])
+        agree = same / len(range(0, n, step))
+        if best is None or agree > best[0]:
+            best = (agree, heads, hdr_len)
+    agree, heads, hdr_len = best
+    print(f"{r19.split('/')[-1][:44]:46s}")
+    print(f"  1.9 {f19[:52]:54s} first header at {at:,} in the first {win // 1048576} MB")
+    print(f"  1.8 {f18[:52]:54s} best alignment at heads={heads} ({hdr_len} B header): {100.0 * agree:.2f} % of the "
+          f"{n:,} sampled bytes past the header identical")
+    if agree > 0.99:
+        print("  -> the twin lines up past the header: a twin-diff measurement is plausible. Run "
+              "tools/fconst19_measure.py on the full packs.")
+    else:
+        print("  -> the twin does NOT line up past the header: its payload is a different division or rotation, so the "
+              "twin-diff route cannot produce this row. It needs the geometry-agnostic path (engine#1740 W1a) or another "
+              "1.8 reference. Do not spend the download.")
     return 0
 
 

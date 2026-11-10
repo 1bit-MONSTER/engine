@@ -1778,7 +1778,28 @@ Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
     return q;
 }
 
-Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err, bool row_major) {
+// engine#1946: `kk == 0` is the tile's bias pair and the decoder below skips it, on the strength of a comment that says it is
+// "all zero here". That assumption is load-bearing (a non-zero bias we never read is an additive term missing from every
+// projection) and it was measured on exactly one subvolume of one pack. Every tile gets ONE check here -- two subvolumes of
+// 2,176 B -- so any import of any pack says whether it held, instead of assuming it.
+static std::string g_bias_witness;
+static int64_t g_bias_tiles_checked = 0;
+const std::string& bias_slot_witness() { return g_bias_witness; }
+int64_t bias_slots_checked() { return g_bias_tiles_checked; }
+
+static void note_bias_slot(const char* who, int64_t tile, int slot, const uint8_t* p, int64_t n) {
+    if (!g_bias_witness.empty()) return;
+    int64_t nz = 0;
+    for (int64_t i = 0; i < n; ++i)
+        if (p[i]) ++nz;
+    if (nz == 0) return;
+    g_bias_witness = std::string(who ? who : "a projection") + " tile " + std::to_string(tile) + " bias subvolume " +
+                     std::to_string(slot) + " holds " + std::to_string(nz) + " of " + std::to_string(n) +
+                     " non-zero bytes, and the decoder skips it";
+}
+
+Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err, bool row_major,
+                        const char* who) {
     Q4 q;
     if (N <= 0 || K <= 0 || N % kExtTileRows != 0 || K % 128 != 0) {
         err = "external tile: N must be a multiple of 64 and K a multiple of 128 (got " + std::to_string(N) + " x " +
@@ -1800,6 +1821,10 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
     q.scale.assign(size_t(N) * (K / 32), 0.0f);
     q.zero.assign(size_t(N) * (K / 32), 0.0f);
     for (int64_t tile = 0; tile < tiles; ++tile) {
+        // the two kk == 0 subvolumes are this tile's bias pair; the loop below starts at kk == 1
+        for (int slot = 0; slot < 2; ++slot)
+            note_bias_slot(who, tile, slot, data + (tile * per_tile + slot) * kExtSubvBytes, kExtSubvBytes);
+        ++g_bias_tiles_checked;
         for (int half = 0; half < 2; ++half) {
             for (int64_t kk = 1; kk <= blocks; ++kk) {   // kk == 0 is the tile's bias pair, all zero here
                 const uint8_t* subv = data + (tile * per_tile + kk * 2 + half) * kExtSubvBytes;
@@ -3378,7 +3403,8 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         if (!mul_ok(uint64_t(wt.length ? wt.length : wt.raw_len), 1, need) || need == 0)
             throw std::runtime_error(mm.weight + ": no external length recorded");
         std::string derr;
-        const Q4 pack = decode_external_tile(bytes_of(wt, need), size_t(need), int(mm.N), int(mm.K), derr);
+        const Q4 pack = decode_external_tile(bytes_of(wt, need), size_t(need), int(mm.N), int(mm.K), derr,
+                                             kExtQuantsRowMajor, mm.weight.c_str());
         if (!derr.empty()) throw std::runtime_error(mm.weight + ": " + derr);
         const Q4 conv = container_from_external_q4(pack);
         std::vector<ContainerTensor> outs;
@@ -4677,6 +4703,14 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         const TextArtifacts ta = scan_text_artifacts(pack_dir);
         c["vocab_size"] = V;
         c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries
+        // engine#1946: the pack's bias TENSORS are not imported (the tile decoder skips the kk == 0 slot that holds them on
+        // the strength of "all zero here"), so say what the decoder found instead of leaving the assumption in a comment.
+        // Empty witness = every slot of every tile it read was all zero, which is the condition the skip is valid under.
+        if (!g_bias_witness.empty())
+            c["bias_slots_note"] = g_bias_witness;
+        else if (g_bias_tiles_checked > 0)
+            c["bias_slots_note"] = "all " + std::to_string(g_bias_tiles_checked) +
+                                   " tile bias slot(s) read were zero, so skipping them is exact";
         if (!r.head_synthesized_note.empty()) c["q4nx_head_note"] = r.head_synthesized_note;
         // The forward picks between "logits from the token embedding" and "logits from a separate head tensor" on this
         // key, and defaults to TIED when it is absent (npu/forward/src/q4nx_semantics.c). An untied pack that ships no

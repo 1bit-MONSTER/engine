@@ -397,7 +397,12 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
                                 std::string& err);
 
 Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::string& err,
-                        bool row_major = kExtQuantsRowMajor);
+                        bool row_major = kExtQuantsRowMajor, const char* who = nullptr);
+
+// engine#1946: what the decoder found in the tile bias slots it skips. Empty = every slot it checked was all zero, which is
+// the assumption `kk == 0` rests on; a non-empty string is the first slot that was not, with its tile and byte count.
+const std::string& bias_slot_witness();
+int64_t bias_slots_checked();
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles = false, bool drop_zero = false);
 

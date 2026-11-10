@@ -3874,8 +3874,35 @@ void test_qk_gain_offsets() {
     check(n4.k_norm == 0 && n4.q_norm == 0, "qk gains: the byte count alone is not enough, head_dim has to agree");
 }
 
+// engine#1946: the external-tile decoder SKIPS the kk == 0 subvolumes because they are "the tile's bias pair, all zero
+// here" -- an assumption in a comment, valid only while it holds. It now checks them and reports the first slot that is not
+// zero, so an import says which it was. Driven here with both shapes, because a witness that fires on everything is as
+// useless as one that never fires.
+void test_bias_slot_witness() {
+    // N=64 rows, K=128: tiles = 1, blocks = 1, per_tile = 2*(1+1) = 4 subvolumes, each kExtSubvBytes
+    const int N = 64, K = 128;
+    const size_t bytes = size_t(N / 64) * size_t(2 * (K / 128 + 1)) * size_t(pi::kExtSubvBytes);
+    std::vector<uint8_t> zero(bytes, 0);
+    for (size_t i = 2 * size_t(pi::kExtSubvBytes); i < bytes; ++i) zero[i] = uint8_t(i * 7 + 3);  // the kk >= 1 payload
+    std::string err;
+    (void)pi::decode_external_tile(zero.data(), bytes, N, K, err, pi::kExtQuantsRowMajor, "zero-bias");
+    check(err.empty(), "bias slot: a zero-bias tile decodes");
+    check(pi::bias_slot_witness().empty(),
+          "bias slot: an all-zero bias pair leaves the witness empty (" + pi::bias_slot_witness() + ")");
+    std::vector<uint8_t> nz = zero;
+    nz[5] = 0x80;   // one non-zero byte in the kk == 0 slot of tile 0
+    (void)pi::decode_external_tile(nz.data(), bytes, N, K, err, pi::kExtQuantsRowMajor, "nonzero-bias");
+    check(!pi::bias_slot_witness().empty(), "bias slot: a non-zero byte in a bias slot is REPORTED, not skipped silently");
+    check(pi::bias_slot_witness().find("nonzero-bias") != std::string::npos,
+          "bias slot: the report names the tensor it was decoding");
+    check(pi::bias_slot_witness().find("1 of ") != std::string::npos,
+          "bias slot: and counts the non-zero bytes rather than saying 'something'");
+    check(pi::bias_slots_checked() >= 2, "bias slot: the tiles it looked at are counted");
+}
+
 int main(int argc, char** argv) {
     test_qk_norm_refusal();
+    test_bias_slot_witness();
     test_qk_gain_offsets();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";

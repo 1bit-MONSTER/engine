@@ -3667,6 +3667,17 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 if (loc.off < 0) {
                     late.push_back("lm_head.weight: " + loc.why);
                 } else {
+                    // engine#1740: say WHICH placement was taken. "imported" alone cannot distinguish a tail that ends
+                    // with the head from one that ends in padding, and that difference is the whole point of the
+                    // search -- so the number a reviewer needs is here rather than inferred from the file size.
+                    std::fprintf(stderr,
+                                 "  lm head: tile 0 at %lld B, %lld tile(s) after a %lld B envelope; %lld B of trailing "
+                                 "zeros, %lld tile(s) of slack%s%s\n",
+                                 (long long)loc.off, (long long)rows, (long long)env, (long long)loc.zeros,
+                                 (long long)loc.slack,
+                                 loc.exact ? ", the tail ends with the head" : "",
+                                 loc.verified ? " (tied: located by correlation with the pack's embedding)"
+                                              : " (untied: placement taken, not verified)");
                     std::vector<TileW> tiles;
                     tiles.reserve(size_t(rows));
                     bool exact = true;

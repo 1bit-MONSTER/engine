@@ -1436,10 +1436,38 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             lm_head_f_.assign((size_t)NV * (size_t)kpad_, 0.0f);
             lm_w_ = kpad_;
             const uint8_t* lp = (const uint8_t*)model_tensor_data(mw_, ltd);
-            if (!lp || dequant_any(lp, (size_t)ltd->data_size, NV, kpad_,
-                                   lm_head_f_.data()) != 0) {
+            /* engine#1990: the container's head may carry MORE rows than the vocabulary, for the same reason a padded
+             * column exists -- q4_1 tiles hold 32-row multiples and a pack's vocabulary need not be one (CodeLlama's is
+             * 32,016). The importer pads those rows; the reader must therefore dequantise on the tensor's own grid and
+             * keep only the vocabulary's rows. Asking for exactly NV rows is what failed here: 32,016 is not a multiple
+             * of the tile's 32 rows, so dequant_any() refused a head that was perfectly well formed.
+             *
+             * The extra rows decode to zero and are never sampled: the logits vector stays NV long. */
+            int head_rows = NV;
+            if (ltd->ndim >= 2 && kpad_ > 0 && kpad_ % Q4NX_TILE_COLS == 0 && ltd->shape[1] == kpad_) {
+                const int64_t per_block = kpad_ / Q4NX_TILE_COLS;   // tiles per 32-row block
+                if (per_block > 0 && ltd->shape[0] % per_block == 0) {
+                    const int64_t r = (ltd->shape[0] / per_block) * Q4NX_TILE_ROWS;
+                    if (r >= NV && r % Q4NX_TILE_ROWS == 0) head_rows = int(r);
+                }
+            }
+            std::vector<float> head_f32;
+            float* head_out = lm_head_f_.data();
+            if (head_rows != NV) {
+                head_f32.assign((size_t)head_rows * (size_t)kpad_, 0.0f);
+                head_out = head_f32.data();
+            }
+            if (!lp || dequant_any(lp, (size_t)ltd->data_size, head_rows, kpad_, head_out) != 0) {
                 err_ = "lm_head dequant failed";
                 return false;
+            }
+            if (head_rows != NV) {
+                for (int r = 0; r < NV; r++)
+                    std::memcpy(&lm_head_f_[(size_t)r * (size_t)kpad_], &head_f32[(size_t)r * (size_t)kpad_],
+                                sizeof(float) * (size_t)kpad_);
+                std::fprintf(stderr,
+                             "  [forward] lm head: %d row(s) stored for a vocabulary of %d; the %d padding row(s) are "
+                             "not read (engine#1990)\n", head_rows, NV, head_rows - NV);
             }
             fprintf(stderr, "  [forward] separate lm_head.weight -> dequantized "
                             "(%zu floats)\n", lm_head_f_.size());

@@ -929,7 +929,7 @@ void test_head_row_padding() {
         q.K = 128;      // two 64-column tiles
         q.block = 32;   // four groups per row
         q.codes.assign(size_t(N) * size_t(q.K), 1);          // non-zero, so padding is distinguishable
-        q.scale.assign(size_t(N) * size_t(q.K / q.block), 0.5f);
+        q.scale.assign(size_t(N) * size_t(q.K / q.block), 0.5f);   // 1.0 in the padded rows; see below
         q.zero.assign(size_t(N) * size_t(q.K / q.block), 0.25f);
         return q;
     };
@@ -943,9 +943,9 @@ void test_head_row_padding() {
         for (int r = 32016; r < q.N; r++) {
             for (int k = 0; k < q.K; k++) zeros = zeros && q.codes[size_t(r) * 128 + size_t(k)] == 0;
             for (int g = 0; g < 4; g++)
-                zeros = zeros && q.scale[size_t(r) * 4 + size_t(g)] == 0.0f && q.zero[size_t(r) * 4 + size_t(g)] == 0.0f;
+                zeros = zeros && q.scale[size_t(r) * 4 + size_t(g)] == 1.0f && q.zero[size_t(r) * 4 + size_t(g)] == 0.0f;
         }
-        check(zeros, "head padding: every padded row is code 0, scale 0, zero 0 -- which decodes to 0.0, not to a weight");
+        check(zeros, "head padding: every padded row is code 0, scale 1, zero 0 -- which decodes to 0.0, not to a weight");
         bool kept = true;
         for (int r = 0; r < 32016; r++)
             for (int k = 0; k < 128; k++) kept = kept && q.codes[size_t(r) * 128 + size_t(k)] == 1;

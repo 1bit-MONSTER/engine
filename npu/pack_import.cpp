@@ -1778,8 +1778,9 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
 // refused the whole import with "q4_1 tiles need N % 32 == 0" -- a head the grid cannot hold, not a head that is wrong.
 // Where the pack pads its own head (the .fconst tail carries ceil(V/64)*64 rows: Hunyuan-0.5B has 120,832 for 120,818)
 // nothing here fires; where it does not, pad with rows that decode to zero, and leave `vocab_size` at the vocabulary's
-// own number so the padding is never addressed. codes 0 with scale 0 decode to 0, for the same reason a padded column
-// does: the quantised value is code*scale + zero, and zero holds the group's `m`.
+// own number so the padding is never addressed. codes 0 with SCALE 1 and zero 0 decode to exactly 0.0 -- and scale 1,
+// not 0: a zero scale is not a zero weight to a reader, it is a malformed parameter block (the forward's dequant refuses
+// it, which is how the first version of this padding was caught: "lm_head dequant failed").
 void pad_rows_to_tile_quantum(Q4& q, int vocab) {
     if (q.N <= 0 || q.K <= 0 || q.block <= 0 || q.K % q.block) return;
     if (q.N % q4nx::kRows == 0) return;
@@ -1787,7 +1788,7 @@ void pad_rows_to_tile_quantum(Q4& q, int vocab) {
     const size_t gpr = size_t(q.K / q.block);   // groups per row
     for (int r = q.N; r < padded; r++) {
         q.codes.insert(q.codes.end(), size_t(q.K), 0);
-        q.scale.insert(q.scale.end(), gpr, 0.0f);
+        q.scale.insert(q.scale.end(), gpr, 1.0f);   // 1.0, not 0: code 0 * 1 + 0 = 0.0, and a 0 scale is malformed
         q.zero.insert(q.zero.end(), gpr, 0.0f);
     }
     std::fprintf(stderr,

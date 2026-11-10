@@ -78,7 +78,7 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   add-on (the gate builds that) and does not dispatch anything. Green means the pinned pair builds into the engine. It
   does not replace the `hw-gate` label on a pin bump.
 
-> **Between about 21:0x and 23:1x on 2026-11-09 this job failed on every branch, and a red badge was not a signal** (engine #1733).
+> **From 20:01 to 21:52 on 2026-11-09 this job failed on every branch that ran it, and a red badge was not a signal** (engine #1733).
 > Three errors sat in `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as
 > `bool`, and two declarations that differ only in return type — on every branch measured (five of them), and #1681's pin bump
 > failed the same way at 9m15s while its `build` was green. **The window closed when the pin moved**, and the pins are what to
@@ -86,10 +86,11 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
 > **`60ae4c935`** (the fork fix is llama.cpp#260 → `4e570337`, taken by engine#1736):
 >
 > ```
-> 21:24–21:52  five failures   ->  llama.cpp 8f124f906      (void at :383, bool at :517: the TU cannot compile)
-> 21:41, 21:42  success        ->  llama.cpp 60ae4c935
-> 22:04 onward  all success    ->  llama.cpp 60ae4c935
-> 00:21         success        ->  llama.cpp 831629fe9
+> 20:01–21:52  ten failures   ->  llama.cpp 8f124f906      (void at :383, bool at :517: the TU cannot compile)
+> 21:41, 21:42  success       ->  llama.cpp 60ae4c935       (first green: the pin that carries the fix)
+> 22:04 onward  all success   ->  llama.cpp 60ae4c935       (the branches that had failed come back green)
+> 00:21         success       ->  llama.cpp 831629fe9
+> 02:23         failure       ->  exit 75 from "Wait for memory (or refuse)", NOT a compile failure
 > ```
 >
 > So the red **was** a property of the pinned tree, and it was not mysterious: `8f124f906` declares `device_free_total` `void` at

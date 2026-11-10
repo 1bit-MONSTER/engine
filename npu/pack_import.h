@@ -71,7 +71,26 @@ struct Dims {
     unsigned short eps_bits = 0x3586;
     std::string model_type;
     std::vector<int> eos;
+    // config.json's `use_qk_norm` (engine#1889). Hunyuan-7B declares it and puts 32x128 + 8x128 per-head q/k
+    // gains in its block; nothing read this key, so the importer decided `qk_norm` from layout arithmetic alone,
+    // landed on false, and the pack imported cleanly with the norms silently omitted -- the forward then runs
+    // without normalising q/k, which produces deterministic gibberish rather than a refusal. Read here so the
+    // decision has the pack's own statement as one of its inputs.
+    bool use_qk_norm = false;
 };
+
+// Why a pack that DECLARES per-head q/k gains cannot be imported, or "" when it can (engine#1889).
+//
+// `declared` is config.json's `use_qk_norm`; `found` says the block layout located the two sections (knorm_off /
+// qnorm_off) or the graph carries them. The three cases are deliberately separate: declared-and-not-found is a
+// REFUSAL (importing without the gains is the silent-garbage path), found-and-not-declared is allowed only with the
+// measurement behind it (Qwen3 packs ship the sections without the key), and neither is the ordinary case. Exposed
+// so the three can be pinned without a 4 GB pack.
+struct QkGainOffsets {
+    int64_t k_norm = 0, q_norm = 0;  // 0,0 = the gap is not the gains' shape
+};
+QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
+std::string qk_norm_refusal(bool declared, bool found);
 
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
 // GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
@@ -202,6 +221,10 @@ struct TextArtifacts {
     bool tokenizer = false;                     // tokenizer.json present: what `1bit serve` opens
 };
 TextArtifacts scan_text_artifacts(const std::string& pack_dir);
+// engine#1751 follow-up: the one text-artifact copier both import paths use. Copies every kTextFiles entry the pack has
+// into out_dir and returns how many; a file the pack has that cannot be copied throws, naming it (a skipped file is not
+// a failure -- packs legitimately ship subsets). Exported so a test can drive the failure path without a pack.
+int copy_text_artifacts_exported(const std::string& pack_dir, const std::string& out_dir);
 
 // engine#1740 (W1a): where the 1.9 Token .fconst keeps its output layer. The arithmetic is exposed because it is the
 // half that can be wrong silently -- a one-tile error reads a plausible region and only a correlation against the
@@ -440,6 +463,13 @@ int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without
 // engine#1638: the geometry as read, so a test can check WHICH source a number came from.
 nlohmann::json load_geometry_exported(const std::string& pack_dir, std::string* source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
+// engine#1831: the in-block header offsets the epsilon anchors support at a known stride, sorted -- every offset that
+// recurs `min_repeat` or more times (offset 0, the block start, excluded). Kept as a list, not a mode: a Qwen3 block has
+// three equally frequent inner headers.
+std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64_t stride, int min_repeat);
+// engine#1831: set `hdr`/`h1`/`period` from that list the way locate_fconst() does -- one inner header is a 2-header block,
+// three is a 4-header block. Returns false, and changes nothing, for any other count.
+bool fconst_set_block_headers(FconstGeom& g, const std::vector<int64_t>& inner);
 
 // One measured Ryzen AI 1.9 Token .fconst block shape (engine#1503). Every field is measured against the 1.8 pack of
 // the same model by tools/fconst19_measure.py; none of it is derivable from the pack, which is why a pack whose shape
@@ -462,6 +492,13 @@ const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std:
 // weights into the wrong projections while every anchor still lines up), and a row that a merge silently drops (the
 // h4096 row was lost twice that way, which un-measured a whole model class with nothing failing).
 const Fconst19Rule* fconst19_rules(int* count);
+// The preference order for the 1.9 canonical .fconst scratch copy (engine#1801): the explicit override, then the on-disk cache
+// directory, then the temp directory and the cwd. Exposed so a test can pin the order -- the bug that shipped once was a cache
+// directory that was never created, so every pack silently fell through to tmpfs.
+std::vector<std::string> fconst_scratch_dirs();
+// True when `dir` is, or can be made into, a directory the scratch copy may be written to. Exposed with the order above because the
+// bug #1801 shipped once was exactly this: the cache directory existed only in the comment.
+bool fconst_scratch_ready(const std::string& dir);
 // The same decision over an explicit table, so a test can hand it the one shape that decides correctness and that the
 // real table must never contain: two rows for one geometry with different shapes.
 const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,

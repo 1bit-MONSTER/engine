@@ -568,6 +568,27 @@ static void test_head_image(void) {
                       "head image: no image reads as a refusal");
                 check(why[0] != 0 && strstr(why, "not there") != NULL, "... whose reason is that it is not there");
             }
+            /* (e) THE KEY: each of the four facts a head image depends on must change it. kpad, T and blocked come from the
+             * kernel designs and head_hash from the container, so any one of them differing means a DIFFERENT image -- and
+             * keying on fewer would serve one kernel set's image to another while the correlation still looked plausible. */
+            {
+                Q4nxHeadImageKey base = {96, 64, 1, q4nx_head_image_hash(codes, scales, kd, nd)};
+                const uint64_t d0 = q4nx_head_image_key_digest(&base);
+                Q4nxHeadImageKey k[4];
+                for (int i = 0; i < 4; i++) k[i] = base;
+                k[0].kpad++;              k[1].t++;           k[2].blocked = 0;     k[3].head_hash ^= 1ull;
+                int changed = 0;
+                for (int i = 0; i < 4; i++)
+                    if (q4nx_head_image_key_digest(&k[i]) != d0) changed++;
+                check_int(changed, 4, "head image key: kpad, T, blocked and the head hash each change the digest");
+                /* and the name is stable for the same key, so a cache written by one run is found by the next */
+                char n1[64], n2[64], n3[64];
+                check(q4nx_head_image_key_name(&base, n1, (int)sizeof n1) == 1, "head image key: it names a file");
+                check(q4nx_head_image_key_name(&base, n2, (int)sizeof n2) == 1 && strcmp(n1, n2) == 0,
+                      "... the same name for the same key");
+                check(q4nx_head_image_key_name(&k[1], n3, (int)sizeof n3) == 1 && strcmp(n1, n3) != 0,
+                      "... and a different name when T changes, so two kernel sets cannot share one cached image");
+            }
             /* (d) a truncated file refuses rather than returning a partial image */
             {
                 check(q4nx_head_image_write(path, codes, scales, kd, nd) == 1, "head image: written for the truncation arm");

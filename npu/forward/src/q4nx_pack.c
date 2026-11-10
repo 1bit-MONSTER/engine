@@ -132,6 +132,108 @@ void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
     }
 }
 
+/* The integer arm of the same contract (engine#1808): the activation is already quantised to int8 by the
+ * engine's own rule (q4nx_quant_i8::row, which is byte-identical to its scalar reference), the weights are
+ * the container's int4 codes as the importer packed them, and the accumulation is EXACT int32 -- no float
+ * anywhere. That is what the kernel computes, so this is the only host reference a bit-exactness gate can
+ * be written against: the f32 path (below) cannot be bit-exact with int8 by construction.
+ *
+ * out32[n] = sum_k codes[k][n] * a8[k],  codes in [-8, 7], a8 in [-127, 127].
+ * Scaling (per-128-K group multiplier and the per-row activation scale) is deliberately NOT applied here:
+ * the gate compares the int32 exactly, and applies scales on both sides from the same inputs, so a scale
+ * mistake cannot hide inside the comparison. */
+/* The whole GEMM in int8 x int4, for the gate's `NPU_INFER_HOST_GEMM=i8` arm: quantise the activation row
+ * and every weight column with the engine's own rule, accumulate exactly, and hand back the int32 -- the
+ * caller applies the multiplier and the activation scale, the same two factors the kernel's epilogue uses.
+ *
+ * LIMIT, stated because it decides what this arm can and cannot prove: the weights are quantised HERE from
+ * the dequantised f32 matrix, not read from the container's packed b8 image. So this arm isolates the
+ * kernel's ACCUMULATION and epilogue from its weight-layout handling: a wrong tile order will not show up
+ * here (the f32 arm covers that by construction), but a wrong int4 quantisation, a wrong per-128-K group
+ * boundary, an int8 intermediate or a saturated accumulator will. That is the split the MoE oracle already
+ * uses (`expected_int32` with the scales factored out), and it is what makes an int32 bit-exact comparison
+ * meaningful at all. */
+/* The per-call cost that matters (engine#1809, measured): quantising the WEIGHTS inside the GEMM made one 7B
+ * token ~7.5 G scalar operations, so the arm never finished a token in a 9-minute ticket. The weights are the
+ * same matrix on every call, so they are quantised once per tensor by the caller and reuse this form:
+ *
+ *   out[n] = ascale * sum_g d[g][n] * ( sum_{k in group g} code[k][n] * a8[k] )
+ *
+ * exactly the kernel's epilogue, with the inner sum in int32 and no float in it. `d` is the per-128-K-group
+ * multiplier per column ([groups][N]), `ascale` the activation row's scale. */
+
+void q4nx_host_gemm_i8_grouped(const int8_t* a8, int K, const int8_t* codes, const float* d,
+                               int groups, int N, float ascale, float* out) {
+    const int G = 128;
+    for (int n = 0; n < N; n++) out[n] = 0.0f;
+    for (int g = 0; g < groups; g++) {
+        const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
+        for (int n = 0; n < N; n++) {
+            int32_t acc = 0;
+            for (int k = k0; k < k1; k++) acc += (int32_t)((int)codes[(size_t)k * (size_t)N + (size_t)n] * (int)a8[k]);
+            out[n] += d[(size_t)g * (size_t)N + (size_t)n] * (ascale * (float)acc);
+        }
+    }
+}
+
+void q4nx_host_gemm_i8_from_f32(const float* A, int a_k, int M, int K, int N, const float* Bmat,
+                                int32_t* out32) {
+    const int G = 128;                       /* the arena's multiplier group: one d per 128 K-rows per column */
+    const int kg = (K + G - 1) / G;
+    for (int m = 0; m < M; m++) {
+        const float* a = A + (size_t)m * (size_t)a_k;
+        int32_t* out = out32 + (size_t)m * (size_t)N;
+        for (int n = 0; n < N; n++) out[n] = 0;
+        for (int g = 0; g < kg; g++) {
+            const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
+            /* the activation's own per-row scale is the caller's; here only the integer codes matter, and the
+             * kernel receives them already scaled, so quantise with a per-group unit scale to keep the
+             * comparison about the accumulation rather than about a float that both sides share */
+            for (int n = 0; n < N; n++) {
+                float amax = 0.0f;
+                for (int k = k0; k < k1; k++) {
+                    const float v = fabsf(Bmat[(size_t)k * (size_t)N + (size_t)n]);
+                    if (v > amax && isfinite(v)) amax = v;
+                }
+                /* engine#1839: the scale and the clamp describe the SAME range -- int4, [-8, 7] -- or the codes
+                 * saturate and the dequantised weight is ~18x too small. q4nx_quant_int4_*() own the pair. */
+                const float amax_eff = (amax >= 1e-12f) ? amax : 1.0f;
+                for (int k = k0; k < k1; k++) {
+                    const float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
+                    const int q = q4nx_quant_int4_code(v, amax_eff);
+                    int aq = (int)roundf(a[k] * 127.0f);
+                    if (aq > 127) aq = 127;
+                    else if (aq < -127) aq = -127;
+                    out[n] += (int32_t)(q * aq);
+                }
+            }
+        }
+    }
+}
+
+float q4nx_quant_int4_scale(float amax) {
+    if (!(amax >= 1e-12f) || !isfinite(amax)) return 1.0f;   /* an all-zero group still needs a usable scale */
+    return amax / 7.0f;
+}
+
+int8_t q4nx_quant_int4_code(float v, float amax) {
+    if (!isfinite(v)) v = 0.0f;
+    const float s = q4nx_quant_int4_scale(amax);
+    int q = (int)roundf(v / s);
+    if (q > 7) q = 7;
+    else if (q < -8) q = -8;
+    return (int8_t)q;
+}
+
+void q4nx_host_gemm_i8(const int8_t* a8, int K, const int8_t* codes, int N, int32_t* out32) {
+    for (int n = 0; n < N; n++) out32[n] = 0;
+    for (int k = 0; k < K; k++) {
+        const int a = (int)a8[k];
+        const int8_t* row = codes + (size_t)k * (size_t)N;
+        for (int n = 0; n < N; n++) out32[n] += (int32_t)((int)row[n] * a);
+    }
+}
+
 void q4nx_host_gemm_f32_padded(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                               float* out) {
     if (!A || !Bmat || !out || M <= 0 || K <= 0 || N <= 0) return;

@@ -41,6 +41,9 @@ LINE_STYLES = [
       # engine#1595: the direction-B ratchet's baseline is a '#'-comment data file too, and `.txt` has no style of
       # its own (a blanket "*.txt" would demand a notice in files that are data, not code).
       "add_test_gaps.txt",
+      # engine#1820: the other sweep's allow-list, same shape and the same reason -- `#`-comment data, `.txt` has no
+      # style, and the header it wants is already at the top of the file.
+      "unreferenced_tests.txt",
       "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
       # cycle 17: Puppy's switch that skips its first-run Quick Setup is an empty marker file whose only content
       # is this notice - Puppy tests for its existence, so a comment is free

@@ -1071,6 +1071,10 @@ what it can and records the rest in the container's `__metadata__` (`incomplete`
 `config.json` (`q4nx_source.incomplete`). The shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
 now imports whole — **291 tensors, 67,088 tiles, no refusals**: embedding, head, the 48 layer
 norms, the final norm, 96 attention projections, 72 attention biases and 72 MLP projections.
+That holds for a pack whose layer projections are graph initializers (no `.fconst`) too: a
+projection the decoder cannot read, for example codes present but no scales tensor beside them,
+is refused by name like any other. It used to be skipped, so the import reported no refusals over
+a container missing that projection (engine#1841).
 
 ### The final norm, and the tail envelope
 
@@ -1976,6 +1980,13 @@ the images it writes.
 `tools/mtp_acceptance --offline` scores the drafter alone on the base's own greedy stream, `--live` runs the loop,
 `--live --match` scores both **at the loop's own chain positions** (so the two per-depth tables are one measurement
 sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
+
+`NPU_BATCH_CHECK=1` is the oracle underneath that check. Every `step_batch` first replays its rows with sequential
+`step()` calls and prints `[batchcheck] M=.. positions=a..b` with the argmax at the last row and a bitwise row count
+(`identical=N differing=0`). Both passes continue the same prefix: the oracle snapshots the first `start_pos`
+positions before the replay and restores them afterwards (engine#1905). So a chunk after the first, or the serve
+path's split-off last token, is compared from the state the batched pass really continues, and the flag leaves the
+run's own output unchanged. `tests/batch_check_state_test.cpp` pins both properties.
 
 `tools/mtp_depth_pool.py` pools those tickets. It refuses a pool it cannot read (a repeated tail, a cell scored twice, a
 short read, a mixed budget, a mixed window identity) and, since the tau=0.6 window, it also says when a depth is too

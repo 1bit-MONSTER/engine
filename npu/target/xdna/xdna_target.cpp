@@ -283,6 +283,14 @@ bool XdnaTarget::weight_cached(int layer, int key) const {
 int XdnaTarget::max_rows() const {
     if (pb16i_) { for (int i = 0; i < ndesigns_; i++) if (ctx16_[i]) return ctx16_[i]->MD; }
     for (int i = 0; i < ndesigns_; i++) if (ctx_[i]) return ctx_[i]->MD;
+    // engine#1900: the sealed/mono-ELF generation adopts its kernel set through a path that fills neither array, so both
+    // loops above find nothing and this returned 1. This is the CHUNK WIDTH (q4nx_forward's `blk = max_batch_rows()`), so
+    // those packs batched ONE ROW per launch however wide their design is -- `models/npu/bonsai2-27b-NPU-b8` states prefill
+    // M=128 and reported 1. Only reachable when no per-role context was adopted, so nothing that has one changes; and the
+    // plan is the pack's own statement of the width its kernels were built for (a plan whose M disagrees with adopted
+    // kernels is already refused above). Still 1 when the plan states nothing: guessing a width launches into a BO sized for
+    // fewer rows, which is the memory-corruption path engine#1372 records.
+    if (plan_.prefill_m > 0) return plan_.prefill_m;
     return 1;
 }
 
@@ -1149,6 +1157,18 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     }
     const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     out.resize((size_t)M * N);
+    // engine#1808: the device's per-column weight scales, KEYED by (layer, N, K) so it can be paired with the host
+    // arm's dump exactly. Index pairing was tried first and is meaningless -- the two sides reach the GEMM a
+    // different number of times (384 device dumps against 1024 arm dumps on the same request).
+    if (const char* gdir = getenv("NPU_I8_GS_DUMP")) {
+        static int n = 0;
+        char path[4096];
+        std::snprintf(path, sizeof path, "%s/dev_L%d_N%d_K%d_%03d.bin", gdir, ar.layer, N, K, n++);
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            if (gs && !gs->empty()) std::fwrite(gs->data(), sizeof(float), (size_t)N, f);
+            std::fclose(f);
+        }
+    }
     for (int m = 0; m < M; m++) {
         const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
         const float asc = ascales[(size_t)m];

@@ -687,10 +687,14 @@ buffer — the loader resolves it through `select_weight_buft()` over `make_cpu_
 repack path is allowed (`binding.weight` is that flag, engine#969). Measured, three arms in one ticket, Qwen3-4B-Q4_K_M,
 `-p 512 -n 32`, own peak `drm-total-gtt` from `bo_trace`:
 
-| arm | BO bytes | own peak GTT | prefill |
-|---|---:|---:|---:|
-| everything on the device | 5,867.8 MiB | 5,495 MiB | 3,241 tok/s |
-| host-placed `ffn_down` + repack | 7,743.8 MiB | 6,459 MiB | 3,879 tok/s |
+| arm | load mode | BO bytes | own peak GTT | prefill |
+|---|---|---:|---:|---:|
+| everything on the device | `-lm mmap` (default) | 5,867.8 MiB | 5,495 MiB | 3,241 tok/s |
+| host-placed `ffn_down` + repack | `-lm none` | 7,743.8 MiB | 6,459 MiB | 3,879 tok/s |
+
+The two rows differ in load mode as well as placement, so their prefill ratio (1.197×) is **not** a placement result: `-lm none`
+alone is 1.1745× prefill on the same file and shape ([#1668](https://github.com/1bit-MONSTER/engine/issues/1668)). The third arm
+holds the load mode fixed, and that is the placement number quoted below.
 
 The native range really does shrink — the whole-model buffer drops **2,376.0 → 1,786.0 MiB (−590)** — but the repacked and parked
 copies cost more than the range they displace: a new **896.0 MiB** class (`HostWeightCache`'s reserved-plus-parked slots), **37 ×

@@ -1358,6 +1358,11 @@ differ because the two encodings are different, both exactly:
 | Q4_0 codes | unsigned `q` (0..15) | **signed** `q-8`, nibble = `q` xor 8 |
 | code order in a tile | `[row-half(2)][group(8)][col-in-group(32)][row-pair(8)]` (the 16-row split the kernel walks) | plain column major `[col(256)][row-pair(16)]` |
 
+`npu-pack`'s writers hold the container to that unsigned field: `tile_q4_1`, `tile_q4_1_f32` and the
+`.fconst` tile encoder all refuse a code above 15, naming where it is, rather than mask it into
+a different code one full range away (engine#1921). A signed code has to be converted before it
+reaches a writer, which is what the 1.9 decoder does.
+
 Measured, per tensor, against the GGUF as ground truth: **196/196 Q4_0 tensors exact (0.0 error)
 under each file's own decoder** — so both converters are correct — and **0/197 exact when one is
 read with the other's decoder** (worst error 2.8-3.0). The scale planes of all 53 760 Q4_0 tiles

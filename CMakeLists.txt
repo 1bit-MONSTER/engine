@@ -1118,6 +1118,11 @@ target_link_libraries(npu_pack_test PRIVATE onebit_npu)
 add_executable(ops_dump_test tests/ops_dump_test.cpp)
 target_include_directories(ops_dump_test PRIVATE npu/forward/include)
 add_test(NAME ops_dump COMMAND ops_dump_test)
+# engine#1822 review: an `add_test` whose target ci.yml never builds is a ctest row that never runs in CI, and
+# `ci_targets_check --check` fails on it. `add_dependencies(onebit <target>)` is the tree's documented second build route
+# (the same one onebit_npu_forward_syntax and route_log_test use), so `--target onebit` pulls the test binary in without
+# touching the workflow file.
+add_dependencies(onebit ops_dump_test)
 
 add_test(NAME npu_blocked_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_blocked_layout_test.sh

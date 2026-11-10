@@ -86,10 +86,6 @@ struct Dims {
 // REFUSAL (importing without the gains is the silent-garbage path), found-and-not-declared is allowed only with the
 // measurement behind it (Qwen3 packs ship the sections without the key), and neither is the ordinary case. Exposed
 // so the three can be pinned without a 4 GB pack.
-struct QkGainOffsets {
-    int64_t k_norm = 0, q_norm = 0;  // 0,0 = the gap is not the gains' shape
-};
-QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
@@ -138,6 +134,10 @@ struct Plan {
     // none. Identified and verified byte-exact against the public Qwen3-1.7B/4B checkpoints (0 of 128
     // values differ on either pack, and the swap differs on 127-128 of 128).
     int64_t knorm_off = 0, qnorm_off = 0;
+    // engine#1934: the bytes between the last qkv tile and o_proj when they are the per-head gains in the PACKED form
+    // (`…q_norm.layernorm.weight.qk_rms_packed_26_0`, one bf16 tensor of 320 values). Recorded, not claimed: the two-window
+    // split #1928 used read one window twice, and a value check cannot tell the difference.
+    int64_t qk_packed_gap_bytes = 0;
     int64_t mlp_off = 0;  // the MLP section starts just past the block's post-attention norm
     // What the pack's *graph* carries, reported so `npu-pack info` can answer a pack's genre without a
     // third-party parser: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights as ordinary ONNX initializers, while

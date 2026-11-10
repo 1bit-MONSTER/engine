@@ -2508,18 +2508,6 @@ std::string Plan::manifest() const {
     return j.dump(2);
 }
 
-// engine#1889: where the per-head QK gains sit when the attention section carries them as the 640 B between the last
-// qkv tile and o_proj. Split out and exposed because this is the arithmetic a wrong answer silently mis-rotates every
-// Hunyuan pack with: a right offset reads a gain (~1.0-2.0), a wrong one reads tile bytes as bf16 and the gains come out
-// wild, and the test drives both shapes without a pack.
-QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes) {
-    const int64_t per_head = head_dim * 2;
-    if (gap_bytes != 2 * (kNormOff + per_head)) return QkGainOffsets{};
-    QkGainOffsets o;
-    o.k_norm = gap_start + kNormOff;                          // block 0 is k, as the separate-section family
-    o.q_norm = gap_start + (kNormOff + per_head) + kNormOff;  // block 1 is q
-    return o;
-}
 
 std::string qk_norm_refusal(bool declared, bool found) {
     if (declared && !found)
@@ -2848,10 +2836,15 @@ Plan plan(const std::string& pack_dir) {
                             // use_qk_norm, gains not located") into an import; the values are the check (a wrong offset
                             // reads tile bytes as bf16 and the gains come out wild, a right one gives the 1.0-2.0 a norm
                             // gain has).
-                            const QkGainOffsets qkg =
-                                qk_gain_offsets(attn_off + p.attn_tiles * tile_bytes, int64_t(d.head_dim), rem);
-                            p.knorm_off = qkg.k_norm;
-                            p.qnorm_off = qkg.q_norm;
+                            // engine#1934: NOT claimed. The pack's own per-op metadata names this gap as ONE tensor --
+                            // `attn.q_norm.layernorm.weight.qk_rms_packed_26_0`, size 640, shape [320] -- and #1928's
+                            // two-window split read the SAME bytes twice (the structure repeats with a period of 320 B),
+                            // so it wrote two copies of one vector as `q_norm`/`k_norm`. Neither is the pack's gain, and
+                            // a value check cannot tell: both windows are plausible gains, which is exactly the trap
+                            // #1889 warned about. Until the `qk_rms_packed` packing is known the honest state is to read
+                            // nothing here; a pack that DECLARES the gains then meets #1895's refusal by name instead of
+                            // importing two tensors that are not them.
+                            p.qk_packed_gap_bytes = rem;
                             static bool said2 = false;
                             if (!said2) {
                                 said2 = true;

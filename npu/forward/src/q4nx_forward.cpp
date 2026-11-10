@@ -3074,6 +3074,8 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     const HostI8Tensor& t = it->second;
     std::vector<float> padded_a;
     float order_gap_ = 0.0f;
+    static int i8_dump_call_ = 0;
+    std::vector<int32_t> acc_row;
     // One-GEMM A/B (engine#1830): with NPU_DBG_I8_AB set, compare this arm's output against the f32 GEMM for the
     // SAME activation and the SAME tensor. cos ~0.99 means the layout and scales are right and a remaining
     // degeneracy is an integration issue; cos ~0 means the operands are still wrong. Host only, first few calls.
@@ -3103,11 +3105,13 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
         }
         float* dst = out + (size_t)m * (size_t)N;
+        acc_row.assign((size_t)N, 0);
         for (int n = 0; n < N; n++) {
             int32_t acc = 0;
             for (int k = 0; k < K; k++)
                 acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] * (int)a8[(size_t)k]);
             dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
+            acc_row[(size_t)n] = acc;
             // How much can float ORDER alone move this value? The device multiplies ((cm * asc) * gs); this arm
             // multiplies (gs * (asc * cm)). Track the gap so "the residue is just multiplication order" can be
             // checked instead of asserted.
@@ -3115,7 +3119,16 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
             const float gap = std::fabs(alt - dst[(size_t)n]);
             if (gap > order_gap_) order_gap_ = gap;
         }
+        if (const char* idir = getenv("NPU_I8_INT32_DUMP")) {
+            char path[4096];
+            std::snprintf(path, sizeof path, "%s/i8_%03d_m%d.bin", idir, i8_dump_call_, m);
+            if (std::FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(acc_row.data(), sizeof(int32_t), (size_t)N, f);
+                std::fclose(f);
+            }
+        }
     }
+    if (getenv("NPU_I8_INT32_DUMP")) i8_dump_call_++;
     if (ab) {
         double dot = 0, na = 0, nb = 0, md = 0;
         for (size_t i = 0; i < ab_ref.size(); i++) {

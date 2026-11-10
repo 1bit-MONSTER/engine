@@ -1153,6 +1153,19 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
         const float asc = ascales[(size_t)m];
         float* o = out.data() + (size_t)m * N;
+        // engine#1808: the last measurement between "the device is right to int8 precision" and "bit-exact at the
+        // accumulator" is the INTEGER comparison -- dump the post-readback int32 rows so they can be diffed against
+        // a host arm's accumulators directly. Env-gated, off by default, one file per call.
+        if (const char* idir = getenv("NPU_I8_INT32_DUMP")) {
+            static int call = 0;
+            char path[4096];
+            std::snprintf(path, sizeof path, "%s/dev_%03d_m%d.bin", idir, call, m);
+            if (std::FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(cm, sizeof(int32_t), (size_t)N, f);
+                std::fclose(f);
+            }
+            if (m + 1 == M) call++;
+        }
         for (int n = 0; n < N; n++)
             o[n] = (float)cm[n] * asc * (*gs)[(size_t)n];
     }

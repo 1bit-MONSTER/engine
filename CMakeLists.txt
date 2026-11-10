@@ -196,6 +196,7 @@ add_test(NAME embed_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/embed_serve.sh $<TAR
 # serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
 add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
 # serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.
+add_test(NAME serve_hangup COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_hangup_test.sh $<TARGET_FILE:onebit>)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
 add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $<TARGET_FILE:onebit>)
@@ -342,6 +343,12 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
+# engine #1750: the carried amdxdna series applies in order to the pinned driver, and the context-restart code it
+# produces fails a context's jobs (and logs it) when the restart fails, instead of leaving them parked or running
+# them at close on a half-built firmware context. The driver's own functions in a user-space harness: no NPU, no
+# kernel headers. Skips (77) where the driver source is not checked out (third_party/xdna-driver or ONEBIT_XDNA_SRC).
+add_test(NAME amdxdna_restart COMMAND bash ${CMAKE_SOURCE_DIR}/tests/amdxdna_restart_test.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(amdxdna_restart PROPERTIES SKIP_RETURN_CODE 77)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.
@@ -378,6 +385,14 @@ add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
 add_test(NAME think_split COMMAND think_split_test)
 # Host / Origin checks every engine HTTP server applies (app/http_guard.h); header only, runs in CI.
+# engine#1779 (F10 fault 2): the degenerate-repetition predicate at the context limit. Header only, no device.
+add_executable(serve_degenerate_test tests/serve_degenerate_test.cpp)
+target_include_directories(serve_degenerate_test PRIVATE app)
+add_test(NAME serve_degenerate COMMAND serve_degenerate_test)
+# Built with `onebit`, which CI's --target list already names: a test target of its own would need a line in
+# .github/workflows/ci.yml, and a PR that edits a workflow cannot be merged by a token without the `workflow` scope.
+add_dependencies(onebit serve_degenerate_test)
+
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)
 add_test(NAME http_guard COMMAND http_guard_test)

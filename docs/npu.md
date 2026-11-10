@@ -937,6 +937,25 @@ What converts, and how faithfully:
 | `model.norm` (final) | `.fconst`, the tail envelope at `layers x stride` | bf16 | byte-exact |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
+**A multi-component pack's per-layer embedding** (engine#1725). gemma-4's embedding component
+carries, beside the token table, `embed_tokens_per_layer.weight` (`vocab x layers*P` f32; 262,144 x
+8,960 on e2b, 9.4 GiB), a `P`-wide `per_layer_projection_norm.weight` shared by every layer, and
+the context projection `per_layer_model_projection.weight_t_Q4` quantised at block 32. The import
+writes them under the names the forward loads:
+
+| container tensor | from | form |
+|---|---|---|
+| `model.per_layer_token_embd.weight` `[vocab, layers*P]` | the f32 table | BF16, round to nearest even |
+| `model.per_layer_proj_norm.weight` `[P]` | the norm | BF16 |
+| `model.per_layer_model_proj.weight_layer{l}` `[P, hidden]` | the projection, dequantised, one per layer | BF16 |
+
+The table is never held in memory, in either form: the reader points into the component's mapped
+external data (its extent is checked once, when it is located), and the container writer converts
+it 32 rows at a time while it writes the file. A projection with no zero-point tensor takes the
+implicit zero point 8, the same rule as every other MatMulNBits here. `config.json` gets
+`hidden_size_per_layer_input` and `vocab_size_per_layer_input` only when all three parts went into
+the container, because those two keys are what switch the block on in the forward.
+
 An OGA pack keeps its tensors inside the `If` branches: the top-level graph has **no
 initializers** and four nodes (`Shape`/`Constant`/`Equal`/`If`). The importer walks the
 subgraphs. The 4-bit decode is `w = (code - zp) * scale` with two codes per byte (low nibble
@@ -1380,6 +1399,28 @@ again to get the logits the answer is drawn from. Restoring `cached - 1` positio
 `cached` is what the KV alone would allow, and it applies the last token's GDN update twice: measured on the first
 version of this fix, the cache hit (`[prefix] slot=0 cached=179 of 180 reason=hit`, TTFT 5.3 s against 15.6 s) and
 answered the same prompt with different, fragmented text.
+
+### The prefix cache's pinned slot: single-turn requests under one system prompt (engine#1785)
+
+A slot holds a whole prompt, and a request hits a slot only when the slot is a prefix of it. Requests that
+share a system prompt and differ in the user turn therefore reuse nothing from each other: `system + question 1`
+is not a prefix of `system + question 2`. `tests/npu_sampling_test.cpp` (`test_prefix_pin`) states that as its
+first row: a 900-token system prompt, a second question, `cached_tokens: 0`.
+
+The slot table (`app/npu_prefix_cache.h`) has a slot kind for the part such requests do share:
+
+| call | what it decides |
+|---|---|
+| `pin_point(prev, ids)` | how many leading tokens this request shares with the previous one. 0 when one prompt is a prefix of the other (a repeat or a continued conversation, which the ordinary slots already keep), when the shared part adds fewer than `--prefix-min-gain` tokens over a slot that already covers the request, or when the cache is off |
+| `pin(prefix, bytes)` | keep the state at that point. One pinned slot at a time: a new pin replaces it; eviction for room and a longer prompt's replacement both leave it alone |
+| `lookup(ids)` | unchanged, and reports `pinned` when the hit is the pinned slot |
+
+It reads token ids only, so it does not depend on the template or on which message is the system prompt.
+
+**State of this, plainly:** the table and its tests are in; `forward-serve` does not call `pin_point()`/`pin()`
+yet, so no request is faster because of it today. The forward half is one more cut in the prefill loop (stop one
+token short of the pin point, `snapshot_state`, `pin`), and it needs a device run to be claimed.
+
 
 ### Sampling and structured output
 

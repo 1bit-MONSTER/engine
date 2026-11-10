@@ -93,6 +93,10 @@ def coverage(raw):
                 out.append(b)
         return out
 
+    def a_get(table, key):
+        a = table.get(key)
+        return bool(a and a.get("backends"))
+
     with_arch = raw["total"] - raw["no_arch"]
     mapped = checked = 0
     per_backend = {b: {"mapped": 0, "checked": 0} for b in ("hrx", "npu")}
@@ -110,8 +114,36 @@ def coverage(raw):
             checked += n
             for b in c:
                 per_backend[b]["checked"] += n
+    # engine#1929 review: `declined` is a THIRD state, not work remaining. registry/significant.json lists the classes a
+    # human reviewed and deliberately did not map (`watch: "report"`, the same predicate tools/census_watch.py uses for
+    # "reviewed"), so a census that counts their models as unmapped reports work that is actually a recorded decision --
+    # and one that subtracts them silently reports a percentage over an unwritten denominator. They are counted here, and
+    # kept out of `top_unmapped`, which is the list of things still to do.
+    declined_archs = set()
+    try:
+        sig = json.load(open(os.path.join(REG, "significant.json")))["classes"]
+        declined_archs = {hf for hf, e in sig.items() if e.get("watch") == "report" and not (a_get(archs, hf))}
+    except (OSError, ValueError, KeyError):
+        declined_archs = set()          # no registry, no declines: say zero rather than fail the census
+    declined = sum(n for hf, n in raw["counts"].items() if hf in declined_archs)
+    unmapped = [(hf, n) for hf, n in unmapped if hf not in declined_archs]
     pct = lambda x: round(100.0 * x / with_arch, 2) if with_arch else 0.0
     return {
+        "definitions": {
+            "mapped": "the pinned backend's code accepts this HF architecture class (registry/architectures.json "
+                      "names a backend for it); it is a property of the ARCHITECTURE, so every model of a mapped "
+                      "class counts as mapped whether or not that model was ever run",
+            "checked": "the architecture has a PASSING serve_e2e at the pin -- not that this model was run. It is "
+                       "the same per-architecture property, which is why the npu figure is essentially one "
+                       "architecture's model population rather than a count of models anyone exercised",
+            "declined": "a human reviewed the class and deliberately did not map it (registry/significant.json, "
+                        "`watch: \"report\"`). Counted separately and excluded from top_unmapped: it is a recorded "
+                        "decision, not work remaining. The denominator is unchanged -- declined models are still "
+                        "`with_architecture`",
+            "with_architecture": "models whose HF card names an architecture this census can look up; models with no "
+                                 "architecture are excluded from every percentage above",
+        },
+        "declined_models": declined, "declined_architectures": len(declined_archs),
         "models": raw["total"], "with_architecture": with_arch,
         "architectures_seen": len(raw["counts"]),
         "mapped_models": mapped, "mapped_pct": pct(mapped),

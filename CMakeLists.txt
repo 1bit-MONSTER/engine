@@ -1228,7 +1228,8 @@ target_include_directories(npu_derive_designs_dump PRIVATE npu/forward/include)
 target_link_libraries(npu_derive_designs_dump PRIVATE m)
 # q4nx_dequant.c joins this target: the fused chunks->int8 path (engine #1416) dequantises one tile at a time and
 # the test compares it against the two-step dequant+pack, so both live here.
-add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
+add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c
+                   npu/forward/src/q4nx_head_image.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)

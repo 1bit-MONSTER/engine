@@ -27,13 +27,23 @@
 // 1024-column tensor at 896 columns (which the chunk decoder refuses outright).
 #include "q4nx_dequant.h"
 #include "q4nx_pack.h"
+#include "q4nx_head_image.h"
 
 #include <math.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
+
+
+static void truncate_file(const char* path, long bytes) {
+    FILE* f = fopen(path, "r+b");
+    if (!f) return;
+    if (ftruncate(fileno(f), bytes) != 0) { /* best effort: the arm asserts the refusal either way */ }
+    fclose(f);
+}
 
 static void check(int ok, const char* what) {
     printf("%s %s\n", ok ? "ok  " : "FAIL", what);
@@ -431,7 +441,91 @@ static void activation_pad(void) {
     free(src); free(dst);
 }
 
+
+static void test_head_image(void) {
+    /* THE HEAD IMAGE ROUND TRIP (engine#1716, the cache's correctness bar). The image a serve copies into the weight BO
+     * must be byte-identical to what the packer produces for the same tile, and a file that cannot prove it is the same
+     * image must be REFUSED rather than copied -- a stale or damaged image copied into a BO answers wrongly with no
+     * message at all, which is the failure this whole contract exists to make impossible. */
+    {
+        const int kd = 96, nd = 64;                 /* the same head-tile shape the layout contract above uses */
+        float* bt = malloc((size_t)kd * nd * sizeof(float));
+        int8_t* codes = malloc((size_t)kd * nd);
+        int8_t* back = malloc((size_t)kd * nd);
+        float* scales = malloc((size_t)nd * sizeof(float));
+        float* sc_back = malloc((size_t)nd * sizeof(float));
+        check(bt && codes && back && scales && sc_back, "head image: the fixture allocates");
+        if (bt && codes && back && scales && sc_back) {
+            for (int k = 0; k < kd; k++)
+                for (int n = 0; n < nd; n++) bt[(size_t)k * nd + n] = (float)((k * 29 + n * 11) % 101) * 0.013f - 0.6f;
+            q4nx_pack_B_int8(bt, kd, nd, codes, nd, scales);
+
+            const char* path = "head_image_roundtrip.bin";
+            remove(path);
+            check(q4nx_head_image_write(path, codes, scales, kd, nd) == 1, "head image: the image is written");
+            Q4nxHeadImageInfo info;
+            char why[256];
+            check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd, &info, why, (int)sizeof why) == 1,
+                  "head image: it reads back");
+            check_int((int)info.kd, kd, "head image: the geometry in the header is the geometry written");
+            check_int((int)info.nd, nd, "head image: and so is the column count");
+            /* THE BAR: byte-identical to a fresh pack, not merely close */
+            check(memcmp(codes, back, (size_t)kd * nd) == 0, "head image: the codes are byte-identical to a fresh pack");
+            check(memcmp(scales, sc_back, (size_t)nd * sizeof(float)) == 0,
+                  "head image: and so are the scales");
+
+            /* a caller that rebuilt the image itself can compare hashes rather than bytes */
+            check(q4nx_head_image_hash(codes, scales, kd, nd) == info.hash,
+                  "head image: the file's hash is the hash of the image the caller would build");
+
+            /* (a) a corrupted byte must refuse */
+            {
+                FILE* f = fopen(path, "r+b");
+                if (f) {
+                    /* the payload starts after the 24-byte header this writer uses */
+                    fseek(f, 24 + 5, SEEK_SET);
+                    int c = fgetc(f);
+                    fseek(f, 24 + 5, SEEK_SET);
+                    fputc((c ^ 0x5a) & 0xff, f);
+                    fclose(f);
+                }
+                why[0] = 0;
+                check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd, &info, why, (int)sizeof why) == 0,
+                      "head image: a single corrupted payload byte is REFUSED, not copied");
+                check(why[0] != 0 && strstr(why, "hash") != NULL, "... and the refusal says the hash did not reproduce");
+            }
+            /* (b) the wrong geometry must refuse even when the file is intact */
+            {
+                check(q4nx_head_image_write(path, codes, scales, kd, nd) == 1, "head image: rewritten intact");
+                why[0] = 0;
+                check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd - 1, &info, why, (int)sizeof why) == 0,
+                      "head image: a container with a different column count refuses it");
+            }
+            /* (c) absence is not an error at this layer: it is a refusal with a reason the caller can treat as "pack" */
+            {
+                remove(path);
+                why[0] = 0;
+                check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd, &info, why, (int)sizeof why) == 0,
+                      "head image: no image reads as a refusal");
+                check(why[0] != 0 && strstr(why, "not there") != NULL, "... whose reason is that it is not there");
+            }
+            /* (d) a truncated file refuses rather than returning a partial image */
+            {
+                check(q4nx_head_image_write(path, codes, scales, kd, nd) == 1, "head image: written for the truncation arm");
+                FILE* f = fopen(path, "r+b");
+                if (f) { fseek(f, 0, SEEK_END); const long sz = ftell(f); fclose(f); if (sz > 40) truncate_file(path, sz - 40); }
+                why[0] = 0;
+                check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd, &info, why, (int)sizeof why) == 0,
+                      "head image: a truncated image is refused");
+                remove(path);
+            }
+        }
+        free(bt); free(codes); free(back); free(scales); free(sc_back);
+    }
+}
+
 int main(void) {
+    test_head_image();
     oga_geometry();
     on_grid_geometry();
     activation_pad();

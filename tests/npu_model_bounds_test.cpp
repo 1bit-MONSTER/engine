@@ -64,6 +64,7 @@ struct Entry {
     std::string name;
     std::vector<int64_t> shape;
     uint64_t bytes;
+    std::string dtype = "U8";   // engine#1843: the vocab check reads the table's dtype; U8 is "not evidence"
 };
 
 // Writes dir/model.q4nx (tensors packed in order, zero-filled) and dir/config.json.
@@ -75,7 +76,7 @@ void write_model(const fs::path& dir, const std::vector<Entry>& entries, uint64_
     json table = json::object();
     uint64_t off = 0;
     for (const auto& e : entries) {
-        table[e.name] = {{"dtype", "U8"}, {"shape", e.shape}, {"data_offsets", {off, off + e.bytes}}};
+        table[e.name] = {{"dtype", e.dtype}, {"shape", e.shape}, {"data_offsets", {off, off + e.bytes}}};
         off += e.bytes;
     }
     if (!bad_name.empty()) table[bad_name]["data_offsets"] = bad_offsets;
@@ -160,6 +161,50 @@ int main() {
         check(why.empty(), "a tiled embedding without vocab_size derives rows, not tiles" +
                                (why.empty() ? "" : " (" + why + ")"));
     }
+    {  // engine#1843: vocab_size is held against the table it overrides, under every layout the forward reads.
+        // hidden is 128 in this fixture, so one 256-column tile spans a row and a chunked table is 1 tile wide.
+        struct Case {
+            const char* tag;
+            std::vector<int64_t> shape;
+            uint64_t bytes;
+            const char* dtype;
+            int vocab;
+            bool loads;
+            const char* what;
+        };
+        const std::vector<Case> cases = {
+            {"bf16-eq", {64, 128}, 64 * 128 * 2, "BF16", 64, true, "a BF16 table of exactly vocab rows loads"},
+            {"bf16-flat", {64 * 128}, 64 * 128 * 2, "BF16", 64, true,
+             "a FLAT 1-D BF16 table (the zr1 container's shape) is rows by bytes, and loads"},
+            {"bf16-short", {64, 128}, 64 * 128 * 2, "BF16", 100, false,
+             "a config stating MORE rows than a BF16 table holds is refused (the read would run into the next tensor)"},
+            {"bf16-long", {64, 128}, 64 * 128 * 2, "BF16", 32, false,
+             "a config stating FEWER rows than a BF16 table holds is refused (the tail would be unreachable)"},
+            {"i8-plain", {64, 128}, 64 * 128, "I8", 64, true, "plain int8 [vocab, hidden] (the Gemma4 layout) loads"},
+            {"i8-grid-pad", {2, 1, 5120}, 2 * 5120, "I8", 50, true,
+             "a 3-D tile grid holding vocab padded up to whole 32-row tiles (50 -> 64) loads"},
+            {"i8-list", {2, 5120}, 2 * 5120, "I8", 64, true,
+             "a 2-D chunk LIST [tiles, 5120] (the bonsai2-27b layout, which is NOT [rows, hidden]) loads"},
+            {"i8-grid-short", {2, 1, 5120}, 2 * 5120, "I8", 100, false,
+             "a config stating more rows than a tile grid holds (100 > 64) is refused"},
+            {"i8-grid-long", {4, 1, 5120}, 4 * 5120, "I8", 40, false,
+             "a tile grid holding more than vocab's padded rows (128 > 64) is refused"},
+        };
+        for (const auto& k : cases) {
+            std::vector<Entry> e = one_layer();
+            for (auto& x : e)
+                if (x.name == "model.embed_tokens.weight") { x.shape = k.shape; x.bytes = k.bytes; x.dtype = k.dtype; }
+            const fs::path d = root / (std::string("vocab-") + k.tag);
+            write_model(d, e, 0, nullptr, "", json{{"vocab_size", k.vocab}});
+            const std::string why = thrown([&] { Model m(d.string()); });
+            if (k.loads)
+                check(why.empty(), std::string("vocab vs table: ") + k.what + (why.empty() ? "" : " (" + why + ")"));
+            else
+                check(why.find("vocab_size " + std::to_string(k.vocab)) != std::string::npos &&
+                          why.find("embedding table") != std::string::npos,
+                      std::string("vocab vs table: ") + k.what + ", by name (" + why + ")");
+        }
+    }
     {  // engine#1782: neither -> refused by name, not by "model has no tensor"
         std::vector<Entry> e = one_layer();
         e.erase(std::remove_if(e.begin(), e.end(),
@@ -194,6 +239,33 @@ int main() {
             pack_layer_weights(m, 0, w.data());
         });
         check(why.find("runs past the end") != std::string::npos, "a projection larger than the file is refused");
+    }
+    {  // engine#1881: k_proj claims four tiles and holds one, with more tensors AFTER it in the file. Bounded by the end
+        // of the file (`avail`), the packer read three tiles of v/o/down as k_proj's; bounded by the tensor, it refuses.
+        std::vector<Entry> e = one_layer();
+        for (auto& x : e)
+            if (x.name == "model.layers.0.self_attn.k_proj.weight") x.shape = {4, 5120};   // bytes stay 5120
+        write_model(root / "k-overread", e);
+        const std::string why = thrown([&] {
+            Model m((root / "k-overread").string());
+            std::vector<uint8_t> w(layer_weight_bytes(m));
+            pack_layer_weights(m, 0, w.data());
+        });
+        check(why.find("run into the next tensor") != std::string::npos,
+              "a projection that over-reads into the NEXT tensor (not past the file) is refused (" + why + ")");
+    }
+    {  // engine#1881: input_layernorm holds 128 of the 256 bytes hidden x 2 needs; the next tensor follows it
+        std::vector<Entry> e = one_layer();
+        for (auto& x : e)
+            if (x.name == "model.layers.0.input_layernorm.weight") { x.shape = {64}; x.bytes = 128; }
+        write_model(root / "norm-short", e);
+        const std::string why = thrown([&] {
+            Model m((root / "norm-short").string());
+            std::vector<uint8_t> i5(4 * 128);
+            fill_i5(m, 0, i5.data());
+        });
+        check(why.find("input_layernorm") != std::string::npos && why.find("next tensor") != std::string::npos,
+              "a layer norm shorter than hidden x 2 is refused, not completed from its neighbour (" + why + ")");
     }
     {  // gate/up of one tile each: the interleave would write a whole chunk past the layer's buffer
         write_model(root / "chunks", one_layer({1, 5120}, 1));

@@ -1525,6 +1525,20 @@ void implicit_zp_zero(Q4& q, int bits) {
     for (size_t i = 0; i < q.zero.size(); ++i) q.zero[i] -= zp * q.scale[i];
 }
 
+// The bit width, taken from the SPELLING that matched (engine#1841, second point). The rule above used to be called with a
+// literal `4` on the projection path and with the node's own `bits` on the head path; nothing tied the literal to the name,
+// so a later spelling like `weight_Q8` would have kept the lookup working while leaving the zero point at 2^3 instead of 2^7
+// -- a wrong weight with no error anywhere. Deriving it from the suffix makes the two agree by construction, and an
+// unrecognised suffix falls back to the node's value (documented here) rather than to a silent 4.
+int zp_bits_for_spelling(const std::string& spelling, int node_bits) {
+    const auto pos = spelling.rfind("_Q");
+    if (pos != std::string::npos && pos + 2 < spelling.size()) {
+        const char d = spelling[pos + 2];
+        if (d >= '2' && d <= '8') return d - '0';
+    }
+    return node_bits;
+}
+
 // ── MatMulNBits → (codes, scale, zero) per 32-column group ───────────────────
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles, bool drop_zero) {
@@ -3729,7 +3743,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // one ONNX Runtime's MatMulNBits uses. Missing it here decoded every PROJECTION with zero point 0 while the
             // head was decoded with 8, which is why the pack imported completely, served on the device, and answered
             // gibberish on both the device and the host-GEMM path (engine#1503: "West什么呢ưởng中国联通nio…").
-            if (!zt) implicit_zp_zero(q, 4);
+            if (!zt) implicit_zp_zero(q, zp_bits_for_spelling(qw->name, 4));
             // the row slice, re-tiled exactly as the whole tensor would be
             Q4 part;
             part.N = rows; part.K = K;
@@ -3855,7 +3869,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         if (!mul_ok(groups_n, uint64_t(mm.block) / 2, qw_need)) throw std::runtime_error("lm_head: qweight length overflows");
         Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
         // no qzeros tensor -> the implicit zero point (engine#1503: Qwen3-VL-4B's spelling, three-input nodes)
-        if (!have_zp) implicit_zp_zero(q, mm.bits);
+        if (!have_zp) implicit_zp_zero(q, zp_bits_for_spelling(mm.weight, mm.bits));
 
         std::vector<uint8_t> tiled;
         long long pinexact = 0;

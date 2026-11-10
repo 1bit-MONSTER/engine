@@ -378,6 +378,13 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles = false, bool drop_zero = false);
 
+// The implicit zero point 2^(bits-1) for a MatMulNBits with no zeros tensor, and the bit width its SPELLING implies
+// (`weight_Q4` -> 4, `weight_Q8` -> 8, anything else -> the node's own value). Exposed because the pair is what can drift:
+// the projection path used to pass a hardcoded 4 while the head path passed the node's bits, so a future `weight_Q8`
+// spelling would have kept the lookup working and left the zero point at 8 instead of 128 (engine#1841).
+void implicit_zp_zero(Q4& q, int bits);
+int  zp_bits_for_spelling(const std::string& spelling, int node_bits);
+
 // One 64-row tile of the .fconst attention payload, as the pack stores it. Established byte-exactly
 // (amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md §7.13, §7.15): the tile is 2*(K/128)+2 subvolumes
 // of 2,176 B = one pair per (column half, K block of 128) plus the pair holding the writer's bias input.

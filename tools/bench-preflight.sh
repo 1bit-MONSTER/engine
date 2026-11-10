@@ -169,6 +169,13 @@ esac
 GGML_HRX_LOG_DISPATCH=1 "$bench" -m "$model" -p "$tokens" -n 0 -ngl 99 --device HRX0 -r 3 -lm "$lm" \
     >/dev/null 2>"$log" &
 bench_pid=$!
+# The bench is a background child from here on, so nothing ends it when this script ends unless the script does: a
+# signalled preflight (a ticket that ends, Ctrl-C, an operator's kill) or a refusal below would otherwise leave it on the
+# GPU with no owner. Every way out goes through EXIT, and EXIT stops the bench and waits for it before the log goes.
+trap 'kill "$bench_pid" 2>/dev/null; wait "$bench_pid" 2>/dev/null; rm -f "$log"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # The mode is REQUESTED above and OBSERVED here (engine #1668): llama.cpp puts a model it mmaps in `/proc/<pid>/maps` and a
 # model it only reads is not there, so the run can be checked against the flag instead of trusted to honour it. A bench that
 # ignores `-lm` yields a number the header mislabels, which is the same defect as an unstated mode -- one variable measured,

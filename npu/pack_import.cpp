@@ -694,10 +694,11 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // canonical form (a new kFconst19Rules entry, a different tile order) leaves the source file untouched, so source
     // identity alone would keep serving a copy of the old form. Bump this when the canonical form changes.
     constexpr int kCanonicalFormVersion = 1;
-    const std::string name = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
-                             std::to_string(dims.hidden) + "-" +
-                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + "-" +
-                             std::to_string(src_ec ? std::uintmax_t(0) : src_size) + "-" +
+    // Everything but the source identity: the group this run evicts its stale siblings from (engine#1770).
+    const std::string ident_prefix = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
+                                     std::to_string(dims.hidden) + "-" + std::to_string(dims.heads) + "-" +
+                                     std::to_string(dims.layers) + "-";
+    const std::string name = ident_prefix + std::to_string(src_ec ? std::uintmax_t(0) : src_size) + "-" +
                              std::to_string(static_cast<std::uint64_t>(src_stamp)) + ".fconst";
     // `temp_directory_path()` THROWS when TMPDIR names a directory that no longer exists, which is the ordinary state of
     // a shell after a reboot has cleared /tmp -- and it threw before any work was attempted, so `npu-pack info` on a
@@ -724,6 +725,9 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
         if (!probe) continue;
         probe.close();
         work = cand.string();
+        // This is the copy that will be written, so the copies of the same pack and geometry at other sizes/mtimes are
+        // the ones nothing will reuse (engine#1770).
+        evict_stale_canonical_copies(d.string(), name, ident_prefix);
         // Say where it went whenever that is not the ordinary place: the copy is a few hundred MB and it is scratch.
         std::error_code ec2;
         const fs::path tmpdir = [&] { try { return fs::temp_directory_path(); } catch (...) { return fs::path(); } }();
@@ -4271,6 +4275,25 @@ bool canonical_copy_reusable(const std::string& work, int64_t expected_len) {
     // file_size() fails on a missing file and on a directory, which is exactly the set that must be rewritten.
     const std::uintmax_t have = fs::file_size(work, ec);
     return !ec && have == static_cast<std::uintmax_t>(expected_len);
+}
+
+// engine#1770: reuse (engine#1662) writes a NEW copy when the source changes instead of overwriting, so copies only ever
+// accumulate -- 699 files and 8.7 GiB of tmpfs (i.e. RAM) on this box, most of them truncated 0-byte tails. The identity
+// in the name is `1bit-fconst19v<n>-<pack tag>-<hidden>-<heads>-<layers>-<source size>-<source mtime>.fconst`, so keeping
+// one copy per (pack, geometry) means removing the entries that share the prefix but not the whole name. That cannot take
+// a copy a reader is about to use: reuse requires the entire name to match, and the one name that can match is the one
+// being kept. A reader holding a removed file open is unaffected (the inode outlives the unlink); at worst a concurrent
+// lane rewrites a copy it would have reused, which costs a file write and no correctness.
+void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix) {
+    if (dir.empty() || keep_name.empty() || prefix.empty() || keep_name.size() <= prefix.size()) return;
+    std::error_code ec;
+    for (fs::directory_iterator it(fs::path(dir), ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string base = it->path().filename().string();
+        if (base == keep_name || base.size() <= prefix.size()) continue;
+        if (base.compare(0, prefix.size(), prefix) != 0) continue;
+        std::error_code rm;
+        fs::remove(it->path(), rm);
+    }
 }
 
 }  // namespace onebit::npu::pack_import

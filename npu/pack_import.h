@@ -177,6 +177,13 @@ Plan plan(const std::string& pack_dir);
 // and a directory on the scratch path must all come back false.
 bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
 
+// Removes the canonical Token .fconst copies in `dir` that share `prefix` -- one pack path and geometry -- but are not
+// `keep_name` (engine#1770). Reuse writes a new copy when the source changes rather than overwriting, so without this the
+// scratch directory grows one multi-hundred-MB file per change; on this box 699 files / 8.7 GiB of tmpfs. Exposed for the
+// same reason as canonical_copy_reusable(): the rule it applies is what can be wrong, and a test can prove it on a
+// directory of empty files with no pack at all.
+void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix);
+
 // The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
 // actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos
 // do publish the text, and how much of it varies per pack), and an importer that says nothing about

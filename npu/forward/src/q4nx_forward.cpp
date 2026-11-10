@@ -1412,6 +1412,48 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
                 made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
                 want_m16 ? "" : " (NPU_DECODE_M16=0: disabled)");
+        // engine#1990: a wide prefill family for a sealed pb16i/t2s set. NPU_WIDE_SEALED_ELF names a second sealed
+        // ELF carrying the same instances built for NPU_WIDE_ROWS rows (default 32); a chunk of more than 16 rows
+        // then runs one launch per role instead of two. Experimental and off unless the variable is set: no pack
+        // ships such an ELF yet, and the plan has no key for it. All roles or none -- max_batch_rows() is the chunk
+        // width, so one role without a wide kernel would be launched past its buffers.
+        if (const char* wide_elf = getenv("NPU_WIDE_SEALED_ELF");
+            wide_elf && *wide_elf && pb16i_ && !pb16i_sealed_.empty() && made > 0) {
+            const char* wr = getenv("NPU_WIDE_ROWS");
+            const int rows = wr && *wr ? atoi(wr) : 32;
+            int wide = 0;
+            std::string why;
+            if (rows <= Q4NX_DESIGN_M_DECODE || rows > Q4NX_DESIGN_M_PREFILL) why = "NPU_WIDE_ROWS must be 17..128";
+            else if (!file_exists(wide_elf)) why = std::string("no such file: ") + wide_elf;
+            for (int i = 0; why.empty() && i < ndesigns_; i++) {
+                I8Ctx* c16 = xd_->ctx16(i);
+                if (!c16) continue;
+                const char* inst = pb16i_instance(designs16_[i].role);
+                I8Ctx* cw = inst ? xd_->make_ctx_wide(i) : nullptr;
+                if (!cw) { why = std::string("no wide context for role ") + role_tag(designs16_[i].role); break; }
+                cw->MD = rows;
+                cw->KD = c16->KD;
+                cw->ND = c16->ND;
+                cw->blocked_b = c16->blocked_b;
+                cw->pb16i = c16->pb16i;
+                cw->t2s = c16->t2s;
+                cw->pb16i_planes = c16->pb16i_planes;
+                if (!cw->init_elf(*dev, wide_elf, rows, c16->KD, c16->ND, 1, inst)) {
+                    why = std::string("init_elf failed for instance ") + inst;
+                    break;
+                }
+                wide++;
+            }
+            if (why.empty() && wide > 0 && !xd_->adopt_wide(rows)) why = "a role with a decode context has no wide one";
+            if (why.empty() && wide > 0) {
+                fprintf(stderr, "  [forward] wide family: %d role(s) at M=%d from %s (chunks of 17..%d rows)\n",
+                        wide, rows, wide_elf, rows);
+            } else {
+                xd_->drop_wide();
+                fprintf(stderr, "  [forward] wide family NOT adopted (%s); chunks stay at %d rows\n",
+                        why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
+            }
+        }
     }
 
     // The lm head's own context (pb16i ternary images, the int8 ladder, or the q4_1 gemv head).  Cut out

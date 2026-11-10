@@ -112,8 +112,41 @@ static void batch_width_arms() {
     std::printf("  batch width: 7 arms (min not first, empty slots, fallback)\n");
 }
 
+/* engine#1990: a sealed set may carry a wide family beside the 16-row one. The rules that decide whether it is used,
+ * how wide a chunk is and which launches take it are pure, and wrong in the dangerous direction means more rows in a
+ * launch than a kernel's buffers hold. */
+static void wide_family_arms() {
+    using onebit::npu::chunk_rows;
+    using onebit::npu::wide_family_complete;
+    using onebit::npu::wide_takes;
+    const int n16[] = {16, 16, 0, 16};
+    const int w32[] = {32, 32, 0, 32};
+    check(wide_family_complete(n16, w32, 4, 32), "wide family: every decode role has a 32-row kernel -> complete");
+    const int hole[] = {32, 0, 0, 32};
+    check(!wide_family_complete(n16, hole, 4, 32), "wide family: one decode role without a wide kernel -> not complete");
+    const int mixed[] = {32, 64, 0, 32};
+    check(!wide_family_complete(n16, mixed, 4, 32), "wide family: a role built for another row count -> not complete");
+    const int extra[] = {32, 32, 32, 32};
+    check(!wide_family_complete(n16, extra, 4, 32), "wide family: a wide kernel for a role with no decode one -> refused");
+    const int w16[] = {16, 16, 0, 16};
+    check(!wide_family_complete(n16, w16, 4, 16), "wide family: 'wide' must be wider than the decode family");
+    const int none[] = {0, 0, 0, 0};
+    check(!wide_family_complete(none, none, 4, 32), "wide family: no role at all is not a family");
+    check(!wide_family_complete(nullptr, w32, 4, 32) && !wide_family_complete(n16, w32, 0, 32) &&
+          !wide_family_complete(n16, w32, 4, 0), "wide family: null, empty and zero-row inputs are not complete");
+    check(chunk_rows(16, 0) == 16, "chunk rows: no wide family keeps the decode width");
+    check(chunk_rows(16, 32) == 32, "chunk rows: an adopted wide family widens the chunk");
+    check(chunk_rows(16, 8) == 16, "chunk rows: a 'wide' value below the decode width never narrows the chunk");
+    check(!wide_takes(1, 16, 32) && !wide_takes(16, 16, 32), "wide takes: 1 and 16 rows stay on the decode family");
+    check(wide_takes(17, 16, 32) && wide_takes(32, 16, 32), "wide takes: 17 and 32 rows go to the wide family");
+    check(!wide_takes(33, 16, 32), "wide takes: 33 rows are not routed to a 32-row kernel");
+    check(!wide_takes(17, 16, 0) && !wide_takes(17, 16, 16), "wide takes: no family, or one no wider than decode, takes nothing");
+    std::printf("  wide family: 14 arms (complete or not, chunk width, which launch takes it)\n");
+}
+
 int main(int argc, char** argv) {
     batch_width_arms();
+    wide_family_arms();
     quant_int4_arms();
     for (int G : {8, 9, 16}) {
         for (int n : {G, 3 * G}) {  // whole groups: a ragged tail is not a permutation

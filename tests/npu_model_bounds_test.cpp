@@ -205,6 +205,20 @@ int main() {
         check(why.find("whole chunks") != std::string::npos, "gate/up that do not fill whole chunks are refused");
     }
     fs::remove_all(root);
+    // engine#1881: the bound is the tensor, not the bytes left in the file. `avail` counts to the end of the
+    // file, so a check written against it passes for a tensor whose own bytes are short and lets the read run
+    // on into the next tensor -- same file, wrong data. The middle arm is the one that bites: it is satisfied
+    // by `avail` and refused by `usable()`.
+    {
+        Tensor t;
+        t.bytes = 64;
+        t.avail = 64;
+        check(t.usable() == 64, "a tensor with exactly its own bytes is usable to them");
+        t.avail = 4096;  // the file continues past this tensor: avail says yes, the tensor says no
+        check(t.usable() == 64, "a longer file does not extend the tensor (avail alone would say 4096, got " + std::to_string(t.usable()) + ")");
+        t.bytes = 8192;  // a malformed container may declare more than the file holds
+        check(t.usable() == 4096, "a tensor that claims more than the file holds is bounded by the file (got " + std::to_string(t.usable()) + ")");
+    }
     std::printf("%s\n", failures ? "FAILED" : "all cases ok");
     return failures ? 1 : 0;
 }

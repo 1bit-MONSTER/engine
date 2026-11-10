@@ -98,10 +98,17 @@ struct Lane::Impl {
         logits = make_bo(dev, kSmallBo);
         fnorm = make_bo(dev, kSmallBo);
         const Tensor& norm = model.tensor("model.norm.weight");
-        if (norm.avail < size_t(d.hidden) * 2) throw std::runtime_error("model.q4nx: model.norm.weight runs past the end of the file");
+        // engine#1881: bound the copy by the tensor, not by the bytes left in the file -- `avail` passes a tensor
+        // whose own bytes are short and lets the copy run on into the next tensor. The message names which bound bit.
+        if (norm.usable() < size_t(d.hidden) * 2)
+            throw std::runtime_error(norm.avail < size_t(d.hidden) * 2 ? "model.q4nx: model.norm.weight runs past the end of the file"
+                                                                      : "model.q4nx: model.norm.weight runs past its tensor");
         std::memcpy(fnorm->map(), norm.data, size_t(d.hidden) * 2);
-        if (model.tensor("model.embed_tokens.weight").avail < size_t(d.vocab) * size_t(d.hidden) * 2)
-            throw std::runtime_error("model.q4nx: model.embed_tokens.weight runs past the end of the file");
+        const Tensor& emb = model.tensor("model.embed_tokens.weight");
+        if (emb.usable() < size_t(d.vocab) * size_t(d.hidden) * 2)
+            throw std::runtime_error(emb.avail < size_t(d.vocab) * size_t(d.hidden) * 2
+                                         ? "model.q4nx: model.embed_tokens.weight runs past the end of the file"
+                                         : "model.q4nx: model.embed_tokens.weight runs past its tensor");
         lmhead_w = make_bo(dev, lmhead_weight_bytes(model));
         pack_lmhead_weights(model, static_cast<uint8_t*>(lmhead_w->map()));
 

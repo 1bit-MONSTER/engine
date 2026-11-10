@@ -65,9 +65,17 @@ size_t tiles_read(int n_tiles, int G) {
 }
 
 // A tensor's shape decides how much the packer reads; refuse one whose reads would run past the
-// end of model.q4nx.
+// tensor (engine#1881: `avail` alone is the FILE bound, so a shape that overshoots its own tensor
+// passed this and read on into the next tensor's data). Which bound bit is part of the message: a
+// tensor that declares too few bytes for its own shape is a different defect from a container whose
+// declared tensor runs past the end of the file.
 void need(const Tensor& t, size_t bytes, const char* what) {
-    if (bytes > t.avail) throw std::runtime_error(std::string("model.q4nx: ") + what + " runs past the end of the file");
+    // One gate on the tight bound; the message names the bound that bit. A truncated container (avail < bytes) is the
+    // more specific diagnosis, so it is checked first; for a healthy container avail >= bytes and a shape that
+    // overshoots its own tensor is reported as such (engine#1881).
+    if (bytes > t.usable())
+        throw std::runtime_error(std::string("model.q4nx: ") + what +
+                                 (bytes > t.avail ? " runs past the end of the file" : " runs past its tensor"));
 }
 
 const char* const kProj[] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",

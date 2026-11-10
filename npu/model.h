@@ -38,7 +38,12 @@ struct Tensor {
     std::vector<int64_t> shape;
     const uint8_t* data = nullptr;
     uint64_t bytes = 0;
-    uint64_t avail = 0;  // bytes from data to the end of the file: the most a reader may touch
+    uint64_t avail = 0;  // bytes from data to the end of the file: the outer bound a reader may not cross
+    // engine#1881: the most a reader may touch. `avail` alone is only the FILE bound, so a bounds check written
+    // against it passes for a tensor whose own bytes are short and lets the read run on into the next tensor's
+    // data (same file, wrong tensor). Both bounds matter: a malformed container can also declare `bytes` past
+    // the end of the file, so the tight bound is the smaller of the two.
+    uint64_t usable() const { return bytes < avail ? bytes : avail; }
 
     // Tiles in a projection: shape[0] rows of shape[1] bytes, in 5120-byte tiles.
     int tiles() const;

@@ -1589,6 +1589,14 @@ endif()
     target_link_libraries(gdn_batch_order_test PRIVATE onebit_npu_forward)
     add_dependencies(npu_sampling_test gdn_batch_order_test)
     add_test(NAME gdn_batch_order COMMAND gdn_batch_order_test)
+    # engine#1905: the NPU_BATCH_CHECK oracle restores the prefix it replays from instead of resetting it, so a chunk
+    # at start_pos > 0 is compared (and then run) from the state the batched pass continues. Host-GEMM, no device;
+    # skips (77) unless ONEBIT_TEST_Q4NX names a container.
+    add_executable(batch_check_state_test tests/batch_check_state_test.cpp)
+    target_include_directories(batch_check_state_test PRIVATE npu/forward/include)
+    target_link_libraries(batch_check_state_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test batch_check_state_test)
+    add_test(NAME batch_check_state COMMAND batch_check_state_test)
     # The MTP drafter measured against the real base model (tools/mtp_acceptance.cpp): draft, verify through
     # step_batch_all(), commit the accepted prefix, repeat.  The head runs on the host in the pb16i-exact
     # arithmetic, the base on the exact route.  Needs the device, so it is a tool, not a ctest.
@@ -1610,6 +1618,7 @@ endif()
     endif()
     set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(gdn_batch_order PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(batch_check_state PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source
     # check, outside this repository (docs/npu.md, "Checking the NPU").

@@ -434,6 +434,13 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // this comment subtracted the prefix from a per-block figure and produced a number three orders of magnitude off; the
     // review of #1758 caught it. Written out here so the next reader can check it with a calculator.)
     {3584, 28, 28, 7232, 8, 1, 1009664},
+    // Qwen2.5_3B_Instruct at hidden 2,048 / 16 heads / 36 layers: measured with tools/fconst19_measure.py against
+    // amd/Qwen2.5_3B_Instruct_rai_1.8.0_npu_4K, 1,917 of 1,706,629,440 bytes differ (1.12e-06 of the file, which the tool
+    // prints as 1.12e-04 %). Same hidden size as the Qwen3-1.7B row and NOT the same row: the prefix is 4,160 against
+    // 1.7B's 8,512, and the bundle is nine tiles of 295,936 (2,663,424 B) against three of 1,183,744 -- so at this hidden
+    // size both the prefix and the division move with the layer count. Measured, never derived: 64 + 2*hidden + 4,352
+    // would predict 8,512 here and be wrong by 4,352.
+    {2048, 16, 36, 4160, 9, 1, 295936},
     // Mistral-7B-Instruct-v0.2 at hidden 4,096 / 32 heads / 32 layers: measured with tools/fconst19_measure.py against
     // amd/Mistral-7B-Instruct-v0.2_rai_1.8.0_npu_4K, 1,954 of 3,843,419,200 bytes differ (5.08e-05) -- content, not
     // layout. The prefix follows the Qwen3 line (64 + 2*hidden + 4,352 = 12,608), the bundle is 5 tiles of 2,297,856
@@ -1755,6 +1762,11 @@ namespace {
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                    std::string* why);   // defined with the table, internal to this file
 }
+const Fconst19Rule* fconst19_rules(int* count) {
+    if (count) *count = int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0]));
+    return kFconst19Rules;
+}
+
 const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std::string* why) {
     return select_rule_in(kFconst19Rules, int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0])), hidden, heads, layers,
                           why);

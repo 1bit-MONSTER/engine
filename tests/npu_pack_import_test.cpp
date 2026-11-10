@@ -2401,6 +2401,39 @@ void test_fconst19_rule_table() {
     check(pi::select_fconst19_rule_from(dup, 2, 1536, 12, 28, &why) != nullptr,
           "fconst19 rule: a geometry measured twice with the same shape is fine -- that is the h1536 pair, which is "
           "byte-identical over all 28 blocks");
+    // 4. engine#1774 / TNPU-ALL W2's third gate clause: EVERY row of the real table must select itself back, with its own
+    //    numbers. Written table-driven rather than one check per row for two reasons the table has already demonstrated:
+    //    a wrong digit is silent (the anchors still line up), and a merge dropped the h4096 row twice with nothing failing.
+    int rules_n = 0;
+    const pi::Fconst19Rule* rules = pi::fconst19_rules(&rules_n);
+    check(rules && rules_n >= 8,
+          "fconst19 rule: the table still has its rows (" + std::to_string(rules_n) + " >= 8; a merge dropping one is a "
+          "silent un-measure of a whole class)");
+    for (int i = 0; i < rules_n; i++) {
+        const pi::Fconst19Rule& row = rules[i];
+        std::string w;
+        const pi::Fconst19Rule* got = pi::select_fconst19_rule(row.hidden, row.heads, row.layers, &w);
+        check(got && got->prefix == row.prefix && got->n_tiles == row.n_tiles && got->rot == row.rot && got->tile == row.tile,
+              "fconst19 rule: row " + std::to_string(row.hidden) + "/" + std::to_string(row.heads) + "h/" +
+                  std::to_string(row.layers) + "L selects itself back with its measured numbers (" +
+                  std::to_string(got ? got->prefix : -1) + ", " + std::to_string(got ? got->n_tiles : -1) + ", " +
+                  std::to_string(got ? got->rot : -1) + ", " + std::to_string(got ? got->tile : -1) + ")");
+    }
+
+    // 5. the case this row is: the SECOND geometry at hidden 2048 / 16 heads, told apart only by its layer count. If a
+    //    later edit relaxed the key to (hidden, heads) or merged rows, these two must still separate.
+    why.clear();
+    const pi::Fconst19Rule* q17 = pi::select_fconst19_rule(2048, 16, 28, &why);
+    const pi::Fconst19Rule* q3 = pi::select_fconst19_rule(2048, 16, 36, &why);
+    check(q17 && q17->prefix == 8512 && q17->n_tiles == 3 && q17->tile == 1183744,
+          "fconst19 rule: 2048/16h/28L is still Qwen3-1.7B's row (8,512 / 3 tiles of 1,183,744)");
+    check(q3 && q3->prefix == 4160 && q3->n_tiles == 9 && q3->rot == 1 && q3->tile == 295936,
+          "fconst19 rule: 2048/16h/36L is Qwen2.5_3B's row (4,160 / 9 tiles of 295,936) -- the prefix is NOT the 8,512 "
+          "the Qwen3 formula predicts, which is why the row is measured");
+    why.clear();
+    check(!pi::select_fconst19_rule(2048, 16, 32, &why) && why.find("has not been measured") != std::string::npos,
+          "fconst19 rule: 2048/16h/32L is still unmeasured and refuses by name (" + why + ")");
+
     std::printf("fconst19 rule: measured row, unmeasured refusal, and the ambiguity guard all behave\n");
 }
 

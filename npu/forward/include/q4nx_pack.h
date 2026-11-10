@@ -184,6 +184,13 @@ void q4nx_host_gemm_i8(const int8_t* a8, int K, const int8_t* codes, int N, int3
 void q4nx_host_gemm_i8_from_f32(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                                 int32_t* out32);
 
+/* The reusable form: `codes` and `d` are quantised once per tensor by the caller (a per-call quantisation of
+ * the weights costs ~7.5 G scalar operations per 7B token, measured — it never finished a token in a
+ * 9-minute ticket), and this applies the kernel's epilogue: ascale * sum_g d[g][n] * sum_{k in g} code*a8,
+ * with the inner sum exact int32 and no float inside it. */
+void q4nx_host_gemm_i8_grouped(const int8_t* a8, int K, const int8_t* codes, const float* d,
+                               int groups, int N, float ascale, float* out);
+
 
 /* Architecture dims a design set is derived from. */
 typedef struct {

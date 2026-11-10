@@ -3032,6 +3032,65 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 // packed-weight BO cache, pb16i images, Hadamard fold.  What stays here is the model's own fallback, the
 // plain float GEMM of init_host() -- that is a property of the model, not of any NPU.
 // --------------------------------------------------------------------------
+// The integer host arm (engine#1808/#1809). Two decisions here, both measured:
+//  * the weight codes and their per-128-K multipliers are quantised ONCE per tensor (`wkey`) and cached --
+//    doing it per call made a 7B token ~7.5 G scalar operations and the arm never finished a token inside a
+//    9-minute ticket;
+//  * the inner sum is exact int32 with no float in it (q4nx_host_gemm_i8_grouped), so the comparison against
+//    the device is about accumulation and epilogue, not about a float both sides happen to share.
+void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
+                                  int wkey, float* out) {
+    const int G = 128, groups = (K + G - 1) / G;
+    auto it = host_i8_cache_.find(wkey);
+    if (it == host_i8_cache_.end()) {
+        HostI8Tensor t;
+        t.groups = groups; t.N = N;
+        t.codes.assign((size_t)K * (size_t)N, 0);
+        t.d.assign((size_t)groups * (size_t)N, 0.0f);
+        for (int g = 0; g < groups; g++) {
+            const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
+            for (int n = 0; n < N; n++) {
+                float amax = 0.0f;
+                for (int k = k0; k < k1; k++) {
+                    const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
+                    if (std::isfinite(v) && v > amax) amax = v;
+                }
+                if (!(amax >= 1e-12f)) amax = 1.0f;
+                t.d[(size_t)g * (size_t)N + (size_t)n] = amax / 127.0f;
+                const float tis = 127.0f / amax;
+                for (int k = k0; k < k1; k++) {
+                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
+                    if (!std::isfinite(v)) v = 0.0f;
+                    int q = (int)std::round(v * tis);
+                    q = q > 7 ? 7 : (q < -8 ? -8 : q);
+                    t.codes[(size_t)k * (size_t)N + (size_t)n] = (int8_t)q;
+                }
+            }
+        }
+        it = host_i8_cache_.emplace(wkey, std::move(t)).first;
+    }
+    const HostI8Tensor& t = it->second;
+    std::vector<int8_t> a8((size_t)K);
+    for (int m = 0; m < M; m++) {
+        const float* a = A + (size_t)m * (size_t)a_k;
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            const float v = std::fabs(a[k]);
+            if (std::isfinite(v) && v > amax) amax = v;
+        }
+        const float ascale = (amax >= 1e-12f) ? amax / 127.0f : 1.0f;
+        const float tis = 1.0f / ascale;
+        for (int k = 0; k < K; k++) {
+            float v = a[k];
+            if (!std::isfinite(v)) v = 0.0f;
+            int q = (int)std::round(v * tis);
+            a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        }
+        q4nx_host_gemm_i8_grouped(a8.data(), K, t.codes.data(), t.d.data(), t.groups, N, ascale,
+                                  out + (size_t)m * (size_t)N);
+    }
+}
+
 void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
                               std::vector<float>& out, int wkey, const char* sc, int a_k) {
     if (host_gemm_) {
@@ -3041,11 +3100,7 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
         // branch reading past the caller's buffer at a padded design.)
         out.assign((size_t)N, 0.0f);
         if (host_gemm_i8_) {
-            // int32 arm: quantise both sides here, accumulate exactly, then apply the same two factors the
-            // kernel's epilogue applies (the activation row scale and the per-128-K weight multiplier).
-            std::vector<int32_t> acc((size_t)N, 0);
-            q4nx_host_gemm_i8_from_f32(A, a_k, 1, K, N, Bmat, acc.data());
-            for (int n = 0; n < N; n++) out[(size_t)n] = (float)acc[(size_t)n];
+            host_gemm_i8(A, a_k, 1, K, N, Bmat, wkey, out.data());
             return;
         }
         q4nx_host_gemm_f32_padded(A, a_k, 1, K, N, Bmat, out.data());
@@ -3068,9 +3123,7 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         // caller's buffer is laid out at `m * a_k`, so every row past the first read the wrong row.
         out.assign((size_t)M * N, 0.0f);
         if (host_gemm_i8_) {
-            std::vector<int32_t> acc((size_t)M * (size_t)N, 0);
-            q4nx_host_gemm_i8_from_f32(A, a_k, M, K, N, Bmat, acc.data());
-            for (size_t i = 0; i < acc.size(); i++) out[i] = (float)acc[i];
+            host_gemm_i8(A, a_k, M, K, N, Bmat, wkey, out.data());
             return;
         }
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());

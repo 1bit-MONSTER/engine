@@ -120,6 +120,54 @@ int main() {
         check(ok, "whole-GEMM i8 arm: exact int32, 128-K group boundary respected at K=130");
     }
 
+    // 5. the reusable grouped form the forward now calls: same epilogue as the kernel, inner sum exact int32.
+    //    Checked against an independent double computation with the 128-K group multipliers applied outside.
+    {
+        const int KK = 130, NN = 2, groups = 2;
+        std::vector<float> A(KK), B((size_t)KK * NN), want((size_t)NN, 0.0f);
+        std::vector<int8_t> codes((size_t)KK * NN, 0);
+        std::vector<float> d((size_t)groups * NN, 0.0f);
+        for (int k = 0; k < KK; k++) A[k] = (float)(k % 13) - 6.0f;
+        for (int k = 0; k < KK; k++)
+            for (int n = 0; n < NN; n++) B[(size_t)k * NN + n] = (float)((k * 3 + n) % 7) - 3.0f;
+        for (int g = 0; g < groups; g++) {
+            const int k0 = g * 128, k1 = (k0 + 128 < KK) ? k0 + 128 : KK;
+            for (int n = 0; n < NN; n++) {
+                float amax = 0.0f;
+                for (int k = k0; k < k1; k++) amax = std::max(amax, std::fabs(B[(size_t)k * NN + n]));
+                if (amax < 1e-12f) amax = 1.0f;
+                d[(size_t)g * NN + n] = amax / 127.0f;
+                const float tis = 127.0f / amax;
+                for (int k = k0; k < k1; k++) {
+                    int q = (int)std::round(B[(size_t)k * NN + n] * tis);
+                    codes[(size_t)k * NN + n] = (int8_t)(q > 7 ? 7 : (q < -8 ? -8 : q));
+                }
+            }
+        }
+        float amax = 0.0f;
+        for (int k = 0; k < KK; k++) amax = std::max(amax, std::fabs(A[k]));
+        const float ascale = amax / 127.0f, tis = 1.0f / ascale;
+        std::vector<int8_t> a8(KK);
+        for (int k = 0; k < KK; k++) {
+            int q = (int)std::round(A[k] * tis);
+            a8[k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        }
+        for (int g = 0; g < groups; g++) {
+            const int k0 = g * 128, k1 = (k0 + 128 < KK) ? k0 + 128 : KK;
+            for (int n = 0; n < NN; n++) {
+                double acc = 0;
+                for (int k = k0; k < k1; k++) acc += (double)codes[(size_t)k * NN + n] * (double)a8[k];
+                want[(size_t)n] += (float)(d[(size_t)g * NN + n] * (double)(ascale * (float)acc));
+            }
+        }
+        std::vector<float> got((size_t)NN, 0.0f);
+        q4nx_host_gemm_i8_grouped(a8.data(), KK, codes.data(), d.data(), groups, NN, ascale, got.data());
+        bool ok = true;
+        for (int n = 0; n < NN; n++)
+            if (std::fabs(got[(size_t)n] - want[(size_t)n]) > 1e-5f * std::fabs(want[(size_t)n]) + 1e-6f) ok = false;
+        check(ok, "grouped form: int32 inner sum + per-128-K multipliers match an independent computation");
+    }
+
     if (failures) { std::fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     std::printf("all npu_host_gemm_i8 checks passed\n");
     return 0;

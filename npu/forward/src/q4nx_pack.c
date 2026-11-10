@@ -153,6 +153,28 @@ void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
  * boundary, an int8 intermediate or a saturated accumulator will. That is the split the MoE oracle already
  * uses (`expected_int32` with the scales factored out), and it is what makes an int32 bit-exact comparison
  * meaningful at all. */
+/* The per-call cost that matters (engine#1809, measured): quantising the WEIGHTS inside the GEMM made one 7B
+ * token ~7.5 G scalar operations, so the arm never finished a token in a 9-minute ticket. The weights are the
+ * same matrix on every call, so they are quantised once per tensor by the caller and reuse this form:
+ *
+ *   out[n] = ascale * sum_g d[g][n] * ( sum_{k in group g} code[k][n] * a8[k] )
+ *
+ * exactly the kernel's epilogue, with the inner sum in int32 and no float in it. `d` is the per-128-K-group
+ * multiplier per column ([groups][N]), `ascale` the activation row's scale. */
+void q4nx_host_gemm_i8_grouped(const int8_t* a8, int K, const int8_t* codes, const float* d,
+                               int groups, int N, float ascale, float* out) {
+    const int G = 128;
+    for (int n = 0; n < N; n++) out[n] = 0.0f;
+    for (int g = 0; g < groups; g++) {
+        const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
+        for (int n = 0; n < N; n++) {
+            int32_t acc = 0;
+            for (int k = k0; k < k1; k++) acc += (int32_t)((int)codes[(size_t)k * (size_t)N + (size_t)n] * (int)a8[k]);
+            out[n] += d[(size_t)g * (size_t)N + (size_t)n] * (ascale * (float)acc);
+        }
+    }
+}
+
 void q4nx_host_gemm_i8_from_f32(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                                 int32_t* out32) {
     const int G = 128;                       /* the arena's multiplier group: one d per 128 K-rows per column */

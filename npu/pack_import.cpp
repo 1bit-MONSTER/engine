@@ -1409,7 +1409,15 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
             // and every attention projection refused while the MLP imported byte-exact -- measured on Qwen2-7B 1.9.
             // The scan window is the first GiB (about 8 blocks of this geometry), so the right residue repeats ~8 times
             // against 1-2 for a payload coincidence. Requiring `layers/2` was too strict and silently dropped the real one.
-            if (best >= 3) {                             // the residue repeats across blocks: a real section boundary
+            // engine#1831: this must FILL what the epsilon vote did not establish, never OVERWRITE what it did.
+            // `locate_fconst()` sets `h1` and a `period - 1`-entry `hdr` when its vote wins, and `plan()` reads the block
+            // layout from `hdr.size()`: 1 entry is the 2-header block (q/k/v/o in one payload, Qwen2/Llama), 3 is the
+            // 4-header block (q/k/v, then k_norm, then q_norm, then o_proj, Qwen3). Assigning unconditionally truncated a
+            // Qwen3 pack's list to one entry, so `post_attn_hdr()` -- which returns `hdr.back()` and is the only thing
+            // that marks the end of attention -- returned the k_norm header as the start of the MLP section: weights read
+            // from the wrong place, silently, on a container that parses cleanly. The old comment's own reason ("setting
+            // only `h1` left `hdr` empty") is exactly why the guard is `g.hdr.empty()`, not a rewrite.
+            if (best >= 3 && g.hdr.empty()) {            // the residue repeats across blocks: a real section boundary
                 g.h1 = best_off;
                 g.hdr.assign(1, best_off);               // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
                 g.period = 2;

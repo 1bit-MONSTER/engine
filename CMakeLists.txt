@@ -319,6 +319,16 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
+# engine#1901: tools/*.py that declare `--self-test` must be run by something. This one was the only declaration with
+# no runner at all (tools/ci/selftest_registration_check.py finds them); its self-test is model-free by construction --
+# window arithmetic and the mel shape on synthetic input -- so it belongs in every configure.
+add_python_test(whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools/whisper_encoder_baseline.py --self-test)
+# engine#1901: the tools/ half of "a test that exists and never runs". A tool that DECLARES --self-test is claiming
+# it can be verified without its real inputs; the claim is unbacked when nothing runs it. Keyed on the declaration
+# (parsed from argparse) so CLI-only tools are out of scope, and satisfied by a ctest row, a workflow step or another
+# test, because those are all places a tool is actually executed.
+add_python_test(selftest_registration ${CMAKE_SOURCE_DIR}/tools/ci/selftest_registration_check.py --check)
+add_python_test(selftest_registration_self ${CMAKE_SOURCE_DIR}/tools/ci/selftest_registration_check.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The

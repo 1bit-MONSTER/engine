@@ -2004,6 +2004,34 @@ reaps or signals the holder -- killing another lane's live serve is the box-cras
 Qwen3-4B, whose kernel sets are on this box): each model solo, then both at once, three reps, every
 number stamped with the build that produced it.
 
+### Finding where a forward diverges: `NPU_INFER_DUMP_DIR` and `NPU_INFER_DUMP_OPS`
+
+Two diagnostic switches of the NPU forward. Both are off by default, neither changes a result, and neither
+can fail a run.
+
+| variable | what it writes | answers |
+|---|---|---|
+| `NPU_INFER_DUMP_DIR=<dir>` | `<dir>/layer_<ll>.f32` per layer: the residual stream after that layer, M x H little-endian f32, row-major. The directory must exist; a file that cannot be written is reported on stderr and the run goes on. | which **layer** two runs part at (per-layer cosine against a reference trace) |
+| `NPU_INFER_DUMP_OPS=1` | one stderr line per projection and per weighted RMSNorm: `[op] L<layer> <tag> rows=<M> \|x\| mean <m> absmax <a>` | which **op** inside the layer |
+
+`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process.
+
+```
+  [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935
+  [op] L00 ffn_gate_up  rows=1 |x| mean 0.0258482 absmax 1.25728
+  [op] L00 ffn_down     rows=1 |x| mean 0.00315921 absmax 0.673885
+```
+
+- The tag is the one the projection's call site already passes (`attn_qkv`, `attn_output`, `ffn_gate_up`,
+  `ffn_down`, `ssm_out`, ...). Layer norms are `rmsnorm`; on a family with per-head q/k norms those print as
+  `q_norm` and `k_norm`, one line per head.
+- The numbers are over row 0 of the result (its first N values). A batched projection prints one line with
+  `rows=M`; a norm is called per row, so a batched pass prints one norm line per row.
+- A NaN or Inf is counted (`nonfinite 2/4096` at the end of the line) and left out of the mean and the maximum.
+- The same lines come out on the host arms (`NPU_INFER_HOST_GEMM=1` or `=i8`) and on the device arm, in the same
+  order and number, so the two logs of one prompt can be compared with `diff`. Start there: the first line whose
+  numbers differ names the op.
+
 ### When a load follows an evict
 
 On the appliance the NPU model is swapped by evicting it and starting a fresh `1bit` for the next

@@ -134,6 +134,11 @@ struct Plan {
     int64_t graph_ryzenai_matmuls = 0;
     int64_t graph_packed_siblings = 0;
     int64_t graph_weightless_matmuls = 0;   // dropped: placeholder + packed sibling both byte-less (engine#1671)
+    // Of those, the ones outside the decode `If` branch: what plan() refuses on. The total above stays for `info`.
+    int64_t graph_weightless_matmuls_decode = 0;
+    // The `If` branch taken when input_ids has length 1, and how that was decided (read from the condition, or assumed).
+    std::string graph_decode_branch;
+    std::string graph_branch_note;
     // How many of the graph's 4-bit block-128 weights satisfy length == N x (K/128 + 1) x 68 (the per-row stride the
     // .fconst tile also carries): a measurement, so `info` can say "201 of 201" or "3 of 7" instead of guessing.
     int64_t graph_stride_ok = 0, graph_stride_of = 0;

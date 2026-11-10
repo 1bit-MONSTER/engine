@@ -131,6 +131,12 @@ struct OnnxMatMul {
     std::string data, weight, scales, zeros;
     int64_t K = 0, N = 0;
     int bits = 0, block = 0;
+    // Which `If` branch declared it, as the AttributeProto's name (`then_branch` / `else_branch`), or empty in the
+    // top-level graph. An OGA pack splits prefill from decode with `If (Shape(input_ids) == 1)`: Qwen3-8B declares ONE
+    // MatMulNBits (its head) in `then_branch` and every layer projection in `else_branch`, so a walk that merges the
+    // branches cannot tell which path a weight belongs to. The Token .fconst IS the decode path, so the head is read
+    // from the decode branch -- see is_decode_branch().
+    std::string branch;
 };
 
 struct OnnxModel {
@@ -149,9 +155,27 @@ struct OnnxModel {
     // .fconst, so plan() drops them; with no .fconst there is no other source and plan() refuses by name (#1687).
     int64_t weightless_matmuls = 0;
     std::string weightless_example;   // the first one, for the refusal's text
+    // weightless_matmuls for placeholders OUTSIDE the decode branch only. A placeholder in the prefill branch is not a
+    // fault for a Token-fconst pack reading its decode weights: Qwen3-8B's `else_branch` spells lm_head as an empty
+    // placeholder while `then_branch` (decode) carries the real [151936,32,64] tensor. This is what plan() consults for
+    // "are these weights genuinely absent from the pack" -- the total stays for `info`'s census.
+    int64_t weightless_matmuls_decode = 0;
+    // The branch that runs when `input_ids` has length 1, i.e. the decode path the Token .fconst belongs to. Learned
+    // from the `If`'s condition where it is the literal we recognise, else defaulted to `then_branch` -- the ONNX
+    // convention every OGA pack on the Hub follows -- and named in the note either way, so a pack that puts it in the
+    // other branch is diagnosable rather than silently misread.
+    std::string decode_branch;
+    std::string branch_note;
 };
 
-void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
+// A matmul is decode-path when its branch is the decode branch, or when it is in no branch at all (a pack whose graph
+// is flat has one path). A pack whose decode branch was never identified keeps every matmul, which is today's
+// behaviour and cannot lose a head.
+bool is_decode_branch(const OnnxModel& m, const std::string& branch) {
+    return branch.empty() || m.decode_branch.empty() || branch == m.decode_branch;
+}
+
+void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& branch = std::string()) {
     const auto g = pb(p, n);
     for (const auto* f : fields(g, 5)) {
         const auto t = pb(f->p, f->n);
@@ -189,8 +213,11 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
             const auto* nm = field1(at, 1);
             if (!nm) continue;
             if (const auto* iv = field1(at, 3)) attrs[pb_str(*nm)] = int64_t(iv->v);
-            for (const auto* sg : fields(at, 6)) walk_graph(sg->p, sg->n, m);
-            for (const auto* sg : fields(at, 11)) walk_graph(sg->p, sg->n, m);
+            // AttributeProto.graph is field 6 (a GRAPH), graphs is field 11 (a repeated GRAPH) -- so a branch arrives
+            // in field 6 and its name is the attribute's own, `then_branch` / `else_branch`.
+            const std::string sub_branch = nm ? pb_str(*nm) : std::string();
+            for (const auto* sg : fields(at, 6)) walk_graph(sg->p, sg->n, m, sub_branch);
+            for (const auto* sg : fields(at, 11)) walk_graph(sg->p, sg->n, m, sub_branch);
         }
         // The graph is the authority on how THIS reader should spell a quantised matmul: the same pack also states the
         // op in `cache/*_meta.json` (which the block census reads) and in the `.onnx` alias table, and if those ever
@@ -215,6 +242,7 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
             if (attrs.count("N")) mm.N = attrs["N"];
             if (attrs.count("bits")) mm.bits = int(attrs["bits"]);
             if (attrs.count("block_size")) mm.block = int(attrs["block_size"]);
+            mm.branch = branch;
             if (!mm.weight.empty()) m.matmuls.push_back(std::move(mm));
         }
     }
@@ -231,6 +259,31 @@ OnnxModel parse_onnx(const std::string& path) {
         const auto* g = field1(model, 7);
         if (!g) throw std::runtime_error(path + ": no graph");
         walk_graph(g->p, g->n, m);
+        // Which branch is decode. The condition is `Equal(Shape(input_ids), Constant(value_int 1))` on every OGA 1.9
+        // pack measured (Qwen3-8B, granite-4.1-b8), so the branch taken when it is TRUE is the one-token path and
+        // therefore the path the Token .fconst carries. Reading the comparison's own value rather than assuming
+        // `then_branch` keeps the rule honest for a pack that inverts it; when the graph is not that shape, the ONNX
+        // convention (`then_branch`) stands and `branch_note` says the rule was assumed rather than read.
+        {
+            const auto gpb = pb(g->p, g->n);
+            bool one_token_when_true = true, read = false;
+            for (const auto* f : fields(gpb, 1)) {   // GraphProto.node = 1
+                const auto node = pb(f->p, f->n);
+                const auto* opf = field1(node, 4);
+                if (!opf || pb_str(*opf) != "Constant") continue;
+                for (const auto* a : fields(node, 5)) {
+                    const auto at = pb(a->p, a->n);
+                    const auto* nm = field1(at, 1);
+                    if (!nm || pb_str(*nm) != "value_int") continue;
+                    const auto* iv = field1(at, 3);
+                    if (iv) { one_token_when_true = (iv->v == 1); read = true; }
+                }
+            }
+            m.decode_branch = one_token_when_true ? "then_branch" : "else_branch";
+            m.branch_note = read ? "the If condition compares the input shape with 1, so " + m.decode_branch +
+                                       " is the one-token (decode) path"
+                                 : "no recognisable If condition, so then_branch is taken as decode by the ONNX convention";
+        }
     } catch (...) {
         unmap_file(map, size);
         throw;
@@ -304,6 +357,8 @@ OnnxModel parse_onnx(const std::string& path) {
             // which knows whether an .fconst is there, decides. Deferring it silently produced
             // `...qweight.empty: no data` from a lookup much later, naming the placeholder rather than the problem.
             ++m.weightless_matmuls;
+            if (is_decode_branch(m, mm.branch))
+                ++m.weightless_matmuls_decode;
             m.weightless_example = w->name + " (its " + packed + " sibling carries no data either)";
             continue;
         }
@@ -2471,6 +2526,12 @@ std::string Plan::manifest() const {
         // (engine#1671). Reported so a test can pin the drop without needing a 1.9 pack, and so `info` says how many
         // graph weights this pack does not keep in its graph.
         g["weightless_matmuls"] = graph_weightless_matmuls;
+        // Of those, the ones OUTSIDE the decode branch. A placeholder in the prefill branch is not a fault when the
+        // decode branch carries the real tensor (Qwen3-8B: `else_branch` has an empty lm_head placeholder, `then_branch`
+        // has lm_head [151936,32,64]), so the refusal reads this one and the census above stays a census.
+        g["weightless_matmuls_decode"] = graph_weightless_matmuls_decode;
+        g["decode_branch"] = graph_decode_branch;
+        if (!graph_branch_note.empty()) g["decode_branch_note"] = graph_branch_note;
         if (graph_stride_of > 0)
             g["external_row_stride"] = {{"matched", graph_stride_ok}, {"of", graph_stride_of},
                                         {"rule", "length == N * (K/128 + 1) * 68"}};
@@ -2595,6 +2656,9 @@ Plan plan(const std::string& pack_dir) {
         p.graph_ryzenai_matmuls = onnx.ryzenai_matmuls;
         p.graph_packed_siblings = onnx.packed_siblings;
         p.graph_weightless_matmuls = onnx.weightless_matmuls;
+        p.graph_weightless_matmuls_decode = onnx.weightless_matmuls_decode;
+        p.graph_decode_branch = onnx.decode_branch;
+        p.graph_branch_note = onnx.branch_note;
         for (const auto& t : onnx.tensors)
             if (!t.location.empty()) p.graph_external++;
         if (!ext_file.empty()) {
@@ -2611,7 +2675,7 @@ Plan plan(const std::string& pack_dir) {
     // data has no weight for those ops IN THE GRAPH. With a Token .fconst that is the normal shape of a 1.9 pack -- its
     // graph is all placeholders and the weights are in the .fconst -- so the walker drops them and the import proceeds.
     // With no .fconst there is nothing to fall back to, and the honest answer is #1687's refusal, by name.
-    if (tok_path.empty() && onnx.weightless_matmuls > 0)
+    if (tok_path.empty() && onnx.weightless_matmuls_decode > 0)
         throw std::runtime_error(
             pack_dir + ": " + onnx.weightless_example +
             ", and the pack carries no Token .fconst either (no dd_metastate_Llm_Token_*.fconst): these weights are "
@@ -3801,6 +3865,20 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         }
     }
 
+    // The head is the node whose geometry is the vocabulary x hidden -- but which NODE, when both `If` branches declare
+    // one? The Token .fconst is the decode path, so the decode branch's node is the one that describes it. Measured on
+    // amd/Qwen3-8B_rai_1.9.0_npu: `then_branch` (taken when Shape(input_ids) == 1, i.e. one token) holds exactly ONE
+    // MatMulNBits and it is lm_head [151936, 32, 64] at offset 15,269,888 in model.onnx.data; `else_branch` holds the
+    // 109 layer projections and an `lm_head.MatMulNBits.qweight.empty` placeholder with no bytes. The head is not the
+    // same tensor in both paths, so a walk that merges the branches reads the placeholder and falls back to the tail --
+    // and on these packs the tail is the envelope alone (8,256 B = 64 + 2*4096, no head tiles), which is how the import
+    // refused with "the head's offsets are not established" for every 4096-hidden untied pack.
+    const OnnxMatMul* head_mm = nullptr;
+    for (const auto& mm : onnx.matmuls)
+        if (mm.N == int(V) && mm.K == int(H) && is_decode_branch(onnx, mm.branch)) { head_mm = &mm; break; }
+    if (!head_mm)
+        for (const auto& mm : onnx.matmuls)
+            if (mm.N == int(V) && mm.K == int(H)) { head_mm = &mm; break; }
     for (const auto& mm : onnx.matmuls) {
         const auto wi = onnx.index.find(mm.weight), si = onnx.index.find(mm.scales);
         if (getenv("NPU_PACK_DEBUG"))
@@ -3839,6 +3917,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // which is why the imported container answered "!!!!!!!!". Only the node whose geometry IS the head is
         // taken here; the projections are imported from the graph's initializers by the block below.
         if (!(mm.N == int(V) && mm.K == int(H))) continue;
+        if (head_mm && &mm != head_mm) continue;   // a same-geometry node in the other `If` branch
         if (mm.bits != 4) throw std::runtime_error("lm_head: MatMulNBits is not 4-bit");
         const auto& wt = onnx.tensors[wi->second];
         const auto& st = onnx.tensors[si->second];

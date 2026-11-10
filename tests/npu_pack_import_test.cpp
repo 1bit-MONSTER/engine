@@ -520,6 +520,41 @@ void test_external_packed_genre(const std::string& root) {
                   "placeholder with no sibling: the matmul is KEPT, so the pack is not mistaken for a tail-head pack");
     }
 
+    // Which `If` branch is decode (engine#1740). An OGA pack splits prefill from decode with
+    // `If (Equal(Shape(input_ids), Constant(value_int 1)))`, and the two branches do NOT hold the same tensors: measured
+    // on amd/Qwen3-8B_rai_1.9.0_npu, `then_branch` holds exactly one MatMulNBits -- lm_head [151936,32,64] with real
+    // bytes -- while `else_branch` holds 109 layer projections and an `lm_head.MatMulNBits.qweight.empty` placeholder
+    // with none. The Token .fconst is the decode path, so a walk that merges the branches counts the prefill
+    // placeholder as "this pack has no head", falls back to the tail, and refuses (these packs' tails are the 8,256-byte
+    // envelope alone). The arm pins the reading of the condition, both ways round.
+    {
+        const auto graph_with_cond = [&](bool one_token_when_true, const std::string& head_branch) {
+            std::string named;
+            pb::str(named, 4, "Constant");
+            std::string a;
+            pb::str(a, 1, "value_int");
+            pb::ints(a, 3, one_token_when_true ? 1 : 2);
+            pb::tag(named, 5, 2);
+            pb::varint(named, a.size());
+            named += a;
+            const std::string head = pb::matmulnbits("lm_head", {"x", "w", "w.scales", "w.zeros"}, K, N, 4, 128);
+            const std::string prefill = pb::graph({}, {head});
+            const std::string decode = pb::graph({}, {head});
+            return pb::model({}, {named, pb::if_node("c", "input_ids", "logits", head_branch, decode),
+                                  pb::if_node("c2", "input_ids", "logits",
+                                              head_branch == "then_branch" ? "else_branch" : "then_branch", prefill)});
+        };
+        put_file((dir / "model.onnx").string(), graph_with_cond(/*one_token_when_true=*/true, "then_branch"));
+        const json d1 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
+        check(d1.contains("decode_branch") && d1["decode_branch"].get<std::string>() == "then_branch",
+              "decode branch: a condition comparing the shape with 1 makes then_branch the decode path");
+        put_file((dir / "model.onnx").string(), graph_with_cond(/*one_token_when_true=*/false, "else_branch"));
+        const json d2 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
+        check(d2["decode_branch"].get<std::string>() == "else_branch",
+              "decode branch: an inverted condition moves the decode path to else_branch");
+        write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N);
+    }
+
     // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
     write_data(stride * N - 68);
     write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N - 68);

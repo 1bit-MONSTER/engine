@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "batch_check_compare.h"
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
@@ -3264,16 +3265,25 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // device state -- localises a batched-vs-sequential divergence immediately.
     static const bool batch_check = getenv("NPU_BATCH_CHECK") != nullptr;
     int seq_argmax = -1;
+    // engine#1781: the old oracle compared ONE argmax at ONE position -- the last row's -- which is not the question a
+    // speculative decoder asks. Every drafted position's LOGITS matter (the accept rule consumes the target's
+    // probability at the drafted token), so the sequential rows are kept whole and compared row for row, bitwise.
+    // M x vocab floats: 4-7 MB on the models this runs, allocated only under the debug flag.
+    std::vector<float> seq_rows, bat_rows;
     // Not with injected rows: the oracle's own sequential pass runs step(tokens[m]) on the placeholder ids this
     // entry point supplies, so it would compare against a zero-token pass and report a divergence that is not
     // there. A debug tool that lies is worse than one that says "not applicable".
     if (batch_check && !inject_embeds_) {
         std::vector<float> seq;
-        for (int m = 0; m < M; m++)
+        if (c_.NV > 0) seq_rows.reserve((size_t)M * (size_t)c_.NV);
+        for (int m = 0; m < M; m++) {
             if (!step(tokens[m], start_pos + m, seq)) return false;
+            seq_rows.insert(seq_rows.end(), seq.begin(), seq.end());   // every row, not only the last
+            if (m == M - 1)
+                for (size_t i = 0; i < seq.size(); i++)
+                    if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
+        }
         reset();
-        for (size_t i = 0; i < seq.size(); i++)
-            if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
     }
 
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
@@ -3685,6 +3695,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
         }
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
+        // engine#1781: keep the batched rows so the oracle can compare all of them, not just the last one's argmax.
+        if (batch_check) bat_rows.assign(batch_all_out_->begin(), batch_all_out_->end());
     } else {
         std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
         rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
@@ -3712,6 +3724,16 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (logits[i] > logits[(size_t)ba]) ba = (int)i;
         std::fprintf(stderr, "[batchcheck] M=%d start=%d seq_argmax=%d batch_argmax=%d %s\n",
                      M, start_pos, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+        // engine#1781: and the comparison the gate actually asks for -- every row, bitwise.
+        if (!seq_rows.empty() && bat_rows.size() == seq_rows.size() && c_.NV > 0) {
+            onebit::npu::RowMismatch mm;
+            const int differing = onebit::npu::compare_rows_bitwise(seq_rows.data(), bat_rows.data(), M, c_.NV, &mm);
+            std::fprintf(stderr, "[batchcheck] rows M=%d identical=%d differing=%d", M, M - differing, differing);
+            if (differing > 0)
+                std::fprintf(stderr, " first row=%d index=%d seq=0x%08x bat=0x%08x%s", mm.row, mm.index,
+                             (unsigned)mm.seq_bits, (unsigned)mm.bat_bits, mm.nan_mismatch ? " (NaN)" : "");
+            std::fprintf(stderr, "\n");
+        }
     } else if (getenv("NPU_BATCH_DBG")) {
         std::fprintf(stderr, "[batch] M=%d start=%d batched (%d layers, two_widths=%d)\n",
                      M, start_pos, c_.NL, (int)two_widths);

@@ -341,6 +341,10 @@ target_include_directories(serve_watchdog_test PRIVATE app)
 add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 # The NPU route's sampling controls and GBNF output constraint (app/npu_sampling.h,
 # app/npu_grammar.h, docs/npu.md "Sampling and structured output"); header only, no device.
+# engine#1781: the comparator behind NPU_BATCH_CHECK -- pure arithmetic over two float arrays, so it runs with no model,
+# no device and no runtime. It is a header, so the test includes it directly and needs no link libraries.
+add_executable(batch_check_compare_test tests/batch_check_compare_test.cpp)
+target_include_directories(batch_check_compare_test PRIVATE npu/forward/include)
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
@@ -802,6 +806,10 @@ add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
     # the HRX hardware gate's judges (docs/hw-gate.md) against a fake server and synthetic logs;
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
+    # engine#1781: the comparator behind NPU_BATCH_CHECK, host-only (no model, no device, no runtime):
+    # the batched verify pass is compared row for row against the sequential one, bitwise.
+    add_test(NAME batch_check_compare
+             COMMAND batch_check_compare_test)
     add_test(NAME q4nx_pb16i COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_pb16i_test.py)
     # The padded-grid read (engine#1097/#1110): tools/q4nx_diff.py decode reads a container whose weight sits on a
     # WIDER tile grid than the model's dimensions (the FastFlowLM repack pads intermediate_size to 512 columns, IM

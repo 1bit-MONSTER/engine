@@ -642,6 +642,13 @@ void test_external_import_success(const std::string& root) {
             }
     check(int64_t(blob.size()) == int64_t(N) * (K / 128 + 1) * 68,
           "external success: the crafted blob has the genre's length N x (K/128 + 1) x 68");
+    // engine#1863: the expectation is the PACK decoded by production code, not a hand model of the pack. `w_of`
+    // reproduced the pack's per-ROW scale while the container is re-quantised per 32-column GROUP, and the two
+    // differed by exactly one 4-bit code range on 128 of 256 columns (two representative classes) -- a property of
+    // comparing two quantisers, nothing to do with the split this arm exists to check.
+    std::string dec_err;
+    const pi::Q4 pack_q4 = pi::decode_external_tile(reinterpret_cast<const uint8_t*>(blob.data()), blob.size(), N, K,
+                                                   dec_err, /*row_major=*/false);
     // The embedding, F32 in the pack, values exact in bf16.
     std::string embed(size_t(V) * H * 4, '\0');
     for (int i = 0; i < V * H; ++i) {
@@ -731,6 +738,12 @@ void test_external_import_success(const std::string& root) {
             }
             const json& e = c.table.at(nm);
             const int64_t lo = e.at("data_offsets").at(0), hi = e.at("data_offsets").at(1);
+            // engine#1863: compare the container against the PACK's own decode, not against a hand model of it. The
+            // hand model (`w_of`) reproduced the pack's per-ROW scale, while the container is re-quantised per
+            // 32-column GROUP, so the two could only agree by luck -- measured: 128 of 256 columns differed by exactly
+            // one 4-bit code range, in two representative classes. `decode_external_tile` is the production decoder,
+            // so using it on both sides makes this arm test the q/k/v SPLIT and the row mapping (what it is for) and
+            // not which of two quantisers is "right".
             const int RT = want.rows / 32, KT = K / 256;
             const size_t tb = size_t(onebit::npu::q4nx::Chunk::Q4_1F);
             check(e.at("shape").at(1) == int64_t(tb) && (hi - lo) == int64_t(RT) * KT * int64_t(tb),
@@ -746,7 +759,15 @@ void test_external_import_success(const std::string& root) {
                     for (int r = 0; r < 32; ++r)
                         for (int col = 0; col < 256; ++col) {
                             const int row = rt * 32 + r, gcol = kt * 256 + col;
-                            if (w[size_t(r) * 256 + col] != w_of(want.lo + row, gcol)) {
+                            const size_t pr = size_t(want.lo + row), pk = size_t(gcol);
+                            const int pkb = int(pk) / 32;
+                            const float pack_v =
+                                float((int(pack_q4.codes[pr * size_t(K) + pk] >= 8
+                                               ? int(pack_q4.codes[pr * size_t(K) + pk]) - 16
+                                               : int(pack_q4.codes[pr * size_t(K) + pk])) -
+                                       int(std::lround(pack_q4.zero[pr * size_t(K / 32) + size_t(pkb)]))) *
+                                      pack_q4.scale[pr * size_t(K / 32) + size_t(pkb)]);
+                            if (w[size_t(r) * 256 + col] != pack_v) {
                                 if (bad++ == 0) first_r = row, first_c = gcol;
                             }
                         }

@@ -113,5 +113,50 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("audio exec: whole encoder on the host matches onnxruntime\n");
+
+    // ---- the decoder, on the same pack: 128-position token window x, the encoder output xa ----------------------------
+    const char* dpath = (argc > 2) ? argv[2] : std::getenv("ONEBIT_TEST_WHISPER_DECODER");
+    if (dpath == nullptr || *dpath == '\0') {
+        std::printf("SKIP decoder: pass the decoder .onnx as the second argument\n");
+        return 0;
+    }
+    OnnxGraphInfo dg;
+    try {
+        dg = parse_onnx_graph(dpath);
+    } catch (const std::exception& e) {
+        std::printf("FAIL cannot parse %s: %s\n", dpath, e.what());
+        return 1;
+    }
+    const int ntok = 128;
+    std::vector<int64_t> toks(size_t(ntok), 0);
+    toks[0] = 50258;   // <|startoftranscript|>
+    toks[1] = 50359;   // <|en|>
+    toks[2] = 50257;   // <|transcribe|>
+    toks[3] = 1234;
+    std::vector<int64_t> xad;
+    for (int64_t d : r.dims) xad.push_back(d);
+    AudioRunResult dr;
+    if (!run_decoder_graph(dg, toks.data(), ntok, r.data.data(), xad, "", &dr, &why)) {
+        std::printf("FAIL decoder run: %s\n", why.c_str());
+        return 1;
+    }
+    std::printf("decoder ran %zu nodes -> dims", dg.nodes.size());
+    for (int64_t d : dr.dims) std::printf(" %lld", (long long)d);
+    std::printf("\n");
+    check(dr.dims.size() == 3 && dr.dims[0] == 1 && dr.dims[1] == ntok, "decoder output is [1,128,vocab]");
+    if (dr.dims.size() == 3) {
+        const int64_t V = dr.dims[2];
+        auto dl = [&](int64_t t, int64_t v) { return dr.data[size_t(t) * size_t(V) + size_t(v)]; };
+        // onnxruntime, same chain (formula mel -> encoder -> xa -> decoder): the decoder's last row and row 3.
+        const double last[5] = {8.26411438, -1.29840982, -2.36972690, -3.26691365, -2.12733102};
+        const double row3[4] = {18.45385361, 17.14962196, 12.60445786, 10.96115971};
+        for (int i = 0; i < 5; ++i) expect_close(dl(ntok - 1, i), last[i], 2e-3, "decoder last row col " + std::to_string(i));
+        for (int i = 0; i < 4; ++i) expect_close(dl(3, i), row3[i], 2e-3, "decoder row 3 col " + std::to_string(i));
+    }
+    if (g_failures != 0) {
+        std::printf("audio exec: %d failures\n", g_failures);
+        return 1;
+    }
+    std::printf("audio exec: decoder graph runs on the host and matches onnxruntime\n");
     return 0;
 }

@@ -19,14 +19,25 @@
 namespace onebit::npu::pack_import {
 
 struct AudioRunResult {
-    std::vector<int64_t> dims;   // dims of the requested output
-    std::vector<float> data;     // row-major
+    std::vector<int64_t> dims;      // dims of the requested output
+    std::vector<float> data;        // row-major f32 payload
+    std::vector<int64_t> i64;       // int64 payload, when the requested tensor is an index/token tensor
+    std::vector<uint8_t> b;         // bool payload, when it is a mask
 };
 
+// Two entry points, because a Whisper pack has two graphs: the encoder consumes the mel window as f32, the decoder consumes
+// a token window as int64 plus the encoder's output. Everything else -- node order, weights, refusals -- is shared.
+//
 // mel: (mel_bins, frames) row-major f32, the encoder's graph input in the layout its own first Conv consumes.
 // out_name: the graph output to return (empty = the graph's declared output).
 // Returns true and fills `out`; on failure returns false and sets `why` to the node and the reason.
 bool run_audio_graph(const OnnxGraphInfo& g, const float* mel, int64_t mel_bins, int64_t frames,
                      const std::string& out_name, AudioRunResult* out, std::string* why);
+
+// The decoder: `tokens` is the int64 token window for the graph's first input; `xa` (the encoder output, row-major f32) is
+// bound to the graph's second input when the graph has one. `xa_dims` may be empty when there is no cross-attention input.
+bool run_decoder_graph(const OnnxGraphInfo& g, const int64_t* tokens, int64_t n_tokens, const float* xa,
+                       const std::vector<int64_t>& xa_dims, const std::string& out_name, AudioRunResult* out,
+                       std::string* why);
 
 }  // namespace onebit::npu::pack_import

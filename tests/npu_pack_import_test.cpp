@@ -292,8 +292,13 @@ void test_external_tile_decode() {
     check(err.empty() && q.N == N && q.K == K && q.block == 32,
           "external tile: a blob of the measured size decodes (" + err + ")");
     bool codes_ok = q.codes.size() == codes.size(), scale_ok = true, zero_ok = true;
-    for (size_t i = 0; codes_ok && i < codes.size(); ++i)
-        if (q.codes[i] != codes[i]) codes_ok = false;
+    // The pack's codes are int4 TWO'S COMPLEMENT; the container's form is the offset from the group minimum, i.e.
+    // c_signed + 8. A test that expected the raw nibble passed on the unsigned bug (engine#1503).
+    for (size_t i = 0; codes_ok && i < codes.size(); ++i) {
+        const int raw = codes[i];
+        const int cs = (raw >= 8) ? raw - 16 : raw;
+        if (q.codes[i] != uint8_t(cs + 8)) codes_ok = false;
+    }
     // Every row's own scale and all four of its zero points, so the addressing (row r*2 in the param regions, the
     // group index (kk-1)*4+g, the half and tile choice) is pinned rather than the value of one row repeated.
     for (int64_t tile = 0; tile < tiles; ++tile)
@@ -304,7 +309,10 @@ void test_external_tile_decode() {
                     for (int g = 0; g < 4; ++g) {
                         const size_t at = size_t(row) * (K / 32) + (kk - 1) * 4 + g;
                         if (q.scale[at] != scale_for(tile, half, kk, r)) scale_ok = false;
-                        if (q.zero[at] != float(zero_for(tile, half, kk, r, g))) zero_ok = false;
+                        // and the container's zero is the offset, m = (-8 - z) * scale, for a signed int4 z
+                        const int zraw = zero_for(tile, half, kk, r, g);
+                        const int zs = (zraw >= 8) ? zraw - 16 : zraw;
+                        if (q.zero[at] != float(-8 - zs) * scale_for(tile, half, kk, r)) zero_ok = false;
                     }
                 }
     check(codes_ok, std::string("external tile: every 4-bit code comes back exactly, ") + (row_major ? "row-major" : "w8 interleave"));

@@ -1372,6 +1372,28 @@ again to get the logits the answer is drawn from. Restoring `cached - 1` positio
 version of this fix, the cache hit (`[prefix] slot=0 cached=179 of 180 reason=hit`, TTFT 5.3 s against 15.6 s) and
 answered the same prompt with different, fragmented text.
 
+### The prefix cache's pinned slot: single-turn requests under one system prompt (engine#1785)
+
+A slot holds a whole prompt, and a request hits a slot only when the slot is a prefix of it. Requests that
+share a system prompt and differ in the user turn therefore reuse nothing from each other: `system + question 1`
+is not a prefix of `system + question 2`. `tests/npu_sampling_test.cpp` (`test_prefix_pin`) states that as its
+first row: a 900-token system prompt, a second question, `cached_tokens: 0`.
+
+The slot table (`app/npu_prefix_cache.h`) has a slot kind for the part such requests do share:
+
+| call | what it decides |
+|---|---|
+| `pin_point(prev, ids)` | how many leading tokens this request shares with the previous one. 0 when one prompt is a prefix of the other (a repeat or a continued conversation, which the ordinary slots already keep), when the shared part adds fewer than `--prefix-min-gain` tokens over a slot that already covers the request, or when the cache is off |
+| `pin(prefix, bytes)` | keep the state at that point. One pinned slot at a time: a new pin replaces it; eviction for room and a longer prompt's replacement both leave it alone |
+| `lookup(ids)` | unchanged, and reports `pinned` when the hit is the pinned slot |
+
+It reads token ids only, so it does not depend on the template or on which message is the system prompt.
+
+**State of this, plainly:** the table and its tests are in; `forward-serve` does not call `pin_point()`/`pin()`
+yet, so no request is faster because of it today. The forward half is one more cut in the prefill loop (stop one
+token short of the pin point, `snapshot_state`, `pin`), and it needs a device run to be claimed.
+
+
 ### Sampling and structured output
 
 `1bit serve -m <NPU model dir> --device npu` serves through `1bit forward-serve`

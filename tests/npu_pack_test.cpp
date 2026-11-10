@@ -23,6 +23,7 @@
 #include "full_elf.h"
 #include "pack.h"
 #include "q4nx_pack.h"
+#include "batch_width.h"
 
 #include "golden/host_gemm_i8_fixture.h"
 
@@ -86,7 +87,33 @@ static void quant_int4_arms() {
     std::printf("  int4 pair: 11 arms (known codes, ladder, floor, NaN, round-trip)\n");
 }
 
+/* engine#1900: the batch width is the chunk width, and the activation BO holds exactly that many rows -- an OVER-wide
+ * answer reads past the BO (engine#1372, memory corruption rather than a slow path). The old code returned the first
+ * populated design's width, so a mixed set answered whichever role was index 0.
+ *
+ * These arms pin the RULE (minimise, skip empty slots, take a fallback), not a measurement: no pack on this box has been
+ * shown to adopt mixed widths, so nothing here claims the old answer was wrong on a real pack -- only that it would be
+ * the dangerous way round if one ever did. The sealed route's width is #1904's, read from the plan and measured on the
+ * device. */
+static void batch_width_arms() {
+    using onebit::npu::batch_width_min;
+    const int mixed[] = {16, 16, 128};
+    check(batch_width_min(mixed, 3, 1) == 16, "batch width: 16/16/128 answers 16, not the 128 at index 2");
+    const int wide_first[] = {128, 16, 16};
+    check(batch_width_min(wide_first, 3, 1) == 16,
+          "batch width: 128 at index 0 does not win (the old code returned the FIRST populated entry)");
+    const int slots[] = {0, 0, 16, 0};
+    check(batch_width_min(slots, 4, 1) == 16, "batch width: unloaded slots are skipped, not treated as a width");
+    const int none[] = {0, 0, 0};
+    check(batch_width_min(none, 3, 1) == 1, "batch width: no design at all falls back to 1 (a single-row launch)");
+    check(batch_width_min(none, 3, 16) == 16, "batch width: the fallback is the loaded design's own M when the caller has it");
+    check(batch_width_min(nullptr, 0, 128) == 128, "batch width: a null array reads as empty and takes the fallback");
+    check(batch_width_min(mixed, 0, 4) == 4, "batch width: an n of 0 reads nothing and takes the fallback");
+    std::printf("  batch width: 7 arms (min not first, empty slots, fallback)\n");
+}
+
 int main(int argc, char** argv) {
+    batch_width_arms();
     quant_int4_arms();
     for (int G : {8, 9, 16}) {
         for (int n : {G, 3 * G}) {  // whole groups: a ragged tail is not a permutation

@@ -172,6 +172,12 @@
    "model_type": "deepseek_v4_flash_superexpert",
    "family": "DeepSeek V4.1 Flash SuperExpert, published as remote code and with AW-SECD-compressed weights (8.5 GB, claimed 0.962 retention); MLA-style geometry (kv_lora_rank 512, q_lora_rank 1536, qk_rope_head_dim 64, v_head_dim 128, 32 heads / 16 KV, IM 4096). Not an alias of deepseek_v41: nothing at the pin decodes AW-SECD weights, so mapping it would name a backend that cannot read it",
    "watch": "report"
+  },
+  "MicroLlamaForCausalLM": {
+   "model_type": "llama",
+   "family": "MicroLlama (Climb-Ai/Climb-1-Toki: vocab 1024, hidden 192, 6 heads, 6 layers, 256 positions)",
+   "watch": "report",
+   "mapped_ok": "engine#1922: model_type is `llama`, which the registry already maps (LlamaForCausalLM -> gguf llama, hrx+npu). Only the architectures[0] CLASS NAME is new, and the NPU path matches on model_type, not on the class name (tools/registry_build.py). Reported, not alerted: a renamed fine-tune of a supported family is not a coverage gap."
   }
  }
 }

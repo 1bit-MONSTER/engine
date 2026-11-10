@@ -774,6 +774,8 @@ if(Python3_Interpreter_FOUND)
     # three refusals a real pack needed -- a block-32 head refused by name, an untied head given no false oracle, the
     # trailing zeros counted. It was never registered, so nothing ran it after #1710.
     add_test(NAME q4nx_tail_head COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_tail_head_test.py)
+    # Without onnx its two refusal arms cannot run: it exits 77, so ctest shows SKIPPED rather than a pass (#1747 review).
+    set_tests_properties(q4nx_tail_head PROPERTIES SKIP_RETURN_CODE 77)
     # A member declared in npu/forward/include/q4nx_forward.h and never defined keeps `main` green while a full
     # `cmake --build` fails at link time (engine#1573: the 3-argument step_batch_embeds).  CI cannot catch it --
     # .github/workflows/ci.yml builds `--target onebit` only, because a full build wants the private NPU runtime --

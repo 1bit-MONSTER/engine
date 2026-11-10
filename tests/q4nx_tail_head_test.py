@@ -280,8 +280,17 @@ def main():
 
     synthetic()
 
-    print("all q4nx_tail_head checks passed" if not failures else "%d check(s) failed" % failures)
-    return 1 if failures else 0
+    if failures:
+        print("%d check(s) failed" % failures)
+        return 1
+    # engine#1747 review: the block-32 refusal and the undeclared-tie arm need onnx, and they are the reason this test is
+    # registered. Without onnx a pass would hide that they never ran, so report SKIPPED to ctest (SKIP_RETURN_CODE 77 in
+    # CMakeLists.txt) instead. A failing synthetic check still returns 1 above, in either environment.
+    if not HAVE_ONNX:
+        print("SKIPPED: the synthetic checks passed, but the two onnx arms (block-32 refusal, undeclared tie) did not run")
+        return 77
+    print("all q4nx_tail_head checks passed")
+    return 0
 
 
 if __name__ == "__main__":

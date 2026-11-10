@@ -3142,7 +3142,13 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     if (!cacheable || it == host_i8_cache_.end()) {
         HostI8Tensor t;
         t.N = N;
-        t.codes.assign((size_t)K * (size_t)N, 0);
+        /* engine#1994: a blocked image is ceil(N/128)*ceil(K/64)*8192 bytes, which equals K*N only on aligned geometry.
+         * Allocating K*N and indexing with blocked_index() runs past the vector for e.g. N=8512 (66.5 tiles) or an LM head
+         * whose last vocabulary block is not 128-aligned (phi-3-mini: 32064 % 8192 = 7488) -- the packer writes past the
+         * buffer and the MAC reads the same out-of-range offsets back, so the reference returns plausible wrong numbers.
+         * The row-major layout is safe for any geometry and is only slower; correctness first. */
+        t.blocked = q4nx_layout::blocked_fits(K, N);
+        t.codes.assign(t.blocked ? q4nx_layout::blocked_bytes(K, N) : (size_t)K * (size_t)N, 0);
         // RESOLVED toward the int8 packer (this branch) rather than main's corrected int4 rule (engine#1839).
         // Both are self-consistent; the question is what the DEVICE consumes. The device's body image comes from
         // packB_blocked() -- one multiplier per column, int8 codes -- and this branch measured the consequence:
@@ -3160,7 +3166,7 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         // blocked=1: the image is written in the blocked microtile order, which is the fast path AND the layout the
         // device actually reads, so the MAC below walks it with q4nx_layout::blocked_index(). (blocked=0 was measured
         // at 174.5 s of warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.)
-        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, /*blocked=*/1, t.d.data(), &ssum);
+        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, /*blocked=*/t.blocked ? 1 : 0, t.d.data(), &ssum);
         if (!cacheable) {
             scratch = std::move(t);
             cached = &scratch;
@@ -3199,9 +3205,11 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         float* dst = out + (size_t)m * (size_t)N;
         for (int n = 0; n < N; n++) {
             int32_t acc = 0;
-            for (int k = 0; k < K; k++)
-                acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] *
-                                 (int)a8[(size_t)k]);
+            for (int k = 0; k < K; k++) {
+                const size_t wi = t.blocked ? q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)
+                                            : q4nx_layout::rowmajor_index((size_t)k, (size_t)n, K, N);
+                acc += (int32_t)((int)t.codes[wi] * (int)a8[(size_t)k]);
+            }
             dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
         }
     }
@@ -5359,16 +5367,24 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
                 for (int n = n0; n < n1; n++)
                     for (int k = 0; k < H; k++) bt[(size_t)k * Tn + (n - n0)] = lm_at(n, k);
                 c.N = Tn;
-                c.codes.assign((size_t)H * (size_t)Tn, 0);
+                /* engine#1994: same sizing rule as the body GEMM above -- a blocked image is ceil(Tn/128)*ceil(H/64)*8192
+                 * bytes, and the LAST vocabulary block is where this bites: phi-3-mini's 32064 vocabulary ends in a 7488-wide
+                 * block (58.5 tiles of 128), so K*Tn under-allocates by 196,608 B and both the packer and the MAC walk off
+                 * the end of the vector. Row-major for unaligned geometry, blocked where it fits. */
+                c.blocked = q4nx_layout::blocked_fits(H, Tn);
+                c.codes.assign(c.blocked ? q4nx_layout::blocked_bytes(H, Tn) : (size_t)H * (size_t)Tn, 0);
                 c.d.assign((size_t)Tn, 0.0f);
                 double ssum = 0.0;
-                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, /*blocked=*/1, c.d.data(), &ssum);
+                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, /*blocked=*/c.blocked ? 1 : 0,
+                                         c.d.data(), &ssum);
             }
             for (int n = 0; n < Tn; n++) {
                 int32_t acc = 0;
-                for (int k = 0; k < H; k++)
-                    acc += (int32_t)((int)c.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, H, Tn)] *
-                                     (int)a8i[(size_t)k]);
+                for (int k = 0; k < H; k++) {
+                    const size_t wi = c.blocked ? q4nx_layout::blocked_index((size_t)k, (size_t)n, H, Tn)
+                                                : q4nx_layout::rowmajor_index((size_t)k, (size_t)n, H, Tn);
+                    acc += (int32_t)((int)c.codes[wi] * (int)a8i[(size_t)k]);
+                }
                 float v = c.d[(size_t)n] * (ascale * (float)acc);
                 if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
                 logits[(size_t)(n0 + n)] = v;

@@ -23,6 +23,7 @@
 #include "full_elf.h"
 #include "pack.h"
 #include "q4nx_pack.h"
+#include "q4nx_weight_layout.h"
 #include "batch_width.h"
 
 #include "golden/host_gemm_i8_fixture.h"
@@ -112,7 +113,36 @@ static void batch_width_arms() {
     std::printf("  batch width: 7 arms (min not first, empty slots, fallback)\n");
 }
 
+/* engine#1994: `host_gemm_i8`'s weight image is sized K*N but indexed with the BLOCKED tile grid, so any N that is not
+ * 128-aligned reads and writes past the vector. The two expressions are each correct alone, which is why it survived
+ * review: `150144 % 8192 = 2688 = 21x128` and `11008 = 86x128`, so every measured shape was aligned. The failure needs a
+ * vocabulary whose last block is not (`32064 % 8192 = 7488`, phi-3-mini) or a body width that is not (`8512 = 66.5x128`).
+ *
+ * The arms pin the sizing rule, because the size is the defect: `blocked_bytes()` must equal K*N exactly when the geometry
+ * is aligned (so the fast path is unchanged) and must EXCEED K*N when it is not (so a blocked image cannot be allocated
+ * as K*N), and `blocked_fits()` must be false for exactly those geometries. */
+static void blocked_image_size_arms() {
+    using namespace q4nx_layout;
+    // aligned: the two agree, which is why nothing measured ever saw the bug
+    check(blocked_fits(4096, 11008) && blocked_bytes(4096, 11008) == size_t(4096) * 11008,
+          "blocked size: an aligned geometry (4096x11008, the measured family) is K*N exactly");
+    check(blocked_fits(4096, 2688) && blocked_bytes(4096, 2688) == size_t(4096) * 2688,
+          "blocked size: the measured LM-head block (2688 = 21x128) is K*N exactly");
+    // unaligned: the blocked image is BIGGER than K*N, which is the out-of-bounds write
+    check(!blocked_fits(3072, 32064),
+          "blocked size: 32064 is 250.5 tiles of 128, so blocked_fits() is false (phi-3-mini's vocabulary)");
+    check(blocked_bytes(2048, 8512) > size_t(2048) * 8512,
+          "blocked size: 8512 (66.5 tiles) needs MORE than K*N -- allocating K*N and indexing blocked is the overflow");
+    check(!blocked_fits(2048, 8512), "blocked size: and blocked_fits() refuses it");
+    check(blocked_bytes(2048, 8512) - size_t(2048) * 8512 == 131072,
+          "blocked size: the overrun is 131,072 B for a 2048x8512 body, the figure in the issue");
+    // the coarse predicate: K%64 and N%128
+    check(!blocked_fits(2047, 8192), "blocked size: a K that is not 64-aligned is refused too");
+    std::printf("  blocked size: 8 arms (aligned == K*N, unaligned > K*N with the issue's 131,072 B)\n");
+}
+
 int main(int argc, char** argv) {
+    blocked_image_size_arms();
     batch_width_arms();
     quant_int4_arms();
     for (int G : {8, 9, 16}) {

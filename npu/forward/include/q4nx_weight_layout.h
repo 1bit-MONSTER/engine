@@ -62,6 +62,15 @@ inline size_t rowmajor_index(size_t i, size_t j, int KD, int ND) {
     return i * (size_t)ND + j;
 }
 
+// Bytes a blocked image of KD x ND occupies: ceil(ND/128) tiles across, ceil(KD/64) rows of tiles, 8192 B per tile.
+// engine#1994: a caller that allocates KD*ND and indexes with blocked_index() reads and writes past the buffer whenever
+// the geometry is not 128/64-aligned -- the two expressions are each correct on their own, which is why it survived review:
+// `150144 % 8192 = 2688 = 21 * 128` and `11008 = 86 * 128`, so every measured shape was aligned.
+inline size_t blocked_bytes(int KD, int ND) {
+    const size_t nt = ((size_t)ND + 127) / 128, kt = ((size_t)KD + 63) / 64;
+    return nt * kt * 8192;
+}
+
 inline bool blocked_fits(int KD, int ND) {
     return KD > 0 && ND > 0 && KD % 64 == 0 && ND % 128 == 0;
 }

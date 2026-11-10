@@ -243,7 +243,15 @@ private:
     // quantisation, a wrong 128-K group boundary, an int8 intermediate or a saturated accumulator.
     bool host_gemm_i8_ = false;
     // Weight codes + per-128-K multipliers for the integer host arm, quantised once per tensor (engine#1809).
-    struct HostI8Tensor { int groups = 0; int N = 0; std::vector<int8_t> codes; std::vector<float> d; };
+    struct HostI8Tensor {
+        int groups = 0;
+        int N = 0;
+        // engine#1994: which layout `codes` is in. A blocked image is ceil(N/128)*ceil(K/64)*8192 bytes; K*N only fits
+        // when both are aligned, and indexing a K*N buffer with blocked_index() walks past it otherwise.
+        bool blocked = false;
+        std::vector<int8_t> codes;
+        std::vector<float> d;
+    };
     // Keyed on (LAYER, wkey, K, N): `wkey` alone is a per-role slot that repeats in every layer and `Bmat` is the one
     // scratch buffer each layer is decoded into, so keying on it served layer 0's weights to every later layer
     // (engine#1830 review). Routed experts pass wkey < 0 and are never cached: their weights change per token.

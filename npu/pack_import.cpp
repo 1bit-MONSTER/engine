@@ -1411,8 +1411,17 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
             // against 1-2 for a payload coincidence. Requiring `layers/2` was too strict and silently dropped the real one.
             if (best >= 3) {                             // the residue repeats across blocks: a real section boundary
                 g.h1 = best_off;
-                g.hdr.assign(1, best_off);               // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
-                g.period = 2;
+                // NEVER overwrite a header list the epsilon vote already established (engine#1831). `locate_fconst`
+                // records `period - 1` inner headers, and the reader picks the block layout from that count: one entry
+                // is the 2-header Qwen2/Llama shape, three is the 4-header Qwen3 shape (q/k/v, then k_norm and q_norm,
+                // then o_proj). Assigning unconditionally turned every Qwen3 pack into the 2-header shape, so
+                // `post_attn_hdr()` -- which is `hdr.back()`, the post-attention norm AND the start of the MLP section --
+                // returned the k_norm header and the block was read from the wrong offset with no error. This branch
+                // exists for the case its comment describes: the vote could not win and left `hdr` empty.
+                if (g.hdr.empty()) {
+                    g.hdr.assign(1, best_off);           // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
+                    g.period = 2;
+                }
             }
         }
     }

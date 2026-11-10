@@ -604,6 +604,41 @@ A request wall moves less than the block does and scatters more: the same four a
 21.6-23.1 after by TTFT, with one outlier in each direction (18.3 and 15.8) from other lanes' load. Quote the block
 medians for the effect and the TTFT range for what a caller sees.
 
+#### The attention rows of a block share one thread team (#1990)
+
+The next host term after the one above, same pack, same instruments. A batched pass called `attention()` once per row,
+and each call opened its own thread team over the heads: 16 rows on each of this model's 16 full-attention layers is
+256 teams per block. The rows of a layer now go through `q4nx_attn::rows_context()` (`npu/forward/include/attn_math.h`):
+every row's position-local half runs first (its q, and its k/v appended to the cache), then all (row, head) pairs are
+one statically scheduled loop in one team. A causal row reads only positions up to its own, so the later rows already
+being in the cache changes nothing it reads.
+
+Measured on `bonsai2-27b-t2s2` (2026-11-10, `npu-hold` tickets, one binary, `NPU_ATTN_ROWS=0` against the default,
+103 blocks per arm, `amdxdna` error count unchanged). **What it buys is the attention term and its behaviour under
+load, not a block-wall gain that can be resolved on a quiet box:**
+
+| ticket, arms in order | attention per block, mean (per-row -> one team) | block wall median |
+|---|---|---|
+| first: A B (quiet) | 31.2 -> **14.3 ms** | 675.7 -> 658.4 ms |
+| second: A B A B (quiet) | 24.5 -> **13.0**, 26.6 -> **13.1 ms** | 609.3 -> 613.1, 626.3 -> 601.9 ms |
+| first, later arms: B then A, another lane's load on the box | **16.0** vs 98.1 ms | 674.5 vs 834.4 ms |
+
+The attention term halves in every pair. The block wall does not follow it reliably: the first pair moved by 17 ms,
+the two pairs of the second ticket by +4 and -24 ms, which is the arm-to-arm scatter of this box (about 15 ms on a
+600 ms block) and not a measured 2-3 %. The first version of this section quoted the first pair as a 2.6 % gain; the
+second ticket is why it no longer does. Under load the picture is different and is one observation, not a repeat: the
+per-row arm measured 56.2 ms median attention with 36 of 103 blocks over 100 ms, while the one-team arm before it held
+13.6 ms with none.
+
+Nothing rounds differently: a (row, head) pair runs the same statements in the same order as before
+(`q4nx_attn::head_context()`, which `attention()` now calls too) and writes only its own floats. Greedy text is identical
+in every arm. `NPU_ATTN_CHECK=1` recomputes each row the per-row way and compares bit patterns, failing the pass on a
+difference (160 of 160 layer passes identical on the device); `tests/attn_math_test` holds `rows_context()` to the
+per-row form bit for bit on 1, 2, 5 and 12 threads, for causal, whole-prompt and sliding-window reads.
+
+The schedule is static on purpose. A first version used a dynamic schedule and measured a lower median (15-25 ms) but a
+worse mean than the per-row form, with 6 and 14 of 103 blocks over 100 ms in its two arms: the tail was the whole cost.
+
 #### Per-tile arithmetic ceiling, and where our GEMMs sit against it (AM027)
 
 AM027 (*Versal Adaptive SoC AIE-ML v2 Architecture Manual*, v1.1) **Appendix A, Table 14** gives 512 INT8×INT8 multipliers per compute tile and 256
@@ -1249,6 +1284,50 @@ layout checks are all there is, and the note says the values are not verified. M
 equals `bf16(-m/8)` of its 32-column embedding block, `m` being the block's largest-magnitude
 weight, and the read head correlates 0.996 with the embedding.
 
+**A pack whose every MatMulNBits is `block_size 32` keeps its layers in those units too**
+(engine#1503). `SmolLM2-135M-Instruct_rai_1.9.0_npu` declares block 32 on all 151 ops, and its
+*raw* Token `.fconst` (the file as shipped, not the 1.8-form copy the block-128 path makes) is
+`layers` blocks of one fixed shape and then the tail. With `H` = hidden, `Nq` = heads x head_dim,
+`Nkv` = KV heads x head_dim, `IM` = intermediate, `unit(K) = 2,560 + 2 x (K/32) x 640` (the head's
+unit above) and `mlp_unit(K) = 4,864 + 2 x (K/32) x 1,216`:
+
+| section | bytes | holds |
+|---|---|---|
+| envelope | `64 + 2H` | bf16 `rms_norm_eps`, zeros to 64, `input_layernorm` bf16[H] |
+| q, k, v | `(Nq/64 + 2 x Nkv/64) x unit(H)` | `q_proj` [Nq][H], `k_proj` [Nkv][H], `v_proj` [Nkv][H] |
+| — | `4 x heads` | not a weight; skipped |
+| o | `(H/64) x unit(Nq)` | `o_proj` [H][Nq] |
+| envelope | `64 + 2H` | epsilon, zeros, `post_attention_layernorm` bf16[H] |
+| gate + up | `(IM/64) x mlp_unit(H)` | `gate_proj` and `up_proj`, [IM][H] each |
+| — | 64 | skipped, not interpreted (`01` then zeros on the measured pack) |
+| down | `(H/64) x unit(IM)` | `down_proj` [H][IM] |
+
+The tail is the same envelope with the final norm, then `ceil(vocab/64)` head units at K = `H`,
+then zeros. On SmolLM2-135M the block is 2,360,292 B (q at 1,216, k at 231,616, v at 308,416, o at
+385,252, the second envelope at 615,652, gate/up at 616,868, down at 1,784,292), the head is at
+70,809,976 and the file is exactly `30 x 2,360,292 + 1,216 + 768 x 25,600 = 90,470,776` B.
+
+The **gate/up unit** is the head's unit with 64 row *slots* per strip instead of 32 rows: 4,864
+zero bytes, then `2 x (K/32)` strips of 1,216 B. Strip `s` holds K block `s/2`; slots 0..31 are
+`gate_proj` rows `32 x (s%2) .. +31` of the unit and slots 32..63 are the same rows of `up_proj`.
+A strip is 1,024 B of 4-bit codes (low nibble first; position `p` is slot `(p/256) x 8 + p%8`,
+column `(p/8) % 32`), 32 B of zero-point nibbles, 32 zero bytes, and 64 signed bf16 scales. The
+code order was measured against the public checkpoint; that zero point and scale are indexed by
+slot is assumed by analogy with the 640-byte strip, and is tested by the imported container's
+gate/up still correlating with the checkpoint once they are applied.
+
+`npu-pack import` takes this path when every op the pack's `cache/*_meta.json` declares is block 32,
+at least one of them is a layer projection, and the pack has a Token `.fconst` (a pack that
+declares only its head at 32 is the case above). Nothing is located by search: the offsets are
+arithmetic on the geometry, and the file has to agree with them — at least
+`layers x stride + 64 + 2H + ceil(vocab/64) x unit(H)` bytes, the pack's epsilon and zeros at every
+envelope, zero unit headers and strip gaps, finite scales, zeros after the head — or the tensors
+are refused by name with the offset. The container gets the same tensors in the same q4_1f tiles as
+a block-128 import; this layout has no bias field, so no bias tensor is written. There is no
+decode->encode round trip on this path (no encoder for these units exists), so the import's
+`attention:` and `MLP:` round-trip lines are replaced by a `block 32:` line. Measured on one pack
+only, where `Nq == H`; `o_proj`'s K being `Nq` is the declared shape, not a measurement.
+
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
 opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as
 `npu_pack_import`, and as `npu_pack_import_oga` when `-DONEBIT_OGA_PACK=<dir>` is given) checks
@@ -1531,10 +1610,28 @@ The slot table (`app/npu_prefix_cache.h`) has a slot kind for the part such requ
 
 It reads token ids only, so it does not depend on the template or on which message is the system prompt.
 
-**State of this, plainly:** the table and its tests are in; `forward-serve` does not call `pin_point()`/`pin()`
-yet, so no request is faster because of it today. The forward half is one more cut in the prefill loop (stop one
-token short of the pin point, `snapshot_state`, `pin`), and it needs a device run to be claimed.
+**`--prefix-pin`** (on `1bit serve --device npu` and on `forward-serve`; off by default) turns it on. The
+forward keeps the previous request's prompt ids, and when `pin_point()` is non-zero it stops the prefill one
+token short of that point, takes a snapshot and pins it, the same cut it already makes before the last token.
+The cost is one more launch on the request that makes the pin. Every decision is logged
+(`[prefix] pin slot=1 tokens=342 state_at=341 pinned`), and `usage.flm_prefix_cache.pinned` says when a hit
+came from the pinned slot.
 
+Measured 2026-11-10 on `bonsai2-t2s2-perrole876` with its `kernels-m16`, `--ctx-size 1024`, one `npu-hold`
+ticket, one server per arm, four requests: the same 14-rule system prompt, then three different questions and
+the second one again. 16 tokens generated, temperature 0.
+
+| request | cache off | default cache | `--prefix-pin` |
+|---|---|---|---|
+| 1 (question A) | cached 0, 58.6 s | cached 0 | cached 0, 59.5 s |
+| 2 (question B) | cached 0, 59.4 s | cached 0 | cached 0, 62.1 s (makes the pin: 342 tokens) |
+| 3 (question C) | cached 0, 61.5 s | cached 0 | **cached 341 of 355, pinned, 23.4 s** |
+| 4 (question B again) | cached 0, 60.0 s | not reached | cached 354 of 355 (the whole-prompt slot), 20.4 s |
+
+The generated text of all four requests is identical between the cache-off arm and the `--prefix-pin` arm.
+The default-cache arm's times are not in the table: the ticket ended during its third request, so only its
+three cache decisions (from the server log) are known. A request's time here is the whole HTTP call, prefill
+plus 16 generated tokens, not TTFT.
 
 ### Sampling and structured output
 

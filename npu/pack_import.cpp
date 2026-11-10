@@ -133,11 +133,20 @@ struct OnnxMatMul {
     std::string data, weight, scales, zeros;
     int64_t K = 0, N = 0;
     int bits = 0, block = 0;
+    // Which `If` branch declared it, as the AttributeProto's name (`then_branch` / `else_branch`), or empty in the
+    // top-level graph. An OGA pack splits prefill from decode with `If (Shape(input_ids) == 1)`: Qwen3-8B declares ONE
+    // MatMulNBits (its head) in `then_branch` and every layer projection in `else_branch`, so a walk that merges the
+    // branches cannot tell which path a weight belongs to. The Token .fconst IS the decode path, so the head is read
+    // from the decode branch -- see is_decode_branch().
+    std::string branch;
 };
 
 struct OnnxModel {
     std::vector<OnnxTensor> tensors;
     std::vector<OnnxMatMul> matmuls;
+    // The fused-MLP nodes' (SSMLP / GQO) gate/up/down shapes, from their attributes. Kept apart from `matmuls` because they
+    // name no weight tensor: `matmuls` answers "does the graph carry quantised weights", and these must not.
+    std::vector<OnnxMatMul> fused_mlp;
     std::map<std::string, size_t> index;
     // `com.ryzenai:MatMulNBitsBf` is the same quantised matmul as `com.microsoft:MatMulNBits`, and on the 1.9
     // blob/external-data packs it is the ONLY one: phi-4's 201 weights are all `MatMulNBitsBf`, so a walker that
@@ -151,9 +160,27 @@ struct OnnxModel {
     // .fconst, so plan() drops them; with no .fconst there is no other source and plan() refuses by name (#1687).
     int64_t weightless_matmuls = 0;
     std::string weightless_example;   // the first one, for the refusal's text
+    // weightless_matmuls for placeholders OUTSIDE the decode branch only. A placeholder in the prefill branch is not a
+    // fault for a Token-fconst pack reading its decode weights: Qwen3-8B's `else_branch` spells lm_head as an empty
+    // placeholder while `then_branch` (decode) carries the real [151936,32,64] tensor. This is what plan() consults for
+    // "are these weights genuinely absent from the pack" -- the total stays for `info`'s census.
+    int64_t weightless_matmuls_decode = 0;
+    // The branch that runs when `input_ids` has length 1, i.e. the decode path the Token .fconst belongs to. Learned
+    // from the `If`'s condition where it is the literal we recognise, else defaulted to `then_branch` -- the ONNX
+    // convention every OGA pack on the Hub follows -- and named in the note either way, so a pack that puts it in the
+    // other branch is diagnosable rather than silently misread.
+    std::string decode_branch;
+    std::string branch_note;
 };
 
-void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
+// A matmul is decode-path when its branch is the decode branch, or when it is in no branch at all (a pack whose graph
+// is flat has one path). A pack whose decode branch was never identified keeps every matmul, which is today's
+// behaviour and cannot lose a head.
+bool is_decode_branch(const OnnxModel& m, const std::string& branch) {
+    return branch.empty() || m.decode_branch.empty() || branch == m.decode_branch;
+}
+
+void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& branch = std::string()) {
     const auto g = pb(p, n);
     for (const auto* f : fields(g, 5)) {
         const auto t = pb(f->p, f->n);
@@ -191,8 +218,11 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
             const auto* nm = field1(at, 1);
             if (!nm) continue;
             if (const auto* iv = field1(at, 3)) attrs[pb_str(*nm)] = int64_t(iv->v);
-            for (const auto* sg : fields(at, 6)) walk_graph(sg->p, sg->n, m);
-            for (const auto* sg : fields(at, 11)) walk_graph(sg->p, sg->n, m);
+            // AttributeProto.graph is field 6 (a GRAPH), graphs is field 11 (a repeated GRAPH) -- so a branch arrives
+            // in field 6 and its name is the attribute's own, `then_branch` / `else_branch`.
+            const std::string sub_branch = nm ? pb_str(*nm) : std::string();
+            for (const auto* sg : fields(at, 6)) walk_graph(sg->p, sg->n, m, sub_branch);
+            for (const auto* sg : fields(at, 11)) walk_graph(sg->p, sg->n, m, sub_branch);
         }
         // The graph is the authority on how THIS reader should spell a quantised matmul: the same pack also states the
         // op in `cache/*_meta.json` (which the block census reads) and in the `.onnx` alias table, and if those ever
@@ -217,7 +247,37 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
             if (attrs.count("N")) mm.N = attrs["N"];
             if (attrs.count("bits")) mm.bits = int(attrs["bits"]);
             if (attrs.count("block_size")) mm.block = int(attrs["block_size"]);
+            mm.branch = branch;
             if (!mm.weight.empty()) m.matmuls.push_back(std::move(mm));
+        }
+        // The Ryzen AI fused MLPs: `SSMLP` is gate+up+down as ONE node and `GQO` is grouped-query attention, so neither
+        // has a MatMulNBits node for the FFN to pair up -- which is why amd/granite-4.1-8b_rai_1.9.0_npu states no
+        // intermediate_size anywhere (`config.json` is literally {}, and genai_config.json's decoder block has only
+        // hidden_size / heads / layers) and was refused. The node carries the same numbers as attributes, measured on
+        // that pack: gate_K 4096, gate_N 12800, up_K 4096, up_N 12800, down_K 12800, down_N 4096 -- the plain
+        // (K == hidden, N == w) gate/up and (K == w, N == hidden) down triple, w = 12800. Recording them as matmuls lets
+        // intermediate_size_from_graph find them by the SAME witness it uses for the separate-node spelling (gate and up
+        // reading one activation) rather than adding a second rule that could disagree with the first.
+        if (op == "SSMLP" || op == "GQO") {
+            for (const char* sub : {"gate", "up", "down"}) {
+                const auto k = attrs.find(std::string(sub) + "_K"), n = attrs.find(std::string(sub) + "_N");
+                if (k == attrs.end() || n == attrs.end() || k->second <= 0 || n->second <= 0) continue;
+                OnnxMatMul mm;
+                // gate and up share the node's activation input; down reads the gated product, so it gets its own name.
+                // That shared activation is the very witness separate gate/up nodes provide.
+                mm.data = ins.empty() ? std::string() : ins[0];
+                if (std::string(sub) == "down") mm.data += ".down";
+                mm.weight = sub;   // the role name intermediate_size_from_graph's excluded() filter reads
+                mm.K = k->second;
+                mm.N = n->second;
+                mm.branch = branch;
+                // NOT into `matmuls`: these carry no weight tensor, and `matmuls.empty()` is how the importer knows a
+                // 1.9 pack keeps its head in the .fconst tail. Counted as graph matmuls they turned that off for every
+                // pack with a fused MLP -- measured on Qwen-2.5 1.5B 1.9, which then imported 338 tensors with no
+                // lm_head, exit 0 and no refusal. They are geometry witnesses only, read by
+                // intermediate_size_from_graph().
+                m.fused_mlp.push_back(std::move(mm));
+            }
         }
     }
 }
@@ -233,6 +293,65 @@ OnnxModel parse_onnx(const std::string& path) {
         const auto* g = field1(model, 7);
         if (!g) throw std::runtime_error(path + ": no graph");
         walk_graph(g->p, g->n, m);
+        // Which branch is decode. The condition is `Equal(Shape(input_ids), Constant(value_int 1))` on every OGA 1.9
+        // pack measured (Qwen3-8B, granite-4.1-b8), so the branch taken when it is TRUE is the one-token path and
+        // therefore the path the Token .fconst carries. Reading the comparison's own value rather than assuming
+        // `then_branch` keeps the rule honest for a pack that inverts it; when the graph is not that shape, the ONNX
+        // convention (`then_branch`) stands and `branch_note` says the rule was assumed rather than read.
+        {
+            // g IS the GraphProto (field 7 of ModelProto), so its nodes are at field 1 of g directly -- re-wrapping
+            // g's bytes in another pb() would read the graph as if it were a node list and find no Constant at all.
+            bool one_token_when_true = true, read = false;
+            for (const auto* f : fields(pb(g->p, g->n), 1)) {   // GraphProto.node = 1
+                const auto node = pb(f->p, f->n);
+                const auto* opf = field1(node, 4);
+                if (!opf || pb_str(*opf) != "Constant") continue;
+                for (const auto* a : fields(node, 5)) {
+                    const auto at = pb(a->p, a->n);
+                    const auto* nm = field1(at, 1);
+                    if (!nm || pb_str(*nm) != "value_int") continue;
+                    const auto* iv = field1(at, 3);
+                    if (iv) { one_token_when_true = (iv->v == 1); read = true; }
+                }
+            }
+            // The branch whose graph actually declares a MatMulNBits. `value_int == 1` is the pack's convention, but the
+            // arithmetic is what must hold: the Token .fconst carries the graph's own quantised matmuls, so the branch
+            // that HAS them is the decode path whatever the constant says. A pack that inverts the condition without
+            // moving its weights stays readable; a pack whose weights sit in two branches is ambiguous, so the condition
+            // decides and the note says it did.
+            const auto branch_has_matmul = [&](const std::string& want) {
+                int n = 0;
+                for (const auto* f : fields(pb(g->p, g->n), 1)) {
+                    const auto node = pb(f->p, f->n);
+                    for (const auto* a : fields(node, 5)) {
+                        const auto at = pb(a->p, a->n);
+                        const auto* nm = field1(at, 1);
+                        if (!nm || (pb_str(*nm) != "then_branch" && pb_str(*nm) != "else_branch")) continue;
+                        if (pb_str(*nm) != want) continue;
+                        for (const auto* sg : fields(at, 6)) {
+                            for (const auto* nf : fields(pb(sg->p, sg->n), 1)) {
+                                const auto sub = pb(nf->p, nf->n);
+                                const auto* op = field1(sub, 4);
+                                if (op && (pb_str(*op) == "MatMulNBits" || pb_str(*op) == "MatMulNBitsBf")) ++n;
+                            }
+                        }
+                    }
+                }
+                return n;
+            };
+            const std::string by_condition = one_token_when_true ? "then_branch" : "else_branch";
+            const int then_mm = branch_has_matmul("then_branch"), else_mm = branch_has_matmul("else_branch");
+            if (then_mm > 0 && else_mm == 0) m.decode_branch = "then_branch";
+            else if (else_mm > 0 && then_mm == 0) m.decode_branch = "else_branch";
+            else m.decode_branch = by_condition;
+            m.branch_note = read ? "the If condition compares the input shape with 1, so " + by_condition +
+                                       " is the one-token (decode) path" +
+                                       ((m.decode_branch == by_condition) ? "" :
+                                        "; its weights are in " + m.decode_branch + " (then " +
+                                            std::to_string(then_mm) + ", else " + std::to_string(else_mm) +
+                                            " quantised matmuls), which is where the Token .fconst's weights are read")
+                                 : "no recognisable If condition, so then_branch is taken as decode by the ONNX convention";
+        }
     } catch (...) {
         unmap_file(map, size);
         throw;
@@ -306,6 +425,8 @@ OnnxModel parse_onnx(const std::string& path) {
             // which knows whether an .fconst is there, decides. Deferring it silently produced
             // `...qweight.empty: no data` from a lookup much later, naming the placeholder rather than the problem.
             ++m.weightless_matmuls;
+            if (is_decode_branch(m, mm.branch))
+                ++m.weightless_matmuls_decode;
             m.weightless_example = w->name + " (its " + packed + " sibling carries no data either)";
             continue;
         }
@@ -387,6 +508,10 @@ constexpr double kTieCorr = 0.99;
 // measured so far, not a rule: do not derive a row from it. A 1.9 pack with NO 1.8 twin cannot be given a row at all --
 // there is nothing to diff it against, so it stays refused by the shape gate (amd/granite-4.1-8b_rai_1.9.0_npu is the
 // standing example) rather than being given an inferred prefix and reported working.
+// What was tried on granite, so it is not tried again: its 40 uniform headers and its tail of exactly
+// 8,256 + 1,568 x 143,616 pin the TILE by head-grid arithmetic and say nothing about the prefix; a row added from
+// that alone was refused by the pack's own in-block checks (scale/zero exactness 0 %, no second header, 0/80 norm
+// anchors) and withdrawn.
 constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen2.5-0.5B-Instruct: normalises to its 1.8 twin byte for byte, whole file, all 24 blocks.
     {896, 14, 24, 1856, 16, 2, 34816},
@@ -1613,14 +1738,16 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
     };
     std::map<std::string, std::map<int64_t, int>> shared;  // activation tensor -> N -> how many nodes read it
     std::set<int64_t> down_k, gate_n;                     // down: N == hidden, K > hidden;  gate/up: K == hidden, N > hidden
-    for (const auto& mm : m.matmuls) {
-        if (mm.K <= 0 || mm.N <= 0 || excluded(mm.weight)) continue;
+    const auto witness = [&](const OnnxMatMul& mm) {
+        if (mm.K <= 0 || mm.N <= 0 || excluded(mm.weight)) return;
         if (mm.K == hidden && mm.N > hidden) {
             shared[mm.data][mm.N]++;
             gate_n.insert(mm.N);
         }
         if (mm.N == hidden && mm.K > hidden) down_k.insert(mm.K);
-    }
+    };
+    for (const auto& mm : m.matmuls) witness(mm);
+    for (const auto& mm : m.fused_mlp) witness(mm);   // SSMLP / GQO attributes: shapes without a weight tensor
     // separate gate/up first: it is the witness attention cannot produce
     std::set<int64_t> separate;
     for (const int64_t dk : down_k)
@@ -2572,14 +2699,104 @@ static TailHeadLocate locate_tail_head(const Fconst& fc, int64_t tail_off, int64
     return r;
 }
 
-// engine#1740: the block-32 tail head. Layout and its measurement are in pack_import.h.
-Block32Head read_block32_head(const uint8_t* p, int64_t avail, int64_t V, int64_t K) {
+// engine#1740 / engine#1503: the block-32 units. Layouts and their measurement are in pack_import.h.
+namespace {
+bool b32_all_zero(const uint8_t* b, int64_t n) {
+    for (int64_t i = 0; i < n; ++i)
+        if (b[i] != 0) return false;
+    return true;
+}
+float b32_bf16(const uint8_t* b) {
+    const uint32_t wide = uint32_t(uint16_t(b[0]) | uint16_t(uint16_t(b[1]) << 8)) << 16;
+    float v;
+    std::memcpy(&v, &wide, 4);
+    return v;
+}
+void b32_q_init(Q4& q, int64_t rows, int64_t K) {
+    q.N = int(rows);
+    q.K = int(K);
+    q.block = 32;
+    q.codes.assign(size_t(rows) * size_t(K), 0);
+    q.scale.assign(size_t(rows) * size_t(K / 32), 1.0f);
+    q.zero.assign(size_t(rows) * size_t(K / 32), 0.0f);
+}
+// One row's 32 codes of one K block out of a strip's code field. `slot` is the row's index inside the strip (0..31
+// in a 640-byte strip, 0..63 in a gate/up one): position `(slot/8)*256 + col*8 + slot%8`, low nibble first. A negative
+// scale is folded into the codes, so the stored scale is positive: (code - zp) * sc == ((15-code) - (15-zp)) * -sc.
+void b32_row(Q4& q, int64_t row, int64_t kblock, const uint8_t* codes, int slot, int zp, float sc) {
+    if (sc == 0.0f) return;   // an all-zero block: codes 0, scale 1, zero 0 decode to 0
+    const bool flip = sc < 0;
+    const float mag = flip ? -sc : sc;
+    const size_t g = size_t(row) * size_t(q.K / 32) + size_t(kblock);
+    q.scale[g] = mag;
+    q.zero[g] = -float(flip ? 15 - zp : zp) * mag;
+    const int base = (slot / 8) * 256 + (slot % 8);
+    uint8_t* dst = q.codes.data() + size_t(row) * size_t(q.K) + size_t(kblock) * 32;
+    for (int c = 0; c < 32; ++c) {
+        const int pos = base + c * 8;
+        const int code = (codes[pos / 2] >> (4 * (pos & 1))) & 15;
+        dst[c] = uint8_t(flip ? 15 - code : code);
+    }
+}
+}  // namespace
+
+Block32Units read_block32_units(const uint8_t* p, int64_t avail, int64_t rows, int64_t K, const char* what,
+                                int64_t file_off) {
+    Block32Units h;
+    const std::string tag = std::string("block-32 ") + what;
+    if (rows <= 0 || K <= 0 || K % 32 != 0) {
+        h.why = "a " + tag + " needs K to be a multiple of 32 (K " + std::to_string(K) + ")";
+        return h;
+    }
+    const int64_t kb = K / 32, strips = 2 * kb, unit = block32_unit_bytes(K);
+    h.units = (rows + kB32UnitRows - 1) / kB32UnitRows;
+    h.bytes = h.units * unit;
+    if (avail < h.bytes) {
+        h.why = "the .fconst has " + std::to_string(avail) + " B at " + std::to_string(file_off) + " B, and a " + tag +
+                " of " + std::to_string(h.units) + " units x " + std::to_string(unit) + " B needs " +
+                std::to_string(h.bytes);
+        return h;
+    }
+    b32_q_init(h.q, h.units * kB32UnitRows, K);
+    for (int64_t u = 0; u < h.units; ++u) {
+        const uint8_t* up = p + u * unit;
+        const std::string where = tag + " unit " + std::to_string(u) + " (at " + std::to_string(file_off + u * unit) +
+                                  " B)";
+        if (!b32_all_zero(up, kB32UnitHeader)) {
+            h.why = where + " does not open with " + std::to_string(kB32UnitHeader) +
+                    " zero bytes, so this is not the layout measured";
+            return h;
+        }
+        for (int64_t s = 0; s < strips; ++s) {
+            const uint8_t* sp = up + kB32UnitHeader + s * kB32StripBytes;
+            if (!b32_all_zero(sp + 528, 48)) {
+                h.why = where + " strip " + std::to_string(s) +
+                        " has non-zero bytes between its zero points and its scales, so this is not the layout measured";
+                return h;
+            }
+            const int64_t row0 = u * kB32UnitRows + 32 * (s % 2);
+            for (int r = 0; r < 32; ++r) {
+                const float sc = b32_bf16(sp + 576 + 2 * r);
+                if (!std::isfinite(sc)) {
+                    h.why = where + " strip " + std::to_string(s) + " row " + std::to_string(r) +
+                            " has a scale that is not finite";
+                    return h;
+                }
+                b32_row(h.q, row0 + r, s / 2, sp, r, (sp[512 + r / 2] >> (4 * (r & 1))) & 15, sc);
+            }
+        }
+    }
+    h.ok = true;
+    return h;
+}
+
+Block32Head read_block32_head(const uint8_t* p, int64_t avail, int64_t V, int64_t K, int64_t file_off) {
     Block32Head h;
     if (V <= 0 || K <= 0 || K % 32 != 0) {
         h.why = "a block-32 head needs K to be a multiple of 32 (K " + std::to_string(K) + ")";
         return h;
     }
-    const int64_t kb = K / 32, strips = 2 * kb, unit = block32_unit_bytes(K);
+    const int64_t unit = block32_unit_bytes(K);
     h.units = (V + kB32UnitRows - 1) / kB32UnitRows;
     h.bytes = h.units * unit;
     if (avail < h.bytes) {
@@ -2595,63 +2812,129 @@ Block32Head read_block32_head(const uint8_t* p, int64_t avail, int64_t V, int64_
             return h;
         }
     h.padding = avail - h.bytes;
-    const auto all_zero = [](const uint8_t* b, int64_t n) {
-        for (int64_t i = 0; i < n; ++i)
-            if (b[i] != 0) return false;
-        return true;
-    };
-    Q4& q = h.q;
-    q.N = int(h.units * kB32UnitRows);
-    q.K = int(K);
-    q.block = 32;
-    q.codes.assign(size_t(q.N) * size_t(K), 0);
-    q.scale.assign(size_t(q.N) * size_t(kb), 1.0f);
-    q.zero.assign(size_t(q.N) * size_t(kb), 0.0f);
+    Block32Units u = read_block32_units(p, h.bytes, V, K, "head", file_off);
+    if (!u.ok) {
+        h.why = u.why;
+        return h;
+    }
+    h.q = std::move(u.q);
+    h.ok = true;
+    return h;
+}
+
+Block32GateUp read_block32_gate_up(const uint8_t* p, int64_t avail, int64_t rows, int64_t K, int64_t file_off) {
+    Block32GateUp h;
+    if (rows <= 0 || K <= 0 || K % 32 != 0) {
+        h.why = "a block-32 gate/up needs K to be a multiple of 32 (K " + std::to_string(K) + ")";
+        return h;
+    }
+    const int64_t kb = K / 32, strips = 2 * kb, unit = block32_mlp_unit_bytes(K);
+    h.units = (rows + kB32UnitRows - 1) / kB32UnitRows;
+    h.bytes = h.units * unit;
+    if (avail < h.bytes) {
+        h.why = "the .fconst has " + std::to_string(avail) + " B at " + std::to_string(file_off) +
+                " B, and a block-32 gate/up of " + std::to_string(h.units) + " units x " + std::to_string(unit) +
+                " B needs " + std::to_string(h.bytes);
+        return h;
+    }
+    b32_q_init(h.gate, h.units * kB32UnitRows, K);
+    b32_q_init(h.up, h.units * kB32UnitRows, K);
     for (int64_t u = 0; u < h.units; ++u) {
         const uint8_t* up = p + u * unit;
-        if (!all_zero(up, kB32UnitHeader)) {
-            h.why = "block-32 head unit " + std::to_string(u) + " does not open with " +
-                    std::to_string(kB32UnitHeader) + " zero bytes, so this is not the layout measured";
+        const std::string where =
+            "block-32 gate/up unit " + std::to_string(u) + " (at " + std::to_string(file_off + u * unit) + " B)";
+        if (!b32_all_zero(up, kB32MlpUnitHeader)) {
+            h.why = where + " does not open with " + std::to_string(kB32MlpUnitHeader) +
+                    " zero bytes, so this is not the layout measured";
             return h;
         }
         for (int64_t s = 0; s < strips; ++s) {
-            const uint8_t* sp = up + kB32UnitHeader + s * kB32StripBytes;
-            if (!all_zero(sp + 528, 48)) {
-                h.why = "block-32 head unit " + std::to_string(u) + " strip " + std::to_string(s) +
+            const uint8_t* sp = up + kB32MlpUnitHeader + s * kB32MlpStripBytes;
+            if (!b32_all_zero(sp + 1056, 32)) {
+                h.why = where + " strip " + std::to_string(s) +
                         " has non-zero bytes between its zero points and its scales, so this is not the layout measured";
                 return h;
             }
-            const int64_t col0 = (s / 2) * 32, row0 = u * kB32UnitRows + 32 * (s % 2);
-            for (int r = 0; r < 32; ++r) {
-                const uint16_t bits = uint16_t(sp[576 + 2 * r]) | uint16_t(uint16_t(sp[577 + 2 * r]) << 8);
-                const uint32_t wide = uint32_t(bits) << 16;
-                float sc;
-                std::memcpy(&sc, &wide, 4);
+            const int64_t row0 = u * kB32UnitRows + 32 * (s % 2);
+            for (int slot = 0; slot < 64; ++slot) {
+                const float sc = b32_bf16(sp + 1088 + 2 * slot);
                 if (!std::isfinite(sc)) {
-                    h.why = "block-32 head unit " + std::to_string(u) + " strip " + std::to_string(s) + " row " +
-                            std::to_string(r) + " has a scale that is not finite";
+                    h.why = where + " strip " + std::to_string(s) + " slot " + std::to_string(slot) +
+                            " has a scale that is not finite";
                     return h;
                 }
-                const int zp = (sp[512 + r / 2] >> (4 * (r & 1))) & 15;
-                const bool flip = sc < 0;
-                const size_t g = size_t(row0 + r) * size_t(kb) + size_t(s / 2);
-                if (sc == 0.0f) continue;   // an all-zero block: codes 0, scale 1, zero 0 decode to 0
-                const float mag = flip ? -sc : sc;
-                q.scale[g] = mag;
-                q.zero[g] = -float(flip ? 15 - zp : zp) * mag;
-                // position p = band*256 + col*8 + (r%8) holds row band*8 + r%8, column col
-                const int base = (r / 8) * 256 + (r % 8);
-                uint8_t* dst = q.codes.data() + size_t(row0 + r) * size_t(K) + size_t(col0);
-                for (int c = 0; c < 32; ++c) {
-                    const int pos = base + c * 8;
-                    const int code = (sp[pos / 2] >> (4 * (pos & 1))) & 15;
-                    dst[c] = uint8_t(flip ? 15 - code : code);
-                }
+                // slots 0..31 are gate rows, 32..63 the same rows of up; zero point and scale by slot (assumed)
+                b32_row(slot < 32 ? h.gate : h.up, row0 + slot % 32, s / 2, sp, slot,
+                        (sp[1024 + slot / 2] >> (4 * (slot & 1))) & 15, sc);
             }
         }
     }
     h.ok = true;
     return h;
+}
+
+Block32Layout block32_layout(const Dims& d) {
+    Block32Layout l;
+    const int64_t H = d.hidden, IM = d.intermediate, Nq = int64_t(d.heads) * d.head_dim,
+                  Nkv = int64_t(d.kv_heads) * d.head_dim, V = d.vocab;
+    if (H <= 0 || IM <= 0 || Nq <= 0 || Nkv <= 0 || V <= 0 || d.layers <= 0) {
+        l.why = "the all-block-32 layout needs hidden, intermediate, heads, kv heads, head_dim, vocab and layers, and "
+                "the pack's geometry leaves one of them 0";
+        return l;
+    }
+    for (const auto& [name, v] : {std::pair<const char*, int64_t>{"hidden", H},
+                                  std::pair<const char*, int64_t>{"intermediate", IM},
+                                  std::pair<const char*, int64_t>{"heads*head_dim", Nq},
+                                  std::pair<const char*, int64_t>{"kv_heads*head_dim", Nkv}})
+        if (v % kB32UnitRows != 0) {
+            l.why = std::string("the all-block-32 layout is 64-row units of 32-column blocks, and ") + name + " " +
+                    std::to_string(v) + " is not a multiple of 64";
+            return l;
+        }
+    l.env = kNormOff + 2 * H;
+    l.q_off = l.env;
+    l.k_off = l.q_off + (Nq / kB32UnitRows) * block32_unit_bytes(H);
+    l.v_off = l.k_off + (Nkv / kB32UnitRows) * block32_unit_bytes(H);
+    l.sink_off = l.v_off + (Nkv / kB32UnitRows) * block32_unit_bytes(H);
+    l.o_off = l.sink_off + 4 * int64_t(d.heads);
+    l.post_off = l.o_off + (H / kB32UnitRows) * block32_unit_bytes(Nq);
+    l.gu_off = l.post_off + l.env;
+    l.hdr_off = l.gu_off + (IM / kB32UnitRows) * block32_mlp_unit_bytes(H);
+    l.down_off = l.hdr_off + 64;
+    l.stride = l.down_off + (H / kB32UnitRows) * block32_unit_bytes(IM);
+    l.tail_off = int64_t(d.layers) * l.stride;
+    l.head_off = l.tail_off + l.env;
+    l.head_units = (V + kB32UnitRows - 1) / kB32UnitRows;
+    l.min_size = l.head_off + l.head_units * block32_unit_bytes(H);
+    return l;
+}
+
+std::string block32_file_refusal(const uint8_t* map, int64_t size, const Dims& d, const Block32Layout& lay) {
+    if (!lay.why.empty()) return lay.why;
+    if (size < lay.min_size)
+        return "the Token .fconst is " + std::to_string(size) + " B, and the all-block-32 layout of this geometry is " +
+               std::to_string(d.layers) + " layer blocks x " + std::to_string(lay.stride) + " B + a " +
+               std::to_string(lay.env) + " B envelope + " + std::to_string(lay.head_units) + " head units x " +
+               std::to_string(block32_unit_bytes(d.hidden)) + " B = " + std::to_string(lay.min_size) +
+               " B (plus zero padding), so the file is not this layout";
+    const auto envelope = [&](int64_t off, const std::string& what) -> std::string {
+        if (map[off] != uint8_t(d.eps_bits & 0xFF) || map[off + 1] != uint8_t(d.eps_bits >> 8))
+            return "no RMSNorm epsilon at " + std::to_string(off) + " B, where the all-block-32 layout puts the " +
+                   what + " envelope, so the file is not this layout";
+        for (int64_t i = 2; i < kNormOff; ++i)
+            if (map[off + i] != 0)
+                return "the " + what + " envelope at " + std::to_string(off) + " B is not zero between its epsilon "
+                       "and its norm (byte " + std::to_string(off + i) + "), so the file is not this layout";
+        return {};
+    };
+    for (int L = 0; L <= d.layers; ++L) {
+        const int64_t base = int64_t(L) * lay.stride;
+        const std::string name = L == d.layers ? std::string("tail") : "layer " + std::to_string(L);
+        std::string why = envelope(base, name + (L == d.layers ? "" : " input_layernorm"));
+        if (why.empty() && L < d.layers) why = envelope(base + lay.post_off, name + " post_attention_layernorm");
+        if (!why.empty()) return why;
+    }
+    return {};
 }
 
 // engine#1740: a self-test for the SEARCH, not the arithmetic. `plan_tail_head` is pinned by the host test; this pins
@@ -2923,6 +3206,17 @@ std::string Plan::manifest() const {
                              {"o_proj_k", o_k},
                              {"qk_norm", knorm_off != 0},
                              {"note", attn_note}};
+    // engine#1503: an all-block-32 pack is read with its own layout, so the block-128 measurements above are 0 for it;
+    // this says which layout was used and what its arithmetic gives. Absent for every other pack.
+    if (block32_layers) {
+        const Block32Layout lay = block32_layout(dims);
+        j["block32_layers"] = {{"stride", lay.stride},
+                               {"post_attention_envelope", lay.post_off},
+                               {"head_offset", lay.head_off},
+                               {"head_units", lay.head_units},
+                               {"bytes", lay.min_size},
+                               {"note", block32_note}};
+    }
     // What the *graph* carries, in the graph's own terms. A pack's genre is the first question every sweep row asks,
     // and until now it could only be answered by an external tool: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights
     // as ordinary ONNX initializers (pi-inferzo: 25/25 real qweights, UINT8 [1152,7,64], location model_jit.onnx.data)
@@ -2946,6 +3240,12 @@ std::string Plan::manifest() const {
         // (engine#1671). Reported so a test can pin the drop without needing a 1.9 pack, and so `info` says how many
         // graph weights this pack does not keep in its graph.
         g["weightless_matmuls"] = graph_weightless_matmuls;
+        // Of those, the ones OUTSIDE the decode branch. A placeholder in the prefill branch is not a fault when the
+        // decode branch carries the real tensor (Qwen3-8B: `else_branch` has an empty lm_head placeholder, `then_branch`
+        // has lm_head [151936,32,64]), so the refusal reads this one and the census above stays a census.
+        g["weightless_matmuls_decode"] = graph_weightless_matmuls_decode;
+        g["decode_branch"] = graph_decode_branch;
+        if (!graph_branch_note.empty()) g["decode_branch_note"] = graph_branch_note;
         if (graph_stride_of > 0)
             g["external_row_stride"] = {{"matched", graph_stride_ok}, {"of", graph_stride_of},
                                         {"rule", "length == N * (K/128 + 1) * 68"}};
@@ -3139,6 +3439,9 @@ Plan plan(const std::string& pack_dir) {
         p.graph_ryzenai_matmuls = onnx.ryzenai_matmuls;
         p.graph_packed_siblings = onnx.packed_siblings;
         p.graph_weightless_matmuls = onnx.weightless_matmuls;
+        p.graph_weightless_matmuls_decode = onnx.weightless_matmuls_decode;
+        p.graph_decode_branch = onnx.decode_branch;
+        p.graph_branch_note = onnx.branch_note;
         for (const auto& t : onnx.tensors)
             if (!t.location.empty()) p.graph_external++;
         if (!ext_file.empty()) {
@@ -3150,12 +3453,27 @@ Plan plan(const std::string& pack_dir) {
     // The Token .fconst, found once (see find_token_fconst) and used by the attention block below. Empty means this
     // pack keeps no weights there -- which for the rai_1.3/1.6/1.7.1 line is the normal case, not a fault.
     std::string tok_why;
-    std::string tok_path = materialise_token_fconst(pack_dir, p.dims);
+    const DeclaredMap declared = read_declared(pack_dir);
+    // engine#1503: a pack whose every declared MatMulNBits is block 32 -- layers included, not only the head -- is read
+    // from its RAW .fconst with the all-block-32 layout (pack_import.h, Block32Layout). Decided here, before the
+    // canonical copy is made, because that copy is the 1.8 form of a block-128 file and is not what this path reads.
+    // A pack that declares only its head (the block-32-head fixtures, and nothing measured) is not this class.
+    {
+        bool any = false, all32 = true, layer = false;
+        for (const auto& [proj, dec] : declared) {
+            if (!dec.block) continue;
+            any = true;
+            if (dec.block != 32) all32 = false;
+            if (proj.rfind("lm_head", 0) != 0) layer = true;
+        }
+        p.block32_layers = any && all32 && layer && !find_token_fconst(pack_dir).empty();
+    }
+    std::string tok_path = p.block32_layers ? find_token_fconst(pack_dir) : materialise_token_fconst(pack_dir, p.dims);
     // engine#1671 / #1687: a pack whose graph names `*.qweight.empty` placeholders whose `*.packed` siblings carry no
     // data has no weight for those ops IN THE GRAPH. With a Token .fconst that is the normal shape of a 1.9 pack -- its
     // graph is all placeholders and the weights are in the .fconst -- so the walker drops them and the import proceeds.
     // With no .fconst there is nothing to fall back to, and the honest answer is #1687's refusal, by name.
-    if (tok_path.empty() && onnx.weightless_matmuls > 0)
+    if (tok_path.empty() && onnx.weightless_matmuls_decode > 0)
         throw std::runtime_error(
             pack_dir + ": " + onnx.weightless_example +
             ", and the pack carries no Token .fconst either (no dd_metastate_Llm_Token_*.fconst): these weights are "
@@ -3208,6 +3526,17 @@ Plan plan(const std::string& pack_dir) {
                                  {embed->dims.at(0), embed->dims.at(1)}));
     }
 
+    // engine#1503: the all-block-32 layout against the file, once the vocab is known (the head's unit count needs it).
+    if (p.block32_layers) {
+        const Block32Layout lay = block32_layout(p.dims);
+        if (!lay.why.empty()) {
+            p.block32_note = lay.why;
+        } else {
+            Fconst fc = open_fconst(tok_path);
+            p.block32_note = block32_file_refusal(fc.map, int64_t(fc.size), p.dims, lay);
+            unmap_file(fc.map, fc.size);
+        }
+    }
     // Only the node whose geometry IS the head (N = V, K = H) is the head. This loop used to take the FIRST MatMulNBits and
     // `break`, so on a pack whose first matmul is a projection the plan reported that projection's shape as
     // `lm_head.weight` -- [1152, 896], a fused qkv, instead of [151936, 896] on Qwen2.5-0.5B-Instruct 1.9 (engine#1671).
@@ -3228,14 +3557,16 @@ Plan plan(const std::string& pack_dir) {
         // there if the tail's arithmetic does not come out, so the plan does not refuse it here. Keyed on "did a graph
         // head get written", not "is the graph free of matmuls": a graph of projections only is not a pack without a head
         // (engine#1671).
-        p.tensors.push_back(make("lm_head.weight", "fconst:tail", "q4_1", {d.vocab, d.hidden}));
+        auto x = make("lm_head.weight", "fconst:tail", "q4_1", {d.vocab, d.hidden});
+        x.refusal = p.block32_note;   // empty unless an all-block-32 pack's file does not fit its layout
+        p.tensors.push_back(std::move(x));
     }
 
     // norms: the layer blocks are located by their epsilon anchors at import time, so the offsets work
     // for any hidden size (engine#734). plan() cannot prove that without reading the file, so the
     // refusal here is empty and import_pack reports what the anchors actually found.
     const std::string norm_source = "fconst:Llm_Token_Token";
-    const std::string norm_refusal;
+    const std::string norm_refusal = p.block32_note;   // empty except on an all-block-32 pack whose file does not fit
     const int64_t H = d.hidden;   // the geometry's hidden; the embedding, when the main graph has none, must match it
     // Genre A: the norms are ordinary F16 initializers named after themselves, with real offsets -- not the
     // .fconst tail envelope -- so the refusal names the initializer and where it sits.
@@ -3275,6 +3606,7 @@ Plan plan(const std::string& pack_dir) {
     // and the norm at +64, and where both .fconst files exist the two copies are byte-identical. The
     // position is confirmed at import time by the epsilon marker plus that cross-check.
     auto fin = make("model.norm.weight", norm_source, "BF16", {H});
+    fin.refusal = p.block32_note;
     p.tensors.push_back(std::move(fin));
 
     // projections: the attention payload (q/k/v/o) decodes tile by tile and the MLP section group by
@@ -3291,6 +3623,10 @@ Plan plan(const std::string& pack_dir) {
         if (tok.empty()) {
             p.attn_note = tok_why;
             p.mlp_note = p.attn_note;
+        } else if (p.block32_layers) {
+            // the all-block-32 layout is arithmetic on the geometry, checked against the file above
+            p.attn_note = p.block32_note;
+            p.mlp_note = p.block32_note;
         } else if (tile_bytes == 0) {
             p.attn_note = "hidden " + std::to_string(H) + " is not a multiple of 128, so the attention "
                                                                   "payload is not 64-row tiles of this shape";
@@ -3460,7 +3796,6 @@ Plan plan(const std::string& pack_dir) {
                           {"mlp.gate_proj", d.intermediate, d.hidden},
                           {"mlp.up_proj", d.intermediate, d.hidden},
                           {"mlp.down_proj", d.hidden, d.intermediate}};
-    const DeclaredMap declared = read_declared(pack_dir);
     // Block size gate (engine#1410 §3 of FACTS-fconst-layout): the compiler states `block_size` per MatMulNBits, and
     // this importer's tile geometry is the block-128 one -- a group is 2*(K/block)+2 subvolumes, so a block-32 pack
     // has every offset in a different place. Refusing by number beats parsing it at the 1.8 geometry, which is what
@@ -3498,7 +3833,12 @@ Plan plan(const std::string& pack_dir) {
         // calling the writer here cost a second 278 MiB rewrite per command.
         const bool fconst_weights = !find_token_fconst(pack_dir).empty();
         if (fconst_weights && !blocks.empty() && !(blocks.size() == 1 && blocks.begin()->first == kKBlock)) {
-            if (only_the_head) {
+            if (p.block32_layers) {
+                // engine#1503: every op is block 32 and the pack is read with the all-block-32 layout, which was
+                // checked against the file where `block32_layers` was decided; a file that does not fit is refused
+                // tensor by tensor with `block32_note`.
+                if (const auto it = declared.find("lm_head"); it != declared.end()) p.head_block = it->second.block;
+            } else if (only_the_head) {
                 p.head_block = declared.at(off_block[0].substr(0, off_block[0].find(" @ "))).block;
             } else {
                 // Name a few and count the rest: SmolLM2-135M has 151 off-block ops, and listing every one of them made
@@ -3515,7 +3855,9 @@ Plan plan(const std::string& pack_dir) {
                     }() + ", and this importer decodes the block-" + std::to_string(kKBlock) +
                     " tile layout only: at a different block every subvolume offset in the .fconst moves, so the "
                     "weights would be read from the wrong place, not merely mis-scaled. The off-block tensor(s) are " +
-                    list + "; only the LM head could be tolerated, because the layers come before it in the tail.");
+                    list + "; only the LM head could be tolerated, because the layers come before it in the tail. (The "
+                    "one other layout this importer reads is the all-block-32 one, and only for a pack that declares "
+                    "32 on every op.)");
             }
         }
         if (!bits.empty() && !(bits.size() == 1 && bits.begin()->first == 4))
@@ -4462,6 +4804,20 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         }
     }
 
+    // The head is the node whose geometry is the vocabulary x hidden -- but which NODE, when both `If` branches declare
+    // one? The Token .fconst is the decode path, so the decode branch's node is the one that describes it. Measured on
+    // amd/Qwen3-8B_rai_1.9.0_npu: `then_branch` (taken when Shape(input_ids) == 1, i.e. one token) holds exactly ONE
+    // MatMulNBits and it is lm_head [151936, 32, 64] at offset 15,269,888 in model.onnx.data; `else_branch` holds the
+    // 109 layer projections and an `lm_head.MatMulNBits.qweight.empty` placeholder with no bytes. The head is not the
+    // same tensor in both paths, so a walk that merges the branches reads the placeholder and falls back to the tail --
+    // and on these packs the tail is the envelope alone (8,256 B = 64 + 2*4096, no head tiles), which is how the import
+    // refused with "the head's offsets are not established" for every 4096-hidden untied pack.
+    const OnnxMatMul* head_mm = nullptr;
+    for (const auto& mm : onnx.matmuls)
+        if (mm.N == int(V) && mm.K == int(H) && is_decode_branch(onnx, mm.branch)) { head_mm = &mm; break; }
+    if (!head_mm)
+        for (const auto& mm : onnx.matmuls)
+            if (mm.N == int(V) && mm.K == int(H)) { head_mm = &mm; break; }
     for (const auto& mm : onnx.matmuls) {
         const auto wi = onnx.index.find(mm.weight), si = onnx.index.find(mm.scales);
         if (getenv("NPU_PACK_DEBUG"))
@@ -4500,6 +4856,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // which is why the imported container answered "!!!!!!!!". Only the node whose geometry IS the head is
         // taken here; the projections are imported from the graph's initializers by the block below.
         if (!(mm.N == int(V) && mm.K == int(H))) continue;
+        if (head_mm && &mm != head_mm) continue;   // a same-geometry node in the other `If` branch
         if (mm.bits != 4) throw std::runtime_error("lm_head: MatMulNBits is not 4-bit");
         const auto& wt = onnx.tensors[wi->second];
         const auto& st = onnx.tensors[si->second];
@@ -4614,6 +4971,175 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         break;
     }
 
+    // engine#1740: read a block-32 head whose first unit is at `head_off` of the Token .fconst and write it as
+    // lm_head.weight. Returns why it was NOT taken (empty when it was). On a tied pack the read has to correlate with
+    // the embedding above kTieCorr; on an untied one the structural checks are all there is, which the note states.
+    // Shared by the mixed pack (layers at 128, head at 32) and the all-block-32 pack (engine#1503).
+    auto take_block32_head = [&](const Fconst& fc, int64_t head_off) -> std::string {
+        std::string why;
+        Block32Head h32 = read_block32_head(fc.map + head_off, int64_t(fc.size) - head_off, V, H, head_off);
+        const bool is_tied = tie_declared && tied;
+        double c32 = 0.0;
+        if (h32.ok && embed_tbl.ok()) c32 = corr(h32.q, embed_tbl, int(V));
+        if (!h32.ok) {
+            why = h32.why;
+        } else if (is_tied && !(c32 > kTieCorr)) {
+            char b[160];
+            std::snprintf(b, sizeof b,
+                          "the tail's block-32 head decodes but correlates %.6f with the embedding of "
+                          "a pack that declares them tied", c32);
+            why = b;
+        } else {
+            Q4& q = h32.q;
+            std::fprintf(stderr,
+                         "  lm head: block 32, %lld unit(s) of %lld B at %lld B, %lld B of zeros after "
+                         "them%s\n",
+                         (long long)h32.units, (long long)block32_unit_bytes(H),
+                         (long long)head_off, (long long)h32.padding,
+                         is_tied ? " (tied: verified by correlation with the pack's embedding)"
+                                 : " (untied: layout checked, values not verified)");
+            if (embed_tbl.ok()) {
+                r.lmhead_corr = c32;
+                {
+                    double sum_abs = 0, sum_ref = 0;
+                    for (int n = 0; n < int(V); ++n)
+                        for (int k = 0; k < q.K; ++k) {
+                            const size_t gg = size_t(n) * (q.K / 32) + size_t(k) / 32;
+                            const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[gg] + q.zero[gg];
+                            const double e = embed_at(embed_tbl, n, k);
+                            sum_abs += std::fabs(x - e);
+                            sum_ref += std::fabs(e);
+                        }
+                    if (sum_ref > 0) r.lmhead_rel = sum_abs / sum_ref;
+                }
+                r.selfcheck_reference = true;
+                r.selfcheck_tied = c32 > kTieCorr;
+                double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
+                const int nsh = std::min(2048, int(V) - 1);
+                for (int rr = 0; rr < nsh; ++rr)
+                    for (int k = 0; k < q.K; ++k) {
+                        const size_t gg = size_t(rr) * (q.K / 32) + size_t(k) / 32;
+                        const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[gg] + q.zero[gg];
+                        const double y = embed_at(embed_tbl, rr + 1, k);
+                        sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
+                    }
+                const double m = double(nsh) * q.K;
+                const double cx = sxx - sx * sx / m, cy = syy - sy * sy / m;
+                if (m > 0 && cx > 1e-12 && cy > 1e-12)
+                    r.ctrl_corr_rowshift = (sxy - sx * sy / m) / std::sqrt(cx * cy);
+            }
+            std::vector<uint8_t> tiled;
+            long long pinexact = 0;
+            tile_q4_1_f32(q, tiled, &pinexact);
+            r.codes_total = q.codes.size();
+            r.zero_exact_pct = 100.0 * double(q.scale.size() - pinexact) / double(q.scale.size());
+            const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
+            r.tiles += head_tiles;
+            w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
+            ++r.tensors;
+            head_written = true;
+            r.head_read_note =
+                std::string("lm_head was read from the .fconst tail's block 32 head (") +
+                std::to_string(h32.units) + " units of " + std::to_string(block32_unit_bytes(H)) +
+                " B)" + (is_tied ? ", and it reproduces model.embed_tokens"
+                                 : "; the pack is untied, so its values are not verified against "
+                                   "anything in the pack");
+        }
+        return why;
+    };
+    if (p.block32_layers) {
+        // engine#1503: every MatMulNBits of this pack is block 32. The RAW Token .fconst is read with the layout in
+        // pack_import.h (Block32Layout); the offsets are arithmetic on the geometry, and plan() has already checked the
+        // file's size and every envelope's epsilon against them. The tensors written are the ones the block-128 walk
+        // below writes, in the same form. This layout has no bias field, so no bias tensor is written.
+        std::vector<std::string> late;
+        if (p.block32_note.empty()) {
+            const Block32Layout lay = block32_layout(p.dims);
+            Fconst fc = open_fconst(find_token_fconst(pack_dir));
+            // the file is re-checked on this mapping: plan() looked at its own
+            if (const std::string why = block32_file_refusal(fc.map, int64_t(fc.size), p.dims, lay); !why.empty())
+                throw std::runtime_error(fc.path + ": " + why);
+            r.stride = lay.stride;
+            r.second_header = lay.post_off;
+            if (!head_written) {
+                const std::string why = take_block32_head(fc, lay.head_off);
+                if (!why.empty()) late.push_back("lm_head.weight: " + why);
+                else r.block32_units += lay.head_units;
+            }
+            auto add_norm = [&](int64_t off, const std::string& name) {
+                w.add(name, "BF16", {H}, as_bf16(at(fc, off, H * 2), kBF16, size_t(H)));
+                ++r.tensors;
+            };
+            for (int L = 0; L < p.dims.layers; ++L) {
+                const int64_t base = int64_t(L) * lay.stride;
+                r.norm_anchors_total += 2;
+                r.norm_anchors_ok += int(eps_at(fc, base, p.dims.eps_bits)) +
+                                     int(eps_at(fc, base + lay.post_off, p.dims.eps_bits));
+                add_norm(base + kNormOff, "model.layers." + std::to_string(L) + ".input_layernorm.weight");
+                add_norm(base + lay.post_off + kNormOff,
+                         "model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");
+            }
+            add_norm(lay.tail_off + kNormOff, "model.norm.weight");
+            r.final_norm_imported = true;
+            if (!find_one(pack_dir, "dd_metastate_Llm_Prefill_", ".fconst").empty())
+                r.fconst_note = "the pack ships a prefill .fconst, and its copy of the final norm is not compared on "
+                                "the all-block-32 path";
+            const int64_t q_out = int64_t(p.dims.heads) * p.dims.head_dim,
+                          kv_out = int64_t(p.dims.kv_heads) * p.dims.head_dim, IM = p.dims.intermediate;
+            long long attn_inexact = 0, attn_groups = 0, mlp_inexact = 0, mlp_groups = 0;
+            auto emit = [&](Q4& q, const std::string& name, bool mlp) {
+                std::vector<uint8_t> tiled;
+                long long pinexact = 0;
+                tile_q4_1_f32(q, tiled, &pinexact);
+                (mlp ? mlp_inexact : attn_inexact) += pinexact;
+                (mlp ? mlp_groups : attn_groups) += (long long)q.scale.size();
+                const int64_t nt = int64_t(tiled.size() / kImportTileBytes);
+                r.tiles += nt;
+                w.add(name + ".weight", "I8", {nt, kImportTileBytes}, std::move(tiled));
+                ++r.tensors;
+                ++(mlp ? r.mlp_projections : r.attn_projections);
+            };
+            struct Slot { const char* proj; int64_t off, rows, k; bool mlp; };
+            const Slot slots[] = {{"self_attn.q_proj", lay.q_off, q_out, H, false},
+                                  {"self_attn.k_proj", lay.k_off, kv_out, H, false},
+                                  {"self_attn.v_proj", lay.v_off, kv_out, H, false},
+                                  {"self_attn.o_proj", lay.o_off, H, q_out, false},
+                                  {"mlp.down_proj", lay.down_off, H, IM, true}};
+            for (int L = 0; L < p.dims.layers; ++L) {
+                const int64_t base = int64_t(L) * lay.stride;
+                const std::string layer = "model.layers." + std::to_string(L) + ".";
+                for (const auto& sl : slots) {
+                    Block32Units u = read_block32_units(fc.map + base + sl.off, int64_t(fc.size) - base - sl.off,
+                                                        sl.rows, sl.k, sl.proj, base + sl.off);
+                    if (!u.ok) {
+                        late.push_back(layer + sl.proj + ".weight: " + u.why);
+                        continue;
+                    }
+                    r.block32_units += u.units;
+                    emit(u.q, layer + sl.proj, sl.mlp);
+                }
+                Block32GateUp gu = read_block32_gate_up(fc.map + base + lay.gu_off,
+                                                        int64_t(fc.size) - base - lay.gu_off, IM, H, base + lay.gu_off);
+                if (!gu.ok) {
+                    late.push_back(layer + "mlp.gate_proj.weight: " + gu.why);
+                    late.push_back(layer + "mlp.up_proj.weight: " + gu.why);
+                    continue;
+                }
+                r.block32_units += gu.units;
+                emit(gu.gate, layer + "mlp.gate_proj", true);
+                emit(gu.up, layer + "mlp.up_proj", true);
+            }
+            r.attn_zero_inexact_pct = attn_groups ? 100.0 * double(attn_inexact) / double(attn_groups) : 0.0;
+            r.mlp_zero_inexact_pct = mlp_groups ? 100.0 * double(mlp_inexact) / double(mlp_groups) : 0.0;
+            unmap_file(fc.map, fc.size);
+        } else {
+            r.fconst_note = p.block32_note;   // every .fconst tensor is already refused by name with this
+        }
+        if (!late.empty()) {
+            for (auto& s : late) r.refused.push_back(std::move(s));
+            if (!opt.allow_incomplete) return r;  // nothing has been written yet
+        }
+    } else
     {
         std::string path_why;
         const std::string path = materialise_token_fconst(pack_dir, p.dims);
@@ -4656,76 +5182,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     if (tail_off + env > int64_t(fc.size)) {
                         head32_why = "the .fconst ends before the tail's envelope";
                     } else {
-                        Block32Head h32 = read_block32_head(fc.map + tail_off + env, int64_t(fc.size) - tail_off - env,
-                                                            V, H);
-                        const bool is_tied = tie_declared && tied;
-                        double c32 = 0.0;
-                        if (h32.ok && embed_tbl.ok()) c32 = corr(h32.q, embed_tbl, int(V));
-                        if (!h32.ok) {
-                            head32_why = h32.why;
-                        } else if (is_tied && !(c32 > kTieCorr)) {
-                            char b[160];
-                            std::snprintf(b, sizeof b,
-                                          "the tail's block-32 head decodes but correlates %.6f with the embedding of "
-                                          "a pack that declares them tied", c32);
-                            head32_why = b;
-                        } else {
-                            Q4& q = h32.q;
-                            std::fprintf(stderr,
-                                         "  lm head: block 32, %lld unit(s) of %lld B at %lld B, %lld B of zeros after "
-                                         "them%s\n",
-                                         (long long)h32.units, (long long)block32_unit_bytes(H),
-                                         (long long)(tail_off + env), (long long)h32.padding,
-                                         is_tied ? " (tied: verified by correlation with the pack's embedding)"
-                                                 : " (untied: layout checked, values not verified)");
-                            if (embed_tbl.ok()) {
-                                r.lmhead_corr = c32;
-                                {
-                                    double sum_abs = 0, sum_ref = 0;
-                                    for (int n = 0; n < int(V); ++n)
-                                        for (int k = 0; k < q.K; ++k) {
-                                            const size_t gg = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                                            const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[gg] + q.zero[gg];
-                                            const double e = embed_at(embed_tbl, n, k);
-                                            sum_abs += std::fabs(x - e);
-                                            sum_ref += std::fabs(e);
-                                        }
-                                    if (sum_ref > 0) r.lmhead_rel = sum_abs / sum_ref;
-                                }
-                                r.selfcheck_reference = true;
-                                r.selfcheck_tied = c32 > kTieCorr;
-                                double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
-                                const int nsh = std::min(2048, int(V) - 1);
-                                for (int rr = 0; rr < nsh; ++rr)
-                                    for (int k = 0; k < q.K; ++k) {
-                                        const size_t gg = size_t(rr) * (q.K / 32) + size_t(k) / 32;
-                                        const double x = double(q.codes[size_t(rr) * q.K + k]) * q.scale[gg] + q.zero[gg];
-                                        const double y = embed_at(embed_tbl, rr + 1, k);
-                                        sxy += x * y; sx += x; sy += y; sxx += x * x; syy += y * y;
-                                    }
-                                const double m = double(nsh) * q.K;
-                                const double cx = sxx - sx * sx / m, cy = syy - sy * sy / m;
-                                if (m > 0 && cx > 1e-12 && cy > 1e-12)
-                                    r.ctrl_corr_rowshift = (sxy - sx * sy / m) / std::sqrt(cx * cy);
-                            }
-                            std::vector<uint8_t> tiled;
-                            long long pinexact = 0;
-                            tile_q4_1_f32(q, tiled, &pinexact);
-                            r.codes_total = q.codes.size();
-                            r.zero_exact_pct = 100.0 * double(q.scale.size() - pinexact) / double(q.scale.size());
-                            const int64_t head_tiles = int64_t(tiled.size() / kImportTileBytes);
-                            r.tiles += head_tiles;
-                            w.add("lm_head.weight", "I8", {head_tiles, kImportTileBytes}, std::move(tiled));
-                            ++r.tensors;
-                            head_written = true;
-                            head32_read = true;
-                            r.head_read_note =
-                                std::string("lm_head was read from the .fconst tail's block 32 head (") +
-                                std::to_string(h32.units) + " units of " + std::to_string(block32_unit_bytes(H)) +
-                                " B)" + (is_tied ? ", and it reproduces model.embed_tokens"
-                                                 : "; the pack is untied, so its values are not verified against "
-                                                   "anything in the pack");
-                        }
+                        head32_why = take_block32_head(fc, tail_off + env);
+                        head32_read = head32_why.empty();
                     }
                 }
                 if (head32_read) {
@@ -5533,9 +5991,12 @@ int run(int argc, char** argv) {
                     r.mlp_groups_ok, r.mlp_groups_total, r.mlp_projections,
                     100.0 - r.mlp_zero_inexact_pct);
     if (r.stride)
-        std::printf("  fconst:     stride %lld, second header %lld (measured from the eps anchors); "
+        std::printf("  fconst:     stride %lld, second header %lld (%s); "
                     "%d/%d RMSNorm anchors found, final norm %s\n",
-                    (long long)r.stride, (long long)r.second_header, r.norm_anchors_ok,
+                    (long long)r.stride, (long long)r.second_header,
+                    r.block32_units ? "computed from the geometry, checked at the eps anchors"
+                                    : "measured from the eps anchors",
+                    r.norm_anchors_ok,
                     r.norm_anchors_total,
                     !r.final_norm_imported
                         ? "REFUSED (no readable tail envelope)"
@@ -5543,6 +6004,11 @@ int run(int argc, char** argv) {
                                                       ? "identical in both .fconst tails"
                                                       : "taken from the Token_Token tail -- the two copies DISAGREE")
                                                : "taken from the tail envelope (the pack ships no prefill copy)"));
+    if (r.block32_units)
+        std::printf("  block 32:   every MatMulNBits is block 32: %d attention + %d MLP projections and the head read "
+                    "from %lld units of the raw .fconst (zero fields, finite scales and epsilon anchors checked; this "
+                    "path has no decode->encode round trip)\n",
+                    r.attn_projections, r.mlp_projections, r.block32_units);
     if (!r.fconst_note.empty()) std::printf("  fconst:     %s\n", r.fconst_note.c_str());
     if (!r.refused.empty()) std::printf("  incomplete: %zu tensors, listed in %s/model.q4nx\n",
                                         r.refused.size(), out.c_str());

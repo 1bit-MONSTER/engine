@@ -3050,7 +3050,17 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     //    different model: it answered "ikt" to "The capital of France is" and then locked onto one token;
     //  * the image and its per-column scales are cached per (wkey, K, N), because quantising 7B per call cost
     //    7.5 G scalar operations and the arm never finished a token in a 9-minute ticket.
-    const auto key = std::make_tuple(wkey, K, N);
+    // Keyed by the WEIGHT POINTER, not by `wkey`: `wkey` is a weight-cache role key (0, 1, 2, 4 -- QKV, O,
+    // GU, D), so every layer shares it, and keying by it made layer 1 onward reuse layer 0's codes. Measured
+    // 2026-11-10 with the per-GEMM A/B: layers 0's four GEMMs at cos 0.9993-0.99999 and **390 further calls
+    // at cos ~0 or negative**, with the residual exploding to 3300x the reference by layer 29. The pointer
+    // identifies the tensor in host mode, where the model owns its weights for the process's life.
+    // Keyed by (layer, role/weight key, K, N). Neither `wkey` alone nor the weight POINTER works: `wkey` is a
+    // weight-cache ROLE key shared by every layer (0, 1, 2, 4 -- QKV, O, GU, D), and in host mode the caller
+    // dequantises each layer into the same per-role scratch, so the pointer repeats too. Measured 2026-11-10 with
+    // the per-GEMM A/B: with either of those keys, layer 0's four GEMMs came out at cos 0.9993-0.99999 and the
+    // 386 calls after them at cos ~0 or negative, with the residual stream exploding to 3300x the reference.
+    const auto key = std::make_tuple(cur_layer_, wkey, K, N);
     auto it = host_i8_cache_.find(key);
     if (it == host_i8_cache_.end()) {
         HostI8Tensor t;
@@ -3062,24 +3072,31 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         it = host_i8_cache_.emplace(key, std::move(t)).first;
     }
     const HostI8Tensor& t = it->second;
+    std::vector<float> padded_a;
     // One-GEMM A/B (engine#1830): with NPU_DBG_I8_AB set, compare this arm's output against the f32 GEMM for the
     // SAME activation and the SAME tensor. cos ~0.99 means the layout and scales are right and a remaining
     // degeneracy is an integration issue; cos ~0 means the operands are still wrong. Host only, first few calls.
-    const bool ab = getenv("NPU_DBG_I8_AB") != nullptr && dbg_i8_ab_ < 4;
+    const bool ab = getenv("NPU_DBG_I8_AB") != nullptr && dbg_i8_ab_ < 400;
     std::vector<float> ab_ref;
     if (ab) { ab_ref.assign((size_t)M * (size_t)N, 0.0f); q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, ab_ref.data()); }
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
+        // The caller's row is `a_k` wide and laid out at stride `a_k`; the GEMM contracts over K. That is the
+        // whole reason q4nx_host_gemm_f32_padded() exists (engine#845): reading a[k] for k < K straight out of an
+        // a_k-wide buffer runs off the row into the next one. So pad onto a K-wide row first, exactly as the f32
+        // arm does, and quantise from that.
         const float* a = A + (size_t)m * (size_t)a_k;
+        padded_a.assign((size_t)K, 0.0f);
+        for (int k = 0; k < (a_k < K ? a_k : K); k++) padded_a[(size_t)k] = a[k];
         float amax = 0.0f;
         for (int k = 0; k < K; k++) {
-            const float v = std::fabs(a[k]);
+            const float v = std::fabs(padded_a[(size_t)k]);
             if (std::isfinite(v) && v > amax) amax = v;
         }
         const float ascale = (amax >= 1e-12f) ? amax / 127.0f : 1.0f;
         const float tis = 1.0f / ascale;
         for (int k = 0; k < K; k++) {
-            float v = a[k];
+            float v = padded_a[(size_t)k];
             if (!std::isfinite(v)) v = 0.0f;
             int q = (int)std::round(v * tis);
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
@@ -3100,8 +3117,10 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
             md = std::max(md, std::fabs(a - b));
         }
         const double cos = dot / (std::sqrt(na * nb) + 1e-30);
-        std::fprintf(stderr, "[i8ab] wkey=%d K=%d N=%d cos(i8,f32)=%.6f max|d|=%.6g ref[0]=%g i8[0]=%g\n",
-                     wkey, K, N, cos, md, (double)ab_ref.empty() ? 0.0 : (double)ab_ref[0], (double)out[0]);
+        if (cos < 0.999 || dbg_i8_ab_ < 4)
+            std::fprintf(stderr, "[i8ab] call=%d wkey=%d K=%d N=%d cos(i8,f32)=%.6f max|d|=%.6g ref[0]=%g i8[0]=%g\n",
+                         dbg_i8_ab_, wkey, K, N, cos, md,
+                         ab_ref.empty() ? 0.0 : (double)ab_ref[0], (double)out[0]);
         dbg_i8_ab_++;
     }
 }

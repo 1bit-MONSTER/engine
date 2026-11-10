@@ -243,7 +243,7 @@ private:
     struct HostI8Tensor { int groups = 0; int N = 0; std::vector<int8_t> codes; std::vector<float> d; };
     // Keyed by (wkey, K, N): a wkey alone is not enough -- a second tensor with the same key and a
     // different shape would reuse the first one's codes.
-    std::map<std::tuple<int, int, int>, HostI8Tensor> host_i8_cache_;
+    std::map<std::tuple<int, int, int, int>, HostI8Tensor> host_i8_cache_;   // (layer, wkey, K, N)
     int dbg_i8_ab_ = 0;   // NPU_DBG_I8_AB: one-GEMM A/B against the f32 arm
     void host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat, int wkey, float* out);
     bool load_layer(int l);

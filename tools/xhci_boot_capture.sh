@@ -32,7 +32,9 @@
 # needs root and is therefore the one part that will say so if it cannot read.
 #
 # usage: tools/xhci_boot_capture.sh [outdir]
-#   default outdir: /data/xhci-capture-<YYYYmmdd-HHMMSS> when /data is writable, else /tmp/...
+#   default outdir: /data/xhci-capture-<YYYYmmdd-HHMMSS> when /data is writable, else
+#   ${XDG_CACHE_HOME:-$HOME/.cache}/1bit/captures. NEVER /tmp: on strixhalo /tmp is tmpfs,
+#   so a capture written there is RAM held until reboot (engine#2027's rule).
 # exit: 0 captured, 2 not root and sudo unavailable, 3 cannot write
 set -u
 
@@ -49,7 +51,13 @@ fi
 stamp=$(date +%Y%m%d-%H%M%S)
 out=${1:-}
 if [ -z "$out" ]; then
-    if [ -d /data ] && [ -w /data ]; then out=/data/xhci-capture-$stamp; else out=/tmp/xhci-capture-$stamp; fi
+    if [ -d /data ] && [ -w /data ]; then
+        out=/data/xhci-capture-$stamp
+    else
+        # engine#2027: NOT /tmp. On this box /tmp is tmpfs, so a capture there is RAM held until reboot;
+        # the cache directory is on disk and is where the fconst and q4nx caches already live.
+        out=${XDG_CACHE_HOME:-$HOME/.cache}/1bit/captures/xhci-$stamp
+    fi
 fi
 mkdir -p "$out" 2>/dev/null || { say "xhci_boot_capture: cannot write $out" >&2; exit 3; }
 

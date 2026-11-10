@@ -81,10 +81,21 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
 > **Between about 21:0x and 23:1x on 2026-11-09 this job failed on every branch, and a red badge was not a signal** (engine #1733).
 > Three errors sat in `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as
 > `bool`, and two declarations that differ only in return type — on every branch measured (five of them), and #1681's pin bump
-> failed the same way at 9m15s while its `build` was green. The window is closed: later runs pass, including one whose pins are
-> **exactly `main`'s** (`bump-hrx/831629fe`, 00:21, `llama.cpp` `831629fe9` + `hrx-system` `7f4236924`), so the failure was not a
-> property of the pins in the tree — which is what the same pins failing four hours earlier had seemed to say. Read a red badge as
-> meaningful again; if it returns, that run's own log is the evidence, not the earlier window.
+> failed the same way at 9m15s while its `build` was green. It was a property of the pin, and the pins say so:
+>
+> | | `hrx-system` | `llama.cpp` | result |
+> |---|---|---|---|
+> | red window, 21:06 (`fix/1696`, run 42699357566) | `7f4236924` | **`8f124f906`** | failure |
+> | green, 00:21 (`bump-hrx/831629fe`, run 42727646749) | `7f4236924` | **`831629fe9`** | success |
+>
+> `hrx-system` is the same on both and `llama.cpp` is not. At `8f124f906`, `ggml-hrx.cpp` declares `device_free_total`
+> twice — `void` from #252's forward declaration at `:383`, `bool` from #240's eight hundred lines later — so the
+> translation unit cannot compile; #1759 replaced that pin with `831629fe` and the job has been green since. The window
+> closed because the pin moved, not because the failure was transient.
+>
+> So read a red badge as meaningful, and treat a `llama.cpp` bump whose run leaves `hrx_build` red as a bump that has not
+> landed — which is what the `hw-gate` label is for, and what #1768 did before merging (`hrx_build` pass, 1m10s). If a red
+> run ever returns without the pin changing, that run's own log is the evidence.
 
 ## What it checks
 

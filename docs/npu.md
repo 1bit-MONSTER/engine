@@ -1136,6 +1136,17 @@ their hidden sizes differ). `plan()` accepts a block of 2 or 4 headers, checks e
 that arithmetic to the byte, and refuses any other count by name. FACTS §7.24 has the tables and
 the checkpoint evidence.
 
+**A 2-header block can carry the gains too, in the other order** (engine#1889, engine#1934). The
+Hunyuan packs declare `use_qk_norm: true` and keep one header per block: the gains are the 640 B
+between the last q/k/v tile and o_proj, which the pack's metadata names as one tensor
+(`model.layers.L.attn.q_norm.layernorm.weight.qk_rms_packed_26_L`, bf16 `[320]`). Its layout is
+`[64 B zeros][q_norm, bf16 [128]][64 B zeros][k_norm, bf16 [128]]` — **q first**, the reverse of
+the Qwen3 sections above. The order is not readable from the bytes (the two gains differ by about
+one bf16 ulp in a few elements, so both look like a gain), so it was taken from the pack's own
+graph: `model.onnx` carries `attn.q_norm.layernorm.weight` and `attn.k_norm.layernorm.weight` as
+FP16 `[128]` initializers, and on Hunyuan-7B-Instruct their bf16 rounding is the first and the
+second block bit for bit in 32 of 32 layers. `qk_gain_offsets()` holds that arithmetic.
+
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
 one comparison holds every field, index and nibble order at once, and it is why a tile whose

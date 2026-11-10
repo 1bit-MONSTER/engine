@@ -2483,10 +2483,10 @@ struct BatchPhases {
         const double row = M > 0 ? (double)M : 1.0;
         std::fprintf(stderr,
                      "[bl] M=%2d gdn %7.1f ab %7.1f core %7.1f attn %6.1f mlp %6.1f rms %5.1f "
-                     "res %5.1f gemm %7.1f head %6.1f | per row: gdn %6.1f attn %5.1f "
+                     "res %5.1f gemm %7.1f head %6.1f deq %6.1f | per row: gdn %6.1f attn %5.1f "
                      "gemm %6.1f head %5.1f\n",
                      M, ms(LH_GDN), ms(LH_GDN_AB), ms(LH_GDN_CORE), ms(LH_ATTN), ms(LH_MLP),
-                     ms(LH_RMS), ms(LH_RES), gemm, ms(LH_HEAD_ROWS),
+                     ms(LH_RMS), ms(LH_RES), gemm, ms(LH_HEAD_ROWS), ms(LH_DEQ_OUT),
                      ms(LH_GDN) / row, ms(LH_ATTN) / row, gemm / row, ms(LH_HEAD_ROWS) / row);
     }
 };

@@ -540,6 +540,15 @@ endif()
              COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh $<TARGET_FILE:onebit>
                      "${ONEBIT_SERVE_TEST_GGUF}" cpu)
     set_tests_properties(serve_context_limit_cpu PROPERTIES SKIP_RETURN_CODE 77)
+# engine#1779 fault 3 ("wrong vectors from embed-gemma"): tested on the route where OUR code computes the vector -
+# `serve.cpp:2264 if (embed_serve::container(model))` serves a container directory in-process - not on the
+# `rag_launch()` proxy, where the numbers come from a delegated llama-server. Same registration rule as the two
+# above (outside both guards, skip 77 when unset); ONEBIT_EMBED_TEST_CONTAINER names a directory holding model.embed.
+set(ONEBIT_EMBED_TEST_CONTAINER "" CACHE PATH "1-bit encoder container (.embed dir) the embed-vector test loads")
+add_test(NAME serve_embed_vectors_cpu
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_embed_vectors_test.sh $<TARGET_FILE:onebit>
+                 "${ONEBIT_EMBED_TEST_CONTAINER}" cpu)
+set_tests_properties(serve_embed_vectors_cpu PROPERTIES SKIP_RETURN_CODE 77)
 
 # ── DwarfStar is gone (owner 2026-11-01, removed 2026-11-02) ───────────────
 # `--device ds4` ran DwarfStar (third_party/ds4: antirez's CUDA kernels behind a HIP shim plus

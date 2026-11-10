@@ -32,6 +32,12 @@ loop made first).
 
 Documentation is deliberately NOT a reference: a sentence in a `.md` that names a test is not something that runs it.
 
+A second, NARROW rule covers `tools/` (engine#1901): a tool that DECLARES a self-test (`--self-test`) and is registered
+nowhere is a self-test nobody runs -- the same defect one directory over. It is deliberately not a blanket rule over
+`tools/*.py`: 16 of 60 sampled tools are referenced by nothing by design, because most are invoked by hand, and a row
+that fails on them is a row someone disables. What is not defensible is a file that advertises verifiability and never
+gets verified.
+
 The allow-list is `tools/ci/unreferenced_tests.txt`, one basename per line with an optional `# reason` -- the same
 shape as `add_test_gaps.txt`. An entry that no longer needs to be there is reported so the list can shrink, which
 keeps it honest rather than accumulating.
@@ -104,6 +110,25 @@ def check(root):
         print("tests_referenced: cannot tell: no tests/ directory under %s" % root, file=sys.stderr)
         return 2
     need = sorted(p.name for p in tests.glob("*.sh"))
+    # engine#1901: ... plus any tools/*.py that advertises a self-test. KNOWN LIMITATION, measured on the tree that
+    # motivated this: `tools/mtp_head_pb16i_exact.py` imports `mtp_head_ref` and its docstring says the reference step
+    # "is run twice", and neither runs `mtp_head_ref.py --self-test` -- so a mention or an import satisfies this rule
+    # without the self-test ever executing. Tightening it to require a `--self-test` on the same line was tried and is
+    # WRONG in the other direction: `tools/seal_manifest.py` advertises a self-test but is exercised through its
+    # subcommands by tests/seal_manifest_test.sh, so the strict form flags a tool that genuinely runs. A row that
+    # produces false positives is a row someone disables, so this reports what it can prove and the import-only case
+    # stays a known gap (engine#1901).
+    tool_self = []
+    tools = root / "tools"
+    if tools.is_dir():
+        for p in sorted(tools.glob("*.py")):
+            try:
+                text = p.read_text(errors="replace")
+            except OSError:
+                continue
+            if "--self-test" in text or "self_test" in text:
+                tool_self.append(p.name)
+                need.append(p.name)
     allow = allow_list(root)
     found = referenced(root, need)
     drift = [n for n in need if not found[n] and n not in allow]
@@ -119,7 +144,7 @@ def check(root):
               % (name, ALLOW))
     if drift or gone or idle:
         return 1
-    print("tests_referenced: all %d test script(s) are referenced%s" % (
+    print("tests_referenced: all %d required script(s) are referenced%s" % (
         len(need), "" if not allow else " (%d deliberately not a row: %s)" % (len(allow), ", ".join(sorted(allow)))))
     return 0
 
@@ -180,6 +205,23 @@ def self_test():
     r = root_with({"tests/keeper2.sh": "#!/bin/sh\n", "CMakeLists.txt": "",
                    str(ALLOW): "tests/keeper2.sh   # path form is accepted\n"})
     cases.append(("a path-form allow entry is accepted", check(r), 0, None))
+
+    # 8a. a tool that declares a self-test and nobody runs -> drift (engine#1901)
+    r = root_with({"tests/one.sh": "#!/bin/sh\n", "CMakeLists.txt": "tests/one.sh\n",
+                   "tools/lonely_tool.py": 'if "--self-test" in sys.argv: pass\n'})
+    cases.append(("a tool that declares a self-test and is unregistered is drift", check(r), 1, "lonely_tool.py"))
+    cases_root["a tool that declares a self-test and is unregistered is drift"] = r
+
+    # 8b. ... and registered -> clean
+    r = root_with({"tests/one.sh": "#!/bin/sh\n", "CMakeLists.txt": "tests/one.sh\n",
+                   "tools/used_tool.py": 'if "--self-test" in sys.argv: pass\n'})
+    cases.append(("a registered tool self-test counts", check(r), 1, "used_tool.py"))
+    cases_root["a registered tool self-test counts"] = r
+
+    # 8c. THE NARROWNESS: a tool with NO self-test may be unreferenced -- most are invoked by hand
+    r = root_with({"tests/one.sh": "#!/bin/sh\n", "CMakeLists.txt": "tests/one.sh\n",
+                   "tools/cli_only.py": "print('run me by hand')\n"})
+    cases.append(("a hand-invoked tool with no self-test is not drift", check(r), 0, None))
 
     # 8. no tests/ at all -> cannot tell, not "clean"
     r = root_with({"CMakeLists.txt": ""})

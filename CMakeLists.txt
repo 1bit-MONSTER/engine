@@ -304,6 +304,10 @@ add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
 add_python_test(tests_referenced ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(tests_referenced_self ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --self-test)
+# engine#1901: a tool that advertises a self-test and is registered nowhere is a self-test nobody runs. This is the one such
+# file the #1824 sweep found; its self-test needs no pack, no network and no device, and passes by hand, so it becomes a
+# row rather than an allow-list entry.
+add_python_test(whisper_encoder_baseline_self ${CMAKE_SOURCE_DIR}/tools/whisper_encoder_baseline.py --self-test)
 # engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
 add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three

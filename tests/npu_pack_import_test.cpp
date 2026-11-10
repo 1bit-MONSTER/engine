@@ -2901,10 +2901,62 @@ void test_embedding_f32_component(const std::string& root) {
     std::string why2;
     const std::vector<float> none = pi::read_embedding_component(b.string(), &why2);
     std::printf("f32 embedding (per-layer): %zu values, why: %s\n", none.size(), why2.c_str());
-    check(none.empty() && why2.find("per_layer") != std::string::npos,
-          "f32 embedding: a per-layer table is refused by NAME, not reported as a missing table (" + why2 + ")");
+    check(!none.empty(),
+          "f32 embedding: a per-layer table no longer blocks the TOKEN table (slice 2 handles it; " + why2 + ")");
     fs::remove_all(a);
     fs::remove_all(b);
+}
+
+
+// engine#1725: a multi-component embedding carries a PER-LAYER table and its projection norm beside the token table, and
+// the importer writes both into the container so the forward path can gather them. Measured shapes on
+// amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: embed_tokens.weight (262144,1536) f32,
+// embed_tokens_per_layer.weight (262144,8960) f32, per_layer_projection_norm.weight (256,) -- all f32, no scales.
+// This drives the writer on a crafted pack of that shape (V=4, width=6) and reads the container header back.
+void test_per_layer_container(const std::string& root) {
+    const fs::path dir = fs::path(root) / "perlayer";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "embedding");
+    const int64_t V = 4, width = 6;
+    // two-arg form: `norm(size_t(width))` parses as a function declaration and `norm{size_t(width)}` is an
+    // initializer_list of ONE element = width. Both mistakes produce a plausible-looking fixture.
+    std::vector<float> tok(size_t(V) * 3, 0.0f), per(size_t(V) * size_t(width), 0.0f), norm(size_t(width), 0.0f);
+    for (size_t i = 0; i < tok.size(); ++i) tok[i] = float(i) * 0.5f;
+    for (size_t i = 0; i < per.size(); ++i) per[i] = float(int(i) - 8) * 0.25f;
+    for (size_t i = 0; i < norm.size(); ++i) norm[i] = 1.0f + float(i) * 0.125f;
+    std::string data;
+    const size_t tok_bytes = tok.size() * 4, per_bytes = per.size() * 4;
+    data.append(reinterpret_cast<const char*>(tok.data()), tok_bytes);
+    data.append(reinterpret_cast<const char*>(per.data()), per_bytes);
+    data.append(reinterpret_cast<const char*>(norm.data()), norm.size() * 4);
+    put_file((dir / "embedding" / "model.onnx.data").string(), data);
+    put_file((dir / "embedding" / "model.onnx").string(),
+             pb::model({pb::tensor("embedding.embed_tokens.weight", {V, 3}, "model.onnx.data", 0, tok_bytes, 1),
+                        pb::tensor("embedding.embed_tokens_per_layer.weight", {V, width}, "model.onnx.data", tok_bytes,
+                                   per_bytes, 1),
+                        pb::tensor("embedding.per_layer_projection_norm.weight", {width}, "model.onnx.data",
+                                   tok_bytes + per_bytes, norm.size() * 4, 1)},
+                       {}));
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"type":"gemma4","embedding":{"filename":"embedding/model.onnx"},)"
+             R"("decoder":{"filename":"decoder/model.onnx"}}})");
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"gemma4","hidden_size":3,"intermediate_size":6,"num_hidden_layers":1,)"
+             R"("num_attention_heads":1,"num_key_value_heads":1,"head_dim":3,"vocab_size":4,"rope_theta":10000.0})");
+    std::string why;
+    const pi::EmbedPerLayer pl = pi::read_embedding_per_layer(dir.string(), &why);
+    std::printf("per-layer: V %lld width %lld, why: %s (tok %zu per %zu norm %zu bytes)\n", (long long) pl.V,
+                (long long) pl.width, why.c_str(), tok_bytes, per_bytes, norm.size() * 4);
+    check(pl.ok(), "per-layer: the table and its projection norm are read from the component genai_config.json names");
+    bool same = pl.ok() && pl.table.size() == per.size();
+    for (size_t i = 0; same && i < per.size(); ++i) same = pl.table[i] == per[i];
+    for (size_t i = 0; same && i < norm.size(); ++i) same = pl.norm[i] == norm[i];
+    check(same, "per-layer: the values come back exactly as the component states them");
+    // the token table is still this reader's other half: it must NOT be refused because a per-layer table is present
+    std::string why2;
+    const std::vector<float> t = pi::read_embedding_component(dir.string(), &why2);
+    check(t.size() == size_t(V) * 3, "per-layer: the token table still reads beside it (" + std::to_string(t.size()) + ")");
+    fs::remove_all(dir);
 }
 
 int main(int argc, char** argv) {
@@ -2947,6 +2999,7 @@ int main(int argc, char** argv) {
         test_im_from_node_attrs(golden_dir.empty() ? "." : golden_dir);
         test_fconst_in_component(golden_dir.empty() ? "." : golden_dir);
         test_embedding_in_component(golden_dir.empty() ? "." : golden_dir);
+        test_per_layer_container(golden_dir.empty() ? "." : golden_dir);
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);

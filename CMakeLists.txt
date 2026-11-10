@@ -1131,6 +1131,14 @@ target_link_libraries(npu_stop_tokens_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME npu_stop_tokens COMMAND npu_stop_tokens_test)
 add_dependencies(npu_sampling_test npu_stop_tokens_test)
 
+# The hand-off between the thread that generates a streamed reply and the one that writes it (app/stream_bridge.h,
+# engine#1785: the NPU route sent every frame after the generation ended). Two threads and a clock; no device.
+add_executable(stream_bridge_test tests/stream_bridge_test.cpp)
+target_include_directories(stream_bridge_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+target_link_libraries(stream_bridge_test PRIVATE Threads::Threads)
+add_test(NAME stream_bridge COMMAND stream_bridge_test)
+add_dependencies(npu_sampling_test stream_bridge_test)
+
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
 add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)

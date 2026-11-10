@@ -2791,6 +2791,7 @@ void test_fconst19_rule_table() {
             {3584, 28, 28, 7232, 8, 1, 1009664},     // the Qwen2.5-7B family, measured on two models
             {2048, 16, 36, 4160, 9, 1, 295936},      // Qwen2.5_3B_Instruct
             {4096, 32, 32, 12608, 5, 1, 2297856},    // Mistral-7B-Instruct-v0.2
+            {4096, 32, 36, 12608, 5, 1, 2297856},    // Qwen3-8B (measured against ..._rai_1.8.0_npu_16K)
             {3072, 24, 28, 10560, 4, 1, 1740800},    // Llama-3.2-3B (and -Instruct)
         };
         const int want_n = (int)(sizeof(want) / sizeof(want[0]));

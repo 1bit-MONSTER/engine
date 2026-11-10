@@ -2070,6 +2070,18 @@ std::string Plan::manifest() const {
                                         {"rule", "length == N * (K/128 + 1) * 68"}};
         j["graph_weights"] = g;
     }
+    // engine#1786 (item F1): a FastFlowLM NPU2 model source has no graph, so the census above is absent and this is
+    // what `info` reports instead -- a count and a dtype map taken from the container's own header, plus what the genre
+    // still needs. Measured on FastFlowLM/Gemma3-270M-NPU2 (0.54 GB): 237 tensors, 0.503 GB, {BF16: 110, I8: 127}.
+    if (container_tensors >= 0) {
+        json c;
+        c["format"] = "safetensors (model.q4nx)";
+        c["tensors"] = container_tensors;
+        c["payload_bytes"] = container_payload_bytes;
+        c["dtypes"] = container_dtypes;
+        c["note"] = container_note;
+        j["container"] = c;
+    }
     j["mlp_section"] = {{"gate_up_units_measured", mlp_gu_units},
                         {"down_groups_measured", mlp_down_groups},
                         {"note", mlp_note}};
@@ -2086,6 +2098,29 @@ Plan plan(const std::string& pack_dir) {
     Plan p;
     p.dir = pack_dir;
     p.pack = fs::path(pack_dir).lexically_normal().filename().string();
+
+    // engine#1786 (item F1): the FastFlowLM NPU2 model sources are a safetensors container named model.q4nx with no
+    // graph at all. Detect that genre before anything looks for a graph, report what the container holds, and say what
+    // it still needs -- the alternative is the first byte failing with "cannot open <pack>/model.onnx", which describes
+    // a missing file on a pack that has no graph by design.
+    {
+        std::error_code ec;
+        const std::string container = pack_dir + "/model.q4nx";
+        const std::string graph_now = graph_filename(pack_dir);
+        if (fs::exists(container, ec) && !fs::exists(pack_dir + "/" + graph_now, ec)) {
+            const Q4nxContainer c = read_q4nx_container(container);
+            p.container_tensors = int64_t(c.tensors.size());
+            p.container_payload_bytes = c.payload_bytes;
+            for (const auto& t : c.tensors) p.container_dtypes[t.dtype]++;
+            p.container_note = c.why.empty()
+                ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +
+                      " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph. Reading it as a"
+                      " weights source needs the container-genre plan (engine#1786, item F1); until then this pack is"
+                      " recognised and reported, not importable."
+                : "model.q4nx is present but unreadable: " + c.why;
+            return p;
+        }
+    }
 
     std::string geom_src;
     json geom = load_geometry(pack_dir, &geom_src);

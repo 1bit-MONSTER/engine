@@ -124,6 +124,14 @@ struct Plan {
     // third-party parser: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights as ordinary ONNX initializers, while
     // 1.8 and R1-Distill ship placeholders and keep the weights in model.bin (pi-inferzo, 2026-11-08).
     // graph_matmuls < 0 means "no graph was read", which is why it is not just a count.
+    // engine#1786 (item F1): a FastFlowLM NPU2 model source is a safetensors container (`model.q4nx`) with no graph,
+    // so the two census fields above stay -1. `container_tensors` is -1 for every pack that is not that genre; when it
+    // is not, it is the container's tensor count and the dtype map says what the reader found. Reported rather than
+    // refused at the first byte, because "cannot open model.onnx" says nothing about a pack that has no graph by design.
+    int64_t container_tensors = -1;
+    int64_t container_payload_bytes = 0;
+    std::map<std::string, int64_t> container_dtypes;
+    std::string container_note;   // what the container genre still needs, empty for a non-container pack
     int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)

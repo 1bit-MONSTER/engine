@@ -491,6 +491,14 @@ constexpr double kTieCorr = 0.99;
 // Qwen3's per-head QK norm gains, but Llama-3.2-1B -- which has no QK norms at all -- carries the same +4,352 at hidden
 // 2,048, so the extra is a property of the geometry, not of the architecture. Measured anyway, because a plausible
 // explanation that survives one model is how this table would get a wrong row.
+// A geometry with no row is refused, and for a pack with no 1.8 twin that is the right answer rather than a gap to
+// fill by inference. `prefix` and the tile are defined by a diff against the twin (`tools/fconst19_measure.py`: prefix
+// is the first byte where the 1.9 block diverges from the 1.8 one, and `probe-what-follows` locates the tile by finding
+// where that first-differing run reappears at a displacement). Nothing in the 1.9 pack alone names either number:
+// amd/granite-4.1-8b_rai_1.9.0_npu has 40 clean uniform headers and a tail of exactly 8,256 + 1,568 x 143,616, which
+// pins its TILE by head-grid arithmetic and says nothing about its prefix -- and adding a row from that alone was
+// refused by the pack's own in-block checks (scale/zero exactness 0 %, no second header, 0/80 norm anchors). No 1.8
+// granite exists on the Hub, so the row cannot be measured until one does.
 constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen2.5-0.5B-Instruct: normalises to its 1.8 twin byte for byte, whole file, all 24 blocks.
     {896, 14, 24, 1856, 16, 2, 34816},
@@ -577,17 +585,6 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // tolerance -- so this pair does not isolate the prefix. `prefix = 12,608` rests on the Mistral row above and the
     // Qwen3 arithmetic (64 + 2*hidden + 4,352) agreeing, which is exactly the caveat the 3,584 row carries too.
     {4096, 32, 36, 12608, 5, 1, 2297856},
-    // granite-4.1-8b at hidden 4,096 / 32 heads / 40 layers: the same bundle shape and rotation as the Qwen3-8B row
-    // above -- every field identical but the layer count -- which again says the bundle is a property of the hidden size
-    // and its head count, not the depth. It must still be its own row because select_rule_in() keys on all three.
-    // Unlike Qwen3-8B this pack's head is NOT in the tail's envelope: its tail is 225,198,144 B after 40 x 107,728,192,
-    // and that is exactly 8,256 + 1,568 x 143,616 (the h4096 tile, rows = ceil(100,352 / 64)), i.e. a full head grid,
-    // so the tail carries the head itself. The header stride is uniform over all 40 blocks (40 runs of 32 x
-    // `00 00 7f ff`, first at 13,795,392, every gap 107,728,192).
-    // Honest limit: amd publishes no 1.8 twin for this model, so the rotation and the tile are corroborated by the head
-    // grid arithmetic and by agreement with the Qwen3-8B row at the same geometry rather than by a direct diff. The
-    // prefix is the same 64 + 2*hidden + 4,352 = 12,608 the Qwen3 row uses, with the same caveat that row states.
-    {4096, 32, 40, 12608, 5, 1, 2297856},
     // Llama-3.2-3B (and -Instruct, same geometry) at hidden 3,072 / 24 heads / 28 layers: measured with
     // tools/fconst19_measure.py against amd/Llama-3.2-3B_rai_1.8.0_npu_4K, 1,090 of 1,756,930,368 bytes differ
     // (6.20e-07 of the file, which the tool prints as 6.20e-05 %) -- content, not layout. The prefix is the Qwen3 line's 64 + 2*hidden + 4,352 = 10,560 at this hidden

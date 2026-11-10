@@ -64,6 +64,7 @@ struct Entry {
     std::string name;
     std::vector<int64_t> shape;
     uint64_t bytes;
+    std::string dtype = "U8";
 };
 
 // Writes dir/model.q4nx (tensors packed in order, zero-filled) and dir/config.json.
@@ -75,7 +76,7 @@ void write_model(const fs::path& dir, const std::vector<Entry>& entries, uint64_
     json table = json::object();
     uint64_t off = 0;
     for (const auto& e : entries) {
-        table[e.name] = {{"dtype", "U8"}, {"shape", e.shape}, {"data_offsets", {off, off + e.bytes}}};
+        table[e.name] = {{"dtype", e.dtype}, {"shape", e.shape}, {"data_offsets", {off, off + e.bytes}}};
         off += e.bytes;
     }
     if (!bad_name.empty()) table[bad_name]["data_offsets"] = bad_offsets;
@@ -159,6 +160,36 @@ int main() {
         });
         check(why.empty(), "a tiled embedding without vocab_size derives rows, not tiles" +
                                (why.empty() ? "" : " (" + why + ")"));
+    }
+    {  // engine#1843: vocab_size from config.json is compared with the table when the table is there
+        struct Case { const char* tag; std::vector<int64_t> shape; std::string dtype; int vocab; bool loads; };
+        const std::vector<Case> cases = {
+            {"bf16-match", {2, 128}, "BF16", 2, true},
+            {"bf16-config-larger", {2, 128}, "BF16", 3, false},     // the embedding read would run past the table
+            {"bf16-config-smaller", {2, 128}, "BF16", 1, false},    // a row the config says does not exist
+            {"tiled-exact", {2, 4, 8704}, "I8", 64, true},
+            {"tiled-padded", {2, 4, 8704}, "I8", 40, true},         // the last tile-row is partly padding
+            {"tiled-config-larger", {2, 4, 8704}, "I8", 65, false},
+            {"tiled-whole-spare-tile-row", {2, 4, 8704}, "I8", 32, false},
+            {"i8-2d-not-compared", {2, 128}, "I8", 999, true},     // plain int8 or tile chunks: rows not on the shape
+        };
+        for (const auto& k : cases) {
+            std::vector<Entry> e = one_layer();
+            for (auto& x : e)
+                if (x.name == "model.embed_tokens.weight") {
+                    x.shape = k.shape;
+                    x.dtype = k.dtype;
+                }
+            write_model(root / k.tag, e, 0, nullptr, "", json{{"vocab_size", k.vocab}});
+            const std::string why = thrown([&] { Model m((root / k.tag).string()); });
+            if (k.loads)
+                check(why.empty(), std::string("vocab check ") + k.tag + ": loads" +
+                                       (why.empty() ? "" : " (" + why + ")"));
+            else
+                check(why.find("vocab_size " + std::to_string(k.vocab)) != std::string::npos &&
+                          why.find("model.embed_tokens.weight") != std::string::npos,
+                      std::string("vocab check ") + k.tag + ": refused, naming both numbers (" + why + ")");
+        }
     }
     {  // engine#1782: neither -> refused by name, not by "model has no tensor"
         std::vector<Entry> e = one_layer();

@@ -121,10 +121,6 @@ static const uint8_t* data_of(ModelWeights* mw, const TensorDesc* d, size_t byte
     return (const uint8_t*)model_tensor_data(mw, const_cast<TensorDesc*>(d));
 }
 
-// Which instance of the sealed ELF runs a role, or nullptr when the sealed ELF does not cover it.  The table
-// moved to q4nx_pack.c (q4nx_pb16i_instance) because the target opens the decode family (engine#803 A2b) and a
-// contract both sides must agree on cannot live on one side; this wrapper keeps the call sites unchanged.
-static const char* pb16i_instance(Q4nxDesign r) { return q4nx_pb16i_instance(r); }
 
 // Where an M=16 int8 twin is looked for, first hit wins: <model dir>/kernels-m16,
 // <kernels>/m16, then <kernels> itself.

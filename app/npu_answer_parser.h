@@ -34,6 +34,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cctype>
+#include <functional>
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -44,6 +47,11 @@ namespace onebit::npu {
 
 enum class AnswerFamily {
     qwen3,
+    // Gemma 4 (engine#1779, F10 fault 4): the pack's own tokenizer_config.json states this markup, and it is not
+    // qwen3's. Tokens: <|turn>/<turn|>, <|channel>/<channel|>, <|tool_call>/<tool_call|>, escape <|"|>.
+    // A call body is `call:NAME{key:value,...}` with string values escaped as <|"|>v<|"|> -- NOT JSON, which is
+    // why a JSON-only reader fails on it (the vendor's response_schema ships the same two regexes this follows).
+    gemma4,
 };
 
 // One tool call, in OpenAI's shape: function.arguments is a JSON *string*, so the parsed object is
@@ -63,9 +71,17 @@ struct ParsedAnswer {
 
 namespace answer_detail {
 
+inline std::string trim(const std::string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && (s[b] == ' ' || s[b] == '\n' || s[b] == '\r' || s[b] == '\t')) ++b;
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\n' || s[e - 1] == '\r' || s[e - 1] == '\t')) --e;
+    return s.substr(b, e - b);
+}
+
 inline const char* family_name(AnswerFamily f) {
     switch (f) {
         case AnswerFamily::qwen3: return "qwen3";
+        case AnswerFamily::gemma4: return "gemma4";
     }
     return "?";
 }
@@ -82,6 +98,10 @@ inline FamilyTags tags_of(AnswerFamily f) {
     switch (f) {
         case AnswerFamily::qwen3:
             return FamilyTags{"<think>", "</think>", "<tool_call>", "</tool_call>"};
+        case AnswerFamily::gemma4:
+            // The reasoning channel opens with <|channel> immediately followed by the literal word `thought`; the
+            // template emits exactly `<|channel>thought\n…\n<channel|>`, so the pair is the tag.
+            return FamilyTags{"<|channel>thought", "<channel|>", "<|tool_call>", "<tool_call|>"};
     }
     throw std::runtime_error(std::string("answer parser: unsupported family ") + family_name(f));
 }
@@ -169,7 +189,10 @@ private:
         };
         while (i < safe.size()) {
             if (safe[i] == '<') {
-                const std::string rest = safe.substr(i, 16);
+                // 32 bytes, not 16: gemma4's thinking tag is `<|channel>thought` (18 bytes) and the old
+                // 16-byte window could never match it -- every tag longer than the window looked like text
+                // (engine#1779). 32 covers the longest tag any family carries with room to spare.
+                const std::string rest = safe.substr(i, 32);
                 auto starts = [&](const char* tag) { return rest.rfind(tag, 0) == 0; };
                 if (starts(tags_.think_open)) {
                     flush_plain();
@@ -207,6 +230,11 @@ private:
     }
 
     void close_call(std::vector<std::pair<bool, std::string>>& out) {
+        if (fam_ == AnswerFamily::gemma4 && close_gemma_call()) {
+            call_text_.clear();
+            mode_ = Mode::content;
+            return;
+        }
         try {
             const nlohmann::json j = nlohmann::json::parse(call_text_);
             ToolCall c;
@@ -221,6 +249,90 @@ private:
         }
         call_text_.clear();
         mode_ = Mode::content;
+    }
+
+    // `call:NAME{key:value,...}` -> a ToolCall whose arguments are JSON, so the two routes hand the caller one shape.
+    // The Gemma object syntax is not JSON: keys are bare, string values are wrapped in <|"|>, and nested objects and
+    // arrays use the same bare-key form. This rewrites it rather than guessing: <|"|>v<|"|> becomes a JSON string,
+    // a bare key gains quotes, and numbers/true/false/null pass through as literals.
+    // shortcut: values that are neither quoted, numeric, boolean, null nor a brace/bracket nest are emitted as strings,
+    // re-derive from the pack if a writer starts emitting bare tokens that are meant to be something else.
+    static std::string gemma_object_to_json(const std::string& body) {
+        std::string out;
+        size_t i = 0;
+        auto space = [&] { while (i < body.size() && (body[i] == ' ' || body[i] == '\n' || body[i] == '\t')) ++i; };
+        // one value at `i`
+        std::function<void()> value = [&] {
+            space();
+            if (body.compare(i, 5, "<|\"|>") == 0) {
+                i += 5;
+                std::string lit;
+                while (i < body.size() && body.compare(i, 5, "<|\"|>") != 0) lit += body[i++];
+                i += (i < body.size() ? 5 : 0);
+                out += nlohmann::json(lit).dump();
+                return;
+            }
+            if (i < body.size() && (body[i] == '{' || body[i] == '[')) {
+                const char close_ch = body[i] == '{' ? '}' : ']';
+                out += body[i++];
+                space();
+                bool first = true;
+                while (i < body.size() && body[i] != close_ch) {
+                    if (!first) out += ',';
+                    first = false;
+                    space();
+                    if (close_ch == '}') {
+                        const size_t colon = body.find(':', i);
+                        std::string key = body.substr(i, colon == std::string::npos ? 0 : colon - i);
+                        while (!key.empty() && (key.back() == ' ' || key.back() == '\n')) key.pop_back();
+                        out += nlohmann::json(key).dump() + ":";
+                        i = (colon == std::string::npos) ? body.size() : colon + 1;
+                        value();
+                    } else {
+                        value();
+                    }
+                    space();
+                    if (i < body.size() && body[i] == ',') ++i;
+                }
+                if (i < body.size()) { out += body[i++]; }
+                return;
+            }
+            std::string raw;
+            int depth = 0;
+            while (i < body.size()) {
+                const char c = body[i];
+                if (c == '{' || c == '[') ++depth;
+                if (c == '}' || c == ']') { if (depth == 0) break; --depth; }
+                if (depth == 0 && (c == ',' || c == '}' || c == ']')) break;
+                raw += c; ++i;
+            }
+            while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\n')) raw.pop_back();
+            if (raw == "true" || raw == "false" || raw == "null" || (!raw.empty() && (std::isdigit((unsigned char)raw[0]) || raw[0] == '-'))) {
+                out += raw;
+            } else {
+                out += nlohmann::json(raw).dump();
+            }
+        };
+        value();
+        return out;
+    }
+
+    bool close_gemma_call() {
+        const std::string body = answer_detail::trim(call_text_);
+        if (body.compare(0, 5, "call:") != 0) return false;
+        const size_t brace = body.find('{');
+        if (brace == std::string::npos || body.back() != '}') return false;
+        ToolCall c;
+        c.id = "call_" + std::to_string(calls_.size());
+        c.name = answer_detail::trim(body.substr(5, brace - 5));
+        if (c.name.empty()) return false;
+        try {
+            c.arguments = gemma_object_to_json(body.substr(brace, body.size() - brace));
+        } catch (const std::exception&) {
+            return false;
+        }
+        calls_.push_back(std::move(c));
+        return true;
     }
 
     AnswerFamily fam_;

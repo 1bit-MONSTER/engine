@@ -653,6 +653,46 @@ void test_json_schema_refusals() {
           "grammar and json_schema together are refused");
 }
 
+
+// Gemma 4's own markup (engine#1779, F10 fault 4), taken from the pack's tokenizer_config.json: the call body is
+// `call:NAME{key:value,...}` with string values wrapped in <|"|>, which is not JSON. Asserted on the normalised
+// JSON rather than on "a call was found", because the normalisation is the part that can be silently wrong.
+void test_gemma4_answer_parser() {
+    const auto G = AnswerFamily::gemma4;
+    {
+        const std::string reply =
+            "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3,metric:true}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1, "gemma4: a <|tool_call> body is a call when tools were sent");
+        check(a.calls[0].name == "get_weather", "gemma4: the name is what follows call:");
+        check(a.calls[0].arguments == R"({"city":"Paris","days":3,"metric":true})",
+              "gemma4: arguments are rewritten to JSON (escaped strings, numbers, booleans)");
+        check(a.content.empty() && a.content_null, "gemma4: a call-only reply has content: null");
+    }
+    {
+        // A comma inside an escaped string must not split the argument list -- the case a naive splitter gets wrong.
+        const std::string reply =
+            "<|tool_call>call:say{text:<|\"|>hello, world<|\"|>,n:2}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == R"({"text":"hello, world","n":2})",
+              "gemma4: a comma inside <|\"|>...<|\"|> stays inside the string");
+    }
+    {
+        const std::string reply = "<|tool_call>call:ping{}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == "{}", "gemma4: a call with no arguments is {}");
+        const auto without = parse_answer(reply, G, false);
+        check(without.calls.empty(), "gemma4: the same markup is not a call when no tools were sent");
+        check(without.content.find("<|tool_call>") != std::string::npos,
+              "gemma4: and it stays in content, marker included");
+    }
+    {
+        const auto a = parse_answer("<|channel>thought\nlet me think<channel|>Done.", G, false);
+        check(a.reasoning == "\nlet me think", "gemma4: the thought channel is reasoning");
+        check(a.content == "Done.", "gemma4: and the reply after it is content");
+    }
+}
+
 void test_answer_parser() {
     const auto F = AnswerFamily::qwen3;
     {   // reasoning, then content: the Qwen3 shape this route sees on every answer
@@ -979,6 +1019,7 @@ int main() {
     test_answer_parser();
     test_answer_stream();
     test_tool_grammar();
+    test_gemma4_answer_parser();
     test_tool_request_parsing();
     test_content_mask();
     test_request_parsing();

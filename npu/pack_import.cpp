@@ -2499,6 +2499,17 @@ std::string Plan::manifest() const {
     j["mlp_section"] = {{"gate_up_units_measured", mlp_gu_units},
                         {"down_groups_measured", mlp_down_groups},
                         {"note", mlp_note}};
+    // engine#1934: the section offsets, in bytes, measured from the fconst's start. They were computed all along and
+    // never printed, so anyone comparing a container against the pack (the folded-q/k-gains question, an HF diff, a
+    // hand decode) had to derive them -- and a derived offset reads plausible data from the wrong place, which cost
+    // three wrong measurements in one night. `info` reports the measurement, not the plan (engine#734's lesson), and a
+    // byte offset nothing prints is exactly the thing that gets re-derived wrong.
+    j["sections"] = {{"attn_tiles", attn_tiles},
+                     {"o_off", o_off},
+                     {"o_k", o_k},
+                     {"knorm_off", knorm_off},
+                     {"qnorm_off", qnorm_off},
+                     {"mlp_off", mlp_off}};
     j["incomplete"] = refused();
     const TextArtifacts text = scan_text_artifacts(dir);
     j["text_artifacts"] = {{"present", text.present},

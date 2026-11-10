@@ -731,6 +731,44 @@ void test_evict_stale_canonical_copies() {
                 " geometry/age rules + 3 degenerate)\n");
 }
 
+// engine#1907: the sweep ran only in the directory being written. Since #1801 that is the on-disk cache, so /tmp was never swept
+// again, and 17.0 GiB of copies left there by older binaries stayed in tmpfs (RAM). Every candidate is swept now; one that does
+// not exist is not created.
+void test_sweep_fconst_scratch_dirs() {
+    const fs::path root = fs::temp_directory_path() / ("1bit-sweep-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    const fs::path written = root / "cache", other = root / "tmp", absent = root / "never-made";
+    fs::create_directories(written);
+    fs::create_directories(other);
+    auto touch = [&](const fs::path& d, const std::string& base) {
+        std::ofstream o(d / base, std::ios::binary | std::ios::trunc);
+        o << 'x';
+    };
+    const std::string prefix = "1bit-fconst19v1-12345-896-14-24-";
+    const std::string keep = prefix + "291653952-76263210.fconst";
+    const std::string stale = prefix + "291653952-99999.fconst";
+    const std::string legacy = "1bit-fconst19-12345-896-14-24.fconst";
+    const std::string old_other = "1bit-fconst19v1-77777-1536-12-28-995712640-73345656.fconst";
+    const std::string fresh_other = "1bit-fconst19v1-88888-1536-12-28-995712640-73345656.fconst";
+    for (const auto& f : {keep, stale, legacy, old_other, fresh_other}) touch(other, f);
+    touch(written, keep);
+    const auto seven_hours_ago = fs::file_time_type::clock::now() - std::chrono::hours(7);
+    fs::last_write_time(other / old_other, seven_hours_ago, ec);
+    pi::sweep_fconst_scratch_dirs({written.string(), other.string(), absent.string()}, written.string(), keep, prefix, legacy,
+                                  6 * 3600);
+    const auto in_other = [&](const std::string& b) { return fs::exists(other / b); };
+    check(!in_other(old_other), "sweep: an abandoned copy in a directory that was NOT written goes (the /tmp left behind by #1801)");
+    check(!in_other(stale) && !in_other(legacy),
+          "sweep: a stale identity and the legacy name of this pack go from the other directory too");
+    check(in_other(keep), "sweep: the exact name is kept in every directory (another environment may reuse it there)");
+    check(in_other(fresh_other), "sweep: a fresh copy of another pack stays -- another run may be writing it");
+    check(fs::exists(written / keep), "sweep: the copy being written is kept");
+    check(!fs::exists(absent), "sweep: a candidate that does not exist is not created");
+    fs::remove_all(root, ec);
+    std::printf("  scratch sweep: every candidate directory, 6 arms\n");
+}
+
 void test_modelbin_genre_refusal(const std::string& root) {
     const fs::path dir = fs::path(root) / "crafted-modelbin";
     fs::remove_all(dir);
@@ -2891,6 +2929,19 @@ void test_fconst_block_headers() {
 // cache whose size is the pack's own .fconst, and on this box /tmp is tmpfs, so where it lands is a RAM decision. The bug was a
 // cache directory that was never created -- every pack then fell through to /tmp and nothing noticed.
 void test_fconst_scratch_order() {
+    // engine#1907: this arm rewrites four variables, and it used to leave HOME=/home/x with TMPDIR and the override unset, so
+    // every crafted import after it fell through to the literal /tmp (179 of the 188 files found there were this suite's).
+    // Save and restore them, so the rest of the run keeps the per-run scratch directory main() set.
+    struct Saved { const char* name; bool had; std::string value; };
+    std::vector<Saved> saved;
+    for (const char* n : {"ONEBIT_FCONST_SCRATCH", "XDG_CACHE_HOME", "HOME", "TMPDIR"}) {
+        const char* v = std::getenv(n);
+        saved.push_back({n, v != nullptr, v ? v : ""});
+    }
+    struct Restore {
+        std::vector<Saved>& s;
+        ~Restore() { for (const auto& x : s) { if (x.had) setenv(x.name, x.value.c_str(), 1); else unsetenv(x.name); } }
+    } restore{saved};
     const auto first_with = [](const char* scratch, const char* xdg, const char* home) {
         if (scratch) setenv("ONEBIT_FCONST_SCRATCH", scratch, 1); else unsetenv("ONEBIT_FCONST_SCRATCH");
         if (xdg) setenv("XDG_CACHE_HOME", xdg, 1); else unsetenv("XDG_CACHE_HOME");
@@ -2945,7 +2996,6 @@ void test_fconst_scratch_order() {
         check(std::count(no_tmpdir.begin(), no_tmpdir.end(), std::string("/tmp")) == 1,
               "fconst scratch: with TMPDIR unset, /tmp appears exactly once (no duplicate from the resolver)");
         std::system(("rm -rf " + tdir).c_str());
-        setenv("HOME", "/home/x", 1);           // leave the environment as the arms above expect it
     }
     std::printf("fconst scratch: order is override -> disk cache -> temp/cwd, pinned\n");
 }
@@ -3662,6 +3712,14 @@ void test_qk_norm_refusal() {
 }
 
 int main(int argc, char** argv) {
+    // engine#1907: every crafted 1.9 import writes a canonical copy into the scratch cache. Without this the suite left 0-byte
+    // copies in the user's real ~/.cache/1bit/fconst19 and in /tmp on every run. Give the run its own directory, removed at exit.
+    const fs::path run_scratch = fs::temp_directory_path() / ("1bit-pack-test-scratch-" + std::to_string(::getpid()));
+    if (!std::getenv("ONEBIT_FCONST_SCRATCH")) setenv("ONEBIT_FCONST_SCRATCH", run_scratch.c_str(), 1);
+    struct ScratchCleanup {
+        fs::path p;
+        ~ScratchCleanup() { std::error_code ec; fs::remove_all(p, ec); }
+    } scratch_cleanup{run_scratch};
     test_qk_norm_refusal();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
@@ -3683,6 +3741,7 @@ int main(int argc, char** argv) {
     test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
         test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
+        test_sweep_fconst_scratch_dirs();
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);

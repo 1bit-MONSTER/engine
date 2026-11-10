@@ -752,7 +752,17 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
         // GiB of tmpfs, had been resident all day).
         const std::string legacy_name = std::string(kScratchStem) + "-" + tag + "-" + std::to_string(dims.hidden) + "-" +
                                         std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst";
-        evict_stale_canonical_copies(d.string(), name, ident_prefix, legacy_name, kScratchMaxAgeSeconds);
+        // Sweep EVERY candidate directory, not only the one written (engine#1907). Since #1801 moved the cache to disk, a
+        // write lands in ~/.cache, so the sweep never visited /tmp again, and the copies older binaries had left there
+        // (17.0 GiB of tmpfs, i.e. RAM, measured 2026-11-10) stayed until reboot. The other directories are only swept,
+        // never created, and the rule is the same one as here: the exact name is kept wherever it is.
+        // An explicit ONEBIT_FCONST_SCRATCH is a lane saying "my scratch is here": then only that directory is swept, so a
+        // run with an override (the test suite sets one) never removes another lane's files from the shared /tmp or cache.
+        std::vector<std::string> dir_names;
+        const char* override_dir = std::getenv("ONEBIT_FCONST_SCRATCH");
+        if (override_dir && *override_dir) dir_names.push_back(d.string());
+        else for (const auto& x : dirs) dir_names.push_back(x.string());
+        sweep_fconst_scratch_dirs(dir_names, d.string(), name, ident_prefix, legacy_name, kScratchMaxAgeSeconds);
         // Say where it went whenever that is not the ordinary place: the copy is a few hundred MB and it is scratch.
         std::error_code ec2;
         const fs::path tmpdir = [&] { try { return fs::temp_directory_path(); } catch (...) { return fs::path(); } }();
@@ -4907,5 +4917,18 @@ void evict_stale_canonical_copies(const std::string& dir, const std::string& kee
         }
     }
 }
+
+void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::string& written_dir,
+                               const std::string& keep_name, const std::string& prefix, const std::string& legacy_name,
+                               int64_t max_age_seconds) {
+    // engine#1907: every candidate is swept, not only the one being written. A directory that does not exist is skipped,
+    // never created: only the written one is made ready, by its caller.
+    for (const auto& dir : dirs) {
+        std::error_code ec;
+        if (dir == written_dir || fs::is_directory(dir, ec))
+            evict_stale_canonical_copies(dir, keep_name, prefix, legacy_name, max_age_seconds);
+    }
+}
+
 
 }  // namespace onebit::npu::pack_import

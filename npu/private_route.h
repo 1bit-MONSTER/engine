@@ -104,6 +104,11 @@ std::string private_model_name(const std::string& model_type);
 // it or it is not a private route's type; otherwise that the route is not in this build.
 std::string private_route_missing(const std::string& model_type);
 // "KEY=VALUE" -> opts[KEY] = VALUE; throws without '=' or with an empty key.
+// True when this build links a private-route add-on and it registered at least one route or command. `--npu-opt` only
+// means anything in that case; without it the option used to be stored and silently ignored, which turns a mistyped or
+// add-on-less invocation into a 10x slower route with no signal (engine#1740, W6).
+bool private_routes_available();
+
 void parse_private_option(const std::string& kv, PrivateOptions& opts);
 
 // Defined by the add-on; `1bit` calls it once at startup in -DONEBIT_NPU_PRIVATE builds.

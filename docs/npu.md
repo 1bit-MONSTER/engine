@@ -909,6 +909,25 @@ What converts, and how faithfully:
 | `model.norm` (final) | `.fconst`, the tail envelope at `layers x stride` | bf16 | byte-exact |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
+**A multi-component pack's per-layer embedding** (engine#1725). gemma-4's embedding component
+carries, beside the token table, `embed_tokens_per_layer.weight` (`vocab x layers*P` f32; 262,144 x
+8,960 on e2b, 9.4 GiB), a `P`-wide `per_layer_projection_norm.weight` shared by every layer, and
+the context projection `per_layer_model_projection.weight_t_Q4` quantised at block 32. The import
+writes them under the names the forward loads:
+
+| container tensor | from | form |
+|---|---|---|
+| `model.per_layer_token_embd.weight` `[vocab, layers*P]` | the f32 table | BF16, round to nearest even |
+| `model.per_layer_proj_norm.weight` `[P]` | the norm | BF16 |
+| `model.per_layer_model_proj.weight_layer{l}` `[P, hidden]` | the projection, dequantised, one per layer | BF16 |
+
+The table is never held in memory, in either form: the reader points into the component's mapped
+external data (its extent is checked once, when it is located), and the container writer converts
+it 32 rows at a time while it writes the file. A projection with no zero-point tensor takes the
+implicit zero point 8, the same rule as every other MatMulNBits here. `config.json` gets
+`hidden_size_per_layer_input` and `vocab_size_per_layer_input` only when all three parts went into
+the container, because those two keys are what switch the block on in the forward.
+
 An OGA pack keeps its tensors inside the `If` branches: the top-level graph has **no
 initializers** and four nodes (`Shape`/`Constant`/`Equal`/`If`). The importer walks the
 subgraphs. The 4-bit decode is `w = (code - zp) * scale` with two codes per byte (low nibble

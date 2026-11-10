@@ -912,6 +912,85 @@ DeclaredMap read_declared(const std::string& pack_dir) {
 // Returns [V, H] f32 (row-major), empty when the pack has no such component. Everything it needs already existed:
 // walk_graph() reads the graph with its external-data declarations, decode_matmulnbits() is block-parameterised, and
 // the scale-per-32-column-group layout is the container's own.
+// engine#1725: the per-layer half of a multi-component embedding. Same component path resolution as the token table
+// (genai_config.json's model.embedding.filename), same external-data rule (resolved beside the graph), and the same
+// dtype rule slice 1 established: f32 is read, anything else unquantised is refused by dtype rather than mis-read.
+// Kept separate from read_embedding_component() because the shapes differ (V x width and a width-wide norm, not V x H)
+// and because the consumer differs: the token table is the head's ORACLE, these are a decoder INPUT.
+EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, std::string* why) {
+    EmbedPerLayer out;
+    std::string gpath = pack_dir + "/embedding.onnx";
+    {
+        std::ifstream gf(pack_dir + "/genai_config.json");
+        if (gf) {
+            json g;
+            try { g = json::parse(gf); } catch (...) { g = json::object(); }
+            if (g.is_object() && g.contains("model") && g["model"].is_object() && g["model"].contains("embedding") &&
+                g["model"]["embedding"].is_object()) {
+                const json& emb = g["model"]["embedding"];
+                if (emb.contains("filename") && emb["filename"].is_string()) {
+                    const std::string rel = emb["filename"].get<std::string>();
+                    if (!rel.empty() && rel.front() != '/' && rel.find("..") == std::string::npos) {
+                        std::error_code nec;
+                        if (fs::is_regular_file(pack_dir + "/" + rel, nec)) gpath = pack_dir + "/" + rel;
+                    }
+                }
+            }
+        }
+    }
+    std::error_code ec;
+    if (!fs::is_regular_file(gpath, ec)) { if (why) *why = "no embedding component graph at " + gpath; return out; }
+    OnnxModel em;
+    try { em = parse_onnx(gpath); } catch (const std::exception& e) { if (why) *why = e.what(); return out; }
+    const OnnxTensor* table = nullptr;
+    const OnnxTensor* norm  = nullptr;
+    for (const auto& t : em.tensors) {
+        if (t.name.find("embed_tokens_per_layer") != std::string::npos) table = &t;
+        else if (norm == nullptr && t.name.find("per_layer_projection_norm") != std::string::npos) norm = &t;
+    }
+    if (table == nullptr) { if (why) *why = "the component carries no embed_tokens_per_layer table"; return out; }
+    if (table->dims.size() != 2 || table->dims.at(0) <= 0 || table->dims.at(1) <= 0) {
+        if (why) *why = "embed_tokens_per_layer is not 2-D with positive dims"; return out;
+    }
+    if (table->type != kF32) {
+        if (why) *why = "embed_tokens_per_layer has dtype " + std::to_string(table->type) + ", and only f32 is read here";
+        return out;
+    }
+    const int64_t V = table->dims.at(0), width = table->dims.at(1);
+    const auto read_f32 = [&](const OnnxTensor& t, size_t count, const char* what, std::vector<float>* dst) {
+        const std::string base = fs::path(gpath).parent_path().string() + "/" + t.location;
+        size_t sz = 0;
+        std::string w2;
+        const uint8_t* m = map_file(base, sz, &w2);
+        if (!m) { if (why) *why = std::string(what) + ": " + w2; return false; }
+        const uint64_t need = uint64_t(count) * 4ull;
+        if (t.offset + need > sz) { if (why) *why = std::string(what) + " declares more bytes than its data carries"; return false; }
+        dst->resize(count);
+        std::memcpy(dst->data(), m + t.offset, size_t(need));
+        return true;
+    };
+    if (!table->location.empty()) {
+        if (!read_f32(*table, size_t(V) * size_t(width), "embed_tokens_per_layer", &out.table)) return out;
+    } else if (table->raw != nullptr && table->raw_len >= size_t(V) * size_t(width) * 4) {
+        out.table.resize(size_t(V) * size_t(width));
+        std::memcpy(out.table.data(), table->raw, out.table.size() * sizeof(float));
+    } else {
+        if (why) *why = "embed_tokens_per_layer has no readable data"; return out;
+    }
+    if (norm != nullptr && norm->type == kF32 && norm->dims.size() == 1 && norm->dims.at(0) == width &&
+        !norm->location.empty()) {
+        if (!read_f32(*norm, size_t(width), "per_layer_projection_norm", &out.norm)) return out;
+    }
+    if (out.norm.empty()) {
+        // No projection norm: the table is still usable, but say so — a consumer that expects the projection to be
+        // normalised would otherwise silently use raw rows.
+        if (why) *why = "no usable per_layer_projection_norm beside the table (rows are NOT projected)";
+    }
+    out.V = V;
+    out.width = width;
+    return out;
+}
+
 std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why) {
     // A multi-component pack (`type: compositemodel`) names its embedding component in genai_config.json
     // (`model.embedding.filename = "embedding/model.onnx"`), exactly as it names its decoder; a single-graph pack keeps

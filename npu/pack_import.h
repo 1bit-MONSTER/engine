@@ -78,6 +78,19 @@ struct Dims {
 // reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
 std::vector<float> read_embedding_component(const std::string& pack_dir, std::string* why);
 
+// The per-layer half of a multi-component pack's embedding (engine#1725). gemma-4 components carry, beside the token
+// table, `embed_tokens_per_layer.weight` (262144 x 8960 on e2b = layers x head_dim) and a 256-wide projection norm;
+// the decoder consumes them as `per_layer_inputs`, so a container without them gives the decoder less than it asks for.
+// Read separately from the token table because they have different shapes and different consumers: the token table
+// becomes the head oracle, this becomes an input. Empty (with `why`) when the component has no per-layer table.
+struct EmbedPerLayer {
+    std::vector<float> table;   // [V][layers*head_dim], row-major
+    std::vector<float> norm;    // [layers*head_dim]
+    int64_t          V = 0, width = 0;
+    bool ok() const { return V > 0 && width > 0 && table.size() == size_t(V) * size_t(width) && norm.size() == size_t(width); }
+};
+EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, std::string* why);
+
 // One tensor the pack describes, and where its values would come from.
 struct Planned {
     std::string name;     // Q4NX tensor name (model.layers.N.<...>.weight)

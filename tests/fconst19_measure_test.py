@@ -139,12 +139,43 @@ def case_refuse(root):
     return ok, f"rc={rc} err={err.strip().splitlines()[-1][:90] if err.strip() else ''!r}"
 
 
+
+def case_check_row(root):
+    """engine#2010: a row must BE the measurement. `prefix` is the first byte where the twins diverge, so a row
+    whose prefix came from `64 + 2*hidden + 4,352` (or from a neighbour's shape) is wrong in a way no geometry
+    check sees. The guard is `--check-row <pack_import.cpp>`; here the source file is a two-line stand-in."""
+    a = b"".join(block_18(L) for L in range(LAYERS)) + b"TAIL" * 16
+    b = b"".join(block_19(L) for L in range(LAYERS)) + b"TAIL" * 16
+    p18 = write_pack(root, "p18", a)
+    p19 = write_pack(root, "p19", b, declared_18=False)
+    rc, out, err = run((p18, p19), ("--json",))
+    if rc != 0:
+        return False, f"the pair itself did not measure: rc={rc} {err.strip()[:80]}"
+    row = json.loads([l for l in out.splitlines() if l.startswith("{")][0])
+    good = (f"    {{{row['hidden']}, {row['heads']}, {row['layers']}, {row['prefix']}, {row['n_tiles']}, "
+            f"{row['rot']}, {row['tile']}}},")   # the struct's order: prefix, n, rot, tile
+    src = os.path.join(root, "good.cpp")
+    with open(src, "w") as f:
+        f.write("constexpr Fconst19Rule kFconst19Rules[] = {\n" + good + "\n};\n")
+    rc1, out1, err1 = run((p18, p19), ("--check-row", src))
+    # and a row whose prefix is off by one tile-length, which is what a derived prefix looks like
+    bad = good.replace(f", {row['prefix']},", f", {row['prefix'] + 64},", 1)
+    src2 = os.path.join(root, "bad.cpp")
+    with open(src2, "w") as f:
+        f.write("constexpr Fconst19Rule kFconst19Rules[] = {\n" + bad + "\n};\n")
+    rc2, out2, err2 = run((p18, p19), ("--check-row", src2))
+    ok = rc1 == 0 and rc2 == 1 and "is exactly what this pair measures" in (out1 + err1) \
+         and "MISMATCH" in (out2 + err2) and f"prefix {row['prefix'] + 64} vs measured" in (out2 + err2)
+    return ok, f"match rc={rc1}; mismatch rc={rc2}; detail={(out2 + err2).strip()[-90:]!r}"
+
+
 def main():
     root = tempfile.mkdtemp(prefix="fconst19-test.")
     try:
         results = [("exact pair (and the refusal path executes)", case_exact(root)),
                    ("a few hundred codes differ: accepted with residual", case_tolerance(root)),
-                   ("a scrambled tile: refused", case_refuse(root))]
+                   ("a scrambled tile: refused", case_refuse(root)),
+                   ("--check-row: the table's row must be this pair's measurement", case_check_row(root))]
     finally:
         shutil.rmtree(root, ignore_errors=True)
     bad = [n for n, (ok, _) in results if not ok]

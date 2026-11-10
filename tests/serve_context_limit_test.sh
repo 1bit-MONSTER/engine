@@ -22,9 +22,15 @@
 # per ~/briefs/TNPU-ALL.md §9: a request whose prompt fills the context, then one more turn, and the response must be
 # **a refusal or a truncated-but-clean answer, never a degenerate repeat of one token**.
 #
-# So the assertion is on the SHAPE of the answer, not on its wording: a 4xx/5xx with an error body passes (that is a
-# refusal), a 200 with ordinary text passes (truncated-but-clean), an empty 200 with finish_reason "length" passes, and
-# a 200 whose content is one character repeated — `//////` being the reported instance — FAILS.
+# So the assertion is on the SHAPE of the answer, not on its wording: a 4xx passes (the server refused), a 200 with
+# ordinary text passes (truncated-but-clean), an empty 200 with finish_reason "length" passes, and a 200 whose content
+# is one character repeated (the reported instance was `//////`) FAILS.
+#
+# engine#1844: `000` (no response at all, i.e. the server died mid-request) and `5xx` are NOT refusals -- they are the
+# server failing the very property this row exists for, so they have their own verdicts and FAIL. The first version
+# accepted anything that was not 2xx, so a crash passed. The classifier and its pass set are exercised without a
+# device by `--self-test`, which is also a ctest row: the bug was never the one wrong line, it was that nothing ever
+# ran the classifier on the codes it has to reject.
 #
 # Device-free by construction: `--device cpu`, per the issue's rule for these four.
 #
@@ -36,6 +42,112 @@ bin=${1:?usage: serve_context_limit_test.sh path/to/1bit <model> <device> [ctx] 
 here=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=tests/serve_port.sh
 . "$(dirname "$0")/serve_port.sh"
+classify_over_limit() {   # <http code> <body file> -> refusal|refusal-empty|died|server-error|degenerate|clean-empty|clean
+    python3 - "$1" "$2" <<'PY'
+import json, sys, re
+code, path = sys.argv[1], sys.argv[2]
+try:
+    body = open(path, "rb").read().decode("utf-8", "replace")
+except OSError:
+    body = ""
+if code in ("", "000"):
+    print("died")                      # curl's 000: no response at all, so the server went away mid-request
+    raise SystemExit
+if code.startswith("5"):
+    print("server-error")              # it answered, but with its own failure -- not the client's
+    raise SystemExit
+if code.startswith("4"):
+    print("refusal" if body.strip() else "refusal-empty")
+    raise SystemExit
+if not code.startswith("2"):
+    print("unclassified-%s" % code)    # e.g. a 3xx redirect: neither outcome, so say so rather than pass
+    raise SystemExit
+try:
+    j = json.loads(body)
+    choice = (j.get("choices") or [{}])[0]
+    text = (choice.get("message") or {}).get("content") or ""
+    finish = choice.get("finish_reason")
+except Exception:
+    text, finish = body.strip(), None
+core = text.strip()
+if re.fullmatch(r"(.)\1{7,}", core, re.S):
+    print("degenerate")
+elif core == "" and finish in ("length", None):
+    print("clean-empty")
+elif core == "":
+    print("clean-empty")
+else:
+    print("clean")
+PY
+}
+
+# The accepted outcomes, in one place, so the self-test asserts the same set the run uses instead of a copied `case`.
+verdict_is_pass() {   # <verdict> -> 0 when that verdict is an acceptable over-limit answer
+    case "$1" in
+        refusal|refusal-empty|clean|clean-empty) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# engine#1844: the classifier's job is to REJECT codes, so the cases that must fail are the ones worth running. Device-
+# free by construction (no model, no server): this is a ctest row of its own, and it fails if either class above is put
+# back into the "refusal" bucket.
+self_test() {
+    local tmp fails=0 got
+    tmp=$(mktemp -d) || { echo "FAIL self_test: mktemp -d"; return 1; }
+    printf '%s' '{"choices":[{"message":{"content":"////////////////"},"finish_reason":"stop"}]}' > "$tmp/degenerate.json"
+    printf '%s' '{"choices":[{"message":{"content":"The answer is 4."},"finish_reason":"stop"}]}' > "$tmp/clean.json"
+    printf '%s' '{"choices":[{"message":{"content":""},"finish_reason":"length"}]}' > "$tmp/empty.json"
+    printf '%s' '{"error":{"message":"context length exceeded"}}' > "$tmp/err.json"
+    : > "$tmp/none.body"
+
+    expect() {   # <label> <code> <body file> <wanted verdict>
+        got=$(classify_over_limit "$2" "$3")
+        if [ "$got" != "$4" ]; then
+            echo "FAIL self_test: $1 -> '$got', wanted '$4'"
+            fails=$((fails + 1))
+        fi
+    }
+    expect_pass() {   # <label> <verdict> <should it be accepted: yes|no>
+        if verdict_is_pass "$2"; then
+            [ "$3" = yes ] || { echo "FAIL self_test: $1 ('$2') is accepted but must not be"; fails=$((fails + 1)); }
+        else
+            [ "$3" = no ] || { echo "FAIL self_test: $1 ('$2') is rejected but must be accepted"; fails=$((fails + 1)); }
+        fi
+    }
+
+    # the two the first version got wrong, and the reason this self-test exists
+    expect      "no response at all (the server died)" 000  "$tmp/none.body"   died
+    expect_pass "no response at all"                    died                   no
+    expect      "the server's own 500"                 500  "$tmp/err.json"    server-error
+    expect_pass "the server's own 500"                  server-error           no
+    # the accepted outcomes must stay accepted, or the fix would just invert the bug
+    expect      "a 400 refusal"                        400  "$tmp/err.json"    refusal
+    expect_pass "a 400 refusal"                         refusal                yes
+    expect      "an ordinary answer"                   200  "$tmp/clean.json"  clean
+    expect_pass "an ordinary answer"                    clean                  yes
+    expect      "an empty answer with finish_reason length" 200 "$tmp/empty.json" clean-empty
+    expect_pass "an empty answer with finish_reason length" clean-empty        yes
+    # and the fault itself still has to fail
+    expect      "the reported degenerate answer"       200  "$tmp/degenerate.json" degenerate
+    expect_pass "the reported degenerate answer"       degenerate             no
+    # neither outcome: say so rather than pass
+    expect      "a redirect nobody follows"            302  "$tmp/none.body"   unclassified-302
+    expect_pass "a redirect nobody follows"            unclassified-302       no
+
+    rm -rf "$tmp"
+    if [ "$fails" -ne 0 ]; then
+        echo "self-test: $fails failure(s)"
+        return 1
+    fi
+    echo "self-test: every classification case behaves, including the two that used to pass"
+    return 0
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+    self_test
+    exit $?
+fi
 model=${2:?}
 device=${3:?}
 ctx=${4:-512}
@@ -113,41 +225,39 @@ code2=$(curl -s -m 300 -o "$log.over.body" -w '%{http_code}' -H 'Content-Type: a
     -d @"$log.over.json" "http://127.0.0.1:$port/v1/chat/completions" 2> /dev/null)
 echo "over-limit turn:    HTTP $code2 $(head -c 160 "$log.over.body" 2> /dev/null | tr '\n' ' ')"
 
-# Classify the over-limit answer: refusal (non-2xx with a body), clean text, empty-with-length, or degenerate.
-verdict=$(python3 - "$code2" "$log.over.body" <<'PY'
-import json, sys, re
-code, path = sys.argv[1], sys.argv[2]
-try:
-    body = open(path, "rb").read().decode("utf-8", "replace")
-except OSError:
-    body = ""
-if not code.startswith("2"):
-    print("refusal" if body.strip() else "refusal-empty")
-    raise SystemExit
-try:
-    j = json.loads(body)
-    choice = (j.get("choices") or [{}])[0]
-    text = (choice.get("message") or {}).get("content") or ""
-    finish = choice.get("finish_reason")
-except Exception:
-    text, finish = body.strip(), None
-core = text.strip()
-if re.fullmatch(r"(.)\1{7,}", core, re.S):
-    print("degenerate")
-elif core == "" and finish in ("length", None):
-    print("clean-empty")
-elif core == "":
-    print("clean-empty")
-else:
-    print("clean")
-PY
-)
+# engine#1844: one classifier for (http code, body) and one predicate for "is that verdict acceptable", so the
+# self-test below exercises exactly the pair the run above uses.
+
+# engine#1844: the fill turn is a PRECONDITION -- if it did not answer 2xx the over-limit assertion below is made
+# against a server that had already failed, so it is checked rather than only printed.
+case "$code1" in
+    2[0-9][0-9]) ;;
+    *)
+        echo "FAIL serve_context_limit: the fill turn returned HTTP $code1, so the over-limit turn proves nothing"
+        tail -15 "$log"
+        exit 1 ;;
+esac
+
+verdict=$(classify_over_limit "$code2" "$log.over.body")
 echo "verdict:            $verdict"
 
 case "$verdict" in
-    refusal|refusal-empty|clean|clean-empty)
-        echo "PASS serve_context_limit: an over-limit turn is $verdict, not a degenerate repeat"
-        exit 0 ;;
+    died)
+        echo "FAIL serve_context_limit: no response at all from the over-limit turn (curl 000) -- the server went away, which is the property this row exists for"
+        tail -15 "$log"
+        exit 1 ;;
+    server-error)
+        echo "FAIL serve_context_limit: the over-limit turn returned HTTP $code2 -- the server failed on its own, not a refusal"
+        tail -15 "$log"
+        exit 1 ;;
+esac
+
+if verdict_is_pass "$verdict"; then
+    echo "PASS serve_context_limit: an over-limit turn is $verdict, not a degenerate repeat"
+    exit 0
+fi
+
+case "$verdict" in
     degenerate)
         echo "FAIL serve_context_limit: the over-limit turn degenerated to a repeated character: $(head -c 80 "$log.over.body")"
         tail -15 "$log"

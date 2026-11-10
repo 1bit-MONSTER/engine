@@ -16,8 +16,10 @@
 #include "q4nx_cache.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <vector>
 
@@ -82,4 +84,23 @@ Q4nxCacheSweep q4nx_cache_evict(const std::string& root, const std::string& keep
                      (long long)min_age_seconds);
     }
     return r;
+}
+
+int64_t q4nx_cache_bound_bytes(const char* text, int64_t default_gib) {
+    const int64_t max_gib = INT64_MAX >> 30;      // the largest GiB count whose byte count still fits
+    long long gib = default_gib;
+    if (text && *text) {
+        char* end = nullptr;
+        errno = 0;
+        const long long v = std::strtoll(text, &end, 10);
+        if (end != text) gib = v;                 // a number (ERANGE saturates, which the clamp below handles)
+    }
+    if (gib <= 0) return 0;
+    if (gib > max_gib) gib = max_gib;
+    return int64_t(gib) << 30;
+}
+
+void q4nx_cache_touch(const std::string& entry) {
+    std::error_code ec;
+    if (fs::is_directory(entry, ec)) fs::last_write_time(entry, fs::file_time_type::clock::now(), ec);
 }

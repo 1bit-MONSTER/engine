@@ -351,6 +351,9 @@ add_python_test(check_pins ${CMAKE_SOURCE_DIR}/tests/check_pins_test.py)
 add_python_test(gguf_to_q4nx ${CMAKE_SOURCE_DIR}/tests/gguf_to_q4nx_test.py)
 add_python_test(hrx_long_prompt ${CMAKE_SOURCE_DIR}/tests/hrx_long_prompt_test.py)
 add_python_test(hyperloom_benchmark ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
+# ... and it SKIPS (77) on a box with no GTT counters, because its assertions are about a real device: the first version of
+# this row failed CI's build runner in 0.06 s on `gtt_used_gib is not None` (engine#2018). A skip, not a weakened assertion.
+set_tests_properties(hyperloom_benchmark PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(moe_expert_chunks_accum ${CMAKE_SOURCE_DIR}/tests/moe_expert_chunks_accum_test.py)
 add_python_test(mtp_draft_vocab ${CMAKE_SOURCE_DIR}/tests/mtp_draft_vocab_test.py)
 add_python_test(repack_verify_source ${CMAKE_SOURCE_DIR}/tests/repack_verify_source_test.py)

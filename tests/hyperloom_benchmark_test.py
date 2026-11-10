@@ -44,6 +44,15 @@ def load():
 def main():
     bench = load()
 
+    # engine#2018: this file's assertions are about a REAL device (`box_conditions()` must return numbers for every field
+    # it reads), so on a box with no amdgpu -- CI's build runner -- there is nothing for them to be true about. Skipped with
+    # 77 rather than weakened: the numbers are the point where a GPU exists, and a test that passes on a null box would
+    # stop being evidence. Registered as a ctest row with SKIP_RETURN_CODE 77 (CMakeLists.txt, engine#2018).
+    _box = bench.box_conditions()
+    if _box["gtt_used_gib"] is None or _box["gtt_total_gib"] is None:
+        print("skip: this box exposes no GTT counters (no amdgpu) -- the assertions below are about a real device")
+        return 77
+
     # The filler prompt: measured at ~4.85 characters per token on this box (a 75,200-character prompt
     # came back as 15,492 prompt tokens), so 18,800 tokens needs >= 18,800 * 4.85 characters, and the
     # same request twice has to be byte-identical or candidates are not comparable.

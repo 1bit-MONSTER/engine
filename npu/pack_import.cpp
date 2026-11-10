@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -996,6 +998,7 @@ DeclaredMap read_declared(const std::string& pack_dir) {
 // dtype rule slice 1 established: f32 is read, anything else unquantised is refused by dtype rather than mis-read.
 // Kept separate from read_embedding_component() because the shapes differ (V x width and a width-wide norm, not V x H)
 // and because the consumer differs: the token table is the head's ORACLE, these are a decoder INPUT.
+void implicit_zp_zero(Q4& q, int bits);   // defined below, beside decode_matmulnbits
 EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidden, std::string* why) {
     EmbedPerLayer out;
     std::string gpath = pack_dir + "/embedding.onnx";
@@ -1036,29 +1039,66 @@ EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidd
         return out;
     }
     const int64_t V = table->dims.at(0), width = table->dims.at(1);
-    const auto read_f32 = [&](const OnnxTensor& t, size_t count, const char* what, std::vector<float>* dst) {
+    // Every external-data file this component names is mapped once and held by `out.keep` (the table's pointer lives in
+    // one of them); the norm is small and copied out.
+    struct Maps {
+        std::vector<std::pair<const uint8_t*, size_t>> all;
+        std::vector<float> inline_table;
+        ~Maps() {
+            for (const auto& [m, n] : all) unmap_file(m, n);
+        }
+    };
+    auto maps = std::make_shared<Maps>();
+    std::map<std::string, std::pair<const uint8_t*, size_t>> by_path;
+    const auto mapped = [&](const OnnxTensor& t, const char* what, size_t* sz) -> const uint8_t* {
         const std::string base = fs::path(gpath).parent_path().string() + "/" + t.location;
-        size_t sz = 0;
+        const auto it = by_path.find(base);
+        if (it != by_path.end()) { *sz = it->second.second; return it->second.first; }
         std::string w2;
-        const uint8_t* m = map_file(base, sz, &w2);
-        if (!m) { if (why) *why = std::string(what) + ": " + w2; return false; }
+        const uint8_t* m = map_file(base, *sz, &w2);
+        if (!m) { if (why) *why = std::string(what) + ": " + w2; return nullptr; }
+        maps->all.emplace_back(m, *sz);
+        by_path[base] = {m, *sz};
+        return m;
+    };
+    const auto read_f32 = [&](const OnnxTensor& t, size_t count, const char* what, std::vector<float>* dst) {
+        size_t sz = 0;
+        const uint8_t* m = mapped(t, what, &sz);
+        if (!m) return false;
         const uint64_t need = uint64_t(count) * 4ull;
         if (t.offset + need > sz) { if (why) *why = std::string(what) + " declares more bytes than its data carries"; return false; }
         dst->resize(count);
         std::memcpy(dst->data(), m + t.offset, size_t(need));
         return true;
     };
+    const uint8_t* table_f32 = nullptr;
     if (!table->location.empty()) {
-        if (!read_f32(*table, size_t(V) * size_t(width), "embed_tokens_per_layer", &out.table)) return out;
+        // The table is POINTED AT, not read: V x width f32 is 9.4 GiB on gemma-4-e2b. Its extent is checked here, once,
+        // so a band read cannot run off the mapping later.
+        size_t sz = 0;
+        const uint8_t* m = mapped(*table, "embed_tokens_per_layer", &sz);
+        if (!m) return out;
+        if (table->offset + uint64_t(V) * uint64_t(width) * 4ull > sz) {
+            if (why) *why = "embed_tokens_per_layer declares more bytes than its data carries";
+            return out;
+        }
+        table_f32 = m + table->offset;
     } else if (table->raw != nullptr && table->raw_len >= size_t(V) * size_t(width) * 4) {
-        out.table.resize(size_t(V) * size_t(width));
-        std::memcpy(out.table.data(), table->raw, out.table.size() * sizeof(float));
+        // an inline initializer is small by construction (it sits inside the graph file); copy it so nothing depends on
+        // the parsed graph outliving this call
+        maps->inline_table.resize(size_t(V) * size_t(width));
+        std::memcpy(maps->inline_table.data(), table->raw, maps->inline_table.size() * sizeof(float));
+        table_f32 = reinterpret_cast<const uint8_t*>(maps->inline_table.data());
     } else {
         if (why) *why = "embed_tokens_per_layer has no readable data"; return out;
     }
-    if (norm != nullptr && norm->type == kF32 && norm->dims.size() == 1 && norm->dims.at(0) == width &&
-        !norm->location.empty()) {
-        if (!read_f32(*norm, size_t(width), "per_layer_projection_norm", &out.norm)) return out;
+    // The norm is P wide and SHARED by every layer: gemma-4-e2b states it as (256,) beside a table 8960 = 35 x 256
+    // wide. Requiring it to be `width` long (as this did) skipped it on exactly that pack, and the loader then refuses
+    // the container on `model.per_layer_proj_norm.weight`. Any length that divides the table's width is a per-layer
+    // width; one that does not is not this norm.
+    if (norm != nullptr && norm->type == kF32 && norm->dims.size() == 1 && norm->dims.at(0) > 0 &&
+        width % norm->dims.at(0) == 0 && !norm->location.empty()) {
+        if (!read_f32(*norm, size_t(norm->dims.at(0)), "per_layer_projection_norm", &out.norm)) return out;
     }
     // The context projection: `per_layer_model_projection.weight_t_Q4` [width][H] at block 32, with `..._t_scales` and
     // packed `..._t_zero_point`. Dequantised through the file's own MatMulNBits decoder so the arithmetic is the one the
@@ -1078,7 +1118,9 @@ EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidd
             const auto blob = [&](const OnnxTensor& t, std::string* w4) -> const uint8_t* {
                 if (t.location.empty()) return t.raw;
                 size_t sz = 0;
-                return map_file(gdir + "/" + t.location, sz, w4);
+                const uint8_t* m = mapped(t, "per_layer_model_projection", &sz);
+                if (!m && w4 && why) *w4 = *why;
+                return m ? m + t.offset : nullptr;
             };
             std::string wa, wb, wc;
             const uint8_t* qw = blob(*pw, &wa);
@@ -1086,8 +1128,11 @@ EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidd
             const uint8_t* zp = pz ? blob(*pz, &wc) : nullptr;
             if (qw && sc) {
                 const int64_t H = hidden;
-                const Q4 q = decode_matmulnbits(qw, reinterpret_cast<const float*>(sc), zp, int(width), int(H), 32,
-                                                false, zp == nullptr);
+                Q4 q = decode_matmulnbits(qw, reinterpret_cast<const float*>(sc), zp, int(width), int(H), 32,
+                                          false, zp == nullptr);
+                // no zero-point tensor means the implicit 2^(bits-1), not 0 (see implicit_zp_zero: ONNX Runtime's rule,
+                // measured on this family's own embedding component)
+                if (zp == nullptr) implicit_zp_zero(q, 4);
                 if (q.N == int(width) && q.K == int(H)) {
                     // NL = width / P; the norm is P wide, so P comes from it when the component states one.
                     const int64_t Pn = !out.norm.empty() ? int64_t(out.norm.size()) : width / (width / 256 ? width / 256 : 1);
@@ -1115,65 +1160,34 @@ EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidd
     }
     out.V = V;
     out.width = width;
+    out.table_f32 = table_f32;
+    out.keep = maps;
     if (out.P <= 0) out.P = int64_t(out.norm.size());   // the norm is P wide: it states the per-layer width
     return out;
 }
 
-// engine#1725: stream the per-layer token table out in bands. The component states it as f32 (V x NL*P, 9.4 GiB on
-// gemma-4-e2b), so materialising it to convert would cost more RAM than the box has to spare for one import; the bands go
-// straight from the mapped external data into the container's BF16 layout.
-int64_t read_per_layer_table_band(const std::string& pack_dir, EmbedPerLayer* meta, int64_t first_row, int64_t rows,
-                                  uint8_t* out, std::string* why) {
-    if (meta == nullptr || out == nullptr || meta->V <= 0 || meta->width <= 0) {
-        if (why) *why = "no per-layer table metadata (call read_embedding_per_layer first)";
+// engine#1725: one band of the per-layer token table, f32 -> BF16. The component states the table as f32 (V x NL*P,
+// 9.4 GiB on gemma-4-e2b); `meta` already holds the mapping and has checked the table's extent, so this is a bounds
+// check on the band and a conversion loop -- `f32_to_bf16`, round to nearest even, the conversion every other tensor in
+// the container gets. (It used to re-parse the graph and re-map the data on every call, 8,192 times on e2b, and round
+// "up iff the kept lsb is 1", which moved half of all values by one ulp -- including ones bf16 holds exactly.)
+int64_t read_per_layer_table_band(const EmbedPerLayer& meta, int64_t first_row, int64_t rows, uint8_t* out,
+                                  std::string* why) {
+    if (out == nullptr || !meta.ok()) {
+        if (why) *why = "no per-layer table (call read_embedding_per_layer first)";
         return -1;
     }
-    if (first_row < 0 || rows <= 0 || first_row + rows > meta->V) {
+    if (first_row < 0 || rows <= 0 || first_row + rows > meta.V) {
         if (why) *why = "band out of range";
         return -1;
     }
-    std::string gpath = pack_dir + "/embedding.onnx";
-    {
-        std::ifstream gf(pack_dir + "/genai_config.json");
-        if (gf) {
-            json g;
-            try { g = json::parse(gf); } catch (...) { g = json::object(); }
-            if (g.is_object() && g.contains("model") && g["model"].is_object() && g["model"].contains("embedding") &&
-                g["model"]["embedding"].is_object() && g["model"]["embedding"].contains("filename") &&
-                g["model"]["embedding"]["filename"].is_string()) {
-                const std::string rel = g["model"]["embedding"]["filename"].get<std::string>();
-                if (!rel.empty() && rel.front() != '/' && rel.find("..") == std::string::npos) {
-                    std::error_code nec;
-                    if (fs::is_regular_file(pack_dir + "/" + rel, nec)) gpath = pack_dir + "/" + rel;
-                }
-            }
-        }
-    }
-    OnnxModel em;
-    try { em = parse_onnx(gpath); } catch (const std::exception& e) { if (why) *why = e.what(); return -1; }
-    const OnnxTensor* table = nullptr;
-    for (const auto& t : em.tensors)
-        if (t.name.find("embed_tokens_per_layer") != std::string::npos) table = &t;
-    if (table == nullptr) { if (why) *why = "the component carries no embed_tokens_per_layer table"; return -1; }
-    if (table->location.empty()) { if (why) *why = "the per-layer table has no external data (banded reads need it)"; return -1; }
-    const std::string base = fs::path(gpath).parent_path().string() + "/" + table->location;
-    size_t sz = 0;
-    std::string w2;
-    const uint8_t* m = map_file(base, sz, &w2);
-    if (!m) { if (why) *why = w2; return -1; }
-    const uint64_t row_bytes = uint64_t(meta->width) * 4ull;
-    const uint64_t need_end = table->offset + uint64_t(first_row + rows) * row_bytes;
-    if (need_end > sz) { if (why) *why = "the per-layer table declares more bytes than its data carries"; return -1; }
-    const uint8_t* src = m + table->offset + uint64_t(first_row) * row_bytes;
-    uint16_t* dst = reinterpret_cast<uint16_t*>(out);
-    const size_t n = size_t(rows) * size_t(meta->width);
+    const uint8_t* src = meta.table_f32 + size_t(first_row) * size_t(meta.width) * 4;
+    const size_t n = size_t(rows) * size_t(meta.width);
     for (size_t i = 0; i < n; ++i) {
         float f;
         std::memcpy(&f, src + i * 4, 4);
-        uint32_t b;
-        std::memcpy(&b, &f, 4);
-        const uint32_t lsb = (b >> 16) & 1u;
-        dst[i] = uint16_t((b >> 16) + (lsb && ((b & 0xFFFFu) != 0 || (((b >> 16) & 1u) != 0)) ? 1u : 0u));
+        const uint16_t h = f32_to_bf16(f);
+        std::memcpy(out + i * 2, &h, 2);
     }
     return rows;
 }
@@ -3387,6 +3401,16 @@ struct Writer {
         offset += bytes.size();
         blobs.emplace_back(name, std::move(bytes));
     }
+    // A tensor too large to hold: `produce` writes exactly `bytes` bytes when the container is written, in table order.
+    // (engine#1725: gemma-4-e2b's per-layer table is 4.7 GiB as BF16 and comes from a 9.4 GiB f32 mapping.)
+    void add_stream(const std::string& name, const std::string& dtype, const std::vector<int64_t>& shape, uint64_t bytes,
+                    std::function<void(std::ostream&)> produce) {
+        table[name] = {{"dtype", dtype}, {"shape", shape}, {"data_offsets", {offset, offset + bytes}}};
+        offset += bytes;
+        streams[blobs.size()] = {bytes, std::move(produce)};
+        blobs.emplace_back(name, std::vector<uint8_t>());
+    }
+    std::map<size_t, std::pair<uint64_t, std::function<void(std::ostream&)>>> streams;
     void finish(const json& metadata) {
         json t = json::object();
         t["__metadata__"] = metadata;
@@ -3398,8 +3422,20 @@ struct Writer {
         const uint64_t len = header.size();
         f.write(reinterpret_cast<const char*>(&len), 8);
         f.write(header.data(), std::streamsize(header.size()));
-        for (const auto& [name, bytes] : blobs)
-            f.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        for (size_t i = 0; i < blobs.size(); ++i) {
+            const auto st = streams.find(i);
+            if (st == streams.end()) {
+                f.write(reinterpret_cast<const char*>(blobs[i].second.data()), std::streamsize(blobs[i].second.size()));
+                continue;
+            }
+            const std::streampos before = f.tellp();
+            st->second.second(f);
+            // the header already states this tensor's extent, so a producer that wrote anything else has corrupted
+            // every offset after it
+            if (!f || uint64_t(f.tellp() - before) != st->second.first)
+                throw std::runtime_error(blobs[i].first + ": the streamed tensor did not write the " +
+                                         std::to_string(st->second.first) + " B the container's header states");
+        }
         if (!f) throw std::runtime_error("short write into " + dir + "/model.q4nx");
     }
 };
@@ -3876,42 +3912,39 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // identity = 16 * table[id], per_layer_input = (context + identity)/sqrt(2). Absent for a single-graph pack.
         {
             std::string pl_why;
-            EmbedPerLayer pl = read_embedding_per_layer(pack_dir, H, &pl_why);
+            const EmbedPerLayer pl = read_embedding_per_layer(pack_dir, H, &pl_why);
             if (pl.ok()) {
-                // The token table is streamed: V x (NL*P) f32 is 9.4 GiB on e2b, and a band is 32 rows.
-                std::vector<uint8_t> tbl_bf16(size_t(pl.V) * size_t(pl.width) * 2);
-                bool bands_ok = true;
-                for (int64_t row = 0; row < pl.V; row += 32) {
-                    const int64_t n = (pl.V - row < 32) ? (pl.V - row) : 32;
-                    if (read_per_layer_table_band(pack_dir, &pl, row, n,
-                                                  tbl_bf16.data() + size_t(row) * size_t(pl.width) * 2, &pl_why) != n) {
-                        bands_ok = false;
-                        break;
+                // The table is STREAMED into the container when it is written: V x (NL*P) f32 is 9.4 GiB on e2b and
+                // 4.7 GiB as BF16, so neither form is held -- the producer converts 32 rows at a time (573 KB there)
+                // out of the component's mapping, which the captured `pl` keeps alive until the write.
+                const uint64_t tbl_bytes = uint64_t(pl.V) * uint64_t(pl.width) * 2ull;
+                w.add_stream("model.per_layer_token_embd.weight", "BF16", {pl.V, pl.width}, tbl_bytes,
+                             [pl](std::ostream& f) {
+                                 std::vector<uint8_t> band(size_t(32) * size_t(pl.width) * 2);
+                                 std::string bw;
+                                 for (int64_t row = 0; row < pl.V; row += 32) {
+                                     const int64_t n = (pl.V - row < 32) ? (pl.V - row) : 32;
+                                     if (read_per_layer_table_band(pl, row, n, band.data(), &bw) != n)
+                                         throw std::runtime_error("model.per_layer_token_embd.weight: " + bw);
+                                     f.write(reinterpret_cast<const char*>(band.data()),
+                                             std::streamsize(size_t(n) * size_t(pl.width) * 2));
+                                 }
+                             });
+                if (!pl.norm.empty())
+                    w.add("model.per_layer_proj_norm.weight", "BF16", {pl.P},
+                          as_bf16(reinterpret_cast<const uint8_t*>(pl.norm.data()), kF32, pl.norm.size()));
+                r.tensors += 1 + (pl.norm.empty() ? 0 : 1);
+                if (pl.complete()) {
+                    for (int64_t l = 0; l < pl.NL; ++l) {
+                        w.add("model.per_layer_model_proj.weight_layer" + std::to_string(l), "BF16", {pl.P, pl.H},
+                              as_bf16(reinterpret_cast<const uint8_t*>(pl.model_proj.data() +
+                                                                       size_t(l) * size_t(pl.P) * size_t(pl.H)),
+                                      kF32, size_t(pl.P) * size_t(pl.H)));
+                        ++r.tensors;
                     }
-                }
-                if (bands_ok) {
-                    w.add("model.per_layer_token_embd.weight", "BF16", {pl.V, pl.width}, std::move(tbl_bf16));
-                    if (!pl.norm.empty())
-                        w.add("model.per_layer_proj_norm.weight", "BF16", {pl.P},
-                              as_bf16(reinterpret_cast<const uint8_t*>(pl.norm.data()), kF32, pl.norm.size()));
-                    r.tensors += 1 + (pl.norm.empty() ? 0 : 1);
-                    if (pl.complete()) {
-                        for (int64_t l = 0; l < pl.NL; ++l) {
-                            std::vector<uint8_t> one(size_t(pl.P) * size_t(pl.H) * 2);
-                            for (int64_t o = 0; o < pl.P; ++o)
-                                for (int64_t k = 0; k < pl.H; ++k) {
-                                    const float f = pl.model_proj[size_t(l * pl.P + o) * size_t(pl.H) + size_t(k)];
-                                    uint32_t b;
-                                    std::memcpy(&b, &f, 4);
-                                    const uint32_t lsb = (b >> 16) & 1u;
-                                    reinterpret_cast<uint16_t*>(one.data())[size_t(o) * size_t(pl.H) + size_t(k)] =
-                                        uint16_t((b >> 16) + (lsb && ((b & 0xFFFFu) != 0 || (((b >> 16) & 1u) != 0)) ? 1u : 0u));
-                                }
-                            w.add("model.per_layer_model_proj.weight_layer" + std::to_string(l), "BF16", {pl.P, pl.H},
-                                  std::move(one));
-                            ++r.tensors;
-                        }
-                    }
+                    // what switches the block on in the container's config (written further down, by another writer)
+                    r.per_layer_P = pl.P;
+                    r.per_layer_V = pl.V;
                 }
             }
         }
@@ -4828,16 +4861,11 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // (q4nx_semantics.c), so a container that carries the per-layer tensors but not these two keys would import them
         // and never use them -- the forward skips the block silently. Taken from the component itself, which is where they
         // are measured (gemma-4-e2b: 256 and 262144), rather than from the pack's config, which states them one level down.
-        {
-            // One metadata read, not plumbing: the per-layer facts live in the component, and this config block is in a
-            // different writer from the one that emits the tensors. The table itself is NOT read here (only names, dims
-            // and the quantised projection header), so this costs a file parse and no memory.
-            std::string pl_why;
-            const EmbedPerLayer pl2 = read_embedding_per_layer(pack_dir, p.dims.hidden, &pl_why);
-            if (pl2.complete()) {
-                c["hidden_size_per_layer_input"] = pl2.P;
-                c["vocab_size_per_layer_input"] = pl2.V;
-            }
+        // They come from the component, measured when its tensors were written above (gemma-4-e2b: 256 and 262144), and
+        // are set only when the whole block -- table, norm and context projection -- went into the container.
+        if (r.per_layer_P > 0 && r.per_layer_V > 0) {
+            c["hidden_size_per_layer_input"] = r.per_layer_P;
+            c["vocab_size_per_layer_input"] = r.per_layer_V;
         }
         // The Gemma-4 layer-shape switches the semantics reader also consults, carried through when the pack states them.
         {

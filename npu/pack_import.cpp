@@ -3171,6 +3171,11 @@ static const char* const kTextFiles[] = {"tokenizer.json",
                                          "generation_config.json"};
 
 // The same list every path copies (see kTextFiles): a container without tokenizer.json is not an NPU model directory.
+// engine#1751 follow-up: the ONE copier. Both import paths call it (the .fconst path used to keep its own loop, which
+// threw a bare filesystem_error, while this one counted successes and swallowed failures), and a file the pack HAS that
+// fails to copy is refused by name -- a counter nobody compared let an import "succeed" without tokenizer.json, and serve
+// then refused the directory for a missing tokenizer, the exact misleading report #1751 existed to remove. A file the pack
+// does not ship stays a skip: a pack without a chat template is legitimate.
 static int copy_text_artifacts(const std::string& pack_dir, const std::string& out_dir) {
     int copied = 0;
     for (const char* f : kTextFiles) {
@@ -3178,9 +3183,15 @@ static int copy_text_artifacts(const std::string& pack_dir, const std::string& o
         std::error_code cec;
         if (!fs::exists(src, cec)) continue;
         fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing, cec);
-        if (!cec) ++copied;
+        if (cec)
+            throw std::runtime_error("cannot copy the pack's " + std::string(f) + " into " + out_dir + " (" + cec.message() +
+                                     "); without it the output is not a servable model directory");
+        ++copied;
     }
     return copied;
+}
+int copy_text_artifacts_exported(const std::string& pack_dir, const std::string& out_dir) {
+    return copy_text_artifacts(pack_dir, out_dir);
 }
 
 TextArtifacts scan_text_artifacts(const std::string& pack_dir) {
@@ -3657,6 +3668,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     // this is a loop, not a second reader. The one projection that needs arithmetic is the fused qkv: one
     // [q|k|v] tensor that has to be split by head geometry, since only it is fused.
     if (graph_weights_a) {
+        std::vector<std::string> proj_gaps;
         auto init_of = [&](const std::string& n) -> const OnnxTensor* {
             const auto it = onnx.index.find(n);
             return it == onnx.index.end() ? nullptr : &onnx.tensors[it->second];
@@ -3674,14 +3686,24 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // (engine#1503).
             std::string pre = proj;
             if (!pre.empty() && pre.back() != '.') pre += '.';
+            // Every way out of here that writes nothing is a named gap (engine#1841), never a quiet skip.
+            auto gap = [&](const std::string& why) {
+                proj_gaps.push_back(out_name + ": `" + pre + "` " + why);
+                return false;
+            };
             const OnnxTensor* qw = init_of(pre + "MatMulNBits.qweight");
             const OnnxTensor* sc = init_of(pre + "MatMulNBits.scales");
             if (!qw || !sc) {
                 qw = init_of(pre + "MatMul.weight_Q4");
                 sc = init_of(pre + "MatMul.weight_scales");
             }
-            if (!qw || !sc) return false;   // named, so the caller's refusal says which
-            if (!qw || !sc || qw->dims.size() != 3 || sc->dims.empty()) return false;
+            // plan() counts a projection present on its codes alone, so a pack missing only the scales passed it; returning
+            // quietly here then let the container report itself complete without the projection.
+            if (!qw || !sc)
+                return gap("has no quantised projection the decoder can pair (tried MatMulNBits.qweight + .scales and "
+                           "MatMul.weight_Q4 + _scales)");
+            if (qw->dims.size() != 3 || sc->dims.empty())
+                return gap("qweight is not [N, K/block, block/2], or its scales have no shape");
             const int N = int(qw->dims[0]);
             const int block = int(qw->dims[2]) * 2;            // 64 B holds 128 four-bit codes
             const int K = k_override > 0 ? k_override : int(qw->dims[1]) * block;
@@ -3690,26 +3712,29 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // block the pack used, which is why a block-32 SmolLM-class pack tiles identically (pi-inferzo
             // verified the recipe on amd/SmolLM2-135M-Instruct_rai_1.7.1_hybrid, corr +0.9957 against the
             // pack's own tied embedding).
-            if (block <= 0 || N <= 0 || K <= 0 || K % block || row0 < 0 || row0 + rows > N) return false;
+            if (block <= 0 || N <= 0 || K <= 0 || K % block || row0 < 0 || row0 + rows > N)
+                return gap("has geometry N=" + std::to_string(N) + " K=" + std::to_string(K) + " block=" +
+                           std::to_string(block) + " that does not hold rows [" + std::to_string(row0) + ", " +
+                           std::to_string(row0 + rows) + ")");
             const uint64_t groups = uint64_t(K) / uint64_t(block), nrows = uint64_t(N);
             uint64_t groups_n = 0;
-            if (!mul_ok(nrows, groups, groups_n)) return false;
+            if (!mul_ok(nrows, groups, groups_n)) return gap("declares a size that overflows");
             std::vector<float> scales(static_cast<std::vector<float>::size_type>(groups_n));
             const uint64_t sw = sc->type == kF32 ? 4 : 2;
             uint64_t s_need = 0;
-            if (!mul_ok(groups_n, sw, s_need)) return false;
+            if (!mul_ok(groups_n, sw, s_need)) return gap("declares a size that overflows");
             if (sc->type == kF32) std::memcpy(scales.data(), bytes_of(*sc, s_need), scales.size() * 4);
             else {
                 const auto b = as_bf16(bytes_of(*sc, s_need), sc->type, scales.size());
                 const auto* d = reinterpret_cast<const uint16_t*>(b.data());
                 for (size_t i = 0; i < scales.size(); ++i) scales[i] = bf16_to_f32(d[i]);
             }
-            const OnnxTensor* zt = init_of(proj + ".MatMulNBits.qzeros");
+            const OnnxTensor* zt = init_of(pre + "MatMulNBits.qzeros");
             uint64_t z_need = 0;
-            if (!mul_ok(nrows, (groups + 1) / 2, z_need)) return false;
+            if (!mul_ok(nrows, (groups + 1) / 2, z_need)) return gap("declares a size that overflows");
             const uint8_t* zp = zt ? bytes_of(*zt, z_need) : nullptr;
             uint64_t qw_need = 0;
-            if (!mul_ok(groups_n, uint64_t(block) / 2, qw_need)) return false;
+            if (!mul_ok(groups_n, uint64_t(block) / 2, qw_need)) return gap("declares a size that overflows");
             Q4 q = decode_matmulnbits(bytes_of(*qw, qw_need), scales.data(), zp, N, K, block);
             // No qzeros tensor means the implicit zero point 2^(bits-1) -- the same rule the head path applies, and the
             // one ONNX Runtime's MatMulNBits uses. Missing it here decoded every PROJECTION with zero point 0 while the
@@ -3765,6 +3790,10 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 decode_rows(a + "k_proj", 0, kv_rows, base + ".self_attn.k_proj.weight", 0);
                 decode_rows(a + "v_proj", 0, kv_rows, base + ".self_attn.v_proj.weight", 0);
             }
+        }
+        if (!proj_gaps.empty()) {
+            for (auto& s : proj_gaps) r.refused.push_back(std::move(s));
+            if (!opt.allow_incomplete) return r;   // refuse by name; the container is not written
         }
     }
 
@@ -4582,10 +4611,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         std::ofstream out(out_dir + "/config.json");
         out << c.dump(2) << "\n";
     }
-    for (const char* f : kTextFiles) {
-        const std::string src = pack_dir + "/" + f;
-        if (fs::exists(src)) fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing);
-    }
+    // engine#1751 follow-up: the same copier the external-data path uses, so the two genres cannot drift apart again.
+    copy_text_artifacts(pack_dir, out_dir);
     for (const auto& [name, m] : ext) unmap_file(m, ext_size[name]);
     return r;
 }

@@ -1809,6 +1809,161 @@ std::vector<uint8_t> encode_tile(const TileW& t) {
     return out;
 }
 
+
+constexpr int kLocateSlack = 8;  // tiles of search before the zero-run position
+
+// The placement arithmetic on its own: no file, no decode, no correlation. Split out because it is the half that can be
+// wrong without anything throwing -- an off-by-one tile here reads a plausible region and only the correlation notices
+// -- so it is pinned by a host test that needs no pack, no device and no fixture.
+// TailHeadPlacement is declared in the header: the placement arithmetic is pinned by a host test.
+// bytes = the whole .fconst's length; zeros = trailing all-zero run measured by the caller.
+TailHeadPlacement plan_tail_head(int64_t bytes, int64_t tail_off, int64_t env, int64_t rows, int64_t tile,
+                                        int64_t zeros) {
+    TailHeadPlacement p;
+    p.rows = rows;
+    p.zeros = zeros;
+    p.have = bytes - tail_off;
+    p.want = env + rows * tile;
+    if (p.have < p.want) {
+        p.why = "the .fconst tail is " + std::to_string(p.have) + " B, shorter than the " + std::to_string(p.want) +
+                " B its envelope and head tiles would take";
+        return p;
+    }
+    p.exact = (p.have == p.want);
+    const int64_t base = tail_off + env;
+    p.last = base + ((bytes - zeros - base) / tile - rows) * tile;
+    p.first = p.last - kLocateSlack * tile;
+    if (p.first < base) p.first = base;
+    if (p.last < base) p.last = base;
+    return p;
+}
+
+// engine#1740: where the 1.9 Token .fconst keeps the lm head.
+//
+// The tail is [envelope][rows x tile][padding], and only the middle term is the head. The importer used to require
+// `have == env + rows*tile` exactly, which is true for a pack that ends with the head and false for one that ends with
+// padding -- and on the hidden-1536 family the padding is 110,208,000 B, 11 % of the file. Refusing there is a named
+// refusal, but it refuses the head for a reason that is about placement, not about the fields, and 12+ of the 42 1.9
+// packs keep their head only here.
+//
+// So the placement is measured rather than assumed, in this order:
+//   1. the run of all-zero bytes at EOF (`zeros`), whatever its alignment -- a pack can also end in junk that is not a
+//      whole number of tiles (Hunyuan-0.5B's tail is 28 B off), and that has to be visible rather than rounded away;
+//   2. `rows` consecutive tile-aligned candidates, each starting at most kSlack tiles before the position the zero run
+//      implies, because "the data ends where the zeros begin" is arithmetic and the head may not sit there;
+//   3. the round-trip (decode -> encode) proves the FIELD ORDER and nothing else: an all-zero tile decodes to zeros and
+//      re-encodes to zeros exactly, so padding passes it. Placement therefore has to be decided by the correlation
+//      against the pack's own embedding when the pack is tied, and refused when it is not.
+//
+// The outcome is a value, not a std::string, so the caller cannot accidentally proceed on a refusal.
+struct TailHeadLocate {
+    int64_t off = -1;        // byte offset of head tile 0
+    int64_t rows = 0;        // tiles of the head
+    int64_t zeros = 0;       // trailing all-zero bytes at EOF
+    int64_t slack = 0;       // tiles the accepted placement sits before the zero-run position
+    double  corr = 0.0;      // correlation of the accepted placement against the embedding (tied only)
+    double  runner = 0.0;    // best rejected placement's correlation, for the ambiguity message
+    bool    verified = false;// corr above kTieCorr: this is the head, not merely a decodable region
+    bool    exact = false;   // the tail length matched with no padding at all (the pre-#1740 path)
+    std::string why;         // set on refusal: what was measured, in numbers
+};
+
+static int64_t trailing_zero_run(const Fconst& fc, int64_t from) {
+    const uint8_t* m = fc.map;
+    int64_t i = fc.size;
+    while (i > from && m[i - 1] == 0) --i;
+    return int64_t(fc.size) - i;
+}
+
+// `want` is env + rows*tile at this geometry; `tail_off` is where the tail begins (layers x stride).
+static TailHeadLocate locate_tail_head(const Fconst& fc, int64_t tail_off, int64_t env, int64_t rows, int64_t tile,
+                                      int64_t k, const EmbedTable& embed, bool tied) {
+    TailHeadLocate r;
+    r.rows = rows;
+    r.zeros = trailing_zero_run(fc, tail_off);
+    const TailHeadPlacement plan = plan_tail_head(int64_t(fc.size), tail_off, env, rows, tile, r.zeros);
+    r.exact = plan.exact;
+    if (!plan.why.empty()) {
+        r.why = plan.why;
+        return r;
+    }
+    // Candidate 0 is where the zero run says the head ends; earlier candidates cover a head that does not end at the
+    // last non-zero byte. Every candidate must be tile-aligned to the same phase as the envelope, so a jumbled offset
+    // cannot be mistaken for a placement.
+    const int64_t base = tail_off + env;
+    // The planner gives the earliest and latest tile-aligned candidate; the zero run decides the latest.
+    const int64_t k0 = (plan.last - base) / tile;
+    int64_t best_slack = -1, second_slack = -1;
+    double best = -2.0, second = -2.0;
+    int64_t tried = 0;
+    for (int64_t cand = (plan.first - base) / tile; cand <= k0; ++cand) {
+        const int64_t s = base + cand * tile;
+        if (s < base || s + rows * tile > int64_t(fc.size)) continue;
+        std::vector<TileW> tiles;
+        tiles.reserve(size_t(rows));
+        bool exact_rt = true;
+        for (int64_t i = 0; i < rows; ++i) {
+            const uint8_t* src = fc.map + s + i * tile;
+            tiles.push_back(decode_tile(src, int(k)));
+            const std::vector<uint8_t> back = encode_tile(tiles.back());
+            if (std::memcmp(back.data(), src, size_t(tile)) != 0) exact_rt = false;
+        }
+        ++tried;
+        if (!exact_rt) continue;
+        double c = 0.0;
+        if (tied) {
+            const Q4 q = q_from_tiles(tiles);
+            if (q.N < int(embed.H) || q.K != int(embed.H)) continue;
+            c = corr(q, embed, int(embed.H));
+        }
+        if (c > best) {
+            second = best; second_slack = best_slack;
+            best = c; best_slack = cand;
+        } else if (c > second) {
+            second = c; second_slack = cand;
+        }
+    }
+    if (tried == 0) {
+        r.why = "no tile-aligned placement in the last " + std::to_string(rows + kLocateSlack) + " tiles decodes and "
+                "re-encodes exactly, so the head's fields are not understood at this geometry";
+        return r;
+    }
+    if (best_slack < 0) {
+        r.why = "the tail holds " + std::to_string(tried) + " tile-aligned placement(s) and none of them survives "
+                "decode->encode, so the head's offsets are not established";
+        return r;
+    }
+    r.off = base + best_slack * tile;
+    r.slack = best_slack;
+    r.corr = best;
+    r.runner = second;
+    if (!tied) {
+        // No reference inside the pack: only the exact placement is taken, and it is reported as unverified.
+        if (!r.exact || best_slack != 0) {
+            r.why = "this pack is untied, so the head cannot be verified against its embedding, and its tail carries " +
+                    std::to_string(r.zeros) + " B of trailing zeros -- the placement would be a guess";
+            return r;
+        }
+        r.off = base;
+        r.why.clear();
+        return r;
+    }
+    if (best < kTieCorr) {
+        r.why = "the best placement correlates " + std::to_string(best) + " with the pack's own embedding (the tie "
+                "threshold is " + std::to_string(kTieCorr) + "), so no placement in the tail is the head";
+        return r;
+    }
+    if (second > kTieCorr) {
+        r.why = "two placements both correlate with the embedding (" + std::to_string(best) + " at offset " +
+                std::to_string(base + best_slack * tile) + ", " + std::to_string(second) + " at offset " +
+                std::to_string(base + (second_slack < 0 ? 0 : second_slack) * tile) +
+                "), so the head's offset is ambiguous";
+        return r;
+    }
+    r.verified = true;
+    return r;
+}
+
 Q4 q_from_tiles(const std::vector<TileW>& tiles) {
     if (tiles.empty()) throw std::runtime_error("no tiles");
     const int k = tiles.at(0).k, kbs = k / kKBlock, rows = tiles.at(0).rows;
@@ -3505,18 +3660,18 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 // byte, which the constant would have missed by 2,304.
                 const int64_t env = attn_payload_off(H);
                 const int64_t want = env + rows * tile;
-                const int64_t have = int64_t(fc.size) - tail_off;
-                if (want != have) {
-                    late.push_back("lm_head.weight: the .fconst tail is " + std::to_string(have) + " B, not the " +
-                                   std::to_string(want) + " B its envelope and head tiles would take (" +
-                                   std::to_string(env) + " + " + std::to_string(rows) + " x " +
-                                   std::to_string(tile) + " B), so the head's offsets are not established");
+                // engine#1740: the head is LOCATED, not assumed to end the file. `want == have` was an equality
+                // check on the tail length, so a pack whose .fconst ends in padding (110,208,000 B on the
+                // hidden-1536 family) was refused for a reason about placement rather than about its fields.
+                const TailHeadLocate loc = locate_tail_head(fc, tail_off, env, rows, tile, H, embed_tbl, tie_declared && tied);
+                if (loc.off < 0) {
+                    late.push_back("lm_head.weight: " + loc.why);
                 } else {
                     std::vector<TileW> tiles;
                     tiles.reserve(size_t(rows));
                     bool exact = true;
                     for (int64_t i = 0; i < rows; ++i) {
-                        const uint8_t* src = at(fc, tail_off + env + i * tile, tile);
+                        const uint8_t* src = at(fc, loc.off + i * tile, tile);
                         tiles.push_back(decode_tile(src, int(H)));
                         const std::vector<uint8_t> back = encode_tile(tiles.back());
                         if (std::memcmp(back.data(), src, size_t(tile)) != 0) exact = false;

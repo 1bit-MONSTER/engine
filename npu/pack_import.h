@@ -188,6 +188,22 @@ struct TextArtifacts {
 };
 TextArtifacts scan_text_artifacts(const std::string& pack_dir);
 
+// engine#1740 (W1a): where the 1.9 Token .fconst keeps its output layer. The arithmetic is exposed because it is the
+// half that can be wrong silently -- a one-tile error reads a plausible region and only a correlation against the
+// embedding notices -- so it is pinned by a host test with no pack, no device and no fixture.
+struct TailHeadPlacement {
+    int64_t first = -1;   // earliest tile-aligned candidate (== tail_off + env)
+    int64_t last = -1;    // candidate the trailing zero run implies
+    int64_t rows = 0;
+    int64_t zeros = 0;
+    int64_t have = 0;
+    int64_t want = 0;
+    bool exact = false;   // have == want: the head ends the file
+    std::string why;      // non-empty when no candidate exists
+};
+TailHeadPlacement plan_tail_head(int64_t bytes, int64_t tail_off, int64_t env, int64_t rows, int64_t tile,
+                                 int64_t zeros);
+
 struct Options {
     bool allow_incomplete = false;  // write what is representable and name the rest
     // The device weight layout the container will declare (`q4nx_weight_layout`). Empty means the

@@ -2907,7 +2907,70 @@ void test_embedding_f32_component(const std::string& root) {
     fs::remove_all(b);
 }
 
+// engine#1740 (W1a): the tail-head placement arithmetic, pinned without a pack, a device or a fixture. The rows, the
+// tile size and the envelope are the hidden-896 pack's, so the numbers here are the real ones: 1,856 B envelope,
+// 2,374 tiles of 122,880 B, tail 1,856 + 2,374 x 122,880 = 291,653,952 B.
+void test_tail_head_placement() {
+    const int64_t env = 1856, rows = 2374, tile = 122880;
+    const int64_t head = rows * tile;                    // 291,741,120 B... one tile more than the real tail
+    const int64_t exact_bytes = 896 * 0 + env + head;    // the file ends with the head
+    // (a) the head ends the file: exactly one candidate, no slack
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes, 0, env, rows, tile, 0);
+        check(p.why.empty() && p.exact, "tail placement: a tail that ends with the head is exact");
+        check(p.first == env && p.last == env, "tail placement: and the only candidate is the envelope's end");
+    }
+    // (b) n whole zero tiles after the head: the candidate walks back by exactly n tiles, never past the envelope
+    for (int64_t n : {1, 3, 9}) {
+        const int64_t bytes = exact_bytes + n * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, n * tile);
+        check(p.why.empty() && !p.exact, "tail placement: trailing padding is not the exact case");
+        check(p.last == env,
+              "tail placement: " + std::to_string(n) + " zero tile(s) at EOF still land the head at the envelope's end");
+        check(p.first == env, "tail placement: and the search never walks to before the envelope");
+    }
+    // (c) a clean zero run of ANY length puts the head at the envelope's end -- the padding's size is not a displacement
+    {
+        const int64_t bytes = exact_bytes + 20 * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, 20 * tile);
+        check(p.why.empty() && p.first == env && p.last == env,
+              "tail placement: trailing padding of 20 tiles still ends the head at the envelope's end");
+    }
+    // (c2) but when the file ends in NON-zero bytes after the head, the zero run is short and the candidates span the
+    // slack -- this is the shape the caller's correlation has to decide (the hidden-1536 case)
+    {
+        const int64_t bytes = exact_bytes + 20 * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, 3 * tile);
+        check(p.why.empty() && p.first > env && p.last > p.first,
+              "tail placement: a short zero run before non-zero junk leaves a span of candidates, not one guess");
+    }
+    // (d) refinements: a tail shorter than envelope + head is refused by name, with both numbers in it
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(env + head - 1, 0, env, rows, tile, 0);
+        check(!p.why.empty(), "tail placement: a short tail is refused, not read");
+        check(p.why.find(std::to_string(env + head)) != std::string::npos,
+              "tail placement: and the refusal carries the length it wanted (" + p.why + ")");
+    }
+    // (e) one byte short is refused for the length, and one byte more is a candidate rather than a refusal: the
+    // boundary is exact, which is what keeps a part-tile payload from being rounded up into a head
+    {
+        const pi::TailHeadPlacement short_by_one = pi::plan_tail_head(env + head - 1, 0, env, rows, tile, 0);
+        const pi::TailHeadPlacement one_more = pi::plan_tail_head(env + head + 1, 0, env, rows, tile, 0);
+        check(!short_by_one.why.empty() && one_more.why.empty(),
+              "tail placement: the length boundary is exact (short refused, one byte more is a candidate)");
+        check(one_more.last == env, "tail placement: and the extra byte does not move the head");
+    }
+    // (f) a tail_off that moves the window is honoured: the same arithmetic one layer block later
+    {
+        const int64_t tail_off = 5 * 8708288;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(tail_off + exact_bytes, tail_off, env, rows, tile, 0);
+        check(p.why.empty() && p.last == tail_off + env, "tail placement: the window is relative to tail_off");
+    }
+}
+
+
 int main(int argc, char** argv) {
+    test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
     // The pack leg is the only one that can regress a real pack, and ctest runs this binary with the

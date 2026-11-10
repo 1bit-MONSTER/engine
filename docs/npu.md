@@ -295,8 +295,11 @@ is replaced, with one stderr line saying why:
 The serve log line says what happened: `lm head: N packed weight tile(s) resident (…); H from the
 image cache, P packed (W written for the next serve) in S s`. `ONEBIT_HEAD_IMAGE_CACHE=0` turns
 the cache off (nothing is read or written). The files are `kd × nd` bytes plus `nd` scales per
-tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set; nothing prunes them,
-the same as the device-form copies next to them. Ternary (`pb16i`) heads and the gemv head do not
+tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set. The Q4NX cache sweep
+(`ONEBIT_Q4NX_CACHE_MAX_GIB`, above) counts `head-images/` as one entry of the cache and removes it
+whole when the cache is over its bound and that directory is the least recently written one. Its
+age is the last time a tile was written into it: a serve that only reads its tiles does not refresh
+it. Losing the directory costs the next serve one pack of its head, nothing else. Ternary (`pb16i`) heads and the gemv head do not
 use it: their image already is a file. Each writer builds the file under its own name
 (`<file>.tmp.<pid>`) and renames it into place, so two serves that start cold on the same pack both
 finish their write and a reader only ever sees a whole image. The behaviour is pinned host-side in

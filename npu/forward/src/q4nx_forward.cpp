@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "ops-dump.h"
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
@@ -3053,6 +3054,10 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         // caller's buffer is laid out at `m * a_k`, so every row past the first read the wrong row.
         out.assign((size_t)M * N, 0.0f);
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
+        // Gated diagnostic (NPU_INFER_DUMP_OPS): every projection is logged by the tag its caller already passes
+        // ("attn_qkv", "ssm_out", ...), so there is no second name table. Row 0 of the result is the whole signal
+        // for localising a divergence (engine#1503).
+        if (onebit::npu::ops_dump_enabled()) onebit::npu::ops_dump(sc, cur_layer_, M, out.data(), N);
         return;
     }
     // The device's activation BO holds exactly max_batch_rows() rows (the M=128 prefill design), and a wider
@@ -3784,6 +3789,7 @@ int Q4nxNpuForward::max_batch_rows() const {
 // --------------------------------------------------------------------------
 float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out) const {
     LhScope _tlh(LH_RMS);
+    const bool dump = onebit::npu::ops_dump_enabled();
     double ss = 0.0;
     for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
     const float inv = 1.0f / std::sqrt((float)(ss / (double)n) + sem_.eps);
@@ -3793,6 +3799,9 @@ float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out)
     } else {
         for (int i = 0; i < n; i++) out[i] = x[i] * inv * w[i];
     }
+    // Gated diagnostic (NPU_INFER_DUMP_OPS): the norm's own output, so a divergence can be attributed to it rather
+    // than to the layer it lives in (engine#1503).
+    if (dump) onebit::npu::ops_dump("rmsnorm", cur_layer_, 1, out, n);
     return inv;
 }
 

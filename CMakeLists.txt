@@ -1112,6 +1112,13 @@ target_link_libraries(npu_pack_test PRIVATE onebit_npu)
 # and no runtime.  CI builds an explicit target list, so the check compiles itself with
 # the build's compiler at test time (tests/npu_blocked_layout_test.sh) rather than being
 # one missing target away from "Not Run".
+# The NPU_INFER_DUMP_OPS gate (engine#1503): off unless the variable is set to something other than "" or "0",
+# because a diagnostic must never change a run -- and the per-op line is what localises a divergence to an op when
+# the residual dump only gives layer boundaries.
+add_executable(ops_dump_test tests/ops_dump_test.cpp)
+target_include_directories(ops_dump_test PRIVATE npu/forward/include)
+add_test(NAME ops_dump COMMAND ops_dump_test)
+
 add_test(NAME npu_blocked_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_blocked_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include

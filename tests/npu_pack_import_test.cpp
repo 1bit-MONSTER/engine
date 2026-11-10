@@ -687,6 +687,28 @@ void test_evict_stale_canonical_copies() {
     check(!exists(old_other), "evict: an abandoned geometry older than the age goes (the tail a write cannot reach)");
     check(exists(fresh_other), "evict: a fresh copy of another geometry stays -- another run may be writing it");
 
+    // engine#1797 review: the age rule reads `last_write_time`, and reuse used to READ the copy without writing it -- so
+    // a file in continuous use aged past `max_age_seconds` and was swept, and the next run rewrote it. The repair is
+    // that reuse now touches the copy, which makes the timestamp mean "last use". This arm pins the rule that repair
+    // relies on: a copy with a FRESH mtime survives an age sweep, and one with an old mtime does not.
+    {
+        // DIFFERENT geometry (hidden 1536), so the name rule cannot reach them and only the age rule decides -- which is
+        // the rule this arm is about. Same geometry would test the name rule instead, and my first version of this arm
+        // made exactly that mistake and failed on it.
+        const std::string stem = "1bit-fconst19v1-";
+        const std::string aged = stem + "12345-1536-12-28-995712640-73345656.fconst";
+        const std::string fresh_name = stem + "12345-1536-12-28-500000000-11111111.fconst";
+        touch(aged);
+        touch(fresh_name);
+        std::error_code tec;
+        fs::last_write_time(dir / aged, fs::file_time_type::clock::now() - std::chrono::hours(10), tec);
+        check(!tec, "evict age: the fixture can age a copy");
+        // 6 h window: the 10 h copy goes, the one just written stays
+        pi::evict_stale_canonical_copies(dir.string(), keep, prefix, "", 6 * 3600);
+        check(!exists(aged), "evict age: a copy nobody has touched for 10 h is swept");
+        check(exists(fresh_name), "evict age: a copy with a fresh mtime survives -- what reuse's touch produces");
+        check(exists(keep), "evict age: and the copy being written is still kept");
+    }
     // The degenerate arguments must not turn into "delete the directory".
     for (const auto& f : {keep, stale}) touch(f);
     pi::evict_stale_canonical_copies(dir.string(), "", prefix);

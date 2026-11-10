@@ -562,6 +562,12 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     // and a TRUNCATED copy from an interrupted run is caught by the length test rather than trusted.
     const int64_t expected = int64_t(fc.size) - int64_t(layers) * hdr_len;
     if (canonical_copy_reusable(work, expected)) {
+        // engine#1797 review: the eviction age is `last_write_time`, and a reuse used to READ the file without writing
+        // it -- so a copy in continuous use aged past `max_age_seconds` and was swept, and the next run rewrote a
+        // multi-hundred-MB file. Touching on reuse makes the timestamp mean what the rule assumes: last USE. Errors
+        // are ignored: failing to bump an mtime must not fail an import that already has a good copy.
+        std::error_code tec;
+        fs::last_write_time(fs::path(work), fs::file_time_type::clock::now(), tec);
         unmap_file(fc.map, fc.size);
         return work;
     }

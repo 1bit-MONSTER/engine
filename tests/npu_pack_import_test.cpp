@@ -2001,8 +2001,9 @@ void test_block32_tail_head(const std::string& root) {
               "block-32 tail, fused MLP in the graph: the container still carries the head read from the tail");
         check(x.r.selfcheck_tied && x.r.head_read_note.find("reproduces") != std::string::npos,
               "block-32 tail, fused MLP in the graph: the tied self-check still runs (" + x.r.head_read_note + ")");
-        const json g = json::parse(pi::plan(build(true, "b32-tied-ssmlp-plan", encode_block32_units(emb, V, H), true)
-                                                .string()).manifest());
+        const fs::path plan_dir = build(true, "b32-tied-ssmlp-plan", encode_block32_units(emb, V, H), true);
+        const json g = json::parse(pi::plan(plan_dir.string()).manifest());
+        fs::remove_all(plan_dir);
         check(g.value("graph_weights", json::object()).value("matmulnbits_ops", int64_t(-1)) == 0,
               "block-32 tail, fused MLP in the graph: SSMLP attributes are not counted as graph matmuls");
     }

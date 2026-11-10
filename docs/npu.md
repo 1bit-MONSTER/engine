@@ -1559,8 +1559,34 @@ resize. Every piece is a multiple of 56 pixels (4 patches) in both extents, beca
 (heights first.) So one 448-pixel slice is 64 rows, not the 1,225 that 980 / 14 / 2 squared suggests: the
 position table is 70 × 70, but no piece the processor produces is that large unless the image is a very
 long strip. The plan is checked against the reference's own answers for 3,481 image sizes in
-`tests/npu_vision_plan_test.cpp`. Resampling the pixels (the reference uses bicubic), rescaling and the
-slice separators on the text side are not written.
+`tests/npu_vision_plan_test.cpp`.
+
+**From bytes to the tower's input (`npu/vision_image.h`).** `vision::preprocess(rgb, height, width, plan)`
+resizes an RGB byte image to the plan's whole view and, when it is sliced, to the refine size, cuts the
+slices, and returns each piece as `(3, height, width)` float32 with value `(byte − 127.5) / 127.5`: the
+whole view first, then the slices row by row. The resize is bicubic with antialiasing on bytes and
+reproduces `torch.nn.functional.interpolate(uint8, mode="bicubic", antialias=True)` (torch 2.13) bit
+for bit: the a = −0.5 cubic stretched by the scale when shrinking, integer weights at the largest
+precision that still fits int16 (PIL's fixed 22 bits differs by one in about 1 % of bytes), width
+first and then height. `tests/npu_vision_image_test.cpp` holds the reference's bytes for eleven
+resizes as hashes.
+
+End to end on the 1B pack, 2026-11-10: a 460 × 470 synthetic image through plan, resize, pieces and
+`tower_forward()`, against the reference's plan, torch's resize and the transformers tower on the same
+image:
+
+| piece | patches | rows | max \|d\| | corr |
+|---|---|---|---|---|
+| whole view 448 × 448 | 32 × 32 | 64 | 6.4e-6 | 1.000000000 |
+| slice 0, 616 × 336 | 44 × 24 | 66 | 7.5e-6 | 1.000000000 |
+| slice 1, 616 × 336 | 44 × 24 | 66 | 6.7e-6 | 1.000000000 |
+
+That run took 110 s on one thread, which is the host reference's cost and the reason it is not a
+serving path. Two things are not established: the reference side called torch's `interpolate`
+directly, on the understanding that this is what the processor's torchvision resize does for byte
+images on a CPU build with AVX2 (torchvision is not on this box, so that link is read, not run); and
+no real photograph or image decoder has been through it. The slice separators and placeholder rows on
+the text side are not written.
 
 ## Serving
 

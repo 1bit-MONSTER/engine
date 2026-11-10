@@ -693,7 +693,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp
                             npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
@@ -1224,6 +1224,11 @@ add_executable(npu_vision_plan_test tests/npu_vision_plan_test.cpp)
 target_include_directories(npu_vision_plan_test PRIVATE npu)
 add_test(NAME npu_vision_plan COMMAND npu_vision_plan_test)
 add_dependencies(onebit npu_vision_plan_test)
+# The resize (bit for bit against torch's uint8 antialiased bicubic) and the pieces handed to the tower.
+add_executable(npu_vision_image_test tests/npu_vision_image_test.cpp)
+target_link_libraries(npu_vision_image_test PRIVATE onebit_npu)
+add_test(NAME npu_vision_image COMMAND npu_vision_image_test)
+add_dependencies(onebit npu_vision_image_test)
 add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)

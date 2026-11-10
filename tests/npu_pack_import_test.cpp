@@ -2945,7 +2945,7 @@ void test_per_layer_container(const std::string& root) {
              R"({"model_type":"gemma4","hidden_size":3,"intermediate_size":6,"num_hidden_layers":1,)"
              R"("num_attention_heads":1,"num_key_value_heads":1,"head_dim":3,"vocab_size":4,"rope_theta":10000.0})");
     std::string why;
-    const pi::EmbedPerLayer pl = pi::read_embedding_per_layer(dir.string(), &why);
+    const pi::EmbedPerLayer pl = pi::read_embedding_per_layer(dir.string(), 3, &why);
     std::printf("per-layer: V %lld width %lld, why: %s (tok %zu per %zu norm %zu bytes)\n", (long long) pl.V,
                 (long long) pl.width, why.c_str(), tok_bytes, per_bytes, norm.size() * 4);
     check(pl.ok(), "per-layer: the table and its projection norm are read from the component genai_config.json names");

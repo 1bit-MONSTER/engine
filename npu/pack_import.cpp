@@ -917,7 +917,7 @@ DeclaredMap read_declared(const std::string& pack_dir) {
 // dtype rule slice 1 established: f32 is read, anything else unquantised is refused by dtype rather than mis-read.
 // Kept separate from read_embedding_component() because the shapes differ (V x width and a width-wide norm, not V x H)
 // and because the consumer differs: the token table is the head's ORACLE, these are a decoder INPUT.
-EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, std::string* why) {
+EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidden, std::string* why) {
     EmbedPerLayer out;
     std::string gpath = pack_dir + "/embedding.onnx";
     {
@@ -981,6 +981,54 @@ EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, std::string*
         !norm->location.empty()) {
         if (!read_f32(*norm, size_t(width), "per_layer_projection_norm", &out.norm)) return out;
     }
+    // The context projection: `per_layer_model_projection.weight_t_Q4` [width][H] at block 32, with `..._t_scales` and
+    // packed `..._t_zero_point`. Dequantised through the file's own MatMulNBits decoder so the arithmetic is the one the
+    // rest of the importer uses, then split into one [P][H] matrix per layer for the loader's naming.
+    {
+        const OnnxTensor* pw = nullptr;
+        const OnnxTensor* ps = nullptr;
+        const OnnxTensor* pz = nullptr;
+        for (const auto& t : em.tensors) {
+            if (t.name.find("per_layer_model_projection") == std::string::npos) continue;
+            if (t.name.find("scale") != std::string::npos) ps = &t;
+            else if (t.name.find("zero_point") != std::string::npos) pz = &t;
+            else if (t.name.find("_Q4") != std::string::npos) pw = &t;
+        }
+        if (pw && ps && hidden > 0 && width > 0) {
+            const std::string gdir = fs::path(gpath).parent_path().string();
+            const auto blob = [&](const OnnxTensor& t, std::string* w4) -> const uint8_t* {
+                if (t.location.empty()) return t.raw;
+                size_t sz = 0;
+                return map_file(gdir + "/" + t.location, sz, w4);
+            };
+            std::string wa, wb, wc;
+            const uint8_t* qw = blob(*pw, &wa);
+            const uint8_t* sc = blob(*ps, &wb);
+            const uint8_t* zp = pz ? blob(*pz, &wc) : nullptr;
+            if (qw && sc) {
+                const int64_t H = hidden;
+                const Q4 q = decode_matmulnbits(qw, reinterpret_cast<const float*>(sc), zp, int(width), int(H), 32,
+                                                false, zp == nullptr);
+                if (q.N == int(width) && q.K == int(H)) {
+                    // NL = width / P; the norm is P wide, so P comes from it when the component states one.
+                    const int64_t Pn = !out.norm.empty() ? int64_t(out.norm.size()) : width / (width / 256 ? width / 256 : 1);
+                    out.P = Pn > 0 ? Pn : width;
+                    out.NL = width / out.P;
+                    if (out.NL > 0 && out.NL * out.P == width) {
+                        out.model_proj.assign(size_t(out.NL) * size_t(out.P) * size_t(H), 0.0f);
+                        for (int64_t n = 0; n < width; ++n)
+                            for (int64_t k = 0; k < H; ++k) {
+                                const size_t ci = size_t(n) * size_t(H) + size_t(k);
+                                const size_t gi = size_t(n) * size_t(H / 32) + size_t(k / 32);
+                                out.model_proj[size_t(n) * size_t(H) + size_t(k)] =
+                                    float(q.codes[ci]) * q.scale[gi] + q.zero[gi];
+                            }
+                        out.H = H;
+                    }
+                }
+            }
+        }
+    }
     if (out.norm.empty()) {
         // No projection norm: the table is still usable, but say so — a consumer that expects the projection to be
         // normalised would otherwise silently use raw rows.
@@ -988,6 +1036,7 @@ EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, std::string*
     }
     out.V = V;
     out.width = width;
+    if (out.P <= 0) out.P = int64_t(out.norm.size());   // the norm is P wide: it states the per-layer width
     return out;
 }
 
@@ -3112,7 +3161,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // than a refusal.
         {
             std::string pl_why;
-            const EmbedPerLayer pl = read_embedding_per_layer(pack_dir, &pl_why);
+            const EmbedPerLayer pl = read_embedding_per_layer(pack_dir, H, &pl_why);
             if (pl.ok()) {
                 w.add("model.embed_tokens_per_layer.weight", "BF16", {pl.V, pl.width},
                       as_bf16(reinterpret_cast<const uint8_t*>(pl.table.data()), kF32, pl.table.size()));

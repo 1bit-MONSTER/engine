@@ -84,12 +84,27 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
 // Read separately from the token table because they have different shapes and different consumers: the token table
 // becomes the head oracle, this becomes an input. Empty (with `why`) when the component has no per-layer table.
 struct EmbedPerLayer {
-    std::vector<float> table;   // [V][layers*head_dim], row-major
-    std::vector<float> norm;    // [layers*head_dim]
-    int64_t          V = 0, width = 0;
-    bool ok() const { return V > 0 && width > 0 && table.size() == size_t(V) * size_t(width) && norm.size() == size_t(width); }
+    std::vector<float> table;   // [V][layers*P], row-major   (embed_tokens_per_layer.weight)
+    std::vector<float> norm;    // [P]                       (per_layer_projection_norm.weight, shared by every layer)
+    // The CONTEXT projection: the component carries it quantised as
+    // `per_layer_model_projection.weight_t_Q4` [layers*P][H] plus scales and packed zero points. The loader wants it
+    // dequantised, one [P][H] matrix per layer (`model.per_layer_model_proj.weight_layer{l}`), so it is dequantised here
+    // -- without it the per-layer input is `16*table/sqrt(2)`, plausible and wrong at every layer (engine#1725).
+    std::vector<float> model_proj;   // [layers][P][H]
+    int64_t          V = 0, width = 0, P = 0, H = 0, NL = 0;
+    // `ok()` is what the reader guarantees: the table and the projection norm. `complete()` additionally requires the
+    // context projection, which the PLE contract needs -- a component with `ok()` but not `complete()` imports the table
+    // and will be refused by the loader on `per_layer_model_proj.weight_layer0`, which is the honest place to refuse
+    // (the importer does not know whether the decoder declares per_layer_inputs).
+    bool ok() const {
+        return V > 0 && width > 0 && table.size() == size_t(V) * size_t(width) &&
+               (!norm.empty() ? norm.size() == size_t(P) : true);
+    }
+    bool complete() const { return ok() && P > 0 && H > 0 && NL > 0 && model_proj.size() == size_t(NL) * size_t(P) * size_t(H); }
 };
-EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, std::string* why);
+// `hidden` is the decoder's hidden size (the context projection's K); it comes from the pack's geometry, not from
+// the component, which is why the caller passes it.
+EmbedPerLayer read_embedding_per_layer(const std::string& pack_dir, int64_t hidden, std::string* why);
 
 // One tensor the pack describes, and where its values would come from.
 struct Planned {

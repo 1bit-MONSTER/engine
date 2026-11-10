@@ -937,6 +937,18 @@ finally:
 check("a 401 falls back to anonymous instead of failing the run",
       page == [{"id": "x/y"}] and seen_auth[0] == "Bearer hf_stale" and seen_auth[1] is None)
 
+
+# 17. engine#1922: DeepSeek V4.1 Flash SuperExpert is reviewed and report-only -- listed, not alerted.
+# The class is remote code (its own modeling_ module) AND ships AW-SECD-compressed weights, so nothing at
+# the pin decodes it: mapping it in architectures.json would name a backend that cannot read the file.
+_DS = "DeepseekV4FlashSuperExpertForCausalLM"
+check("engine#1922 class is recorded as report-only",
+      sig.get(_DS, {}).get("watch") == "report")
+check("engine#1922 entry states WHY (the compressed weights), not just that it is declined",
+      "AW-SECD" in sig.get(_DS, {}).get("family", ""))
+check("engine#1922 class stays out of the runtime registry", _DS not in archs)
+check("engine#1922 entry records its model_type", sig.get(_DS, {}).get("model_type") == "deepseek_v4_flash_superexpert")
+
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)

@@ -36,13 +36,14 @@ bin=${1:?usage: serve_context_limit_test.sh path/to/1bit <model> <device> [ctx] 
 here=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=tests/serve_port.sh
 . "$(dirname "$0")/serve_port.sh"
-model=${2:?}
+model=${2:-}   # empty in CI unless ONEBIT_SERVE_TEST_GGUF is set: that is a SKIP, not a failure
 device=${3:?}
 ctx=${4:-512}
 [ "$ctx" -ge 64 ] 2>/dev/null || ctx=512
 shift 3
 if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then shift; fi   # the optional ctx argument, when given
 
+[ -n "$model" ] || { echo "skip: no model given (set ONEBIT_SERVE_TEST_GGUF - engine#1779: this test is registered in CI and must show as a skip, not as an absent test)"; exit 77; }
 [ -x "$bin" ] || { echo "skip: no 1bit at $bin"; exit 77; }
 [ -f "$model" ] || { echo "skip: no model at $model"; exit 77; }
 command -v curl > /dev/null || { echo "skip: no curl"; exit 77; }

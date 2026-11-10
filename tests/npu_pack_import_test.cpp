@@ -640,6 +640,46 @@ void test_canonical_copy_reusable() {
 // engine#1770: the canonical copy is scratch that used to only ever accumulate -- reuse writes a new file when the source
 // changes, so 699 files / 8.7 GiB of tmpfs (RAM) had built up on one box. The eviction rule is "same pack and geometry,
 // different source identity", and what can go wrong is deleting one of the neighbours that must survive, so each is an arm.
+// engine#1907: the eviction must reach the scratch directories a run did NOT write to. Since the canonical copy moved to the
+// on-disk cache, /tmp (tmpfs) was never swept again and 17.0 GiB of copies from older binaries stayed in RAM. The chosen
+// directory is left to the writer's own sweep, and the current directory is never swept.
+void test_sweep_other_fconst_scratch() {
+    const fs::path base = fs::temp_directory_path() / ("1bit-sweep-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(base, ec);
+    const fs::path chosen = base / "cache", other = base / "tmp", cwd = base / "cwd";
+    for (const auto& d : {chosen, other, cwd}) fs::create_directories(d);
+    const std::string prefix = "1bit-fconst19v1-76263210-896-14-24-";
+    const std::string keep = prefix + "291653952-1.fconst";
+    const auto old = fs::file_time_type::clock::now() - std::chrono::hours(7);
+    auto mk = [&](const fs::path& p, bool aged) {
+        put_file(p.string(), "x");
+        if (aged) fs::last_write_time(p, old, ec);
+        return p;
+    };
+    const fs::path o_old = mk(other / "1bit-fconst19v1-111-4096-32-32-9-9.fconst", true);   // another pack, 7 h old
+    const fs::path o_new = mk(other / "1bit-fconst19v1-222-4096-32-32-9-9.fconst", false);  // another pack, fresh
+    const fs::path o_sib = mk(other / (prefix + "291653952-0.fconst"), false);               // THIS pack, stale identity
+    const fs::path o_unrel = mk(other / "notes.txt", true);                                   // not the stem
+    const fs::path c_old = mk(chosen / "1bit-fconst19v1-333-4096-32-32-9-9.fconst", true);   // chosen dir: not this sweep's
+    const fs::path w_old = mk(cwd / "1bit-fconst19v1-444-4096-32-32-9-9.fconst", true);      // cwd: never swept
+    const fs::path prev = fs::current_path(ec);
+    fs::current_path(cwd, ec);
+    const int swept = pi::sweep_other_fconst_scratch({chosen.string(), other.string(), ".", cwd.string()}, chosen.string(),
+                                                     keep, prefix, "", 6 * 3600);
+    fs::current_path(prev, ec);
+    check(swept == 1, "scratch sweep: exactly the one directory that is neither chosen nor the cwd is swept (" +
+                          std::to_string(swept) + ")");
+    check(!fs::exists(o_old), "scratch sweep: a 7 h old copy in a directory the run did not write to goes (the #1907 RAM)");
+    check(fs::exists(o_new), "scratch sweep: a fresh copy of another pack there is kept -- a lane may be using it");
+    check(!fs::exists(o_sib), "scratch sweep: this pack's stale-identity sibling there goes too");
+    check(fs::exists(o_unrel), "scratch sweep: a file that is not fconst19 scratch is kept, however old");
+    check(fs::exists(c_old), "scratch sweep: the chosen directory is left to the writer's own sweep");
+    check(fs::exists(w_old), "scratch sweep: the current directory is never swept, however old the file");
+    fs::remove_all(base, ec);
+    std::printf("  scratch sweep: other scratch dirs swept by age and sibling, chosen dir and cwd left alone\n");
+}
+
 void test_evict_stale_canonical_copies() {
     const fs::path dir = fs::temp_directory_path() / ("1bit-evict-" + std::to_string(::getpid()));
     std::error_code ec;
@@ -3682,7 +3722,7 @@ int main(int argc, char** argv) {
     test_external_roles();
     test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
-        test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
+        test_canonical_copy_reusable();        test_evict_stale_canonical_copies(); test_sweep_other_fconst_scratch();
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);

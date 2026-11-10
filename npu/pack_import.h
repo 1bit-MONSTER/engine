@@ -492,6 +492,11 @@ const Fconst19Rule* fconst19_rules(int* count);
 // directory, then the temp directory and the cwd. Exposed so a test can pin the order -- the bug that shipped once was a cache
 // directory that was never created, so every pack silently fell through to tmpfs.
 std::vector<std::string> fconst_scratch_dirs();
+// engine#1907: run evict_stale_canonical_copies() over every directory in `dirs` except `chosen_dir` (already swept by the
+// write) and the current directory (a write fallback, never swept). Returns how many directories were swept.
+int sweep_other_fconst_scratch(const std::vector<std::string>& dirs, const std::string& chosen_dir,
+                               const std::string& keep_name, const std::string& prefix, const std::string& legacy_name,
+                               int64_t max_age_seconds);
 // True when `dir` is, or can be made into, a directory the scratch copy may be written to. Exposed with the order above because the
 // bug #1801 shipped once was exactly this: the cache directory existed only in the comment.
 bool fconst_scratch_ready(const std::string& dir);

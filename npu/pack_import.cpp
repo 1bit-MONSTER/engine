@@ -753,6 +753,8 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
         const std::string legacy_name = std::string(kScratchStem) + "-" + tag + "-" + std::to_string(dims.hidden) + "-" +
                                         std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst";
         evict_stale_canonical_copies(d.string(), name, ident_prefix, legacy_name, kScratchMaxAgeSeconds);
+        // engine#1907: and the scratch directories this run did NOT write to -- above all /tmp, which older binaries used.
+        sweep_other_fconst_scratch(fconst_scratch_dirs(), d.string(), name, ident_prefix, legacy_name, kScratchMaxAgeSeconds);
         // Say where it went whenever that is not the ordinary place: the copy is a few hundred MB and it is scratch.
         std::error_code ec2;
         const fs::path tmpdir = [&] { try { return fs::temp_directory_path(); } catch (...) { return fs::path(); } }();
@@ -4906,6 +4908,30 @@ void evict_stale_canonical_copies(const std::string& dir, const std::string& kee
             }
         }
     }
+}
+
+// engine#1907: the sweep above ran only on the directory the copy was WRITTEN to. Since #1801 that is the on-disk cache, so
+// the copies older binaries left in /tmp (tmpfs, i.e. RAM) were never looked at again -- 188 files, 17.0 GiB measured on
+// strixhalo 2026-11-10, 2-9 h old. Every other scratch directory gets the same rules (stale siblings of this pack and geometry,
+// and anything of the stem untouched for `max_age_seconds`). The current directory is never swept: it is the last-resort
+// WRITE location, not a scratch directory, and a user's working directory is not this importer's to clean.
+int sweep_other_fconst_scratch(const std::vector<std::string>& dirs, const std::string& chosen_dir,
+                               const std::string& keep_name, const std::string& prefix, const std::string& legacy_name,
+                               int64_t max_age_seconds) {
+    std::error_code ec;
+    const fs::path chosen = chosen_dir.empty() ? fs::path() : fs::weakly_canonical(fs::path(chosen_dir), ec);
+    const fs::path cwd = fs::weakly_canonical(fs::current_path(ec), ec);
+    int swept = 0;
+    for (const std::string& d : dirs) {
+        if (d.empty() || d == ".") continue;
+        std::error_code e2;
+        if (!fs::is_directory(fs::path(d), e2)) continue;
+        const fs::path c = fs::weakly_canonical(fs::path(d), e2);
+        if (e2 || c == chosen || c == cwd) continue;
+        evict_stale_canonical_copies(d, keep_name, prefix, legacy_name, max_age_seconds);
+        ++swept;
+    }
+    return swept;
 }
 
 }  // namespace onebit::npu::pack_import

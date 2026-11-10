@@ -1042,19 +1042,11 @@ std::vector<float> read_embedding_component(const std::string& pack_dir, std::st
     // and a 256-wide projection norm, and no reader here implements that mechanism yet. So: read the token table, refuse
     // by NAME when the per-layer table is present, instead of reporting the shape mismatch as a missing table.
     if (table && !scales) {
-        const bool per_layer = [&] {
-            for (const auto& t2 : em.tensors)
-                if (t2.name.find("embed_tokens_per_layer") != std::string::npos) return true;
-            return false;
-        }();
-        if (per_layer) {
-            if (why)
-                *why = "the component carries embedding.embed_tokens_per_layer.weight, i.e. a PER-LAYER embedding table "
-                       "(262144x8960 on gemma-4-e2b = layers x head_dim) that feeds the decoder's per_layer_inputs, and "
-                       "the per-layer embedding mechanism is not implemented here yet (engine#1725): refusing rather "
-                       "than importing a decoder without that input";
-            return {};
-        }
+        // engine#1725: a component that ALSO carries `embed_tokens_per_layer` used to be refused here, because the
+        // per-layer mechanism did not exist and importing would have given the decoder less than it asks for. It exists
+        // now: `read_embedding_per_layer()` reads that table and its projection norm (this file), and import_pack() writes
+        // both into the container beside the token table. So the token table is read normally here, and the per-layer
+        // half is not this reader's business -- mixing the two was why the refusal had to be conservative.
         if (table->type != kF32) {
             if (why) *why = "embed_tokens is unquantised with dtype " + std::to_string(table->type) +
                             ", and only f32 is read here (engine#1725)";
@@ -3114,6 +3106,21 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         embed_tbl = EmbedTable{embed_bf16.data(), EmbedTable::Fmt::BF16, int(H)};
         w.add("model.embed_tokens.weight", "BF16", {V, H}, embed_bf16);
         ++r.tensors;
+        // engine#1725: a multi-component pack's embedding also carries the PER-LAYER table and its projection norm, which
+        // the decoder consumes as `per_layer_inputs`. Written as BF16 like every other table here (the component ships
+        // f32); the forward path does the gather. Absent for a single-graph pack, which is why this is conditional rather
+        // than a refusal.
+        {
+            std::string pl_why;
+            const EmbedPerLayer pl = read_embedding_per_layer(pack_dir, &pl_why);
+            if (pl.ok()) {
+                w.add("model.embed_tokens_per_layer.weight", "BF16", {pl.V, pl.width},
+                      as_bf16(reinterpret_cast<const uint8_t*>(pl.table.data()), kF32, pl.table.size()));
+                w.add("model.per_layer_projection_norm.weight", "BF16", {pl.width},
+                      as_bf16(reinterpret_cast<const uint8_t*>(pl.norm.data()), kF32, pl.norm.size()));
+                r.tensors += 2;
+            }
+        }
     }
 
     // genre A = the graph carries real weights and there is no .fconst to read (the same test plan() uses)

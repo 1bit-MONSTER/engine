@@ -3360,6 +3360,28 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     // q4nx_weight_layout b8", and then finding the key absent from config.json (engine#1503).
     if (const std::string why = weight_layout_refusal(opt.weight_layout); !why.empty())
         throw std::runtime_error("--weight-layout: " + why);
+    // A FINAL NORM the pack does not carry. phi-4's graph has 80 `SkipSimplifiedLayerNormalization` ops (two per layer)
+    // and none at model level: its only model-scope tensor is the embedding. The forward nevertheless applies a final
+    // RMSNorm before the head, and with no weight tensor it read zeros -- `[mla] final xn: mean|x|=0.000000` -- so every
+    // logit was 0, the argmax was token 0, and the model answered `!!!!!!!!!!!!!!!!!!!!!!!!` on every prompt while the
+    // residual stream looked (wrongly) like the only problem. Writing a UNIT gain is what the pack's own graph means
+    // (the norm runs, with no learned scale), and the container says so rather than leaving the absence to be guessed.
+    bool have_final_norm = false;
+    for (const auto& t : onnx.tensors)
+        if (t.name == "model.norm.weight" || t.name == "model.final_layernorm.weight") have_final_norm = true;
+    if (!have_final_norm && p.dims.hidden > 0) {
+        std::vector<uint8_t> ones(size_t(p.dims.hidden) * 2);
+        for (int64_t i = 0; i < p.dims.hidden; ++i) {
+            const uint16_t one = bf16_bits_of(1.0f);
+            ones[size_t(i) * 2] = uint8_t(one & 0xFF);
+            ones[size_t(i) * 2 + 1] = uint8_t(one >> 8);
+        }
+        w.add("model.norm.weight", "BF16", {p.dims.hidden}, std::move(ones));
+        ++r.tensors;
+        std::fprintf(stderr,
+                     "npu-pack: the pack carries no final RMSNorm weight; wrote a unit gain (the pack's graph runs the "
+                     "norm with no learned scale)\n");
+    }
     json c;
     // engine#1794 review: the container's OWN config is what the forward reads (`q4nx_semantics.c:121` value_for_top,
     // depth 1 only), and this writer started from an empty json -- so a mRoPE declaration that lives only at
@@ -3373,6 +3395,7 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         if (geom.contains("mrope_section")) c["mrope_section"] = geom["mrope_section"];
     }
     c["model_type"] = p.dims.model_type;
+    if (!have_final_norm) c["q4nx_final_norm"] = "unit gain written: the pack carries no final-norm weight tensor";
     c["hidden_size"] = p.dims.hidden;
     c["intermediate_size"] = p.dims.intermediate;
     c["num_hidden_layers"] = p.dims.layers;

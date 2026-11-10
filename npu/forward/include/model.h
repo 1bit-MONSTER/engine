@@ -18,6 +18,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include "common.h"
 
 #ifdef __cplusplus
@@ -130,6 +131,33 @@ void* model_tensor_data(ModelWeights* mw, TensorDesc* desc);
 // Used for architecture-specific tensors the fixed fields do not cover.
 // (Distinct from the legacy model_find_tensor(name, mw), which returns an index.)
 TensorDesc* model_tensor_by_name(ModelWeights* mw, const char* name);
+// engine#1786 (item F1): three FastFlowLM NPU2 model sources spell the per-layer prefix `model.layer.` (singular)
+// where this forward addresses `model.layers.`. Writes the OTHER spelling into `out` and returns 1 when `name` carries
+// either prefix, 0 when it does not. Only the leading prefix is swapped, once: a caller that wants a fallback retries
+// the lookup with this name AFTER an exact match has failed, so a container carrying both spellings still resolves
+// exactly first. Pure string work, exported so a test can pin it without a container.
+static inline int model_tensor_name_alt(const char* name, char* out, size_t cap) {
+    static const char kPlural[]   = "model.layers.";
+    static const char kSingular[] = "model.layer.";
+    const size_t nl = sizeof(kPlural) - 1, ns = sizeof(kSingular) - 1;
+    const char* to;
+    size_t fl;
+    if (!name || !out || cap == 0) return 0;
+    if (strncmp(name, kPlural, nl) == 0) {          /* model.layers. -> model.layer. */
+        to = kSingular; fl = nl;                    /* fl is the MATCHED prefix's length, not the target's */
+    } else if (strncmp(name, kSingular, ns) == 0) { /* model.layer.  -> model.layers. */
+        to = kPlural; fl = ns;
+    } else {
+        return 0;
+    }
+    const char* rest = name + fl;                   /* everything after the prefix, unchanged */
+    const size_t rl = strlen(rest);
+    const size_t tl = (to == kPlural) ? nl : ns;
+    if (tl + rl + 1 > cap) return 0;
+    memcpy(out, to, tl);
+    memcpy(out + tl, rest, rl + 1);
+    return 1;
+}
 void model_print_info(ModelWeights* mw);
 int model_find_tensor(const char* name, ModelWeights* mw);
 

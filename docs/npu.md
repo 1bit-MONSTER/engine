@@ -1138,6 +1138,17 @@ their hidden sizes differ). `plan()` accepts a block of 2 or 4 headers, checks e
 that arithmetic to the byte, and refuses any other count by name. FACTS §7.24 has the tables and
 the checkpoint evidence.
 
+**A 2-header block can carry the gains too, in the other order** (engine#1889, engine#1934). The
+Hunyuan packs declare `use_qk_norm: true` and keep one header per block: the gains are the 640 B
+between the last q/k/v tile and o_proj, which the pack's metadata names as one tensor
+(`model.layers.L.attn.q_norm.layernorm.weight.qk_rms_packed_26_L`, bf16 `[320]`). Its layout is
+`[64 B zeros][q_norm, bf16 [128]][64 B zeros][k_norm, bf16 [128]]` — **q first**, the reverse of
+the Qwen3 sections above. The order is not readable from the bytes (the two gains differ by about
+one bf16 ulp in a few elements, so both look like a gain), so it was taken from the pack's own
+graph: `model.onnx` carries `attn.q_norm.layernorm.weight` and `attn.k_norm.layernorm.weight` as
+FP16 `[128]` initializers, and on Hunyuan-7B-Instruct their bf16 rounding is the first and the
+second block bit for bit in 32 of 32 layers. `qk_gain_offsets()` holds that arithmetic.
+
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
 one comparison holds every field, index and nibble order at once, and it is why a tile whose
@@ -1818,6 +1829,57 @@ usable beside another NPU engine, and what its limits are:
   not wait for other shared holders"; `LOCK_EX` = "I want the device to myself". A holder keeps its fd
   open for the life of the process; closing or exiting releases it. `LOCK_EX` and `LOCK_SH` never
   overlap, in either order, on one file.
+### `NPU_INFER_HOST_GEMM=i8`: the integer arm, and why a float one cannot gate a kernel
+
+`NPU_INFER_HOST_GEMM=1` runs the forward on the host with **f32** GEMMs. That is enough to tell a structural
+break (garbage output) from a working route, and it is *not* enough to check a kernel family: the device's
+weights are int8 codes with one multiplier per column and its accumulators are int32, so an f32 arm differs from
+it by quantisation alone -- measured on the h4096 family, cosine 0.9960-0.9974 and an argmax flip at step 3,
+none of which is a kernel fault. A family gated against f32 can therefore never be *bit-exact*, which is the bar
+`TISSUES-ALL` §4 asks for.
+
+`NPU_INFER_HOST_GEMM=i8` is the reference that can. It builds each body GEMM's weight image with the engine's
+own packer (`q4nx_pack_B_int8_blocked()`: one multiplier per column, int8 codes, blocked microtile order), walks
+it with `q4nx_layout::blocked_index()`, quantises the activation row to int8 with `amax/127`, accumulates in
+int32 and applies `d[n] * (ascale * acc)`. **Same packer, same image, same order** -- that is the whole point: a
+reference that re-quantises by a different rule computes a different model, and will disagree with a correct
+device (measured: per-128-K int4 codes answer `ikt` to a question four other packs answer correctly on).
+
+The LM head is included, in vocabulary blocks (a whole head image is H x V bytes, 622 MB at 150k vocabulary).
+Without it the body is exact and the head is not, and the residual shows up as `max|d| ~ 0.3` on logits that no
+amount of body-side agreement can remove.
+
+**What it measures.** Run the device arm and the `=i8` arm on the same request with `--dump-logits`, then
+`scripts/families/compare-logits.py` (npu-kernels). On `kernels-h4096-b8` with Mistral-7B-Instruct-v0.2 1.9:
+
+```
+step 0: argmax 3916 == 3916    cos 1.000000   max|d| 0
+step 1: argmax  278 ==  278    cos 1.000000   max|d| 0
+step 2: argmax 28725 == 28725  cos 1.000000   max|d| 0
+step 3: argmax 22478 == 22478  cos 1.000000   max|d| 0
+BIT-EXACT over 4 step(s) at max|d| tolerance 0.0
+```
+three repeats of the device arm, an edge case (`Hi`), and run-to-run determinism all `max|d| = 0`.
+
+**How to run the two arms.** One ticket each, dumps compared per step:
+
+```
+1bit forward-serve -m <conv>/model.q4nx --kernels <conv>/npu -p 20081 --dump-logits /tmp/g/i8 \
+    &                        # with NPU_INFER_HOST_GEMM=i8 in the environment
+1bit forward-serve -m <conv>/model.q4nx --kernels <conv>/npu -p 20082 --dump-logits /tmp/g/dev
+scripts/families/compare-logits.py /tmp/g/i8 /tmp/g/dev      # BIT-EXACT at tolerance 0
+```
+`--dump-logits` writes `step_<response>_<n>.bin` per generated step, so the comparison is per position rather than
+per run. Repeat the device arm three times for determinism, and add an edge case (a two-token prompt), which is
+what the table above did.
+
+**What it costs.** The arm warms up slowly (it builds one image per tensor, ~35 s on a 7B container) and is not
+a speed path: it exists to be a reference. It is off by default and `=1` (f32) keeps its old meaning.
+
+**What it does not claim.** Nothing about throughput, and nothing about a family it has not been run on. The
+same gate on the other four-h4096 sets needs a pack with *their* geometry, which is a download, not a code
+change.
+
 - **Who may take what.** Anything that honours the file interlocks with us: `forward-serve`
   (`--npu-streams` decides which mode), the in-process route (`LOCK_EX`, always -- `app/unified.cpp`),
   the ELF runner (`LOCK_EX`, always). **A run that never opens the device takes no lock**: with

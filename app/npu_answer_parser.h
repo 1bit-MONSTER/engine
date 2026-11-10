@@ -26,13 +26,17 @@
 //     model's <tool_call> block is text the caller asked for and stays in `content`;
 //   * a reply that is only tool calls has `content: null` (content_null), not "".
 //
-// Families: Qwen3's markup today -- `<think>…</think>` for reasoning and
+// Families: Qwen3's markup -- `<think>…</think>` for reasoning and
 // `<tool_call>{"name": …, "arguments": {…}}</tool_call>` for calls, which is what this route's ChatML
-// models emit.  AnswerFamily exists so Gemma 4 (`call:f{…}`) and LFM2 can be added without another
-// signature change; an unsupported family is a 400 the caller sees, never a silent wrong split.
+// models emit -- and Gemma 4's (`<|channel>thought…<channel|>`, `<|tool_call>call:f{…}<tool_call|>`).
+// answer_family_of_template() picks one from the container's own chat template.  AnswerFamily exists so
+// LFM2 can be added without another signature change.
 #pragma once
 
 #include <nlohmann/json.hpp>
+
+#include <cctype>
+#include <functional>
 
 #include <algorithm>
 #include <stdexcept>
@@ -44,6 +48,11 @@ namespace onebit::npu {
 
 enum class AnswerFamily {
     qwen3,
+    // Gemma 4 (engine#1779, F10 fault 4): the pack's own tokenizer_config.json states this markup, and it is not
+    // qwen3's. Tokens: <|turn>/<turn|>, <|channel>/<channel|>, <|tool_call>/<tool_call|>, escape <|"|>.
+    // A call body is `call:NAME{key:value,...}` with string values escaped as <|"|>v<|"|> -- NOT JSON, which is
+    // why a JSON-only reader fails on it (the vendor's response_schema ships the same two regexes this follows).
+    gemma4,
 };
 
 // One tool call, in OpenAI's shape: function.arguments is a JSON *string*, so the parsed object is
@@ -63,9 +72,17 @@ struct ParsedAnswer {
 
 namespace answer_detail {
 
+inline std::string trim(const std::string& s) {
+    size_t b = 0, e = s.size();
+    while (b < e && (s[b] == ' ' || s[b] == '\n' || s[b] == '\r' || s[b] == '\t')) ++b;
+    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\n' || s[e - 1] == '\r' || s[e - 1] == '\t')) --e;
+    return s.substr(b, e - b);
+}
+
 inline const char* family_name(AnswerFamily f) {
     switch (f) {
         case AnswerFamily::qwen3: return "qwen3";
+        case AnswerFamily::gemma4: return "gemma4";
     }
     return "?";
 }
@@ -82,6 +99,10 @@ inline FamilyTags tags_of(AnswerFamily f) {
     switch (f) {
         case AnswerFamily::qwen3:
             return FamilyTags{"<think>", "</think>", "<tool_call>", "</tool_call>"};
+        case AnswerFamily::gemma4:
+            // The reasoning channel opens with <|channel> immediately followed by the literal word `thought`; the
+            // template emits exactly `<|channel>thought\n…\n<channel|>`, so the pair is the tag.
+            return FamilyTags{"<|channel>thought", "<channel|>", "<|tool_call>", "<tool_call|>"};
     }
     throw std::runtime_error(std::string("answer parser: unsupported family ") + family_name(f));
 }
@@ -103,6 +124,19 @@ inline size_t holdback(const std::string& buf, const FamilyTags& t) {
 }
 
 }  // namespace answer_detail
+
+// Which family a container's replies are written in, read from the chat template the container declares: a
+// model writes the markup its template taught it.  Gemma 4's template carries `<|tool_call>` and
+// `<|channel>thought` as literals (amd/gemma-4-e4b-it's chat_template: one of each); a Qwen3 template carries
+// `<tool_call>` and neither of those.  No template, or one with neither marker, is qwen3 -- what every
+// container was parsed as before this function existed.
+inline AnswerFamily answer_family_of_template(const std::string& template_text) {
+    const answer_detail::FamilyTags g = answer_detail::tags_of(AnswerFamily::gemma4);
+    if (template_text.find(g.call_open) != std::string::npos ||
+        template_text.find(g.think_open) != std::string::npos)
+        return AnswerFamily::gemma4;
+    return AnswerFamily::qwen3;
+}
 
 // The incremental splitter.  feed() appends whatever is now unambiguous to `out` as
 // (is_reasoning, text) pieces; finish() flushes what the holdback still held and reports the calls.
@@ -169,8 +203,13 @@ private:
         };
         while (i < safe.size()) {
             if (safe[i] == '<') {
-                const std::string rest = safe.substr(i, 16);
-                auto starts = [&](const char* tag) { return rest.rfind(tag, 0) == 0; };
+                // Compared at the tag's own length, never through a fixed window: this read `safe.substr(i, 16)`
+                // once, and gemma4's thinking tag `<|channel>thought` is 17 bytes, so it could never match -- every
+                // tag as long as the window read as text (engine#1779). No width is left here to outgrow.
+                auto starts = [&](const char* tag) {
+                    const size_t n = std::char_traits<char>::length(tag);
+                    return safe.compare(i, n, tag) == 0;
+                };
                 if (starts(tags_.think_open)) {
                     flush_plain();
                     mode_ = Mode::reasoning;
@@ -207,6 +246,11 @@ private:
     }
 
     void close_call(std::vector<std::pair<bool, std::string>>& out) {
+        if (fam_ == AnswerFamily::gemma4 && close_gemma_call()) {
+            call_text_.clear();
+            mode_ = Mode::content;
+            return;
+        }
         try {
             const nlohmann::json j = nlohmann::json::parse(call_text_);
             ToolCall c;
@@ -221,6 +265,102 @@ private:
         }
         call_text_.clear();
         mode_ = Mode::content;
+    }
+
+    // `call:NAME{key:value,...}` -> a ToolCall whose arguments are JSON, so the two routes hand the caller one shape.
+    // Throws on a body that is not that shape (the caller puts the markup back into content).
+    // The Gemma object syntax is not JSON: keys are bare, string values are wrapped in <|"|>, and nested objects and
+    // arrays use the same bare-key form. This rewrites it rather than guessing: <|"|>v<|"|> becomes a JSON string,
+    // a bare key gains quotes, and numbers/true/false/null pass through as literals.
+    // shortcut: values that are neither quoted, numeric, boolean, null nor a brace/bracket nest are emitted as strings,
+    // re-derive from the pack if a writer starts emitting bare tokens that are meant to be something else.
+    static std::string gemma_object_to_json(const std::string& body) {
+        std::string out;
+        size_t i = 0;
+        auto space = [&] { while (i < body.size() && (body[i] == ' ' || body[i] == '\n' || body[i] == '\t')) ++i; };
+        // one value at `i`
+        std::function<void()> value = [&] {
+            space();
+            if (body.compare(i, 5, "<|\"|>") == 0) {
+                i += 5;
+                std::string lit;
+                while (i < body.size() && body.compare(i, 5, "<|\"|>") != 0) lit += body[i++];
+                // A string whose closing escape never arrives is malformed, not a shorter string: refusing it sends
+                // the markup back to content (close_call), where accepting it would invent a truncated argument.
+                if (i >= body.size()) throw std::runtime_error("gemma4 call: unterminated <|\"|> string");
+                i += 5;
+                out += nlohmann::json(lit).dump();
+                return;
+            }
+            if (i < body.size() && (body[i] == '{' || body[i] == '[')) {
+                const char close_ch = body[i] == '{' ? '}' : ']';
+                out += body[i++];
+                space();
+                bool first = true;
+                while (i < body.size() && body[i] != close_ch) {
+                    if (!first) out += ',';
+                    first = false;
+                    space();
+                    if (close_ch == '}') {
+                        const size_t colon = body.find(':', i);
+                        if (colon == std::string::npos) throw std::runtime_error("gemma4 call: a key with no value");
+                        std::string key = body.substr(i, colon - i);
+                        while (!key.empty() && (key.back() == ' ' || key.back() == '\n')) key.pop_back();
+                        if (key.empty()) throw std::runtime_error("gemma4 call: an empty key");
+                        out += nlohmann::json(key).dump() + ":";
+                        i = colon + 1;
+                        value();
+                    } else {
+                        value();
+                    }
+                    space();
+                    if (i < body.size() && body[i] == ',') ++i;
+                }
+                if (i >= body.size()) throw std::runtime_error("gemma4 call: an object or array that never closes");
+                out += body[i++];
+                return;
+            }
+            std::string raw;
+            int depth = 0;
+            while (i < body.size()) {
+                const char c = body[i];
+                if (c == '{' || c == '[') ++depth;
+                if (c == '}' || c == ']') { if (depth == 0) break; --depth; }
+                if (depth == 0 && (c == ',' || c == '}' || c == ']')) break;
+                raw += c; ++i;
+            }
+            while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\n')) raw.pop_back();
+            // An empty value consumed nothing. Refusing it is also what keeps the loops above finite: `[1}` would
+            // otherwise ask for a value at the `}` for ever, appending a comma each time.
+            if (raw.empty()) throw std::runtime_error("gemma4 call: an empty value");
+            if (raw == "true" || raw == "false" || raw == "null" || (!raw.empty() && (std::isdigit((unsigned char)raw[0]) || raw[0] == '-'))) {
+                out += raw;
+            } else {
+                out += nlohmann::json(raw).dump();
+            }
+        };
+        value();
+        space();
+        if (i != body.size()) throw std::runtime_error("gemma4 call: text after the arguments object");
+        return out;
+    }
+
+    bool close_gemma_call() {
+        const std::string body = answer_detail::trim(call_text_);
+        if (body.compare(0, 5, "call:") != 0) return false;
+        const size_t brace = body.find('{');
+        if (brace == std::string::npos || body.back() != '}') return false;
+        ToolCall c;
+        c.id = "call_" + std::to_string(calls_.size());
+        c.name = answer_detail::trim(body.substr(5, brace - 5));
+        if (c.name.empty()) return false;
+        try {
+            c.arguments = gemma_object_to_json(body.substr(brace, body.size() - brace));
+        } catch (const std::exception&) {
+            return false;
+        }
+        calls_.push_back(std::move(c));
+        return true;
     }
 
     AnswerFamily fam_;

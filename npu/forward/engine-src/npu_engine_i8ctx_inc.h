@@ -514,6 +514,15 @@ struct I8Ctx {
         sout = (float)(ssum / N);
     }
 
+    // Fill an (already-allocated) weight BO through `fill(Bm)`, which writes the KD x ND image itself, then sync it.
+    // packB_into() above is this with the packer as `fill`; the head-image cache (engine#1716) is this with
+    // q4nx_head_tile_image(), which either reads the image a previous serve wrote or packs it the same way.
+    template <class F>
+    void fill_weight_bo(xrt::bo& bo, F&& fill) {
+        fill((int8_t*)bo.map());
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+
     // Async launch with an arbitrary weight BO (resident-expert path).
     inline xrt::run launch_async_with_bo(xrt::bo& wbo, const float* A,
                                          int am, int ak, float ascale) {

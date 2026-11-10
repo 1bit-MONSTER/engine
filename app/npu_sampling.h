@@ -82,14 +82,25 @@ struct Candidate {
     int id = 0;
 };
 
+// How many leading ids of a logits row are tokens: the tokenizer's vocabulary when it is the
+// smaller of the two.  The head's width is the container's `vocab_size`, which may exceed the
+// tokenizer's (Qwen3-0.6B: 151,936 for 151,669 ids); the ids in between are padding positions with
+// no text, and a pick that lands there emits nothing and never ends the reply (engine#1182,
+// #2017).  `vocab` <= 0 means "no tokenizer to bound by" and keeps the whole row.
+inline size_t token_bound(size_t width, int vocab) {
+    return (vocab > 0 && size_t(vocab) < width) ? size_t(vocab) : width;
+}
+
 // Draw one token from `logits`.  `allowed`, when given, is a per-token mask (non-zero =
 // the grammar accepts the token); a mask with nothing set is refused with -1 and the
-// caller reports it rather than decoding an unconstrained token.
+// caller reports it rather than decoding an unconstrained token.  `vocab` is the
+// tokenizer's size (token_bound): ids at or past it are never drawn, with or without a mask.
 inline int sample_token(const std::vector<float>& logits, const SampleParams& p, std::mt19937_64& rng,
-                        const std::vector<char>* allowed = nullptr) {
+                        const std::vector<char>* allowed = nullptr, int vocab = 0) {
+    const size_t n = token_bound(logits.size(), vocab);
     std::vector<Candidate> c;
-    c.reserve(logits.size());
-    for (size_t i = 0; i < logits.size(); i++) {
+    c.reserve(n);
+    for (size_t i = 0; i < n; i++) {
         if (allowed && !(*allowed)[i]) continue;
         c.push_back({logits[i], int(i)});
     }
@@ -155,6 +166,16 @@ inline int sample_token(const std::vector<float>& logits, const SampleParams& p,
         if (run >= target) return x.id;
     }
     return c.back().id;
+}
+
+// The greedy id of one logits row of `width` floats, bounded like sample_token(): a higher
+// logit wins and a tie keeps the lower id.  `1bit npu-run` prints this per row.
+inline int argmax_token(const float* row, size_t width, int vocab = 0) {
+    const size_t n = token_bound(width, vocab);
+    int best = 0;
+    for (size_t v = 1; v < n; v++)
+        if (row[v] > row[size_t(best)]) best = int(v);
+    return best;
 }
 
 // One candidate of the raw distribution, as the client reads it: the id and its log-probability.

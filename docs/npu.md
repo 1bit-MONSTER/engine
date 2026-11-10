@@ -1841,6 +1841,14 @@ ended itself once its grammar had reached an accepting state — the route puts 
 mask exactly there, so a complete JSON object reports `stop` instead of padding with whitespace to `max_tokens`
 (engine#1182).
 
+Every pick is bounded by the tokenizer, not only the constrained one. The head is `vocab_size` wide, and
+`vocab_size` may exceed the tokenizer's ids: Qwen3's 151,936 against 151,669 (measured on Qwen3-0.6B's
+`config.json` and `tokenizer.json`). The ids in between are padding positions with no text, so a token drawn
+there emits nothing and never ends the reply. `sample_token()` and `1bit npu-run`'s per-row argmax
+(`argmax_token()`) therefore consider only ids below the tokenizer's size (`token_bound()` in
+`app/npu_sampling.h`, engine#2017), with or without a grammar. A container with no `tokenizer.json` keeps the
+whole row.
+
 The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
 `third_party/llama.cpp/src/llama-sampler.cpp` (top_k, then top_p, then temperature, then the
 cumulative-sum draw that `common/sampling.cpp`'s chain ends with) over the raw logits this route

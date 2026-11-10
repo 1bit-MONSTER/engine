@@ -498,7 +498,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     std::fclose(f);
                 }
             }
-            const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr);
+            const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr, e.tok->size());
             // -1: the grammar allows no token here, so the answer ends where it is.  An end token is
             // in the mask only where the grammar can stop (refresh_allowed), so a constrained reply
             // that completes reports "stop" instead of padding to the budget (engine#1182).
@@ -865,6 +865,10 @@ int run_forward_ids(const std::string& model_dir, const std::string& kernels, co
     if (ids.empty()) throw std::runtime_error("--ids: no token ids");
     const std::string model = model_dir + "/model.q4nx";
     if (!std::filesystem::exists(model)) throw std::runtime_error(model + " does not exist");
+    // The tokenizer's size bounds the printed ids (engine#2017); a container without tokenizer.json keeps the whole row.
+    int tok_vocab = 0;
+    if (const std::string tj = model_dir + "/tokenizer.json"; std::filesystem::exists(tj))
+        tok_vocab = npu::Tokenizer(tj).size();
     // Same device discipline as forward-serve: host-GEMM runs take no lock (engine#1353 -- a host-GEMM run that held it
     // for 4 h 52 m stopped two lanes' device work), a run that opens the device takes the exclusive one.
     int lock_fd = -1;
@@ -895,10 +899,8 @@ int run_forward_ids(const std::string& model_dir, const std::string& kernels, co
                                      " floats for " + std::to_string(m) + " rows)");
         const int nv = int(all.size() / size_t(m));
         for (int r = 0; r < m; ++r) {
-            const float* row = all.data() + size_t(r) * size_t(nv);
-            int best = 0;
-            for (int v = 1; v < nv; ++v)
-                if (row[v] > row[best]) best = v;
+            // Bounded by the tokenizer like the served route (engine#2017): an id past it is a padding position.
+            const int best = npu::argmax_token(all.data() + size_t(r) * size_t(nv), size_t(nv), tok_vocab);
             std::printf("%d\n", best);   // token ids out, in row order: the id the model chooses at that row
         }
         done += m;

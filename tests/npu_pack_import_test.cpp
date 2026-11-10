@@ -2181,6 +2181,37 @@ void test_text_config_geometry(const std::string& root) {
 // pack: `info` printed matmulnbits_ops 0 and the import wrote the embedding only ("imported 1 tensors, 0 q4_1 tiles").
 // On the real pack the fix yields 147 tensors / 47,480 tiles and the pack's own self-check reads corr 0.993981 against its
 // embedding, with the no-zero-point control at 0.3333 -- this arm pins the mechanism without the 3 GB pack.
+// engine#1503: `rope_theta` nested one level deeper still — `text_config.rope_parameters.rope_theta` — which is how
+// Qwen3-VL-4B declares 5,000,000 with no `rope_theta` anywhere else. The reader's 10000 default made the importer warn that
+// the pack's cos/sin caches "no plain theta explains"; measured against the pack's own cos_cache (262144 x 64), theta 5e6
+// reproduces row 1 to max|d| 0.000000 while 10000 is off by 0.088. This pins the lift and the never-override rule.
+void test_rope_parameters_theta(const std::string& root) {
+    const fs::path dir = fs::path(root) / "ropeparams";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen3_vl","text_config":{"hidden_size":64,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"intermediate_size":128,)"
+             R"("vocab_size":32,"rope_parameters":{"mrope_interleaved":true,"mrope_section":[24,20,20],)"
+             R"("rope_theta":5000000,"rope_type":"default"}}})");
+    std::string src;
+    const nlohmann::json g = pi::load_geometry_exported(dir.string(), &src);
+    const pi::Dims d = pi::read_dims_exported(g, src);
+    check(d.rope_theta == 5000000.0f,
+          "rope_parameters: rope_theta comes from the nested block (" + std::to_string(d.rope_theta) + ")");
+    check(src.find("rope_parameters") != std::string::npos, "rope_parameters: and the source says so (" + src + ")");
+    // a top-level rope_theta still wins
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen3_vl","rope_theta":10000.0,"text_config":{"hidden_size":64,)"
+             R"("num_hidden_layers":1,"num_attention_heads":2,"head_dim":32,"intermediate_size":128,"vocab_size":32,)"
+             R"("rope_parameters":{"rope_theta":5000000}}})");
+    const nlohmann::json g2 = pi::load_geometry_exported(dir.string(), &src);
+    check(pi::read_dims_exported(g2, src).rope_theta == 10000.0f,
+          "rope_parameters: a top-level rope_theta is NOT overridden by the nested one");
+    std::printf("  rope_parameters: theta %.0f nested, top-level still wins\n", (double)d.rope_theta);
+    fs::remove_all(dir);
+}
+
 void test_three_input_matmulnbits(const std::string& root) {
     const fs::path dir = fs::path(root) / "mm3";
     fs::remove_all(dir);
@@ -2973,6 +3004,7 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
+        test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();

@@ -1138,6 +1138,22 @@ json load_geometry(const std::string& pack_dir, std::string* source) {
                 ++from_text_config;
             }
         }
+        // `rope_theta` (and the rotary block's other keys) can be ONE LEVEL DEEPER still: Qwen3-VL-4B declares
+        // `text_config.rope_parameters = {mrope_interleaved: true, mrope_section: [24,20,20], rope_theta: 5000000,
+        // rope_type: default}` with no `rope_theta` anywhere else, so this reader fell back to its 10000 default and the
+        // importer warned that the pack's cos/sin caches "no plain theta explains (best 0.5918 at 3.2e+06, declared 10000)".
+        // Measured against the pack's own cos_cache (262144 x 64, external): **theta 5e6 reproduces row 1 to max|d|
+        // 0.000000**, 10000 is off by 0.088 and 3.2e6 by 0.005 -- so the caches are not unexplained at all, the theta was
+        // simply not read (engine#1503). Gaps only, never overriding, same rule as the lift above.
+        int from_rope_params = 0;
+        if (cfg.contains("rope_parameters") && cfg["rope_parameters"].is_object()) {
+            for (auto it = cfg["rope_parameters"].begin(); it != cfg["rope_parameters"].end(); ++it) {
+                if (cfg.contains(it.key()) || it.value().is_null()) continue;
+                cfg[it.key()] = it.value();
+                ++from_rope_params;
+            }
+        }
+        if (from_rope_params > 0 && source) *source += " + config.json rope_parameters";
         if (from_text_config > 0 && source) *source += " + config.json text_config";
         if (fill_from_model_config_impl(pack_dir, cfg) > 0 && source) *source += " + model_config.json (text_config)";
         return cfg;

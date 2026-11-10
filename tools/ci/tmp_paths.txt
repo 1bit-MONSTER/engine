@@ -1,0 +1,20 @@
+# Hardcoded /tmp paths under npu/, app/, tools/, scripts/ - the sites that exist today.
+# A ram on this box is tmpfs, so each of these is anonymous memory when it is written.
+# This list may only SHRINK: fix a site, then delete its line. A new site fails
+# tools/ci/tmp_path_check.py --check, and so does a line whose site is gone.
+# Regenerate with: tools/ci/tmp_path_check.py --write-baseline
+
+app/npu_device_lock.h	"/tmp/1bit-npu-device.lock"
+app/serve.cpp	"/tmp/1bit-hybrid-XXXXXX"
+npu/forward/src/q4nx_forward.cpp	"/tmp/a0-XXXXXX"
+npu/forward/src/q4nx_forward.cpp	"/tmp/npu_layer.bin"
+npu/forward/src/q4nx_forward.cpp	"/tmp/q4nx_hidden_%d.bin"
+npu/ort/onebit_npu_gemm.cpp	"/tmp/1bit-npu-device.lock"
+npu/target/xdna/xdna_target.cpp	"/tmp/a0-XXXXXX"
+scripts/npu-window11.sh	"/tmp/window11-$LABEL.log"
+tools/spec_decode_acceptance_hrx.sh	"/tmp/hrxacc-$PORT_D.log"
+tools/spec_decode_acceptance_hrx.sh	"/tmp/hrxacc-$PORT_T.log"
+tools/spec_decode_acceptance_hrx.sh	"/tmp/hrxacc-$port.log"
+tools/spec_decode_speedup.sh	"/tmp/specdec-$label.acc"
+tools/spec_decode_speedup.sh	"/tmp/specdec-$label.log"
+tools/spec_decode_speedup.sh	"/tmp/specdec-{lab}.acc"

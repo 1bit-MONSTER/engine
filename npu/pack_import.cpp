@@ -1745,14 +1745,15 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
 }
 
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
-    Q4 q = pack;   // same codes, same geometry
+    // A PASS-THROUGH since the signed-int4 fix: `decode_external_tile` produces the container's own convention directly
+    // (code = c_signed + 8, zero = (-8 - z_signed) * scale), so converting `zero` again applies the mapping TWICE --
+    // `zero` became -((-8-z)*scale)*scale ~ +0.0002 instead of -0.04, every weight sat at code*scale (a near-constant
+    // POSITIVE matrix), and a down projection summed to K*mean(act)*0.04 ~ 110,000 where a healthy layer gives ~1.
+    // The function survives as the one place that reports the bf16-exactness of the container's offset.
+    Q4 q = pack;
     long long inexact = 0;
-    for (size_t i = 0; i < q.zero.size(); ++i) {
-        // pack: w = (code - zp) * scale  ->  container: w = code * scale + m, so m = -zp * scale.
-        const float m = -q.zero[i] * q.scale[i];
-        if (bf16_to_f32(bf16_bits_of(m)) != m) ++inexact;
-        q.zero[i] = m;
-    }
+    for (size_t i = 0; i < q.zero.size(); ++i)
+        if (bf16_to_f32(bf16_bits_of(q.zero[i])) != q.zero[i]) ++inexact;
     if (m_inexact) *m_inexact = inexact;
     return q;
 }

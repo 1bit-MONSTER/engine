@@ -345,23 +345,14 @@ void test_external_to_container() {
 
     long long m_inexact = -1;
     const pi::Q4 q = pi::container_from_external_q4(pack, &m_inexact);
-    check(q.codes == pack.codes, "external->container: codes are carried unchanged (the pack's grid is the container's)");
-    check(q.scale == pack.scale, "external->container: d is the pack's scale");
-    check(m_inexact >= 0, "external->container: the bf16-exactness of m is reported, not assumed");
-
-    // The arithmetic identity: code*d + m must equal the pack's (code - zp)*scale, up to the bf16 rounding of m.
-    float worst_rel = 0.0f;
-    for (int r = 0; r < pack.N; ++r)
-        for (int k = 0; k < pack.K; ++k) {
-            const size_t g = size_t(r) * (pack.K / 32) + size_t(k) / 32;
-            const float want = (float(pack.codes[size_t(r) * pack.K + k]) - pack.zero[g]) * pack.scale[g];
-            const float got = float(q.codes[size_t(r) * pack.K + k]) * q.scale[g] + q.zero[g];
-            const float range = 15.0f * pack.scale[g];
-            worst_rel = std::max(worst_rel, std::fabs(got - want) / range);
-        }
-    check(worst_rel <= 1.0f / 256.0f,
-          "external->container: code*d + m reproduces (code - zp)*scale to within one bf16 ulp of m (worst " +
-              std::to_string(worst_rel) + " of the group's 15-step range)");
+    // The conversion is a PASS-THROUGH: decode_external_tile already returns the container's convention, so the
+    // identity to pin is that nothing is converted a SECOND time. It was: `zero` became -((-8-z)*scale)*scale ~
+    // +0.0002 instead of -0.04, every weight sat at code*scale -- a near-constant POSITIVE matrix -- and a down
+    // projection summed to K*mean(act)*0.04 ~ 110,000 where a healthy layer gives ~1 (engine#1503).
+    check(q.codes == pack.codes, "external->container: codes pass through unchanged");
+    check(q.scale == pack.scale, "external->container: scales pass through unchanged");
+    check(q.zero == pack.zero, "external->container: the offset passes through unchanged (the mapping is NOT re-applied)");
+    check(m_inexact >= 0, "external->container: the bf16-exactness of the offset is reported, not assumed");
 }
 
 // The writer's role mapping (engine#1503): the graph's own names, mapped onto the roles the tile writer already

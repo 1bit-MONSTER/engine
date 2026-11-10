@@ -24,6 +24,7 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "plan/prefill_launch_plan.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
@@ -3159,7 +3160,23 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     // choke point every batched projection goes through: the same launches in the same order, each within the
     // BO. Each row's result is independent of the others -- the row loops downstream (`row_attn`, the GDN
     // recurrence) never needed the whole prompt in one launch, only the GEMMs did.
-    const int blk = max_batch_rows();
+    int blk = max_batch_rows();
+    // engine#1959: a chunk that fits in `ceil(M/16) <= 6` M=16 launches is cheaper than one wide pass -- measured 6.51x on the
+    // served route (16-row pass 1073.4 ms against 6992.2 ms for one 128-row pass), so 17..96 rows should be launched 16 at a
+    // time rather than as one wide pass. Opt-in for now (`ONEBIT_PREFILL_SPLIT16=1`) so the default route is byte-for-byte
+    // unchanged until the acceptance row (prefill tok/s under npu-hold) has both arms measured in one ticket.
+    if (blk > 16 && std::getenv("ONEBIT_PREFILL_SPLIT16")) {
+        const auto plan = npu::plan::plan_prefill_launches(M, /*has_twin=*/blk >= 16);
+        if (plan.twin_launches > 1) {
+            static bool split_said = false;
+            if (!split_said) {
+                std::fprintf(stderr, "  [prefill] %d rows -> %d M=16 launches (engine#1959: cheaper than one %d-row pass)\n",
+                             M, plan.twin_launches, blk);
+                split_said = true;
+            }
+            blk = npu::plan::kPrefillM16Rows;
+        }
+    }
     if (blk > 0 && M > blk) {
         // engine#1582: say the block width out loud, once. A log that reads "0 launches, 93 s host" cannot be told
         // apart from a device that never ran the batch, and the width the batch was blocked at is the whole answer.

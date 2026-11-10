@@ -2479,20 +2479,52 @@ void test_fconst19_rule_table() {
           "fconst19 rule: a geometry measured twice with the same shape is fine -- that is the h1536 pair, which is "
           "byte-identical over all 28 blocks");
     // 4. engine#1774 / TNPU-ALL W2's third gate clause: EVERY row of the real table must select itself back, with its own
-    //    numbers. Written table-driven rather than one check per row for two reasons the table has already demonstrated:
-    //    a wrong digit is silent (the anchors still line up), and a merge dropped the h4096 row twice with nothing failing.
+    //    numbers. The expectations are written out HERE, not read out of the table (engine#1854): the previous version
+    //    took each row's own (hidden, heads, layers), selected it, and compared the result with that same row, so it
+    //    proved only that the table equals itself -- a wrong digit, or a row dropped by a merge, both passed. This list
+    //    is the second copy on purpose: it is the only way a test can disagree with the thing it is checking.
+    struct Row {
+        int hidden, heads, layers;
+        int64_t prefix, tile;
+        int n_tiles, rot;
+    };
+    const Row expect[] = {
+        {896, 14, 24, 1856, 34816, 16, 2},          // Qwen2.5-0.5B
+        {2048, 16, 28, 8512, 1183744, 3, 1},        // Qwen3-1.7B
+        {576, 9, 30, 3776, 76800, 4, 1},            // SmolLM2-135M
+        {1536, 12, 28, 3136, 226304, 7, 1},         // hidden-1536 family
+        {2560, 32, 36, 9536, 1462272, 5, 1},        // Qwen3-4B
+        {2048, 32, 16, 8512, 591872, 5, 1},         // Llama-3.2-1B
+        {3072, 32, 32, 10560, 5222400, 2, 1},       // Phi-3.5-mini / Phi-4-mini
+        {3584, 28, 28, 7232, 1009664, 8, 1},        // Qwen2.5-7B
+        {2048, 16, 36, 4160, 295936, 9, 1},         // Qwen2.5-3B (the second 2048/16 row, told apart by layers)
+        {4096, 32, 32, 12608, 2297856, 5, 1},       // h4096
+        {3072, 24, 28, 10560, 1740800, 4, 1},       // Llama-3.2-3B
+    };
+    const int expect_n = int(sizeof(expect) / sizeof(expect[0]));
     int rules_n = 0;
     const pi::Fconst19Rule* rules = pi::fconst19_rules(&rules_n);
-    check(rules && rules_n >= 8,
-          "fconst19 rule: the table still has its rows (" + std::to_string(rules_n) + " >= 8; a merge dropping one is a "
-          "silent un-measure of a whole class)");
-    for (int i = 0; i < rules_n; i++) {
+    check(rules_n == expect_n,
+          "fconst19 rule: the table has exactly the rows the test expects (" + std::to_string(rules_n) + " vs " +
+              std::to_string(expect_n) + "; a row dropped or added by a merge fails here)");
+    for (int i = 0; i < rules_n && i < expect_n; i++) {
         const pi::Fconst19Rule& row = rules[i];
+        const Row& e = expect[i];
+        const std::string at = std::to_string(e.hidden) + "/" + std::to_string(e.heads) + "h/" +
+                               std::to_string(e.layers) + "L";
+        // (a) the table itself carries the measured numbers
+        check(row.hidden == e.hidden && row.heads == e.heads && row.layers == e.layers && row.prefix == e.prefix &&
+                  row.n_tiles == e.n_tiles && row.rot == e.rot && row.tile == e.tile,
+              "fconst19 rule: table row " + at + " is the measured shape {prefix " + std::to_string(e.prefix) +
+                  ", " + std::to_string(e.n_tiles) + " tiles, rot " + std::to_string(e.rot) + ", tile " +
+                  std::to_string(e.tile) + "} (got prefix " + std::to_string(row.prefix) + ", " +
+                  std::to_string(row.n_tiles) + " tiles, rot " + std::to_string(row.rot) + ", tile " +
+                  std::to_string(row.tile) + ")");
+        // (b) and the selector returns THAT row for that geometry
         std::string w;
-        const pi::Fconst19Rule* got = pi::select_fconst19_rule(row.hidden, row.heads, row.layers, &w);
-        check(got && got->prefix == row.prefix && got->n_tiles == row.n_tiles && got->rot == row.rot && got->tile == row.tile,
-              "fconst19 rule: row " + std::to_string(row.hidden) + "/" + std::to_string(row.heads) + "h/" +
-                  std::to_string(row.layers) + "L selects itself back with its measured numbers (" +
+        const pi::Fconst19Rule* got = pi::select_fconst19_rule(e.hidden, e.heads, e.layers, &w);
+        check(got && got->prefix == e.prefix && got->n_tiles == e.n_tiles && got->rot == e.rot && got->tile == e.tile,
+              "fconst19 rule: " + at + " selects the row the test expects (got " +
                   std::to_string(got ? got->prefix : -1) + ", " + std::to_string(got ? got->n_tiles : -1) + ", " +
                   std::to_string(got ? got->rot : -1) + ", " + std::to_string(got ? got->tile : -1) + ")");
     }

@@ -141,7 +141,16 @@ static void wide_family_arms() {
     check(wide_takes(17, 16, 32) && wide_takes(32, 16, 32), "wide takes: 17 and 32 rows go to the wide family");
     check(!wide_takes(33, 16, 32), "wide takes: 33 rows are not routed to a 32-row kernel");
     check(!wide_takes(17, 16, 0) && !wide_takes(17, 16, 16), "wide takes: no family, or one no wider than decode, takes nothing");
-    std::printf("  wide family: 14 arms (complete or not, chunk width, which launch takes it)\n");
+    using onebit::npu::wide_elf_path;
+    check(wide_elf_path(nullptr, "", "/k").empty() && wide_elf_path("", "", "/k").empty(),
+          "wide elf: neither the environment nor the pack names one -> none");
+    check(wide_elf_path(nullptr, "W.elf", "/k") == "/k/W.elf", "wide elf: the pack's name is looked up in the kernels dir");
+    check(wide_elf_path("", "W.elf", "/k") == "/k/W.elf", "wide elf: an empty variable is not an override");
+    check(wide_elf_path(nullptr, "/abs/W.elf", "/k") == "/abs/W.elf", "wide elf: an absolute pack name is used as given");
+    check(wide_elf_path("/e/X.elf", "W.elf", "/k") == "/e/X.elf", "wide elf: the environment wins over the pack");
+    check(wide_elf_path("0", "W.elf", "/k").empty(), "wide elf: NPU_WIDE_SEALED_ELF=0 switches a pack's wide family off");
+    check(wide_elf_path("0x.elf", "", "/k") == "0x.elf", "wide elf: only the exact value 0 means off");
+    std::printf("  wide family: 21 arms (complete or not, chunk width, which launch takes it, which file)\n");
 }
 
 int main(int argc, char** argv) {

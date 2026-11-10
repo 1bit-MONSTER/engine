@@ -24,6 +24,7 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "batch_width.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
@@ -511,6 +512,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             // pb16i ELF (which would read 4,608-B tiles out of 2,176-B images).
             pb16i_sealed_ = read_config_string(
                 cfg_path, t2s_ ? "\"q4nx_t2s_sealed_elf\"" : "\"q4nx_pb16i_sealed_elf\"", "");
+            // engine#1990: an optional second sealed ELF, the same instances built for more rows per launch.
+            wide_sealed_ = read_config_string(
+                cfg_path, t2s_ ? "\"q4nx_t2s_sealed_wide_elf\"" : "\"q4nx_pb16i_sealed_wide_elf\"", "");
+            wide_sealed_rows_ = q4nx_config_int(cfg_path.c_str(), "q4nx_sealed_wide_rows", 32);
             // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
             // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
             // read in the stored (rotated) basis against un-rotated activations.
@@ -1342,6 +1347,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                     continue;
                 }
                 elf = dir + "/" + pb16i_sealed_;
+                sealed_dir_ = dir;
                 kname = inst;
                 if (!file_exists(elf)) {
                     err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
@@ -1412,15 +1418,19 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
                 made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
                 want_m16 ? "" : " (NPU_DECODE_M16=0: disabled)");
-        // engine#1990: a wide prefill family for a sealed pb16i/t2s set. NPU_WIDE_SEALED_ELF names a second sealed
-        // ELF carrying the same instances built for NPU_WIDE_ROWS rows (default 32); a chunk of more than 16 rows
-        // then runs one launch per role instead of two. Experimental and off unless the variable is set: no pack
-        // ships such an ELF yet, and the plan has no key for it. All roles or none -- max_batch_rows() is the chunk
-        // width, so one role without a wide kernel would be launched past its buffers.
-        if (const char* wide_elf = getenv("NPU_WIDE_SEALED_ELF");
-            wide_elf && *wide_elf && pb16i_ && !pb16i_sealed_.empty() && made > 0) {
+        // engine#1990: a wide prefill family for a sealed pb16i/t2s set: a second sealed ELF carrying the same
+        // instances built for more rows per launch (default 32), so a chunk of more than 16 rows runs one launch per
+        // role instead of two. The pack names it (config `q4nx_<layout>_sealed_wide_elf`, rows in
+        // `q4nx_sealed_wide_rows`); NPU_WIDE_SEALED_ELF overrides the file ("0" = off) and NPU_WIDE_ROWS the rows.
+        // All roles or none -- max_batch_rows() is the chunk width, so one role without a wide kernel would be
+        // launched past its buffers. A named file that is missing or does not load is logged and the pass stays at
+        // 16 rows: a pack must never stop serving over an optional speed-up.
+        const std::string wide_path =
+            onebit::npu::wide_elf_path(getenv("NPU_WIDE_SEALED_ELF"), wide_sealed_, sealed_dir_);
+        if (const char* wide_elf = wide_path.c_str();
+            !wide_path.empty() && pb16i_ && !pb16i_sealed_.empty() && made > 0) {
             const char* wr = getenv("NPU_WIDE_ROWS");
-            const int rows = wr && *wr ? atoi(wr) : 32;
+            const int rows = wr && *wr ? atoi(wr) : wide_sealed_rows_;
             int wide = 0;
             std::string why;
             if (rows <= Q4NX_DESIGN_M_DECODE || rows > Q4NX_DESIGN_M_PREFILL) why = "NPU_WIDE_ROWS must be 17..128";

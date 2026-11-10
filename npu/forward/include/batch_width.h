@@ -25,6 +25,8 @@
 // pinned by a host test with no device, no ELF and no runtime.
 #pragma once
 
+#include <string>
+
 namespace onebit {
 namespace npu {
 
@@ -72,6 +74,17 @@ inline int chunk_rows(int narrow, int wide) { return wide > narrow ? wide : narr
 // wide one: a wide launch costs more than a narrow one whatever it carries, so a decode step never takes it, and a
 // launch past `wide` rows is never routed here (the caller refuses it by name).
 inline bool wide_takes(int rows, int narrow, int wide) { return wide > narrow && rows > narrow && rows <= wide; }
+
+// Which file is the wide sealed ELF, if any?  The environment wins over the pack so a set can be tried, or switched
+// off, without editing a pack: `env` "0" means no wide family even when the pack names one, any other non-empty
+// value is the path as given. Otherwise the pack's name is used: as given when absolute, else inside `kernels_dir`
+// (where the 16-row sealed ELF lives). Empty answer = no wide family. `env` may be null.
+inline std::string wide_elf_path(const char* env, const std::string& pack_name, const std::string& kernels_dir) {
+    if (env && *env) return (env[0] == '0' && env[1] == 0) ? std::string() : std::string(env);
+    if (pack_name.empty()) return std::string();
+    if (pack_name[0] == '/' || kernels_dir.empty()) return pack_name;
+    return kernels_dir + "/" + pack_name;
+}
 
 }  // namespace npu
 }  // namespace onebit

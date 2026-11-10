@@ -444,6 +444,13 @@ int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without
 // engine#1638: the geometry as read, so a test can check WHICH source a number came from.
 nlohmann::json load_geometry_exported(const std::string& pack_dir, std::string* source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
+// engine#1831: the in-block header offsets the epsilon anchors support at a known stride, sorted -- every offset that
+// recurs `min_repeat` or more times (offset 0, the block start, excluded). Kept as a list, not a mode: a Qwen3 block has
+// three equally frequent inner headers.
+std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64_t stride, int min_repeat);
+// engine#1831: set `hdr`/`h1`/`period` from that list the way locate_fconst() does -- one inner header is a 2-header block,
+// three is a 4-header block. Returns false, and changes nothing, for any other count.
+bool fconst_set_block_headers(FconstGeom& g, const std::vector<int64_t>& inner);
 
 // One measured Ryzen AI 1.9 Token .fconst block shape (engine#1503). Every field is measured against the 1.8 pack of
 // the same model by tools/fconst19_measure.py; none of it is derivable from the pack, which is why a pack whose shape

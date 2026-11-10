@@ -1281,6 +1281,16 @@ add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src
                                   npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
+# engine#1781's oracle (merged in #1813) arrived with its test file but no registration, so the comparator behind
+# NPU_BATCH_CHECK -- "every drafted position's logits, bitwise" instead of one argmax at the last row -- was neither
+# built nor run while every job stayed green. Header-only, so the test needs no link libraries; host-only, so it needs no
+# model and no device.
+add_executable(batch_check_compare_test tests/batch_check_compare_test.cpp)
+target_include_directories(batch_check_compare_test PRIVATE npu/forward/include)
+add_test(NAME batch_check_compare COMMAND batch_check_compare_test)
+# direction B (tools/ci/ci_targets_check.py): a target ci.yml's --target list does not name is "never built", and ci.yml
+# is a workflow file no lane can patch. The documented hook is the one onebit_npu_forward_syntax uses.
+add_dependencies(onebit batch_check_compare_test)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
 # The plan's `designs` section against the engine's own derivation (engine#803 A2a): the generator and
 # q4nx_derive_designs() must state the same kernels, because a section that disagreed would be refused at

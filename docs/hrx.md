@@ -515,9 +515,21 @@ IQ3_XXS on 28 blocks and IQ4_XS on 17 — and on identical geometry the IQ3_XXS 
 IQ4_XS blocks cost (79.94 ms vs 33.34 ms per dispatch at a 10x639 grid, from the dispatch profiler). The IQ3_XXS grid
 decode was the reason: it selected a 12-bit grid code out of 256 inline constants, once per 4-value packet.
 
-`GGML_HRX_IQ3S_TABLE_DECODE=1` selects a second router-expert kernel that reads that grid from a small per-workgroup
-table instead. It is **off by default**; unset or `0` is the shipping path. Measured with it on, in one hold against a
-control arm on the same binary:
+A second router-expert kernel reads that grid from a small per-workgroup table instead. Which one runs depends on the
+fork pin:
+
+| fork pin | unset | `GGML_HRX_IQ3S_TABLE_DECODE=0` | `=1` |
+|---|---|---|---|
+| before `69ee6f50e` (llama.cpp#281) | select chain | select chain | table |
+| `69ee6f50e` and later | **table** | select chain | table |
+
+From `69ee6f50e` on, the table decode is the default for any routed gate/up pair where either weight is IQ3_XXS, and
+`=0` is the way back to the select chain. The first such dispatch logs which one was chosen
+(`ggml_hrx: IQ3_XXS routed gate/up decode: workgroup table`). A file with no IQ3_XXS expert tensors is unaffected:
+UD-IQ3_XXS stores its experts as IQ2_S, so of the two Flash-Next files only UD-IQ4_XS takes this path.
+
+Measured with the table on, in one hold against a control arm on the same binary, while it was still opt-in
+(engine#1347):
 
 | cell | control | `=1` | |
 |---|---:|---:|---|
@@ -530,10 +542,20 @@ The PPL row is the point: the value is unchanged to four decimals, measured in t
 decode is the same arithmetic. The absolute tok/s above are one box's state on one day — the same arm has read 182-318
 tok/s across windows for identical flags, which is why only the paired ratios are quoted.
 
-It stays opt-in because the two windows above ran on a fork commit that predates the SET_ROWS fix (#227), and a
-3,858-token prompt on that commit intermittently died in the CPU fallback (engine #1251). Before this becomes a default
-it needs the long-prompt cell plus `test-backend-ops -o MUL_MAT -b HRX0` on the current pin, neither of which this lane
-has run.
+It was opt-in at first because the two windows above ran on a fork commit that predates the SET_ROWS fix (#227), and
+a 3,858-token prompt on that commit intermittently died in the CPU fallback (engine #1251). What was run before the
+default changed (11-10, HRX0 against the CPU backend, both decodes in each row):
+
+    test-backend-ops -b HRX0 -o MUL_MAT_VEC_FUSION, fork cef5e2e20 (same kernel and matcher), unset and =1:
+        374 OK / 0 FAIL in each arm
+    the four routed cases below, fork 2d62cc7af plus the default change, unset and =0:
+        4/4 OK in each arm, NMSE 3.09e-5 .. 3.12e-5 against a 5e-3 limit
+
+The four are a routed gate/up SwiGLU, 640 -> 2560, 16 experts, top-10, with IQ3_XXS and IQ4_XS weights at 80 and 512
+tokens. They are in the fork's `tests/test-backend-ops.cpp` from `69ee6f50e`; before it, no case covered the routed
+IQ3_XXS shape. Not run for the default change: the paired pp4096 cell on the UD-IQ4_XS file at a pin that
+has it (the file needs about 60 GiB free and the box did not have it), and a bitwise compare of the two decodes. The
+ratios in the table are therefore still the opt-in ones.
 
 Still open on #572, stated so nobody reads this as closed: the 1,679 tok/s gap is not explained; the
 ubatch lever was measured up to 2048 and 4096 was tried and does not fit this 87 GiB file; no MTP

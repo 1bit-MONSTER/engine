@@ -88,6 +88,8 @@ struct Dims {
 // REFUSAL (importing without the gains is the silent-garbage path), found-and-not-declared is allowed only with the
 // measurement behind it (Qwen3 packs ship the sections without the key), and neither is the ordinary case. Exposed
 // so the three can be pinned without a 4 GB pack.
+// The gap is `[64 B zeros][q_norm bf16 [head_dim]][64 B zeros][k_norm bf16 [head_dim]]`: q first (engine#1934, measured
+// against the q_norm/k_norm initializers in Hunyuan-7B's own model.onnx).
 struct QkGainOffsets {
     int64_t k_norm = 0, q_norm = 0;  // 0,0 = the gap is not the gains' shape
 };

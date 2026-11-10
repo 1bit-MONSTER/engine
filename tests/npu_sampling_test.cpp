@@ -449,6 +449,105 @@ void test_logprob_options() {
           "top_logprobs without logprobs: true is refused rather than ignored");
 }
 
+// The pinned shared prefix (engine#1785): single-turn requests that share a system prompt and differ in the
+// user turn. `sys(n)` + `turn(k)` stand for the two parts; the table sees token ids only.
+void test_prefix_pin() {
+    using onebit::npu::shared_prefix_len;
+    auto prompt = [](int sys, int turn_start, int turn) {
+        std::vector<int> v;
+        for (int i = 0; i < sys; i++) v.push_back(1 + i);
+        for (int i = 0; i < turn; i++) v.push_back(turn_start + i);
+        return v;
+    };
+    PrefixOptions o;
+    o.slots = 4;
+    o.cache_mb = 1;
+    o.min_gain = 128;
+    const std::vector<int> q1 = prompt(900, 5000, 40), q2 = prompt(900, 6000, 30), q3 = prompt(900, 7000, 50);
+
+    {   // the gap, on the table as it was: a whole saved prompt is no use to the next single-turn request
+        PrefixCache c(o);
+        check(c.insert(q1, 1000) >= 0, "the first single-turn prompt is saved whole");
+        const auto d = c.lookup(q2);
+        check(d.slot == -1 && d.cached_tokens == 0,
+              "a second question under the same 900-token system prompt reuses nothing from the first");
+    }
+    {   // the pin: request 2 finds the shared part, request 3 resumes from it
+        PrefixCache c(o);
+        check(c.pin_point({}, q1) == 0, "the first request has nothing to compare with");
+        c.insert(q1, 1000);
+        check(shared_prefix_len(q1, q2) == 900, "the two prompts share exactly the system part");
+        const size_t at = c.pin_point(q1, q2);
+        check(at == 900, "the second request's pin point is the end of what it shares with the first");
+        std::string why;
+        const int pin = c.pin(std::vector<int>(q2.begin(), q2.begin() + long(at)), 2000, &why);
+        check(pin >= 0 && why == "pinned" && c.pinned_slot() == pin, "the shared part is pinned");
+        const auto d = c.lookup(q3);
+        check(d.slot == pin && d.cached_tokens == 900 && d.pinned && d.reason == "hit",
+              "a third question resumes from the pin: 900 of its 950 tokens are already there");
+        check(onebit::npu::resume_point(d, q3.size()) == 899, "and resumes one token short of it, as every hit does");
+        check(c.pin_point(q2, q3) == 0, "a prefix the pin already covers is not pinned again");
+        check(!c.lookup(q1).pinned && c.lookup(q1).cached_tokens == 940,
+              "a whole-prompt slot is still preferred when it is the longer match, and says it is not the pin");
+    }
+    {   // what is not a pin point
+        PrefixCache c(o);
+        check(c.pin_point(q1, q1) == 0, "a repeated prompt is insert()'s business, not a pin");
+        std::vector<int> longer = q1;
+        for (int i = 0; i < 200; i++) longer.push_back(9000 + i);
+        check(c.pin_point(q1, longer) == 0, "a continued conversation is insert()'s business too");
+        check(c.pin_point(longer, q1) == 0, "and so is a prompt the previous one continued");
+        check(c.pin_point(prompt(100, 5000, 40), prompt(100, 6000, 40)) == 0,
+              "100 shared tokens do not beat prefix-min-gain 128");
+        check(c.pin_point(prompt(900, 5000, 40), prompt(0, 6000, 40)) == 0, "prompts that share nothing have no pin point");
+        PrefixOptions off = o;
+        off.slots = 0;
+        check(PrefixCache(off).pin_point(q1, q2) == 0, "an off cache pins nothing");
+        check(PrefixCache(off).pin(q1, 10) == -1, "and refuses a pin");
+    }
+    {   // the pin outlives what evicts and replaces everything else
+        PrefixOptions b = o;
+        b.slots = 4;  // one more than the three snapshots the budget holds, so a slot is always free
+        b.min_gain = 1;
+        PrefixCache c(b);  // 1 MB
+        const std::vector<int> sys(q1.begin(), q1.begin() + 900);
+        const int pin = c.pin(sys, 300000);
+        const int a = c.insert(prompt(0, 100, 10), 300000);
+        const int bb = c.insert(prompt(0, 200, 10), 300000);
+        check(pin >= 0 && a >= 0 && bb >= 0 && c.used_bytes() == 900000, "a pin and two prompts fit under 1 MB");
+        // The pin is the least recently used of the three, and 300000 more does not fit: something goes.
+        const int cc = c.insert(prompt(0, 300, 10), 300000);
+        check(cc == a, "room is made from the oldest whole prompt");
+        check(c.pinned_slot() == pin && c.lookup(q2).slot == pin, "not from the pin, though it is the oldest slot");
+        // A prompt that extends the pin does not replace it.
+        std::string why;
+        const int whole = c.insert(q2, 1000, pin, &why);
+        check(whole >= 0 && whole != pin && c.pinned_slot() == pin,
+              "a prompt that resumed from the pin is saved beside it, not over it");
+        check(c.lookup(q3).slot == pin && c.lookup(q3).cached_tokens == 900, "so the next question still finds the pin");
+        // A new pin replaces the old one: one shared prefix at a time.
+        const std::vector<int> other = prompt(0, 40000, 500);
+        const int pin2 = c.pin(other, 1000);
+        check(pin2 >= 0 && c.pinned_slot() == pin2, "a new pin takes over");
+        check(c.lookup(q3).slot != pin || !c.lookup(q3).pinned, "and the old one is no longer pinned");
+        check(c.pin(other, 2u * 1024u * 1024u, &why) == -1 && why == "larger than prefix-cache-mb" &&
+                  c.pinned_slot() == pin2,
+              "a pin over the budget is refused and the standing pin is kept");
+    }
+    {   // every slot holds a whole prompt: the pin takes the oldest
+        PrefixOptions b = o;
+        b.slots = 2;
+        b.min_gain = 1;
+        PrefixCache c(b);
+        const int s0 = c.insert(prompt(0, 100, 10), 100);
+        c.insert(prompt(0, 200, 10), 100);
+        const int pin = c.pin(prompt(900, 0, 0), 100);
+        check(pin == s0, "with no free slot the pin takes the least recently used prompt's");
+        check(c.insert(prompt(0, 300, 10), 100) != pin, "and a later prompt cannot take it back");
+        check(c.pinned_slot() == pin, "the pin is still there");
+    }
+}
+
 void test_prefix_cache() {
     auto ids = [](int n, int start = 1) {
         std::vector<int> v;
@@ -651,6 +750,113 @@ void test_json_schema_refusals() {
                            "json_schema": {"schema": {"type": "object"}}}})"))
                   .find("conflicts") != std::string::npos,
           "grammar and json_schema together are refused");
+}
+
+
+// Gemma 4's own markup (engine#1779, F10 fault 4), taken from the pack's tokenizer_config.json: the call body is
+// `call:NAME{key:value,...}` with string values wrapped in <|"|>, which is not JSON. Asserted on the normalised
+// JSON rather than on "a call was found", because the normalisation is the part that can be silently wrong.
+void test_gemma4_answer_parser() {
+    const auto G = AnswerFamily::gemma4;
+    {
+        const std::string reply =
+            "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3,metric:true}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1, "gemma4: a <|tool_call> body is a call when tools were sent");
+        check(a.calls[0].name == "get_weather", "gemma4: the name is what follows call:");
+        check(a.calls[0].arguments == R"({"city":"Paris","days":3,"metric":true})",
+              "gemma4: arguments are rewritten to JSON (escaped strings, numbers, booleans)");
+        check(a.content.empty() && a.content_null, "gemma4: a call-only reply has content: null");
+    }
+    {
+        // A comma inside an escaped string must not split the argument list -- the case a naive splitter gets wrong.
+        const std::string reply =
+            "<|tool_call>call:say{text:<|\"|>hello, world<|\"|>,n:2}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == R"({"text":"hello, world","n":2})",
+              "gemma4: a comma inside <|\"|>...<|\"|> stays inside the string");
+    }
+    {
+        const std::string reply = "<|tool_call>call:ping{}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == "{}", "gemma4: a call with no arguments is {}");
+        const auto without = parse_answer(reply, G, false);
+        check(without.calls.empty(), "gemma4: the same markup is not a call when no tools were sent");
+        check(without.content.find("<|tool_call>") != std::string::npos,
+              "gemma4: and it stays in content, marker included");
+    }
+    {
+        const auto a = parse_answer("<|channel>thought\nlet me think<channel|>Done.", G, false);
+        check(a.reasoning == "\nlet me think", "gemma4: the thought channel is reasoning");
+        check(a.content == "Done.", "gemma4: and the reply after it is content");
+    }
+    {
+        // A string whose closing <|"|> never arrives is malformed: no call, and the markup is back in content.
+        const std::string reply = "<|tool_call>call:say{text:<|\"|>hello}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.empty(), "gemma4: an unterminated <|\"|> string is not a call");
+        check(a.content == reply, "gemma4: and what the model wrote is back in content, whole");
+        const auto b = parse_answer("<|tool_call>call:f{a:1}tail}<tool_call|>", G, true);
+        check(b.calls.empty() && !b.content.empty(), "gemma4: text after the arguments object is not a call");
+        const auto c = parse_answer("<|tool_call>call:f{a:[1,2}<tool_call|>", G, true);
+        check(c.calls.empty() && !c.content.empty(), "gemma4: an array that never closes is not a call");
+    }
+    {
+        // Nested object and array, the same bare-key form one level down.
+        const auto a = parse_answer(
+            "<|tool_call>call:f{o:{k:<|\"|>v<|\"|>},l:[1,<|\"|>a,b<|\"|>],z:null}<tool_call|>", G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == R"({"o":{"k":"v"},"l":[1,"a,b"],"z":null})",
+              "gemma4: nested objects and arrays are rewritten too");
+    }
+}
+
+// The family comes from the container's chat template. The Gemma 4 lines are the two literals the pack's own
+// chat_template carries (amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu: `<|tool_call>` x1, `<|channel>thought`
+// x1, `<tool_call>` x0, `<think>` x0), not a guess at them.
+void test_answer_family_of_template() {
+    using onebit::npu::answer_family_of_template;
+    check(answer_family_of_template("") == AnswerFamily::qwen3, "no template is qwen3, as before");
+    check(answer_family_of_template("{%- if tools %}<tool_call>\n{\"name\": ...}</tool_call>{% endif %}<think>") ==
+              AnswerFamily::qwen3,
+          "a template with <tool_call> and <think> is qwen3");
+    check(answer_family_of_template("{{- '<|tool_call>call:' + function['name'] + '{' -}}") == AnswerFamily::gemma4,
+          "a template that writes <|tool_call>call: is gemma4");
+    check(answer_family_of_template("{{- '<|channel>thought\\n<channel|>' -}}") == AnswerFamily::gemma4,
+          "a template with the thought channel and no tools is gemma4 too");
+    check(answer_family_of_template("<|im_start|>user\n{{ content }}<|im_end|>") == AnswerFamily::qwen3,
+          "a template with neither marker is qwen3");
+}
+
+// Every tag every family declares must be recognised, whatever its length, whole and split across two chunks at
+// every byte. The scanner once read tags through a 16-byte window, so a 17-byte tag read as text (engine#1779);
+// this arm fails for any family whose tags the scanner cannot match, including one added later.
+void test_every_family_tag_is_matched() {
+    for (const AnswerFamily f : {AnswerFamily::qwen3, AnswerFamily::gemma4}) {
+        const auto t = onebit::npu::answer_detail::tags_of(f);
+        const std::string name = onebit::npu::answer_detail::family_name(f);
+        const std::string think = std::string(t.think_open) + "R" + t.think_close + "C";
+        const std::string call = std::string(t.call_open) + "not a call" + t.call_close;
+        for (size_t cut = 0; cut <= think.size(); cut++) {
+            AnswerStream s(f, false);
+            std::vector<std::pair<bool, std::string>> out;
+            s.feed(think.substr(0, cut), out);
+            s.feed(think.substr(cut), out);
+            s.finish(out);
+            check(s.reasoning() == "R" && s.content() == "C",
+                  (name + ": think tags are matched, split at byte " + std::to_string(cut)).c_str());
+        }
+        for (size_t cut = 0; cut <= call.size(); cut++) {
+            AnswerStream s(f, true);
+            std::vector<std::pair<bool, std::string>> out;
+            s.feed(call.substr(0, cut), out);
+            s.feed(call.substr(cut), out);
+            s.finish(out);
+            // Not a valid body, so it comes back as content: open tag, body and close tag, which proves both
+            // call tags were seen (an unseen close tag would leave the body unterminated and drop the tag).
+            check(s.calls().empty() && s.content() == call && s.reasoning().empty(),
+                  (name + ": call tags are matched, split at byte " + std::to_string(cut)).c_str());
+        }
+    }
 }
 
 void test_answer_parser() {
@@ -974,11 +1180,15 @@ int main() {
     test_logprobs();
     test_logprob_options();
     test_prefix_cache();
+    test_prefix_pin();
     test_json_schema();
     test_json_schema_refusals();
     test_answer_parser();
     test_answer_stream();
     test_tool_grammar();
+    test_gemma4_answer_parser();
+    test_every_family_tag_is_matched();
+    test_answer_family_of_template();
     test_tool_request_parsing();
     test_content_mask();
     test_request_parsing();

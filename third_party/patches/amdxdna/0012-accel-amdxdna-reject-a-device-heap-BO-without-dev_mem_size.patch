@@ -1,0 +1,26 @@
+From 3e32932d362b1f0c9e8a7d6c5b4a3f2e1d0c9b8a Mon Sep 17 00:00:00 2001
+From: David Zhang <upstream@drm-misc>
+Date: Thu, 8 Oct 2026 00:00:00 +0000
+Subject: [PATCH] accel/amdxdna: Reject device heap BO when dev_mem_size is not set
+
+Carried from drm-misc-next-2026-10-16 (tag 41cec5feed4687aea2a59378b271faf363c7d938),
+upstream commit 3e32932d362b. Unmodified upstream change: it applies to our pinned
+xdna-driver (526c6081974e) both on the bare pin and on top of 0001-0010.
+Applied by: pi-kernel-74 (carried, not installed).
+---
+ amdxdna_gem.c
+diff --git a/drivers/accel/amdxdna/amdxdna_gem.c b/drivers/accel/amdxdna/amdxdna_gem.c
+--- a/drivers/accel/amdxdna/amdxdna_gem.c
++++ b/drivers/accel/amdxdna/amdxdna_gem.c
+@@ -1140,6 +1140,11 @@ amdxdna_drm_create_dev_heap_bo(struct drm_device *dev,
+ 	struct amdxdna_gem_obj *abo;
+ 	int ret;
+ 
++	if (!xdna->dev_info->dev_mem_size) {
++		XDNA_DBG(xdna, "Device heap is not supported");
++		return ERR_PTR(-EOPNOTSUPP);
++	}
++
+ 	WARN_ON(!is_power_of_2(xdna->dev_info->dev_mem_size));
+ 	XDNA_DBG(xdna, "Requested dev heap size 0x%llx", args->size);
+ 	if (!args->size || !IS_ALIGNED(args->size, xdna->dev_info->dev_mem_size)) {

@@ -342,6 +342,19 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # the same offset from the data section returns the tensor, from byte 8 it does not.
 add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-test)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
+# engine#2018: eight `tests/*_test.py` had NO runner at all -- the third file kind for this sweep (`tests/*.sh` is
+# engine#1824, `tools/*.py` self-tests is engine#1911), and the kind most of this tree's newer tests are written in. A PR
+# that modifies one of them changes code that never executes. All eight pass on this box (`python3 tests/<f>` rc 0, checked
+# before registering), so they are rows rather than allow-list entries; `tools/ci/tests_referenced_check.py` now fails on the
+# state, so a ninth cannot appear unnoticed.
+add_python_test(check_pins ${CMAKE_SOURCE_DIR}/tests/check_pins_test.py)
+add_python_test(gguf_to_q4nx ${CMAKE_SOURCE_DIR}/tests/gguf_to_q4nx_test.py)
+add_python_test(hrx_long_prompt ${CMAKE_SOURCE_DIR}/tests/hrx_long_prompt_test.py)
+add_python_test(hyperloom_benchmark ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
+add_python_test(moe_expert_chunks_accum ${CMAKE_SOURCE_DIR}/tests/moe_expert_chunks_accum_test.py)
+add_python_test(mtp_draft_vocab ${CMAKE_SOURCE_DIR}/tests/mtp_draft_vocab_test.py)
+add_python_test(repack_verify_source ${CMAKE_SOURCE_DIR}/tests/repack_verify_source_test.py)
+add_python_test(ternary_to_q4_0 ${CMAKE_SOURCE_DIR}/tests/ternary_to_q4_0_test.py)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The

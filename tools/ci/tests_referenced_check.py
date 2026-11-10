@@ -135,6 +135,52 @@ def unregistered_selftest_tools(root):
     return drift
 
 
+def unregistered_test_scripts(root):
+    """tests/*.py that are tests and that no registration names (engine#2018).
+
+    The third file kind for this sweep: `tests/*.sh` is engine#1824, `tools/*.py` self-tests is engine#1911, and the newer
+    tests here are written in Python -- measured at filing, **8 of the tree's 41 `tests/*_test.py` had no runner at all**, so a
+    PR that modifies one changes code that never executes (tests/gguf_to_q4nx_test.py was the named example).
+
+    A file is a test by the tree's own convention (`*_test.py`) or by declaring a self-test flag. `have` is a registration in
+    CMakeLists.txt/cmake/*.cmake, or another `tests/*.py` that imports it -- a registered test importing a helper does run it,
+    and that is how several module-level arms in this tree are written.
+    """
+    tests = root / "tests"
+    if not tests.is_dir():
+        return []
+    need = []
+    for path in sorted(tests.glob("*.py")):
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        if path.name.endswith("_test.py") or SELFTEST.search(text):
+            need.append(path.name)
+    if not need:
+        return []
+    named = {n: False for n in need}
+    for path in [root / "CMakeLists.txt"] + sorted((root / "cmake").glob("*.cmake")):
+        if not path.is_file():
+            continue
+        text = path.read_text(errors="replace")
+        for n in need:
+            if n in text:
+                named[n] = True
+    if not all(named.values()):
+        for path in sorted(tests.glob("*.py")):
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            for n in need:
+                if path.name == n:
+                    continue                      # a test naming itself is not a runner
+                if n in text or pathlib.PurePosixPath(n).stem in text:
+                    named[n] = True
+    return [n for n in need if not named[n]]
+
+
 def check(root):
     tests = root / "tests"
     if not tests.is_dir():
@@ -158,7 +204,11 @@ def check(root):
     for rel in tools_drift:
         print("tests_referenced: %s declares a self-test and no runner names it -- add a ctest row (add_test in "
               "CMakeLists.txt or cmake/*.cmake) or a workflow step, or the arm is dead code" % rel)
-    if drift or gone or idle or tools_drift:
+    py_drift = unregistered_test_scripts(root)
+    for name in py_drift:
+        print("tests_referenced: tests/%s is a test and nothing runs it -- register it (add_python_test in "
+              "CMakeLists.txt), or list it in %s with the reason it must not be a row (engine#2018)" % (name, ALLOW))
+    if drift or gone or idle or tools_drift or py_drift:
         return 1
     print("tests_referenced: all %d test script(s) are referenced%s; %d tool self-test(s) are registered" % (
         len(need), "" if not allow else " (%d deliberately not a row: %s)" % (len(allow), ", ".join(sorted(allow))),
@@ -238,6 +288,24 @@ def self_test():
                                       "add_test(NAME t COMMAND tools/registered.py --self-test)\n",
                     "tools/registered.py": "# --self-test\n"})
     cases.append(("a registered tool self-test is clean", check(r3), 0, None))
+
+    # 8b. engine#2018: a tests/*.py that is a test and that nothing runs
+    r = root_with({"tests/one.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME one COMMAND one.sh)\n",
+                   "tests/orphan_test.py": "print('x')\n"})
+    cases.append(("a tests/*_test.py with no runner is drift", check(r), 1, "orphan_test.py"))
+    cases_root["a tests/*_test.py with no runner is drift"] = r
+    # ... and it is not drift once a registration names it
+    r = root_with({"tests/one.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME one COMMAND one.sh)\nadd_python_test(orphan tests/orphan_test.py)\n",
+                   "tests/orphan_test.py": "print('x')\n"})
+    cases.append(("a registered tests/*_test.py is clean", check(r), 0, None))
+    # ... and a registered test that IMPORTS it runs it, which is how several module-level arms are written here
+    r = root_with({"tests/one.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME one COMMAND one.sh)\nadd_python_test(one_py tests/one_test.py)\n",
+                   "tests/one_test.py": "import orphan_test\n",
+                   "tests/orphan_test.py": "print('x')\n"})
+    cases.append(("a tests/*.py another registered test imports is not drift", check(r), 0, None))
 
     # 9. the entry may be written either way: path form and basename mean the same line
     r = root_with({"tests/keeper2.sh": "#!/bin/sh\n", "CMakeLists.txt": "",

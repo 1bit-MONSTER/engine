@@ -83,6 +83,13 @@ void q4nx_dequant_tile_q8(const uint8_t* chunk, float* out, int ld);
  * geometry/size mismatch. */
 int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                                 int cols, int chunk_bytes, float* out);
+/* ONE row of the same chunked (tiled) tensor, decoded without decoding the table: row `r` lives as row `r % 32` inside
+ * each of `cols / 256` tiles, so this reads those tiles and nothing else. A loader that reads a row per token needs no
+ * table-sized buffer, which is the difference between 0.74 GiB of packed container and its 4.74 GiB f32 expansion
+ * (engine#1784). Returns 0 and writes `cols` floats, or -1 for the same conditions q4nx_dequant_tensor_chunked()
+ * refuses, plus an out-of-range row. The values are the ones that function would place at that row, bit for bit. */
+int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols, int chunk_bytes, int r,
+                          float* out /* cols */);
 
 /* The (rows, cols) tile grid a container actually stores, when it is LARGER than the model's.
  *

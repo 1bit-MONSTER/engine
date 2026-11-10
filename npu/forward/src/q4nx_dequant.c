@@ -123,6 +123,34 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
     return 0;
 }
 
+/* engine#1784: see the declaration. The tile grid and its ordering are q4nx_dequant_tensor_chunked()'s -- a row lives
+ * inside one tile-row, at offset r % Q4NX_TILE_ROWS of each tile across the row -- so the two cannot disagree about
+ * where a row starts. No OpenMP: this is called per token, with one row to do. */
+int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols, int chunk_bytes, int r, float* out) {
+    if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    if (r < 0 || r >= rows) return -1;
+    if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
+    if (chunk_bytes != Q4NX_TILE_BYTES && chunk_bytes != Q4NX_CHUNK_Q4K &&
+        chunk_bytes != Q4NX_CHUNK_Q8)
+        return -1;
+    const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
+    if (nbytes < (size_t)ntr * (size_t)ntc * (size_t)chunk_bytes) return -1;
+    const int tr = r / Q4NX_TILE_ROWS, rr = r % Q4NX_TILE_ROWS;
+    float tmp[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
+    for (int tc = 0; tc < ntc; tc++) {
+        const uint8_t* c = data + (size_t)(tr * ntc + tc) * (size_t)chunk_bytes;
+        if (chunk_bytes == Q4NX_CHUNK_Q4K)
+            q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
+        else if (chunk_bytes == Q4NX_CHUNK_Q8)
+            q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+        else
+            q4nx_dequant_tile(c, tmp, Q4NX_TILE_COLS);
+        memcpy(out + (size_t)tc * Q4NX_TILE_COLS, tmp + (size_t)rr * Q4NX_TILE_COLS,
+               Q4NX_TILE_COLS * sizeof(float));
+    }
+    return 0;
+}
+
 int q4nx_packed_grid(size_t nbytes, int rows, int cols, int* cb_out, int* rp_out, int* cp_out) {
     const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
     if (rows <= 0 || cols <= 0 || rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return 0;

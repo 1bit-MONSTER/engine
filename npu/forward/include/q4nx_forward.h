@@ -396,6 +396,16 @@ private:
     const int8_t*   embed_i8_     = nullptr;      // plain int8 table, row stride c_.H
     const float*    embed_sc_     = nullptr;      // per-32-column scales, H/32 per row (may be null: unscaled)
     int             embed_groups_ = 0;            // H / Q4NX_GROUP_SIZE
+    /* The chunked formats (tiled), read one row per token out of the same mapping: `embed_row_buf_` holds the row
+     * currently gathered and `embed_row_tok_` which token it is for (mutable: embed_at() is const and the callers walk
+     * k innermost, so a row is gathered once and served H times). engine#1784. */
+    const uint8_t*  embed_tile_        = nullptr;
+    size_t          embed_tile_bytes_  = 0;
+    int             embed_tile_rows_   = 0;
+    int             embed_tile_cols_   = 0;
+    int             embed_tile_cb_     = 0;
+    mutable std::vector<float>   embed_row_buf_;
+    mutable int                  embed_row_tok_ = -1;
     // Set only while step_batch_embeds() runs: the row source for the batched body's embedding fill.
     const float* inject_embeds_ = nullptr;
     // Set only while step_batch_embeds(..., position_ids, ...) runs: 3 x rows, plane-major, or null.

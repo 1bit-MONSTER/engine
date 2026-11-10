@@ -532,14 +532,14 @@ endif()
     add_test(NAME serve_client_hangup_cpu
              COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_client_hangup_test.sh $<TARGET_FILE:onebit>
                      "${ONEBIT_SERVE_TEST_GGUF}" cpu)
-    set_tests_properties(serve_client_hangup_cpu PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(serve_client_hangup_cpu PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
     # engine#1779 fault 2 (FLM 1.0.12: "Qwen3.5 answering `//////` after hitting the context limit"): a prompt that
     # fills the context is served, the next turn cannot fit, and the answer must be a refusal or a truncated-but-clean
     # reply - never one character repeated. Also `cpu`: the fault is in the request path's clamp, not in a kernel.
     add_test(NAME serve_context_limit_cpu
              COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh $<TARGET_FILE:onebit>
                      "${ONEBIT_SERVE_TEST_GGUF}" cpu)
-    set_tests_properties(serve_context_limit_cpu PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(serve_context_limit_cpu PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
 # engine#1779 fault 3 ("wrong vectors from embed-gemma"): tested on the route where OUR code computes the vector -
 # `serve.cpp:2264 if (embed_serve::container(model))` serves a container directory in-process - not on the
 # `rag_launch()` proxy, where the numbers come from a delegated llama-server. Same registration rule as the two
@@ -548,7 +548,7 @@ set(ONEBIT_EMBED_TEST_CONTAINER "" CACHE PATH "1-bit encoder container (.embed d
 add_test(NAME serve_embed_vectors_cpu
          COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_embed_vectors_test.sh $<TARGET_FILE:onebit>
                  "${ONEBIT_EMBED_TEST_CONTAINER}" cpu)
-set_tests_properties(serve_embed_vectors_cpu PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(serve_embed_vectors_cpu PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
 
 # ── DwarfStar is gone (owner 2026-11-01, removed 2026-11-02) ───────────────
 # `--device ds4` ran DwarfStar (third_party/ds4: antirez's CUDA kernels behind a HIP shim plus
@@ -1281,6 +1281,10 @@ add_executable(npu_answer_parser_test tests/npu_answer_parser_test.cpp)
 target_include_directories(npu_answer_parser_test PRIVATE app)
 target_link_libraries(npu_answer_parser_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME npu_answer_parser COMMAND npu_answer_parser_test)
+# direction B (tools/ci/ci_targets_check.py, engine#1595): a target no ci.yml line names is "never built", and its test
+# then reports "Not Run" instead of running. `ci.yml` is a workflow file no lane can patch, so the documented hook is the
+# one this tree already uses for onebit_npu_forward_syntax: add_dependencies(onebit <target>), which the checker follows.
+add_dependencies(onebit npu_answer_parser_test)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
 # The plan's `designs` section against the engine's own derivation (engine#803 A2a): the generator and
 # q4nx_derive_designs() must state the same kernels, because a section that disagreed would be refused at

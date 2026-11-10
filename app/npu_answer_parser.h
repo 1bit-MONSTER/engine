@@ -26,10 +26,11 @@
 //     model's <tool_call> block is text the caller asked for and stays in `content`;
 //   * a reply that is only tool calls has `content: null` (content_null), not "".
 //
-// Families: Qwen3's markup today -- `<think>…</think>` for reasoning and
+// Families: Qwen3's markup -- `<think>…</think>` for reasoning and
 // `<tool_call>{"name": …, "arguments": {…}}</tool_call>` for calls, which is what this route's ChatML
-// models emit.  AnswerFamily exists so Gemma 4 (`call:f{…}`) and LFM2 can be added without another
-// signature change; an unsupported family is a 400 the caller sees, never a silent wrong split.
+// models emit -- and Gemma 4's (`<|channel>thought…<channel|>`, `<|tool_call>call:f{…}<tool_call|>`).
+// answer_family_of_template() picks one from the container's own chat template.  AnswerFamily exists so
+// LFM2 can be added without another signature change.
 #pragma once
 
 #include <nlohmann/json.hpp>
@@ -123,6 +124,19 @@ inline size_t holdback(const std::string& buf, const FamilyTags& t) {
 }
 
 }  // namespace answer_detail
+
+// Which family a container's replies are written in, read from the chat template the container declares: a
+// model writes the markup its template taught it.  Gemma 4's template carries `<|tool_call>` and
+// `<|channel>thought` as literals (amd/gemma-4-e4b-it's chat_template: one of each); a Qwen3 template carries
+// `<tool_call>` and neither of those.  No template, or one with neither marker, is qwen3 -- what every
+// container was parsed as before this function existed.
+inline AnswerFamily answer_family_of_template(const std::string& template_text) {
+    const answer_detail::FamilyTags g = answer_detail::tags_of(AnswerFamily::gemma4);
+    if (template_text.find(g.call_open) != std::string::npos ||
+        template_text.find(g.think_open) != std::string::npos)
+        return AnswerFamily::gemma4;
+    return AnswerFamily::qwen3;
+}
 
 // The incremental splitter.  feed() appends whatever is now unambiguous to `out` as
 // (is_reasoning, text) pieces; finish() flushes what the holdback still held and reports the calls.

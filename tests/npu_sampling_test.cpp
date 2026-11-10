@@ -711,6 +711,23 @@ void test_gemma4_answer_parser() {
     }
 }
 
+// The family comes from the container's chat template. The Gemma 4 lines are the two literals the pack's own
+// chat_template carries (amd/gemma-4-e4b-it-mobius-int4_rai_1.9.0_npu: `<|tool_call>` x1, `<|channel>thought`
+// x1, `<tool_call>` x0, `<think>` x0), not a guess at them.
+void test_answer_family_of_template() {
+    using onebit::npu::answer_family_of_template;
+    check(answer_family_of_template("") == AnswerFamily::qwen3, "no template is qwen3, as before");
+    check(answer_family_of_template("{%- if tools %}<tool_call>\n{\"name\": ...}</tool_call>{% endif %}<think>") ==
+              AnswerFamily::qwen3,
+          "a template with <tool_call> and <think> is qwen3");
+    check(answer_family_of_template("{{- '<|tool_call>call:' + function['name'] + '{' -}}") == AnswerFamily::gemma4,
+          "a template that writes <|tool_call>call: is gemma4");
+    check(answer_family_of_template("{{- '<|channel>thought\\n<channel|>' -}}") == AnswerFamily::gemma4,
+          "a template with the thought channel and no tools is gemma4 too");
+    check(answer_family_of_template("<|im_start|>user\n{{ content }}<|im_end|>") == AnswerFamily::qwen3,
+          "a template with neither marker is qwen3");
+}
+
 // Every tag every family declares must be recognised, whatever its length, whole and split across two chunks at
 // every byte. The scanner once read tags through a 16-byte window, so a 17-byte tag read as text (engine#1779);
 // this arm fails for any family whose tags the scanner cannot match, including one added later.
@@ -1071,6 +1088,7 @@ int main() {
     test_tool_grammar();
     test_gemma4_answer_parser();
     test_every_family_tag_is_matched();
+    test_answer_family_of_template();
     test_tool_request_parsing();
     test_content_mask();
     test_request_parsing();

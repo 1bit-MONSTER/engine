@@ -66,7 +66,9 @@ def write_stub():
                  '  exit 0\n'
                  'fi\n'
                  'exit 1\n')
-    os.chmod(path, 0o755)
+    # 0o700, not 0o755: the stub is executed by this test and by nothing else, so it needs no group/other bits — and a
+    # world-readable mask is what CodeQL's py/overly-permissive-file flagged on this PR (alert at this line).
+    os.chmod(path, 0o700)
     return path
 
 

@@ -220,6 +220,15 @@ json container_table(const std::string& path) {
     return json::parse(header);
 }
 
+// The container's payload, i.e. what `data_offsets` are measured from: after the 8-byte header length and the JSON.
+std::vector<uint8_t> container_payload(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    uint64_t hlen = 0;
+    f.read(reinterpret_cast<char*>(&hlen), 8);
+    f.seekg(std::streamoff(8 + hlen));
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
 // How many I8 tensors of a container are the imported 6,144-byte q4_1f form -- exactly the
 // trigger of the forward loader's refusal (npu/forward/src/model.c, engine#1185).
 int q4_1f_tensors(const json& table) {
@@ -1359,6 +1368,190 @@ void test_mlp_gu(const std::string& golden_dir) {
     }
     std::printf("MLP golden: 1 unit, encode/decode exact, %zu container tiles identical\n",
                 tiled.size() / onebit::npu::kTileBytes);
+}
+
+// ── engine#1850: the tied block-32 head synthesis, and the untied refusal, on a crafted pack ──
+// #1633 makes `import_pack()` synthesise `lm_head` from the embedding when a 1.9 pack quantises its HEAD at a K block other than
+// 128 and declares tied embeddings, refuses an untied pack by name, records `q4nx_head_note`, and self-checks the synthesis
+// against the embedding. None of that had an arm: it was exercised only by hand on the real Coder-1.5B pack, and the Python
+// tail-head test's "block-32 arm" covers the tool's exit code, not this code. One fixture, two arms, no pack and no device.
+void test_tied_block32_head(const std::string& root) {
+    const auto build = [&](bool tied, const char* tag) {
+        const fs::path dir = fs::path(root) / tag;
+        fs::remove_all(dir);
+        fs::create_directories(dir / "cache");
+        const int H = 128, L = 8, V = 64;
+        const int64_t stride = 1 << 20, second = 262144;
+        std::string fc(size_t(int64_t(L) * stride + 64 + size_t(H) * 2), '\0');
+        auto put_eps = [&](int64_t off) {
+            fc[size_t(off)] = char(0x86);
+            fc[size_t(off) + 1] = char(0x35);
+        };
+        for (int l = 0; l < L; ++l) {
+            put_eps(int64_t(l) * stride);
+            put_eps(int64_t(l) * stride + second);
+        }
+        put_eps(int64_t(L) * stride);
+        for (int i = 0; i < H; ++i) {
+            const uint16_t bits = pi::bf16_bits_of(float(i + 1));
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i)] = char(bits & 0xFF);
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i) + 1] = char(bits >> 8);
+        }
+        put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+        const std::string cfg =
+            std::string(R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+                        R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,)"
+                        R"("rope_theta":10000.0,"tie_word_embeddings":)") +
+            (tied ? "true" : "false") + R"(,"rms_norm_eps":1e-06})";
+        put_file((dir / "config.json").string(), cfg);
+        // The head's declared geometry (N=V=64, K=H=128, block=32) has to be carried by the bytes: the gate checks
+        // qweight >= N x (K/block) x (block/2) = 4,096 B, f32 scales >= N x (K/block) x 4 = 1,024 B, zeros >= 128 B.
+        const int64_t kblocks = H / 32;
+        const uint64_t embed_bytes = uint64_t(V) * uint64_t(H) * 2;
+        const uint64_t qw_off = embed_bytes, qw_len = uint64_t(V) * uint64_t(kblocks) * 16;
+        const uint64_t sc_off = qw_off + qw_len, sc_len = uint64_t(V) * uint64_t(kblocks) * 4;
+        const uint64_t z_off = sc_off + sc_len, z_len = uint64_t(V) * ((kblocks + 1) / 2);
+        // A VARIED embedding on purpose: a constant fill quantises to one code with a near-zero scale, so the self-check
+        // would compute 0/0 and the arm would fail for the fixture's sake rather than the code's.
+        std::string data(size_t(z_off + z_len), '\x11');
+        for (int r = 0; r < V; ++r)
+            for (int c = 0; c < H; ++c) {
+                const uint16_t bits = pi::bf16_bits_of(0.05f * float((r * 7 + c * 13) % 97) - 2.4f);
+                const size_t at = (size_t(r) * size_t(H) + size_t(c)) * 2;
+                data[at] = char(bits & 0xFF);
+                data[at + 1] = char(bits >> 8);
+            }
+        put_file((dir / "model.onnx.data").string(), data);
+        // engine#1850: `p.head_block` comes from the pack's `cache/*_meta.json` (read_declared), NOT from the graph -- which
+        // is what makes the synthesis reachable at all: the branch needs `onnx.matmuls.empty()`, so the head cannot be a node
+        // the walker keeps. Writing the declaration into cache/ is the shape the real 1.9 packs have.
+        put_file((dir / "cache" / "lm_head_meta.json").string(),
+                 R"({"op_list":[{"type":"MladfMatMul","name":"lm_head.MatMulNBits",)"
+                 R"("attrs":{"N":{"value":[64]},"K":{"value":[128]},"block_size":{"value":[32]},"bits":{"value":[4]}}}],)"
+                 R"("tensor_map":{}})");
+        put_file((dir / "model.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", 0,
+                                       uint64_t(V) * uint64_t(H) * 2, 10),
+                            // PLACEHOLDERS, not weights (engine#1850): the synthesis path runs only when the walk ends
+                            // with NO matmuls, which is the shape a real pack has when its head is a placeholder with no
+                            // `*.packed` sibling -- the node is dropped from `matmuls` while its `block_size` is still
+                            // counted by the census that sets `p.head_block`. A tensor that carries bytes here would be
+                            // read by the graph-head loop instead and refused for its declared length.
+                            pb::placeholder("lm_head.weight.MatMulNBits.qweight"),
+                            pb::placeholder("lm_head.weight.MatMulNBits.scales"),
+                            pb::placeholder("lm_head.weight.MatMulNBits.zeros")},
+                           {}));
+        return dir;
+    };
+
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    {   // arm 1: declared tied -> synthesised from the embedding, and the note says so
+        const fs::path dir = build(true, "tied-block32");
+        const std::string out = (fs::temp_directory_path() /
+                                 ("oga_pack_import_tied32." + std::to_string(::getpid()))).string();
+        fs::remove_all(out);
+        bool threw = false;
+        std::string why;
+        pi::Report r;
+        try {
+            r = pi::import_pack(dir.string(), out, allow);
+        } catch (const std::exception& e) {
+            threw = true;
+            why = e.what();
+        }
+        check(!threw, "tied block-32: a tied pack imports (" + (why.empty() ? std::string("ok") : why.substr(0, 140)) + ")");
+        check(!r.head_synthesized_note.empty() && r.head_synthesized_note.find("block 32") != std::string::npos,
+              "tied block-32: the synthesis is recorded and names the block (" + r.head_synthesized_note + ")");
+        check(r.selfcheck_tied && r.lmhead_corr > 0.999,
+              "tied block-32: the self-check measures the SYNTHESIS against the embedding (corr " +
+                  std::to_string(r.lmhead_corr) + ")");
+        if (fs::exists(out + "/model.q4nx")) {
+            // `q4nx_head_note` is written into the container's config.json (that is what the forward reads), not into the
+            // q4nx tensor table's metadata.
+            std::ifstream cf(out + "/config.json");
+            check(cf.good(), "tied block-32: the container carries a config.json");
+            if (cf.good()) {
+                const json cfg = json::parse(cf);
+                check(cfg.contains("q4nx_head_note") && cfg["q4nx_head_note"].get<std::string>().find("block 32") !=
+                                                              std::string::npos,
+                      "tied block-32: config.json carries q4nx_head_note and names the block");
+            }
+            check(container_table(out + "/model.q4nx").contains("lm_head.weight"),
+                  "tied block-32: the container carries the synthesised head");
+            // engine#1882 review: presence is not the assertion. The self-check above measures `q` BEFORE `tile_q4_1_f32`
+            // turns it into the bytes the container carries, so an all-zero written head passed every arm -- and that is
+            // exactly the state a serve reads. Decode the container's own bytes with the decoder the forward uses.
+            const json tbl = container_table(out + "/model.q4nx");
+            if (tbl.contains("lm_head.weight")) {
+                const std::vector<uint8_t> blob = container_payload(out + "/model.q4nx");
+                const auto offs = tbl["lm_head.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+                std::vector<float> w(size_t(onebit::npu::q4nx::kRows) * onebit::npu::q4nx::kCols, 0.f);
+                onebit::npu::q4nx::dequant_tile(onebit::npu::q4nx::Chunk::Q4_1F, blob.data() + offs[0], w.data(),
+                                                onebit::npu::q4nx::kCols);
+                // Compare against the embedding THE CONTAINER CARRIES, not against this test's recollection of what it
+                // wrote: the synthesis's claim is that the head IS the embedding, so both sides must come from the file.
+                std::ifstream cfin(out + "/config.json");
+                const json cf = json::parse(cfin);
+                const int V = cf.at("vocab_size").get<int>(), H = cf.at("hidden_size").get<int>();
+                const auto eoffs = tbl["model.embed_tokens.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+                std::vector<float> emb(size_t(V) * size_t(H), 0.f);
+                for (size_t i = 0; i < emb.size(); ++i) {
+                    const uint16_t b = uint16_t(blob[size_t(eoffs[0]) + 2 * i]) |
+                                       (uint16_t(blob[size_t(eoffs[0]) + 2 * i + 1]) << 8);
+                    const uint32_t u = uint32_t(b) << 16;
+                    float v;
+                    std::memcpy(&v, &u, 4);
+                    emb[i] = v;
+                }
+                double num = 0, da = 0, db = 0;
+                int n = 0;
+                for (int r = 0; r < onebit::npu::q4nx::kRows && r < V; ++r)
+                    for (int c = 0; c < H; ++c) {
+                        const double want = double(emb[size_t(r) * size_t(H) + size_t(c)]);
+                        const double got = double(w[size_t(r) * onebit::npu::q4nx::kCols + size_t(c)]);
+                        num += want * got, da += want * want, db += got * got, ++n;
+                    }
+                const double corr = (da > 0 && db > 0) ? num / std::sqrt(da * db) : 0.0;
+                check(n > 0 && corr > 0.999,
+                      "tied block-32: the container's head, decoded from its own bytes, is the embedding (corr " +
+                          std::to_string(corr) + ", n " + std::to_string(n) + ")");
+            }
+        }
+        fs::remove_all(out);
+        fs::remove_all(dir);
+    }
+    {   // arm 2: the same pack without the declaration -> refused by name, nothing written
+        const fs::path dir = build(false, "untied-block32");
+        const std::string out = (fs::temp_directory_path() /
+                                 ("oga_pack_import_untied32." + std::to_string(::getpid()))).string();
+        fs::remove_all(out);
+        bool threw = false;
+        std::string why;
+        pi::Report r;
+        try {
+            // allow-incomplete ON purpose: a strict import bails out at the FIRST refusal (this fixture's layer payload is
+            // empty, so it has 80 of them) and never reaches the head gate -- asserting on it there would test the
+            // bail-out, not the head. With it on, the run reaches the gate and the refusal lands in `refused`.
+            allow.allow_incomplete = true;
+            r = pi::import_pack(dir.string(), out, allow);
+        } catch (const std::exception& e) {
+            threw = true;
+            why = e.what();
+        }
+        std::string said = why;
+        for (const auto& w : r.refused)
+            if (w.rfind("lm_head.weight", 0) == 0) said += " | " + w;
+        check(threw || !r.refused.empty(),
+              "untied block-32: an untied pack is refused rather than synthesised (" + said.substr(0, 140) + ")");
+        check(said.find("block 32") != std::string::npos && said.find("does not declare tied") != std::string::npos,
+              "untied block-32: the refusal names the block and the missing declaration (" + said.substr(0, 160) + ")");
+        if (fs::exists(out + "/model.q4nx"))
+            check(!container_table(out + "/model.q4nx").contains("lm_head.weight"),
+                  "untied block-32: the container carries no head (nothing stands in for an untied one)");
+        fs::remove_all(out);
+        fs::remove_all(dir);
+    }
 }
 
 // ── the final norm out of the tail envelope, on a crafted pack (engine#844) ──────────────────
@@ -3518,6 +3711,7 @@ int main(int argc, char** argv) {
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
+        test_tied_block32_head(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         test_import_fp32_params(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);

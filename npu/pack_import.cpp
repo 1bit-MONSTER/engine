@@ -380,6 +380,13 @@ constexpr double kTieCorr = 0.99;
 // Qwen3's per-head QK norm gains, but Llama-3.2-1B -- which has no QK norms at all -- carries the same +4,352 at hidden
 // 2,048, so the extra is a property of the geometry, not of the architecture. Measured anyway, because a plausible
 // explanation that survives one model is how this table would get a wrong row.
+// WHAT `prefix` IS, because it has been misunderstood twice (engine#2010): it is the FIRST BYTE AT WHICH THE 1.9 LAYER
+// BLOCK DIVERGES FROM ITS 1.8 TWIN -- `tools/fconst19_measure.py:104` walks `while b0[prefix] == a0[prefix]: prefix += 1`
+// on the pair, so the number is a measurement of that pair and nothing else. The frequent agreement with
+// `64 + 2*hidden + 4,352` (or `64 + 2*hidden` on the families with no QK-norm term) is an OBSERVATION about the rows
+// measured so far, not a rule: do not derive a row from it. A 1.9 pack with NO 1.8 twin cannot be given a row at all --
+// there is nothing to diff it against, so it stays refused by the shape gate (amd/granite-4.1-8b_rai_1.9.0_npu is the
+// standing example) rather than being given an inferred prefix and reported working.
 constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen2.5-0.5B-Instruct: normalises to its 1.8 twin byte for byte, whole file, all 24 blocks.
     {896, 14, 24, 1856, 16, 2, 34816},
@@ -401,9 +408,10 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen-2.5_1.5B_Instruct measured to the SAME bundle and rotation as the Coder pack -- byte for byte over all 28
     // layer blocks -- so the two packs share one row now that the key is geometry, not the pack name.
     {1536, 12, 28, 3136, 7, 1, 226304},
-    // Qwen3-4B: 2,933 of 2,208,061,248 bytes differ (1.3e-6), again content not layout. The prefix corroborates the
-    // Qwen3 offset seen at 1.7B -- 64 + 2*hidden + 4,352, so 8,512 at hidden 2,048 and 9,536 at 2,560 -- and the tile
-    // count differs from 1.7B's 3, which is why this is measured per pack and never derived.
+    // Qwen3-4B: 2,933 of 2,208,061,248 bytes differ (1.3e-6), again content not layout. The prefix lands where 1.7B's
+    // twin-diff landed for its hidden size (8,512 at 2,048 here, 9,536 at 2,560) -- an agreement worth noticing, since the
+    // two packs are different models -- and the tile count differs from 1.7B's 3, which is why this is measured per pack and
+    // never derived.
     {2560, 32, 36, 9536, 5, 1, 1462272},
     // Llama-3.2-1B-Instruct: hidden 2,048 with 32/16 heads and no QK norms -- the first non-Qwen family here. Same
     // prefix as Qwen3-1.7B at this hidden size (8,512), a different bundle (5 tiles of 591,872, not 3 of 1,183,744),
@@ -427,9 +435,10 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // 28,271.
     // The prefix is the ONE field this pair does not separate: `prefix+64` differs in 33,291 bytes, which is under the tool's
     // 38,306-byte tolerance -- so `prefix = 7,232` here rests on the two models agreeing and on the plain Qwen2.5 arithmetic
-    // (64 + 2*hidden, with no QK-norm term, unlike the Qwen3 line's +4,352), not on the pair alone. Said plainly because a row
-    // whose comment implies all seven fields were equally pinned would be the same kind of overstatement this table exists to
-    // avoid.
+    // (64 + 2*hidden, with no QK-norm term, unlike the Qwen3 line's +4,352), not on the pair alone -- and note that even that
+    // arithmetic is an observation about measured rows, not the definition: `prefix` is where the twins first diverge. Said
+    // plainly because a row whose comment implies all seven fields were equally pinned would be the same kind of
+    // overstatement this table exists to avoid.
     // The block's arithmetic, from the measurement rather than from a formula: prefix 7,232 + 9 x tile 1,009,664 = 9,094,208,
     // which is exactly the `header_off` the tool reports for this pair -- so the payload after the prefix is NINE tile slots,
     // of which the rule rotates eight and the ninth is the gap the post-attention header sits behind. (An earlier version of
@@ -445,7 +454,7 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     {2048, 16, 36, 4160, 9, 1, 295936},
     // Mistral-7B-Instruct-v0.2 at hidden 4,096 / 32 heads / 32 layers: measured with tools/fconst19_measure.py against
     // amd/Mistral-7B-Instruct-v0.2_rai_1.8.0_npu_4K, 1,954 of 3,843,419,200 bytes differ (5.08e-05) -- content, not
-    // layout. The prefix follows the Qwen3 line (64 + 2*hidden + 4,352 = 12,608), the bundle is 5 tiles of 2,297,856
+    // layout. The prefix is 12,608 (the first twin-diff byte), the bundle is 5 tiles of 2,297,856
     // (11,489,280 B, which is NOT header_off minus the prefix: the header sits after the prefix and the bundle follows
     // it, so this row is one the arithmetic would have got wrong), and the header stride 117,862,720 is uniform over
     // all 32 blocks. This is the largest family on #1503 (31 packs). Measured by another lane on main, whose
@@ -463,7 +472,7 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     {4096, 32, 36, 12608, 5, 1, 2297856},
     // Llama-3.2-3B (and -Instruct, same geometry) at hidden 3,072 / 24 heads / 28 layers: measured with
     // tools/fconst19_measure.py against amd/Llama-3.2-3B_rai_1.8.0_npu_4K, 1,090 of 1,756,930,368 bytes differ
-    // (6.20e-07 of the file, which the tool prints as 6.20e-05 %) -- content, not layout. The prefix is the Qwen3 line's 64 + 2*hidden + 4,352 = 10,560 at this hidden
+    // (6.20e-07 of the file, which the tool prints as 6.20e-05 %) -- content, not layout. The prefix is 10,560 here (the first twin-diff byte at this hidden
     // size, but the bundle is FOUR tiles of 1,740,800 (6,963,200 B) where the Phi/h3072 row has two of 5,222,400 --
     // which is the whole reason a row is measured per geometry and never derived from the hidden size.
     {3072, 24, 28, 10560, 4, 1, 1740800},

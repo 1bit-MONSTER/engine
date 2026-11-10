@@ -151,6 +151,15 @@ int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols
     return 0;
 }
 
+int q4nx_tile_row_kind(size_t nbytes, int rows, int cols) {
+    if (rows <= 0 || cols <= 0 || rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return 0;
+    const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
+    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
+    for (int i = 0; i < 3; i++)
+        if (nbytes == tiles * (size_t)kinds[i]) return kinds[i];
+    return 0;
+}
+
 int q4nx_packed_grid(size_t nbytes, int rows, int cols, int* cb_out, int* rp_out, int* cp_out) {
     const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
     if (rows <= 0 || cols <= 0 || rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return 0;

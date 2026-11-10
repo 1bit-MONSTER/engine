@@ -3217,12 +3217,20 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             // The two spellings of a quantised projection (engine#1503): the 1.8/phi-4 form carries a qweight and a
             // scales sibling; Qwen3-VL-4B names them `<proj>.MatMul.weight_Q4` / `<proj>.MatMul.weight_scales` on a
             // three-input node with no qzeros (implicit zero point, applied below).
-            const OnnxTensor* qw = init_of(proj + ".MatMulNBits.qweight");
-            const OnnxTensor* sc = init_of(proj + ".MatMulNBits.scales");
+            // `proj` arrives from a plan source string (`graph:model.layers.N.attn.q_proj`, no trailing dot) as well as
+            // from a role name (`...q_proj.`, with one), so normalise before appending a suffix -- otherwise the
+            // three-input spelling is looked up as `...q_projMatMul.weight_Q4` and never found, which is how a pack could
+            // plan all 252 projections, write only its norms, and fail on the device with `MLP dequant : data_size 0`
+            // (engine#1503).
+            std::string pre = proj;
+            if (!pre.empty() && pre.back() != '.') pre += '.';
+            const OnnxTensor* qw = init_of(pre + "MatMulNBits.qweight");
+            const OnnxTensor* sc = init_of(pre + "MatMulNBits.scales");
             if (!qw || !sc) {
-                qw = init_of(proj + "MatMul.weight_Q4");
-                sc = init_of(proj + "MatMul.weight_scales");
+                qw = init_of(pre + "MatMul.weight_Q4");
+                sc = init_of(pre + "MatMul.weight_scales");
             }
+            if (!qw || !sc) return false;   // named, so the caller's refusal says which
             if (!qw || !sc || qw->dims.size() != 3 || sc->dims.empty()) return false;
             const int N = int(qw->dims[0]);
             const int block = int(qw->dims[2]) * 2;            // 64 B holds 128 four-bit codes

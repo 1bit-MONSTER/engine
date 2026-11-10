@@ -1202,6 +1202,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         setup.pb16i_dir = pb16i_dir_;
         setup.head_pb16i_images =
             pb16i_ && !pb16i_dir_.empty() && file_exists(head_pb16i_stem(0) + image_ext());
+        // The plan's decode directories, resolved before the target is configured: the decode family and the
+        // lm-head both search setup.decode_dirs, so a list filled after this line reaches neither. (It used to be
+        // filled inside the M=16 block further down, which the projections read through a local copy; with that
+        // block on the target, nothing filled it at all.)
+        plan_decode_dirs_ = plan_.resolved_decode_dirs(mdir, dir);
         setup.decode_dirs = m16dirs_like_head(mdir, dir, plan_decode_dirs_);
         setup.hidden = c_.H;
         setup.vocab = c_.NV;

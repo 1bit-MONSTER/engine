@@ -191,7 +191,6 @@ void q4nx_host_gemm_i8_from_f32(const float* A, int a_k, int M, int K, int N, co
 void q4nx_host_gemm_i8_grouped(const int8_t* a8, int K, const int8_t* codes, const float* d,
                                int groups, int N, float ascale, float* out);
 
-
 /* Architecture dims a design set is derived from. */
 typedef struct {
     int H;        /* hidden_size */

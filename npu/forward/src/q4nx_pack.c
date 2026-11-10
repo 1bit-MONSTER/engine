@@ -161,6 +161,7 @@ void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
  *
  * exactly the kernel's epilogue, with the inner sum in int32 and no float in it. `d` is the per-128-K-group
  * multiplier per column ([groups][N]), `ascale` the activation row's scale. */
+
 void q4nx_host_gemm_i8_grouped(const int8_t* a8, int K, const int8_t* codes, const float* d,
                                int groups, int N, float ascale, float* out) {
     const int G = 128;

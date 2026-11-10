@@ -3044,7 +3044,6 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 //    the device is about accumulation and epilogue, not about a float both sides happen to share.
 void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                                   int wkey, float* out) {
-    const int G = 128, groups = (K + G - 1) / G;
     // THE KEY MUST CARRY THE LAYER AND THE SHAPE (engine#1830 review). `wkey` is a per-ROLE slot -- 0 QKV, 1 O/gate,
     // 2 GU, 3 up, 4 down -- so it is the same number in every layer, and `Bmat` is the one scratch buffer that
     // `load_layer()` decodes each layer into, so neither identifies a layer. Keyed on `wkey` alone, every layer after 0
@@ -3060,29 +3059,20 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     auto it = cacheable ? host_i8_cache_.find(key) : host_i8_cache_.end();
     if (!cacheable || it == host_i8_cache_.end()) {
         HostI8Tensor t;
-        t.groups = groups; t.N = N;
+        t.N = N;
         t.codes.assign((size_t)K * (size_t)N, 0);
-        t.d.assign((size_t)groups * (size_t)N, 0.0f);
-        for (int g = 0; g < groups; g++) {
-            const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
-            for (int n = 0; n < N; n++) {
-                float amax = 0.0f;
-                for (int k = k0; k < k1; k++) {
-                    const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
-                    if (std::isfinite(v) && v > amax) amax = v;
-                }
-                if (!(amax >= 1e-12f)) amax = 1.0f;
-                t.d[(size_t)g * (size_t)N + (size_t)n] = amax / 127.0f;
-                const float tis = 127.0f / amax;
-                for (int k = k0; k < k1; k++) {
-                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
-                    if (!std::isfinite(v)) v = 0.0f;
-                    int q = (int)std::round(v * tis);
-                    q = q > 7 ? 7 : (q < -8 ? -8 : q);
-                    t.codes[(size_t)k * (size_t)N + (size_t)n] = (int8_t)q;
-                }
-            }
-        }
+        t.d.assign((size_t)N, 0.0f);
+        // THE OPERANDS MUST BE THE ENGINE'S, NOT A PRIVATE RE-QUANTISATION (engine#1808/#1830). This arm exists to be
+        // the integer reference a kernel family is gated against, and the device's weight image comes from
+        // q4nx_pack_B_int8_blocked(): ONE multiplier per column (amax over the whole K), int8 codes in [-127, 127].
+        // Quantising here with a different rule -- per 128-K group, int4 [-8, 7] -- computes a different model: measured
+        // 2026-11-10, the arm answered "ikt" to "The capital of France is" and then locked onto one token, while the
+        // per-GEMM A/B read cos 0.9999 against f32 on the same tensors. Same packer, same bytes, same model.
+        double ssum = 0.0;
+        // blocked=1: the image is written in the blocked microtile order, which is the fast path AND the layout the
+        // device actually reads, so the MAC below walks it with q4nx_layout::blocked_index(). (blocked=0 was measured
+        // at 174.5 s of warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.)
+        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, /*blocked=*/1, t.d.data(), &ssum);
         if (!cacheable) {
             scratch = std::move(t);
             cached = &scratch;
@@ -3109,8 +3099,14 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
             int q = (int)std::round(v * tis);
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
         }
-        q4nx_host_gemm_i8_grouped(a8.data(), K, t.codes.data(), t.d.data(), t.groups, N, ascale,
-                                  out + (size_t)m * (size_t)N);
+        float* dst = out + (size_t)m * (size_t)N;
+        for (int n = 0; n < N; n++) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++)
+                acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] *
+                                 (int)a8[(size_t)k]);
+            dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
+        }
     }
 }
 

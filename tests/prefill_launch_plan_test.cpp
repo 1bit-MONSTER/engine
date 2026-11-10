@@ -54,6 +54,22 @@ int main() {
     check(plan_prefill_launches(0, true).wide_launches == 0 && plan_prefill_launches(0, true).twin_launches == 0,
           "0 rows: no launch at all");
 
-    if (fails == 0) std::printf("prefill launch plan: 8 arms pass (16 boundary, 17, 96/97 crossover, no-twin, 0)\n");
+    // A second pack's measured pair changes the answer -- and reproduces the 4B A/B that said splitting loses at 48 rows:
+    // 2416.3 ms for one wide pass against ~834 ms per M=16 launch (2502.6 ms for three), i.e. k <= 2 wins, k = 3 loses.
+    {
+        const npu::plan::PrefillCost fourb{834.0, 2416.3};
+        check(npu::plan::plan_prefill_launches(32, true, fourb).twin_launches == 2,
+              "4B costs: 32 rows -> 2 launches (1668 ms < 2416 ms)");
+        check(npu::plan::plan_prefill_launches(48, true, fourb).wide_launches == 1,
+              "4B costs: 48 rows -> the wide pass, because 3 x 834 = 2502 ms > 2416 ms (the measured 3.6% loss)");
+    }
+    // and a pack whose twin is free is never worth splitting either way -- the degenerate guards
+    {
+        const npu::plan::PrefillCost zero{0.0, 6992.2};
+        check(npu::plan::plan_prefill_launches(48, true, zero).wide_launches == 1,
+              "a zero-cost twin is treated as unusable, not as infinitely fast");
+    }
+
+    if (fails == 0) std::printf("prefill launch plan: 11 arms pass (16 boundary, 17, 96/97 crossover, no-twin, 0, 4B costs x2, zero-cost guard)\n");
     return fails == 0 ? 0 : 1;
 }

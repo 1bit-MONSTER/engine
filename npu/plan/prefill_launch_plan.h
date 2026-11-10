@@ -31,18 +31,31 @@ struct PrefillLaunchPlan {
 };
 
 constexpr int kPrefillM16Rows = 16;   // rows one M=16 launch carries
-constexpr int kPrefillMaxTwinLaunches = 6;   // 6 x 1073.4 = 6440 ms < one 6992 ms wide pass; 7 is 7514 ms, so it loses
+
+// The two unit costs, measured per pack. These two are the 7B pack's (Qwen2.5-7B b8, one npu-hold ticket, NPU_PHASE_PROF=1):
+// 1073.4 ms for a 16-row pass, 6992.2 ms for one 128-row pass -- 6.51x, so six M=16 launches (6440 ms) beat one wide pass and
+// seven (7514 ms) do not. A different pack must supply ITS OWN pair: on the 4B set the same A/B measured 2416.3 ms wide against
+// ~834 ms per 16-row launch, i.e. 3 launches = 2502.6 ms > 2416.3 ms, and splitting loses at 48 rows (3.6% slower, measured).
+struct PrefillCost {
+    double m16_ms = 1073.4;   // one M=16 launch
+    double wide_ms = 6992.2;  // one wide (M=128) launch
+};
 
 // `has_twin` false means the pack carries no _m16 kernel for this projection: the wide path is then the only option, whatever
 // the arithmetic says (the existing `if (!m16_) return prefill;` guard must not be bypassed by a split).
-inline PrefillLaunchPlan plan_prefill_launches(int rows, bool has_twin) {
+inline PrefillLaunchPlan plan_prefill_launches(int rows, bool has_twin, const PrefillCost& cost) {
     PrefillLaunchPlan p;
     if (rows <= 0) return p;
-    if (!has_twin) { p.wide_launches = 1; return p; }
+    if (!has_twin || !(cost.m16_ms > 0.0) || !(cost.wide_ms > 0.0)) { p.wide_launches = 1; return p; }
     const int k = (rows + kPrefillM16Rows - 1) / kPrefillM16Rows;
-    if (k <= kPrefillMaxTwinLaunches) { p.twin_launches = k; return p; }
+    if (double(k) * cost.m16_ms < cost.wide_ms) { p.twin_launches = k; return p; }
     p.wide_launches = 1;
     return p;
+}
+
+// The default overload: the 7B pack's measured costs. Use the three-argument form for any other pack.
+inline PrefillLaunchPlan plan_prefill_launches(int rows, bool has_twin) {
+    return plan_prefill_launches(rows, has_twin, PrefillCost{});
 }
 
 }  // namespace npu::plan

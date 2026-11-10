@@ -2573,25 +2573,10 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
             for (int j = 0; j + 1 < CK - 1; j++) cs[j] = cs[j + 1];
             if (CK > 1) cs[CK - 2] = qkv[ch];
         }
-        // alpha/beta on the host (N = NVH, below the GEMM tile width)
-        const float* xm = xn.data() + (size_t)m * H;
-        {
-            LhScope _t_ab(LH_GDN_AB);
-            for (int hh = 0; hh < NVH; hh++) {
-                const float* ra = gdn_small_[(size_t)l].wa.data() + (size_t)hh * H;
-                const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)hh * H;
-                float sa = 0, sb = 0;
-                for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
-                AHS[(size_t)m * NVH + hh] = sa;
-                BHS[(size_t)m * NVH + hh] = sb;
-            }
-        }
-        if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l) {   // keep what a commit would need
-            auto& rec = row_in_[(size_t)l][(size_t)m];
-            rec.qkv.assign(qkv, qkv + CD);
-            rec.ah.assign(AHS.begin() + (size_t)m * NVH, AHS.begin() + (size_t)(m + 1) * NVH);
-            rec.bh.assign(BHS.begin() + (size_t)m * NVH, BHS.begin() + (size_t)(m + 1) * NVH);
-        }
+        // alpha/beta (N = NVH, below the GEMM tile width) no longer runs here: it depends on nothing this loop
+        // carries, so it is computed head-major inside the layer's one parallel region below (engine#1416).
+        if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l)   // keep what a commit would need;
+            row_in_[(size_t)l][(size_t)m].qkv.assign(qkv, qkv + CD);       // ah/bh are stored after the region
         // q/k L2-normalised with NVH/NKH head repetition; v per v-head
         float* qlm = &QLS[(size_t)m * NVH * KHD];
         float* klm = &KLS[(size_t)m * NVH * KHD];
@@ -2675,12 +2660,46 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     if (gdn_check) core_ref.assign(CORE.size(), 0.0f);
     std::vector<float> state_pre;   // NPU_GDN_CHECK only: the state the old nesting must start from
     if (gdn_check) state_pre = rec_state_[l];
+    // alpha/beta on the host: for every (row, head) one dot product of the row against that head's alpha row and
+    // one against its beta row.  It used to run inside the row loop above on ONE thread -- measured on the served
+    // 27B t2s pack, 76 ms of a 730 ms 16-row prefill block (0.099 ms per row and layer, 48 GDN layers), the largest
+    // single non-GEMM host term of a prefill pass once the pack column fell to 0.13 ms/launch (engine#1416).
+    // Each (row, head) pair is independent and writes its own two elements, and each dot product is the same
+    // sequential loop as before (strict IEEE: the build has no -ffast-math, so the summation order is the source
+    // order), so sharing the pairs out moves no bit.  It takes NO new parallel region: it is a second worksharing
+    // loop inside the one this layer already opens, because a region is what costs under contention (see above).
+    // Head-major like the recurrence, so a thread keeps one head's two weight rows (2 x H floats) in L1/L2 across
+    // the rows.  NPU_GDN_CHECK=1 recomputes it the old way, serially, and compares bit for bit.
+    const float* const wa_all = gdn_small_[(size_t)l].wa.data();
+    const float* const wb_all = gdn_small_[(size_t)l].wb.data();
+    auto alpha_beta = [&](int hh, int m, float* ah, float* bh) {
+        const float* xm = xn.data() + (size_t)m * H;
+        const float* ra = wa_all + (size_t)hh * H;
+        const float* rb = wb_all + (size_t)hh * H;
+        float sa = 0, sb = 0;
+        for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
+        ah[(size_t)m * NVH + hh] = sa;
+        bh[(size_t)m * NVH + hh] = sb;
+    };
     {
-        LhScope _t_core(LH_GDN_CORE);
+        // Timed on thread 0 at the two barriers, so `gdn alpha/beta` and `gdn recurrence` stay the two
+        // disjoint columns they were (an LhScope inside the region would be written by every thread).
+        const bool lh = q4nx_lh::lh_on();
+        std::chrono::steady_clock::time_point t0, t1;
+        if (lh) t0 = std::chrono::steady_clock::now();
 #pragma omp parallel num_threads(gdn_nt)
         {
             std::vector<float> scratch((size_t)2 * VHD);   // one allocation per thread, not per head
             float* sc = scratch.data();
+#pragma omp for schedule(static)
+            for (int hh = 0; hh < NVH; hh++)
+                for (int m = 0; m < M; m++) alpha_beta(hh, m, AHS.data(), BHS.data());
+            // implicit barrier: every AHS/BHS element is written before any head reads one
+#if defined(_OPENMP)
+            if (lh && omp_get_thread_num() == 0) t1 = std::chrono::steady_clock::now();
+#else
+            if (lh) t1 = std::chrono::steady_clock::now();
+#endif
 #pragma omp for schedule(static)
             for (int hh = 0; hh < NVH; hh++) {
                 float* sh = rs + (size_t)hh * KHD * VHD;
@@ -2688,8 +2707,34 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                     head_row(hh, m, sh, CORE.data() + (size_t)m * VD + (size_t)hh * VHD, sc);
             }
         }
+        if (lh) {
+            const auto t2 = std::chrono::steady_clock::now();
+            q4nx_lh::g_lh[LH_GDN_AB] += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            q4nx_lh::g_lh_n[LH_GDN_AB]++;
+            q4nx_lh::g_lh[LH_GDN_CORE] += std::chrono::duration<double, std::milli>(t2 - t1).count();
+            q4nx_lh::g_lh_n[LH_GDN_CORE]++;
+        }
     }
+    if (verify_open_ && (int)row_in_.size() > l)   // the rest of what a commit would need (qkv was stored above)
+        for (int m = 0; m < M && m < verify_rows_; m++) {
+            auto& rec = row_in_[(size_t)l][(size_t)m];
+            rec.ah.assign(AHS.begin() + (size_t)m * NVH, AHS.begin() + (size_t)(m + 1) * NVH);
+            rec.bh.assign(BHS.begin() + (size_t)m * NVH, BHS.begin() + (size_t)(m + 1) * NVH);
+        }
     if (gdn_check) {
+        // alpha/beta the old way: one thread, row-major, through the same body.  Compared as bit patterns, so a
+        // NaN that both produce is equal and a -0.0 against +0.0 is not.
+        std::vector<float> ah_ref(AHS.size()), bh_ref(BHS.size());
+        for (int m = 0; m < M; m++)
+            for (int hh = 0; hh < NVH; hh++) alpha_beta(hh, m, ah_ref.data(), bh_ref.data());
+        const bool ab_same = std::memcmp(ah_ref.data(), AHS.data(), AHS.size() * sizeof(float)) == 0 &&
+                             std::memcmp(bh_ref.data(), BHS.data(), BHS.size() * sizeof(float)) == 0;
+        fprintf(stderr, "[gdncheck] l=%d M=%d alpha/beta shared vs serial: %zu values %s\n", l, M,
+                2 * AHS.size(), ab_same ? "identical" : "MISMATCH");
+        if (!ab_same) {
+            err_ = "gdn check: the shared alpha/beta disagrees with the serial one at layer " + std::to_string(l);
+            return false;
+        }
         // The old nesting, through the same body: one region per row.  Bit-exactness is the whole claim of this
         // change, so it is asserted rather than argued -- the same form as NPU_REPLAY_CHECK in commit_verify_rows.
         std::copy(state_pre.begin(), state_pre.end(), rec_state_[l].begin());

@@ -512,6 +512,41 @@ An **M≥256 t2s family** is what removes the 8x launch overhead; it is private-
 family passes, and the acceptance row is: both Llama3-8B prefill shapes (`K=4096 N=14336`, `K=14336 N=4096`) at M = 256 / 1024 / 16384, ≥ 4 TFLOP/s,
 byte-exact logits against the current path on a fixed prompt set, `amdxdna` counter 0.
 
+#### Where a prefill block's time goes now (measured), and why it is no longer the pack (#1416)
+
+#1416 was filed on a `[prof] pre` table whose `pack` column read 24 ms per launch against 1.3 ms of device wait. That
+column was the first-touch weight fill of a fresh serve, not a per-request cost, and three merged changes removed it
+from every request: the weight cache is filled before the serve says ready (#1621), the fill reads each image into its
+BO (above), and only the rows that exist are quantised. Re-measured on the same pack (`bonsai2-27b-t2s2`, 2026-11-10,
+`npu-hold` tickets, `amdxdna` error count unchanged across each), a 5-token prompt for 8 tokens costs **2.99 s as the
+first request of a serve and 2.90 s as the second and third**, and a 510-536-token prompt reaches its first token at
+**20.2-21.7 tok/s** (`prompt_tokens / wall`, `max_tokens 1`, distinct prompts).
+
+One 16-row block of that prefill, from the serve's own `[bs]` and `[bl]` lines (`NPU_PHASE_PROF=1`; medians over 103
+blocks per arm, two arms per binary run A B B A in one ticket):
+
+| term of a 16-row block | before | after | |
+|---|---:|---:|---|
+| block wall | 734-749 ms | **688-704 ms** | 21.4-21.8 -> **22.7-23.3 rows/s** |
+| device wait (416 launches) | 213-214 ms | 215-217 ms | unchanged: 29-31 % of the block |
+| `gemm pack` | 55.6-56.6 ms | 55.6-58.4 ms | 0.13 ms/launch: 7-8 % of the block, where #1416 read 93 % |
+| host outside the GEMM launches | 392-407 ms | **342-353 ms** | the majority term |
+| of which GDN alpha/beta | 77.5-77.8 ms | **13.1-13.5 ms** | the change below |
+| of which GDN recurrence | 30.5-33.4 ms | 27.0-30.0 ms | |
+
+So prefill on this route is bound by host work outside the launches and by the M=16 launch geometry above, in that
+order, and not by packing. "After" is one change: the per-(row, head) alpha/beta dot products of a GDN layer ran on one
+thread inside the row loop (0.099 ms per row and layer, 48 GDN layers), and they now run as a second worksharing loop
+inside the parallel region that layer already opens for the recurrence. No region is added, because the region count is
+what a loaded box pays for. Each dot product is the same sequential loop as before and the build has no `-ffast-math`,
+so no bit moves: greedy text is identical in all four arms, and `NPU_GDN_CHECK=1` recomputes the serial form for every
+layer and compares bit patterns (336 of 336 layer passes identical on the device at M = 1, 4 and 16; a mismatch fails
+the call). `tests/gdn_batch_order_test` requires those check lines on any hybrid container named by `ONEBIT_TEST_Q4NX`.
+
+A request wall moves less than the block does and scatters more: the same four arms measured 20.2-21.7 tok/s before and
+21.6-23.1 after by TTFT, with one outlier in each direction (18.3 and 15.8) from other lanes' load. Quote the block
+medians for the effect and the TTFT range for what a caller sees.
+
 #### Per-tile arithmetic ceiling, and where our GEMMs sit against it (AM027)
 
 AM027 (*Versal Adaptive SoC AIE-ML v2 Architecture Manual*, v1.1) **Appendix A, Table 14** gives 512 INT8×INT8 multipliers per compute tile and 256

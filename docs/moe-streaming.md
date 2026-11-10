@@ -687,12 +687,38 @@ Co-activating experts cluster hard enough that a **per-layer** placement is wort
 (share of decoded tokens whose experts all land on ONE device, i.e. how often a token can skip the wire entirely). The
 middle row is why this is per layer and not one permutation for the model.
 
+**Those shares are in-sample, and a consumer will not see them.** Each was scored on the same decode steps the plan was
+built from. A placement is fixed in a model while prompts change, so the number that matters is the share on steps the
+plan never saw. Measured with `tools/moe_placement.py` on the same traces (G=2, 2026-11-10):
+
+| table built from | scored on | Qwen3.6 chat | Qwen3.6 code | Flash-Next |
+|---|---|---|---|---|
+| the whole trace | the same trace (in-sample) | 51.1 % | 55.6 % | 52.3 % |
+| the first half of each layer's steps | the second half (held out) | **22.5 %** | **26.3 %** | **18.9 %** |
+| the other prompt's trace | this trace | **7.0 %** (built from code) | **13.5 %** (built from chat) | not measured |
+| contiguous id split (control) | this trace | 0.6 % | 0.5 % | 0.2 % |
+
+So a per-layer placement is still 15 to 50 times the contiguous control on unseen steps, but it is a 7-26 % lever, not a
+44-60 % one, and it is weakest across prompts. With a few hundred decode steps and 256 or 512 experts per layer, a
+partition can keep many of exactly the steps it was fitted to: a table built from chat and code together scores 50 % on
+both, in-sample. The Flash-Next cross-prompt cell is empty on purpose: the only other Flash-Next decode trace on the box
+shares 18 % of its rows with the fitting trace, so it is not an independent sample. Any gate for a consumer of this
+table (engine#1702) should be stated on a held-out or cross-prompt share, or on an end-to-end rate.
+
 `tools/moe_placement.py` builds that table from a `tools/moe_trace.cpp` trace:
 
 ```
 tools/moe_trace … trace.tsv                    # the per-step, per-layer expert ids
 tools/moe_placement.py trace.tsv -g 2 -e 256 -o placement.json
 ```
+
+**The partition is Kernighan-Lin, not just a chain.** The first version of the tool cut a greedy max-affinity chain into
+G runs and said that was close enough to the report's balanced Kernighan-Lin plan. Measured on the report's traces it was
+not: 34.8 % / 34.8 % / 24.7 % in-sample (chat, code, Flash-Next) against 51.1 % / 55.6 % / 52.3 % once the chain's cut is
+refined by Kernighan-Lin swaps (the report measured 46.2 % / 60.0 % / 44.0 % with its own implementation). A chain follows
+one neighbour at a time, so it strings clusters together and the cut lands wherever the count says. The refinement swaps
+equal numbers of experts between groups, so a balanced split stays balanced; inside each group the order is still a
+max-affinity chain. The whole run takes under 2 s per trace.
 
 **`-e` is the model's expert count, and it matters.** A decode sample does not fire every expert in every layer, and the
 default derives the layer's size from the highest id the trace happens to visit — so without `-e` the table is a placement
@@ -711,6 +737,7 @@ splitter or the streamer may consume, and an unused table changes nothing. Its s
 
 ```json
 { "schema": "1bit/moe-placement/1", "groups": 2,
+  "share_in_sample": 0.5113, "share_held_out": 0.2252, "held_out_steps": 14400,
   "layers": { "0": { "decode_steps": 720, "experts": 256, "experts_seen": 243, "unseen": 13,
                      "groups": [[…ids…], […ids…]] } } }
 ```
@@ -718,7 +745,20 @@ splitter or the streamer may consume, and an unused table changes nothing. Its s
 keyed by (layer, global expert id) — the same key `tools/build_expert_placement.py` uses upstream of us, which is why the
 schema carries its own name: a consumer can check `schema` rather than assume this tool's version.
 
-`--self-test` pins the property that matters on synthetic traces with a known answer: two **interleaved** clusters (ids
+The two shares travel in the file, so a table found later says which number it was built on. `share_held_out` is the
+table built from the first half of each layer's steps scored on the second half; the run prints both. To score a table on
+a different trace (another prompt, another session), which is the closest thing to what a consumer gets:
+
+```
+tools/moe_placement.py other-prompt.tsv --score placement.json
+```
+
+It refuses a file whose `schema` is not this one, and a table that lacks a layer the trace has.
+
+`--self-test` pins the property that matters on synthetic traces with a known answer: a bridge pair that fires more often
+than any pair inside two clusters must not pull the clusters apart (the chain alone scores 37.5 % there, the refined plan
+62.5 % with the group sizes unchanged), a table built from the first half of a layer whose clusters then change must score
+0 % held out, and otherwise: two **interleaved** clusters (ids
 `0,2,4,6` / `1,3,5,7`, so a contiguous split cannot be right by accident) must reach a 100 % one-device share under `-g 2`
 while the contiguous control reaches 0 %, four clusters must do it under `-g 4`, a token spanning every group must never
 count as one device, `G=1` / `G=n_experts` must be exact, and a **partial** sample must still place every expert in range

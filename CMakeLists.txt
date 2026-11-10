@@ -427,6 +427,14 @@ add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
+# The speculative round's bookkeeping (app/spec_decode.h, engine#1781): a drafter's proposals against the verifier's
+# per-row logits, with the acceptance rule from npu/mtp/spec_accept.h (#1958, merged). Header-only and pure -- the
+# uniforms come from the caller, so every arm is a hand-computed value and there is no model, device or RNG here.
+# `add_dependencies(onebit ...)` because a target ci.yml never builds is the failure that check exists to catch.
+add_executable(spec_decode_test tests/spec_decode_test.cpp)
+target_include_directories(spec_decode_test PRIVATE app)
+add_test(NAME spec_decode COMMAND spec_decode_test)
+add_dependencies(onebit spec_decode_test)
 # The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):
 # a load started right after an evict can hit the previous backend's hardware context still being torn down, which used
 # to be fatal on the first attempt. Header only, no device, no model.

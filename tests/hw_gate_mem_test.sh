@@ -131,5 +131,47 @@ else
   else echo "ok   a GPU step stopped by the guard is gone (mem-guard $guard)"; fi
 fi
 
+# 5. the GPU token is not held while gpu() waits for memory. gpu(), take_token() and release_token() are taken from
+# the script as they are and run with a real token file; the pre-check ("$0 --cool --mem") is this harness, which
+# refuses twice (76) and records who holds the token each time it is asked and during each wait.
+h=$scratch/s5; mkdir -p "$h/out"
+for f in take_token release_token gpu; do
+  awk -v f="$f" '$0 ~ "^" f "\\(\\) \\{" { on = 1 } on { print } on && /^}/ { exit }' "$root/scripts/hw-gate.sh"
+done > "$h/funcs.sh"
+cat > "$h/harness.sh" << 'EOS'
+#!/usr/bin/env bash
+h=$(dirname "$0")
+held() { if [ -e "$h/token" ]; then echo held; else echo free; fi; }
+if [ "${1:-}" = --cool ]; then
+  n=$(cat "$h/asked" 2> /dev/null || echo 0); echo $((n + 1)) > "$h/asked"
+  echo "precheck $(held)" >> "$h/log"
+  [ "$n" -lt 2 ] && exit 76
+  exit 0
+fi
+TOKEN=$h/token TOKEN_WAIT=30 TOKEN_HELD="" OUT=$h/out ROOT=/nonexistent MEM_FLOOR=1 THERMAL=true infra=0
+note() { :; }; result() { echo "result $*" >> "$h/log"; }; wait_coder_idle() { :; }; ring_timeouts() { echo 0; }
+sleep() { echo "wait $(held)" >> "$h/log"; }
+. "$h/funcs.sh"
+gpu true; echo "rc $? token-after $(held)" >> "$h/log"
+EOS
+if [ "$(grep -c '^gpu() {' "$h/funcs.sh")" != 1 ] || ! grep -q '^take_token() {' "$h/funcs.sh" || ! grep -q '^release_token() {' "$h/funcs.sh"; then
+  fail "token: cannot find gpu(), take_token() and release_token() in hw-gate.sh"
+else
+  chmod +x "$h/harness.sh"      # gpu() runs "$0 --cool ..."
+  HW_GATE_MEM_RETRY_SLEEP=0 timeout 60 "$h/harness.sh" > "$h/stdout" 2>&1
+  want='precheck held
+wait free
+precheck held
+wait free
+precheck held
+rc 0 token-after held'
+  if [ "$(cat "$h/log" 2> /dev/null)" = "$want" ]; then
+    echo "ok   the GPU token is given back for each memory wait and held again for each try"
+  else
+    fail "token: gpu() held the GPU token while waiting for memory (or lost it for a try); the sequence was:"
+    sed 's/^/     /' "$h/log" 2> /dev/null; sed 's/^/     | /' "$h/stdout" | head -n 5
+  fi
+fi
+
 [ "$fails" = 0 ] || { echo "$fails check(s) failed"; exit 1; }
 echo "ok   hw-gate memory checks"

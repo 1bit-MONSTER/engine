@@ -357,9 +357,18 @@ gpu() {
   while :; do
     "$0" --cool --mem "${GPU_MODEL:--}" "$ROOT/scripts/mem-guard.sh" --term "$MEM_FLOOR" "$THERMAL" "$@"
     rc=$?
-    # 76: the memory pre-check said no; nothing is held, so other work can finish first
+    # 76: the memory pre-check said no, and the step holds nothing. The gate still holds the GPU token, though,
+    # and the jobs whose memory it is waiting for may be queued behind that token: so the token is given back
+    # for the wait and taken again before the next try (review of engine#1936). Under the gpu-hold wrapper the
+    # ticket is the wrapper's and cannot be given back from here; release_token is then a no-op.
     [ $rc = 76 ] && [ $tries -lt "${HW_GATE_MEM_RETRIES:-10}" ] || break
-    tries=$((tries + 1)); sleep 60
+    tries=$((tries + 1))
+    release_token
+    sleep "${HW_GATE_MEM_RETRY_SLEEP:-60}"
+    if ! take_token; then
+      result gpu-token FAIL "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
+      exit 2
+    fi
   done
   [ $rc = 76 ] && { note "::error::memory pre-check refused the step ${tries} times"; infra=1; }
   t1=$(date +%s)

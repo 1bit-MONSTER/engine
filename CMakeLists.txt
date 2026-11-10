@@ -444,6 +444,13 @@ if(TARGET OpenMP::OpenMP_CXX)
     target_link_libraries(mtp_draft_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
 add_test(NAME mtp_draft COMMAND mtp_draft_test)
+# engine#1781 gate 2: the distribution-following acceptance rule (accept with min(1, p/q), resample the residual at the
+# first rejection), with the temperature-0 identity and a deliberately wrong drafter whose output must still follow p.
+# Header-only and device-free; pulled into CI through npu_sampling_test for the same reason as mtp_draft_test below.
+add_executable(spec_accept_test tests/spec_accept_test.cpp)
+target_include_directories(spec_accept_test PRIVATE npu)
+add_test(NAME spec_accept COMMAND spec_accept_test)
+add_dependencies(npu_sampling_test spec_accept_test)
 # ci.yml's build step lists every ctest target explicitly, and this branch cannot edit that file (the push
 # token has no `workflow` scope), so the binary is pulled in as a dependency of a listed test target. When a
 # workflow-scoped push is available, add `mtp_draft_test` to ci.yml's build list and delete this line.

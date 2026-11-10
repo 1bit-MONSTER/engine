@@ -262,6 +262,16 @@ cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader tha
 device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
 the bf16 rounding reappears for the device, never in the container.
 
+**The cache is bounded, and the bound is least-recently-used (engine#1956).** After writing an
+entry, `1bit serve` removes the least-recently-used entries until the cache is within
+`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The entry
+just written and any entry used in the last ten minutes are never removed. "Used" means reused,
+not only written: a cache hit — a repacked GGUF found in the cache, or a device-form conversion
+reused at load — marks the entry's directory as used now, so a container imported once and served
+every day outlives a one-off imported yesterday. The value is read as a whole number of GiB: a
+number too large to be a byte count is the largest bound that is one (it does not wrap to a small
+one), and a value that is not a number gets the default rather than an unbounded cache.
+
 **The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
 packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
 with its own scale — and until this cache that happened on every serve. The image is a function
@@ -1859,7 +1869,7 @@ none of which is a kernel fault. A family gated against f32 can therefore never 
 
 `NPU_INFER_HOST_GEMM=i8` is the reference that can. It builds each body GEMM's weight image with the engine's
 own packer (`q4nx_pack_B_int8_blocked()`: one multiplier per column, int8 codes, blocked microtile order), walks
-it with `q4nx_layout::blocked_index()`, quantises the activation row to int8 with `amax/127`, accumulates in
+it with `q4nx_layout::image_index()`, quantises the activation row to int8 with `amax/127`, accumulates in
 int32 and applies `d[n] * (ascale * acc)`. **Same packer, same image, same order** -- that is the whole point: a
 reference that re-quantises by a different rule computes a different model, and will disagree with a correct
 device (measured: per-128-K int4 codes answer `ikt` to a question four other packs answer correctly on).
@@ -1867,6 +1877,12 @@ device (measured: per-128-K int4 codes answer `ikt` to a question four other pac
 The LM head is included, in vocabulary blocks (a whole head image is H x V bytes, 622 MB at 150k vocabulary).
 Without it the body is exact and the head is not, and the residual shows up as `max|d| ~ 0.3` on logits that no
 amount of body-side agreement can remove.
+
+The images are unpadded (K x N bytes), and the blocked order only exists for whole 64 x 128 tiles, so a geometry
+that is not whole tiles is packed and read **row-major** instead: the same codes and scales, so the same int32
+sums. The common case is the head's last vocabulary block (phi-3-mini: `32064 % 8192 = 7488`, which is 58.5
+tiles). Before engine#1994 such a shape was forced blocked, so the packer wrote past the vector and the MAC read
+back whatever was there. `tests/npu_blocked_layout_test.cpp` pins the rule with guard bytes behind the image.
 
 **What it measures.** Run the device arm and the `=i8` arm on the same request with `--dump-logits`, then
 `scripts/families/compare-logits.py` (npu-kernels). On `kernels-h4096-b8` with Mistral-7B-Instruct-v0.2 1.9:

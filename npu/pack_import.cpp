@@ -1650,7 +1650,17 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
     // engine#1831: only when the vote did NOT record the block's headers. When it did, its list is the measurement
     // (`plan()` reads 2-header vs 4-header from `hdr.size()`, and `post_attn_hdr()` is `hdr.back()`), and rewriting it
     // to one entry turned every Qwen3 4-header 1.9 block into a 2-header one whose "post-attention" header was k_norm's.
-    if (!g.hdr.empty()) return g;
+    if (!g.hdr.empty()) {
+        /* engine#1985: the vote's list is a measurement, but it is not the only witness. A pack that declares per-head q/k
+         * gains cannot have a 2-header block, so a one-header vote on such a pack is the #1831 defect coming back through
+         * the vote instead of through the residue step -- measured: Qwen3-1.7B read as 2-header, qk_norm true -> false, 280
+         * refused projections, where main imported it with 0 the day before. Refuse naming both rather than pick. */
+        if (const std::string why = header_witness_refusal(int(g.hdr.size()), dims.use_qk_norm); !why.empty()) {
+            g.why = why;
+            g.stride = 0;
+        }
+        return g;
+    }
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
     // The scan window is the first GiB (about 8 blocks at h3584), so a real section boundary repeats ~8 times against
     // 1-2 for a payload coincidence; 3 separates them (requiring `layers/2` was too strict and dropped the real one).
@@ -2859,6 +2869,13 @@ QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_b
     o.q_norm = gap_start + kNormOff;                          // block 0: [64 B zeros][q_norm bf16 [head_dim]]
     o.k_norm = gap_start + (kNormOff + per_head) + kNormOff;  // block 1: [64 B zeros][k_norm bf16 [head_dim]]
     return o;
+}
+
+std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
+    if (!declared_qk || vote_hdrs != 1) return std::string();
+    return "the epsilon-anchor vote recorded ONE in-block header, and this pack declares use_qk_norm, whose per-head q/k "
+           "gains live in the two sections a 2-header block does not have (engine#1985). The two witnesses disagree and "
+           "neither is being preferred";
 }
 
 std::string qk_norm_refusal(bool declared, bool found) {

@@ -3158,10 +3158,14 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         // 2026-11-10, the arm answered "ikt" to "The capital of France is" and then locked onto one token, while the
         // per-GEMM A/B read cos 0.9999 against f32 on the same tensors. Same packer, same bytes, same model.
         double ssum = 0.0;
-        // blocked=1: the image is written in the blocked microtile order, which is the fast path AND the layout the
-        // device actually reads, so the MAC below walks it with q4nx_layout::blocked_index(). (blocked=0 was measured
-        // at 174.5 s of warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.)
-        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, /*blocked=*/1, t.d.data(), &ssum);
+        // Blocked: the image is written in the blocked microtile order, which is the fast path AND the layout the
+        // device actually reads, so the MAC below walks it with the same index. (blocked=0 was measured at 174.5 s of
+        // warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.) But the image is
+        // UNPADDED, K*N bytes, and blocked_index() addresses whole 64x128 tiles: an N that is not a multiple of 128 (or
+        // a K not of 64) packs and reads past the vector (engine#1994). Those geometries take row-major, which holds
+        // the same codes, so the result is unchanged and only an unaligned shape pays the slower pack.
+        t.blocked = q4nx_layout::blocked_fits(K, N);
+        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, t.blocked ? 1 : 0, t.d.data(), &ssum);
         if (!cacheable) {
             scratch = std::move(t);
             cached = &scratch;
@@ -3201,7 +3205,7 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         for (int n = 0; n < N; n++) {
             int32_t acc = 0;
             for (int k = 0; k < K; k++)
-                acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] *
+                acc += (int32_t)((int)t.codes[q4nx_layout::image_index((size_t)k, (size_t)n, K, N, t.blocked)] *
                                  (int)a8[(size_t)k]);
             dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
         }
@@ -5388,12 +5392,15 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
                 c.codes.assign((size_t)H * (size_t)Tn, 0);
                 c.d.assign((size_t)Tn, 0.0f);
                 double ssum = 0.0;
-                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, /*blocked=*/1, c.d.data(), &ssum);
+                // The last vocabulary block is rarely whole tiles (phi-3-mini: 32064 % 8192 = 7488, not a multiple of
+                // 128), and this image is unpadded, so it takes the layout its geometry fits (engine#1994).
+                c.blocked = q4nx_layout::blocked_fits(H, Tn);
+                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, c.blocked ? 1 : 0, c.d.data(), &ssum);
             }
             for (int n = 0; n < Tn; n++) {
                 int32_t acc = 0;
                 for (int k = 0; k < H; k++)
-                    acc += (int32_t)((int)c.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, H, Tn)] *
+                    acc += (int32_t)((int)c.codes[q4nx_layout::image_index((size_t)k, (size_t)n, H, Tn, c.blocked)] *
                                      (int)a8i[(size_t)k]);
                 float v = c.d[(size_t)n] * (ascale * (float)acc);
                 if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);

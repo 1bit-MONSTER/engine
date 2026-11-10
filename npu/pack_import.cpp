@@ -4161,6 +4161,38 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         c["vocab_size"] = p.dims.vocab;
         c["model_type"] = p.dims.model_type;
         c["rope_theta"] = p.dims.rope_theta;
+        // engine#1725: the PLE block is switched ON by `hidden_size_per_layer_input > 0` in the container's semantics
+        // (q4nx_semantics.c), so a container that carries the per-layer tensors but not these two keys would import them
+        // and never use them -- the forward skips the block silently. Taken from the component itself, which is where they
+        // are measured (gemma-4-e2b: 256 and 262144), rather than from the pack's config, which states them one level down.
+        {
+            // One metadata read, not plumbing: the per-layer facts live in the component, and this config block is in a
+            // different writer from the one that emits the tensors. The table itself is NOT read here (only names, dims
+            // and the quantised projection header), so this costs a file parse and no memory.
+            std::string pl_why;
+            const EmbedPerLayer pl2 = read_embedding_per_layer(pack_dir, p.dims.hidden, &pl_why);
+            if (pl2.complete()) {
+                c["hidden_size_per_layer_input"] = pl2.P;
+                c["vocab_size_per_layer_input"] = pl2.V;
+            }
+        }
+        // The Gemma-4 layer-shape switches the semantics reader also consults, carried through when the pack states them.
+        {
+            std::ifstream mc(pack_dir + "/model_config.json");
+            if (mc) {
+                json m;
+                try { m = json::parse(mc); } catch (...) { m = json::object(); }
+                const json* t2 = nullptr;
+                if (m.is_object() && m.contains("config") && m["config"].is_object() &&
+                    m["config"].contains("model_attributes") && m["config"]["model_attributes"].is_object() &&
+                    m["config"]["model_attributes"].contains("text_config") &&
+                    m["config"]["model_attributes"]["text_config"].is_object())
+                    t2 = &m["config"]["model_attributes"]["text_config"];
+                if (t2 != nullptr)
+                    for (const char* k : {"num_kv_shared_layers", "use_double_wide_mlp", "extra_layer_norms"})
+                        if (t2->contains(k) && !(*t2)[k].is_null()) c[k] = (*t2)[k];
+            }
+        }
         // A pack that ships its own precomputed RoPE (cos_cache/sin_cache) is not necessarily built for the theta
         // its genai_config.json states -- pi-inferzo measured 10000 declared against a model that needs 1e6 on
         // Qwen2.5 rai_1.7.1_hybrid, and our forward computes RoPE from theta rather than reading a cache. That is a

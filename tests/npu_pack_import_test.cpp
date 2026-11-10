@@ -276,7 +276,9 @@ void test_external_tile_decode() {
             for (int64_t kk = 1; kk <= K / 128; ++kk) {
                 uint8_t* subv = blob.data() + (tile * per_tile + kk * 2 + half) * 2176;
                 for (int r = 0; r < 32; ++r) {
-                    const int64_t row = tile * 64 + half * 32 + r;
+                    // The decoder reads the block's FIRST 32 rows from the pair's SECOND subvolume, so the fixture encodes
+                    // its rows in that order; without this the test pins a mapping the decoder does not use (engine#1503).
+                    const int64_t row = tile * 64 + (1 - half) * 32 + r;
                     const uint16_t sc = bf16_bits(scale_for(tile, half, kk, r));
                     subv[2112 + r * 2] = uint8_t(sc & 0xFF);
                     subv[2113 + r * 2] = uint8_t(sc >> 8);
@@ -301,19 +303,29 @@ void test_external_tile_decode() {
     check(err.empty() && q.N == N && q.K == K && q.block == 32,
           "external tile: a blob of the measured size decodes (" + err + ")");
     bool codes_ok = q.codes.size() == codes.size(), scale_ok = true, zero_ok = true;
-    for (size_t i = 0; codes_ok && i < codes.size(); ++i)
-        if (q.codes[i] != codes[i]) codes_ok = false;
+    // The pack's codes are int4 TWO'S COMPLEMENT; the container's form is the offset from the group minimum, i.e.
+    // c_signed + 8. A test that expected the raw nibble passed on the unsigned bug (engine#1503).
+    for (size_t i = 0; codes_ok && i < codes.size(); ++i) {
+        const int raw = codes[i];
+        const int cs = (raw >= 8) ? raw - 16 : raw;
+        if (q.codes[i] != uint8_t(cs + 8)) codes_ok = false;
+    }
     // Every row's own scale and all four of its zero points, so the addressing (row r*2 in the param regions, the
     // group index (kk-1)*4+g, the half and tile choice) is pinned rather than the value of one row repeated.
     for (int64_t tile = 0; tile < tiles; ++tile)
         for (int half = 0; half < 2; ++half)
             for (int64_t kk = 1; kk <= K / 128; ++kk)
                 for (int r = 0; r < 32; ++r) {
-                    const int64_t row = tile * 64 + half * 32 + r;
+                    // The decoder reads the block's FIRST 32 rows from the pair's SECOND subvolume, so the fixture encodes
+                    // its rows in that order; without this the test pins a mapping the decoder does not use (engine#1503).
+                    const int64_t row = tile * 64 + (1 - half) * 32 + r;
                     for (int g = 0; g < 4; ++g) {
                         const size_t at = size_t(row) * (K / 32) + (kk - 1) * 4 + g;
                         if (q.scale[at] != scale_for(tile, half, kk, r)) scale_ok = false;
-                        if (q.zero[at] != float(zero_for(tile, half, kk, r, g))) zero_ok = false;
+                        // and the container's zero is the offset, m = (-8 - z) * scale, for a signed int4 z
+                        const int zraw = zero_for(tile, half, kk, r, g);
+                        const int zs = (zraw >= 8) ? zraw - 16 : zraw;
+                        if (q.zero[at] != float(-8 - zs) * scale_for(tile, half, kk, r)) zero_ok = false;
                     }
                 }
     check(codes_ok, std::string("external tile: every 4-bit code comes back exactly, ") + (row_major ? "row-major" : "w8 interleave"));
@@ -342,23 +354,14 @@ void test_external_to_container() {
 
     long long m_inexact = -1;
     const pi::Q4 q = pi::container_from_external_q4(pack, &m_inexact);
-    check(q.codes == pack.codes, "external->container: codes are carried unchanged (the pack's grid is the container's)");
-    check(q.scale == pack.scale, "external->container: d is the pack's scale");
-    check(m_inexact >= 0, "external->container: the bf16-exactness of m is reported, not assumed");
-
-    // The arithmetic identity: code*d + m must equal the pack's (code - zp)*scale, up to the bf16 rounding of m.
-    float worst_rel = 0.0f;
-    for (int r = 0; r < pack.N; ++r)
-        for (int k = 0; k < pack.K; ++k) {
-            const size_t g = size_t(r) * (pack.K / 32) + size_t(k) / 32;
-            const float want = (float(pack.codes[size_t(r) * pack.K + k]) - pack.zero[g]) * pack.scale[g];
-            const float got = float(q.codes[size_t(r) * pack.K + k]) * q.scale[g] + q.zero[g];
-            const float range = 15.0f * pack.scale[g];
-            worst_rel = std::max(worst_rel, std::fabs(got - want) / range);
-        }
-    check(worst_rel <= 1.0f / 256.0f,
-          "external->container: code*d + m reproduces (code - zp)*scale to within one bf16 ulp of m (worst " +
-              std::to_string(worst_rel) + " of the group's 15-step range)");
+    // The conversion is a PASS-THROUGH: decode_external_tile already returns the container's convention, so the
+    // identity to pin is that nothing is converted a SECOND time. It was: `zero` became -((-8-z)*scale)*scale ~
+    // +0.0002 instead of -0.04, every weight sat at code*scale -- a near-constant POSITIVE matrix -- and a down
+    // projection summed to K*mean(act)*0.04 ~ 110,000 where a healthy layer gives ~1 (engine#1503).
+    check(q.codes == pack.codes, "external->container: codes pass through unchanged");
+    check(q.scale == pack.scale, "external->container: scales pass through unchanged");
+    check(q.zero == pack.zero, "external->container: the offset passes through unchanged (the mapping is NOT re-applied)");
+    check(m_inexact >= 0, "external->container: the bf16-exactness of the offset is reported, not assumed");
 }
 
 // The writer's role mapping (engine#1503): the graph's own names, mapped onto the roles the tile writer already

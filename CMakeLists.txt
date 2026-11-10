@@ -278,6 +278,9 @@ add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.
 # device. Deliberately OUTSIDE if(ONEBIT_SERVE_TEST_GGUF): that row is device-gated, and the whole point is that the
 # classification is checked in every configure, including the ones that never load a model.
 add_test(NAME serve_context_limit_classify COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh --self-test)
+# engine#1785: `serve --flash` names two settings (--ctx-size 1024, --prefix-pin on --device npu) and refuses what
+# contradicts them. Every case ends in the option check, so the row needs no model, no device and no port.
+add_test(NAME serve_flash_refusals COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_flash_test.sh $<TARGET_FILE:onebit>)
 # engine#1594: every target ci.yml's `cmake --build --target …` list names must exist in the configuration ci.yml
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the

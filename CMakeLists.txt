@@ -279,20 +279,38 @@ add_test(NAME serve_context_limit_classify COMMAND bash ${CMAKE_SOURCE_DIR}/test
 # creates. #1583 added one name for a target defined inside if(ONEBIT_NPU), which CI does not configure -- and ninja
 # rejects the whole command line before building anything, so `onebit` stopped being compiled for every PR. Reads the
 # two files, no build and no submodules; --self-test drives it.
-add_test(NAME ci_targets COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
-add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#1864: `find_package(Python3)` used to be at :761, long after the first `${Python3_EXECUTABLE}` users above, so those
+# registrations carried an EMPTY interpreter and ctest executed each script directly -- which passes only while the file keeps
+# its exec bit (a mode-only rewrite of tools/ci/hrx_build_scope.py turned that row into BAD_COMMAND). Find the interpreter
+# first and register every Python test through one place: it runs the script THROUGH the interpreter, and on a machine
+# without one the test is dropped with a status line instead of a .py being handed to the kernel as a program.
+find_package(Python3 COMPONENTS Interpreter)
+function(add_python_test name)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE} ${ARGN})
+    else()
+        message(STATUS "ctest: not registering ${name} (no Python3 interpreter)")
+    endif()
+endfunction()
+# engine#1864: the ordering rule itself, checked on the file (no configure, no build): every ${Python3_EXECUTABLE} use has
+# to follow the find_package above. The nine that did not ran through their exec bit, and a mode-only rewrite of one
+# script turned the row into BAD_COMMAND.
+add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
+add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
-add_test(NAME tests_referenced COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --check --root ${CMAKE_SOURCE_DIR})
-add_test(NAME tests_referenced_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --self-test)
+add_python_test(tests_referenced ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_python_test(tests_referenced_self ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --self-test)
 # engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
 add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
 # orphans of that shape landed in two days (51 GiB of GTT for 14 h; an NPU server 70 min past a 6-min ticket;
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
 # check; the two permanent services are exempt by name. --self-test drives the decision, no device needed.
-add_test(NAME device_holders COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
+add_python_test(device_holders ${CMAKE_SOURCE_DIR}/tools/device_holders.py --self-test)
 # engine #1668: the bench preflight must pin the load mode, because `-lm none` is +17.5 % prefill at -1.6 % decode for +604 MiB of
 # GTT. The script existed with a test that nothing ran; a test nobody runs is a comment, so the loader/flag assertions are registered
 # here (the test fakes the box, so it needs no device and no ticket).
@@ -300,7 +318,7 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
-add_test(NAME moe_placement COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
+add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
@@ -701,15 +719,12 @@ add_test(NAME route_log COMMAND route_log_test)
 # case is an artefact someone would actually push, and the conservative direction -- "full" -- is the
 # one every uncertain case must land on, because the build being skipped is the one that catches a
 # broken HRX pin.  Stdlib only: no git needed for the decision itself.
-add_test(NAME hrx_build_scope
-         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/hrx_build_scope.py --self-test)
-add_test(NAME copyright_check_untracked
-         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/copyright_check_untracked_test.py)
+add_python_test(hrx_build_scope ${CMAKE_SOURCE_DIR}/tools/ci/hrx_build_scope.py --self-test)
+add_python_test(copyright_check_untracked ${CMAKE_SOURCE_DIR}/tests/copyright_check_untracked_test.py)
 # engine#1517: the prefill flash-attention ratio is measured in adjacent pairs and only quoted when the pairs agree, so a
 # loaded box yields VOID instead of a number.  The self-test is the estimator's own gate and needs no GPU: it accepts
 # agreement, refuses disagreement, and proves a dropped run cannot shift an arm.
-add_test(NAME fa_ratio_estimator
-         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fa_ratio.py --self-test)
+add_python_test(fa_ratio_estimator ${CMAKE_SOURCE_DIR}/tools/fa_ratio.py --self-test)
 add_dependencies(onebit route_log_test)
 # CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
 # keeps the laya_models ctest from reporting "Not Run" without a workflow change.
@@ -757,8 +772,7 @@ if(ONEBIT_LAYA_ROUTE_MODEL)
 endif()
 
 # The registry against the reviewed not-an-alias list (docs/arch-gaps.md) and the committed pins:
-# no checkouts or network.
-find_package(Python3 COMPONENTS Interpreter)
+# no checkouts or network. (The interpreter is found once, at :287: engine#1864.)
 if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-gaps)
     # pin the guard's firing behavior: the committed registry always passes --check-gaps, so
@@ -780,6 +794,8 @@ if(Python3_Interpreter_FOUND)
     # three refusals a real pack needed -- a block-32 head refused by name, an untied head given no false oracle, the
     # trailing zeros counted. It was never registered, so nothing ran it after #1710.
     add_test(NAME q4nx_tail_head COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_tail_head_test.py)
+    # Without onnx its two refusal arms cannot run: it exits 77, so ctest shows SKIPPED rather than a pass (#1747 review).
+    set_tests_properties(q4nx_tail_head PROPERTIES SKIP_RETURN_CODE 77)
     # A member declared in npu/forward/include/q4nx_forward.h and never defined keeps `main` green while a full
     # `cmake --build` fails at link time (engine#1573: the 3-argument step_batch_embeds).  CI cannot catch it --
     # .github/workflows/ci.yml builds `--target onebit` only, because a full build wants the private NPU runtime --

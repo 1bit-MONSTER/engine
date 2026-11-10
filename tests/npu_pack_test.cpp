@@ -44,7 +44,50 @@ static void check(bool ok, const std::string& what) {
     }
 }
 
+/* engine#1839: an int4 code and its scale are only correct as a PAIR. The defect this pins: both sites that quantise
+ * float weights into the container's int4 codes used `amax / 127` (an INT8 scale) with the int4 clamp [-8, 7], so every
+ * code but the very largest saturated and the dequantised weight was ~18x too small — in the host arm the device gate
+ * compares against. The arms below are a known input -> known code (not a property any pairing satisfies), the no-
+ * saturation property at full range, and the two degenerate cases the floor exists for. */
+static void quant_int4_arms() {
+    const float amax = 7.0f;
+    check(q4nx_quant_int4_scale(7.0f) == 1.0f, "int4 pair: amax 7 takes scale 1 (so the codes ARE the values)");
+    check(q4nx_quant_int4_code(7.0f, amax) == 7, "int4 pair: +amax quantises to +7");
+    check(q4nx_quant_int4_code(-7.0f, amax) == -7, "int4 pair: -amax quantises to -7");
+    check(q4nx_quant_int4_code(0.0f, amax) == 0, "int4 pair: zero is zero");
+    check(q4nx_quant_int4_code(3.5f, amax) == 4, "int4 pair: half of amax rounds to 4 (round-half-away)");
+    /* The arm the old pairing fails: at amax/127 a mid-range value saturates. */
+    check(q4nx_quant_int4_code(0.1f, 1.0f) == 1, "int4 pair: a small value is 1, not saturated — the 127 scale gives 13");
+    /* THE LADDER: the sevenths of amax must come back as their own code number. This is the arm that can fail for the
+     * wrong scale -- under amax/127 every one of these saturates to +-7 (checked: v=0.1 at amax=1 gives 7 where int4
+     * expects 1), so it distinguishes the pairings rather than asserting a property the clamp makes unfailable. */
+    {
+        const float amax_l = 3.25f;
+        int wrong = 0;
+        for (int k = -7; k <= 7; k++) {
+            const float v = (float)k / 7.0f * amax_l;
+            if (q4nx_quant_int4_code(v, amax_l) != k) wrong++;
+        }
+        check(wrong == 0, "int4 pair: each seventh of amax comes back as its own code (k/7*amax -> k, k=-7..7)");
+    }
+    /* Degenerate groups: the floor keeps the scale usable and the code zero. */
+    check(q4nx_quant_int4_scale(0.0f) == 1.0f, "int4 pair: an all-zero group floors the scale at 1");
+    check(q4nx_quant_int4_code(0.0f, 0.0f) == 0, "int4 pair: and its code is 0, not a division by zero");
+    check(q4nx_quant_int4_code(NAN, 1.0f) == 0, "int4 pair: a NaN value quantises to 0 rather than an undefined code");
+    /* The dequantised value round-trips inside half a step: that is the accuracy the kernel's epilogue assumes. */
+    int worst_ok = 1;
+    for (int i = -127; i <= 127; i++) {
+        const float v = (float)i / 127.0f * 2.0f;     /* amax 2.0 */
+        const float s = q4nx_quant_int4_scale(2.0f);
+        const float back = (float)q4nx_quant_int4_code(v, 2.0f) * s;
+        if (std::fabs(back - v) > s / 2.0f + 1e-6f) worst_ok = 0;
+    }
+    check(worst_ok, "int4 pair: every value round-trips within half a step of amax/7");
+    std::printf("  int4 pair: 11 arms (known codes, ladder, floor, NaN, round-trip)\n");
+}
+
 int main(int argc, char** argv) {
+    quant_int4_arms();
     for (int G : {8, 9, 16}) {
         for (int n : {G, 3 * G}) {  // whole groups: a ragged tail is not a permutation
             // Tile i holds the value i in its first word; after the reorder every

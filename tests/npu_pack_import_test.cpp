@@ -2682,6 +2682,56 @@ void test_fconst19_rule_table() {
     std::printf("fconst19 rule: measured row, unmeasured refusal, and the ambiguity guard all behave\n");
 }
 
+// engine#1831: the header-derived layout keeps EVERY in-block header the anchors support. #1819's version kept only the most
+// common residue and always wrote a 2-header block, so a Qwen3 4-header block (three equally frequent inner headers) was read
+// as 2-header with k_norm's header standing in for the post-attention one -- the engine#1003 misread, reintroduced.
+void test_fconst_block_headers() {
+    const int64_t stride = 1000;
+    auto blocks = [&](std::initializer_list<int64_t> inner, int nblocks, std::initializer_list<int64_t> noise) {
+        std::vector<int64_t> pos;
+        for (int b = 0; b < nblocks; ++b) {
+            pos.push_back(int64_t(b) * stride);                          // the block's own (first) header
+            for (const int64_t r : inner) pos.push_back(int64_t(b) * stride + r);
+        }
+        for (const int64_t q : noise) pos.push_back(q);                  // eps-SHAPED payload bytes: once or twice
+        std::sort(pos.begin(), pos.end());
+        return pos;
+    };
+    // 2-header (Qwen2.5/Llama): one inner header, 8 blocks, two coincidences elsewhere in the payload
+    {
+        const auto inner = pi::fconst_block_headers(blocks({400}, 8, {1234, 5678}), stride, 3);
+        check(inner.size() == 1 && inner[0] == 400, "block headers: a 2-header block yields its one inner header");
+        pi::FconstGeom g;
+        g.stride = stride;
+        check(pi::fconst_set_block_headers(g, inner) && g.period == 2 && g.h1 == 400 && g.hdr.size() == 1 &&
+                  g.post_attn_hdr() == 400,
+              "block headers: and is set as a 2-header block whose post-attention header is h1");
+    }
+    // 4-header (Qwen3): three inner headers repeating equally -- ALL must be kept, in order, so post_attn is the LAST one
+    {
+        const auto inner = pi::fconst_block_headers(blocks({300, 320, 340}, 8, {777}), stride, 3);
+        check(inner.size() == 3 && inner[0] == 300 && inner[1] == 320 && inner[2] == 340,
+              "block headers: a 4-header block yields all three inner headers, sorted (not just the most common one)");
+        pi::FconstGeom g;
+        g.stride = stride;
+        check(pi::fconst_set_block_headers(g, inner) && g.period == 4 && g.h1 == 300 && g.hdr.size() == 3 &&
+                  g.post_attn_hdr() == 340,
+              "block headers: and is set as a 4-header block whose post-attention header is the last one, not k_norm's");
+    }
+    // coincidences alone are not a header, and a count that is neither 1 nor 3 sets nothing
+    {
+        check(pi::fconst_block_headers(blocks({}, 8, {111, 222, 222}), stride, 3).empty(),
+              "block headers: payload coincidences that recur fewer than min_repeat times are not headers");
+        pi::FconstGeom g;
+        g.stride = stride;
+        g.h1 = 7;
+        check(!pi::fconst_set_block_headers(g, {100, 200}) && g.hdr.empty() && g.h1 == 7 && g.period == 0,
+              "block headers: two inner headers is not a known layout, and nothing is changed");
+        check(pi::fconst_block_headers({0, 1000, 2000}, 0, 1).empty(), "block headers: a zero stride yields nothing");
+    }
+    std::printf("  fconst block headers: 2-header and 4-header layouts kept whole; unknown counts refused\n");
+}
+
 // engine#1801's reviewer asked for the test that would catch the case the fix itself found once: the canonical .fconst copy is a
 // cache whose size is the pack's own .fconst, and on this box /tmp is tmpfs, so where it lands is a RAM decision. The bug was a
 // cache directory that was never created -- every pack then fell through to /tmp and nothing noticed.
@@ -2923,6 +2973,34 @@ void test_kernel_set_refusal() {
           "kernels: a directory with no full_i8 ELF is refused");
     check(!pi::kernel_set_refusal({"full_i8_QKV_K3072_N9216_b8.elf.bak"}, "b8").empty(),
           "kernels: a file that is not an .elf is not a kernel");
+}
+
+// engine#1751 follow-up: the one copier both import paths use. #1751 added a second copier that counted successes and
+// swallowed failures, so an import could "succeed" without tokenizer.json and serve then refused the directory for a
+// missing tokenizer -- the misleading report #1751 was written to remove. A file the pack has and cannot copy is refused
+// BY NAME; a file the pack does not ship is not a failure.
+void test_copy_text_artifacts() {
+    const fs::path base = fs::temp_directory_path() / ("1bit-textcopy-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(base, ec);
+    const fs::path pack = base / "pack", out = base / "out";
+    fs::create_directories(pack);
+    fs::create_directories(out);
+    put_file((pack / "tokenizer.json").string(), "{}");
+    put_file((pack / "tokenizer_config.json").string(), "{}");
+    // (a) the files the pack has are copied, the rest skipped without complaint
+    int copied = -1;
+    std::string why;
+    try { copied = pi::copy_text_artifacts_exported(pack.string(), out.string()); } catch (const std::exception& e) { why = e.what(); }
+    check(why.empty() && copied == 2 && fs::exists(out / "tokenizer.json") && fs::exists(out / "tokenizer_config.json"),
+          "text copy: the two files the pack ships are copied, the six it does not are skipped (" + why + ")");
+    // (b) a copy that FAILS is refused, naming the file -- not counted down to a smaller number nobody reads
+    why.clear();
+    try { (void)pi::copy_text_artifacts_exported(pack.string(), (base / "no-such-dir").string()); } catch (const std::exception& e) { why = e.what(); }
+    check(why.find("tokenizer.json") != std::string::npos,
+          "text copy: a file the pack has that cannot be copied is refused by name (" + why + ")");
+    fs::remove_all(base, ec);
+    std::printf("  text copy: present files copied, absent ones skipped, a failed copy refused by name\n");
 }
 
 void test_text_artifacts(const std::string& root) {
@@ -3407,7 +3485,29 @@ void test_tail_head_placement() {
 }
 
 
+/* engine#1889: a pack that declares per-head q/k gains and whose gains the importer did not locate must be REFUSED,
+ * not imported without them. Hunyuan-7B is the measured case: `use_qk_norm: true`, 32x128 + 8x128 gains in its block,
+ * a 96-tile attention payload against the 160 the same geometry gets elsewhere -- and the import reported
+ * `attention 5120/5120 tiles` byte-exact while the served model answered `Trease/ft//////////` three of three.
+ * The three cases are separate on purpose: declared-and-not-found is the refusal; found-and-not-declared is the Qwen3
+ * shape (the sections are there, the key is not) and must NOT be refused. */
+void test_qk_norm_refusal() {
+    const std::string a = pi::qk_norm_refusal(true, false);
+    check(!a.empty(), "qk norm: declared but not found is a refusal (importing without the gains answers gibberish)");
+    check(a.find("use_qk_norm") != std::string::npos, "qk norm: the refusal names the key the pack declared");
+    check(a.find("not where the block layout says") != std::string::npos,
+          "qk norm: and says what was not found, rather than failing generically");
+    check(a.find("engine#1889") != std::string::npos, "qk norm: the refusal carries its issue, like the others here");
+    check(pi::qk_norm_refusal(true, true).empty(),
+          "qk norm: declared and found is allowed (the arithmetic or the graph located the gains)");
+    check(pi::qk_norm_refusal(false, true).empty(),
+          "qk norm: found and not declared is allowed (Qwen3 ships the sections without the key)");
+    check(pi::qk_norm_refusal(false, false).empty(), "qk norm: neither is the ordinary pack");
+    std::printf("  qk norm: 7 arms (declared+not-found refuses; found-only and neither are allowed)\n");
+}
+
 int main(int argc, char** argv) {
+    test_qk_norm_refusal();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -3446,6 +3546,7 @@ int main(int argc, char** argv) {
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();
         test_fconst_scratch_order();
+        test_fconst_block_headers();
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
@@ -3458,6 +3559,7 @@ int main(int argc, char** argv) {
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         test_import_fp32_params(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);
+        test_copy_text_artifacts();
         test_kernel_set_refusal();
         test_weight_layout();
         test_null_optional_dims();

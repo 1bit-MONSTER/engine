@@ -60,7 +60,10 @@ def allow_list(root):
         if not line or line.startswith("#"):
             continue
         name, _, reason = line.partition("#")
-        out[name.strip()] = reason.strip()
+        # Normalised to a basename: `tests/foo.sh` and `foo.sh` mean the same entry. Measured before this: a
+        # path-form entry matched no test, so it suppressed nothing AND was reported as "no such test exists any
+        # more", two contradicting messages about one line and the format never named.
+        out[pathlib.PurePosixPath(name.strip().rstrip("/")).name] = reason.strip()
     return out
 
 
@@ -104,13 +107,17 @@ def check(root):
     allow = allow_list(root)
     found = referenced(root, need)
     drift = [n for n in need if not found[n] and n not in allow]
-    stale = [n for n in allow if n not in need]
+    gone = [n for n in allow if n not in need]
+    idle = [n for n in need if n in allow and found[n]]
     for name in drift:
         print("tests_referenced: %s is referenced by nothing that can run it -- register it (add_test in "
               "CMakeLists.txt or cmake/*.cmake), or list it in %s with the reason it must not be a row" % (name, ALLOW))
-    for name in stale:
+    for name in gone:
         print("tests_referenced: %s is in %s but no such test exists any more -- drop the line" % (name, ALLOW))
-    if drift:
+    for name in idle:
+        print("tests_referenced: %s is in %s but it IS referenced now -- drop the line, it suppresses nothing"
+              % (name, ALLOW))
+    if drift or gone or idle:
         return 1
     print("tests_referenced: all %d test script(s) are referenced%s" % (
         len(need), "" if not allow else " (%d deliberately not a row: %s)" % (len(allow), ", ".join(sorted(allow)))))
@@ -159,10 +166,20 @@ def self_test():
                    str(ALLOW): "keeper.sh   # an operator measurement: always exits 0, so a row would be green noise\n"})
     cases.append(("an allow-listed test is not drift", check(r), 0, None))
 
-    # 7. a stale allow entry -> reported, but not a failure
+    # 7. an allow entry for a test that is gone -> a failure, because a list that only gets WARNED about grows
     r = root_with({"tests/one.sh": "#!/bin/sh\n", "CMakeLists.txt": "tests/one.sh\n",
                    str(ALLOW): "gone.sh   # removed long ago\n"})
-    cases.append(("a stale allow entry is progress, not drift", check(r), 0, "gone.sh")); cases_root["a stale allow entry is progress, not drift"] = r
+    cases.append(("an allow entry for a deleted test fails", check(r), 1, "gone.sh")); cases_root["an allow entry for a deleted test fails"] = r
+
+    # 8. an allow entry for a test that IS referenced -> a failure: it suppresses nothing, which is how the list rots
+    r = root_with({"tests/one.sh": "#!/bin/sh\n", "CMakeLists.txt": "add_test(NAME one COMMAND bash tests/one.sh)\n",
+                   str(ALLOW): "one.sh   # but it is registered\n"})
+    cases.append(("an allow entry that suppresses nothing fails", check(r), 1, "one.sh")); cases_root["an allow entry that suppresses nothing fails"] = r
+
+    # 9. the entry may be written either way: path form and basename mean the same line
+    r = root_with({"tests/keeper2.sh": "#!/bin/sh\n", "CMakeLists.txt": "",
+                   str(ALLOW): "tests/keeper2.sh   # path form is accepted\n"})
+    cases.append(("a path-form allow entry is accepted", check(r), 0, None))
 
     # 8. no tests/ at all -> cannot tell, not "clean"
     r = root_with({"CMakeLists.txt": ""})

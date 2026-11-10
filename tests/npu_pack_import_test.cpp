@@ -4800,7 +4800,17 @@ void test_container_geometry() {
     {
         const auto g = pi::container_geometry(json::object(), json());
         check(g.source.empty(), "silent: no source is claimed");
-        check(g.missing.size() == 7, "silent: all seven required fields are named missing");
+        // eight, and named: the first run of this arm asserted seven and failed in CI -- rope_theta is a required
+        // field of the arithmetic (it is the RoPE base the forward needs), so the count was wrong and the function
+        // was right. Asserted by name now, so the next field added to Dims fails this arm instead of shrinking it.
+        const std::vector<std::string> want = {"hidden_size",         "num_hidden_layers",   "num_attention_heads",
+                                               "num_key_value_heads", "vocab_size",         "intermediate_size",
+                                               "head_dim",            "rope_theta"};
+        check(g.missing.size() == want.size(), "silent: every required field is named missing");
+        bool all_named = true;
+        for (const auto& w : want)
+            all_named = all_named && std::find(g.missing.begin(), g.missing.end(), w) != g.missing.end();
+        check(all_named, "silent: the missing list names each required field");
         check(g.dims.hidden == 0 && g.dims.layers == 0, "silent: no field is invented");
     }
     // 4. head_dim absent but derivable: reported as INFERRED, not as declared.

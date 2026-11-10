@@ -422,7 +422,12 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // 38,306-byte tolerance -- so `prefix = 7,232` here rests on the two models agreeing and on the plain Qwen2.5 arithmetic
     // (64 + 2*hidden, with no QK-norm term, unlike the Qwen3 line's +4,352), not on the pair alone. Said plainly because a row
     // whose comment implies all seven fields were equally pinned would be the same kind of overstatement this table exists to
-    // avoid. The bundle is 8 tiles of 1,009,664 (8,077,312 B = 1,813,568 - 7,232, i.e. the post-attention header follows it).
+    // avoid.
+    // The block's arithmetic, from the measurement rather than from a formula: prefix 7,232 + 9 x tile 1,009,664 = 9,094,208,
+    // which is exactly the `header_off` the tool reports for this pair -- so the payload after the prefix is NINE tile slots,
+    // of which the rule rotates eight and the ninth is the gap the post-attention header sits behind. (An earlier version of
+    // this comment subtracted the prefix from a per-block figure and produced a number three orders of magnitude off; the
+    // review of #1758 caught it. Written out here so the next reader can check it with a calculator.)
     {3584, 28, 28, 7232, 8, 1, 1009664},
     // Mistral-7B-Instruct-v0.2 at hidden 4,096 / 32 heads / 32 layers: measured with tools/fconst19_measure.py against
     // amd/Mistral-7B-Instruct-v0.2_rai_1.8.0_npu_4K, 1,954 of 3,843,419,200 bytes differ (5.08e-05) -- content, not

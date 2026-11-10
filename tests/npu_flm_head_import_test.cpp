@@ -34,6 +34,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace {
 
@@ -220,7 +221,7 @@ void test_refusal(const std::string& root) {
 
 int main(int argc, char** argv) {
     const std::string golden = argc > 1 ? argv[1] : "";
-    const std::string root = (fs::temp_directory_path() / "npu_flm_head_import_test").string();
+    const std::string root = (::onebit::test::tmp_root() / "npu_flm_head_import_test").string();
     try {
         if (!golden.empty()) test_golden(golden);
         else std::printf("skip golden: no directory given\n");

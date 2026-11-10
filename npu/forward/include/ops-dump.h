@@ -36,6 +36,7 @@
 // getenv). It can never fail a run: no allocation, no file, stderr only.
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -107,6 +108,23 @@ inline void ops_dump(const char* tag, int layer, int rows, const float* x, int n
     if (ops_dump_muted()) return;
     char buf[192];
     if (ops_dump_line(buf, sizeof buf, tag, layer, rows, x, n) > 0) std::fputs(buf, stderr);
+}
+
+// engine#2028: the line a process prints once, at model load, when the dump is armed. A run that sets the variable and
+// does not see this line before its first request is running a binary from before the instrument (#1977): four silent
+// phi-4 runs were spent on exactly that, and blamed on the prompt shape and then on the design path before the binary's
+// age was checked. Separate from the print so a test can match the text.
+inline const char* ops_dump_banner() {
+    return "[ops-dump] NPU_INFER_DUMP_OPS is on: an [op] line follows every projection and weighted RMSNorm, on stderr\n";
+}
+
+// Prints the banner once per process (a serve can load more than one forward), and only when the dump is on. Returns
+// whether this call printed it.
+inline bool ops_dump_announce() {
+    static std::atomic<bool> said{false};
+    if (!ops_dump_enabled() || said.exchange(true)) return false;
+    std::fputs(ops_dump_banner(), stderr);
+    return true;
 }
 
 }  // namespace onebit::npu

@@ -436,6 +436,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         // every row measured so far used.
         host_gemm_i8_ = (hg[0] == 'i' && hg[1] == '8');
     }
+    // engine#2028: say at load, before any request, that NPU_INFER_DUMP_OPS is armed (once per process). No line with
+    // the variable set means the binary predates the dump.
+    onebit::npu::ops_dump_announce();
     // The launch layer.  A1: everything below that touches a device talks to this, and the settings the
     // container declares (weight layout, pb16i image dir, Hadamard fold) are pushed into it as they are
     // parsed.  A2 turns this into NpuTarget::open(plan, kernels_dir).

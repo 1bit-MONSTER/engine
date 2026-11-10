@@ -25,6 +25,7 @@
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace fs = std::filesystem;
 using onebit::npu::DecisionHead;
@@ -74,7 +75,7 @@ nlohmann::json base_config() {
 bool close(float a, float b, float eps = 1e-5f) { return std::fabs(a - b) <= eps; }
 
 void test_load_and_logits() {
-    const fs::path dir = fs::temp_directory_path() / "onebit-decision-test";
+    const fs::path dir = ::onebit::test::tmp_root() / "onebit-decision-test";
     fs::remove_all(dir);
     fs::create_directories(dir);
     // W = [[1,0,0],[0,1,0],[0,0,2]] rows A,B,C over a 3-wide hidden state.
@@ -113,7 +114,7 @@ void test_load_and_logits() {
 }
 
 void test_temperature_and_shape_errors() {
-    const fs::path dir = fs::temp_directory_path() / "onebit-decision-test2";
+    const fs::path dir = ::onebit::test::tmp_root() / "onebit-decision-test2";
     fs::remove_all(dir);
     fs::create_directories(dir);
     const std::vector<float> w = {2, 0, 0, 2};  // two options over a 2-wide state
@@ -149,7 +150,7 @@ void test_temperature_and_shape_errors() {
 }
 
 void test_missing_pieces() {
-    const fs::path dir = fs::temp_directory_path() / "onebit-decision-test3";
+    const fs::path dir = ::onebit::test::tmp_root() / "onebit-decision-test3";
     fs::remove_all(dir);
     fs::create_directories(dir);
     DecisionHead head;

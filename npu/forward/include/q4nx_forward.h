@@ -427,6 +427,7 @@ private:
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
     Q4nxRopeLlama3 rope_llama3_;     // rope_type "llama3" (Llama-3.1/3.2/3.3); on == 0 for everything else
+    Q4nxRopeDynamic rope_dynamic_;   // rope_type "dynamic" (NTK base rule, engine#1740 W2); on == 0 elsewhere
     // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
     // every other architecture.  MiniCPM4 scales the embedding by 12 and each
     // residual branch by scale_depth/sqrt(NL) (0.2475 for 32 layers); skipping

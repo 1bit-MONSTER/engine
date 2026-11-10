@@ -744,14 +744,25 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                  * Same tile grid and ordering as q4nx_dequant_tensor_chunked(), pinned by the row test. */
                 const int ntr = NV / 32, ntc = kpad_ / 256;
                 const size_t tiles = (size_t)ntr * (size_t)ntc;
+                /* Take the cheap path only where it has been SHOWN to decode: read the first and the last row through it
+                 * now (engine#1807 review). The arithmetic above can be satisfied by a container this cannot read --
+                 * a chunk size that is not one of the three decodable kinds, or an NV that is not a multiple of the 32-row
+                 * tile -- and embed_at() would then answer 0.0f for every token, i.e. the model would run on an all-zero
+                 * embedding with no message, where the whole-table path below refuses at load with the reason. A failed
+                 * probe leaves embed_tile_ null and the buffer path (unchanged) reports it. */
                 if (tiles > 0 && esz % tiles == 0) {
-                    embed_tile_       = (const uint8_t*)e;
-                    embed_tile_bytes_ = esz;
-                    embed_tile_rows_  = NV;
-                    embed_tile_cols_  = kpad_;
-                    embed_tile_cb_    = int(esz / tiles);
-                    embed_row_buf_.assign((size_t)kpad_, 0.0f);
-                    embed_row_tok_    = -1;
+                    const int cb = int(esz / tiles);
+                    std::vector<float> probe((size_t)kpad_, 0.0f);
+                    if (q4nx_dequant_tile_row((const uint8_t*)e, esz, NV, kpad_, cb, 0, probe.data()) == 0 &&
+                        q4nx_dequant_tile_row((const uint8_t*)e, esz, NV, kpad_, cb, NV - 1, probe.data()) == 0) {
+                        embed_tile_       = (const uint8_t*)e;
+                        embed_tile_bytes_ = esz;
+                        embed_tile_rows_  = NV;
+                        embed_tile_cols_  = kpad_;
+                        embed_tile_cb_    = cb;
+                        embed_row_buf_.assign((size_t)kpad_, 0.0f);
+                        embed_row_tok_    = -1;
+                    }
                 }
                 rc = 0;   // the buffer below is the fallback, and it reports its own failure
             }

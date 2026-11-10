@@ -524,6 +524,13 @@ std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64
 // engine#1831: set `hdr`/`h1`/`period` from that list the way locate_fconst() does -- one inner header is a 2-header block,
 // three is a 4-header block. Returns false, and changes nothing, for any other count.
 bool fconst_set_block_headers(FconstGeom& g, const std::vector<int64_t>& inner);
+// engine#1985: which in-block header list to keep, given the epsilon vote's and the anchor residues'. The two witnesses answer
+// DIFFERENT questions -- the vote settles the STRIDE (it needs a dominance test), the residue settles the COUNT (a real section
+// boundary repeats in every block) -- so a vote that found only part of the list is not wrong, just short, and the longer
+// consistent list wins. `residue` wins only when it CONTAINS the vote's first offset and reports more; an outright disagreement
+// is not a licence to take the longer list, so the vote stands. Pure and exported so this decision table is pinned with no pack,
+// no file and no configure (engine#1986 review).
+bool prefer_residue_headers(int64_t vote_h1, size_t vote_count, const std::vector<int64_t>& residue);
 
 // One measured Ryzen AI 1.9 Token .fconst block shape (engine#1503). Every field is measured against the 1.8 pack of
 // the same model by tools/fconst19_measure.py; none of it is derivable from the pack, which is why a pack whose shape

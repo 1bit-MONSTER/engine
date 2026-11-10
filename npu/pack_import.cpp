@@ -493,6 +493,15 @@ const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hid
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes
 // it a test rather than a magic number. 0x00007fff is the big-endian reading of those four bytes; the bytes
 // are what is compared, because the little-endian reading of the same bytes is 0xff7f0000.
+}  // namespace (closed so prefer_residue_headers has external linkage: the arm drives it directly, engine#1986)
+bool prefer_residue_headers(int64_t vote_h1, size_t vote_count, const std::vector<int64_t>& residue) {
+    if (vote_count == 0 || residue.empty()) return false;
+    if (residue.size() <= vote_count) return false;                       // the vote already has the longer list
+    return std::find(residue.begin(), residue.end(), vote_h1) != residue.end();
+}
+
+namespace {
+
 std::vector<uint8_t> fconst19_header(int heads) {
     std::vector<uint8_t> h(size_t(heads) * 4, 0);
     for (int i = 0; i < heads; ++i) {
@@ -1660,9 +1669,7 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
     const std::vector<int64_t> residue = fconst_block_headers(pos, stride8, 3);
     if (!g.hdr.empty()) {
-        const bool residue_contains_vote =
-            std::find(residue.begin(), residue.end(), g.h1) != residue.end();
-        if (residue_contains_vote && residue.size() > g.hdr.size()) {
+        if (prefer_residue_headers(g.h1, g.hdr.size(), residue)) {
             FconstGeom better = g;
             if (fconst_set_block_headers(better, residue)) {
                 std::fprintf(stderr,

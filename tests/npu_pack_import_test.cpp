@@ -4090,6 +4090,28 @@ void test_fconst_variable_stride(const std::string& root) {
 // engine#1740 (W1a): the tail-head placement arithmetic, pinned without a pack, a device or a fixture. The rows, the
 // tile size and the envelope are the hidden-896 pack's, so the numbers here are the real ones: 1,856 B envelope,
 // 2,374 tiles of 122,880 B, tail 1,856 + 2,374 x 122,880 = 291,653,952 B.
+// engine#1986 review: the arbitration between the two witnesses, pinned as a decision table. Twenty-four lines of "which list
+// wins" had no arm, and both directions matter: taking the residue list too eagerly is a wrong layout on a pack the vote got
+// right, and never taking it is engine#1985 (Qwen3-1.7B refused with 64 tiles where the block has 96).
+void test_prefer_residue_headers() {
+    using V = std::vector<int64_t>;
+    // the vote found ONE in-block offset at 640 B; the residues repeat at three -- engine#1985's shape
+    check(pi::prefer_residue_headers(640, 1, V{640, 1280, 1920}), "prefer residue: a short vote yields to the residue list");
+    // ...and the same three offsets with the vote's one among them in a different position
+    check(pi::prefer_residue_headers(1920, 1, V{640, 1280, 1920}), "prefer residue: position in the list does not matter");
+    // equal lists: nothing to arbitrate, and no churn in the note
+    check(!pi::prefer_residue_headers(640, 3, V{640, 1280, 1920}), "prefer residue: an equal-length list keeps the vote");
+    // the vote found MORE than the residues: the vote wins, because the residues lost a boundary
+    check(!pi::prefer_residue_headers(640, 4, V{640, 1280, 1920}), "prefer residue: a longer vote keeps the vote");
+    // OUTRIGHT DISAGREEMENT: the residue never mentions the vote's offset, so this is not "short", it is "different"
+    check(!pi::prefer_residue_headers(704, 1, V{640, 1280, 1920}),
+          "prefer residue: a residue list that does not contain the vote's offset keeps the vote");
+    // degenerate inputs: an empty vote is handled by the caller's own branch, an empty residue never wins
+    check(!pi::prefer_residue_headers(640, 0, V{640, 1280, 1920}), "prefer residue: an empty vote never prefers the residue");
+    check(!pi::prefer_residue_headers(640, 1, V{}), "prefer residue: an empty residue list never wins");
+    std::printf("  prefer residue: 7 arms (short vote yields, equal/longer/disagreeing keep the vote, degenerate inputs)\n");
+}
+
 void test_tail_head_placement() {
     // The real hidden-896 geometry: group_bytes(896, 64) = 8 x 68 x 64 = 34,816 B per head tile, V/64 = 2,374 tiles,
     // 1,856 B envelope, so the tail is 1,856 + 2,374 x 34,816 = 82,655,040 B -- which is the 0.5B pack's measured tail
@@ -4271,6 +4293,7 @@ int main(int argc, char** argv) {
     test_encode_tile_code_range();
     test_qk_norm_refusal();
     test_qk_gain_offsets();
+    test_prefer_residue_headers();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";

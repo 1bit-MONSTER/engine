@@ -4238,6 +4238,42 @@ void test_encode_tile_code_range() {
     std::printf("  encode tile: 6 arms (0 and 15 encode, 16 refuses by name)\n");
 }
 
+// engine#1921 follow-up: the container writer (tile_q4_1 / tile_q4_1_f32) packs with the same `& 0x0F` as
+// encode_tile(), and it is the writer engine#1918's wrap was measured on. Both tile forms refuse a code above 15 by
+// position, and the legal extremes still write: a guard that refused everything would pass a throw-only arm.
+void test_q4_writer_code_range() {
+    auto make = [](uint8_t code_at_last) {
+        pi::Q4 q;
+        q.N = 32; q.K = 256; q.block = 32;
+        q.codes.assign(size_t(q.N) * q.K, 0);
+        q.scale.assign(size_t(q.N) * (q.K / 32), 1.0f);
+        q.zero.assign(size_t(q.N) * (q.K / 32), 0.0f);
+        q.codes[0] = 15;                              // the top of the range, legal
+        q.codes[size_t(31) * q.K + 255] = code_at_last;
+        return q;
+    };
+    for (int f32 = 0; f32 < 2; ++f32) {
+        const char* form = f32 ? "q4_1f" : "q4_1";
+        auto run = [&](const pi::Q4& q, std::vector<uint8_t>& out) {
+            if (f32) pi::tile_q4_1_f32(q, out); else pi::tile_q4_1(q, out);
+        };
+        std::vector<uint8_t> out;
+        bool ok = false;
+        try { run(make(15), out); ok = !out.empty(); } catch (const std::exception&) {}
+        check(ok, std::string("q4 writer (") + form + "): codes 0 and 15 write a tile");
+        std::string why;
+        std::vector<uint8_t> out2;
+        try { run(make(16), out2); } catch (const std::exception& e) { why = e.what(); }
+        check(!why.empty(), std::string("q4 writer (") + form + "): code 16 is REFUSED, not wrapped to 0");
+        check(why.find("row 31, column 255") != std::string::npos,
+              std::string("q4 writer (") + form + "): the refusal names the row and column");
+        check(why.find("0..15") != std::string::npos && why.find("wrap") != std::string::npos,
+              std::string("q4 writer (") + form + "): and states the range and what would have happened");
+        check(out2.empty(), std::string("q4 writer (") + form + "): nothing is written before the refusal");
+    }
+    std::printf("  q4 writer: 10 arms (both tile forms: 15 writes, 16 refuses by row and column)\n");
+}
+
 // engine#1889: the arithmetic that claims the per-head QK gains out of the 640 B Hunyuan-7B carries between its last qkv
 // tile and o_proj. A wrong offset there reads tile bytes as bf16 and mis-rotates every pack of the family, so both the
 // right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
@@ -4269,6 +4305,7 @@ void test_qk_gain_offsets() {
 
 int main(int argc, char** argv) {
     test_encode_tile_code_range();
+    test_q4_writer_code_range();
     test_qk_norm_refusal();
     test_qk_gain_offsets();
     test_tail_head_placement();

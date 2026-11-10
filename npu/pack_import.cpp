@@ -1831,6 +1831,18 @@ namespace {
 
 void tile_q4_impl(const Q4& q, std::vector<uint8_t>& out, bool f32, long long* param_inexact) {
     if (q.N % q4nx::kRows) throw std::runtime_error("q4_1 tiles need N % 32 == 0");
+    // The same refusal encode_tile() makes (engine#1921), on the writer that needed it first: the packing below masks
+    // with `& 0x0F`, so a code outside 0..15 would land as a different, plausible code one full range away. That is
+    // what engine#1918 measured on this writer (a two's-complement int4 code written into the unsigned field). Its
+    // cause was fixed at the decoder by #1874, so no caller produces such a code today; this keeps a future one from
+    // being packed silently. One pass over the codes, before anything is written.
+    for (size_t i = 0; i < q.codes.size(); ++i)
+        if (q.codes[i] > 0x0F)
+            throw std::runtime_error("q4_1 tile: code " + std::to_string(int(q.codes[i])) + " at row " +
+                                     std::to_string(q.K > 0 ? i / size_t(q.K) : 0) + ", column " +
+                                     std::to_string(q.K > 0 ? i % size_t(q.K) : 0) +
+                                     ": a 4-bit code is 0..15, and packing it would wrap a full code range "
+                                     "(engine#1921: convert a signed code before it reaches the writer)");
     // The grid is 32 x 256, so a tensor whose K is not a whole number of 256-column
     // tiles (Qwen2.5-0.5B: hidden 896 = 3.5 tiles) is stored with the last column tile
     // zero-padded: codes 0, scale 0, zero 0, i.e. w = 0 in the padding. The real K is

@@ -110,11 +110,19 @@ int main() {
         check(all, "control: zero weights return the merger's bias exactly");
     }
 
-    // a token count that disagrees with the grid is refused
+    // A token count that disagrees with the grid is refused. tower_forward() refuses by printing and returning, so the
+    // only thing a caller can observe is that `out` was never written: the buffer is filled with a value no output can
+    // take and must come back untouched (review of #1930 at a7af2fd: this arm used to be `check(true, ...)`).
+    // 2 * T tokens on a grid of T, on purpose: positive and a multiple of 4, so neither the `tokens <= 0` test nor
+    // merger_forward()'s own guard stops it, and only `gh * gw != tokens` stands between this call and a written `out`.
+    // Both buffers are sized for 2 * T tokens, so the call stays inside them even if that check were removed.
     {
-        std::vector<float> o3(size_t(T / 4) * OUT);
-        q4nx_vision::tower_forward(patches.data(), 6, PD, GH, GW, H, NH, HD, IM, OUT, w, inv, o3.data());
-        check(true, "a token count that disagrees with gh*gw is refused");
+        std::vector<float> more(size_t(2 * T) * PD, 0.25f);
+        std::vector<float> o3(size_t(2 * T / 4) * OUT, 1234.0f);
+        q4nx_vision::tower_forward(more.data(), 2 * T, PD, GH, GW, H, NH, HD, IM, OUT, w, inv, o3.data());
+        bool untouched = true;
+        for (float v : o3) untouched = untouched && v == 1234.0f;
+        check(untouched, "a token count that disagrees with gh*gw is refused: the output buffer is never written");
     }
 
     if (fails == 0) std::printf("vision tower: 4 arms pass (golden x2, zero-weight control, refusal)\n");

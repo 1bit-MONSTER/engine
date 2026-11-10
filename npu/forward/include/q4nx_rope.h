@@ -37,6 +37,7 @@
  */
 #pragma once
 
+#include <math.h>
 #include <string.h>
 
 #ifdef __cplusplus
@@ -50,6 +51,34 @@ typedef struct {
     double low_freq_factor;        /* 1.0 */
     double original_max_position;  /* 8192 — the band is in THIS length's units, not the served ctx */
 } Q4nxRopeLlama3;
+
+/* Dynamic NTK ("dynamic"/"dynamic_ntk") — the one rope_scaling type the 1.9 Hunyuan packs declare, and the reason
+ * their serve refuses today.  This is a BASE rule rather than a per-dim rule: below the model's original window the
+ * base is the plain theta (so a short prompt is bit-identical to a model that never declared scaling), and above it
+ *
+ *     base = theta * ((factor * pos / original) - (factor - 1)) ^ (dim / (dim - 2))
+ *
+ * which is the formula HF applies in _compute_dynamic_ntk_parameters and ggml applies through rope_yarn.  The base
+ * therefore has to be recomputed when a position crosses the window -- unlike llama3 and longrope, which are functions
+ * of the dimension alone -- so this is a pure function of (theta, factor, original, pos, dim) with no state, and a
+ * caller that computes it once per position pays one pow per position, not one per dim pair.
+ *
+ * `on == 0` (or unusable numbers) returns `theta` unchanged, so a malformed block cannot silently re-frequency a model
+ * in a way no reference reproduces -- the same rule the llama3 helper follows. */
+typedef struct {
+    int on;                        /* config declared rope_type "dynamic" with usable numbers */
+    double factor;                 /* 1.0 on Hunyuan-0.5B -- a factor of 1 is a no-op until pos > original */
+    double original_max_position;  /* 262144 on Hunyuan-0.5B */
+} Q4nxRopeDynamic;
+
+static inline double q4nx_rope_dynamic_base(double theta, const Q4nxRopeDynamic* d, double pos, int dim) {
+    if (!d || !d->on) return theta;
+    if (!(d->factor > 0.0) || !(d->original_max_position > 0.0) || dim <= 2) return theta;
+    if (!(pos >= d->original_max_position)) return theta;      /* inside the window: plain rope, bit for bit */
+    const double scaled = d->factor * pos / d->original_max_position - (d->factor - 1.0);
+    if (!(scaled > 0.0)) return theta;                          /* a factor below 1 can drive this negative */
+    return theta * pow(scaled, (double)dim / (double)(dim - 2));
+}
 
 /* One dim pair's inverse frequency, after the llama3 rule.  `inv` is the plain theta^(-i/half).
  * Returns `inv` unchanged when `s` is null or off, or when the block is not usable (a factor of 0,
@@ -133,12 +162,16 @@ static inline void q4nx_rope_declared_type(const char* json, char* out, int cap)
  * usable numbers (a declared-but-unusable block is not the same thing as no block) and `longrope`
  * needs the short_factor the forward reads. */
 static inline int q4nx_rope_type_supported(const char* type, const Q4nxRopeLlama3* llama3,
-                                           int has_short_factor) {
+                                           int has_short_factor, int has_dynamic_numbers) {
     if (!type || !type[0]) return 1;                        /* no block declared: plain rope */
     if (!strcmp(type, "default") || !strcmp(type, "none")) return 1;
     if (!strcmp(type, "llama3")) return llama3 && llama3->on;
     if (!strcmp(type, "longrope")) return has_short_factor ? 1 : 0;
-    return 0;                                               /* yarn, linear, dynamic, mrope, ... */
+    /* "dynamic"/"dynamic_ntk" is accepted only with usable numbers: the base rule needs the factor and the window,
+     * and a declared-but-unusable block must be refused rather than served as plain rope (engine#1087).  The
+     * predicate cannot see the numbers, so the caller passes `has_short_factor` as "the numbers were read". */
+    if (!strcmp(type, "dynamic") || !strcmp(type, "dynamic_ntk")) return has_dynamic_numbers ? 1 : 0;
+    return 0;                                               /* yarn, linear, mrope, ... */
 }
 
 #ifdef __cplusplus

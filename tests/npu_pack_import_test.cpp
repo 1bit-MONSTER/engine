@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -219,6 +220,15 @@ json container_table(const std::string& path) {
     return json::parse(header);
 }
 
+// The container's payload, i.e. what `data_offsets` are measured from: after the 8-byte header length and the JSON.
+std::vector<uint8_t> container_payload(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    uint64_t hlen = 0;
+    f.read(reinterpret_cast<char*>(&hlen), 8);
+    f.seekg(std::streamoff(8 + hlen));
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
 // How many I8 tensors of a container are the imported 6,144-byte q4_1f form -- exactly the
 // trigger of the forward loader's refusal (npu/forward/src/model.c, engine#1185).
 int q4_1f_tensors(const json& table) {
@@ -266,7 +276,9 @@ void test_external_tile_decode() {
             for (int64_t kk = 1; kk <= K / 128; ++kk) {
                 uint8_t* subv = blob.data() + (tile * per_tile + kk * 2 + half) * 2176;
                 for (int r = 0; r < 32; ++r) {
-                    const int64_t row = tile * 64 + half * 32 + r;
+                    // The decoder reads the block's FIRST 32 rows from the pair's SECOND subvolume, so the fixture encodes
+                    // its rows in that order; without this the test pins a mapping the decoder does not use (engine#1503).
+                    const int64_t row = tile * 64 + (1 - half) * 32 + r;
                     const uint16_t sc = bf16_bits(scale_for(tile, half, kk, r));
                     subv[2112 + r * 2] = uint8_t(sc & 0xFF);
                     subv[2113 + r * 2] = uint8_t(sc >> 8);
@@ -291,19 +303,29 @@ void test_external_tile_decode() {
     check(err.empty() && q.N == N && q.K == K && q.block == 32,
           "external tile: a blob of the measured size decodes (" + err + ")");
     bool codes_ok = q.codes.size() == codes.size(), scale_ok = true, zero_ok = true;
-    for (size_t i = 0; codes_ok && i < codes.size(); ++i)
-        if (q.codes[i] != codes[i]) codes_ok = false;
+    // The pack's codes are int4 TWO'S COMPLEMENT; the container's form is the offset from the group minimum, i.e.
+    // c_signed + 8. A test that expected the raw nibble passed on the unsigned bug (engine#1503).
+    for (size_t i = 0; codes_ok && i < codes.size(); ++i) {
+        const int raw = codes[i];
+        const int cs = (raw >= 8) ? raw - 16 : raw;
+        if (q.codes[i] != uint8_t(cs + 8)) codes_ok = false;
+    }
     // Every row's own scale and all four of its zero points, so the addressing (row r*2 in the param regions, the
     // group index (kk-1)*4+g, the half and tile choice) is pinned rather than the value of one row repeated.
     for (int64_t tile = 0; tile < tiles; ++tile)
         for (int half = 0; half < 2; ++half)
             for (int64_t kk = 1; kk <= K / 128; ++kk)
                 for (int r = 0; r < 32; ++r) {
-                    const int64_t row = tile * 64 + half * 32 + r;
+                    // The decoder reads the block's FIRST 32 rows from the pair's SECOND subvolume, so the fixture encodes
+                    // its rows in that order; without this the test pins a mapping the decoder does not use (engine#1503).
+                    const int64_t row = tile * 64 + (1 - half) * 32 + r;
                     for (int g = 0; g < 4; ++g) {
                         const size_t at = size_t(row) * (K / 32) + (kk - 1) * 4 + g;
                         if (q.scale[at] != scale_for(tile, half, kk, r)) scale_ok = false;
-                        if (q.zero[at] != float(zero_for(tile, half, kk, r, g))) zero_ok = false;
+                        // and the container's zero is the offset, m = (-8 - z) * scale, for a signed int4 z
+                        const int zraw = zero_for(tile, half, kk, r, g);
+                        const int zs = (zraw >= 8) ? zraw - 16 : zraw;
+                        if (q.zero[at] != float(-8 - zs) * scale_for(tile, half, kk, r)) zero_ok = false;
                     }
                 }
     check(codes_ok, std::string("external tile: every 4-bit code comes back exactly, ") + (row_major ? "row-major" : "w8 interleave"));
@@ -332,23 +354,14 @@ void test_external_to_container() {
 
     long long m_inexact = -1;
     const pi::Q4 q = pi::container_from_external_q4(pack, &m_inexact);
-    check(q.codes == pack.codes, "external->container: codes are carried unchanged (the pack's grid is the container's)");
-    check(q.scale == pack.scale, "external->container: d is the pack's scale");
-    check(m_inexact >= 0, "external->container: the bf16-exactness of m is reported, not assumed");
-
-    // The arithmetic identity: code*d + m must equal the pack's (code - zp)*scale, up to the bf16 rounding of m.
-    float worst_rel = 0.0f;
-    for (int r = 0; r < pack.N; ++r)
-        for (int k = 0; k < pack.K; ++k) {
-            const size_t g = size_t(r) * (pack.K / 32) + size_t(k) / 32;
-            const float want = (float(pack.codes[size_t(r) * pack.K + k]) - pack.zero[g]) * pack.scale[g];
-            const float got = float(q.codes[size_t(r) * pack.K + k]) * q.scale[g] + q.zero[g];
-            const float range = 15.0f * pack.scale[g];
-            worst_rel = std::max(worst_rel, std::fabs(got - want) / range);
-        }
-    check(worst_rel <= 1.0f / 256.0f,
-          "external->container: code*d + m reproduces (code - zp)*scale to within one bf16 ulp of m (worst " +
-              std::to_string(worst_rel) + " of the group's 15-step range)");
+    // The conversion is a PASS-THROUGH: decode_external_tile already returns the container's convention, so the
+    // identity to pin is that nothing is converted a SECOND time. It was: `zero` became -((-8-z)*scale)*scale ~
+    // +0.0002 instead of -0.04, every weight sat at code*scale -- a near-constant POSITIVE matrix -- and a down
+    // projection summed to K*mean(act)*0.04 ~ 110,000 where a healthy layer gives ~1 (engine#1503).
+    check(q.codes == pack.codes, "external->container: codes pass through unchanged");
+    check(q.scale == pack.scale, "external->container: scales pass through unchanged");
+    check(q.zero == pack.zero, "external->container: the offset passes through unchanged (the mapping is NOT re-applied)");
+    check(m_inexact >= 0, "external->container: the bf16-exactness of the offset is reported, not assumed");
 }
 
 // The writer's role mapping (engine#1503): the graph's own names, mapped onto the roles the tile writer already
@@ -582,6 +595,198 @@ void test_external_packed_genre(const std::string& root) {
     fs::remove_all(dir2);
 }
 
+// engine#1849 (the CHANGES on #1712 that the merge went past): the external-data WRITER had no success-path arm. Every
+// import_pack() on the genre above expects a refusal, so the decode -> split -> tile chain, the BF16 copies and the header
+// keys #1751/#1793 added were exercised only on real packs. This builds a pack whose geometry the split CAN satisfy,
+// imports it to completion and reads the container back through q4nx's own decoders -- independent of the writer -- against
+// values the fixture computes itself. Every row has its own scale, and every (row, block, group) its own zero point, so a
+// row that lands in the wrong tensor or a q/k/v range that is off by one tile changes a weight and fails here.
+void test_external_import_success(const std::string& root) {
+    const fs::path dir = fs::path(root) / "external-success";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    // 2 heads + 1 kv head of 128: q 256 rows, k 128, v 128 -> one qkv matmul of N 512 at K = hidden 256.
+    const int H = 256, NH = 2, NKV = 1, HD = 128, V = 64;
+    const int N = (NH + 2 * NKV) * HD, K = H;
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"phi3","hidden_size":256,"intermediate_size":512,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":128,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":false})");
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"decoder":{"filename":"eager-mm.onnx","hidden_size":256,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_size":128,"intermediate_size":512}}})");
+    put_file((dir / "tokenizer.json").string(), R"({"model":{"type":"BPE"}})");
+
+    // The fixture's own weights: w(row, col) = (code - zp) * scale, chosen so every product is exact in f32 (scales are
+    // bf16-exact with 7 mantissa bits, |code - zp| <= 15), so the container's `code*scale + m` form must reproduce them
+    // bit for bit. Both nibbles are int4 TWO'S COMPLEMENT (the pack's writer asserts -8 <= x <= 7), so the reference
+    // sign-extends them: the generators walk all 16 nibble values, and for a code and zero of opposite sign an
+    // unsigned reading is off by 16 * scale (engine#1503, #1874).
+    auto scale_of = [](int row) { return (1.0f + float(row % 128) / 128.0f) * std::ldexp(1.0f, -(row / 128 + 2)); };
+    auto zp_of = [](int row, int kb, int g) { return uint8_t((row + 3 * kb + 5 * g) % 16); };
+    auto code_of = [](int row, int col) { return uint8_t((row * 7 + col * 3) % 16); };
+    auto w_of = [&](int row, int col) {
+        auto sx = [](uint8_t v) { return v >= 8 ? int(v) - 16 : int(v); };
+        return float(sx(code_of(row, col)) - sx(zp_of(row, col / 128, (col % 128) / 32))) * scale_of(row);
+    };
+    // Encode the blob as the pack lays it out -- the inverse of decode_external_tile() for the shipped ordering
+    // (pi::kExtQuantsRowMajor == false: byte (cp%4) + c*4 + (cp/4)*512 holds rows 2cp/2cp+1 of column c).
+    const int blocks = K / 128, tiles = N / 64, per_tile = 2 * (blocks + 1);
+    std::string blob(size_t(tiles) * per_tile * 2176, '\0');
+    for (int tile = 0; tile < tiles; ++tile)
+        for (int half = 0; half < 2; ++half)
+            for (int kk = 1; kk <= blocks; ++kk) {
+                char* subv = &blob[size_t(tile * per_tile + kk * 2 + half) * 2176];
+                for (int r = 0; r < 32; ++r) {
+                    // A 64-row block's FIRST 32 rows live in the pair's SECOND subvolume (measured on the pack, #1874).
+                    const int row = tile * 64 + (1 - half) * 32 + r;
+                    const uint16_t s = pi::bf16_bits_of(scale_of(row));
+                    subv[2112 + r * 2] = char(s & 0xFF);
+                    subv[2112 + r * 2 + 1] = char(s >> 8);
+                    subv[2048 + r * 2] = char(zp_of(row, kk - 1, 0) | (zp_of(row, kk - 1, 1) << 4));
+                    subv[2048 + r * 2 + 1] = char(zp_of(row, kk - 1, 2) | (zp_of(row, kk - 1, 3) << 4));
+                    for (int c = 0; c < 128; ++c) {
+                        const int cp = r / 2;
+                        uint8_t& b = reinterpret_cast<uint8_t&>(subv[(cp % 4) + c * 4 + (cp / 4) * 512]);
+                        const uint8_t nib = code_of(row, (kk - 1) * 128 + c);
+                        b = (r % 2 == 0) ? uint8_t((b & 0xF0) | nib) : uint8_t((b & 0x0F) | (nib << 4));
+                    }
+                }
+            }
+    check(int64_t(blob.size()) == int64_t(N) * (K / 128 + 1) * 68,
+          "external success: the crafted blob has the genre's length N x (K/128 + 1) x 68");
+    // The embedding, F32 in the pack, values exact in bf16.
+    std::string embed(size_t(V) * H * 4, '\0');
+    for (int i = 0; i < V * H; ++i) {
+        const float v = float((i % 61) - 30) * 0.5f;
+        std::memcpy(&embed[size_t(i) * 4], &v, 4);
+    }
+    put_file((dir / "eager-mm.onnx.data").string(), embed + blob);
+    put_file((dir / "eager-mm.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "eager-mm.onnx.data", 0, uint64_t(embed.size())),
+                        pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.empty"),
+                        pb::placeholder("model.layers.0.attn.qkv_proj.MatMulNBits.scales.empty"),
+                        pb::tensor("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", {int64_t(blob.size())},
+                                   "eager-mm.onnx.data", uint64_t(embed.size()), uint64_t(blob.size()))},
+                       {pb::matmulnbits("qkv", {"x", "/model/layers.0/attn/qkv_proj/MatMulNBits.qweight.empty",
+                                                "/model/layers.0/attn/qkv_proj/MatMulNBits.scales.empty", "y"},
+                                        K, N, 4, 128, "MatMulNBitsBf")}));
+
+    struct Container {
+        json table;
+        std::string data;
+    };
+    auto read_container = [](const fs::path& out) {
+        Container c;
+        std::ifstream f(out / "model.q4nx", std::ios::binary);
+        uint64_t hlen = 0;
+        f.read(reinterpret_cast<char*>(&hlen), 8);
+        std::string hdr(size_t(hlen), '\0');
+        f.read(hdr.data(), std::streamsize(hlen));
+        while (!hdr.empty() && (hdr.back() == ' ' || hdr.back() == '\0')) hdr.pop_back();
+        c.table = json::parse(hdr);
+        c.data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        return c;
+    };
+    auto json_of = [](const fs::path& p) {
+        std::ifstream f(p);
+        return json::parse(f);
+    };
+
+    for (const std::string layout : {"", "b8"}) {
+        const fs::path out = dir / (layout.empty() ? "out" : "out-b8");
+        fs::remove_all(out);
+        pi::Options opt;
+        opt.allow_incomplete = true;   // the plan's own refusals (no .fconst, no programs) must not stop the writer
+        opt.weight_layout = layout;
+        pi::Report r;
+        std::string why;
+        try {
+            r = pi::import_pack(dir.string(), out.string(), opt);
+        } catch (const std::exception& e) {
+            why = e.what();
+        }
+        const std::string tag = "external success" + std::string(layout.empty() ? "" : " (b8)") + ": ";
+        check(why.empty() && r.refused.empty() && fs::exists(out / "model.q4nx"),
+              tag + "a pack whose geometry the split satisfies imports to completion (" + why +
+                  (r.refused.empty() ? "" : r.refused.front()) + ")");
+        if (!fs::exists(out / "model.q4nx")) continue;
+
+        // config.json: the geometry, and q4nx_weight_layout ONLY for a non-default layout (engine#1840 / #1793).
+        const json cfg = json_of(out / "config.json");
+        check(cfg.value("num_attention_heads", 0) == NH && cfg.value("num_key_value_heads", 0) == NKV &&
+                  cfg.value("head_dim", 0) == HD && cfg.value("hidden_size", 0) == H,
+              tag + "config.json carries the pack's geometry");
+        if (layout.empty())
+            check(!cfg.contains("q4nx_weight_layout"),
+                  tag + "a default-layout container carries no q4nx_weight_layout key (every earlier container depends "
+                        "on that)");
+        else
+            check(cfg.value("q4nx_weight_layout", std::string()) == "b8",
+                  tag + "--weight-layout b8 writes q4nx_weight_layout \"b8\" into config.json");
+        // The text artifacts (engine#1751): without tokenizer.json the directory is not a model directory.
+        check(fs::exists(out / "tokenizer.json"), tag + "tokenizer.json is copied beside the container");
+        if (!layout.empty()) continue;   // the weights do not depend on the layout key; check them once
+
+        const Container c = read_container(out);
+        // q/k/v land as three tensors with the geometry's row ranges, and every weight is the fixture's.
+        struct Want {
+            const char* name;
+            int lo, rows;
+        };
+        for (const Want& want : {Want{"model.layers.0.self_attn.q_proj.weight", 0, NH * HD},
+                                 Want{"model.layers.0.self_attn.k_proj.weight", NH * HD, NKV * HD},
+                                 Want{"model.layers.0.self_attn.v_proj.weight", NH * HD + NKV * HD, NKV * HD}}) {
+            const std::string nm = want.name;
+            if (!c.table.contains(nm)) {
+                check(false, tag + nm + " is in the container");
+                continue;
+            }
+            const json& e = c.table.at(nm);
+            const int64_t lo = e.at("data_offsets").at(0), hi = e.at("data_offsets").at(1);
+            const int RT = want.rows / 32, KT = K / 256;
+            const size_t tb = size_t(onebit::npu::q4nx::Chunk::Q4_1F);
+            check(e.at("shape").at(1) == int64_t(tb) && (hi - lo) == int64_t(RT) * KT * int64_t(tb),
+                  tag + nm + " is " + std::to_string(RT * KT) + " q4_1f tiles");
+            if ((hi - lo) != int64_t(RT) * KT * int64_t(tb)) continue;
+            int bad = 0, first_r = -1, first_c = -1;
+            std::vector<float> w(32 * 256);
+            for (int rt = 0; rt < RT; ++rt)
+                for (int kt = 0; kt < KT; ++kt) {
+                    const auto* tile =
+                        reinterpret_cast<const uint8_t*>(c.data.data() + lo + (size_t(rt) * KT + kt) * tb);
+                    onebit::npu::q4nx::dequant_tile(onebit::npu::q4nx::Chunk::Q4_1F, tile, w.data(), 256);
+                    for (int r = 0; r < 32; ++r)
+                        for (int col = 0; col < 256; ++col) {
+                            const int row = rt * 32 + r, gcol = kt * 256 + col;
+                            if (w[size_t(r) * 256 + col] != w_of(want.lo + row, gcol)) {
+                                if (bad++ == 0) first_r = row, first_c = gcol;
+                            }
+                        }
+                }
+            check(bad == 0, tag + nm + ": every weight is the pack's row " + std::to_string(want.lo) + "+r, exactly (" +
+                                std::to_string(bad) + " differ, first at " + std::to_string(first_r) + "," +
+                                std::to_string(first_c) + ")");
+        }
+        // The embedding is copied as BF16 with its shape (exact here by construction).
+        bool embed_ok = c.table.contains("model.embed_tokens.weight");
+        if (embed_ok) {
+            const json& e = c.table.at("model.embed_tokens.weight");
+            const int64_t lo = e.at("data_offsets").at(0), hi = e.at("data_offsets").at(1);
+            embed_ok = e.at("dtype") == "BF16" && e.at("shape") == json::array({V, H}) && hi - lo == int64_t(V) * H * 2;
+            for (int i = 0; embed_ok && i < V * H; ++i) {
+                uint16_t b = 0;
+                std::memcpy(&b, c.data.data() + lo + size_t(i) * 2, 2);
+                embed_ok = onebit::npu::bf16_to_f32(b) == float((i % 61) - 30) * 0.5f;
+            }
+        }
+        check(embed_ok, tag + "the embedding is copied as BF16 [64, 256] with every value intact");
+    }
+    fs::remove_all(dir);
+    std::printf("external success: crafted external-data pack imported; q/k/v split, weights, embedding and keys hold\n");
+}
+
+
 // The two overstatements the readers must catch: declared dims larger than the external file, and a
 // MatMulNBits node whose N/K/block_size demand more qweight than the tensor declares.
 // engine#1671: a pack whose graph is all `[0]`-dims placeholders and whose bytes are in model.bin (the 1.8/hybrid
@@ -625,6 +830,100 @@ void test_canonical_copy_reusable() {
           "reuse: an empty copy is not the canonical form of a non-empty body");
     fs::remove_all(dir, ec);
     std::printf("  canonical copy reuse: 7 arms (complete/truncated/long/absent/directory/zero-length/empty)\n");
+}
+
+// engine#1770: the canonical copy is scratch that used to only ever accumulate -- reuse writes a new file when the source
+// changes, so 699 files / 8.7 GiB of tmpfs (RAM) had built up on one box. The eviction rule is "same pack and geometry,
+// different source identity", and what can go wrong is deleting one of the neighbours that must survive, so each is an arm.
+void test_evict_stale_canonical_copies() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-evict-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    auto touch = [&](const std::string& base) {
+        std::ofstream o(dir / base, std::ios::binary | std::ios::trunc);
+        o << 'x';
+    };
+    const std::string keep = "1bit-fconst19v1-12345-896-14-24-291653952-76263210.fconst";
+    const std::string prefix = "1bit-fconst19v1-12345-896-14-24-";
+    const std::string stale = "1bit-fconst19v1-12345-896-14-24-291653952-99999.fconst";     // same pack+geometry, new mtime
+    const std::string stale_size = "1bit-fconst19v1-12345-896-14-24-300000000-76263210.fconst";  // repacked source
+    const std::string other_geometry = "1bit-fconst19v1-12345-1536-12-28-995712640-73345656.fconst";
+    const std::string other_pack = "1bit-fconst19v1-99999-896-14-24-291653952-76263210.fconst";
+    const std::string other_form = "1bit-fconst19v2-12345-896-14-24-291653952-76263210.fconst";
+    const std::string unrelated = "notes.txt";
+    // The split must not change the NAME, or every run rewrites a copy it already had (a ~1 GB rewrite, silently). The
+    // legacy formula concatenated these fields directly; the fix only cuts the string at the size field.
+    check(keep == prefix + "291653952-76263210.fconst",
+          "evict: prefix + source identity is the name the reuse path looks for, unchanged");
+    for (const auto& f : {keep, stale, stale_size, other_geometry, other_pack, other_form, unrelated}) touch(f);
+
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix);
+
+    auto exists = [&](const std::string& base) { return fs::exists(dir / base, ec); };
+    check(exists(keep), "evict: the copy being written is kept");
+    check(!exists(stale), "evict: a copy of the same pack and geometry at another mtime goes (the accumulation)");
+    check(!exists(stale_size), "evict: a repacked source's copy goes (different size, same pack and geometry)");
+    check(exists(other_geometry), "evict: another geometry of the same pack is kept -- it is not this run's to remove");
+    check(exists(other_pack), "evict: another pack with the same geometry is kept");
+    check(exists(other_form), "evict: another canonical form version is kept");
+    check(exists(unrelated), "evict: unrelated files in the directory are kept");
+
+    // engine#1770 (second generation): the pre-version naming has no source identity, so a prefix match on the current form
+    // never sees it -- three such files sat in /tmp for a day at 3.6 GB each, i.e. 10.67 GiB of RAM.
+    const std::string legacy = "1bit-fconst19-12345-896-14-24.fconst";
+    const std::string legacy_other_geometry = "1bit-fconst19-12345-1536-12-28.fconst";
+    touch(legacy);
+    touch(legacy_other_geometry);
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix, legacy);
+    check(!exists(legacy), "evict: the pre-version name for THIS geometry goes (no identity to reuse)");
+    check(exists(legacy_other_geometry), "evict: ... but another geometry's pre-version name is kept");
+
+    // and the abandoned tail: a pack nobody imports again is only reachable by age, because the sweep runs when a pack is
+    // written. 0 must disable it, so the callers that pass nothing keep the old behaviour.
+    const std::string old_other = "1bit-fconst19v1-77777-1536-12-28-995712640-73345656.fconst";
+    const std::string fresh_other = "1bit-fconst19v1-88888-1536-12-28-995712640-73345656.fconst";
+    touch(old_other);
+    touch(fresh_other);
+    const auto seven_hours_ago = fs::file_time_type::clock::now() - std::chrono::hours(7);
+    fs::last_write_time(dir / old_other, seven_hours_ago, ec);
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix, legacy, 6 * 3600);
+    check(!exists(old_other), "evict: an abandoned geometry older than the age goes (the tail a write cannot reach)");
+    check(exists(fresh_other), "evict: a fresh copy of another geometry stays -- another run may be writing it");
+
+    // engine#1797 review: the age rule reads `last_write_time`, and reuse used to READ the copy without writing it -- so
+    // a file in continuous use aged past `max_age_seconds` and was swept, and the next run rewrote it. The repair is
+    // that reuse now touches the copy, which makes the timestamp mean "last use". This arm pins the rule that repair
+    // relies on: a copy with a FRESH mtime survives an age sweep, and one with an old mtime does not.
+    {
+        // DIFFERENT geometry (hidden 1536), so the name rule cannot reach them and only the age rule decides -- which is
+        // the rule this arm is about. Same geometry would test the name rule instead, and my first version of this arm
+        // made exactly that mistake and failed on it.
+        const std::string stem = "1bit-fconst19v1-";
+        const std::string aged = stem + "12345-1536-12-28-995712640-73345656.fconst";
+        const std::string fresh_name = stem + "12345-1536-12-28-500000000-11111111.fconst";
+        touch(aged);
+        touch(fresh_name);
+        std::error_code tec;
+        fs::last_write_time(dir / aged, fs::file_time_type::clock::now() - std::chrono::hours(10), tec);
+        check(!tec, "evict age: the fixture can age a copy");
+        // 6 h window: the 10 h copy goes, the one just written stays
+        pi::evict_stale_canonical_copies(dir.string(), keep, prefix, "", 6 * 3600);
+        check(!exists(aged), "evict age: a copy nobody has touched for 10 h is swept");
+        check(exists(fresh_name), "evict age: a copy with a fresh mtime survives -- what reuse's touch produces");
+        check(exists(keep), "evict age: and the copy being written is still kept");
+    }
+    // The degenerate arguments must not turn into "delete the directory".
+    for (const auto& f : {keep, stale}) touch(f);
+    pi::evict_stale_canonical_copies(dir.string(), "", prefix);
+    check(exists(keep) && exists(stale), "evict: an empty keep-name removes nothing");
+    pi::evict_stale_canonical_copies(dir.string(), keep, "");
+    check(exists(keep) && exists(stale), "evict: an empty prefix removes nothing");
+    pi::evict_stale_canonical_copies((dir / "absent").string(), keep, prefix);
+    check(exists(keep), "evict: an absent directory is not an error");
+    fs::remove_all(dir, ec);
+    std::printf("  canonical copy eviction: 16 arms (name composition + keep/stale/geometry/pack/form/unrelated + legacy name +"
+                " geometry/age rules + 3 degenerate)\n");
 }
 
 void test_modelbin_genre_refusal(const std::string& root) {
@@ -1264,6 +1563,190 @@ void test_mlp_gu(const std::string& golden_dir) {
     }
     std::printf("MLP golden: 1 unit, encode/decode exact, %zu container tiles identical\n",
                 tiled.size() / onebit::npu::kTileBytes);
+}
+
+// ── engine#1850: the tied block-32 head synthesis, and the untied refusal, on a crafted pack ──
+// #1633 makes `import_pack()` synthesise `lm_head` from the embedding when a 1.9 pack quantises its HEAD at a K block other than
+// 128 and declares tied embeddings, refuses an untied pack by name, records `q4nx_head_note`, and self-checks the synthesis
+// against the embedding. None of that had an arm: it was exercised only by hand on the real Coder-1.5B pack, and the Python
+// tail-head test's "block-32 arm" covers the tool's exit code, not this code. One fixture, two arms, no pack and no device.
+void test_tied_block32_head(const std::string& root) {
+    const auto build = [&](bool tied, const char* tag) {
+        const fs::path dir = fs::path(root) / tag;
+        fs::remove_all(dir);
+        fs::create_directories(dir / "cache");
+        const int H = 128, L = 8, V = 64;
+        const int64_t stride = 1 << 20, second = 262144;
+        std::string fc(size_t(int64_t(L) * stride + 64 + size_t(H) * 2), '\0');
+        auto put_eps = [&](int64_t off) {
+            fc[size_t(off)] = char(0x86);
+            fc[size_t(off) + 1] = char(0x35);
+        };
+        for (int l = 0; l < L; ++l) {
+            put_eps(int64_t(l) * stride);
+            put_eps(int64_t(l) * stride + second);
+        }
+        put_eps(int64_t(L) * stride);
+        for (int i = 0; i < H; ++i) {
+            const uint16_t bits = pi::bf16_bits_of(float(i + 1));
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i)] = char(bits & 0xFF);
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i) + 1] = char(bits >> 8);
+        }
+        put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+        const std::string cfg =
+            std::string(R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+                        R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,)"
+                        R"("rope_theta":10000.0,"tie_word_embeddings":)") +
+            (tied ? "true" : "false") + R"(,"rms_norm_eps":1e-06})";
+        put_file((dir / "config.json").string(), cfg);
+        // The head's declared geometry (N=V=64, K=H=128, block=32) has to be carried by the bytes: the gate checks
+        // qweight >= N x (K/block) x (block/2) = 4,096 B, f32 scales >= N x (K/block) x 4 = 1,024 B, zeros >= 128 B.
+        const int64_t kblocks = H / 32;
+        const uint64_t embed_bytes = uint64_t(V) * uint64_t(H) * 2;
+        const uint64_t qw_off = embed_bytes, qw_len = uint64_t(V) * uint64_t(kblocks) * 16;
+        const uint64_t sc_off = qw_off + qw_len, sc_len = uint64_t(V) * uint64_t(kblocks) * 4;
+        const uint64_t z_off = sc_off + sc_len, z_len = uint64_t(V) * ((kblocks + 1) / 2);
+        // A VARIED embedding on purpose: a constant fill quantises to one code with a near-zero scale, so the self-check
+        // would compute 0/0 and the arm would fail for the fixture's sake rather than the code's.
+        std::string data(size_t(z_off + z_len), '\x11');
+        for (int r = 0; r < V; ++r)
+            for (int c = 0; c < H; ++c) {
+                const uint16_t bits = pi::bf16_bits_of(0.05f * float((r * 7 + c * 13) % 97) - 2.4f);
+                const size_t at = (size_t(r) * size_t(H) + size_t(c)) * 2;
+                data[at] = char(bits & 0xFF);
+                data[at + 1] = char(bits >> 8);
+            }
+        put_file((dir / "model.onnx.data").string(), data);
+        // engine#1850: `p.head_block` comes from the pack's `cache/*_meta.json` (read_declared), NOT from the graph -- which
+        // is what makes the synthesis reachable at all: the branch needs `onnx.matmuls.empty()`, so the head cannot be a node
+        // the walker keeps. Writing the declaration into cache/ is the shape the real 1.9 packs have.
+        put_file((dir / "cache" / "lm_head_meta.json").string(),
+                 R"({"op_list":[{"type":"MladfMatMul","name":"lm_head.MatMulNBits",)"
+                 R"("attrs":{"N":{"value":[64]},"K":{"value":[128]},"block_size":{"value":[32]},"bits":{"value":[4]}}}],)"
+                 R"("tensor_map":{}})");
+        put_file((dir / "model.onnx").string(),
+                 pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", 0,
+                                       uint64_t(V) * uint64_t(H) * 2, 10),
+                            // PLACEHOLDERS, not weights (engine#1850): the synthesis path runs only when the walk ends
+                            // with NO matmuls, which is the shape a real pack has when its head is a placeholder with no
+                            // `*.packed` sibling -- the node is dropped from `matmuls` while its `block_size` is still
+                            // counted by the census that sets `p.head_block`. A tensor that carries bytes here would be
+                            // read by the graph-head loop instead and refused for its declared length.
+                            pb::placeholder("lm_head.weight.MatMulNBits.qweight"),
+                            pb::placeholder("lm_head.weight.MatMulNBits.scales"),
+                            pb::placeholder("lm_head.weight.MatMulNBits.zeros")},
+                           {}));
+        return dir;
+    };
+
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    {   // arm 1: declared tied -> synthesised from the embedding, and the note says so
+        const fs::path dir = build(true, "tied-block32");
+        const std::string out = (fs::temp_directory_path() /
+                                 ("oga_pack_import_tied32." + std::to_string(::getpid()))).string();
+        fs::remove_all(out);
+        bool threw = false;
+        std::string why;
+        pi::Report r;
+        try {
+            r = pi::import_pack(dir.string(), out, allow);
+        } catch (const std::exception& e) {
+            threw = true;
+            why = e.what();
+        }
+        check(!threw, "tied block-32: a tied pack imports (" + (why.empty() ? std::string("ok") : why.substr(0, 140)) + ")");
+        check(!r.head_synthesized_note.empty() && r.head_synthesized_note.find("block 32") != std::string::npos,
+              "tied block-32: the synthesis is recorded and names the block (" + r.head_synthesized_note + ")");
+        check(r.selfcheck_tied && r.lmhead_corr > 0.999,
+              "tied block-32: the self-check measures the SYNTHESIS against the embedding (corr " +
+                  std::to_string(r.lmhead_corr) + ")");
+        if (fs::exists(out + "/model.q4nx")) {
+            // `q4nx_head_note` is written into the container's config.json (that is what the forward reads), not into the
+            // q4nx tensor table's metadata.
+            std::ifstream cf(out + "/config.json");
+            check(cf.good(), "tied block-32: the container carries a config.json");
+            if (cf.good()) {
+                const json cfg = json::parse(cf);
+                check(cfg.contains("q4nx_head_note") && cfg["q4nx_head_note"].get<std::string>().find("block 32") !=
+                                                              std::string::npos,
+                      "tied block-32: config.json carries q4nx_head_note and names the block");
+            }
+            check(container_table(out + "/model.q4nx").contains("lm_head.weight"),
+                  "tied block-32: the container carries the synthesised head");
+            // engine#1882 review: presence is not the assertion. The self-check above measures `q` BEFORE `tile_q4_1_f32`
+            // turns it into the bytes the container carries, so an all-zero written head passed every arm -- and that is
+            // exactly the state a serve reads. Decode the container's own bytes with the decoder the forward uses.
+            const json tbl = container_table(out + "/model.q4nx");
+            if (tbl.contains("lm_head.weight")) {
+                const std::vector<uint8_t> blob = container_payload(out + "/model.q4nx");
+                const auto offs = tbl["lm_head.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+                std::vector<float> w(size_t(onebit::npu::q4nx::kRows) * onebit::npu::q4nx::kCols, 0.f);
+                onebit::npu::q4nx::dequant_tile(onebit::npu::q4nx::Chunk::Q4_1F, blob.data() + offs[0], w.data(),
+                                                onebit::npu::q4nx::kCols);
+                // Compare against the embedding THE CONTAINER CARRIES, not against this test's recollection of what it
+                // wrote: the synthesis's claim is that the head IS the embedding, so both sides must come from the file.
+                std::ifstream cfin(out + "/config.json");
+                const json cf = json::parse(cfin);
+                const int V = cf.at("vocab_size").get<int>(), H = cf.at("hidden_size").get<int>();
+                const auto eoffs = tbl["model.embed_tokens.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+                std::vector<float> emb(size_t(V) * size_t(H), 0.f);
+                for (size_t i = 0; i < emb.size(); ++i) {
+                    const uint16_t b = uint16_t(blob[size_t(eoffs[0]) + 2 * i]) |
+                                       (uint16_t(blob[size_t(eoffs[0]) + 2 * i + 1]) << 8);
+                    const uint32_t u = uint32_t(b) << 16;
+                    float v;
+                    std::memcpy(&v, &u, 4);
+                    emb[i] = v;
+                }
+                double num = 0, da = 0, db = 0;
+                int n = 0;
+                for (int r = 0; r < onebit::npu::q4nx::kRows && r < V; ++r)
+                    for (int c = 0; c < H; ++c) {
+                        const double want = double(emb[size_t(r) * size_t(H) + size_t(c)]);
+                        const double got = double(w[size_t(r) * onebit::npu::q4nx::kCols + size_t(c)]);
+                        num += want * got, da += want * want, db += got * got, ++n;
+                    }
+                const double corr = (da > 0 && db > 0) ? num / std::sqrt(da * db) : 0.0;
+                check(n > 0 && corr > 0.999,
+                      "tied block-32: the container's head, decoded from its own bytes, is the embedding (corr " +
+                          std::to_string(corr) + ", n " + std::to_string(n) + ")");
+            }
+        }
+        fs::remove_all(out);
+        fs::remove_all(dir);
+    }
+    {   // arm 2: the same pack without the declaration -> refused by name, nothing written
+        const fs::path dir = build(false, "untied-block32");
+        const std::string out = (fs::temp_directory_path() /
+                                 ("oga_pack_import_untied32." + std::to_string(::getpid()))).string();
+        fs::remove_all(out);
+        bool threw = false;
+        std::string why;
+        pi::Report r;
+        try {
+            // allow-incomplete ON purpose: a strict import bails out at the FIRST refusal (this fixture's layer payload is
+            // empty, so it has 80 of them) and never reaches the head gate -- asserting on it there would test the
+            // bail-out, not the head. With it on, the run reaches the gate and the refusal lands in `refused`.
+            allow.allow_incomplete = true;
+            r = pi::import_pack(dir.string(), out, allow);
+        } catch (const std::exception& e) {
+            threw = true;
+            why = e.what();
+        }
+        std::string said = why;
+        for (const auto& w : r.refused)
+            if (w.rfind("lm_head.weight", 0) == 0) said += " | " + w;
+        check(threw || !r.refused.empty(),
+              "untied block-32: an untied pack is refused rather than synthesised (" + said.substr(0, 140) + ")");
+        check(said.find("block 32") != std::string::npos && said.find("does not declare tied") != std::string::npos,
+              "untied block-32: the refusal names the block and the missing declaration (" + said.substr(0, 160) + ")");
+        if (fs::exists(out + "/model.q4nx"))
+            check(!container_table(out + "/model.q4nx").contains("lm_head.weight"),
+                  "untied block-32: the container carries no head (nothing stands in for an untied one)");
+        fs::remove_all(out);
+        fs::remove_all(dir);
+    }
 }
 
 // ── the final norm out of the tail envelope, on a crafted pack (engine#844) ──────────────────
@@ -2175,6 +2658,175 @@ void test_text_config_geometry(const std::string& root) {
     fs::remove_all(dir);
 }
 
+
+// engine#1503: a THREE-input MatMulNBits with no qzeros, weights spelled `<proj>.MatMul.weight_Q4` +
+// `.weight_scales` -- Qwen3-VL-4B's form. `walk_graph` used to require four inputs, so it recorded NO matmuls for that
+// pack: `info` printed matmulnbits_ops 0 and the import wrote the embedding only ("imported 1 tensors, 0 q4_1 tiles").
+// On the real pack the fix yields 147 tensors / 47,480 tiles and the pack's own self-check reads corr 0.993981 against its
+// embedding, with the no-zero-point control at 0.3333 -- this arm pins the mechanism without the 3 GB pack.
+// engine#1503: `rope_theta` nested one level deeper still — `text_config.rope_parameters.rope_theta` — which is how
+// Qwen3-VL-4B declares 5,000,000 with no `rope_theta` anywhere else. The reader's 10000 default made the importer warn that
+// the pack's cos/sin caches "no plain theta explains"; measured against the pack's own cos_cache (262144 x 64), theta 5e6
+// reproduces row 1 to max|d| 0.000000 while 10000 is off by 0.088. This pins the lift and the never-override rule.
+void test_rope_parameters_theta(const std::string& root) {
+    const fs::path dir = fs::path(root) / "ropeparams";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen3_vl","text_config":{"hidden_size":64,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"intermediate_size":128,)"
+             R"("vocab_size":32,"rope_parameters":{"mrope_interleaved":true,"mrope_section":[24,20,20],)"
+             R"("rope_theta":5000000,"rope_type":"default"}}})");
+    std::string src;
+    const nlohmann::json g = pi::load_geometry_exported(dir.string(), &src);
+    const pi::Dims d = pi::read_dims_exported(g, src);
+    check(d.rope_theta == 5000000.0f,
+          "rope_parameters: rope_theta comes from the nested block (" + std::to_string(d.rope_theta) + ")");
+    check(src.find("rope_parameters") != std::string::npos, "rope_parameters: and the source says so (" + src + ")");
+    // a top-level rope_theta still wins
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen3_vl","rope_theta":10000.0,"text_config":{"hidden_size":64,)"
+             R"("num_hidden_layers":1,"num_attention_heads":2,"head_dim":32,"intermediate_size":128,"vocab_size":32,)"
+             R"("rope_parameters":{"rope_theta":5000000}}})");
+    const nlohmann::json g2 = pi::load_geometry_exported(dir.string(), &src);
+    check(pi::read_dims_exported(g2, src).rope_theta == 10000.0f,
+          "rope_parameters: a top-level rope_theta is NOT overridden by the nested one");
+    std::printf("  rope_parameters: theta %.0f nested, top-level still wins\n", (double)d.rope_theta);
+    fs::remove_all(dir);
+}
+
+void test_three_input_matmulnbits(const std::string& root) {
+    const fs::path dir = fs::path(root) / "mm3";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const int64_t H = 64, N = 32, block = 32, groups = H / block;
+    std::vector<uint8_t> qw(size_t(N) * size_t(groups) * size_t(block / 2), 0x21);   // codes 1/2 alternating
+    std::vector<float> sc(size_t(N) * size_t(groups), 0.01f);
+    std::string data(reinterpret_cast<const char*>(qw.data()), qw.size());
+    data.append(reinterpret_cast<const char*>(sc.data()), sc.size() * sizeof(float));
+    put_file((dir / "model.onnx.data").string(), data);
+    const auto q4 = pb::tensor("model.layers.0.attn.q_proj.MatMul.weight_Q4", {N, groups, block / 2},
+                               "model.onnx.data", 0, qw.size(), 2);
+    const auto scl = pb::tensor("model.layers.0.attn.q_proj.MatMul.weight_scales", {N, groups},
+                                "model.onnx.data", qw.size(), sc.size() * sizeof(float), 1);
+    const auto node = pb::matmulnbits("q", {"x", "model.layers.0.attn.q_proj.MatMul.weight_Q4",
+                                            "model.layers.0.attn.q_proj.MatMul.weight_scales"}, H, N, 4, block);
+    put_file((dir / "model.onnx").string(), pb::model({q4, scl}, {node}));
+    int mm = -1, noz = -1, K = 0, Nn = 0, blk = 0;
+    pi::parse_onnx_matmul_census((dir / "model.onnx").string(), &mm, &noz, &K, &Nn, &blk);
+    check(mm == 1, "3-input MatMulNBits: the walker records the node (" + std::to_string(mm) + " of 1)");
+    check(noz == 1, "3-input MatMulNBits: it is counted as carrying no qzeros, so the implicit zero point applies");
+    check(K == H && Nn == N && blk == block,
+          "3-input MatMulNBits: K/N/block come from the node's own attributes (" + std::to_string(K) + "/" +
+              std::to_string(Nn) + "/" + std::to_string(blk) + ")");
+    std::printf("  3-input MatMulNBits: %d matmul(s), %d without qzeros, K %d N %d block %d\n", mm, noz, K, Nn, blk);
+    fs::remove_all(dir);
+}
+
+// engine#1841: genre A (projections are graph initializers, no .fconst) decodes each layer projection by name, and a
+// lookup that missed used to return quietly -- the container then reported itself complete with no layer projections
+// (the #1790 CHANGES: `...o_projMatMul.weight_Q4`, a missing dot). The dot is normalised on main; this pins the other
+// half: a projection the decoder cannot read is a NAMED refusal, not a skip. plan() refuses a projection whose codes are
+// absent, but it counts one present on `<proj>.MatMul.weight_Q4` (or any `.MatMulNBits.` tensor) alone, while the
+// decoder needs the scales beside it -- so a pack missing only the scales passed plan() and lost the projection without a
+// word. One crafted 1-layer pack in Qwen3-VL-4B's three-input spelling, imported whole (every projection lands, nothing
+// refused), then with down_proj's scales misnamed (refused by name; nothing written without --allow-incomplete).
+void test_genre_a_projection_gap(const std::string& root) {
+    const fs::path dir = fs::path(root) / "genre-a-gap";
+    const int64_t H = 64, I = 64, V = 64, hd = 32, heads = 2, kv = 1, block = 32, groups = H / block;
+    auto build = [&](bool spell_down_wrong) {
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        std::string data;
+        std::vector<std::string> inits, nodes;
+        auto append = [&](const void* q, size_t n) {
+            data.append(static_cast<const char*>(q), n);
+            return uint64_t(data.size() - n);
+        };
+        std::vector<float> embed(size_t(V * H));
+        for (size_t i = 0; i < embed.size(); ++i) embed[i] = 0.01f * float(i % 89) - 0.4f;
+        const uint64_t eo = append(embed.data(), embed.size() * 4);
+        inits.push_back(pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", eo, uint64_t(V * H) * 4));
+        std::vector<uint16_t> ones(size_t(H), 0x3C00);   // f16 1.0
+        for (const char* nm : {"model.layers.0.input_layernorm.weight", "model.layers.0.post_attention_layernorm.weight",
+                               "model.norm.weight"}) {
+            const uint64_t o = append(ones.data(), ones.size() * 2);
+            inits.push_back(pb::tensor(nm, {H}, "model.onnx.data", o, uint64_t(H) * 2, 10));
+        }
+        auto proj = [&](const std::string& pre, int64_t N, int64_t K, bool wrong) {
+            const int64_t g = K / block;
+            std::vector<uint8_t> qw(size_t(N * g * (block / 2)));
+            for (size_t i = 0; i < qw.size(); ++i) qw[i] = uint8_t((i * 7 + 3) & 0xFF);
+            std::vector<float> sc(size_t(N * g));
+            for (size_t i = 0; i < sc.size(); ++i) sc[i] = 0.01f * float(1 + i % 5);
+            // `wrong`: the codes keep their name and the scales sibling does not -- plan() counts a projection present
+            // on its weight_Q4 alone, so only the decoder can see that the pair is incomplete.
+            const std::string wq = pre + ".MatMul.weight_Q4";
+            const std::string ws = pre + (wrong ? ".MatMul.weight_scale" : ".MatMul.weight_scales");
+            const uint64_t qo = append(qw.data(), qw.size()), so = append(sc.data(), sc.size() * 4);
+            inits.push_back(pb::tensor(wq, {N, g, block / 2}, "model.onnx.data", qo, qw.size(), 2));
+            inits.push_back(pb::tensor(ws, {N, g}, "model.onnx.data", so, sc.size() * 4, 1));
+            nodes.push_back(pb::matmulnbits(pre, {"x", wq, ws}, K, N, 4, block));
+        };
+        const std::string a = "model.layers.0.attn.", m = "model.layers.0.mlp.";
+        proj(a + "q_proj", heads * hd, H, false);
+        proj(a + "k_proj", kv * hd, H, false);
+        proj(a + "v_proj", kv * hd, H, false);
+        proj(a + "o_proj", H, heads * hd, false);
+        proj(m + "gate_proj", I, H, false);
+        proj(m + "up_proj", I, H, false);
+        proj(m + "down_proj", H, I, spell_down_wrong);
+        proj("lm_head", V, H, false);
+        put_file((dir / "model.onnx.data").string(), data);
+        put_file((dir / "model.onnx").string(), pb::model(inits, nodes));
+        put_file((dir / "config.json").string(),
+                 R"({"model_type":"qwen2","hidden_size":64,"intermediate_size":64,"num_hidden_layers":1,)"
+                 R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"vocab_size":64,)"
+                 R"("rope_theta":10000.0,"tie_word_embeddings":false,"rms_norm_eps":1e-06})");
+        (void)groups;
+    };
+    const std::string out = (fs::temp_directory_path() / ("oga_pack_genre_a." + std::to_string(::getpid()))).string();
+    auto names_down = [](const pi::Report& r) {
+        for (const auto& s : r.refused)
+            if (s.find("mlp.down_proj.weight") != std::string::npos && s.find("no quantised projection the decoder can pair") != std::string::npos)
+                return true;
+        return false;
+    };
+
+    build(false);
+    fs::remove_all(out);
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    pi::Report whole;
+    try {
+        whole = pi::import_pack(dir.string(), out, allow);
+    } catch (const std::exception& e) {
+        check(false, std::string("genre-A gap: the whole crafted pack imports (threw: ") + e.what() + ")");
+        fs::remove_all(dir);
+        return;
+    }
+    for (const auto& s : whole.refused) std::fprintf(stderr, "  genre-A whole: refused %s\n", s.c_str());
+    bool proj_refused = false;
+    for (const auto& s : whole.refused) proj_refused |= s.find("no quantised projection the decoder can pair") != std::string::npos;
+    check(!proj_refused, "genre-A gap: with every projection present, none is refused as missing");
+    check(whole.tensors >= 7, "genre-A gap: the seven layer projections land in the container (" +
+                                  std::to_string(whole.tensors) + " tensors)");
+
+    build(true);
+    fs::remove_all(out);
+    const pi::Report gap = pi::import_pack(dir.string(), out, pi::Options{});
+    for (const auto& s : gap.refused) std::fprintf(stderr, "  genre-A gap: refused %s\n", s.c_str());
+    check(names_down(gap), "genre-A gap: a projection plan() accepted but the decoder cannot pair is refused BY NAME (down_proj), not skipped");
+    check(!fs::exists(out + "/model.q4nx"), "genre-A gap: and without --allow-incomplete no container is written");
+    const pi::Report gap2 = pi::import_pack(dir.string(), out, allow);
+    check(names_down(gap2) && fs::exists(out + "/model.q4nx"),
+          "genre-A gap: --allow-incomplete writes the rest and still lists down_proj");
+    std::printf("genre-A gap: whole pack %zu refused / %d tensors; down_proj scales misnamed -> %zu refused, named %s\n",
+                whole.refused.size(), whole.tensors, gap.refused.size(), names_down(gap) ? "yes" : "NO");
+    fs::remove_all(out);
+    fs::remove_all(dir);
+}
+
 void test_embedding_component(const std::string& root) {
     const fs::path dir = fs::path(root) / "embedcomp";
     fs::remove_all(dir);
@@ -2318,7 +2970,179 @@ void test_fconst19_rule_table() {
     check(pi::select_fconst19_rule_from(dup, 2, 1536, 12, 28, &why) != nullptr,
           "fconst19 rule: a geometry measured twice with the same shape is fine -- that is the h1536 pair, which is "
           "byte-identical over all 28 blocks");
+    // 4. engine#1774 / TNPU-ALL W2's third gate clause, made able to fail (engine#1854). The expected rows live HERE, as
+    //    literals copied from the measured table, not read back from it: an arm that selects each table row by its own key
+    //    and compares it with itself passes a wrong digit (h4096 prefix 12608 -> 12609) and a dropped row (10 >= 8), the
+    //    two failures this arm exists for. Adding or re-measuring a row is therefore a deliberate edit in BOTH places.
+    {
+        const pi::Fconst19Rule want[] = {
+            {896, 14, 24, 1856, 16, 2, 34816},       // Qwen2.5-0.5B-Instruct
+            {2048, 16, 28, 8512, 3, 1, 1183744},     // Qwen3-1.7B
+            {576, 9, 30, 3776, 4, 1, 76800},         // SmolLM2-135M-Instruct
+            {1536, 12, 28, 3136, 7, 1, 226304},      // Qwen2.5-Coder-1.5B-Instruct (and Qwen-2.5_1.5B_Instruct)
+            {2560, 32, 36, 9536, 5, 1, 1462272},     // Qwen3-4B
+            {2048, 32, 16, 8512, 5, 1, 591872},      // Llama-3.2-1B-Instruct
+            {3072, 32, 32, 10560, 2, 1, 5222400},    // Phi-3.5-mini-instruct (and Phi-3-mini-128k)
+            {3584, 28, 28, 7232, 8, 1, 1009664},     // the Qwen2.5-7B family, measured on two models
+            {2048, 16, 36, 4160, 9, 1, 295936},      // Qwen2.5_3B_Instruct
+            {4096, 32, 32, 12608, 5, 1, 2297856},    // Mistral-7B-Instruct-v0.2
+            {3072, 24, 28, 10560, 4, 1, 1740800},    // Llama-3.2-3B (and -Instruct)
+        };
+        const int want_n = (int)(sizeof(want) / sizeof(want[0]));
+        int rules_n = 0;
+        const pi::Fconst19Rule* rules = pi::fconst19_rules(&rules_n);
+        check(rules && rules_n == want_n,
+              "fconst19 rule: the table has exactly the " + std::to_string(want_n) + " measured rows (" +
+                  std::to_string(rules_n) + "); a dropped row is a silent un-measure of a whole class, an added one "
+                  "must be added here too");
+        for (const pi::Fconst19Rule& row : want) {
+            std::string w;
+            const pi::Fconst19Rule* got = pi::select_fconst19_rule(row.hidden, row.heads, row.layers, &w);
+            check(got && got->prefix == row.prefix && got->n_tiles == row.n_tiles && got->rot == row.rot &&
+                      got->tile == row.tile,
+                  "fconst19 rule: " + std::to_string(row.hidden) + "/" + std::to_string(row.heads) + "h/" +
+                      std::to_string(row.layers) + "L selects its measured numbers (" +
+                      std::to_string(got ? got->prefix : -1) + ", " + std::to_string(got ? got->n_tiles : -1) + ", " +
+                      std::to_string(got ? got->rot : -1) + ", " + std::to_string(got ? got->tile : -1) + ")");
+        }
+        // what the old self-select loop really tested: no two rows of the real table share a key with different
+        // shapes (select_rule_in refuses that as ambiguous, so every row must still select)
+        for (int i = 0; rules && i < rules_n; i++) {
+            std::string w;
+            check(pi::select_fconst19_rule(rules[i].hidden, rules[i].heads, rules[i].layers, &w) != nullptr,
+                  "fconst19 rule: no two rows share the key " + std::to_string(rules[i].hidden) + "/" +
+                      std::to_string(rules[i].heads) + "h/" + std::to_string(rules[i].layers) + "L with different shapes");
+        }
+    }
+
+    // 5. the case this row is: the SECOND geometry at hidden 2048 / 16 heads, told apart only by its layer count. If a
+    //    later edit relaxed the key to (hidden, heads) or merged rows, these two must still separate.
+    why.clear();
+    const pi::Fconst19Rule* q17 = pi::select_fconst19_rule(2048, 16, 28, &why);
+    const pi::Fconst19Rule* q3 = pi::select_fconst19_rule(2048, 16, 36, &why);
+    check(q17 && q17->prefix == 8512 && q17->n_tiles == 3 && q17->tile == 1183744,
+          "fconst19 rule: 2048/16h/28L is still Qwen3-1.7B's row (8,512 / 3 tiles of 1,183,744)");
+    check(q3 && q3->prefix == 4160 && q3->n_tiles == 9 && q3->rot == 1 && q3->tile == 295936,
+          "fconst19 rule: 2048/16h/36L is Qwen2.5_3B's row (4,160 / 9 tiles of 295,936) -- the prefix is NOT the 8,512 "
+          "the Qwen3 formula predicts, which is why the row is measured");
+    why.clear();
+    check(!pi::select_fconst19_rule(2048, 16, 32, &why) && why.find("has not been measured") != std::string::npos,
+          "fconst19 rule: 2048/16h/32L is still unmeasured and refuses by name (" + why + ")");
+
     std::printf("fconst19 rule: measured row, unmeasured refusal, and the ambiguity guard all behave\n");
+}
+
+// engine#1831: the header-derived layout keeps EVERY in-block header the anchors support. #1819's version kept only the most
+// common residue and always wrote a 2-header block, so a Qwen3 4-header block (three equally frequent inner headers) was read
+// as 2-header with k_norm's header standing in for the post-attention one -- the engine#1003 misread, reintroduced.
+void test_fconst_block_headers() {
+    const int64_t stride = 1000;
+    auto blocks = [&](std::initializer_list<int64_t> inner, int nblocks, std::initializer_list<int64_t> noise) {
+        std::vector<int64_t> pos;
+        for (int b = 0; b < nblocks; ++b) {
+            pos.push_back(int64_t(b) * stride);                          // the block's own (first) header
+            for (const int64_t r : inner) pos.push_back(int64_t(b) * stride + r);
+        }
+        for (const int64_t q : noise) pos.push_back(q);                  // eps-SHAPED payload bytes: once or twice
+        std::sort(pos.begin(), pos.end());
+        return pos;
+    };
+    // 2-header (Qwen2.5/Llama): one inner header, 8 blocks, two coincidences elsewhere in the payload
+    {
+        const auto inner = pi::fconst_block_headers(blocks({400}, 8, {1234, 5678}), stride, 3);
+        check(inner.size() == 1 && inner[0] == 400, "block headers: a 2-header block yields its one inner header");
+        pi::FconstGeom g;
+        g.stride = stride;
+        check(pi::fconst_set_block_headers(g, inner) && g.period == 2 && g.h1 == 400 && g.hdr.size() == 1 &&
+                  g.post_attn_hdr() == 400,
+              "block headers: and is set as a 2-header block whose post-attention header is h1");
+    }
+    // 4-header (Qwen3): three inner headers repeating equally -- ALL must be kept, in order, so post_attn is the LAST one
+    {
+        const auto inner = pi::fconst_block_headers(blocks({300, 320, 340}, 8, {777}), stride, 3);
+        check(inner.size() == 3 && inner[0] == 300 && inner[1] == 320 && inner[2] == 340,
+              "block headers: a 4-header block yields all three inner headers, sorted (not just the most common one)");
+        pi::FconstGeom g;
+        g.stride = stride;
+        check(pi::fconst_set_block_headers(g, inner) && g.period == 4 && g.h1 == 300 && g.hdr.size() == 3 &&
+                  g.post_attn_hdr() == 340,
+              "block headers: and is set as a 4-header block whose post-attention header is the last one, not k_norm's");
+    }
+    // coincidences alone are not a header, and a count that is neither 1 nor 3 sets nothing
+    {
+        check(pi::fconst_block_headers(blocks({}, 8, {111, 222, 222}), stride, 3).empty(),
+              "block headers: payload coincidences that recur fewer than min_repeat times are not headers");
+        pi::FconstGeom g;
+        g.stride = stride;
+        g.h1 = 7;
+        check(!pi::fconst_set_block_headers(g, {100, 200}) && g.hdr.empty() && g.h1 == 7 && g.period == 0,
+              "block headers: two inner headers is not a known layout, and nothing is changed");
+        check(pi::fconst_block_headers({0, 1000, 2000}, 0, 1).empty(), "block headers: a zero stride yields nothing");
+    }
+    std::printf("  fconst block headers: 2-header and 4-header layouts kept whole; unknown counts refused\n");
+}
+
+// engine#1801's reviewer asked for the test that would catch the case the fix itself found once: the canonical .fconst copy is a
+// cache whose size is the pack's own .fconst, and on this box /tmp is tmpfs, so where it lands is a RAM decision. The bug was a
+// cache directory that was never created -- every pack then fell through to /tmp and nothing noticed.
+void test_fconst_scratch_order() {
+    const auto first_with = [](const char* scratch, const char* xdg, const char* home) {
+        if (scratch) setenv("ONEBIT_FCONST_SCRATCH", scratch, 1); else unsetenv("ONEBIT_FCONST_SCRATCH");
+        if (xdg) setenv("XDG_CACHE_HOME", xdg, 1); else unsetenv("XDG_CACHE_HOME");
+        if (home) setenv("HOME", home, 1); else unsetenv("HOME");
+        const auto dirs = pi::fconst_scratch_dirs();
+        return dirs.empty() ? std::string() : dirs.front();
+    };
+    // 1. an explicit override wins, because a lane's own scratch dir is the only place it controls
+    check(first_with("/tmp/scratch-override", nullptr, "/home/x") == "/tmp/scratch-override",
+          "fconst scratch: ONEBIT_FCONST_SCRATCH is chosen first");
+    // 2. otherwise the on-disk cache directory, never the temp directory -- the whole point of engine#1801
+    check(first_with(nullptr, "/xdg-cache", "/home/x") == "/xdg-cache/1bit/fconst19",
+          "fconst scratch: XDG_CACHE_HOME/1bit/fconst19 is chosen when no override is set");
+    check(first_with(nullptr, nullptr, "/home/x") == "/home/x/.cache/1bit/fconst19",
+          "fconst scratch: HOME/.cache/1bit/fconst19 is the default -- disk, not tmpfs");
+    // 3. the temp directory must never come first: on this box that is RAM equal to the pack's .fconst
+    const auto dirs = pi::fconst_scratch_dirs();
+    check(!dirs.empty() && dirs.front().find("/tmp") != 0,
+          "fconst scratch: the first choice is not the temp directory (it was, before #1801)");
+    // 4. the bug the fix shipped once: a cache directory that does not exist must be CREATED, not skipped. Without this the loop
+    //    walked past the new first choice and every pack's 3.6 GB scratch copy landed in tmpfs anyway.
+    const std::string fresh = "/tmp/1bit-scratch-test-" + std::to_string(::getpid()) + "/nested";
+    std::system(("rm -rf /tmp/1bit-scratch-test-" + std::to_string(::getpid())).c_str());
+    check(!std::filesystem::exists(fresh) && pi::fconst_scratch_ready(fresh) && std::filesystem::is_directory(fresh),
+          "fconst scratch: a missing cache directory is created, not skipped (the #1801 first-version bug)");
+    std::system(("rm -rf /tmp/1bit-scratch-test-" + std::to_string(::getpid())).c_str());
+    // 5. and there is always somewhere to fall back to
+    check(dirs.size() >= 2, "fconst scratch: more than one candidate, so a box with no HOME still has a fallback");
+    // 6. engine#1818 review: `$TMPDIR` sits BETWEEN the cache and the literal /tmp. It was dropped by the extraction, and a
+    //    lane that points TMPDIR at disk -- which is what lanes here do, because /tmp is RAM -- then landed its scratch copy
+    //    in tmpfs whenever the cache directory was unusable. That is the outcome #1801 exists to prevent, so it is pinned.
+    {
+        const std::string tdir = "/tmp/1bit-tmpdir-test-" + std::to_string(::getpid());
+        std::system(("mkdir -p " + tdir).c_str());
+        unsetenv("ONEBIT_FCONST_SCRATCH");
+        unsetenv("XDG_CACHE_HOME");
+        unsetenv("HOME");                       // no usable cache: the case the reviewer named
+        setenv("TMPDIR", tdir.c_str(), 1);
+        const auto with_tmpdir = pi::fconst_scratch_dirs();
+        size_t at_tmpdir = with_tmpdir.size(), at_slash_tmp = with_tmpdir.size();
+        for (size_t i = 0; i < with_tmpdir.size(); ++i) {
+            if (with_tmpdir[i] == tdir) at_tmpdir = i;
+            if (with_tmpdir[i] == "/tmp") at_slash_tmp = i;
+        }
+        check(at_tmpdir < with_tmpdir.size(),
+              "fconst scratch: a TMPDIR with no override and no cache is a candidate at all (it was dropped)");
+        check(at_tmpdir < at_slash_tmp,
+              "fconst scratch: and it comes BEFORE the literal /tmp, which is RAM on this box");
+        // control: with TMPDIR unset the resolver returns /tmp, so the literal must still be there and unused twice
+        unsetenv("TMPDIR");
+        const auto no_tmpdir = pi::fconst_scratch_dirs();
+        check(std::count(no_tmpdir.begin(), no_tmpdir.end(), std::string("/tmp")) == 1,
+              "fconst scratch: with TMPDIR unset, /tmp appears exactly once (no duplicate from the resolver)");
+        std::system(("rm -rf " + tdir).c_str());
+        setenv("HOME", "/home/x", 1);           // leave the environment as the arms above expect it
+    }
+    std::printf("fconst scratch: order is override -> disk cache -> temp/cwd, pinned\n");
 }
 
 void test_qwen3_attn_sections() {
@@ -2499,6 +3323,34 @@ void test_kernel_set_refusal() {
           "kernels: a directory with no full_i8 ELF is refused");
     check(!pi::kernel_set_refusal({"full_i8_QKV_K3072_N9216_b8.elf.bak"}, "b8").empty(),
           "kernels: a file that is not an .elf is not a kernel");
+}
+
+// engine#1751 follow-up: the one copier both import paths use. #1751 added a second copier that counted successes and
+// swallowed failures, so an import could "succeed" without tokenizer.json and serve then refused the directory for a
+// missing tokenizer -- the misleading report #1751 was written to remove. A file the pack has and cannot copy is refused
+// BY NAME; a file the pack does not ship is not a failure.
+void test_copy_text_artifacts() {
+    const fs::path base = fs::temp_directory_path() / ("1bit-textcopy-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(base, ec);
+    const fs::path pack = base / "pack", out = base / "out";
+    fs::create_directories(pack);
+    fs::create_directories(out);
+    put_file((pack / "tokenizer.json").string(), "{}");
+    put_file((pack / "tokenizer_config.json").string(), "{}");
+    // (a) the files the pack has are copied, the rest skipped without complaint
+    int copied = -1;
+    std::string why;
+    try { copied = pi::copy_text_artifacts_exported(pack.string(), out.string()); } catch (const std::exception& e) { why = e.what(); }
+    check(why.empty() && copied == 2 && fs::exists(out / "tokenizer.json") && fs::exists(out / "tokenizer_config.json"),
+          "text copy: the two files the pack ships are copied, the six it does not are skipped (" + why + ")");
+    // (b) a copy that FAILS is refused, naming the file -- not counted down to a smaller number nobody reads
+    why.clear();
+    try { (void)pi::copy_text_artifacts_exported(pack.string(), (base / "no-such-dir").string()); } catch (const std::exception& e) { why = e.what(); }
+    check(why.find("tokenizer.json") != std::string::npos,
+          "text copy: a file the pack has that cannot be copied is refused by name (" + why + ")");
+    fs::remove_all(base, ec);
+    std::printf("  text copy: present files copied, absent ones skipped, a failed copy refused by name\n");
 }
 
 void test_text_artifacts(const std::string& root) {
@@ -2948,18 +3800,248 @@ void test_per_layer_container(const std::string& root) {
     std::printf("per-layer: V %lld width %lld, why: %s (tok %zu per %zu norm %zu bytes)\n", (long long) pl.V,
                 (long long) pl.width, why.c_str(), tok_bytes, per_bytes, norm.size() * 4);
     check(pl.ok(), "per-layer: the table and its projection norm are read from the component genai_config.json names");
-    bool same = pl.ok() && pl.table.size() == per.size();
-    for (size_t i = 0; same && i < per.size(); ++i) same = pl.table[i] == per[i];
+    bool same = pl.ok() && pl.V == V && pl.width == width;
+    for (size_t i = 0; same && i < per.size(); ++i) same = pl.at(int64_t(i) / width, int64_t(i) % width) == per[i];
     for (size_t i = 0; same && i < norm.size(); ++i) same = pl.norm[i] == norm[i];
     check(same, "per-layer: the values come back exactly as the component states them");
     // the token table is still this reader's other half: it must NOT be refused because a per-layer table is present
     std::string why2;
     const std::vector<float> t = pi::read_embedding_component(dir.string(), &why2);
     check(t.size() == size_t(V) * 3, "per-layer: the token table still reads beside it (" + std::to_string(t.size()) + ")");
+
+    // #1825 review: the band converter had no arm, and it rounded "up iff the kept lsb is 1" -- half of all values off by
+    // one ulp, including values bf16 holds EXACTLY. per[] here is multiples of 0.25 (exact); the fixture below adds the
+    // three cases that separate the rules: an exact value with an odd kept lsb (1.0078125 = 0x3F81'0000 must stay
+    // 0x3F81), a tie on an even lsb (stays), a tie on an odd lsb (goes up to even), and one just above a tie.
+    {
+        const auto f32_of = [](uint32_t bits) {
+            float f;
+            std::memcpy(&f, &bits, 4);
+            return f;
+        };
+        const fs::path d2 = fs::path(root) / "perlayer-band";
+        fs::remove_all(d2);
+        fs::create_directories(d2 / "embedding");
+        const int64_t V2 = 70, W2 = 5;   // 70 rows: two whole 32-row bands and a 6-row one
+        std::vector<float> per2(size_t(V2) * size_t(W2));
+        for (size_t i = 0; i < per2.size(); ++i) per2[i] = 0.001f * float(int(i * 37 % 211) - 100);   // inexact in bf16
+        per2[0] = f32_of(0x3F810000u);   // exact, odd lsb          -> 0x3F81
+        per2[1] = f32_of(0x3F808000u);   // tie, even lsb           -> 0x3F80
+        per2[2] = f32_of(0x3F818000u);   // tie, odd lsb            -> 0x3F82
+        per2[3] = f32_of(0x3F808001u);   // just above a tie        -> 0x3F81
+        per2[size_t(69) * size_t(W2) + 4] = f32_of(0xBF810000u);   // the last value of the short band, exact and negative
+        std::vector<float> norm2(size_t(W2), 1.0f), tok2(size_t(V2) * 3, 0.5f);
+        std::string data2;
+        data2.append(reinterpret_cast<const char*>(tok2.data()), tok2.size() * 4);
+        data2.append(reinterpret_cast<const char*>(per2.data()), per2.size() * 4);
+        data2.append(reinterpret_cast<const char*>(norm2.data()), norm2.size() * 4);
+        put_file((d2 / "embedding" / "model.onnx.data").string(), data2);
+        put_file((d2 / "embedding" / "model.onnx").string(),
+                 pb::model({pb::tensor("embedding.embed_tokens.weight", {V2, 3}, "model.onnx.data", 0, tok2.size() * 4, 1),
+                            pb::tensor("embedding.embed_tokens_per_layer.weight", {V2, W2}, "model.onnx.data",
+                                       tok2.size() * 4, per2.size() * 4, 1),
+                            pb::tensor("embedding.per_layer_projection_norm.weight", {W2}, "model.onnx.data",
+                                       tok2.size() * 4 + per2.size() * 4, norm2.size() * 4, 1)},
+                           {}));
+        put_file((d2 / "genai_config.json").string(),
+                 R"({"model":{"type":"gemma4","embedding":{"filename":"embedding/model.onnx"},)"
+                 R"("decoder":{"filename":"decoder/model.onnx"}}})");
+        std::string why3;
+        const pi::EmbedPerLayer p2 = pi::read_embedding_per_layer(d2.string(), 3, &why3);
+        check(p2.ok() && p2.V == V2 && p2.width == W2, "per-layer band: the table is located (" + why3 + ")");
+        if (p2.ok()) {
+            // the reference is as_bf16-equivalent: pi::bf16_bits_of is the file's exported round-to-nearest-even
+            std::vector<uint16_t> want(per2.size());
+            for (size_t i = 0; i < per2.size(); ++i) want[i] = pi::bf16_bits_of(per2[i]);
+            check(want[0] == 0x3F81 && want[1] == 0x3F80 && want[2] == 0x3F82 && want[3] == 0x3F81,
+                  "per-layer band: the reference rounds to nearest even on the four separating values");
+            std::vector<uint16_t> got(per2.size(), 0xFFFF);
+            bool bands = true;
+            for (int64_t row = 0; row < V2; row += 32) {
+                const int64_t n = std::min<int64_t>(32, V2 - row);
+                std::string bw;
+                bands = bands && pi::read_per_layer_table_band(
+                                     p2, row, n, reinterpret_cast<uint8_t*>(got.data() + size_t(row) * size_t(W2)), &bw) == n;
+            }
+            check(bands, "per-layer band: 32 + 32 + 6 rows read");
+            size_t differ = 0;
+            for (size_t i = 0; i < got.size(); ++i) differ += got[i] != want[i];
+            check(differ == 0, "per-layer band: every banded value is round-to-nearest-even bf16 (" +
+                                   std::to_string(differ) + " of " + std::to_string(got.size()) + " differ)");
+            check(got[0] == 0x3F81, "per-layer band: an exactly representable value with an odd lsb is not moved");
+            std::string bw;
+            std::vector<uint8_t> scratch(size_t(W2) * 2 * 2);
+            check(pi::read_per_layer_table_band(p2, V2 - 1, 2, scratch.data(), &bw) == -1 &&
+                      pi::read_per_layer_table_band(p2, -1, 1, scratch.data(), &bw) == -1,
+                  "per-layer band: a band past the table, or before it, is refused");
+        }
+        // a table that declares more rows than its data carries is refused when it is LOCATED, not at some later band
+        put_file((d2 / "embedding" / "model.onnx").string(),
+                 pb::model({pb::tensor("embedding.embed_tokens_per_layer.weight", {V2 + 1000, W2}, "model.onnx.data",
+                                       tok2.size() * 4, per2.size() * 4, 1)},
+                           {}));
+        std::string why4;
+        const pi::EmbedPerLayer p3 = pi::read_embedding_per_layer(d2.string(), 3, &why4);
+        check(!p3.ok() && why4.find("more bytes than its data carries") != std::string::npos,
+              "per-layer band: a table longer than its data is refused by the reader (" + why4 + ")");
+        fs::remove_all(d2);
+    }
     fs::remove_all(dir);
 }
 
 
+
+// engine#1725, #1825 review: the per-layer block THROUGH import_pack(). The reader arms above call the helpers; nothing
+// ran the writer, so the streamed table, the offsets of every tensor after it, the per-layer split of the context
+// projection and the two config keys that switch the block on were all unpinned. The fixture is the tied block-32 one
+// (it reaches the embedding writer under allow-incomplete) plus an embedding component shaped like gemma-4's: a table
+// NL x P wide, a norm P wide (shared by the layers -- not `width` wide), and the context projection quantised at
+// block 32, stored at a NON-ZERO offset of the external data.
+void test_per_layer_import(const std::string& root) {
+    const fs::path dir = fs::path(root) / "perlayer-import";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    fs::create_directories(dir / "embedding");
+    const int H = 128, L = 8, V = 64;
+    const int64_t P = 4, NL = 2, W = P * NL;
+    {
+        const int64_t stride = 1 << 20, second = 262144;
+        std::string fc(size_t(int64_t(L) * stride + 64 + size_t(H) * 2), '\0');
+        auto put_eps = [&](int64_t off) {
+            fc[size_t(off)] = char(0x86);
+            fc[size_t(off) + 1] = char(0x35);
+        };
+        for (int l = 0; l < L; ++l) {
+            put_eps(int64_t(l) * stride);
+            put_eps(int64_t(l) * stride + second);
+        }
+        put_eps(int64_t(L) * stride);
+        for (int i = 0; i < H; ++i) {
+            const uint16_t bits = pi::bf16_bits_of(float(i + 1));
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i)] = char(bits & 0xFF);
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i) + 1] = char(bits >> 8);
+        }
+        put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+    }
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06})");
+    {
+        std::string data(size_t(V) * size_t(H) * 2, '\0');
+        for (int r = 0; r < V; ++r)
+            for (int c = 0; c < H; ++c) {
+                const uint16_t bits = pi::bf16_bits_of(0.05f * float((r * 7 + c * 13) % 97) - 2.4f);
+                data[(size_t(r) * H + c) * 2] = char(bits & 0xFF);
+                data[(size_t(r) * H + c) * 2 + 1] = char(bits >> 8);
+            }
+        put_file((dir / "model.onnx.data").string(), data);
+    }
+    put_file((dir / "cache" / "lm_head_meta.json").string(),
+             R"({"op_list":[{"type":"MladfMatMul","name":"lm_head.MatMulNBits",)"
+             R"("attrs":{"N":{"value":[64]},"K":{"value":[128]},"block_size":{"value":[32]},"bits":{"value":[4]}}}],)"
+             R"("tensor_map":{}})");
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", 0,
+                                   uint64_t(V) * uint64_t(H) * 2, 10),
+                        pb::placeholder("lm_head.weight.MatMulNBits.qweight"),
+                        pb::placeholder("lm_head.weight.MatMulNBits.scales"),
+                        pb::placeholder("lm_head.weight.MatMulNBits.zeros")},
+                       {}));
+    // the embedding component: table [V][W] f32, norm [P] f32, projection [W][H] int4 at block 32 + f32 scales
+    std::vector<float> per(size_t(V) * size_t(W), 0.0f), norm(size_t(P), 0.0f), scales(size_t(W) * size_t(H / 32), 0.5f);
+    for (size_t i = 0; i < per.size(); ++i) per[i] = 0.003f * float(int(i * 53 % 409) - 200);
+    {
+        uint32_t odd = 0x3F810000u;   // exact in bf16 with an odd kept lsb: must come back as 0x3F81
+        std::memcpy(&per[0], &odd, 4);
+    }
+    for (size_t i = 0; i < norm.size(); ++i) norm[i] = 1.0f + 0.25f * float(i);
+    const std::string qw(size_t(W) * size_t(H) / 2, char(0xBB));   // every code 11 -> (11 - 8) x 0.5 = 1.5
+    std::string data;
+    data.append(reinterpret_cast<const char*>(per.data()), per.size() * 4);
+    const uint64_t norm_off = data.size();
+    data.append(reinterpret_cast<const char*>(norm.data()), norm.size() * 4);
+    const uint64_t qw_off = data.size();
+    data += qw;
+    const uint64_t sc_off = data.size();
+    data.append(reinterpret_cast<const char*>(scales.data()), scales.size() * 4);
+    put_file((dir / "embedding" / "model.onnx.data").string(), data);
+    put_file((dir / "embedding" / "model.onnx").string(),
+             pb::model({pb::tensor("embedding.embed_tokens_per_layer.weight", {V, W}, "model.onnx.data", 0, per.size() * 4, 1),
+                        pb::tensor("embedding.per_layer_projection_norm.weight", {P}, "model.onnx.data", norm_off,
+                                   norm.size() * 4, 1),
+                        pb::tensor("embedding.per_layer_model_projection.weight_t_Q4", {W, int64_t(H / 32), 16},
+                                   "model.onnx.data", qw_off, qw.size(), 2),
+                        pb::tensor("embedding.per_layer_model_projection.weight_t_scales", {W * int64_t(H / 32)},
+                                   "model.onnx.data", sc_off, scales.size() * 4, 1)},
+                       {}));
+    put_file((dir / "genai_config.json").string(), R"({"model":{"embedding":{"filename":"embedding/model.onnx"}}})");
+
+    const std::string out =
+        (fs::temp_directory_path() / ("oga_pack_import_perlayer." + std::to_string(::getpid()))).string();
+    fs::remove_all(out);
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    std::string why;
+    pi::Report r;
+    try {
+        r = pi::import_pack(dir.string(), out, allow);
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    check(why.empty(), "per-layer import: the pack imports (" + why.substr(0, 200) + ")");
+    check(r.per_layer_P == P && r.per_layer_V == V, "per-layer import: the report carries P " + std::to_string(r.per_layer_P) +
+                                                        " and V " + std::to_string(r.per_layer_V));
+    if (fs::exists(out + "/model.q4nx")) {
+        const json tbl = container_table(out + "/model.q4nx");
+        const std::vector<uint8_t> blob = container_payload(out + "/model.q4nx");
+        const auto u16 = [&](const std::string& name, size_t i) {
+            const auto offs = tbl[name]["data_offsets"].get<std::vector<uint64_t>>();
+            return uint16_t(uint16_t(blob[size_t(offs[0]) + 2 * i]) | uint16_t(uint16_t(blob[size_t(offs[0]) + 2 * i + 1]) << 8));
+        };
+        const bool have = tbl.contains("model.per_layer_token_embd.weight") && tbl.contains("model.per_layer_proj_norm.weight") &&
+                          tbl.contains("model.per_layer_model_proj.weight_layer0") &&
+                          tbl.contains("model.per_layer_model_proj.weight_layer1") &&
+                          !tbl.contains("model.per_layer_model_proj.weight_layer2");
+        check(have, "per-layer import: the container carries the table, the norm and one projection per layer (2)");
+        if (have) {
+            const auto shape = tbl["model.per_layer_token_embd.weight"]["shape"].get<std::vector<int64_t>>();
+            const auto offs = tbl["model.per_layer_token_embd.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+            check(shape == std::vector<int64_t>({V, W}) && offs[1] - offs[0] == uint64_t(V) * uint64_t(W) * 2 &&
+                      tbl["model.per_layer_token_embd.weight"]["dtype"] == "BF16",
+                  "per-layer import: the table is declared BF16 [V, NL*P] with exactly that many bytes");
+            size_t differ = 0;
+            for (size_t i = 0; i < per.size(); ++i) differ += u16("model.per_layer_token_embd.weight", i) != pi::bf16_bits_of(per[i]);
+            check(differ == 0, "per-layer import: every value of the STREAMED table is round-to-nearest-even bf16 (" +
+                                   std::to_string(differ) + " of " + std::to_string(per.size()) + " differ)");
+            check(u16("model.per_layer_token_embd.weight", 0) == 0x3F81,
+                  "per-layer import: an exactly representable value with an odd lsb is not moved");
+            // the tensors AFTER the streamed one: their offsets are only right if the stream wrote what the header says
+            bool norm_ok = tbl["model.per_layer_proj_norm.weight"]["shape"].get<std::vector<int64_t>>() == std::vector<int64_t>({P});
+            for (size_t i = 0; norm_ok && i < norm.size(); ++i)
+                norm_ok = u16("model.per_layer_proj_norm.weight", i) == pi::bf16_bits_of(norm[i]);
+            check(norm_ok, "per-layer import: the P-wide norm follows the streamed table intact (shared by the layers)");
+            bool proj_ok = tbl["model.per_layer_model_proj.weight_layer1"]["shape"].get<std::vector<int64_t>>() ==
+                           std::vector<int64_t>({P, int64_t(H)});
+            for (size_t i = 0; proj_ok && i < size_t(P) * size_t(H); ++i)
+                proj_ok = u16("model.per_layer_model_proj.weight_layer0", i) == pi::bf16_bits_of(1.5f) &&
+                          u16("model.per_layer_model_proj.weight_layer1", i) == pi::bf16_bits_of(1.5f);
+            check(proj_ok, "per-layer import: the context projection is read at ITS offset of the external data and split "
+                           "per layer ((11 - 8) x 0.5 = 1.5 everywhere)");
+        }
+        std::ifstream cf(out + "/config.json");
+        check(cf.good(), "per-layer import: the container carries a config.json");
+        if (cf.good()) {
+            const json cfg = json::parse(cf);
+            check(cfg.value("hidden_size_per_layer_input", int64_t(0)) == P && cfg.value("vocab_size_per_layer_input", int64_t(0)) == V,
+                  "per-layer import: config.json switches the block on (hidden_size_per_layer_input 4, vocab 64)");
+        }
+    } else {
+        check(false, "per-layer import: no container was written");
+    }
+    fs::remove_all(out);
+    fs::remove_all(dir);
+}
 
 // engine#1503: a 1.9 fconst whose blocks are NOT uniform (the mobius line). `fconst19_detect` requires one stride for the
 // whole file, so it fails -- and the failure used to be indistinguishable from "not a 1.9 fconst at all". The refusal now
@@ -3005,7 +4087,125 @@ void test_fconst_variable_stride(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// engine#1740 (W1a): the tail-head placement arithmetic, pinned without a pack, a device or a fixture. The rows, the
+// tile size and the envelope are the hidden-896 pack's, so the numbers here are the real ones: 1,856 B envelope,
+// 2,374 tiles of 122,880 B, tail 1,856 + 2,374 x 122,880 = 291,653,952 B.
+void test_tail_head_placement() {
+    // The real hidden-896 geometry: group_bytes(896, 64) = 8 x 68 x 64 = 34,816 B per head tile, V/64 = 2,374 tiles,
+    // 1,856 B envelope, so the tail is 1,856 + 2,374 x 34,816 = 82,655,040 B -- which is the 0.5B pack's measured tail
+    // span (its tile 0 sits at 209,000,768 B in a 291,653,952 B file).
+    const int64_t env = 1856, rows = 2374, tile = 34816;
+    const int64_t head = rows * tile;
+    const int64_t exact_bytes = env + head;              // the file ends with the head
+    // (a) the head ends the file: exactly one candidate, no slack
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes, 0, env, rows, tile, 0);
+        check(p.why.empty() && p.exact, "tail placement: a tail that ends with the head is exact");
+        check(p.first == env && p.last == env, "tail placement: and the only candidate is the envelope's end");
+    }
+    // (b) n whole zero tiles after the head: the candidate walks back by exactly n tiles, never past the envelope
+    for (int64_t n : {1, 3, 9}) {
+        const int64_t bytes = exact_bytes + n * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, n * tile);
+        check(p.why.empty() && !p.exact, "tail placement: trailing padding is not the exact case");
+        check(p.last == env,
+              "tail placement: " + std::to_string(n) + " zero tile(s) at EOF still land the head at the envelope's end");
+        check(p.first == env, "tail placement: and the search never walks to before the envelope");
+    }
+    // (c) a clean zero run of ANY length puts the head at the envelope's end -- the padding's size is not a displacement
+    {
+        const int64_t bytes = exact_bytes + 20 * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, 20 * tile);
+        check(p.why.empty() && p.first == env && p.last == env,
+              "tail placement: trailing padding of 20 tiles still ends the head at the envelope's end");
+    }
+    // (c2) but when the file ends in NON-zero bytes after the head, the zero run is short and the candidates span the
+    // slack -- this is the shape the caller's correlation has to decide (the hidden-1536 case)
+    {
+        const int64_t bytes = exact_bytes + 20 * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, 3 * tile);
+        check(p.why.empty() && p.first > env && p.last > p.first,
+              "tail placement: a short zero run before non-zero junk leaves a span of candidates, not one guess");
+    }
+    // (d) refinements: a tail shorter than envelope + head is refused by name, with both numbers in it
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(env + head - 1, 0, env, rows, tile, 0);
+        check(!p.why.empty(), "tail placement: a short tail is refused, not read");
+        check(p.why.find(std::to_string(env + head)) != std::string::npos,
+              "tail placement: and the refusal carries the length it wanted (" + p.why + ")");
+    }
+    // (e) one byte short is refused for the length, and one byte more is a candidate rather than a refusal: the
+    // boundary is exact, which is what keeps a part-tile payload from being rounded up into a head
+    {
+        const pi::TailHeadPlacement short_by_one = pi::plan_tail_head(env + head - 1, 0, env, rows, tile, 0);
+        const pi::TailHeadPlacement one_more = pi::plan_tail_head(env + head + 1, 0, env, rows, tile, 0);
+        check(!short_by_one.why.empty() && one_more.why.empty(),
+              "tail placement: the length boundary is exact (short refused, one byte more is a candidate)");
+        check(one_more.last == env, "tail placement: and the extra byte does not move the head");
+    }
+    // (f) a tail_off that moves the window is honoured: the same arithmetic one layer block later
+    {
+        const int64_t tail_off = 5 * 8708288;   // the 0.5B pack's measured layer stride
+        const pi::TailHeadPlacement p = pi::plan_tail_head(tail_off + exact_bytes, tail_off, env, rows, tile, 0);
+        check(p.why.empty() && p.last == tail_off + env, "tail placement: the window is relative to tail_off");
+    }
+    // and the SEARCH itself (engine#1740 review): the candidate loop, best/runner-up tracking, the kTieCorr cut, the
+    // ambiguity case and the untied refusal. Synthetic head through encode_tile, so no pack and no device.
+    {
+        std::string why;
+        // called first, then checked: building the message inside the check() call read `why` before the call filled it,
+        // because argument evaluation order is unspecified -- the first run of this arm failed with an empty reason.
+        const bool ok = pi::tail_head_selftest(&why);
+        check(ok, "tail search: a synthetic tied head locates, survives a one-tile displacement, refuses "
+                  "untied-with-padding and takes an untied exact tail unverified"
+                  + (why.empty() ? std::string() : " (" + why + ")"));
+    }
+}
+
+
+/* engine#1889: a pack that declares per-head q/k gains and whose gains the importer did not locate must be REFUSED,
+ * not imported without them. Hunyuan-7B is the measured case: `use_qk_norm: true`, 32x128 + 8x128 gains in its block,
+ * a 96-tile attention payload against the 160 the same geometry gets elsewhere -- and the import reported
+ * `attention 5120/5120 tiles` byte-exact while the served model answered `Trease/ft//////////` three of three.
+ * The three cases are separate on purpose: declared-and-not-found is the refusal; found-and-not-declared is the Qwen3
+ * shape (the sections are there, the key is not) and must NOT be refused. */
+void test_qk_norm_refusal() {
+    const std::string a = pi::qk_norm_refusal(true, false);
+    check(!a.empty(), "qk norm: declared but not found is a refusal (importing without the gains answers gibberish)");
+    check(a.find("use_qk_norm") != std::string::npos, "qk norm: the refusal names the key the pack declared");
+    check(a.find("not where the block layout says") != std::string::npos,
+          "qk norm: and says what was not found, rather than failing generically");
+    check(a.find("engine#1889") != std::string::npos, "qk norm: the refusal carries its issue, like the others here");
+    check(pi::qk_norm_refusal(true, true).empty(),
+          "qk norm: declared and found is allowed (the arithmetic or the graph located the gains)");
+    check(pi::qk_norm_refusal(false, true).empty(),
+          "qk norm: found and not declared is allowed (Qwen3 ships the sections without the key)");
+    check(pi::qk_norm_refusal(false, false).empty(), "qk norm: neither is the ordinary pack");
+    std::printf("  qk norm: 7 arms (declared+not-found refuses; found-only and neither are allowed)\n");
+}
+
+// engine#1889: the arithmetic that claims the per-head QK gains out of the 640 B Hunyuan-7B carries between its last qkv
+// tile and o_proj. A wrong offset there reads tile bytes as bf16 and mis-rotates every pack of the family, so both the
+// right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
+void test_qk_gain_offsets() {
+    const pi::QkGainOffsets o = pi::qk_gain_offsets(1000, 128, 640);
+    check(o.k_norm == 1064, "qk gains: block 0 starts one kNormOff (64 B) after the gap");
+    check(o.q_norm == 1384, "qk gains: block 1 starts after block 0 (64 B header + a 256 B bf16 [128] gain)");
+    check(o.q_norm - o.k_norm == 320, "qk gains: the two blocks are 320 B apart, the same stride as the separate family");
+    const pi::QkGainOffsets n1 = pi::qk_gain_offsets(1000, 128, 639);
+    const pi::QkGainOffsets n2 = pi::qk_gain_offsets(1000, 128, 641);
+    const pi::QkGainOffsets n3 = pi::qk_gain_offsets(1000, 128, 512);   // just the two gains, no headers
+    const pi::QkGainOffsets n4 = pi::qk_gain_offsets(1000, 256, 640);   // the right byte count at the wrong head_dim
+    check(n1.k_norm == 0 && n1.q_norm == 0, "qk gains: a gap one byte short is not the gains' shape");
+    check(n2.k_norm == 0 && n2.q_norm == 0, "qk gains: a gap one byte long is not either");
+    check(n3.k_norm == 0 && n3.q_norm == 0, "qk gains: two bare gains with no headers are not this shape");
+    check(n4.k_norm == 0 && n4.q_norm == 0, "qk gains: the byte count alone is not enough, head_dim has to agree");
+}
+
 int main(int argc, char** argv) {
+    test_qk_norm_refusal();
+    test_qk_gain_offsets();
+    test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
     // The pack leg is the only one that can regress a real pack, and ctest runs this binary with the
@@ -3024,7 +4224,8 @@ int main(int argc, char** argv) {
     test_external_roles();
     test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
-        test_canonical_copy_reusable();
+    test_external_import_success(golden_dir.empty() ? "." : golden_dir);
+        test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);
@@ -3038,8 +4239,13 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
+        test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
+        test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);
+        test_genre_a_projection_gap(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();
+        test_fconst_scratch_order();
+        test_fconst_block_headers();
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);
@@ -3047,12 +4253,15 @@ int main(int argc, char** argv) {
         test_fconst_in_component(golden_dir.empty() ? "." : golden_dir);
         test_embedding_in_component(golden_dir.empty() ? "." : golden_dir);
         test_per_layer_container(golden_dir.empty() ? "." : golden_dir);
+        test_per_layer_import(golden_dir.empty() ? "." : golden_dir);
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
+        test_tied_block32_head(golden_dir.empty() ? "." : golden_dir);
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         test_import_fp32_params(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);
+        test_copy_text_artifacts();
         test_kernel_set_refusal();
         test_weight_layout();
         test_null_optional_dims();

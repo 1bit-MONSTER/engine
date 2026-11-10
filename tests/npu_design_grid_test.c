@@ -27,13 +27,23 @@
 // 1024-column tensor at 896 columns (which the chunk decoder refuses outright).
 #include "q4nx_dequant.h"
 #include "q4nx_pack.h"
+#include "q4nx_head_image.h"
 
 #include <math.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
+
+
+static void truncate_file(const char* path, long bytes) {
+    FILE* f = fopen(path, "r+b");
+    if (!f) return;
+    if (ftruncate(fileno(f), bytes) != 0) { /* best effort: the arm asserts the refusal either way */ }
+    fclose(f);
+}
 
 static void check(int ok, const char* what) {
     printf("%s %s\n", ok ? "ok  " : "FAIL", what);
@@ -293,7 +303,28 @@ static void oga_geometry(void) {
         check(bt && codes && scales, "head tile: the layout fixture allocates");
         if (bt && codes && scales) {
             for (int k = 0; k < kpad; k++)
-                for (int n = 0; n < T; n++) bt[(size_t)k * T + n] = (float)((k * 13 + n * 7) % 97) * 0.01f - 0.5f;
+                /* Per-column spread is load-bearing: the plain ramp reaches -0.5 in every column, so every column's
+                 * absmax is 0.5 and all T scales are equal (measured: 1 distinct scale of 64) -- an arm comparing two
+                 * packers on that fixture cannot see a per-column mistake. Scaling by (1 + 0.05n) gives T distinct
+                 * absmax values (measured: 64 of 64), and the check below keeps the fixture from going flat again. */
+                for (int n = 0; n < T; n++)
+                    bt[(size_t)k * T + n] = ((float)((k * 13 + n * 7) % 97) * 0.01f - 0.5f) * (1.0f + 0.05f * (float)n);
+            {
+                /* the fixture must exercise per-column arithmetic, or every arm below compares on a flat input */
+                float seen[64];
+                int distinct = 0;
+                for (int n = 0; n < T; n++) {
+                    float amax = 0.0f;
+                    for (int k = 0; k < kpad; k++) {
+                        const float a = fabsf(bt[(size_t)k * T + n]);
+                        if (a > amax) amax = a;
+                    }
+                    int dup = 0;
+                    for (int i = 0; i < distinct; i++) if (seen[i] == amax) dup = 1;
+                    if (!dup) seen[distinct++] = amax;
+                }
+                check_int(distinct, T, "head tile: the fixture has T distinct column absmax (not a flat input)");
+            }
             const float m = q4nx_pack_B_int8(bt, kpad, T, codes, T, scales);
             /* (a) one scale per column, and it is that column's absmax/127 (with the all-zero floor) */
             int bad_scale = 0;
@@ -311,10 +342,23 @@ static void oga_geometry(void) {
             for (int n = 0; n < T; n++) ssum += (double)scales[n];
             check(fabsf((float)(ssum / T) - m) < 1e-6f, "head tile: the returned mean is over the T columns");
             /* (b) codes are row-major over (k, n) and match the column's scale */
+            /* The reference has to use the packer's own arithmetic -- absmax with the 1e-12 floor, then
+             * roundf(v * (127/amax)) -- and not v/scales[n]: once the columns differ the two disagree on 26 of 6144
+             * codes, because 127/amax and 1/(amax/127) are different floats. */
+            float tis[64];
+            for (int n = 0; n < T; n++) {
+                float amax = 0.0f;
+                for (int k = 0; k < kpad; k++) {
+                    const float a = fabsf(bt[(size_t)k * T + n]);
+                    if (a > amax) amax = a;
+                }
+                if (amax < 1e-12f) amax = 1.0f;
+                tis[n] = 127.0f / amax;
+            }
             int bad_code = 0;
             for (int k = 0; k < kpad; k++)
                 for (int n = 0; n < T; n++) {
-                    int want = (int)lroundf(bt[(size_t)k * T + n] / scales[n]);
+                    int want = (int)roundf(bt[(size_t)k * T + n] * tis[n]);
                     if (want > 127) want = 127;
                     else if (want < -127) want = -127;
                     if (codes[(size_t)k * T + n] != (int8_t)want) bad_code++;
@@ -333,6 +377,31 @@ static void oga_geometry(void) {
                 for (int i = 0; i < kpad * T; i++) if (codes_t[i] != codes[i]) differ++;
                 check(differ > kpad * T / 4, "head tile control: the transposed scratch is a different image");
                 free(tr); free(codes_t); free(scales_t);
+            }
+            /* The forward does NOT pack the head through q4nx_pack_B_int8: it goes
+             * lctx.packB_into -> packB_blocked -> q4nx_pack_B_int8_blocked, a separate row-major loop in
+             * q4nx_pack_blocked.cpp that never calls the function pinned above. A head-image cache (the fix
+             * for the 10-17 s rebuild, engine#1716) stands in for THAT call, so the layout arms above are
+             * only its contract if the two implementations agree byte for byte -- and nothing asserted it.
+             * Measured on main (engine#1716 comment, 2026-11-10): identical codes, scales and mean at this
+             * geometry; this arm is what keeps that true, since a change to either loop would otherwise
+             * break the cache contract silently. */
+            {
+                int8_t* oc = calloc((size_t)kpad * T, 1);
+                float* osc = calloc((size_t)T, sizeof(float));
+                double osum = 0.0;
+                if (oc && osc) {
+                    q4nx_pack_B_int8_blocked(oc, bt, kpad, T, kpad, T, 0, osc, &osum);
+                    int code_diff = 0;
+                    for (int i = 0; i < kpad * T; i++) if (oc[i] != codes[i]) code_diff++;
+                    int scale_diff = 0;
+                    for (int j = 0; j < T; j++) if (osc[j] != scales[j]) scale_diff++;
+                    check_int(code_diff, 0, "head tile: the blocked packer (the one the forward calls) is byte-identical");
+                    check_int(scale_diff, 0, "head tile: and returns the same column scales");
+                    check(fabs(ssum - osum) <= 1e-9 * (fabs(osum) + 1.0),
+                          "head tile: and the same mean column scale");
+                    free(oc); free(osc);
+                }
             }
             printf("  head tile: kpad %d x T %d, %d codes, %d column scales, layout pinned\n", kpad, T, kpad * T, T);
         }
@@ -431,7 +500,112 @@ static void activation_pad(void) {
     free(src); free(dst);
 }
 
+
+static void test_head_image(void) {
+    /* THE HEAD IMAGE ROUND TRIP (engine#1716, the cache's correctness bar). The image a serve copies into the weight BO
+     * must be byte-identical to what the packer produces for the same tile, and a file that cannot prove it is the same
+     * image must be REFUSED rather than copied -- a stale or damaged image copied into a BO answers wrongly with no
+     * message at all, which is the failure this whole contract exists to make impossible. */
+    {
+        const int kd = 96, nd = 64;                 /* the same head-tile shape the layout contract above uses */
+        float* bt = malloc((size_t)kd * nd * sizeof(float));
+        int8_t* codes = malloc((size_t)kd * nd);
+        int8_t* back = malloc((size_t)kd * nd);
+        float* scales = malloc((size_t)nd * sizeof(float));
+        float* sc_back = malloc((size_t)nd * sizeof(float));
+        check(bt && codes && back && scales && sc_back, "head image: the fixture allocates");
+        if (bt && codes && back && scales && sc_back) {
+            for (int k = 0; k < kd; k++)
+                for (int n = 0; n < nd; n++) bt[(size_t)k * nd + n] = (float)((k * 29 + n * 11) % 101) * 0.013f - 0.6f;
+            q4nx_pack_B_int8(bt, kd, nd, codes, nd, scales);
+
+            const char* path = "head_image_roundtrip.bin";
+            remove(path);
+            check(q4nx_head_image_write(path, codes, scales, kd, nd) == 1, "head image: the image is written");
+            Q4nxHeadImageInfo info;
+            char why[256];
+            check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd, &info, why, (int)sizeof why) == 1,
+                  "head image: it reads back");
+            check_int((int)info.kd, kd, "head image: the geometry in the header is the geometry written");
+            check_int((int)info.nd, nd, "head image: and so is the column count");
+            /* THE BAR: byte-identical to a fresh pack, not merely close */
+            check(memcmp(codes, back, (size_t)kd * nd) == 0, "head image: the codes are byte-identical to a fresh pack");
+            check(memcmp(scales, sc_back, (size_t)nd * sizeof(float)) == 0,
+                  "head image: and so are the scales");
+
+            /* a caller that rebuilt the image itself can compare hashes rather than bytes */
+            check(q4nx_head_image_hash(codes, scales, kd, nd) == info.hash,
+                  "head image: the file's hash is the hash of the image the caller would build");
+
+            /* (a) a corrupted byte must refuse */
+            {
+                FILE* f = fopen(path, "r+b");
+                if (f) {
+                    /* the payload starts after the 24-byte header this writer uses */
+                    fseek(f, 24 + 5, SEEK_SET);
+                    int c = fgetc(f);
+                    fseek(f, 24 + 5, SEEK_SET);
+                    fputc((c ^ 0x5a) & 0xff, f);
+                    fclose(f);
+                }
+                why[0] = 0;
+                check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd, &info, why, (int)sizeof why) == 0,
+                      "head image: a single corrupted payload byte is REFUSED, not copied");
+                check(why[0] != 0 && strstr(why, "hash") != NULL, "... and the refusal says the hash did not reproduce");
+            }
+            /* (b) the wrong geometry must refuse even when the file is intact */
+            {
+                check(q4nx_head_image_write(path, codes, scales, kd, nd) == 1, "head image: rewritten intact");
+                why[0] = 0;
+                check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd - 1, &info, why, (int)sizeof why) == 0,
+                      "head image: a container with a different column count refuses it");
+            }
+            /* (c) absence is not an error at this layer: it is a refusal with a reason the caller can treat as "pack" */
+            {
+                remove(path);
+                why[0] = 0;
+                check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd, &info, why, (int)sizeof why) == 0,
+                      "head image: no image reads as a refusal");
+                check(why[0] != 0 && strstr(why, "not there") != NULL, "... whose reason is that it is not there");
+            }
+            /* (e) THE KEY: each of the four facts a head image depends on must change it. kpad, T and blocked come from the
+             * kernel designs and head_hash from the container, so any one of them differing means a DIFFERENT image -- and
+             * keying on fewer would serve one kernel set's image to another while the correlation still looked plausible. */
+            {
+                Q4nxHeadImageKey base = {96, 64, 1, q4nx_head_image_hash(codes, scales, kd, nd)};
+                const uint64_t d0 = q4nx_head_image_key_digest(&base);
+                Q4nxHeadImageKey k[4];
+                for (int i = 0; i < 4; i++) k[i] = base;
+                k[0].kpad++;              k[1].t++;           k[2].blocked = 0;     k[3].head_hash ^= 1ull;
+                int changed = 0;
+                for (int i = 0; i < 4; i++)
+                    if (q4nx_head_image_key_digest(&k[i]) != d0) changed++;
+                check_int(changed, 4, "head image key: kpad, T, blocked and the head hash each change the digest");
+                /* and the name is stable for the same key, so a cache written by one run is found by the next */
+                char n1[64], n2[64], n3[64];
+                check(q4nx_head_image_key_name(&base, n1, (int)sizeof n1) == 1, "head image key: it names a file");
+                check(q4nx_head_image_key_name(&base, n2, (int)sizeof n2) == 1 && strcmp(n1, n2) == 0,
+                      "... the same name for the same key");
+                check(q4nx_head_image_key_name(&k[1], n3, (int)sizeof n3) == 1 && strcmp(n1, n3) != 0,
+                      "... and a different name when T changes, so two kernel sets cannot share one cached image");
+            }
+            /* (d) a truncated file refuses rather than returning a partial image */
+            {
+                check(q4nx_head_image_write(path, codes, scales, kd, nd) == 1, "head image: written for the truncation arm");
+                FILE* f = fopen(path, "r+b");
+                if (f) { fseek(f, 0, SEEK_END); const long sz = ftell(f); fclose(f); if (sz > 40) truncate_file(path, sz - 40); }
+                why[0] = 0;
+                check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd, &info, why, (int)sizeof why) == 0,
+                      "head image: a truncated image is refused");
+                remove(path);
+            }
+        }
+        free(bt); free(codes); free(back); free(scales); free(sc_back);
+    }
+}
+
 int main(void) {
+    test_head_image();
     oga_geometry();
     on_grid_geometry();
     activation_pad();

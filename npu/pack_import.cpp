@@ -2510,14 +2510,20 @@ std::string Plan::manifest() const {
 
 // engine#1889: where the per-head QK gains sit when the attention section carries them as the 640 B between the last
 // qkv tile and o_proj. Split out and exposed because this is the arithmetic a wrong answer silently mis-rotates every
-// Hunyuan pack with: a right offset reads a gain (~1.0-2.0), a wrong one reads tile bytes as bf16 and the gains come out
-// wild, and the test drives both shapes without a pack.
+// Hunyuan pack with: a wrong offset reads tile bytes as bf16 and the gains come out wild, and a wrong ORDER reads two
+// plausible gains under each other's name (engine#1934). The test drives the shapes and the order without a pack.
 QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes) {
     const int64_t per_head = head_dim * 2;
     if (gap_bytes != 2 * (kNormOff + per_head)) return QkGainOffsets{};
+    // engine#1934: block 0 is Q and block 1 is K here -- the reverse of the separate-section family ([k][q], engine#979).
+    // Measured against the pack's own graph, not inferred from the bytes: Hunyuan-7B's model.onnx carries
+    // `model.layers.L.attn.{q,k}_norm.layernorm.weight` as FP16 [128] initializers, and rounded to bf16 q_norm is block 0
+    // and k_norm is block 1 bit for bit in 32 of 32 layers, each behind a 64 B all-zero header. The two gains differ by
+    // about one bf16 ulp in ~17 of 128 elements and are identical in no layer, so the wrong order is invisible to a value
+    // check ("looks like a gain") and to the served text; only the graph tells them apart.
     QkGainOffsets o;
-    o.k_norm = gap_start + kNormOff;                          // block 0 is k, as the separate-section family
-    o.q_norm = gap_start + (kNormOff + per_head) + kNormOff;  // block 1 is q
+    o.q_norm = gap_start + kNormOff;                          // block 0: [64 B zeros][q_norm bf16 [head_dim]]
+    o.k_norm = gap_start + (kNormOff + per_head) + kNormOff;  // block 1: [64 B zeros][k_norm bf16 [head_dim]]
     return o;
 }
 
@@ -2845,9 +2851,10 @@ Plan plan(const std::string& pack_dir) {
                             // measured, and its shape is the separate-section family's, twice: [64 B header][bf16
                             // [head_dim] gain], i.e. 2 * (kNormOff + head_dim*2) = 640 B at head_dim 128, which is
                             // exactly the `rem` Hunyuan-7B reports. Naming it is what turns #1895's refusal ("declares
-                            // use_qk_norm, gains not located") into an import; the values are the check (a wrong offset
-                            // reads tile bytes as bf16 and the gains come out wild, a right one gives the 1.0-2.0 a norm
-                            // gain has).
+                            // use_qk_norm, gains not located") into an import. The pack names the whole gap as one
+                            // tensor (`...q_norm.layernorm.weight.qk_rms_packed_26_L`, bf16 [320]); which block is q and
+                            // which is k comes from the pack's graph (engine#1934, see qk_gain_offsets()), because a
+                            // value check cannot tell two gains apart.
                             const QkGainOffsets qkg =
                                 qk_gain_offsets(attn_off + p.attn_tiles * tile_bytes, int64_t(d.head_dim), rem);
                             p.knorm_off = qkg.k_norm;

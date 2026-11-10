@@ -3861,9 +3861,20 @@ void test_qk_norm_refusal() {
 // right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
 void test_qk_gain_offsets() {
     const pi::QkGainOffsets o = pi::qk_gain_offsets(1000, 128, 640);
-    check(o.k_norm == 1064, "qk gains: block 0 starts one kNormOff (64 B) after the gap");
-    check(o.q_norm == 1384, "qk gains: block 1 starts after block 0 (64 B header + a 256 B bf16 [128] gain)");
-    check(o.q_norm - o.k_norm == 320, "qk gains: the two blocks are 320 B apart, the same stride as the separate family");
+    // engine#1934: block 0 is Q. Hunyuan-7B's own model.onnx carries both gains as FP16 initializers, and q_norm is the
+    // first block and k_norm the second, bit for bit, in 32 of 32 layers (layer 0: q_norm bytes at 13,795,456 = gap + 64,
+    // k_norm bytes 320 B later). The order this arm replaced had them the other way round, and nothing else could see
+    // it: the two gains differ by about one bf16 ulp, so both orders "look like a gain".
+    check(o.q_norm == 1064, "qk gains: block 0, one kNormOff (64 B) after the gap, is q_norm (engine#1934)");
+    check(o.k_norm == 1384, "qk gains: block 1, after block 0 (64 B header + a 256 B bf16 [128] gain), is k_norm");
+    check(o.k_norm - o.q_norm == 320, "qk gains: the two blocks are 320 B apart, q first");
+    // the two windows are disjoint and inside the gap: neither a copy of the other nor a read past o_proj's start
+    check(o.q_norm + 256 <= o.k_norm - 64, "qk gains: q's window ends before k's 64 B header starts");
+    check(o.q_norm >= 1000 + 64 && o.k_norm + 256 == 1000 + 640, "qk gains: both windows lie inside the 640 B gap");
+    // Layer 0's real numbers, so the arm is tied to the measurement rather than to a round example.
+    const pi::QkGainOffsets hy = pi::qk_gain_offsets(13795392, 128, 640);
+    check(hy.q_norm == 13795456 && hy.k_norm == 13795776,
+          "qk gains: Hunyuan-7B layer 0 -- q_norm at 13,795,456 and k_norm at 13,795,776, where its graph's bytes are");
     const pi::QkGainOffsets n1 = pi::qk_gain_offsets(1000, 128, 639);
     const pi::QkGainOffsets n2 = pi::qk_gain_offsets(1000, 128, 641);
     const pi::QkGainOffsets n3 = pi::qk_gain_offsets(1000, 128, 512);   // just the two gains, no headers

@@ -62,8 +62,16 @@ typedef struct {
      * Source: model_type/architectures == qwen3_5*, resolved against the weights. */
     int rmsnorm_offset_probe;
     /* Per-head RMSNorm applied to q and k before RoPE.
-     * Source: presence of self_attn.q_norm.weight / k_norm.weight. */
+     * Source: config.json's `use_qk_norm` when the config states it (engine#1889: Hunyuan), else the
+     * model_type/architectures table (qwen3*, gemma*). The forward refuses a model whose flag is set and whose
+     * layers carry no self_attn.q_norm.weight, since normalising with an absent gain zeroes q. */
     int qk_norm;
+    /* The q/k RMSNorm runs AFTER RoPE instead of before it (engine#1889). Qwen3 and Gemma normalise, then rotate;
+     * Hunyuan rotates, then normalises. With a per-dimension gain the two orders differ wherever a rotary pair's two
+     * gains differ, so the order is part of the model. Source: model_type/architectures (hunyuan*) -- no config key
+     * states it; the evidence is the pack's own graph, where every layer is
+     * q_proj -> RotaryEmbedding -> q_norm (SimplifiedLayerNormalization) -> GroupQueryAttention. */
+    int qk_norm_after_rope;
     /* RoPE base.  Source: rope_theta. */
     float rope_theta;
     /* Channels actually rotated; 0 means the full head_dim.  Partial rotary

@@ -3305,6 +3305,14 @@ QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_b
     return o;
 }
 
+AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first) {
+    AttnFirstTiles f;
+    f.k = q_first ? n_q : 0;
+    f.q = q_first ? 0 : n_kv;
+    f.v = n_kv + n_q;
+    return f;
+}
+
 std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
     if (!declared_qk || vote_hdrs != 1) return std::string();
     return "the epsilon-anchor vote recorded ONE in-block header, and this pack declares use_qk_norm, whose per-head q/k "
@@ -3790,6 +3798,14 @@ Plan plan(const std::string& pack_dir) {
                                              (long long)rem);
                             }
                             handled = true;
+                            // engine#1889: this block's projections are q, k, v -- not the k, q, v every other family
+                            // writes. It cannot be read off the tiles (no biases here to identify the runs, and the
+                            // round trip is byte-exact either way), so it was settled by the answer: Hunyuan-7B on the
+                            // host forward, teacher-forced on "The capital of France is Paris. The capital of Germany is
+                            // Berlin. The capital of Italy is", predicts ' Paris' / ' Berlin' / ' Rome' at the three
+                            // "is" rows with q,k,v and ' the' / ' the' / ' the' with k,q,v. The same family puts q
+                            // before k in its packed gains (engine#1934), which is the same writer's order.
+                            p.attn_q_first = true;
                         }
                     }
                     const int64_t o_tiles_h = H / kTileRows;
@@ -5550,9 +5566,11 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 // o_proj's K is q_proj's output width).
                 struct Slot { const char* proj; int rows; int64_t base; int k; int first; };
                 const int64_t attn_off = attn_payload_off(H);
-                const Slot slots[] = {{"k_proj", kv_out, attn_off, int(H), 0},
-                                      {"q_proj", q_out, attn_off, int(H), n_kv},
-                                      {"v_proj", kv_out, attn_off, int(H), n_kv + n_q},
+                // engine#1889: k, q, v on every family but the Hunyuan block, which is q, k, v (Plan::attn_q_first).
+                const AttnFirstTiles ft = attn_first_tiles(n_kv, n_q, p.attn_q_first);
+                const Slot slots[] = {{"k_proj", kv_out, attn_off, int(H), ft.k},
+                                      {"q_proj", q_out, attn_off, int(H), ft.q},
+                                      {"v_proj", kv_out, attn_off, int(H), ft.v},
                                       {"o_proj", int(H), p.o_off, p.o_k, 0}};
                 for (int L = 0; L < p.dims.layers; ++L) {
                     const int64_t block = int64_t(L) * g.stride;

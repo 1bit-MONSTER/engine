@@ -334,6 +334,31 @@ static void oga_geometry(void) {
                 check(differ > kpad * T / 4, "head tile control: the transposed scratch is a different image");
                 free(tr); free(codes_t); free(scales_t);
             }
+            /* The forward does NOT pack the head through q4nx_pack_B_int8: it goes
+             * lctx.packB_into -> packB_blocked -> q4nx_pack_B_int8_blocked, a separate row-major loop in
+             * q4nx_pack_blocked.cpp that never calls the function pinned above. A head-image cache (the fix
+             * for the 10-17 s rebuild, engine#1716) stands in for THAT call, so the layout arms above are
+             * only its contract if the two implementations agree byte for byte -- and nothing asserted it.
+             * Measured on main (engine#1716 comment, 2026-11-10): identical codes, scales and mean at this
+             * geometry; this arm is what keeps that true, since a change to either loop would otherwise
+             * break the cache contract silently. */
+            {
+                int8_t* oc = calloc((size_t)kpad * T, 1);
+                float* osc = calloc((size_t)T, sizeof(float));
+                double osum = 0.0;
+                if (oc && osc) {
+                    q4nx_pack_B_int8_blocked(oc, bt, kpad, T, kpad, T, 0, osc, &osum);
+                    int code_diff = 0;
+                    for (int i = 0; i < kpad * T; i++) if (oc[i] != codes[i]) code_diff++;
+                    int scale_diff = 0;
+                    for (int j = 0; j < T; j++) if (osc[j] != scales[j]) scale_diff++;
+                    check_int(code_diff, 0, "head tile: the blocked packer (the one the forward calls) is byte-identical");
+                    check_int(scale_diff, 0, "head tile: and returns the same column scales");
+                    check(fabs(ssum - osum) <= 1e-9 * (fabs(osum) + 1.0),
+                          "head tile: and the same mean column scale");
+                    free(oc); free(osc);
+                }
+            }
             printf("  head tile: kpad %d x T %d, %d codes, %d column scales, layout pinned\n", kpad, T, kpad * T, T);
         }
         free(bt); free(codes); free(scales);

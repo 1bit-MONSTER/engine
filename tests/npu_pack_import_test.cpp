@@ -532,6 +532,47 @@ void test_external_packed_genre(const std::string& root) {
                   "placeholder with no sibling: the matmul is KEPT, so the pack is not mistaken for a tail-head pack");
     }
 
+    // Which `If` branch is decode (engine#1740). An OGA pack splits prefill from decode with
+    // `If (Equal(Shape(input_ids), Constant(value_int 1)))`, and the two branches do NOT hold the same tensors: measured
+    // on amd/Qwen3-8B_rai_1.9.0_npu, `then_branch` holds exactly one MatMulNBits -- lm_head [151936,32,64] with real
+    // bytes -- while `else_branch` holds 109 layer projections and an `lm_head.MatMulNBits.qweight.empty` placeholder
+    // with none. The Token .fconst is the decode path, so a walk that merges the branches counts the prefill
+    // placeholder as "this pack has no head", falls back to the tail, and refuses (these packs' tails are the 8,256-byte
+    // envelope alone). The arm pins the reading of the condition, both ways round.
+    {
+        const auto graph_with_cond = [&](bool one_token_when_true, const std::string& head_branch) {
+            std::string named;
+            pb::str(named, 4, "Constant");
+            std::string a;
+            pb::str(a, 1, "value_int");
+            pb::ints(a, 3, one_token_when_true ? 1 : 2);
+            pb::tag(named, 5, 2);
+            pb::varint(named, a.size());
+            named += a;
+            // A pack this fixture can actually plan: it needs its own embedding tensor in the graph, exactly as the
+            // write_graph lambda above gives it.
+            const std::string emb = pb::tensor("model.embed_tokens.weight", {64, 5120}, "eager-mm.onnx.data", 0,
+                                               uint64_t(embed_bytes));
+            const std::string head = pb::matmulnbits("lm_head", {"x", "w", "w.scales", "w.zeros"}, K, N, 4, 128);
+            const std::string prefill = pb::graph({emb}, {head});
+            const std::string decode = pb::graph({emb}, {head});
+            return pb::model({}, {named, pb::if_node("c", "input_ids", "logits", head_branch, decode),
+                                  pb::if_node("c2", "input_ids", "logits",
+                                              head_branch == "then_branch" ? "else_branch" : "then_branch", prefill)});
+        };
+        // The graph this pack imports is the one genai_config.json names (eager-mm.onnx); a crafted model.onnx beside
+        // it is not read at all, which is why the first version of this arm measured the fixture's own graph.
+        put_file((dir / "eager-mm.onnx").string(), graph_with_cond(/*one_token_when_true=*/true, "then_branch"));
+        const json d1 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
+        check(d1.contains("decode_branch") && d1["decode_branch"].get<std::string>() == "then_branch",
+              "decode branch: a condition comparing the shape with 1 makes then_branch the decode path");
+        put_file((dir / "eager-mm.onnx").string(), graph_with_cond(/*one_token_when_true=*/false, "else_branch"));
+        const json d2 = json::parse(pi::plan(dir.string()).manifest())["graph_weights"];
+        check(d2["decode_branch"].get<std::string>() == "else_branch",
+              "decode branch: an inverted condition moves the decode path to else_branch");
+        write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N);
+    }
+
     // A packed length that does not fit the stride must be reported as a mismatch, not crash and not claim a match.
     write_data(stride * N - 68);
     write_graph("model.layers.0.attn.qkv_proj.MatMulNBits.qweight.packed", stride * N - 68);
@@ -1960,7 +2001,25 @@ void test_block32_tail_head(const std::string& root) {
     check(std::fabs(ncorr(emb, other)) < 0.3,
           "block-32 tail: the fixture's two heads are unrelated (corr " + std::to_string(ncorr(emb, other)) + ")");
 
-    const auto build = [&](bool tied, const char* tag, const std::string& tail_after_env) {
+    // A Ryzen AI fused MLP node as the 1.9 graphs spell it: op SSMLP, the gate/up/down shapes as int attributes, and
+    // NO weight tensor (the weights are in the .fconst). Every 1.9 pack measured carries one per layer.
+    const auto ssmlp_node = [&]() {
+        std::string n;
+        pb::str(n, 1, "/model/layers.0/x");
+        pb::str(n, 4, "SSMLP");
+        const std::pair<const char*, int64_t> attrs[] = {{"gate_K", 128}, {"gate_N", 256}, {"up_K", 128},
+                                                         {"up_N", 256},   {"down_K", 256}, {"down_N", 128}};
+        for (const auto& [name, value] : attrs) {
+            std::string a;
+            pb::str(a, 1, name);
+            pb::ints(a, 3, value);
+            pb::tag(n, 5, 2);
+            pb::varint(n, a.size());
+            n += a;
+        }
+        return n;
+    };
+    const auto build = [&](bool tied, const char* tag, const std::string& tail_after_env, bool fused_mlp = false) {
         const fs::path dir = fs::path(root) / tag;
         fs::remove_all(dir);
         fs::create_directories(dir / "cache");
@@ -2005,7 +2064,7 @@ void test_block32_tail_head(const std::string& root) {
                             pb::placeholder("lm_head.weight.MatMulNBits.qweight"),
                             pb::placeholder("lm_head.weight.MatMulNBits.scales"),
                             pb::placeholder("lm_head.weight.MatMulNBits.zeros")},
-                           {}));
+                           fused_mlp ? std::vector<std::string>{ssmlp_node()} : std::vector<std::string>{}));
         return dir;
     };
     struct Run {
@@ -2082,6 +2141,22 @@ void test_block32_tail_head(const std::string& root) {
         check(!x.head.empty() && ncorr(x.head, emb) > 0.99,
               "block-32 tail, tied: the container's head is the embedding (corr " +
                   std::to_string(x.head.empty() ? 0.0 : ncorr(x.head, emb)) + ")");
+    }
+    {   // arm 2b: the same pack with a fused-MLP node in its graph, as every real 1.9 pack has. The node names no weight,
+        // so it must not make the graph look like it carries quantised matmuls: that is the switch for "the head is in
+        // the .fconst tail", and with it off the import wrote a container with no lm_head at all and exit 0
+        // (measured on Qwen-2.5 1.5B 1.9 with the SSMLP attributes counted as graph matmuls: 338 tensors, not 339).
+        const Run x = run(build(true, "b32-tied-ssmlp", encode_block32_units(emb, V, H), true), "ssmlp");
+        check(x.said.empty(), "block-32 tail, fused MLP in the graph: imports (" + x.said.substr(0, 160) + ")");
+        check(x.has_head && !x.head.empty() && ncorr(x.head, emb) > 0.99,
+              "block-32 tail, fused MLP in the graph: the container still carries the head read from the tail");
+        check(x.r.selfcheck_tied && x.r.head_read_note.find("reproduces") != std::string::npos,
+              "block-32 tail, fused MLP in the graph: the tied self-check still runs (" + x.r.head_read_note + ")");
+        const fs::path plan_dir = build(true, "b32-tied-ssmlp-plan", encode_block32_units(emb, V, H), true);
+        const json g = json::parse(pi::plan(plan_dir.string()).manifest());
+        fs::remove_all(plan_dir);
+        check(g.value("graph_weights", json::object()).value("matmulnbits_ops", int64_t(-1)) == 0,
+              "block-32 tail, fused MLP in the graph: SSMLP attributes are not counted as graph matmuls");
     }
     {   // arm 3: TIED, but the tail's head is some other matrix -> the read is NOT taken, the synthesis stands, says why
         const Run x = run(build(true, "b32-tied-mismatch", encode_block32_units(other, V, H)), "mismatch");
@@ -2904,8 +2979,16 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
         }
         check(attributed, "pack: each runtime-refused tensor is marked imported=false in the manifest");
     }
-    check(r.lmhead_corr > 0.999, "pack: the decode reproduces the fp16 embedding (corr " +
-                                     std::to_string(r.lmhead_corr) + ")");
+    // Only a TIED pack can be checked this way: there lm_head IS the embedding, so correlating them measures the decoder.
+    // An untied pack's lm_head is a separate matrix and the number is meaningless by construction (Qwen3-8B: 0.0043 on a
+    // head that decodes correctly -- std 0.026, plausible per-row scale, weakly correlated rows). Asserting 0.999
+    // unconditionally demanded every pack be tied, which no untied pack can satisfy.
+    if (r.selfcheck_tied)
+        check(r.lmhead_corr > 0.999, "pack: the decode reproduces the fp16 embedding, tied (corr " +
+                                         std::to_string(r.lmhead_corr) + ")");
+    else
+        check(true, "pack: untied, so the embedding correlation is not a decoder check (corr " +
+                        std::to_string(r.lmhead_corr) + ")");
     check(r.ctrl_corr_nibble < 0.5 && r.ctrl_corr_nozp < 0.95,
           "pack: both wrong decoders are rejected as controls");
     // engine#1185: an imported container carries fp32 scale/zero (layout q4nx-2, npu/q4nx.h
@@ -3895,6 +3978,7 @@ void test_fconst19_rule_table() {
             {3584, 28, 28, 7232, 8, 1, 1009664},     // the Qwen2.5-7B family, measured on two models
             {2048, 16, 36, 4160, 9, 1, 295936},      // Qwen2.5_3B_Instruct
             {4096, 32, 32, 12608, 5, 1, 2297856},    // Mistral-7B-Instruct-v0.2
+            {4096, 32, 36, 12608, 5, 1, 2297856},    // Qwen3-8B (measured against ..._rai_1.8.0_npu_16K)
             {3072, 24, 28, 10560, 4, 1, 1740800},    // Llama-3.2-3B (and -Instruct)
         };
         const int want_n = (int)(sizeof(want) / sizeof(want[0]));

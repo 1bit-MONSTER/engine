@@ -133,11 +133,20 @@ struct OnnxMatMul {
     std::string data, weight, scales, zeros;
     int64_t K = 0, N = 0;
     int bits = 0, block = 0;
+    // Which `If` branch declared it, as the AttributeProto's name (`then_branch` / `else_branch`), or empty in the
+    // top-level graph. An OGA pack splits prefill from decode with `If (Shape(input_ids) == 1)`: Qwen3-8B declares ONE
+    // MatMulNBits (its head) in `then_branch` and every layer projection in `else_branch`, so a walk that merges the
+    // branches cannot tell which path a weight belongs to. The Token .fconst IS the decode path, so the head is read
+    // from the decode branch -- see is_decode_branch().
+    std::string branch;
 };
 
 struct OnnxModel {
     std::vector<OnnxTensor> tensors;
     std::vector<OnnxMatMul> matmuls;
+    // The fused-MLP nodes' (SSMLP / GQO) gate/up/down shapes, from their attributes. Kept apart from `matmuls` because they
+    // name no weight tensor: `matmuls` answers "does the graph carry quantised weights", and these must not.
+    std::vector<OnnxMatMul> fused_mlp;
     std::map<std::string, size_t> index;
     // `com.ryzenai:MatMulNBitsBf` is the same quantised matmul as `com.microsoft:MatMulNBits`, and on the 1.9
     // blob/external-data packs it is the ONLY one: phi-4's 201 weights are all `MatMulNBitsBf`, so a walker that
@@ -151,9 +160,27 @@ struct OnnxModel {
     // .fconst, so plan() drops them; with no .fconst there is no other source and plan() refuses by name (#1687).
     int64_t weightless_matmuls = 0;
     std::string weightless_example;   // the first one, for the refusal's text
+    // weightless_matmuls for placeholders OUTSIDE the decode branch only. A placeholder in the prefill branch is not a
+    // fault for a Token-fconst pack reading its decode weights: Qwen3-8B's `else_branch` spells lm_head as an empty
+    // placeholder while `then_branch` (decode) carries the real [151936,32,64] tensor. This is what plan() consults for
+    // "are these weights genuinely absent from the pack" -- the total stays for `info`'s census.
+    int64_t weightless_matmuls_decode = 0;
+    // The branch that runs when `input_ids` has length 1, i.e. the decode path the Token .fconst belongs to. Learned
+    // from the `If`'s condition where it is the literal we recognise, else defaulted to `then_branch` -- the ONNX
+    // convention every OGA pack on the Hub follows -- and named in the note either way, so a pack that puts it in the
+    // other branch is diagnosable rather than silently misread.
+    std::string decode_branch;
+    std::string branch_note;
 };
 
-void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
+// A matmul is decode-path when its branch is the decode branch, or when it is in no branch at all (a pack whose graph
+// is flat has one path). A pack whose decode branch was never identified keeps every matmul, which is today's
+// behaviour and cannot lose a head.
+bool is_decode_branch(const OnnxModel& m, const std::string& branch) {
+    return branch.empty() || m.decode_branch.empty() || branch == m.decode_branch;
+}
+
+void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& branch = std::string()) {
     const auto g = pb(p, n);
     for (const auto* f : fields(g, 5)) {
         const auto t = pb(f->p, f->n);
@@ -191,8 +218,11 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
             const auto* nm = field1(at, 1);
             if (!nm) continue;
             if (const auto* iv = field1(at, 3)) attrs[pb_str(*nm)] = int64_t(iv->v);
-            for (const auto* sg : fields(at, 6)) walk_graph(sg->p, sg->n, m);
-            for (const auto* sg : fields(at, 11)) walk_graph(sg->p, sg->n, m);
+            // AttributeProto.graph is field 6 (a GRAPH), graphs is field 11 (a repeated GRAPH) -- so a branch arrives
+            // in field 6 and its name is the attribute's own, `then_branch` / `else_branch`.
+            const std::string sub_branch = nm ? pb_str(*nm) : std::string();
+            for (const auto* sg : fields(at, 6)) walk_graph(sg->p, sg->n, m, sub_branch);
+            for (const auto* sg : fields(at, 11)) walk_graph(sg->p, sg->n, m, sub_branch);
         }
         // The graph is the authority on how THIS reader should spell a quantised matmul: the same pack also states the
         // op in `cache/*_meta.json` (which the block census reads) and in the `.onnx` alias table, and if those ever
@@ -217,7 +247,37 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
             if (attrs.count("N")) mm.N = attrs["N"];
             if (attrs.count("bits")) mm.bits = int(attrs["bits"]);
             if (attrs.count("block_size")) mm.block = int(attrs["block_size"]);
+            mm.branch = branch;
             if (!mm.weight.empty()) m.matmuls.push_back(std::move(mm));
+        }
+        // The Ryzen AI fused MLPs: `SSMLP` is gate+up+down as ONE node and `GQO` is grouped-query attention, so neither
+        // has a MatMulNBits node for the FFN to pair up -- which is why amd/granite-4.1-8b_rai_1.9.0_npu states no
+        // intermediate_size anywhere (`config.json` is literally {}, and genai_config.json's decoder block has only
+        // hidden_size / heads / layers) and was refused. The node carries the same numbers as attributes, measured on
+        // that pack: gate_K 4096, gate_N 12800, up_K 4096, up_N 12800, down_K 12800, down_N 4096 -- the plain
+        // (K == hidden, N == w) gate/up and (K == w, N == hidden) down triple, w = 12800. Recording them as matmuls lets
+        // intermediate_size_from_graph find them by the SAME witness it uses for the separate-node spelling (gate and up
+        // reading one activation) rather than adding a second rule that could disagree with the first.
+        if (op == "SSMLP" || op == "GQO") {
+            for (const char* sub : {"gate", "up", "down"}) {
+                const auto k = attrs.find(std::string(sub) + "_K"), n = attrs.find(std::string(sub) + "_N");
+                if (k == attrs.end() || n == attrs.end() || k->second <= 0 || n->second <= 0) continue;
+                OnnxMatMul mm;
+                // gate and up share the node's activation input; down reads the gated product, so it gets its own name.
+                // That shared activation is the very witness separate gate/up nodes provide.
+                mm.data = ins.empty() ? std::string() : ins[0];
+                if (std::string(sub) == "down") mm.data += ".down";
+                mm.weight = sub;   // the role name intermediate_size_from_graph's excluded() filter reads
+                mm.K = k->second;
+                mm.N = n->second;
+                mm.branch = branch;
+                // NOT into `matmuls`: these carry no weight tensor, and `matmuls.empty()` is how the importer knows a
+                // 1.9 pack keeps its head in the .fconst tail. Counted as graph matmuls they turned that off for every
+                // pack with a fused MLP -- measured on Qwen-2.5 1.5B 1.9, which then imported 338 tensors with no
+                // lm_head, exit 0 and no refusal. They are geometry witnesses only, read by
+                // intermediate_size_from_graph().
+                m.fused_mlp.push_back(std::move(mm));
+            }
         }
     }
 }
@@ -233,6 +293,65 @@ OnnxModel parse_onnx(const std::string& path) {
         const auto* g = field1(model, 7);
         if (!g) throw std::runtime_error(path + ": no graph");
         walk_graph(g->p, g->n, m);
+        // Which branch is decode. The condition is `Equal(Shape(input_ids), Constant(value_int 1))` on every OGA 1.9
+        // pack measured (Qwen3-8B, granite-4.1-b8), so the branch taken when it is TRUE is the one-token path and
+        // therefore the path the Token .fconst carries. Reading the comparison's own value rather than assuming
+        // `then_branch` keeps the rule honest for a pack that inverts it; when the graph is not that shape, the ONNX
+        // convention (`then_branch`) stands and `branch_note` says the rule was assumed rather than read.
+        {
+            // g IS the GraphProto (field 7 of ModelProto), so its nodes are at field 1 of g directly -- re-wrapping
+            // g's bytes in another pb() would read the graph as if it were a node list and find no Constant at all.
+            bool one_token_when_true = true, read = false;
+            for (const auto* f : fields(pb(g->p, g->n), 1)) {   // GraphProto.node = 1
+                const auto node = pb(f->p, f->n);
+                const auto* opf = field1(node, 4);
+                if (!opf || pb_str(*opf) != "Constant") continue;
+                for (const auto* a : fields(node, 5)) {
+                    const auto at = pb(a->p, a->n);
+                    const auto* nm = field1(at, 1);
+                    if (!nm || pb_str(*nm) != "value_int") continue;
+                    const auto* iv = field1(at, 3);
+                    if (iv) { one_token_when_true = (iv->v == 1); read = true; }
+                }
+            }
+            // The branch whose graph actually declares a MatMulNBits. `value_int == 1` is the pack's convention, but the
+            // arithmetic is what must hold: the Token .fconst carries the graph's own quantised matmuls, so the branch
+            // that HAS them is the decode path whatever the constant says. A pack that inverts the condition without
+            // moving its weights stays readable; a pack whose weights sit in two branches is ambiguous, so the condition
+            // decides and the note says it did.
+            const auto branch_has_matmul = [&](const std::string& want) {
+                int n = 0;
+                for (const auto* f : fields(pb(g->p, g->n), 1)) {
+                    const auto node = pb(f->p, f->n);
+                    for (const auto* a : fields(node, 5)) {
+                        const auto at = pb(a->p, a->n);
+                        const auto* nm = field1(at, 1);
+                        if (!nm || (pb_str(*nm) != "then_branch" && pb_str(*nm) != "else_branch")) continue;
+                        if (pb_str(*nm) != want) continue;
+                        for (const auto* sg : fields(at, 6)) {
+                            for (const auto* nf : fields(pb(sg->p, sg->n), 1)) {
+                                const auto sub = pb(nf->p, nf->n);
+                                const auto* op = field1(sub, 4);
+                                if (op && (pb_str(*op) == "MatMulNBits" || pb_str(*op) == "MatMulNBitsBf")) ++n;
+                            }
+                        }
+                    }
+                }
+                return n;
+            };
+            const std::string by_condition = one_token_when_true ? "then_branch" : "else_branch";
+            const int then_mm = branch_has_matmul("then_branch"), else_mm = branch_has_matmul("else_branch");
+            if (then_mm > 0 && else_mm == 0) m.decode_branch = "then_branch";
+            else if (else_mm > 0 && then_mm == 0) m.decode_branch = "else_branch";
+            else m.decode_branch = by_condition;
+            m.branch_note = read ? "the If condition compares the input shape with 1, so " + by_condition +
+                                       " is the one-token (decode) path" +
+                                       ((m.decode_branch == by_condition) ? "" :
+                                        "; its weights are in " + m.decode_branch + " (then " +
+                                            std::to_string(then_mm) + ", else " + std::to_string(else_mm) +
+                                            " quantised matmuls), which is where the Token .fconst's weights are read")
+                                 : "no recognisable If condition, so then_branch is taken as decode by the ONNX convention";
+        }
     } catch (...) {
         unmap_file(map, size);
         throw;
@@ -306,6 +425,8 @@ OnnxModel parse_onnx(const std::string& path) {
             // which knows whether an .fconst is there, decides. Deferring it silently produced
             // `...qweight.empty: no data` from a lookup much later, naming the placeholder rather than the problem.
             ++m.weightless_matmuls;
+            if (is_decode_branch(m, mm.branch))
+                ++m.weightless_matmuls_decode;
             m.weightless_example = w->name + " (its " + packed + " sibling carries no data either)";
             continue;
         }
@@ -387,6 +508,10 @@ constexpr double kTieCorr = 0.99;
 // measured so far, not a rule: do not derive a row from it. A 1.9 pack with NO 1.8 twin cannot be given a row at all --
 // there is nothing to diff it against, so it stays refused by the shape gate (amd/granite-4.1-8b_rai_1.9.0_npu is the
 // standing example) rather than being given an inferred prefix and reported working.
+// What was tried on granite, so it is not tried again: its 40 uniform headers and its tail of exactly
+// 8,256 + 1,568 x 143,616 pin the TILE by head-grid arithmetic and say nothing about the prefix; a row added from
+// that alone was refused by the pack's own in-block checks (scale/zero exactness 0 %, no second header, 0/80 norm
+// anchors) and withdrawn.
 constexpr Fconst19Rule kFconst19Rules[] = {
     // Qwen2.5-0.5B-Instruct: normalises to its 1.8 twin byte for byte, whole file, all 24 blocks.
     {896, 14, 24, 1856, 16, 2, 34816},
@@ -460,6 +585,16 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // all 32 blocks. This is the largest family on #1503 (31 packs). Measured by another lane on main, whose
     // table is keyed on geometry; merged here in the same form.
     {4096, 32, 32, 12608, 5, 1, 2297856},
+    // Qwen3-8B at hidden 4,096 / 32 heads / **36 layers**: measured with tools/fconst19_measure.py against
+    // amd/Qwen3-8B_rai_1.8.0_npu_16K, 26,104 of 3,756,627,264 bytes differ (6.95e-06 of the file, which the tool prints
+    // as 6.95e-04 %) -- content, not layout, and the largest residual in this table, so it is stated rather than
+    // rounded away. Every other field is IDENTICAL to the 32-layer row above (prefix 12,608, five tiles of 2,297,856,
+    // rotation 1): at this hidden size the layer count moves nothing but the number of blocks, which is the first row
+    // here where that is true -- the h2048 pair above moves both the prefix and the division with the layer count
+    // (4,160/9 tiles at 36 layers against 8,512/3 tiles at 24), so this row is measured, not inferred from that one.
+    // Without it the importer refuses the pack by design ("its block shape has not been measured for hidden 4096, 32
+    // heads, 36 layers"), which is what it did until now: kernel family and fconst rule row are not the same partition.
+    {4096, 32, 36, 12608, 5, 1, 2297856},
     // Llama-3.2-3B (and -Instruct, same geometry) at hidden 3,072 / 24 heads / 28 layers: measured with
     // tools/fconst19_measure.py against amd/Llama-3.2-3B_rai_1.8.0_npu_4K, 1,090 of 1,756,930,368 bytes differ
     // (6.20e-07 of the file, which the tool prints as 6.20e-05 %) -- content, not layout. The prefix is 10,560 here (the first twin-diff byte at this hidden
@@ -1603,14 +1738,16 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
     };
     std::map<std::string, std::map<int64_t, int>> shared;  // activation tensor -> N -> how many nodes read it
     std::set<int64_t> down_k, gate_n;                     // down: N == hidden, K > hidden;  gate/up: K == hidden, N > hidden
-    for (const auto& mm : m.matmuls) {
-        if (mm.K <= 0 || mm.N <= 0 || excluded(mm.weight)) continue;
+    const auto witness = [&](const OnnxMatMul& mm) {
+        if (mm.K <= 0 || mm.N <= 0 || excluded(mm.weight)) return;
         if (mm.K == hidden && mm.N > hidden) {
             shared[mm.data][mm.N]++;
             gate_n.insert(mm.N);
         }
         if (mm.N == hidden && mm.K > hidden) down_k.insert(mm.K);
-    }
+    };
+    for (const auto& mm : m.matmuls) witness(mm);
+    for (const auto& mm : m.fused_mlp) witness(mm);   // SSMLP / GQO attributes: shapes without a weight tensor
     // separate gate/up first: it is the witness attention cannot produce
     std::set<int64_t> separate;
     for (const int64_t dk : down_k)
@@ -3103,6 +3240,12 @@ std::string Plan::manifest() const {
         // (engine#1671). Reported so a test can pin the drop without needing a 1.9 pack, and so `info` says how many
         // graph weights this pack does not keep in its graph.
         g["weightless_matmuls"] = graph_weightless_matmuls;
+        // Of those, the ones OUTSIDE the decode branch. A placeholder in the prefill branch is not a fault when the
+        // decode branch carries the real tensor (Qwen3-8B: `else_branch` has an empty lm_head placeholder, `then_branch`
+        // has lm_head [151936,32,64]), so the refusal reads this one and the census above stays a census.
+        g["weightless_matmuls_decode"] = graph_weightless_matmuls_decode;
+        g["decode_branch"] = graph_decode_branch;
+        if (!graph_branch_note.empty()) g["decode_branch_note"] = graph_branch_note;
         if (graph_stride_of > 0)
             g["external_row_stride"] = {{"matched", graph_stride_ok}, {"of", graph_stride_of},
                                         {"rule", "length == N * (K/128 + 1) * 68"}};
@@ -3296,6 +3439,9 @@ Plan plan(const std::string& pack_dir) {
         p.graph_ryzenai_matmuls = onnx.ryzenai_matmuls;
         p.graph_packed_siblings = onnx.packed_siblings;
         p.graph_weightless_matmuls = onnx.weightless_matmuls;
+        p.graph_weightless_matmuls_decode = onnx.weightless_matmuls_decode;
+        p.graph_decode_branch = onnx.decode_branch;
+        p.graph_branch_note = onnx.branch_note;
         for (const auto& t : onnx.tensors)
             if (!t.location.empty()) p.graph_external++;
         if (!ext_file.empty()) {
@@ -3327,7 +3473,7 @@ Plan plan(const std::string& pack_dir) {
     // data has no weight for those ops IN THE GRAPH. With a Token .fconst that is the normal shape of a 1.9 pack -- its
     // graph is all placeholders and the weights are in the .fconst -- so the walker drops them and the import proceeds.
     // With no .fconst there is nothing to fall back to, and the honest answer is #1687's refusal, by name.
-    if (tok_path.empty() && onnx.weightless_matmuls > 0)
+    if (tok_path.empty() && onnx.weightless_matmuls_decode > 0)
         throw std::runtime_error(
             pack_dir + ": " + onnx.weightless_example +
             ", and the pack carries no Token .fconst either (no dd_metastate_Llm_Token_*.fconst): these weights are "
@@ -4658,6 +4804,20 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         }
     }
 
+    // The head is the node whose geometry is the vocabulary x hidden -- but which NODE, when both `If` branches declare
+    // one? The Token .fconst is the decode path, so the decode branch's node is the one that describes it. Measured on
+    // amd/Qwen3-8B_rai_1.9.0_npu: `then_branch` (taken when Shape(input_ids) == 1, i.e. one token) holds exactly ONE
+    // MatMulNBits and it is lm_head [151936, 32, 64] at offset 15,269,888 in model.onnx.data; `else_branch` holds the
+    // 109 layer projections and an `lm_head.MatMulNBits.qweight.empty` placeholder with no bytes. The head is not the
+    // same tensor in both paths, so a walk that merges the branches reads the placeholder and falls back to the tail --
+    // and on these packs the tail is the envelope alone (8,256 B = 64 + 2*4096, no head tiles), which is how the import
+    // refused with "the head's offsets are not established" for every 4096-hidden untied pack.
+    const OnnxMatMul* head_mm = nullptr;
+    for (const auto& mm : onnx.matmuls)
+        if (mm.N == int(V) && mm.K == int(H) && is_decode_branch(onnx, mm.branch)) { head_mm = &mm; break; }
+    if (!head_mm)
+        for (const auto& mm : onnx.matmuls)
+            if (mm.N == int(V) && mm.K == int(H)) { head_mm = &mm; break; }
     for (const auto& mm : onnx.matmuls) {
         const auto wi = onnx.index.find(mm.weight), si = onnx.index.find(mm.scales);
         if (getenv("NPU_PACK_DEBUG"))
@@ -4696,6 +4856,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // which is why the imported container answered "!!!!!!!!". Only the node whose geometry IS the head is
         // taken here; the projections are imported from the graph's initializers by the block below.
         if (!(mm.N == int(V) && mm.K == int(H))) continue;
+        if (head_mm && &mm != head_mm) continue;   // a same-geometry node in the other `If` branch
         if (mm.bits != 4) throw std::runtime_error("lm_head: MatMulNBits is not 4-bit");
         const auto& wt = onnx.tensors[wi->second];
         const auto& st = onnx.tensors[si->second];

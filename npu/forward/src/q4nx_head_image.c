@@ -21,6 +21,9 @@
 
 #include <stdio.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 // "Q4HI" then the version as four ASCII digits, so a hexdump of the first eight bytes says what the file is.
 #define Q4NX_HEAD_IMAGE_MAGIC "Q4HI"
@@ -68,8 +71,17 @@ int q4nx_head_image_write(const char *path, const int8_t *codes, const float *sc
     h.hash = q4nx_head_image_hash(codes, scales, kd, nd);
     // Written beside the destination and renamed into place: a truncated image must never be readable as a valid one,
     // because the reader would then copy it into a weight BO and the model would answer wrongly with no message.
+    // The temp name carries the writer's pid: two serves that start cold on the same pack write the same image at the
+    // same time, and with one shared name the second open truncated the first writer's file under it and one of the two
+    // renames found nothing to rename. Each writer now renames its own complete file; the last rename wins, and both
+    // files are the same image.
     char tmp[4096];
-    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) <= 0) return 0;
+#if !defined(_WIN32)
+    const int tn = snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+#else
+    const int tn = snprintf(tmp, sizeof tmp, "%s.tmp", path);
+#endif
+    if (tn <= 0 || (size_t)tn >= sizeof tmp) return 0;
     FILE *f = fopen(tmp, "wb");
     if (!f) return 0;
     int ok = fwrite(&h, sizeof h, 1, f) == 1 && fwrite(codes, (size_t)kd * (size_t)nd, 1, f) == 1 &&
@@ -81,6 +93,31 @@ int q4nx_head_image_write(const char *path, const int8_t *codes, const float *sc
         return 0;
     }
     return 1;
+}
+
+uint64_t q4nx_head_image_key_digest(const Q4nxHeadImageKey *key) {
+    if (!key) return 0;
+    struct {
+        uint32_t version;
+        uint32_t kpad;
+        uint32_t t;
+        uint32_t blocked;
+        uint64_t head_hash;
+    } fields;
+    fields.version = Q4NX_HEAD_IMAGE_VERSION;
+    fields.kpad = key->kpad;
+    fields.t = key->t;
+    fields.blocked = key->blocked;
+    fields.head_hash = key->head_hash;
+    uint64_t h = 1469598103934665603ull;
+    return fnv1a(h, &fields, sizeof fields);
+}
+
+int q4nx_head_image_key_name(const Q4nxHeadImageKey *key, char *out, int out_n) {
+    if (!key || !out || out_n < 8) return 0;
+    const uint64_t d = q4nx_head_image_key_digest(key);
+    const int n = snprintf(out, (size_t)out_n, "headimg-%016llx.q4hi", (unsigned long long)d);
+    return n > 0 && n < out_n;
 }
 
 int q4nx_head_image_read(const char *path, int8_t *codes, int codes_n, float *scales, int scales_n, Q4nxHeadImageInfo *info,

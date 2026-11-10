@@ -243,11 +243,13 @@ private:
     // quantisation, a wrong 128-K group boundary, an int8 intermediate or a saturated accumulator.
     bool host_gemm_i8_ = false;
     // Weight codes + per-128-K multipliers for the integer host arm, quantised once per tensor (engine#1809).
-    struct HostI8Tensor { int groups = 0; int N = 0; std::vector<int8_t> codes; std::vector<float> d; };
+    // `blocked` is the layout `codes` was packed in: blocked only when K x N is whole tiles (engine#1994).
+    struct HostI8Tensor { int groups = 0; int N = 0; bool blocked = true; std::vector<int8_t> codes; std::vector<float> d; };
     // Keyed on (LAYER, wkey, K, N): `wkey` alone is a per-role slot that repeats in every layer and `Bmat` is the one
     // scratch buffer each layer is decoded into, so keying on it served layer 0's weights to every later layer
     // (engine#1830 review). Routed experts pass wkey < 0 and are never cached: their weights change per token.
     std::map<std::tuple<int, int, int, int>, HostI8Tensor> host_i8_cache_;
+    std::vector<HostI8Tensor> lm_head_i8_;   // integer arm's head image, one per vocabulary block
     void host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat, int wkey, float* out);
     bool load_layer(int l);
     // `a_k` is the activation's REAL width per row (the design's real_k, i.e. the model's hidden or
@@ -281,7 +283,8 @@ private:
     // The same elementwise gate*up on caller memory, so a batched pass can read its ACT row and write its HH
     // row where they already are instead of staging both through a vector (a copy on each side).
     bool mlp(const float* gu, float* h, int im);
-    float rmsnorm(const float* x, const float* w, int n, float* out) const;
+    // `tag` is the NPU_INFER_DUMP_OPS label (ops-dump.h); the per-head q/k norms pass their own.
+    float rmsnorm(const float* x, const float* w, int n, float* out, const char* tag = "rmsnorm") const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;
     bool run_lm_head(const std::vector<float>& h, std::vector<float>& logits);
     // M rows of hidden state -> M x NV logits, row-major.  Same head, same packed tiles: the rows ride

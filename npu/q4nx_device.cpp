@@ -185,6 +185,9 @@ DeviceForm device_form(const std::string& model_path, const std::string& cache_d
         out.model = model;
         out.converted = true;
         out.reused = true;
+        // A reuse is a use. The cache's sweep (app/q4nx_cache.h) orders entries by this directory's mtime, which nothing
+        // else moves after the conversion is written; the stamp compares the SOURCE's mtime, so this does not disturb it.
+        fs::last_write_time(dir, fs::file_time_type::clock::now(), ec);
         std::fprintf(stderr, "1bit q4nx: reusing the device-form conversion of %s at %s\n",
                      model_path.c_str(), dir.c_str());
         return out;

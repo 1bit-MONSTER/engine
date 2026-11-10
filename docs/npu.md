@@ -287,8 +287,10 @@ image cache, P packed (W written for the next serve) in S s`. `ONEBIT_HEAD_IMAGE
 the cache off (nothing is read or written). The files are `kd × nd` bytes plus `nd` scales per
 tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set; nothing prunes them,
 the same as the device-form copies next to them. Ternary (`pb16i`) heads and the gemv head do not
-use it: their image already is a file. The behaviour is pinned host-side in
-`tests/npu_design_grid_test.c` with a counter on the gather.
+use it: their image already is a file. Each writer builds the file under its own name
+(`<file>.tmp.<pid>`) and renames it into place, so two serves that start cold on the same pack both
+finish their write and a reader only ever sees a whole image. The behaviour is pinned host-side in
+`tests/npu_design_grid_test.c` with a counter on the gather and a two-process write arm.
 
 **Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
 embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors

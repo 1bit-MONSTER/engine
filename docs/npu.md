@@ -1249,6 +1249,50 @@ layout checks are all there is, and the note says the values are not verified. M
 equals `bf16(-m/8)` of its 32-column embedding block, `m` being the block's largest-magnitude
 weight, and the read head correlates 0.996 with the embedding.
 
+**A pack whose every MatMulNBits is `block_size 32` keeps its layers in those units too**
+(engine#1503). `SmolLM2-135M-Instruct_rai_1.9.0_npu` declares block 32 on all 151 ops, and its
+*raw* Token `.fconst` (the file as shipped, not the 1.8-form copy the block-128 path makes) is
+`layers` blocks of one fixed shape and then the tail. With `H` = hidden, `Nq` = heads x head_dim,
+`Nkv` = KV heads x head_dim, `IM` = intermediate, `unit(K) = 2,560 + 2 x (K/32) x 640` (the head's
+unit above) and `mlp_unit(K) = 4,864 + 2 x (K/32) x 1,216`:
+
+| section | bytes | holds |
+|---|---|---|
+| envelope | `64 + 2H` | bf16 `rms_norm_eps`, zeros to 64, `input_layernorm` bf16[H] |
+| q, k, v | `(Nq/64 + 2 x Nkv/64) x unit(H)` | `q_proj` [Nq][H], `k_proj` [Nkv][H], `v_proj` [Nkv][H] |
+| — | `4 x heads` | not a weight; skipped |
+| o | `(H/64) x unit(Nq)` | `o_proj` [H][Nq] |
+| envelope | `64 + 2H` | epsilon, zeros, `post_attention_layernorm` bf16[H] |
+| gate + up | `(IM/64) x mlp_unit(H)` | `gate_proj` and `up_proj`, [IM][H] each |
+| — | 64 | skipped, not interpreted (`01` then zeros on the measured pack) |
+| down | `(H/64) x unit(IM)` | `down_proj` [H][IM] |
+
+The tail is the same envelope with the final norm, then `ceil(vocab/64)` head units at K = `H`,
+then zeros. On SmolLM2-135M the block is 2,360,292 B (q at 1,216, k at 231,616, v at 308,416, o at
+385,252, the second envelope at 615,652, gate/up at 616,868, down at 1,784,292), the head is at
+70,809,976 and the file is exactly `30 x 2,360,292 + 1,216 + 768 x 25,600 = 90,470,776` B.
+
+The **gate/up unit** is the head's unit with 64 row *slots* per strip instead of 32 rows: 4,864
+zero bytes, then `2 x (K/32)` strips of 1,216 B. Strip `s` holds K block `s/2`; slots 0..31 are
+`gate_proj` rows `32 x (s%2) .. +31` of the unit and slots 32..63 are the same rows of `up_proj`.
+A strip is 1,024 B of 4-bit codes (low nibble first; position `p` is slot `(p/256) x 8 + p%8`,
+column `(p/8) % 32`), 32 B of zero-point nibbles, 32 zero bytes, and 64 signed bf16 scales. The
+code order was measured against the public checkpoint; that zero point and scale are indexed by
+slot is assumed by analogy with the 640-byte strip, and is tested by the imported container's
+gate/up still correlating with the checkpoint once they are applied.
+
+`npu-pack import` takes this path when every op the pack's `cache/*_meta.json` declares is block 32,
+at least one of them is a layer projection, and the pack has a Token `.fconst` (a pack that
+declares only its head at 32 is the case above). Nothing is located by search: the offsets are
+arithmetic on the geometry, and the file has to agree with them — at least
+`layers x stride + 64 + 2H + ceil(vocab/64) x unit(H)` bytes, the pack's epsilon and zeros at every
+envelope, zero unit headers and strip gaps, finite scales, zeros after the head — or the tensors
+are refused by name with the offset. The container gets the same tensors in the same q4_1f tiles as
+a block-128 import; this layout has no bias field, so no bias tensor is written. There is no
+decode->encode round trip on this path (no encoder for these units exists), so the import's
+`attention:` and `MLP:` round-trip lines are replaced by a `block 32:` line. Measured on one pack
+only, where `Nq == H`; `o_proj`'s K being `Nq` is the declared shape, not a measurement.
+
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
 opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as
 `npu_pack_import`, and as `npu_pack_import_oga` when `-DONEBIT_OGA_PACK=<dir>` is given) checks

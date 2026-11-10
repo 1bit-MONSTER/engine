@@ -104,8 +104,23 @@ struct Lane::Impl {
             throw std::runtime_error("model.q4nx: model.norm.weight holds " + std::to_string(norm.bytes) +
                                      " bytes, fewer than hidden x 2");
         std::memcpy(fnorm->map(), norm.data, size_t(d.hidden) * 2);
-        if (model.tensor("model.embed_tokens.weight").bytes < size_t(d.vocab) * size_t(d.hidden) * 2)
-            throw std::runtime_error("model.q4nx: model.embed_tokens.weight holds fewer than vocab x hidden bf16 values");
+        // engine#1881 bounded this by the tensor's own span (`bytes`), which is right, but kept a **bf16** expected
+        // size -- and that refuses a quantised table for being smaller than an f32->bf16 table it never claimed to be
+        // (bonsai2-27b: 794,624,000 B of I8 chunks against 2,542,796,800 B). The expected size comes from the dtype now,
+        // and the comparison is made only where a row-major reading is meaningful:
+        //   * a float table (bf16/f16/f32) of V x H must be AT LEAST bytes(V*H*width) -- the case #1881 was written for,
+        //     a config overstating vocab, still refused;
+        //   * an I8 table is either plain row-major (exactly V*H bytes, the gemma4 layout) or a CHUNK GRID, whose shape
+        //     product is already a byte count (155,200 "rows" are 7,760 row tiles x 20 column tiles). Comparing those
+        //     against V*H is the mistake this guard made, so an I8 table keeps the file-end bound (`avail`), which is a
+        //     looser but never-wrong answer.
+        const Tensor& emb = model.tensor("model.embed_tokens.weight");
+        const uint64_t emb_need = emb.dtype == "I8" ? 0 : emb.expected_bytes(uint64_t(d.vocab) * uint64_t(d.hidden));
+        const uint64_t emb_have = emb_need ? emb.bytes : emb.avail;
+        if (emb_need ? (emb.bytes < emb_need) : (emb_have < size_t(d.vocab) * size_t(d.hidden) * 2))
+            throw std::runtime_error("model.q4nx: model.embed_tokens.weight holds " + std::to_string(emb_have) +
+                                     " bytes, fewer than the " + std::to_string(d.vocab) + " x " + std::to_string(d.hidden) +
+                                     " elements config.json declares" + (emb_need ? "" : " (I8 chunked table: file-end bound)"));
         lmhead_w = make_bo(dev, lmhead_weight_bytes(model));
         pack_lmhead_weights(model, static_cast<uint8_t*>(lmhead_w->map()));
 

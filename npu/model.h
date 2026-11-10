@@ -42,6 +42,12 @@ struct Tensor {
 
     // Tiles in a projection: shape[0] rows of shape[1] bytes, in 5120-byte tiles.
     int tiles() const;
+
+    // Bytes this tensor SHOULD occupy for `elements` logical elements, from its own dtype, or 0 for a dtype this reader
+    // does not decode. engine#1881 bounded the embedding by the tensor's own span (`bytes`) but kept a **bf16** figure as
+    // the expected size, which refuses a quantised table: bonsai2-27b's I8 tiled table is 794,624,000 B against that
+    // expression's 2,542,796,800 B. `bytes` is the right field; the expected number has to come from the dtype.
+    uint64_t expected_bytes(uint64_t elements) const;
 };
 
 struct Dims {

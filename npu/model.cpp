@@ -29,6 +29,20 @@
 
 namespace onebit::npu {
 
+uint64_t Tensor::expected_bytes(uint64_t elements) const {
+    // Element widths of the dtypes this reader decodes. Callers pass a row-major element count, so a tiled/chunked entry
+    // (whose shape product is already a byte count: its last dimension is the chunk's BYTES) must not be sent here --
+    // npu/lane.cpp checks `shape.size() == 2` for that reason. 0 means "not understood", and the caller then keeps the
+    // file-end bound rather than refusing on a guess.
+    uint64_t per = 0;
+    if (dtype == "BF16" || dtype == "F16") per = 2;
+    else if (dtype == "F32") per = 4;
+    else if (dtype == "I32") per = 4;
+    else if (dtype == "I8" || dtype == "U8") per = 1;
+    if (per == 0 || elements == 0) return 0;
+    return per * elements;
+}
+
 int Tensor::tiles() const {
     // [tile rows, tile cols, chunk bytes] (Q4NX with Q4_K or Q8 chunks, npu/q4nx.h)
     if (shape.size() == 3 && shape[0] > 0 && shape[1] > 0) return int(shape[0] * shape[1]);

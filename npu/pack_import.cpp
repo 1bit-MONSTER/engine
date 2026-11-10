@@ -585,20 +585,15 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // all 32 blocks. This is the largest family on #1503 (31 packs). Measured by another lane on main, whose
     // table is keyed on geometry; merged here in the same form.
     {4096, 32, 32, 12608, 5, 1, 2297856},
-    // Qwen3-8B at hidden 4,096 / 32 heads / **36** layers: measured with tools/fconst19_measure.py against
-    // amd/Qwen3-8B_rai_1.8.0_npu_16K, 26,104 of 3,756,627,264 bytes differ (6.95e-04 %) -- content, not layout.
-    // Every other field is IDENTICAL to the Mistral row directly above (prefix 12,608, 5 tiles of 2,297,856, rot 1),
-    // and that is the finding, not a copy-paste: the bundle shape and rotation are a property of the hidden size, not of
-    // the layer count, so a 36-layer pack at 4,096 rotates exactly like the 32-layer one. This row exists because
-    // select_rule_in() keys on (hidden, heads, layers) -- an 8B at 36 layers is a different file layout from the same
-    // geometry at 32, and deriving one from the other is what this table refuses to do.
-    // The header stride 104,350,656 is uniform over all 36 blocks (verified independently of this tool: 36 runs of
-    // 32 x `00 00 7f ff`, first at 13,796,032).
-    // What `--probe-wrong` separates here, stated because it is NOT all seven fields: rot+1 and tile/2 differ in
-    // 383,566,077 and 383,571,429 bytes (10.2 %, a factor of 14,700), so the rotation and the tile are pinned hard.
-    // `prefix+64` differs in only 32,960 bytes -- 1.26x the accepted residual and UNDER the tool's 37,566-byte
-    // tolerance -- so this pair does not isolate the prefix. `prefix = 12,608` rests on the Mistral row above and the
-    // Qwen3 arithmetic (64 + 2*hidden + 4,352) agreeing, which is exactly the caveat the 3,584 row carries too.
+    // Qwen3-8B at hidden 4,096 / 32 heads / **36 layers**: measured with tools/fconst19_measure.py against
+    // amd/Qwen3-8B_rai_1.8.0_npu_16K, 26,104 of 3,756,627,264 bytes differ (6.95e-06 of the file, which the tool prints
+    // as 6.95e-04 %) -- content, not layout, and the largest residual in this table, so it is stated rather than
+    // rounded away. Every other field is IDENTICAL to the 32-layer row above (prefix 12,608, five tiles of 2,297,856,
+    // rotation 1): at this hidden size the layer count moves nothing but the number of blocks, which is the first row
+    // here where that is true -- the h2048 pair above moves both the prefix and the division with the layer count
+    // (4,160/9 tiles at 36 layers against 8,512/3 tiles at 24), so this row is measured, not inferred from that one.
+    // Without it the importer refuses the pack by design ("its block shape has not been measured for hidden 4096, 32
+    // heads, 36 layers"), which is what it did until now: kernel family and fconst rule row are not the same partition.
     {4096, 32, 36, 12608, 5, 1, 2297856},
     // Llama-3.2-3B (and -Instruct, same geometry) at hidden 3,072 / 24 heads / 28 layers: measured with
     // tools/fconst19_measure.py against amd/Llama-3.2-3B_rai_1.8.0_npu_4K, 1,090 of 1,756,930,368 bytes differ

@@ -222,6 +222,12 @@ struct Plan {
     int64_t container_payload_bytes = 0;
     std::map<std::string, int64_t> container_dtypes;
     std::string container_note;   // what the container genre still needs, empty for a non-container pack
+    // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
+    // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
+    // disagree (13 of the 29 packs measured carry a `dims` block; all 29 carry config.json). Empty for a non-container pack.
+    std::string container_geometry_source;          // "dims", "config.json", or empty when neither answered
+    std::vector<std::string> container_geometry_missing;   // fields no source could fill, by name
+    std::vector<std::string> container_geometry_inferred;  // fields derived from another field, by name
     int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)

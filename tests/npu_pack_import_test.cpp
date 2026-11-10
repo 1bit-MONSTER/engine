@@ -4825,6 +4825,73 @@ void test_container_geometry() {
     }
 }
 
+// engine#1786 (item F1), slice 2: `plan()` reports WHERE a container's geometry came from. The three genres the census
+// measured are the three cases: `dims` answers (and beats a disagreeing config.json), config.json answers when there is
+// no `dims`, and neither answering is reported as unknown rather than as a zero geometry.
+void test_container_plan(const std::string& root) {
+    namespace fs = std::filesystem;
+    // Under ctest `root` is the source tree's tests/golden, so these three directories are removed on every way out:
+    // the arm is new, and leaving fixtures behind is the defect #2024 fixes for its neighbour -- not repeating it here.
+    struct Cleanup {
+        fs::path base;
+        ~Cleanup() {
+            for (const char* n : {"cg-dims", "cg-cfg", "cg-silent"}) {
+                std::error_code e;
+                fs::remove_all(base / n, e);
+            }
+        }
+    } cleanup{fs::path(root)};
+    const auto write_pack = [&](const std::string& name, const std::string& meta_json, const std::string& config) {
+        const fs::path dir = fs::path(root) / name;
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        std::string hdr = "{";
+        if (!meta_json.empty()) hdr += "\"__metadata__\":" + meta_json + ",";
+        hdr += "\"model.embed_tokens.weight\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[0,16]}}";
+        std::string out(8, '\0');
+        const int64_t n = int64_t(hdr.size());
+        for (int i = 0; i < 8; ++i) out[size_t(i)] = char((n >> (8 * i)) & 0xFF);
+        out += hdr;
+        out.append(16, '\x22');
+        std::ofstream(dir / "model.q4nx", std::ios::binary).write(out.data(), std::streamsize(out.size()));
+        if (!config.empty()) std::ofstream(dir / "config.json") << config;
+        return dir.string();
+    };
+    const std::string dims = "{\"dims\":{\"hidden_size\":576,\"intermediate_size\":1536,\"num_hidden_layers\":30,"
+                             "\"num_attention_heads\":9,\"num_key_value_heads\":3,\"vocab_size\":49152,"
+                             "\"head_dim\":64,\"rope_theta\":10000.0,\"model_type\":\"llama\"}}";
+
+    // 1. self-describing, and a config.json that disagrees: the container's own statement wins and is named.
+    {
+        const auto pl = pi::plan(write_pack("cg-dims", dims, "{\"hidden_size\": 1024}"));
+        check(pl.container_geometry_source == "dims", "plan: a self-describing container reports source=dims");
+        check(pl.dims.hidden == 576, "plan: dims.hidden comes from the container, not the disagreeing config.json");
+        check(pl.dims.layers == 30 && pl.dims.vocab == 49152, "plan: the container's geometry reaches the plan");
+        check(pl.container_geometry_missing.empty(), "plan: nothing is reported missing for a complete container");
+        check(pl.container_note.find("geometry from dims") != std::string::npos,
+              "plan: the note says which source answered");
+    }
+    // 2. gguf-converted: no dims, so config.json answers -- and the source says so.
+    {
+        const auto pl = pi::plan(write_pack("cg-cfg", "{\"converter\":\"tools/gguf_to_q4nx.py\"}",
+                                           "{\"hidden_size\":1024,\"num_hidden_layers\":28,"
+                                           "\"num_attention_heads\":16,\"num_key_value_heads\":8,"
+                                           "\"vocab_size\":151936,\"intermediate_size\":3072,"
+                                           "\"head_dim\":64,\"rope_theta\":1000000.0}"));
+        check(pl.container_geometry_source == "config.json", "plan: a converted container reports source=config.json");
+        check(pl.dims.hidden == 1024 && pl.dims.layers == 28, "plan: config.json supplies the geometry");
+    }
+    // 3. silent: neither answers, so the plan says the geometry is unknown instead of reporting zeros as facts.
+    {
+        const auto pl = pi::plan(write_pack("cg-silent", "", ""));
+        check(pl.container_geometry_source.empty(), "plan: the silent genre claims no source");
+        check(pl.container_geometry_missing.size() == 8, "plan: every required field is reported missing, by name");
+        check(pl.container_note.find("geometry is not known here") != std::string::npos,
+              "plan: the note says the geometry is unknown rather than printing a zero geometry");
+    }
+}
+
 // engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
 // a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
 // which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
@@ -5551,6 +5618,7 @@ int main(int argc, char** argv) {
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
+        test_container_plan(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);

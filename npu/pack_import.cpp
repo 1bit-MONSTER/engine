@@ -3391,11 +3391,33 @@ Plan plan(const std::string& pack_dir) {
             p.container_tensors = int64_t(c.tensors.size());
             p.container_payload_bytes = c.payload_bytes;
             for (const auto& t : c.tensors) p.container_dtypes[t.dtype]++;
+            // slice 2: the geometry, and the name of the source that answered. config.json is read through the ordinary
+            // loader so this genre and every other one agree about what config.json means (text_config lift, top-level
+            // wins) -- the container's own `dims` still takes precedence in container_geometry().
+            std::string cfg_source;
+            const json cfg = load_geometry(pack_dir, &cfg_source);
+            const ContainerGeometry g = container_geometry(c.meta, cfg);
+            p.dims = g.dims;
+            p.container_geometry_source = g.source;
+            p.container_geometry_missing = g.missing;
+            p.container_geometry_inferred = g.inferred;
+            std::string geom = g.source.empty()
+                ? "the container declares no `dims` and no config.json answered, so its geometry is not known here"
+                : "geometry from " + g.source;
+            if (!g.inferred.empty()) {
+                geom += " (";
+                for (size_t i = 0; i < g.inferred.size(); ++i) geom += (i ? ", " : "") + g.inferred[i];
+                geom += " inferred)";
+            }
+            if (!g.missing.empty()) {
+                geom += "; no source states ";
+                for (size_t i = 0; i < g.missing.size(); ++i) geom += (i ? ", " : "") + g.missing[i];
+            }
             p.container_note = c.why.empty()
                 ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +
-                      " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph. Reading it as a"
-                      " weights source needs the container-genre plan (engine#1786, item F1); until then this pack is"
-                      " recognised and reported, not importable."
+                      " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph; " + geom +
+                      ". Reading it as a weights source needs the container-genre plan (engine#1786, item F1); until"
+                      " then this pack is recognised and reported, not importable."
                 : "model.q4nx is present but unreadable: " + c.why;
             return p;
         }

@@ -70,7 +70,12 @@ try:
 except Exception:
     text, finish = body.strip(), None
 core = text.strip()
-if re.fullmatch(r"(.)\1{7,}", core, re.S):
+packed = re.sub(r"\s+", "", core)
+if len(packed) >= 6 and len(set(packed)) == 1:
+    # engine#1791's fix, which main's version did not carry: the reported symptom is "//////" (SIX), and the regex
+    # above needed eight, so a server answering exactly the reported string classified as 'clean'. One character
+    # repeated >= 6 (whitespace stripped, so "////// //////" is caught too) is the rule; six rather than four because
+    # a real completion can legitimately be a short repeated token.
     print("degenerate")
 elif core == "" and finish in ("length", None):
     print("clean-empty")
@@ -153,7 +158,7 @@ if [ "${1:-}" = "--self-test" ]; then
     self_test
     exit $?
 fi
-model=${2:?}
+model=${2:-}   # empty in CI unless ONEBIT_SERVE_TEST_GGUF is set: that is a SKIP, not a failure
 device=${3:?}
 ctx=${4:-512}
 [ "$ctx" -ge 64 ] 2>/dev/null || ctx=512
@@ -161,6 +166,7 @@ shift 3
 if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then shift; fi   # the optional ctx argument, when given
 
 [ -x "$bin" ] || { echo "skip: no 1bit at $bin"; exit 77; }
+[ -n "$model" ] || { echo "skip: no model given (set ONEBIT_SERVE_TEST_GGUF)"; exit 77; }
 [ -f "$model" ] || { echo "skip: no model at $model"; exit 77; }
 command -v curl > /dev/null || { echo "skip: no curl"; exit 77; }
 command -v python3 > /dev/null || { echo "skip: no python3"; exit 77; }

@@ -26,6 +26,7 @@ usage: tests/gguf_to_q4nx_test.py        (needs numpy and gguf)
 import hashlib
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -465,6 +466,81 @@ def rope_scaling_check(gguf_path, out, kind, ok):
     return ok and good and not left
 
 
+def other_arch_check(d, rng, ok):
+    """A GGUF of an architecture this converter has no names for (engine#2013).
+
+    The first unnamed tensor used to be the whole message (`no Q4NX name for blk.0.attn_gate.weight`), a
+    suffix-less one (blk.N.ssm_a) was a ValueError, and the empty output directory stayed behind.
+    """
+    tool = os.path.join(HERE, "..", "tools", "gguf_to_q4nx.py")
+    src, out = os.path.join(d, "gdn.gguf"), os.path.join(d, "gdn-out")
+    w = gguf.GGUFWriter(src, "qwen35")
+    w.add_block_count(1)
+    f = lambda *s: rng.standard_normal(s).astype(np.float32)  # noqa: E731
+    w.add_tensor("token_embd.weight", f(512, 256))
+    w.add_tensor("output_norm.weight", f(256))
+    w.add_tensor("blk.0.attn_norm.weight", f(256))
+    w.add_tensor("blk.0.attn_gate.weight", f(256, 256))
+    w.add_tensor("blk.0.ssm_out.weight", f(256, 256))
+    w.add_tensor("blk.0.ssm_a", f(48))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    checks = []
+    for cmd in ("pack", "verify"):
+        r = subprocess.run([sys.executable, tool, cmd, src, out], capture_output=True, text=True)
+        msg = r.stdout + r.stderr
+        checks += [
+            (f"{cmd}: a qwen35 GGUF exits non-zero without a traceback", r.returncode != 0 and "Traceback" not in msg),
+            (f"{cmd}: ... keeps the first unnamed tensor's name", "no Q4NX name for blk.0.attn_gate.weight" in msg),
+            (f"{cmd}: ... lists every unnamed kind, the suffix-less one too",
+             all(k in msg for k in ("blk.N.attn_gate.weight x1", "blk.N.ssm_out.weight x1", "blk.N.ssm_a x1"))),
+            (f"{cmd}: ... names the architecture and the converter that does pack it",
+             "'qwen35'" in msg and "tools/qwen35_to_q4nx.py" in msg),
+        ]
+        if not all(g for _, g in checks):
+            print(msg[-800:])
+    checks.append(("no output directory was created for it", not os.path.exists(out)))
+    for label, good in checks:
+        print(f"{'ok  ' if good else 'FAIL'} {label}")
+        ok = ok and good
+    return ok
+
+
+def foreign_type_check(good_gguf, d, ok):
+    """A tensor type the gguf package does not know is refused by number, not as an enum ValueError (engine#2013).
+
+    The file is a valid GGUF with one tensor's type field rewritten to 143 (PTQ1_0), which is what a PrismML
+    ternary GGUF looks like to the stock reader.
+    """
+    tool = os.path.join(HERE, "..", "tools", "gguf_to_q4nx.py")
+    src, out = os.path.join(d, "t143.gguf"), os.path.join(d, "t143-out")
+    with open(good_gguf, "rb") as f:
+        raw = bytearray(f.read())
+    name = b"blk.0.attn_q.weight"
+    at = raw.index(name) + len(name) + 4 + 2 * 8      # name, n_dims (u32), two u64 dims, then the type
+    assert struct.unpack_from("<I", raw, at)[0] == int(Q.Q4_0), "the type field is not where the test expects it"
+    struct.pack_into("<I", raw, at, 143)
+    with open(src, "wb") as f:
+        f.write(raw)
+    checks = []
+    for cmd in ("pack", "verify"):
+        r = subprocess.run([sys.executable, tool, cmd, src, out], capture_output=True, text=True)
+        msg = r.stdout + r.stderr
+        checks += [
+            (f"{cmd}: ggml type 143 exits non-zero without a traceback", r.returncode != 0 and "Traceback" not in msg),
+            (f"{cmd}: ... names the number and what it is", "quantisation type 143" in msg and "PTQ1_0" in msg),
+        ]
+        if not all(g for _, g in checks):
+            print(msg[-800:])
+    checks.append(("no output directory was created for it", not os.path.exists(out)))
+    for label, good in checks:
+        print(f"{'ok  ' if good else 'FAIL'} {label}")
+        ok = ok and good
+    return ok
+
+
 def main():
     ok = golden_tile()
     ok = golden_tile8() and ok
@@ -509,6 +585,8 @@ def main():
                 print(f"FAIL moe-q8 {cmd[0]} exited {r.returncode}")
                 ok = False
         ok = moe_check(os.path.join(d, "tiny-moe.gguf"), mq8, ok)
+        ok = other_arch_check(d, rng, ok)
+        ok = foreign_type_check(src, d, ok)
         dense_3d_gguf(os.path.join(d, "dense3d.gguf"), rng)
         ok = dense_3d_pack_check(os.path.join(d, "dense3d.gguf"), os.path.join(d, "dense3d"), ok)
         ok = tokenizer_flags_check(src, out, ok)

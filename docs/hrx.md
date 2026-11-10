@@ -86,7 +86,13 @@ fails a pin that leaves a gate model's node off HRX.
   `DRY_RUN=1` and pushes nothing):
   - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin). When AMD
     rewrites its history, the old `1bit/hrx-vulkan` tip is tagged `hrx-vulkan-<sha>` first,
-    and the run fails if that branch held a commit that is on no AMD branch;
+    and the run fails if that branch held a commit that is on no AMD branch. The failure
+    says which of two things that commit is, because they need opposite actions:
+    **rebased** (AMD's pin holds a commit with the same author, author date and subject:
+    AMD rebased its line and dropped the old one, so the commit is AMD's and the pin is merged
+    by hand) or **foreign** (no such commit: it is not AMD's and moves to
+    `1bit/hrx-vulkan-patched`). `scripts/bump-hrx-sync.sh off-branch <repo> <mirror> <pin>`
+    prints the classification alone, from a commits-only clone;
   - merges AMD's pin into `1bit/hrx-vulkan-patched`, after tagging the previous tip
     `patched-<sha>` so every commit the engine has pinned stays reachable. Conflicts under
     `ggml/src/ggml-hrx` keep our side; a conflict anywhere else fails the run and names the files;

@@ -416,6 +416,11 @@ struct Fconst19Rule {
 // against 5 x 591,872). A wrong row gets the ROTATION wrong, which leaves the prefix and the epsilon anchors untouched,
 // so it reads as a correct parse and answers quiet nonsense; that is why an ambiguous table refuses instead of picking.
 const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std::string* why);
+// The measured 1.9 rule table itself, with its row count, so a test can pin every row against the numbers that were
+// measured. Two failure modes this exists for, both seen on this table: a wrong digit in a row (which rotates a pack's
+// weights into the wrong projections while every anchor still lines up), and a row that a merge silently drops (the
+// h4096 row was lost twice that way, which un-measured a whole model class with nothing failing).
+const Fconst19Rule* fconst19_rules(int* count);
 // The same decision over an explicit table, so a test can hand it the one shape that decides correctness and that the
 // real table must never contain: two rows for one geometry with different shapes.
 const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,

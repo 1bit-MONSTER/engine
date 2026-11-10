@@ -1725,6 +1725,11 @@ namespace {
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                    std::string* why);   // defined with the table, internal to this file
 }
+const Fconst19Rule* fconst19_rules(int* count) {
+    if (count) *count = int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0]));
+    return kFconst19Rules;
+}
+
 const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std::string* why) {
     return select_rule_in(kFconst19Rules, int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0])), hidden, heads, layers,
                           why);

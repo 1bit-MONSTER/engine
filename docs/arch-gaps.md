@@ -1041,7 +1041,10 @@ takes the reviewed set: such a pack prints `. FLM ... registry: none (reviewed, 
 Still open, and alerting on purpose: `MiniCPMV4_7ForConditionalGeneration` (needs one converter registration, not an
 architecture), `MiniCPMOcrForConditionalGeneration` (own `minicpm-ocr` library), `smolvla-NPU2` (no config at all), and
 the `!! NPU FLM` families whose registry mapping is HRX-only (`hy_v3`, `dflash`, `gemma4`, `hunyuan-dense`, `gemma3`) —
-that last group is engine #588 (the family must be served on the NPU route), not a registry edit.
+that last group is **not a registry edit**: the family has to be served on the NPU route. It used to be recorded here as
+engine #588, which is **closed** (2026-10-27) and was about *watching FLM's releases*, not about serving a family on the
+route — so this class currently has **no owning issue**, and an arrival that lands in it is recorded on this page and
+nowhere else. See the 2026-11-10 section below for the arrivals that are sitting in it.
 
 ## Census run 2026-11-09 (`engine #1667`)
 
@@ -1072,9 +1075,11 @@ Left as they are, on purpose, under the policy above: the six `. REMOTE-CODE` cl
 (`HajeriOperatorForCausalLM`, `MM200ForCausalLM`, `K2HorizonForCausalLM`, `KLMForCausalLM`,
 `KimiK31SuperExpertForCausalLM`, `ThalamusReasoningQwen3_5ForConditionalGeneration`); the `? UNVERIFIABLE` gated repos,
 which are retried on every run; and the `!! FLM` lines. Those keep the 2026-11-08 reasons: `MiniCPMV4_7`, `MiniCPMOcr`
-and `smolvla` as above, and `!! NPU FLM` is engine #588. This run's issue window also includes the `gpt-oss`
+and `smolvla` as above, and `!! NPU FLM` was recorded as engine #588 — which is **closed** (2026-10-27) and was
+about watching FLM's releases, not about serving a family on the NPU route, so that class now has no owning issue
+(corrected 2026-11-10; see the section at the end of this page). This run's issue window also includes the `gpt-oss`
 (`GPT-OSS-20B`, `GPT-OSS-Safeguard-20b`) and `lfm2` (`LFM2-1.2B`, `LFM2-2.6B`) Q4NX packs. Their mapping is HRX-only
-too, so they belong to #588, not to a registry edit.
+too, so they are the same class — a route to serve, not a registry edit.
 
 ## 2026-11-10: `DeepseekV4FlashSuperExpertForCausalLM` — reviewed, and recorded here
 
@@ -1087,3 +1092,38 @@ the single undocumented entry out of 37.
   MLA-style geometry (`kv_lora_rank` 512, `q_lora_rank` 1536, `qk_rope_head_dim` 64, `v_head_dim` 128, 32 heads /
   16 KV, IM 4096). **Not an alias of `deepseek_v41`**: nothing at the pin decodes AW-SECD weights, so mapping it to
   that architecture would name a backend that cannot read the file. Reported, not alerted (`"watch": "report"`).
+
+## FLM 1.0.12's HRX build: four family roots with no row (engine#1787, 2026-11-10)
+
+F9 of `TNPU-ALL` §9 asks for a row for *every family FastFlowLM's HRX-targeted build serves and we do not*. The build is
+on the box, so the checklist was enumerated from it rather than from the release notes:
+
+```
+$ ls ~/flm-f9/xclbins | wc -l      -> 54     (per-family xclbin directories)
+$ ls ~/flm-f9/lib/*.so | wc -l     -> 34     (per-family shared objects)
+```
+
+Mapping each of the 54 by **family root** (not by model name: `Gemma3-1B` normalises to `gemma31b`, which appears nowhere,
+and matching that way reported 53 of 54 as unknown) against `registry/*.json`, `docs/registry.md` and this page:
+
+* **48** roots have a trace somewhere — spot-checked rather than assumed: `d3` → `D3LM` in `census.json`, `gemma3` →
+  `Gemma3ForCausalLM` in `architectures.json`, `qwen3.5` → `Qwen3_5ForConditionalGeneration`, `lfm2` → `Lfm2ForCausalLM`.
+* **6** xclbins over **4** family roots have **no trace at all**:
+
+| xclbin (FLM 1.0.12 HRX) | family root | state |
+|---|---|---|
+| `LFM2.5-1.2B` | `lfm2.5` | no row, no registry entry. We map `Lfm2ForCausalLM`, and `registry/significant.json` already carries the note *"lfm2-shaped config, different tensors"*, so a 2.5 generation is exactly the arrival this page exists to catch |
+| `LFM2.5-1.2B-Thinking` | `lfm2.5` | as above |
+| `Medgemma-1.5-4B` | `medgemma` | no row, no registry entry |
+| `Medgemma-4B` | `medgemma` | as above |
+| `Nanbeige4.1-3B` | `nanbeige4.1` | no row, no registry entry |
+| `Translategemma-4B-Instruct` | `translategemma` | no row, no registry entry |
+
+**These rows are un-inspected, and say so on purpose.** Nothing above describes what any of the four families computes: the
+xclbin names are evidence that *their* build carries a compiled family for it, and that is all. §1's five conditions are
+what converts an entry from *listed* to *settled* — imports with zero gaps and serving on the device, a known-answer prompt
+under the model's own template with three identical answers, decode tok/s and TTFT under a ticket, and the kernel set and
+engine commit named. Writing an architecture description from a model name is the defect this week has been about; a row
+that is honest about being un-inspected is more useful than a plausible paragraph.
+
+The `!! NPU FLM` class above is where these belong once someone owns it. As of this run that class has no owning issue.

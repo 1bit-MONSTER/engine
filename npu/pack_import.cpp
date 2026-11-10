@@ -1981,6 +1981,17 @@ TileW decode_tile(const uint8_t* tile, int k, int rows) {
 
 std::vector<uint8_t> encode_tile(const TileW& t) {
     if (t.k <= 0 || t.k % kKBlock) throw std::runtime_error("tile: K is not a positive multiple of 128");
+    /* engine#1918: the nibble packer below applies `& 0x0F`, so a code outside 0..15 WRAPS instead of saturating -- a
+     * weight a full code-range away that still looks plausible (`container == expected mod 4.0` over 32/32 columns of a
+     * group, measured on #1863's arm). Whether the caller is supposed to guarantee the range or the writer should clamp
+     * is not documented anywhere, and a wrapped weight on a model that then answers fluently is the worst outcome
+     * available; so the writer refuses instead, naming the position and the value. A caller that means 15 says 15. */
+    for (size_t i = 0; i < t.code.size(); ++i)
+        if (t.code[i] > 0x0F)
+            throw std::runtime_error("tile: code " + std::to_string(int(t.code[i])) + " at k=" + std::to_string(t.k) +
+                                     " rows=" + std::to_string(t.rows) + ", element " + std::to_string(i) +
+                                     ": a 4-bit code is 0..15, and packing it would wrap a full code range "
+                                     "(engine#1918) -- clamp or re-quantise before encoding");
     const int64_t sv = subv_bytes(t.rows);
     if (sv == 0) throw std::runtime_error("tile: rows is not a positive multiple of 64");
     const int nsubv = t.rows / 2, kbs = t.k / kKBlock;

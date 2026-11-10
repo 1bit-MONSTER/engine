@@ -1216,6 +1216,16 @@ endif()
 # q4nx_pack.c is listed here rather than reached through onebit_npu: the integer host arm's checks
 # (engine#1808) call q4nx_host_gemm_i8*() directly, and those live in that file.
 add_executable(npu_pack_test tests/npu_pack_test.cpp npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
+# A DFlash draft package as a model source (engine#1780): config + container -> a checked model whose tensors decode
+# one at a time. The loader is compiled here and not into onebit_npu because it needs the q4_1 tile decoder, which
+# lives with the forward (npu/forward/src/q4nx_dequant.c); it moves there with the draft's forward. Synthetic package,
+# so no model, no device; a real package is an optional argument (-DONEBIT_DFLASH_DRAFT=<dir>).
+add_executable(dflash_draft_test tests/dflash_draft_test.cpp npu/dflash_draft.cpp npu/forward/src/q4nx_dequant.c)
+target_include_directories(dflash_draft_test PRIVATE npu npu/forward/include)
+target_link_libraries(dflash_draft_test PRIVATE onebit_npu)
+add_dependencies(onebit dflash_draft_test)
+set(ONEBIT_DFLASH_DRAFT "" CACHE PATH "A DFlash draft package directory for dflash_draft_test's real-package arm")
+add_test(NAME dflash_draft COMMAND dflash_draft_test ${ONEBIT_DFLASH_DRAFT})
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)

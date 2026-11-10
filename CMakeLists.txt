@@ -55,6 +55,16 @@ endif()
 
 enable_testing()
 
+# engine#1864: the nine `add_test(... COMMAND ${Python3_EXECUTABLE} ...)` rows below this point need the interpreter, and
+# `find_package(Python3)` used to run ~700 lines LATER, so those rows expanded to an empty command: ctest then executed the
+# `.py` file directly and they worked only because the executable bit was set. A plumbing-built commit that rewrote a mode
+# 100755 -> 100644 with no content change turned one into `***Not Run (BAD_COMMAND)`. Required, not optional: a configure
+# without an interpreter cannot run these rows, and saying so here is better than discovering it as a ctest error.
+find_package(Python3 COMPONENTS Interpreter)
+if(NOT Python3_Interpreter_FOUND)
+    message(FATAL_ERROR "Python3 interpreter not found: the ci/registry/serve-classification ctest rows need it")
+endif()
+
 # Components are ported in the order listed in docs/PORTING.md.
 
 # ── The engine binary: `1bit serve`, an OpenAI-compatible API (docs/serve.md)
@@ -757,8 +767,7 @@ if(ONEBIT_LAYA_ROUTE_MODEL)
 endif()
 
 # The registry against the reviewed not-an-alias list (docs/arch-gaps.md) and the committed pins:
-# no checkouts or network.
-find_package(Python3 COMPONENTS Interpreter)
+# no checkouts or network. (Python3 was found near enable_testing(), engine#1864: the rows above need it too.)
 if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-gaps)
     # pin the guard's firing behavior: the committed registry always passes --check-gaps, so

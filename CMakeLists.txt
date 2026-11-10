@@ -201,12 +201,21 @@ add_test(NAME think_split COMMAND think_split_test)
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)
 add_test(NAME http_guard COMMAND http_guard_test)
+# The "the device is gone" classifiers of app/serve_watchdog.h: a backend's device-lost stderr line, and the
+# NPU runtime's failed-runlist message that makes `1bit unified` answer the request and exit non-zero. Header
+# only, no device, no model.
+add_executable(serve_watchdog_test tests/serve_watchdog_test.cpp)
+target_include_directories(serve_watchdog_test PRIVATE app)
+add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 # The NPU route's sampling controls and GBNF output constraint (app/npu_sampling.h,
 # app/npu_grammar.h, docs/npu.md "Sampling and structured output"); header only, no device.
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME npu_sampling COMMAND npu_sampling_test)
+# Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose target is
+# not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
+add_dependencies(npu_sampling_test serve_watchdog_test)
 # The MTP draft loop (npu/mtp/draft.h): draft k tokens, verify them as one batch, keep the longest prefix
 # the base model agrees with, roll its state back.  Policy only -- a toy base model and toy draft heads stand
 # in for the forward and the MTP head, so the invariants (identical text whatever the head proposes, exact

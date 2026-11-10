@@ -1270,6 +1270,11 @@ K=2048]`, and its graph's gains are in that gap in the same order in 24 of 24 la
 block offset 2,508,928, k_norm 320 B later). `wide_q_attn_section()` holds that division and names
 the gains; before it did, this pack was refused as declaring gains the layout did not hold.
 
+Where the gains are, by layout, in one place: a 4-header block keeps them in their own two sections,
+k first (Qwen3, above); a 2-header block keeps them in the 640 B gap between q/k/v and o_proj, q
+first, whether o_proj's K is hidden (Hunyuan-7B, Hy-MT2-1.8B) or q_proj's width (Hunyuan-0.5B). A
+pack that declares `use_qk_norm` and has them in none of these is refused (`qk_norm_refusal()`).
+
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
 one comparison holds every field, index and nibble order at once, and it is why a tile whose

@@ -3312,6 +3312,8 @@ WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t 
     if (payload <= 0 || qkv_tiles <= 0 || tile_bytes <= 0 || o_tiles <= 0 || o_tile_bytes <= 0) return s;
     const int64_t qkv_bytes = qkv_tiles * tile_bytes;
     s.gap = payload - qkv_bytes - o_tiles * o_tile_bytes;
+    // The ceiling is a derived bound, not a measurement: two bf16 [head_dim] gains plus 256 B of headers and padding
+    // (768 at head_dim 128, 512 at 64). Only the offsets below are measured.
     if (s.gap < 0 || s.gap > int64_t(2) * head_dim * 2 + 256) return s;
     s.ok = true;
     s.o_off = attn_off + qkv_bytes + s.gap;

@@ -796,7 +796,7 @@ if(Python3_Interpreter_FOUND)
     # forward offers is f32 -- which cannot be bit-exact with an int8 x int4 device by construction. This pins
     # the integer arm (q4nx_host_gemm_i8) against an independently generated known answer, including an
     # activation of -128 so a naive int8 intermediate or an int32 saturation would show. Pure host, no device.
-    add_executable(npu_host_gemm_i8_test tests/npu_host_gemm_i8_test.cpp)
+    add_executable(npu_host_gemm_i8_test tests/npu_host_gemm_i8_test.cpp npu/forward/src/q4nx_pack.c)
     target_include_directories(npu_host_gemm_i8_test PRIVATE npu/forward/include ${CMAKE_SOURCE_DIR}/tests)
     target_link_libraries(npu_host_gemm_i8_test PRIVATE onebit_npu)
     add_test(NAME npu_host_gemm_i8 COMMAND npu_host_gemm_i8_test)

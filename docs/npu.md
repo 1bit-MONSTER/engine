@@ -784,6 +784,36 @@ weights over the bound. The Q6_K tensors (half of `v_proj` and `down_proj`, and
 0.079. Served on the NPU, the repacked model decoded 24/24 greedy tokens the same as a CPU
 reference of the repacked weights, with every step's logits at cosine 0.99995 or better.
 
+### What the GGUF converter refuses, and the qwen35 converter
+
+`tools/gguf_to_q4nx.py` converts qwen3, qwen3moe and qwen2. Two other inputs are refused before
+anything is written, with no output directory left behind (engine#2013):
+
+- **A GGUF of another architecture.** Every tensor kind without a Q4NX name is listed in one message,
+  with how many tensors of each there are. For `qwen35` the message points at the converter below.
+- **A tensor type the installed `gguf` package does not know.** The refusal gives the number;
+  143 is PTQ1_0, PrismML's ternary type, which `tools/ternary_to_q4_0.py` rewrites as Q4_0.
+
+`tools/qwen35_to_q4nx.py pack <model.gguf> <out dir> [--tokenizer <dir>]` packs a **qwen35** GGUF:
+layers of gated linear attention (GDN) with a full-attention layer every
+`qwen35.full_attention_interval`. It writes the names the forward looks up
+(`linear_attn.qkv_proj`, `self_attn.gate_proj`, `linear_attn.ssm_*`), reorders the 48 value heads
+from the stored order to the grouping the forward expects, and stores `ssm_alpha`/`ssm_beta` as Q8
+tiles padded to 64 rows. It reads the GGUF itself and needs only numpy. `verify <model.gguf>
+<out dir>` checks every tensor of a container against the GGUF, including the direction of the
+value-head reorder.
+
+Its input has to be a plain qwen35 GGUF in Q4_0 or Q4_1. It refuses, by name:
+
+- a file that still carries `prism.hadamard.*` keys: the weights are in a rotated basis, the tool
+  writes no sign table, and the container would load and answer wrongly;
+- PTQ1_0 tensors (ggml type 143).
+
+So a PrismML ternary GGUF needs two steps before this one: PTQ1_0 to Q4_0
+(`tools/ternary_to_q4_0.py`, which keeps the rotation) and the un-rotation, which is not in this
+tree. The 27B container on the dev box (`__metadata__.converter = qwen35_to_q4nx.py`) was made from
+an un-rotated Q4_0 GGUF.
+
 ### Routed expert stacks
 
 A MoE GGUF keeps its routed experts as one three-dimensional tensor per projection

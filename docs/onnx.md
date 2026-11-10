@@ -463,6 +463,12 @@ silent fall back cannot be mistaken for a device pass.
 
 ## Any graph: `ort-run --input`
 
+> **Two entry points, and only one of them has `--input`** (engine#2000). The arbitrary-graph mode below is
+> the standalone `ort_run` binary — build it with `ninja ort_run` (`ninja onebit` does **not** build it), then
+> run `build/ort_run …`. The habitual `1bit ort-run` subcommand does not accept `--input`, `--output` or
+> `--dump-all` and answers `onebit-ort-run: unknown argument --input`. If a build that looks complete has no
+> `build/ort_run`, that is why.
+
 `ort-run` speaks two interfaces. With `--ids` it is the Qwen3 language model of
 [Qwen3-0.6B](#qwen3-06b) below. With `--input` it is **any** ONNX graph: nothing about the graph's
 names, shapes or roles is assumed, so a vision model, an audio model and a one-op toy all take the

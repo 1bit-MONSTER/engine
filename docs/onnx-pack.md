@@ -99,6 +99,22 @@ model.
 | gate/up `1024×3072` | CPU EP | same |
 | lm_head `1024×151936` | CPU EP | needs a vocab-blocked kernel (N far past one ELF); leave on the CPU until the FFN set is proven |
 
+### A pack's own `*.onnx` component may be vendor-EP targeted (engine#2000)
+
+"It is ONNX" does not mean "it will run". A 1.9 pack's side components look portable — a clean ONNX
+interface, e.g. `vision.onnx` declaring `pixel_values [num_patches,1536] f32` and `image_grid_thw [1,3] i64`
+→ `image_features [num_logical_patches,2560] f32` — and still will not load under the plain ONNX Runtime
+execution providers:
+
+```
+Fatal error: com.ryzenai:DynamicPad(-1) is not a registered function/op
+```
+
+`com.ryzenai:*` is a custom domain (`DynamicPad`, `matmul_add_to_sd_gemm`, `mha_to_sd_mha`,
+`conv_to_nhwc_conv` in that pack's `*_strategy.yaml`), so there is **no CPU-EP oracle**: the component has
+to go through its compiled `partitioned/` form. Before treating a component as a reference, check its
+op domains — an `ai.onnx`-only graph is a reference you can run, anything with a vendor domain is not.
+
 ## What the pack does not do, deliberately
 
 - **KV cache: opt-in, not the default.** The default export re-runs the whole sequence per step, so its

@@ -195,6 +195,33 @@ int main() {
         });
         check(why.find("runs past the end") != std::string::npos, "a projection larger than the file is refused");
     }
+    {  // engine#1881: k_proj claims four tiles and holds one, with more tensors AFTER it in the file. Bounded by the end
+        // of the file (`avail`), the packer read three tiles of v/o/down as k_proj's; bounded by the tensor, it refuses.
+        std::vector<Entry> e = one_layer();
+        for (auto& x : e)
+            if (x.name == "model.layers.0.self_attn.k_proj.weight") x.shape = {4, 5120};   // bytes stay 5120
+        write_model(root / "k-overread", e);
+        const std::string why = thrown([&] {
+            Model m((root / "k-overread").string());
+            std::vector<uint8_t> w(layer_weight_bytes(m));
+            pack_layer_weights(m, 0, w.data());
+        });
+        check(why.find("run into the next tensor") != std::string::npos,
+              "a projection that over-reads into the NEXT tensor (not past the file) is refused (" + why + ")");
+    }
+    {  // engine#1881: input_layernorm holds 128 of the 256 bytes hidden x 2 needs; the next tensor follows it
+        std::vector<Entry> e = one_layer();
+        for (auto& x : e)
+            if (x.name == "model.layers.0.input_layernorm.weight") { x.shape = {64}; x.bytes = 128; }
+        write_model(root / "norm-short", e);
+        const std::string why = thrown([&] {
+            Model m((root / "norm-short").string());
+            std::vector<uint8_t> i5(4 * 128);
+            fill_i5(m, 0, i5.data());
+        });
+        check(why.find("input_layernorm") != std::string::npos && why.find("next tensor") != std::string::npos,
+              "a layer norm shorter than hidden x 2 is refused, not completed from its neighbour (" + why + ")");
+    }
     {  // gate/up of one tile each: the interleave would write a whole chunk past the layer's buffer
         write_model(root / "chunks", one_layer({1, 5120}, 1));
         const std::string why = thrown([&] {

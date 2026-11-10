@@ -98,6 +98,55 @@ def referenced(root, need):
     return found
 
 
+SELF_TEST_FLAGS = ("--self-test", "--selftest")
+
+
+def tools_with_selftest(root):
+    """tools/*.py that DECLARE a self-test flag (engine#1901).
+
+    Narrow on purpose: a blanket "every tools/*.py is referenced" sweep is 16 of 60 today and most of those are legitimate
+    CLI-only tools, which is too noisy to be a ratchet. A tool that ships `--self-test` makes a different claim -- that it
+    can be verified without its real inputs -- and a claim nothing runs is not backed: the arm exists, is maintained with the
+    logic in the same commits, and never executes.
+    """
+    out = []
+    tools = root / "tools"
+    if not tools.is_dir():
+        return out
+    for path in sorted(tools.glob("*.py")):
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        if any(flag in text for flag in SELF_TEST_FLAGS):
+            out.append(path.name)
+    return out
+
+
+def registered_tools(root, need):
+    """{name: [files]} naming each tool in a REGISTRATION file -- CMakeLists.txt or cmake/*.cmake.
+
+    Not `referenced()`: a tool mentioned in a script, a doc or another tool is not run by anything. The claim being checked
+    is that a registration exists, so only the two places that register tests count.
+    """
+    found = {name: [] for name in need}
+    regs = [root / "CMakeLists.txt"] + sorted((root / "cmake").glob("*.cmake"))
+    # A tests/*.py counts too: a registered test that imports the tool runs it, and `spec_decode_acceptance` is exactly
+    # that case (CMakeLists names tests/spec_decode_acceptance_test.py, not the tool). Measured while writing this: the
+    # narrower rule reported it as unrun, which is the false positive that would have made the ratchet noise.
+    regs += sorted((root / "tests").glob("*.py")) if (root / "tests").is_dir() else []
+    for path in regs:
+        if not path.is_file():
+            continue
+        text = path.read_text(errors="replace")
+        for name in need:
+            # a registration names the file (`tools/x.py --self-test`); a test that imports it names the STEM
+            # (`import x`) -- both run it, which is the question this asks
+            if name in text or pathlib.PurePosixPath(name).stem in text:
+                found[name].append(str(path.relative_to(root)))
+    return found
+
+
 def check(root):
     tests = root / "tests"
     if not tests.is_dir():
@@ -117,7 +166,12 @@ def check(root):
     for name in idle:
         print("tests_referenced: %s is in %s but it IS referenced now -- drop the line, it suppresses nothing"
               % (name, ALLOW))
-    if drift or gone or idle:
+    unrun = [n for n in tools_with_selftest(root) if not registered_tools(root, [n])[n] and n not in allow]
+    for name in unrun:
+        print("tests_referenced: tools/%s declares a self-test and nothing registers it -- add a ctest row "
+              "(add_python_test in CMakeLists.txt), or list it in %s with the reason its self-test cannot be a row"
+              % (name, ALLOW))
+    if drift or gone or idle or unrun:
         return 1
     print("tests_referenced: all %d test script(s) are referenced%s" % (
         len(need), "" if not allow else " (%d deliberately not a row: %s)" % (len(allow), ", ".join(sorted(allow)))))
@@ -181,7 +235,25 @@ def self_test():
                    str(ALLOW): "tests/keeper2.sh   # path form is accepted\n"})
     cases.append(("a path-form allow entry is accepted", check(r), 0, None))
 
-    # 8. no tests/ at all -> cannot tell, not "clean"
+    # 8. engine#1901: a tools/*.py that DECLARES a self-test and nothing registers
+    r = root_with({"tests/one.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME one COMMAND one.sh)\n",
+                   "tools/orphan_self.py": "ok = True\nif '--self-test' in argv: pass\n"})
+    cases.append(("a tool with an unregistered self-test is drift", check(r), 1, "tools/orphan_self.py"))
+    cases_root["a tool with an unregistered self-test is drift"] = r
+    # ... and the same tool once a registration names it is clean (so the arm above is not just "tools/ exists")
+    r = root_with({"tests/one.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME one COMMAND one.sh)\nadd_python_test(orphan tools/orphan_self.py --self-test)\n",
+                   "tools/orphan_self.py": "ok = True\nif '--self-test' in argv: pass\n"})
+    cases.append(("a registered self-test is not drift", check(r), 0, None))
+    # ... and a tool a registered tests/*.py imports is RUN, even though no CMake line names the file
+    r = root_with({"tests/one.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME one COMMAND one.sh)\n",
+                   "tests/uses_tool.py": "import sys; sys.path.insert(0, 'tools'); import orphan_self\n",
+                   "tools/orphan_self.py": "ok = True\nif '--self-test' in argv: pass\n"})
+    cases.append(("a tool a registered test imports is not drift", check(r), 0, None))
+
+    # 9. no tests/ at all -> cannot tell, not "clean"
     r = root_with({"CMakeLists.txt": ""})
     cases.append(("no tests/ directory is 'cannot tell'", check(r), 2, None))
 

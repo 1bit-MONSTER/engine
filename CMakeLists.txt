@@ -725,6 +725,16 @@ add_python_test(copyright_check_untracked ${CMAKE_SOURCE_DIR}/tests/copyright_ch
 # loaded box yields VOID instead of a number.  The self-test is the estimator's own gate and needs no GPU: it accepts
 # agreement, refuses disagreement, and proves a dropped run cannot shift an arm.
 add_python_test(fa_ratio_estimator ${CMAKE_SOURCE_DIR}/tools/fa_ratio.py --self-test)
+# engine#1901: five tools that DECLARE a self-test and were registered nowhere -- the arm existed, was maintained with the
+# logic, and never executed. `tools/ci/tests_referenced_check.py` now fails on that state (a tools/*.py with `--self-test`
+# that no registration names), so this list cannot rot back. Note the flag spelling is per tool, not a convention: three
+# take `--selftest` and two `--self-test`, which is the split engine#1901 exists to make visible -- a registration using
+# the wrong one exits non-zero and fails loudly here rather than silently running nothing.
+add_python_test(batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
+add_python_test(logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
+add_python_test(mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
+add_python_test(template_bom ${CMAKE_SOURCE_DIR}/tools/template_bom.py --self-test)
+add_python_test(whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools/whisper_encoder_baseline.py --self-test)
 add_dependencies(onebit route_log_test)
 # CI builds `--target onebit` plus a fixed list in .github/workflows/ci.yml; building this check with onebit
 # keeps the laya_models ctest from reporting "Not Run" without a workflow change.

@@ -1665,6 +1665,14 @@ if [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1; then
             HRXLIB=$(sed -n 's/^IREE_HAL_AMDGPU_LIBHSA_PATH=//p;s/^ONEBIT_HRX_LIBHSA=//p' /etc/1bit/libhsa.env 2>/dev/null | head -1)
             [ -n "$HRXLIB" ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$HRXLIB"
         fi
+        # A runtime that LOADS is not a runtime that initialises: libhsa can be present and still lack a symbol the
+        # backend needs (`hsa_amd_queue_create`, measured on a distro ROCr), and ldd cannot see that - it resolves NEEDED
+        # libraries, never symbols. So the row is told the reason by the backend's own log line, and repeating it is the
+        # difference between "no HRX0 listed" (which reads as a GPU fault) and "the HRX runtime did not initialise:
+        # NOT_FOUND: symbol 'hsa_amd_queue_create' not found" (engine#1766).
+        hrx_init_reason() {
+            printf '%s\n' "$1" | grep -m1 'hrx_gpu_initialize(0) failed:' | sed 's/.*failed: *//'
+        }
         HRXUNLOADABLE=
         if [ -n "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ]; then
             # ldd where it exists (it lists EVERY missing library); the loader itself where it does not - and the loader
@@ -1695,7 +1703,12 @@ if [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1; then
             elif printf '%s' "$LD" | grep -qi "INCOMPATIBLE\|only systems with SVM"; then
                 fail hrx-device "no HRX0 listed: $(printf '%s\n' "$LD" | grep -i 'INCOMPATIBLE\|only systems with SVM' | head -1)"
             else
-                fail hrx-device "no HRX0 listed by $LSRV (${LD:+$(printf '%s' "$LD" | tr '\n' ' ' | cut -c1-120)})"
+                HRXREASON=$(hrx_init_reason "$LD")
+                if [ -n "$HRXREASON" ]; then
+                    fail hrx-device "the HRX runtime did not initialise: $HRXREASON (it loaded, so this is not a missing library; a symbol or config the runtime needs is absent)"
+                else
+                    fail hrx-device "no HRX0 listed by $LSRV (${LD:+$(printf '%s' "$LD" | tr '\n' ' ' | cut -c1-120)})"
+                fi
             fi
         fi
     fi

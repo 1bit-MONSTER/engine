@@ -35,10 +35,17 @@ jobs:
     steps:
       - name: Tools for checkout and the build
         run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git \
-            python3 python3-venv curl jq file procps make gcc-16 g++-16 cmake ninja-build libcurl4-openssl-dev libzstd-dev \
-            libssl-dev libdrm-dev libpcre2-dev
+          pkgs="ca-certificates git python3 python3-venv curl jq file procps make gcc-16 g++-16 cmake ninja-build \
+            libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev libpcre2-dev"
+          # The archive mirrors behind security.ubuntu.com have served an index whose .debs then 404
+          # (main 11-10 04:33Z and 05:45Z: perl 5.40.1-7ubuntu0.4), and a re-run passed. Retry the
+          # update and the install together, so a retry re-reads the index and can reach another mirror.
+          for try in 1 2 3; do
+            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=3 $pkgs && break
+            [ "$try" = 3 ] && exit 1
+            echo "apt attempt $try failed; retrying in $((try * 30)) s"; sleep $((try * 30))
+          done
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 -m venv /opt/ci-venv && echo /opt/ci-venv/bin >> "$GITHUB_PATH"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

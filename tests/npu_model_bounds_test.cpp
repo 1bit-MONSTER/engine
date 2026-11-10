@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -68,7 +69,8 @@ struct Entry {
 // Writes dir/model.q4nx (tensors packed in order, zero-filled) and dir/config.json.
 // `header_len` / `offsets` override the honest values when set.
 void write_model(const fs::path& dir, const std::vector<Entry>& entries, uint64_t header_len = 0,
-                 const json& bad_offsets = nullptr, const std::string& bad_name = "") {
+                 const json& bad_offsets = nullptr, const std::string& bad_name = "",
+                 const json& extra_cfg = json::object()) {
     fs::create_directories(dir);
     json table = json::object();
     uint64_t off = 0;
@@ -84,13 +86,14 @@ void write_model(const fs::path& dir, const std::vector<Entry>& entries, uint64_
     f << h;
     const std::vector<char> zeros(off, 0);
     f.write(zeros.data(), long(zeros.size()));
-    std::ofstream(dir / "config.json") << json{{"hidden_size", 128},
-                                               {"num_hidden_layers", 1},
-                                               {"num_attention_heads", 1},
-                                               {"num_key_value_heads", 1},
-                                               {"head_dim", 128},
-                                               {"intermediate_size", 128}}
-                                              .dump();
+    json cfg{{"hidden_size", 128},
+             {"num_hidden_layers", 1},
+             {"num_attention_heads", 1},
+             {"num_key_value_heads", 1},
+             {"head_dim", 128},
+             {"intermediate_size", 128}};
+    for (auto it = extra_cfg.begin(); it != extra_cfg.end(); ++it) cfg[it.key()] = it.value();
+    std::ofstream(dir / "config.json") << cfg.dump();
 }
 
 // A one-layer model: every projection is one 5120-byte tile, except gate/up, which fill one
@@ -129,6 +132,43 @@ int main() {
             pack_lmhead_weights(m, lm.data());
         });
         check(why.empty(), "a well-formed model loads and packs" + (why.empty() ? "" : " (" + why + ")"));
+    }
+    {  // engine#1782: vocab_size from config.json, with the tied table shipped ONLY as `lm_head.weight`
+        std::vector<Entry> e = one_layer();
+        for (auto& x : e)
+            if (x.name == "model.embed_tokens.weight") x.name = "lm_head.weight";
+        write_model(root / "tied-head-only", e, 0, nullptr, "",
+                    json{{"vocab_size", 777}, {"tie_word_embeddings", true}});
+        std::string why = thrown([&] {
+            Model m((root / "tied-head-only").string());
+            check(m.dims().vocab == 777, "tied pack: vocab comes from config.json (got " +
+                                             std::to_string(m.dims().vocab) + ")");
+        });
+        check(why.empty(), "a pack whose tied table is only `lm_head.weight` loads" +
+                               (why.empty() ? "" : " (" + why + ")"));
+    }
+    {  // engine#1782: no vocab_size anywhere -> the TILED row count, not the tile count
+        std::vector<Entry> e = one_layer();
+        for (auto& x : e)
+            if (x.name == "model.embed_tokens.weight") x.shape = {2, 4, 8704};
+        write_model(root / "tiled-embed", e);
+        std::string why = thrown([&] {
+            Model m((root / "tiled-embed").string());
+            check(m.dims().vocab == 2 * 32, "tiled embed: 2 tiles x 32 rows is vocab 64, not 2 (got " +
+                                                std::to_string(m.dims().vocab) + ")");
+        });
+        check(why.empty(), "a tiled embedding without vocab_size derives rows, not tiles" +
+                               (why.empty() ? "" : " (" + why + ")"));
+    }
+    {  // engine#1782: neither -> refused by name, not by "model has no tensor"
+        std::vector<Entry> e = one_layer();
+        e.erase(std::remove_if(e.begin(), e.end(),
+                               [](const Entry& x) { return x.name == "model.embed_tokens.weight"; }),
+                e.end());
+        write_model(root / "no-embed", e);
+        const std::string why = thrown([&] { Model m((root / "no-embed").string()); });
+        check(why.find("vocab_size") != std::string::npos && why.find("embedding table") != std::string::npos,
+              "a container with neither vocab_size nor an embedding table is refused by name (" + why + ")");
     }
     {  // header length past the end of the file, close enough to 2^64 that 8 + len wraps
         write_model(root / "header", one_layer(), ~uint64_t(0) - 4);

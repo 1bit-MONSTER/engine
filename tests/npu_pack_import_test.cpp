@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -625,6 +626,100 @@ void test_canonical_copy_reusable() {
           "reuse: an empty copy is not the canonical form of a non-empty body");
     fs::remove_all(dir, ec);
     std::printf("  canonical copy reuse: 7 arms (complete/truncated/long/absent/directory/zero-length/empty)\n");
+}
+
+// engine#1770: the canonical copy is scratch that used to only ever accumulate -- reuse writes a new file when the source
+// changes, so 699 files / 8.7 GiB of tmpfs (RAM) had built up on one box. The eviction rule is "same pack and geometry,
+// different source identity", and what can go wrong is deleting one of the neighbours that must survive, so each is an arm.
+void test_evict_stale_canonical_copies() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-evict-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    auto touch = [&](const std::string& base) {
+        std::ofstream o(dir / base, std::ios::binary | std::ios::trunc);
+        o << 'x';
+    };
+    const std::string keep = "1bit-fconst19v1-12345-896-14-24-291653952-76263210.fconst";
+    const std::string prefix = "1bit-fconst19v1-12345-896-14-24-";
+    const std::string stale = "1bit-fconst19v1-12345-896-14-24-291653952-99999.fconst";     // same pack+geometry, new mtime
+    const std::string stale_size = "1bit-fconst19v1-12345-896-14-24-300000000-76263210.fconst";  // repacked source
+    const std::string other_geometry = "1bit-fconst19v1-12345-1536-12-28-995712640-73345656.fconst";
+    const std::string other_pack = "1bit-fconst19v1-99999-896-14-24-291653952-76263210.fconst";
+    const std::string other_form = "1bit-fconst19v2-12345-896-14-24-291653952-76263210.fconst";
+    const std::string unrelated = "notes.txt";
+    // The split must not change the NAME, or every run rewrites a copy it already had (a ~1 GB rewrite, silently). The
+    // legacy formula concatenated these fields directly; the fix only cuts the string at the size field.
+    check(keep == prefix + "291653952-76263210.fconst",
+          "evict: prefix + source identity is the name the reuse path looks for, unchanged");
+    for (const auto& f : {keep, stale, stale_size, other_geometry, other_pack, other_form, unrelated}) touch(f);
+
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix);
+
+    auto exists = [&](const std::string& base) { return fs::exists(dir / base, ec); };
+    check(exists(keep), "evict: the copy being written is kept");
+    check(!exists(stale), "evict: a copy of the same pack and geometry at another mtime goes (the accumulation)");
+    check(!exists(stale_size), "evict: a repacked source's copy goes (different size, same pack and geometry)");
+    check(exists(other_geometry), "evict: another geometry of the same pack is kept -- it is not this run's to remove");
+    check(exists(other_pack), "evict: another pack with the same geometry is kept");
+    check(exists(other_form), "evict: another canonical form version is kept");
+    check(exists(unrelated), "evict: unrelated files in the directory are kept");
+
+    // engine#1770 (second generation): the pre-version naming has no source identity, so a prefix match on the current form
+    // never sees it -- three such files sat in /tmp for a day at 3.6 GB each, i.e. 10.67 GiB of RAM.
+    const std::string legacy = "1bit-fconst19-12345-896-14-24.fconst";
+    const std::string legacy_other_geometry = "1bit-fconst19-12345-1536-12-28.fconst";
+    touch(legacy);
+    touch(legacy_other_geometry);
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix, legacy);
+    check(!exists(legacy), "evict: the pre-version name for THIS geometry goes (no identity to reuse)");
+    check(exists(legacy_other_geometry), "evict: ... but another geometry's pre-version name is kept");
+
+    // and the abandoned tail: a pack nobody imports again is only reachable by age, because the sweep runs when a pack is
+    // written. 0 must disable it, so the callers that pass nothing keep the old behaviour.
+    const std::string old_other = "1bit-fconst19v1-77777-1536-12-28-995712640-73345656.fconst";
+    const std::string fresh_other = "1bit-fconst19v1-88888-1536-12-28-995712640-73345656.fconst";
+    touch(old_other);
+    touch(fresh_other);
+    const auto seven_hours_ago = fs::file_time_type::clock::now() - std::chrono::hours(7);
+    fs::last_write_time(dir / old_other, seven_hours_ago, ec);
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix, legacy, 6 * 3600);
+    check(!exists(old_other), "evict: an abandoned geometry older than the age goes (the tail a write cannot reach)");
+    check(exists(fresh_other), "evict: a fresh copy of another geometry stays -- another run may be writing it");
+
+    // engine#1797 review: the age rule reads `last_write_time`, and reuse used to READ the copy without writing it -- so
+    // a file in continuous use aged past `max_age_seconds` and was swept, and the next run rewrote it. The repair is
+    // that reuse now touches the copy, which makes the timestamp mean "last use". This arm pins the rule that repair
+    // relies on: a copy with a FRESH mtime survives an age sweep, and one with an old mtime does not.
+    {
+        // DIFFERENT geometry (hidden 1536), so the name rule cannot reach them and only the age rule decides -- which is
+        // the rule this arm is about. Same geometry would test the name rule instead, and my first version of this arm
+        // made exactly that mistake and failed on it.
+        const std::string stem = "1bit-fconst19v1-";
+        const std::string aged = stem + "12345-1536-12-28-995712640-73345656.fconst";
+        const std::string fresh_name = stem + "12345-1536-12-28-500000000-11111111.fconst";
+        touch(aged);
+        touch(fresh_name);
+        std::error_code tec;
+        fs::last_write_time(dir / aged, fs::file_time_type::clock::now() - std::chrono::hours(10), tec);
+        check(!tec, "evict age: the fixture can age a copy");
+        // 6 h window: the 10 h copy goes, the one just written stays
+        pi::evict_stale_canonical_copies(dir.string(), keep, prefix, "", 6 * 3600);
+        check(!exists(aged), "evict age: a copy nobody has touched for 10 h is swept");
+        check(exists(fresh_name), "evict age: a copy with a fresh mtime survives -- what reuse's touch produces");
+        check(exists(keep), "evict age: and the copy being written is still kept");
+    }
+    // The degenerate arguments must not turn into "delete the directory".
+    for (const auto& f : {keep, stale}) touch(f);
+    pi::evict_stale_canonical_copies(dir.string(), "", prefix);
+    check(exists(keep) && exists(stale), "evict: an empty keep-name removes nothing");
+    pi::evict_stale_canonical_copies(dir.string(), keep, "");
+    check(exists(keep) && exists(stale), "evict: an empty prefix removes nothing");
+    pi::evict_stale_canonical_copies((dir / "absent").string(), keep, prefix);
+    check(exists(keep), "evict: an absent directory is not an error");
+    fs::remove_all(dir, ec);
+    std::printf("  canonical copy eviction: 16 arms (name composition + keep/stale/geometry/pack/form/unrelated + legacy name +"
+                " geometry/age rules + 3 degenerate)\n");
 }
 
 void test_modelbin_genre_refusal(const std::string& root) {
@@ -2383,6 +2478,39 @@ void test_fconst19_rule_table() {
     check(pi::select_fconst19_rule_from(dup, 2, 1536, 12, 28, &why) != nullptr,
           "fconst19 rule: a geometry measured twice with the same shape is fine -- that is the h1536 pair, which is "
           "byte-identical over all 28 blocks");
+    // 4. engine#1774 / TNPU-ALL W2's third gate clause: EVERY row of the real table must select itself back, with its own
+    //    numbers. Written table-driven rather than one check per row for two reasons the table has already demonstrated:
+    //    a wrong digit is silent (the anchors still line up), and a merge dropped the h4096 row twice with nothing failing.
+    int rules_n = 0;
+    const pi::Fconst19Rule* rules = pi::fconst19_rules(&rules_n);
+    check(rules && rules_n >= 8,
+          "fconst19 rule: the table still has its rows (" + std::to_string(rules_n) + " >= 8; a merge dropping one is a "
+          "silent un-measure of a whole class)");
+    for (int i = 0; i < rules_n; i++) {
+        const pi::Fconst19Rule& row = rules[i];
+        std::string w;
+        const pi::Fconst19Rule* got = pi::select_fconst19_rule(row.hidden, row.heads, row.layers, &w);
+        check(got && got->prefix == row.prefix && got->n_tiles == row.n_tiles && got->rot == row.rot && got->tile == row.tile,
+              "fconst19 rule: row " + std::to_string(row.hidden) + "/" + std::to_string(row.heads) + "h/" +
+                  std::to_string(row.layers) + "L selects itself back with its measured numbers (" +
+                  std::to_string(got ? got->prefix : -1) + ", " + std::to_string(got ? got->n_tiles : -1) + ", " +
+                  std::to_string(got ? got->rot : -1) + ", " + std::to_string(got ? got->tile : -1) + ")");
+    }
+
+    // 5. the case this row is: the SECOND geometry at hidden 2048 / 16 heads, told apart only by its layer count. If a
+    //    later edit relaxed the key to (hidden, heads) or merged rows, these two must still separate.
+    why.clear();
+    const pi::Fconst19Rule* q17 = pi::select_fconst19_rule(2048, 16, 28, &why);
+    const pi::Fconst19Rule* q3 = pi::select_fconst19_rule(2048, 16, 36, &why);
+    check(q17 && q17->prefix == 8512 && q17->n_tiles == 3 && q17->tile == 1183744,
+          "fconst19 rule: 2048/16h/28L is still Qwen3-1.7B's row (8,512 / 3 tiles of 1,183,744)");
+    check(q3 && q3->prefix == 4160 && q3->n_tiles == 9 && q3->rot == 1 && q3->tile == 295936,
+          "fconst19 rule: 2048/16h/36L is Qwen2.5_3B's row (4,160 / 9 tiles of 295,936) -- the prefix is NOT the 8,512 "
+          "the Qwen3 formula predicts, which is why the row is measured");
+    why.clear();
+    check(!pi::select_fconst19_rule(2048, 16, 32, &why) && why.find("has not been measured") != std::string::npos,
+          "fconst19 rule: 2048/16h/32L is still unmeasured and refuses by name (" + why + ")");
+
     std::printf("fconst19 rule: measured row, unmeasured refusal, and the ambiguity guard all behave\n");
 }
 
@@ -2972,7 +3100,84 @@ void test_embedding_f32_component(const std::string& root) {
     fs::remove_all(b);
 }
 
+// engine#1740 (W1a): the tail-head placement arithmetic, pinned without a pack, a device or a fixture. The rows, the
+// tile size and the envelope are the hidden-896 pack's, so the numbers here are the real ones: 1,856 B envelope,
+// 2,374 tiles of 122,880 B, tail 1,856 + 2,374 x 122,880 = 291,653,952 B.
+void test_tail_head_placement() {
+    // The real hidden-896 geometry: group_bytes(896, 64) = 8 x 68 x 64 = 34,816 B per head tile, V/64 = 2,374 tiles,
+    // 1,856 B envelope, so the tail is 1,856 + 2,374 x 34,816 = 82,655,040 B -- which is the 0.5B pack's measured tail
+    // span (its tile 0 sits at 209,000,768 B in a 291,653,952 B file).
+    const int64_t env = 1856, rows = 2374, tile = 34816;
+    const int64_t head = rows * tile;
+    const int64_t exact_bytes = env + head;              // the file ends with the head
+    // (a) the head ends the file: exactly one candidate, no slack
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes, 0, env, rows, tile, 0);
+        check(p.why.empty() && p.exact, "tail placement: a tail that ends with the head is exact");
+        check(p.first == env && p.last == env, "tail placement: and the only candidate is the envelope's end");
+    }
+    // (b) n whole zero tiles after the head: the candidate walks back by exactly n tiles, never past the envelope
+    for (int64_t n : {1, 3, 9}) {
+        const int64_t bytes = exact_bytes + n * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, n * tile);
+        check(p.why.empty() && !p.exact, "tail placement: trailing padding is not the exact case");
+        check(p.last == env,
+              "tail placement: " + std::to_string(n) + " zero tile(s) at EOF still land the head at the envelope's end");
+        check(p.first == env, "tail placement: and the search never walks to before the envelope");
+    }
+    // (c) a clean zero run of ANY length puts the head at the envelope's end -- the padding's size is not a displacement
+    {
+        const int64_t bytes = exact_bytes + 20 * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, 20 * tile);
+        check(p.why.empty() && p.first == env && p.last == env,
+              "tail placement: trailing padding of 20 tiles still ends the head at the envelope's end");
+    }
+    // (c2) but when the file ends in NON-zero bytes after the head, the zero run is short and the candidates span the
+    // slack -- this is the shape the caller's correlation has to decide (the hidden-1536 case)
+    {
+        const int64_t bytes = exact_bytes + 20 * tile;
+        const pi::TailHeadPlacement p = pi::plan_tail_head(bytes, 0, env, rows, tile, 3 * tile);
+        check(p.why.empty() && p.first > env && p.last > p.first,
+              "tail placement: a short zero run before non-zero junk leaves a span of candidates, not one guess");
+    }
+    // (d) refinements: a tail shorter than envelope + head is refused by name, with both numbers in it
+    {
+        const pi::TailHeadPlacement p = pi::plan_tail_head(env + head - 1, 0, env, rows, tile, 0);
+        check(!p.why.empty(), "tail placement: a short tail is refused, not read");
+        check(p.why.find(std::to_string(env + head)) != std::string::npos,
+              "tail placement: and the refusal carries the length it wanted (" + p.why + ")");
+    }
+    // (e) one byte short is refused for the length, and one byte more is a candidate rather than a refusal: the
+    // boundary is exact, which is what keeps a part-tile payload from being rounded up into a head
+    {
+        const pi::TailHeadPlacement short_by_one = pi::plan_tail_head(env + head - 1, 0, env, rows, tile, 0);
+        const pi::TailHeadPlacement one_more = pi::plan_tail_head(env + head + 1, 0, env, rows, tile, 0);
+        check(!short_by_one.why.empty() && one_more.why.empty(),
+              "tail placement: the length boundary is exact (short refused, one byte more is a candidate)");
+        check(one_more.last == env, "tail placement: and the extra byte does not move the head");
+    }
+    // (f) a tail_off that moves the window is honoured: the same arithmetic one layer block later
+    {
+        const int64_t tail_off = 5 * 8708288;   // the 0.5B pack's measured layer stride
+        const pi::TailHeadPlacement p = pi::plan_tail_head(tail_off + exact_bytes, tail_off, env, rows, tile, 0);
+        check(p.why.empty() && p.last == tail_off + env, "tail placement: the window is relative to tail_off");
+    }
+    // and the SEARCH itself (engine#1740 review): the candidate loop, best/runner-up tracking, the kTieCorr cut, the
+    // ambiguity case and the untied refusal. Synthetic head through encode_tile, so no pack and no device.
+    {
+        std::string why;
+        // called first, then checked: building the message inside the check() call read `why` before the call filled it,
+        // because argument evaluation order is unspecified -- the first run of this arm failed with an empty reason.
+        const bool ok = pi::tail_head_selftest(&why);
+        check(ok, "tail search: a synthetic tied head locates, survives a one-tile displacement, refuses "
+                  "untied-with-padding and takes an untied exact tail unverified"
+                  + (why.empty() ? std::string() : " (" + why + ")"));
+    }
+}
+
+
 int main(int argc, char** argv) {
+    test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
     // The pack leg is the only one that can regress a real pack, and ctest runs this binary with the
@@ -2991,7 +3196,7 @@ int main(int argc, char** argv) {
     test_external_roles();
     test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
-        test_canonical_copy_reusable();
+        test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);

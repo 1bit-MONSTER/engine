@@ -148,7 +148,7 @@ static void test_declared_type(void) {
         s.high_freq_factor = 4.0;
         s.low_freq_factor = 1.0;
         s.original_max_position = 8192.0;
-        const int got = q4nx_rope_type_supported(type, &s, cases[i].has_short);
+        const int got = q4nx_rope_type_supported(type, &s, cases[i].has_short, 0);
         char buf[192];
         snprintf(buf, sizeof buf, "declared type \"%s\" reads as \"%s\"", cases[i].type, type);
         check(!strcmp(type, cases[i].type), buf);
@@ -170,7 +170,7 @@ static void test_declared_type(void) {
         char type[64];
         q4nx_rope_declared_type(big, type, (int)sizeof type);
         check(!strcmp(type, "yarn"), "a type 1,000 bytes into the block is still read (fails closed)");
-        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0) == 0,
+        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0, 0) == 0,
               "... and is refused");
     }
     {
@@ -178,7 +178,7 @@ static void test_declared_type(void) {
         q4nx_rope_declared_type("{\"rope_scaling\": {\"factor\": 8.0}, "
                                 "\"quantization_config\": {\"type\": \"fp8\"}}", type, (int)sizeof type);
         check(type[0] == '\0', "a block with no type does not take a neighbour's type");
-        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0) == 1, "... and is not refused");
+        check(q4nx_rope_type_supported(type, (const Q4nxRopeLlama3*)0, 0, 0) == 1, "... and is not refused");
         /* nested arrays/objects before the type, and a '}' inside a string, both keep the block open */
         q4nx_rope_declared_type("{\"rope_scaling\": {\"mrope_section\": [1, 2], \"rope_type\": \"yarn\"}}",
                                 type, (int)sizeof type);
@@ -194,7 +194,35 @@ static void test_declared_type(void) {
     char none[8];
     q4nx_rope_declared_type((const char*)0, none, (int)sizeof none);
     check(none[0] == '\0', "null config declares no type");
-    check(q4nx_rope_type_supported(none, (const Q4nxRopeLlama3*)0, 0) == 1, "no type is supported");
+    check(q4nx_rope_type_supported(none, (const Q4nxRopeLlama3*)0, 0, 0) == 1, "no type is supported");
+    /* engine#1740 W2: dynamic NTK. The support predicate accepts it ONLY when the numbers were read, and the base
+     * rule is the plain theta until a position passes the model's own window -- which is the property that makes
+     * accepting Hunyuan's factor-1.0 block safe rather than a guess. */
+    check(q4nx_rope_type_supported("dynamic", (const Q4nxRopeLlama3*)0, 0, 0) == 0,
+          "dynamic NTK is refused when no numbers were read (a declared block must not be served as plain rope)");
+    check(q4nx_rope_type_supported("dynamic", (const Q4nxRopeLlama3*)0, 0, 1) == 1,
+          "... and accepted when they were");
+    check(q4nx_rope_type_supported("yarn", (const Q4nxRopeLlama3*)0, 0, 1) == 0,
+          "... which does not open the door to the other types");
+    {
+        Q4nxRopeDynamic d = {1, 1.0, 262144.0};            /* Hunyuan-0.5B's own numbers */
+        check(q4nx_rope_dynamic_base(1e6, &d, 0.0, 128) == 1e6, "below the window the base IS theta (position 0)");
+        check(q4nx_rope_dynamic_base(1e6, &d, 262143.0, 128) == 1e6, "... and still is one position short of it");
+        check(q4nx_rope_dynamic_base(1e6, &d, 262144.0, 128) >= 1e6, "... and does not fall below theta once past it");
+        /* factor 1 at exactly the window is the no-op case: scaled == 1, so base == theta */
+        check(q4nx_rope_dynamic_base(1e6, &d, 262144.0, 128) == 1e6, "factor 1 at the window is a no-op, bit for bit");
+        Q4nxRopeDynamic f4 = {1, 4.0, 8192.0};
+        const double at_2x = q4nx_rope_dynamic_base(1e4, &f4, 16384.0, 128);
+        /* factor 4 at 2x the window: scaled = 4*2 - 3 = 5, base = theta * 5^(dim/(dim-2)) */
+        check(fabs(at_2x - 1e4 * pow(5.0, 128.0 / 126.0)) < 1e-6, "the dynamic base follows the NTK formula exactly");
+        Q4nxRopeDynamic bad = {1, 0.0, 8192.0};
+        check(q4nx_rope_dynamic_base(1e4, &bad, 1e6, 128) == 1e4, "an unusable factor leaves the base alone");
+        Q4nxRopeDynamic bad2 = {1, 4.0, 0.0};
+        check(q4nx_rope_dynamic_base(1e4, &bad2, 1e6, 128) == 1e4, "an unusable window leaves the base alone");
+        Q4nxRopeDynamic off = {0, 4.0, 8192.0};
+        check(q4nx_rope_dynamic_base(1e4, &off, 1e6, 128) == 1e4, "and off is a no-op");
+    }
+
 }
 
 int main(void) {

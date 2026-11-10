@@ -199,13 +199,19 @@ A3 is the step with the large diff and no numerical content; it goes after the g
 page describes: it keeps every member name as a **reference** into `NpuModel`, so no expression in the class changes and
 each slice is reviewable as the ownership change it is.
 
-| slice | what moved | uses left alone |
+| slice | what moved | expressions unchanged |
 |---|---|---|
-| target | `std::unique_ptr<XdnaTarget>` | ~94 `xd_->…` |
-| semantics | `Q4nxSemantics` | 82 `sem_.…` |
-| geometry | `Q4nxForwardConfig` (the type moved with it) | 112 `c_.…` |
-| norm scratch | `in_norm_`, `post_norm_`, `q_norm_`, `k_norm_` | 16 |
-| KV / MLA / recurrent | `kcache_`, `vcache_`, `mla_*`, `conv_state_`, `rec_state_`, `kv_owner_` | 54 |
+| target | `std::unique_ptr<XdnaTarget>` | `xd_->…` |
+| semantics | `Q4nxSemantics` | `sem_.…` |
+| geometry | `Q4nxForwardConfig` (the type moved with it) | `c_.…` |
+| norm scratch | `in_norm_`, `post_norm_`, `q_norm_`, `k_norm_` | those four names |
+| KV / MLA / recurrent | `kcache_`, `vcache_`, `mla_*`, `conv_state_`, `rec_state_`, `kv_owner_` | those members |
+
+The column carried counts (94 / 82 / 112 / 16 / 54) until a reviewer tried to reproduce them. They were true on each slice's own base and
+**not** from the merged tree, where the file has grown: `grep -o` over `npu/forward/src/q4nx_forward.cpp` +
+`npu/forward/include/q4nx_forward.h` gives **104** for `xd_->`, **112** for `sem_.` and **169** for `c_.` at the merge. So the integers are
+gone rather than wrong — a table of five exact numbers nothing checks is the shape this repository has been bitten by, and the claim that
+matters ("every expression unchanged, because the member name is still a reference") does not need them.
 
 Why the last one is safe to move and the aliasing question that had to be answered first: nothing outside the model
 aliases those buffers — the model's KV sharing is *between its own layers* (`kv_owner_`), and the dma-buf shared region

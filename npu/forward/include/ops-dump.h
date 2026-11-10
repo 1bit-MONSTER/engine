@@ -16,17 +16,20 @@
 // ops-dump.h -- NPU_INFER_DUMP_OPS=1 prints mean|x| and absmax after every projection and every weighted RMSNorm,
 // tagged with the call site's own name:
 //
-//   [op] L00 rmsnorm    rows=1 |x| mean 0.0105 absmax 0.0598
-//   [op] L00 attn_qkv   rows=1 |x| mean 1.3877 absmax 31.8909
+//   [op] L00 rmsnorm      rows=1 |x| mean 0.0105 absmax 0.0598
+//   [op] L00 attn_qkv     rows=1 |x| mean 1.3877 absmax 31.8909
 //
 // Why it exists: NPU_INFER_DUMP_DIR (residual-dump.h) writes the residual stream at LAYER boundaries, which says
 // that a model diverges and not which op did it (engine#1503: a residual already 1e4 too large at layer 0 while
 // the container matched its pack tensor for tensor). The insertion points are `rmsnorm()`, `npu_gemm()` and
 // `npu_gemm_rows()`; the tag each projection already carries is the label, so there is no second name table.
-// The line is printed on the host arms and on the device arm alike, so the same run under NPU_INFER_HOME_GEMM=1
-// and without it can be compared line for line.
+// The line is printed on the host arms and on the device arm alike, so the same run under NPU_INFER_HOST_GEMM=1
+// and without it can be compared line for line: a batched projection prints one line with rows=M on every arm,
+// also when the device arm walks it in blocks. The per-head q and k norms of a qk-norm family are tagged
+// "q_norm" and "k_norm" (one line per head), so they cannot be mistaken for the layer norms.
 //
 // Row 0 only (the first N values of a batched result): one line per call, which is what localises a divergence.
+// A norm is called per row, so a batched pass prints one norm line per row.
 //
 // Off unless the variable is set to something other than "" or "0". The variable is read ONCE per process
 // (ops_dump_enabled() is called per projection per token, and off has to cost a load and a branch, not a
@@ -47,6 +50,20 @@ inline bool ops_dump_enabled() {
     static const bool on = ops_dump_value_on(std::getenv("NPU_INFER_DUMP_OPS"));
     return on;
 }
+
+// A projection that is carried out as several inner calls (the device arm's blocked launches) holds one of these
+// across them, so the inner calls stay quiet and the outer call prints the one line. Per thread.
+inline int& ops_dump_mute_depth() {
+    thread_local int depth = 0;
+    return depth;
+}
+struct OpsDumpMute {
+    OpsDumpMute() { ++ops_dump_mute_depth(); }
+    ~OpsDumpMute() { --ops_dump_mute_depth(); }
+    OpsDumpMute(const OpsDumpMute&) = delete;
+    OpsDumpMute& operator=(const OpsDumpMute&) = delete;
+};
+inline bool ops_dump_muted() { return ops_dump_mute_depth() > 0; }
 
 struct OpsStats {
     double mean = 0.0;   // mean of |x[i]|
@@ -80,13 +97,14 @@ inline int ops_dump_line(char* buf, size_t cap, const char* tag, int layer, int 
     if (!x || n <= 0) return 0;
     const OpsStats s = ops_stats(x, n);
     if (s.nonfinite)
-        return std::snprintf(buf, cap, "  [op] L%02d %-10s rows=%d |x| mean %.6g absmax %.6g nonfinite %d/%d\n", layer,
+        return std::snprintf(buf, cap, "  [op] L%02d %-12s rows=%d |x| mean %.6g absmax %.6g nonfinite %d/%d\n", layer,
                              tag ? tag : "?", rows, s.mean, (double)s.absmax, s.nonfinite, n);
-    return std::snprintf(buf, cap, "  [op] L%02d %-10s rows=%d |x| mean %.6g absmax %.6g\n", layer, tag ? tag : "?",
+    return std::snprintf(buf, cap, "  [op] L%02d %-12s rows=%d |x| mean %.6g absmax %.6g\n", layer, tag ? tag : "?",
                          rows, s.mean, (double)s.absmax);
 }
 
 inline void ops_dump(const char* tag, int layer, int rows, const float* x, int n) {
+    if (ops_dump_muted()) return;
     char buf[192];
     if (ops_dump_line(buf, sizeof buf, tag, layer, rows, x, n) > 0) std::fputs(buf, stderr);
 }

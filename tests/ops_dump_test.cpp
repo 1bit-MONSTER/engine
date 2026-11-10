@@ -27,6 +27,8 @@
 #include <limits>
 #include <string>
 
+#include <unistd.h>
+
 static int failures = 0;
 static void check(bool ok, const std::string& what) {
     if (ok) return;
@@ -91,13 +93,52 @@ int main(int argc, char** argv) {
     // The text.
     char buf[192];
     int n = ops_dump_line(buf, sizeof buf, "attn_qkv", 7, 16, x, 4);
-    check(std::string(buf) == "  [op] L07 attn_qkv   rows=16 |x| mean 1.5 absmax 3\n", std::string("line text, got: ") + buf);
+    check(std::string(buf) == "  [op] L07 attn_qkv     rows=16 |x| mean 1.5 absmax 3\n", std::string("line text, got: ") + buf);
     check(n == (int)std::strlen(buf), "the count is the line's length");
     ops_dump_line(buf, sizeof buf, "rmsnorm", 0, 1, bad, 4);
-    check(std::string(buf) == "  [op] L00 rmsnorm    rows=1 |x| mean 3 absmax 5 nonfinite 2/4\n",
+    check(std::string(buf) == "  [op] L00 rmsnorm      rows=1 |x| mean 3 absmax 5 nonfinite 2/4\n",
           std::string("non-finite line text, got: ") + buf);
     check(ops_dump_line(buf, sizeof buf, "t", 0, 1, nullptr, 4) == 0 && buf[0] == '\0', "a null array prints nothing");
     check(ops_dump_line(buf, sizeof buf, "t", 0, 1, x, 0) == 0 && buf[0] == '\0', "n = 0 prints nothing");
+    // The longest tags in the tree are 11 characters; the column has to hold them, or their lines sit one out of step.
+    ops_dump_line(buf, sizeof buf, "ffn_gate_up", 3, 1, x, 4);
+    check(std::string(buf) == "  [op] L03 ffn_gate_up  rows=1 |x| mean 1.5 absmax 3\n", std::string("11-char tag, got: ") + buf);
+
+    // The mute: held across the inner calls of one projection, it nests and it ends with its scope.
+    check(!ops_dump_muted(), "not muted to begin with");
+    {
+        OpsDumpMute outer;
+        check(ops_dump_muted(), "muted inside a scope");
+        { OpsDumpMute inner; check(ops_dump_muted(), "still muted when nested"); }
+        check(ops_dump_muted(), "the inner scope ending does not unmute the outer one");
+    }
+    check(!ops_dump_muted(), "unmuted when the scope ends");
+    // ops_dump() itself prints nothing while muted: stderr goes to a file for the two calls, and the file holds one line.
+    {
+        char path[] = "/tmp/ops_dump_test_XXXXXX";
+        const int fd = mkstemp(path);
+        check(fd >= 0, "mkstemp");
+        if (fd >= 0) {
+            std::fflush(stderr);
+            const int saved = dup(2);
+            dup2(fd, 2);
+            { OpsDumpMute m; ops_dump("muted_tag", 1, 1, x, 4); }
+            ops_dump("heard_tag", 1, 1, x, 4);
+            std::fflush(stderr);
+            dup2(saved, 2);
+            close(saved);
+            close(fd);
+            std::string got;
+            if (FILE* f = std::fopen(path, "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof line, f)) got += line;
+                std::fclose(f);
+            }
+            std::remove(path);
+            check(got == "  [op] L01 heard_tag    rows=1 |x| mean 1.5 absmax 3\n", "muted call silent, next call heard; got: " + got);
+        }
+    }
+
     char small[8];
     ops_dump_line(small, sizeof small, "attn_qkv", 7, 16, x, 4);
     check(std::strlen(small) == sizeof small - 1, "a short buffer is truncated and terminated");

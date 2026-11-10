@@ -3276,6 +3276,9 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             if (note && note[0]) { std::fprintf(stderr, "  [batch] %s\n", note); note_said = true; }
         }
         out.assign((size_t)M * N, 0.0f);
+        // NPU_INFER_DUMP_OPS: the blocks are one projection, so they print one line (rows=M, row 0), as the host
+        // arms do; the inner launches are muted for the length of the walk.
+        onebit::npu::OpsDumpMute ops_mute;
         for (int b0 = 0; b0 < M && err_.empty(); b0 += blk) {
             const int rows = std::min(blk, M - b0);
             std::vector<float> part;
@@ -3286,6 +3289,12 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
                 return;
             }
             std::copy(part.begin(), part.begin() + (size_t)rows * N, out.begin() + (size_t)b0 * N);
+        }
+        // Printed by hand: op_line() would be muted by this scope's own guard. A nested walk stays quiet.
+        if (err_.empty() && onebit::npu::ops_dump_enabled() && onebit::npu::ops_dump_mute_depth() == 1) {
+            char line[192];
+            if (onebit::npu::ops_dump_line(line, sizeof line, sc, cur_layer_, M, out.data(), N) > 0)
+                std::fputs(line, stderr);
         }
         return;
     }
@@ -4032,7 +4041,7 @@ int Q4nxNpuForward::max_batch_rows() const {
 // --------------------------------------------------------------------------
 // host helpers (float32, matching the Python reference)
 // --------------------------------------------------------------------------
-float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out) const {
+float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out, const char* tag) const {
     LhScope _tlh(LH_RMS);
     double ss = 0.0;
     for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
@@ -4044,7 +4053,7 @@ float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out)
         for (int i = 0; i < n; i++) out[i] = x[i] * inv * w[i];
     }
     // NPU_INFER_DUMP_OPS: the norm's own output, so a divergence can be put on the norm and not on its layer.
-    if (onebit::npu::ops_dump_enabled()) onebit::npu::ops_dump("rmsnorm", cur_layer_, 1, out, n);
+    if (onebit::npu::ops_dump_enabled()) onebit::npu::ops_dump(tag, cur_layer_, 1, out, n);
     return inv;
 }
 
@@ -4488,12 +4497,12 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     if (sem_.qk_norm) {
         std::vector<float> t(HD);
         for (int h = 0; h < NH; h++) {
-            rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data());
+            rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data(), "q_norm");
             memcpy(&q[(size_t)h * HD], t.data(), sizeof(float) * HD);
         }
         if (append_kv) {
             for (int h = 0; h < NKV; h++) {
-                rmsnorm(&k[(size_t)h * HD], k_norm_[cur_layer_].data(), HD, t.data());
+                rmsnorm(&k[(size_t)h * HD], k_norm_[cur_layer_].data(), HD, t.data(), "k_norm");
                 memcpy(&k[(size_t)h * HD], t.data(), sizeof(float) * HD);
             }
         }

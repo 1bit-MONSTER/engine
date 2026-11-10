@@ -19,10 +19,15 @@
 // measured at 10-17 s quiet and minutes contended for the h4096 shapes. Nothing device-side enters that image, so it can be
 // produced on the host, written once at import and copied on later serves.
 //
-// What makes that safe is the identity, not the speed. The image is written with a format version, its geometry, and a hash
-// over the payload; `read` recomputes the hash and refuses rather than returning bytes it cannot vouch for. A packer change,
-// a geometry change or a truncated write are therefore a loud refusal and never a plausible-looking image -- the same rule the
-// .fconst canonical copy follows after engine#1662/#1669.
+// What makes that safe is INTEGRITY AND GEOMETRY, not provenance (engine#1802 audit). The image is written with a format
+// version, its geometry, and a hash over the payload; `read` recomputes the hash and refuses rather than returning bytes it
+// cannot vouch for. So a truncated write, a corrupted byte, or a geometry change is a loud refusal and never a
+// plausible-looking image -- the same rule the .fconst canonical copy follows after engine#1662/#1669.
+//
+// What the hash does NOT prove: that the image was built from THESE weights. An image from another pack with the same kd/nd
+// hashes faithfully to its own bytes and passes every check here, so a stale image left beside a different container of the
+// same head geometry would be accepted. Nothing calls this API yet; whoever first does must key the path on the container's
+// identity (or add a source hash beside the payload hash) before a stale file can be read as this pack's head.
 //
 // Absence is not an error: a container without an image simply packs as it did before.
 #ifndef Q4NX_HEAD_IMAGE_H

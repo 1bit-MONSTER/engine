@@ -148,6 +148,32 @@ int run_npu(int argc, char** argv) {
     std::istringstream in(ids);
     for (int t; in >> t;) prompt.push_back(t);
 
+    // engine#1862: a kernel directory from the sealed/full-ELF generation has no layer_ctx*.elf, and the bare
+    // "cannot read <dir>/layer_ctx1.elf" from npu/lane.cpp reads as a missing file rather than a different route.
+    // Name the generation that IS there, and the command that drives it.
+    {
+        namespace fs = std::filesystem;
+        if (!fs::exists(fs::path(kernel_dir) / "layer_ctx1.elf")) {
+            int sealed = 0;
+            std::error_code ec;
+            for (const auto& ent : fs::directory_iterator(kernel_dir, ec)) {
+                const std::string name = ent.path().filename().string();
+                if (ent.path().extension() == ".elf" &&
+                    (name.rfind("SEALED-", 0) == 0 || name.rfind("full_i8_", 0) == 0))
+                    ++sealed;
+            }
+            if (sealed > 0)
+                throw std::runtime_error(
+                    kernel_dir + " holds the sealed full-ELF kernel set (" + std::to_string(sealed) +
+                    " ELF(s)), which npu-run does not drive: npu-run needs layer_ctx{1,2,17}.elf, lmhead.elf and "
+                    "layer.pdi. The sealed route is driven by `1bit serve --device npu` from the pack's plan.json "
+                    "(engine#1862)");
+            throw std::runtime_error("no kernel set in " + kernel_dir +
+                                     ": neither layer_ctx1.elf (the per-role set npu-run drives) nor a SEALED-*/full_i8_* "
+                                     "ELF (the sealed set) is present");
+        }
+    }
+
     const onebit::npu::Model model(model_dir);
     auto t0 = std::chrono::steady_clock::now();
     onebit::npu::Lane lane(model, kernel_dir);

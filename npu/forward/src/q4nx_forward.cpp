@@ -196,7 +196,7 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
 // 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
 // accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
-static Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
+Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     Q4nxRopeDynamic d{};
     std::ifstream f(cfg_path);
     if (!f) return d;
@@ -4266,7 +4266,11 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
         // Below the model's original window this returns theta unchanged, which is what makes a short prompt
         // bit-identical to the same model served without the scaling.
-        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, (int)HD);
+        // engine#1792 review: the exponent is HF's `dim / (dim - 2)` over the ROTARY width (`dim = int(head_dim *
+        // partial_rotary_factor)`), which is `rot` here -- passing `HD` was wrong for any model that declares dynamic
+        // scaling together with partial_rotary_factor < 1. Unreachable in today's catalog, so this is a correctness
+        // constant rather than a behaviour change for any pack that exists.
+        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, rot);
         for (int i = 0; i < half; i++) {
             double inv;
             if (proportional) {

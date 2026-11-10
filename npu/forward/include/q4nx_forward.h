@@ -70,6 +70,10 @@ struct I8Ctx;
 
 // Q4nxForwardConfig now lives with the model that owns it: npu/model/npu_model.h (engine#803 A3).
 
+// engine#1740 W2: the rope_type "dynamic" reader, exposed so a host test can pin it against the exact block the
+// Hunyuan 1.9 packs carry ({"type": "dynamic", "factor": 1.0} with max_position_embeddings 262144) without a device.
+Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path);
+
 class Q4nxNpuForward {
 public:
     Q4nxNpuForward();

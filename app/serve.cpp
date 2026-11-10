@@ -3421,6 +3421,21 @@ int run_serve(int argc, char** argv) {
                                        fs::exists(fs::path(o.model) / "config.json") &&
                                        fs::exists(fs::path(o.model) / "tokenizer.json");
             if (model_generic && !kernels.empty() && fs::is_directory(kernels)) {
+                // engine#1740 (W6): --npu-opt is for a PRIVATE route, and this branch is the per-op forward, which
+                // cannot consume one. #1868 made the option refuse when no add-on is linked; with an add-on linked the
+                // option was still accepted here and then bypassed by the CONTAINER TYPE, silently -- a W6 run asked for
+                // the fused route, got per-op, and produced *identical* numbers, which reads as "no gain" rather than
+                // "wrong route". Refusing is the only answer that cannot be misread.
+                if (!o.npu_opts.empty()) {
+                    std::string keys;
+                    for (const auto& kv : o.npu_opts) keys += (keys.empty() ? "" : ", ") + kv.substr(0, kv.find('='));
+                    std::fprintf(stderr,
+                                 "1bit serve: --npu-opt %s was given, but %s is a model-generic container, which serves "
+                                 "through the per-op forward: the option has no effect here (it applies to a private "
+                                 "route's own model directory). Drop it, or serve the model directory that route "
+                                 "expects.\n", keys.c_str(), o.model.c_str());
+                    return 2;
+                }
                 std::fprintf(stderr,
                              "1bit serve: %s is a model-generic container: serving it through the per-op forward "
                              "(kernels %s)\n", o.model.c_str(), kernels.c_str());

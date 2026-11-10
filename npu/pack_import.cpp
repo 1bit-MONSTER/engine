@@ -245,6 +245,30 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m, const std::string& bra
             mm.branch = branch;
             if (!mm.weight.empty()) m.matmuls.push_back(std::move(mm));
         }
+        // The Ryzen AI fused MLPs: `SSMLP` is gate+up+down as ONE node and `GQO` is grouped-query attention, so neither
+        // has a MatMulNBits node for the FFN to pair up -- which is why amd/granite-4.1-8b_rai_1.9.0_npu states no
+        // intermediate_size anywhere (`config.json` is literally {}, and genai_config.json's decoder block has only
+        // hidden_size / heads / layers) and was refused. The node carries the same numbers as attributes, measured on
+        // that pack: gate_K 4096, gate_N 12800, up_K 4096, up_N 12800, down_K 12800, down_N 4096 -- the plain
+        // (K == hidden, N == w) gate/up and (K == w, N == hidden) down triple, w = 12800. Recording them as matmuls lets
+        // intermediate_size_from_graph find them by the SAME witness it uses for the separate-node spelling (gate and up
+        // reading one activation) rather than adding a second rule that could disagree with the first.
+        if (op == "SSMLP" || op == "GQO") {
+            for (const char* sub : {"gate", "up", "down"}) {
+                const auto k = attrs.find(std::string(sub) + "_K"), n = attrs.find(std::string(sub) + "_N");
+                if (k == attrs.end() || n == attrs.end() || k->second <= 0 || n->second <= 0) continue;
+                OnnxMatMul mm;
+                // gate and up share the node's activation input; down reads the gated product, so it gets its own name.
+                // That shared activation is the very witness separate gate/up nodes provide.
+                mm.data = ins.empty() ? std::string() : ins[0];
+                if (std::string(sub) == "down") mm.data += ".down";
+                mm.weight = sub;   // the role name intermediate_size_from_graph's excluded() filter reads
+                mm.K = k->second;
+                mm.N = n->second;
+                mm.branch = branch;
+                m.matmuls.push_back(std::move(mm));
+            }
+        }
     }
 }
 
@@ -553,6 +577,17 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // tolerance -- so this pair does not isolate the prefix. `prefix = 12,608` rests on the Mistral row above and the
     // Qwen3 arithmetic (64 + 2*hidden + 4,352) agreeing, which is exactly the caveat the 3,584 row carries too.
     {4096, 32, 36, 12608, 5, 1, 2297856},
+    // granite-4.1-8b at hidden 4,096 / 32 heads / 40 layers: the same bundle shape and rotation as the Qwen3-8B row
+    // above -- every field identical but the layer count -- which again says the bundle is a property of the hidden size
+    // and its head count, not the depth. It must still be its own row because select_rule_in() keys on all three.
+    // Unlike Qwen3-8B this pack's head is NOT in the tail's envelope: its tail is 225,198,144 B after 40 x 107,728,192,
+    // and that is exactly 8,256 + 1,568 x 143,616 (the h4096 tile, rows = ceil(100,352 / 64)), i.e. a full head grid,
+    // so the tail carries the head itself. The header stride is uniform over all 40 blocks (40 runs of 32 x
+    // `00 00 7f ff`, first at 13,795,392, every gap 107,728,192).
+    // Honest limit: amd publishes no 1.8 twin for this model, so the rotation and the tile are corroborated by the head
+    // grid arithmetic and by agreement with the Qwen3-8B row at the same geometry rather than by a direct diff. The
+    // prefix is the same 64 + 2*hidden + 4,352 = 12,608 the Qwen3 row uses, with the same caveat that row states.
+    {4096, 32, 40, 12608, 5, 1, 2297856},
     // Llama-3.2-3B (and -Instruct, same geometry) at hidden 3,072 / 24 heads / 28 layers: measured with
     // tools/fconst19_measure.py against amd/Llama-3.2-3B_rai_1.8.0_npu_4K, 1,090 of 1,756,930,368 bytes differ
     // (6.20e-07 of the file, which the tool prints as 6.20e-05 %) -- content, not layout. The prefix is the Qwen3 line's 64 + 2*hidden + 4,352 = 10,560 at this hidden

@@ -1648,8 +1648,16 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
         }
         check(attributed, "pack: each runtime-refused tensor is marked imported=false in the manifest");
     }
-    check(r.lmhead_corr > 0.999, "pack: the decode reproduces the fp16 embedding (corr " +
-                                     std::to_string(r.lmhead_corr) + ")");
+    // Only a TIED pack can be checked this way: there lm_head IS the embedding, so correlating them measures the decoder.
+    // An untied pack's lm_head is a separate matrix and the number is meaningless by construction (Qwen3-8B: 0.0043 on a
+    // head that decodes correctly -- std 0.026, plausible per-row scale, weakly correlated rows). Asserting 0.999
+    // unconditionally demanded every pack be tied, which no untied pack can satisfy.
+    if (r.selfcheck_tied)
+        check(r.lmhead_corr > 0.999, "pack: the decode reproduces the fp16 embedding, tied (corr " +
+                                         std::to_string(r.lmhead_corr) + ")");
+    else
+        check(true, "pack: untied, so the embedding correlation is not a decoder check (corr " +
+                        std::to_string(r.lmhead_corr) + ")");
     check(r.ctrl_corr_nibble < 0.5 && r.ctrl_corr_nozp < 0.95,
           "pack: both wrong decoders are rejected as controls");
     // engine#1185: an imported container carries fp32 scale/zero (layout q4nx-2, npu/q4nx.h

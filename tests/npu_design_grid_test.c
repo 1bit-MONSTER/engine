@@ -32,6 +32,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -598,6 +600,46 @@ static void test_head_image(void) {
                 check(q4nx_head_image_read(path, back, kd * nd, sc_back, nd, &info, why, (int)sizeof why) == 0,
                       "head image: a truncated image is refused");
                 remove(path);
+            }
+            /* (e) TWO WRITERS, ONE IMAGE. Two serves that start cold on the same pack write the same file at the same
+             * time. Each must end with a successful write and the path must read back intact after every one of them:
+             * with one shared temp name the second open truncated the first writer's file and one rename found nothing. */
+            {
+                const int bk = 2048, bn = 2048;     /* 4 MiB, so a write is long enough for the two to overlap */
+                int8_t* big = malloc((size_t)bk * bn);
+                int8_t* big_back = malloc((size_t)bk * bn);
+                float* bsc = malloc((size_t)bn * sizeof(float));
+                float* bsc_back = malloc((size_t)bn * sizeof(float));
+                check(big && big_back && bsc && bsc_back, "head image: the two-writer fixture allocates");
+                if (big && big_back && bsc && bsc_back) {
+                    for (size_t i = 0; i < (size_t)bk * bn; i++) big[i] = (int8_t)((i * 31u + 7u) % 251u - 125);
+                    for (int n = 0; n < bn; n++) bsc[n] = 0.001f * (float)(n + 1);
+                    const char* shared = "head_image_two_writers.bin";
+                    remove(shared);
+                    const int rounds = 40;
+                    fflush(stdout);
+                    const pid_t child = fork();
+                    if (child == 0) {
+                        int bad = 0;
+                        for (int i = 0; i < rounds; i++) bad += q4nx_head_image_write(shared, big, bsc, bk, bn) != 1;
+                        _exit(bad > 255 ? 255 : bad);
+                    }
+                    int bad_w = 0, bad_r = 0;
+                    for (int i = 0; i < rounds; i++) {
+                        bad_w += q4nx_head_image_write(shared, big, bsc, bk, bn) != 1;
+                        bad_r += q4nx_head_image_read(shared, big_back, bk * bn, bsc_back, bn, &info, why, (int)sizeof why) != 1;
+                    }
+                    int st = 0, bad_c = -1;
+                    if (child > 0 && waitpid(child, &st, 0) == child && WIFEXITED(st)) bad_c = WEXITSTATUS(st);
+                    check_int(bad_w, 0, "head image: with a second writer on the same path, every write of ours lands");
+                    check_int(bad_c, 0, "... and so does every write of the other process");
+                    check_int(bad_r, 0, "... and the path reads back intact after each of them");
+                    check(q4nx_head_image_read(shared, big_back, bk * bn, bsc_back, bn, &info, why, (int)sizeof why) == 1 &&
+                              memcmp(big, big_back, (size_t)bk * bn) == 0,
+                          "... and what is left is the image both wrote");
+                    remove(shared);
+                }
+                free(big); free(big_back); free(bsc); free(bsc_back);
             }
         }
         free(bt); free(codes); free(back); free(scales); free(sc_back);

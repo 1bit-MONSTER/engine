@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include "batch_check_compare.h"
+#include "ops-dump.h"
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
@@ -3157,10 +3158,14 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         // 2026-11-10, the arm answered "ikt" to "The capital of France is" and then locked onto one token, while the
         // per-GEMM A/B read cos 0.9999 against f32 on the same tensors. Same packer, same bytes, same model.
         double ssum = 0.0;
-        // blocked=1: the image is written in the blocked microtile order, which is the fast path AND the layout the
-        // device actually reads, so the MAC below walks it with q4nx_layout::blocked_index(). (blocked=0 was measured
-        // at 174.5 s of warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.)
-        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, /*blocked=*/1, t.d.data(), &ssum);
+        // Blocked: the image is written in the blocked microtile order, which is the fast path AND the layout the
+        // device actually reads, so the MAC below walks it with the same index. (blocked=0 was measured at 174.5 s of
+        // warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.) But the image is
+        // UNPADDED, K*N bytes, and blocked_index() addresses whole 64x128 tiles: an N that is not a multiple of 128 (or
+        // a K not of 64) packs and reads past the vector (engine#1994). Those geometries take row-major, which holds
+        // the same codes, so the result is unchanged and only an unaligned shape pays the slower pack.
+        t.blocked = q4nx_layout::blocked_fits(K, N);
+        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, t.blocked ? 1 : 0, t.d.data(), &ssum);
         if (!cacheable) {
             scratch = std::move(t);
             cached = &scratch;
@@ -3200,11 +3205,19 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         for (int n = 0; n < N; n++) {
             int32_t acc = 0;
             for (int k = 0; k < K; k++)
-                acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] *
+                acc += (int32_t)((int)t.codes[q4nx_layout::image_index((size_t)k, (size_t)n, K, N, t.blocked)] *
                                  (int)a8[(size_t)k]);
             dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
         }
     }
+}
+
+// NPU_INFER_DUMP_OPS (ops-dump.h): one line per projection, tagged with the tag its caller already passes
+// ("attn_qkv", "ssm_out", ...). Called where a projection's result is final -- both host arms and the device arm --
+// so a host run and a device run print the same lines. Row 0 of the result; off is one cached bool.
+static inline void op_line(const char* tag, int layer, int rows, const std::vector<float>& out, int n) {
+    if (onebit::npu::ops_dump_enabled() && n > 0 && out.size() >= (size_t)n)
+        onebit::npu::ops_dump(tag, layer, rows, out.data(), n);
 }
 
 void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
@@ -3217,9 +3230,11 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
         out.assign((size_t)N, 0.0f);
         if (host_gemm_i8_) {
             host_gemm_i8(A, a_k, 1, K, N, Bmat, wkey, out.data());
+            op_line(sc, cur_layer_, 1, out, N);
             return;
         }
         q4nx_host_gemm_f32_padded(A, a_k, 1, K, N, Bmat, out.data());
+        op_line(sc, cur_layer_, 1, out, N);
         return;
     }
     npu::target::GemvArgs a;
@@ -3228,7 +3243,8 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
     a.a_k = a_k;
     a.tiles = &Q4nxNpuForward::gemv_tile_cb; a.tiles_self = this;
     std::string err;
-    if (!xd_ || !xd_->gemv(a, out, err)) err_ = err.empty() ? "npu_gemm: no target" : err;
+    if (!xd_ || !xd_->gemv(a, out, err)) { err_ = err.empty() ? "npu_gemm: no target" : err; return; }
+    op_line(sc, cur_layer_, 1, out, N);
 }
 
 void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N,
@@ -3240,9 +3256,11 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         out.assign((size_t)M * N, 0.0f);
         if (host_gemm_i8_) {
             host_gemm_i8(A, a_k, M, K, N, Bmat, wkey, out.data());
+            op_line(sc, cur_layer_, M, out, N);
             return;
         }
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
+        op_line(sc, cur_layer_, M, out, N);
         return;
     }
     // The device's activation BO holds exactly max_batch_rows() rows (the M=128 prefill design), and a wider
@@ -3262,6 +3280,9 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             if (note && note[0]) { std::fprintf(stderr, "  [batch] %s\n", note); note_said = true; }
         }
         out.assign((size_t)M * N, 0.0f);
+        // NPU_INFER_DUMP_OPS: the blocks are one projection, so they print one line (rows=M, row 0), as the host
+        // arms do; the inner launches are muted for the length of the walk.
+        onebit::npu::OpsDumpMute ops_mute;
         for (int b0 = 0; b0 < M && err_.empty(); b0 += blk) {
             const int rows = std::min(blk, M - b0);
             std::vector<float> part;
@@ -3273,6 +3294,12 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             }
             std::copy(part.begin(), part.begin() + (size_t)rows * N, out.begin() + (size_t)b0 * N);
         }
+        // Printed by hand: op_line() would be muted by this scope's own guard. A nested walk stays quiet.
+        if (err_.empty() && onebit::npu::ops_dump_enabled() && onebit::npu::ops_dump_mute_depth() == 1) {
+            char line[192];
+            if (onebit::npu::ops_dump_line(line, sizeof line, sc, cur_layer_, M, out.data(), N) > 0)
+                std::fputs(line, stderr);
+        }
         return;
     }
     npu::target::GemvArgs a;
@@ -3282,7 +3309,8 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     a.rows = true; a.decode_twin = decode_twin;
     a.tiles = &Q4nxNpuForward::gemv_tile_cb; a.tiles_self = this;
     std::string err;
-    if (!xd_ || !xd_->gemv(a, out, err)) err_ = err.empty() ? "npu_gemm_rows: no target" : err;
+    if (!xd_ || !xd_->gemv(a, out, err)) { err_ = err.empty() ? "npu_gemm_rows: no target" : err; return; }
+    op_line(sc, cur_layer_, M, out, N);
 }
 
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
@@ -4017,7 +4045,7 @@ int Q4nxNpuForward::max_batch_rows() const {
 // --------------------------------------------------------------------------
 // host helpers (float32, matching the Python reference)
 // --------------------------------------------------------------------------
-float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out) const {
+float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out, const char* tag) const {
     LhScope _tlh(LH_RMS);
     double ss = 0.0;
     for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
@@ -4028,6 +4056,8 @@ float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out)
     } else {
         for (int i = 0; i < n; i++) out[i] = x[i] * inv * w[i];
     }
+    // NPU_INFER_DUMP_OPS: the norm's own output, so a divergence can be put on the norm and not on its layer.
+    if (onebit::npu::ops_dump_enabled()) onebit::npu::ops_dump(tag, cur_layer_, 1, out, n);
     return inv;
 }
 
@@ -4471,12 +4501,12 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     if (sem_.qk_norm) {
         std::vector<float> t(HD);
         for (int h = 0; h < NH; h++) {
-            rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data());
+            rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data(), "q_norm");
             memcpy(&q[(size_t)h * HD], t.data(), sizeof(float) * HD);
         }
         if (append_kv) {
             for (int h = 0; h < NKV; h++) {
-                rmsnorm(&k[(size_t)h * HD], k_norm_[cur_layer_].data(), HD, t.data());
+                rmsnorm(&k[(size_t)h * HD], k_norm_[cur_layer_].data(), HD, t.data(), "k_norm");
                 memcpy(&k[(size_t)h * HD], t.data(), sizeof(float) * HD);
             }
         }
@@ -5362,12 +5392,15 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
                 c.codes.assign((size_t)H * (size_t)Tn, 0);
                 c.d.assign((size_t)Tn, 0.0f);
                 double ssum = 0.0;
-                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, /*blocked=*/1, c.d.data(), &ssum);
+                // The last vocabulary block is rarely whole tiles (phi-3-mini: 32064 % 8192 = 7488, not a multiple of
+                // 128), and this image is unpadded, so it takes the layout its geometry fits (engine#1994).
+                c.blocked = q4nx_layout::blocked_fits(H, Tn);
+                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, c.blocked ? 1 : 0, c.d.data(), &ssum);
             }
             for (int n = 0; n < Tn; n++) {
                 int32_t acc = 0;
                 for (int k = 0; k < H; k++)
-                    acc += (int32_t)((int)c.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, H, Tn)] *
+                    acc += (int32_t)((int)c.codes[q4nx_layout::image_index((size_t)k, (size_t)n, H, Tn, c.blocked)] *
                                      (int)a8i[(size_t)k]);
                 float v = c.d[(size_t)n] * (ascale * (float)acc);
                 if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);

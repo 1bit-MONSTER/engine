@@ -9,7 +9,9 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <cstdlib>
 #include <limits>
+#include <thread>
 #include <stdexcept>
 
 #include "forward/include/audio_ops.h"
@@ -78,6 +80,33 @@ size_t bcast_index(const std::vector<int64_t>& od, const std::vector<int64_t>& s
         stride *= size_t(d);
     }
     return off;
+}
+
+// Deterministic fork-join over independent units of work (output rows, batch indices). Each unit writes only its own slice, so
+// every element's arithmetic is unchanged by the thread count: the result is bit-identical to the serial loop, which is the
+// property a reference implementation has to keep. ONEBIT_AUDIO_THREADS=1 forces the serial path (the control for measuring it).
+template <typename Fn>
+void parallel_units(size_t units, Fn&& fn) {
+    size_t want = 1;
+    if (const char* env = std::getenv("ONEBIT_AUDIO_THREADS")) {
+        const long n = std::strtol(env, nullptr, 10);
+        want = n > 0 ? size_t(n) : 1;
+    } else {
+        const size_t hw = std::thread::hardware_concurrency();
+        want = hw == 0 ? 1 : (hw > 8 ? 8 : hw);
+    }
+    if (want > units) want = units;
+    if (want <= 1) {
+        for (size_t u = 0; u < units; ++u) fn(u);
+        return;
+    }
+    std::vector<std::thread> pool;
+    pool.reserve(want);
+    for (size_t t = 0; t < want; ++t)
+        pool.emplace_back([&, t]() {
+            for (size_t u = t; u < units; u += want) fn(u);
+        });
+    for (auto& th : pool) th.join();
 }
 
 void broadcast_binary(const Tensor& a, const Tensor& b, const std::string& op, Tensor* out) {
@@ -229,9 +258,19 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                 r.dims.push_back(M);
                 r.dims.push_back(N);
                 r.data.assign(nelem(r.dims), 0.0f);
-                std::vector<size_t> idx(bp.dims.size(), 0);
+                // Rows are independent, so the work splits over (batch, row) without touching any element's arithmetic.
                 const size_t batches = nelem(bp.dims);
-                for (size_t bi = 0; bi < batches; ++bi) {
+                const size_t rows = size_t(std::max<int64_t>(M, 1));
+                parallel_units(batches * rows, [&](size_t u) {
+                    const size_t bi = u / rows;
+                    const int64_t i = int64_t(u % rows);
+                    std::vector<size_t> idx(bp.dims.size(), 0);
+                    size_t rem = bi;
+                    for (size_t d = bp.dims.size(); d-- > 0;) {   // row-major unflatten of the batch index
+                        const size_t dim = size_t(bp.dims[d] ? bp.dims[d] : 1);
+                        idx[d] = rem % dim;
+                        rem /= dim;
+                    }
                     size_t oa = 0, ob = 0;
                     for (size_t d = 0; d < idx.size(); ++d) {
                         oa += idx[d] * bp.stride_big[d];
@@ -239,21 +278,14 @@ bool run_graph_impl(const OnnxGraphInfo& g, std::map<std::string, Tensor> t, con
                     }
                     const float* ap = a.data.data() + oa * size_t(M * K);
                     const float* bpp = b.data.data() + ob * size_t(K * N);
-                    float* rp = r.data.data() + bi * size_t(M * N);
-                    for (int64_t i = 0; i < M; ++i) {
-                        float* rr = rp + size_t(i) * size_t(N);
-                        for (int64_t k = 0; k < K; ++k) {
-                            const float av = ap[size_t(i) * size_t(K) + size_t(k)];
-                            if (av == 0.0f) continue;
-                            const float* br = bpp + size_t(k) * size_t(N);
-                            for (int64_t j = 0; j < N; ++j) rr[j] += av * br[j];
-                        }
+                    float* rr = r.data.data() + bi * size_t(M * N) + size_t(i) * size_t(N);
+                    for (int64_t k = 0; k < K; ++k) {
+                        const float av = ap[size_t(i) * size_t(K) + size_t(k)];
+                        if (av == 0.0f) continue;
+                        const float* br = bpp + size_t(k) * size_t(N);
+                        for (int64_t j = 0; j < N; ++j) rr[j] += av * br[j];
                     }
-                    for (size_t d = idx.size(); d-- > 0;) {
-                        if (++idx[d] < size_t(bp.dims[d])) break;
-                        idx[d] = 0;
-                    }
-                }
+                });
             } else if (n.op == "Add" || n.op == "Mul" || n.op == "Div" || n.op == "Sub") {
                 // An operand is either a tensor an earlier node produced or an initializer (a bias vector, the 1/sqrt(d)
                 // scalar); init_f32() handles the second without a separate code path at every call site.

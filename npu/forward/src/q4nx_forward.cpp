@@ -2683,7 +2683,15 @@ bool Q4nxNpuForward::load_ple_block(int row) {
     ple_block_.assign((size_t)Q4NX_TILE_ROWS * (size_t)cols, 0.0f);
     const size_t plain_bytes =
         (size_t)sem_.vocab_size_per_layer_input * (size_t)cols;
-    if ((size_t)td->data_size == plain_bytes) {
+    // engine#1725: a RAW BF16 band. The multi-component packs state this table as f32 and the importer converts it to BF16
+    // when it writes the container (a converting copy of the whole V x NL*P table would be 9.4 GiB), so the band here is
+    // 32 rows of BF16 -- exactly the shape the plain-int8 branch handles, with a 2-byte element instead of a code.
+    const size_t bf16_bytes = (size_t)Q4NX_TILE_ROWS * (size_t)cols * 2;
+    if ((size_t)td->data_size >= ((size_t)block + 1) * bf16_bytes &&
+        (size_t)td->data_size % bf16_bytes == 0 && (size_t)td->data_size != plain_bytes) {
+        const uint16_t* band = reinterpret_cast<const uint16_t*>(raw + (size_t)block * bf16_bytes);
+        for (size_t i = 0; i < (size_t)Q4NX_TILE_ROWS * (size_t)cols; ++i) ple_block_[i] = bf16_to_f32(band[i]);
+    } else if ((size_t)td->data_size == plain_bytes) {
         // PLAIN int8 + per-32-column scale (Gemma4): only the requested band of
         // 32 rows is needed, so it is dequantized in place rather than the whole
         // [vocab, NL*ple_dim] table.

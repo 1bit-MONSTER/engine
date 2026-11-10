@@ -1650,11 +1650,33 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
     // engine#1831: only when the vote did NOT record the block's headers. When it did, its list is the measurement
     // (`plan()` reads 2-header vs 4-header from `hdr.size()`, and `post_attn_hdr()` is `hdr.back()`), and rewriting it
     // to one entry turned every Qwen3 4-header 1.9 block into a 2-header one whose "post-attention" header was k_norm's.
-    if (!g.hdr.empty()) return g;
+    // engine#1985: a vote that succeeded can still be SHORT. On amd/Qwen3-1.7B_rai_1.9.0_npu the epsilon-anchor vote records
+    // one in-block offset for a block that has three (Qwen3 opens a per-head k_norm and q_norm section before o_proj), and
+    // engine#1838's early return -- correct for a vote that found the whole list -- then keeps that one and every attention
+    // projection refuses with "attention payload holds 64 tiles; q/k/v/o at 64 rows each need 96". The two witnesses answer
+    // different questions: the vote settles the STRIDE (it needs a dominance test), the residue settles the COUNT (a real
+    // section boundary repeats in every block). So when the residues contain the vote's offset and say there are more, the
+    // residue list wins; when they disagree outright, the vote's answer stands untouched.
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
+    const std::vector<int64_t> residue = fconst_block_headers(pos, stride8, 3);
+    if (!g.hdr.empty()) {
+        const bool residue_contains_vote =
+            std::find(residue.begin(), residue.end(), g.h1) != residue.end();
+        if (residue_contains_vote && residue.size() > g.hdr.size()) {
+            FconstGeom better = g;
+            if (fconst_set_block_headers(better, residue)) {
+                std::fprintf(stderr,
+                             "note: the epsilon vote recorded %d in-block header(s) at %lld B stride, the anchor residues "
+                             "repeat at %d; using the residue list (%d headers per block)\n",
+                             int(g.hdr.size()), (long long)g.stride, int(residue.size()), better.period);
+                g = better;
+            }
+        }
+        return g;
+    }
     // The scan window is the first GiB (about 8 blocks at h3584), so a real section boundary repeats ~8 times against
     // 1-2 for a payload coincidence; 3 separates them (requiring `layers/2` was too strict and dropped the real one).
-    const std::vector<int64_t> inner = fconst_block_headers(pos, stride8, 3);
+    const std::vector<int64_t>& inner = residue;
     if (!fconst_set_block_headers(g, inner)) {
         g.why = "the 1.9 header gives stride " + std::to_string(stride8) + ", but the epsilon anchors repeat at " +
                 std::to_string(inner.size()) + " in-block offset(s), and a layer block has 1 (2-header) or 3 (4-header); "

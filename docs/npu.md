@@ -2017,6 +2017,19 @@ is worth more than the whole bar. Those depths keep their PASS/FAIL (the bar is 
 `(thin: N live chain(s), one chain = X pp > the 2 pp bar)` and are counted out of the summary line, because a bare FAIL
 on 2 chains reads as a drafter regression when it is arithmetic.
 
+**Which drafts a sampler may keep** is a separate rule from how they are committed, and it lives in
+`npu/mtp/spec_accept.h` (engine#1781, gate 2). The loop above accepts a draft when it equals the base model's argmax,
+which is exact for greedy decode only. With a sampler the contract is that the output follows the **target's**
+distribution, and the rule that guarantees it is: accept a drafted token `x` (drawn from the drafter's distribution `q`)
+with probability `min(1, p(x)/q(x))`, and at the first rejection emit a token from `normalise(max(0, p - q))` and stop
+the chain. `p` and `q` are the final sampling distributions (after temperature, top-k, top-p), and an argmax drafter
+states a one-hot `q`. At temperature 0 both rows are one-hot and the rule reduces to the greedy contract, so that
+contract is its degenerate case. `tests/spec_accept_test.cpp` (ctest `spec_accept`) pins both: the temperature-0
+identity, and a deliberately wrong drafter (`p = [.45, .35, .20]`, `q = [.10, .80, .10]`) whose emitted tokens are
+within 0.0016 of `p` over 200,000 draws at an acceptance rate of 0.55, where the greedy rule on the same rows misses
+`p` by 0.55. The header is not called by a serve yet: wiring a speculative loop into `forward-serve` is the rest of
+#1781, and that loop must print its acceptance rate beside its tok/s.
+
 **The one thing that must be right**: the drafter attends over its own states, so its cache has to be the base
 model's *committed stream, row by row*. Feeding it only the current chain is silent — drafts get worse, the text
 stays correct — and it cost this project 69 % → 14 % first-draft acceptance until the cursor was made a checked

@@ -195,6 +195,21 @@ static void test_declared_type(void) {
     q4nx_rope_declared_type((const char*)0, none, (int)sizeof none);
     check(none[0] == '\0', "null config declares no type");
     check(q4nx_rope_type_supported(none, (const Q4nxRopeLlama3*)0, 0, 0) == 1, "no type is supported");
+    /* engine#1740 W2: the declared-type extraction must SEE Hunyuan's block, because everything downstream (the
+     * reader, the predicate, the base rule) is gated on this string. A config that declares dynamic must report it,
+     * and one that declares nothing must report nothing -- the second half is what keeps every other model on plain
+     * rope. */
+    {
+        const char* hy = "{\"rope_scaling\": {\"type\": \"dynamic\", \"factor\": 1.0}, \"max_position_embeddings\": 262144}";
+        char t2[64] = {0};
+        q4nx_rope_declared_type(hy, t2, (int)sizeof t2);
+        check(!strcmp(t2, "dynamic"), "a config declaring rope_scaling dynamic is read as dynamic");
+        const char* none = "{\"max_position_embeddings\": 32768}";
+        char t3[64] = {1};
+        q4nx_rope_declared_type(none, t3, (int)sizeof t3);
+        check(t3[0] == 0, "and a config with no rope_scaling block reports nothing");
+    }
+
     /* engine#1740 W2: dynamic NTK. The support predicate accepts it ONLY when the numbers were read, and the base
      * rule is the plain theta until a position passes the model's own window -- which is the property that makes
      * accepting Hunyuan's factor-1.0 block safe rather than a guess. */

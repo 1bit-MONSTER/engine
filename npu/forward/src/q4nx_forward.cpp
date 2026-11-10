@@ -196,7 +196,7 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
 // 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
 // accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
-static Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
+Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     Q4nxRopeDynamic d{};
     std::ifstream f(cfg_path);
     if (!f) return d;

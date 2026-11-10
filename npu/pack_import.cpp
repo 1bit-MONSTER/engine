@@ -200,11 +200,16 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
         if (op == "MatMulNBits" || op == "MatMulNBitsBf") {
             if (op == "MatMulNBitsBf") ++m.ryzenai_matmuls;
             OnnxMatMul mm;
-            if (ins.size() >= 4) {
+            // THREE inputs is a real spelling, not a truncation: `amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu` names its
+            // projections `(activations, ...MatMul.weight_Q4, ...MatMul.weight_scales)` with `bits 4, block_size 32` and
+            // no qzeros tensor at all, and a `>= 4` test therefore recorded NO matmuls for it -- `info` printed
+            // matmulnbits_ops 0 and the importer wrote only the embedding (engine#1503). A missing qzeros means the
+            // implicit zero point, which `implicit_zp_zero()` below applies.
+            if (ins.size() >= 3) {
                 mm.data = ins[0];
                 mm.weight = ins[1];
                 mm.scales = ins[2];
-                mm.zeros = ins[3];
+                if (ins.size() >= 4) mm.zeros = ins[3];
             }
             if (attrs.count("K")) mm.K = attrs["K"];
             if (attrs.count("N")) mm.N = attrs["N"];
@@ -429,6 +434,13 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // this comment subtracted the prefix from a per-block figure and produced a number three orders of magnitude off; the
     // review of #1758 caught it. Written out here so the next reader can check it with a calculator.)
     {3584, 28, 28, 7232, 8, 1, 1009664},
+    // Qwen2.5_3B_Instruct at hidden 2,048 / 16 heads / 36 layers: measured with tools/fconst19_measure.py against
+    // amd/Qwen2.5_3B_Instruct_rai_1.8.0_npu_4K, 1,917 of 1,706,629,440 bytes differ (1.12e-06 of the file, which the tool
+    // prints as 1.12e-04 %). Same hidden size as the Qwen3-1.7B row and NOT the same row: the prefix is 4,160 against
+    // 1.7B's 8,512, and the bundle is nine tiles of 295,936 (2,663,424 B) against three of 1,183,744 -- so at this hidden
+    // size both the prefix and the division move with the layer count. Measured, never derived: 64 + 2*hidden + 4,352
+    // would predict 8,512 here and be wrong by 4,352.
+    {2048, 16, 36, 4160, 9, 1, 295936},
     // Mistral-7B-Instruct-v0.2 at hidden 4,096 / 32 heads / 32 layers: measured with tools/fconst19_measure.py against
     // amd/Mistral-7B-Instruct-v0.2_rai_1.8.0_npu_4K, 1,954 of 3,843,419,200 bytes differ (5.08e-05) -- content, not
     // layout. The prefix follows the Qwen3 line (64 + 2*hidden + 4,352 = 12,608), the bundle is 5 tiles of 2,297,856
@@ -437,6 +449,12 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // all 32 blocks. This is the largest family on #1503 (31 packs). Measured by another lane on main, whose
     // table is keyed on geometry; merged here in the same form.
     {4096, 32, 32, 12608, 5, 1, 2297856},
+    // Llama-3.2-3B (and -Instruct, same geometry) at hidden 3,072 / 24 heads / 28 layers: measured with
+    // tools/fconst19_measure.py against amd/Llama-3.2-3B_rai_1.8.0_npu_4K, 1,090 of 1,756,930,368 bytes differ
+    // (6.20e-07 of the file, which the tool prints as 6.20e-05 %) -- content, not layout. The prefix is the Qwen3 line's 64 + 2*hidden + 4,352 = 10,560 at this hidden
+    // size, but the bundle is FOUR tiles of 1,740,800 (6,963,200 B) where the Phi/h3072 row has two of 5,222,400 --
+    // which is the whole reason a row is measured per geometry and never derived from the hidden size.
+    {3072, 24, 28, 10560, 4, 1, 1740800},
 };
 
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
@@ -551,6 +569,12 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     // and a TRUNCATED copy from an interrupted run is caught by the length test rather than trusted.
     const int64_t expected = int64_t(fc.size) - int64_t(layers) * hdr_len;
     if (canonical_copy_reusable(work, expected)) {
+        // engine#1797 review: the eviction age is `last_write_time`, and a reuse used to READ the file without writing
+        // it -- so a copy in continuous use aged past `max_age_seconds` and was swept, and the next run rewrote a
+        // multi-hundred-MB file. Touching on reuse makes the timestamp mean what the rule assumes: last USE. Errors
+        // are ignored: failing to bump an mtime must not fail an import that already has a good copy.
+        std::error_code tec;
+        fs::last_write_time(fs::path(work), fs::file_time_type::clock::now(), tec);
         unmap_file(fc.map, fc.size);
         return work;
     }
@@ -688,10 +712,17 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // canonical form (a new kFconst19Rules entry, a different tile order) leaves the source file untouched, so source
     // identity alone would keep serving a copy of the old form. Bump this when the canonical form changes.
     constexpr int kCanonicalFormVersion = 1;
-    const std::string name = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
-                             std::to_string(dims.hidden) + "-" +
-                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + "-" +
-                             std::to_string(src_ec ? std::uintmax_t(0) : src_size) + "-" +
+    // Every generation of the scratch cache starts with this (engine#1770). Named because the sweep below has to match the
+    // generations that have no version suffix.
+    constexpr const char* kScratchStem = "1bit-fconst19";
+    // A scratch copy older than this is a pack no run is importing: no import holds one for hours, so an mtime this far back
+    // means the pack was abandoned, not that somebody is using it. Kept well above the longest import measured (~minutes).
+    constexpr int64_t kScratchMaxAgeSeconds = 6 * 3600;
+    // Everything but the source identity: the group this run evicts its stale siblings from (engine#1770).
+    const std::string ident_prefix = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
+                                     std::to_string(dims.hidden) + "-" + std::to_string(dims.heads) + "-" +
+                                     std::to_string(dims.layers) + "-";
+    const std::string name = ident_prefix + std::to_string(src_ec ? std::uintmax_t(0) : src_size) + "-" +
                              std::to_string(static_cast<std::uint64_t>(src_stamp)) + ".fconst";
     // `temp_directory_path()` THROWS when TMPDIR names a directory that no longer exists, which is the ordinary state of
     // a shell after a reboot has cleared /tmp -- and it threw before any work was attempted, so `npu-pack info` on a
@@ -718,6 +749,14 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
         if (!probe) continue;
         probe.close();
         work = cand.string();
+        // This is the copy that will be written, so the copies of the same pack and geometry at other sizes/mtimes are
+        // the ones nothing will reuse (engine#1770).
+        // The pre-version generation of the same pack and geometry: `1bit-fconst19-<tag>-<h>-<heads>-<layers>.fconst`,
+        // with no source identity in the name, so the prefix above cannot match it (engine#1770: three such files, 10.67
+        // GiB of tmpfs, had been resident all day).
+        const std::string legacy_name = std::string(kScratchStem) + "-" + tag + "-" + std::to_string(dims.hidden) + "-" +
+                                        std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst";
+        evict_stale_canonical_copies(d.string(), name, ident_prefix, legacy_name, kScratchMaxAgeSeconds);
         // Say where it went whenever that is not the ordinary place: the copy is a few hundred MB and it is scratch.
         std::error_code ec2;
         const fs::path tmpdir = [&] { try { return fs::temp_directory_path(); } catch (...) { return fs::path(); } }();
@@ -1245,6 +1284,21 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without_zeros, int* K, int* N, int* block) {
+    const OnnxModel m = parse_onnx(path);
+    if (matmuls) *matmuls = int(m.matmuls.size());
+    if (without_zeros) {
+        int n = 0;
+        for (const auto& mm : m.matmuls) if (mm.zeros.empty()) ++n;
+        *without_zeros = n;
+    }
+    if (!m.matmuls.empty()) {
+        if (K) *K = int(m.matmuls[0].K);
+        if (N) *N = int(m.matmuls[0].N);
+        if (block) *block = m.matmuls[0].block;
+    }
+    return int(m.matmuls.size());
+}
 // The 1.9 external-data genre states no FFN width anywhere a file shows it: the weights are MatMulNBitsBf nodes
 // whose initializers carry dims `[0]` (bytes live in a *.qweight.packed sibling), so the initializer-dimension
 // heuristic in plan() sees nothing. The NODE carries K and N as attributes, and walk_graph already descends into
@@ -1385,6 +1439,19 @@ FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits) {
     return g;
 }
 
+
+// ── The implicit zero point ───────────────────────────────────────────────────
+// A quantised matmul with no `qzeros` input takes an implicit zero point of 2^(bits-1) -- ONNX Runtime's own
+// MatMulNBits does exactly that when the tensor is absent, and it is corroborated in this collection: the *embedding*
+// component of the same family (GatherBlockQuantized, also no zeros) decodes to ONNX Runtime's output with cosine
+// 1.00000000 and max|d| 0 at zero point 8, against 0.317 at zero point 0 (measured on
+// amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu, engine#1725/#1661). `decode_matmulnbits` folds the zero into `q.zero`, so
+// this subtracts the implicit one the same way: zero term = -(2^(bits-1)) * scale.
+void implicit_zp_zero(Q4& q, int bits) {
+    if (bits <= 0 || q.scale.empty() || q.scale.size() != q.zero.size()) return;
+    const float zp = float(1 << (bits - 1));
+    for (size_t i = 0; i < q.zero.size(); ++i) q.zero[i] -= zp * q.scale[i];
+}
 
 // ── MatMulNBits → (codes, scale, zero) per 32-column group ───────────────────
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
@@ -1712,6 +1779,11 @@ namespace {
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                    std::string* why);   // defined with the table, internal to this file
 }
+const Fconst19Rule* fconst19_rules(int* count) {
+    if (count) *count = int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0]));
+    return kFconst19Rules;
+}
+
 const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std::string* why) {
     return select_rule_in(kFconst19Rules, int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0])), hidden, heads, layers,
                           why);
@@ -2432,9 +2504,14 @@ Plan plan(const std::string& pack_dir) {
     std::set<std::string> graph_projs;
     if (graph_weights) {
         for (const auto& t : onnx.tensors) {
-            const size_t pos = t.name.find(".MatMulNBits.");
-            if (pos == std::string::npos || t.dims.empty()) continue;   // 0-dim placeholders sit beside them
-            graph_projs.insert(t.name.substr(0, pos));
+            if (t.dims.empty()) continue;                              // 0-dim placeholders sit beside them
+            // Two spellings of the same thing: `<proj>.MatMulNBits.qweight` (the 1.8/phi-4 form) and
+            // `<proj>.MatMul.weight_Q4` (Qwen3-VL-4B's, three-input nodes, engine#1503).
+            size_t pos = t.name.find(".MatMulNBits.");
+            if (pos != std::string::npos) { graph_projs.insert(t.name.substr(0, pos)); continue; }
+            const std::string q4 = ".MatMul.weight_Q4";
+            pos = t.name.find(q4);
+            if (pos != std::string::npos) graph_projs.insert(t.name.substr(0, pos));
         }
     }
     const OnnxTensor* embed = nullptr;
@@ -3166,6 +3243,12 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         ++r.tensors;
         ++aux;
     }
+    // The device weight layout, when the caller declared one (`--weight-layout b8`): without this key the container
+    // asks the forward for the UNTAGGED family while the caller built `_b8` ELFs, and the failure reads as "missing
+    // full ELF" for a set that exists. Found by importing phi-4 with the flag, seeing the report print "declares
+    // q4nx_weight_layout b8", and then finding the key absent from config.json (engine#1503).
+    if (const std::string why = weight_layout_refusal(opt.weight_layout); !why.empty())
+        throw std::runtime_error("--weight-layout: " + why);
     json c;
     c["model_type"] = p.dims.model_type;
     c["hidden_size"] = p.dims.hidden;
@@ -3177,10 +3260,12 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     c["vocab_size"] = p.dims.vocab;
     c["rope_theta"] = p.dims.rope_theta;
     c["q4nx_parameters"] = "fp32 scale/zero per 32-column group";
+    if (!opt.weight_layout.empty() && opt.weight_layout != "rm") c["q4nx_weight_layout"] = opt.weight_layout;
     c["q4nx_source"] = {{"kind", "oga-npu-pack external data"}, {"pack", p.pack},
                         {"importer", "1bit npu-pack import"}, {"graph", graph},
                         {"note", "weights decoded from *.qweight.packed via decode_external_tile; the code ordering is "
-                                 "kExtQuantsRowMajor's compile-time choice (engine#1503)"}};
+                                 "kExtQuantsRowMajor's compile-time choice (engine#1503)"},
+                        {"weight_layout", opt.weight_layout.empty() ? "rm" : opt.weight_layout}};
     json manifest;
     manifest["format"] = "q4nx";
     manifest["layout"] = "q4nx-2";
@@ -3457,8 +3542,15 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // Decode rows [row0, row0+rows) of a projection's MatMulNBits weight into q4_1 tiles.
         auto decode_rows = [&](const std::string& proj, int row0, int rows, const std::string& out_name,
                                int k_override) -> bool {
+            // The two spellings of a quantised projection (engine#1503): the 1.8/phi-4 form carries a qweight and a
+            // scales sibling; Qwen3-VL-4B names them `<proj>.MatMul.weight_Q4` / `<proj>.MatMul.weight_scales` on a
+            // three-input node with no qzeros (implicit zero point, applied below).
             const OnnxTensor* qw = init_of(proj + ".MatMulNBits.qweight");
             const OnnxTensor* sc = init_of(proj + ".MatMulNBits.scales");
+            if (!qw || !sc) {
+                qw = init_of(proj + "MatMul.weight_Q4");
+                sc = init_of(proj + "MatMul.weight_scales");
+            }
             if (!qw || !sc || qw->dims.size() != 3 || sc->dims.empty()) return false;
             const int N = int(qw->dims[0]);
             const int block = int(qw->dims[2]) * 2;            // 64 B holds 128 four-bit codes
@@ -3608,7 +3700,9 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         const uint8_t* zp = have_zp ? bytes_of(onnx.tensors[zi->second], zp_need) : nullptr;
         uint64_t qw_need = 0;   // N * K/block * block/2
         if (!mul_ok(groups_n, uint64_t(mm.block) / 2, qw_need)) throw std::runtime_error("lm_head: qweight length overflows");
-        const Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        // no qzeros tensor -> the implicit zero point (engine#1503: Qwen3-VL-4B's spelling, three-input nodes)
+        if (!have_zp) implicit_zp_zero(q, mm.bits);
 
         std::vector<uint8_t> tiled;
         long long pinexact = 0;
@@ -4573,6 +4667,48 @@ bool canonical_copy_reusable(const std::string& work, int64_t expected_len) {
     // file_size() fails on a missing file and on a directory, which is exactly the set that must be rewritten.
     const std::uintmax_t have = fs::file_size(work, ec);
     return !ec && have == static_cast<std::uintmax_t>(expected_len);
+}
+
+// engine#1770: reuse (engine#1662) writes a NEW copy when the source changes instead of overwriting, so copies only ever
+// accumulate -- 699 files and 8.7 GiB of tmpfs (i.e. RAM) on this box, most of them truncated 0-byte tails. The identity
+// in the name is `1bit-fconst19v<n>-<pack tag>-<hidden>-<heads>-<layers>-<source size>-<source mtime>.fconst`, so keeping
+// one copy per (pack, geometry) means removing the entries that share the prefix but not the whole name. That cannot take
+// a copy a reader is about to use: reuse requires the entire name to match, and the one name that can match is the one
+// being kept. A reader holding a removed file open is unaffected (the inode outlives the unlink); at worst a concurrent
+// lane rewrites a copy it would have reused, which costs a file write and no correctness.
+void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix,
+                                  const std::string& legacy_name, int64_t max_age_seconds) {
+    if (dir.empty() || keep_name.empty() || prefix.empty() || keep_name.size() <= prefix.size()) return;
+    const std::string stem = "1bit-fconst19";
+    const auto        now  = fs::file_time_type::clock::now();
+    std::error_code   ec;
+    for (fs::directory_iterator it(fs::path(dir), ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string base = it->path().filename().string();
+        if (base == keep_name) continue;
+        // same pack and geometry, different source identity: nothing reuses it
+        if (base.size() > prefix.size() && base.compare(0, prefix.size(), prefix) == 0) {
+            std::error_code rm;
+            fs::remove(it->path(), rm);
+            continue;
+        }
+        // the generation before the source identity was part of the name: at most one per pack+geometry, matched exactly
+        if (!legacy_name.empty() && base == legacy_name) {
+            std::error_code rm;
+            fs::remove(it->path(), rm);
+            continue;
+        }
+        // and any scratch copy at all that nobody has touched for max_age_seconds is an abandoned pack: a write-triggered
+        // sweep is enough for the geometry being written, but a pack that is never imported again would otherwise stay in
+        // tmpfs (i.e. in RAM) for the life of the box (engine#1770)
+        if (max_age_seconds > 0 && base.size() > stem.size() && base.compare(0, stem.size(), stem) == 0) {
+            std::error_code tec;
+            const auto      mtime = fs::last_write_time(it->path(), tec);
+            if (!tec && now - mtime > std::chrono::seconds(max_age_seconds)) {
+                std::error_code rm;
+                fs::remove(it->path(), rm);
+            }
+        }
+    }
 }
 
 }  // namespace onebit::npu::pack_import

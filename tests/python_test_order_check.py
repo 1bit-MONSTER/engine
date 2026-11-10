@@ -73,11 +73,20 @@ INCLUDE = re.compile(r"^\s*include\(\s*([^)\s]+)\s*\)", re.MULTILINE)
 
 
 def include_offenders(root: pathlib.Path, cmake: pathlib.Path, text: str):
-    """Line numbers of includes that bind Python before find_package(Python3) does."""
+    """Line numbers of includes that bind Python before find_package(Python3) does.
+
+    Covered: an include whose argument is a path to a file that exists. An include of a variable or a module
+    (`include(${_file})`, `include(<name>)`) is skipped, because there is no file to read here -- so a registration
+    file reached through a `file(GLOB ...)` loop is outside this rule; its position is the loop's.
+    """
+    # One text for every offset: stripping comments shortens it, so the find_package's offset taken from the raw
+    # text and an include's offset taken from the stripped text are not comparable, and a comment above a correct
+    # find_package made the include after it an "offender" at the wrong line (review of engine#2012).
+    text = _strip_comments(text)
     finds = list(FIND.finditer(text))
     first = finds[0].start() if finds else None
     out = []
-    for m in INCLUDE.finditer(_strip_comments(text)):
+    for m in INCLUDE.finditer(text):
         target = m.group(1)
         if target.startswith("$") or target.startswith("<"):
             continue  # a variable or a module: its contents are not a file we can read here
@@ -91,8 +100,10 @@ def include_offenders(root: pathlib.Path, cmake: pathlib.Path, text: str):
         body = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
         if "${Python3_EXECUTABLE}" not in body and "add_python_test(" not in body:
             continue
-        if first is None or m.start() < first:
-            out.append(text.count("\n", 0, m.start()) + 1)
+        # m.start(1) is the include's own argument: the pattern's leading `\s*` also swallows the blank lines above it
+        # (which is what a stripped comment leaves), so m.start() can sit lines earlier than the include.
+        if first is None or m.start(1) < first:
+            out.append(text.count("\n", 0, m.start(1)) + 1)
     return out
 
 
@@ -125,7 +136,8 @@ def self_test() -> int:
     helper = "find_package(Python3 COMPONENTS Interpreter)\nfunction(add_python_test n)\n  add_test(NAME ${n} COMMAND ${Python3_EXECUTABLE} ${ARGN})\nendfunction()\nadd_python_test(a s.py)\n"
     # 4b. engine#1979: an include that pulls in a registration file is bound only if it comes after the find_package
     import tempfile
-    inc_root = pathlib.Path(tempfile.mkdtemp())
+    inc_tmp = tempfile.TemporaryDirectory()      # removed when the self-test returns
+    inc_root = pathlib.Path(inc_tmp.name)
     (inc_root / "cmake").mkdir()
     (inc_root / "cmake" / "reg.cmake").write_text("add_python_test(x tools/x.py --self-test)\n")
     (inc_root / "later").mkdir()
@@ -148,6 +160,25 @@ def self_test() -> int:
           "and the same include after it is not (got rc %d, want 1 because the 'earlier' tree is a counter-example)" % inc_ok)
     if inc_ok != 1:
         bad += 1
+    # ... and each tree by itself, with the line: a rule that flagged both trees, or the wrong one, also gives rc 1.
+    find = "find_package(Python3 COMPONENTS Interpreter)\n"
+    inc = "include(cmake/reg.cmake)\n"
+    note = "# a comment long enough to move every offset after it: the interpreter is found below, before the include\n"
+    inc_cases = [
+        (inc + find, [1], "an include before the find_package is the offender, at its own line"),
+        (find + inc, [], "an include after the find_package is not"),
+        (note + find + inc, [], "a comment above a correct find_package does not make the include an offender"),
+        (note + note + inc + find, [3], "a comment above a wrong order still reports the include's own line"),
+        (find + "# " + inc, [], "a commented-out include is not an include"),
+        (inc, [1], "with no find_package the include is unbound"),
+        (find + "include(${_registration_file})\n", [], "an include of a variable is outside the rule"),
+    ]
+    for text, want, why in inc_cases:
+        got = include_offenders(inc_root, inc_root / "CMakeLists.txt", text)
+        if got != want:
+            print(f"FAIL self-test: {why}: want {want}, got {got}")
+            bad += 1
+    print(("ok   " if not bad else "FAIL ") + "%d include trees checked one by one" % len(inc_cases))
     for text, want, why in cases:
         got = offenders(text)
         if got != want:

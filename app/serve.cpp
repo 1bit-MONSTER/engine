@@ -66,6 +66,7 @@
 #include "built_path.h"
 
 #include "gguf_meta.h"
+#include "q4nx_cache.h"
 #include "hrx_archs.h"
 #include "hrx_cwsr.h"
 #include "hrx_runtime.h"
@@ -2954,6 +2955,17 @@ std::string q4nx_cache_root() {
 // (Python), cached by GGUF stem so a repeated serve reuses the conversion.
 // Override the tool paths with ONEBIT_Q4NX_PYTHON / ONEBIT_Q4NX_CONVERTER and
 // the cache root with ONEBIT_Q4NX_CACHE.
+// engine#1956: the cache is regenerable scratch, not user data, and nothing ever removed an old entry -- measured at 104 G in
+// 29 entries on one box, which closed two lanes' build gates the same day. The bound is a size, not an age, because a busy
+// day imports more packs than any age window expires; ONEBIT_Q4NX_CACHE_MAX_GIB=0 restores the old unbounded behaviour.
+// The order is least-recently-USED: a cache hit touches its entry (q4nx_cache_touch), here and in npu/q4nx_device.cpp.
+// The entry just written is never a candidate, and neither is one younger than the sweep's age window (a serve may be reading
+// it) -- see app/q4nx_cache.h for why that is a heuristic rather than a guarantee.
+static void q4nx_cache_sweep(const std::string& cache, const std::string& keep) {
+    q4nx_cache_touch(keep);              // a reused entry counts as used now: the sweep is LRU by this, not by creation
+    q4nx_cache_evict(cache, keep, q4nx_cache_bound_bytes(std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB")));
+}
+
 std::string repack_gguf(const std::string& gguf) {
     const std::string stem = fs::path(gguf).stem().string();
     const std::string cache = q4nx_cache_root();
@@ -3029,9 +3041,13 @@ std::string repack_gguf(const std::string& gguf) {
                     "1bit serve: ============================================================\n\n",
                     checker.empty() ? "(unresolved)" : checker.c_str());
             }
+            q4nx_cache_touch(out);       // a hit is a use: without this the sweep's order is by creation
             return out;
         }
-        if (run_program({ python, checker, gguf, out }, true) == 0) return out;
+        if (run_program({ python, checker, gguf, out }, true) == 0) {
+            q4nx_cache_touch(out);
+            return out;
+        }
         std::fprintf(stderr, "1bit serve: cached Q4NX dir %s FAILED the declared-scale scan; "
                              "discarding and re-repacking\n", out.c_str());
         fs::remove_all(out);
@@ -3048,6 +3064,7 @@ std::string repack_gguf(const std::string& gguf) {
     const int rc = run_program(repack, false);
     if (rc != 0 || !fs::exists(out + "/model.q4nx"))
         throw std::runtime_error("GGUF repack failed (rc=" + std::to_string(rc) + "): " + command_text(repack));
+    q4nx_cache_sweep(cache, out);        // engine#1956: after the new entry exists, and never evicting it
     return out;
 }
 
@@ -3117,6 +3134,7 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
             fs::copy_file(fs::path(tok) / "tokenizer_config.json", fs::path(out) / "tokenizer_config.json",
                           fs::copy_options::overwrite_existing);
     }
+    q4nx_cache_sweep(cache, out);        // engine#1956: the lane layout lands in the same cache, so it sweeps too
     return out;
 }
 
@@ -3403,6 +3421,21 @@ int run_serve(int argc, char** argv) {
                                        fs::exists(fs::path(o.model) / "config.json") &&
                                        fs::exists(fs::path(o.model) / "tokenizer.json");
             if (model_generic && !kernels.empty() && fs::is_directory(kernels)) {
+                // engine#1740 (W6): --npu-opt is for a PRIVATE route, and this branch is the per-op forward, which
+                // cannot consume one. #1868 made the option refuse when no add-on is linked; with an add-on linked the
+                // option was still accepted here and then bypassed by the CONTAINER TYPE, silently -- a W6 run asked for
+                // the fused route, got per-op, and produced *identical* numbers, which reads as "no gain" rather than
+                // "wrong route". Refusing is the only answer that cannot be misread.
+                if (!o.npu_opts.empty()) {
+                    std::string keys;
+                    for (const auto& kv : o.npu_opts) keys += (keys.empty() ? "" : ", ") + kv.substr(0, kv.find('='));
+                    std::fprintf(stderr,
+                                 "1bit serve: --npu-opt %s was given, but %s is a model-generic container, which serves "
+                                 "through the per-op forward: the option has no effect here (it applies to a private "
+                                 "route's own model directory). Drop it, or serve the model directory that route "
+                                 "expects.\n", keys.c_str(), o.model.c_str());
+                    return 2;
+                }
                 std::fprintf(stderr,
                              "1bit serve: %s is a model-generic container: serving it through the per-op forward "
                              "(kernels %s)\n", o.model.c_str(), kernels.c_str());

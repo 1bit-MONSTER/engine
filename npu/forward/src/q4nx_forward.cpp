@@ -3056,16 +3056,15 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
                     const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
                     if (std::isfinite(v) && v > amax) amax = v;
                 }
-                if (!(amax >= 1e-12f)) amax = 1.0f;
-                t.d[(size_t)g * (size_t)N + (size_t)n] = amax / 127.0f;
-                const float tis = 127.0f / amax;
-                for (int k = k0; k < k1; k++) {
-                    float v = Bmat[(size_t)k * (size_t)N + (size_t)n];
-                    if (!std::isfinite(v)) v = 0.0f;
-                    int q = (int)std::round(v * tis);
-                    q = q > 7 ? 7 : (q < -8 ? -8 : q);
-                    t.codes[(size_t)k * (size_t)N + (size_t)n] = (int8_t)q;
-                }
+                /* engine#1839: the weights here are the container's INT4 codes, so the scale that maps amax onto
+                 * that range is amax/7 -- pairing amax/127 (an int8 scale) with the [-8, 7] clamp saturated every code
+                 * but the largest and made the host reference's weights ~18x too small. q4nx_quant_int4_*() own the
+                 * pair so this site and q4nx_pack.c's cannot drift apart again. */
+                const float amax_eff = (amax >= 1e-12f) ? amax : 1.0f;
+                t.d[(size_t)g * (size_t)N + (size_t)n] = q4nx_quant_int4_scale(amax_eff);
+                for (int k = k0; k < k1; k++)
+                    t.codes[(size_t)k * (size_t)N + (size_t)n] =
+                        q4nx_quant_int4_code(Bmat[(size_t)k * (size_t)N + (size_t)n], amax_eff);
             }
         }
         it = host_i8_cache_.emplace(wkey, std::move(t)).first;

@@ -1542,6 +1542,26 @@ output for it as goldens, so the arithmetic is checked in CI without a pack; wit
 `ONEBIT_MINICPM_PACK` and `ONEBIT_MINICPM_ORACLE` set it repeats the comparison above. The reference
 run itself needs transformers and torch and is not in the tree.
 
+**Where an image goes before the tower (`npu/vision_plan.h`).** `vision::plan_image(height, width)` is
+the arithmetic of the model's image processor (transformers' `MiniCPMV4_6ImageProcessor`, which 4.7
+loads), with no pixel touched: the model looks at an image whole, resized to about 448 × 448 pixels,
+and, when the image is larger than that, again as a grid of up to 9 slices cut from a second, larger
+resize. Every piece is a multiple of 56 pixels (4 patches) in both extents, because the tower merges
+2 × 2 twice, and becomes `(height/56) × (width/56)` rows on the text side.
+
+| image | whole view | slices | text rows |
+|---|---|---|---|
+| 448 × 448 or smaller (scaled up) | 448 × 448 | none | 64 |
+| 480 × 640 | 392 × 504 | 1 × 2 of 560 × 392 | 63 + 2 × 70 |
+| 1080 × 1920 | 336 × 616 | 2 × 4 of 448 × 448 | 66 + 8 × 64 |
+| 3024 × 4032 | 392 × 504 | 3 × 3 of 392 × 504 | 63 + 9 × 63 |
+
+(heights first.) So one 448-pixel slice is 64 rows, not the 1,225 that 980 / 14 / 2 squared suggests: the
+position table is 70 × 70, but no piece the processor produces is that large unless the image is a very
+long strip. The plan is checked against the reference's own answers for 3,481 image sizes in
+`tests/npu_vision_plan_test.cpp`. Resampling the pixels (the reference uses bicubic), rescaling and the
+slice separators on the text side are not written.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU

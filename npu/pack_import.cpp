@@ -1352,7 +1352,19 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
         int64_t best_off = 0;
         for (const auto& [o, n] : off)
             if (n > best) { best = n; best_off = o; }
-        if (best_off > 0) g.h1 = best_off;
+        if (best_off > 0) {
+            // Populate the same fields `locate_fconst` would have: `hdr` is the in-block header list and the reader
+            // classifies a pack as a 2-header (one inner anchor) or 4-header (three) block from its SIZE. Setting only
+            // h1 left `hdr` empty, so a pack whose anchors could not win the vote was classified as "1 epsilon header"
+            // and every attention projection refused while the MLP imported byte-exact -- measured on Qwen2-7B 1.9.
+            // The scan window is the first GiB (about 8 blocks of this geometry), so the right residue repeats ~8 times
+            // against 1-2 for a payload coincidence. Requiring `layers/2` was too strict and silently dropped the real one.
+            if (best >= 3) {                             // the residue repeats across blocks: a real section boundary
+                g.h1 = best_off;
+                g.hdr.assign(1, best_off);               // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
+                g.period = 2;
+            }
+        }
     }
     return g;
 }

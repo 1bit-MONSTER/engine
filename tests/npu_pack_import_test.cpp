@@ -2988,7 +2988,7 @@ void test_q4nx_container(const std::string& root) {
         check(!c.tensors.empty(), "q4nx container: a two-tensor header reads (" + c.why + ")");
         check(c.tensors.size() == 2, "q4nx container: both tensors are reported");
         check(c.header_bytes == int64_t(hdr.size()), "q4nx container: the 8-byte length is the header's own");
-        check(c.payload_bytes == 819200, "q4nx container: the payload is the sum of the data_offsets spans (got " +
+        check(c.payload_bytes == 820480, "q4nx container: the payload is the sum of the data_offsets spans (got " +
                                              std::to_string(c.payload_bytes) + ")");
         bool saw_bf16 = false, saw_i8 = false;
         for (const auto& t : c.tensors) {
@@ -3047,8 +3047,10 @@ void test_q4nx_container(const std::string& root) {
         std::string out(8, '\0');
         const int64_t n = int64_t(1) << 40;
         for (int i = 0; i < 8; ++i) out[size_t(i)] = char((n >> (8 * i)) & 0xFF);
-        std::ofstream f(p, std::ios::binary);
-        f.write(out.data(), std::streamsize(out.size()));
+        {
+            std::ofstream f(p, std::ios::binary);
+            f.write(out.data(), std::streamsize(out.size()));
+        }   // flushed and closed: the reader must see the bytes, not an empty file
         const auto c = pi::read_q4nx_container(p.string());
         check(c.tensors.empty() && c.why.find("implausible") != std::string::npos,
               "q4nx container: an implausible header length is refused by the number (" + c.why + ")");

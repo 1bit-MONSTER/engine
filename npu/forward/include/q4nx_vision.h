@@ -62,6 +62,17 @@ inline void block_position(int t, int gh, int gw, int* h, int* w) {
 // `table` is row-major (side, side, C); `out` is (gh*gw, C). gh and gw must be even and >= kMergeSize.
 void pos_embed(const float* table, int gh, int gw, int C, float* out);
 
+// The tower's axial 2D rotary embedding, exactly as the graph applies it to q and k:
+//   ang = concat([pos_h * inv_freq, pos_w * inv_freq])            (head_dim/2 wide)
+//   cos = TILE(cos(ang), 2),  sin = TILE(sin(ang), 2)             (Lg: cat([a,a]) -- a tile, NOT an interleave)
+//   out = x*cos + rotate_half(x)*sin,  rotate_half(u) = cat(-u[head_dim/2:], u[:head_dim/2])
+// Established against the graph's own post-rope q: corr 0.999996, mean|d| 3.3e-3 on |ref| 1.15. Both details are load
+// bearing and both were wrong in my first three attempts: an interleaved `repeat` gives corr 0.44 where the tile gives 0.84
+// before the rest of the tower is even considered, and rotating each 32-dim half separately gives 0.99 but never 1.
+// `inv_freq` is the pack's own `visual.rotary_pos_emb.inv_freq` table (head_dim/4 entries); `pos_h`/`pos_w` are the token
+// positions in merge-block order (see block_position).
+void rope_axial(float* x, int tokens, int n_heads, int head_dim, const float* inv_freq, const int* pos_h, const int* pos_w);
+
 }  // namespace q4nx_vision
 
 #endif  // ONEBIT_NPU_VISION_H

@@ -847,17 +847,10 @@ add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
     # the whole run loop against canned completions, and re-derives the summary from the written transcript.  Stdlib
     # only, with no route, no socket, no dataset fetch and no device.
     add_test(NAME gsm8k_eval COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gsm8k_eval_test.py)
-    # engine#1808: the kernel gate asks for "bit-exact against the host reference", but the only host arm the
-    # forward offers is f32 -- which cannot be bit-exact with an int8 x int4 device by construction. This pins
-    # the integer arm (q4nx_host_gemm_i8) against an independently generated known answer, including an
-    # activation of -128 so a naive int8 intermediate or an int32 saturation would show. Pure host, no device.
-    # q4nx_pack.c is the file that defines q4nx_host_gemm_i8 (it is in onebit_npu_forward, not onebit_npu), and
-    # its newer body also calls q4nx_dequant_tensor_chunked, so both sources come with the test.
-    add_executable(npu_host_gemm_i8_test tests/npu_host_gemm_i8_test.cpp
-        npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
-    target_include_directories(npu_host_gemm_i8_test PRIVATE npu/forward/include ${CMAKE_SOURCE_DIR}/tests)
-    target_link_libraries(npu_host_gemm_i8_test PRIVATE onebit_npu)
-    add_test(NAME npu_host_gemm_i8 COMMAND npu_host_gemm_i8_test)
+    # engine#1808's integer host arm is pinned inside tests/npu_pack_test.cpp (ctest npu_pack): that binary is
+    # already built by ci.yml, and a new ctest target would need a `.github/workflows/ci.yml` edit, which this
+    # lane's token cannot push (the OAuth app has no `workflow` scope) -- the ci_targets check caught exactly
+    # that, with both failures ("ci_targets" and "npu_host_gemm_i8 Not Run").
     # The repack's tile-order claim (engine#1110): `npu_plan.py` writes container.tile_order=engine-1 for every
     # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
     # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.
@@ -1106,13 +1099,18 @@ if(ONEBIT_OGA_PACK)
     add_test(NAME npu_pack_import_oga
              COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden ${ONEBIT_OGA_PACK})
 endif()
-add_executable(npu_pack_test tests/npu_pack_test.cpp)
+# q4nx_pack.c is listed here rather than reached through onebit_npu: the integer host arm's checks
+# (engine#1808) call q4nx_host_gemm_i8*() directly, and those live in that file.
+add_executable(npu_pack_test tests/npu_pack_test.cpp npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
 target_link_libraries(npu_flm_head_import_test PRIVATE onebit_npu)
 add_test(NAME npu_flm_head_import COMMAND npu_flm_head_import_test ${CMAKE_SOURCE_DIR}/tests/golden/flm-i8)
 target_link_libraries(npu_pack_test PRIVATE onebit_npu)
+# engine#1808: the integer host arm's checks live in this binary (see above), so it needs the header and the
+# golden fixture that pins them.
+target_include_directories(npu_pack_test PRIVATE npu/forward/include ${CMAKE_SOURCE_DIR}/tests)
 
 # The device weight layout contract (q4nx_weight_layout): pure index math, no device
 # and no runtime.  CI builds an explicit target list, so the check compiles itself with

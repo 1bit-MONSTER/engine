@@ -1071,6 +1071,10 @@ what it can and records the rest in the container's `__metadata__` (`incomplete`
 `config.json` (`q4nx_source.incomplete`). The shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
 now imports whole — **291 tensors, 67,088 tiles, no refusals**: embedding, head, the 48 layer
 norms, the final norm, 96 attention projections, 72 attention biases and 72 MLP projections.
+That holds for a pack whose layer projections are graph initializers (no `.fconst`) too: a
+projection the decoder cannot read, for example codes present but no scales tensor beside them,
+is refused by name like any other. It used to be skipped, so the import reported no refusals over
+a container missing that projection (engine#1841).
 
 ### The final norm, and the tail envelope
 

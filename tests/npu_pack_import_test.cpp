@@ -2335,6 +2335,110 @@ void test_three_input_matmulnbits(const std::string& root) {
     fs::remove_all(dir);
 }
 
+// engine#1841: genre A (projections are graph initializers, no .fconst) decodes each layer projection by name, and a
+// lookup that missed used to return quietly -- the container then reported itself complete with no layer projections
+// (the #1790 CHANGES: `...o_projMatMul.weight_Q4`, a missing dot). The dot is normalised on main; this pins the other
+// half: a projection the decoder cannot read is a NAMED refusal, not a skip. plan() refuses a projection whose codes are
+// absent, but it counts one present on `<proj>.MatMul.weight_Q4` (or any `.MatMulNBits.` tensor) alone, while the
+// decoder needs the scales beside it -- so a pack missing only the scales passed plan() and lost the projection without a
+// word. One crafted 1-layer pack in Qwen3-VL-4B's three-input spelling, imported whole (every projection lands, nothing
+// refused), then with down_proj's scales misnamed (refused by name; nothing written without --allow-incomplete).
+void test_genre_a_projection_gap(const std::string& root) {
+    const fs::path dir = fs::path(root) / "genre-a-gap";
+    const int64_t H = 64, I = 64, V = 64, hd = 32, heads = 2, kv = 1, block = 32, groups = H / block;
+    auto build = [&](bool spell_down_wrong) {
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        std::string data;
+        std::vector<std::string> inits, nodes;
+        auto append = [&](const void* q, size_t n) {
+            data.append(static_cast<const char*>(q), n);
+            return uint64_t(data.size() - n);
+        };
+        std::vector<float> embed(size_t(V * H));
+        for (size_t i = 0; i < embed.size(); ++i) embed[i] = 0.01f * float(i % 89) - 0.4f;
+        const uint64_t eo = append(embed.data(), embed.size() * 4);
+        inits.push_back(pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", eo, uint64_t(V * H) * 4));
+        std::vector<uint16_t> ones(size_t(H), 0x3C00);   // f16 1.0
+        for (const char* nm : {"model.layers.0.input_layernorm.weight", "model.layers.0.post_attention_layernorm.weight",
+                               "model.norm.weight"}) {
+            const uint64_t o = append(ones.data(), ones.size() * 2);
+            inits.push_back(pb::tensor(nm, {H}, "model.onnx.data", o, uint64_t(H) * 2, 10));
+        }
+        auto proj = [&](const std::string& pre, int64_t N, int64_t K, bool wrong) {
+            const int64_t g = K / block;
+            std::vector<uint8_t> qw(size_t(N * g * (block / 2)));
+            for (size_t i = 0; i < qw.size(); ++i) qw[i] = uint8_t((i * 7 + 3) & 0xFF);
+            std::vector<float> sc(size_t(N * g));
+            for (size_t i = 0; i < sc.size(); ++i) sc[i] = 0.01f * float(1 + i % 5);
+            // `wrong`: the codes keep their name and the scales sibling does not -- plan() counts a projection present
+            // on its weight_Q4 alone, so only the decoder can see that the pair is incomplete.
+            const std::string wq = pre + ".MatMul.weight_Q4";
+            const std::string ws = pre + (wrong ? ".MatMul.weight_scale" : ".MatMul.weight_scales");
+            const uint64_t qo = append(qw.data(), qw.size()), so = append(sc.data(), sc.size() * 4);
+            inits.push_back(pb::tensor(wq, {N, g, block / 2}, "model.onnx.data", qo, qw.size(), 2));
+            inits.push_back(pb::tensor(ws, {N, g}, "model.onnx.data", so, sc.size() * 4, 1));
+            nodes.push_back(pb::matmulnbits(pre, {"x", wq, ws}, K, N, 4, block));
+        };
+        const std::string a = "model.layers.0.attn.", m = "model.layers.0.mlp.";
+        proj(a + "q_proj", heads * hd, H, false);
+        proj(a + "k_proj", kv * hd, H, false);
+        proj(a + "v_proj", kv * hd, H, false);
+        proj(a + "o_proj", H, heads * hd, false);
+        proj(m + "gate_proj", I, H, false);
+        proj(m + "up_proj", I, H, false);
+        proj(m + "down_proj", H, I, spell_down_wrong);
+        proj("lm_head", V, H, false);
+        put_file((dir / "model.onnx.data").string(), data);
+        put_file((dir / "model.onnx").string(), pb::model(inits, nodes));
+        put_file((dir / "config.json").string(),
+                 R"({"model_type":"qwen2","hidden_size":64,"intermediate_size":64,"num_hidden_layers":1,)"
+                 R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"vocab_size":64,)"
+                 R"("rope_theta":10000.0,"tie_word_embeddings":false,"rms_norm_eps":1e-06})");
+        (void)groups;
+    };
+    const std::string out = (fs::temp_directory_path() / ("oga_pack_genre_a." + std::to_string(::getpid()))).string();
+    auto names_down = [](const pi::Report& r) {
+        for (const auto& s : r.refused)
+            if (s.find("mlp.down_proj.weight") != std::string::npos && s.find("no quantised projection the decoder can pair") != std::string::npos)
+                return true;
+        return false;
+    };
+
+    build(false);
+    fs::remove_all(out);
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    pi::Report whole;
+    try {
+        whole = pi::import_pack(dir.string(), out, allow);
+    } catch (const std::exception& e) {
+        check(false, std::string("genre-A gap: the whole crafted pack imports (threw: ") + e.what() + ")");
+        fs::remove_all(dir);
+        return;
+    }
+    for (const auto& s : whole.refused) std::fprintf(stderr, "  genre-A whole: refused %s\n", s.c_str());
+    bool proj_refused = false;
+    for (const auto& s : whole.refused) proj_refused |= s.find("no quantised projection the decoder can pair") != std::string::npos;
+    check(!proj_refused, "genre-A gap: with every projection present, none is refused as missing");
+    check(whole.tensors >= 7, "genre-A gap: the seven layer projections land in the container (" +
+                                  std::to_string(whole.tensors) + " tensors)");
+
+    build(true);
+    fs::remove_all(out);
+    const pi::Report gap = pi::import_pack(dir.string(), out, pi::Options{});
+    for (const auto& s : gap.refused) std::fprintf(stderr, "  genre-A gap: refused %s\n", s.c_str());
+    check(names_down(gap), "genre-A gap: a projection plan() accepted but the decoder cannot pair is refused BY NAME (down_proj), not skipped");
+    check(!fs::exists(out + "/model.q4nx"), "genre-A gap: and without --allow-incomplete no container is written");
+    const pi::Report gap2 = pi::import_pack(dir.string(), out, allow);
+    check(names_down(gap2) && fs::exists(out + "/model.q4nx"),
+          "genre-A gap: --allow-incomplete writes the rest and still lists down_proj");
+    std::printf("genre-A gap: whole pack %zu refused / %d tensors; down_proj scales misnamed -> %zu refused, named %s\n",
+                whole.refused.size(), whole.tensors, gap.refused.size(), names_down(gap) ? "yes" : "NO");
+    fs::remove_all(out);
+    fs::remove_all(dir);
+}
+
 void test_embedding_component(const std::string& root) {
     const fs::path dir = fs::path(root) / "embedcomp";
     fs::remove_all(dir);
@@ -2478,23 +2582,49 @@ void test_fconst19_rule_table() {
     check(pi::select_fconst19_rule_from(dup, 2, 1536, 12, 28, &why) != nullptr,
           "fconst19 rule: a geometry measured twice with the same shape is fine -- that is the h1536 pair, which is "
           "byte-identical over all 28 blocks");
-    // 4. engine#1774 / TNPU-ALL W2's third gate clause: EVERY row of the real table must select itself back, with its own
-    //    numbers. Written table-driven rather than one check per row for two reasons the table has already demonstrated:
-    //    a wrong digit is silent (the anchors still line up), and a merge dropped the h4096 row twice with nothing failing.
-    int rules_n = 0;
-    const pi::Fconst19Rule* rules = pi::fconst19_rules(&rules_n);
-    check(rules && rules_n >= 8,
-          "fconst19 rule: the table still has its rows (" + std::to_string(rules_n) + " >= 8; a merge dropping one is a "
-          "silent un-measure of a whole class)");
-    for (int i = 0; i < rules_n; i++) {
-        const pi::Fconst19Rule& row = rules[i];
-        std::string w;
-        const pi::Fconst19Rule* got = pi::select_fconst19_rule(row.hidden, row.heads, row.layers, &w);
-        check(got && got->prefix == row.prefix && got->n_tiles == row.n_tiles && got->rot == row.rot && got->tile == row.tile,
-              "fconst19 rule: row " + std::to_string(row.hidden) + "/" + std::to_string(row.heads) + "h/" +
-                  std::to_string(row.layers) + "L selects itself back with its measured numbers (" +
-                  std::to_string(got ? got->prefix : -1) + ", " + std::to_string(got ? got->n_tiles : -1) + ", " +
-                  std::to_string(got ? got->rot : -1) + ", " + std::to_string(got ? got->tile : -1) + ")");
+    // 4. engine#1774 / TNPU-ALL W2's third gate clause, made able to fail (engine#1854). The expected rows live HERE, as
+    //    literals copied from the measured table, not read back from it: an arm that selects each table row by its own key
+    //    and compares it with itself passes a wrong digit (h4096 prefix 12608 -> 12609) and a dropped row (10 >= 8), the
+    //    two failures this arm exists for. Adding or re-measuring a row is therefore a deliberate edit in BOTH places.
+    {
+        const pi::Fconst19Rule want[] = {
+            {896, 14, 24, 1856, 16, 2, 34816},       // Qwen2.5-0.5B-Instruct
+            {2048, 16, 28, 8512, 3, 1, 1183744},     // Qwen3-1.7B
+            {576, 9, 30, 3776, 4, 1, 76800},         // SmolLM2-135M-Instruct
+            {1536, 12, 28, 3136, 7, 1, 226304},      // Qwen2.5-Coder-1.5B-Instruct (and Qwen-2.5_1.5B_Instruct)
+            {2560, 32, 36, 9536, 5, 1, 1462272},     // Qwen3-4B
+            {2048, 32, 16, 8512, 5, 1, 591872},      // Llama-3.2-1B-Instruct
+            {3072, 32, 32, 10560, 2, 1, 5222400},    // Phi-3.5-mini-instruct (and Phi-3-mini-128k)
+            {3584, 28, 28, 7232, 8, 1, 1009664},     // the Qwen2.5-7B family, measured on two models
+            {2048, 16, 36, 4160, 9, 1, 295936},      // Qwen2.5_3B_Instruct
+            {4096, 32, 32, 12608, 5, 1, 2297856},    // Mistral-7B-Instruct-v0.2
+            {3072, 24, 28, 10560, 4, 1, 1740800},    // Llama-3.2-3B (and -Instruct)
+        };
+        const int want_n = (int)(sizeof(want) / sizeof(want[0]));
+        int rules_n = 0;
+        const pi::Fconst19Rule* rules = pi::fconst19_rules(&rules_n);
+        check(rules && rules_n == want_n,
+              "fconst19 rule: the table has exactly the " + std::to_string(want_n) + " measured rows (" +
+                  std::to_string(rules_n) + "); a dropped row is a silent un-measure of a whole class, an added one "
+                  "must be added here too");
+        for (const pi::Fconst19Rule& row : want) {
+            std::string w;
+            const pi::Fconst19Rule* got = pi::select_fconst19_rule(row.hidden, row.heads, row.layers, &w);
+            check(got && got->prefix == row.prefix && got->n_tiles == row.n_tiles && got->rot == row.rot &&
+                      got->tile == row.tile,
+                  "fconst19 rule: " + std::to_string(row.hidden) + "/" + std::to_string(row.heads) + "h/" +
+                      std::to_string(row.layers) + "L selects its measured numbers (" +
+                      std::to_string(got ? got->prefix : -1) + ", " + std::to_string(got ? got->n_tiles : -1) + ", " +
+                      std::to_string(got ? got->rot : -1) + ", " + std::to_string(got ? got->tile : -1) + ")");
+        }
+        // what the old self-select loop really tested: no two rows of the real table share a key with different
+        // shapes (select_rule_in refuses that as ambiguous, so every row must still select)
+        for (int i = 0; rules && i < rules_n; i++) {
+            std::string w;
+            check(pi::select_fconst19_rule(rules[i].hidden, rules[i].heads, rules[i].layers, &w) != nullptr,
+                  "fconst19 rule: no two rows share the key " + std::to_string(rules[i].hidden) + "/" +
+                      std::to_string(rules[i].heads) + "h/" + std::to_string(rules[i].layers) + "L with different shapes");
+        }
     }
 
     // 5. the case this row is: the SECOND geometry at hidden 2048 / 16 heads, told apart only by its layer count. If a
@@ -3309,6 +3439,7 @@ int main(int argc, char** argv) {
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);
+        test_genre_a_projection_gap(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();
         test_fconst_scratch_order();

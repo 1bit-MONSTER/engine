@@ -90,6 +90,11 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
  * refuses, plus an out-of-range row. The values are the ones that function would place at that row, bit for bit. */
 int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols, int chunk_bytes, int r,
                           float* out /* cols */);
+/* The chunk kind q4nx_dequant_tile_row() would accept for a [rows, cols] table of `nbytes`, or 0 when it would refuse
+ * every row: rows a multiple of 32, cols a multiple of 256, and nbytes exactly (rows/32)*(cols/256) tiles of one of the
+ * three kinds. A loader that picks the per-row path asks this first (engine#1842): choosing it on `nbytes % tiles == 0`
+ * alone let a table the reader refuses load fine and then serve every embedding read as 0.0f. */
+int q4nx_tile_row_kind(size_t nbytes, int rows, int cols);
 
 /* The (rows, cols) tile grid a container actually stores, when it is LARGER than the model's.
  *

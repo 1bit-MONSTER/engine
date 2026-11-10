@@ -742,14 +742,17 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                  * 155,200 of them), so a row is read out of the `cols/256` tiles that cover it instead of the whole
                  * table being decoded into f32 -- which for that pack is 0.74 GiB of container becoming 4.74 GiB.
                  * Same tile grid and ordering as q4nx_dequant_tensor_chunked(), pinned by the row test. */
-                const int ntr = NV / 32, ntc = kpad_ / 256;
-                const size_t tiles = (size_t)ntr * (size_t)ntc;
-                if (tiles > 0 && esz % tiles == 0) {
+                /* engine#1842: the grid is checked with the row reader's own rule, not `esz % tiles == 0`. That test let a
+                 * table with no supported chunk kind, or an NV / kpad_ off the 32 x 256 grid, take this path; the reader
+                 * then refused every row and embed_at() served 0.0f with no message. A table it would refuse stays on
+                 * the whole-table decode below, which reports its own failure. */
+                const int cb = q4nx_tile_row_kind(esz, NV, kpad_);
+                if (cb != 0) {
                     embed_tile_       = (const uint8_t*)e;
                     embed_tile_bytes_ = esz;
                     embed_tile_rows_  = NV;
                     embed_tile_cols_  = kpad_;
-                    embed_tile_cb_    = int(esz / tiles);
+                    embed_tile_cb_    = cb;
                     embed_row_buf_.assign((size_t)kpad_, 0.0f);
                     embed_row_tok_    = -1;
                 }
@@ -3042,8 +3045,20 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                                   int wkey, float* out) {
     const int G = 128, groups = (K + G - 1) / G;
-    auto it = host_i8_cache_.find(wkey);
-    if (it == host_i8_cache_.end()) {
+    // THE KEY MUST CARRY THE LAYER AND THE SHAPE (engine#1830 review). `wkey` is a per-ROLE slot -- 0 QKV, 1 O/gate,
+    // 2 GU, 3 up, 4 down -- so it is the same number in every layer, and `Bmat` is the one scratch buffer that
+    // `load_layer()` decodes each layer into, so neither identifies a layer. Keyed on `wkey` alone, every layer after 0
+    // ran on LAYER 0's weights: layer 0 scored cos 0.99923, layer 1 collapsed to 0.37, and 31 layers of wrong residual
+    // updates compounded into the "explosion, not drift" the per-layer dump shows. The device cache this arm mirrors
+    // says the rule in its own comment -- one weight BO per (layer, wkey) -- and carries `a.layer = cur_layer_`.
+    // `wkey < 0` is the routed-expert case: those weights vary per TOKEN, which is why the device path passes -1; caching
+    // them would serve every token's experts from the first token's, so that case packs a throwaway image instead.
+    const bool cacheable = wkey >= 0;
+    const auto key = std::make_tuple(cur_layer_, wkey, K, N);
+    HostI8Tensor scratch;
+    const HostI8Tensor* cached = nullptr;
+    auto it = cacheable ? host_i8_cache_.find(key) : host_i8_cache_.end();
+    if (!cacheable || it == host_i8_cache_.end()) {
         HostI8Tensor t;
         t.groups = groups; t.N = N;
         t.codes.assign((size_t)K * (size_t)N, 0);
@@ -3068,9 +3083,16 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
                 }
             }
         }
-        it = host_i8_cache_.emplace(wkey, std::move(t)).first;
+        if (!cacheable) {
+            scratch = std::move(t);
+            cached = &scratch;
+        } else {
+            cached = &host_i8_cache_.emplace(key, std::move(t)).first->second;
+        }
+    } else {
+        cached = &it->second;
     }
-    const HostI8Tensor& t = it->second;
+    const HostI8Tensor& t = *cached;
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
         const float* a = A + (size_t)m * (size_t)a_k;

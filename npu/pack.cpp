@@ -64,10 +64,15 @@ size_t tiles_read(int n_tiles, int G) {
     return most;
 }
 
-// A tensor's shape decides how much the packer reads; refuse one whose reads would run past the
-// end of model.q4nx.
+// A tensor's shape decides how much the packer reads; refuse one whose reads would run past the TENSOR. engine#1881:
+// this used to test `t.avail`, which is measured to the end of the FILE, so a read that overran its own tensor into
+// the next one passed -- every tensor but the last has neighbours. `t.bytes` is the tensor; `avail` stays the outer
+// bound of the mapping (and is >= bytes by construction).
 void need(const Tensor& t, size_t bytes, const char* what) {
-    if (bytes > t.avail) throw std::runtime_error(std::string("model.q4nx: ") + what + " runs past the end of the file");
+    if (bytes > t.bytes)
+        throw std::runtime_error(std::string("model.q4nx: ") + what + " needs " + std::to_string(bytes) +
+                                 " bytes but the tensor holds " + std::to_string(t.bytes) +
+                                 (bytes > t.avail ? " (and runs past the end of the file)" : " (the read would run into the next tensor)"));
 }
 
 const char* const kProj[] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",

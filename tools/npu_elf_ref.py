@@ -64,8 +64,15 @@ def prng_bits(n, seed):
 def quantise(weights, axis):
     """int8 codes + per-(check) scale, the way a container holds them: absmax/127 with a 1.0 floor on an all-zero slice.
 
-    axis=1 -> a per-COLUMN scale (B, the weight matrix: one scale per output column, floored per 32-column group upstream)
-    axis=0 -> a per-ROW scale (A, the activations: one scale per token)
+    axis=0 -> a per-COLUMN scale (B, the weight matrix: `amax` is taken along K, one value per output column)
+    axis=1 -> a per-ROW scale (A, the activations: one value per token)
+
+    Those two lines were swapped until #1805's audit: `axis=1` reduces ALONG axis 1 and broadcasts as `(-1, 1)`, i.e. one scale per ROW, and
+    `run_case()` agrees with the code (`a_w, axis=1` = per token, `b_w, axis=0` = per column). The self-check now asserts the convention so the
+    docstring and the code cannot drift again.
+
+    `codes = rint(weights / scale)` rounds half to even (numpy's default). The packer's mode is not stated here; if it differs on exact .5
+    boundaries the codes differ there and nowhere else, which is the edge the saturating case is built to reach.
     """
     amax = np.max(np.abs(weights), axis=axis).astype(np.float64)
     amax[amax < 1e-12] = 1.0                       # the container's floor: an all-zero slice quantises to zeros at scale 1
@@ -167,6 +174,15 @@ def main():
                   f"rel={rel:.1e} acc32==acc64={p['int32_matches_int64']} zero_cols={p['zero_b_cols']} "
                   f"floored={p['floored_cols']} maxcode={p['max_abs_code']}")
             bad += 0 if ok else 1
+        # engine#1805 audit: the docstring's axes were swapped for as long as this tool existed, so assert the convention too -- a per-column
+        # scale comes from reducing along axis 0, and a 3x4 must give 4 column scales and 3 row scales. Re-swapping either line fails here.
+        _w = np.ones((3, 4))
+        _col, _col_s = quantise(_w, axis=0)
+        _row, _row_s = quantise(_w, axis=1)
+        _conv = _col_s.shape == (4,) and _row_s.shape == (3,)
+        print(f"  {'ok  ' if _conv else 'FAIL'} axis convention: axis=0 -> {_col_s.shape[0]} column scales, "
+              f"axis=1 -> {_row_s.shape[0]} row scales (3x4 matrix)")
+        bad += 0 if _conv else 1
         print("npu_elf_ref self-check: " + ("ok" if not bad else f"{bad} FAILED"))
         return 0 if not bad else 1
 

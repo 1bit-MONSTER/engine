@@ -107,9 +107,18 @@ std::string private_route_missing(const std::string& model_type) {
            "-DONEBIT_NPU_PRIVATE=<npu-kernels checkout> (docs/npu.md, \"Private routes\")";
 }
 
+bool private_routes_available() { return !routes().empty() || !commands().empty(); }
+
 void parse_private_option(const std::string& kv, PrivateOptions& opts) {
     const auto eq = kv.find('=');
     if (eq == std::string::npos || eq == 0) throw std::runtime_error("--npu-opt takes KEY=VALUE, not '" + kv + "'");
+    // A private-route option on a build with no private routes is not a preference, it is a request nothing will read.
+    // Storing it silently is how a run ended up 10x slower than asked with no log line anywhere (engine#1740, W6): the
+    // caller asked for one route and got another, and the only evidence was that the numbers were identical.
+    if (!private_routes_available())
+        throw std::runtime_error("--npu-opt " + kv +
+                                 " was given, but this build links no private NPU route, so the option would be ignored. "
+                                 "Build with -DONEBIT_NPU_PRIVATE=<npu-kernels checkout> (docs/npu.md, \"Private routes\")");
     opts[kv.substr(0, eq)] = kv.substr(eq + 1);
 }
 

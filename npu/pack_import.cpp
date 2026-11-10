@@ -1786,7 +1786,11 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                 const uint8_t* zeros = subv + 2048;
                 const uint8_t* scales = subv + 2112;
                 for (int r = 0; r < kExtSubvRows; ++r) {
-                    const int64_t row = tile * kExtTileRows + half * kExtSubvRows + r;
+                    // MEASURED, not assumed: a 64-row block's two subvolume halves are stored in the order (half 1,
+                    // half 0) -- the block's FIRST 32 rows live in the pair's SECOND subvolume. Checked row for row against
+                    // the imported container: with `half * 32 + r` exactly one row in 64 matched (R mod 64 == 0), and with the
+                    // swap the sampled rows match (engine#1503).
+                    const int64_t row = tile * kExtTileRows + (1 - half) * kExtSubvRows + r;
                     const float s = bf16_to_f32(uint16_t(scales[r * 2] | (scales[r * 2 + 1] << 8)));
                     // four int4 zero points per row, one per 32-column group of the 128-column block
                     const uint8_t z0 = zeros[r * 2], z1 = zeros[r * 2 + 1];

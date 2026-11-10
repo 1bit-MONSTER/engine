@@ -217,7 +217,11 @@ int64_t group_bytes(int64_t k, int rows);
 // `bf16_bits_of()`; the default is bf16 1e-6, which is what the Qwen family declares.
 struct FconstGeom {
     int64_t stride = 0;   // bytes per layer block
-    int64_t h1 = 0;       // offset of the second (post-attention) header within a block
+    int64_t h1 = 0;       // offset of the block's SECOND header (the post-attention one only when a block
+                          // carries two; on a 4-header block it opens the k_norm section)
+    // Where the block's post-attention section starts: h1 on a 2-header block, the LAST header on a
+    // 4-header (Qwen3) block. Shared by the post_attention_layernorm read and the MLP section start.
+    int64_t post_attn_hdr() const { return hdr.empty() ? h1 : hdr.back(); }
     int period = 0;       // headers per block
     int blocks = 0;       // block starts seen
     // Every in-block header offset after the block's first (so hdr[0] == h1), relative to the block

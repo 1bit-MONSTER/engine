@@ -462,10 +462,11 @@ def check(root):
         where = f" under if({' AND '.join(guards)})" if guards else ""
         print(f"ci_targets_check: add_test names '{name}'{where}, and ci.yml never builds "
               f"{'/'.join(sorted(set(need[name])))} -- that test never reaches ctest in the configuration CI "
-              f"creates (it is not registered, or registered and not built). Three routes, and only the middle one "
-              f"needs no ci.yml edit: name the target in ci.yml's build list (a `.github/workflows/` edit, so it "
-              f"needs `workflow` scope), fold these cases into a target ci.yml ALREADY builds (the "
-              f"tests/npu_pack_import_test.cpp pattern), or drop the test")
+              f"creates (it is not registered, or registered and not built). Routes, of which only the first needs a "
+              f"ci.yml edit: name the target in ci.yml's build list (a `.github/workflows/` edit, so it needs "
+              f"`workflow` scope); make it a build dependency of a target ci.yml builds "
+              f"(`add_dependencies(onebit <target>)`, which this checker already follows); fold these cases into such "
+              f"a target (the tests/npu_pack_import_test.cpp pattern); or drop the test")
     if new:
         return 1
     # A baseline entry that no longer drifts is progress; say so rather than staying silent, so the

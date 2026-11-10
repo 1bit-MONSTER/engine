@@ -3753,10 +3753,338 @@ void test_embedding_f32_component(const std::string& root) {
     std::string why2;
     const std::vector<float> none = pi::read_embedding_component(b.string(), &why2);
     std::printf("f32 embedding (per-layer): %zu values, why: %s\n", none.size(), why2.c_str());
-    check(none.empty() && why2.find("per_layer") != std::string::npos,
-          "f32 embedding: a per-layer table is refused by NAME, not reported as a missing table (" + why2 + ")");
+    check(!none.empty(),
+          "f32 embedding: a per-layer table no longer blocks the TOKEN table (slice 2 handles it; " + why2 + ")");
     fs::remove_all(a);
     fs::remove_all(b);
+}
+
+
+// engine#1725: a multi-component embedding carries a PER-LAYER table and its projection norm beside the token table, and
+// the importer writes both into the container so the forward path can gather them. Measured shapes on
+// amd/gemma-4-e2b-it-mobius-int4_rai_1.9.0_npu: embed_tokens.weight (262144,1536) f32,
+// embed_tokens_per_layer.weight (262144,8960) f32, per_layer_projection_norm.weight (256,) -- all f32, no scales.
+// This drives the writer on a crafted pack of that shape (V=4, width=6) and reads the container header back.
+void test_per_layer_container(const std::string& root) {
+    const fs::path dir = fs::path(root) / "perlayer";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "embedding");
+    const int64_t V = 4, width = 6;
+    // two-arg form: `norm(size_t(width))` parses as a function declaration and `norm{size_t(width)}` is an
+    // initializer_list of ONE element = width. Both mistakes produce a plausible-looking fixture.
+    std::vector<float> tok(size_t(V) * 3, 0.0f), per(size_t(V) * size_t(width), 0.0f), norm(size_t(width), 0.0f);
+    for (size_t i = 0; i < tok.size(); ++i) tok[i] = float(i) * 0.5f;
+    for (size_t i = 0; i < per.size(); ++i) per[i] = float(int(i) - 8) * 0.25f;
+    for (size_t i = 0; i < norm.size(); ++i) norm[i] = 1.0f + float(i) * 0.125f;
+    std::string data;
+    const size_t tok_bytes = tok.size() * 4, per_bytes = per.size() * 4;
+    data.append(reinterpret_cast<const char*>(tok.data()), tok_bytes);
+    data.append(reinterpret_cast<const char*>(per.data()), per_bytes);
+    data.append(reinterpret_cast<const char*>(norm.data()), norm.size() * 4);
+    put_file((dir / "embedding" / "model.onnx.data").string(), data);
+    put_file((dir / "embedding" / "model.onnx").string(),
+             pb::model({pb::tensor("embedding.embed_tokens.weight", {V, 3}, "model.onnx.data", 0, tok_bytes, 1),
+                        pb::tensor("embedding.embed_tokens_per_layer.weight", {V, width}, "model.onnx.data", tok_bytes,
+                                   per_bytes, 1),
+                        pb::tensor("embedding.per_layer_projection_norm.weight", {width}, "model.onnx.data",
+                                   tok_bytes + per_bytes, norm.size() * 4, 1)},
+                       {}));
+    put_file((dir / "genai_config.json").string(),
+             R"({"model":{"type":"gemma4","embedding":{"filename":"embedding/model.onnx"},)"
+             R"("decoder":{"filename":"decoder/model.onnx"}}})");
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"gemma4","hidden_size":3,"intermediate_size":6,"num_hidden_layers":1,)"
+             R"("num_attention_heads":1,"num_key_value_heads":1,"head_dim":3,"vocab_size":4,"rope_theta":10000.0})");
+    std::string why;
+    const pi::EmbedPerLayer pl = pi::read_embedding_per_layer(dir.string(), 3, &why);
+    std::printf("per-layer: V %lld width %lld, why: %s (tok %zu per %zu norm %zu bytes)\n", (long long) pl.V,
+                (long long) pl.width, why.c_str(), tok_bytes, per_bytes, norm.size() * 4);
+    check(pl.ok(), "per-layer: the table and its projection norm are read from the component genai_config.json names");
+    bool same = pl.ok() && pl.V == V && pl.width == width;
+    for (size_t i = 0; same && i < per.size(); ++i) same = pl.at(int64_t(i) / width, int64_t(i) % width) == per[i];
+    for (size_t i = 0; same && i < norm.size(); ++i) same = pl.norm[i] == norm[i];
+    check(same, "per-layer: the values come back exactly as the component states them");
+    // the token table is still this reader's other half: it must NOT be refused because a per-layer table is present
+    std::string why2;
+    const std::vector<float> t = pi::read_embedding_component(dir.string(), &why2);
+    check(t.size() == size_t(V) * 3, "per-layer: the token table still reads beside it (" + std::to_string(t.size()) + ")");
+
+    // #1825 review: the band converter had no arm, and it rounded "up iff the kept lsb is 1" -- half of all values off by
+    // one ulp, including values bf16 holds EXACTLY. per[] here is multiples of 0.25 (exact); the fixture below adds the
+    // three cases that separate the rules: an exact value with an odd kept lsb (1.0078125 = 0x3F81'0000 must stay
+    // 0x3F81), a tie on an even lsb (stays), a tie on an odd lsb (goes up to even), and one just above a tie.
+    {
+        const auto f32_of = [](uint32_t bits) {
+            float f;
+            std::memcpy(&f, &bits, 4);
+            return f;
+        };
+        const fs::path d2 = fs::path(root) / "perlayer-band";
+        fs::remove_all(d2);
+        fs::create_directories(d2 / "embedding");
+        const int64_t V2 = 70, W2 = 5;   // 70 rows: two whole 32-row bands and a 6-row one
+        std::vector<float> per2(size_t(V2) * size_t(W2));
+        for (size_t i = 0; i < per2.size(); ++i) per2[i] = 0.001f * float(int(i * 37 % 211) - 100);   // inexact in bf16
+        per2[0] = f32_of(0x3F810000u);   // exact, odd lsb          -> 0x3F81
+        per2[1] = f32_of(0x3F808000u);   // tie, even lsb           -> 0x3F80
+        per2[2] = f32_of(0x3F818000u);   // tie, odd lsb            -> 0x3F82
+        per2[3] = f32_of(0x3F808001u);   // just above a tie        -> 0x3F81
+        per2[size_t(69) * size_t(W2) + 4] = f32_of(0xBF810000u);   // the last value of the short band, exact and negative
+        std::vector<float> norm2(size_t(W2), 1.0f), tok2(size_t(V2) * 3, 0.5f);
+        std::string data2;
+        data2.append(reinterpret_cast<const char*>(tok2.data()), tok2.size() * 4);
+        data2.append(reinterpret_cast<const char*>(per2.data()), per2.size() * 4);
+        data2.append(reinterpret_cast<const char*>(norm2.data()), norm2.size() * 4);
+        put_file((d2 / "embedding" / "model.onnx.data").string(), data2);
+        put_file((d2 / "embedding" / "model.onnx").string(),
+                 pb::model({pb::tensor("embedding.embed_tokens.weight", {V2, 3}, "model.onnx.data", 0, tok2.size() * 4, 1),
+                            pb::tensor("embedding.embed_tokens_per_layer.weight", {V2, W2}, "model.onnx.data",
+                                       tok2.size() * 4, per2.size() * 4, 1),
+                            pb::tensor("embedding.per_layer_projection_norm.weight", {W2}, "model.onnx.data",
+                                       tok2.size() * 4 + per2.size() * 4, norm2.size() * 4, 1)},
+                           {}));
+        put_file((d2 / "genai_config.json").string(),
+                 R"({"model":{"type":"gemma4","embedding":{"filename":"embedding/model.onnx"},)"
+                 R"("decoder":{"filename":"decoder/model.onnx"}}})");
+        std::string why3;
+        const pi::EmbedPerLayer p2 = pi::read_embedding_per_layer(d2.string(), 3, &why3);
+        check(p2.ok() && p2.V == V2 && p2.width == W2, "per-layer band: the table is located (" + why3 + ")");
+        if (p2.ok()) {
+            // the reference is as_bf16-equivalent: pi::bf16_bits_of is the file's exported round-to-nearest-even
+            std::vector<uint16_t> want(per2.size());
+            for (size_t i = 0; i < per2.size(); ++i) want[i] = pi::bf16_bits_of(per2[i]);
+            check(want[0] == 0x3F81 && want[1] == 0x3F80 && want[2] == 0x3F82 && want[3] == 0x3F81,
+                  "per-layer band: the reference rounds to nearest even on the four separating values");
+            std::vector<uint16_t> got(per2.size(), 0xFFFF);
+            bool bands = true;
+            for (int64_t row = 0; row < V2; row += 32) {
+                const int64_t n = std::min<int64_t>(32, V2 - row);
+                std::string bw;
+                bands = bands && pi::read_per_layer_table_band(
+                                     p2, row, n, reinterpret_cast<uint8_t*>(got.data() + size_t(row) * size_t(W2)), &bw) == n;
+            }
+            check(bands, "per-layer band: 32 + 32 + 6 rows read");
+            size_t differ = 0;
+            for (size_t i = 0; i < got.size(); ++i) differ += got[i] != want[i];
+            check(differ == 0, "per-layer band: every banded value is round-to-nearest-even bf16 (" +
+                                   std::to_string(differ) + " of " + std::to_string(got.size()) + " differ)");
+            check(got[0] == 0x3F81, "per-layer band: an exactly representable value with an odd lsb is not moved");
+            std::string bw;
+            std::vector<uint8_t> scratch(size_t(W2) * 2 * 2);
+            check(pi::read_per_layer_table_band(p2, V2 - 1, 2, scratch.data(), &bw) == -1 &&
+                      pi::read_per_layer_table_band(p2, -1, 1, scratch.data(), &bw) == -1,
+                  "per-layer band: a band past the table, or before it, is refused");
+        }
+        // a table that declares more rows than its data carries is refused when it is LOCATED, not at some later band
+        put_file((d2 / "embedding" / "model.onnx").string(),
+                 pb::model({pb::tensor("embedding.embed_tokens_per_layer.weight", {V2 + 1000, W2}, "model.onnx.data",
+                                       tok2.size() * 4, per2.size() * 4, 1)},
+                           {}));
+        std::string why4;
+        const pi::EmbedPerLayer p3 = pi::read_embedding_per_layer(d2.string(), 3, &why4);
+        check(!p3.ok() && why4.find("more bytes than its data carries") != std::string::npos,
+              "per-layer band: a table longer than its data is refused by the reader (" + why4 + ")");
+        fs::remove_all(d2);
+    }
+    fs::remove_all(dir);
+}
+
+
+
+// engine#1725, #1825 review: the per-layer block THROUGH import_pack(). The reader arms above call the helpers; nothing
+// ran the writer, so the streamed table, the offsets of every tensor after it, the per-layer split of the context
+// projection and the two config keys that switch the block on were all unpinned. The fixture is the tied block-32 one
+// (it reaches the embedding writer under allow-incomplete) plus an embedding component shaped like gemma-4's: a table
+// NL x P wide, a norm P wide (shared by the layers -- not `width` wide), and the context projection quantised at
+// block 32, stored at a NON-ZERO offset of the external data.
+void test_per_layer_import(const std::string& root) {
+    const fs::path dir = fs::path(root) / "perlayer-import";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    fs::create_directories(dir / "embedding");
+    const int H = 128, L = 8, V = 64;
+    const int64_t P = 4, NL = 2, W = P * NL;
+    {
+        const int64_t stride = 1 << 20, second = 262144;
+        std::string fc(size_t(int64_t(L) * stride + 64 + size_t(H) * 2), '\0');
+        auto put_eps = [&](int64_t off) {
+            fc[size_t(off)] = char(0x86);
+            fc[size_t(off) + 1] = char(0x35);
+        };
+        for (int l = 0; l < L; ++l) {
+            put_eps(int64_t(l) * stride);
+            put_eps(int64_t(l) * stride + second);
+        }
+        put_eps(int64_t(L) * stride);
+        for (int i = 0; i < H; ++i) {
+            const uint16_t bits = pi::bf16_bits_of(float(i + 1));
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i)] = char(bits & 0xFF);
+            fc[size_t(int64_t(L) * stride + 64 + 2 * i) + 1] = char(bits >> 8);
+        }
+        put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+    }
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06})");
+    {
+        std::string data(size_t(V) * size_t(H) * 2, '\0');
+        for (int r = 0; r < V; ++r)
+            for (int c = 0; c < H; ++c) {
+                const uint16_t bits = pi::bf16_bits_of(0.05f * float((r * 7 + c * 13) % 97) - 2.4f);
+                data[(size_t(r) * H + c) * 2] = char(bits & 0xFF);
+                data[(size_t(r) * H + c) * 2 + 1] = char(bits >> 8);
+            }
+        put_file((dir / "model.onnx.data").string(), data);
+    }
+    put_file((dir / "cache" / "lm_head_meta.json").string(),
+             R"({"op_list":[{"type":"MladfMatMul","name":"lm_head.MatMulNBits",)"
+             R"("attrs":{"N":{"value":[64]},"K":{"value":[128]},"block_size":{"value":[32]},"bits":{"value":[4]}}}],)"
+             R"("tensor_map":{}})");
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {V, H}, "model.onnx.data", 0,
+                                   uint64_t(V) * uint64_t(H) * 2, 10),
+                        pb::placeholder("lm_head.weight.MatMulNBits.qweight"),
+                        pb::placeholder("lm_head.weight.MatMulNBits.scales"),
+                        pb::placeholder("lm_head.weight.MatMulNBits.zeros")},
+                       {}));
+    // the embedding component: table [V][W] f32, norm [P] f32, projection [W][H] int4 at block 32 + f32 scales
+    std::vector<float> per(size_t(V) * size_t(W), 0.0f), norm(size_t(P), 0.0f), scales(size_t(W) * size_t(H / 32), 0.5f);
+    for (size_t i = 0; i < per.size(); ++i) per[i] = 0.003f * float(int(i * 53 % 409) - 200);
+    {
+        uint32_t odd = 0x3F810000u;   // exact in bf16 with an odd kept lsb: must come back as 0x3F81
+        std::memcpy(&per[0], &odd, 4);
+    }
+    for (size_t i = 0; i < norm.size(); ++i) norm[i] = 1.0f + 0.25f * float(i);
+    const std::string qw(size_t(W) * size_t(H) / 2, char(0xBB));   // every code 11 -> (11 - 8) x 0.5 = 1.5
+    std::string data;
+    data.append(reinterpret_cast<const char*>(per.data()), per.size() * 4);
+    const uint64_t norm_off = data.size();
+    data.append(reinterpret_cast<const char*>(norm.data()), norm.size() * 4);
+    const uint64_t qw_off = data.size();
+    data += qw;
+    const uint64_t sc_off = data.size();
+    data.append(reinterpret_cast<const char*>(scales.data()), scales.size() * 4);
+    put_file((dir / "embedding" / "model.onnx.data").string(), data);
+    put_file((dir / "embedding" / "model.onnx").string(),
+             pb::model({pb::tensor("embedding.embed_tokens_per_layer.weight", {V, W}, "model.onnx.data", 0, per.size() * 4, 1),
+                        pb::tensor("embedding.per_layer_projection_norm.weight", {P}, "model.onnx.data", norm_off,
+                                   norm.size() * 4, 1),
+                        pb::tensor("embedding.per_layer_model_projection.weight_t_Q4", {W, int64_t(H / 32), 16},
+                                   "model.onnx.data", qw_off, qw.size(), 2),
+                        pb::tensor("embedding.per_layer_model_projection.weight_t_scales", {W * int64_t(H / 32)},
+                                   "model.onnx.data", sc_off, scales.size() * 4, 1)},
+                       {}));
+    put_file((dir / "genai_config.json").string(), R"({"model":{"embedding":{"filename":"embedding/model.onnx"}}})");
+
+    const std::string out =
+        (fs::temp_directory_path() / ("oga_pack_import_perlayer." + std::to_string(::getpid()))).string();
+    fs::remove_all(out);
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    std::string why;
+    pi::Report r;
+    try {
+        r = pi::import_pack(dir.string(), out, allow);
+    } catch (const std::exception& e) {
+        why = e.what();
+    }
+    check(why.empty(), "per-layer import: the pack imports (" + why.substr(0, 200) + ")");
+    check(r.per_layer_P == P && r.per_layer_V == V, "per-layer import: the report carries P " + std::to_string(r.per_layer_P) +
+                                                        " and V " + std::to_string(r.per_layer_V));
+    if (fs::exists(out + "/model.q4nx")) {
+        const json tbl = container_table(out + "/model.q4nx");
+        const std::vector<uint8_t> blob = container_payload(out + "/model.q4nx");
+        const auto u16 = [&](const std::string& name, size_t i) {
+            const auto offs = tbl[name]["data_offsets"].get<std::vector<uint64_t>>();
+            return uint16_t(uint16_t(blob[size_t(offs[0]) + 2 * i]) | uint16_t(uint16_t(blob[size_t(offs[0]) + 2 * i + 1]) << 8));
+        };
+        const bool have = tbl.contains("model.per_layer_token_embd.weight") && tbl.contains("model.per_layer_proj_norm.weight") &&
+                          tbl.contains("model.per_layer_model_proj.weight_layer0") &&
+                          tbl.contains("model.per_layer_model_proj.weight_layer1") &&
+                          !tbl.contains("model.per_layer_model_proj.weight_layer2");
+        check(have, "per-layer import: the container carries the table, the norm and one projection per layer (2)");
+        if (have) {
+            const auto shape = tbl["model.per_layer_token_embd.weight"]["shape"].get<std::vector<int64_t>>();
+            const auto offs = tbl["model.per_layer_token_embd.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+            check(shape == std::vector<int64_t>({V, W}) && offs[1] - offs[0] == uint64_t(V) * uint64_t(W) * 2 &&
+                      tbl["model.per_layer_token_embd.weight"]["dtype"] == "BF16",
+                  "per-layer import: the table is declared BF16 [V, NL*P] with exactly that many bytes");
+            size_t differ = 0;
+            for (size_t i = 0; i < per.size(); ++i) differ += u16("model.per_layer_token_embd.weight", i) != pi::bf16_bits_of(per[i]);
+            check(differ == 0, "per-layer import: every value of the STREAMED table is round-to-nearest-even bf16 (" +
+                                   std::to_string(differ) + " of " + std::to_string(per.size()) + " differ)");
+            check(u16("model.per_layer_token_embd.weight", 0) == 0x3F81,
+                  "per-layer import: an exactly representable value with an odd lsb is not moved");
+            // the tensors AFTER the streamed one: their offsets are only right if the stream wrote what the header says
+            bool norm_ok = tbl["model.per_layer_proj_norm.weight"]["shape"].get<std::vector<int64_t>>() == std::vector<int64_t>({P});
+            for (size_t i = 0; norm_ok && i < norm.size(); ++i)
+                norm_ok = u16("model.per_layer_proj_norm.weight", i) == pi::bf16_bits_of(norm[i]);
+            check(norm_ok, "per-layer import: the P-wide norm follows the streamed table intact (shared by the layers)");
+            bool proj_ok = tbl["model.per_layer_model_proj.weight_layer1"]["shape"].get<std::vector<int64_t>>() ==
+                           std::vector<int64_t>({P, int64_t(H)});
+            for (size_t i = 0; proj_ok && i < size_t(P) * size_t(H); ++i)
+                proj_ok = u16("model.per_layer_model_proj.weight_layer0", i) == pi::bf16_bits_of(1.5f) &&
+                          u16("model.per_layer_model_proj.weight_layer1", i) == pi::bf16_bits_of(1.5f);
+            check(proj_ok, "per-layer import: the context projection is read at ITS offset of the external data and split "
+                           "per layer ((11 - 8) x 0.5 = 1.5 everywhere)");
+        }
+        std::ifstream cf(out + "/config.json");
+        check(cf.good(), "per-layer import: the container carries a config.json");
+        if (cf.good()) {
+            const json cfg = json::parse(cf);
+            check(cfg.value("hidden_size_per_layer_input", int64_t(0)) == P && cfg.value("vocab_size_per_layer_input", int64_t(0)) == V,
+                  "per-layer import: config.json switches the block on (hidden_size_per_layer_input 4, vocab 64)");
+        }
+    } else {
+        check(false, "per-layer import: no container was written");
+    }
+    fs::remove_all(out);
+    fs::remove_all(dir);
+}
+
+// engine#1503: a 1.9 fconst whose blocks are NOT uniform (the mobius line). `fconst19_detect` requires one stride for the
+// whole file, so it fails -- and the failure used to be indistinguishable from "not a 1.9 fconst at all". The refusal now
+// names the structure and says the rule table cannot describe it. Measured on gemma-4-e2b: 35 blocks of 8 anchors, sizes
+// 21.87-288.06 MiB.
+void test_fconst_variable_stride(const std::string& root) {
+    const fs::path dir = fs::path(root) / "fconst-varstride";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    const int H = 128, L = 4, heads = 2;
+    const int64_t hdr = heads * 4;
+    // four blocks, each header then a body of a DIFFERENT size: 64 KiB, 96 KiB, 128 KiB, 160 KiB
+    const int64_t bodies[4] = {64 << 10, 96 << 10, 128 << 10, 160 << 10};
+    std::string fc;
+    for (int l = 0; l < L; ++l) {
+        for (int h = 0; h < heads; ++h) {                  // 00 00 7f ff per head
+            fc.push_back('\0'); fc.push_back('\0'); fc.push_back(char(0x7f)); fc.push_back(char(0xff));
+        }
+        fc.append(size_t(bodies[l]), '\0');
+    }
+    check(fc.size() > size_t(L * hdr), "variable stride: the crafted fconst is larger than its headers");
+    put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"gemma4","hidden_size":128,"intermediate_size":256,"num_hidden_layers":4,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,"rope_theta":10000.0})");
+    put_file((dir / "model.onnx").string(), pb::model({}, {}));
+    put_file((dir / "model.onnx.data").string(), std::string(4096, '\x11'));
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    const std::string out = (fs::temp_directory_path() / ("varstride_out." + std::to_string(::getpid()))).string();
+    fs::remove_all(out);
+    bool refused = false;
+    std::string what;
+    try {
+        (void) pi::import_pack(dir.string(), out, allow);
+    } catch (const std::exception& e) {
+        what = e.what();
+        refused = what.find("variable-stride") != std::string::npos || what.find("NOT uniform") != std::string::npos;
+    }
+    std::printf("variable stride: %s\n", refused ? "refused by name (variable-stride container)" : what.substr(0, 140).c_str());
+    check(refused, "variable stride: a 1.9 fconst whose blocks differ in size is refused BY NAME, not as 'not a 1.9 fconst'");
+    fs::remove_all(out);
+    fs::remove_all(dir);
 }
 
 // engine#1740 (W1a): the tail-head placement arithmetic, pinned without a pack, a device or a fixture. The rows, the
@@ -3918,6 +4246,7 @@ int main(int argc, char** argv) {
         test_attn_tile(golden_dir);
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
+        test_fconst_variable_stride(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
@@ -3934,6 +4263,8 @@ int main(int argc, char** argv) {
         test_im_from_node_attrs(golden_dir.empty() ? "." : golden_dir);
         test_fconst_in_component(golden_dir.empty() ? "." : golden_dir);
         test_embedding_in_component(golden_dir.empty() ? "." : golden_dir);
+        test_per_layer_container(golden_dir.empty() ? "." : golden_dir);
+        test_per_layer_import(golden_dir.empty() ? "." : golden_dir);
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);

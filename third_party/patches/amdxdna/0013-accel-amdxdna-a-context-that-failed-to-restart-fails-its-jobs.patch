@@ -1,0 +1,129 @@
+From 135f6a890220ccecb283997e046ff3417f98915e Mon Sep 17 00:00:00 2001
+From: bong-water-water-bong <bong-water-water-bong@1bit.gg>
+Date: Tue, 10 Nov 2026 10:47:01 -0400
+Subject: [PATCH] accel/amdxdna: a context that failed to restart fails its
+ jobs
+
+aie2_hwctx_restart() left a context whose restart failed paused. That
+kept its queue off a context firmware does not have, but it did not
+finish the job:
+
+- A failure after aie2_create_context() succeeded (map host buffer,
+  add heap, config CU) left the new firmware context and its started
+  mailbox channel in place, without a host buffer or a CU
+  configuration. aie2_hwctx_fini() unpauses unconditionally, so at
+  close the parked jobs were run on that context.
+- A parked job was never failed. Its submitter waited until its own
+  timeout or until the context was closed.
+
+On failure, destroy the firmware context again (a no-op when the
+create itself failed) and then unpause. aie2_job_run() already refuses
+a job on a context with no mailbox channel: it sets -ENODEV on the
+fence, signals it and frees the job. So the parked jobs and every
+later submission on the context fail at once, and nothing is sent to a
+context firmware does not have or has only half of.
+
+The failure is logged once at error level with the context name, the
+error, the teardown result and the number of parked jobs failed. The
+-ESRCH return for a context that is being torn down is unchanged, and
+so is the TDR resume callback returning 0 for every context.
+---
+ drivers/accel/amdxdna/aie2_ctx.c | 50 ++++++++++++++++++++++++++------
+ drivers/accel/amdxdna/aie2_tdr.c |  9 ++++--
+ 2 files changed, 47 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/aie2_ctx.c b/drivers/accel/amdxdna/aie2_ctx.c
+index 75bc573..100a07d 100644
+--- a/drivers/accel/amdxdna/aie2_ctx.c
++++ b/drivers/accel/amdxdna/aie2_ctx.c
+@@ -137,6 +137,8 @@ int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx)
+ {
+ 	struct amdxdna_gem_obj *heap = hwctx->priv->heap;
+ 	unsigned long heap_id;
++	int destroy_ret;
++	size_t parked;
+ 	int ret;
+ 
+ 	/*
+@@ -204,19 +206,49 @@ int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx)
+ 	}
+ 
+ out:
+-	/*
+-	 * Only a context that actually came back may take work.  Unpausing on the
+-	 * failure path submitted jobs to a context firmware no longer has, and the
+-	 * only visible symptom was an NPU that had "restarted" and then silently
+-	 * stopped answering (engine#1750).  A context that failed stays paused, so
+-	 * its jobs get a clean, attributable failure instead of a wedge.
+-	 */
+ 	if (!ret) {
+ 		XDNA_DBG(xdna, "%s restarted", hwctx->name);
+ 		aie2_hwctx_job_unpause(hwctx);
+-	} else {
+-		XDNA_DBG(xdna, "%s restart failed, left paused, ret %d", hwctx->name, ret);
++		return 0;
+ 	}
++
++	/*
++	 * -ESRCH: the owner is tearing the context down. It has no firmware
++	 * context (aie2_hwctx_stop() destroyed it) and aie2_hwctx_fini() fails
++	 * whatever is parked on it, so there is nothing to do here.
++	 */
++	if (ret == -ESRCH)
++		return ret;
++
++	/*
++	 * The restart failed. Two things were wrong with leaving it at that
++	 * (engine#1750, engine#1855):
++	 *
++	 * - A failure after aie2_create_context() succeeded (map host buffer,
++	 *   add heap, config CU) left a firmware context and a started mailbox
++	 *   channel behind with no host buffer or no CU configuration.
++	 *   Whoever unpaused the queue next - aie2_hwctx_fini() does,
++	 *   unconditionally - ran the parked jobs on that context.
++	 * - A parked job was never failed: its submitter waited until its own
++	 *   timeout or until the context was closed, which is the "NPU
++	 *   recovered and then stopped answering" symptom.
++	 *
++	 * So take the firmware context away again (a no-op when the create
++	 * itself failed), and then unpause: aie2_job_run() refuses a job on a
++	 * context with no mailbox channel, sets -ENODEV on its fence, signals
++	 * it and frees the job. The parked jobs and every later submission on
++	 * this context get that error at once, and nothing is ever sent to a
++	 * context firmware does not have or has only half of. A later restart
++	 * that succeeds (the next device resume) makes the context usable again.
++	 */
++	mutex_lock(&hwctx->priv->io_lock);
++	parked = list_count_nodes(&hwctx->priv->paused_job_list);
++	mutex_unlock(&hwctx->priv->io_lock);
++
++	destroy_ret = aie2_destroy_context(xdna->dev_handle, hwctx);
++	XDNA_ERR(xdna, "%s restart failed, ret %d: no firmware context (teardown ret %d), failing %zu parked job(s) and later submissions with -ENODEV",
++		 hwctx->name, ret, destroy_ret, parked);
++	aie2_hwctx_job_unpause(hwctx);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/accel/amdxdna/aie2_tdr.c b/drivers/accel/amdxdna/aie2_tdr.c
+index fbe9a86..1615839 100644
+--- a/drivers/accel/amdxdna/aie2_tdr.c
++++ b/drivers/accel/amdxdna/aie2_tdr.c
+@@ -135,9 +135,12 @@ static int aie2_tdr_resume_hwctx(struct amdxdna_hwctx *hwctx, void *arg)
+ 		 */
+ 		rarg->skipped++;
+ 	} else if (ret) {
+-		/* aie2_hwctx_restart() left it paused when it failed: it is counted as
+-		 * failed here, and must not be unpaused by a retry either. */
+-		XDNA_ERR(rarg->xdna, "%s restart failed, left paused, ret %d", hwctx->name, ret);
++		/*
++		 * aie2_hwctx_restart() has already taken the firmware context
++		 * away, failed the parked jobs and logged it; this context
++		 * refuses work with -ENODEV. It is counted as failed here.
++		 */
++		XDNA_ERR(rarg->xdna, "%s restart failed, ret %d", hwctx->name, ret);
+ 		rarg->failed = true;
+ 	}
+ 
+-- 
+2.53.0
+

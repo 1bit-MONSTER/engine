@@ -184,7 +184,11 @@ int serve_only(const std::string& model_dir, const std::string& host, int port, 
     };
     srv.Post("/v1/embeddings", handler);
     srv.Post("/embeddings", handler);
-    if (!srv.bind_to_port(host, port)) {
+    // bind_to_port() answers bool; the port comes back from bind_to_any_port(), which is the same bind_internal(host, 0)
+    // with the chosen port returned. Same idiom as app/serve.cpp:2023 and :2694 - a caller that asked for port 0 has no
+    // other way to learn which one it got.
+    const int bound_port = port == 0 ? srv.bind_to_any_port(host) : (srv.bind_to_port(host, port) ? port : -1);
+    if (bound_port < 0) {
         std::fprintf(stderr, "1bit serve: cannot listen on %s:%d\n", host.c_str(), port);
         return 2;
     }
@@ -195,6 +199,11 @@ int serve_only(const std::string& model_dir, const std::string& host, int port, 
     std::thread listener([&] { srv.listen_after_bind(); });
     std::fprintf(stderr, "1bit serve: %s on %s embedding (%s), in-process: /v1/embeddings, dim %d, %d-token cap\n",
                  id.c_str(), backend.device().c_str(), model_dir.c_str(), backend.dim(), backend.max_tokens());
+    // engine#1779: the readiness line every other serve route prints, and the one `serve_port_from_log()`
+    // (tests/serve_port.sh) reads back. The in-process embedding route returned before either of the other two
+    // "ready on" sites (serve.cpp:2050, :2765), so a caller that asked for --port 0 could not discover the port it was
+    // listening on - which is what engine #1485 fixed for the other routes and left true only for them.
+    std::fprintf(stderr, "1bit serve: ready on http://%s:%d\n", host.c_str(), bound_port);
     listener.join();
     return 0;
 }

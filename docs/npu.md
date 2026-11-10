@@ -1715,7 +1715,7 @@ The cost is one more launch on the request that makes the pin. Every decision is
 (`[prefix] pin slot=1 tokens=342 state_at=341 pinned`), and `usage.flm_prefix_cache.pinned` says when a hit
 came from the pinned slot.
 
-Measured 2026-11-10 on `bonsai2-t2s2-perrole876` with its `kernels-m16`, `--ctx-size 1024`, one `npu-hold`
+Measured 2026-11-10 on `bonsai2-t2s2-perrole876` with its `kernels-m16`, one `npu-hold`
 ticket, one server per arm, four requests: the same 14-rule system prompt, then three different questions and
 the second one again. 16 tokens generated, temperature 0.
 
@@ -1730,6 +1730,30 @@ The generated text of all four requests is identical between the cache-off arm a
 The default-cache arm's times are not in the table: the ticket ended during its third request, so only its
 three cache decisions (from the server log) are known. A request's time here is the whole HTTP call, prefill
 plus 16 generated tokens, not TTFT.
+
+**`--flash`** (`1bit serve --device npu --flash`) is the single-turn profile as one word: `--ctx-size 1024`
+plus `--prefix-pin`. It refuses what contradicts it (`--ctx-size` other than 1024, `--prefix-slots 0`, a device
+other than `npu`) instead of quietly winning or losing.
+
+`--ctx-size N` now reaches this route. Before engine#1785's flash slice, `serve --ctx-size N` on a
+model-generic container was accepted and dropped at the hand-off to `forward-serve`, which kept the model's
+own `max_position_embeddings` (so the run in the table above was passed `--ctx-size 1024` and it had no effect;
+its prompts were about 355 tokens, so nothing in the table depends on it). The limit is prompt plus answer,
+it can lower the model's context and never raise it, and the load line says what is in force:
+`1bit forward-serve: context 1024 tokens (prompt plus answer)`.
+
+A request that does not fit is the client's error, so it is a 400 with the type the GGUF route's backend uses
+for the same refusal (it was a 500 with a bare message):
+
+```
+HTTP 400 {"error": {"message": "request (1597 tokens) exceeds the available context size (1024 tokens)",
+                    "type": "exceed_context_size_error", "n_prompt_tokens": 1597, "n_ctx": 1024}}
+```
+
+Measured 2026-11-10 with `--flash`, same pack and kernels, one `npu-hold` ticket, `max_tokens 8`: the
+1597-token request above refused in 0.02 s; then three questions under one system prompt: request 1
+`cached 0` (56.2 s), request 2 `cached 0` (48.9 s, makes the pin at 342 tokens), request 3
+`cached 341 of 355, pinned` (13.9 s). Whole HTTP calls, one run.
 
 ### Sampling and structured output
 
@@ -2246,7 +2270,10 @@ can fail a run.
 | `NPU_INFER_DUMP_DIR=<dir>` | `<dir>/layer_<ll>.f32` per layer: the residual stream after that layer, M x H little-endian f32, row-major. The directory must exist; a file that cannot be written is reported on stderr and the run goes on. | which **layer** two runs part at (per-layer cosine against a reference trace) |
 | `NPU_INFER_DUMP_OPS=1` | one stderr line per projection and per weighted RMSNorm: `[op] L<layer> <tag> rows=<M> \|x\| mean <m> absmax <a>` | which **op** inside the layer |
 
-`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process.
+`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process. When it is on, the forward prints
+`[ops-dump] NPU_INFER_DUMP_OPS is on: …` once at model load, before any request (engine#2028). A run that sets the
+variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
+looking for a code path that skips the dump.
 
 ```
   [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935

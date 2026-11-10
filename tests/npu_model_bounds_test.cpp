@@ -36,6 +36,7 @@
 #include <vector>
 
 #include <unistd.h>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 using namespace onebit::npu;
 namespace fs = std::filesystem;
@@ -120,7 +121,7 @@ std::vector<Entry> one_layer(std::vector<int64_t> q_shape = {1, 5120}, int64_t g
 }  // namespace
 
 int main() {
-    const fs::path root = fs::temp_directory_path() / ("npu_model_bounds_test." + std::to_string(::getpid()));
+    const fs::path root = ::onebit::test::tmp_root() / ("npu_model_bounds_test." + std::to_string(::getpid()));
     fs::remove_all(root);
 
     {  // well-formed: loads and packs

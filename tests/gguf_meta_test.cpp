@@ -23,6 +23,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace {
 
@@ -66,7 +67,7 @@ void expect(const std::string& what, const std::string& got, const std::string& 
 }  // namespace
 
 int main() {
-    const auto dir = std::filesystem::temp_directory_path() / "onebit_gguf_meta_test";
+    const auto dir = ::onebit::test::tmp_root() / "onebit_gguf_meta_test";
     std::filesystem::create_directories(dir);
 
     Gguf first;

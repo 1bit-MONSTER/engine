@@ -44,6 +44,7 @@
 #include <vector>
 
 #include <unistd.h>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 using namespace onebit::npu;
 namespace fs = std::filesystem;
@@ -80,7 +81,7 @@ struct Crafted {
 };
 
 fs::path write_dir(const Crafted& m, const std::string& tag) {
-    fs::path dir = fs::temp_directory_path() / ("npu_moe_test_" + std::to_string(::getpid()) + tag);
+    fs::path dir = ::onebit::test::tmp_root() / ("npu_moe_test_" + std::to_string(::getpid()) + tag);
     fs::remove_all(dir);
     fs::create_directories(dir);
     const uint64_t chunk = uint64_t(m.tiles) * kTileBytes;

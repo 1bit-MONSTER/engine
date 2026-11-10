@@ -263,9 +263,8 @@ add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_te
 # engine#1701: the NPU hold's queue/token follow ONEBIT_HOLD_DIR, and its queue settings never reach the payload.
 # Shell only (a stub gpu-hold plus the tree's own), no device, ~1 s.
 add_test(NAME npu_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_hold_test.sh)
-# engine#1696: the gpu_hold_* registrations live in their own file, so adding one does not conflict with every
-# other test-adding PR through the one contiguous add_test block this used to be part of (see that file's header).
-include(cmake/tests-gpu-hold.cmake)
+# engine#1696: the gpu_hold_* registrations live in cmake/tests-gpu-hold.cmake. It is no longer named here: every
+# cmake/tests-*.cmake is included by the glob near the end of this file (engine#1979).
 # engine#1485: the two port read-backs the route tests use (tests/serve_port.sh). Script-based, no device, no model --
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
@@ -1709,6 +1708,22 @@ if(ONEBIT_NPU_PRIVATE)
         target_compile_definitions(onebit PRIVATE ONEBIT_NPU_DX_KERNELS_DEFAULT="${ONEBIT_NPU_DX_KERNELS}")
     endif()
 endif()
+
+# ── Test registrations that live in their own file (engine#1696, engine#1979) ─
+# Every cmake/tests-*.cmake is included here, in name order. A test added as a NEW file there touches no line any
+# other pull request touches, so it cannot conflict and its registration cannot go stale while the PR waits: 37 commits
+# changed this file in the 24 h before engine#1979 was filed, and three open PRs had a registration hunk that no longer
+# applied. The rows above stay where they are; nothing has to move.
+# Here, after every target and after find_package(Python3), so a file may use if(TARGET ...), add_python_test() and
+# ${Python3_EXECUTABLE}; and before the RESOURCE_LOCK loop below, which asks if(TEST ...).
+# CONFIGURE_DEPENDS re-runs the glob at build time, so a file added after the first configure is picked up.
+# Readers that follow this shape: tools/ci/ci_targets_check.py (the glob), tools/ci/hrx_build_scope.py and
+# .github/workflows/hrx-build.yml (the cmake/tests-*.cmake path), tools/ci/tests_referenced_check.py (all of cmake/).
+file(GLOB ONEBIT_TEST_REGISTRATION_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tests-*.cmake)
+list(SORT ONEBIT_TEST_REGISTRATION_FILES)
+foreach(_onebit_test_registration_file IN LISTS ONEBIT_TEST_REGISTRATION_FILES)
+    include(${_onebit_test_registration_file})
+endforeach()
 
 # ── Loopback ports: route tests run one at a time (engine#1070) ──────────────
 # Every test named below starts a server on 127.0.0.1. Most pick a port by binding :0, closing the

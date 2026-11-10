@@ -87,6 +87,14 @@ an RFC or issue.
   hands the script to the interpreter instead of relying on the file's exec bit; `tests/python_test_order_check.py
   --check` enforces that it follows `find_package(Python3)`. Two rows may not share a name: CMake stops at configure with
   `add_test given test NAME "…" which already exists in this directory`.
+- **A new test's registration goes in its own file.** Put the `add_test(...)` (or `add_python_test(...)`) row, its
+  comment, and its `set_tests_properties` in a new `cmake/tests-<name>.cmake` with the Apache notice, and do not touch
+  `CMakeLists.txt` for it: every `cmake/tests-*.cmake` is included by a glob near the end of `CMakeLists.txt`, after all
+  targets exist. A new file cannot conflict with another pull request, and a row appended to `CMakeLists.txt` does —
+  that file changed 37 times in one day and three open pull requests had a registration hunk that no longer applied
+  (engine [#1979](https://github.com/1bit-MONSTER/engine/issues/1979)). A row that belongs to an existing family goes in
+  that family's file (`cmake/tests-gpu-hold.cmake`). An `add_executable` for a test binary still goes in
+  `CMakeLists.txt` next to the sources it builds; only the registration moves. Existing rows stay where they are.
 - **Pins only move forward.** CI fails a pull request whose submodule pin is behind, or has
   diverged from, the pin on `main` (`tools/check_pins.py`), because that drops commits the engine
   already shipped. A rollback on purpose carries the `pin rollback` label.

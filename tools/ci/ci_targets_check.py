@@ -65,7 +65,9 @@ INCLUDE = re.compile(r'^\s*include\(\s*"?([^\s")]+\.cmake)"?\s*\)', re.M)
 # shape engine#1696 landed. The include argument is a VARIABLE, so INCLUDE above cannot match it, and a
 # reader that only followed literal includes would stop seeing every registration at once - the count
 # would fall to zero and read as "the gap closed".
-GLOB = re.compile(r'file\s*\(\s*GLOB\s+(\w+)[^)]*?([^\s")]+/\*\.cmake)', re.IGNORECASE)
+# engine#1979: the pattern main uses is `cmake/tests-*.cmake` (a prefix before the star), not `<dir>/*.cmake`; a
+# reader that wanted the star right after the slash matched nothing there, and every such file went unread.
+GLOB = re.compile(r'file\s*\(\s*GLOB\s+(\w+)[^)]*?([^\s")]+/[^\s"/)]*\*[^\s"/)]*\.cmake)', re.IGNORECASE)
 INCLUDE_VAR = re.compile(r'include\(\s*\$\{(\w+)\}\s*\)')
 FOREACH_LISTS = re.compile(r'foreach\s*\(\s*(\w+)\s+IN\s+LISTS\s+(\w+)', re.IGNORECASE)
 DEFINE = re.compile(r"-D([A-Za-z0-9_]+)=([^\s\"]*)")
@@ -516,16 +518,16 @@ def self_test():
     import tempfile
     fails = 0
 
-    def case(what, ci, cmake, want, baseline="auto", family=None):
+    def case(what, ci, cmake, want, baseline="auto", family=None, family_rel="cmake/tests/zz_family.cmake"):
         nonlocal fails
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, ".github", "workflows"))
             open(os.path.join(d, CI), "w", encoding="utf-8").write(ci)
             open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(cmake)
             if family is not None:
-                fam_dir = os.path.join(d, "cmake", "tests")
-                os.makedirs(fam_dir, exist_ok=True)
-                open(os.path.join(fam_dir, "zz_family.cmake"), "w", encoding="utf-8").write(family)
+                fam_path = os.path.join(d, family_rel)
+                os.makedirs(os.path.dirname(fam_path), exist_ok=True)
+                open(fam_path, "w", encoding="utf-8").write(family)
             if baseline == "auto":
                 # The direction-A fixtures below are not about direction B, so the baseline records
                 # whatever they drift - a direction-B case must then say what its baseline is.
@@ -600,6 +602,18 @@ endforeach()
     case("an add_test in a glob-included family file is still read",
          B_CI, GLOB_CMAKE, 1, baseline="",
          family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n")
+    # engine#1979: the shape main has, a prefix before the star (`cmake/tests-*.cmake`). With the GLOB pattern that
+    # wanted `<dir>/*.cmake` this arm returned 0: the file was configured by CMake and read by nobody here.
+    PREFIX_GLOB_CMAKE = GLOB_CMAKE.replace("cmake/tests/*.cmake", "cmake/tests-*.cmake")
+    case("an add_test in a file included by a cmake/tests-*.cmake glob is still read",
+         B_CI, PREFIX_GLOB_CMAKE, 1, baseline="",
+         family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n",
+         family_rel="cmake/tests-zz.cmake")
+    # ... and a file the glob does not match (one directory down) is not configured, so it is not read.
+    case("a file the cmake/tests-*.cmake glob does not match is not read",
+         B_CI, PREFIX_GLOB_CMAKE, 0, baseline="",
+         family="add_executable(glob_fam g.cpp)\nadd_test(NAME glob_suite COMMAND glob_fam)\n",
+         family_rel="cmake/tests-zz/inner.cmake")
     # ... and a baseline name nothing names any more is a FAILURE, not "progress": the two reasons a
     # count can fall are "now built" (good) and "no longer seen" (the reader narrowed).
     case("a baseline name no add_test names any more fails instead of reading as progress",

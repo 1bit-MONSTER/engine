@@ -1673,6 +1673,14 @@ endif()
     # at start_pos > 0 is compared (and then run) from the state the batched pass continues. Host-GEMM, no device;
     # skips (77) unless ONEBIT_TEST_Q4NX names a container. It links onebit_npu_forward, so the row exists only where
     # ONEBIT_NPU configures; ci.yml does not, so this is a dev-box test (ONEBIT_NPU=ON plus a container), not CI coverage.
+    # engine#1990: the padded-head row arithmetic, driven on the shape that broke it (CodeLlama-7b's I8 [16016, 6144]
+    # for a 32,032-row head at kpad 4,096). Pure: no container, no device, so it runs wherever ONEBIT_NPU configures --
+    # unlike the container-gated tests beside it. `add_dependencies` puts the target in the build CI runs (engine#1858).
+    add_executable(npu_pad_head_rows_test tests/npu_pad_head_rows_test.cpp)
+    target_include_directories(npu_pad_head_rows_test PRIVATE npu/forward/include)
+    target_link_libraries(npu_pad_head_rows_test PRIVATE onebit_npu_forward)
+    add_dependencies(onebit npu_pad_head_rows_test)
+    add_test(NAME npu_pad_head_rows COMMAND npu_pad_head_rows_test)
     add_executable(batch_check_state_test tests/batch_check_state_test.cpp)
     target_include_directories(batch_check_state_test PRIVATE npu/forward/include)
     target_link_libraries(batch_check_state_test PRIVATE onebit_npu_forward)

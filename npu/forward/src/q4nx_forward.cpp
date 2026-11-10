@@ -333,6 +333,11 @@ static std::string read_config_string(const std::string& cfg_path, const char* k
 // here unqualified.
 using namespace q4nx_lh;
 
+// engine#1990: the row count the padded-head path dequantises (defined below, beside the code it serves). Declared here
+// because the reader uses it before its definition and the function is deliberately free-standing -- it is the half of
+// that path a test can drive without a container.
+int padded_head_rows(int64_t shape0, int64_t shape1, int kpad, int NV);
+
 Q4nxNpuForward::Q4nxNpuForward() {}
 Q4nxNpuForward::~Q4nxNpuForward() = default;
 
@@ -1455,13 +1460,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 // second form, so a padded head in the first form kept head_rows = NV and dequant_any() refused it:
                 // "lm_head dequant failed" on a head that is exactly what the importer was asked to write.
                 // Both spellings count TILE-ROWS in shape[0] -- [rows, kpad_] and [tiles, tile bytes] -- so the number of
-                // 32-row blocks is shape[0] / per_block either way; only the row WIDTH in shape[1] differs.
-                int64_t blocks = 0;
-                if (per_block > 0 && ltd->shape[0] % per_block == 0) blocks = ltd->shape[0] / per_block;
-                if (blocks > 0) {
-                    const int64_t r = blocks * Q4NX_TILE_ROWS;
-                    if (r >= NV && r % Q4NX_TILE_ROWS == 0) head_rows = int(r);
-                }
+                // 32-row blocks is shape[0] / per_block either way; only the row WIDTH in shape[1] differs. Exposed as a
+                // pure function because these numbers are what a test can drive without a container.
+                head_rows = padded_head_rows(ltd->shape[0], ltd->shape[1], kpad_, NV);
             }
             std::vector<float> head_f32;
             float* head_out = lm_head_f_.data();
@@ -2505,6 +2506,22 @@ bool Q4nxNpuForward::gdn_apply_rows(int from, int to) {
 // its array launches are M-independent (a pb16i ELF runs its 16 rows whatever M is), so the marginal cost of
 // a row is host-side and has to be named, not inferred.  Snapshots the same slots step() fills, prints the
 // delta of one step_batch() call when NPU_PHASE_PROF is set.  Measurement only: nothing here is read back.
+// engine#1990: how many rows to dequantise for the lm_head, given the tensor's OWN grid and the container's K grid.
+// A container stores the head either as [rows, kpad_] or as [tiles, tile bytes]; both count TILE-ROWS in shape[0], so the
+// number of 32-row blocks is shape[0] / (kpad / 256) either way. A vocabulary need not be a multiple of 32
+// (CodeLlama-7b's is 32,016), so the importer pads to 32,032 and this returns the PADDED row count; the caller decodes
+// that many rows and keeps NV of them, because the padded rows decode to zero and are never sampled. Pure, so the
+// numbers are drivable without a container (tests/npu_pad_head_rows_test.cpp).
+int padded_head_rows(int64_t shape0, int64_t shape1, int kpad, int NV) {
+    (void)shape1;   // both spellings count tile-rows in shape[0]; the width only says which spelling it is
+    if (kpad <= 0 || kpad % Q4NX_TILE_COLS != 0 || shape0 <= 0 || NV <= 0) return NV;
+    const int64_t per_block = kpad / Q4NX_TILE_COLS;   // tiles per 32-row block
+    if (per_block <= 0 || shape0 % per_block != 0) return NV;
+    const int64_t r = (shape0 / per_block) * Q4NX_TILE_ROWS;
+    if (r < NV || r % Q4NX_TILE_ROWS != 0) return NV;
+    return int(r);
+}
+
 namespace {
 struct BatchPhases {
     const bool on = lh_on();

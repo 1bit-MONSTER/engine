@@ -275,6 +275,13 @@ add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.
 # two files, no build and no submodules; --self-test drives it.
 add_test(NAME ci_targets COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
+# `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
+# tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
+add_test(NAME tests_referenced COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_test(NAME tests_referenced_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --self-test)
+# engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
+add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
 # orphans of that shape landed in two days (51 GiB of GTT for 14 h; an NPU server 70 min past a 6-min ticket;
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the

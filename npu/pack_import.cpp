@@ -200,11 +200,16 @@ void walk_graph(const uint8_t* p, size_t n, OnnxModel& m) {
         if (op == "MatMulNBits" || op == "MatMulNBitsBf") {
             if (op == "MatMulNBitsBf") ++m.ryzenai_matmuls;
             OnnxMatMul mm;
-            if (ins.size() >= 4) {
+            // THREE inputs is a real spelling, not a truncation: `amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu` names its
+            // projections `(activations, ...MatMul.weight_Q4, ...MatMul.weight_scales)` with `bits 4, block_size 32` and
+            // no qzeros tensor at all, and a `>= 4` test therefore recorded NO matmuls for it -- `info` printed
+            // matmulnbits_ops 0 and the importer wrote only the embedding (engine#1503). A missing qzeros means the
+            // implicit zero point, which `implicit_zp_zero()` below applies.
+            if (ins.size() >= 3) {
                 mm.data = ins[0];
                 mm.weight = ins[1];
                 mm.scales = ins[2];
-                mm.zeros = ins[3];
+                if (ins.size() >= 4) mm.zeros = ins[3];
             }
             if (attrs.count("K")) mm.K = attrs["K"];
             if (attrs.count("N")) mm.N = attrs["N"];
@@ -429,6 +434,13 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // this comment subtracted the prefix from a per-block figure and produced a number three orders of magnitude off; the
     // review of #1758 caught it. Written out here so the next reader can check it with a calculator.)
     {3584, 28, 28, 7232, 8, 1, 1009664},
+    // Qwen2.5_3B_Instruct at hidden 2,048 / 16 heads / 36 layers: measured with tools/fconst19_measure.py against
+    // amd/Qwen2.5_3B_Instruct_rai_1.8.0_npu_4K, 1,917 of 1,706,629,440 bytes differ (1.12e-06 of the file, which the tool
+    // prints as 1.12e-04 %). Same hidden size as the Qwen3-1.7B row and NOT the same row: the prefix is 4,160 against
+    // 1.7B's 8,512, and the bundle is nine tiles of 295,936 (2,663,424 B) against three of 1,183,744 -- so at this hidden
+    // size both the prefix and the division move with the layer count. Measured, never derived: 64 + 2*hidden + 4,352
+    // would predict 8,512 here and be wrong by 4,352.
+    {2048, 16, 36, 4160, 9, 1, 295936},
     // Mistral-7B-Instruct-v0.2 at hidden 4,096 / 32 heads / 32 layers: measured with tools/fconst19_measure.py against
     // amd/Mistral-7B-Instruct-v0.2_rai_1.8.0_npu_4K, 1,954 of 3,843,419,200 bytes differ (5.08e-05) -- content, not
     // layout. The prefix follows the Qwen3 line (64 + 2*hidden + 4,352 = 12,608), the bundle is 5 tiles of 2,297,856
@@ -437,6 +449,12 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // all 32 blocks. This is the largest family on #1503 (31 packs). Measured by another lane on main, whose
     // table is keyed on geometry; merged here in the same form.
     {4096, 32, 32, 12608, 5, 1, 2297856},
+    // Llama-3.2-3B (and -Instruct, same geometry) at hidden 3,072 / 24 heads / 28 layers: measured with
+    // tools/fconst19_measure.py against amd/Llama-3.2-3B_rai_1.8.0_npu_4K, 1,090 of 1,756,930,368 bytes differ
+    // (6.20e-07 of the file, which the tool prints as 6.20e-05 %) -- content, not layout. The prefix is the Qwen3 line's 64 + 2*hidden + 4,352 = 10,560 at this hidden
+    // size, but the bundle is FOUR tiles of 1,740,800 (6,963,200 B) where the Phi/h3072 row has two of 5,222,400 --
+    // which is the whole reason a row is measured per geometry and never derived from the hidden size.
+    {3072, 24, 28, 10560, 4, 1, 1740800},
 };
 
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
@@ -551,6 +569,12 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     // and a TRUNCATED copy from an interrupted run is caught by the length test rather than trusted.
     const int64_t expected = int64_t(fc.size) - int64_t(layers) * hdr_len;
     if (canonical_copy_reusable(work, expected)) {
+        // engine#1797 review: the eviction age is `last_write_time`, and a reuse used to READ the file without writing
+        // it -- so a copy in continuous use aged past `max_age_seconds` and was swept, and the next run rewrote a
+        // multi-hundred-MB file. Touching on reuse makes the timestamp mean what the rule assumes: last USE. Errors
+        // are ignored: failing to bump an mtime must not fail an import that already has a good copy.
+        std::error_code tec;
+        fs::last_write_time(fs::path(work), fs::file_time_type::clock::now(), tec);
         unmap_file(fc.map, fc.size);
         return work;
     }
@@ -688,18 +712,36 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     // canonical form (a new kFconst19Rules entry, a different tile order) leaves the source file untouched, so source
     // identity alone would keep serving a copy of the old form. Bump this when the canonical form changes.
     constexpr int kCanonicalFormVersion = 1;
-    const std::string name = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
-                             std::to_string(dims.hidden) + "-" +
-                             std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + "-" +
-                             std::to_string(src_ec ? std::uintmax_t(0) : src_size) + "-" +
+    // Every generation of the scratch cache starts with this (engine#1770). Named because the sweep below has to match the
+    // generations that have no version suffix.
+    constexpr const char* kScratchStem = "1bit-fconst19";
+    // A scratch copy older than this is a pack no run is importing: no import holds one for hours, so an mtime this far back
+    // means the pack was abandoned, not that somebody is using it. Kept well above the longest import measured (~minutes).
+    constexpr int64_t kScratchMaxAgeSeconds = 6 * 3600;
+    // Everything but the source identity: the group this run evicts its stale siblings from (engine#1770).
+    const std::string ident_prefix = "1bit-fconst19v" + std::to_string(kCanonicalFormVersion) + "-" + tag + "-" +
+                                     std::to_string(dims.hidden) + "-" + std::to_string(dims.heads) + "-" +
+                                     std::to_string(dims.layers) + "-";
+    const std::string name = ident_prefix + std::to_string(src_ec ? std::uintmax_t(0) : src_size) + "-" +
                              std::to_string(static_cast<std::uint64_t>(src_stamp)) + ".fconst";
     // `temp_directory_path()` THROWS when TMPDIR names a directory that no longer exists, which is the ordinary state of
     // a shell after a reboot has cleared /tmp -- and it threw before any work was attempted, so `npu-pack info` on a
     // 1.9 pack failed with `filesystem error: temp_directory_path: No such file or directory [/tmp/x]` and no hint that
     // the pack was fine. Fall back rather than fail: /tmp, then the current directory. The copy is scratch, and a note
     // says where it went so nobody wonders what that 291 MB file is.
+    // Where the canonical copy lives. This is a CACHE (reused on size+mtime+rules version), not a leak, but its size is the
+    // pack's fconst -- 3.6 GB for an h4096 pack -- and on a box whose /tmp is a RAM disk that is RAM, per pack, held until
+    // reboot: three of them from one afternoon's imports were 11.4 GB of tmpfs (measured 2026-11-10). So the order is:
+    // an explicit override, then the on-disk cache directory, and only then the temp directory this used to prefer.
     std::vector<fs::path> dirs;
+    if (const char* scratch = std::getenv("ONEBIT_FCONST_SCRATCH"); scratch && *scratch)
+        dirs.emplace_back(scratch);
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+        dirs.emplace_back(fs::path(xdg) / "1bit/fconst19");
+    else if (const char* home = std::getenv("HOME"); home && *home)
+        dirs.emplace_back(fs::path(home) / ".cache/1bit/fconst19");
     try {
+        // Last resort only: on strixhalo /tmp is tmpfs, so this costs RAM equal to the pack's fconst.
         dirs.push_back(fs::temp_directory_path());
     } catch (const std::exception& e) {
         std::fprintf(stderr,
@@ -711,13 +753,27 @@ std::string materialise_token_fconst(const std::string& pack_dir, const Dims& di
     std::string work;
     for (const auto& d : dirs) {
         std::error_code ec;
-        if (!fs::is_directory(d, ec) || ec) continue;
+        // The cache directory is ours to create: without this the new first choice never wins, because it does not exist on a
+        // fresh box and the loop walked straight past it to /tmp (caught by testing the default, not the override).
+        if (!fs::is_directory(d, ec) || ec) {
+            std::error_code made;
+            fs::create_directories(d, made);
+            if (made || !fs::is_directory(d)) continue;
+        }
         const fs::path cand = d / name;
         // Writable in fact, not just in theory: the copy is written immediately after this.
         std::ofstream probe(cand, std::ios::binary | std::ios::app);
         if (!probe) continue;
         probe.close();
         work = cand.string();
+        // This is the copy that will be written, so the copies of the same pack and geometry at other sizes/mtimes are
+        // the ones nothing will reuse (engine#1770).
+        // The pre-version generation of the same pack and geometry: `1bit-fconst19-<tag>-<h>-<heads>-<layers>.fconst`,
+        // with no source identity in the name, so the prefix above cannot match it (engine#1770: three such files, 10.67
+        // GiB of tmpfs, had been resident all day).
+        const std::string legacy_name = std::string(kScratchStem) + "-" + tag + "-" + std::to_string(dims.hidden) + "-" +
+                                        std::to_string(dims.heads) + "-" + std::to_string(dims.layers) + ".fconst";
+        evict_stale_canonical_copies(d.string(), name, ident_prefix, legacy_name, kScratchMaxAgeSeconds);
         // Say where it went whenever that is not the ordinary place: the copy is a few hundred MB and it is scratch.
         std::error_code ec2;
         const fs::path tmpdir = [&] { try { return fs::temp_directory_path(); } catch (...) { return fs::path(); } }();
@@ -1245,6 +1301,21 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
 // engine#1650: exported so the config reader can be tested on a pack that declares an optional
 // field as null, without a pack and without the vendor stack.
 Dims read_dims_exported(const json& c, const std::string& source) { return read_dims(c, source); }
+int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without_zeros, int* K, int* N, int* block) {
+    const OnnxModel m = parse_onnx(path);
+    if (matmuls) *matmuls = int(m.matmuls.size());
+    if (without_zeros) {
+        int n = 0;
+        for (const auto& mm : m.matmuls) if (mm.zeros.empty()) ++n;
+        *without_zeros = n;
+    }
+    if (!m.matmuls.empty()) {
+        if (K) *K = int(m.matmuls[0].K);
+        if (N) *N = int(m.matmuls[0].N);
+        if (block) *block = m.matmuls[0].block;
+    }
+    return int(m.matmuls.size());
+}
 // The 1.9 external-data genre states no FFN width anywhere a file shows it: the weights are MatMulNBitsBf nodes
 // whose initializers carry dims `[0]` (bytes live in a *.qweight.packed sibling), so the initializer-dimension
 // heuristic in plan() sees nothing. The NODE carries K and N as attributes, and walk_graph already descends into
@@ -1385,6 +1456,19 @@ FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits) {
     return g;
 }
 
+
+// ── The implicit zero point ───────────────────────────────────────────────────
+// A quantised matmul with no `qzeros` input takes an implicit zero point of 2^(bits-1) -- ONNX Runtime's own
+// MatMulNBits does exactly that when the tensor is absent, and it is corroborated in this collection: the *embedding*
+// component of the same family (GatherBlockQuantized, also no zeros) decodes to ONNX Runtime's output with cosine
+// 1.00000000 and max|d| 0 at zero point 8, against 0.317 at zero point 0 (measured on
+// amd/Qwen3-VL-4B-Instruct_rai_1.9.0_npu, engine#1725/#1661). `decode_matmulnbits` folds the zero into `q.zero`, so
+// this subtracts the implicit one the same way: zero term = -(2^(bits-1)) * scale.
+void implicit_zp_zero(Q4& q, int bits) {
+    if (bits <= 0 || q.scale.empty() || q.scale.size() != q.zero.size()) return;
+    const float zp = float(1 << (bits - 1));
+    for (size_t i = 0; i < q.zero.size(); ++i) q.zero[i] -= zp * q.scale[i];
+}
 
 // ── MatMulNBits → (codes, scale, zero) per 32-column group ───────────────────
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
@@ -1712,6 +1796,11 @@ namespace {
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,
                                    std::string* why);   // defined with the table, internal to this file
 }
+const Fconst19Rule* fconst19_rules(int* count) {
+    if (count) *count = int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0]));
+    return kFconst19Rules;
+}
+
 const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std::string* why) {
     return select_rule_in(kFconst19Rules, int(sizeof(kFconst19Rules) / sizeof(kFconst19Rules[0])), hidden, heads, layers,
                           why);
@@ -1807,6 +1896,303 @@ std::vector<uint8_t> encode_tile(const TileW& t) {
         }
     }
     return out;
+}
+
+
+constexpr int kLocateSlack = 8;  // tiles of search before the zero-run position
+
+// The placement arithmetic on its own: no file, no decode, no correlation. Split out because it is the half that can be
+// wrong without anything throwing -- an off-by-one tile here reads a plausible region and only the correlation notices
+// -- so it is pinned by a host test that needs no pack, no device and no fixture.
+// TailHeadPlacement is declared in the header: the placement arithmetic is pinned by a host test.
+// bytes = the whole .fconst's length; zeros = trailing all-zero run measured by the caller.
+TailHeadPlacement plan_tail_head(int64_t bytes, int64_t tail_off, int64_t env, int64_t rows, int64_t tile,
+                                        int64_t zeros) {
+    TailHeadPlacement p;
+    p.rows = rows;
+    p.zeros = zeros;
+    p.have = bytes - tail_off;
+    p.want = env + rows * tile;
+    if (p.have < p.want) {
+        p.why = "the .fconst tail is " + std::to_string(p.have) + " B, shorter than the " + std::to_string(p.want) +
+                " B its envelope and head tiles would take";
+        return p;
+    }
+    p.exact = (p.have == p.want);
+    const int64_t base = tail_off + env;
+    p.last = base + ((bytes - zeros - base) / tile - rows) * tile;
+    p.first = p.last - kLocateSlack * tile;
+    if (p.first < base) p.first = base;
+    if (p.last < base) p.last = base;
+    return p;
+}
+
+// engine#1740: where the 1.9 Token .fconst keeps the lm head.
+//
+// The tail is [envelope][rows x tile][padding], and only the middle term is the head. The importer used to require
+// `have == env + rows*tile` exactly, which is true for a pack that ends with the head and false for one that ends with
+// padding -- and on the hidden-1536 family the padding is 110,208,000 B, 11 % of the file. Refusing there is a named
+// refusal, but it refuses the head for a reason that is about placement, not about the fields, and 12+ of the 42 1.9
+// packs keep their head only here.
+//
+// So the placement is measured rather than assumed, in this order:
+//   1. the run of all-zero bytes at EOF (`zeros`), whatever its alignment -- a pack can also end in junk that is not a
+//      whole number of tiles (Hunyuan-0.5B's tail is 28 B off), and that has to be visible rather than rounded away;
+//   2. `rows` consecutive tile-aligned candidates, each starting at most kSlack tiles before the position the zero run
+//      implies, because "the data ends where the zeros begin" is arithmetic and the head may not sit there;
+//   3. the round-trip (decode -> encode) proves the FIELD ORDER and nothing else: an all-zero tile decodes to zeros and
+//      re-encodes to zeros exactly, so padding passes it. Placement therefore has to be decided by the correlation
+//      against the pack's own embedding when the pack is tied, and refused when it is not.
+//
+// The outcome is a value, not a std::string, so the caller cannot accidentally proceed on a refusal.
+struct TailHeadLocate {
+    int64_t off = -1;        // byte offset of head tile 0
+    int64_t rows = 0;        // tiles of the head
+    int64_t zeros = 0;       // trailing all-zero bytes at EOF
+    int64_t slack = 0;       // tiles the accepted placement sits before the zero-run position
+    double  corr = 0.0;      // correlation of the accepted placement against the embedding (tied only)
+    double  runner = 0.0;    // best rejected placement's correlation, for the ambiguity message
+    bool    verified = false;// corr above kTieCorr: this is the head, not merely a decodable region
+    bool    exact = false;   // the tail length matched with no padding at all (the pre-#1740 path)
+    std::string why;         // set on refusal: what was measured, in numbers
+};
+
+static int64_t trailing_zero_run(const Fconst& fc, int64_t from) {
+    const uint8_t* m = fc.map;
+    int64_t i = fc.size;
+    while (i > from && m[i - 1] == 0) --i;
+    return int64_t(fc.size) - i;
+}
+
+// `want` is env + rows*tile at this geometry; `tail_off` is where the tail begins (layers x stride).
+static TailHeadLocate locate_tail_head(const Fconst& fc, int64_t tail_off, int64_t env, int64_t rows, int64_t tile,
+                                      int64_t k, const EmbedTable& embed, bool tied) {
+    TailHeadLocate r;
+    r.rows = rows;
+    r.zeros = trailing_zero_run(fc, tail_off);
+    const TailHeadPlacement plan = plan_tail_head(int64_t(fc.size), tail_off, env, rows, tile, r.zeros);
+    r.exact = plan.exact;
+    if (!plan.why.empty()) {
+        r.why = plan.why;
+        return r;
+    }
+    // Candidate 0 is where the zero run says the head ends; earlier candidates cover a head that does not end at the
+    // last non-zero byte. Every candidate must be tile-aligned to the same phase as the envelope, so a jumbled offset
+    // cannot be mistaken for a placement.
+    const int64_t base = tail_off + env;
+    // The planner gives the earliest and latest tile-aligned candidate; the zero run decides the latest.
+    const int64_t k0 = (plan.last - base) / tile;
+    int64_t best_slack = -1, second_slack = -1;
+    double best = -2.0, second = -2.0;
+    int64_t tried = 0;
+    // engine#1773 review: the search window is anchored on the zero run, so when the file ends in NON-zero junk after
+    // the head the window slides forward and can EXCLUDE the true start (`base`, the envelope's end) -- arm (c2) builds
+    // exactly that shape and blessed the span without noticing the one placement that matters was outside it. `base` is
+    // known independently of the zero run, so it is always a candidate; the slack window is kept for the rest.
+    std::vector<int64_t> cands;
+    cands.push_back(0);                                  // the head begins right after the envelope
+    for (int64_t cand = (plan.first - base) / tile; cand <= k0; ++cand)
+        if (cand != 0) cands.push_back(cand);
+    for (size_t ci = 0; ci < cands.size(); ++ci) {
+        const int64_t cand = cands[ci];
+        const int64_t s = base + cand * tile;
+        if (s < base || s + rows * tile > int64_t(fc.size)) continue;
+        std::vector<TileW> tiles;
+        tiles.reserve(size_t(rows));
+        bool exact_rt = true;
+        for (int64_t i = 0; i < rows; ++i) {
+            const uint8_t* src = fc.map + s + i * tile;
+            tiles.push_back(decode_tile(src, int(k)));
+            const std::vector<uint8_t> back = encode_tile(tiles.back());
+            if (std::memcmp(back.data(), src, size_t(tile)) != 0) exact_rt = false;
+        }
+        ++tried;
+        if (!exact_rt) continue;
+        double c = 0.0;
+        if (tied) {
+            const Q4 q = q_from_tiles(tiles);
+            if (q.N < int(embed.H) || q.K != int(embed.H)) continue;
+            c = corr(q, embed, int(embed.H));
+        }
+        if (c > best) {
+            second = best; second_slack = best_slack;
+            best = c; best_slack = cand;
+        } else if (c > second) {
+            second = c; second_slack = cand;
+        }
+    }
+    if (tried == 0) {
+        r.why = "no tile-aligned placement in the last " + std::to_string(rows + kLocateSlack) + " tiles decodes and "
+                "re-encodes exactly, so the head's fields are not understood at this geometry";
+        return r;
+    }
+    if (best_slack < 0) {
+        r.why = "the tail holds " + std::to_string(tried) + " tile-aligned placement(s) and none of them survives "
+                "decode->encode, so the head's offsets are not established";
+        return r;
+    }
+    // `off` stays -1 until a placement is ACCEPTED: the caller decides on `off < 0`, so a refusal that left an offset
+    // behind would be read by the caller -- which is exactly what the self-test's untied arm caught, because every
+    // refusal path here sets `why` but the offset had already been assigned.
+    const int64_t chosen = base + best_slack * tile;
+    if (!tied) {
+        // No reference inside the pack: only the exact placement is taken, and it is reported as unverified.
+        if (!r.exact || best_slack != 0) {
+            r.why = "this pack is untied, so the head cannot be verified against its embedding, and its tail carries " +
+                    std::to_string(r.zeros) + " B of trailing zeros -- the placement would be a guess";
+            return r;
+        }
+        r.off = base;
+        r.slack = best_slack;
+        r.corr = best;
+        r.runner = second;
+        return r;
+    }
+    if (best < kTieCorr) {
+        r.off = -1;
+        r.why = "the best placement correlates " + std::to_string(best) + " with the pack's own embedding (the tie "
+                "threshold is " + std::to_string(kTieCorr) + "), so no placement in the tail is the head";
+        return r;
+    }
+    if (second > kTieCorr) {
+        r.off = -1;
+        r.why = "two placements both correlate with the embedding (" + std::to_string(best) + " at offset " +
+                std::to_string(base + best_slack * tile) + ", " + std::to_string(second) + " at offset " +
+                std::to_string(base + (second_slack < 0 ? 0 : second_slack) * tile) +
+                "), so the head's offset is ambiguous";
+        return r;
+    }
+    r.off = chosen;
+    r.slack = best_slack;
+    r.corr = best;
+    r.runner = second;
+    r.verified = true;
+    return r;
+}
+
+// engine#1740: a self-test for the SEARCH, not the arithmetic. `plan_tail_head` is pinned by the host test; this pins
+// the part that can go silently wrong -- the candidate loop, best/runner-up tracking, the kTieCorr cut, the ambiguity
+// refusal and the untied-with-padding refusal -- using a synthetic head built through encode_tile, so it needs no pack,
+// no device and no fixture. Called from the importer's test, and usable while W1b works on the block-32 placement.
+bool tail_head_selftest(std::string* why) {
+    auto fail = [&](const std::string& m) { if (why) *why = m; return false; };
+    const int H = kKBlock, rows_per_tile = kTileRows, ntiles = 4;
+    const int64_t tile = attn_tile_bytes(H);
+    const int64_t env = attn_payload_off(H);
+    // A deterministic embedding, and the bf16 copy the correlation reads. Pearson is shift- and scale-invariant, so a
+    // min-max quantisation of this table correlates with it at ~1 without having to reproduce it byte for byte.
+    std::vector<float> emb(size_t(ntiles) * rows_per_tile * H);
+    std::vector<uint16_t> emb_bf16(emb.size());
+    for (size_t n = 0; n < size_t(ntiles) * rows_per_tile; ++n)
+        for (int k = 0; k < H; ++k) {
+            const float v = float(std::sin(double(n) * 0.37 + double(k) * 0.11) * 0.5 + 0.25 * double(n % 7));
+            emb[n * H + k] = v;
+            uint32_t b; std::memcpy(&b, &v, 4);
+            emb_bf16[n * H + k] = uint16_t((b + 0x8000) >> 16);
+        }
+    const EmbedTable embed{reinterpret_cast<const uint8_t*>(emb_bf16.data()), EmbedTable::Fmt::BF16, H};
+    // One tile per `rows_per_tile` rows, quantised the way the importer's synthesis path does it (per 32 columns).
+    auto make_tile = [&](size_t tile_index) {
+        TileW t;
+        t.k = H; t.rows = rows_per_tile;
+        t.code.assign(size_t(rows_per_tile) * H, 0);
+        t.scale.assign(size_t(rows_per_tile) * (H / kKBlock), 0.0f);
+        t.zp.assign(size_t(rows_per_tile) * (H / kKBlock), 0);
+        t.bias.assign(rows_per_tile, 0);
+        for (int r = 0; r < rows_per_tile; ++r) {
+            const size_t n = tile_index * rows_per_tile + r;
+            for (int kb = 0; kb < H / kKBlock; ++kb) {
+                // CENTRED quantisation about a zero point of 7, i.e. exactly what the decoder reconstructs:
+                // x = (code - zp) * scale. A min-max scale with the offset dropped (`zp == 0`) reconstructs
+                // code * scale, which is per-block shifted -- the first version of this self-test scored corr 0.576
+                // for that reason, which is the synthetic head teaching the same lesson the real one does.
+                float amax = 0.0f;
+                for (int k = 0; k < kKBlock; ++k)
+                    amax = std::max(amax, std::fabs(emb[n * H + kb * kKBlock + k]));
+                const float sc = amax > 0 ? amax / 7.0f : 1.0f;
+                t.scale[size_t(r) * (H / kKBlock) + kb] = sc;
+                t.zp[size_t(r) * (H / kKBlock) + kb] = 7;
+                for (int k = 0; k < kKBlock; ++k) {
+                    const float v = emb[n * H + kb * kKBlock + k];
+                    const int code = int(std::lround(v / sc)) + 7;
+                    t.code[size_t(r) * H + kb * kKBlock + k] = uint8_t(std::min(15, std::max(0, code)));
+                }
+            }
+        }
+        return encode_tile(t);
+    };
+    auto build = [&](int junk_before, int zero_tiles_after, Q4* want_head) {
+        std::vector<uint8_t> buf(size_t(env), 0);
+        auto push = [&](const std::vector<uint8_t>& b) { buf.insert(buf.end(), b.begin(), b.end()); };
+        if (junk_before > 0) push(std::vector<uint8_t>(size_t(tile) * size_t(junk_before), 0x11));
+        std::vector<TileW> tiles;
+        for (int i = 0; i < ntiles; ++i) {
+            const std::vector<uint8_t> t = make_tile(size_t(i));
+            tiles.push_back(decode_tile(t.data(), H, rows_per_tile));
+            push(t);
+        }
+        if (want_head) *want_head = q_from_tiles(tiles);
+        if (zero_tiles_after > 0) push(std::vector<uint8_t>(size_t(tile) * size_t(zero_tiles_after), 0));
+        return buf;
+    };
+    const int64_t base = env;   // tail_off == 0 for this synthetic file
+    // (a) the head ends the file
+    {
+        Q4 head;
+        std::vector<uint8_t> buf = build(0, 0, &head);
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, true);
+        if (loc.off < 0) return fail("a synthetic head that ends the file was not located: " + loc.why);
+        if (loc.slack != 0) return fail("the head that ends the file was located at slack " + std::to_string(loc.slack));
+        if (!loc.verified) return fail("and it was not verified (corr " + std::to_string(loc.corr) + ")");
+        if (loc.corr < 0.99) return fail("corr " + std::to_string(loc.corr) + " is below the tie threshold");
+    }
+    // (b) one junk tile before the head and three zero tiles after it: the head is a tile later, and the junk tile's
+    // placement must stay below the threshold -- this is the search doing its job rather than the arithmetic
+    {
+        std::vector<uint8_t> buf = build(1, 3, nullptr);
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, true);
+        if (loc.off < 0) return fail("a head behind one junk tile and three zero tiles was not located: " + loc.why);
+        if (loc.slack != 1) return fail("it was located at slack " + std::to_string(loc.slack) + ", not 1");
+        if (!loc.verified) return fail("and it was not verified");
+        if (loc.runner >= kTieCorr) return fail("the runner-up also passed the threshold (" + std::to_string(loc.runner) + ")");
+    }
+    // (e) engine#1773 review: junk AFTER the head, then zeros. The zero run then sits 18 tiles past the envelope's end,
+    // so `plan_tail_head`'s window -- anchored on the zero run and walking backwards -- starts at `base + 10*tile` and
+    // the head's true placement at `base` is OUTSIDE it. Arm (b) cannot see this: one junk tile before the head leaves
+    // the window clamped to `base`. Only a candidate list that always contains the envelope's end finds the head here.
+    {
+        std::vector<uint8_t> buf = build(0, 0, nullptr);
+        buf.insert(buf.end(), size_t(tile) * 18, 0x11);   // junk after the head ...
+        buf.insert(buf.end(), size_t(tile) * 3, 0);       // ... then zeros: last = base + 18 tiles, first = base + 10
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, true);
+        if (loc.off < 0)
+            return fail("a head followed by junk and then zeros was not located: " + loc.why);
+        if (loc.off != base)
+            return fail("a head followed by junk and then zeros was located at " + std::to_string(loc.off) +
+                        " B, not the envelope's end " + std::to_string(base));
+    }
+    // (c) untied + padding: refused rather than taken
+    {
+        std::vector<uint8_t> buf = build(0, 3, nullptr);
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, false);
+        if (loc.off >= 0) return fail("an untied padded tail was taken instead of refused");
+        if (loc.why.empty()) return fail("and the refusal says nothing");
+    }
+    // (d) untied + exact: taken and marked unverified
+    {
+        std::vector<uint8_t> buf = build(0, 0, nullptr);
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, false);
+        if (loc.off < 0) return fail("an untied exact tail was refused: " + loc.why);
+        if (loc.off != base) return fail("an untied exact tail was located at the wrong offset");
+        if (loc.verified) return fail("an untied tail reported itself as verified");
+    }
+    if (why) why->clear();
+    return true;
 }
 
 Q4 q_from_tiles(const std::vector<TileW>& tiles) {
@@ -2135,9 +2521,14 @@ Plan plan(const std::string& pack_dir) {
     std::set<std::string> graph_projs;
     if (graph_weights) {
         for (const auto& t : onnx.tensors) {
-            const size_t pos = t.name.find(".MatMulNBits.");
-            if (pos == std::string::npos || t.dims.empty()) continue;   // 0-dim placeholders sit beside them
-            graph_projs.insert(t.name.substr(0, pos));
+            if (t.dims.empty()) continue;                              // 0-dim placeholders sit beside them
+            // Two spellings of the same thing: `<proj>.MatMulNBits.qweight` (the 1.8/phi-4 form) and
+            // `<proj>.MatMul.weight_Q4` (Qwen3-VL-4B's, three-input nodes, engine#1503).
+            size_t pos = t.name.find(".MatMulNBits.");
+            if (pos != std::string::npos) { graph_projs.insert(t.name.substr(0, pos)); continue; }
+            const std::string q4 = ".MatMul.weight_Q4";
+            pos = t.name.find(q4);
+            if (pos != std::string::npos) graph_projs.insert(t.name.substr(0, pos));
         }
     }
     const OnnxTensor* embed = nullptr;
@@ -2869,6 +3260,12 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         ++r.tensors;
         ++aux;
     }
+    // The device weight layout, when the caller declared one (`--weight-layout b8`): without this key the container
+    // asks the forward for the UNTAGGED family while the caller built `_b8` ELFs, and the failure reads as "missing
+    // full ELF" for a set that exists. Found by importing phi-4 with the flag, seeing the report print "declares
+    // q4nx_weight_layout b8", and then finding the key absent from config.json (engine#1503).
+    if (const std::string why = weight_layout_refusal(opt.weight_layout); !why.empty())
+        throw std::runtime_error("--weight-layout: " + why);
     json c;
     c["model_type"] = p.dims.model_type;
     c["hidden_size"] = p.dims.hidden;
@@ -2880,10 +3277,12 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     c["vocab_size"] = p.dims.vocab;
     c["rope_theta"] = p.dims.rope_theta;
     c["q4nx_parameters"] = "fp32 scale/zero per 32-column group";
+    if (!opt.weight_layout.empty() && opt.weight_layout != "rm") c["q4nx_weight_layout"] = opt.weight_layout;
     c["q4nx_source"] = {{"kind", "oga-npu-pack external data"}, {"pack", p.pack},
                         {"importer", "1bit npu-pack import"}, {"graph", graph},
                         {"note", "weights decoded from *.qweight.packed via decode_external_tile; the code ordering is "
-                                 "kExtQuantsRowMajor's compile-time choice (engine#1503)"}};
+                                 "kExtQuantsRowMajor's compile-time choice (engine#1503)"},
+                        {"weight_layout", opt.weight_layout.empty() ? "rm" : opt.weight_layout}};
     json manifest;
     manifest["format"] = "q4nx";
     manifest["layout"] = "q4nx-2";
@@ -3160,8 +3559,15 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         // Decode rows [row0, row0+rows) of a projection's MatMulNBits weight into q4_1 tiles.
         auto decode_rows = [&](const std::string& proj, int row0, int rows, const std::string& out_name,
                                int k_override) -> bool {
+            // The two spellings of a quantised projection (engine#1503): the 1.8/phi-4 form carries a qweight and a
+            // scales sibling; Qwen3-VL-4B names them `<proj>.MatMul.weight_Q4` / `<proj>.MatMul.weight_scales` on a
+            // three-input node with no qzeros (implicit zero point, applied below).
             const OnnxTensor* qw = init_of(proj + ".MatMulNBits.qweight");
             const OnnxTensor* sc = init_of(proj + ".MatMulNBits.scales");
+            if (!qw || !sc) {
+                qw = init_of(proj + "MatMul.weight_Q4");
+                sc = init_of(proj + "MatMul.weight_scales");
+            }
             if (!qw || !sc || qw->dims.size() != 3 || sc->dims.empty()) return false;
             const int N = int(qw->dims[0]);
             const int block = int(qw->dims[2]) * 2;            // 64 B holds 128 four-bit codes
@@ -3311,7 +3717,9 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         const uint8_t* zp = have_zp ? bytes_of(onnx.tensors[zi->second], zp_need) : nullptr;
         uint64_t qw_need = 0;   // N * K/block * block/2
         if (!mul_ok(groups_n, uint64_t(mm.block) / 2, qw_need)) throw std::runtime_error("lm_head: qweight length overflows");
-        const Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        // no qzeros tensor -> the implicit zero point (engine#1503: Qwen3-VL-4B's spelling, three-input nodes)
+        if (!have_zp) implicit_zp_zero(q, mm.bits);
 
         std::vector<uint8_t> tiled;
         long long pinexact = 0;
@@ -3505,18 +3913,29 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 // byte, which the constant would have missed by 2,304.
                 const int64_t env = attn_payload_off(H);
                 const int64_t want = env + rows * tile;
-                const int64_t have = int64_t(fc.size) - tail_off;
-                if (want != have) {
-                    late.push_back("lm_head.weight: the .fconst tail is " + std::to_string(have) + " B, not the " +
-                                   std::to_string(want) + " B its envelope and head tiles would take (" +
-                                   std::to_string(env) + " + " + std::to_string(rows) + " x " +
-                                   std::to_string(tile) + " B), so the head's offsets are not established");
+                // engine#1740: the head is LOCATED, not assumed to end the file. `want == have` was an equality
+                // check on the tail length, so a pack whose .fconst ends in padding (110,208,000 B on the
+                // hidden-1536 family) was refused for a reason about placement rather than about its fields.
+                const TailHeadLocate loc = locate_tail_head(fc, tail_off, env, rows, tile, H, embed_tbl, tie_declared && tied);
+                if (loc.off < 0) {
+                    late.push_back("lm_head.weight: " + loc.why);
                 } else {
+                    // engine#1740: say WHICH placement was taken. "imported" alone cannot distinguish a tail that ends
+                    // with the head from one that ends in padding, and that difference is the whole point of the
+                    // search -- so the number a reviewer needs is here rather than inferred from the file size.
+                    std::fprintf(stderr,
+                                 "  lm head: tile 0 at %lld B, %lld tile(s) after a %lld B envelope; %lld B of trailing "
+                                 "zeros, %lld tile(s) of slack%s%s\n",
+                                 (long long)loc.off, (long long)rows, (long long)env, (long long)loc.zeros,
+                                 (long long)loc.slack,
+                                 loc.exact ? ", the tail ends with the head" : "",
+                                 loc.verified ? " (tied: located by correlation with the pack's embedding)"
+                                              : " (untied: placement taken, not verified)");
                     std::vector<TileW> tiles;
                     tiles.reserve(size_t(rows));
                     bool exact = true;
                     for (int64_t i = 0; i < rows; ++i) {
-                        const uint8_t* src = at(fc, tail_off + env + i * tile, tile);
+                        const uint8_t* src = at(fc, loc.off + i * tile, tile);
                         tiles.push_back(decode_tile(src, int(H)));
                         const std::vector<uint8_t> back = encode_tile(tiles.back());
                         if (std::memcmp(back.data(), src, size_t(tile)) != 0) exact = false;
@@ -4265,6 +4684,48 @@ bool canonical_copy_reusable(const std::string& work, int64_t expected_len) {
     // file_size() fails on a missing file and on a directory, which is exactly the set that must be rewritten.
     const std::uintmax_t have = fs::file_size(work, ec);
     return !ec && have == static_cast<std::uintmax_t>(expected_len);
+}
+
+// engine#1770: reuse (engine#1662) writes a NEW copy when the source changes instead of overwriting, so copies only ever
+// accumulate -- 699 files and 8.7 GiB of tmpfs (i.e. RAM) on this box, most of them truncated 0-byte tails. The identity
+// in the name is `1bit-fconst19v<n>-<pack tag>-<hidden>-<heads>-<layers>-<source size>-<source mtime>.fconst`, so keeping
+// one copy per (pack, geometry) means removing the entries that share the prefix but not the whole name. That cannot take
+// a copy a reader is about to use: reuse requires the entire name to match, and the one name that can match is the one
+// being kept. A reader holding a removed file open is unaffected (the inode outlives the unlink); at worst a concurrent
+// lane rewrites a copy it would have reused, which costs a file write and no correctness.
+void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix,
+                                  const std::string& legacy_name, int64_t max_age_seconds) {
+    if (dir.empty() || keep_name.empty() || prefix.empty() || keep_name.size() <= prefix.size()) return;
+    const std::string stem = "1bit-fconst19";
+    const auto        now  = fs::file_time_type::clock::now();
+    std::error_code   ec;
+    for (fs::directory_iterator it(fs::path(dir), ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string base = it->path().filename().string();
+        if (base == keep_name) continue;
+        // same pack and geometry, different source identity: nothing reuses it
+        if (base.size() > prefix.size() && base.compare(0, prefix.size(), prefix) == 0) {
+            std::error_code rm;
+            fs::remove(it->path(), rm);
+            continue;
+        }
+        // the generation before the source identity was part of the name: at most one per pack+geometry, matched exactly
+        if (!legacy_name.empty() && base == legacy_name) {
+            std::error_code rm;
+            fs::remove(it->path(), rm);
+            continue;
+        }
+        // and any scratch copy at all that nobody has touched for max_age_seconds is an abandoned pack: a write-triggered
+        // sweep is enough for the geometry being written, but a pack that is never imported again would otherwise stay in
+        // tmpfs (i.e. in RAM) for the life of the box (engine#1770)
+        if (max_age_seconds > 0 && base.size() > stem.size() && base.compare(0, stem.size(), stem) == 0) {
+            std::error_code tec;
+            const auto      mtime = fs::last_write_time(it->path(), tec);
+            if (!tec && now - mtime > std::chrono::seconds(max_age_seconds)) {
+                std::error_code rm;
+                fs::remove(it->path(), rm);
+            }
+        }
+    }
 }
 
 }  // namespace onebit::npu::pack_import

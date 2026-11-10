@@ -1744,6 +1744,18 @@ BIT-EXACT over 4 step(s) at max|d| tolerance 0.0
 ```
 three repeats of the device arm, an edge case (`Hi`), and run-to-run determinism all `max|d| = 0`.
 
+**How to run the two arms.** One ticket each, dumps compared per step:
+
+```
+1bit forward-serve -m <conv>/model.q4nx --kernels <conv>/npu -p 20081 --dump-logits /tmp/g/i8 \
+    &                        # with NPU_INFER_HOST_GEMM=i8 in the environment
+1bit forward-serve -m <conv>/model.q4nx --kernels <conv>/npu -p 20082 --dump-logits /tmp/g/dev
+scripts/families/compare-logits.py /tmp/g/i8 /tmp/g/dev      # BIT-EXACT at tolerance 0
+```
+`--dump-logits` writes `step_<response>_<n>.bin` per generated step, so the comparison is per position rather than
+per run. Repeat the device arm three times for determinism, and add an edge case (a two-token prompt), which is
+what the table above did.
+
 **What it costs.** The arm warms up slowly (it builds one image per tensor, ~35 s on a 7B container) and is not
 a speed path: it exists to be a reference. It is off by default and `=1` (f32) keeps its old meaning.
 

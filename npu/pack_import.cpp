@@ -4587,6 +4587,8 @@ OnnxGraphInfo parse_onnx_graph(const std::string& path) {
     const auto g = pb(gfield->p, gfield->n);
 
     OnnxGraphInfo out;
+    const size_t slash = path.find_last_of('/');
+    out.dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
     for (const auto* f : fields(g, 11)) {           // graph.input
         const auto vi = pb(f->p, f->n);
         if (const auto* nm = field1(vi, 1)) out.inputs.push_back(pb_str(*nm));
@@ -4600,14 +4602,26 @@ OnnxGraphInfo parse_onnx_graph(const std::string& path) {
         const auto* nm = field1(t, 8);
         if (nm == nullptr) continue;
         out.initializers.push_back(pb_str(*nm));
-        for (const auto* d : fields(t, 13)) {       // TensorProto.external_data: "location" means a side file
+        OnnxInit ti;
+        ti.name = pb_str(*nm);
+        if (const auto* dt = field1(t, 2)) ti.dtype = int(dt->v);
+        for (const auto* d : fields(t, 1)) ti.dims.push_back(int64_t(d->v));
+        if (const auto* rd = field1(t, 9)) {
+            ti.raw = rd->p;
+            ti.raw_len = rd->n;
+        }
+        for (const auto* d : fields(t, 13)) {       // TensorProto.external_data: key/value string pairs
             const auto kv = pb(d->p, d->n);
             const auto* k = field1(kv, 1);
-            if (k != nullptr && pb_str(*k) == "location") {
-                out.external.push_back(pb_str(*nm));
-                break;
-            }
+            const auto* v = field1(kv, 2);
+            if (k == nullptr || v == nullptr) continue;
+            const std::string key = pb_str(*k), val = pb_str(*v);
+            if (key == "location") ti.location = val;
+            else if (key == "offset") ti.offset = std::stoull(val);
+            else if (key == "length") ti.length = std::stoull(val);
         }
+        if (!ti.location.empty()) out.external.push_back(ti.name);
+        out.init_tensors.push_back(std::move(ti));
     }
     for (const auto* f : fields(g, 1)) {            // graph.node
         const auto node = pb(f->p, f->n);
@@ -4634,7 +4648,9 @@ OnnxGraphInfo parse_onnx_graph(const std::string& path) {
         }
         out.nodes.push_back(std::move(ni));
     }
-    unmap_file(base, size);
+    // NOT unmapped: init_tensors[].raw points into this mapping, and the executor copies what it needs while it is alive.
+    // shortcut: the mapping is released when the process exits; a long-lived caller that parses many graphs should own the
+    // mapping itself, which is the refactor to make when a second consumer appears.
     return out;
 }
 

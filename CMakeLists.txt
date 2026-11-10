@@ -566,7 +566,7 @@ if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp
-                            npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
+                            npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
@@ -1084,6 +1084,8 @@ target_include_directories(audio_ops_test PRIVATE npu/forward/include)
 # census the host reference was written against. Skips (77) without a path.
 add_executable(onnx_graph_test tests/onnx_graph_test.cpp)
 target_link_libraries(onnx_graph_test PRIVATE onebit_npu)
+add_executable(audio_exec_test tests/audio_exec_test.cpp)
+target_link_libraries(audio_exec_test PRIVATE onebit_npu)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
@@ -1310,6 +1312,8 @@ endif()
 add_test(NAME audio_ops COMMAND audio_ops_test)
 set_tests_properties(audio_ops PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME onnx_graph COMMAND onnx_graph_test ${ONEBIT_AUDIO_ONNX})
+add_test(NAME audio_exec COMMAND audio_exec_test ${ONEBIT_AUDIO_ONNX})
+set_tests_properties(audio_exec PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(onnx_graph PROPERTIES SKIP_RETURN_CODE 77)
 # The private NPU route registry (npu/private_route.h), without an add-on.
 add_executable(npu_private_route_test tests/npu_private_route_test.cpp)

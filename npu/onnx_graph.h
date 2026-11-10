@@ -29,7 +29,21 @@ struct OnnxNodeInfo {
     std::map<std::string, float> attrs_float;                 // `alpha`, `epsilon` (as stored)
 };
 
+// One initializer: its shape, dtype and where its bytes are (inline `raw_data`, or a side file via external_data).
+struct OnnxInit {
+    std::string name;
+    int dtype = 0;                     // TensorProto.DataType: 1 = FLOAT, 7 = INT64, 10 = FLOAT16, ...
+    std::vector<int64_t> dims;
+    const uint8_t* raw = nullptr;      // valid only while the mapped file is open; the caller copies what it needs
+    size_t raw_len = 0;
+    std::string location;              // external_data side file, relative to the graph's directory
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+
 struct OnnxGraphInfo {
+    std::string dir;                   // directory of the .onnx file, for resolving external_data
+    std::vector<OnnxInit> init_tensors;
     std::vector<std::string> inputs;    // graph inputs, in declaration order
     std::vector<std::string> outputs;   // graph outputs
     std::vector<OnnxNodeInfo> nodes;    // graph order, which ONNX guarantees is topological

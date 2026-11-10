@@ -174,7 +174,7 @@ fi
 head -c 65536 /dev/urandom > "$tmp/models/big.gguf"      # non-empty: mmap of a zero-length file fails
 cat > "$tmp/mapbench" <<'PY'
 #!/usr/bin/env python3
-import mmap, os, sys, time
+import mmap, os, signal, sys, time
 a = sys.argv[1:]
 lm = a[a.index('-lm') + 1] if '-lm' in a else 'mmap'
 model = a[a.index('-m') + 1]
@@ -188,6 +188,8 @@ else:
 sys.stderr.write('ggml_hrx dispatch: common.mul_mat.q4_k_q8_1_x4_prefill\n')
 sys.stderr.write('| qwen3-4b | 2.30 GiB | 4B | HRX | 99 | 1 | pp512 | 3181.97 t/s |\n')
 sys.stderr.flush()
+if os.environ.get('FAKE_BENCH_IGNORE_TERM'):          # a bench wedged in the device does not answer SIGTERM
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if os.environ.get('FAKE_BENCH_PIDFILE'):          # a case reads this to see whether the bench outlived the preflight
     open(os.environ['FAKE_BENCH_PIDFILE'], 'w').write(str(os.getpid()))
 time.sleep(float(os.environ.get('FAKE_BENCH_SLEEP') or 0.7))
@@ -236,21 +238,28 @@ wait_pidfile() {  # wait_pidfile <file> -> prints the bench pid once the bench h
     until [ -s "$1" ]; do n=$((n + 1)); [ "$n" -gt 50 ] && return 1; sleep 0.1; done
     cat "$1"
 }
-orphan_case() {  # orphan_case <name> <signal> -> signals the preflight while its bench runs, wants the bench gone
-    local name=$1 how=$2 root pidfile pre bench
+orphan_case() {  # orphan_case <name> <signal> [ignore-term] -> signals the preflight while its bench runs, wants the bench gone
+    local name=$1 how=$2 ignore=${3:-} root pidfile pre bench started
     root=$(fake 3600 0 60)
     pidfile=$root/bench.pid
     rm -f "$pidfile"          # fake() hands the same root to equal arguments, so an earlier case's pid would be read
     patched "$root" >/dev/null 2>&1          # writes $root/run.sh; without --dispatch it stops after the gates
-    FAKE_BENCH_SLEEP=30 FAKE_BENCH_PIDFILE=$pidfile \
+    FAKE_BENCH_SLEEP=30 FAKE_BENCH_PIDFILE=$pidfile FAKE_BENCH_IGNORE_TERM=$ignore \
         PREFLIGHT_MODEL=$tmp/models/big.gguf bash "$root/run.sh" --dispatch "$tmp/mapbench" 512 >/dev/null 2>&1 &
     pre=$!
     if ! bench=$(wait_pidfile "$pidfile"); then
         printf 'FAIL %-38s the fake bench never started\n' "$name"; fail=$((fail+1))
         kill "$pre" 2>/dev/null; return
     fi
+    started=$SECONDS
     kill -s "$how" "$pre" 2>/dev/null
     wait "$pre" 2>/dev/null
+    # The bench sleeps 30 s. A preflight that only returns once the bench ends by itself has not stopped it, it has waited
+    # for it - which is what an unbounded wait on a bench that ignores TERM does.
+    if [ $((SECONDS - started)) -ge 15 ]; then
+        printf 'FAIL %-38s the preflight took %ds to return\n' "$name" "$((SECONDS - started))"; fail=$((fail+1))
+        kill -KILL "$bench" 2>/dev/null; return
+    fi
     if gone "$bench"; then
         printf 'ok   %-38s bench pid %s is gone\n' "$name" "$bench"; pass=$((pass+1))
     else
@@ -260,6 +269,7 @@ orphan_case() {  # orphan_case <name> <signal> -> signals the preflight while it
 }
 orphan_case "SIGTERM to the preflight stops the bench" TERM
 orphan_case "SIGHUP to the preflight stops the bench"  HUP
+orphan_case "a bench that ignores TERM is killed"      TERM 1
 
 printf '\nbench-preflight test: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

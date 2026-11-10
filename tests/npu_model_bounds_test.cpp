@@ -119,7 +119,30 @@ std::vector<Entry> one_layer(std::vector<int64_t> q_shape = {1, 5120}, int64_t g
 
 }  // namespace
 
+// engine#1890: the widths `Tensor::expected_bytes()` uses, pinned here because the guard in npu/lane.cpp is only as right as
+// this table. A quantised table is the case that broke: #1881 compared the embedding's `bytes` against a bf16 figure, so an I8
+// table (0.625 B/element) was refused for being legitimately small (bonsai2-27b: 794,624,000 B against 2,542,796,800 B). The
+// table below is what makes the comparison legal, and the 0 return is what keeps an unknown dtype on the file-end bound instead
+// of refusing on a guess.
+void expected_bytes_widths() {
+    auto tb = [](const char* dtype) {
+        Tensor t;
+        t.dtype = dtype;
+        return t;
+    };
+    check(tb("BF16").expected_bytes(1000) == 2000, "expected_bytes: BF16 is 2 bytes per element");
+    check(tb("F16").expected_bytes(1000) == 2000, "expected_bytes: F16 is 2 bytes per element");
+    check(tb("F32").expected_bytes(1000) == 4000, "expected_bytes: F32 is 4 bytes per element");
+    check(tb("I32").expected_bytes(1000) == 4000, "expected_bytes: I32 is 4 bytes per element");
+    check(tb("I8").expected_bytes(1000) == 1000, "expected_bytes: I8 is 1 byte per element");
+    check(tb("U8").expected_bytes(1000) == 1000, "expected_bytes: U8 is 1 byte per element");
+    check(tb("Q4").expected_bytes(1000) == 0, "expected_bytes: an unknown dtype answers 0, so the caller keeps `avail`");
+    check(tb("BF16").expected_bytes(0) == 0, "expected_bytes: zero elements is 0, not a bogus width");
+    std::printf("  expected_bytes: 8 arms (six widths, unknown dtype, zero elements)\n");
+}
+
 int main() {
+    expected_bytes_widths();
     const fs::path root = fs::temp_directory_path() / ("npu_model_bounds_test." + std::to_string(::getpid()));
     fs::remove_all(root);
 

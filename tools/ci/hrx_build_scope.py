@@ -266,6 +266,14 @@ def self_test():
         ok = got == want
         print(("ok   " if ok else "FAIL ") + f"{name} -> {got}" + ("" if ok else f" (wanted {want}: {why})"))
         bad += 0 if ok else 1
+    # The reason string is this tool's product, and the arms above compare the verdict only (engine#1753's review). The
+    # no-line-change branch is reached by a mode change on a family file too, since #1744 widened the diff, so it must
+    # name the registration files and not claim CMakeLists.txt: that wrong wording is what survived #1744 unseen.
+    got, why = decide(["cmake/tests-gpu-hold.cmake"], "+++ b/cmake/tests-gpu-hold.cmake\n")
+    ok = got == "full" and "registration file" in why and "CMakeLists.txt" not in why
+    print(("ok   " if ok else "FAIL ") + "a mode-only family file names the registration files, not CMakeLists.txt"
+          + ("" if ok else f" (got {got}: {why})"))
+    bad += 0 if ok else 1
     g = git_arm()
     if g is None:
         print("skip git: no git on PATH, from_git() not exercised")

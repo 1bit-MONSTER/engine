@@ -71,7 +71,22 @@ struct Dims {
     unsigned short eps_bits = 0x3586;
     std::string model_type;
     std::vector<int> eos;
+    // config.json's `use_qk_norm` (engine#1889). Hunyuan-7B declares it and puts 32x128 + 8x128 per-head q/k
+    // gains in its block; nothing read this key, so the importer decided `qk_norm` from layout arithmetic alone,
+    // landed on false, and the pack imported cleanly with the norms silently omitted -- the forward then runs
+    // without normalising q/k, which produces deterministic gibberish rather than a refusal. Read here so the
+    // decision has the pack's own statement as one of its inputs.
+    bool use_qk_norm = false;
 };
+
+// Why a pack that DECLARES per-head q/k gains cannot be imported, or "" when it can (engine#1889).
+//
+// `declared` is config.json's `use_qk_norm`; `found` says the block layout located the two sections (knorm_off /
+// qnorm_off) or the graph carries them. The three cases are deliberately separate: declared-and-not-found is a
+// REFUSAL (importing without the gains is the silent-garbage path), found-and-not-declared is allowed only with the
+// measurement behind it (Qwen3 packs ship the sections without the key), and neither is the ordinary case. Exposed
+// so the three can be pinned without a 4 GB pack.
+std::string qk_norm_refusal(bool declared, bool found);
 
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
 // GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the

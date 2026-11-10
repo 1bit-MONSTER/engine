@@ -3369,7 +3369,29 @@ void test_tail_head_placement() {
 }
 
 
+/* engine#1889: a pack that declares per-head q/k gains and whose gains the importer did not locate must be REFUSED,
+ * not imported without them. Hunyuan-7B is the measured case: `use_qk_norm: true`, 32x128 + 8x128 gains in its block,
+ * a 96-tile attention payload against the 160 the same geometry gets elsewhere -- and the import reported
+ * `attention 5120/5120 tiles` byte-exact while the served model answered `Trease/ft//////////` three of three.
+ * The three cases are separate on purpose: declared-and-not-found is the refusal; found-and-not-declared is the Qwen3
+ * shape (the sections are there, the key is not) and must NOT be refused. */
+void test_qk_norm_refusal() {
+    const std::string a = pi::qk_norm_refusal(true, false);
+    check(!a.empty(), "qk norm: declared but not found is a refusal (importing without the gains answers gibberish)");
+    check(a.find("use_qk_norm") != std::string::npos, "qk norm: the refusal names the key the pack declared");
+    check(a.find("not where the block layout says") != std::string::npos,
+          "qk norm: and says what was not found, rather than failing generically");
+    check(a.find("engine#1889") != std::string::npos, "qk norm: the refusal carries its issue, like the others here");
+    check(pi::qk_norm_refusal(true, true).empty(),
+          "qk norm: declared and found is allowed (the arithmetic or the graph located the gains)");
+    check(pi::qk_norm_refusal(false, true).empty(),
+          "qk norm: found and not declared is allowed (Qwen3 ships the sections without the key)");
+    check(pi::qk_norm_refusal(false, false).empty(), "qk norm: neither is the ordinary pack");
+    std::printf("  qk norm: 7 arms (declared+not-found refuses; found-only and neither are allowed)\n");
+}
+
 int main(int argc, char** argv) {
+    test_qk_norm_refusal();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";

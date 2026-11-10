@@ -691,6 +691,56 @@ void test_gemma4_answer_parser() {
         check(a.reasoning == "\nlet me think", "gemma4: the thought channel is reasoning");
         check(a.content == "Done.", "gemma4: and the reply after it is content");
     }
+    {
+        // A string whose closing <|"|> never arrives is malformed: no call, and the markup is back in content.
+        const std::string reply = "<|tool_call>call:say{text:<|\"|>hello}<tool_call|>";
+        const auto a = parse_answer(reply, G, true);
+        check(a.calls.empty(), "gemma4: an unterminated <|\"|> string is not a call");
+        check(a.content == reply, "gemma4: and what the model wrote is back in content, whole");
+        const auto b = parse_answer("<|tool_call>call:f{a:1}tail}<tool_call|>", G, true);
+        check(b.calls.empty() && !b.content.empty(), "gemma4: text after the arguments object is not a call");
+        const auto c = parse_answer("<|tool_call>call:f{a:[1,2}<tool_call|>", G, true);
+        check(c.calls.empty() && !c.content.empty(), "gemma4: an array that never closes is not a call");
+    }
+    {
+        // Nested object and array, the same bare-key form one level down.
+        const auto a = parse_answer(
+            "<|tool_call>call:f{o:{k:<|\"|>v<|\"|>},l:[1,<|\"|>a,b<|\"|>],z:null}<tool_call|>", G, true);
+        check(a.calls.size() == 1 && a.calls[0].arguments == R"({"o":{"k":"v"},"l":[1,"a,b"],"z":null})",
+              "gemma4: nested objects and arrays are rewritten too");
+    }
+}
+
+// Every tag every family declares must be recognised, whatever its length, whole and split across two chunks at
+// every byte. The scanner once read tags through a 16-byte window, so a 17-byte tag read as text (engine#1779);
+// this arm fails for any family whose tags the scanner cannot match, including one added later.
+void test_every_family_tag_is_matched() {
+    for (const AnswerFamily f : {AnswerFamily::qwen3, AnswerFamily::gemma4}) {
+        const auto t = onebit::npu::answer_detail::tags_of(f);
+        const std::string name = onebit::npu::answer_detail::family_name(f);
+        const std::string think = std::string(t.think_open) + "R" + t.think_close + "C";
+        const std::string call = std::string(t.call_open) + "not a call" + t.call_close;
+        for (size_t cut = 0; cut <= think.size(); cut++) {
+            AnswerStream s(f, false);
+            std::vector<std::pair<bool, std::string>> out;
+            s.feed(think.substr(0, cut), out);
+            s.feed(think.substr(cut), out);
+            s.finish(out);
+            check(s.reasoning() == "R" && s.content() == "C",
+                  (name + ": think tags are matched, split at byte " + std::to_string(cut)).c_str());
+        }
+        for (size_t cut = 0; cut <= call.size(); cut++) {
+            AnswerStream s(f, true);
+            std::vector<std::pair<bool, std::string>> out;
+            s.feed(call.substr(0, cut), out);
+            s.feed(call.substr(cut), out);
+            s.finish(out);
+            // Not a valid body, so it comes back as content: open tag, body and close tag, which proves both
+            // call tags were seen (an unseen close tag would leave the body unterminated and drop the tag).
+            check(s.calls().empty() && s.content() == call && s.reasoning().empty(),
+                  (name + ": call tags are matched, split at byte " + std::to_string(cut)).c_str());
+        }
+    }
 }
 
 void test_answer_parser() {
@@ -1020,6 +1070,7 @@ int main() {
     test_answer_stream();
     test_tool_grammar();
     test_gemma4_answer_parser();
+    test_every_family_tag_is_matched();
     test_tool_request_parsing();
     test_content_mask();
     test_request_parsing();

@@ -189,11 +189,13 @@ private:
         };
         while (i < safe.size()) {
             if (safe[i] == '<') {
-                // 32 bytes, not 16: gemma4's thinking tag is `<|channel>thought` (18 bytes) and the old
-                // 16-byte window could never match it -- every tag longer than the window looked like text
-                // (engine#1779). 32 covers the longest tag any family carries with room to spare.
-                const std::string rest = safe.substr(i, 32);
-                auto starts = [&](const char* tag) { return rest.rfind(tag, 0) == 0; };
+                // Compared at the tag's own length, never through a fixed window: this read `safe.substr(i, 16)`
+                // once, and gemma4's thinking tag `<|channel>thought` is 17 bytes, so it could never match -- every
+                // tag as long as the window read as text (engine#1779). No width is left here to outgrow.
+                auto starts = [&](const char* tag) {
+                    const size_t n = std::char_traits<char>::length(tag);
+                    return safe.compare(i, n, tag) == 0;
+                };
                 if (starts(tags_.think_open)) {
                     flush_plain();
                     mode_ = Mode::reasoning;
@@ -252,6 +254,7 @@ private:
     }
 
     // `call:NAME{key:value,...}` -> a ToolCall whose arguments are JSON, so the two routes hand the caller one shape.
+    // Throws on a body that is not that shape (the caller puts the markup back into content).
     // The Gemma object syntax is not JSON: keys are bare, string values are wrapped in <|"|>, and nested objects and
     // arrays use the same bare-key form. This rewrites it rather than guessing: <|"|>v<|"|> becomes a JSON string,
     // a bare key gains quotes, and numbers/true/false/null pass through as literals.
@@ -268,7 +271,10 @@ private:
                 i += 5;
                 std::string lit;
                 while (i < body.size() && body.compare(i, 5, "<|\"|>") != 0) lit += body[i++];
-                i += (i < body.size() ? 5 : 0);
+                // A string whose closing escape never arrives is malformed, not a shorter string: refusing it sends
+                // the markup back to content (close_call), where accepting it would invent a truncated argument.
+                if (i >= body.size()) throw std::runtime_error("gemma4 call: unterminated <|\"|> string");
+                i += 5;
                 out += nlohmann::json(lit).dump();
                 return;
             }
@@ -283,10 +289,12 @@ private:
                     space();
                     if (close_ch == '}') {
                         const size_t colon = body.find(':', i);
-                        std::string key = body.substr(i, colon == std::string::npos ? 0 : colon - i);
+                        if (colon == std::string::npos) throw std::runtime_error("gemma4 call: a key with no value");
+                        std::string key = body.substr(i, colon - i);
                         while (!key.empty() && (key.back() == ' ' || key.back() == '\n')) key.pop_back();
+                        if (key.empty()) throw std::runtime_error("gemma4 call: an empty key");
                         out += nlohmann::json(key).dump() + ":";
-                        i = (colon == std::string::npos) ? body.size() : colon + 1;
+                        i = colon + 1;
                         value();
                     } else {
                         value();
@@ -294,7 +302,8 @@ private:
                     space();
                     if (i < body.size() && body[i] == ',') ++i;
                 }
-                if (i < body.size()) { out += body[i++]; }
+                if (i >= body.size()) throw std::runtime_error("gemma4 call: an object or array that never closes");
+                out += body[i++];
                 return;
             }
             std::string raw;
@@ -307,6 +316,9 @@ private:
                 raw += c; ++i;
             }
             while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\n')) raw.pop_back();
+            // An empty value consumed nothing. Refusing it is also what keeps the loops above finite: `[1}` would
+            // otherwise ask for a value at the `}` for ever, appending a comma each time.
+            if (raw.empty()) throw std::runtime_error("gemma4 call: an empty value");
             if (raw == "true" || raw == "false" || raw == "null" || (!raw.empty() && (std::isdigit((unsigned char)raw[0]) || raw[0] == '-'))) {
                 out += raw;
             } else {
@@ -314,6 +326,8 @@ private:
             }
         };
         value();
+        space();
+        if (i != body.size()) throw std::runtime_error("gemma4 call: text after the arguments object");
         return out;
     }
 

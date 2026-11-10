@@ -383,6 +383,9 @@ add_test(NAME think_split COMMAND think_split_test)
 add_executable(serve_degenerate_test tests/serve_degenerate_test.cpp)
 target_include_directories(serve_degenerate_test PRIVATE app)
 add_test(NAME serve_degenerate COMMAND serve_degenerate_test)
+# Built with `onebit`, which CI's --target list already names: a test target of its own would need a line in
+# .github/workflows/ci.yml, and a PR that edits a workflow cannot be merged by a token without the `workflow` scope.
+add_dependencies(onebit serve_degenerate_test)
 
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)

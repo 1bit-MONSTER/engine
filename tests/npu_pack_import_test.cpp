@@ -2950,6 +2950,24 @@ int main(int argc, char** argv) {
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
+        // engine#1740: the tail may be padded by whole tile-slots; anything else means the head's offsets are not established.
+        {
+            const int64_t env = 8256, rows = 2003, tile = 143616;   // Hunyuan-7B-Instruct 1.9's own numbers
+            // The predicate answers "is it LONGER by whole slots", never "is this length fine" -- the caller's exact-equality
+            // arm accepts the exact length, and conflating the two is how an accept-everything 0-slot case would slip in.
+            check(!pi::fconst19_tail_padded(env, rows, tile, env + rows * tile),
+                  "tail padding: the exact length is not \"padded\" (the caller accepts it separately)");
+            check(pi::fconst19_tail_padded(env, rows, tile, env + (rows + 1) * tile),
+                  "tail padding: one padded slot is accepted (Hunyuan-7B 1.9 ships exactly this)");
+            check(pi::fconst19_tail_padded(env, rows, tile, env + (rows + 2) * tile),
+                  "tail padding: two padded slots are accepted");
+            check(!pi::fconst19_tail_padded(env, rows, tile, env + (rows + 3) * tile),
+                  "tail padding: three slots is not padding, the offsets are not established");
+            check(!pi::fconst19_tail_padded(env, rows, tile, env + rows * tile + tile / 2),
+                  "tail padding: a half slot is not padding");
+            check(!pi::fconst19_tail_padded(env, rows, tile, env + rows * tile - 1),
+                  "tail padding: a SHORT tail is never accepted");
+        }
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         test_import_fp32_params(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);

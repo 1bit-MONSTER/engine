@@ -389,6 +389,11 @@ struct FconstGeom {
     int64_t post_attn_hdr() const { return hdr.empty() ? h1 : hdr.back(); }
     std::string why;      // non-empty when the geometry could not be established
 };
+// Whether a 1.9 pack's .fconst tail is LONGER than its head needs by whole tile-slots, which is a vendor padding the head to
+// a multiple of 64 rows rather than a tail whose offsets are not established (engine#1740: Hunyuan-7B-Instruct carries 2004
+// slots for a 128,167-token vocabulary). Exported so the decision has a test that needs no pack.
+bool fconst19_tail_padded(int64_t env, int64_t rows, int64_t tile, int64_t have);
+
 unsigned short bf16_bits_of(float v);
 
 // engine#1650: config.json may declare an OPTIONAL field as JSON null (AMD's 1.9

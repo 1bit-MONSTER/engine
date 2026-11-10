@@ -1320,6 +1320,19 @@ int fill_from_model_config(const std::string& pack_dir, nlohmann::json& cfg) {
 
 // engine#734: exported so the epsilon anchor itself can be tested against a crafted .fconst, without a pack.
 // The two bytes a bf16 epsilon is stored as (little-endian): round the f32 to nearest-even bf16.
+// engine#1740: is the .fconst tail LONGER than the head needs by whole tile-slots? A vendor pads the head to a whole number of
+// 64-row tiles -- Hunyuan-7B-Instruct 1.9 carries 2004 slots for a vocabulary of 128,167 (2003 slots needed = 89 padding rows,
+// 143,616 B) -- and the exact-length check refused the whole head over it. Accepting is safe only while the padding is whole
+// SLOTS (the head's own offsets stay the ones this arithmetic derives) and small (<= 2 slots): anything else means the tail is
+// not this envelope plus this head and the offsets are not established. Exported so the decision is testable without a pack.
+bool fconst19_tail_padded(int64_t env, int64_t rows, int64_t tile, int64_t have) {
+    if (tile <= 0 || rows <= 0 || have <= 0) return false;
+    const int64_t body = have - env;
+    if (body <= 0 || body % tile != 0) return false;
+    const int64_t slots = body / tile - rows;
+    return slots > 0 && slots <= 2;
+}
+
 unsigned short bf16_bits_of(float v) {
     uint32_t u = 0;
     std::memcpy(&u, &v, 4);
@@ -3506,7 +3519,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 const int64_t env = attn_payload_off(H);
                 const int64_t want = env + rows * tile;
                 const int64_t have = int64_t(fc.size) - tail_off;
-                if (want != have) {
+                // A vendor may pad the head to a whole number of tiles: Hunyuan-7B-Instruct 1.9 carries 2004 tile-slots for a
+                // vocab of 128,167 (2003 of 64 rows needed), i.e. 89 padding rows and 143,616 B of trailing padding. That is
+                // a tail LARGER than the head needs, which used to refuse the whole head. Accept the extra only when the
+                // remainder is a whole number of tile-slots (so the head's own offsets are still the ones this arithmetic
+                // derives) and read the tiles the vocab needs, leaving the padding unread.
+                if (want != have && !fconst19_tail_padded(env, rows, tile, have)) {
                     late.push_back("lm_head.weight: the .fconst tail is " + std::to_string(have) + " B, not the " +
                                    std::to_string(want) + " B its envelope and head tiles would take (" +
                                    std::to_string(env) + " + " + std::to_string(rows) + " x " +

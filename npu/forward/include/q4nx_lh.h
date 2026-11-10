@@ -55,6 +55,7 @@ enum LhSlot {
     LH_RQ_RESP,         // response serialise + write
     LH_PACK_UPLOAD,     // weight BO create + pack + upload (wcache_ miss only)
     LH_HEAD_ROWS,       // run_lm_head_rows(): the head for a batched verify pass
+    LH_DEQ_OUT,         // a layer launch's result -> f32 (after readback, so in no launch phase column)
     LH_N
 };
 inline bool lh_on() {
@@ -96,7 +97,7 @@ inline const char* lh_name(int s) {
         "decode (step loop)", "  of-which: sample+grammar",
         "  of-which: detokenise token", "response write",
         "  of-which: weight pack+upload (wcache miss)",
-        "lm head (batch rows)"};
+        "lm head (batch rows)", "launch output dequant"};
     return (s >= 0 && s < LH_N) ? kn[s] : "?";
 }
 }  // namespace q4nx_lh

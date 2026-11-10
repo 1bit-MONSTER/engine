@@ -742,14 +742,17 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                  * 155,200 of them), so a row is read out of the `cols/256` tiles that cover it instead of the whole
                  * table being decoded into f32 -- which for that pack is 0.74 GiB of container becoming 4.74 GiB.
                  * Same tile grid and ordering as q4nx_dequant_tensor_chunked(), pinned by the row test. */
-                const int ntr = NV / 32, ntc = kpad_ / 256;
-                const size_t tiles = (size_t)ntr * (size_t)ntc;
-                if (tiles > 0 && esz % tiles == 0) {
+                /* engine#1842: the grid is checked with the row reader's own rule, not `esz % tiles == 0`. That test let a
+                 * table with no supported chunk kind, or an NV / kpad_ off the 32 x 256 grid, take this path; the reader
+                 * then refused every row and embed_at() served 0.0f with no message. A table it would refuse stays on
+                 * the whole-table decode below, which reports its own failure. */
+                const int cb = q4nx_tile_row_kind(esz, NV, kpad_);
+                if (cb != 0) {
                     embed_tile_       = (const uint8_t*)e;
                     embed_tile_bytes_ = esz;
                     embed_tile_rows_  = NV;
                     embed_tile_cols_  = kpad_;
-                    embed_tile_cb_    = int(esz / tiles);
+                    embed_tile_cb_    = cb;
                     embed_row_buf_.assign((size_t)kpad_, 0.0f);
                     embed_row_tok_    = -1;
                 }

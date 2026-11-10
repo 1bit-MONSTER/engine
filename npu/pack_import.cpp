@@ -1282,6 +1282,9 @@ Dims read_dims(const json& c, const std::string& source = "config.json") {
     d.rope_theta = opt_field<float>(c, "rope_theta", 10000.0f);
     d.model_type = opt_field<std::string>(c, "model_type", "");
     d.rms_norm_eps = opt_field<float>(c, "rms_norm_eps", 1e-6f);
+    // engine#1889: the pack's own statement about per-head q/k gains. `opt_field<bool>` because the key is absent on
+    // every pack that has no such norm, and absent must mean false rather than a parse error.
+    d.use_qk_norm = opt_field<bool>(c, "use_qk_norm", false);
     d.eps_bits = bf16_bits_of(d.rms_norm_eps);
     if (c.contains("eos_token_id")) {
         const auto& e = c["eos_token_id"];
@@ -2490,6 +2493,14 @@ std::string Plan::manifest() const {
     return j.dump(2);
 }
 
+std::string qk_norm_refusal(bool declared, bool found) {
+    if (declared && !found)
+        return "this pack declares use_qk_norm and its per-head q/k gains are not where the block layout says "
+               "(engine#1889): importing without them would normalise no q/k, which answers plausibly-wrong text "
+               "instead of refusing. The section location for this family is not measured yet";
+    return std::string();
+}
+
 Plan plan(const std::string& pack_dir) {
     Plan p;
     p.dir = pack_dir;
@@ -3071,6 +3082,13 @@ Plan plan(const std::string& pack_dir) {
     // source from the .fconst's two per-head sections but the same tensor in the container.
     const bool graph_qk_norm = graph_weights && !onnx.index.empty() &&
                                onnx.index.count("model.layers.0.attn.q_norm.layernorm.weight");
+    /* engine#1889: a pack that DECLARES per-head q/k gains and whose gains this importer did not locate must not
+     * import -- the forward would run without normalising q/k, which answers deterministic gibberish instead of
+     * refusing (Hunyuan-7B: `Trease/ft//////////` three of three, at a geometry four other packs answer correctly on).
+     * The section location for that family is not measured yet, so the honest outcome is a named refusal; the
+     * layout arithmetic and the graph check stay the two ways the gains ARE found. */
+    if (const std::string qk_why = qk_norm_refusal(d.use_qk_norm, p.knorm_off != 0 || graph_qk_norm); !qk_why.empty())
+        throw std::runtime_error(pack_dir + ": " + qk_why);
     if (p.knorm_off || graph_qk_norm)
         for (int L = 0; L < d.layers; ++L)
             for (const char* nm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {

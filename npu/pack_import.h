@@ -440,6 +440,15 @@ int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without
 // engine#1638: the geometry as read, so a test can check WHICH source a number came from.
 nlohmann::json load_geometry_exported(const std::string& pack_dir, std::string* source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
+// The 112-byte-per-head marker a 1.9 Token .fconst repeats once per layer (`heads * 4` bytes, four per head with the
+// `7f ff` pair). Exposed for the same reason as `plan_tail_head`: the arm that pins "the header wins over the eps vote"
+// needs to BUILD a file whose header states a stride while its payload defeats the vote, and that means constructing the
+// marker rather than retyping it in the test (engine#1819 review).
+std::vector<uint8_t> fconst19_header(int heads);
+// engine#1740/#1819: locate with the 1.9 header asked FIRST and the eps vote as the fallback (a payload dense in
+// eps-shaped bytes can hold the vote below its 66 % bar while the header states the stride exactly). Exported so the arm
+// can hand it a pack directory whose header and whose vote disagree -- the case the call-order change exists for.
+FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims);
 
 // One measured Ryzen AI 1.9 Token .fconst block shape (engine#1503). Every field is measured against the 1.8 pack of
 // the same model by tools/fconst19_measure.py; none of it is derivable from the pack, which is why a pack whose shape

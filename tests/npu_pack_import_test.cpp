@@ -2879,6 +2879,41 @@ void test_fconst_eps(const std::string& root) {    const fs::path dir = fs::path
                   std::to_string(g.h1) + ", period " + std::to_string(g.period));
         check(g.blocks == blocks * 2 + 1,
               "fconst eps: " + label + " found every header including the tail (" + std::to_string(g.blocks) + ")");
+
+    // engine#1819 review: the case this PR exists for -- a 1.9 header that STATES the stride while the eps vote cannot
+    // clear its 66 % bar -- had no arm, so reverting the header-first call order left the suite green. Measured on
+    // Qwen2-7B 1.9 the right stride won only 52.6 % of lag-2 pairs, under the bar, and the pack was refused with "the
+    // epsilon headers do not repeat with a single period" while its own header carried the stride.
+    {
+        const int h_heads = 4, h_layers = 3;
+        const int64_t stride9 = int64_t(1) << 20;      // well above the locator's 1e6 floor and > the marker size
+        const std::vector<uint8_t> pat = pi::fconst19_header(h_heads);
+        // An eps-DENSE payload: bf16 1e-6 (86 35) followed by zeros, at an irregular period, so the vote has many
+        // candidate periods and cannot agree on one. That is the payload shape the issue describes, not a tidy one.
+        std::string bytes(size_t(int64_t(h_layers) * stride9), '\0');
+        for (size_t o = 512; o + 12 < bytes.size(); o += 512)
+            for (int k = 0; k < 12; k += 2) { bytes[o + size_t(k)] = char(0x86); bytes[o + size_t(k) + 1] = char(0x35); }
+        for (int L = 0; L < h_layers; ++L)
+            std::memcpy(&bytes[size_t(int64_t(L) * stride9)], pat.data(), pat.size());
+        const fs::path hd = fs::path(root) / "fconst19-header-vote";
+        fs::remove_all(hd);
+        fs::create_directories(hd);
+        const std::string hpath = (hd / "dd_metastate_Llm_Token_x.fconst").string();
+        put_file(hpath, bytes);
+
+        const pi::FconstGeom by_vote = pi::locate_fconst(hpath, 0x3586);
+        check(by_vote.stride == 0,
+              "fconst header: the eps vote CANNOT locate this payload (got stride " + std::to_string(by_vote.stride) +
+                  "), which is the condition the arm needs");
+        pi::Dims d;
+        d.hidden = 896; d.heads = h_heads; d.layers = h_layers; d.head_dim = 64; d.eps_bits = 0x3586;
+        const pi::FconstGeom g = pi::locate_fconst_with_header(hpath, hd.string(), d);
+        const int64_t expect8 = stride9 - int64_t(h_heads) * 4;   // 1.9 includes the header inside the block
+        check(g.stride == expect8,
+              "fconst header: the header's stride wins where the vote failed (" + std::to_string(g.stride) + " vs " +
+                  std::to_string(expect8) + ")");
+        check(g.why.empty(), "fconst header: and it is not reported as a disagreement (" + g.why + ")");
+    }
         const unsigned short other = bits == 0x3586 ? 0x3728 : 0x3586;
         const pi::FconstGeom w = pi::locate_fconst(path, other);
         check(w.stride == 0 && !w.why.empty(),

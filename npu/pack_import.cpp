@@ -491,6 +491,7 @@ const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hid
 // The header a 1.9 block carries: 00 00 7f ff once per head. Its length being the head count is what makes
 // it a test rather than a magic number. 0x00007fff is the big-endian reading of those four bytes; the bytes
 // are what is compared, because the little-endian reading of the same bytes is 0xff7f0000.
+}  // namespace (closed so the marker builder has external linkage: a test builds the fixture with it, engine#1819)
 std::vector<uint8_t> fconst19_header(int heads) {
     std::vector<uint8_t> h(size_t(heads) * 4, 0);
     for (int i = 0; i < heads; ++i) {
@@ -499,6 +500,7 @@ std::vector<uint8_t> fconst19_header(int heads) {
     }
     return h;
 }
+namespace {
 
 // True when `fc` is a 1.9 Token .fconst of this geometry: exactly `layers` headers, evenly spaced.
 // Fills the first header's offset and the block stride. False means the 1.8 form (or a shape this

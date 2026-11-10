@@ -49,6 +49,8 @@ using onebit::npu::logprobs_of;
 using onebit::npu::options_from_body;
 using onebit::npu::SampleParams;
 using onebit::npu::sample_token;
+using onebit::npu::argmax_token;
+using onebit::npu::token_bound;
 using onebit::npu::stop_holdback;
 
 int failures = 0;
@@ -1192,7 +1194,36 @@ void test_request_parsing() {
 
 }  // namespace
 
+// engine#2017: the logits row is `vocab_size` wide, which may exceed the tokenizer (Qwen3-0.6B: 151,936 for 151,669
+// ids; the shape below is the issue's, 32,032 for 32,016). Ids past the tokenizer are padding positions: every real
+// logit negative and the padding at exactly 0.0 is the row where an unbounded argmax picks one (engine#1182).
+void test_vocab_bound() {
+    const int V = 32016, W = 32032;
+    std::vector<float> row(size_t(W), 0.0f);
+    for (int v = 0; v < V; v++) row[size_t(v)] = -1.0f - float(v % 97) * 0.01f;
+    row[123] = -0.5f;  // the real best
+    check(argmax_token(row.data(), size_t(W)) >= V, "control: an unbounded argmax lands on a padding id");
+    check(argmax_token(row.data(), size_t(W), V) == 123, "the bounded argmax picks the best real id");
+    check(sample(row, SampleParams(), 1) >= V, "control: unbounded greedy sample lands on a padding id");
+    std::mt19937_64 rng(1);
+    check(sample_token(row, SampleParams(), rng, nullptr, V) == 123, "bounded greedy sample picks the best real id");
+    SampleParams hot;
+    hot.temperature = 1.0f;
+    bool all_real = true;
+    for (uint64_t s = 0; s < 200; s++) {
+        std::mt19937_64 r(s);
+        if (sample_token(row, hot, r, nullptr, V) >= V) all_real = false;
+    }
+    check(all_real, "a bounded draw at temperature 1 never draws a padding id");
+    std::vector<char> mask(size_t(W), 1);
+    std::mt19937_64 r2(2);
+    check(sample_token(row, SampleParams(), r2, &mask, V) == 123, "the bound holds with a mask that allows padding");
+    check(token_bound(size_t(W), 0) == size_t(W), "no tokenizer keeps the whole row");
+    check(token_bound(size_t(V), W) == size_t(V), "a tokenizer larger than the row does not widen it");
+}
+
 int main() {
+    test_vocab_bound();
     test_sampler();
     test_sampler_distribution();
     test_stop();

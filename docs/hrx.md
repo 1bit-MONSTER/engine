@@ -330,6 +330,31 @@ The projector's own graph still runs 103 of 626 nodes on the CPU for an image of
 the attention score matmul and softmax, `IM2COL`, `UPSCALE`); with it offloaded, encoding the image is no
 faster than with `--no-mmproj-offload` (0.5 to 1.1 s against 0.4 to 0.6 s).
 
+### Fixed: prefill attention lost its rate at long context ([engine#1989](https://github.com/1bit-MONSTER/engine/issues/1989))
+
+The cost of prefill attention per key was measured at 0.0331 ms per KV token per 512-token graph on Qwen3-4B
+(over 0 to 7.7k keys) and 0.0522 over 0 to 24k. Timed alone on `HRX0`, the attention dispatch costs what its
+arithmetic costs up to about 8,192 keys; beyond that, and at particular key counts, it fell into a slower regime.
+The cause was not in the attention kernel's arithmetic. From 256 query tokens the dispatch copies V into a
+transposed buffer and walks it across channels, and two things about that step were slow at long key counts:
+
+- the buffer's rows were `2 x keys` bytes apart, which at key counts such as 16,384 and 32,768 puts every channel
+  of a key block on the same cache sets. A key count that is a multiple of 64 now gets a pitch of `keys + 32`;
+- one launch over 512 query tokens was slower per token than two over 256. From 4,096 keys the dispatch now runs
+  256-token launches over the one transposed buffer.
+
+The pitch is derived inside the attention kernel from its key count, so a new key count compiles no new kernel
+(llama.cpp #289 and #291; #289 alone made it a compile parameter and must not be pinned without #291).
+
+Measured at pin `2293f95ea` on gfx1151 (2026-11-10, power mode `performance`, Qwen3-4B Q4_K_M,
+`llama-bench -p 24576 -n 0 -b 512 -ub 512 -r 3`, old layout through `GGML_HRX_FA_VALUE_PITCH=0
+GGML_HRX_FA_QUERY_CHUNK=2048`, alternated): warm repetitions 813 to 822 tok/s before, 980 to 1,074 after;
+first, cold repetitions 701 to 711 before, 856 to 866 after. At 8,192 tokens 1,545 and 1,600 before, 1,766 and
+1,768 after; 2,048 and 512 tokens do not move. A cold run on a 9,230-token prompt takes the same time with either
+layout (8.80 s and 8.85 s) and gives the same text. `test-hrx-fa-transposed-value` compares the path with the CPU
+backend (8 cases). Why 256-token launches are faster than one 512-token launch at long key counts is measured,
+not explained.
+
 ### MoE decode and the kernel cache (llama.cpp #32, #33)
 
 - **MoE decode.** With one to four tokens, a `MUL_MAT_ID` (a MoE expert matmul) runs as a GEMV over

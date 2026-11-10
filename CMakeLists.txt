@@ -1271,6 +1271,16 @@ add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src
                                   npu/forward/src/q4nx_pack_blocked.cpp)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
+# engine#1779 fault 4 ("Gemma 4 tool-call parsing"): the answer parser is header-only (app/npu_answer_parser.h), so
+# this is a PURE unit test - no server, no model, no device - of the contract that header states: a template's own
+# <tool_call>{"name":...,"arguments":{...}}</tool_call> becomes a structured call with the arguments re-dumped as JSON
+# text; a call-only reply reports content_null; WITHOUT tools declared the marker stays text in content; and a
+# malformed call body is never dropped. The issue asked for name, arguments and a non-tool reply that must not be
+# parsed as one; the last two arms are the loss-proofing the header promises at :193 and :216-221.
+add_executable(npu_answer_parser_test tests/npu_answer_parser_test.cpp)
+target_include_directories(npu_answer_parser_test PRIVATE app)
+target_link_libraries(npu_answer_parser_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_answer_parser COMMAND npu_answer_parser_test)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
 # The plan's `designs` section against the engine's own derivation (engine#803 A2a): the generator and
 # q4nx_derive_designs() must state the same kernels, because a section that disagreed would be refused at

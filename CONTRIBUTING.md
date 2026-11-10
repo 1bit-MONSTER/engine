@@ -83,9 +83,12 @@ an RFC or issue.
   `onebit_npu_forward_syntax` is, and `tools/ci/ci_targets_check.py --check` keeps the count from growing. A
   `tests/*.sh` script has to be named by a row — or listed with a reason in `tools/ci/unreferenced_tests.txt` if it is
   not a row (`anchor_rerun.sh`, an operator measurement that always exits 0) — and `tools/ci/tests_referenced_check.py
-  --check` fails on one that is referenced by nothing. A row that runs Python goes through `add_python_test()`, which
-  hands the script to the interpreter instead of relying on the file's exec bit; `tests/python_test_order_check.py
-  --check` enforces that it follows `find_package(Python3)`. Two rows may not share a name: CMake stops at configure with
+  --check` fails on one that is referenced by nothing. A row that runs Python names the interpreter
+  explicitly (`add_test(NAME x COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/x_test.py)`) rather than relying on the
+  file's exec bit; `tests/python_test_order_check.py --check` enforces that every `${Python3_EXECUTABLE}` use follows
+  `find_package(Python3)`, and `tools/ci/python_test_referenced_check.py --check` fails when a `tests/*_test.py` has no row
+  and no recorded reason (`tools/ci/unreferenced_python_tests.txt`) — the third file kind after #1824's `tests/*.sh` and
+  #1911's `tools/*.py`. Two rows may not share a name: CMake stops at configure with
   `add_test given test NAME "…" which already exists in this directory`.
 - **A new test's registration goes in its own file.** Put the `add_test(...)` (or `add_python_test(...)`) row, its
   comment, and its `set_tests_properties` in a new `cmake/tests-<name>.cmake` with the Apache notice, and do not touch

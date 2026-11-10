@@ -871,6 +871,26 @@ if(Python3_Interpreter_FOUND)
     # payloads under tests/fixtures/fflm/ — engine #588), so a regression cannot leave the
     # daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+    # engine#2018: eight tests/*_test.py were on main with no ctest row at all, so nothing ran them -- #1824's
+    # sweep covers tests/*.sh and #1911's covers tools/*.py with --self-test, and the third file kind had no rule.
+    # Each of these passes when run by hand (2026-11-10, rc=0); the audit that keeps the set from growing is
+    # tools/ci/python_test_referenced_check.py. A row that runs Python names the interpreter rather than relying on
+    # the file's exec bit, and must sit after find_package(Python3) (tests/python_test_order_check.py).
+    add_test(NAME check_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/check_pins_test.py)
+    add_test(NAME gguf_to_q4nx COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gguf_to_q4nx_test.py)
+    add_test(NAME hrx_long_prompt COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hrx_long_prompt_test.py)
+    add_test(NAME hyperloom_benchmark COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
+    add_test(NAME moe_expert_chunks_accum COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/moe_expert_chunks_accum_test.py)
+    add_test(NAME mtp_draft_vocab COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mtp_draft_vocab_test.py)
+    add_test(NAME repack_verify_source COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/repack_verify_source_test.py)
+    add_test(NAME ternary_to_q4_0 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ternary_to_q4_0_test.py)
+    # engine#2018: the audit that keeps the eight rows above from being the last ones added. Fails when a
+    # tests/*_test.py is named by no row and excused by nothing, and when an excuse outlives the row it excused.
+    add_test(NAME python_tests_referenced
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/python_test_referenced_check.py --check)
+    add_test(NAME python_tests_referenced_self
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/python_test_referenced_check.py --self-test)
+
     # an installed package must find its libraries beside itself: the 2026-11-08 incident's rule, from
     # the installed side that no release gate can reach (engine #1411). Skips without patchelf/readelf.
     add_test(NAME installed_rpath COMMAND bash ${CMAKE_SOURCE_DIR}/tests/installed_rpath_test.sh)

@@ -2956,6 +2956,80 @@ void test_embedding_f32_component(const std::string& root) {
     fs::remove_all(b);
 }
 
+// engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
+// a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
+// which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
+// the emptiness. No weights are read and no device is opened: the header is 26,496 B on the smallest real pack.
+void test_q4nx_container(const std::string& root) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(root) / "q4nx-container";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+
+    const auto write_container = [&](const std::string& name, const std::string& header_json, int64_t payload,
+                                     bool truncate_header) {
+        const fs::path p = dir / name;
+        std::string out(8, '\0');
+        int64_t n = int64_t(header_json.size());
+        for (int i = 0; i < 8; ++i) out[size_t(i)] = char((n >> (8 * i)) & 0xFF);
+        out += truncate_header ? header_json.substr(0, header_json.size() / 2) : header_json;
+        out.append(size_t(payload), '\x22');
+        std::ofstream f(p, std::ios::binary);
+        f.write(out.data(), std::streamsize(out.size()));
+        return p.string();
+    };
+
+    // (a) the real shape: one BF16 vector and one packed I8 matrix, with the payload the offsets imply.
+    {
+        const std::string hdr =
+            R"({"model.layers.0.input_layernorm.weight":{"dtype":"BF16","shape":[640],"data_offsets":[0,1280]},)"
+            R"("model.layers.0.mlp.down_proj.weight":{"dtype":"I8","shape":[640,1280],"data_offsets":[1280,820480]}})";
+        const auto c = pi::read_q4nx_container(write_container("two.q4nx", hdr, 820480, false));
+        check(!c.tensors.empty(), "q4nx container: a two-tensor header reads (" + c.why + ")");
+        check(c.tensors.size() == 2, "q4nx container: both tensors are reported");
+        check(c.header_bytes == int64_t(hdr.size()), "q4nx container: the 8-byte length is the header's own");
+        check(c.payload_bytes == 819200, "q4nx container: the payload is the sum of the data_offsets spans (got " +
+                                             std::to_string(c.payload_bytes) + ")");
+        bool saw_bf16 = false, saw_i8 = false;
+        for (const auto& t : c.tensors) {
+            if (t.dtype == "BF16" && t.shape.size() == 1 && t.shape[0] == 640) saw_bf16 = true;
+            // The packed matrix: I8 with TWICE the logical element count of a 640-wide FFN is the NPU2 shape.
+            if (t.dtype == "I8" && t.shape.size() == 2 && t.shape[0] == 640 && t.shape[1] == 1280) saw_i8 = true;
+        }
+        check(saw_bf16 && saw_i8, "q4nx container: dtype and shape survive for a vector and a packed matrix");
+    }
+
+    // (b) `__metadata__` is a string map, not a tensor, and the vendor's converter does not always write one.
+    {
+        const std::string hdr =
+            R"({"__metadata__":{"group_size":"32"},"t":{"dtype":"I8","shape":[32,256],"data_offsets":[0,5120]}})";
+        const auto c = pi::read_q4nx_container(write_container("meta.q4nx", hdr, 5120, false));
+        check(c.tensors.size() == 1 && c.tensors[0].name == "t",
+              "q4nx container: __metadata__ is skipped, not counted as a tensor");
+    }
+
+    // (c) a truncated header is named, and reports no tensors rather than a partial inventory.
+    {
+        const std::string hdr = R"({"a":{"dtype":"I8","shape":[32,256],"data_offsets":[0,5120]}})";
+        const auto c = pi::read_q4nx_container(write_container("short.q4nx", hdr, 5120, true));
+        check(c.tensors.empty() && !c.why.empty(),
+              "q4nx container: a truncated header names the problem instead of reporting no tensors (" + c.why + ")");
+    }
+
+    // (d) an implausible length is refused by the number, so a mis-typed length cannot make the caller allocate it.
+    {
+        const fs::path p = dir / "huge.q4nx";
+        std::string out(8, '\0');
+        const int64_t n = int64_t(1) << 40;
+        for (int i = 0; i < 8; ++i) out[size_t(i)] = char((n >> (8 * i)) & 0xFF);
+        std::ofstream f(p, std::ios::binary);
+        f.write(out.data(), std::streamsize(out.size()));
+        const auto c = pi::read_q4nx_container(p.string());
+        check(c.tensors.empty() && c.why.find("implausible") != std::string::npos,
+              "q4nx container: an implausible header length is refused by the number (" + c.why + ")");
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2987,6 +3061,7 @@ int main(int argc, char** argv) {
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
+        test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();

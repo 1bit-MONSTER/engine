@@ -167,6 +167,29 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden);
 // multi-component one (`type: compositemodel`), whose geometry files stay at the root. Exported for the unit test.
 std::string find_token_fconst_exported(const std::string& pack_dir);
 
+// A FastFlowLM NPU2 model source (engine#1786, item F1) is a safetensors container named `model.q4nx`: an 8-byte
+// little-endian header length, that many bytes of JSON mapping tensor name -> {dtype, shape, data_offsets}, then the
+// payload. There is no graph and no `model.onnx`, which is why the importer above refuses such a pack before reading a
+// byte of it. The tensor NAMES are the model's own HF names, so this reader is also the work list: what it reports is
+// what a container-genre plan has to map.
+//
+// Header only: no weights are read, no device is opened. Exported because it is the half that can be wrong silently
+// (an off-by-one header length reports an empty inventory and looks like "a pack with no tensors").
+struct Q4nxTensor {
+    std::string name;
+    std::string dtype;
+    std::vector<int64_t> shape;
+    int64_t begin = 0;      // data_offsets[0]
+    int64_t end = 0;        // data_offsets[1]
+};
+struct Q4nxContainer {
+    int64_t header_bytes = 0;
+    int64_t payload_bytes = 0;
+    std::vector<Q4nxTensor> tensors;   // in header order
+    std::string why;                        // non-empty when the container could not be read; tensors is then empty
+};
+Q4nxContainer read_q4nx_container(const std::string& path);
+
 // Reads the pack (model.onnx, its external data, both .fconst headers, config.json).
 // Throws only when the pack is structurally unreadable.
 Plan plan(const std::string& pack_dir);

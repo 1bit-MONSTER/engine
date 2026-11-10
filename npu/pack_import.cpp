@@ -449,6 +449,16 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // all 32 blocks. This is the largest family on #1503 (31 packs). Measured by another lane on main, whose
     // table is keyed on geometry; merged here in the same form.
     {4096, 32, 32, 12608, 5, 1, 2297856},
+    // Qwen3-8B at hidden 4,096 / 32 heads / **36 layers**: measured with tools/fconst19_measure.py against
+    // amd/Qwen3-8B_rai_1.8.0_npu_16K, 26,104 of 3,756,627,264 bytes differ (6.95e-06 of the file, which the tool prints
+    // as 6.95e-04 %) -- content, not layout, and the largest residual in this table, so it is stated rather than
+    // rounded away. Every other field is IDENTICAL to the 32-layer row above (prefix 12,608, five tiles of 2,297,856,
+    // rotation 1): at this hidden size the layer count moves nothing but the number of blocks, which is the first row
+    // here where that is true -- the h2048 pair above moves both the prefix and the division with the layer count
+    // (4,160/9 tiles at 36 layers against 8,512/3 tiles at 24), so this row is measured, not inferred from that one.
+    // Without it the importer refuses the pack by design ("its block shape has not been measured for hidden 4096, 32
+    // heads, 36 layers"), which is what it did until now: kernel family and fconst rule row are not the same partition.
+    {4096, 32, 36, 12608, 5, 1, 2297856},
     // Llama-3.2-3B (and -Instruct, same geometry) at hidden 3,072 / 24 heads / 28 layers: measured with
     // tools/fconst19_measure.py against amd/Llama-3.2-3B_rai_1.8.0_npu_4K, 1,090 of 1,756,930,368 bytes differ
     // (6.20e-07 of the file, which the tool prints as 6.20e-05 %) -- content, not layout. The prefix is the Qwen3 line's 64 + 2*hidden + 4,352 = 10,560 at this hidden

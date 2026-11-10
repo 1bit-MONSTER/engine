@@ -20,6 +20,7 @@
 //
 // docs/npu-p4-target-split.md records what moved in A1 and what A2 (plan-driven setup) still owes.
 #include "target/xdna/xdna_target.h"
+#include "plan/prefill_launch_plan.h"
 
 #include <algorithm>
 #include <chrono>
@@ -351,6 +352,10 @@ I8Ctx* XdnaTarget::ctx_for(I8Ctx* prefill, int rows, bool decode_twin) {
     // decode_twin forces the narrow kernel even for a wide launch: the pb16i prefill path uses it for a
     // projection that has no M=128 kernel at all.
     if (!m16_) return prefill;
+    // engine#1959: the 17..96-row band is where this decision costs 3.26x -- `plan_prefill_launches()` says those rows should
+    // be `ceil(rows/16)` M=16 launches (measured: 2147 ms vs 6992 ms at 17 rows). The launch path does not split yet, so the
+    // wide kernel still runs here; the plan is consulted so the threshold and its measurement live in one place.
+    if (!decode_twin && npu::plan::plan_prefill_launches(rows, m16_).wide_launches) return prefill;
     if (!decode_twin && (rows < 1 || rows > 16)) return prefill;
     for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++)
         if (ctx_[i].get() == prefill && ctx16_[i]) return ctx16_[i].get();
@@ -1177,3 +1182,4 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
 }
 
 }  // namespace npu::target::xdna
+

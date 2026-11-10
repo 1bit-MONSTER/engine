@@ -1108,6 +1108,11 @@ target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
 add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4nx)
 # engine#1503 W4: the vision tower's position embedding -- bilinear with align_corners, then the merge-block reorder.
 # Listed explicitly like npu_pack_test above so the test needs no NPU library to build.
+# engine#1959: the prefill launch decision is a pure function, so its crossover is pinned without a device.
+add_executable(prefill_launch_plan_test tests/prefill_launch_plan_test.cpp)
+target_include_directories(prefill_launch_plan_test PRIVATE npu)
+add_test(NAME prefill_launch_plan COMMAND prefill_launch_plan_test)
+add_dependencies(onebit prefill_launch_plan_test)
 add_executable(q4nx_vision_pos_test tests/q4nx_vision_pos_test.cpp npu/forward/src/q4nx_vision_pos.cpp)
 add_executable(q4nx_vision_rope_test tests/q4nx_vision_rope_test.cpp npu/forward/src/q4nx_vision_rope.cpp)
 add_executable(q4nx_vision_block_test tests/q4nx_vision_block_test.cpp npu/forward/src/q4nx_vision_block.cpp npu/forward/src/q4nx_vision_pos.cpp npu/forward/src/q4nx_vision_rope.cpp)

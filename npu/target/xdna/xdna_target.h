@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "target/target.h"
+#include "plan/prefill_launch_plan.h"
 #include "plan/plan.h"   // onebit::npu::plan::Plan (engine #799 P1)
 #include "q4nx_pack.h"       // Q4nxDesignGeom, Q4NX_MAX_DESIGNS
 #include "rt.h"          // xrt::device, xrt::bo

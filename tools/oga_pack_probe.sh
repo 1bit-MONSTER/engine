@@ -63,6 +63,29 @@ LOG=$OUT/serve.log
 
 [ -d "$PACK" ] || { echo "oga_pack_probe: no such pack dir: $PACK" >&2; exit 2; }
 
+# engine#1611 review: the `case` above guards `pack_base`, i.e. the name DERIVED from the pack, but OUT is operator-settable and this
+# script's own error text tells people to set it ("set OUT= or SCRATCH="). `rm -rf "$OUT"` runs before gate 1, so OUT=<the pack> -- or
+# any directory inside it, or a parent of it -- deletes the operator's model and replaces it with the probe's container, silently.
+# Containment in BOTH directions, and the OUT= affordance stays because the third check is what makes it safe:
+#   outward: OUT must not be the pack, inside the pack, or a parent of the pack;
+#   inward:  OUT must live under $SCRATCH, unless a caller explicitly opts out (OGAPROBE_ALLOW_ANY_OUT=1).
+real() { realpath -m -- "$1" 2>/dev/null || printf '%s' "$1"; }
+out_r=$(real "$OUT")
+pack_r=$(real "$PACK")
+scratch_r=$(real "$SCRATCH")
+case "$out_r/" in
+    "$pack_r"/*) echo "oga_pack_probe: refusing OUT='$OUT' -- it is the pack or inside it, and 'rm -rf \$OUT' runs before gate 1" >&2; exit 2;;
+esac
+case "$pack_r/" in
+    "$out_r"/*) echo "oga_pack_probe: refusing OUT='$OUT' -- it is a parent of the pack ($PACK), so \$OUT would be deleted" >&2; exit 2;;
+esac
+if [ "${OGAPROBE_ALLOW_ANY_OUT:-0}" != 1 ]; then
+    case "$out_r/" in
+        "$scratch_r"/*) ;;
+        *) echo "oga_pack_probe: refusing OUT='$OUT' -- it is outside the scratch root $SCRATCH (set OGAPROBE_ALLOW_ANY_OUT=1 to allow that deliberately)" >&2; exit 2;;
+    esac
+fi
+
 # Gate 2 touches the NPU, so this script is only correct inside a device ticket. The check is "is an ancestor of mine the pid
 # the token file names?", which is what npu-kernels#32 settled on after the GPU_TOKEN_FILE idea failed: the helpers are bash
 # scripts, so a running npu-hold's argv[0] is the INTERPRETER and its script path is argv[1] -- matching argv[0] (the first

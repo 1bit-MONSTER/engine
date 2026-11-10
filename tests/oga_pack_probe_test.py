@@ -138,6 +138,36 @@ r = subprocess.run(["bash", "-c", script, "x", gpu_tok, home, TMP + "/scratch", 
 check("GATE 2 WILL NOT RUN" in r.stderr, "a GPU token alone is NOT a ticket for the NPU gate")
 check("rc=3" in r.stdout, "so only gate 1 runs (rc=3), and no NPU work happens under a GPU ticket")
 
+# 7-9. engine#1611 review: OUT is operator-settable, and `rm -rf "$OUT"` runs before gate 1. Three shapes, each with the operator's
+# own file inside the directory that must survive.
+def out_case(name, out, want_rc=2, needle="refusing OUT="):
+    r = subprocess.run(["bash", TOOL, pack, "19954"], capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "BIN": STUB, "SCRATCH": TMP + "/scratch", "OUT": out,
+                            "TOKEN_FILES": TMP + "/no-such-token"})
+    ok = r.returncode == want_rc and needle in r.stderr
+    print(f"{'PASS' if ok else 'FAIL'}  {name} (rc={r.returncode}, stderr={r.stderr.strip()[:70]})")
+    return ok
+survivor = TMP + "/operator-dir"
+os.makedirs(survivor, exist_ok=True)
+with open(survivor + "/keep-me.txt", "w") as fh:
+    fh.write("the operator's data\n")
+checks = []
+checks.append(out_case("OUT = the pack itself is refused", pack))
+checks.append(out_case("OUT = a parent of the pack is refused", TMP))
+checks.append(out_case("OUT = a directory outside the scratch root is refused",
+                       os.path.dirname(survivor)))
+checks.append(out_case("OUT with the scratch root as a prefix but outside it is refused", TMP + "/scratchy"))
+for c in checks:
+    check(c, "one of the operator-OUT containment arms")
+check(os.path.exists(survivor + "/keep-me.txt"),
+      "the operator's file is still there: nothing was deleted before the refusal")
+# ...and the escape hatch is deliberate, not accidental: with the override, an OUT outside $SCRATCH is allowed (and the stub fails at
+# gate 2, i.e. the run proceeds rather than being refused).
+r = subprocess.run(["bash", TOOL, pack, "19953"], capture_output=True, text=True, timeout=120,
+                   env={**os.environ, "BIN": STUB, "SCRATCH": TMP + "/scratch", "OUT": TMP + "/allowed-out",
+                        "OGAPROBE_ALLOW_ANY_OUT": "1", "TOKEN_FILES": TMP + "/no-such-token"})
+check("refusing OUT=" not in r.stderr, "OGAPROBE_ALLOW_ANY_OUT=1 permits an OUT outside the scratch root")
+
 import shutil
 shutil.rmtree(TMP, ignore_errors=True)
 

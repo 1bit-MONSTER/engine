@@ -105,6 +105,27 @@ void block_forward(float* x, int tokens, int hidden, int heads, int head_dim, in
 void merger_forward(const float* x, int tokens, int hidden, int out_hidden, const float* ln_w, const float* ln_b,
                     const float* fc1_w, const float* fc1_b, const float* fc2_w, const float* fc2_b, float* out);
 
+// The whole tower: patch embed (a matmul, because the Conv3d kernel equals its stride) + position embedding + n_blocks of
+// block_forward() + merger_forward(). Tokens are in merge-block order throughout, which is the order the pack's pixel_values
+// arrive in and the order pos_embed() writes.
+struct VisionTowerWeights {
+    const float* conv_w;     // (hidden, patch_dim)
+    const float* conv_b;     // (hidden)
+    const float* pos_table;  // (48, 48, hidden)
+    const VisionBlockWeights* blocks;
+    int n_blocks;
+    const float* m_ln_w;
+    const float* m_ln_b;
+    const float* m_fc1_w;    // (4*hidden, 4*hidden)
+    const float* m_fc1_b;
+    const float* m_fc2_w;    // (out_hidden, 4*hidden)
+    const float* m_fc2_b;
+};
+
+// `patches` is (tokens, patch_dim); `out` is (tokens/4, out_hidden). gh*gw must equal tokens.
+void tower_forward(const float* patches, int tokens, int patch_dim, int gh, int gw, int hidden, int heads, int head_dim,
+                   int intermediate, int out_hidden, const VisionTowerWeights& w, const float* inv_freq, float* out);
+
 }  // namespace q4nx_vision
 
 #endif  // ONEBIT_NPU_VISION_H

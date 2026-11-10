@@ -125,3 +125,30 @@ void merger_forward(const float* x, int tokens, int hidden, int out_hidden, cons
 }
 
 }  // namespace q4nx_vision
+
+namespace q4nx_vision {
+
+void tower_forward(const float* patches, int tokens, int patch_dim, int gh, int gw, int hidden, int heads, int head_dim,
+                   int intermediate, int out_hidden, const VisionTowerWeights& w, const float* inv_freq, float* out) {
+    if (!patches || !out || !w.conv_w || !w.pos_table || !w.blocks || tokens <= 0 || hidden <= 0 ||
+        gh * gw != tokens || heads * head_dim != hidden) {
+        std::fprintf(stderr, "vision tower_forward: bad geometry tokens=%d gh=%d gw=%d h=%d heads=%d hd=%d\n", tokens, gh, gw,
+                     hidden, heads, head_dim);
+        return;
+    }
+    std::vector<float> x(size_t(tokens) * hidden);
+    matmul_t(patches, w.conv_w, w.conv_b, tokens, patch_dim, hidden, x.data());
+    std::vector<float> pe(size_t(tokens) * hidden);
+    pos_embed(w.pos_table, gh, gw, hidden, pe.data());
+    for (size_t i = 0; i < x.size(); ++i) x[i] += pe[i];
+
+    std::vector<int> ph(static_cast<size_t>(tokens)), pw(static_cast<size_t>(tokens));
+    for (int t = 0; t < tokens; ++t) block_position(t, gh, gw, &ph[size_t(t)], &pw[size_t(t)]);
+
+    for (int b = 0; b < w.n_blocks; ++b)
+        block_forward(x.data(), tokens, hidden, heads, head_dim, intermediate, w.blocks[b], inv_freq, ph.data(), pw.data());
+
+    merger_forward(x.data(), tokens, hidden, out_hidden, w.m_ln_w, w.m_ln_b, w.m_fc1_w, w.m_fc1_b, w.m_fc2_w, w.m_fc2_b, out);
+}
+
+}  // namespace q4nx_vision

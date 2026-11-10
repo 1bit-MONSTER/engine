@@ -81,10 +81,21 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
 > **Between about 21:0x and 23:1x on 2026-11-09 this job failed on every branch, and a red badge was not a signal** (engine #1733).
 > Three errors sat in `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as
 > `bool`, and two declarations that differ only in return type — on every branch measured (five of them), and #1681's pin bump
-> failed the same way at 9m15s while its `build` was green. The window is closed: later runs pass, including one whose pins are
-> **exactly `main`'s** (`bump-hrx/831629fe`, 00:21, `llama.cpp` `831629fe9` + `hrx-system` `7f4236924`), so the failure was not a
-> property of the pins in the tree — which is what the same pins failing four hours earlier had seemed to say. Read a red badge as
-> meaningful again; if it returns, that run's own log is the evidence, not the earlier window.
+> failed the same way at 9m15s while its `build` was green. **The window closed when the pin moved**, and the pins are what to
+> check first if it returns: every failing run in it pinned `llama.cpp` **`8f124f906`**, every passing run after it pinned
+> **`60ae4c935`** (the fork fix is llama.cpp#260 → `4e570337`, taken by engine#1736):
+>
+> ```
+> 21:24–21:52  five failures   ->  llama.cpp 8f124f906      (void at :383, bool at :517: the TU cannot compile)
+> 21:41, 21:42  success        ->  llama.cpp 60ae4c935
+> 22:04 onward  all success    ->  llama.cpp 60ae4c935
+> 00:21         success        ->  llama.cpp 831629fe9
+> ```
+>
+> So the red **was** a property of the pinned tree, and it was not mysterious: `8f124f906` declares `device_free_total` `void` at
+> `:383` (engine #252) and `bool` at `:517` (engine #240), which gcc rejects as a redeclaration before it ever reaches `:610`. A
+> red `hrx_build` names its own cause in the log, and the pin is one command away (`git ls-tree <sha> third_party/llama.cpp`).
+> Read a red badge as meaningful again.
 
 ## What it checks
 

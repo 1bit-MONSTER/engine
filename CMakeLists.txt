@@ -1328,8 +1328,12 @@ target_link_libraries(npu_derive_designs_dump PRIVATE m)
 # actually calls against the reference; the test links both. It is C++, so CMake switches this target's linker to CXX.
 # q4nx_head_image.c is the image cache's file format (engine#1716's cache slice, this branch): the identity arm above pins
 # what the image must contain, this one pins that what is written and read back is byte-identical to it.
+# q4nx_head_tile_cache.cpp is what a serve calls per head tile (load the image a previous serve wrote, or pack and write
+# it): the arms here are the cache's behaviour -- a second pass does not pack, a changed key does, a damaged or stale image
+# is replaced rather than used -- with a counter on the gather, so "rebuilt on every serve" cannot come back unnoticed.
 add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c
-                                  npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c)
+                                  npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c
+                                  npu/forward/src/q4nx_head_tile_cache.cpp)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 # engine#1779 fault 4 ("Gemma 4 tool-call parsing"): the answer parser is header-only (app/npu_answer_parser.h), so
@@ -1569,6 +1573,9 @@ endif()
         npu/forward/src/q4nx_pack.c
         # The production weight packer, extracted from I8Ctx so it can be tested without the device runtime (#1416).
         npu/forward/src/q4nx_pack_blocked.cpp
+        # The lm-head image cache (engine#1716): the file format, and the load-or-pack a serve calls per head tile.
+        npu/forward/src/q4nx_head_image.c
+        npu/forward/src/q4nx_head_tile_cache.cpp
         npu/forward/src/q4nx_semantics.c
         npu/forward/src/q4nx_forward.cpp
         # The NPU target interface and this box's target (engine#799 P4): the model keeps the maths, the

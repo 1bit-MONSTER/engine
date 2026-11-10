@@ -262,6 +262,34 @@ cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader tha
 device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
 the bf16 rounding reappears for the device, never in the container.
 
+**The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
+packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
+with its own scale — and until this cache that happened on every serve. The image is a function
+of the head's stored bytes and of the kernel set (`kpad`, the tile width `T`, the blocked or
+row-major layout), so the forward keeps it in `<Q4NX cache>/head-images/` as
+`headimg-<key digest>-t<tile>.q4hi`, one file per tile. The digest covers the format version,
+`kpad`, `T`, the layout, and a hash of the head tensor's bytes together with the vocabulary size,
+the width and the dtype it is decoded at, so another container, another kernel set or a re-import
+names different files.
+
+A cached tile is used only when both of these hold, otherwise it is packed as before and the file
+is replaced, with one stderr line saying why:
+
+- the file reads back whole: format version, geometry and the hash over its payload
+  (`q4nx_head_image_read`);
+- a sample of its columns (8 per tile, both ends and an even spread) packs to the same scale and
+  the same codes from the weights the forward holds at that moment, through the production packer
+  (`q4nx_pack_B_int8_blocked`). This is the check a payload hash cannot make: an intact image
+  written for other weights is caught here.
+
+The serve log line says what happened: `lm head: N packed weight tile(s) resident (…); H from the
+image cache, P packed (W written for the next serve) in S s`. `ONEBIT_HEAD_IMAGE_CACHE=0` turns
+the cache off (nothing is read or written). The files are `kd × nd` bytes plus `nd` scales per
+tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set; nothing prunes them,
+the same as the device-form copies next to them. Ternary (`pb16i`) heads and the gemv head do not
+use it: their image already is a file. The behaviour is pinned host-side in
+`tests/npu_design_grid_test.c` with a counter on the gather.
+
 **Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
 embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors
 (untied lm_head, projections) store it at `(r/16)*4096 + (k/32)*512 + (k%32)*16 + r%16`.

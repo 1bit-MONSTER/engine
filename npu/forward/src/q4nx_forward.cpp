@@ -37,6 +37,7 @@
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
@@ -48,6 +49,7 @@
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_semantics.h"
 #include "q4nx_pack.h"
+#include "q4nx_head_image.h"   // the lm-head tile cache (engine#1716)
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -5371,7 +5373,6 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     if (head_packed &&
         ((int)lm_head_packed_.size() != ntiles || lm_head_packed_T_ != T)) {
         lm_head_packed_.clear();
-        std::vector<float> bt(tile_elems);
         if (head_pb16i) {
             // The image is the file: no dequant, no pack, nothing to quantise on the host.  A
             // tile whose side table asks for the two-plane accumulator is refused, not guessed:
@@ -5398,20 +5399,76 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             fprintf(stderr, "  [forward] lm head: %d ternary image(s) resident (H=%d T=%d), "
                             "f32 head released\n", ntiles, H, T);
         } else {
+        // engine#1716: this loop used to gather and pack every tile on EVERY serve (10-17 s on a quiet box for the
+        // h4096 shapes, minutes on a contended one). The image is a pure function of the head's stored bytes and the
+        // kernel set's geometry, so a serve now asks q4nx_head_tile_image() for it: a previous serve's file is used
+        // when it reads back whole AND a sample of its columns re-packs to the same bytes from the weights held here;
+        // anything else packs exactly as before (same packer, same padded KD x ND image, same per-column scales as
+        // the per-token packB below) and leaves the file for the next serve. ONEBIT_HEAD_IMAGE_CACHE=0 turns it off.
+        const auto head_t0 = std::chrono::steady_clock::now();
+        std::string head_dir;
+        Q4nxHeadImageKey head_key = {(uint32_t)kpad_, (uint32_t)T, lctx.blocked_b ? 1u : 0u, 0};
+        {
+            const char* off = getenv("ONEBIT_HEAD_IMAGE_CACHE");
+            const bool cache_on = !(off && off[0] == '0' && off[1] == 0);
+            // The head's stored bytes: the separate lm_head.weight of an untied model, else the token table lm_at()
+            // falls back to (which a tied container may itself store as lm_head.weight).
+            TensorDesc* src = !lm_head_f_.empty() ? model_tensor_by_name(mw_, "lm_head.weight") : nullptr;
+            if (!src) {
+                src = &mw_->embed_tokens;
+                if (src->data_size == 0 || src->name[0] == '\0') src = model_tensor_by_name(mw_, "lm_head.weight");
+            }
+            const void* sp = (cache_on && src) ? model_tensor_data(mw_, src) : nullptr;
+            // An image the layout cannot hold as kd x nd bytes of T columns is not cached: it packs as before.
+            if (sp && src->data_size > 0 && (int)lctx.ND == T && (int)lctx.KD >= kpad_) {
+                // What changes the decoded head without changing its bytes: the vocabulary, the width it is read at,
+                // whether it is the tied table, and the dtype the decoder dispatches on.
+                uint32_t extra[8] = {(uint32_t)NV, (uint32_t)H, (uint32_t)lm_w_, lm_head_f_.empty() ? 1u : 0u, 0, 0, 0, 0};
+                std::memcpy(&extra[4], src->dtype, std::min(sizeof src->dtype, (size_t)16));
+                head_key.head_hash = q4nx_head_source_hash(sp, (size_t)src->data_size, extra, 8);
+                try {
+                    head_dir = onebit::npu::q4nx::cache_root() + "/head-images";
+                    std::error_code ec;
+                    std::filesystem::create_directories(head_dir, ec);
+                    if (ec) head_dir.clear();
+                } catch (const std::exception&) {
+                    head_dir.clear();   // no home and no ONEBIT_Q4NX_CACHE: pack, as before
+                }
+            }
+        }
+        struct HeadCol {
+            const Q4nxNpuForward* self;
+            int k;
+        } head_col = {this, kpad_};
+        const Q4nxHeadColFn head_col_fn = [](void* ctx, int n, float* out) {
+            const HeadCol* c = (const HeadCol*)ctx;
+            for (int k = 0; k < c->k; k++) out[k] = c->self->lm_at(n, k);
+        };
+        int head_hits = 0, head_wrote = 0;
         for (int t = 0; t < ntiles; t++) {
             const int n0 = t * T, n1 = std::min(NV, n0 + T);
-            std::fill(bt.begin(), bt.end(), 0.0f);   // padded columns must be zero
-            for (int n = n0; n < n1; n++)
-                for (int k = 0; k < kpad_; k++) bt[(size_t)k * T + (n - n0)] = lm_at(n, k);
             PackedWeight pw;
             pw.bo = lctx.make_weight_bo(*dev_);
-            float sout = 1.0f;
-            // Same packer, same padded KD x ND BO, same per-column scales as the
-            // per-token packB below, so the packed bytes are bit-identical.
-            lctx.packB_into(*pw.bo, bt.data(), kpad_, T, sout, pw.scales);
+            pw.scales.assign((size_t)lctx.ND > (size_t)T ? (size_t)lctx.ND : (size_t)T, 0.0f);
+            Q4nxHeadTileResult hres;
+            bool ok = false;
+            lctx.fill_weight_bo(*pw.bo, [&](int8_t* Bm) {
+                ok = q4nx_head_tile_image(head_dir.empty() ? nullptr : head_dir.c_str(), &head_key, t, n0, n1 - n0, kpad_,
+                                          T, lctx.KD, lctx.ND, head_col_fn, &head_col, Bm, pw.scales.data(), &hres) == 1;
+            });
+            if (!ok) {
+                err_ = std::string("lm head: ") + hres.why;
+                return false;
+            }
+            if (hres.refused)
+                fprintf(stderr, "  [forward] lm head: tile %d's cached image was NOT used and is replaced: %s\n", t, hres.why);
+            head_hits += hres.hit;
+            head_wrote += hres.wrote;
+            pw.scales.resize((size_t)T);
             lm_head_packed_.push_back(std::move(pw));
         }
         lm_head_packed_T_ = T;
+        const double head_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count();
         // Both f32 copies are now dead on this path: lm_head_tiles_ was only ever
         // read by the memcpy below, and lm_at() is reachable only from the
         // host_gemm_ branch (which returns above) and from the gather just done.
@@ -5420,8 +5477,9 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         lm_head_f_.clear();
         lm_head_f_.shrink_to_fit();
         fprintf(stderr, "  [forward] lm head: %d packed weight tile(s) resident "
-                        "(H=%d T=%d), f32 head + f32 tile gather released\n",
-                ntiles, H, T);
+                        "(H=%d T=%d), f32 head + f32 tile gather released; %d from the image cache, %d packed "
+                        "(%d written for the next serve) in %.2f s\n",
+                ntiles, H, T, head_hits, ntiles - head_hits, head_wrote, head_s);
         }
     }
     std::vector<float> Bt;

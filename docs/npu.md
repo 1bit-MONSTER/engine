@@ -262,6 +262,16 @@ cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader tha
 device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
 the bf16 rounding reappears for the device, never in the container.
 
+**The cache is bounded, and the bound is least-recently-used (engine#1956).** After writing an
+entry, `1bit serve` removes the least-recently-used entries until the cache is within
+`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The entry
+just written and any entry used in the last ten minutes are never removed. "Used" means reused,
+not only written: a cache hit — a repacked GGUF found in the cache, or a device-form conversion
+reused at load — marks the entry's directory as used now, so a container imported once and served
+every day outlives a one-off imported yesterday. The value is read as a whole number of GiB: a
+number too large to be a byte count is the largest bound that is one (it does not wrap to a small
+one), and a value that is not a number gets the default rather than an unbounded cache.
+
 **The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
 packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
 with its own scale — and until this cache that happened on every serve. The image is a function
@@ -507,6 +517,23 @@ that is not `tiles x 2,176` bytes is refused by name (never read as a pb16i imag
 checks keep the contract honest without a device: `tests/npu_t2s_layout_test.cpp` pins the tile
 against the numbers the tool measured on a real image (gate/up: 50,135,040 B of pb16i → 23,674,880 B
 of stream), and `tests/q4nx_t2s_test.py` pins the code order byte for byte.
+
+**That single rounding costs one multiply per element, not one `ldexp()` (#1990).** A launch's result is
+`float32(S * 2^e_ref) * ascale` for every element, and `2^e_ref` depends only on the column. It was computed
+with a libm `ldexp()` call per element, after readback, where no launch phase column counted it: a 16-row
+prefill block on `bonsai2-27b-t2s2` is 416 launches of up to 16 x 17,408 elements, and that call was the
+block's largest host term. `q4nx_pb16i::dequant_rows()` computes the power once per column and multiplies.
+The value is the same, not close: a double times a normal power of two is exact while the product is a
+normal double, which holds for every exponent from -1022 to 960, and any column outside that range takes
+the per-element form as before. Measured in one `npu-hold` ticket, one binary, `NPU_DEQ_LDEXP=1` (the old
+form) against the default, 103 blocks per arm: the dequant term **137.4 -> 32.3 ms per block**, the block
+median **630.4 -> 515.0 ms** (25.4 -> 31.1 rows/s), and three 510-536-token prompts reached their first
+token at 24.4-25.1 tok/s before and **29.8-30.6 tok/s** after. That is the first pair of arms; the box
+slowed for both forms in the second pair (the old form measured 357 ms of dequant per block there), so the
+second pair is not quoted as a speedup. `NPU_DEQ_LDEXP=2` runs both forms and counts differing elements:
+0 of 568,483,840 on the device, and the greedy text is identical in all five arms.
+`tests/npu_pb16i_layout_test.cpp` holds the two forms to the same bits for one and two planes, the edges
+of the exponent range and exponents outside it. The `[bl]` line names the term as `deq`.
 
 **A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
 a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
@@ -1019,6 +1046,26 @@ Two facts about what the container holds, both reported, not hidden:
   `lm_head` and q/k/v/o are stored as 4 column tiles with the last one zero-padded (codes 0,
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's
   manifest and in `config.json`, and nothing reads a padding column as a weight.
+
+### Where a 1.9 pack's rewritten `.fconst` goes
+
+A Ryzen AI 1.9 pack's Token `.fconst` is rewritten into its 1.8 form before it is read. The copy is as large as the source
+(3.6 GB for an h4096 pack), so where it lands matters: on strixhalo `/tmp` is tmpfs, which means RAM. The importer tries these
+directories in order:
+
+1. `$ONEBIT_FCONST_SCRATCH`, if set;
+2. `$XDG_CACHE_HOME/1bit/fconst19`, or `~/.cache/1bit/fconst19` (on disk);
+3. `$TMPDIR`, then `/tmp`, then the current directory.
+
+The copy is a cache: it is reused while the source's size and mtime and the rules version match. On each write the importer
+sweeps the scratch directories. It removes other identities of the same pack and geometry, the pre-version name, and any
+`1bit-fconst19*` copy nobody has written for 6 hours. Without an override, **every** candidate directory is swept, not only the
+one being written, so copies older binaries left in `/tmp` get reclaimed (engine#1907). With `ONEBIT_FCONST_SCRATCH` set, only
+that directory is swept, and a run with an override never removes another lane's files. The current directory is the
+one candidate that is never swept unless the copy is being written there: it is only the last write fallback, and a
+working directory's files are not the importer's to clean. The 6 hours are what keep a concurrent run's copy alive in a
+shared directory, so the number stays above the longest import; it is not the knob for disk or tmpfs pressure. The test suite sets one per run and
+removes it at exit.
 
 ### Linking the kernel set the container will be served with
 
@@ -2037,6 +2084,34 @@ reaps or signals the holder -- killing another lane's live serve is the box-cras
 `tools/showcase-612-npu-streams.sh` measures with `MODEL` and `MODEL_B` (default Qwen3-0.6B and
 Qwen3-4B, whose kernel sets are on this box): each model solo, then both at once, three reps, every
 number stamped with the build that produced it.
+
+### Finding where a forward diverges: `NPU_INFER_DUMP_DIR` and `NPU_INFER_DUMP_OPS`
+
+Two diagnostic switches of the NPU forward. Both are off by default, neither changes a result, and neither
+can fail a run.
+
+| variable | what it writes | answers |
+|---|---|---|
+| `NPU_INFER_DUMP_DIR=<dir>` | `<dir>/layer_<ll>.f32` per layer: the residual stream after that layer, M x H little-endian f32, row-major. The directory must exist; a file that cannot be written is reported on stderr and the run goes on. | which **layer** two runs part at (per-layer cosine against a reference trace) |
+| `NPU_INFER_DUMP_OPS=1` | one stderr line per projection and per weighted RMSNorm: `[op] L<layer> <tag> rows=<M> \|x\| mean <m> absmax <a>` | which **op** inside the layer |
+
+`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process.
+
+```
+  [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935
+  [op] L00 ffn_gate_up  rows=1 |x| mean 0.0258482 absmax 1.25728
+  [op] L00 ffn_down     rows=1 |x| mean 0.00315921 absmax 0.673885
+```
+
+- The tag is the one the projection's call site already passes (`attn_qkv`, `attn_output`, `ffn_gate_up`,
+  `ffn_down`, `ssm_out`, ...). Layer norms are `rmsnorm`; on a family with per-head q/k norms those print as
+  `q_norm` and `k_norm`, one line per head.
+- The numbers are over row 0 of the result (its first N values). A batched projection prints one line with
+  `rows=M`; a norm is called per row, so a batched pass prints one norm line per row.
+- A NaN or Inf is counted (`nonfinite 2/4096` at the end of the line) and left out of the mean and the maximum.
+- The same lines come out on the host arms (`NPU_INFER_HOST_GEMM=1` or `=i8`) and on the device arm, in the same
+  order and number, so the two logs of one prompt can be compared with `diff`. Start there: the first line whose
+  numbers differ names the op.
 
 ### When a load follows an evict
 

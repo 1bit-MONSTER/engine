@@ -1080,8 +1080,13 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
         const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         kctx.readback();
         const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        out.assign((size_t)M * (size_t)N, 0.0f);
-        kctx.dequant_pb16i(out.data(), M, N, ascales.data(), slot->eref, kctx.pb16i_planes);
+        {
+            // `out` is already M x N (sized before the refusal paths above) and every element is written here, so it
+            // is not zero-filled a second time. Timed on its own: this runs after `tr`, so no launch phase column
+            // ever counted it, and the batched [lh] table had it under UNATTRIBUTED (engine#1990).
+            q4nx_lh::LhScope _t_deq(LH_DEQ_OUT);
+            kctx.dequant_pb16i(out.data(), M, N, ascales.data(), slot->eref, kctx.pb16i_planes);
+        }
         // The batched (prefill) twin of the trace above: a short prompt runs step_batch, so this
         // is the path a 1-token request actually takes.
         if (const char* tl = getenv("NPU_PB16I_TRACE")) {

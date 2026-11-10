@@ -208,6 +208,40 @@ void test_production_packer() {
     std::printf("  production packer: %zu codes, %d scales, blocked == bpos(rowmajor)\n", (size_t)K * N, N);
 }
 
+// engine#1994: the integer host arm packs UNPADDED images (KD == K, ND == N) into K*N bytes. blocked_index() addresses
+// whole 64x128 tiles, so a geometry that is not whole tiles has to be packed and read row-major, or both the packer and
+// the MAC walk past the buffer. This pins the rule the arm uses -- blocked = blocked_fits(K, N), read through
+// image_index() -- on the shapes that broke it, with guard bytes after the image to catch a write past K*N.
+void test_unpadded_image(int K, int N, bool expect_blocked) {
+    const bool blocked = q4nx_layout::blocked_fits(K, N);
+    check(blocked == expect_blocked, "unpadded image: blocked only when K x N is whole tiles", K, N);
+    std::vector<float> w((size_t)K * N);
+    for (size_t i = 0; i < w.size(); ++i) w[i] = float((i * 2654435761u) % 2000) * 1e-3f - 1.0f;
+    const size_t guard = size_t(1) << 18, img = (size_t)K * N;
+    std::vector<int8_t> buf(img + guard, int8_t(0x5A)), rowmaj(img);
+    std::vector<float> sc((size_t)N), sc_ref((size_t)N);
+    q4nx_pack_B_int8(w.data(), K, N, rowmaj.data(), N, sc_ref.data());
+    double ssum = 0;
+    const int rc = q4nx_pack_B_int8_blocked(buf.data(), w.data(), K, N, K, N, blocked ? 1 : 0, sc.data(), &ssum);
+    bool guard_ok = true;
+    for (size_t g = img; g < img + guard; ++g) guard_ok &= buf[g] == int8_t(0x5A);
+    size_t past = 0, mismatched = 0, forced_max = 0;
+    for (int i = 0; i < K; ++i)
+        for (int j = 0; j < N; ++j) {
+            const size_t at = q4nx_layout::image_index((size_t)i, (size_t)j, K, N, blocked);
+            if (at >= img) past++;
+            else if (buf[at] != rowmaj[(size_t)i * N + (size_t)j]) mismatched++;
+            forced_max = std::max(forced_max, q4nx_layout::blocked_index((size_t)i, (size_t)j, K, N));
+        }
+    check(rc == 0 && guard_ok, "unpadded image: the packer writes nothing past K*N", K, N);
+    check(past == 0 && mismatched == 0, "unpadded image: every code reads back at image_index, inside K*N", K, N);
+    // The mechanism, so the arm above cannot pass for the wrong reason: on an unaligned shape the blocked index the
+    // arm used to force really does leave the buffer.
+    if (!expect_blocked) check(forced_max >= img, "unpadded image: forced blocked_index would run past K*N", K, N);
+    std::printf("  unpadded %dx%d: %s, forced blocked reaches %zu of %zu B\n", K, N, blocked ? "blocked" : "row-major",
+                forced_max + 1, img);
+}
+
 int main() {
     for (Geom g : kGeoms) {
         test_bijection(g);
@@ -218,6 +252,10 @@ int main() {
     test_production_packer();
     test_row_major_unchanged();
     test_pack_geometries();
+    test_unpadded_image(3072, 7488, false);   // phi-3-mini's last vocabulary block (32064 % 8192)
+    test_unpadded_image(2048, 8512, false);   // a body width of 66.5 tiles
+    test_unpadded_image(100, 128, false);     // K not a whole number of 64-row tiles
+    test_unpadded_image(4096, 2688, true);    // the measured head block (150144 % 8192 = 21 tiles): stays blocked
     if (failures) {
         std::printf("npu_blocked_layout_test: %d failure(s)\n", failures);
         return 1;

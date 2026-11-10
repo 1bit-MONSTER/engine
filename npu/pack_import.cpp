@@ -412,6 +412,23 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // change the transform above notes -- so n=2/rot=1 is the minimal spelling of it (n=4/rot=2 and n=8/rot=4 are the
     // identical permutation, which is why the measurement tool prints the same residual for each).
     {3072, 32, 32, 10560, 2, 1, 5222400},
+    // hidden 3,584 / 28 heads / 28 layers -- the Qwen2.5-7B family. Measured TWICE, against two different models' 1.8 twins, and
+    // both pairs give this row: Qwen2.5-7B-Instruct (2,219 of 3,830,638,912 bytes differ, 5.79e-05 %) and Qwen2.5-Coder-7B-Instruct
+    // (28,271 differ, 7.38e-04 %), each against its own `_rai_1.8.0_npu_16K` build. Two independent models of one geometry agreeing
+    // on `rot` is the corroboration a single pair cannot give, and `--probe-wrong` separates the rotation by four orders of
+    // magnitude on the Coder pair: rot+1 differs in 208,982,210 bytes (5.46 %), n+1 in 52,522,601 (1.37 %), against this row's
+    // 28,271.
+    // The prefix is the ONE field this pair does not separate: `prefix+64` differs in 33,291 bytes, which is under the tool's
+    // 38,306-byte tolerance -- so `prefix = 7,232` here rests on the two models agreeing and on the plain Qwen2.5 arithmetic
+    // (64 + 2*hidden, with no QK-norm term, unlike the Qwen3 line's +4,352), not on the pair alone. Said plainly because a row
+    // whose comment implies all seven fields were equally pinned would be the same kind of overstatement this table exists to
+    // avoid.
+    // The block's arithmetic, from the measurement rather than from a formula: prefix 7,232 + 9 x tile 1,009,664 = 9,094,208,
+    // which is exactly the `header_off` the tool reports for this pair -- so the payload after the prefix is NINE tile slots,
+    // of which the rule rotates eight and the ninth is the gap the post-attention header sits behind. (An earlier version of
+    // this comment subtracted the prefix from a per-block figure and produced a number three orders of magnitude off; the
+    // review of #1758 caught it. Written out here so the next reader can check it with a calculator.)
+    {3584, 28, 28, 7232, 8, 1, 1009664},
     // Mistral-7B-Instruct-v0.2 at hidden 4,096 / 32 heads / 32 layers: measured with tools/fconst19_measure.py against
     // amd/Mistral-7B-Instruct-v0.2_rai_1.8.0_npu_4K, 1,954 of 3,843,419,200 bytes differ (5.08e-05) -- content, not
     // layout. The prefix follows the Qwen3 line (64 + 2*hidden + 4,352 = 12,608), the bundle is 5 tiles of 2,297,856

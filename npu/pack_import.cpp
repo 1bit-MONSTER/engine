@@ -1366,6 +1366,24 @@ int intermediate_size_from_graph(const std::string& model_path, int64_t hidden) 
 // with "the epsilon headers do not repeat with a single period" while its own header reported the stride exactly.
 // So ask the header first on the SOURCE file (the canonical copy has the 1.9 header removed by construction), and keep the eps
 // vote as the fallback for packs with no 1.9 header -- the 1.8 / R1-Distill line, where it works today.
+FconstGeom fconst_layout_choose(const FconstGeom& voted, int64_t stride8, int64_t residue_off, int residue_count) {
+    FconstGeom g = voted;
+    g.stride = stride8;   // the 1.9 header's stride wins; a disagreement was refused by the caller
+    g.why.clear();
+    // A layout the VOTE found is the only witness to how many in-block headers a pack has: `period` is 2 on the
+    // Qwen2/Llama packs (q/k/v/o share one payload) and 4 on the Qwen3 ones (three in-block headers, the middle two being
+    // the per-head QK norms, which `post_attn_hdr()` reads as `hdr.back()`). Rewriting that here is not "populating the
+    // same fields" -- it discards the measurement that separates the two layouts, and on Qwen3 it pointed
+    // `post_attn_hdr()` at the k_norm header (engine#1831). Everything below fills in what the vote could NOT find.
+    if (!g.hdr.empty()) return g;
+    if (residue_off > 0 && residue_count >= 3) {   // repeats across blocks: a real section boundary, not a coincidence
+        g.h1 = residue_off;
+        g.hdr.assign(1, residue_off);              // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
+        g.period = 2;
+    }
+    return g;
+}
+
 FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& pack_dir, const Dims& dims) {
     FconstGeom g = locate_fconst(tok, dims.eps_bits);
     const std::string src = find_token_fconst(pack_dir);
@@ -1385,38 +1403,23 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
         g.stride = 0;
         return g;
     }
-    g.stride = stride8;
-    g.why.clear();
     // The second header offset (`h1`) is what tells the payload reader whether a block holds 2 eps headers or 4, so the eps
     // vote failing must not leave it at 0: with the stride known, the anchors' offsets *within* a block repeat, and the mode
-    // of `pos mod stride` (excluding 0, the block start) is the second header. This is the same pool of anchors the vote
-    // could not win on, used for a question that does not need a dominance test -- 28 blocks each contribute their residue.
+    // of `pos mod stride` (excluding 0, the block start) is the second header. The scan window is the first GiB (about 8
+    // blocks of this geometry), so the right residue repeats ~8 times against 1-2 for a payload coincidence.
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
+    int best = 0;
+    int64_t best_off = 0;
     if (!pos.empty()) {
         std::map<int64_t, int> off;
         for (const int64_t q : pos) {
             const int64_t r = q % stride8;
             if (r > 0 && r < stride8) ++off[r];
         }
-        int best = 0;
-        int64_t best_off = 0;
         for (const auto& [o, n] : off)
             if (n > best) { best = n; best_off = o; }
-        if (best_off > 0) {
-            // Populate the same fields `locate_fconst` would have: `hdr` is the in-block header list and the reader
-            // classifies a pack as a 2-header (one inner anchor) or 4-header (three) block from its SIZE. Setting only
-            // h1 left `hdr` empty, so a pack whose anchors could not win the vote was classified as "1 epsilon header"
-            // and every attention projection refused while the MLP imported byte-exact -- measured on Qwen2-7B 1.9.
-            // The scan window is the first GiB (about 8 blocks of this geometry), so the right residue repeats ~8 times
-            // against 1-2 for a payload coincidence. Requiring `layers/2` was too strict and silently dropped the real one.
-            if (best >= 3) {                             // the residue repeats across blocks: a real section boundary
-                g.h1 = best_off;
-                g.hdr.assign(1, best_off);               // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
-                g.period = 2;
-            }
-        }
     }
-    return g;
+    return fconst_layout_choose(g, stride8, best_off, best);
 }
 
 std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }

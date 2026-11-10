@@ -440,6 +440,12 @@ int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without
 // engine#1638: the geometry as read, so a test can check WHICH source a number came from.
 nlohmann::json load_geometry_exported(const std::string& pack_dir, std::string* source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
+// The in-block layout to hand the reader: the epsilon vote's own when it found one, otherwise the 2-header shape a stride
+// and a repeated residue imply. Split out so the rule "never rewrite a layout the vote found" is a testable function
+// rather than a position inside a sixty-line one -- rewriting it made a Qwen3 pack's k_norm header read as
+// post-attention (engine#1831). `residue_off`/`residue_count` are the mode of `eps position mod stride` and how often it
+// repeated; the caller is expected to have already refused when the two witnesses disagree on the stride itself.
+FconstGeom fconst_layout_choose(const FconstGeom& voted, int64_t stride8, int64_t residue_off, int residue_count);
 
 // One measured Ryzen AI 1.9 Token .fconst block shape (engine#1503). Every field is measured against the 1.8 pack of
 // the same model by tools/fconst19_measure.py; none of it is derivable from the pack, which is why a pack whose shape

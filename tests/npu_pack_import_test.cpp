@@ -3208,8 +3208,44 @@ void test_tail_head_placement() {
 }
 
 
+// engine#1831: the layout a 1.9 pack's header list describes is the only witness to how many in-block headers it has,
+// and `locate_fconst_with_header()` used to rewrite it unconditionally to the 2-header shape -- which on a Qwen3 pack
+// (three in-block headers, `period == 4`) pointed `post_attn_hdr()` at the k_norm section. Four arms: the vote's layout
+// survives, a missing one is filled, a weak residue fills nothing, and a 2-header vote is not overwritten either.
+static void test_fconst_layout_choose() {
+    pi::FconstGeom four;                       // what locate_fconst() returns for a Qwen3 pack
+    four.stride = 1 << 20;
+    four.period = 4;
+    four.h1 = 262144;
+    four.hdr = {262144, 524288, 786432};
+    four.blocks = 8;
+
+    const pi::FconstGeom keep = pi::fconst_layout_choose(four, four.stride, 131072, 8);
+    check(keep.period == 4 && keep.hdr.size() == 3 && keep.h1 == 262144 && keep.post_attn_hdr() == 786432,
+          "layout: a voted 4-header layout survives a strong residue (period " + std::to_string(keep.period) +
+              ", post-attn " + std::to_string(keep.post_attn_hdr()) + ")");
+
+    pi::FconstGeom none;                       // the vote found no stride: nothing to preserve
+    const pi::FconstGeom filled = pi::fconst_layout_choose(none, 1 << 20, 131072, 8);
+    check(filled.period == 2 && filled.hdr.size() == 1 && filled.h1 == 131072 && filled.post_attn_hdr() == 131072,
+          "layout: an empty vote is filled from the residue (period " + std::to_string(filled.period) + ")");
+
+    const pi::FconstGeom weak = pi::fconst_layout_choose(none, 1 << 20, 131072, 2);
+    check(weak.period == 0 && weak.hdr.empty() && weak.h1 == 0,
+          "layout: a residue that repeats twice is not a section boundary (" + std::to_string(weak.period) + ")");
+
+    pi::FconstGeom two = four;                 // a Qwen2/Llama pack
+    two.period = 2;
+    two.h1 = 131072;
+    two.hdr = {131072};
+    const pi::FconstGeom kept2 = pi::fconst_layout_choose(two, two.stride, 65536, 8);
+    check(kept2.period == 2 && kept2.hdr.size() == 1 && kept2.h1 == 131072,
+          "layout: a voted 2-header layout is not overwritten either (h1 " + std::to_string(kept2.h1) + ")");
+}
+
 int main(int argc, char** argv) {
     test_tail_head_placement();
+    test_fconst_layout_choose();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
     // The pack leg is the only one that can regress a real pack, and ctest runs this binary with the

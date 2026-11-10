@@ -1030,6 +1030,26 @@ Two facts about what the container holds, both reported, not hidden:
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's
   manifest and in `config.json`, and nothing reads a padding column as a weight.
 
+### Where a 1.9 pack's rewritten `.fconst` goes
+
+A Ryzen AI 1.9 pack's Token `.fconst` is rewritten into its 1.8 form before it is read. The copy is as large as the source
+(3.6 GB for an h4096 pack), so where it lands matters: on strixhalo `/tmp` is tmpfs, which means RAM. The importer tries these
+directories in order:
+
+1. `$ONEBIT_FCONST_SCRATCH`, if set;
+2. `$XDG_CACHE_HOME/1bit/fconst19`, or `~/.cache/1bit/fconst19` (on disk);
+3. `$TMPDIR`, then `/tmp`, then the current directory.
+
+The copy is a cache: it is reused while the source's size and mtime and the rules version match. On each write the importer
+sweeps the scratch directories. It removes other identities of the same pack and geometry, the pre-version name, and any
+`1bit-fconst19*` copy nobody has written for 6 hours. Without an override, **every** candidate directory is swept, not only the
+one being written, so copies older binaries left in `/tmp` get reclaimed (engine#1907). With `ONEBIT_FCONST_SCRATCH` set, only
+that directory is swept, and a run with an override never removes another lane's files. The current directory is the
+one candidate that is never swept unless the copy is being written there: it is only the last write fallback, and a
+working directory's files are not the importer's to clean. The 6 hours are what keep a concurrent run's copy alive in a
+shared directory, so the number stays above the longest import; it is not the knob for disk or tmpfs pressure. The test suite sets one per run and
+removes it at exit.
+
 ### Linking the kernel set the container will be served with
 
 A model directory carries its own NPU kernels in `npu/` (see "A model directory"), and for an imported

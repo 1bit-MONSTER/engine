@@ -307,6 +307,14 @@ void evict_stale_canonical_copies(const std::string& dir, const std::string& kee
                                   const std::string& legacy_name  = std::string(),
                                   int64_t            max_age_seconds = 0);
 
+// engine#1907: apply evict_stale_canonical_copies() to EVERY scratch candidate, not only the one being written. Since #1801 the
+// write lands in the on-disk cache, so a sweep of that directory alone never reached /tmp again, and the copies older binaries
+// had left in tmpfs (17.0 GiB of RAM, measured 2026-11-10) stayed until reboot. `written_dir` is swept even if it is not yet a
+// directory as seen here; every other entry is swept only when it already exists, and is never created.
+void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::string& written_dir,
+                               const std::string& keep_name, const std::string& prefix, const std::string& legacy_name,
+                               int64_t max_age_seconds);
+
 // The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
 // actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos
 // do publish the text, and how much of it varies per pack), and an importer that says nothing about

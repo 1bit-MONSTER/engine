@@ -97,7 +97,27 @@ def attn_payload_off(hidden):
     return K_NORM_OFF + hidden * 2
 
 
-def head_offset(fconst_bytes, ntiles, tile):
+def slot_candidates(fconst_bytes, env, ntiles, tile, zeros=0, slack=8):
+    """Where the head's grid can start when the tail is padded to WHOLE tile slots.
+
+    engine#1852: the head occupies `ntiles` tiles, but a 1.9 pack may carry more slots -- `Hunyuan-7B` needs 2003 for a
+    128,167-row vocabulary and ships 2004 (89 padding rows, 143,616 B) -- so the #1789 rule (`size - zeros - ntiles*tile`)
+    lands a whole tile early on such a pack. The grid still ENDS at `size - zeros`, so the candidates grow backwards from
+    there: `size - zeros - (ntiles + k)*tile` for k = 0..slack, keeping only those at or after the envelope (nothing before
+    the tail can be the head). `slack` is bounded like the importer's own search window -- the padding seen in practice is
+    one slot, and an unbounded search would walk into the per-layer payload.
+    """
+    end = fconst_bytes - zeros
+    out = []
+    for k in range(0, slack + 1):
+        off = end - (ntiles + k) * tile
+        if off < env or off + ntiles * tile > end:
+            break
+        out.append(off)
+    return out
+
+
+def head_offset(fconst_bytes, ntiles, tile, zeros=0):
     """Where the tied head's grid starts: the last `ntiles * tile` bytes of the `.fconst`.
 
     The importer derives the same number as `layers * stride + attn_payload_off(H)` -- past the per-layer payload, then
@@ -114,7 +134,13 @@ def head_offset(fconst_bytes, ntiles, tile):
     correlates 1.0000 with the pack's own fp16 embedding, magnitude ratio 1.000, rel_err 0.0007 over four tiles on
     `Qwen2.5-0.5B-Instruct_rai_1.9.0_npu`.
     """
-    return fconst_bytes - ntiles * tile
+    # engine#1740: the tail is [envelope][rows x tile][PADDING], and 12+ of the 42 1.9 packs end in a multi-hundred-MB
+    # all-zero run (110,208,000 B on the hidden-1536 family). Subtracting only the grid lands *inside that padding* and
+    # reports corr ~ 0 with a zero variance -- the symptom engine#1693 started from, on a pack where nothing is wrong.
+    # So the grid ends where the zero run begins; `zeros` is measured, not assumed. This is the zero-run-implied candidate
+    # and not a proof of placement (the head need not end exactly there): the printed correlation is what decides, and the
+    # importer's `plan_tail_head()` walks the neighbouring tile-aligned candidates for the cases where it does not.
+    return fconst_bytes - zeros - ntiles * tile
 
 
 def bf16_to_f32(codes):
@@ -311,8 +337,39 @@ def measure(pack, tiles_wanted, ref_path=None, ref_dtype="bf16"):
     # WHERE the head is: the LAST `ntiles * tile` bytes. `env` on its own is only the tail's envelope -- the importer
     # reaches the head as `layers*stride + env`, which equals this subtraction whenever its size check passes
     # (engine#1693: at `env` the decode correlates at chance, at the real offset 1.0000).
-    base = head_offset(size, ntiles, tile)
     zeros = trailing_zeros(path)
+    # engine#1852: the grid may be padded to whole tile slots, so there can be more than one placement. The candidates grow
+    # backwards from the end of the payload; which one is the head can only be settled by the oracle, so without one this
+    # refuses rather than picking the #1789 rule's answer and calling it measured.
+    cands = slot_candidates(size, env, ntiles, tile, zeros)
+    placement = 0
+    base = cands[0] if cands else -1
+    if len(cands) > 1:
+        if ref_all is None:
+            return None, 7, ("the payload holds %d more tile-slot(s) than the head needs (%d tiles), so %d placements are "
+                             "possible; pass --pack with model.onnx (the oracle) or --ref, or the answer is a guess"
+                             % (len(cands) - 1, ntiles, len(cands)))
+        best_i, best_c, second_c = 0, -2.0, -2.0
+        with open(path, "rb") as f:
+            for i, off in enumerate(cands):
+                f.seek(off)
+                buf = f.read(tile)
+                if len(buf) != tile:
+                    continue
+                w0, _ = decode_tile(buf, hidden, K_TILE_ROWS)
+                with np.errstate(all="ignore"):
+                    c = float(np.corrcoef(w0.ravel().astype(np.float64),
+                                          ref_all[0:K_TILE_ROWS].ravel().astype(np.float64))[0, 1])
+                if c > best_c:
+                    second_c, best_i, best_c = best_c, i, c
+                elif c > second_c:
+                    second_c = c
+        if not (best_c > 0.5) or second_c > 0.5:
+            return None, 7, ("no placement in the tail correlates with the packet's embedding (%d candidates, best %.4f, "
+                             "second %.4f at %d tiles needed against a padded grid)"
+                             % (len(cands), best_c, second_c, ntiles))
+        placement = best_i
+        base = cands[best_i]
     rows = []
     status = 0 if base >= 0 else 3
     if base >= 0 and oracle is None:
@@ -350,7 +407,7 @@ def measure(pack, tiles_wanted, ref_path=None, ref_dtype="bf16"):
         "pack": os.path.basename(os.path.abspath(pack)),
         "vocab": vocab, "hidden": hidden, "tied": tied, "head": decl, "oracle": oracle,
         "block_checked": decl is not None, "block_unchecked_why": unchecked,
-        "geometry": {"env": env, "head_off": base, "tile_bytes": tile, "tiles": ntiles, "tail_bytes": env + ntiles * tile,
+        "geometry": {"env": env, "head_off": base, "placement": placement, "placements": len(cands), "tile_bytes": tile, "tiles": ntiles, "tail_bytes": env + ntiles * tile,
                      "fconst_bytes": size, "trailing_zero_bytes": zeros, "tail_fits": base >= 0,
                      "tiles_wanted": tiles_wanted,
                      "ref_rows": None if ref_all is None else int(ref_all.shape[0]), "ref_tiles": ref_tiles},

@@ -16,6 +16,11 @@
 #
 # Re-run the anchor completion on `1bit serve` for the target models.
 # usage: anchor_rerun.sh <1bit> <outdir> <device> <alias>:<gguf> [<alias>:<gguf> ...]
+#
+# Not a ctest row, on purpose (engine#1800): this is an operator MEASUREMENT, not a pass/fail test. It needs real GGUFs
+# and an output directory, allows each model a 30-minute health window, prints PASS/FAIL/SKIP per model and always exits
+# 0, so registered it would either skip forever or report green over a FAIL line. Run it by hand, inside a gpu-hold
+# ticket when --device names a GPU.
 set -uo pipefail
 
 bin=${1:?usage: anchor_rerun.sh <1bit> <outdir> <device> <alias>:<gguf> ...}

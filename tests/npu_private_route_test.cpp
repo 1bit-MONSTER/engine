@@ -51,7 +51,24 @@ bool throws(const std::string& kv) {
 
 }  // namespace
 
+// engine#1740 (W6): with no add-on linked, a private-route option must be REFUSED, not stored. The failure it pins is
+// concrete: `--npu-opt dx=<dir>` on such a build was accepted, ignored, and served the per-op route instead -- 10x slower
+// with no log line, discovered only because two runs produced identical numbers. The arm is ordered before any route is
+// registered below, which is exactly the no-add-on state.
+void no_addon_refuses_the_option() {
+    PrivateOptions o;
+    bool threw = false;
+    try {
+        parse_private_option("dx=/tmp/kernels", o);
+    } catch (const std::runtime_error& e) {
+        threw = std::string(e.what()).find("links no private NPU route") != std::string::npos;
+    }
+    check("no add-on: --npu-opt is refused by name, not stored (engine#1740)", threw && o.empty());
+    check("no add-on: private_routes_available() is false", !private_routes_available());
+}
+
 int main() {
+    no_addon_refuses_the_option();
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / ("npu_private_route_test." + std::to_string(::getpid()));
     fs::create_directories(dir);

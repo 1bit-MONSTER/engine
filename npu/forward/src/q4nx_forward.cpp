@@ -33,9 +33,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include "batch_check_compare.h"
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
@@ -47,6 +49,7 @@
 #include "q4nx_device.h"  // an imported q4nx-2 container's device form (engine#1185)
 #include "q4nx_semantics.h"
 #include "q4nx_pack.h"
+#include "q4nx_head_image.h"   // the lm-head tile cache (engine#1716)
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -193,6 +196,29 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
 // every other architecture builds exactly the table it built before.  Keys are searched with their
 // quotes, which is what keeps "factor" from matching inside "high_freq_factor".
+// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
+// 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
+// accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
+Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
+    Q4nxRopeDynamic d{};
+    std::ifstream f(cfg_path);
+    if (!f) return d;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    char type[64];
+    q4nx_rope_declared_type(t.c_str(), type, (int)sizeof type);
+    if (std::strcmp(type, "dynamic") && std::strcmp(type, "dynamic_ntk")) return d;
+    auto number = [&](const char* key) {
+        const std::string k = std::string("\"") + key + "\":";
+        const size_t at = t.find(k);
+        if (at == std::string::npos) return 0.0;
+        return std::strtod(t.c_str() + at + k.size(), nullptr);
+    };
+    d.factor = number("factor");
+    d.original_max_position = number("max_position_embeddings");
+    d.on = (d.factor > 0.0 && d.original_max_position > 0.0) ? 1 : 0;
+    return d;
+}
+
 static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
     Q4nxRopeLlama3 s{};
     std::ifstream f(cfg_path);
@@ -401,7 +427,14 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
 
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
-    if (getenv("NPU_INFER_HOST_GEMM")) host_gemm_ = true;
+    if (const char* hg = getenv("NPU_INFER_HOST_GEMM")) {
+        host_gemm_ = true;
+        // engine#1808: "i8" selects the integer arm, whose int32 accumulation is the only thing a
+        // kernel family can be bit-exact against (an int8 device cannot match an f32 host by
+        // construction). Any other value keeps the f32 path, which is what every existing caller and
+        // every row measured so far used.
+        host_gemm_i8_ = (hg[0] == 'i' && hg[1] == '8');
+    }
     // The launch layer.  A1: everything below that touches a device talks to this, and the settings the
     // container declares (weight layout, pb16i image dir, Hadamard fold) are pushed into it as they are
     // parsed.  A2 turns this into NpuTarget::open(plan, kernels_dir).
@@ -579,6 +612,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    rope_dynamic_ = read_rope_dynamic(cfg_path);     // rope_type "dynamic" (NTK by base, engine#1740 W2)
     {
         // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
         // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
@@ -587,7 +621,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         char declared[64];
         q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
-        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1)) {
+        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
             if (!std::strcmp(declared, "llama3"))
                 err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
                        "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
@@ -666,7 +700,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         fprintf(stderr, "  [forward] container K grid: H %d -> %d, IM %d -> %d (pad columns are zero)\n",
                 c_.H, kpad_, c_.IM, impad_);
 
-    embed_.resize((size_t)NV * H);
+    /* engine#1784: `embed_` (the bf16 copy) is no longer filled: the table is read in place. It stays for nothing
+     * and is sized to zero, so a stale read would be a bounds error rather than a silent wrong answer. */
     {
         /* A tied model may store the table ONLY as `lm_head.weight` (Qwen3.5-4B's
          * container has no `model.embed_tokens.weight`); it doubles as both the
@@ -685,7 +720,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             /* A quantised table is stored on the container's K grid, so it dequantises to kpad_
              * wide rows (engine#845); the pad columns are zero, so the head's dot product over
              * c_.H columns is unchanged. */
-            embed_f_.resize((size_t)NV * (size_t)kpad_);
+            /* engine#1784: nothing is expanded until it is asked for. The plain int8 + per-32-column-scale table --
+             * the dtype the 27B and the gemma-class containers use -- is read element-wise straight from the mapping
+             * by embed_at(), so 0.74 GiB of container no longer becomes 2.96 GiB of anonymous memory. Only the chunked
+             * formats (which have no element-wise read yet) still decode into embed_f_. */
             lm_w_ = kpad_;
             const size_t esz = (size_t)etd->data_size;
             int rc;
@@ -697,24 +735,60 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 TensorDesc* sd = model_tensor_by_name(mw_, "model.embed_tokens.weight.scale");
                 const float* sc = sd ? (const float*)data_of(mw_, sd, en / 32 * sizeof(float)) : nullptr;
                 if (sd && !sc) { err_ = "model.embed_tokens.weight.scale is too small"; return false; }
-                rc = q4nx_dequant_plain_i8((const uint8_t*)e, sc, NV, H, embed_f_.data());
+                embed_i8_     = (const int8_t*)e;
+                embed_sc_     = sc;
+                embed_groups_ = H / Q4NX_GROUP_SIZE;
+                rc            = 0;
             } else {
-                rc = dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data());
+                /* engine#1784: the chunked formats are tiles of 5,120 B (the 27B's 0.625 B/element packed table is
+                 * 155,200 of them), so a row is read out of the `cols/256` tiles that cover it instead of the whole
+                 * table being decoded into f32 -- which for that pack is 0.74 GiB of container becoming 4.74 GiB.
+                 * Same tile grid and ordering as q4nx_dequant_tensor_chunked(), pinned by the row test. */
+                /* engine#1842: the grid is checked with the row reader's own rule, not `esz % tiles == 0`. That test let a
+                 * table with no supported chunk kind, or an NV / kpad_ off the 32 x 256 grid, take this path; the reader
+                 * then refused every row and embed_at() served 0.0f with no message. A table it would refuse stays on
+                 * the whole-table decode below, which reports its own failure. */
+                const int cb = q4nx_tile_row_kind(esz, NV, kpad_);
+                if (cb != 0) {
+                    embed_tile_       = (const uint8_t*)e;
+                    embed_tile_bytes_ = esz;
+                    embed_tile_rows_  = NV;
+                    embed_tile_cols_  = kpad_;
+                    embed_tile_cb_    = cb;
+                    embed_row_buf_.assign((size_t)kpad_, 0.0f);
+                    embed_row_tok_    = -1;
+                }
+                rc = 0;   // the buffer below is the fallback, and it reports its own failure
             }
             if (rc != 0) {
                 err_ = std::string("embedding dtype ") + dt + " but dequant failed";
                 return false;
             }
+            if (!embed_tile_ && !embed_i8_) {   // no element-wise read: keep the whole-table buffer (unchanged path)
+                embed_f_.resize((size_t)NV * (size_t)kpad_);
+                if (dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data()) != 0) {
+                    err_ = std::string("embedding dtype ") + dt + " but dequant failed";
+                    return false;
+                }
+            }
             embed_f32_ = true;
-            fprintf(stderr, "  [forward] embedding dtype %s -> dequantized (%zu floats, %.2f GiB)\n",
-                    dt, embed_f_.size(),
-                    (double)embed_f_.size() * sizeof(float) / (1024.0 * 1024.0 * 1024.0));
+            if (embed_i8_ || embed_tile_)
+                fprintf(stderr, "  [forward] embedding dtype %s -> read in place from the container, one row per token "
+                                "(engine#1784): %.2f GiB not materialised\n", dt,
+                        (double)NV * (double)kpad_ * 4.0 / (1024.0 * 1024.0 * 1024.0));
+            else
+                fprintf(stderr, "  [forward] embedding dtype %s -> dequantized (%zu floats, %.2f GiB)\n",
+                        dt, embed_f_.size(),
+                        (double)embed_f_.size() * sizeof(float) / (1024.0 * 1024.0 * 1024.0));
         } else {
             if (etd->data_size < (size_t)NV * H * 2) {
                 err_ = "embedding too small for NV*H bf16";
                 return false;
             }
-            memcpy(embed_.data(), e, (size_t)NV * H * sizeof(uint16_t));
+            /* engine#1784: read the table in place out of the container's read-only mapping, one row per token,
+             * instead of copying it. `e` points into `mw_`'s mapping, which outlives this forward, and embed_at()
+             * indexes it at the container's own row stride. */
+            embed_bf16_ = (const uint16_t*)e;
             lm_w_ = H;   // raw bf16: the table has no pad
         }
     }
@@ -1473,13 +1547,32 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
 
     backend_ = "full ELF";
     ready_ = true;
+    /* engine#1900: say the batch width once at load, the way the block note does, so a log can be told apart from a
+     * forward that never batched. #1904 gives the sealed route its plan's width; this line is what makes the difference
+     * visible either way. */
+    std::fprintf(stderr, "  [forward] batch width %d row(s) per launch\n", max_batch_rows());
     return true;
 }
 
 float Q4nxNpuForward::embed_at(int token, int k) const {
     if (token < 0 || token >= c_.NV || k < 0 || k >= c_.H) return 0.0f;
+    // engine#1784: the two dtypes that can be read in place, without a table-sized buffer, are read in place. Pad
+    // columns (k >= c_.H) are already refused above and read as 0.0f, which is what the expanded table held there.
+    if (embed_i8_)
+        return q4nx_plain_i8_at((const uint8_t*)embed_i8_, embed_sc_, c_.NV, c_.H, token, k);
+    if (embed_tile_) {
+        // One row per token: the callers walk k innermost, so this gathers the row once and serves the H reads from it.
+        if (token != embed_row_tok_) {
+            if (q4nx_dequant_tile_row(embed_tile_, embed_tile_bytes_, embed_tile_rows_, embed_tile_cols_,
+                                      embed_tile_cb_, token, embed_row_buf_.data()) != 0)
+                return 0.0f;
+            embed_row_tok_ = token;
+        }
+        return embed_row_buf_[(size_t)k];
+    }
+    if (embed_bf16_) return bf16_to_f32(embed_bf16_[(size_t)token * (size_t)c_.H + (size_t)k]);
     if (embed_f32_) return embed_f_[(size_t)token * (size_t)lm_w_ + (size_t)k];
-    return bf16_to_f32(embed_[(size_t)token * (size_t)c_.H + (size_t)k]);
+    return 0.0f;
 }
 
 /* LM-head weight for output n, column k: the separate lm_head.weight when the
@@ -2486,25 +2579,10 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
             for (int j = 0; j + 1 < CK - 1; j++) cs[j] = cs[j + 1];
             if (CK > 1) cs[CK - 2] = qkv[ch];
         }
-        // alpha/beta on the host (N = NVH, below the GEMM tile width)
-        const float* xm = xn.data() + (size_t)m * H;
-        {
-            LhScope _t_ab(LH_GDN_AB);
-            for (int hh = 0; hh < NVH; hh++) {
-                const float* ra = gdn_small_[(size_t)l].wa.data() + (size_t)hh * H;
-                const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)hh * H;
-                float sa = 0, sb = 0;
-                for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
-                AHS[(size_t)m * NVH + hh] = sa;
-                BHS[(size_t)m * NVH + hh] = sb;
-            }
-        }
-        if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l) {   // keep what a commit would need
-            auto& rec = row_in_[(size_t)l][(size_t)m];
-            rec.qkv.assign(qkv, qkv + CD);
-            rec.ah.assign(AHS.begin() + (size_t)m * NVH, AHS.begin() + (size_t)(m + 1) * NVH);
-            rec.bh.assign(BHS.begin() + (size_t)m * NVH, BHS.begin() + (size_t)(m + 1) * NVH);
-        }
+        // alpha/beta (N = NVH, below the GEMM tile width) no longer runs here: it depends on nothing this loop
+        // carries, so it is computed head-major inside the layer's one parallel region below (engine#1416).
+        if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l)   // keep what a commit would need;
+            row_in_[(size_t)l][(size_t)m].qkv.assign(qkv, qkv + CD);       // ah/bh are stored after the region
         // q/k L2-normalised with NVH/NKH head repetition; v per v-head
         float* qlm = &QLS[(size_t)m * NVH * KHD];
         float* klm = &KLS[(size_t)m * NVH * KHD];
@@ -2588,12 +2666,46 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
     if (gdn_check) core_ref.assign(CORE.size(), 0.0f);
     std::vector<float> state_pre;   // NPU_GDN_CHECK only: the state the old nesting must start from
     if (gdn_check) state_pre = rec_state_[l];
+    // alpha/beta on the host: for every (row, head) one dot product of the row against that head's alpha row and
+    // one against its beta row.  It used to run inside the row loop above on ONE thread -- measured on the served
+    // 27B t2s pack, 76 ms of a 730 ms 16-row prefill block (0.099 ms per row and layer, 48 GDN layers), the largest
+    // single non-GEMM host term of a prefill pass once the pack column fell to 0.13 ms/launch (engine#1416).
+    // Each (row, head) pair is independent and writes its own two elements, and each dot product is the same
+    // sequential loop as before (strict IEEE: the build has no -ffast-math, so the summation order is the source
+    // order), so sharing the pairs out moves no bit.  It takes NO new parallel region: it is a second worksharing
+    // loop inside the one this layer already opens, because a region is what costs under contention (see above).
+    // Head-major like the recurrence, so a thread keeps one head's two weight rows (2 x H floats) in L1/L2 across
+    // the rows.  NPU_GDN_CHECK=1 recomputes it the old way, serially, and compares bit for bit.
+    const float* const wa_all = gdn_small_[(size_t)l].wa.data();
+    const float* const wb_all = gdn_small_[(size_t)l].wb.data();
+    auto alpha_beta = [&](int hh, int m, float* ah, float* bh) {
+        const float* xm = xn.data() + (size_t)m * H;
+        const float* ra = wa_all + (size_t)hh * H;
+        const float* rb = wb_all + (size_t)hh * H;
+        float sa = 0, sb = 0;
+        for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
+        ah[(size_t)m * NVH + hh] = sa;
+        bh[(size_t)m * NVH + hh] = sb;
+    };
     {
-        LhScope _t_core(LH_GDN_CORE);
+        // Timed on thread 0 at the two barriers, so `gdn alpha/beta` and `gdn recurrence` stay the two
+        // disjoint columns they were (an LhScope inside the region would be written by every thread).
+        const bool lh = q4nx_lh::lh_on();
+        std::chrono::steady_clock::time_point t0, t1;
+        if (lh) t0 = std::chrono::steady_clock::now();
 #pragma omp parallel num_threads(gdn_nt)
         {
             std::vector<float> scratch((size_t)2 * VHD);   // one allocation per thread, not per head
             float* sc = scratch.data();
+#pragma omp for schedule(static)
+            for (int hh = 0; hh < NVH; hh++)
+                for (int m = 0; m < M; m++) alpha_beta(hh, m, AHS.data(), BHS.data());
+            // implicit barrier: every AHS/BHS element is written before any head reads one
+#if defined(_OPENMP)
+            if (lh && omp_get_thread_num() == 0) t1 = std::chrono::steady_clock::now();
+#else
+            if (lh) t1 = std::chrono::steady_clock::now();
+#endif
 #pragma omp for schedule(static)
             for (int hh = 0; hh < NVH; hh++) {
                 float* sh = rs + (size_t)hh * KHD * VHD;
@@ -2601,8 +2713,34 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                     head_row(hh, m, sh, CORE.data() + (size_t)m * VD + (size_t)hh * VHD, sc);
             }
         }
+        if (lh) {
+            const auto t2 = std::chrono::steady_clock::now();
+            q4nx_lh::g_lh[LH_GDN_AB] += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            q4nx_lh::g_lh_n[LH_GDN_AB]++;
+            q4nx_lh::g_lh[LH_GDN_CORE] += std::chrono::duration<double, std::milli>(t2 - t1).count();
+            q4nx_lh::g_lh_n[LH_GDN_CORE]++;
+        }
     }
+    if (verify_open_ && (int)row_in_.size() > l)   // the rest of what a commit would need (qkv was stored above)
+        for (int m = 0; m < M && m < verify_rows_; m++) {
+            auto& rec = row_in_[(size_t)l][(size_t)m];
+            rec.ah.assign(AHS.begin() + (size_t)m * NVH, AHS.begin() + (size_t)(m + 1) * NVH);
+            rec.bh.assign(BHS.begin() + (size_t)m * NVH, BHS.begin() + (size_t)(m + 1) * NVH);
+        }
     if (gdn_check) {
+        // alpha/beta the old way: one thread, row-major, through the same body.  Compared as bit patterns, so a
+        // NaN that both produce is equal and a -0.0 against +0.0 is not.
+        std::vector<float> ah_ref(AHS.size()), bh_ref(BHS.size());
+        for (int m = 0; m < M; m++)
+            for (int hh = 0; hh < NVH; hh++) alpha_beta(hh, m, ah_ref.data(), bh_ref.data());
+        const bool ab_same = std::memcmp(ah_ref.data(), AHS.data(), AHS.size() * sizeof(float)) == 0 &&
+                             std::memcmp(bh_ref.data(), BHS.data(), BHS.size() * sizeof(float)) == 0;
+        fprintf(stderr, "[gdncheck] l=%d M=%d alpha/beta shared vs serial: %zu values %s\n", l, M,
+                2 * AHS.size(), ab_same ? "identical" : "MISMATCH");
+        if (!ab_same) {
+            err_ = "gdn check: the shared alpha/beta disagrees with the serial one at layer " + std::to_string(l);
+            return false;
+        }
         // The old nesting, through the same body: one region per row.  Bit-exactness is the whole claim of this
         // change, so it is asserted rather than argued -- the same form as NPU_REPLAY_CHECK in commit_verify_rows.
         std::copy(state_pre.begin(), state_pre.end(), rec_state_[l].begin());
@@ -2683,7 +2821,38 @@ bool Q4nxNpuForward::load_ple_block(int row) {
     ple_block_.assign((size_t)Q4NX_TILE_ROWS * (size_t)cols, 0.0f);
     const size_t plain_bytes =
         (size_t)sem_.vocab_size_per_layer_input * (size_t)cols;
-    if ((size_t)td->data_size == plain_bytes) {
+    // engine#1725: a RAW BF16 band. The multi-component packs state this table as f32 and the importer converts it to BF16
+    // when it writes the container (a converting copy of the whole V x NL*P table would be 9.4 GiB), so the band here is
+    // 32 rows of BF16 -- the shape the plain-int8 branch handles, with a 2-byte element instead of a code.
+    //
+    // The branch is chosen by the container's DECLARED dtype, not by arithmetic on data_size (review of #1825): a size test
+    // needs `% bf16_bytes == 0 && != plain_bytes` to separate two layouts, and every multiple of the band satisfies it, so a
+    // plain table whose byte count happens to divide would be read as BF16 bands -- plausible and wrong. This tree already
+    // decides exactly this way elsewhere (`model.c`: `strcmp(dtype,"I8")`), and `q4nx_dequant.h`'s rule is that an
+    // ambiguous layout is refused rather than resolved by which test happens to pass.
+    const size_t bf16_bytes = (size_t)Q4NX_TILE_ROWS * (size_t)cols * 2;
+    const char* pl_dtype = td->dtype;
+    const bool declared_bf16 = pl_dtype[0] != '\0' && std::strcmp(pl_dtype, "BF16") == 0;
+    const bool declared_i8 = pl_dtype[0] != '\0' && (std::strcmp(pl_dtype, "I8") == 0 || std::strcmp(pl_dtype, "Q4") == 0);
+    if (!declared_bf16 && !declared_i8) {
+        // Some other declared format, or none at all: refuse rather than fall through to a layout guess. A container
+        // written by this importer always states one (`w.add()` writes dtype for every tensor), so an empty dtype means a
+        // foreign or truncated container, not a layout this loader can infer.
+        err_ = pl_dtype[0] != '\0'
+                   ? std::string("per_layer_token_embd has dtype ") + pl_dtype +
+                         ", which this loader does not read (BF16 or plain I8 only)"
+                   : std::string("per_layer_token_embd declares no dtype, so its layout cannot be decided");
+        return false;
+    }
+    if (declared_bf16) {
+        if ((size_t)td->data_size < ((size_t)block + 1) * bf16_bytes ||
+            (size_t)td->data_size % bf16_bytes != 0) {
+            err_ = "per_layer_token_embd is declared BF16 but its size is not whole 32-row bands";
+            return false;
+        }
+        const uint16_t* band = reinterpret_cast<const uint16_t*>(raw + (size_t)block * bf16_bytes);
+        for (size_t i = 0; i < (size_t)Q4NX_TILE_ROWS * (size_t)cols; ++i) ple_block_[i] = bf16_to_f32(band[i]);
+    } else if ((size_t)td->data_size == plain_bytes) {
         // PLAIN int8 + per-32-column scale (Gemma4): only the requested band of
         // 32 rows is needed, so it is dequantized in place rather than the whole
         // [vocab, NL*ple_dim] table.
@@ -2949,6 +3118,95 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 // packed-weight BO cache, pb16i images, Hadamard fold.  What stays here is the model's own fallback, the
 // plain float GEMM of init_host() -- that is a property of the model, not of any NPU.
 // --------------------------------------------------------------------------
+// The integer host arm (engine#1808/#1809). Two decisions here, both measured:
+//  * the weight codes and their per-128-K multipliers are quantised ONCE per tensor (`wkey`) and cached --
+//    doing it per call made a 7B token ~7.5 G scalar operations and the arm never finished a token inside a
+//    9-minute ticket;
+//  * the inner sum is exact int32 with no float in it (q4nx_host_gemm_i8_grouped), so the comparison against
+//    the device is about accumulation and epilogue, not about a float both sides happen to share.
+void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
+                                  int wkey, float* out) {
+    // THE KEY MUST CARRY THE LAYER AND THE SHAPE (engine#1830 review). `wkey` is a per-ROLE slot -- 0 QKV, 1 O/gate,
+    // 2 GU, 3 up, 4 down -- so it is the same number in every layer, and `Bmat` is the one scratch buffer that
+    // `load_layer()` decodes each layer into, so neither identifies a layer. Keyed on `wkey` alone, every layer after 0
+    // ran on LAYER 0's weights: layer 0 scored cos 0.99923, layer 1 collapsed to 0.37, and 31 layers of wrong residual
+    // updates compounded into the "explosion, not drift" the per-layer dump shows. The device cache this arm mirrors
+    // says the rule in its own comment -- one weight BO per (layer, wkey) -- and carries `a.layer = cur_layer_`.
+    // `wkey < 0` is the routed-expert case: those weights vary per TOKEN, which is why the device path passes -1; caching
+    // them would serve every token's experts from the first token's, so that case packs a throwaway image instead.
+    const bool cacheable = wkey >= 0;
+    const auto key = std::make_tuple(cur_layer_, wkey, K, N);
+    HostI8Tensor scratch;
+    const HostI8Tensor* cached = nullptr;
+    auto it = cacheable ? host_i8_cache_.find(key) : host_i8_cache_.end();
+    if (!cacheable || it == host_i8_cache_.end()) {
+        HostI8Tensor t;
+        t.N = N;
+        t.codes.assign((size_t)K * (size_t)N, 0);
+        // RESOLVED toward the int8 packer (this branch) rather than main's corrected int4 rule (engine#1839).
+        // Both are self-consistent; the question is what the DEVICE consumes. The device's body image comes from
+        // packB_blocked() -- one multiplier per column, int8 codes -- and this branch measured the consequence:
+        // device logits BIT-EXACT (max|d| = 0) over four steps, three repeats, plus an edge case. So the int8 packer
+        // is the rule the reference has to share with the device, and q4nx_quant_int4_*() stays for the paths that
+        // genuinely hold int4 codes.
+        t.d.assign((size_t)N, 0.0f);
+        // THE OPERANDS MUST BE THE ENGINE'S, NOT A PRIVATE RE-QUANTISATION (engine#1808/#1830). This arm exists to be
+        // the integer reference a kernel family is gated against, and the device's weight image comes from
+        // q4nx_pack_B_int8_blocked(): ONE multiplier per column (amax over the whole K), int8 codes in [-127, 127].
+        // Quantising here with a different rule -- per 128-K group, int4 [-8, 7] -- computes a different model: measured
+        // 2026-11-10, the arm answered "ikt" to "The capital of France is" and then locked onto one token, while the
+        // per-GEMM A/B read cos 0.9999 against f32 on the same tensors. Same packer, same bytes, same model.
+        double ssum = 0.0;
+        // blocked=1: the image is written in the blocked microtile order, which is the fast path AND the layout the
+        // device actually reads, so the MAC below walks it with q4nx_layout::blocked_index(). (blocked=0 was measured
+        // at 174.5 s of warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.)
+        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, /*blocked=*/1, t.d.data(), &ssum);
+        if (!cacheable) {
+            scratch = std::move(t);
+            cached = &scratch;
+        } else {
+            cached = &host_i8_cache_.emplace(key, std::move(t)).first->second;
+        }
+    } else {
+        cached = &it->second;
+    }
+    const HostI8Tensor& t = *cached;
+    if (const char* gdir = getenv("NPU_I8_GS_DUMP")) {
+        static int n = 0;
+        char path[4096];
+        std::snprintf(path, sizeof path, "%s/arm_L%d_N%d_K%d_%03d.bin", gdir, cur_layer_, N, K, n++);
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            std::fwrite(t.d.data(), sizeof(float), std::min<size_t>((size_t)N, t.d.size()), f);
+            std::fclose(f);
+        }
+    }
+    std::vector<int8_t> a8((size_t)K);
+    for (int m = 0; m < M; m++) {
+        const float* a = A + (size_t)m * (size_t)a_k;
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            const float v = std::fabs(a[k]);
+            if (std::isfinite(v) && v > amax) amax = v;
+        }
+        const float ascale = (amax >= 1e-12f) ? amax / 127.0f : 1.0f;
+        const float tis = 1.0f / ascale;
+        for (int k = 0; k < K; k++) {
+            float v = a[k];
+            if (!std::isfinite(v)) v = 0.0f;
+            int q = (int)std::round(v * tis);
+            a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        }
+        float* dst = out + (size_t)m * (size_t)N;
+        for (int n = 0; n < N; n++) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++)
+                acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] *
+                                 (int)a8[(size_t)k]);
+            dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
+        }
+    }
+}
+
 void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
                               std::vector<float>& out, int wkey, const char* sc, int a_k) {
     if (host_gemm_) {
@@ -2957,6 +3215,10 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
         // unpadded A. (In review of this PR the split moved the pad into the target and left this
         // branch reading past the caller's buffer at a padded design.)
         out.assign((size_t)N, 0.0f);
+        if (host_gemm_i8_) {
+            host_gemm_i8(A, a_k, 1, K, N, Bmat, wkey, out.data());
+            return;
+        }
         q4nx_host_gemm_f32_padded(A, a_k, 1, K, N, Bmat, out.data());
         return;
     }
@@ -2976,6 +3238,10 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         // Same pad, and here it is also a stride: the rows form used to index A at `m * K` while the
         // caller's buffer is laid out at `m * a_k`, so every row past the first read the wrong row.
         out.assign((size_t)M * N, 0.0f);
+        if (host_gemm_i8_) {
+            host_gemm_i8(A, a_k, M, K, N, Bmat, wkey, out.data());
+            return;
+        }
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
         return;
     }
@@ -3188,16 +3454,46 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // device state -- localises a batched-vs-sequential divergence immediately.
     static const bool batch_check = getenv("NPU_BATCH_CHECK") != nullptr;
     int seq_argmax = -1;
+    // engine#1781: the old oracle compared ONE argmax at ONE position -- the last row's -- which is not the question a
+    // speculative decoder asks. Every drafted position's LOGITS matter (the accept rule consumes the target's
+    // probability at the drafted token), so the sequential rows are kept whole and compared row for row, bitwise.
+    // M x vocab floats: 4-7 MB on the models this runs, allocated only under the debug flag.
+    std::vector<float> seq_rows, bat_rows;
     // Not with injected rows: the oracle's own sequential pass runs step(tokens[m]) on the placeholder ids this
     // entry point supplies, so it would compare against a zero-token pass and report a divergence that is not
     // there. A debug tool that lies is worse than one that says "not applicable".
+    // engine#1905: the oracle's sequential replay must start from the SAME state the batched pass will, or the
+    // comparison is between different prefixes. It used to walk `start_pos .. start_pos+M-1` and then `reset()`, so for
+    // any chunk with `start_pos > 0` the batched pass ran from an empty cache and the replay from the real prefix: the
+    // oracle reported MISMATCH for every chunk but the first (measured on `bonsai2-27b-NPU-b8`, width 1, four ids:
+    // start=0 MATCH, start=1 seq=220 bat=653). That reads as a row-dependence bug in the kernels and sends the reader
+    // to fix the wrong thing. Snapshot the state the prefix established and restore it after the replay -- the same
+    // pair the prefix cache uses (`snapshot_state`/`restore_state`, and `q4nx_state_planes.h` is device-free).
+    StateSnapshot oracle_snap;
+    const bool oracle_snapped = batch_check && !inject_embeds_ && start_pos > 0 &&
+                                snapshot_state(start_pos, oracle_snap);
     if (batch_check && !inject_embeds_) {
         std::vector<float> seq;
-        for (int m = 0; m < M; m++)
+        if (c_.NV > 0) seq_rows.reserve((size_t)M * (size_t)c_.NV);
+        for (int m = 0; m < M; m++) {
             if (!step(tokens[m], start_pos + m, seq)) return false;
-        reset();
-        for (size_t i = 0; i < seq.size(); i++)
-            if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
+            seq_rows.insert(seq_rows.end(), seq.begin(), seq.end());   // every row, not only the last
+            if (m == M - 1)
+                for (size_t i = 0; i < seq.size(); i++)
+                    if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
+        }
+        // Restore instead of reset() when the replay ran over a real prefix: `reset()` would leave the batched pass
+        // starting from nothing while the replay started from `start_pos` rows, which is the false mismatch above. With
+        // `start_pos == 0` there is nothing to restore and `reset()` is exactly right.
+        if (oracle_snapped) {
+            if (!restore_state(oracle_snap, start_pos)) {
+                err_ = "batch check: the sequential replay's prefix could not be restored, so the batched pass would "
+                       "not be comparable with it";
+                return false;
+            }
+        } else {
+            reset();
+        }
     }
 
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
@@ -3609,6 +3905,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
         }
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
+        // engine#1781: keep the batched rows so the oracle can compare all of them, not just the last one's argmax.
+        if (batch_check) bat_rows.assign(batch_all_out_->begin(), batch_all_out_->end());
     } else {
         std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
         rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
@@ -3634,8 +3932,21 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         int ba = 0;
         for (size_t i = 1; i < logits.size(); i++)
             if (logits[i] > logits[(size_t)ba]) ba = (int)i;
-        std::fprintf(stderr, "[batchcheck] M=%d start=%d seq_argmax=%d batch_argmax=%d %s\n",
-                     M, start_pos, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+        // engine#1905: name the positions compared, not only the start. Before the snapshot fix this line said
+        // `start=1 MATCH`-looking numbers for a comparison that was really "position 1 from scratch" against "position
+        // 1 continuing a prefix", and the reader had to infer the range from `start` and `M`.
+        std::fprintf(stderr, "[batchcheck] M=%d positions=%d..%d seq_argmax=%d batch_argmax=%d %s\n",
+                     M, start_pos, start_pos + M - 1, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+        // engine#1781: and the comparison the gate actually asks for -- every row, bitwise.
+        if (!seq_rows.empty() && bat_rows.size() == seq_rows.size() && c_.NV > 0) {
+            onebit::npu::RowMismatch mm;
+            const int differing = onebit::npu::compare_rows_bitwise(seq_rows.data(), bat_rows.data(), M, c_.NV, &mm);
+            std::fprintf(stderr, "[batchcheck] rows M=%d identical=%d differing=%d", M, M - differing, differing);
+            if (differing > 0)
+                std::fprintf(stderr, " first row=%d index=%d seq=0x%08x bat=0x%08x%s", mm.row, mm.index,
+                             (unsigned)mm.seq_bits, (unsigned)mm.bat_bits, mm.nan_mismatch ? " (NaN)" : "");
+            std::fprintf(stderr, "\n");
+        }
     } else if (getenv("NPU_BATCH_DBG")) {
         std::fprintf(stderr, "[batch] M=%d start=%d batched (%d layers, two_widths=%d)\n",
                      M, start_pos, c_.NL, (int)two_widths);
@@ -4187,13 +4498,21 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     {
         const int half = proportional ? HD / 2 : rot / 2;
         std::vector<float> cos_(half), sin_(half);
+        // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
+        // Below the model's original window this returns theta unchanged, which is what makes a short prompt
+        // bit-identical to the same model served without the scaling.
+        // engine#1792 review: the exponent is HF's `dim / (dim - 2)` over the ROTARY width (`dim = int(head_dim *
+        // partial_rotary_factor)`), which is `rot` here -- passing `HD` was wrong for any model that declares dynamic
+        // scaling together with partial_rotary_factor < 1. Unreachable in today's catalog, so this is a correctness
+        // constant rather than a behaviour change for any pack that exists.
+        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, rot);
         for (int i = 0; i < half; i++) {
             double inv;
             if (proportional) {
-                inv = 1.0 / std::pow((double)theta, 2.0 * (double)i / (double)HD);
+                inv = 1.0 / std::pow(rope_theta, 2.0 * (double)i / (double)HD);
                 if (i >= rot / 2) inv = 0.0;
             } else {
-                inv = 1.0 / std::pow((double)theta, (double)i / (double)half);
+                inv = 1.0 / std::pow(rope_theta, (double)i / (double)half);
                 // LongRoPE (MiniCPM4): ggml's rope applies the factor as
                 // `rope_yarn(theta / ff, ...)` (ggml-cpu/ops.cpp
                 // ggml_rope_cache_init), i.e. the angle is DIVIDED by
@@ -5008,6 +5327,55 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         if (npu::model::run_lm_head(*xd_, h.data(), via_target.data())) { logits = std::move(via_target); return true; }
     }
     if (!host_gemm_ && xd_ && xd_->head_ctx() && xd_->head_ctx()->gemv) return run_lm_head_gemv(h, logits);
+    if (host_gemm_ && host_gemm_i8_) {
+        // engine#1808: the head's integer twin. Without this the arm's head is a plain f32 matvec ("No I8Ctx is
+        // touched" below) while the device's head reads a packed quantised table, which is exactly the 0.30 max|d|
+        // that was left once every body GEMM had been shown bit-exact. The device packs its head tiles with
+        // lctx.packB_into(...) -> packB_blocked, so the arm builds them with the same rule through
+        // q4nx_pack_B_int8_blocked(): one multiplier per column, int8 codes. Chunked by vocabulary block, because a
+        // whole head image is H x V bytes (622 MB at this vocabulary).
+        const float inv_es = (sem_.tie_embeddings && sem_.embed_scale > 0) ? 1.0f / sem_.embed_scale : 1.0f;
+        const int TB = 8192;   // vocabulary block; a tile's image is H x TB bytes
+        if ((int)lm_head_i8_.size() != (NV + TB - 1) / TB) lm_head_i8_.assign((NV + TB - 1) / TB, HostI8Tensor());
+        logits.assign((size_t)NV, 0.0f);
+        std::vector<float> a8v((size_t)H);
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) {
+            const float v = std::fabs(h[(size_t)k] * inv_es);
+            if (v > amax) amax = v;
+        }
+        const float ascale = amax > 0 ? amax / 127.0f : 1.0f;
+        for (int k = 0; k < H; k++) {
+            int q = (int)std::round(h[(size_t)k] * inv_es / ascale);
+            a8v[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        }
+        std::vector<float> bt((size_t)H * (size_t)TB);
+        std::vector<int8_t> a8i((size_t)H);
+        for (size_t i = 0; i < a8v.size(); i++) a8i[i] = a8v[i];
+        for (int t = 0; t < (int)lm_head_i8_.size(); t++) {
+            const int n0 = t * TB, n1 = std::min(NV, n0 + TB), Tn = n1 - n0;
+            HostI8Tensor& c = lm_head_i8_[(size_t)t];
+            if (c.codes.empty()) {
+                for (int n = n0; n < n1; n++)
+                    for (int k = 0; k < H; k++) bt[(size_t)k * Tn + (n - n0)] = lm_at(n, k);
+                c.N = Tn;
+                c.codes.assign((size_t)H * (size_t)Tn, 0);
+                c.d.assign((size_t)Tn, 0.0f);
+                double ssum = 0.0;
+                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, /*blocked=*/1, c.d.data(), &ssum);
+            }
+            for (int n = 0; n < Tn; n++) {
+                int32_t acc = 0;
+                for (int k = 0; k < H; k++)
+                    acc += (int32_t)((int)c.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, H, Tn)] *
+                                     (int)a8i[(size_t)k]);
+                float v = c.d[(size_t)n] * (ascale * (float)acc);
+                if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                logits[(size_t)(n0 + n)] = v;
+            }
+        }
+        return true;
+    }
     if (host_gemm_) {
         // Offline mode: plain float matvec against the (possibly dequantized)
         // tied table, matching the Python reference.  No I8Ctx is touched.
@@ -5085,7 +5453,6 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     if (head_packed &&
         ((int)lm_head_packed_.size() != ntiles || lm_head_packed_T_ != T)) {
         lm_head_packed_.clear();
-        std::vector<float> bt(tile_elems);
         if (head_pb16i) {
             // The image is the file: no dequant, no pack, nothing to quantise on the host.  A
             // tile whose side table asks for the two-plane accumulator is refused, not guessed:
@@ -5112,20 +5479,76 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             fprintf(stderr, "  [forward] lm head: %d ternary image(s) resident (H=%d T=%d), "
                             "f32 head released\n", ntiles, H, T);
         } else {
+        // engine#1716: this loop used to gather and pack every tile on EVERY serve (10-17 s on a quiet box for the
+        // h4096 shapes, minutes on a contended one). The image is a pure function of the head's stored bytes and the
+        // kernel set's geometry, so a serve now asks q4nx_head_tile_image() for it: a previous serve's file is used
+        // when it reads back whole AND a sample of its columns re-packs to the same bytes from the weights held here;
+        // anything else packs exactly as before (same packer, same padded KD x ND image, same per-column scales as
+        // the per-token packB below) and leaves the file for the next serve. ONEBIT_HEAD_IMAGE_CACHE=0 turns it off.
+        const auto head_t0 = std::chrono::steady_clock::now();
+        std::string head_dir;
+        Q4nxHeadImageKey head_key = {(uint32_t)kpad_, (uint32_t)T, lctx.blocked_b ? 1u : 0u, 0};
+        {
+            const char* off = getenv("ONEBIT_HEAD_IMAGE_CACHE");
+            const bool cache_on = !(off && off[0] == '0' && off[1] == 0);
+            // The head's stored bytes: the separate lm_head.weight of an untied model, else the token table lm_at()
+            // falls back to (which a tied container may itself store as lm_head.weight).
+            TensorDesc* src = !lm_head_f_.empty() ? model_tensor_by_name(mw_, "lm_head.weight") : nullptr;
+            if (!src) {
+                src = &mw_->embed_tokens;
+                if (src->data_size == 0 || src->name[0] == '\0') src = model_tensor_by_name(mw_, "lm_head.weight");
+            }
+            const void* sp = (cache_on && src) ? model_tensor_data(mw_, src) : nullptr;
+            // An image the layout cannot hold as kd x nd bytes of T columns is not cached: it packs as before.
+            if (sp && src->data_size > 0 && (int)lctx.ND == T && (int)lctx.KD >= kpad_) {
+                // What changes the decoded head without changing its bytes: the vocabulary, the width it is read at,
+                // whether it is the tied table, and the dtype the decoder dispatches on.
+                uint32_t extra[8] = {(uint32_t)NV, (uint32_t)H, (uint32_t)lm_w_, lm_head_f_.empty() ? 1u : 0u, 0, 0, 0, 0};
+                std::memcpy(&extra[4], src->dtype, std::min(sizeof src->dtype, (size_t)16));
+                head_key.head_hash = q4nx_head_source_hash(sp, (size_t)src->data_size, extra, 8);
+                try {
+                    head_dir = onebit::npu::q4nx::cache_root() + "/head-images";
+                    std::error_code ec;
+                    std::filesystem::create_directories(head_dir, ec);
+                    if (ec) head_dir.clear();
+                } catch (const std::exception&) {
+                    head_dir.clear();   // no home and no ONEBIT_Q4NX_CACHE: pack, as before
+                }
+            }
+        }
+        struct HeadCol {
+            const Q4nxNpuForward* self;
+            int k;
+        } head_col = {this, kpad_};
+        const Q4nxHeadColFn head_col_fn = [](void* ctx, int n, float* out) {
+            const HeadCol* c = (const HeadCol*)ctx;
+            for (int k = 0; k < c->k; k++) out[k] = c->self->lm_at(n, k);
+        };
+        int head_hits = 0, head_wrote = 0;
         for (int t = 0; t < ntiles; t++) {
             const int n0 = t * T, n1 = std::min(NV, n0 + T);
-            std::fill(bt.begin(), bt.end(), 0.0f);   // padded columns must be zero
-            for (int n = n0; n < n1; n++)
-                for (int k = 0; k < kpad_; k++) bt[(size_t)k * T + (n - n0)] = lm_at(n, k);
             PackedWeight pw;
             pw.bo = lctx.make_weight_bo(*dev_);
-            float sout = 1.0f;
-            // Same packer, same padded KD x ND BO, same per-column scales as the
-            // per-token packB below, so the packed bytes are bit-identical.
-            lctx.packB_into(*pw.bo, bt.data(), kpad_, T, sout, pw.scales);
+            pw.scales.assign((size_t)lctx.ND > (size_t)T ? (size_t)lctx.ND : (size_t)T, 0.0f);
+            Q4nxHeadTileResult hres;
+            bool ok = false;
+            lctx.fill_weight_bo(*pw.bo, [&](int8_t* Bm) {
+                ok = q4nx_head_tile_image(head_dir.empty() ? nullptr : head_dir.c_str(), &head_key, t, n0, n1 - n0, kpad_,
+                                          T, lctx.KD, lctx.ND, head_col_fn, &head_col, Bm, pw.scales.data(), &hres) == 1;
+            });
+            if (!ok) {
+                err_ = std::string("lm head: ") + hres.why;
+                return false;
+            }
+            if (hres.refused)
+                fprintf(stderr, "  [forward] lm head: tile %d's cached image was NOT used and is replaced: %s\n", t, hres.why);
+            head_hits += hres.hit;
+            head_wrote += hres.wrote;
+            pw.scales.resize((size_t)T);
             lm_head_packed_.push_back(std::move(pw));
         }
         lm_head_packed_T_ = T;
+        const double head_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count();
         // Both f32 copies are now dead on this path: lm_head_tiles_ was only ever
         // read by the memcpy below, and lm_at() is reachable only from the
         // host_gemm_ branch (which returns above) and from the gather just done.
@@ -5134,8 +5557,9 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         lm_head_f_.clear();
         lm_head_f_.shrink_to_fit();
         fprintf(stderr, "  [forward] lm head: %d packed weight tile(s) resident "
-                        "(H=%d T=%d), f32 head + f32 tile gather released\n",
-                ntiles, H, T);
+                        "(H=%d T=%d), f32 head + f32 tile gather released; %d from the image cache, %d packed "
+                        "(%d written for the next serve) in %.2f s\n",
+                ntiles, H, T, head_hits, ntiles - head_hits, head_wrote, head_s);
         }
     }
     std::vector<float> Bt;

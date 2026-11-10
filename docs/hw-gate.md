@@ -52,8 +52,8 @@ compiled `ggml/src/ggml-hrx` at PR time, and every pin bump merged that week rea
 hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
 
 - **When.** On every same-repo PR that changes an input of that build: the `third_party/llama.cpp` or
-  `third_party/hrx-system` gitlink, `CMakeLists.txt`, `cmake/hrx.cmake`, `config/hrx-toolchain.config`,
-  `config/hrx-system-hold.config`, `app/serve.cpp` (the HRX wiring) or the workflow itself. It also runs by hand
+  `third_party/hrx-system` gitlink, `CMakeLists.txt`, a `cmake/tests-*.cmake` family file, `cmake/hrx.cmake`,
+  `config/hrx-toolchain.config`, `config/hrx-system-hold.config`, `app/serve.cpp` (the HRX wiring) or the workflow itself. It also runs by hand
   (Actions -> hrx-build -> Run workflow). It needs no label.
 - **Configure only, for a test registration.** A PR whose only change among those inputs is a ctest registration
   added to `CMakeLists.txt` or to a `cmake/tests-*.cmake` family file it includes (`add_test(...)`,
@@ -78,13 +78,39 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   add-on (the gate builds that) and does not dispatch anything. Green means the pinned pair builds into the engine. It
   does not replace the `hw-gate` label on a pin bump.
 
-> **Between about 21:0x and 23:1x on 2026-11-09 this job failed on every branch, and a red badge was not a signal** (engine #1733).
+> **From 20:01 to 21:52Z on 2026-11-09 this job failed on every branch that ran it, and a red badge was not a signal** (engine #1733).
 > Three errors sat in `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as
 > `bool`, and two declarations that differ only in return type — on every branch measured (five of them), and #1681's pin bump
-> failed the same way at 9m15s while its `build` was green. The window is closed: later runs pass, including one whose pins are
-> **exactly `main`'s** (`bump-hrx/831629fe`, 00:21, `llama.cpp` `831629fe9` + `hrx-system` `7f4236924`), so the failure was not a
-> property of the pins in the tree — which is what the same pins failing four hours earlier had seemed to say. Read a red badge as
-> meaningful again; if it returns, that run's own log is the evidence, not the earlier window.
+> failed the same way at 9m15s while its `build` was green. It was a property of the pin, and the pins say so:
+>
+> | | `hrx-system` | `llama.cpp` | result |
+> |---|---|---|---|
+> | red window, 20:01–21:52 (`8f124f906`; 13 of the 15 failing runs) | `7f4236924` | **`8f124f906`** | failure |
+> | 21:00, 21:01 (`1bit/pack-blocked-*`) | `7f4236924` | `b970d85ba` | failure, **unexplained** (see below) |
+> | first green, 21:41 (`bump-hrx/60ae4c935`) | `7f4236924` | **`60ae4c935`** | success |
+> | green from 22:04 (`bump-hrx/831629fe` 00:21) | `7f4236924` | `831629fe9` | success |
+>
+> `hrx-system` is the same throughout and `llama.cpp` is not. At `8f124f906`, `ggml-hrx.cpp` declares `device_free_total`
+> twice — `void` from #252's forward declaration at `:383`, `bool` from #240's eight hundred lines later — so the
+> translation unit cannot compile. **The pin that closed the window is `60ae4c935`, from #1736**, which carries the fork
+> fix (llama.cpp #260, `4e570337a`): it is green from 21:41Z, before `831629fe` existed. #1759's `831629fe` is a *later*
+> bump (green at 00:21) and did not end the window — an earlier version of this paragraph credited it, which the runs
+> contradict. The window closed because the pin moved, not because the failure was transient.
+>
+> **Two of the fifteen failing runs are not this failure**, and saying so is the point of a window: `21:00`
+> (`1bit/pack-blocked-extract`, run 42698418833) and `21:01` (`1bit/pack-blocked-rowmajor`) ran on the **older** pin
+> `b970d85ba` with the same `hrx-system` `7f4236924`, and I could not re-verify whether that pair built green earlier
+> (those commits are no longer fetchable), while `gh run view 42698418833 --log-failed` returns nothing. So: thirteen runs
+> on `8f124f906` are the redeclaration, two are unexplained, and neither is evidence for the other.
+>
+> One red run after the window is worth knowing about, because it is not this failure: `2026-11-10 02:23` on `1b02be9`
+> (pin already `5514ebea`) failed in **"Wait for memory (or refuse)" with exit 75** — `gh run view 42742403894
+> --log-failed` — a memory gate on the box, not a compile error. A red `hrx_build` on a pin newer than `60ae4c935` is
+> therefore not evidence that this break returned.
+>
+> So read a red badge as meaningful, and treat a `llama.cpp` bump whose run leaves `hrx_build` red as a bump that has not
+> landed — which is what the `hw-gate` label is for, and what #1768 did before merging (`hrx_build` pass, 1m10s). If a red
+> run ever returns without the pin changing, that run's own log is the evidence.
 
 ## What it checks
 

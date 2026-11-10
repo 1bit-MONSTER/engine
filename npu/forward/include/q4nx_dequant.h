@@ -83,6 +83,18 @@ void q4nx_dequant_tile_q8(const uint8_t* chunk, float* out, int ld);
  * geometry/size mismatch. */
 int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
                                 int cols, int chunk_bytes, float* out);
+/* ONE row of the same chunked (tiled) tensor, decoded without decoding the table: row `r` lives as row `r % 32` inside
+ * each of `cols / 256` tiles, so this reads those tiles and nothing else. A loader that reads a row per token needs no
+ * table-sized buffer, which is the difference between 0.74 GiB of packed container and its 4.74 GiB f32 expansion
+ * (engine#1784). Returns 0 and writes `cols` floats, or -1 for the same conditions q4nx_dequant_tensor_chunked()
+ * refuses, plus an out-of-range row. The values are the ones that function would place at that row, bit for bit. */
+int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols, int chunk_bytes, int r,
+                          float* out /* cols */);
+/* The chunk kind q4nx_dequant_tile_row() would accept for a [rows, cols] table of `nbytes`, or 0 when it would refuse
+ * every row: rows a multiple of 32, cols a multiple of 256, and nbytes exactly (rows/32)*(cols/256) tiles of one of the
+ * three kinds. A loader that picks the per-row path asks this first (engine#1842): choosing it on `nbytes % tiles == 0`
+ * alone let a table the reader refuses load fine and then serve every embedding read as 0.0f. */
+int q4nx_tile_row_kind(size_t nbytes, int rows, int cols);
 
 /* The (rows, cols) tile grid a container actually stores, when it is LARGER than the model's.
  *
@@ -142,6 +154,13 @@ int q4nx_dequant_plain_bf16(const uint8_t* data, int rows, int cols, float* out)
  * Returns 0 on success, -1 on a geometry mismatch. */
 int q4nx_dequant_plain_i8(const uint8_t* data, const float* scale, int rows,
                           int cols, float* out);
+
+/* One element of the same table `q4nx_dequant_plain_i8()` decodes, without decoding the table: what a loader needs
+ * to read a row per token out of a read-only mapping instead of expanding the whole table into RAM (engine#1784).
+ * `row`/`col` out of range give 0.0f. `scale` may be NULL, which is the unscaled int8 table. The arithmetic is the
+ * one in the loop above -- `(float)q * scale[row * groups + col / group]` -- so a row read this way is bit-identical
+ * to the same element of the fully decoded table, which is what the test pins. */
+float q4nx_plain_i8_at(const uint8_t* data, const float* scale, int rows, int cols, int row, int col);
 
 #ifdef __cplusplus
 }

@@ -262,6 +262,34 @@ cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader tha
 device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
 the bf16 rounding reappears for the device, never in the container.
 
+**The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
+packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
+with its own scale — and until this cache that happened on every serve. The image is a function
+of the head's stored bytes and of the kernel set (`kpad`, the tile width `T`, the blocked or
+row-major layout), so the forward keeps it in `<Q4NX cache>/head-images/` as
+`headimg-<key digest>-t<tile>.q4hi`, one file per tile. The digest covers the format version,
+`kpad`, `T`, the layout, and a hash of the head tensor's bytes together with the vocabulary size,
+the width and the dtype it is decoded at, so another container, another kernel set or a re-import
+names different files.
+
+A cached tile is used only when both of these hold, otherwise it is packed as before and the file
+is replaced, with one stderr line saying why:
+
+- the file reads back whole: format version, geometry and the hash over its payload
+  (`q4nx_head_image_read`);
+- a sample of its columns (8 per tile, both ends and an even spread) packs to the same scale and
+  the same codes from the weights the forward holds at that moment, through the production packer
+  (`q4nx_pack_B_int8_blocked`). This is the check a payload hash cannot make: an intact image
+  written for other weights is caught here.
+
+The serve log line says what happened: `lm head: N packed weight tile(s) resident (…); H from the
+image cache, P packed (W written for the next serve) in S s`. `ONEBIT_HEAD_IMAGE_CACHE=0` turns
+the cache off (nothing is read or written). The files are `kd × nd` bytes plus `nd` scales per
+tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set; nothing prunes them,
+the same as the device-form copies next to them. Ternary (`pb16i`) heads and the gemv head do not
+use it: their image already is a file. The behaviour is pinned host-side in
+`tests/npu_design_grid_test.c` with a counter on the gather.
+
 **Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
 embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors
 (untied lm_head, projections) store it at `(r/16)*4096 + (k/32)*512 + (k%32)*16 + r%16`.
@@ -511,6 +539,41 @@ Consequences a reader will otherwise trip over:
 An **M≥256 t2s family** is what removes the 8x launch overhead; it is private-repo kernel work (`npu-kernels`) with the same byte-exact gate the M=16
 family passes, and the acceptance row is: both Llama3-8B prefill shapes (`K=4096 N=14336`, `K=14336 N=4096`) at M = 256 / 1024 / 16384, ≥ 4 TFLOP/s,
 byte-exact logits against the current path on a fixed prompt set, `amdxdna` counter 0.
+
+#### Where a prefill block's time goes now (measured), and why it is no longer the pack (#1416)
+
+#1416 was filed on a `[prof] pre` table whose `pack` column read 24 ms per launch against 1.3 ms of device wait. That
+column was the first-touch weight fill of a fresh serve, not a per-request cost, and three merged changes removed it
+from every request: the weight cache is filled before the serve says ready (#1621), the fill reads each image into its
+BO (above), and only the rows that exist are quantised. Re-measured on the same pack (`bonsai2-27b-t2s2`, 2026-11-10,
+`npu-hold` tickets, `amdxdna` error count unchanged across each), a 5-token prompt for 8 tokens costs **2.99 s as the
+first request of a serve and 2.90 s as the second and third**, and a 510-536-token prompt reaches its first token at
+**20.2-21.7 tok/s** (`prompt_tokens / wall`, `max_tokens 1`, distinct prompts).
+
+One 16-row block of that prefill, from the serve's own `[bs]` and `[bl]` lines (`NPU_PHASE_PROF=1`; medians over 103
+blocks per arm, two arms per binary run A B B A in one ticket):
+
+| term of a 16-row block | before | after | |
+|---|---:|---:|---|
+| block wall | 734-749 ms | **688-704 ms** | 21.4-21.8 -> **22.7-23.3 rows/s** |
+| device wait (416 launches) | 213-214 ms | 215-217 ms | unchanged: 29-31 % of the block |
+| `gemm pack` | 55.6-56.6 ms | 55.6-58.4 ms | 0.13 ms/launch: 7-8 % of the block, where #1416 read 93 % |
+| host outside the GEMM launches | 392-407 ms | **342-353 ms** | the majority term |
+| of which GDN alpha/beta | 77.5-77.8 ms | **13.1-13.5 ms** | the change below |
+| of which GDN recurrence | 30.5-33.4 ms | 27.0-30.0 ms | |
+
+So prefill on this route is bound by host work outside the launches and by the M=16 launch geometry above, in that
+order, and not by packing. "After" is one change: the per-(row, head) alpha/beta dot products of a GDN layer ran on one
+thread inside the row loop (0.099 ms per row and layer, 48 GDN layers), and they now run as a second worksharing loop
+inside the parallel region that layer already opens for the recurrence. No region is added, because the region count is
+what a loaded box pays for. Each dot product is the same sequential loop as before and the build has no `-ffast-math`,
+so no bit moves: greedy text is identical in all four arms, and `NPU_GDN_CHECK=1` recomputes the serial form for every
+layer and compares bit patterns (336 of 336 layer passes identical on the device at M = 1, 4 and 16; a mismatch fails
+the call). `tests/gdn_batch_order_test` requires those check lines on any hybrid container named by `ONEBIT_TEST_Q4NX`.
+
+A request wall moves less than the block does and scatters more: the same four arms measured 20.2-21.7 tok/s before and
+21.6-23.1 after by TTFT, with one outlier in each direction (18.3 and 15.8) from other lanes' load. Quote the block
+medians for the effect and the TTFT range for what a caller sees.
 
 #### Per-tile arithmetic ceiling, and where our GEMMs sit against it (AM027)
 
@@ -909,6 +972,25 @@ What converts, and how faithfully:
 | `model.norm` (final) | `.fconst`, the tail envelope at `layers x stride` | bf16 | byte-exact |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
+**A multi-component pack's per-layer embedding** (engine#1725). gemma-4's embedding component
+carries, beside the token table, `embed_tokens_per_layer.weight` (`vocab x layers*P` f32; 262,144 x
+8,960 on e2b, 9.4 GiB), a `P`-wide `per_layer_projection_norm.weight` shared by every layer, and
+the context projection `per_layer_model_projection.weight_t_Q4` quantised at block 32. The import
+writes them under the names the forward loads:
+
+| container tensor | from | form |
+|---|---|---|
+| `model.per_layer_token_embd.weight` `[vocab, layers*P]` | the f32 table | BF16, round to nearest even |
+| `model.per_layer_proj_norm.weight` `[P]` | the norm | BF16 |
+| `model.per_layer_model_proj.weight_layer{l}` `[P, hidden]` | the projection, dequantised, one per layer | BF16 |
+
+The table is never held in memory, in either form: the reader points into the component's mapped
+external data (its extent is checked once, when it is located), and the container writer converts
+it 32 rows at a time while it writes the file. A projection with no zero-point tensor takes the
+implicit zero point 8, the same rule as every other MatMulNBits here. `config.json` gets
+`hidden_size_per_layer_input` and `vocab_size_per_layer_input` only when all three parts went into
+the container, because those two keys are what switch the block on in the forward.
+
 An OGA pack keeps its tensors inside the `If` branches: the top-level graph has **no
 initializers** and four nodes (`Shape`/`Constant`/`Equal`/`If`). The importer walks the
 subgraphs. The 4-bit decode is `w = (code - zp) * scale` with two codes per byte (low nibble
@@ -1054,6 +1136,17 @@ their hidden sizes differ). `plan()` accepts a block of 2 or 4 headers, checks e
 that arithmetic to the byte, and refuses any other count by name. FACTS §7.24 has the tables and
 the checkpoint evidence.
 
+**A 2-header block can carry the gains too, in the other order** (engine#1889, engine#1934). The
+Hunyuan packs declare `use_qk_norm: true` and keep one header per block: the gains are the 640 B
+between the last q/k/v tile and o_proj, which the pack's metadata names as one tensor
+(`model.layers.L.attn.q_norm.layernorm.weight.qk_rms_packed_26_L`, bf16 `[320]`). Its layout is
+`[64 B zeros][q_norm, bf16 [128]][64 B zeros][k_norm, bf16 [128]]` — **q first**, the reverse of
+the Qwen3 sections above. The order is not readable from the bytes (the two gains differ by about
+one bf16 ulp in a few elements, so both look like a gain), so it was taken from the pack's own
+graph: `model.onnx` carries `attn.q_norm.layernorm.weight` and `attn.k_norm.layernorm.weight` as
+FP16 `[128]` initializers, and on Hunyuan-7B-Instruct their bf16 rounding is the first and the
+second block bit for bit in 32 of 32 layers. `qk_gain_offsets()` holds that arithmetic.
+
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
 one comparison holds every field, index and nibble order at once, and it is why a tile whose
@@ -1071,6 +1164,10 @@ what it can and records the rest in the container's `__metadata__` (`incomplete`
 `config.json` (`q4nx_source.incomplete`). The shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
 now imports whole — **291 tensors, 67,088 tiles, no refusals**: embedding, head, the 48 layer
 norms, the final norm, 96 attention projections, 72 attention biases and 72 MLP projections.
+That holds for a pack whose layer projections are graph initializers (no `.fconst`) too: a
+projection the decoder cannot read, for example codes present but no scales tensor beside them,
+is refused by name like any other. It used to be skipped, so the import reported no refusals over
+a container missing that projection (engine#1841).
 
 ### The final norm, and the tail envelope
 
@@ -1348,6 +1445,28 @@ again to get the logits the answer is drawn from. Restoring `cached - 1` positio
 `cached` is what the KV alone would allow, and it applies the last token's GDN update twice: measured on the first
 version of this fix, the cache hit (`[prefix] slot=0 cached=179 of 180 reason=hit`, TTFT 5.3 s against 15.6 s) and
 answered the same prompt with different, fragmented text.
+
+### The prefix cache's pinned slot: single-turn requests under one system prompt (engine#1785)
+
+A slot holds a whole prompt, and a request hits a slot only when the slot is a prefix of it. Requests that
+share a system prompt and differ in the user turn therefore reuse nothing from each other: `system + question 1`
+is not a prefix of `system + question 2`. `tests/npu_sampling_test.cpp` (`test_prefix_pin`) states that as its
+first row: a 900-token system prompt, a second question, `cached_tokens: 0`.
+
+The slot table (`app/npu_prefix_cache.h`) has a slot kind for the part such requests do share:
+
+| call | what it decides |
+|---|---|
+| `pin_point(prev, ids)` | how many leading tokens this request shares with the previous one. 0 when one prompt is a prefix of the other (a repeat or a continued conversation, which the ordinary slots already keep), when the shared part adds fewer than `--prefix-min-gain` tokens over a slot that already covers the request, or when the cache is off |
+| `pin(prefix, bytes)` | keep the state at that point. One pinned slot at a time: a new pin replaces it; eviction for room and a longer prompt's replacement both leave it alone |
+| `lookup(ids)` | unchanged, and reports `pinned` when the hit is the pinned slot |
+
+It reads token ids only, so it does not depend on the template or on which message is the system prompt.
+
+**State of this, plainly:** the table and its tests are in; `forward-serve` does not call `pin_point()`/`pin()`
+yet, so no request is faster because of it today. The forward half is one more cut in the prefill loop (stop one
+token short of the pin point, `snapshot_state`, `pin`), and it needs a device run to be claimed.
+
 
 ### Sampling and structured output
 
@@ -1976,6 +2095,13 @@ the images it writes.
 `tools/mtp_acceptance --offline` scores the drafter alone on the base's own greedy stream, `--live` runs the loop,
 `--live --match` scores both **at the loop's own chain positions** (so the two per-depth tables are one measurement
 sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
+
+`NPU_BATCH_CHECK=1` is the oracle underneath that check. Every `step_batch` first replays its rows with sequential
+`step()` calls and prints `[batchcheck] M=.. positions=a..b` with the argmax at the last row and a bitwise row count
+(`identical=N differing=0`). Both passes continue the same prefix: the oracle snapshots the first `start_pos`
+positions before the replay and restores them afterwards (engine#1905). So a chunk after the first, or the serve
+path's split-off last token, is compared from the state the batched pass really continues, and the flag leaves the
+run's own output unchanged. `tests/batch_check_state_test.cpp` pins both properties.
 
 `tools/mtp_depth_pool.py` pools those tickets. It refuses a pool it cannot read (a repeated tail, a cell scored twice, a
 short read, a mixed budget, a mixed window identity) and, since the tau=0.6 window, it also says when a depth is too

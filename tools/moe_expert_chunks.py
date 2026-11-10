@@ -91,6 +91,27 @@ def quantise(wt):
     return codes, d
 
 
+def quantise_i8_row(a):
+    """[K] float32 activations -> (a8 int8, scale float32): symmetric int8, the rule `q4nx_quant_i8::row` uses.
+
+    Exposed next to the accumulation below so a host int8 arm and this gate share one definition (engine#1808): a
+    host that scaled by max|a|/128 or clipped to -128 would differ by a rounding step and the gate would read that
+    as a kernel defect.
+    """
+    scale = float(np.abs(a).max() / 127.0) or 1.0
+    return np.clip(np.rint(a / scale), -127, 127).astype(np.int8), scale
+
+
+def int32_accum(codes, a8):
+    """codes^T . a8 in int32, exactly: the contraction the MoE gate uses, and the one a per-op host arm must match.
+
+    Exact, not approximate: |code| <= 8 and |a8| <= 127, so |sum| <= 8*127*K - 2,080,768 at K=2048 and 11,184,128 at
+    K=11008, both far inside int32. That is what lets a family gate demand `max|d| == 0` against a host reference
+    instead of a cosine (engine#1808); a K beyond ~2.1e6 would break the bound and the accumulator would have to widen.
+    """
+    return codes.astype(np.int32).T @ a8.astype(np.int32)
+
+
 def dequantise(codes, d):
     return codes.astype(np.float32) * np.repeat(d, GROUP, axis=0)
 
@@ -330,11 +351,10 @@ def gate(args):
         a = a_row(e)
         if a.shape[0] != K:
             raise SystemExit(f"{name}: expert {e}'s A row is {a.shape[0]}, the contraction is {K}")
-        ascales[e] = float(np.abs(a).max() / 127.0) or 1.0
-        a8s[e] = np.clip(np.rint(a / ascales[e]), -127, 127).astype(np.int8)
+        a8s[e], ascales[e] = quantise_i8_row(a)
         wq = pad_n(container_expert(q, name, e), args.pad_n)
         codes, d = quantise(wq)
-        exact = codes.astype(np.int32).T @ a8s[e].astype(np.int32)      # [N]
+        exact = int32_accum(codes, a8s[e])                              # [N]
         expected[e] = {"d_max": float(d.max()),
                        "d_bits": d.astype(np.float16).view(np.uint16).tolist(),
                        "int32": exact.tolist()}

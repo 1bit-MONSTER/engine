@@ -123,6 +123,43 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
     return 0;
 }
 
+/* engine#1784: see the declaration. The tile grid and its ordering are q4nx_dequant_tensor_chunked()'s -- a row lives
+ * inside one tile-row, at offset r % Q4NX_TILE_ROWS of each tile across the row -- so the two cannot disagree about
+ * where a row starts. No OpenMP: this is called per token, with one row to do. */
+int q4nx_dequant_tile_row(const uint8_t* data, size_t nbytes, int rows, int cols, int chunk_bytes, int r, float* out) {
+    if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    if (r < 0 || r >= rows) return -1;
+    if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
+    if (chunk_bytes != Q4NX_TILE_BYTES && chunk_bytes != Q4NX_CHUNK_Q4K &&
+        chunk_bytes != Q4NX_CHUNK_Q8)
+        return -1;
+    const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
+    if (nbytes < (size_t)ntr * (size_t)ntc * (size_t)chunk_bytes) return -1;
+    const int tr = r / Q4NX_TILE_ROWS, rr = r % Q4NX_TILE_ROWS;
+    float tmp[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
+    for (int tc = 0; tc < ntc; tc++) {
+        const uint8_t* c = data + (size_t)(tr * ntc + tc) * (size_t)chunk_bytes;
+        if (chunk_bytes == Q4NX_CHUNK_Q4K)
+            q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
+        else if (chunk_bytes == Q4NX_CHUNK_Q8)
+            q4nx_dequant_tile_q8(c, tmp, Q4NX_TILE_COLS);
+        else
+            q4nx_dequant_tile(c, tmp, Q4NX_TILE_COLS);
+        memcpy(out + (size_t)tc * Q4NX_TILE_COLS, tmp + (size_t)rr * Q4NX_TILE_COLS,
+               Q4NX_TILE_COLS * sizeof(float));
+    }
+    return 0;
+}
+
+int q4nx_tile_row_kind(size_t nbytes, int rows, int cols) {
+    if (rows <= 0 || cols <= 0 || rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return 0;
+    const size_t tiles = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
+    const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
+    for (int i = 0; i < 3; i++)
+        if (nbytes == tiles * (size_t)kinds[i]) return kinds[i];
+    return 0;
+}
+
 int q4nx_packed_grid(size_t nbytes, int rows, int cols, int* cb_out, int* rp_out, int* cp_out) {
     const int kinds[3] = {Q4NX_TILE_BYTES, Q4NX_CHUNK_Q4K, Q4NX_CHUNK_Q8};
     if (rows <= 0 || cols <= 0 || rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return 0;
@@ -270,4 +307,16 @@ int q4nx_dequant_plain_i8(const uint8_t* data, const float* scale, int rows,
         }
     }
     return 0;
+}
+
+/* engine#1784: the element-wise form of the loop above, for a loader that reads one row at a time out of the
+ * container's mapping instead of materialising the table. Kept beside the loop so the two cannot drift: the group
+ * index and the scale row are computed the same way, and out-of-range coordinates are 0.0f (the caller's pad
+ * columns read as zero, which is what the fully decoded table holds there). */
+float q4nx_plain_i8_at(const uint8_t* data, const float* scale, int rows, int cols, int row, int col) {
+    if (!data || rows <= 0 || cols <= 0 || (cols % Q4NX_GROUP_SIZE) != 0) return 0.0f;
+    if (row < 0 || row >= rows || col < 0 || col >= cols) return 0.0f;
+    const int groups = cols / Q4NX_GROUP_SIZE;
+    const float v = (float)((const int8_t*)data)[(size_t)row * (size_t)cols + (size_t)col];
+    return scale ? v * scale[(size_t)row * (size_t)groups + (size_t)col / Q4NX_GROUP_SIZE] : v;
 }

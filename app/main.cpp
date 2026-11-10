@@ -139,7 +139,10 @@ int run_npu(int argc, char** argv) {
             std::printf("usage: 1bit npu-run --model <dir> --kernels <dir> --ids \"<id> <id> ...\"\n"
                         "                    [-n 24] [--repetition-penalty 1.1] [--no-eos] [--dump-logits <dir>]\n"
                         "  --model    directory with model.q4nx and config.json\n"
-                        "  --kernels  directory with layer_ctx{1,2,17}.elf, lmhead.elf and layer.pdi\n");
+                        "  --kernels  the pack's kernel directory. Two generations are driven: the per-role lane set\n"
+                        "             (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi) as a token loop, and the sealed set\n"
+                        "             (SEALED-*/full_i8_*) through the in-tree forward as ONE multi-row pass, printing each\n"
+                        "             row's choice (engine#1862; -n does not apply to the sealed route)\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
     }
@@ -147,6 +150,35 @@ int run_npu(int argc, char** argv) {
     std::vector<int> prompt;
     std::istringstream in(ids);
     for (int t; in >> t;) prompt.push_back(t);
+
+    // engine#1862: a kernel directory from the sealed/full-ELF generation has no layer_ctx*.elf, and the bare
+    // "cannot read <dir>/layer_ctx1.elf" from npu/lane.cpp reads as a missing file rather than a different route.
+    // Name the generation that IS there, and the command that drives it.
+    {
+        namespace fs = std::filesystem;
+        if (!fs::exists(fs::path(kernel_dir) / "layer_ctx1.elf")) {
+            int sealed = 0;
+            std::error_code ec;
+            for (const auto& ent : fs::directory_iterator(kernel_dir, ec)) {
+                const std::string name = ent.path().filename().string();
+                if (ent.path().extension() == ".elf" &&
+                    (name.rfind("SEALED-", 0) == 0 || name.rfind("full_i8_", 0) == 0))
+                    ++sealed;
+            }
+            if (sealed > 0) {
+                // engine#1862: this is every pack on disk, so refuse-and-redirect was the wrong answer for the CLI that
+                // exists to hand N ids to ONE pass. The sealed set is driven by the same in-tree forward `forward-serve`
+                // uses; run the ids through it and print each row's choice.
+                std::fprintf(stderr, "1bit npu-run: sealed kernel set (%d ELF(s)), one multi-row pass through the "
+                                     "in-tree forward\n", sealed);
+                return onebit::run_forward_ids(model_dir, kernel_dir, prompt, opt.max_tokens,
+                                               opt.repetition_penalty, std::getenv("NPU_INFER_HOST_GEMM") != nullptr);
+            }
+            throw std::runtime_error("no kernel set in " + kernel_dir +
+                                     ": neither layer_ctx1.elf (the per-role set npu-run drives) nor a SEALED-*/full_i8_* "
+                                     "ELF (the sealed set) is present");
+        }
+    }
 
     const onebit::npu::Model model(model_dir);
     auto t0 = std::chrono::steady_clock::now();

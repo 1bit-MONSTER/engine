@@ -1661,10 +1661,17 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                     const float s = bf16_to_f32(uint16_t(scales[r * 2] | (scales[r * 2 + 1] << 8)));
                     // four int4 zero points per row, one per 32-column group of the 128-column block
                     const uint8_t z0 = zeros[r * 2], z1 = zeros[r * 2 + 1];
-                    const uint8_t zp[4] = {uint8_t(z0 & 0xF), uint8_t(z0 >> 4), uint8_t(z1 & 0xF), uint8_t(z1 >> 4)};
+                    // Both fields are int4 in TWO'S COMPLEMENT, not 0..15 (the pack's own writer asserts -8 <= x <= 7,
+                    // FACTS-oga-pack-weight-layout.md §7.13). Reading them unsigned is only equivalent when the code and
+                    // its zero point happen to share a sign: for one negative and one positive the difference is off by
+                    // 16 * scale, which is ~16 codes wide and dominates the weight. That is what left phi-4 answering
+                    // '都都都都': every row where the two differed in sign became a near-constant matrix (engine#1503).
+                    const int zp[4] = {int8_t(z0 << 4) >> 4, int8_t(z0) >> 4, int8_t(z1 << 4) >> 4, int8_t(z1) >> 4};
                     for (int g = 0; g < 4; ++g) {
                         q.scale[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = s;
-                        q.zero[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = float(zp[g]);
+                        // The container's form is w = code*d + m with code in 0..15 and m the group MIN, so the signed
+                        // code c becomes c + 8 and m becomes (-8 - z) * scale: (c+8)*s + (-8-z)*s == (c - z)*s exactly.
+                        q.zero[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = float(-8 - zp[g]) * s;
                     }
                     for (int c = 0; c < 128; ++c) {
                         // Row-major: a row's 128 codes are 64 contiguous bytes, even column in the low nibble.
@@ -1679,7 +1686,10 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                             const uint8_t b = quants[(cp % 4) + c * 4 + (cp / 4) * 512];
                             nib = (r % 2 == 0) ? uint8_t(b & 0xF) : uint8_t(b >> 4);
                         }
-                        q.codes[size_t(row) * K + (kk - 1) * 128 + c] = nib;
+                        // signed int4 -> the container's 0..15 offset from the group minimum: c_signed = nib-16 for a
+                        // negative nibble, then +8. A no-op would have been `nib`, which is the bug this replaces.
+                        const int cs = (nib >= 8) ? int(nib) - 16 : int(nib);
+                        q.codes[size_t(row) * K + (kk - 1) * 128 + c] = uint8_t(cs + 8);
                     }
                 }
             }

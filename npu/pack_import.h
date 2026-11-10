@@ -462,6 +462,10 @@ const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std:
 // weights into the wrong projections while every anchor still lines up), and a row that a merge silently drops (the
 // h4096 row was lost twice that way, which un-measured a whole model class with nothing failing).
 const Fconst19Rule* fconst19_rules(int* count);
+// True when the pack's own config declares a per-head q/k RMSNorm (`use_qk_norm`/`qk_norm`, top level or under
+// `text_config`). Exposed so a test can pin the declaration reading: engine#1889 is the case where the declaration was
+// ignored and the import silently ran without the norm.
+bool declared_qk_norm(const std::string& pack_dir);
 // The preference order for the 1.9 canonical .fconst scratch copy (engine#1801): the explicit override, then the on-disk cache
 // directory, then the temp directory and the cwd. Exposed so a test can pin the order -- the bug that shipped once was a cache
 // directory that was never created, so every pack silently fell through to tmpfs.

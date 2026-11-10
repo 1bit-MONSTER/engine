@@ -315,6 +315,24 @@ OnnxModel parse_onnx(const std::string& path) {
     return m;
 }
 
+// The pack's own declaration of a per-head q/k RMSNorm (engine#1889). Hunyuan-7B states `use_qk_norm: true` in
+// config.json; the block arithmetic below then failed to find the gains, the flag landed on false, the import reported
+// byte-exact tiles, and the forward normalised nothing -- so the model answered gibberish with no error anywhere. The
+// declaration is read so that case becomes a named refusal instead of a silent omission.
+bool pack_declares_qk_norm(const std::string& pack_dir) {
+    for (const char* fn : {"config.json", "model_config.json"}) {
+        std::ifstream f(pack_dir + "/" + fn);
+        if (!f) continue;
+        json j;
+        try { j = json::parse(f); } catch (...) { continue; }
+        const json* c = &j;
+        if (j.contains("text_config") && j["text_config"].is_object()) c = &j["text_config"];
+        for (const char* k : {"use_qk_norm", "qk_norm"})
+            if (c->contains(k) && (*c)[k].is_boolean() && (*c)[k].get<bool>()) return true;
+    }
+    return false;
+}
+
 // ── the .fconst files: layer block geometry (observed, byte-exact) ───────────
 // amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md §2.1. Every layer block opens
 // with bf16 1e-6 (the RMSNorm epsilon, little-endian 86 35), which is what locates a
@@ -1862,6 +1880,9 @@ bool fconst_scratch_ready(const std::string& dir) {
     return fs::is_directory(dir, ec) && !ec;
 }
 
+// engine#1889: the public spelling of the declaration check above (the internal one lives in the anonymous namespace).
+bool declared_qk_norm(const std::string& pack_dir) { return pack_declares_qk_norm(pack_dir); }
+
 std::vector<std::string> fconst_scratch_dirs() {
     // Where the canonical .fconst copy may live, in preference order. A function because the ORDER is the fix from engine#1801 and
     // the reviewer's ask was a test that pins it: on strixhalo /tmp is tmpfs, so the first choice has to be disk, and a version of
@@ -3054,6 +3075,16 @@ Plan plan(const std::string& pack_dir) {
     // source from the .fconst's two per-head sections but the same tensor in the container.
     const bool graph_qk_norm = graph_weights && !onnx.index.empty() &&
                                onnx.index.count("model.layers.0.attn.q_norm.layernorm.weight");
+    // engine#1889: the pack says it has per-head q/k norms and neither source found them. Refuse by name -- importing
+    // without them is a wrong answer that reads like a clean run.
+    if (declared_qk_norm(pack_dir) && !p.knorm_off && !graph_qk_norm)
+        throw std::runtime_error(
+            "this pack declares use_qk_norm: true, so its per-head q/k RMSNorm gains must be applied, but they were found "
+            "in neither place this importer looks: the layer block's two per-head sections (hidden " + std::to_string(d.hidden) +
+            ", " + std::to_string(d.heads) + " heads, so the arithmetic expects a gain section after the q/k/v bundle) and the "
+            "graph's model.layers.0.attn.q_norm.layernorm.weight. Importing without them would normalise nothing and answer "
+            "quiet nonsense from byte-exact weights, which is the failure this refusal exists to prevent (engine#1889).");
+
     if (p.knorm_off || graph_qk_norm)
         for (int L = 0; L < d.layers; ++L)
             for (const char* nm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {

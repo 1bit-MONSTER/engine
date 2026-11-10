@@ -2707,6 +2707,25 @@ void test_fconst_scratch_order() {
     std::printf("fconst scratch: order is override -> disk cache -> temp/cwd, pinned\n");
 }
 
+// engine#1889: the pack's own use_qk_norm declaration has to be read, because the importer's layout arithmetic can fail to
+// find the gains and then silently import without them (Hunyuan-7B answered gibberish on byte-exact weights).
+void test_declared_qk_norm() {
+    const auto with_config = [](const char* body) {
+        const std::string dir = "/tmp/1bit-qkn-" + std::to_string(::getpid());
+        std::system(("rm -rf " + dir).c_str());
+        std::filesystem::create_directories(dir);
+        std::ofstream(dir + "/config.json") << body;
+        const bool got = pi::declared_qk_norm(dir);
+        std::system(("rm -rf " + dir).c_str());
+        return got;
+    };
+    check(with_config(R"({"use_qk_norm": true})"), "qk norm declared: top-level use_qk_norm: true is read");
+    check(with_config(R"({"text_config": {"use_qk_norm": true}})"), "qk norm declared: read under text_config too");
+    check(!with_config(R"({"use_qk_norm": false})"), "qk norm declared: false is false");
+    check(!with_config(R"({"hidden_size": 4096})"), "qk norm declared: an absent key is false, not an error");
+    std::printf("qk norm declaration: top-level, text_config, false and absent all read\n");
+}
+
 void test_qwen3_attn_sections() {
     struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
     const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
@@ -3408,6 +3427,7 @@ int main(int argc, char** argv) {
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();
         test_fconst_scratch_order();
+        test_declared_qk_norm();
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);

@@ -257,6 +257,35 @@ static void test_declared_type(void) {
             check(fabs(got64 - got128) > 1e3,
                   "and the two widths differ by more than 1e3, so this arm cannot pass with the widths confused");
         }
+        /* engine#1889: Hunyuan's block is `{"alpha": 1000.0, "factor": 1.0, "type": "dynamic"}`, and with alpha set its
+         * rotary embedding uses ONE fixed base, theta * alpha^(dim/(dim-2)), at every position. Read as factor-only the
+         * block was a no-op (base 10000), which rotated every position by the wrong angle. The expected numbers are the
+         * pack's, not the formula's: Hunyuan-7B's model.onnx.data carries the graph's cos_cache/sin_cache (FP16
+         * [32768, 64]); at position 1 the angle of pair i is its inverse frequency, and the table reads
+         *   pair 1: 0.77608   pair 2: 0.60209   pair 5: 0.28159
+         * (FP16, so good to about 5e-4), against 0.86596 / 0.74989 / 0.48697 for plain theta 10000. */
+        {
+            Q4nxRopeDynamic hy = {1, 1.0, 262144.0, 1000.0};   /* Hunyuan-7B's own numbers */
+            const double base = q4nx_rope_dynamic_base(1e4, &hy, 1.0, 128);
+            check(fabs(base - 11158839.9) < 1.0, "alpha 1000 at theta 10000, dim 128: the base is 11,158,840");
+            check(q4nx_rope_dynamic_base(1e4, &hy, 0.0, 128) == base && q4nx_rope_dynamic_base(1e4, &hy, 300000.0, 128) == base,
+                  "... at every position, inside the window and past it (the alpha form does not move with pos)");
+            check(fabs(pow(base, -1.0 / 64.0) - 0.77608) < 5e-4, "pair 1's inverse frequency is the pack table's 0.77608");
+            check(fabs(pow(base, -2.0 / 64.0) - 0.60209) < 5e-4, "pair 2's is the pack table's 0.60209");
+            check(fabs(pow(base, -5.0 / 64.0) - 0.28159) < 5e-4, "pair 5's is the pack table's 0.28159");
+            check(fabs(pow(1e4, -1.0 / 64.0) - 0.77608) > 0.05,
+                  "and plain theta 10000 misses pair 1 by more than 0.05, so these arms cannot pass on the no-op");
+            Q4nxRopeDynamic hy64 = {1, 1.0, 262144.0, 1000.0};
+            check(fabs(q4nx_rope_dynamic_base(1e4, &hy64, 1.0, 64) - 1e4 * pow(1000.0, 64.0 / 62.0)) < 1e-3,
+                  "the exponent is dim/(dim-2) over the rotary width here too (dim 64 -> 64/62)");
+            Q4nxRopeDynamic no_alpha = {1, 1.0, 262144.0, 0.0};
+            check(q4nx_rope_dynamic_base(1e4, &no_alpha, 5.0, 128) == 1e4,
+                  "alpha 0 is the factor rule: inside the window the base is theta, as before");
+            Q4nxRopeDynamic off_alpha = {0, 1.0, 262144.0, 1000.0};
+            check(q4nx_rope_dynamic_base(1e4, &off_alpha, 5.0, 128) == 1e4, "and an alpha on a block that is off does nothing");
+            Q4nxRopeDynamic tiny = {1, 1.0, 262144.0, 1000.0};
+            check(q4nx_rope_dynamic_base(1e4, &tiny, 5.0, 2) == 1e4, "a rotary width of 2 has no exponent, so the base stays theta");
+        }
     }
 
 }

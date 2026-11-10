@@ -255,6 +255,12 @@ const char* q4nx_design_role_name(Q4nxDesign role);
  * that is a change worth making on purpose, in a PR that says so, not as a side effect of a move. */
 const char* q4nx_design_log_tag(Q4nxDesign role);
 
+// Which instance of a SEALED pb16i ELF runs a role, or NULL when the sealed ELF does not cover it.  The names
+// are the contract with the kernel lane (TROSS-GU-STATE.md 08:30).  Here rather than in the forward because the
+// target opens the decode family (engine#803 A2b) and a table the two sides must agree on cannot live on one
+// side of the split: a duplicate would be two contracts that drift silently.
+const char* q4nx_pb16i_instance(Q4nxDesign role);
+
 /* Look up the entry for a role in a derived set; NULL if absent. */
 const Q4nxDesignGeom* q4nx_find_design(const Q4nxDesignGeom* designs, int count,
                                        Q4nxDesign role);

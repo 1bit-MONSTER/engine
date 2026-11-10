@@ -2481,6 +2481,12 @@ std::string qk_norm_refusal(bool declared, bool found) {
         return "this pack declares use_qk_norm and its per-head q/k gains are not where the block layout says "
                "(engine#1889): importing without them would normalise no q/k, which answers plausibly-wrong text "
                "instead of refusing. The section location for this family is not measured yet";
+    if (!declared && found)
+        // engine#1889 review: the REVERSE disagreement. A block that carries a per-head section while the config denies
+        // the norm means one of the two is wrong, and an import that guesses serves a model nobody measured.
+        return "the layer block carries a per-head q/k norm section and config.json does not declare use_qk_norm "
+               "(engine#1889): one of the two is wrong, and importing would either apply gains the pack does not declare "
+               "or hide gains it carries";
     return std::string();
 }
 

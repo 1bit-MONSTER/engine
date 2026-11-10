@@ -318,6 +318,11 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
+# engine#1901: two tools shipped a self-test and nothing ran them -- the #1824 sweep asks about tests/*.sh only, so
+# a tool's own check was invisible to it (the same defect one file kind over). Registered here, and the sweep now
+# covers tools/*.py that declare one. `batched_repeat.py` spells it --selftest, `whisper_encoder_baseline.py` --self-test.
+add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
+add_python_test(tool_selftest_whisper_encoder ${CMAKE_SOURCE_DIR}/tools/whisper_encoder_baseline.py --self-test)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that

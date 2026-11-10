@@ -85,10 +85,22 @@ def scan_files(root):
                 continue
 
 
+def uncommented(text):
+    """The text with comment-only lines dropped: a registration commented out does not run anything.
+
+    engine#1901: the rule was "mentions its basename somewhere that can run things", which counted a `# add_test(...)`
+    as a runner -- so commenting a registration out left the sweep green (measured: commenting out both of this PR's
+    registrations changed nothing). Trailing comments are left alone; a line whose first non-space character is `#` is
+    the shape a disabled registration takes, in CMake, shell, YAML and Python alike.
+    """
+    return "\n".join(l for l in text.split("\n") if not l.lstrip().startswith("#"))
+
+
 def referenced(root, need):
     """{name: [files]}, ignoring a file mentioning its own basename."""
     found = {name: [] for name in need}
     for path, text in scan_files(root):
+        text = uncommented(text)
         for name in need:
             if name not in text:
                 continue
@@ -107,20 +119,34 @@ def check(root):
     allow = allow_list(root)
     found = referenced(root, need)
     drift = [n for n in need if not found[n] and n not in allow]
+    # engine#1901: the same defect one file kind over -- a tool that ships a --self-test and is registered nowhere is a
+    # check nobody runs, and this sweep could not see it because `need` is tests/*.sh only. The rule is narrow on purpose
+    # ("DECLARES a self-test"): the blanket "tools/*.py referenced by nothing" found 16 of 60 on this tree, most of them
+    # legitimately CLI-only, and a list that noisy gets ignored. Both spellings count -- tools/mtp_head_ref.py has had
+    # --selftest since before the hyphenated convention.
+    tools_need = sorted(p.name for p in (root / "tools").glob("*.py")
+                        if "--self-test" in p.read_text(errors="replace")
+                        or "--selftest" in p.read_text(errors="replace"))
+    found_tools = referenced(root, tools_need)
+    tools_drift = [n for n in tools_need if not found_tools[n] and n not in allow]
     gone = [n for n in allow if n not in need]
     idle = [n for n in need if n in allow and found[n]]
     for name in drift:
         print("tests_referenced: %s is referenced by nothing that can run it -- register it (add_test in "
               "CMakeLists.txt or cmake/*.cmake), or list it in %s with the reason it must not be a row" % (name, ALLOW))
+    for name in tools_drift:
+        print("tests_referenced: tools/%s declares a self-test and nothing registers it -- add_python_test in "
+              "CMakeLists.txt, or list it in %s with the reason" % (name, ALLOW))
     for name in gone:
         print("tests_referenced: %s is in %s but no such test exists any more -- drop the line" % (name, ALLOW))
     for name in idle:
         print("tests_referenced: %s is in %s but it IS referenced now -- drop the line, it suppresses nothing"
               % (name, ALLOW))
-    if drift or gone or idle:
+    if drift or gone or idle or tools_drift:
         return 1
-    print("tests_referenced: all %d test script(s) are referenced%s" % (
-        len(need), "" if not allow else " (%d deliberately not a row: %s)" % (len(allow), ", ".join(sorted(allow)))))
+    print("tests_referenced: all %d test script(s) and %d self-testing tool(s) are referenced%s" % (
+        len(need), len(tools_need),
+        "" if not allow else " (%d deliberately not a row: %s)" % (len(allow), ", ".join(sorted(allow)))))
     return 0
 
 
@@ -146,6 +172,21 @@ def self_test():
     # 2. referenced from CMakeLists.txt -> clean
     r = root_with({"tests/ok.sh": "#!/bin/sh\n", "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n"})
     cases.append(("a registration in CMakeLists.txt counts", check(r), 0, None))
+
+    # 2b. engine#1901: a tool that DECLARES a self-test and is registered nowhere -> drift, and it is NAMED
+    r = root_with({"tests/ok.sh": "#!/bin/sh\n", "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n",
+                   "tools/orphan.py": "ap.add_argument('--self-test')\n",
+                   "tools/library_only.py": "def f():\n    pass\n"})
+    cases.append(("a self-testing tool nothing registers is drift", check(r), 1, "orphan.py"))
+    cases_root["a self-testing tool nothing registers is drift"] = r
+    # 2c. the same tool registered -> clean, and a tool with NO self-test is never a row (the blanket sweep is noise)
+    r = root_with({"tests/ok.sh": "#!/bin/sh\n",
+                   "CMakeLists.txt": "add_test(NAME ok COMMAND bash tests/ok.sh)\n"
+                                     "add_python_test(t tool.py --self-test)\n",
+                   "tools/tool.py": "ap.add_argument('--self-test')\n",
+                   "tools/library_only.py": "def f():\n    pass\n"})
+    cases.append(("a registered self-testing tool is clean, and a tool with none is not a row", check(r), 0, None))
+    cases_root["a registered self-testing tool is clean, and a tool with none is not a row"] = r
 
     # 3. referenced from an included family file -> clean
     r = root_with({"tests/fam.sh": "#!/bin/sh\n", "CMakeLists.txt": "",

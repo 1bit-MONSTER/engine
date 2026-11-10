@@ -36,12 +36,17 @@ tested) on any machine.
    `parse_special` on, as the server itself tokenizes); `/v1/completions` tokenizes its `prompt`
    string. The provider sees exactly the ids the backend would have prefilled.
 2. **The provider prefills.** serve writes the ids to a file in the backend's slot directory and runs
-   the provider. It writes a llama.cpp sequence-state file for the prompt.
+   the provider. It writes a llama.cpp sequence-state file for the prompt's tokens except the last one
+   (see step 4), so the file holds N-1 cells at positions 0..N-2.
 3. **Restore into slot 0.** `POST /slots/0?action=restore` loads the file into the one slot; serve
-   checks the slot holds all the prompt's tokens.
+   checks the slot holds all the tokens it handed over.
 4. **Decode.** The request is forwarded with `id_slot` 0 and `cache_prompt` true. llama-server finds
-   the prompt in the slot, re-evaluates its last token (it always does, for the logits), and generates.
-   The reply, streamed or not, is relayed as for every device.
+   the prompt in the slot and evaluates its **last token** - the one the provider left for it - then
+   generates. One token is deliberate, not a miss: llama-server always evaluates at least one token of
+   a prompt (that is where the logits come from, `[TAG_PROMPT_LOGITS]`), and on a hybrid model the
+   recurrent memory is a summary with no partial tail to trim, so a handoff that covered the *whole*
+   prompt would leave the decoder nothing it is allowed to evaluate and it would re-process everything
+   (engine#941). The reply, streamed or not, is relayed as for every device.
 
 One line per request on stderr: `hybrid: N prompt tokens: prefill X ms, restore Y ms, first byte Z ms`
 (the provider's own `prefill_ms` when it reports one, else its wall time; the restore from the backend's
@@ -67,11 +72,11 @@ would draft over a cache it did not compute.
 
 | | |
 |---|---|
-| `--tokens` | the prompt's token ids, one decimal id per line, in order |
+| `--tokens` | the prompt's token ids, one decimal id per line, in order, **minus the last**: the decoder evaluates that one itself (step 4 above) |
 | `--out` | where to write the state: a bare filename inside the backend's `--slot-save-path` directory (serve chooses it; the backend restores by that name) |
 | `--model` | the model file serve was given (`-m`) |
 | `--elfs` | passed when `ONEBIT_HYBRID_ELFS` is set: where the provider's kernels are |
-| stdout | one JSON line, last: `{"n_tokens": N, "argmax": id, "prefill_ms": x}`; `n_tokens` must equal the ids given (checked), `argmax` is the next-token argmax after the prompt (for diagnostics), `prefill_ms` is optional |
+| stdout | one JSON line, last: `{"n_tokens": N, "argmax": id, "prefill_ms": x}`; `n_tokens` must equal the ids given (checked), `argmax` is the next-token argmax after those ids - i.e. one token before the prompt's end, which the decoder evaluates itself - (for diagnostics), `prefill_ms` is optional |
 | exit | 0 on success; anything else, or no file, is the fallback above |
 | environment | `ONEBIT_HYBRID_BACKEND_URL=http://127.0.0.1:<port>`, the decoding llama-server's address (a test provider makes its file through it; a real one has no use for it), plus serve's own environment |
 | time limit | `ONEBIT_HYBRID_PREFILL_TIMEOUT_S` (default 600): SIGTERM, then SIGKILL |
@@ -108,8 +113,9 @@ it) replaces the file with two dma-buf fds:
 Per request: `POST /slots/0?action=share {"socket": PATH}` makes the decoder export its KV buffers and
 hand the fds over an AF_UNIX socket that serve is listening on (`SCM_RIGHTS`, one length-prefixed JSON
 message); serve passes them to the provider as inherited descriptors; the provider maps them as its own
-KV tensors and prefills the prompt into them; `POST /slots/0?action=adopt {"tokens": [...]}` makes the
-decoder take cells 0..N-1 as positions 0..N-1 with no data movement (`llama_kv_cells_adopt`). The
+KV tensors and prefills the prompt's tokens except the last into them; `POST /slots/0?action=adopt {"tokens": [...]}` makes
+  the decoder take cells 0..N-2 as positions 0..N-2 with no data movement (`llama_kv_cells_adopt`), and it evaluates
+the last prompt token itself (step 4 above). The
 provider never writes a file, and the only bytes that cross a boundary are the fds and a few hundred
 bytes of JSON. `llama-kvshare-prefill` (llama.cpp `tools/kvshare-prefill`) is the reference provider:
 a CPU prefill, so the plumbing can be gated with no NPU; the NPU engine is the real one, mapping the

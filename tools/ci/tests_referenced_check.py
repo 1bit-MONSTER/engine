@@ -22,6 +22,11 @@ target ci.yml never builds, which is the case ci_targets_check does cover). A te
 reads as green for ever -- the same defect as #1595, one file kind over.
 
   need = every tests/*.sh
+         AND every tools/**/*.py that declares a --self-test (engine#1901): a tool that ships one is claiming it can be
+         verified without its real inputs, so an unregistered one is an arm nobody runs. For those the corpus is
+         RUNNERS only (CMakeLists.txt, cmake/, .github/workflows/) -- a mention in another tool's source is a citation,
+         not a runner. That distinction is the count: 2 with the wide corpus, 5 with this one, and 5 is the honest
+         number because `tools/mtp_head_ref.py` is only *cited* by two other tools.
   have = every file that MENTIONS its basename, in a place that can run things:
          CMakeLists.txt, cmake/**, scripts/**, tools/**, tests/**, .github/workflows/**
   drift = need - have - allow-list
@@ -42,6 +47,7 @@ Exit: 0 every test is reachable, 1 an unreferenced one (named), 2 cannot tell (n
 
 import argparse
 import pathlib
+import re
 import sys
 
 ALLOW = pathlib.Path("tools/ci/unreferenced_tests.txt")
@@ -60,7 +66,10 @@ def allow_list(root):
         if not line or line.startswith("#"):
             continue
         name, _, reason = line.partition("#")
-        out[name.strip()] = reason.strip()
+        # Normalised to a basename: `tests/foo.sh` and `foo.sh` mean the same entry. Measured before this: a
+        # path-form entry matched no test, so it suppressed nothing AND was reported as "no such test exists any
+        # more", two contradicting messages about one line and the format never named.
+        out[pathlib.PurePosixPath(name.strip().rstrip("/")).name] = reason.strip()
     return out
 
 
@@ -95,6 +104,37 @@ def referenced(root, need):
     return found
 
 
+SELFTEST = re.compile(r"--self[-_]?test\b")
+RUNNERS = ("CMakeLists.txt", "cmake", ".github/workflows")
+
+
+def unregistered_selftest_tools(root):
+    """tools/**/*.py that declare a self-test and that no RUNNER names (engine#1901)."""
+    tools = root / "tools"
+    if not tools.is_dir():
+        return []
+    runner_text = []
+    for sub in RUNNERS:
+        p = root / sub
+        files = [p] if p.is_file() else (sorted(q for q in p.rglob("*") if q.is_file()) if p.is_dir() else [])
+        for f in files:
+            try:
+                runner_text.append(f.read_text(errors="replace"))
+            except OSError:
+                pass
+    drift = []
+    for tool in sorted(tools.rglob("*.py")):
+        try:
+            src = tool.read_text(errors="replace")
+        except OSError:
+            continue
+        if not SELFTEST.search(src):
+            continue
+        if not any(tool.name in text for text in runner_text):
+            drift.append(str(tool.relative_to(root)))
+    return drift
+
+
 def check(root):
     tests = root / "tests"
     if not tests.is_dir():
@@ -104,17 +144,31 @@ def check(root):
     allow = allow_list(root)
     found = referenced(root, need)
     drift = [n for n in need if not found[n] and n not in allow]
-    stale = [n for n in allow if n not in need]
+    gone = [n for n in allow if n not in need]
+    idle = [n for n in need if n in allow and found[n]]
     for name in drift:
         print("tests_referenced: %s is referenced by nothing that can run it -- register it (add_test in "
               "CMakeLists.txt or cmake/*.cmake), or list it in %s with the reason it must not be a row" % (name, ALLOW))
-    for name in stale:
+    for name in gone:
         print("tests_referenced: %s is in %s but no such test exists any more -- drop the line" % (name, ALLOW))
-    if drift:
+    for name in idle:
+        print("tests_referenced: %s is in %s but it IS referenced now -- drop the line, it suppresses nothing"
+              % (name, ALLOW))
+    tools_drift = unregistered_selftest_tools(root)
+    for rel in tools_drift:
+        print("tests_referenced: %s declares a self-test and no runner names it -- add a ctest row (add_test in "
+              "CMakeLists.txt or cmake/*.cmake) or a workflow step, or the arm is dead code" % rel)
+    if drift or gone or idle or tools_drift:
         return 1
-    print("tests_referenced: all %d test script(s) are referenced%s" % (
-        len(need), "" if not allow else " (%d deliberately not a row: %s)" % (len(allow), ", ".join(sorted(allow)))))
+    print("tests_referenced: all %d test script(s) are referenced%s; %d tool self-test(s) are registered" % (
+        len(need), "" if not allow else " (%d deliberately not a row: %s)" % (len(allow), ", ".join(sorted(allow))),
+        len(_selftest_tools(root))))
     return 0
+
+
+def _selftest_tools(root):
+    tools = root / "tools"
+    return [p for p in tools.rglob("*.py") if SELFTEST.search(p.read_text(errors="replace"))] if tools.is_dir() else []
 
 
 def self_test():
@@ -159,10 +213,36 @@ def self_test():
                    str(ALLOW): "keeper.sh   # an operator measurement: always exits 0, so a row would be green noise\n"})
     cases.append(("an allow-listed test is not drift", check(r), 0, None))
 
-    # 7. a stale allow entry -> reported, but not a failure
+    # 7. an allow entry for a test that is gone -> a failure, because a list that only gets WARNED about grows
     r = root_with({"tests/one.sh": "#!/bin/sh\n", "CMakeLists.txt": "tests/one.sh\n",
                    str(ALLOW): "gone.sh   # removed long ago\n"})
-    cases.append(("a stale allow entry is progress, not drift", check(r), 0, "gone.sh")); cases_root["a stale allow entry is progress, not drift"] = r
+    cases.append(("an allow entry for a deleted test fails", check(r), 1, "gone.sh")); cases_root["an allow entry for a deleted test fails"] = r
+
+    # 8. an allow entry for a test that IS referenced -> a failure: it suppresses nothing, which is how the list rots
+    r = root_with({"tests/one.sh": "#!/bin/sh\n", "CMakeLists.txt": "add_test(NAME one COMMAND bash tests/one.sh)\n",
+                   str(ALLOW): "one.sh   # but it is registered\n"})
+    cases.append(("an allow entry that suppresses nothing fails", check(r), 1, "one.sh")); cases_root["an allow entry that suppresses nothing fails"] = r
+
+    # 9b. engine#1901: a tool that declares a self-test and is named by no RUNNER is reported, and a mention in
+    #     another tool's source does not count as one -- that distinction is the difference between 2 and 5 on main.
+    base_ok = {"tests/ok.sh": "#!/bin/sh\n", "CMakeLists.txt": "add_test(NAME ok COMMAND tests/ok.sh)\n"}
+    r = root_with(dict(base_ok, **{"tools/quiet.py": "import sys\n# --self-test\n"}))
+    cases.append(("a tool self-test no runner names is drift", check(r), 1, "quiet.py"))
+    cases_root["a tool self-test no runner names is drift"] = r
+    r2 = root_with(dict(base_ok, **{"tools/cited.py": "# --self-test\n",
+                                    "tools/other.py": "see tools/cited.py for the arm\n"}))
+    cases.append(("a citation in another tool is not a runner", check(r2), 1, "cited.py"))
+    cases_root["a citation in another tool is not a runner"] = r2
+    r3 = root_with({"tests/ok.sh": "#!/bin/sh\n",
+                    "CMakeLists.txt": "add_test(NAME ok COMMAND tests/ok.sh)\n"
+                                      "add_test(NAME t COMMAND tools/registered.py --self-test)\n",
+                    "tools/registered.py": "# --self-test\n"})
+    cases.append(("a registered tool self-test is clean", check(r3), 0, None))
+
+    # 9. the entry may be written either way: path form and basename mean the same line
+    r = root_with({"tests/keeper2.sh": "#!/bin/sh\n", "CMakeLists.txt": "",
+                   str(ALLOW): "tests/keeper2.sh   # path form is accepted\n"})
+    cases.append(("a path-form allow entry is accepted", check(r), 0, None))
 
     # 8. no tests/ at all -> cannot tell, not "clean"
     r = root_with({"CMakeLists.txt": ""})

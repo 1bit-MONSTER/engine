@@ -177,6 +177,17 @@ void q4nx_host_gemm_f32_padded(const float* A, int a_k, int M, int K, int N, con
  * holding an int4 value in [-8, 7], exactly as the importer's packB lays it down. */
 void q4nx_host_gemm_i8(const int8_t* a8, int K, const int8_t* codes, int N, int32_t* out32);
 
+/* engine#1839: the int4 code range and its scale, together, because they are only correct as a pair.
+ *
+ * A symmetric int4 code spans [-8, 7], so the scale that maps a group's `amax` onto that range is `amax / 7`, and the
+ * code is `round(v * 7 / amax)` clamped to [-8, 7]. The two places that quantise float weights into the container's
+ * int4 codes used to pair `amax / 127` (an INT8 scale) with the int4 clamp, so every code but the very largest
+ * saturated at +-7 and the dequantised weight was ~18x too small -- in the host arm the gate compares the device
+ * against, which is the worst place for it. 7 rather than 8 so that no code saturates: round(v * 7 / amax) lands in
+ * [-7, 7] for |v| <= amax, and the -8 slot stays a guard rather than an asymmetry. */
+float q4nx_quant_int4_scale(float amax);
+int8_t q4nx_quant_int4_code(float v, float amax);
+
 /* The whole GEMM in int8 x int4 for the gate's `i8` host arm, quantising both sides here with the engine's
  * own rule. It cannot see a wrong weight LAYOUT (the f32 arm covers that); what it can see is a wrong int4
  * quantisation, a wrong 128-K group boundary, an int8 intermediate or a saturated accumulator -- i.e. the

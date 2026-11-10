@@ -23,6 +23,10 @@
 #include <fstream>
 #include <stdexcept>
 
+// The tile geometry and chunk sizes the forward reads an embedding table with -- included, not restated, so the vocab
+// check below cannot drift from the reader it stands in for (engine#1878 review).
+#include "forward/include/q4nx_dequant.h"
+
 namespace onebit::npu {
 
 int Tensor::tiles() const {
@@ -46,8 +50,8 @@ namespace {
 // does hold, for the message.
 bool table_holds_vocab(const Tensor& t, int64_t vocab, int64_t hidden, std::string* seen) {
     if (vocab <= 0 || hidden <= 0) return true;
-    const int64_t pad_v = (vocab + 31) / 32 * 32;
-    const int64_t col_tiles = (hidden + 255) / 256;
+    const int64_t pad_v = (vocab + Q4NX_TILE_ROWS - 1) / Q4NX_TILE_ROWS * Q4NX_TILE_ROWS;
+    const int64_t col_tiles = (hidden + Q4NX_TILE_COLS - 1) / Q4NX_TILE_COLS;
     const auto rows_ok = [&](int64_t r) { return r == vocab || r == pad_v; };
     int esz = 0;
     if (t.dtype == "BF16" || t.dtype == "F16") esz = 2;
@@ -57,20 +61,23 @@ bool table_holds_vocab(const Tensor& t, int64_t vocab, int64_t hidden, std::stri
         if (t.bytes % row != 0) { *seen = "is " + std::to_string(t.bytes) + " B, not a whole number of rows"; return false; }
         const int64_t r = int64_t(t.bytes / row);
         *seen = "has " + std::to_string(r) + " rows of " + std::to_string(hidden);
-        return r == vocab;   // a plain table has no tile padding
+        // A plain row table has no tile grid, so nothing pads it: every BF16 table on strixhalo (78 measured, 11-10)
+        // has exactly vocab_size rows, and the forward reads it at row stride `hidden` with no pad rows.
+        return r == vocab;
     }
     if (t.dtype != "I8") return true;
     if (t.bytes == uint64_t(vocab) * uint64_t(hidden)) return true;   // plain int8 + per-32-column scale (Gemma4)
-    const auto is_chunk = [](int64_t b) { return b == 5120 || b == 4736 || b == 8704; };  // Q4NX tile / Q4_K / Q8 chunk
+    const auto is_chunk = [](int64_t b) { return b == Q4NX_TILE_BYTES || b == Q4NX_CHUNK_Q4K || b == Q4NX_CHUNK_Q8; };
     int64_t r = -1;
-    if (t.shape.size() == 3 && is_chunk(t.shape[2]) && t.shape[1] == col_tiles) r = t.shape[0] * 32;
-    else if (t.shape.size() == 2 && is_chunk(t.shape[1]) && t.shape[0] % col_tiles == 0) r = t.shape[0] / col_tiles * 32;
+    if (t.shape.size() == 3 && is_chunk(t.shape[2]) && t.shape[1] == col_tiles) r = t.shape[0] * Q4NX_TILE_ROWS;
+    else if (t.shape.size() == 2 && is_chunk(t.shape[1]) && t.shape[0] % col_tiles == 0)
+        r = t.shape[0] / col_tiles * Q4NX_TILE_ROWS;
     if (r < 0) {
         *seen = "is neither " + std::to_string(vocab) + " x " + std::to_string(hidden) +
                 " plain int8 nor a tile grid " + std::to_string(col_tiles) + " tiles wide";
         return false;
     }
-    *seen = "holds " + std::to_string(r) + " rows (" + std::to_string(r / 32) + " row tiles)";
+    *seen = "holds " + std::to_string(r) + " rows (" + std::to_string(r / Q4NX_TILE_ROWS) + " row tiles)";
     return rows_ok(r);
 }
 

@@ -262,6 +262,34 @@ cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader tha
 device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
 the bf16 rounding reappears for the device, never in the container.
 
+**The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
+packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
+with its own scale — and until this cache that happened on every serve. The image is a function
+of the head's stored bytes and of the kernel set (`kpad`, the tile width `T`, the blocked or
+row-major layout), so the forward keeps it in `<Q4NX cache>/head-images/` as
+`headimg-<key digest>-t<tile>.q4hi`, one file per tile. The digest covers the format version,
+`kpad`, `T`, the layout, and a hash of the head tensor's bytes together with the vocabulary size,
+the width and the dtype it is decoded at, so another container, another kernel set or a re-import
+names different files.
+
+A cached tile is used only when both of these hold, otherwise it is packed as before and the file
+is replaced, with one stderr line saying why:
+
+- the file reads back whole: format version, geometry and the hash over its payload
+  (`q4nx_head_image_read`);
+- a sample of its columns (8 per tile, both ends and an even spread) packs to the same scale and
+  the same codes from the weights the forward holds at that moment, through the production packer
+  (`q4nx_pack_B_int8_blocked`). This is the check a payload hash cannot make: an intact image
+  written for other weights is caught here.
+
+The serve log line says what happened: `lm head: N packed weight tile(s) resident (…); H from the
+image cache, P packed (W written for the next serve) in S s`. `ONEBIT_HEAD_IMAGE_CACHE=0` turns
+the cache off (nothing is read or written). The files are `kd × nd` bytes plus `nd` scales per
+tile, so a head costs about `kpad × vocabulary` bytes on disk per kernel set; nothing prunes them,
+the same as the device-form copies next to them. Ternary (`pb16i`) heads and the gemv head do not
+use it: their image already is a file. The behaviour is pinned host-side in
+`tests/npu_design_grid_test.c` with a counter on the gather.
+
 **Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
 embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors
 (untied lm_head, projections) store it at `(r/16)*4096 + (k/32)*512 + (k%32)*16 + r%16`.
@@ -944,6 +972,25 @@ What converts, and how faithfully:
 | `model.norm` (final) | `.fconst`, the tail envelope at `layers x stride` | bf16 | byte-exact |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
+**A multi-component pack's per-layer embedding** (engine#1725). gemma-4's embedding component
+carries, beside the token table, `embed_tokens_per_layer.weight` (`vocab x layers*P` f32; 262,144 x
+8,960 on e2b, 9.4 GiB), a `P`-wide `per_layer_projection_norm.weight` shared by every layer, and
+the context projection `per_layer_model_projection.weight_t_Q4` quantised at block 32. The import
+writes them under the names the forward loads:
+
+| container tensor | from | form |
+|---|---|---|
+| `model.per_layer_token_embd.weight` `[vocab, layers*P]` | the f32 table | BF16, round to nearest even |
+| `model.per_layer_proj_norm.weight` `[P]` | the norm | BF16 |
+| `model.per_layer_model_proj.weight_layer{l}` `[P, hidden]` | the projection, dequantised, one per layer | BF16 |
+
+The table is never held in memory, in either form: the reader points into the component's mapped
+external data (its extent is checked once, when it is located), and the container writer converts
+it 32 rows at a time while it writes the file. A projection with no zero-point tensor takes the
+implicit zero point 8, the same rule as every other MatMulNBits here. `config.json` gets
+`hidden_size_per_layer_input` and `vocab_size_per_layer_input` only when all three parts went into
+the container, because those two keys are what switch the block on in the forward.
+
 An OGA pack keeps its tensors inside the `If` branches: the top-level graph has **no
 initializers** and four nodes (`Shape`/`Constant`/`Equal`/`If`). The importer walks the
 subgraphs. The 4-bit decode is `w = (code - zp) * scale` with two codes per byte (low nibble
@@ -1387,6 +1434,28 @@ again to get the logits the answer is drawn from. Restoring `cached - 1` positio
 `cached` is what the KV alone would allow, and it applies the last token's GDN update twice: measured on the first
 version of this fix, the cache hit (`[prefix] slot=0 cached=179 of 180 reason=hit`, TTFT 5.3 s against 15.6 s) and
 answered the same prompt with different, fragmented text.
+
+### The prefix cache's pinned slot: single-turn requests under one system prompt (engine#1785)
+
+A slot holds a whole prompt, and a request hits a slot only when the slot is a prefix of it. Requests that
+share a system prompt and differ in the user turn therefore reuse nothing from each other: `system + question 1`
+is not a prefix of `system + question 2`. `tests/npu_sampling_test.cpp` (`test_prefix_pin`) states that as its
+first row: a 900-token system prompt, a second question, `cached_tokens: 0`.
+
+The slot table (`app/npu_prefix_cache.h`) has a slot kind for the part such requests do share:
+
+| call | what it decides |
+|---|---|
+| `pin_point(prev, ids)` | how many leading tokens this request shares with the previous one. 0 when one prompt is a prefix of the other (a repeat or a continued conversation, which the ordinary slots already keep), when the shared part adds fewer than `--prefix-min-gain` tokens over a slot that already covers the request, or when the cache is off |
+| `pin(prefix, bytes)` | keep the state at that point. One pinned slot at a time: a new pin replaces it; eviction for room and a longer prompt's replacement both leave it alone |
+| `lookup(ids)` | unchanged, and reports `pinned` when the hit is the pinned slot |
+
+It reads token ids only, so it does not depend on the template or on which message is the system prompt.
+
+**State of this, plainly:** the table and its tests are in; `forward-serve` does not call `pin_point()`/`pin()`
+yet, so no request is faster because of it today. The forward half is one more cut in the prefill loop (stop one
+token short of the pin point, `snapshot_state`, `pin`), and it needs a device run to be claimed.
+
 
 ### Sampling and structured output
 

@@ -41,8 +41,21 @@ r = subprocess.run([sys.executable, TOOL, "--selftest"], capture_output=True, te
 check(r.returncode == 0, f"the tool's own selftest passes (rc={r.returncode})")
 for want in ("a shared prefix of 2 is accepted", "a first-token miss accepts nothing",
              "a draft longer than the target's continuation is capped by the target",
-             "tokens/round is emitted/rounds", "accepted drafts/round is a different number"):
+             "tokens/round is emitted/rounds", "accepted drafts/round is a different number",
+             "replay: a perfect drafter at k=4", "replay: a drafter that is always wrong",
+             "economics: bars are round cost / step cost",
+             "economics: a drafter that accepts nothing is a slow-down"):
     check(want in r.stdout, f"selftest covers: {want}")
+check("FAIL" not in r.stdout, "no selftest arm fails")
+
+# The recorded-target mode (engine#1371) refuses half-specified invocations in the tool, not in the caller's head.
+rr = subprocess.run([sys.executable, TOOL, "--record-openai", "http://127.0.0.1:1"], capture_output=True, text=True)
+check(rr.returncode == 2 and "--prompts and --out" in rr.stderr, f"record mode without --prompts/--out exits 2 (rc={rr.returncode})")
+rr = subprocess.run([sys.executable, TOOL, "--target-recorded", "x.json"], capture_output=True, text=True)
+check(rr.returncode == 2 and "needs --draft" in rr.stderr, f"replay mode without --draft exits 2 (rc={rr.returncode})")
+rr = subprocess.run([sys.executable, TOOL, "--target-recorded", "x.json", "--draft", "http://127.0.0.1:1", "--pass-ms", "5"],
+                    capture_output=True, text=True)
+check(rr.returncode == 2 and "go together" in rr.stderr, f"--pass-ms without --step-ms exits 2 (rc={rr.returncode})")
 
 # No server: the tool must fail, not report 0 acceptance as if it were a result.
 p = os.path.join(ROOT, "tests", ".spec_decode_prompt.txt")

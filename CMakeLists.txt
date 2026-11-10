@@ -293,6 +293,21 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # resolves outside the payload, and a runtime set shipped without the aqlprofile agent libhsa opens. Each
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
+# engine #1800: eight shell tests under tests/ existed and were referenced by NOTHING -- not registered here, not
+# called by a workflow, not a helper of another test -- so a green job never ran them. Seven are registered below; each
+# command line was run by hand against this tree before being written down (all seven exit 0), and each takes either no
+# argument or a path, which is why none of them needs a target.
+#
+#   anchor_rerun.sh is deliberately NOT here: its usage is `<1bit> <outdir> <device> <alias>:<gguf>` -- it needs a built
+#   binary AND a device, so it is a manual instrument (docs/hrx.md's anchors), not a CI gate. Registering it would add a
+#   test that can only ever skip.
+add_test(NAME base_modes COMMAND ${CMAKE_SOURCE_DIR}/tests/base_modes_test.sh ${CMAKE_SOURCE_DIR})
+add_test(NAME gpu_hold_group COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_group_test.sh)
+add_test(NAME gpu_hold_hold_dir COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_hold_dir_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+add_test(NAME gpu_hold_mem_abort COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_mem_abort_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+add_test(NAME gpu_hold_survivors COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_survivors_test.sh ${CMAKE_SOURCE_DIR}/scripts/gpu-hold)
+add_test(NAME gpu_hold_ticket_lost COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_ticket_lost_test.sh)
+add_test(NAME gpu_hold_tree COMMAND ${CMAKE_SOURCE_DIR}/tests/gpu_hold_tree_test.sh)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and

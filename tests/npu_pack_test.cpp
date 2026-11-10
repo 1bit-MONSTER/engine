@@ -109,7 +109,16 @@ static void batch_width_arms() {
     check(batch_width_min(none, 3, 16) == 16, "batch width: the fallback is the loaded design's own M when the caller has it");
     check(batch_width_min(nullptr, 0, 128) == 128, "batch width: a null array reads as empty and takes the fallback");
     check(batch_width_min(mixed, 0, 4) == 4, "batch width: an n of 0 reads nothing and takes the fallback");
-    std::printf("  batch width: 7 arms (min not first, empty slots, fallback)\n");
+    /* The sealed route (engine#1904): no per-role design is adopted, so both arrays are empty and the answer is the
+     * plan's prefill M, passed as the fallback. These are the arms that would have caught a merge that dropped it. */
+    const int plan_m = 128;
+    check(batch_width_min(none, 3, plan_m) == 128,
+          "batch width: sealed route (no per-role design) answers the plan's prefill M, not 1");
+    check(batch_width_min(none, 3, 0) == 1, "batch width: sealed route with a plan that states no M stays at 1");
+    const int narrow[] = {0, 16, 0};
+    check(batch_width_min(narrow, 3, plan_m) == 16,
+          "batch width: a loaded 16-row design beats a wider plan M (the plan is only the fallback)");
+    std::printf("  batch width: 10 arms (min not first, empty slots, fallback, sealed plan M)\n");
 }
 
 int main(int argc, char** argv) {

@@ -1765,14 +1765,15 @@ bool external_container_tensors(const std::string& role, int nh, int nkv, int hd
 }
 
 Q4 container_from_external_q4(const Q4& pack, long long* m_inexact) {
-    Q4 q = pack;   // same codes, same geometry
+    // A PASS-THROUGH since the signed-int4 fix: `decode_external_tile` produces the container's own convention directly
+    // (code = c_signed + 8, zero = (-8 - z_signed) * scale), so converting `zero` again applies the mapping TWICE --
+    // `zero` became -((-8-z)*scale)*scale ~ +0.0002 instead of -0.04, every weight sat at code*scale (a near-constant
+    // POSITIVE matrix), and a down projection summed to K*mean(act)*0.04 ~ 110,000 where a healthy layer gives ~1.
+    // The function survives as the one place that reports the bf16-exactness of the container's offset.
+    Q4 q = pack;
     long long inexact = 0;
-    for (size_t i = 0; i < q.zero.size(); ++i) {
-        // pack: w = (code - zp) * scale  ->  container: w = code * scale + m, so m = -zp * scale.
-        const float m = -q.zero[i] * q.scale[i];
-        if (bf16_to_f32(bf16_bits_of(m)) != m) ++inexact;
-        q.zero[i] = m;
-    }
+    for (size_t i = 0; i < q.zero.size(); ++i)
+        if (bf16_to_f32(bf16_bits_of(q.zero[i])) != q.zero[i]) ++inexact;
     if (m_inexact) *m_inexact = inexact;
     return q;
 }
@@ -1806,14 +1807,25 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                 const uint8_t* zeros = subv + 2048;
                 const uint8_t* scales = subv + 2112;
                 for (int r = 0; r < kExtSubvRows; ++r) {
-                    const int64_t row = tile * kExtTileRows + half * kExtSubvRows + r;
+                    // MEASURED, not assumed: a 64-row block's two subvolume halves are stored in the order (half 1,
+                    // half 0) -- the block's FIRST 32 rows live in the pair's SECOND subvolume. Checked row for row against
+                    // the imported container: with `half * 32 + r` exactly one row in 64 matched (R mod 64 == 0), and with the
+                    // swap the sampled rows match (engine#1503).
+                    const int64_t row = tile * kExtTileRows + (1 - half) * kExtSubvRows + r;
                     const float s = bf16_to_f32(uint16_t(scales[r * 2] | (scales[r * 2 + 1] << 8)));
                     // four int4 zero points per row, one per 32-column group of the 128-column block
                     const uint8_t z0 = zeros[r * 2], z1 = zeros[r * 2 + 1];
-                    const uint8_t zp[4] = {uint8_t(z0 & 0xF), uint8_t(z0 >> 4), uint8_t(z1 & 0xF), uint8_t(z1 >> 4)};
+                    // Both fields are int4 in TWO'S COMPLEMENT, not 0..15 (the pack's own writer asserts -8 <= x <= 7,
+                    // FACTS-oga-pack-weight-layout.md §7.13). Reading them unsigned is only equivalent when the code and
+                    // its zero point happen to share a sign: for one negative and one positive the difference is off by
+                    // 16 * scale, which is ~16 codes wide and dominates the weight. That is what left phi-4 answering
+                    // '都都都都': every row where the two differed in sign became a near-constant matrix (engine#1503).
+                    const int zp[4] = {int8_t(z0 << 4) >> 4, int8_t(z0) >> 4, int8_t(z1 << 4) >> 4, int8_t(z1) >> 4};
                     for (int g = 0; g < 4; ++g) {
                         q.scale[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = s;
-                        q.zero[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = float(zp[g]);
+                        // The container's form is w = code*d + m with code in 0..15 and m the group MIN, so the signed
+                        // code c becomes c + 8 and m becomes (-8 - z) * scale: (c+8)*s + (-8-z)*s == (c - z)*s exactly.
+                        q.zero[size_t(row) * (K / 32) + (kk - 1) * 4 + g] = float(-8 - zp[g]) * s;
                     }
                     for (int c = 0; c < 128; ++c) {
                         // Row-major: a row's 128 codes are 64 contiguous bytes, even column in the low nibble.
@@ -1828,7 +1840,10 @@ Q4 decode_external_tile(const uint8_t* data, size_t bytes, int N, int K, std::st
                             const uint8_t b = quants[(cp % 4) + c * 4 + (cp / 4) * 512];
                             nib = (r % 2 == 0) ? uint8_t(b & 0xF) : uint8_t(b >> 4);
                         }
-                        q.codes[size_t(row) * K + (kk - 1) * 128 + c] = nib;
+                        // signed int4 -> the container's 0..15 offset from the group minimum: c_signed = nib-16 for a
+                        // negative nibble, then +8. A no-op would have been `nib`, which is the bug this replaces.
+                        const int cs = (nib >= 8) ? int(nib) - 16 : int(nib);
+                        q.codes[size_t(row) * K + (kk - 1) * 128 + c] = uint8_t(cs + 8);
                     }
                 }
             }
@@ -2493,6 +2508,19 @@ std::string Plan::manifest() const {
     return j.dump(2);
 }
 
+// engine#1889: where the per-head QK gains sit when the attention section carries them as the 640 B between the last
+// qkv tile and o_proj. Split out and exposed because this is the arithmetic a wrong answer silently mis-rotates every
+// Hunyuan pack with: a right offset reads a gain (~1.0-2.0), a wrong one reads tile bytes as bf16 and the gains come out
+// wild, and the test drives both shapes without a pack.
+QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes) {
+    const int64_t per_head = head_dim * 2;
+    if (gap_bytes != 2 * (kNormOff + per_head)) return QkGainOffsets{};
+    QkGainOffsets o;
+    o.k_norm = gap_start + kNormOff;                          // block 0 is k, as the separate-section family
+    o.q_norm = gap_start + (kNormOff + per_head) + kNormOff;  // block 1 is q
+    return o;
+}
+
 std::string qk_norm_refusal(bool declared, bool found) {
     if (declared && !found)
         return "this pack declares use_qk_norm and its per-head q/k gains are not where the block layout says "
@@ -2813,6 +2841,17 @@ Plan plan(const std::string& pack_dir) {
                             p.attn_tiles = n_kv * 2 + n_q;
                             p.o_off = attn_off + p.attn_tiles * tile_bytes + rem;
                             p.o_k = int(H);
+                            // engine#1889: that gap IS the per-head QK norms -- the note below has said so since it was
+                            // measured, and its shape is the separate-section family's, twice: [64 B header][bf16
+                            // [head_dim] gain], i.e. 2 * (kNormOff + head_dim*2) = 640 B at head_dim 128, which is
+                            // exactly the `rem` Hunyuan-7B reports. Naming it is what turns #1895's refusal ("declares
+                            // use_qk_norm, gains not located") into an import; the values are the check (a wrong offset
+                            // reads tile bytes as bf16 and the gains come out wild, a right one gives the 1.0-2.0 a norm
+                            // gain has).
+                            const QkGainOffsets qkg =
+                                qk_gain_offsets(attn_off + p.attn_tiles * tile_bytes, int64_t(d.head_dim), rem);
+                            p.knorm_off = qkg.k_norm;
+                            p.qnorm_off = qkg.q_norm;
                             static bool said2 = false;
                             if (!said2) {
                                 said2 = true;
@@ -3406,6 +3445,28 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
     // q4nx_weight_layout b8", and then finding the key absent from config.json (engine#1503).
     if (const std::string why = weight_layout_refusal(opt.weight_layout); !why.empty())
         throw std::runtime_error("--weight-layout: " + why);
+    // A FINAL NORM the pack does not carry. phi-4's graph has 80 `SkipSimplifiedLayerNormalization` ops (two per layer)
+    // and none at model level: its only model-scope tensor is the embedding. The forward nevertheless applies a final
+    // RMSNorm before the head, and with no weight tensor it read zeros -- `[mla] final xn: mean|x|=0.000000` -- so every
+    // logit was 0, the argmax was token 0, and the model answered `!!!!!!!!!!!!!!!!!!!!!!!!` on every prompt while the
+    // residual stream looked (wrongly) like the only problem. Writing a UNIT gain is what the pack's own graph means
+    // (the norm runs, with no learned scale), and the container says so rather than leaving the absence to be guessed.
+    bool have_final_norm = false;
+    for (const auto& t : onnx.tensors)
+        if (t.name == "model.norm.weight" || t.name == "model.final_layernorm.weight") have_final_norm = true;
+    if (!have_final_norm && p.dims.hidden > 0) {
+        std::vector<uint8_t> ones(size_t(p.dims.hidden) * 2);
+        for (int64_t i = 0; i < p.dims.hidden; ++i) {
+            const uint16_t one = bf16_bits_of(1.0f);
+            ones[size_t(i) * 2] = uint8_t(one & 0xFF);
+            ones[size_t(i) * 2 + 1] = uint8_t(one >> 8);
+        }
+        w.add("model.norm.weight", "BF16", {p.dims.hidden}, std::move(ones));
+        ++r.tensors;
+        std::fprintf(stderr,
+                     "npu-pack: the pack carries no final RMSNorm weight; wrote a unit gain (the pack's graph runs the "
+                     "norm with no learned scale)\n");
+    }
     json c;
     // engine#1794 review: the container's OWN config is what the forward reads (`q4nx_semantics.c:121` value_for_top,
     // depth 1 only), and this writer started from an empty json -- so a mRoPE declaration that lives only at
@@ -3419,6 +3480,7 @@ Report import_external(const std::string& pack_dir, const std::string& out_dir, 
         if (geom.contains("mrope_section")) c["mrope_section"] = geom["mrope_section"];
     }
     c["model_type"] = p.dims.model_type;
+    if (!have_final_norm) c["q4nx_final_norm"] = "unit gain written: the pack carries no final-norm weight tensor";
     c["hidden_size"] = p.dims.hidden;
     c["intermediate_size"] = p.dims.intermediate;
     c["num_hidden_layers"] = p.dims.layers;

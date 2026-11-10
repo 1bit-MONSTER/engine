@@ -304,6 +304,18 @@ add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
 add_python_test(tests_referenced ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(tests_referenced_self ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --self-test)
+# engine#1901: five tools ship a --self-test that no runner named, so the arms existed, were maintained beside the logic they
+# check, and never executed. All five run device-free and fast (58-277 ms measured), so they are rows rather than allow-list
+# excuses, and tools/ci/tests_referenced_check.py now counts tools/**/*.py that declare one and are named by no RUNNER
+# (CMakeLists/cmake/workflows -- a citation in another tool's source is not a runner: that is the 5-vs-2 difference).
+# Registered through add_python_test (engine#1864), so they run THROUGH the interpreter: my first version used the raw
+# `${Python3_EXECUTABLE}` form above the find_package and the repository's own ordering guard caught it by name --
+# tools/mtp_head_ref.py is the one of the five without an exec bit, and it became BAD_COMMAND under ctest.
+add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
+add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
+add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
+add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)
+add_python_test(tool_selftest_whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools/whisper_encoder_baseline.py --self-test)
 # engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
 add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
@@ -539,21 +551,6 @@ if(ONEBIT_HRX)
             # hrx skips without a gfx1151 (ONEBIT_HRX_E2E_TARGETS)
             set_tests_properties(serve_e2e_${_dev} PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
-        # engine#1779 fault 1 (FLM 1.0.12: "a server that stopped accepting connections after clients hung up"): a
-        # client that disconnects mid-response, repeated, then a fresh client must still be served. The assertion is
-        # about the LISTENER, so an interrupted request is allowed to get nothing. `cpu` on purpose: the fault is
-        # server logic, and the issue's rule is that these four are tested without a device where possible.
-        add_test(NAME serve_client_hangup_cpu
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_client_hangup_test.sh $<TARGET_FILE:onebit>
-                         ${ONEBIT_SERVE_TEST_GGUF} cpu)
-        set_tests_properties(serve_client_hangup_cpu PROPERTIES SKIP_RETURN_CODE 77)
-        # engine#1779 fault 2 (FLM 1.0.12: "Qwen3.5 answering `//////` after hitting the context limit"): a prompt that
-        # fills the context is served, the next turn cannot fit, and the answer must be a refusal or a truncated-but-clean
-        # reply - never one character repeated. Also `cpu`: the fault is in the request path's clamp, not in a kernel.
-        add_test(NAME serve_context_limit_cpu
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh $<TARGET_FILE:onebit>
-                         ${ONEBIT_SERVE_TEST_GGUF} cpu)
-        set_tests_properties(serve_context_limit_cpu PROPERTIES SKIP_RETURN_CODE 77)
         # Placement must not change the answer (engine #674): the same greedy prompt through the CPU, through the device
         # with every layer assigned to the CPU, and fully offloaded, compared byte for byte.
         add_test(NAME hrx_cpu_weight_parity
@@ -569,7 +566,39 @@ if(ONEBIT_HRX)
                  COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_kvshare_e2e.sh "${ONEBIT_HRX_SERVER}" "${ONEBIT_SERVE_TEST_GGUF}" "${ONEBIT_KVSHARE_PREFILL}")
         set_tests_properties(hybrid_kvshare_e2e PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+
 endif()
+
+    # engine#1779: these two are registered OUTSIDE both `if(ONEBIT_SERVE_TEST_GGUF)` and `if(ONEBIT_HRX)` on purpose.
+    # Inside the GGUF guard they did not exist in CI at all (a configure-time cache path CI never sets: the build job
+    # runs 164 tests and none of the serve_* family is among them, so a gap in the family looked like coverage), and
+    # inside the HRX guard they would only exist for an HRX build while ci.yml configures without ONEBIT_HRX. They skip
+    # (77) when the model path is empty, which is a visible skip in the CI table, not an absent test. `onebit` is an
+    # unconditional target (CMakeLists.txt:97), so $<TARGET_FILE:onebit> resolves in any configuration.
+    # engine#1779 fault 1 (FLM 1.0.12: "a server that stopped accepting connections after clients hung up"): a
+    # client that disconnects mid-response, repeated, then a fresh client must still be served. The assertion is
+    # about the LISTENER, so an interrupted request is allowed to get nothing. `cpu` on purpose: the fault is
+    # server logic, and the issue's rule is that these four are tested without a device where possible.
+    add_test(NAME serve_client_hangup_cpu
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_client_hangup_test.sh $<TARGET_FILE:onebit>
+                     "${ONEBIT_SERVE_TEST_GGUF}" cpu)
+    set_tests_properties(serve_client_hangup_cpu PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
+    # engine#1779 fault 2 (FLM 1.0.12: "Qwen3.5 answering `//////` after hitting the context limit"): a prompt that
+    # fills the context is served, the next turn cannot fit, and the answer must be a refusal or a truncated-but-clean
+    # reply - never one character repeated. Also `cpu`: the fault is in the request path's clamp, not in a kernel.
+    add_test(NAME serve_context_limit_cpu
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh $<TARGET_FILE:onebit>
+                     "${ONEBIT_SERVE_TEST_GGUF}" cpu)
+    set_tests_properties(serve_context_limit_cpu PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
+# engine#1779 fault 3 ("wrong vectors from embed-gemma"): tested on the route where OUR code computes the vector -
+# `serve.cpp:2264 if (embed_serve::container(model))` serves a container directory in-process - not on the
+# `rag_launch()` proxy, where the numbers come from a delegated llama-server. Same registration rule as the two
+# above (outside both guards, skip 77 when unset); ONEBIT_EMBED_TEST_CONTAINER names a directory holding model.embed.
+set(ONEBIT_EMBED_TEST_CONTAINER "" CACHE PATH "1-bit encoder container (.embed dir) the embed-vector test loads")
+add_test(NAME serve_embed_vectors_cpu
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_embed_vectors_test.sh $<TARGET_FILE:onebit>
+                 "${ONEBIT_EMBED_TEST_CONTAINER}" cpu)
+set_tests_properties(serve_embed_vectors_cpu PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK route_ports)
 
 # ── DwarfStar is gone (owner 2026-11-01, removed 2026-11-02) ───────────────
 # `--device ds4` ran DwarfStar (third_party/ds4: antirez's CUDA kernels behind a HIP shim plus
@@ -1303,6 +1332,20 @@ add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src
                                   npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
+# engine#1779 fault 4 ("Gemma 4 tool-call parsing"): the answer parser is header-only (app/npu_answer_parser.h), so
+# this is a PURE unit test - no server, no model, no device - of the contract that header states: a template's own
+# <tool_call>{"name":...,"arguments":{...}}</tool_call> becomes a structured call with the arguments re-dumped as JSON
+# text; a call-only reply reports content_null; WITHOUT tools declared the marker stays text in content; and a
+# malformed call body is never dropped. The issue asked for name, arguments and a non-tool reply that must not be
+# parsed as one; the last two arms are the loss-proofing the header promises at :193 and :216-221.
+add_executable(npu_answer_parser_test tests/npu_answer_parser_test.cpp)
+target_include_directories(npu_answer_parser_test PRIVATE app)
+target_link_libraries(npu_answer_parser_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_answer_parser COMMAND npu_answer_parser_test)
+# direction B (tools/ci/ci_targets_check.py, engine#1595): a target no ci.yml line names is "never built", and its test
+# then reports "Not Run" instead of running. `ci.yml` is a workflow file no lane can patch, so the documented hook is the
+# one this tree already uses for onebit_npu_forward_syntax: add_dependencies(onebit <target>), which the checker follows.
+add_dependencies(onebit npu_answer_parser_test)
 # engine#1781's oracle (merged in #1813) arrived with its test file but no registration, so the comparator behind
 # NPU_BATCH_CHECK -- "every drafted position's logits, bitwise" instead of one argmax at the last row -- was neither
 # built nor run while every job stayed green. Header-only, so the test needs no link libraries; host-only, so it needs no
@@ -1577,6 +1620,15 @@ endif()
     target_link_libraries(gdn_batch_order_test PRIVATE onebit_npu_forward)
     add_dependencies(npu_sampling_test gdn_batch_order_test)
     add_test(NAME gdn_batch_order COMMAND gdn_batch_order_test)
+    # engine#1905: the NPU_BATCH_CHECK oracle restores the prefix it replays from instead of resetting it, so a chunk
+    # at start_pos > 0 is compared (and then run) from the state the batched pass continues. Host-GEMM, no device;
+    # skips (77) unless ONEBIT_TEST_Q4NX names a container. It links onebit_npu_forward, so the row exists only where
+    # ONEBIT_NPU configures; ci.yml does not, so this is a dev-box test (ONEBIT_NPU=ON plus a container), not CI coverage.
+    add_executable(batch_check_state_test tests/batch_check_state_test.cpp)
+    target_include_directories(batch_check_state_test PRIVATE npu/forward/include)
+    target_link_libraries(batch_check_state_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test batch_check_state_test)
+    add_test(NAME batch_check_state COMMAND batch_check_state_test)
     # The MTP drafter measured against the real base model (tools/mtp_acceptance.cpp): draft, verify through
     # step_batch_all(), commit the accepted prefix, repeat.  The head runs on the host in the pb16i-exact
     # arithmetic, the base on the exact route.  Needs the device, so it is a tool, not a ctest.
@@ -1598,6 +1650,7 @@ endif()
     endif()
     set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(gdn_batch_order PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(batch_check_state PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source
     # check, outside this repository (docs/npu.md, "Checking the NPU").

@@ -1547,10 +1547,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     ready_ = true;
     /* engine#1900: say the batch width once at load, the way the block note does, so a log can be told apart from a
      * forward that never batched. Before this, a sealed pack reported 1 through the whole run and nothing said so --
-     * the only symptom was N single-row passes and #1781 gate 1 having no pack to measure on. */
-    std::fprintf(stderr, "  [forward] batch width %d row(s) per launch%s\n", max_batch_rows(),
-                 max_batch_rows() <= 1 ? " (single row: no per-role design width -- the sealed route reports its plan's "
-                                         "width in engine#1904)" : "");
+     * the only symptom was N single-row passes and #1781 gate 1 having no pack to measure on. Read once: the value
+     * printed is the value tested. */
+    const int batch_w = max_batch_rows();
+    std::fprintf(stderr, "  [forward] batch width %d row(s) per launch%s\n", batch_w,
+                 batch_w <= 1 ? " (single row: no per-role design width and the plan states no prefill M)" : "");
     return true;
 }
 
@@ -3050,7 +3051,6 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
 //    the device is about accumulation and epilogue, not about a float both sides happen to share.
 void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                                   int wkey, float* out) {
-    const int G = 128, groups = (K + G - 1) / G;
     // THE KEY MUST CARRY THE LAYER AND THE SHAPE (engine#1830 review). `wkey` is a per-ROLE slot -- 0 QKV, 1 O/gate,
     // 2 GU, 3 up, 4 down -- so it is the same number in every layer, and `Bmat` is the one scratch buffer that
     // `load_layer()` decodes each layer into, so neither identifies a layer. Keyed on `wkey` alone, every layer after 0
@@ -3066,28 +3066,26 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     auto it = cacheable ? host_i8_cache_.find(key) : host_i8_cache_.end();
     if (!cacheable || it == host_i8_cache_.end()) {
         HostI8Tensor t;
-        t.groups = groups; t.N = N;
+        t.N = N;
         t.codes.assign((size_t)K * (size_t)N, 0);
-        t.d.assign((size_t)groups * (size_t)N, 0.0f);
-        for (int g = 0; g < groups; g++) {
-            const int k0 = g * G, k1 = (k0 + G < K) ? k0 + G : K;
-            for (int n = 0; n < N; n++) {
-                float amax = 0.0f;
-                for (int k = k0; k < k1; k++) {
-                    const float v = std::fabs(Bmat[(size_t)k * (size_t)N + (size_t)n]);
-                    if (std::isfinite(v) && v > amax) amax = v;
-                }
-                /* engine#1839: the weights here are the container's INT4 codes, so the scale that maps amax onto
-                 * that range is amax/7 -- pairing amax/127 (an int8 scale) with the [-8, 7] clamp saturated every code
-                 * but the largest and made the host reference's weights ~18x too small. q4nx_quant_int4_*() own the
-                 * pair so this site and q4nx_pack.c's cannot drift apart again. */
-                const float amax_eff = (amax >= 1e-12f) ? amax : 1.0f;
-                t.d[(size_t)g * (size_t)N + (size_t)n] = q4nx_quant_int4_scale(amax_eff);
-                for (int k = k0; k < k1; k++)
-                    t.codes[(size_t)k * (size_t)N + (size_t)n] =
-                        q4nx_quant_int4_code(Bmat[(size_t)k * (size_t)N + (size_t)n], amax_eff);
-            }
-        }
+        // RESOLVED toward the int8 packer (this branch) rather than main's corrected int4 rule (engine#1839).
+        // Both are self-consistent; the question is what the DEVICE consumes. The device's body image comes from
+        // packB_blocked() -- one multiplier per column, int8 codes -- and this branch measured the consequence:
+        // device logits BIT-EXACT (max|d| = 0) over four steps, three repeats, plus an edge case. So the int8 packer
+        // is the rule the reference has to share with the device, and q4nx_quant_int4_*() stays for the paths that
+        // genuinely hold int4 codes.
+        t.d.assign((size_t)N, 0.0f);
+        // THE OPERANDS MUST BE THE ENGINE'S, NOT A PRIVATE RE-QUANTISATION (engine#1808/#1830). This arm exists to be
+        // the integer reference a kernel family is gated against, and the device's weight image comes from
+        // q4nx_pack_B_int8_blocked(): ONE multiplier per column (amax over the whole K), int8 codes in [-127, 127].
+        // Quantising here with a different rule -- per 128-K group, int4 [-8, 7] -- computes a different model: measured
+        // 2026-11-10, the arm answered "ikt" to "The capital of France is" and then locked onto one token, while the
+        // per-GEMM A/B read cos 0.9999 against f32 on the same tensors. Same packer, same bytes, same model.
+        double ssum = 0.0;
+        // blocked=1: the image is written in the blocked microtile order, which is the fast path AND the layout the
+        // device actually reads, so the MAC below walks it with q4nx_layout::blocked_index(). (blocked=0 was measured
+        // at 174.5 s of warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.)
+        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, /*blocked=*/1, t.d.data(), &ssum);
         if (!cacheable) {
             scratch = std::move(t);
             cached = &scratch;
@@ -3098,6 +3096,15 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         cached = &it->second;
     }
     const HostI8Tensor& t = *cached;
+    if (const char* gdir = getenv("NPU_I8_GS_DUMP")) {
+        static int n = 0;
+        char path[4096];
+        std::snprintf(path, sizeof path, "%s/arm_L%d_N%d_K%d_%03d.bin", gdir, cur_layer_, N, K, n++);
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            std::fwrite(t.d.data(), sizeof(float), std::min<size_t>((size_t)N, t.d.size()), f);
+            std::fclose(f);
+        }
+    }
     std::vector<int8_t> a8((size_t)K);
     for (int m = 0; m < M; m++) {
         const float* a = A + (size_t)m * (size_t)a_k;
@@ -3114,8 +3121,14 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
             int q = (int)std::round(v * tis);
             a8[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
         }
-        q4nx_host_gemm_i8_grouped(a8.data(), K, t.codes.data(), t.d.data(), t.groups, N, ascale,
-                                  out + (size_t)m * (size_t)N);
+        float* dst = out + (size_t)m * (size_t)N;
+        for (int n = 0; n < N; n++) {
+            int32_t acc = 0;
+            for (int k = 0; k < K; k++)
+                acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] *
+                                 (int)a8[(size_t)k]);
+            dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
+        }
     }
 }
 
@@ -3374,6 +3387,16 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // Not with injected rows: the oracle's own sequential pass runs step(tokens[m]) on the placeholder ids this
     // entry point supplies, so it would compare against a zero-token pass and report a divergence that is not
     // there. A debug tool that lies is worse than one that says "not applicable".
+    // engine#1905: the oracle's sequential replay must start from the SAME state the batched pass will, or the
+    // comparison is between different prefixes. It used to walk `start_pos .. start_pos+M-1` and then `reset()`, so for
+    // any chunk with `start_pos > 0` the batched pass ran from an empty cache and the replay from the real prefix: the
+    // oracle reported MISMATCH for every chunk but the first (measured on `bonsai2-27b-NPU-b8`, width 1, four ids:
+    // start=0 MATCH, start=1 seq=220 bat=653). That reads as a row-dependence bug in the kernels and sends the reader
+    // to fix the wrong thing. Snapshot the state the prefix established and restore it after the replay -- the same
+    // pair the prefix cache uses (`snapshot_state`/`restore_state`, and `q4nx_state_planes.h` is device-free).
+    StateSnapshot oracle_snap;
+    const bool oracle_snapped = batch_check && !inject_embeds_ && start_pos > 0 &&
+                                snapshot_state(start_pos, oracle_snap);
     if (batch_check && !inject_embeds_) {
         std::vector<float> seq;
         if (c_.NV > 0) seq_rows.reserve((size_t)M * (size_t)c_.NV);
@@ -3384,7 +3407,18 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 for (size_t i = 0; i < seq.size(); i++)
                     if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
         }
-        reset();
+        // Restore instead of reset() when the replay ran over a real prefix: `reset()` would leave the batched pass
+        // starting from nothing while the replay started from `start_pos` rows, which is the false mismatch above. With
+        // `start_pos == 0` there is nothing to restore and `reset()` is exactly right.
+        if (oracle_snapped) {
+            if (!restore_state(oracle_snap, start_pos)) {
+                err_ = "batch check: the sequential replay's prefix could not be restored, so the batched pass would "
+                       "not be comparable with it";
+                return false;
+            }
+        } else {
+            reset();
+        }
     }
 
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the
@@ -3823,8 +3857,11 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         int ba = 0;
         for (size_t i = 1; i < logits.size(); i++)
             if (logits[i] > logits[(size_t)ba]) ba = (int)i;
-        std::fprintf(stderr, "[batchcheck] M=%d start=%d seq_argmax=%d batch_argmax=%d %s\n",
-                     M, start_pos, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+        // engine#1905: name the positions compared, not only the start. Before the snapshot fix this line said
+        // `start=1 MATCH`-looking numbers for a comparison that was really "position 1 from scratch" against "position
+        // 1 continuing a prefix", and the reader had to infer the range from `start` and `M`.
+        std::fprintf(stderr, "[batchcheck] M=%d positions=%d..%d seq_argmax=%d batch_argmax=%d %s\n",
+                     M, start_pos, start_pos + M - 1, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
         // engine#1781: and the comparison the gate actually asks for -- every row, bitwise.
         if (!seq_rows.empty() && bat_rows.size() == seq_rows.size() && c_.NV > 0) {
             onebit::npu::RowMismatch mm;
@@ -5215,6 +5252,55 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         if (npu::model::run_lm_head(*xd_, h.data(), via_target.data())) { logits = std::move(via_target); return true; }
     }
     if (!host_gemm_ && xd_ && xd_->head_ctx() && xd_->head_ctx()->gemv) return run_lm_head_gemv(h, logits);
+    if (host_gemm_ && host_gemm_i8_) {
+        // engine#1808: the head's integer twin. Without this the arm's head is a plain f32 matvec ("No I8Ctx is
+        // touched" below) while the device's head reads a packed quantised table, which is exactly the 0.30 max|d|
+        // that was left once every body GEMM had been shown bit-exact. The device packs its head tiles with
+        // lctx.packB_into(...) -> packB_blocked, so the arm builds them with the same rule through
+        // q4nx_pack_B_int8_blocked(): one multiplier per column, int8 codes. Chunked by vocabulary block, because a
+        // whole head image is H x V bytes (622 MB at this vocabulary).
+        const float inv_es = (sem_.tie_embeddings && sem_.embed_scale > 0) ? 1.0f / sem_.embed_scale : 1.0f;
+        const int TB = 8192;   // vocabulary block; a tile's image is H x TB bytes
+        if ((int)lm_head_i8_.size() != (NV + TB - 1) / TB) lm_head_i8_.assign((NV + TB - 1) / TB, HostI8Tensor());
+        logits.assign((size_t)NV, 0.0f);
+        std::vector<float> a8v((size_t)H);
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) {
+            const float v = std::fabs(h[(size_t)k] * inv_es);
+            if (v > amax) amax = v;
+        }
+        const float ascale = amax > 0 ? amax / 127.0f : 1.0f;
+        for (int k = 0; k < H; k++) {
+            int q = (int)std::round(h[(size_t)k] * inv_es / ascale);
+            a8v[(size_t)k] = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
+        }
+        std::vector<float> bt((size_t)H * (size_t)TB);
+        std::vector<int8_t> a8i((size_t)H);
+        for (size_t i = 0; i < a8v.size(); i++) a8i[i] = a8v[i];
+        for (int t = 0; t < (int)lm_head_i8_.size(); t++) {
+            const int n0 = t * TB, n1 = std::min(NV, n0 + TB), Tn = n1 - n0;
+            HostI8Tensor& c = lm_head_i8_[(size_t)t];
+            if (c.codes.empty()) {
+                for (int n = n0; n < n1; n++)
+                    for (int k = 0; k < H; k++) bt[(size_t)k * Tn + (n - n0)] = lm_at(n, k);
+                c.N = Tn;
+                c.codes.assign((size_t)H * (size_t)Tn, 0);
+                c.d.assign((size_t)Tn, 0.0f);
+                double ssum = 0.0;
+                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, /*blocked=*/1, c.d.data(), &ssum);
+            }
+            for (int n = 0; n < Tn; n++) {
+                int32_t acc = 0;
+                for (int k = 0; k < H; k++)
+                    acc += (int32_t)((int)c.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, H, Tn)] *
+                                     (int)a8i[(size_t)k]);
+                float v = c.d[(size_t)n] * (ascale * (float)acc);
+                if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                logits[(size_t)(n0 + n)] = v;
+            }
+        }
+        return true;
+    }
     if (host_gemm_) {
         // Offline mode: plain float matvec against the (possibly dequantized)
         // tied table, matching the Python reference.  No I8Ctx is touched.

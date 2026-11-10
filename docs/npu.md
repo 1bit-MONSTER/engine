@@ -1981,6 +1981,13 @@ the images it writes.
 `--live --match` scores both **at the loop's own chain positions** (so the two per-depth tables are one measurement
 sampled two ways), and `--batchcheck` takes the verify batch's M-curve.
 
+`NPU_BATCH_CHECK=1` is the oracle underneath that check. Every `step_batch` first replays its rows with sequential
+`step()` calls and prints `[batchcheck] M=.. positions=a..b` with the argmax at the last row and a bitwise row count
+(`identical=N differing=0`). Both passes continue the same prefix: the oracle snapshots the first `start_pos`
+positions before the replay and restores them afterwards (engine#1905). So a chunk after the first, or the serve
+path's split-off last token, is compared from the state the batched pass really continues, and the flag leaves the
+run's own output unchanged. `tests/batch_check_state_test.cpp` pins both properties.
+
 `tools/mtp_depth_pool.py` pools those tickets. It refuses a pool it cannot read (a repeated tail, a cell scored twice, a
 short read, a mixed budget, a mixed window identity) and, since the tau=0.6 window, it also says when a depth is too
 **thin** to carry the 2 pp bar: one chain moves a depth's rate by `100/n` pp, so under 50 chains a single accepted draft

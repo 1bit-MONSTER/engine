@@ -290,9 +290,12 @@ int XdnaTarget::max_rows() const {
      * pb16i set that adopted only its prefill kernels has no 16-row twin, and answering 1 there would walk single-row
      * passes (the #1900 symptom on a different route).
      *
-     * The sealed route (no per-role context at all) is NOT decided here: the pack's own statement is `plan_m`, which
-     * #1904 reads and measured on the device. Whichever lands first, this must never answer wider than the narrowest
-     * loaded design. */
+     * The sealed/mono-ELF generation adopts its kernel set through a path that fills neither array, so both aggregates
+     * find nothing. Its answer is the plan's prefill M (engine#1904, measured on the device: bonsai2-27b-NPU-b8 states
+     * M=128 and reported 1): the plan is the pack's own statement of the width its kernels were built for, and a plan
+     * whose M disagrees with adopted kernels is already refused at load. It is only the FALLBACK -- a loaded per-role
+     * design always wins, so this never answers wider than the narrowest loaded design -- and it stays 1 when the plan
+     * states nothing: guessing a width launches into a BO sized for fewer rows. */
     const int n = ndesigns_ < Q4NX_MAX_DESIGNS ? ndesigns_ : Q4NX_MAX_DESIGNS;
     int widths16[Q4NX_MAX_DESIGNS] = {0};
     bool any16 = false;
@@ -303,7 +306,7 @@ int XdnaTarget::max_rows() const {
     int widths[Q4NX_MAX_DESIGNS] = {0};
     for (int i = 0; i < n; i++)
         if (ctx_[i]) widths[i] = ctx_[i]->MD;
-    return onebit::npu::batch_width_min(widths, n, 1);
+    return onebit::npu::batch_width_min(widths, n, plan_.prefill_m);
 }
 
 int XdnaTarget::rows_for(int role, int want) const {
@@ -1169,6 +1172,18 @@ void XdnaTarget::npu_gemm_rows(const GemvArgs& ar, std::vector<float>& out, std:
     }
     const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     out.resize((size_t)M * N);
+    // engine#1808: the device's per-column weight scales, KEYED by (layer, N, K) so it can be paired with the host
+    // arm's dump exactly. Index pairing was tried first and is meaningless -- the two sides reach the GEMM a
+    // different number of times (384 device dumps against 1024 arm dumps on the same request).
+    if (const char* gdir = getenv("NPU_I8_GS_DUMP")) {
+        static int n = 0;
+        char path[4096];
+        std::snprintf(path, sizeof path, "%s/dev_L%d_N%d_K%d_%03d.bin", gdir, ar.layer, N, K, n++);
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            if (gs && !gs->empty()) std::fwrite(gs->data(), sizeof(float), (size_t)N, f);
+            std::fclose(f);
+        }
+    }
     for (int m = 0; m < M; m++) {
         const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
         const float asc = ascales[(size_t)m];

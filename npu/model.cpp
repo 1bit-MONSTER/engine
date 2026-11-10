@@ -36,6 +36,46 @@ int Tensor::tiles() const {
     return int(shape[0]);
 }
 
+namespace {
+
+// engine#1843: does `t` hold exactly `vocab` rows of `hidden`, under ANY layout the forward reads an embedding table in
+// (q4nx_forward.cpp's init: BF16/F16/F32 rows at stride `hidden`; I8 either plain [vocab, hidden] -- bytes == V*H -- or
+// chunked tiles of 32 rows x 256 columns at one of the three chunk sizes, as a 3-D [row_tiles, col_tiles, chunk] grid or
+// a 2-D [tiles, chunk] list)? A tiled table may carry vocab padded up to a whole 32-row tile. An unrecognised dtype
+// returns true: it is not evidence either way, and the forward has its own refusal for it. `seen` gets what the table
+// does hold, for the message.
+bool table_holds_vocab(const Tensor& t, int64_t vocab, int64_t hidden, std::string* seen) {
+    if (vocab <= 0 || hidden <= 0) return true;
+    const int64_t pad_v = (vocab + 31) / 32 * 32;
+    const int64_t col_tiles = (hidden + 255) / 256;
+    const auto rows_ok = [&](int64_t r) { return r == vocab || r == pad_v; };
+    int esz = 0;
+    if (t.dtype == "BF16" || t.dtype == "F16") esz = 2;
+    else if (t.dtype == "F32") esz = 4;
+    if (esz) {
+        const uint64_t row = uint64_t(hidden) * uint64_t(esz);
+        if (t.bytes % row != 0) { *seen = "is " + std::to_string(t.bytes) + " B, not a whole number of rows"; return false; }
+        const int64_t r = int64_t(t.bytes / row);
+        *seen = "has " + std::to_string(r) + " rows of " + std::to_string(hidden);
+        return r == vocab;   // a plain table has no tile padding
+    }
+    if (t.dtype != "I8") return true;
+    if (t.bytes == uint64_t(vocab) * uint64_t(hidden)) return true;   // plain int8 + per-32-column scale (Gemma4)
+    const auto is_chunk = [](int64_t b) { return b == 5120 || b == 4736 || b == 8704; };  // Q4NX tile / Q4_K / Q8 chunk
+    int64_t r = -1;
+    if (t.shape.size() == 3 && is_chunk(t.shape[2]) && t.shape[1] == col_tiles) r = t.shape[0] * 32;
+    else if (t.shape.size() == 2 && is_chunk(t.shape[1]) && t.shape[0] % col_tiles == 0) r = t.shape[0] / col_tiles * 32;
+    if (r < 0) {
+        *seen = "is neither " + std::to_string(vocab) + " x " + std::to_string(hidden) +
+                " plain int8 nor a tile grid " + std::to_string(col_tiles) + " tiles wide";
+        return false;
+    }
+    *seen = "holds " + std::to_string(r) + " rows (" + std::to_string(r / 32) + " row tiles)";
+    return rows_ok(r);
+}
+
+}  // namespace
+
 Model::Model(const std::string& dir) {
     const std::string path = dir + "/model.q4nx";
     std::string why;
@@ -81,6 +121,19 @@ Model::Model(const std::string& dir) {
     // table is [7760, 4, 8704] and was reported as vocab 7760, hidden 4.
     if (c.contains("vocab_size")) {
         dims_.vocab = c.at("vocab_size");
+        // engine#1843: when the container also ships the table, it is evidence, and a table that cannot hold
+        // vocab_size rows is refused by name. A config stating MORE rows than the table makes the embedding read run
+        // into whatever tensor follows (Tensor::avail is measured to the end of the FILE, so lane.cpp's bound does not
+        // catch it); FEWER leaves rows nothing can reach. Neither number can be trusted then.
+        const Tensor* emb = find("model.embed_tokens.weight");
+        if (!emb && c.value("tie_word_embeddings", false)) emb = find("lm_head.weight");
+        if (emb) {
+            std::string seen;
+            if (!table_holds_vocab(*emb, dims_.vocab, dims_.hidden, &seen))
+                throw std::runtime_error(dir + "/config.json states vocab_size " + std::to_string(dims_.vocab) +
+                                         " but the embedding table (" + emb->dtype + ") " + seen +
+                                         "; refusing rather than reading past it or leaving rows unreachable");
+        }
     } else {
         const Tensor* emb = find("model.embed_tokens.weight");
         if (!emb && c.value("tie_word_embeddings", false)) emb = find("lm_head.weight");

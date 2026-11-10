@@ -304,6 +304,18 @@ add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
 add_python_test(tests_referenced ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(tests_referenced_self ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --self-test)
+# engine#1901: five tools ship a --self-test that no runner named, so the arms existed, were maintained beside the logic they
+# check, and never executed. All five run device-free and fast (58-277 ms measured), so they are rows rather than allow-list
+# excuses, and tools/ci/tests_referenced_check.py now counts tools/**/*.py that declare one and are named by no RUNNER
+# (CMakeLists/cmake/workflows -- a citation in another tool's source is not a runner: that is the 5-vs-2 difference).
+# Registered through add_python_test (engine#1864), so they run THROUGH the interpreter: my first version used the raw
+# `${Python3_EXECUTABLE}` form above the find_package and the repository's own ordering guard caught it by name --
+# tools/mtp_head_ref.py is the one of the five without an exec bit, and it became BAD_COMMAND under ctest.
+add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
+add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
+add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)
+add_python_test(tool_selftest_spec_decode_acceptance ${CMAKE_SOURCE_DIR}/tools/spec_decode_acceptance.py --selftest)
+add_python_test(tool_selftest_whisper_encoder_baseline ${CMAKE_SOURCE_DIR}/tools/whisper_encoder_baseline.py --self-test)
 # engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
 add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three

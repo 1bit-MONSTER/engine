@@ -437,6 +437,12 @@ constexpr Fconst19Rule kFconst19Rules[] = {
     // all 32 blocks. This is the largest family on #1503 (31 packs). Measured by another lane on main, whose
     // table is keyed on geometry; merged here in the same form.
     {4096, 32, 32, 12608, 5, 1, 2297856},
+    // Llama-3.2-3B (and -Instruct, same geometry) at hidden 3,072 / 24 heads / 28 layers: measured with
+    // tools/fconst19_measure.py against amd/Llama-3.2-3B_rai_1.8.0_npu_4K, 1,090 of 1,756,930,368 bytes differ
+    // (6.20e-05) -- content, not layout. The prefix is the Qwen3 line's 64 + 2*hidden + 4,352 = 10,560 at this hidden
+    // size, but the bundle is FOUR tiles of 1,740,800 (6,963,200 B) where the Phi/h3072 row has two of 5,222,400 --
+    // which is the whole reason a row is measured per geometry and never derived from the hidden size.
+    {3072, 24, 28, 10560, 4, 1, 1740800},
 };
 
 const Fconst19Rule* select_rule_in(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,

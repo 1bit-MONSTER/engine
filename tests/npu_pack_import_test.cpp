@@ -2284,6 +2284,43 @@ void test_selfcheck_reads_bf16() {
     }
 }
 
+// engine#1633: the two behaviours that decide correctness in the 1.9 rule table, plus the one shape the table must
+// never contain. The row is the product of this PR -- every field measured against the 1.8 twin by
+// tools/fconst19_measure.py -- so a wrong row rotates a pack's weights into the wrong projections while leaving the
+// prefix and the epsilon anchors untouched, i.e. it reads as a correct parse and answers quietly wrong text.
+void test_fconst19_rule_table() {
+    // 1. a measured geometry returns its row, with the numbers that were measured
+    std::string why;
+    const pi::Fconst19Rule* r = pi::select_fconst19_rule(896, 14, 24, &why);
+    check(r && r->prefix == 1856 && r->n_tiles == 16 && r->rot == 2 && r->tile == 34816,
+          "fconst19 rule: Qwen2.5-0.5B's geometry returns its measured row (prefix " +
+              std::to_string(r ? r->prefix : -1) + ", " + std::to_string(r ? r->n_tiles : -1) + " tiles of " +
+              std::to_string(r ? r->tile : -1) + " B, rot " + std::to_string(r ? r->rot : -1) + ")");
+
+    // 2. a geometry that has never been measured is refused, and the refusal names the geometry
+    why.clear();
+    check(!pi::select_fconst19_rule(1234, 7, 11, &why) && why.find("1234") != std::string::npos &&
+              why.find("has not been measured") != std::string::npos,
+          "fconst19 rule: an unmeasured geometry is refused, naming it (" + why + ")");
+
+    // 3. the shape the real table must never contain: one geometry measured TWICE with different block shapes. A pack's
+    //    geometry cannot choose between them, and picking either is the silent mis-rotation this table exists to avoid.
+    const pi::Fconst19Rule two[] = {{2048, 16, 28, 8512, 3, 1, 1183744},     // Qwen3-1.7B's
+                                    {2048, 16, 28, 8512, 5, 1, 591872}};     // Llama-3.2-1B's bundle, same geometry
+    why.clear();
+    check(!pi::select_fconst19_rule_from(two, 2, 2048, 16, 28, &why) && why.find("DIFFERENT") != std::string::npos &&
+              why.find("1183744") != std::string::npos && why.find("591872") != std::string::npos,
+          "fconst19 rule: two rows for one geometry refuse rather than pick (" + why.substr(0, 120) + "...)");
+
+    // control for 3: the same geometry listed twice with the SAME shape is not ambiguous
+    const pi::Fconst19Rule dup[] = {{1536, 12, 28, 3136, 7, 1, 226304}, {1536, 12, 28, 3136, 7, 1, 226304}};
+    why.clear();
+    check(pi::select_fconst19_rule_from(dup, 2, 1536, 12, 28, &why) != nullptr,
+          "fconst19 rule: a geometry measured twice with the same shape is fine -- that is the h1536 pair, which is "
+          "byte-identical over all 28 blocks");
+    std::printf("fconst19 rule: measured row, unmeasured refusal, and the ambiguity guard all behave\n");
+}
+
 void test_qwen3_attn_sections() {
     struct Pack { const char* name; int64_t hidden, q_out, kv_out, hd, h0, h1, h2; };
     const Pack packs[] = {{"Qwen3-1.7B", 2048, 2048, 1024, 128, 4739136, 4739456, 7107264},
@@ -2879,6 +2916,7 @@ int main(int argc, char** argv) {
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
+        test_fconst19_rule_table();
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);

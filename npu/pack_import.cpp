@@ -5868,6 +5868,23 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     }
                     // candidates: what the metadata says first, then the values these families actually use
                     std::vector<double> cands{p.dims.rope_theta, 1e4, 5e4, 1e5, 5e5, 1e6, 1e7, 1.6e6, 3.2e6};
+                    // engine#1889: a `rope_scaling: {type: "dynamic", alpha: A}` block (Hunyuan) is a FIXED base
+                    // theta * A^(dim/(dim-2)), and the forward computes it from the block (q4nx_rope_dynamic_base).
+                    // That base is tried first: on Hunyuan-7B it is 11,158,840 and no plain candidate comes near
+                    // (best 0.7222 at 1e7), so the import warned "no plain theta explains" about a cache the
+                    // model's own config explains. rope_theta is left as declared when this one wins -- writing the
+                    // scaled base there would have the forward apply alpha twice.
+                    double alpha_base = 0.0, alpha = 0.0;
+                    if (c.contains("rope_scaling") && c["rope_scaling"].is_object() &&
+                        c["rope_scaling"].contains("type") && c["rope_scaling"]["type"].is_string() &&
+                        c["rope_scaling"]["type"].get<std::string>() == "dynamic" &&
+                        c["rope_scaling"].contains("alpha") && c["rope_scaling"]["alpha"].is_number()) {
+                        alpha = c["rope_scaling"]["alpha"].get<double>();
+                        const double hd = double(half) * 2.0;
+                        if (alpha > 0.0 && hd > 2.0 && p.dims.rope_theta > 0)
+                            alpha_base = double(p.dims.rope_theta) * std::pow(alpha, hd / (hd - 2.0));
+                    }
+                    if (alpha_base > 0.0) cands.insert(cands.begin(), alpha_base);
                     double best_corr = -2.0, best_theta = p.dims.rope_theta;
                     const int HD2 = int(half) * 2;          // head_dim implied by the cache
                     const int64_t pmax = std::min<int64_t>(rows, 4096);
@@ -5898,7 +5915,21 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             if (corr == corr && corr > best_corr) { best_corr = corr; best_theta = th; }
                         }
                     }
-                    if (best_corr > 0.99 && std::fabs(best_theta - p.dims.rope_theta) > 1e-9) {
+                    if (best_corr > 0.99 && alpha_base > 0.0 && best_theta == alpha_base) {
+                        std::fprintf(stderr,
+                                     "note: RoPE base %.8g (rope_theta %.6g, rope_scaling alpha %.6g) verified against "
+                                     "the pack's cos_cache (corr %.4f)\n",
+                                     alpha_base, (double)p.dims.rope_theta, alpha, best_corr);
+                        c.erase("q4nx_rope_note");
+                    } else if (best_corr > 0.99 && alpha_base > 0.0) {
+                        // A plain theta fits and the alpha base does not, while the config still carries alpha: the
+                        // forward would scale whatever is written to rope_theta, so nothing is adopted.
+                        std::fprintf(stderr,
+                                     "WARNING: this pack's RoPE caches fit plain theta %.6g (corr %.4f), not the base "
+                                     "%.8g its rope_scaling alpha %.6g implies; this forward applies alpha, so "
+                                     "attention may be wrong from the first token\n",
+                                     best_theta, best_corr, alpha_base, alpha);
+                    } else if (best_corr > 0.99 && std::fabs(best_theta - p.dims.rope_theta) > 1e-9) {
                         std::fprintf(stderr,
                                      "note: rope_theta %.6g declared, %.6g adopted (correlation %.4f against the "
                                      "pack's own cos_cache)\n", (double)p.dims.rope_theta, best_theta, best_corr);

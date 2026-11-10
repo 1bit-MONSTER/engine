@@ -1061,7 +1061,6 @@ target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
 add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4nx)
 add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp)
-target_include_directories(npu_pack_import_test PRIVATE ${CMAKE_SOURCE_DIR}/npu/forward/include)
 target_link_libraries(npu_pack_import_test PRIVATE onebit_npu)
 add_test(NAME npu_pack_import COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden)
 # engine#1726: NPU_INFER_DUMP_DIR's residual write must SAY when it cannot write -- a missing or unwritable directory, or a

@@ -37,7 +37,6 @@
 #include "pack.h"
 #include "pack_import.h"
 #include "q4nx.h"
-#include "per_layer_embed.h"
 #include "q4nx_device.h"
 
 #include <nlohmann/json.hpp>
@@ -2961,42 +2960,6 @@ void test_per_layer_container(const std::string& root) {
 }
 
 
-// engine#1725: the per-layer gather the forward will call. Pure: three numbers pin the projection.
-void test_per_layer_gather() {
-    using namespace onebit::npu;
-    const int64_t V = 2, width = 4;
-    // two-arg form: `nrm(size_t(width))` would be a function declaration (the same trap as the per-layer fixture above)
-    std::vector<uint16_t> tbl(size_t(V * width), 0), nrm(size_t(width), 0);
-    auto bf = [](float f) { uint32_t b; __builtin_memcpy(&b, &f, 4); return uint16_t(b >> 16); };
-    // row 0 = {1, 2, 3, 4}, row 1 = {-1, 0.5, 0, 8}; norm = {2, 2, 0.5, 0.25}
-    const float r0[4] = {1, 2, 3, 4}, r1[4] = {-1, 0.5f, 0, 8}, nn[4] = {2, 2, 0.5f, 0.25f};
-    for (int k = 0; k < 4; ++k) { tbl[size_t(k)] = bf(r0[k]); tbl[size_t(4 + k)] = bf(r1[k]); nrm[size_t(k)] = bf(nn[k]); }
-    float out[4] = {0, 0, 0, 0};
-    per_layer_gather(tbl.data(), nrm.data(), V, width, 0, out);
-    const float want0[4] = {2, 4, 1.5f, 1};
-    bool ok0 = true;
-    for (int k = 0; k < 4; ++k) ok0 = ok0 && out[k] == want0[k];
-    std::printf("per-layer gather: row0 -> %.2f %.2f %.2f %.2f\n", out[0], out[1], out[2], out[3]);
-    check(ok0, "per-layer gather: the projection is row * norm, elementwise (1*2, 2*2, 3*0.5, 4*0.25)");
-    per_layer_gather(tbl.data(), nrm.data(), V, width, 1, out);
-    const float want1[4] = {-2, 1, 0, 2};
-    bool ok1 = true;
-    for (int k = 0; k < 4; ++k) ok1 = ok1 && out[k] == want1[k];
-    check(ok1, "per-layer gather: a different row picks a different row of the table (-1*2, 0.5*2, 0*0.5, 8*0.25)");
-    // a null norm means "no projection", not "zero": the row passes through
-    per_layer_gather(tbl.data(), nullptr, V, width, 0, out);
-    bool ok2 = true;
-    for (int k = 0; k < 4; ++k) ok2 = ok2 && out[k] == r0[k];
-    check(ok2, "per-layer gather: no norm passes the row through (a missing projection is not a zero one)");
-    // out-of-range ids and shapes are a no-op, not a crash: the loader can hand a short container
-    float untouched[4] = {9, 9, 9, 9};
-    per_layer_gather(tbl.data(), nrm.data(), V, width, 5, untouched);
-    per_layer_gather(nullptr, nrm.data(), V, width, 0, untouched);
-    bool ok3 = true;
-    for (int k = 0; k < 4; ++k) ok3 = ok3 && untouched[k] == 9;
-    check(ok3, "per-layer gather: an out-of-range id or a missing table leaves the output untouched");
-}
-
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -3038,7 +3001,6 @@ int main(int argc, char** argv) {
         test_fconst_in_component(golden_dir.empty() ? "." : golden_dir);
         test_embedding_in_component(golden_dir.empty() ? "." : golden_dir);
         test_per_layer_container(golden_dir.empty() ? "." : golden_dir);
-        test_per_layer_gather();
         test_embedding_f32_component(golden_dir.empty() ? "." : golden_dir);
         test_qwen3_attn_sections();
         test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);

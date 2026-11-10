@@ -1115,6 +1115,10 @@ add_executable(q4nx_vision_rope_test tests/q4nx_vision_rope_test.cpp npu/forward
 # test runs.
 add_executable(q4nx_vision_block_test tests/q4nx_vision_block_test.cpp npu/forward/src/q4nx_vision_block.cpp npu/forward/src/q4nx_vision_pos.cpp npu/forward/src/q4nx_vision_rope.cpp)
 add_executable(q4nx_vision_tower_test tests/q4nx_vision_tower_test.cpp npu/forward/src/q4nx_vision_block.cpp npu/forward/src/q4nx_vision_pos.cpp npu/forward/src/q4nx_vision_rope.cpp)
+# engine#1930 review: three of these four targets are tests ci.yml never builds, so their `add_test` rows would never run in
+# CI -- `ci_targets_check` refuses that. `add_dependencies(onebit <target>)` is the tree's documented route (it needs no
+# `.github/workflows/` edit, so it also needs no `workflow` scope for the push), and the checker follows it.
+add_dependencies(onebit q4nx_vision_block_test q4nx_vision_pos_test q4nx_vision_rope_test q4nx_vision_tower_test)
 target_include_directories(q4nx_vision_tower_test PRIVATE npu/forward/include)
 add_test(NAME q4nx_vision_tower COMMAND q4nx_vision_tower_test)
 target_include_directories(q4nx_vision_block_test PRIVATE npu/forward/include)

@@ -513,93 +513,56 @@ void test_external_packed_genre(const std::string& root) {
         check(imported, "external writer: a crafted pack with a satisfiable split imports" + (imported ? "" : " (" + why_imp + ")"));
         if (imported) {
             check(fs::exists(sout / "model.q4nx"), "external writer: and writes model.q4nx");
-            std::ifstream f(sout / "model.q4nx", std::ios::binary);
-            uint64_t hlen = 0;
-            f.read(reinterpret_cast<char*>(&hlen), 8);
-            std::string hdr(static_cast<size_t>(hlen), '\0');
-            f.read(&hdr[0], std::streamsize(hlen));
-            const json h = json::parse(hdr);
-            std::string qname;
-            uint64_t qoff = 0, qbytes = 0;
-            uint64_t qtile = 0;
-            // The container header is a FLAT map of tensor name -> {dtype, shape, data_offsets}: no "tensors" wrapper,
-            // and non-tensor keys (format, config) carry no data_offsets.
-            for (auto it = h.begin(); it != h.end(); ++it) {
-                if (!it.value().is_object() || !it.value().contains("data_offsets")) continue;
-                const std::string k2 = it.key();
-                if (k2.find("q_proj") != std::string::npos || k2.find("qkv") != std::string::npos) {
-                    qname = k2;
-                    qoff = it.value()["data_offsets"][0].get<uint64_t>();
-                    qbytes = it.value()["data_offsets"][1].get<uint64_t>() - qoff;
-                    // The writer stores a projection as {ntiles, kImportTileBytes} (pack_import.cpp: "w.add(prefix,
-                    // "I8", {nt, kImportTileBytes}, …)"), NOT as [rows, cols] -- so the decode below must be told the
-                    // MODEL's geometry and the tile size, and the stored shape only supplies the chunk size.
+            // ALL THREE projections, not just q: container_from_external_q4() runs on the FUSED qkv (15360 rows), so a
+            // slot it gets wrong can land in k or v while q stays clean -- measured, doubling scale[size/2] of the
+            // fused pack leaves q_proj at 22.0 and lands in v_proj, which a q-only arm never sees.
+            for (const char* role : {"q_proj", "k_proj", "v_proj"}) {
+                std::ifstream f(sout / "model.q4nx", std::ios::binary);
+                uint64_t hlen = 0;
+                f.read(reinterpret_cast<char*>(&hlen), 8);
+                std::string hdr(static_cast<size_t>(hlen), '\0');
+                f.read(&hdr[0], std::streamsize(hlen));
+                const json h = json::parse(hdr);
+                std::string name;
+                uint64_t off = 0, nbytes = 0, chunk = 0;
+                for (auto it = h.begin(); it != h.end(); ++it) {
+                    if (!it.value().is_object() || !it.value().contains("data_offsets")) continue;
+                    if (it.key().find(role) == std::string::npos) continue;
+                    name = it.key();
+                    off = it.value()["data_offsets"][0].get<uint64_t>();
+                    nbytes = it.value()["data_offsets"][1].get<uint64_t>() - off;
                     if (it.value().contains("shape") && it.value()["shape"].size() >= 2)
-                        qtile = it.value()["shape"][1].get<uint64_t>();
+                        chunk = it.value()["shape"][1].get<uint64_t>();
                 }
-            }
-            check(!qname.empty(), "external writer: the container carries the q projection");
-            if (!qname.empty()) {
-                std::printf("  writer success: %s %llu B (header %llu B)\n", qname.c_str(),
-                            (unsigned long long)qbytes, (unsigned long long)hlen);
-                std::vector<uint8_t> tile_raw(static_cast<size_t>(qbytes));
-                f.seekg(std::streamoff(8 + hlen + qoff));
-                f.read(reinterpret_cast<char*>(tile_raw.data()), std::streamsize(tile_raw.size()));
-                const int64_t q_rows = heads * hd, q_cols = K;   // q_proj as the model sees it
-                std::printf("  writer success: %llu B in %llu B tiles -> %llu tiles; model rows %lld cols %lld\n",
-                            (unsigned long long)qbytes, (unsigned long long)qtile, (unsigned long long)(qbytes / qtile),
-                            (long long)q_rows, (long long)q_cols);
-                // The writer stores Q4_1F tiles (6144 B), which q4nx_dequant_tile_row does not decode: the device loader
-                // repacks them through q4nx::as_q4_1() first (q4nx_device.cpp:263-266), so the read-back takes the same
-                // route rather than a second decoder written for this test.
-                // chunk_of() reads shape.back() (npu/q4nx.cpp:89) -- which is exactly why the writer stores
-                // {ntiles, chunk_bytes}: the last dimension IS the chunk kind. Giving it {rows, cols} instead makes
-                // chunk_of() see 5120 (Q4_1) and as_q4_1() copies the bytes through without repacking.
+                if (name.empty()) { check(false, std::string("external writer: the container carries ") + role); continue; }
+                // chunk_of() reads shape.back(), so the Tensor is shaped {ntiles, chunk_bytes} -- what the writer stores.
                 onebit::npu::Tensor q4f;
                 q4f.dtype = "I8";
-                q4f.shape = {int64_t(qbytes / qtile), int64_t(qtile)};
-                q4f.data = tile_raw.data();
-                q4f.bytes = q4f.avail = uint64_t(tile_raw.size());
+                q4f.shape = {int64_t(nbytes / chunk), int64_t(chunk)};
+                std::vector<uint8_t> raw(static_cast<size_t>(nbytes));
+                f.seekg(std::streamoff(8 + hlen + off));
+                f.read(reinterpret_cast<char*>(raw.data()), std::streamsize(raw.size()));
+                q4f.data = raw.data();
+                q4f.bytes = q4f.avail = nbytes;
                 const std::vector<uint8_t> conv = onebit::npu::q4nx::as_q4_1(q4f);
-                std::printf("  as_q4_1: %llu B -> %zu B (%zu tiles)\n", (unsigned long long)qbytes, conv.size(),
-                            conv.size() / size_t(Q4NX_TILE_BYTES));
-                // The writer pads the column count to a whole 256-column tile (5120 -> 6144), so the decode has to be
-                // told the PADDED grid: 160 row-tiles x 24 col-tiles = 3840 tiles, which is what as_q4_1() returned.
-                const int64_t q_cols_pad = (q_cols + 255) / 256 * 256;
-                std::printf("  decode grid: rows %lld cols %lld (padded from %lld); %zu tiles of %d\n",
-                            (long long)q_rows, (long long)q_cols_pad, (long long)q_cols,
-                            conv.size() / size_t(Q4NX_TILE_BYTES), int(Q4NX_TILE_BYTES));
-                std::vector<float> row(static_cast<size_t>(q_cols_pad));
-                const int rc = q4nx_dequant_tile_row(conv.data(), conv.size(), int(q_rows), int(q_cols_pad),
-                                                     Q4NX_TILE_BYTES, 0, row.data());
-                check(rc == 0, "external writer: the written tile decodes (got " + std::to_string(rc) + ")");
-                if (rc == 0) {
-                    for (int rr : {0, 32, int(q_rows - 1)}) {
-                        std::vector<float> r2(static_cast<size_t>(q_cols_pad));
-                        const int r2c = q4nx_dequant_tile_row(conv.data(), conv.size(), int(q_rows), int(q_cols_pad),
-                                                              Q4NX_TILE_BYTES, rr, r2.data());
-                        if (r2c == 0)
-                            std::printf("  row %d: first %.4f  mid %.4f\n", rr, double(r2[0]), double(r2[size_t(q_cols / 2)]));
-                        else
-                            std::printf("  row %d: refused (%d)\n", rr, r2c);
-                    }
-                    // Every row, not just row 0: with a uniform blob any slot the writer gets wrong lands in some
-                    // row, and an arm that checks one row is blind to all the others (measured: a single doubled
-                    // scale slot was caught by the sibling arms and missed by a row-0-only check).
-                    size_t bad = 0;
-                    int64_t bad_row = -1;
-                    for (int64_t r = 0; r < q_rows; ++r) {
-                        if (q4nx_dequant_tile_row(conv.data(), conv.size(), int(q_rows), int(q_cols),
-                                                  Q4NX_TILE_BYTES, int(r), row.data()) != 0) { ++bad; continue; }
-                        for (int64_t c = 0; c < q_cols; ++c)
-                            if (std::fabs(row[size_t(c)] - 22.0f) > 1e-6f) { ++bad; if (bad_row < 0) bad_row = r; }
-                    }
-                    char msg[220];
-                    std::snprintf(msg, sizeof msg,
-                                  "external writer: every one of %lld rows decodes to 22.0 ((12 - 1) * 2.0); %zu differ, first bad row %lld",
-                                  (long long)q_rows, bad, (long long)bad_row);
-                    check(bad == 0, msg);
+                const int64_t rows = heads * hd, cols = K;
+                std::vector<float> row(static_cast<size_t>(cols));
+                size_t bad = 0;
+                int64_t bad_row = -1;
+                for (int64_t r = 0; r < rows; ++r) {
+                    if (q4nx_dequant_tile_row(conv.data(), conv.size(), int(rows), int(cols), Q4NX_TILE_BYTES,
+                                              int(r), row.data()) != 0) { ++bad; continue; }
+                    for (int64_t c = 0; c < cols; ++c)
+                        if (std::fabs(row[size_t(c)] - 22.0f) > 1e-6f) { ++bad; if (bad_row < 0) bad_row = r; }
                 }
+                std::printf("  writer success: %s %llu B in %llu B chunks -> %zu tiles, rows %lld\n", name.c_str(),
+                            (unsigned long long)nbytes, (unsigned long long)chunk,
+                            conv.size() / size_t(Q4NX_TILE_BYTES), (long long)rows);
+                char msg[240];
+                std::snprintf(msg, sizeof msg,
+                              "external writer: every one of %s %lld rows decodes to 22.0 ((12 - 1) * 2.0); %zu differ, first bad row %lld",
+                              role, (long long)rows, bad, (long long)bad_row);
+                check(bad == 0, msg);
             }
         }
     }

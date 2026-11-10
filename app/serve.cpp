@@ -74,6 +74,7 @@
 #include "pm.h"
 #include "laya_checkpoint.h"
 #include "recipes.h"
+#include "q4nx_cache_evict.h"   // engine#1956: the cache cap's pure planner
 #include "route_log.h"
 #include "serve_metrics.h"
 #include "serve_watchdog.h"
@@ -2950,6 +2951,42 @@ std::string q4nx_cache_root() {
     throw std::runtime_error("no home directory for the Q4NX cache: set HOME or ONEBIT_Q4NX_CACHE");
 }
 
+// engine#1956: keep the Q4NX cache bounded, evicting on write. `keep` is the entry just written.
+//
+// The cap is on the whole directory, in GiB, because the unit that matters to the disk is bytes: ~3.5 G per
+// pack, so the default of 40 GiB holds about what a box serves in a day while bounding the directory at a
+// third of the 104 G it reached on 2026-11-10. ONEBIT_Q4NX_CACHE_MAX_GIB overrides it; 0 disables eviction
+// (for a lane that has measured its own cache and wants no surprises).
+void evict_q4nx_cache(const std::string& cache_dir, const std::string& keep) {
+    const char* env = std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB");
+    const uint64_t cap_gib = env && *env ? std::strtoull(env, nullptr, 10) : 40ull;
+    if (cap_gib == 0) return;
+    std::error_code ec;
+    std::vector<onebit::Q4nxCacheEntry> entries;
+    for (const auto& e : fs::directory_iterator(cache_dir, ec)) {
+        if (ec || !e.is_directory()) continue;
+        uint64_t bytes = 0;
+        int64_t newest = 0;
+        std::error_code wec;
+        for (const auto& f : fs::recursive_directory_iterator(e.path(), wec)) {
+            std::error_code sec;
+            if (f.is_regular_file()) bytes += f.file_size(sec);
+            const auto t = fs::last_write_time(f.path(), sec);
+            const int64_t secs = int64_t(t.time_since_epoch().count());
+            if (secs > newest) newest = secs;
+        }
+        entries.push_back({e.path().filename().string(), bytes, newest});
+    }
+    const std::vector<std::string> victims = onebit::q4nx_cache_evict_plan(entries, cap_gib << 30, keep);
+    for (const std::string& v : victims) {
+        std::error_code rec;
+        fs::remove_all(fs::path(cache_dir) / v, rec);
+        if (!rec)
+            std::fprintf(stderr, "1bit serve: evicted cached Q4NX dir %s (engine#1956, cap %llu GiB)\n", v.c_str(),
+                         (unsigned long long)cap_gib);
+    }
+}
+
 // Repack a GGUF into a Q4NX model directory with the FLM_Q4NX_Converter
 // (Python), cached by GGUF stem so a repeated serve reuses the conversion.
 // Override the tool paths with ONEBIT_Q4NX_PYTHON / ONEBIT_Q4NX_CONVERTER and
@@ -3048,6 +3085,7 @@ std::string repack_gguf(const std::string& gguf) {
     const int rc = run_program(repack, false);
     if (rc != 0 || !fs::exists(out + "/model.q4nx"))
         throw std::runtime_error("GGUF repack failed (rc=" + std::to_string(rc) + "): " + command_text(repack));
+    evict_q4nx_cache(cache, stem);
     return out;
 }
 
@@ -3117,6 +3155,7 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
             fs::copy_file(fs::path(tok) / "tokenizer_config.json", fs::path(out) / "tokenizer_config.json",
                           fs::copy_options::overwrite_existing);
     }
+    evict_q4nx_cache(cache, stem);   // engine#1956: the fused-lane writer bounds the cache too
     return out;
 }
 

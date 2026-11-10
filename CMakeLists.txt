@@ -1254,6 +1254,14 @@ endif()
 add_executable(npu_model_bounds_test tests/npu_model_bounds_test.cpp)
 target_link_libraries(npu_model_bounds_test PRIVATE onebit_npu)
 add_test(NAME npu_model_bounds COMMAND npu_model_bounds_test)
+
+# engine#1956: the Q4NX cache cap's planner -- policy for a cache that had grown to 104 G with no eviction.
+# Header-only, no cache and no converter: the arm tests the policy, and `add_dependencies` puts the target in
+# the build CI actually runs (an `add_test` alone leaves a target unbuilt on this runner, engine#1858/#1834).
+add_executable(q4nx_cache_evict_test tests/q4nx_cache_evict_test.cpp)
+target_include_directories(q4nx_cache_evict_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+add_test(NAME q4nx_cache_evict COMMAND q4nx_cache_evict_test)
+add_dependencies(onebit q4nx_cache_evict_test)
 # CI builds an explicit target list (.github/workflows/ci.yml, "Keep this list in step with
 # add_test()"), and extending that list needs a token with the `workflow` scope, which a lane does
 # not carry. Binding npu_moe_test to a target the list already names gets it built either way (a

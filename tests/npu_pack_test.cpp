@@ -89,9 +89,12 @@ static void quant_int4_arms() {
 
 /* engine#1900: the batch width is the chunk width, and the activation BO holds exactly that many rows -- an OVER-wide
  * answer reads past the BO (engine#1372, memory corruption rather than a slow path). The old code returned the first
- * populated design's width, so a 16/16/128 set answered 128 whenever that role was index 0. The arms below are the
- * dangerous direction (min, not first), the empty array (sealed packs: no per-role ctx at all, hence a fallback), and
- * the zero slots that an unloaded role leaves behind. */
+ * populated design's width, so a mixed set answered whichever role was index 0.
+ *
+ * These arms pin the RULE (minimise, skip empty slots, take a fallback), not a measurement: no pack on this box has been
+ * shown to adopt mixed widths, so nothing here claims the old answer was wrong on a real pack -- only that it would be
+ * the dangerous way round if one ever did. The sealed route's width is #1904's, read from the plan and measured on the
+ * device. */
 static void batch_width_arms() {
     using onebit::npu::batch_width_min;
     const int mixed[] = {16, 16, 128};

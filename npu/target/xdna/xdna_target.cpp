@@ -282,22 +282,27 @@ bool XdnaTarget::weight_cached(int layer, int key) const {
 }
 
 int XdnaTarget::max_rows() const {
-    /* engine#1900 (review of #1903): this width IS the chunk width, and the activation BO holds exactly that many rows --
-     * an over-wide launch reads and poisons past the BO, which is memory corruption rather than a slow path (engine#1372).
-     * The old code returned the FIRST populated per-role entry, so a 16/16/128 set answered 128 whenever the wide role
-     * happened to be index 0: the dangerous direction was live even on the array path.
+    /* engine#1900: this width IS the chunk width, and the activation BO holds exactly that many rows -- an over-wide
+     * launch reads and poisons past the BO, which is memory corruption rather than a slow path (engine#1372). The old
+     * code returned the FIRST populated per-role entry, so a mixed set answered whichever role happened to be index 0.
      *
-     * The MINIMUM of the loaded widths is therefore the only safe aggregate. The SEALED-wide case (no per-role context is
-     * populated at all, so this falls through) is NOT decided here: the sealed branch took the width from a compile-time
-     * constant through caps(), which is a guess at which design is loaded, and the pack's own statement is `plan_m` -- see
-     * #1904, which reads it and measured one 4-row pass on the device (`identical=4 differing=0`). Whichever of the two
-     * lands first, this function must not answer wider than the narrowest loaded design. */
+     * The MINIMUM of the loaded widths is the only safe aggregate, and the pb16i_ case keeps main's FALL-THROUGH: a
+     * pb16i set that adopted only its prefill kernels has no 16-row twin, and answering 1 there would walk single-row
+     * passes (the #1900 symptom on a different route).
+     *
+     * The sealed route (no per-role context at all) is NOT decided here: the pack's own statement is `plan_m`, which
+     * #1904 reads and measured on the device. Whichever lands first, this must never answer wider than the narrowest
+     * loaded design. */
     const int n = ndesigns_ < Q4NX_MAX_DESIGNS ? ndesigns_ : Q4NX_MAX_DESIGNS;
-    int widths[Q4NX_MAX_DESIGNS] = {0};
+    int widths16[Q4NX_MAX_DESIGNS] = {0};
+    bool any16 = false;
     if (pb16i_)
-        for (int i = 0; i < n; i++) widths[i] = ctx16_[i] ? ctx16_[i]->MD : 0;
-    else
-        for (int i = 0; i < n; i++) widths[i] = ctx_[i] ? ctx_[i]->MD : 0;
+        for (int i = 0; i < n; i++)
+            if (ctx16_[i]) { widths16[i] = ctx16_[i]->MD; any16 = true; }
+    if (any16) return onebit::npu::batch_width_min(widths16, n, 1);
+    int widths[Q4NX_MAX_DESIGNS] = {0};
+    for (int i = 0; i < n; i++)
+        if (ctx_[i]) widths[i] = ctx_[i]->MD;
     return onebit::npu::batch_width_min(widths, n, 1);
 }
 

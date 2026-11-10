@@ -128,9 +128,15 @@ architecture class the census counts.
 
 Exit 0 means every newest model is mapped; **exit 1 is the alert** — a class arrived that
 no backend accepts. One kind of unmapped class is reported without the alert: a class whose
-models all load through custom modeling code (`auto_map` in the config, or a runtime that is
-not Transformers, so Transformers has no implementation of it either) and that fewer than 3
-uploaders publish. Research one-offs like that arrive every day (`Ihatetomatoes/nanoBeard-sloop-14M`
+models all load through custom modeling code and that fewer than 3 uploaders publish. Custom
+code is any of three things, and in each Transformers has no implementation of the class
+either: `auto_map` in the config; a runtime library that is not Transformers; or a repo with
+no library at all that ships its own top-level `modeling_<name>.py` and is not tagged
+`transformers` (`Climb-Ai/Climb-1-Toki`: `MicroLlamaForCausalLM` is a bare `torch.nn.Module`
+in `modeling_micro_llama.py`, with `model_type: llama` and no `auto_map`, engine#1922). The
+third rule reads the repo's file names, which is why the listing is asked for `full=true`.
+The Hub marks a repo it can load with the library as a Transformers model, so a new class
+Transformers really has still alerts. Research one-offs like that arrive every day (`Ihatetomatoes/nanoBeard-sloop-14M`
 is a raw `pytorch` nanoGPT checkpoint whose config says `architectures: ["GPT"]` and
 `model_type: nanobeard-gpt`, engine#296). It alerts once 3 uploaders use it, and a reviewed
 class (`registry/significant.json`) always alerts, unless its entry says `"watch": "report"`:

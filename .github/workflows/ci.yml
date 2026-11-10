@@ -130,7 +130,8 @@ jobs:
             npu_model_bounds_test npu_forward_loader_test npu_design_grid_test npu_sampling_test \
             npu_flm_head_import_test npu_elf_args_test \
             npu_template_test npu_chatml_test \
-            tokenizer_linear_test hrx_placement_test hrx_cwsr_test hrx_runtime_test npu_device_lock_test -j
+            tokenizer_linear_test hrx_placement_test hrx_cwsr_test hrx_runtime_test npu_device_lock_test \
+            serve_degenerate_test -j
       - name: Test
         # One hung test must not hold the job for hours: each test gets 10 minutes.
         run: ctest --test-dir build --output-on-failure --timeout 600

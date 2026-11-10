@@ -3371,6 +3371,12 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     if (batch_check && !inject_embeds_) {
         std::vector<float> seq;
         if (c_.NV > 0) seq_rows.reserve((size_t)M * (size_t)c_.NV);
+        // engine#1905: keep the state the batched pass continues from. This used to `reset()`, which emptied the cache the
+        // replay had just filled AND dropped the caller's prefix -- so for every chunk at start_pos > 0 the two sides ran
+        // from different states ("one token at position start from scratch" vs "position start continuing the previous
+        // chunk") and the oracle reported a MISMATCH that was not in the kernels. Snapshot the prefix, replay, restore.
+        StateSnapshot oracle_prefix;
+        const bool had_prefix = start_pos > 0 && snapshot_state(start_pos, oracle_prefix);
         for (int m = 0; m < M; m++) {
             if (!step(tokens[m], start_pos + m, seq)) return false;
             seq_rows.insert(seq_rows.end(), seq.begin(), seq.end());   // every row, not only the last
@@ -3378,7 +3384,9 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 for (size_t i = 0; i < seq.size(); i++)
                     if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
         }
-        reset();
+        // start_pos == 0 has no prefix to keep, and a snapshot that did not take is not a reason to compare against the
+        // replay's own state: both fall back to reset(), and the row comparison below still applies.
+        if (!(had_prefix && restore_state(oracle_prefix, start_pos))) reset();
     }
 
     // Batch phase attribution: the same partition step() prints, for an M-row verify pass, so the

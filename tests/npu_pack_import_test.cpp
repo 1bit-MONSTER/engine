@@ -464,11 +464,14 @@ void test_external_packed_genre(const std::string& root) {
     // The blob cannot be the all-0x22 the other fixtures write: a 68-byte stride is 64 B of codes then 4 B of zero
     // point and bf16 scale, so all-0x22 makes every weight (2 - 2) x s = 0 -- and an all-zero decode is exactly what a
     // broken writer produces too (engine#1871, engine#1875). These bytes decode to a value that pins all three parts:
-    //   codes 0xCC -> nibble 12; zero point 0x11 -> four nibbles of 1; scale bf16 0x4000 = 2.0
-    //   w = (nibble - zp) * s = (12 - 1) * 2 = 22.0
-    // MatMulNBits codes are UNSIGNED (the zero point shifts them), which is why 12 is 12 here and not int4 -4;
-    // measured, after the first version of this arm expected (12-12u)*... = -10.0 and read 22.0 from every row.
-    // Drop the codes and it reads 2.0, drop the zero point 24.0, drop the scale 11.0.
+    //   codes 0xCC -> nibble 12 = two's-complement int4 -4; zero point 0x11 -> four nibbles of 1; scale bf16
+    //   0x4000 = 2.0; the pack's fields are SIGNED, so w = (sx(c) - sx(zp)) * s = (-4 - 1) * 2 = -10.0.
+    //
+    // This arm reads 22.0 today, and that is engine#1932, not an arithmetic choice: decode_external_tile() keeps raw
+    // nibbles 0..15 and container_from_external_q4() pairs them with m = -zp*s, so every code with the high bit set
+    // comes back +16 codes high (+16*s = +4.0 at s=0.25; +32.0 at s=2.0 here: -10 -> 22). The expectation below is the
+    // CORRECT value, so this arm is RED until #1932's fix (c_u = sx(c) + 8, z_c = (-8 - sx(zp)) * s) lands. Do not
+    // "fix" the expectation to 22.0: that turns the bug into the spec.
     {
         const fs::path sdir = fs::path(root) / "external-success";
         fs::remove_all(sdir);
@@ -553,14 +556,14 @@ void test_external_packed_genre(const std::string& root) {
                     if (q4nx_dequant_tile_row(conv.data(), conv.size(), int(rows), int(cols), Q4NX_TILE_BYTES,
                                               int(r), row.data()) != 0) { ++bad; continue; }
                     for (int64_t c = 0; c < cols; ++c)
-                        if (std::fabs(row[size_t(c)] - 22.0f) > 1e-6f) { ++bad; if (bad_row < 0) bad_row = r; }
+                        if (std::fabs(row[size_t(c)] - (-10.0f)) > 1e-6f) { ++bad; if (bad_row < 0) bad_row = r; }
                 }
                 std::printf("  writer success: %s %llu B in %llu B chunks -> %zu tiles, rows %lld\n", name.c_str(),
                             (unsigned long long)nbytes, (unsigned long long)chunk,
                             conv.size() / size_t(Q4NX_TILE_BYTES), (long long)rows);
                 char msg[240];
                 std::snprintf(msg, sizeof msg,
-                              "external writer: every one of %s %lld rows decodes to 22.0 ((12 - 1) * 2.0); %zu differ, first bad row %lld",
+                              "external writer: every one of %s %lld rows decodes to -10.0 ((sx(12) - sx(1)) * 2.0 = -10); %zu differ, first bad row %lld",
                               role, (long long)rows, bad, (long long)bad_row);
                 check(bad == 0, msg);
             }

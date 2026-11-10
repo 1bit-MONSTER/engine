@@ -48,6 +48,17 @@ namespace onebit::npu::plan {
 // exactly that hole, and it is the hole the rule exists to close.
 enum class OpId { gemv = 0, gdn_step, attn_step, lm_head, count };
 
+// engine#799 rule 1, made a compile error rather than a test result.  The comment above says it: "Without [`count`] a
+// fifth OpId added tomorrow with no entry leaves both green".  `op_coverage()` and the test do catch a missing entry --
+// but only when someone runs them, which is after the enum, the table and the target's `Op` have all been edited by
+// hand.  This turns the same omission into a build failure that cannot be skipped, and bumping the number IS the
+// decision: whoever adds an op has to add its entry, its known-answer case and this constant in one commit, or nothing
+// compiles.  When the number is bumped, `op_coverage()`'s exact-string assertion also forces the gap to be declared
+// rather than left implicit.
+static_assert(static_cast<int>(OpId::count) == 4,
+              "a new OpId needs an entry in the registry table, a known-answer case in it, and this number bumped: "
+              "bumping it is the decision, so a fifth op cannot arrive green by omission (engine#799 rule 1)");
+
 const char* op_name(OpId op);
 
 // One known-answer case.  `a` is m x k and `b` is k x n, both row-major; `want` is m x n.

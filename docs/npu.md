@@ -2276,9 +2276,11 @@ variable and never sees that line is running a binary built before the dump exis
 looking for a code path that skips the dump.
 
 The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS_DUMP`'s weight-scale pairs) are
-created owner-only (0600) and never through a symlink at the final path component, whatever the umask; the head-image
-cache's files are 0644. Both go through `npu/forward/include/file_create.h`, so no write site uses `fopen(…, "w")`,
+created owner-only (0600) and never through a symlink at the final path component, whatever the umask, and a dump file
+an older build left at 0666 is narrowed to 0600 when it is rewritten; the head-image cache's files are at most 0644. Both go through `npu/forward/include/file_create.h`, so no write site uses `fopen(…, "w")`,
 which creates with 0666 under the umask and follows a planted link (CodeQL `cpp/world-writable-file-creation`).
+`tools/ci/file_create_check.py` refuses a new `fopen(…, "w")` or `"a"` anywhere in the tree unless the line says why
+(`file-create-ok: <reason>`), and `tests/file_create_test.c` pins the modes.
 
 ```
   [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935

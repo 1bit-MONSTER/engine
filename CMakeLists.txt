@@ -1591,7 +1591,8 @@ endif()
     add_test(NAME gdn_batch_order COMMAND gdn_batch_order_test)
     # engine#1905: the NPU_BATCH_CHECK oracle restores the prefix it replays from instead of resetting it, so a chunk
     # at start_pos > 0 is compared (and then run) from the state the batched pass continues. Host-GEMM, no device;
-    # skips (77) unless ONEBIT_TEST_Q4NX names a container.
+    # skips (77) unless ONEBIT_TEST_Q4NX names a container. It links onebit_npu_forward, so the row exists only where
+    # ONEBIT_NPU configures; ci.yml does not, so this is a dev-box test (ONEBIT_NPU=ON plus a container), not CI coverage.
     add_executable(batch_check_state_test tests/batch_check_state_test.cpp)
     target_include_directories(batch_check_state_test PRIVATE npu/forward/include)
     target_link_libraries(batch_check_state_test PRIVATE onebit_npu_forward)

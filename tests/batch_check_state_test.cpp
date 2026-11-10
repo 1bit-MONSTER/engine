@@ -30,7 +30,11 @@
 // splits it (a chunk, then a later chunk, then the one-token tail):
 //   [1] after every chunk the forward holds exactly the positions run so far -- a reset in the oracle leaves it
 //       holding only the last chunk's;
-//   [2] the last chunk's logits are the sequential reference's at that position (argmax exact, tight rel-L1).
+//   [2] the last chunk's logits equal the sequential reference's at that position, bit for bit: in host-GEMM mode
+//       both sides are the same arithmetic in the same order, so any tolerance would only hide a one-row prefix leak.
+//
+// Where it runs: the row is registered under if(ONEBIT_NPU) (it links onebit_npu_forward) and ci.yml configures
+// without it, so it runs on a dev box with ONEBIT_NPU=ON and a container, not in CI.
 #include "q4nx_forward.h"
 
 #include <cmath>
@@ -116,7 +120,7 @@ int main() {
     char msg[200];
     std::snprintf(msg, sizeof msg, "last chunk's logits vs the sequential reference: rel-L1 %.2e, argmax %d vs %d", rel,
                   argmax(logits), argmax(ref));
-    check(argmax(logits) == argmax(ref) && rel < 5e-3, msg);
+    check(argmax(logits) == argmax(ref) && rel == 0.0, msg);
 
     std::printf("%s (%d failed)\n", fails == 0 ? "ALL PASS" : "FAILED", fails);
     return fails == 0 ? 0 : 1;

@@ -1835,9 +1835,16 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
         return g;
     }
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
-    // The scan window is the first GiB (about 8 blocks at h3584), so a real section boundary repeats ~8 times against
-    // 1-2 for a payload coincidence; 3 separates them (requiring `layers/2` was too strict and dropped the real one).
-    const std::vector<int64_t> inner = fconst_block_headers(pos, stride8, 3);
+    // The scan window is the first GiB, so a real section boundary repeats once per block in it, while a payload
+    // coincidence repeats a handful of times. The cut therefore has to scale with how many blocks the window holds:
+    // a constant `3` was calibrated on h3584 ("about 8 blocks"), and at a smaller stride the same window holds more
+    // blocks, so a coincidence accrues more chances to reach 3 while the real boundaries stay near one-per-block
+    // (engine#1985: Qwen3-1.7B, hidden 2048, came back with four in-block offsets -- three real plus a coincidence --
+    // and `fconst_set_block_headers` accepts only 1 or 3, so the whole layout was dropped and the pack refused with
+    // "the 4-header block is read as 2-header"). One repeat per block is the floor the comment above already assumes.
+    const int64_t blocks_in_window = int64_t(pos.size());
+    const int min_repeat = int(std::max<int64_t>(3, blocks_in_window / 4));
+    const std::vector<int64_t> inner = fconst_block_headers(pos, stride8, min_repeat);
     if (!fconst_set_block_headers(g, inner)) {
         g.why = "the 1.9 header gives stride " + std::to_string(stride8) + ", but the epsilon anchors repeat at " +
                 std::to_string(inner.size()) + " in-block offset(s), and a layer block has 1 (2-header) or 3 (4-header); "

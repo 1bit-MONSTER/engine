@@ -133,6 +133,10 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/hrx_archs.h
      "static const char* const kHrxGgufArchs[] = {\n${_onebit_archs}};\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/registry/architectures.json)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
+# engine#1993: the CLI's *name* is a build target too. `cmake --build <dir> --target 1bit` otherwise finds the 1bit file
+# already in the build tree, treats it as an up-to-date file target and exits 0 having built nothing -- so a binary from an
+# older checkout looks like a fresh build. With this target both spellings build the CLI.
+add_custom_target(1bit DEPENDS onebit)
 target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
 
 # ── The chat-template renderer (engine #963, docs/npu-chat-template.md) ──────

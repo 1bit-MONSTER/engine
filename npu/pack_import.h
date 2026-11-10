@@ -202,6 +202,10 @@ struct TextArtifacts {
     bool tokenizer = false;                     // tokenizer.json present: what `1bit serve` opens
 };
 TextArtifacts scan_text_artifacts(const std::string& pack_dir);
+// engine#1751 follow-up: the one text-artifact copier both import paths use. Copies every kTextFiles entry the pack has
+// into out_dir and returns how many; a file the pack has that cannot be copied throws, naming it (a skipped file is not
+// a failure -- packs legitimately ship subsets). Exported so a test can drive the failure path without a pack.
+int copy_text_artifacts_exported(const std::string& pack_dir, const std::string& out_dir);
 
 // engine#1740 (W1a): where the 1.9 Token .fconst keeps its output layer. The arithmetic is exposed because it is the
 // half that can be wrong silently -- a one-tile error reads a plausible region and only a correlation against the

@@ -3171,6 +3171,11 @@ static const char* const kTextFiles[] = {"tokenizer.json",
                                          "generation_config.json"};
 
 // The same list every path copies (see kTextFiles): a container without tokenizer.json is not an NPU model directory.
+// engine#1751 follow-up: the ONE copier. Both import paths call it (the .fconst path used to keep its own loop, which
+// threw a bare filesystem_error, while this one counted successes and swallowed failures), and a file the pack HAS that
+// fails to copy is refused by name -- a counter nobody compared let an import "succeed" without tokenizer.json, and serve
+// then refused the directory for a missing tokenizer, the exact misleading report #1751 existed to remove. A file the pack
+// does not ship stays a skip: a pack without a chat template is legitimate.
 static int copy_text_artifacts(const std::string& pack_dir, const std::string& out_dir) {
     int copied = 0;
     for (const char* f : kTextFiles) {
@@ -3178,9 +3183,15 @@ static int copy_text_artifacts(const std::string& pack_dir, const std::string& o
         std::error_code cec;
         if (!fs::exists(src, cec)) continue;
         fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing, cec);
-        if (!cec) ++copied;
+        if (cec)
+            throw std::runtime_error("cannot copy the pack's " + std::string(f) + " into " + out_dir + " (" + cec.message() +
+                                     "); without it the output is not a servable model directory");
+        ++copied;
     }
     return copied;
+}
+int copy_text_artifacts_exported(const std::string& pack_dir, const std::string& out_dir) {
+    return copy_text_artifacts(pack_dir, out_dir);
 }
 
 TextArtifacts scan_text_artifacts(const std::string& pack_dir) {
@@ -4582,10 +4593,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         std::ofstream out(out_dir + "/config.json");
         out << c.dump(2) << "\n";
     }
-    for (const char* f : kTextFiles) {
-        const std::string src = pack_dir + "/" + f;
-        if (fs::exists(src)) fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing);
-    }
+    // engine#1751 follow-up: the same copier the external-data path uses, so the two genres cannot drift apart again.
+    copy_text_artifacts(pack_dir, out_dir);
     for (const auto& [name, m] : ext) unmap_file(m, ext_size[name]);
     return r;
 }

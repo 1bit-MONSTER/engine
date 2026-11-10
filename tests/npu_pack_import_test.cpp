@@ -2757,6 +2757,34 @@ void test_kernel_set_refusal() {
           "kernels: a file that is not an .elf is not a kernel");
 }
 
+// engine#1751 follow-up: the one copier both import paths use. #1751 added a second copier that counted successes and
+// swallowed failures, so an import could "succeed" without tokenizer.json and serve then refused the directory for a
+// missing tokenizer -- the misleading report #1751 was written to remove. A file the pack has and cannot copy is refused
+// BY NAME; a file the pack does not ship is not a failure.
+void test_copy_text_artifacts() {
+    const fs::path base = fs::temp_directory_path() / ("1bit-textcopy-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(base, ec);
+    const fs::path pack = base / "pack", out = base / "out";
+    fs::create_directories(pack);
+    fs::create_directories(out);
+    put_file((pack / "tokenizer.json").string(), "{}");
+    put_file((pack / "tokenizer_config.json").string(), "{}");
+    // (a) the files the pack has are copied, the rest skipped without complaint
+    int copied = -1;
+    std::string why;
+    try { copied = pi::copy_text_artifacts_exported(pack.string(), out.string()); } catch (const std::exception& e) { why = e.what(); }
+    check(why.empty() && copied == 2 && fs::exists(out / "tokenizer.json") && fs::exists(out / "tokenizer_config.json"),
+          "text copy: the two files the pack ships are copied, the six it does not are skipped (" + why + ")");
+    // (b) a copy that FAILS is refused, naming the file -- not counted down to a smaller number nobody reads
+    why.clear();
+    try { (void)pi::copy_text_artifacts_exported(pack.string(), (base / "no-such-dir").string()); } catch (const std::exception& e) { why = e.what(); }
+    check(why.find("tokenizer.json") != std::string::npos,
+          "text copy: a file the pack has that cannot be copied is refused by name (" + why + ")");
+    fs::remove_all(base, ec);
+    std::printf("  text copy: present files copied, absent ones skipped, a failed copy refused by name\n");
+}
+
 void test_text_artifacts(const std::string& root) {
     const fs::path dir = fs::path(root) / "text-artifacts";
     fs::remove_all(dir);
@@ -3289,6 +3317,7 @@ int main(int argc, char** argv) {
         test_final_norm_envelope(golden_dir.empty() ? "." : golden_dir);
         test_import_fp32_params(golden_dir.empty() ? "." : golden_dir);
         test_text_artifacts(golden_dir.empty() ? "." : golden_dir);
+        test_copy_text_artifacts();
         test_kernel_set_refusal();
         test_weight_layout();
         test_null_optional_dims();

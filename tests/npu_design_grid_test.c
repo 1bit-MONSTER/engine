@@ -293,7 +293,28 @@ static void oga_geometry(void) {
         check(bt && codes && scales, "head tile: the layout fixture allocates");
         if (bt && codes && scales) {
             for (int k = 0; k < kpad; k++)
-                for (int n = 0; n < T; n++) bt[(size_t)k * T + n] = (float)((k * 13 + n * 7) % 97) * 0.01f - 0.5f;
+                /* Per-column spread is load-bearing: the plain ramp reaches -0.5 in every column, so every column's
+                 * absmax is 0.5 and all T scales are equal (measured: 1 distinct scale of 64) -- an arm comparing two
+                 * packers on that fixture cannot see a per-column mistake. Scaling by (1 + 0.05n) gives T distinct
+                 * absmax values (measured: 64 of 64), and the check below keeps the fixture from going flat again. */
+                for (int n = 0; n < T; n++)
+                    bt[(size_t)k * T + n] = ((float)((k * 13 + n * 7) % 97) * 0.01f - 0.5f) * (1.0f + 0.05f * (float)n);
+            {
+                /* the fixture must exercise per-column arithmetic, or every arm below compares on a flat input */
+                float seen[64];
+                int distinct = 0;
+                for (int n = 0; n < T; n++) {
+                    float amax = 0.0f;
+                    for (int k = 0; k < kpad; k++) {
+                        const float a = fabsf(bt[(size_t)k * T + n]);
+                        if (a > amax) amax = a;
+                    }
+                    int dup = 0;
+                    for (int i = 0; i < distinct; i++) if (seen[i] == amax) dup = 1;
+                    if (!dup) seen[distinct++] = amax;
+                }
+                check_int(distinct, T, "head tile: the fixture has T distinct column absmax (not a flat input)");
+            }
             const float m = q4nx_pack_B_int8(bt, kpad, T, codes, T, scales);
             /* (a) one scale per column, and it is that column's absmax/127 (with the all-zero floor) */
             int bad_scale = 0;
@@ -311,10 +332,23 @@ static void oga_geometry(void) {
             for (int n = 0; n < T; n++) ssum += (double)scales[n];
             check(fabsf((float)(ssum / T) - m) < 1e-6f, "head tile: the returned mean is over the T columns");
             /* (b) codes are row-major over (k, n) and match the column's scale */
+            /* The reference has to use the packer's own arithmetic -- absmax with the 1e-12 floor, then
+             * roundf(v * (127/amax)) -- and not v/scales[n]: once the columns differ the two disagree on 26 of 6144
+             * codes, because 127/amax and 1/(amax/127) are different floats. */
+            float tis[64];
+            for (int n = 0; n < T; n++) {
+                float amax = 0.0f;
+                for (int k = 0; k < kpad; k++) {
+                    const float a = fabsf(bt[(size_t)k * T + n]);
+                    if (a > amax) amax = a;
+                }
+                if (amax < 1e-12f) amax = 1.0f;
+                tis[n] = 127.0f / amax;
+            }
             int bad_code = 0;
             for (int k = 0; k < kpad; k++)
                 for (int n = 0; n < T; n++) {
-                    int want = (int)lroundf(bt[(size_t)k * T + n] / scales[n]);
+                    int want = (int)roundf(bt[(size_t)k * T + n] * tis[n]);
                     if (want > 127) want = 127;
                     else if (want < -127) want = -127;
                     if (codes[(size_t)k * T + n] != (int8_t)want) bad_code++;
@@ -333,6 +367,31 @@ static void oga_geometry(void) {
                 for (int i = 0; i < kpad * T; i++) if (codes_t[i] != codes[i]) differ++;
                 check(differ > kpad * T / 4, "head tile control: the transposed scratch is a different image");
                 free(tr); free(codes_t); free(scales_t);
+            }
+            /* The forward does NOT pack the head through q4nx_pack_B_int8: it goes
+             * lctx.packB_into -> packB_blocked -> q4nx_pack_B_int8_blocked, a separate row-major loop in
+             * q4nx_pack_blocked.cpp that never calls the function pinned above. A head-image cache (the fix
+             * for the 10-17 s rebuild, engine#1716) stands in for THAT call, so the layout arms above are
+             * only its contract if the two implementations agree byte for byte -- and nothing asserted it.
+             * Measured on main (engine#1716 comment, 2026-11-10): identical codes, scales and mean at this
+             * geometry; this arm is what keeps that true, since a change to either loop would otherwise
+             * break the cache contract silently. */
+            {
+                int8_t* oc = calloc((size_t)kpad * T, 1);
+                float* osc = calloc((size_t)T, sizeof(float));
+                double osum = 0.0;
+                if (oc && osc) {
+                    q4nx_pack_B_int8_blocked(oc, bt, kpad, T, kpad, T, 0, osc, &osum);
+                    int code_diff = 0;
+                    for (int i = 0; i < kpad * T; i++) if (oc[i] != codes[i]) code_diff++;
+                    int scale_diff = 0;
+                    for (int j = 0; j < T; j++) if (osc[j] != scales[j]) scale_diff++;
+                    check_int(code_diff, 0, "head tile: the blocked packer (the one the forward calls) is byte-identical");
+                    check_int(scale_diff, 0, "head tile: and returns the same column scales");
+                    check(fabs(ssum - osum) <= 1e-9 * (fabs(osum) + 1.0),
+                          "head tile: and the same mean column scale");
+                    free(oc); free(osc);
+                }
             }
             printf("  head tile: kpad %d x T %d, %d codes, %d column scales, layout pinned\n", kpad, T, kpad * T, T);
         }

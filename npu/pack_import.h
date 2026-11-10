@@ -177,6 +177,21 @@ Plan plan(const std::string& pack_dir);
 // and a directory on the scratch path must all come back false.
 bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
 
+// Removes the canonical Token .fconst copies in `dir` that nothing will reuse (engine#1770). Reuse writes a new copy when the
+// source changes rather than overwriting, so without this the scratch directory grows one multi-hundred-MB file per change; on
+// this box 699 files / 8.7 GiB of tmpfs. Three rules:
+//   * share `prefix` (one pack path and geometry) but are not `keep_name` -- normal generations of a superseded source;
+//   * equal `legacy_name` -- the generation before the source identity was part of the name
+//     (`1bit-fconst19-<tag>-<h>-<heads>-<layers>.fconst`), which `prefix` cannot match because it was written without the version
+//     suffix, so those files were invisible to this sweep and stayed resident (three of them, 10.67 GiB, on 2026-11-10);
+//   * start with `1bit-fconst19` and are older than `max_age_seconds` (0 disables) -- a pack nobody imports again. A write-triggered
+//     sweep only reaches the geometry being written, so the abandoned tail needs an age rule.
+// Exposed for the same reason as canonical_copy_reusable(): the rule it applies is what can be wrong, and a test can prove it on a
+// directory of empty files with no pack at all.
+void evict_stale_canonical_copies(const std::string& dir, const std::string& keep_name, const std::string& prefix,
+                                  const std::string& legacy_name  = std::string(),
+                                  int64_t            max_age_seconds = 0);
+
 // The text artifacts a runnable container needs beside model.q4nx, and which of them the pack
 // actually carries. A pack fetched weight by weight can be weights-only (engine#1024; AMD's repos
 // do publish the text, and how much of it varies per pack), and an importer that says nothing about
@@ -203,6 +218,11 @@ struct TailHeadPlacement {
 };
 TailHeadPlacement plan_tail_head(int64_t bytes, int64_t tail_off, int64_t env, int64_t rows, int64_t tile,
                                  int64_t zeros);
+
+// The search half: a synthetic tied head (built through the tile encoder) is located, then displaced by one tile and
+// still located, then handed over as untied where padding must refuse and an exact tail must be taken unverified.
+// Returns false with *why set. No pack, no device, no fixture.
+bool tail_head_selftest(std::string* why);
 
 struct Options {
     bool allow_incomplete = false;  // write what is representable and name the rest
@@ -412,6 +432,11 @@ unsigned short bf16_bits_of(float v);
 // the default rather than throw. Exported so tests/npu_pack_import_test.cpp can pin it without a
 // pack; `source` names where the geometry came from, for the refusal messages.
 Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
+// engine#1503: what the graph walker RECORDED, without exposing its model type. A three-input MatMulNBits (no qzeros,
+// weights spelled `<proj>.MatMul.weight_Q4`) used to be dropped entirely, which is why Qwen3-VL-4B imported one tensor.
+// Returns the matmul count; `without_zeros` counts those that carry no qzeros tensor (the implicit-zero-point case), and
+// the last three report the first matmul's own K/N/block attributes.
+int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without_zeros, int* K, int* N, int* block);
 // engine#1638: the geometry as read, so a test can check WHICH source a number came from.
 nlohmann::json load_geometry_exported(const std::string& pack_dir, std::string* source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
@@ -432,6 +457,11 @@ struct Fconst19Rule {
 // against 5 x 591,872). A wrong row gets the ROTATION wrong, which leaves the prefix and the epsilon anchors untouched,
 // so it reads as a correct parse and answers quiet nonsense; that is why an ambiguous table refuses instead of picking.
 const Fconst19Rule* select_fconst19_rule(int hidden, int heads, int layers, std::string* why);
+// The measured 1.9 rule table itself, with its row count, so a test can pin every row against the numbers that were
+// measured. Two failure modes this exists for, both seen on this table: a wrong digit in a row (which rotates a pack's
+// weights into the wrong projections while every anchor still lines up), and a row that a merge silently drops (the
+// h4096 row was lost twice that way, which un-measured a whole model class with nothing failing).
+const Fconst19Rule* fconst19_rules(int* count);
 // The same decision over an explicit table, so a test can hand it the one shape that decides correctness and that the
 // real table must never contain: two rows for one geometry with different shapes.
 const Fconst19Rule* select_fconst19_rule_from(const Fconst19Rule* rules, int count, int hidden, int heads, int layers,

@@ -42,6 +42,27 @@ serve_port_from_log() {  # <log> -> the port, empty while serve has not said
 # measured at 44.5 s on a folded 27B pack, and pays it on exactly the configurations these tests exercise. A caller that
 # wants the old bound can still pass it, and a log now says `warming` before the wait, so a short budget fails with a
 # readable line rather than with "serve never reported a port".
+# A build that predates engine #1485 reports `ready on http://127.0.0.1:0` when it was asked for port 0, while the
+# backend it spawned prints the port it actually bound. Tests that must also run against an older payload (engine#1779
+# fault 1 does) take the backend's figure rather than curling port 0. Current main never needs this.
+serve_child_port() {  # <log> -> the backend's bound port, empty when it has not said
+    awk '/llama_server: listening on http:\/\//{ n = split($NF, a, ":"); if (a[n] ~ /^[0-9]+$/ && a[n] != "0") { print a[n]; exit } }' "$1" 2>/dev/null
+}
+
+serve_port_wait_any() {  # <log> <pid> [tenths] -> the port, preferring serve's own report
+    local log=$1 pid=$2 tries=${3:-900} port=
+    port=$(serve_port_wait "$log" "$pid" "$tries") || return 1
+    if [ "$port" = "0" ]; then
+        local child
+        child=$(serve_child_port "$log")
+        if [ -n "$child" ]; then
+            echo "note: serve reported port 0 (engine #1485's read-back is not in this build); using the backend's $child" >&2
+            port=$child
+        fi
+    fi
+    printf '%s\n' "$port"
+}
+
 serve_port_wait() {  # <log> <pid> [tenths-of-a-second, default 900 = 90 s] -> the port, non-zero if it never came
     local log=$1 pid=$2 tries=${3:-900} port=
     for _ in $(seq 1 "$tries"); do

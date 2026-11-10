@@ -78,13 +78,39 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   add-on (the gate builds that) and does not dispatch anything. Green means the pinned pair builds into the engine. It
   does not replace the `hw-gate` label on a pin bump.
 
-> **Since 2026-11-09 this job is red on every branch, so a red badge is not a signal** (engine #1733). Three errors sit in
-> `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as `bool`, and two declarations
-> that differ only in return type — i.e. the fork's source no longer compiles against the fork's own headers, and the pin-bump
-> PR #1681 does not change it (its own `hrx_build` fails at 9m15s while `build` is green). Measured on five unrelated branches
-> and on the last eight runs of this workflow, all failures. Until the fork is fixed, read `hrx_build` as **unavailable**, not as
-> failing: a red run says nothing about the change under it, and there is no green run left to compare against. It is the same
-> shape as #1595 in the opposite direction — a red job nobody can act on stops being a check.
+> **From 20:01 to 21:52Z on 2026-11-09 this job failed on every branch that ran it, and a red badge was not a signal** (engine #1733).
+> Three errors sat in `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as
+> `bool`, and two declarations that differ only in return type — on every branch measured (five of them), and #1681's pin bump
+> failed the same way at 9m15s while its `build` was green. It was a property of the pin, and the pins say so:
+>
+> | | `hrx-system` | `llama.cpp` | result |
+> |---|---|---|---|
+> | red window, 20:01–21:52 (`8f124f906`; 13 of the 15 failing runs) | `7f4236924` | **`8f124f906`** | failure |
+> | 21:00, 21:01 (`1bit/pack-blocked-*`) | `7f4236924` | `b970d85ba` | failure, **unexplained** (see below) |
+> | first green, 21:41 (`bump-hrx/60ae4c935`) | `7f4236924` | **`60ae4c935`** | success |
+> | green from 22:04 (`bump-hrx/831629fe` 00:21) | `7f4236924` | `831629fe9` | success |
+>
+> `hrx-system` is the same throughout and `llama.cpp` is not. At `8f124f906`, `ggml-hrx.cpp` declares `device_free_total`
+> twice — `void` from #252's forward declaration at `:383`, `bool` from #240's eight hundred lines later — so the
+> translation unit cannot compile. **The pin that closed the window is `60ae4c935`, from #1736**, which carries the fork
+> fix (llama.cpp #260, `4e570337a`): it is green from 21:41Z, before `831629fe` existed. #1759's `831629fe` is a *later*
+> bump (green at 00:21) and did not end the window — an earlier version of this paragraph credited it, which the runs
+> contradict. The window closed because the pin moved, not because the failure was transient.
+>
+> **Two of the fifteen failing runs are not this failure**, and saying so is the point of a window: `21:00`
+> (`1bit/pack-blocked-extract`, run 42698418833) and `21:01` (`1bit/pack-blocked-rowmajor`) ran on the **older** pin
+> `b970d85ba` with the same `hrx-system` `7f4236924`, and I could not re-verify whether that pair built green earlier
+> (those commits are no longer fetchable), while `gh run view 42698418833 --log-failed` returns nothing. So: thirteen runs
+> on `8f124f906` are the redeclaration, two are unexplained, and neither is evidence for the other.
+>
+> One red run after the window is worth knowing about, because it is not this failure: `2026-11-10 02:23` on `1b02be9`
+> (pin already `5514ebea`) failed in **"Wait for memory (or refuse)" with exit 75** — `gh run view 42742403894
+> --log-failed` — a memory gate on the box, not a compile error. A red `hrx_build` on a pin newer than `60ae4c935` is
+> therefore not evidence that this break returned.
+>
+> So read a red badge as meaningful, and treat a `llama.cpp` bump whose run leaves `hrx_build` red as a bump that has not
+> landed — which is what the `hw-gate` label is for, and what #1768 did before merging (`hrx_build` pass, 1m10s). If a red
+> run ever returns without the pin changing, that run's own log is the evidence.
 
 ## What it checks
 

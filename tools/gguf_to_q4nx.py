@@ -373,7 +373,19 @@ def moe_meta(r, items, table):
 
 
 def pack(args):
-    r = gguf.GGUFReader(args.gguf)
+    # engine#2013: a quantisation type this gguf cannot read fails INSIDE GGUFReader's _build_tensors, as
+    # `ValueError: np.uint32(143) is not a valid GGMLQuantizationType` from the enum -- naming neither the file nor a way
+    # forward, and looking like a caller bug rather than "this pack uses a type this tree does not support". Refuse by
+    # file and number instead.
+    try:
+        r = gguf.GGUFReader(args.gguf)
+    except ValueError as e:
+        if "GGMLQuantizationType" not in str(e):
+            raise
+        raise SystemExit(
+            f"{args.gguf}: {e}. A tensor uses a quantisation type this gguf library does not know (it knows "
+            f"{', '.join(q.name for q in gguf.GGMLQuantizationType)}); a newer or vendor-specific type needs a "
+            "dequantiser before this pack can be packed, and nothing was written")
     refuse_unsupported_rope(r)   # before the output directory exists: no half-written container
     os.makedirs(args.out, exist_ok=True)
     items = planned(r)

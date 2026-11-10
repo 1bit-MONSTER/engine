@@ -52,6 +52,22 @@ for p in "$series"/[0-9][0-9][0-9][0-9]-*.patch; do
 done
 echo "ok   $n patches apply in order on ${pin:0:12}"
 
+# The test-only fault injection (engine#1750) has to keep applying on top of the series, or the one run it exists
+# for cannot be built. It is checked, not applied: the harness below is the carried code. And it must stay out of
+# the numbered glob above, which is what a package build takes.
+inject=$series/test-only/restart-fault-injection.patch
+if ! git -C "$scratch/tree" apply --check "$inject" 2> "$scratch/apply.err"; then
+  echo "FAIL test-only/restart-fault-injection.patch does not apply on top of the $n carried patches:"
+  sed 's/^/     /' "$scratch/apply.err" | head -n 5
+  exit 1
+fi
+echo "ok   test-only/restart-fault-injection.patch applies on top of them (checked, not applied)"
+if ls "$series"/[0-9][0-9][0-9][0-9]-*.patch | xargs grep -l "TEST ONLY" > "$scratch/leak" 2> /dev/null; then
+  echo "FAIL a numbered patch carries TEST ONLY code: $(tr '\n' ' ' < "$scratch/leak")"
+  exit 1
+fi
+echo "ok   no numbered patch carries TEST ONLY code"
+
 # one function definition: from its header line (column 0, not a prototype) to the first closing brace in column 0
 for f in aie2_hwctx_job_pause aie2_hwctx_stop aie2_hwctx_restart aie2_hwctx_job_unpause; do
   awk -v f="$f" '!on && $0 ~ "^[a-z].*[ *]" f "\\(" && $0 !~ /;[ \t]*$/ { on = 1 } on { print } on && /^}/ { exit }' \

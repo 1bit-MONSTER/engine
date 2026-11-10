@@ -1413,6 +1413,46 @@ void test_final_norm_envelope(const std::string& root) {
                              ("oga_pack_import_norm." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     const pi::Report r = pi::import_pack(dir.string(), out, allow);
+    // engine#1840: a container built with a NON-default weight layout must carry `q4nx_weight_layout`, and a
+    // default-layout import must NOT -- every container the importer wrote before the option existed depends on the
+    // key being absent. Without this pair, the regression #1793 fixed (a report printing `declares q4nx_weight_layout
+    // "b8"` while the writer omitted the key) can return silently: nothing else asserts the writer's half.
+    {
+        const auto header_of = [](const std::string& file) -> json {
+            std::ifstream cf(file, std::ios::binary);
+            uint64_t hlen = 0;
+            cf.read(reinterpret_cast<char*>(&hlen), 8);
+            std::string hdr(size_t(hlen), '\0');
+            cf.read(hdr.data(), std::streamsize(hlen));
+            while (!hdr.empty() && (hdr.back() == ' ' || hdr.back() == '\0')) hdr.pop_back();
+            return json::parse(hdr);
+        };
+        const auto default_doc = header_of(out + "/model.q4nx");
+        check(!default_doc.contains("q4nx_weight_layout"),
+              "weight layout: a default-layout container carries no q4nx_weight_layout (the key is only for a non-default one)");
+        const std::string out_b8 = out + "_b8";
+        fs::remove_all(out_b8);
+        pi::Options b8 = allow;
+        b8.weight_layout = "b8";
+        bool threw_b8 = false;
+        try {
+            (void)pi::import_pack(dir.string(), out_b8, b8);
+        } catch (const std::exception& e) {
+            // an exception here would take the rest of this function with it, and the arm's job is to report, not to abort
+            threw_b8 = true;
+            std::printf("  weight layout: the b8 import threw: %s\n", e.what());
+        }
+        check(!threw_b8, "weight layout: a b8 import completes on a pack the default layout imports");
+        if (fs::exists(out_b8 + "/model.q4nx")) {
+            const auto b8_doc = header_of(out_b8 + "/model.q4nx");
+            check(b8_doc.contains("q4nx_weight_layout") && b8_doc["q4nx_weight_layout"].is_string() &&
+                      b8_doc["q4nx_weight_layout"].get<std::string>() == "b8",
+                  "weight layout: --weight-layout b8 writes q4nx_weight_layout=\"b8\" into the container it builds");
+        } else {
+            check(false, "weight layout: a b8 import wrote a container");
+        }
+        fs::remove_all(out_b8);
+    }
     check(r.final_norm_imported, "final norm: the crafted tail envelope yields model.norm.weight");
     check(!r.prefill_tail_seen && !r.final_norm_crosscheck,
           "final norm: with no prefill program the cross-check is unavailable, not failed");

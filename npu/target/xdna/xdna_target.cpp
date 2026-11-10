@@ -283,6 +283,14 @@ bool XdnaTarget::weight_cached(int layer, int key) const {
 int XdnaTarget::max_rows() const {
     if (pb16i_) { for (int i = 0; i < ndesigns_; i++) if (ctx16_[i]) return ctx16_[i]->MD; }
     for (int i = 0; i < ndesigns_; i++) if (ctx_[i]) return ctx_[i]->MD;
+    // engine#1900: the sealed/mono-ELF generation adopts its kernel set through a path that fills neither array, so both
+    // loops above find nothing and this returned 1. This is the CHUNK WIDTH (q4nx_forward's `blk = max_batch_rows()`), so
+    // those packs batched ONE ROW per launch however wide their design is -- `models/npu/bonsai2-27b-NPU-b8` states prefill
+    // M=128 and reported 1. Only reachable when no per-role context was adopted, so nothing that has one changes; and the
+    // plan is the pack's own statement of the width its kernels were built for (a plan whose M disagrees with adopted
+    // kernels is already refused above). Still 1 when the plan states nothing: guessing a width launches into a BO sized for
+    // fewer rows, which is the memory-corruption path engine#1372 records.
+    if (plan_.prefill_m > 0) return plan_.prefill_m;
     return 1;
 }
 

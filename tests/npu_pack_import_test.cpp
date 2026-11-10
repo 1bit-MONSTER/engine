@@ -626,7 +626,8 @@ void test_external_import_success(const std::string& root) {
             for (int kk = 1; kk <= blocks; ++kk) {
                 char* subv = &blob[size_t(tile * per_tile + kk * 2 + half) * 2176];
                 for (int r = 0; r < 32; ++r) {
-                    const int row = tile * 64 + half * 32 + r;
+                    // A 64-row block's FIRST 32 rows live in the pair's SECOND subvolume (measured on the pack, #1874).
+                    const int row = tile * 64 + (1 - half) * 32 + r;
                     const uint16_t s = pi::bf16_bits_of(scale_of(row));
                     subv[2112 + r * 2] = char(s & 0xFF);
                     subv[2112 + r * 2 + 1] = char(s >> 8);

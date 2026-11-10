@@ -3016,6 +3016,31 @@ void test_q4nx_container(const std::string& root) {
               "q4nx container: a truncated header names the problem instead of reporting no tensors (" + c.why + ")");
     }
 
+    // (e) engine#1786: a pack that IS a container and has NO graph is recognised and reported, not refused at the first
+    // byte. The alternative -- `npu-pack info` answering a 0.5 GB model source with "cannot open <pack>/model.onnx" --
+    // describes a missing file on a pack that has no graph by design, and says nothing about what it does contain.
+    {
+        const fs::path pdir = dir / "container-genre";
+        fs::create_directories(pdir, ec);
+        const std::string hdr =
+            R"({"model.embed_tokens.weight":{"dtype":"BF16","shape":[64,8],"data_offsets":[0,1024]},)"
+            R"("model.layers.0.mlp.down_proj.weight":{"dtype":"I8","shape":[8,16],"data_offsets":[1024,1152]}})";
+        write_container("container-genre/model.q4nx", hdr, 1152, false);
+        const pi::Plan p = pi::plan(pdir.string());
+        check(p.container_tensors == 2, "container genre: plan() reports the container's tensors (" +
+                                            std::to_string(p.container_tensors) + ")");
+        check(p.container_payload_bytes == 1152, "container genre: and the payload the offsets imply");
+        check(p.container_dtypes.count("BF16") == 1 && p.container_dtypes.count("I8") == 1,
+              "container genre: and both dtypes it found");
+        // The note must say it is NOT importable: a plan that listed these as importable would be worse than the
+        // refusal it replaces, because it would claim a compute mapping this importer does not have.
+        check(p.container_note.find("not importable") != std::string::npos,
+              "container genre: the note says the pack is recognised and not importable (" + p.container_note + ")");
+        const json m = json::parse(p.manifest());
+        check(m.contains("container") && m["container"]["tensors"] == 2,
+              "container genre: and manifest() reports it, so npu-pack info prints it");
+    }
+
     // (d) an implausible length is refused by the number, so a mis-typed length cannot make the caller allocate it.
     {
         const fs::path p = dir / "huge.q4nx";

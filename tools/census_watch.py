@@ -51,10 +51,10 @@ must never be printed as "nothing new" — but when an alert is also present the
 (1), since that is the code a human has to act on, and the failure is still printed as
 `!! FLM WATCH FAILED` for the log grep.
 
-A class whose models all load through custom modeling code (`auto_map` in the config, or a
-runtime library that is not Transformers, so Transformers itself has no implementation of
-it either) and that fewer than REMOTE_CODE_SPREAD uploaders publish is reported but does
-not alert: research one-offs like that arrive every day and are not something a backend
+A class whose models all load through custom modeling code (`auto_map` in the config, a
+runtime library that is not Transformers, or a repo with no library at all that ships its own
+`modeling_*.py`; in each case Transformers itself has no implementation of the class) and
+that fewer than REMOTE_CODE_SPREAD uploaders publish is reported but does not alert: research one-offs like that arrive every day and are not something a backend
 could map. Once REMOTE_CODE_SPREAD uploaders use it, or it is a reviewed class
 (registry/significant.json), it alerts like any other. The exception is a reviewed class
 whose entry says `"watch": "report"`: a research architecture reviewed as not an alias that
@@ -172,6 +172,13 @@ NON_TRANSFORMERS_LIBRARIES = frozenset((
     "mlc-llm", "tensorflow", "tf-keras", "keras", "jax", "flax", "openvino", "coreml",
 ))
 
+# A repo's own modeling code, by the name Transformers gives such files (`modeling_<name>.py`),
+# at the top level of the repo. engine#1922: Climb-Ai/Climb-1-Toki declares
+# `architectures: ["MicroLlamaForCausalLM"]` and `model_type: llama` with no `auto_map` and no
+# library, and ships `modeling_micro_llama.py`, where that class is a bare `torch.nn.Module`
+# with its own tensor names (`layers.0.attn.q_proj`, `token_embd`). It alerted as a new class.
+_OWN_MODELING = re.compile(r"^modeling_[A-Za-z0-9_]+\.py$")
+
 COVERED, UNCOVERED, UNVERIFIABLE, DERIVATIVE = "covered", "uncovered", "unverifiable", "derivative"
 
 
@@ -228,13 +235,21 @@ def is_remote_code(model):
 
     A raw checkpoint through a non-Transformers library carries an architecture class no
     backend can map (the library's own code runs it), exactly like an `auto_map` model.
-    A missing `library_name` is unknown, not custom, so it alerts.
+    A missing `library_name` is unknown, not custom, so it alerts - unless the repo ships its
+    own `modeling_*.py` and nothing calls it a Transformers model: then the class is whatever
+    that file defines, and without `auto_map` Transformers cannot even be told to load it.
+    The Hub puts `library_name: transformers` and the `transformers` tag on a repo it can
+    load with the library, so a new class Transformers really has keeps alerting.
     """
     cfg = model.get("config") or {}
     if cfg.get("auto_map"):
         return True
+    transformers = "transformers" in (model.get("tags") or [])
     if model.get("library_name") in NON_TRANSFORMERS_LIBRARIES:
-        return "transformers" not in (model.get("tags") or [])
+        return not transformers
+    if not model.get("library_name") and not transformers:
+        return any(_OWN_MODELING.match((sib or {}).get("rfilename") or "")
+                   for sib in model.get("siblings") or ())
     return False
 
 
@@ -299,7 +314,9 @@ def sweep_newest(limit, seen, tag="text-generation", pages_guard=20, fetch=None)
     """
     fetch = fetch or hf_get_page
     fresh, batch_ids = [], set()
-    url = f"{API}?pipeline_tag={tag}&sort=createdAt&direction=-1&limit=100&config=true"
+    # full=true: the listing then carries each repo's file names (`siblings`), which is how
+    # is_remote_code() sees a repo's own modeling code; config=true alone leaves them out
+    url = f"{API}?pipeline_tag={tag}&sort=createdAt&direction=-1&limit=100&config=true&full=true"
     page = 0
     while url and len(fresh) < limit and page < pages_guard:
         batch, link = fetch(url)
@@ -779,7 +796,7 @@ def report(models, res, previously_seen):
         elif cls in quiet:
             owners = len({i.split("/")[0] for i in ids})
             print(f"  . REMOTE-CODE {cls}: {len(ids)} model(s) from {owners} uploader(s), e.g. {ids[0]}")
-            print(f"     -> custom modeling code (auto_map, or a non-Transformers runtime); "
+            print(f"     -> custom modeling code (auto_map, a non-Transformers runtime, or the repo's own modeling_*.py); "
                   f"alerts once {REMOTE_CODE_SPREAD} uploaders use it")
         elif cls in res["significant"]:
             print(f"  !! UNCOVERED {cls} (reviewed, not an alias — docs/arch-gaps.md): "

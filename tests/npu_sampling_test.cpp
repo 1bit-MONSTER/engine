@@ -449,6 +449,105 @@ void test_logprob_options() {
           "top_logprobs without logprobs: true is refused rather than ignored");
 }
 
+// The pinned shared prefix (engine#1785): single-turn requests that share a system prompt and differ in the
+// user turn. `sys(n)` + `turn(k)` stand for the two parts; the table sees token ids only.
+void test_prefix_pin() {
+    using onebit::npu::shared_prefix_len;
+    auto prompt = [](int sys, int turn_start, int turn) {
+        std::vector<int> v;
+        for (int i = 0; i < sys; i++) v.push_back(1 + i);
+        for (int i = 0; i < turn; i++) v.push_back(turn_start + i);
+        return v;
+    };
+    PrefixOptions o;
+    o.slots = 4;
+    o.cache_mb = 1;
+    o.min_gain = 128;
+    const std::vector<int> q1 = prompt(900, 5000, 40), q2 = prompt(900, 6000, 30), q3 = prompt(900, 7000, 50);
+
+    {   // the gap, on the table as it was: a whole saved prompt is no use to the next single-turn request
+        PrefixCache c(o);
+        check(c.insert(q1, 1000) >= 0, "the first single-turn prompt is saved whole");
+        const auto d = c.lookup(q2);
+        check(d.slot == -1 && d.cached_tokens == 0,
+              "a second question under the same 900-token system prompt reuses nothing from the first");
+    }
+    {   // the pin: request 2 finds the shared part, request 3 resumes from it
+        PrefixCache c(o);
+        check(c.pin_point({}, q1) == 0, "the first request has nothing to compare with");
+        c.insert(q1, 1000);
+        check(shared_prefix_len(q1, q2) == 900, "the two prompts share exactly the system part");
+        const size_t at = c.pin_point(q1, q2);
+        check(at == 900, "the second request's pin point is the end of what it shares with the first");
+        std::string why;
+        const int pin = c.pin(std::vector<int>(q2.begin(), q2.begin() + long(at)), 2000, &why);
+        check(pin >= 0 && why == "pinned" && c.pinned_slot() == pin, "the shared part is pinned");
+        const auto d = c.lookup(q3);
+        check(d.slot == pin && d.cached_tokens == 900 && d.pinned && d.reason == "hit",
+              "a third question resumes from the pin: 900 of its 950 tokens are already there");
+        check(onebit::npu::resume_point(d, q3.size()) == 899, "and resumes one token short of it, as every hit does");
+        check(c.pin_point(q2, q3) == 0, "a prefix the pin already covers is not pinned again");
+        check(!c.lookup(q1).pinned && c.lookup(q1).cached_tokens == 940,
+              "a whole-prompt slot is still preferred when it is the longer match, and says it is not the pin");
+    }
+    {   // what is not a pin point
+        PrefixCache c(o);
+        check(c.pin_point(q1, q1) == 0, "a repeated prompt is insert()'s business, not a pin");
+        std::vector<int> longer = q1;
+        for (int i = 0; i < 200; i++) longer.push_back(9000 + i);
+        check(c.pin_point(q1, longer) == 0, "a continued conversation is insert()'s business too");
+        check(c.pin_point(longer, q1) == 0, "and so is a prompt the previous one continued");
+        check(c.pin_point(prompt(100, 5000, 40), prompt(100, 6000, 40)) == 0,
+              "100 shared tokens do not beat prefix-min-gain 128");
+        check(c.pin_point(prompt(900, 5000, 40), prompt(0, 6000, 40)) == 0, "prompts that share nothing have no pin point");
+        PrefixOptions off = o;
+        off.slots = 0;
+        check(PrefixCache(off).pin_point(q1, q2) == 0, "an off cache pins nothing");
+        check(PrefixCache(off).pin(q1, 10) == -1, "and refuses a pin");
+    }
+    {   // the pin outlives what evicts and replaces everything else
+        PrefixOptions b = o;
+        b.slots = 4;  // one more than the three snapshots the budget holds, so a slot is always free
+        b.min_gain = 1;
+        PrefixCache c(b);  // 1 MB
+        const std::vector<int> sys(q1.begin(), q1.begin() + 900);
+        const int pin = c.pin(sys, 300000);
+        const int a = c.insert(prompt(0, 100, 10), 300000);
+        const int bb = c.insert(prompt(0, 200, 10), 300000);
+        check(pin >= 0 && a >= 0 && bb >= 0 && c.used_bytes() == 900000, "a pin and two prompts fit under 1 MB");
+        // The pin is the least recently used of the three, and 300000 more does not fit: something goes.
+        const int cc = c.insert(prompt(0, 300, 10), 300000);
+        check(cc == a, "room is made from the oldest whole prompt");
+        check(c.pinned_slot() == pin && c.lookup(q2).slot == pin, "not from the pin, though it is the oldest slot");
+        // A prompt that extends the pin does not replace it.
+        std::string why;
+        const int whole = c.insert(q2, 1000, pin, &why);
+        check(whole >= 0 && whole != pin && c.pinned_slot() == pin,
+              "a prompt that resumed from the pin is saved beside it, not over it");
+        check(c.lookup(q3).slot == pin && c.lookup(q3).cached_tokens == 900, "so the next question still finds the pin");
+        // A new pin replaces the old one: one shared prefix at a time.
+        const std::vector<int> other = prompt(0, 40000, 500);
+        const int pin2 = c.pin(other, 1000);
+        check(pin2 >= 0 && c.pinned_slot() == pin2, "a new pin takes over");
+        check(c.lookup(q3).slot != pin || !c.lookup(q3).pinned, "and the old one is no longer pinned");
+        check(c.pin(other, 2u * 1024u * 1024u, &why) == -1 && why == "larger than prefix-cache-mb" &&
+                  c.pinned_slot() == pin2,
+              "a pin over the budget is refused and the standing pin is kept");
+    }
+    {   // every slot holds a whole prompt: the pin takes the oldest
+        PrefixOptions b = o;
+        b.slots = 2;
+        b.min_gain = 1;
+        PrefixCache c(b);
+        const int s0 = c.insert(prompt(0, 100, 10), 100);
+        c.insert(prompt(0, 200, 10), 100);
+        const int pin = c.pin(prompt(900, 0, 0), 100);
+        check(pin == s0, "with no free slot the pin takes the least recently used prompt's");
+        check(c.insert(prompt(0, 300, 10), 100) != pin, "and a later prompt cannot take it back");
+        check(c.pinned_slot() == pin, "the pin is still there");
+    }
+}
+
 void test_prefix_cache() {
     auto ids = [](int n, int start = 1) {
         std::vector<int> v;
@@ -1081,6 +1180,7 @@ int main() {
     test_logprobs();
     test_logprob_options();
     test_prefix_cache();
+    test_prefix_pin();
     test_json_schema();
     test_json_schema_refusals();
     test_answer_parser();

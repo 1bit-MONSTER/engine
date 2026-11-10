@@ -343,6 +343,12 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
+# engine #1750: the carried amdxdna series applies in order to the pinned driver, and the context-restart code it
+# produces fails a context's jobs (and logs it) when the restart fails, instead of leaving them parked or running
+# them at close on a half-built firmware context. The driver's own functions in a user-space harness: no NPU, no
+# kernel headers. Skips (77) where the driver source is not checked out (third_party/xdna-driver or ONEBIT_XDNA_SRC).
+add_test(NAME amdxdna_restart COMMAND bash ${CMAKE_SOURCE_DIR}/tests/amdxdna_restart_test.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(amdxdna_restart PROPERTIES SKIP_RETURN_CODE 77)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
 # pin file's refusals, the completeness check against a fabricated tree, and that cmake and
 # weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.

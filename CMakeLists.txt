@@ -851,7 +851,10 @@ add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
     # forward offers is f32 -- which cannot be bit-exact with an int8 x int4 device by construction. This pins
     # the integer arm (q4nx_host_gemm_i8) against an independently generated known answer, including an
     # activation of -128 so a naive int8 intermediate or an int32 saturation would show. Pure host, no device.
-    add_executable(npu_host_gemm_i8_test tests/npu_host_gemm_i8_test.cpp)
+    # q4nx_pack.c is the file that defines q4nx_host_gemm_i8 (it is in onebit_npu_forward, not onebit_npu), and
+    # its newer body also calls q4nx_dequant_tensor_chunked, so both sources come with the test.
+    add_executable(npu_host_gemm_i8_test tests/npu_host_gemm_i8_test.cpp
+        npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
     target_include_directories(npu_host_gemm_i8_test PRIVATE npu/forward/include ${CMAKE_SOURCE_DIR}/tests)
     target_link_libraries(npu_host_gemm_i8_test PRIVATE onebit_npu)
     add_test(NAME npu_host_gemm_i8 COMMAND npu_host_gemm_i8_test)

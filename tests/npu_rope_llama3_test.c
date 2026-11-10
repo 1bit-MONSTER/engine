@@ -236,6 +236,27 @@ static void test_declared_type(void) {
         check(q4nx_rope_dynamic_base(1e4, &bad2, 1e6, 128) == 1e4, "an unusable window leaves the base alone");
         Q4nxRopeDynamic off = {0, 4.0, 8192.0};
         check(q4nx_rope_dynamic_base(1e4, &off, 1e6, 128) == 1e4, "and off is a no-op");
+        /* THE EXPONENT, against a KNOWN VALUE (review of #1792). Every arm above asserts a property -- "below the window
+         * the base is theta, past it not below theta" -- and every one of them is satisfied by ANY exponent, which is how
+         * a wrong rotary width (the caller passing head_dim instead of the rotary width) survived a green suite. With
+         * factor 1.0 the rule collapses to theta * (pos/original)^(dim/(dim-2)), so one printed constant pins it:
+         *   pos 524288, original 262144 -> ratio 2; dim 64 -> 1e6 * 2^(64/62) = 2.0435e6
+         * and dim 128 -> 1e6 * 2^(128/126) = 2.0219e6, i.e. the arm distinguishes the two widths the bug confused. */
+        {
+            Q4nxRopeDynamic k = {1, 1.0, 262144.0};
+            const double want64 = 1e6 * pow(2.0, 64.0 / 62.0);
+            const double want128 = 1e6 * pow(2.0, 128.0 / 126.0);
+            const double got64 = q4nx_rope_dynamic_base(1e6, &k, 524288.0, 64);
+            const double got128 = q4nx_rope_dynamic_base(1e6, &k, 524288.0, 128);
+            check(fabs(got64 - want64) < 1e-6 * want64,
+                  "the base at twice the window with dim 64 is theta * 2^(64/62), to 1e-6 relative");
+            check(fabs(got128 - want128) < 1e-6 * want128,
+                  "... and with dim 128 it is theta * 2^(128/62)");
+            /* the pair is the point: if the exponent were ignored, or the width were not passed through, these would be
+             * equal -- so this asserts the arms CAN tell the rotary width from the head dim. */
+            check(fabs(got64 - got128) > 1e3,
+                  "and the two widths differ by more than 1e3, so this arm cannot pass with the widths confused");
+        }
     }
 
 }

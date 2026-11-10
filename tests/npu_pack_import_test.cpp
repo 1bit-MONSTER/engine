@@ -627,6 +627,55 @@ void test_canonical_copy_reusable() {
     std::printf("  canonical copy reuse: 7 arms (complete/truncated/long/absent/directory/zero-length/empty)\n");
 }
 
+// engine#1770: the canonical copy is scratch that used to only ever accumulate -- reuse writes a new file when the source
+// changes, so 699 files / 8.7 GiB of tmpfs (RAM) had built up on one box. The eviction rule is "same pack and geometry,
+// different source identity", and what can go wrong is deleting one of the neighbours that must survive, so each is an arm.
+void test_evict_stale_canonical_copies() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-evict-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    auto touch = [&](const std::string& base) {
+        std::ofstream o(dir / base, std::ios::binary | std::ios::trunc);
+        o << 'x';
+    };
+    const std::string keep = "1bit-fconst19v1-12345-896-14-24-291653952-76263210.fconst";
+    const std::string prefix = "1bit-fconst19v1-12345-896-14-24-";
+    const std::string stale = "1bit-fconst19v1-12345-896-14-24-291653952-99999.fconst";     // same pack+geometry, new mtime
+    const std::string stale_size = "1bit-fconst19v1-12345-896-14-24-300000000-76263210.fconst";  // repacked source
+    const std::string other_geometry = "1bit-fconst19v1-12345-1536-12-28-995712640-73345656.fconst";
+    const std::string other_pack = "1bit-fconst19v1-99999-896-14-24-291653952-76263210.fconst";
+    const std::string other_form = "1bit-fconst19v2-12345-896-14-24-291653952-76263210.fconst";
+    const std::string unrelated = "notes.txt";
+    // The split must not change the NAME, or every run rewrites a copy it already had (a ~1 GB rewrite, silently). The
+    // legacy formula concatenated these fields directly; the fix only cuts the string at the size field.
+    check(keep == prefix + "291653952-76263210.fconst",
+          "evict: prefix + source identity is the name the reuse path looks for, unchanged");
+    for (const auto& f : {keep, stale, stale_size, other_geometry, other_pack, other_form, unrelated}) touch(f);
+
+    pi::evict_stale_canonical_copies(dir.string(), keep, prefix);
+
+    auto exists = [&](const std::string& base) { return fs::exists(dir / base, ec); };
+    check(exists(keep), "evict: the copy being written is kept");
+    check(!exists(stale), "evict: a copy of the same pack and geometry at another mtime goes (the accumulation)");
+    check(!exists(stale_size), "evict: a repacked source's copy goes (different size, same pack and geometry)");
+    check(exists(other_geometry), "evict: another geometry of the same pack is kept -- it is not this run's to remove");
+    check(exists(other_pack), "evict: another pack with the same geometry is kept");
+    check(exists(other_form), "evict: another canonical form version is kept");
+    check(exists(unrelated), "evict: unrelated files in the directory are kept");
+
+    // The degenerate arguments must not turn into "delete the directory".
+    for (const auto& f : {keep, stale}) touch(f);
+    pi::evict_stale_canonical_copies(dir.string(), "", prefix);
+    check(exists(keep) && exists(stale), "evict: an empty keep-name removes nothing");
+    pi::evict_stale_canonical_copies(dir.string(), keep, "");
+    check(exists(keep) && exists(stale), "evict: an empty prefix removes nothing");
+    pi::evict_stale_canonical_copies((dir / "absent").string(), keep, prefix);
+    check(exists(keep), "evict: an absent directory is not an error");
+    fs::remove_all(dir, ec);
+    std::printf("  canonical copy eviction: 12 arms (name composition + keep/stale/geometry/pack/form/unrelated + 3 degenerate)\n");
+}
+
 void test_modelbin_genre_refusal(const std::string& root) {
     const fs::path dir = fs::path(root) / "crafted-modelbin";
     fs::remove_all(dir);
@@ -2926,7 +2975,7 @@ int main(int argc, char** argv) {
     test_external_roles();
     test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
-        test_canonical_copy_reusable();
+        test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_modelbin_genre_refusal(golden_dir.empty() ? "." : golden_dir);
         test_1671_plan_head_arm(golden_dir.empty() ? "." : golden_dir);

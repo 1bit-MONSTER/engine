@@ -48,69 +48,96 @@ except ImportError:                                            # the box has num
     sys.exit("npu_elf_ref: numpy is required")
 
 
-def prng_matrix(rows, cols, seed):
-    """int8 in [-127, 127] from a documented generator: xorshift64*, so a seed reproduces the matrix anywhere."""
-    n = rows * cols
-    out = np.empty(n, dtype=np.int32)
+def prng_bits(n, seed):
+    """n values drawn from xorshift64*, in [0,1) -- the seed is printed so a case is reproducible anywhere."""
     mask = (1 << 64) - 1
-    x = seed if seed else 1                      # plain Python ints: numpy warns on uint64 multiply overflow, and this
-    for i in range(n):                           # generator's overflow is the point (xorshift64*), not a bug
+    x = seed if seed else 1
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
         x ^= x >> 12
         x ^= (x << 25) & mask
         x ^= x >> 27
-        v = ((x * 2685821657736338717) & mask) >> 57                    # 7 bits: 0..127
-        out[i] = v - 127 if (i & 1) else v                              # alternate sign: both ends get used
-    return out.reshape(rows, cols).astype(np.int8)
+        out[i] = ((x * 2685821657736338717) & mask) / float(1 << 64)
+    return out
 
 
-def edge_matrix(rows, cols, kind):
-    m = np.zeros((rows, cols), dtype=np.int8)
+def quantise(weights, axis):
+    """int8 codes + per-(check) scale, the way a container holds them: absmax/127 with a 1.0 floor on an all-zero slice.
+
+    axis=1 -> a per-COLUMN scale (B, the weight matrix: one scale per output column, floored per 32-column group upstream)
+    axis=0 -> a per-ROW scale (A, the activations: one scale per token)
+    """
+    amax = np.max(np.abs(weights), axis=axis).astype(np.float64)
+    amax[amax < 1e-12] = 1.0                       # the container's floor: an all-zero slice quantises to zeros at scale 1
+    scale = amax / 127.0
+    shape = (1, -1) if axis == 0 else (-1, 1)
+    codes = np.rint(weights / np.broadcast_to(scale.reshape(shape), weights.shape))
+    return np.clip(codes, -127, 127).astype(np.int8), scale
+
+
+def edge_weights(rows, cols, kind, rng):
+    """Edge cases applied to the WEIGHT matrix, because that is where the column scales live (review round on #1805):
+    a zero column is what floors a scale, and saturating weights are what puts codes at +/-127."""
+    w = (rng.reshape(rows, cols) - 0.5) * 2.0
+    third = max(1, cols // 3)
     if kind == "zero":
-        m[:, : max(1, cols // 3)] = 0                                 # all-zero columns -> the scale floor
-        m[:, max(1, cols // 3):] = prng_matrix(rows, max(1, cols - max(1, cols // 3)), 7)
+        w[:, :third] = 0.0                          # columns whose absmax is 0 -> scale floors at 1.0, codes all zero
     elif kind == "full":
-        m[:, : max(1, cols // 3)] = 127                               # saturating codes
-        m[:, max(1, cols // 3):] = -127
+        w[:, :third] = 1.0                          # one column fully saturating at +127
+        w[:, third:2 * third] = -1.0
     elif kind == "floor":
-        m[:] = 0                                                      # every column zero -> every scale floors
+        w[:] = 0.0                                  # every column floors
     else:
         raise SystemExit(f"unknown edge kind {kind}")
-    return m
+    return w
 
 
-def column_scales(b):
-    """absmax/127 per column, with the container's 1e-12 floor on an all-zero column."""
-    amax = np.max(np.abs(b.astype(np.int32)), axis=0).astype(np.float64)
-    amax[amax < 1e-12] = 1.0
-    return amax / 127.0
+def reference(a_codes, a_scale, b_codes, b_scale):
+    """(int64 exact, int32 accumulation, folded float, dequantise-then-multiply).
+
+    Two independent things are being checked here, and the review round on #1805 is why both exist:
+      * the ACCUMULATOR: int64 arithmetic is exact, and int32 must agree with it element for element -- that is a check
+        that can fail, unlike (a@b)*s versus a@(b*s), which are the same float expression;
+      * the FOLD: applying the row and column scales after the integer dot must equal dequantising both operands first.
+    """
+    a64 = a_codes.astype(np.int64) @ b_codes.astype(np.int64)
+    a32 = a_codes.astype(np.int32) @ b_codes.astype(np.int32)
+    folded = a64.astype(np.float64) * a_scale[:, None] * b_scale[None, :]
+    deq = (a_codes.astype(np.float64) * a_scale[:, None]) @ (b_codes.astype(np.float64) * b_scale[None, :])
+    return a64, a32, folded, deq
 
 
-def reference(a, b, scales):
-    """(folded int32, dequantise-then-multiply) -- both, and the caller compares them."""
-    acc = a.astype(np.int32) @ b.astype(np.int32)                     # exact in int32 for these shapes
-    folded = acc.astype(np.float64) * scales[None, :]
-    deq = a.astype(np.float64) @ (b.astype(np.float64) * scales[None, :])
-    return acc, folded, deq
-
-
-def write_case(out, a, b, scales, acc, folded):
+def write_case(out, a, b, a_scale, b_scale, acc, folded):
     os.makedirs(out, exist_ok=True)
     a.tofile(os.path.join(out, "a.i8"))
     b.tofile(os.path.join(out, "b.i8"))
-    scales.astype(np.float32).tofile(os.path.join(out, "scales.f32"))
+    a_scale.astype(np.float32).tofile(os.path.join(out, "a_scales.f32"))
+    b_scale.astype(np.float32).tofile(os.path.join(out, "scales.f32"))
     acc.astype(np.int32).tofile(os.path.join(out, "c.i32"))
     folded.astype(np.float32).tofile(os.path.join(out, "c.f32"))
 
 
 def run_case(K, N, M, seed, kind, out):
-    a = edge_matrix(M, K, kind) if kind else prng_matrix(M, K, seed)
-    b = prng_matrix(K, N, seed + 1)
-    sc = column_scales(b)
-    acc, folded, deq = reference(a, b, sc)
+    rng_a = prng_bits(M * K, seed)
+    rng_b = prng_bits(K * N, seed + 1)
+    a_w = (rng_a.reshape(M, K) - 0.5) * 2.0
+    b_w = edge_weights(K, N, kind, rng_b) if kind else (rng_b.reshape(K, N) - 0.5) * 2.0
+    a_codes, a_scale = quantise(a_w, axis=1)        # per row (per token)
+    b_codes, b_scale = quantise(b_w, axis=0)        # per column
+    a64, a32, folded, deq = reference(a_codes, a_scale, b_codes, b_scale)
     rel = float(np.max(np.abs(folded - deq)) / max(1e-12, float(np.max(np.abs(deq)))))
+    props = {
+        "zero_b_cols": int(np.sum(np.all(b_codes == 0, axis=0))),
+        # a column FLOORS only when its weights are all zero -- absmax exactly 1.0 also gives scale 1/127, so counting
+        # scales would confuse "floored" with "saturating fixture" (caught by running this after the first rewrite)
+        "floored_cols": int(np.sum(np.all(b_w == 0.0, axis=0))),
+        "max_abs_code": int(np.max(np.abs(b_codes.astype(np.int32)))),
+        "int32_matches_int64": bool(np.array_equal(a32, a64.astype(np.int32))),
+        "int64_fits_int32": bool(np.max(np.abs(a64)) <= 2**31 - 1),
+    }
     if out:
-        write_case(out, a, b, sc, acc, folded)
-    return acc, folded, deq, rel
+        write_case(out, a_codes, b_codes, a_scale, b_scale, a32, folded)
+    return a64, a32, folded, deq, rel, props
 
 
 def main():
@@ -127,17 +154,26 @@ def main():
     if a.self_check:
         bad = 0
         for kind in (None, "zero", "full", "floor"):
-            acc, folded, deq, rel = run_case(a.K, a.N, a.M, a.seed, kind, None)
-            ok = rel <= 1e-6
-            print(f"  {'ok  ' if ok else 'FAIL'} reference agrees with itself: K={a.K} N={a.N} M={a.M} "
-                  f"edge={kind or 'seeded'} rel={rel:.3e} acc_range={int(acc.min())}..{int(acc.max())}")
+            a64, a32, folded, deq, rel, p = run_case(a.K, a.N, a.M, a.seed, kind, None)
+            ok = rel <= 1e-6 and p["int32_matches_int64"] and p["int64_fits_int32"]
+            # each edge case must REACH the property it names, or the arm tests nothing (review round on #1805)
+            if kind == "zero":
+                ok = ok and p["zero_b_cols"] > 0 and p["floored_cols"] > 0
+            if kind == "floor":
+                ok = ok and p["floored_cols"] == a.N
+            if kind == "full":
+                ok = ok and p["max_abs_code"] == 127
+            print(f"  {'ok  ' if ok else 'FAIL'} K={a.K} N={a.N} M={a.M} edge={kind or 'seeded'} "
+                  f"rel={rel:.1e} acc32==acc64={p['int32_matches_int64']} zero_cols={p['zero_b_cols']} "
+                  f"floored={p['floored_cols']} maxcode={p['max_abs_code']}")
             bad += 0 if ok else 1
         print("npu_elf_ref self-check: " + ("ok" if not bad else f"{bad} FAILED"))
         return 0 if not bad else 1
 
-    acc, folded, deq, rel = run_case(a.K, a.N, a.M, a.seed, a.edge, a.out)
+    a64, a32, folded, deq, rel, p = run_case(a.K, a.N, a.M, a.seed, a.edge, a.out)
     print(f"K={a.K} N={a.N} M={a.M} seed={a.seed} edge={a.edge or '-'} rel={rel:.3e} "
-          f"acc={int(acc.min())}..{int(acc.max())}" + (f" out={a.out}" if a.out else ""))
+          f"acc={int(a64.min())}..{int(a64.max())} zero_cols={p['zero_b_cols']} floored={p['floored_cols']} "
+          f"maxcode={p['max_abs_code']} acc32==acc64={p['int32_matches_int64']}" + (f" out={a.out}" if a.out else ""))
     return 0
 
 

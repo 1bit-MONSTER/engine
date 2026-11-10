@@ -27,6 +27,7 @@
 #include <string>
 
 #include <unistd.h>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace {
 
@@ -70,7 +71,7 @@ void no_addon_refuses_the_option() {
 int main() {
     no_addon_refuses_the_option();
     namespace fs = std::filesystem;
-    const fs::path dir = fs::temp_directory_path() / ("npu_private_route_test." + std::to_string(::getpid()));
+    const fs::path dir = ::onebit::test::tmp_root() / ("npu_private_route_test." + std::to_string(::getpid()));
     fs::create_directories(dir);
     std::ofstream(dir / "config.json") << R"({"model_type": "qwen3_5_moe", "num_hidden_layers": 40})";
     check("model_type_of reads config.json", model_type_of(dir.string()) == "qwen3_5_moe");

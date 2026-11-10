@@ -1448,6 +1448,66 @@ selections per layer touch nearly all 128 experts and stream ~18 GB. MoE prefill
 GPU route (`--moe-prefetch`, docs/serve.md); this is the thing that decides whether a kernel is
 right.
 
+### A pack's vision component (`vision_weight.q4nx`, engine#1788)
+
+FastFlowLM's MiniCPM-V 4.7 packs are two containers at the pack root: `model.q4nx` (the text model) and
+the file `config.json` names as `vision_model_weight`, `vision_weight.q4nx` (the vision tower). The
+second is the same container format holding a ViT: every tensor BF16, no tiles. `npu/vision_pack.h`
+reads it, and `1bit npu-pack vision <pack dir>` prints what it found:
+
+```
+$ 1bit npu-pack vision MiniCPM-V-4.7-1B-NPU2
+vision component  MiniCPM-V-4.7-1B-NPU2/vision_weight.q4nx
+tensors           347, all BF16, 1135109120 B of payload, 0 B unaccounted
+patch embed       14 x 14 pixels x 3 channels -> 1152
+positions         4900 (a 70 x 70 grid; image 980)
+blocks            27 at width 1152, 16 heads x 72, MLP 4304 (4608 stored)
+vit_merger        attention at 1152, MLP 4608 -> 17216 (17280 stored) -> 1152
+merger            4608 -> 4608 -> 1024 (the text model's hidden size)
+source_file       mmproj-model-f16.gguf
+source_sha256     fb9cc047a3cdad5317fd8433a4aeda2d22f00f02ca4bd93b34ad84165b25a900
+note              config.json states MINICPM_V_VISION_MLP_INTERMEDIATE_SIZE 4304; model.visual.blocks.*.mlp.linear_fc1.weight has 4608 rows, the last 304 all zero: the container pads the model's width, and sizes come from the tensor
+note              config.json states MINICPM_V_VIT_MERGER_INTERMEDIATE_SIZE 17216; model.visual.vit_merger.mlp.linear_fc1.weight has 17280 rows, the last 64 all zero: the container pads the model's width, and sizes come from the tensor
+```
+
+This is a reader, not a forward: nothing runs the tower yet. What it settles is what a forward may
+rely on.
+
+- **Sizes come from the tensors.** The geometry is derived from the tensors' own shapes, and every
+  tensor must have the shape the others imply.
+- **The MLPs are stored padded.** The model's MLP widths are 4304 (blocks) and 17216 (`vit_merger`);
+  that is what `config.json` states and what the source GGUF's tensors are. The container stores them
+  4608 and 17280 wide, the next multiples of 128, with the extra `linear_fc1` rows, bias entries and
+  `linear_fc2` columns all zero. A loader that sized a buffer from the config would be 304 rows short
+  of what the file holds. The reader sizes from the tensor, verifies that everything past the stated
+  width is zero in every block, and carries the model's width beside the stored one
+  (`Geometry::model_intermediate`). If any value past the stated width is not zero it says so and
+  keeps the tensor's width; a config that states an MLP wider than its tensors is refused.
+- **Zero gaps.** A tensor the reader has no place for is a refusal, as is a missing one, a hole in the
+  block indices, a tensor that is not BF16, an extent that is not its shape's byte length, an extent
+  outside the payload, and two tensors on the same bytes. Each names the tensor.
+- **`config.json` is consulted for what the tensors cannot say** (the head count, the image size, the
+  unpadded MLP widths) and refused where the two cannot both be right: heads that do not multiply to
+  the width, an image size that is not the position grid times the patch, another width, block count
+  or position count, and a text `hidden_size` that is not what the merger projects to. That last one
+  is a tower paired with the wrong text model.
+
+**Checked against the source, bit for bit** (2026-11-10, both published packs). The 1B container's
+`__metadata__` names `mmproj-model-f16.gguf` and its SHA-256, which is the file of that name in
+`openbmb/MiniCPM-V-4.7-1B-gguf`. All 347 pack tensors were rebuilt from that GGUF and compared as
+BF16 bit patterns: 263 identical, 84 identical in the source's extent and `+0.0` in the padding, 0
+different. The pack's `attn.qkv` is the source's `attn_q`, `attn_k`, `attn_v` stacked in that order;
+`merger.norm` is the source's `v.post_ln`. Every F32 source tensor is exactly representable in BF16.
+The 35B-A3B container carries no `__metadata__`; the same comparison against
+`openbmb/MiniCPM-V-4.7-35B-A3B-gguf`'s `mmproj-model-f16.gguf` (SHA-256 `bff3b688…5d20f1`) gives the
+same 263 / 84 / 0, and against the 1B's source gives 0 of 347, so the two towers share a geometry and
+not a single tensor. One source tensor has no counterpart in either container: `v.tok_embd_sep`
+(`[4, hidden]`).
+
+Pinned by `tests/npu_vision_pack_test.cpp` on crafted containers; `ONEBIT_MINICPM_PACK=<pack dir>` adds
+the published pack's own numbers. The source comparison above was run by hand and is not a test in the
+tree.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
@@ -1655,7 +1715,7 @@ The cost is one more launch on the request that makes the pin. Every decision is
 (`[prefix] pin slot=1 tokens=342 state_at=341 pinned`), and `usage.flm_prefix_cache.pinned` says when a hit
 came from the pinned slot.
 
-Measured 2026-11-10 on `bonsai2-t2s2-perrole876` with its `kernels-m16`, `--ctx-size 1024`, one `npu-hold`
+Measured 2026-11-10 on `bonsai2-t2s2-perrole876` with its `kernels-m16`, one `npu-hold`
 ticket, one server per arm, four requests: the same 14-rule system prompt, then three different questions and
 the second one again. 16 tokens generated, temperature 0.
 
@@ -1670,6 +1730,30 @@ The generated text of all four requests is identical between the cache-off arm a
 The default-cache arm's times are not in the table: the ticket ended during its third request, so only its
 three cache decisions (from the server log) are known. A request's time here is the whole HTTP call, prefill
 plus 16 generated tokens, not TTFT.
+
+**`--flash`** (`1bit serve --device npu --flash`) is the single-turn profile as one word: `--ctx-size 1024`
+plus `--prefix-pin`. It refuses what contradicts it (`--ctx-size` other than 1024, `--prefix-slots 0`, a device
+other than `npu`) instead of quietly winning or losing.
+
+`--ctx-size N` now reaches this route. Before engine#1785's flash slice, `serve --ctx-size N` on a
+model-generic container was accepted and dropped at the hand-off to `forward-serve`, which kept the model's
+own `max_position_embeddings` (so the run in the table above was passed `--ctx-size 1024` and it had no effect;
+its prompts were about 355 tokens, so nothing in the table depends on it). The limit is prompt plus answer,
+it can lower the model's context and never raise it, and the load line says what is in force:
+`1bit forward-serve: context 1024 tokens (prompt plus answer)`.
+
+A request that does not fit is the client's error, so it is a 400 with the type the GGUF route's backend uses
+for the same refusal (it was a 500 with a bare message):
+
+```
+HTTP 400 {"error": {"message": "request (1597 tokens) exceeds the available context size (1024 tokens)",
+                    "type": "exceed_context_size_error", "n_prompt_tokens": 1597, "n_ctx": 1024}}
+```
+
+Measured 2026-11-10 with `--flash`, same pack and kernels, one `npu-hold` ticket, `max_tokens 8`: the
+1597-token request above refused in 0.02 s; then three questions under one system prompt: request 1
+`cached 0` (56.2 s), request 2 `cached 0` (48.9 s, makes the pin at 342 tokens), request 3
+`cached 341 of 355, pinned` (13.9 s). Whole HTTP calls, one run.
 
 ### Sampling and structured output
 
@@ -2186,7 +2270,10 @@ can fail a run.
 | `NPU_INFER_DUMP_DIR=<dir>` | `<dir>/layer_<ll>.f32` per layer: the residual stream after that layer, M x H little-endian f32, row-major. The directory must exist; a file that cannot be written is reported on stderr and the run goes on. | which **layer** two runs part at (per-layer cosine against a reference trace) |
 | `NPU_INFER_DUMP_OPS=1` | one stderr line per projection and per weighted RMSNorm: `[op] L<layer> <tag> rows=<M> \|x\| mean <m> absmax <a>` | which **op** inside the layer |
 
-`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process.
+`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process. When it is on, the forward prints
+`[ops-dump] NPU_INFER_DUMP_OPS is on: …` once at model load, before any request (engine#2028). A run that sets the
+variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
+looking for a code path that skips the dump.
 
 ```
   [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935

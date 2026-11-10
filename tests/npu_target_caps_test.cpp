@@ -33,6 +33,7 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace fs = std::filesystem;
 using onebit::npu::plan::Plan;
@@ -68,7 +69,7 @@ nlohmann::json base_plan() {
 }
 
 std::string write_plan(const std::string& name, const nlohmann::json& body) {
-    const fs::path p = fs::temp_directory_path() / ("npu_target_caps_test_" + name + ".json");
+    const fs::path p = ::onebit::test::tmp_root() / ("npu_target_caps_test_" + name + ".json");
     std::ofstream f(p);
     f << body.dump(2) << "\n";
     f.close();

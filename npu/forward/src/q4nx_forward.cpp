@@ -1311,99 +1311,12 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 snprintf(designs16_[i].elf_name, Q4NX_ELF_NAME_MAX, "%s", n16.c_str());
             }
         }
-        std::vector<std::string> m16dirs;
-        plan_decode_dirs_.clear();
-        if (plan_.loaded() && !plan_.decode_dirs.empty()) {
-            // The plan says which of the two given paths each candidate hangs off, so the runtime
-            // stops guessing which base a bare directory name meant.
-            for (const auto& d : plan_.decode_dirs)
-                plan_decode_dirs_.push_back((d.under_model ? mdir : dir) + "/" + d.path);
-            for (const auto& p : plan_decode_dirs_) m16dirs.push_back(p);
-        } else {
-            m16dirs.push_back(mdir + "/kernels-m16");
-            m16dirs.push_back(dir + "/m16");
-            m16dirs.push_back(dir);
-        }
+        // The decode family is the target's (engine#803 A2b): it resolves each role's `_m16` ELF under the plan's
+        // decode directories (or the sealed pb16i image), creates the context and configures it.  What stays here is
+        // the container's naming -- which sidecar file the sealed ELF is -- and the summary line, which is about the
+        // model's geometry rather than the target's.
         int made = 0, skipped = 0;
-        for (int i = 0; i < ndesigns_; i++) {
-            if (designs16_[i].M <= 0) { skipped++; continue; }
-            std::string elf, kname = "main:seq";
-            if (pb16i_ && !pb16i_sealed_.empty()) {
-                // One ELF for every ternary phase: the file is the same for all roles and
-                // only the instance name differs, so I8Ctx reuses the one hw_context.
-                const char* inst = pb16i_instance(designs16_[i].role);
-                if (!inst) {
-                    fprintf(stderr, "  [forward] pb16i: the sealed ELF has no instance for "
-                                    "role %s; this role has no decode kernel\n",
-                            role_tag(designs16_[i].role));
-                    designs16_[i].M = 0;
-                    skipped++;
-                    continue;
-                }
-                elf = dir + "/" + pb16i_sealed_;
-                kname = inst;
-                if (!file_exists(elf)) {
-                    err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
-                                             pb16i_sealed_ + "\" is not in " + dir + " (missing)")
-                                          : ("pb16i: missing sealed ELF " + elf);
-                    return false;
-                }
-            } else {
-                for (const std::string& d : m16dirs) {
-                    std::string cand = d + "/" + designs16_[i].elf_name;
-                    if (file_exists(cand)) { elf = cand; break; }
-                }
-            }
-            if (elf.empty()) {
-                // A pb16i role without its image kernel must stop the load: it is not
-                // a slower path, it is a missing one (the int8 weights are not packed
-                // for these geometries under this layout).
-                if (pb16i_) {
-                    err_ = plan_.loaded()
-                               ? std::string("plan ") + plan_path_ + ": decode role " +
-                                     role_tag(designs16_[i].role) + " needs \"" + designs16_[i].elf_name +
-                                     "\" (missing)"
-                               : std::string("pb16i: missing decode ELF ") + designs16_[i].elf_name;
-                    return false;
-                }
-                skipped++;
-                continue;   // stay on M=128
-            }
-            I8Ctx* c16 = xd_->make_ctx16(i, designs16_[i]);
-            if (!c16) { err_ = "cannot create the decode context for role " + std::to_string(i); return false; }
-            c16->MD = designs16_[i].M;
-            c16->KD = designs16_[i].K;
-            c16->ND = designs16_[i].N;
-            c16->blocked_b = weight_layout_b8_;
-            c16->pb16i = pb16i_;
-            c16->t2s = t2s_;
-            // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and
-            // the full-attention q half).  This mirrors the ELF family contract rather
-            // than inferring it, and load/launch refuse a tensor that needs two planes on
-            // a one-plane ELF.
-            if (pb16i_) {
-                const Q4nxDesign r = designs16_[i].role;
-                c16->pb16i_planes =
-                    (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
-            }
-            if (!c16->init_elf(*dev, elf.c_str(), designs16_[i].M,
-                               designs16_[i].K, designs16_[i].N, 1, kname.c_str())) {
-                if (pb16i_) {
-                    err_ = "pb16i: init_elf failed for " + elf;
-                    return false;
-                }
-                fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
-                                "this role keeps M=128\n", designs16_[i].elf_name);
-                xd_->drop_ctx16(i);
-                skipped++;
-                continue;
-            }
-            made++;
-            fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
-                    role_tag(designs_[i].role), designs16_[i].M, designs16_[i].K,
-                    designs16_[i].N, elf.c_str());
-        }
-        xd_->note_m16_made(made > 0);
+        if (!xd_->open_decode_family(designs16_, ndesigns_, pb16i_sealed_, &made, &skipped, err_)) return false;
         if (pb16i_ && made < ndesigns_ - 0) {
             fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
                     t2s_ ? "t2s" : "pb16i", made, ndesigns_);

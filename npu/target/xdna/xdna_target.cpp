@@ -541,6 +541,102 @@ void XdnaTarget::prof_dump() {
     prof_head_ = ProfAcc{};
 }
 
+namespace {
+bool decode_elf_exists(const std::string& p) {
+    if (p.empty()) return false;
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(p, ec);
+    return !ec && sz > 0;
+}
+}  // namespace
+
+bool XdnaTarget::open_decode_family(Q4nxDesignGeom* designs16, int n, const std::string& sealed_elf,
+                                    int* made, int* skipped, std::string& err) {
+    int made_n = 0, skipped_n = 0;
+    for (int i = 0; i < n; i++) {
+        if (designs16[i].M <= 0) { ++skipped_n; continue; }
+        std::string elf, kname = "main:seq";
+        if (setup_.pb16i && !sealed_elf.empty()) {
+            // One ELF for every ternary phase: the file is the same for all roles and only the instance name
+            // differs, so I8Ctx reuses the one hw_context.
+            const char* inst = q4nx_pb16i_instance(designs16[i].role);
+            if (!inst) {
+                std::fprintf(stderr,
+                             "  [forward] pb16i: the sealed ELF has no instance for role %s; this role has no "
+                             "decode kernel\n",
+                             q4nx_design_log_tag(designs16[i].role));
+                designs16[i].M = 0;
+                ++skipped_n;
+                continue;
+            }
+            elf = setup_.kernels_dir + "/" + sealed_elf;
+            kname = inst;
+            if (!decode_elf_exists(elf)) {
+                err = plan_.loaded() ? ("plan " + setup_.plan_path + ": decode.sealed_elf \"" + sealed_elf +
+                                        "\" is not in " + setup_.kernels_dir + " (missing)")
+                                     : ("pb16i: missing sealed ELF " + elf);
+                return false;
+            }
+        } else {
+            for (const std::string& d : setup_.decode_dirs) {
+                const std::string cand = d + "/" + designs16[i].elf_name;
+                if (decode_elf_exists(cand)) { elf = cand; break; }
+            }
+        }
+        if (elf.empty()) {
+            // A pb16i role without its image kernel must stop the load: it is not a slower path, it is a missing
+            // one (the int8 weights are not packed for these geometries under this layout).
+            if (setup_.pb16i) {
+                err = plan_.loaded() ? std::string("plan ") + setup_.plan_path + ": decode role " +
+                                           q4nx_design_log_tag(designs16[i].role) + " needs \"" +
+                                           designs16[i].elf_name + "\" (missing)"
+                                     : std::string("pb16i: missing decode ELF ") + designs16[i].elf_name;
+                return false;
+            }
+            ++skipped_n;
+            continue;   // stay on M=128
+        }
+        I8Ctx* c16 = make_ctx16(i, designs16[i]);
+        if (!c16) {
+            err = "cannot create the decode context for role " + std::to_string(i);
+            return false;
+        }
+        c16->MD = designs16[i].M;
+        c16->KD = designs16[i].K;
+        c16->ND = designs16[i].N;
+        c16->blocked_b = setup_.b8;
+        c16->pb16i = setup_.pb16i;
+        c16->t2s = setup_.t2s;
+        // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and the full-attention q half).
+        // This mirrors the ELF family contract rather than inferring it, and load/launch refuse a tensor that
+        // needs two planes on a one-plane ELF.
+        if (setup_.pb16i) {
+            const Q4nxDesign r = designs16[i].role;
+            c16->pb16i_planes = (r == Q4NX_DESIGN_D || r == Q4NX_DESIGN_O || r == Q4NX_DESIGN_QKVFA_Q) ? 2 : 1;
+        }
+        if (!c16->init_elf(*dev_, elf.c_str(), designs16[i].M, designs16[i].K, designs16[i].N, 1, kname.c_str())) {
+            if (setup_.pb16i) {
+                err = "pb16i: init_elf failed for " + elf;
+                return false;
+            }
+            std::fprintf(stderr,
+                         "  [forward] M=16 twin failed to load (%s); this role keeps M=128\n",
+                         designs16[i].elf_name);
+            drop_ctx16(i);
+            ++skipped_n;
+            continue;
+        }
+        ++made_n;
+        std::fprintf(stderr, "  [forward] %-7s M=%d K=%d N=%d  %s (decode)\n",
+                     q4nx_design_log_tag(designs16[i].role), designs16[i].M, designs16[i].K, designs16[i].N,
+                     elf.c_str());
+    }
+    note_m16_made(made_n > 0);
+    if (made) *made = made_n;
+    if (skipped) *skipped = skipped_n;
+    return true;
+}
+
 bool XdnaTarget::open_head(const Q4nxDesignGeom* designs, int n, std::string& err) {
     // run_lm_head packs int8 B tiles from the f32 head and launches them itself, so it
     // needs an int8 context with K=H.  Under pb16i every decode context is a pb16i one,

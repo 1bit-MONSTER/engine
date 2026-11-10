@@ -208,6 +208,10 @@ add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $
 # it is here because nothing else runs it: the rows had 128 assertions and no runner. It names no add_executable, so it
 # adds nothing to the set of test targets the CI --target list would have to build (the direction-B measurement, #1595).
 add_test(NAME release_check_selftest COMMAND bash ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh --self-test)
+# engine#1766/#1767: the hrx-device row's init-reason extraction, three arms. Script-based (it reads the row function
+# out of os/mini/release-check.sh), no build, no device. It reached main with #1777 referenced by nothing; registering
+# it here is what lets the engine#1820 row below pass on a tree that tells the truth.
+add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1800: the 1bit OS base layer's mode normaliser and reporter (scripts/pack-elf.sh, engine#1474), run over a
 # crafted tree. Same shape as the row above: no build, no device, no target, so it adds nothing to the CI --target list.
 # It was in tests/ with nothing referencing it, so the property it pins (the normaliser only NARROWS modes: a 0600
@@ -275,6 +279,12 @@ add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.
 # two files, no build and no submodules; --self-test drives it.
 add_test(NAME ci_targets COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#1820: the shell half of the same idea ci_targets owns for targets -- every tests/*.sh must be named by
+# something that could run it (CMakeLists, cmake/, .github/, scripts/, tools/, or another test), or be excused with a
+# reason in tools/ci/unreferenced_tests.txt. Three PRs in one night shipped a test nothing ran and this had no row;
+# #1777's tests/release_check_hrx_init_reason_test.sh is on main today because of it. No target, no device, no network.
+add_test(NAME unreferenced_tests COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/unreferenced_tests_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_test(NAME unreferenced_tests_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/unreferenced_tests_check.py --self-test)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
 # orphans of that shape landed in two days (51 GiB of GTT for 14 h; an NPU server 70 min past a 6-min ticket;
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the

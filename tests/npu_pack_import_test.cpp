@@ -519,7 +519,7 @@ void test_external_packed_genre(const std::string& root) {
             const json h = json::parse(hdr);
             std::string qname;
             uint64_t qoff = 0, qbytes = 0;
-            int64_t qrows = 0, qcols = 0;
+            uint64_t qtile = 0;
             // The container header is a FLAT map of tensor name -> {dtype, shape, data_offsets}: no "tensors" wrapper,
             // and non-tensor keys (format, config) carry no data_offsets.
             for (auto it = h.begin(); it != h.end(); ++it) {
@@ -529,10 +529,11 @@ void test_external_packed_genre(const std::string& root) {
                     qname = k2;
                     qoff = it.value()["data_offsets"][0].get<uint64_t>();
                     qbytes = it.value()["data_offsets"][1].get<uint64_t>() - qoff;
-                    if (it.value().contains("shape") && it.value()["shape"].size() >= 2) {
-                        qrows = it.value()["shape"][0].get<int64_t>();
-                        qcols = it.value()["shape"][1].get<int64_t>();
-                    }
+                    // The writer stores a projection as {ntiles, kImportTileBytes} (pack_import.cpp: "w.add(prefix,
+                    // "I8", {nt, kImportTileBytes}, …)"), NOT as [rows, cols] -- so the decode below must be told the
+                    // MODEL's geometry and the tile size, and the stored shape only supplies the chunk size.
+                    if (it.value().contains("shape") && it.value()["shape"].size() >= 2)
+                        qtile = it.value()["shape"][1].get<uint64_t>();
                 }
             }
             check(!qname.empty(), "external writer: the container carries the q projection");
@@ -542,25 +543,48 @@ void test_external_packed_genre(const std::string& root) {
                 std::vector<uint8_t> tile_raw(static_cast<size_t>(qbytes));
                 f.seekg(std::streamoff(8 + hlen + qoff));
                 f.read(reinterpret_cast<char*>(tile_raw.data()), std::streamsize(tile_raw.size()));
-                std::printf("  writer success: shape %lld x %lld\n", (long long)qrows, (long long)qcols);
-                std::vector<float> row(static_cast<size_t>(qcols));
-                const int rc = q4nx_dequant_tile_row(tile_raw.data(), tile_raw.size(), int(qrows), int(qcols),
+                const int64_t q_rows = heads * hd, q_cols = K;   // q_proj as the model sees it
+                std::printf("  writer success: %llu B in %llu B tiles -> %llu tiles; model rows %lld cols %lld\n",
+                            (unsigned long long)qbytes, (unsigned long long)qtile, (unsigned long long)(qbytes / qtile),
+                            (long long)q_rows, (long long)q_cols);
+                // The writer stores Q4_1F tiles (6144 B), which q4nx_dequant_tile_row does not decode: the device loader
+                // repacks them through q4nx::as_q4_1() first (q4nx_device.cpp:263-266), so the read-back takes the same
+                // route rather than a second decoder written for this test.
+                onebit::npu::Tensor q4f;
+                q4f.dtype = "I8";
+                q4f.shape = {q_rows, q_cols};
+                q4f.data = tile_raw.data();
+                q4f.bytes = q4f.avail = uint64_t(tile_raw.size());
+                const std::vector<uint8_t> conv = onebit::npu::q4nx::as_q4_1(q4f);
+                std::printf("  as_q4_1: %llu B -> %zu B (%zu tiles)\n", (unsigned long long)qbytes, conv.size(),
+                            conv.size() / size_t(Q4NX_TILE_BYTES));
+                // The writer pads the column count to a whole 256-column tile (5120 -> 6144), so the decode has to be
+                // told the PADDED grid: 160 row-tiles x 24 col-tiles = 3840 tiles, which is what as_q4_1() returned.
+                const int64_t q_cols_pad = (q_cols + 255) / 256 * 256;
+                std::printf("  decode grid: rows %lld cols %lld (padded from %lld); %zu tiles of %d\n",
+                            (long long)q_rows, (long long)q_cols_pad, (long long)q_cols,
+                            conv.size() / size_t(Q4NX_TILE_BYTES), int(Q4NX_TILE_BYTES));
+                std::vector<float> row(static_cast<size_t>(q_cols_pad));
+                const int rc = q4nx_dequant_tile_row(conv.data(), conv.size(), int(q_rows), int(q_cols_pad),
                                                      Q4NX_TILE_BYTES, 0, row.data());
                 check(rc == 0, "external writer: the written tile decodes (got " + std::to_string(rc) + ")");
                 if (rc == 0) {
-                    for (int rr : {0, 32, 160, qrows > 0 ? int(qrows - 1) : 0}) {
-                        std::vector<float> r2(static_cast<size_t>(qcols));
-                        const int r2c = q4nx_dequant_tile_row(tile_raw.data(), tile_raw.size(), int(qrows), int(qcols),
+                    for (int rr : {0, 32, int(q_rows - 1)}) {
+                        std::vector<float> r2(static_cast<size_t>(q_cols_pad));
+                        const int r2c = q4nx_dequant_tile_row(conv.data(), conv.size(), int(q_rows), int(q_cols_pad),
                                                               Q4NX_TILE_BYTES, rr, r2.data());
-                        if (r2c == 0) std::printf("  row %d: first %.4f  mid %.4f\n", rr, double(r2[0]), double(r2[size_t(qcols / 2)]));
+                        if (r2c == 0)
+                            std::printf("  row %d: first %.4f  mid %.4f\n", rr, double(r2[0]), double(r2[size_t(q_cols / 2)]));
+                        else
+                            std::printf("  row %d: refused (%d)\n", rr, r2c);
                     }
                     size_t bad = 0;
-                    for (int64_t c = 0; c < qcols; ++c)
+                    for (int64_t c = 0; c < q_cols; ++c)
                         if (std::fabs(row[size_t(c)] - (-10.0f)) > 1e-6f) ++bad;
                     char msg[200];
                     std::snprintf(msg, sizeof msg,
                                   "external writer: every decoded weight is -10.0 (codes -4, zero 1, scale 2.0); %zu of %d differ, first %.4f",
-                                  bad, int(qcols), double(row[0]));
+                                  bad, int(q_cols), double(row[0]));
                     check(bad == 0, msg);
                 }
             }

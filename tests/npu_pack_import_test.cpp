@@ -1414,6 +1414,33 @@ void test_final_norm_envelope(const std::string& root) {
     fs::remove_all(out);
     const pi::Report r = pi::import_pack(dir.string(), out, allow);
     check(r.final_norm_imported, "final norm: the crafted tail envelope yields model.norm.weight");
+    // engine#1889: `use_qk_norm` is a declaration the layout arithmetic cannot see, so the two must agree. This fixture's
+    // block is the 2-header shape the arithmetic reads as "no per-head gains"; declaring `use_qk_norm: true` on top of it is
+    // the Hunyuan-7B situation, where the importer used to write a container with the gains omitted and serve gibberish.
+    // It must refuse by name instead.
+    {
+        put_file((dir / "config.json").string(),
+                 R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+                 R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":128,)"
+                 R"("rope_theta":10000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06,)"
+                 R"("use_qk_norm":true})");
+        std::string why;
+        bool refused = false;
+        try {
+            (void)pi::import_pack(dir.string(), out + ".qknorm", allow);
+        } catch (const std::exception& e) {
+            refused = true;
+            why = e.what();
+        }
+        check(refused, "use_qk_norm: a pack that declares the gains but whose layout has no section is refused");
+        check(why.find("use_qk_norm") != std::string::npos && why.find("engine#1889") != std::string::npos,
+              "use_qk_norm: and the refusal names the key and the issue (" + why + ")");
+        // restore the declaration-free config for the arms below
+        put_file((dir / "config.json").string(),
+                 R"({"model_type":"qwen2","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+                 R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":128,)"
+                 R"("rope_theta":10000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06})");
+    }
     check(!r.prefill_tail_seen && !r.final_norm_crosscheck,
           "final norm: with no prefill program the cross-check is unavailable, not failed");
     if (r.final_norm_imported) {

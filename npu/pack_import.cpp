@@ -485,6 +485,27 @@ std::vector<uint8_t> fconst19_header(int heads) {
 // True when `fc` is a 1.9 Token .fconst of this geometry: exactly `layers` headers, evenly spaced.
 // Fills the first header's offset and the block stride. False means the 1.8 form (or a shape this
 // importer does not know, which the caller decides about).
+// engine#1503: the run scan on its own. `fconst19_detect` additionally requires ONE stride, which the mobius line
+// (gemma-4-e2b: 35 blocks of 21.87-288.06 MiB) does not have -- so a caller that needs to tell "this is not a 1.9 fconst"
+// from "this is a 1.9 fconst whose blocks are not uniform" needs the starts before the stride test.
+bool fconst19_block_starts(const Fconst& fc, int heads, int layers, std::vector<int64_t>* starts) {
+    if (heads <= 0 || layers < 2) return false;
+    const std::vector<uint8_t> pat = fconst19_header(heads);
+    std::vector<int64_t> runs;
+    for (size_t i = 0; i + pat.size() <= fc.size;) {
+        if (fc.map[i] == pat[0] && fc.map[i + 2] == 0x7f && fc.map[i + 3] == 0xff &&
+            std::memcmp(fc.map + i, pat.data(), pat.size()) == 0) {
+            runs.push_back(int64_t(i));
+            i += pat.size();
+        } else {
+            ++i;
+        }
+    }
+    if (int(runs.size()) != layers) return false;
+    if (starts) *starts = std::move(runs);
+    return true;
+}
+
 bool fconst19_detect(const Fconst& fc, int heads, int layers, int64_t* hdr_off, int64_t* stride) {
     if (heads <= 0 || layers < 2) return false;
     const std::vector<uint8_t> pat = fconst19_header(heads);
@@ -519,6 +540,29 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     Fconst fc = open_fconst(path);
     int64_t hdr_off = 0, stride9 = 0;
     if (!fconst19_detect(fc, heads, layers, &hdr_off, &stride9)) {
+        // Distinguish "not a 1.9 fconst" from "a 1.9 fconst whose blocks are NOT uniform": the mobius line (gemma-4-e2b
+        // measured: 35 blocks, 8 anchors each, sizes 21.87-288.06 MiB) is the second, and the rule table cannot describe
+        // it -- one stride per file is the table's model (engine#1503). Refusing with the block table is the difference
+        // between a reader that looks unmeasured and a model that is wrong for the family.
+        std::vector<int64_t> starts;
+        if (fconst19_block_starts(fc, heads, layers, &starts)) {
+            std::string sizes;
+            int64_t lo = INT64_MAX, hi = 0;
+            for (size_t k = 0; k < starts.size(); ++k) {
+                const int64_t end = (k + 1 < starts.size()) ? starts[k + 1] : int64_t(fc.size);
+                const int64_t sz = end - starts[k];
+                if (sz < lo) lo = sz;
+                if (sz > hi) hi = sz;
+            }
+            unmap_file(fc.map, fc.size);
+            throw std::runtime_error(
+                path + ": this IS a Ryzen AI 1.9 Token .fconst (" + std::to_string(layers) + " blocks of " +
+                std::to_string(heads * 4) + " B headers at " + std::to_string(starts.front()) + " B) but its blocks are " +
+                "NOT uniform: " + std::to_string(lo / 1024) + " KiB to " + std::to_string(hi / 1024) +
+                " KiB, i.e. a variable-stride container. The rule table describes one stride per file, so no row can fit "
+                "it; this family (mobius/MatFormer) needs the per-layer block table instead -- the anchors give the block "
+                "starts, and each block's size follows that layer's own projection shapes (engine#1503)");
+        }
         unmap_file(fc.map, fc.size);
         return path;
     }

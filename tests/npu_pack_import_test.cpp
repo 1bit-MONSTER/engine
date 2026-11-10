@@ -2960,6 +2960,51 @@ void test_per_layer_container(const std::string& root) {
 }
 
 
+
+// engine#1503: a 1.9 fconst whose blocks are NOT uniform (the mobius line). `fconst19_detect` requires one stride for the
+// whole file, so it fails -- and the failure used to be indistinguishable from "not a 1.9 fconst at all". The refusal now
+// names the structure and says the rule table cannot describe it. Measured on gemma-4-e2b: 35 blocks of 8 anchors, sizes
+// 21.87-288.06 MiB.
+void test_fconst_variable_stride(const std::string& root) {
+    const fs::path dir = fs::path(root) / "fconst-varstride";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    const int H = 128, L = 4, heads = 2;
+    const int64_t hdr = heads * 4;
+    // four blocks, each header then a body of a DIFFERENT size: 64 KiB, 96 KiB, 128 KiB, 160 KiB
+    const int64_t bodies[4] = {64 << 10, 96 << 10, 128 << 10, 160 << 10};
+    std::string fc;
+    for (int l = 0; l < L; ++l) {
+        for (int h = 0; h < heads; ++h) {                  // 00 00 7f ff per head
+            fc.push_back('\0'); fc.push_back('\0'); fc.push_back(char(0x7f)); fc.push_back(char(0xff));
+        }
+        fc.append(size_t(bodies[l]), '\0');
+    }
+    check(fc.size() > size_t(L * hdr), "variable stride: the crafted fconst is larger than its headers");
+    put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"gemma4","hidden_size":128,"intermediate_size":256,"num_hidden_layers":4,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":64,"rope_theta":10000.0})");
+    put_file((dir / "model.onnx").string(), pb::model({}, {}));
+    put_file((dir / "model.onnx.data").string(), std::string(4096, '\x11'));
+    pi::Options allow;
+    allow.allow_incomplete = true;
+    const std::string out = (fs::temp_directory_path() / ("varstride_out." + std::to_string(::getpid()))).string();
+    fs::remove_all(out);
+    bool refused = false;
+    std::string what;
+    try {
+        (void) pi::import_pack(dir.string(), out, allow);
+    } catch (const std::exception& e) {
+        what = e.what();
+        refused = what.find("variable-stride") != std::string::npos || what.find("NOT uniform") != std::string::npos;
+    }
+    std::printf("variable stride: %s\n", refused ? "refused by name (variable-stride container)" : what.substr(0, 140).c_str());
+    check(refused, "variable stride: a 1.9 fconst whose blocks differ in size is refused BY NAME, not as 'not a 1.9 fconst'");
+    fs::remove_all(out);
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
@@ -2989,6 +3034,7 @@ int main(int argc, char** argv) {
         test_attn_tile(golden_dir);
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
+        test_fconst_variable_stride(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);

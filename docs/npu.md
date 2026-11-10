@@ -1448,6 +1448,66 @@ selections per layer touch nearly all 128 experts and stream ~18 GB. MoE prefill
 GPU route (`--moe-prefetch`, docs/serve.md); this is the thing that decides whether a kernel is
 right.
 
+### A pack's vision component (`vision_weight.q4nx`, engine#1788)
+
+FastFlowLM's MiniCPM-V 4.7 packs are two containers at the pack root: `model.q4nx` (the text model) and
+the file `config.json` names as `vision_model_weight`, `vision_weight.q4nx` (the vision tower). The
+second is the same container format holding a ViT: every tensor BF16, no tiles. `npu/vision_pack.h`
+reads it, and `1bit npu-pack vision <pack dir>` prints what it found:
+
+```
+$ 1bit npu-pack vision MiniCPM-V-4.7-1B-NPU2
+vision component  MiniCPM-V-4.7-1B-NPU2/vision_weight.q4nx
+tensors           347, all BF16, 1135109120 B of payload, 0 B unaccounted
+patch embed       14 x 14 pixels x 3 channels -> 1152
+positions         4900 (a 70 x 70 grid; image 980)
+blocks            27 at width 1152, 16 heads x 72, MLP 4304 (4608 stored)
+vit_merger        attention at 1152, MLP 4608 -> 17216 (17280 stored) -> 1152
+merger            4608 -> 4608 -> 1024 (the text model's hidden size)
+source_file       mmproj-model-f16.gguf
+source_sha256     fb9cc047a3cdad5317fd8433a4aeda2d22f00f02ca4bd93b34ad84165b25a900
+note              config.json states MINICPM_V_VISION_MLP_INTERMEDIATE_SIZE 4304; model.visual.blocks.*.mlp.linear_fc1.weight has 4608 rows, the last 304 all zero: the container pads the model's width, and sizes come from the tensor
+note              config.json states MINICPM_V_VIT_MERGER_INTERMEDIATE_SIZE 17216; model.visual.vit_merger.mlp.linear_fc1.weight has 17280 rows, the last 64 all zero: the container pads the model's width, and sizes come from the tensor
+```
+
+This is a reader, not a forward: nothing runs the tower yet. What it settles is what a forward may
+rely on.
+
+- **Sizes come from the tensors.** The geometry is derived from the tensors' own shapes, and every
+  tensor must have the shape the others imply.
+- **The MLPs are stored padded.** The model's MLP widths are 4304 (blocks) and 17216 (`vit_merger`);
+  that is what `config.json` states and what the source GGUF's tensors are. The container stores them
+  4608 and 17280 wide, the next multiples of 128, with the extra `linear_fc1` rows, bias entries and
+  `linear_fc2` columns all zero. A loader that sized a buffer from the config would be 304 rows short
+  of what the file holds. The reader sizes from the tensor, verifies that everything past the stated
+  width is zero in every block, and carries the model's width beside the stored one
+  (`Geometry::model_intermediate`). If any value past the stated width is not zero it says so and
+  keeps the tensor's width; a config that states an MLP wider than its tensors is refused.
+- **Zero gaps.** A tensor the reader has no place for is a refusal, as is a missing one, a hole in the
+  block indices, a tensor that is not BF16, an extent that is not its shape's byte length, an extent
+  outside the payload, and two tensors on the same bytes. Each names the tensor.
+- **`config.json` is consulted for what the tensors cannot say** (the head count, the image size, the
+  unpadded MLP widths) and refused where the two cannot both be right: heads that do not multiply to
+  the width, an image size that is not the position grid times the patch, another width, block count
+  or position count, and a text `hidden_size` that is not what the merger projects to. That last one
+  is a tower paired with the wrong text model.
+
+**Checked against the source, bit for bit** (2026-11-10, both published packs). The 1B container's
+`__metadata__` names `mmproj-model-f16.gguf` and its SHA-256, which is the file of that name in
+`openbmb/MiniCPM-V-4.7-1B-gguf`. All 347 pack tensors were rebuilt from that GGUF and compared as
+BF16 bit patterns: 263 identical, 84 identical in the source's extent and `+0.0` in the padding, 0
+different. The pack's `attn.qkv` is the source's `attn_q`, `attn_k`, `attn_v` stacked in that order;
+`merger.norm` is the source's `v.post_ln`. Every F32 source tensor is exactly representable in BF16.
+The 35B-A3B container carries no `__metadata__`; the same comparison against
+`openbmb/MiniCPM-V-4.7-35B-A3B-gguf`'s `mmproj-model-f16.gguf` (SHA-256 `bff3b688…5d20f1`) gives the
+same 263 / 84 / 0, and against the 1B's source gives 0 of 347, so the two towers share a geometry and
+not a single tensor. One source tensor has no counterpart in either container: `v.tok_embd_sep`
+(`[4, hidden]`).
+
+Pinned by `tests/npu_vision_pack_test.cpp` on crafted containers; `ONEBIT_MINICPM_PACK=<pack dir>` adds
+the published pack's own numbers. The source comparison above was run by hand and is not a test in the
+tree.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU

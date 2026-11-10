@@ -208,6 +208,11 @@ add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $
 # it is here because nothing else runs it: the rows had 128 assertions and no runner. It names no add_executable, so it
 # adds nothing to the set of test targets the CI --target list would have to build (the direction-B measurement, #1595).
 add_test(NAME release_check_selftest COMMAND bash ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh --self-test)
+# engine#1800: the 1bit OS base layer's mode normaliser and reporter (scripts/pack-elf.sh, engine#1474), run over a
+# crafted tree. Same shape as the row above: no build, no device, no target, so it adds nothing to the CI --target list.
+# It was in tests/ with nothing referencing it, so the property it pins (the normaliser only NARROWS modes: a 0600
+# secret stays 0600 and /tmp keeps 1777) had no runner at all.
+add_test(NAME base_modes COMMAND bash ${CMAKE_SOURCE_DIR}/tests/base_modes_test.sh ${CMAKE_SOURCE_DIR})
 add_test(NAME template_pin COMMAND ${CMAKE_SOURCE_DIR}/tests/template_pin.sh $<TARGET_FILE:onebit>)
 add_test(NAME greedy_shortcut COMMAND ${CMAKE_SOURCE_DIR}/tests/greedy_shortcut.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)
@@ -270,6 +275,13 @@ add_test(NAME serve_port COMMAND bash ${CMAKE_SOURCE_DIR}/tests/serve_port_test.
 # two files, no build and no submodules; --self-test drives it.
 add_test(NAME ci_targets COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_test(NAME ci_targets_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
+# `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
+# tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
+add_test(NAME tests_referenced COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --check --root ${CMAKE_SOURCE_DIR})
+add_test(NAME tests_referenced_self COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci/tests_referenced_check.py --self-test)
+# engine#1777: the release row's own arm, which merged unregistered -- this sweep is what found it (engine#1820).
+add_test(NAME release_check_hrx_init_reason COMMAND bash ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1615: every process holding the GPU/NPU device must belong to a live gpu-hold/npu-hold ticket. Three
 # orphans of that shape landed in two days (51 GiB of GTT for 14 h; an NPU server 70 min past a 6-min ticket;
 # then two lanes each starting an HRX server outside the token within one half hour). The ancestry test is the
@@ -851,6 +863,10 @@ add_test(NAME route_port_lock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/
     # the whole run loop against canned completions, and re-derives the summary from the written transcript.  Stdlib
     # only, with no route, no socket, no dataset fetch and no device.
     add_test(NAME gsm8k_eval COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gsm8k_eval_test.py)
+    # engine#1808's integer host arm is pinned inside tests/npu_pack_test.cpp (ctest npu_pack): that binary is
+    # already built by ci.yml, and a new ctest target would need a `.github/workflows/ci.yml` edit, which this
+    # lane's token cannot push (the OAuth app has no `workflow` scope) -- the ci_targets check caught exactly
+    # that, with both failures ("ci_targets" and "npu_host_gemm_i8 Not Run").
     # The repack's tile-order claim (engine#1110): `npu_plan.py` writes container.tile_order=engine-1 for every
     # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
     # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.
@@ -1099,13 +1115,18 @@ if(ONEBIT_OGA_PACK)
     add_test(NAME npu_pack_import_oga
              COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden ${ONEBIT_OGA_PACK})
 endif()
-add_executable(npu_pack_test tests/npu_pack_test.cpp)
+# q4nx_pack.c is listed here rather than reached through onebit_npu: the integer host arm's checks
+# (engine#1808) call q4nx_host_gemm_i8*() directly, and those live in that file.
+add_executable(npu_pack_test tests/npu_pack_test.cpp npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
 add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
 target_link_libraries(npu_flm_head_import_test PRIVATE onebit_npu)
 add_test(NAME npu_flm_head_import COMMAND npu_flm_head_import_test ${CMAKE_SOURCE_DIR}/tests/golden/flm-i8)
 target_link_libraries(npu_pack_test PRIVATE onebit_npu)
+# engine#1808: the integer host arm's checks live in this binary (see above), so it needs the header and the
+# golden fixture that pins them.
+target_include_directories(npu_pack_test PRIVATE npu/forward/include ${CMAKE_SOURCE_DIR}/tests)
 
 # The device weight layout contract (q4nx_weight_layout): pure index math, no device
 # and no runtime.  CI builds an explicit target list, so the check compiles itself with
@@ -1254,8 +1275,10 @@ target_link_libraries(npu_derive_designs_dump PRIVATE m)
 # the test compares it against the two-step dequant+pack, so both live here.
 # q4nx_pack_blocked.cpp is here because the head-tile identity arm (engine#1716) compares the blocked packer the forward
 # actually calls against the reference; the test links both. It is C++, so CMake switches this target's linker to CXX.
+# q4nx_head_image.c is the image cache's file format (engine#1716's cache slice, this branch): the identity arm above pins
+# what the image must contain, this one pins that what is written and read back is byte-identical to it.
 add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c npu/forward/src/q4nx_dequant.c
-                                  npu/forward/src/q4nx_pack_blocked.cpp)
+                                  npu/forward/src/q4nx_pack_blocked.cpp npu/forward/src/q4nx_head_image.c)
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)

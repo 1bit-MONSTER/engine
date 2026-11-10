@@ -178,6 +178,12 @@ struct Options {
     std::vector<std::string> npu_opts;   // --npu-opt KEY=VALUE, for a private NPU route
     int load_queue_ms = 45000;           // --load-queue-ms N: how long a refused NPU context is queued
     int npu_streams = 1;   // --npu-streams N: N opted-in serves share the NPU (app/npu_device_lock.h)
+    // engine #1785 (F5 flash serving): the prefix cache's knobs, so a serve route can size and gate it.
+    // -1 means "not given" and the forward keeps its own default (slots 8, cache 4096 MB, min-gain 128);
+    // the values and their meaning stay in app/npu_prefix_cache.h, this only carries them through.
+    int prefix_slots    = -1;   // --prefix-slots N (0 = off)
+    int prefix_cache_mb = -1;   // --prefix-cache-mb N
+    int prefix_min_gain = -1;   // --prefix-min-gain N: tokens a prompt must add to be worth keeping
     std::string npu_target;  // --npu-target NAME: which NPU target serves the per-op route (empty = the build's default)
     std::string prefill_provider;        // --prefill-provider PATH (or ONEBIT_HYBRID_PREFILL): --device hybrid's prefill (docs/hybrid.md)
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
@@ -3145,6 +3151,8 @@ void usage(FILE* out) {
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
                  "                  [--npu-streams N]   with --device npu: this serve is one of N sharing the NPU\n"
+                 "                  [--prefix-slots N] [--prefix-cache-mb N] [--prefix-min-gain N]   the prompt prefix cache\n"
+                 "                  (docs/npu.md; 0 slots turns it off). Unset keeps the forward's defaults: 8 / 4096 / 128\n"
                  "                  (default 1, the device exclusive; docs/npu.md)\n"
                  "                  [--load-queue-ms N]   a load refused because another client holds the NPU array\n"
                  "                  waits at most N ms for it to free before the driver is called dead\n"
@@ -3257,6 +3265,9 @@ int run_serve(int argc, char** argv) {
         else if (a == "--npu-opt") o.npu_opts.push_back(next());
         else if (a == "--load-queue-ms") o.load_queue_ms = std::stoi(next());
         else if (a == "--npu-streams") o.npu_streams = std::stoi(next());
+        else if (a == "--prefix-slots")    o.prefix_slots    = std::stoi(next());
+        else if (a == "--prefix-cache-mb") o.prefix_cache_mb = std::stoi(next());
+        else if (a == "--prefix-min-gain") o.prefix_min_gain = std::stoi(next());
         else if (a == "--npu-target") o.npu_target = next();
         else if (a == "--prefill-provider") o.prefill_provider = next();
         else if (a == "--laya-model") o.laya_model = next();
@@ -3403,6 +3414,11 @@ int run_serve(int argc, char** argv) {
                 // The forward owns the list of compiled targets and the refusal (app/forward_serve.cpp); serve
                 // only carries the operator's choice through, so there is one place that says which names exist.
                 if (!o.npu_target.empty()) { fargs.push_back("--npu-target"); fargs.push_back(o.npu_target); }
+                // engine #1785: the prefix cache's knobs, passed only when the operator set them, so the
+                // forward's own defaults stay the single source of truth for what "unset" means.
+                if (o.prefix_slots    >= 0) { fargs.push_back("--prefix-slots");    fargs.push_back(std::to_string(o.prefix_slots)); }
+                if (o.prefix_cache_mb >= 0) { fargs.push_back("--prefix-cache-mb"); fargs.push_back(std::to_string(o.prefix_cache_mb)); }
+                if (o.prefix_min_gain >= 0) { fargs.push_back("--prefix-min-gain"); fargs.push_back(std::to_string(o.prefix_min_gain)); }
                 std::vector<char*> fav;
                 for (auto& a : fargs) fav.push_back(a.data());
                 return run_forward_serve(int(fav.size()), fav.data());

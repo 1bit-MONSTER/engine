@@ -1,0 +1,32 @@
+# Carried patch, NOT authored here and NOT a `git format-patch` artifact (engine#1811 review).
+#
+# Upstream change: drm-misc-next-2026-10-16 (tag 41cec5feed4687aea2a59378b271faf363c7d938),
+# commit 3e32932d362b -- the 12-hex prefix is what was recorded; the full 40-hex id and the author were
+# not retained in this tree, so they are not stated. The paragraph below says the same thing.
+#
+# Applied by path (`git apply`), never by `git am`: nothing here reads these lines as authorship, and
+# an earlier version of this file DID invent them (a 41-character id, "upstream@drm-misc", midnight UTC),
+# which looks verifiable and is not. Provenance this file can actually support follows the subject.
+Subject: [PATCH] accel/amdxdna: Reject device heap BO when dev_mem_size is not set
+
+Carried from drm-misc-next-2026-10-16 (tag 41cec5feed4687aea2a59378b271faf363c7d938),
+upstream commit 3e32932d362b (12-hex prefix as recorded; full id not retained). Unmodified upstream change: it applies to our pinned
+xdna-driver (526c6081974e) both on the bare pin and on top of 0001-0010.
+Applied by: pi-kernel-74 (carried, not installed).
+---
+ amdxdna_gem.c
+diff --git a/drivers/accel/amdxdna/amdxdna_gem.c b/drivers/accel/amdxdna/amdxdna_gem.c
+--- a/drivers/accel/amdxdna/amdxdna_gem.c
++++ b/drivers/accel/amdxdna/amdxdna_gem.c
+@@ -1140,6 +1140,11 @@ amdxdna_drm_create_dev_heap_bo(struct drm_device *dev,
+ 	struct amdxdna_gem_obj *abo;
+ 	int ret;
+ 
++	if (!xdna->dev_info->dev_mem_size) {
++		XDNA_DBG(xdna, "Device heap is not supported");
++		return ERR_PTR(-EOPNOTSUPP);
++	}
++
+ 	WARN_ON(!is_power_of_2(xdna->dev_info->dev_mem_size));
+ 	XDNA_DBG(xdna, "Requested dev heap size 0x%llx", args->size);
+ 	if (!args->size || !IS_ALIGNED(args->size, xdna->dev_info->dev_mem_size)) {

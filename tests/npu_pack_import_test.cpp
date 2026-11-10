@@ -2483,6 +2483,56 @@ void test_fconst19_rule_table() {
     std::printf("fconst19 rule: measured row, unmeasured refusal, and the ambiguity guard all behave\n");
 }
 
+// engine#1831: the header-derived layout keeps EVERY in-block header the anchors support. #1819's version kept only the most
+// common residue and always wrote a 2-header block, so a Qwen3 4-header block (three equally frequent inner headers) was read
+// as 2-header with k_norm's header standing in for the post-attention one -- the engine#1003 misread, reintroduced.
+void test_fconst_block_headers() {
+    const int64_t stride = 1000;
+    auto blocks = [&](std::initializer_list<int64_t> inner, int nblocks, std::initializer_list<int64_t> noise) {
+        std::vector<int64_t> pos;
+        for (int b = 0; b < nblocks; ++b) {
+            pos.push_back(int64_t(b) * stride);                          // the block's own (first) header
+            for (const int64_t r : inner) pos.push_back(int64_t(b) * stride + r);
+        }
+        for (const int64_t q : noise) pos.push_back(q);                  // eps-SHAPED payload bytes: once or twice
+        std::sort(pos.begin(), pos.end());
+        return pos;
+    };
+    // 2-header (Qwen2.5/Llama): one inner header, 8 blocks, two coincidences elsewhere in the payload
+    {
+        const auto inner = pi::fconst_block_headers(blocks({400}, 8, {1234, 5678}), stride, 3);
+        check(inner.size() == 1 && inner[0] == 400, "block headers: a 2-header block yields its one inner header");
+        pi::FconstGeom g;
+        g.stride = stride;
+        check(pi::fconst_set_block_headers(g, inner) && g.period == 2 && g.h1 == 400 && g.hdr.size() == 1 &&
+                  g.post_attn_hdr() == 400,
+              "block headers: and is set as a 2-header block whose post-attention header is h1");
+    }
+    // 4-header (Qwen3): three inner headers repeating equally -- ALL must be kept, in order, so post_attn is the LAST one
+    {
+        const auto inner = pi::fconst_block_headers(blocks({300, 320, 340}, 8, {777}), stride, 3);
+        check(inner.size() == 3 && inner[0] == 300 && inner[1] == 320 && inner[2] == 340,
+              "block headers: a 4-header block yields all three inner headers, sorted (not just the most common one)");
+        pi::FconstGeom g;
+        g.stride = stride;
+        check(pi::fconst_set_block_headers(g, inner) && g.period == 4 && g.h1 == 300 && g.hdr.size() == 3 &&
+                  g.post_attn_hdr() == 340,
+              "block headers: and is set as a 4-header block whose post-attention header is the last one, not k_norm's");
+    }
+    // coincidences alone are not a header, and a count that is neither 1 nor 3 sets nothing
+    {
+        check(pi::fconst_block_headers(blocks({}, 8, {111, 222, 222}), stride, 3).empty(),
+              "block headers: payload coincidences that recur fewer than min_repeat times are not headers");
+        pi::FconstGeom g;
+        g.stride = stride;
+        g.h1 = 7;
+        check(!pi::fconst_set_block_headers(g, {100, 200}) && g.hdr.empty() && g.h1 == 7 && g.period == 0,
+              "block headers: two inner headers is not a known layout, and nothing is changed");
+        check(pi::fconst_block_headers({0, 1000, 2000}, 0, 1).empty(), "block headers: a zero stride yields nothing");
+    }
+    std::printf("  fconst block headers: 2-header and 4-header layouts kept whole; unknown counts refused\n");
+}
+
 // engine#1801's reviewer asked for the test that would catch the case the fix itself found once: the canonical .fconst copy is a
 // cache whose size is the pack's own .fconst, and on this box /tmp is tmpfs, so where it lands is a RAM decision. The bug was a
 // cache directory that was never created -- every pack then fell through to /tmp and nothing noticed.
@@ -3245,6 +3295,7 @@ int main(int argc, char** argv) {
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();
         test_fconst_scratch_order();
+        test_fconst_block_headers();
         test_selfcheck_reads_bf16();
         if (const char* rc = std::getenv("NPU_EMBED_COMPONENT")) dump_real_component(rc);
         test_model_config_geometry(golden_dir.empty() ? "." : golden_dir);

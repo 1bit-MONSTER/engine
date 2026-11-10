@@ -1391,32 +1391,49 @@ FconstGeom locate_fconst_with_header(const std::string& tok, const std::string& 
     // vote failing must not leave it at 0: with the stride known, the anchors' offsets *within* a block repeat, and the mode
     // of `pos mod stride` (excluding 0, the block start) is the second header. This is the same pool of anchors the vote
     // could not win on, used for a question that does not need a dominance test -- 28 blocks each contribute their residue.
+    // engine#1831: only when the vote did NOT record the block's headers. When it did, its list is the measurement
+    // (`plan()` reads 2-header vs 4-header from `hdr.size()`, and `post_attn_hdr()` is `hdr.back()`), and rewriting it
+    // to one entry turned every Qwen3 4-header 1.9 block into a 2-header one whose "post-attention" header was k_norm's.
+    if (!g.hdr.empty()) return g;
     const std::vector<int64_t> pos = eps_header_positions(tok, size_t(1) << 30, dims.eps_bits);
-    if (!pos.empty()) {
-        std::map<int64_t, int> off;
-        for (const int64_t q : pos) {
-            const int64_t r = q % stride8;
-            if (r > 0 && r < stride8) ++off[r];
-        }
-        int best = 0;
-        int64_t best_off = 0;
-        for (const auto& [o, n] : off)
-            if (n > best) { best = n; best_off = o; }
-        if (best_off > 0) {
-            // Populate the same fields `locate_fconst` would have: `hdr` is the in-block header list and the reader
-            // classifies a pack as a 2-header (one inner anchor) or 4-header (three) block from its SIZE. Setting only
-            // h1 left `hdr` empty, so a pack whose anchors could not win the vote was classified as "1 epsilon header"
-            // and every attention projection refused while the MLP imported byte-exact -- measured on Qwen2-7B 1.9.
-            // The scan window is the first GiB (about 8 blocks of this geometry), so the right residue repeats ~8 times
-            // against 1-2 for a payload coincidence. Requiring `layers/2` was too strict and silently dropped the real one.
-            if (best >= 3) {                             // the residue repeats across blocks: a real section boundary
-                g.h1 = best_off;
-                g.hdr.assign(1, best_off);               // 2-header block: q/k/v/o in one payload (Qwen2/Llama)
-                g.period = 2;
-            }
-        }
+    // The scan window is the first GiB (about 8 blocks at h3584), so a real section boundary repeats ~8 times against
+    // 1-2 for a payload coincidence; 3 separates them (requiring `layers/2` was too strict and dropped the real one).
+    const std::vector<int64_t> inner = fconst_block_headers(pos, stride8, 3);
+    if (!fconst_set_block_headers(g, inner)) {
+        g.why = "the 1.9 header gives stride " + std::to_string(stride8) + ", but the epsilon anchors repeat at " +
+                std::to_string(inner.size()) + " in-block offset(s), and a layer block has 1 (2-header) or 3 (4-header); "
+                "refusing rather than guessing the layout";
+        g.stride = 0;
     }
     return g;
+}
+
+// engine#1831: every in-block header offset the anchors support, sorted. A header at offset `r` of a block of `stride`
+// bytes lands at `r` modulo `stride` in every block, so the offsets that recur `min_repeat` or more times are the block's
+// section boundaries; offset 0 is the block start, not an inner header. ALL of them are kept rather than the most common
+// one: a Qwen3 block has three equally frequent inner headers, and keeping only the first maximum picked k_norm's.
+std::vector<int64_t> fconst_block_headers(const std::vector<int64_t>& pos, int64_t stride, int min_repeat) {
+    std::vector<int64_t> out;
+    if (stride <= 0) return out;
+    std::map<int64_t, int> count;
+    for (const int64_t q : pos) {
+        const int64_t r = q % stride;
+        if (r > 0) ++count[r];
+    }
+    for (const auto& [r, n] : count)
+        if (n >= min_repeat) out.push_back(r);   // std::map iterates in order, so `out` is sorted
+    return out;
+}
+
+// engine#1831: the fields `locate_fconst()` sets from the same list -- `hdr` (whose SIZE is the block layout), `h1` (its
+// first entry) and `period` (headers per block, counting the block's own). One inner header is a 2-header block
+// (Qwen2.5/Llama), three is a 4-header block (Qwen3); anything else is not a layout this reader knows, so nothing is set.
+bool fconst_set_block_headers(FconstGeom& g, const std::vector<int64_t>& inner) {
+    if (inner.size() != 1 && inner.size() != 3) return false;
+    g.hdr = inner;
+    g.h1 = inner.front();
+    g.period = int(inner.size()) + 1;
+    return true;
 }
 
 std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }

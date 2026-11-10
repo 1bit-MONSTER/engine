@@ -134,6 +134,13 @@ def to_q4_1(t):
 LAYER = {
     "attn_norm": "input_layernorm", "ffn_norm": "post_attention_layernorm",
     "attn_q_norm": "self_attn.q_norm", "attn_k_norm": "self_attn.k_norm",
+    # engine#2013: the GATED linear-attention (GateDeltaNet) families carry a per-layer attention gate under
+    # `blk.N.attn_gate.weight`; the container's name for it is `self_attn.gate_proj.weight`, which is what the forward
+    # looks up (npu/forward/src/model.c:1083, in the linear-attn section; q4nx_forward.h's `attn_output_gate`). Measured on
+    # this box's `bonsai2-unrot-q4_0.gguf`: every `blk.N.attn_gate.weight` is [5120, 6144] Q4_0, and 5120 x 6144 =
+    # 31,457,280 = 3840 x 8192, a whole number of 32 x 256 tiles, so the tiling check passes and the name is the only gap.
+    # Only some layers carry it (0, 1, 2, 4, 5, 6, 8, 9 in the first ten), so it is looked up per layer, never assumed.
+    "attn_gate": "self_attn.gate_proj",
     "attn_q": "self_attn.q_proj", "attn_k": "self_attn.k_proj", "attn_v": "self_attn.v_proj",
     "attn_output": "self_attn.o_proj",
     "ffn_gate": "mlp.gate_proj", "ffn_up": "mlp.up_proj", "ffn_down": "mlp.down_proj",

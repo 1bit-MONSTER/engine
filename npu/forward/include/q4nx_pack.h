@@ -170,6 +170,13 @@ void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out);
 void q4nx_host_gemm_f32_padded(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                               float* out);
 
+/* The integer arm of the same host path (engine#1808): int8 activation x int4 weight codes -> exact int32,
+ * which is what the kernel computes. Written for the bit-exactness gate, because the f32 host path cannot
+ * be bit-exact with an int8 device arm by construction; scales are applied by the caller on both sides so
+ * a scale mistake cannot hide inside the integer comparison. `codes` is [K][N], one int8 per element
+ * holding an int4 value in [-8, 7], exactly as the importer's packB lays it down. */
+void q4nx_host_gemm_i8(const int8_t* a8, int K, const int8_t* codes, int N, int32_t* out32);
+
 
 /* Architecture dims a design set is derived from. */
 typedef struct {

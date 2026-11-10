@@ -792,6 +792,14 @@ if(Python3_Interpreter_FOUND)
     # the whole run loop against canned completions, and re-derives the summary from the written transcript.  Stdlib
     # only, with no route, no socket, no dataset fetch and no device.
     add_test(NAME gsm8k_eval COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/gsm8k_eval_test.py)
+    # engine#1808: the kernel gate asks for "bit-exact against the host reference", but the only host arm the
+    # forward offers is f32 -- which cannot be bit-exact with an int8 x int4 device by construction. This pins
+    # the integer arm (q4nx_host_gemm_i8) against an independently generated known answer, including an
+    # activation of -128 so a naive int8 intermediate or an int32 saturation would show. Pure host, no device.
+    add_executable(npu_host_gemm_i8_test tests/npu_host_gemm_i8_test.cpp)
+    target_include_directories(npu_host_gemm_i8_test PRIVATE npu/forward/include ${CMAKE_SOURCE_DIR}/tests)
+    target_link_libraries(npu_host_gemm_i8_test PRIVATE onebit_npu)
+    add_test(NAME npu_host_gemm_i8 COMMAND npu_host_gemm_i8_test)
     # The repack's tile-order claim (engine#1110): `npu_plan.py` writes container.tile_order=engine-1 for every
     # plan, so the load-time guard (#1130) is green on a container whose TILES are another order.  This pins the
     # mapping from q4nx_diff's verdict to (stamp value, fatal), stdlib only: no model, no numpy, no device.

@@ -131,6 +131,25 @@ void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
     }
 }
 
+/* The integer arm of the same contract (engine#1808): the activation is already quantised to int8 by the
+ * engine's own rule (q4nx_quant_i8::row, which is byte-identical to its scalar reference), the weights are
+ * the container's int4 codes as the importer packed them, and the accumulation is EXACT int32 -- no float
+ * anywhere. That is what the kernel computes, so this is the only host reference a bit-exactness gate can
+ * be written against: the f32 path (below) cannot be bit-exact with int8 by construction.
+ *
+ * out32[n] = sum_k codes[k][n] * a8[k],  codes in [-8, 7], a8 in [-127, 127].
+ * Scaling (per-128-K group multiplier and the per-row activation scale) is deliberately NOT applied here:
+ * the gate compares the int32 exactly, and applies scales on both sides from the same inputs, so a scale
+ * mistake cannot hide inside the comparison. */
+void q4nx_host_gemm_i8(const int8_t* a8, int K, const int8_t* codes, int N, int32_t* out32) {
+    for (int n = 0; n < N; n++) out32[n] = 0;
+    for (int k = 0; k < K; k++) {
+        const int a = (int)a8[k];
+        const int8_t* row = codes + (size_t)k * (size_t)N;
+        for (int n = 0; n < N; n++) out32[n] += (int32_t)((int)row[n] * a);
+    }
+}
+
 void q4nx_host_gemm_f32_padded(const float* A, int a_k, int M, int K, int N, const float* Bmat,
                               float* out) {
     if (!A || !Bmat || !out || M <= 0 || K <= 0 || N <= 0) return;

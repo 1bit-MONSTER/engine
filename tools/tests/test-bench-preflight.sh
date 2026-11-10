@@ -167,5 +167,55 @@ else
     printf 'FAIL %-38s header does not name the load mode\n%s\n' "tally header states -lm" "$(cat "$tmp/lastout")"; fail=$((fail+1))
 fi
 
+# --dispatch must also OBSERVE the load mode, not only request it (engine #1668): llama.cpp puts a model it mmaps in
+# `/proc/<pid>/maps` and a model it only reads is not there. The bench below really maps or really reads the model and then
+# sleeps, so the observation has something to see; FAKE_BENCH_LM lets a case make the bench ignore `-lm`, which is the defect
+# the check exists for (a number the header mislabels).
+head -c 65536 /dev/urandom > "$tmp/models/big.gguf"      # non-empty: mmap of a zero-length file fails
+cat > "$tmp/mapbench" <<'PY'
+#!/usr/bin/env python3
+import mmap, os, sys, time
+a = sys.argv[1:]
+lm = a[a.index('-lm') + 1] if '-lm' in a else 'mmap'
+model = a[a.index('-m') + 1]
+mode = os.environ.get('FAKE_BENCH_LM') or lm          # a case sets this to make the bench disagree with -lm
+handle = keep = None
+if mode in ('mmap', 'mmap+mlock'):
+    handle = open(model, 'rb')
+    keep = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+else:
+    open(model, 'rb').read(4096)
+sys.stderr.write('ggml_hrx dispatch: common.mul_mat.q4_k_q8_1_x4_prefill\n')
+sys.stderr.write('| qwen3-4b | 2.30 GiB | 4B | HRX | 99 | 1 | pp512 | 3181.97 t/s |\n')
+time.sleep(0.7)
+assert keep is None or len(keep) == 65536          # the mapping must outlive the sleep
+PY
+chmod +x "$tmp/mapbench"
+
+lm_case() {  # lm_case <want: ok|no> <name> <PREFLIGHT_LM> [FAKE_BENCH_LM]
+    local want=$1 name=$2 lm=$3 fake_lm=${4:-} root out rc got
+    root=$(fake 3600 0 60)
+    out=$(PREFLIGHT_LM=$lm FAKE_BENCH_LM=$fake_lm PREFLIGHT_MODEL=$tmp/models/big.gguf \
+          patched "$root" --dispatch "$tmp/mapbench" 512 2>&1); rc=$?
+    got=ok; [ $rc -ne 0 ] && got=no
+    if [ "$got" = "$want" ]; then
+        printf 'ok   %-38s rc=%d\n' "$name" "$rc"; pass=$((pass+1))
+    else
+        printf 'FAIL %-38s rc=%d want=%s\n%s\n' "$name" "$rc" "$want" "$out"; fail=$((fail+1))
+    fi
+    printf '%s' "$out" > "$tmp/lastlm"
+}
+
+lm_case ok "observed mmap agrees with -lm mmap"        mmap
+lm_case ok "observed read agrees with -lm none"        none
+lm_case no "-lm none that actually mmapped is refused"  none mmap
+lm_case no "-lm mmap that only read is refused"         mmap none
+# The refusal has to say what it saw, or the reader cannot tell a mapping mismatch from a bench that never started.
+if grep -q 'is not the measurement the header claims' "$tmp/lastlm"; then
+    printf 'ok   %-38s names the mismatch\n' "the refusal names its reason"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s missing reason\n%s\n' "the refusal names its reason" "$(cat "$tmp/lastlm")"; fail=$((fail+1))
+fi
+
 printf '\nbench-preflight test: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

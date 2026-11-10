@@ -44,6 +44,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <thread>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -835,6 +837,102 @@ void test_external_import_success(const std::string& root) {
 // "<tensor>.qweight.empty: no data", which reports a placeholder as though the bytes were absent rather than elsewhere.
 // Crafted, so this needs no 1.9 pack: a graph with one resolvable tensor, one MatMulNBits whose qweight input is a
 // `.empty` placeholder with no sibling, and a model.bin next to it.
+// engine#1985: the canonical copy lives at a path every import of the same pack shares, and it used to be written in place.
+// A second import that started mid-write saw a short file, truncated it and wrote again, and the first then read its own
+// copy while it was being refilled: Qwen3-1.7B came back with 280 refused tensors and exit 0 in 4 of 24 runs of three
+// imports 0.15 s apart. The arms: the bytes arrive and no temporary file stays; a failed write leaves nothing; the
+// temporary name is out of reach of another import's prefix sweep and inside the age sweep; and the race itself, with
+// threads doing what an import does (reuse the copy if it is complete, else write it, then read it).
+void test_write_canonical_copy() {
+    const fs::path dir = fs::temp_directory_path() / ("1bit-atomic-" + std::to_string(::getpid()));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    const std::string prefix = "1bit-fconst19v1-7-2048-16-28-";
+    const std::string name = prefix + "957724736-1234.fconst";
+    const std::string work = (dir / name).string();
+    const size_t n = size_t(4) << 20;
+    std::vector<uint8_t> body(n);
+    for (size_t i = 0; i < n; ++i) body[i] = uint8_t((i * 2654435761u) >> 24) | 1;   // never 0: a refilled hole reads as 0
+    auto same = [&](const std::string& f) {
+        std::ifstream is(f, std::ios::binary);
+        if (!is) return false;
+        std::vector<uint8_t> got(n + 1);
+        is.read(reinterpret_cast<char*>(got.data()), std::streamsize(got.size()));
+        return size_t(is.gcount()) == n && std::memcmp(got.data(), body.data(), n) == 0;
+    };
+    auto entries = [&] {
+        int k = 0;
+        for (const auto& e : fs::directory_iterator(dir)) { (void)e; ++k; }
+        return k;
+    };
+
+    pi::write_canonical_copy(work, body.data(), n);
+    check(same(work), "atomic copy: the bytes written are the bytes at the path");
+    check(entries() == 1, "atomic copy: no temporary file is left beside the copy");
+    std::vector<uint8_t> other(body);
+    other[n / 2] ^= 0xff;
+    pi::write_canonical_copy(work, other.data(), n);
+    check(!same(work) && entries() == 1, "atomic copy: a second write replaces the copy, again leaving one file");
+    pi::write_canonical_copy(work, body.data(), n);
+
+    bool threw = false;
+    try {
+        pi::write_canonical_copy((dir / "no-such-dir" / name).string(), body.data(), n);
+    } catch (const std::runtime_error&) { threw = true; }
+    check(threw && entries() == 1, "atomic copy: a copy that cannot be written throws and leaves nothing behind");
+
+    // the temporary name: beside the copy, not the copy, unique per call, invisible to the prefix sweep, visible to the age sweep
+    const std::string t1 = pi::canonical_copy_temp_name(work), t2 = pi::canonical_copy_temp_name(work);
+    const std::string b1 = fs::path(t1).filename().string();
+    check(fs::path(t1).parent_path() == fs::path(work).parent_path(), "atomic copy: the temporary file is in the copy's directory");
+    check(t1 != work && t1 != t2, "atomic copy: the temporary name is not the copy's and is new on every call");
+    check(b1.compare(0, prefix.size(), prefix) != 0 && b1.compare(0, 13, "1bit-fconst19") == 0,
+          "atomic copy: the temporary name starts with the scratch stem and not with the pack's prefix");
+    { std::ofstream o(t1, std::ios::binary); o << "being written"; }
+    pi::evict_stale_canonical_copies(dir.string(), name, prefix, std::string(), 3600);
+    check(fs::exists(t1) && fs::exists(work), "atomic copy: another import's sweep does not remove a copy that is being written");
+    fs::last_write_time(t1, fs::file_time_type::clock::now() - std::chrono::hours(2));
+    pi::evict_stale_canonical_copies(dir.string(), name, prefix, std::string(), 3600);
+    check(!fs::exists(t1) && fs::exists(work), "atomic copy: a temporary file a killed run left is removed by the age rule");
+
+    // the race: every thread is an import. It reuses a complete-length copy or writes one, then reads the path, as
+    // canonical_token_fconst()'s caller does. One thread also removes the copy now and then, so the cycle restarts.
+    fs::remove(work, ec);
+    std::atomic<int> bad{0}, read_ok{0}, wrote{0};
+    auto importer = [&](int id) {
+        for (int r = 0; r < 24; ++r) {
+            if (!pi::canonical_copy_reusable(work, int64_t(n))) {
+                try { pi::write_canonical_copy(work, body.data(), n); ++wrote; } catch (const std::runtime_error&) { ++bad; }
+            }
+            std::error_code e2;
+            // An open that fails is the remover having been there, not a bad copy; a copy that OPENS must be whole.
+            if (std::ifstream(work, std::ios::binary).good()) {
+                std::ifstream is(work, std::ios::binary);
+                std::vector<uint8_t> got(n + 1);
+                if (is) {
+                    is.read(reinterpret_cast<char*>(got.data()), std::streamsize(got.size()));
+                    if (size_t(is.gcount()) == n && std::memcmp(got.data(), body.data(), n) == 0) ++read_ok;
+                    else ++bad;
+                }
+            }
+            if (id == 0 && r % 4 == 3) fs::remove(work, e2);
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int i = 0; i < 6; ++i) pool.emplace_back(importer, i);
+    for (auto& t : pool) t.join();
+    check(bad.load() == 0, "atomic copy: no import ever reads a copy another import is still writing (engine#1985)");
+    check(read_ok.load() > 0 && wrote.load() > 1, "atomic copy: the race arm really wrote more than once and read copies back");
+    int leftover = 0;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.path().filename().string() != name) ++leftover;
+    check(leftover == 0, "atomic copy: the race leaves no temporary files");
+    fs::remove_all(dir, ec);
+    std::printf("  atomic canonical copy: 11 arms (bytes, replace, failed write, temporary name x4, %d racing writes / %d reads, no leftovers)\n",
+                wrote.load(), read_ok.load());
+}
+
 // engine#1662: the ~291 MB canonical Token .fconst rewrite is skipped when the copy on the scratch path already holds
 // exactly the bytes this run would write. The decision is a length test against a length that is a function of the source
 // alone, so what can go wrong is the test being too willing -- a truncated copy from an interrupted run, a leftover
@@ -5473,6 +5571,7 @@ int main(int argc, char** argv) {
     test_external_container_names();
     test_external_packed_genre(golden_dir.empty() ? "." : golden_dir);
     test_external_import_success(golden_dir.empty() ? "." : golden_dir);
+        test_write_canonical_copy();
         test_canonical_copy_reusable();        test_evict_stale_canonical_copies();
         test_sweep_fconst_scratch_dirs();
         test_sweep_is_wired(golden_dir.empty() ? "." : golden_dir);

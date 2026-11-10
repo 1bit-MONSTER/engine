@@ -303,6 +303,16 @@ Plan plan(const std::string& pack_dir);
 // and a directory on the scratch path must all come back false.
 bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
 
+// engine#1985: how the canonical copy reaches `work`. It is written under canonical_copy_temp_name(work) -- a private name
+// in the same directory -- and renamed into place, so a concurrent import of the same pack finds no copy or a complete one,
+// never one that is being written. Writing in place let a second import truncate the file the first was about to read.
+// Throws std::runtime_error when the copy cannot be written or moved; the temporary file is removed on either failure.
+// Exposed so the rule has an arm that needs no pack (threads writing one path while a reader checks every complete-length
+// file it finds), and so the temporary name's two properties are pinned: a pack's sweep prefix never matches it, and the
+// age rule does.
+std::string canonical_copy_temp_name(const std::string& work);
+void write_canonical_copy(const std::string& work, const uint8_t* data, size_t len);
+
 // Removes the canonical Token .fconst copies in `dir` that nothing will reuse (engine#1770). Reuse writes a new copy when the
 // source changes rather than overwriting, so without this the scratch directory grows one multi-hundred-MB file per change; on
 // this box 699 files / 8.7 GiB of tmpfs. Three rules:

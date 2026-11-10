@@ -1135,6 +1135,15 @@ working directory's files are not the importer's to clean. The 6 hours are what 
 shared directory, so the number stays above the longest import; it is not the knob for disk or tmpfs pressure. The test suite sets one per run and
 removes it at exit.
 
+The cache directory is shared: every import of the same pack on the box uses the same file name. The copy is therefore
+written under a temporary name beside it (`1bit-fconst19tmp-<pid>-<n>-<name>`) and renamed into place, so an import finds
+either no copy or a complete one (engine#1985). Before that the copy was written in place, and two imports of one pack
+started a fraction of a second apart could leave the first reading a file the second had just truncated. The result was a
+wrong layout reading with exit 0: `Qwen3-1.7B` reported 280 refused tensors, `qk_norm` false and 0 measured tiles in 4 of
+24 runs of three imports 0.15 s apart, and 0 of 144 with the rename. A temporary file left by a killed run is removed by
+the 6-hour rule above. A binary older than this change still writes in place, so a box where old and new binaries import
+the same pack at the same moment can still show it.
+
 ### Linking the kernel set the container will be served with
 
 A model directory carries its own NPU kernels in `npu/` (see "A model directory"), and for an imported

@@ -22,6 +22,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
 #include <functional>
@@ -32,6 +33,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace onebit::npu::pack_import {
 namespace {
@@ -782,12 +784,8 @@ std::string canonical_token_fconst(const std::string& path, int hidden, int head
     }
     out.insert(out.end(), fc.map + tail_off, fc.map + fc.size);
     unmap_file(fc.map, fc.size);
-    {
-        std::ofstream os(work, std::ios::binary | std::ios::trunc);
-        if (!os) throw std::runtime_error(work + ": cannot write the canonical copy of the 1.9 .fconst");
-        os.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
-        if (!os) throw std::runtime_error(work + ": short write of the canonical copy of the 1.9 .fconst");
-    }
+    // engine#1985: never in place. The path is shared by every import of this pack on the box, see write_canonical_copy().
+    write_canonical_copy(work, out.data(), out.size());
     return work;
 }
 
@@ -6080,6 +6078,47 @@ int run(int argc, char** argv) {
     return 0;
 }
 
+
+// engine#1985: the temporary name a canonical copy is written under before it is renamed onto `work`. Same directory
+// (rename is only atomic inside one filesystem). The name starts with the scratch stem `1bit-fconst19`, so the age rule
+// of evict_stale_canonical_copies() removes one a killed run left behind, and continues with `tmp-`, so it can never
+// match a pack's `1bit-fconst19v<n>-...` prefix: another import's sweep must not delete a copy that is being written.
+std::string canonical_copy_temp_name(const std::string& work) {
+    static std::atomic<unsigned> serial{0};
+    const fs::path p(work);
+    const std::string base = "1bit-fconst19tmp-" + std::to_string(static_cast<long>(::getpid())) + "-" +
+                             std::to_string(serial.fetch_add(1)) + "-" + p.filename().string();
+    return (p.parent_path() / base).string();
+}
+
+// engine#1985: write the canonical copy under a private name and rename it onto `work`. The copy used to be written in
+// place with O_TRUNC, at a path every import of the same pack shares, and reuse is decided by length -- so a second
+// import that started while the first was still writing saw a short file, truncated it and began again, and the first
+// then read its own copy while it was being refilled. Measured on Qwen3-1.7B with three imports 0.15 s apart: 4 of 24
+// runs read "0 in-block offsets", refused all 280 attention tensors and exited 0, on a pack a lone import reads with 0
+// gaps. With a rename a reader finds no copy or a complete one, and two writers each install the same bytes.
+void write_canonical_copy(const std::string& work, const uint8_t* data, size_t len) {
+    const std::string tmp = canonical_copy_temp_name(work);
+    {
+        std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+        if (!os) throw std::runtime_error(tmp + ": cannot write the canonical copy of the 1.9 .fconst");
+        os.write(reinterpret_cast<const char*>(data), std::streamsize(len));
+        os.flush();
+        if (!os) {
+            os.close();
+            std::error_code rm;
+            fs::remove(tmp, rm);
+            throw std::runtime_error(tmp + ": short write of the canonical copy of the 1.9 .fconst");
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmp, work, ec);
+    if (ec) {
+        std::error_code rm;
+        fs::remove(tmp, rm);
+        throw std::runtime_error(work + ": cannot move the canonical copy of the 1.9 .fconst into place (" + ec.message() + ")");
+    }
+}
 
 // Public (engine#1662): see the declaration in pack_import.h. Lives outside the anonymous namespace because the test
 // calls it directly with crafted files, so the decision that guards a ~291 MB rewrite is pinned without a 1.9 pack.

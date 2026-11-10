@@ -269,6 +269,67 @@ the fix, 0 of 15 after. `llama-bench -p 512 -n 128 -r 3`, two runs each: Sarashi
 at 26.49 and 25.92 tok/s, stories15M Q8_0 at 317.77 and 338.54 tok/s (the box was shared; the same
 binary gave 545.39 tok/s on a quieter run).
 
+### Fixed: all-NaN logits after a large expert activation ([engine#1539](https://github.com/1bit-MONSTER/engine/issues/1539), [#1962](https://github.com/1bit-MONSTER/engine/issues/1962))
+
+`flint-40b-a2.5b` on `HRX0` answered some requests and then failed a later one with
+`HRX returned NaN logits: count=150144 of 150144`. The matmul kernels multiply in half precision, and a
+half-precision value ends at 65504. An FFN down-projection reads the SwiGLU output, which nothing
+normalises: flint's layer 46 reaches about 9.1e4 on an ordinary 22-token prompt. That value became
+`inf`, the sum over the routed experts `inf - inf = NaN`, and the NaN was stored as those tokens'
+keys and values. The request that overflowed still returned finite logits. The next, shorter request
+on the same slot found the stale NaN row inside its masked attention window and returned NaN for the
+whole vocabulary. So the failure depended on the prompt (which tokens drive an activation that large)
+and on the order of requests, not on memory, load or timing, and the CPU backend, which multiplies in
+single precision, was never affected.
+
+The routed-expert kernel (llama.cpp #284) and the dense kernel for single-precision activations
+(llama.cpp #285) now scale the activations by 2^-6 before the half-precision stage and scale the
+result back by 2^6. Both factors are powers of two, so values that fit before are rounded as before;
+the usable range moves from [6.1e-5, 6.55e4] to [3.9e-3, 4.19e6].
+
+Measured on gfx1151 (2026-11-10):
+
+- flint, the sequence that failed on 9 of 9 fresh loads (a 22-token request, then an 8-token one on
+  the same slot): 150144 of 150144 NaN before, 0 after; a read-back of all 3056 graph nodes finds no
+  non-finite value, and the first short request now returns the same logits as its repeat.
+- `test-backend-ops -o MUL_MAT_ID`: the new case at flint's shape with activations of 9.1e4 returned
+  NaN against the CPU's 56214.23 before, and passes after; the whole op is 845 of 845. `-o MUL_MAT`:
+  the 47 new large-activation cases went from 23 to 47 passing; the whole op is 589 of 589.
+- The range the shift gives up at the low end is not used by the models measured: the smallest
+  activation column maximum is 3.2e-2 on flint's expert down-projections (37278 columns) and 2.4e-2 on
+  the dense inputs of Qwen3-0.6B, Qwen3-4B, ZAYA1-8B and flint. Cases at those two values are in the
+  suite, so the shift has a test on each side.
+
+Still open under #1962: two prefill kernels that re-quantise the activations into 8-bit blocks
+(Q5_K and Q6_K weights at 512 tokens) keep a per-block term in half precision and still return NaN
+above 65504. And the limit is moved, not removed: an activation above 4.19e6 would overflow again.
+
+### Fixed: Qwen3-VL on `HRX0`: it decodes again, and its rotation runs on the device ([engine#1467](https://github.com/1bit-MONSTER/engine/issues/1467))
+
+Two faults, both in the text model's graph rather than in the projector:
+
+- **A refused view (llama.cpp #283).** A deepstack model adds a slice of the wide input embedding to each of
+  its first layers, taken as a view of a view. With the first view's node in another split, the HRX graph
+  never holds the wide tensor, the slice could not alias its input, and the graph was refused at
+  `unsupported HRX node 20: VIEW`. So Qwen3-VL-2B could not decode even text, and every image request failed
+  with it. Such a view is external to the graph and a layout op writes nothing, so the scheduler now skips it.
+- **The rotation on the CPU (llama.cpp #286).** The model's rotation is the interleaved multi-section one
+  with sections that do not collapse to the plain rotation, so 56 `ROPE` nodes per text graph ran on the CPU
+  and cut the graph into 114 splits. The two generic rotation kernels gained a mode that reads the position
+  section each pair selects; the text graph is now 2 or 3 splits with `PAD` (and `GET_ROWS` on token
+  batches) left on the CPU.
+
+Measured at pin `50d28600a` on gfx1151 (2026-11-10, power mode `performance`, Qwen3VL-2B-Instruct Q4_K_M with
+`mmproj-Qwen3VL-2B-Instruct-F16`): `test-backend-ops -o ROPE -b HRX0` 166/166; 12 greedy text tokens
+byte-identical to the CPU backend; `llama-bench -p 512 -n 64 -r 3` at 6,481 and 6,532 tok/s prefill, 133.7
+and 135.5 tok/s decode (2,331 and 57.8 before the rotation moved). `llama-server` with the projector on
+`HRX0`: the first request for the 448x448 test image takes 2.99 s (`prompt_ms` 2,782 for 227 prompt tokens)
+against the 16.97 s this issue was filed on, and answers "A red rectangle and a green circle."
+
+The projector's own graph still runs 103 of 626 nodes on the CPU for an image of that size (its 2-D rotation,
+the attention score matmul and softmax, `IM2COL`, `UPSCALE`); with it offloaded, encoding the image is no
+faster than with `--no-mmproj-offload` (0.5 to 1.1 s against 0.4 to 0.6 s).
+
 ### MoE decode and the kernel cache (llama.cpp #32, #33)
 
 - **MoE decode.** With one to four tokens, a `MUL_MAT_ID` (a MoE expert matmul) runs as a GEMV over

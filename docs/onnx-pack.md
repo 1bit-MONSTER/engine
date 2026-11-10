@@ -114,6 +114,25 @@ model.
 - **No vendor operators, ever.** If a shape has no kernel it goes to the CPU EP. That keeps the
   failure mode boring: a slower session, never a session that refuses to load because a custom domain
   is missing.
+- **…and the vendor's own components are the exception that proves it** (engine#2000). The bullet above
+  is about what *our* export emits. A 1.9 pack also carries the vendor's leftover graphs, and those are
+  written for their execution provider, not for ours: `Qwen3.5_4B_rai_1.9.0_npu`'s
+  `partitioned_patch1_sdgemm_leftover/vision.onnx` (84.7 MiB, with `.data` and `vision_strategy.yaml`)
+  has a clean ONNX interface — `pixel_values [num_patches,1536] f32` + `image_grid_thw [1,3] i64` →
+  `image_features [num_logical_patches,2560] f32` — and still will not load here. Its first strategy pass
+  is `qwen35_vision_stx.dynamic_pad`, and the graph is built on custom domains
+  (`com.ryzenai:DynamicPad`, then `matmul_add_to_sd_gemm`, `mha_to_sd_mha`, `conv_to_nhwc_conv`), so the
+  plain ONNX Runtime EPs reject it outright:
+
+  ```
+  Fatal error: com.ryzenai:DynamicPad(-1) is not a registered function/op
+  ```
+
+  with inputs built to the declared interface at bucket 1 of the three in `vision_strategy.yaml` — so
+  the failure is the operator, not the shape. **"The pack contains `vision.onnx`" does not mean there is
+  a portable graph to compare against.** For those components the compiled `partitioned/` route is the
+  only path, and there is no CPU-EP oracle for them: a correctness check on the vision tower has to be
+  built against the pack's own component, not against a reference run of the `.onnx` file.
 
 ## Where the numbers live
 

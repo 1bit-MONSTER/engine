@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include "batch_check_compare.h"
+#include "ops-dump.h"
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
@@ -2483,10 +2484,10 @@ struct BatchPhases {
         const double row = M > 0 ? (double)M : 1.0;
         std::fprintf(stderr,
                      "[bl] M=%2d gdn %7.1f ab %7.1f core %7.1f attn %6.1f mlp %6.1f rms %5.1f "
-                     "res %5.1f gemm %7.1f head %6.1f | per row: gdn %6.1f attn %5.1f "
+                     "res %5.1f gemm %7.1f head %6.1f deq %6.1f | per row: gdn %6.1f attn %5.1f "
                      "gemm %6.1f head %5.1f\n",
                      M, ms(LH_GDN), ms(LH_GDN_AB), ms(LH_GDN_CORE), ms(LH_ATTN), ms(LH_MLP),
-                     ms(LH_RMS), ms(LH_RES), gemm, ms(LH_HEAD_ROWS),
+                     ms(LH_RMS), ms(LH_RES), gemm, ms(LH_HEAD_ROWS), ms(LH_DEQ_OUT),
                      ms(LH_GDN) / row, ms(LH_ATTN) / row, gemm / row, ms(LH_HEAD_ROWS) / row);
     }
 };
@@ -3157,10 +3158,14 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         // 2026-11-10, the arm answered "ikt" to "The capital of France is" and then locked onto one token, while the
         // per-GEMM A/B read cos 0.9999 against f32 on the same tensors. Same packer, same bytes, same model.
         double ssum = 0.0;
-        // blocked=1: the image is written in the blocked microtile order, which is the fast path AND the layout the
-        // device actually reads, so the MAC below walks it with q4nx_layout::blocked_index(). (blocked=0 was measured
-        // at 174.5 s of warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.)
-        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, /*blocked=*/1, t.d.data(), &ssum);
+        // Blocked: the image is written in the blocked microtile order, which is the fast path AND the layout the
+        // device actually reads, so the MAC below walks it with the same index. (blocked=0 was measured at 174.5 s of
+        // warm-up on this container versus 32.2 s blocked -- the row-major scatter is the slow one.) But the image is
+        // UNPADDED, K*N bytes, and blocked_index() addresses whole 64x128 tiles: an N that is not a multiple of 128 (or
+        // a K not of 64) packs and reads past the vector (engine#1994). Those geometries take row-major, which holds
+        // the same codes, so the result is unchanged and only an unaligned shape pays the slower pack.
+        t.blocked = q4nx_layout::blocked_fits(K, N);
+        q4nx_pack_B_int8_blocked(t.codes.data(), Bmat, K, N, K, N, t.blocked ? 1 : 0, t.d.data(), &ssum);
         if (!cacheable) {
             scratch = std::move(t);
             cached = &scratch;
@@ -3200,11 +3205,19 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
         for (int n = 0; n < N; n++) {
             int32_t acc = 0;
             for (int k = 0; k < K; k++)
-                acc += (int32_t)((int)t.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, K, N)] *
+                acc += (int32_t)((int)t.codes[q4nx_layout::image_index((size_t)k, (size_t)n, K, N, t.blocked)] *
                                  (int)a8[(size_t)k]);
             dst[(size_t)n] = t.d[(size_t)n] * (ascale * (float)acc);
         }
     }
+}
+
+// NPU_INFER_DUMP_OPS (ops-dump.h): one line per projection, tagged with the tag its caller already passes
+// ("attn_qkv", "ssm_out", ...). Called where a projection's result is final -- both host arms and the device arm --
+// so a host run and a device run print the same lines. Row 0 of the result; off is one cached bool.
+static inline void op_line(const char* tag, int layer, int rows, const std::vector<float>& out, int n) {
+    if (onebit::npu::ops_dump_enabled() && n > 0 && out.size() >= (size_t)n)
+        onebit::npu::ops_dump(tag, layer, rows, out.data(), n);
 }
 
 void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
@@ -3217,9 +3230,11 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
         out.assign((size_t)N, 0.0f);
         if (host_gemm_i8_) {
             host_gemm_i8(A, a_k, 1, K, N, Bmat, wkey, out.data());
+            op_line(sc, cur_layer_, 1, out, N);
             return;
         }
         q4nx_host_gemm_f32_padded(A, a_k, 1, K, N, Bmat, out.data());
+        op_line(sc, cur_layer_, 1, out, N);
         return;
     }
     npu::target::GemvArgs a;
@@ -3228,7 +3243,8 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
     a.a_k = a_k;
     a.tiles = &Q4nxNpuForward::gemv_tile_cb; a.tiles_self = this;
     std::string err;
-    if (!xd_ || !xd_->gemv(a, out, err)) err_ = err.empty() ? "npu_gemm: no target" : err;
+    if (!xd_ || !xd_->gemv(a, out, err)) { err_ = err.empty() ? "npu_gemm: no target" : err; return; }
+    op_line(sc, cur_layer_, 1, out, N);
 }
 
 void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N,
@@ -3240,9 +3256,11 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         out.assign((size_t)M * N, 0.0f);
         if (host_gemm_i8_) {
             host_gemm_i8(A, a_k, M, K, N, Bmat, wkey, out.data());
+            op_line(sc, cur_layer_, M, out, N);
             return;
         }
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
+        op_line(sc, cur_layer_, M, out, N);
         return;
     }
     // The device's activation BO holds exactly max_batch_rows() rows (the M=128 prefill design), and a wider
@@ -3262,6 +3280,9 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             if (note && note[0]) { std::fprintf(stderr, "  [batch] %s\n", note); note_said = true; }
         }
         out.assign((size_t)M * N, 0.0f);
+        // NPU_INFER_DUMP_OPS: the blocks are one projection, so they print one line (rows=M, row 0), as the host
+        // arms do; the inner launches are muted for the length of the walk.
+        onebit::npu::OpsDumpMute ops_mute;
         for (int b0 = 0; b0 < M && err_.empty(); b0 += blk) {
             const int rows = std::min(blk, M - b0);
             std::vector<float> part;
@@ -3273,6 +3294,12 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             }
             std::copy(part.begin(), part.begin() + (size_t)rows * N, out.begin() + (size_t)b0 * N);
         }
+        // Printed by hand: op_line() would be muted by this scope's own guard. A nested walk stays quiet.
+        if (err_.empty() && onebit::npu::ops_dump_enabled() && onebit::npu::ops_dump_mute_depth() == 1) {
+            char line[192];
+            if (onebit::npu::ops_dump_line(line, sizeof line, sc, cur_layer_, M, out.data(), N) > 0)
+                std::fputs(line, stderr);
+        }
         return;
     }
     npu::target::GemvArgs a;
@@ -3282,7 +3309,8 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     a.rows = true; a.decode_twin = decode_twin;
     a.tiles = &Q4nxNpuForward::gemv_tile_cb; a.tiles_self = this;
     std::string err;
-    if (!xd_ || !xd_->gemv(a, out, err)) err_ = err.empty() ? "npu_gemm_rows: no target" : err;
+    if (!xd_ || !xd_->gemv(a, out, err)) { err_ = err.empty() ? "npu_gemm_rows: no target" : err; return; }
+    op_line(sc, cur_layer_, M, out, N);
 }
 
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
@@ -3662,7 +3690,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             // One row of attention.  `append` is the K/V cache append, `kvlen` is how many cached
             // positions to read (0 = up to and including `pos`, i.e. causal), and `dst` receives the
             // context -- null when the pass only fills the cache (the noncausal first pass below).
-            auto row_attn = [&](int m, float* dst, bool append, int kvlen) -> bool {
+            auto row_attn = [&](int m, float* dst, bool append, int kvlen,
+                                std::vector<float>* q_keep = nullptr) -> bool {
                 {
                     CpScope _cp(CP_QKV);
                     qkv_row.assign(QKV.begin() + (size_t)m * g->N,
@@ -3697,9 +3726,10 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 }
                 if (!attention(*in, start_pos + m, pos3_ ? trio : nullptr, dst ? ctx_row : ctx_scratch,
                                l_hd, l_nkv, l_theta,
-                               l_rot, l_prop, l_win, l, append, kvlen)) {
+                               l_rot, l_prop, l_win, l, append, kvlen, q_keep)) {
                     err_ = "attention failed"; return false;
                 }
+                if (q_keep) return true;       // prepare only: q is in *q_keep, k/v are in the cache
                 if (!dst) return true;
                 if (gate_ptr)
                     for (int i = 0; i < nhd; i++)
@@ -3715,7 +3745,62 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             // hold all M rows before any of them attends -- a row's keys come from the same layer, and
             // the rows after it only exist once their projections ran.  The GDN layers keep their own
             // causal recurrence (the reference keeps it too), and a sliding layer stays causal.
-            if (noncausal_attn_ && l_full) {
+            // engine#1990: one thread team for the layer's M rows instead of one per row. Every row's
+            // position-local half runs first (q, and its k/v appended -- a causal row reads only positions up
+            // to its own, so the later rows already being in the cache changes nothing it reads), then all
+            // (row, head) pairs are one work-shared loop. NPU_ATTN_ROWS=0 keeps the per-row form for an A/B;
+            // NPU_ATTN_CHECK=1 recomputes every row that way and fails the pass on any differing bit.
+            static const bool attn_rows_on = [] {
+                const char* e = getenv("NPU_ATTN_ROWS");
+                return !(e && e[0] == '0');
+            }();
+            static const bool attn_check = [] {
+                const char* e = getenv("NPU_ATTN_CHECK");
+                return e && e[0] == '1';
+            }();
+            if (attn_rows_on && M > 1 && l_hd > 0 && c_.NH % l_nkv == 0) {
+                const bool whole = noncausal_attn_ && l_full;
+                const size_t qw = (size_t)nhd;
+                std::vector<float> qall((size_t)M * qw), qm;
+                std::vector<int> Tm((size_t)M), t0m((size_t)M);
+                for (int m = 0; m < M; m++) {
+                    if (!row_attn(m, nullptr, true, 0, &qm)) return false;
+                    if (qm.size() != qw) { err_ = "attention rows: q width"; return false; }
+                    memcpy(qall.data() + (size_t)m * qw, qm.data(), qw * sizeof(float));
+                    const int T = whole ? start_pos + M : start_pos + m + 1;
+                    Tm[(size_t)m] = T;
+                    t0m[(size_t)m] = (l_win > 0 && T > l_win) ? T - l_win : 0;
+                }
+                {
+                    LhScope _t_attn(LH_ATTN);
+                    const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)l_hd);
+                    const int nt = ((long)M * (start_pos + M) * l_hd >= 8192) ? omp_heads_threads() : 1;
+                    q4nx_attn::rows_context(qall.data(), kcache_[l].data(), vcache_[l].data(), M, c_.NH, l_nkv,
+                                            l_hd, Tm.data(), t0m.data(), scale, CTX.data(), nt);
+                    if (attn_gate_)
+                        for (int m = 0; m < M; m++) {
+                            const float* gate = QKV.data() + (size_t)m * g->N + nhd;
+                            float* c = CTX.data() + (size_t)m * ctx_w;
+                            for (int i = 0; i < nhd; i++) c[i] *= 1.0f / (1.0f + expf(-gate[i]));
+                        }
+                }
+                if (attn_check) {
+                    std::vector<float> ref((size_t)ctx_w);
+                    size_t differing = 0;
+                    for (int m = 0; m < M; m++) {
+                        if (!row_attn(m, ref.data(), false, Tm[(size_t)m])) return false;
+                        const float* c = CTX.data() + (size_t)m * ctx_w;
+                        for (int i = 0; i < ctx_w; i++)
+                            if (memcmp(&c[i], &ref[(size_t)i], sizeof(float)) != 0) differing++;
+                    }
+                    fprintf(stderr, "[attncheck] l=%d M=%d start=%d one-team vs per-row: %zu values %s\n", l, M,
+                            start_pos, (size_t)M * ctx_w, differing ? "MISMATCH" : "identical");
+                    if (differing) {
+                        err_ = "attention rows: the one-team form differs from the per-row form";
+                        return false;
+                    }
+                }
+            } else if (noncausal_attn_ && l_full) {
                 for (int m = 0; m < M; m++)
                     if (!row_attn(m, nullptr, true, 0)) return false;
                 for (int m = 0; m < M; m++)
@@ -4017,7 +4102,7 @@ int Q4nxNpuForward::max_batch_rows() const {
 // --------------------------------------------------------------------------
 // host helpers (float32, matching the Python reference)
 // --------------------------------------------------------------------------
-float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out) const {
+float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out, const char* tag) const {
     LhScope _tlh(LH_RMS);
     double ss = 0.0;
     for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
@@ -4028,6 +4113,8 @@ float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out)
     } else {
         for (int i = 0; i < n; i++) out[i] = x[i] * inv * w[i];
     }
+    // NPU_INFER_DUMP_OPS: the norm's own output, so a divergence can be put on the norm and not on its layer.
+    if (onebit::npu::ops_dump_enabled()) onebit::npu::ops_dump(tag, cur_layer_, 1, out, n);
     return inv;
 }
 
@@ -4448,7 +4535,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
                                std::vector<float>& ctx, int head_dim,
                                int n_kv_heads, float theta, int rotary_dim,
                                bool proportional, int window,
-                               int kv_layer, bool append_kv, int kv_len) {
+                               int kv_layer, bool append_kv, int kv_len, std::vector<float>* q_out) {
     const int NH = c_.NH;
     const int HD = head_dim;      /* per layer type (Gemma4: 256 or 512) */
     const int NKV = n_kv_heads;
@@ -4471,12 +4558,12 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     if (sem_.qk_norm) {
         std::vector<float> t(HD);
         for (int h = 0; h < NH; h++) {
-            rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data());
+            rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data(), "q_norm");
             memcpy(&q[(size_t)h * HD], t.data(), sizeof(float) * HD);
         }
         if (append_kv) {
             for (int h = 0; h < NKV; h++) {
-                rmsnorm(&k[(size_t)h * HD], k_norm_[cur_layer_].data(), HD, t.data());
+                rmsnorm(&k[(size_t)h * HD], k_norm_[cur_layer_].data(), HD, t.data(), "k_norm");
                 memcpy(&k[(size_t)h * HD], t.data(), sizeof(float) * HD);
             }
         }
@@ -4555,6 +4642,13 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         vcache_[kv_layer].insert(vcache_[kv_layer].end(), v.begin(), v.end());
     }
 
+    // engine#1990: a batched pass asks for the position-local half only -- the q this row attends with, and its
+    // k/v in the cache -- and runs the read for all of its rows in one thread team (q4nx_attn::rows_context).
+    if (q_out) {
+        q_out->swap(q);
+        return true;
+    }
+
     // kv_len > 0 is a noncausal read: attend over that many cached positions instead of only the ones
     // up to `pos`.  Everything above (rope, qk-norm, the cache append) is position-local and unchanged.
     const int T = kv_len > 0 ? kv_len : pos + 1;
@@ -4576,30 +4670,9 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     {
         std::vector<float> score(T);
 #pragma omp for schedule(static)
-        for (int h = 0; h < NH; h++) {
-            const int kh = h / gqa;
-            const float* qh = &q[(size_t)h * HD];
-            float mx = -1e30f;
-            for (int t = 0; t < T; t++) {
-                if (t < t0) { score[t] = -1e30f; continue; }
-                const float* kt = &kcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-                score[t] = q4nx_attn::dot(qh, kt, HD) * scale;
-                if (score[t] > mx) mx = score[t];
-            }
-            float sum = 0.0f;
-            for (int t = 0; t < T; t++) {
-                if (t < t0) { score[t] = 0.0f; continue; }
-                score[t] = std::exp(score[t] - mx);
-                sum += score[t];
-            }
-            const float inv = sum > 0 ? 1.0f / sum : 0.0f;
-            float* out = &ctx[(size_t)h * HD];
-            for (int t = t0; t < T; t++) {
-                const float p = score[t] * inv;
-                const float* vt = &vcache_[kv_layer][((size_t)t * NKV + kh) * HD];
-                q4nx_attn::saxpy(p, vt, out, HD);
-            }
-        }
+        for (int h = 0; h < NH; h++)
+            q4nx_attn::head_context(&q[(size_t)h * HD], kcache_[kv_layer].data(), vcache_[kv_layer].data(), NKV,
+                                    h / gqa, HD, t0, T, scale, score.data(), &ctx[(size_t)h * HD]);
     }
     return true;
 }
@@ -5362,12 +5435,15 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
                 c.codes.assign((size_t)H * (size_t)Tn, 0);
                 c.d.assign((size_t)Tn, 0.0f);
                 double ssum = 0.0;
-                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, /*blocked=*/1, c.d.data(), &ssum);
+                // The last vocabulary block is rarely whole tiles (phi-3-mini: 32064 % 8192 = 7488, not a multiple of
+                // 128), and this image is unpadded, so it takes the layout its geometry fits (engine#1994).
+                c.blocked = q4nx_layout::blocked_fits(H, Tn);
+                q4nx_pack_B_int8_blocked(c.codes.data(), bt.data(), H, Tn, H, Tn, c.blocked ? 1 : 0, c.d.data(), &ssum);
             }
             for (int n = 0; n < Tn; n++) {
                 int32_t acc = 0;
                 for (int k = 0; k < H; k++)
-                    acc += (int32_t)((int)c.codes[q4nx_layout::blocked_index((size_t)k, (size_t)n, H, Tn)] *
+                    acc += (int32_t)((int)c.codes[q4nx_layout::image_index((size_t)k, (size_t)n, H, Tn, c.blocked)] *
                                      (int)a8i[(size_t)k]);
                 float v = c.d[(size_t)n] * (ascale * (float)acc);
                 if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);

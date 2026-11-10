@@ -266,9 +266,8 @@ add_test(NAME copyright_gate COMMAND ${CMAKE_SOURCE_DIR}/tests/copyright_gate_te
 # engine#1701: the NPU hold's queue/token follow ONEBIT_HOLD_DIR, and its queue settings never reach the payload.
 # Shell only (a stub gpu-hold plus the tree's own), no device, ~1 s.
 add_test(NAME npu_hold COMMAND bash ${CMAKE_SOURCE_DIR}/tests/npu_hold_test.sh)
-# engine#1696: the gpu_hold_* registrations live in their own file, so adding one does not conflict with every
-# other test-adding PR through the one contiguous add_test block this used to be part of (see that file's header).
-include(cmake/tests-gpu-hold.cmake)
+# engine#1696: the gpu_hold_* registrations live in cmake/tests-gpu-hold.cmake. It is no longer named here: every
+# cmake/tests-*.cmake is included by the glob near the end of this file (engine#1979).
 # engine#1485: the two port read-backs the route tests use (tests/serve_port.sh). Script-based, no device, no model --
 # it feeds the parsers the exact lines `1bit serve` and `llama-server` print, because a read-back that silently returns
 # empty turns into "the server did not come up" and is blamed on whatever the row under test checks.
@@ -337,6 +336,11 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # engine#1702: builds a per-layer MoE expert placement table from a moe_trace, and refuses a prefill-only trace because
 # placement is a decode lever (5.4-6.9 % on batched prefill against dedup's 90-94 %). --self-test drives it on synthetic
 # traces with a known answer; no model, no device.
+# engine#1934: reading ONE tensor out of a safetensors shard needs `data_offsets` measured from 8 + header_len, not
+# from byte 8. Getting that wrong returns a *different* tensor of the same size that still looks finite, and it cost
+# two false conclusions about a pack in one night. `--self-test` drives the rule on a synthetic shard (no network):
+# the same offset from the data section returns the tensor, from byte 8 it does not.
+add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-test)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
@@ -1235,6 +1239,14 @@ target_link_libraries(npu_pack_test PRIVATE onebit_npu)
 # golden fixture that pins them.
 target_include_directories(npu_pack_test PRIVATE npu/forward/include ${CMAKE_SOURCE_DIR}/tests)
 
+# NPU_INFER_DUMP_OPS (npu/forward/include/ops-dump.h, engine#1503): the on/off rule, the mean|x|/absmax arithmetic and
+# the line's text. Header-only, no device. `add_dependencies(onebit ...)` is what gets it built in CI, whose target
+# list is explicit (tools/ci/ci_targets_check.py).
+add_executable(ops_dump_test tests/ops_dump_test.cpp)
+target_include_directories(ops_dump_test PRIVATE npu/forward/include)
+add_test(NAME ops_dump COMMAND ops_dump_test)
+add_dependencies(onebit ops_dump_test)
+
 # The device weight layout contract (q4nx_weight_layout): pure index math, no device
 # and no runtime.  CI builds an explicit target list, so the check compiles itself with
 # the build's compiler at test time (tests/npu_blocked_layout_test.sh) rather than being
@@ -1340,6 +1352,11 @@ add_test(NAME quant_i8_row COMMAND quant_i8_row_test)
 add_executable(attn_math_test tests/attn_math_test.cpp)
 target_include_directories(attn_math_test PRIVATE npu/forward/include)
 add_test(NAME attn_math COMMAND attn_math_test)
+# engine#1990: the test also holds rows_context() (M rows in one thread team) to the per-row form bit for bit,
+# and that comparison is only about threads when the test has them.
+if(TARGET OpenMP::OpenMP_CXX)
+    target_link_libraries(attn_math_test PRIVATE OpenMP::OpenMP_CXX)
+endif()
 # ci.yml's build step names its targets explicitly and needs the `workflow` scope to extend, so bind each new
 # test binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add these to the list itself. `host_gemm_pad_test` is here for the
@@ -1743,6 +1760,42 @@ if(ONEBIT_NPU_PRIVATE)
         target_compile_definitions(onebit PRIVATE ONEBIT_NPU_DX_KERNELS_DEFAULT="${ONEBIT_NPU_DX_KERNELS}")
     endif()
 endif()
+
+# ── Test registrations that live in their own file (engine#1696, engine#1979) ─
+# Every cmake/tests-*.cmake is included here, in name order. A test added as a NEW file there touches no line any
+# other pull request touches, so it cannot conflict and its registration cannot go stale while the PR waits: 37 commits
+# changed this file in the 24 h before engine#1979 was filed, and three open PRs had a registration hunk that no longer
+# applied. The rows above stay where they are; nothing has to move.
+# Here, after every target and after find_package(Python3), so a file may use if(TARGET ...), add_python_test() and
+# ${Python3_EXECUTABLE}; and before the RESOURCE_LOCK loop below, which asks if(TEST ...).
+# CONFIGURE_DEPENDS re-runs the glob at build time, so a file added after the first configure is picked up.
+# Readers that follow this shape: tools/ci/ci_targets_check.py (the glob), tools/ci/hrx_build_scope.py and
+# .github/workflows/hrx-build.yml (the cmake/tests-*.cmake path), tools/ci/tests_referenced_check.py (all of cmake/).
+# The lines between the two markers are run as they stand by tests/registration_glob_test.sh, in a scratch project.
+# >>> registration glob
+file(GLOB ONEBIT_TEST_REGISTRATION_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tests-*.cmake)
+list(SORT ONEBIT_TEST_REGISTRATION_FILES)
+# A file this CMakeLists.txt already include()s by name is skipped: that include fixes the file's position (some rows
+# need one), and including it twice stops the configure with `add_test given test NAME ... which already exists`. So a
+# family file moved out with its own include() line and this glob can land in either order.
+# "By name" means a line CMake would execute -- include( at the start of a line, the same rule
+# tools/ci/ci_targets_check.py reads by -- and not the same text in a comment: a substring search took
+# `# was include(cmake/tests-gpu-hold.cmake)` for an include, and the seven gpu_hold_* tests left the configuration with
+# every gate green (review of engine#1983). An include this pattern does not recognise is the loud miss: both includes
+# run and the configure stops.
+file(READ ${CMAKE_CURRENT_LIST_FILE} _onebit_top_cmake_text)
+set(_onebit_include_prefix "(^|\n)[ \t]*include\\([ \t]*\"?(\\$\\{CMAKE_(CURRENT_)?SOURCE_DIR\\}/)?cmake/")
+foreach(_onebit_test_registration_file IN LISTS ONEBIT_TEST_REGISTRATION_FILES)
+    get_filename_component(_onebit_test_registration_name ${_onebit_test_registration_file} NAME)
+    string(REGEX REPLACE "([.+])" "\\\\\\1" _onebit_test_registration_re "${_onebit_test_registration_name}")
+    string(REGEX MATCH "${_onebit_include_prefix}${_onebit_test_registration_re}\"?[ \t]*\\)" _onebit_named
+           "${_onebit_top_cmake_text}")
+    if(_onebit_named STREQUAL "")
+        include(${_onebit_test_registration_file})
+    endif()
+endforeach()
+unset(_onebit_top_cmake_text)
+# <<< registration glob
 
 # ── Loopback ports: route tests run one at a time (engine#1070) ──────────────
 # Every test named below starts a server on 127.0.0.1. Most pick a port by binding :0, closing the

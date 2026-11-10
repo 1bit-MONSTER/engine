@@ -684,7 +684,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp
                             npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
@@ -1191,6 +1191,12 @@ if(ONEBIT_NPU_CAPTURED AND ONEBIT_NPU_PDI AND ONEBIT_NPU_GOLDEN)
 endif()
 
 # Q4NX chunk decoders against 1bit-MONSTER's verified decoders, on committed real tiles
+# engine#1788: the vision component reader (vision_weight.q4nx). Crafted containers for every refusal; the published
+# pack's own numbers when ONEBIT_MINICPM_PACK names a MiniCPM-V 4.7 pack directory.
+add_executable(npu_vision_pack_test tests/npu_vision_pack_test.cpp)
+target_link_libraries(npu_vision_pack_test PRIVATE onebit_npu)
+add_test(NAME npu_vision_pack COMMAND npu_vision_pack_test)
+add_dependencies(onebit npu_vision_pack_test)
 add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)

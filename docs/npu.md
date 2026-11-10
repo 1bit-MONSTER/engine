@@ -1448,6 +1448,50 @@ selections per layer touch nearly all 128 experts and stream ~18 GB. MoE prefill
 GPU route (`--moe-prefetch`, docs/serve.md); this is the thing that decides whether a kernel is
 right.
 
+### A pack's vision component (`vision_weight.q4nx`, engine#1788)
+
+FastFlowLM's MiniCPM-V 4.7 packs are two containers at the pack root: `model.q4nx` (the text model) and
+the file `config.json` names as `vision_model_weight`, `vision_weight.q4nx` (the vision tower). The
+second is the same container format holding a ViT: every tensor BF16, no tiles. `npu/vision_pack.h`
+reads it, and `1bit npu-pack vision <pack dir>` prints what it found:
+
+```
+$ 1bit npu-pack vision MiniCPM-V-4.7-35B-A3B-NPU2
+vision component  MiniCPM-V-4.7-35B-A3B-NPU2/vision_weight.q4nx
+tensors           347, all BF16, 1144548352 B of payload, 0 B unaccounted
+patch embed       14 x 14 pixels x 3 channels -> 1152
+positions         4900 (a 70 x 70 grid; image 980)
+blocks            27 at width 1152, 16 heads x 72, MLP 4608
+vit_merger        attention at 1152, MLP 4608 -> 17280 -> 1152
+merger            4608 -> 4608 -> 2048 (the text model's hidden size)
+note              config.json states MINICPM_V_VISION_MLP_INTERMEDIATE_SIZE 4304; model.visual.blocks.*.mlp.linear_fc1.weight has 4608 rows, and the tensor is what is used
+note              config.json states MINICPM_V_VIT_MERGER_INTERMEDIATE_SIZE 17216; model.visual.vit_merger.mlp.linear_fc1.weight has 17280 rows, and the tensor is what is used
+```
+
+This is a reader, not a forward: nothing runs the tower yet. What it settles is what a forward may
+rely on.
+
+- **Sizes come from the tensors.** The geometry is derived from the tensors' own shapes, and every
+  tensor must have the shape the others imply. Both published packs state two MLP widths in
+  `config.json` that their tensors do not have (the two `note` lines above); a loader that sized a
+  buffer from the config would read 304 rows into the neighbouring tensor and return plausible
+  numbers. Those two fields are reported and overruled.
+- **Zero gaps.** A tensor the reader has no place for is a refusal, as is a missing one, a hole in the
+  block indices, a tensor that is not BF16, an extent that is not its shape's byte length, an extent
+  outside the payload, and two tensors on the same bytes. Each names the tensor.
+- **`config.json` is consulted for what the tensors cannot say** (the head count, the image size) and
+  refused where the two cannot both be right: heads that do not multiply to the width, an image size
+  that is not the position grid times the patch, another width, block count or position count, and a
+  text `hidden_size` that is not what the merger projects to. That last one is a tower paired with the
+  wrong text model.
+- **Provenance** is whatever `__metadata__` carries. The 1B pack's container names its source file and
+  a SHA-256 of it; the 35B-A3B's carries none.
+
+The two published packs have the same tower geometry and different weights: none of the 347 tensors is
+byte-identical between them (measured 2026-11-10), so code written against one serves the other, and
+a numerical reference for one says nothing about the other. Pinned by `tests/npu_vision_pack_test.cpp`
+on crafted containers; `ONEBIT_MINICPM_PACK=<pack dir>` adds the published pack's own numbers.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU

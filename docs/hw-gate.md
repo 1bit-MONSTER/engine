@@ -78,13 +78,13 @@ hrx-system) through `cmake/hrx.cmake`, then links `onebit` with its HRX wiring.
   add-on (the gate builds that) and does not dispatch anything. Green means the pinned pair builds into the engine. It
   does not replace the `hw-gate` label on a pin bump.
 
-> **Since 2026-11-09 this job is red on every branch, so a red badge is not a signal** (engine #1733). Three errors sit in
-> `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as `bool`, and two declarations
-> that differ only in return type — i.e. the fork's source no longer compiles against the fork's own headers, and the pin-bump
-> PR #1681 does not change it (its own `hrx_build` fails at 9m15s while `build` is green). Measured on five unrelated branches
-> and on the last eight runs of this workflow, all failures. Until the fork is fixed, read `hrx_build` as **unavailable**, not as
-> failing: a red run says nothing about the change under it, and there is no green run left to compare against. It is the same
-> shape as #1595 in the opposite direction — a red job nobody can act on stops being a check.
+> **Between about 21:0x and 23:1x on 2026-11-09 this job failed on every branch, and a red badge was not a signal** (engine #1733).
+> Three errors sat in `third_party/llama.cpp`'s own HRX backend — `ggml-hrx.cpp:517,610,854`: a `void` return tested as
+> `bool`, and two declarations that differ only in return type — on every branch measured (five of them), and #1681's pin bump
+> failed the same way at 9m15s while its `build` was green. The window is closed: later runs pass, including one whose pins are
+> **exactly `main`'s** (`bump-hrx/831629fe`, 00:21, `llama.cpp` `831629fe9` + `hrx-system` `7f4236924`), so the failure was not a
+> property of the pins in the tree — which is what the same pins failing four hours earlier had seemed to say. Read a red badge as
+> meaningful again; if it returns, that run's own log is the evidence, not the earlier window.
 
 ## What it checks
 

@@ -22,8 +22,10 @@ index 6b8653a..75bc573 100644
 +	 * Only a context that actually came back may take work.  Unpausing on the
 +	 * failure path submitted jobs to a context firmware no longer has, and the
 +	 * only visible symptom was an NPU that had "restarted" and then silently
-+	 * stopped answering (engine#1750).  A context that failed stays paused, so
-+	 * its jobs get a clean, attributable failure instead of a wedge.
++	 * stopped answering (engine#1750).  A context that failed stays paused, which
++	 * is what THIS path fixes; it is not yet a clean failure, because
++	 * aie2_hwctx_fini() unpauses unconditionally and that RUNS parked jobs
++	 * instead of failing them (engine#1855, the remaining half of #1750).
 +	 */
 +	if (!ret) {
 +		XDNA_DBG(xdna, "%s restarted", hwctx->name);

@@ -354,6 +354,7 @@ def family_text(root, cmake_text):
     tracks a guard stack across the text this returns.
     """
     out = []
+    seen = set()
     # a glob the include loop iterates: every file matching it is configured, so every one is read
     for gvar, pattern in GLOB.findall(cmake_text):
         # the loop variable differs from the glob variable: `foreach(v IN LISTS GLOBVAR) include(${v})`
@@ -362,12 +363,16 @@ def family_text(root, cmake_text):
             continue
         pat = pattern.replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
         for path in sorted(glob.glob(os.path.join(root, pat))):
-            if os.path.isfile(path):
+            if os.path.isfile(path) and os.path.realpath(path) not in seen:
+                seen.add(os.path.realpath(path))
                 out.append(open(path, encoding="utf-8").read())
     for m in INCLUDE.finditer(cmake_text):
         rel = m.group(1).replace("${CMAKE_SOURCE_DIR}/", "").replace("${PROJECT_SOURCE_DIR}/", "")
         path = os.path.join(root, rel)
-        if os.path.isfile(path):
+        # engine#1979: a file both named by a literal include() and matched by the glob is configured once
+        # (CMakeLists.txt skips it in the glob loop), so it is read once.
+        if os.path.isfile(path) and os.path.realpath(path) not in seen:
+            seen.add(os.path.realpath(path))
             out.append(open(path, encoding="utf-8").read())
     return "\n".join(out)
 

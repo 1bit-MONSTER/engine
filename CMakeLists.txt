@@ -1721,9 +1721,19 @@ endif()
 # .github/workflows/hrx-build.yml (the cmake/tests-*.cmake path), tools/ci/tests_referenced_check.py (all of cmake/).
 file(GLOB ONEBIT_TEST_REGISTRATION_FILES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/cmake/tests-*.cmake)
 list(SORT ONEBIT_TEST_REGISTRATION_FILES)
+# A file this CMakeLists.txt already names in a literal include(cmake/tests-<name>.cmake) is skipped: that include
+# fixes the file's position (some rows need one), and including it twice stops the configure with
+# `add_test given test NAME ... which already exists`. So a family file moved out with its own include() line and
+# this glob can land in either order.
+file(READ ${CMAKE_CURRENT_LIST_FILE} _onebit_top_cmake_text)
 foreach(_onebit_test_registration_file IN LISTS ONEBIT_TEST_REGISTRATION_FILES)
-    include(${_onebit_test_registration_file})
+    get_filename_component(_onebit_test_registration_name ${_onebit_test_registration_file} NAME)
+    string(FIND "${_onebit_top_cmake_text}" "include(cmake/${_onebit_test_registration_name})" _onebit_named_at)
+    if(_onebit_named_at EQUAL -1)
+        include(${_onebit_test_registration_file})
+    endif()
 endforeach()
+unset(_onebit_top_cmake_text)
 
 # ── Loopback ports: route tests run one at a time (engine#1070) ──────────────
 # Every test named below starts a server on 127.0.0.1. Most pick a port by binding :0, closing the

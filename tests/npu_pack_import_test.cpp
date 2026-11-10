@@ -5446,6 +5446,46 @@ void test_wide_q_attn_section() {
     check(!pi::wide_q_attn_section(2112, 3691136 - 641, 64, 39168, 16, 73984, 128).ok,
           "wide-q section: a payload shorter than the tiles is refused");
     check(!pi::wide_q_attn_section(2112, 0, 64, 39168, 16, 73984, 128).ok, "wide-q section: an empty payload is refused");
+    // the same layout with one more [header][gain] section (the gains displaced by 320 B): not a norms gap, so the
+    // caller falls through to the refusals it had before
+    check(!pi::wide_q_attn_section(2112, 3691136 + 320, 64, 39168, 16, 73984, 128).ok,
+          "wide-q section: a 960 B remainder is not this layout");
+    // the offsets are arithmetic on the arguments, not this pack's constants: another head_dim and tile count
+    const pi::WideQAttnSection h64 = pi::wide_q_attn_section(1000, 10 * 500 + 384 + 4 * 900, 10, 500, 4, 900, 64);
+    check(h64.ok && h64.gap == 384 && h64.q_norm == 1000 + 5000 + 64 && h64.k_norm == h64.q_norm + 128 + 64 &&
+              h64.o_off == 1000 + 5000 + 384,
+          "wide-q section: at head_dim 64 the gap is 384 B and every offset follows the arguments");
+}
+
+// Review of engine#2063: the gap's offsets are one number for every layer, so the import checks each layer's bytes to be
+// the [64 B zeros][gain][64 B zeros][gain] pair before writing a gain, and refuses the layer otherwise.
+void test_qk_gap_block_why() {
+    std::vector<uint8_t> gap(640, 0);
+    auto put = [&](size_t off, uint16_t v) { gap[off] = uint8_t(v & 0xFF); gap[off + 1] = uint8_t(v >> 8); };
+    for (int i = 0; i < 128; ++i) {
+        put(64 + 2 * size_t(i), 0x3F80);        // q_norm = 1.0
+        put(384 + 2 * size_t(i), 0x3FC0);       // k_norm = 1.5
+    }
+    check(pi::qk_gap_block_why(gap.data(), 128).empty(), "qk gap: two zero headers and two finite gains are the pair");
+    // the windows displaced by one section (320 B): q's window is then k's header + gain start, as a reader that
+    // placed the gains one section late would see it
+    std::vector<uint8_t> shifted(640, 0);
+    std::copy(gap.begin() + 320, gap.end(), shifted.begin());   // [hdr][k] then zeros where k should be
+    const std::string a = pi::qk_gap_block_why(shifted.data(), 128);
+    check(!a.empty() && a.find("k_norm is all zero") != std::string::npos,
+          "qk gap: a gain displaced by 320 B is refused, naming the gain that is not there");
+    std::vector<uint8_t> hdr = gap;
+    hdr[320 + 7] = 1;
+    const std::string b = pi::qk_gap_block_why(hdr.data(), 128);
+    check(b.find("before k_norm are not zero") != std::string::npos && b.find("byte 7") != std::string::npos,
+          "qk gap: a non-zero header byte is refused with its index");
+    std::vector<uint8_t> inf = gap;
+    inf[64 + 2 * 5] = 0x80; inf[64 + 2 * 5 + 1] = 0x7F;       // +inf in element 5 of q_norm
+    const std::string c = pi::qk_gap_block_why(inf.data(), 128);
+    check(c.find("q_norm element 5 is not finite") != std::string::npos, "qk gap: a non-finite gain is refused by element");
+    std::vector<uint8_t> tile(640);
+    for (size_t i = 0; i < tile.size(); ++i) tile[i] = uint8_t(17 * i + 3);   // tile-like bytes where the gap should be
+    check(!pi::qk_gap_block_why(tile.data(), 128).empty(), "qk gap: tile bytes are not the pair");
 }
 
 /* engine#1985: a REGRESSION, not a new bug -- `Qwen3-1.7B` imported with 0 gaps on yesterday's main and refused with 280
@@ -5486,6 +5526,7 @@ int main(int argc, char** argv) {
     test_qk_norm_refusal();
     test_qk_gain_offsets();
     test_wide_q_attn_section();
+    test_qk_gap_block_why();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";

@@ -107,6 +107,12 @@ struct WideQAttnSection {
     bool ok = false;
     int64_t gap = 0, o_off = 0, q_norm = 0, k_norm = 0;
 };
+// Why one block's gap is NOT `[64 B zeros][bf16 [head_dim] gain][64 B zeros][bf16 [head_dim] gain]`, or "" when it is.
+// `gap` points at 2 * (64 + head_dim*2) bytes. The offsets come from the block arithmetic, which is the same number
+// for every layer; this is the per-layer witness that the bytes there are gains: both headers all zero, and each gain
+// finite and not all zero. A gain window displaced by a section (320 B at head_dim 128) lands on a header or on tile
+// bytes and fails one of these. The import refuses the layer by name on a non-empty answer (review of engine#2063).
+std::string qk_gap_block_why(const uint8_t* gap, int64_t head_dim);
 WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t qkv_tiles, int64_t tile_bytes,
                                      int64_t o_tiles, int64_t o_tile_bytes, int64_t head_dim);
 
@@ -223,6 +229,9 @@ struct Plan {
     // none. Identified and verified byte-exact against the public Qwen3-1.7B/4B checkpoints (0 of 128
     // values differ on either pack, and the swap differs on 127-128 of 128).
     int64_t knorm_off = 0, qnorm_off = 0;
+    // Where the 2-header families' gap `[64 B zeros][q_norm][64 B zeros][k_norm]` starts in the block, 0 when the gains
+    // are not in that form. The import checks the form in EVERY layer (qk_gap_block_why()) before it writes a gain.
+    int64_t qk_gap_off = 0;
     int64_t mlp_off = 0;  // the MLP section starts just past the block's post-attention norm
     // What the pack's *graph* carries, reported so `npu-pack info` can answer a pack's genre without a
     // third-party parser: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights as ordinary ONNX initializers, while

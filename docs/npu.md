@@ -1274,6 +1274,9 @@ Where the gains are, by layout, in one place: a 4-header block keeps them in the
 k first (Qwen3, above); a 2-header block keeps them in the 640 B gap between q/k/v and o_proj, q
 first, whether o_proj's K is hidden (Hunyuan-7B, Hy-MT2-1.8B) or q_proj's width (Hunyuan-0.5B). A
 pack that declares `use_qk_norm` and has them in none of these is refused (`qk_norm_refusal()`).
+The gap's offsets are block arithmetic, one number for every layer, so the import checks each
+layer's bytes to be `[64 B zeros][finite gain][64 B zeros][finite gain]` (`qk_gap_block_why()`)
+and refuses a layer that is not, by name, instead of writing whatever is there.
 
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That

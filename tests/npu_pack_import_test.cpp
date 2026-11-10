@@ -2911,9 +2911,12 @@ void test_embedding_f32_component(const std::string& root) {
 // tile size and the envelope are the hidden-896 pack's, so the numbers here are the real ones: 1,856 B envelope,
 // 2,374 tiles of 122,880 B, tail 1,856 + 2,374 x 122,880 = 291,653,952 B.
 void test_tail_head_placement() {
-    const int64_t env = 1856, rows = 2374, tile = 122880;
-    const int64_t head = rows * tile;                    // 291,741,120 B... one tile more than the real tail
-    const int64_t exact_bytes = 896 * 0 + env + head;    // the file ends with the head
+    // The real hidden-896 geometry: group_bytes(896, 64) = 8 x 68 x 64 = 34,816 B per head tile, V/64 = 2,374 tiles,
+    // 1,856 B envelope, so the tail is 1,856 + 2,374 x 34,816 = 82,655,040 B -- which is the 0.5B pack's measured tail
+    // span (its tile 0 sits at 209,000,768 B in a 291,653,952 B file).
+    const int64_t env = 1856, rows = 2374, tile = 34816;
+    const int64_t head = rows * tile;
+    const int64_t exact_bytes = env + head;              // the file ends with the head
     // (a) the head ends the file: exactly one candidate, no slack
     {
         const pi::TailHeadPlacement p = pi::plan_tail_head(exact_bytes, 0, env, rows, tile, 0);
@@ -2962,9 +2965,20 @@ void test_tail_head_placement() {
     }
     // (f) a tail_off that moves the window is honoured: the same arithmetic one layer block later
     {
-        const int64_t tail_off = 5 * 8708288;
+        const int64_t tail_off = 5 * 8708288;   // the 0.5B pack's measured layer stride
         const pi::TailHeadPlacement p = pi::plan_tail_head(tail_off + exact_bytes, tail_off, env, rows, tile, 0);
         check(p.why.empty() && p.last == tail_off + env, "tail placement: the window is relative to tail_off");
+    }
+    // and the SEARCH itself (engine#1740 review): the candidate loop, best/runner-up tracking, the kTieCorr cut, the
+    // ambiguity case and the untied refusal. Synthetic head through encode_tile, so no pack and no device.
+    {
+        std::string why;
+        // called first, then checked: building the message inside the check() call read `why` before the call filled it,
+        // because argument evaluation order is unspecified -- the first run of this arm failed with an empty reason.
+        const bool ok = pi::tail_head_selftest(&why);
+        check(ok, "tail search: a synthetic tied head locates, survives a one-tile displacement, refuses "
+                  "untied-with-padding and takes an untied exact tail unverified"
+                  + (why.empty() ? std::string() : " (" + why + ")"));
     }
 }
 

@@ -204,6 +204,11 @@ struct TailHeadPlacement {
 TailHeadPlacement plan_tail_head(int64_t bytes, int64_t tail_off, int64_t env, int64_t rows, int64_t tile,
                                  int64_t zeros);
 
+// The search half: a synthetic tied head (built through the tile encoder) is located, then displaced by one tile and
+// still located, then handed over as untied where padding must refuse and an exact tail must be taken unverified.
+// Returns false with *why set. No pack, no device, no fixture.
+bool tail_head_selftest(std::string* why);
+
 struct Options {
     bool allow_incomplete = false;  // write what is representable and name the rest
     // The device weight layout the container will declare (`q4nx_weight_layout`). Empty means the

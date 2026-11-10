@@ -1933,10 +1933,10 @@ static TailHeadLocate locate_tail_head(const Fconst& fc, int64_t tail_off, int64
                 "decode->encode, so the head's offsets are not established";
         return r;
     }
-    r.off = base + best_slack * tile;
-    r.slack = best_slack;
-    r.corr = best;
-    r.runner = second;
+    // `off` stays -1 until a placement is ACCEPTED: the caller decides on `off < 0`, so a refusal that left an offset
+    // behind would be read by the caller -- which is exactly what the self-test's untied arm caught, because every
+    // refusal path here sets `why` but the offset had already been assigned.
+    const int64_t chosen = base + best_slack * tile;
     if (!tied) {
         // No reference inside the pack: only the exact placement is taken, and it is reported as unverified.
         if (!r.exact || best_slack != 0) {
@@ -1945,23 +1945,140 @@ static TailHeadLocate locate_tail_head(const Fconst& fc, int64_t tail_off, int64
             return r;
         }
         r.off = base;
-        r.why.clear();
+        r.slack = best_slack;
+        r.corr = best;
+        r.runner = second;
         return r;
     }
     if (best < kTieCorr) {
+        r.off = -1;
         r.why = "the best placement correlates " + std::to_string(best) + " with the pack's own embedding (the tie "
                 "threshold is " + std::to_string(kTieCorr) + "), so no placement in the tail is the head";
         return r;
     }
     if (second > kTieCorr) {
+        r.off = -1;
         r.why = "two placements both correlate with the embedding (" + std::to_string(best) + " at offset " +
                 std::to_string(base + best_slack * tile) + ", " + std::to_string(second) + " at offset " +
                 std::to_string(base + (second_slack < 0 ? 0 : second_slack) * tile) +
                 "), so the head's offset is ambiguous";
         return r;
     }
+    r.off = chosen;
+    r.slack = best_slack;
+    r.corr = best;
+    r.runner = second;
     r.verified = true;
     return r;
+}
+
+// engine#1740: a self-test for the SEARCH, not the arithmetic. `plan_tail_head` is pinned by the host test; this pins
+// the part that can go silently wrong -- the candidate loop, best/runner-up tracking, the kTieCorr cut, the ambiguity
+// refusal and the untied-with-padding refusal -- using a synthetic head built through encode_tile, so it needs no pack,
+// no device and no fixture. Called from the importer's test, and usable while W1b works on the block-32 placement.
+bool tail_head_selftest(std::string* why) {
+    auto fail = [&](const std::string& m) { if (why) *why = m; return false; };
+    const int H = kKBlock, rows_per_tile = kTileRows, ntiles = 4;
+    const int64_t tile = attn_tile_bytes(H);
+    const int64_t env = attn_payload_off(H);
+    // A deterministic embedding, and the bf16 copy the correlation reads. Pearson is shift- and scale-invariant, so a
+    // min-max quantisation of this table correlates with it at ~1 without having to reproduce it byte for byte.
+    std::vector<float> emb(size_t(ntiles) * rows_per_tile * H);
+    std::vector<uint16_t> emb_bf16(emb.size());
+    for (size_t n = 0; n < size_t(ntiles) * rows_per_tile; ++n)
+        for (int k = 0; k < H; ++k) {
+            const float v = float(std::sin(double(n) * 0.37 + double(k) * 0.11) * 0.5 + 0.25 * double(n % 7));
+            emb[n * H + k] = v;
+            uint32_t b; std::memcpy(&b, &v, 4);
+            emb_bf16[n * H + k] = uint16_t((b + 0x8000) >> 16);
+        }
+    const EmbedTable embed{reinterpret_cast<const uint8_t*>(emb_bf16.data()), EmbedTable::Fmt::BF16, H};
+    // One tile per `rows_per_tile` rows, quantised the way the importer's synthesis path does it (per 32 columns).
+    auto make_tile = [&](size_t tile_index) {
+        TileW t;
+        t.k = H; t.rows = rows_per_tile;
+        t.code.assign(size_t(rows_per_tile) * H, 0);
+        t.scale.assign(size_t(rows_per_tile) * (H / kKBlock), 0.0f);
+        t.zp.assign(size_t(rows_per_tile) * (H / kKBlock), 0);
+        t.bias.assign(rows_per_tile, 0);
+        for (int r = 0; r < rows_per_tile; ++r) {
+            const size_t n = tile_index * rows_per_tile + r;
+            for (int kb = 0; kb < H / kKBlock; ++kb) {
+                // CENTRED quantisation about a zero point of 7, i.e. exactly what the decoder reconstructs:
+                // x = (code - zp) * scale. A min-max scale with the offset dropped (`zp == 0`) reconstructs
+                // code * scale, which is per-block shifted -- the first version of this self-test scored corr 0.576
+                // for that reason, which is the synthetic head teaching the same lesson the real one does.
+                float amax = 0.0f;
+                for (int k = 0; k < kKBlock; ++k)
+                    amax = std::max(amax, std::fabs(emb[n * H + kb * kKBlock + k]));
+                const float sc = amax > 0 ? amax / 7.0f : 1.0f;
+                t.scale[size_t(r) * (H / kKBlock) + kb] = sc;
+                t.zp[size_t(r) * (H / kKBlock) + kb] = 7;
+                for (int k = 0; k < kKBlock; ++k) {
+                    const float v = emb[n * H + kb * kKBlock + k];
+                    const int code = int(std::lround(v / sc)) + 7;
+                    t.code[size_t(r) * H + kb * kKBlock + k] = uint8_t(std::min(15, std::max(0, code)));
+                }
+            }
+        }
+        return encode_tile(t);
+    };
+    auto build = [&](int junk_before, int zero_tiles_after, Q4* want_head) {
+        std::vector<uint8_t> buf(size_t(env), 0);
+        auto push = [&](const std::vector<uint8_t>& b) { buf.insert(buf.end(), b.begin(), b.end()); };
+        if (junk_before > 0) push(std::vector<uint8_t>(size_t(tile) * size_t(junk_before), 0x11));
+        std::vector<TileW> tiles;
+        for (int i = 0; i < ntiles; ++i) {
+            const std::vector<uint8_t> t = make_tile(size_t(i));
+            tiles.push_back(decode_tile(t.data(), H, rows_per_tile));
+            push(t);
+        }
+        if (want_head) *want_head = q_from_tiles(tiles);
+        if (zero_tiles_after > 0) push(std::vector<uint8_t>(size_t(tile) * size_t(zero_tiles_after), 0));
+        return buf;
+    };
+    const int64_t base = env;   // tail_off == 0 for this synthetic file
+    // (a) the head ends the file
+    {
+        Q4 head;
+        std::vector<uint8_t> buf = build(0, 0, &head);
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, true);
+        if (loc.off < 0) return fail("a synthetic head that ends the file was not located: " + loc.why);
+        if (loc.slack != 0) return fail("the head that ends the file was located at slack " + std::to_string(loc.slack));
+        if (!loc.verified) return fail("and it was not verified (corr " + std::to_string(loc.corr) + ")");
+        if (loc.corr < 0.99) return fail("corr " + std::to_string(loc.corr) + " is below the tie threshold");
+    }
+    // (b) one junk tile before the head and three zero tiles after it: the head is a tile later, and the junk tile's
+    // placement must stay below the threshold -- this is the search doing its job rather than the arithmetic
+    {
+        std::vector<uint8_t> buf = build(1, 3, nullptr);
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, true);
+        if (loc.off < 0) return fail("a head behind one junk tile and three zero tiles was not located: " + loc.why);
+        if (loc.slack != 1) return fail("it was located at slack " + std::to_string(loc.slack) + ", not 1");
+        if (!loc.verified) return fail("and it was not verified");
+        if (loc.runner >= kTieCorr) return fail("the runner-up also passed the threshold (" + std::to_string(loc.runner) + ")");
+    }
+    // (c) untied + padding: refused rather than taken
+    {
+        std::vector<uint8_t> buf = build(0, 3, nullptr);
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, false);
+        if (loc.off >= 0) return fail("an untied padded tail was taken instead of refused");
+        if (loc.why.empty()) return fail("and the refusal says nothing");
+    }
+    // (d) untied + exact: taken and marked unverified
+    {
+        std::vector<uint8_t> buf = build(0, 0, nullptr);
+        const Fconst fc{"synthetic", buf.data(), buf.size()};
+        const TailHeadLocate loc = locate_tail_head(fc, 0, env, ntiles, tile, H, embed, false);
+        if (loc.off < 0) return fail("an untied exact tail was refused: " + loc.why);
+        if (loc.off != base) return fail("an untied exact tail was located at the wrong offset");
+        if (loc.verified) return fail("an untied tail reported itself as verified");
+    }
+    if (why) why->clear();
+    return true;
 }
 
 Q4 q_from_tiles(const std::vector<TileW>& tiles) {

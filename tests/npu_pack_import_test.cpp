@@ -606,13 +606,16 @@ void test_external_import_success(const std::string& root) {
     put_file((dir / "tokenizer.json").string(), R"({"model":{"type":"BPE"}})");
 
     // The fixture's own weights: w(row, col) = (code - zp) * scale, chosen so every product is exact in f32 (scales are
-    // bf16-exact with 7 mantissa bits, codes and zero points are < 16), so the container's `code*scale + m` form must
-    // reproduce them bit for bit.
+    // bf16-exact with 7 mantissa bits, |code - zp| <= 15), so the container's `code*scale + m` form must reproduce them
+    // bit for bit. Both nibbles are int4 TWO'S COMPLEMENT (the pack's writer asserts -8 <= x <= 7), so the reference
+    // sign-extends them: the generators walk all 16 nibble values, and for a code and zero of opposite sign an
+    // unsigned reading is off by 16 * scale (engine#1503, #1874).
     auto scale_of = [](int row) { return (1.0f + float(row % 128) / 128.0f) * std::ldexp(1.0f, -(row / 128 + 2)); };
     auto zp_of = [](int row, int kb, int g) { return uint8_t((row + 3 * kb + 5 * g) % 16); };
     auto code_of = [](int row, int col) { return uint8_t((row * 7 + col * 3) % 16); };
     auto w_of = [&](int row, int col) {
-        return (float(code_of(row, col)) - float(zp_of(row, col / 128, (col % 128) / 32))) * scale_of(row);
+        auto sx = [](uint8_t v) { return v >= 8 ? int(v) - 16 : int(v); };
+        return float(sx(code_of(row, col)) - sx(zp_of(row, col / 128, (col % 128) / 32))) * scale_of(row);
     };
     // Encode the blob as the pack lays it out -- the inverse of decode_external_tile() for the shipped ordering
     // (pi::kExtQuantsRowMajor == false: byte (cp%4) + c*4 + (cp/4)*512 holds rows 2cp/2cp+1 of column c).

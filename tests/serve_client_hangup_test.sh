@@ -71,19 +71,11 @@ trap cleanup EXIT INT TERM
 
 "$bin" serve -m "$model" --device "$device" --host 127.0.0.1 --port 0 "$@" > "$log" 2>&1 &
 srv=$!
-# serve_port_wait <log> <pid> <tenths> prints the port serve reported; the pid is there so a serve that dies stops the
-# wait instead of sleeping out the budget (my first version passed a file path here and broke out on the first poll)
-if ! port=$(serve_port_wait "$log" "$srv" 24000); then
+# serve_port_wait_any <log> <pid> <tenths> prints the port; the pid is there so a serve that dies stops the wait
+# instead of sleeping out the budget (my first version passed a file path here and broke out on the first poll), and it
+# falls back to the backend's own line for a payload that predates engine #1485's read-back
+if ! port=$(serve_port_wait_any "$log" "$srv" 24000); then
     echo "skip: serve did not report a port in 240 s (see below)"; tail -20 "$log"; exit 77
-fi
-# A build that predates engine #1485's read-back prints `ready on http://127.0.0.1:0` when it was asked for port 0,
-# while the backend it spawned prints the port it actually bound. Take that one rather than curling port 0.
-if [ "$port" = "0" ]; then
-    child_port=$(awk '/llama_server: listening on http:\/\//{ n = split($NF, a, ":"); if (a[n] ~ /^[0-9]+$/ && a[n] != "0") { print a[n]; exit } }' "$log")
-    if [ -n "$child_port" ]; then
-        echo "note: serve reported port 0 (engine #1485's read-back is not in this build); using the backend's $child_port"
-        port=$child_port
-    fi
 fi
 echo "serve on 127.0.0.1:$port, device=$device, $rounds rounds"
 

@@ -509,6 +509,13 @@ if(ONEBIT_HRX)
                  COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_client_hangup_test.sh $<TARGET_FILE:onebit>
                          ${ONEBIT_SERVE_TEST_GGUF} cpu)
         set_tests_properties(serve_client_hangup_cpu PROPERTIES SKIP_RETURN_CODE 77)
+        # engine#1779 fault 2 (FLM 1.0.12: "Qwen3.5 answering `//////` after hitting the context limit"): a prompt that
+        # fills the context is served, the next turn cannot fit, and the answer must be a refusal or a truncated-but-clean
+        # reply - never one character repeated. Also `cpu`: the fault is in the request path's clamp, not in a kernel.
+        add_test(NAME serve_context_limit_cpu
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_context_limit_test.sh $<TARGET_FILE:onebit>
+                         ${ONEBIT_SERVE_TEST_GGUF} cpu)
+        set_tests_properties(serve_context_limit_cpu PROPERTIES SKIP_RETURN_CODE 77)
         # Placement must not change the answer (engine #674): the same greedy prompt through the CPU, through the device
         # with every layer assigned to the CPU, and fully offloaded, compared byte for byte.
         add_test(NAME hrx_cpu_weight_parity

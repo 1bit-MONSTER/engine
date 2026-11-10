@@ -97,6 +97,9 @@ struct ForwardEngine {
     // The template the container declares, its sha256 and where it came from: rendered per request
     // when present (app/npu_template.h), else ChatML when the tokenizer has the anchors.
     npu::ChatTemplate tmpl;
+    // The markup this container's replies are split by (app/npu_answer_parser.h): the template's own when
+    // the template is what gets rendered, else qwen3, which is what the ChatML fallback prompts for.
+    npu::AnswerFamily answer_family = npu::AnswerFamily::qwen3;
     std::string bos_text;  // the bos/eos *strings* the template's {{ bos_token }} renders
     std::string eos_text;
     // decode() of every vocabulary id, built on the first constrained request: the GBNF
@@ -534,6 +537,10 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         return json{{"content", content}};
     };
 
+    // A tool grammar (tool_choice "required" or a named function) constrains the reply to the qwen3 call
+    // markup whatever the container is (app/npu_tool_grammar.h), so that reply is split as qwen3.  Every
+    // other reply is in the container's own markup.
+    const npu::AnswerFamily family = opts.tool_grammar ? npu::AnswerFamily::qwen3 : e.answer_family;
     auto wrap = [&](const std::string& content, const std::string& finish, const std::vector<Emitted>& lps) {
         json out;
         out["id"] = id;
@@ -544,7 +551,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             // (issue #652 item 3) one shared parser splits what the model wrote into OpenAI's three
             // parts; a reply that is only tool calls says content: null.
             const npu::ParsedAnswer ans =
-                npu::parse_answer(content, npu::AnswerFamily::qwen3, opts.tools_sent);
+                npu::parse_answer(content, family, opts.tools_sent);
             json message{{"role", "assistant"}};
             message["content"] = ans.content_null ? json(nullptr) : json(ans.content);
             if (!ans.reasoning.empty()) message["reasoning_content"] = ans.reasoning;
@@ -565,7 +572,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 std::vector<std::string> texts;
                 texts.reserve(lps.size());
                 for (const auto& x : lps) texts.push_back(x.text);
-                const std::vector<char> keep = npu::content_mask(texts, npu::AnswerFamily::qwen3, opts.tools_sent);
+                const std::vector<char> keep = npu::content_mask(texts, family, opts.tools_sent);
                 std::vector<Emitted> content_lps;
                 for (size_t i = 0; i < lps.size(); i++)
                     if (i < keep.size() && keep[i]) content_lps.push_back(lps[i]);
@@ -606,7 +613,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             auto chunks = std::make_shared<std::vector<std::string>>();
             // The same splitter as the non-streamed path, fed piece by piece, so a streamed reply
             // and a non-streamed one cannot disagree about what is reasoning and what is content.
-            npu::AnswerStream stream(npu::AnswerFamily::qwen3, opts.tools_sent);
+            npu::AnswerStream stream(family, opts.tools_sent);
             auto emit_pieces = [&](const std::string& t, const std::vector<Emitted>& lp) {
                 std::vector<std::pair<bool, std::string>> pieces;
                 stream.feed(t, pieces);
@@ -933,6 +940,9 @@ int run_forward_serve(int argc, char** argv) {
                  e.tmpl.present() ? e.tmpl.source.c_str() : "no template",
                  e.tmpl.present() ? "" : " -- the chat route uses ChatML with anchors, else refuses");
     const bool can_render = e.tmpl.present() && npu::renderer_built();
+    if (can_render) e.answer_family = npu::answer_family_of_template(e.tmpl.text);
+    std::fprintf(stderr, "1bit forward-serve: answer markup=%s\n",
+                 e.answer_family == npu::AnswerFamily::gemma4 ? "gemma4" : "qwen3");
     if (e.tmpl.present() && !npu::renderer_built())
         std::fprintf(stderr,
                      "1bit forward-serve: this build has no chat-template renderer (ONEBIT_JINJA=OFF), so the "

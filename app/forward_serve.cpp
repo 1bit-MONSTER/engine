@@ -795,6 +795,64 @@ void handle_systemone(ForwardEngine& e, const httplib::Request& req, httplib::Re
 
 }  // namespace
 
+// engine#1862: the sealed-route one-shot id run. `npu-run` was written for the per-role lane kernel set
+// (layer_ctx{1,2,17}.elf + lmhead.elf), which no pack on disk ships any more: every pack since the sealed route carries
+// SEALED-*.elf / full_i8_* driven by this forward. So an id run on a current pack goes through the SAME forward, and
+// the pass it makes is the one the k-row identity check needs -- one launch, M rows, per-row logits.
+int run_forward_ids(const std::string& model_dir, const std::string& kernels, const std::vector<int>& ids,
+                    int max_tokens, float penalty, bool host_gemm) {
+    if (ids.empty()) throw std::runtime_error("--ids: no token ids");
+    const std::string model = model_dir + "/model.q4nx";
+    if (!std::filesystem::exists(model)) throw std::runtime_error(model + " does not exist");
+    // Same device discipline as forward-serve: host-GEMM runs take no lock (engine#1353 -- a host-GEMM run that held it
+    // for 4 h 52 m stopped two lanes' device work), a run that opens the device takes the exclusive one.
+    int lock_fd = -1;
+    if (npu_lock_taken(!host_gemm, std::getenv("NPU_NO_DEVICE_LOCK") != nullptr)) lock_fd = take_npu_device_lock(1);
+    std::unique_ptr<xrt::device> dev;
+    if (!host_gemm) dev = std::make_unique<xrt::device>(0);
+    Q4nxNpuForward fwd;
+    const bool ok = dev ? fwd.init(*dev, model.c_str(), kernels) : fwd.init_host(model.c_str(), kernels);
+    if (!ok) throw std::runtime_error("forward init failed: " + std::string(fwd.last_error()));
+    const int width = fwd.max_batch_rows();
+    if (int(ids.size()) > width)
+        std::fprintf(stderr, "1bit npu-run: %zu ids, so this runs in passes of %d rows (the kernel's width)\n", ids.size(),
+                     width);
+    int done = 0;
+    while (done < int(ids.size())) {
+        const int m = std::min(width, int(ids.size()) - done);
+        std::vector<int> chunk(ids.begin() + done, ids.begin() + done + m);
+        std::vector<float> all, one;
+        // begin_verify() is what makes the next pass norm EVERY row and write M x NV logits (the speculative verifier's
+        // call); plain step_batch() returns only the last row, which cannot answer a per-row question.
+        fwd.begin_verify(m, done);
+        if (!fwd.step_batch_all(chunk, done, all))
+            throw std::runtime_error("forward step failed: " + std::string(fwd.last_error()));
+        // NV from the block itself (the vocab width is whatever the head returns) rather than from a config accessor:
+        // the size has to divide by the row count either way, and a block that does not is the thing to report.
+        if (all.empty() || all.size() % size_t(m) != 0)
+            throw std::runtime_error("forward returned a logits block of the wrong size (" + std::to_string(all.size()) +
+                                     " floats for " + std::to_string(m) + " rows)");
+        const int nv = int(all.size() / size_t(m));
+        for (int r = 0; r < m; ++r) {
+            const float* row = all.data() + size_t(r) * size_t(nv);
+            int best = 0;
+            for (int v = 1; v < nv; ++v)
+                if (row[v] > row[best]) best = v;
+            std::printf("%d\n", best);   // token ids out, in row order: the id the model chooses at that row
+        }
+        done += m;
+    }
+    // -n only matters for a continuation, which this route does not do: say so rather than ignore the option.
+    if (max_tokens > 0)
+        std::fprintf(stderr,
+                     "1bit npu-run: sealed route returns the model's choice at EVERY row of one pass; -n %d is not "
+                     "used (a continuation is `1bit forward-serve`)\n",
+                     max_tokens);
+    (void)penalty;
+    if (lock_fd >= 0) ::close(lock_fd);
+    return 0;
+}
+
 int run_forward_serve(int argc, char** argv) {
     std::string model, kernels, host = "127.0.0.1", alias, dump_logits;
     int port = 8000, streams = 1;

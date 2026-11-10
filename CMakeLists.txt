@@ -208,6 +208,12 @@ add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $
 # it is here because nothing else runs it: the rows had 128 assertions and no runner. It names no add_executable, so it
 # adds nothing to the set of test targets the CI --target list would have to build (the direction-B measurement, #1595).
 add_test(NAME release_check_selftest COMMAND bash ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh --self-test)
+# engine#1777: the hrx-device row's init-reason extraction, asserted against a synthetic report. Same shape again - it
+# reads the script, needs no build and no device, and takes the script as its argument rather than a target. It shipped
+# registered nowhere (ci_targets_check's direction C, engine#1820, is the row that would have said so), which is why it
+# is here with the other two script tests rather than in a file nobody runs.
+add_test(NAME release_check_hrx_init_reason
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/release_check_hrx_init_reason_test.sh ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh)
 # engine#1800: the 1bit OS base layer's mode normaliser and reporter (scripts/pack-elf.sh, engine#1474), run over a
 # crafted tree. Same shape as the row above: no build, no device, no target, so it adds nothing to the CI --target list.
 # It was in tests/ with nothing referencing it, so the property it pins (the normaliser only NARROWS modes: a 0600

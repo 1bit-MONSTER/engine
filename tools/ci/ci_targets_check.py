@@ -39,6 +39,11 @@ in name only. `have` is the `--target` list above. The difference is a ratchet r
 when the difference grows**, printing only the new names. A shrinking baseline is progress, not a failure,
 so a rename does not have to be argued with -- a count would pass it.
 
+A third direction covers the case neither of those can see (engine#1820): a standalone `tests/*.sh` that nothing
+references at all. It has no target for direction B to reason about, so "declared and never built" cannot reach
+it; the check now asks who mentions each script's basename and fails on the ones nobody does. The deliberate
+exceptions live in `tools/ci/unreferenced_tests.txt` with their reason beside them.
+
 A script test names its interpreter (`add_test(… COMMAND bash script.sh)`), and `bash` is not an
 `add_executable`, so a self-test runner costs nothing here: that is why the release check's suite can live
 in an `add_test` (engine#1596) without raising the drift it measures.
@@ -128,6 +133,12 @@ def ci_targets(ci_text):
 ADD_EXE = re.compile(r"^\s*add_executable\s*\(\s*([A-Za-z0-9_.+-]+)", re.IGNORECASE)
 ADD_TEST = re.compile(r"^\s*add_test\s*\(\s*NAME\s+([A-Za-z0-9_.+-]+)\s+COMMAND\s+(.*)$", re.IGNORECASE)
 BASELINE = "tools/ci/add_test_gaps.txt"
+# Direction C (engine#1820): a standalone `tests/*.sh` that NOTHING references. The allow-list below names the
+# deliberate exceptions with their reason, in the same shape as BASELINE: `name  # why`.
+UNREFERENCED = "tools/ci/unreferenced_tests.txt"
+# Where a reference to a test's basename can live: the registration files, the workflows, and any script, tool or
+# other test that invokes it.
+REFERENCE_DIRS = ("CMakeLists.txt", "cmake", ".github", "scripts", "tests", "tools")
 # `add_dependencies(<target> <dep>…)`: the second way a target gets built (engine#1595 review).
 ADD_DEPS = re.compile(r"add_dependencies\s*\(\s*([A-Za-z0-9_.+-]+)([^)]*)\)", re.IGNORECASE)
 
@@ -221,6 +232,56 @@ def read_baseline(path):
         if name:
             names.add(name)
     return names
+
+
+def unreferenced_shell_tests(root):
+    """`tests/*.sh` whose basename nothing else mentions -> (drift, allowed).
+
+    Direction C (engine#1820). `ci_targets_check` reasons about TARGETS, and a standalone shell test has none:
+    #1806, #1809 and #1777 each shipped a test that nothing ran, and the two shell ones were invisible here. A
+    file counts as referenced when any file under REFERENCE_DIRS mentions its basename, excluding itself -- which
+    is deliberately generous: an `add_test`, a `bash tests/x.sh` inside another test, or a script that invokes it
+    all count, because all three make it run somewhere.
+
+    The allow-list, the direction-B baseline and this file are excluded from the scan, because they NAME tests in
+    order to talk about them: count them as references and every exception vouches for itself, which is the exact
+    opposite of what the list is for. (First draft did precisely that -- the exemption line and then this very
+    docstring both made an unreferenced test look referenced, and it was reported as a stale entry.)
+    """
+    tests = os.path.join(root, "tests")
+    if not os.path.isdir(tests):
+        return set(), set()                      # a fixture root with no tests/ has nothing to judge
+    corpus = set()
+    for d in REFERENCE_DIRS:
+        p = os.path.join(root, d)
+        if os.path.isfile(p):
+            corpus.add(os.path.realpath(p))
+        elif os.path.isdir(p):
+            for dirpath, _dirnames, filenames in os.walk(p):
+                corpus.update(os.path.realpath(os.path.join(dirpath, f)) for f in filenames)
+    # These three NAME tests in order to talk about them, so they are struck OUT of the corpus: count them as
+    # references and every exception vouches for itself, which is the opposite of what the list is for.
+    corpus -= {os.path.realpath(os.path.join(root, UNREFERENCED)),
+               os.path.realpath(os.path.join(root, BASELINE)),
+               os.path.realpath(__file__)}
+    drift = set()
+    for path in sorted(glob.glob(os.path.join(tests, "*.sh"))):
+        base = os.path.basename(path)
+        me = os.path.realpath(path)
+        hit = False
+        for other in corpus:
+            if other == me:
+                continue
+            try:
+                if base in open(other, encoding="utf-8", errors="replace").read():
+                    hit = True
+                    break
+            except OSError:
+                continue
+        if not hit:
+            drift.add(base)
+    allowed = read_baseline(os.path.join(root, UNREFERENCED)) or set()
+    return drift, allowed
 
 
 def ci_defines(ci_text):
@@ -481,6 +542,24 @@ def check(root):
         return 1
     print(f"ci_targets_check: {len(drift)} target(s) whose test never reaches ctest under ci.yml "
           f"(baseline {len(baseline)}), and none new")
+
+    # ── direction C (engine#1820): a standalone tests/*.sh that nothing references never runs either ────
+    # The same idea as direction B, one layer out: a script test has no target for direction B to reason about,
+    # so "declared and never built" cannot see it. Three PRs in one night shipped one (#1806, #1809, #1777).
+    unref, allowed = unreferenced_shell_tests(root)
+    new_unref = sorted(unref - allowed)
+    for name in new_unref:
+        print(f"ci_targets_check: tests/{name} is referenced by nothing -- no add_test, no cmake/ registration, no "
+              f"workflow, and no other test or script invokes it, so nothing runs it. Register it (ctest row or "
+              f"another test's driver), or list it in {UNREFERENCED} with the reason it is by hand")
+    stale = sorted(allowed - unref)
+    for name in stale:
+        print(f"ci_targets_check: '{name}' is in {UNREFERENCED} but nothing references it any more -- drop the line "
+              f"if the test was deleted, or keep it honest if it was registered")
+    if new_unref or stale:
+        return 1
+    print(f"ci_targets_check: every tests/*.sh is referenced by something, or listed in {UNREFERENCED} "
+          f"({len(allowed)} by hand)")
     return 0
 
 
@@ -508,12 +587,20 @@ def self_test():
     import tempfile
     fails = 0
 
-    def case(what, ci, cmake, want, baseline="auto", family=None):
+    def case(what, ci, cmake, want, baseline="auto", family=None, tests=None, unreferenced=None):
         nonlocal fails
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, ".github", "workflows"))
             open(os.path.join(d, CI), "w", encoding="utf-8").write(ci)
             open(os.path.join(d, CMAKE), "w", encoding="utf-8").write(cmake)
+            # direction C fixtures (engine#1820): script files under tests/ and an optional allow-list
+            for name in (tests or []):
+                os.makedirs(os.path.join(d, "tests"), exist_ok=True)
+                open(os.path.join(d, "tests", name), "w", encoding="utf-8").write("#!/bin/sh\ntrue\n")
+            if unreferenced is not None:
+                upath = os.path.join(d, UNREFERENCED)
+                os.makedirs(os.path.dirname(upath), exist_ok=True)
+                open(upath, "w", encoding="utf-8").write(unreferenced)
             if family is not None:
                 fam_dir = os.path.join(d, "cmake", "tests")
                 os.makedirs(fam_dir, exist_ok=True)
@@ -679,6 +766,33 @@ add_test(NAME family_suite COMMAND family_test)
     # And the clean case.
     case("a plain target list passes",
          SELF_CI.replace("hidden_test ", ""), SELF_CMAKE, 0)
+
+    # ── direction C (engine#1820): a standalone tests/*.sh that nothing references ──────────────────
+    # A CLEAN fixture: SELF_CMAKE deliberately carries a target under a guard ci.yml does not configure (that is
+    # direction A's subject), so an arm that expects rc 0 has to start from a tree where direction A is satisfied.
+    CLEAN_CMAKE = SELF_CMAKE.replace("if(ONEBIT_NPU)", "if(ONEBIT_HOST)") + 'option(ONEBIT_HOST "x" ON)\n'
+    # The shape #1806/#1777 shipped: a script test in the tree, referenced by no registration, workflow, script,
+    # tool or other test. Direction B cannot see it (no target), so this is the arm that would have said so.
+    case("an unregistered tests/*.sh is reported",
+         SELF_CI, SELF_CMAKE, 1, tests=["planted_test.sh"])
+    # The same file becomes referenced the moment any scanned file names its basename - here the CMake registration.
+    case("the same script passes once CMakeLists.txt names it",
+         SELF_CI, CLEAN_CMAKE + "add_test(NAME planted COMMAND bash ${CMAKE_SOURCE_DIR}/tests/planted_test.sh)\n", 0,
+         tests=["planted_test.sh"])
+    # A deliberate exception goes in the allow-list WITH its reason, and is then not drift.
+    case("a script in the allow-list is not reported",
+         SELF_CI, CLEAN_CMAKE, 0, tests=["planted_test.sh"],
+         unreferenced="planted_test.sh  # by hand: needs a device, so a ctest row would only ever skip\n")
+    # … and an allow-list line for a file that is gone must not become a silent pass either: it is drift the
+    # other way (the entry names nothing), which is what keeps the list honest.
+    case("an allow-list entry for a script that does not exist is reported",
+         SELF_CI, SELF_CMAKE, 1, tests=[],
+         unreferenced="gone_test.sh  # by hand\n")
+    # The list must not vouch for itself: a name that appears ONLY in the allow-list is still unreferenced when
+    # its file is absent from the list (this is the first-draft bug, kept as an arm so it cannot come back).
+    case("the allow-list naming a script does not count as referencing it",
+         SELF_CI, SELF_CMAKE, 1, tests=["planted_test.sh"],
+         unreferenced="other_test.sh  # unrelated exception\n")
 
     print(f"ci_targets_check --self-test: {fails} failure(s)")
     return 1 if fails else 0

@@ -1,0 +1,13 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# tests/*.sh that nothing references, on purpose, one per line: `name` then `#` and the reason. The check
+# (tools/ci/ci_targets_check.py, direction C, engine#1820) fails on any test whose basename appears in no
+# registration, workflow, script, tool or other test -- this file is how a deliberate exception stays out of that
+# count WITHOUT losing the reason it exists.
+#
+# Nothing else belongs here. If a test should run, register it; a line here says it should not.
+
+anchor_rerun.sh  # an operator measurement, not a pass/fail test: `anchor_rerun.sh <1bit> <outdir> <device>
+                 # <alias>:<gguf>` needs a built binary and a real GPU, and it always exits 0, so as a ctest row it
+                 # would either skip forever or report green over a FAIL line in its own output

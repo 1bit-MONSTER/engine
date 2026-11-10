@@ -193,6 +193,29 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
 // every other architecture builds exactly the table it built before.  Keys are searched with their
 // quotes, which is what keeps "factor" from matching inside "high_freq_factor".
+// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
+// 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
+// accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
+static Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
+    Q4nxRopeDynamic d{};
+    std::ifstream f(cfg_path);
+    if (!f) return d;
+    std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    char type[64];
+    q4nx_rope_declared_type(t.c_str(), type, (int)sizeof type);
+    if (std::strcmp(type, "dynamic") && std::strcmp(type, "dynamic_ntk")) return d;
+    auto number = [&](const char* key) {
+        const std::string k = std::string("\"") + key + "\":";
+        const size_t at = t.find(k);
+        if (at == std::string::npos) return 0.0;
+        return std::strtod(t.c_str() + at + k.size(), nullptr);
+    };
+    d.factor = number("factor");
+    d.original_max_position = number("max_position_embeddings");
+    d.on = (d.factor > 0.0 && d.original_max_position > 0.0) ? 1 : 0;
+    return d;
+}
+
 static Q4nxRopeLlama3 read_rope_llama3(const std::string& cfg_path) {
     Q4nxRopeLlama3 s{};
     std::ifstream f(cfg_path);
@@ -579,6 +602,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     rope_llama3_ = read_rope_llama3(cfg_path);       // rope_type "llama3" (engine#1048)
+    rope_dynamic_ = read_rope_dynamic(cfg_path);     // rope_type "dynamic" (NTK by base, engine#1740 W2)
     {
         // A declared scaling this forward does not apply is refused BY NAME (engine#1087): serving it
         // would run plain rope, stay fluent and be wrong past the original window, with nothing in the
@@ -587,7 +611,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         std::string t((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         char declared[64];
         q4nx_rope_declared_type(t.c_str(), declared, (int)sizeof declared);
-        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1)) {
+        if (!q4nx_rope_type_supported(declared, &rope_llama3_, rope_scale_.empty() ? 0 : 1, rope_dynamic_.on)) {
             if (!std::strcmp(declared, "llama3"))
                 err_ = "config.json declares rope_type \"llama3\" but its numbers are not usable (factor > 0, "
                        "original_max_position_embeddings > 0, high_freq_factor > low_freq_factor), so the "
@@ -4207,13 +4231,17 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     {
         const int half = proportional ? HD / 2 : rot / 2;
         std::vector<float> cos_(half), sin_(half);
+        // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
+        // Below the model's original window this returns theta unchanged, which is what makes a short prompt
+        // bit-identical to the same model served without the scaling.
+        const double rope_theta = q4nx_rope_dynamic_base((double)theta, &rope_dynamic_, (double)pos, (int)HD);
         for (int i = 0; i < half; i++) {
             double inv;
             if (proportional) {
-                inv = 1.0 / std::pow((double)theta, 2.0 * (double)i / (double)HD);
+                inv = 1.0 / std::pow(rope_theta, 2.0 * (double)i / (double)HD);
                 if (i >= rot / 2) inv = 0.0;
             } else {
-                inv = 1.0 / std::pow((double)theta, (double)i / (double)half);
+                inv = 1.0 / std::pow(rope_theta, (double)i / (double)half);
                 // LongRoPE (MiniCPM4): ggml's rope applies the factor as
                 // `rope_yarn(theta / ff, ...)` (ggml-cpu/ops.cpp
                 // ggml_rope_cache_init), i.e. the angle is DIVIDED by

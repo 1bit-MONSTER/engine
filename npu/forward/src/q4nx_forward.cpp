@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include "batch_check_compare.h"
+#include "ops-dump.h"
 #include "residual-dump.h"
 #include <cstdlib>
 #include <cstring>
@@ -3211,6 +3212,14 @@ void Q4nxNpuForward::host_gemm_i8(const float* A, int a_k, int M, int K, int N, 
     }
 }
 
+// NPU_INFER_DUMP_OPS (ops-dump.h): one line per projection, tagged with the tag its caller already passes
+// ("attn_qkv", "ssm_out", ...). Called where a projection's result is final -- both host arms and the device arm --
+// so a host run and a device run print the same lines. Row 0 of the result; off is one cached bool.
+static inline void op_line(const char* tag, int layer, int rows, const std::vector<float>& out, int n) {
+    if (onebit::npu::ops_dump_enabled() && n > 0 && out.size() >= (size_t)n)
+        onebit::npu::ops_dump(tag, layer, rows, out.data(), n);
+}
+
 void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const float* Bmat,
                               std::vector<float>& out, int wkey, const char* sc, int a_k) {
     if (host_gemm_) {
@@ -3221,9 +3230,11 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
         out.assign((size_t)N, 0.0f);
         if (host_gemm_i8_) {
             host_gemm_i8(A, a_k, 1, K, N, Bmat, wkey, out.data());
+            op_line(sc, cur_layer_, 1, out, N);
             return;
         }
         q4nx_host_gemm_f32_padded(A, a_k, 1, K, N, Bmat, out.data());
+        op_line(sc, cur_layer_, 1, out, N);
         return;
     }
     npu::target::GemvArgs a;
@@ -3232,7 +3243,8 @@ void Q4nxNpuForward::npu_gemm(int role, const float* A, int K, int N, const floa
     a.a_k = a_k;
     a.tiles = &Q4nxNpuForward::gemv_tile_cb; a.tiles_self = this;
     std::string err;
-    if (!xd_ || !xd_->gemv(a, out, err)) err_ = err.empty() ? "npu_gemm: no target" : err;
+    if (!xd_ || !xd_->gemv(a, out, err)) { err_ = err.empty() ? "npu_gemm: no target" : err; return; }
+    op_line(sc, cur_layer_, 1, out, N);
 }
 
 void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N,
@@ -3244,9 +3256,11 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
         out.assign((size_t)M * N, 0.0f);
         if (host_gemm_i8_) {
             host_gemm_i8(A, a_k, M, K, N, Bmat, wkey, out.data());
+            op_line(sc, cur_layer_, M, out, N);
             return;
         }
         q4nx_host_gemm_f32_padded(A, a_k, M, K, N, Bmat, out.data());
+        op_line(sc, cur_layer_, M, out, N);
         return;
     }
     // The device's activation BO holds exactly max_batch_rows() rows (the M=128 prefill design), and a wider
@@ -3266,6 +3280,9 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             if (note && note[0]) { std::fprintf(stderr, "  [batch] %s\n", note); note_said = true; }
         }
         out.assign((size_t)M * N, 0.0f);
+        // NPU_INFER_DUMP_OPS: the blocks are one projection, so they print one line (rows=M, row 0), as the host
+        // arms do; the inner launches are muted for the length of the walk.
+        onebit::npu::OpsDumpMute ops_mute;
         for (int b0 = 0; b0 < M && err_.empty(); b0 += blk) {
             const int rows = std::min(blk, M - b0);
             std::vector<float> part;
@@ -3277,6 +3294,12 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
             }
             std::copy(part.begin(), part.begin() + (size_t)rows * N, out.begin() + (size_t)b0 * N);
         }
+        // Printed by hand: op_line() would be muted by this scope's own guard. A nested walk stays quiet.
+        if (err_.empty() && onebit::npu::ops_dump_enabled() && onebit::npu::ops_dump_mute_depth() == 1) {
+            char line[192];
+            if (onebit::npu::ops_dump_line(line, sizeof line, sc, cur_layer_, M, out.data(), N) > 0)
+                std::fputs(line, stderr);
+        }
         return;
     }
     npu::target::GemvArgs a;
@@ -3286,7 +3309,8 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     a.rows = true; a.decode_twin = decode_twin;
     a.tiles = &Q4nxNpuForward::gemv_tile_cb; a.tiles_self = this;
     std::string err;
-    if (!xd_ || !xd_->gemv(a, out, err)) err_ = err.empty() ? "npu_gemm_rows: no target" : err;
+    if (!xd_ || !xd_->gemv(a, out, err)) { err_ = err.empty() ? "npu_gemm_rows: no target" : err; return; }
+    op_line(sc, cur_layer_, M, out, N);
 }
 
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
@@ -4021,7 +4045,7 @@ int Q4nxNpuForward::max_batch_rows() const {
 // --------------------------------------------------------------------------
 // host helpers (float32, matching the Python reference)
 // --------------------------------------------------------------------------
-float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out) const {
+float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out, const char* tag) const {
     LhScope _tlh(LH_RMS);
     double ss = 0.0;
     for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
@@ -4032,6 +4056,8 @@ float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out)
     } else {
         for (int i = 0; i < n; i++) out[i] = x[i] * inv * w[i];
     }
+    // NPU_INFER_DUMP_OPS: the norm's own output, so a divergence can be put on the norm and not on its layer.
+    if (onebit::npu::ops_dump_enabled()) onebit::npu::ops_dump(tag, cur_layer_, 1, out, n);
     return inv;
 }
 
@@ -4475,12 +4501,12 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
     if (sem_.qk_norm) {
         std::vector<float> t(HD);
         for (int h = 0; h < NH; h++) {
-            rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data());
+            rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data(), "q_norm");
             memcpy(&q[(size_t)h * HD], t.data(), sizeof(float) * HD);
         }
         if (append_kv) {
             for (int h = 0; h < NKV; h++) {
-                rmsnorm(&k[(size_t)h * HD], k_norm_[cur_layer_].data(), HD, t.data());
+                rmsnorm(&k[(size_t)h * HD], k_norm_[cur_layer_].data(), HD, t.data(), "k_norm");
                 memcpy(&k[(size_t)h * HD], t.data(), sizeof(float) * HD);
             }
         }

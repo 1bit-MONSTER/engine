@@ -2958,12 +2958,12 @@ std::string q4nx_cache_root() {
 // engine#1956: the cache is regenerable scratch, not user data, and nothing ever removed an old entry -- measured at 104 G in
 // 29 entries on one box, which closed two lanes' build gates the same day. The bound is a size, not an age, because a busy
 // day imports more packs than any age window expires; ONEBIT_Q4NX_CACHE_MAX_GIB=0 restores the old unbounded behaviour.
+// The order is least-recently-USED: a cache hit touches its entry (q4nx_cache_touch), here and in npu/q4nx_device.cpp.
 // The entry just written is never a candidate, and neither is one younger than the sweep's age window (a serve may be reading
 // it) -- see app/q4nx_cache.h for why that is a heuristic rather than a guarantee.
 static void q4nx_cache_sweep(const std::string& cache, const std::string& keep) {
-    const char* env = std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB");
-    long long gib = env && *env ? std::atoll(env) : 60;
-    q4nx_cache_evict(cache, keep, gib > 0 ? gib * (1LL << 30) : 0);
+    q4nx_cache_touch(keep);              // a reused entry counts as used now: the sweep is LRU by this, not by creation
+    q4nx_cache_evict(cache, keep, q4nx_cache_bound_bytes(std::getenv("ONEBIT_Q4NX_CACHE_MAX_GIB")));
 }
 
 std::string repack_gguf(const std::string& gguf) {
@@ -3041,9 +3041,13 @@ std::string repack_gguf(const std::string& gguf) {
                     "1bit serve: ============================================================\n\n",
                     checker.empty() ? "(unresolved)" : checker.c_str());
             }
+            q4nx_cache_touch(out);       // a hit is a use: without this the sweep's order is by creation
             return out;
         }
-        if (run_program({ python, checker, gguf, out }, true) == 0) return out;
+        if (run_program({ python, checker, gguf, out }, true) == 0) {
+            q4nx_cache_touch(out);
+            return out;
+        }
         std::fprintf(stderr, "1bit serve: cached Q4NX dir %s FAILED the declared-scale scan; "
                              "discarding and re-repacking\n", out.c_str());
         fs::remove_all(out);

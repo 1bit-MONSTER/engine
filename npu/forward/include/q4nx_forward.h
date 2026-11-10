@@ -283,7 +283,8 @@ private:
     // The same elementwise gate*up on caller memory, so a batched pass can read its ACT row and write its HH
     // row where they already are instead of staging both through a vector (a copy on each side).
     bool mlp(const float* gu, float* h, int im);
-    float rmsnorm(const float* x, const float* w, int n, float* out) const;
+    // `tag` is the NPU_INFER_DUMP_OPS label (ops-dump.h); the per-head q/k norms pass their own.
+    float rmsnorm(const float* x, const float* w, int n, float* out, const char* tag = "rmsnorm") const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;
     bool run_lm_head(const std::vector<float>& h, std::vector<float>& logits);
     // M rows of hidden state -> M x NV logits, row-major.  Same head, same packed tiles: the rows ride

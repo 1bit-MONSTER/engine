@@ -1717,6 +1717,85 @@ bool fconst_set_block_headers(FconstGeom& g, const std::vector<int64_t>& inner) 
 
 std::string find_token_fconst_exported(const std::string& pack_dir) { return find_token_fconst(pack_dir); }
 
+// engine#1786 (item F1): read a FastFlowLM NPU2 model source's container header. Safetensors layout: an 8-byte
+// little-endian header length, then that many bytes of JSON. `__metadata__` is a string map, not a tensor, and the
+// vendor's converter does not always write one -- so its presence is not a genre test and its absence is not an error.
+// Every failure names what was wrong, because the caller's next move ("refuse this pack" vs "read it") depends on which.
+Q4nxContainer read_q4nx_container(const std::string& path) {
+    Q4nxContainer out;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        out.why = "cannot open " + path;
+        return out;
+    }
+    unsigned char len[8] = {0};
+    if (!f.read(reinterpret_cast<char*>(len), 8)) {
+        out.why = path + ": shorter than the 8-byte safetensors header length";
+        return out;
+    }
+    int64_t n = 0;
+    for (int i = 7; i >= 0; --i) n = (n << 8) | int64_t(len[i]);
+    // A header this large is not a container: the largest real one seen on the NPU2 sources is 26,496 B (237 tensors).
+    // Refusing above 64 MiB keeps a mis-typed length from making the caller allocate whatever the file claims.
+    if (n <= 0 || n > (int64_t(64) << 20)) {
+        out.why = path + ": implausible header length " + std::to_string(n) + " B";
+        return out;
+    }
+    std::string hdr(size_t(n), '\0');
+    if (!f.read(&hdr[0], n)) {
+        out.why = path + ": truncated header (" + std::to_string(n) + " B claimed)";
+        return out;
+    }
+    out.header_bytes = n;
+    json j;
+    try {
+        j = json::parse(hdr);
+    } catch (const std::exception& e) {
+        out.why = path + ": header is not JSON (" + e.what() + ")";
+        return out;
+    }
+    if (!j.is_object()) {
+        out.why = path + ": header is not a JSON object";
+        return out;
+    }
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        if (it.key() == "__metadata__") continue;
+        if (!it.value().is_object()) {
+            out.why = path + ": tensor '" + it.key() + "' is not an object";
+            out.tensors.clear();
+            return out;
+        }
+        Q4nxTensor t;
+        t.name = it.key();
+        const json& v = it.value();
+        t.dtype = v.value("dtype", std::string());
+        if (t.dtype.empty()) {
+            out.why = path + ": tensor '" + t.name + "' states no dtype";
+            out.tensors.clear();
+            return out;
+        }
+        if (v.contains("shape") && v["shape"].is_array())
+            for (const json& d : v["shape"]) t.shape.push_back(d.is_number_integer() ? d.get<int64_t>() : 0);
+        if (!v.contains("data_offsets") || !v["data_offsets"].is_array() || v["data_offsets"].size() != 2 ||
+            !v["data_offsets"][0].is_number_integer() || !v["data_offsets"][1].is_number_integer()) {
+            out.why = path + ": tensor '" + t.name + "' has no [begin, end] data_offsets";
+            out.tensors.clear();
+            return out;
+        }
+        t.begin = v["data_offsets"][0].get<int64_t>();
+        t.end   = v["data_offsets"][1].get<int64_t>();
+        if (t.begin < 0 || t.end < t.begin) {
+            out.why = path + ": tensor '" + t.name + "' has data_offsets [" + std::to_string(t.begin) + ", " +
+                      std::to_string(t.end) + "]";
+            out.tensors.clear();
+            return out;
+        }
+        out.payload_bytes += t.end - t.begin;
+        out.tensors.push_back(std::move(t));
+    }
+    return out;
+}
+
 // engine#1638: the geometry READ (not just its dims), so a test can assert where each number came from -- the
 // text_config lift and the top-level-wins rule are both properties of load_geometry(), not of read_dims().
 json load_geometry_exported(const std::string& pack_dir, std::string* source) { return load_geometry(pack_dir, source); }
@@ -2853,6 +2932,18 @@ std::string Plan::manifest() const {
                                         {"rule", "length == N * (K/128 + 1) * 68"}};
         j["graph_weights"] = g;
     }
+    // engine#1786 (item F1): a FastFlowLM NPU2 model source has no graph, so the census above is absent and this is
+    // what `info` reports instead -- a count and a dtype map taken from the container's own header, plus what the genre
+    // still needs. Measured on FastFlowLM/Gemma3-270M-NPU2 (0.54 GB): 237 tensors, 0.503 GB, {BF16: 110, I8: 127}.
+    if (container_tensors >= 0) {
+        json c;
+        c["format"] = "safetensors (model.q4nx)";
+        c["tensors"] = container_tensors;
+        c["payload_bytes"] = container_payload_bytes;
+        c["dtypes"] = container_dtypes;
+        c["note"] = container_note;
+        j["container"] = c;
+    }
     j["mlp_section"] = {{"gate_up_units_measured", mlp_gu_units},
                         {"down_groups_measured", mlp_down_groups},
                         {"note", mlp_note}};
@@ -2903,6 +2994,29 @@ Plan plan(const std::string& pack_dir) {
     Plan p;
     p.dir = pack_dir;
     p.pack = fs::path(pack_dir).lexically_normal().filename().string();
+
+    // engine#1786 (item F1): the FastFlowLM NPU2 model sources are a safetensors container named model.q4nx with no
+    // graph at all. Detect that genre before anything looks for a graph, report what the container holds, and say what
+    // it still needs -- the alternative is the first byte failing with "cannot open <pack>/model.onnx", which describes
+    // a missing file on a pack that has no graph by design.
+    {
+        std::error_code ec;
+        const std::string container = pack_dir + "/model.q4nx";
+        const std::string graph_now = graph_filename(pack_dir);
+        if (fs::exists(container, ec) && !fs::exists(pack_dir + "/" + graph_now, ec)) {
+            const Q4nxContainer c = read_q4nx_container(container);
+            p.container_tensors = int64_t(c.tensors.size());
+            p.container_payload_bytes = c.payload_bytes;
+            for (const auto& t : c.tensors) p.container_dtypes[t.dtype]++;
+            p.container_note = c.why.empty()
+                ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +
+                      " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph. Reading it as a"
+                      " weights source needs the container-genre plan (engine#1786, item F1); until then this pack is"
+                      " recognised and reported, not importable."
+                : "model.q4nx is present but unreadable: " + c.why;
+            return p;
+        }
+    }
 
     std::string geom_src;
     json geom = load_geometry(pack_dir, &geom_src);

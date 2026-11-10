@@ -262,6 +262,16 @@ cache (`$ONEBIT_Q4NX_CACHE`, else `~/.cache/1bit/q4nx`) and hands the loader tha
 device streams its 5,120-byte bf16 q4_1 while the container on disk stays exact. The repack is where
 the bf16 rounding reappears for the device, never in the container.
 
+**The cache is bounded, and the bound is least-recently-used (engine#1956).** After writing an
+entry, `1bit serve` removes the least-recently-used entries until the cache is within
+`ONEBIT_Q4NX_CACHE_MAX_GIB` (default 60; `0` or a negative number turns the sweep off). The entry
+just written and any entry used in the last ten minutes are never removed. "Used" means reused,
+not only written: a cache hit — a repacked GGUF found in the cache, or a device-form conversion
+reused at load — marks the entry's directory as used now, so a container imported once and served
+every day outlives a one-off imported yesterday. The value is read as a whole number of GiB: a
+number too large to be a byte count is the largest bound that is one (it does not wrap to a small
+one), and a value that is not a number gets the default rather than an unbounded cache.
+
 **The packed lm-head is cached beside it (engine#1716).** A model whose head runs as int8 tiles
 packs those tiles on the host — gather `kpad × T` weights per tile, quantise each column to int8
 with its own scale — and until this cache that happened on every serve. The image is a function
@@ -2013,6 +2023,34 @@ reaps or signals the holder -- killing another lane's live serve is the box-cras
 `tools/showcase-612-npu-streams.sh` measures with `MODEL` and `MODEL_B` (default Qwen3-0.6B and
 Qwen3-4B, whose kernel sets are on this box): each model solo, then both at once, three reps, every
 number stamped with the build that produced it.
+
+### Finding where a forward diverges: `NPU_INFER_DUMP_DIR` and `NPU_INFER_DUMP_OPS`
+
+Two diagnostic switches of the NPU forward. Both are off by default, neither changes a result, and neither
+can fail a run.
+
+| variable | what it writes | answers |
+|---|---|---|
+| `NPU_INFER_DUMP_DIR=<dir>` | `<dir>/layer_<ll>.f32` per layer: the residual stream after that layer, M x H little-endian f32, row-major. The directory must exist; a file that cannot be written is reported on stderr and the run goes on. | which **layer** two runs part at (per-layer cosine against a reference trace) |
+| `NPU_INFER_DUMP_OPS=1` | one stderr line per projection and per weighted RMSNorm: `[op] L<layer> <tag> rows=<M> \|x\| mean <m> absmax <a>` | which **op** inside the layer |
+
+`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process.
+
+```
+  [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935
+  [op] L00 ffn_gate_up  rows=1 |x| mean 0.0258482 absmax 1.25728
+  [op] L00 ffn_down     rows=1 |x| mean 0.00315921 absmax 0.673885
+```
+
+- The tag is the one the projection's call site already passes (`attn_qkv`, `attn_output`, `ffn_gate_up`,
+  `ffn_down`, `ssm_out`, ...). Layer norms are `rmsnorm`; on a family with per-head q/k norms those print as
+  `q_norm` and `k_norm`, one line per head.
+- The numbers are over row 0 of the result (its first N values). A batched projection prints one line with
+  `rows=M`; a norm is called per row, so a batched pass prints one norm line per row.
+- A NaN or Inf is counted (`nonfinite 2/4096` at the end of the line) and left out of the mean and the maximum.
+- The same lines come out on the host arms (`NPU_INFER_HOST_GEMM=1` or `=i8`) and on the device arm, in the same
+  order and number, so the two logs of one prompt can be compared with `diff`. Start there: the first line whose
+  numbers differ names the op.
 
 ### When a load follows an evict
 

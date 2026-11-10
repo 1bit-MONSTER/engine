@@ -87,8 +87,42 @@ int main() {
     check(r.removed == 0 && fs::exists(root / "keepme-1") && fs::exists(root / "keepme-2"),
           "a non-positive bound disables the sweep");
 
+    // (f) a hit is a use: the older entry, touched, outlives a younger one nobody opened. Without the touch the order is
+    // by creation and the entry served every day goes first.
     fs::remove_all(root, ec);
-    std::printf("q4nx cache: %d arm(s) over the sweep (bound, LRU order, keep, age window, disabled)\n",
-                failures ? 0 : 12);
+    make_entry(root, "served-daily", 4, 7 * 24 * 60);
+    make_entry(root, "one-off", 4, 24 * 60);
+    q4nx_cache_touch((root / "served-daily").string());
+    r = q4nx_cache_evict(root.string(), "", 6LL << 20, /*min_age_seconds=*/0);
+    check(r.removed == 1, "one entry has to go (removed " + std::to_string(r.removed) + ")");
+    check(fs::exists(root / "served-daily"), "the entry that was just used survives");
+    check(!fs::exists(root / "one-off"), "and the unused one is the one removed");
+    // ... and a touched entry is inside the age window, so a serve that just opened it is covered like a new one
+    make_entry(root, "one-off", 4, 24 * 60);
+    make_entry(root, "opened-now", 4, 7 * 24 * 60);
+    fs::remove_all(root / "served-daily", ec);
+    q4nx_cache_touch((root / "opened-now").string());
+    r = q4nx_cache_evict(root.string(), "", 1LL << 20);
+    check(fs::exists(root / "opened-now") && !fs::exists(root / "one-off"),
+          "a touched entry is protected by the age window");
+    q4nx_cache_touch((root / "absent").string());
+    check(!fs::exists(root / "absent"), "touching a missing entry creates nothing");
+
+    // (g) the bound from ONEBIT_Q4NX_CACHE_MAX_GIB's text: never wraps, and a typo is not "unbounded"
+    const int64_t gib = 1LL << 30, top = (INT64_MAX >> 30) << 30;
+    check(q4nx_cache_bound_bytes(nullptr) == 60 * gib && q4nx_cache_bound_bytes("") == 60 * gib, "unset is the default");
+    check(q4nx_cache_bound_bytes("100") == 100 * gib, "a plain number is that many GiB");
+    check(q4nx_cache_bound_bytes("0") == 0 && q4nx_cache_bound_bytes("-5") == 0, "zero or negative disables the sweep");
+    check(q4nx_cache_bound_bytes("8589934592") == top, "2^33 GiB clamps instead of overflowing");
+    check(q4nx_cache_bound_bytes("17179869184") == top, "2^34 GiB is not a bound of 0");
+    check(q4nx_cache_bound_bytes("17179869185") == top, "2^34+1 GiB is not a bound of 1 GiB");
+    check(q4nx_cache_bound_bytes("99999999999999999999999") == top, "a number past long long clamps too");
+    check(q4nx_cache_bound_bytes("sixty") == 60 * gib, "a value that is not a number is the default, not unbounded");
+    check(q4nx_cache_bound_bytes("40G") == 40 * gib, "a number with a suffix keeps its number");
+    check(q4nx_cache_bound_bytes("7", 9) == 7 * gib && q4nx_cache_bound_bytes(nullptr, 9) == 9 * gib, "the default is the caller's");
+
+    fs::remove_all(root, ec);
+    std::printf("q4nx cache: %d arm(s) over the sweep (bound, LRU order, keep, age window, disabled, touch on a hit, bound text)\n",
+                failures ? 0 : 26);
     return failures ? 1 : 0;
 }

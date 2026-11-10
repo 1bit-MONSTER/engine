@@ -403,6 +403,11 @@ unsigned short bf16_bits_of(float v);
 // the default rather than throw. Exported so tests/npu_pack_import_test.cpp can pin it without a
 // pack; `source` names where the geometry came from, for the refusal messages.
 Dims read_dims_exported(const nlohmann::json& c, const std::string& source);
+// engine#1503: what the graph walker RECORDED, without exposing its model type. A three-input MatMulNBits (no qzeros,
+// weights spelled `<proj>.MatMul.weight_Q4`) used to be dropped entirely, which is why Qwen3-VL-4B imported one tensor.
+// Returns the matmul count; `without_zeros` counts those that carry no qzeros tensor (the implicit-zero-point case), and
+// the last three report the first matmul's own K/N/block attributes.
+int parse_onnx_matmul_census(const std::string& path, int* matmuls, int* without_zeros, int* K, int* N, int* block);
 // engine#1638: the geometry as read, so a test can check WHICH source a number came from.
 nlohmann::json load_geometry_exported(const std::string& pack_dir, std::string* source);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);

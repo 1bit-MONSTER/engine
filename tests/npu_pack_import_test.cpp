@@ -2224,6 +2224,40 @@ void test_text_config_geometry(const std::string& root) {
     fs::remove_all(dir);
 }
 
+
+// engine#1503: a THREE-input MatMulNBits with no qzeros, weights spelled `<proj>.MatMul.weight_Q4` +
+// `.weight_scales` -- Qwen3-VL-4B's form. `walk_graph` used to require four inputs, so it recorded NO matmuls for that
+// pack: `info` printed matmulnbits_ops 0 and the import wrote the embedding only ("imported 1 tensors, 0 q4_1 tiles").
+// On the real pack the fix yields 147 tensors / 47,480 tiles and the pack's own self-check reads corr 0.993981 against its
+// embedding, with the no-zero-point control at 0.3333 -- this arm pins the mechanism without the 3 GB pack.
+void test_three_input_matmulnbits(const std::string& root) {
+    const fs::path dir = fs::path(root) / "mm3";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const int64_t H = 64, N = 32, block = 32, groups = H / block;
+    std::vector<uint8_t> qw(size_t(N) * size_t(groups) * size_t(block / 2), 0x21);   // codes 1/2 alternating
+    std::vector<float> sc(size_t(N) * size_t(groups), 0.01f);
+    std::string data(reinterpret_cast<const char*>(qw.data()), qw.size());
+    data.append(reinterpret_cast<const char*>(sc.data()), sc.size() * sizeof(float));
+    put_file((dir / "model.onnx.data").string(), data);
+    const auto q4 = pb::tensor("model.layers.0.attn.q_proj.MatMul.weight_Q4", {N, groups, block / 2},
+                               "model.onnx.data", 0, qw.size(), 2);
+    const auto scl = pb::tensor("model.layers.0.attn.q_proj.MatMul.weight_scales", {N, groups},
+                                "model.onnx.data", qw.size(), sc.size() * sizeof(float), 1);
+    const auto node = pb::matmulnbits("q", {"x", "model.layers.0.attn.q_proj.MatMul.weight_Q4",
+                                            "model.layers.0.attn.q_proj.MatMul.weight_scales"}, H, N, 4, block);
+    put_file((dir / "model.onnx").string(), pb::model({q4, scl}, {node}));
+    int mm = -1, noz = -1, K = 0, Nn = 0, blk = 0;
+    pi::parse_onnx_matmul_census((dir / "model.onnx").string(), &mm, &noz, &K, &Nn, &blk);
+    check(mm == 1, "3-input MatMulNBits: the walker records the node (" + std::to_string(mm) + " of 1)");
+    check(noz == 1, "3-input MatMulNBits: it is counted as carrying no qzeros, so the implicit zero point applies");
+    check(K == H && Nn == N && blk == block,
+          "3-input MatMulNBits: K/N/block come from the node's own attributes (" + std::to_string(K) + "/" +
+              std::to_string(Nn) + "/" + std::to_string(blk) + ")");
+    std::printf("  3-input MatMulNBits: %d matmul(s), %d without qzeros, K %d N %d block %d\n", mm, noz, K, Nn, blk);
+    fs::remove_all(dir);
+}
+
 void test_embedding_component(const std::string& root) {
     const fs::path dir = fs::path(root) / "embedcomp";
     fs::remove_all(dir);
@@ -2988,6 +3022,7 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
+        test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);
         test_embedding_component(golden_dir.empty() ? "." : golden_dir);
         test_fconst19_rule_table();
         test_selfcheck_reads_bf16();

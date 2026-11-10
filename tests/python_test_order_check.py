@@ -65,6 +65,37 @@ def offenders(text: str):
     return out
 
 
+# engine#1979: a registration file is INCLUDED from a CMakeLists, so whether its `${Python3_EXECUTABLE}` is bound depends on
+# where the `include()` sits, not on anything inside the file -- recursing into the `.cmake` file would check the wrong
+# thing. The rule for those is the include's position: an `include(<f>.cmake)` that pulls in `${Python3_EXECUTABLE}` or
+# `add_python_test(` must come after the first `find_package(Python3`.
+INCLUDE = re.compile(r"^\s*include\(\s*([^)\s]+)\s*\)", re.MULTILINE)
+
+
+def include_offenders(root: pathlib.Path, cmake: pathlib.Path, text: str):
+    """Line numbers of includes that bind Python before find_package(Python3) does."""
+    finds = list(FIND.finditer(text))
+    first = finds[0].start() if finds else None
+    out = []
+    for m in INCLUDE.finditer(_strip_comments(text)):
+        target = m.group(1)
+        if target.startswith("$") or target.startswith("<"):
+            continue  # a variable or a module: its contents are not a file we can read here
+        # `include()` is resolved against the including file's directory, and (for a top-level CMakeLists in this repo)
+        # against the source root as well: try both rather than assume which one the tree uses.
+        path = (cmake.parent / target).resolve()
+        if not path.is_file():
+            path = (root / target).resolve()
+        if not path.is_file():
+            continue
+        body = _strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+        if "${Python3_EXECUTABLE}" not in body and "add_python_test(" not in body:
+            continue
+        if first is None or m.start() < first:
+            out.append(text.count("\n", 0, m.start()) + 1)
+    return out
+
+
 def check(root: pathlib.Path) -> int:
     bad = 0
     for cmake in sorted(root.rglob("CMakeLists.txt")):
@@ -75,10 +106,14 @@ def check(root: pathlib.Path) -> int:
         for ln in lines:
             print(f"FAIL {cmake.relative_to(root)}:{ln}: ${{Python3_EXECUTABLE}} used before find_package(Python3)")
             bad += 1
+        for ln in include_offenders(root, cmake, text):
+            print(f"FAIL {cmake.relative_to(root)}:{ln}: includes a registration file before find_package(Python3), "
+                  "so its ${Python3_EXECUTABLE} is empty there")
+            bad += 1
     if bad:
         print(f"FAIL {bad} registration(s) run a script through its exec bit instead of through the interpreter")
         return 1
-    print("ok: every ${Python3_EXECUTABLE} use follows find_package(Python3)")
+    print("ok: every ${Python3_EXECUTABLE} use, and every include that binds it, follows find_package(Python3)")
     return 0
 
 
@@ -88,6 +123,17 @@ def self_test() -> int:
     none = "add_test(NAME a COMMAND ${Python3_EXECUTABLE} s.py)\n"
     commented = "# ${Python3_EXECUTABLE} in a comment is prose, not a use\nadd_test(NAME a COMMAND ${Python3_EXECUTABLE} s.py)\n"
     helper = "find_package(Python3 COMPONENTS Interpreter)\nfunction(add_python_test n)\n  add_test(NAME ${n} COMMAND ${Python3_EXECUTABLE} ${ARGN})\nendfunction()\nadd_python_test(a s.py)\n"
+    # 4b. engine#1979: an include that pulls in a registration file is bound only if it comes after the find_package
+    import tempfile
+    inc_root = pathlib.Path(tempfile.mkdtemp())
+    (inc_root / "cmake").mkdir()
+    (inc_root / "cmake" / "reg.cmake").write_text("add_python_test(x tools/x.py --self-test)\n")
+    (inc_root / "later").mkdir()
+    (inc_root / "later" / "CMakeLists.txt").write_text(
+        "find_package(Python3 COMPONENTS Interpreter)\ninclude(cmake/reg.cmake)\n")
+    (inc_root / "earlier").mkdir()
+    (inc_root / "earlier" / "CMakeLists.txt").write_text(
+        "include(cmake/reg.cmake)\nfind_package(Python3 COMPONENTS Interpreter)\n")
     cases = [
         (after, [], "a use after the find_package is fine"),
         (before, [1], "a use before it is an offender"),
@@ -96,6 +142,12 @@ def self_test() -> int:
         (commented, [2], "a comment mentioning the variable is not a use"),
     ]
     bad = 0
+    # the include cases run on real files, through check(), because the rule reads the included file
+    inc_ok = check(inc_root)
+    print(("ok   " if inc_ok == 1 else "FAIL ") + "an include of a registration file before find_package is caught, "
+          "and the same include after it is not (got rc %d, want 1 because the 'earlier' tree is a counter-example)" % inc_ok)
+    if inc_ok != 1:
+        bad += 1
     for text, want, why in cases:
         got = offenders(text)
         if got != want:

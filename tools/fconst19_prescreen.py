@@ -28,6 +28,7 @@ it says whether measuring one is worth the download.
 
 Usage:  ./fconst19-prescreen.py amd/Model_rai_1.9.0_npu amd/Model_rai_1.8.0_npu_4K
 """
+import hashlib
 import json
 import os
 import re
@@ -59,11 +60,24 @@ def token_fconst(repo):
 
 
 def head_bytes(repo, name, n=WINDOW):
-    """First `n` bytes of a file, by range request."""
+    """First `n` bytes of a file, by range request -- and REFUSE anything that is not a range response.
+
+    `r.read()` returns whatever the server sends. A CDN that ignores `Range`, a proxy or edge node that strips it, or a redirect
+    that drops the header all answer 200 with the ENTIRE file -- 1.76 GB for a 7B pack -- and the caller would treat it as a 12 MB
+    window. Two independent checks, because the point of this tool is to avoid exactly that download: the status must be 206, and
+    the body must be no larger than the window asked for.
+    """
     url = f"https://huggingface.co/{repo}/resolve/main/{name}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token()}", "Range": f"bytes=0-{n-1}"})
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token()}", "Range": f"bytes=0-{n - 1}"})
     with urllib.request.urlopen(req, timeout=120) as r:
-        return r.read()
+        status = getattr(r, "status", None) or r.getcode()
+        body = r.read(n)                      # never read past the window, even if the server sends more
+        if status != 206:
+            raise RuntimeError(f"{repo}/{name}: the server answered {status}, not 206 -- it ignored the Range request, so this "
+                               f"would have been a full-file download. Refusing (this tool exists to avoid that).")
+        if len(body) > n:
+            raise RuntimeError(f"{repo}/{name}: {len(body)} B returned for a {n} B range request")
+        return body
 
 
 def geometry(repo):
@@ -119,18 +133,7 @@ def main():
     if n <= 0:
         print("  the windows are too small to compare past the first header")
         return 0
-    best = None
-    for heads in range(1, 129):
-        hdr_len = heads * 4
-        if at + hdr_len + n > len(b):
-            continue
-        step = max(1, n // 20000)
-        idx = range(0, n, step)
-        same = sum(1 for i in idx if a[at + i] == b[at + hdr_len + i])
-        agree = same / len(range(0, n, step))
-        if best is None or agree > best[0]:
-            best = (agree, heads, hdr_len)
-    agree, heads, hdr_len = best
+    agree, heads, hdr_len = align_past_header(a, b, at, n)
     print(f"{r19.split('/')[-1][:44]:46s}")
     print(f"  1.9 {f19[:52]:54s} first header at {at:,} in the first {win // 1048576} MB")
     print(f"  1.8 {f18[:52]:54s} best alignment at heads={heads} ({hdr_len} B header): {100.0 * agree:.2f} % of the "
@@ -145,5 +148,58 @@ def main():
     return 0
 
 
+def align_past_header(a, b, at, n):
+    """Best (agreement, heads, header_bytes) over plausible head counts, comparing the bytes that follow the 1.9 header.
+
+    The head count is not read from a config: the first version did, got None, and left a 24-head fallback that mis-aligned a
+    known-good pair by 32 B. Searching is self-validating -- the right count makes the files agree, the wrong ones do not, and the
+    count it recovers is the pack's real head count, which is the check that it is not fitting noise.
+    """
+    best = None
+    for heads in range(1, 129):
+        hdr_len = heads * 4
+        if at + hdr_len + n > len(b):
+            continue
+        step = max(1, n // 20000)
+        same = sum(1 for i in range(0, n, step) if a[at + i] == b[at + hdr_len + i])
+        agree = same / len(range(0, n, step))
+        if best is None or agree > best[0]:
+            best = (agree, heads, hdr_len)
+    return best
+
+
+def self_test():
+    """Check the alignment on a synthetic pair whose answer is known -- no network, no packs.
+
+    A 1.8 block with no header, a 1.9 block that is the same bytes with a header inserted at offset `hdr_off`: the aligner must
+    recover the head count and 100 % agreement. Then the same pair with the 1.8 payload rotated by one byte must score ~0, which is
+    what "the twin does not line up" means.
+    """
+    heads, block = 16, 400_000
+    hdr_off = 100_000
+    # A pseudo-random payload, not a periodic one: an arithmetic pattern like (i*7+3) % 251 aligns with itself after a shift, so a
+    # rotated twin would score like an aligned one and the negative arm would pass the bug it is meant to catch (it did, first run).
+    payload = b"".join(hashlib.sha256(str(i).encode()).digest() for i in range(block // 32 + 1))[:block]
+    a18 = payload[:hdr_off] + payload[hdr_off:]                      # no header at all
+    a19 = payload[:hdr_off] + b"\x00\x00\x7f\xff" * heads + payload[hdr_off:]
+    at = a19.find(b"\x00\x00\x7f\xff")
+    agree, got_heads, hdr_len = align_past_header(a18, a19, at, 200_000)
+    ok = (at == hdr_off and got_heads == heads and hdr_len == heads * 4 and agree > 0.99)
+    print(f"  self-test aligned pair: at={at} heads={got_heads} agree={agree:.2f} -> {'PASS' if ok else 'FAIL'}")
+    rotated = payload[:hdr_off] + payload[hdr_off + 1:] + payload[hdr_off:hdr_off + 1]
+    agree2, _, _ = align_past_header(rotated[:len(a18)], a19, at, 200_000)
+    ok2 = agree2 < 0.5
+    print(f"  self-test rotated twin: agree={agree2:.2f} -> {'PASS' if ok2 else 'FAIL'} (must not line up)")
+    # a header run that is not a whole number of heads must not be mistaken for the 1.9 form
+    short = payload[:hdr_off] + b"\x00\x00\x7f\xff" * 3 + payload[hdr_off:]
+    at_short = short.find(b"\x00\x00\x7f\xff")
+    agree3, heads3, _ = align_past_header(a18, short, at_short, 100_000)
+    ok3 = heads3 != heads
+    print(f"  self-test 3-marker run: heads={heads3} -> {'PASS' if ok3 else 'FAIL'} (not the declared {heads})")
+    return 0 if (ok and ok2 and ok3) else 1
+
+
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        sys.exit(self_test())
     sys.exit(main())

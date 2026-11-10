@@ -38,7 +38,9 @@ pids=()
 cleanup() {
     for p in "${pids[@]}"; do pkill -9 -P "$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; done
     wait 2>/dev/null
-    statefile | xargs -r rm -f
+    # serve keeps a state file naming the port it bound; drop it like tests/metrics_serve.sh does, but only if the
+    # helper exists -- this test must not fail in cleanup for a reason unrelated to the fault it measures.
+    if command -v statefile >/dev/null 2>&1; then statefile | xargs -r rm -f; fi
     rm -rf "$scratch"
 }
 trap cleanup EXIT
@@ -61,6 +63,12 @@ body='{"model":"hangup","messages":[{"role":"user","content":"hello"}],"stream":
 for i in $(seq 1 5); do
     timeout 0.4 curl -sN "$api/v1/chat/completions" -H 'Content-Type: application/json' -d "$body" >"$scratch/hang$i.txt" 2>/dev/null
 done
+
+# How many hang-ups actually reached the response stage: the client is killed by `timeout`, so a non-empty file means the
+# server had begun writing when the socket went away -- which is the moment this fault lives in. Reported, not asserted:
+# a run where none reached it proves less than it appears to, and the reader deserves to know which they got.
+got=0; for i in $(seq 1 5); do [ -s "$scratch/hang$i.txt" ] && got=$((got + 1)); done
+echo "note $got of 5 hang-ups had begun receiving a response before the client was killed"
 
 check "serve is still running after 5 client hang-ups" "kill -0 $pid 2>/dev/null"
 code=$(curl -s -o "$scratch/after.txt" -w '%{http_code}' --max-time 5 "$api/health")

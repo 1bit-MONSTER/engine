@@ -1592,6 +1592,17 @@ Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t
 // values are copied bit for bit.
 namespace {
 
+// A pack's int4 fields are TWO'S COMPLEMENT; the q4_1/q4_1f container's code field is UNSIGNED and its zero is a value,
+// so the sign was dropped at the boundary and every code with the high bit set came back 16 codes high (engine#1932,
+// measured: 128 of 256 columns off by +4.00000 at scale 0.25 = 16 codes; phi-4 and the whole 1.9 external-data family).
+// The container gives `v = c_u * s + z_c` and the pack means `v = (sx(c) - sx(zp)) * s`, so writing
+//     c_u  = sx(c) + 8            (still 0..15, what the container expects)
+//     z_c  = (-8 - sx(zp)) * s    (value units, which is what fp32 zero is)
+// gives v' = (sx(c) + 8)s + (-8 - sx(zp))s = (sx(c) - sx(zp))s exactly -- no tolerance, and the container format is unchanged.
+int sx4(int nibble) { return nibble >= 8 ? nibble - 16 : nibble; }
+uint8_t code_u4(int nibble) { return uint8_t(sx4(nibble) + 8); }
+float zero_value4(int zp_nibble, float scale) { return (float(-8 - sx4(zp_nibble))) * scale; }
+
 void tile_q4_impl(const Q4& q, std::vector<uint8_t>& out, bool f32, long long* param_inexact) {
     if (q.N % q4nx::kRows) throw std::runtime_error("q4_1 tiles need N % 32 == 0");
     // The grid is 32 x 256, so a tensor whose K is not a whole number of 256-column
@@ -1626,16 +1637,19 @@ void tile_q4_impl(const Q4& q, std::vector<uint8_t>& out, bool f32, long long* p
                         continue;
                     }
                     const size_t idx = size_t(row) * (q.K / 32) + size_t(kt) * 8 + g;
+                    // engine#1932: the zero is a VALUE in the container and a NIBBLE in the pack, so it moves with the
+                    // code shift (see zero_value4()): z_c = (-8 - sx(zp)) * s, not the raw zp.
+                    const float z_val = zero_value4(int(q.zero[idx]), q.scale[idx]);
                     if (!f32) {
                         sc16[i] = f32_to_bf16(q.scale[idx]);
-                        zr16[i] = f32_to_bf16(q.zero[idx]);
-                        if (param_inexact && bf16_to_f32(zr16[i]) != q.zero[idx]) ++inexact;
+                        zr16[i] = f32_to_bf16(z_val);
+                        if (param_inexact && bf16_to_f32(zr16[i]) != z_val) ++inexact;
                     } else {
                         sc32[i] = q.scale[idx];
-                        zr32[i] = q.zero[idx];
-                        // read the written bytes back: a q4_1f parameter is the source float, bit for bit
+                        zr32[i] = z_val;
+                        // read the written bytes back: a q4_1f parameter is the derived value, bit for bit
                         if (param_inexact && (std::memcmp(&sc32[i], &q.scale[idx], 4) != 0 ||
-                                              std::memcmp(&zr32[i], &q.zero[idx], 4) != 0))
+                                              std::memcmp(&zr32[i], &z_val, 4) != 0))
                             ++inexact;
                     }
                 }
@@ -1653,8 +1667,10 @@ void tile_q4_impl(const Q4& q, std::vector<uint8_t>& out, bool f32, long long* p
                                 byte = 0;
                                 continue;
                             }
-                            const uint8_t even = q.codes[size_t(r_even) * q.K + k] & 0x0F;
-                            const uint8_t odd = q.codes[size_t(r_even + 1) * q.K + k] & 0x0F;
+                            // engine#1932: sx(nibble) + 8, so an int4 value of -7 is stored as 1 and reads back as
+                            // 1 * s + (-8 - sx(zp)) * s -- the pack's own value, not 9 * s
+                            const uint8_t even = code_u4(q.codes[size_t(r_even) * q.K + k] & 0x0F);
+                            const uint8_t odd = code_u4(q.codes[size_t(r_even + 1) * q.K + k] & 0x0F);
                             byte = uint8_t(even | (odd << 4));
                         }
                     }

@@ -22,13 +22,12 @@
 // well-formed head with "lm_head dequant failed". CodeLlama-7b: `I8 [16016, 6144]`, kpad 4096, NV 32,016.
 //
 // The arithmetic is pure, so every case here runs with no container, no device and no pack.
-#include "q4nx_dequant.h"
+#include "pad_head_rows.h"   // the rule, header-only: no library, so CI can build this
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
-int padded_head_rows(int64_t shape0, int64_t shape1, int kpad, int NV);
 
 static int failures = 0;
 

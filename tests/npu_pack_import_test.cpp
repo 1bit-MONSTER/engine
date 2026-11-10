@@ -464,9 +464,11 @@ void test_external_packed_genre(const std::string& root) {
     // The blob cannot be the all-0x22 the other fixtures write: a 68-byte stride is 64 B of codes then 4 B of zero
     // point and bf16 scale, so all-0x22 makes every weight (2 - 2) x s = 0 -- and an all-zero decode is exactly what a
     // broken writer produces too (engine#1871, engine#1875). These bytes decode to a value that pins all three parts:
-    //   codes 0xCC -> int4 -4 everywhere; zero point 0x11 -> four nibbles of 1; scale bf16 0x4000 = 2.0
-    //   w = (c - z) * s  (engine#1874's identity) = (-4 - 1) * 2 = -10.0
-    // Drop the codes and it reads -2.0, drop the zero point -8.0, drop the scale -5.0.
+    //   codes 0xCC -> nibble 12; zero point 0x11 -> four nibbles of 1; scale bf16 0x4000 = 2.0
+    //   w = (nibble - zp) * s = (12 - 1) * 2 = 22.0
+    // MatMulNBits codes are UNSIGNED (the zero point shifts them), which is why 12 is 12 here and not int4 -4;
+    // measured, after the first version of this arm expected (12-12u)*... = -10.0 and read 22.0 from every row.
+    // Drop the codes and it reads 2.0, drop the zero point 24.0, drop the scale 11.0.
     {
         const fs::path sdir = fs::path(root) / "external-success";
         fs::remove_all(sdir);
@@ -550,9 +552,12 @@ void test_external_packed_genre(const std::string& root) {
                 // The writer stores Q4_1F tiles (6144 B), which q4nx_dequant_tile_row does not decode: the device loader
                 // repacks them through q4nx::as_q4_1() first (q4nx_device.cpp:263-266), so the read-back takes the same
                 // route rather than a second decoder written for this test.
+                // chunk_of() reads shape.back() (npu/q4nx.cpp:89) -- which is exactly why the writer stores
+                // {ntiles, chunk_bytes}: the last dimension IS the chunk kind. Giving it {rows, cols} instead makes
+                // chunk_of() see 5120 (Q4_1) and as_q4_1() copies the bytes through without repacking.
                 onebit::npu::Tensor q4f;
                 q4f.dtype = "I8";
-                q4f.shape = {q_rows, q_cols};
+                q4f.shape = {int64_t(qbytes / qtile), int64_t(qtile)};
                 q4f.data = tile_raw.data();
                 q4f.bytes = q4f.avail = uint64_t(tile_raw.size());
                 const std::vector<uint8_t> conv = onebit::npu::q4nx::as_q4_1(q4f);
@@ -578,13 +583,21 @@ void test_external_packed_genre(const std::string& root) {
                         else
                             std::printf("  row %d: refused (%d)\n", rr, r2c);
                     }
+                    // Every row, not just row 0: with a uniform blob any slot the writer gets wrong lands in some
+                    // row, and an arm that checks one row is blind to all the others (measured: a single doubled
+                    // scale slot was caught by the sibling arms and missed by a row-0-only check).
                     size_t bad = 0;
-                    for (int64_t c = 0; c < q_cols; ++c)
-                        if (std::fabs(row[size_t(c)] - (-10.0f)) > 1e-6f) ++bad;
-                    char msg[200];
+                    int64_t bad_row = -1;
+                    for (int64_t r = 0; r < q_rows; ++r) {
+                        if (q4nx_dequant_tile_row(conv.data(), conv.size(), int(q_rows), int(q_cols),
+                                                  Q4NX_TILE_BYTES, int(r), row.data()) != 0) { ++bad; continue; }
+                        for (int64_t c = 0; c < q_cols; ++c)
+                            if (std::fabs(row[size_t(c)] - 22.0f) > 1e-6f) { ++bad; if (bad_row < 0) bad_row = r; }
+                    }
+                    char msg[220];
                     std::snprintf(msg, sizeof msg,
-                                  "external writer: every decoded weight is -10.0 (codes -4, zero 1, scale 2.0); %zu of %d differ, first %.4f",
-                                  bad, int(q_cols), double(row[0]));
+                                  "external writer: every one of %lld rows decodes to 22.0 ((12 - 1) * 2.0); %zu differ, first bad row %lld",
+                                  (long long)q_rows, bad, (long long)bad_row);
                     check(bad == 0, msg);
                 }
             }

@@ -288,10 +288,17 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
         const std::string prompt = prompt_text(port, path, body, &o.why);
         if (prompt.empty()) { if (o.why.empty()) o.why = "empty prompt"; return o; }
         const std::vector<int32_t> ids = tokenize(port, prompt, &o.why);
-        if (ids.size() < 2) { if (o.why.empty()) o.why = "prompt shorter than 2 tokens"; return o; }
+        if (ids.size() < 3) { if (o.why.empty()) o.why = "prompt shorter than 3 tokens"; return o; }
         o.n_tokens = ids.size();
+        // engine#941: hand over one token less than the prompt. A hybrid model's recurrent memory keeps its whole
+        // prefix in one cell, so an exact-state handoff of the *entire* prompt leaves the decoder nothing it is
+        // allowed to evaluate - the server's cache path insists on at least one token ([TAG_PROMPT_LOGITS]) and
+        // trims it out of the memory, which a recurrent state cannot do. Leaving the last prompt token to the
+        // decoder is one legitimate decode step from state that is already in place, and it covers a sliding
+        // window too. Without this the decoder re-processes the whole prompt and the handoff buys nothing.
+        const std::vector<int32_t> head(ids.begin(), ids.end() - 1);
         if (shared_) {
-            Outcome shared = prepare_shared(port, ids, o);
+            Outcome shared = prepare_shared(port, head, o);
             if (shared.handed_over) {
                 body["id_slot"] = 0;
                 body["cache_prompt"] = true;
@@ -304,7 +311,7 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
         const std::filesystem::path state = std::filesystem::path(slot_dir_) / (stem + ".bin");
         {
             std::ofstream f(tokens);
-            for (int32_t id : ids) f << id << '\n';
+            for (int32_t id : head) f << id << '\n';
             if (!f) { o.why = "cannot write " + tokens.string(); return o; }
         }
         std::vector<std::string> argv = {provider_, "--tokens", tokens.string(), "--out", state.string(), "--model", model_};
@@ -328,8 +335,8 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
             if (const size_t nl = last.rfind('\n'); nl != std::string::npos) last = last.substr(nl + 1);
             const json j = json::parse(last);
             if (j.contains("prefill_ms") && j["prefill_ms"].is_number()) o.prefill_ms = j["prefill_ms"].get<double>();
-            if (j.contains("n_tokens") && j["n_tokens"].is_number_integer() && j["n_tokens"].get<size_t>() != ids.size()) {
-                o.why = "provider prefilled " + std::to_string(j["n_tokens"].get<size_t>()) + " of " + std::to_string(ids.size()) + " tokens";
+            if (j.contains("n_tokens") && j["n_tokens"].is_number_integer() && j["n_tokens"].get<size_t>() != head.size()) {
+                o.why = "provider prefilled " + std::to_string(j["n_tokens"].get<size_t>()) + " of " + std::to_string(head.size()) + " tokens";
                 std::filesystem::remove(state, ec);
                 return o;
             }
@@ -350,8 +357,8 @@ public:    // provider: the program; elfs: passed as --elfs when not empty; slot
         try {
             const json j = json::parse(r->body);
             const size_t restored = j.value("n_restored", size_t(0));
-            if (restored != ids.size()) {
-                o.why = "restore holds " + std::to_string(restored) + " of " + std::to_string(ids.size()) + " tokens";
+            if (restored != head.size()) {
+                o.why = "restore holds " + std::to_string(restored) + " of " + std::to_string(head.size()) + " tokens";
                 return o;
             }
             if (j.contains("timings") && j["timings"].contains("restore_ms")) o.restore_ms = j["timings"]["restore_ms"].get<double>();

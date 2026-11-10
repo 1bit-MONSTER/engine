@@ -500,6 +500,28 @@ void test_prefix_pin() {
         check(c.pin_point(prompt(100, 5000, 40), prompt(100, 6000, 40)) == 0,
               "100 shared tokens do not beat prefix-min-gain 128");
         check(c.pin_point(prompt(900, 5000, 40), prompt(0, 6000, 40)) == 0, "prompts that share nothing have no pin point");
+        {   // only the leading tokens count: the same 900 tokens at the end of both prompts are not a prefix
+            std::vector<int> a1 = prompt(0, 5000, 200), a2 = prompt(0, 6000, 200);
+            const std::vector<int> tail = prompt(900, 0, 0);
+            a1.insert(a1.end(), tail.begin(), tail.end());
+            a2.insert(a2.end(), tail.begin(), tail.end());
+            check(shared_prefix_len(a1, a2) == 0 && c.pin_point(a1, a2) == 0,
+                  "a shared ending under different openings is not a pin point");
+            a2[0] = a1[0];  // one shared leading token, then they part: still nothing worth a slot
+            check(shared_prefix_len(a1, a2) == 1 && c.pin_point(a1, a2) == 0,
+                  "and one shared leading token before that ending is not one either");
+        }
+        // the contract the forward relies on: a pin point is a real common prefix, never longer than either
+        for (int sys : {0, 1, 127, 128, 129, 500, 900}) {
+            for (int turn : {1, 40}) {
+                const std::vector<int> x = prompt(sys, 5000, turn), y = prompt(sys, 6000, turn + 7);
+                const size_t n = c.pin_point(x, y);
+                check(n <= x.size() && n <= y.size() && std::equal(x.begin(), x.begin() + long(n), y.begin()),
+                      "a pin point never reaches past the tokens both prompts start with");
+                check(n == (sys >= 128 ? size_t(sys) : 0u),
+                      "it is the whole shared opening when that is worth a slot, and 0 (no pin) when it is not");
+            }
+        }
         PrefixOptions off = o;
         off.slots = 0;
         check(PrefixCache(off).pin_point(q1, q2) == 0, "an off cache pins nothing");

@@ -1264,6 +1264,12 @@ graph: `model.onnx` carries `attn.q_norm.layernorm.weight` and `attn.k_norm.laye
 FP16 `[128]` initializers, and on Hunyuan-7B-Instruct their bf16 rounding is the first and the
 second block bit for bit in 32 of 32 layers. `qk_gain_offsets()` holds that arithmetic.
 
+The same gap exists when q_proj is wider than hidden. Hunyuan-0.5B-Instruct (hidden 1024, 16 heads
+of 128, so q_proj has 2,048 rows) has `[64 q/k/v tiles at K=1024][640 B][16 o_proj tiles at
+K=2048]`, and its graph's gains are in that gap in the same order in 24 of 24 layers (q_norm at
+block offset 2,508,928, k_norm 320 B later). `wide_q_attn_section()` holds that division and names
+the gains; before it did, this pack was refused as declaring gains the layout did not hold.
+
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
 one comparison holds every field, index and nibble order at once, and it is why a tile whose

@@ -5417,6 +5417,37 @@ void test_qk_gain_offsets() {
     check(n4.k_norm == 0 && n4.q_norm == 0, "qk gains: the byte count alone is not enough, head_dim has to agree");
 }
 
+// engine#1889, the pack whose q_proj is wider than hidden (Hunyuan-0.5B-Instruct: hidden 1024, q_out 2048). Its
+// one-header attention section is [64 q/k/v tiles at K=1024][640 B][16 o_proj tiles at K=2048]; the reader placed
+// o_proj and left the gains unnamed, so the pack was refused as "gains are not where the block layout says". The
+// numbers are the pack's own: payload 3,691,136 B from attn_off 2,112, tiles of 39,168 and 73,984 B, and the gains'
+// bytes found in the .fconst from the graph's initializers at 2,508,928 (q) and 2,509,248 (k) in every block.
+void test_wide_q_attn_section() {
+    const pi::WideQAttnSection s = pi::wide_q_attn_section(2112, 3691136, 64, 39168, 16, 73984, 128);
+    check(s.ok && s.gap == 640, "wide-q section: Hunyuan-0.5B's remainder is the 640 B gap");
+    check(s.o_off == 2112 + 64 * 39168 + 640, "wide-q section: o_proj starts after the gap");
+    check(s.q_norm == 2508928, "wide-q section: q_norm is named, where the graph's bytes are (engine#1889)");
+    check(s.k_norm == 2509248, "wide-q section: k_norm is named, 320 B after q_norm");
+    check(pi::qk_norm_refusal(true, s.k_norm != 0).empty(),
+          "wide-q section: a pack declaring use_qk_norm is therefore not refused for unlocated gains");
+    // a pack of the same shape with no gap (no per-head norms): read, and no gain is invented
+    const pi::WideQAttnSection z = pi::wide_q_attn_section(2112, 3691136 - 640, 64, 39168, 16, 73984, 128);
+    check(z.ok && z.gap == 0 && z.q_norm == 0 && z.k_norm == 0 && z.o_off == 2112 + 64 * 39168,
+          "wide-q section: no gap is read as no gains, o_proj directly after q/k/v");
+    // a norms-sized gap that is not the gains' shape: the section is read, the gains stay unnamed (so a pack that
+    // declares them is still refused rather than handed tile bytes)
+    const pi::WideQAttnSection odd = pi::wide_q_attn_section(2112, 3691136 - 128, 64, 39168, 16, 73984, 128);
+    check(odd.ok && odd.gap == 512 && odd.q_norm == 0 && odd.k_norm == 0,
+          "wide-q section: a 512 B gap is not the [header][gain] pair and names nothing");
+    check(!pi::qk_norm_refusal(true, odd.k_norm != 0).empty(), "wide-q section: and such a pack is still refused");
+    // not this layout at all: a tile too many, or a payload shorter than the tiles
+    check(!pi::wide_q_attn_section(2112, 3691136 + 39168, 64, 39168, 16, 73984, 128).ok,
+          "wide-q section: a remainder of a whole tile is not a norms gap");
+    check(!pi::wide_q_attn_section(2112, 3691136 - 641, 64, 39168, 16, 73984, 128).ok,
+          "wide-q section: a payload shorter than the tiles is refused");
+    check(!pi::wide_q_attn_section(2112, 0, 64, 39168, 16, 73984, 128).ok, "wide-q section: an empty payload is refused");
+}
+
 /* engine#1985: a REGRESSION, not a new bug -- `Qwen3-1.7B` imported with 0 gaps on yesterday's main and refused with 280
  * on today's, because #1838's early return trusted an epsilon-anchor vote that had recorded ONE in-block header on a block
  * that has three. The tell in the report is `qk_norm: true -> false`: a pack that declares per-head q/k gains keeps them in
@@ -5454,6 +5485,7 @@ int main(int argc, char** argv) {
     test_q4_writer_code_range();
     test_qk_norm_refusal();
     test_qk_gain_offsets();
+    test_wide_q_attn_section();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";

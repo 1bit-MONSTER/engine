@@ -3306,6 +3306,24 @@ QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_b
     return o;
 }
 
+WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t qkv_tiles, int64_t tile_bytes,
+                                     int64_t o_tiles, int64_t o_tile_bytes, int64_t head_dim) {
+    WideQAttnSection s;
+    if (payload <= 0 || qkv_tiles <= 0 || tile_bytes <= 0 || o_tiles <= 0 || o_tile_bytes <= 0) return s;
+    const int64_t qkv_bytes = qkv_tiles * tile_bytes;
+    s.gap = payload - qkv_bytes - o_tiles * o_tile_bytes;
+    if (s.gap < 0 || s.gap > int64_t(2) * head_dim * 2 + 256) return s;
+    s.ok = true;
+    s.o_off = attn_off + qkv_bytes + s.gap;
+    // Measured on Hunyuan-0.5B-Instruct_rai_1.9.0_npu against the q_norm/k_norm FP16 initializers of its own model.onnx:
+    // rounded to bf16, q_norm is at block offset 2,508,928 and k_norm 320 B later in 24 of 24 layers, each behind 64
+    // zero bytes -- the same [header][q][header][k] gap as Hunyuan-7B's, at attn_off + 64 tiles.
+    const QkGainOffsets g = qk_gain_offsets(attn_off + qkv_bytes, head_dim, s.gap);
+    s.q_norm = g.q_norm;
+    s.k_norm = g.k_norm;
+    return s;
+}
+
 std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
     if (!declared_qk || vote_hdrs != 1) return std::string();
     return "the epsilon-anchor vote recorded ONE in-block header, and this pack declares use_qk_norm, whose per-head q/k "
@@ -3716,15 +3734,17 @@ Plan plan(const std::string& pack_dir) {
                         }
                     }
                     const int64_t o_tiles_h = H / kTileRows;
-                    const int64_t qkv_bytes_c = int64_t(n_kv * 2 + n_q) * tile_bytes;
-                    const int64_t o_bytes_c = o_tiles_h * tile_o;
-                    const int64_t gap_c = payload - qkv_bytes_c - o_bytes_c;
-                    const int64_t norm_ceiling = int64_t(2) * int64_t(d.head_dim) * 2 + 256;
-                    if (!handled && payload > 0 && q_out != H && o_tiles_h > 0 && gap_c >= 0 && gap_c <= norm_ceiling) {
+                    const WideQAttnSection wq = wide_q_attn_section(attn_off, payload, int64_t(n_kv * 2 + n_q), tile_bytes,
+                                                                    o_tiles_h, tile_o, int64_t(d.head_dim));
+                    const int64_t gap_c = wq.gap;
+                    if (!handled && q_out != H && wq.ok) {
                         handled = true;
                         p.attn_tiles = n_kv * 2 + n_q;
-                        p.o_off = attn_off + qkv_bytes_c + gap_c;
+                        p.o_off = wq.o_off;
                         p.o_k = int(q_out);
+                        // engine#1889: the gap IS the per-head gains when it has their shape; 0,0 otherwise.
+                        p.qnorm_off = wq.q_norm;
+                        p.knorm_off = wq.k_norm;
                         // NOT p.attn_note: that field is the refusal channel -- a non-empty value there refuses the
                         // attention biases by name (it means "why this section could not be read"). This is the
                         // opposite: the section WAS read this way. Reported on stderr once instead.

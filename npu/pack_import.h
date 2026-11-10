@@ -96,6 +96,20 @@ struct QkGainOffsets {
 QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_bytes);
 std::string qk_norm_refusal(bool declared, bool found);
 
+// The one-header attention section of a pack whose q_proj is WIDER than hidden (Hunyuan-0.5B: hidden 1024, 16 heads x
+// head_dim 128, so q_out = 2048): [q,k,v tiles at K=hidden][gap][o_proj tiles at K=q_out]. `payload` is the bytes from
+// `attn_off` to the block's header. `ok` is false when the remainder is not a norms-sized gap (negative, or larger than
+// two gains plus 256 B), which is a layout this reader has not measured. When the gap has the gains' shape
+// (qk_gain_offsets()), `q_norm`/`k_norm` are their offsets; otherwise both are 0 and the section is still read
+// (engine#1889: this branch placed o_proj and never named the gains, so a pack that declares use_qk_norm was refused
+// with "gains are not where the block layout says" although they sit in the gap it had just computed).
+struct WideQAttnSection {
+    bool ok = false;
+    int64_t gap = 0, o_off = 0, q_norm = 0, k_norm = 0;
+};
+WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t qkv_tiles, int64_t tile_bytes,
+                                     int64_t o_tiles, int64_t o_tile_bytes, int64_t head_dim);
+
 // Why a pack's two layout witnesses cannot be reconciled, or "" when they can (engine#1985).
 //
 // `vote_hdrs` is the number of in-block headers the epsilon-anchor vote recorded (0 when it could not win); `declared_qk`

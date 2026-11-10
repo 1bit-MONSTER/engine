@@ -220,6 +220,15 @@ json container_table(const std::string& path) {
     return json::parse(header);
 }
 
+// The container's payload, i.e. what `data_offsets` are measured from: after the 8-byte header length and the JSON.
+std::vector<uint8_t> container_payload(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    uint64_t hlen = 0;
+    f.read(reinterpret_cast<char*>(&hlen), 8);
+    f.seekg(std::streamoff(8 + hlen));
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
 // How many I8 tensors of a container are the imported 6,144-byte q4_1f form -- exactly the
 // trigger of the forward loader's refusal (npu/forward/src/model.c, engine#1185).
 int q4_1f_tensors(const json& table) {
@@ -1470,6 +1479,44 @@ void test_tied_block32_head(const std::string& root) {
             }
             check(container_table(out + "/model.q4nx").contains("lm_head.weight"),
                   "tied block-32: the container carries the synthesised head");
+            // engine#1882 review: presence is not the assertion. The self-check above measures `q` BEFORE `tile_q4_1_f32`
+            // turns it into the bytes the container carries, so an all-zero written head passed every arm -- and that is
+            // exactly the state a serve reads. Decode the container's own bytes with the decoder the forward uses.
+            const json tbl = container_table(out + "/model.q4nx");
+            if (tbl.contains("lm_head.weight")) {
+                const std::vector<uint8_t> blob = container_payload(out + "/model.q4nx");
+                const auto offs = tbl["lm_head.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+                std::vector<float> w(size_t(onebit::npu::q4nx::kRows) * onebit::npu::q4nx::kCols, 0.f);
+                onebit::npu::q4nx::dequant_tile(onebit::npu::q4nx::Chunk::Q4_1F, blob.data() + offs[0], w.data(),
+                                                onebit::npu::q4nx::kCols);
+                // Compare against the embedding THE CONTAINER CARRIES, not against this test's recollection of what it
+                // wrote: the synthesis's claim is that the head IS the embedding, so both sides must come from the file.
+                std::ifstream cfin(out + "/config.json");
+                const json cf = json::parse(cfin);
+                const int V = cf.at("vocab_size").get<int>(), H = cf.at("hidden_size").get<int>();
+                const auto eoffs = tbl["model.embed_tokens.weight"]["data_offsets"].get<std::vector<uint64_t>>();
+                std::vector<float> emb(size_t(V) * size_t(H), 0.f);
+                for (size_t i = 0; i < emb.size(); ++i) {
+                    const uint16_t b = uint16_t(blob[size_t(eoffs[0]) + 2 * i]) |
+                                       (uint16_t(blob[size_t(eoffs[0]) + 2 * i + 1]) << 8);
+                    const uint32_t u = uint32_t(b) << 16;
+                    float v;
+                    std::memcpy(&v, &u, 4);
+                    emb[i] = v;
+                }
+                double num = 0, da = 0, db = 0;
+                int n = 0;
+                for (int r = 0; r < onebit::npu::q4nx::kRows && r < V; ++r)
+                    for (int c = 0; c < H; ++c) {
+                        const double want = double(emb[size_t(r) * size_t(H) + size_t(c)]);
+                        const double got = double(w[size_t(r) * onebit::npu::q4nx::kCols + size_t(c)]);
+                        num += want * got, da += want * want, db += got * got, ++n;
+                    }
+                const double corr = (da > 0 && db > 0) ? num / std::sqrt(da * db) : 0.0;
+                check(n > 0 && corr > 0.999,
+                      "tied block-32: the container's head, decoded from its own bytes, is the embedding (corr " +
+                          std::to_string(corr) + ", n " + std::to_string(n) + ")");
+            }
         }
         fs::remove_all(out);
         fs::remove_all(dir);

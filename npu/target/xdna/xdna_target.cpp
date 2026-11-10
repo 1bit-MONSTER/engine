@@ -282,29 +282,23 @@ bool XdnaTarget::weight_cached(int layer, int key) const {
 }
 
 int XdnaTarget::max_rows() const {
-    // engine#1900: the SEALED route keeps its design in one ELF and populates no per-role ctx_, so both loops used to
-    // find nothing and every sealed pack reported width 1 -- the chunker then walked N single-row passes, which is
-    // the whole point of step_batch's chunking. The width is known: the sealed ELF is plan-derived and `caps()`
-    // already answers which design is loaded (the decode twin or the prefill one).
-    //
-    // MIN over the loaded widths, never the first populated one: this width is the chunk width, and an over-wide
-    // launch reads past the activation BO (engine#1372 -- memory corruption, not a slow path). A 16/16/128 set must
-    // therefore answer 16; answering 128 because that role happens to be index 0 is the dangerous direction.
-    const int n = ndesigns_;
-    int w = 0;
-    if (pb16i_) {
-        int widths[Q4NX_MAX_DESIGNS] = {0};
-        for (int i = 0; i < n && i < Q4NX_MAX_DESIGNS; i++) widths[i] = ctx16_[i] ? ctx16_[i]->MD : 0;
-        w = onebit::npu::batch_width_min(widths, n < Q4NX_MAX_DESIGNS ? n : Q4NX_MAX_DESIGNS, 1);
-        if (w <= 1 && !pb16i_sealed_.empty()) w = caps().max_rows;   // sealed: no ctx, the loaded design's own M
-        if (w > 1) return w;
-    } else {
-        int widths[Q4NX_MAX_DESIGNS] = {0};
-        for (int i = 0; i < n && i < Q4NX_MAX_DESIGNS; i++) widths[i] = ctx_[i] ? ctx_[i]->MD : 0;
-        w = onebit::npu::batch_width_min(widths, n < Q4NX_MAX_DESIGNS ? n : Q4NX_MAX_DESIGNS, 1);
-        if (w > 1) return w;
-    }
-    return 1;
+    /* engine#1900 (review of #1903): this width IS the chunk width, and the activation BO holds exactly that many rows --
+     * an over-wide launch reads and poisons past the BO, which is memory corruption rather than a slow path (engine#1372).
+     * The old code returned the FIRST populated per-role entry, so a 16/16/128 set answered 128 whenever the wide role
+     * happened to be index 0: the dangerous direction was live even on the array path.
+     *
+     * The MINIMUM of the loaded widths is therefore the only safe aggregate. The SEALED-wide case (no per-role context is
+     * populated at all, so this falls through) is NOT decided here: the sealed branch took the width from a compile-time
+     * constant through caps(), which is a guess at which design is loaded, and the pack's own statement is `plan_m` -- see
+     * #1904, which reads it and measured one 4-row pass on the device (`identical=4 differing=0`). Whichever of the two
+     * lands first, this function must not answer wider than the narrowest loaded design. */
+    const int n = ndesigns_ < Q4NX_MAX_DESIGNS ? ndesigns_ : Q4NX_MAX_DESIGNS;
+    int widths[Q4NX_MAX_DESIGNS] = {0};
+    if (pb16i_)
+        for (int i = 0; i < n; i++) widths[i] = ctx16_[i] ? ctx16_[i]->MD : 0;
+    else
+        for (int i = 0; i < n; i++) widths[i] = ctx_[i] ? ctx_[i]->MD : 0;
+    return onebit::npu::batch_width_min(widths, n, 1);
 }
 
 int XdnaTarget::rows_for(int role, int want) const {

@@ -1548,7 +1548,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     /* engine#1900: say the batch width once at load, the way the block note does, so a log can be told apart from a
      * forward that never batched. Before this, a sealed pack reported 1 through the whole run and nothing said so --
      * the only symptom was N single-row passes and #1781 gate 1 having no pack to measure on. */
-    std::fprintf(stderr, "  [forward] batch width %d row(s) per launch\n", max_batch_rows());
+    std::fprintf(stderr, "  [forward] batch width %d row(s) per launch%s\n", max_batch_rows(),
+                 max_batch_rows() <= 1 ? " (single row: no per-role design width -- the sealed route reports its plan's "
+                                         "width in engine#1904)" : "");
     return true;
 }
 

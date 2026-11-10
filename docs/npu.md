@@ -2210,7 +2210,10 @@ can fail a run.
 | `NPU_INFER_DUMP_DIR=<dir>` | `<dir>/layer_<ll>.f32` per layer: the residual stream after that layer, M x H little-endian f32, row-major. The directory must exist; a file that cannot be written is reported on stderr and the run goes on. | which **layer** two runs part at (per-layer cosine against a reference trace) |
 | `NPU_INFER_DUMP_OPS=1` | one stderr line per projection and per weighted RMSNorm: `[op] L<layer> <tag> rows=<M> \|x\| mean <m> absmax <a>` | which **op** inside the layer |
 
-`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process.
+`NPU_INFER_DUMP_OPS` is on for any value other than empty or `0`, and is read once per process. When it is on, the forward prints
+`[ops-dump] NPU_INFER_DUMP_OPS is on: …` once at model load, before any request (engine#2028). A run that sets the
+variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
+looking for a code path that skips the dump.
 
 ```
   [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935

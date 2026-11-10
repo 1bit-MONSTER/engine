@@ -2248,7 +2248,9 @@ void test_block32_layers(const std::string& root) {
               "all-block-32 fixture: the stream built from the description is the layout's size (" +
                   std::to_string(good.size()) + ")");
     }
-    const auto build = [&](const char* tag, const std::string& fc, bool layers_declared) {
+    // `layer_block` / `head_block` are what cache/ops_meta.json DECLARES; the .fconst bytes are the caller's.
+    const auto build = [&](const char* tag, const std::string& fc, bool layers_declared, int layer_block = 32,
+                           int head_block = 32) {
         const fs::path dir = fs::path(root) / tag;
         fs::remove_all(dir);
         fs::create_directories(dir / "cache");
@@ -2265,12 +2267,13 @@ void test_block32_layers(const std::string& root) {
             data[2 * i + 1] = char(bits >> 8);
         }
         put_file((dir / "model.onnx.data").string(), data);
-        const auto op = [](const std::string& name, int n, int k) {
+        const auto op_at = [](const std::string& name, int n, int k, int block) {
             return R"({"type":"MladfMatMul","name":")" + name + R"(.MatMulNBits","attrs":{"N":{"value":[)" +
-                   std::to_string(n) + R"(]},"K":{"value":[)" + std::to_string(k) +
-                   R"(]},"block_size":{"value":[32]},"bits":{"value":[4]}}})";
+                   std::to_string(n) + R"(]},"K":{"value":[)" + std::to_string(k) + R"(]},"block_size":{"value":[)" +
+                   std::to_string(block) + R"(]},"bits":{"value":[4]}}})";
         };
-        std::string ops = op("lm_head", V, H);
+        const auto op = [&](const std::string& name, int n, int k) { return op_at(name, n, k, layer_block); };
+        std::string ops = op_at("lm_head", V, H, head_block);
         if (layers_declared)
             for (int l = 0; l < LAYERS; ++l) {
                 const std::string a = "model.layers." + std::to_string(l) + ".attn.",
@@ -2449,6 +2452,58 @@ void test_block32_layers(const std::string& root) {
         }
         check(!block32, "all-block-32: a pack that declares only lm_head at block 32 does not take the all-block-32 path");
         fs::remove_all(dir);
+    }
+    // 5h..5k: the path is chosen by what the pack DECLARES, one arm per declaration. The bytes are the same good
+    // all-block-32 file every time, so the only thing that changes is cache/ops_meta.json -- and a declaration this
+    // importer has no layout for must be refused with its number, never read at 32 or at 128 by default.
+    const auto declared_as = [&](const char* tag, int layer_block, int head_block) {
+        const fs::path dir = build(tag, good, true, layer_block, head_block);
+        const std::string out = out_of(tag);
+        fs::remove_all(out);
+        std::string said;
+        bool block32 = false;
+        try {
+            block32 = pi::plan(dir.string()).block32_layers;
+            const pi::Report r = pi::import_pack(dir.string(), out, pi::Options{});
+            for (const auto& w : r.refused) said += w + " | ";
+        } catch (const std::exception& e) {
+            said = e.what();
+        }
+        if (block32) said = "TOOK THE ALL-BLOCK-32 PATH " + said;
+        if (fs::exists(out + "/model.q4nx")) said = "WROTE A CONTAINER " + said;
+        fs::remove_all(out);
+        fs::remove_all(dir);
+        return said;
+    };
+    for (const int b : {3, 64, 256}) {   // 5h: every op at a block nobody has measured
+        const std::string said = declared_as(("b32-layers-all" + std::to_string(b)).c_str(), b, b);
+        check(said.find("WROTE") == std::string::npos && said.find("TOOK") == std::string::npos &&
+                  said.find("block size along K is " + std::to_string(b) + " (11 ops)") != std::string::npos &&
+                  said.find("lm_head @ " + std::to_string(b)) != std::string::npos,
+              "block declaration: every op at " + std::to_string(b) + " is refused with that number (" +
+                  said.substr(0, 200) + ")");
+    }
+    {   // 5i: layers at 32 under a block-128 head is not the all-block-32 class, and is refused by tensor
+        const std::string said = declared_as("b32-layers-head128", 32, 128);
+        check(said.find("WROTE") == std::string::npos && said.find("TOOK") == std::string::npos &&
+                  said.find("128 (1 ops)") != std::string::npos && said.find("32 (10 ops)") != std::string::npos &&
+                  said.find("lm_head @") == std::string::npos,
+              "block declaration: layers at 32 with the head at 128 is refused, naming the layers (" +
+                  said.substr(0, 260) + ")");
+    }
+    {   // 5j: layers at 32 with the head at 64 -- one unmeasured op is enough to leave the class
+        const std::string said = declared_as("b32-layers-head64", 32, 64);
+        check(said.find("WROTE") == std::string::npos && said.find("TOOK") == std::string::npos &&
+                  said.find("64 (1 ops)") != std::string::npos,
+              "block declaration: layers at 32 with the head at 64 is refused (" + said.substr(0, 260) + ")");
+    }
+    {   // 5k: the same ops all declared at 128 stay on the block-128 walk (which then refuses THESE bytes, because
+        // they are a block-32 file: the point is that the declaration, not a default, picked the path)
+        const std::string said = declared_as("b32-layers-all128", 128, 128);
+        check(said.find("WROTE") == std::string::npos && said.find("TOOK") == std::string::npos &&
+                  said.find("block size along K") == std::string::npos && !said.empty(),
+              "block declaration: every op at 128 does not take the all-block-32 path or the block gate (" +
+                  said.substr(0, 260) + ")");
     }
 }
 

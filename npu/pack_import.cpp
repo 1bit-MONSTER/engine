@@ -3541,7 +3541,9 @@ Plan plan(const std::string& pack_dir) {
                     }() + ", and this importer decodes the block-" + std::to_string(kKBlock) +
                     " tile layout only: at a different block every subvolume offset in the .fconst moves, so the "
                     "weights would be read from the wrong place, not merely mis-scaled. The off-block tensor(s) are " +
-                    list + "; only the LM head could be tolerated, because the layers come before it in the tail.");
+                    list + "; only the LM head could be tolerated, because the layers come before it in the tail. (The "
+                    "one other layout this importer reads is the all-block-32 one, and only for a pack that declares "
+                    "32 on every op.)");
             }
         }
         if (!bits.empty() && !(bits.size() == 1 && bits.begin()->first == 4))

@@ -18,6 +18,7 @@
 //
 //   ops_dump_test             the checks below
 //   ops_dump_test --enabled   prints 1 or 0: what ops_dump_enabled() says in a process started with this environment
+//   ops_dump_test --announce  calls ops_dump_announce() twice and prints the two results (engine#2028's load line)
 #include "ops-dump.h"
 
 #include <cmath>
@@ -46,10 +47,29 @@ static int child_says(const char* self, const char* env_prefix) {
     return c == '1' ? 1 : c == '0' ? 0 : -1;
 }
 
+// Everything a fresh process writes, stderr included, for one environment and one mode.
+static std::string child_output(const char* self, const char* env_prefix, const char* mode) {
+    const std::string cmd = std::string(env_prefix) + " '" + self + "' " + mode + " 2>&1";
+    std::string got;
+    if (FILE* p = popen(cmd.c_str(), "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, p)) got += line;
+        pclose(p);
+    }
+    return got;
+}
+
 int main(int argc, char** argv) {
     using namespace onebit::npu;
     if (argc > 1 && !std::strcmp(argv[1], "--enabled")) {
         std::printf("%d\n", ops_dump_enabled() ? 1 : 0);
+        return 0;
+    }
+    if (argc > 1 && !std::strcmp(argv[1], "--announce")) {
+        const bool first = ops_dump_announce();
+        const bool second = ops_dump_announce();
+        std::fflush(stderr);
+        std::printf("%d%d\n", first ? 1 : 0, second ? 1 : 0);
         return 0;
     }
 
@@ -65,6 +85,16 @@ int main(int argc, char** argv) {
     check(child_says(argv[0], "env NPU_INFER_DUMP_OPS=") == 0, "process: empty is off");
     check(child_says(argv[0], "env NPU_INFER_DUMP_OPS=0") == 0, "process: 0 is off");
     check(child_says(argv[0], "env NPU_INFER_DUMP_OPS=1") == 1, "process: 1 is on");
+
+    // The load line (engine#2028): printed once when the dump is on, never when it is off. Its absence with the variable
+    // set is how a run tells that its binary predates the dump.
+    check(child_output(argv[0], "env NPU_INFER_DUMP_OPS=1", "--announce") == std::string(ops_dump_banner()) + "10\n",
+          "on: the banner once, and the second call is silent; got: " +
+              child_output(argv[0], "env NPU_INFER_DUMP_OPS=1", "--announce"));
+    check(child_output(argv[0], "env -u NPU_INFER_DUMP_OPS", "--announce") == "00\n", "unset: no banner");
+    check(child_output(argv[0], "env NPU_INFER_DUMP_OPS=0", "--announce") == "00\n", "0: no banner");
+    check(std::string(ops_dump_banner()).find("NPU_INFER_DUMP_OPS") != std::string::npos,
+          "the banner names the variable, so a grep for it finds the line");
 
     // Read once: whatever this process decided first, a later change of the variable does not move it.
     const bool first = ops_dump_enabled();

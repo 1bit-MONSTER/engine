@@ -228,6 +228,12 @@ struct Plan {
     std::string container_geometry_source;          // "dims", "config.json", or empty when neither answered
     std::vector<std::string> container_geometry_missing;   // fields no source could fill, by name
     std::vector<std::string> container_geometry_inferred;  // fields derived from another field, by name
+    // engine#1786 (item F1), slice 3b: what the pack's names say it carries, and what nothing recognised. `unassigned`
+    // is the list that matters -- it means "nothing knows this tensor", so an empty one is the statement that the role
+    // map covers the pack. The SSM and MTP families are recognised (roles `ssm` / `mtp`), so a hybrid pack and a draft
+    // head do not masquerade as unknown tensors.
+    std::map<std::string, int> container_role_counts;
+    std::vector<std::string> container_roles_unassigned;
     int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)

@@ -70,9 +70,15 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 
 **What ends an answer.** The serve stops on every id in `config.json`'s `eos_token_id` (one integer or a list), on
 `<|endoftext|>` when the tokenizer has it, on `tokenizer_config.json`'s `eos_token` when that file is beside the
-tokenizer, and, when the chat route falls back to ChatML, on `<|im_end|>`. The two files need not agree: FastFlowLM's
+tokenizer, and on the marker the chat route's prompts close an assistant turn with: `<|im_end|>` on the ChatML
+fallback, or, when the container's own template is rendered, whatever that template puts right after an assistant
+message (`<|end|>` for Phi, `<|eot_id|>` for Llama 3, `<end_of_turn>` for Gemma), read off a rendered two-message
+exchange at load. The two files need not agree: FastFlowLM's
 `Qwen3.5-2B-NPU2` container names `<|endoftext|>` in the first and `<|im_end|>` in the second, and the model ends a
-chat turn with the second. The load prints the list (`forward-serve: stops on …`).
+chat turn with the second. And neither file has to name the turn end at all: FastFlowLM's
+`Phi4-mini-Instruct-NPU2` names `<|endoftext|>` in both, its template closes every turn with `<|end|>`, and before
+the template was consulted its answer ran on past `Paris<|end|><|assistant|>` to the token budget. The load prints
+the list (`forward-serve: stops on …`).
 
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the OpenAI-compatible API
 ([serve.md](serve.md)); inside Lemonade, that is what its `onebit` backend runs (`--onebit npu`).

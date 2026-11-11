@@ -177,6 +177,21 @@
    "model_type": "opensci",
    "family": "OpenSci (1.7B 'nemotron-hq' recipe). A REMOTE-CODE class: its config carries an auto_map pointing at modeling_opensci.py / configuration_opensci.py, so the pinned backends cannot accept the architecture without that custom code. Not an alias of any supported family, and not mappable until the code is vendored or upstreamed.",
    "watch": "report"
+  },
+  "MiniCPMOcrForConditionalGeneration": {
+   "model_type": "minicpm_ocr",
+   "family": "MiniCPM-OCR 1.0 vision-language OCR pack (FastFlowLM/MiniCPM-OCR-1.0-NPU2: model.q4nx beside vision_weight.q4nx); the pinned llama.cpp registers no minicpm class at all, and the OCR read is a vision tower this engine has no route for",
+   "watch": "report"
+  },
+  "MiniCPMV4_7ForConditionalGeneration": {
+   "model_type": "minicpmv4_7",
+   "family": "MiniCPM-V 4.7 vision-language pack (MiniCPM-V-4.7-1B and -35B-A3B NPU2, each shipping vision_weight.q4nx beside model.q4nx); nothing at the pin registers a minicpmv class, so this is a vision tower plus a text decoder this engine does not serve, not an alias",
+   "watch": "report"
+  },
+  "WhisperForConditionalGeneration": {
+   "model_type": "whisper",
+   "family": "Whisper ASR encoder-decoder (Whisper-V3-Turbo-NPU2, base openai/whisper-large-v3-turbo); whisper at the pin is a separate library (whisper.cpp), not a class the engine's text route registers, and the q4nx pack is an audio encoder this backend never loads",
+   "watch": "report"
   }
  }
 }

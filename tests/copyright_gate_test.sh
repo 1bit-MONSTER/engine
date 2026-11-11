@@ -161,6 +161,17 @@ check "...and exactly one SPDX line is left in the window" \
 # left the copy in place, so the file it had just written still failed the very check that sent it there.
 printf '%s%s\nx = 1\n' "$NOTICE_BLOCK" "$NOTICE_BLOCK" > "$tmp/doubled.py"
 git -C "$tmp" add doubled.py
+# (checked with `case`, not `python --check | grep -q`: this file runs under `set -o pipefail` and `--check` exits 1 BY DESIGN
+# for the duplicate it just reported, so the pipeline would return 1 even when grep matched -- the same `cmd | grep` trap that
+# makes `$?` the pipeline's rather than the command's.)
+# the report must name the command that repairs it: the old text said "delete the second copy", i.e. hand-edit a file that
+# `--fix` had been failing on and now repairs (engine#2192), so a reader was told to do by hand what the tool does.
+# assigned first, not nested: `\"` inside `$( )` inside a double-quoted argument is NOT unescaped by bash, so a nested form
+# comparing the captured output passes the quote characters into the path (`cd: "/tmp/..."`).
+dup_report=$( cd "$tmp" && python3 copyright.py --check 2>&1 )
+check "the duplicate report names --fix rather than telling the reader to edit by hand" \
+      "case \"\$dup_report\" in *'keeps the first copy'*) true ;; *) false ;; esac" \
+      "$( cd "$tmp" && python3 copyright.py --check 2>&1 | grep duplicated )"
 ( cd "$tmp" && python3 copyright.py --fix >/dev/null 2>&1 )
 check "--fix on a doubled block leaves a file that its own --check accepts" \
       "! ( cd \"$tmp\" && python3 copyright.py --check 2>&1 | grep -q duplicated )" \

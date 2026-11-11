@@ -221,6 +221,18 @@ public:
     // The post-final-norm hidden of EVERY row of the last batched pass (M x H, row-major): a speculative drafter
     // has to advance its own stream over the rows that were actually accepted, and those are exactly these.
     const std::vector<float>& last_hidden_rows() const { return last_hidden_rows_; }
+    // engine#1780: the residual stream after the listed layers, for a draft that reads the target's hidden states
+    // (a DFlash draft's target_layer_ids). `layers` must be ascending and inside the model; every pass then appends
+    // one row per position to *sink, [taps * H] wide, the listed layers side by side in the order given -- the
+    // layout dflash_forward.h's `taps` argument takes. Layer l's row is the stream as layer l + 1 receives it (after
+    // layer l's own closing scale). Works for step() and for the batched passes. An empty list or a null sink turns
+    // it off; the sink must outlive the passes. Returns false, changing nothing, on a list that is not usable.
+    // A pass that returns false appends nothing: whatever it had written is taken back, so the sink only ever holds
+    // rows of passes that succeeded. A call refused earlier on the same forward does not affect later passes.
+    // Not for use under NPU_BATCH_CHECK: that oracle replays positions through step(), and the replays would be
+    // appended as if they were new positions.
+    bool set_layer_taps(const std::vector<int>& layers, std::vector<float>* sink);
+    int layer_count() const { return c_.NL; }   // layers of the loaded model; 0 before init
     // One row of the embedding table (what a token means to the model): the MTP drafter's `pre_fc_norm_embedding`
     // input.  It reads the same table the forward uses, so the drafter cannot drift from the model's embeddings.
     void embed_row(int token, std::vector<float>& out) const {
@@ -240,12 +252,21 @@ private:
     bool load_norms();
     std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
     std::vector<float> last_residual_;  // and one norm earlier: the raw residual of the last position
+    std::vector<int>    tap_layers_;           // engine#1780: set_layer_taps()
+    std::vector<float>* tap_sink_ = nullptr;
+    size_t              tap_base_ = 0;         // where the current pass's rows start in *tap_sink_
+    bool                tap_fault_ = false;    // a tapped layer arrived with a different row count than the pass opened with
+    void tap_layer(int layer, const float* X, int M);
+    // The bodies of step() and step_batch(). The public functions wrap them so that a failed pass leaves the tap
+    // sink as it found it (layer_taps.h, LayerTapPass).
+    bool step_impl(int token, int pos, std::vector<float>& logits, int cache_pos);
+    bool step_batch_impl(const std::vector<int>& tokens, int start_pos, std::vector<float>& logits);
     std::vector<float> last_hidden_rows_;  // [M][H] normed hidden of the last batched pass
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
     std::vector<float>* batch_all_out_ = nullptr;
-    // engine#803 A2b step one: the decode-family block as its own method, body unchanged, so the move into
-    // XdnaTarget::open_decode_family() is a copy rather than surgery inside init_impl.
+    // engine#803 A2b: the model's half of the decode family (design names, summary lines, the wide and narrow
+    // sealed families); the per-role ELF resolution and context creation is XdnaTarget::open_decode_family().
     bool open_decode_family_local(bool want_m16, xrt::device* dev, const std::string& mdir,
                                   const std::string& dir);
 
@@ -666,6 +687,21 @@ private:
     bool gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                          std::vector<float>& out);
     bool load_gdn_layer(int l);
+
+    // ── LFM2 gated short-convolution layers ──────────────────────────────
+    // A layer that carries shortconv.* tensors has no attention: in_proj (H -> 3H, the QKVLIN design, weight
+    // key 0) and out_proj (H -> H, the O design, key 1, the slot an attention layer's o_proj has) run on the
+    // device, and everything between them is lfm2_shortconv.h on the host. The only state is the last L-1
+    // values of B*X per channel, kept in conv_state_[l] so snapshot/restore/reset cover it with no new code.
+    bool shortconv_ = false;                       // the model has at least one such layer
+    int sc_taps_ = 0;                              // L, from shortconv.conv.weight's own shape
+    std::vector<uint8_t> sc_layer_;                // [NL] 1 = conv layer
+    std::vector<std::vector<float>> sc_w_;         // [NL][H * L] the depthwise taps, bf16-decoded once
+    std::vector<std::vector<float>> sc_rows_;      // [NL][rows * H] B*X of a verify batch's rows (see begin_verify)
+    bool is_conv_layer(int l) const { return shortconv_ && l >= 0 && l < (int)sc_layer_.size() && sc_layer_[(size_t)l]; }
+    bool conv_layer(int l, const std::vector<float>& xn, std::vector<float>& out);
+    bool conv_layer_batch(int l, const std::vector<float>& xn, int M, std::vector<float>& out);
+    void conv_apply_rows(int rows);                // re-apply the first `rows` recorded rows after a restore
     std::string err_;
     std::string backend_ = "uninitialised";
     bool ready_ = false;

@@ -126,9 +126,11 @@ proved by the byte-exact gate rather than assumed. It is listed in §5.
   the artifact, refuses by name, and owns `init_elf`; the forward no longer creates an `I8Ctx` for the
   prefill set. The device is passed at construction (`XdnaTarget(xrt::device*)`), which keeps
   `NpuTarget::open(plan, kernels_dir, family, err)` exactly as documented here. **Done** (#1380).
-- **still in the forward, and therefore still owed**: the M=16 decode family and the lm-head context.
-  Moving them needs only the setup state that `configure(Setup)` already carries (dirs, family, plan,
-  layout flags), which is why that struct exists.
+- **the lm-head context and the M=16 decode family are the target's** too: `XdnaTarget::open_head()`
+  (#1458, #1478) and `XdnaTarget::open_decode_family()` (#2166, A2b). The forward still names the decode
+  designs (`open_decode_family_local()`, from the plan's `decode.dirs`) and the target opens and configures
+  the M=16 contexts. What remains of context setup in the forward is the optional wide and narrow sealed
+  families (`load_family` in the same function), which it still configures field by field.
 - `load_block(first_layer, n_layers, err)` — **not started, and its premise is now measured, which changes
   what it is for.** It was described here as taking over "`load_layer()`'s packing half (`wcache_` fill +
   pb16i image load)"; at this tree that half is **already the target's**: `wcache_` lives in
@@ -234,7 +236,23 @@ What is still not wired, and stated as such: `gdn_step`/`attn_step` dispatch nee
 ## 4. Gate (unchanged from #803)
 
 1. `window11`: 3 greedy prompts, text identical to the current binary.
-2. Logits KLD **0** on 8 prompts (the same prompts the hw-gate uses), same model dir and kernel set.
+2. Logits KLD **0** on 8 prompts, same model dir and kernel set in both arms. (This line used to ask for the hw-gate's prompts; the row below was run on eight fixed completions and says so.)
+
+   **Measured (2026-11-11, on the NPU, under `npu-hold` tickets).** Baseline: the binary at `540e1fd`
+   (before the decode-family move), run twice as the control. Candidate: `main` at `d0fa51c` (with #2166).
+   Both built against the same runtime. Model `ZR1-1.5B-npu-q4km-v2` with its 8 kernels (4 roles at M=16),
+   8 fixed prompts through `/v1/completions` (so both arms tokenise the same text), 8 greedy tokens each,
+   `--dump-logits` on, compared with `tools/logits_kld.py`:
+
+   | comparison | positions | mean KLD | max KLD | dumps byte-identical | texts identical |
+   |---|---|---|---|---|---|
+   | baseline run 1 vs run 2 (control) | 64 | 0.000000 | 0.000000 | 64 of 64 | 8 of 8 |
+   | baseline vs `main` | 64 | 0.000000 | 0.000000 | 64 of 64 | 8 of 8 |
+
+   The dumps are the same bytes, so the KLD is 0 exactly, not to a tolerance. Two limits: the prompts are
+   eight fixed completions, not the hw-gate's list, and the model is the 1.5B one, because the 27B container
+   did not fit above the box's memory floor that day; the 27B row of this gate is item 1's (window11, three
+   texts identical across the same two binaries, on #803).
 3. `NPU_PROFILE=1` profile table: every row within 2 % of the pre-split binary, same row count.
 4. `ctest` green; `--npu-target xdna` is the default and an unknown target name is refused by name.
    The flag is `forward-serve`'s (the per-op route's own command) and `serve` carries it through to that child,

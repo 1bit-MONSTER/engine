@@ -28,6 +28,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace fs = std::filesystem;
 using namespace onebit;
@@ -94,7 +95,7 @@ void put(const fs::path& p, const std::string& text) {
 }  // namespace
 
 int main() {
-    const fs::path dir = fs::temp_directory_path() / ("mem_admit_test_" + std::to_string(::getpid()));
+    const fs::path dir = ::onebit::test::tmp_root() / ("mem_admit_test_" + std::to_string(::getpid()));
     fs::create_directories(dir);
     const std::string d = dir.string();
 

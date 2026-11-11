@@ -68,6 +68,12 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
   npu/                   the model's NPU kernels
 ```
 
+**What ends an answer.** The serve stops on every id in `config.json`'s `eos_token_id` (one integer or a list), on
+`<|endoftext|>` when the tokenizer has it, on `tokenizer_config.json`'s `eos_token` when that file is beside the
+tokenizer, and, when the chat route falls back to ChatML, on `<|im_end|>`. The two files need not agree: FastFlowLM's
+`Qwen3.5-2B-NPU2` container names `<|endoftext|>` in the first and `<|im_end|>` in the second, and the model ends a
+chat turn with the second. The load prints the list (`forward-serve: stops on …`).
+
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the OpenAI-compatible API
 ([serve.md](serve.md)); inside Lemonade, that is what its `onebit` backend runs (`--onebit npu`).
 
@@ -83,6 +89,25 @@ The schema, the refusal rules and the generator flags are in [npu-plan.md](npu-p
 | `fusion.gate_up` (`fused`/`split`) | the fused `full_i8_GU_*` kernel won, and with no split kernel on disk the split layout was assumed |
 | `kernels.tag` (`""`/`_b8`/`_pb16i`/`_t2s`) | the artifact family came from `q4nx_weight_layout`, so a kernel dir of the other family changed which kernels ran |
 | `decode.dirs` | the M=16 twins were looked for in `<model>/kernels-m16`, then `<kernels>/m16`, then `<kernels>` |
+
+**A decode off the 16-row family is said at ready (engine #2102).** forward-serve prints one line after `ready on
+http://...` when roles have no M=16 decode kernel. In that case every decode step runs a 128-row prefill launch:
+
+```
+npu: 0 of 4 role(s) have a 16-row decode kernel in <kernels> -- decode runs prefill-width launches and is far slower than the fused route (engine#2102). ...
+```
+
+The load line `[forward] decode family: N role(s) at M=16, ...` stays byte-for-byte, because gates grep it. The new line
+is silent when:
+
+- the family is full;
+- the arm is host-GEMM (`NPU_INFER_HOST_GEMM`, which loads no family);
+- the container is ternary (pb16i/t2s) with some roles on M=128. Its loader refuses a missing decode kernel, and the
+  roles it leaves are covered by its geometry, which the load log names per role.
+
+`NPU_DECODE_M16=0` gets its own sentence, which names the switch. The twins are not the way to the demo rate. Measured on
+Qwen3-0.6B, the per-op forward decodes at ~1.7 tok/s without them and ~2.7 tok/s with all four, against 88-101 tok/s on
+the fused route.
 
 `tools/npu_plan.py <model dir>` writes one from `config.json` plus the kernel directory (it derives layer
 roles from `layer_types` and projection shapes from the model's own dimensions, the way the forward does).
@@ -544,7 +569,9 @@ may name a second sealed ELF with the same instances built for more rows: `q4nx_
 `q4nx_pb16i_sealed_wide_elf`) in `config.json`, a file in the kernels directory beside the 16-row one, and
 `q4nx_sealed_wide_rows` for its row count (default 32, allowed 17..128). No pack ships one yet, so nothing
 changes for an existing pack. `NPU_WIDE_SEALED_ELF=<file>` overrides the pack's file, `NPU_WIDE_SEALED_ELF=0`
-switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count.
+switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count. `tools/npu_plan.py` copies
+the two keys into `plan.json` as `prefill.sealed_elf` and `prefill.sealed_rows`, and a loaded plan wins over
+`config.json` (`docs/npu-plan.md`).
 
 When the wide ELF loads for every role that has a 16-row kernel, the chunk width becomes its row count and a
 launch of more than 16 rows takes the wide kernel; decode steps and chunks of up to 16 rows stay on the
@@ -566,6 +593,33 @@ arms off / on / off / on, three 510-536-token prompts per arm (`prompt_tokens / 
 Two 16-row blocks against one 32-row block is 30-31 rows/s against 35-37. The 8-token greedy text is
 identical with the family off and on, and `NPU_BATCH_CHECK=1` on the wide path reports MATCH on every chunk
 it checks (32-, 4- and 1-row) in both tickets. Only 32 rows has been measured.
+
+**...and a narrow family for decode (#2073).** A decode step on `bonsai2-27b-t2s2` is 416 launches, and
+device wait is 211 of its 302 ms: every launch runs a kernel built for 16 rows and carries one, and a
+launch's device time does not depend on how many of its rows are filled. So a pack may also name a sealed
+ELF built for FEWER rows: `q4nx_t2s_sealed_narrow_elf` (or `q4nx_pb16i_sealed_narrow_elf`) and
+`q4nx_sealed_narrow_rows` (default 4, allowed 1..15) in `config.json`; `NPU_NARROW_SEALED_ELF=<file>`
+overrides the file, `=0` switches it off, `NPU_NARROW_ROWS` overrides the rows. A launch of 1..rows rows
+takes it (a decode step, or a verify pass of a few rows); anything wider keeps the 16-row family. The rules
+are the wide family's: all roles or none, one hw_context, shared weight images, and a file that is missing
+or does not load is logged (`[forward] narrow family NOT adopted (...)`) while decode stays on the 16-row
+kernels. `narrow_family_complete` and `narrow_takes` in `batch_width.h` are pinned by
+`tests/npu_pack_test.cpp`. No pack ships a narrow ELF yet. `plan.json` carries it as `decode.narrow_elf` and
+`decode.narrow_rows` (`docs/npu-plan.md`).
+
+Measured with a 4-row set, one binary, arms 16-row / 4-row / 16-row / 4-row, three prompts generating 49
+tokens each (`(tokens - 1) / (wall - wall of a 1-token request)`), two `npu-hold` tickets:
+
+| ticket, pair | decode, 16-row family | decode, 4-row family | device wait per step |
+|---|---|---|---|
+| first, pair 1 | 3.26-3.33 tok/s | **3.69-4.21 tok/s** | 210.1 -> 158.1 ms |
+| first, pair 2 (another lane loading the box) | 1.88-2.59 tok/s | 2.33-3.14 tok/s | 230.7 -> 208.1 ms |
+| second, pair 1 | 2.85-3.29 tok/s | **3.90-4.16 tok/s** | 234.7 -> 151.7 ms |
+| second, pair 2 | 2.15-3.32 tok/s | **4.05-4.19 tok/s** | 210.9 -> 150.9 ms |
+
+The step wall follows the wait: 286.0 -> 233.7 ms and 296.2 -> 225.9 ms in the quiet pairs. The 49-token
+greedy text of each prompt is identical in all eight arms, and `NPU_BATCH_CHECK=1` with the narrow family
+reports MATCH on every chunk it checks (1-, 4- and 6-row; the 6-row one runs on the 16-row family).
 
 **A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
 a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
@@ -1580,6 +1634,80 @@ output for it as goldens, so the arithmetic is checked in CI without a pack; wit
 `ONEBIT_MINICPM_PACK` and `ONEBIT_MINICPM_ORACLE` set it repeats the comparison above. The reference
 run itself needs transformers and torch and is not in the tree.
 
+**Where an image goes before the tower (`npu/vision_plan.h`).** `vision::plan_image(height, width)` is
+the arithmetic of the model's image processor (transformers' `MiniCPMV4_6ImageProcessor`, which 4.7
+loads), with no pixel touched: the model looks at an image whole, resized to about 448 × 448 pixels,
+and, when the image is larger than that, again as a grid of up to 9 slices cut from a second, larger
+resize. Every piece is a multiple of 56 pixels (4 patches) in both extents, because the tower merges
+2 × 2 twice, and becomes `(height/56) × (width/56)` rows on the text side.
+
+| image | whole view | slices | text rows |
+|---|---|---|---|
+| 448 × 448 or smaller (scaled up) | 448 × 448 | none | 64 |
+| 480 × 640 | 392 × 504 | 1 × 2 of 560 × 392 | 63 + 2 × 70 |
+| 1080 × 1920 | 336 × 616 | 2 × 4 of 448 × 448 | 66 + 8 × 64 |
+| 3024 × 4032 | 392 × 504 | 3 × 3 of 392 × 504 | 63 + 9 × 63 |
+
+(heights first.) So one 448-pixel slice is 64 rows, not the 1,225 that 980 / 14 / 2 squared suggests: the
+position table is 70 × 70, but no piece the processor produces is that large unless the image is a very
+long strip. The plan is checked against the reference's own answers for 3,481 image sizes in
+`tests/npu_vision_plan_test.cpp`. Nothing is cropped or padded and no size is refused for not being a
+multiple of anything: every image is resized whole (385 × 384 becomes 448 × 448, so the aspect ratio moves
+a little, as it does in the model's own processor), and the slices tile the refine size exactly. The plan
+does not bound its result: a 1,048,576 × 1 strip gives the reference's answer, a piece 458,752 pixels
+tall, and it is the caller that decides how many rows to accept. `plan_image()` reads no file and touches
+no pixel, which is what lets it be checked anywhere; keep it that way.
+
+**From bytes to the tower's input (`npu/vision_image.h`).** `vision::preprocess(rgb, height, width, plan)`
+resizes an RGB byte image to the plan's whole view and, when it is sliced, to the refine size, cuts the
+slices, and returns each piece as `(3, height, width)` float32 with value `(byte − 127.5) / 127.5`
+(rescale by 1/255, then mean 0.5 and std 0.5, the same for each channel; R, G, B order in and out; byte
+0 is exactly −1 and byte 255 exactly +1): the whole view first, then the slices row by row. The resize is bicubic with antialiasing on bytes and
+reproduces `torch.nn.functional.interpolate(uint8, mode="bicubic", antialias=True)` (torch 2.13) bit
+for bit: the a = −0.5 cubic stretched by the scale when shrinking, integer weights at the largest
+precision that still fits int16 (PIL's fixed 22 bits differs by one in about 1 % of bytes), width
+first and then height. `tests/npu_vision_image_test.cpp` holds the reference's bytes for eleven
+resizes as hashes.
+
+End to end on the 1B pack, 2026-11-10: a 460 × 470 synthetic image through plan, resize, pieces and
+`tower_forward()`, against the reference's plan, torch's resize and the transformers tower on the same
+image:
+
+| piece | patches | rows | max \|d\| | corr |
+|---|---|---|---|---|
+| whole view 448 × 448 | 32 × 32 | 64 | 6.4e-6 | 1.000000000 |
+| slice 0, 616 × 336 | 44 × 24 | 66 | 7.5e-6 | 1.000000000 |
+| slice 1, 616 × 336 | 44 × 24 | 66 | 6.7e-6 | 1.000000000 |
+
+That run took 110 s on one thread, which is the host reference's cost and the reason it is not a
+serving path. Two things are not established: the reference side called torch's `interpolate`
+directly, on the understanding that this is what the processor's torchvision resize does for byte
+images on a CPU build with AVX2 (torchvision is not on this box, so that link is read, not run); and
+no real photograph or image decoder has been through it. The slice separators and placeholder rows on
+the text side are not written.
+
+**The text side of an image (`npu/vision_prompt.h`).** Two more pieces of arithmetic, on token ids only:
+
+- `vision::image_tokens(plan, markers)`: what replaces one `<|image_pad|>` in the rendered prompt.
+  `<image>`, one placeholder per row of the whole view, `</image>`, then each row of slices as
+  `<slice>` placeholders `</slice>` per slice, with one newline token between rows. The tower's rows go
+  into the placeholders in order. (`<image_id>k</image_id>` in front is ordinary text, left to the
+  caller.)
+- `vision::prompt_positions(ids, markers, grids)`: the three position planes (t, h, w) for a prompt that
+  contains images, the model's `mrope_mode: canvas`. Text counts 1, 2, 3 on all three planes. An image
+  is laid on a canvas whose origin is the next free position: the slices tile it, the whole view is
+  stretched over it, `<image>` sits one step before it and `</image>` on its far corner, and the text
+  after it resumes at `origin + max(canvas height, canvas width) + 1`. So an image moves the position
+  counter by its **side**, not by its row count: a 480 × 640 picture is 203 placeholder rows and
+  advances the position by 15.
+
+Both follow transformers' `MiniCPMV4_7Processor.replace_image_token` and
+`MiniCPMV4_7Model.get_rope_index`, and `tests/npu_vision_prompt_test.cpp` holds that code's answers for
+eight prompts (one to two images, with and without slices, touching, newline-separated, with id
+prefixes, and none) as hashes over every token id and position. Images only: video frames are not
+handled. Nothing feeds these planes or the tower's rows into the text forward yet; that is the route's
+work.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
@@ -1736,12 +1864,15 @@ re-dequantised each layer's 17408-wide dense FFN tail on every token even after 
 packed on the device. `ffn_tail_cached()` (`npu/forward/src/q4nx_forward.cpp`) closes that: once a
 layer's packed gate/up/down BOs are resident, the f32 `wg_`/`wu_`/`wd_` buffers are no longer read,
 so the reload is skipped. It is on by default for a GDN model on the NPU route, when the packed
-weight cache is on, the run is not `NPU_INFER_HOST_GEMM`, and the tail is at least 256 MB per layer
-(the size guard; below that the reload is too small to be worth a behaviour change). `NPU_FFN_CACHE=0`
+weight cache is on, the run is not `NPU_INFER_HOST_GEMM`, and the tail is at least 128 MB per layer
+(the size guard, set just under the smallest tail measured; `npu/forward/include/ffn_cache_policy.h`). `NPU_FFN_CACHE=0`
 or `=1` forces it either way, and the resolved state is logged once as
 `[ffn] dense-tail cache on|off (default|NPU_FFN_CACHE; lin_kd=… IM=… H=…)`. On Qwen3.8-27B-NPU2 an
 interleaved 5-round A/B (`~/lb/587-cache-20261030`) measured an 8-token request at 104.5 s against
 117.4 s (**−11%**), CPU per token 22.9 s against 63.3 s (**−64%**), same text in every arm.
+On FastFlowLM's Qwen3.5-2B-NPU2 (IM 6144, H 2048, a 151 MB tail that the earlier 256 MB floor left out) an A B B A
+run in one ticket measured decode at 362–367 ms per token with the cache on (both arms) against 485–520 ms with
+it off in the quieter of the two off arms and 478–707 ms in the other, same text in all twelve runs (engine#1785).
 
 ### The prefix cache's snapshot: two kinds of plane
 
@@ -2000,6 +2131,11 @@ forward-serve` serves that too, from the same process and the same weights:
 |---|---|
 | `POST /v1/systemone` (alias `POST /v1/decisions`) | `{"state": …, "questions": {id: question}}` → `{"model", "answers": {id: answer}, "usage"}` |
 | `GET /v1/systemone/models` | the decision model this build serves: name, description, `max_input_tokens`, `modalities` |
+
+A pack that declares `attention_mode: noncausal_full_attention` (below) is a decision model and nothing else:
+it encodes a prompt in one pass and has no token-by-token decode. On such a pack `/v1/chat/completions` and
+`/v1/completions` answer **400** with `type: decision_model_error` and a message that names `/v1/systemone`
+(or says there is no decision head, when the serve loaded none), before any work is done.
 
 `questions` is an **object**, and its ids come back as the keys of `answers` in request order. Question
 types are `choice` (1–255 options), `noul` and `score` (2–10 ordered levels); a decision runs one backbone

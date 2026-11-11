@@ -200,6 +200,12 @@ add_test(NAME serve_hangup COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_hangup_test.s
 # engine#1945: scripts/bump-hrx-sync.sh tells AMD's own commit from a line AMD rebased apart from a commit that
 # is not AMD's. Local git repositories only: no network, no GPU.
 add_test(NAME bump_hrx_sync COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_sync_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-sync.sh)
+# engine#2102: the sentence a serve owes an operator when no 16-row decode kernel was found (app/npu_decode_note.h). Pure:
+# the silent cases are the ones that matter, and they are arms.
+add_executable(npu_decode_note_test tests/npu_decode_note_test.cpp)
+target_include_directories(npu_decode_note_test PRIVATE app)
+add_test(NAME npu_decode_note COMMAND npu_decode_note_test)
+add_dependencies(onebit npu_decode_note_test)
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
@@ -306,6 +312,16 @@ add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_or
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
 add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#803 gate, second half: the comparator that turns two --dump-logits directories into the KLD verdict the
+# P4 gate asks for. No device and no model, so the gate is one command when a ticket is free; the self-test pins
+# the four cases a KLD implementation gets wrong (identical -> exactly 0, a shift is positive and directional, a
+# uniform shift stays 0, and an asymmetric file set is refused by name).
+add_python_test(logits_kld_self ${CMAKE_SOURCE_DIR}/tools/logits_kld.py --self-test)
+# engine#2018: this one was in tools/ci/unreferenced_py_tests.txt as a baseline entry, and it should not have been: the
+# file is portable and passes (worst-case |sum| 11.18e6 inside int32 at K=11008, 4 arms), it just never had a runner. A
+# baseline records a test as never-run, which for a passing test is the wrong outcome -- so it is registered and the line
+# is removed, which is the shrink the baseline's own comment asks for.
+add_python_test(moe_expert_chunks_accum_test ${CMAKE_SOURCE_DIR}/tests/moe_expert_chunks_accum_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.
@@ -353,9 +369,23 @@ add_test(NAME bench_preflight COMMAND bash ${CMAKE_SOURCE_DIR}/tools/tests/test-
 # two false conclusions about a pack in one night. `--self-test` drives the rule on a synthetic shard (no network):
 # the same offset from the data section returns the tensor, from byte 8 it does not.
 add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-test)
+# engine#1946: a test that returns 77 is green, and green-because-it-did-not-run is the failure this fleet keeps paying
+# for. `tools/ci/ctest_skips.py` reads a ctest log and reports every test that did not execute -- `***Skipped` (77) against
+# `tools/ci/ctest_skips.txt`, and `(Not Run)` (a missing binary) as a build-list mistake that can never be baselined.
+# Self-test only here: wiring it into ci.yml's Test step needs the log plus a `workflow`-scoped token (engine#1817).
+add_python_test(ctest_skips_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_skips.py --self-test)
+# engine#2106 / #2102: the release gate's NPU serve check asserts the fast route, a decode floor, the first token and a
+# non-empty answer, because a serve on the slow per-op route still answers. --self-test drives the judging on the shape
+# of each failure (the silent fallback at 1.9 tok/s, thinking left on, a degenerate reply); no device, no binary.
+add_python_test(npu_serve_smoke_self ${CMAKE_SOURCE_DIR}/tools/npu_serve_smoke.py --self-test)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
+# engine#1313 item 3: the "after" of "before/after routing accuracy" -- a ridge head over --dump-encoder output, with the
+# table's own logits as the before arm. Self-test only, so it needs no dump and no model.
+add_python_test(laya_head_finetune ${CMAKE_SOURCE_DIR}/tools/laya_head_finetune.py --self-test)
 # engine#856: one HRX process's GTT split into the loader's copy and HRX's packed second copy, from its own -v log.
 add_python_test(hrx_gtt_split_self ${CMAKE_SOURCE_DIR}/tools/hrx_gtt_split.py --self-test)
+# engine#679: time per HRX dispatch from the backend's serial trace (the id hash and the per-kernel sums).
+add_python_test(hrx_dispatch_profile_self ${CMAKE_SOURCE_DIR}/tools/hrx_dispatch_profile.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
@@ -367,6 +397,10 @@ add_test(NAME pack_version COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_version_test.s
 # arm asserts the row's message, and a clean tree is the control. No package build, no GPU, runs in CI.
 add_test(NAME pack_check COMMAND ${CMAKE_SOURCE_DIR}/tests/pack_check_test.sh)
 add_test(NAME check_ci_runners COMMAND ${CMAKE_SOURCE_DIR}/tests/check_ci_runners_test.sh)
+# engine #1504: the release preflight blocks on a runner unit that is down and only warns on a short restart policy.
+# The real scripts/ci-runner-health.sh and weekly.sh's preflight_runner_units() against a stub systemctl; no systemd.
+add_test(NAME weekly_runner_preflight COMMAND ${CMAKE_SOURCE_DIR}/tests/weekly_runner_preflight_test.sh)
+add_test(NAME ci_runner_health_selftest COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/ci-runner-health.sh --self-test)
 # engine #1750: the carried amdxdna series applies in order to the pinned driver, and the context-restart code it
 # produces fails a context's jobs (and logs it) when the restart fails, instead of leaving them parked or running
 # them at close on a half-built firmware context. The driver's own functions in a user-space harness: no NPU, no
@@ -700,7 +734,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/vision_pack.cpp npu/vision_tower.cpp npu/vision_image.cpp
                             npu/audio_exec.cpp npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
                             npu/q4nx.cpp npu/q4nx_device.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
@@ -816,6 +850,12 @@ add_executable(laya_eval_test tests/laya_eval_test.cpp)
 target_link_libraries(laya_eval_test PRIVATE onebit_laya nlohmann_json::nlohmann_json)
 add_test(NAME laya_eval COMMAND laya_eval_test)
 add_dependencies(onebit laya_eval_test)
+# engine#1313 item 3: the head-only fine-tune over --dump-encoder dumps, on a synthetic checkpoint and dump (no model,
+# no device). It needs torch + numpy, which the engine build does not, so a box without them skips (77).
+add_python_test(laya_finetune ${CMAKE_SOURCE_DIR}/tests/laya_finetune_test.py)
+if(Python3_Interpreter_FOUND)
+    set_tests_properties(laya_finetune PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 # Crafted Laya checkpoints the reader and the scorer must refuse (written at run time); runs in CI.
 add_executable(laya_bounds_test tests/laya_bounds_test.cpp)
 target_link_libraries(laya_bounds_test PRIVATE onebit_laya nlohmann_json::nlohmann_json)
@@ -1226,6 +1266,21 @@ add_executable(npu_vision_tower_test tests/npu_vision_tower_test.cpp)
 target_link_libraries(npu_vision_tower_test PRIVATE onebit_npu)
 add_test(NAME npu_vision_tower COMMAND npu_vision_tower_test)
 add_dependencies(onebit npu_vision_tower_test)
+# The image plan (sizes, slice grid, text rows) against the reference image processor's answers for 3,481 sizes.
+add_executable(npu_vision_plan_test tests/npu_vision_plan_test.cpp)
+target_include_directories(npu_vision_plan_test PRIVATE npu)
+add_test(NAME npu_vision_plan COMMAND npu_vision_plan_test)
+add_dependencies(onebit npu_vision_plan_test)
+# The resize (bit for bit against torch's uint8 antialiased bicubic) and the pieces handed to the tower.
+add_executable(npu_vision_image_test tests/npu_vision_image_test.cpp)
+target_link_libraries(npu_vision_image_test PRIVATE onebit_npu)
+add_test(NAME npu_vision_image COMMAND npu_vision_image_test)
+add_dependencies(onebit npu_vision_image_test)
+# The text side of an image: its tokens and the canvas positions, against the reference model code's own answers.
+add_executable(npu_vision_prompt_test tests/npu_vision_prompt_test.cpp)
+target_include_directories(npu_vision_prompt_test PRIVATE npu)
+add_test(NAME npu_vision_prompt COMMAND npu_vision_prompt_test)
+add_dependencies(onebit npu_vision_prompt_test)
 add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
@@ -1297,6 +1352,12 @@ add_executable(ops_dump_test tests/ops_dump_test.cpp)
 target_include_directories(ops_dump_test PRIVATE npu/forward/include)
 add_test(NAME ops_dump COMMAND ops_dump_test)
 add_dependencies(onebit ops_dump_test)
+# When the dense-tail cache is on by default (npu/forward/include/ffn_cache_policy.h): the size rule and the two
+# models it was measured on, one on each side of the old floor. Header-only, no device.
+add_executable(ffn_cache_policy_test tests/ffn_cache_policy_test.cpp)
+target_include_directories(ffn_cache_policy_test PRIVATE npu/forward/include)
+add_test(NAME ffn_cache_policy COMMAND ffn_cache_policy_test)
+add_dependencies(onebit ffn_cache_policy_test)
 
 # The device weight layout contract (q4nx_weight_layout): pure index math, no device
 # and no runtime.  CI builds an explicit target list, so the check compiles itself with

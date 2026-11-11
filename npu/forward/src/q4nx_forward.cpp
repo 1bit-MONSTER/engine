@@ -25,6 +25,7 @@
 // element-wise.
 #include "q4nx_forward.h"
 #include "batch_width.h"
+#include "ffn_cache_policy.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
 #include <algorithm>
@@ -438,6 +439,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
     if (!want_m16) {
         fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n", 0,
                 Q4NX_DESIGN_M_DECODE, ndesigns_, Q4NX_DESIGN_M_PREFILL, " (NPU_DECODE_M16=0: disabled)");
+        decode_disabled_ = true;   // engine#2102: turned off on purpose, which the ready line must not call missing
         return true;
     }
     q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
@@ -590,6 +592,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
                 designs16_[i].N, elf.c_str());
     }
     xd_->note_m16_made(made > 0);
+    decode_roles_ = made;   // engine#2102: the caller-facing count, beside the byte-for-byte log line below
     if (pb16i_ && made < ndesigns_ - 0) {
         fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
                 t2s_ ? "t2s" : "pb16i", made, ndesigns_);
@@ -604,44 +607,64 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
     // All roles or none -- max_batch_rows() is the chunk width, so one role without a wide kernel would be
     // launched past its buffers. A named file that is missing or does not load is logged and the pass stays at
     // 16 rows: a pack must never stop serving over an optional speed-up.
-    const std::string wide_path =
-        onebit::npu::wide_elf_path(getenv("NPU_WIDE_SEALED_ELF"), wide_sealed_, sealed_dir_);
-    if (const char* wide_elf = wide_path.c_str();
-        !wide_path.empty() && pb16i_ && !pb16i_sealed_.empty() && made > 0) {
-        const char* wr = getenv("NPU_WIDE_ROWS");
-        const int rows = wr && *wr ? atoi(wr) : wide_sealed_rows_;
-        int wide = 0;
+    // The narrow decode family is the mirror image: the same instances built for FEWER rows (default 4), taken
+    // by launches of 1..rows rows -- a decode step carries one. Config `q4nx_<layout>_sealed_narrow_elf` and
+    // `q4nx_sealed_narrow_rows`; NPU_NARROW_SEALED_ELF / NPU_NARROW_ROWS override, "0" = off.
+    // One loader for both: `wide` picks the row bound, the target's make/adopt/drop trio and the log text.
+    auto load_family = [&](bool wide, const std::string& path, int rows) {
+        if (path.empty() || !pb16i_ || pb16i_sealed_.empty() || made <= 0) return;
+        const char* tag = wide ? "wide" : "narrow";
+        int n = 0;
         std::string why;
-        if (rows <= Q4NX_DESIGN_M_DECODE || rows > Q4NX_DESIGN_M_PREFILL) why = "NPU_WIDE_ROWS must be 17..128";
-        else if (!file_exists(wide_elf)) why = std::string("no such file: ") + wide_elf;
+        if (wide && (rows <= Q4NX_DESIGN_M_DECODE || rows > Q4NX_DESIGN_M_PREFILL)) why = "NPU_WIDE_ROWS must be 17..128";
+        else if (!wide && (rows < 1 || rows >= Q4NX_DESIGN_M_DECODE)) why = "NPU_NARROW_ROWS must be 1..15";
+        else if (!file_exists(path)) why = "no such file: " + path;
         for (int i = 0; why.empty() && i < ndesigns_; i++) {
             I8Ctx* c16 = xd_->ctx16(i);
             if (!c16) continue;
             const char* inst = pb16i_instance(designs16_[i].role);
-            I8Ctx* cw = inst ? xd_->make_ctx_wide(i) : nullptr;
-            if (!cw) { why = std::string("no wide context for role ") + role_tag(designs16_[i].role); break; }
-            cw->MD = rows;
-            cw->KD = c16->KD;
-            cw->ND = c16->ND;
-            cw->blocked_b = c16->blocked_b;
-            cw->pb16i = c16->pb16i;
-            cw->t2s = c16->t2s;
-            cw->pb16i_planes = c16->pb16i_planes;
-            if (!cw->init_elf(*dev, wide_elf, rows, c16->KD, c16->ND, 1, inst)) {
+            I8Ctx* c = !inst ? nullptr : (wide ? xd_->make_ctx_wide(i) : xd_->make_ctx_narrow(i));
+            if (!c) { why = std::string("no ") + tag + " context for role " + role_tag(designs16_[i].role); break; }
+            c->MD = rows;
+            c->KD = c16->KD;
+            c->ND = c16->ND;
+            c->blocked_b = c16->blocked_b;
+            c->pb16i = c16->pb16i;
+            c->t2s = c16->t2s;
+            c->pb16i_planes = c16->pb16i_planes;
+            if (!c->init_elf(*dev, path.c_str(), rows, c16->KD, c16->ND, 1, inst)) {
                 why = std::string("init_elf failed for instance ") + inst;
                 break;
             }
-            wide++;
+            n++;
         }
-        if (why.empty() && wide > 0 && !xd_->adopt_wide(rows)) why = "a role with a decode context has no wide one";
-        if (why.empty() && wide > 0) {
-            fprintf(stderr, "  [forward] wide family: %d role(s) at M=%d from %s (chunks of 17..%d rows)\n",
-                    wide, rows, wide_elf, rows);
+        if (why.empty() && n > 0 && !(wide ? xd_->adopt_wide(rows) : xd_->adopt_narrow(rows)))
+            why = std::string("a role with a decode context has no ") + tag + " one";
+        if (why.empty() && n > 0) {
+            if (wide)
+                fprintf(stderr, "  [forward] wide family: %d role(s) at M=%d from %s (chunks of 17..%d rows)\n",
+                        n, rows, path.c_str(), rows);
+            else
+                fprintf(stderr, "  [forward] narrow family: %d role(s) at M=%d from %s (launches of 1..%d rows)\n",
+                        n, rows, path.c_str(), rows);
         } else {
-            xd_->drop_wide();
-            fprintf(stderr, "  [forward] wide family NOT adopted (%s); chunks stay at %d rows\n",
-                    why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
+            if (wide) xd_->drop_wide(); else xd_->drop_narrow();
+            if (wide)
+                fprintf(stderr, "  [forward] wide family NOT adopted (%s); chunks stay at %d rows\n",
+                        why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
+            else
+                fprintf(stderr, "  [forward] narrow family NOT adopted (%s); decode stays on the %d-row kernels\n",
+                        why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
         }
+    };
+    {
+        const char* wr = getenv("NPU_WIDE_ROWS");
+        load_family(true, onebit::npu::wide_elf_path(getenv("NPU_WIDE_SEALED_ELF"), wide_sealed_, sealed_dir_),
+                    wr && *wr ? atoi(wr) : wide_sealed_rows_);
+        const char* nr = getenv("NPU_NARROW_ROWS");
+        load_family(false,
+                    onebit::npu::wide_elf_path(getenv("NPU_NARROW_SEALED_ELF"), narrow_sealed_, sealed_dir_),
+                    nr && *nr ? atoi(nr) : narrow_sealed_rows_);
     }
     return true;
 }
@@ -738,6 +761,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             wide_sealed_ = read_config_string(
                 cfg_path, t2s_ ? "\"q4nx_t2s_sealed_wide_elf\"" : "\"q4nx_pb16i_sealed_wide_elf\"", "");
             wide_sealed_rows_ = q4nx_config_int(cfg_path.c_str(), "q4nx_sealed_wide_rows", 32);
+            // ... and an optional third one built for fewer rows, for decode steps.
+            narrow_sealed_ = read_config_string(
+                cfg_path, t2s_ ? "\"q4nx_t2s_sealed_narrow_elf\"" : "\"q4nx_pb16i_sealed_narrow_elf\"", "");
+            narrow_sealed_rows_ = q4nx_config_int(cfg_path.c_str(), "q4nx_sealed_narrow_rows", 4);
             // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
             // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
             // read in the stored (rotated) basis against un-rotated activations.
@@ -823,6 +850,15 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // The plan is the runtime's copy of the sealed-ELF decision; when it names one it wins, so a plan
     // and a container cannot disagree about which file the decode roles run.
     if (plan_.loaded() && !plan_.sealed_elf.empty()) pb16i_sealed_ = plan_.sealed_elf;
+    // The plan is the pack's description when there is one, so its wide family wins over config.json's keys.
+    if (plan_.loaded() && !plan_.sealed_wide_elf.empty()) {
+        wide_sealed_ = plan_.sealed_wide_elf;
+        wide_sealed_rows_ = plan_.sealed_wide_rows;
+    }
+    if (plan_.loaded() && !plan_.sealed_narrow_elf.empty()) {
+        narrow_sealed_ = plan_.sealed_narrow_elf;
+        narrow_sealed_rows_ = plan_.sealed_narrow_rows;
+    }
     // Hand the layout family to the launch layer now that the plan (or the probes) has settled it.
     xd_->set_pb16i(pb16i_, pb16i_dir_, pb16i_sealed_);
     xd_->set_hadamard_block(had_block);
@@ -1788,15 +1824,11 @@ void Q4nxNpuForward::layer_attn_dims(int l, int& hd, int& nkv) const {
 // it -- a GDN model (lin_kd_ > 0, the one case step()'s `dense_weights_cached`
 // can never cover, since that guard stops at lin_kd_ == 0), packed weights
 // actually being cached, and a dense tail big enough for the per-token reload to
-// be material.  Qwen3.8-27B-NPU2 (IM 17408 x H 5120) clears it with 1.07 GB per
-// layer, and measured 117.4 -> 104.5 s wall and 63.3 -> 22.9 s CPU per token on
-// an 8-token request with identical text (~/lb/587-cache-20261030).
-// The floor is a size guard, not a second measurement: below it the reload is
-// small enough that the behaviour change is not worth taking unasked.
+// be material.  The size rule and the two measurements it rests on (Qwen3.8-27B
+// and, since engine#1785, Qwen3.5-2B) are in ffn_cache_policy.h.
 bool Q4nxNpuForward::ffn_cache_default() const {
     if (host_gemm_ || !xd_->weight_cache_on() || lin_kd_ <= 0) return false;
-    const double tail_bytes = 3.0 * (double)c_.IM * (double)c_.H * 4.0;   // wg_+wu_+wd_
-    return tail_bytes >= 256.0 * 1024.0 * 1024.0;
+    return onebit::npu::ffn_cache_worth_it(c_.IM, c_.H);
 }
 // ---- layer-loop host attribution ------------------------------------------
 // The `host=` residual of the [ph] line is layer time that is NOT any of the

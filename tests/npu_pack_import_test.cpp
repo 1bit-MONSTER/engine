@@ -3007,10 +3007,13 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
               "pack: 64 columns per gate|up unit and per down_proj group");
 
     int norms = 0, attn_planned = 0, mlp_planned = 0, lm_tiles_planned = 0;
+    bool head_in_tail = false;
     for (const auto& t : p.tensors) {
         if (t.name.find("layernorm") != std::string::npos || t.name == "model.norm.weight") ++norms;
-        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0)
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0) {
             lm_tiles_planned = int((t.shape[0] / 32) * ((t.shape[1] + 255) / 256));
+            head_in_tail = t.source == "fconst:tail";
+        }
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find("self_attn") != std::string::npos) ++attn_planned;
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find(".mlp.") != std::string::npos) ++mlp_planned;
     }
@@ -3143,8 +3146,12 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     // the container must open with the engine's own loader
     onebit::npu::Model m(out);
     const auto& head = m.tensor("lm_head.weight");
-    check(head.shape.at(0) == int64_t((head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256)),
-          "pack: lm_head tile count matches the container");
+    // A head read from the .fconst tail keeps the pack's padding to whole 64-row tiles (Hunyuan: 120,818 rows are stored
+    // as 120,832), so the container's count follows the stored rows; the plan's shape stays the vocabulary.
+    const int64_t stored_rows = pi::head_stored_rows(head_rows, head_in_tail);
+    check(head.shape.at(0) == (stored_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256),
+          "pack: lm_head tile count matches the container (" + std::to_string(head.shape.at(0)) + " tiles for " +
+              std::to_string(stored_rows) + " stored rows)");
     check(m.tensor("model.layers.0.input_layernorm.weight").shape.at(0) == p.dims.hidden,
           "pack: a layer norm is `hidden` bf16 values, whatever the hidden size");
     check(m.tensor("model.norm.weight").shape.at(0) == int64_t(p.dims.hidden),
@@ -5616,6 +5623,17 @@ void test_q4_writer_code_range() {
 // engine#1889: the arithmetic that claims the per-head QK gains out of the 640 B Hunyuan-7B carries between its last qkv
 // tile and o_proj. A wrong offset there reads tile bytes as bf16 and mis-rotates every pack of the family, so both the
 // right shape (2 * (64 + head_dim*2) = 640 at head_dim 128) and the neighbours that must NOT be taken for it are driven.
+// The rows a tail head occupies in the container: the pack's own padding to whole 64-row tiles stays. The pack leg's
+// tile-count check used the vocabulary, so it failed on every pack whose vocabulary is not a multiple of 64 although
+// the import was right (Hunyuan-1.8B: 15,104 tiles written, 15,100 expected).
+void test_head_stored_rows() {
+    check(pi::head_stored_rows(120818, true) == 120832, "head rows: Hunyuan's 120,818 are stored as 120,832");
+    check(pi::head_stored_rows(151936, true) == 151936, "head rows: a multiple of 64 is stored as it is");
+    check(pi::head_stored_rows(49152 + 32, true) == 49152 + 64, "head rows: a multiple of 32 that is not one of 64 is padded");
+    check(pi::head_stored_rows(120818, false) == 120818, "head rows: a graph head is not padded");
+    check(pi::head_stored_rows(0, true) == 0, "head rows: no vocabulary, no rows");
+}
+
 void test_qk_gain_offsets() {
     const pi::QkGainOffsets o = pi::qk_gain_offsets(1000, 128, 640);
     // engine#1934: block 0 is Q. Hunyuan-7B's own model.onnx carries both gains as FP16 initializers, and q_norm is the
@@ -5665,7 +5683,23 @@ void test_header_witness_refusal() {
     std::printf("  header witness: 8 arms (one-header vote vs declaration refuses; 3/1-without-declaration/0 allowed)\n");
 }
 
+// engine#1503: the tied-head rule as ONE predicate -- correlated AND not mis-scaled. Two packs on this box correlate
+// (0.9915 / 0.9961) while being scaled copies of their own embedding (rel_err 0.1361 / 0.0949): they import cleanly and
+// serve garbage, where the pack that serves correctly reports rel_err 0.000000. Correlation alone cannot tell them apart,
+// which is why the correlation-only check passed both and cost two device tickets.
+static void selfcheck_head_rule_arms() {
+    check(pi::selfcheck_head_ok(0.996901, 0.000000), "head rule: the pack that serves correctly passes (corr .9969, rel 0)");
+    check(!pi::selfcheck_head_ok(0.991539, 0.136140), "head rule: a correlated but scaled head is refused (corr .9915, rel .1361)");
+    check(!pi::selfcheck_head_ok(0.996053, 0.094874), "head rule: the second measured pack is refused too (corr .9961, rel .0949)");
+    check(pi::selfcheck_head_ok(0.996053, 0.000000),
+          "head rule: correlated and unscaled passes -- the rule is not 'refuse everything'");
+    check(!pi::selfcheck_head_ok(0.50, 0.000000), "head rule: an uncorrelated head is still refused on correlation");
+    check(pi::selfcheck_head_ok(0.996053, pi::kSelfcheckRelMax), "head rule: exactly at the threshold passes (inclusive bound)");
+    std::printf("  head rule: 6 arms (two measured bad packs, the serving one, the unscaled control, no-corr, boundary)\n");
+}
+
 int main(int argc, char** argv) {
+    selfcheck_head_rule_arms();
     // engine#1907: every crafted 1.9 import writes a canonical copy into the scratch cache. Without this the suite left 0-byte
     // copies in the user's real ~/.cache/1bit/fconst19 and in /tmp on every run. Give the run its own directory, removed at exit.
     const fs::path run_scratch = ::onebit::test::tmp_root() / ("1bit-pack-test-scratch-" + std::to_string(::getpid()));
@@ -5678,6 +5712,7 @@ int main(int argc, char** argv) {
     test_encode_tile_code_range();
     test_q4_writer_code_range();
     test_qk_norm_refusal();
+    test_head_stored_rows();
     test_qk_gain_offsets();
     test_tail_head_placement();
     const std::string golden_dir = argc > 1 ? argv[1] : "";

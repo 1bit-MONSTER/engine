@@ -35,6 +35,8 @@
 // resets it from position 0.
 #include "forward_serve.h"
 
+#include "npu_decode_note.h"
+
 #include "../npu/forward/include/q4nx_forward.h"
 #include "../npu/target/xdna/xdna_target.h"  // XdnaTarget::kName for --npu-target
 #include "npu_device_lock.h"
@@ -625,6 +627,9 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     // markup whatever the container is (app/npu_tool_grammar.h), so that reply is split as qwen3.  Every
     // other reply is in the container's own markup.
     const npu::AnswerFamily family = opts.tool_grammar ? npu::AnswerFamily::qwen3 : e.answer_family;
+    // A template whose generation prompt already opens the reasoning block leaves the answer inside it
+    // (npu::prompt_opens_reasoning).  Only a rendered chat prompt can: an ids prompt and /v1/completions are raw.
+    const bool starts_in_reasoning = chat && !prompt_is_ids && npu::prompt_opens_reasoning(prompt, family);
     auto wrap = [&](const std::string& content, const std::string& finish, const std::vector<Emitted>& lps) {
         json out;
         out["id"] = id;
@@ -635,7 +640,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             // (issue #652 item 3) one shared parser splits what the model wrote into OpenAI's three
             // parts; a reply that is only tool calls says content: null.
             const npu::ParsedAnswer ans =
-                npu::parse_answer(content, family, opts.tools_sent);
+                npu::parse_answer(content, family, opts.tools_sent, starts_in_reasoning);
             json message{{"role", "assistant"}};
             message["content"] = ans.content_null ? json(nullptr) : json(ans.content);
             if (!ans.reasoning.empty()) message["reasoning_content"] = ans.reasoning;
@@ -656,7 +661,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 std::vector<std::string> texts;
                 texts.reserve(lps.size());
                 for (const auto& x : lps) texts.push_back(x.text);
-                const std::vector<char> keep = npu::content_mask(texts, family, opts.tools_sent);
+                const std::vector<char> keep = npu::content_mask(texts, family, opts.tools_sent, starts_in_reasoning);
                 std::vector<Emitted> content_lps;
                 for (size_t i = 0; i < lps.size(); i++)
                     if (i < keep.size() && keep[i]) content_lps.push_back(lps[i]);
@@ -703,7 +708,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             };
             // The same splitter as the non-streamed path, fed piece by piece, so a streamed reply
             // and a non-streamed one cannot disagree about what is reasoning and what is content.
-            npu::AnswerStream stream(family, opts.tools_sent);
+            npu::AnswerStream stream(family, opts.tools_sent, starts_in_reasoning);
             auto emit_pieces = [&](const std::string& t, const std::vector<Emitted>& lp) {
                 std::vector<std::pair<bool, std::string>> pieces;
                 stream.feed(t, pieces);
@@ -804,6 +809,12 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
 // this thread waits for the first frame or the end, and only then decides between an ordinary response -- the 400s
 // and 500s a request can earn before it has produced anything keep their status codes -- and a stream.
 void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Response& res, bool chat) {
+    // A non-causal decision pack has no decode to run (npu::decision_only_refusal): say so before any work.
+    if (e.fwd && e.fwd->noncausal()) {
+        res.status = 400;
+        res.set_content(npu::decision_only_refusal(e.id, e.head != nullptr).dump(), "application/json");
+        return;
+    }
     bool wants_stream = false;
     try {
         const json body = json::parse(req.body);
@@ -1088,6 +1099,7 @@ int run_forward_serve(int argc, char** argv) {
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
     e.eos = npu::eos_token_ids_from_config(cfg);
+    const size_t eos_from_config = e.eos.size();
     e.endoftext = e.tok->token_id("<|endoftext|>");
     // q4nx_config_int finds the key at any depth (a text_config's too).
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
@@ -1142,6 +1154,20 @@ int run_forward_serve(int argc, char** argv) {
             "prompt as token ids (#938) and render the model's own template" +
             (specials.empty() ? std::string() : " (model specials: " + specials + ")");
         std::fprintf(stderr, "1bit forward-serve: chat route disabled: %s\n", e.chat_refusal.c_str());
+    }
+    // What ends a generation is more than config.json's eos_token_id (npu::stop_token_ids): the tokenizer's own
+    // eos_token, and, when this route closes its prompt turns with ChatML's marker, that marker.  Decided here,
+    // after the template, because whether the route renders ChatML is known only now.
+    {
+        const bool chatml_route = !can_render && e.chat_ok;
+        e.eos = npu::stop_token_ids(npu::read_json_or_null(cfg), npu::read_json_or_null(dir + "/tokenizer_config.json"),
+                                    chatml_route ? std::string("<|im_end|>") : std::string(),
+                                    [&](const std::string& text) { return e.tok->token_id(text); });
+        std::string named;
+        for (size_t i = 0; i < e.eos.size(); i++)
+            named += std::string(i ? ", " : "") + std::to_string(e.eos[i]) + " " + e.tok->decode(e.eos[i]) +
+                     (i < eos_from_config ? "" : " (tokenizer / chat turn end)");
+        std::fprintf(stderr, "1bit forward-serve: stops on %s\n", named.empty() ? "<|endoftext|> only" : named.c_str());
     }
     // The template variables `{{ bos_token }}`/`{{ eos_token }}` render: the strings the tokenizer
     // actually has (a null bos_token in tokenizer_config.json is "", and the engine's -1 is the same
@@ -1341,6 +1367,13 @@ int run_forward_serve(int argc, char** argv) {
     // The target that is actually serving, so a log says which one answered rather than leaving it to the build.
     std::fprintf(stderr, " [npu-target=%s]", npu_target.c_str());
     std::fprintf(stderr, "\n");
+    // engine#2102: the machine line `[forward] decode family: …` stays byte-for-byte (gates grep it). This is the sentence
+    // an operator needs at the ready line's level when it says 0 of N -- the route that answers correctly and 50x slower.
+    {
+        const std::string note = onebit::npu::decode_family_note(e.fwd->decode_roles(), e.fwd->design_roles(), kernels,
+                                                                 e.fwd->decode_disabled(), e.fwd->decode_image());
+        if (!note.empty()) std::fprintf(stderr, "%s\n", note.c_str());
+    }
 
     while (true) std::this_thread::sleep_for(std::chrono::seconds(3600));
     return 0;

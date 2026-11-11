@@ -573,6 +573,32 @@ Two 16-row blocks against one 32-row block is 30-31 rows/s against 35-37. The 8-
 identical with the family off and on, and `NPU_BATCH_CHECK=1` on the wide path reports MATCH on every chunk
 it checks (32-, 4- and 1-row) in both tickets. Only 32 rows has been measured.
 
+**...and a narrow family for decode (#2073).** A decode step on `bonsai2-27b-t2s2` is 416 launches, and
+device wait is 211 of its 302 ms: every launch runs a kernel built for 16 rows and carries one, and a
+launch's device time does not depend on how many of its rows are filled. So a pack may also name a sealed
+ELF built for FEWER rows: `q4nx_t2s_sealed_narrow_elf` (or `q4nx_pb16i_sealed_narrow_elf`) and
+`q4nx_sealed_narrow_rows` (default 4, allowed 1..15) in `config.json`; `NPU_NARROW_SEALED_ELF=<file>`
+overrides the file, `=0` switches it off, `NPU_NARROW_ROWS` overrides the rows. A launch of 1..rows rows
+takes it (a decode step, or a verify pass of a few rows); anything wider keeps the 16-row family. The rules
+are the wide family's: all roles or none, one hw_context, shared weight images, and a file that is missing
+or does not load is logged (`[forward] narrow family NOT adopted (...)`) while decode stays on the 16-row
+kernels. `narrow_family_complete` and `narrow_takes` in `batch_width.h` are pinned by
+`tests/npu_pack_test.cpp`. No pack ships a narrow ELF yet.
+
+Measured with a 4-row set, one binary, arms 16-row / 4-row / 16-row / 4-row, three prompts generating 49
+tokens each (`(tokens - 1) / (wall - wall of a 1-token request)`), two `npu-hold` tickets:
+
+| ticket, pair | decode, 16-row family | decode, 4-row family | device wait per step |
+|---|---|---|---|
+| first, pair 1 | 3.26-3.33 tok/s | **3.69-4.21 tok/s** | 210.1 -> 158.1 ms |
+| first, pair 2 (another lane loading the box) | 1.88-2.59 tok/s | 2.33-3.14 tok/s | 230.7 -> 208.1 ms |
+| second, pair 1 | 2.85-3.29 tok/s | **3.90-4.16 tok/s** | 234.7 -> 151.7 ms |
+| second, pair 2 | 2.15-3.32 tok/s | **4.05-4.19 tok/s** | 210.9 -> 150.9 ms |
+
+The step wall follows the wait: 286.0 -> 233.7 ms and 296.2 -> 225.9 ms in the quiet pairs. The 49-token
+greedy text of each prompt is identical in all eight arms, and `NPU_BATCH_CHECK=1` with the narrow family
+reports MATCH on every chunk it checks (1-, 4- and 6-row; the 6-row one runs on the 16-row family).
+
 **A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
 a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
 family shipped as eight per-role `_t2s2_m16` ELFs paid **+2.0-2.3 ms on every launch, in every role** — more

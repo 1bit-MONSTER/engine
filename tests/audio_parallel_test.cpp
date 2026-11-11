@@ -29,6 +29,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "audio_exec.h"
@@ -187,12 +190,40 @@ void test_a_throwing_unit() {
     }
 }
 
+// engine#2035 review: a worker that cannot be started (std::thread throws std::system_error at EAGAIN) used to leave the
+// threads started before it joinable while `pool` unwound -- std::terminate. The spawner fails on its Nth call, so the
+// case is deterministic; without the join-then-rethrow the process dies by SIGABRT here.
+void test_a_failed_start() {
+    using onebit::npu::pack_import::parallel_units_spawn;
+    for (size_t fail_at : {size_t(0), size_t(1), size_t(3)}) {
+        const size_t units = 40, want = 4;
+        std::atomic<int> ran{0};
+        size_t calls = 0;
+        auto spawn = [&](auto&& f) {
+            if (calls++ == fail_at) throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+            return std::thread(std::forward<decltype(f)>(f));
+        };
+        bool caught = false;
+        try {
+            parallel_units_spawn(units, want, [&](size_t) { ran.fetch_add(1); }, spawn);
+        } catch (const std::system_error& e) {
+            caught = e.code() == std::errc::resource_unavailable_try_again;
+        }
+        check(caught, "a worker that cannot be started (start " + std::to_string(fail_at) +
+                          " of 4) is a std::system_error the caller catches, not std::terminate");
+        // the workers started before the failure ran all their units and were joined before the rethrow
+        check(ran.load() == int(fail_at * (units / want)),
+              "the " + std::to_string(fail_at) + " worker(s) started before the failure finish before the caller sees it");
+    }
+}
+
 }  // namespace
 
 int main() {
     test_bit_identity();
     test_every_unit_once();
     test_a_throwing_unit();
+    test_a_failed_start();
     if (g_failures == 0) std::printf("audio_parallel: ok\n");
     return g_failures == 0 ? 0 : 1;
 }

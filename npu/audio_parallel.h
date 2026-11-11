@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <exception>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace onebit::npu::pack_import {
@@ -49,9 +50,22 @@ inline size_t audio_thread_count() {
     return hw == 0 ? 1 : (hw > 8 ? 8 : hw);
 }
 
+// How a worker is started. It is a parameter so a test can make the Nth start fail: std::thread's constructor throws
+// std::system_error when the OS refuses a thread (EAGAIN at RLIMIT_NPROC, which a box running many lanes under one user
+// can reach), and that failure cannot be arranged deterministically from a test any other way.
+struct StdThreadSpawn {
+    template <typename F>
+    std::thread operator()(F&& f) const { return std::thread(std::forward<F>(f)); }
+};
+
 // Run fn(0) .. fn(units-1), each exactly once, on at most `want` threads. Worker t takes units t, t+want, t+2*want, ...
-template <typename Fn>
-void parallel_units(size_t units, size_t want, Fn&& fn) {
+//
+// A worker that cannot be STARTED is handled like a unit that throws (engine#2035 review): the workers already running
+// are joined and the start's exception is rethrown on the caller. Without the join, the unwind destroys `pool` while it
+// still holds joinable threads, and a joinable std::thread's destructor calls std::terminate. The units of the workers
+// that never started do not run, which is why this is an exception and not a quiet fallback to fewer threads.
+template <typename Fn, typename Spawn>
+void parallel_units_spawn(size_t units, size_t want, Fn&& fn, Spawn&& spawn) {
     if (want > units) want = units;
     if (want <= 1) {
         for (size_t u = 0; u < units; ++u) fn(u);
@@ -59,18 +73,28 @@ void parallel_units(size_t units, size_t want, Fn&& fn) {
     }
     std::vector<std::exception_ptr> failed(want);
     std::vector<std::thread> pool;
-    pool.reserve(want);
-    for (size_t t = 0; t < want; ++t)
-        pool.emplace_back([&, t]() {
-            try {
-                for (size_t u = t; u < units; u += want) fn(u);
-            } catch (...) {
-                failed[t] = std::current_exception();
-            }
-        });
+    pool.reserve(want);   // no reallocation below, so a start failure cannot also lose a started thread
+    try {
+        for (size_t t = 0; t < want; ++t)
+            pool.push_back(spawn([&, t]() {
+                try {
+                    for (size_t u = t; u < units; u += want) fn(u);
+                } catch (...) {
+                    failed[t] = std::current_exception();
+                }
+            }));
+    } catch (...) {
+        for (auto& th : pool) th.join();
+        throw;
+    }
     for (auto& th : pool) th.join();
     for (const auto& ep : failed)
         if (ep) std::rethrow_exception(ep);
+}
+
+template <typename Fn>
+void parallel_units(size_t units, size_t want, Fn&& fn) {
+    parallel_units_spawn(units, want, static_cast<Fn&&>(fn), StdThreadSpawn{});
 }
 
 template <typename Fn>

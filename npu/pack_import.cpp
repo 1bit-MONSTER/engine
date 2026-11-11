@@ -6042,8 +6042,9 @@ int run(int argc, char** argv) {
                      "1bit npu-pack: refusing to import %s: the head correlates with the pack's own embedding (%.6f) but "
                      "its relative error is %.6f, which is a scaled or partially decoded head rather than a rounding "
                      "difference (the threshold is %.3f). A pack in this state imports cleanly and answers garbage on "
-                     "the device; --allow-incomplete does not override this.\n",
-                     dir.c_str(), r.lmhead_corr, r.lmhead_rel, kSelfcheckRelMax);
+                     "the device; --allow-incomplete does not override this. The partial output this run already\n"
+                     "wrote under %s is not servable -- delete it before retrying.\n",
+                     dir.c_str(), r.lmhead_corr, r.lmhead_rel, kSelfcheckRelMax, out.c_str());
         return 3;
     }
     if (!r.refused.empty() && !allow) {

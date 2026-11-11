@@ -115,7 +115,39 @@ def judge(log_text, replies, floor=60.0, first_token_ms=600.0, fast_route=FAST_R
             bad.append("reply %d: one character repeated (%r)" % (i, c[:12]))
     if not replies:
         bad.append("no replies")
-    out.append(("content", not bad, "; ".join(bad) if bad else "%d replies, all with content" % len(replies)))
+    # engine#2111 (its own refinement, now that the field is in the build): an EMPTY content with
+    # finish_reason "length" and reasoning_tokens > 0 is not a degeneracy - the budget went into a thinking block
+    # the engine strips - so it is a SKIP with a reason, not a FAIL. `reasoning_tokens == -1` means the route could
+    # not count it (e.g. /v1/completions) and must NOT be read as zero: that stays a FAIL that says so.
+    # "No replies" keeps its own arm: an empty list is nothing readable, which is never a pass.
+    if not replies:
+        out.append(("content", False, "no replies"))
+        return out
+    bad, skipped = [], []
+    for i, r in enumerate(replies):
+        c = content_of(r)
+        if c and not degenerate(c):
+            continue
+        choice = (r.get("choices") or [{}])[0]
+        rt = (((r.get("usage") or {}).get("completion_tokens_details")) or {}).get("reasoning_tokens")
+        if not c:
+            if (choice.get("finish_reason") or "").lower() == "length" and isinstance(rt, int) and rt > 0:
+                skipped.append("reply %d: budget spent in reasoning (reasoning_tokens %d, finish_reason length)"
+                               % (i, rt))
+                continue
+            bad.append("reply %d: empty content%s" % (
+                i, " (reasoning_tokens -1: the route could not count it, which is not zero)" if rt == -1 else ""))
+        else:
+            bad.append("reply %d: content is one character repeated" % i)
+    if bad:
+        out.append(("content", False, "; ".join(bad)))
+    elif skipped and len(skipped) == len(replies):
+        out.append(("content", True, "SKIP: " + "; ".join(skipped)))
+    elif skipped:
+        out.append(("content", True, "%d replies with content, %d skipped: %s"
+                    % (len(replies) - len(skipped), len(skipped), "; ".join(skipped))))
+    else:
+        out.append(("content", True, "%d replies, all with content" % len(replies)))
     return out
 
 
@@ -458,11 +490,33 @@ def self_test():
         if rc != 2:
             fails.append("rejudge() on a directory with no reply_*.json returned %r, wanted 2" % rc)
 
+
+    # engine#2111's refinement, now that completion_tokens_details.reasoning_tokens is in the build: four cases that
+    # must stay FOUR answers, because collapsing any pair of them is how an ambiguity becomes a wrong report.
+    def _r(content, fr="stop", rt="absent"):
+        r = {"choices": [{"finish_reason": fr, "message": {"content": content}}],
+             "timings": {"prompt_ms": 200.0, "predicted_ms": 100.0, "predicted_per_second": 80.0},
+             "usage": {"completion_tokens": 8}}
+        if rt != "absent":
+            r["usage"]["completion_tokens_details"] = {"reasoning_tokens": rt}
+        return r
+
+    def _content_ok(reply):
+        return dict((n, ok) for n, ok, _ in judge(fast_log, [reply]))["content"]
+
+    if not _content_ok(_r("", "length", 8)):
+        fails.append("empty content + finish_reason length + reasoning_tokens 8 must be a SKIP, not a FAIL")
+    if _content_ok(_r("", "length", -1)):
+        fails.append("reasoning_tokens -1 must not pass: the route could not count it, which is not zero")
+    if _content_ok(_r("", "stop", 8)):
+        fails.append("empty content with finish_reason stop must FAIL: the model said nothing, not the budget")
+    if _content_ok(_r("//////", "stop")):
+        fails.append("a degenerate content must still FAIL: that is the model, not the budget")
     self_test_run(fails)
     for f in fails:
         print("FAIL " + f)
     print("npu_serve_smoke self-test: %d case(s) failed" % len(fails) if fails
-          else "npu_serve_smoke self-test: 16 judging cases, 3 runs against a stand-in serve and a TERM mid-request ok")
+          else "npu_serve_smoke self-test: 16 judging cases, 4 engine#2111 content arms, 3 runs against a stand-in serve and a TERM mid-request ok")
     return 1 if fails else 0
 
 

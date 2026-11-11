@@ -1845,7 +1845,7 @@ engine#587 measured the route on it):
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
 | `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
 | `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served |
-| `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2`, `FastFlowLM/LFM2.5-1.2B-NPU2` | hrx, npu | `LFM2.5-1.2B-NPU2` **served and measured** on the per-op route ("FastFlowLM's own containers" below); `LFM2-1.2B-NPU2` has the same tensor grid and tile kind and was not run; `LFM2-2.6B-NPU2` was not run |
+| `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2`, `FastFlowLM/LFM2.5-1.2B-NPU2` | hrx, npu | `LFM2.5-1.2B-NPU2` **served and measured** on the per-op route ("FastFlowLM's own containers" below); `LFM2-1.2B-NPU2` serves too (one paired ticket, same section); `LFM2-2.6B-NPU2` was not run |
 | `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
 | `hy_v3` | `FastFlowLM/Hy-Memory-30B-A3B-NPU2` | hrx | not served; the first table above records this one |
 
@@ -1901,6 +1901,7 @@ does on a geometry that has a sealed set: `Qwen3-1.7B-NPU2` is 3.0 tok/s here an
 | `Phi4-mini-Instruct-NPU2` | `phi3` | identical, `Paris`, once the turn end is read from the template (below) | 1.4 to 1.5 tok/s |
 | `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `qwen3` | identical, `Paris` | 1.4 to 1.5 tok/s |
 | `LFM2.5-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | identical, `Paris`; against FastFlowLM's runtime below | 3.5 to 4.6 tok/s |
+| `LFM2-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | `Paris`; one request per prompt, against FastFlowLM's runtime below | 3.7 tok/s |
 
 `D3-Nano-NPU2` is a decision pack: it loads on the `Qwen3.5-2B` kernel set, its readout converts with
 `tools/safetensors_to_q4nx.py decision`, and `/v1/systemone` returned three identical answers to the documented
@@ -1946,6 +1947,13 @@ not something this row decides. Also on this pack: batched prefill equals token-
 prompt tokens cached, conv state included) returns the bytes it returns with the prefix cache off; and decode was
 4.6 tok/s at load 3 to 4 and 3.5 to 3.7 at load 8 to 10, against FastFlowLM's 48 to 83 tok/s on the same replies,
 the gap "Per-op route" above describes.
+
+`LFM2-1.2B-NPU2` (sha256 `2755ab40cd927e3c…`) went through the same paired ticket on the same kernel directory,
+at the merged head of that change: two of five answers byte-identical (`Paris`; the count from one to ten), three
+that share 21, 58 and 53 characters with FastFlowLM's and then continue differently, each a fluent answer to the
+question (a Fibonacci function that returns `0` for `n <= 0` where theirs returns a message). Decode 3.7 tok/s
+against 42 to 47. Its logprobs at the three points were not taken, and it was asked each prompt once, so this row
+does not carry the three-identical-answers condition.
 
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry

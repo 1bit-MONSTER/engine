@@ -216,6 +216,12 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     // from `ids`.  Do not log `prompt` as the request's text without handling this case first.
     std::vector<int> prompt_ids;
     bool prompt_is_ids = false;
+    // --prefix-pin: the leading system messages and a probe user message (npu::pin_probe_messages), rendered.  Whatever
+    // of that the full prompt starts with is the part every question under this system prompt shares, so it can be pinned on
+    // the FIRST request (PrefixCache::pin_at) -- comparing with the previous request only finds it on the second,
+    // and can run a few tokens into the question when two questions open with the same words.  Empty = the
+    // request has no system message, or the route is not pinning.
+    std::string system_prompt;
     try {
         if (chat) {
             if (!e.chat_ok) throw std::runtime_error(e.chat_refusal);
@@ -232,8 +238,25 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 extra["enable_thinking"] = npu::thinking_from_body(body);
                 prompt = npu::render_chat_template(e.tmpl, ordered.at("messages"), /*add_generation_prompt=*/true,
                                                    extra, e.bos_text, e.eos_text);
+                if (e.prefix_pin) {
+                    // A template that cannot render the probe is no reason to refuse the request: it only means
+                    // there is no early pin, and the log says so.
+                    try {
+                        const nlohmann::ordered_json probe = npu::pin_probe_messages(ordered.at("messages"));
+                        if (!probe.empty())
+                            system_prompt = npu::render_chat_template(e.tmpl, probe, /*add_generation_prompt=*/false, extra,
+                                                                      e.bos_text, e.eos_text);
+                    } catch (const std::exception& ex) {
+                        system_prompt.clear();
+                        std::fprintf(stderr, "[prefix] no early pin: the template did not render the system turn (%s)\n", ex.what());
+                    }
+                }
             } else {
                 prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
+                if (e.prefix_pin) {
+                    const json probe = npu::pin_probe_messages(body.at("messages"));
+                    if (!probe.empty()) system_prompt = npu::chatml(probe, npu::thinking_from_body(body));
+                }
             }
         } else {
             prompt_is_ids = npu::prompt_ids_from_body(body, e.tok->size(), prompt_ids);
@@ -291,7 +314,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
     // a stop sequence or a grammar that allows nothing more, "length" when the token
     // budget ran out.
-    auto run = [&e, &req, prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats, dump_req, bridge](
+    auto run = [&e, &req, prompt, system_prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats, dump_req, bridge](
                    const std::function<bool(const std::string&, const std::vector<Emitted>&)>& on_text) {
         std::string finish = "stop";
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.  A caller
@@ -358,7 +381,16 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
         int pin_cut = -1;
         size_t pin_tokens = 0;
         if (e.prefix_pin && e.prefix && e.prefix->enabled()) {
-            pin_tokens = e.prefix->pin_point(e.prev_ids, ids);
+            // The end of the system turn first: it is known on the first request and it is the right place.  Only
+            // a request with no system message falls back to what it shares with the previous request.
+            if (!system_prompt.empty()) {
+                std::vector<int> lead = e.tok->encode(system_prompt);
+                if (chat && e.add_bos && e.bos_id >= 0 && (lead.empty() || lead.front() != e.bos_id))
+                    lead.insert(lead.begin(), e.bos_id);
+                pin_tokens = e.prefix->pin_at(ids, npu::shared_prefix_len(lead, ids));
+            } else {
+                pin_tokens = e.prefix->pin_point(e.prev_ids, ids);
+            }
             if (pin_tokens > 0 && int(pin_tokens) - 1 >= resume) pin_cut = int(pin_tokens) - 1;
         }
         {
@@ -1056,6 +1088,7 @@ int run_forward_serve(int argc, char** argv) {
     e.bos_id  = json_int(cfg, "bos_token_id", -1);
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
     e.eos = npu::eos_token_ids_from_config(cfg);
+    const size_t eos_from_config = e.eos.size();
     e.endoftext = e.tok->token_id("<|endoftext|>");
     // q4nx_config_int finds the key at any depth (a text_config's too).
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
@@ -1110,6 +1143,20 @@ int run_forward_serve(int argc, char** argv) {
             "prompt as token ids (#938) and render the model's own template" +
             (specials.empty() ? std::string() : " (model specials: " + specials + ")");
         std::fprintf(stderr, "1bit forward-serve: chat route disabled: %s\n", e.chat_refusal.c_str());
+    }
+    // What ends a generation is more than config.json's eos_token_id (npu::stop_token_ids): the tokenizer's own
+    // eos_token, and, when this route closes its prompt turns with ChatML's marker, that marker.  Decided here,
+    // after the template, because whether the route renders ChatML is known only now.
+    {
+        const bool chatml_route = !can_render && e.chat_ok;
+        e.eos = npu::stop_token_ids(npu::read_json_or_null(cfg), npu::read_json_or_null(dir + "/tokenizer_config.json"),
+                                    chatml_route ? std::string("<|im_end|>") : std::string(),
+                                    [&](const std::string& text) { return e.tok->token_id(text); });
+        std::string named;
+        for (size_t i = 0; i < e.eos.size(); i++)
+            named += std::string(i ? ", " : "") + std::to_string(e.eos[i]) + " " + e.tok->decode(e.eos[i]) +
+                     (i < eos_from_config ? "" : " (tokenizer / chat turn end)");
+        std::fprintf(stderr, "1bit forward-serve: stops on %s\n", named.empty() ? "<|endoftext|> only" : named.c_str());
     }
     // The template variables `{{ bos_token }}`/`{{ eos_token }}` render: the strings the tokenizer
     // actually has (a null bos_token in tokenizer_config.json is "", and the engine's -1 is the same

@@ -25,6 +25,11 @@ add_python_test(python_test_order_check ${CMAKE_SOURCE_DIR}/tests/python_test_or
 add_python_test(python_test_order_check_self ${CMAKE_SOURCE_DIR}/tests/python_test_order_check.py --self-test)
 add_python_test(ci_targets ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --check --root ${CMAKE_SOURCE_DIR})
 add_python_test(ci_targets_self ${CMAKE_SOURCE_DIR}/tools/ci/ci_targets_check.py --self-test)
+# engine#803 gate, second half: the comparator that turns two --dump-logits directories into the KLD verdict the
+# P4 gate asks for. No device and no model, so the gate is one command when a ticket is free; the self-test pins
+# the four cases a KLD implementation gets wrong (identical -> exactly 0, a shift is positive and directional, a
+# uniform shift stays 0, and an asymmetric file set is refused by name).
+add_python_test(logits_kld_self ${CMAKE_SOURCE_DIR}/tools/logits_kld.py --self-test)
 # engine#2018: this one was in tools/ci/unreferenced_py_tests.txt as a baseline entry, and it should not have been: the
 # file is portable and passes (worst-case |sum| 11.18e6 inside int32 at K=11008, 4 arms), it just never had a runner. A
 # baseline records a test as never-run, which for a passing test is the wrong outcome -- so it is registered and the line
@@ -42,6 +47,13 @@ add_python_test(tests_referenced_self ${CMAKE_SOURCE_DIR}/tools/ci/tests_referen
 # Registered through add_python_test (engine#1864), so they run THROUGH the interpreter: my first version used the raw
 # `${Python3_EXECUTABLE}` form above the find_package and the repository's own ordering guard caught it by name --
 # tools/mtp_head_ref.py is the one of the five without an exec bit, and it became BAD_COMMAND under ctest.
+# engine#1962: the narrowing-body enumeration, as a ratchet. The corpus is a submodule, so the check
+# skips (rc 77) where third_party/llama.cpp is not checked out; the baseline file is in the engine tree,
+# so the recorded set is reviewable everywhere.
+add_python_test(tool_selftest_hrx_f16_narrowing ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --self-test)
+add_test(NAME hrx_f16_narrowing_check COMMAND ${Python3_EXECUTABLE}
+         ${CMAKE_SOURCE_DIR}/tools/ci/hrx_f16_narrowing.py --check --root ${CMAKE_SOURCE_DIR})
+set_tests_properties(hrx_f16_narrowing_check PROPERTIES SKIP_RETURN_CODE 77)
 add_python_test(tool_selftest_batched_repeat ${CMAKE_SOURCE_DIR}/tools/batched_repeat.py --selftest)
 add_python_test(tool_selftest_logprob_agree ${CMAKE_SOURCE_DIR}/tools/logprob_agree.py --selftest)
 add_python_test(tool_selftest_mtp_head_ref ${CMAKE_SOURCE_DIR}/tools/mtp_head_ref.py --selftest)

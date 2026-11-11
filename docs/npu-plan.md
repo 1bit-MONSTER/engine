@@ -56,10 +56,14 @@ tools/npu_plan.py <model dir> [--kernels DIR] [--out PATH] [--check] [--print]
 | `container.tile_order` | q4_1 tile order; only `engine-1` is implemented. Absent means `engine-1`, so containers written before the field keep loading; an unknown id is refused. The loader is its only reader in this tree |
 | `fusion.gate_up` | `fused` or `split` (replaces the `full_i8_GU_*` filename probe) |
 | `prefill.M` | prefill activation rows; absent/0 means "not stated". Recorded and validated, but the current forward still takes its prefill rows from `Q4NX_DESIGN_M_PREFILL` (128) |
+| `prefill.sealed_elf` | optional, pb16i/t2s only: a second sealed ELF, the decode set's instances built for more rows per launch (the wide prefill family, engine#1990). A bare file name in the kernels directory. Wins over the `config.json` key; `NPU_WIDE_SEALED_ELF` still overrides both. A file that is missing or does not load is logged and prefill stays at 16 rows |
+| `prefill.sealed_rows` | rows per launch of `prefill.sealed_elf`, 17..128; required when it is named |
 | `decode.M` | decode activation rows; absent/0 means not stated. Recorded for P4’s `NpuModel`; the current forward selects the M=16 family through `decode.dirs`, not through this value |
 | `decode.enabled` | false disables the decode twin family |
 | `decode.dirs[]` | where the decode family is looked for, in order: `root` is `model` (the `-m` directory) or `kernels` (`--kernels`), `path` is relative under that root, `.` is the root itself. Empty, absolute or `..` paths are refused |
 | `decode.sealed_elf` | pb16i only: the sealed ELF the decode roles run |
+| `decode.narrow_elf` | optional, pb16i/t2s only: a third sealed ELF, the decode set's instances built for fewer rows per launch (the narrow decode family, engine#2073). A bare file name in the kernels directory; wins over the `config.json` key, and `NPU_NARROW_SEALED_ELF` overrides both. A file that is missing or does not load is logged and decode stays on the 16-row kernels |
+| `decode.narrow_rows` | rows per launch of `decode.narrow_elf`, 1..15; required when it is named |
 | `kernels.tag` | artifact-name suffix: `""`, `_b8`, `_pb16i`, `_t2s` or `_t2s2`; must agree with the container layout and `container.pb16i` |
 | `attention.mode` | `causal` (default) or `noncausal_full_attention`. The latter is a prompt-encoding mode: every full-attention layer sees the whole prompt, and the forward refuses to generate with it |
 | `kv.key`, `kv.value` | what the KV cache is stored as, per side: `f16` (the meaning of an absent `kv` block, and of every plan written before P7) or `int8`. `int8` is int8 with **one fp32 scale per (head, token)**, taken *after* a per-head Hadamard rotation — the rotation is what makes one scale affordable, because it collapses the per-channel magnitude spread the scale would otherwise have to cover. `key` is the side that costs no un-rotation (`(QH)(KH)ᵀ = QKᵀ`), so storing K rotated and rotating Q needs no inverse transform; `value` is a separate choice because an int8 V needs one on the output, which is why K-only is the cheap variant to prove the path with. This is a description until a target opens it: a target without the capability refuses `int8` **by name**, never serves f16 in its place. That check is `check_kv_caps` in `npu/target/target.h`, called from every target's `open()`, and it is gated device-free (`ctest -R npu_target_caps`) |
@@ -103,6 +107,10 @@ The loader never substitutes a default for something it cannot honour; every ref
   layer count that disagrees with `model.layers`;
 - `container.pb16i` with an empty `decode.sealed_elf` when `kernels.tag` is `_pb16i` and decode is enabled;
   or a non-empty `sealed_elf` on a non-pb16i container.
+- `prefill.sealed_elf` without `decode.sealed_elf`, with a path instead of a bare name, or with
+  `prefill.sealed_rows` missing or outside 17..128; or `prefill.sealed_rows` without `prefill.sealed_elf`.
+- `decode.narrow_elf` without `decode.sealed_elf`, with a path instead of a bare name, or with
+  `decode.narrow_rows` missing or outside 1..15; or `decode.narrow_rows` without `decode.narrow_elf`.
 
 The forward adds one more check on load: `kernels.tag` must equal the tag the container itself implies
 (same block, `Q4nxNpuForward::init_impl` in `npu/forward/src/q4nx_forward.cpp`), so a plan and a container cannot

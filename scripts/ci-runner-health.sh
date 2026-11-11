@@ -30,8 +30,12 @@
 #   scripts/ci-runner-health.sh <unit> [...]    # named units, e.g. for a specific runner
 #   scripts/ci-runner-health.sh --self-test     # the verdict logic, with systemctl stubbed
 #
-# Exit: 0 when every runner is active/running with no failure result; 1 when any is not; 2 when there is nothing to inspect
-# (no such units on this host, so a silent pass would be the defect).
+# Exit: 0 when every runner is active/running with a restart policy that survives an OOM kill; 1 when a runner is not
+# accepting jobs NOW; 2 when there is nothing to inspect (no such units on this host, so a silent pass would be the defect);
+# 3 when every runner is accepting jobs but a restart policy would leave one down after the next OOM kill. 1 and 3 are
+# separate because they call for different things (engine#1504, owner 2026-11-11): a dead runner blocks a release, since
+# its checks would queue for ever, while a policy line is a box configuration change the owner applies
+# (docs/ci-runners.md "The two drop-ins"), so scripts/weekly.sh warns on 3 and goes on. The policy lines print as WARN.
 set -uo pipefail
 
 # <restart> <oompolicy> <memorymax> -> one verdict line. The state checks above answer "is it alive", which is what the
@@ -53,6 +57,13 @@ policy_verdict() {
     # an infinite ceiling means the cgroup never hits its own limit, so the box's OOM killer chooses - and the bench runner
     # is the unit whose jobs are memory-heavy by definition.
     [ -n "${_mmax:-}" ] && [ "$_mmax" != infinity ] || _bad="$_bad MemoryMax=${_mmax:-?}(want a ceiling);"
+    case "$_bad" in
+        "") ;;
+        *Restart=*|*OOMPolicy=*) ;;
+        # Restart and OOMPolicy are right and only the ceiling is missing: the unit does come back, so do not say it will not.
+        *) printf 'FAIL the runner would come back after an OOM kill, but its cgroup has no ceiling:%s the box-wide OOM killer picks the victim, not the limit of this unit' "$_bad"
+           return 0 ;;
+    esac
     if [ -n "$_bad" ]; then
         printf 'FAIL the restart policy cannot restart this runner after an OOM kill:%s one OOM kill and the unit stops for good, while jobs read as pending' "$_bad"
         return 0
@@ -109,7 +120,12 @@ self_test() {
     chk FAIL "$(policy_verdict always stop 51539607552)"    # an OOM kill of a JOB stops the RUNNER
     chk FAIL "$(policy_verdict always continue infinity)"   # no cgroup ceiling: the box's OOM killer chooses
     chk FAIL "$(policy_verdict '' '' '')"                   # nothing readable is not a pass
-    [ "$rc" = 0 ] && echo "ci-runner-health self-test: ok (15 cases)" || echo "ci-runner-health self-test: FAIL"
+    # a missing ceiling alone must not be reported as "the unit stops for good" (the live strixhalo-engine unit, 2026-11-11)
+    case "$(policy_verdict always continue infinity)" in
+        *'would come back'*) printf 'ok   a missing ceiling alone says the runner comes back\n' ;;
+        *) printf 'FAIL a missing ceiling alone should not say the unit stops for good\n'; rc=1 ;;
+    esac
+    [ "$rc" = 0 ] && echo "ci-runner-health self-test: ok (16 cases)" || echo "ci-runner-health self-test: FAIL"
     return $rc
 }
 
@@ -125,7 +141,7 @@ if [ ${#units[@]} -eq 0 ]; then
     exit 2
 fi
 
-rc=0
+rc=0 policy=0
 for u in "${units[@]}"; do
     line=$("$SC" show "$u" -p ActiveState -p SubState -p Result -p NRestarts -p Restart -p OOMPolicy -p MemoryMax 2>/dev/null)
     st=$(printf '%s\n' "$line" | sed -n 's/^ActiveState=//p')
@@ -144,7 +160,9 @@ for u in "${units[@]}"; do
     p=$(policy_verdict "$rst" "$oom" "$mmax")
     case "$p" in
         PASS*) printf 'PASS %-52s %s\n' "" "${p#PASS }" ;;
-        *)     printf 'FAIL %-52s %s\n' "" "${p#FAIL }"; rc=1 ;;
+        *)     printf 'WARN %-52s %s\n' "" "${p#FAIL }"; policy=1 ;;
     esac
 done
+# a runner that is down outranks a policy line: 1 if any unit is not accepting jobs, else 3 if only a policy is short.
+[ "$rc" = 0 ] && [ "$policy" = 1 ] && rc=3
 exit "$rc"

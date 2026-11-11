@@ -143,6 +143,42 @@ mk_named "$tmp/n-mixed/1024x3072x16x8" 1024x3072x16x8 1 2
 check $([ $? -eq 1 ] && echo ok || echo fail) "a set with BOTH naming schemes: rc 1"
 check $(has "$tmp/out13" "MIXED NAMING" && echo ok || echo fail) "... and the reason is named"
 
+
+# 9. engine#2128: a pack that names the wide/narrow sealed sets must name files that are there
+mk_pack() {  # mk_pack <dir> <config-or-plan: config|plan> <key> <value> [<key2> <value2>]
+    mkdir -p "$1"
+    python3 - "$@" <<'PYP'
+import json, os, sys
+root, kind, *pairs = sys.argv[1:]
+if kind == "config":
+    body = {pairs[i]: pairs[i + 1] for i in range(0, len(pairs), 2)}
+else:
+    body = {"prefill": {}, "decode": {}}
+    for i in range(0, len(pairs), 2):
+        key, value = pairs[i], pairs[i + 1]
+        body["prefill" if key == "sealed_elf" else "decode"][key] = value
+json.dump(body, open(os.path.join(root, kind + ".json"), "w"))
+PYP
+}
+mk_set "$tmp/named/1024x3072x16x8" 1024x3072x16x8 1 elf
+ln -sf "$tmp/named/1024x3072x16x8/layer1_100/layer1.elf" "$tmp/named/1024x3072x16x8/wide32.elf" 2>/dev/null || true
+mk_pack "$tmp/pack-named" config q4nx_t2s_sealed_wide_elf wide32.elf
+"$script" --pack "$tmp/pack-named" "$tmp/named/1024x3072x16x8" > "$tmp/out14" 2>&1
+check $(has "$tmp/out14" "wide set wide32.elf named in config.json is present" && echo ok || echo fail) \
+      "a pack naming a wide set that exists: named and present"
+mk_pack "$tmp/pack-missing" config q4nx_t2s_sealed_wide_elf absent32.elf
+"$script" --pack "$tmp/pack-missing" "$tmp/named/1024x3072x16x8" > "$tmp/out15" 2>&1
+check $([ $? -eq 1 ] && echo ok || echo fail) "a pack naming a set that is ABSENT: rc 1"
+check $(has "$tmp/out15" "stay on the 16-row set" && echo ok || echo fail) "... and says what the serve would do instead"
+mk_pack "$tmp/pack-plan" plan sealed_elf wide32.elf narrow_elf gone4.elf
+"$script" --pack "$tmp/pack-plan" "$tmp/named/1024x3072x16x8" > "$tmp/out16" 2>&1
+check $([ $? -eq 1 ] && echo ok || echo fail) "naming from plan.json is read too (the narrow file is absent)"
+check $(has "$tmp/out16" "narrow set named in plan.json" && echo ok || echo fail) "... and the missing one is named"
+mk_pack "$tmp/pack-none" config unused 1
+"$script" --pack "$tmp/pack-none" "$tmp/named/1024x3072x16x8" > "$tmp/out17" 2>&1
+check $(has "$tmp/out17" "names no wide/narrow set (16-row set only)" && echo ok || echo fail) \
+      "a pack naming nothing: said explicitly, not silently"
+
 if [ "$fails" -ne 0 ]; then
     printf 'kernel_set_check: %d failure(s)\n' "$fails"
     exit 1

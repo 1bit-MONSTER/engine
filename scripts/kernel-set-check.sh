@@ -16,7 +16,7 @@
 #
 # kernel-set-check.sh: is a shipped kernel set self-consistent, and in which form? (engine#2106)
 #
-#   scripts/kernel-set-check.sh <set dir> [<set dir> ...]
+#   scripts/kernel-set-check.sh [--pack <model dir>] <set dir> [<set dir> ...]
 #
 # Why this exists: the release candidate serves small models at 87-101 tok/s with the set that ships beside it, and a
 # build of current main refused that same set with "layer ELFs: the NB 2 and 3 builds differ in size". Neither the set
@@ -35,6 +35,18 @@
 # Exit: 0 the set is consistent, 1 it is not, 2 the argument is not a set (no manifest.json).
 
 set -uo pipefail
+
+# --pack <model dir> is the only option: everything else is a set directory. Parsed before the work so a set named like an
+# option cannot be mistaken for one, and so `pack` is always defined under `set -u`.
+pack=""
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --pack) pack="${2:-}"; shift 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+set -- "${args[@]}"
 
 fail=0
 
@@ -144,6 +156,59 @@ PY
 
 }
 
+# engine#2128: a pack that names the wide/narrow sealed sets must name files that are actually there. The naming lives in
+# `config.json` (`q4nx_t2s_sealed_wide_elf`, `q4nx_sealed_wide_rows`, `q4nx_t2s_sealed_narrow_elf`, `q4nx_sealed_narrow_rows`)
+# or in `plan.json` (`prefill.sealed_elf`, `decode.narrow_elf`). A name that does not exist is *logged* at run time and the serve
+# stays on the 16-row set -- correct, and invisible until someone reads a log. This says it before a ticket: naming is a decision,
+# and a decision whose file is missing is a no-op that reads like a win.
+check_pack_naming() {
+    local dir=${1%/}
+    shift
+    python3 - "$dir" "$@" <<'PYPACK'
+import json, os, sys
+root = sys.argv[1]
+sets = sys.argv[2:]
+problems, named = [], {}
+def load(name):
+    path = os.path.join(root, name)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except Exception:
+        return {}
+config, plan = load("config.json"), load("plan.json")
+keys = {
+    "wide": [("config.json", config.get("q4nx_t2s_sealed_wide_elf")),
+             ("plan.json", (plan.get("prefill") or {}).get("sealed_elf"))],
+    "narrow": [("config.json", config.get("q4nx_t2s_sealed_narrow_elf")),
+               ("plan.json", (plan.get("decode") or {}).get("narrow_elf"))],
+}
+for kind, sources in keys.items():
+    for where, value in sources:
+        if not value:
+            continue
+        named[kind] = (where, value)
+        base = os.path.basename(str(value))
+        found = []
+        for s in sets:
+            for cur, _, names in os.walk(s):
+                if base in names:
+                    found.append(os.path.join(cur, base))
+        if not found:
+            problems.append(f"{kind} set named in {where} as {value!r}, which is in none of the sets given "
+                            f"({', '.join(os.path.basename(x) or x for x in sets)}) -- the serve would log it and stay on the 16-row set")
+        else:
+            print(f"OK   {os.path.basename(root)}: {kind} set {base} named in {where} is present")
+if not named:
+    print(f"OK   {os.path.basename(root)}: names no wide/narrow set (16-row set only)")
+for problem in problems:
+    print(f"FAIL {os.path.basename(root)}: {problem}")
+raise SystemExit(0 if not problems else 1)
+PYPACK
+}
+
 if [ $# -eq 0 ]; then
     printf 'usage: %s <set dir> [<set dir> ...]\n' "$0" >&2
     exit 2
@@ -153,6 +218,15 @@ rc=0
 for dir in "$@"; do
     check_set "$dir" || { rc=$?; [ "$rc" -gt 1 ] && rc=2; }
 done
+
+if [ -n "$pack" ]; then
+    if [ ! -d "$pack" ]; then
+        printf 'FAIL %s: --pack is not a directory\n' "$pack"
+        fail=1
+    elif ! check_pack_naming "$pack" "$@"; then
+        fail=1
+    fi
+fi
 
 if [ "$fail" != 0 ]; then
     [ "$rc" -eq 0 ] && rc=1

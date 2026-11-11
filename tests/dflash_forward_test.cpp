@@ -86,7 +86,7 @@ std::vector<float> identity(int n) {
     return m;
 }
 
-// hidden 2, one head of width 2, one layer, eps 0, every projection the identity except v. The gains that sit on
+// hidden 2, one head of width 2, one layer, eps 0, every projection the identity except v, gate and up. The gains that sit on
 // the attention's inputs are all different, so a norm applied to the wrong rows (or not at all) moves the answer.
 DraftWeights tiny_model() {
     DraftWeights w;
@@ -96,8 +96,12 @@ DraftWeights tiny_model() {
     w.hidden_norm = {0.5f, 3.0f};
     w.norm = {1.0f, 1.0f};
     DraftLayerWeights L;
-    L.q = L.k = L.o = L.gate = L.up = L.down = identity(2);
+    L.q = L.k = L.o = L.down = identity(2);
     L.v = {2.0f, 0.0f, 0.0f, 3.0f};
+    // gate and up differ, and gate drives its first output negative where up is positive, so silu(gate) * up and
+    // silu(up) * gate are different numbers: which of the two is activated is part of the answer.
+    L.gate = {-1.0f, 0.0f, 0.0f, 2.0f};
+    L.up = {3.0f, 0.0f, 0.0f, 0.5f};
     L.input_norm = {2.0f, 0.5f};
     L.q_norm = {1.5f, 0.5f};
     L.k_norm = {0.25f, 2.0f};
@@ -121,8 +125,8 @@ void tiny_tail(double x0, double x1, double a0, double a1, double& o0, double& o
     double y0 = x0 + a0, y1 = x1 + a1;          // residual (o_proj is the identity)
     double p0 = y0, p1 = y1;
     rms2(p0, p1);                                // post_norm
-    y0 += silu(p0) * p0;                         // gate, up, down are the identity
-    y1 += silu(p1) * p1;
+    y0 += silu(-1.0 * p0) * (3.0 * p0);          // silu(gate(p)) * up(p); down is the identity
+    y1 += silu(2.0 * p1) * (0.5 * p1);
     rms2(y0, y1);                                // the final norm
     o0 = y0; o1 = y1;
 }

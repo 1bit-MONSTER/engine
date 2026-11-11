@@ -1297,6 +1297,12 @@ The gap's offsets are block arithmetic, one number for every layer, so the impor
 layer's bytes to be `[64 B zeros][finite gain][64 B zeros][finite gain]` (`qk_gap_block_why()`)
 and refuses a layer that is not, by name, instead of writing whatever is there.
 
+Hunyuan-0.5B's first payload is in the order q, k, v, like Hunyuan-7B's (`Plan::attn_q_first`).
+Checked against `tencent/Hunyuan-0.5B-Instruct` on the host: read as k, q, v, q_proj and k_proj
+correlate 0.01 with the checkpoint in layers 0, 11 and 23; read as q, k, v they correlate 0.96 to
+0.99, and in chat format the container picks the checkpoint's next token at 39 of 42 positions
+(mean KL 0.030 nats).
+
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
 one comparison holds every field, index and nibble order at once, and it is why a tile whose

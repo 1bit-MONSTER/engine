@@ -3787,6 +3787,11 @@ Plan plan(const std::string& pack_dir) {
                         p.qnorm_off = wq.q_norm;
                         p.knorm_off = wq.k_norm;
                         if (wq.k_norm) p.qk_gap_off = wq.o_off - wq.gap;
+                        // The Hunyuan block's first payload is q, k, v here too (see attn_q_first). Measured on
+                        // Hunyuan-0.5B-Instruct against the public checkpoint: read as k, q, v, the container's k_proj
+                        // is q_proj's first 1,024 rows and its q_proj is q's last 1,024 rows followed by k (per-tensor
+                        // correlation 0.01 for both in three layers); read as q, k, v all three correlate above 0.95.
+                        if (wq.k_norm) p.attn_q_first = true;
                         // NOT p.attn_note: that field is the refusal channel -- a non-empty value there refuses the
                         // attention biases by name (it means "why this section could not be read"). This is the
                         // opposite: the section WAS read this way. Reported on stderr once instead.

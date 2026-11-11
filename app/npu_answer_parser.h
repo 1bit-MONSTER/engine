@@ -180,8 +180,22 @@ public:
 private:
     enum class Mode { content, reasoning, call };
 
-    void emit(std::vector<std::pair<bool, std::string>>& out, bool is_reasoning, const std::string& text) {
-        if (text.empty()) return;
+    // Whitespace around a reasoning block is the model's layout, not part of either text: `<think>\n...\n</think>\n\n`
+    // then the answer.  Left in, the answer to "one word" comes back as "\n\nParis", and a model that thinks nothing
+    // (`<think>\n\n</think>`) sends a reasoning chunk that is two newlines.  So the whitespace that LEADS the reasoning
+    // is dropped, and so is the whitespace that leads the content when that content follows a reasoning block --
+    // the rule app/think_split.h has always applied on the in-process route ("whitespace around the block is
+    // dropped"), so the two routes return the same strings.  Content with no reasoning before it is not touched.
+    void emit(std::vector<std::pair<bool, std::string>>& out, bool is_reasoning, const std::string& raw) {
+        if (raw.empty()) return;
+        std::string text = raw;
+        bool& trim = is_reasoning ? trim_reasoning_ : trim_content_;
+        if (trim) {
+            const size_t b = text.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos) return;   // all whitespace so far: nothing to send yet
+            text.erase(0, b);
+            trim = false;
+        }
         if (is_reasoning) {
             reasoning_ += text;
             saw_reasoning_ = true;
@@ -221,6 +235,8 @@ private:
                 }
                 if (starts(tags_.think_close)) {
                     flush_plain();
+                    // what follows a block is separated from it by layout whitespace -- unless content came first
+                    if (mode_ == Mode::reasoning && !saw_text_) trim_content_ = true;
                     mode_ = Mode::content;
                     i += std::string(tags_.think_close).size();
                     continue;
@@ -377,6 +393,8 @@ private:
     std::vector<ToolCall> calls_;
     bool saw_reasoning_ = false;
     bool saw_text_ = false;
+    bool trim_reasoning_ = true;   // until the reasoning's first non-whitespace character
+    bool trim_content_ = false;    // set when a reasoning block closes before any content; cleared by the first text
 };
 
 // Does the rendered prompt leave the model INSIDE a reasoning block?  Some templates end their generation prompt

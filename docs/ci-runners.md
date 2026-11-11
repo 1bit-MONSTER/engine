@@ -306,7 +306,9 @@ here: a new workflow changes what the repository's token may do, which is an RFC
 ## Two rows, one question: are the runners healthy?
 
 Since #1682 and #1546 both landed there are two checks, and neither alone is enough — each is blind to what the
-other sees. Both run in `scripts/weekly.sh`'s preflight, so a release refuses to start on a runner it cannot trust.
+other sees. Both run in `scripts/weekly.sh`'s preflight. A runner that is **not accepting jobs** stops the release
+before it starts. A runner that is up but whose **restart policy is short** is a warning, and the release goes on
+(owner decision on engine#1504, 2026-11-11): see [the next section](#a-short-restart-policy-warns-it-does-not-block).
 
 | | `scripts/check-ci-runners.sh` | `scripts/ci-runner-health.sh` |
 |---|---|---|
@@ -315,7 +317,7 @@ other sees. Both run in `scripts/weekly.sh`'s preflight, so a release refuses to
 | notices | a registration that was revoked, expired or never made | `Result=oom-kill`, a restart window, a unit that stopped |
 | cannot see | *why* it died — no `oom-kill`, no restart count | a unit that is running fine while its registration is gone |
 | speed | after the heartbeat times out | the moment the unit dies |
-| exit | 0 online · 1 an offender, named · **2 cannot tell** (unreadable or truncated list) | 0 all accepting · 1 one is not · 2 no such units on this host |
+| exit | 0 online · 1 an offender, named · **2 cannot tell** (unreadable or truncated list) | 0 all accepting, policy right · 1 one is not accepting jobs · 2 no such units on this host · **3 all accepting, a restart policy is short** |
 
 Run either by hand — both are read-only and neither restarts anything:
 
@@ -335,3 +337,72 @@ rather than report green.
 One case neither row covers: a runner that is `online` in the API *and* active locally, but wedged so it takes no
 jobs. That is a hung process, not a registration or unit state; the practical signal for it is a queue that stops
 moving while both rows stay green.
+
+## A short restart policy warns, it does not block
+
+`scripts/ci-runner-health.sh` prints two lines per unit: its state (`PASS`/`FAIL`) and its restart policy
+(`PASS`/`WARN`). The exit code keeps them apart, because they call for different things:
+
+| exit | meaning | `scripts/weekly.sh` preflight |
+|---|---|---|
+| 0 | every unit is accepting jobs and would come back after an OOM kill | passes |
+| 1 | a unit is not accepting jobs now (dead, or in its restart window) | **blocks**: the checks after the release would queue for ever |
+| 2 | no `actions.runner.*` units on this host | a note |
+| 3 | every unit is accepting jobs, but a `WARN` line names a policy setting | **warns** and goes on |
+
+A unit that is down outranks a policy line, so 1 wins over 3. The warning in the release log reads
+`preflight: WARNING, not blocking: every runner unit is accepting jobs, but a restart policy would leave one down
+after the next OOM kill`, with the `WARN` lines above it naming the unit and the setting.
+
+Why a warning is enough: the policy is a box configuration change, which the owner applies (below), and a release
+that cannot start does not make the unit any safer. Meanwhile the heavy builds run under
+`scripts/mem-guard.sh --term`, which ends the build before the kernel's OOM killer reaches the runner. **A build step
+that ends with exit 143 was stopped by that guard**: the log has a `GUARD: MemAvailable N GB < floor GB` line, the
+runner is still alive, and the job is re-run once memory frees. The guard covers only the steps that use it. A server
+or a bench started without it can still take the unit down, which is why the drop-ins below are the real fix.
+
+`tests/weekly_runner_preflight_test.sh` (ctest `weekly_runner_preflight`) runs the real health script and the real
+`preflight_runner_units()` from `scripts/weekly.sh` against a stub `systemctl`: the four exit codes, block on a dead
+unit, warn on a short policy.
+
+### The two drop-ins (owner step)
+
+On strixhalo, `strixhalo-bench` and `strixhalo-org` still run the units that predate `scripts/install-ci-runner.sh`:
+`Restart=no`, `OOMPolicy=stop`. One OOM kill of any process in the unit stops it for good. `strixhalo-engine` got
+the same drop-in on 2026-11-10. This needs `sudo`, so it is the owner's to run. It does not re-register a runner,
+change its user, or stop a job in flight.
+
+Both files have the same content, [`scripts/ci-runner-restart.conf`](../scripts/ci-runner-restart.conf):
+
+```ini
+# /etc/systemd/system/actions.runner.1bit-MONSTER-engine.strixhalo-bench.service.d/restart.conf
+# /etc/systemd/system/actions.runner.1bit-MONSTER.strixhalo-org.service.d/restart.conf
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=15
+OOMPolicy=continue
+```
+
+The three commands, from the root of an engine checkout:
+
+```sh
+sudo install -Dm644 scripts/ci-runner-restart.conf /etc/systemd/system/actions.runner.1bit-MONSTER-engine.strixhalo-bench.service.d/restart.conf
+sudo install -Dm644 scripts/ci-runner-restart.conf /etc/systemd/system/actions.runner.1bit-MONSTER.strixhalo-org.service.d/restart.conf
+sudo systemctl daemon-reload
+```
+
+Check it took (read-only, no `sudo`):
+
+```sh
+systemctl show actions.runner.1bit-MONSTER-engine.strixhalo-bench.service actions.runner.1bit-MONSTER.strixhalo-org.service -p Id -p Restart -p OOMPolicy
+scripts/ci-runner-health.sh; echo "exit $?"
+```
+
+Want `Restart=always` and `OOMPolicy=continue` on both. The health script still exits 3 afterwards, with one `WARN`
+per unit naming only `MemoryMax=infinity(want a ceiling)`: the drop-in sets no memory ceiling. The ceiling this page
+documents (`MemoryHigh=43G`, `MemoryMax=48G`) comes with a full `scripts/install-ci-runner.sh` install, or with
+`sudo systemctl set-property <unit> MemoryHigh=43G MemoryMax=48G` per unit. To undo a drop-in, delete the
+`restart.conf` and run `sudo systemctl daemon-reload`.

@@ -40,10 +40,13 @@ import pathlib
 import re
 import sys
 
-# A literal `/tmp` path in C, C++ or shell, including its closing quote where there is one, so the baseline
-# names the literal exactly as a reader finds it in the file. `["']` opens on either quote; a template literal
-# with no closing quote on the same line (a shell `"${TMPDIR:-/tmp}/x"`) ends at what it matched.
-LITERAL = re.compile(r"""["']/tmp/[^"'\s]*["']?""")
+# A `/tmp` path in C, C++ or shell. The first version of this required a LEADING QUOTE, and a reviewer measured
+# what that missed: `echo y > /tmp/x.log` -- a bare path, the plain shell idiom, and arguably the most likely form
+# in `scripts/*.sh` -- was invisible, while the same path in quotes was caught. So the leading quote is gone and the
+# anchor is "not the tail of another path": `(?<![A-Za-z0-9_./-])` keeps `/var/tmp/x` out (the `a` before `tmp`
+# blocks it) and lets `/tmp/x` in whether it follows a space, `>`, `=`, a quote or nothing at all. A trailing quote
+# is included when present so the baseline names the literal as a reader finds it.
+LITERAL = re.compile(r"""(?<![A-Za-z0-9_./-])/tmp/[^"'\s;|)]*["']?""")
 
 # The paths this check owns. `npu/` and `app/` are where a dump lands; `tools/` and `scripts/` are where a
 # benchmark log lands. Everything else is out of scope on purpose: a test may use a temp dir (and pytest's
@@ -105,7 +108,9 @@ def scan(root: pathlib.Path) -> dict[str, list[str]]:
                 text = path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            hits = [m.group(0) for m in LITERAL.finditer(strip_comments(text, path.suffix))]
+            # A trailing quote is stripped so the baseline records the PATH: re-quoting a site (`"/tmp/x"` ->
+            # `/tmp/x`) is not a new site, and the two spellings of one path would otherwise be two baseline lines.
+            hits = [m.group(0).rstrip("\"'") for m in LITERAL.finditer(strip_comments(text, path.suffix))]
             if hits:
                 found[rel] = sorted(set(hits))
     return found
@@ -212,11 +217,18 @@ def self_test() -> int:
             encoding="utf-8",
         )
         found = scan(root)
-        check(found.get("npu/forward/dump.cpp") == ['"/tmp/npu_layer.bin"'],
+        check(found.get("npu/forward/dump.cpp") == ["/tmp/npu_layer.bin"],
               "a live literal is found and the two commented copies are not")
-        check('"/tmp/old.bin"' not in str(found), "a commented-out path is not a site")
+        check("/tmp/old.bin" not in str(found), "a commented-out path is not a site")
         check("tests/dump_test.cpp" not in found, "a test file is out of scope")
-        check('"/var/tmp/not_ours.bin"' not in str(found), "/var/tmp is not /tmp")
+        check("/var/tmp/not_ours.bin" not in str(found), "/var/tmp is not /tmp")
+        # engine#2027 review: the bare shell spelling, which the first pattern missed
+        (root / "tools" / "bare.sh").write_text('echo y > /tmp/bare.log\ncp a /tmp/b2\n', encoding="utf-8")
+        bare = scan(root)
+        check(bare.get("tools/bare.sh") == ["/tmp/b2", "/tmp/bare.log"],
+              "a bare /tmp path is a site (no quotes): the engine#2027 review's hole")
+        check(all('"' not in s and "'" not in s for s in bare.get("tools/bare.sh", [])),
+              "and the bare form is recorded without a quote it never had")
 
         # The ratchet: a new site fails, a stale baseline line fails, and an unchanged tree passes.
         write_baseline(root / "tools" / "ci" / "tmp_paths.txt", found)

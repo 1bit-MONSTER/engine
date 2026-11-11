@@ -903,12 +903,18 @@ def sweep_support(pins, fetch=None):
         sha = commit.get("sha") or ""
         pinned = entry.get("commit") or ""
         paths = list(entry.get("paths") or ())
-        moved_paths = []
-        if paths and sha and sha != pinned:
+        moved_paths, dead_paths = [], []
+        if paths and sha:
             for path in paths:
                 at_pin = (fetch(GH_PATH_HEAD.format(repo=repo, sha=pinned, path=path)) or [{}])[0] or {}
+                if not at_pin.get("sha"):
+                    # no commit at the pin touches it (a typo, or renamed before the pin): it could never move
+                    dead_paths.append(path)
+                    continue
+                if sha == pinned:
+                    continue
                 at_head = (fetch(GH_PATH_HEAD.format(repo=repo, sha=sha, path=path)) or [{}])[0] or {}
-                if (at_pin.get("sha") or "") != (at_head.get("sha") or ""):
+                if at_pin["sha"] != (at_head.get("sha") or ""):
                     moved_paths.append(path)
         heads[repo] = {
             "repo": repo,
@@ -918,7 +924,8 @@ def sweep_support(pins, fetch=None):
             "reviewed": entry.get("reviewed") or "",
             "paths": paths,
             "moved_paths": moved_paths,
-            "moved": (bool(moved_paths) if paths else sha != pinned),
+            "dead_paths": dead_paths,
+            "moved": (bool(moved_paths or dead_paths) if paths else sha != pinned),
         }
     sources = pins.get("d3_sources") or {}
     org, prefix = sources.get("org") or "", sources.get("prefix") or ""
@@ -939,7 +946,9 @@ def report_support(heads, new_d3, org="", prefix=""):
         if h["moved"]:
             print(f"  !! SUPPORT MOVED {h['repo']}  head {h['commit'][:12]} ({h['date'][:10]})  "
                   f"pinned {h['pinned'][:12]} reviewed {h['reviewed']}"
-                  + (f"  watched paths changed: {', '.join(h['moved_paths'])}" if h.get("moved_paths") else ""))
+                  + (f"  watched paths changed: {', '.join(h['moved_paths'])}" if h.get("moved_paths") else "")
+                  + (f"  watched paths with no commit at the pin (fix `paths`): {', '.join(h['dead_paths'])}"
+                     if h.get("dead_paths") else ""))
         elif h.get("paths") and h["commit"] != h["pinned"]:
             print(f"  + SUPPORT PIN {h['repo']}  head {h['commit'][:12]} ({h['date'][:10]})  pinned "
                   f"{h['pinned'][:12]} reviewed {h['reviewed']}: no commit since the pin touches the "

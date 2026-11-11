@@ -1070,12 +1070,15 @@ PATH_PINS = {"repos": {"vllm-project/semantic-router": {
     "paths": ["src/model-runtime/vllm_srun/families/vela3_d3", "config/schemas/systemone"]}}}
 
 
-def path_fetch(head="head99", touched=()):
-    """Head `head`; the last commit touching each path is the same at pin and head unless the path is in `touched`."""
+def path_fetch(head="head99", touched=(), dead=()):
+    """Head `head`; the last commit touching each path is the same at pin and head unless the path is in `touched`.
+    A path in `dead` has no commit at all (the API answers [])."""
     def fetch(url):
         if "&path=" in url:
             sha = url.split("sha=")[1].split("&")[0]
             path = urllib.parse.unquote(url.split("path=")[1].split("&")[0])
+            if path in dead:
+                return []
             return [{"sha": ("new-" + path) if (sha == head and path in touched) else ("old-" + path)}]
         if "/commits" in url:
             return [{"sha": head, "commit": {"committer": {"date": "2026-11-11T00:00:00Z"}}}]
@@ -1099,7 +1102,14 @@ check("support paths: a commit touching a watched path alerts and names the path
       and "watched paths changed: config/schemas/systemone" in buf.getvalue())
 with contextlib.redirect_stdout(io.StringIO()):
     p_rc, _ = cw.watch_support(PATH_PINS, fetch=path_fetch(head="pin000"))
-check("support paths: a head equal to the pin reads no paths and is green", p_rc == 0)
+check("support paths: a head equal to the pin is green", p_rc == 0)
+for _head in ("head99", "pin000"):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        p_rc, _ = cw.watch_support(PATH_PINS, fetch=path_fetch(head=_head, dead=("config/schemas/systemone",)))
+    check(f"support paths: a watched path with no commit at the pin alerts and names it (head {_head})",
+          p_rc == 1 and "!! SUPPORT MOVED vllm-project/semantic-router" in buf.getvalue()
+          and "no commit at the pin (fix `paths`): config/schemas/systemone" in buf.getvalue())
 check("support paths: a pin without `paths` still moves on any commit (the converter's rule is unchanged)",
       cw.watch_support(PINS, fetch=support_fetch(router="zzz999"))[0] == 1)
 check("support paths: the committed router pin watches the d3 family and the System One contract",

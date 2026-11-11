@@ -871,7 +871,7 @@ program is rebuilt.
 wraps its file mapping as an `HRX0_Mapped` buffer. That buffer is host memory: no copy, no device allocation, and no import (the
 userptr import described below is not used). HRX makes its own device copy of each weight from those pages. The model's file pages
 stay in the page cache, which is file-backed and reclaimable. `GGML_HRX_MODEL_BUFFER_COPY=1`, or any
-`GGML_HRX_HOST_WEIGHT_LIMIT_MB`, brings back the upload described in the next paragraph. Measured at llama.cpp `209091986` (#304 on `b6f65a273`)
+`GGML_HRX_HOST_WEIGHT_LIMIT_MB`, brings back the upload described in the next paragraph. Measured at llama.cpp `204493d40` (#304 as merged)
 and hrx-system `7f4236924aad`, with one binary for both arms (`tools/hrx_gtt_split.py run`, peak `drm-total-gtt`):
 
 | shape | upload (`GGML_HRX_MODEL_BUFFER_COPY=1`) | #304 |

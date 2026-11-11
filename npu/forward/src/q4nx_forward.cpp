@@ -202,9 +202,10 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
 // transformers' _compute_llama3_parameters applies.  `on == 0` unless the config names the type, so
 // every other architecture builds exactly the table it built before.  Keys are searched with their
 // quotes, which is what keeps "factor" from matching inside "high_freq_factor".
-// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`. Hunyuan's
-// 1.9 packs declare factor 1.0 with a 262,144 window, i.e. a no-op until a prompt passes that window -- which is why
-// accepting it is safe rather than a guess: below the window the base IS theta, so the served bytes are plain rope.
+// Dynamic NTK: `rope_scaling: {type: "dynamic"|"dynamic_ntk", factor: F}` and `max_position_embeddings`: below the
+// window the base IS theta, so a block with factor 1.0 serves plain rope. Hunyuan's 1.9 packs declare that AND
+// `alpha: 1000.0`, which is a different rule (a fixed base theta * alpha^(dim/(dim-2)), engine#1889): reading only
+// the factor made their block a no-op and rotated every position by the wrong angle.
 Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     Q4nxRopeDynamic d{};
     std::ifstream f(cfg_path);
@@ -221,7 +222,10 @@ Q4nxRopeDynamic read_rope_dynamic(const std::string& cfg_path) {
     };
     d.factor = number("factor");
     d.original_max_position = number("max_position_embeddings");
-    d.on = (d.factor > 0.0 && d.original_max_position > 0.0) ? 1 : 0;
+    // engine#1889: `alpha` selects Hunyuan's fixed-base form (q4nx_rope.h). The key is searched with its quotes and its
+    // colon, so "lora_alpha" or an "alpha" inside a string value cannot be taken for it.
+    d.alpha = number("alpha");
+    d.on = ((d.factor > 0.0 && d.original_max_position > 0.0) || d.alpha > 0.0) ? 1 : 0;
     return d;
 }
 
@@ -1782,6 +1786,17 @@ bool Q4nxNpuForward::load_norms() {
         layer_attn_dims(l, hd_l, nkv_l);
         if (!read_bf16(&mw_->layers[l].input_layernorm_weight, in_norm_[l].data(), H)) return false;
         if (!read_bf16(&mw_->layers[l].post_attention_layernorm_weight, post_norm_[l].data(), H)) return false;
+        // engine#1889: the config says q and k are normalised and this layer has no gain to normalise with. read_bf16
+        // would hand back zeros for the absent tensor and rmsnorm(q, 0) is 0 for every head, so the layer would attend
+        // uniformly and answer fluent nonsense. A Hunyuan container imported before the importer claimed the gains is
+        // exactly this shape, so it is refused by name here instead.
+        if (sem_.qk_norm && absent(&mw_->layers[l].q_norm_weight)) {
+            err_ = "config.json says q and k are normalised per head (" +
+                   std::string(q4nx_semantics_field(Q4NX_SEM_QK_NORM)) + ") and layer " + std::to_string(l) +
+                   " has no self_attn.q_norm.weight: normalising with an absent gain zeroes q, so this container "
+                   "would answer wrong text (engine#1889); re-import the pack with a build that carries the gains";
+            return false;
+        }
         if (!read_bf16(&mw_->layers[l].q_norm_weight, q_norm_[l].data(), hd_l)) return false;
         // Qwen2.5-style attention biases (q/k/v projection biases); absent on the
         // bias-free families, so a miss is not an error.  Loaded BEFORE the k_norm
@@ -4825,7 +4840,11 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
 
     // per-head RMSNorm on q and k, only for architectures that have it.  A KV-shared
     // layer (Gemma4) computed no k at all, so its k is never normalized or used.
-    if (sem_.qk_norm) {
+    // engine#1889: WHERE it runs is per family. Qwen3 and Gemma normalise and then rotate; Hunyuan's graph rotates
+    // and then normalises (q_proj -> RotaryEmbedding -> q_norm -> attention), so for it the same code runs after the
+    // RoPE block below. The RMS itself is rotation-invariant; the per-dimension gain is not, so the order matters
+    // wherever a rotary pair's two gains differ.
+    auto qk_normalise = [&]() {
         std::vector<float> t(HD);
         for (int h = 0; h < NH; h++) {
             rmsnorm(&q[(size_t)h * HD], q_norm_[cur_layer_].data(), HD, t.data(), "q_norm");
@@ -4837,7 +4856,8 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
                 memcpy(&k[(size_t)h * HD], t.data(), sizeof(float) * HD);
             }
         }
-    }
+    };
+    if (sem_.qk_norm && !sem_.qk_norm_after_rope) qk_normalise();
     // Gemma4 normalises v with a SCALE-FREE RMSNorm (its v_norm has no weight).
     if (sem_.v_norm && append_kv) {
         std::vector<float> tv(HD);
@@ -4857,7 +4877,8 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         std::vector<float> cos_(half), sin_(half);
         // Dynamic NTK: the base moves with the position, so it is one pow per position rather than one per dim pair.
         // Below the model's original window this returns theta unchanged, which is what makes a short prompt
-        // bit-identical to the same model served without the scaling.
+        // bit-identical to the same model served without the scaling. A block with `alpha` (Hunyuan) is the fixed
+        // base theta * alpha^(dim/(dim-2)) at every position instead (engine#1889).
         // engine#1792 review: the exponent is HF's `dim / (dim - 2)` over the ROTARY width (`dim = int(head_dim *
         // partial_rotary_factor)`), which is `rot` here -- passing `HD` was wrong for any model that declares dynamic
         // scaling together with partial_rotary_factor < 1. Unreachable in today's catalog, so this is a correctness
@@ -4904,6 +4925,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos, const int
         for (int h = 0; h < NH; h++) rot_half(&q[(size_t)h * HD]);
         for (int h = 0; h < NKV; h++) rot_half(&k[(size_t)h * HD]);
     }
+    if (sem_.qk_norm && sem_.qk_norm_after_rope) qk_normalise();
 
     // append to cache (a KV-shared layer reuses its owner's, which the owner has
     // already appended earlier in this same step).

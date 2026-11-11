@@ -117,6 +117,14 @@ int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail);
 // pinned without a 2.6 GB pack.
 std::string header_witness_refusal(int vote_hdrs, bool declared_qk);
 
+// The first tile of k_proj, q_proj and v_proj inside the attention payload, for n_kv k/v tiles and n_q q tiles
+// (64 rows each). `q_first` false is k, q, v; true is q, k, v (engine#1889, the Hunyuan block). v is last either way.
+// Split out so the order is pinned by a test instead of living in an initializer list.
+struct AttnFirstTiles {
+    int k = 0, q = 0, v = 0;
+};
+AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first);
+
 // A hybrid pack's embedding table lives in its own graph (`embedding.onnx` + `.data`, gathered with
 // GatherBlockQuantized). Returns [V, H] f32 row-major, empty when the pack has no such component, with `why` naming the
 // reason. Exposed so the dequantisation can be tested against known codes and scales instead of only on a 3 GB pack.
@@ -217,6 +225,11 @@ struct Plan {
     // none. Identified and verified byte-exact against the public Qwen3-1.7B/4B checkpoints (0 of 128
     // values differ on either pack, and the swap differs on 127-128 of 128).
     int64_t knorm_off = 0, qnorm_off = 0;
+    // The order of the three projections in the block's first payload. Every family measured before Hunyuan writes
+    // k, q, v (identified on Qwen2.5-0.5B by the tiles' bias subvolumes). The Hunyuan block -- q/k/v at K=hidden, the
+    // packed per-head gains, o_proj -- writes q, k, v (engine#1889): with k,q,v the container's k_proj was q_proj's
+    // first rows, and the model answered filler words; with q,k,v it answers. See attn_first_tiles().
+    bool attn_q_first = false;
     int64_t mlp_off = 0;  // the MLP section starts just past the block's post-attention norm
     // What the pack's *graph* carries, reported so `npu-pack info` can answer a pack's genre without a
     // third-party parser: the rai_1.3/1.6/1.7.1 line ships its 4-bit weights as ordinary ONNX initializers, while

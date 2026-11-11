@@ -27,7 +27,19 @@ arrives, and adds the two up per kernel; the names come from the kernel manifest
 What the numbers are: the wall time from "dispatch launched" to "device idle", one dispatch at a time. That is the
 kernel's device time plus one wake-up of the waiting thread, so a sum over a graph is larger than the same graph in
 a normal run, where dispatches are queued back to back. Use it to see WHICH kernel a graph's time is in and how
-that changes with the context length, not as a tok/s figure. Run the command under gpu-hold like any device run.
+that changes with the context length, not as a tok/s figure. The serial mode slows decode much more than prefill,
+so compare shares inside one program, never between programs. Run the command under gpu-hold like any device run.
+
+Times are milliseconds from time.monotonic_ns() (CLOCK_MONOTONIC, nanosecond steps), read when the trace line arrives.
+
+A kept trace (`run --log`, the input of `parse`) is one line per trace line, the arrival time in ns and the line:
+  <ns> hrx debug serial: begin phase=command-dispatch list=main index=0 list_commands=612 ordinal=0 kind=Kernel kernel_id=<id> bindings=3
+  <ns> hrx debug serial: end phase=command-dispatch ...                 the launch returned
+  <ns> hrx debug serial: sync-end phase=command-post-dispatch ...       the device finished it
+A dispatch is the three lines with the same list, list_commands and index. Lines of other phases are ignored.
+
+Kernels of a build with extra kernel directories are not in the fork's manifests and show as a numeric id; give
+their directory with a second --manifests.
 """
 import argparse
 import collections
@@ -75,7 +87,8 @@ def parse_fields(text):
 
 
 def profile(lines):
-    """lines: iterable of (time_ns, trace text without the prefix). Returns the per-program, per-kernel totals."""
+    """lines: iterable of (time_ns, trace text without the prefix).
+    Returns (per-program per-kernel totals, kernel ids of the dispatches that were launched and never finished)."""
     programs = collections.OrderedDict()
     open_dispatch = {}
     for time_ns, text in lines:
@@ -86,21 +99,24 @@ def profile(lines):
             continue
         key = (fields.get("list"), fields.get("list_commands"), fields["index"])
         if event == "begin" and phase == "command-dispatch":
-            open_dispatch[key] = [time_ns, None]
+            open_dispatch[key] = [time_ns, None, int(fields["kernel_id"])]
         elif event == "end" and phase == "command-dispatch" and key in open_dispatch:
             open_dispatch[key][1] = time_ns
         elif event == "sync-end" and phase == "command-post-dispatch" and key in open_dispatch:
-            begin_ns, launched_ns = open_dispatch.pop(key)
+            begin_ns, launched_ns, _ = open_dispatch.pop(key)
             program = programs.setdefault((fields.get("list"), int(fields.get("list_commands", 0))), {})
             row = program.setdefault(int(fields["kernel_id"]), {"dispatches": 0, "total_ns": 0, "launch_ns": 0})
             row["dispatches"] += 1
             row["total_ns"] += time_ns - begin_ns
             row["launch_ns"] += (launched_ns if launched_ns is not None else begin_ns) - begin_ns
-    return programs
+    return programs, [entry[2] for entry in open_dispatch.values()]
 
 
-def report(programs, names, top, out=sys.stdout):
+def report(programs, names, top, out=sys.stdout, unfinished=(), lines_read=None):
     result = []
+    if programs:
+        print("times: ms, time.monotonic_ns() at the arrival of each trace line; launch to device-idle, serial mode",
+              file=out)
     for (list_kind, command_count), kernels in programs.items():
         total_ns = sum(row["total_ns"] for row in kernels.values())
         dispatches = sum(row["dispatches"] for row in kernels.values())
@@ -123,17 +139,29 @@ def report(programs, names, top, out=sys.stdout):
         if len(rows) > top:
             print(f"  ... {len(rows) - top} more kernels (--top)", file=out)
         result.append(entry)
+    if unfinished:
+        kernels = sorted({names.get(kid, str(kid)) for kid in unfinished})
+        print(f"\nnote: {len(unfinished)} dispatch(es) were launched and never finished (the run was killed or the "
+              f"trace is cut). Their time is NOT in the tables: {', '.join(kernels)}", file=out)
     if not result:
-        print("no dispatch was traced: is the binary an HRX build, and did the run reach the device?", file=out)
+        if lines_read is not None and lines_read[1] == 0:
+            print(f"no dispatch was traced: {lines_read[0]} line(s) read, none is a time-stamped "
+                  f"'{TRACE_PREFIX.strip()}' line. Is this a trace kept by `run --log`?", file=out)
+        else:
+            print("no dispatch was traced: is the binary an HRX build, and did the run reach the device?", file=out)
     return result
 
 
 def read_log(path):
-    with open(path) as handle:
+    """Returns (trace lines, lines read)."""
+    lines, read = [], 0
+    with open(path, errors="replace") as handle:
         for line in handle:
+            read += 1
             stamp, _, text = line.rstrip("\n").partition(" ")
             if stamp.isdigit() and text.startswith(TRACE_PREFIX):
-                yield int(stamp), text[len(TRACE_PREFIX):]
+                lines.append((int(stamp), text[len(TRACE_PREFIX):]))
+    return lines, read
 
 
 def run_command(command, log_path):
@@ -158,7 +186,13 @@ def run_command(command, log_path):
 
 
 def self_test():
-    assert kernel_id("loom_libs", "ggml_mul_mat_f32_f32_wmma") == 5916100870017593149, "the catalog id hash changed"
+    fails = []
+
+    def check(name, got, want):
+        if got != want:
+            fails.append("%s: got %r, want %r" % (name, got, want))
+
+    check("catalog id hash", kernel_id("loom_libs", "ggml_mul_mat_f32_f32_wmma"), 5916100870017593149)
     detail = "list=main index={i} list_commands=2 ordinal={i} kind=Kernel kernel_id={k} bindings=3"
     trace = []
     clock = 1000
@@ -173,17 +207,48 @@ def self_test():
             trace.append((clock + launch + device, "sync-end phase=command-post-dispatch " + text))
             clock += launch + device + 1000  # host time between dispatches is not charged to a kernel
     trace.append((clock, "begin phase=command-list list=main list_commands=2 main_commands=2"))
-    programs = profile(trace)
-    assert list(programs) == [("main", 2)], programs
-    assert programs[("main", 2)][7] == {"dispatches": 2, "total_ns": 200, "launch_ns": 20}, programs
-    assert programs[("main", 2)][9] == {"dispatches": 2, "total_ns": 50, "launch_ns": 10}, programs
-    with open(os.devnull, "w") as sink:
-        result = report(programs, {7: "f:slow", 9: "f:fast"}, 1, out=sink)
-        assert report({}, {}, 5, out=sink) == []
-    assert [k["kernel"] for k in result[0]["kernels"]] == ["f:slow", "f:fast"], result
-    assert abs(result[0]["kernels"][0]["share"] - 0.8) < 1e-9, result
-    print("hrx_dispatch_profile self-test: OK")
-    return 0
+    programs, unfinished = profile(trace)
+    check("programs", list(programs), [("main", 2)])
+    check("slow kernel", programs.get(("main", 2), {}).get(7), {"dispatches": 2, "total_ns": 200, "launch_ns": 20})
+    check("fast kernel", programs.get(("main", 2), {}).get(9), {"dispatches": 2, "total_ns": 50, "launch_ns": 10})
+    check("all finished", unfinished, [])
+
+    class Sink:
+        def __init__(self):
+            self.text = ""
+
+        def write(self, text):
+            self.text += text
+
+    sink = Sink()
+    result = report(programs, {7: "f:slow", 9: "f:fast"}, 1, out=sink)
+    check("order", [k["kernel"] for k in result[0]["kernels"]] if result else None, ["f:slow", "f:fast"])
+    check("share", round(result[0]["kernels"][0]["share"], 9) if result else None, 0.8)
+    check("units in the header", "time.monotonic_ns()" in sink.text, True)
+
+    # a dispatch that is launched and never finished is named, not dropped
+    cut = trace[:6] + [(9000, "begin phase=command-dispatch " + detail.format(i=1, k=9)),
+                       (9005, "end phase=command-dispatch " + detail.format(i=1, k=9))]
+    programs, unfinished = profile(cut)
+    check("unfinished dispatch", unfinished, [9])
+    check("finished one still counted", programs.get(("main", 2), {}).get(7, {}).get("dispatches"), 1)
+    sink = Sink()
+    report(programs, {9: "f:fast"}, 5, out=sink, unfinished=unfinished)
+    check("unfinished is reported", "1 dispatch(es) were launched and never finished" in sink.text
+          and "f:fast" in sink.text, True)
+
+    # nothing traced: a file that is not a trace is told apart from a run that reached no device
+    sink = Sink()
+    check("empty result", report({}, {}, 5, out=sink, lines_read=(3, 0)), [])
+    check("wrong file message", "3 line(s) read, none is a time-stamped" in sink.text, True)
+    sink = Sink()
+    report({}, {}, 5, out=sink, lines_read=(3, 2))
+    check("no device message", "is the binary an HRX build" in sink.text, True)
+
+    for fail in fails:
+        print("FAIL " + fail)
+    print("hrx_dispatch_profile self-test: %s" % ("FAILED" if fails else "OK"))
+    return 1 if fails else 0
 
 
 def main():
@@ -195,25 +260,33 @@ def main():
         p = sub.add_parser(mode)
         p.add_argument("--top", type=int, default=12, help="kernels printed per program (default 12)")
         p.add_argument("--json", help="write the full table here")
-        p.add_argument("--manifests", default=DEFAULT_MANIFESTS, help="the fork's kernel-corpus/kernels directory")
+        p.add_argument("--manifests", action="append",
+                       help="a kernel-corpus/kernels directory; repeat it for a build with extra kernel directories "
+                            "(default: the pinned fork's)")
         if mode == "run":
             p.add_argument("--log", help="keep the time-stamped trace here (on disk, not /tmp)")
             p.add_argument("command", nargs=argparse.REMAINDER, help="-- CMD ARGS...")
         else:
             p.add_argument("log")
     args = parser.parse_args()
-    names = load_kernel_names(args.manifests)
+    names = {}
+    for directory in args.manifests or [DEFAULT_MANIFESTS]:
+        names.update(load_kernel_names(directory))
     if not names:
-        print(f"note: no kernel manifest under {args.manifests}; kernels are shown by id", file=sys.stderr)
+        print(f"note: no kernel manifest under {args.manifests or DEFAULT_MANIFESTS}; kernels are shown by id",
+              file=sys.stderr)
     code = 0
+    lines_read = None
     if args.mode == "run":
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         if not command:
             parser.error("run needs a command after --")
         lines, code = run_command(command, args.log)
     else:
-        lines = list(read_log(args.log))
-    result = report(profile(lines), names, args.top)
+        lines, read = read_log(args.log)
+        lines_read = (read, len(lines))
+    programs, unfinished = profile(lines)
+    result = report(programs, names, args.top, unfinished=unfinished, lines_read=lines_read)
     if args.json:
         with open(args.json, "w") as handle:
             json.dump(result, handle, indent=1)

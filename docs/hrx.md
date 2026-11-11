@@ -891,6 +891,9 @@ The matmuls cost the same at any context; the attention kernel is the part that 
 What the numbers are and are not: each is the wall time from launch to device-idle with one dispatch in flight, so it holds
 one wake-up of the waiting thread and the run is slower than a normal one (the same command: pp512 2,977 -> 2,500 tok/s,
 tg16 67 -> 36, pp8192 1,191 -> 1,167). Use it to rank kernels and to see what grows with the context, not as a rate.
+Decode is slowed much more than prefill, so compare shares inside one program and never between programs. A dispatch that
+was launched and never finished (a ticket that ran out, a cut trace) is listed under the tables and is not in them. A build
+with extra kernel directories shows those kernels as numeric ids; name them with a second `--manifests DIR`.
 
 ### Measuring on `HRX0`: what makes a number citable
 

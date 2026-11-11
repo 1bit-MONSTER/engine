@@ -41,6 +41,10 @@
 //   with an all-zero zero-point block; 285,696 tiles in the two LFM2 packs, every one of them all-zero. Read as
 //   asymmetric, an LFM2 projection correlates -0.39 with the same tensor of the upstream GGUF; read as above, 0.99.
 //   (An asymmetric tile whose 256 group minima are all exactly 0 would be a matrix with no negative weight.)
+//   The same tie test that settled the asymmetric layout settles this reading: LFM2.5-1.2B's lm_head is the
+//   quantised copy of its own bf16 token_embd, and over the first 2048 rows |dequant - embedding| / |scale| has
+//   mean 0.243 and maximum 1.000 (0.48 % of elements above 0.5, all of them the clip of +8 steps to +7). The
+//   other two candidate readings, (code - 8) * scale and unsigned code * scale, are 8 and 7 steps off on average.
 //
 // NOTE: this is NOT the layout asserted by the older tests/verify_i4_dequant.py
 // and tests/verify_q4nx_format.py (per-row 20-byte [scale][zp][16B nibbles]

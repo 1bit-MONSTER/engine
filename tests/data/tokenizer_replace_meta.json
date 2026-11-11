@@ -1,0 +1,88 @@
+{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [
+  {
+   "id": 8,
+   "content": "<bos>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  }
+ ],
+ "normalizer": {
+  "type": "Replace",
+  "pattern": {
+   "String": " "
+  },
+  "content": "▁"
+ },
+ "pre_tokenizer": {
+  "type": "Split",
+  "pattern": {
+   "String": " "
+  },
+  "behavior": "MergedWithPrevious",
+  "invert": false
+ },
+ "post_processor": null,
+ "decoder": {
+  "type": "Sequence",
+  "decoders": [
+   {
+    "type": "Replace",
+    "pattern": {
+     "String": "▁"
+    },
+    "content": " "
+   },
+   {
+    "type": "ByteFallback"
+   },
+   {
+    "type": "Fuse"
+   }
+  ]
+ },
+ "model": {
+  "type": "BPE",
+  "dropout": null,
+  "unk_token": null,
+  "continuing_subword_prefix": null,
+  "end_of_word_suffix": null,
+  "fuse_unk": false,
+  "byte_fallback": false,
+  "ignore_merges": false,
+  "vocab": {
+   "▁": 0,
+   "a": 1,
+   "b": 2,
+   "▁a": 3,
+   "▁b": 4,
+   "ab": 5,
+   "\n": 6,
+   "▁ab": 7
+  },
+  "merges": [
+   [
+    "▁",
+    "a"
+   ],
+   [
+    "▁",
+    "b"
+   ],
+   [
+    "a",
+    "b"
+   ],
+   [
+    "▁",
+    "ab"
+   ]
+  ]
+ }
+}

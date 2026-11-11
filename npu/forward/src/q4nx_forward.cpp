@@ -25,6 +25,7 @@
 // element-wise.
 #include "q4nx_forward.h"
 #include "weight_keys.h"     // the per-layer weight-cache keys, held distinct at compile time
+#include "layer_taps.h"      // engine#1780: where a tapped layer's rows go in the sink
 #include "pad_head_rows.h"   // engine#1990: the padded-head row rule, header-only for its arm
 #include "batch_width.h"
 #include "ffn_cache_policy.h"
@@ -3614,6 +3615,37 @@ void Q4nxNpuForward::npu_gemm_rows(int role, const float* A, int M, int K, int N
     op_line(sc, cur_layer_, M, out, N);
 }
 
+bool Q4nxNpuForward::set_layer_taps(const std::vector<int>& layers, std::vector<float>* sink) {
+    if (layers.empty() || !sink) {
+        tap_layers_.clear();
+        tap_sink_ = nullptr;
+        return true;
+    }
+    if (!onebit::npu::layer_taps_usable(layers.data(), int(layers.size()), c_.NL)) return false;
+    tap_layers_ = layers;
+    tap_sink_ = sink;
+    tap_base_ = sink->size();
+    return true;
+}
+
+// One tapped layer of one pass: M rows of H, written into the pass's rows of the sink at this layer's column block.
+void Q4nxNpuForward::tap_layer(int layer, const float* X, int M) {
+    const int T = int(tap_layers_.size());
+    const int j = onebit::npu::layer_tap_index(tap_layers_.data(), T, layer);
+    if (j < 0 || !tap_sink_ || M <= 0) return;
+    const size_t H = size_t(c_.H);
+    if (j == 0) {   // the first listed layer opens the pass's rows
+        tap_base_ = tap_sink_->size();
+        tap_sink_->resize(tap_base_ + size_t(M) * size_t(T) * H);
+    }
+    if (tap_sink_->size() != tap_base_ + size_t(M) * size_t(T) * H) {   // not the rows this pass opened with
+        tap_fault_ = true;
+        return;
+    }
+    for (int m = 0; m < M; m++)
+        onebit::npu::layer_tap_put(tap_sink_->data() + tap_base_, m, j, T, int(H), X + size_t(m) * H);
+}
+
 // The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
 // then the f32 signs those offsets index (the GGUF's prism.hadamard.sign_widths/sign_values).
 // The plain-text overload. It is declared in q4nx_forward.h and used by npu/forward/embeds_equiv_probe.cpp, but only the
@@ -3714,8 +3746,28 @@ bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_po
     return ok;
 }
 
-bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
-                                std::vector<float>& logits) {
+// engine#1780: a pass that fails must not leave rows in the tap sink. The bodies below return false from many
+// places, so the rule is applied once, here, around each of them.
+bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos, std::vector<float>& logits) {
+    onebit::npu::LayerTapPass pass(tap_sink_);
+    tap_fault_ = false;
+    const bool ok = step_batch_impl(tokens, start_pos, logits);
+    if (tap_fault_ && tap_sink_)
+        std::fprintf(stderr, "  [taps] a batched pass at position %d changed its row count between tapped layers; "
+                             "its rows are dropped\n", start_pos);
+    pass.keep = ok && !tap_fault_;
+    return ok;
+}
+
+bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
+    onebit::npu::LayerTapPass pass(tap_sink_);
+    const bool ok = step_impl(token, pos, logits, cache_pos);
+    pass.keep = ok;
+    return ok;
+}
+
+bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_pos,
+                                     std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // A noncausal pack reads the whole prompt at once, so a chunk that starts above 0 was already
     // encoded causally by an earlier call and cannot be repaired here.  Named, not silently causal.
@@ -3882,6 +3934,9 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
 
     std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row;
     for (int l = 0; l < c_.NL; l++) {
+        // engine#1780: the stream as this layer receives it is the previous layer's output. Taken here and not at
+        // the end of the body, because the body leaves through more than one `continue`.
+        if (l > 0 && tap_sink_) tap_layer(l - 1, X.data(), M);
         cur_layer_ = l;   // the layer index the per-layer helpers read
         const bool cached = weight_cached(0);
         const int lt0 = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
@@ -4279,6 +4334,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // residual here produced garbage logits (the M=1 self-check caught it).
     std::vector<float> fnorm(H);
     bool ok = true;
+    if (tap_sink_) tap_layer(c_.NL - 1, X.data(), M);
     last_residual_.assign(X.begin() + (size_t)(M - 1) * H, X.end());
     if (batch_all_out_) {
         // step_batch_all(): the verifier needs the model's own choice at every drafted position, so every
@@ -5015,7 +5071,7 @@ bool Q4nxNpuForward::mlp(const float* gu, float* h, int im) {
 // --------------------------------------------------------------------------
 // step
 // --------------------------------------------------------------------------
-bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
+bool Q4nxNpuForward::step_impl(int token, int pos, std::vector<float>& logits, int cache_pos) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // Generation is causal by construction (one position at a time, keys only in the past), so a pack
     // whose full-attention layers read the whole prompt cannot be run this way.  Refused by name
@@ -5072,6 +5128,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
     if (ph) { g_ph.embed = ph_ms(tp_step); tp_lap = std::chrono::steady_clock::now(); }
 
     for (int l = 0; l < c_.NL; l++) {
+        if (l > 0 && tap_sink_) tap_layer(l - 1, x.data(), 1);   // engine#1780, as in the batched body
         cur_layer_ = l;
         // Dense models: once this layer's projections are packed (after the
         // first token), the f32 weights are no longer read, so skip the per-token
@@ -5398,6 +5455,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
     }
     if (ph) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
 
+    if (tap_sink_) tap_layer(c_.NL - 1, x.data(), 1);
     last_residual_ = x;                        // one norm earlier, for a drafter that wants the residual
     rmsnorm(x.data(), final_norm_.data(), H, xn.data());
     last_hidden_ = xn;  // for last_hidden(): the post-final-norm state of this position

@@ -40,7 +40,7 @@ int q4nx_num_designs(const Q4nxModelDims* d) {
         return 10;
     return (d->fused_gu ? 4 : 5) + (d->ple_dim > 0 ? 2 : 0) +
            (d->double_wide_mlp ? 2 : 0) + (has_second_attn(d) ? 2 : 0) +
-           (d->lin_kd > 0 ? 2 : 0);
+           (d->lin_kd > 0 ? 2 : 0) + (d->lin_kd <= 0 && d->shortconv_n > 0 ? 1 : 0);
 }
 
 /* MLA + MoE design set (see q4nx_num_designs).  dims->HD must be the per-head
@@ -463,6 +463,11 @@ int q4nx_derive_designs(const Q4nxModelDims* d, Q4nxDesignGeom* out) {
 
         i++;
         geom(&out[i], d->M, d->H, d->lin_vd, Q4NX_DESIGN_Z, "Z");
+    } else if (d->shortconv_n > 0) {
+        /* LFM2 short-convolution in_proj: the same fused-projection role and
+         * kernel format as the GDN q|k|v, at N = 3*H, and no Z. */
+        i++;
+        geom(&out[i], d->M, d->H, d->shortconv_n, Q4NX_DESIGN_QKVLIN, "QKV");
     }
 
     return i + 1;

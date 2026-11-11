@@ -831,7 +831,43 @@ static void test_head_tile_cache(void) {
     free(codes); free(ref); free(scales); free(sref);
 }
 
+/* LFM2-1.2B: a hybrid whose conv layers need one more projection, in_proj (K=H, N=3*H). It is the fused-projection
+ * role at a new N and nothing else: no Z, the other four designs untouched, and off when the model has GDN layers. */
+static void shortconv_geometry(void) {
+    Q4nxModelDims d;
+    memset(&d, 0, sizeof d);
+    d.H = 2048; d.NH = 32; d.NKV = 8; d.HD = 64; d.IM = 8192;
+    d.fused_gu = 1; d.M = Q4NX_DESIGN_M_PREFILL;
+    Q4nxDesignGeom plain[Q4NX_MAX_DESIGNS], g[Q4NX_MAX_DESIGNS];
+    const int n0 = q4nx_derive_designs(&d, plain);
+    d.shortconv_n = 3 * d.H;
+    check_int(q4nx_num_designs(&d), n0 + 1, "short-convolution layers add exactly one design to the count");
+    const int n = q4nx_derive_designs(&d, g);
+    check_int(n, n0 + 1, "and exactly one to the derived table");
+    Q4nxDesignGeom* in = find(g, n, Q4NX_DESIGN_QKVLIN);
+    check(in != NULL, "it is the fused-projection role");
+    if (in) {
+        check_int(in->K, 2048, "in_proj K is the hidden size");
+        check_int(in->N, 6144, "in_proj N is 3 * hidden: [B | C | X]");
+        check(strcmp(in->elf_name, "full_i8_QKV_K2048_N6144.elf") == 0, "its artifact name is geometry-derived, like every other");
+    }
+    check(find(g, n, Q4NX_DESIGN_Z) == NULL, "no Z design: a conv layer has no gate projection");
+    int same = 1;
+    for (int i = 0; i < n0; i++)
+        if (g[i].role != plain[i].role || g[i].K != plain[i].K || g[i].N != plain[i].N ||
+            strcmp(g[i].elf_name, plain[i].elf_name) != 0) same = 0;
+    check(same, "the attention and feed-forward designs are the ones the same model derives without it");
+    Q4nxDesignGeom* o = find(g, n, Q4NX_DESIGN_O);
+    check(o && o->K == 2048 && o->N == 2048, "out_proj (H -> H) is the O design when NH*HD == H");
+    d.lin_kd = 1024; d.lin_vd = 2048;
+    Q4nxDesignGeom both[Q4NX_MAX_DESIGNS];
+    const int nb = q4nx_derive_designs(&d, both);
+    check_int(nb, n0 + 2, "with GDN dims set the GDN pair is derived and shortconv_n adds nothing");
+    check_int(q4nx_num_designs(&d), nb, "and the count agrees with the table");
+}
+
 int main(void) {
+    shortconv_geometry();
     test_head_image();
     test_head_tile_cache();
     oga_geometry();

@@ -463,6 +463,8 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
 
     /* epsilon */
     if (get_num(json, "rms_norm_eps", &d) && d > 0) s->eps = (float)d;
+    /* LFM2 spells it norm_eps (and has no rms_norm_eps at all) */
+    else if (get_num(json, "norm_eps", &d) && d > 0) s->eps = (float)d;
 
     /* ── Gemma4-style per-layer embeddings (PLE) + KV sharing ── */
     if (get_num(json, "hidden_size_per_layer_input", &d) && d > 0)

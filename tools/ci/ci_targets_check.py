@@ -575,6 +575,17 @@ def where_rows(root, cmake_path, wanted):
 ROW = re.compile(r'^\s*(?:add_test|add_python_test)\s*\(\s*(?:NAME\s+)?(\w+)')
 
 
+def where_rc(hits, wanted):
+    """The exit status of --where: 0 only when EVERY requested row is registered somewhere.
+
+    A release verifier passes its whole gate list in one call (`--where a,b,c,d,e`), so one row that is registered
+    nowhere must fail the call. The first version returned 0 as soon as any row was found, so `--where
+    ci_targets,not_a_real_row` printed NOT REGISTERED and still exited 0 (review of engine#2160).
+    """
+    found = {row for row, _, _ in hits}
+    return 0 if wanted and all(row in found for row in wanted) else 1
+
+
 def where_rows_self_test(tmp):
     """engine#2129 follow-up: the answer must come from the family files too, not only CMakeLists.txt."""
     import pathlib as _p
@@ -843,7 +854,7 @@ def main(argv):
                     hint = ("\n\t  but %d row(s) START WITH it -- the row name may be what is wrong, not the "
                             "registration: %s" % (len(near), ", ".join(f"{r} ({where.get(r, '?')})" for r in near)))
                 print(f"{row}\tNOT REGISTERED (searched CMakeLists.txt and every file it include()s or globs){hint}")
-        return 0 if found else 1
+        return where_rc(hits, wanted)
     if a.check:
         return check(a.root)
     ap.print_help()

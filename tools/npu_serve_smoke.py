@@ -242,6 +242,17 @@ def rejudge(args):
         with open(os.path.join(d, "reply_%d.json" % i)) as f:
             replies.append(json.load(f))
         i += 1
+    # A directory with no replies is not a demo that failed - it is the wrong directory (or a harness that wrote
+    # its reply somewhere else), and saying so is the difference between "the run failed" and "look again". The
+    # 2026-11-11 10:54Z smoke was logged FAIL on exactly this: the ad-hoc harness wrote `npu.json`, `--judge`
+    # looked for `reply_0.json`, and three FAIL lines read as a broken demo. The same bytes, renamed, give PASS.
+    if not replies:
+        found = sorted(f for f in os.listdir(d) if f.endswith(".json")) if os.path.isdir(d) else []
+        print("serve       cannot judge: no replies in %s" % d)
+        print("            looked for serve.log, reply_0.json …, load.json; the .json files here are: %s"
+              % (", ".join(found) if found else "none"))
+        print("            if this is another harness's output, name its reply as reply_0.json and re-run --judge")
+        return 2
     load1, ncpu = None, 0   # the load the RUN recorded, if it did: judging again later must not read today's box
     try:
         with open(os.path.join(d, "load.json")) as f:
@@ -433,6 +444,19 @@ def self_test():
     expect("no replies", judge(fast_log, []), {"route": True, "rate": False, "first-token": False, "content": False})
     if not degenerate("//////") or degenerate("391") or degenerate("aa") or not degenerate("a a a a"):
         fails.append("degenerate(): wrong on a fixture")
+
+    # engine#2129 follow-up: `--judge` on a directory that holds no reply_*.json must say "cannot judge" (rc 2),
+    # not report three FAILs - a lane triaging a smoke FAIL was sent after a broken demo on 2026-11-11 10:54Z when
+    # the truth was that its harness had written `npu.json`. The judge() path above still FAILs on an empty list
+    # (that is a run that produced no reply); rejudge() refuses a DIRECTORY it cannot read.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        open(os.path.join(td, "serve.log"), "w").write(fast_log)
+        open(os.path.join(td, "npu.json"), "w").write('{"choices": []}')
+        rc = rejudge(argparse.Namespace(judge=td, floor=60.0, first_token_ms=600.0,
+                                        fast_route=FAST_ROUTE, slow_route=SLOW_ROUTE))
+        if rc != 2:
+            fails.append("rejudge() on a directory with no reply_*.json returned %r, wanted 2" % rc)
 
     self_test_run(fails)
     for f in fails:

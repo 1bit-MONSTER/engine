@@ -244,11 +244,13 @@ comparators and `logprob_agree.py`'s prompts, so it measures what this page docu
 
 ### What the `hrx` width gate is, by name
 
-> **It is not a behaviour-neutral instrument (engine#2143).** With this flag set, an 18,782-token request
-> *completes* where the same binary, model and request **fails** without it, and NaN-logit incidents went from 2
-> to 0; a plain 18.6k prefill measured **271.75 t/s** unset against **118.86 t/s** set. A 2.3x gap is not
-> "logging cost" — it is a different code path. So a rate taken with the flag is not comparable to one taken
-> without it, and an A/B that sets it on one arm only is not an A/B.
+> **Set it in both arms of an A/B, and record box load beside any rate (engine#2143).** #2143 asked whether this
+> flag changes behaviour: one 18,782-token request failed without it and completed with it, and one 18.6k prefill
+> measured 271.75 t/s unset against 118.86 t/s set. At the engine's pin the flag only gates `fprintf` calls
+> (`dispatch_log_match()` and `dispatch_log_requested_output()` in `dispatch-registry.cpp`): the readback check and
+> its decline run in both arms, so the dispatches selected are the same either way. Each of those measurements is
+> one run per arm, #1536 then failed in 4 of 6 runs, and box load moves a rate by about 2x here, so neither shows
+> a flag effect. Setting it in both arms is right whichever way #2143 settles.
 
 `GGML_HRX_LOG_DISPATCH=1` prints each dispatch registration the first time it matches
 (`dispatch_registry/dispatch-registry.cpp`), so the set of registrations a serve logs is the set of
@@ -261,7 +263,6 @@ step splits into two disjoint sets:
 |---|---|
 | 1 (solo, and any sequential history) | `hip.qkv_rope`, `kquant.mul_mat.decode_f32`, `hip.dense_kquant_swiglu`, `hip.gemv_add_norm`, `common.mul_mat.f32_f32_decode` |
 | 2 (concurrent) | `hip.kquant_tokens.mm`, `hip.kquant_tokens.mm_add`, `hip.kquant_tokens.swiglu`, `common.rmsnorm_binary_f32` |
-
 
 Seventeen more registrations match at both widths, including the attention kernel
 (`common.flash_attention_decode_split_next_q8`): on `hrx`, unlike on `cpu`, attention is *not* where

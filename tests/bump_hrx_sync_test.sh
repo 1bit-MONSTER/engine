@@ -136,5 +136,39 @@ else
   fail "config/llama-mirror-hold.config is in the tree"
 fi
 
+# ---- which branch is the mirror (config/llama-mirror-branch.config) -----------------------------------------
+mb=$work/mirror.config
+branch() { LLAMA_MIRROR_FILE=$mb bash "$script" mirror-branch 2>&1; }
+rm -f "$mb"
+expect "no file: the mirror is 1bit/hrx-vulkan, as it always was" "$(branch)" "1bit/hrx-vulkan"
+printf '# only comments\n\n#   1bit/hrx-vulkan-20261110\n' > "$mb"
+expect "a branch that is only mentioned in a comment changes nothing" "$(branch)" "1bit/hrx-vulkan"
+printf '# the dated mirror\n\n  1bit/hrx-vulkan-20261110  \n1bit/ignored-second-line\n' > "$mb"
+expect "the first line that is not a comment names the mirror, spaces around it ignored" "$(branch)" "1bit/hrx-vulkan-20261110"
+for bad in '1bit/hrx-vulkan-patched' 'refs/heads/1bit/x' '../x' '-x' 'a b' 'x;rm' 'x:y'; do
+  printf '%s\n' "$bad" > "$mb"
+  if out=$(branch); then fail "a mirror named '$bad' is refused (got: $out)"; else
+    case "$out" in *"$mb"*|*llama-mirror*|*mirror*) ok "a mirror named '$bad' is refused, naming the file" ;; *) fail "the refusal of '$bad' names the file (got: $out)" ;; esac
+  fi
+done
+# The same refusal through the path the workflow runs: `llama` reads the name inside a command substitution, where a
+# message written to stdout is captured into the variable and never printed. The run must fail AND say why.
+printf 'x;rm\n' > "$mb"
+mkdir -p "$work/empty-scratch"
+if out=$(cd "$work/empty-scratch" && env -u GH_TOKEN -u GITHUB_TOKEN DRY_RUN=1 LLAMA_MIRROR_FILE=$mb AMD_LLAMA=$(printf "a%.0s" $(seq 40)) OURS_HRX=$(printf "b%.0s" $(seq 40)) bash "$script" llama 2>&1); then
+  fail "the llama sync with a mirror named 'x;rm' fails (it exited 0: $out)"
+else
+  case "$out" in
+    *"::error::"*"not a plain branch name"*) ok "the llama sync refuses a bad mirror name with its ::error:: line, not silently" ;;
+    *) fail "the llama sync's refusal of a bad mirror name is printed (got: '$out')" ;;
+  esac
+fi
+shipped_mb=$(cd "$(dirname "$script")/.." && pwd)/config/llama-mirror-branch.config
+if [ -f "$shipped_mb" ]; then
+  expect "the shipped file names no branch, so the mirror is unchanged" "$(LLAMA_MIRROR_FILE=$shipped_mb bash "$script" mirror-branch)" "1bit/hrx-vulkan"
+else
+  fail "config/llama-mirror-branch.config is in the tree"
+fi
+
 if [ "$fails" -ne 0 ]; then echo "$fails check(s) failed"; exit 1; fi
 echo "bump_hrx_sync: ok"

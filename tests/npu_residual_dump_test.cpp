@@ -67,7 +67,7 @@ int main() {
     // 3. a short write: /dev/full accepts the open and fails the write, which is the full-disk case, and it is the arm a
     //    version that only checks fopen would pass.
     err.clear();
-    if (FILE * probe = std::fopen("/dev/full", "wb")) {  // skips cleanly on a host without it
+    if (FILE * probe = std::fopen("/dev/full", "rb")) {  // skips cleanly on a host without it (read: a probe creates nothing)
         std::fclose(probe);
         check(!onebit::npu::write_residual_dump("/dev/full", data.data(), data.size(), &err),
               "a full disk is a failure even though fopen succeeded");

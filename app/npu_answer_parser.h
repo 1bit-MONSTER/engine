@@ -172,6 +172,9 @@ public:
     // The calls seen so far, in order.  A call needs tools_sent, per the issue's rule.
     const std::vector<ToolCall>& calls() const { return calls_; }
     bool saw_reasoning() const { return saw_reasoning_; }
+    // Inside a reasoning block right now (after the opening tag, before the closing one). reasoning_token_count()
+    // reads it before and after each token, so the tags themselves and held-back partial tags count with the block.
+    bool in_reasoning() const { return mode_ == Mode::reasoning; }
     bool saw_text() const { return saw_text_; }
 
     const std::string& reasoning() const { return reasoning_; }
@@ -270,6 +273,11 @@ private:
             mode_ = Mode::content;
             return;
         }
+        if (fam_ == AnswerFamily::qwen3 && close_function_call()) {
+            call_text_.clear();
+            mode_ = Mode::content;
+            return;
+        }
         try {
             const nlohmann::json j = nlohmann::json::parse(call_text_);
             ToolCall c;
@@ -364,6 +372,59 @@ private:
         return out;
     }
 
+    // The second call form a <tool_call> block carries (Qwen3.5's template, and MiniCPM-V 4.7's, teach it):
+    //     <function=NAME>
+    //     <parameter=KEY>
+    //     VALUE
+    //     </parameter>
+    //     </function>
+    // The template writes a string argument bare and everything else through `tojson`, so a value is read back
+    // the same way: an object, an array, a number, true/false/null are JSON; anything else is the string itself,
+    // less the one newline the form puts on each side.  False on any other shape (the caller then tries the JSON
+    // form and, failing that, puts the markup back into content).
+    // shortcut: without the request's schema a string argument whose text is a JSON literal ("17", "true") comes
+    // back as that literal; type by the tool's parameter schema here if a caller needs it kept a string.
+    bool close_function_call() {
+        const std::string body = answer_detail::trim(call_text_);
+        static const std::string fopen_ = "<function=", fclose_ = "</function>", popen_ = "<parameter=", pclose_ = "</parameter>";
+        if (body.compare(0, fopen_.size(), fopen_) != 0) return false;
+        if (body.size() < fclose_.size() || body.compare(body.size() - fclose_.size(), fclose_.size(), fclose_) != 0) return false;
+        const size_t name_end = body.find('>', fopen_.size());
+        if (name_end == std::string::npos) return false;
+        ToolCall c;
+        c.id = "call_" + std::to_string(calls_.size());
+        c.name = answer_detail::trim(body.substr(fopen_.size(), name_end - fopen_.size()));
+        if (c.name.empty() || c.name.find('<') != std::string::npos) return false;
+        nlohmann::ordered_json args = nlohmann::ordered_json::object();
+        size_t i = name_end + 1;
+        const size_t end = body.size() - fclose_.size();
+        auto space = [&] { while (i < end && (body[i] == ' ' || body[i] == '\n' || body[i] == '\r' || body[i] == '\t')) ++i; };
+        for (space(); i < end; space()) {
+            if (body.compare(i, popen_.size(), popen_) != 0) return false;
+            const size_t key_end = body.find('>', i + popen_.size());
+            if (key_end == std::string::npos || key_end >= end) return false;
+            const std::string key = answer_detail::trim(body.substr(i + popen_.size(), key_end - i - popen_.size()));
+            const size_t close = body.find(pclose_, key_end + 1);
+            if (key.empty() || close == std::string::npos || close > end) return false;
+            std::string value = body.substr(key_end + 1, close - key_end - 1);
+            if (!value.empty() && value.front() == '\n') value.erase(0, 1);
+            if (!value.empty() && value.back() == '\n') value.pop_back();
+            const std::string t = answer_detail::trim(value);
+            nlohmann::ordered_json v = value;
+            const bool literal = !t.empty() && (t[0] == '{' || t[0] == '[' || t[0] == '-' || std::isdigit((unsigned char)t[0]) ||
+                                                t == "true" || t == "false" || t == "null");
+            if (literal) {
+                const nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(t, nullptr, /*allow_exceptions=*/false);
+                if (!parsed.is_discarded() && !parsed.is_string()) v = parsed;
+            }
+            args[key] = std::move(v);
+            i = close + pclose_.size();
+        }
+        c.arguments = args.dump();
+        calls_.push_back(std::move(c));
+        return true;
+    }
+
     bool close_gemma_call() {
         const std::string body = answer_detail::trim(call_text_);
         if (body.compare(0, 5, "call:") != 0) return false;
@@ -440,6 +501,57 @@ inline std::vector<char> content_mask(const std::vector<std::string>& pieces, An
         if (!is_reasoning && !mask.empty() && !mask.back()) mask.back() = 1;
     }
     return mask;
+}
+
+// How many of `pieces` (one generated token's text each, in order) were reasoning: OpenAI's
+// usage.completion_tokens_details.reasoning_tokens (engine#2111). An empty `content` with finish_reason "length" reads
+// like "the model said nothing" when the whole budget went into a thinking block, and this is the number that says so.
+// A token is reasoning when none of its text reached `content` and the block was open before it, after it, or it put
+// text into the block: so the opening and closing tags, a partial tag the holdback keeps, and an unclosed block at the
+// end of the budget all count, while call markup and the whitespace after a closed block do not. A token that
+// straddles the boundary ("</think>The") is content, as content_mask() says. Same splitter, so the count, the split
+// and the logprob entries cannot disagree.
+inline int reasoning_token_count(const std::vector<std::string>& pieces, AnswerFamily family, bool tools_sent,
+                                 bool starts_in_reasoning = false) {
+    AnswerStream s(family, tools_sent, starts_in_reasoning);
+    std::vector<std::pair<bool, std::string>> out;
+    int n = 0;
+    bool last_counted = false;
+    // Tokens that produced nothing before anything was produced (leading whitespace, the first half of an opening tag
+    // the holdback keeps) belong to whatever comes next: to the block if the next token opens it, to nothing otherwise.
+    int pending = 0;
+    bool started = false;
+    for (const auto& piece : pieces) {
+        const bool before = s.in_reasoning();
+        out.clear();
+        s.feed(piece, out);
+        bool content = false, reasoning = false;
+        for (const auto& [is_reasoning, text] : out) {
+            (void)text;
+            (is_reasoning ? reasoning : content) = true;
+        }
+        last_counted = !content && (reasoning || before || s.in_reasoning());
+        if (last_counted) {
+            ++n;
+            if (!started) n += pending;
+            started = true;
+        } else if (content) {
+            started = true;
+        } else if (!started) {
+            ++pending;
+        }
+    }
+    // What the holdback still holds is flushed by finish(): if it is content, the last token's text reached `content`.
+    out.clear();
+    s.finish(out);
+    for (const auto& [is_reasoning, text] : out) {
+        (void)text;
+        if (!is_reasoning && last_counted) {
+            --n;
+            last_counted = false;
+        }
+    }
+    return n;
 }
 
 // The whole answer at once: the same splitter, so the two paths cannot disagree.

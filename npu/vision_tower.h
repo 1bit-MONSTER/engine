@@ -15,7 +15,7 @@
 //
 // The MiniCPM-V 4.7 vision tower, host float32 (engine#1788): pixels in, the rows the text model receives out.
 //
-// A reference, not a serving path: plain loops, one image, no device. It exists so that whatever later runs this
+// A reference, not a serving path: plain loops (spread over threads, see tower_threading), one image, no device. It exists so that whatever later runs this
 // tower on the NPU has numbers to be compared with, and it is itself compared with the transformers implementation
 // (transformers.models.minicpmv4_7, 5.22.2) on a published pack's weights: docs/npu.md has the figures.
 //
@@ -45,6 +45,13 @@ namespace onebit::npu::vision {
 // Throws std::runtime_error when the grid is not a multiple of 4 in both extents, is empty, or the pack's geometry
 // lacks what only config.json states (the head count).
 std::vector<float> tower_forward(const Pack& pack, const float* pixels, int gh, int gw, std::vector<float>* tower = nullptr);
+
+// How the forward spreads its loops over threads. `threads` 0 means the default (ONEBIT_VISION_THREADS, else the
+// machine's count, capped at 16) and 1 means none; `min_work` is the number of multiply-adds below which a loop stays
+// on the calling thread (default 4e6, so a small tower never starts one). The output does not depend on either: every
+// token and every attention head is computed by exactly one thread with the single-threaded arithmetic. Not for use
+// while a tower_forward() is running.
+void tower_threading(int threads, double min_work = 4e6);
 
 // Step 2's table row for patch (y, x) of a gh x gw grid on a side x side table.
 inline int nearest_position(int y, int x, int gh, int gw, int side) {

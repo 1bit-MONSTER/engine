@@ -70,9 +70,15 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 
 **What ends an answer.** The serve stops on every id in `config.json`'s `eos_token_id` (one integer or a list), on
 `<|endoftext|>` when the tokenizer has it, on `tokenizer_config.json`'s `eos_token` when that file is beside the
-tokenizer, and, when the chat route falls back to ChatML, on `<|im_end|>`. The two files need not agree: FastFlowLM's
+tokenizer, and on the marker the chat route's prompts close an assistant turn with: `<|im_end|>` on the ChatML
+fallback, or, when the container's own template is rendered, whatever that template puts right after an assistant
+message (`<|end|>` for Phi, `<|eot_id|>` for Llama 3, `<end_of_turn>` for Gemma), read off a rendered two-message
+exchange at load. The two files need not agree: FastFlowLM's
 `Qwen3.5-2B-NPU2` container names `<|endoftext|>` in the first and `<|im_end|>` in the second, and the model ends a
-chat turn with the second. The load prints the list (`forward-serve: stops on …`).
+chat turn with the second. And neither file has to name the turn end at all: FastFlowLM's
+`Phi4-mini-Instruct-NPU2` names `<|endoftext|>` in both, its template closes every turn with `<|end|>`, and before
+the template was consulted its answer ran on past `Paris<|end|><|assistant|>` to the token budget. The load prints
+the list (`forward-serve: stops on …`).
 
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the OpenAI-compatible API
 ([serve.md](serve.md)); inside Lemonade, that is what its `onebit` backend runs (`--onebit npu`).
@@ -89,6 +95,25 @@ The schema, the refusal rules and the generator flags are in [npu-plan.md](npu-p
 | `fusion.gate_up` (`fused`/`split`) | the fused `full_i8_GU_*` kernel won, and with no split kernel on disk the split layout was assumed |
 | `kernels.tag` (`""`/`_b8`/`_pb16i`/`_t2s`) | the artifact family came from `q4nx_weight_layout`, so a kernel dir of the other family changed which kernels ran |
 | `decode.dirs` | the M=16 twins were looked for in `<model>/kernels-m16`, then `<kernels>/m16`, then `<kernels>` |
+
+**A decode off the 16-row family is said at ready (engine #2102).** forward-serve prints one line after `ready on
+http://...` when roles have no M=16 decode kernel. In that case every decode step runs a 128-row prefill launch:
+
+```
+npu: 0 of 4 role(s) have a 16-row decode kernel in <kernels> -- decode runs prefill-width launches and is far slower than the fused route (engine#2102). ...
+```
+
+The load line `[forward] decode family: N role(s) at M=16, ...` stays byte-for-byte, because gates grep it. The new line
+is silent when:
+
+- the family is full;
+- the arm is host-GEMM (`NPU_INFER_HOST_GEMM`, which loads no family);
+- the container is ternary (pb16i/t2s) with some roles on M=128. Its loader refuses a missing decode kernel, and the
+  roles it leaves are covered by its geometry, which the load log names per role.
+
+`NPU_DECODE_M16=0` gets its own sentence, which names the switch. The twins are not the way to the demo rate. Measured on
+Qwen3-0.6B, the per-op forward decodes at ~1.7 tok/s without them and ~2.7 tok/s with all four, against 88-101 tok/s on
+the fused route.
 
 `tools/npu_plan.py <model dir>` writes one from `config.json` plus the kernel directory (it derives layer
 roles from `layer_types` and projection shapes from the model's own dimensions, the way the forward does).
@@ -550,7 +575,9 @@ may name a second sealed ELF with the same instances built for more rows: `q4nx_
 `q4nx_pb16i_sealed_wide_elf`) in `config.json`, a file in the kernels directory beside the 16-row one, and
 `q4nx_sealed_wide_rows` for its row count (default 32, allowed 17..128). No pack ships one yet, so nothing
 changes for an existing pack. `NPU_WIDE_SEALED_ELF=<file>` overrides the pack's file, `NPU_WIDE_SEALED_ELF=0`
-switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count.
+switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count. `tools/npu_plan.py` copies
+the two keys into `plan.json` as `prefill.sealed_elf` and `prefill.sealed_rows`, and a loaded plan wins over
+`config.json` (`docs/npu-plan.md`).
 
 When the wide ELF loads for every role that has a 16-row kernel, the chunk width becomes its row count and a
 launch of more than 16 rows takes the wide kernel; decode steps and chunks of up to 16 rows stay on the
@@ -583,7 +610,8 @@ takes it (a decode step, or a verify pass of a few rows); anything wider keeps t
 are the wide family's: all roles or none, one hw_context, shared weight images, and a file that is missing
 or does not load is logged (`[forward] narrow family NOT adopted (...)`) while decode stays on the 16-row
 kernels. `narrow_family_complete` and `narrow_takes` in `batch_width.h` are pinned by
-`tests/npu_pack_test.cpp`. No pack ships a narrow ELF yet.
+`tests/npu_pack_test.cpp`. No pack ships a narrow ELF yet. `plan.json` carries it as `decode.narrow_elf` and
+`decode.narrow_rows` (`docs/npu-plan.md`).
 
 Measured with a 4-row set, one binary, arms 16-row / 4-row / 16-row / 4-row, three prompts generating 49
 tokens each (`(tokens - 1) / (wall - wall of a 1-token request)`), two `npu-hold` tickets:
@@ -1644,8 +1672,14 @@ loaded with each pack's own weights, same input (`pixel(c, y, x) = sin(0.37c + 0
 | 1B | 16 × 20 | 1.1e-5, 1.000000000 | 2.4e-6, 1.000000000 |
 | 35B-A3B | 16 × 20 | 9.5e-6, 1.000000000 | 9.5e-7, 1.000000000 |
 
-The 16 × 20 grid took 5.5 s and 1.25 GB of memory for this code on one thread; a full 70 × 70 slice
-has 61 times the tokens and its attention grows with the square, which is why this is a reference.
+The loops are spread over threads (`ONEBIT_VISION_THREADS`, default the machine's count capped at 16;
+`vision::tower_threading()` in code) and the matrix products walk each weight once per handful of
+tokens instead of once per token. Neither changes a bit of the output: every token and every attention
+head is computed by one thread with the single-threaded arithmetic, and the test requires 1, 2, 5 and
+16 threads to give identical rows. Measured on a full 448 × 448 view (1,024 patches) of the 1B pack,
+box load about 13: 37.7 s before, 18.1 s on one thread with the blocked product, 3.2 s on 16 threads.
+It is still a reference: a 70 × 70 slice has nearly five times the patches and its attention grows with
+the square.
 `tests/npu_vision_tower_test.cpp` carries a small tower with LCG weights and that implementation's
 output for it as goldens, so the arithmetic is checked in CI without a pack; with
 `ONEBIT_MINICPM_PACK` and `ONEBIT_MINICPM_ORACLE` set it repeats the comparison above. The reference
@@ -1696,7 +1730,7 @@ image:
 | slice 0, 616 × 336 | 44 × 24 | 66 | 7.5e-6 | 1.000000000 |
 | slice 1, 616 × 336 | 44 × 24 | 66 | 6.7e-6 | 1.000000000 |
 
-That run took 110 s on one thread, which is the host reference's cost and the reason it is not a
+That run took 110 s on one thread (before the tower was threaded), which is the host reference's cost and the reason it is not a
 serving path. Two things are not established: the reference side called torch's `interpolate`
 directly, on the understanding that this is what the processor's torchvision resize does for byte
 images on a CPU build with AVX2 (torchvision is not on this box, so that link is read, not run); and
@@ -1724,6 +1758,27 @@ eight prompts (one to two images, with and without slices, touching, newline-sep
 prefixes, and none) as hashes over every token id and position. Images only: video frames are not
 handled. Nothing feeds these planes or the tower's rows into the text forward yet; that is the route's
 work.
+
+**One picture, one question, end to end (`minicpm_image_probe`).** A probe under `ONEBIT_NPU` that
+chains every step above with nothing from outside the engine:
+
+```
+minicpm_image_probe <pack dir> <kernels dir> (--image f.ppm | --solid R,G,B [--size HxW] | --halves R,G,B:R,G,B | --none)
+                    --prompt "question" [--decode N] [--expect-ids ids.i32]
+```
+
+RGB bytes → `plan_image` → `preprocess` → `tower_forward` on the CPU → `image_tokens` and
+`prompt_positions` → the text model's `step_batch_embeds()` with the tower's rows where the
+placeholders are, then a greedy decode. The image is a binary PPM or a generated colour, so no image
+decoder is involved, and the prompt is the one the pack's chat template renders for a single user turn
+with one image and thinking off, written out in the probe rather than rendered. The text model opens
+the device unless `NPU_INFER_HOST_GEMM` is set.
+
+It is a probe, not a route: `forward-serve` does not accept an image, and the tower runs on the
+CPU (about 3 s per 448 × 448 view on 16 threads, 18 s on one). The measured rows are in
+engine#1788. On the published packs the text model only loads once the padded-head rule of
+engine#2026 is in: their head is stored 2 and 16 rows past the vocabulary, and without that rule the
+probe stops at `text model: lm_head dequant failed`.
 
 ## Serving
 
@@ -1803,6 +1858,68 @@ route loads and a captured `--device npu` run stands behind it; the regenerated 
 GGUF-on-NPU forward), while every D3-* pack in this body declares the dense `qwen3_5` family, so
 the two are not the same answer and the registry keeps them apart.
 
+### FastFlowLM's own containers, served as published: measured rows (engine#1786)
+
+The tables above answer "does the registry map this family". This one answers a different question for the packs
+it lists: does FastFlowLM's own `model.q4nx`, with nothing converted, load and answer on `--device npu`. Each row
+is one `npu-hold` ticket on the dev box (2026-11-10/11), the pack's own chat template, temperature 0, and the
+question "What is the capital of France?" asked three times with thinking off unless noted; "identical" means
+the three replies were the same bytes. The answer is a sanity check, not a comparison with FastFlowLM's output.
+
+**Fused route** (the build shipped as `rc-2026-11-07`, which carries sealed sets for three dense Qwen3 geometries).
+Nothing is edited: `1bit serve -m <the pack directory as published> --device npu`, and the log says
+`on the private route dx … (…/npu/kernels/<set>)`.
+
+| pack | sealed set | ready | answer | decode on a 55 to 96 token reply |
+|---|---|---|---|---|
+| `Qwen3-0.6B-NPU2` | `1024x3072x16x8` | 2.4 s | identical, "The capital of France is Paris." | 64.0 tok/s |
+| `Qwen3-1.7B-NPU2` | `2048x6144x16x8` | 2.2 s | identical | 39.0 tok/s |
+| `Qwen3-4B-NPU2` | `2560x9728x32x8` | 12.4 s | identical | 9.4 tok/s |
+| `Qwen3-4B-Instruct-2507-NPU2` | `2560x9728x32x8` | 6.2 s | identical | 16.6 tok/s |
+| `Qwen3-4B-Thinking-2507-NPU2` | `2560x9728x32x8` | 5.1 s | with thinking on: `Paris`, reasoning split out | 16.2 tok/s |
+| `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `2560x9728x32x8` | 2.8 s | with no `chat_template_kwargs`: `Paris` | 16.7 tok/s |
+
+The two `Qwen3-4B` rates were taken in different tickets at different box loads; the gap between them is not a
+model difference until a same-ticket pair says so. On the same array and the same `model.q4nx`, FastFlowLM 1.0.12's
+own runtime decoded `Qwen3-1.7B-NPU2` at 45.7 tok/s against 39.3 here, with time to first token level (0.59 s and
+0.57 s): one interleaved theirs, ours, ours, theirs ticket (engine#1787).
+
+On this route `enable_thinking: false` is wrong for two of the packs, because the route builds its own prompt and
+adds an empty think block whatever the pack's template says: `Qwen3-4B-Thinking-2507-NPU2` (a template that
+always thinks) returns its reasoning and a literal `</think>` as `content`, and `Qwen3-VL-4B-Instruct-NPU2` (a
+template with no thinking at all) answers with a refusal or an apology. Both are engine#2135, open.
+
+**Per-op route** (`forward-serve`). The pack needs a kernel set for its geometry in the blocked family, and one key
+in a copy of its `config.json`, `"q4nx_weight_layout": "b8"`; the container's bytes are untouched. Decode here is
+this route's speed, a small multiple of one token per second on these sizes (engine#2102), not what the array
+does on a geometry that has a sealed set: `Qwen3-1.7B-NPU2` is 3.0 tok/s here and 39.0 on the fused route.
+
+| pack | family | answer | decode |
+|---|---|---|---|
+| `Qwen3-1.7B-NPU2` | `qwen3` | identical, `Paris.` | 3.0 tok/s |
+| `Qwen3.5-2B-NPU2` (the `qwen3.5-flash:2b` tag) | `qwen3_5`, hybrid | identical, `Paris`; full row on engine#1785 | 2.7 to 3.4 tok/s |
+| `Llama-3.2-1B-NPU2` | `llama` | identical, `Paris`, stops on `<|eot_id|>` | 4.2 to 4.3 tok/s |
+| `Llama-3.2-3B-NPU2` | `llama` | identical, `Paris.` | 1.7 to 1.8 tok/s |
+| `Phi4-mini-Instruct-NPU2` | `phi3` | identical, `Paris`, once the turn end is read from the template (below) | 1.4 to 1.5 tok/s |
+| `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `qwen3` | identical, `Paris` | 1.4 to 1.5 tok/s |
+
+`D3-Nano-NPU2` is a decision pack: it loads on the `Qwen3.5-2B` kernel set, its readout converts with
+`tools/safetensors_to_q4nx.py decision`, and `/v1/systemone` returned three identical answers to the documented
+example in about 1.1 s each. Its text routes answer 400 by design ("Decisions" below).
+
+Serving these packs as published is what found six engine faults, each fixed with the pack as its evidence:
+a turn-end marker named in `tokenizer_config.json` only (`Qwen3.5-2B`), or only in the template (`Phi4-mini`);
+a stream that was sent after the generation had ended; reasoning that the template's own generation prompt opens
+(`Qwen3.5-2B`); layout newlines returned around a reasoning block; and a 500 for a text request to a
+decision-only pack. "What ends an answer" and [npu-chat-template.md](npu-chat-template.md) describe the rules
+that came out of them.
+
+Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
+containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry
+has no kernel set on the box. Of the 57 `*-NPU2` repos with a readable geometry on 2026-11-11, 19 had all four
+dense kernel shapes already built in the blocked family; the families the forward may not model at all (`lfm2`,
+`hunyuan_v1_dense`, the multimodal towers) are a separate question from the shapes.
+
 ### Sealed kernel sets: the manifest is what says a set is ours
 
 A set ships as `<set>/layout.json`, `<set>/layer1_*/layer1.elf` (each `1BPKCRYP` ciphertext, opened
@@ -1881,12 +1998,15 @@ re-dequantised each layer's 17408-wide dense FFN tail on every token even after 
 packed on the device. `ffn_tail_cached()` (`npu/forward/src/q4nx_forward.cpp`) closes that: once a
 layer's packed gate/up/down BOs are resident, the f32 `wg_`/`wu_`/`wd_` buffers are no longer read,
 so the reload is skipped. It is on by default for a GDN model on the NPU route, when the packed
-weight cache is on, the run is not `NPU_INFER_HOST_GEMM`, and the tail is at least 256 MB per layer
-(the size guard; below that the reload is too small to be worth a behaviour change). `NPU_FFN_CACHE=0`
+weight cache is on, the run is not `NPU_INFER_HOST_GEMM`, and the tail is at least 128 MB per layer
+(the size guard, set just under the smallest tail measured; `npu/forward/include/ffn_cache_policy.h`). `NPU_FFN_CACHE=0`
 or `=1` forces it either way, and the resolved state is logged once as
 `[ffn] dense-tail cache on|off (default|NPU_FFN_CACHE; lin_kd=… IM=… H=…)`. On Qwen3.8-27B-NPU2 an
 interleaved 5-round A/B (`~/lb/587-cache-20261030`) measured an 8-token request at 104.5 s against
 117.4 s (**−11%**), CPU per token 22.9 s against 63.3 s (**−64%**), same text in every arm.
+On FastFlowLM's Qwen3.5-2B-NPU2 (IM 6144, H 2048, a 151 MB tail that the earlier 256 MB floor left out) an A B B A
+run in one ticket measured decode at 362–367 ms per token with the cache on (both arms) against 485–520 ms with
+it off in the quieter of the two off arms and 478–707 ms in the other, same text in all twelve runs (engine#1785).
 
 ### The prefix cache's snapshot: two kinds of plane
 
@@ -2145,6 +2265,11 @@ forward-serve` serves that too, from the same process and the same weights:
 |---|---|
 | `POST /v1/systemone` (alias `POST /v1/decisions`) | `{"state": …, "questions": {id: question}}` → `{"model", "answers": {id: answer}, "usage"}` |
 | `GET /v1/systemone/models` | the decision model this build serves: name, description, `max_input_tokens`, `modalities` |
+
+A pack that declares `attention_mode: noncausal_full_attention` (below) is a decision model and nothing else:
+it encodes a prompt in one pass and has no token-by-token decode. On such a pack `/v1/chat/completions` and
+`/v1/completions` answer **400** with `type: decision_model_error` and a message that names `/v1/systemone`
+(or says there is no decision head, when the serve loaded none), before any work is done.
 
 `questions` is an **object**, and its ids come back as the keys of `answers` in request order. Question
 types are `choice` (1–255 options), `noul` and `score` (2–10 ordered levels); a decision runs one backbone
@@ -2531,6 +2656,13 @@ can fail a run.
 `[ops-dump] NPU_INFER_DUMP_OPS is on: …` once at model load, before any request (engine#2028). A run that sets the
 variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
 looking for a code path that skips the dump.
+
+The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS_DUMP`'s weight-scale pairs) are
+created owner-only (0600) and never through a symlink at the final path component, whatever the umask, and a dump file
+an older build left at 0666 is narrowed to 0600 when it is rewritten; the head-image cache's files are at most 0644. Both go through `npu/forward/include/file_create.h`, so no write site uses `fopen(…, "w")`,
+which creates with 0666 under the umask and follows a planted link (CodeQL `cpp/world-writable-file-creation`).
+`tools/ci/file_create_check.py` refuses a new `fopen(…, "w")` or `"a"` anywhere in the tree unless the line says why
+(`file-create-ok: <reason>`), and `tests/file_create_test.c` pins the modes.
 
 ```
   [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935

@@ -118,6 +118,11 @@ host_desc() {
 
 # --- build / test -------------------------------------------------------------------------
 build() {
+    # engine#2129: what this builds is $SRC, whose submodules `checkout` has just updated, and a build compiles whatever
+    # those work trees hold. This cannot live in preflight(): preflight runs before $SRC exists, so the check would find
+    # no file to run, skip, and report success -- a check that inspects nothing and says it passed. Here it is the tree
+    # that is about to be compiled, and the run stops before the first compile instead of after it.
+    preflight_submodules "$SRC/tools/ci/submodule_pin_check.py" "$SRC" || return 1
     # the private components compiled in (docs/releases.md, "Private components"): the NPU runtime
     # (into 1bit) and the HIP kernels (into the HRX llama.cpp), each a checkout at the commit its
     # config/*.config pins; the build stops here when one cannot be fetched at that commit
@@ -658,7 +663,8 @@ preflight_runner_units() {
     return 0
 }
 
-# The submodule row of the preflight (engine#2129). The bumps and build stages build the tree in front of them, and a
+# The submodule row of the build (engine#2129). It runs at the top of build(), not in preflight(): the tree to inspect is
+# $SRC, which `checkout` creates, and preflight runs before that. A
 # build compiles whatever the submodules' work trees hold: tools/ci/submodule_pin_check.py is the check for whether those
 # checkouts ARE the commits this tree pins. It already exists as a ctest row, and a ctest row runs in CI -- nothing ran it
 # before a build on the box, which is where the drift was measured (7 of 7 submodules off-pin). Exit 1 stops the run: the
@@ -669,7 +675,9 @@ preflight_runner_units() {
 # A function of its own so tests/weekly_submodule_preflight_test.sh can run it against a stub.
 preflight_submodules() {
     local check=$1 src=$2 out rc=0
-    [ -f "$check" ] || return 0
+    # An older ref does not carry the tool. That is not a failure, but it is not a pass either: say that the tree was not
+    # inspected, because a silent 0 here is a check that reports success for doing nothing.
+    [ -f "$check" ] || { echo "preflight: WARNING, not blocking: $src has no tools/ci/submodule_pin_check.py (a ref older than engine#2129), so submodule drift is not checked for this build"; return 0; }
     out=$(python3 "$check" --check --root "$src" 2>&1) || rc=$?
     case "$rc" in
         0) printf '%s\n' "$out" | grep -v 'at their pinned commit' | sed 's/^/preflight: /' ;;
@@ -701,9 +709,7 @@ preflight() {
                              2> "$LOGS/hrx-toolchain.log"); then :; else
                            echo "preflight: cannot fetch the pinned HRX toolchain (config/hrx-toolchain.config): see $LOGS/hrx-toolchain.log"; bad=1
                        fi ;;
-                esac
-                # engine#2129: this stage builds the tree in front of it, so the submodules have to BE the pinned tree
-                preflight_submodules "$SRC/tools/ci/submodule_pin_check.py" "$SRC" || bad=1 ;;
+                esac ;;
             package)
                 # scripts/package-linux.sh rewrites RPATHs with patchelf
                 command -v patchelf > /dev/null ||

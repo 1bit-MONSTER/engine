@@ -64,9 +64,9 @@ row "no checkout to compare only WARNS" 0 "WARNING, not blocking" 2 "submodule_p
 # A dirty submodule at its pin is reported and does NOT block: a deliberate local patch is a real thing a box does.
 row "a dirty submodule at its pin is reported, not blocking" 0 "changed path" 0 "submodule_pin: third_party/x is at the pinned abc but its work tree has 301 changed path(s)"
 
-# A checker that is not there at all (an older tree): the row is skipped, not failed.
-preflight_submodules "$tmp/no-such-check.py" "$tmp" >/dev/null 2>&1 && ok "a missing checker does not stop the run" \
-    || bad "a missing checker should not stop the run"
+# A checker that is not there at all (an older ref): not a failure, but it must SAY that nothing was inspected --
+# a silent pass here is a check that reports success for doing nothing, which is what its first version did.
+out=$(preflight_submodules "$tmp/no-such-check.py" "$tmp" 2>&1) &&     printf '%s' "$out" | grep -q 'is not checked for this build' && ok "a missing checker warns and does not stop the run"     || bad "a missing checker should warn (and not stop the run): $out"
 
 # The asymmetry, in one assertion: exit 2 must not block, exit 1 must.
 check=$(stub 2 "submodule_pin: cannot tell")

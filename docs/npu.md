@@ -1779,8 +1779,11 @@ plus 16 generated tokens, not TTFT.
 **Pinned on the first request (engine#1785).** That run needed two requests to find the shared part, so the
 third was the first warm one, and when two questions opened with the same words the pin ran a few tokens into the
 question, which a question opening differently could not use. A chat request with a leading system message now
-gives the point directly: the route renders the system messages alone (the container's template, or ChatML) and
-pins where the full prompt stops agreeing with that, on the first request (`pin_at`). Only a request with no
+gives the point directly: the route renders the leading system messages followed by a probe user message (the
+container's template, or ChatML) and pins where the full prompt stops agreeing with that, on the first request
+(`pin_at`). The probe user message is there because a template may refuse to render a system turn alone (the
+Qwen3.5 template does); if a template cannot render even that, the request has no early pin and the log says so
+(`[prefix] no early pin: …`). Only a request with no
 system message still uses the comparison with the previous request (`pin_point`). On FastFlowLM's
 `Qwen3.5-2B-NPU2` container under `--flash`, a 1,016-token prompt, time to first token (two server loads):
 

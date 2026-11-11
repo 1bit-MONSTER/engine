@@ -216,8 +216,8 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     // from `ids`.  Do not log `prompt` as the request's text without handling this case first.
     std::vector<int> prompt_ids;
     bool prompt_is_ids = false;
-    // --prefix-pin: the leading system messages rendered alone, with no generation prompt.  Whatever of that the
-    // full prompt starts with is the part every question under this system prompt shares, so it can be pinned on
+    // --prefix-pin: the leading system messages and a probe user message (npu::pin_probe_messages), rendered.  Whatever
+    // of that the full prompt starts with is the part every question under this system prompt shares, so it can be pinned on
     // the FIRST request (PrefixCache::pin_at) -- comparing with the previous request only finds it on the second,
     // and can run a few tokens into the question when two questions open with the same words.  Empty = the
     // request has no system message, or the route is not pinning.
@@ -239,30 +239,23 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
                 prompt = npu::render_chat_template(e.tmpl, ordered.at("messages"), /*add_generation_prompt=*/true,
                                                    extra, e.bos_text, e.eos_text);
                 if (e.prefix_pin) {
-                    nlohmann::ordered_json lead = nlohmann::ordered_json::array();
-                    for (const auto& m : ordered.at("messages")) {
-                        if (!m.is_object() || m.value("role", std::string()) != "system") break;
-                        lead.push_back(m);
-                    }
-                    // A template that cannot render a system turn on its own is no reason to refuse the request:
-                    // it only means there is no early pin.
+                    // A template that cannot render the probe is no reason to refuse the request: it only means
+                    // there is no early pin, and the log says so.
                     try {
-                        if (!lead.empty())
-                            system_prompt = npu::render_chat_template(e.tmpl, lead, /*add_generation_prompt=*/false, extra,
+                        const nlohmann::ordered_json probe = npu::pin_probe_messages(ordered.at("messages"));
+                        if (!probe.empty())
+                            system_prompt = npu::render_chat_template(e.tmpl, probe, /*add_generation_prompt=*/false, extra,
                                                                       e.bos_text, e.eos_text);
-                    } catch (const std::exception&) {
+                    } catch (const std::exception& ex) {
                         system_prompt.clear();
+                        std::fprintf(stderr, "[prefix] no early pin: the template did not render the system turn (%s)\n", ex.what());
                     }
                 }
             } else {
                 prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
                 if (e.prefix_pin) {
-                    json lead = json::array();
-                    for (const auto& m : body.at("messages")) {
-                        if (!m.is_object() || m.value("role", std::string()) != "system") break;
-                        lead.push_back(m);
-                    }
-                    if (!lead.empty()) system_prompt = npu::chatml(lead, npu::thinking_from_body(body));
+                    const json probe = npu::pin_probe_messages(body.at("messages"));
+                    if (!probe.empty()) system_prompt = npu::chatml(probe, npu::thinking_from_body(body));
                 }
             }
         } else {

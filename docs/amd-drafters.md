@@ -116,6 +116,28 @@ the config, or a tensor it cannot explain (the second draft family, `DFlash2Draf
 convolution tensors this tool does not know) each fail by name. `--selftest` runs those controls on a synthetic
 package (ctest `tool_selftest_dflash_draft_info`).
 
+### The loader (`npu/dflash_draft.h`)
+
+`onebit::npu::dflash::load_draft(dir)` is the C++ half of that gate: it reads the DFlash `config.json`, opens the
+container with the engine's own Q4NX reader, checks every tensor against the geometry the config gives, and returns
+a model whose tensors are views into the mapped file. Nothing is decoded at load (the Bolt draft's projections are
+327,680,000 weights, 1.3 GB as f32); `decode_projection()`, `decode_gain()` and `decode_fusion()` produce one tensor
+at a time, through the same q4_1 tile decoder the forward uses. It throws, naming the tensor or key, on a missing or
+mis-sized tensor, a dtype label it does not expect, a container scalar that disagrees with the config, a tensor it
+cannot explain, another architecture (`DFlash2DraftModel`), or a weight path that leaves the package.
+
+Two facts about the container that the loader depends on, both measured on the Bolt draft:
+
+| fact | evidence |
+|---|---|
+| `model.fc.weight` is **not** row-major. Its declared shape `[80, 12800, 32]` is the element order: 32-row blocks, column by column, the row inside the block last. | Magnitudes that share an input column correlate about five times more strongly than magnitudes that share an output row. Decoded in the declared order the four neighbour figures are consistent (next row 0.107, 32 rows on 0.106; next column 0.022, 32 columns on 0.021). Read as plain row-major they contradict each other (next row 0.019 but 32 rows on 0.107; next column 0.105 but 32 columns on 0.024). `dflash_draft_test` asserts the first and uses the second as its control. |
+| A norm gain may be negative. | Three post-attention norms each hold one gain just below zero (-0.0009 to -0.0024) among 2,560. As bf16 that is a gain crossing zero; as half-float the same element would be -0.8 among values of 1.3 to 2.4, which is one more reason the bf16 reading is the right one. |
+
+`dflash_draft_test` builds a synthetic package (every projection encoded tile by tile from a formula and compared at
+every element, the fusion matrix checked for row-major order, sixteen refusals each matched on its message) and needs
+no model; given a package directory (`-DONEBIT_DFLASH_DRAFT=<dir>` or `ONEBIT_TEST_DFLASH_DRAFT`) it also loads and
+decodes the real one. The loader is not wired into `forward-serve` yet: there is no forward for it to feed.
+
 ## PARD-2's repos are weights-only — borrow the target's tokenizer
 
 `amd/PARD2-*` ship **`README.md`, `config.json`, `model.safetensors`, `warp_model.bin`** and nothing else: **no tokenizer

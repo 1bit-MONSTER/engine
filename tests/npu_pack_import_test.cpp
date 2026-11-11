@@ -53,6 +53,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace {
 
@@ -840,7 +841,7 @@ void test_external_import_success(const std::string& root) {
 // alone, so what can go wrong is the test being too willing -- a truncated copy from an interrupted run, a leftover
 // directory, a copy from a bigger pack. Those are the arms.
 void test_canonical_copy_reusable() {
-    const fs::path dir = fs::temp_directory_path() / ("1bit-reuse-" + std::to_string(::getpid()));
+    const fs::path dir = ::onebit::test::tmp_root() / ("1bit-reuse-" + std::to_string(::getpid()));
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir);
@@ -877,7 +878,7 @@ void test_canonical_copy_reusable() {
 // changes, so 699 files / 8.7 GiB of tmpfs (RAM) had built up on one box. The eviction rule is "same pack and geometry,
 // different source identity", and what can go wrong is deleting one of the neighbours that must survive, so each is an arm.
 void test_evict_stale_canonical_copies() {
-    const fs::path dir = fs::temp_directory_path() / ("1bit-evict-" + std::to_string(::getpid()));
+    const fs::path dir = ::onebit::test::tmp_root() / ("1bit-evict-" + std::to_string(::getpid()));
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::create_directories(dir);
@@ -971,7 +972,7 @@ void test_evict_stale_canonical_copies() {
 // again, and 17.0 GiB of copies left there by older binaries stayed in tmpfs (RAM). Every candidate is swept now; one that does
 // not exist is not created.
 void test_sweep_fconst_scratch_dirs() {
-    const fs::path root = fs::temp_directory_path() / ("1bit-sweep-" + std::to_string(::getpid()));
+    const fs::path root = ::onebit::test::tmp_root() / ("1bit-sweep-" + std::to_string(::getpid()));
     std::error_code ec;
     fs::remove_all(root, ec);
     const fs::path written = root / "cache", other = root / "tmp", absent = root / "never-made";
@@ -1037,8 +1038,8 @@ void test_sweep_fconst_scratch_dirs() {
 // override set only that directory is swept, so the second directory's copy must still be there.
 void test_sweep_is_wired(const std::string& root) {
     const fs::path dir = fs::path(root) / "sweep-wired";
-    const fs::path scratch = fs::temp_directory_path() / ("1bit-sweep-wired-" + std::to_string(::getpid()));
-    const fs::path cache_home = fs::temp_directory_path() / ("1bit-sweep-wired-xdg-" + std::to_string(::getpid()));
+    const fs::path scratch = ::onebit::test::tmp_root() / ("1bit-sweep-wired-" + std::to_string(::getpid()));
+    const fs::path cache_home = ::onebit::test::tmp_root() / ("1bit-sweep-wired-xdg-" + std::to_string(::getpid()));
     std::error_code ec;
     fs::remove_all(dir, ec);
     fs::remove_all(scratch, ec);
@@ -1088,7 +1089,7 @@ void test_sweep_is_wired(const std::string& root) {
     }
     setenv("ONEBIT_FCONST_SCRATCH", scratch.c_str(), 1);
     setenv("XDG_CACHE_HOME", cache_home.c_str(), 1);
-    const std::string out = (fs::temp_directory_path() / ("oga_pack_import_sweepwired." + std::to_string(::getpid()))).string();
+    const std::string out = (::onebit::test::tmp_root() / ("oga_pack_import_sweepwired." + std::to_string(::getpid()))).string();
     fs::remove_all(out, ec);
     pi::Options allow;
     allow.allow_incomplete = true;
@@ -1835,7 +1836,7 @@ void test_tied_block32_head(const std::string& root) {
     allow.allow_incomplete = true;
     {   // arm 1: declared tied -> synthesised from the embedding, and the note says so
         const fs::path dir = build(true, "tied-block32");
-        const std::string out = (fs::temp_directory_path() /
+        const std::string out = (::onebit::test::tmp_root() /
                                  ("oga_pack_import_tied32." + std::to_string(::getpid()))).string();
         fs::remove_all(out);
         bool threw = false;
@@ -1910,7 +1911,7 @@ void test_tied_block32_head(const std::string& root) {
     }
     {   // arm 2: the same pack without the declaration -> refused by name, nothing written
         const fs::path dir = build(false, "untied-block32");
-        const std::string out = (fs::temp_directory_path() /
+        const std::string out = (::onebit::test::tmp_root() /
                                  ("oga_pack_import_untied32." + std::to_string(::getpid()))).string();
         fs::remove_all(out);
         bool threw = false;
@@ -2076,7 +2077,7 @@ void test_block32_tail_head(const std::string& root) {
     const auto run = [&](const fs::path& dir, const char* tag) {
         Run x;
         const std::string out =
-            (fs::temp_directory_path() /
+            (::onebit::test::tmp_root() /
              (std::string("oga_pack_import_b32tail_") + tag + "." + std::to_string(::getpid()))).string();
         fs::remove_all(out);
         pi::Options allow;
@@ -2781,7 +2782,7 @@ void test_final_norm_envelope(const std::string& root) {
               (geom.why.empty() ? "" : ", why: " + geom.why) + ")");
     pi::Options allow;
     allow.allow_incomplete = true;
-    const std::string out = (fs::temp_directory_path() /
+    const std::string out = (::onebit::test::tmp_root() /
                              ("oga_pack_import_norm." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     const pi::Report r = pi::import_pack(dir.string(), out, allow);
@@ -2932,7 +2933,7 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     // a fully representable pack imports without --allow-incomplete; a partial one writes nothing.
     // Per-process scratch dir: two concurrent runs of this binary (or two ctest shards) otherwise write
     // into the same directory and one dies with "cannot write .../model.q4nx" (measured 2026-11-03).
-    const std::string out = (fs::temp_directory_path() /
+    const std::string out = (::onebit::test::tmp_root() /
                              ("oga_pack_import_test." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     const pi::Report r0 = pi::import_pack(pack, out, pi::Options{});
@@ -3330,7 +3331,7 @@ void test_import_fp32_params(const std::string& root) {
                        {pb::matmulnbits("lm_head", {"x", "lm_head_qweight", "lm_head_scales", "lm_head_zeros"},
                                         H, V, 4, block)}));
 
-    const std::string out = (fs::temp_directory_path() /
+    const std::string out = (::onebit::test::tmp_root() /
                              ("oga_pack_import_fp32." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     const pi::Report r = pi::import_pack(dir.string(), out, pi::Options{});
@@ -3437,7 +3438,7 @@ void test_import_fp32_params(const std::string& root) {
     // than misread it (npu/forward/src/model.c). Q4nxNpuForward::init_impl converts first through
     // npu/q4nx_device.cpp; this is that conversion, and the proof it changes only the parameter
     // width: the device tiles are byte-identical to the old bf16 container's for the same weights.
-    const std::string cache = (fs::temp_directory_path() /
+    const std::string cache = (::onebit::test::tmp_root() /
                                ("oga_q4nx_device_form." + std::to_string(::getpid()))).string();
     fs::remove_all(cache);
     {
@@ -3590,7 +3591,7 @@ void test_hybrid_pack_import(const std::string& root) {
                                    int64_t(H) * H * 4)}, {}));
     put_file((dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string(), fc);
 
-    const std::string out = (fs::temp_directory_path() /
+    const std::string out = (::onebit::test::tmp_root() /
                              ("oga_pack_import_hybrid." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     pi::Options allow;
@@ -3777,7 +3778,7 @@ void test_genre_a_projection_gap(const std::string& root) {
                  R"("rope_theta":10000.0,"tie_word_embeddings":false,"rms_norm_eps":1e-06})");
         (void)groups;
     };
-    const std::string out = (fs::temp_directory_path() / ("oga_pack_genre_a." + std::to_string(::getpid()))).string();
+    const std::string out = (::onebit::test::tmp_root() / ("oga_pack_genre_a." + std::to_string(::getpid()))).string();
     auto names_down = [](const pi::Report& r) {
         for (const auto& s : r.refused)
             if (s.find("mlp.down_proj.weight") != std::string::npos && s.find("no quantised projection the decoder can pair") != std::string::npos)
@@ -4264,7 +4265,7 @@ void test_post_attn_norm_header(const std::string& root) {
 
     pi::Options allow;
     allow.allow_incomplete = true;   // the crafted block has no tiles, so the payload legs are refused
-    const std::string out = (fs::temp_directory_path() /
+    const std::string out = (::onebit::test::tmp_root() /
                              ("oga_pack_import_pa." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     try {
@@ -4335,7 +4336,7 @@ void test_kernel_set_refusal() {
 // missing tokenizer -- the misleading report #1751 was written to remove. A file the pack has and cannot copy is refused
 // BY NAME; a file the pack does not ship is not a failure.
 void test_copy_text_artifacts() {
-    const fs::path base = fs::temp_directory_path() / ("1bit-textcopy-" + std::to_string(::getpid()));
+    const fs::path base = ::onebit::test::tmp_root() / ("1bit-textcopy-" + std::to_string(::getpid()));
     std::error_code ec;
     fs::remove_all(base, ec);
     const fs::path pack = base / "pack", out = base / "out";
@@ -4764,6 +4765,66 @@ void test_embedding_f32_component(const std::string& root) {
     fs::remove_all(b);
 }
 
+// engine#1786 (item F1): the container genre's geometry, pinned as a pure function over the three header shapes the
+// census measured on this box -- no pack, no device, no file, which is what makes the two genres with no config.json
+// (`d3-edge`, `d3-flash`) pinnable at all.
+void test_container_geometry() {
+    using nlohmann::json;
+    // 1. self-describing: `dims` answers everything, and config.json must NOT be preferred over it.
+    {
+        json meta = {{"dims", {{"hidden_size", 576}, {"intermediate_size", 1536}, {"num_hidden_layers", 30},
+                               {"num_attention_heads", 9}, {"num_key_value_heads", 3}, {"vocab_size", 49152},
+                               {"head_dim", 64}, {"rope_theta", 10000.0}, {"model_type", "llama"}}}};
+        json cfg = {{"hidden_size", 1024}};   // a deliberate disagreement: the container's own statement wins
+        const auto g = pi::container_geometry(meta, cfg);
+        check(g.source == "dims", "self-describing: source is dims");
+        check(g.dims.hidden == 576, "self-describing: hidden comes from dims, not config.json");
+        check(g.dims.layers == 30 && g.dims.heads == 9 && g.dims.kv_heads == 3 && g.dims.vocab == 49152,
+              "self-describing: every field dims states is taken");
+        check(g.dims.head_dim == 64, "self-describing: a stated head_dim is used as stated");
+        check(g.missing.empty(), "self-describing: nothing is missing");
+        check(g.inferred.empty(), "self-describing: nothing is inferred");
+    }
+    // 2. gguf-converted: no dims, so config.json answers and the source says so.
+    {
+        json meta = {{"converter", "tools/gguf_to_q4nx.py"}, {"format", "q4nx"}, {"source", "x.gguf"}};
+        json cfg = {{"hidden_size", 1024}, {"num_hidden_layers", 28}, {"num_attention_heads", 16},
+                    {"num_key_value_heads", 8}, {"vocab_size", 151936}, {"intermediate_size", 3072},
+                    {"head_dim", 64}, {"rope_theta", 1000000.0}};
+        const auto g = pi::container_geometry(meta, cfg);
+        check(g.source == "config.json", "gguf-converted: source is config.json");
+        check(g.dims.hidden == 1024 && g.dims.vocab == 151936, "gguf-converted: config.json supplies the geometry");
+        check(g.missing.empty(), "gguf-converted: nothing is missing when config.json is complete");
+    }
+    // 3. silent: neither answers, so every field is named missing rather than left as a zero that reads like a value.
+    {
+        const auto g = pi::container_geometry(json::object(), json());
+        check(g.source.empty(), "silent: no source is claimed");
+        // eight, and named: the first run of this arm asserted seven and failed in CI -- rope_theta is a required
+        // field of the arithmetic (it is the RoPE base the forward needs), so the count was wrong and the function
+        // was right. Asserted by name now, so the next field added to Dims fails this arm instead of shrinking it.
+        const std::vector<std::string> want = {"hidden_size",         "num_hidden_layers",   "num_attention_heads",
+                                               "num_key_value_heads", "vocab_size",         "intermediate_size",
+                                               "head_dim",            "rope_theta"};
+        check(g.missing.size() == want.size(), "silent: every required field is named missing");
+        bool all_named = true;
+        for (const auto& w : want)
+            all_named = all_named && std::find(g.missing.begin(), g.missing.end(), w) != g.missing.end();
+        check(all_named, "silent: the missing list names each required field");
+        check(g.dims.hidden == 0 && g.dims.layers == 0, "silent: no field is invented");
+    }
+    // 4. head_dim absent but derivable: reported as INFERRED, not as declared.
+    {
+        json meta = {{"dims", {{"hidden_size", 2048}, {"intermediate_size", 6144}, {"num_hidden_layers", 28},
+                               {"num_attention_heads", 16}, {"num_key_value_heads", 8}, {"vocab_size", 151936},
+                               {"rope_theta", 1000000.0}}}};
+        const auto g = pi::container_geometry(meta, json());
+        check(g.dims.head_dim == 128, "inferred: head_dim is hidden/heads");
+        check(g.inferred.size() == 1 && g.inferred[0] == "head_dim", "inferred: the inference is named");
+        check(g.missing.size() == 0, "inferred: an inferred field is not also missing");
+    }
+}
+
 // engine#1786 (item F1): an NPU2 model source is a safetensors container, and this is the reader that decides whether
 // a pack is that genre. The failure that matters is the silent one -- a wrong header length yields an empty inventory,
 // which reads as "a pack with no tensors" rather than "a malformed header" -- so each arm asserts the reason, not just
@@ -5091,7 +5152,7 @@ void test_per_layer_import(const std::string& root) {
     put_file((dir / "genai_config.json").string(), R"({"model":{"embedding":{"filename":"embedding/model.onnx"}}})");
 
     const std::string out =
-        (fs::temp_directory_path() / ("oga_pack_import_perlayer." + std::to_string(::getpid()))).string();
+        (::onebit::test::tmp_root() / ("oga_pack_import_perlayer." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     pi::Options allow;
     allow.allow_incomplete = true;
@@ -5184,7 +5245,7 @@ void test_fconst_variable_stride(const std::string& root) {
     put_file((dir / "model.onnx.data").string(), std::string(4096, '\x11'));
     pi::Options allow;
     allow.allow_incomplete = true;
-    const std::string out = (fs::temp_directory_path() / ("varstride_out." + std::to_string(::getpid()))).string();
+    const std::string out = (::onebit::test::tmp_root() / ("varstride_out." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     bool refused = false;
     std::string what;
@@ -5442,7 +5503,7 @@ void test_header_witness_refusal() {
 int main(int argc, char** argv) {
     // engine#1907: every crafted 1.9 import writes a canonical copy into the scratch cache. Without this the suite left 0-byte
     // copies in the user's real ~/.cache/1bit/fconst19 and in /tmp on every run. Give the run its own directory, removed at exit.
-    const fs::path run_scratch = fs::temp_directory_path() / ("1bit-pack-test-scratch-" + std::to_string(::getpid()));
+    const fs::path run_scratch = ::onebit::test::tmp_root() / ("1bit-pack-test-scratch-" + std::to_string(::getpid()));
     if (!std::getenv("ONEBIT_FCONST_SCRATCH")) setenv("ONEBIT_FCONST_SCRATCH", run_scratch.c_str(), 1);
     struct ScratchCleanup {
         fs::path p;
@@ -5489,6 +5550,7 @@ int main(int argc, char** argv) {
         test_attn_payload_off();
         test_text_config_geometry(golden_dir.empty() ? "." : golden_dir);
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
+        test_container_geometry();
         test_hybrid_pack_import(golden_dir.empty() ? "." : golden_dir);
         test_rope_parameters_theta(golden_dir.empty() ? "." : golden_dir);
         test_three_input_matmulnbits(golden_dir.empty() ? "." : golden_dir);

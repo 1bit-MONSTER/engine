@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <fstream>
 #include <string>
+#include "tmp_root.h"   // engine#2029: scratch goes on disk, not in tmpfs
 
 namespace fs = std::filesystem;
 static int failures = 0;
@@ -44,7 +45,7 @@ static void make_entry(const fs::path& root, const std::string& name, int mb, in
 
 int main() {
     std::error_code ec;
-    const fs::path root = fs::temp_directory_path() / ("q4nx-cache-test-" + std::to_string(::getpid()));
+    const fs::path root = ::onebit::test::tmp_root() / ("q4nx-cache-test-" + std::to_string(::getpid()));
     fs::remove_all(root, ec);
 
     // (a) under the bound: nothing is removed

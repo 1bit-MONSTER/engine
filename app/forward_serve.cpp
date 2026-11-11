@@ -76,6 +76,7 @@
 
 namespace onebit {
 
+
 namespace {
 
 // A prompt that leaves no room for an answer inside the context (the model's, or --ctx-size).
@@ -605,20 +606,19 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
 
     // OpenAI's usage object plus the two fields issue #650 reports: how many prompt tokens came
     // from a saved prefix, and what the cache decided (which slot, and why).
+    // engine#2111: the usage object is `onebit::usage_json_text()` now (app/forward_serve.h) - a pure function, so
+    // the rule "reasoning_tokens appears iff the route could count it" has known answers without an NPU
+    // (tests/serve_usage_test.cpp). The JSON stays here, where the rest of the reply is built.
     auto usage_json = [](const CallStats& st) {
-        json u{{"prompt_tokens", st.prompt_tokens},
-               {"completion_tokens", st.completion_tokens},
-               {"total_tokens", st.prompt_tokens + st.completion_tokens},
-               {"prompt_tokens_details", {{"cached_tokens", st.prefix.cached_tokens}}},
-               {"flm_prefix_cache", {{"slot", st.prefix.slot},
-                                     {"cached_tokens", st.prefix.cached_tokens},
-                                     {"reason", st.prefix.reason},
-                                     {"pinned", st.prefix.pinned}}}};
-        // engine#2111: OpenAI's field for "how much of the budget went into reasoning". With content "" and
-        // finish_reason "length", reasoning_tokens == completion_tokens is the sentence that says the budget ran out
-        // inside a thinking block, rather than that the model said nothing. Additive: absent where nothing was split.
-        if (st.reasoning_tokens >= 0) u["completion_tokens_details"] = {{"reasoning_tokens", st.reasoning_tokens}};
-        return u;
+        UsageCounters u;
+        u.prompt_tokens = st.prompt_tokens;
+        u.completion_tokens = st.completion_tokens;
+        u.cached_tokens = st.prefix.cached_tokens;
+        u.prefix_slot = st.prefix.slot;
+        u.prefix_reason = st.prefix.reason;
+        u.prefix_pinned = st.prefix.pinned;
+        u.reasoning_tokens = st.reasoning_tokens;
+        return json::parse(usage_json_text(u));
     };
 
     // OpenAI's logprobs.content entry: the token's text, its log-probability, and the most likely

@@ -432,7 +432,11 @@ target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 # uniforms come from the caller, so every arm is a hand-computed value and there is no model, device or RNG here.
 # `add_dependencies(onebit ...)` because a target ci.yml never builds is the failure that check exists to catch.
 add_executable(spec_decode_test tests/spec_decode_test.cpp)
-target_include_directories(spec_decode_test PRIVATE app)
+# ${CMAKE_SOURCE_DIR} as well as app/, because app/spec_decode.h includes "npu/mtp/spec_accept.h" by its repo-relative
+# path -- which is how every other consumer of that header spells it. Without the root on this target's path the build
+# fails with "npu/mtp/spec_accept.h: No such file or directory", measured on CI run 42935896650 (the risk the PR body
+# named, so it cost one run rather than a review).
+target_include_directories(spec_decode_test PRIVATE app ${CMAKE_SOURCE_DIR})
 add_test(NAME spec_decode COMMAND spec_decode_test)
 add_dependencies(onebit spec_decode_test)
 # The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):

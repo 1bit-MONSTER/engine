@@ -395,6 +395,10 @@ add_python_test(ctest_skips_self ${CMAKE_SOURCE_DIR}/tools/ci/ctest_skips.py --s
 # of each failure (the silent fallback at 1.9 tok/s, thinking left on, a degenerate reply); no device, no binary.
 add_python_test(npu_serve_smoke_self ${CMAKE_SOURCE_DIR}/tools/npu_serve_smoke.py --self-test)
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
+# The three ways this corpus loses a value to half precision (engine #1962/#2127/#2186): an input
+# truncated without a prescale, a computed value published to f16, and an f16 accumulator updated by a
+# multiply -- the last has no conversion instruction at all, which is why a truncation scan cannot see it.
+add_python_test(hrx_f16_narrowing ${CMAKE_SOURCE_DIR}/tools/hrx_f16_narrowing_check.py --self-test)
 # engine#1313 item 3: the "after" of "before/after routing accuracy" -- a ridge head over --dump-encoder output, with the
 # table's own logits as the before arm. Self-test only, so it needs no dump and no model.
 add_python_test(laya_head_finetune ${CMAKE_SOURCE_DIR}/tools/laya_head_finetune.py --self-test)

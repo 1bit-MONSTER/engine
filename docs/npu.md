@@ -1196,6 +1196,24 @@ stride the `.fconst` attention tile already carries (2,176 B subvolume = 32 rows
 from the node's own `N`/`K` (`gate_proj`/`up_proj` → N, `down_proj` → K), because the weight is a 1-D byte blob with no
 shape to read it from (engine#1503).
 
+**The 1.8 hybrid line (`*_rai_1.8.0_hybrid`) is not importable, and that is a decision, not a gap still to be filled (engine#1503).** These packs pair a `model.onnx` with a `model.bin`: 1.3 GB on `Llama-3.2-1B-Instruct_rai_1.8.0_hybrid`, alongside a 542 MB `model.onnx.data` that holds only the embedding and the norms. In the graph, every `.MatMulNBits.*` initializer is a `[0]` placeholder with no bytes, and so is its `.packed` sibling (162 of 162 on that pack). The weights exist only in `model.bin`, a compiled container that the vendor's runtime reads. Writing a reader for it means decoding that container, which this engine does not do, so `npu-pack info` and `npu-pack import` refuse these packs by name before reading anything:
+
+```
+lm_head.MatMulNBits.qweight (its lm_head.MatMulNBits.qweight.packed sibling carries no data either), and the pack carries
+no Token .fconst either (...): these weights are genuinely absent from the pack's external data, so this pack cannot be
+imported -- not a tile-layout or block-size problem. This pack's weights are in its model.bin, which this importer does
+not read (engine#1503)
+```
+
+The same models ship in an earlier generation that this engine reads. Use that pack instead. The last column says what was measured on it (11-11):
+
+| 1.8 hybrid pack | instead | measured |
+|---|---|---|
+| `Llama-3.2-1B-Instruct_rai_1.8.0_hybrid` | the `rai_1.7.1` hybrid | imported and served on the NPU on 11-10, before the tied-head gate existed; not re-run since |
+| `SmolLM2-135M-Instruct_rai_1.8.0_hybrid` | the `rai_1.7.1` hybrid | `npu-pack import` rc 0 with the head-fit check (head 1.07× its 4-bit floor); the earlier rel ≤ 0.02 rule refused it at 0.104 |
+| `Qwen2.5-0.5B-Instruct_rai_1.8.0_hybrid` | the `rai_1.7.1` hybrid, or `rai_1.9.0_npu` | both `npu-pack import` rc 0 |
+| `Phi-3.5-mini-instruct_rai_1.8.0_hybrid` | the `rai_1.7.1` hybrid | `npu-pack info` rc 0 (plan clean); not imported here |
+
 **A pack can be the weights without the text.** AMD's `_rai_1.8.0_npu_4K` repos do publish the
 model's own `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, `merges.txt`,
 `chat_template.jinja`, `special_tokens_map.json`, `added_tokens.json` and `generation_config.json`,

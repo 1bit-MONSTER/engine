@@ -14,21 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# ci-apt-install.sh - make sure the CI build's apt dependencies are present, without depending on the mirror.
+# ci-apt-install.sh - make sure the CI build's apt dependencies are present, without depending on the network.
 #
-# engine#2210. Two separate faults, both observed on 2026-11-11:
+# engine#2210. On 2026-11-11 the build step failed four times in a row and took `main` plus eleven open PRs red at
+# once (#2199-#2205, #2183, #2187, #2189, #2207). The step reported it as "404s on debs the index lists" and
+# engine#1814's retry was written for that reading, quite reasonably -- but the cause turned out to be the
+# **build container's DNS** (engine#2211, fixed by #2224 giving the container its own resolvers). An apt that
+# cannot resolve the archive fails the same way a mirror 404 does, and the error text names the mirror.
 #
-# 1. THE MIRROR. ci.yml retried this for engine#1814 and the shape was right -- each attempt re-reads the index,
-#    so a later attempt can reach a different mirror -- but four attempts span ~90 s of back-off, and a mirror
-#    returning 404s on debs its own fresh index lists does not repair itself inside 90 s. At 14:53Z that took
-#    `main` plus eleven open PRs red at once (#2199-#2205, #2183, #2187, #2189, #2207).
-#
-# 2. THE DEPENDENCY ITSELF. The runners are self-hosted and the whole toolchain is already installed, so the
-#    common case fetches nothing -- but the step still ran apt on every job, which is why a mirror outage could
-#    fail a build at all. Checking first means the normal path touches no network.
+# That is the lesson this script is built around, and it is not "retry harder". The runners are self-hosted and
+# the whole toolchain is already installed, so the common case fetches nothing -- the step was making a network
+# round trip to fetch packages that were present, and that round trip is the only reason a DNS or mirror fault
+# could fail a build at all. Checking first means the normal path touches no network, so neither fault can.
 #
 # So: check every package with dpkg, install only what is missing, and if apt has to run, give it a time budget
-# (doubling back-off to a deadline) instead of a fixed attempt count.
+# (doubling back-off to a deadline) instead of a fixed attempt count -- because when something upstream is wrong,
+# time is the only lever a retry has.
 #
 # usage: scripts/ci-apt-install.sh [--deadline-seconds N]
 # exit: 0 all packages present (fetching nothing, or after a successful install), 1 the mirror never served them

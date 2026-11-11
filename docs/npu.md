@@ -1925,9 +1925,13 @@ The kernel directory is the `Llama-3.2-1B` set's four shapes plus that one `QKV_
 Two things in these packs were read wrong before, and neither is about convolutions. Their 4-bit weights are a
 **symmetric** kind of the 5,120-byte tile (FastFlowLM's list calls the pack `Q4_0` where the others are `Q4_1`):
 the same byte layout with every zero-point stored as 0, a scale that carries a sign, and a two's-complement code.
-Nothing in the container names the kind, so the decoder reads it off each tile: 256 zero-points that are all zero.
-Of 1,889,236 tiles in the other packs on the box none has that block all zero; of 285,696 in the two LFM2 packs
-every one has. Read as the usual kind, each LFM2 projection correlated -0.39 with the same tensor of the upstream
+Nothing in the container names the kind (the name is in FastFlowLM's model list, which is not part of a pack), so
+the decoder reads it from the weights: a tile is symmetric when its 256 zero-points are all zero **and** some scale
+is negative, a tensor is one kind (tiles that decide nothing follow their tensor), and a tensor holding both kinds
+is refused. A zero offset alone decides nothing: an asymmetric tile may have one, and the engine's own converter
+test writes such a tile. Of 1,889,236 tiles in the other packs on the box none has an all-zero zero-point block or
+a negative scale; of 285,696 in the two LFM2 packs every one has both.
+Read as the usual kind, each LFM2 projection correlated -0.39 with the same tensor of the upstream
 GGUF, and the serve answered in fluent-looking fragments of unrelated words; read as symmetric, 0.99, and the
 pack's quantised `lm_head` sits within one step of its own bf16 embedding (mean 0.24 of a step). And the
 attention layers carry per-head `q_norm`/`k_norm`, which the `lfm2` model type did not switch on: with only the
@@ -1954,6 +1958,11 @@ that share 21, 58 and 53 characters with FastFlowLM's and then continue differen
 question (a Fibonacci function that returns `0` for `n <= 0` where theirs returns a message). Decode 3.7 tok/s
 against 42 to 47. Its logprobs at the three points were not taken, and it was asked each prompt once, so this row
 does not carry the three-identical-answers condition.
+
+`LFM2.5-1.2B-Thinking-NPU2` loads on the same directory too: its template is read from the pack's
+`chat_template.jinja`, the reasoning is split out, and at 96 tokens every one of the five replies was still
+reasoning, so there is no answer text to compare and no row; the reasoning differs from FastFlowLM's from its
+first words.
 
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry

@@ -1633,8 +1633,14 @@ loaded with each pack's own weights, same input (`pixel(c, y, x) = sin(0.37c + 0
 | 1B | 16 × 20 | 1.1e-5, 1.000000000 | 2.4e-6, 1.000000000 |
 | 35B-A3B | 16 × 20 | 9.5e-6, 1.000000000 | 9.5e-7, 1.000000000 |
 
-The 16 × 20 grid took 5.5 s and 1.25 GB of memory for this code on one thread; a full 70 × 70 slice
-has 61 times the tokens and its attention grows with the square, which is why this is a reference.
+The loops are spread over threads (`ONEBIT_VISION_THREADS`, default the machine's count capped at 16;
+`vision::tower_threading()` in code) and the matrix products walk each weight once per handful of
+tokens instead of once per token. Neither changes a bit of the output: every token and every attention
+head is computed by one thread with the single-threaded arithmetic, and the test requires 1, 2, 5 and
+16 threads to give identical rows. Measured on a full 448 × 448 view (1,024 patches) of the 1B pack,
+box load about 13: 37.7 s before, 18.1 s on one thread with the blocked product, 3.2 s on 16 threads.
+It is still a reference: a 70 × 70 slice has nearly five times the patches and its attention grows with
+the square.
 `tests/npu_vision_tower_test.cpp` carries a small tower with LCG weights and that implementation's
 output for it as goldens, so the arithmetic is checked in CI without a pack; with
 `ONEBIT_MINICPM_PACK` and `ONEBIT_MINICPM_ORACLE` set it repeats the comparison above. The reference
@@ -1685,7 +1691,7 @@ image:
 | slice 0, 616 × 336 | 44 × 24 | 66 | 7.5e-6 | 1.000000000 |
 | slice 1, 616 × 336 | 44 × 24 | 66 | 6.7e-6 | 1.000000000 |
 
-That run took 110 s on one thread, which is the host reference's cost and the reason it is not a
+That run took 110 s on one thread (before the tower was threaded), which is the host reference's cost and the reason it is not a
 serving path. Two things are not established: the reference side called torch's `interpolate`
 directly, on the understanding that this is what the processor's torchvision resize does for byte
 images on a CPU build with AVX2 (torchvision is not on this box, so that link is read, not run); and
@@ -1729,8 +1735,8 @@ decoder is involved, and the prompt is the one the pack's chat template renders 
 with one image and thinking off, written out in the probe rather than rendered. The text model opens
 the device unless `NPU_INFER_HOST_GEMM` is set.
 
-It is a probe, not a route: `forward-serve` does not accept an image, and the tower's half minute to a
-minute per 448 × 448 view on one thread is the host reference's cost. The measured rows are in
+It is a probe, not a route: `forward-serve` does not accept an image, and the tower runs on the
+CPU (about 3 s per 448 × 448 view on 16 threads, 18 s on one). The measured rows are in
 engine#1788. On the published packs the text model only loads once the padded-head rule of
 engine#2026 is in: their head is stored 2 and 16 rows past the vocabulary, and without that rule the
 probe stops at `text model: lm_head dequant failed`.

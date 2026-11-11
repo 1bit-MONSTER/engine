@@ -14,33 +14,79 @@
 // limitations under the License.
 #include "vision_tower.h"
 
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace onebit::npu::vision {
 
 namespace {
 
+// Rows of work split over a few threads. Every unit (a token, a head) is computed by exactly one thread with exactly
+// the arithmetic the single-threaded loop used, so the result does not depend on the thread count: the goldens in
+// tests/npu_vision_tower_test.cpp hold bit for bit at any setting. ONEBIT_VISION_THREADS sets the count (1 turns
+// threading off); the default is the machine's, capped at 16. Small jobs stay on the calling thread.
+std::atomic<int> g_threads{0};            // 0: not set, use the environment / the machine
+std::atomic<double> g_min_work{4e6};      // multiply-adds below which a loop stays on the calling thread
+int tower_threads() {
+    const int forced = g_threads.load();
+    if (forced > 0) return forced;
+    static const int n = [] {
+        int v = 0;
+        if (const char* e = std::getenv("ONEBIT_VISION_THREADS")) v = std::atoi(e);
+        if (v <= 0) v = int(std::thread::hardware_concurrency());
+        return v < 1 ? 1 : (v > 16 ? 16 : v);
+    }();
+    return n;
+}
+template <typename Fn>
+void parallel_for(int count, double work_per_item, Fn fn) {   // fn(first, last) over [0, count)
+    const int nt = tower_threads();
+    if (nt <= 1 || count < 2 || work_per_item * count < g_min_work.load()) {
+        fn(0, count);
+        return;
+    }
+    const int parts = count < nt ? count : nt;
+    std::vector<std::thread> pool;
+    pool.reserve(size_t(parts - 1));
+    for (int p = 1; p < parts; ++p)
+        pool.emplace_back(fn, int(int64_t(count) * p / parts), int(int64_t(count) * (p + 1) / parts));
+    fn(0, int(int64_t(count) / parts));
+    for (std::thread& t : pool) t.join();
+}
+
 // y[n, rows] = x[n, in] * W[rows_stored.., in_stride]^T + b, using the first `rows` rows and the first `in` columns of
 // a weight stored `in_stride` wide. The padded MLPs are read through this: the stride is the tensor's, the extent the
 // model's. Eight partial sums so the compiler can vectorise without being allowed to reorder a single chain.
 void linear(const float* x, int n, int in, const float* w, int in_stride, const float* b, int rows, float* y) {
-    for (int t = 0; t < n; ++t) {
-        const float* xr = x + size_t(t) * in;
-        float* yr = y + size_t(t) * rows;
-        for (int r = 0; r < rows; ++r) {
-            const float* wr = w + size_t(r) * in_stride;
+  parallel_for(n, double(in) * rows, [=](int t0, int t1) {
+    // Tokens are taken a few at a time and every weight row is applied to the whole handful before the next row is
+    // touched. A weight matrix here is tens of megabytes and a token's input a few kilobytes, so walking the matrix
+    // once per token (the obvious loop) is bound by memory, not arithmetic; this walks it once per handful. Each
+    // dot product is the same sequence of operations either way, so the result is the same bits.
+    const int kBlock = 16;
+    for (int tb = t0; tb < t1; tb += kBlock) {
+      const int te = tb + kBlock < t1 ? tb + kBlock : t1;
+      for (int r = 0; r < rows; ++r) {
+        const float* wr = w + size_t(r) * in_stride;
+        const float bias = b ? b[r] : 0.0f;
+        for (int t = tb; t < te; ++t) {
+            const float* xr = x + size_t(t) * in;
             float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
             int i = 0;
             for (; i + 8 <= in; i += 8)
                 for (int k = 0; k < 8; ++k) acc[k] += xr[i + k] * wr[i + k];
             float s = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
             for (; i < in; ++i) s += xr[i] * wr[i];
-            yr[r] = s + (b ? b[r] : 0.0f);
+            y[size_t(t) * rows + r] = s + bias;
         }
+      }
     }
+  });
 }
 
 // torch.nn.LayerNorm: the population variance, eps inside the root.
@@ -74,11 +120,16 @@ Attn load_attn(const Pack& p, const std::string& stem) {
 // out[n, H] = proj(attention(x)), where tokens attend only inside consecutive groups of `group` tokens (group == n is
 // full attention). qkv is [3H, H]: q, k, v stacked in that order, heads contiguous inside each.
 void attention(const float* x, int n, int H, int heads, int head_dim, int group, const Attn& a, float* out) {
-    std::vector<float> qkv(size_t(n) * 3 * H), ctx(size_t(n) * H), prob(static_cast<size_t>(group));
+    std::vector<float> qkv(size_t(n) * 3 * H), ctx(size_t(n) * H);
     linear(x, n, H, a.qkv_w.data(), H, a.qkv_b.data(), 3 * H, qkv.data());
     const float scale = 1.0f / std::sqrt(float(head_dim));
-    for (int g0 = 0; g0 < n; g0 += group) {
-        for (int h = 0; h < heads; ++h) {
+    const int groups = n / group;
+    // one unit = one head of one group; each writes its own slice of ctx
+    parallel_for(groups * heads, double(group) * group * head_dim * 2, [&, scale](int u0, int u1) {
+      std::vector<float> prob(static_cast<size_t>(group));
+      for (int u = u0; u < u1; ++u) {
+        const int g0 = (u / heads) * group, h = u % heads;
+        {
             for (int i = 0; i < group; ++i) {
                 const float* q = qkv.data() + size_t(g0 + i) * 3 * H + size_t(h) * head_dim;
                 float mx = -INFINITY;
@@ -107,7 +158,8 @@ void attention(const float* x, int n, int H, int heads, int head_dim, int group,
                 }
             }
         }
-    }
+      }
+    });
     linear(ctx.data(), n, H, a.proj_w.data(), H, a.proj_b.data(), H, out);
 }
 
@@ -137,6 +189,11 @@ std::vector<float> windows(const float* x, int gh, int gw, int H) {
 }
 
 }  // namespace
+
+void tower_threading(int threads, double min_work) {
+    g_threads.store(threads > 16 ? 16 : (threads < 0 ? 0 : threads));
+    g_min_work.store(min_work < 0 ? 0 : min_work);
+}
 
 std::vector<float> tower_forward(const Pack& p, const float* pixels, int gh, int gw, std::vector<float>* tower) {
     const Geometry& g = p.geometry();

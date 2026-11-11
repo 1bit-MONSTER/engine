@@ -1708,6 +1708,27 @@ prefixes, and none) as hashes over every token id and position. Images only: vid
 handled. Nothing feeds these planes or the tower's rows into the text forward yet; that is the route's
 work.
 
+**One picture, one question, end to end (`minicpm_image_probe`).** A probe under `ONEBIT_NPU` that
+chains every step above with nothing from outside the engine:
+
+```
+minicpm_image_probe <pack dir> <kernels dir> (--image f.ppm | --solid R,G,B [--size HxW] | --halves R,G,B:R,G,B | --none)
+                    --prompt "question" [--decode N] [--expect-ids ids.i32]
+```
+
+RGB bytes → `plan_image` → `preprocess` → `tower_forward` on the CPU → `image_tokens` and
+`prompt_positions` → the text model's `step_batch_embeds()` with the tower's rows where the
+placeholders are, then a greedy decode. The image is a binary PPM or a generated colour, so no image
+decoder is involved, and the prompt is the one the pack's chat template renders for a single user turn
+with one image and thinking off, written out in the probe rather than rendered. The text model opens
+the device unless `NPU_INFER_HOST_GEMM` is set.
+
+It is a probe, not a route: `forward-serve` does not accept an image, and the tower's half minute to a
+minute per 448 × 448 view on one thread is the host reference's cost. The measured rows are in
+engine#1788. On the published packs the text model only loads once the padded-head rule of
+engine#2026 is in: their head is stored 2 and 16 rows past the vocabulary, and without that rule the
+probe stops at `text model: lm_head dequant failed`.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
@@ -2522,6 +2543,13 @@ can fail a run.
 `[ops-dump] NPU_INFER_DUMP_OPS is on: …` once at model load, before any request (engine#2028). A run that sets the
 variable and never sees that line is running a binary built before the dump existed (#1977): rebuild it, rather than
 looking for a code path that skips the dump.
+
+The files these dumps write (`NPU_INFER_DUMP_DIR`'s `layer_<ll>.f32`, `NPU_I8_GS_DUMP`'s weight-scale pairs) are
+created owner-only (0600) and never through a symlink at the final path component, whatever the umask, and a dump file
+an older build left at 0666 is narrowed to 0600 when it is rewritten; the head-image cache's files are at most 0644. Both go through `npu/forward/include/file_create.h`, so no write site uses `fopen(…, "w")`,
+which creates with 0666 under the umask and follows a planted link (CodeQL `cpp/world-writable-file-creation`).
+`tools/ci/file_create_check.py` refuses a new `fopen(…, "w")` or `"a"` anywhere in the tree unless the line says why
+(`file-create-ok: <reason>`), and `tests/file_create_test.c` pins the modes.
 
 ```
   [op] L00 rmsnorm      rows=1 |x| mean 0.0143171 absmax 3.01935

@@ -275,6 +275,15 @@ tools/npu_serve_smoke.py --self-test        # the judging on the shape of each f
 tools/npu_serve_smoke.py --judge <dir>      # judge a finished run's serve.log and reply_*.json again
 ```
 
+It also prints one `load` line: the box's 1-minute load average as the run found it (kept in `load.json`, so
+`--judge` reports the run's load and not today's). The fast route keeps about 1.5 CPU cores of host work per token and
+`npu-hold` serialises the device, not the CPU. Measured on the shipped binary (#2106): 86-94 tok/s at 16, 32, 96 and
+128 answer tokens on a quiet box, and 51-89 tok/s while a 10-job build ran beside it, on the same route with the same
+answers. So the floor is not a function of answer length, and when the route and the content pass and only the timing
+fails, the line says a busy box is the likely cause and to re-run on a quiet one. It never turns a FAIL into a PASS:
+a starved box is something the release run should notice.
+
+
 The two route texts are what the serve prints today (`on the private route dx`, `per-op forward`);
 `--fast-route` and `--slow-route` change them when the serve's wording does, and a log that names
 neither is a failure, not a pass. It prints one line per assertion and `RESULT: PASS` or `RESULT: FAIL` (exit 0 or 1). It takes no device

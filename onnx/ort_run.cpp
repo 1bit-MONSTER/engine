@@ -38,6 +38,8 @@
 
 #include <onnxruntime_c_api.h>
 
+#include "../npu/forward/include/file_create.h"   // dumps are created 0600, never through a symlink
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -722,7 +724,7 @@ int run_generic(OrtSession* session, OrtMemoryInfo* mi, const Args& a) {
     }
 
     if (a.dump_all) ::mkdir(a.dump_all, 0700);   // EEXIST is the normal case
-    FILE* side = a.dump_all ? std::fopen((std::string(a.dump_all) + "/outputs.txt").c_str(), "a") : nullptr;
+    FILE* side = a.dump_all ? onebit_fopen_private_ab((std::string(a.dump_all) + "/outputs.txt").c_str()) : nullptr;
     for (size_t i = 0; i < outs.size(); ++i) {
         OrtAllocator* alloc = nullptr;
         char* gname = nullptr;
@@ -758,7 +760,7 @@ int run_generic(OrtSession* session, OrtMemoryInfo* mi, const Args& a) {
         size_t elems = 1;
         for (int64_t d : dims) elems *= (size_t)(d > 0 ? d : 1);
         const size_t bytes = elems * elem_size(et);
-        FILE* f = std::fopen(path.c_str(), "wb");
+        FILE* f = onebit_fopen_private_wb(path.c_str());
         if (!f) {
             std::fprintf(stderr, "onebit-ort-run: cannot write %s\n", path.c_str());
             rc = 2;

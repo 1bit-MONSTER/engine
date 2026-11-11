@@ -252,6 +252,44 @@ The settings are environment variables at the top of the script: `HW_GATE_STORE`
 `$HW_GATE_OUT` (default `~/.cache/hw-gate/runs/<time>`). Exit code: 0 pass, 1 a check failed, 2
 the box could not run the gate (lock timeout, a model or base file missing, memory refused).
 
+## The NPU serve check (`tools/npu_serve_smoke.py`)
+
+The `npu` phase above checks the NPU engine through a private checker. It does not start `1bit serve`,
+so it cannot see what engine#2102 and #2106 are about: a shipped binary whose serve quietly takes the
+slow per-op route. That serve still answers, correctly, at about 2 tok/s where the fast route gives 80
+to 100, so a check that asks "did it answer" passes on the wrong route.
+
+`tools/npu_serve_smoke.py` starts the serve, sends three prompts with thinking off, stops the serve,
+and asserts the four things the fallback fails:
+
+| assertion | passes when |
+|---|---|
+| `route` | the serve log names the fast route and does not name the per-op forward |
+| `rate` | the median decode rate is at least `--floor` tok/s (default 60; the two routes are 45× apart) |
+| `first-token` | the median prompt time is at most `--first-token-ms` (default 600) |
+| `content` | every reply has non-empty content that is not one character repeated |
+
+```sh
+npu-hold -l npu-smoke -t 10 -- tools/npu_serve_smoke.py --bin <1bit> --model <model dir> [--out <dir>]
+tools/npu_serve_smoke.py --self-test        # the judging on the shape of each failure; no device, no binary
+tools/npu_serve_smoke.py --judge <dir>      # judge a finished run's serve.log and reply_*.json again
+```
+
+It prints one line per assertion and `RESULT: PASS` or `RESULT: FAIL` (exit 0 or 1). It takes no device
+ticket of its own: run it under `npu-hold`, and the serve ends with the script. Logs and replies go to
+`--out` (default `~/.cache/1bit/npu-serve-smoke`).
+
+Measured on strixhalo, 2026-11-11, Qwen3-0.6B, one ticket each:
+
+| binary | route taken | result |
+|---|---|---|
+| the 2026-11-07 release candidate, with the kernel set that ships beside it | fast | `PASS`: median 84.4 tok/s (98.4, 84.4, 82.1), first token 277 ms |
+| a build of main without the private route, model-generic directory | per-op | `FAIL`: `route`, `rate` (median 1.9 tok/s) and `first-token` (1,063 ms) fail; `content` passes |
+
+The second row is the point: its three answers were fine, and only the other three assertions say
+the release would have shipped the slow route. The check is not wired into `scripts/hw-gate.sh` or the
+release script yet; it is the instrument, and the release lane decides where it runs.
+
 ## Measured
 
 Strix Halo, 2026-10-12, at the release pin (main d2a56a4, llama.cpp 0e255d77, hrx-system

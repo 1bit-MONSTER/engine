@@ -971,8 +971,22 @@ counting distinct (weight, layout) copies:
 | a 100-token prompt | 398 copies, 2,375.9 MiB | 398 copies, 2,375.9 MiB |
 
 Perplexity at a 300-token batch is 19.2890 in both arms. Prefill is not slower: 1,229 against 1,098 tok/s at 300 tokens and 2,040
-against 1,860 at 1,700 (back to back, not interleaved). Still one model: there is no dense 27B row and no routed-expert row, and the
-6-to-16-token Q6_K kernel reads a third layout that neither switch covers.
+against 1,860 at 1,700 (back to back, not interleaved).
+
+**Since pin `0494dfa28` a short prompt and its reply share one copy as well** (llama.cpp #316). The Q6_K kernel for batches of 6 to
+16 tokens read the weight in an i8 layout of its own, so after a 12-token prompt and a reply 35 Q6_K weights were held twice:
+433 device copies, 2,856.2 MiB. For a weight whose layout is the packed rows, that batch size now goes to the tiled kernel, which
+reads the packed rows: 398 copies, 2,375.9 MiB, the model's own size. With that, Qwen3-4B Q4_K_M holds one device copy per weight
+at every prompt shape measured (3, 8, 12, 40, 100 and 1,700 tokens, with and without a reply). It costs prefill speed at those
+sizes: 8.9 % at 8 tokens, 5.3 % at 12 and 6.9 % at 16 (interleaved, quiet box), which is 2 to 3 ms on a short prompt. Perplexity
+at a 12-token batch is 59.0414 before and 59.0417 after. An uploaded weight keeps the i8 kernel.
+
+**A dense mixed-quant 27B still holds some weights twice.** Qwen3.8-27B UD-Q4_K_XL after a 1,700-token prompt and a reply: 920
+device copies, 18,205.2 MiB, with 70 weights in two layouts (2,486.7 MiB of duplicate; 88 weights and 2,621.5 MiB with both
+switches at `0`). On that model the one-token decode kernels read the stored layout by design and some prefill kernels read only
+the packed rows, so the two disagree on those 70. Making decode step aside for them was measured and does not help: the same 70
+duplicates, and decode 8.5 % slower. Removing them needs a kernel that reads the other layout
+([engine#2137](https://github.com/1bit-MONSTER/engine/issues/2137)). No routed-expert model has been measured.
 
 `GGML_HRX_Q6K_PACKED_PREFILL=1`, the older switch, never saved a copy: its dispatch bound the stored layout. Off its kernel's wide
 tile (tokens not a multiple of 256, or outputs not a multiple of 128) it also read past the weight: a Q6_K matmul at 128 tokens with

@@ -153,6 +153,10 @@ struct CallStats {
     double prompt_ms = 0;
     double predicted_ms = 0;
     npu::PrefixDecision prefix{-1, 0, "off"};  // "off" when --prefix-slots 0
+    // engine#2111: each generated token's text, in order, and how many of them were reasoning. -1 = not counted (a
+    // /v1/completions reply is raw text with no split), so the usage object then carries no details at all.
+    std::vector<std::string> pieces;
+    int reasoning_tokens = -1;
 };
 
 // One generated token's log-probability entry, with the text that token produced.  The two travel
@@ -549,6 +553,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             // pre-top_k/top_p/temperature and the grammar mask cannot narrow it.
             if (want_lp)
                 held.emplace_back(Emitted{piece, npu::logprobs_of(logits, next, opts.sample.top_logprobs)}, piece.size());
+            stats.pieces.push_back(piece);   // engine#2111: reasoning_tokens is counted over these
             ++produced;
             const size_t stop_at = npu::find_stop(pending, opts.stop);
             if (stop_at != std::string::npos) {
@@ -597,14 +602,19 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
     // OpenAI's usage object plus the two fields issue #650 reports: how many prompt tokens came
     // from a saved prefix, and what the cache decided (which slot, and why).
     auto usage_json = [](const CallStats& st) {
-        return json{{"prompt_tokens", st.prompt_tokens},
-                    {"completion_tokens", st.completion_tokens},
-                    {"total_tokens", st.prompt_tokens + st.completion_tokens},
-                    {"prompt_tokens_details", {{"cached_tokens", st.prefix.cached_tokens}}},
-                    {"flm_prefix_cache", {{"slot", st.prefix.slot},
-                                          {"cached_tokens", st.prefix.cached_tokens},
-                                          {"reason", st.prefix.reason},
-                                          {"pinned", st.prefix.pinned}}}};
+        json u{{"prompt_tokens", st.prompt_tokens},
+               {"completion_tokens", st.completion_tokens},
+               {"total_tokens", st.prompt_tokens + st.completion_tokens},
+               {"prompt_tokens_details", {{"cached_tokens", st.prefix.cached_tokens}}},
+               {"flm_prefix_cache", {{"slot", st.prefix.slot},
+                                     {"cached_tokens", st.prefix.cached_tokens},
+                                     {"reason", st.prefix.reason},
+                                     {"pinned", st.prefix.pinned}}}};
+        // engine#2111: OpenAI's field for "how much of the budget went into reasoning". With content "" and
+        // finish_reason "length", reasoning_tokens == completion_tokens is the sentence that says the budget ran out
+        // inside a thinking block, rather than that the model said nothing. Additive: absent where nothing was split.
+        if (st.reasoning_tokens >= 0) u["completion_tokens_details"] = {{"reasoning_tokens", st.reasoning_tokens}};
+        return u;
     };
 
     // OpenAI's logprobs.content entry: the token's text, its log-probability, and the most likely
@@ -639,6 +649,7 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             // parts; a reply that is only tool calls says content: null.
             const npu::ParsedAnswer ans =
                 npu::parse_answer(content, family, opts.tools_sent, starts_in_reasoning);
+            stats.reasoning_tokens = npu::reasoning_token_count(stats.pieces, family, opts.tools_sent, starts_in_reasoning);
             json message{{"role", "assistant"}};
             message["content"] = ans.content_null ? json(nullptr) : json(ans.content);
             if (!ans.reasoning.empty()) message["reasoning_content"] = ans.reasoning;
@@ -767,6 +778,10 @@ void handle_generate_impl(ForwardEngine& e, const httplib::Request& req, httplib
             {
                 json tail = chunk_tpl;
                 tail["choices"] = json::array();
+                // engine#2111: the same count as the non-streamed reply's, over the same pieces.
+                if (chat)
+                    stats.reasoning_tokens =
+                        npu::reasoning_token_count(stats.pieces, family, opts.tools_sent, starts_in_reasoning);
                 tail["usage"] = usage_json(stats);
             tail["timings"] = timings_json(stats);
                 send("data: " + tail.dump() + "\n\n");

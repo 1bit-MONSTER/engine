@@ -522,6 +522,13 @@ part of this build. `--npu-opt KEY=VALUE` passes an option through to an add-on 
 `stream_options.include_usage` gets a last chunk with `usage` and `timings`, as OpenAI's
 API sends it.
 
+A chat reply on the NPU also says how many of its `completion_tokens` were reasoning, in OpenAI's
+field `usage.completion_tokens_details.reasoning_tokens` (engine#2111). `"content": ""` with
+`"finish_reason": "length"` and `reasoning_tokens` equal to `completion_tokens` means the budget ran out
+inside the thinking block, not that the model said nothing: the text is in `reasoning_content`; raise
+`max_tokens` or send `enable_thinking: false`. Both tags of the block count as reasoning;
+the answer and tool-call markup do not. A `/v1/completions` reply is raw text and carries no details.
+
 `chat_template_kwargs.enable_thinking: false` works on every device. The GPU
 backends apply the model's own chat template. The NPU route emits what Qwen3's
 template does: an empty think block after the assistant prefix. For Qwen3.6-35B-A3B it

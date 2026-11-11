@@ -3435,7 +3435,10 @@ void Q4nxNpuForward::tap_layer(int layer, const float* X, int M) {
         tap_base_ = tap_sink_->size();
         tap_sink_->resize(tap_base_ + size_t(M) * size_t(T) * H);
     }
-    if (tap_sink_->size() < tap_base_ + size_t(M) * size_t(T) * H) return;   // a pass that changed width mid-way
+    if (tap_sink_->size() != tap_base_ + size_t(M) * size_t(T) * H) {   // not the rows this pass opened with
+        tap_fault_ = true;
+        return;
+    }
     for (int m = 0; m < M; m++)
         onebit::npu::layer_tap_put(tap_sink_->data() + tap_base_, m, j, T, int(H), X + size_t(m) * H);
 }
@@ -3540,8 +3543,28 @@ bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_po
     return ok;
 }
 
-bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
-                                std::vector<float>& logits) {
+// engine#1780: a pass that fails must not leave rows in the tap sink. The bodies below return false from many
+// places, so the rule is applied once, here, around each of them.
+bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos, std::vector<float>& logits) {
+    onebit::npu::LayerTapPass pass(tap_sink_);
+    tap_fault_ = false;
+    const bool ok = step_batch_impl(tokens, start_pos, logits);
+    if (tap_fault_ && tap_sink_)
+        std::fprintf(stderr, "  [taps] a batched pass at position %d changed its row count between tapped layers; "
+                             "its rows are dropped\n", start_pos);
+    pass.keep = ok && !tap_fault_;
+    return ok;
+}
+
+bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
+    onebit::npu::LayerTapPass pass(tap_sink_);
+    const bool ok = step_impl(token, pos, logits, cache_pos);
+    pass.keep = ok;
+    return ok;
+}
+
+bool Q4nxNpuForward::step_batch_impl(const std::vector<int>& tokens, int start_pos,
+                                     std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // A noncausal pack reads the whole prompt at once, so a chunk that starts above 0 was already
     // encoded causally by an earlier call and cannot be repaired here.  Named, not silently causal.
@@ -4106,7 +4129,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // residual here produced garbage logits (the M=1 self-check caught it).
     std::vector<float> fnorm(H);
     bool ok = true;
-    if (tap_sink_ && err_.empty()) tap_layer(c_.NL - 1, X.data(), M);
+    if (tap_sink_) tap_layer(c_.NL - 1, X.data(), M);
     last_residual_.assign(X.begin() + (size_t)(M - 1) * H, X.end());
     if (batch_all_out_) {
         // step_batch_all(): the verifier needs the model's own choice at every drafted position, so every
@@ -4836,7 +4859,7 @@ bool Q4nxNpuForward::mlp(const float* gu, float* h, int im) {
 // --------------------------------------------------------------------------
 // step
 // --------------------------------------------------------------------------
-bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int cache_pos) {
+bool Q4nxNpuForward::step_impl(int token, int pos, std::vector<float>& logits, int cache_pos) {
     if (!ready_) { err_ = "not initialised"; return false; }
     // Generation is causal by construction (one position at a time, keys only in the past), so a pack
     // whose full-attention layers read the whole prompt cannot be run this way.  Refused by name
@@ -5216,7 +5239,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits, int ca
     }
     if (ph) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
 
-    if (tap_sink_ && err_.empty()) tap_layer(c_.NL - 1, x.data(), 1);
+    if (tap_sink_) tap_layer(c_.NL - 1, x.data(), 1);
     last_residual_ = x;                        // one norm earlier, for a drafter that wants the residual
     rmsnorm(x.data(), final_norm_.data(), H, xn.data());
     last_hidden_ = xn;  // for last_hidden(): the post-final-norm state of this position

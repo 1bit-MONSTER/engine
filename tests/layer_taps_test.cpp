@@ -58,6 +58,31 @@ int main() {
                     ok = ok && rows[size_t((m * 3 + j) * 2 + k)] == float(100 * m + 10 * j + k);
         check(ok, "a row is one position with its taps side by side, in list order");
     }
+    {   // a pass that is not kept takes its rows back; a kept one leaves them; passes nest
+        std::vector<float> sink(4, 1.0f);
+        {
+            LayerTapPass pass(&sink);
+            sink.resize(10, 0.0f);
+        }
+        check(sink.size() == 4, "a pass that is not kept leaves the sink at the size it found");
+        {
+            LayerTapPass pass(&sink);
+            sink.resize(10, 2.0f);
+            pass.keep = true;
+        }
+        check(sink.size() == 10 && sink[3] == 1.0f && sink[9] == 2.0f, "a kept pass leaves its rows, and the earlier ones");
+        {
+            LayerTapPass outer(&sink);
+            {
+                LayerTapPass inner(&sink);
+                sink.resize(16, 3.0f);
+                inner.keep = true;       // the inner pass succeeded ...
+            }
+        }                                // ... inside an outer one that did not
+        check(sink.size() == 10, "a failed outer pass takes back the rows of the passes inside it");
+        { LayerTapPass none(nullptr); }
+        check(true, "a pass with no sink does nothing");
+    }
     if (g_fail) { std::printf("layer_taps: %d of %d checks FAILED\n", g_fail, g_n); return 1; }
     std::printf("layer_taps: ok (%d checks)\n", g_n);
     return 0;

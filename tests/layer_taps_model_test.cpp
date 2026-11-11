@@ -24,7 +24,10 @@
 //     that already existed and writes at the end of the layer body, so a tap that is one layer off cannot agree;
 //   - a step() pass at position 0 gives the same row as the batched pass gave for that position, closely (the two
 //     paths are not bit-identical in general), which holds step()'s tap to the same layers;
-//   - a list that is not usable is refused and leaves the previous taps in place; an empty list turns them off.
+//   - a list that is not usable is refused and leaves the previous taps in place; an empty list turns them off;
+//   - a call that was refused (a token outside the vocabulary) appends nothing, and the passes AFTER it still carry
+//     the last layer's block. The forward never clears its error text, so anything that gated a tap on "no error so
+//     far" would hand every later pass zeros there (review of fa8d642).
 
 #include <cstdio>
 #include <cstdlib>
@@ -73,6 +76,16 @@ int main() {
     const fs::path dump = fs::current_path() / ("layer_taps_dump." + std::to_string(getpid()));
     fs::create_directories(dump);
     setenv("NPU_INFER_DUMP_DIR", dump.c_str(), 1);
+
+    // A refused call first, so the forward carries an error text from here on.
+    {
+        const std::vector<int> bad = {1, -1};
+        const bool refused_batch = !fwd.step_batch(bad, 0, logits);
+        const bool refused_step = !fwd.step(-1, 0, logits);
+        check(refused_batch && refused_step && sink.empty(), "a refused call appends nothing");
+        check(fwd.last_error()[0] != '\0', "and the forward now carries an error text, as it will for the rest of its life");
+        fwd.reset();
+    }
 
     const std::vector<int> tokens = {1, 2, 3};
     const bool batched = !fwd.noncausal() ? fwd.step_batch_all(tokens, 0, logits) : fwd.step_batch(tokens, 0, logits);

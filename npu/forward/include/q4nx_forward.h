@@ -227,6 +227,10 @@ public:
     // layout dflash_forward.h's `taps` argument takes. Layer l's row is the stream as layer l + 1 receives it (after
     // layer l's own closing scale). Works for step() and for the batched passes. An empty list or a null sink turns
     // it off; the sink must outlive the passes. Returns false, changing nothing, on a list that is not usable.
+    // A pass that returns false appends nothing: whatever it had written is taken back, so the sink only ever holds
+    // rows of passes that succeeded. A call refused earlier on the same forward does not affect later passes.
+    // Not for use under NPU_BATCH_CHECK: that oracle replays positions through step(), and the replays would be
+    // appended as if they were new positions.
     bool set_layer_taps(const std::vector<int>& layers, std::vector<float>* sink);
     int layer_count() const { return c_.NL; }   // layers of the loaded model; 0 before init
     // One row of the embedding table (what a token means to the model): the MTP drafter's `pre_fc_norm_embedding`
@@ -251,7 +255,12 @@ private:
     std::vector<int>    tap_layers_;           // engine#1780: set_layer_taps()
     std::vector<float>* tap_sink_ = nullptr;
     size_t              tap_base_ = 0;         // where the current pass's rows start in *tap_sink_
+    bool                tap_fault_ = false;    // a tapped layer arrived with a different row count than the pass opened with
     void tap_layer(int layer, const float* X, int M);
+    // The bodies of step() and step_batch(). The public functions wrap them so that a failed pass leaves the tap
+    // sink as it found it (layer_taps.h, LayerTapPass).
+    bool step_impl(int token, int pos, std::vector<float>& logits, int cache_pos);
+    bool step_batch_impl(const std::vector<int>& tokens, int start_pos, std::vector<float>& logits);
     std::vector<float> last_hidden_rows_;  // [M][H] normed hidden of the last batched pass
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.

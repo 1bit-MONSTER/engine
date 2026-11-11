@@ -5230,6 +5230,36 @@ void test_container_role_fields() {
                                  (conflicts.empty() ? std::string() : " (" + conflicts.front() + ")"));
 }
 
+// engine#1788 / 3c step 3: what a container's I8 payload looks like, as fact. Measured on both packs on this box:
+// 35B {4736: 370, 8704: 1}, 1B {4736: 150, 8704: 37} -- two widths per container, the second being the head. The earlier
+// version of this check judged each row against the geometry's widths and produced false positives (both containers'
+// `lm_head` implies K = 4032, which neither model declares), so it reports the distribution and only *refuses* the rows
+// that cannot be a payload at all.
+void test_container_payload_rule() {
+    const auto t = [](const std::string& n, std::vector<int64_t> shape) {
+        pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; x.shape = std::move(shape); return x;
+    };
+    {
+        const std::vector<pi::Q4nxTensor> v = {t("a", {4096, 8, 4736}), t("b", {16384, 2, 4736}),
+                                               t("lm_head.weight", {7755, 8, 8704})};
+        const std::map<int64_t, int64_t> rows = pi::container_payload_rows(v);
+        check(rows.size() == 2 && rows.at(4736) == 2 && rows.at(8704) == 1,
+              "payload rows: the distribution is reported, so a writer can see one width or several");
+        check(pi::container_payload_anomalies(v).empty(), "payload rows: ordinary rows are not anomalies");
+    }
+    {
+        const std::vector<pi::Q4nxTensor> v = {t("short", {4, 2, 512}), t("odd", {4, 2, 4737})};
+        const std::vector<pi::ContainerPayloadAnomaly> a = pi::container_payload_anomalies(v);
+        check(a.size() == 2 && a[0].name == "short" && a[0].implied_k == -1,
+              "payload rows: a row below the 640-byte overhead, or with an odd remainder, is reported");
+    }
+    {
+        pi::Q4nxTensor bf16; bf16.name = "model.embed_tokens.weight"; bf16.dtype = "BF16"; bf16.shape = {248144, 2048};
+        check(pi::container_payload_rows({bf16}).empty() && pi::container_payload_anomalies({bf16}).empty(),
+              "payload rows: a BF16 table is not an I8 row");
+    }
+}
+
 void test_container_roles() {
     const auto t = [](const std::string& n) { pi::Q4nxTensor x; x.name = n; x.dtype = "I8"; return x; };
     const auto roles = [&](std::initializer_list<const char*> names) {
@@ -6270,6 +6300,7 @@ int main(int argc, char** argv) {
         test_q4nx_container(golden_dir.empty() ? "." : golden_dir);
         test_container_geometry();
         test_container_roles();
+        test_container_payload_rule();
         test_container_role_fields();
         test_container_plan_reports_roles();
         test_container_roles_moe_and_singular_layer();

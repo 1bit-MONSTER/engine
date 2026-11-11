@@ -199,6 +199,11 @@ int64_t read_per_layer_table_band(const EmbedPerLayer& meta, int64_t first_row, 
                                   std::string* why);
 
 // One tensor the pack describes, and where its values would come from.
+struct ContainerPayloadAnomaly {
+    std::string name;
+    int64_t row_bytes = 0;
+    int64_t implied_k = 0;
+};
 struct Planned {
     std::string name;     // Q4NX tensor name (model.layers.N.<...>.weight)
     std::string source;   // "model.onnx.data", "fconst:Llm_Token_Token", "fconst:Llm_Prefill", "config.json"
@@ -274,6 +279,10 @@ struct Plan {
     int64_t container_vision_payload_bytes = 0;
     int64_t container_vision_roles_named = -1;
     std::map<std::string, int64_t> container_vision_role_counts;
+    // engine#1788, 3c: every I8 row whose implied K is none of the widths the geometry declares. Reported for the
+    // writer's benefit -- a row that implies a K the model does not have is a re-tile, not a copy.
+    std::map<int64_t, int64_t> container_payload_rows;          // row_bytes -> how many I8 tensors use it
+    std::vector<ContainerPayloadAnomaly> container_payload_anomalies;
     // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
     // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
     // disagree (13 of the 29 packs measured carry a `dims` block; all 29 carry config.json). Empty for a non-container pack.
@@ -403,6 +412,21 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors);
 // forward's loader reads: fused pairs (`qkv_proj`, `gate_up_proj`) are consumed by a fused path, `ssm`/`mtp`/`vision`
 // are their own containers or their own code, and `shared_expert_gate` is read only by the MoE block.
 const char* container_role_field(const std::string& role);
+// engine#1788, slice 3c step 3: does a container tensor's payload agree with the geometry the pack declares? An I8 row
+// in this genre is `2*K + 640` bytes (K the projection's input width, 640 the fixed per-group scale/zero overhead) --
+// measured on both MiniCPM-V packs on this box (35B: uniform 4736 with K = H = 2048; 1B: 4736 and 8704, K = 2048/4032).
+// A row that implies a K the model's geometry does not contain is a re-tile the writer must not copy blind, so it is
+// reported by name rather than written.
+
+// `plausible_k` is NOT used to judge: running it against the two packs on this box produced false positives (both
+// containers' `lm_head` rows imply K = 4032, a width no geometry field of either model declares, and 37 of the 1B's
+// rows with it). So the check reports what it can prove and stops there:
+//   - `container_payload_rows`  the distribution of row widths, which is the fact a writer needs (one width = a copy,
+//                               several = a re-tile per shape);
+//   - `container_payload_anomalies`  only the rows that cannot be one of these at all (shorter than the 640-byte
+//                               overhead, or an odd remainder), with implied_k = -1.
+std::map<int64_t, int64_t> container_payload_rows(const std::vector<Q4nxTensor>& tensors);
+std::vector<ContainerPayloadAnomaly> container_payload_anomalies(const std::vector<Q4nxTensor>& tensors);
 // The destination fields claimed by more than one role in `counts` (each with the roles that claim it). Empty is the
 // only state a writer may start from.
 std::vector<std::string> container_role_field_conflicts(const std::map<std::string, int>& counts);

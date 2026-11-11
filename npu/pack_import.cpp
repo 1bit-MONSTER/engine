@@ -3313,6 +3313,13 @@ std::string Plan::manifest() const {
                       {"unassigned", unnamed},
                       {"counts", container_role_counts}};
         if (!container_roles_unassigned.empty()) c["roles"]["unassigned_names"] = container_roles_unassigned;
+        c["payload_rows"] = container_payload_rows;
+        if (!container_payload_anomalies.empty()) {
+            json a = json::array();
+            for (const auto& x : container_payload_anomalies)
+                a.push_back({{"name", x.name}, {"row_bytes", x.row_bytes}});
+            c["payload_anomalies"] = a;
+        }
         if (container_vision_tensors >= 0)
             c["vision"] = {{"tensors", container_vision_tensors},
                            {"payload_bytes", container_vision_payload_bytes},
@@ -3443,6 +3450,23 @@ const char* container_role_field(const std::string& role) {
     for (const auto& kv : kMap)
         if (role == kv.first) return kv.second;
     return "";
+}
+
+std::map<int64_t, int64_t> container_payload_rows(const std::vector<Q4nxTensor>& tensors) {
+    std::map<int64_t, int64_t> out;
+    for (const auto& t : tensors)
+        if (t.dtype == "I8" && t.shape.size() == 3) out[t.shape[2]]++;
+    return out;
+}
+
+std::vector<ContainerPayloadAnomaly> container_payload_anomalies(const std::vector<Q4nxTensor>& tensors) {
+    std::vector<ContainerPayloadAnomaly> out;
+    for (const auto& t : tensors) {
+        if (t.dtype != "I8" || t.shape.size() != 3) continue;
+        const int64_t row_bytes = t.shape[2];
+        if (row_bytes < 640 || (row_bytes - 640) % 2 != 0) out.push_back({t.name, row_bytes, -1});
+    }
+    return out;
 }
 
 std::vector<std::string> container_role_field_conflicts(const std::map<std::string, int>& counts) {
@@ -3691,6 +3715,9 @@ Plan plan(const std::string& pack_dir) {
                     for (const auto& kv : vr.counts) p.container_vision_role_counts[kv.first] = int64_t(kv.second);
                 }
             }
+            // engine#1788, 3c: what the writer needs to know about the payload, as fact rather than judgement.
+            p.container_payload_rows = container_payload_rows(c.tensors);
+            p.container_payload_anomalies = container_payload_anomalies(c.tensors);
             p.container_note = c.why.empty()
                 ? "the pack is a safetensors container (model.q4nx): " + std::to_string(c.tensors.size()) +
                       " tensors, " + std::to_string(c.payload_bytes) + " B of payload, no graph; " + geom +

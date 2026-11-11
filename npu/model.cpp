@@ -67,7 +67,7 @@ bool table_holds_vocab(const Tensor& t, int64_t vocab, int64_t hidden, std::stri
     }
     if (t.dtype != "I8") return true;
     if (t.bytes == uint64_t(vocab) * uint64_t(hidden)) return true;   // plain int8 + per-32-column scale (Gemma4)
-    const auto is_chunk = [](int64_t b) { return b == Q4NX_TILE_BYTES || b == Q4NX_CHUNK_Q4K || b == Q4NX_CHUNK_Q8; };
+    const auto is_chunk = [](int64_t b) { return b == Q4NX_TILE_BYTES || b == Q4NX_CHUNK_Q4K || b == Q4NX_CHUNK_Q8 || b == Q4NX_CHUNK_Q4S; };
     int64_t r = -1;
     if (t.shape.size() == 3 && is_chunk(t.shape[2]) && t.shape[1] == col_tiles) r = t.shape[0] * Q4NX_TILE_ROWS;
     else if (t.shape.size() == 2 && is_chunk(t.shape[1]) && t.shape[0] % col_tiles == 0)

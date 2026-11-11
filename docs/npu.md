@@ -477,6 +477,44 @@ first build of that target for reading the tile grid k-outer instead of n-outer 
 paragraphs up — which is the reason it exists: the target was self-consistent, bit-exact against its
 own scalar reference, and decoding a different matrix than the container meant.
 
+
+**The decode head can run on the host (engine#1785), `NPU_HEAD_HOST=1`.** A decode step sends one row
+through every tile of the int8 head, and a launch costs the same weight pass for one row as for a full
+batch, so those launches are the most expensive use of the device in a token. With `NPU_HEAD_HOST=1` the
+single-row head is computed on the host instead, from the same image the device reads (the resident weight
+buffer's host mapping, no second copy), with the device path's own activation quantiser and the same
+epilogue. The sums are int32, so the logits are the device head's bit for bit, not an approximation of
+them. `NPU_HEAD_HOST_THREADS` sets the threads the tiles are split over (default 4, at most 16). It applies
+to the int8 tiled head only: the ternary (`pb16i`) head, the gemv head and batched head rows (prefill,
+verify) stay on the device. Off by default.
+
+Measured on the NPU with FastFlowLM's `Qwen3.5-2B-NPU2` container (vocabulary 248,320, width 2,048, 21
+head tiles), same binary, device head and host head interleaved, 24 greedy tokens per request, on a busy
+box (load 6 to 23):
+
+| | device head | host head, 4 threads |
+|---|---|---|
+| head time per decode token (the head's own timer), 5 serves each | 52, 51, 78, 57, 59 ms | 9.5, 15, 18, 8.3, 17 ms |
+| logits dumps identical to the first device serve | 240 of 240 | 336 of 336 |
+| decode, first run, the two requests before the box got busier | 339, 338 ms/token | 286, 289 ms/token |
+
+Serves of the same mode on that box differed by more than the head costs (the layer launches read 2.2 to
+3.3 ms each in both modes), so the rate is taken inside one serve instead. `NPU_HEAD_HOST=alt` alternates
+host and device head on successive decode tokens and logs each call (`[head-ab] call=… head=host|device
+head_ms=… layers_before_ms=…`). One serve, 100 tokens, load 15, logits again byte-identical to the device
+serve (96 of 96):
+
+| median over 50 tokens each | device head | host head |
+|---|---|---|
+| the head | 76.4 ms | 8.7 ms |
+| the layers of the token that follows it | 309.9 ms | 325.0 ms |
+| head plus following layers | 386 ms (2.6 tok/s) | 334 ms (3.0 tok/s) |
+
+So the host head takes 68 ms off the head and the next token's layers give 15 ms of it back, a net 52 ms
+(13 %) per token on this model. It stays off by default because it changes the profile table's row set (one
+`HEAD` row at M=1 in place of the M=16 launches), and `scripts/npu-window11.sh --compare` requires the two
+binaries it compares to print the same rows. The layers are the other four fifths of a token and are untouched.
+
 ### The t2s stream (what the XDNA decode kernel reads)
 
 t2 is the container format: the decoder's byte order, for any consumer. The device does not want that
@@ -884,6 +922,25 @@ forward route, which reads the block from `config.json`: `rope_type: "llama3"`
 (Llama-3.1/3.2/3.3) and LongRoPE's `short_factor` (MiniCPM4). The same refusal covers a
 declared-but-unusable `llama3` block, and every other declared type, at `1bit serve` /
 `forward-serve` load time rather than at request time.
+
+**Hunyuan (`hunyuan_v1_dense`) differs from the other q/k-norm families in four places: three in
+the forward, which reads them from the model rather than from a family list where it can, and one in
+the importer**
+([engine#1889](https://github.com/1bit-MONSTER/engine/issues/1889)). Each was measured against
+`Hunyuan-7B-Instruct`'s own pack:
+
+| what | rule | where it comes from |
+|---|---|---|
+| whether q and k are normalised | `use_qk_norm` in `config.json` decides when the config states it; the `qwen3*`/`gemma*` table answers only for configs that do not | the config key. The table has no Hunyuan row, so its gains were loaded and never applied |
+| the RoPE base | `rope_scaling: {type: "dynamic", alpha: A}` is a **fixed** base `theta * A^(dim/(dim-2))` at every position (11,158,840 for theta 10000, alpha 1000, dim 128). Without `alpha` the block is the position-dependent NTK rule | the graph's `cos_cache`/`sin_cache` in `model.onnx.data` match that base to 0.00024; plain theta 10000 is off by up to 1.99. `1bit npu-pack import` tests this base against the pack's cache first and prints `note: RoPE base ... verified`; before, it warned that no plain theta explained the cache |
+| the order of norm and RoPE | RoPE first, then the per-head RMSNorm (Qwen3 and Gemma normalise first) | the graph: `q_proj -> RotaryEmbedding -> q_norm -> GroupQueryAttention` in every layer |
+| the order of the attention tiles in the pack (importer) | q tiles first, then k, then v. Every other family's block is k, q, v. `1bit npu-pack import` picks the order with the block shape that carries the packed q/k gains | measured: with k, q, v the imported model predicts 26 of 77 next tokens of a fixed text, with q, k, v 59 (the two projections were being read as each other) |
+
+A model whose config says q and k are normalised and whose container has no
+`self_attn.q_norm.weight` is refused at load: the gain would read as zeros and zero every head's q.
+That is the shape of a Hunyuan container imported before the importer carried the gains, so the
+answer is to re-import it. A Hunyuan container imported before the tile order was right has
+the gains and still answers filler words; re-import that one too.
 
 | GGUF type | To q4_1 | Error |
 |---|---|---|
@@ -1475,6 +1532,28 @@ the decode, the tiling against `tests/golden/oga_pack_tiles.bin` — written by
 the attention tile against `tests/golden/oga_attn_tile.bin`, and, against a real pack, the refusal
 list, the tile round trip, the self-check numbers and that the container opens with `npu::Model`.
 
+### The tied-head self-check
+
+On a tied pack, the pack's own embedding is an independent reference for the decoded 4-bit head. The import compares the two and refuses a head that is scaled or only partly decoded. A pack in that state imports cleanly and answers garbage on the device, so `--allow-incomplete` does not override this refusal. The check has four parts. A head passes when all of them hold:
+
+- **correlation** above 0.99;
+- **best-fit scale** within 5 % of 1. This is the least-squares `a` in `embedding ≈ a · head`, so a scaled copy shows up here directly;
+- **RMS ratio** `rms(head) / rms(embedding)` within 5 % of 1;
+- **relative error** no more than 1.5× the embedding's own **4-bit noise floor**, or 0.02 if that is larger. The floor is what quantizing the embedding at the head's block size (asymmetric 4-bit, min/max per block) costs.
+
+The relative error on its own cannot separate a scaled head from a correct 4-bit head whose embedding is kept at higher precision: both score about 0.09. Measured (engine#1503):
+
+| pack | rel | best-fit scale | RMS ratio | noise floor | result |
+|---|---|---|---|---|---|
+| `Qwen2-1.5B_rai_1.9.0_npu` (block-32 tail head) | 0.094316 | 0.994173 | 1.001808 | 0.083865 | imports; on the NPU (`kernels-1536-2048-b8`, greedy) it answers "The capital of France is Paris." and "12 times 12 is 144." |
+| `SmolLM2-135M` rai_1.7.1 hybrid | 0.103587 | 0.992172 | 1.003540 | 0.097113 | imports |
+| `Qwen2.5-0.5B` rai_1.9.0 | 0.000700 | 0.999993 | 1.000006 | 0.006941 | imports |
+| `gemma-2-2b-awq-…-hybrid` | 0.094874 | 0.992235 | 1.003849 | 0.088985 | head passes, but refused by `model_type` (below) |
+
+A relative error near 0 means the embedding *is* the dequantized head (as on `Qwen-2.5_1.5B_Instruct` 1.9). It does not mean that only such packs are correct. The earlier rule (relative error ≤ 0.02, with nothing else checked) refused the first two packs above.
+
+**`model_type: gemma2` is refused by name.** The two gemma-2-2b hybrid packs answer garbage on this route (`myſelf…`), but their head is a correct 4-bit head, so the cause is somewhere else and has not been found. The import refuses them with that reason, rather than letting them import cleanly.
+
 ### Cross-check against the official converter
 
 ROCm's **FLM_Q4NX_Converter** (`convert.py`) is the official gguf → Q4NX converter, and since
@@ -1851,7 +1930,7 @@ engine#587 measured the route on it):
 | `qwen35` | `FastFlowLM/D3-*-NPU2` (Edge, Flash, Mini, Nano, Lite, Turbo, Ultra), `FastFlowLM/Qwen3.8-27B-NPU2`, `FastFlowLM/Qwen3.5-0.8B-NPU2` | hrx, npu | **served, and measured** (engine#587): the same `Qwen3.8-27B-NPU2` family runs on the NPU route — 0.2902 s/token (3.45 tok/s) and 19.55 tok/s of prefill on the sealed single-ELF ternary rung, 22.811 s to a first token with the weight load in it (`bench/npu-leaderboard/27b-t2s2-*-20261106.json`) — int8 Q4NX decodes at 63.1 s/token and takes 145.7 s to a first token (`bench/npu-leaderboard/27b-*.json`, 2026-10-27), a 5-token prefill chunk is 58.14 s, and the ternary sealed-ELF rung on the same container is 1.72 s/token with 3/3 text-identical output (engine#697, closed by #728). Quality on the same route: **GSM8K 97.5 % (39/40)** with greedy decoding, **6 of the 40 answers cut off by the 512-token budget and exactly 1 of those 6 also wrong** — so among answers that finished, 34/34 were right (`27b-gsm8k-20261107`); and the per-token cost at those answer lengths is 0.3857 s/token against 0.2902 on a 13-token prompt, i.e. it grows ~1.33x with context (`27b-decode-cot-20261107`). What a stock install still needs is a kernel set for the model's geometry — none ships in this repository — so the row read `not served` until the route itself was measured |
 | `dflash` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-DFlash-NPU2` | hrx | not served: a draft head, not a decoder; "The draft loop, and whether to serve it" below covers what the HRX route does with it |
 | `gemma4` | `FastFlowLM/Nemotron-3.5-Bolt-E4B-NPU2`, `FastFlowLM/Gemma4-12B-IT-NPU2` | hrx | not served: no gemma4 model type or kernels in the route |
-| `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx | not served |
+| `hunyuan-dense` | `FastFlowLM/Hy-MT2-1.8B-NPU2` | hrx, npu | **served and measured** on the per-op route ("FastFlowLM's own containers" below) |
 | `gemma3` | `FastFlowLM/medgemma-1.5-4b-it-NPU2` | hrx | not served |
 | `lfm2` | `FastFlowLM/LFM2-2.6B-NPU2`, `FastFlowLM/LFM2-1.2B-NPU2`, `FastFlowLM/LFM2.5-1.2B-NPU2` | hrx, npu | `LFM2.5-1.2B-NPU2` **served and measured** on the per-op route ("FastFlowLM's own containers" below); `LFM2-1.2B-NPU2` serves too (one paired ticket, same section); `LFM2-2.6B-NPU2` was not run |
 | `gpt-oss` | `FastFlowLM/GPT-OSS-20B-NPU2`, `FastFlowLM/GPT-OSS-Safeguard-20b-NPU2` | hrx | not served |
@@ -1863,6 +1942,34 @@ route loads and a captured `--device npu` run stands behind it; the regenerated 
 `npu` in `backends`. Note that the route does serve `qwen3_5_moe` (`Qwen3.6-35B-A3B` through the
 GGUF-on-NPU forward), while every D3-* pack in this body declares the dense `qwen3_5` family, so
 the two are not the same answer and the registry keeps them apart.
+
+The answers are also machine-readable, in `registry/flm_answers.json`, because CI keeps no watcher state: every scheduled
+run sees the whole org as new, and before that file each family answered above printed `!! NPU FLM` again and re-filed
+the census issue the day after it closed (engine#2171; the 2026-11-11 run alerted on 31 packs, every one already
+answered or tracked). A pack whose declared architecture is listed there prints `. NPU FLM` / `. FLM` with the issue
+that tracks it and does not alert; a family with no entry still alerts. The test fails on an entry for a family the
+registry serves on the NPU route, so a family that starts to load drops its answer. Keyed by the architecture each
+pack declares (a config with no `architectures` declares its `model_type`):
+
+| declared architecture | packs on 2026-11-11 | answer | tracked by |
+|---|---|---|---|
+| `MiniCPMV4_7ForConditionalGeneration` | MiniCPM-V-4.7-1B, MiniCPM-V-4.7-35B-A3B | not served: a VLM class the pin does not register | engine#1788 |
+| `MiniCPMOcrForConditionalGeneration` | MiniCPM-OCR-1.0 | not served: an OCR/vision pack; the route claims text decoders only | engine#1786 |
+| `HYV3ForCausalLM` | Hy-Memory-30B-A3B | not served: `hy_v3`, hrx only | engine#1786 |
+| `DFlashDraftModel` | Nemotron-3.5-Bolt-E4B-DFlash | not served: a draft head, not a decoder | engine#1780 |
+| `Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration` | Nemotron-3.5-Bolt-E4B, Gemma4-E4B-IT, Gemma4-E2B-IT, Gemma4-12B-IT | not served: `gemma4`, hrx only | engine#1786 |
+| `HunYuanDenseV1ForCausalLM` | Hy-MT2-1.8B | not served: `hunyuan-dense`, hrx only | engine#1786 |
+| `Gemma3ForCausalLM`, `gemma3_text` | Gemma3-270M, Gemma3-1B, Gemma3-4B, Gemma3-4B-Text, medgemma-4b-it, medgemma-1.5-4b-it, Translategemma-4B-Instruct | not served: `gemma3`, hrx only | engine#1786 |
+| `Lfm2ForCausalLM` | LFM2-1.2B, LFM2-2.6B, LFM2-1.2B-Tool, LFM2-2.6B-Transcript, LFM2.5-1.2B, LFM2.5-1.2B-Thinking | not in the registry's NPU set: `lfm2`, hrx only (LFM2.5-1.2B on the per-op route is engine#2170, which adds no `NPU_ARCHS` entry) | engine#1786 |
+| `GptOssForCausalLM` | GPT-OSS-20B, GPT-OSS-Safeguard-20b | not served: `gpt-oss`, hrx only | engine#1786 |
+| `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B | not served for this class: the route serves `qwen3_5_moe` through `Qwen3_5MoeForCausalLM` (GGUF on the NPU); the VLM wrapper class is hrx only, and FastFlowLM's own pack is not measured on the route | engine#1786 |
+| `Qwen2_5_VLForConditionalGeneration` | Qwen2.5-VL-3B-Instruct | not served: `qwen2vl`, hrx only (the route serves the text-only `qwen2` class) | engine#1786 |
+| `Phi3ForCausalLM` | Phi4-mini-Instruct | not served: `phi3`, hrx only | engine#1786 |
+| `Gemma3TextModel` | Embedding-Gemma-300M | not served: `gemma-embedding`, an embedding model, hrx only | engine#1786 |
+| `WhisperForConditionalGeneration` | Whisper-V3-Turbo | not served: a speech encoder-decoder the registry does not map | engine#1783 |
+
+`FastFlowLM/smolvla-NPU2` is answered by its repo id (`repos` in the same file): it has no config and no `*.q4nx`
+file, so there is no architecture to key on and nothing for the route to load.
 
 ### FastFlowLM's own containers, served as published: measured rows (engine#1786)
 
@@ -1908,6 +2015,7 @@ does on a geometry that has a sealed set: `Qwen3-1.7B-NPU2` is 3.0 tok/s here an
 | `Llama-3.2-3B-NPU2` | `llama` | identical, `Paris.` | 1.7 to 1.8 tok/s |
 | `Phi4-mini-Instruct-NPU2` | `phi3` | identical, `Paris`, once the turn end is read from the template (below) | 1.4 to 1.5 tok/s |
 | `Qwen3-VL-4B-Instruct-NPU2`, text tower only | `qwen3` | identical, `Paris` | 1.4 to 1.5 tok/s |
+| `Hy-MT2-1.8B-NPU2` | `hunyuan_v1_dense` | identical, `Paris`; 4 of 5 translations byte-identical to FastFlowLM's runtime (below) | 2.3 to 2.8 tok/s |
 | `LFM2.5-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | identical, `Paris`; against FastFlowLM's runtime below | 3.5 to 4.6 tok/s |
 | `LFM2-1.2B-NPU2` | `lfm2`, hybrid: 10 conv layers of 16 | `Paris`; one request per prompt, against FastFlowLM's runtime below | 3.7 tok/s |
 
@@ -1971,6 +2079,34 @@ does not carry the three-identical-answers condition.
 `chat_template.jinja`, the reasoning is split out, and at 96 tokens every one of the five replies was still
 reasoning, so there is no answer text to compare and no row; the reasoning differs from FastFlowLM's from its
 first words.
+
+**`Hy-MT2-1.8B-NPU2`: a third tile.** This pack's projections are stored 4,608 bytes to a tile where every
+other pack on the box uses 5,120, and no reader knew the size, so it was refused at the first dequant. The tile is
+256 bf16 scales (index `g*32 + r`) followed by 4,096 code bytes in column order (`c*16 + r/2`, even row in the low
+nibble), and a weight is the two's-complement nibble times its scale: the symmetric reading of the LFM2 packs with
+the zero-point block left out and the codes in the Q4K chunk's order. It was settled the same way, against the
+pack's own bf16 embedding (its `lm_head` is the quantised copy): mean 0.244 of a step, maximum 1.000, and the
+eleven other combinations of scale order, code order and code sign are 3 to 8 steps off. Here the size names the
+kind, so nothing is read off the data. The kernel directory is four shapes that were already built for other
+packs (`QKV K2048 N3072`, `O K2048 N2048`, `GU K2048 N12288`, `D K6144 N2048`); q/k norm and the template
+(`chat_template.jinja`) are read from the pack.
+
+Measured 2026-11-11, same `model.q4nx` (sha256 `a992683e04c2110e…`) for both runtimes, five translation requests
+(into German, French, Spanish, Chinese and English), FastFlowLM 1.0.12's runtime then this route in one ticket:
+
+| this route's code | byte-identical to FastFlowLM's answer |
+|---|---|
+| the tile reader alone, on the semantics `main` had for this family | 1 of 5 |
+| the tile reader with the family's RoPE base and q/k-norm order (engine#1889), which is this change | 4 of 5 |
+
+Reading the tiles made the pack serve; it did not make it this model. `hunyuan_v1_dense` was run at RoPE base 10000
+where the family's `rope_scaling.alpha` of 1000 makes it 10000 x 1000^(128/126), about 1.116e7, at every position,
+and q/k were normalised before RoPE where the family does it after. All five answers were correct translations
+either way, which is why fluency was no evidence: `Das Wetter ist heute schön. Wir werden zum Spazierengehen gehen.`
+on the wrong base, `Das Wetter ist heute schön, und wir gehen spazieren.` on the right one and from FastFlowLM. The
+one request still different is `Me gustaría una taza de café…` here against `Quisiera una taza de café…` there. At
+the same code three requests of the known-answer prompt returned `Paris` three times, and decode was 2.3 to 2.8
+tok/s (32 layers on the per-op route) against FastFlowLM's 50 to 53.
 
 Not established by any row here: that a pack goes through the importer (`npu-pack` still reports these
 containers as recognised, not importable), anything about a vision or audio tower, and any pack whose geometry
@@ -2065,6 +2201,19 @@ interleaved 5-round A/B (`~/lb/587-cache-20261030`) measured an 8-token request 
 On FastFlowLM's Qwen3.5-2B-NPU2 (IM 6144, H 2048, a 151 MB tail that the earlier 256 MB floor left out) an A B B A
 run in one ticket measured decode at 362–367 ms per token with the cache on (both arms) against 485–520 ms with
 it off in the quieter of the two off arms and 478–707 ms in the other, same text in all twelve runs (engine#1785).
+
+The full-attention layers of such a model had the same reload, for their own four buffers: `load_layer()`
+dequantised `q`, `k`, `v` and `o` into `wq_`/`wk_`/`wv_`/`wo_` on every decode token, and the only reader of
+those buffers (`q4nx_assemble_B`) is skipped once the layer's packed QKV and O images are on the device. The
+reload is now skipped when **both** images are resident (the batched path guards its O assemble with the QKV
+key, so a half-cached layer still loads everything) and the run is not `NPU_INFER_HOST_GEMM`.
+`NPU_ATTN_RELOAD=1` keeps the old per-token reload. On Qwen3.5-2B-NPU2 (6 full-attention layers of 24), an
+A B B A run in one ticket with `NPU_PHASE_PROF=1`, 46 decode tokens per arm, medians: `load_layer` 13.0 and
+11.6 ms per token with the reload against 0.04 and 0.03 ms without; the layer loop's host share 23.9 and 22.2
+ms against 10.6 and 11.1 ms; device wait unchanged (240.7 to 247.3 ms in all four). All 144 logits dumps of
+the other three arms are byte-identical to the first arm's, so this removes work and changes no value. The
+whole token moved from 347 and 345 ms to 332 and 341 ms, which on that box (load 20 to 27) is inside the
+spread between two arms of one mode; the host share is the number to read (engine#1785).
 
 ### The prefix cache's snapshot: two kinds of plane
 

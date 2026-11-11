@@ -407,10 +407,16 @@ OnnxModel parse_onnx(const std::string& path) {
             continue;
         }
         if (!w) { kept.push_back(mm); continue; }   // names nothing this graph declares: not this genre's business
+        // Two spellings of the placeholder: 1.9 names it `<w>.empty` beside `<w>.packed`; the 1.8 hybrid line names the
+        // node's own `<w>` as the `[0]` placeholder beside `<w>.packed` (Llama-3.2-1B-Instruct_rai_1.8.0_hybrid: all 162
+        // `.MatMulNBits.*` initializers dims [0] and no data, the weights in model.bin). Missing the second spelling kept
+        // the node as a real weight, so `info` reported every projection importable and `import` died on
+        // `...MatMulNBits.bias: no data` (engine#1503).
         std::string packed = w->name;
         if (packed.size() >= 6 && packed.compare(packed.size() - 6, 6, ".empty") == 0)
             packed.replace(packed.size() - 6, 6, ".packed");
-        else { kept.push_back(mm); continue; }
+        else
+            packed += ".packed";
         const OnnxTensor* pw = find_init(packed);
         // No sibling at all: not this genre's pack. Keep the node exactly as it was -- it still names its `*.empty`
         // initializer and the reader below decides what that means. Dropping it here would be a decision made by an
@@ -3334,6 +3340,65 @@ QkGainOffsets qk_gain_offsets(int64_t gap_start, int64_t head_dim, int64_t gap_b
     return o;
 }
 
+std::string qk_gap_block_why(const uint8_t* gap, int64_t head_dim) {
+    const int64_t per_head = head_dim * 2;
+    for (int b = 0; b < 2; ++b) {
+        const uint8_t* blk = gap + int64_t(b) * (kNormOff + per_head);
+        const char* nm = b == 0 ? "q_norm" : "k_norm";
+        for (int64_t i = 0; i < kNormOff; ++i)
+            if (blk[i])
+                return std::string("the 64 B before ") + nm + " are not zero (byte " + std::to_string(i) + " is " +
+                       std::to_string(int(blk[i])) + "), so this is not the [header][gain] pair";
+        bool any = false;
+        for (int64_t i = 0; i < head_dim; ++i) {
+            const uint16_t v = uint16_t(blk[kNormOff + 2 * i]) | uint16_t(uint16_t(blk[kNormOff + 2 * i + 1]) << 8);
+            if ((v & 0x7F80) == 0x7F80)
+                return std::string(nm) + " element " + std::to_string(i) + " is not finite (bf16 bits " +
+                       std::to_string(int(v)) + "), so these bytes are not a gain";
+            any = any || (v & 0x7FFF) != 0;
+        }
+        if (!any) return std::string(nm) + " is all zero, so these bytes are not a gain";
+    }
+    return std::string();
+}
+
+WideQAttnSection wide_q_attn_section(int64_t attn_off, int64_t payload, int64_t qkv_tiles, int64_t tile_bytes,
+                                     int64_t o_tiles, int64_t o_tile_bytes, int64_t head_dim) {
+    WideQAttnSection s;
+    if (payload <= 0 || qkv_tiles <= 0 || tile_bytes <= 0 || o_tiles <= 0 || o_tile_bytes <= 0) return s;
+    const int64_t qkv_bytes = qkv_tiles * tile_bytes;
+    s.gap = payload - qkv_bytes - o_tiles * o_tile_bytes;
+    // The ceiling is a derived bound, not a measurement: two bf16 [head_dim] gains plus 256 B of headers and padding
+    // (768 at head_dim 128, 512 at 64). Only the offsets below are measured.
+    if (s.gap < 0 || s.gap > int64_t(2) * head_dim * 2 + 256) return s;
+    s.ok = true;
+    s.o_off = attn_off + qkv_bytes + s.gap;
+    // Measured on Hunyuan-0.5B-Instruct_rai_1.9.0_npu against the q_norm/k_norm FP16 initializers of its own model.onnx:
+    // rounded to bf16, q_norm is at block offset 2,508,928 and k_norm 320 B later in 24 of 24 layers, each behind 64
+    // zero bytes -- the same [header][q][header][k] gap as Hunyuan-7B's, at attn_off + 64 tiles.
+    const QkGainOffsets g = qk_gain_offsets(attn_off + qkv_bytes, head_dim, s.gap);
+    s.q_norm = g.q_norm;
+    s.k_norm = g.k_norm;
+    return s;
+}
+
+bool apply_wide_q_section(Plan& p, const WideQAttnSection& wq, int64_t n_kv, int64_t n_q, int q_out, int64_t hidden) {
+    if (int64_t(q_out) == hidden || !wq.ok) return false;
+    p.attn_tiles = n_kv * 2 + n_q;
+    p.o_off = wq.o_off;
+    p.o_k = q_out;
+    // engine#1889: the gap IS the per-head gains when it has their shape; 0,0 otherwise.
+    p.qnorm_off = wq.q_norm;
+    p.knorm_off = wq.k_norm;
+    if (wq.k_norm) p.qk_gap_off = wq.o_off - wq.gap;
+    // The Hunyuan block's first payload is q, k, v here too (see attn_q_first). Measured on Hunyuan-0.5B-Instruct
+    // against the public checkpoint: read as k, q, v, the container's k_proj is q_proj's first 1,024 rows and its q_proj
+    // is q's last 1,024 rows followed by k (per-tensor correlation 0.01 for both in three layers); read as q, k, v all
+    // three correlate above 0.95.
+    if (wq.k_norm) p.attn_q_first = true;
+    return true;
+}
+
 std::string header_witness_refusal(int vote_hdrs, bool declared_qk) {
     if (!declared_qk || vote_hdrs != 1) return std::string();
     return "the epsilon-anchor vote recorded ONE in-block header, and this pack declares use_qk_norm, whose per-head q/k "
@@ -3390,6 +3455,14 @@ ContainerGeometry container_geometry(const json& meta, const json& config) {
 
     g.source = used_dims ? "dims" : (used_cfg ? "config.json" : "");
     return g;
+}
+
+AttnFirstTiles attn_first_tiles(int n_kv, int n_q, bool q_first) {
+    AttnFirstTiles f;
+    f.k = q_first ? n_q : 0;
+    f.q = q_first ? 0 : n_kv;
+    f.v = n_kv + n_q;
+    return f;
 }
 
 int64_t head_stored_rows(int64_t vocab, bool from_fconst_tail) {
@@ -3596,7 +3669,12 @@ Plan plan(const std::string& pack_dir) {
             pack_dir + ": " + onnx.weightless_example +
             ", and the pack carries no Token .fconst either (no dd_metastate_Llm_Token_*.fconst): these weights are "
             "genuinely absent from the pack's external data, so this pack cannot be imported -- not a tile-layout or "
-            "block-size problem");
+            "block-size problem" +
+            // The 1.8 hybrid line keeps them in a `model.bin` beside the graph (1.3 GB on Llama-3.2-1B-Instruct), a
+            // container this importer does not read; saying where they are is what tells a reader which work is missing.
+            std::string(fs::exists(pack_dir + "/model.bin")
+                            ? ". This pack's weights are in its model.bin, which this importer does not read (engine#1503)"
+                            : ""));
     const bool no_fconst = tok_path.empty();
     // The 1.9 external-data genre (phi-4: 201 `MatMulNBitsBf` ops whose bytes are `*.qweight.packed` siblings in
     // `eager-mm.onnx.data`) must NOT ride the graph-weights path below, which was written for the 1.3/1.6/1.7.1 line's
@@ -3767,7 +3845,7 @@ Plan plan(const std::string& pack_dir) {
                 const int64_t n_kv = kv_out / 64, n_q = q_out / 64;
                 auto refuse = [&](const std::string& s) {
                     p.attn_note = s;
-                    p.knorm_off = p.qnorm_off = p.o_off = 0;  // an unread section is not a half-read one
+                    p.knorm_off = p.qnorm_off = p.o_off = p.qk_gap_off = 0;  // an unread section is not a half-read one
                     p.o_k = 0;
                 };
                 if (g.hdr.size() == 1) {
@@ -3810,6 +3888,7 @@ Plan plan(const std::string& pack_dir) {
                                 qk_gain_offsets(attn_off + p.attn_tiles * tile_bytes, int64_t(d.head_dim), rem);
                             p.knorm_off = qkg.k_norm;
                             p.qnorm_off = qkg.q_norm;
+                            if (qkg.k_norm) p.qk_gap_off = attn_off + p.attn_tiles * tile_bytes;
                             static bool said2 = false;
                             if (!said2) {
                                 said2 = true;
@@ -3819,18 +3898,22 @@ Plan plan(const std::string& pack_dir) {
                                              (long long)rem);
                             }
                             handled = true;
+                            // engine#1889: this block's projections are q, k, v -- not the k, q, v every other family
+                            // writes. It cannot be read off the tiles (no biases here to identify the runs, and the
+                            // round trip is byte-exact either way), so it was settled by the answer: Hunyuan-7B on the
+                            // host forward, teacher-forced on "The capital of France is Paris. The capital of Germany is
+                            // Berlin. The capital of Italy is", predicts ' Paris' / ' Berlin' / ' Rome' at the three
+                            // "is" rows with q,k,v and ' the' / ' the' / ' the' with k,q,v. The same family puts q
+                            // before k in its packed gains (engine#1934), which is the same writer's order.
+                            p.attn_q_first = true;
                         }
                     }
                     const int64_t o_tiles_h = H / kTileRows;
-                    const int64_t qkv_bytes_c = int64_t(n_kv * 2 + n_q) * tile_bytes;
-                    const int64_t o_bytes_c = o_tiles_h * tile_o;
-                    const int64_t gap_c = payload - qkv_bytes_c - o_bytes_c;
-                    const int64_t norm_ceiling = int64_t(2) * int64_t(d.head_dim) * 2 + 256;
-                    if (!handled && payload > 0 && q_out != H && o_tiles_h > 0 && gap_c >= 0 && gap_c <= norm_ceiling) {
+                    const WideQAttnSection wq = wide_q_attn_section(attn_off, payload, int64_t(n_kv * 2 + n_q), tile_bytes,
+                                                                    o_tiles_h, tile_o, int64_t(d.head_dim));
+                    const int64_t gap_c = wq.gap;
+                    if (!handled && apply_wide_q_section(p, wq, n_kv, n_q, q_out, H)) {
                         handled = true;
-                        p.attn_tiles = n_kv * 2 + n_q;
-                        p.o_off = attn_off + qkv_bytes_c + gap_c;
-                        p.o_k = int(q_out);
                         // NOT p.attn_note: that field is the refusal channel -- a non-empty value there refuses the
                         // attention biases by name (it means "why this section could not be read"). This is the
                         // opposite: the section WAS read this way. Reported on stderr once instead.
@@ -4520,6 +4603,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             "tile decoder does not apply (engine#1503)");
     Report r;
     r.out_dir = out_dir;
+    r.model_type = p.dims.model_type;
     r.refused = p.refused();
     if (!r.refused.empty() && !opt.allow_incomplete) return r;  // refuse by name, write nothing
 
@@ -5030,24 +5114,15 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                          mm.weight.c_str(), q.N, q.K, mm.block, int(V), int(H), (int)head_geometry);
         if (tied || head_geometry) r.selfcheck_reference = true;
         if (tied || head_geometry) {
-            double sum_abs = 0, sum_ref = 0;
-            for (int n = 0; n < q.N; ++n)
-                for (int k = 0; k < q.K; ++k) {
-                    const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                    const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
-                    double e;
-                    e = embed_at(embed_tbl, int(n), k);
-                    sum_abs += std::fabs(x - e);
-                    sum_ref += std::fabs(e);
-                }
-            r.lmhead_rel = sum_abs / sum_ref;
+            r.head_fit = fit_head(q, embed_tbl, q.N, mm.block);
+            r.lmhead_rel = r.head_fit.rel;
             r.lmhead_corr = corr(q, embed_tbl, q.N);
             // The diagnostic follows the NUMBER, not the pack's declaration: a genre-A pack ships no config.json, so
             // `tied` is false there while the head plainly reproduces its embedding, and the readout used to call those
             // packs untied while the container it wrote said tied. Same threshold the container's own decision uses.
             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
 
-            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
+            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.head_fit);
             const Q4 swap = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K),
                                                mm.block, /*swap_nibbles*/ true, false);
             const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
@@ -5121,22 +5196,12 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                  : " (untied: layout checked, values not verified)");
             if (embed_tbl.ok()) {
                 r.lmhead_corr = c32;
-                {
-                    double sum_abs = 0, sum_ref = 0;
-                    for (int n = 0; n < int(V); ++n)
-                        for (int k = 0; k < q.K; ++k) {
-                            const size_t gg = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                            const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[gg] + q.zero[gg];
-                            const double e = embed_at(embed_tbl, n, k);
-                            sum_abs += std::fabs(x - e);
-                            sum_ref += std::fabs(e);
-                        }
-                    if (sum_ref > 0) r.lmhead_rel = sum_abs / sum_ref;
-                }
+                r.head_fit = fit_head(q, embed_tbl, int(V), 32);
+                r.lmhead_rel = r.head_fit.rel;
                 r.selfcheck_reference = true;
                 r.selfcheck_tied = c32 > kTieCorr;
 
-                r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
+                r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.head_fit);
                 double sxy = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
                 const int nsh = std::min(2048, int(V) - 1);
                 for (int rr = 0; rr < nsh; ++rr)
@@ -5450,22 +5515,13 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                         // q.N may exceed V by the pack's tile padding (Hunyuan-0.5B: 120,832 rows for 120,818),
                         // so the reference is compared over the vocabulary's own rows.
                         if (q.N >= int(V) && q.K == int(H)) {
-                            double sum_abs = 0, sum_ref = 0;
-                            for (int n = 0; n < int(V); ++n)
-                                for (int k = 0; k < q.K; ++k) {
-                                    const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
-                                    const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
-                                    const double e =
-                                        embed_at(embed_tbl, int(n), k);
-                                    sum_abs += std::fabs(x - e);
-                                    sum_ref += std::fabs(e);
-                                }
-                            r.lmhead_rel = sum_abs / sum_ref;
+                            r.head_fit = fit_head(q, embed_tbl, int(V), q.block > 0 ? q.block : 128);
+                            r.lmhead_rel = r.head_fit.rel;
                             r.lmhead_corr = corr(q, embed_tbl, q.N);
                             r.selfcheck_reference = true;
                             r.selfcheck_tied = r.lmhead_corr > kTieCorr;
 
-                            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.lmhead_rel);
+                            r.selfcheck_scaled = r.selfcheck_tied && !selfcheck_head_ok(r.lmhead_corr, r.head_fit);
                             // The control this path can actually run: the same tiles and the same decoder, with each
                             // head row matched against the NEXT embedding row. If a misaligned head still correlated,
                             // the number above would be measuring the vocabulary's mean brightness rather than the
@@ -5588,9 +5644,11 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 // o_proj's K is q_proj's output width).
                 struct Slot { const char* proj; int rows; int64_t base; int k; int first; };
                 const int64_t attn_off = attn_payload_off(H);
-                const Slot slots[] = {{"k_proj", kv_out, attn_off, int(H), 0},
-                                      {"q_proj", q_out, attn_off, int(H), n_kv},
-                                      {"v_proj", kv_out, attn_off, int(H), n_kv + n_q},
+                // engine#1889: k, q, v on every family but the Hunyuan block, which is q, k, v (Plan::attn_q_first).
+                const AttnFirstTiles ft = attn_first_tiles(n_kv, n_q, p.attn_q_first);
+                const Slot slots[] = {{"k_proj", kv_out, attn_off, int(H), ft.k},
+                                      {"q_proj", q_out, attn_off, int(H), ft.q},
+                                      {"v_proj", kv_out, attn_off, int(H), ft.v},
                                       {"o_proj", int(H), p.o_off, p.o_k, 0}};
                 for (int L = 0; L < p.dims.layers; ++L) {
                     const int64_t block = int64_t(L) * g.stride;
@@ -5649,7 +5707,16 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     }
                     // per-head QK norms (Qwen3 and later): plain bf16 [head_dim] gains that the
                     // container already carries for families that have them.
-                    if (p.knorm_off)
+                    // The gap families: the offsets are one number for every layer, so each layer's bytes are checked
+                    // to be the [header][gain] pair before a gain is written; a layer that differs is refused by name.
+                    std::string gap_why;
+                    if (p.qk_gap_off)
+                        gap_why = qk_gap_block_why(
+                            at(fc, block + p.qk_gap_off, 2 * (kNormOff + int64_t(p.dims.head_dim) * 2)),
+                            int64_t(p.dims.head_dim));
+                    if (!gap_why.empty())
+                        late.push_back("model.layers." + std::to_string(L) + ".self_attn.q_norm.weight: " + gap_why);
+                    else if (p.knorm_off)
                         for (const auto& [off, nm] : {std::pair<int64_t, const char*>{p.knorm_off, "k_norm"},
                                                       std::pair<int64_t, const char*>{p.qnorm_off, "q_norm"}}) {
                             const int64_t n = p.dims.head_dim;
@@ -5893,6 +5960,23 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                     }
                     // candidates: what the metadata says first, then the values these families actually use
                     std::vector<double> cands{p.dims.rope_theta, 1e4, 5e4, 1e5, 5e5, 1e6, 1e7, 1.6e6, 3.2e6};
+                    // engine#1889: a `rope_scaling: {type: "dynamic", alpha: A}` block (Hunyuan) is a FIXED base
+                    // theta * A^(dim/(dim-2)), and the forward computes it from the block (q4nx_rope_dynamic_base).
+                    // That base is tried first: on Hunyuan-7B it is 11,158,840 and no plain candidate comes near
+                    // (best 0.7222 at 1e7), so the import warned "no plain theta explains" about a cache the
+                    // model's own config explains. rope_theta is left as declared when this one wins -- writing the
+                    // scaled base there would have the forward apply alpha twice.
+                    double alpha_base = 0.0, alpha = 0.0;
+                    if (c.contains("rope_scaling") && c["rope_scaling"].is_object() &&
+                        c["rope_scaling"].contains("type") && c["rope_scaling"]["type"].is_string() &&
+                        c["rope_scaling"]["type"].get<std::string>() == "dynamic" &&
+                        c["rope_scaling"].contains("alpha") && c["rope_scaling"]["alpha"].is_number()) {
+                        alpha = c["rope_scaling"]["alpha"].get<double>();
+                        const double hd = double(half) * 2.0;
+                        if (alpha > 0.0 && hd > 2.0 && p.dims.rope_theta > 0)
+                            alpha_base = double(p.dims.rope_theta) * std::pow(alpha, hd / (hd - 2.0));
+                    }
+                    if (alpha_base > 0.0) cands.insert(cands.begin(), alpha_base);
                     double best_corr = -2.0, best_theta = p.dims.rope_theta;
                     const int HD2 = int(half) * 2;          // head_dim implied by the cache
                     const int64_t pmax = std::min<int64_t>(rows, 4096);
@@ -5923,7 +6007,21 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                             if (corr == corr && corr > best_corr) { best_corr = corr; best_theta = th; }
                         }
                     }
-                    if (best_corr > 0.99 && std::fabs(best_theta - p.dims.rope_theta) > 1e-9) {
+                    if (best_corr > 0.99 && alpha_base > 0.0 && best_theta == alpha_base) {
+                        std::fprintf(stderr,
+                                     "note: RoPE base %.8g (rope_theta %.6g, rope_scaling alpha %.6g) verified against "
+                                     "the pack's cos_cache (corr %.4f)\n",
+                                     alpha_base, (double)p.dims.rope_theta, alpha, best_corr);
+                        c.erase("q4nx_rope_note");
+                    } else if (best_corr > 0.99 && alpha_base > 0.0) {
+                        // A plain theta fits and the alpha base does not, while the config still carries alpha: the
+                        // forward would scale whatever is written to rope_theta, so nothing is adopted.
+                        std::fprintf(stderr,
+                                     "WARNING: this pack's RoPE caches fit plain theta %.6g (corr %.4f), not the base "
+                                     "%.8g its rope_scaling alpha %.6g implies; this forward applies alpha, so "
+                                     "attention may be wrong from the first token\n",
+                                     best_theta, best_corr, alpha_base, alpha);
+                    } else if (best_corr > 0.99 && std::fabs(best_theta - p.dims.rope_theta) > 1e-9) {
                         std::fprintf(stderr,
                                      "note: rope_theta %.6g declared, %.6g adopted (correlation %.4f against the "
                                      "pack's own cos_cache)\n", (double)p.dims.rope_theta, best_theta, best_corr);
@@ -6067,14 +6165,26 @@ int run(int argc, char** argv) {
     // packs measured: rel_err 0.095 and 0.136 against 0.000000 on the pack that serves). `--allow-incomplete` is not an
     // override here: that flag means "write the tensors I could not represent", and this is "the tensors I wrote do not
     // decode", which no amount of writing fixes.
+    // engine#1503: an architecture this route is measured to answer garbage on, whatever its head scores. The head fit
+    // above stopped refusing gemma-2-2b AWQ (its head is a correct 4-bit head), so the refusal that #2101 made for the
+    // wrong reason is kept here for the right one, by name, until the cause is found.
+    if (const char* why = known_bad_architecture(r.model_type)) {
+        std::fprintf(stderr, "1bit npu-pack: refusing to import %s: model_type %s -- %s. The partial output this run "
+                             "already wrote under %s is not servable -- delete it.\n",
+                     dir.c_str(), r.model_type.c_str(), why, out.c_str());
+        return 3;
+    }
     if (r.selfcheck_scaled) {
         std::fprintf(stderr,
                      "1bit npu-pack: refusing to import %s: the head correlates with the pack's own embedding (%.6f) but "
-                     "its relative error is %.6f, which is a scaled or partially decoded head rather than a rounding "
-                     "difference (the threshold is %.3f). A pack in this state imports cleanly and answers garbage on "
+                     "it is a scaled or partially decoded head rather than a correct 4-bit one: relative error %.6f "
+                     "(allowed %.6f = max(%.3f, %.1f x the embedding's own 4-bit noise floor %.6f)), best-fit scale %.6f "
+                     "and rms ratio %.6f (allowed 1 +- %.2f). A pack in this state imports cleanly and answers garbage on "
                      "the device; --allow-incomplete does not override this. The partial output this run already\n"
                      "wrote under %s is not servable -- delete it before retrying.\n",
-                     dir.c_str(), r.lmhead_corr, r.lmhead_rel, kSelfcheckRelMax, out.c_str());
+                     dir.c_str(), r.lmhead_corr, r.lmhead_rel,
+                     std::max(kSelfcheckRelMax, kHeadFloorFactor * r.head_fit.floor), kSelfcheckRelMax, kHeadFloorFactor,
+                     r.head_fit.floor, r.head_fit.scale, r.head_fit.rms_ratio, kHeadScaleTol, out.c_str());
         return 3;
     }
     if (!r.refused.empty() && !allow) {
@@ -6091,6 +6201,10 @@ int run(int argc, char** argv) {
         std::printf("  self-check: the head reproduces the pack's own embedding (as imported, bf16)  corr %.6f  rel_err %.6f\n"
                     "              (tied: this correlation is the check, and it passed)\n",
                     r.lmhead_corr, r.lmhead_rel);
+        if (r.head_fit.floor > 0)
+            std::printf("  head fit:   best-fit scale %.6f, rms ratio %.6f, embedding's own 4-bit noise floor %.6f "
+                        "(rel_err is %.2fx of it): a 4-bit head, not a scaled one\n",
+                        r.head_fit.scale, r.head_fit.rms_ratio, r.head_fit.floor, r.lmhead_rel / r.head_fit.floor);
         if (r.ctrl_corr_rowshift >= 0)
             std::printf("  controls:   row-shifted corr %.4f (must fail)\n", r.ctrl_corr_rowshift);
         else
@@ -6334,5 +6448,51 @@ void sweep_fconst_scratch_dirs(const std::vector<std::string>& dirs, const std::
 // copy is ambiguous with it at every call site). Correlated AND not a scaled copy of the embedding -- the two states this
 // box measures are rel_err 0.000000 (serves) and 0.095/0.136 (imports cleanly, answers garbage).
 bool selfcheck_head_ok(double corr, double rel) { return corr > kTieCorr && rel <= kSelfcheckRelMax; }
+
+const char* known_bad_architecture(const std::string& model_type) {
+    if (model_type == "gemma2")
+        return "gemma-2-2b hybrid packs import cleanly and answer garbage on this route (`myselfGetBytes...`, two packs, "
+               "measured for #2101), and their head is a correct 4-bit head (best-fit scale 0.992, rel 1.07x its 4-bit "
+               "noise floor), so the fault is elsewhere and not yet found (engine#1503)";
+    return nullptr;
+}
+
+bool selfcheck_head_ok(double corr, const HeadFit& f) {
+    return corr > kTieCorr && std::fabs(f.scale - 1.0) <= kHeadScaleTol && std::fabs(f.rms_ratio - 1.0) <= kHeadScaleTol &&
+           f.rel <= std::max(kSelfcheckRelMax, kHeadFloorFactor * f.floor);
+}
+
+HeadFit fit_head(const Q4& q, const EmbedTable& embed, int rows, int block) {
+    HeadFit f;
+    rows = std::min(rows, q.N);
+    if (block <= 0 || q.K % block) block = 32;
+    double sum_abs = 0, sum_ref = 0, sxe = 0, sxx = 0, see = 0, floor_abs = 0;
+    std::vector<double> e(size_t(q.K));
+    for (int n = 0; n < rows; ++n) {
+        for (int k = 0; k < q.K; ++k) e[size_t(k)] = embed_at(embed, n, k);
+        for (int k = 0; k < q.K; ++k) {
+            const size_t g = size_t(n) * (q.K / 32) + size_t(k) / 32;
+            const double x = double(q.codes[size_t(n) * q.K + k]) * q.scale[g] + q.zero[g];
+            sum_abs += std::fabs(x - e[size_t(k)]);
+            sum_ref += std::fabs(e[size_t(k)]);
+            sxe += x * e[size_t(k)];
+            sxx += x * x;
+            see += e[size_t(k)] * e[size_t(k)];
+        }
+        for (int g0 = 0; g0 < q.K; g0 += block) {
+            double lo = e[size_t(g0)], hi = lo;
+            for (int k = g0; k < g0 + block; ++k) { lo = std::min(lo, e[size_t(k)]); hi = std::max(hi, e[size_t(k)]); }
+            const double sc = (hi - lo) / 15.0;
+            for (int k = g0; k < g0 + block; ++k) {
+                const double c = sc > 0 ? std::min(15.0, std::max(0.0, std::round((e[size_t(k)] - lo) / sc))) : 0.0;
+                floor_abs += std::fabs(c * sc + lo - e[size_t(k)]);
+            }
+        }
+    }
+    if (sum_ref > 0) { f.rel = sum_abs / sum_ref; f.floor = floor_abs / sum_ref; }
+    if (sxx > 0) f.scale = sxe / sxx;
+    if (see > 0) f.rms_ratio = std::sqrt(sxx / see);
+    return f;
+}
 
 }  // namespace onebit::npu::pack_import

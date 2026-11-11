@@ -152,7 +152,12 @@ path untouched.
 
 `scripts/npu-window11.sh` is the gate the plan change was validated with: three fixed greedy prompts plus
 the prof table, compared between a run with the plan and one without. `--compare` refuses to run without
-`--tol PCT` or `--control C1.log C2.log`; `--self-test` checks that policy.
+`--tol PCT` or `--control C1.log C2.log`; `--self-test` checks that policy. The prof rows of the two
+runs must be the same set of (phase, role, M), with one declared exception: a run with the decode lm head on
+the host (`NPU_HEAD_HOST`, [npu.md](npu.md)) prints `dec HEAD M=1` where a device-head run prints
+`dec HEAD M=16`. When that pair is the whole difference the comparison passes, prints both head rows and
+which side each is on, and scores every shared row as usual; any other missing or added row still fails
+(engine#1785).
 
 Tests: `tests/npu_plan_test.cpp` (ctest `npu_plan`) pins the loader and the refusals;
 `tests/npu_plan_generate_test.py` (ctest `npu_plan_generate`) runs the generator and `--check` on a
@@ -189,6 +194,9 @@ layers[0]     {"index": 0, "role": "gdn", "qkv": {"K": 5120, "N": 10240, "fused"
 
 ## Not yet
 
+The tracker (#799) closes with P4 (#803). What follows is the part of the plan that was **not built**, so that closing
+it does not read as "all seven phases shipped": each entry says what landed, what did not, and why.
+
 - **P4** (#803): **A1 landed** in #808 (`0a2cbb9`) — the `NpuTarget` interface (`npu/target/target.h`), the XDNA
   target behind it, and `open()` consuming the plan instead of duplicating the derivation. The step-by-step record is
   [npu-p4-target-split.md](npu-p4-target-split.md) §3, so this list does not snapshot it, but the two ends that touch
@@ -204,9 +212,17 @@ layers[0]     {"index": 0, "role": "gdn", "qkv": {"K": 5120, "N": 10240, "fused"
   ([npu-p4-target-split.md](npu-p4-target-split.md) §4). `XdnaTarget::load_block` remains a named no-op, so weight
   residency and decoding stay as they were — the cache fills lazily inside `gemv`, and turning that into an
   explicit block step is an optimisation whose evidence is a tokens/s row, not a structural move.
-- **P5** (#804): Hexagon target (t2 gemv on HVX/HMX, QEMU v73 oracle) has no engine rows yet.
-- **P6** (#805): the shared drafter protocol is on main; tau=0.6 and Hexagon acceptance rows are still missing.
-- **P7** (#806): the `kv` contract above is in the plan and its arithmetic is gated in CI (`ctest -R npu_kv_int8`,
+- **P5** (#804, closed 2026-11-07 on the scope the owner set: a toolchain check): the t2 GEMV is bit-exact in QEMU
+  v73 on the container's own layer-0 tensors and has a cycle model, and `tests/npu_t2_target_gate.py` (#1272) holds
+  any t2 target to the pinned accumulation order. **Not built:** a Hexagon `NpuTarget` in the engine (`npu/target/`
+  holds `xdna` only, and `--npu-target hexagon` is refused by name), silicon timing of our kernel (no board on the
+  fleet), and the decoder layer composed on the DSP.
+- **P6** (#805, closed 2026-11-07): the shared drafter protocol is on main and measured on XDNA at both gates, 8
+  prompts x 64 tokens, text identical 8/8 — tau 0.6 (the default): hit rate 78.77 %, depth-1 acceptance 78.34 %, 1.83
+  tokens per pass; tau 0: 46.69 %, 75.14 %, 2.87 ([npu-leaderboard.md](npu-leaderboard.md), the `27b-mtp-*` rows).
+  Leaf fill was rejected with a test (`tests/mtp_draft_test.cpp` [16]) rather than built. **Not measured:** acceptance
+  on a second target, because there is no second target (P5).
+- **P7** (#806, closed 2026-11-07 with the refusal in place, the writer not built): the `kv` contract above is in the plan and its arithmetic is gated in CI (`ctest -R npu_kv_int8`,
   which needs no device: see below), and the **target-side refusal** is enforced as well (`npu_target_caps`, so an
   `int8` plan cannot be run as f16 by any target, including P5's Hexagon). Still open, in the order it can be taken:
   the cache **writer/reader** in the

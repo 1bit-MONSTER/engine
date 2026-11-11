@@ -1168,6 +1168,17 @@ load per arm).
 the device leaves **no line at all**. Measured: two arms differing only in one tensor type's format had a **near-identical** registration set (one extra
 line, none missing) while `pp512` differed **5.4x** and `pp8` **8.1x**. So the histogram answers *"which kernel won"*, never *"did something fall back"*.
 
+**The flag gates logging, not arithmetic (engine#2143), so set it in both arms of any A/B.** The two pages that also teach
+this flag carry the same paragraph; this is the copy a reader here needs:
+
+> **Set it in both arms of an A/B, and record box load beside any rate (engine#2143).** #2143 asked whether this
+> flag changes behaviour: one 18,782-token request failed without it and completed with it, and one 18.6k prefill
+> measured 271.75 t/s unset against 118.86 t/s set. At the engine's pin the flag only gates `fprintf` calls
+> (`dispatch_log_match()` and `dispatch_log_requested_output()` in `dispatch-registry.cpp`): the readback check and
+> its decline run in both arms, so the dispatches selected are the same either way. Each of those measurements is
+> one run per arm, #1536 then failed in 4 of 6 runs, and box load moves a rate by about 2x here, so neither shows
+> a flag effect. Setting it in both arms is right whichever way #2143 settles.
+
 Use the right instrument for each question — three are needed and the histogram is only the first:
 
 | question | instrument |

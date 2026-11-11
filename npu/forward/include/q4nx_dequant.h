@@ -90,6 +90,16 @@ extern "C" {
  * the cross-validation against the checkpoint's own `.bf16` twin. */
 #define Q4NX_CHUNK_Q4K 4736
 #define Q4NX_CHUNK_Q8  8704
+/* The symmetric 4-bit chunk with no zero-point block (FastFlowLM lists the pack as "Q4_0"; Hy-MT2-1.8B-NPU2):
+ *   scales [256] bf16 @[0,512)     index g*32 + r (group-major, as in the 5120-byte tile)
+ *   codes  [256][16]  @[512,4608)  byte c*16 + r/2, even row = low nibble (column-major, as in the Q4K chunk)
+ *   value[r][c] = (code >= 8 ? code - 16 : code) * scale[g][r]
+ * Settled by the tie test on that pack (2026-11-11): its lm_head is the quantised copy of its own bf16
+ * embed_tokens, and over the first 1024 rows |dequant - embedding| / |scale| has mean 0.244 and maximum 1.000 with
+ * this reading; the eleven other combinations of scale order, code order and code sign are 3 to 8 steps off.
+ * The size names the kind (no tile of another kind is 4608 bytes), so nothing is inferred from the data. */
+#define Q4NX_CHUNK_Q4S 4608
+void q4nx_dequant_tile_q4s(const uint8_t* chunk, float* out, int ld);
 
 /* Q4_K chunk: 32 rows x 256 K, 4736 B.
  *   scales[8][32] uint8 @[0,256)    index g*32 + r

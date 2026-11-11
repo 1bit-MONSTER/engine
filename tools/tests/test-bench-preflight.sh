@@ -179,7 +179,11 @@ a = sys.argv[1:]
 lm = a[a.index('-lm') + 1] if '-lm' in a else 'mmap'
 model = a[a.index('-m') + 1]
 mode = os.environ.get('FAKE_BENCH_LM') or lm          # a case sets this to make the bench disagree with -lm
+time.sleep(float(os.environ.get('FAKE_BENCH_PRE') or 0))          # a load that takes a while: alive, nothing mapped yet
 handle = keep = None
+if os.environ.get('FAKE_BENCH_MAP_OTHER'):          # some other file of the same NAME is mapped the whole time
+    other = open(os.environ['FAKE_BENCH_MAP_OTHER'], 'rb')
+    keep_other = mmap.mmap(other.fileno(), 0, access=mmap.ACCESS_READ)
 if mode in ('mmap', 'mmap+mlock'):
     handle = open(model, 'rb')
     keep = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
@@ -220,6 +224,51 @@ if grep -q 'is not the measurement the header claims' "$tmp/lastlm"; then
     printf 'ok   %-38s names the mismatch\n' "the refusal names its reason"; pass=$((pass+1))
 else
     printf 'FAIL %-38s missing reason\n%s\n' "the refusal names its reason" "$(cat "$tmp/lastlm")"; fail=$((fail+1))
+fi
+
+# A bench that honours `-lm mmap` but is short must not be refused (the review of #1913 at 7b218e0, 5 of 5 before this):
+# it is alive and unmapped while it loads, then maps, dispatches and exits inside one poll interval, so no sample ever
+# holds the mapping. Absence counts only on samples taken while the bench was dispatching and still running; this run has
+# none, so the answer is the WARN and exit 0, every time.
+short_ok=0
+for try in 1 2 3 4 5; do
+    root=$(fake 3600 0 60)
+    out=$(PREFLIGHT_LM=mmap FAKE_BENCH_PRE=0.35 FAKE_BENCH_SLEEP=0 PREFLIGHT_MODEL=$tmp/models/big.gguf \
+          patched "$root" --dispatch "$tmp/mapbench" 512 2>&1) && short_ok=$((short_ok + 1))
+done
+if [ "$short_ok" -eq 5 ]; then
+    printf 'ok   %-38s 5 of 5 rc=0\n' "a short correct -lm mmap run passes"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s %d of 5 rc=0\n%s\n' "a short correct -lm mmap run passes" "$short_ok" "$out"; fail=$((fail+1))
+fi
+# A bench that is gone before anything could be sampled says so instead of passing silently.
+root=$(fake 3600 0 60)
+out=$(PREFLIGHT_LM=mmap FAKE_BENCH_LM=none FAKE_BENCH_SLEEP=0 PREFLIGHT_MODEL=$tmp/models/big.gguf \
+      patched "$root" --dispatch "$tmp/mapbench" 512 2>&1); rc=$?
+if [ $rc -eq 0 ] && printf '%s' "$out" | grep -q -- '-lm mmap not checked'; then
+    printf 'ok   %-38s rc=0 and WARN\n' "an unobserved run is a WARN"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s rc=%d\n%s\n' "an unobserved run is a WARN" "$rc" "$out"; fail=$((fail+1))
+fi
+# The mapping is matched by the model's resolved path, not its file name. Another directory's big.gguf mapped by a bench
+# that only reads the model is not the model; a model named through a symlink is.
+mkdir -p "$tmp/elsewhere"; cp "$tmp/models/big.gguf" "$tmp/elsewhere/big.gguf"
+root=$(fake 3600 0 60)
+out=$(PREFLIGHT_LM=none FAKE_BENCH_MAP_OTHER=$tmp/elsewhere/big.gguf PREFLIGHT_MODEL=$tmp/models/big.gguf \
+      patched "$root" --dispatch "$tmp/mapbench" 512 2>&1); rc=$?
+if [ $rc -eq 0 ]; then
+    printf 'ok   %-38s rc=0\n' "a same-named file elsewhere is not it"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s rc=%d\n%s\n' "a same-named file elsewhere is not it" "$rc" "$out"; fail=$((fail+1))
+fi
+ln -sf "$tmp/models/big.gguf" "$tmp/models/alias.gguf"
+root=$(fake 3600 0 60)
+out=$(PREFLIGHT_LM=mmap PREFLIGHT_MODEL=$tmp/models/alias.gguf \
+      patched "$root" --dispatch "$tmp/mapbench" 512 2>&1); rc=$?
+if [ $rc -eq 0 ] && ! printf '%s' "$out" | grep -q 'not checked'; then
+    printf 'ok   %-38s rc=0, observed\n' "a symlinked model is seen mapped"; pass=$((pass+1))
+else
+    printf 'FAIL %-38s rc=%d\n%s\n' "a symlinked model is seen mapped" "$rc" "$out"; fail=$((fail+1))
 fi
 
 # The bench runs in the background while the mode is observed, so the preflight has to take it down on every way out

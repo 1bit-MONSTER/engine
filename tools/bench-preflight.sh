@@ -197,11 +197,26 @@ trap 'exit 143' TERM
 # model it only reads is not there, so the run can be checked against the flag instead of trusted to honour it. A bench that
 # ignores `-lm` yields a number the header mislabels, which is the same defect as an unstated mode -- one variable measured,
 # two reported.
-mapped=no; alive=0
+# What counts as seen. A MAPPING is the model's resolved path as a whole pathname in the maps file: a basename would also
+# accept another directory's file of the same name, and would miss a model given through a symlink. An ABSENCE is one sample
+# where the bench was already dispatching before the maps file was read and was still running after it: before the first
+# dispatch the model may simply not be loaded yet, and a read of a process that has gone is a failed read, not an empty one.
+real=$(realpath -- "$model")
+in_maps() {
+    awk -v p="$real" '{ i = index($0, "/"); if (i && substr($0, i) == p) { f = 1; exit } } END { exit !f }' \
+        "/proc/$bench_pid/maps" 2>/dev/null
+}
+running() {
+    kill -0 "$bench_pid" 2>/dev/null && ! grep -q '^State:[[:space:]]*Z' "/proc/$bench_pid/status" 2>/dev/null
+}
+absent_need=3
+mapped=no; absent=0
 while :; do
-    grep -qF -- "$(basename "$model")" "/proc/$bench_pid/maps" 2>/dev/null && { mapped=yes; break; }
-    kill -0 "$bench_pid" 2>/dev/null || break
-    alive=$((alive + 1))
+    dispatching=no
+    grep -q 'ggml_hrx dispatch:' "$log" 2>/dev/null && dispatching=yes
+    in_maps && { mapped=yes; break; }
+    running || break
+    [ "$dispatching" = yes ] && absent=$((absent + 1))
     sleep 0.1
 done
 bench_rc=0
@@ -211,18 +226,21 @@ bench_pid=
 [ "$bench_rc" -eq 0 ] || fatal "the bench exited $bench_rc; see $log"
 # Only the modes whose mapping is unambiguous are asserted: `mmap`/`mmap+mlock` map, `none`/`dio` do not, and `mlock` alone is
 # not asserted because whether it maps depends on the loader -- a gate that guessed would fail a correct run. An OBSERVED
-# mapping is trusted on its own; an ABSENT one is only trusted when the process was seen alive after the sample, since a
-# bench that maps and exits between polls would otherwise be reported as a mismatch.
-if [ "$mapped" = no ] && [ "$alive" -eq 0 ]; then
-    printf '  WARN the bench finished before the load mode could be observed; -lm %s not checked\n' "$lm"
-else
-    case "$lm:$mapped" in
-        mmap:no|mmap+mlock:no)
-            fatal "the load mode is -lm $lm but the model is not in /proc/$bench_was/maps; the run is not the measurement the header claims (engine #1668)" ;;
-        none:yes|dio:yes)
-            fatal "the load mode is -lm $lm but the model IS in /proc/$bench_was/maps; the run is not the measurement the header claims (engine #1668)" ;;
-    esac
-fi
+# mapping is trusted on its own. An absent one is trusted only after $absent_need samples of the kind described above, because
+# a bench that maps, runs and exits between two polls leaves no mapping to see and has still honoured `-lm mmap`: refusing it
+# would refuse a correct run. Anything short of that is said as a WARN and the tally goes ahead, unchecked and labelled so.
+verdict=unseen
+[ "$mapped" = yes ] && verdict=mapped
+[ "$mapped" = no ] && [ "$absent" -ge "$absent_need" ] && verdict=absent
+case "$lm:$verdict" in
+    mmap:absent|mmap+mlock:absent)
+        fatal "the load mode is -lm $lm but the model is not in /proc/$bench_was/maps; the run is not the measurement the header claims (engine #1668)" ;;
+    none:mapped|dio:mapped)
+        fatal "the load mode is -lm $lm but the model IS in /proc/$bench_was/maps; the run is not the measurement the header claims (engine #1668)" ;;
+    mlock:*) ;;
+    *:unseen)
+        printf '  WARN the bench finished before the load mode could be observed; -lm %s not checked\n' "$lm" ;;
+esac
 
 lines=$(grep -c 'ggml_hrx dispatch:' "$log" || true)
 # A silent bench is the failure this flag exists to catch: an empty tally looks like "nothing declined"

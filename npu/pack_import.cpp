@@ -3321,8 +3321,16 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
     static const Rule kRules[] = {
         {"embed",         "embed_tokens"},   {"embed",         "tok_embeddings"}, {"embed",  "word_embeddings"},
         {"lm_head",       "lm_head"},        {"lm_head",       "output.weight"},
-        {"qkv_proj",      "qkv_proj"},       {"qkv_proj",      "attn_qkv"},       {"qkv_proj", "in_proj"},
+        // engine#2097 review: `in_proj` alone is not attention -- LFM2's `shortconv.in_proj` is the short-convolution
+        // input projection and was counted as `qkv_proj` on a real pack. It has its own field in model.h
+        // (`shortconv_in_proj_weight`), so it gets its own role; the attention needle now requires `attn`.
+        {"shortconv_in_proj", "shortconv.in_proj"},
+        {"qkv_proj",      "qkv_proj"},       {"qkv_proj",      "attn_qkv"},       {"qkv_proj", "attn.in_proj"},
         {"gate_up_proj",  "gate_up_proj"},   {"gate_up_proj",  "ffn_gate_up"},
+        // engine#2097 review: `attn_q` is a PREFIX of `attn_q_norm`, so with the projection rules first the two
+        // `*_norm` needles could never fire and every `attn_q_norm` was filed as `q_proj`. Norms come first.
+        {"q_norm",        "q_norm"},         {"q_norm",        "attn_q_norm"},
+        {"k_norm",        "k_norm"},         {"k_norm",        "attn_k_norm"},
         {"q_proj",        "q_proj"},         {"q_proj",        "attn_q"},         {"q_proj", "wq."},
         {"k_proj",        "k_proj"},         {"k_proj",        "attn_k"},         {"k_proj", "wk."},
         {"v_proj",        "v_proj"},         {"v_proj",        "attn_v"},         {"v_proj", "wv."},
@@ -3332,8 +3340,6 @@ ContainerRoles container_roles(const std::vector<Q4nxTensor>& tensors) {
         {"down_proj",     "down_proj"},      {"down_proj",     "ffn_down"},
         {"input_norm",    "input_layernorm"},{"input_norm",    "attn_norm"},      {"input_norm", "attention_norm"},
         {"post_norm",     "post_attention_layernorm"},          {"post_norm",    "ffn_norm"},
-        {"q_norm",        "q_norm"},         {"q_norm",        "attn_q_norm"},
-        {"k_norm",        "k_norm"},         {"k_norm",        "attn_k_norm"},
         {"final_norm",    "final_layernorm"},
     };
     // Recognised but not transformer roles: kept out of `unassigned` so that list means "nothing knows this", which is

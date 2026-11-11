@@ -145,6 +145,19 @@ A line whose decision was cached still carries the state it was cached under, so
 same decisions serve made. A decision whose `state_len` exceeds `len(state)` must be dropped or re-sent with a
 shorter prompt: `--eval` would otherwise classify a prefix the demo never sent.
 
+**The head itself: `tools/laya_head_finetune.py` (engine#1313 item 3).** `--dump-encoder` writes the encoder state and
+`--eval` scores a classifier; this takes the dump and fits the classifier, so "before/after routing accuracy" has both
+halves on the same cases, encoder and class order:
+
+```sh
+1bit route --laya-models table.json --laya-model DIR --dump-encoder cases.jsonl --out dump/
+tools/laya_head_finetune.py dump/ --holdout 0.5     # before (the table's logits) vs after (a ridge head), held out
+```
+
+The split is by **case and stratified by label**, not by index: a decision log is written in arrival order and a demo's
+arrival order is class-contiguous, so an index split holds out a class rather than a sample of each. `--holdout 0` fits
+and scores on everything and reports `in-sample`, because a number is not a gate until you know which it is.
+
 `--eval` prints accuracy, per-class support, recall and precision, the confusion matrix (rows true, columns
 chosen), serve's mean confidence, the mean top probability, ECE (10 equal bins over the top probability), log
 loss and the decision time p50 and p90. Size-gated cases are counted (`gated`), since serve would gate them too.

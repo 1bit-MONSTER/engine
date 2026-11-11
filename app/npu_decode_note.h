@@ -31,16 +31,33 @@
 
 namespace onebit::npu {
 
-// decode_roles: roles that got an M=16 decode kernel. design_roles: roles the model has. kernels_dir: what the operator
-// pointed at, echoed so the message can be acted on without reading the rest of the log.
-inline std::string decode_family_note(int decode_roles, int design_roles, const std::string& kernels_dir) {
-    if (design_roles <= 0) return {};          // no roles: not this issue's fault, and no number to quote
-    if (decode_roles >= design_roles) return {};   // the fast route: say nothing
-    char buf[512];
+// decode_roles: roles that got an M=16 decode kernel. design_roles: roles the model has (0 on the host-GEMM arm, which loads
+// no decode family). kernels_dir: what the operator pointed at, echoed so the message can be acted on without reading the
+// rest of the log. disabled: NPU_DECODE_M16=0 turned the family off, so nothing is missing. image: a ternary (pb16i/t2s)
+// container, whose loader refuses a missing decode kernel; the roles it leaves on M=128 are ones its geometry or the split
+// designs cover (named per role in the load log), so for it only 0 of N is this issue.
+//
+// The way out names the fused route, not the _m16 designs: measured on Qwen3-0.6B (#2102), the per-op forward with all four
+// twins decodes at ~2.7 tok/s against ~1.7 without them and 88-101 on the fused route, so the twins are not the demo rate.
+inline std::string decode_family_note(int decode_roles, int design_roles, const std::string& kernels_dir,
+                                      bool disabled = false, bool image = false) {
+    if (design_roles <= 0) return {};          // no roles (or the host arm): not this issue's fault, and no number to quote
+    const char* dir = kernels_dir.empty() ? "(no kernel directory)" : kernels_dir.c_str();
+    char buf[640];
+    if (disabled) {
+        std::snprintf(buf, sizeof buf,
+                      "npu: NPU_DECODE_M16=0 turned the 16-row decode family off -- decode runs prefill-width launches on all %d "
+                      "role(s) (engine#2102). Unset it to use the decode kernels in %s.",
+                      design_roles, dir);
+        return std::string(buf);
+    }
+    if (decode_roles >= design_roles) return {};   // a full decode family: say nothing
+    if (image && decode_roles > 0) return {};      // a ternary family's M=128 roles are its geometry's, already named
     std::snprintf(buf, sizeof buf,
-                  "npu: %d of %d role(s) have a 16-row decode kernel in %s -- decode runs prefill-width launches and will be "
-                  "far slower than the fused route (engine#2102). Ship the full_i8_*_m16 designs, or expect the many-call path.",
-                  decode_roles, design_roles, kernels_dir.empty() ? "(no kernel directory)" : kernels_dir.c_str());
+                  "npu: %d of %d role(s) have a 16-row decode kernel in %s -- decode runs prefill-width launches and is far "
+                  "slower than the fused route (engine#2102). The _m16 designs help only part of the way; the demo rate is the "
+                  "fused route's (docs/npu.md, plan.json: decode.dirs).",
+                  decode_roles, design_roles, dir);
     return std::string(buf);
 }
 

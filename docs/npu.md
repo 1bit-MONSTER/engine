@@ -90,6 +90,25 @@ The schema, the refusal rules and the generator flags are in [npu-plan.md](npu-p
 | `kernels.tag` (`""`/`_b8`/`_pb16i`/`_t2s`) | the artifact family came from `q4nx_weight_layout`, so a kernel dir of the other family changed which kernels ran |
 | `decode.dirs` | the M=16 twins were looked for in `<model>/kernels-m16`, then `<kernels>/m16`, then `<kernels>` |
 
+**A decode off the 16-row family is said at ready (engine #2102).** forward-serve prints one line after `ready on
+http://...` when roles have no M=16 decode kernel. In that case every decode step runs a 128-row prefill launch:
+
+```
+npu: 0 of 4 role(s) have a 16-row decode kernel in <kernels> -- decode runs prefill-width launches and is far slower than the fused route (engine#2102). ...
+```
+
+The load line `[forward] decode family: N role(s) at M=16, ...` stays byte-for-byte, because gates grep it. The new line
+is silent when:
+
+- the family is full;
+- the arm is host-GEMM (`NPU_INFER_HOST_GEMM`, which loads no family);
+- the container is ternary (pb16i/t2s) with some roles on M=128. Its loader refuses a missing decode kernel, and the
+  roles it leaves are covered by its geometry, which the load log names per role.
+
+`NPU_DECODE_M16=0` gets its own sentence, which names the switch. The twins are not the way to the demo rate. Measured on
+Qwen3-0.6B, the per-op forward decodes at ~1.7 tok/s without them and ~2.7 tok/s with all four, against 88-101 tok/s on
+the fused route.
+
 `tools/npu_plan.py <model dir>` writes one from `config.json` plus the kernel directory (it derives layer
 roles from `layer_types` and projection shapes from the model's own dimensions, the way the forward does).
 `--check` re-generates and diffs against the file on disk, so a stale plan is a gate failure rather than a

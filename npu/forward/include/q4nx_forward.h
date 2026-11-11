@@ -102,7 +102,10 @@ public:
     // then runs prefill-width launches. The values are recorded where the family is opened (open_decode_family_local), not
     // inferred later, because the derived designs are not kept per role.
     int decode_roles() const { return decode_roles_; }
-    int design_roles() const { return ndesigns_; }
+    // The host-GEMM arm loads no decode family, so it reports no roles rather than "0 of N" (engine#2102).
+    int design_roles() const { return host_gemm_ ? 0 : ndesigns_; }
+    bool decode_disabled() const { return decode_disabled_; }   // NPU_DECODE_M16=0
+    bool decode_image() const { return pb16i_; }                // a ternary (pb16i/t2s) container's decode family
     const char* last_error() const { return err_.c_str(); }
 
     // Clear the KV cache (start a new sequence).
@@ -339,6 +342,7 @@ private:
     // kernels for fused gate/up, five when gate and up are split.
     Q4nxDesignGeom designs_[Q4NX_MAX_DESIGNS];
     int ndesigns_ = 0;
+    bool decode_disabled_ = false;   // engine#2102: NPU_DECODE_M16=0 turned the family off
     int decode_roles_ = 0;   // engine#2102: roles with an M=16 decode kernel, as open_decode_family_local() found them
     // M=16 decode twins of the same roles (empty/skipped where no ELF or no legal geometry).  The geometry
     // stays here because the model needs it (max_batch_rows, the layer loop's row count); the contexts

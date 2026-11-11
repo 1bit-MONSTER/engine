@@ -207,6 +207,11 @@ target_include_directories(npu_decode_note_test PRIVATE app)
 add_test(NAME npu_decode_note COMMAND npu_decode_note_test)
 add_dependencies(onebit npu_decode_note_test)
 add_test(NAME bump_hrx_report COMMAND bash ${CMAKE_SOURCE_DIR}/tests/bump_hrx_report_test.sh ${CMAKE_SOURCE_DIR}/scripts/bump-hrx-report.sh)
+# engine#1931 (first slice): the Whisper front-end's four f32 host kernels -- conv1d with stride/pad, layer norm with the
+# biased variance, the exact erf-GELU, and a row softmax. Header-only and device-free, so it runs wherever CI builds.
+add_executable(audio_ops_test tests/audio_ops_test.cpp)
+target_include_directories(audio_ops_test PRIVATE npu/forward/include)
+add_test(NAME audio_ops COMMAND audio_ops_test)
 add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 # serve --print-backend: the llama-server Lemonade starts itself, one hop (docs/serve.md): no GPU.
 add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $<TARGET_FILE:onebit>)

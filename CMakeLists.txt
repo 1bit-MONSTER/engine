@@ -460,6 +460,9 @@ add_test(NAME think_split COMMAND think_split_test)
 add_executable(think_template_test tests/think_template_test.cpp)
 target_include_directories(think_template_test PRIVATE app)
 add_test(NAME think_template COMMAND think_template_test)
+# ci.yml's build list is not ours to edit without `workflow` scope, so the test reaches CI as a build dependency of a
+# target it already builds (tools/ci/ci_targets_check.py follows this edge).
+add_dependencies(onebit think_template_test)
 # Host / Origin checks every engine HTTP server applies (app/http_guard.h); header only, runs in CI.
 # engine#1779 (F10 fault 2): the degenerate-repetition predicate at the context limit. Header only, no device.
 add_executable(serve_degenerate_test tests/serve_degenerate_test.cpp)

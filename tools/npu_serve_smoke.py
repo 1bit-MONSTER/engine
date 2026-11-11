@@ -225,6 +225,8 @@ def self_test():
     expect("one degenerate reply", judge(fast_log, good[:2] + [reply("//////", 90.0)]), dict(all_ok, content=False))
     # the rate is the median: one slow reply of three does not fail it, two do
     expect("one slow reply of three", judge(fast_log, [good[0], good[1], reply("391", 20.0)]), all_ok)
+    # ... and it IS the median: (70, 70, 1.9) has a mean of 47, under the floor, and still passes
+    expect("the median, not the mean", judge(fast_log, [reply("a b", 70.0), reply("c d", 70.0), reply("391", 1.9)]), all_ok)
     expect("two slow replies of three", judge(fast_log, [good[0], reply("x y", 20.0), reply("391", 20.0)]), dict(all_ok, rate=False))
     # just under and at the floor
     expect("just under the floor", judge(fast_log, [reply("a b", 59.9)] * 3), dict(all_ok, rate=False))
@@ -245,7 +247,7 @@ def self_test():
 
     for f in fails:
         print("FAIL " + f)
-    print("npu_serve_smoke self-test: %d case(s) failed" % len(fails) if fails else "npu_serve_smoke self-test: 15 cases ok")
+    print("npu_serve_smoke self-test: %d case(s) failed" % len(fails) if fails else "npu_serve_smoke self-test: 16 cases ok")
     return 1 if fails else 0
 
 

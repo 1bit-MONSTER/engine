@@ -222,6 +222,12 @@ struct Plan {
     int64_t container_payload_bytes = 0;
     std::map<std::string, int64_t> container_dtypes;
     std::string container_note;   // what the container genre still needs, empty for a non-container pack
+    // engine#1786 (item F1), slice 2: WHERE the container's geometry came from, and what it could not reach.
+    // A bare number in `dims` cannot say whether the pack declared it or a file beside it did, and those two are free to
+    // disagree (13 of the 29 packs measured carry a `dims` block; all 29 carry config.json). Empty for a non-container pack.
+    std::string container_geometry_source;          // "dims", "config.json", or empty when neither answered
+    std::vector<std::string> container_geometry_missing;   // fields no source could fill, by name
+    std::vector<std::string> container_geometry_inferred;  // fields derived from another field, by name
     int64_t graph_matmuls = -1;      // MatMulNBits nodes in the main graph
     int64_t graph_real_weights = 0;  // of those, how many point at an initializer with dims (i.e. real weights)
     int64_t graph_external = 0;      // initializers that declare external data (location + offset)
@@ -322,6 +328,16 @@ Plan plan(const std::string& pack_dir);
 // out of canonical_token_fconst() so the decision has a test that needs no 1.9 pack: a truncated copy, a missing file
 // and a directory on the scratch path must all come back false.
 bool canonical_copy_reusable(const std::string& work, int64_t expected_len);
+
+// engine#1985: how the canonical copy reaches `work`. It is written under canonical_copy_temp_name(work) -- a private name
+// in the same directory -- and renamed into place, so a concurrent import of the same pack finds no copy or a complete one,
+// never one that is being written. Writing in place let a second import truncate the file the first was about to read.
+// Throws std::runtime_error when the copy cannot be written or moved; the temporary file is removed on either failure.
+// Exposed so the rule has an arm that needs no pack (threads writing one path while a reader checks every complete-length
+// file it finds), and so the temporary name's two properties are pinned: a pack's sweep prefix never matches it, and the
+// age rule does.
+std::string canonical_copy_temp_name(const std::string& work);
+void write_canonical_copy(const std::string& work, const uint8_t* data, size_t len);
 
 // Removes the canonical Token .fconst copies in `dir` that nothing will reuse (engine#1770). Reuse writes a new copy when the
 // source changes rather than overwriting, so without this the scratch directory grows one multi-hundred-MB file per change; on

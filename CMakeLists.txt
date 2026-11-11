@@ -356,6 +356,8 @@ add_python_test(hf_tensor_self ${CMAKE_SOURCE_DIR}/tools/hf_tensor.py --self-tes
 add_python_test(moe_placement ${CMAKE_SOURCE_DIR}/tools/moe_placement.py --self-test)
 # engine#856: one HRX process's GTT split into the loader's copy and HRX's packed second copy, from its own -v log.
 add_python_test(hrx_gtt_split_self ${CMAKE_SOURCE_DIR}/tools/hrx_gtt_split.py --self-test)
+# engine#679: time per HRX dispatch from the backend's serial trace (the id hash and the per-kernel sums).
+add_python_test(hrx_dispatch_profile_self ${CMAKE_SOURCE_DIR}/tools/hrx_dispatch_profile.py --self-test)
 # engine #1279: the version a package is built with (scripts/pack-version.sh) -- a release tag as
 # it stands, a candidate mapped into the ISO week of its own date with a suffix that sorts below that
 # release, and the ordering a candidate needs: previous release < candidate < its release. The
@@ -431,6 +433,13 @@ add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 # engine#1781: the comparator behind NPU_BATCH_CHECK -- pure arithmetic over two float arrays, so it runs with no model,
 # no device and no runtime. It is a header, so the test includes it directly and needs no link libraries.
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
+# The shape rule for a 1.8 external-data initializer (npu/pack_initializer_shape.h, engine#1503's graph-initializer
+# reader). Those packs zero every `dims`, so a byte length has to become a shape -- and a shape inferred wrongly imports
+# cleanly and serves garbage, so the refusals are the arms worth pinning. Header-only, no parser, no pack, no device.
+add_executable(pack_initializer_shape_test tests/pack_initializer_shape_test.cpp)
+target_include_directories(pack_initializer_shape_test PRIVATE npu)
+add_test(NAME pack_initializer_shape COMMAND pack_initializer_shape_test)
+add_dependencies(onebit pack_initializer_shape_test)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 # The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):

@@ -538,6 +538,35 @@ second pair is not quoted as a speedup. `NPU_DEQ_LDEXP=2` runs both forms and co
 `tests/npu_pb16i_layout_test.cpp` holds the two forms to the same bits for one and two planes, the edges
 of the exponent range and exponents outside it. The `[bl]` line names the term as `deq`.
 
+**A sealed set may carry a wide family for prefill (#1990).** The served sealed sets are built for 16
+rows per launch, so a prefill chunk is 16 rows and a 536-token prompt is 34 blocks of 416 launches. A pack
+may name a second sealed ELF with the same instances built for more rows: `q4nx_t2s_sealed_wide_elf` (or
+`q4nx_pb16i_sealed_wide_elf`) in `config.json`, a file in the kernels directory beside the 16-row one, and
+`q4nx_sealed_wide_rows` for its row count (default 32, allowed 17..128). No pack ships one yet, so nothing
+changes for an existing pack. `NPU_WIDE_SEALED_ELF=<file>` overrides the pack's file, `NPU_WIDE_SEALED_ELF=0`
+switches a pack's wide family off, and `NPU_WIDE_ROWS` overrides the row count.
+
+When the wide ELF loads for every role that has a 16-row kernel, the chunk width becomes its row count and a
+launch of more than 16 rows takes the wide kernel; decode steps and chunks of up to 16 rows stay on the
+16-row family. It is all roles or none: the chunk width is one number for the pass, so a set missing one
+role is not adopted. A named file that is missing or does not load never stops the serve: the log says why
+(`[forward] wide family NOT adopted (...)`) and chunks stay at 16 rows. The weight images are shared, only
+the activation and result buffers differ. A launch that carries more rows than its kernel holds is refused
+by name. The rules (`wide_family_complete`, `chunk_rows`, `wide_takes`, `wide_elf_path` in
+`npu/forward/include/batch_width.h`) are pinned without a device by `tests/npu_pack_test.cpp`.
+
+Measured on `bonsai2-27b-t2s2` with a 32-row set, one `npu-hold` ticket per row of the table, one binary,
+arms off / on / off / on, three 510-536-token prompts per arm (`prompt_tokens / wall`, `max_tokens 1`):
+
+| how the wide set was named | first token, wide off | first token, wide on | 16-row block median | 32-row block median |
+|---|---|---|---|---|
+| `NPU_WIDE_SEALED_ELF` | 28.3-29.8, 30.5-30.8 tok/s | **35.6-35.9, 35.0-35.4 tok/s** | 534.2, 509.3 ms | 871.0, 881.5 ms |
+| the pack's `config.json` key | 28.7-28.9, 28.7-29.0 tok/s | **33.9-34.2, 34.2-34.4 tok/s** | 541.2, 541.4 ms | 914.0, 908.3 ms |
+
+Two 16-row blocks against one 32-row block is 30-31 rows/s against 35-37. The 8-token greedy text is
+identical with the family off and on, and `NPU_BATCH_CHECK=1` on the wide path reports MATCH on every chunk
+it checks (32-, 4- and 1-row) in both tickets. Only 32 rows has been measured.
+
 **A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
 a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
 family shipped as eight per-role `_t2s2_m16` ELFs paid **+2.0-2.3 ms on every launch, in every role** — more
@@ -1134,6 +1163,15 @@ one candidate that is never swept unless the copy is being written there: it is 
 working directory's files are not the importer's to clean. The 6 hours are what keep a concurrent run's copy alive in a
 shared directory, so the number stays above the longest import; it is not the knob for disk or tmpfs pressure. The test suite sets one per run and
 removes it at exit.
+
+The cache directory is shared: every import of the same pack on the box uses the same file name. The copy is therefore
+written under a temporary name beside it (`1bit-fconst19tmp-<pid>-<n>-<name>`) and renamed into place, so an import finds
+either no copy or a complete one (engine#1985). Before that the copy was written in place, and two imports of one pack
+started a fraction of a second apart could leave the first reading a file the second had just truncated. The result was a
+wrong layout reading with exit 0: `Qwen3-1.7B` reported 280 refused tensors, `qk_norm` false and 0 measured tiles in 4 of
+24 runs of three imports 0.15 s apart, and 0 of 144 with the rename. A temporary file left by a killed run is removed by
+the 6-hour rule above. A binary older than this change still writes in place, so a box where old and new binaries import
+the same pack at the same moment can still show it.
 
 ### Linking the kernel set the container will be served with
 
@@ -1798,10 +1836,12 @@ The slot table (`app/npu_prefix_cache.h`) has a slot kind for the part such requ
 | call | what it decides |
 |---|---|
 | `pin_point(prev, ids)` | how many leading tokens this request shares with the previous one. 0 when one prompt is a prefix of the other (a repeat or a continued conversation, which the ordinary slots already keep), when the shared part adds fewer than `--prefix-min-gain` tokens over a slot that already covers the request, or when the cache is off |
+| `pin_at(ids, n)` | the same decision for a point the caller already knows: `n` leading tokens every such request shares. 0 when `n` is the whole prompt, when a slot already covers it, or when it is under `--prefix-min-gain` |
 | `pin(prefix, bytes)` | keep the state at that point. One pinned slot at a time: a new pin replaces it; eviction for room and a longer prompt's replacement both leave it alone |
 | `lookup(ids)` | unchanged, and reports `pinned` when the hit is the pinned slot |
 
-It reads token ids only, so it does not depend on the template or on which message is the system prompt.
+The table itself reads token ids only, so it does not depend on the template. Where the pin goes is the caller's
+choice between two rules, below.
 
 **`--prefix-pin`** (on `1bit serve --device npu` and on `forward-serve`; off by default) turns it on. The
 forward keeps the previous request's prompt ids, and when `pin_point()` is non-zero it stops the prefill one
@@ -1825,6 +1865,27 @@ The generated text of all four requests is identical between the cache-off arm a
 The default-cache arm's times are not in the table: the ticket ended during its third request, so only its
 three cache decisions (from the server log) are known. A request's time here is the whole HTTP call, prefill
 plus 16 generated tokens, not TTFT.
+
+**Pinned on the first request (engine#1785).** That run needed two requests to find the shared part, so the
+third was the first warm one, and when two questions opened with the same words the pin ran a few tokens into the
+question, which a question opening differently could not use. A chat request with a leading system message now
+gives the point directly: the route renders the leading system messages followed by a probe user message (the
+container's template, or ChatML) and pins where the full prompt stops agreeing with that, on the first request
+(`pin_at`). The probe user message is there because a template may refuse to render a system turn alone (the
+Qwen3.5 template does); if a template cannot render even that, the request has no early pin and the log says so
+(`[prefix] no early pin: …`). Only a request with no
+system message still uses the comparison with the previous request (`pin_point`). On FastFlowLM's
+`Qwen3.5-2B-NPU2` container under `--flash`, a 1,016-token prompt, time to first token (two server loads):
+
+| request | before | after |
+|---|---|---|
+| first question | 8.8 s | 10.6 / 11.1 s (busier box; makes the pin: 1,003 tokens) |
+| **second question** | 9.1–9.5 s (made the pin: 1,009 tokens) | **1.39 / 1.38 s** (1,002 of 1,017 cached) |
+| third question | 1.06 s | 1.40 / 1.35 s |
+
+The "before" column was taken with two other changes that make decode about a third faster on this model, the
+"after" column without them and at twice the box load, so compare the rows' shape (which request is the first warm
+one), not the third row's two figures.
 
 **`--flash`** (`1bit serve --device npu --flash`) is the single-turn profile as one word: `--ctx-size 1024`
 plus `--prefix-pin`. It refuses what contradicts it (`--ctx-size` other than 1024, `--prefix-slots 0`, a device

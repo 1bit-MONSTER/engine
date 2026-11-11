@@ -311,6 +311,16 @@ with open(os.path.join(ROOT, "docs", "arch-gaps.md")) as f:
 check("reviewed non-alias classes are documented",
       all(cls in gap_docs for cls in reviewed_gaps)
       and "not an alias" in gap_docs)
+# engine#2014 review: the list above is hand-written and names three classes, so it keeps covering those three
+# while the file it is about grows (37 entries today) -- a fourth, fifth and thirty-seventh class can be added
+# with no row in docs/arch-gaps.md and this file stays green. significant.json's own `about` says its classes
+# are documented there, so derive the list from the file: a missing row then fails here instead of resting on
+# three names that nobody will remember to extend. The floor stops the loop passing vacuously if the file were
+# ever loaded empty -- a check that iterates nothing must not report success.
+undocumented = sorted(cls for cls in sig if cls not in gap_docs)
+check(f"every one of the {len(sig)} reviewed classes is cited in docs/arch-gaps.md"
+      + (f" -- missing: {', '.join(undocumented)}" if undocumented else ""),
+      len(sig) >= 30 and not undocumented)
 
 # 14. A reviewed class marked `"watch": "report"` is listed but does not alert (engine#381).
 check("GrugMoeForCausalLM is reviewed as report-only",

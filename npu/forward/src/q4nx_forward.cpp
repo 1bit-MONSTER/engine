@@ -187,7 +187,7 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
     const size_t n = (size_t)(rows / Q4NX_TILE_ROWS) * (size_t)(cols / Q4NX_TILE_COLS);
     if (n == 0) return -1;
     const int cb = (int)(nbytes / n);
-    if (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8)
+    if (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8 || cb == Q4NX_CHUNK_Q4S)
         return q4nx_dequant_tensor_chunked((const uint8_t*)data, nbytes, rows, cols, cb, out);
     // The container may store this weight on a wider grid than the model's dimensions (engine#1097).
     // Read it on the container's grid and write only the model's [rows, cols], so buffers, row

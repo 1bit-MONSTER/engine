@@ -24,6 +24,7 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include "batch_width.h"
 #include "ffn_cache_policy.h"
 #include "q4nx_state_planes.h"   // the plane-copy half of a snapshot, device-free and unit-tested
 #include "model/op_dispatch.h"   // the optional-op fallback seam (engine#803 A3)
@@ -526,6 +527,7 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
                 continue;
             }
             elf = dir + "/" + pb16i_sealed_;
+            sealed_dir_ = dir;
             kname = inst;
             if (!file_exists(elf)) {
                 err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
@@ -596,6 +598,52 @@ bool Q4nxNpuForward::open_decode_family_local(bool want_m16, xrt::device* dev, c
     fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
             made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
             want_m16 ? "" : " (NPU_DECODE_M16=0: disabled)");
+    // engine#1990: a wide prefill family for a sealed pb16i/t2s set: a second sealed ELF carrying the same
+    // instances built for more rows per launch (default 32), so a chunk of more than 16 rows runs one launch per
+    // role instead of two. The pack names it (config `q4nx_<layout>_sealed_wide_elf`, rows in
+    // `q4nx_sealed_wide_rows`); NPU_WIDE_SEALED_ELF overrides the file ("0" = off) and NPU_WIDE_ROWS the rows.
+    // All roles or none -- max_batch_rows() is the chunk width, so one role without a wide kernel would be
+    // launched past its buffers. A named file that is missing or does not load is logged and the pass stays at
+    // 16 rows: a pack must never stop serving over an optional speed-up.
+    const std::string wide_path =
+        onebit::npu::wide_elf_path(getenv("NPU_WIDE_SEALED_ELF"), wide_sealed_, sealed_dir_);
+    if (const char* wide_elf = wide_path.c_str();
+        !wide_path.empty() && pb16i_ && !pb16i_sealed_.empty() && made > 0) {
+        const char* wr = getenv("NPU_WIDE_ROWS");
+        const int rows = wr && *wr ? atoi(wr) : wide_sealed_rows_;
+        int wide = 0;
+        std::string why;
+        if (rows <= Q4NX_DESIGN_M_DECODE || rows > Q4NX_DESIGN_M_PREFILL) why = "NPU_WIDE_ROWS must be 17..128";
+        else if (!file_exists(wide_elf)) why = std::string("no such file: ") + wide_elf;
+        for (int i = 0; why.empty() && i < ndesigns_; i++) {
+            I8Ctx* c16 = xd_->ctx16(i);
+            if (!c16) continue;
+            const char* inst = pb16i_instance(designs16_[i].role);
+            I8Ctx* cw = inst ? xd_->make_ctx_wide(i) : nullptr;
+            if (!cw) { why = std::string("no wide context for role ") + role_tag(designs16_[i].role); break; }
+            cw->MD = rows;
+            cw->KD = c16->KD;
+            cw->ND = c16->ND;
+            cw->blocked_b = c16->blocked_b;
+            cw->pb16i = c16->pb16i;
+            cw->t2s = c16->t2s;
+            cw->pb16i_planes = c16->pb16i_planes;
+            if (!cw->init_elf(*dev, wide_elf, rows, c16->KD, c16->ND, 1, inst)) {
+                why = std::string("init_elf failed for instance ") + inst;
+                break;
+            }
+            wide++;
+        }
+        if (why.empty() && wide > 0 && !xd_->adopt_wide(rows)) why = "a role with a decode context has no wide one";
+        if (why.empty() && wide > 0) {
+            fprintf(stderr, "  [forward] wide family: %d role(s) at M=%d from %s (chunks of 17..%d rows)\n",
+                    wide, rows, wide_elf, rows);
+        } else {
+            xd_->drop_wide();
+            fprintf(stderr, "  [forward] wide family NOT adopted (%s); chunks stay at %d rows\n",
+                    why.empty() ? "no role has a decode context" : why.c_str(), Q4NX_DESIGN_M_DECODE);
+        }
+    }
     return true;
 }
 
@@ -687,6 +735,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             // pb16i ELF (which would read 4,608-B tiles out of 2,176-B images).
             pb16i_sealed_ = read_config_string(
                 cfg_path, t2s_ ? "\"q4nx_t2s_sealed_elf\"" : "\"q4nx_pb16i_sealed_elf\"", "");
+            // engine#1990: an optional second sealed ELF, the same instances built for more rows per launch.
+            wide_sealed_ = read_config_string(
+                cfg_path, t2s_ ? "\"q4nx_t2s_sealed_wide_elf\"" : "\"q4nx_pb16i_sealed_wide_elf\"", "");
+            wide_sealed_rows_ = q4nx_config_int(cfg_path.c_str(), "q4nx_sealed_wide_rows", 32);
             // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
             // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
             // read in the stored (rotated) basis against un-rotated activations.

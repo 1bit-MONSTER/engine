@@ -1374,6 +1374,12 @@ add_executable(ffn_cache_policy_test tests/ffn_cache_policy_test.cpp)
 target_include_directories(ffn_cache_policy_test PRIVATE npu/forward/include)
 add_test(NAME ffn_cache_policy COMMAND ffn_cache_policy_test)
 add_dependencies(onebit ffn_cache_policy_test)
+# LFM2's gated short convolution as host arithmetic (npu/forward/include/lfm2_shortconv.h, engine#1786): the batched
+# form must equal the token-by-token form bit for bit. Header-only, no model, no device.
+add_executable(lfm2_shortconv_test tests/lfm2_shortconv_test.cpp)
+target_include_directories(lfm2_shortconv_test PRIVATE npu/forward/include)
+add_test(NAME lfm2_shortconv COMMAND lfm2_shortconv_test)
+add_dependencies(onebit lfm2_shortconv_test)
 
 # The device weight layout contract (q4nx_weight_layout): pure index math, no device
 # and no runtime.  CI builds an explicit target list, so the check compiles itself with

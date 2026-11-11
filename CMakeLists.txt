@@ -431,6 +431,13 @@ add_test(NAME serve_watchdog COMMAND serve_watchdog_test)
 # engine#1781: the comparator behind NPU_BATCH_CHECK -- pure arithmetic over two float arrays, so it runs with no model,
 # no device and no runtime. It is a header, so the test includes it directly and needs no link libraries.
 add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
+# The shape rule for a 1.8 external-data initializer (npu/pack_initializer_shape.h, engine#1503's graph-initializer
+# reader). Those packs zero every `dims`, so a byte length has to become a shape -- and a shape inferred wrongly imports
+# cleanly and serves garbage, so the refusals are the arms worth pinning. Header-only, no parser, no pack, no device.
+add_executable(pack_initializer_shape_test tests/pack_initializer_shape_test.cpp)
+target_include_directories(pack_initializer_shape_test PRIVATE npu)
+add_test(NAME pack_initializer_shape COMMAND pack_initializer_shape_test)
+add_dependencies(onebit pack_initializer_shape_test)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 # The NPU route's bounded load retry (app/npu_load_retry.h, engine #1010, docs/npu.md "When a load follows an evict"):

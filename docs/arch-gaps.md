@@ -1093,7 +1093,17 @@ the single undocumented entry out of 37.
   16 KV, IM 4096). **Not an alias of `deepseek_v41`**: nothing at the pin decodes AW-SECD weights, so mapping it to
   that architecture would name a backend that cannot read the file. Reported, not alerted (`"watch": "report"`).
 
-<<<<<<< HEAD
+## 2026-11-11: `OpensciForCausalLM` — reviewed remote code (engine#2171)
+
+* `OpensciForCausalLM` (`model_type` `opensci`, 121 models in the 2026-11-11 census) — the open-sci reference models
+  (for example `open-sci/open-sci-1.7b-nemotron-cc-1T-oh-dcft`: hidden 2048, 24 layers, 32 heads / 32 KV,
+  `qk_layernorm`, vocab 50304). **Published as remote code**: `config.json` carries an `auto_map` to its own
+  `configuration_opensci.OpensciConfig` and `modeling_opensci.OpensciForCausalLM`, so no pinned backend accepts the
+  class without that code. **Not an alias** of any supported family. Reported, not alerted (`"watch": "report"`).
+  The other spelling, `OpenSciForCausalLM` (7 models, same `model_type` and the same `auto_map`), is a separate exact
+  key: `census_watch.py` matches architecture classes exactly, so that spelling needs its own entry and is not covered
+  by this one.
+
 ## FLM 1.0.12's build on the box: one family root with nothing, three that are already somewhere (engine#1787)
 
 F9 of `TNPU-ALL` §9 asks for a row for *every family FastFlowLM's build serves and we do not*. The build is on the box,
@@ -1135,15 +1145,3 @@ went from listed to settled that way.
 
 The `!! NPU FLM` class above is where the owed rows belong. Its owning issue is engine#1786 (every `*-NPU2` source
 serves), which is open.
-=======
-## 2026-11-11: `OpensciForCausalLM` — reviewed remote code (engine#2171)
-
-* `OpensciForCausalLM` (`model_type` `opensci`, 121 models in the 2026-11-11 census) — the open-sci reference models
-  (for example `open-sci/open-sci-1.7b-nemotron-cc-1T-oh-dcft`: hidden 2048, 24 layers, 32 heads / 32 KV,
-  `qk_layernorm`, vocab 50304). **Published as remote code**: `config.json` carries an `auto_map` to its own
-  `configuration_opensci.OpensciConfig` and `modeling_opensci.OpensciForCausalLM`, so no pinned backend accepts the
-  class without that code. **Not an alias** of any supported family. Reported, not alerted (`"watch": "report"`).
-  The other spelling, `OpenSciForCausalLM` (7 models, same `model_type` and the same `auto_map`), is a separate exact
-  key: `census_watch.py` matches architecture classes exactly, so that spelling needs its own entry and is not covered
-  by this one.
->>>>>>> origin/main

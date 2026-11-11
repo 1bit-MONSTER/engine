@@ -2065,6 +2065,11 @@ one), not the third row's two figures.
 plus `--prefix-pin`. It refuses what contradicts it (`--ctx-size` other than 1024, `--prefix-slots 0`, a device
 other than `npu`) instead of quietly winning or losing.
 
+The pin obeys `--prefix-min-gain` like every other slot (128 tokens by default): a system turn shorter than
+that is not pinned, under `--flash` too, and each request prefills it again. That is the cache's policy, not
+something `--flash` changes, so to pin a short system turn give the threshold with the profile, for example
+`--flash --prefix-min-gain 32` for a 40-token one. A lower threshold also lets shorter whole prompts take a slot.
+
 `--ctx-size N` now reaches this route. Before engine#1785's flash slice, `serve --ctx-size N` on a
 model-generic container was accepted and dropped at the hand-off to `forward-serve`, which kept the model's
 own `max_position_embeddings` (so the run in the table above was passed `--ctx-size 1024` and it had no effect;

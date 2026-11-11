@@ -5807,6 +5807,26 @@ static void selfcheck_head_rule_arms() {
               std::fabs(good.rel - good.floor) < 1e-6 && pi::selfcheck_head_ok(0.999, good),
           "fit_head: a correct 4-bit head reads scale ~1, rel == its floor, and passes (scale " +
               std::to_string(good.scale) + " rel " + std::to_string(good.rel) + " floor " + std::to_string(good.floor) + ")");
+    // The floor follows the head's block (the block-128 tail head passes 128): the same table quantised at block 128
+    // must read rel == its block-128 floor, which is LARGER than the block-32 floor of the same table.
+    pi::Q4 q128 = q;
+    for (int n = 0; n < N; ++n)
+        for (int g = 0; g < K / 128; ++g) {
+            float lo = 1e30f, hi = -1e30f;
+            for (int k = 0; k < 128; ++k) { lo = std::min(lo, ef[size_t(n) * K + g * 128 + k]); hi = std::max(hi, ef[size_t(n) * K + g * 128 + k]); }
+            const float sc = (hi - lo) / 15.f;
+            for (int j = 0; j < 4; ++j) {   // a 128-block's scale and zero apply to its four 32-column groups
+                q128.scale[size_t(n) * (K / 32) + g * 4 + j] = sc;
+                q128.zero[size_t(n) * (K / 32) + g * 4 + j] = lo;
+            }
+            for (int k = 0; k < 128; ++k)
+                q128.codes[size_t(n) * K + g * 128 + k] =
+                    uint8_t(std::min(15.0, std::max(0.0, std::round((double(ef[size_t(n) * K + g * 128 + k]) - lo) / sc))));
+        }
+    const pi::HeadFit f128 = pi::fit_head(q128, et, N, 128);
+    check(std::fabs(f128.rel - f128.floor) < 1e-6 && f128.floor > good.floor && pi::selfcheck_head_ok(0.999, f128),
+          "fit_head: at block 128 the floor is the block-128 one (rel " + std::to_string(f128.rel) + " == floor " +
+              std::to_string(f128.floor) + " > block-32 floor " + std::to_string(good.floor) + ")");
     pi::Q4 half = q;
     for (auto& v : half.scale) v *= 0.5f;
     for (auto& v : half.zero) v *= 0.5f;
@@ -5819,7 +5839,7 @@ static void selfcheck_head_rule_arms() {
     check(pi::known_bad_architecture("qwen2") == nullptr && pi::known_bad_architecture("llama") == nullptr &&
               pi::known_bad_architecture("") == nullptr,
           "known-bad: nothing else is on the list");
-    std::printf("  head fit rule: 14 arms (two measured heads, scaled/rms/noisy/no-corr controls, fit_head on a known head, gemma2 by name)\n");
+    std::printf("  head fit rule: 15 arms (two measured heads, scaled/rms/noisy/no-corr controls, fit_head at blocks 32 and 128, gemma2 by name)\n");
 }
 
 int main(int argc, char** argv) {

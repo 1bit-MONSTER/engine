@@ -112,6 +112,49 @@ int main(void) {
     check(q4nx_block_note(0, 16, 128)[0] == '\0' && q4nx_block_note(10, 16, 128)[0] == '\0',
           "a batch inside the block, or an empty one, prints nothing");
 
+    /* engine#1788: per-head q/k norm, decided by the container when the name does not decide it. The config is the
+     * published MiniCPM-V 4.7 1B pack's: model_type minicpmv4_7 around a qwen3_5 text model whose full-attention
+     * layers (3, 7, 11, ...) ship q_norm and k_norm. */
+    {
+        const char* path = "npu_rmsnorm_offset_test.config.json";
+        const unsigned char full[8] = {0, 0, 0, 1, 0, 0, 0, 1};   /* layers 3 and 7 carry the tensor */
+        const unsigned char none[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        Q4nxSemantics sem;
+        FILE* f = fopen(path, "w");
+        if (f) {
+            fputs("{\"model_type\": \"minicpmv4_7\", \"architectures\": [\"MiniCPMV4_7ForConditionalGeneration\"], "
+                  "\"hidden_size\": 1024, \"num_hidden_layers\": 8, \"hidden_act\": \"silu\"}", f);
+            fclose(f);
+        }
+        check(f && q4nx_semantics_from_config(path, ".", &sem) == 0 && sem.qk_norm == 0,
+              "minicpmv4_7: the name alone says no q/k norm (the gap)");
+        check(q4nx_semantics_qk_norm_from_tensors(&sem, full, full, 8) == 3 && sem.qk_norm == 1,
+              "... and a layer carrying q_norm and k_norm turns it on, naming layer 3");
+        check(q4nx_semantics_qk_norm_from_tensors(&sem, full, full, 8) == -1 && sem.qk_norm == 1,
+              "already on: nothing changes and no layer is named");
+        sem.qk_norm = 0;
+        check(q4nx_semantics_qk_norm_from_tensors(&sem, none, none, 8) == -1 && sem.qk_norm == 0,
+              "no layer carries the tensors: it stays off (llama, phi)");
+        check(q4nx_semantics_qk_norm_from_tensors(&sem, full, none, 8) == -1 && sem.qk_norm == 0,
+              "q_norm without k_norm is not the pair: it stays off");
+        check(q4nx_semantics_qk_norm_from_tensors(&sem, none, full, 8) == -1 && sem.qk_norm == 0,
+              "k_norm without q_norm is not the pair either");
+        check(q4nx_semantics_qk_norm_from_tensors(&sem, full, full, 3) == -1 && sem.qk_norm == 0,
+              "only the layers that exist are read (3 layers: the pair at layer 3 is out of range)");
+        check(q4nx_semantics_qk_norm_from_tensors(&sem, NULL, full, 8) == -1 && q4nx_semantics_qk_norm_from_tensors(NULL, full, full, 8) == -1 &&
+                  q4nx_semantics_qk_norm_from_tensors(&sem, full, full, 0) == -1,
+              "null or empty input changes nothing");
+        f = fopen(path, "w");
+        if (f) {
+            fputs("{\"model_type\": \"qwen3_5\", \"hidden_size\": 1024, \"num_hidden_layers\": 8}", f);
+            fclose(f);
+        }
+        check(f && q4nx_semantics_from_config(path, ".", &sem) == 0 && sem.qk_norm == 1 &&
+                  q4nx_semantics_qk_norm_from_tensors(&sem, none, none, 8) == -1 && sem.qk_norm == 1,
+              "qwen3_5: on by name, and absent tensors never turn it off");
+        remove(path);
+    }
+
     printf(failures ? "npu_rmsnorm_offset: %d FAILED\n" : "npu_rmsnorm_offset: ok\n", failures);
     return failures ? 1 : 0;
 }

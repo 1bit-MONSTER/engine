@@ -41,11 +41,24 @@ usage: hrx_f16_narrowing.py --check [--root .]     rc 1 on drift, rc 77 without 
 """
 import argparse
 import pathlib
+import re
 import sys
 
 CORPUS = pathlib.Path("third_party/llama.cpp/ggml/src/ggml-hrx/kernel-corpus/kernels")
 BASELINE = pathlib.Path("tools/ci/hrx_f16_narrowing.txt")
-NARROW = ("f32 to f16", "truncf")
+# The narrowing this lists is the *type pair*, not the opcode spelling: the corpus writes the scalar form as
+# `%x = scalar.fptrunc %y : f32 to f16` and the vector form as
+# `%h = vector.fptrunc %v : vector<4xf32> to vector<4xf16>`, and a substring test on `f32 to f16` saw only the first
+# (engine#2219). Measured at the pin 2b7960bae: 233 `fptrunc` lines, 101 scalar and 132 vector, over 27 more bodies than
+# the old rule reached.
+#
+# The bare `truncf` alternative it used to carry is GONE, and that is a correction rather than a simplification: it
+# matched `loom-libs/motifs/unary_f32_apply.loom`, whose narrowing spells out `scalar.truncf %value : f32` and
+# `vector.truncf %values : vector<4xf32>` and names no f16 type at all -- a truncation *within* f32, listed as a
+# narrowing to f16 for as long as the ratchet has existed. No body in this corpus spells an f16 narrowing as a
+# `truncf` that these two patterns miss (checked), so dropping it removes exactly that line and nothing else: 25 -> 51,
+# with the 52nd body in the old count being the one that was never narrowing to f16.
+NARROW = (re.compile(r"f32 to f16"), re.compile(r"vector<\d+xf32> to vector<\d+xf16>"))
 GUARD = ("scale_log2", "prescale")
 
 
@@ -59,7 +72,7 @@ def narrowing_bodies(corpus):
     found = set()
     for path in corpus.rglob("*.loom"):
         body = path.read_text(encoding="utf-8", errors="replace")
-        if any(marker in body for marker in NARROW):
+        if any(m.search(body) if hasattr(m, "search") else m in body for m in NARROW):
             found.add(path.relative_to(corpus).as_posix())
     return found
 
@@ -144,6 +157,16 @@ def self_test():
         new, stale = drift(baseline_paths((root / BASELINE).read_text()), narrowing_bodies(corpus))
         check_that(stale == ["a.loom"],
                    "a rename leaves a stale baseline line (the engine#1728 lesson)")
+        # engine#2219: the vector form narrows too, and a truncation that stays inside f32 does not.
+        (corpus / "v.loom").write_text("  %h = vector.fptrunc %v : vector<4xf32> to vector<4xf16>\n")
+        check_that(narrowing_bodies(corpus) >= {"v.loom"}, "the vector form is a narrowing (it was invisible before #2219)")
+        (corpus / "t.loom").write_text(
+            "  %a = scalar.truncf %value : f32\n  %b = vector.truncf %values : vector<4xf32>\n")
+        check_that("t.loom" not in narrowing_bodies(corpus),
+                   "a truncf that names no f16 type is NOT a narrowing (the body the old `truncf` alternative listed)")
+        check_that("v.loom" in narrowing_bodies(corpus) and "t.loom" not in narrowing_bodies(corpus),
+                   "... and the two are decided by the type pair, not by which opcode is spelled")
+        (corpus / "v.loom").unlink(); (corpus / "t.loom").unlink()
         (corpus / "renamed.loom").write_text("  %x = scalar.fptrunc %y : f32 to f16  # scale_log2\n")
         check_that(guarded({"renamed.loom"}, corpus) == {"renamed.loom"},
                    "a guard marker is reported, not denied")

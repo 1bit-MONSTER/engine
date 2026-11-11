@@ -26,7 +26,13 @@ bad() { printf 'FAIL %s\n' "$1"; fail=1; }
 
 sed -n '/^preflight_submodules() {$/,/^}$/p' "$root/scripts/weekly.sh" > "$tmp/fn.sh"
 grep -q 'submodule_pin_check.py exit' "$tmp/fn.sh" || { bad "could not cut preflight_submodules() out of scripts/weekly.sh"; echo "weekly_submodule_preflight: FAIL"; exit 1; }
-grep -q 'preflight_submodules "' "$root/scripts/weekly.sh" || bad "scripts/weekly.sh's preflight no longer calls preflight_submodules"
+# WHERE the call is, not merely that it exists: this gate was a silent no-op once because it lived in preflight(), which runs
+# before `checkout` creates $SRC -- the file was not there to run, the function returned 0, and a green run meant nothing. A
+# "present anywhere in weekly.sh" assertion passes in exactly that state, so pin the function it belongs to.
+sed -n '/^build() {$/,/^}$/p' "$root/scripts/weekly.sh" > "$tmp/build_fn.sh"
+sed -n '/^preflight() {$/,/^}$/p' "$root/scripts/weekly.sh" > "$tmp/preflight_fn.sh"
+grep -q 'preflight_submodules "' "$tmp/build_fn.sh" || bad "scripts/weekly.sh's build() no longer runs the submodule gate (a call elsewhere is the no-op this test exists for)"
+if grep -q 'preflight_submodules "' "$tmp/preflight_fn.sh"; then bad "the submodule gate is inside preflight(), which runs before \$SRC exists: it would inspect nothing and report success"; else ok "the submodule gate is in build(), where \$SRC exists"; fi
 say() { echo "$*"; }
 # shellcheck disable=SC1091
 . "$tmp/fn.sh"

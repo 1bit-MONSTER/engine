@@ -68,6 +68,14 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
   npu/                   the model's NPU kernels
 ```
 
+The NPU route reads `tokenizer.json` with its own reader (`npu/tokenizer.cpp`). Four vocabulary shapes are handled:
+byte-level BPE; SentencePiece pieces with no merges; SentencePiece pieces with merges and a normalizer that prepends
+the word-boundary symbol (Phi-3.5); and BPE with merges whose normalizer only rewrites spaces to that symbol and
+prepends none (the Gemma family, engine#2215). The last one is encoded by rank over the whole run with no prefix, and
+the symbol decodes back to a space. Before that shape was recognised a Gemma4 prompt encoded to 31 ids where the
+reference library gives 21, and replies kept the raw symbols. With `-DONEBIT_GEMMA_TOKENIZER=<tokenizer.json>` ctest
+`tokenizer_gemma4` holds the reader to the 17 reference cases kept for that file (2 of 17 before, 17 of 17 now).
+
 **What ends an answer.** The serve stops on every id in `config.json`'s `eos_token_id` (one integer or a list), on
 `<|endoftext|>` when the tokenizer has it, on `tokenizer_config.json`'s `eos_token` when that file is beside the
 tokenizer, and on the marker the chat route's prompts close an assistant turn with: `<|im_end|>` on the ChatML

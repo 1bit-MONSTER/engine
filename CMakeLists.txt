@@ -322,6 +322,11 @@ add_python_test(logits_kld_self ${CMAKE_SOURCE_DIR}/tools/logits_kld.py --self-t
 # baseline records a test as never-run, which for a passing test is the wrong outcome -- so it is registered and the line
 # is removed, which is the shrink the baseline's own comment asks for.
 add_python_test(moe_expert_chunks_accum_test ${CMAKE_SOURCE_DIR}/tests/moe_expert_chunks_accum_test.py)
+# engine#2018: the last baseline entry. The file recorded it as "needs the benchmark harness", but the test stubs
+# llama-bench (stdlib only: hashlib/importlib.util/json/pathlib/platform/sys) and passes on a plain interpreter, so it is a
+# test with no runner rather than a test that cannot run here. Registered, and the baseline is now empty: from here the
+# sweep is zero-tolerance instead of a record of known gaps.
+add_python_test(hyperloom_benchmark_test ${CMAKE_SOURCE_DIR}/tests/hyperloom_benchmark_test.py)
 # engine#1820: the other half of ci_targets_check -- a standalone shell test that nothing references cannot fail.
 # `need` is every tests/*.sh, `have` is every file that mentions its basename somewhere that can run it, and
 # tools/ci/unreferenced_tests.txt carries the deliberate exclusions WITH their reasons, so the list can shrink.

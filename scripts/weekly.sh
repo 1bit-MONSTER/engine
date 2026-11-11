@@ -706,7 +706,10 @@ preflight() {
                     say "preflight: no actions.runner.* units on this host: systemd has nothing to inspect"
                 else
                     printf '%s\n' "$health_out" | sed 's/^/preflight: /'
-                    echo "preflight: a runner unit is not accepting jobs (scripts/ci-runner-health.sh): $health_rc"
+                    # Two kinds of FAIL reach here (engine#1504): a unit that is down NOW, and since #2082 a unit that is up
+                    # but whose restart policy would leave it down after the next OOM kill. The FAIL lines above say which;
+                    # this line must not claim "not accepting jobs" for the second, where every runner is active/running.
+                    echo "preflight: a runner unit is down, or its restart policy would leave it down after the next OOM kill (scripts/ci-runner-health.sh exit $health_rc; the FAIL lines above say which, and scripts/install-ci-runner.sh fixes a policy line)"
                     bad=1
                 fi
             fi

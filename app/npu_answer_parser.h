@@ -273,6 +273,11 @@ private:
             mode_ = Mode::content;
             return;
         }
+        if (fam_ == AnswerFamily::qwen3 && close_function_call()) {
+            call_text_.clear();
+            mode_ = Mode::content;
+            return;
+        }
         try {
             const nlohmann::json j = nlohmann::json::parse(call_text_);
             ToolCall c;
@@ -365,6 +370,59 @@ private:
         space();
         if (i != body.size()) throw std::runtime_error("gemma4 call: text after the arguments object");
         return out;
+    }
+
+    // The second call form a <tool_call> block carries (Qwen3.5's template, and MiniCPM-V 4.7's, teach it):
+    //     <function=NAME>
+    //     <parameter=KEY>
+    //     VALUE
+    //     </parameter>
+    //     </function>
+    // The template writes a string argument bare and everything else through `tojson`, so a value is read back
+    // the same way: an object, an array, a number, true/false/null are JSON; anything else is the string itself,
+    // less the one newline the form puts on each side.  False on any other shape (the caller then tries the JSON
+    // form and, failing that, puts the markup back into content).
+    // shortcut: without the request's schema a string argument whose text is a JSON literal ("17", "true") comes
+    // back as that literal; type by the tool's parameter schema here if a caller needs it kept a string.
+    bool close_function_call() {
+        const std::string body = answer_detail::trim(call_text_);
+        static const std::string fopen_ = "<function=", fclose_ = "</function>", popen_ = "<parameter=", pclose_ = "</parameter>";
+        if (body.compare(0, fopen_.size(), fopen_) != 0) return false;
+        if (body.size() < fclose_.size() || body.compare(body.size() - fclose_.size(), fclose_.size(), fclose_) != 0) return false;
+        const size_t name_end = body.find('>', fopen_.size());
+        if (name_end == std::string::npos) return false;
+        ToolCall c;
+        c.id = "call_" + std::to_string(calls_.size());
+        c.name = answer_detail::trim(body.substr(fopen_.size(), name_end - fopen_.size()));
+        if (c.name.empty() || c.name.find('<') != std::string::npos) return false;
+        nlohmann::ordered_json args = nlohmann::ordered_json::object();
+        size_t i = name_end + 1;
+        const size_t end = body.size() - fclose_.size();
+        auto space = [&] { while (i < end && (body[i] == ' ' || body[i] == '\n' || body[i] == '\r' || body[i] == '\t')) ++i; };
+        for (space(); i < end; space()) {
+            if (body.compare(i, popen_.size(), popen_) != 0) return false;
+            const size_t key_end = body.find('>', i + popen_.size());
+            if (key_end == std::string::npos || key_end >= end) return false;
+            const std::string key = answer_detail::trim(body.substr(i + popen_.size(), key_end - i - popen_.size()));
+            const size_t close = body.find(pclose_, key_end + 1);
+            if (key.empty() || close == std::string::npos || close > end) return false;
+            std::string value = body.substr(key_end + 1, close - key_end - 1);
+            if (!value.empty() && value.front() == '\n') value.erase(0, 1);
+            if (!value.empty() && value.back() == '\n') value.pop_back();
+            const std::string t = answer_detail::trim(value);
+            nlohmann::ordered_json v = value;
+            const bool literal = !t.empty() && (t[0] == '{' || t[0] == '[' || t[0] == '-' || std::isdigit((unsigned char)t[0]) ||
+                                                t == "true" || t == "false" || t == "null");
+            if (literal) {
+                const nlohmann::ordered_json parsed = nlohmann::ordered_json::parse(t, nullptr, /*allow_exceptions=*/false);
+                if (!parsed.is_discarded() && !parsed.is_string()) v = parsed;
+            }
+            args[key] = std::move(v);
+            i = close + pclose_.size();
+        }
+        c.arguments = args.dump();
+        calls_.push_back(std::move(c));
+        return true;
     }
 
     bool close_gemma_call() {

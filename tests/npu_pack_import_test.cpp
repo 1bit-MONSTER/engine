@@ -1350,6 +1350,40 @@ void test_crafted_refusals(const std::string& root) {
     }
     check(!fs::exists(dir / "out3" / "model.qnx") && !fs::exists(dir / "out3" / "model.q4nx"),
           "crafted: nothing written for the empty .packed sibling");
+
+    // 4. engine#1503: the 1.8 hybrid spelling of the same thing. The node names `<w>` ITSELF as the [0] placeholder (no
+    // `.empty` suffix) beside an equally empty `<w>.packed`, and the weights are in a model.bin next to the graph
+    // (Llama-3.2-1B-Instruct_rai_1.8.0_hybrid: all 162 `.MatMulNBits.*` initializers are this shape). Before the fix the
+    // walker only knew the `.empty` spelling, kept the node as a real weight, `info` called every projection importable
+    // and `import` died much later on `...MatMulNBits.bias: no data`.
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {8, 8}, "model.onnx.data", 0, 256),
+                        pb::tensor("rai18_qweight", {0}, "", 0, 0),
+                        pb::tensor("rai18_qweight.packed", {0}, "", 0, 0),
+                        pb::tensor("rai18_scales", {0}, "", 0, 0),
+                        pb::tensor("rai18_zeros", {0}, "", 0, 0)},
+                       {pb::matmulnbits("mm", {"x", "rai18_qweight", "rai18_scales", "rai18_zeros"}, 64, 512, 4, 128)}));
+    put_file((dir / "model.bin").string(), std::string(64, '\0'));
+    try {
+        (void)pi::plan(dir.string());
+        check(false, "crafted 1.8: a [0] qweight with an empty .packed sibling was refused");
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        std::printf("  crafted 1.8 placeholder refusal: %s\n", what.c_str());
+        check(what.find("rai18_qweight (its rai18_qweight.packed sibling carries no data either)") != std::string::npos &&
+                  what.find("genuinely absent") != std::string::npos,
+              "crafted 1.8: plan() refuses by name, naming the placeholder and its sibling (" + what + ")");
+        check(what.find("weights are in its model.bin") != std::string::npos,
+              "crafted 1.8: and says where the weights are when a model.bin is there (" + what + ")");
+    }
+    fs::remove(dir / "model.bin");
+    try {
+        (void)pi::plan(dir.string());
+        check(false, "crafted 1.8 without model.bin: refused");
+    } catch (const std::exception& e) {
+        check(std::string(e.what()).find("model.bin") == std::string::npos,
+              "crafted 1.8: no model.bin, so the refusal does not claim one (" + std::string(e.what()) + ")");
+    }
     fs::remove_all(dir);
 }
 
@@ -5731,6 +5765,21 @@ void test_header_witness_refusal() {
     std::printf("  header witness: 8 arms (one-header vote vs declaration refuses; 3/1-without-declaration/0 allowed)\n");
 }
 
+// engine#1889: which tile each projection starts at inside the attention payload. Every family before Hunyuan is
+// k, q, v; the Hunyuan block is q, k, v, and reading it k, q, v handed the forward q_proj's first rows as k_proj
+// (byte-exact round trip, filler-word answers). Hunyuan-7B's own counts: 16 k/v tiles, 64 q tiles.
+void test_attn_first_tiles() {
+    const pi::AttnFirstTiles kqv = pi::attn_first_tiles(16, 64, false);
+    check(kqv.k == 0 && kqv.q == 16 && kqv.v == 80, "attn order: k,q,v puts k at tile 0, q at 16, v at 80");
+    const pi::AttnFirstTiles qkv = pi::attn_first_tiles(16, 64, true);
+    check(qkv.q == 0 && qkv.k == 64 && qkv.v == 80, "attn order: q,k,v puts q at tile 0, k at 64, v at 80 (engine#1889)");
+    check(qkv.k + 16 == qkv.v && kqv.q + 64 == kqv.v, "attn order: v follows the second run in both orders");
+    const pi::AttnFirstTiles small = pi::attn_first_tiles(2, 14, false);   // Qwen2.5-0.5B: k 2, q 14, v 2
+    check(small.k == 0 && small.q == 2 && small.v == 16, "attn order: the Qwen2.5-0.5B run (2/14/2) is unchanged");
+    pi::Plan p;
+    check(!p.attn_q_first, "attn order: a plan is k,q,v unless the block measured otherwise");
+}
+
 // engine#1503: the tied-head rule as ONE predicate -- correlated AND not mis-scaled. Two packs on this box correlate
 // (0.9915 / 0.9961) while being scaled copies of their own embedding (rel_err 0.1361 / 0.0949): they import cleanly and
 // serve garbage, where the pack that serves correctly reports rel_err 0.000000. Correlation alone cannot tell them apart,
@@ -5744,6 +5793,102 @@ static void selfcheck_head_rule_arms() {
     check(!pi::selfcheck_head_ok(0.50, 0.000000), "head rule: an uncorrelated head is still refused on correlation");
     check(pi::selfcheck_head_ok(0.996053, pi::kSelfcheckRelMax), "head rule: exactly at the threshold passes (inclusive bound)");
     std::printf("  head rule: 6 arms (two measured bad packs, the serving one, the unscaled control, no-corr, boundary)\n");
+
+    // engine#1503: the rule on what it claims (scale, rms ratio, rel against the embedding's own 4-bit noise floor).
+    // Measured fits, from the import's own numbers:
+    const pi::HeadFit qwen2_15b{0.094316, 0.994173, 1.001808, 0.083865};   // Qwen2-1.5B 1.9, block-32 tail head
+    const pi::HeadFit gemma_awq{0.094874, 0.992235, 1.003849, 0.088985};   // gemma-2-2b AWQ hybrid, graph head
+    check(!pi::selfcheck_head_ok(0.995969, qwen2_15b.rel),
+          "fit rule: the rel-only rule refuses Qwen2-1.5B's head (the reason this rule exists)");
+    check(pi::selfcheck_head_ok(0.995969, qwen2_15b),
+          "fit rule: Qwen2-1.5B's head passes: scale .994, rms 1.002, rel 1.12x its 4-bit floor");
+    check(pi::selfcheck_head_ok(0.996053, gemma_awq),
+          "fit rule: gemma-2-2b AWQ's head passes too -- by these numbers its head is not what served garbage");
+    check(pi::selfcheck_head_ok(0.996901, pi::HeadFit{0.0, 1.0, 1.0, 0.08}),
+          "fit rule: a head that IS its embedding (rel 0) passes");
+    check(!pi::selfcheck_head_ok(0.996, pi::HeadFit{0.09, 0.5, 2.0, 0.08}), "fit rule: a head scaled by 2 is refused");
+    check(!pi::selfcheck_head_ok(0.996, pi::HeadFit{0.09, 0.94, 1.0, 0.08}), "fit rule: scale 0.94 (outside 5 %) is refused");
+    check(!pi::selfcheck_head_ok(0.996, pi::HeadFit{0.09, 1.0, 1.06, 0.08}), "fit rule: rms ratio 1.06 is refused");
+    check(!pi::selfcheck_head_ok(0.996, pi::HeadFit{0.13, 1.0, 1.0, 0.08}),
+          "fit rule: rel 1.6x the floor is refused (a partial decode is noisier than quantisation)");
+    check(pi::selfcheck_head_ok(0.996, pi::HeadFit{0.12, 1.0, 1.0, 0.08}), "fit rule: exactly 1.5x the floor passes");
+    check(!pi::selfcheck_head_ok(0.50, qwen2_15b), "fit rule: an uncorrelated head is still refused on correlation");
+
+    // fit_head itself, on a synthetic table: the head is the embedding quantised asymmetric 4-bit at block 32, the way
+    // a correct pack's head is, so the fit must read scale ~1 and rel == floor; the same head scaled by 0.5 must not.
+    const int N = 64, K = 128;
+    std::vector<uint8_t> emb(size_t(N) * K * 2);
+    std::vector<float> ef(size_t(N) * K);
+    uint32_t st = 12345;
+    for (size_t i = 0; i < ef.size(); ++i) {
+        st = st * 1664525u + 1013904223u;
+        float v = (float(st >> 8) / float(1u << 24) - 0.5f) * 0.2f;
+        uint32_t b;
+        std::memcpy(&b, &v, 4);
+        const uint16_t h = uint16_t(b >> 16);   // bf16: the top half, so ef[] holds exactly what the table says
+        b = uint32_t(h) << 16;
+        std::memcpy(&v, &b, 4);
+        ef[i] = v;
+        emb[2 * i] = uint8_t(h & 0xff);
+        emb[2 * i + 1] = uint8_t(h >> 8);
+    }
+    pi::EmbedTable et;
+    et.p = emb.data();
+    et.H = K;
+    pi::Q4 q;
+    q.N = N; q.K = K; q.block = 32;
+    q.codes.assign(size_t(N) * K, 0);
+    q.scale.assign(size_t(N) * (K / 32), 0.f);
+    q.zero.assign(size_t(N) * (K / 32), 0.f);
+    for (int n = 0; n < N; ++n)
+        for (int g = 0; g < K / 32; ++g) {
+            float lo = 1e30f, hi = -1e30f;
+            for (int k = 0; k < 32; ++k) { lo = std::min(lo, ef[size_t(n) * K + g * 32 + k]); hi = std::max(hi, ef[size_t(n) * K + g * 32 + k]); }
+            const float sc = (hi - lo) / 15.f;
+            q.scale[size_t(n) * (K / 32) + g] = sc;
+            q.zero[size_t(n) * (K / 32) + g] = lo;
+            for (int k = 0; k < 32; ++k)
+                q.codes[size_t(n) * K + g * 32 + k] =
+                    uint8_t(std::min(15.0, std::max(0.0, std::round((double(ef[size_t(n) * K + g * 32 + k]) - lo) / sc))));
+        }
+    const pi::HeadFit good = pi::fit_head(q, et, N, 32);
+    check(std::fabs(good.scale - 1) < 0.01 && std::fabs(good.rms_ratio - 1) < 0.01 && good.rel > 0 &&
+              std::fabs(good.rel - good.floor) < 1e-6 && pi::selfcheck_head_ok(0.999, good),
+          "fit_head: a correct 4-bit head reads scale ~1, rel == its floor, and passes (scale " +
+              std::to_string(good.scale) + " rel " + std::to_string(good.rel) + " floor " + std::to_string(good.floor) + ")");
+    // The floor follows the head's block (the block-128 tail head passes 128): the same table quantised at block 128
+    // must read rel == its block-128 floor, which is LARGER than the block-32 floor of the same table.
+    pi::Q4 q128 = q;
+    for (int n = 0; n < N; ++n)
+        for (int g = 0; g < K / 128; ++g) {
+            float lo = 1e30f, hi = -1e30f;
+            for (int k = 0; k < 128; ++k) { lo = std::min(lo, ef[size_t(n) * K + g * 128 + k]); hi = std::max(hi, ef[size_t(n) * K + g * 128 + k]); }
+            const float sc = (hi - lo) / 15.f;
+            for (int j = 0; j < 4; ++j) {   // a 128-block's scale and zero apply to its four 32-column groups
+                q128.scale[size_t(n) * (K / 32) + g * 4 + j] = sc;
+                q128.zero[size_t(n) * (K / 32) + g * 4 + j] = lo;
+            }
+            for (int k = 0; k < 128; ++k)
+                q128.codes[size_t(n) * K + g * 128 + k] =
+                    uint8_t(std::min(15.0, std::max(0.0, std::round((double(ef[size_t(n) * K + g * 128 + k]) - lo) / sc))));
+        }
+    const pi::HeadFit f128 = pi::fit_head(q128, et, N, 128);
+    check(std::fabs(f128.rel - f128.floor) < 1e-6 && f128.floor > good.floor && pi::selfcheck_head_ok(0.999, f128),
+          "fit_head: at block 128 the floor is the block-128 one (rel " + std::to_string(f128.rel) + " == floor " +
+              std::to_string(f128.floor) + " > block-32 floor " + std::to_string(good.floor) + ")");
+    pi::Q4 half = q;
+    for (auto& v : half.scale) v *= 0.5f;
+    for (auto& v : half.zero) v *= 0.5f;
+    const pi::HeadFit bad = pi::fit_head(half, et, N, 32);
+    check(std::fabs(bad.scale - 2) < 0.05 && !pi::selfcheck_head_ok(0.999, bad),
+          "fit_head: the same head at half scale reads scale ~2 and is refused (scale " + std::to_string(bad.scale) + ")");
+    check(pi::known_bad_architecture("gemma2") != nullptr &&
+              std::string(pi::known_bad_architecture("gemma2")).find("not yet found") != std::string::npos,
+          "known-bad: gemma2 stays refused, by name and with the reason (the head fit no longer refuses it)");
+    check(pi::known_bad_architecture("qwen2") == nullptr && pi::known_bad_architecture("llama") == nullptr &&
+              pi::known_bad_architecture("") == nullptr,
+          "known-bad: nothing else is on the list");
+    std::printf("  head fit rule: 15 arms (two measured heads, scaled/rms/noisy/no-corr controls, fit_head at blocks 32 and 128, gemma2 by name)\n");
 }
 
 int main(int argc, char** argv) {
@@ -5759,6 +5904,7 @@ int main(int argc, char** argv) {
     test_header_witness_refusal();
     test_encode_tile_code_range();
     test_q4_writer_code_range();
+    test_attn_first_tiles();
     test_qk_norm_refusal();
     test_head_stored_rows();
     test_qk_gain_offsets();

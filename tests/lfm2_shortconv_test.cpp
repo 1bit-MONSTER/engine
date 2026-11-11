@@ -115,6 +115,32 @@ int main() {
                   std::memcmp(tail.data(), &want[size_t(11) * H], tail.size() * sizeof(float)) == 0,
               "a copy of the state at position 11 resumes to the same bits" + tag);
 
+        // a rolled-back batch: run all T rows from a copy, put the copy back, re-apply only the first 7 rows' B*X.
+        // That must be the state 7 decode steps leave, and decode must carry on from it to the same bits.
+        {
+            ShortConvState base;
+            base.reset(H, L);
+            std::vector<float> junk(size_t(T) * H);
+            shortconv_rows(base, bcx.data(), 4, taps.data(), junk.data());       // 4 tokens already committed
+            const ShortConvState snap = base;
+            shortconv_rows(base, &bcx[size_t(4) * 3 * H], T - 4, taps.data(), junk.data());   // the speculative batch
+            base = snap;                                                           // rejected past row 7
+            bool pok = true;
+            std::vector<float> bx(H);
+            for (int t = 4; t < 11; ++t) {
+                for (int h = 0; h < H; ++h) bx[h] = bcx[size_t(t) * 3 * H + h] * bcx[size_t(t) * 3 * H + 2 * H + h];
+                pok = pok && onebit::npu::shortconv_push(base, bx.data());
+            }
+            std::vector<float> rest(size_t(T - 11) * H);
+            pok = pok && shortconv_rows(base, &bcx[size_t(11) * 3 * H], T - 11, taps.data(), rest.data());
+            check(pok && base.history == one.history &&
+                      std::memcmp(rest.data(), &want[size_t(11) * H], rest.size() * sizeof(float)) == 0,
+                  "restore + push of the accepted rows' B*X equals having decoded them" + tag);
+            ShortConvState unsized;
+            check(!onebit::npu::shortconv_push(unsized, bx.data()) && !onebit::npu::shortconv_push(base, nullptr),
+                  "push refuses an unsized state and a null row" + tag);
+        }
+
         // the history really is the last L-1 values of B*X, oldest first
         bool hist = true;
         for (int j = 0; j < L - 1 && hist; ++j)

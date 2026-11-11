@@ -678,6 +678,21 @@ private:
     bool gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                          std::vector<float>& out);
     bool load_gdn_layer(int l);
+
+    // ── LFM2 gated short-convolution layers ──────────────────────────────
+    // A layer that carries shortconv.* tensors has no attention: in_proj (H -> 3H, the QKVLIN design, weight
+    // key 0) and out_proj (H -> H, the O design, key 1, the slot an attention layer's o_proj has) run on the
+    // device, and everything between them is lfm2_shortconv.h on the host. The only state is the last L-1
+    // values of B*X per channel, kept in conv_state_[l] so snapshot/restore/reset cover it with no new code.
+    bool shortconv_ = false;                       // the model has at least one such layer
+    int sc_taps_ = 0;                              // L, from shortconv.conv.weight's own shape
+    std::vector<uint8_t> sc_layer_;                // [NL] 1 = conv layer
+    std::vector<std::vector<float>> sc_w_;         // [NL][H * L] the depthwise taps, bf16-decoded once
+    std::vector<std::vector<float>> sc_rows_;      // [NL][rows * H] B*X of a verify batch's rows (see begin_verify)
+    bool is_conv_layer(int l) const { return shortconv_ && l >= 0 && l < (int)sc_layer_.size() && sc_layer_[(size_t)l]; }
+    bool conv_layer(int l, const std::vector<float>& xn, std::vector<float>& out);
+    bool conv_layer_batch(int l, const std::vector<float>& xn, int M, std::vector<float>& out);
+    void conv_apply_rows(int rows);                // re-apply the first `rows` recorded rows after a restore
     std::string err_;
     std::string backend_ = "uninitialised";
     bool ready_ = false;

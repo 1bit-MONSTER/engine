@@ -26,7 +26,7 @@
 
 static const char* kFields[Q4NX_SEM_COUNT] = {
     /* RMSNORM_OFFSET  */ "model_type/architectures (gemma* uses the 1+w form)",
-    /* QK_NORM         */ "model_type/architectures (q_norm/k_norm tensors)",
+    /* QK_NORM         */ "use_qk_norm when stated, else model_type/architectures",
     /* ROPE_THETA      */ "rope_theta",
     /* ROTARY_DIM      */ "partial_rotary_factor * head_dim",
     /* MLP_ACT         */ "hidden_act (falls back to model_type)",
@@ -35,7 +35,7 @@ static const char* kFields[Q4NX_SEM_COUNT] = {
     /* EMBED_SCALE     */ "model_type (gemma* uses sqrt(hidden_size))",
     /* LOGIT_SOFTCAP   */ "final_logit_softcapping",
     /* SLIDING_WINDOW  */ "sliding_window",
-    /* EPS             */ "rms_norm_eps",
+    /* EPS             */ "rms_norm_eps (norm_eps when absent)",
     /* HYBRID_LAYERS   */ "layer_types (count of entries != full_attention)",
     /* MROPE           */ "rope_parameters.mrope_interleaved (rope_type)",
     /* PER_LAYER_ROPE  */ "rope_parameters.{full,sliding}_attention sub-blocks",
@@ -219,8 +219,23 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
      * layer-0 input_layernorm weight it loads (a config-only answer would be a guess). */
     s->rmsnorm_offset_probe = (is_qwen35 && !is_gemma) ? 1 : 0;
 
-    /* per-head q/k RMSNorm: qwen3* and gemma* have q_norm/k_norm; llama/phi do not */
-    s->qk_norm = (is_qwen3 || is_gemma) ? 1 : 0;
+    /* LFM2 / LFM2.5 (Lfm2ForCausalLM): its attention layers carry q_norm/k_norm, applied before RoPE */
+    const int is_lfm2 = starts_with(model_type, "lfm2") || starts_with(arch, "Lfm2");
+
+    /* per-head q/k RMSNorm: qwen3*, gemma* and lfm2 have q_norm/k_norm; llama/phi do not */
+    s->qk_norm = (is_qwen3 || is_gemma || is_lfm2) ? 1 : 0;
+    /* engine#1889: a config that STATES `use_qk_norm` decides it, whatever the name table says. The table is a list
+     * of the families measured so far, so a family it has never heard of got 0 silently: Hunyuan-7B is
+     * `hunyuan_v1_dense` / `HunYuanDenseV1ForCausalLM` with `use_qk_norm: true`, its container carries
+     * self_attn.{q,k}_norm.weight for all 32 layers, and the forward loaded them and never applied them -- the same
+     * text with the gains, without them and with the key set to false, because nothing read the key. Families that
+     * do not state the key (qwen3, gemma) keep the table's answer. */
+    {
+        double uq = 0;
+        if (get_num(json, "use_qk_norm", &uq)) s->qk_norm = uq != 0 ? 1 : 0;
+    }
+    /* Hunyuan rotates q and k first and normalises them after (see the header); everyone else normalises first. */
+    s->qk_norm_after_rope = (starts_with(model_type, "hunyuan") || starts_with(arch, "HunYuan")) ? 1 : 0;
 
     /* RoPE base.  Qwen3.5 nests it under rope_parameters (scalar); Gemma4 nests
      * it PER LAYER TYPE under rope_parameters.{full,sliding}_attention with
@@ -463,6 +478,8 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
 
     /* epsilon */
     if (get_num(json, "rms_norm_eps", &d) && d > 0) s->eps = (float)d;
+    /* LFM2 spells it norm_eps (and has no rms_norm_eps at all) */
+    else if (get_num(json, "norm_eps", &d) && d > 0) s->eps = (float)d;
 
     /* ── Gemma4-style per-layer embeddings (PLE) + KV sharing ── */
     if (get_num(json, "hidden_size_per_layer_input", &d) && d > 0)
@@ -551,6 +568,9 @@ void q4nx_semantics_dump(const Q4nxSemantics* s) {
             q4nx_semantics_field(Q4NX_SEM_RMSNORM_OFFSET));
     fprintf(stderr, "  [semantics] qk_norm=%d  <- %s\n", s->qk_norm,
             q4nx_semantics_field(Q4NX_SEM_QK_NORM));
+    if (s->qk_norm)
+        fprintf(stderr, "  [semantics] qk_norm order: %s  <- model_type/architectures (hunyuan* normalises after RoPE)\n",
+                s->qk_norm_after_rope ? "RoPE, then norm" : "norm, then RoPE");
     fprintf(stderr, "  [semantics] rope_theta=%.6g  <- %s\n", s->rope_theta,
             q4nx_semantics_field(Q4NX_SEM_ROPE_THETA));
     fprintf(stderr, "  [semantics] rotary_dim=%d  <- %s\n", s->rotary_dim,

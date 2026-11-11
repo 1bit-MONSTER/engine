@@ -172,7 +172,7 @@ def run(args):
         log_text = f.read()
     if not replies:
         print("serve       FAIL  it never became ready within %d s (exit %s); see %s" % (args.ready_seconds, serve.returncode, log_path))
-    return report(judge(log_text, replies, args.floor, args.first_token_ms))
+    return report(judge(log_text, replies, args.floor, args.first_token_ms, args.fast_route, args.slow_route))
 
 
 def rejudge(args):
@@ -185,7 +185,7 @@ def rejudge(args):
         with open(os.path.join(d, "reply_%d.json" % i)) as f:
             replies.append(json.load(f))
         i += 1
-    return report(judge(log_text, replies, args.floor, args.first_token_ms))
+    return report(judge(log_text, replies, args.floor, args.first_token_ms, args.fast_route, args.slow_route))
 
 
 def self_test():
@@ -261,6 +261,8 @@ def main():
     p.add_argument("--port", type=int, default=18173)
     p.add_argument("--floor", type=float, default=60.0)
     p.add_argument("--first-token-ms", type=float, default=600.0)
+    p.add_argument("--fast-route", default=FAST_ROUTE, help="the text the serve log prints on the fast route")
+    p.add_argument("--slow-route", default=SLOW_ROUTE, help="the text the serve log prints on the slow route")
     p.add_argument("--max-tokens", type=int, default=96)
     p.add_argument("--ready-seconds", type=int, default=120)
     p.add_argument("--request-seconds", type=int, default=120)

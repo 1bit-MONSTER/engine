@@ -275,7 +275,9 @@ tools/npu_serve_smoke.py --self-test        # the judging on the shape of each f
 tools/npu_serve_smoke.py --judge <dir>      # judge a finished run's serve.log and reply_*.json again
 ```
 
-It prints one line per assertion and `RESULT: PASS` or `RESULT: FAIL` (exit 0 or 1). It takes no device
+The two route texts are what the serve prints today (`on the private route dx`, `per-op forward`);
+`--fast-route` and `--slow-route` change them when the serve's wording does, and a log that names
+neither is a failure, not a pass. It prints one line per assertion and `RESULT: PASS` or `RESULT: FAIL` (exit 0 or 1). It takes no device
 ticket of its own: run it under `npu-hold`, and the serve ends with the script. Logs and replies go to
 `--out` (default `~/.cache/1bit/npu-serve-smoke`).
 

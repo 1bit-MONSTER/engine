@@ -1664,12 +1664,15 @@ re-dequantised each layer's 17408-wide dense FFN tail on every token even after 
 packed on the device. `ffn_tail_cached()` (`npu/forward/src/q4nx_forward.cpp`) closes that: once a
 layer's packed gate/up/down BOs are resident, the f32 `wg_`/`wu_`/`wd_` buffers are no longer read,
 so the reload is skipped. It is on by default for a GDN model on the NPU route, when the packed
-weight cache is on, the run is not `NPU_INFER_HOST_GEMM`, and the tail is at least 256 MB per layer
-(the size guard; below that the reload is too small to be worth a behaviour change). `NPU_FFN_CACHE=0`
+weight cache is on, the run is not `NPU_INFER_HOST_GEMM`, and the tail is at least 128 MB per layer
+(the size guard, set just under the smallest tail measured; `npu/forward/include/ffn_cache_policy.h`). `NPU_FFN_CACHE=0`
 or `=1` forces it either way, and the resolved state is logged once as
 `[ffn] dense-tail cache on|off (default|NPU_FFN_CACHE; lin_kd=… IM=… H=…)`. On Qwen3.8-27B-NPU2 an
 interleaved 5-round A/B (`~/lb/587-cache-20261030`) measured an 8-token request at 104.5 s against
 117.4 s (**−11%**), CPU per token 22.9 s against 63.3 s (**−64%**), same text in every arm.
+On FastFlowLM's Qwen3.5-2B-NPU2 (IM 6144, H 2048, a 151 MB tail that the earlier 256 MB floor left out) an A B B A
+run in one ticket measured decode at 362–367 ms per token with the cache on (both arms) against 485–520 ms with
+it off in the quieter of the two off arms and 478–707 ms in the other, same text in all twelve runs (engine#1785).
 
 ### The prefix cache's snapshot: two kinds of plane
 
